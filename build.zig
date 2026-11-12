@@ -80,19 +80,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path(if (tool != null) "src/tool_root.zig" else "src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
-            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize) },
             .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize) },
         },
     });
-
-    // Jinja2 template engine (wangzhaode/jinja.cpp + nlohmann/json; see NOTICE).
-    // Precompiled with system clang++ for C++17's system libc++; rebuild instructions in CLAUDE.md.
-    mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
-    mod.addIncludePath(b.path("lib/jinja_cpp"));
 
     // stb_image for JPEG/PNG decoding in the vision pipeline
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
@@ -472,6 +465,7 @@ fn nameFilter(full: []const u8, all: []const []const u8, user: []const []const u
 fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, user: ?[]const []const u8) []const *std.Build.Step.Compile {
     const io = b.graph.io;
     const host_stems = hostStems(b);
+    const host_paths = hostPaths(b);
     var stems: std.ArrayList([]const u8) = .empty;
     var nested: std.ArrayList(struct { stem: []const u8, filter: []const u8, full: []const u8 }) = .empty;
     // A scoped run names each test of a root file that another model's file name ends with ("model" in
@@ -493,7 +487,7 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
         while (it.next(io) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e })) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
             const stem = entry.name[0 .. entry.name.len - ".zig".len];
-            if (isHostStem(host_stems, stem)) continue;
+            if (isHostFile(host_paths, dir_path, stem)) continue;
             if (std.mem.startsWith(u8, stem, "ubench_")) continue;
             if (out_of_scope) {
                 skipped.append(b.allocator, b.allocator.dupe(u8, stem) catch @panic("OOM")) catch @panic("OOM");
@@ -549,7 +543,8 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
             }
         }
     }
-    // A host file's tests run only in test-host, so no MLX filter may select them.
+    // A host file's tests run only in test-host, so no MLX filter may select them. A host file is found by its path, so
+    // an MLX file that shares its stem (a later src/render.zig, an arch's value.zig) lands here, loudly.
     for (host_stems) |h| for (stems.items) |a| {
         if (std.mem.endsWith(u8, h, a[0 .. a.len - ".test.".len])) std.debug.panic("host test file {s} would also run in the MLX bucket of {s}", .{ h, a });
     };
@@ -722,9 +717,16 @@ fn hostUserFilters(b: *std.Build, user: []const []const u8) []const []const u8 {
     return out.items;
 }
 
-fn isHostStem(host_stems: []const []const u8, stem: []const u8) bool {
+/// Whether `<dir_path>/<stem>.zig` is a host-tier file, matched by its path under src/, never by its stem alone.
+fn isHostFile(host_paths: []const []const u8, dir_path: []const u8, stem: []const u8) bool {
     if (std.mem.endsWith(u8, stem, arch_bill_suffix)) return true;
-    for (host_stems) |h| if (std.mem.eql(u8, h, stem)) return true;
+    const folder = if (std.mem.eql(u8, dir_path, "src")) "" else dir_path["src/".len..];
+    for (host_paths) |h| {
+        const sep = std.mem.lastIndexOfScalar(u8, h, '/');
+        const h_folder = if (sep) |i| h[0..i] else "";
+        const h_stem = if (sep) |i| h[i + 1 ..] else h;
+        if (std.mem.eql(u8, h_folder, folder) and std.mem.eql(u8, h_stem, stem)) return true;
+    }
     return false;
 }
 

@@ -162,6 +162,51 @@ mkdir -p "$TMP/t/src/tensor"
 printf '%s\n' 'const engine = struct { var active: bool = false; };' 'pub fn makers(own: bool) void {' '    engine.active = own;' '}' > "$TMP/t/src/tensor/route.zig"
 expect_green "a read, a test that turns the engine on, and the owner's own file"
 
+# rule template-runtime-safety
+tree
+mkdir -p "$TMP/t/src/template"
+printf '%s\n' 'fn lex(s: []const u8) usize {' '    return s.len;' '}' > "$TMP/t/src/template/p.zig"
+expect_red "a template fn without runtime safety" "src/template/p.zig:1:4 \[template-runtime-safety\] lex: fn 'lex' does not start with @setRuntimeSafety(true)"
+
+tree
+mkdir -p "$TMP/t/src/template"
+printf '%s\n' 'fn f(s: []const u8) usize {' '    const n = s.len;' '    @setRuntimeSafety(true);' '    return n;' '}' \
+  'fn g() void {' '    @setRuntimeSafety(false);' '}' 'const S = struct {' '    fn h() void {' '        @setRuntimeSafety(true);' \
+  '        const inner = struct {' '            fn k() void {}' '        };' '        _ = inner;' '    }' '};' > "$TMP/t/src/template/p.zig"
+expect_red "safety set late" "\[template-runtime-safety\] f:"
+expect_red "safety turned off" "\[template-runtime-safety\] g:"
+expect_red "a fn nested in a struct inside a fn" "\[template-runtime-safety\] k:"
+
+tree
+mkdir -p "$TMP/t/src/template"
+printf '%s\n' 'fn f(s: []const u8) usize {' '    @setRuntimeSafety(true);' '    {' '        @setRuntimeSafety(false);' '        return s.len;' '    }' '}' \
+  'comptime {' '    @setRuntimeSafety(false);' '}' > "$TMP/t/src/template/p.zig"
+expect_red "safety turned off in a nested block" "src/template/p.zig:4:9 \[template-runtime-safety\] f: @setRuntimeSafety(false) under src/template/"
+expect_red "safety turned off outside any fn" "\[template-runtime-safety\] -: @setRuntimeSafety(false)"
+
+tree
+mkdir -p "$TMP/t/src/template"
+printf '%s\n' 'fn f(s: []const u8) usize {' '    @setRuntimeSafety(true);' '    return s.len;' '}' \
+  'extern "c" fn time(t: ?*c_long) c_long;' 'test "t" { _ = f("x"); }' > "$TMP/t/src/template/p.zig"
+printf '%s\n' 'fn outside() void {}' > "$TMP/t/src/p.zig"
+expect_green "a safe fn, an extern, a test and a fn outside src/template/"
+
+# rule template-superlinear-std
+tree
+mkdir -p "$TMP/t/src/template"
+printf '%s\n' 'const std = @import("std");' 'const mem = std.mem;' 'fn f(s: []const u8, xs: []u8) ?usize {' '    @setRuntimeSafety(true);' \
+  '    std.sort.block(u8, xs, {}, std.sort.asc(u8));' '    _ = mem.count(u8, s, "ab");' '    return std.mem.lastIndexOf(u8, s, "ab");' '}' > "$TMP/t/src/template/p.zig"
+expect_red "a std sort under src/template/" "src/template/p.zig:5:9 \[template-superlinear-std\] f: std.sort under src/template/"
+expect_red "a substring count through an alias" "\[template-superlinear-std\] f: mem.count"
+expect_red "a substring search" "\[template-superlinear-std\] f: mem.lastIndexOf"
+
+tree
+mkdir -p "$TMP/t/src/template"
+printf '%s\n' 'const std = @import("std");' 'fn f(s: []const u8) ?usize {' '    @setRuntimeSafety(true);' '    return std.mem.indexOfScalar(u8, s, 0x2c);' '}' \
+  'test "an oracle" { _ = std.mem.indexOf(u8, "ab", "b"); }' > "$TMP/t/src/template/p.zig"
+printf '%s\n' 'const std = @import("std");' 'fn outside(s: []const u8) ?usize {' '    return std.mem.indexOf(u8, s, "ab");' '}' > "$TMP/t/src/p.zig"
+expect_green "a scalar search, a test oracle and a search outside src/template/"
+
 # the allowlist
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn handleOf(s: *S) *S { return s; }' 'fn f(self: *const S) *S {' \

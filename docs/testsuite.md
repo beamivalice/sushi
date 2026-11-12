@@ -135,6 +135,14 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `double-free` flags a handle that an `errdefer` frees and a later `defer` frees again.
   `scope-state` flags a hand write of `engine.active` (anywhere outside `src/tensor/`) or of `engine.enabled`
   (outside tests): the guards of [the seam](engine-own-forward.md#the-seam) are the only writers.
+  `template-runtime-safety` flags a fn under `src/template/` whose body does not open with `@setRuntimeSafety(true)`,
+  and any `@setRuntimeSafety(false)` there: the engine reads pack text, and in ReleaseFast only that keeps its bounds
+  and overflow checks. It covers the engine's own code, not the std functions it calls (those run unchecked); that is
+  sound because the engine hands them only UTF-8 it validated (the template text; `std.json` refuses invalid UTF-8 and
+  lone surrogates) or built from validated pieces at code-point boundaries, and slices it bounded itself.
+  `template-superlinear-std` flags, under `src/template/` outside tests, `std.sort` and a `mem.` substring search or
+  sort (`indexOf`, `lastIndexOf`, `count`, `replace`, `splitSequence`, `sort`, ...): their time grows with text times
+  needle, or they assume a consistent comparator; the engine uses `value.Finder` (KMP) and `value.stableSort`.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its

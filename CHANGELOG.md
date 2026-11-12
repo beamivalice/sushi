@@ -11,6 +11,12 @@ earlier history is mlx-serve's, in that project's changelog.
   process sooner with the same output; the SSD budget sets 0.7 GB aside for them.
 - **DeepSeek-V4.1-Flash drafts cost less**: each drafted token reads its bigram table once, in the form the pack
   stores it, so speculative rounds on code and prose finish sooner with the same text, and the load holds 66 MB less.
+- **Chat templates render in sushi's own engine**: numbers in a tool schema or a tool call replayed from history now
+  reach the prompt as Python's chat templates write them, every digit and a float's `.0` kept (`1.0` no longer `1`).
+- **Long conversations start answering sooner**: building the prompt of a 400-turn tool-calling conversation takes
+  2 to 4 ms where it took 0.1 to 0.6 s, on every served model.
+- **A chat template that leans on a jinja.cpp leniency Python's Jinja2 refuses now fails by name**: a list or dict
+  mutator other than `append`, or `|length` of a `map` result, fails the render with today's handling of a failed render.
 - **DeepSeek-V4.1-Flash STQ prefill runs on Sushi Cooler on M5 Macs**: long prompts are processed on sushi's own Metal
   engine beside generation, with the same answers; `--ds41-mlx-engine` and the "Use Sushi's Cooler Engine instead of
   MLX" setting move prefill back to MLX with the rest.

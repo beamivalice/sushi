@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const media_mode = @import("arch/media_mode.zig");
 const effort_mod = @import("effort.zig");
 const arch_chat = @import("arch/chat.zig");
-const jinja_c = @import("jinja_c");
+const template_engine = @import("template/template.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
 
@@ -522,27 +522,14 @@ pub fn renderChatTemplate(
     const messages_json = try serializeMessagesJsonFor(allocator, effective_messages, chat_config);
     defer allocator.free(messages_json);
 
-    // Null-terminate strings for C
-    const tmpl_z = try allocator.dupeSentinel(u8, render_tpl, 0);
-    defer allocator.free(tmpl_z);
-    const msgs_z = try allocator.dupeSentinel(u8, messages_json, 0);
-    defer allocator.free(msgs_z);
-    const extra_z = try allocator.dupeSentinel(u8, extra_json, 0);
-    defer allocator.free(extra_z);
-
-    var tools_z: ?[:0]const u8 = null;
-    defer if (tools_z) |tz| allocator.free(tz);
-    if (effective_tools_json) |tj| {
-        tools_z = try allocator.dupeSentinel(u8, tj, 0);
-    }
-
     if (prefill) |partial| {
         const turn = messages[messages.len - 1];
-        if (try renderContinuation(allocator, tmpl_z, extra_z, tools_z, effective_messages, turn, partial, chat_config)) |cont| return cont;
+        if (try renderContinuation(allocator, render_tpl, extra_json, effective_tools_json, effective_messages, turn, partial, chat_config)) |cont| return cont;
     }
 
-    if (renderEngine(tmpl_z, msgs_z, tools_z, extra_z, true)) |engine_out| {
-        defer jinja_c.jinja_str_free(engine_out.ptr);
+    var failure: EngineFailure = .{};
+    if (try renderEngine(allocator, render_tpl, messages_json, effective_tools_json, extra_json, true, &failure)) |engine_out| {
+        defer allocator.free(engine_out);
         const collapsed = try collapseDoubledThinkTags(allocator, engine_out);
         // A continuation commits the content channel and then hands the model
         // its own unfinished sentence. It runs INSTEAD of the thinking-off
@@ -564,19 +551,16 @@ pub fn renderChatTemplate(
     // WARN, not debug: a failed render silently swaps a ChatML model's prompt into
     // fallbackFormatChat's format, so the downgrade must be visible at the default
     // log level. Any other model has no fallback: its turn tokens are not ChatML's.
+    var reason_buf: [1200]u8 = undefined;
+    const reason = failure.describe(&reason_buf);
     if (!fallbackIsChatMl(chat_config)) {
-        const reason = if (jinja_c.jinja_last_error()) |e| std.mem.span(e) else "the template failed to render";
         log.warn("jinja render failed ({s}), and this model has no fallback chat format\n", .{reason});
         return refuseTemplate(reason);
     }
     // The template says the conversation has nothing to answer: a request defect, not a render fault.
-    if (jinja_c.jinja_last_error()) |e| {
-        if (std.mem.indexOf(u8, std.mem.span(e), NO_USER_QUERY_RAISE) != null) return error.ChatNeedsUserTurn;
-    }
+    if (failure.err == error.TemplateRaised and failure.diag.messageIs(NO_USER_QUERY_RAISE)) return error.ChatNeedsUserTurn;
     _ = template_fallbacks.fetchAdd(1, .monotonic);
-    if (jinja_c.jinja_last_error()) |e| {
-        log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{std.mem.span(e)});
-    }
+    log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{reason});
     const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
     if (prefill) |partial| {
         defer allocator.free(base);
@@ -592,9 +576,9 @@ pub fn renderChatTemplate(
 /// back to the generation prompt plus the content-channel tail.
 fn renderContinuation(
     allocator: std.mem.Allocator,
-    tmpl_z: [:0]const u8,
-    extra_z: [:0]const u8,
-    tools_z: ?[:0]const u8,
+    tmpl: []const u8,
+    extra: []const u8,
+    tools: ?[]const u8,
     history: []const Message,
     turn: Message,
     partial: []const u8,
@@ -606,15 +590,14 @@ fn renderContinuation(
     turns[history.len] = .{ .role = "assistant", .content = partial, .reasoning_content = turn.reasoning_content };
     const json = try serializeMessagesJsonFor(allocator, turns, chat_config);
     defer allocator.free(json);
-    const json_z = try allocator.dupeSentinel(u8, json, 0);
-    defer allocator.free(json_z);
-    const engine_out = renderEngine(tmpl_z, json_z, tools_z, extra_z, false) orelse return null;
-    defer jinja_c.jinja_str_free(engine_out.ptr);
+    var failure: EngineFailure = .{};
+    const engine_out = try renderEngine(allocator, tmpl, json, tools, extra, false, &failure) orelse return null;
+    defer allocator.free(engine_out);
     const rendered = try collapseDoubledThinkTags(allocator, engine_out);
     defer allocator.free(rendered);
     // A template may trim the text's leading whitespace, as transformers allows for.
     const text = std.mem.trimStart(u8, partial, " \t\r\n");
-    const at = std.mem.lastIndexOf(u8, rendered, text) orelse return null;
+    const at = try template_engine.lastIndexOf(allocator, rendered, text) orelse return null;
     return try allocator.dupe(u8, rendered[0 .. at + text.len]);
 }
 
@@ -714,8 +697,8 @@ fn templateProbeRendersMarker(
 }
 
 /// The template's render of `probe_messages` without a generation prompt, or
-/// null when it fails. Probe failures are conservative: the real render clears
-/// the thread-local Jinja error and either renders or logs its own failure.
+/// null when it fails. Probe failures are conservative: the real render either
+/// renders or logs its own failure.
 fn templateProbeRender(
     allocator: std.mem.Allocator,
     tpl: []const u8,
@@ -724,17 +707,8 @@ fn templateProbeRender(
 ) !?[]u8 {
     const messages_json = try serializeMessagesJson(allocator, probe_messages);
     defer allocator.free(messages_json);
-
-    const tmpl_z = try allocator.dupeSentinel(u8, tpl, 0);
-    defer allocator.free(tmpl_z);
-    const msgs_z = try allocator.dupeSentinel(u8, messages_json, 0);
-    defer allocator.free(msgs_z);
-    const extra_z = try allocator.dupeSentinel(u8, extra_json, 0);
-    defer allocator.free(extra_z);
-
-    const engine_out = renderEngine(tmpl_z, msgs_z, null, extra_z, false) orelse return null;
-    defer jinja_c.jinja_str_free(engine_out.ptr);
-    return try allocator.dupe(u8, engine_out);
+    var failure: EngineFailure = .{};
+    return renderEngine(allocator, tpl, messages_json, null, extra_json, false, &failure);
 }
 
 /// One call into the template engine, its inputs exactly as the engine reads them (tests only, `engine_spy`).
@@ -746,6 +720,8 @@ pub const EngineCall = struct {
     add_generation_prompt: bool,
     /// Null when the engine raised.
     rendered: ?[]const u8,
+    /// The work the render took against the engine's limits.
+    usage: template_engine.Usage,
 };
 
 pub const EngineSpy = struct { ctx: *anyopaque, see: *const fn (ctx: *anyopaque, call: EngineCall) void };
@@ -753,19 +729,39 @@ pub const EngineSpy = struct { ctx: *anyopaque, see: *const fn (ctx: *anyopaque,
 /// Read only by a test build: the test that sets it sees every call `renderEngine` makes.
 pub var engine_spy: ?EngineSpy = null;
 
-/// The only call into the template engine. The caller frees the render with `jinja_c.jinja_str_free`.
-fn renderEngine(tmpl_z: [:0]const u8, msgs_z: [:0]const u8, tools_z: ?[:0]const u8, extra_z: [:0]const u8, add_generation_prompt: bool) ?[]u8 {
-    // Length-delimited: a message may carry a raw 0x00, and a C-string read would cut the prompt there.
-    var len: usize = 0;
-    const ptr = jinja_c.jinja_render_chat(tmpl_z.ptr, msgs_z.ptr, if (tools_z) |tz| tz.ptr else null, extra_z.ptr, @intFromBool(add_generation_prompt), &len);
-    const rendered: ?[]u8 = if (ptr) |p| p[0..len] else null;
+/// Why a render failed: the engine's error and its diagnostic (for a raise, the template's own text).
+const EngineFailure = struct {
+    err: template_engine.Error = error.TemplateRuntime,
+    diag: template_engine.Diagnostic = .{},
+
+    /// `line L column C: message`, or the message alone when it has no place in the template.
+    fn describe(self: *const EngineFailure, buf: []u8) []const u8 {
+        if (self.diag.line == 0) return std.fmt.bufPrint(buf, "{s}", .{self.diag.message()}) catch self.diag.message();
+        return std.fmt.bufPrint(buf, "line {d} column {d}: {s}", .{ self.diag.line, self.diag.column, self.diag.message() }) catch self.diag.message();
+    }
+};
+
+/// The only call into the template engine: the render, owned by `allocator`, or null with why in `failure`.
+fn renderEngine(allocator: std.mem.Allocator, tmpl: []const u8, msgs: []const u8, tools: ?[]const u8, extra: []const u8, add_generation_prompt: bool, failure: *EngineFailure) error{OutOfMemory}!?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var usage: template_engine.Usage = .{};
+    const in: template_engine.Input = .{ .template = tmpl, .messages_json = msgs, .tools_json = tools, .extra_json = extra, .add_generation_prompt = add_generation_prompt, .usage = if (builtin.is_test) &usage else null };
+    const rendered: ?[]u8 = if (template_engine.renderJson(arena.allocator(), in, &failure.diag)) |out| try allocator.dupe(u8, out) else |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => blk: {
+            failure.err = e;
+            break :blk null;
+        },
+    };
     if (builtin.is_test) if (engine_spy) |spy| spy.see(spy.ctx, .{
-        .template = tmpl_z,
-        .messages = msgs_z,
-        .tools = tools_z,
-        .extra = extra_z,
+        .template = tmpl,
+        .messages = msgs,
+        .tools = tools,
+        .extra = extra,
         .add_generation_prompt = add_generation_prompt,
         .rendered = rendered,
+        .usage = usage,
     });
     return rendered;
 }
@@ -1364,7 +1360,11 @@ const SpecialEntry = struct {
 };
 
 /// What Qwen's template raises for a conversation with no user turn to answer (a system-only or assistant-only chat).
-const NO_USER_QUERY_RAISE = "No user query found";
+const NO_USER_QUERY_RAISE = "No user query found in messages.";
+comptime {
+    // Matched whole against the diagnostic, which keeps the first `buf.len` bytes of a raise.
+    std.debug.assert(NO_USER_QUERY_RAISE.len <= @typeInfo(@FieldType(template_engine.Diagnostic, "buf")).array.len);
+}
 
 threadlocal var template_refusal_buf: [160]u8 = undefined;
 threadlocal var template_refusal_len: usize = 0;
@@ -2983,23 +2983,25 @@ test "an effort word with a quote or a backslash reaches the word-dialect templa
 test "jinja: a number after a dot subscripts, as in Jinja2" {
     const tpl = "{{ x.0.y }}|{{ x.1.0 }}|{{ x.1.1 }}|{{ s.0 }}|{{ x[1].0 }}|{{ x.1.0 + 0.5 }}|{{ 'no' if x.5 is not defined else 'yes' }}|{{ 1.5 }}";
     const extra = "{\"x\":[{\"y\":\"a\"},[7,8]],\"s\":\"hey\"}";
-    var len: usize = 0;
-    const ptr = jinja_c.jinja_render_chat(tpl, "[]", null, extra, 0, &len) orelse {
-        std.debug.print("\njinja error: {s}\n", .{std.mem.span(jinja_c.jinja_last_error().?)});
-        return error.RenderFailed;
-    };
-    defer jinja_c.jinja_str_free(ptr);
-    try testing.expectEqualStrings("a|7|8|h|7|7.5|no|1.5", ptr[0..len]);
+    const out = try renderRawForTest(testing.allocator, tpl, "[]", null, extra, false);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a|7|8|h|7|7.5|no|1.5", out);
 }
 
-fn renderJinjaRaw(tpl: [:0]const u8, messages: [:0]const u8, expect: []const u8) !void {
-    var len: usize = 0;
-    const ptr = jinja_c.jinja_render_chat(tpl, messages, null, null, 0, &len) orelse {
-        std.debug.print("\njinja error: {s}\n", .{std.mem.span(jinja_c.jinja_last_error().?)});
+/// `tpl` rendered by the served engine over raw JSON inputs; the caller frees the render.
+fn renderRawForTest(a: std.mem.Allocator, tpl: []const u8, messages: []const u8, tools: ?[]const u8, extra: []const u8, add_generation_prompt: bool) ![]u8 {
+    var failure: EngineFailure = .{};
+    return try renderEngine(a, tpl, messages, tools, extra, add_generation_prompt, &failure) orelse {
+        var buf: [1200]u8 = undefined;
+        std.debug.print("\ntemplate error: {s}\n", .{failure.describe(&buf)});
         return error.RenderFailed;
     };
-    defer jinja_c.jinja_str_free(ptr);
-    try testing.expectEqualStrings(expect, ptr[0..len]);
+}
+
+fn renderJinjaRaw(tpl: []const u8, messages: []const u8, expect: []const u8) !void {
+    const out = try renderRawForTest(testing.allocator, tpl, messages, null, "{}", false);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(expect, out);
 }
 
 test "jinja: a set in a loop body ends with its iteration, as in Jinja2" {
@@ -3037,6 +3039,21 @@ test "a template that raises or is missing is refused unless the model ends turn
         defer testing.allocator.free(rendered);
         try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n"));
     }
+}
+
+test "renderChatTemplate: a replayed call's numbers reach the prompt as Python's json.dumps writes them" {
+    var config = ChatConfig{
+        .chat_template = "{% for m in messages %}{% if m.role == 'tool' %}{{ m.content }}{% endif %}{% if m.tool_calls %}{% for c in m.tool_calls %}{{ c.function.arguments|tojson }}{% endfor %}{% endif %}{% endfor %}",
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = testing.allocator,
+    };
+    const call = [_]ToolCall{.{ .id = "c1", .name = "f", .arguments = "{\"one\":1.0,\"pi\":3.141592653589793,\"big\":18446744073709551616,\"tiny\":1e-05}" }};
+    const msgs = [_]Message{ .{ .role = "user", .content = "q" }, .{ .role = "assistant", .content = "", .tool_calls = &call } };
+    const rendered = try renderChatTemplate(testing.allocator, &msgs, &config, null, null, true, null, false);
+    defer testing.allocator.free(rendered);
+    try testing.expectEqualStrings("{\"one\": 1.0, \"pi\": 3.141592653589793, \"big\": 18446744073709551616, \"tiny\": 1e-05}", rendered);
 }
 
 test "a template that raises counts one generic fallback" {
@@ -3115,23 +3132,18 @@ test "chat: V4.1 renders images as the release's encoder does, an atom for each 
         },
     };
     var cfg = ChatConfig{ .chat_template = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = (arch_chat.pinOf("deepseek_v41") orelse return).image_placeholder };
-    const tpl_z = try a.dupeSentinel(u8, cfg.chat_template, 0);
-    defer a.free(tpl_z);
     for (cases) |c| for ([_]struct { mode: []const u8, want: []const u8 }{ .{ .mode = "chat", .want = c.chat }, .{ .mode = "thinking", .want = c.thinking } }) |arm| {
         const json = try serializeMessagesJsonFor(a, c.msgs, &cfg);
         defer a.free(json);
-        const json_z = try a.dupeSentinel(u8, json, 0);
-        defer a.free(json_z);
-        const extra = try std.fmt.allocPrintSentinel(a, "{{\"thinking_mode\":\"{s}\",\"reasoning_effort\":\"high\"}}", .{arm.mode}, 0);
+        const extra = try std.fmt.allocPrint(a, "{{\"thinking_mode\":\"{s}\",\"reasoning_effort\":\"high\"}}", .{arm.mode});
         defer a.free(extra);
-        var len: usize = 0;
-        const ptr = jinja_c.jinja_render_chat(tpl_z.ptr, json_z.ptr, null, extra.ptr, 1, &len) orelse return error.RenderFailed;
-        defer jinja_c.jinja_str_free(ptr);
-        try testing.expectEqualStrings(arm.want, ptr[0..len]);
+        const out = try renderRawForTest(a, cfg.chat_template, json, null, extra, true);
+        defer a.free(out);
+        try testing.expectEqualStrings(arm.want, out);
     };
 }
 
-test "chat: the embedded V4.1 template renders through jinja.cpp byte-exact with DeepSeek's encoder" {
+test "chat: the embedded V4.1 template renders through the template engine byte-exact with DeepSeek's encoder" {
     const a = testing.allocator;
     const tpl = @embedFile("fixtures/dsv41_chat_template.jinja");
     const parsed = try std.json.parseFromSlice(std.json.Value, a, @embedFile("fixtures/dsv41_template_cases.json"), .{});
@@ -3146,21 +3158,12 @@ test "chat: the embedded V4.1 template renders through jinja.cpp byte-exact with
         defer a.free(effort);
         const extra = try std.fmt.allocPrint(a, "{{\"thinking_mode\":\"{s}\",\"reasoning_effort\":{s}}}", .{ o.get("thinking_mode").?.string, effort });
         defer a.free(extra);
-        const tpl_z = try a.dupeSentinel(u8, tpl, 0);
-        defer a.free(tpl_z);
-        const msgs_z = try a.dupeSentinel(u8, msgs, 0);
-        defer a.free(msgs_z);
-        const extra_z = try a.dupeSentinel(u8, extra, 0);
-        defer a.free(extra_z);
-        const tools_z = if (tools) |t| try a.dupeSentinel(u8, t, 0) else null;
-        defer if (tools_z) |t| a.free(t);
-        var len: usize = 0;
-        const ptr = jinja_c.jinja_render_chat(tpl_z.ptr, msgs_z.ptr, if (tools_z) |t| t.ptr else null, extra_z.ptr, 1, &len) orelse {
-            std.debug.print("{s}: {s}\n", .{ o.get("label").?.string, if (jinja_c.jinja_last_error()) |e| std.mem.span(e) else "render failed" });
-            return error.RenderFailed;
+        const out = renderRawForTest(a, tpl, msgs, tools, extra, true) catch |e| {
+            std.debug.print("case: {s}\n", .{o.get("label").?.string});
+            return e;
         };
-        defer jinja_c.jinja_str_free(ptr);
-        testing.expectEqualStrings(o.get("expected").?.string, ptr[0..len]) catch |e| {
+        defer a.free(out);
+        testing.expectEqualStrings(o.get("expected").?.string, out) catch |e| {
             std.debug.print("case: {s}\n", .{o.get("label").?.string});
             return e;
         };
@@ -3174,6 +3177,126 @@ test "chat: the V4.1 effort words map onto the encoder's 1-100 ladder, medium at
     try testing.expectEqualStrings("\"high\"", scaleEffortFor("high"));
     try testing.expectEqualStrings("87", scaleEffortFor("xhigh"));
     try testing.expectEqualStrings("\"max\"", scaleEffortFor("max"));
+}
+
+test "renderChatTemplate: the largest served conversation renders on every served template within a quarter of each limit" {
+    // About 8 MB of messages over 4,000 turns, as a 1M-token context holds: the engine's limits must refuse
+    // hostile templates, never an honest prompt this size.
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const turns = 4000;
+    var msgs = std.ArrayList(Message).empty;
+    const rep = struct {
+        fn f(al: std.mem.Allocator, unit: []const u8, n: usize) ![]const u8 {
+            const out = try al.alloc(u8, unit.len * n);
+            for (0..n) |k| @memcpy(out[k * unit.len ..][0..unit.len], unit);
+            return out;
+        }
+    }.f;
+    const ask = try rep(arena, "The numbers moved again, and I want the reason. ", 15);
+    const plan = try rep(arena, "I should read the file first, then compare. ", 12);
+    const says = try rep(arena, "The figures differ in the second table. ", 8);
+    const rows = try rep(arena, "| a | b | c |\n", 6);
+    try msgs.append(arena, .{ .role = "system", .content = try rep(arena, "You are a careful assistant. ", 40) });
+    var text_bytes: usize = 0;
+    for (0..turns) |i| {
+        const user = try std.fmt.allocPrint(arena, "Turn {d}: please look at the report and tell me what changed. {s}", .{ i, ask });
+        const thought = try std.fmt.allocPrint(arena, "Turn {d}: the user wants the change explained. {s}", .{ i, plan });
+        const answer = try std.fmt.allocPrint(arena, "Reading the report for turn {d}. {s}", .{ i, says });
+        const call_id = try std.fmt.allocPrint(arena, "call_{d}", .{i});
+        const calls = try arena.alloc(ToolCall, 1);
+        calls[0] = .{ .id = call_id, .name = "read_file", .arguments = try std.fmt.allocPrint(arena, "{{\"path\": \"reports/turn_{d}.md\", \"range\": {{\"start\": {d}, \"end\": {d}}}, \"follow\": [\"tables\", \"notes\"]}}", .{ i, i, i + 40 }) };
+        const result = try std.fmt.allocPrint(arena, "reports/turn_{d}.md: {s}", .{ i, rows });
+        try msgs.append(arena, .{ .role = "user", .content = user });
+        try msgs.append(arena, .{ .role = "assistant", .content = answer, .reasoning_content = thought, .tool_calls = calls });
+        try msgs.append(arena, .{ .role = "tool", .content = result, .tool_call_id = call_id });
+        text_bytes += user.len + thought.len + answer.len + calls[0].arguments.len + result.len;
+    }
+    try testing.expect(text_bytes > 7_000_000);
+    const tools =
+        \\[{"type": "function", "function": {"name": "read_file", "description": "Read a file of the workspace.",
+        \\  "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "range": {"type": "object",
+        \\  "properties": {"start": {"type": "integer"}, "end": {"type": "integer"}}}, "follow": {"type": "array",
+        \\  "items": {"type": "string", "enum": ["tables", "notes", "links"]}}}, "required": ["path"]}}},
+        \\ {"type": "function", "function": {"name": "search", "description": "Search the workspace.",
+        \\  "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}]
+    ;
+    const Seen = struct {
+        worst: template_engine.Usage = .{},
+        calls: usize = 0,
+        failed: usize = 0,
+        fn see(ctx: *anyopaque, call: EngineCall) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (call.rendered == null) self.failed += 1;
+            self.worst.steps = @max(self.worst.steps, call.usage.steps);
+            self.worst.memory = @max(self.worst.memory, call.usage.memory);
+            self.worst.largest_string = @max(self.worst.largest_string, call.usage.largest_string);
+        }
+    };
+    const qwen = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
+    // The late-system form exists while the Qwen arch is built.
+    const qwen_late = try arch_chat.lateSystemTemplate(a, qwen);
+    defer if (qwen_late) |t| a.free(t);
+    const templates = [_]?[]const u8{ qwen, qwen_late, @embedFile("fixtures/glm53_chat_template.jinja"), @embedFile("fixtures/dsv41_chat_template.jinja"), @embedFile("fixtures/mimo_v26_chat_template.jinja") };
+    const limits = template_engine.Limits{};
+    for (templates) |maybe| {
+        const tpl = maybe orelse continue;
+        var seen = Seen{};
+        engine_spy = .{ .ctx = &seen, .see = Seen.see };
+        defer engine_spy = null;
+        var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        const out = try renderChatTemplate(a, msgs.items, &config, tools, null, true, null, false);
+        defer a.free(out);
+        try testing.expect(out.len > text_bytes / 2);
+        try testing.expect(seen.calls > 0);
+        try testing.expectEqual(@as(usize, 0), seen.failed);
+        try testing.expect(seen.worst.steps < limits.max_steps / 4);
+        try testing.expect(seen.worst.memory < limits.max_memory / 4);
+        try testing.expect(seen.worst.largest_string < limits.max_string / 4);
+    }
+}
+
+test "renderChatTemplate: a tool schema nested 120 levels under $defs renders on every served template" {
+    // Honest schemas nest a few dozen levels; each level is two JSON levels, well inside the engine's 512.
+    const a = testing.allocator;
+    var schema = std.ArrayList(u8).empty;
+    defer schema.deinit(a);
+    const levels = 120;
+    try schema.appendSlice(a, "[{\"type\": \"function\", \"function\": {\"name\": \"plan\", \"description\": \"Plan.\", \"parameters\": {\"type\": \"object\", \"$defs\": {\"Node\": ");
+    for (0..levels) |k| try schema.print(a, "{{\"type\": \"object\", \"properties\": {{\"level{d}\": ", .{k});
+    try schema.appendSlice(a, "{\"type\": \"string\"}");
+    for (0..levels) |_| try schema.appendSlice(a, "}}");
+    try schema.appendSlice(a, "}, \"properties\": {\"root\": {\"$ref\": \"#/$defs/Node\"}}}}}]");
+    const qwen = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
+    const templates = [_][]const u8{ qwen, @embedFile("fixtures/glm53_chat_template.jinja"), @embedFile("fixtures/dsv41_chat_template.jinja"), @embedFile("fixtures/mimo_v26_chat_template.jinja") };
+    const msgs = [_]Message{.{ .role = "user", .content = "Plan it." }};
+    for (templates) |tpl| {
+        var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|endoftext|>", .add_bos_token = false, .allocator = a };
+        const out = try renderChatTemplate(a, &msgs, &config, schema.items, null, true, null, false);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "level119") != null);
+    }
+}
+
+test "renderChatTemplate: a continuation the template drops follows the generation prompt" {
+    // The search for the partial in the rendered history is template.lastIndexOf, linear in the history (its
+    // own test pins the bytes it reads); this pins what a miss renders.
+    const a = testing.allocator;
+    const m = 50_000;
+    const hist = try a.alloc(u8, 2 * m);
+    defer a.free(hist);
+    @memset(hist, 'a');
+    const partial = try std.mem.concat(a, u8, &.{ hist[0..m], "<think>z</think>x" });
+    defer a.free(partial);
+    const msgs = [_]Message{ .{ .role = "user", .content = hist }, .{ .role = "assistant", .content = partial } };
+    var config = ChatConfig{ .chat_template = @embedFile("fixtures/glm53_chat_template.jinja"), .bos_token = null, .eos_token = "<|endoftext|>", .add_bos_token = false, .allocator = a };
+    const out = try renderChatTemplate(a, &msgs, &config, null, null, true, null, true);
+    defer a.free(out);
+    try testing.expect(std.mem.endsWith(u8, out, partial));
+    try testing.expectEqual(@as(?usize, out.len - partial.len), try template_engine.lastIndexOf(a, out, partial));
 }
 
 /// One turn of a hybrid-state arch replayed the way a client does (the pack's own template and tokenizer): the

@@ -62,7 +62,7 @@ applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the che
 bf16 slab kernels hold parity at the Qwen3.8-Flash-Next expert geometry
 capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS_DIR): the layer-streamed capture of a real four-layer slice reproduces the full forward's hidden boundaries, MLP input rows, routing and Hessians
 characterization: a sidecar boot's width-trial SCHEDULE re-reads its period like qwen4
-chat: the embedded V4.1 template renders through jinja.cpp byte-exact with DeepSeek's encoder
+chat: the embedded V4.1 template renders through the template engine byte-exact with DeepSeek's encoder
 deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one line naming the keys set
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line
 deepseek_v41 thinks by default, at its native high effort

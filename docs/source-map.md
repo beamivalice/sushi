@@ -10,6 +10,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `help.zig` / `arch/flags.zig` / `arch/packs.zig` / `arch/serve.zig` / `<arch>/<arch>_flags.zig` | `--help` assembled from the enabled archs; their flags, subcommands, launch refusals and serve hooks; the pack alias table | engine-arch-seam |
 | `server.zig` / `responses.zig` / `ws.zig` / `stop_sequences.zig` / `http_conn` / `request_policy` / `request_media` / `models_api` / `logprobs` / `generation_stream` / `anthropic` / `completions` / `responses_api` | all HTTP: `/v1/*`, `/metrics`, WS, `--api-key`, Responses store | server-http-apis |
 | `chat.zig` / `think_tags` / `tool_calls` / `tool_schema` | chat templates, thinking tags, tool-call parse/repair/coercion | server-tool-calling |
+| `template/` | the chat-template engine: Jinja2 in Zig (`lexer`, `parser`, `ast`, `value`, `render`, `builtins`, `tojson`), `template.renderJson` its entry | server-tool-calling |
 | `arch/chat.zig` / `<arch>/<arch>_chat.zig` | each arch's MLX-free chat face: effort table, pinned template and image atom, pre-tokenizer; the host tier reads them through `registry.Chat` | engine-arch-seam |
 | `reasoning_protocol.zig` / `json_schema.zig` / `json_grammar.zig` / `token_mask.zig` / `regex.zig` | constrained decoding | server-http-apis |
 | `launch.zig` | `sushi launch <agent>` | server-http-apis |

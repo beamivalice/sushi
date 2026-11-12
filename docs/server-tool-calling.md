@@ -36,33 +36,61 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   maps the client's effort word per template dialect (scale: `thinking_mode`, a 1-100 ladder; ladder: the literal
   `'xhigh'`, xhigh|medium|low; word: `effective_reasoning_effort` with `[gMASK]<sop>`, the word as sent; any other gets
   high/no_think). An arch brings only what a template cannot say: a template it pins when the checkpoint's cannot be
-  parsed by jinja.cpp (`pin` in its `<arch>_chat.zig`, read by `loadChatConfig` from the model type in `config.json`;
+  parsed by the engine (`pin` in its `<arch>_chat.zig`, read by `loadChatConfig` from the model type in `config.json`;
   DeepSeek-V4.1's, with its image atom), and a pre-tokenizer spelling (`pretokenizer`, read by the tokenizer). See
   [engine-arch-seam](engine-arch-seam.md).
 
-- **Control bytes**: ONE raw byte <0x20 in history kills the strict render → `fallbackFormatChat` on a `<|im_end|>` model
-  (ChatML, the stop token kept), a named 500 `chat template unusable: <jinja error>` on any other. Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first. A
-  NUL byte truncated the rendered prompt (`jinja_render_chat` returns its LENGTH; tell: the same `prompt=` count on
-  consecutive turns).
-- **A parse or runtime gap in jinja.cpp is the same silent downgrade**: GLM-5.3's `m.content.0.output` (a number after
-  a dot) failed to parse on EVERY tool message, so each agent turn after a tool result ran in the untrained generic
-  format and broke prefix reuse. Fixed in `lib/jinja_cpp` (`x.0` is `x[0]`; `x.1.0` is two subscripts, never a float);
-  the pack template is a committed fixture. Only a model whose turns end in `<|im_end|>` (Qwen, MiMo) has a fallback
+- **The engine is `src/template/`, a Jinja2 renderer in Zig held to Python Jinja2**: `formatChat` calls it once per
+  render through `chat.renderEngine` (`template.renderJson`: the template text and the JSON of messages, tools and the
+  extra context in; the prompt, or `TemplateSyntax`, `TemplateRaised`, `TemplateRuntime` with line, column and message
+  out). It reads what jinja.cpp read (the filters, tests, methods, globals and loop fields of
+  `src/template/builtins.zig`, `jinja_cpp_only` names with jinja.cpp's result); any other filter, test or statement
+  (`include`, `extends`, `raw`, `recursive`, `**`, `//`) is a `TemplateSyntax` naming it, and a template leaning on a
+  jinja.cpp leniency (a list mutator but `append`, `|length` of a `map` result) fails at render, both with the failed
+  render's handling below. Limits, each a `TemplateRuntime` by name: 200 levels of nesting (a link of `a + b + c` or
+  `x|f|g` counts), 100 macro calls deep, 20M steps, a 256 MiB string, 1 GiB of render memory, a `range` of 100000.
+  Every fn there opens with `@setRuntimeSafety(true)` (lint `template-runtime-safety`): template text comes from packs.
+  Work is metered by what it touches (a comparison or a search by its bytes), and searches and sorts are linear or
+  n log n whatever the text: `value.Finder` (KMP), `value.stableSort`, which a NaN key fails by name (lint
+  `template-superlinear-std`). The continuation search in `chat.zig` uses the same finder. A loop over `range(...)` is
+  lazy and a loop pays per item walked, as Python's: GLM-5.3 scans `range(i, messages|length)` per tool block and
+  breaks at once. The limits hold a 4,000-turn, 7.7 MB conversation on every served template under a quarter of each
+  (test "the largest served conversation"); a raise longer than the 1 KiB Diagnostic is cut at a character and never
+  matches a known raise (`Diagnostic.messageIs`).
+  One render of a tool-calling conversation, the same bytes from both engines (the engine as landed on `54e1aef3`,
+  ReleaseFast test binary, M5 Max, best of three, the four served templates): 400 turns (0.8 MB) 2.2 to 3.8 ms where
+  jinja.cpp took 90 to 597 ms; 4,000 turns (8.1 MB) 21 to 36 ms where jinja.cpp took 6.4 to 51 s (GLM-5.3 the slowest).
+  Known approximations, each pinned in `src/template_oracle_test.zig`: case mapping is ASCII-only, `wordcount`'s `\w`
+  and `repr`'s isprintable past ASCII, `sameas` as identity of the engine's values, integers past 64 bits printed
+  exactly but never computed with (`TemplateRuntime`).
+- **Numbers print as Python prints them**: `tojson` and `{{ }}` write an integer exactly at any size and a float as
+  Python's shortest repr (`1.0`, `1e-05`, `3.141592653589793`); jinja.cpp wrote `%g` (`1`, `3.14159`, 2^64 as
+  `1.84467e+19`), so a replayed call's arguments carried other bytes than the client sent.
+- **Control bytes**: ONE raw byte <0x20 in history killed jinja.cpp's strict render → `fallbackFormatChat` on a
+  `<|im_end|>` model (ChatML, the stop token kept), a named 500 `chat template unusable: <reason>` on any other.
+  Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first. A NUL byte once
+  truncated the rendered prompt (tell: the same `prompt=` count on consecutive turns); the engine returns a slice.
+- **A parse or runtime gap in the engine is the same silent downgrade**: GLM-5.3's `m.content.0.output` (a number after
+  a dot) failed to parse in jinja.cpp on EVERY tool message, so each agent turn after a tool result ran in the
+  untrained generic format and broke prefix reuse (`x.0` is `x[0]`; `x.1.0` is two subscripts, never a float); the
+  pack template is a committed fixture. Only a model whose turns end in `<|im_end|>` (Qwen, MiMo) has a fallback
   format, ChatML; GLM and DeepSeek answer a raise or a missing template with 500 `chat template unusable: <reason>` on
-  every generative surface, streamed or not. A fallback logs `jinja render failed (…)` at warn on every render and
+  every generative surface, streamed or not; the reason names the template's line and column. A fallback logs
+  `jinja render failed (…)` at warn on every render and
   counts into `/props.template_fallbacks`: nonzero on a model that ships a template means a broken prompt, so grep
   that line first. A new template ships its fixture and a no-fallback case in the `format corpus` tool-traffic test.
   Cross-check suspect templates against Python Jinja2 on the same JSON before blaming the model.
-- **The template oracle holds jinja.cpp to Python Jinja2**: `src/template_oracle_test.zig` captures every engine call
+- **The template oracle holds the engine to Python Jinja2**: `src/template_oracle_test.zig` captures every engine call
   `formatChat` makes (probes too) over a request corpus through the four served templates, as each pack serves them,
-  and compares jinja.cpp with `src/fixtures/template_oracle.json` (transformers' chat-template environment, written by
-  `tests/dump_template_oracle.py`). A difference is listed in the test with its reason; on a served prompt today's
-  bytes stand until the owner decides. A change to what formatChat hands the engine fails the corpus test until the
-  fixture is regenerated (`SUSHI_TEMPLATE_ORACLE_DUMP`, then the dumper's `render`).
-- **jinja.cpp prints numbers its own way**: `tojson` writes a float with `%g` (six significant digits, `1.0` as `1`),
-  an integer past 2^64-1 as such a float and 2^64-1 as -1; Python prints both exactly. Listed in the oracle.
-- **A loop iteration is its own scope in jinja.cpp, as in Jinja2**: a body `set` (GLM-5.3's per-message `reasoning_content`)
-  neither reaches the next iteration nor leaves the loop; only a `namespace` carries state across. One shared scope
+  and requires the Zig engine to give `src/fixtures/template_oracle.json` on every case (transformers' chat-template
+  environment, written by `tests/dump_template_oracle.py`); jinja.cpp, linked into the test builds only, keeps its
+  listed differences. A change to what formatChat hands the engine fails the corpus test until the fixture is
+  regenerated (`SUSHI_TEMPLATE_ORACLE_DUMP`, then the dumper's `render`). The builtin table
+  (`src/fixtures/template_builtins.json`, the dumper's `builtins`) holds one case or more per name the engine serves;
+  a name without one fails by name.
+- **A loop iteration is its own scope, as in Jinja2**: a body `set` (GLM-5.3's per-message `reasoning_content`)
+  neither reaches the next iteration nor leaves the loop (nor does one in the loop's `else`); only a `namespace`
+  carries state across. One shared scope
   rendered an earlier turn's thought into a reasoning-less assistant turn instead of `<think></think>`.
 - **A `chat_template` value can be a POINTER** (`{% include 'chat_template.jinja' %}`): `chat.isIncludeStub` reads it
   as "no inline template" so the sidecar loads. Grep the log for `jinja` first.

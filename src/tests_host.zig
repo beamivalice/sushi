@@ -23,6 +23,14 @@ test {
     _ = @import("think_tags.zig");
     _ = @import("format_corpus_test.zig");
     _ = @import("template_oracle_test.zig");
+    _ = @import("template/template.zig");
+    _ = @import("template/lexer.zig");
+    _ = @import("template/parser.zig");
+    _ = @import("template/value.zig");
+    _ = @import("template/tojson.zig");
+    _ = @import("template/builtins.zig");
+    _ = @import("template/render.zig");
+    _ = @import("template/ast.zig");
     _ = @import("tool_traffic_replay_test.zig");
     _ = @import("tokenize_cache.zig");
     _ = @import("round_cost.zig");

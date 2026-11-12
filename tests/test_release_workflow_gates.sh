@@ -163,7 +163,7 @@ for tag, ok in (("1.0.0", True), ("1.0.0-pre-release.2", True), ("26.9.1", False
           f"a pushed tag v{tag} is {'accepted' if ok else 'refused'} for 1.0.0")
 
 # ── Third-party attribution must travel WITH the binary. The shipped binary
-# links Apache-2.0 code (MTPLX/dflash/oMLX Metal kernels, jinja.cpp), and
+# links Apache-2.0 code (MTPLX/dflash/oMLX Metal kernels, a port of jinja.cpp), and
 # section 4 conditions redistribution on the recipient getting the license text
 # and the NOTICE attributions. Nothing pinned that those files leave the repo,
 # and for months they did not: the packaging path shipped the binary alone.

@@ -277,9 +277,13 @@ https://github.com/wangzhaode/jinja.cpp
 Copyright 2025 Wang Zhaode
 Licensed under the Apache License, Version 2.0.
 
-Vendored under `lib/jinja_cpp/`, compiled to `libjinja.a` and linked into the
-sushi binary. It renders the chat templates that ship inside model
-directories.
+The chat-template engine in `src/template/` (Zig) ports jinja.cpp's behaviour
+and builtin set: the filters, tests, methods and globals it serves, and the
+names only jinja.cpp has (the `strip` filter, `str.indent`, `list.append`),
+with jinja.cpp's result. jinja.cpp itself stays vendored under `lib/jinja_cpp/`,
+compiled to `libjinja.a` and linked into the test builds only, as the
+differential oracle the engine is checked against; the sushi binary does not
+link it.
 
 Modifications by mlx-serve: `value.cpp` and `value.h` were changed to add
 `tojson(sort_keys=..., separators=...)`, which some chat templates require.
@@ -581,8 +585,8 @@ nlohmann/json
 https://github.com/nlohmann/json
 SPDX-FileCopyrightText: 2013-2023 Niels Lohmann
 
-Vendored under `lib/jinja_cpp/nlohmann/` as a dependency of jinja.cpp.
-Unmodified.
+Vendored under `lib/jinja_cpp/nlohmann/` as a dependency of jinja.cpp, and
+compiled with it into the test builds only. Unmodified.
 
 --------------------------------------------------------------------------------
 mlxfast-challenge

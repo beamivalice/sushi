@@ -11,6 +11,7 @@
 const std = @import("std");
 const testing = std.testing;
 const jinja_c = @import("jinja_c");
+const zig_template = @import("template/template.zig");
 const chat = @import("chat.zig");
 const arch_chat = @import("arch/chat.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -730,4 +731,156 @@ test "template oracle: jinja.cpp renders the corpus as Python Jinja2 does, excep
     if (unlisted > 0) std.debug.print("\n{d} unlisted differences\n", .{unlisted});
     try testing.expectEqual(@as(usize, 0), unlisted);
     try testing.expectEqual(@as(usize, 0), stale);
+}
+
+test "template oracle: the Zig engine renders the corpus as Python Jinja2 does, on every case" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const oracle = try std.json.parseFromSliceLeaky(Oracle, arena, oracle_json, .{});
+    try testing.expect(oracle.cases.len > 0);
+
+    var failed: usize = 0;
+    for (oracle.cases) |c| {
+        var case_arena = std.heap.ArenaAllocator.init(a);
+        defer case_arena.deinit();
+        var diag = zig_template.Diagnostic{};
+        const got = zig_template.renderJson(case_arena.allocator(), .{
+            .template = oracle.templates.map.get(c.template).?,
+            .messages_json = c.messages,
+            .tools_json = c.tools,
+            .extra_json = c.extra,
+            .add_generation_prompt = c.add_generation_prompt,
+        }, &diag);
+        const same = if (got) |text|
+            c.python != null and std.mem.eql(u8, text, c.python.?)
+        else |e| e == error.TemplateRaised and c.python_error != null and
+            std.mem.eql(u8, c.python_error.?, try std.fmt.allocPrint(case_arena.allocator(), "TemplateError: {s}", .{diag.message()}));
+        if (same) continue;
+        failed += 1;
+        if (failed > 5) continue;
+        if (got) |text| {
+            const want = c.python orelse "";
+            const at = std.mem.indexOfDiff(u8, text, want) orelse 0;
+            const from = at -| 60;
+            std.debug.print("\n[{s}] {s}\n  zig    at {d}: {s}\n  python at {d}: {s} {?s}\n", .{
+                c.id,                            c.label,
+                at,                              text[from..@min(text.len, at + 120)],
+                at,                              want[@min(want.len, from)..@min(want.len, at + 120)],
+                c.python_error,
+            });
+        } else |e| std.debug.print("\n[{s}] {s}\n  zig: {s} at {d}:{d}: {s}\n  python: {?s}\n", .{ c.id, c.label, @errorName(e), diag.line, diag.column, diag.message(), c.python_error });
+    }
+    if (failed > 0) std.debug.print("\n{d} of {d} cases differ\n", .{ failed, oracle.cases.len });
+    try testing.expectEqual(@as(usize, 0), failed);
+}
+
+const BuiltinCase = struct {
+    covers: []const u8,
+    label: []const u8,
+    template: []const u8,
+    extra: []const u8,
+    python: ?[]const u8,
+    python_error: ?[]const u8,
+};
+
+/// Names Python's sandbox refuses and jinja.cpp serves: the engine gives jinja.cpp's result.
+const jinja_cpp_only = [_][]const u8{ "filter strip", "method indent", "method append" };
+
+/// A builtin case whose Zig render is not Python's, and why. Every listed case must still differ.
+const builtin_differences = [_]struct { label: []const u8, why: []const u8 }{
+    .{ .label = "filter lower #2", .why = "case mapping is ASCII-only, as jinja.cpp's" },
+    .{ .label = "filter upper #2", .why = "case mapping is ASCII-only, as jinja.cpp's" },
+    .{ .label = "filter wordcount #3", .why = "`\\w` past ASCII is approximated: symbols such as an arrow count as word characters, and Latin-1 numerics such as one half do not" },
+    .{ .label = "filter string #2", .why = "repr's isprintable is approximated: an unassigned code point prints as itself, not as a \\u escape" },
+    .{ .label = "operator + #2", .why = "arithmetic on an integer past 64 bits is a TemplateRuntime error, never a wrong number" },
+    .{ .label = "filter int #2", .why = "an integer past 64 bits from int() is a TemplateRuntime error, never a wrong number" },
+    .{ .label = "filter sort #4", .why = "a NaN sort key fails by name: the order Python gives it depends on its sort algorithm" },
+    .{ .label = "operator slice #10", .why = "Jinja2 folds an all-literal slice at compile time through getitem, which makes one Python refuses undefined; the engine raises as Python does at run time" },
+    .{ .label = "operator slice #11", .why = "Jinja2 folds an all-literal slice at compile time through getitem, which makes one Python refuses undefined; the engine raises as Python does at run time" },
+    .{ .label = "method title #2", .why = "case mapping is ASCII-only: a non-ASCII letter does not join a word, so the letter after it starts one" },
+    .{ .label = "test sameas #2", .why = "`sameas` is identity of the engine's values: equal literals are not one object as CPython's interned constants are" },
+};
+
+fn requiredBuiltinNames(arena: std.mem.Allocator) ![]const []const u8 {
+    const builtins = @import("template/builtins.zig");
+    const value = @import("template/value.zig");
+    var names = std.ArrayList([]const u8).empty;
+    inline for (.{ .{ "filter", builtins.Filter }, .{ "test", builtins.Test }, .{ "method", value.Method }, .{ "global", value.Global } }) |kind| {
+        inline for (comptime std.meta.tags(kind[1])) |tag| try names.append(arena, kind[0] ++ " " ++ @tagName(tag));
+    }
+    for ([_][]const u8{ "index", "index0", "revindex", "revindex0", "first", "last", "length", "previtem", "nextitem" }) |f|
+        try names.append(arena, try std.fmt.allocPrint(arena, "loop {s}", .{f}));
+    for ([_][]const u8{ "in", "not in", "~", "==", "!=", "<", "<=", ">", ">=", "and", "or", "not", "+", "-", "*", "/", "%", "unary -", "unary +", "slice", "subscript", "if else", "literals" }) |o|
+        try names.append(arena, try std.fmt.allocPrint(arena, "operator {s}", .{o}));
+    for ([_][]const u8{ "if", "for", "break", "continue", "set", "set block", "macro", "call", "filter", "generation", "comment", "whitespace" }) |s|
+        try names.append(arena, try std.fmt.allocPrint(arena, "statement {s}", .{s}));
+    return names.items;
+}
+
+test "template builtins: every filter, test, method, global, loop field, operator and statement renders as Python Jinja2 does" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const doc = try std.json.parseFromSliceLeaky(struct { generator: []const u8, cases: []const BuiltinCase }, arena, @embedFile("fixtures/template_builtins.json"), .{});
+
+    var uncovered: usize = 0;
+    for (try requiredBuiltinNames(arena)) |name| {
+        const hit = for (doc.cases) |c| {
+            if (std.mem.eql(u8, c.covers, name)) break true;
+        } else false;
+        if (!hit) {
+            uncovered += 1;
+            std.debug.print("\nno builtin case covers '{s}': add one to tests/dump_template_oracle.py\n", .{name});
+        }
+    }
+
+    var failed: usize = 0;
+    var differ_seen: [builtin_differences.len]bool = @splat(false);
+    for (doc.cases) |c| {
+        var case_arena = std.heap.ArenaAllocator.init(a);
+        defer case_arena.deinit();
+        const ca = case_arena.allocator();
+        var diag = zig_template.Diagnostic{};
+        const got = zig_template.renderJson(ca, .{ .template = c.template, .messages_json = "[]", .tools_json = null, .extra_json = c.extra, .add_generation_prompt = false }, &diag);
+
+        const cpp_only = for (jinja_cpp_only) |n| {
+            if (std.mem.eql(u8, n, c.covers)) break true;
+        } else false;
+        var want: ?[]const u8 = c.python;
+        var cpp_out: ?[*]u8 = null;
+        defer if (cpp_out) |p| jinja_c.jinja_str_free(p);
+        if (cpp_only) {
+            var len: usize = 0;
+            cpp_out = jinja_c.jinja_render_chat((try ca.dupeSentinel(u8, c.template, 0)).ptr, "[]", null, (try ca.dupeSentinel(u8, c.extra, 0)).ptr, 0, &len);
+            want = if (cpp_out) |p| p[0..len] else null;
+        }
+        const same = if (got) |text| (want != null and std.mem.eql(u8, text, want.?)) else |e| blk: {
+            if (cpp_only or c.python_error == null) break :blk false;
+            const perr = c.python_error.?;
+            if (std.mem.startsWith(u8, perr, "TemplateError: "))
+                break :blk e == error.TemplateRaised and std.mem.eql(u8, perr["TemplateError: ".len..], diag.message());
+            const syntax = std.mem.startsWith(u8, perr, "TemplateSyntaxError") or std.mem.startsWith(u8, perr, "TemplateAssertionError");
+            break :blk e == if (syntax) error.TemplateSyntax else error.TemplateRuntime;
+        };
+        const listed = for (builtin_differences, 0..) |d, i| {
+            if (std.mem.eql(u8, d.label, c.label)) break i;
+        } else null;
+        if (listed) |i| {
+            differ_seen[i] = !same;
+            if (!same) continue;
+        } else if (same) continue;
+        failed += 1;
+        if (got) |text| {
+            std.debug.print("\n[{s}] {s}\n  zig:    {s}\n  expect: {?s} {?s}\n", .{ c.label, if (listed != null) "is listed as a difference and renders the same now" else "", text, want, if (cpp_only) "(jinja.cpp)" else c.python_error });
+        } else |e| std.debug.print("\n[{s}]\n  zig: {s} at {d}:{d}: {s}\n  expect: {?s} {?s}\n", .{ c.label, @errorName(e), diag.line, diag.column, diag.message(), want, c.python_error });
+    }
+    for (builtin_differences, differ_seen) |d, seen| if (!seen) {
+        std.debug.print("\nlisted builtin difference not found or renders the same: {s}\n", .{d.label});
+        failed += 1;
+    };
+    try testing.expectEqual(@as(usize, 0), uncovered);
+    try testing.expectEqual(@as(usize, 0), failed);
 }

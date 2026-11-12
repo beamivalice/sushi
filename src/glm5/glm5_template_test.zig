@@ -2,7 +2,7 @@
 const std = @import("std");
 const chat = @import("../chat.zig");
 const fixtures = @import("glm5_fixtures.zig");
-const jinja_c = @import("jinja_c");
+const template_engine = @import("../template/template.zig");
 const ChatConfig = chat.ChatConfig;
 const Message = chat.Message;
 const ToolCall = chat.ToolCall;
@@ -44,15 +44,20 @@ test "GLM-5.3 template renders a tool round-trip itself, never the generic fallb
 }
 
 /// Renders `messages_json` through GLM-5.3's own template; the text from the first user turn on.
-fn renderRaw(messages_json: [:0]const u8, tools_json: ?[:0]const u8, out: *std.ArrayList(u8)) !void {
-    const extra = "{\"enable_thinking\":true,\"reasoning_effort\":\"high\"}";
-    var len: usize = 0;
-    const ptr = jinja_c.jinja_render_chat(fixtures.template, messages_json, if (tools_json) |t| t.ptr else null, extra, 1, &len) orelse {
-        std.debug.print("\njinja error: {s}\n", .{std.mem.span(jinja_c.jinja_last_error().?)});
+fn renderRaw(messages_json: []const u8, tools_json: ?[]const u8, out: *std.ArrayList(u8)) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var diag = template_engine.Diagnostic{};
+    const text = template_engine.renderJson(arena.allocator(), .{
+        .template = fixtures.template,
+        .messages_json = messages_json,
+        .tools_json = tools_json,
+        .extra_json = "{\"enable_thinking\":true,\"reasoning_effort\":\"high\"}",
+        .add_generation_prompt = true,
+    }, &diag) catch |e| {
+        std.debug.print("\ntemplate error: {s} at {d}:{d}: {s}\n", .{ @errorName(e), diag.line, diag.column, diag.message() });
         return error.RenderFailed;
     };
-    defer jinja_c.jinja_str_free(ptr);
-    const text = ptr[0..len];
     try out.appendSlice(testing.allocator, text[std.mem.indexOf(u8, text, "<|user|>").?..]);
 }
 

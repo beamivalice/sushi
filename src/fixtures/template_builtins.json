@@ -1,0 +1,1853 @@
+{
+"generator": "tests/dump_template_oracle.py builtins: transformers 5.22.2 chat-template environment, jinja2 3.1.6, Python 3.14.7",
+"cases": [
+{
+"covers": "filter abs",
+"label": "filter abs #1",
+"template": "{{ -3|abs }} {{ (-2.5)|abs }} {{ n|abs }}",
+"extra": "{\"n\": -7}",
+"python": "3 2.5 7",
+"python_error": null
+},
+{
+"covers": "filter capitalize",
+"label": "filter capitalize #1",
+"template": "{{ 'hELLO wORLD'|capitalize }}|{{ ''|capitalize }}",
+"extra": "{}",
+"python": "Hello world|",
+"python_error": null
+},
+{
+"covers": "filter default",
+"label": "filter default #1",
+"template": "{{ missing|default('dflt') }} {{ ''|default('e', true) }} {{ ''|default('e') }} {{ none|default('n') }}",
+"extra": "{}",
+"python": "dflt e  None",
+"python_error": null
+},
+{
+"covers": "filter first",
+"label": "filter first #1",
+"template": "{{ [3, 1, 2]|first }} {{ 'abc'|first }} {{ d|first }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "3 a b",
+"python_error": null
+},
+{
+"covers": "filter first",
+"label": "filter first #2",
+"template": "{{ []|first }}|",
+"extra": "{}",
+"python": "|",
+"python_error": null
+},
+{
+"covers": "filter float",
+"label": "filter float #1",
+"template": "{{ '3.5'|float }} {{ 2|float }} {{ 'x'|float }} {{ 'x'|float(1.5) }} {{ ' 1e3 '|float }}",
+"extra": "{}",
+"python": "3.5 2.0 0.0 1.5 1000.0",
+"python_error": null
+},
+{
+"covers": "filter format",
+"label": "filter format #1",
+"template": "{{ '%s-%d-%r'|format('a', 5, 'q') }} {{ '%(k)s'|format(k='v') }} {{ '%.2f%%'|format(1.5) }}",
+"extra": "{}",
+"python": "a-5-'q' v 1.50%",
+"python_error": null
+},
+{
+"covers": "filter format",
+"label": "filter format #2",
+"template": "{{ '%.2f|%.0f|%f'|format(2.675, 0.5, 123456789.125) }}",
+"extra": "{}",
+"python": "2.67|0|123456789.125000",
+"python_error": null
+},
+{
+"covers": "filter format",
+"label": "filter format #3",
+"template": "{{ '<b>%s</b>'|safe|format('<') }} {{ '<%s>'|format('<') }}",
+"extra": "{}",
+"python": "<b>&lt;</b> <<>",
+"python_error": null
+},
+{
+"covers": "filter indent",
+"label": "filter indent #1",
+"template": "{{ 'a\\nb\\n\\nc'|indent }}|{{ 'a\\nb\\n\\nc'|indent(2, true, true) }}|{{ 'a\\nb'|indent('> ') }}",
+"extra": "{}",
+"python": "a\n    b\n\n    c|  a\n  b\n  \n  c|a\n> b",
+"python_error": null
+},
+{
+"covers": "filter int",
+"label": "filter int #1",
+"template": "{{ '42'|int }} {{ 3.9|int }} {{ 'x'|int }} {{ 'x'|int(7) }} {{ '0x1A'|int(base=16) }} {{ '2.5'|int }} {{ true|int }}",
+"extra": "{}",
+"python": "42 3 0 7 26 2 1",
+"python_error": null
+},
+{
+"covers": "filter int",
+"label": "filter int #2",
+"template": "{{ '99999999999999999999'|int }}",
+"extra": "{}",
+"python": "99999999999999999999",
+"python_error": null
+},
+{
+"covers": "filter int",
+"label": "filter int #3",
+"template": "{{ ' -0x1a '|int(0, 16) }} {{ '0b101'|int(base=0) }} {{ '0o17'|int(0, 8) }} {{ '1_000'|int }} {{ '_1'|int(5) }} {{ '1__0'|int(5) }} {{ '017'|int(5, 0) }} {{ 'z'|int(base=36) }}",
+"extra": "{}",
+"python": "-26 5 15 1000 5 5 17 35",
+"python_error": null
+},
+{
+"covers": "filter int",
+"label": "filter int #4",
+"template": "{{ 'inf'|int }} {{ 'nan'|int(7) }} {{ '-inf'|int }} {{ '1e400'|int }} {{ ' 1e3 '|int }} {{ 'infinity'|int(3) }}",
+"extra": "{}",
+"python": "0 7 0 0 1000 3",
+"python_error": null
+},
+{
+"covers": "filter int",
+"label": "filter int #5",
+"template": "{{ (big * 10 - big * 10)|int(5) }}",
+"extra": "{\"big\": 1e+308}",
+"python": "5",
+"python_error": null
+},
+{
+"covers": "filter int",
+"label": "filter int #6",
+"template": "{{ (big * 10)|int(5) }}",
+"extra": "{\"big\": 1e+308}",
+"python": null,
+"python_error": "OverflowError: cannot convert float infinity to integer"
+},
+{
+"covers": "filter items",
+"label": "filter items #1",
+"template": "{% for k, v in d|items %}{{ k }}={{ v }};{% endfor %}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "b=2;a=1;c=None;",
+"python_error": null
+},
+{
+"covers": "filter join",
+"label": "filter join #1",
+"template": "{{ [1, 'a', none]|join(', ') }} {{ people|join('/', attribute='name') }} {{ 'abc'|join('.') }}",
+"extra": "{\"people\": [{\"name\": \"bo\", \"age\": 31, \"tags\": [\"x\"]}, {\"name\": \"Al\", \"age\": 25, \"tags\": []}, {\"name\": \"cy\", \"age\": 31, \"tags\": [\"y\", \"z\"]}]}",
+"python": "1, a, None bo/Al/cy a.b.c",
+"python_error": null
+},
+{
+"covers": "filter last",
+"label": "filter last #1",
+"template": "{{ [3, 1, 2]|last }} {{ 'abc'|last }}",
+"extra": "{}",
+"python": "2 c",
+"python_error": null
+},
+{
+"covers": "filter length",
+"label": "filter length #1",
+"template": "{{ [1, 2]|length }} {{ 'héllo'|length }} {{ d|length }} {{ ''|length }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "2 5 3 0",
+"python_error": null
+},
+{
+"covers": "filter list",
+"label": "filter list #1",
+"template": "{{ 'ab'|list }} {{ d|list }} {{ (1, 2)|list }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "['a', 'b'] ['b', 'a', 'c'] [1, 2]",
+"python_error": null
+},
+{
+"covers": "filter lower",
+"label": "filter lower #1",
+"template": "{{ 'MiXeD Case'|lower }}",
+"extra": "{}",
+"python": "mixed case",
+"python_error": null
+},
+{
+"covers": "filter lower",
+"label": "filter lower #2",
+"template": "{{ 'ÉCOLE ÀÖ'|lower }}",
+"extra": "{}",
+"python": "école àö",
+"python_error": null
+},
+{
+"covers": "filter map",
+"label": "filter map #1",
+"template": "{{ people|map(attribute='name')|join(',') }} {{ ['a', 'b']|map('upper')|list }} {{ people|map(attribute='missing', default='-')|list }}",
+"extra": "{\"people\": [{\"name\": \"bo\", \"age\": 31, \"tags\": [\"x\"]}, {\"name\": \"Al\", \"age\": 25, \"tags\": []}, {\"name\": \"cy\", \"age\": 31, \"tags\": [\"y\", \"z\"]}]}",
+"python": "bo,Al,cy ['A', 'B'] ['-', '-', '-']",
+"python_error": null
+},
+{
+"covers": "filter map",
+"label": "filter map #2",
+"template": "{{ ['ab', 'c']|map('map', 'upper')|map('list')|list }} {{ ['a']|map('map', 'map', 'upper')|map('map', 'list')|map('list')|list }}",
+"extra": "{}",
+"python": "[['A', 'B'], ['C']] [[['A']]]",
+"python_error": null
+},
+{
+"covers": "filter max",
+"label": "filter max #1",
+"template": "{{ [3, 9, 2]|max }} {{ ['b', 'A', 'c']|max }} {{ ['b', 'A', 'c']|max(case_sensitive=true) }} {{ people|max(attribute='age')|tojson }}",
+"extra": "{\"people\": [{\"name\": \"bo\", \"age\": 31, \"tags\": [\"x\"]}, {\"name\": \"Al\", \"age\": 25, \"tags\": []}, {\"name\": \"cy\", \"age\": 31, \"tags\": [\"y\", \"z\"]}]}",
+"python": "9 c c {\"name\": \"bo\", \"age\": 31, \"tags\": [\"x\"]}",
+"python_error": null
+},
+{
+"covers": "filter min",
+"label": "filter min #1",
+"template": "{{ [3, 9, 2]|min }} {{ ['b', 'A', 'c']|min }} {{ people|min(attribute='age')|tojson }}",
+"extra": "{\"people\": [{\"name\": \"bo\", \"age\": 31, \"tags\": [\"x\"]}, {\"name\": \"Al\", \"age\": 25, \"tags\": []}, {\"name\": \"cy\", \"age\": 31, \"tags\": [\"y\", \"z\"]}]}",
+"python": "2 A {\"name\": \"Al\", \"age\": 25, \"tags\": []}",
+"python_error": null
+},
+{
+"covers": "filter reject",
+"label": "filter reject #1",
+"template": "{{ [0, 1, 2, 3, none]|reject|list }} {{ [1, 2, 3, 4]|reject('odd')|list }} {{ [1, 2, 3]|reject('==', 2)|list }}",
+"extra": "{}",
+"python": "[0, None] [2, 4] [1, 3]",
+"python_error": null
+},
+{
+"covers": "filter rejectattr",
+"label": "filter rejectattr #1",
+"template": "{{ people|rejectattr('tags')|map(attribute='name')|list }} {{ people|rejectattr('age', 'equalto', 31)|map(attribute='name')|list }}",
+"extra": "{\"people\": [{\"name\": \"bo\", \"age\": 31, \"tags\": [\"x\"]}, {\"name\": \"Al\", \"age\": 25, \"tags\": []}, {\"name\": \"cy\", \"age\": 31, \"tags\": [\"y\", \"z\"]}]}",
+"python": "['Al'] ['Al']",
+"python_error": null
+},
+{
+"covers": "filter replace",
+"label": "filter replace #1",
+"template": "{{ 'aaa'|replace('a', 'b') }} {{ 'aaa'|replace('a', 'b', 2) }} {{ 'abc'|replace('', '-') }}",
+"extra": "{}",
+"python": "bbb bba -a-b-c-",
+"python_error": null
+},
+{
+"covers": "filter replace",
+"label": "filter replace #2",
+"template": "{{ 'aaa'|replace('a', 'b', -9223372036854775807 - 1) }} {{ 'ab'|replace('', '-', -9223372036854775807 - 1) }}",
+"extra": "{}",
+"python": "bbb -a-b-",
+"python_error": null
+},
+{
+"covers": "filter reverse",
+"label": "filter reverse #1",
+"template": "{{ 'abc'|reverse }} {{ [1, 2, 3]|reverse|list }} {% for x in [1, 2]|reverse %}{{ x }}{% endfor %}",
+"extra": "{}",
+"python": "cba [3, 2, 1] 21",
+"python_error": null
+},
+{
+"covers": "filter safe",
+"label": "filter safe #1",
+"template": "{{ '<b>'|safe }} {{ ('<a>'|safe + '<i>') }}",
+"extra": "{}",
+"python": "<b> <a>&lt;i&gt;",
+"python_error": null
+},
+{
+"covers": "filter select",
+"label": "filter select #1",
+"template": "{{ [0, 1, 2, '', 'x']|select|list }} {{ [1, 2, 3, 4]|select('even')|list }} {{ [1, 5, 9]|select('>', 4)|list }} {{ ['a', 1]|select('string')|list }}",
+"extra": "{}",
+"python": "[1, 2, 'x'] [2, 4] [5, 9] ['a']",
+"python_error": null
+},
+{
+"covers": "filter selectattr",
+"label": "filter selectattr #1",
+"template": "{{ people|selectattr('tags')|map(attribute='name')|list }} {{ people|selectattr('age', 'gt', 30)|map(attribute='name')|list }} {{ people|selectattr('name', 'in', ['Al', 'cy'])|map(attribute='age')|list }}",
+"extra": "{\"people\": [{\"name\": \"bo\", \"age\": 31, \"tags\": [\"x\"]}, {\"name\": \"Al\", \"age\": 25, \"tags\": []}, {\"name\": \"cy\", \"age\": 31, \"tags\": [\"y\", \"z\"]}]}",
+"python": "['bo', 'cy'] ['bo', 'cy'] [25, 31]",
+"python_error": null
+},
+{
+"covers": "filter sort",
+"label": "filter sort #1",
+"template": "{{ [3, 1, 2]|sort }} {{ ['b', 'A', 'c']|sort }} {{ ['b', 'A', 'c']|sort(case_sensitive=true) }} {{ [3, 1, 2]|sort(reverse=true) }} {{ people|sort(attribute='age,name')|map(attribute='name')|list }}",
+"extra": "{\"people\": [{\"name\": \"bo\", \"age\": 31, \"tags\": [\"x\"]}, {\"name\": \"Al\", \"age\": 25, \"tags\": []}, {\"name\": \"cy\", \"age\": 31, \"tags\": [\"y\", \"z\"]}]}",
+"python": "[1, 2, 3] ['A', 'b', 'c'] ['A', 'b', 'c'] [3, 2, 1] ['Al', 'bo', 'cy']",
+"python_error": null
+},
+{
+"covers": "filter sort",
+"label": "filter sort #2",
+"template": "{{ [none, none]|sort }} {{ [{'a': 1}, {'a': 1}]|sort }} {{ [[1], [1]]|sort }} {{ [none]|sort }}",
+"extra": "{}",
+"python": "[None, None] [{'a': 1}, {'a': 1}] [[1], [1]] [None]",
+"python_error": null
+},
+{
+"covers": "filter sort",
+"label": "filter sort #3",
+"template": "{{ [{'a': 1}, {'a': 2}]|sort }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: '<' not supported between instances of 'dict' and 'dict'"
+},
+{
+"covers": "filter string",
+"label": "filter string #1",
+"template": "{{ 5|string }} {{ none|string }} {{ [1, 'a']|string }} {{ d|string }} {{ 1.0|string }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "5 None [1, 'a'] {'b': 2, 'a': 1, 'c': None} 1.0",
+"python_error": null
+},
+{
+"covers": "filter string",
+"label": "filter string #2",
+"template": "{{ ['tab\\t', 'q\\'', 'both\\'\"', '\\x7f', '\\u00ad', 'é', '\\u0378', '\\U0001F600'] }}",
+"extra": "{}",
+"python": "['tab\\t', \"q'\", 'both\\'\"', '\\x7f', '\\xad', 'é', '\\u0378', '😀']",
+"python_error": null
+},
+{
+"covers": "filter strip",
+"label": "filter strip #1",
+"template": "{{ '  x  '|strip }}|{{ 'xxaxx'|strip('x') }}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateAssertionError: No filter named 'strip'."
+},
+{
+"covers": "filter sum",
+"label": "filter sum #1",
+"template": "{{ [1, 2, 3]|sum }} {{ [1.5, 2]|sum }} {{ people|sum(attribute='age') }} {{ [1, 2]|sum(start=10) }}",
+"extra": "{\"people\": [{\"name\": \"bo\", \"age\": 31, \"tags\": [\"x\"]}, {\"name\": \"Al\", \"age\": 25, \"tags\": []}, {\"name\": \"cy\", \"age\": 31, \"tags\": [\"y\", \"z\"]}]}",
+"python": "6 3.5 87 13",
+"python_error": null
+},
+{
+"covers": "filter title",
+"label": "filter title #1",
+"template": "{{ 'hello wORLD-foo (bar) x_y'|title }}",
+"extra": "{}",
+"python": "Hello World-Foo (Bar) X_y",
+"python_error": null
+},
+{
+"covers": "filter tojson",
+"label": "filter tojson #1",
+"template": "{{ d|tojson }} {{ [1, 'é', none, true, 1.5]|tojson }} {{ 'a<b>&\\'c'|tojson }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "{\"b\": 2, \"a\": 1, \"c\": null} [1, \"é\", null, true, 1.5] \"a<b>&'c\"",
+"python_error": null
+},
+{
+"covers": "filter tojson",
+"label": "filter tojson #2",
+"template": "{{ '\\x7fé'|tojson(ensure_ascii=true) }} {{ '\\x7f'|tojson }}",
+"extra": "{}",
+"python": "\"\\u007f\\u00e9\" \"\"",
+"python_error": null
+},
+{
+"covers": "filter tojson",
+"label": "filter tojson #3",
+"template": "{{ d|tojson(indent=2) }}|{{ d|tojson(sort_keys=true) }}|{{ x|tojson }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}, \"x\": {\"n\": [1, 2.0, 1e-05, 1e+100, 9007199254740993, -0.0]}}",
+"python": "{\n  \"b\": 2,\n  \"a\": 1,\n  \"c\": null\n}|{\"a\": 1, \"b\": 2, \"c\": null}|{\"n\": [1, 2.0, 1e-05, 1e+100, 9007199254740993, -0.0]}",
+"python_error": null
+},
+{
+"covers": "filter tojson",
+"label": "filter tojson #4",
+"template": "{{ x|tojson(ensure_ascii=true) }} {{ x|tojson(separators=(',', ':')) }}",
+"extra": "{\"x\": {\"k\": \"é中😀\\u0001\"}}",
+"python": "{\"k\": \"\\u00e9\\u4e2d\\ud83d\\ude00\\u0001\"} {\"k\":\"é中😀\\u0001\"}",
+"python_error": null
+},
+{
+"covers": "filter trim",
+"label": "filter trim #1",
+"template": "{{ '  x \\n'|trim }}|{{ '--x--'|trim('-') }}",
+"extra": "{}",
+"python": "x|x",
+"python_error": null
+},
+{
+"covers": "filter truncate",
+"label": "filter truncate #1",
+"template": "{{ 'hello world, how are you'|truncate(9) }}|{{ 'hello world, how are you'|truncate(9, true) }}|{{ 'hello world, how are you'|truncate(12, false, '..', 0) }}|{{ 'short'|truncate(10) }}",
+"extra": "{}",
+"python": "hello...|hello ...|hello..|short",
+"python_error": null
+},
+{
+"covers": "filter truncate",
+"label": "filter truncate #2",
+"template": "{{ 'abc'|truncate(9223372036854775807) }} {{ 'abcdefghij'|truncate(5, leeway=9223372036854775807) }}",
+"extra": "{}",
+"python": "abc abcdefghij",
+"python_error": null
+},
+{
+"covers": "filter unique",
+"label": "filter unique #1",
+"template": "{{ [1, 2, 1, 3, 2]|unique|list }} {{ ['a', 'A', 'b']|unique|list }} {{ ['a', 'A']|unique(case_sensitive=true)|list }} {{ people|unique(attribute='age')|map(attribute='name')|list }}",
+"extra": "{\"people\": [{\"name\": \"bo\", \"age\": 31, \"tags\": [\"x\"]}, {\"name\": \"Al\", \"age\": 25, \"tags\": []}, {\"name\": \"cy\", \"age\": 31, \"tags\": [\"y\", \"z\"]}]}",
+"python": "[1, 2, 3] ['a', 'b'] ['a', 'A'] ['bo', 'Al']",
+"python_error": null
+},
+{
+"covers": "filter upper",
+"label": "filter upper #1",
+"template": "{{ 'MiXeD case'|upper }}",
+"extra": "{}",
+"python": "MIXED CASE",
+"python_error": null
+},
+{
+"covers": "filter upper",
+"label": "filter upper #2",
+"template": "{{ 'école àö ß'|upper }}",
+"extra": "{}",
+"python": "ÉCOLE ÀÖ SS",
+"python_error": null
+},
+{
+"covers": "filter wordcount",
+"label": "filter wordcount #1",
+"template": "{{ 'one two  three-four'|wordcount }} {{ ''|wordcount }} {{ 'a_b c'|wordcount }}",
+"extra": "{}",
+"python": "4 0 2",
+"python_error": null
+},
+{
+"covers": "filter wordcount",
+"label": "filter wordcount #2",
+"template": "{{ 'naïve café 中文 x'|wordcount }}",
+"extra": "{}",
+"python": "4",
+"python_error": null
+},
+{
+"covers": "filter wordcount",
+"label": "filter wordcount #3",
+"template": "{{ 'a → b'|wordcount }}",
+"extra": "{}",
+"python": "2",
+"python_error": null
+},
+{
+"covers": "test boolean",
+"label": "test boolean #1",
+"template": "{{ true is boolean }} {{ 1 is boolean }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test callable",
+"label": "test callable #1",
+"template": "{{ range is callable }} {{ 1 is callable }} {{ 'x'.upper is callable }}",
+"extra": "{}",
+"python": "True False True",
+"python_error": null
+},
+{
+"covers": "test defined",
+"label": "test defined #1",
+"template": "{{ x is defined }} {{ missing is defined }} {{ d.a is defined }} {{ d.zz is defined }} {{ d.c is defined }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}, \"x\": 1}",
+"python": "True False True False True",
+"python_error": null
+},
+{
+"covers": "test divisibleby",
+"label": "test divisibleby #1",
+"template": "{{ 9 is divisibleby 3 }} {{ 9 is divisibleby(4) }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test eq",
+"label": "test eq #1",
+"template": "{{ 1 is eq 1 }} {{ 'a' is eq 'b' }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test equalto",
+"label": "test equalto #1",
+"template": "{{ 1 is equalto 1.0 }}",
+"extra": "{}",
+"python": "True",
+"python_error": null
+},
+{
+"covers": "test escaped",
+"label": "test escaped #1",
+"template": "{{ 'x'|safe is escaped }} {{ 'x' is escaped }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test even",
+"label": "test even #1",
+"template": "{{ 2 is even }} {{ 3 is even }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test false",
+"label": "test false #1",
+"template": "{{ false is false }} {{ 0 is false }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test filter",
+"label": "test filter #1",
+"template": "{{ 'upper' is filter }} {{ 'nope' is filter }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test float",
+"label": "test float #1",
+"template": "{{ 1.0 is float }} {{ 1 is float }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test ge",
+"label": "test ge #1",
+"template": "{{ 2 is ge 2 }} {{ 1 is ge 2 }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test gt",
+"label": "test gt #1",
+"template": "{{ 3 is gt 2 }} {{ 2 is gt 2 }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test greaterthan",
+"label": "test greaterthan #1",
+"template": "{{ 3 is greaterthan 2 }}",
+"extra": "{}",
+"python": "True",
+"python_error": null
+},
+{
+"covers": "test in",
+"label": "test in #1",
+"template": "{{ 1 is in [1, 2] }} {{ 'a' is in 'bcd' }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test integer",
+"label": "test integer #1",
+"template": "{{ 1 is integer }} {{ 1.0 is integer }} {{ true is integer }}",
+"extra": "{}",
+"python": "True False False",
+"python_error": null
+},
+{
+"covers": "test iterable",
+"label": "test iterable #1",
+"template": "{{ [] is iterable }} {{ 'x' is iterable }} {{ 1 is iterable }} {{ d is iterable }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "True True False True",
+"python_error": null
+},
+{
+"covers": "test lower",
+"label": "test lower #1",
+"template": "{{ 'abc' is lower }} {{ 'aBc' is lower }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test lt",
+"label": "test lt #1",
+"template": "{{ 1 is lt 2 }} {{ 2 is lt 1 }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test lessthan",
+"label": "test lessthan #1",
+"template": "{{ 1 is lessthan 2 }}",
+"extra": "{}",
+"python": "True",
+"python_error": null
+},
+{
+"covers": "test mapping",
+"label": "test mapping #1",
+"template": "{{ d is mapping }} {{ [] is mapping }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test ne",
+"label": "test ne #1",
+"template": "{{ 1 is ne 2 }} {{ 1 is ne 1 }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test none",
+"label": "test none #1",
+"template": "{{ none is none }} {{ d.c is none }} {{ 0 is none }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "True True False",
+"python_error": null
+},
+{
+"covers": "test number",
+"label": "test number #1",
+"template": "{{ 1 is number }} {{ 1.5 is number }} {{ '1' is number }}",
+"extra": "{}",
+"python": "True True False",
+"python_error": null
+},
+{
+"covers": "test odd",
+"label": "test odd #1",
+"template": "{{ 3 is odd }} {{ 2 is odd }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test sameas",
+"label": "test sameas #1",
+"template": "{{ none is sameas none }} {{ true is sameas true }} {{ x is sameas x }} {{ [] is sameas [] }}",
+"extra": "{\"x\": [1]}",
+"python": "True True True False",
+"python_error": null
+},
+{
+"covers": "test sameas",
+"label": "test sameas #2",
+"template": "{{ 'a' is sameas 'a' }} {{ 1000 is sameas 1000 }} {{ 1.5 is sameas 1.5 }}",
+"extra": "{}",
+"python": "True False False",
+"python_error": null
+},
+{
+"covers": "test sequence",
+"label": "test sequence #1",
+"template": "{{ [] is sequence }} {{ 'x' is sequence }} {{ 1 is sequence }} {{ d is sequence }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "True True False True",
+"python_error": null
+},
+{
+"covers": "test string",
+"label": "test string #1",
+"template": "{{ 'x' is string }} {{ 1 is string }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test test",
+"label": "test test #1",
+"template": "{{ 'odd' is test }} {{ 'nope' is test }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test true",
+"label": "test true #1",
+"template": "{{ true is true }} {{ 1 is true }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test undefined",
+"label": "test undefined #1",
+"template": "{{ missing is undefined }} {{ 1 is undefined }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test upper",
+"label": "test upper #1",
+"template": "{{ 'ABC' is upper }} {{ 'AbC' is upper }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "test not",
+"label": "test not #1",
+"template": "{{ 1 is not none }} {{ x is not defined }}",
+"extra": "{}",
+"python": "True True",
+"python_error": null
+},
+{
+"covers": "method upper",
+"label": "method upper #1",
+"template": "{{ 'ab'.upper() }}",
+"extra": "{}",
+"python": "AB",
+"python_error": null
+},
+{
+"covers": "method lower",
+"label": "method lower #1",
+"template": "{{ 'AB'.lower() }}",
+"extra": "{}",
+"python": "ab",
+"python_error": null
+},
+{
+"covers": "method title",
+"label": "method title #1",
+"template": "{{ 'hello wORLD x1y'.title() }}",
+"extra": "{}",
+"python": "Hello World X1Y",
+"python_error": null
+},
+{
+"covers": "method title",
+"label": "method title #2",
+"template": "{{ 'xéy'.title() }}",
+"extra": "{}",
+"python": "Xéy",
+"python_error": null
+},
+{
+"covers": "method capitalize",
+"label": "method capitalize #1",
+"template": "{{ 'hELLO'.capitalize() }}",
+"extra": "{}",
+"python": "Hello",
+"python_error": null
+},
+{
+"covers": "method strip",
+"label": "method strip #1",
+"template": "{{ '  x '.strip() }}|{{ 'xyx'.strip('x') }}",
+"extra": "{}",
+"python": "x|y",
+"python_error": null
+},
+{
+"covers": "method lstrip",
+"label": "method lstrip #1",
+"template": "{{ '  x '.lstrip() }}|{{ 'xxy'.lstrip('x') }}",
+"extra": "{}",
+"python": "x |y",
+"python_error": null
+},
+{
+"covers": "method rstrip",
+"label": "method rstrip #1",
+"template": "{{ '  x '.rstrip() }}|{{ 'yxx'.rstrip('x') }}",
+"extra": "{}",
+"python": "  x|y",
+"python_error": null
+},
+{
+"covers": "method startswith",
+"label": "method startswith #1",
+"template": "{{ 'abc'.startswith('ab') }} {{ 'abc'.startswith(('x', 'a')) }} {{ 'abc'.startswith('b', 1) }}",
+"extra": "{}",
+"python": "True True True",
+"python_error": null
+},
+{
+"covers": "method startswith",
+"label": "method startswith #2",
+"template": "{{ ''.startswith('', 1) }} {{ 'ab'.startswith('', 2) }} {{ 'ab'.startswith('', 3) }} {{ 'ab'.startswith('', -9) }}",
+"extra": "{}",
+"python": "False True False True",
+"python_error": null
+},
+{
+"covers": "method endswith",
+"label": "method endswith #1",
+"template": "{{ 'abc'.endswith('bc') }} {{ 'abc'.endswith(('x', 'y')) }} {{ 'abc'.endswith('b', 0, 2) }}",
+"extra": "{}",
+"python": "True False True",
+"python_error": null
+},
+{
+"covers": "method endswith",
+"label": "method endswith #2",
+"template": "{{ 'ab'.endswith('', 3) }} {{ 'ab'.endswith('', 2) }} {{ 'ab'.endswith('b', -1) }} {{ 'ab'.endswith('', 1, 0) }}",
+"extra": "{}",
+"python": "False True True False",
+"python_error": null
+},
+{
+"covers": "method split",
+"label": "method split #1",
+"template": "{{ 'a,b,,c'.split(',') }} {{ ' a  b '.split() }} {{ 'a,b,c'.split(',', 1) }} {{ 'a b c'.split(maxsplit=1) }} {{ ' a  b  c '.split(None, 1) }}",
+"extra": "{}",
+"python": "['a', 'b', '', 'c'] ['a', 'b'] ['a', 'b,c'] ['a', 'b c'] ['a', 'b  c ']",
+"python_error": null
+},
+{
+"covers": "method split",
+"label": "method split #2",
+"template": "{{ 'a,b,c'.split(',', -9223372036854775807 - 1) }} {{ 'a b c'.split(None, -9223372036854775807 - 1) }}",
+"extra": "{}",
+"python": "['a', 'b', 'c'] ['a', 'b', 'c']",
+"python_error": null
+},
+{
+"covers": "method rsplit",
+"label": "method rsplit #1",
+"template": "{{ 'a,b,c'.rsplit(',', 1) }} {{ ' a  b c '.rsplit(None, 1) }}",
+"extra": "{}",
+"python": "['a,b', 'c'] [' a  b', 'c']",
+"python_error": null
+},
+{
+"covers": "method rsplit",
+"label": "method rsplit #2",
+"template": "{{ 'a,b,c'.rsplit(',', -9223372036854775807 - 1) }} {{ ' a b '.rsplit(None, -9223372036854775807 - 1) }}",
+"extra": "{}",
+"python": "['a', 'b', 'c'] ['a', 'b']",
+"python_error": null
+},
+{
+"covers": "method replace",
+"label": "method replace #1",
+"template": "{{ 'aaa'.replace('a', 'b', 1) }}",
+"extra": "{}",
+"python": "baa",
+"python_error": null
+},
+{
+"covers": "method replace",
+"label": "method replace #2",
+"template": "{{ 'aaa'.replace('a', 'b', -9223372036854775807 - 1) }} {{ 'ab'.replace('', '-', -9223372036854775807 - 1) }}",
+"extra": "{}",
+"python": "bbb -a-b-",
+"python_error": null
+},
+{
+"covers": "method get",
+"label": "method get #1",
+"template": "{{ d.get('a') }} {{ d.get('zz') }} {{ d.get('zz', 9) }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "1 None 9",
+"python_error": null
+},
+{
+"covers": "method keys",
+"label": "method keys #1",
+"template": "{{ d.keys()|list }} {{ d.keys()|length }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "['b', 'a', 'c'] 3",
+"python_error": null
+},
+{
+"covers": "method values",
+"label": "method values #1",
+"template": "{{ d.values()|list }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "[2, 1, None]",
+"python_error": null
+},
+{
+"covers": "method items",
+"label": "method items #1",
+"template": "{% for k, v in d.items() %}{{ k }}:{{ v }} {% endfor %}{{ d.items()|list }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "b:2 a:1 c:None [('b', 2), ('a', 1), ('c', None)]",
+"python_error": null
+},
+{
+"covers": "method indent",
+"label": "method indent #1",
+"template": "{{ 'a\\nb\\n\\nc\\n'.indent(2) }}|{{ 'a\\nb'.indent(2, true) }}|{{ 'a\\n\\nb'.indent('>', false, true) }}",
+"extra": "{}",
+"python": null,
+"python_error": "UndefinedError: 'str object' has no attribute 'indent'"
+},
+{
+"covers": "method append",
+"label": "method append #1",
+"template": "{% set xs = [1] %}{% set _ = xs.append(2) %}{{ xs|length }} {{ xs|join(',') }} {{ xs.append(3)|join(',') }}",
+"extra": "{}",
+"python": null,
+"python_error": "SecurityError: access to attribute 'append' of 'list' object is unsafe."
+},
+{
+"covers": "method append",
+"label": "method append #2",
+"template": "{% set xs = [1, 2] %}{% for x in xs %}{{ x }}{% if x < 3 %}{% set _ = xs.append(x + 2) %}{% endif %}{% endfor %}[{{ xs|join(',') }}]",
+"extra": "{}",
+"python": null,
+"python_error": "SecurityError: access to attribute 'append' of 'list' object is unsafe."
+},
+{
+"covers": "global range",
+"label": "global range #1",
+"template": "{{ range(3)|list }} {{ range(1, 7, 2)|list }} {{ range(5, 0, -2)|list }} {% for i in range(2) %}{{ i }}{% endfor %}",
+"extra": "{}",
+"python": "[0, 1, 2] [1, 3, 5] [5, 3, 1] 01",
+"python_error": null
+},
+{
+"covers": "global range",
+"label": "global range #2",
+"template": "{{ range(-9223372036854775807 - 1, 9223372036854775807, 9223372036854775807)|list }} {{ range(9223372036854775807, -9223372036854775807 - 1, -9223372036854775807 - 1)|list }}",
+"extra": "{}",
+"python": "[-9223372036854775808, -1, 9223372036854775806] [9223372036854775807, -1]",
+"python_error": null
+},
+{
+"covers": "global range",
+"label": "global range #3",
+"template": "{{ range(3) }} {{ range(1, 5, 2) }} {{ range(0) }} {{ range(5, 1, -1) }}",
+"extra": "{}",
+"python": "range(0, 3) range(1, 5, 2) range(0, 0) range(5, 1, -1)",
+"python_error": null
+},
+{
+"covers": "global range",
+"label": "global range #4",
+"template": "{{ range(10)[::3] }} {{ range(10)[1:3] }} {{ range(5)[::-1] }} {{ range(0, 10, 3)[-1:] }} {{ range(4)[9:] }} {{ [range(2)] }}",
+"extra": "{}",
+"python": "range(0, 10, 3) range(1, 3) range(4, -1, -1) range(9, 12, 3) range(4, 4) [range(0, 2)]",
+"python_error": null
+},
+{
+"covers": "global namespace",
+"label": "global namespace #1",
+"template": "{% set ns = namespace(n=0, s='a') %}{% for i in range(3) %}{% set ns.n = ns.n + i %}{% endfor %}{{ ns.n }}{{ ns.s }}",
+"extra": "{}",
+"python": "3a",
+"python_error": null
+},
+{
+"covers": "global raise_exception",
+"label": "global raise_exception #1",
+"template": "{{ raise_exception('stop here') }}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateError: stop here"
+},
+{
+"covers": "global strftime_now",
+"label": "global strftime_now #1",
+"template": "{{ strftime_now('fixed text, no field') }}|{{ strftime_now('100%%') }}",
+"extra": "{}",
+"python": "fixed text, no field|100%",
+"python_error": null
+},
+{
+"covers": "loop index",
+"label": "loop index #1",
+"template": "{% for x in 'abc' %}{{ loop.index }}{% endfor %}",
+"extra": "{}",
+"python": "123",
+"python_error": null
+},
+{
+"covers": "loop index0",
+"label": "loop index0 #1",
+"template": "{% for x in 'abc' %}{{ loop.index0 }}{% endfor %}",
+"extra": "{}",
+"python": "012",
+"python_error": null
+},
+{
+"covers": "loop revindex",
+"label": "loop revindex #1",
+"template": "{% for x in 'abc' %}{{ loop.revindex }}{% endfor %}",
+"extra": "{}",
+"python": "321",
+"python_error": null
+},
+{
+"covers": "loop revindex0",
+"label": "loop revindex0 #1",
+"template": "{% for x in 'abc' %}{{ loop.revindex0 }}{% endfor %}",
+"extra": "{}",
+"python": "210",
+"python_error": null
+},
+{
+"covers": "loop first",
+"label": "loop first #1",
+"template": "{% for x in 'abc' %}{{ loop.first }} {% endfor %}",
+"extra": "{}",
+"python": "True False False ",
+"python_error": null
+},
+{
+"covers": "loop last",
+"label": "loop last #1",
+"template": "{% for x in 'abc' %}{{ loop.last }} {% endfor %}",
+"extra": "{}",
+"python": "False False True ",
+"python_error": null
+},
+{
+"covers": "loop length",
+"label": "loop length #1",
+"template": "{% for x in 'abc' %}{{ loop.length }}{% endfor %}",
+"extra": "{}",
+"python": "333",
+"python_error": null
+},
+{
+"covers": "loop previtem",
+"label": "loop previtem #1",
+"template": "{% for x in 'abc' %}[{{ loop.previtem }}]{% endfor %}",
+"extra": "{}",
+"python": "[][a][b]",
+"python_error": null
+},
+{
+"covers": "loop nextitem",
+"label": "loop nextitem #1",
+"template": "{% for x in 'abc' %}[{{ loop.nextitem }}]{% endfor %}",
+"extra": "{}",
+"python": "[b][c][]",
+"python_error": null
+},
+{
+"covers": "operator in",
+"label": "operator in #1",
+"template": "{{ 1 in [1, 2] }} {{ 'b' in 'abc' }} {{ 'a' in d }} {{ 'zz' in d }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "True True True False",
+"python_error": null
+},
+{
+"covers": "operator in",
+"label": "operator in #2",
+"template": "{{ [1] in d }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": null,
+"python_error": "TypeError: cannot use 'list' as a dict key (unhashable type: 'list')"
+},
+{
+"covers": "operator in",
+"label": "operator in #3",
+"template": "{{ {'a': 1}.get([1]) }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: cannot use 'list' as a dict key (unhashable type: 'list')"
+},
+{
+"covers": "operator in",
+"label": "operator in #4",
+"template": "{{ {[1]: 2} }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: cannot use 'list' as a dict key (unhashable type: 'list')"
+},
+{
+"covers": "operator in",
+"label": "operator in #5",
+"template": "[{{ d[[1]] }}]",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "[]",
+"python_error": null
+},
+{
+"covers": "operator in",
+"label": "operator in #6",
+"template": "{{ (1, [2]) in d }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": null,
+"python_error": "TypeError: cannot use 'tuple' as a dict key (unhashable type: 'list')"
+},
+{
+"covers": "operator in",
+"label": "operator in #7",
+"template": "{{ {namespace(): 1}|length }} {{ {(1, 'a'): 1}|length }} {{ {range(2): 1}|length }} {{ {none: 1, 1.5: 2, true: 3}|length }}",
+"extra": "{}",
+"python": "1 1 1 3",
+"python_error": null
+},
+{
+"covers": "operator in",
+"label": "operator in #8",
+"template": "{{ {x.keys(): 1} }}",
+"extra": "{\"x\": {\"a\": 1}}",
+"python": null,
+"python_error": "TypeError: cannot use 'dict_keys' as a dict key (unhashable type: 'dict_keys')"
+},
+{
+"covers": "operator in",
+"label": "operator in #9",
+"template": "{{ {x.values(): 1}|length }}",
+"extra": "{\"x\": {\"a\": 1}}",
+"python": "1",
+"python_error": null
+},
+{
+"covers": "filter unique",
+"label": "filter unique #2",
+"template": "{{ [[1], [1]]|unique|list }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: cannot use 'list' as a set element (unhashable type: 'list')"
+},
+{
+"covers": "operator not in",
+"label": "operator not in #1",
+"template": "{{ 3 not in [1, 2] }} {{ 'a' not in d }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "operator ~",
+"label": "operator ~ #1",
+"template": "{{ 'a' ~ 1 ~ none ~ [2] }}",
+"extra": "{}",
+"python": "a1None[2]",
+"python_error": null
+},
+{
+"covers": "operator ==",
+"label": "operator == #1",
+"template": "{{ 1 == 1.0 }} {{ 'a' == 'a' }} {{ [1] == [1] }} {{ none == false }}",
+"extra": "{}",
+"python": "True True True False",
+"python_error": null
+},
+{
+"covers": "operator !=",
+"label": "operator != #1",
+"template": "{{ 1 != 2 }} {{ d != d }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "operator <",
+"label": "operator < #1",
+"template": "{{ 1 < 2 }} {{ 'a' < 'b' }} {{ [1, 2] < [1, 3] }}",
+"extra": "{}",
+"python": "True True True",
+"python_error": null
+},
+{
+"covers": "operator <=",
+"label": "operator <= #1",
+"template": "{{ 2 <= 2 }} {{ 1 < 2 <= 2 }}",
+"extra": "{}",
+"python": "True True",
+"python_error": null
+},
+{
+"covers": "operator >",
+"label": "operator > #1",
+"template": "{{ 2 > 1 }} {{ 1.5 > 2 }}",
+"extra": "{}",
+"python": "True False",
+"python_error": null
+},
+{
+"covers": "operator >=",
+"label": "operator >= #1",
+"template": "{{ 2 >= 3 }}",
+"extra": "{}",
+"python": "False",
+"python_error": null
+},
+{
+"covers": "operator <",
+"label": "operator < #2",
+"template": "{% set n = big * 10 - big * 10 %}{{ n < 1 }} {{ n > 1 }} {{ n <= n }} {{ n >= 1 }} {{ 1 < n }} {{ [1, n] < [1, 2] }} {{ ([n]|sort)[0] }}",
+"extra": "{\"big\": 1e+308}",
+"python": "False False False False False False nan",
+"python_error": null
+},
+{
+"covers": "operator <",
+"label": "operator < #3",
+"template": "{{ 9007199254740993 > 9007199254740992.0 }} {{ 9007199254740992.0 < 9007199254740993 }} {{ 9223372036854775807 < 9223372036854775808.0 }} {{ -9223372036854775808 > -9223372036854775808.0 }} {{ 2 > 1.5 }} {{ -2 < -1.5 }}",
+"extra": "{}",
+"python": "True True True False True True",
+"python_error": null
+},
+{
+"covers": "filter sort",
+"label": "filter sort #4",
+"template": "{% set n = big * 10 - big * 10 %}{{ [n, 1, n]|sort }}",
+"extra": "{\"big\": 1e+308}",
+"python": "[nan, 1, nan]",
+"python_error": null
+},
+{
+"covers": "operator and",
+"label": "operator and #1",
+"template": "{{ 1 and 'x' }} {{ 0 and 'x' }} {{ [] and 1 }}|",
+"extra": "{}",
+"python": "x 0 []|",
+"python_error": null
+},
+{
+"covers": "operator or",
+"label": "operator or #1",
+"template": "{{ 0 or 'x' }} {{ 1 or 'x' }} {{ none or [] }}",
+"extra": "{}",
+"python": "x 1 []",
+"python_error": null
+},
+{
+"covers": "operator not",
+"label": "operator not #1",
+"template": "{{ not 0 }} {{ not 'x' }} {{ not none }}",
+"extra": "{}",
+"python": "True False True",
+"python_error": null
+},
+{
+"covers": "operator +",
+"label": "operator + #1",
+"template": "{{ 1 + 2 }} {{ 1 + 0.5 }} {{ 'a' + 'b' }} {{ [1] + [2] }}",
+"extra": "{}",
+"python": "3 1.5 ab [1, 2]",
+"python_error": null
+},
+{
+"covers": "operator -",
+"label": "operator - #1",
+"template": "{{ 5 - 7 }} {{ 1.5 - 1 }}",
+"extra": "{}",
+"python": "-2 0.5",
+"python_error": null
+},
+{
+"covers": "operator +",
+"label": "operator + #2",
+"template": "{{ x }} {{ x + 1 }}",
+"extra": "{\"x\": 18446744073709551616}",
+"python": "18446744073709551616 18446744073709551617",
+"python_error": null
+},
+{
+"covers": "operator *",
+"label": "operator * #1",
+"template": "{{ 3 * 4 }} {{ 'ab' * 3 }} {{ [0] * 2 }} {{ 1.5 * 2 }}",
+"extra": "{}",
+"python": "12 ababab [0, 0] 3.0",
+"python_error": null
+},
+{
+"covers": "operator /",
+"label": "operator / #1",
+"template": "{{ 7 / 2 }} {{ 6 / 3 }} {{ 1 / 3 }}",
+"extra": "{}",
+"python": "3.5 2.0 0.3333333333333333",
+"python_error": null
+},
+{
+"covers": "operator /",
+"label": "operator / #2",
+"template": "{{ 0 / 9007199254740993 }} {{ 0 / -9007199254740993 }} {{ -0 / 9007199254740993 }} {{ -0 / -9007199254740993 }} {{ (-9223372036854775807 - 1) / 9007199254740993 }} {{ (-9223372036854775807 - 1) / -9007199254740993 }} {{ 0 / (-9223372036854775807 - 1) }} {{ (-9223372036854775807 - 1) / (-9223372036854775807 - 1) }} {{ 1 / 9223372036854775807 }}",
+"extra": "{}",
+"python": "0.0 -0.0 0.0 -0.0 -1023.9999999999999 1023.9999999999999 -0.0 1.0 1.0842021724855044e-19",
+"python_error": null
+},
+{
+"covers": "operator /",
+"label": "operator / #3",
+"template": "{{ 18014398509481985 / 3 }} {{ 9007199254740993 / 1 }} {{ -9223372036854775807 / 7 }} {{ 9223372036854775807 / -3 }} {{ 9007199254740993 / 9007199254740992 }} {{ 1 / 9223372036854775807 }}",
+"extra": "{}",
+"python": "6004799503160662.0 9007199254740992.0 -1.3176245766935393e+18 -3.0744573456182584e+18 1.0 1.0842021724855044e-19",
+"python_error": null
+},
+{
+"covers": "operator /",
+"label": "operator / #4",
+"template": "{{ 7553705426322969113 / 929034 }} {{ -4024571214244900419 / 3 }} {{ 845035163197522276 / 721185 }} {{ 6737799718809409591 / 9075052138599801624 }} {{ 3803124323149175780 / 8866492710033342388 }} {{ 630775572003593558 / -250236853049 }} {{ 6624828931508799992 / 3 }} {{ 3960464187922662128 / 10 }} {{ 5176960997028201545 / 10 }} {{ 8167369317587610177 / 1348282716345341916 }} {{ -4170956898410604572 / 2080350270456257537 }} {{ 7680770348320607716 / 3 }} {{ -4923639403098242023 / 990257 }} {{ 1317653624395294099 / -705612325586 }} {{ 9071690235867802094 / 3 }} {{ 1479425574464320135 / -904039931603 }} {{ -6767389531502128954 / 7 }} {{ -2588341384320151708 / 278333 }} {{ 2467830691614586993 / 3 }} {{ 4449338550679644969 / 3 }} {{ 8941867459866163772 / 3 }} {{ 3118797910300725590 / 10 }} {{ 4817483597098638109 / -146154148479 }} {{ 7487016406521098487 / 256445 }} {{ 8154973488651719718 / 10 }} {{ -2123646268900458661 / 10 }} {{ 5884347578626357340 / -568963763138 }} {{ -3603404109804220084 / 10 }} {{ 319425140002548654 / 10 }} {{ 5681260045197463057 / 3 }} {{ -3312766790882648609 / 135277 }} {{ 4440462185195170651 / 3 }} {{ 2231394784865157940 / 6598030653182758576 }} {{ 6511301892412530921 / 3 }} {{ 2737248902196432997 / -691038876585 }} {{ -4994553524825823619 / 10 }} {{ -4172655392929477050 / -864140256871 }} {{ -1144348507175027107 / 3 }} {{ 3529398522193778747 / 3 }} {{ -1866377842881345303 / 7 }}",
+"extra": "{}",
+"python": "8130709345753.729 -1.3415237380816335e+18 1171731474167.5469 0.7424530036748628 0.42893221113750557 -2520714.1327024223 2.2082763105029332e+18 3.9604641879226624e+17 5.1769609970282016e+17 6.0576088520411355 -2.004930110877838 2.560256782773536e+18 -4972082401940.347 -1867390.3170568957 3.023896745289267e+18 -1636460.4291771427 -9.667699330717327e+17 -9299441260361.336 8.226102305381957e+17 1.4831128502265482e+18 2.9806224866220544e+18 3.118797910300726e+17 -32961661.69235239 29195408007647.246 8.15497348865172e+17 -2.1236462689004586e+17 -10342218.538088394 -3.60340410980422e+17 3.1942514000254864e+16 1.8937533483991544e+18 -24488765946041.445 1.4801540617317235e+18 0.33819103034763526 2.1704339641375104e+18 -3961063.5449679256 -4.9945535248258234e+17 4828678.400006975 -3.814495023916757e+17 1.176466174064593e+18 -2.6662540612590646e+17",
+"python_error": null
+},
+{
+"covers": "operator <",
+"label": "operator < #4",
+"template": "{{ 642753998708299439892463 < 6.427539987082994e+23 }}{{ 642753998708299439892463 == 6.427539987082994e+23 }} {{ 949466351188907686881201 < 9.494663511889074e+23 }}{{ 949466351188907686881201 == 9.494663511889074e+23 }} {{ -482915017715844009995815 < -4.829150177158441e+23 }}{{ -482915017715844009995815 == -4.829150177158441e+23 }} {{ -900847596202032899796327 < -9.008475962020329e+23 }}{{ -900847596202032899796327 == -9.008475962020329e+23 }} {{ -14158789038519150330827 < -1.4158789038519148e+22 }}{{ -14158789038519150330827 == -1.4158789038519148e+22 }} {{ -1000329225958895646043093 < -1.0003292259588954e+24 }}{{ -1000329225958895646043093 == -1.0003292259588954e+24 }} {{ -211064566021775290963957 < -2.1106456602177532e+23 }}{{ -211064566021775290963957 == -2.1106456602177532e+23 }} {{ -433026300841319576901397 < -4.330263008413195e+23 }}{{ -433026300841319576901397 == -4.330263008413195e+23 }} {{ 546215503529557539222417 < 5.4621550352955765e+23 }}{{ 546215503529557539222417 == 5.4621550352955765e+23 }} {{ -294293842617904827679533 < -2.9429384261790483e+23 }}{{ -294293842617904827679533 == -2.9429384261790483e+23 }} {{ 892822975724787589052807 < 8.928229757247877e+23 }}{{ 892822975724787589052807 == 8.928229757247877e+23 }} {{ -18025537850313306408188 < -1.802553785031331e+22 }}{{ -18025537850313306408188 == -1.802553785031331e+22 }} {{ -738538394959388516640948 < -7.385383949593884e+23 }}{{ -738538394959388516640948 == -7.385383949593884e+23 }} {{ -260127383319125153836337 < -2.601273833191251e+23 }}{{ -260127383319125153836337 == -2.601273833191251e+23 }} {{ 690141392371859763891065 < 6.901413923718598e+23 }}{{ 690141392371859763891065 == 6.901413923718598e+23 }} {{ -1003119745054903110374226 < -1.0031197450549028e+24 }}{{ -1003119745054903110374226 == -1.0031197450549028e+24 }} {{ 972821265147317145827744 < 9.728212651473174e+23 }}{{ 972821265147317145827744 == 9.728212651473174e+23 }} {{ 1010574352992422631008909 < 1.0105743529924224e+24 }}{{ 1010574352992422631008909 == 1.0105743529924224e+24 }} {{ -226984074321792254703469 < -2.2698407432179232e+23 }}{{ -226984074321792254703469 == -2.2698407432179232e+23 }} {{ 520151534780550678026784 < 5.201515347805508e+23 }}{{ 520151534780550678026784 == 5.201515347805508e+23 }} {{ -938706240211981996583205 < -9.38706240211982e+23 }}{{ -938706240211981996583205 == -9.38706240211982e+23 }} {{ 756363345633110549383049 < 7.563633456331107e+23 }}{{ 756363345633110549383049 == 7.563633456331107e+23 }} {{ -163982613949203472410755 < -1.639826139492035e+23 }}{{ -163982613949203472410755 == -1.639826139492035e+23 }} {{ 679329962532905644328485 < 6.793299625329055e+23 }}{{ 679329962532905644328485 == 6.793299625329055e+23 }} {{ -964161866125000661814369 < -9.641618661250003e+23 }}{{ -964161866125000661814369 == -9.641618661250003e+23 }} {{ -63284378059865588370791 < -6.3284378059865604e+22 }}{{ -63284378059865588370791 == -6.3284378059865604e+22 }} {{ 729452652869525919688514 < 7.294526528695259e+23 }}{{ 729452652869525919688514 == 7.294526528695259e+23 }} {{ 44382484143188898641580 < 4.438248414318889e+22 }}{{ 44382484143188898641580 == 4.438248414318889e+22 }} {{ 1111569193078051617541419 < 1.1115691930780516e+24 }}{{ 1111569193078051617541419 == 1.1115691930780516e+24 }} {{ 302058235990530834453403 < 3.0205823599053083e+23 }}{{ 302058235990530834453403 == 3.0205823599053083e+23 }}",
+"extra": "{}",
+"python": "FalseFalse FalseFalse FalseFalse FalseFalse TrueFalse TrueFalse FalseFalse TrueFalse TrueFalse FalseFalse TrueFalse FalseFalse TrueFalse TrueFalse TrueFalse TrueFalse TrueFalse FalseFalse FalseFalse TrueFalse TrueFalse TrueFalse FalseFalse FalseFalse TrueFalse FalseFalse FalseFalse FalseFalse TrueFalse FalseFalse",
+"python_error": null
+},
+{
+"covers": "operator %",
+"label": "operator % #1",
+"template": "{{ 7 % 3 }} {{ -7 % 3 }} {{ 7.5 % 2 }} {{ 'x=%s' % 5 }}",
+"extra": "{}",
+"python": "1 2 1.5 x=5",
+"python_error": null
+},
+{
+"covers": "operator %",
+"label": "operator % #2",
+"template": "{{ '%.2f' % 2.675 }} {{ '%.0f' % 0.5 }} {{ '%.0f' % 1.5 }} {{ '%.0f' % 2.5 }} {{ '%.3f' % -0.0 }} {{ '%f' % 1e300 }} {{ '%.20f' % 0.1 }} {{ '%f' % 3 }} {{ '%.1f' % 0.05 }} {{ '%.2f' % 1.005 }} {{ '%f' % 5e-324 }}",
+"extra": "{}",
+"python": "2.67 0 2 2 -0.000 1000000000000000052504760255204420248704468581108159154915854115511802457988908195786371375080447864043704443832883878176942523235360430575644792184786706982848387200926575803737830233794788090059368953234970799945081119038967640880074652742780142494579258788820056842838115669472196386865459400540160.000000 0.10000000000000000555 3.000000 0.1 1.00 0.000000",
+"python_error": null
+},
+{
+"covers": "operator %",
+"label": "operator % #3",
+"template": "{{ ('%.400f' % 1.0)|length }} {{ ('%.400f' % 0.1)[-5:] }} {{ '%f %f %f' % (1e308 * 10, -1e308 * 10, (1e308 * 10) - (1e308 * 10)) }} {{ '%.3f' % true }}",
+"extra": "{}",
+"python": "402 00000 inf -inf nan 1.000",
+"python_error": null
+},
+{
+"covers": "operator %",
+"label": "operator % #4",
+"template": "{{ '<b>%s</b>'|safe % '<' }} {{ '<b>%s %s</b>'|safe % ('<', '&') }} {{ '<%s>' % '<' }}",
+"extra": "{}",
+"python": "<b>&lt;</b> <b>&lt; &amp;</b> <<>",
+"python_error": null
+},
+{
+"covers": "operator <",
+"label": "operator < #5",
+"template": "{{ 9223372036854775807 < 9223372036854775808 }} {{ 9223372036854775807 == 9223372036854775808 }} {{ 18446744073709551616 < 18446744073709551617 }} {{ 18446744073709551617 > 18446744073709551616 }} {{ 18446744073709551617 == 18446744073709551616.0 }} {{ 18446744073709551616 == 18446744073709551616.0 }} {{ -18446744073709551617 < -18446744073709551616 }} {{ -18446744073709551617 > -18446744073709551616.0 }} {{ 18446744073709551617 < 18446744073709555712.0 }} {{ 18446744073709551617 > 18446744073709551616.0 }} {{ -9223372036854775809 < -9223372036854775808 }} {{ 1e300 > 99999999999999999999999 }} {{ -1e400 < -99999999999999999999 }}",
+"extra": "{}",
+"python": "True False True True False True True False True True True True True",
+"python_error": null
+},
+{
+"covers": "operator <",
+"label": "operator < #6",
+"template": "{{ -9223372036854775808 == -9223372036854775807 - 1 }} {{ -9223372036854775808 + 1 }} {{ x == -9223372036854775807 - 1 }} {{ -0x8000000000000000 + 1 }}",
+"extra": "{\"x\": -9223372036854775808}",
+"python": "True -9223372036854775807 True -9223372036854775807",
+"python_error": null
+},
+{
+"covers": "operator unary -",
+"label": "operator unary - #1",
+"template": "{{ (-9223372036854775808)|abs }} {{ -(-9223372036854775808) }}",
+"extra": "{}",
+"python": "9223372036854775808 9223372036854775808",
+"python_error": null
+},
+{
+"covers": "filter sort",
+"label": "filter sort #5",
+"template": "{{ [18446744073709551617, 18446744073709551616.0, 9223372036854775807, -18446744073709551617]|sort }} {{ [18446744073709551617, 18446744073709551616.0]|unique|list }} {{ [18446744073709551617, 18446744073709551616.0]|max }} {{ {18446744073709551616: 'a'}[18446744073709551616.0] }}",
+"extra": "{}",
+"python": "[-18446744073709551617, 9223372036854775807, 1.8446744073709552e+19, 18446744073709551617] [18446744073709551617, 1.8446744073709552e+19] 18446744073709551617 a",
+"python_error": null
+},
+{
+"covers": "operator <",
+"label": "operator < #7",
+"template": "{{ 99999999999999999999 < 1e20 }} {{ 100000000000000000001 > 1e20 }} {{ 100000000000000000001 == 1e20 }} {{ 100000000000000000000 == 1e20 }} {{ -99999999999999999999 > -1e20 }} {{ 99999999999999999999 > 1.5 }}",
+"extra": "{}",
+"python": "True True False True True True",
+"python_error": null
+},
+{
+"covers": "operator unary -",
+"label": "operator unary - #2",
+"template": "{{ -x }} {{ -(1.5) }} {{ - -2 }}",
+"extra": "{\"x\": 3}",
+"python": "-3 -1.5 2",
+"python_error": null
+},
+{
+"covers": "operator unary +",
+"label": "operator unary + #1",
+"template": "{{ +x }}",
+"extra": "{\"x\": 3}",
+"python": "3",
+"python_error": null
+},
+{
+"covers": "operator slice",
+"label": "operator slice #1",
+"template": "{{ 'abcdef'[1:4] }} {{ 'abcdef'[::-1] }} {{ [1, 2, 3, 4][-2:] }} {{ [1, 2, 3, 4][::2] }} {{ 'héllo'[1:3] }} {{ x[:-1] }}",
+"extra": "{\"x\": [1, 2, 3]}",
+"python": "bcd fedcba [3, 4] [1, 3] él [1, 2]",
+"python_error": null
+},
+{
+"covers": "operator slice",
+"label": "operator slice #2",
+"template": "{{ 'abc'[1::9223372036854775807] }} {{ 'abc'[::-9223372036854775807 - 1] }} {{ [1, 2, 3][-9223372036854775807 - 1:9223372036854775807] }} {{ 'abc'[9223372036854775807::-1] }}",
+"extra": "{}",
+"python": "b c [1, 2, 3] cba",
+"python_error": null
+},
+{
+"covers": "operator slice",
+"label": "operator slice #3",
+"template": "{{ x[:10] }}",
+"extra": "{\"x\": null}",
+"python": null,
+"python_error": "TypeError: 'NoneType' object is not subscriptable"
+},
+{
+"covers": "operator slice",
+"label": "operator slice #4",
+"template": "{{ x[:1] }}",
+"extra": "{\"x\": 5}",
+"python": null,
+"python_error": "TypeError: 'int' object is not subscriptable"
+},
+{
+"covers": "operator slice",
+"label": "operator slice #5",
+"template": "{{ x[:1] }}",
+"extra": "{\"x\": true}",
+"python": null,
+"python_error": "TypeError: 'bool' object is not subscriptable"
+},
+{
+"covers": "operator slice",
+"label": "operator slice #6",
+"template": "{{ x[:1] }}",
+"extra": "{\"x\": {\"a\": 1}}",
+"python": null,
+"python_error": "KeyError: slice(None, 1, None)"
+},
+{
+"covers": "operator slice",
+"label": "operator slice #7",
+"template": "{{ x.items()[:1] }}",
+"extra": "{\"x\": {\"a\": 1}}",
+"python": null,
+"python_error": "TypeError: 'dict_items' object is not subscriptable"
+},
+{
+"covers": "operator slice",
+"label": "operator slice #8",
+"template": "{{ (x|map('upper'))[:1] }}",
+"extra": "{\"x\": [\"a\"]}",
+"python": null,
+"python_error": "TypeError: 'generator' object is not subscriptable"
+},
+{
+"covers": "operator slice",
+"label": "operator slice #9",
+"template": "{% for i in [1] %}{{ loop[:1] }}{% endfor %}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: 'LoopContext' object is not subscriptable"
+},
+{
+"covers": "operator slice",
+"label": "operator slice #10",
+"template": "{{ 'abc'['a':] }}",
+"extra": "{}",
+"python": "",
+"python_error": null
+},
+{
+"covers": "operator slice",
+"label": "operator slice #11",
+"template": "{{ 'abc'[1.0:] }}",
+"extra": "{}",
+"python": "",
+"python_error": null
+},
+{
+"covers": "operator slice",
+"label": "operator slice #12",
+"template": "{{ [1, 2][:x] }}",
+"extra": "{\"x\": [1]}",
+"python": null,
+"python_error": "TypeError: slice indices must be integers or None or have an __index__ method"
+},
+{
+"covers": "operator slice",
+"label": "operator slice #13",
+"template": "{{ 'abc'[true:] }} {{ 'abc'[-99999999999999999999:99999999999999999999] }} {{ [1, 2, 3][none:none:-1] }} {{ range(5)[1:3]|list }} {{ 'abc'[99999999999999999999:] }}|",
+"extra": "{}",
+"python": "bc abc [3, 2, 1] [1, 2] |",
+"python_error": null
+},
+{
+"covers": "operator subscript",
+"label": "operator subscript #1",
+"template": "{{ x[0] }} {{ x[-1] }} {{ d['a'] }} {{ x.0 }} {{ d.b }} {{ y.1.0 }} {{ x[9] }}|",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}, \"x\": [1, 2, 3], \"y\": [0, [5]]}",
+"python": "1 3 1 1 2 5 |",
+"python_error": null
+},
+{
+"covers": "operator if else",
+"label": "operator if else #1",
+"template": "{{ 'y' if 1 else 'n' }} {{ 'y' if 0 else 'n' }} {{ 'y' if 0 }}|",
+"extra": "{}",
+"python": "y n |",
+"python_error": null
+},
+{
+"covers": "operator literals",
+"label": "operator literals #1",
+"template": "{{ [1, 'a', none, true, false, 1.5, -2] }} {{ {'k': 'v', 1: 2} }} {{ (1,) }} {{ (1, 2) }} {{ 1_000 }} {{ 1e3 }} {{ \"dq\" 'sq' }}",
+"extra": "{}",
+"python": "[1, 'a', None, True, False, 1.5, -2] {'k': 'v', 1: 2} (1,) (1, 2) 1000 1000.0 dqsq",
+"python_error": null
+},
+{
+"covers": "operator literals",
+"label": "operator literals #2",
+"template": "{{ 0x0 }} {{ 0x00000000000000000000000001 }} {{ 0b0 }} {{ 0o0 }} {{ 0xFFFFFFFFFFFFFFFF }} {{ -0x8000000000000001 }}",
+"extra": "{}",
+"python": "0 1 0 0 18446744073709551615 -9223372036854775809",
+"python_error": null
+},
+{
+"covers": "operator literals",
+"label": "operator literals #3",
+"template": "{{ 0xFFFFFFFFFFFFFFFFFF }} {{ 0o7777777777777777777777777 }} {{ 0b11111111111111111111111111111111111111111111111111111111111111111111 }} {{ 0x7FFF_FFFF_FFFF_FFFF }} {{ 0x8000000000000000 }} {{ -0x8000000000000000 }}",
+"extra": "{}",
+"python": "4722366482869645213695 37778931862957161709567 295147905179352825855 9223372036854775807 9223372036854775808 -9223372036854775808",
+"python_error": null
+},
+{
+"covers": "operator literals",
+"label": "operator literals #4",
+"template": "{{ '\\x+1' }}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateSyntaxError: truncated \\xXX escape"
+},
+{
+"covers": "operator literals",
+"label": "operator literals #5",
+"template": "{{ '\\u+041' }}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateSyntaxError: truncated \\uXXXX escape"
+},
+{
+"covers": "operator literals",
+"label": "operator literals #6",
+"template": "{{ '\\u0_41' }}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateSyntaxError: truncated \\uXXXX escape"
+},
+{
+"covers": "operator literals",
+"label": "operator literals #7",
+"template": "{{ '\\U+0000041' }}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateSyntaxError: truncated \\UXXXXXXXX escape"
+},
+{
+"covers": "operator literals",
+"label": "operator literals #8",
+"template": "{{ '\\x41\\u0042\\U00000043' }}",
+"extra": "{}",
+"python": "ABC",
+"python_error": null
+},
+{
+"covers": "statement if",
+"label": "statement if #1",
+"template": "{% if 0 %}a{% elif none %}b{% elif 'x' %}c{% else %}d{% endif %}",
+"extra": "{}",
+"python": "c",
+"python_error": null
+},
+{
+"covers": "statement for",
+"label": "statement for #1",
+"template": "{% for x in [] %}a{% else %}empty{% endfor %} {% for x in [1, 2, 3, 4] if x is even %}{{ x }}{% endfor %} {% for a, b in [[1, 2], [3, 4]] %}{{ a + b }}{% endfor %}",
+"extra": "{}",
+"python": "empty 24 37",
+"python_error": null
+},
+{
+"covers": "statement for",
+"label": "statement for #2",
+"template": "{% set q = 0 %}{% for i in [] %}x{% else %}{% set q = 1 %}{{ q }}{% endfor %}{{ q }}{% for i in [] %}{% else %}{% set z = 1 %}{% endfor %}{{ z is defined }}{% for x in [1, 2] if x > 5 %}{% else %}[{{ x }}]{% endfor %}",
+"extra": "{}",
+"python": "10False[]",
+"python_error": null
+},
+{
+"covers": "statement for",
+"label": "statement for #3",
+"template": "{% for i in [1, 2] %}{% break %}{% else %}E{% endfor %}|{% for i in [1, 2] %}{% continue %}{% else %}E{% endfor %}|{% for i in [1, 2] %}{% if i == 2 %}{% continue %}{% endif %}{{ i }}{% else %}E{% endfor %}|{% for i in [1, 2] %}{{ i }}{% if i == 2 %}{% break %}{% endif %}{% else %}E{% endfor %}|{% for i in [1, 2] %}{% if i == 1 %}{% continue %}{% endif %}{{ i }}{% else %}E{% endfor %}",
+"extra": "{}",
+"python": "E|E|1|12|2",
+"python_error": null
+},
+{
+"covers": "statement for",
+"label": "statement for #4",
+"template": "{% set i = 7 %}{% for i in [1, 2] %}{% break %}{% else %}[{{ i }}{{ loop is defined }}]{% endfor %}",
+"extra": "{}",
+"python": "[7False]",
+"python_error": null
+},
+{
+"covers": "statement set",
+"label": "statement set #1",
+"template": "{% if 1 %}{% set q = 1 %}{% endif %}{{ q }}{% for i in [1] %}{% if 1 %}{% set w = 2 %}{% endif %}{{ w }}{% endfor %}[{{ w }}]",
+"extra": "{}",
+"python": "12[]",
+"python_error": null
+},
+{
+"covers": "statement break",
+"label": "statement break #1",
+"template": "{% for x in range(9) %}{% if x == 3 %}{% break %}{% endif %}{{ x }}{% endfor %}",
+"extra": "{}",
+"python": "012",
+"python_error": null
+},
+{
+"covers": "statement continue",
+"label": "statement continue #1",
+"template": "{% for x in range(5) %}{% if x is odd %}{% continue %}{% endif %}{{ x }}{% endfor %}",
+"extra": "{}",
+"python": "024",
+"python_error": null
+},
+{
+"covers": "statement set",
+"label": "statement set #2",
+"template": "{% set x = 1 %}{% for i in [1] %}{% set x = 2 %}{{ x }}{% endfor %}{{ x }}{% set a, b = 3, 4 %}{{ a }}{{ b }}",
+"extra": "{}",
+"python": "2134",
+"python_error": null
+},
+{
+"covers": "statement set block",
+"label": "statement set block #1",
+"template": "{% set x %}  body {{ 1 }} {% endset %}[{{ x }}]{% set y | upper %}up{% endset %}{{ y }}",
+"extra": "{}",
+"python": "[  body 1 ]UP",
+"python_error": null
+},
+{
+"covers": "statement macro",
+"label": "statement macro #1",
+"template": "{% macro m(a, b='B') %}<{{ a }}{{ b }}>{% endmacro %}{{ m(1) }}{{ m(1, 2) }}{{ m(b=3, a=4) }}",
+"extra": "{}",
+"python": "<1B><12><43>",
+"python_error": null
+},
+{
+"covers": "statement macro",
+"label": "statement macro #2",
+"template": "{% set x = 3 %}{% macro m(x=x) %}[{{ x }}]{% endmacro %}{{ m() }}{% macro n(a, b=a) %}[{{ b }}]{% endmacro %}{{ n(1) }}",
+"extra": "{}",
+"python": "[][1]",
+"python_error": null
+},
+{
+"covers": "statement macro",
+"label": "statement macro #3",
+"template": "{% macro m(a) %}{{ a }}{{ varargs }}{{ kwargs }}{% endmacro %}{{ m(1, 2, k=3) }}|{{ m(1) }}",
+"extra": "{}",
+"python": "1(2,){'k': 3}|1(){}",
+"python_error": null
+},
+{
+"covers": "statement macro",
+"label": "statement macro #4",
+"template": "{% macro m(a) %}{{ a }}{% endmacro %}{{ m(1, 2) }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: macro 'm' takes not more than 1 argument(s)"
+},
+{
+"covers": "statement macro",
+"label": "statement macro #5",
+"template": "{% macro m(a) %}{{ a }}{% endmacro %}{{ m(1, k=2) }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: macro 'm' takes no keyword argument 'k'"
+},
+{
+"covers": "statement macro",
+"label": "statement macro #6",
+"template": "{% macro m() %}{{ varargs|length }}{% endmacro %}{{ m(1, 2) }}",
+"extra": "{}",
+"python": "2",
+"python_error": null
+},
+{
+"covers": "statement call",
+"label": "statement call #1",
+"template": "{% macro w(t) %}[{{ t }}:{{ caller() }}]{% endmacro %}{% call w('x') %}inner{% endcall %}",
+"extra": "{}",
+"python": "[x:inner]",
+"python_error": null
+},
+{
+"covers": "statement call",
+"label": "statement call #2",
+"template": "{% macro m() %}x{% endmacro %}{% call m() %}y{% endcall %}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: macro 'm' was invoked with two values for the special caller argument. This is most likely a bug."
+},
+{
+"covers": "statement call",
+"label": "statement call #3",
+"template": "{% macro m() %}{{ caller() if caller is defined }}{% endmacro %}{% call m() %}y{% endcall %}",
+"extra": "{}",
+"python": "y",
+"python_error": null
+},
+{
+"covers": "statement filter",
+"label": "statement filter #1",
+"template": "{% filter upper %}shout {{ 'this' }}{% endfilter %}",
+"extra": "{}",
+"python": "SHOUT THIS",
+"python_error": null
+},
+{
+"covers": "statement set block",
+"label": "statement set block #2",
+"template": "{% for x in [1, 2, 3] %}{% set y %}{% if x == 2 %}{% break %}{% endif %}{{ x }}{% endset %}[{{ y }}]{% endfor %}",
+"extra": "{}",
+"python": "[1]",
+"python_error": null
+},
+{
+"covers": "statement set block",
+"label": "statement set block #3",
+"template": "{% for x in [1, 2, 3] %}{% set y %}{% if x == 2 %}{% continue %}{% endif %}{{ x }}{% endset %}[{{ y }}]{% endfor %}",
+"extra": "{}",
+"python": "[1][3]",
+"python_error": null
+},
+{
+"covers": "statement filter",
+"label": "statement filter #2",
+"template": "{% for x in [1, 2, 3] %}{% filter upper %}{% if x == 2 %}{% break %}{% endif %}a{{ x }}{% endfilter %}{% endfor %}",
+"extra": "{}",
+"python": "A1",
+"python_error": null
+},
+{
+"covers": "statement filter",
+"label": "statement filter #3",
+"template": "{% for x in [1, 2, 3] %}{% filter upper %}a{% if x == 2 %}{% continue %}{% endif %}{{ x }}{% endfilter %}|{% endfor %}",
+"extra": "{}",
+"python": "A1|A3|",
+"python_error": null
+},
+{
+"covers": "statement generation",
+"label": "statement generation #1",
+"template": "a{% generation %}b{{ 1 }}{% endgeneration %}c",
+"extra": "{}",
+"python": "ab1c",
+"python_error": null
+},
+{
+"covers": "statement comment",
+"label": "statement comment #1",
+"template": "a{# note #}b",
+"extra": "{}",
+"python": "ab",
+"python_error": null
+},
+{
+"covers": "statement whitespace",
+"label": "statement whitespace #1",
+"template": "  {% if 1 %}\n  x\n  {%- if 1 -%}  y  {%- endif %}\n{%+ if 1 %}z{% endif %}\n{% endif %}\n{{- ' w ' -}}\n.\n",
+"extra": "{}",
+"python": "  xyz w .",
+"python_error": null
+},
+{
+"covers": "statement whitespace",
+"label": "statement whitespace #2",
+"template": "x\n　{% if 1 %}y{% endif %}|x\n\f{% if 1 %}y{% endif %}|x\n\u000b{% if 1 %}y{% endif %}|x\n {% if 1 %}y{% endif %}|x\n \t{% if 1 %}y{% endif %}|x\nz {% if 1 %}y{% endif %}",
+"extra": "{}",
+"python": "x\ny|x\ny|x\ny|x\ny|x\ny|x\nz y",
+"python_error": null
+},
+{
+"covers": "statement whitespace",
+"label": "statement whitespace #3",
+"template": "a\r\n  {# c #}\r\nb {%+ if 1 +%} c\n{% endif %}\t{{ 'd' }}\n  {{ 'e' }}\n",
+"extra": "{}",
+"python": "a\nb  c\n\td\n  e",
+"python_error": null
+},
+{
+"covers": "undefined prints",
+"label": "undefined prints #1",
+"template": "[{{ missing }}][{{ d.zz }}][{{ x[5] }}]",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}, \"x\": [1]}",
+"python": "[][][]",
+"python_error": null
+},
+{
+"covers": "undefined fails",
+"label": "undefined fails #1",
+"template": "{{ missing.attr }}",
+"extra": "{}",
+"python": null,
+"python_error": "UndefinedError: 'missing' is undefined"
+},
+{
+"covers": "undefined fails",
+"label": "undefined fails #2",
+"template": "{{ missing + 1 }}",
+"extra": "{}",
+"python": null,
+"python_error": "UndefinedError: 'missing' is undefined"
+},
+{
+"covers": "undefined fails",
+"label": "undefined fails #3",
+"template": "{{ 1 / 0 }}",
+"extra": "{}",
+"python": null,
+"python_error": "ZeroDivisionError: division by zero"
+}
+]
+}

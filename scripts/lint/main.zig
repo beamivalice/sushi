@@ -15,6 +15,8 @@ const rules = .{
     @import("mlx_extern.zig"),
     @import("double_free.zig"),
     @import("scope_state.zig"),
+    @import("template_runtime_safety.zig"),
+    @import("template_superlinear_std.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

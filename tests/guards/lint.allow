@@ -6,3 +6,5 @@ undefined-nested-write src/qwen4/qwen4_generate_test.zig:MTP_continuation_releas
 undefined-nested-write src/scheduler.zig:a_slot_the_batched_tick_hands_back_to_the_serial_path_counts_its_pending_pad_once serialFallback reads only gen.ctx.ssm_entries, through readyToBatch
 std-xxhash3 src/xxh3.zig:- the short inputs (240 bytes and under) and the tests' reference values
 scope-state src/dsv41/dsv41_pipelines.zig:init a test fixture's load, in a file that is not a test file: it turns the engine on for its tests' span
+template-superlinear-std src/template/template.zig:expectLimit a test helper: finds the expected words in a diagnostic
+template-superlinear-std src/template/template.zig:expectFinderAgrees a test helper: std.mem is the oracle the finder must agree with
