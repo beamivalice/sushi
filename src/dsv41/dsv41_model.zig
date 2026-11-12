@@ -2312,9 +2312,10 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix, qu
 }
 
 /// The router's logits of a chunk, `[L, E]` f32: `h` times the router rows `w`, a tile of `gate_tile_rows` rows at a
-/// time with the last tile padded by zero rows. The dense product picks its kernel and its k split by the row count
-/// (MLX's `steel_matmul`, and the engine's twin of it), and those sum in different orders: with every call the same
-/// shape, a row's logits are the same bits whatever the width of the chunk it came in.
+/// time. The dense product picks its kernel and its k split by the row count (MLX's `steel_matmul`, and the engine's
+/// twin of it), and those sum in different orders: with every tile launched as a full one, a row's logits are the
+/// same bits whatever the width of the chunk it came in. The engine launches a short tile as a full one over its
+/// own rows; MLX offers no such launch, so there the tile is padded by zero rows.
 fn gateLogitsWide(sc: *Scope, h: A, w: A) !A {
     const L = dim(h, 0);
     const T: usize = @intCast(cfg_mod.gate_tile_rows);
@@ -2329,6 +2330,11 @@ fn gateLogitsWide(sc: *Scope, h: A, w: A) !A {
         const rows = if (lo == 0 and hi == L) hf else try sc.slice(hf, 0, lo, hi);
         if (hi - lo == T) {
             tile.* = try sc.matmul(rows, wt);
+            continue;
+        }
+        if (mlx.engine.isStream(sc.s)) {
+            var o = mlx.mlx_array_new();
+            tile.* = try sc.res(mlx.engine.matmulRowsAs(&o, rows, wt, T), &o);
             continue;
         }
         const padded = try sc.concat(&.{ rows, try sc.zeros(&.{ ci(T - (hi - lo)), ci(dim(h, 1)) }, .float32) }, 0);

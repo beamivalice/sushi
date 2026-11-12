@@ -208,7 +208,7 @@ pub fn matmul(a_in: *Tensor, b_in: *Tensor) Error!*Tensor {
         b = wide_b;
     }
 
-    var out = try product(a, b);
+    var out = try product(a, b, null);
     errdefer core.release(out);
     if (flattened) {
         var shape: [core.max_dims]c_int = undefined;
@@ -235,8 +235,20 @@ pub fn matmul(a_in: *Tensor, b_in: *Tensor) Error!*Tensor {
     return squeezed;
 }
 
-/// `Matmul::eval_gpu`: operands of one rank whose batch axes agree.
-fn product(a_pre: *Tensor, b_pre: *Tensor) Error!*Tensor {
+/// Two matrices as `matmul` multiplies them, but with the kernel, its tile and its k split chosen as for `rows_as` rows
+/// of `a`. MLX picks those by the row count and its arms sum in different orders, so a row's result changes with the rows
+/// beside it; a caller whose rows must not depend on their company fixes the count. The rows are computed as they are:
+/// nothing is padded.
+pub fn matmulRowsAs(a: *Tensor, b: *Tensor, rows_as: usize) Error!*Tensor {
+    if (a.ndim != 2 or b.ndim != 2 or a.dtype != b.dtype) return error.TensorShape;
+    if (a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return error.TensorDtype;
+    if (a.shape[1] != b.shape[0]) return error.TensorShape;
+    if (a.size() == 0 or b.size() == 0 or rows_as < 2) return error.TensorUnsupported;
+    return product(a, b, rows_as);
+}
+
+/// `Matmul::eval_gpu`: operands of one rank whose batch axes agree. `rows_as` fixes the row count the arm is chosen for.
+fn product(a_pre: *Tensor, b_pre: *Tensor, rows_as: ?usize) Error!*Tensor {
     var m: usize = @intCast(a_pre.shape[a_pre.ndim - 2]);
     const n: usize = @intCast(b_pre.shape[b_pre.ndim - 1]);
     const k: usize = @intCast(a_pre.shape[a_pre.ndim - 1]);
@@ -260,16 +272,19 @@ fn product(a_pre: *Tensor, b_pre: *Tensor) Error!*Tensor {
         batch_out = 1;
         batches = .one;
     }
-    if (m == 1 and n == 1 and batch_out == 1 and a.t.rowContiguous() and b.t.rowContiguous()) return dot(a.t, b.t, k, shape[0..a_pre.ndim]);
+    if (rows_as == null and m == 1 and n == 1 and batch_out == 1 and a.t.rowContiguous() and b.t.rowContiguous()) return dot(a.t, b.t, k, shape[0..a_pre.ndim]);
 
     const out = try core.fresh(a_pre.dtype, shape[0..a_pre.ndim]);
     errdefer core.release(out);
     const g = try gpu();
-    const call: Call = .{ .g = g, .a = a, .b = b, .out = out, .m = m, .n = n, .k = k, .batch_out = batch_out, .batches = batches };
-    if (!a.transposed and b.transposed and try gemvWide(call)) return out;
-    if (@min(m, n) == 1) {
-        try gemv(call);
-        return out;
+    const call: Call = .{ .g = g, .a = a, .b = b, .out = out, .m = m, .n = n, .k = k, .batch_out = batch_out, .batches = batches, .arm_m = rows_as orelse m };
+    // A fixed row count asks for the tiled kernels' sum: the vector kernels are other arithmetic.
+    if (rows_as == null) {
+        if (!a.transposed and b.transposed and try gemvWide(call)) return out;
+        if (@min(m, n) == 1) {
+            try gemv(call);
+            return out;
+        }
     }
     try steel(call);
     return out;
@@ -309,6 +324,8 @@ const Call = struct {
     k: usize,
     batch_out: usize,
     batches: Batches,
+    /// The row count the kernel, its tile and its k split are chosen for: `m` unless the caller fixed it.
+    arm_m: usize,
 
     fn int(v: usize) c_int {
         return @intCast(v);
@@ -423,8 +440,8 @@ fn gemv(c: Call) Error!void {
 fn steel(c: Call) Error!void {
     const use_nax = c.g.nax and (c.g.tf32 or c.out.dtype != .float32);
     const threshold: usize = if (c.g.class == 's' or c.g.class == 'd') 2048 else 1024;
-    const big = @max(c.m, c.n);
-    if (!use_nax and c.batch_out == 1 and ((c.m + 15) / 16) * ((c.n + 15) / 16) <= threshold and c.k / 16 >= 8 and c.k >= big) return splitK(c);
+    const big = @max(c.arm_m, c.n);
+    if (!use_nax and c.batch_out == 1 and ((c.arm_m + 15) / 16) * ((c.n + 15) / 16) <= threshold and c.k / 16 >= 8 and c.k >= big) return splitK(c);
     if (use_nax and c.batch_out == 1 and (c.k >= 3 * big or (big <= 1024 and c.k > 2 * big))) return splitKNax(c);
     return if (use_nax) fusedNax(c) else fused(c);
 }
@@ -476,9 +493,9 @@ fn fused(c: Call) Error!void {
     if (c.g.class == 'g' or c.g.class == 'p') {
         if (nt) t = nt_tile else if (half) t = half_tile;
     } else if (c.g.class == 'd') {
-        if (c.batch_out * c.m * c.n >= 1 << 20) {
+        if (c.batch_out * c.arm_m * c.n >= 1 << 20) {
             if (half) {
-                t = if (2 * @max(c.m, c.n) > c.k) half_tile else if (nt) nt_tile else .{ .bm = 32, .bn = 64, .bk = 16, .wm = 1, .wn = 2 };
+                t = if (2 * @max(c.arm_m, c.n) > c.k) half_tile else if (nt) nt_tile else .{ .bm = 32, .bn = 64, .bk = 16, .wm = 1, .wn = 2 };
             }
         } else if (half) {
             t = if (nt) nt_tile else half_tile;
@@ -494,11 +511,11 @@ fn fusedNax(c: Call) Error!void {
     var t: Tile = .{ .bm = 128, .bn = 128, .bk = 512, .wm = 4, .wn = 4 };
     const class = c.g.class;
     if (class == 's' or class == 'c') {
-        t.bk = if (c.k >= 8192 and c.k > c.m + c.n) 64 else 256;
+        t.bk = if (c.k >= 8192 and c.k > c.arm_m + c.n) 64 else 256;
         t.bm = 64;
         t.wm = 2;
     } else if (class == 'd') {
-        t = if (c.n > c.m) .{ .bm = 128, .bn = 64, .bk = 512, .wm = 4, .wn = 2 } else .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4 };
+        t = if (c.n > c.arm_m) .{ .bm = 128, .bn = 64, .bk = 512, .wm = 4, .wn = 2 } else .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4 };
     }
     const tiles_m = (c.m + t.bm - 1) / t.bm;
     var swizzle: u5 = if (tiles_m <= 3) 0 else 1;
@@ -600,10 +617,10 @@ fn nextPowerOfTwo(v: usize) usize {
 
 /// `steel_gemm_splitk_axpby`: a long inner axis cut into parts, each a product into f32, then summed.
 fn splitK(c: Call) Error!void {
-    const tm = (c.m + 31) / 32;
+    const tm = (c.arm_m + 31) / 32;
     const tn = (c.n + 31) / 32;
     const tk = c.k / 16;
-    const t: Tile = .{ .bm = if (c.m < 40) 16 else 32, .bn = if (c.n < 40) 16 else 32, .bk = 16, .wm = 2, .wn = 2 };
+    const t: Tile = .{ .bm = if (c.arm_m < 40) 16 else 32, .bn = if (c.n < 40) 16 else 32, .bk = 16, .wm = 2, .wn = 2 };
     const parts_n = @min(@max(2, nextPowerOfTwo(tk / (tm * tn))), 32);
     const iterations = (c.k / t.bk) / parts_n;
     const parts = try core.fresh(.float32, &.{ Call.int(parts_n), Call.int(c.m), Call.int(c.n) });
@@ -645,16 +662,16 @@ fn splitKNax(c: Call) Error!void {
     var part_size: usize = 4096;
     const ultra = c.g.class == 'd';
     if (ultra) {
-        if (c.m <= 2048 and c.n <= 2048) {
+        if (c.arm_m <= 2048 and c.n <= 2048) {
             t = .{ .bm = 64, .bn = 64, .bk = 256, .wm = 2, .wn = 2 };
             part_size = 2048;
-        } else if (c.n > c.m) {
+        } else if (c.n > c.arm_m) {
             t = .{ .bm = 128, .bn = 64, .bk = 512, .wm = 4, .wn = 2 };
         } else {
             t = .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4 };
         }
     }
-    if ((c.m + c.n) / 2 < 512 or c.k <= 4096) t = .{ .bm = 64, .bn = 64, .bk = 256, .wm = 2, .wn = 2 };
+    if ((c.arm_m + c.n) / 2 < 512 or c.k <= 4096) t = .{ .bm = 64, .bn = 64, .bk = 256, .wm = 2, .wn = 2 };
     if (c.k <= 1024) part_size = c.k / 2 else if (c.k <= 2048) part_size = 1024 else if (c.k <= 4096) part_size = 2048;
     const parts_n = (c.k + part_size - 1) / part_size;
     const parts = try core.fresh(.float32, &.{ Call.int(parts_n), Call.int(c.m), Call.int(c.n) });

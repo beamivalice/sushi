@@ -307,12 +307,19 @@ When it engages:
 A row's result does not depend on the rows beside it:
 - **The forward's kind picks its arms** (`Model.Forward`: `prefill`, `step`, `verify`; `Model.arm(kind)` is the one
   writer of the EXL3 row mode and of the deferred head, and gives back what it found).
-- **The router's dense product runs in fixed tiles of 2,048 rows** (`gateLogitsWide`, `cfg.gate_tile_rows`), a short
-  tile padded with zero rows. MLX's kernel choice for that product follows the row count
+- **The router's dense product runs in fixed tiles of 2,048 rows** (`gateLogitsWide`, `cfg.gate_tile_rows`). MLX's
+  kernel choice for that product follows the row count
   ([engine-mlx-gotchas](engine-mlx-gotchas.md#what-mlxs-bytes-depend-on)), so 1,024-row and 2,048-row chunks routed
-  on logits that differed in rounding and a near-tie pick could move with `--prefill-chunk`. The pad is 42 MB of f32
-  at the release's width, inside the forward cap's slack. The per-row gate kernel was measured and not taken: 2.97 ms
-  against 0.50 ms for 2,048 rows (release shape, min of 6).
+  on logits that differed in rounding and a near-tie pick could move with `--prefill-chunk`. The per-row gate kernel
+  was measured and not taken: 2.97 ms against 0.50 ms for 2,048 rows (release shape, min of 6).
+  - On the engine a short tile is launched as a full one over its own rows (`matmul.matmulRowsAs`: the kernel, its
+    tile and its k split are chosen for 2,048 rows, the grid covers the rows there are): the padded product's bits at
+    every width from 1 to 2,047, with no pad.
+  - MLX offers no such launch: on its stream the short tile is padded with zero rows, 42 MB of f32 at the release's
+    width, inside the forward cap's slack.
+  - A prompt shorter than 1,707 rows took MLX's split-K arm before the tiles and takes the fused arm now: its router
+    logits differ by f32 summation order (about 1e-6 relative), neither arm the more exact. The KLD gate's prompts are
+    282 to 338 rows, so its reading moved with it ([quality-kld](quality-kld.md)).
 - Pinned on `DSV41_STQ_TINY`: a prompt's tokens and the logits after them at chunk widths from 1,024 down to 33
   (`a prompt's tokens and the logits after them do not depend on the width its prefill was cut at`), every row of a
   verify at every width against the serial step on both routes, and the release's one-pass attention kernel span by

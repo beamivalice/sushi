@@ -125,8 +125,9 @@ between requests, about 0.26 GB (`arch_config.expertPoolBytes`, the arch's own a
 - **A restore reserves the rows' slack** (`Rows.reserve`): the first step after a restore from a point someone keeps
   copied every layer's rows (1,441,792 bytes on the tiny fixture against 163,840 cold); it now takes 196,608 and does
   not grow with the context.
-- **What does not scale with the rows sits in the cap's slack** (`cap_slack_bytes`, 256 MB): the router's zero pad of a
-  short tile (42 MB at the release's width, [dsv41-arch](dsv41-arch.md#prefill-width)) and the pool's whole pages. A wide
+- **What does not scale with the rows sits in the cap's slack** (`cap_slack_bytes`, 256 MB): the pool's whole pages
+  and, on MLX's stream only, the router's zero pad of a short tile (42 MB at the release's width,
+  [dsv41-arch](dsv41-arch.md#prefill-width)). A wide
   chunk fits its row term alone (`each forward's pool peak stays inside its cap, a wide chunk's inside the cap less its slack`).
 
 The live headroom the borrow reads (`dsv41Headroom`) is the ceiling less `gpu_mem.activeBytes`, which holds the

@@ -1028,6 +1028,12 @@ pub fn mlx_matmul(res: *A, a: A, b: A, _: S) c_int {
     return op2("matmul", res, a, b, @import("matmul.zig").matmul, .{});
 }
 
+/// `mlx_matmul` of two matrices on the engine, its kernel and tile chosen as for `rows_as` rows of `a`
+/// (`matmul.matmulRowsAs`).
+pub fn matmulRowsAs(res: *A, a: A, b: A, rows_as: usize) c_int {
+    return op2("matmul", res, a, b, @import("matmul.zig").matmulRowsAs, .{rows_as});
+}
+
 pub fn mlx_fast_rms_norm(res: *A, x: A, weight: A, eps: f32, _: S) c_int {
     return op2("rms_norm", res, x, weight, stock.rmsNorm, .{eps});
 }
@@ -4588,4 +4594,58 @@ test "engine reduction over an axis of no elements into a result that has some i
     try t_std.expect(mlx.mlx_sum_axis(&o, x, 1, false, core.stream()) != 0);
     var said: [256]u8 = undefined;
     try t_std.expect(std.mem.indexOf(u8, mlx.takeError(&said) orelse "", "TensorUnsupported") != null);
+}
+
+test "a dense product whose arm is chosen for a fixed row count gives each row the bits of the zero-padded product, at every width (the router's shapes)" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const s = core.stream();
+    const T = 2048;
+    // The release router (5,120 channels, 384 experts) and the tiny fixture's.
+    for ([_][2]usize{ .{ 5120, 384 }, .{ 256, 8 } }) |router| {
+        const k, const n = router;
+        const host = try t_std.allocator.alloc(f32, (T - 1) * k + n * k);
+        defer t_std.allocator.free(host);
+        var state: u32 = 0x2f6e2b1;
+        for (host) |*v| {
+            state = state *% 1664525 +% 1013904223;
+            v.* = @as(f32, @floatFromInt(state >> 8)) / 16777216.0 - 0.5;
+        }
+        const w = mlx.mlx_array_new_data(host[(T - 1) * k ..].ptr, &[_]c_int{ @intCast(n), @intCast(k) }, 2, .float32);
+        defer _ = mlx.mlx_array_free(w);
+        var wt: A = .{};
+        defer _ = mlx.mlx_array_free(wt);
+        try mlx.check(mlx.mlx_transpose_axes(&wt, w, &[_]c_int{ 1, 0 }, 2, s));
+        for ([_]usize{ 1, 2, 17, 31, 63, 64, 65, 100, 127, 128, 129, 500, 1000, 1024, 2047 }) |rows| {
+            const a = mlx.mlx_array_new_data(host.ptr, &[_]c_int{ @intCast(rows), @intCast(k) }, 2, .float32);
+            defer _ = mlx.mlx_array_free(a);
+            var zeros: A = .{};
+            defer _ = mlx.mlx_array_free(zeros);
+            try mlx.check(mlx.mlx_zeros(&zeros, &[_]c_int{ @intCast(T - rows), @intCast(k) }, 2, .float32, s));
+            const parts = mlx.mlx_vector_array_new_data(&[_]A{ a, zeros }, 2);
+            defer _ = mlx.mlx_vector_array_free(parts);
+            var padded: A = .{};
+            defer _ = mlx.mlx_array_free(padded);
+            try mlx.check(mlx.mlx_concatenate_axis(&padded, parts, 0, s));
+            var whole: A = .{};
+            defer _ = mlx.mlx_array_free(whole);
+            try mlx.check(mlx.mlx_matmul(&whole, padded, wt, s));
+            var want: A = .{};
+            defer _ = mlx.mlx_array_free(want);
+            try mlx.check(mlx.mlx_slice(&want, whole, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ @intCast(rows), @intCast(n) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            var want_c: A = .{};
+            defer _ = mlx.mlx_array_free(want_c);
+            try mlx.check(mlx.mlx_contiguous(&want_c, want, false, s));
+            var got: A = .{};
+            defer _ = mlx.mlx_array_free(got);
+            try mlx.check(matmulRowsAs(&got, a, wt, T));
+            try mlx.check(mlx.mlx_array_eval(want_c));
+            try mlx.check(mlx.mlx_array_eval(got));
+            try t_std.expectEqualSlices(c_int, mlx.getShape(want_c), mlx.getShape(got));
+            const bytes = rows * n * 4;
+            try t_std.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want_c).?[0..bytes], mlx.mlx_array_data_uint8(got).?[0..bytes]);
+        }
+    }
 }
