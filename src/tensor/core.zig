@@ -387,10 +387,22 @@ pub fn resetKernelProfile() void {
     profile.clearRetainingCapacity();
 }
 
+/// Kernels a profile lists by name before it sums the rest as one line: every kernel where the switch reads `all`.
+fn profileTop(raw: ?[*:0]const u8) usize {
+    const v = raw orelse return 40;
+    return if (std.mem.eql(u8, std.mem.span(v), "all")) std.math.maxInt(usize) else 40;
+}
+
+test "a kernel profile names its top 40 kernels, and every kernel where the switch reads all" {
+    try std.testing.expectEqual(@as(usize, 40), profileTop(null));
+    try std.testing.expectEqual(@as(usize, 40), profileTop("1"));
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), profileTop("all"));
+}
+
 /// Debug lines for the profile, `per` forwards to the totals; nothing while the switch is off.
 pub fn logKernelProfile(per: f64) void {
     if (!kernelProfOn()) return;
-    const top = 40;
+    const top = profileTop(std.c.getenv("SUSHI_ENGINE_KERNEL_PROF"));
     var other: KernelStat = .{ .name = "", .dispatches = 0, .total_ns = 0, .max_ns = 0 };
     var more: usize = 0;
     for (kernelProfile(), 0..) |k, i| {

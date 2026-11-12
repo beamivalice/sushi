@@ -208,6 +208,35 @@ Rules for reading it:
   Baseline:
   [perf-baselines](perf-baselines.md#deepseek-v41-stq-decode-energy-per-token-2026-11-11).
 
+<a id="optimization-tiers"></a>
+## 4e. Optimization rounds: micro indicator, fast bench, release bench
+
+An optimization lever is judged in three tiers, cheapest first. A tier is passed before the next one runs, and a later
+tier never stands in for an earlier one: the release bench heats the box for ten minutes and cannot tell a 2% lever from
+its own thermal state.
+
+| tier | what runs | cost | what it answers | how often |
+|---|---|---|---|---|
+| 1. micro indicator | the one reading the lever can move, named before the lever is built: bytes (a test on the tiny fixtures), a count (dispatches, command buffers, waits, bytes read: the census tests, `[engine] since load`), or `sushi-ubench` microseconds at release shapes with the old and the new arm in one process ([process-ubench](process-ubench.md)) | seconds to a minute, no pack load or one short one | is the lever real, and how large | every experiment |
+| 2. fast bench | `tests/bench.sh --tag <t> --rungs 4k,8k <pack> -- <serve flags>`: the release bench's own protocol at its first two rungs, both arms, one load | about 2 min, under a minute of GPU work | does the served path take the lever: the same text, the speculative mode engaged, the round mix, no Warnings, no cell under the baseline's | once per landing |
+| 3. release bench | the full ladder ([4c](#4c-the-release-bench)) | 10 min, and the box ends hot | the number that is recorded | once at the end of a series of landings, and when a phase closes |
+
+- **Tier 1 decides.** Arms interleaved in one process are the only timing heat does not move, and a count or a byte
+  compare does not move at all. A lever with no micro indicator gets one first (a `sushi-ubench` arm or bench, beside its
+  red test). A lever whose indicator does not move as predicted stops there.
+- **Tier 2 confirms, it never discovers.** One run of the new arm. The baseline is the series' first fast bench on its
+  head, inherited until a landing moves it; that landing's run is then the baseline. Read in this order: bytes (for a
+  byte-identical lever the text, or the `[spec-stats]` round mix), Warnings, verify ms at an equal round mix, tok/s. A
+  tok/s gap under 3% between two loads is no verdict either way.
+- **A context-dependent path adds its rung, not the ladder.** A diff in the indexer, the compressed rows, state growth
+  or restore runs the fast bench at the rung where that path engages (`--rungs 4k,64k`).
+- **Tier 3 needs a rested box**: no pack load in the 15 minutes before it and a boot under 50 °C. Its report carries
+  thermal pressure and the GPU clock beside every cell, and a 64k or 128k cell is compared only with them.
+- **Heat budget.** A pack load outside tier 3 lasts at most 3 minutes and its server stops with its last request. No
+  load repeats a number tier 1 already decided. A profiled load (`SUSHI_ENGINE_KERNEL_PROF`) runs the forward meter or
+  one short request, never a ladder. Cooling is the wrapper's own step (fans at max, an idle under 50 °C), not a wait
+  between unrelated runs: a tier 1 count or byte reading needs none.
+
 ## 5. Wait without hanging
 
 Never wait on `pgrep -f "<string>"`: every agent shell's own `zsh -c "<command>"` contains the string and matches
