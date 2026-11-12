@@ -537,6 +537,9 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - **A restore that finds a chunk file missing or short poisons the entry** (`restoreKvInto`), so the request prefills
   cold and the next commit of that prompt stores fresh instead of seeing it as superseded.
 - **A restore that fails on an unreadable or corrupt file poisons its entry on every arm** (`poisonUnreadable`: `MlxError`, `DiskCacheCorrupt*`), so a same-size rotted chunk is not retried on each lookup; a coverage miss (no checkpoint, QSA gap) leaves the entry, since a shorter prefix can still serve.
+- **A restore refused for memory keeps its entry** on every arm: `poisonUnreadable` poisons only when
+  `mlx.memoryRefusals()` (MLX's memory-class raises and the engine's pool refusals) did not move during the restore, read
+  by count because the restore drops its latch before the caller sees the error; it logs `[disk-cache] e<id> kept`.
 - A binary older than the lock takes none, so beside a newer one it still shares the root; only the token check
   covers that.
 

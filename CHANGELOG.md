@@ -76,6 +76,8 @@ earlier history is mlx-serve's, in that project's changelog.
   with the same output and no slower prefill.
 - **The peak memory figure is never below the memory in use**: right after a reset, `/props`, `sushi kld` and the
   load log read MLX's peak as at least what MLX holds, where it read nothing until MLX next allocated.
+- **A prompt-cache entry on the SSD survives a restore refused for memory**: on Qwen3.8-Flash-Next, GLM-5.3-Flash and
+  MiMo, a restore that ran out of room no longer deletes a valid entry; the next request restores it.
 
 ## v1.6.0 — Stability, UI and Architecture Refactor
 

@@ -561,9 +561,10 @@ pub fn restoreDisk(
         }
         self.allocator.free(kda);
     }
+    const refusals = mlx.memoryRefusals();
     const restored = d.restoreIntoKda(&pseudo, kda, hm.idx, hm.cp, s) catch |err| {
         log.warn("  [disk-cache] GLM restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-        pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err);
+        pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err, refusals);
         return null;
     };
     var rows = rowsFromDisk(self.allocator, &pseudo, bits) catch return null;

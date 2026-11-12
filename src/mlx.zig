@@ -1584,7 +1584,9 @@ pub const fault = struct {
 /// error — the state a real mlx-c raise leaves behind, which a best-effort caller
 /// must drop before returning.
 const LATCH_FAULT_MSG = "injected latching mlx-c raise (test only)";
+const LATCH_MEMORY_FAULT_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected latching raise, test only)";
 var latch_remaining: u64 = 0;
+var latch_msg: [*:0]const u8 = LATCH_FAULT_MSG.ptr;
 var latch_fired = false;
 
 fn latchFaultHit() bool {
@@ -1598,6 +1600,12 @@ fn latchFaultHit() bool {
 pub fn armLatchingFaultForTest(k: u64) void {
     latch_remaining = k;
     latch_fired = false;
+    latch_msg = LATCH_FAULT_MSG.ptr;
+}
+/// `armLatchingFaultForTest` whose raise is a Metal out-of-memory.
+pub fn armLatchingMemoryFaultForTest(k: u64) void {
+    armLatchingFaultForTest(k);
+    latch_msg = LATCH_MEMORY_FAULT_MSG.ptr;
 }
 pub fn latchingFaultFiredForTest() bool {
     return latch_fired;
@@ -1609,7 +1617,7 @@ pub fn check(ret: c_int) !void {
     if (comptime builtin.is_test) {
         if (fault.hit()) return error.MlxError;
         if (latchFaultHit()) {
-            latchMlxError(LATCH_FAULT_MSG.ptr, null);
+            latchMlxError(latch_msg, null);
             return error.MlxError;
         }
     }
@@ -1762,9 +1770,19 @@ pub fn mlxErrorIsMemory(msg: []const u8) bool {
     return false;
 }
 
+/// MLX raises of the memory class, counted whether or not they won the latch.
+var memory_raises = std.atomic.Value(u64).init(0);
+
+/// Refusals for memory so far, MLX's raises and the engine's pool both: a step that saw this move failed for room,
+/// whatever error it returned and whoever settled the latch since.
+pub fn memoryRefusals() u64 {
+    return memory_raises.load(.monotonic) + engine.poolRefusals();
+}
+
 fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
     _ = data;
     const span = std.mem.span(msg);
+    if (mlxErrorIsTransientCap(span) or mlxErrorIsMemory(span)) _ = memory_raises.fetchAdd(1, .monotonic);
     lockErrBuf();
     defer unlockErrBuf();
     // First error wins: follow-on noise from a poisoned stream must not hide the cause.

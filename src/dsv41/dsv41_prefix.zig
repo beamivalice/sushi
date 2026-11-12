@@ -498,12 +498,6 @@ fn rollbackLiveInPlace(
     return .{ .matched = pos, .full_match = false, .slot_owned = true };
 }
 
-/// Whether the failure latched now is a cap's or the machine's refusal of memory, which the next attempt may not meet.
-fn refusedForMemory() bool {
-    const name = mlx.peekErrorName() orelse return false;
-    return std.mem.eql(u8, name, "TransientCapExceeded") or std.mem.eql(u8, name, "OutOfMemory");
-}
-
 /// DeepSeek's SSD arm: the stored point under the match that beats the RAM match restores into the model.
 pub fn restoreDisk(
     self: *pc.HotPrefixCache,
@@ -526,11 +520,10 @@ pub fn restoreDisk(
     const cap = mlx.engine.uncapped();
     defer mlx.engine.capped(cap);
     const handled = Handled.begin();
-    const refused_before = mlx.engine.poolRefusals();
+    const refusals = mlx.memoryRefusals();
     var cp = d.restoreCheckpointInto(target_cache, hm.idx, hm.cp, snapshotLayers(m), s) catch |err| {
         log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-        // A refusal for memory says nothing of the file: its entry stays for the next lookup.
-        if (mlx.engine.poolRefusals() == refused_before and !refusedForMemory()) pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err);
+        pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err, refusals);
         target_cache.truncate(0, s) catch {};
         handled.drop();
         return null;

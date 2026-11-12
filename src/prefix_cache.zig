@@ -1356,10 +1356,15 @@ pub const HotPrefixCache = struct {
     }
 
     /// An unreadable or corrupt file fails the same way on every later lookup, so its entry dies;
-    /// a coverage miss (no checkpoint, QSA gap) can still serve a shorter prefix, so it stays.
-    pub fn poisonUnreadable(d: *kv_disk_cache.DiskTier, idx: usize, err: anyerror) void {
+    /// a coverage miss (no checkpoint, QSA gap) can still serve a shorter prefix, so it stays, and so does an entry
+    /// whose restore was refused for memory (`refusals_before`: `mlx.memoryRefusals()` as the restore began).
+    pub fn poisonUnreadable(d: *kv_disk_cache.DiskTier, idx: usize, err: anyerror, refusals_before: u64) void {
         switch (err) {
             error.MlxError, error.DiskCacheCorruptChunk, error.DiskCacheCorruptRing, error.DiskCacheCorruptSsm => {
+                if (mlx.memoryRefusals() != refusals_before) {
+                    log.warn("  [disk-cache] e{d} kept: its restore was refused for memory\n", .{d.entries.items[idx].id});
+                    return;
+                }
                 _ = d.poisonId(d.entries.items[idx].id, @errorName(err));
             },
             else => {},
@@ -1451,9 +1456,10 @@ pub const HotPrefixCache = struct {
                 const full_match = rm.at == prompt_ids.len;
                 const final_len: u32 = if (full_match and rm.at > 1) rm.at - 1 else rm.at;
                 const sw = io_util.Stopwatch.init(d.io);
+                const refusals = mlx.memoryRefusals();
                 d.restoreIntoRinged(target_cache, rm.idx, rm.pos, final_len, s) catch |err| {
                     log.warn("  [disk-cache] ring restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-                    poisonUnreadable(d, rm.idx, err);
+                    poisonUnreadable(d, rm.idx, err, refusals);
                     target_cache.truncate(0, s) catch {};
                     break :disk;
                 };
@@ -1496,9 +1502,10 @@ pub const HotPrefixCache = struct {
                 const disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
+                const refusals = mlx.memoryRefusals();
                 const restored = d.restoreIntoHybrid(target_cache, ssm_entries, hm.idx, disk_cp, s) catch |err| {
                     log.warn("  [disk-cache] hybrid restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-                    poisonUnreadable(d, hm.idx, err);
+                    poisonUnreadable(d, hm.idx, err, refusals);
                     // A failed restore can leave the cache AND ssm entries
                     // half-rebuilt; reset both before the fall-through.
                     target_cache.truncate(0, s) catch {};
@@ -1547,9 +1554,10 @@ pub const HotPrefixCache = struct {
             const full_match = effective == prompt_ids.len;
             const final_len: usize = if (full_match and effective > 1) effective - 1 else effective;
             const sw = io_util.Stopwatch.init(d.io);
+            const refusals = mlx.memoryRefusals();
             d.restorePrefixInto(target_cache, dm.idx, @intCast(final_len), s) catch |err| {
                 log.warn("  [disk-cache] restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-                poisonUnreadable(d, dm.idx, err);
+                poisonUnreadable(d, dm.idx, err, refusals);
                 // A failed restore can leave a half-rebuilt cache; reset it.
                 target_cache.truncate(0, s) catch {};
                 break :disk;
@@ -5817,6 +5825,49 @@ test "HotPrefixCache: an SSD entry that fails to restore is poisoned, not retrie
     try testing.expectEqual(@as(usize, 0), res.matched);
     try testing.expect(hc2.disk.?.entryPoisoned(id));
     mlx.dropLatchedErrorUnless(false);
+}
+
+test "HotPrefixCache: an SSD restore refused for memory keeps its entry, and the next lookup restores it" {
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-oom", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        _ = try hc.commit(&cache, &tokens, false);
+        hc.flushPendingDisk(s);
+    }
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-oom", 0, 128);
+    defer hc2.deinit();
+    const id = hc2.disk.?.entries.items[0].id;
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    var moe_off: usize = 0;
+    mlx.armLatchingMemoryFaultForTest(1);
+    const refused = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, 0, null, null);
+    const fired = mlx.latchingFaultFiredForTest();
+    mlx.armLatchingFaultForTest(0);
+    try testing.expect(fired);
+    try testing.expectEqual(@as(usize, 0), refused.matched);
+    try testing.expect(!hc2.disk.?.entryPoisoned(id));
+    try testing.expect(!mlx.errorPending());
+
+    const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 599), res.matched);
 }
 
 test "HotPrefixCache: a rotted tensor block of an SSD chunk refuses the restore, poisons the entry and the request prefills" {
