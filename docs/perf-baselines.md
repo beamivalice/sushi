@@ -425,31 +425,40 @@ is the same on the three sides. About 160 of a request's 210 rounds are plain on
   against 296 to 302): a wide chunk's Engram rows are read without `F_RDADVISE` since `0d43d77d`.
 - The decode right after the prefill (position 1): 39.3, 39.7 and 47.2 tok/s at 1399, 1404 and 1298 GPU mJ/token.
 
-## DeepSeek-V4.1 STQ on Sushi Cooler: release ladder at `7eb2da99` (2026-11-12)
+## DeepSeek-V4.1 STQ on Sushi Cooler: release ladder at `2aa5ddaf` (2026-11-12)
 
-The working baseline of the DeepSeek optimization rounds: `tests/bench.sh --tag cooler-p2b
+The working baseline of the DeepSeek optimization rounds: `tests/bench.sh --tag cooler-p2c
 DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw -- --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000`, commit
-`7eb2da99`, binary SHA-256 `3751dc19594fec7f`, M5 Max 128 GB, AC, fans at max, boot at 49 °C, `taskpolicy -a`, GPU
-lock, no Warnings (no kernel compiled inside a request). Beside it the v1.6.0 release report's cells (MLX decode and
+`2aa5ddaf`, binary SHA-256 `d9b45dce6682cb55`, M5 Max 128 GB, AC, fans at max, `taskpolicy -a`, GPU lock, no Warnings
+(no kernel compiled inside a request). The box had run no pack load for 15 minutes ([the release bench's tier](process-measurement.md#optimization-tiers)):
+boot at 49 °C, thermal pressure Nominal at every cell. Beside it the v1.6.0 release report's cells (MLX decode and
 prefill, `ac3da7aa`), the same protocol. Medians of three decode samples; tok/s.
 
 | rung | code decode | v1.6.0 | prose decode | v1.6.0 | code prefill | v1.6.0 | prose prefill | v1.6.0 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4k | 95.7 | 95.5 | 52.5 | 50.3 | 1,293 | 1,242 | 905 | 858 |
-| 8k | 96.6 | 100.8 | 57.5 | 56.5 | 1,464 | 1,493 | 1,297 | 1,093 |
-| 16k | 75.2 | 76.5 | 50.2 | 46.9 | 1,477 | 1,497 | 1,405 | 1,247 |
-| 32k | 86.3 | 91.1 | 54.2 | 51.3 | 1,477 | 1,468 | 1,347 | 1,191 |
-| 64k | 84.9 | 84.8 | 50.1 | 51.8 | 1,377 | 1,383 | 1,308 | 1,264 |
-| 128k | 74.2 | 75.1 | 51.0 | 52.2 | 1,225 | 1,266 | 1,178 | 1,172 |
+| 4k | 93.3 | 95.5 | 53.1 | 50.3 | 1,300 | 1,242 | 893 | 858 |
+| 8k | 99.6 | 100.8 | 58.4 | 56.5 | 1,476 | 1,493 | 1,311 | 1,093 |
+| 16k | 76.2 | 76.5 | 54.4 | 46.9 | 1,524 | 1,497 | 1,427 | 1,247 |
+| 32k | 88.7 | 91.1 | 54.1 | 51.3 | 1,480 | 1,468 | 1,374 | 1,191 |
+| 64k | 83.4 | 84.8 | 54.0 | 51.8 | 1,417 | 1,383 | 1,313 | 1,264 |
+| 128k | 75.2 | 75.1 | 52.3 | 52.2 | 1,272 | 1,266 | 1,195 | 1,172 |
 
-- **Cells still under v1.6.0**: code decode at 8k (4%), 32k (5%), 16k and 128k (1 to 2%); prose decode at 64k and 128k
-  (2 to 3%); code prefill at 8k, 16k (1 to 2%) and 128k (3%). Prose prefill is ahead at every rung, prose decode to 32k.
-- **The long rungs ran hotter than v1.6.0's**: thermal pressure read Moderate at the prose 64k rung and Heavy at both
-  128k rungs (GPU 1513 and 1571 MHz), where the v1.6.0 run stayed Nominal (1528 and 1589 MHz). The box had run loads
-  all day; a cell at 64k or 128k is compared only with its pressure and clock beside it.
-- The run before it (`f9cacade`, tag `cooler-p2a`) is not a measurement: one window compiled a kernel inside a request
-  (fixed in `771cbaca`), and its copy rounds went to 16 rows after one whole round (`7eb2da99` changed the rule), which
-  cost its code cells 88.7 at 8k, 78.3 at 64k and 67.6 at 128k.
+- **Prose decode and prose prefill are ahead of v1.6.0 at every rung** (decode 3 to 16% to 64k, level at 128k; prefill
+  2 to 20%). Code prefill is ahead or level but for 8k (1%).
+- **Code decode is 0 to 3% under v1.6.0 to 64k and level at 128k.** At an equal round mix a verify pass costs what
+  the MLX route's does (one binary, both routes, cooled loads back to back at 16k, 32k and 64k: within 3% either way
+  at every pass width), so what is left is the round mix a run draws (the 4k cell ran 52 rounds in one run and 55 in
+  another) and under 3% of clock.
+- **The run three hours of loads earlier (`7eb2da99`, tag `cooler-p2b`) read Moderate and Heavy pressure at the long
+  rungs** and 1 to 5% lower there (code 128k 74.2 at Heavy, prose 64k 50.1 at Moderate): the rest before the bench
+  is what moved those cells, not code. Since it: the draft's Markov kernel (`e27483db`).
+- The run before that (`f9cacade`, tag `cooler-p2a`) is not a measurement: one window compiled a kernel inside a
+  request (fixed in `771cbaca`), and its copy rounds went to 16 rows after one whole round (`7eb2da99` changed the
+  rule), which cost its code cells 88.7 at 8k, 78.3 at 64k and 67.6 at 128k.
+- **Where a decode request's GPU time goes** (per-kernel profile of one greedy request, 75 rounds, `7f726d0d`): the
+  routed experts' pair and down kernels 37%, the trunk's row kernels 23%, attention 7%, the draft's stage experts 7%,
+  hyper-connections 5%; every small glue dispatch together (finishes, copies, casts, norms) 5%. The GPU is busy 98%
+  of the request. Prefill (25.8k tokens): the two GEMM families 62%, attention 16%.
 
 ## v1.2.0-dev release context ladder
 
