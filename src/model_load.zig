@@ -704,6 +704,7 @@ pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config:
     const per_expert = bill.expert_bytes;
     streamed.expert_shape = bill.shape;
     streamed.expert_shape.pool_bytes = config.expertPoolBytes();
+    streamed.expert_shape.kept_bytes = if (config.expertKeepsScales()) bill.shape.scale_bytes else 0;
     const picked = resolveStreamedVision(budget_bytes, &streamed, split, per_expert, vision) catch |err| {
         if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or pass --no-vision\n", .{
             budget_bytes >> 30,
@@ -1733,8 +1734,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         vision_cost = plan.vision;
         load_vision = plan.vision.on;
         var origin_buf: [160]u8 = undefined;
+        var kept_buf: [48]u8 = undefined;
         log.info("{s}\n", .{budgetOriginLine(&origin_buf, budget, if (plan.resolved.ledger) |led| led.resident else false)});
-        if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, vision {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB, mlx pool {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer{s}\n", .{
+        if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, vision {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB, mlx pool {d:.2} GB{s} -> expert cache {d:.2} GB = {d} slots/layer{s}\n", .{
             led.budget_bytes >> 30,
             @as(f64, @floatFromInt(led.trunk_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.mtp_bytes)) / 1e9,
@@ -1743,6 +1745,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             @as(f64, @floatFromInt(led.selected_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.bounce_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.pool_bytes)) / 1e9,
+            if (led.kept_bytes > 0) std.fmt.bufPrint(&kept_buf, ", kept scales {d:.2} GB", .{@as(f64, @floatFromInt(led.kept_bytes)) / 1e9}) catch unreachable else "",
             @as(f64, @floatFromInt(led.cache_bytes)) / 1e9,
             plan.cache.slots_per_layer,
             if (led.resident) ", every routed expert resident" else "",

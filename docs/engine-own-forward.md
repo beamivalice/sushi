@@ -91,6 +91,9 @@ hands to the GPU at once, so the GPU runs group g while the host reads group g+1
 route marks the ranges each stage writes (`Staged.marks`, one covering range per stage and slab, in `fill_marks`)
 instead of the slabs whole, so the guard lets a pass bind a group that has landed and still refuses one that binds a
 group still being read. `StqStream.stage_on_engine` (test only) restores the old order, which the guard refuses.
+The route hands the open pass to the GPU before each of its reads (`mlx.engine.submit`): the prep and the shared
+expert's GEMMs encoded ahead of the first group would otherwise wait in the pass for the SSD
+(`StqStream.held_at_read` counts dispatches a read found unsubmitted; a served route leaves it 0).
 
 The load also runs the wide forwards a prompt reaches (`warmWide`: a full-width state-only and head chunk, head chunks
 whole, part and not at all on the GEMM tiles, the held-back tail, one chunk per pick-sort size and one per

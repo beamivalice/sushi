@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash prefills long prompts faster on Sushi Cooler**: an expert streamed back from the SSD no
+  longer re-reads its small scale vectors while the GPU waits, so long prompts on a budget below the whole pack
+  process sooner with the same output; the SSD budget sets 0.7 GB aside for them.
 - **DeepSeek-V4.1-Flash drafts cost less**: each drafted token reads its bigram table once, in the form the pack
   stores it, so speculative rounds on code and prose finish sooner with the same text, and the load holds 66 MB less.
 - **DeepSeek-V4.1-Flash STQ prefill runs on Sushi Cooler on M5 Macs**: long prompts are processed on sushi's own Metal

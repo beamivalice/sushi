@@ -125,6 +125,12 @@ pub fn ownDecode(c: *const Config) bool {
     return decodeSideOf(c) == .engine;
 }
 
+/// Whether the load keeps each expert's scale vectors in host memory once read (`expert_stream.KeptScales`): an STQ
+/// pack on Sushi Cooler. The load turns it on and the ssd-budget ledger bills it from this one answer.
+pub fn keepsScales(c: *const Config) bool {
+    return c.expert_dec != null and ownDecode(c);
+}
+
 /// What the engine of our own may hold during a request at `seq`, beside MLX's cap: a decode forward's cap again,
 /// since a forward of ours makes on its own queue what MLX's would have made on MLX's.
 pub fn ownCap(c: *const Config, seq: u64) u64 {

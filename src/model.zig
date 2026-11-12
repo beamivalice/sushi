@@ -823,6 +823,12 @@ pub const ModelConfig = struct {
         return arch_config.expertPoolBytes(self);
     }
 
+    /// Whether the load keeps each streamed expert's scale vectors in host memory once read, billed in the ssd-budget
+    /// ledger (`arch_config.expertKeepsScales`).
+    pub fn expertKeepsScales(self: *const ModelConfig) bool {
+        return arch_config.expertKeepsScales(self);
+    }
+
     /// Percent of the SSD read rate the expert prefetch may use: the launch flag, else the model setting, else the default.
     pub fn ssdPrefetchPct(self: *const ModelConfig) u8 {
         return self.ssd_prefetch orelse self.ssd_prefetch_override orelse default_ssd_prefetch;

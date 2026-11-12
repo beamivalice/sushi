@@ -457,9 +457,30 @@ prefill, `ac3da7aa`), the same protocol. Medians of three decode samples; tok/s.
   request (fixed in `771cbaca`), and its copy rounds went to 16 rows after one whole round (`7eb2da99` changed the
   rule), which cost its code cells 88.7 at 8k, 78.3 at 64k and 67.6 at 128k.
 - **Where a decode request's GPU time goes** (per-kernel profile of one greedy request, 75 rounds, `7f726d0d`): the
-  routed experts' pair and down kernels 37%, the trunk's row kernels 23%, attention 7%, the draft's stage experts 7%,
+  routed experts' pair and down kernels 37%, the trunk's row kernels 23%, attention 7%, the prefill GEMMs of the
+  request's own prompt tail 6%, the draft's stage experts 2%,
   hyper-connections 5%; every small glue dispatch together (finishes, copies, casts, norms) 5%. The GPU is busy 98%
   of the request. Prefill (25.8k tokens): the two GEMM families 62%, attention 16%.
+
+### Prefill after the kept scales (`39bbe103`, fast bench)
+
+`tests/bench.sh --tag p2-scales --rungs 8k,32k`, the same pack and flags, commit `39bbe103` (on `404e8b38`: a ranged
+route hands its pass over before each read, and an expert's scales are read from the SSD once), binary SHA-256
+`1ac58f779286f1b8`, M5 Max, AC, fans at max, `taskpolicy -a`, GPU lock, boot at 49 °C, Nominal. Baseline: the table above,
+recorded, not rerun.
+
+| rung | code prefill | was | prose prefill | was |
+|---|---:|---:|---:|---:|
+| 8k | 1,576 | 1,476 | 1,339 | 1,311 |
+| 32k | 1,500 | 1,480 | 1,434 | 1,374 |
+
+- The micro indicator that decided it: on one 25.8k-token prompt the GPU's idle time fell from 2,864 to 2,076 ms of
+  18.6 s (`[engine] since load:`, uncooled loads back to back, same reply bytes).
+- Decode at an equal round mix costs the same a round (code 8k: 56.2 ms a round in both runs on the 52-round sample,
+  55.4 against 54.3 to 54.7 on the 47-round one); the code 8k cell reads 93.8 against 99.6 because one of its three
+  samples drew a 49-round mix. The ledger gives the scales 0.68 GB, 262 slots a layer for 264.
+- What is left of the idle is the trellis reads of the layers that miss the most (sixty experts a chunk on some
+  encoder layers, 47 ms of reads against 16 ms of GEMMs to hide them behind).
 
 ## v1.2.0-dev release context ladder
 

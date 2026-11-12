@@ -64,6 +64,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         allocator.destroy(e);
     };
     const engine = engine_mine.?;
+    if (dsv41_borrow.keepsScales(&config.dsv41.?) and !engine.plan.resident) try engine.keepScales();
     var plan = beginPipelines(allocator, &config, engine, own_decode);
     defer plan.deinit();
     // The load drops each tensor from the map once its arrays are bound.

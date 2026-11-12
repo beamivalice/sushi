@@ -821,6 +821,16 @@ pub fn mlx_async_eval(v: V) c_int {
     return 0;
 }
 
+/// Hands the open pass to the GPU without waiting, for a host about to block on something that is not the GPU.
+pub fn submit() !void {
+    if (enabled) try core.submit();
+}
+
+/// Dispatches encoded and not yet handed over.
+pub fn openDispatches() u32 {
+    return if (enabled) core.openDispatches() else 0;
+}
+
 pub fn mlx_synchronize(s: S) c_int {
     _ = s;
     core.sync() catch |e| return fail("synchronize", e);

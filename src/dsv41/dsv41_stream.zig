@@ -165,6 +165,9 @@ pub const StqStream = struct {
     stage_on_engine: bool = false,
     /// Wide routes read in MLX's order, the whole fill behind one lazy chain: none on a load whose chain is the engine's.
     mlx_order_routes: u64 = 0,
+    /// Dispatches a ranged route had encoded and not handed over when one of its reads began: GPU work that waited
+    /// for the SSD.
+    held_at_read: u64 = 0,
     /// A settle's picks as expert ids, and the slots they resolved to: kept between settles.
     picks: std.ArrayList(u16) = .empty,
     slots: std.ArrayList(i32) = .empty,
@@ -382,18 +385,23 @@ pub const StqStream = struct {
             engine: *stream.Engine,
             prepared: *stream.Prepared,
             stall_ns: u64,
+            held: *u64,
             fn scales(ctx: *anyopaque) anyerror!*const exl3.Ragged {
                 const r: *@This() = @ptrCast(@alignCast(ctx));
+                try mlx.engine.submit();
+                r.held.* += mlx.engine.openDispatches();
                 try r.engine.stageScales(r.prepared);
                 return r.engine.stageBank(r.prepared);
             }
             fn group(ctx: *anyopaque, g: usize) anyerror!void {
                 const r: *@This() = @ptrCast(@alignCast(ctx));
                 if (g > 0 and r.stall_ns != 0) _ = std.c.nanosleep(&.{ .sec = 0, .nsec = @intCast(r.stall_ns) }, null);
+                try mlx.engine.submit();
+                r.held.* += mlx.engine.openDispatches();
                 try r.engine.stageGroup(r.prepared, g);
             }
         };
-        var reads = Reads{ .engine = self.engine, .prepared = &prepared, .stall_ns = self.stall_ns };
+        var reads = Reads{ .engine = self.engine, .prepared = &prepared, .stall_ns = self.stall_ns, .held = &self.held_at_read };
         const out = if (ranged)
             try model.stqRoutedStaged(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), x, local, wts, shared, .{ .ctx = &reads, .scales = Reads.scales, .group = Reads.group })
         else

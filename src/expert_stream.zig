@@ -198,6 +198,8 @@ pub const BudgetLedger = struct {
     selected_bytes: u64,
     bounce_bytes: u64,
     pool_bytes: u64 = 0,
+    /// The scales kept in host memory (`KeptScales`); 0 where the load keeps none.
+    kept_bytes: u64 = 0,
     cache_bytes: u64,
     slots_per_layer: u16,
     resident: bool = false,
@@ -237,7 +239,7 @@ pub fn budgetLedger(
     };
     const workspace_bytes = workspaceBytes(experts, expert_bytes, shape) catch return error.InvalidExpertGeometry;
     const selected_bytes = @as(u64, @min(top_k, experts)) *| expert_bytes;
-    const fixed = trunk_bytes +| mtp_bytes +| vision_bytes +| workspace_bytes +| selected_bytes +| bounce_bytes +| shape.pool_bytes;
+    const fixed = trunk_bytes +| mtp_bytes +| vision_bytes +| workspace_bytes +| selected_bytes +| bounce_bytes +| shape.pool_bytes +| shape.kept_bytes;
     if (fixed >= budget_bytes) return error.SsdBudgetBelowResident;
     const per_slot = @as(u64, layers) *| expert_bytes;
     const slots_u64 = @min((budget_bytes - fixed) / per_slot, experts);
@@ -253,6 +255,7 @@ pub fn budgetLedger(
         .selected_bytes = selected_bytes,
         .bounce_bytes = bounce_bytes,
         .pool_bytes = shape.pool_bytes,
+        .kept_bytes = shape.kept_bytes,
         .cache_bytes = @as(u64, slots) *| per_slot,
         .slots_per_layer = slots,
     };
@@ -1792,6 +1795,31 @@ fn presentSlabCount(slabs: []const SlabOperand) u64 {
 }
 
 /// A wide route's SSD fill in stages: stage 0 every miss's scale pieces, stage 1 + g rate group g's trellis.
+/// A missed expert whose scales are being read from the SSD: where each scale component lands.
+const ScaleRead = struct { expert: u16, dst: [quant.component_count][]u8 = @splat(&.{}) };
+
+/// The scale vectors of every expert the engine has read them for (`Engine.keepScales`), in host memory: a later miss
+/// of the expert copies them from here and reads only its trellis. One entry an expert, its scale components in
+/// component order.
+pub const KeptScales = struct {
+    entries: []?[]u8,
+    experts: usize,
+    bytes: u64 = 0,
+    /// Experts whose scales were read from the SSD and kept.
+    read: u64 = 0,
+    /// Misses filled from here.
+    served: u64 = 0,
+
+    fn at(self: *KeptScales, layer: u16, expert: usize) *?[]u8 {
+        return &self.entries[@as(usize, layer) * self.experts + expert];
+    }
+
+    fn deinit(self: *KeptScales, allocator: std.mem.Allocator) void {
+        for (self.entries) |entry| if (entry) |bytes| allocator.free(bytes);
+        allocator.free(self.entries);
+    }
+};
+
 pub const Staged = struct {
     layer: u16,
     gl: *GroupedLayer,
@@ -1802,6 +1830,8 @@ pub const Staged = struct {
     spans: [1 + quant.rate_group_limit]std.ArrayList(io_mod.FillSpan) = @splat(.empty),
     /// Admitted misses as (group, slot), ready once every stage has landed.
     admitted: std.ArrayList([2]u16) = .empty,
+    /// The scales stage 0 reads, kept once it has landed.
+    scale_reads: std.ArrayList(ScaleRead) = .empty,
     misses: u64 = 0,
     /// Stages read so far.
     done: usize = 0,
@@ -1839,6 +1869,7 @@ pub const Staged = struct {
         for (&self.marks) |*list| list.deinit(allocator);
         for (&self.spans) |*list| list.deinit(allocator);
         self.admitted.deinit(allocator);
+        self.scale_reads.deinit(allocator);
         allocator.destroy(self);
     }
 };
@@ -1957,6 +1988,7 @@ pub const ProbeReading = struct { bps: [probe_widths.len]f64, max_bps: f64 };
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     geometry: Geometry,
+    kept: ?KeptScales = null,
     drop_owned: ?*expert_usage.Drop = null,
     /// The pack's `expert_usage.json` counts, `[routed layer][expert id]`: ranks what `warmCache` preloads.
     warm_usage: ?expert_usage.Usage = null,
@@ -2196,7 +2228,50 @@ pub const Engine = struct {
             self.allocator.destroy(d);
         }
         if (self.warm_usage) |*u| u.deinit();
+        if (self.kept) |*k| k.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// From here on the scales of an expert read from the SSD stay in host memory (`KeptScales`).
+    pub fn keepScales(self: *Engine) !void {
+        if (self.kept != null) return;
+        const entries = try self.allocator.alloc(?[]u8, @as(usize, self.geometry.layers) * self.geometry.experts);
+        @memset(entries, null);
+        self.kept = .{ .entries = entries, .experts = self.geometry.experts };
+    }
+
+    /// The scale component `ci` of `expert` copied to `dst` from the kept ones; false where none is kept, and the
+    /// caller reads it.
+    fn scaleFromKept(self: *Engine, layer: u16, expert: u16, ci: usize, dst: []u8) bool {
+        const k = &(self.kept orelse return false);
+        const entry = k.at(layer, expert).* orelse return false;
+        var at: usize = 0;
+        for (0..ci) |cj| {
+            if (cj % 3 != 0) at += self.store.spanAt(layer, expert, cj).len;
+        }
+        @memcpy(dst, entry[at..][0..dst.len]);
+        if (ci == 1) k.served += 1;
+        return true;
+    }
+
+    /// Keeps the scales `reads` name, which have landed.
+    fn keepRead(self: *Engine, layer: u16, reads: []const ScaleRead) !void {
+        const k = &(self.kept orelse return);
+        for (reads) |r| {
+            const entry = k.at(layer, r.expert);
+            if (entry.* != null) continue;
+            var total: usize = 0;
+            for (r.dst) |d| total += d.len;
+            const bytes = try self.allocator.alloc(u8, total);
+            var at: usize = 0;
+            for (r.dst) |d| {
+                @memcpy(bytes[at..][0..d.len], d);
+                at += d.len;
+            }
+            entry.* = bytes;
+            k.bytes += total;
+            k.read += 1;
+        }
     }
 
     /// Bytes `--drop-expert` leaves unloaded: each dropped expert at its own rate group's size.
@@ -3209,6 +3284,8 @@ pub const Engine = struct {
 
         var spans: std.ArrayList(io_mod.FillSpan) = .empty;
         defer spans.deinit(self.allocator);
+        var scale_reads: std.ArrayList(ScaleRead) = .empty;
+        defer scale_reads.deinit(self.allocator);
         var misses: u64 = 0;
         var copy_clock = Clock.init();
         if (use_union) layer.stats.unions += 1;
@@ -3225,14 +3302,21 @@ pub const Engine = struct {
                 }
                 if (binding.hit) continue;
                 misses += 1;
+                const global = gl.groups.base[g] + binding.expert;
+                var read: ScaleRead = .{ .expert = global };
                 for (0..n) |ci| {
-                    const source = self.store.spanAt(layer_index, gl.groups.base[g] + binding.expert, ci);
+                    const source = self.store.spanAt(layer_index, global, ci);
                     const dst = if (use_union)
                         gl.unionRegion(&read_set[ci], g, ci, position)
                     else
                         gl.cacheRegion(&layer.slabs[ci], g, ci, binding.slot orelse return error.ExpertBindingMissing);
+                    if (ci % 3 != 0) {
+                        if (self.scaleFromKept(layer_index, global, ci, dst[0..source.len])) continue;
+                        read.dst[ci] = dst[0..source.len];
+                    }
                     try spans.append(self.allocator, gl.fillSpan(source, dst, g, ci));
                 }
+                if (self.kept != null and read.dst[1].len > 0) try scale_reads.append(self.allocator, read);
             }
         }
         if (!use_union and spans.items.len > 0) wrote_cache = true;
@@ -3240,6 +3324,7 @@ pub const Engine = struct {
         layer.stats.copy_ns += copied;
         self.copy_ns_total += copied;
         try self.runFill(layer_index, spans.items);
+        try self.keepRead(layer_index, scale_reads.items);
         self.fill_experts_total += misses;
 
         if (use_union) {
@@ -3364,9 +3449,14 @@ pub const Engine = struct {
                 if (binding.hit) continue;
                 st.misses += 1;
                 if (binding.slot) |slot| try st.admitted.append(self.allocator, .{ @intCast(g), slot });
+                var read: ScaleRead = .{ .expert = global };
                 for (0..n) |ci| {
                     const source = self.store.spanAt(layer_index, global, ci);
                     const dst = if (binding.slot) |slot| gl.cacheRegion(&layer.slabs[ci], g, ci, slot) else gl.unionRegion(&self.grouped_union[ci], g, ci, spilled);
+                    if (ci % 3 != 0) {
+                        if (self.scaleFromKept(layer_index, global, ci, dst[0..source.len])) continue;
+                        read.dst[ci] = dst[0..source.len];
+                    }
                     // The scales go first: every group's GEMM prepares its rows with all of them.
                     const stage = if (ci % 3 == 0) 1 + g else 0;
                     try st.spans[stage].append(self.allocator, gl.fillSpan(source, dst, g, ci));
@@ -3374,6 +3464,7 @@ pub const Engine = struct {
                     const seen = &cover[stage][if (binding.slot != null) 0 else 1][ci];
                     seen.* = if (seen.*) |r| .{ @min(r[0], at_dst), @max(r[1], at_dst + dst.len) } else .{ at_dst, at_dst + dst.len };
                 }
+                if (self.kept != null and read.dst[1].len > 0) try st.scale_reads.append(self.allocator, read);
                 if (binding.slot == null) spilled += 1;
             }
         }
@@ -3465,6 +3556,8 @@ pub const Engine = struct {
         const st = p.staged orelse return;
         if (st.done >= 1) return;
         try self.runFill(st.layer, st.spans[0].items);
+        try self.keepRead(st.layer, st.scale_reads.items);
+        st.scale_reads.clearRetainingCapacity();
         st.done = 1;
         st.unmark(0);
     }
@@ -4026,6 +4119,27 @@ test "expert stream ssd budget ledger bills the MLX pool beside the fixed terms 
     // A budget the pool alone tips under two slots a layer is refused.
     const floor = fixed + 2 * 48 * expert_bytes;
     try t.expectError(error.SsdBudgetBelowResident, budgetLedger(floor - 1, trunk, 0, 0, 48, 512, 10, expert_bytes, BOUNCE_BYTES, .{ .pool_bytes = 6 * GiB }));
+}
+
+test "expert stream ssd budget ledger bills the kept scales beside the cache, and a resident store bills none" {
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const expert_bytes: u64 = 9_830_400;
+    const trunk: u64 = 9_900_000_000;
+    const kept: u64 = 700_000_000;
+    const none = try budgetLedger(100 * GiB, trunk, 0, 0, 40, 384, 6, expert_bytes, BOUNCE_BYTES, .{});
+    const keeps = try budgetLedger(100 * GiB, trunk, 0, 0, 40, 384, 6, expert_bytes, BOUNCE_BYTES, .{ .kept_bytes = kept });
+    try t.expectEqual(@as(u64, 0), none.kept_bytes);
+    try t.expectEqual(kept, keeps.kept_bytes);
+    try t.expect(keeps.slots_per_layer < none.slots_per_layer);
+    const fixed = trunk + keeps.workspace_bytes + keeps.selected_bytes + BOUNCE_BYTES + kept;
+    try t.expect(fixed + keeps.cache_bytes <= 100 * GiB);
+    try t.expect(fixed + keeps.cache_bytes + 40 * expert_bytes > 100 * GiB);
+    // Nothing is read on a route of a resident store, so nothing is kept.
+    const shape: quant.StoreShape = .{ .all_bytes = 100_000_000_000, .kept_bytes = kept };
+    const resident = try budgetLedger(trunk + shape.all_bytes, trunk, 0, 0, 40, 384, 6, 9_000_000, BOUNCE_BYTES, shape);
+    try t.expect(resident.resident);
+    try t.expectEqual(@as(u64, 0), resident.kept_bytes);
 }
 
 test "expert stream: a resident store still bills the pool, and a budget short by it streams" {

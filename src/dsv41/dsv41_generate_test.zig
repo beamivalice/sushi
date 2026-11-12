@@ -3048,6 +3048,7 @@ fn wideChunkProof(dir: []const u8, plans: []const []const usize, cache_bytes: u6
         m.engine_prefill = true;
         hook.stall_ns = stall_ns;
         hook.stage_on_engine = refused != null;
+        try hook.engine.keepScales();
         const filled = hook.engine.fill_bytes_total;
         defer {
             m.engine_decode = false;
@@ -3079,7 +3080,15 @@ fn wideChunkProof(dir: []const u8, plans: []const []const usize, cache_bytes: u6
         try testing.expectEqual(@as(u64, 0), want.prefill_dispatches);
         try testing.expect(got.prefill_dispatches > 0);
         try testing.expectEqual(cache_bytes < (64 << 20), hook.engine.fill_bytes_total > filled);
+        // The GPU has everything encoded before a read of the route began.
+        try testing.expectEqual(@as(u64, 0), hook.held_at_read);
         try want.expectSame(&got);
+        if (cache_bytes < (64 << 20)) {
+            // An expert's scales are read from the SSD once; a later miss of it copies them and reads its trellis only.
+            const kept = hook.engine.kept.?;
+            try testing.expect(kept.read > 0 and kept.read <= kept.entries.len);
+            try testing.expect(kept.served > 0);
+        }
     }
 }
 

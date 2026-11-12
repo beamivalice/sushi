@@ -228,6 +228,14 @@ pub fn expertPoolBytes(config: *const model.ModelConfig) u64 {
     }
 }
 
+/// Whether the arch's load keeps its streamed experts' scale vectors in host memory; an arch that says nothing keeps none.
+pub fn expertKeepsScales(config: *const model.ModelConfig) bool {
+    const tag = tagOf(config) orelse return false;
+    switch (tag) {
+        inline else => |t| return if (@hasDecl(registry.Mod(t), "expertKeepsScales")) registry.Mod(t).expertKeepsScales(config) else false,
+    }
+}
+
 /// The arch's part of the parse, on top of the fields every arch shares.
 pub fn parseFamily(config: *model.ModelConfig, tag: Tag, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
     config.arch = .{ .tag = tag };

@@ -1230,6 +1230,12 @@ pub fn submit() Error!void {
     try commitPass(s, open);
 }
 
+/// Dispatches encoded into the open pass and not yet handed to the GPU.
+pub fn openDispatches() u32 {
+    const s = &(state orelse return 0);
+    return if (s.pass != null) s.pass_dispatches else 0;
+}
+
 /// Submits the open pass and waits until the GPU has run everything submitted.
 pub fn sync() Error!void {
     return syncState(try st());

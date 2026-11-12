@@ -36,6 +36,8 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
   - **Decode** (a forward of up to 17 rows, DSpark's widest verify is 16): `dsv41_pool_bytes`, 1 GiB, billed in the
     ledger as the `mlx pool` term (`capMlxPool` at load, `[mem] MLX buffer-pool cap ... from the ssd-budget ledger`), so
     the cache gives up ~3 slots a layer instead of ~24.
+  - **Kept scales** (an STQ pack on Sushi Cooler): host memory, not Metal's, 0.68 GB on the 1.75bpw pack, the ledger's
+    `kept scales` term ([engine-expert-streaming](engine-expert-streaming.md#budget)): two slots a layer at 108 GiB.
   - **Prefill** (a wider forward): the RAM-wide cap, with no cap of its own. The transient cap
     ([below](#transient-caps)) bounds the pool together with the forward's allocations, so MLX trims the pool on demand
     at it and the parked pool never passes what was billed. The decode cap is a standing term of the live headroom

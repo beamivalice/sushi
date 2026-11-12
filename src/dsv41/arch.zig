@@ -51,6 +51,12 @@ pub fn expertPoolBytes(config: *const Config) u64 {
     return if (borrow.ownDecode(&c)) borrow.ownCap(&c, 1) else config_file.dsv41_pool_bytes;
 }
 
+/// An STQ pack on Sushi Cooler keeps the scales of the experts it has read (`dsv41_borrow.keepsScales`).
+pub fn expertKeepsScales(config: *const Config) bool {
+    const c = config.dsv41 orelse return false;
+    return @import("dsv41_borrow.zig").keepsScales(&c);
+}
+
 pub const config_facts: arch_config.Facts = .{
     .thinks_by_default = true,
     .reads_pair_major = true,

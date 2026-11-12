@@ -93,7 +93,8 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - `expert_stream.budgetLedger`, one `[expert-stream] ssd budget` boot line. `--ssd-budget-gb N` is a TOTAL resident
   target of N GiB = trunk + MTP + vision tower (under `--vision`) + the all-experts union workspace + selected slab +
   bounce + the MLX buffer pool a model caps for itself (`StoreShape.pool_bytes`, DeepSeek only; others keep the
-  RAM/16 cap outside the ledger); the remainder is a uniform per-layer LRU. The ledger refuses a budget under two slots per layer, and under
+  RAM/16 cap outside the ledger) + the scales a load keeps in host memory (`StoreShape.kept_bytes`, below; the boot
+  line names them only where there are some); the remainder is a uniform per-layer LRU. The ledger refuses a budget under two slots per layer, and under
   one expert of every rate group of a grouped layer (`SsdBudgetBelowResident`, `StoreShape.layer_floor_bytes`).
 - **Resident**: a budget that holds every routed expert (`StoreShape.all_bytes`, set when every routed layer is
   rate-grouped) beside the trunk, MTP and tower bills no union workspace, selected slab or bounce. The engine sizes
@@ -187,6 +188,13 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   (in the `[expert-stream] forward=` line) counts the routes.
   Measured on the STQ 1.75bpw pack (default SSD budget, M5 Max on AC, one boot per arm, a cold llmprobe code prompt):
   prefill 1383 / 1451 tok/s staged against 1242 / 1372 tok/s with the fill read whole, at 32k / 64k tokens.
+- **An expert's scales are read from the SSD once** (`KeptScales`, `Engine.keepScales`; DeepSeek STQ on Sushi Cooler,
+  `arch_config.expertKeepsScales`). A miss reads six scale vectors of a few kilobytes beside three trellis pieces of
+  megabytes, and a small read costs its latency, not its bytes: stage 0 of a wide route took 0.14 ms a missed expert
+  (9 ms on a layer with sixty misses) with nothing on the GPU, since every group's GEMM waits for the scales. The engine
+  keeps the scales of each expert it has read (44.5 KB an expert on the 1.75bpw pack, 0.68 GB for all of them, billed
+  whole in the ledger) and a later miss of that expert copies them and reads its trellis only. An expert the load's
+  cache warm brought in is kept at its first miss. Same bytes in the slabs, so the same output.
 - The breakdown line's `copy_ms` / `unions` time the host copies of a union route: cached hits copied into the
   workspace and admitted misses copied back. A read-ahead (the next router on this layer's rows) was measured and cut:
   it guessed about a quarter of a 1024-row chunk's picks and did not move cold prefill.

@@ -25,6 +25,10 @@ pub const StoreShape = struct {
     all_bytes: u64 = 0,
     /// MLX's freed-buffer pool, capped for the load and billed beside the resident terms (`Config.expertPoolBytes`).
     pool_bytes: u64 = 0,
+    /// The scale vectors of every expert of the rate-grouped layers: what `expert_stream.KeptScales` holds at most.
+    scale_bytes: u64 = 0,
+    /// `scale_bytes` where the load keeps them in host memory (`Config.expertKeepsScales`), billed beside the cache.
+    kept_bytes: u64 = 0,
 };
 
 pub const Geometry = struct {
@@ -866,6 +870,9 @@ pub const QuantStore = struct {
             out.layer_floor_bytes = @max(out.layer_floor_bytes, lg.floorBytes(self.geometry.hidden, self.geometry.intermediate));
             out.union_meta_bytes += @as(u64, self.geometry.kept()) * rate_group_meta_bytes + lg.padBytes();
             out.all_bytes += lg.allBytes(self.geometry.hidden, self.geometry.intermediate) + @as(u64, self.geometry.kept()) * rate_group_meta_bytes;
+            for (0..self.geometry.experts) |expert| for (0..component_count) |ci| {
+                if (ci % 3 != 0) out.scale_bytes += self.span(@intCast(layer), @intCast(expert), @fromBackingInt(@intCast(ci))).len;
+            };
         }
         if (grouped and uniform) out.union_sets = 2;
         if (uniform) out.all_bytes = 0;
