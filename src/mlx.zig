@@ -1233,6 +1233,7 @@ fn readAllocator(r: *engine.MlxAtRest, empty: bool) void {
         _ = raw.mlx_get_active_memory(&now[0]);
         _ = raw.mlx_get_cache_memory(&now[1]);
         _ = raw.mlx_get_peak_memory(&now[2]);
+        now[2] = @max(now[2], now[0]);
         _ = raw.mlx_get_external_memory(&now[3]);
     }
     r.active.store(now[0], .monotonic);
@@ -1270,9 +1271,17 @@ pub fn mlx_get_cache_memory(res: *usize) c_int {
     res.* = r.cache.load(.monotonic);
     return 0;
 }
+/// MLX's reset starts its peak from zero, not from what is active: the high-water read here never sits under it.
 pub fn mlx_get_peak_memory(res: *usize) c_int {
-    const r = atRest() orelse return raw.mlx_get_peak_memory(res);
+    const r = atRest() orelse return livePeak(res);
     res.* = r.peak.load(.monotonic);
+    return 0;
+}
+fn livePeak(res: *usize) c_int {
+    var active: usize = 0;
+    const rc = raw.mlx_get_peak_memory(res);
+    if (rc != 0) return rc;
+    if (raw.mlx_get_active_memory(&active) == 0) res.* = @max(res.*, active);
     return 0;
 }
 pub fn mlx_reset_peak_memory() c_int {

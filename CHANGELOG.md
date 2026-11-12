@@ -74,6 +74,8 @@ earlier history is mlx-serve's, in that project's changelog.
   Qwen3.8-Flash-Next, decodes about 5% faster and prefills about 2% faster, with the same output.
 - **Less CPU while DeepSeek-V4.1-Flash prefills prose**: a long prose prompt takes less than half the system CPU it did,
   with the same output and no slower prefill.
+- **The peak memory figure is never below the memory in use**: right after a reset, `/props`, `sushi kld` and the
+  load log read MLX's peak as at least what MLX holds, where it read nothing until MLX next allocated.
 
 ## v1.6.0 — Stability, UI and Architecture Refactor
 

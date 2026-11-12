@@ -66,8 +66,7 @@ test "the peak reading counts the engine's pool at its fullest beside MLX's, and
     try core.sync();
     gpu_mem.resetPeak();
     const base = gpu_mem.peakBytes();
-    // The engine's part starts from what it has in use. MLX's starts from zero until MLX next allocates, whatever
-    // earlier tests left it holding.
+    // Each part starts from what it has in use.
     try t.expect(base >= (mlx.engine.poolTotal() -| mlx.engine.poolFree()) + mlx.engine.mappedTotal());
     const a = try core.fresh(.uint8, &.{9 * mb + 5});
     core.release(a);

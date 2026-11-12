@@ -380,3 +380,16 @@ test "GPU memory readings are MLX's alone while the engine has made no pool buff
     try testing.expectEqual(active, gpu_mem.activeBytes());
     try testing.expectEqual(cache, gpu_mem.cacheBytes());
 }
+
+test "the peak reading never sits under the active reading, right after a reset too" {
+    const mlx = @import("mlx.zig");
+    const gpu_mem = @import("gpu_mem.zig");
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var held = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(held);
+    try mlx.check(mlx.mlx_zeros(&held, &[_]c_int{1 << 20}, 1, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(held));
+    gpu_mem.resetPeak();
+    try testing.expect(gpu_mem.peakBytes() >= gpu_mem.activeBytes());
+}
