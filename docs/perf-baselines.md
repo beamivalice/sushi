@@ -425,6 +425,32 @@ is the same on the three sides. About 160 of a request's 210 rounds are plain on
   against 296 to 302): a wide chunk's Engram rows are read without `F_RDADVISE` since `0d43d77d`.
 - The decode right after the prefill (position 1): 39.3, 39.7 and 47.2 tok/s at 1399, 1404 and 1298 GPU mJ/token.
 
+## DeepSeek-V4.1 STQ on Sushi Cooler: release ladder at `7eb2da99` (2026-11-12)
+
+The working baseline of the DeepSeek optimization rounds: `tests/bench.sh --tag cooler-p2b
+DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw -- --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000`, commit
+`7eb2da99`, binary SHA-256 `3751dc19594fec7f`, M5 Max 128 GB, AC, fans at max, boot at 49 °C, `taskpolicy -a`, GPU
+lock, no Warnings (no kernel compiled inside a request). Beside it the v1.6.0 release report's cells (MLX decode and
+prefill, `ac3da7aa`), the same protocol. Medians of three decode samples; tok/s.
+
+| rung | code decode | v1.6.0 | prose decode | v1.6.0 | code prefill | v1.6.0 | prose prefill | v1.6.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 95.7 | 95.5 | 52.5 | 50.3 | 1,293 | 1,242 | 905 | 858 |
+| 8k | 96.6 | 100.8 | 57.5 | 56.5 | 1,464 | 1,493 | 1,297 | 1,093 |
+| 16k | 75.2 | 76.5 | 50.2 | 46.9 | 1,477 | 1,497 | 1,405 | 1,247 |
+| 32k | 86.3 | 91.1 | 54.2 | 51.3 | 1,477 | 1,468 | 1,347 | 1,191 |
+| 64k | 84.9 | 84.8 | 50.1 | 51.8 | 1,377 | 1,383 | 1,308 | 1,264 |
+| 128k | 74.2 | 75.1 | 51.0 | 52.2 | 1,225 | 1,266 | 1,178 | 1,172 |
+
+- **Cells still under v1.6.0**: code decode at 8k (4%), 32k (5%), 16k and 128k (1 to 2%); prose decode at 64k and 128k
+  (2 to 3%); code prefill at 8k, 16k (1 to 2%) and 128k (3%). Prose prefill is ahead at every rung, prose decode to 32k.
+- **The long rungs ran hotter than v1.6.0's**: thermal pressure read Moderate at the prose 64k rung and Heavy at both
+  128k rungs (GPU 1513 and 1571 MHz), where the v1.6.0 run stayed Nominal (1528 and 1589 MHz). The box had run loads
+  all day; a cell at 64k or 128k is compared only with its pressure and clock beside it.
+- The run before it (`f9cacade`, tag `cooler-p2a`) is not a measurement: one window compiled a kernel inside a request
+  (fixed in `771cbaca`), and its copy rounds went to 16 rows after one whole round (`7eb2da99` changed the rule), which
+  cost its code cells 88.7 at 8k, 78.3 at 64k and 67.6 at 128k.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.
