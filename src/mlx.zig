@@ -1624,6 +1624,12 @@ const DeviceFacts = struct {
 var device_facts: DeviceFacts = .{};
 var device_known: std.atomic.Value(bool) = .init(false);
 
+/// A test's process as one that has not asked the device yet.
+pub fn forgetDeviceForTest() void {
+    no_gpu_backend_cache = null;
+    device_known.store(false, .release);
+}
+
 fn deviceFacts() ?*const DeviceFacts {
     if (device_known.load(.acquire)) return &device_facts;
     var dev = mlx_device{ .ctx = null };

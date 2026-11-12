@@ -26,6 +26,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek-V4.1-Flash greedy answers no longer depend on how tokens were drafted**: at long context a rare rounding
   difference between a single-token step and a drafted round could change a greedy answer; a token now gets the same
   result either way, so a request that asks for logprobs gives the text one without them gives.
+- **`sushi bench` rejects a row the engine compiled a kernel in**: such a request's time holds a compile, so it is
+  listed under Warnings like a missed restore; a Sushi Cooler load whose kernel warm fails now stops with the error
+  instead of serving.
 - **DeepSeek-V4.1-Flash answers no longer depend on `--prefill-chunk`**: a rounding difference in expert routing
   between chunk sizes could change an answer at a near-tie; a prompt now routes the same at every chunk size.
 - **DeepSeek-V4.1-Flash no longer fails a request on its image token**: a text prompt that holds the image

@@ -1408,12 +1408,14 @@ test "dsv41 vision: the tower's pipelines ride the manifest: a first load warms 
     defer w2.deinit();
     const pipelines_registry = mlx.engine.pipeline_registry;
 
-    // First load: no manifest, the tower warms and the manifest is written with the warm's marker.
+    // First load: no manifest, the load stores its own after its warm, then the tower warms and the manifest is
+    // written again with the warm's marker.
     pipelines_registry.resetForTest();
     var first = dsv41_pipelines.begin(testing.allocator, io, tmp.dir, "", key, 0);
     defer first.deinit();
     try testing.expectEqual(dsv41_pipelines.Case.none, first.case);
     _ = first.settle();
+    first.store();
     var one = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &w1);
     defer one.deinit();
     const warms = Dsv41Vision.warms;

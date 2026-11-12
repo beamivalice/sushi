@@ -11,6 +11,7 @@ const gpu_live = @import("gpu_clock_live.zig");
 const energy = @import("energy.zig");
 const box = @import("bench_box.zig");
 const completions = @import("completions.zig");
+const mlx = @import("mlx.zig");
 const server_mod = @import("server.zig");
 const server_state = @import("server_state.zig");
 const LoadedModel = @import("model_registry.zig").LoadedModel;
@@ -391,6 +392,8 @@ pub const Sample = struct {
     gpu_pressure: ?gpu_clock.Pressure = null,
     /// The server ended the request through its repetition-loop stop, so fewer tokens than asked is expected.
     loop_stop: bool = false,
+    /// Kernels the engine compiled inside the request: its time then holds their compiles.
+    compiled: u32 = 0,
     /// What the request spent, cut at the end of its prefill; null when the run did not measure energy.
     energy: ?SampleEnergy = null,
 
@@ -592,10 +595,11 @@ const Meter = struct {
     }
 };
 
-pub const Problem = enum { restore_missed, no_restore_line, short_decode, gpu_throttled };
+pub const Problem = enum { restore_missed, no_restore_line, short_decode, gpu_throttled, compiled_in_request };
 
 pub fn check(s: Sample) ?Problem {
     if (gpu_clock.verdict(s.gpu_mhz, s.gpu_pressure) != .ok) return .gpu_throttled;
+    if (s.compiled > 0) return .compiled_in_request;
     if (s.base == 0) {
         if (s.cached_n != 0) return .restore_missed;
     } else if (s.cached_n + restore_slack < s.base or s.cached_n > s.base) return .restore_missed;
@@ -696,6 +700,11 @@ pub fn parseRestore(segment: []const u8) ?Restore {
     var ms_it = std.mem.tokenizeScalar(u8, line[m + marker.len ..], ' ');
     const ms = std.fmt.parseFloat(f64, ms_it.next() orelse return null) catch return null;
     return .{ .matched = matched, .total = total, .ms = ms };
+}
+
+/// The kernels a log segment says the engine compiled inside a request.
+pub fn parseCompiles(segment: []const u8) u32 {
+    return @intCast(std.mem.count(u8, segment, "[engine] compiled inside a request"));
 }
 
 /// The speculative mode of the last `[spec-stats] mode=<m>` line of a log segment.
@@ -974,6 +983,7 @@ fn problemText(p: Problem) []const u8 {
         .no_restore_line => "no restore was reported for it, so the restore time was not taken out",
         .short_decode => "decoded fewer tokens than asked",
         .gpu_throttled => "the GPU clock or thermal pressure failed the abort rule (see the GPU columns)",
+        .compiled_in_request => "the engine compiled a kernel inside it, which the load's warm should have made",
     };
 }
 
@@ -1244,12 +1254,14 @@ fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: [
 
     var restore: ?Restore = null;
     var mode: ?[]const u8 = null;
+    var compiled: u32 = 0;
     var tries: usize = 0;
     while (tries < 20) : (tries += 1) {
         const text = try readLog(a, io, log_path);
         const seg = text[@min(log_len.*, text.len)..];
         restore = parseRestore(seg);
         mode = parseSpecMode(seg);
+        compiled = parseCompiles(seg);
         if (restore != null and (mode != null or req.max_tokens <= 1)) break;
         std.Io.sleep(io, .fromMilliseconds(500), .real) catch {};
     }
@@ -1280,6 +1292,7 @@ fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: [
         .gpu_mhz = gpu.mhz,
         .gpu_pressure = gpu.pressure,
         .loop_stop = c.loop_stop,
+        .compiled = compiled,
     };
     sample.energy = meter.attribute(spent, sample);
     return sample;
@@ -1412,6 +1425,7 @@ const LocalBackend = struct {
     fn request(ptr: *anyopaque, a: std.mem.Allocator, ids: []const u32, req: Request, arm: Arm, sampler: ?*gpu_clock.Sampler, meter: *Meter) anyerror!Sample {
         const self: *LocalBackend = @ptrCast(@alignCast(ptr));
         var span = Span.open(self.io, meter);
+        const late = mlx.engine.latePipelines();
         const r = completions.completeIds(a, self.lm, ids[0..req.prompt_len], req.max_tokens) catch |err| {
             log.err("sushi bench: the {s} {d}-token request failed: {s}\n", .{ @tagName(arm), req.prompt_len, @errorName(err) });
             if (err == error.PromptExceedsContext) log.err("sushi bench: the context is shorter than the ladder: pass --ctx-size, or fewer rungs\n", .{});
@@ -1448,6 +1462,7 @@ const LocalBackend = struct {
             .gpu_mhz = gpu.mhz,
             .gpu_pressure = gpu.pressure,
             .loop_stop = std.mem.eql(u8, r.finish_reason, "stop") and if (r.finish_details) |d| std.mem.eql(u8, d, "repetition_loop") else false,
+            .compiled = @intCast(mlx.engine.latePipelines() - late),
         };
         sample.energy = meter.attribute(spent, sample);
         return sample;
@@ -1915,6 +1930,15 @@ test "bench samples: the restore comes out of the prefill time, and a missed res
     s.max_tokens = 1;
     s.base = 0;
     try testing.expectEqual(Problem.restore_missed, check(s).?);
+    s.base = 8192;
+    try testing.expect(check(s) == null);
+    s.compiled = 2;
+    try testing.expectEqual(Problem.compiled_in_request, check(s).?);
+}
+
+test "bench log: the kernels a request compiled are counted off its log segment" {
+    try testing.expectEqual(@as(u32, 0), parseCompiles("[engine] compiled sushi_take\n  <- 4096+256 tokens\n"));
+    try testing.expectEqual(@as(u32, 2), parseCompiles("x\n[engine] compiled inside a request (9 ms): a\n[spec-stats] mode=dspark\n[engine] compiled inside a request (118 ms): b\n"));
 }
 
 test "bench median: odd, even and empty" {

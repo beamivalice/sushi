@@ -118,7 +118,6 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     mdl_mine = null;
     shell.expert_stream = engine;
     engine_mine = null;
-    // A failed warm costs the first requests their compiles, not the load.
     var clock = expert_stream_mod.Clock.init();
     const had_error = mlx.errorPending();
     const warm_t0 = load_clock.now();
@@ -129,8 +128,9 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         if (scope == .all and own_decode) plan.store();
     } else |e| {
         mlx.dropLatchedErrorUnless(had_error);
-        // A forward the bill does not cover would be a Metal OOM in a request.
-        if (e == error.PoolOverBudget) return e;
+        // A forward the bill does not cover would be a Metal OOM in a request, and a forward of the engine's that
+        // fails here fails in a request too: neither load serves. On MLX a failed warm costs requests their compiles.
+        if (e == error.PoolOverBudget or own_decode) return e;
         log.warn("[dsv41] kernel warm failed ({s}); requests compile their own\n", .{@errorName(e)});
     }
     const made = mlx.engine.pipelinesMade();

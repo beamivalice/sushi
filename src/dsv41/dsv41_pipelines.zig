@@ -105,7 +105,8 @@ pub const Plan = struct {
     /// Makes the pipelines of the manifest found, on worker threads, and says which case runs. The warm that follows is
     /// the scope returned.
     pub fn settle(p: *Plan) dsv41_model.WarmScope {
-        remember(p);
+        // A later warm adds to a manifest only where a complete one stands: the one found, or the one `store` writes.
+        last = null;
         var dir_buf: [manifest.Key.dir_len]u8 = undefined;
         const dir = p.key.dirName(&dir_buf);
         const recipes: []const manifest.Recipe = switch (p.found) {
@@ -134,6 +135,7 @@ pub const Plan = struct {
                 // Every recipe of the file made, so every one is a pipeline of this process: a manifest rewritten
                 // after a late warm keeps the ones this load never launched.
                 for (recipes) |r| registry.record(r);
+                remember(p);
                 log.info("[pipelines] made {d} pipelines from the manifest {s} on {d} threads in {d} ms; the engine's warm forwards are skipped (key {d} ms)\n", .{ report.made, dir, p.threads, wall_ms, p.key_ms });
                 return .mlx;
             }
@@ -164,7 +166,8 @@ pub const Plan = struct {
     }
 };
 
-/// Where this load's manifest lives, for a warm that runs after the load's own (the vision tower's).
+/// Where this load's manifest lives once it holds a complete warm, for a warm that runs after the load's own (the
+/// vision tower's).
 var last: ?struct { a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: manifest.Key } = null;
 
 fn remember(p: *const Plan) void {
@@ -372,6 +375,27 @@ test "dsv41 pipelines: a load with no manifest writes one, and a load from it sk
     defer testing.allocator.free(from_manifest);
     try testing.expectEqualSlices(u32, warmed, from_manifest);
     try testing.expectEqual(late, mlx.engine.latePipelines());
+}
+
+test "dsv41 pipelines: a load whose warm did not finish leaves no manifest, and a later warm writes none in its place" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    defer forget();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const key = testKey("c2c2c2c2c2c2c2c2");
+    var plan = plainBegin(tmp.dir, key);
+    defer plan.deinit();
+    try testing.expectEqual(dsv41_model.WarmScope.all, plan.settle());
+    rewriteLate();
+    var unfinished = try manifest.lookup(testing.allocator, io, tmp.dir, key);
+    defer unfinished.deinit();
+    try testing.expect(unfinished == .none);
+
+    plan.store();
+    rewriteLate();
+    var stored = try manifest.lookup(testing.allocator, io, tmp.dir, key);
+    defer stored.deinit();
+    try testing.expect(stored == .same);
 }
 
 test "dsv41 pipelines: the wide chunks' recipes are in the manifest, and a load from it runs none of the wide forwards and compiles none inside a prompt (DSV41_STQ_TINY)" {

@@ -1122,6 +1122,11 @@ pub fn gemmNaxOn() bool {
     return !gemm_nax_failed and gemmNaxAvailable();
 }
 
+/// A test's process as one that has not asked the GPU's architecture yet.
+pub fn forgetGpuArchForTest() void {
+    gemm_nax_cached = null;
+}
+
 /// Builds and proves the NAX GEMM kernel of `dec` and `order` now, on `s`, the stream the forwards run on: the proof
 /// is a launch like any other, so a load proves the kernel where it will run it.
 /// On the host's own engine a kernel that cannot be proven is the load's error, with what the proof latched: every GPU

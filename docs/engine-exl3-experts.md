@@ -382,6 +382,8 @@ or from 1024 rows the decoded path below.
   input, so each row keeps its one-row decode tick's bytes. Before, a 9-row verify (an 8-draft prompt lookup) took the
   sorted GEMM, one launch per projection and another sum order. Prefill chunks of 9 to 16 rows keep the GEMM. Tests: `at 9
   to 16 rows every row equals the one-row launch`, `a 9- to 16-row spec verify keeps each row's decode tick bytes`.
+  DeepSeek's lm_head (5120 x 129280) keeps the SIMD arm in exact mode, whose launch holds 8 rows: `projectRows` sends
+  its 9 to 16 rows in two halves, each row still its one-row launch (`at the lm_head's shape a wide exact verify ...`).
   Meter: [qwen4-perf](qwen4-perf.md#verify-rows9).
 - A row's bytes are the same at widths 2 to 8 (NAX); the one-row SIMD kernel and the GEMM differ from them in sum order
   only. All three hold the f32-truth bar 1.5e-3 past the output dtype's own rounding of the truth, added in quadrature

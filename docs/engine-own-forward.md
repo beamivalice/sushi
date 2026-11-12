@@ -194,8 +194,8 @@ route and the MLX arm still build the bank at prepare time.
 - **A Cooler pack loads again after its unload.** `dsv41_borrow.unloadModel` leaves the pool empty and uncapped, and
   `initDsv41` sets its own budget and unseals the pipelines before it proves a kernel. The NAX GEMM arm proven on the
   engine's side stays proven: a later build that fails there is an error, never a switch to another arm.
-- **The device is asked once a process** (`mlx.deviceArchitecture`, `maxRecommendedWorkingSet`; the boot asks what a
-  load would, the NAX question of the EXL3 kernels included). A live Cooler process (STQ 1.75bpw, 348b99fb plus this
+- **The device is asked once a process** (`mlx.deviceArchitecture`, `maxRecommendedWorkingSet`; `main` asks what a
+  load would, the NAX question of the EXL3 kernels included, above every GPU command: `sushi kld` loads too). A live Cooler process (STQ 1.75bpw, 348b99fb plus this
   change) makes 27 calls into mlx-c, all in its boot: the device, the default device and seed, the pool cap, one
   allocator reading. Its load, its requests and its unload make none. `SUSHI_MLX_CALLS_TRACE=1` prints the tally by
   entry point at both ends of a load and after a request ([envvar](envvar.md)).
@@ -452,7 +452,12 @@ rebuilds one.
 - **No manifest, or one that cannot be read** (the reason is named): today's load, then a manifest is written. A recipe that
   fails to make from a same-key manifest makes it untrusted: the full warm runs.
 - Written only after a warm that returned without error, through a temp file and a rename. One `[pipelines]` line says
-  which case ran.
+  which case ran. A later warm (the tower's) writes it again only where a complete one stands, found or stored by this
+  load: a short manifest would be trusted by every later load, which skips the warm that could fill it.
+- **A Cooler load whose warm fails does not serve**: a forward of the engine's that fails in the warm fails in a
+  request. On MLX a failed warm is a warning and costs requests their compiles.
+- **A launch the warm must reach on the release shape is tested at that shape.** The tiny fixtures hold no 5120 x 129280
+  head, so the head's 9- to 16-row launch failed only on the release pack and the load warned and served.
 
 ## What a forward costs
 

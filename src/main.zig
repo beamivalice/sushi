@@ -117,6 +117,13 @@ fn commandUsesGpu(proc_args: std.process.Args) bool {
     return true;
 }
 
+/// What a load asks the device, asked once before any load: a load that is the engine's then asks MLX nothing.
+fn settleDeviceReads() void {
+    if (mlx.noGpuBackend()) return;
+    _ = mlx.deviceArchitecture();
+    _ = @import("sushi_exl3").kernels.gemmNaxOn();
+}
+
 pub fn main(init: std.process.Init) void {
     runCli(init) catch |err| {
         if (cli_error.describe(err)) |text| log.err("{s}\n", .{text});
@@ -140,6 +147,7 @@ fn runCli(init: std.process.Init) !void {
         server_mod.resolveMlxCadence();
         // The engine's own reading of the GPU, on the main thread before any other asks.
         _ = mlx.engine.matrixUnits();
+        settleDeviceReads();
     }
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("arch/kernels.zig").warmEnvCaches();
@@ -1003,12 +1011,9 @@ fn runCli(init: std.process.Init) !void {
 
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
-    // The process's MLX setup ends here. What a load would ask the device is asked now, once, and MLX's allocator is
-    // read, so a load that is the engine's finds both known and asks MLX nothing.
+    // The process's MLX setup ends here: MLX's allocator is read, so a load that is the engine's finds it known and
+    // asks MLX nothing (the device was asked above every command, `settleDeviceReads`).
     if (metal_avail) {
-        _ = mlx.noGpuBackend();
-        _ = mlx.deviceArchitecture();
-        _ = @import("sushi_exl3").kernels.gemmNaxOn();
         mlx.noteAllocator();
     }
     server_state.disk_writer_permit_bytes = @import("kv_disk_writer.zig").permitForRam(@import("status.zig").getTotalMemBytes());
@@ -1675,4 +1680,23 @@ test "launch flags: --ds41-mlx-engine pins the model's ds41_cooler, and no flag 
     model_mod.cooler_off_flag = true;
     pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
     try std.testing.expectEqualStrings("--ds41-mlx-engine", model_settings_mod.launch_locks.model("ds41_cooler").?.text());
+}
+
+test "the device reads a load makes are asked before it: under a hold they ask MLX nothing" {
+    try mlx.requireGpu();
+    const exl3_kernels = @import("sushi_exl3").kernels;
+    mlx.forgetDeviceForTest();
+    exl3_kernels.forgetGpuArchForTest();
+    settleDeviceReads();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    mlx.engine.hold();
+    defer mlx.engine.unhold();
+    const breaks = mlx.rest_breaks.load(.monotonic);
+    _ = mlx.noGpuBackend();
+    _ = mlx.deviceArchitecture();
+    _ = mlx.maxRecommendedWorkingSet();
+    _ = exl3_kernels.gemmNaxOn();
+    try std.testing.expectEqual(breaks, mlx.rest_breaks.load(.monotonic));
 }

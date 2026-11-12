@@ -222,6 +222,10 @@ The published Qwen pack moved to revision 2.0 (6-bit STQ trunk) after 1.5.1: on 
 flags) it reads 0.061834, 92.30%, 7061 positions, and 1.6.0 reads the same to the last digit. DeepSeek on 1.6.0 reads 0.6% above 1.5.1, equal to the 1.5.0 binary's reading of revision 2.0.
 On Sushi Cooler with no call into MLX from load to unload (`df84c004`, the row's flags with `--tokens 512 --top-k 10
 --ctx-size 8192 --no-mtp`, AC power) DeepSeek reads 0.210305, 86.46%, 7533 positions: 1.6.0's reading on MLX.
+With the router's product in fixed tiles (`f71dfd5c`, the same flags) it reads 0.211004, 86.51%, 7533 positions: +0.33%
+in KLD, +0.05 points of top-1. The fixture's prompts are 282 to 338 rows, which took the product's split-K arm before
+and take the fused arm now ([dsv41-arch](dsv41-arch.md#prefill-width)); the tree with the one function reverted reads
+0.210305 to the last digit.
 
 The Qwen 1.5.0 reading equals the 1.4.0 Homebrew binary's on the same settings to the last digit; the 0.0692 / 92.76%
 quoted for this pack in [qwen4-kld](qwen4-kld.md) was taken on settings it does not name.

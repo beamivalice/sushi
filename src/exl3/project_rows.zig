@@ -482,7 +482,7 @@ fn rowsLaunch(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, nax: bo
     return .{ .tgrp = if (rows >= 2) 2 else 1, .kph = 4, .nsplit = nsplit, .chunk = rowsChunk(in_dim, rows, nsplit) };
 }
 
-/// `y[r] = svh * H128(W . H128(suh * x[r]))` for every row of `x` (`[rows, in]` f16, bf16 or f32, rows 1..8), over one
+/// `y[r] = svh * H128(W . H128(suh * x[r]))` for every row of `x` (`[rows, in]` f16, bf16 or f32, rows 1 to `rowsMax(mode)`), over one
 /// trellis `[in/16, out/16, n]` (or a one-matrix bank), its `suh [in]` and `svh [out]`: `projectIndexed`'s
 /// numbers, each weight decoded once for all rows. Returns `[rows, out]` in x's dtype, rounded once from the f32 sum. A bank `[G, in/16, out/16, n]` takes
 /// `x` `[G * rows, in]`, group g's rows contiguous, `suh [G, in]` and `svh [G, out]`, and returns `[G * rows, out]`.
@@ -491,8 +491,29 @@ pub fn projectRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, 
     const ts = mlx.getShape(trellis);
     if (xs.len != 2 or ts.len < 3) return error.BadExl3Shape;
     const groups: c_int = if (ts.len == 4) ts[0] else 1;
-    const g = rowsGeometry(xs[1], ts[ts.len - 2] * 16, @divExact(xs[0], groups), groups, mode);
-    return projectRowsWith(s, x, trellis, suh, svh, g, try rowsKernel(g), null);
+    const rows = @divExact(xs[0], groups);
+    const out = ts[ts.len - 2] * 16;
+    const g = rowsGeometry(xs[1], out, rows, groups, mode);
+    if (g.nax or groups != 1 or rows <= PROJECT_ROWS_MAX or rows > rowsMax(mode)) return projectRowsWith(s, x, trellis, suh, svh, g, try rowsKernel(g), null);
+    // A SIMD launch holds `PROJECT_ROWS_MAX` rows and sums a row the same at every count: a wider call goes in halves.
+    const half = @divFloor(rows + 1, 2);
+    var parts: [2]mlx.mlx_array = @splat(.{});
+    defer for (parts) |part| {
+        _ = mlx.mlx_array_free(part);
+    };
+    for (&parts, [_][2]c_int{ .{ 0, half }, .{ half, rows } }) |*part, span| {
+        var xp: mlx.mlx_array = .{};
+        defer _ = mlx.mlx_array_free(xp);
+        try mlx.check(mlx.mlx_slice(&xp, x, &[_]c_int{ span[0], 0 }, 2, &[_]c_int{ span[1], xs[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        const gp = rowsGeometry(xs[1], out, span[1] - span[0], 1, mode);
+        part.* = try projectRowsWith(s, xp, trellis, suh, svh, gp, try rowsKernel(gp), null);
+    }
+    const joined = mlx.mlx_vector_array_new_data(&parts, parts.len);
+    defer _ = mlx.mlx_vector_array_free(joined);
+    var y: mlx.mlx_array = .{};
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_concatenate_axis(&y, joined, 0, s));
+    return y;
 }
 
 /// `projectRows` over linears that share their input, stacked along the output (one trellis `[1, in/16, out/16, n]`,
@@ -693,6 +714,30 @@ const RowsRig = struct {
         const got = try kernels.evalF16(s, y, &yc);
         return alloc.dupe(u16, @as([*]const u16, @ptrCast(got))[0 .. self.groups * rows * self.out]);
     }
+
+    /// Rows `first..first + rows` of a one-bank rig through `projectRows` in `mode`, on the stream `s`.
+    fn project(self: RowsRig, alloc: std.mem.Allocator, s: mlx.mlx_stream, first: usize, rows: usize, mode: Mode) ![]const u16 {
+        var held: [4]mlx.mlx_array = undefined;
+        {
+            const host = mlx.engine.enter(s);
+            defer host.end();
+            held = .{
+                mlx.mlx_array_new_data(self.xh[first * self.in ..].ptr, &[_]c_int{ @intCast(rows), @intCast(self.in) }, 2, .float16),
+                mlx.mlx_array_new_data(self.tr.ptr, &[_]c_int{ 1, @intCast(self.in / 16), @intCast(self.out / 16), @intCast(self.n) }, 4, .uint16),
+                mlx.mlx_array_new_data(self.suh.ptr, &[_]c_int{ 1, @intCast(self.in) }, 2, .float16),
+                mlx.mlx_array_new_data(self.svh.ptr, &[_]c_int{ 1, @intCast(self.out) }, 2, .float16),
+            };
+        }
+        defer for (held) |h| {
+            _ = mlx.mlx_array_free(h);
+        };
+        const y = try projectRows(s, held[0], held[1], held[2], held[3], mode);
+        defer _ = mlx.mlx_array_free(y);
+        var yc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(yc);
+        const got = try kernels.evalF16(s, y, &yc);
+        return alloc.dupe(u16, @as([*]const u16, @ptrCast(got))[0 .. rows * self.out]);
+    }
 };
 
 const SIMD_ROWS_DECODES = [_]struct { dec: exl3.Decode, n: u32 }{
@@ -786,6 +831,35 @@ test "exl3 SIMD multi-row: every row equals the one-row launch bit for bit" {
                     for (0..sh[2]) |grp| try std.testing.expectEqualSlices(u16, one[grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
                 }
             }
+        }
+    }
+}
+
+// In exact mode the lm_head keeps the SIMD arm, whose launch holds eight rows, while a wide verify brings up to
+// sixteen: its head rows go eight or fewer at a time, each still its one-row launch.
+test "exl3 multi-row mode: at the lm_head's shape a wide exact verify of 9 to 16 rows gives each row its one-row launch's bits, on MLX's stream and on the engine's" {
+    try mlx.requireGpu();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    defer kernels.setDecodeParams(.mul1);
+    const d = SIMD_ROWS_DECODES[1];
+    try d.dec.requireTable();
+    kernels.setDecodeParams(d.dec);
+    const out: usize = 129280;
+    const rig = try RowsRig.init(alloc, 0x1ead, 5120, out, 1, d.n);
+    try std.testing.expect(!rowsGeometry(5120, 129280, 9, 1, .{ .exact = true, .wide = true }).nax);
+    const was = mlx.engine.enabled;
+    defer mlx.engine.enabled = was;
+    for ([_]bool{ false, true }) |on_engine| {
+        mlx.engine.enabled = on_engine;
+        const s = if (on_engine) mlx.engine.stream() else mlx.gpuStream();
+        const pool: usize = @intCast(NAX_ROWS_MAX);
+        const ones = try alloc.alloc(u16, pool * out);
+        for (0..pool) |r| @memcpy(ones[r * out ..][0..out], try rig.project(alloc, s, r, 1, .{ .exact = true }));
+        for ([_]usize{ 9, 13, 16 }) |rows| {
+            const many = try rig.project(alloc, s, 0, rows, .{ .exact = true, .wide = true });
+            try std.testing.expectEqualSlices(u16, ones[0 .. rows * out], many);
         }
     }
 }

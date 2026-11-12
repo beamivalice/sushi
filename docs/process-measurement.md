@@ -157,8 +157,9 @@ The protocol, fixed for every model and release:
   a decode number from a run that was not monitored needs a clock look beside it before it is recorded.
 - **The prose arm starts cool.** Between the arms `sushi bench` sets the fans to max and idles until the hottest
   `fanctl status` die is under 50 C, at most 180 s (no idle when `fanctl` gives no reading); the wait is logged and named in the report's protocol line.
-- **A request that did not restore** within 64 tokens of the point it should, one without a restore log line, or a
-  short decode is listed under Warnings and makes the run exit non-zero: it is not a measurement. A decode the
+- **A request that did not restore** within 64 tokens of the point it should, one without a restore log line, a
+  short decode, or one the engine compiled a kernel in (`[engine] compiled inside a request`: the load's warm did not
+  make it) is listed under Warnings and makes the run exit non-zero: it is not a measurement. A decode the
   server's loop stop ended (`finish_details.type` = `repetition_loop`) is valid: it counts and is listed under Notes.
 
 Cross-engine comparison is not this bench: start the other engine, run llmprobe by hand
