@@ -1268,7 +1268,8 @@ test "ResponseStore evicts LRU at cap" {
 
 fn expectSameQwenPrompt(actual: []const chat_mod.Message, expected: []const chat_mod.Message) !void {
     const a = testing.allocator;
-    var config = arch_fx.qwenChatConfig(a) orelse return error.SkipZigTest;
+    var config = (try arch_fx.qwenChatConfig(a)) orelse return error.SkipZigTest;
+    defer config.dropCompiled();
     config.preserve_thinking = true;
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}}}]";
     const got = try chat_mod.renderChatTemplate(a, actual, &config, tools, null, true, null, false);

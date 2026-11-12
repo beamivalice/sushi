@@ -80,24 +80,42 @@ pub fn of(arena: Allocator, body: []const Node) error{OutOfMemory}!Facts {
     return w.facts;
 }
 
-/// Whether the template defines or sets a `raise_exception` of its own, which may print its argument.
+/// Whether anything in the template binds the name `raise_exception` (a macro, a set, a loop target, a parameter, a
+/// caller's parameter): then a call of it may print its argument, so no call of it counts as the raise.
 fn shadowsRaise(body: []const Node) bool {
     @setRuntimeSafety(true);
     for (body) |n| switch (n.kind) {
-        .macro => |m| if (std.mem.eql(u8, m.name, "raise_exception") or shadowsRaise(m.body)) return true,
-        .set => |st| if (st.target == .name and std.mem.eql(u8, st.target.name, "raise_exception")) return true,
-        .set_block => |st| if ((st.target == .name and std.mem.eql(u8, st.target.name, "raise_exception")) or shadowsRaise(st.body)) return true,
+        .macro => |m| if (std.mem.eql(u8, m.name, "raise_exception") or bindsInMacro(m)) return true,
+        .set => |st| if (targetBinds(st.target)) return true,
+        .set_block => |st| if (targetBinds(st.target) or shadowsRaise(st.body)) return true,
         .if_ => |f| {
             for (f.branches) |b| if (shadowsRaise(b.body)) return true;
             if (shadowsRaise(f.else_)) return true;
         },
-        .for_ => |f| if (shadowsRaise(f.body) or shadowsRaise(f.else_)) return true,
-        .call_block => |c| if (shadowsRaise(c.caller.body)) return true,
+        .for_ => |f| if (targetBinds(f.target) or shadowsRaise(f.body) or shadowsRaise(f.else_)) return true,
+        .call_block => |c| if (bindsInMacro(c.caller)) return true,
         .filter_block => |f| if (shadowsRaise(f.body)) return true,
         .generation => |g| if (shadowsRaise(g)) return true,
         else => {},
     };
     return false;
+}
+
+fn bindsInMacro(m: *const ast.Macro) bool {
+    @setRuntimeSafety(true);
+    for (m.params) |p| if (std.mem.eql(u8, p.name, "raise_exception")) return true;
+    return shadowsRaise(m.body);
+}
+
+fn targetBinds(t: ast.Target) bool {
+    @setRuntimeSafety(true);
+    return switch (t) {
+        .name => |n| std.mem.eql(u8, n, "raise_exception"),
+        .names => |ns| for (ns) |n| {
+            if (std.mem.eql(u8, n, "raise_exception")) break true;
+        } else false,
+        .attr => false,
+    };
 }
 
 const Walker = struct {
@@ -284,6 +302,11 @@ test "template facts: a literal that may reach output is emitted, by every way i
         "{% set l = [] %}{% if l.append('</think>') == y %}{% endif %}{{ l|join }}",
         "{% macro raise_exception(m) %}{{ m }}{% endmacro %}{{ raise_exception('</think>') }}",
         "{% set raise_exception = y %}{{ raise_exception('</think>') }}",
+        "{% for raise_exception in [y] %}{{ raise_exception('</think>') }}{% endfor %}",
+        "{% set a, raise_exception = y, z %}{{ raise_exception('</think>') }}",
+        "{% macro m(raise_exception) %}{{ raise_exception('</think>') }}{% endmacro %}{{ m(y) }}",
+        "{% macro m() %}{{ caller('</think>') }}{% endmacro %}{% call(raise_exception) m() %}{{ raise_exception }}{% endcall %}",
+        "{% macro m() %}{{ caller(y) }}{% endmacro %}{% call(raise_exception) m() %}{{ raise_exception('</think>') }}{% endcall %}",
         "{% filter upper %}{{ '</think>' }}{% endfilter %}",
         "{% call m('</think>') %}{% endcall %}",
     };

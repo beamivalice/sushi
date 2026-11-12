@@ -1031,6 +1031,8 @@ test "a video-capable vision model advertises video beside image, loaded or not"
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     var chat_cfg = chat_mod.ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
+    try chat_cfg.compile();
+    defer chat_cfg.dropCompiled();
     const Case = struct { config_json: []const u8, video_token_id: u32, want: []const u8 };
     for ([_]Case{
         .{ .config_json = "{\"model_type\":\"qwen4_exp\",\"vision_config\":{},\"video_token_id\":151656}", .video_token_id = 151656, .want = "\"input_modalities\":[\"text\",\"image\",\"video\"]" },
@@ -1324,6 +1326,8 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     var chat_cfg = chat_mod.ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
+    try chat_cfg.compile();
+    defer chat_cfg.dropCompiled();
     const Case = struct { arch: []const u8, gen: []const u8, want: []const u8 };
     for ([_]Case{
         .{ .arch = "qwen4_exp", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"reasoning_effort_budgets\":{\"low\":2048,\"medium\":8192},\"reasoning_effort_values\":{\"low\":\"low\",\"medium\":\"medium\",\"xhigh\":\"xhigh\"},\"default_reasoning_effort\":\"medium\"" },
@@ -1379,6 +1383,8 @@ test "/v1/models rows stay valid JSON for a model id and error name with a quote
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     var chat_cfg = chat_mod.ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
+    try chat_cfg.compile();
+    defer chat_cfg.dropCompiled();
     const hostile = "q\"b\\c\x01d";
     var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
     var entry = model_registry_mod.LoadedModel{

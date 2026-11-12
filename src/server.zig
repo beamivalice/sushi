@@ -3477,7 +3477,8 @@ test "getTimeoutNs computes correctly" {
 }
 
 pub fn renderQwenForResponsesTest(a: std.mem.Allocator, messages: []const chat_mod.Message) ![]const u8 {
-    const config = arch_fx.qwenChatConfig(a) orelse return error.SkipZigTest;
+    var config = (try arch_fx.qwenChatConfig(a)) orelse return error.SkipZigTest;
+    defer config.dropCompiled();
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}}}]";
     return chat_mod.renderChatTemplate(a, messages, &config, tools, null, true, null, false);
 }

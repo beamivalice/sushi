@@ -14,8 +14,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   truncation salvage, then the ONE chokepoint `server.parseToolCallsForRequest` = parse → inferred-name filter →
   parallel clamp → buried-param hoist → schema coercion (last two gated by `--no-tool-autocorrect`; emitted
   `arguments` ALWAYS valid JSON).
-- Serialization `chat.serializeMessagesJson`: role "tool" native, args as JSON STRINGS, every string via
-  `appendJsonString`. Streaming: full args in ONE SSE delta, thinking → `reasoning_content`.
+- Template input `chat.templateMessages`: role "tool" native, a call's `arguments` the client's JSON object (`{}` for
+  anything else), every string valid UTF-8 (U+FFFD for a bad sequence, as `appendJsonString` writes). Streaming: full args in ONE SSE delta, thinking → `reasoning_content`.
 - Buffered calls may exceed a client's inter-event progress deadline even while SSE keepalives arrive. The omp launcher
   disables that deadline only for its Sushi provider; argument truncation and loop-stop rules remain unchanged.
 - **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups; coercion
@@ -32,7 +32,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## Templates
 
 - One-shot CLI prompts carry the same thinking fields through the chat request policy; no CLI render may hardcode thinking off.
-- **Dialects are named by format and asked of the compiled template, never of the model type**: `serializeExtraContext`
+- **Dialects are named by format and asked of the compiled template, never of the model type**: `templateSettings`
   maps the client's effort word per template dialect (scale: `thinking_mode`, a 1-100 ladder; ladder: the literal
   `'xhigh'`, xhigh|medium|low; word: `effective_reasoning_effort` with `[gMASK]<sop>`, the word as sent; any other gets
   high/no_think). An arch brings only what a template cannot say: a template it pins when the checkpoint's cannot be
@@ -41,12 +41,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   [engine-arch-seam](engine-arch-seam.md).
 
 - **The engine is `src/template/`, a Jinja2 renderer in Zig held to Python Jinja2**: `formatChat` calls it once per
-  render through `chat.renderEngine` (`template.renderJson`: the template text and the JSON of messages, tools and the
-  extra context in; the prompt, or `TemplateSyntax`, `TemplateRaised`, `TemplateRuntime` with line, column and message
+  render through `chat.renderEngine` (`Template.render`: the compiled tree and a `Context` the caller builds in the
+  render's own arena, once per render: the messages as `chat.templateMessages` shapes them, the request's tools read
+  once by the engine's `fromJson` (exact digits) with the optional keys `fillToolDefKeys` adds, and the settings of
+  `chat.templateSettings`; no JSON text between server and engine, strings referenced, not copied; the prompt, or `TemplateSyntax`, `TemplateRaised`, `TemplateRuntime` with line, column and message
   out). A template compiles once, at load (`template.Template`, `ChatConfig.compiled`, the late-system form beside
   it): one that does not compile fails the load with `[load] chat template: line L column C: message`; a render only
   reads the tree, on any thread. Each probe render (tool content, late system, forced call) is memoized on its
-  compiled template by probe and extra-context JSON (`ProbeMemo`: 256 entries, started over when full). It reads what
+  compiled template by probe and settings (`ProbeMemo`: 256 entries, started over when full). It reads what
   jinja.cpp read (the filters, tests, methods, globals and loop fields of
   `src/template/builtins.zig`, `jinja_cpp_only` names with jinja.cpp's result); any other filter, test or statement
   (`include`, `extends`, `raw`, `recursive`, `**`, `//`) is a `TemplateSyntax` naming it, and a template leaning on a
@@ -60,16 +62,21 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   lazy and a loop pays per item walked, as Python's: GLM-5.3 scans `range(i, messages|length)` per tool block and
   breaks at once. The limits hold a 4,000-turn, 7.7 MB conversation on every served template under a quarter of each
   (test "the largest served conversation"); a raise longer than the 1 KiB Diagnostic is cut at a character and never
-  matches a known raise (`Diagnostic.messageIs`).
+  matches a known raise (`Diagnostic.messageIs`). The oracle keys each engine call by the JSON text its context once
+  was: `chat_json_test.zig` writes it, byte for byte the old serializers' text, in test binaries only (it fails to
+  compile into any other build).
 - **The server asks a template through its facts, never its text** (`template/facts.zig`, `chat.asks`; lint
   `template-text-search`): the names it reads, its literals, the literals it compares against, and the literals it MAY
   print. The may-print set errs toward output: only comparison and test operands, subscript keys, slice bounds and
   raise arguments are left out; a call's argument counts wherever the call sits (`l.append(x)` stores it), and
-  `raise_exception` is no raise once the template defines or sets its own. A word in a comment counts for nothing. What rides on it:
+  `raise_exception` is no raise once anything in the template binds that name (a macro, a set, a loop target, a
+  macro's or a caller's parameter). A word in a comment counts for nothing. What rides on it:
   rendering the tool list, the tool-role probe, `preserve_thinking`, the think span, each effort dialect, `/v1/models`
   reasoning support, the generated think opener and channel protocol, and the reserved-token mask
   (`reservedOutputIds` keeps a special the template may print). Limit: a literal only pieced together
-  (`'<|im_' ~ 'end|>'`) is seen by neither the facts nor a text search.
+  (`'<|im_' ~ 'end|>'`) is seen by neither the facts nor a text search. A config built by hand calls `compile`
+  (`arch_fixtures_test.qwenChatConfig` does): `ChatConfig.facts` panics on a template never compiled or swapped in
+  after its compile (`compiledFacts` returns `TemplateNotCompiled`), so no question answers from empty facts.
   One render of a tool-calling conversation, the same bytes from both engines (the engine as landed on `54e1aef3`,
   ReleaseFast test binary, M5 Max, best of three, the four served templates): 400 turns (0.8 MB) 2.2 to 3.8 ms where
   jinja.cpp took 90 to 597 ms; 4,000 turns (8.1 MB) 21 to 36 ms where jinja.cpp took 6.4 to 51 s (GLM-5.3 the slowest).
@@ -107,7 +114,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   rendered an earlier turn's thought into a reasoning-less assistant turn instead of `<think></think>`.
 - **A `chat_template` value can be a POINTER** (`{% include 'chat_template.jinja' %}`): `chat.isIncludeStub` reads it
   as "no inline template" so the sidecar loads. Grep the log for `jinja` first.
-- A template can raise on OUR extra-context values: `serializeExtraContext` sniffs the family; tool-call `arguments`
+- A template can raise on OUR extra-context values: `templateSettings` sniffs the family; tool-call `arguments`
   stay OBJECTS (a history call whose arguments are empty, null, an array, a scalar or malformed text embeds `{}`:
   `arguments|items` on anything else raises into the silent fallback; an object that repeats a key passes as sent, and
   the template reads its last value at the first key's place, as `json.loads` does); history tool_calls carry `"id"`; `noThinkTailSuffix` closes the block a template opens unconditionally (GLM-5.3's
@@ -118,7 +125,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   holds the "System message must be at the beginning" branch (`{% if message.role == "system" %}` opening with an
   `{% if not loop.first %}` around only a `raise_exception`, at any spacing: `lateSystemTemplate` of the qwen4 chat
   face, fixture `qwen38_flash_next_chat_template.jinja`) gets ONLY that inner body replaced and renders the note in
-  place; a template without it keeps the fold, and a `qwen4_exp` load says so in one `[load]` line. The adapter runs only when a late system turn exists, so a prompt without one is byte-identical; a second
+  place; a template without it keeps the fold, and a `qwen4_exp` load says so in one `[load]` line. Only the face of
+  the config's own `model_type` is asked (`ChatConfig.model_type`, from config.json): another arch's template, or one
+  with no model type, keeps the fold whatever its shape. The adapter runs only when a late system turn exists, so a prompt without one is byte-identical; a second
   LEADING system turn is now a turn of its own too. `QWEN_MID_SYSTEM_MODEL_DIR=<pack> zig build test
   -Dtest-filter="real Qwen pack"` proves a loaded pack engages.
 - **A surface never folds before the render**: a pre-fold moved Codex's mid-input `developer` turn and Claude Code's
@@ -126,7 +135,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `instructions` replace only the stored history's LEADING system turn.
 - **A generic ChatML role header preserves tool roles**: absence of a literal `'tool'` branch does not license
   rewriting tool results as user text (`asks.toolRole`: a comparison against `'tool'`, else the probe).
-- **`preserve_thinking` reaches only a template that reads it** (`serializeExtraContext`), resolved per request:
+- **`preserve_thinking` reaches only a template that reads it** (`templateSettings`), resolved per request:
   `chat_template_kwargs` > `--preserve-thinking` > model-settings.json > undefined (Qwen3.8 keeps every turn's
   thinking). Each value renders its own prompt, so the tokenize-cache key carries it.
 - **A continuation is the template's own rendering of the partial turn**, cut after its text (transformers'

@@ -135,7 +135,7 @@ fn servedTemplates(a: std.mem.Allocator, arena: std.mem.Allocator, toks: *std.Ar
     if (arch_fx.qwen_template) |qwen| {
         const tok = try testTokenizer(a, arena, "qwen38_flash_next");
         try toks.append(arena, tok);
-        try out.append(arena, .{ .id = "qwen38_flash_next", .tok = tok, .config = .{ .chat_template = qwen, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a } });
+        try out.append(arena, .{ .id = "qwen38_flash_next", .tok = tok, .config = .{ .chat_template = qwen, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a, .model_type = arch_fx.qwen_model_type } });
     }
     {
         const tok = try testTokenizer(a, arena, "glm53");
@@ -162,7 +162,7 @@ const get_time_tools =
 const number_tools =
     \\[{"type":"function","function":{"name":"edge_numbers","description":"Numbers: é 中 😀   <b>&amp;</b> 'q' \"dq\" \\ / \u0007","parameters":{"type":"object","properties":{"ratio":{"type":"number","default":1.0,"minimum":1e-05,"maximum":1e100,"multipleOf":0.1,"examples":[-0.0,2.5e-8,1E5,3.141592653589793,5e-324,1.7976931348623157e308]},"count":{"type":"integer","default":9007199254740993,"maximum":18446744073709551616,"minimum":-9223372036854775808,"examples":[123456789012345678901234567890]},"zeta":{"type":"string","enum":["z","a"]},"alpha":{"type":"boolean","default":false},"nothing":{"default":null}},"required":["ratio"]},"strict":true}}]
 ;
-/// The same numbers beside a tool with no description or parameters, which formatChat fills and re-serializes.
+/// The same numbers beside a tool with no description or parameters, whose keys formatChat fills.
 const filled_tools =
     \\[{"type":"function","function":{"name":"edge_numbers","parameters":{"type":"object","properties":{"ratio":{"type":"number","default":1.0,"minimum":1e-05,"multipleOf":0.1},"count":{"type":"integer","maximum":18446744073709551616,"default":9007199254740993}}}}},
     \\ {"type":"function","function":{"name":"bare_tool"}}]
@@ -602,7 +602,7 @@ test "template oracle: the corpus is every call formatChat makes into the engine
     var known = std.ArrayList(Known).empty;
     for (served) |s| try known.append(arena, .{ .id = s.id, .text = s.config.chat_template });
     if (arch_fx.qwen_template) |qwen| {
-        const adapted = (try arch_chat.lateSystemTemplate(arena, qwen)) orelse return error.LateSystemAdapterDisengaged;
+        const adapted = (try arch_chat.lateSystemTemplate(arch_fx.qwen_model_type.?, arena, qwen)) orelse return error.LateSystemAdapterDisengaged;
         try known.append(arena, .{ .id = "qwen38_flash_next+late_system", .text = adapted });
     }
     var capture = Capture{ .arena = arena, .known = known.items };
@@ -659,8 +659,8 @@ const number_what = "tojson of a number in the tools list and the call arguments
     "without its `.0` (1.0 -> 1, 1E5 -> 100000, -0.0 -> -0), any other float to six significant digits " ++
     "(3.141592653589793 -> 3.14159, 1.7976931348623157e308 -> 1.79769e+308, 5e-324 -> 4.94066e-324), an integer past " ++
     "2^64-1 as such a float (18446744073709551616 -> 1.84467e+19, 10^29 -> 1e+29), and 2^64-1 as -1";
-const filled_what = "tojson of the integer 18446744073709551616 in a tools list formatChat re-serialized (a tool had no " ++
-    "description): jinja.cpp writes 1.84467e+19";
+const filled_what = "tojson of the integer 18446744073709551616 in a tools list whose missing keys formatChat filled (a tool " ++
+    "had no description): jinja.cpp writes 1.84467e+19";
 const number_why = "jinja.cpp keeps a JSON number as an int64 or a double (an unsigned past 2^63 wraps, a larger integer " ++
     "becomes a double) and prints a double with %g; transformers' tojson is json.dumps over Python's int and float, " ++
     "which print exactly. Python is right. A served prompt has these bytes only when a client's tool schema or call " ++
@@ -675,14 +675,14 @@ const differences = [_]Difference{
     .{ .case = "0885ebb8423c54c30f524565", .what = number_what, .why = number_why }, // mimo_v26, thinking false
     .{ .case = "ca48cb49cf7a32bb3e8f0bec", .what = number_what, .why = number_why }, // dsv41, thinking true
     .{ .case = "095f228afd32b3a8d0218f79", .what = number_what, .why = number_why }, // dsv41, thinking false
-    .{ .case = "22907e24174bbf497f29130f", .what = filled_what, .why = number_why }, // qwen38_flash_next, thinking true
-    .{ .case = "91f0f80fdc18d037d931dbec", .what = filled_what, .why = number_why }, // qwen38_flash_next, thinking false
-    .{ .case = "2b8d519ce6378d1f6cabb66e", .what = filled_what, .why = number_why }, // glm53, thinking true
-    .{ .case = "1b76f85ace30ee1953c08077", .what = filled_what, .why = number_why }, // glm53, thinking false
-    .{ .case = "fe75932cc90259449f5581d6", .what = filled_what, .why = number_why }, // mimo_v26, thinking true
-    .{ .case = "b6c130faca31239214d4d1fc", .what = filled_what, .why = number_why }, // mimo_v26, thinking false
-    .{ .case = "89196a5692274ce298075bc5", .what = filled_what, .why = number_why }, // dsv41, thinking true
-    .{ .case = "a6f861ec684f9a839016dd4c", .what = filled_what, .why = number_why }, // dsv41, thinking false
+    .{ .case = "d409857ee965d2a05873e9cd", .what = filled_what, .why = number_why }, // qwen38_flash_next, thinking true
+    .{ .case = "915a88f33d13cefdd96654a4", .what = filled_what, .why = number_why }, // qwen38_flash_next, thinking false
+    .{ .case = "9245030cd0fa62de0c8e8536", .what = filled_what, .why = number_why }, // glm53, thinking true
+    .{ .case = "af5ce95c5b0319468b4b73d2", .what = filled_what, .why = number_why }, // glm53, thinking false
+    .{ .case = "027c37e1f049ee354df073a9", .what = filled_what, .why = number_why }, // mimo_v26, thinking true
+    .{ .case = "898599c9ee6773f3012e63cf", .what = filled_what, .why = number_why }, // mimo_v26, thinking false
+    .{ .case = "7a752a9ffea1cdf9c0c49cb0", .what = filled_what, .why = number_why }, // dsv41, thinking true
+    .{ .case = "a5e007eba80bdc5355798f6d", .what = filled_what, .why = number_why }, // dsv41, thinking false
 };
 
 test "template oracle: jinja.cpp renders the corpus as Python Jinja2 does, except the listed differences" {

@@ -11,6 +11,8 @@ fn declOf(comptime name: []const u8, comptime decl: []const u8) ?[]const u8 {
 }
 
 pub const qwen_template = declOf("qwen4", "template");
+pub const qwen_model_type = arch_chat.modelTypeOf("qwen4");
+pub const glm_model_type = arch_chat.modelTypeOf("glm5");
 pub const mimo_template = declOf("mimo2", "template");
 
 /// The Flash-Next teacher fixture of `sushi kld`, under the models root.
@@ -19,15 +21,19 @@ pub const qwen_teacher_pack = declOf("qwen4", "teacher_pack");
 /// The stock templates the late-system adapter byte-matches.
 pub const qwen_late_templates: []const []const u8 = if (qwen_template) |t| &.{t} else &.{};
 
-/// Flash-Next's stock template with turns ending `<|im_end|>`.
-pub fn qwenChatConfig(allocator: std.mem.Allocator) ?chat.ChatConfig {
-    return .{
+/// Flash-Next's stock template with turns ending `<|im_end|>`, compiled as a load compiles it; the caller calls
+/// `dropCompiled`.
+pub fn qwenChatConfig(allocator: std.mem.Allocator) !?chat.ChatConfig {
+    var cc: chat.ChatConfig = .{
         .chat_template = qwen_template orelse return null,
         .bos_token = null,
         .eos_token = "<|im_end|>",
         .add_bos_token = false,
         .allocator = allocator,
+        .model_type = qwen_model_type,
     };
+    try cc.compile();
+    return cc;
 }
 
 /// A Flash-Next-shaped model that counts a request's tokens: no layers, thinking declared off so only a test that

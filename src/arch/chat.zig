@@ -59,15 +59,14 @@ pub fn thinkOffRefusal(model_type: []const u8) ?[]const u8 {
     }
 }
 
-/// The template with a late system turn rendered in place, when a built arch recognises it as its stock template
-/// (`lateSystemTemplate` of its chat face); null leaves the template and the fold to the caller. The caller frees it.
-pub fn lateSystemTemplate(allocator: std.mem.Allocator, tpl: []const u8) !?[]const u8 {
-    inline for (comptime std.meta.tags(registry.Tag)) |t| {
-        if (comptime @hasDecl(faceOf(t), "lateSystemTemplate")) {
-            if (try faceOf(t).lateSystemTemplate(allocator, tpl)) |adapted| return adapted;
-        }
+/// The template with a late system turn rendered in place, when `model_type`'s own face edits it (`lateSystemTemplate`
+/// of its chat face); null leaves the template and the fold to the caller. No arch's edit reaches another's template.
+/// The caller frees it.
+pub fn lateSystemTemplate(model_type: []const u8, allocator: std.mem.Allocator, tpl: []const u8) !?[]const u8 {
+    const tag = registry.ofModelType(model_type) orelse return null;
+    switch (tag) {
+        inline else => |t| return if (@hasDecl(faceOf(t), "lateSystemTemplate")) faceOf(t).lateSystemTemplate(allocator, tpl) else null,
     }
-    return null;
 }
 
 /// Whether `model_type`'s chat face edits its template so a late system turn renders in place.
@@ -76,6 +75,12 @@ pub fn editsLateSystem(model_type: []const u8) bool {
     switch (tag) {
         inline else => |t| return @hasDecl(faceOf(t), "lateSystemTemplate"),
     }
+}
+
+/// The first `model_type` the arch `name` serves, or null when the build leaves it out (tests of shared code).
+pub fn modelTypeOf(comptime name: []const u8) ?[]const u8 {
+    if (comptime !@hasField(registry.Tag, name)) return null;
+    return faceOf(@field(registry.Tag, name)).model_types[0];
 }
 
 pub fn pinOf(model_type: []const u8) ?Pin {

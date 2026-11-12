@@ -6,6 +6,11 @@ const parser = @import("parser.zig");
 const value = @import("value.zig");
 const render = @import("render.zig");
 pub const ast = @import("ast.zig");
+pub const Value = value.Value;
+pub const fromStruct = value.fromStruct;
+pub const fromJson = value.fromJson;
+pub const JsonError = value.JsonError;
+pub const Dict = value.Dict;
 const facts_mod = @import("facts.zig");
 
 pub const Facts = facts_mod.Facts;
@@ -98,17 +103,46 @@ pub const Template = struct {
     }
 };
 
-/// What a render reads besides the template.
+/// What a render reads besides the template. Its context's values may reference the caller's strings without
+/// copying them: what they point at (the request's messages and tools) outlives the render.
 pub const Inputs = struct {
-    messages_json: []const u8,
-    /// Null or empty: the context has no `tools`.
-    tools_json: ?[]const u8,
-    /// A JSON object whose keys join the context last (bos and eos tokens, thinking switches).
-    extra_json: []const u8,
+    context: Context,
     add_generation_prompt: bool,
     limits: Limits = .{},
     /// When set, gets the work the render took against its limits, whether it succeeded or not.
     usage: ?*Usage = null,
+};
+
+/// The variables a render reads: `messages`, `tools` when there are any, and a dict whose keys join last (bos and
+/// eos tokens, thinking switches).
+pub const Vars = struct { messages: Value, tools: ?Value = null, extra: Value };
+
+/// Builds a render's `Vars` in the render's own arena, inside its memory budget, once per render, so a template that
+/// changes a list changes only its own copy. A failure sets `diag`.
+pub const Context = struct {
+    ptr: *const anyopaque,
+    build: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, diag: *Diagnostic) Error!Vars,
+};
+
+/// A context read from JSON text, as Python's `json.loads` reads it (the oracle's form).
+pub const JsonContext = struct {
+    messages: []const u8,
+    /// Null or empty: the context has no `tools`.
+    tools: ?[]const u8 = null,
+    /// A JSON object.
+    extra: []const u8,
+
+    pub fn context(self: *const JsonContext) Context {
+        @setRuntimeSafety(true);
+        return .{ .ptr = self, .build = build };
+    }
+
+    fn build(ptr: *const anyopaque, arena: std.mem.Allocator, diag: *Diagnostic) Error!Vars {
+        @setRuntimeSafety(true);
+        const self: *const JsonContext = @ptrCast(@alignCast(ptr));
+        const tools: ?Value = if (self.tools) |t| if (t.len > 0) try readJson(arena, t, "tools", diag) else null else null;
+        return .{ .messages = try readJson(arena, self.messages, "messages", diag), .tools = tools, .extra = try readJson(arena, self.extra, "extra context", diag) };
+    }
 };
 
 pub const Input = struct {
@@ -142,10 +176,9 @@ pub const max_template_len = 4 << 20;
 /// render leaks into any other allocator).
 pub fn renderJson(arena: std.mem.Allocator, in: Input, diag: *Diagnostic) Error![]const u8 {
     @setRuntimeSafety(true);
+    const json = JsonContext{ .messages = in.messages_json, .tools = in.tools_json, .extra = in.extra_json };
     return renderTree(arena, null, .{
-        .messages_json = in.messages_json,
-        .tools_json = in.tools_json,
-        .extra_json = in.extra_json,
+        .context = json.context(),
         .add_generation_prompt = in.add_generation_prompt,
         .limits = in.limits,
         .usage = in.usage,
@@ -197,16 +230,16 @@ fn renderBudgeted(arena: std.mem.Allocator, given: ?Tree, in: Inputs, diag: *Dia
     const src = tree.src;
     const body = tree.body;
 
+    const vars = try in.context.build(in.context.ptr, arena, diag);
     var globals = render.Frame{ .parent = null };
-    try globals.vars.put(arena, "messages", try jsonInput(arena, in.messages_json, "messages", diag));
+    try globals.vars.put(arena, "messages", vars.messages);
     try globals.vars.put(arena, "add_generation_prompt", .{ .boolean = in.add_generation_prompt });
-    if (in.tools_json) |t| if (t.len > 0) try globals.vars.put(arena, "tools", try jsonInput(arena, t, "tools", diag));
-    const extra = try jsonInput(arena, in.extra_json, "extra context", diag);
-    if (extra != .dict) {
+    if (vars.tools) |t| try globals.vars.put(arena, "tools", t);
+    if (vars.extra != .dict) {
         diag.set("", null, "the extra context is not a JSON object");
         return error.TemplateRuntime;
     }
-    for (extra.dict.entries.items) |e| try globals.vars.put(arena, e.key.string, e.value);
+    for (vars.extra.dict.entries.items) |e| try globals.vars.put(arena, e.key.string, e.value);
 
     var out = std.ArrayList(u8).empty;
     var r = render.Renderer{ .arena = arena, .limits = in.limits, .out = &out, .meter = .{ .max = in.limits.max_steps }, .stack_base = @frameAddress() };
@@ -226,7 +259,8 @@ fn renderBudgeted(arena: std.mem.Allocator, given: ?Tree, in: Inputs, diag: *Dia
     return out.items;
 }
 
-fn jsonInput(arena: std.mem.Allocator, text: []const u8, comptime what: []const u8, diag: *Diagnostic) Error!value.Value {
+/// `text` read as `json.loads` reads it, or a failure naming `what` in `diag` (not JSON, or nested too deep).
+pub fn readJson(arena: std.mem.Allocator, text: []const u8, comptime what: []const u8, diag: *Diagnostic) Error!value.Value {
     @setRuntimeSafety(true);
     return value.fromJson(arena, text) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
@@ -260,20 +294,21 @@ test "template: a template compiled once renders on many threads at once, each a
     var diag = Diagnostic{};
     var compiled = try Template.compile(testing.allocator, source, &diag);
     defer compiled.deinit();
-    const inputs = [_]Inputs{
-        .{ .messages_json = "[{\"role\": \"user\", \"content\": \"hi\"}]", .tools_json = null, .extra_json = "{}", .add_generation_prompt = true },
-        .{ .messages_json = "[{\"role\": \"system\", \"content\": \"s\"}, {\"role\": \"user\", \"content\": \"q\"}]", .tools_json = "[{}]", .extra_json = "{}", .add_generation_prompt = false },
+    const jsons = [_]JsonContext{
+        .{ .messages = "[{\"role\": \"user\", \"content\": \"hi\"}]", .extra = "{}" },
+        .{ .messages = "[{\"role\": \"system\", \"content\": \"s\"}, {\"role\": \"user\", \"content\": \"q\"}]", .tools = "[{}]", .extra = "{}" },
     };
     const Worker = struct {
-        fn run(t: *const Template, in: Inputs, ok: *bool) void {
+        fn run(t: *const Template, json: *const JsonContext, ok: *bool) void {
             @setRuntimeSafety(true);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             var d = Diagnostic{};
             var fresh = Diagnostic{};
+            const agp = json.tools == null;
             for (0..200) |_| {
-                const got = t.render(arena.allocator(), in, &d) catch return;
-                const want = renderJson(arena.allocator(), .{ .template = source, .messages_json = in.messages_json, .tools_json = in.tools_json, .extra_json = in.extra_json, .add_generation_prompt = in.add_generation_prompt }, &fresh) catch return;
+                const got = t.render(arena.allocator(), .{ .context = json.context(), .add_generation_prompt = agp }, &d) catch return;
+                const want = renderJson(arena.allocator(), .{ .template = source, .messages_json = json.messages, .tools_json = json.tools, .extra_json = json.extra, .add_generation_prompt = agp }, &fresh) catch return;
                 if (!std.mem.eql(u8, got, want)) return;
             }
             ok.* = true;
@@ -281,7 +316,7 @@ test "template: a template compiled once renders on many threads at once, each a
     };
     var oks: [8]bool = @splat(false);
     var threads: [8]std.Thread = undefined;
-    for (&threads, &oks, 0..) |*t, *ok, i| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &compiled, inputs[i % inputs.len], ok });
+    for (&threads, &oks, 0..) |*t, *ok, i| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &compiled, &jsons[i % jsons.len], ok });
     for (threads) |t| t.join();
     for (oks) |ok| try testing.expect(ok);
 }

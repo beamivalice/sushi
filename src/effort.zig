@@ -229,7 +229,7 @@ pub fn scaleText(n: u8) []const u8 {
     return scale_text[@min(n, 100)];
 }
 
-/// The value the template's `reasoning_effort` receives for `arm` (`chat.serializeExtraContext` maps it per family).
+/// The value the template's `reasoning_effort` receives for `arm` (`chat.templateSettings` maps it per family).
 pub fn templateValue(arm: EffortArm) []const u8 {
     return switch (arm.sends) {
         .none => @tagName(arm.effort),

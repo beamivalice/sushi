@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A tool declared without a description keeps its schema's numbers as sent**: a whole float such as `1.0`, `1e5`
+  or `-0.0` in its parameters no longer reaches the prompt as an integer, and a tool list with a repeated key gets its
+  missing description and parameters filled like any other.
 - **A chat template that does not parse now fails the model's load**: the log names its line and column
   (`[load] chat template:`) instead of every request failing its render.
 - **DeepSeek-V4.1-Flash's prefill attention does less work for the same output**: the kernel reads each block of

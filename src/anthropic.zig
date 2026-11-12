@@ -2030,8 +2030,8 @@ test "anthropic messages: a forced tool_choice is committed at the answer bounda
 
 /// Render one turn as the surface builds it: Responses input (with `instructions`)
 /// or a /v1/messages body.
-fn renderSurfaceTurnForTests(a: std.mem.Allocator, tpl: []const u8, surface: enum { responses, messages }, body_json: []const u8) ![]const u8 {
-    var config = chat_mod.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+fn renderSurfaceTurnForTests(a: std.mem.Allocator, tpl: []const u8, model_type: ?[]const u8, surface: enum { responses, messages }, body_json: []const u8) ![]const u8 {
+    var config = chat_mod.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a, .model_type = model_type };
     try config.compile();
     defer config.dropCompiled();
     const parsed = try std.json.parseFromSlice(std.json.Value, a, body_json, .{});
@@ -2070,17 +2070,18 @@ test "a late system turn keeps each turn's prompt a prefix of the next where the
         \\{"system":"S","messages":[{"role":"user","content":"u1"},{"role":"assistant","content":"a1"},
         \\ {"role":"system","content":"hook: started"},{"role":"user","content":"u2"}]}
     ;
-    const Template = struct { tpl: []const u8, places_late_system: bool };
+    const Template = struct { tpl: []const u8, places_late_system: bool, model_type: ?[]const u8 = null };
     const templates = [_]Template{
         .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .places_late_system = true },
-        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .places_late_system = true },
+        // Qwen's own face edits its template so the turn renders in place; without that arch it folds.
+        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .places_late_system = arch_fx.qwen_model_type != null, .model_type = arch_fx.qwen_model_type },
         .{ .tpl = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .places_late_system = false },
     };
     for (templates) |t| {
         inline for (.{ .{ .responses, responses_n, responses_next, "approvals: never" }, .{ .messages, messages_n, messages_next, "hook: started" } }) |c| {
-            const turn_n = try renderSurfaceTurnForTests(a, t.tpl, c[0], c[1]);
+            const turn_n = try renderSurfaceTurnForTests(a, t.tpl, t.model_type, c[0], c[1]);
             defer a.free(turn_n);
-            const turn_next = try renderSurfaceTurnForTests(a, t.tpl, c[0], c[2]);
+            const turn_next = try renderSurfaceTurnForTests(a, t.tpl, t.model_type, c[0], c[2]);
             defer a.free(turn_next);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, turn_next, c[3]));
             if (t.places_late_system) try std.testing.expect(std.mem.startsWith(u8, turn_next, turn_n));
@@ -2174,7 +2175,8 @@ const CountTokensFixture = struct {
     fn init(f: *CountTokensFixture) !void {
         const a = std.testing.allocator;
         f.cfg = arch_fx.qwenCountConfig() orelse return error.SkipZigTest;
-        f.chat_cfg = arch_fx.qwenChatConfig(a) orelse return error.SkipZigTest;
+        f.chat_cfg = (try arch_fx.qwenChatConfig(a)) orelse return error.SkipZigTest;
+        errdefer f.chat_cfg.dropCompiled();
         f.arena = .init(a);
         f.tok = try byteTokenizerForTests(a, f.arena.allocator(), &.{ "<|im_start|>", "<|im_end|>", "<think>", "</think>" });
         f.lm = undefined;
@@ -2190,6 +2192,7 @@ const CountTokensFixture = struct {
     }
 
     fn deinit(f: *CountTokensFixture) void {
+        f.chat_cfg.dropCompiled();
         f.lm.tokenize_cache.?.deinit();
         deinitTestTokenizer(&f.tok);
         f.arena.deinit();
@@ -2254,8 +2257,10 @@ test "a refused chat template answers a named 500 on every generative surface, s
     var f: CountTokensFixture = undefined;
     try f.init();
     defer f.deinit();
+    f.chat_cfg.dropCompiled();
     f.chat_cfg.chat_template = "{{ raise_exception('no turn format') }}";
     f.chat_cfg.eos_token = "<|endoftext|>";
+    try f.chat_cfg.compile();
     const Case = struct { handler: *const fn (std.mem.Allocator, *Conn, []const u8, *LoadedModel) anyerror!void, body: []const u8 };
     const cases = [_]Case{
         .{ .handler = handleChatCompletions, .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },

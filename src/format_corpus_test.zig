@@ -3,7 +3,7 @@
 //! A table of REAL captured model outputs (plus a few minimal synthetic
 //! variants of real failures) run through the pure post-processing layer:
 //! `think_tags.splitThinkBlock` / `tool_calls.parseToolCalls` —
-//! and back through the INPUT layer (`chat.serializeMessagesJson`), since
+//! and back through the INPUT layer (`chat.messagesJsonForTest`), since
 //! every output re-enters the next request's history.
 //! No model weights, no server — runs in CI on every `zig build test`.
 //!
@@ -39,7 +39,7 @@
 const std = @import("std");
 const testing = std.testing;
 const chat = @import("chat.zig");
-const arch_chat = @import("arch/chat.zig");
+const arch_fx = @import("arch_fixtures_test.zig");
 const think_tags = @import("think_tags.zig");
 const tool_calls_mod = @import("tool_calls.zig");
 const tool_schema = @import("tool_schema.zig");
@@ -74,16 +74,14 @@ test "format corpus: late system notes never vanish, and a template that places 
     // `in_place` templates render a late note where it was sent (the stock Qwen ones through the
     // adapter); the rest fold it into the leading turn, which rewrites earlier bytes by design.
     const qwen_tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
-    const adapted = try arch_chat.lateSystemTemplate(testing.allocator, qwen_tpl);
-    defer if (adapted) |a| testing.allocator.free(a);
-    const templates = [_]struct { source: []const u8, in_place: bool }{
-        .{ .source = qwen_tpl, .in_place = adapted != null },
+    const templates = [_]struct { source: []const u8, in_place: bool, model_type: ?[]const u8 = null }{
+        .{ .source = qwen_tpl, .in_place = arch_fx.qwen_model_type != null, .model_type = arch_fx.qwen_model_type },
         .{ .source = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("fixtures/dsv41_chat_template.jinja"), .in_place = true },
         .{ .source = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .in_place = false },
     };
     for (templates) |template| {
-        const config = chat.ChatConfig{ .chat_template = template.source, .bos_token = "<bos>", .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
+        const config = chat.ChatConfig{ .chat_template = template.source, .bos_token = "<bos>", .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator, .model_type = template.model_type };
         const messages = [_]chat.Message{
             .{ .role = "system", .content = "stable instructions" },
             .{ .role = "user", .content = "corpus question marker" },
@@ -2097,7 +2095,7 @@ test "format corpus: the incremental stream gates agree with the full rescan on 
 test "format corpus: history round-trip serialization survives any byte content" {
     // Inverse direction of the corpus: everything a model emits (and every
     // tool result an agent echoes back) re-enters the NEXT request's history
-    // and is serialized by chat.serializeMessagesJson into the JSON that the
+    // and is serialized by chat.messagesJsonForTest into the JSON that the
     // C++ Jinja engine (nlohmann, strict) parses. 2026-06-11 pi/gemma-4-31b
     // failure: a tool result with a raw ESC byte (`\x1b[?25l`, ANSI
     // hide-cursor from an interactive npm CLI) produced invalid JSON →
@@ -2136,7 +2134,7 @@ test "format corpus: history round-trip serialization survives any byte content"
                 .{ .role = "tool", .content = tool_result, .tool_call_id = "tc_0" },
             };
 
-            const serialized = try chat.serializeMessagesJson(allocator, &messages);
+            const serialized = try chat.messagesJsonForTest(allocator, &messages, null);
             defer allocator.free(serialized);
 
             for (serialized) |c| {
@@ -2322,7 +2320,7 @@ test "format corpus: a parameter VALUE never decides the call" {
 
 test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
     // Every call we parse is rendered back into the NEXT request's history by
-    // serializeMessagesJson. If that round-trip loses or mangles a call, the
+    // messagesJsonForTest. If that round-trip loses or mangles a call, the
     // model sees a malformed version of its own last turn and repeats it —
     // which is what turns one bad call into a loop. Parse the dialect, put the
     // result through the serializer, read it back, and require the same call.
@@ -2348,7 +2346,7 @@ test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
             .{ .role = "user", .content = "write a.txt" },
             .{ .role = "assistant", .content = "", .tool_calls = tcs },
         };
-        const serialized = try chat.serializeMessagesJson(allocator, &messages);
+        const serialized = try chat.messagesJsonForTest(allocator, &messages, null);
         defer allocator.free(serialized);
 
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, serialized, .{}) catch {
@@ -2507,9 +2505,9 @@ test "format corpus: a system turn past index 0 reaches the prompt once, on ever
     // loop, and the stock Qwen3.8 ones through the late-system adapter) keep it in place. The
     // fallback render carried it twice.
     const chatml = "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\\n' ~ message.content ~ '<|im_end|>' }}{% endfor %}";
-    const Case = struct { name: []const u8, tpl: []const u8, system_headers: usize };
+    const Case = struct { name: []const u8, tpl: []const u8, system_headers: usize, model_type: ?[]const u8 = null };
     const cases = [_]Case{
-        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .system_headers = 2 },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .system_headers = 2, .model_type = arch_fx.qwen_model_type },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .system_headers = 0 },
         .{ .name = "role loop", .tpl = chatml, .system_headers = 2 },
@@ -2522,13 +2520,14 @@ test "format corpus: a system turn past index 0 reaches the prompt once, on ever
     };
     for (cases) |c| {
         // The stock-template adapter belongs to the arch whose template it is: without that arch the turn folds.
-        if (try arch_chat.lateSystemTemplate(testing.allocator, c.tpl)) |adapted| testing.allocator.free(adapted) else if (std.mem.eql(u8, c.name, "qwen3.8-flash-next")) continue;
+        if (std.mem.eql(u8, c.name, "qwen3.8-flash-next") and c.model_type == null) continue;
         var config = chat.ChatConfig{
             .chat_template = c.tpl,
             .bos_token = null,
             .eos_token = "<|im_end|>",
             .add_bos_token = false,
             .allocator = testing.allocator,
+            .model_type = c.model_type,
         };
         const rendered = try chat.renderChatTemplate(testing.allocator, &messages, &config, null, null, true, null, false);
         defer testing.allocator.free(rendered);

@@ -782,6 +782,52 @@ fn convert(arena: Allocator, j: std.json.Value, depth: usize) JsonError!Value {
     };
 }
 
+/// `v` as the template reads it, built in `arena` without copying its strings: a struct is a dict of its fields in
+/// order with a null optional left out, as an absent JSON key; a slice is a list, a `[]const u8` a string, a tagged
+/// union its payload's value (a void payload `none`), an enum its tag's name, a `Value` itself, and a type with a
+/// `templateValue()` what that returns (a value parsed from text the caller keeps).
+pub fn fromStruct(arena: Allocator, v: anytype) error{OutOfMemory}!Value {
+    @setRuntimeSafety(true);
+    const T = @TypeOf(v);
+    if (T == Value) return v;
+    if (T == []const u8) return .{ .string = v };
+    if (comptime (@typeInfo(T) == .@"struct" or @typeInfo(T) == .@"union") and @hasDecl(T, "templateValue")) return v.templateValue();
+    switch (@typeInfo(T)) {
+        .bool => return .{ .boolean = v },
+        .int, .comptime_int => return .{ .int = @intCast(v) },
+        .float, .comptime_float => return .{ .float = @floatCast(v) },
+        .optional => return if (v) |x| fromStruct(arena, x) else .none,
+        .@"enum" => return .{ .string = @tagName(v) },
+        .void => return .none,
+        .pointer => |p| switch (p.size) {
+            .one => return fromStruct(arena, v.*),
+            .slice => {
+                const l = try arena.create(List);
+                l.* = .{};
+                try l.items.ensureTotalCapacity(arena, v.len);
+                for (v) |item| l.items.appendAssumeCapacity(try fromStruct(arena, item));
+                return .{ .list = l };
+            },
+            else => @compileError("fromStruct: no template value for " ++ @typeName(T)),
+        },
+        .@"union" => switch (v) {
+            inline else => |payload| return fromStruct(arena, payload),
+        },
+        .@"struct" => |st| {
+            const d = try arena.create(Dict);
+            d.* = .{};
+            try d.entries.ensureTotalCapacity(arena, st.field_names.len);
+            inline for (st.field_names, st.field_types) |name, F| {
+                const field = @field(v, name);
+                const absent = @typeInfo(F) == .optional and field == null;
+                if (!absent) d.entries.appendAssumeCapacity(.{ .key = .{ .string = name }, .value = try fromStruct(arena, field) });
+            }
+            return .{ .dict = d };
+        },
+        else => @compileError("fromStruct: no template value for " ++ @typeName(T)),
+    }
+}
+
 /// The integer of decimal `text` (an optional '-', digits, no leading zero): an int when it fits 64 bits, else
 /// a bigint. Every bigint is made here, so a bigint is always outside i64 and orders by its sign against an int.
 pub fn integer(text: []const u8) Value {
@@ -815,6 +861,42 @@ test "template value: a JSON number reads as Python reads it" {
     try testing.expectEqual(@as(usize, 2), d.entries.items.len);
     try testing.expectEqualStrings("a", d.entries.items[0].key.string);
     try testing.expectEqual(@as(i64, 3), d.entries.items[0].value.int);
+}
+
+test "template value: a Zig value reads as the JSON of it reads, a null optional as an absent key" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Call = struct { name: []const u8, arguments: Value };
+    const Content = union(enum) { text: []const u8, parts: []const Value, none };
+    const Msg = struct { role: []const u8, content: Content, calls: ?[]const Call = null, id: ?[]const u8 = null, n: i64 = 0, f: f64 = 0.5, ok: bool = true };
+    const args = try fromJson(a, "{\"x\": 1.0}");
+    const msgs = [_]Msg{
+        .{ .role = "user", .content = .{ .text = "hi" } },
+        .{ .role = "assistant", .content = .none, .calls = &.{.{ .name = "f", .arguments = args }}, .id = "c1", .n = -3 },
+    };
+    const v = try fromStruct(a, @as([]const Msg, &msgs));
+    const want = try fromJson(a,
+        \\[{"role": "user", "content": "hi", "n": 0, "f": 0.5, "ok": true},
+        \\ {"role": "assistant", "content": null, "calls": [{"name": "f", "arguments": {"x": 1.0}}], "id": "c1", "n": -3, "f": 0.5, "ok": true}]
+    );
+    var m: Meter = .{};
+    try testing.expect(try eql(&m, want, v, 0));
+    const d0 = v.list.items.items[0].dict;
+    try testing.expectEqual(@as(usize, 5), d0.entries.items.len);
+    for ([_][]const u8{ "role", "content", "n", "f", "ok" }, d0.entries.items) |k, e| try testing.expectEqualStrings(k, e.key.string);
+    try testing.expect(d0.entries.items[0].value.string.ptr == msgs[0].role.ptr);
+    // A type that keeps its text beside the value it parsed gives the template the value.
+    const Raw = struct {
+        text: []const u8,
+        parsed: Value,
+        pub fn templateValue(self: @This()) Value {
+            @setRuntimeSafety(true);
+            return self.parsed;
+        }
+    };
+    const raw = try fromStruct(a, .{ .arguments = Raw{ .text = "{\"x\": 1.0}", .parsed = args } });
+    try testing.expect(try eql(&m, try fromJson(a, "{\"arguments\": {\"x\": 1.0}}"), raw, 0));
 }
 
 test "template value: the stable sort survives a comparator that lies or fails, and loses no item" {
