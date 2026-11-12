@@ -498,6 +498,22 @@ M5 Max, AC, fans at max, `taskpolicy -a`, GPU lock, boot at 49 °C, Nominal. Bas
 - The bench reads the same corpus every run, so its Engram rows may sit in the page cache: these cells show no loss,
   not the gain. A prompt of fresh text waited 309 ms on the rows of its first 2,048-token chunk (one load, uncooled).
 
+### Attention scores with the keys as the left operand (fast bench)
+
+`tests/bench.sh --tag p2-attn --rungs 4k,8k`, the same pack and flags, the source tree of this change on `a7fd31db`,
+M5 Max, AC, fans at max, `taskpolicy -a`, GPU lock, boot at 49 °C, Nominal. Baseline: the Engram table above, recorded,
+not rerun.
+
+| rung | code prefill | was | prose prefill | was | code decode | was | prose decode | was |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 1,372 | 1,324 | 1,192 | 1,169 | 94.6 | 95.7 | 53.3 | 53.1 |
+| 8k | 1,560 | 1,528 | 1,431 | 1,390 | 101.8 | 100.8 | 59.0 | 56.1 |
+
+- The micro indicator that decided it: `sushi-ubench run dsv41.picks_span`, arm `packed_nax`, 7 rounds: a 256-row span
+  1.6-1.7 to 1.5-1.6 ms, a 128-row span 0.9-1.0 to 0.9, the same heads byte for byte
+  ([engine-kernels](engine-kernels.md)). The kernel is 16% of a long prompt's prefill GPU time, so the cells above
+  show no loss; the gain is inside their run-to-run spread.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.

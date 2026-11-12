@@ -1396,8 +1396,9 @@ const ATTN_NAX_HEADER =
     \\
 ;
 
-/// `ATTN_FUSED_HEAD` with both products on the matrix units: the scores as 16 heads x 16 keys over 32-channel steps,
-/// P x V as 16 heads x 32 channels over the 16 keys. Only the summation order inside the products differs.
+/// `ATTN_FUSED_HEAD` with both products on the matrix units: the scores as 16 keys x 16 heads over 32-channel steps
+/// (keys the left operand, so a tile's key fragments are read once and serve P x V as its right operand), P x V as
+/// 16 heads x 32 channels over the 16 keys. Only the summation order inside the products differs.
 const ATTN_NAX_HEAD =
     \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
     \\const ushort lane = thread_index_in_simdgroup;
@@ -1415,12 +1416,12 @@ const ATTN_NAX_HEAD =
     \\const int hh = int(tid) / TPH, sub = int(tid) % TPH;
     \\float m = sink[h0 + hh], lsum = 1.0f;
     \\const float scale = scal[0];
-    \\T qa[QS][16];
+    \\T qt[QS][16];
     \\float o[OF * 8];
     \\#pragma clang loop unroll(full)
     \\for (int ks = 0; ks < QS; ++ks)
     \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < 16; ++i) qa[ks][i] = q[(size_t(l) * H + h0 + dsv41_nax_r(lane, i % 8)) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_c(lane, i % 8)];
+    \\  for (int i = 0; i < 16; ++i) qt[ks][i] = q[(size_t(l) * H + h0 + dsv41_nax_c(lane, i % 8)) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_r(lane, i % 8)];
     \\#pragma clang loop unroll(full)
     \\for (int i = 0; i < OF * 8; ++i) o[i] = 0.0f;
     \\for (int t0 = 0; t0 < total; t0 += KT) {
@@ -1443,15 +1444,15 @@ const ATTN_NAX_TAIL =
     \\  float s[8];
     \\  #pragma clang loop unroll(full)
     \\  for (int i = 0; i < 8; ++i) s[i] = 0.0f;
+    \\  T kf[QS][16];
     \\  #pragma clang loop unroll(full)
     \\  for (int ks = 0; ks < QS; ++ks) {
-    \\    T b[16];
     \\    #pragma clang loop unroll(full)
-    \\    for (int i = 0; i < 16; ++i) b[i] = kt[dsv41_nax_c(lane, i % 8) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_r(lane, i % 8)];
-    \\    dsv41_nax_mma<16, 32>(s, qa[ks], b);
+    \\    for (int i = 0; i < 16; ++i) kf[ks][i] = kt[dsv41_nax_r(lane, i % 8) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_c(lane, i % 8)];
+    \\    dsv41_nax_mma<16, 32>(s, kf[ks], qt[ks]);
     \\  }
     \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < 8; ++i) sp[(int(sg) * HB + dsv41_nax_r(lane, i)) * KT + dsv41_nax_c(lane, i)] = s[i];
+    \\  for (int i = 0; i < 8; ++i) sp[(int(sg) * HB + dsv41_nax_c(lane, i)) * KT + dsv41_nax_r(lane, i)] = s[i];
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  float sv[NJ], tmax = -INFINITY;
     \\  for (int jj = 0; jj < NJ; ++jj) {
@@ -1487,14 +1488,9 @@ const ATTN_NAX_TAIL =
     \\  #pragma clang loop unroll(full)
     \\  for (int i = 0; i < 8; ++i) { ah[i] = ph[dsv41_nax_r(lane, i) * KT + dsv41_nax_c(lane, i)]; al[i] = pl[dsv41_nax_r(lane, i) * KT + dsv41_nax_c(lane, i)]; }
     \\  #pragma clang loop unroll(full)
-    \\  for (int g = 0; g < OF / 2; ++g) {
-    \\    T b[16];
-    \\    #pragma clang loop unroll(full)
-    \\    for (int f = 0; f < 2; ++f)
-    \\      #pragma clang loop unroll(full)
-    \\      for (int i = 0; i < 8; ++i) b[f * 8 + i] = kt[dsv41_nax_r(lane, i) * D + d0 + g * 32 + f * 16 + dsv41_nax_c(lane, i)];
-    \\    dsv41_nax_mma<32, 16>(o + g * 16, al, b);
-    \\    dsv41_nax_mma<32, 16>(o + g * 16, ah, b);
+    \\  for (int g = 0; g < QS; ++g) {
+    \\    dsv41_nax_mma<32, 16>(o + g * 16, al, kf[g]);
+    \\    dsv41_nax_mma<32, 16>(o + g * 16, ah, kf[g]);
     \\  }
     \\}
     \\if (sub == 0) rl[hh] = 1.0f / lsum;

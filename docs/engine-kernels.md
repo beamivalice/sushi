@@ -208,11 +208,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   rounds): span 256 3.4 ms against 6.1 for gather + fused, span 128 1.8 against 3.1; peak beyond the inputs 16 MB
   against 182 MB. Resident 32K prefill (`--drop-expert 128`, one boot an arm, profiled): 1016.5 to 1078.4 tok/s.
 - `dsv41_attn_nax` (`_fp4`, `Model.attn_nax`, on where `attnNaxFits` holds and the load's trial `attnNaxProbe` against the SIMD kernel passes) runs both products on NAX `matmul2d`
-  fragments (16 heads x 16 keys over 32-channel steps for the scores, 16 heads x 32 channels for P x V, lo then hi P), everything else
+  fragments (16 keys x 16 heads over 32-channel steps for the scores, the keys the left operand so a lane reads a tile's key fragments
+  once and reuses them as the right operand of P x V; 16 heads x 32 channels for P x V, lo then hi P), everything else
   as the fused kernel: the epilogue store maps the 16 x 16 fragment (a lane holds four contiguous columns of rows `r` and `r + 8`, the
   same lane groups for the fp8 amax shuffles). Design after CommunityServe/plugins PR #6 (@STRML, MIT). Error against the CPU f32
   `attnCore` 3.0e-6 to 6.6e-6 of peak; packed rows and the epilogue store are byte-equal to its gather and op chain. `ubench`
   `dsv41.picks_span` arm `packed_nax`: 3.2 to 1.7 ms (span 256), 1.7 to 1.0 (span 128); resident 32K prefill +14.0%.
+  With the keys as the scores' left operand (04b1498a against the source tree of this change on a7fd31db, quiet, 7 rounds):
+  1.6-1.7 to 1.5-1.6 ms (span 256), 0.9-1.0 to 0.9 (span 128), the same heads byte for byte (64 rows x 64 heads x 512 in f32,
+  512 picks with gaps, compared at the landing).
   The trial is the probe-and-decline pattern above: a failed one is recorded by not setting the arm, never re-run per call. A Metal type name (`half`) as a loop variable fails the JIT compile and surfaces only as a failed test.
 - Both kernels take an `Epilogue` (`attnEpilogueFits`: head width a multiple of 256): the store does what `attnOut` did to the
   heads, in the same order, so the bytes are the op chain's: round to the activation dtype, the tail's inverse rotation
