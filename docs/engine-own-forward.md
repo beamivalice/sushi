@@ -404,12 +404,17 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   manifest's recipes then compile on 8 threads in about 2.5 s ([the manifest](#the-pipeline-manifest)).
 - **A kernel has one signature.** MLX binds an input under 8 elements as a `constant` reference and a longer one
   as a `device` pointer, so one source is two pipelines; ours binds every array as a `device` pointer.
-- **The warm runs every shape that names a pipeline** (`warmOwn`, `warmOwnFills`, `warmOwnBlocks`, `warmOwnLong`):
+- **The warm runs every shape that names a pipeline** (`warmOwn`, `warmOwnFills`, `warmOwnBlocks`, `warmOwnLong`,
+  `warmOwnStream`):
   a verify of every width to the ring's slack (a copy round is wider than the block), each with the routed chains
   queued and waiting, the block indexer at a context it can afford (fewer candidate blocks kept), a draft at every
   fill of the stages' windows (MLX picks a matmul tile and a row reduction by the row count, so a prompt shorter
   than the window is other kernels), and the kernels a step takes from 131072 keys (the one-row index scan on the
-  matrix units by lowering `Model.index_nax_keys` for one step, the split top-k on scores of its own).
+  matrix units by lowering `Model.index_nax_keys` for one step, the split top-k on scores of its own), and a chunk
+  whose index top-k streams over key tiles, by lowering `Model.index_stream_tile` to its smallest (a prompt streams
+  only past 32768 keys; the fold of a second tile takes ids along an axis, a pipeline no shorter prompt makes).
+- **A path a prompt reaches only past a threshold is warmed by lowering the threshold**, never left to the first long
+  prompt: the count must be no kernel's template value, and a test seals the engine and runs the path at that setting.
 - **The sampled verdict is warmed** (`dsv41_serving.warmSampledVerdict`, after `warmKernels`): its op chain
   (`sampledDraws`, the function a round calls) runs on the engine's stream over zero logits of `[1, w, vocab]` f32 for
   every verify width, unseeded, at the four filter settings (neither, top-k 40, top-p 0.95, both) with a suppress mask;

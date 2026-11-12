@@ -41,6 +41,20 @@ const INDEX_STREAM_TILE: usize = @intCast(cfg_mod.index_stream_tile);
 /// Tests: the spans whose index top-k streamed.
 var index_streams: std.atomic.Value(usize) = .init(0);
 
+/// Index top-ks streamed over key tiles since the process began.
+pub fn indexStreams() usize {
+    return index_streams.load(.monotonic);
+}
+
+/// The smallest tile `indexStream` takes on `m`'s keys: whole key tiles of the kernel and whole candidate blocks.
+pub fn indexStreamTileMin(m: *const Model) usize {
+    const step = kernels.indexKeyTile(m.act);
+    const bs: usize = if (m.cfg.cand_source >= 0) m.cfg.cand_block_size else 0;
+    var tile = step;
+    while (bs > 0 and tile % bs != 0) tile += step;
+    return tile;
+}
+
 // ── weights ──────────────────────────────────────────────────────────────
 
 /// Tests: MLX's quantized matmul rounds its f32 inputs (about 5e-4 relative), so the tight f32 bar
@@ -2996,6 +3010,7 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
         try warmOwnLong(m, ids[0]);
         try warmOwnCapture(m);
         try warmOwnImages(m);
+        try warmOwnStream(m);
     }
 }
 
@@ -3071,6 +3086,42 @@ fn warmOwnBlocks(m: *Model, t1: u32) !void {
     try warmRun(try chunk);
     // The indexer's kernels are the same under either schedule of the routed chains.
     try warmOwn(m, t1, .queued);
+}
+
+/// The engine's kernels of a chunk whose index top-k streams over key tiles (`indexStream`), which a prompt reaches
+/// only past `index_stream_tile` keys. The load runs one such chunk at a context it can afford, with the smallest tile
+/// and, as `warmOwnBlocks`, fewer blocks kept: neither count is a kernel's template value.
+fn warmOwnStream(m: *Model) !void {
+    const c = &m.cfg;
+    if (!m.engine_prefill) return;
+    const tile = indexStreamTileMin(m);
+    var r_min: usize = std.math.maxInt(usize);
+    var r_max: usize = 0;
+    for (m.layers, 0..) |*l, li| if (l.idx != null) {
+        r_min = @min(r_min, m.ratio(li));
+        r_max = @max(r_max, m.ratio(li));
+    };
+    if (r_max == 0) return;
+    const kept = c.cand_blocks;
+    const bs: usize = if (c.cand_source >= 0) c.cand_block_size else 0;
+    const few = if (bs > 0) @min(kept, c.index_topk / c.cand_block_size + 1) else kept;
+    const block_rows = if (bs > 0) (@as(usize, few) + 2) * bs * m.ratio(@intCast(c.cand_source)) else 0;
+    const rows = @min(c.max_pos, @max((2 * tile + 1) * r_max, block_rows));
+    // No layer of this context holds a second tile of keys: nor does a prompt's.
+    if (rows / r_min <= tile) return;
+    c.cand_blocks = few;
+    defer c.cand_blocks = kept;
+    const served = m.index_stream_tile;
+    m.index_stream_tile = tile;
+    defer m.index_stream_tile = served;
+    resetState(m);
+    const ctx = try m.gpa.alloc(u32, rows);
+    defer m.gpa.free(ctx);
+    for (ctx, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % c.vocab);
+    const was = ownBegin(m);
+    defer ownEnd(m, was);
+    warmBudget(m, rows);
+    try warmRun(try extend(m, ctx, .last));
 }
 
 /// From here `m`'s ops go to the engine of our own, and an MLX stream among them is refused by name. Returns the

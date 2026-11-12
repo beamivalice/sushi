@@ -438,6 +438,41 @@ test "dsv41 pipelines: the wide chunks' recipes are in the manifest, and a load 
     try testing.expect(with_wide > 0);
 }
 
+test "dsv41 pipelines: a chunk whose index top-k streams over key tiles compiles nothing inside a prompt, after a full warm and after a load from the manifest (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    var served: Served = undefined;
+    try served.init(testing.allocator);
+    defer served.deinit();
+    const m = served.model();
+    m.engine_prefill = true;
+    // The fixture's window of 8 rows is a span the indexer scans a row at a time: a wider one is scored in tiles.
+    m.cfg.window = 32;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const key = testKey("e2e2e2e2e2e2e2e2");
+    var prompt: [97]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = served.ids[(i * 5 + 3) % served.ids.len];
+    const served_tile = m.index_stream_tile;
+    defer m.index_stream_tile = served_tile;
+    for ([_]dsv41_model.WarmScope{ .all, .mlx }) |scope| {
+        mlx.engine.seal(false);
+        m.index_stream_tile = served_tile;
+        var plan = plainBegin(tmp.dir, key);
+        defer plan.deinit();
+        try testing.expectEqual(scope, try served.load(&plan));
+        mlx.engine.seal(true);
+        defer mlx.engine.seal(false);
+        const late = mlx.engine.latePipelines();
+        const streams = dsv41_model.indexStreams();
+        // The fixture's context is under one served tile of keys: the smallest tile makes its second chunk span two.
+        m.index_stream_tile = dsv41_model.indexStreamTileMin(m);
+        try served.prefillChunk(prompt[0..64]);
+        try served.prefillChunk(prompt[64..97]);
+        try testing.expect(dsv41_model.indexStreams() > streams);
+        try testing.expectEqual(late, mlx.engine.latePipelines());
+    }
+}
+
 test "dsv41 pipelines: a manifest of another build is recompiled, the warm runs in full, and the older build's directory goes (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     var served: Served = undefined;
