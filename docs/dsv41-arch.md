@@ -1078,8 +1078,17 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   slot set, another arm or a bumped tag never reads these entries. Any change to what a stored state means bumps the
   tag, or adds a key part, in the same landing.
 - **Checkpoints** come from the Qwen schedule: absolute multiples of the stride (at least the prefill chunk, 8192 by
-  default) and the prompt-end snapshot 30 tokens before the end, where the next turn's re-rendered generation prefix
-  still matches. In RAM (a RAM entry, a prefill's list) at most 4 (`dsv41_prefix.checkpoint_cap`): each is a full copy,
+  default) and the prompt-end snapshot, where the next turn's re-rendered generation prefix still matches. On a chat
+  prompt that is right before its last `<｜Assistant｜>` (`dsv41_prefix.snapshotBackoff` through the
+  `arch_config.snapshotBackoff` seam): the pinned template renders everything before that opener the same once the
+  turn is history, and the last forward is then the opener and its think tag, two rows on the decode-width kernels,
+  where the shared 30-token tail made it 31 rows on the wide ones. On a MoE every row of a short wide block brings
+  its own six experts a layer, so a cached turn's prefill went from 154 ms to 34 ms (59-66 at 8 rows, 37-46 at 4). The
+  shared 30 tokens stay when the opener is more than 16 tokens from the end (a forced prefix, a continued partial
+  reply) or the prompt has none (`/v1/completions`). What the opener gives up: a prompt that differs from the previous
+  one only inside its last ~27 tokens before the opener (the same document with another short question in one
+  message) no longer restores from the prompt-end point and falls back to the grid. A request's reply moves once at
+  rounding level where its tail rows change kernels; cold equals restored. In RAM (a RAM entry, a prefill's list) at most 4 (`dsv41_prefix.checkpoint_cap`): each is a full copy,
   about 890 B a token plus the fixed rings. An SSD entry keeps up to 160 (`disk_checkpoint_cap`): the 8192-token grid
   to 1M tokens with room for earlier turns' prompt ends and thought points. The thinning drops the interior point whose
   neighbours are closest and always keeps the oldest and the newest, so the newest point written (below) survives until

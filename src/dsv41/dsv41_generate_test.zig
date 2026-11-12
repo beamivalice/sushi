@@ -3729,6 +3729,74 @@ test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restor
     try testing.expectEqualSlices(u32, want.items, got.items);
 }
 
+test "dsv41 generator: a chat prompt's snapshot sits before its last assistant opener, and a restore there runs the two-row tail to the cold tokens (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    const opener: u32 = 201;
+    try tok.special_tokens.put(try a.dupe(u8, "<\u{ff5c}Assistant\u{ff5c}>"), opener);
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const opts: Generator.InitOptions = .{ .skip_lazy_preforward = true, .ssm_checkpoint_stride = 16, .ssm_checkpoint_max = 4 };
+
+    // A turn as the template ends it: the opener, then one think tag.
+    var prompt: [100]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = ids[i % ids.len] % 200;
+    prompt[98] = opener;
+
+    var xfm = try Trunk.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(a);
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 6, greedy, &.{}, opts);
+    defer gen.deinit(a);
+    try testing.expectEqual(@as(usize, 1), gen.ssm_checkpoints.items.len);
+    try testing.expectEqual(@as(usize, 98), gen.ssm_checkpoints.items[0].pos);
+    try want.append(a, gen.next_token_id);
+    while (try gen.next(a)) |t| try want.append(a, t);
+
+    // An opener further than a decode-width pass from the end keeps the shared tail.
+    try xfm.resetCache();
+    var far = prompt;
+    far[98] = 5;
+    far[70] = opener;
+    {
+        var shared = try Generator.initWithOptions(io, a, &xfm, &tok, &far, 1, greedy, &.{}, opts);
+        defer shared.deinit(a);
+        try testing.expectEqual(@as(usize, 69), shared.ssm_checkpoints.items[0].pos);
+    }
+
+    try xfm.resetCache();
+    try dsv41_prefix.restore(dsv41_state.modelOf(&xfm).?, &gen.ssm_checkpoints.items[0], &prompt);
+    xfm.cache.step = 98;
+    var warm_opts = opts;
+    warm_opts.ssm_checkpoint_pos_offset = 98;
+    var warm = try Generator.initWithOptions(io, a, &xfm, &tok, prompt[98..], 6, greedy, &.{}, warm_opts);
+    defer warm.deinit(a);
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(a);
+    try got.append(a, warm.next_token_id);
+    while (try warm.next(a)) |t| try got.append(a, t);
+    try testing.expectEqualSlices(u32, want.items, got.items);
+}
+
 test "dsv41 generator: under a write-through every restore point the tier takes is gone before the next forward, and the tokens do not move (DSV41_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");

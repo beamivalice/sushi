@@ -20,6 +20,21 @@ const kv_quant = @import("../kv_quant.zig");
 const prefix_arch = @import("../arch/prefix.zig");
 const restore_dump = @import("../restore_dump.zig");
 const dsv41_state = @import("dsv41_state.zig");
+const cfg_mod = @import("dsv41_config.zig");
+
+/// Tokens a prompt's chunk loop holds back for its last forward: those after the last assistant opener (`opener`
+/// its id), so the prompt-end snapshot sits before that opener. The pinned template renders everything before it the
+/// same once the turn is history, where the think tag after it turns. Null (the shared count) when the last
+/// forward would then be wider than a decode-width pass or the prompt's end holds no opener.
+pub fn snapshotBackoff(opener: u32, prompt_ids: []const u32) ?usize {
+    const n = prompt_ids.len;
+    var i = n;
+    while (i > 0 and n - i < cfg_mod.narrow_rows) {
+        i -= 1;
+        if (prompt_ids[i] == opener) return n - 1 - i;
+    }
+    return null;
+}
 
 /// The model whose request state a lookup restores into.
 pub const State = *dsv41_model.Model;
@@ -684,6 +699,25 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, why: []co
     for (cps.items) |*cp| live.markFlushed(cp.pos);
     const bytes = self.disk.?.point_bytes_written - staged_before;
     log.info("[dsv41-prefix] live points to SSD ({s}): {d} points to {d}, {d:.2} GB staged, held {d} ms\n", .{ why, cps.items.len, top, @as(f64, @floatFromInt(bytes)) / 1e9, sw.read() / std.time.ns_per_ms });
+}
+
+test "snapshotBackoff: the last forward starts at the prompt's last assistant opener when it fits a decode-width pass" {
+    const A = 900;
+    const T = 901;
+    // A plain turn ends opener, think tag: one token is held back and the last forward is two rows.
+    try testing.expectEqual(@as(?usize, 1), snapshotBackoff(A, &.{ 5, 6, 7, A, T }));
+    // A restored remainder is those two rows alone.
+    try testing.expectEqual(@as(?usize, 1), snapshotBackoff(A, &.{ A, T }));
+    try testing.expectEqual(@as(?usize, 0), snapshotBackoff(A, &.{ 5, A }));
+    // Text the server appended after the tag rides the same forward: opener + 15 more is the widest.
+    var forced: [21]u32 = @splat(8);
+    forced[4] = A;
+    try testing.expectEqual(@as(?usize, 15), snapshotBackoff(A, forced[0..20]));
+    try testing.expectEqual(@as(?usize, null), snapshotBackoff(A, &forced));
+    // The last opener counts, an earlier turn's does not.
+    try testing.expectEqual(@as(?usize, 1), snapshotBackoff(A, &.{ A, T, 9, 9, A, T }));
+    try testing.expectEqual(@as(?usize, null), snapshotBackoff(A, &.{ 5, 6, 7 }));
+    try testing.expectEqual(@as(?usize, null), snapshotBackoff(A, &.{}));
 }
 
 test "layoutKey: a boot that drops other experts or picks leniently has its own namespace" {

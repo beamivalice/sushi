@@ -259,9 +259,14 @@ pub const SSM_SNAPSHOT_BACKOFF: usize = 30;
 /// span of the same rows: a 30 + 1 split reads different kernel tilings and
 /// greedy flips at a bf16 near-tie. No new snapshot: the restored one is it.
 pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) usize {
+    return snapshotBackoffOf(want_ssm_cp, prefix_len, restored, SSM_SNAPSHOT_BACKOFF);
+}
+
+/// `ssmSnapshotBackoff` for an arch that says where its own template stops re-rendering: `back` tokens held back.
+pub fn snapshotBackoffOf(want_ssm_cp: bool, prefix_len: usize, restored: bool, back: usize) usize {
     if (!want_ssm_cp) return 0;
-    if (prefix_len <= SSM_SNAPSHOT_BACKOFF) return if (restored) prefix_len else 0;
-    return SSM_SNAPSHOT_BACKOFF;
+    if (prefix_len <= back) return if (restored) prefix_len else 0;
+    return back;
 }
 
 /// Effective SSM-checkpoint stride for a model, given the base (configured)
@@ -714,6 +719,18 @@ test "boundedPrefillChunk: composed-causal keeps the 2048 cap + score formula" {
     // The scores-budget formula still wins BELOW the cap: 64K on 24 heads
     // yields 1024 (measured better than 2048 there: 186 vs 182.3 tok/s).
     try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 24, 65536, false, false, false));
+}
+
+test "snapshotBackoffOf: an arch's own count is held back, and a restored tail inside it is one span" {
+    try testing.expectEqual(@as(usize, 0), snapshotBackoffOf(false, 8192, false, 1));
+    // A plain turn: the opener and the think tag are the last forward, the snapshot sits before the opener.
+    try testing.expectEqual(@as(usize, 1), snapshotBackoffOf(true, 8191, false, 1));
+    try testing.expectEqual(@as(usize, 0), snapshotBackoffOf(true, 8191, false, 0));
+    // The restored tail is the cold run's last span: no chunk, no new snapshot.
+    try testing.expectEqual(@as(usize, 1), snapshotBackoffOf(true, 1, true, 1));
+    try testing.expectEqual(@as(usize, 0), snapshotBackoffOf(true, 1, false, 1));
+    try testing.expectEqual(@as(usize, 12), snapshotBackoffOf(true, 40, true, 12));
+    try testing.expectEqual(ssmSnapshotBackoff(true, 8192, false), snapshotBackoffOf(true, 8192, false, SSM_SNAPSHOT_BACKOFF));
 }
 
 test "ssmSnapshotBackoff: engages only under checkpointing and past the backoff length" {

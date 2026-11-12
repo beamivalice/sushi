@@ -126,7 +126,9 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   scorer boots with the cache off.
 - Every request logs one `[prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms` line (`[dsv41-prefix]` on DeepSeek); `prompt_ms` includes that time and `sushi bench` takes it out.
 - The always-on SSM snapshot sits 30 tokens BEFORE prompt end; a restored tail inside that window forwards as ONE
-  span (`prefill_plan.ssmSnapshotBackoff`). Guard: `tests/test_prefix_reuse.sh`.
+  span (`prefill_plan.ssmSnapshotBackoff`). Guard: `tests/test_prefix_reuse.sh`. An arch whose template says where
+  the next turn stops re-rendering places it there instead (`arch_config.snapshotBackoff`; DeepSeek-V4.1: before the
+  last assistant opener, [dsv41-arch](dsv41-arch.md#prefix-cache)).
 - A speculative Qwen turn also leaves a point right behind its reply ([decode-end points](#decode-end-points)), so the
   next turn re-prefills none of it; a serial finish keeps only the prompt-end point.
 - **A ringed (sliding-window) entry restores at its end or at one of its ring checkpoints**

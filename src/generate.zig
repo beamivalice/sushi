@@ -35,6 +35,7 @@ const dflash_policy = @import("dflash_policy.zig");
 const dspark_rows = @import("dspark_rows.zig");
 const arch_dspark = @import("arch/dspark.zig");
 const prefix_arch = @import("arch/prefix.zig");
+const arch_config = @import("arch/config.zig");
 const DflashModel = dflash_mod.DflashModel;
 const KVCache = trunk.KVCache;
 const sampler = @import("sampler.zig");
@@ -1480,7 +1481,7 @@ pub const Generator = struct {
             const snapshot_backoff = if (arch_request != null and want_state_cp)
                 prefix_arch.requestCaptureBackoff(options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len)
             else
-                prefill_plan.ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
+                prefill_plan.snapshotBackoffOf(want_state_cp, prefix_len, ssm_cp_offset > 0, arch_config.snapshotBackoff(&xfm.config, tok, prompt_ids) orelse prefill_plan.SSM_SNAPSHOT_BACKOFF);
             const loop_end = prefix_len - snapshot_backoff;
             final_start = loop_end;
             // Vision prompts chunk like text (issue #197) — the splice offset

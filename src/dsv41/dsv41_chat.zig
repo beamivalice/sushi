@@ -84,3 +84,31 @@ test "DeepSeek's Sequence of Splits is read as its own pre-tokenizer, any other 
     defer other.deinit();
     try std.testing.expect(!pretokenizer.matches(other.value));
 }
+
+test "the pinned template renders a prompt's text before its last assistant opener the same once the turn is history" {
+    // What `dsv41_prefix.snapshotBackoff` stands on: the prompt-end snapshot before the opener is one a follow-up reaches.
+    const template_engine = @import("../template/template.zig");
+    const a = std.testing.allocator;
+    const opener = "<\u{ff5c}Assistant\u{ff5c}>";
+    const tools = "[{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Read.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}}}]";
+    const call = "{\"role\": \"assistant\", \"content\": \"\", \"reasoning_content\": \"I should read it.\", \"tool_calls\": [{\"id\": \"c1\", \"type\": \"function\", \"function\": {\"name\": \"read\", \"arguments\": {\"path\": \"a.md\"}}}]}";
+    const Turn = struct { now: []const u8, next: []const u8, tools: ?[]const u8 = null };
+    const turns = [_]Turn{
+        .{ .now = "[{\"role\": \"system\", \"content\": \"Be brief.\"}, {\"role\": \"user\", \"content\": \"Hi\"}]", .next = "[{\"role\": \"system\", \"content\": \"Be brief.\"}, {\"role\": \"user\", \"content\": \"Hi\"}, {\"role\": \"assistant\", \"content\": \"Hello.\", \"reasoning_content\": \"A greeting.\"}, {\"role\": \"user\", \"content\": \"More\"}]" },
+        .{ .now = "[{\"role\": \"user\", \"content\": \"Hi\"}]", .next = "[{\"role\": \"user\", \"content\": \"Hi\"}, {\"role\": \"user\", \"content\": \"Are you there?\"}]" },
+        .{ .tools = tools, .now = "[{\"role\": \"user\", \"content\": \"Read a.md\"}]", .next = "[{\"role\": \"user\", \"content\": \"Read a.md\"}, " ++ call ++ ", {\"role\": \"tool\", \"tool_call_id\": \"c1\", \"content\": \"text\"}]" },
+        .{ .tools = tools, .now = "[{\"role\": \"user\", \"content\": \"Read a.md\"}, " ++ call ++ ", {\"role\": \"tool\", \"tool_call_id\": \"c1\", \"content\": \"text\"}]", .next = "[{\"role\": \"user\", \"content\": \"Read a.md\"}, " ++ call ++ ", {\"role\": \"tool\", \"tool_call_id\": \"c1\", \"content\": \"text\"}, {\"role\": \"assistant\", \"content\": \"It says text.\", \"reasoning_content\": \"Done.\"}, {\"role\": \"user\", \"content\": \"Thanks\"}]" },
+    };
+    for ([_][]const u8{ "{\"thinking_mode\": \"thinking\"}", "{\"thinking_mode\": \"chat\"}" }) |extra| for (turns) |t| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var diag = template_engine.Diagnostic{};
+        const now = try template_engine.renderJson(arena.allocator(), .{ .template = pin.template, .messages_json = t.now, .tools_json = t.tools, .extra_json = extra, .add_generation_prompt = true }, &diag);
+        const next = try template_engine.renderJson(arena.allocator(), .{ .template = pin.template, .messages_json = t.next, .tools_json = t.tools, .extra_json = extra, .add_generation_prompt = true }, &diag);
+        const at = std.mem.lastIndexOf(u8, now, opener).?;
+        // The opener and one think tag end the prompt: the two rows of its last forward.
+        const tail = now[at + opener.len ..];
+        try std.testing.expect(std.mem.eql(u8, tail, "<think>") or std.mem.eql(u8, tail, "</think>"));
+        try std.testing.expect(std.mem.startsWith(u8, next, now[0..at]));
+    };
+}

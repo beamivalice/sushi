@@ -236,6 +236,15 @@ pub fn expertKeepsScales(config: *const model.ModelConfig) bool {
     }
 }
 
+/// Tokens the prompt's chunk loop holds back for its last forward, from an arch that places the prompt-end snapshot
+/// by its own template (`tok` looks its markers up); null is the shared `prefill_plan.SSM_SNAPSHOT_BACKOFF`.
+pub fn snapshotBackoff(config: *const model.ModelConfig, tok: anytype, prompt_ids: []const u32) ?usize {
+    const tag = tagOf(config) orelse return null;
+    switch (tag) {
+        inline else => |t| return if (@hasDecl(registry.Mod(t), "snapshotBackoff")) registry.Mod(t).snapshotBackoff(tok, prompt_ids) else null,
+    }
+}
+
 /// The arch's part of the parse, on top of the fields every arch shares.
 pub fn parseFamily(config: *model.ModelConfig, tag: Tag, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
     config.arch = .{ .tag = tag };

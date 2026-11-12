@@ -57,6 +57,11 @@ pub fn expertKeepsScales(config: *const Config) bool {
     return @import("dsv41_borrow.zig").keepsScales(&c);
 }
 
+/// Where a prompt's last forward starts (`dsv41_prefix.snapshotBackoff`); `tok` names the assistant opener.
+pub fn snapshotBackoff(tok: anytype, prompt_ids: []const u32) ?usize {
+    return dsv41_prefix.snapshotBackoff(tok.specialTokenId("<｜Assistant｜>") orelse return null, prompt_ids);
+}
+
 pub const config_facts: arch_config.Facts = .{
     .thinks_by_default = true,
     .reads_pair_major = true,
