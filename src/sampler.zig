@@ -3635,9 +3635,11 @@ test "upstream bugfix: constrained logprobs describe the returned token before m
     try mlx.requireGpu();
     const a = testing.allocator;
     const s = mlx.gpuStream();
-    // Each call is the final allowed token, so no model forward is needed.
-    var xfm: Trunk = undefined;
-    xfm.s = s;
+    // Each call is the final allowed token, so no model forward is needed. The step still reads the trunk's arch
+    // and think mask, so none of it is left undefined.
+    var cache = try @import("kv_cache.zig").KVCache.init(a, 0);
+    defer cache.deinit();
+    var xfm = std.mem.zeroInit(Trunk, .{ .s = s, .allocator = a, .cache = cache });
     var bytes = try token_mask.TokenBytes.init(std.heap.ArenaAllocator.init(a), &.{ null, "true", "false", "invalid" }, null);
     defer bytes.deinit();
     const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"boolean\"}", .{});
