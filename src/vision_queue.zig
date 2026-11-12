@@ -372,6 +372,8 @@ pub fn encodeVideoBlock(vision_enc: *VisionEncoder, vid: VisionVideoPixels) !mlx
 /// not the scheduler's borrowed-view singleton — each LoadedModel has its
 /// own vision encoder when applicable.
 pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
+    const turn = @import("arch/handle.zig").turnFor(req.model.handle, req.model.config);
+    defer turn.end();
     const vision_enc = req.model.vision_encoder orelse {
         finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
         return;

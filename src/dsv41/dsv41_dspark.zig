@@ -43,8 +43,10 @@ pub const dsv41_max_drafts = dspark_rows.max_drafts;
 /// The widest verify `dsv41VerifyImpl` accepts, a ring slack's rows.
 pub const dsv41_max_verify_rows: u8 = @intCast(@import("dsv41_config.zig").ring_slack);
 
-/// The widest verify whose rows are their one-row step's bits: past `project_rows.PROJECT_ROWS_MAX` the trunk linears
-/// leave the multi-row arm for the sorted GEMM, which sums in another order. Adaptive rounds stay inside the block (6).
+/// The widest copy round. A verify's rows are their one-row step's bits at every width on a machine with matrix units
+/// (`Model.Forward.verify`); without them the trunk linears leave the multi-row arm past
+/// `project_rows.PROJECT_ROWS_MAX` for the sorted GEMM, which sums in another order, so a copy round stays inside it
+/// on every machine. Adaptive rounds stay inside the block (6).
 pub const dsv41_exact_verify_rows: u8 = 8;
 
 /// `SUSHI_DSV41_DSPARK_ROWS` (diagnostic): `sweep` cycles the verify width over `dspark_sweep_rows`, a number forces
@@ -162,11 +164,6 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
     const wanted: usize = forced orelse policy.rows(conf_buf[0 .. block_len - 1]);
     var rows: usize = dsparkRowsForRoom(mtp_plan.rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at), think_room);
-    // The draft heads score the whole vocabulary, but only a prompt may carry the image id (the model refuses it
-    // without rows), and the trunk never picks it: a draft that holds it ends the chunk before it.
-    if (dsv41_state.modelOf(xfm)) |m| if (m.cfg.image_token_id != 0) {
-        if (std.mem.indexOfScalar(u32, ids_buf[1..rows], m.cfg.image_token_id)) |at| rows = 1 + at;
-    };
     const vocab: usize = if (dsv41_state.modelOf(xfm)) |m| m.cfg.vocab else 0;
     var rows_masked = false;
     if (constraint) |c| {

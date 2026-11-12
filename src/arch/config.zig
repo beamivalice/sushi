@@ -220,6 +220,14 @@ pub fn facts(config: *const model.ModelConfig) ?Facts {
     return factsOf(tagOf(config) orelse return null);
 }
 
+/// The pool the ledger bills beside the model: the arch's own answer for this config where it has one, else its fact.
+pub fn expertPoolBytes(config: *const model.ModelConfig) u64 {
+    const tag = tagOf(config) orelse return 0;
+    switch (tag) {
+        inline else => |t| return if (@hasDecl(registry.Mod(t), "expertPoolBytes")) registry.Mod(t).expertPoolBytes(config) else registry.Mod(t).config_facts.expert_pool_bytes,
+    }
+}
+
 /// The arch's part of the parse, on top of the fields every arch shares.
 pub fn parseFamily(config: *model.ModelConfig, tag: Tag, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
     config.arch = .{ .tag = tag };

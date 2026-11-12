@@ -702,7 +702,8 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
     };
     const logits = if (sampling.suppress_mask) |m| blk: {
         suppressed = mlx.mlx_array_new();
-        applySuppressMask(&suppressed, logits_in, m, s) catch break :blk logits_in;
+        // A mask that could not be applied fails the draw: the unmasked row would hand out a reserved id.
+        applySuppressMask(&suppressed, logits_in, m, s) catch return .{ .ctx = null };
         break :blk suppressed;
     } else logits_in;
 
@@ -2942,6 +2943,36 @@ test "suppress_mask: the mask is an array of the stream it is built for, the eng
     try std.testing.expectEqual(calls, mlx.engine.mlxCalls());
     try std.testing.expect(mlx.engine.isOurs(ours) and !mlx.engine.isOurs(on_mlx));
     try std.testing.expectEqualSlices(bool, mlx.mlx_array_data_bool(on_mlx).?[0..8], mlx.mlx_array_data_bool(ours).?[0..8]);
+}
+
+test "suppress_mask: a mask the engine could not apply fails the draw, and the suppressed id is not drawn in its place" {
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was_enabled);
+    const s = mlx.engine.stream();
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    const row = [_]f32{ 0, 9, 1, 2, 3, 4, 5, 6 };
+    const logits = mlx.mlx_array_new_data(&row, &[_]c_int{ 1, 1, 8 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    // Id 1, and the reserved ids from 6 up.
+    const mask = try buildSuppressMask(&[_]u32{1}, 6, 8, s);
+    defer _ = mlx.mlx_array_free(mask);
+    defer mlx.engine.fault.disarm();
+    mlx.engine.fault.arm(1);
+    const tok = sampleTokenLazy(logits, .{ .temperature = 0.0, .suppress_mask = mask }, s);
+    defer _ = mlx.mlx_array_free(tok);
+    mlx.engine.fault.disarm();
+    try std.testing.expect(tok.ctx == null);
+    try std.testing.expect(mlx.takeErrorIf("PoolOverBudget"));
+    // What a caller does next with the draw is refused by name.
+    try std.testing.expectError(error.MlxError, mlx.check(mlx.mlx_array_eval(tok)));
+    try std.testing.expect(mlx.takeErrorIf("empty handle"));
+    const drawn = sampleTokenLazy(logits, .{ .temperature = 0.0, .suppress_mask = mask }, s);
+    defer _ = mlx.mlx_array_free(drawn);
+    try mlx.check(mlx.mlx_array_eval(drawn));
+    try std.testing.expectEqual(@as(u32, 5), mlx.mlx_array_data_uint32(drawn).?[0]);
 }
 
 test "suppress_mask: a suppressed id is unreachable from both samplers, everything else stays" {

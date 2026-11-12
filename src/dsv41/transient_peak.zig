@@ -1,5 +1,5 @@
 //! `SUSHI_DSV41_TRANSIENT_PEAK=1`: one `[transient-peak]` line per DeepSeek forward phase, the high-water of the
-//! bytes MLX allocated itself (imported weights left out) since the phase began.
+//! bytes MLX and the engine allocated themselves (weights left out) since the phase began, and both pools' free bytes.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
@@ -30,7 +30,9 @@ fn enabled() bool {
 }
 
 pub fn begin() void {
-    if (enabled()) mlx.resetTransientPeak();
+    if (!enabled()) return;
+    mlx.resetTransientPeak();
+    mlx.engine.resetPoolPeak(.phase);
 }
 
 /// `rows` is the phase's width: tokens of the pass, or patches of an image.
@@ -39,7 +41,7 @@ pub fn end(phase: Phase, rows: usize) void {
     var cache: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache);
     var line: [160]u8 = undefined;
-    log.info("{s}", .{formatLine(&line, phase, rows, mlx.transientPeak(), cache)});
+    log.info("{s}", .{formatLine(&line, phase, rows, mlx.transientPeak() + mlx.engine.poolPeak(.phase), cache + mlx.engine.poolFree())});
 }
 
 fn formatLine(buf: []u8, phase: Phase, rows: usize, peak: usize, cache: usize) []const u8 {

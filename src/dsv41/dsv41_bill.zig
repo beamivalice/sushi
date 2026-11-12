@@ -37,10 +37,11 @@ pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u
     _ = warm;
     const c = config.dsv41 orelse return null;
     const held = (@as(u64, seq) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
-    // The transient cap a forward runs under (`Config.forwardCap`) is its bill. The prefill's comes out of the decoder
-    // pools it may release (`dsv41_borrow`); a decode forward's never does. The decode pool is parked beside either,
-    // and so is the pool of the engine of our own.
-    const work = @max(c.forwardCap(dsv41_borrow.verify_rows, seq), c.chunkCap(chunk, seq) -| bills.borrowableBytes(config)) +| config.expertPoolBytes() +| dsv41_borrow.ownCap(&c, seq);
+    // The cap a forward runs under (`Config.forwardCap`) is its bill. The prefill's comes out of the decoder pools it
+    // may release (`dsv41_borrow`); a decode forward's never does. On MLX the decode pool is parked beside either. On
+    // a Cooler load the engine's pool is the cap itself (its free buffers are inside it) and MLX holds nothing.
+    const forward = @max(c.forwardCap(dsv41_borrow.verify_rows, seq), c.chunkCap(chunk, seq) -| bills.borrowableBytes(config));
+    const work = forward +| (if (dsv41_borrow.ownDecode(&c)) 0 else config.expertPoolBytes());
     return (held +| checkpointReserve(config, seq, chunk)) *| 5 / 4 +| work +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 

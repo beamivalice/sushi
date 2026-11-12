@@ -211,6 +211,8 @@ pub fn runClear(io: std.Io, req: *ClearRequest) void {
     }
     const entry = req.entry;
     if (entry.state != .ready) return;
+    const turn = @import("arch/handle.zig").turnFor(entry.handle, entry.config);
+    defer turn.end();
     const hc = if (entry.prefix_cache) |*h| h else return;
     if (hc.disk == null) return;
     const d = &hc.disk.?;

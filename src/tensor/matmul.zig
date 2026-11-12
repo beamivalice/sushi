@@ -294,8 +294,9 @@ fn dot(a: *Tensor, b: *Tensor, k: usize, shape: []const c_int) Error!*Tensor {
     errdefer core.release(sum);
     try @import("reduce.zig").all(.sum, partials, sum);
     if (a.dtype == .float32) return sum;
-    defer core.release(sum);
-    return ops.astype(sum, a.dtype);
+    const cast = try ops.astype(sum, a.dtype);
+    core.release(sum);
+    return cast;
 }
 
 const Call = struct {

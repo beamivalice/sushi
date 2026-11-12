@@ -7,6 +7,7 @@
 //! One thread drives the engine, the inference thread, as it does MLX.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const metal = @import("../metal.zig");
 const metal_mlx = @import("../metal_mlx.zig");
 const io_util = @import("../io_util.zig");
@@ -17,7 +18,7 @@ const fill_marks = @import("../fill_marks.zig");
 pub const max_dims = 8;
 pub const Dtype = mlx.mlx_dtype;
 
-pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, PoolOverBudget, ReadsFillingSlab };
+pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, TensorNull, MlxAtRest, PoolOverBudget, ReadsFillingSlab };
 
 pub fn itemSize(d: Dtype) usize {
     return switch (d) {
@@ -57,6 +58,8 @@ pub var refused_fill: struct { read: usize = 0, read_len: usize = 0, fill: usize
 /// What the pool refused last for its budget: the buffer wanted, what Metal held for the pool, what the tensors in use
 /// asked for, and the limit on the first of those. For the refusal's message.
 pub var refused_budget: struct { wanted: u64 = 0, held: u64 = 0, asked: u64 = 0, limit: u64 = 0 } = .{};
+/// Buffers the pool refused since the process began: a caller that handles a failure reads whether memory was its cause.
+pub var pool_refusals: u64 = 0;
 
 const Range = struct { ptr: usize, len: usize };
 
@@ -76,6 +79,8 @@ pub const Tensor = struct {
     twin: mlx.mlx_array = .{},
     /// A slice update not yet written: `ops.settle` writes it before the bytes are first used.
     pending: ?*Pending = null,
+    /// False once released: the box waits for its next tensor, and a second release of the same handle is refused.
+    live: bool = true,
 
     pub fn dims(t: *const Tensor) []const c_int {
         return t.shape[0..t.ndim];
@@ -282,9 +287,24 @@ pub fn touch() void {
     (metal.device() catch return).touch();
 }
 
+/// Which high-water of the pool's bytes in use: the one the process's peak reading resets, or a forward phase's.
+pub const Peak = enum { process, phase };
+var pool_peaks: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
+
+pub fn poolPeak(which: Peak) u64 {
+    return pool_peaks[@intFromEnum(which)].load(.monotonic);
+}
+
+/// The high-water starts again from what is in use now.
+pub fn resetPoolPeak(which: Peak) void {
+    pool_peaks[@intFromEnum(which)].store(poolTotal() - poolFree(), .monotonic);
+}
+
 fn publishPool(s: *const State) void {
     pool_total.store(s.stats.pool_bytes, .monotonic);
     pool_unused.store(s.stats.pool_free, .monotonic);
+    const in_use = s.stats.pool_bytes - s.stats.pool_free;
+    for (&pool_peaks) |*peak| if (in_use > peak.load(.monotonic)) peak.store(in_use, .monotonic);
 }
 
 // ── Kernel profile ──
@@ -452,12 +472,68 @@ fn classBytes(class: usize) usize {
     return ((steps + k % steps) << @intCast(k / steps)) * page_bytes;
 }
 
+/// TEST-ONLY, `mlx.fault` for the engine's allocations: `arm(k)` makes the pool refuse its k-th buffer from here with
+/// `PoolOverBudget`, so a test walks every error path of a forward without patching it. Compiled only under test.
+pub const fault = struct {
+    var remaining: u64 = 0; // 0 = disarmed
+    var asked: u64 = 0;
+
+    pub fn arm(k: u64) void {
+        remaining = k;
+    }
+    pub fn disarm() void {
+        remaining = 0;
+    }
+    /// Buffers the pool was asked for since the process began: the difference over a request is its sweep's length.
+    pub fn count() u64 {
+        return asked;
+    }
+    fn hit() bool {
+        asked += 1;
+        if (remaining == 0) return false;
+        remaining -= 1;
+        return remaining == 0;
+    }
+};
+
+/// TEST-ONLY: with `byte` set, the pool writes it over every buffer it hands out (a reused one once the passes that
+/// bound it have run), and `free` writes it over the free ones, so a kernel that reads bytes nothing wrote shows as a
+/// changed result. Compiled only under test.
+pub const poison = struct {
+    pub var byte: ?u8 = null;
+    /// Reused buffers handed out as they were: the open pass's predecessors still bound them.
+    pub var skipped: u64 = 0;
+
+    /// Writes `b` over every free buffer, every pass having run. The bytes written.
+    pub fn free(b: u8) usize {
+        const s = &(state orelse return 0);
+        syncState(s) catch return 0;
+        takeBack();
+        var n: usize = 0;
+        for (&s.free, 0..) |*list, class| for (list.items) |store| {
+            @memset(store.ptr[0..classBytes(class)], b);
+            n += classBytes(class);
+        };
+        return n;
+    }
+
+    fn handOut(s: *State, store: *Store, bytes: usize) Error!void {
+        const b = byte orelse return;
+        if (store.seq > s.done and store.seq < s.seq) try waitFor(s, store.seq);
+        if (store.seq <= s.done) @memset(store.ptr[0..bytes], b) else skipped += 1;
+    }
+};
+
 /// A store of at least `len` bytes from the pool, never one the open pass binds. `for_host` asks for one no
 /// submitted pass still binds either, since the host is about to write it. A new buffer stays inside the budget:
 /// free buffers go to make room, and with none left the op is refused.
 fn poolStore(len: usize, for_host: bool) Error!*Store {
     const s = try st();
     takeBack();
+    if (comptime builtin.is_test) if (fault.hit()) {
+        pool_refusals += 1;
+        return error.PoolOverBudget;
+    };
     const class = classOf(len);
     if (class >= classes) return error.TensorShape;
     const bytes = classBytes(class);
@@ -470,6 +546,7 @@ fn poolStore(len: usize, for_host: bool) Error!*Store {
         // A buffer the open pass already binds would make its next dispatch wait for the ones before it.
         if (store.seq == s.seq and s.pass != null) continue;
         _ = list.swapRemove(at);
+        if (comptime builtin.is_test) try poison.handOut(s, store, bytes);
         store.refs = 1;
         store.len = len;
         s.stats.pool_free -= bytes;
@@ -478,8 +555,10 @@ fn poolStore(len: usize, for_host: bool) Error!*Store {
         return store;
     }
     if (s.pool_limit) |limit| {
-        if (!try trimTo(s, limit -| bytes)) {
+        // A buffer larger than the cap fits under no trim: an empty pool would otherwise let it through.
+        if (bytes > limit or !try trimTo(s, limit - bytes)) {
             refused_budget = .{ .wanted = bytes, .held = s.stats.pool_bytes, .asked = s.stats.pool_asked, .limit = limit };
+            pool_refusals += 1;
             return error.PoolOverBudget;
         }
     }
@@ -487,6 +566,7 @@ fn poolStore(len: usize, for_host: bool) Error!*Store {
     errdefer buffer.release();
     const store = gpa.create(Store) catch return error.OutOfMemory;
     store.* = .{ .buffer = buffer, .at = 0, .ptr = buffer.bytes().ptr, .len = len, .origin = .{ .pool = @intCast(class) } };
+    if (comptime builtin.is_test) if (poison.byte) |b| @memset(store.ptr[0..bytes], b);
     s.stats.pool_bytes += bytes;
     s.stats.pool_asked += len;
     publishPool(s);
@@ -589,6 +669,8 @@ fn dropStore(store: *Store) void {
             if (s.free[class].append(gpa, store)) |_| {
                 s.stats.pool_free += classBytes(class);
             } else |_| {
+                // No room to keep it: it goes once the passes that bind it have run.
+                if (store.seq > s.done) waitFor(s, store.seq) catch {};
                 store.buffer.release();
                 s.stats.pool_bytes -= classBytes(class);
                 gpa.destroy(store);
@@ -656,6 +738,7 @@ fn takeBack() void {
 /// has taken it.
 pub fn lend(t: *Tensor) Error!mlx.mlx_array {
     if (t.twin.ctx != null) return t.twin;
+    if (mlx.engine.mlx_at_rest.on.load(.monotonic)) return error.MlxAtRest;
     if (t.offset != 0 or !t.rowContiguous() or t.pending != null) return error.NotRowContiguous;
     const s = try st();
     if (t.store.seq > s.done) try waitFor(s, t.store.seq);
@@ -698,8 +781,18 @@ fn box() Error!*Tensor {
     const t = s.boxes.pop() orelse (gpa.create(Tensor) catch return error.OutOfMemory);
     t.twin = .{};
     t.pending = null;
+    t.live = true;
     return t;
 }
+
+/// The box of a tensor that is gone, kept for the next one.
+fn unbox(t: *Tensor) void {
+    t.live = false;
+    state.?.boxes.append(gpa, t) catch gpa.destroy(t);
+}
+
+/// Releases of a tensor already released, since the process began: each was a defect in a caller's error path.
+pub var double_releases: u64 = 0;
 
 fn setShape(t: *Tensor, shape: []const c_int) Error!void {
     if (shape.len > max_dims) return error.TensorShape;
@@ -722,7 +815,7 @@ pub fn fresh(dtype: Dtype, shape: []const c_int) Error!*Tensor {
 
 fn freshFor(dtype: Dtype, shape: []const c_int, for_host: bool) Error!*Tensor {
     const t = try box();
-    errdefer state.?.boxes.append(gpa, t) catch gpa.destroy(t);
+    errdefer unbox(t);
     try setShape(t, shape);
     t.dtype = dtype;
     t.offset = 0;
@@ -749,7 +842,7 @@ pub fn fromHost(bytes: []const u8, dtype: Dtype, shape: []const c_int) Error!*Te
 pub fn wrapMapped(ptr: [*]u8, dtype: Dtype, shape: []const c_int, payload: ?*anyopaque, release_fn: MappedRelease) Error!*Tensor {
     const s = try st();
     const t = try box();
-    errdefer s.boxes.append(gpa, t) catch gpa.destroy(t);
+    errdefer unbox(t);
     try setShape(t, shape);
     t.dtype = dtype;
     t.offset = 0;
@@ -775,10 +868,16 @@ pub fn share(base: *const Tensor) Error!*Tensor {
 }
 
 pub fn release(t: *Tensor) void {
+    // A box holds one tensor at a time: released again before it is reused, it would sit in the free list twice and
+    // give two owners one tensor, and its store would go back to the pool while in use.
+    if (!t.live) {
+        double_releases += 1;
+        return mlx.latchError("[engine] release: a tensor released twice");
+    }
     if (t.twin.ctx != null) _ = mlx.mlx_array_free(t.twin);
     if (t.pending) |p| freePending(p);
     dropStore(t.store);
-    state.?.boxes.append(gpa, t) catch gpa.destroy(t);
+    unbox(t);
 }
 
 // ── MLX memory the engine reads ──
@@ -787,6 +886,12 @@ pub fn release(t: *Tensor) void {
 /// Metal buffer, so the memory is wired once. A strided view keeps its strides. The store keeps the array, and
 /// with it the buffer, until every pass that binds it has run.
 pub fn import(a: mlx.mlx_array) Error!*Tensor {
+    // At rest MLX is asked nothing: an array of its own that reaches an op of ours is a model on MLX's work outside
+    // its turn, refused by name.
+    if (mlx.engine.mlx_at_rest.on.load(.monotonic)) return error.MlxAtRest;
+    // An array of no elements has no memory to share: its shape and dtype are all of it.
+    const dims = mlx.getShape(a);
+    for (dims) |d| if (d == 0) return fresh(mlx.mlx_array_dtype(a), dims);
     const s = try st();
     var available = false;
     try mlx.check(mlx._mlx_array_is_available(&available, a));
@@ -797,8 +902,8 @@ pub fn import(a: mlx.mlx_array) Error!*Tensor {
     try mlx.check(mlx._mlx_array_metal_buffer(&raw, &at, a));
     const dtype = mlx.mlx_array_dtype(a);
     const t = try box();
-    errdefer s.boxes.append(gpa, t) catch gpa.destroy(t);
-    try setShape(t, mlx.getShape(a));
+    errdefer unbox(t);
+    try setShape(t, dims);
     const strides = mlx.mlx_array_strides(a);
     for (0..t.ndim) |axis| t.strides[axis] = strides[axis];
     t.dtype = dtype;
@@ -815,6 +920,8 @@ pub fn import(a: mlx.mlx_array) Error!*Tensor {
 
 /// `a` as a tensor the caller releases: ours with one more reference, or an import of an MLX array.
 pub fn take(a: mlx.mlx_array) Error!*Tensor {
+    // An empty handle is what a maker that failed gave its caller: the op that takes it says so.
+    if (a.ctx == null) return error.TensorNull;
     if (isOurs(a)) return share(try ready(a));
     return import(a);
 }
@@ -832,7 +939,7 @@ pub fn adopt(t: *Tensor, from: *Tensor) void {
     t.store = from.store;
     t.offset = from.offset;
     t.strides = from.strides;
-    state.?.boxes.append(gpa, from) catch gpa.destroy(from);
+    unbox(from);
 }
 
 /// Whether no one else reads `store`'s bytes, so that a write into them changes nothing another holder sees. For
@@ -1116,6 +1223,16 @@ pub fn sync() Error!void {
     return syncState(try st());
 }
 
+/// A store over an MLX array that waits for a pass of ours is freed now, its passes waited on. MLX's allocator goes to
+/// rest after this, where the free of its array would be a call into MLX outside its turn.
+pub fn settleMlxAliases() void {
+    const s = &(state orelse return);
+    for (s.retired.items) |store| {
+        if (store.origin == .mlx) break;
+    } else return;
+    syncState(s) catch {};
+}
+
 /// Ends the open pass and waits for everything submitted; nothing when the engine never ran. A thread that ends
 /// with an encoder still open trips a Metal assertion as its autorelease pool drains.
 pub fn close() void {
@@ -1197,6 +1314,9 @@ fn waitFor(s: *State, upto_in: u64) Error!void {
             break;
         }
     }
+    // A failed pass ends the rest for the caller, not for the GPU: the passes behind it run on, and each still binds
+    // its buffers until it ends.
+    if (failed != null) for (s.flying.items) |f| f.cmd.waitDone();
     s.stats.wait_ns += nowNs() - t0;
     s.done = if (failed == null) upto else s.seq - 1;
     // Passes end in the order of their numbers: the ones behind that have ended too are done.
@@ -1269,6 +1389,47 @@ test "a fresh tensor comes from the pool and goes back to it" {
     defer release(b);
     try t.expectEqual(first, b.store);
     try t.expectEqual(pooled, stats().pool_bytes);
+}
+
+test "a second release of a tensor is refused by name: its box and its store are given back once" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    const a = try fresh(.uint8, &.{100});
+    release(a);
+    const free_bytes = poolFree();
+    const refused = double_releases;
+    release(a);
+    try t.expectEqual(refused + 1, double_releases);
+    try t.expect(mlx.takeErrorIf("released twice"));
+    try t.expectEqual(free_bytes, poolFree());
+    const b = try fresh(.uint8, &.{100});
+    defer release(b);
+    const c = try fresh(.uint8, &.{100});
+    defer release(c);
+    try t.expect(b != c and b.store != c.store);
+}
+
+test "the pool's high-waters keep what was in use at its fullest, each from its own reset" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    const mb = 1 << 20;
+    try sync();
+    resetPoolPeak(.process);
+    resetPoolPeak(.phase);
+    const in_use = poolTotal() - poolFree();
+    try t.expectEqual(in_use, poolPeak(.process));
+    const a = try fresh(.uint8, &.{9 * mb + 5});
+    const full = poolTotal() - poolFree();
+    try t.expect(full >= in_use + 9 * mb);
+    release(a);
+    try t.expectEqual(full, poolPeak(.process));
+    resetPoolPeak(.phase);
+    try t.expectEqual(in_use, poolPeak(.phase));
+    const b = try fresh(.uint8, &.{3 * mb + 5});
+    const part = poolTotal() - poolFree();
+    release(b);
+    try t.expectEqual(part, poolPeak(.phase));
+    try t.expectEqual(full, poolPeak(.process));
 }
 
 test "the pool's byte mirrors follow every allocation, return and release, and an emptied pool reads zero" {

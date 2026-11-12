@@ -330,6 +330,10 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   Resident MiMo batches plain slots as rows of one forward, capped by `batchGroupCap` (4) with no padding
   ([mimo2-arch](mimo2-arch.md#batched-decode)); resident GLM does the same through `verifyGroups`, and a
   drafting GLM slot joins as a plain row when its model has company ([glm5-arch](glm5-arch.md#concurrency)).
+- **Beside a Cooler model each side's slots are a decode tick of their own** (`arch_handle.perSide`): the slots of
+  models on MLX run first inside a turn of MLX's, then the Cooler's inside a turn of the engine's, each in their
+  order; with no Cooler model loaded the tick is one, as before. Slot cleanup, an orphaned image array's free and the
+  GPU warm tick take the turn of the model they serve ([engine-own-forward](engine-own-forward.md#the-seam)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
 - `--prefill-decode-share S` (default 0.25) targets the fraction of wall time given

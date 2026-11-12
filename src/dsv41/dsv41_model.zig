@@ -348,6 +348,20 @@ pub const Rows = struct {
         buf.* = up;
     }
 
+    /// The grow the next append would make, made now: a buffer of this state's own with that append's slack.
+    fn reserve(self: *Rows, s: S) !void {
+        if (self.used == 0) return;
+        const cap = @max(64, self.used + @max(1, self.used / cfg_mod.rows_grow_div));
+        if (self.pack) |pk| {
+            try grow(&self.buf, self.used, cap, self.width / 2, .uint8, s);
+            try grow(&self.sbuf, self.used, cap, self.width / pk.group, .uint8, s);
+            try mlx.check(mlx.mlx_array_eval(self.sbuf));
+        } else try grow(&self.buf, self.used, cap, self.width, self.dtype, s);
+        // Written now: a grow left pending would take its buffer inside the forward that first reads it.
+        try mlx.check(mlx.mlx_array_eval(self.buf));
+        self.cap = cap;
+    }
+
     pub fn append(self: *Rows, sc: *Scope, x: A) !void {
         const n = dim(x, 0);
         if (n == 0) return;
@@ -729,7 +743,7 @@ pub const Model = struct {
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
     /// text does not depend on the round mix (`SUSHI_DSV41_DSPARK_EXACT=0` takes the faster arms, which sum by width).
     dspark_exact: bool = true,
-    /// The launch mode of the trellis linears of the pass in flight (`verify` sets it).
+    /// The launch mode of the trellis linears of the pass in flight (`arm` sets it).
     rows: exl3.project_rows.Mode = .{},
     /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
     engram_ahead: ?*engram.Prefetch = null,
@@ -752,7 +766,7 @@ pub const Model = struct {
     engine_decode: bool = false,
     /// `ownBegin`s open on this model, and whether the engine's scope was open before the first of them.
     own_depth: u32 = 0,
-    own_found_active: bool = false,
+    own_side: mlx.engine.Makers = .{ .was = false },
     /// Prefill chunks wider than a verify block run there too: set with `engine_decode` at the load.
     engine_prefill: bool = false,
     /// Decode forwards that queued layer 0 ahead of their token.
@@ -787,6 +801,53 @@ pub const Model = struct {
     ced_split: ?usize = null,
     /// Diagnostic (`SUSHI_DSV41_PREFILL_PROFILE`): a wide chunk evaluates after every stage and logs where its time went.
     profile: ?*Profile = null,
+
+    /// What a forward is for: it alone picks the arm the trellis linears launch on (`rowsOf`).
+    pub const Forward = enum {
+        /// A prefill chunk, or any forward whose rows no later forward has to repeat bit for bit.
+        prefill,
+        /// One row of decode.
+        step,
+        /// A round's verify chunk.
+        verify,
+    };
+
+    /// A step beside a drafter and a verify row are one token by two roads, so both take the arm whose rows have
+    /// their one-row bytes at every width a verify accepts (`Mode.wide`: on a machine with matrix units the rows past
+    /// `PROJECT_ROWS_MAX` stay on that arm). With no drafter there are no rounds, and a step keeps the one-row arm
+    /// that costs less.
+    fn rowsOf(self: *const Model, kind: Forward) exl3.project_rows.Mode {
+        return switch (kind) {
+            .prefill => .{},
+            .step => .{ .exact = self.dspark != null and self.dspark_exact },
+            .verify => .{ .exact = self.dspark_exact, .wide = true },
+        };
+    }
+
+    /// The model's forwards are `kind`'s from here to `Armed.end`, which puts back what it found. The one writer of
+    /// `rows` and `defer_head`.
+    pub fn arm(self: *Model, kind: Forward) Armed {
+        const was: Armed = .{ .m = self, .rows = self.rows, .defer_head = self.defer_head };
+        self.rows = self.rowsOf(kind);
+        self.defer_head = false;
+        return was;
+    }
+
+    pub const Armed = struct {
+        m: *Model,
+        rows: exl3.project_rows.Mode,
+        defer_head: bool,
+
+        /// The caller takes its verdict from a value built on the logits, whose evaluation waits for the head.
+        pub fn lazyHead(self: Armed, on: bool) void {
+            self.m.defer_head = on and self.m.lazy_head;
+        }
+
+        pub fn end(self: Armed) void {
+            self.m.rows = self.rows;
+            self.m.defer_head = self.defer_head;
+        }
+    };
 
     /// A scope over this model's allocator and stream, launching trellis linears in the mode of the pass in flight.
     pub fn scope(self: *const Model) Scope {
@@ -880,7 +941,8 @@ pub const Model = struct {
     fn ropeFor(self: *const Model, li: usize) *const Rope {
         return if (self.ratio(li) > 0) &self.rope_yarn else &self.rope_plain;
     }
-    /// A token's Engram id; an image span's positions take no part in an n-gram.
+    /// A token's Engram id. The image id takes no part in an n-gram wherever it stands, with a row behind it or as a
+    /// plain token: a restored prefix rebuilds this history from the ids alone.
     fn compressedId(self: *const Model, t: u32) u32 {
         if (self.cfg.image_token_id != 0 and t == self.cfg.image_token_id) return engram.Hash.DEAD;
         return if (t < self.token_map.len) self.token_map[t] else 0;
@@ -2217,7 +2279,7 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix, qu
         const logits = if (dim(h, 0) <= NARROW_ROWS and c.dim % 8 == 0)
             try kernels.gateLogits(sc, h, ly.gate_w)
         else
-            try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(ly.gate_w, .float32)));
+            try gateLogitsWide(sc, h, ly.gate_w);
         var r = if (mix) |mx| blk: {
             if (mx.sp != null or mx.z.ctx == null) break :blk try kernels.route(sc, logits, bias, K, norm, c.route_scale);
             // The FFN stage's mixes are split in the router's launch, and a resident layer's slots are mapped in it.
@@ -2238,7 +2300,7 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix, qu
         try tapRoutes(sc, m, li, r);
         return r;
     }
-    const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(ly.gate_w, .float32))); // [L, E]
+    const logits = try gateLogitsWide(sc, h, ly.gate_w); // [L, E]
     const scores = try sc.op1(mlx.mlx_sqrt, try sc.op2(mlx.mlx_logaddexp, logits, try sc.f(0)));
     const idx = try topkRows(sc, m, try sc.add(scores, bias), K);
     var wts = try sc.takeAlong(scores, idx, -1);
@@ -2247,6 +2309,32 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix, qu
     try traceRoutes(m, li, logits, r);
     try tapRoutes(sc, m, li, r);
     return r;
+}
+
+/// The router's logits of a chunk, `[L, E]` f32: `h` times the router rows `w`, a tile of `gate_tile_rows` rows at a
+/// time with the last tile padded by zero rows. The dense product picks its kernel and its k split by the row count
+/// (MLX's `steel_matmul`, and the engine's twin of it), and those sum in different orders: with every call the same
+/// shape, a row's logits are the same bits whatever the width of the chunk it came in.
+fn gateLogitsWide(sc: *Scope, h: A, w: A) !A {
+    const L = dim(h, 0);
+    const T: usize = @intCast(cfg_mod.gate_tile_rows);
+    const hf = try sc.astype(h, .float32);
+    const wt = try sc.t2(try sc.astype(w, .float32));
+    const n_tiles = (L + T - 1) / T;
+    const tiles = try sc.a.alloc(A, n_tiles);
+    defer sc.a.free(tiles);
+    for (tiles, 0..) |*tile, i| {
+        const lo = i * T;
+        const hi = @min(L, lo + T);
+        const rows = if (lo == 0 and hi == L) hf else try sc.slice(hf, 0, lo, hi);
+        if (hi - lo == T) {
+            tile.* = try sc.matmul(rows, wt);
+            continue;
+        }
+        const padded = try sc.concat(&.{ rows, try sc.zeros(&.{ ci(T - (hi - lo)), ci(dim(h, 1)) }, .float32) }, 0);
+        tile.* = try sc.slice(try sc.matmul(padded, wt), 0, 0, hi - lo);
+    }
+    return if (n_tiles == 1) tiles[0] else sc.concat(tiles, 0);
 }
 
 /// The router's logits and picks, for tests that compare two forwards: a pick may differ only where scores tie.
@@ -2978,16 +3066,15 @@ fn warmOwnBlocks(m: *Model, t1: u32) !void {
 pub fn ownBegin(m: *Model) S {
     const was = m.s;
     m.s = mlx.engine.stream();
-    if (m.own_depth == 0) m.own_found_active = mlx.engine.active;
+    if (m.own_depth == 0) m.own_side = mlx.engine.makers(true);
     m.own_depth += 1;
-    mlx.engine.active = true;
     return was;
 }
 
 /// The outermost `ownEnd` gives the engine's scope back as the first `ownBegin` found it.
 pub fn ownEnd(m: *Model, was: S) void {
     m.own_depth -= 1;
-    if (m.own_depth == 0) mlx.engine.active = m.own_found_active;
+    if (m.own_depth == 0) m.own_side.end();
     m.s = was;
 }
 
@@ -3254,6 +3341,15 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
         try st.hist.ensureTotalCapacity(m.gpa, n);
         for (ids[0..n]) |t| st.hist.appendAssumeCapacity(m.compressedId(t));
     }
+    // The append-only rows become the state's own here, with their slack, as the state's room and not a forward's: a
+    // restored buffer has none, so the first forward would copy every layer's rows inside a cap that prices one
+    // layer's, and beside the point's own where someone keeps it (a RAM entry).
+    const cap = mlx.engine.uncapped();
+    defer mlx.engine.capped(cap);
+    for (st.layers) |*ls| {
+        if (ls.comp) |*rows| try rows.reserve(stateStream(m));
+        if (ls.idx_k) |*rows| try rows.reserve(stateStream(m));
+    }
 }
 
 /// Whether no row buffer of the live state is larger than a `prompt_len`-token request's own would be, with the
@@ -3465,9 +3561,11 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
     errdefer if (img.ctx != null) {
         _ = mlx.mlx_array_free(img);
     };
-    // Once the request's rows are all consumed an image id is one the model emitted itself: a plain token.
-    if (imageRows(m, ids) > 0 and (vision == null or vision.?.offset * c.dim < mlx.mlx_array_size(vision.?.rows))) {
-        const vr = vision orelse return error.Dsv41VisionRowsMissing;
+    // An image id with no row behind it is a plain token, as the release's forward has no image mask without image
+    // spans: one a text prompt holds, or one the model emitted (a request's rows are all consumed by then).
+    const rows_left = if (vision) |vr| vr.offset * c.dim < mlx.mlx_array_size(vr.rows) else false;
+    if (rows_left and imageRows(m, ids) > 0) {
+        const vr = vision.?;
         for (m.layers[0..c.layers]) |*ly| if (ly.gate_bias_vl.ctx == null) return error.Dsv41VisionBiasMissing;
         const take = try sc.a.alloc(i32, L);
         defer sc.a.free(take);
@@ -3966,16 +4064,9 @@ pub fn extendLazy(m: *Model, id: A, host: *[1]u32) !A {
         defer sc.deinit();
         pass.x, pass.cpre = try startStreams(&sc, m, try m.embed.rows(&sc, try sc.reshape(id, &.{1}), m.act), 1);
     }
-    // A token the pass refuses leaves nothing of layer 0 in the state it was queued on.
-    var undo = Undo.take(st, 0, 1);
-    defer undo.deinit();
-    var read = false;
-    errdefer if (!read) undo.restore();
     try passLayer(m, &pass, 0);
     try mlx.check(mlx.mlx_array_eval(id));
     host[0] = (mlx.mlx_array_data_uint32(id) orelse return error.InvalidDsv41Input)[0];
-    if (imageRows(m, host) > 0) return error.Dsv41VisionRowsMissing;
-    read = true;
     if (m.hash) |*hs| {
         const comp = m.compressedId(host[0]);
         pass.rows = try m.gpa.alloc(u32, hs.n_layers * hs.cols());
@@ -4314,11 +4405,9 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
 pub fn verify(m: *Model, ids: []const u32) !A {
     const st = try ensureState(m);
     if (st.verify != null) return error.Dsv41VerifyOpen;
-    m.rows = .{ .exact = m.dspark_exact };
-    defer m.rows = .{};
-    // The caller takes the verdict from a value built on the logits, whose evaluation waits for the head.
-    m.defer_head = m.lazy_head;
-    defer m.defer_head = false;
+    const armed = m.arm(.verify);
+    defer armed.end();
+    armed.lazyHead(true);
     if (ids.len == 1) return extend(m, ids, .all);
     const nl = m.cfg.layers;
     var v: Verify = .{
@@ -6013,11 +6102,12 @@ test "dsv41 Engram: the carried look-ahead is freed by a reset, by a failed pass
     resetState(m);
     try testing.expect(m.engram_ahead == null);
 
-    // The next chunk holds an image span no rows were given for: the pass fails, and the rows read for it go.
+    // The next chunk holds an image span longer than the rows given for it: the pass fails, and the rows read for it go.
     for (ids[22..26]) |*id| id.* = t.image_id;
     _ = mlx.mlx_array_free(try extendAhead(m, ids[0..20], .last, 5, null, ids[20..]));
     try testing.expect(m.engram_ahead != null);
-    try testing.expectError(error.Dsv41VisionRowsMissing, extendAhead(m, ids[20..], .last, 5, null, &.{}));
+    const short: VisionRows = .{ .rows = try routerRows(&sc, m.cfg.dim, 2, 7), .offset = 0 };
+    try testing.expectError(error.Dsv41VisionRowsShort, extendAhead(m, ids[20..], .last, 5, short, &.{}));
     try testing.expect(m.engram_ahead == null);
 
     // A request that ends here leaves its look-ahead to the unload.
@@ -6162,6 +6252,53 @@ test "dsv41 packed picks: the fused kernel reading the picked rows packed gives 
             defer for (heads) |h| testing.allocator.free(h);
             errdefer std.debug.print("case {d} nax {}\n", .{ ci_, nax });
             try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(heads[0]), std.mem.sliceAsBytes(heads[1]));
+        }
+    }
+}
+
+test "dsv41 fused attention: a row's heads are the same bits in one span and in any two the span is cut into, on both arms and with the picks packed (release span shapes)" {
+    try mlx.requireGpu();
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    const cases = [_]AttnCase{
+        .{ .L = 256, .wp = 127, .K = 512, .nc = 700 },
+        .{ .L = 200, .wp = 0, .K = 512, .nc = 4096, .holes = false },
+        .{ .L = 100, .wp = 63, .K = 0, .nc = 0 },
+        .{ .L = 80, .wp = 7, .K = 24, .nc = 30, .H = 16, .hd = 64, .window = 20 },
+    };
+    for (cases, 0..) |c, ci_| {
+        var sc = Scope.plain(testing.allocator, gpu);
+        defer sc.deinit();
+        const d = try attnCaseData(&sc, c, 0xc17 + ci_);
+        var store: ?Rows = if (c.K > 0) try packedStore(&sc, d.comp) else null;
+        defer if (store) |*r| r.deinit();
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hd)));
+        for ([_]bool{ false, true }) |nax| {
+            if (nax and !kernels.attnNaxFits(c.H, c.hd)) continue;
+            for ([_]bool{ false, true }) |raw| {
+                if (raw and store == null) continue;
+                const whole_picks: Picks = if (store) |*r| try packedPicks(&sc, r, d.topk, raw) else .{};
+                const whole = try hostRows(&sc, try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, whole_picks, scale, .bfloat16, null, nax));
+                defer testing.allocator.free(whole);
+                const per_row = c.H * c.hd;
+                // Cuts at a row of a threadgroup's own, inside the window of the span's first row, and past it.
+                for ([_]usize{ 1, 17, c.window - 1, c.window + 5, c.L / 2, c.L - 1 }) |cut| {
+                    if (cut == 0 or cut >= c.L) continue;
+                    for ([_][2]usize{ .{ 0, cut }, .{ cut, c.L } }) |span| {
+                        const a = span[0];
+                        const b = span[1];
+                        // The window rows a span keeps before its first row, as `attention` reads them off the ring.
+                        const first_key = (c.wp + a) -| (c.window - 1);
+                        const keys = try sc.slice(d.keys, 0, first_key, c.wp + b);
+                        const topk = if (store != null) try sc.slice(d.topk, 0, a, b) else none;
+                        const picks: Picks = if (store) |*r| try packedPicks(&sc, r, topk, raw) else .{};
+                        const part = try hostRows(&sc, try fusedHeads(&sc, d.sink, try sc.slice(d.q, 0, a, b), keys, c.wp + a - first_key, c.window, picks, scale, .bfloat16, null, nax));
+                        defer testing.allocator.free(part);
+                        errdefer std.debug.print("case {d} nax {} raw {} rows {d}..{d}\n", .{ ci_, nax, raw, a, b });
+                        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(whole[a * per_row .. b * per_row]), std.mem.sliceAsBytes(part));
+                    }
+                }
+            }
         }
     }
 }
@@ -6565,7 +6702,11 @@ fn expectMaskedRoute(sc: *Scope, full: *Model, cut: *Model, d: *const expert_usa
     const idx = try sc_mod.hostI32(try sc.astype(r.idx, .int32));
     const wts = try sc_mod.hostF32(r.wts);
 
-    const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(full.layers[li].gate_w, .float32)));
+    // Bit for bit against the router's own tiled product; the fused kernel against a plain product, within its rounding.
+    const logits = if (exact)
+        try gateLogitsWide(sc, h, full.layers[li].gate_w)
+    else
+        try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(full.layers[li].gate_w, .float32)));
     const scores = try sc.op1(mlx.mlx_sqrt, try sc.op2(mlx.mlx_logaddexp, logits, try sc.f(0)));
     const sel = try sc_mod.hostF32(try sc.add(scores, full.layers[li].gate_bias));
     for (0..rows) |row| {
@@ -6777,7 +6918,41 @@ test "dsv41 vision: the span rows replace the embeddings, and the logits are the
     try testing.expect(worst > 1e-3);
 }
 
-test "dsv41 vision: a span without rows, or a pack without the image bias, is refused by name (DSV41_TINY)" {
+test "dsv41 vision: an image id with no row behind it is a plain token, in a request without images as after the last row of one with them (DSV41_TINY)" {
+    const dir = try fixtureDir();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var sc = Scope.plain(testing.allocator, cpu);
+    defer sc.deinit();
+    const t = try visionTinyModel(dir, cpu);
+    defer t.m.deinit();
+    const ids = [_]u32{ 3, t.image_id, t.image_id, 4, 5 };
+    const spent: VisionRows = .{ .rows = try routerRows(&sc, t.m.cfg.dim, 2, 7), .offset = 2 };
+    var logits: [3][]f32 = undefined;
+    var made: usize = 0;
+    defer for (logits[0..made]) |l| testing.allocator.free(l);
+    // The whole prompt without images, the same with a request's rows already taken, and the id fed alone as a
+    // token the model emitted.
+    for ([_]?VisionRows{ null, spent, null }, 0..) |vision, which| {
+        resetState(t.m);
+        var last: A = none;
+        defer _ = mlx.mlx_array_free(last);
+        if (which == 2) {
+            for (ids) |id| {
+                _ = mlx.mlx_array_free(last);
+                last = try extendVision(t.m, &.{id}, .last, 64, vision);
+            }
+        } else last = try extendVision(t.m, &ids, .last, 64, vision);
+        logits[which] = try hostRows(&sc, last);
+        made += 1;
+    }
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(logits[0]), std.mem.sliceAsBytes(logits[1]));
+    try compare("an image id fed alone", logits[2], logits[0], 2e-3);
+    // Its Engram id stays the dead one, as a restored prefix rebuilds it from the ids alone.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u32, (try ensureState(t.m)).hist.items, &.{engram.Hash.DEAD}));
+}
+
+test "dsv41 vision: a pack without the image bias, or a span longer than its rows, is refused by name (DSV41_TINY)" {
     const dir = try fixtureDir();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
@@ -6786,8 +6961,6 @@ test "dsv41 vision: a span without rows, or a pack without the image bias, is re
     const t = try visionTinyModel(dir, cpu);
     defer t.m.deinit();
     const ids = [_]u32{ 3, t.image_id, t.image_id, 4 };
-    try testing.expectError(error.Dsv41VisionRowsMissing, extendVision(t.m, &ids, .last, 64, null));
-    resetState(t.m);
     const bias = t.m.layers[2].gate_bias_vl;
     t.m.layers[2].gate_bias_vl = none;
     const rows = try routerRows(&sc, t.m.cfg.dim, 2, 7);

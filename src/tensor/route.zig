@@ -21,12 +21,37 @@ const V = mlx.mlx_vector_array;
 const Tensor = core.Tensor;
 const gpa = std.heap.c_allocator;
 
-/// Read once: the engine exists in this process. Off, no call is ever routed here and no kernel is recorded.
+// ── The engine's scope ──
+// `enabled`, `active`, the holds, MLX's allocator at rest and the seal are written in this file alone (lint rule
+// `scope-state`): a span that moves one gives back what it found (`Scope`, `Makers`, `Turn`, `Seal`), on every path.
+
+/// Read once: the engine exists in this process. Off, no call is ever routed here and no kernel is recorded. On from
+/// the first load that is the engine's (`enable`, `hold`), for the life of the process.
 pub var enabled: bool = false;
+
+pub fn enable() void {
+    enabled = true;
+}
 
 /// On while a forward of ours runs: the makers that take no stream and no array (a host array, a vector, a kernel
 /// config) make engine objects.
 pub var active: bool = false;
+
+/// The makers that take no stream make the engine's objects (`own`) or MLX's from here to `Makers.end`, whatever the
+/// scope around: a forward of ours inside a turn of MLX's, or a read of MLX's own arrays inside a forward of ours.
+pub fn makers(own: bool) Makers {
+    const was = active;
+    active = own;
+    return .{ .was = was };
+}
+
+pub const Makers = struct {
+    was: bool,
+
+    pub fn end(self: Makers) void {
+        active = self.was;
+    }
+};
 
 /// Host arrays and vectors made between `enter` and `Scope.end` are the engine's when `s` is its stream, and make no
 /// call into MLX. On any other stream it changes nothing.
@@ -62,8 +87,9 @@ pub var mlx_at_rest: MlxAtRest = .{};
 /// A load that is the engine's alone holds the engine's scope open from its first tensor to its unload: every host
 /// array and vector made for it is the engine's, and an op on an MLX stream is refused by name.
 pub fn hold() void {
+    // A hold is the engine's own load: the engine exists from the first one on.
     enabled = true;
-    if (holds == 0) mlx.restAllocator(&mlx_at_rest);
+    if (holds == 0) mlx.restAllocator(&mlx_at_rest, true);
     holds += 1;
     active = true;
 }
@@ -73,11 +99,49 @@ pub fn unhold() void {
     if (holds != 0) return;
     active = false;
     mlx_at_rest.on.store(false, .release);
+    mlx.payOwed();
 }
 
 pub fn holding() bool {
     return holds > 0;
 }
+
+/// The inference thread turns to work for one model, a load of which is the engine's (`own`) or not. While a load
+/// holds, the engine's scope and MLX's allocator at rest are for the engine's own models alone: a turn to any other
+/// model steps out of both for its span, and `end` gives back what the turn found. A turn that changes neither (one
+/// of the engine's inside another) asks MLX nothing. MLX's allocator is read again only by the turn that woke it, with
+/// its pool left to the model that filled it; what MLX was owed while at rest is done as its turn begins. In a process
+/// no load holds, a turn is nothing.
+pub fn turnTo(own: bool) Turn {
+    if (holds == 0) return .{};
+    const was: Turn = .{ .took = true, .active = active, .rest = mlx_at_rest.on.load(.acquire) };
+    active = own;
+    if (own == was.rest) return was;
+    if (own) {
+        mlx.restAllocator(&mlx_at_rest, false);
+    } else {
+        mlx_at_rest.on.store(false, .release);
+        mlx.payOwed();
+    }
+    return was;
+}
+
+pub const Turn = struct {
+    took: bool = false,
+    active: bool = false,
+    rest: bool = false,
+
+    pub fn end(self: Turn) void {
+        if (!self.took) return;
+        // The last hold may have gone inside the turn (the model's unload): nothing is given back then.
+        if (holds == 0) return;
+        active = self.active;
+        if (self.rest == mlx_at_rest.on.load(.acquire)) return;
+        if (self.rest) return mlx.restAllocator(&mlx_at_rest, false);
+        mlx_at_rest.on.store(false, .release);
+        mlx.payOwed();
+    }
+};
 
 /// Whether a load's mapped weights are wrapped by the engine instead of MLX (`model.wrapRegion`). Set for the span of
 /// a load that runs every forward on the engine: a weight of the engine's lent to MLX is wired a second time.
@@ -102,10 +166,15 @@ pub fn mlxCalls() u64 {
 }
 
 /// Whether kernels and their configs are noted for the engine as they are made. A module keeps both for the life of
-/// the process; a test process turns the engine on after other tests made theirs.
+/// the process, and a load on MLX may come before one on the engine: so they are noted wherever the engine can serve
+/// (a GPU with matrix units), on or not yet. A test process turns the engine on after other tests made theirs.
 pub fn noting() bool {
-    return enabled or @import("builtin").is_test;
+    if (enabled or (@import("builtin").is_test and !noting_as_served)) return true;
+    return matrixUnits();
 }
+
+/// A test takes a served process's rule: without it a test process notes everything.
+pub var noting_as_served: bool = false;
 
 pub const Side = enum {
     mlx,
@@ -385,6 +454,13 @@ pub const stream = core.stream;
 pub const stats = core.stats;
 pub const poolTotal = core.poolTotal;
 pub const poolFree = core.poolFree;
+pub const fault = core.fault;
+pub const poison = core.poison;
+pub fn poolRefusals() u64 {
+    return core.pool_refusals;
+}
+pub const poolPeak = core.poolPeak;
+pub const resetPoolPeak = core.resetPoolPeak;
 
 /// What the pool refused last for its budget (`core.refused_budget`).
 pub fn refusedBudget() @TypeOf(core.refused_budget) {
@@ -412,6 +488,7 @@ pub fn phase(now: u8) void {
     core.phase = now;
 }
 pub const trim = core.trim;
+pub const settleMlxAliases = core.settleMlxAliases;
 
 pub const nowNs = core.nowNs;
 
@@ -419,6 +496,22 @@ pub const nowNs = core.nowNs;
 pub fn seal(on: bool) void {
     core.sealed = on;
 }
+
+/// Pipelines may be made from here to `Seal.end`, which seals again if it found the engine sealed: a warm inside a
+/// load, or a tower's own.
+pub fn unsealed() Seal {
+    const was = core.sealed;
+    core.sealed = false;
+    return .{ .was = was };
+}
+
+pub const Seal = struct {
+    was: bool,
+
+    pub fn end(self: Seal) void {
+        core.sealed = self.was;
+    }
+};
 
 pub fn sealed() bool {
     return core.sealed;
@@ -1289,6 +1382,23 @@ pub fn noteGroup(c: mlx.mlx_fast_metal_kernel_config, x: c_int, y: c_int, z: c_i
     if (mirror(c)) |m| m.group = .{ x, y, z };
 }
 
+/// Inside the engine's scope a grid or a thread group set on a config MLX made stays in its mirror, which is all a
+/// launch of the engine's reads: true when it did, and MLX's config is then behind until `caughtUp`.
+pub fn keepsBehind(c: mlx.mlx_fast_metal_kernel_config) bool {
+    if (!active) return false;
+    const m = mirrors.get(@intFromPtr(c.ctx)) orelse return false;
+    m.behind = true;
+    return true;
+}
+
+/// The grid and thread group MLX's config `c` was not given, for the launch on MLX's side that needs them now.
+pub fn caughtUp(c: mlx.mlx_fast_metal_kernel_config) ?*const kernel.Config {
+    const m = mirrors.get(@intFromPtr(c.ctx)) orelse return null;
+    if (!m.behind) return null;
+    m.behind = false;
+    return m;
+}
+
 pub fn noteTemplate(c: mlx.mlx_fast_metal_kernel_config, name: [*:0]const u8, value: kernel.TemplateValue) void {
     if (mirror(c)) |m| m.addTemplate(std.mem.span(name), value) catch {
         m.partial = true;
@@ -1439,6 +1549,7 @@ fn expectSame(comptime build: anytype, inputs: []const A) !void {
     try t_std.expectEqual(mlx.mlx_array_dtype(results[0]), mlx.mlx_array_dtype(results[1]));
     try t_std.expectEqualSlices(c_int, mlx.getShape(results[0]), mlx.getShape(results[1]));
     const n = mlx.mlx_array_size(results[0]) * mlx.mlx_array_itemsize(results[0]);
+    if (n == 0) return;
     try t_std.expectEqualSlices(u8, mlx.mlx_array_data_uint8(results[0]).?[0..n], mlx.mlx_array_data_uint8(results[1]).?[0..n]);
 }
 
@@ -1740,6 +1851,36 @@ test "a slice update leaves its base as it was" {
     try t_std.expectEqualSlices(f32, &base_data, mlx.mlx_array_data_float32(ours).?[0..6]);
 }
 
+test "a slice update whose write was refused is still owed: the next read of the result writes it" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const s = core.stream();
+    const base_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const row = [_]f32{ 9, 9, 9 };
+    const base = hostArray(f32, &base_data, &.{ 2, 3 }, .float32);
+    defer _ = mlx.mlx_array_free(base);
+    const update = hostArray(f32, &row, &.{ 1, 3 }, .float32);
+    defer _ = mlx.mlx_array_free(update);
+    var ours: A = .{};
+    defer _ = mlx.mlx_array_free(ours);
+    try mlx.check(mlx.mlx_astype(&ours, base, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(ours));
+    var written: A = .{};
+    defer _ = mlx.mlx_array_free(written);
+    try mlx.check(mlx.mlx_slice_update(&written, ours, update, &[_]c_int{ 1, 0 }, 2, &[_]c_int{ 2, 3 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    // The base is held, so the write needs a copy, and the pool refuses its buffer.
+    core.fault.arm(1);
+    const refused = mlx.check(mlx.mlx_array_eval(written));
+    core.fault.disarm();
+    try t_std.expectError(error.MlxError, refused);
+    try t_std.expect(mlx.takeErrorIf("PoolOverBudget"));
+    try mlx.check(mlx.mlx_array_eval(written));
+    try t_std.expectEqualSlices(f32, &.{ 1, 2, 3, 9, 9, 9 }, mlx.mlx_array_data_float32(written).?[0..6]);
+    try t_std.expectEqualSlices(f32, &base_data, mlx.mlx_array_data_float32(ours).?[0..6]);
+}
+
 test "a handle of the engine's is freed by the engine after the engine is switched off" {
     try mlx.requireGpu();
     const was = enabled;
@@ -1819,6 +1960,48 @@ test "a custom kernel launched on the engine writes what it writes under MLX" {
             }
         }
     };
+}
+
+test "a kernel and a config MLX made while the engine was off launch on the engine once it is on, as a served process needs" {
+    try mlx.requireGpu();
+    if (!matrixUnits()) return error.SkipZigTest;
+    const was = enabled;
+    defer enabled = was;
+    noting_as_served = true;
+    defer noting_as_served = false;
+    // A load on MLX comes first: its module keeps the kernel and the config for the life of the process.
+    enabled = false;
+    const names_in = [_][*:0]const u8{"x"};
+    const names_out = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&names_in, names_in.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&names_out, names_out.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_made_before_probe", iv, ov, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);", "", true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{8}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", 2));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 8, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 8, 1, 1));
+    // Then a load on the engine reaches the same module.
+    enabled = true;
+    const host = enter(core.stream());
+    defer host.end();
+    const xs = ramp(f32, 8, 1, 0);
+    const x = hostArray(f32, &xs, &.{8}, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const inputs = mlx.mlx_vector_array_new_data(&[_]A{x}, 1);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, k, inputs, cfg, core.stream()));
+    var y: A = .{};
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+    try mlx.check(mlx.mlx_array_eval(y));
+    for (mlx.mlx_array_data_float32(y).?[0..8], xs) |got, v| try t_std.expectEqual(v + 2, got);
 }
 
 test "a kernel, its name lists and its config made while the engine is on call nothing in mlx-c, and launch on both sides" {
@@ -2448,6 +2631,254 @@ test "under a hold MLX's allocator is not asked: its readings are the hold's fir
     try std.testing.expectEqual(@as(usize, 1 << 30), after);
 }
 
+test "a turn of the engine's inside another asks MLX nothing, though MLX changed since it was read" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    hold();
+    defer unhold();
+    var ones = mlx.mlx_array_new();
+    {
+        const t = turnTo(false);
+        defer t.end();
+        try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1 << 10, 4 }, 2, .float32, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(ones));
+    }
+    // Work of the model on MLX done outside its turn: the one call counts as a break of MLX's rest.
+    const breaks = mlx.rest_breaks.load(.monotonic);
+    _ = mlx.mlx_array_free(ones);
+    try std.testing.expectEqual(breaks + 1, mlx.rest_breaks.load(.monotonic));
+    const calls = mlxCalls();
+    {
+        const outer = turnTo(true);
+        defer outer.end();
+        const inner = turnTo(true);
+        defer inner.end();
+        try std.testing.expect(active and mlx_at_rest.on.load(.acquire));
+    }
+    try std.testing.expectEqual(calls, mlxCalls());
+}
+
+test "beside a held scope a model on MLX finds its pool as its last turn left it" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    var cached: [2]usize = .{ 0, 0 };
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    for (&cached, 0..) |*bytes, held| {
+        // What earlier work left on MLX's queue reaches its pool before the pool is emptied.
+        try mlx.check(mlx.mlx_synchronize(s));
+        _ = mlx.mlx_clear_cache();
+        if (held == 1) hold();
+        defer if (held == 1) unhold();
+        {
+            const t = turnTo(false);
+            defer t.end();
+            var ones = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1 << 18, 4 }, 2, .float32, s));
+            try mlx.check(mlx.mlx_array_eval(ones));
+            // The buffer is the pool's once the pass that wrote it is done.
+            try mlx.check(mlx.mlx_synchronize(s));
+            _ = mlx.mlx_array_free(ones);
+        }
+        const t = turnTo(false);
+        defer t.end();
+        try mlx.check(mlx.mlx_get_cache_memory(bytes));
+        _ = mlx.mlx_clear_cache();
+    }
+    try std.testing.expect(cached[0] >= 4 << 18);
+    try std.testing.expectEqual(cached[0], cached[1]);
+}
+
+test "an array of MLX's that reaches an op of the engine's at rest is refused by name, with no call into MLX" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    var buf: [512]u8 = undefined;
+    _ = mlx.takeError(&buf);
+    hold();
+    defer unhold();
+    var theirs = mlx.mlx_array_new();
+    {
+        const t = turnTo(false);
+        defer t.end();
+        try mlx.check(mlx.mlx_ones(&theirs, &[_]c_int{4}, 1, .float32, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(theirs));
+    }
+    defer {
+        const t = turnTo(false);
+        _ = mlx.mlx_array_free(theirs);
+        t.end();
+    }
+    const xs = ramp(f32, 4, 1, 0);
+    const ours = mlx.mlx_array_new_data(&xs, &[_]c_int{4}, 1, .float32);
+    defer _ = mlx.mlx_array_free(ours);
+    try std.testing.expect(core.isOurs(ours));
+    const calls = mlxCalls();
+    var sum: A = .{};
+    try std.testing.expectError(error.MlxError, mlx.check(mlx.mlx_add(&sum, ours, theirs, core.stream())));
+    try std.testing.expect(std.mem.indexOf(u8, mlx.takeError(&buf).?, "MlxAtRest") != null);
+    try std.testing.expectEqual(calls, mlxCalls());
+}
+
+test "an array of MLX's the engine still binds when MLX's turn ends is freed inside that turn, not at rest" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    hold();
+    defer unhold();
+    const breaks = mlx.rest_breaks.load(.monotonic);
+    {
+        const t = turnTo(false);
+        defer t.end();
+        var theirs = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_ones(&theirs, &[_]c_int{ 1 << 12, 4 }, 2, .float32, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(theirs));
+        // A pass of ours reads MLX's array, and both handles go before the pass has run.
+        var sum: A = .{};
+        try mlx.check(mlx.mlx_add(&sum, theirs, theirs, core.stream()));
+        _ = mlx.mlx_array_free(sum);
+        _ = mlx.mlx_array_free(theirs);
+    }
+    // The engine's next work, in its own turn, finds nothing of MLX's left to free.
+    const xs = ramp(f32, 4, 1, 0);
+    const ours = mlx.mlx_array_new_data(&xs, &[_]c_int{4}, 1, .float32);
+    defer _ = mlx.mlx_array_free(ours);
+    var twice: A = .{};
+    defer _ = mlx.mlx_array_free(twice);
+    try mlx.check(mlx.mlx_add(&twice, ours, ours, core.stream()));
+    try mlx.check(mlx.mlx_array_eval(twice));
+    try core.sync();
+    try std.testing.expectEqual(breaks, mlx.rest_breaks.load(.monotonic));
+}
+
+test "a setting asked of MLX at rest is counted and reaches nothing; inside MLX's turn it is MLX's and none is counted" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    var orig: usize = 0;
+    try mlx.check(mlx.mlx_set_cache_limit(&orig, 3 << 20));
+    defer {
+        var unused: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&unused, orig);
+    }
+    hold();
+    var is_held = true;
+    defer if (is_held) unhold();
+    const swallows = mlx.rest_swallows.load(.monotonic);
+    const breaks = mlx.rest_breaks.load(.monotonic);
+    var prev: usize = 0;
+    try mlx.check(mlx.mlx_set_cache_limit(&prev, 5 << 20));
+    try mlx.check(mlx.mlx_clear_cache());
+    try std.testing.expectEqual(swallows + 2, mlx.rest_swallows.load(.monotonic));
+    {
+        const t = turnTo(false);
+        defer t.end();
+        try mlx.check(mlx.mlx_set_cache_limit(&prev, 7 << 20));
+        // The limit asked at rest never reached MLX.
+        try std.testing.expectEqual(@as(usize, 3 << 20), prev);
+        try mlx.check(mlx.mlx_clear_cache());
+    }
+    try std.testing.expectEqual(swallows + 2, mlx.rest_swallows.load(.monotonic));
+    try std.testing.expectEqual(breaks, mlx.rest_breaks.load(.monotonic));
+    unhold();
+    is_held = false;
+    try mlx.check(mlx.mlx_set_cache_limit(&prev, orig));
+    try std.testing.expectEqual(@as(usize, 7 << 20), prev);
+}
+
+test "the wired limit a load asks for at rest is MLX's at its next turn, less what the engine wraps" {
+    try mlx.requireGpu();
+    const max_rec = mlx.maxRecommendedWorkingSet();
+    if (max_rec == 0) return error.SkipZigTest;
+    const was_enabled = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    var orig: usize = 0;
+    try mlx.check(mlx.mlx_set_wired_limit(&orig, 1 << 30));
+    defer {
+        var unused: usize = 0;
+        _ = mlx.mlx_set_wired_limit(&unused, orig);
+    }
+    hold();
+    var is_held = true;
+    defer if (is_held) unhold();
+    const calls = mlxCalls();
+    try std.testing.expectEqual(@as(?usize, null), mlx.applyWiredPolicy());
+    try std.testing.expectEqual(calls, mlxCalls());
+    try std.testing.expect(mlx.owes());
+    var now: usize = 0;
+    {
+        const t = turnTo(false);
+        defer t.end();
+        try std.testing.expect(!mlx.owes());
+        try mlx.check(mlx.mlx_set_wired_limit(&now, 1 << 30));
+        try std.testing.expectEqual(max_rec -| @as(usize, @intCast(mappedTotal())), now);
+    }
+    // Owed again, and no turn of MLX's before the hold ends: the hold's end sets it.
+    _ = mlx.applyWiredPolicy();
+    unhold();
+    is_held = false;
+    try std.testing.expect(!mlx.owes());
+    try mlx.check(mlx.mlx_set_wired_limit(&now, orig));
+    try std.testing.expectEqual(max_rec -| @as(usize, @intCast(mappedTotal())), now);
+}
+
+test "a config MLX launched, dropped in a turn of the engine's, has its twin freed at MLX's next turn" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    const names_in = [_][*:0]const u8{"x"};
+    const names_out = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&names_in, names_in.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&names_out, names_out.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_owed_twin_probe", iv, ov, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + 1.0f;", "", true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const xs = ramp(f32, 4, 1, 0);
+    const x = hostArray(f32, &xs, &.{4}, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const inputs = mlx.mlx_vector_array_new_data(&[_]A{x}, 1);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    try std.testing.expect(isConfig(cfg));
+    {
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4}, 1, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 4, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 4, 1, 1));
+        var outs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outs);
+        const s = mlx.gpuStream();
+        defer _ = mlx.mlx_stream_free(s);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, k, inputs, cfg, s));
+        try std.testing.expect(configOf(cfg).twin != null);
+    }
+    hold();
+    var is_held = true;
+    defer if (is_held) unhold();
+    const calls = mlxCalls();
+    _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try std.testing.expectEqual(calls, mlxCalls());
+    try std.testing.expect(mlx.owes());
+    {
+        const t = turnTo(false);
+        defer t.end();
+        try std.testing.expect(!mlx.owes());
+        try std.testing.expectEqual(calls + 1, mlxCalls());
+    }
+    unhold();
+    is_held = false;
+}
+
 test "a map of the engine's holds arrays and strings by name, in the order they were put, and answers mlx-c's way for a name it lacks" {
     try mlx.requireGpu();
     const t = std.testing;
@@ -2974,6 +3405,112 @@ test "engine cumsum gives MLX's bytes: exclusive and inclusive, short rows, a vo
     try expectSame(Build.scan(true, false), &.{n});
     try expectSame(Build.along(1, false, true), &.{n});
     try expectSame(Build.along(0, true, false), &.{n});
+}
+
+test "engine cumsum gives MLX's bytes over a view: a turned one whose scanned axis is not unit-stride, an inner axis of floats, a cut of a turned one" {
+    try mlx.requireGpu();
+    const Build = struct {
+        fn turn(s: S, a: A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_transpose_axes(&o, a, &[_]c_int{ 2, 0, 1 }, 3, s));
+            return o;
+        }
+        fn whole(s: S, a: A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_array_set(&o, a));
+            _ = s;
+            return o;
+        }
+        /// Rows 0..3 of the turned view's middle axis: no gap in memory, so MLX scans it where it lies.
+        fn turnedDense(s: S, a: A) !A {
+            const turned = try turn(s, a);
+            defer _ = mlx.mlx_array_free(turned);
+            var o: A = .{};
+            try mlx.check(mlx.mlx_slice(&o, turned, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 37, 3, 7 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            return o;
+        }
+        /// Every other element of the turned view's first axis: gaps, so MLX scans a copy.
+        fn turnedGaps(s: S, a: A) !A {
+            const turned = try turn(s, a);
+            defer _ = mlx.mlx_array_free(turned);
+            var o: A = .{};
+            try mlx.check(mlx.mlx_slice(&o, turned, &[_]c_int{ 1, 0, 0 }, 3, &[_]c_int{ 37, 6, 7 }, 3, &[_]c_int{ 2, 1, 1 }, 3, s));
+            return o;
+        }
+        fn over(comptime view: anytype, comptime axis: c_int, comptime reverse: bool, comptime inclusive: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    const v = try view(s, in[0]);
+                    defer _ = mlx.mlx_array_free(v);
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_cumsum(&o, v, axis, reverse, inclusive, s));
+                    return o;
+                }
+            }.build;
+        }
+    };
+    const values = ramp(f32, 6 * 7 * 37, 8, -4);
+    const x = hostArray(f32, &values, &.{ 6, 7, 37 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    var x16: A = .{};
+    defer _ = mlx.mlx_array_free(x16);
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    try mlx.check(mlx.mlx_astype(&x16, x, .bfloat16, gpu));
+    var counts: [6 * 7 * 37]i32 = undefined;
+    for (&counts, 0..) |*v, i| v.* = @intCast(i * 7919 % 13);
+    const n = hostArray(i32, &counts, &.{ 6, 7, 37 }, .int32);
+    defer _ = mlx.mlx_array_free(n);
+    inline for (.{ Build.turn, Build.turnedDense, Build.turnedGaps, Build.whole }) |view| {
+        inline for (.{ -1, 0, 1 }) |axis| inline for (.{ false, true }) |reverse| inline for (.{ false, true }) |inclusive| {
+            try expectSame(Build.over(view, axis, reverse, inclusive), &.{x});
+        };
+        try expectSame(Build.over(view, -1, true, false), &.{x16});
+        try expectSame(Build.over(view, 1, false, true), &.{x16});
+        try expectSame(Build.over(view, -1, true, false), &.{n});
+        try expectSame(Build.over(view, 0, false, true), &.{n});
+    }
+    // A stride wider than one block of the kernel's, and an axis longer than one.
+    const wide = ramp(f32, 3 * 70 * 45, 0.5, -0.25);
+    const w = hostArray(f32, &wide, &.{ 3, 70, 45 }, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    try expectSame(Build.over(Build.whole, 1, false, true), &.{w});
+    try expectSame(Build.over(Build.whole, 1, true, false), &.{w});
+    try expectSame(Build.over(Build.whole, 0, false, false), &.{w});
+    // One element along the scanned axis, which then has no stride of its own.
+    const thin = hostArray(f32, wide[0 .. 6 * 37], &.{ 6, 1, 37 }, .float32);
+    defer _ = mlx.mlx_array_free(thin);
+    inline for (.{ Build.turn, Build.whole }) |view| inline for (.{ 0, 1, 2 }) |axis| {
+        try expectSame(Build.over(view, axis, false, true), &.{thin});
+        try expectSame(Build.over(view, axis, true, false), &.{thin});
+    };
+}
+
+test "engine casts to bool give MLX's bytes for every float: zeros of both signs, denormals, NaN and infinities" {
+    try mlx.requireGpu();
+    const bits = [_]u32{ 0x00000000, 0x80000000, 0x00000001, 0x80000001, 0x007fffff, 0x807fffff, 0x00800000, 0x80800000, 0x33800000, 0x3f800000, 0xbf800000, 0x7f7fffff, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc00000, 0x7f800001 };
+    var values: [bits.len]f32 = undefined;
+    for (&values, bits) |*v, b| v.* = @bitCast(b);
+    const x = hostArray(f32, &values, &.{bits.len}, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    // The same patterns as half floats: the smallest and largest denormals, the smallest normal, zeros, NaN, infinities.
+    const half_bits = [_]u16{ 0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x8400, 0x3c00, 0xbc00, 0x7bff, 0x7c00, 0xfc00, 0x7e00, 0xfe00, 0x7c01 };
+    const xh = hostArray(u16, &half_bits, &.{half_bits.len}, .float16);
+    defer _ = mlx.mlx_array_free(xh);
+    // bfloat16 keeps float32's exponent: its denormals are float32's with the low half cut.
+    const brain_bits = [_]u16{ 0x0000, 0x8000, 0x0001, 0x8001, 0x007f, 0x807f, 0x0080, 0x8080, 0x3f80, 0xbf80, 0x7f7f, 0x7f80, 0xff80, 0x7fc0, 0xffc0, 0x7f81 };
+    const xb = hostArray(u16, &brain_bits, &.{brain_bits.len}, .bfloat16);
+    defer _ = mlx.mlx_array_free(xb);
+    const Build = struct {
+        fn toBool(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_astype(&o, in[0], .bool_, s));
+            return o;
+        }
+    };
+    try expectSame(Build.toBool, &.{x});
+    try expectSame(Build.toBool, &.{xh});
+    try expectSame(Build.toBool, &.{xb});
 }
 
 test "engine put_along_axis and pad give MLX's bytes: keep flags scattered along the last axis, a constant border" {
@@ -3677,4 +4214,378 @@ test "logprobs on the engine's stream rank as MLX's do and agree to the last bit
     const once = try sampler.computeLogprobs(t_std.allocator, f32_row, 128000, 5, core.stream());
     defer t_std.allocator.free(once.top_logprobs);
     try t_std.expectEqual(before, mlx_ops);
+}
+
+/// `expectSame` for a table of cases: a failing one is named on stderr and counted, so one run shows them all.
+var named_failures: usize = 0;
+fn expectNamed(name: []const u8, comptime build: anytype, inputs: []const A) !void {
+    expectSame(build, inputs) catch |e| {
+        if (e == error.SkipZigTest) return e;
+        var said: [256]u8 = undefined;
+        std.debug.print("{s}: {s} {s}\n", .{ name, @errorName(e), mlx.takeError(&said) orelse "" });
+        named_failures += 1;
+    };
+}
+
+/// Every special float32 (zeros, infinities, NaNs, denormals, the ends of the range, values at the edges of exp and of
+/// the integer casts), then values over every exponent and both signs.
+fn edgeF32(comptime n: usize, seed: u32) [n]f32 {
+    const specials = [_]u32{ 0x00000000, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc00000, 0x7f800001, 0x00000001, 0x80000001, 0x007fffff, 0x00800000, 0x7f7fffff, 0xff7fffff, 0x3f800000, 0xbf800000, 0x42b17218, 0x42b20000, 0xc2ce0000, 0xc2d00000, 0x33800000, 0x3effffff, 0x3f000000, 0x4b000000, 0x4b000001, 0xcb000001, 0x4effffff, 0x4f000000, 0xcf000000, 0xcf000001, 0x4f800000, 0x5f000000 };
+    var out: [n]f32 = undefined;
+    var state: u32 = seed;
+    for (&out, 0..) |*v, i| {
+        if (i < specials.len) {
+            v.* = @bitCast(specials[i]);
+            continue;
+        }
+        state = state *% 1664525 +% 1013904223;
+        // Exponents across the whole range, either sign.
+        const e: u32 = (state >> 9) % 254 + 1;
+        state = state *% 1664525 +% 1013904223;
+        v.* = @bitCast((state & 0x807fffff) | (e << 23));
+    }
+    return out;
+}
+
+test "engine elementwise ops, casts, reductions, sorts and scans give MLX's bytes over the special floats and every exponent" {
+    try mlx.requireGpu();
+    named_failures = 0;
+    const N = 4099;
+    const xa = edgeF32(N, 0x51);
+    const ya = edgeF32(N, 0x77);
+    const x = hostArray(f32, &xa, &.{N}, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const y = hostArray(f32, &ya, &.{N}, .float32);
+    defer _ = mlx.mlx_array_free(y);
+    const x16 = try castByMlx(x, .bfloat16);
+    defer _ = mlx.mlx_array_free(x16);
+    const xh = try castByMlx(x, .float16);
+    defer _ = mlx.mlx_array_free(xh);
+    const B = struct {
+        fn b2(comptime f: anytype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var o: A = .{};
+                    try mlx.check(f(&o, in[0], in[1], s));
+                    return o;
+                }
+            }.build;
+        }
+        fn cast(comptime d: mlx.mlx_dtype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_astype(&o, in[0], d, s));
+                    return o;
+                }
+            }.build;
+        }
+        fn red(comptime f: anytype, comptime axis: c_int) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var r: A = .{};
+                    defer _ = mlx.mlx_array_free(r);
+                    try mlx.check(mlx.mlx_reshape(&r, in[0], &[_]c_int{ 1, 4099 }, 2, s));
+                    var o: A = .{};
+                    try mlx.check(f(&o, r, axis, false, s));
+                    return o;
+                }
+            }.build;
+        }
+        fn softmax(s: S, in: []const A) !A {
+            var r: A = .{};
+            defer _ = mlx.mlx_array_free(r);
+            try mlx.check(mlx.mlx_reshape(&r, in[0], &[_]c_int{ 1, 4099 }, 2, s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_softmax_axis(&o, r, -1, true, s));
+            return o;
+        }
+        fn where(s: S, in: []const A) !A {
+            var c: A = .{};
+            defer _ = mlx.mlx_array_free(c);
+            try mlx.check(mlx.mlx_less(&c, in[0], in[1], s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_where(&o, c, in[0], in[1], s));
+            return o;
+        }
+        fn sortv(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_sort_axis(&o, in[0], -1, s));
+            return o;
+        }
+        fn argsortv(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_argsort_axis(&o, in[0], -1, s));
+            return o;
+        }
+        fn cumsum(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_cumsum(&o, in[0], -1, false, true, s));
+            return o;
+        }
+    };
+    inline for (.{ .{ "exp", mlx.mlx_exp }, .{ "log", mlx.mlx_log }, .{ "abs", mlx.mlx_abs }, .{ "sigmoid", mlx.mlx_sigmoid }, .{ "sqrt", mlx.mlx_sqrt }, .{ "rsqrt", mlx.mlx_rsqrt }, .{ "square", mlx.mlx_square }, .{ "floor", mlx.mlx_floor }, .{ "negative", mlx.mlx_negative }, .{ "erf", mlx.mlx_erf } }) |p| {
+        try expectNamed("f32 " ++ p[0], build1(p[1]), &.{x});
+        try expectNamed("bf16 " ++ p[0], build1(p[1]), &.{x16});
+        try expectNamed("f16 " ++ p[0], build1(p[1]), &.{xh});
+    }
+    inline for (.{ .{ "add", mlx.mlx_add }, .{ "subtract", mlx.mlx_subtract }, .{ "multiply", mlx.mlx_multiply }, .{ "divide", mlx.mlx_divide }, .{ "maximum", mlx.mlx_maximum }, .{ "minimum", mlx.mlx_minimum }, .{ "less", mlx.mlx_less }, .{ "less_equal", mlx.mlx_less_equal }, .{ "greater", mlx.mlx_greater }, .{ "greater_equal", mlx.mlx_greater_equal }, .{ "equal", mlx.mlx_equal }, .{ "logaddexp", mlx.mlx_logaddexp }, .{ "floor_divide", mlx.mlx_floor_divide } }) |p| {
+        try expectNamed("f32 " ++ p[0], B.b2(p[1]), &.{ x, y });
+    }
+    try expectNamed("where", B.where, &.{ x, y });
+    inline for (.{ .{ "bf16", mlx.mlx_dtype.bfloat16 }, .{ "f16", mlx.mlx_dtype.float16 }, .{ "i32", mlx.mlx_dtype.int32 }, .{ "u32", mlx.mlx_dtype.uint32 }, .{ "bool", mlx.mlx_dtype.bool_ }, .{ "u8", mlx.mlx_dtype.uint8 }, .{ "i64", mlx.mlx_dtype.int64 } }) |p| {
+        try expectNamed("cast f32->" ++ p[0], B.cast(p[1]), &.{x});
+    }
+    try expectNamed("cast bf16->f32", B.cast(.float32), &.{x16});
+    try expectNamed("cast f16->f32", B.cast(.float32), &.{xh});
+    try expectNamed("cast bf16->f16", B.cast(.float16), &.{x16});
+    try expectNamed("sum", B.red(mlx.mlx_sum_axis, -1), &.{x});
+    try expectNamed("max", B.red(mlx.mlx_max_axis, -1), &.{x});
+    try expectNamed("argmax", B.red(mlx.mlx_argmax_axis, -1), &.{x});
+    try expectNamed("mean", B.red(mlx.mlx_mean_axis, -1), &.{x});
+    try expectNamed("softmax", B.softmax, &.{x});
+    try expectNamed("sort", B.sortv, &.{x});
+    try expectNamed("argsort", B.argsortv, &.{x});
+    try expectNamed("cumsum", B.cumsum, &.{x});
+    // Finite values only, where the ops are well defined.
+    var fa: [N]f32 = undefined;
+    for (&fa, xa) |*o, v| o.* = if (std.math.isFinite(v)) std.math.clamp(v, -80, 80) else 1.5;
+    const xf = hostArray(f32, &fa, &.{N}, .float32);
+    defer _ = mlx.mlx_array_free(xf);
+    try expectNamed("finite sum", B.red(mlx.mlx_sum_axis, -1), &.{xf});
+    try expectNamed("finite softmax", B.softmax, &.{xf});
+    try expectNamed("finite argmax", B.red(mlx.mlx_argmax_axis, -1), &.{xf});
+    try expectNamed("finite sort", B.sortv, &.{xf});
+    try expectNamed("finite argsort", B.argsortv, &.{xf});
+    try expectNamed("finite cumsum", B.cumsum, &.{xf});
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+}
+
+test "engine ops give MLX's bytes over a turned view, a strided slice, a slice of a slice, a broadcast and an empty view" {
+    try mlx.requireGpu();
+    const vals = ramp(f32, 6 * 7 * 37, 8, -4);
+    const x = hostArray(f32, &vals, &.{ 6, 7, 37 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    var idx_h: [6 * 7 * 5]i32 = undefined;
+    for (&idx_h, 0..) |*v, i| v.* = @as(i32, @intCast((i * 7) % 37)) - @as(i32, if (i % 3 == 0) 37 else 0);
+    const idx = hostArray(i32, &idx_h, &.{ 6, 7, 5 }, .int32);
+    defer _ = mlx.mlx_array_free(idx);
+    const B = struct {
+        fn tr(s: S, a: A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_transpose_axes(&o, a, &[_]c_int{ 2, 0, 1 }, 3, s));
+            return o;
+        }
+        fn sl(s: S, a: A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_slice(&o, a, &[_]c_int{ 1, 0, 3 }, 3, &[_]c_int{ 6, 7, 36 }, 3, &[_]c_int{ 2, 3, 2 }, 3, s));
+            return o;
+        }
+        fn slsl(s: S, a: A) !A {
+            const first = try sl(s, a);
+            defer _ = mlx.mlx_array_free(first);
+            var o: A = .{};
+            try mlx.check(mlx.mlx_slice(&o, first, &[_]c_int{ 1, 1, 1 }, 3, &[_]c_int{ 3, 3, 16 }, 3, &[_]c_int{ 1, 1, 3 }, 3, s));
+            return o;
+        }
+        fn bc(s: S, a: A) !A {
+            var row: A = .{};
+            defer _ = mlx.mlx_array_free(row);
+            try mlx.check(mlx.mlx_slice(&row, a, &[_]c_int{ 0, 2, 0 }, 3, &[_]c_int{ 1, 3, 37 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_broadcast_to(&o, row, &[_]c_int{ 4, 3, 37 }, 3, s));
+            return o;
+        }
+        fn empty(s: S, a: A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_slice(&o, a, &[_]c_int{ 0, 3, 0 }, 3, &[_]c_int{ 6, 3, 37 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            return o;
+        }
+        fn view(comptime v: anytype, comptime f: anytype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    const t = try v(s, in[0]);
+                    defer _ = mlx.mlx_array_free(t);
+                    return f(s, t, in);
+                }
+            }.build;
+        }
+        fn sum(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_sum_axis(&o, t, -1, false, s));
+            return o;
+        }
+        fn sum0(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_sum_axis(&o, t, 0, true, s));
+            return o;
+        }
+        fn maxm(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_max_axis(&o, t, 1, false, s));
+            return o;
+        }
+        fn amax(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_argmax_axis(&o, t, -1, false, s));
+            return o;
+        }
+        fn amax0(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_argmax_axis(&o, t, 0, false, s));
+            return o;
+        }
+        fn smax(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_softmax_axis(&o, t, -1, true, s));
+            return o;
+        }
+        fn smax1(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_softmax_axis(&o, t, 1, true, s));
+            return o;
+        }
+        fn sort(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_argsort_axis(&o, t, -1, s));
+            return o;
+        }
+        fn sort0(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_sort_axis(&o, t, 0, s));
+            return o;
+        }
+        fn cum(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_cumsum(&o, t, -1, true, false, s));
+            return o;
+        }
+        fn cum1(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_cumsum(&o, t, 1, false, true, s));
+            return o;
+        }
+        fn expf(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_exp(&o, t, s));
+            return o;
+        }
+        fn addself(s: S, t: A, in: []const A) !A {
+            _ = in;
+            var o: A = .{};
+            try mlx.check(mlx.mlx_add(&o, t, t, s));
+            return o;
+        }
+        fn reshape(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_reshape(&o, t, &[_]c_int{-1}, 1, s));
+            return o;
+        }
+        fn copy(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_copy(&o, t, s));
+            return o;
+        }
+        fn bf(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_astype(&o, t, .bfloat16, s));
+            return o;
+        }
+        fn cat(s: S, t: A, in: []const A) !A {
+            const parts = [_]A{ t, t };
+            _ = in;
+            const v = mlx.mlx_vector_array_new_data(&parts, 2);
+            defer _ = mlx.mlx_vector_array_free(v);
+            var o: A = .{};
+            try mlx.check(mlx.mlx_concatenate_axis(&o, v, -1, s));
+            return o;
+        }
+        fn mean(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_mean_axis(&o, t, -1, true, s));
+            return o;
+        }
+        fn pad(s: S, t: A, _: []const A) !A {
+            const v = mlx.mlx_array_new_float(-7);
+            defer _ = mlx.mlx_array_free(v);
+            var o: A = .{};
+            try mlx.check(mlx.mlx_pad(&o, t, &[_]c_int{ 0, 2 }, 2, &[_]c_int{ 1, 0 }, 2, &[_]c_int{ 2, 3 }, 2, v, "constant", s));
+            return o;
+        }
+        fn rep(s: S, t: A, _: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_repeat_axis(&o, t, 3, 1, s));
+            return o;
+        }
+        fn rms(s: S, t: A, _: []const A) !A {
+            var w: A = .{};
+            defer _ = mlx.mlx_array_free(w);
+            var row: A = .{};
+            defer _ = mlx.mlx_array_free(row);
+            const shp = mlx.getShape(t);
+            try mlx.check(mlx.mlx_slice(&row, t, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, 1, shp[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            try mlx.check(mlx.mlx_reshape(&w, row, &[_]c_int{shp[2]}, 1, s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_fast_rms_norm(&o, t, w, 1e-6, s));
+            return o;
+        }
+        fn mm(s: S, t: A, _: []const A) !A {
+            var tt: A = .{};
+            defer _ = mlx.mlx_array_free(tt);
+            try mlx.check(mlx.mlx_transpose_axes(&tt, t, &[_]c_int{ 0, 2, 1 }, 3, s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_matmul(&o, t, tt, s));
+            return o;
+        }
+    };
+    const views = .{ .{ "tr", B.tr }, .{ "slice", B.sl }, .{ "slice of slice", B.slsl }, .{ "broadcast", B.bc }, .{ "empty", B.empty } };
+    const opsl = .{ .{ "sum", B.sum }, .{ "sum0", B.sum0 }, .{ "max", B.maxm }, .{ "argmax", B.amax }, .{ "argmax0", B.amax0 }, .{ "softmax", B.smax }, .{ "softmax1", B.smax1 }, .{ "argsort", B.sort }, .{ "sort0", B.sort0 }, .{ "cumsum rev", B.cum }, .{ "cumsum1", B.cum1 }, .{ "exp", B.expf }, .{ "add", B.addself }, .{ "reshape", B.reshape }, .{ "copy", B.copy }, .{ "bf16", B.bf }, .{ "concat", B.cat }, .{ "mean", B.mean }, .{ "pad", B.pad }, .{ "repeat", B.rep }, .{ "rms", B.rms }, .{ "matmul", B.mm } };
+    named_failures = 0;
+    inline for (views) |v| inline for (opsl) |o| {
+        const name = v[0] ++ " -> " ++ o[0];
+        // MLX itself refuses these of an array with no elements, or faults: no reference to hold the engine to.
+        const no_reference = comptime blk: {
+            @setEvalBranchQuota(100_000);
+            for ([_][]const u8{ "pad", "matmul", "max", "argmax", "argmax0", "rms" }) |op| {
+                if (std.mem.eql(u8, name, "empty -> " ++ op)) break :blk true;
+            }
+            break :blk false;
+        };
+        // MLX's own sort along a broadcast axis gives the array's first element everywhere.
+        const mlx_is_wrong = comptime std.mem.eql(u8, name, "broadcast -> sort0");
+        if (!no_reference and !mlx_is_wrong) try expectNamed(name, B.view(v[1], o[1]), &.{x});
+    };
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+
+    // The engine's sort along a broadcast axis: every element along it is the same, so the rows as they were.
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    var rows: [2]A = .{ .{}, .{} };
+    defer for (rows) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    inline for (.{ B.sort0, B.copy }, &rows) |f, *out| {
+        const built = try B.view(B.bc, f)(core.stream(), &.{x});
+        defer _ = mlx.mlx_array_free(built);
+        try mlx.check(mlx.mlx_contiguous(out, built, false, core.stream()));
+        try mlx.check(mlx.mlx_array_eval(out.*));
+    }
+    const n = mlx.mlx_array_size(rows[0]) * mlx.mlx_array_itemsize(rows[0]);
+    try t_std.expectEqualSlices(u8, mlx.mlx_array_data_uint8(rows[1]).?[0..n], mlx.mlx_array_data_uint8(rows[0]).?[0..n]);
+}
+
+test "engine reduction over an axis of no elements into a result that has some is refused by name" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    var x: A = .{};
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ 6, 0, 37 }, 3, .float32, core.stream()));
+    var o: A = .{};
+    defer _ = mlx.mlx_array_free(o);
+    try t_std.expect(mlx.mlx_sum_axis(&o, x, 1, false, core.stream()) != 0);
+    var said: [256]u8 = undefined;
+    try t_std.expect(std.mem.indexOf(u8, mlx.takeError(&said) orelse "", "TensorUnsupported") != null);
 }

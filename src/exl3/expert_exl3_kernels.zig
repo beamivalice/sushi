@@ -1,5 +1,6 @@
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 const log = @import("mlx_host").log;
 const io_util = @import("mlx_host").io_util;
 const exl3 = @import("expert_exl3.zig");
@@ -1123,14 +1124,19 @@ pub fn gemmNaxOn() bool {
 
 /// Builds and proves the NAX GEMM kernel of `dec` and `order` now, on `s`, the stream the forwards run on: the proof
 /// is a launch like any other, so a load proves the kernel where it will run it.
-pub fn prepareGemmNax(dec: exl3.Decode, order: TileOrder, s: mlx.mlx_stream) void {
+/// On the host's own engine a kernel that cannot be proven is the load's error, with what the proof latched: every GPU
+/// that load runs on has the arm, so a failure there is a fault, never a reason to serve another arm's bytes. On MLX's
+/// stream the arm is declined, as a GPU without matrix units needs.
+pub fn prepareGemmNax(dec: exl3.Decode, order: TileOrder, s: mlx.mlx_stream) !void {
     if (!gemmNaxOn()) return;
     const had_error = mlx.errorPending();
-    defer mlx.dropLatchedErrorUnless(had_error);
     const previous = active_decode;
     defer active_decode = previous;
     active_decode = dec;
-    _ = getGemmNaxKernelFor(order, s) catch {};
+    _ = getGemmNaxKernelFor(order, s) catch |e| {
+        if (host_side.of(s) == 1) return e;
+        mlx.dropLatchedErrorUnless(had_error);
+    };
 }
 
 // Capability is independent of the dispatch failure latch: tests must still
@@ -1177,6 +1183,7 @@ fn getGemmNaxKernelFor(order: TileOrder, s: mlx.mlx_stream) !mlx.mlx_fast_metal_
                     buildNaxGemmKernel(GEMM_NAX_TM_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_tm" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
                 else
                     buildNaxGemmKernel(GEMM_NAX_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)) orelse {
+                    if (host_side.of(s) == 1) return error.MetalKernelCompileFailed;
                     gemm_nax_failed = true;
                     log.info("[exl3-gemm] NAX arm declined (kernel probe failed); the sorted GEMM serves prefill\n", .{});
                     return error.MetalKernelCompileFailed;
@@ -1207,7 +1214,8 @@ fn buildNaxGemmKernel(source: [:0]const u8, header: [:0]const u8, name: [*:0]con
 
 fn probeNaxGemm(kernel: mlx.mlx_fast_metal_kernel, s: mlx.mlx_stream) bool {
     const had_error = mlx.errorPending();
-    defer mlx.dropLatchedErrorUnless(had_error);
+    // On the host's own engine a failed proof is an error of its caller's, which reads what it latched.
+    defer if (host_side.of(s) != 1) mlx.dropLatchedErrorUnless(had_error);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const in_dim: c_int = 16;
@@ -1521,9 +1529,12 @@ pub fn innerGemmSortedTableOrdered(
                 gemm_nax_worked = true;
                 return nout;
             }
-            if (gemm_nax_worked) return error.Exl3GemmLaunchFailed;
+            // An arm that has served, or any launch on the host's own engine: a failure is an error, never a quiet
+            // move to another arm with other bytes.
+            if (gemm_nax_worked or host_side.of(s) == 1) return error.Exl3GemmLaunchFailed;
             gemm_nax_failed = true;
-        } else |_| {
+        } else |e| {
+            if (host_side.of(s) == 1) return e;
             gemm_nax_failed = true;
         }
         mlx.dropLatchedErrorUnless(had_error);

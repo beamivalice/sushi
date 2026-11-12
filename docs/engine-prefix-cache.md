@@ -546,7 +546,9 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - **Every file operation of the tier goes through `DiskTier.fs`** (`src/kv_disk_fs.zig`), on one of two backends:
   `cas` (the default), the content-addressed layer at `<root>/v/` (`prefix_vfs.zig`: packs, journal, snapshot), or
   `real`, the plain files `<root>/e<id>/...`. `SUSHI_PREFIX_FS=real|cas` picks one when the tier starts, until the
-  `real` arm goes; the `background writer armed (fs=...)` line names it.
+  `real` arm goes; the `background writer armed (fs=...)` line names it. The plain files pass through MLX arrays, so
+  a model whose arrays are the engine's (a Cooler load) gets no tier there: the load says so and runs as with
+  `--prefix-cache-disk off`.
 - **One call is one filesystem operation of the plain path, at the same point, by the same path.** A staged file is
   one writer op (same FIFO, permit, fence and `isPending`), made visible where the plain file's rename lands and no
   sooner than the plain write would land (`Writer.calibratePace` at arm). A file past the writer's part size goes as

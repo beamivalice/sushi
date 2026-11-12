@@ -46,24 +46,32 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     if (own_load) mlx.engine.hold();
     errdefer if (own_load) mlx.engine.unhold();
     const model_stream = if (own_load) mlx.engine.stream() else s;
+    // No cap of an earlier model's forward (a load that failed in its warm, a request that never ended) meets this load.
+    if (own_load) try mlx.engine.budget(std.math.maxInt(u64));
+    // The seal of an earlier load is lifted before this one makes its first pipeline, and stands again if this one fails.
+    // A load on MLX makes none: the engine's seal, pool and budget are not its to move.
+    const making: ?mlx.engine.Seal = if (own_load) mlx.engine.unsealed() else null;
+    errdefer if (making) |seal| seal.end();
     if (own_decode) {
         const dsv41 = &config.dsv41.?;
-        if (dsv41.expert_dec) |dec| expert_exl3_kernels.prepareGemmNax(dec, if (config.expert_tile_order == .pair_major) .tile_major else .pack, model_stream);
-        if (dsv41.trunk_dec) |dec| expert_exl3_kernels.prepareGemmNax(dec, .pack, model_stream);
+        if (dsv41.expert_dec) |dec| try expert_exl3_kernels.prepareGemmNax(dec, if (config.expert_tile_order == .pair_major) .tile_major else .pack, model_stream);
+        if (dsv41.trunk_dec) |dec| try expert_exl3_kernels.prepareGemmNax(dec, .pack, model_stream);
     }
-    mlx.engine.seal(false);
-    const engine = try Trunk.newExpertEngine(allocator, &config, model_stream);
-    errdefer {
-        engine.deinit();
-        allocator.destroy(engine);
-    }
+    // What this function makes is its own until the shell takes it, and the shell's from then on: one owner at a time.
+    var engine_mine: ?*expert_stream_mod.Engine = try Trunk.newExpertEngine(allocator, &config, model_stream);
+    errdefer if (engine_mine) |e| {
+        e.deinit();
+        allocator.destroy(e);
+    };
+    const engine = engine_mine.?;
     var plan = beginPipelines(allocator, &config, engine, own_decode);
     defer plan.deinit();
     // The load drops each tensor from the map once its arrays are bound.
     mlx.engine.own_weights = own_load;
     defer mlx.engine.own_weights = false;
-    const mdl = try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
-    errdefer mdl.deinit();
+    var mdl_mine: ?*dsv41_model.Model = try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
+    errdefer if (mdl_mine) |m| m.deinit();
+    const mdl = mdl_mine.?;
     dsv41_model.logMemory(mdl);
     mdl.engine_decode = own_decode;
     const side: dsv41_borrow.DecodeSide = if (own_decode) .engine else dsv41_borrow.decodeSideOf(&config.dsv41.?);
@@ -86,27 +94,30 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         mdl.profile.?.* = .init(verify_profile);
     }
     var shell = try initModuleShell(allocator, config, model_stream);
-    // Only the trunk half: `shell.arch_state` is filled last, so the model and engine have the errdefers above.
-    errdefer shell.deinitTrunk();
+    // The shell frees what it has been given: the experts' stream from its making, the model and the engine below.
+    errdefer {
+        shell.arch_state.dsv41.deinit(allocator);
+        shell.deinitTrunk();
+    }
     if (stq) {
         // CED runs the decoder over a chunk's last rows, so a prefill can take the decoder's pools for its working set.
         if (mdl.ced_split) |split| engine.borrow_from = @intCast(split);
         const experts = try allocator.create(dsv41_stream.StqStream);
-        errdefer allocator.destroy(experts);
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg };
-        mdl.experts = .{ .hook = experts.hook() };
         shell.arch_state.dsv41.stq_experts = experts;
+        mdl.experts = .{ .hook = experts.hook() };
         try startExpertPrefetch(engine, mdl, config.ssdPrefetchPct());
     } else {
         const experts = try allocator.create(dsv41_stream.Stream);
-        errdefer allocator.destroy(experts);
         experts.* = .{ .engine = engine, .cfg = &mdl.cfg, .act = mdl.act };
-        mdl.experts = .{ .hook = experts.hook() };
         shell.arch_state.dsv41.experts = experts;
+        mdl.experts = .{ .hook = experts.hook() };
         if (prefetchIgnoredLine(&config)) |line| log.info("{s}\n", .{line});
     }
     shell.arch_state.dsv41.model = mdl;
+    mdl_mine = null;
     shell.expert_stream = engine;
+    engine_mine = null;
     // A failed warm costs the first requests their compiles, not the load.
     var clock = expert_stream_mod.Clock.init();
     const had_error = mlx.errorPending();
@@ -125,10 +136,11 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const made = mlx.engine.pipelinesMade();
     const count_before = @import("dsv41_load.zig").takePipelinesBefore() orelse made_before.count;
     load_clock.warmDone(warm_t0, made.ns - made_before.ns + plan.made_ns, made.count - count_before + plan.made_count);
-    mlx.engine.seal(true);
     // The warm's transients leave the pool, so the load's memory reading is the model's.
-    if (!own_load) _ = mlx.mlx_clear_cache();
-    mlx.engine.trim();
+    if (own_load) {
+        mlx.engine.seal(true);
+        mlx.engine.trim();
+    } else _ = mlx.mlx_clear_cache();
     return shell;
 }
 
@@ -487,6 +499,8 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     const rows = mlx.getShape(ids);
     if (rows.len != 2 or rows[0] != 1) return error.InvalidDsv41Input;
     const n: usize = @intCast(rows[1]);
+    const armed = m.arm(if (n == 1) .step else .prefill);
+    defer armed.end();
     // Where decode runs on the engine every forward does, at a decode width or a prefill's, with image rows or without.
     // On MLX a one-row greedy decode reads its token while layer 0 runs (`extendLazy`).
     const decode_width = m.engine_decode and (n <= expert_exl3_kernels.DECODE_ROWS_MAX or m.engine_prefill);
@@ -517,8 +531,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
         ctx.cache.step = st.n;
         return mlx.mlx_array_new();
     }
-    m.defer_head = m.lazy_head and ctx.lazy_logits and n == 1;
-    defer m.defer_head = false;
+    armed.lazyHead(ctx.lazy_logits and n == 1);
     if (own) _ = dsv41_model.ownBegin(m);
     if (own) mlx.engine.phase(1);
     defer mlx.engine.phase(0);

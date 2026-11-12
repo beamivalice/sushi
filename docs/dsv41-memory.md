@@ -114,11 +114,20 @@ state's 890 B a token is 204 B; the cap carries 603 B (x 5/4).
 | decode or verify block | 9k / 225k / 1M | 0.55 / 0.71 / 1.33 | 0.28 / 0.44 / 1.06 |
 | image encode | any | unchanged: the bill already covered the measured peak by a quarter | |
 
-With decode on the engine of our own (an STQ pack on a GPU with matrix units, [engine-own-forward](engine-own-forward.md#memory)) the
-request bill carries the decode cap a second time, for the engine's pool: 0.28 / 0.44 / 1.06 GB more at 9k / 225k /
-1M tokens. The engine's forward makes on its own queue what MLX's made on MLX's, and each allocator is held to the
-cap separately. A prefill chunk on the engine splits its one cap between the two (`Config.forwardCapMlx` for the state rows
-MLX appends, the rest for the engine's pool), so the bill of a chunk is the one above.
+On a Cooler load (an STQ pack on a GPU with matrix units, [engine-own-forward](engine-own-forward.md#memory)) the request
+bill is the state and one forward's cap: the engine's pool is that cap (its free buffers are inside it), a prefill chunk
+gives its cap whole to the pool (the state rows it appends grow there too), and MLX allocates nothing, so MLX's parked
+decode pool (1 GiB on the MLX route) is not billed. The ledger's pool line of a Cooler load is what the engine parks
+between requests, about 0.26 GB (`arch_config.expertPoolBytes`, the arch's own answer for the config).
+- **The caps belong to a side** (`dsv41_borrow`): a request's end or a forward of a model on MLX moves MLX's caps
+  only, a Cooler model's the engine's budget only, so one model's request end never takes the other's room
+  (`after a model on MLX beside it served and ended a request, the Cooler's next request of any kind has the engine's room`).
+- **A restore reserves the rows' slack** (`Rows.reserve`): the first step after a restore from a point someone keeps
+  copied every layer's rows (1,441,792 bytes on the tiny fixture against 163,840 cold); it now takes 196,608 and does
+  not grow with the context.
+- **What does not scale with the rows sits in the cap's slack** (`cap_slack_bytes`, 256 MB): the router's zero pad of a
+  short tile (42 MB at the release's width, [dsv41-arch](dsv41-arch.md#prefill-width)) and the pool's whole pages. A wide
+  chunk fits its row term alone (`each forward's pool peak stays inside its cap, a wide chunk's inside the cap less its slack`).
 
 The live headroom the borrow reads (`dsv41Headroom`) is the ceiling less `gpu_mem.activeBytes`, which holds the
 engine's pool buffers bound to live tensors (the state rows, window rings and rollback record) beside MLX's active

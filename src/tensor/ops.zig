@@ -163,6 +163,7 @@ pub fn astype(t: *Tensor, dtype: Dtype) Error!*Tensor {
         v.dtype = dtype;
         return v;
     }
+    if (dtype == .bool_ and (t.dtype == .float32 or t.dtype == .bfloat16)) return elementwise("cast", "sushi_true(x)", &.{t}, dtype, t.dims());
     return elementwise("cast", "$O(x)", &.{t}, dtype, t.dims());
 }
 
@@ -210,9 +211,17 @@ const helpers =
     \\inline long sushi_flat(uint3 at, uint3 grid) {
     \\  return long(at.x) + long(grid.x) * (long(at.y) + long(grid.y) * long(at.z));
     \\}
+    \\// MLX's `cast_to<bool, T>` (mlx/backend/metal/kernels/utils.h): any bit under the sign, so a denormal is true.
+    \\inline bool sushi_true(float v) { return (as_type<uint>(v) & 0x7FFFFFFF) != 0; }
+    \\inline bool sushi_true(bfloat v) { return (as_type<ushort>(v) & 0x7FFF) != 0; }
     \\// MLX's Sigmoid, Maximum and Minimum (mlx/backend/metal/kernels/{unary,binary}_ops.h), statement for statement.
     \\template <typename T> T sushi_sigmoid(T x) {
     \\  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+    \\  return T((x < 0) ? y : 1 - y);
+    \\}
+    \\// On bfloat16 MLX's math functions work in float and round their result (kernels/bf16_math.h); the rest is bfloat's.
+    \\inline bfloat sushi_sigmoid(bfloat x) {
+    \\  bfloat y = 1 / (1 + bfloat(metal::precise::exp(metal::abs(float(x)))));
     \\  return (x < 0) ? y : 1 - y;
     \\}
     \\template <typename T> metal::enable_if_t<metal::is_integral_v<T>, T> sushi_maximum(T x, T y) { return metal::max(x, y); }
@@ -420,7 +429,7 @@ pub fn unary(comptime op: Unary, a: *Tensor) Error!*Tensor {
         .sqrt => "$O(metal::precise::sqrt(x))",
         .rsqrt => "$O(metal::precise::rsqrt(x))",
         .square => "x * x",
-        .floor => "floor(x)",
+        .floor => "$O(floor(x))",
         .negative => "-x",
     };
     return elementwise("un_" ++ @tagName(op), expr, &.{a}, a.dtype, a.dims());
@@ -445,6 +454,21 @@ pub const Reduce = enum { sum, max };
 pub fn reduce(comptime op: Reduce, t: *Tensor, axis_in: c_int, keepdims: bool) Error!*Tensor {
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
     if (axis >= t.ndim) return error.TensorShape;
+    if (t.size() == 0) {
+        // Nothing to reduce into nothing. Over an axis of no elements into a result that has some, MLX fills in the
+        // op's identity or refuses: not served.
+        var shape: [max_dims]c_int = undefined;
+        var n: usize = 0;
+        var holds: usize = 1;
+        for (t.dims(), 0..) |d, i| {
+            if (i != axis) holds *= @intCast(d);
+            if (i == axis and !keepdims) continue;
+            shape[n] = if (i == axis) 1 else d;
+            n += 1;
+        }
+        if (holds != 0) return error.TensorUnsupported;
+        return core.fresh(t.dtype, shape[0..n]);
+    }
     switch (t.dtype) {
         // A float reduction is MLX's kernel under MLX's plan: the order a sum is taken in is part of its bytes.
         .float16, .bfloat16, .float32 => {
@@ -501,8 +525,9 @@ pub fn reduce(comptime op: Reduce, t: *Tensor, axis_in: c_int, keepdims: bool) E
     p.constant(t.shape[axis], 6);
     core.dispatch(p, g.size, g.group);
     if (keepdims) return out;
-    defer core.release(out);
-    return squeeze(out, &.{@intCast(axis)});
+    const squeezed = try squeeze(out, &.{@intCast(axis)});
+    core.release(out);
+    return squeezed;
 }
 
 /// `base` with `update` written over the slice `start..stop` (step 1). The write waits until the result's bytes are
@@ -525,16 +550,18 @@ pub fn sliceUpdate(base: *Tensor, update: *Tensor, start: []const c_int, stop: [
 /// Writes `t`'s pending slice update.
 pub fn settle(t: *Tensor) Error!void {
     const p = t.pending orelse return;
+    // Off while the ops below read `t`; a write that fails leaves the update owed, for the next read to make.
     t.pending = null;
-    defer core.freePending(p);
+    errdefer t.pending = p;
     // Through a broadcast axis one write would land on every element that axis reads.
     const in_place = !t.repeats() and try core.sole(t.store);
     if (!in_place) core.adopt(t, try contiguousCopy(t));
-    core.countUpdate(in_place);
     var ones: [max_dims]c_int = @splat(1);
     const window = try slice(t, p.start[0..t.ndim], p.stop[0..t.ndim], ones[0..t.ndim]);
     defer core.release(window);
     try copyInto(window, p.update);
+    core.countUpdate(in_place);
+    core.freePending(p);
 }
 
 /// Writes `src` over the bytes `dst` views; the two have one shape.
@@ -587,6 +614,7 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
     }
     const out = try core.fresh(first.dtype, shape[0..first.ndim]);
     errdefer core.release(out);
+    if (out.size() == 0) return out;
     var start: [max_dims]c_int = @splat(0);
     var stop: [max_dims]c_int = shape;
     var ones: [max_dims]c_int = @splat(1);
@@ -916,6 +944,7 @@ pub fn argmax(t: *Tensor, axis_in: c_int, keepdims: bool) Error!*Tensor {
     if (axis >= t.ndim) return error.TensorShape;
     const out = try stock_reduce.argmax(t, axis);
     if (keepdims) return out;
-    defer core.release(out);
-    return squeeze(out, &.{@intCast(axis)});
+    const squeezed = try squeeze(out, &.{@intCast(axis)});
+    core.release(out);
+    return squeezed;
 }

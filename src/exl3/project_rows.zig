@@ -595,11 +595,15 @@ pub fn launchRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, s
     };
     const ov = try kernels.applyOuts(s, kernel, &.{ x, trellis, suh, svh }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
+    // One owner: the fold hands `y` out and leaves the defer an empty handle.
     var y = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(y);
-    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
-    if (fold) return y;
     defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+    if (fold) {
+        const whole = y;
+        y = mlx.mlx_array_new();
+        return whole;
+    }
     return rowsFinish(s, y, svh, l, g.nsplit, bounds, if (pin) |p| p.finish else null);
 }
 

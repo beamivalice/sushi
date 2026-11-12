@@ -5,3 +5,4 @@ undefined-nested-write src/qwen4/qwen4_forward.zig:qwen4_PLE_spec_capture_follow
 undefined-nested-write src/qwen4/qwen4_generate_test.zig:MTP_continuation_releases_its_owned_chain_when_drafting_fails mtpRoundContinue fails on the absent head after reading only gen.ctx.arch_ctx
 undefined-nested-write src/scheduler.zig:a_slot_the_batched_tick_hands_back_to_the_serial_path_counts_its_pending_pad_once serialFallback reads only gen.ctx.ssm_entries, through readyToBatch
 std-xxhash3 src/xxh3.zig:- the short inputs (240 bytes and under) and the tests' reference values
+scope-state src/dsv41/dsv41_pipelines.zig:init a test fixture's load, in a file that is not a test file: it turns the engine on for its tests' span

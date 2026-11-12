@@ -66,6 +66,9 @@ pub const Config = struct {
     n_targs: usize = 0,
     /// A mirror that could not hold what its MLX config was given: a launch through it is refused.
     partial: bool = false,
+    /// A mirror of MLX's config whose grid or thread group was set inside the engine's scope: MLX's own config is
+    /// given them when it next launches on MLX's side, not before.
+    behind: bool = false,
     /// The pipeline of the last launch, for a config that outlives its launch. The outputs and template values only
     /// change through `addOutput` and `addTemplate`, which clear it; a launch checks the kernel and the inputs.
     last: ?Last = null,

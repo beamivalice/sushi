@@ -30,7 +30,11 @@ Rules: [CLAUDE.md](../CLAUDE.md#team-process). Tests and tiers: [testsuite](test
 - Write and run **scratch tests**: at the bottom of a test file the bucket already runs, on the tiny fixtures, with
   the bucket's filter. A scratch test may print to stderr (never stdout); it is not held to the quiet-test rule.
 - Leave a one-line local change that proves a diagnosis, marked `// SCRATCH PROOF`.
-- Use the fault injector to reach error paths: `mlx.fault.arm(k)` fails the k-th checked MLX call.
+- Use the fault injectors to reach error paths: `mlx.fault.arm(k)` fails the k-th checked MLX call, and
+  `mlx.engine.fault.arm(k)` makes the engine's pool refuse its k-th buffer (`fault.count()` over a request is the
+  length of its sweep).
+- Use `mlx.engine.poison` to find a read of bytes nothing wrote: `byte` set, every buffer the pool hands out is
+  written over with it first, and `free(b)` writes it over the free ones. The clean bytes must come back.
 
 A hunter never commits, pushes, stashes or fixes product code, never loads a real pack, boots a server, binds a port
 or takes the GPU lock, and checks `QUIET` before every build. It works only in its own worktree.

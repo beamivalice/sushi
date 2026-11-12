@@ -4,6 +4,7 @@
 //! the served kernels' bytes at its own rate.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 const log = @import("mlx_host").log;
 const exl3 = @import("expert_exl3.zig");
 const codebook_tables = @import("codebook_tables.zig");
@@ -118,7 +119,7 @@ pub const Ragged = struct {
             self.suh[pi] = try concat(s, sv[0..banks.len]);
             self.svh[pi] = try concat(s, dv[0..banks.len]);
         }
-        self.meta = metaTable(s, meta.items);
+        self.meta = try metaTable(s, meta.items);
         var at: [3]c_int = @splat(0);
         for (banks, 0..) |bank, g| {
             var view: root.Bank = undefined;
@@ -185,7 +186,7 @@ pub const Ragged = struct {
             for (0..3) |pi| words[pi] += @as(u64, pool.slots) * tiles * pool.rates[pi] / 2;
             self.experts += pool.slots;
         }
-        self.meta = metaTable(s, meta.items);
+        self.meta = try metaTable(s, meta.items);
         try self.poolViews(s);
         return self;
     }
@@ -263,7 +264,7 @@ pub const Ragged = struct {
             self.suh[pi] = try concat(s, suh[pi][0..made]);
             self.svh[pi] = try concat(s, svh[pi][0..made]);
         }
-        self.meta = metaTable(s, meta.items);
+        self.meta = try metaTable(s, meta.items);
         for (self.views[0..self.view_count], 0..) |*view, p| {
             for (0..3) |pi| {
                 const dst = projPtr(view, pi);
@@ -379,7 +380,7 @@ fn projPtr(bank: *root.Bank, pi: usize) *root.Proj {
 
 fn concat(s: mlx.mlx_stream, parts: []const mlx.mlx_array) !mlx.mlx_array {
     // The vector is of the stream that joins it: MLX's would take each part of the engine's as a lend.
-    const scope = mlx.engine.enter(s);
+    const scope = host_side.enter(s);
     defer scope.end();
     const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
     defer _ = mlx.mlx_vector_array_free(vec);
@@ -694,10 +695,10 @@ fn decodeConfig(key: DecodeKey) !mlx.mlx_fast_metal_kernel_config {
 }
 
 /// A bank's meta words as an array on `s`: the engine's own when `s` is its stream.
-fn metaTable(s: mlx.mlx_stream, words: []const u32) mlx.mlx_array {
-    const scope = mlx.engine.enter(s);
+fn metaTable(s: mlx.mlx_stream, words: []const u32) !mlx.mlx_array {
+    const scope = host_side.enter(s);
     defer scope.end();
-    return mlx.mlx_array_new_data(words.ptr, &[_]c_int{@intCast(words.len)}, 1, .uint32);
+    return host_side.made(mlx.mlx_array_new_data(words.ptr, &[_]c_int{@intCast(words.len)}, 1, .uint32));
 }
 
 fn getOut(v: mlx.mlx_vector_array, i: usize) !mlx.mlx_array {
@@ -867,14 +868,16 @@ var fused_reduce_redo_kernel: ?mlx.mlx_fast_metal_kernel = null;
 /// Test and bench arm: which part's threadgroups the fused grid lists first.
 pub var fused_shared_first: bool = false;
 
-var zero_slot_rows: [kernels.DECODE_ROWS_MAX + 1]?mlx.mlx_array = @splat(null);
+/// One set for each side of the host: an array belongs to the side that made it.
+var zero_slot_rows: [2][kernels.DECODE_ROWS_MAX + 1]?mlx.mlx_array = @splat(@splat(null));
 
 /// The shared expert's slot ids: expert 0, once per row.
-fn zeroSlots(rows: usize) mlx.mlx_array {
-    if (zero_slot_rows[rows]) |a| return a;
+fn zeroSlots(rows: usize) !mlx.mlx_array {
+    const slot = &zero_slot_rows[host_side.making()][rows];
+    if (slot.*) |a| return a;
     const zeros: [kernels.DECODE_ROWS_MAX]u32 = @splat(0);
-    const a = mlx.mlx_array_new_data(&zeros, &[_]c_int{@intCast(rows)}, 1, .uint32);
-    zero_slot_rows[rows] = a;
+    const a = try host_side.made(mlx.mlx_array_new_data(&zeros, &[_]c_int{@intCast(rows)}, 1, .uint32));
+    slot.* = a;
     return a;
 }
 
@@ -1159,13 +1162,19 @@ const REDUCE_EXPAND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.met
 /// One for MLX's streams and one for the engine's: an array belongs to the side that made it.
 var unit_score: [2]?mlx.mlx_array = .{ null, null };
 
-fn unitScore(s: mlx.mlx_stream) mlx.mlx_array {
-    const side = &unit_score[@intFromBool(mlx.engine.isStream(s))];
+/// Frees side `side`'s scalar (`host_side.of`).
+pub fn dropUnitScore(side: u1) void {
+    if (unit_score[side]) |a| _ = mlx.mlx_array_free(a);
+    unit_score[side] = null;
+}
+
+fn unitScore(s: mlx.mlx_stream) !mlx.mlx_array {
+    const side = &unit_score[host_side.of(s)];
     if (side.*) |a| return a;
-    const scope = mlx.engine.enter(s);
+    const scope = host_side.enter(s);
     defer scope.end();
     const one: f32 = 1;
-    const a = mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .float32);
+    const a = try host_side.made(mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .float32));
     side.* = a;
     return a;
 }
@@ -1191,7 +1200,7 @@ fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots:
         fused_reduce_cfgs.put(key, c);
         break :blk c;
     };
-    const ins = [_]mlx.mlx_array{ down, rb.svh[2], slots, scores, sdown, se.bank.down.svh, unitScore(s) };
+    const ins = [_]mlx.mlx_array{ down, rb.svh[2], slots, scores, sdown, se.bank.down.svh, try unitScore(s) };
     if (expand) |e| {
         const kernel = try kernels.getNamedKernel(&fused_reduce_expand_kernel, "sushi_exl3_down_reduce_fused_expand", &.{ "inner", "svh", "slots", "sc", "s_inner", "s_svh", "unit", "x1", "post", "comb" }, &.{"y"}, REDUCE_EXPAND_SOURCE, "");
         const ov = try kernels.applyOuts(s, kernel, &(ins ++ [_]mlx.mlx_array{ e.x, e.post, e.comb }), cfg, 1);
@@ -1200,7 +1209,7 @@ fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots:
     }
     const ov = if (redo) |r| blk: {
         const kernel = try kernels.getNamedKernel(&fused_reduce_redo_kernel, "sushi_exl3_down_reduce_fused_shared_redo", &.{ "inner", "part", "redo", "svh", "slots", "sc", "s_inner", "s_svh", "unit" }, &.{"y"}, REDUCE_FUSED_REDO_SOURCE, "");
-        break :blk try kernels.applyOuts(s, kernel, &.{ down, r.part, r.at, rb.svh[2], slots, scores, sdown, se.bank.down.svh, unitScore(s) }, cfg, 1);
+        break :blk try kernels.applyOuts(s, kernel, &.{ down, r.part, r.at, rb.svh[2], slots, scores, sdown, se.bank.down.svh, try unitScore(s) }, cfg, 1);
     } else blk: {
         const kernel = try kernels.getNamedKernel(&fused_reduce_kernel, "sushi_exl3_down_reduce_fused_shared", &.{ "inner", "svh", "slots", "sc", "s_inner", "s_svh", "unit" }, &.{"y"}, REDUCE_FUSED_SOURCE, "");
         break :blk try kernels.applyOuts(s, kernel, &ins, cfg, 1);
@@ -1286,7 +1295,7 @@ pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: 
         .one_row = false,
         .b_first = fused_shared_first,
     };
-    const zeros = zeroSlots(@intCast(rows));
+    const zeros = try zeroSlots(@intCast(rows));
     const prep_ov = try applyStage(s, try stageFor(key), &.{ x, rb.suh[0], rb.suh[1], slots }, &.{ x, se.bank.gate.suh, se.bank.up.suh, zeros }, 3);
     defer _ = mlx.mlx_vector_array_free(prep_ov);
     const prep = try getOut(prep_ov, 0);
@@ -2320,7 +2329,7 @@ fn prefillReduce(s: mlx.mlx_stream, down: [DIRECT_PLANES]mlx.mlx_array, inverse:
         break :blk c;
     };
     const kernel = try kernels.getNamedKernel(&prefill_reduce_kernel, "sushi_exl3_prefill_reduce_fused_shared_planes", &REDUCE_PLANES_INS, &.{"y"}, PREFILL_REDUCE_PLANES_SOURCE, "");
-    const ov = try kernels.applyOuts(s, kernel, &(down ++ [_]mlx.mlx_array{ rb.svh[2], slots, scores, sdown, se.bank.down.svh, unitScore(s), inverse, rb.meta }), cfg, 1);
+    const ov = try kernels.applyOuts(s, kernel, &(down ++ [_]mlx.mlx_array{ rb.svh[2], slots, scores, sdown, se.bank.down.svh, try unitScore(s), inverse, rb.meta }), cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     return getOut(ov, 0);
 }

@@ -2402,6 +2402,8 @@ pub fn destroyAbandoned(head: ?*Slot) void {
     var next = head;
     while (next) |slot| {
         next = slot.abandoned_next;
+        const turn = arch_handle.turnFor(slot.model.handle, slot.model.config);
+        defer turn.end();
         slot.deinit();
     }
 }
@@ -2494,8 +2496,19 @@ const gpuWarmTickDue = sched_policy.gpuWarmTickDue;
 const gpuWarmParkNs = sched_policy.gpuWarmParkNs;
 const gpuWarmBeforePark = sched_policy.gpuWarmBeforePark;
 
-/// Inference thread only.
-const gpuWarmTick = mlx.gpuTouch;
+/// Inference thread only. Beside a load that holds the engine's scope, a model on MLX has its queue touched in a turn
+/// of MLX's; with none loaded MLX is asked nothing.
+fn gpuWarmTick(sch: *Scheduler) void {
+    var on_mlx = false;
+    if (mlx.engine.holding()) {
+        sch.registry.mutex.lockUncancelable(sch.io);
+        defer sch.registry.mutex.unlock(sch.io);
+        on_mlx = sch.registry.anyOnMlxLocked();
+    }
+    const turn = mlx.engine.turnTo(!on_mlx);
+    defer turn.end();
+    mlx.gpuTouch();
+}
 
 const TO_PREFILL_MAX = 16;
 
@@ -2626,6 +2639,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             if (sch.cleanup_queue.items.len == 0 and sch.prefix_clear_queue.items.len > 0) clear_req = sch.prefix_clear_queue.orderedRemove(0);
         }
         for (cleanup_batch[0..cleanup_n]) |s| {
+            const turn = arch_handle.turnFor(s.model.handle, s.model.config);
+            defer turn.end();
             // Decode-phase cancel: `complete()` pulled this slot straight
             // into the cleanup queue, so it never went through finishSlot
             // and its committed KV (prompt + every emitted token) would die
@@ -2662,7 +2677,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         }
         deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
         destroyAbandoned(abandoned);
-        for (orphan_vision[0..orphan_vision_n]) |ve| vision_queue.freeVisionArray(ve);
+        if (orphan_vision_n > 0) {
+            // An orphaned encode has no model left to turn to: an array of MLX's is freed in a turn of MLX's, and one
+            // of the engine's is freed by the engine on either side.
+            const turn = mlx.engine.turnTo(false);
+            defer turn.end();
+            for (orphan_vision[0..orphan_vision_n]) |ve| vision_queue.freeVisionArray(ve);
+        }
         for (vision_batch[0..vision_n]) |req| vision_queue.runVisionEncode(sch, req);
         if (load_req) |req| model_load.runLoadRequest(sch, req);
         if (unload_req) |req| model_load.runUnloadRequest(sch, req);
@@ -2701,7 +2722,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                         if (warm_ticks == 0) log.debug("[gpu-warm] keeping the GPU awake for {d} s\n", .{gpu_warm_secs});
                         warm_ticks += 1;
                         sch.queue_mu.unlock(sch.io);
-                        gpuWarmTick();
+                        gpuWarmTick(sch);
                         sch.queue_mu.lockUncancelable(sch.io);
                     }
                 } else {
@@ -3003,6 +3024,8 @@ const live_flush_idle_secs: u64 = 300;
 
 /// Writes the live restore points of one resident model that keeps any (DeepSeek). Inference thread.
 pub fn flushLiveState(entry: *model_registry_mod.LoadedModel, why: []const u8) void {
+    const turn = arch_handle.turnFor(entry.handle, entry.config);
+    defer turn.end();
     sched.flushResident(entry, why);
 }
 
@@ -3279,10 +3302,16 @@ pub fn publishDiskStats(sch: *Scheduler) void {
 fn deinitSlotsReturningPool(slots: []const *Slot) void {
     var returns_pool = false;
     for (slots) |s| {
-        if (s.model.config) |c| returns_pool = returns_pool or c.reservesKvCapacity();
+        const turn = arch_handle.turnFor(s.model.handle, s.model.config);
+        defer turn.end();
+        // A model on the engine's stream returns nothing to MLX's pool.
+        if (s.model.config) |c| returns_pool = returns_pool or (c.reservesKvCapacity() and !mlx.engine.active);
         s.deinit();
     }
-    if (returns_pool) _ = mlx.mlx_clear_cache();
+    if (!returns_pool) return;
+    const turn = mlx.engine.turnTo(false);
+    defer turn.end();
+    _ = mlx.mlx_clear_cache();
 }
 
 /// Allocate the slot's KVCache state (already done in Slot.init), construct
@@ -3563,6 +3592,8 @@ fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
 }
 
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+    const turn = arch_handle.turnFor(slot.model.handle, slot.model.config);
+    defer turn.end();
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
     // so the panel isn't blind until the first chunk lands; the chunk loop in
@@ -4107,11 +4138,12 @@ fn recordDrained(metrics: ?*metrics_mod.Metrics, drained: anytype, decoding: any
     publishLiveTokens(metrics, decoding);
 }
 
+fn slotOnEngine(s: *Slot) bool {
+    return arch_handle.onEngine(s.model.handle, s.model.config);
+}
+
 pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (active.len == 0) return;
-
-    const buffers = mlx.DecodeBuffers.begin();
-    defer buffers.end();
 
     // Publish the live-token gauge after the whole tick (all decode work + any finishSlot calls) on every
     // return path: O(active), never per token. Finished slots are excluded, so the last slot's completion
@@ -4124,6 +4156,17 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     for (active) |s| {
         if (s.legacy_gen) |*g| g.spec_cost_solo = active.len == 1;
     }
+
+    // A planner's round, a head detached and a group's forward are their model's work: each side's slots are a tick
+    // of their own, in that side's turn.
+    return arch_handle.perSide(*Slot, active, slotOnEngine, sch, runSideTick);
+}
+
+/// One tick of the slots of one side: models on MLX (`own` false), or on the engine's own stream.
+fn runSideTick(sch: *Scheduler, active: []*Slot, own: bool) anyerror!void {
+    // MLX's command buffers are a model on MLX's; the engine commits its own.
+    const buffers: ?mlx.DecodeBuffers = if (own) null else .begin();
+    defer if (buffers) |b| b.end();
 
     if (Planner.enabled()) {
         for (active) |slot| if (slot.legacy_gen) |*gen| {
@@ -4585,6 +4628,8 @@ pub fn capMtpRoundToThinkBound(gen: *Generator) void {
 }
 
 pub fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
+    const turn = arch_handle.turnFor(slot.model.handle, slot.model.config);
+    defer turn.end();
     var inner_err: ?anyerror = null;
     runSingleDecodeTickInner(sch, slot) catch |e| switch (e) {
         // A reasoning-protocol dead end is this request's failure; the tick
@@ -4845,6 +4890,8 @@ const prefill_plan = @import("prefill_plan.zig");
 const sampler = @import("sampler.zig");
 
 pub fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+    const turn = arch_handle.turnFor(active[0].model.handle, active[0].model.config);
+    defer turn.end();
     var inner_err: ?anyerror = null;
     runBatchedDecodeTickInner(sch, active) catch |e| {
         inner_err = e;

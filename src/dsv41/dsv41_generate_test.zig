@@ -1057,21 +1057,25 @@ fn lazyIdSteps(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, steps: us
     return run;
 }
 
-/// A lazy pass whose token the model refuses (an image id with no image rows) is dropped from the state it was queued on.
-fn droppedStartLeavesNothing(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, token: u32) !void {
+/// An image id the model emits has no image row behind it and is a plain token: read first or still on the GPU when
+/// layer 0 is queued, the forward gives the same bytes.
+fn emittedImageIdIsPlain(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, token: u32) !void {
     const m = dsv41_state.modelOf(xfm).?;
     const vocab = m.cfg.vocab;
+    const image_id = m.cfg.image_token_id;
+    m.cfg.image_token_id = token;
+    defer m.cfg.image_token_id = image_id;
     var logits: [2]std.ArrayList(f32) = @splat(.empty);
     defer for (&logits) |*l| l.deinit(a);
-    for (&logits, [_]bool{ false, true }) |*out, dropped| {
+    for (&logits, [_]bool{ false, true }) |*out, queued| {
         try xfm.resetCache();
         var ctx = xfm.defaultCtx();
         const first = try forwardIds(xfm, &ctx, prompt);
         _ = mlx.mlx_array_free(first);
-        if (dropped) {
-            const image_id = m.cfg.image_token_id;
-            m.cfg.image_token_id = token;
-            defer m.cfg.image_token_id = image_id;
+        const before = m.lazy_starts;
+        var lg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lg);
+        if (queued) {
             const base = [_]i32{ @intCast(token), 0 };
             const held = mlx.mlx_array_new_data(&base, &[_]c_int{ 1, 1 }, 2, .int32);
             defer _ = mlx.mlx_array_free(held);
@@ -1081,14 +1085,10 @@ fn droppedStartLeavesNothing(a: std.mem.Allocator, xfm: *Trunk, prompt: []const 
             defer _ = mlx.mlx_array_free(id);
             try mlx.check(mlx.mlx_add(&id, held, none_, xfm.s));
             ctx.lazy_logits = true;
-            const before = m.lazy_starts;
-            try testing.expectError(error.Dsv41VisionRowsMissing, xfm.forwardWith(&ctx, id));
-            try testing.expectEqual(before, m.lazy_starts);
-            try testing.expectEqual(prompt.len, ctx.cache.step);
-        }
-        ctx.lazy_logits = false;
-        const lg = try forwardIds(xfm, &ctx, &.{token});
-        defer _ = mlx.mlx_array_free(lg);
+            lg = try xfm.forwardWith(&ctx, id);
+        } else lg = try forwardIds(xfm, &ctx, &.{token});
+        try testing.expectEqual(before + @intFromBool(queued), m.lazy_starts);
+        try testing.expectEqual(prompt.len + 1, ctx.cache.step);
         try mlx.check(mlx.mlx_array_eval(lg));
         try out.appendSlice(a, (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..vocab]);
     }
@@ -1173,8 +1173,7 @@ fn lazyHeadProof(dir: []const u8, stq: bool, dspark: bool) !void {
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(held_back.logits.items), std.mem.sliceAsBytes(queued.logits.items));
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(queued.logits.items));
 
-    // A token the pass refuses leaves nothing of its layer 0 behind: the same token decodes to the same bytes after.
-    try droppedStartLeavesNothing(a, &xfm, prompt, want.tokens.items[0]);
+    try emittedImageIdIsPlain(a, &xfm, prompt, want.tokens.items[0]);
 
     // A request that reads the logits themselves keeps the evaluated head.
     const kept = m.heads_deferred;
@@ -1265,6 +1264,47 @@ fn dsparkRoundBytes(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, roun
         try dsv41_serving.dsv41FinishImpl(xfm, &ctx, accepted);
     }
     return out;
+}
+
+test "dsv41 engine: a serial step and a one-row round give one position the same logits, bit for bit, on both routes (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    for ([_]bool{ true, false }) |on_engine| {
+        if (on_engine and !mlx.engine.matrixUnits()) continue;
+        var fx: EngineFixture = undefined;
+        if (on_engine) try fx.open(dir) else try fx.openMlx(dir);
+        defer fx.deinit();
+        const vocab = fx.model().cfg.vocab;
+        var buf: [24]u32 = undefined;
+        const prompt = fx.prompt(&buf);
+        var bytes: [2][]u8 = undefined;
+        var made: usize = 0;
+        defer for (bytes[0..made]) |b| a.free(b);
+        for ([_]bool{ true, false }) |serial| {
+            try fx.xfm.resetCache();
+            var ctx = fx.xfm.defaultCtx();
+            const first = try forwardIds(&fx.xfm, &ctx, prompt);
+            const tok = try argmaxHost(&fx.xfm, first);
+            _ = mlx.mlx_array_free(first);
+            // Three positions: the token after the prompt and two after it, each fed the serial way or as a round of one.
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(a);
+            var next = tok;
+            for (0..3) |_| {
+                const logits = if (serial) try forwardIds(&fx.xfm, &ctx, &.{next}) else try dsv41_serving.dsv41VerifyImpl(&fx.xfm, &ctx, &.{next});
+                defer _ = mlx.mlx_array_free(logits);
+                try mlx.check(mlx.mlx_array_eval(logits));
+                const data = (mlx.mlx_array_data_float32(logits) orelse return error.NoLogits)[0..vocab];
+                try out.appendSlice(a, std.mem.sliceAsBytes(data));
+                next = @intCast(std.mem.indexOfMax(f32, data));
+                if (!serial) try dsv41_serving.dsv41FinishImpl(&fx.xfm, &ctx, 0);
+            }
+            bytes[made] = try out.toOwnedSlice(a);
+            made += 1;
+        }
+        try testing.expectEqualSlices(u8, bytes[0], bytes[1]);
+    }
 }
 
 test "dsv41 engine: a DSpark round on the engine gives MLX's draft, confidences and verify logits bit for bit at every width (DSV41_STQ_TINY)" {
@@ -1646,16 +1686,21 @@ test "dsv41 engine: a forward through the Trunk while a verify is open runs on t
 }
 
 /// What one phase of a request asked of MLX: every call into mlx-c, and the ops among them.
-const Asked = struct { calls: u64, ops: u64 };
+/// What a phase asked of MLX: calls into it, ops built on it, and settings asked of its allocator at rest, which
+/// reach nothing (`mlx.rest_swallows`).
+const Asked = struct { calls: u64, ops: u64, swallows: u64 = 0 };
 
 const Census = struct {
     calls: u64,
     ops: u64,
+    swallows: u64 = 0,
     names: std.ArrayList(mlx.NameCount) = .empty,
     stats: @TypeOf(mlx.engine.stats()) = undefined,
+    /// The engine's dispatches of the phase `end` closed.
+    dispatched: u64 = 0,
 
     fn begin() !Census {
-        var self: Census = .{ .calls = mlx.engine.mlxCalls(), .ops = mlx.engine.mlx_ops, .stats = mlx.engine.stats() };
+        var self: Census = .{ .calls = mlx.engine.mlxCalls(), .ops = mlx.engine.mlx_ops, .swallows = mlx.rest_swallows.load(.monotonic), .stats = mlx.engine.stats() };
         try mlx.callsByName(&self.names, testing.allocator);
         return self;
     }
@@ -1666,12 +1711,13 @@ const Census = struct {
             self.names.deinit(testing.allocator);
             self.names = .empty;
         }
-        const asked: Asked = .{ .calls = mlx.engine.mlxCalls() - self.calls, .ops = mlx.engine.mlx_ops - self.ops };
+        const asked: Asked = .{ .calls = mlx.engine.mlxCalls() - self.calls, .ops = mlx.engine.mlx_ops - self.ops, .swallows = mlx.rest_swallows.load(.monotonic) - self.swallows };
+        self.dispatched = mlx.engine.stats().dispatches - self.stats.dispatches;
         if (std.c.getenv("SUSHI_DSV41_CENSUS_TRACE") == null) return asked;
         var now: std.ArrayList(mlx.NameCount) = .empty;
         defer now.deinit(testing.allocator);
         try mlx.callsByName(&now, testing.allocator);
-        std.debug.print("[census] {s}: {d} calls, {d} ops\n", .{ phase, asked.calls, asked.ops });
+        std.debug.print("[census] {s}: {d} calls, {d} ops, {d} settings at rest\n", .{ phase, asked.calls, asked.ops, asked.swallows });
         const now_stats = mlx.engine.stats();
         std.debug.print("[census]   engine: {d} dispatches, {d} submits, imports {d}, lends {d}, appends in place {d}, copied {d}\n", .{ now_stats.dispatches - self.stats.dispatches, now_stats.submits - self.stats.submits, now_stats.imports - self.stats.imports, now_stats.lends - self.stats.lends, now_stats.updates_in_place - self.stats.updates_in_place, now_stats.updates_copied - self.stats.updates_copied });
         for (now.items) |n| {
@@ -1687,7 +1733,8 @@ const Census = struct {
 
 /// One load, the phases of a request, the unload: what each asked of MLX. With `own_weights` the engine wraps the
 /// pack's weights itself.
-fn censusOf(dir: []const u8) ![9]Asked {
+/// What each phase of a Cooler load's life asks of MLX, and the engine's dispatches of each in `work`.
+fn censusOf(dir: []const u8, work: *[9]u64) ![9]Asked {
     const a = testing.allocator;
     var asked: [9]Asked = undefined;
     var fx: EngineFixture = undefined;
@@ -1707,6 +1754,7 @@ fn censusOf(dir: []const u8) ![9]Asked {
     var open = true;
     defer if (open) fx.deinit();
     asked[8] = try c.end("the load");
+    work[8] = c.dispatched;
     const m = fx.model();
     var tok = Tokenizer.initEmptyForTests(a);
     defer tok.deinit();
@@ -1739,14 +1787,17 @@ fn censusOf(dir: []const u8) ![9]Asked {
     c = try Census.begin();
     try Request.run(&fx, &tok, prompt, greedy, .{ .dspark_enabled = true });
     asked[0] = try c.end("greedy rounds: a 40-row prefill and 12 tokens");
+    work[0] = c.dispatched;
 
     c = try Census.begin();
     try Request.run(&fx, &tok, prompt, seeded, .{ .dspark_enabled = true });
     asked[1] = try c.end("seeded rounds");
+    work[1] = c.dispatched;
 
     c = try Census.begin();
     try Request.run(&fx, &tok, prompt, greedy, .{ .skip_lazy_preforward = true, .logprobs_n = 3 });
     asked[2] = try c.end("serial steps with logprobs");
+    work[2] = c.dispatched;
 
     try fx.xfm.resetCache();
     var ctx = fx.xfm.defaultCtx();
@@ -1755,41 +1806,139 @@ fn censusOf(dir: []const u8) ![9]Asked {
     var cp = try dsv41_prefix.capture(a, m, prompt.len);
     defer cp.deinit(a);
     asked[3] = try c.end("a restore point captured");
+    work[3] = c.dispatched;
 
     try fx.xfm.resetCache();
     c = try Census.begin();
     try dsv41_prefix.restore(m, &cp, prompt);
     asked[4] = try c.end("the point restored");
+    work[4] = c.dispatched;
 
     ctx = fx.xfm.defaultCtx();
     ctx.cache.step = prompt.len;
     c = try Census.begin();
     _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, &.{prompt[3]}));
     asked[5] = try c.end("a step on the restored state");
+    work[5] = c.dispatched;
 
     c = try Census.begin();
     var bytes = try imagePromptBytes(a, &fx, image.rows, &.{ 8, 16, 40 }, 3);
     bytes.deinit(a);
     asked[6] = try c.end("an image prompt in three chunks and 3 steps");
+    work[6] = c.dispatched;
 
     image.drop();
     image_given = false;
+    // Configs other tests launched on MLX and this load's requests dropped are MLX's to free, in a turn of its own as
+    // a server gives it: the unload counted is the load's alone.
+    mlx.engine.turnTo(false).end();
+    try testing.expect(!mlx.owes());
     c = try Census.begin();
     open = false;
     fx.deinit();
     asked[7] = try c.end("the unload");
+    work[7] = c.dispatched;
 
     return asked;
 }
 
-test "dsv41 engine: a Cooler load, its requests and its unload ask nothing of MLX, phase by phase (DSV41_STQ_TINY)" {
+test "dsv41 engine: a Cooler load, its requests and its unload ask nothing of MLX, phase by phase, and dispatch the same work at a later load (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    const asked = try censusOf(dir);
+    var work: [2][9]u64 = undefined;
+    const asked = try censusOf(dir, &work[0]);
     // A Cooler load holds the engine's scope from its first tensor to its unload: nothing is asked of MLX, whose
     // allocator the census read before the load as a served process does at the end of its boot.
     for (asked) |got| try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, got);
+    // The engine's own work is the load's and the request's alone: a later load of the process dispatches the same.
+    _ = try censusOf(dir, &work[1]);
+    try testing.expectEqualSlices(u64, &work[0], &work[1]);
+}
+
+/// The SSD tier as the scheduler arms it for a Cooler load, on a 256-token grid.
+fn coolerTier(f: *EngineFixture, at: []const u8) !@import("../prefix_cache.zig").HotPrefixCache {
+    const kv_disk_cache = @import("../kv_disk_cache.zig");
+    var hc = @import("../prefix_cache.zig").HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+    errdefer hc.deinit();
+    hc.ssd_first = true;
+    hc.hybrid = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, testing.io, at, "dsv41-census", 0, 128);
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+    hc.disk.?.enableBackgroundWriter();
+    const c = &f.config.dsv41.?;
+    const divs = try dsv41_prefix.rowDivisors(testing.allocator, c, true);
+    defer testing.allocator.free(divs);
+    hc.disk.?.ssm_max_per_entry = dsv41_prefix.disk_checkpoint_cap;
+    try hc.disk.?.setGrownSpec(256, divs, c.stateBytesPerToken());
+    hc.arrays_on = dsv41_prefix.arraysOn(&f.config);
+    hc.disk.?.arrays_on = hc.arrays_on;
+    return hc;
+}
+
+test "dsv41 engine: a write-through or a restore that fails and is handled leaves no error latched for the next request (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    defer mlx.engine.fault.disarm();
+    const m = fx.model();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var buf: [600]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    const point = 512;
+    var hc = try coolerTier(&fx, base);
+    defer hc.deinit();
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..point]));
+    ctx.cache.step = point;
+    // The write-through's rows are refused: it says so in the log and the request goes on.
+    {
+        var cps = [1]trunk_mod.SSMCheckpoint{(try dsv41_prefix.captureCheckpoint(a, &fx.xfm, point, true)).?};
+        defer cps[0].deinit(a);
+        mlx.engine.fault.arm(1);
+        dsv41_prefix.writeThroughDsv41(&hc, m, ctx.cache, prompt[0..point], false, .{}, &cps, "prefill");
+        mlx.engine.fault.disarm();
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        try testing.expect(!mlx.errorPending());
+    }
+    // A point on SSD, then restores that are refused at one buffer after another: each falls back or serves, none
+    // leaves the latch set, and none costs the entry (a refusal for memory says nothing of its files).
+    {
+        const cps = try a.alloc(trunk_mod.SSMCheckpoint, 1);
+        cps[0] = (try dsv41_prefix.captureCheckpoint(a, &fx.xfm, point, true)).?;
+        dsv41_prefix.writeThroughDsv41(&hc, m, ctx.cache, prompt[0..point], false, .{}, cps, "prefill");
+        try dsv41_prefix.markRows(ctx.cache, @import("dsv41_model.zig").stateStream(m));
+        _ = try hc.commitWithState(ctx.cache, prompt[0..point], false, 0, cps, null, null);
+        hc.flushPendingDisk(fx.xfm.s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+    for (0..24) |k| {
+        try fx.xfm.resetCache();
+        const cold = fx.xfm.defaultCtx();
+        var moe: usize = 0;
+        // The last pass is refused nothing: the point still serves after every failure before it.
+        mlx.engine.fault.arm(if (k == 23) 0 else k + 1);
+        const res = dsv41_prefix.lookupAndRestoreDsv41(&hc, cold.cache, &moe, m, fx.xfm.s, prompt, false, 0, null, &.{}, null, false);
+        mlx.engine.fault.disarm();
+        const got = res catch {
+            var msg: [300]u8 = undefined;
+            _ = mlx.takeError(&msg);
+            continue;
+        };
+        try testing.expect(!mlx.errorPending());
+        if (k == 23) try testing.expectEqual(@as(usize, point), got.matched);
+    }
 }
 
 test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and restores it, byte for byte, with nothing asked of MLX (DSV41_STQ_TINY)" {
@@ -1798,8 +1947,6 @@ test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and res
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = testing.io;
-    const pc = @import("../prefix_cache.zig");
-    const kv_disk_cache = @import("../kv_disk_cache.zig");
     var fx: EngineFixture = undefined;
     try fx.open(dir);
     defer fx.deinit();
@@ -1812,34 +1959,13 @@ test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and res
     const prompt = fx.prompt(&buf);
     const point = 512;
 
-    // The tier as the scheduler arms it, on a grid the point is on.
-    const Tier = struct {
-        fn open(f: *EngineFixture, at: []const u8) !pc.HotPrefixCache {
-            var hc = pc.HotPrefixCache.initWithMem(testing.allocator, 0, 0);
-            errdefer hc.deinit();
-            hc.ssd_first = true;
-            hc.hybrid = true;
-            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, testing.io, at, "dsv41-census", 0, 128);
-            hc.disk.?.ssd_first = true;
-            hc.disk.?.armTestSpace(256 << 30, 1 << 40);
-            hc.disk.?.enableBackgroundWriter();
-            const c = &f.config.dsv41.?;
-            const divs = try dsv41_prefix.rowDivisors(testing.allocator, c, true);
-            defer testing.allocator.free(divs);
-            hc.disk.?.ssm_max_per_entry = dsv41_prefix.disk_checkpoint_cap;
-            try hc.disk.?.setGrownSpec(256, divs, c.stateBytesPerToken());
-            hc.arrays_on = dsv41_prefix.arraysOn(&f.config);
-            hc.disk.?.arrays_on = hc.arrays_on;
-            return hc;
-        }
-    };
     var asked: [2]Asked = undefined;
     // The state at the point as an owned copy, for the bytes the restore must give back.
     var want: trunk_mod.SSMCheckpoint = undefined;
     var wanted = false;
     defer if (wanted) want.deinit(a);
     {
-        var hc = try Tier.open(&fx, base);
+        var hc = try coolerTier(&fx, base);
         defer hc.deinit();
         try fx.xfm.resetCache();
         var ctx = fx.xfm.defaultCtx();
@@ -1862,7 +1988,7 @@ test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and res
         try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
     }
     {
-        var hc = try Tier.open(&fx, base);
+        var hc = try coolerTier(&fx, base);
         defer hc.deinit();
         try fx.xfm.resetCache();
         const ctx = fx.xfm.defaultCtx();
@@ -1937,6 +2063,535 @@ test "dsv41 engine: a Cooler load holds the engine's scope from its load to its 
     try on_mlx.openMlx(dir);
     defer on_mlx.deinit();
     try testing.expect(!mlx.engine.active and !mlx.engine.isStream(on_mlx.xfm.s));
+}
+
+test "dsv41 engine: beside a resident Cooler model, a model on MLX loads, runs and unloads inside its own turn, and the Cooler's hold is as it was after (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var cooler: EngineFixture = undefined;
+    try cooler.open(dir);
+    defer cooler.deinit();
+    var buf: [24]u32 = undefined;
+    const ids = cooler.prompt(&buf);
+    const a = testing.allocator;
+    // The caps as `serve` installs them, so each model's hooks move what is theirs.
+    const ram_cap = dsv41_borrow.pool_ram_cap;
+    dsv41_borrow.pool_ram_cap = 8 << 30;
+    defer {
+        dsv41_borrow.pool_ram_cap = ram_cap;
+        mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    }
+    {
+        // A request of the Cooler's first: its pool holds free buffers the other model's hooks must leave alone.
+        var first = try shortPrefillBytes(a, &cooler.xfm, ids, 16, 8, 2);
+        first.deinit(a);
+        dsv41_borrow.endRequestMlx(&cooler.config);
+    }
+    const free_before = mlx.engine.poolFree();
+    try testing.expect(free_before > 0);
+    var want: [2]std.ArrayList(u8) = .{ .empty, .empty };
+    defer for (&want) |*w| w.deinit(a);
+    for (&want) |*w| {
+        // The scheduler turns to the other model for each of its jobs: its load, its requests, its unload.
+        const turn = mlx.engine.turnTo(false);
+        defer turn.end();
+        try testing.expect(!mlx.engine.active);
+        var on_mlx: EngineFixture = undefined;
+        try on_mlx.openMlx(dir);
+        defer on_mlx.deinit();
+        try testing.expect(!mlx.engine.isStream(on_mlx.xfm.s));
+        // MLX's allocator answers for itself while its model works: a model's weights are in it.
+        var held_by_mlx: usize = 0;
+        try mlx.check(mlx.mlx_get_active_memory(&held_by_mlx));
+        try testing.expect(held_by_mlx > 0);
+        w.* = try shortPrefillBytes(a, &on_mlx.xfm, ids, 16, 8, 2);
+        dsv41_borrow.endRequestMlx(&on_mlx.config);
+        dsv41_borrow.unloadModelMlx(&on_mlx.config);
+    }
+    try testing.expectEqualSlices(u8, want[0].items, want[1].items);
+    // Back in the Cooler's turn: its scope holds, its pool is as it left it, and its forward asks MLX nothing.
+    try testing.expect(mlx.engine.active and mlx.engine.holding());
+    try testing.expect(mlx.engine.poolFree() >= free_before);
+    const turn = mlx.engine.turnTo(true);
+    defer turn.end();
+    var census = try Census.begin();
+    errdefer census.names.deinit(a);
+    var got = try shortPrefillBytes(a, &cooler.xfm, ids, 16, 8, 2);
+    defer got.deinit(a);
+    try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, try census.end("the Cooler's forwards after another model's turn"));
+}
+
+test "dsv41 engine: a Cooler load beside a model on MLX leaves MLX a wired limit less the mappings the engine wraps, from that model's next turn (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const max_rec = mlx.maxRecommendedWorkingSet();
+    if (max_rec == 0) return error.SkipZigTest;
+    var on_mlx: EngineFixture = undefined;
+    try on_mlx.openMlx(dir);
+    defer on_mlx.deinit();
+    var orig: usize = 0;
+    try mlx.check(mlx.mlx_set_wired_limit(&orig, 0));
+    try mlx.check(mlx.mlx_set_wired_limit(&orig, orig));
+    defer {
+        const t = mlx.engine.turnTo(false);
+        var unused: usize = 0;
+        _ = mlx.mlx_set_wired_limit(&unused, orig);
+        t.end();
+    }
+    // The policy as the load job of the model on MLX applies it.
+    const alone = mlx.applyWiredPolicy() orelse return error.SkipZigTest;
+    var cooler: EngineFixture = undefined;
+    try cooler.open(dir);
+    defer cooler.deinit();
+    // The Cooler's load job applies it under its hold: nothing is set now.
+    try testing.expectEqual(@as(?usize, null), mlx.applyWiredPolicy());
+    const mapped: usize = @intCast(mlx.engine.mappedTotal());
+    try testing.expect(mapped > 0);
+    var now: usize = 0;
+    {
+        const t = mlx.engine.turnTo(false);
+        defer t.end();
+        // Read by setting it: the call hands back the limit it replaces, which then goes back.
+        try mlx.check(mlx.mlx_set_wired_limit(&now, alone));
+        var unused: usize = 0;
+        try mlx.check(mlx.mlx_set_wired_limit(&unused, now));
+    }
+    try testing.expectEqual(max_rec - mapped, now);
+}
+
+/// A load or an unload as the scheduler runs it (`model_load.JobTurn`).
+const LoadJob = struct {
+    turn: mlx.engine.Turn,
+    own: bool,
+
+    fn begin(own: bool) LoadJob {
+        const t = mlx.engine.turnTo(own);
+        if (own) mlx.engine.hold();
+        return .{ .turn = t, .own = own };
+    }
+
+    fn end(self: LoadJob) void {
+        if (self.own) mlx.engine.unhold();
+        self.turn.end();
+    }
+};
+
+test "dsv41 engine: a Cooler model and a model on MLX loaded beside it each serve their own bytes, the Cooler asks MLX nothing, and its unload first leaves the other serving (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    // The two fixtures below close in the order they opened, so each would put back what the other had set.
+    const was_own = dsv41_borrow.own_override;
+    defer dsv41_borrow.own_override = was_own;
+    defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    var buf: [24]u32 = undefined;
+    // The server's unload hook runs on a config that outlives the model.
+    var kept = try model_mod.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, dir);
+    defer kept.deinit(a);
+    var want_mlx: std.ArrayList(u8) = .empty;
+    defer want_mlx.deinit(a);
+    var want_own: std.ArrayList(u8) = .empty;
+    defer want_own.deinit(a);
+    {
+        var fx: EngineFixture = undefined;
+        try fx.openMlx(dir);
+        defer fx.deinit();
+        want_mlx = try shortPrefillBytes(a, &fx.xfm, fx.prompt(&buf), 16, 8, 2);
+    }
+    {
+        var fx: EngineFixture = undefined;
+        try fx.open(dir);
+        defer fx.deinit();
+        want_own = try shortPrefillBytes(a, &fx.xfm, fx.prompt(&buf), 16, 8, 2);
+    }
+    for (0..2) |_| {
+        var cooler: EngineFixture = undefined;
+        {
+            const job = LoadJob.begin(true);
+            defer job.end();
+            try cooler.open(dir);
+        }
+        var on_mlx: EngineFixture = undefined;
+        {
+            const job = LoadJob.begin(false);
+            defer job.end();
+            try on_mlx.openMlx(dir);
+        }
+        {
+            const turn = mlx.engine.turnTo(false);
+            defer turn.end();
+            var got = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&buf), 16, 8, 2);
+            defer got.deinit(a);
+            try testing.expectEqualSlices(u8, want_mlx.items, got.items);
+        }
+        {
+            // The configs the other model launched are in the caches both share: the Cooler's request drops some.
+            const turn = mlx.engine.turnTo(true);
+            defer turn.end();
+            var census = try Census.begin();
+            errdefer census.names.deinit(a);
+            var got = try shortPrefillBytes(a, &cooler.xfm, cooler.prompt(&buf), 16, 8, 2);
+            defer got.deinit(a);
+            try testing.expectEqualSlices(u8, want_own.items, got.items);
+            try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, try census.end("the Cooler's request beside a model on MLX"));
+        }
+        {
+            const job = LoadJob.begin(true);
+            defer job.end();
+            cooler.deinit();
+            dsv41_borrow.unloadModelMlx(&kept);
+        }
+        try testing.expect(!mlx.engine.holding() and !mlx.engine.active and !mlx.engine.mlx_at_rest.on.load(.acquire));
+        {
+            var got = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&buf), 16, 8, 2);
+            defer got.deinit(a);
+            try testing.expectEqualSlices(u8, want_mlx.items, got.items);
+        }
+        const job = LoadJob.begin(false);
+        defer job.end();
+        dsv41_borrow.unloadModelMlx(&on_mlx.config);
+        on_mlx.deinit();
+    }
+}
+
+test "dsv41 engine: each row of a verify, at every width the model accepts, is the bits of the serial step at its position, on either route, an image id the model emitted among them or not (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const widest: usize = @import("dsv41_dspark.zig").dsv41_max_verify_rows;
+    for ([_][2]bool{ .{ true, false }, .{ true, true }, .{ false, false }, .{ false, true } }) |arm| {
+        const on_engine, const emits_image_id = arm;
+        var fx: EngineFixture = undefined;
+        if (on_engine) try fx.open(dir) else try fx.openMlx(dir);
+        defer fx.deinit();
+        const vocab = fx.model().cfg.vocab;
+        var buf: [48]u32 = undefined;
+        const ids = fx.prompt(&buf);
+        const lead = 20;
+        // No image rows stand behind an id the model emits: it is a plain token to the step and to the verify.
+        if (emits_image_id) fx.model().cfg.image_token_id = ids[lead + 2];
+        try fx.xfm.resetCache();
+        var ctx = fx.xfm.defaultCtx();
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[0..lead]));
+        const serial = try a.alloc(f32, widest * vocab);
+        defer a.free(serial);
+        for (0..widest) |j| {
+            const lg = try forwardIds(&fx.xfm, &ctx, ids[lead + j ..][0..1]);
+            defer _ = mlx.mlx_array_free(lg);
+            try mlx.check(mlx.mlx_array_eval(lg));
+            @memcpy(serial[j * vocab ..][0..vocab], (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..vocab]);
+        }
+        for (1..widest + 1) |w| {
+            try fx.xfm.resetCache();
+            ctx = fx.xfm.defaultCtx();
+            _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[0..lead]));
+            const lg = try dsv41_serving.dsv41VerifyImpl(&fx.xfm, &ctx, ids[lead..][0..w]);
+            defer _ = mlx.mlx_array_free(lg);
+            try mlx.check(mlx.mlx_array_eval(lg));
+            const rows = (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0 .. w * vocab];
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial[0 .. w * vocab]), std.mem.sliceAsBytes(rows));
+            try dsv41_serving.dsv41FinishImpl(&fx.xfm, &ctx, w - 1);
+        }
+    }
+}
+
+test "dsv41 engine: a prompt's tokens and the logits after them do not depend on the width its prefill was cut at (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    // Wider than a decode-width pass, as the release's window is.
+    m.cfg.window = 20;
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var prompt: [600]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = fx.ids[(i * 5 + 3) % fx.ids.len];
+    const saved_chunk = settings_resolve.prefill_chunk.value;
+    defer settings_resolve.prefill_chunk.value = saved_chunk;
+    var want_tokens: std.ArrayList(u32) = .empty;
+    defer want_tokens.deinit(a);
+    var want_logits: std.ArrayList(f32) = .empty;
+    defer want_logits.deinit(a);
+    // One chunk, the widths either side of the dense product's kernel switch at this fixture's shapes (128 rows), and
+    // narrower ones. Not under 33: this fixture has two heads, which the one-pass attention kernel does not take, so its
+    // attention is the op chain, whose own dense products change kernel with the keys a narrow span holds. The release's
+    // kernel is proven cut by cut (`dsv41 fused attention: a row's heads are the same bits in one span and in any two`).
+    for ([_]usize{ 1024, 256, 129, 128, 127, 100, 64, 40, 33 }, 0..) |width, run| {
+        settings_resolve.prefill_chunk.value = width;
+        try fx.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, &prompt, 8, .{ .temperature = 0.0 }, &.{}, .{
+            .skip_lazy_preforward = true,
+            .pinned_prefill_chunk = width,
+            .adaptive_chunk_width = false,
+            .skip_unread_tails = true,
+        });
+        defer gen.deinit(a);
+        var tokens: std.ArrayList(u32) = .empty;
+        defer tokens.deinit(a);
+        try tokens.append(a, gen.next_token_id);
+        while (try gen.next(a)) |t| try tokens.append(a, t);
+        const lg = try forwardIds(&fx.xfm, &gen.ctx, &.{prompt[0]});
+        defer _ = mlx.mlx_array_free(lg);
+        try mlx.check(mlx.mlx_array_eval(lg));
+        const logits = (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..m.cfg.vocab];
+        if (run == 0) {
+            try want_tokens.appendSlice(a, tokens.items);
+            try want_logits.appendSlice(a, logits);
+            continue;
+        }
+        errdefer std.debug.print("a prefill cut at {d} rows gives other bytes than one chunk\n", .{width});
+        try testing.expectEqualSlices(u32, want_tokens.items, tokens.items);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want_logits.items), std.mem.sliceAsBytes(logits));
+    }
+}
+
+test "dsv41 engine: a Cooler pack loads again after its unload in the same process (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    // The engine outlives both loads, as it does in a server.
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    var kept = try model_mod.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, dir);
+    defer kept.deinit(a);
+    for (0..2) |_| {
+        var fx: EngineFixture = undefined;
+        try fx.open(dir);
+        // The server's order: the model goes, then the arch's unload hook runs on its config.
+        fx.deinit();
+        dsv41_borrow.unloadModelMlx(&kept);
+        try testing.expect(!mlx.engine.holding());
+    }
+}
+
+test "dsv41 engine: a Cooler load whose warm does not fit its bill fails by name, frees what it made once, and the next load serves (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    var kept = try model_mod.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, dir);
+    defer kept.deinit(a);
+    var want: [2]std.ArrayList(u32) = @splat(.empty);
+    defer for (&want) |*w| w.deinit(a);
+    for (&want, [_]bool{ false, true }) |*ids, after_failure| {
+        if (after_failure) {
+            dsv41_borrow.warm_budget_override = 0;
+            var failed: EngineFixture = undefined;
+            const got = failed.open(dir);
+            dsv41_borrow.warm_budget_override = null;
+            try testing.expectError(error.PoolOverBudget, got);
+            dsv41_borrow.unloadModelMlx(&kept);
+            try testing.expect(!mlx.engine.holding());
+            try testing.expect(!mlx.engine.active);
+            try testing.expect(!mlx.errorPending());
+        }
+        var fx: EngineFixture = undefined;
+        try fx.open(dir);
+        var tok = Tokenizer.initEmptyForTests(a);
+        defer tok.deinit();
+        var buf: [24]u32 = undefined;
+        var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, &fx.xfm, &tok, fx.prompt(&buf), 8, .{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
+        try ids.append(a, gen.next_token_id);
+        while (try gen.next(a)) |t| try ids.append(a, t);
+        gen.deinit(a);
+        fx.deinit();
+        dsv41_borrow.unloadModelMlx(&kept);
+    }
+    try testing.expectEqualSlices(u32, want[0].items, want[1].items);
+}
+
+test "dsv41 engine: a Cooler load that fails beside a resident Cooler model leaves that model's scope and seal as they were (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    try testing.expect(mlx.engine.sealed());
+    dsv41_borrow.warm_budget_override = 0;
+    var failed: EngineFixture = undefined;
+    const got = failed.open(dir);
+    dsv41_borrow.warm_budget_override = null;
+    try testing.expectError(error.PoolOverBudget, got);
+    try testing.expect(mlx.engine.holding());
+    try testing.expect(mlx.engine.sealed());
+}
+
+/// A prefill, a verify of three rows, its finish, a draft and a serial step, as the bytes of their logits and ids.
+fn shortRequest(a: std.mem.Allocator, fx: *EngineFixture, ids: []const u32) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    const vocab = fx.model().cfg.vocab;
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[0..20]));
+    const v = try dsv41_serving.dsv41VerifyImpl(&fx.xfm, &ctx, ids[20..23]);
+    defer _ = mlx.mlx_array_free(v);
+    try mlx.check(mlx.mlx_array_eval(v));
+    try out.appendSlice(a, std.mem.sliceAsBytes((mlx.mlx_array_data_float32(v) orelse return error.NoLogits)[0 .. 3 * vocab]));
+    try dsv41_serving.dsv41FinishImpl(&fx.xfm, &ctx, 1);
+    var d = try dsv41_serving.dsv41DraftImpl(&fx.xfm, ids[21]);
+    defer d.deinit();
+    try out.appendSlice(a, std.mem.sliceAsBytes(d.ids));
+    const lg = try forwardIds(&fx.xfm, &ctx, ids[22..23]);
+    defer _ = mlx.mlx_array_free(lg);
+    try mlx.check(mlx.mlx_array_eval(lg));
+    try out.appendSlice(a, std.mem.sliceAsBytes((mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..vocab]));
+    return out;
+}
+
+test "dsv41 engine: a request refused at any one of its pool buffers leaves the next request its clean bytes (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    defer mlx.engine.fault.disarm();
+    var buf: [80]u32 = undefined;
+    const ids = fx.prompt(&buf);
+    var want = try shortRequest(a, &fx, ids);
+    defer want.deinit(a);
+    const before = mlx.engine.fault.count();
+    var once = try shortRequest(a, &fx, ids);
+    once.deinit(a);
+    const total = mlx.engine.fault.count() - before;
+    try testing.expect(total > 500);
+    // Every 7th buffer, from each of seven starts over the bucket's runs: a refusal at one costs two requests.
+    var msg: [300]u8 = undefined;
+    var k: u64 = 1 + before % 7;
+    while (k <= total) : (k += 7) {
+        mlx.engine.fault.arm(k);
+        if (shortRequest(a, &fx, ids)) |ran| {
+            var r = ran;
+            r.deinit(a);
+        } else |_| {}
+        mlx.engine.fault.disarm();
+        _ = mlx.takeError(&msg);
+        var got = try shortRequest(a, &fx, ids);
+        defer got.deinit(a);
+        try testing.expectEqualSlices(u8, want.items, got.items);
+    }
+}
+
+test "dsv41 engine: GEMM inputs the pool refused are an error, nothing of them is kept, and an op given an empty handle says so (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    defer mlx.engine.fault.disarm();
+    const lin = @import("sushi_exl3").linear;
+    // Three host arrays a key no warm made: each refused in turn.
+    for (1..4) |k| {
+        mlx.engine.fault.arm(k);
+        const refused = lin.gemmInputs(3, 770 + k, 32);
+        mlx.engine.fault.disarm();
+        try testing.expectError(error.HostArrayRefused, refused);
+        try testing.expect(mlx.takeErrorIf("PoolOverBudget"));
+        const made = try lin.gemmInputs(3, 770 + k, 32);
+        for ([_]mlx.mlx_array{ made.slots, made.tab.starts, made.tab.nlives }) |arr| try testing.expect(arr.ctx != null);
+    }
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    try testing.expectError(error.MlxError, mlx.check(mlx.mlx_reshape(&out, mlx.mlx_array_new(), &[_]c_int{1}, 1, mlx.engine.stream())));
+    try testing.expect(mlx.takeErrorIf("TensorNull"));
+    try testing.expectEqual(@as(usize, 0), mlx.getShape(mlx.mlx_array_new()).len);
+}
+
+test "dsv41 engine: a NAX GEMM kernel that cannot be proven on the engine is the load's error, and the arm is not declined for the process" {
+    try mlx.requireGpu();
+    const exl3 = @import("sushi_exl3");
+    if (!mlx.engine.matrixUnits() or !exl3.kernels.gemmNaxOn()) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const s = mlx.engine.stream();
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    defer mlx.engine.fault.disarm();
+    // A window no pack of the tests names: its kernel is proven here for the first time.
+    const dec = exl3.format.Decode.tabled(.mul1, .w11);
+    mlx.engine.fault.arm(1);
+    const refused = exl3.kernels.prepareGemmNax(dec, .pack, s);
+    mlx.engine.fault.disarm();
+    try testing.expectError(error.MetalKernelCompileFailed, refused);
+    try testing.expect(mlx.takeErrorIf("PoolOverBudget"));
+    try testing.expect(exl3.kernels.gemmNaxOn());
+    try exl3.kernels.prepareGemmNax(dec, .pack, s);
+}
+
+test "dsv41 engine: the first step after a restore from a point someone keeps copies no rows of the state: what it takes beyond a cold step does not grow with the context (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    const m = fx.model();
+    const ids = try a.alloc(u32, 8192 + 8);
+    defer a.free(ids);
+    _ = fx.prompt(ids);
+    // The fixed arrays a point shares (the window rings, the open group, the DSpark stages) are copied at their first
+    // write, the same bytes at any length; the rows, which grow with the context, are the state's own from the restore.
+    var beyond: [2]u64 = undefined;
+    for ([_]usize{ 4096, 8192 }, &beyond) |n, *extra| {
+        var growth: [2]u64 = undefined;
+        for ([_]bool{ false, true }, &growth) |restored, *g| {
+            try fx.xfm.resetCache();
+            var ctx = fx.xfm.defaultCtx();
+            var at: usize = 0;
+            while (at < n) : (at += 2048) {
+                ctx = fx.xfm.defaultCtx();
+                ctx.cache.step = at;
+                _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[at .. at + 2048]));
+            }
+            // What a RAM entry keeps: the point, held while the state restored from it runs on.
+            var cp = try dsv41_prefix.capture(a, m, n);
+            defer cp.deinit(a);
+            if (restored) {
+                try fx.xfm.resetCache();
+                try dsv41_prefix.restore(m, &cp, ids[0..n]);
+            }
+            mlx.engine.close();
+            const before = mlx.engine.stats();
+            ctx = fx.xfm.defaultCtx();
+            ctx.cache.step = n;
+            _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[n .. n + 1]));
+            mlx.engine.close();
+            const after = mlx.engine.stats();
+            g.* = (after.pool_bytes - after.pool_free) -| (before.pool_bytes - before.pool_free);
+        }
+        extra.* = growth[1] -| growth[0];
+    }
+    try testing.expect(beyond[1] <= beyond[0]);
 }
 
 test "dsv41 engine: a Cooler load answers the fused hyper-connection kernel's probe as the MLX route does: the probe runs on the engine's stream (DSV41_STQ_TINY)" {
@@ -2402,7 +3057,8 @@ fn wideChunkProof(dir: []const u8, plans: []const []const usize, cache_bytes: u6
             } else |_| {}
             var buf: [512]u8 = undefined;
             const said = mlx.takeError(&buf) orelse return error.NoRefusalMessage;
-            mlx.engine.active = false;
+            // A refused forward gives the scope back as it found it.
+            try testing.expect(!mlx.engine.active);
             try testing.expect(std.mem.indexOf(u8, said, name) != null);
             // A refused launch is its own failure: the kernel arm it used stays on for the process.
             try testing.expect(!@import("sushi_exl3").kernels.gemm_nax_failed);
@@ -2540,7 +3196,6 @@ test "dsv41 engine: the load's warm runs every engine forward, decode-width and 
         dsv41_borrow.own_override = null;
         dsv41_borrow.warm_budget = false;
         dsv41_borrow.warm_budget_override = null;
-        mlx.engine.active = false;
         // The budget is the engine's for the process: the tests after this one run with none.
         mlx.engine.budget(std.math.maxInt(u64)) catch {};
     }
@@ -3434,7 +4089,7 @@ test "dsv41 DSpark: --max-mtp-ctx ends drafting once the context passes it (DSV4
     try testing.expectEqual(SpecDisableReason.max_ctx, g.spec_disable_reason);
 }
 
-test "dsv41 DSpark: a drafted image-token id is cut from the verify chunk, since only a prompt may carry one (DSV41_TINY)" {
+test "dsv41 DSpark: a drafted image-token id rides the verify chunk as a plain token (DSV41_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -3453,18 +4108,14 @@ test "dsv41 DSpark: a drafted image-token id is cut from the verify chunk, since
     const dsv = dsv41_state.modelOf(&xfm).?;
     var d = try dsv41_serving.dsv41DraftImpl(&xfm, g.next_token_id);
     defer d.deinit();
-    const k = for (2..d.ids.len) |i| {
+    const k = for (2..4) |i| {
         if (d.ids[i] != d.ids[0] and d.ids[i] != d.ids[1]) break i;
     } else return error.NoDistinctDraft;
     dsv.cfg.image_token_id = d.ids[k];
-    const round = g.nextDspark(a) catch |err| {
-        std.debug.print("the verify chunk carrying the drafted image id failed: {s}\n", .{@errorName(err)});
-        return err;
-    };
-    const r = round orelse return error.NoRound;
+    const r = (try g.nextDspark(a)) orelse return error.NoRound;
     defer a.free(r.tokens);
-    try testing.expect(std.mem.indexOfScalar(u32, r.tokens, d.ids[k]) == null);
-    try testing.expect(g.dspark_stats.drafted < k);
+    try testing.expectEqual(@as(u64, 3), g.dspark_stats.drafted);
+    try testing.expectEqual(@as(usize, r.accepted_tokens) + 1, r.tokens.len);
 }
 
 const grammar_test_schema =
@@ -4431,7 +5082,7 @@ fn mlxRouteIds(fx: *EngineFixture, sampling: SamplingParams, rounds: bool, out: 
     }
 }
 
-test "dsv41 engine: the MLX route's seeded ids, serial and in DSpark rounds, are what they were before the engine took the sampler (DSV41_STQ_TINY)" {
+test "dsv41 engine: the MLX route's ids are pinned, and a seeded request gives the same ids serial and in DSpark rounds (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
@@ -4442,10 +5093,10 @@ test "dsv41 engine: the MLX route's seeded ids, serial and in DSpark rounds, are
     const penalized = SamplingParams{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .seed = 7 };
     const Case = struct { sampling: SamplingParams, rounds: bool, ids: [12]u32 };
     const cases = [_]Case{
-        .{ .sampling = seeded, .rounds = false, .ids = .{ 116, 250, 45, 163, 22, 139, 130, 76, 119, 34, 40, 71 } },
-        .{ .sampling = penalized, .rounds = false, .ids = .{ 116, 250, 45, 163, 22, 139, 130, 76, 16, 207, 237, 146 } },
+        .{ .sampling = seeded, .rounds = false, .ids = .{ 116, 250, 45, 163, 22, 139, 130, 76, 188, 93, 74, 185 } },
+        .{ .sampling = penalized, .rounds = false, .ids = .{ 116, 250, 45, 163, 22, 139, 130, 76, 177, 9, 203, 35 } },
         .{ .sampling = seeded, .rounds = true, .ids = .{ 116, 250, 45, 163, 22, 139, 130, 76, 188, 93, 74, 185 } },
-        .{ .sampling = .{ .temperature = 0.0 }, .rounds = false, .ids = .{ 116, 250, 208, 47, 8, 159, 222, 227, 76, 78, 3, 57 } },
+        .{ .sampling = .{ .temperature = 0.0 }, .rounds = false, .ids = .{ 116, 250, 208, 47, 138, 32, 201, 219, 66, 76, 93, 15 } },
     };
     for (cases) |c| {
         var ids: std.ArrayList(u32) = .empty;
@@ -4453,6 +5104,8 @@ test "dsv41 engine: the MLX route's seeded ids, serial and in DSpark rounds, are
         try mlxRouteIds(&fx, c.sampling, c.rounds, &ids);
         try testing.expectEqualSlices(u32, &c.ids, ids.items);
     }
+    // Beside a drafter a serial step takes the round's arm: the pins of the seeded request, serial and in rounds, are one.
+    try testing.expectEqualSlices(u32, &cases[0].ids, &cases[2].ids);
 }
 
 /// The calls into MLX's `name` since `before`.
@@ -4547,4 +5200,876 @@ test "dsv41 engine: a Cooler load wraps its weights itself: the MLX route's gree
     // Nothing the load, the steps or the unload refused was swallowed.
     var said: [512]u8 = undefined;
     try testing.expectEqualStrings("", mlx.takeError(&said) orelse "");
+}
+
+// ── What the bug hunt's scratch tests proved, kept ──
+
+/// The engine's pool and mappings as a balance sheet, read with every pass handed over.
+const Sheet = struct {
+    in_use: u64,
+    asked: u64,
+    mapped: u64,
+
+    fn now() Sheet {
+        mlx.engine.close();
+        const s = mlx.engine.stats();
+        return .{ .in_use = s.pool_bytes - s.pool_free, .asked = s.pool_asked, .mapped = s.mapped_bytes };
+    }
+};
+
+/// A request of `n` tokens as the Generator serves it: DSpark rounds swept over their widths, or serial steps. Its
+/// tokens go to `out`, and it is dropped after `stop_after` rounds or steps, as a client that leaves.
+fn runRequest(f: *EngineFixture, t: *Tokenizer, ids: []const u32, sampling: SamplingParams, opts: Generator.InitOptions, n: u32, stop_after: ?usize, out: ?*std.ArrayList(u32)) !void {
+    const al = testing.allocator;
+    try f.xfm.resetCache();
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), al, &f.xfm, t, ids, n, sampling, &.{}, opts);
+    defer gen.deinit(al);
+    var done: usize = 0;
+    if (opts.dspark_enabled) {
+        gen.dspark_diag = .sweep;
+        while (try gen.nextDspark(al)) |r| {
+            defer al.free(r.tokens);
+            if (out) |o| try o.appendSlice(al, r.tokens);
+            done += 1;
+            if (stop_after) |k| if (done >= k) return;
+        }
+    } else while (try gen.next(al)) |x| {
+        if (out) |o| try o.append(al, x);
+        done += 1;
+        if (stop_after) |k| if (done >= k) return;
+    }
+}
+
+/// The bytes of `logits`, evaluated.
+fn logitBytes(a: std.mem.Allocator, out: *std.ArrayList(u8), logits: mlx.mlx_array) !void {
+    try mlx.check(mlx.mlx_array_eval(logits));
+    const n = mlx.mlx_array_size(logits) * mlx.mlx_array_itemsize(logits);
+    try out.appendSlice(a, (mlx.mlx_array_data_uint8(logits) orelse return error.NoLogits)[0..n]);
+}
+
+/// The logits of `ids[from..]` on the state at `from` and of `steps` greedy tokens after them.
+fn continueBytes(a: std.mem.Allocator, fx: *EngineFixture, ids: []const u32, from: usize, steps: usize) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var ctx = fx.xfm.defaultCtx();
+    ctx.cache.step = from;
+    var l = try forwardIds(&fx.xfm, &ctx, ids[from..]);
+    defer _ = mlx.mlx_array_free(l);
+    var pos = ids.len;
+    for (0..steps) |_| {
+        try logitBytes(a, &out, l);
+        const t = try argmaxHost(&fx.xfm, l);
+        _ = mlx.mlx_array_free(l);
+        l = mlx.mlx_array_new();
+        ctx = fx.xfm.defaultCtx();
+        ctx.cache.step = pos;
+        l = try forwardIds(&fx.xfm, &ctx, &.{t});
+        pos += 1;
+    }
+    return out;
+}
+
+/// The request's state at `pos` as bytes: every array of its restore point.
+fn stateBytes(a: std.mem.Allocator, m: *@import("dsv41_model.zig").Model, pos: usize) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var cp = try dsv41_prefix.capture(a, m, pos);
+    defer cp.deinit(a);
+    for (cp.layers) |l| for ([_]mlx.mlx_array{ l.conv_state, l.ssm_state }) |x| {
+        if (x.ctx != null) try logitBytes(a, &out, x);
+    };
+    return out;
+}
+
+test "dsv41 engine: requests, repeated, leave the engine's pool as they found it, and an unload gives back everything, load after load (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var kept = try model_mod.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, dir);
+    defer kept.deinit(a);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    const greedy: SamplingParams = .{ .temperature = 0.0 };
+    for (0..3) |_| {
+        const before = Sheet.now();
+        var fx: EngineFixture = undefined;
+        try fx.open(dir);
+        {
+            errdefer fx.deinit();
+            var buf: [48]u32 = undefined;
+            const prompt = fx.prompt(&buf)[0..40];
+            try runRequest(&fx, &tok, prompt, greedy, .{ .dspark_enabled = true }, 12, null, null);
+            try runRequest(&fx, &tok, prompt, greedy, .{ .skip_lazy_preforward = true }, 12, null, null);
+            const warm = Sheet.now();
+            for (0..4) |_| {
+                try runRequest(&fx, &tok, prompt, greedy, .{ .dspark_enabled = true }, 12, null, null);
+                try runRequest(&fx, &tok, prompt, greedy, .{ .skip_lazy_preforward = true }, 12, null, null);
+                try testing.expectEqual(warm, Sheet.now());
+            }
+        }
+        fx.deinit();
+        dsv41_borrow.unloadModelMlx(&kept);
+        try testing.expectEqual(before, Sheet.now());
+    }
+}
+
+test "dsv41 engine: a request dropped after any round or step leaks nothing, and the next request's tokens are as they were (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..40];
+    const greedy: SamplingParams = .{ .temperature = 0.0 };
+    const seeded: SamplingParams = .{ .temperature = 0.8, .top_p = 0.95, .seed = 7 };
+    for ([_]SamplingParams{ greedy, seeded }) |sampling| for ([_]bool{ true, false }) |spark| {
+        const opts: Generator.InitOptions = .{ .dspark_enabled = spark };
+        var want: std.ArrayList(u32) = .empty;
+        defer want.deinit(a);
+        try runRequest(&fx, &tok, prompt, sampling, opts, 16, null, &want);
+        try fx.xfm.resetCache();
+        const base = Sheet.now();
+        for (1..6) |cut| {
+            try runRequest(&fx, &tok, prompt, sampling, opts, 16, cut, null);
+            try fx.xfm.resetCache();
+            try testing.expectEqual(base, Sheet.now());
+            var again: std.ArrayList(u32) = .empty;
+            defer again.deinit(a);
+            try runRequest(&fx, &tok, prompt, sampling, opts, 16, null, &again);
+            try testing.expectEqualSlices(u32, want.items, again.items);
+        }
+    };
+}
+
+test "dsv41 engine: a restore point either route wrote to the SSD tier restores on the other as that route's own cold state (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var buf: [600]u32 = undefined;
+    const point = 512;
+    for ([_][2]bool{ .{ false, true }, .{ true, false } }) |routes| {
+        const writer_cooler, const reader_cooler = routes;
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var path_buf: [512]u8 = undefined;
+        const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+        {
+            var fx: EngineFixture = undefined;
+            if (writer_cooler) try fx.open(dir) else try fx.openMlx(dir);
+            defer fx.deinit();
+            const prompt = fx.prompt(&buf);
+            var hc = try coolerTier(&fx, base);
+            defer hc.deinit();
+            try fx.xfm.resetCache();
+            var ctx = fx.xfm.defaultCtx();
+            _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..point]));
+            ctx.cache.step = point;
+            const cps = try a.alloc(trunk_mod.SSMCheckpoint, 1);
+            cps[0] = (try dsv41_prefix.captureCheckpoint(a, &fx.xfm, point, true)).?;
+            dsv41_prefix.writeThroughDsv41(&hc, fx.model(), ctx.cache, prompt[0..point], false, .{}, cps, "prefill");
+            try dsv41_prefix.markRows(ctx.cache, @import("dsv41_model.zig").stateStream(fx.model()));
+            _ = try hc.commitWithState(ctx.cache, prompt[0..point], false, 0, cps, null, null);
+            hc.flushPendingDisk(fx.xfm.s);
+            hc.disk.?.drainWriter();
+            try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        }
+        var fx: EngineFixture = undefined;
+        if (reader_cooler) try fx.open(dir) else try fx.openMlx(dir);
+        defer fx.deinit();
+        const prompt = fx.prompt(&buf);
+        try fx.xfm.resetCache();
+        var ctx = fx.xfm.defaultCtx();
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..point]));
+        var want = try stateBytes(a, fx.model(), point);
+        defer want.deinit(a);
+        var hc = try coolerTier(&fx, base);
+        defer hc.deinit();
+        try fx.xfm.resetCache();
+        const cold = fx.xfm.defaultCtx();
+        var moe: usize = 0;
+        const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, cold.cache, &moe, fx.model(), fx.xfm.s, prompt, false, 0, null, &.{}, null, false);
+        try testing.expectEqual(@as(usize, point), res.matched);
+        var got = try stateBytes(a, fx.model(), point);
+        defer got.deinit(a);
+        try testing.expectEqualSlices(u8, want.items, got.items);
+    }
+}
+
+test "dsv41 engine: on a Cooler load a prefill that releases the decoder's pools and reads them back gives the same logits, with nothing asked of MLX and no slab left waiting (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const es = @import("../expert_stream.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    const engine = fx.xfm.expert_stream.?;
+    var buf: [96]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    // A 40-row prefill, a 20-row chunk with the decoder's layers out on loan, two steps with them back.
+    const Steps = struct {
+        fn run(al: std.mem.Allocator, f: *EngineFixture, p: []const u32, borrow: ?*es.Engine) !std.ArrayList(u8) {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(al);
+            const decoder_from = f.model().ced_split.?;
+            const layers = f.model().cfg.layers;
+            try f.xfm.resetCache();
+            var at: usize = 0;
+            for ([_]usize{ 40, 20, 1, 1 }, 0..) |n, i| {
+                if (i == 1) if (borrow) |e| for (decoder_from..layers) |li| {
+                    _ = try e.borrowLayer(@intCast(li));
+                };
+                if (i == 2) if (borrow) |e| for (decoder_from..layers) |li| try e.restoreLayer(@intCast(li));
+                var ctx = f.xfm.defaultCtx();
+                ctx.cache.step = at;
+                const l = try forwardIds(&f.xfm, &ctx, p[at .. at + n]);
+                defer _ = mlx.mlx_array_free(l);
+                try logitBytes(al, &out, l);
+                at += n;
+            }
+            return out;
+        }
+    };
+    var want = try Steps.run(a, &fx, prompt, null);
+    defer want.deinit(a);
+    engine.borrow_from = @intCast(m.ced_split.?);
+    const timeouts = es.slab_release_timeouts.load(.monotonic);
+    const mapped = Sheet.now().mapped;
+    var c = try Census.begin();
+    errdefer c.names.deinit(a);
+    var got = try Steps.run(a, &fx, prompt, engine);
+    defer got.deinit(a);
+    try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, try c.end("a decoder's pools borrowed and restored"));
+    try testing.expectEqual(timeouts, es.slab_release_timeouts.load(.monotonic));
+    try testing.expectEqual(mapped, Sheet.now().mapped);
+    try testing.expectEqualSlices(u8, want.items, got.items);
+}
+
+/// A prompt whose first 25 tokens are `first`'s and whose rest are other ids: a second turn that parts from the first.
+fn partingPrompt(fx: *const EngineFixture, first: []const u32, out: *[40]u32) void {
+    @memcpy(out[0..25], first[0..25]);
+    for (out[25..], 25..) |*t, i| t.* = (fx.ids[i % fx.ids.len] + 1) % 90;
+}
+
+/// `ids[0..20]` prefilled cold in chunks of 12 and 8, then `continueBytes` from there.
+fn coldContinue(a: std.mem.Allocator, fx: *EngineFixture, ids: []const u32) !std.ArrayList(u8) {
+    try fx.xfm.resetCache();
+    var at: usize = 0;
+    for ([_]usize{ 12, 8 }) |n| {
+        var ctx = fx.xfm.defaultCtx();
+        ctx.cache.step = at;
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[at .. at + n]));
+        at += n;
+    }
+    return continueBytes(a, fx, ids, 20, 6);
+}
+
+test "dsv41 engine: a RAM entry restored twice on a Cooler load continues like cold both times (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const pc = @import("../prefix_cache.zig");
+    const dense = trunk_mod.KVQuantConfig.dense;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    var buf: [48]u32 = undefined;
+    const first = fx.prompt(&buf)[0..30];
+    var hc = pc.HotPrefixCache.init(a, 4);
+    defer hc.deinit();
+    try fx.xfm.resetCache();
+    var cps: std.ArrayList(trunk_mod.SSMCheckpoint) = .empty;
+    errdefer {
+        for (cps.items) |*cp| cp.deinit(a);
+        cps.deinit(a);
+    }
+    var at: usize = 0;
+    for ([_]usize{ 12, 8, 10 }, 0..) |n, i| {
+        var ctx = fx.xfm.defaultCtx();
+        ctx.cache.step = at;
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, first[at .. at + n]));
+        at += n;
+        if (i < 2) try cps.append(a, try dsv41_prefix.capture(a, m, at));
+    }
+    var cache = try KVCache.initWithConfig(a, m.cfg.layers, dense);
+    defer cache.deinit();
+    cache.step = first.len;
+    _ = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(a), null, null);
+    var next: [40]u32 = undefined;
+    partingPrompt(&fx, first, &next);
+    var cold = try coldContinue(a, &fx, &next);
+    defer cold.deinit(a);
+    for (0..2) |_| {
+        try fx.xfm.resetCache();
+        var target = try KVCache.initWithConfig(a, m.cfg.layers, dense);
+        defer target.deinit();
+        var off: usize = 0;
+        const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, &target, &off, m, fx.xfm.s, &next, false, 0, null, &.{}, null, false);
+        try testing.expectEqual(@as(usize, 20), res.matched);
+        var got = try continueBytes(a, &fx, &next, 20, 6);
+        defer got.deinit(a);
+        try testing.expectEqualSlices(u8, cold.items, got.items);
+    }
+}
+
+test "dsv41 engine: a Cooler state rolled back in place to a point it kept continues like cold, turn after turn (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const pc = @import("../prefix_cache.zig");
+    const dense = trunk_mod.KVQuantConfig.dense;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    var buf: [48]u32 = undefined;
+    const first = fx.prompt(&buf)[0..30];
+    var hc = pc.HotPrefixCache.init(a, 4);
+    defer hc.deinit();
+    var next: [40]u32 = undefined;
+    partingPrompt(&fx, first, &next);
+    var cold = try coldContinue(a, &fx, &next);
+    defer cold.deinit(a);
+    for (0..2) |_| {
+        // Turn one, its points at 12 and 20 kept live, and a few decoded tokens.
+        try fx.xfm.resetCache();
+        var at: usize = 0;
+        for ([_]usize{ 12, 8, 10 }, 0..) |n, i| {
+            var ctx = fx.xfm.defaultCtx();
+            ctx.cache.step = at;
+            _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, first[at .. at + n]));
+            at += n;
+            if (i < 2) {
+                var cp = try dsv41_prefix.capture(a, m, at);
+                defer cp.deinit(a);
+                try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, false);
+            }
+        }
+        var all: [31]u32 = undefined;
+        @memcpy(all[0..30], first);
+        all[30] = first[3];
+        var decoded = try continueBytes(a, &fx, &all, 30, 4);
+        decoded.deinit(a);
+        _ = dsv41_prefix.publishLiveDsv41(&hc, m, all[0..30], false, .{}, dense);
+        // Turn two parts at 25: the state rolls back to 20 in place.
+        var target = try KVCache.initWithConfig(a, m.cfg.layers, dense);
+        defer target.deinit();
+        var off: usize = 0;
+        const res = dsv41_prefix.rollbackLive(&hc, m, &target, &off, fx.xfm.s, &next, false, .{}, null) orelse return error.NoRollback;
+        try testing.expectEqual(@as(usize, 20), res.matched);
+        var got = try continueBytes(a, &fx, &next, 20, 6);
+        defer got.deinit(a);
+        try testing.expectEqualSlices(u8, cold.items, got.items);
+    }
+}
+
+/// The caps as `serve` installs them, with the engine's own budget live: what a forward and a request's end move.
+const ServedCaps = struct {
+    was_cap: u64,
+    was_override: ?bool,
+
+    fn install() ServedCaps {
+        const self: ServedCaps = .{ .was_cap = dsv41_borrow.pool_ram_cap, .was_override = dsv41_borrow.own_override };
+        dsv41_borrow.pool_ram_cap = 1 << 40;
+        return self;
+    }
+
+    fn restore(self: ServedCaps) void {
+        dsv41_borrow.pool_ram_cap = self.was_cap;
+        dsv41_borrow.own_override = self.was_override;
+        mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    }
+
+    fn setOwn(bytes: u64) void {
+        mlx.engine.budget(bytes) catch {};
+    }
+    fn ignore(_: u64) void {}
+    fn clear() void {}
+    const ops: dsv41_borrow.PoolOps = .{ .set_limit = &ignore, .clear = &clear, .set_transient = &ignore, .set_own = &setOwn };
+};
+
+test "dsv41 engine: after a model on MLX beside it served and ended a request, the Cooler's next request of any kind has the engine's room (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const caps = ServedCaps.install();
+    defer caps.restore();
+    var cooler: EngineFixture = undefined;
+    try cooler.open(dir);
+    defer cooler.deinit();
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = cooler.prompt(&buf)[0..40];
+    const greedy: SamplingParams = .{ .temperature = 0.0 };
+    try runRequest(&cooler, &tok, prompt, greedy, .{}, 6, null, null);
+    dsv41_borrow.endRequestMlx(&cooler.config);
+    var on_mlx: EngineFixture = undefined;
+    {
+        const turn = mlx.engine.turnTo(false);
+        defer turn.end();
+        try on_mlx.openMlx(dir);
+    }
+    defer {
+        const turn = mlx.engine.turnTo(false);
+        on_mlx.deinit();
+        turn.end();
+    }
+    const Variant = struct { sampling: SamplingParams, opts: Generator.InitOptions };
+    const variants = [_]Variant{
+        .{ .sampling = greedy, .opts = .{} },
+        .{ .sampling = greedy, .opts = .{ .dspark_enabled = true } },
+        .{ .sampling = .{ .temperature = 0.8, .top_k = 20, .top_p = 0.9, .seed = 3 }, .opts = .{} },
+        .{ .sampling = .{ .temperature = 0.0, .repeat_penalty = 1.2, .presence_penalty = 0.5, .frequency_penalty = 0.3 }, .opts = .{} },
+        .{ .sampling = greedy, .opts = .{ .logprobs_n = 3, .skip_lazy_preforward = true } },
+        .{ .sampling = .{ .temperature = 0.8, .top_p = 0.95, .seed = 5 }, .opts = .{ .dspark_enabled = true } },
+    };
+    for (variants) |v| {
+        {
+            // The other model's request and its end, in its own turn as the scheduler runs them.
+            dsv41_borrow.own_override = false;
+            const turn = mlx.engine.turnTo(false);
+            defer turn.end();
+            var ids: [24]u32 = undefined;
+            var bytes = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&ids), 16, 8, 2);
+            bytes.deinit(a);
+            dsv41_borrow.endRequestMlx(&on_mlx.config);
+        }
+        dsv41_borrow.own_override = true;
+        const turn = mlx.engine.turnTo(true);
+        defer turn.end();
+        try runRequest(&cooler, &tok, prompt, v.sampling, v.opts, 6, null, null);
+        dsv41_borrow.endRequestMlx(&cooler.config);
+        try testing.expect(!mlx.errorPending());
+    }
+}
+
+test "dsv41 engine: the Cooler's live restore points reach the SSD tier at an idle flush, a model on MLX having served in between or not (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    const caps = ServedCaps.install();
+    defer caps.restore();
+    var cooler: EngineFixture = undefined;
+    try cooler.open(dir);
+    defer cooler.deinit();
+    const m = cooler.model();
+    var on_mlx: EngineFixture = undefined;
+    {
+        const turn = mlx.engine.turnTo(false);
+        defer turn.end();
+        try on_mlx.openMlx(dir);
+    }
+    defer {
+        const turn = mlx.engine.turnTo(false);
+        on_mlx.deinit();
+        turn.end();
+    }
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    var buf: [600]u32 = undefined;
+    const prompt = cooler.prompt(&buf);
+    const point = 512;
+    for ([_]bool{ false, true }) |other_served| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var path_buf: [512]u8 = undefined;
+        const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+        var hc = try coolerTier(&cooler, base);
+        defer hc.deinit();
+        {
+            // The Cooler's request: a prefill to the point, which it keeps live, then its end.
+            dsv41_borrow.own_override = true;
+            const turn = mlx.engine.turnTo(true);
+            defer turn.end();
+            try cooler.xfm.resetCache();
+            var ctx = cooler.xfm.defaultCtx();
+            _ = dsv41_borrow.enterForward(point, point, &cooler.config, &cooler.config.dsv41.?, ServedCaps.ops);
+            _ = mlx.mlx_array_free(try forwardIds(&cooler.xfm, &ctx, prompt[0..point]));
+            ctx.cache.step = point;
+            var cp = try dsv41_prefix.capture(a, m, point);
+            defer cp.deinit(a);
+            try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, false);
+            try testing.expect(dsv41_prefix.publishLiveDsv41(&hc, m, prompt[0..point], false, .{}, ctx.cache.config));
+            dsv41_borrow.endRequestMlx(&cooler.config);
+        }
+        if (other_served) {
+            dsv41_borrow.own_override = false;
+            const turn = mlx.engine.turnTo(false);
+            defer turn.end();
+            var ids: [24]u32 = undefined;
+            var bytes = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&ids), 16, 8, 2);
+            bytes.deinit(a);
+            dsv41_borrow.endRequestMlx(&on_mlx.config);
+        }
+        dsv41_borrow.own_override = true;
+        const turn = mlx.engine.turnTo(true);
+        defer turn.end();
+        dsv41_prefix.flushLiveDsv41(&hc, m, "idle");
+        hc.disk.?.drainWriter();
+        try testing.expect(!mlx.errorPending());
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        try testing.expect(!dsv41_prefix.liveOf(&hc).unflushed());
+        try runRequest(&cooler, &tok, prompt[0..40], .{ .temperature = 0.0 }, .{}, 4, null, null);
+    }
+}
+
+test "dsv41 engine: each forward's pool peak stays inside its cap, a wide chunk's inside the cap less its slack, at the widths the router pads and at a decode step (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    const c = &fx.config.dsv41.?;
+    const widths = [_]usize{ 2048, 2048, 1024, 512, 2048, 100, 40, 2048, 1, 1, 2048, 1 };
+    var total: usize = 0;
+    for (widths) |w| total += w;
+    const ids = try a.alloc(u32, total);
+    defer a.free(ids);
+    _ = fx.prompt(ids);
+    try fx.xfm.resetCache();
+    var pos: usize = 0;
+    for (widths) |n| {
+        // The free buffers out first, so what the pool grows by over the forward bounds its peak from above.
+        mlx.engine.close();
+        try mlx.engine.budget(0);
+        try mlx.engine.budget(std.math.maxInt(u64));
+        const stats = mlx.engine.stats();
+        const in_use = stats.pool_bytes - stats.pool_free;
+        var ctx = fx.xfm.defaultCtx();
+        ctx.cache.step = pos;
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[pos .. pos + n]));
+        mlx.engine.close();
+        pos += n;
+        const peak = mlx.engine.stats().pool_bytes - in_use;
+        // A wide chunk fits its row term alone; the slack is for what does not scale with the rows (the router's pad, the
+        // pool's whole pages), which is most of a narrow forward on this small model.
+        const cap = c.forwardCap(if (n == 1) dsv41_borrow.verify_rows else n, pos);
+        try testing.expect(peak <= if (n >= 512) cap - dsv41_config.cap_slack_bytes else cap);
+    }
+}
+
+/// `shortPrefillBytes` with a greedy token fed back: a `lead`-row prefill, `k` rows, `steps` steps, each one's logits
+/// and token. `spoil` writes that byte over the pool's free buffers before every forward.
+fn greedyBytes(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, lead: usize, k: usize, steps: usize, spoil: ?u8) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    const vocab = dsv41_state.modelOf(xfm).?.cfg.vocab;
+    try xfm.resetCache();
+    if (spoil) |b| _ = mlx.engine.poison.free(b);
+    var ctx = xfm.defaultCtx();
+    _ = mlx.mlx_array_free(try forwardIds(xfm, &ctx, prompt[0..lead]));
+    if (spoil) |b| _ = mlx.engine.poison.free(b);
+    var lg = try forwardIds(xfm, &ctx, prompt[lead..][0..k]);
+    defer _ = mlx.mlx_array_free(lg);
+    for (0..steps + 1) |_| {
+        try mlx.check(mlx.mlx_array_eval(lg));
+        const data = (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..vocab];
+        try out.appendSlice(a, std.mem.sliceAsBytes(data));
+        const tok: u32 = @intCast(std.mem.indexOfMax(f32, data));
+        try out.appendSlice(a, std.mem.asBytes(&tok));
+        _ = mlx.mlx_array_free(lg);
+        lg = mlx.mlx_array_new();
+        if (spoil) |b| _ = mlx.engine.poison.free(b);
+        lg = try forwardIds(xfm, &ctx, &.{tok});
+    }
+    return out;
+}
+
+test "dsv41 engine: forwards and requests give the same bytes whatever the pool's buffers held: each one handed out, and the free ones, written over (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    defer mlx.engine.poison.byte = null;
+    const a = testing.allocator;
+    var buf: [48]u32 = undefined;
+    const ids = fx.prompt(&buf);
+    for ([_][2]usize{ .{ 16, 8 }, .{ 1, 1 }, .{ 30, 3 }, .{ 40, 1 }, .{ 17, 16 } }) |cut| {
+        var clean = try greedyBytes(a, &fx.xfm, ids, cut[0], cut[1], 6, null);
+        defer clean.deinit(a);
+        for ([_]u8{ 0xFF, 0x7F, 0x00, 0x80 }) |b| {
+            mlx.engine.poison.byte = b;
+            defer mlx.engine.poison.byte = null;
+            var got = try greedyBytes(a, &fx.xfm, ids, cut[0], cut[1], 6, b);
+            defer got.deinit(a);
+            try testing.expectEqualSlices(u8, clean.items, got.items);
+        }
+    }
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    const prompt = ids[0..30];
+    const seeded: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
+    const penalized: SamplingParams = .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .frequency_penalty = 0.3, .seed = 9 };
+    for ([_]Mode{ .serial, .serial_logprobs, .rows3, .sweep, .adaptive }) |mode| for ([_]SamplingParams{ seeded, .{ .temperature = 0 }, penalized }) |sampling| {
+        var clean: std.ArrayList(u32) = .empty;
+        defer clean.deinit(a);
+        try engineIds(&fx, &tok, prompt, 24, sampling, mode, &clean);
+        mlx.engine.poison.byte = 0xFF;
+        defer mlx.engine.poison.byte = null;
+        try fx.xfm.resetCache();
+        _ = mlx.engine.poison.free(0xFF);
+        var got: std.ArrayList(u32) = .empty;
+        defer got.deinit(a);
+        try engineIds(&fx, &tok, prompt, 24, sampling, mode, &got);
+        try testing.expectEqualSlices(u32, clean.items, got.items);
+    };
+}
+
+test "dsv41 engine: a request gives one text serial and in rounds of any width, after other requests, and at a second load of the process (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a);
+    defer tok.deinit();
+    const seeded: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
+    const cases = [_]SamplingParams{
+        seeded,
+        .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .frequency_penalty = 0.3, .seed = 9 },
+        .{ .temperature = 1.3, .top_k = 3, .top_p = 0.5, .seed = 11 },
+        .{ .temperature = 0 },
+        .{ .temperature = 0, .repeat_penalty = 1.5 },
+    };
+    const modes = [_]Mode{ .serial, .serial_logprobs, .rows1, .rows3, .sweep, .adaptive };
+    var first: [cases.len][40]u32 = undefined;
+    for (0..2) |load| {
+        var fx: EngineFixture = undefined;
+        try fx.open(dir);
+        defer fx.deinit();
+        var buf: [48]u32 = undefined;
+        const prompt = fx.prompt(&buf)[0..30];
+        for (cases, 0..) |sampling, ci| for (modes, 0..) |mode, mi| {
+            var got: std.ArrayList(u32) = .empty;
+            defer got.deinit(a);
+            try engineIds(&fx, &tok, prompt, 40, sampling, mode, &got);
+            try testing.expectEqual(@as(usize, 40), got.items.len);
+            if (load == 0 and mi == 0) @memcpy(&first[ci], got.items);
+            try testing.expectEqualSlices(u32, &first[ci], got.items);
+            // Another request between, of another prompt length.
+            var other: std.ArrayList(u32) = .empty;
+            defer other.deinit(a);
+            try engineIds(&fx, &tok, fx.prompt(&buf)[0 .. 5 + ci * 7 + mi], 9, seeded, .rows3, &other);
+        };
+    }
+}
+
+/// A prefill, then one-row steps and verify rounds of chosen widths and accept counts, a draft after each: the logits'
+/// bytes, the drafts and the state's hash at the end. `rebuild_all` lets every layer of a pass rebuild after a missed pick.
+fn roundMixBytes(a: std.mem.Allocator, fx: *EngineFixture, prompt: []const u32, rebuild_all: bool) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    const m = fx.model();
+    if (rebuild_all) m.route_spec_rebuilds = std.math.maxInt(u32);
+    const vocab = m.cfg.vocab;
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..20]));
+    var at: usize = 20;
+    for ([_][2]usize{ .{ 5, 2 }, .{ 0, 0 }, .{ 6, 0 }, .{ 4, 3 }, .{ 0, 0 }, .{ 3, 1 }, .{ 0, 0 }, .{ 2, 1 }, .{ 7, 6 }, .{ 0, 0 } }) |round| {
+        const verify_rows, const accepted = round;
+        const rows = @max(verify_rows, 1);
+        if (at + rows > prompt.len) break;
+        const lg = if (verify_rows == 0) try forwardIds(&fx.xfm, &ctx, prompt[at..][0..1]) else try dsv41_serving.dsv41VerifyImpl(&fx.xfm, &ctx, prompt[at..][0..rows]);
+        defer _ = mlx.mlx_array_free(lg);
+        try mlx.check(mlx.mlx_array_eval(lg));
+        try out.appendSlice(a, std.mem.sliceAsBytes((mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0 .. vocab * rows]));
+        if (verify_rows != 0) try dsv41_serving.dsv41FinishImpl(&fx.xfm, &ctx, accepted);
+        at += if (verify_rows == 0) 1 else accepted + 1;
+        var d = try dsv41_serving.dsv41DraftImpl(&fx.xfm, prompt[at - 1]);
+        defer d.deinit();
+        try out.appendSlice(a, std.mem.sliceAsBytes(d.ids));
+        try out.appendSlice(a, std.mem.sliceAsBytes(d.conf));
+    }
+    try out.appendSlice(a, &(try stateHash(m)));
+    return out;
+}
+
+test "dsv41 engine: rounds and steps through an expert cache too small to hold a pass's experts give the big cache's bytes, a few layers rebuilt or all (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var buf: [80]u32 = undefined;
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(a);
+    {
+        var fx: EngineFixture = undefined;
+        try fx.open(dir);
+        defer fx.deinit();
+        want = try roundMixBytes(a, &fx, fx.prompt(&buf), false);
+    }
+    // Three layers' worth of eight experts, and twice that.
+    const small = 3 * 8 * (256 * 128 * 3 * 64 / 128);
+    const rebuilt_before = @import("dsv41_model.zig").spec_rebuilt;
+    for ([_]u64{ small, 2 * small }) |cache_bytes| for ([_]bool{ false, true }) |rebuild_all| {
+        var fx: EngineFixture = undefined;
+        try fx.openSized(dir, null, cache_bytes);
+        defer fx.deinit();
+        var got = try roundMixBytes(a, &fx, fx.prompt(&buf), rebuild_all);
+        defer got.deinit(a);
+        try testing.expectEqualSlices(u8, want.items, got.items);
+    };
+    try testing.expect(@import("dsv41_model.zig").spec_rebuilt > rebuilt_before);
+}
+
+/// `imagePromptBytes` with the image ids at `spans`, which take `rows` in order.
+fn imageSpanBytes(a: std.mem.Allocator, fx: *EngineFixture, rows: mlx.mlx_array, spans: []const [2]usize, cuts: []const usize, steps: usize) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    const m = fx.model();
+    var buf: [48]u32 = undefined;
+    var ids = fx.prompt(&buf)[0..48].*;
+    for (spans) |span| for (ids[span[0]..span[1]]) |*id| {
+        id.* = m.cfg.image_token_id;
+    };
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    ctx.vision_embeddings = rows;
+    var at: usize = 0;
+    var lg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lg);
+    for (cuts) |end| {
+        _ = mlx.mlx_array_free(lg);
+        lg = mlx.mlx_array_new();
+        lg = try forwardIds(&fx.xfm, &ctx, ids[at..end]);
+        ctx.vision_splice_offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
+        at = end;
+    }
+    for (0..steps + 1) |_| {
+        try mlx.check(mlx.mlx_array_eval(lg));
+        const data = (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..m.cfg.vocab];
+        try out.appendSlice(a, std.mem.sliceAsBytes(data));
+        const tok: u32 = @intCast(std.mem.indexOfMax(f32, data));
+        _ = mlx.mlx_array_free(lg);
+        lg = mlx.mlx_array_new();
+        lg = try forwardIds(&fx.xfm, &ctx, &.{tok});
+    }
+    return out;
+}
+
+test "dsv41 engine: image spans cut at their edges and inside, a chunk of image rows only, two images, a span at row 0: MLX's bytes, the pool's buffers written over or not (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const Case = struct { spans: []const [2]usize, cuts: []const usize };
+    const cases = [_]Case{
+        .{ .spans = &.{.{ 5, 15 }}, .cuts = &.{ 5, 15, 40 } },
+        .{ .spans = &.{.{ 5, 15 }}, .cuts = &.{ 15, 40 } },
+        .{ .spans = &.{.{ 5, 15 }}, .cuts = &.{ 5, 40 } },
+        .{ .spans = &.{.{ 5, 15 }}, .cuts = &.{ 14, 15, 16, 40 } },
+        .{ .spans = &.{.{ 5, 15 }}, .cuts = &.{ 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 40 } },
+        .{ .spans = &.{.{ 0, 10 }}, .cuts = &.{40} },
+        .{ .spans = &.{.{ 0, 10 }}, .cuts = &.{ 1, 40 } },
+        .{ .spans = &.{ .{ 3, 8 }, .{ 30, 35 } }, .cuts = &.{40} },
+        .{ .spans = &.{ .{ 3, 8 }, .{ 30, 35 } }, .cuts = &.{ 8, 30, 40 } },
+        .{ .spans = &.{ .{ 3, 8 }, .{ 30, 35 } }, .cuts = &.{ 6, 33, 40 } },
+        .{ .spans = &.{ .{ 3, 8 }, .{ 8, 13 } }, .cuts = &.{ 20, 40 } },
+        .{ .spans = &.{.{ 30, 40 }}, .cuts = &.{ 20, 40 } },
+        .{ .spans = &.{.{ 30, 40 }}, .cuts = &.{ 39, 40 } },
+    };
+    var want: [cases.len]std.ArrayList(u8) = @splat(.empty);
+    defer for (&want) |*w| w.deinit(a);
+    {
+        var on_mlx: EngineFixture = undefined;
+        try on_mlx.openMlx(dir);
+        defer on_mlx.deinit();
+        var image = try ImageStandIn.give(a, &on_mlx);
+        defer image.drop();
+        for (cases, &want) |c, *w| w.* = try imageSpanBytes(a, &on_mlx, image.rows, c.spans, c.cuts, 3);
+    }
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    defer mlx.engine.poison.byte = null;
+    var image = try ImageStandIn.give(a, &fx);
+    defer image.drop();
+    try @import("dsv41_model.zig").warmOwnImages(fx.model());
+    for (cases, &want) |c, *w| for ([_]?u8{ null, 0xFF }) |spoil| {
+        mlx.engine.poison.byte = spoil;
+        defer mlx.engine.poison.byte = null;
+        var got = try imageSpanBytes(a, &fx, image.rows, c.spans, c.cuts, 3);
+        defer got.deinit(a);
+        try testing.expectEqualSlices(u8, w.items, got.items);
+    };
+}
+
+test "dsv41 engine: at the filters' edges a sampled token is one the filters allow, and the serial draw and the round's draw are the same token (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const vocab = fx.model().cfg.vocab;
+    const flags = try testing.allocator.alloc(bool, vocab);
+    defer testing.allocator.free(flags);
+    const host = try testing.allocator.alloc(f32, vocab);
+    defer testing.allocator.free(host);
+    const s = mlx.engine.stream();
+    const Edge = struct { temp: f32, k: u32, p: f32, greedy: bool = false };
+    const edges = [_]Edge{
+        .{ .temp = 0.8, .k = 1, .p = 1, .greedy = true },
+        .{ .temp = 0.8, .k = 0, .p = 0, .greedy = true },
+        .{ .temp = 0.8, .k = @intCast(vocab + 5), .p = 1 },
+        .{ .temp = 0.8, .k = @intCast(vocab), .p = 0.5 },
+        .{ .temp = 0.0100001, .k = 0, .p = 1 },
+        .{ .temp = 1000, .k = 0, .p = 1 },
+        .{ .temp = 0.8, .k = 2, .p = 1e-30 },
+    };
+    const Shape = enum { spread, tie_at_top, all_masked_but_two };
+    for (edges) |e| for (std.enums.values(Shape)) |shape| for (0..6) |position| {
+        for (host, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 2654435761 + position * 40503) % 1000)) / 250.0;
+        @memset(flags, false);
+        const top = std.mem.indexOfMax(f32, host);
+        if (shape == .tie_at_top) host[(top + 17) % vocab] = host[top];
+        if (shape == .all_masked_but_two) {
+            @memset(flags, true);
+            flags[(top + 3) % vocab] = false;
+            flags[(top + 5) % vocab] = false;
+        }
+        const mask = mlx.mlx_array_new_data(flags.ptr, &[_]c_int{@intCast(vocab)}, 1, .bool_);
+        defer _ = mlx.mlx_array_free(mask);
+        const logits = mlx.mlx_array_new_data(host.ptr, &[_]c_int{ 1, 1, @intCast(vocab) }, 3, .float32);
+        defer _ = mlx.mlx_array_free(logits);
+        const sampling = SamplingParams{ .temperature = e.temp, .top_k = e.k, .top_p = e.p, .draw = position, .draw_root = 5, .suppress_mask = if (shape == .all_masked_but_two) mask else null };
+        const serial = sampler.sampleTokenLazy(logits, sampling, s);
+        defer _ = mlx.mlx_array_free(serial);
+        var drawn: i32 = -1;
+        try mlx.check(mlx.mlx_array_eval(serial));
+        try mlx.check(mlx.mlx_array_item_int32(&drawn, serial));
+        const round = try dsv41_serving.sampledDraws(sampling, logits, 1, s);
+        defer _ = mlx.mlx_array_free(round);
+        var in_round: i32 = -1;
+        try mlx.check(mlx.mlx_array_eval(round));
+        try mlx.check(mlx.mlx_array_item_int32(&in_round, round));
+        try testing.expectEqual(drawn, in_round);
+        try testing.expect(drawn >= 0 and drawn < vocab and !flags[@intCast(drawn)]);
+        if (e.greedy and shape == .spread) try testing.expectEqual(@as(i32, @intCast(top)), drawn);
+    };
 }

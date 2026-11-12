@@ -1,10 +1,12 @@
 //! DeepSeek-V4.1-Flash (`deepseek_v41`) as the registry sees it: its one public face.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const log = @import("../log.zig");
 const trunk = @import("../trunk.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
 const serving = @import("dsv41_serving.zig");
+const sushi_exl3 = @import("sushi_exl3");
 const admission = @import("../arch/admission.zig");
 const registry = @import("../arch/registry.zig");
 const Trunk = trunk.Trunk;
@@ -41,6 +43,14 @@ pub const streamed_mtp_head = struct {
         return layout == .mxfp4_w123 or layout == .exl3_k4;
     }
 };
+/// The pool parked beside the model between requests: MLX's decode pool, or on a Cooler load the engine's free
+/// buffers under the cap a request's end leaves it (`dsv41_borrow.endRequest`). MLX's pool is empty under such a load.
+pub fn expertPoolBytes(config: *const Config) u64 {
+    const c = config.dsv41 orelse return config_file.dsv41_pool_bytes;
+    const borrow = @import("dsv41_borrow.zig");
+    return if (borrow.ownDecode(&c)) borrow.ownCap(&c, 1) else config_file.dsv41_pool_bytes;
+}
+
 pub const config_facts: arch_config.Facts = .{
     .thinks_by_default = true,
     .reads_pair_major = true,
@@ -123,7 +133,13 @@ pub fn deinit(xfm: Model) void {
     const held = if (xfm.arch_state.dsv41.model) |m| m.engine_decode else false;
     xfm.arch_state.dsv41.deinit(xfm.allocator);
     xfm.deinitTrunk();
-    if (held) mlx.engine.unhold();
+    if (!held) return;
+    mlx.engine.unhold();
+    // The last Cooler model gone, nothing of the engine's stays in use: the EXL3 module's arrays of its side go too.
+    if (!mlx.engine.holding()) sushi_exl3.dropHostArrays(1);
+    const breaks = mlx.rest_breaks.load(.monotonic);
+    const swallows = mlx.rest_swallows.load(.monotonic);
+    if (breaks != 0 or swallows != 0) log.warn("[engine] while MLX was at rest it was called {d} times and asked {d} settings that reached nothing (process totals): work outside its model's turn\n", .{ breaks, swallows });
 }
 
 pub fn resetCache(xfm: Model) !void {

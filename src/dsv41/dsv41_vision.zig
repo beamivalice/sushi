@@ -396,9 +396,8 @@ pub const Dsv41Vision = struct {
             own = true;
         }
         // The requantization's kernel is this load's to make, as the warm's are.
-        const was_sealed = mlx.engine.sealed();
-        if (own) mlx.engine.seal(false);
-        defer mlx.engine.seal(was_sealed);
+        const making: ?mlx.engine.Seal = if (own) mlx.engine.unsealed() else null;
+        defer if (making) |seal| seal.end();
         var self = try load(allocator, config, weights, quantize_at_load, own);
         errdefer self.deinit();
         if (own) try self.useEngine();
@@ -425,20 +424,17 @@ pub const Dsv41Vision = struct {
     /// The engine runs this pass: its ops take over, an MLX stream among them is refused by name, and its pool may
     /// hold the pass's scratch. A no-op on MLX's side.
     const Run = struct {
-        was: bool,
-        own: bool,
+        makers: ?mlx.engine.Makers,
 
         fn end(r: Run) void {
-            if (r.own) mlx.engine.active = r.was;
+            if (r.makers) |made| made.end();
         }
     };
 
     fn engage(self: *const Dsv41Vision, patches: usize) !Run {
-        if (!self.own) return .{ .was = false, .own = false };
-        const was = mlx.engine.active;
+        if (!self.own) return .{ .makers = null };
         try mlx.engine.budget(scratchOf(self.v, self.out_dim, patches));
-        mlx.engine.active = true;
-        return .{ .was = was, .own = true };
+        return .{ .makers = mlx.engine.makers(true) };
     }
 
     /// `quantize` false keeps every linear bf16 (the reference-parity tests).
@@ -566,8 +562,8 @@ pub const Dsv41Vision = struct {
             return;
         }
         warms += 1;
-        mlx.engine.seal(false);
-        defer mlx.engine.seal(true);
+        const making = mlx.engine.unsealed();
+        defer making.end();
         var clock = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
         const made_before = mlx.engine.pipelinesMade().count;
         const feat: usize = 3 * self.v.patch * self.v.patch;

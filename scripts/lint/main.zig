@@ -13,6 +13,8 @@ const rules = .{
     @import("unused_import.zig"),
     @import("undefined_nested_write.zig"),
     @import("mlx_extern.zig"),
+    @import("double_free.zig"),
+    @import("scope_state.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

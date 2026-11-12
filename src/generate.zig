@@ -1728,7 +1728,7 @@ pub const Generator = struct {
                     const line = formatPrefillMemLine(&mem_buf, pos, end, eval_dt / std.time.ns_per_ms, prefillMem());
                     log.debug("{s}", .{line});
                     // The next line's peak is then its own chunk's: what a transient bill is fitted to.
-                    if (chunk_peak) _ = mlx.mlx_reset_peak_memory();
+                    if (chunk_peak) gpu_mem.resetPeak();
                 }
 
                 // This chunk's latch, read before anything persists it, snapshots it or yields
@@ -4122,9 +4122,7 @@ test "tokensPerSec basic and zero-time" {
 const PrefillMem = struct { active: usize, cache: usize, peak: usize };
 
 fn prefillMem() PrefillMem {
-    var peak: usize = 0;
-    _ = mlx.mlx_get_peak_memory(&peak);
-    return .{ .active = gpu_mem.activeBytes(), .cache = gpu_mem.cacheBytes(), .peak = peak };
+    return .{ .active = gpu_mem.activeBytes(), .cache = gpu_mem.cacheBytes(), .peak = gpu_mem.peakBytes() };
 }
 
 fn formatPrefillMemLine(buf: []u8, pos: usize, end: usize, eval_ms: u64, mem: PrefillMem) []const u8 {

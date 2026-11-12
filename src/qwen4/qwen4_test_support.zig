@@ -221,10 +221,13 @@ pub fn logicalSsmCapture(s: mlx.mlx_stream, entry: *const SSMCacheEntry) !mlx.ml
     const shape = mlx.getShape(entry.spec_state_seq);
     if (shape.len != 5 or shape[0] < 1) return error.SpecCaptureShape;
     var final = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(final);
-    try mlx.check(mlx.mlx_expand_dims(&final, entry.ssm_state, 0, s));
-    if (shape[0] == 1) return final;
     defer _ = mlx.mlx_array_free(final);
+    try mlx.check(mlx.mlx_expand_dims(&final, entry.ssm_state, 0, s));
+    if (shape[0] == 1) {
+        const whole = final;
+        final = mlx.mlx_array_new();
+        return whole;
+    }
     var prefix = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(prefix);
     var stop: [5]c_int = undefined;

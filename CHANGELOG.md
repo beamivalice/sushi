@@ -25,7 +25,11 @@ earlier history is mlx-serve's, in that project's changelog.
   penalties, logit bias, grammar masks and logprobs of a token no longer run on MLX there.
 - **DeepSeek-V4.1-Flash greedy answers no longer depend on how tokens were drafted**: at long context a rare rounding
   difference between a single-token step and a drafted round could change a greedy answer; a token now gets the same
-  result either way.
+  result either way, so a request that asks for logprobs gives the text one without them gives.
+- **DeepSeek-V4.1-Flash answers no longer depend on `--prefill-chunk`**: a rounding difference in expert routing
+  between chunk sizes could change an answer at a near-tie; a prompt now routes the same at every chunk size.
+- **DeepSeek-V4.1-Flash no longer fails a request on its image token**: a text prompt that holds the image
+  placeholder, or a reply in which the model writes it, is read as ordinary text when no image stands behind it.
 - **DeepSeek-V4.1-Flash STQ loads skip the engine's warm-up on a repeat start**: the first load of a pack on a build
   keeps the engine's kernel recipes in `~/.sushi/cache/pipelines`, and the next load makes its kernels from them instead
   of running the engine's warm forwards.

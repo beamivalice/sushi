@@ -4,6 +4,7 @@
 //! host from the known row order, so no GPU drain.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 const exl3 = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
 const project_rows = @import("project_rows.zig");
@@ -221,39 +222,46 @@ pub const GemmInputs = struct { slots: mlx.mlx_array, tab: kernels.WindowTable }
 
 const GemmKey = struct { groups: usize, rows: usize, win: c_int };
 const gemm_cache_len = 8;
-var gemm_cache: [gemm_cache_len]?struct { key: GemmKey, inputs: GemmInputs } = @splat(null);
-var gemm_cache_next: usize = 0;
+const GemmRing = struct {
+    entries: [gemm_cache_len]?struct { key: GemmKey, inputs: GemmInputs } = @splat(null),
+    next: usize = 0,
+};
+/// One ring for each side of the host (`host_side.making`): an array belongs to the side that made it, which alone
+/// uses it and frees it.
+var gemm_cache: [2]GemmRing = .{ .{}, .{} };
 
-/// Frees the cached inputs. Their handles are whichever side made them (the engine's while it ran): a process that turns
-/// the engine off must drop them first.
-pub fn dropGemmInputs() void {
-    for (&gemm_cache) |*e| {
+/// Frees the inputs side `side` cached (`host_side.of`): a host whose engine no model holds any more gives them back.
+pub fn dropGemmInputs(side: u1) void {
+    const ring = &gemm_cache[side];
+    for (&ring.entries) |*e| {
         if (e.*) |old| for ([_]mlx.mlx_array{ old.inputs.slots, old.inputs.tab.starts, old.inputs.tab.nlives }) |a| {
             _ = mlx.mlx_array_free(a);
         };
         e.* = null;
     }
-    gemm_cache_next = 0;
+    ring.next = 0;
 }
 
 /// The inputs depend on `(groups, rows, win)` alone, and a prefill chunk's trellis linears all share them, so they are
 /// built and uploaded once. The handles are the cache's: valid until a later call evicts them, never freed by the caller.
 pub fn gemmInputs(groups: usize, rows: usize, win: c_int) !GemmInputs {
     const key = GemmKey{ .groups = groups, .rows = rows, .win = win };
-    for (gemm_cache) |e| if (e) |hit| if (std.meta.eql(hit.key, key)) return hit.inputs;
+    const ring = &gemm_cache[host_side.making()];
+    for (ring.entries) |e| if (e) |hit| if (std.meta.eql(hit.key, key)) return hit.inputs;
     const alloc = std.heap.page_allocator;
     const ids = try alloc.alloc(u32, groups * rows);
     defer alloc.free(ids);
     for (ids, 0..) |*v, i| v.* = @intCast(i / rows);
-    const slots = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .uint32);
+    const slots = try host_side.made(mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .uint32));
     errdefer _ = mlx.mlx_array_free(slots);
     const tab = try windowTable(groups, rows, win);
-    if (gemm_cache[gemm_cache_next]) |old| for ([_]mlx.mlx_array{ old.inputs.slots, old.inputs.tab.starts, old.inputs.tab.nlives }) |a| {
+    const at = ring.next;
+    if (ring.entries[at]) |old| for ([_]mlx.mlx_array{ old.inputs.slots, old.inputs.tab.starts, old.inputs.tab.nlives }) |a| {
         _ = mlx.mlx_array_free(a);
     };
-    gemm_cache[gemm_cache_next] = .{ .key = key, .inputs = .{ .slots = slots, .tab = tab } };
-    gemm_cache_next = (gemm_cache_next + 1) % gemm_cache_len;
-    return gemm_cache[(gemm_cache_next + gemm_cache_len - 1) % gemm_cache_len].?.inputs;
+    ring.entries[at] = .{ .key = key, .inputs = .{ .slots = slots, .tab = tab } };
+    ring.next = (at + 1) % gemm_cache_len;
+    return ring.entries[at].?.inputs;
 }
 
 /// Windows of at most `win` rows that never straddle two banks.
@@ -270,9 +278,9 @@ pub fn windowTable(groups: usize, rows: usize, win: c_int) !kernels.WindowTable 
         lives[g * per + i] = @intCast(@min(w, rows - i * w));
     };
     const n: c_int = @intCast(groups * per);
-    const st = mlx.mlx_array_new_data(starts.ptr, &[_]c_int{n}, 1, .uint32);
+    const st = try host_side.made(mlx.mlx_array_new_data(starts.ptr, &[_]c_int{n}, 1, .uint32));
     errdefer _ = mlx.mlx_array_free(st);
-    return .{ .starts = st, .nlives = mlx.mlx_array_new_data(lives.ptr, &[_]c_int{n}, 1, .uint32), .nwin = n };
+    return .{ .starts = st, .nlives = try host_side.made(mlx.mlx_array_new_data(lives.ptr, &[_]c_int{n}, 1, .uint32)), .nwin = n };
 }
 
 /// One bank's weight as the kernels apply it, `W^T = diag(suh) H M H diag(svh)` in f32 `[in, out]` (M the decoded

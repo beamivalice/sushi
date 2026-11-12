@@ -35,6 +35,13 @@ pub const trunk_gemm = @import("trunk_gemm.zig");
 pub const trunk = @import("trunk.zig");
 pub const Bank = struct { gate: Proj, up: Proj, down: Proj };
 
+/// Frees the arrays the module caches for side `side` of the host (`host_side.of`): the GEMM inputs and the unit
+/// score. For a side no model uses any more; the next model's first asks make them again.
+pub fn dropHostArrays(side: u1) void {
+    linear.dropGemmInputs(side);
+    rate_groups.dropUnitScore(side);
+}
+
 /// Routed SwiGLU experts over `x` [B, S, D] for the top-k `inds`/`scores` [B, S, K],
 /// returned in x's shape and dtype. Up to `kernels.DECODE_ROWS_MAX` rows (or any
 /// verify rows) take the decode chain, wider the prefill GEMM.
@@ -655,8 +662,9 @@ pub fn moeRagged(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: m
     else
         try rate_groups.moePrefill(s, x2, rb, slots, sc, K);
     defer _ = mlx.mlx_array_free(y);
+    // One owner: a return of `routed` itself hands it out and leaves the defer an empty handle.
     var routed = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(routed);
+    defer _ = mlx.mlx_array_free(routed);
     try mlx.check(mlx.mlx_reshape(&routed, y, xsh.ptr, xsh.len, s));
     if (mlx.mlx_array_dtype(routed) != xd) {
         var c = mlx.mlx_array_new();
@@ -664,9 +672,16 @@ pub fn moeRagged(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: m
         _ = mlx.mlx_array_free(routed);
         routed = c;
     }
-    const value = shared orelse return routed;
-    if (fold) return routed;
-    defer _ = mlx.mlx_array_free(routed);
+    const value = shared orelse {
+        const whole = routed;
+        routed = mlx.mlx_array_new();
+        return whole;
+    };
+    if (fold) {
+        const whole = routed;
+        routed = mlx.mlx_array_new();
+        return whole;
+    }
     var gated = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gated);
     if (shared_gate) |logit| {

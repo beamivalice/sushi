@@ -220,6 +220,8 @@ DeepSeek moved to pack revision 2.0 after 1.5.0; the 1.5.0 binary read it at 0.2
 1.5.1 is within 0.6%. Qwen 1.5.1 equals 1.5.0 to the last digit.
 The published Qwen pack moved to revision 2.0 (6-bit STQ trunk) after 1.5.1: on the 1.5.1 code (`88c0173a`, the same
 flags) it reads 0.061834, 92.30%, 7061 positions, and 1.6.0 reads the same to the last digit. DeepSeek on 1.6.0 reads 0.6% above 1.5.1, equal to the 1.5.0 binary's reading of revision 2.0.
+On Sushi Cooler with no call into MLX from load to unload (`df84c004`, the row's flags with `--tokens 512 --top-k 10
+--ctx-size 8192 --no-mtp`, AC power) DeepSeek reads 0.210305, 86.46%, 7533 positions: 1.6.0's reading on MLX.
 
 The Qwen 1.5.0 reading equals the 1.4.0 Homebrew binary's on the same settings to the last digit; the 0.0692 / 92.76%
 quoted for this pack in [qwen4-kld](qwen4-kld.md) was taken on settings it does not name.

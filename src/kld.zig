@@ -604,8 +604,7 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         .top_k = opts.top_k,
         .elapsed_secs = elapsed_secs,
     }, records.items);
-    var peak_bytes: usize = 0;
-    try mlx.check(mlx.mlx_get_peak_memory(&peak_bytes));
+    const peak_bytes = gpu_mem.peakBytes();
     out.print("[kld] captured {d} prompts x {d} tokens into {s} in {d:.1}s (mean strict NLL {d:.9}, peak active {d:.2} GB)\n", .{
         records.items.len,
         opts.tokens,
@@ -656,7 +655,7 @@ fn writeMemoryReportFields(w: *std.Io.Writer, report: MemoryReport) !void {
 pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Options, out: *Out) !void {
     var memory: MemoryReport = undefined;
     memory.model_active_bytes = gpu_mem.activeBytes();
-    try mlx.check(mlx.mlx_reset_peak_memory());
+    gpu_mem.resetPeak();
 
     var base = try fixture_mod.readBaseline(allocator, io, opts.fixture);
     defer base.deinit();
@@ -810,7 +809,7 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
     const mean_cosine_similarity_eos = total_cosine_similarity_eos / positions_eos_f;
     const mean_cosine_loss_eos = total_cosine_loss_eos / positions_eos_f;
     const mean_top1_eos = @as(f64, @floatFromInt(total_top1_eos)) / positions_eos_f;
-    try mlx.check(mlx.mlx_get_peak_memory(&memory.peak_active_bytes));
+    memory.peak_active_bytes = gpu_mem.peakBytes();
     memory.final_active_bytes = gpu_mem.activeBytes();
     memory.final_cache_bytes = gpu_mem.cacheBytes();
 

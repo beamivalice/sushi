@@ -303,6 +303,23 @@ When it engages:
 - Load line: `[dsv41] CED: layers 20..39 run the last 128 rows of a prefill chunk`. Each chunk logs
   `[dsv41] CED prefill: N rows encoder-only, replay 128 rows` at debug.
 
+<a id="prefill-width"></a>
+A row's result does not depend on the rows beside it:
+- **The forward's kind picks its arms** (`Model.Forward`: `prefill`, `step`, `verify`; `Model.arm(kind)` is the one
+  writer of the EXL3 row mode and of the deferred head, and gives back what it found).
+- **The router's dense product runs in fixed tiles of 2,048 rows** (`gateLogitsWide`, `cfg.gate_tile_rows`), a short
+  tile padded with zero rows. MLX's kernel choice for that product follows the row count
+  ([engine-mlx-gotchas](engine-mlx-gotchas.md#what-mlxs-bytes-depend-on)), so 1,024-row and 2,048-row chunks routed
+  on logits that differed in rounding and a near-tie pick could move with `--prefill-chunk`. The pad is 42 MB of f32
+  at the release's width, inside the forward cap's slack. The per-row gate kernel was measured and not taken: 2.97 ms
+  against 0.50 ms for 2,048 rows (release shape, min of 6).
+- Pinned on `DSV41_STQ_TINY`: a prompt's tokens and the logits after them at chunk widths from 1,024 down to 33
+  (`a prompt's tokens and the logits after them do not depend on the width its prefill was cut at`), every row of a
+  verify at every width against the serial step on both routes, and the release's one-pass attention kernel span by
+  span (`dsv41 fused attention: a row's heads are the same bits in one span and in any two the span is cut into`).
+- What differs by definition: a last chunk of `window` rows or fewer is a full pass that reads the previous tail's
+  rings, where a wider one replays the window (the production tail merge keeps the last chunk at 512 rows or more).
+
 Proofs (`DSV41_TINY`, CPU stream, f32, QAT off):
 - The encoder's state slots are bit-identical to the full forward's.
 - The decoder's compressed rows equal the full forward's.
@@ -503,7 +520,7 @@ tests at the output; `zig build test` caches a passing env-gated run, so re-run 
 | slab experts vs resident experts | identical logits |
 | DSpark draft: ids, Markov-biased logits, confidence, main rows | QAT off 1e-4 / 2e-3 of the peak; QAT on cosine > 0.99 from the reference's rows |
 | DSpark verify rollback at every accepted count, a second round, the next draft | serial logits 2e-3, serial draft |
-| `nextDspark` through the Generator on the GPU in bf16 | the budget, the stats and the first token; the later tokens may break a near-tie against serial decode (DSpark rows are the same at every width, and the serial step sums as the SIMD one-row arm) (the exact-stream rows above pin the identity) |
+| `nextDspark` through the Generator on the GPU in bf16 | the budget, the stats and the first token; the later tokens may break a near-tie against a `--no-mtp` load's serial decode (DSpark rows are the same at every width; a serial step beside a drafter takes the rounds' arm, one without a drafter the SIMD one-row arm) (the exact-stream rows above pin the identity) |
 | DSpark bills | resident bytes equal the held arrays; window and slack bytes equal the bill |
 | `Transformer.forward` through the shell | identical to the model's own, across prefill and decode chunks |
 | chat template | 14 cases byte for byte with `encode_messages` |
@@ -771,10 +788,10 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
 
 - **Copy rounds** (`nextDspark`, `mtp_lookup.matchBest` / `copyLen` / `CopyBackoff`, the MTP lookup's index): when the committed tail
   plus t1 matches 16 or more tokens earlier in the prompt or output (the best of the last 8 occurrences) and the continuation
-  outruns the stage block, the round verifies the copy (up to 7 drafts) and skips the stage draft. It is capped at 8 rows,
-  `dsv41_exact_verify_rows`: past `PROJECT_ROWS_MAX` the trunk linears leave the multi-row arm for the sorted GEMM (`exl3/linear.zig`),
-  so 9-16 row verifies are not the one-row step's bits (the tiny fixture's text differs from the first token; follow-up: exact verify
-  past 8 rows, then the cap can rise to 16). A backoff skips copies that lose to the stage rounds on ms per token, a doubling stretch
+  outruns the stage block, the round verifies the copy (up to 7 drafts) and skips the stage draft. It is capped at 8 rows
+  (`dsv41_exact_verify_rows`), a cap that is now only the copy round's: a verify is the one-row step's bits at every width up to
+  16 on a machine with matrix units (`Model.arm(.verify)` takes the wide exact arm past `PROJECT_ROWS_MAX`; [a row alone](#prefill-width)),
+  so a wider copy round is open as a speed lever. A backoff skips copies that lose to the stage rounds on ms per token, a doubling stretch
   up to 16 matches, and sizes a copy to what copies have landed plus 2. Greedy text is byte-identical on and off. Design after
   CommunityServe/plugins #15 (@STRML, MIT). Pack `DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw`, `--ssd-budget-gb 108`, greedy, no
   thinking, 800 tokens, main + copy arm `aacdc607` ReleaseFast, GPU lock, fans max, `taskpolicy -a`, arm off by a temporary env knob
@@ -889,9 +906,9 @@ verdict is a value built on the logits), and neither it nor `finishVerify` waits
 wait besides the layers' pick reads (`dsv41 DSpark: a verify round waits on neither ...`, `readsAt`). On the same gate (text, no tap/trace/profile, layer 0 not an Engram
 layer) the forward queues the argmax, the embedding gather and layer 0 before the host reads the token
 (`dsv41_model.extendLazy`, `Model.lazy_starts`); the host then reads the token, hashes it for the Engram rows and runs
-layer 1 on. A token the pass refuses (an image id without image rows) restores layer 0's state (`Undo`) and the next
-forward at that position gives the bytes of one that never saw it (`dsv41 generator: a one-row decode that hands its
-logits back unevaluated and queues layer 0 ahead of its token ...`, tokens and logits bit for bit). The FFN's hc split
+layer 1 on; the token read first or still on the GPU, the forward gives the same bytes (`dsv41 generator: a one-row decode
+that hands its logits back unevaluated and queues layer 0 ahead of its token ...`, tokens and logits bit for bit, an image
+id the model emitted included). The FFN's hc split
 (`sf`: pre, post, comb) is a second threadgroup of the router's launch (`dsv41_route_split`) and leaves with the picks (`submitWith`,
 `Spec.queue`'s `ride`), so the one-simdgroup Sinkhorn runs beside the picks and not in a buffer of its own behind the routed chain; same bytes
 (`dsv41 submit`, `dsv41 route split`). Together with the picks kernel and the hc expand grid, serial `--no-mtp` decode at 4.7k went
@@ -1136,12 +1153,16 @@ across threadgroups, and a block's pick width is its last row's, so a row sat in
 one-row step and sum in another order. Each row therefore splits its own `min(K, (pos + 1) / ratio)` picks (`DecodeArgs.ratio`) at
 its own `attnSplits` count, and the rows of a round that take different counts run as separate launches (only a round straddling a
 split step makes more than one). The real-pack probe (`SUSHI_DSV41_REAL_PACK`, `testsuite.md`) compares every verify row with its
-one-row round layer by layer. Where there is no NAX the arms are the same and nothing changes. `--no-mtp` serial keeps its SIMD
-one-row arm, so its text can part from DSpark's at a near-tie (it is itself the same at every repeat). `SUSHI_DSV41_DSPARK_EXACT=0`
+one-row round layer by layer. Where there is no NAX the arms are the same and nothing changes. A serial step of a load
+that has a drafter (a request with logprobs, the rounds a stop switch turns plain) is a round of one row by another
+road and takes the round's arm (`Model.arm(.step)`), so a token's logits do not depend on which of the
+two fed it; it pays the exact arm's one-row cost (41.6 against 46.8 tok/s on a serial-only request, STQ 1.75bpw).
+`--no-mtp` has no drafter and no rounds: its serial step keeps the SIMD one-row arm, so its text can part from a
+DSpark load's at a near-tie (it is itself the same at every repeat). `SUSHI_DSV41_DSPARK_EXACT=0`
 restores the arms that sum by width (SIMD one-row step, NAX head at 2..8 rows); text then depends on the round mix. What holds
 either way is that a generation's stream and non-stream responses carry the same bytes.
 `--max-mtp-ctx` ends drafting for the rest of a request once prompt + generated passes it (plain 1-row rounds), as it does
-for MTP. A drafted image id ends the verify chunk before it: only a prompt carries one, and the model refuses it without rows.
+for MTP. A drafted image id rides the verify chunk as the plain token it is ([image input](#image-input)).
 A round (draft 12-17 ms, verify 450-750 ms) costs about 2.6 serial
 decode steps, since five rows route to more streamed experts than one, so only acceptance above that pays.
 
@@ -1200,7 +1221,12 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   too); `engramWrite` leaves their stream untouched; their Engram id is `Hash.DEAD`, so no n-gram spans an image
   (`compressedId`, also on a restored history). A one-row chunk holding an image position skips the fused decode FFN.
   The CED replay slices the image mask with its rows. DSpark's draft is text and reads the target layers' streams, which
-  already hold the image rows, so an image request keeps DSpark.
+  already hold the image rows, so an image request keeps DSpark. An image id with no row behind it (in a request
+  without images, or after a request's last row: one the model emitted, or a prompt wrote as text) is a plain token,
+  as the release's forward has no image mask without image spans: its own embedding, the text bias, DSpark verifies it
+  like any id. One difference from the release: its Engram id stays `Hash.DEAD`, so its n-grams read as the pad's and
+  no n-gram spans it, since a restored prefix rebuilds the history from the ids alone (`dsv41 vision: an image id with
+  no row behind it is a plain token ...`). A span longer than its rows is refused by name (`Dsv41VisionRowsShort`).
 - **Prefix cache**: the lookup takes the request's media key and boundary (`lookupAndRestoreDsv41`), so ids that
   repeat under another image restore only the text before it, and a write-through point lands only in a record of its
   own key ([engine-prefix-cache](engine-prefix-cache.md)); the splice resumes at the image rows inside the restored

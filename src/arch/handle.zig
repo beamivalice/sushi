@@ -42,6 +42,19 @@ pub fn stream(h: Handle) mlx.mlx_stream {
     return trunk(h).s;
 }
 
+/// The inference thread's turn for one unit of work on a model: the model of `h`, or before it has one the model
+/// `cfg` will load. Beside a model whose load holds the engine's scope, the work of any other steps out of that
+/// scope for its span (`engine.turnTo`); in a process no load holds, a turn is nothing.
+pub fn turnFor(h: ?Handle, cfg: ?*const trunk_mod.ModelConfig) mlx.engine.Turn {
+    if (!mlx.engine.holding()) return .{};
+    return mlx.engine.turnTo(onEngine(h, cfg));
+}
+
+/// Whether the model of `h`, or before it has one the model `cfg` will load, runs on the engine's own stream.
+pub fn onEngine(h: ?Handle, cfg: ?*const trunk_mod.ModelConfig) bool {
+    return if (h) |handle| mlx.engine.isStream(stream(handle)) else if (cfg) |c| arch_life.ownStream(c) != null else false;
+}
+
 pub fn config(h: Handle) *const trunk_mod.ModelConfig {
     return &trunk(h).config;
 }
@@ -67,6 +80,78 @@ pub fn logitBias(h: Handle) []const @import("../logit_bias.zig").Bias {
 
 pub fn flushImatrix(h: Handle) void {
     trunk(h).flushImatrix();
+}
+
+/// Runs `run` on `items` in the turn of the side that owns them. Beside a load that holds the engine's scope the
+/// items of each side are a run of their own, a side's items in the order they came: those on MLX (`own` false), then
+/// those `onEngineOf` names. No model's work then runs in a turn of the other side. In a process no load holds, one
+/// run of them all, `own` false.
+pub fn perSide(comptime T: type, items: []T, comptime onEngineOf: fn (T) bool, ctx: anytype, comptime run: fn (@TypeOf(ctx), []T, bool) anyerror!void) !void {
+    if (!mlx.engine.holding()) return run(ctx, items, false);
+    std.sort.insertion(T, items, {}, struct {
+        fn mlxFirst(_: void, a: T, b: T) bool {
+            return !onEngineOf(a) and onEngineOf(b);
+        }
+    }.mlxFirst);
+    var split: usize = 0;
+    while (split < items.len and !onEngineOf(items[split])) split += 1;
+    for ([_][]T{ items[0..split], items[split..] }, [_]bool{ false, true }) |side, own| {
+        if (side.len == 0) continue;
+        const turn = mlx.engine.turnTo(own);
+        defer turn.end();
+        try run(ctx, side, own);
+    }
+}
+
+test "beside a held scope each side's items run in that side's turn, in their order; with no hold they run as one" {
+    try mlx.requireGpu();
+    const Item = struct { id: u8, own: bool };
+    const Seen = struct {
+        runs: usize = 0,
+        ids: [2][4]u8 = @splat(@splat(0)),
+        lens: [2]usize = .{ 0, 0 },
+        own: [2]bool = .{ false, false },
+        active: [2]bool = .{ false, false },
+        rest: [2]bool = .{ false, false },
+
+        fn run(self: *@This(), items: []Item, own: bool) anyerror!void {
+            const at = self.runs;
+            self.runs += 1;
+            for (items, 0..) |it, i| self.ids[at][i] = it.id;
+            self.lens[at] = items.len;
+            self.own[at] = own;
+            self.active[at] = mlx.engine.active;
+            self.rest[at] = mlx.engine.mlx_at_rest.on.load(.acquire);
+        }
+    };
+    const onEngineOf = struct {
+        fn f(it: Item) bool {
+            return it.own;
+        }
+    }.f;
+    var items = [_]Item{ .{ .id = 1, .own = true }, .{ .id = 2, .own = false }, .{ .id = 3, .own = true }, .{ .id = 4, .own = false } };
+    var alone: Seen = .{};
+    try perSide(Item, &items, onEngineOf, &alone, Seen.run);
+    try std.testing.expectEqual(@as(usize, 1), alone.runs);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, alone.ids[0][0..alone.lens[0]]);
+    try std.testing.expect(!alone.own[0]);
+
+    const was_enabled = mlx.engine.enabled;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    mlx.engine.hold();
+    defer mlx.engine.unhold();
+    const swallows = mlx.rest_swallows.load(.monotonic);
+    var held: Seen = .{};
+    try perSide(Item, &items, onEngineOf, &held, Seen.run);
+    try std.testing.expectEqual(@as(usize, 2), held.runs);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 4 }, held.ids[0][0..held.lens[0]]);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 3 }, held.ids[1][0..held.lens[1]]);
+    try std.testing.expectEqual([2]bool{ false, true }, held.own);
+    try std.testing.expectEqual([2]bool{ false, true }, held.active);
+    try std.testing.expectEqual([2]bool{ false, true }, held.rest);
+    // Back as the hold left it.
+    try std.testing.expect(mlx.engine.active and mlx.engine.mlx_at_rest.on.load(.acquire));
+    try std.testing.expectEqual(swallows, mlx.rest_swallows.load(.monotonic));
 }
 
 test "a handle reads back the trunk it was made from, its stream, config and logit bias" {

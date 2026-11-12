@@ -239,8 +239,9 @@ pub fn dequantize(w_in: *Tensor, scales_in: *Tensor, biases_in: ?*Tensor, group:
     core.bindOut(p, out, 3);
     core.dispatch(p, .{ .x = threads }, .{ .x = @min(k.max_threads, threads) });
     if (kernel_type == out_type) return out;
-    defer core.release(out);
-    return ops.astype(out, out_type);
+    const cast = try ops.astype(out, out_type);
+    core.release(out);
+    return cast;
 }
 
 /// `quantize` in affine mode (`quantize_impl`): the packed codes of `w` (uint32) and, per group of `group` values

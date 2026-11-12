@@ -42,6 +42,14 @@ var pool_now: ?u64 = null;
 var transient_now: bool = false;
 /// The process-wide cap the load replaced with the decode cap; null while none is lowered.
 var ram_limit: ?u64 = null;
+/// Loads on MLX that hold the lowered cap: the last one to unload gives the process-wide cap back.
+var ram_cappers: u32 = 0;
+
+/// Whether `config`'s forwards allocate on the engine of our own. Such a model moves the engine's budget and nothing
+/// of MLX's; a model on MLX moves MLX's caps and nothing of the engine's. Each hook below takes one branch.
+fn ownsEngine(config: *const ModelConfig) bool {
+    return if (config.dsv41) |*c| ownDecode(c) else false;
+}
 
 pub const PoolOps = struct {
     set_limit: *const fn (bytes: u64) void,
@@ -157,15 +165,18 @@ pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const C
         return false;
     }
     const split = splitOf(rows, seq, c);
+    if (ownDecode(c)) {
+        ops.set_own(split.own);
+        return false;
+    }
     setTransient(phaseLimit(split.mlx, config), ops);
-    ops.set_own(split.own);
     return moveCap(rowsCap(rows, config), config, ops);
 }
 
 /// A forward of the load's warm: the engine's share of the cap a request's forward of `rows` ending at `seq` has. Nothing
 /// outside the warm.
 pub fn enterWarm(rows: u64, seq: u64, c: *const Config, ops: PoolOps) void {
-    if (!warm_budget) return;
+    if (!warm_budget or !ownDecode(c)) return;
     warm_budget_set = true;
     ops.set_own(warm_budget_override orelse splitOf(rows, seq, c).own);
 }
@@ -186,24 +197,23 @@ pub fn endWarmMlx() void {
     endWarm(mlx_ops);
 }
 
-/// What a forward's cap leaves to MLX and to the engine of our own. A wide chunk on the engine splits the one cap its
-/// bill reserves: MLX keeps the state rows it appends, the engine's pool takes the rest.
+/// What a forward's cap leaves to MLX and to the engine of our own. A wide chunk on the engine takes the whole cap its
+/// bill reserves: the state rows it appends grow in the engine's pool with the rest, and MLX allocates nothing.
 fn splitOf(rows: u64, seq: u64, c: *const Config) struct { mlx: u64, own: u64 } {
     const cap = c.forwardCap(rows, seq);
-    const wide_own = rows > verify_rows and ownDecode(c);
-    const mlx_cap = if (wide_own) c.forwardCapMlx(rows, seq) else cap;
-    return .{ .mlx = mlx_cap, .own = if (wide_own) cap - mlx_cap else ownCap(c, seq) };
+    if (!ownDecode(c)) return .{ .mlx = cap, .own = 0 };
+    return .{ .mlx = 0, .own = if (rows > verify_rows) cap else ownCap(c, seq) };
 }
 
 /// An image encode of `bill` bytes (`request_media.visionEncodeBill`) starts: its allocations are capped at it. No bill, no cap.
 pub fn enterVision(bill: u64, config: *const ModelConfig, ops: PoolOps) void {
-    if (pool_ram_cap == 0 or bill == 0 or !arch_config.isOf(config, "dsv41")) return;
+    if (pool_ram_cap == 0 or bill == 0 or !arch_config.isOf(config, "dsv41") or ownsEngine(config)) return;
     setTransient(phaseLimit(bill, config), ops);
 }
 
 /// The encode is over; the next forward installs its own cap.
 pub fn leaveVision(config: *const ModelConfig, ops: PoolOps) void {
-    if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41") or !transient_now) return;
+    if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41") or ownsEngine(config) or !transient_now) return;
     setTransient(0, ops);
 }
 
@@ -211,25 +221,36 @@ pub fn leaveVision(config: *const ModelConfig, ops: PoolOps) void {
 /// state before its first forward) and the pool cap drops back to the decode cap.
 pub fn endRequest(config: *const ModelConfig, ops: PoolOps) bool {
     if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41")) return false;
+    if (ownsEngine(config)) {
+        // The next request bills the engine's cap from its own length: the shortest one covers what stays.
+        ops.set_own(ownCap(&config.dsv41.?, 1));
+        return false;
+    }
     const was_on = transient_now;
     if (was_on) setTransient(0, ops);
-    // The next request bills the engine's cap from its own length: the shortest one covers what stays.
-    if (config.dsv41) |*c| ops.set_own(ownCap(c, 1));
     return moveCap(config.expertPoolBytes(), config, ops) or was_on;
 }
 
 /// The load lowered the process-wide cap from `prev` to the ledger's decode cap.
 pub fn poolCapped(prev: u64) void {
     if (ram_limit == null) ram_limit = prev;
+    ram_cappers += 1;
 }
 
 /// A DeepSeek model is unloaded: the next model gets the process-wide cap back, and the raised cap is forgotten.
 pub fn unloadModel(config: *const ModelConfig, ops: PoolOps) bool {
     if (!arch_config.isOf(config, "dsv41")) return false;
+    if (ownsEngine(config)) {
+        // The engine's free buffers go, and then its cap: a cap is a forward's, and the next load makes tensors before any.
+        ops.set_own(0);
+        ops.set_own(std.math.maxInt(u64));
+        return false;
+    }
     pool_now = null;
     if (transient_now) setTransient(0, ops);
-    ops.set_own(0);
     const prev = ram_limit orelse return false;
+    ram_cappers -|= 1;
+    if (ram_cappers > 0) return false;
     ram_limit = null;
     ops.set_limit(prev);
     return true;
@@ -456,12 +477,14 @@ const PoolProbe = struct {
     var transient: u64 = 0;
     var transient_sets: usize = 0;
     var own: u64 = 0;
+    var own_sets: usize = 0;
     fn reset() void {
         n = 0;
         cleared = 0;
         transient = 0;
         transient_sets = 0;
         own = 0;
+        own_sets = 0;
     }
     fn capTransient(bytes: u64) void {
         transient = bytes;
@@ -476,22 +499,25 @@ const PoolProbe = struct {
     }
     fn capOwn(bytes: u64) void {
         own = bytes;
+        own_sets += 1;
     }
     const ops: PoolOps = .{ .set_limit = &set, .clear = &clear, .set_transient = &capTransient, .set_own = &capOwn };
 };
 
 fn withPoolState(ram_cap: u64, body: *const fn () anyerror!void) !void {
-    const saved = .{ pool_ram_cap, pool_now, ram_limit, transient_now };
+    const saved = .{ pool_ram_cap, pool_now, ram_limit, transient_now, ram_cappers };
     defer {
         pool_ram_cap = saved[0];
         pool_now = saved[1];
         ram_limit = saved[2];
         transient_now = saved[3];
+        ram_cappers = saved[4];
     }
     pool_ram_cap = ram_cap;
     pool_now = null;
     ram_limit = null;
     transient_now = false;
+    ram_cappers = 0;
     PoolProbe.reset();
     try body();
 }
@@ -531,7 +557,7 @@ test "dsv41 borrow: a forward moves the pool cap to its rows' cap, and lowering 
     try testing.expectEqual(@as(usize, 0), PoolProbe.transient_sets);
 }
 
-test "dsv41 borrow: a wide chunk on the engine splits the cap it bills between MLX and the engine, which sum to it" {
+test "dsv41 borrow: a wide chunk on the engine gives the engine's pool the whole cap it bills, the state's growth included" {
     const Body = struct {
         fn run() anyerror!void {
             const config = try dsv41Config();
@@ -540,10 +566,11 @@ test "dsv41 borrow: a wide chunk on the engine splits the cap it bills between M
             defer own_override = null;
             for ([_][2]u64{ .{ 2048, 2048 }, .{ 1100, 1 << 20 }, .{ 31, 4096 } }) |chunk| {
                 _ = enterForward(chunk[0], chunk[1], &config, c, PoolProbe.ops);
-                const mlx_share = PoolProbe.transient - config.expertPoolBytes();
-                try testing.expect(mlx_share > 0 and PoolProbe.own > 0);
-                try testing.expectEqual(c.forwardCap(chunk[0], chunk[1]), mlx_share + PoolProbe.own);
+                try testing.expectEqual(c.forwardCap(chunk[0], chunk[1]), PoolProbe.own);
             }
+            // Nothing of MLX's is a Cooler load's to move: its caps belong to the models that allocate there.
+            try testing.expectEqual(@as(usize, 0), PoolProbe.n);
+            try testing.expectEqual(@as(usize, 0), PoolProbe.transient_sets);
         }
     };
     try withPoolState(8 << 30, &Body.run);
@@ -580,9 +607,9 @@ test "dsv41 borrow: the load's warm gives each engine forward, of any width, the
             enterWarm(1, 4096, c, PoolProbe.ops);
             try testing.expectEqual(@as(u64, 0), PoolProbe.own);
             warm_budget = true;
-            // A wide chunk takes its share of the one cap; a decode-width forward, whatever its rows, the decode cap at its position.
+            // A wide chunk takes the one cap whole; a decode-width forward, whatever its rows, the decode cap at its position.
             try testing.expect(!enterForward(2048, 2048, &config, c, PoolProbe.ops));
-            try testing.expectEqual(c.forwardCap(2048, 2048) - c.forwardCapMlx(2048, 2048), PoolProbe.own);
+            try testing.expectEqual(c.forwardCap(2048, 2048), PoolProbe.own);
             for ([_]u64{ 1, 3, verify_rows }) |rows| {
                 enterWarm(rows, 4096 + rows, c, PoolProbe.ops);
                 try testing.expectEqual(ownCap(c, 4096 + rows), PoolProbe.own);
@@ -675,8 +702,6 @@ test "dsv41 borrow: unloading DeepSeek gives the next model the process-wide poo
             const config = try dsv41Config();
             const ram: u64 = 8 << 30;
             poolCapped(ram);
-            // A second load keeps the cap the first one replaced.
-            poolCapped(config.expertPoolBytes());
             try testing.expect(enterForward(2048, 2048, &config, &config.dsv41.?, PoolProbe.ops));
             try testing.expect(pool_now != null);
             try testing.expect(unloadModel(&config, PoolProbe.ops));
@@ -688,6 +713,7 @@ test "dsv41 borrow: unloading DeepSeek gives the next model the process-wide poo
             const n = PoolProbe.n;
             try testing.expect(!unloadModel(&config, PoolProbe.ops));
             poolCapped(ram);
+            defer ram_cappers = 0;
             const qwen = ModelConfig{ .model_type = "qwen4_exp" };
             try testing.expect(!unloadModel(&qwen, PoolProbe.ops));
             try testing.expectEqual(n, PoolProbe.n);
@@ -711,11 +737,12 @@ test "dsv41 borrow: with decode on the engine of our own every forward installs 
             try testing.expectEqual(c.forwardCap(verify_rows, 9_000), PoolProbe.own);
             // A prefill chunk takes the cap less MLX's share.
             _ = enterForward(2048, 225_000, &config, c, PoolProbe.ops);
-            try testing.expectEqual(c.forwardCap(2048, 225_000) - c.forwardCapMlx(2048, 225_000), PoolProbe.own);
+            try testing.expectEqual(c.forwardCap(2048, 225_000), PoolProbe.own);
             _ = endRequest(&config, PoolProbe.ops);
             try testing.expectEqual(c.forwardCap(verify_rows, 1), PoolProbe.own);
+            // The unload trims the engine's pool and leaves it without a cap for the next load.
             _ = unloadModel(&config, PoolProbe.ops);
-            try testing.expectEqual(@as(u64, 0), PoolProbe.own);
+            try testing.expectEqual(@as(u64, std.math.maxInt(u64)), PoolProbe.own);
         }
     };
     PoolProbe.reset();
@@ -745,4 +772,179 @@ test "dsv41 borrow: the load line names the side and why, with Sushi Cooler as t
     try testing.expectEqualStrings("[dsv41] decode forwards: on MLX because model-settings.json ds41_cooler is off (Sushi Cooler is off)", decodeLine(.mlx_by_setting));
     try testing.expect(std.mem.indexOf(u8, decodeLine(.mlx_not_stq), "FP8 trunk or MXFP4 experts") != null);
     try testing.expect(std.mem.indexOf(u8, decodeLine(.mlx_no_matrix_units), "matrix units") != null);
+}
+
+test "dsv41 borrow: beside a Cooler model, a model on MLX has its transient cap lifted at its request's end" {
+    try mlx.requireGpu();
+    const Body = struct {
+        fn run() anyerror!void {
+            const config = try dsv41Config();
+            const c = &config.dsv41.?;
+            const was_enabled = mlx.engine.enabled;
+            mlx.engine.enabled = true;
+            defer @import("../test_support.zig").restoreEngine(was_enabled);
+            defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+            defer own_override = null;
+            mlx.engine.hold();
+            defer mlx.engine.unhold();
+            {
+                const turn = mlx.engine.turnTo(false);
+                defer turn.end();
+                try testing.expectEqual(@as(usize, 0), mlx.setTransientLimit(0));
+                own_override = false;
+                _ = enterForward(1, 9_000, &config, c, mlx_ops);
+            }
+            {
+                const turn = mlx.engine.turnTo(true);
+                defer turn.end();
+                own_override = true;
+                _ = endRequest(&config, mlx_ops);
+            }
+            const turn = mlx.engine.turnTo(false);
+            defer turn.end();
+            own_override = false;
+            _ = endRequest(&config, mlx_ops);
+            try testing.expectEqual(@as(usize, 0), mlx.setTransientLimit(0));
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: beside a Cooler model's forward, a model on MLX drops its pool cap back for its decode" {
+    try mlx.requireGpu();
+    const Body = struct {
+        fn run() anyerror!void {
+            const config = try dsv41Config();
+            const c = &config.dsv41.?;
+            const was_enabled = mlx.engine.enabled;
+            mlx.engine.enabled = true;
+            defer @import("../test_support.zig").restoreEngine(was_enabled);
+            defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+            defer own_override = null;
+            var orig: usize = 0;
+            try mlx.check(mlx.mlx_set_cache_limit(&orig, 1 << 40));
+            defer {
+                var unused: usize = 0;
+                _ = mlx.mlx_set_cache_limit(&unused, orig);
+                _ = mlx.setTransientLimit(0);
+            }
+            mlx.engine.hold();
+            defer mlx.engine.unhold();
+            {
+                const turn = mlx.engine.turnTo(false);
+                defer turn.end();
+                own_override = false;
+                try testing.expect(enterForward(2048, 2048, &config, c, mlx_ops));
+            }
+            {
+                const turn = mlx.engine.turnTo(true);
+                defer turn.end();
+                own_override = true;
+                _ = enterForward(1, 4097, &config, c, mlx_ops);
+            }
+            const turn = mlx.engine.turnTo(false);
+            defer turn.end();
+            own_override = false;
+            _ = enterForward(1, 2049, &config, c, mlx_ops);
+            var now: usize = 0;
+            try mlx.check(mlx.mlx_set_cache_limit(&now, 1 << 40));
+            try testing.expectEqual(config.expertPoolBytes(), now);
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: a Cooler model's unload leaves MLX's lowered pool cap to the model on MLX, whose unload gives it back" {
+    try mlx.requireGpu();
+    const Body = struct {
+        fn run() anyerror!void {
+            const config = try dsv41Config();
+            const was_enabled = mlx.engine.enabled;
+            mlx.engine.enabled = true;
+            defer @import("../test_support.zig").restoreEngine(was_enabled);
+            defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+            defer own_override = null;
+            var orig: usize = 0;
+            try mlx.check(mlx.mlx_set_cache_limit(&orig, 1 << 40));
+            defer {
+                var unused: usize = 0;
+                _ = mlx.mlx_set_cache_limit(&unused, orig);
+            }
+            mlx.engine.hold();
+            {
+                // The model on MLX loads: the ledger lowers MLX's pool cap in its turn.
+                const turn = mlx.engine.turnTo(false);
+                defer turn.end();
+                var prev: usize = 0;
+                try mlx.check(mlx.mlx_set_cache_limit(&prev, 3 << 30));
+                poolCapped(prev);
+            }
+            own_override = true;
+            unloadModelMlx(&config);
+            mlx.engine.unhold();
+            var now: usize = 0;
+            try mlx.check(mlx.mlx_set_cache_limit(&now, 3 << 30));
+            try testing.expectEqual(@as(usize, 3 << 30), now);
+            own_override = false;
+            unloadModelMlx(&config);
+            try mlx.check(mlx.mlx_set_cache_limit(&now, 1 << 40));
+            try testing.expectEqual(@as(usize, 1 << 40), now);
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: a model on MLX never moves the engine's budget, at a forward, a request's end or its unload" {
+    const Body = struct {
+        fn run() anyerror!void {
+            const config = try dsv41Config();
+            const c = &config.dsv41.?;
+            own_override = false;
+            defer own_override = null;
+            const sets = PoolProbe.own_sets;
+            _ = enterForward(1, 9_000, &config, c, PoolProbe.ops);
+            _ = enterForward(2048, 2048, &config, c, PoolProbe.ops);
+            _ = endRequest(&config, PoolProbe.ops);
+            _ = unloadModel(&config, PoolProbe.ops);
+            try testing.expectEqual(sets, PoolProbe.own_sets);
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: two models on MLX: the lowered pool cap goes back when the second of them unloads" {
+    const Body = struct {
+        fn run() anyerror!void {
+            const config = try dsv41Config();
+            own_override = false;
+            defer own_override = null;
+            poolCapped(8 << 30);
+            poolCapped(1 << 30);
+            try testing.expect(!unloadModel(&config, PoolProbe.ops));
+            try testing.expectEqual(@as(usize, 0), PoolProbe.n);
+            try testing.expect(unloadModel(&config, PoolProbe.ops));
+            try testing.expectEqual(@as(u64, 8 << 30), PoolProbe.limits[PoolProbe.n - 1]);
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: the ledger bills the pool that is parked: MLX's decode pool, or a Cooler load's engine buffers under its idle cap" {
+    const config = try dsv41Config();
+    const c = &config.dsv41.?;
+    defer own_override = null;
+    own_override = false;
+    try testing.expectEqual(cfg_mod.dsv41_pool_bytes, config.expertPoolBytes());
+    own_override = true;
+    try testing.expectEqual(c.forwardCap(verify_rows, 1), config.expertPoolBytes());
+    try testing.expect(config.expertPoolBytes() < cfg_mod.dsv41_pool_bytes);
+    // What a request's end leaves the engine is what the ledger billed.
+    const Body = struct {
+        fn run() anyerror!void {
+            const cfg = try dsv41Config();
+            _ = endRequest(&cfg, PoolProbe.ops);
+            try testing.expectEqual(cfg.expertPoolBytes(), PoolProbe.own);
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
 }

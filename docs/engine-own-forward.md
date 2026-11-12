@@ -97,9 +97,10 @@ whole, part and not at all on the GEMM tiles, the held-back tail, one chunk per 
 compressed-row count under 17), so a request compiles no kernel; MLX's own prefill warm stays beside it, for the image
 forwards.
 
-A wide chunk on the engine bills the one `Config.forwardCap` it always did, split between the two sides
-(`forwardCapMlx`: the state rows MLX appends and 64 MB; the engine's pool takes the rest), so MLX's peak above its
-start plus the pool's held peak stays under the bill. `serve` installs the caps after the load, so the load's warm
+A wide chunk on the engine bills the one `Config.forwardCap` it always did and the engine's pool takes it whole: the
+state rows the chunk appends grow in that pool (a ring's new buffer beside its old one), and MLX allocates nothing
+under a Cooler load. The split that left the state's growth to MLX (`forwardCapMlx`) dates from the state on MLX; it
+under-capped the pool by 0.18 GB at 225k tokens and 0.58 GB at 1M. `serve` installs the caps after the load, so the load's warm
 gives every forward of the engine, decode-width or wide, the engine's share a request's forward has (`warm_budget`,
 `enterWarm`, the same `splitOf` as serve): a forward the bill does not cover fails the load with `PoolOverBudget`, not a
 request with a Metal OOM, and the budget is lifted when the warm ends.
@@ -176,7 +177,23 @@ route and the MLX arm still build the bank at prepare time.
   These were the last calls of a request: 300 to 700 each on the real pack.
 - **The hold begins with the load job** (`model_load.doLoadOnInferenceThread`, for an arch that brings its own
   stream; the model keeps a hold of its own from `initDsv41` to its unload). What the job did on MLX before the
-  model was made is under it: the pool cap of the ledger, the readings around the weights, the wired limit.
+  model was made is under it: the readings around the weights, the wired limit. The ledger's cap of MLX's pool is
+  an MLX load's alone (`capMlxPool`): a Cooler load swallowed it, and an MLX model loaded after it ran uncapped.
+- **Another model takes a turn** (`engine.turnTo`, `Turn.end`; `arch_handle.turnFor`, `model_load.JobTurn`). While a
+  Cooler load holds, work for a model that is not the engine's steps out of the scope and of the allocator at rest
+  for its span and steps back at its end: the scheduler's prefill, decode ticks, slot cleanup and live-state flush,
+  an image encode, a cache clear, and the load, evict and unload jobs. Inside a turn MLX is asked as it always was;
+  after it the hold reads MLX's allocator again (MLX changed). A Cooler model's forwards after another model's turn
+  ask nothing of MLX (pinned: `beside a resident Cooler model, a model on MLX loads, runs and unloads`).
+- **What the two sides share is kept per side.** A config MLX made, or the MLX twin of a config of ours, takes a new
+  grid or threadgroup when it next launches on MLX (`Config.behind`), never from inside the engine's scope. The EXL3
+  module asks its host which side a stream is (`src/exl3/host_side.zig`, which names no engine: mlx-serve vendors
+  the module) and keeps its GEMM input ring and zero-slot rows one per side.
+- **A kernel is noted in a served process whatever the engine's state** (`route.noting`: a GPU with matrix units),
+  so a kernel or config a module made before the first Cooler load launches on the engine like one made after it.
+- **A Cooler pack loads again after its unload.** `dsv41_borrow.unloadModel` leaves the pool empty and uncapped, and
+  `initDsv41` sets its own budget and unseals the pipelines before it proves a kernel. The NAX GEMM arm proven on the
+  engine's side stays proven: a later build that fails there is an error, never a switch to another arm.
 - **The device is asked once a process** (`mlx.deviceArchitecture`, `maxRecommendedWorkingSet`; the boot asks what a
   load would, the NAX question of the EXL3 kernels included). A live Cooler process (STQ 1.75bpw, 348b99fb plus this
   change) makes 27 calls into mlx-c, all in its boot: the device, the default device and seed, the pool cap, one
@@ -195,6 +212,22 @@ route and the MLX arm still build the bank at prepare time.
 - **A Cooler load runs no forward on MLX.** The load's warm used to run three prefill chunks through MLX whatever
   the decode side; they only built the state the engine's own warms start from. Where prefill is the engine's they
   run on the engine, and with the pipelines read from a manifest they do not run at all.
+
+- **At rest MLX is asked nothing and told nothing, and both are counted.** A call that reaches mlx-c while MLX's
+  allocator is at rest is a break (`mlx.rest_breaks`); a setting asked there (a pool clear, a limit, a peak reset)
+  reaches nothing and is counted (`mlx.rest_swallows`). Both are zero in the census, and a Cooler unload warns when
+  they are not. An array of MLX's that reaches an op of ours at rest is refused by name (`MlxAtRest`), as is a lend.
+- **Work for MLX asked at rest is owed, not dropped** (`mlx.payOwed`): the free of a config's MLX twin and the wired
+  limit a load asks for are paid at MLX's next turn or at the last unhold. Before MLX goes to rest the engine frees
+  the MLX arrays it retired (`core.settleMlxAliases`).
+- **A turn that changes nothing asks nothing.** A turn of the engine's inside another reads nothing; MLX's pool is
+  emptied by the first hold only, and its allocator is read again only by the turn that woke it.
+- **The scope's state has one owner** (`src/tensor/route.zig`): `enable`, `makers(own)`, `unsealed()`, `enter`,
+  `turnTo`, `hold` and `unhold` are guards that give back what they found. No other file writes `engine.active` or
+  `engine.enabled` (lint rule `scope-state`).
+- **The last Cooler unload leaves nothing of the engine's in use**: the pool is empty and the EXL3 module's arrays of
+  the engine's side (its GEMM input ring, a unit scalar) go with it (`sushi_exl3.dropHostArrays`). Pinned from zero:
+  `requests, repeated, leave the engine's pool as they found it, and an unload gives back everything`.
 
 ## Crossing between the two
 
@@ -471,6 +504,20 @@ rebuilds one.
   so a wait at the request's end (0.6 s here) showed in no bench column, only in the time to the last stream chunk.
 - **A cleanup is checked by the full suite**: a filter compiles only the tests it names, and a type removed as
   unused was still a test's.
+
+- **Error paths are swept, not reasoned about**: `mlx.engine.fault.arm(k)` refuses the pool's k-th buffer, and a test
+  walks k over a whole request (`a request refused at any one of its pool buffers leaves the next request its clean
+  bytes`). A tensor released twice is latched and counted (`core.double_releases`), never returned to the pool twice.
+- **A read of bytes nothing wrote is caught by poison** (`mlx.engine.poison`): every buffer the pool hands out and
+  every free one written over, the forwards and requests must give the clean bytes.
+- **The census counts the engine's work too**: every phase of a Cooler load's life dispatches the same at a later
+  load of the process, so a one-time cost that slipped into a request shows as a difference.
+- **Kernels are held to MLX over the edges, in tables**: the special floats and every exponent through each
+  elementwise op, cast, reduction, sort and scan, and each op over a turned view, a strided slice, a slice of a
+  slice, a broadcast and an empty view (`engine elementwise ops, casts, ...`, `engine ops give MLX's bytes over ...`).
+  What MLX itself gets wrong or refuses is named in the test ([engine-mlx-gotchas](engine-mlx-gotchas.md#what-mlxs-bytes-depend-on)).
+- An op whose result has no elements returns it without a dispatch; a reduction over an axis of no elements into a
+  result that has some is refused by name. An MLX array of no elements imports as an empty tensor of ours.
 
 ## Ruled out
 

@@ -20,6 +20,7 @@ const prefix_arch = @import("arch/prefix.zig");
 const arch_serve = @import("arch/serve.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
+const kv_disk_fs = @import("kv_disk_fs.zig");
 const disk_placement = @import("disk_placement.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -1470,6 +1471,12 @@ pub const CacheAttach = struct {
 
 pub const AttachMode = enum { load, rearm };
 
+/// The plain-file backend reads and writes its tensor files through MLX arrays: a model whose arrays are the
+/// engine's has no tier there.
+fn plainFilesNeedMlx(backend: kv_disk_fs.Backend, arrays_on: ?mlx.mlx_stream) bool {
+    return backend == .real and arrays_on != null;
+}
+
 /// Brings up the model's SSD tier and the hot prefix cache hanging off it, and bills the tier on the config.
 /// `entry` has its config, path and handle; `disk_bytes` is the SSD ask. A re-arm of a declined tier logs nothing
 /// when it fails and leaves the config declined; one that finds the cache built (a RAM tier) attaches the tier to it.
@@ -1501,6 +1508,10 @@ fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedMod
         if (ask.explicit()) log.info("{s}\n", .{disk_placement.diskOffLine(&off_buf, 0, "", ask.sourceName())});
     }
     if (cache_applies and disk_bytes > 0 and disk_ok) attach: {
+        if (kv_disk_fs.backendFromEnv() catch null) |backend| if (plainFilesNeedMlx(backend, prefix_arch.arraysOn(config))) {
+            log.atLevel(failed, "[disk-cache] SUSHI_PREFIX_FS=real: the plain files pass through MLX arrays, which this model's load does not make — persistence off for this model\n", .{});
+            break :attach;
+        };
         const layout = diskLayoutKey(allocator, config, entry.path, xfm) catch |err| {
             log.atLevel(failed, "[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
@@ -1572,11 +1583,7 @@ fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedMod
         }
         if (disk_tier) |tier| entry.prefix_cache.?.disk = tier;
         entry.prefix_cache.?.arrays_on = prefix_arch.arraysOn(config);
-        if (entry.prefix_cache.?.disk) |*d| {
-            // MLX reads and writes the plain-file backend's safetensors, so that tier's arrays stay MLX's.
-            if (d.fs.vfs != null) d.arrays_on = entry.prefix_cache.?.arrays_on else if (entry.prefix_cache.?.arrays_on != null)
-                log.warn("[disk-cache] SUSHI_PREFIX_FS=real: this model's state is not MLX's, and the tier's files pass through MLX arrays\n", .{});
-        }
+        if (entry.prefix_cache.?.disk) |*d| d.arrays_on = entry.prefix_cache.?.arrays_on;
         // SSD-first: arch + env switch + a live disk tier (attached above); without one qwen4_exp takes the RAM arm.
         entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
             config,
@@ -1663,9 +1670,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     try model_mod.archGate(params.config);
     // A load whose arch brings its own stream is the engine's from here on; the model keeps a hold of its own to its
     // unload.
-    const own_load = @import("arch/life.zig").ownStream(params.config) != null;
-    if (own_load) mlx.engine.hold();
-    defer if (own_load) mlx.engine.unhold();
+    const job = JobTurn.begin(null, params.config);
+    defer job.end();
+    const own_load = job.own;
     if (params.config.unsupported_note) |note| log.warn("{s}\n", .{note});
     var streaming_resident_bytes: ?u64 = null;
     var expert_source_assigned = false;
@@ -1741,7 +1748,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (led.resident) ", every routed expert resident" else "",
         });
         applyStreamingPlan(params.config, plan, budget.bytes);
-        if (plan.resolved.ledger) |led| if (led.pool_bytes > 0) gpu_mem.capMlxPool(led.pool_bytes);
+        // MLX's pool holds nothing under a load that is the engine's: its cap stays the process's, with none to give back.
+        if (!own_load) if (plan.resolved.ledger) |led| if (led.pool_bytes > 0) gpu_mem.capMlxPool(led.pool_bytes);
         if (params.config.expert_source_dir == null) {
             params.config.expert_source_dir = try sch.allocator.dupe(u8, params.model_dir);
             expert_source_assigned = true;
@@ -2049,9 +2057,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             mlx.engine.resetKernelProfile();
             var buffers0: usize = 0;
             _ = mlx.mlx_metal_command_buffer_count(&buffers0);
-            var active0: usize = 0;
-            _ = mlx.mlx_reset_peak_memory();
-            _ = mlx.mlx_get_active_memory(&active0);
+            gpu_mem.resetPeak();
+            const active0 = gpu_mem.activeBytes();
             for (0..n) |_| {
                 const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
@@ -2078,11 +2085,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const proc_cpu_ns = processCpuNs() - proc_cpu0;
             var buffers1: usize = 0;
             _ = mlx.mlx_metal_command_buffer_count(&buffers1);
-            var peak1: usize = 0;
-            _ = mlx.mlx_get_peak_memory(&peak1);
+            const peak1 = gpu_mem.peakBytes();
             const dn: f64 = @floatFromInt(@max(done, 1));
             const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
-            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward, process CPU {d:.3} ms/forward on every thread, {d:.0} command buffers/forward, MLX peak {d} MB over the start (build {d:.3} ms CPU + eval {d:.3} ms GPU of which submit {d:.3} ms ({d:.3} ms thread CPU), {d:.0} ops/forward)\n", .{
+            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward, process CPU {d:.3} ms/forward on every thread, {d:.0} command buffers/forward, peak {d} MB over the start (build {d:.3} ms CPU + eval {d:.3} ms GPU of which submit {d:.3} ms ({d:.3} ms thread CPU), {d:.0} ops/forward)\n", .{
                 done,
                 ms,
                 @as(f64, @floatFromInt(proc_cpu_ns)) / 1.0e6 / dn,
@@ -2465,11 +2471,33 @@ fn logWiredPolicy(limit: ?usize) void {
     if (limit) |bytes| {
         log.info("[wired] limit={d} MB\n", .{bytes / (1024 * 1024)});
     } else {
-        log.debug("[wired] declined (no gpu)\n", .{});
+        log.debug("[wired] MLX's limit left as it is (no GPU, or the load is the engine's)\n", .{});
     }
 }
 
+/// One model's load or unload job on the inference thread. A model on the engine's own stream has the job held to
+/// its end, so what the job does around the model itself (a pool clear, a limit) asks MLX nothing; beside such a
+/// model, any other model's job steps out of the held scope for its span.
+const JobTurn = struct {
+    turn: mlx.engine.Turn,
+    own: bool,
+
+    fn begin(handle: ?arch_handle.Handle, config: ?*const ModelConfig) JobTurn {
+        const own = if (handle) |h| mlx.engine.isStream(arch_handle.stream(h)) else if (config) |c| @import("arch/life.zig").ownStream(c) != null else false;
+        const turn = mlx.engine.turnTo(own);
+        if (own) mlx.engine.hold();
+        return .{ .turn = turn, .own = own };
+    }
+
+    fn end(self: JobTurn) void {
+        if (self.own) mlx.engine.unhold();
+        self.turn.end();
+    }
+};
+
 pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
+    const job = JobTurn.begin(null, req.config);
+    defer job.end();
     // Step 1: evict victims (if any) BEFORE the load, so peak GPU residency
     // never holds the old + new model at once. unloadResident() drops
     // mlx_arrays — same thread-stream invariant as cleanup_queue drain.
@@ -2481,8 +2509,12 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
             victim.id,
             @as(f64, @floatFromInt(victim_bytes)) / 1_073_741_824.0,
         });
-        victim.unloadResident();
-        if (victim.config) |c| arch_serve.unloadModel(c);
+        {
+            const victim_job = JobTurn.begin(victim.handle, victim.config);
+            defer victim_job.end();
+            victim.unloadResident();
+            if (victim.config) |c| arch_serve.unloadModel(c);
+        }
         evicted_bytes +|= victim_bytes;
         sch.registry.mutex.lockUncancelable(sch.io);
         sch.registry.accountEvictedLocked(victim_bytes);
@@ -2551,6 +2583,7 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0,
     });
     const wired_before = status.getWiredMemBytes();
+    const job = JobTurn.begin(entry.handle, entry.config);
     scheduler_mod.flushLiveState(entry, "unload");
     entry.unloadResident();
     if (entry.config) |c| arch_serve.unloadModel(c);
@@ -2559,6 +2592,7 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     // of the load→generate→unload flow).
     _ = mlx.mlx_clear_cache();
     waitForUnwire(sch.io, wired_before, bytes);
+    job.end();
     // Drop any borrowed views that pointed at this entry so post-unload reads
     // don't dangle (gen entries leave xfm null already, but an LLM unload
     // must clear them).
@@ -2575,13 +2609,15 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.accountEvictedLocked(bytes);
     sch.registry.finalizeEvictionLocked(entry);
+    const left = sch.registry.countLoadedLocked();
     sch.registry.mutex.unlock(sch.io);
     publishDiskStats(sch);
 
     // Shrink `fit` capacity back to the surviving live set — leaving the
     // freed model's headroom in place is exactly the per-transient-commit
-    // configuration the policy exists to avoid.
-    logWiredPolicy(mlx.applyWiredPolicy());
+    // configuration the policy exists to avoid. An engine model that leaves no model behind left MLX nothing to
+    // wire, and nothing is asked of it.
+    if (!(job.own and left == 0)) logWiredPolicy(mlx.applyWiredPolicy());
 
     req.done_mu.lockUncancelable(sch.io);
     req.done = true;
@@ -3000,6 +3036,14 @@ test "rearmDiskTier: an SSD size named in settings arms a declined tier on a ful
     try testing.expect(rearmDiskTier(testing.allocator, testing.io, f.entry, s, "test"));
     try testing.expect(!f.config.prefix_cache_disk_declined);
     try testing.expectEqual(@as(u64, 2 << 30), f.entry.prefix_cache.?.disk.?.max_bytes);
+}
+
+test "the plain-file SSD tier is declined for a model whose arrays are the engine's, and for no other" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    try std.testing.expect(plainFilesNeedMlx(.real, s));
+    try std.testing.expect(!plainFilesNeedMlx(.real, null));
+    try std.testing.expect(!plainFilesNeedMlx(.cas, s));
 }
 
 test "rearmDiskTier: a RAM cache the load built keeps its object and entries when the tier joins it" {

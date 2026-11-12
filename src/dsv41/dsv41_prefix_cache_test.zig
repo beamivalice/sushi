@@ -601,6 +601,38 @@ test "DeepSeek SSD tier split: a write-through prefill stages the points on the 
     try testing.expectEqual(e.ssm_bytes[0], e.ssm_bytes[1]);
 }
 
+test "DeepSeek SSD tier: a write-through whose rows cannot be marked drops its shared points, so the next forward copies no store (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [800]u32 = undefined;
+    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
+
+    var hc = try dsv41SplitCache(io, base, "dsv41-unmarked", &net, 128);
+    defer hc.deinit();
+    dsv41_model.resetState(net.m);
+    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer cache.deinit();
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[0..512], .last));
+    var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(testing.allocator, net.m, 512)};
+    defer cps[0].deinit(testing.allocator);
+    cache.step = 512;
+    mlx.fault.arm(1);
+    dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, first[0..512], false, .{}, &cps, "prefill");
+    const fired = mlx.fault.didFire();
+    mlx.fault.disarm();
+    try testing.expect(fired);
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entries.items.len);
+    try testing.expect(cps[0].isReleased());
+}
+
 test "DeepSeek SSD tier split: an heir that restored from its donor links the donor's row segments, restores a full capture's bytes and outlives the donor (DSV41_TINY)" {
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();

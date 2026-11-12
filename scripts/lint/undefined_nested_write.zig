@@ -51,18 +51,6 @@ fn scopeEnd(tree: *const Ast, decl_token: u32) u32 {
 
 const Test = struct { key: []const u8, first: u32, last: u32 };
 
-/// The allowlist key of a test: its name with everything but letters and digits as `_`.
-fn testKey(arena: std.mem.Allocator, tree: *const Ast, name_token: ?u32) ![]const u8 {
-    const t = name_token orelse return "(unnamed)";
-    const slice = tree.tokenSlice(t);
-    const inner = if (slice.len >= 2 and slice[0] == '"') slice[1 .. slice.len - 1] else slice;
-    const out = try arena.dupe(u8, inner);
-    for (out) |*c| if (!std.ascii.isAlphanumeric(c.*)) {
-        c.* = '_';
-    };
-    return out;
-}
-
 const Assign = struct { token: u32, target: Target };
 
 fn contains(list: []const []const u8, item: []const u8) bool {
@@ -92,7 +80,7 @@ pub fn check(arena: std.mem.Allocator, tree: *const Ast, report: rule.Report) !v
                 const data = tree.nodeData(node).opt_token_and_node;
                 const name_token: ?u32 = data[0].unwrap();
                 try tests.append(arena, .{
-                    .key = try testKey(arena, tree, name_token),
+                    .key = try rule.testKey(arena, tree, name_token),
                     .first = tree.firstToken(data[1]),
                     .last = tree.lastToken(data[1]),
                 });

@@ -484,16 +484,24 @@ fn rollbackLiveInPlace(
         stored = @max(stored, hm.cp);
     };
     if (stored > pos) return null;
+    const handled = Handled.begin();
     live.rollback(self.allocator, m, idx, prompt_ids) catch |err| {
         log.warn("  [dsv41-prefix] live state not rolled back: {s}; a stored point serves\n", .{@errorName(err)});
         live.clear(self.allocator);
+        handled.drop();
         return null;
     };
-    target_cache.truncate(0, s) catch {};
+    target_cache.truncate(0, s) catch handled.drop();
     target_cache.step = pos;
     target_moe_seq_offset.* = pos;
     self.last_restored_live = true;
     return .{ .matched = pos, .full_match = false, .slot_owned = true };
+}
+
+/// Whether the failure latched now is a cap's or the machine's refusal of memory, which the next attempt may not meet.
+fn refusedForMemory() bool {
+    const name = mlx.peekErrorName() orelse return false;
+    return std.mem.eql(u8, name, "TransientCapExceeded") or std.mem.eql(u8, name, "OutOfMemory");
 }
 
 /// DeepSeek's SSD arm: the stored point under the match that beats the RAM match restores into the model.
@@ -517,10 +525,14 @@ pub fn restoreDisk(
     // The arrays read back are state: they take their own room in the engine's pool, whatever cap the last forward left.
     const cap = mlx.engine.uncapped();
     defer mlx.engine.capped(cap);
+    const handled = Handled.begin();
+    const refused_before = mlx.engine.poolRefusals();
     var cp = d.restoreCheckpointInto(target_cache, hm.idx, hm.cp, snapshotLayers(m), s) catch |err| {
         log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-        pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err);
+        // A refusal for memory says nothing of the file: its entry stays for the next lookup.
+        if (mlx.engine.poolRefusals() == refused_before and !refusedForMemory()) pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err);
         target_cache.truncate(0, s) catch {};
+        handled.drop();
         return null;
     };
     defer cp.deinit(d.allocator);
@@ -528,10 +540,11 @@ pub fn restoreDisk(
         log.warn("  [disk-cache] DeepSeek state not installed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
         target_cache.truncate(0, s) catch {};
         reset(m);
+        handled.drop();
         return null;
     };
     self.last_restored_disk_id = d.entries.items[hm.idx].id;
-    liveOf(self).keepRestored(self.allocator, m, &cp, true) catch {};
+    liveOf(self).keepRestored(self.allocator, m, &cp, true) catch handled.drop();
     log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (dsv41@{d})\n", .{ hm.cp, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
     return .{ .matched = hm.cp, .full_match = false, .slot_owned = true };
 }
@@ -541,9 +554,23 @@ pub fn restoreEntry(self: *pc.HotPrefixCache, m: State, e: *pc.Entry, restore_ca
     const cps = e.ssm_checkpoints orelse return 0;
     const cp = pc.HotPrefixCache.highestCheckpointAtOrBelow(cps, restore_cap) orelse return 0;
     try restore(m, cp, prompt_ids);
-    liveOf(self).keepRestored(self.allocator, m, cp, false) catch {};
+    const handled = Handled.begin();
+    liveOf(self).keepRestored(self.allocator, m, cp, false) catch handled.drop();
     return cp.pos;
 }
+
+/// A step this file handles itself when it fails (a log line and a fallback): what the failure latched goes with it,
+/// so the next request, whose own first check would read the latch, does not meet it.
+const Handled = struct {
+    had: bool,
+
+    fn begin() Handled {
+        return .{ .had = mlx.errorPending() };
+    }
+    fn drop(self: Handled) void {
+        mlx.dropLatchedErrorUnless(self.had);
+    }
+};
 
 /// DeepSeek's write-through: the request's restore points on the tier's row-segment grid go to the SSD tier and every
 /// point leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
@@ -552,9 +579,13 @@ pub fn restoreEntry(self: *pc.HotPrefixCache, m: State, e: *pc.Entry, restore_ca
 pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, held: []const u8) void {
     const s = dsv41_model.stateStream(m);
     if (self.disk == null or prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+    const handled = Handled.begin();
+    defer handled.drop();
     var pending = false;
     for (cps) |*cp| pending = pending or !cp.isReleased();
     if (!pending) return;
+    // The points share the request's rows: one that outlived this call would make the next forward copy the store.
+    defer for (cps) |*cp| cp.release();
     markRows(cache, s) catch |err| {
         log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
         return;
@@ -572,7 +603,6 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
     defer self.disk.?.rows_base = std.math.maxInt(u32);
     self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, null, cps, &.{}, std.math.maxInt(u64), s);
     const bytes = self.disk.?.point_bytes_written - staged_before;
-    for (cps) |*cp| cp.release();
     // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
     log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, {s} held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(bytes)) / 1e9, held, sw.read() / std.time.ns_per_ms });
 }
@@ -618,6 +648,8 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, why: []co
     // A pixel key with no boundary proves nothing about where its rows begin (`diskTextLen`).
     if (live.vision_key != 0 and live.media_start == null) return;
     const st = m.dec_state orelse return;
+    const handled = Handled.begin();
+    defer handled.drop();
     var cps: std.ArrayList(SSMCheckpoint) = .empty;
     defer {
         for (cps.items) |*cp| cp.deinit(self.allocator);

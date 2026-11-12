@@ -29,11 +29,25 @@ fn sortable(d: core.Dtype) bool {
     };
 }
 
-/// `t` sorted along its last axis, or with `arg` the uint32 indices that sort it.
+/// `t` sorted along `axis_in`, or with `arg` the uint32 indices that sort it. Another axis than the last is sorted as
+/// the last one of a turned view, as MLX does.
 pub fn sort(t: *Tensor, axis_in: c_int, comptime arg: bool) Error!*Tensor {
     if (t.ndim == 0 or !sortable(t.dtype)) return error.TensorDtype;
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
-    if (axis != t.ndim - 1) return error.TensorUnsupported;
+    if (axis >= t.ndim) return error.TensorShape;
+    if (axis != t.ndim - 1) {
+        var axes: [core.max_dims]c_int = undefined;
+        for (axes[0..t.ndim], 0..) |*a, i| a.* = @intCast(i);
+        std.mem.swap(c_int, &axes[axis], &axes[t.ndim - 1]);
+        const view = try ops.transpose(t, axes[0..t.ndim]);
+        defer core.release(view);
+        // A row-major copy: the kernel walks strides, and a broadcast axis has none to walk.
+        const turned = try ops.contiguous(view);
+        defer core.release(turned);
+        const sorted = try sort(turned, -1, arg);
+        defer core.release(sorted);
+        return ops.transpose(sorted, axes[0..t.ndim]);
+    }
     const out_type: core.Dtype = if (arg) .uint32 else t.dtype;
     if (t.size() == 0) return core.fresh(out_type, t.dims());
     const n: usize = @intCast(t.shape[axis]);

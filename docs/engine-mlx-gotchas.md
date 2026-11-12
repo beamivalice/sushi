@@ -134,6 +134,26 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - A weight outside every warmup forward is still LAZY at serve time (`appendWeightArrays`).
 - Helpers that could take a block use the `_axis` op.
 
+## What MLX's bytes depend on
+
+Found while holding the engine of our own to MLX's bytes ([engine-own-forward](engine-own-forward.md#proving-a-change)).
+
+- **A dense product's kernel is picked by its shape** (`steel_matmul`): the split-K NAX arm when `k >= 3 * big` or
+  (`big <= 1024` and `k > 2 * big`), `big = max(m, n)`, else the fused one, and the two sum in another order. A row's
+  result therefore changes with the rows beside it: DeepSeek's router (rows x 384 experts over 5,120 channels)
+  switched at about 1,707 rows, between a 1,024-row and a 2,048-row prefill chunk. A product whose rows must not
+  depend on their company runs in fixed tiles ([dsv41-arch](dsv41-arch.md#prefill-width)).
+- **A scan (`cumsum`) picks its kernel by the scanned axis's stride**: one element, the kernel of contiguous rows; any
+  other, the strided one, which sums floats in another order. A view that fills its memory (a transpose) is scanned
+  where it lies, one with gaps or a broadcast as a row-major copy.
+- **bfloat16 math rounds after every function** (`kernels/bf16_math.h`: `exp`, `abs` and the rest work in float and
+  cast back), so `sigmoid` on bf16 is not the float32 result rounded once.
+- **float32 and bfloat16 cast to bool by their bits** (`cast_to<bool, T>`: any bit under the sign), so a denormal is
+  true; float16 takes Metal's cast.
+- **A sort along a broadcast axis returns the array's first element everywhere** (MLX's kernel walks a stride of 0):
+  no reference there, the engine sorts a row-major copy.
+- MLX refuses or faults on a pad, a matmul, a max, an argmax and an RMS norm of an array with no elements.
+
 ## Views, copies, ownership
 
 - Slice-born weights into gather_qmm/quantized_matmul are `mlx_contiguous`-materialized at load; mlx
@@ -157,6 +177,9 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - The prefill loop's per-chunk clear stays: handing the pool to the next chunk measured 5-7% slower prefill and a
   3 GB larger footprint ([glm5-perf](glm5-perf.md#glm-prefill-pool-clear)).
 - `active` flat while phys climbs = the POOL (`memory.cache_bytes`). RSS is blind to Metal.
+- **MLX hands a small array a larger buffer its pool already holds** (a 96-byte table got 128), and returns a freed
+  buffer to the pool from a Metal completion thread. A test that reads MLX's active or cached bytes synchronizes and
+  clears first, and asserts "the ledger's bytes, under a page more", never an exact size.
 
 ## Zig
 

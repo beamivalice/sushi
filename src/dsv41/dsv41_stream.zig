@@ -361,13 +361,12 @@ pub const StqStream = struct {
         const ranged = wide and self.overlap and on_engine and !self.stage_on_engine;
         self.mlx_order_routes += @intFromBool(staged);
         // Slab views an MLX-stream expert engine makes are MLX's own arrays; the engine imports them when a kernel reads them.
-        const own = mlx.engine.active;
-        if (wide and !mlx.engine.isStream(self.engine.s)) mlx.engine.active = false;
+        const theirs: ?mlx.engine.Makers = if (wide and !mlx.engine.isStream(self.engine.s)) mlx.engine.makers(false) else null;
         var prepared = (if (ranged) self.engine.prepareHostStagedRanged(@intCast(layer), host) else if (staged) self.engine.prepareHostStaged(@intCast(layer), host) else if (wide) self.engine.prepareHostWide(@intCast(layer), host) else self.engine.prepareHost(@intCast(layer), host)) catch |e| {
-            mlx.engine.active = own;
+            if (theirs) |made| made.end();
             return e;
         };
-        mlx.engine.active = own;
+        if (theirs) |made| made.end();
         defer prepared.deinit();
         errdefer _ = mlx.mlx_synchronize(sc.s);
         const slots = try gpa.alloc(i32, host.len);
@@ -2357,7 +2356,10 @@ test "dsv41 borrow: a released pool gives MLX its bytes back, its routes read th
             try testing.expectEqual(bytes, try lent.engine.borrowLayer(li));
             var after: usize = 0;
             _ = mlx.mlx_get_active_memory(&after);
-            try testing.expectEqual(bytes, before - after);
+            // MLX gets back no less than the ledger says. It may get a little more: its allocator hands a small array
+            // (the pool's table) a buffer its pool already held, which can be larger than the array.
+            try testing.expect(before - after >= bytes);
+            try testing.expect(before - after - bytes < std.heap.pageSize());
             try testing.expectEqual(@as(u64, 0), lent.engine.poolBytes(li));
             try testing.expectEqual(pools - bytes, published);
         }

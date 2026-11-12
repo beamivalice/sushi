@@ -10,11 +10,12 @@ const Trunk = trunk.Trunk;
 const bindLinears = @import("layer_weights.zig").bindLinears;
 
 
-/// A test gives the engine back: `enabled` returns to `was`, and with it off the GEMM inputs built while it ran go, since
-/// MLX cannot read their handles.
+/// A test gives the engine back: `enabled` returns to `was`, and with it off the arrays the EXL3 module cached go: the
+/// engine's side as a served process drops them at its last Cooler unload, MLX's so the next test finds MLX holding
+/// nothing of this one's.
 pub fn restoreEngine(was: bool) void {
     mlx.engine.enabled = was;
-    if (!was) sushi_exl3.linear.dropGemmInputs();
+    if (!was) for ([_]u1{ 0, 1 }) |side| sushi_exl3.dropHostArrays(side);
 }
 
 pub const Exl3MoeHarness = struct {

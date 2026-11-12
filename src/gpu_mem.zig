@@ -31,6 +31,22 @@ pub fn cacheBytes() usize {
     return cache + mlx.engine.poolFree();
 }
 
+/// The high-water since `resetPeak`: MLX's own peak, and beside it the engine's pool at its fullest with the mappings
+/// it wraps now. The two peaks need not have met, so the sum errs high. MLX starts its peak from zero at a reset, so
+/// until it next allocates this reads below `activeBytes` by what MLX holds.
+pub fn peakBytes() usize {
+    if (host_tier) return liveRead();
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    return peak + mlx.engine.poolPeak(.process) + mlx.engine.mappedTotal();
+}
+
+pub fn resetPeak() void {
+    if (host_tier) return liveRead();
+    _ = mlx.mlx_reset_peak_memory();
+    mlx.engine.resetPoolPeak(.process);
+}
+
 fn engineInUse() usize {
     return (mlx.engine.poolTotal() -| mlx.engine.poolFree()) + mlx.engine.mappedTotal();
 }

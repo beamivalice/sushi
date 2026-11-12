@@ -95,8 +95,17 @@ fn readsOnly(comptime name: []const u8) bool {
     return false;
 }
 
+/// Calls that reached mlx-c while its allocator was at rest (`engine.hold`): work of a model on MLX done outside its
+/// turn, or of a model on the engine that still asks MLX. Zero in a process that keeps its turns.
+pub var rest_breaks: std.atomic.Value(u64) = .init(0);
+
+/// Settings of MLX's allocator asked while it was at rest, which reached nothing: a model on MLX sets its own inside
+/// its turn, and a model on the engine has none to set. Zero in a process that keeps its turns.
+pub var rest_swallows: std.atomic.Value(u64) = .init(0);
+
 inline fn tally(comptime name: []const u8) void {
     _ = calls.fetchAdd(1, .monotonic);
+    if (engine.mlx_at_rest.on.load(.monotonic)) _ = rest_breaks.fetchAdd(1, .monotonic);
     if (comptime !readsOnly(name)) _ = changes.fetchAdd(1, .monotonic);
     if (comptime builtin.is_test) by_name.add(name) else if (callNamesTraced()) by_name.add(name);
 }
@@ -503,6 +512,11 @@ pub inline fn mlx_array_dtype(arr: mlx_array) mlx_dtype {
 }
 pub const mlx_array_strides = routed("mlx_array_strides", fn (arr: mlx_array) callconv(.c) [*]const usize);
 pub fn mlx_array_eval(arr: mlx_array) c_int {
+    // What a maker or an op that failed left its caller: mlx-c would read through it.
+    if (arr.ctx == null) {
+        latchError("[mlx] eval: an empty handle, the result of an op that failed");
+        return 1;
+    }
     if (engine.enabled and engine.isOurs(arr)) return engine.mlx_array_eval(arr);
     return eval_raw.mlx_array_eval(arr);
 }
@@ -827,16 +841,53 @@ pub fn mlx_fast_metal_kernel_config_new() mlx_fast_metal_kernel_config {
 fn dropConfigTwin(c: *engine.kernel.Config) void {
     const twin: mlx_fast_metal_kernel_config = .{ .ctx = c.twin orelse return };
     kernel_keys.configFree(twin);
-    _ = raw_kernel.mlx_fast_metal_kernel_config_free(twin);
     c.twin = null;
+    // A model on the engine drops a config a model on MLX launched: MLX frees its twin at its next turn.
+    if (atRest() != null) if (owed.twins.append(std.heap.c_allocator, twin)) |_| return else |_| {};
+    _ = raw_kernel.mlx_fast_metal_kernel_config_free(twin);
+}
+
+/// MLX work asked for while its allocator is at rest, done when the inference thread next turns to a model on MLX or
+/// the last hold ends (`payOwed`): the free of a config's twin, and the wired limit a load or an unload moved.
+const owed = struct {
+    var twins: std.ArrayList(mlx_fast_metal_kernel_config) = .empty;
+    var wired: bool = false;
+};
+
+/// Inference thread, MLX's allocator not at rest.
+pub fn payOwed() void {
+    for (owed.twins.items) |twin| _ = raw_kernel.mlx_fast_metal_kernel_config_free(twin);
+    owed.twins.clearRetainingCapacity();
+    if (!owed.wired) return;
+    owed.wired = false;
+    _ = applyWiredPolicy();
+}
+
+/// Whether MLX is owed work for its next turn.
+pub fn owes() bool {
+    return owed.wired or owed.twins.items.len != 0;
 }
 
 /// MLX's config for a launch on MLX's side: `cls` itself, or the twin of a config of the engine's own, filled in the
 /// order its maker filled it.
 fn mlxConfig(cls: mlx_fast_metal_kernel_config) ?mlx_fast_metal_kernel_config {
-    if (!engine.isConfig(cls)) return cls;
+    if (!engine.isConfig(cls)) {
+        // A config of MLX's whose grid was last set inside the engine's scope gets it now.
+        if (engine.enabled) if (engine.caughtUp(cls)) |m| {
+            if (raw_kernel.mlx_fast_metal_kernel_config_set_grid(cls, m.grid[0], m.grid[1], m.grid[2]) != 0) return null;
+            if (raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(cls, m.group[0], m.group[1], m.group[2]) != 0) return null;
+        };
+        return cls;
+    }
     const c = engine.configOf(cls);
-    if (c.twin) |twin| return .{ .ctx = twin };
+    if (c.twin) |twin| {
+        if (c.behind) {
+            c.behind = false;
+            if (raw_kernel.mlx_fast_metal_kernel_config_set_grid(.{ .ctx = twin }, c.grid[0], c.grid[1], c.grid[2]) != 0) return null;
+            if (raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(.{ .ctx = twin }, c.group[0], c.group[1], c.group[2]) != 0) return null;
+        }
+        return .{ .ctx = twin };
+    }
     const twin = raw_kernel.mlx_fast_metal_kernel_config_new();
     if (twin.ctx == null) return null;
     var out: usize = 0;
@@ -905,10 +956,17 @@ pub fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, 
     if (engine.isConfig(cls)) {
         const c = engine.configOf(cls);
         c.grid = .{ g1, g2, g3 };
-        return if (c.twin) |twin| raw_kernel.mlx_fast_metal_kernel_config_set_grid(.{ .ctx = twin }, g1, g2, g3) else 0;
+        const twin = c.twin orelse return 0;
+        // Inside the engine's scope MLX's twin waits for its next launch on MLX's side (`mlxConfig`).
+        if (engine.active) {
+            c.behind = true;
+            return 0;
+        }
+        return raw_kernel.mlx_fast_metal_kernel_config_set_grid(.{ .ctx = twin }, g1, g2, g3);
     }
     if (engine.noting()) {
         engine.noteGrid(cls, g1, g2, g3);
+        if (engine.keepsBehind(cls)) return 0;
     }
     return raw_kernel.mlx_fast_metal_kernel_config_set_grid(cls, g1, g2, g3);
 }
@@ -916,10 +974,16 @@ pub fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_
     if (engine.isConfig(cls)) {
         const c = engine.configOf(cls);
         c.group = .{ t1, t2, t3 };
-        return if (c.twin) |twin| raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(.{ .ctx = twin }, t1, t2, t3) else 0;
+        const twin = c.twin orelse return 0;
+        if (engine.active) {
+            c.behind = true;
+            return 0;
+        }
+        return raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(.{ .ctx = twin }, t1, t2, t3);
     }
     if (engine.noting()) {
         engine.noteGroup(cls, t1, t2, t3);
+        if (engine.keepsBehind(cls)) return 0;
     }
     return raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(cls, t1, t2, t3);
 }
@@ -1138,22 +1202,34 @@ const eval_raw = struct {
 
 // ── Memory management ──
 // ── MLX's allocator ──
-// Under a held scope (`engine.hold`) none of these calls MLX: a reading is the one the hold began with, and a pool
-// clear, a peak reset and a limit do nothing, since MLX allocates nothing there. A limit hands back the value given.
+// Under a held scope (`engine.hold`) none of these calls MLX: a reading is the one MLX was last left with, and a pool
+// clear, a peak reset and a limit do nothing, since MLX allocates nothing there (`rest_swallows` counts them). A limit
+// hands back the value given.
 
 fn atRest() ?*engine.MlxAtRest {
     return if (engine.mlx_at_rest.on.load(.acquire)) &engine.mlx_at_rest else null;
 }
 
-var allocator_read_at: ?u64 = null;
+/// A setting asked of MLX at rest: counted, and nothing else.
+fn swallowedAtRest(comptime name: []const u8) bool {
+    if (atRest() == null) return false;
+    _ = rest_swallows.fetchAdd(1, .monotonic);
+    if (comptime builtin.is_test) by_name.add("at rest: " ++ name);
+    return true;
+}
 
-/// MLX's pool emptied and its allocator read into `r`, unless nothing has changed in MLX since the last time: then
-/// what `r` holds is still true and no call is made. A process that never called MLX has nothing there to read.
-fn readAllocator(r: *engine.MlxAtRest) void {
-    if (allocator_read_at) |at| if (at == changes.load(.monotonic)) return;
+var allocator_read_at: ?u64 = null;
+var pool_emptied_at: ?u64 = null;
+
+/// MLX's allocator read into `r`, its pool emptied first when `empty`, unless nothing has changed in MLX since the
+/// last time: then what `r` holds is still true and no call is made. A process that never called MLX has nothing
+/// there to read.
+fn readAllocator(r: *engine.MlxAtRest, empty: bool) void {
+    const at = changes.load(.monotonic);
+    if (allocator_read_at == at and (!empty or pool_emptied_at == at)) return;
     var now: [4]usize = @splat(0);
     if (calls.load(.monotonic) != 0) {
-        _ = raw.mlx_clear_cache();
+        if (empty) _ = raw.mlx_clear_cache();
         _ = raw.mlx_get_active_memory(&now[0]);
         _ = raw.mlx_get_cache_memory(&now[1]);
         _ = raw.mlx_get_peak_memory(&now[2]);
@@ -1164,22 +1240,25 @@ fn readAllocator(r: *engine.MlxAtRest) void {
     r.peak.store(now[2], .monotonic);
     r.external.store(now[3], .monotonic);
     allocator_read_at = changes.load(.monotonic);
+    if (empty) pool_emptied_at = allocator_read_at;
 }
 
-/// For the hold that begins (inference thread).
-pub fn restAllocator(r: *engine.MlxAtRest) void {
-    readAllocator(r);
+/// MLX's allocator goes to rest (inference thread): for the first hold with its pool emptied (`empty`), after a turn
+/// of a model on MLX as that model left it, since the pool is that model's to reuse at its next turn.
+pub fn restAllocator(r: *engine.MlxAtRest, empty: bool) void {
+    engine.settleMlxAliases();
+    readAllocator(r, empty);
     r.on.store(true, .release);
 }
 
 /// The end of a process's MLX setup, on the thread that loads: a load that is the engine's and finds MLX as it was
 /// left here asks it nothing.
 pub fn noteAllocator() void {
-    readAllocator(&engine.mlx_at_rest);
+    readAllocator(&engine.mlx_at_rest, true);
 }
 
 pub fn mlx_clear_cache() c_int {
-    return if (atRest() != null) 0 else raw.mlx_clear_cache();
+    return if (swallowedAtRest("mlx_clear_cache")) 0 else raw.mlx_clear_cache();
 }
 pub fn mlx_get_active_memory(res: *usize) c_int {
     const r = atRest() orelse return raw.mlx_get_active_memory(res);
@@ -1213,27 +1292,27 @@ pub fn mlx_get_transient_peak(res: *usize) c_int {
     return 0;
 }
 pub fn mlx_reset_transient_peak() c_int {
-    return if (atRest() != null) 0 else raw.mlx_reset_transient_peak();
+    return if (swallowedAtRest("mlx_reset_transient_peak")) 0 else raw.mlx_reset_transient_peak();
 }
-fn limitAtRest(res: *usize, limit: usize) bool {
-    if (atRest() == null) return false;
+fn limitAtRest(comptime name: []const u8, res: *usize, limit: usize) bool {
+    if (!swallowedAtRest(name)) return false;
     res.* = limit;
     return true;
 }
 pub fn mlx_set_memory_limit(res: *usize, limit: usize) c_int {
-    return if (limitAtRest(res, limit)) 0 else raw.mlx_set_memory_limit(res, limit);
+    return if (limitAtRest("mlx_set_memory_limit", res, limit)) 0 else raw.mlx_set_memory_limit(res, limit);
 }
 pub fn mlx_set_cache_limit(res: *usize, limit: usize) c_int {
-    return if (limitAtRest(res, limit)) 0 else raw.mlx_set_cache_limit(res, limit);
+    return if (limitAtRest("mlx_set_cache_limit", res, limit)) 0 else raw.mlx_set_cache_limit(res, limit);
 }
 pub fn mlx_set_wired_limit(res: *usize, limit: usize) c_int {
-    return if (limitAtRest(res, limit)) 0 else raw.mlx_set_wired_limit(res, limit);
+    return if (limitAtRest("mlx_set_wired_limit", res, limit)) 0 else raw.mlx_set_wired_limit(res, limit);
 }
 pub fn mlx_set_transient_limit(res: *usize, limit: usize) c_int {
-    return if (limitAtRest(res, limit)) 0 else raw.mlx_set_transient_limit(res, limit);
+    return if (limitAtRest("mlx_set_transient_limit", res, limit)) 0 else raw.mlx_set_transient_limit(res, limit);
 }
 pub fn mlx_metal_set_max_mb_per_buffer(prev: *c_int, mb: c_int) c_int {
-    if (atRest() == null) return raw.mlx_metal_set_max_mb_per_buffer(prev, mb);
+    if (!swallowedAtRest("mlx_metal_set_max_mb_per_buffer")) return raw.mlx_metal_set_max_mb_per_buffer(prev, mb);
     prev.* = mb;
     return 0;
 }
@@ -1315,10 +1394,10 @@ pub fn gpuStream() mlx_stream {
 }
 
 /// One synced element-op on the GPU stream: a queue the driver sees in use. A failure stays unlatched. The engine's
-/// queue gets a pass too when it keeps weights resident, and it alone under a load that is the engine's.
+/// queue gets a pass too when it keeps weights resident, and it alone while MLX is at rest.
 pub fn gpuTouch() void {
     engine.touch();
-    if (engine.holding()) return;
+    if (atRest() != null) return;
     const had_error = errorPending();
     defer dropLatchedErrorUnless(had_error);
     const s = gpuStream();
@@ -1343,6 +1422,7 @@ pub fn printArray(label: []const u8, arr: mlx_array) void {
 
 /// Get array shape as a Zig slice
 pub fn getShape(arr: mlx_array) []const c_int {
+    if (arr.ctx == null) return &.{};
     const ndim = mlx_array_ndim(arr);
     if (ndim == 0) return &.{};
     return mlx_array_shape(arr)[0..ndim];
@@ -1581,6 +1661,12 @@ pub fn maxRecommendedWorkingSet() usize {
 /// failed. The caller logs the result.
 pub fn applyWiredPolicy() ?usize {
     if (noGpuBackend()) return null;
+    // Under a held scope MLX's limit is not set now: it is owed to MLX's next turn (`payOwed`), where a model on MLX
+    // beside the engine's gets the limit less what the engine wraps. No limit is reported as set.
+    if (atRest() != null) {
+        owed.wired = true;
+        return null;
+    }
     const max_rec = maxRecommendedWorkingSet();
     if (max_rec == 0) return null;
     // A mapping the engine wraps is wired by the engine's sets: MLX's limit gives those bytes up, so the two together
@@ -1610,8 +1696,12 @@ fn unlockErrBuf() void {
 /// Opens the message of an allocation the transient cap refused.
 pub const transient_cap_tag = "[mlx-transient-cap]";
 
+/// In the message of an allocation the engine's pool refused under its cap (`engine.fail`).
+pub const pool_cap_tag = "PoolOverBudget";
+
+/// A refusal under a forward's cap, MLX's transient cap or the engine's pool cap: the bill did not cover the forward.
 pub fn mlxErrorIsTransientCap(msg: []const u8) bool {
-    return std.mem.startsWith(u8, msg, transient_cap_tag);
+    return std.mem.startsWith(u8, msg, transient_cap_tag) or std.mem.indexOf(u8, msg, pool_cap_tag) != null;
 }
 
 /// Cap on the bytes MLX allocates itself, imported buffers left out; 0 turns it off. Returns the previous cap.
@@ -2022,6 +2112,7 @@ test "a transient-cap refusal is its own failure, at every checkpoint, and is co
     const refusal = transient_cap_tag ++ " Allocating 4096 bytes needs 8192 bytes of transient memory; the limit is 4096.";
     try t.expect(!mlxErrorIsMemory(refusal));
     try t.expect(mlxErrorIsTransientCap(refusal));
+    try t.expect(mlxErrorIsTransientCap("[engine] kernel_apply: PoolOverBudget: a buffer of 16 KB with 10 MB held for the pool, 4 MB of it asked by tensors in use, under a limit of 4 MB"));
     try t.expect(!mlxErrorIsTransientCap("[METAL] Insufficient Memory"));
 
     latchErrorForTest(refusal);

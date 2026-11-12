@@ -1095,6 +1095,17 @@ pub const ModelRegistry = struct {
         return n;
     }
 
+    /// Whether a loaded model runs on MLX. Caller holds `mutex`.
+    pub fn anyOnMlxLocked(self: *const ModelRegistry) bool {
+        var it = self.entries.valueIterator();
+        while (@constCast(&it).next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state != .ready and entry.state != .evicting) continue;
+            if (!arch_handle.onEngine(entry.handle, entry.config)) return true;
+        }
+        return false;
+    }
+
     /// Phase D: subtract `bytes` from the resident accounting. Caller holds
     /// `mutex`. Used after `unloadResident()` to keep `current_resident_bytes`
     /// in sync with the actual GPU footprint.

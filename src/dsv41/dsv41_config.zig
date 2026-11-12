@@ -239,12 +239,6 @@ pub const Config = struct {
         return ctx * (self.stateBytesPerToken() / rows_grow_div + self.worstLayerBytesPerToken());
     }
 
-    /// The part of `forwardCap` that a wide chunk on the engine of our own leaves on MLX: the state rows it appends
-    /// and a slack for the few ops and views that stay there. The engine's pool takes the rest.
-    pub fn forwardCapMlx(self: *const Config, rows: u64, seq: u64) u64 {
-        return @min(self.forwardCap(rows, seq), self.growthBytes(@max(seq, 1)) *| 5 / 4 +| wide_mlx_slack_bytes);
-    }
-
     /// `forwardCap` of a prefill chunk of `chunk` rows ending at `seq`: the last chunk of a prompt absorbs a tail of
     /// up to `tail_merge_rows`, so the widest forward is `chunk + tail_merge_rows` rows.
     pub fn chunkCap(self: *const Config, chunk: u64, seq: u64) u64 {
@@ -267,11 +261,15 @@ fn indexRowBytes(width: u64) u64 {
 /// chunk is the encoder's 20 layers, whose experts a wider chunk reads once for more rows.
 pub const prefill_width: u32 = 2048;
 
+/// Rows the router scores in one dense product on a prefill chunk (`dsv41_model.gateLogitsWide`): the load's chunk
+/// width, so a chunk of it pads nothing. A narrower forward pads one f32 tile a layer at a time (42 MB at the release
+/// width), inside the cap's margin: the measured chunk peaks the cap is fitted to are taken with it.
+pub const gate_tile_rows: u64 = prefill_width;
+
 /// The MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
 pub const dsv41_pool_bytes: u64 = 1 << 30;
 /// Added to every cap: twice the 0.12 GiB of small tensors and tables a decode forward was measured to hold.
-const cap_slack_bytes: u64 = 256 << 20;
-const wide_mlx_slack_bytes: u64 = 64 << 20;
+pub const cap_slack_bytes: u64 = 256 << 20;
 const score_copies: u64 = 3;
 /// `prefill_plan.TAIL_MERGE_MAX - 1`: the longest tail the last chunk of a prompt absorbs.
 pub const tail_merge_rows: u64 = 511;

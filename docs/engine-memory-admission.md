@@ -529,6 +529,9 @@ a named 503. The pool is inside the cap, so a prefill's pool is no separate bill
 
 ### GPU memory readers
 
+`gpu_mem.peakBytes` is MLX's peak plus the engine's pool at its fullest (`core.poolPeak`, kept where the pool's
+counters change) and the mappings it wraps; `resetPeak` starts both again. `/props`, `sushi kld`, the prefill trace
+and `[fwd-ubench]` read it, and `[transient-peak]` adds the pool's high-water of the phase.
 `gpu_mem.activeBytes` is MLX's active bytes plus the engine's pool buffers bound to live tensors
 (`pool_bytes - pool_free`) and the mappings it wraps as buffers of its own (`core.mappedTotal`: a Cooler load's weights and
 expert slabs, which MLX then no longer counts); `gpu_mem.cacheBytes` is MLX's cache plus the engine's free buffers (`pool_free`). Not

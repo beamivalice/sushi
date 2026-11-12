@@ -5,6 +5,7 @@ const http = @import("http.zig");
 const build_options = @import("build_options");
 // pub: src/exl3 reaches mlx, log and io_util through its host root.
 pub const mlx = @import("mlx.zig");
+const gpu_mem = @import("gpu_mem.zig");
 pub const io_util = @import("io_util.zig");
 const model_mod = @import("model.zig");
 const effort_mod = @import("effort.zig");
@@ -137,6 +138,8 @@ fn runCli(init: std.process.Init) !void {
     if (commandUsesGpu(init.minimal.args)) {
         server_mod.applyMlxCacheLimit();
         server_mod.resolveMlxCadence();
+        // The engine's own reading of the GPU, on the main thread before any other asks.
+        _ = mlx.engine.matrixUnits();
     }
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("arch/kernels.zig").warmEnvCaches();
@@ -1303,8 +1306,7 @@ fn runCli(init: std.process.Init) !void {
         const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false, null, false);
         defer allocator.free(prompt_ids);
 
-        // Reset peak memory before generation
-        _ = mlx.mlx_reset_peak_memory();
+        gpu_mem.resetPeak();
 
         const eos_slice = config.eosTokenSlice();
         const sampling = sampler.SamplingParams{ .temperature = temperature };
@@ -1361,9 +1363,7 @@ fn runCli(init: std.process.Init) !void {
             try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.completion_tokens, result.decode_tps });
         }
 
-        var peak_mem: usize = 0;
-        _ = mlx.mlx_get_peak_memory(&peak_mem);
-        const peak_gb = @as(f64, @floatFromInt(peak_mem)) / (1024.0 * 1024.0 * 1024.0);
+        const peak_gb = @as(f64, @floatFromInt(gpu_mem.peakBytes())) / (1024.0 * 1024.0 * 1024.0);
         try stdout_w.print("Peak memory: {d:.3} GB\n", .{peak_gb});
     }
 }

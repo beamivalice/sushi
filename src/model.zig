@@ -817,9 +817,10 @@ pub const ModelConfig = struct {
         return arch_config.fact(self, name);
     }
 
-    /// The MLX buffer pool a streamed load is allowed to hold, billed in its ssd-budget ledger; 0 keeps the RAM-wide cap.
+    /// The buffer pool a streamed load parks beside the model between requests, billed in its ssd-budget ledger; 0 keeps
+    /// the RAM-wide cap. The arch names the allocator and its size where they follow the load (`arch_config.expertPoolBytes`).
     pub fn expertPoolBytes(self: *const ModelConfig) u64 {
-        return (arch_config.facts(self) orelse arch_config.Facts{}).expert_pool_bytes;
+        return arch_config.expertPoolBytes(self);
     }
 
     /// Percent of the SSD read rate the expert prefetch may use: the launch flag, else the model setting, else the default.

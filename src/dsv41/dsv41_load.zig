@@ -19,7 +19,7 @@ pub fn weights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, 
     try source.validateTileOrder(io, allocator, model_dir, config.expert_tile_order, config.hidden_size, config.moe_intermediate_size);
     // The engine is on before its first weight is wrapped; `initDsv41` binds them under the same answer.
     const own_weights = dsv41_borrow.ownDecode(&config.dsv41.?);
-    if (own_weights) mlx.engine.enabled = true;
+    if (own_weights) mlx.engine.enable();
     pipelines_before = mlx.engine.pipelinesMade().count;
     mlx.engine.own_weights = own_weights;
     defer mlx.engine.own_weights = false;

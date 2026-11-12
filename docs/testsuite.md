@@ -132,6 +132,9 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   call counter sits ([engine-own-forward](engine-own-forward.md#the-seam)).
   `undefined-nested-write` flags, in a test block, `v.a.b = ...` on a `var v: T = undefined` before `v.a = ...`, `v = ...`
   or a `v.method()` call; its allowlist key is the test name with every non-alphanumeric character as `_`.
+  `double-free` flags a handle that an `errdefer` frees and a later `defer` frees again.
+  `scope-state` flags a hand write of `engine.active` (anywhere outside `src/tensor/`) or of `engine.enabled`
+  (outside tests): the guards of [the seam](engine-own-forward.md#the-seam) are the only writers.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its
