@@ -226,6 +226,9 @@ With the router's product in fixed tiles (`f71dfd5c`, the same flags) it reads 0
 in KLD, +0.05 points of top-1. The fixture's prompts are 282 to 338 rows, which took the product's split-K arm before
 and take the fused arm now ([dsv41-arch](dsv41-arch.md#prefill-width)); the tree with the one function reverted reads
 0.210305 to the last digit.
+The reading is the same to the last digit (0.211004283, 86.5127%) at `bee7b113`, after the router's unpadded short
+tile, the copy-round width rule and the draft's Markov kernel, and that run's unload reports no call into MLX while it
+was at rest (the `f71dfd5c` run reported five, the device reads `a74fcf43` moved above the load).
 
 The Qwen 1.5.0 reading equals the 1.4.0 Homebrew binary's on the same settings to the last digit; the 0.0692 / 92.76%
 quoted for this pack in [qwen4-kld](qwen4-kld.md) was taken on settings it does not name.
