@@ -32,7 +32,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## Templates
 
 - One-shot CLI prompts carry the same thinking fields through the chat request policy; no CLI render may hardcode thinking off.
-- **Dialects are named by format and sniffed from the template text, never from the model type**: `serializeExtraContext`
+- **Dialects are named by format and asked of the compiled template, never of the model type**: `serializeExtraContext`
   maps the client's effort word per template dialect (scale: `thinking_mode`, a 1-100 ladder; ladder: the literal
   `'xhigh'`, xhigh|medium|low; word: `effective_reasoning_effort` with `[gMASK]<sop>`, the word as sent; any other gets
   high/no_think). An arch brings only what a template cannot say: a template it pins when the checkpoint's cannot be
@@ -43,7 +43,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **The engine is `src/template/`, a Jinja2 renderer in Zig held to Python Jinja2**: `formatChat` calls it once per
   render through `chat.renderEngine` (`template.renderJson`: the template text and the JSON of messages, tools and the
   extra context in; the prompt, or `TemplateSyntax`, `TemplateRaised`, `TemplateRuntime` with line, column and message
-  out). It reads what jinja.cpp read (the filters, tests, methods, globals and loop fields of
+  out). A template compiles once, at load (`template.Template`, `ChatConfig.compiled`, the late-system form beside
+  it): one that does not compile fails the load with `[load] chat template: line L column C: message`; a render only
+  reads the tree, on any thread. Each probe render (tool content, late system, forced call) is memoized on its
+  compiled template by probe and extra-context JSON (`ProbeMemo`: 256 entries, started over when full). It reads what
+  jinja.cpp read (the filters, tests, methods, globals and loop fields of
   `src/template/builtins.zig`, `jinja_cpp_only` names with jinja.cpp's result); any other filter, test or statement
   (`include`, `extends`, `raw`, `recursive`, `**`, `//`) is a `TemplateSyntax` naming it, and a template leaning on a
   jinja.cpp leniency (a list mutator but `append`, `|length` of a `map` result) fails at render, both with the failed
@@ -57,6 +61,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   breaks at once. The limits hold a 4,000-turn, 7.7 MB conversation on every served template under a quarter of each
   (test "the largest served conversation"); a raise longer than the 1 KiB Diagnostic is cut at a character and never
   matches a known raise (`Diagnostic.messageIs`).
+- **The server asks a template through its facts, never its text** (`template/facts.zig`, `chat.asks`; lint
+  `template-text-search`): the names it reads, its literals, the literals it compares against, and the literals it MAY
+  print. The may-print set errs toward output: only comparison and test operands, subscript keys, slice bounds and
+  raise arguments are left out; a call's argument counts wherever the call sits (`l.append(x)` stores it), and
+  `raise_exception` is no raise once the template defines or sets its own. A word in a comment counts for nothing. What rides on it:
+  rendering the tool list, the tool-role probe, `preserve_thinking`, the think span, each effort dialect, `/v1/models`
+  reasoning support, the generated think opener and channel protocol, and the reserved-token mask
+  (`reservedOutputIds` keeps a special the template may print). Limit: a literal only pieced together
+  (`'<|im_' ~ 'end|>'`) is seen by neither the facts nor a text search.
   One render of a tool-calling conversation, the same bytes from both engines (the engine as landed on `54e1aef3`,
   ReleaseFast test binary, M5 Max, best of three, the four served templates): 400 turns (0.8 MB) 2.2 to 3.8 ms where
   jinja.cpp took 90 to 597 ms; 4,000 turns (8.1 MB) 21 to 36 ms where jinja.cpp took 6.4 to 51 s (GLM-5.3 the slowest).
@@ -101,17 +114,18 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `<|assistant|><think>`) when thinking is off.
 - **A system turn past index 0 renders where the template allows it**: a template that raises on it or drops it gets
   it folded into the leading system (`templateProbeRendersLateSystem`, every surface); MiMo's role loop keeps it in
-  place, byte for byte. The fold rewrites every earlier byte of the prompt, so the two byte-pinned stock Qwen3.8
-  templates (`qwenLateSystemTemplate`: the one the Flash-Next packs ship, fixture `qwen38_flash_next_chat_template.jinja`) get ONLY their
-  "System message must be at the beginning" branch replaced and render the note in place; any other revision keeps
-  the fold. The adapter runs only when a late system turn exists, so a prompt without one is byte-identical; a second
+  place, byte for byte. The fold rewrites every earlier byte of the prompt, so a Qwen3.8 template whose parsed tree
+  holds the "System message must be at the beginning" branch (`{% if message.role == "system" %}` opening with an
+  `{% if not loop.first %}` around only a `raise_exception`, at any spacing: `lateSystemTemplate` of the qwen4 chat
+  face, fixture `qwen38_flash_next_chat_template.jinja`) gets ONLY that inner body replaced and renders the note in
+  place; a template without it keeps the fold, and a `qwen4_exp` load says so in one `[load]` line. The adapter runs only when a late system turn exists, so a prompt without one is byte-identical; a second
   LEADING system turn is now a turn of its own too. `QWEN_MID_SYSTEM_MODEL_DIR=<pack> zig build test
   -Dtest-filter="real Qwen pack"` proves a loaded pack engages.
 - **A surface never folds before the render**: a pre-fold moved Codex's mid-input `developer` turn and Claude Code's
   hook output to the front, so on MiMo turn N's prompt stopped being a prefix of turn N+1's. Responses' fresh
   `instructions` replace only the stored history's LEADING system turn.
 - **A generic ChatML role header preserves tool roles**: absence of a literal `'tool'` branch does not license
-  rewriting tool results as user text (`templateReferencesToolRole`).
+  rewriting tool results as user text (`asks.toolRole`: a comparison against `'tool'`, else the probe).
 - **`preserve_thinking` reaches only a template that reads it** (`serializeExtraContext`), resolved per request:
   `chat_template_kwargs` > `--preserve-thinking` > model-settings.json > undefined (Qwen3.8 keeps every turn's
   thinking). Each value renders its own prompt, so the tokenize-cache key carries it.

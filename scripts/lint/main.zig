@@ -18,6 +18,7 @@ const rules = .{
     @import("template_runtime_safety.zig"),
     @import("template_superlinear_std.zig"),
     @import("arch_test_unlisted.zig"),
+    @import("template_text_search.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

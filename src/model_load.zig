@@ -1902,7 +1902,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
     // specials): derived per model from tokenizer + template + eos.
     params.config.mergeTokenizerStops(params.tok);
-    sampler.installSuppressMask(xfm_ptr, params.tok, params.chat_config.chat_template, params.config.eosTokenSlice());
+    sampler.installSuppressMask(xfm_ptr, params.tok, params.chat_config.printedFacts(), params.config.eosTokenSlice());
     generate_mod.installThinkMarkers(xfm_ptr, params.tok);
     try generate_mod.installLogitBias(sch.io, xfm_ptr, params.tok);
 
@@ -1932,7 +1932,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const mtp_enabled = mtp.on and !mtp_streaming_off and !arch_config.fact(params.config, "no_mtp_head");
     arch_serve.loadLines(params.config, .{ .io = sch.io, .allocator = sch.allocator, .model_dir = params.model_dir, .mtp_source = mtp.sourceName() });
     arch_load.logLoad(params.config, kv_quant_config, mtp.on, params);
-    if (@import("chat.zig").templateTakesPreserveThinking(params.chat_config.chat_template)) {
+    if (@import("chat.zig").templateTakesPreserveThinking(params.chat_config)) {
         const keep = settings_resolve.resolve(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, model_settings.default_preserve_thinking);
         log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", settings_resolve.sourceLabel(keep.source, "--preserve-thinking") });
     }

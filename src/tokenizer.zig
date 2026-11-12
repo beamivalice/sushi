@@ -3,6 +3,10 @@ const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const unicode_props = @import("tokenizer_unicode.zig");
 const arch_chat = @import("arch/chat.zig");
+const template_engine = @import("template/template.zig");
+
+/// What a compiled chat template may print (`reservedOutputIds`).
+pub const TemplateFacts = template_engine.Facts;
 
 const WordRules = enum { legacy, letters, letters_marks };
 
@@ -13,30 +17,31 @@ pub const FlaggedSpecial = struct { id: u32, content: []const u8 };
 /// MINUS the ones that are legitimate output. Legitimacy is DERIVED, never a
 /// hardcoded list (which would break thinking/tool-calling on the next arch):
 ///   - EOS/stop ids (`exempt_ids`) stay reachable, and
-///   - any special whose literal text appears in the chat template source
+///   - any special the chat template may print (`printed`, its compiled facts)
 ///     stays reachable — thinking tags, tool markers and role markers all
 ///     ride their model's own template.
-/// An empty `template_source` disables suppression entirely (returns no ids):
+/// No template (`printed` null) disables suppression entirely (returns no ids):
 /// with no template to consult, "what can this model legitimately emit" has
 /// no honest answer, and fallback-formatted models keep pre-change behavior.
 /// A reserved marker like `<|fim_hole|>` in chat output is always a bug
 /// regardless of what produced it (a collapsed distribution can rank one top-5 at a
-/// degenerate position); the substring rule errs toward exemption, which can
-/// only ever keep a token reachable.
+/// degenerate position); the facts err toward output, which can only ever keep
+/// a token reachable. A special the template only pieces together
+/// (`'<|im_' ~ 'end|>'`) is not seen as printed.
 pub fn reservedOutputIds(
     allocator: std.mem.Allocator,
     flagged: []const FlaggedSpecial,
-    template_source: []const u8,
+    printed: ?*const TemplateFacts,
     exempt_ids: []const u32,
 ) ![]u32 {
-    if (template_source.len == 0) return allocator.alloc(u32, 0);
+    const facts = printed orelse return allocator.alloc(u32, 0);
     var out = std.ArrayList(u32).empty;
     errdefer out.deinit(allocator);
     outer: for (flagged) |sp| {
         for (exempt_ids) |e| {
             if (sp.id == e) continue :outer;
         }
-        if (std.mem.indexOf(u8, template_source, sp.content) != null) continue;
+        if (facts.emits(sp.content)) continue;
         try out.append(allocator, sp.id);
     }
     return out.toOwnedSlice(allocator);
@@ -310,13 +315,6 @@ pub const Tokenizer = struct {
     /// Look up a special token ID by its string representation.
     pub fn specialTokenId(self: *const Tokenizer, name: []const u8) ?u32 {
         return self.special_tokens.get(name);
-    }
-
-    /// Reserved-output ids for this tokenizer: `reservedOutputIds` over the
-    /// `special: true` added tokens recorded at load. See that function for
-    /// the derivation rules.
-    pub fn reservedIds(self: *const Tokenizer, allocator: std.mem.Allocator, template_source: []const u8, exempt_ids: []const u32) ![]u32 {
-        return reservedOutputIds(allocator, self.flagged_specials, template_source, exempt_ids);
     }
 
     /// Highest DEFINED id + 1 — the real vocabulary, which is not the config's
@@ -1636,10 +1634,9 @@ test "reservedOutputIds: specials minus template markers minus eos" {
     // A reserved marker (`<|fim_hole|>` at a collapsed position) in
     // chat output is always a bug; the suppression set is every `special:
     // true` added token MINUS legitimate output. Legitimacy is DERIVED, never
-    // hardcoded: EOS/stop ids stay, and so does any special whose literal
-    // text appears in the chat template source (thinking tags, tool markers,
-    // role markers) — a hardcoded list breaks thinking/tool-calling on the
-    // next arch.
+    // hardcoded: EOS/stop ids stay, and so does any special the chat template
+    // may print (thinking tags, tool markers, role markers) — a hardcoded list
+    // breaks thinking/tool-calling on the next arch.
     const alloc = testing.allocator;
     const flagged = [_]FlaggedSpecial{
         .{ .id = 10, .content = "<|fim_hole|>" },
@@ -1654,7 +1651,7 @@ test "reservedOutputIds: specials minus template markers minus eos" {
         "<role>ASSISTANT</role>\n<think></think>{% if tools %}<tool_call>{% endif %}";
     const eos = [_]u32{30};
 
-    const ids = try reservedOutputIds(alloc, &flagged, template, &eos);
+    const ids = try reservedOf(alloc, &flagged, template, &eos);
     defer alloc.free(ids);
     // Only the FIM markers survive: think/tool/role markers appear in the
     // template, <|endoftext|> is EOS.
@@ -1663,7 +1660,7 @@ test "reservedOutputIds: specials minus template markers minus eos" {
     // No template at all => suppression disabled entirely (fallback-formatted
     // models keep pre-change behavior; ChatML markers are not in any template
     // source we could consult).
-    const none = try reservedOutputIds(alloc, &flagged, "", &eos);
+    const none = try reservedOutputIds(alloc, &flagged, null, &eos);
     defer alloc.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
 }
@@ -1674,7 +1671,7 @@ test "reservedOutputIds: every flagged special exempt yields empty set" {
         .{ .id = 5, .content = "<eos>" },
         .{ .id = 6, .content = "<think>" },
     };
-    const ids = try reservedOutputIds(alloc, &flagged, "x<think>y", &[_]u32{5});
+    const ids = try reservedOf(alloc, &flagged, "x<think>y", &[_]u32{5});
     defer alloc.free(ids);
     try testing.expectEqual(@as(usize, 0), ids.len);
 }
@@ -1864,4 +1861,24 @@ test "pre-tokenizer style: a spelling no arch claims stays gpt2" {
     var plain = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"ByteLevel\"}", .{});
     defer plain.deinit();
     try testing.expectEqual(PretokStyle.gpt2, arch_chat.pretokStyleOf(plain.value));
+}
+
+test "reservedOutputIds: a special named only in a comment or a comparison stays reserved" {
+    const alloc = testing.allocator;
+    const flagged = [_]FlaggedSpecial{
+        .{ .id = 10, .content = "<|fim_hole|>" },
+        .{ .id = 11, .content = "<|fim_begin|>" },
+        .{ .id = 20, .content = "<think>" },
+    };
+    const ids = try reservedOf(alloc, &flagged, "{# <|fim_hole|> #}{% if m == '<|fim_begin|>' %}{% endif %}<think>", &.{});
+    defer alloc.free(ids);
+    try testing.expectEqualSlices(u32, &[_]u32{ 10, 11 }, ids);
+}
+
+fn reservedOf(alloc: std.mem.Allocator, flagged: []const FlaggedSpecial, source: []const u8, exempt_ids: []const u32) ![]u32 {
+    @setRuntimeSafety(true);
+    var diag: template_engine.Diagnostic = .{};
+    var t = try template_engine.Template.compile(alloc, source, &diag);
+    defer t.deinit();
+    return reservedOutputIds(alloc, flagged, &t.facts, exempt_ids);
 }

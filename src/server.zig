@@ -474,7 +474,7 @@ pub fn armCallForce(
             return null;
         }
         break :blk .thinking;
-    } else if (enable_thinking and opener != null and closer != null and templateThinkOpener(chat_config.chat_template) != null)
+    } else if (enable_thinking and opener != null and closer != null and chat_mod.templateThinkOpener(chat_config) != null)
         .open
     else
         .answer;
@@ -554,23 +554,6 @@ fn nameIds(allocator: std.mem.Allocator, tok: *const Tokenizer, tools_json: []co
     return .{ .flat = flat, .slices = slices };
 }
 
-/// A generated tag needs one unambiguous literal spelling in the template.
-/// Dynamic or conflicting spellings retain the unsupported-format fallback.
-fn templateThinkOpener(template: []const u8) ?[]const u8 {
-    var found: ?[]const u8 = null;
-    var offset: usize = 0;
-    while (std.mem.indexOfPos(u8, template, offset, "<think")) |start| {
-        const len = think_tags.thinkOpenTagLenAt(template[start..]) orelse return null;
-        const tag = template[start..][0..len];
-        if (found) |previous| {
-            if (!std.mem.eql(u8, previous, tag)) return null;
-        }
-        found = tag;
-        offset = start + len;
-    }
-    return found;
-}
-
 /// Resolve a reasoning protocol from the rendered prompt and template. Tokenizer
 /// indexes and exact recovery suffixes are cached on the loaded model.
 pub fn resolveReasoningProtocol(
@@ -589,8 +572,7 @@ pub fn resolveReasoningProtocol(
     defer allocator.free(tail);
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
 
-    const template = chat_config.chat_template;
-    const kind: rp_mod.Kind = if (std.mem.indexOf(u8, template, "<|channel>") != null)
+    const kind: rp_mod.Kind = if (chat_mod.templateUsesChannels(chat_config))
         .gemma
     else
         .bare_think;
@@ -606,7 +588,7 @@ pub fn resolveReasoningProtocol(
                 if (!proto.setCloser(think_tags.BARE_THINK_CLOSER)) return false;
             },
             .none => {
-                const opener = templateThinkOpener(template) orelse return false;
+                const opener = chat_mod.templateThinkOpener(chat_config) orelse return false;
                 var closer_buf: [rp_mod.MAX_MARKER_BYTES]u8 = undefined;
                 const close = std.fmt.bufPrint(&closer_buf, "</{s}", .{opener[1..]}) catch return false;
                 if (!proto.setOpener(opener) or !proto.setCloser(close)) return false;
@@ -4061,19 +4043,6 @@ test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag"
     try std.testing.expect(!admitMtpForCtx(false, 1));
 }
 
-test "generated think tags require an unambiguous literal template opener" {
-    try std.testing.expectEqualStrings("<think>", templateThinkOpener("{{ '<think>' }} <think>").?);
-    try std.testing.expect(templateThinkOpener("{{ '<think:opensource>' }}") == null);
-    try std.testing.expect(templateThinkOpener("<think> <think:opensource>") == null);
-    try std.testing.expect(templateThinkOpener("<think:{{ suffix }}>") == null);
-    try std.testing.expect(templateThinkOpener("assistant") == null);
-}
-
-
-
-
-
-
 const byteTokenizerForTests = tokenizer_mod.byteTokenizerForTests;
 const deinitTestTokenizer = tokenizer_mod.deinitTestTokenizer;
 
@@ -4098,6 +4067,8 @@ pub fn expectSurfaceForcesCall(tool_choice_json: []const u8, openai_tools: []con
     const messages = [_]chat_mod.Message{.{ .role = "user", .content = "What time is it?" }};
     for (families) |f| {
         var config = chat_mod.ChatConfig{ .chat_template = f.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        try config.compile();
+        defer config.dropCompiled();
         // `required` commits the only declared name too: the call names a declared function.
         const call = try std.mem.concat(a, u8, &.{ f.head, forced_name orelse "get_time", f.name_tail });
         defer a.free(call);
@@ -4173,6 +4144,8 @@ test "tool_choice auto and none arm no forced call" {
     var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
     defer deinitTestTokenizer(&tok);
     var config = chat_mod.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    try config.compile();
+    defer config.dropCompiled();
     const ids = try tok.encode(a, "<|im_start|>assistant\n<think>\n");
     defer a.free(ids);
     try std.testing.expect(armCallForce(a, &tok, &config, ids, true, .auto, null) == null);
@@ -4193,6 +4166,8 @@ test "tool_choice none bans each family's one-token call opener, and nothing els
         @embedFile("fixtures/glm53_chat_template.jinja"),
     }) |tpl| {
         var config = chat_mod.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        try config.compile();
+        defer config.dropCompiled();
         const ban = noneCallBan(a, &tok, &config) orelse return error.OpenerNotBanned;
         try std.testing.expectEqual(tok.special_tokens.get("<tool_call>").?, ban.id);
         try std.testing.expectEqual(@as(f32, -100), ban.delta);

@@ -31,6 +31,7 @@ test {
     _ = @import("template/builtins.zig");
     _ = @import("template/render.zig");
     _ = @import("template/ast.zig");
+    _ = @import("template/facts.zig");
     _ = @import("tool_traffic_replay_test.zig");
     _ = @import("tokenize_cache.zig");
     _ = @import("round_cost.zig");

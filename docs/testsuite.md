@@ -145,6 +145,10 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   needle, or they assume a consistent comparator; the engine uses `value.Finder` (KMP) and `value.stableSort`.
   `arch-test-unlisted` flags a file that declares a test and sits beside an `arch_tests.zig` that does not import
   it: the buckets select tests by listed file, so its tests would never run.
+  `template-text-search` flags, outside `src/template/` and tests, a `mem.` search (`indexOf`, `count`, `startsWith`,
+  ...) whose arguments name a template's source (`chat_template`, `template`, `tmpl`, `tpl`, `template_source`): a
+  word in the text may sit in a comment or a comparison, so the server asks the compiled template's facts
+  (`chat.asks`). It matches names, not data flow: a copy under another name (`isIncludeStub`'s trimmed `t`) passes.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its

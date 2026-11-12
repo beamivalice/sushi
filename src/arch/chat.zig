@@ -70,6 +70,14 @@ pub fn lateSystemTemplate(allocator: std.mem.Allocator, tpl: []const u8) !?[]con
     return null;
 }
 
+/// Whether `model_type`'s chat face edits its template so a late system turn renders in place.
+pub fn editsLateSystem(model_type: []const u8) bool {
+    const tag = registry.ofModelType(model_type) orelse return false;
+    switch (tag) {
+        inline else => |t| return @hasDecl(faceOf(t), "lateSystemTemplate"),
+    }
+}
+
 pub fn pinOf(model_type: []const u8) ?Pin {
     const tag = registry.ofModelType(model_type) orelse return null;
     switch (tag) {

@@ -4,7 +4,7 @@
 /// The `config.json` cut from Qwen3.8-Flash-Next-Sushi-3bpw.
 pub const config = @embedFile("../fixtures/model-configs/qwen4_exp.json");
 
-/// The stock chat template, byte-matched by the late-system adapter.
+/// The stock chat template, whose late-system branch the chat face edits.
 pub const template = @embedFile("../fixtures/qwen38_flash_next_chat_template.jinja");
 
 /// The wikitext2 teacher fixture of `sushi kld`, under the models root.

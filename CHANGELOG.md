@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A chat template that does not parse now fails the model's load**: the log names its line and column
+  (`[load] chat template:`) instead of every request failing its render.
 - **DeepSeek-V4.1-Flash prefills long prompts faster on Sushi Cooler**: an expert streamed back from the SSD no
   longer re-reads its small scale vectors while the GPU waits, so long prompts on a budget below the whole pack
   process sooner with the same output; the SSD budget sets 0.7 GB aside for them.

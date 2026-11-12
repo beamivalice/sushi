@@ -83,4 +83,10 @@ pub const Node = struct {
     };
 };
 
-pub const Branch = struct { test_: *const Expr, body: []const Node };
+pub const Branch = struct {
+    test_: *const Expr,
+    body: []const Node,
+    /// Source offsets: the `%}` that closes the branch's own tag, and the `{%` of the tag that ends its body.
+    open_end: u32 = 0,
+    close: u32 = 0,
+};

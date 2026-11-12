@@ -620,10 +620,10 @@ fn readPackFacts(io: std.Io, allocator: std.mem.Allocator, row: *ModelRow) void 
     row.fit.window_native = row.rope.native;
     row.fit.window_default = row.rope.cap();
     if (row.loaded != null) return;
-    var chat_config = chat.loadChatConfig(io, allocator, row.path) catch return;
+    var chat_config = chat.peekChatConfig(io, allocator, row.path) catch return;
     defer chat_config.deinit();
-    row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(chat_config.chat_template);
-    row.fit.template_thinks = chat.templateHasThinkSpan(chat_config.chat_template);
+    row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(&chat_config);
+    row.fit.template_thinks = chat.templateHasThinkSpan(&chat_config);
 }
 
 /// An entry's row from what the registry holds; the caller holds its lock.
@@ -636,8 +636,8 @@ fn heldRow(e: *model_registry_mod.LoadedModel) ModelRow {
         row.loaded = loadedWith(c);
         row.defaults = resolvedDefaults(c);
         if (e.chat_config) |cc| {
-            row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(cc.chat_template);
-            row.fit.template_thinks = chat.templateHasThinkSpan(cc.chat_template);
+            row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(cc);
+            row.fit.template_thinks = chat.templateHasThinkSpan(cc);
         }
         const snap = e.disk_stats.snapshot();
         if (snap.namespace != 0) row.tier = .{ .cap_bytes = snap.budget, .used_bytes = snap.used };

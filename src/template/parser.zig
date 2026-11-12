@@ -196,8 +196,9 @@ pub const Parser = struct {
         var else_: []const Node = &.{};
         while (true) {
             const test_ = try self.tuple(.{ .condexpr = false });
+            const open_end = self.cur().pos;
             const body = try self.block(&.{ "elif", "else", "endif" });
-            try branches.append(self.arena, .{ .test_ = test_, .body = body });
+            try branches.append(self.arena, .{ .test_ = test_, .body = body, .open_end = open_end, .close = self.tokens[self.i - 1].pos });
             const end = self.advance().text;
             if (std.mem.eql(u8, end, "elif")) continue;
             if (std.mem.eql(u8, end, "else")) {

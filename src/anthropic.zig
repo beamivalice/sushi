@@ -2032,6 +2032,8 @@ test "anthropic messages: a forced tool_choice is committed at the answer bounda
 /// or a /v1/messages body.
 fn renderSurfaceTurnForTests(a: std.mem.Allocator, tpl: []const u8, surface: enum { responses, messages }, body_json: []const u8) ![]const u8 {
     var config = chat_mod.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    try config.compile();
+    defer config.dropCompiled();
     const parsed = try std.json.parseFromSlice(std.json.Value, a, body_json, .{});
     defer parsed.deinit();
     switch (surface) {

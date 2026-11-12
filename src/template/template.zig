@@ -5,6 +5,10 @@ const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const value = @import("value.zig");
 const render = @import("render.zig");
+pub const ast = @import("ast.zig");
+const facts_mod = @import("facts.zig");
+
+pub const Facts = facts_mod.Facts;
 
 pub const Limits = render.Limits;
 
@@ -63,6 +67,50 @@ pub const Diagnostic = struct {
     }
 };
 
+/// A template parsed once, rendered any number of times from any thread: a render reads the tree and never writes
+/// it. The tree lives in the template's own arena until `deinit`.
+pub const Template = struct {
+    arena: std.heap.ArenaAllocator,
+    /// The normalized source, for the line and column of a render's failure.
+    src: []const u8,
+    body: []const ast.Node,
+    /// What the tree says about itself, read once here (`facts.zig`).
+    facts: Facts,
+
+    pub fn compile(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Error!Template {
+        @setRuntimeSafety(true);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const tree = try parseTemplate(arena.allocator(), source, diag);
+        const facts = try facts_mod.of(arena.allocator(), tree.body);
+        return .{ .arena = arena, .src = tree.src, .body = tree.body, .facts = facts };
+    }
+
+    pub fn deinit(self: *Template) void {
+        @setRuntimeSafety(true);
+        self.arena.deinit();
+    }
+
+    /// The rendered prompt, allocated in `arena` as `renderJson` allocates it.
+    pub fn render(self: *const Template, arena: std.mem.Allocator, in: Inputs, diag: *Diagnostic) Error![]const u8 {
+        @setRuntimeSafety(true);
+        return renderTree(arena, .{ .src = self.src, .body = self.body }, in, diag, null);
+    }
+};
+
+/// What a render reads besides the template.
+pub const Inputs = struct {
+    messages_json: []const u8,
+    /// Null or empty: the context has no `tools`.
+    tools_json: ?[]const u8,
+    /// A JSON object whose keys join the context last (bos and eos tokens, thinking switches).
+    extra_json: []const u8,
+    add_generation_prompt: bool,
+    limits: Limits = .{},
+    /// When set, gets the work the render took against its limits, whether it succeeded or not.
+    usage: ?*Usage = null,
+};
+
 pub const Input = struct {
     template: []const u8,
     messages_json: []const u8,
@@ -89,32 +137,34 @@ pub const Usage = struct {
 /// The largest template text the engine reads.
 pub const max_template_len = 4 << 20;
 
-/// The rendered prompt, allocated in `arena` with everything the render built. Nothing is freed or moved before
-/// the caller frees `arena` (an arena: the render leaks into any other allocator).
+/// The rendered prompt, allocated in `arena` with everything the render built: the template is parsed for this
+/// render alone, inside its memory budget. Nothing is freed or moved before the caller frees `arena` (an arena: the
+/// render leaks into any other allocator).
 pub fn renderJson(arena: std.mem.Allocator, in: Input, diag: *Diagnostic) Error![]const u8 {
     @setRuntimeSafety(true);
-    var budget = render.Budget{ .child = arena, .limit = in.limits.max_memory };
-    defer if (in.usage) |u| {
-        u.memory = budget.used;
-    };
-    return renderBudgeted(budget.allocator(), in, diag) catch |e| {
-        if (e != error.OutOfMemory or !budget.exceeded) return e;
-        diag.set("", null, "the render uses more memory than its limit");
-        return error.TemplateRuntime;
-    };
+    return renderTree(arena, null, .{
+        .messages_json = in.messages_json,
+        .tools_json = in.tools_json,
+        .extra_json = in.extra_json,
+        .add_generation_prompt = in.add_generation_prompt,
+        .limits = in.limits,
+        .usage = in.usage,
+    }, diag, in.template);
 }
 
-fn renderBudgeted(arena: std.mem.Allocator, in: Input, diag: *Diagnostic) Error![]const u8 {
+const Tree = struct { src: []const u8, body: []const ast.Node };
+
+fn parseTemplate(arena: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Error!Tree {
     @setRuntimeSafety(true);
-    if (in.template.len > max_template_len) {
+    if (source.len > max_template_len) {
         diag.set("", null, "the template is larger than the engine reads");
         return error.TemplateSyntax;
     }
-    if (!std.unicode.utf8ValidateSlice(in.template)) {
+    if (!std.unicode.utf8ValidateSlice(source)) {
         diag.set("", null, "the template is not valid UTF-8");
         return error.TemplateSyntax;
     }
-    const src = try lexer.Lexer.normalize(arena, in.template);
+    const src = try lexer.Lexer.normalize(arena, source);
     var syntax: lexer.SyntaxError = .{ .pos = 0, .message = "" };
     const tokens = lexer.tokenize(arena, src, &syntax) catch |e| {
         if (e == error.TemplateSyntax) diag.set(src, syntax.pos, syntax.message);
@@ -124,6 +174,28 @@ fn renderBudgeted(arena: std.mem.Allocator, in: Input, diag: *Diagnostic) Error!
         if (e == error.TemplateSyntax) diag.set(src, syntax.pos, syntax.message);
         return e;
     };
+    return .{ .src = src, .body = body };
+}
+
+/// Renders `tree`, or with `source` set, parses it first inside the same memory budget.
+fn renderTree(arena: std.mem.Allocator, tree: ?Tree, in: Inputs, diag: *Diagnostic, source: ?[]const u8) Error![]const u8 {
+    @setRuntimeSafety(true);
+    var budget = render.Budget{ .child = arena, .limit = in.limits.max_memory };
+    defer if (in.usage) |u| {
+        u.memory = budget.used;
+    };
+    return renderBudgeted(budget.allocator(), tree, in, diag, source) catch |e| {
+        if (e != error.OutOfMemory or !budget.exceeded) return e;
+        diag.set("", null, "the render uses more memory than its limit");
+        return error.TemplateRuntime;
+    };
+}
+
+fn renderBudgeted(arena: std.mem.Allocator, given: ?Tree, in: Inputs, diag: *Diagnostic, source: ?[]const u8) Error![]const u8 {
+    @setRuntimeSafety(true);
+    const tree = given orelse try parseTemplate(arena, source.?, diag);
+    const src = tree.src;
+    const body = tree.body;
 
     var globals = render.Frame{ .parent = null };
     try globals.vars.put(arena, "messages", try jsonInput(arena, in.messages_json, "messages", diag));
@@ -175,6 +247,50 @@ const testing = std.testing;
 pub fn renderForTest(arena: std.mem.Allocator, template: []const u8, messages: []const u8, extra: []const u8, limits: Limits, diag: *Diagnostic) Error![]const u8 {
     @setRuntimeSafety(true);
     return renderJson(arena, .{ .template = template, .messages_json = messages, .tools_json = null, .extra_json = extra, .add_generation_prompt = false, .limits = limits }, diag);
+}
+
+test "template: a template compiled once renders on many threads at once, each as a fresh compile renders" {
+    // Macros, a namespace, loops and literals: everything a render reads from the tree, shared read-only.
+    const source =
+        \\{%- macro tag(m) -%}<{{ m.role }}>{%- endmacro -%}
+        \\{%- set ns = namespace(n=0) -%}
+        \\{%- for m in messages -%}{{ tag(m) }}{{ m.content|upper }}{% set ns.n = ns.n + 1 %}{%- endfor -%}
+        \\[{{ ns.n }}{{ ' tools' if tools is defined }}]{% if add_generation_prompt %}<assistant>{% endif %}
+    ;
+    var diag = Diagnostic{};
+    var compiled = try Template.compile(testing.allocator, source, &diag);
+    defer compiled.deinit();
+    const inputs = [_]Inputs{
+        .{ .messages_json = "[{\"role\": \"user\", \"content\": \"hi\"}]", .tools_json = null, .extra_json = "{}", .add_generation_prompt = true },
+        .{ .messages_json = "[{\"role\": \"system\", \"content\": \"s\"}, {\"role\": \"user\", \"content\": \"q\"}]", .tools_json = "[{}]", .extra_json = "{}", .add_generation_prompt = false },
+    };
+    const Worker = struct {
+        fn run(t: *const Template, in: Inputs, ok: *bool) void {
+            @setRuntimeSafety(true);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var d = Diagnostic{};
+            var fresh = Diagnostic{};
+            for (0..200) |_| {
+                const got = t.render(arena.allocator(), in, &d) catch return;
+                const want = renderJson(arena.allocator(), .{ .template = source, .messages_json = in.messages_json, .tools_json = in.tools_json, .extra_json = in.extra_json, .add_generation_prompt = in.add_generation_prompt }, &fresh) catch return;
+                if (!std.mem.eql(u8, got, want)) return;
+            }
+            ok.* = true;
+        }
+    };
+    var oks: [8]bool = @splat(false);
+    var threads: [8]std.Thread = undefined;
+    for (&threads, &oks, 0..) |*t, *ok, i| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &compiled, inputs[i % inputs.len], ok });
+    for (threads) |t| t.join();
+    for (oks) |ok| try testing.expect(ok);
+}
+
+test "template: a template that does not compile fails at compile, with its place" {
+    var diag = Diagnostic{};
+    try testing.expectError(error.TemplateSyntax, Template.compile(testing.allocator, "ok\n{% for x in %}", &diag));
+    try testing.expectEqual(@as(u32, 2), diag.line);
+    try testing.expect(diag.message().len > 0);
 }
 
 test "template: a raise reports its text and where it was raised" {

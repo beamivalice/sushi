@@ -225,6 +225,23 @@ expect_green "a listed file, a file with no test and a folder with no arch_tests
 printf '%s\n' 'pub fn c() void {}' 'test "named only in a comment" { c(); }' > "$TMP/t/src/arch1/comment.zig"
 expect_red "a file the list names only in a comment" "\[arch-test-unlisted\] -: comment.zig"
 
+# rule template-text-search
+tree
+printf '%s\n' 'const std = @import("std");' 'const mem = std.mem;' 'const C = struct { chat_template: []const u8 };' \
+  'fn f(cc: *const C, tpl: []const u8) bool {' '    if (std.mem.indexOf(u8, cc.chat_template, "<think>") != null) return true;' \
+  '    return mem.count(u8, tpl, "tools") > 0;' '}' > "$TMP/t/src/p.zig"
+expect_red "a search of a config's template text" "src/p.zig:5:17 \[template-text-search\] f: mem.indexOf over the template text"
+expect_red "a count of a template parameter through an alias" "\[template-text-search\] f: mem.count over the template text"
+
+tree
+mkdir -p "$TMP/t/src/template"
+printf '%s\n' 'const std = @import("std");' 'fn f(rendered: []const u8, tpl: []const u8) bool {' \
+  '    return std.mem.indexOf(u8, rendered, "<think>") != null and std.mem.eql(u8, tpl, "x");' '}' \
+  'test "a test reads its template" { _ = std.mem.indexOf(u8, "{{ x }}", "x"); const tpl = "a"; _ = std.mem.count(u8, tpl, "a"); }' > "$TMP/t/src/p.zig"
+printf '%s\n' 'const std = @import("std");' 'fn g(template: []const u8) ?usize {' '    @setRuntimeSafety(true);' \
+  '    return std.mem.indexOfScalar(u8, template, 0x7b);' '}' > "$TMP/t/src/template/q.zig"
+expect_green "a search of rendered text, an equality, a test, and the engine itself"
+
 # the allowlist
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn handleOf(s: *S) *S { return s; }' 'fn f(self: *const S) *S {' \

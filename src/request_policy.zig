@@ -210,16 +210,6 @@ pub fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u3
     return max_tokens;
 }
 
-/// Heuristic: chat templates that contain a thinking-block opener indicate the
-/// model can produce reasoning_content. Covers Qwen (`enable_thinking`,
-/// `<think>`), Gemma 4 (`<|channel>thought`), and generic `<think>` templates.
-pub fn chatTemplateSupportsThinking(tmpl: []const u8) bool {
-    return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
-        std.mem.indexOf(u8, tmpl, "<think>") != null or
-        std.mem.indexOf(u8, tmpl, "thought") != null or
-        std.mem.indexOf(u8, tmpl, "<|channel>") != null;
-}
-
 /// Render an optional model-author sampling recommendation (from the model's
 /// generation_config.json) as a JSON scalar: the number when present, the
 /// literal `null` when the model ships no value. Caller owns the slice.
@@ -246,7 +236,7 @@ pub const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const
 /// only a delivery cap fights the word: `chat.templateConsumesEffort`).
 pub fn effortWordOnly(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
     const cc = lm.chat_config orelse return false;
-    return chat_mod.templateConsumesEffort(cc.chat_template) and !thinkMarkersAtomic(allocator, lm, tok);
+    return chat_mod.templateConsumesEffort(cc) and !thinkMarkersAtomic(allocator, lm, tok);
 }
 
 pub fn parseReasoningEffort(root: std.json.ObjectMap, template_consumes_effort: bool, arms: ?[]const effort_mod.EffortArm) error{EffortRefused}!?ReasoningEffort {

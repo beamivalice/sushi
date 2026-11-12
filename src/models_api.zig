@@ -38,7 +38,7 @@ const http_conn = @import("http_conn.zig");
 const request_policy = @import("request_policy.zig");
 const Conn = http_conn.Conn;
 const batchVerdictFor = server.batchVerdictFor;
-const chatTemplateSupportsThinking = request_policy.chatTemplateSupportsThinking;
+const chatTemplateSupportsThinking = chat_mod.templateSupportsThinking;
 const computeMemoryContext = server.computeMemoryContext;
 const defaultEnableMtpForStreaming = server.defaultEnableMtpForStreaming;
 const forceMtpFor = server.forceMtpFor;
@@ -372,7 +372,7 @@ pub fn renderModelEntry(
         var caps = try readyCapsJson(allocator, .{
             .has_chat = has_chat,
             .has_vision = has_vision,
-            .has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template),
+            .has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config),
         });
         defer caps.deinit(allocator);
 
