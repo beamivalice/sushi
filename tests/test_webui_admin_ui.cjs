@@ -50,6 +50,7 @@ function makeServer(opts = {}) {
       pack_update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
       skip_mem_preflight: { file: null, flag: null, default: false, source: 'default', locked: false, applies: 'applies at once' },
       port: { file: null, flag: null, default: 12345, source: 'default', locked: false, applies: 'the next start; a running server keeps its port' },
+      max_request_mb: { file: null, default: 128, min: 1, max: 4096, source: 'default', locked: false, applies: 'applies at once to new requests; uploads already in progress keep their limit' },
     },
     cache: {
       root: '/h/.sushi/kv-cache', volume: { free_bytes: 1399 * GiB, total_bytes: 3722 * GiB }, total_bytes: 71.5 * GiB,
@@ -1134,6 +1135,24 @@ async function main() {
       await page.click('#portSave');
       await page.waitForFunction(() => document.querySelector('#portNum').value === '');
       assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings')[1].body, { server: { port: null } });
+    });
+    await scenario('request size limit validates, saves and resets without a restart', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#requestMb', { timeout: 3000 });
+      assert.equal(await page.getAttribute('#requestMb', 'placeholder'), 'Default (128)');
+      for (const value of ['0', '4097', '1.5', 'abc']) {
+        await page.fill('#requestMb', value);
+        assert.equal(await page.isDisabled('#requestSave'), true);
+        assert.equal(await page.getAttribute('#requestMb', 'aria-invalid'), 'true');
+      }
+      await page.fill('#requestMb', '5');
+      await page.click('#requestSave');
+      await page.waitForFunction(() => document.querySelector('.set[data-key="max_request_mb"] .badges').textContent.includes('Saved'));
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { max_request_mb: 5 } });
+      assert.match(await page.textContent('.set[data-key="max_request_mb"] .badges'), /Now/);
+      await page.fill('#requestMb', '');
+      await page.click('#requestSave');
+      await page.waitForFunction(() => document.querySelector('#requestMb').value === '');
+      assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings')[1].body, { server: { max_request_mb: null } });
     });
     await scenario('--port locks the default port and names the flag', { path: '/settings', setup: (s) => {
       Object.assign(s.state.server.port, { flag: '9000', source: 'flag', locked: true });

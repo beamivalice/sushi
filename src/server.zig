@@ -338,7 +338,6 @@ pub fn chatPageUrl(buf: []u8, host: []const u8, port: u16) []const u8 {
     return std.fmt.bufPrint(buf, "http://{s}:{d}/", .{ shown, port }) catch "http://127.0.0.1/";
 }
 
-pub const max_request_bytes: usize = 64 * 1024 * 1024;
 
 
 

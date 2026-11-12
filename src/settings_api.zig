@@ -344,6 +344,11 @@ pub fn render(
     try writeToggle(w, "update_check", srv.update_check, &locks.update_check, true);
     try writeToggle(w, "pack_update_check", srv.pack_update_check, &locks.pack_update_check, true);
     try writeToggle(w, "skip_mem_preflight", srv.skip_mem_preflight, &locks.skip_mem_preflight, false);
+    try w.writeAll(",\"max_request_mb\":{\"file\":");
+    try writeJson(w, srv.max_request_mb);
+    try w.print(",\"default\":{d},\"min\":1,\"max\":{d},\"source\":\"{s}\",\"locked\":false,\"applies\":\"applies at once to new requests; uploads already in progress keep their limit\"}}", .{
+        model_settings.default_max_request_mb, model_settings.max_request_mb_limit, if (srv.max_request_mb != null) "file" else "default",
+    });
     const port_pinned = locks.port.set;
     try w.writeAll(",\"port\":{\"file\":");
     try writeJson(w, srv.port);
@@ -796,6 +801,9 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
             try writeJson(w, applyUpdateCheck(&model_settings.launch_locks, e.key, e.value));
         } else if (std.mem.eql(u8, e.key, "skip_mem_preflight")) {
             try writeJson(w, applySkipMemPreflight(&model_settings.launch_locks, e.value));
+        } else if (std.mem.eql(u8, e.key, "max_request_mb")) {
+            server_state.setMaxRequestMb(if (e.value) |v| @intCast(v.integer) else null);
+            try writeJson(w, "applies to the next request");
         } else if (std.mem.eql(u8, e.key, "port")) {
             try writeJson(w, portMessage(&model_settings.launch_locks));
         } else {
@@ -850,7 +858,7 @@ test "settings api: every saved key is classified, and the ones a load reads cle
     for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" }) |key| {
         try std.testing.expect(reachesLoad(key));
     }
-    for ([_][]const u8{ "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" }) |key| {
+    for ([_][]const u8{ "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb" }) |key| {
         try std.testing.expect(!reachesLoad(key));
     }
     // A new key must be classified above before it ships.
@@ -867,7 +875,7 @@ test "settings api: only the two SSD size keys re-arm a declined SSD tier, and b
 }
 
 fn classified(key: []const u8) bool {
-    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" };
+    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb" };
     for (known) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
@@ -1148,6 +1156,21 @@ test "settings api: render reports skip_mem_preflight off by default, with the f
     try testing.expectEqualStrings("flag", o.get("source").?.string);
     try testing.expect(o.get("locked").?.bool);
     try testing.expectEqualStrings("--skip-mem-preflight", o.get("flag").?.string);
+}
+
+test "settings api: request size limit accepts MiB or null and rejects invalid values" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const plan = parseRequest(arena_state.allocator(), "{\"server\":{\"max_request_mb\":5}}");
+    try testing.expect(plan == .ok);
+    try testing.expectEqual(@as(i64, 5), plan.ok.server_edits[0].value.?.integer);
+    const reset = parseRequest(arena_state.allocator(), "{\"server\":{\"max_request_mb\":null}}");
+    try testing.expect(reset == .ok);
+    try testing.expect(reset.ok.server_edits[0].value == null);
+    for ([_][]const u8{ "0", "-1", "4097", "1.5", "\"5\"", "true" }) |value| {
+        const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"server\":{{\"max_request_mb\":{s}}}}}", .{value});
+        try expectRejected(body, 400, "invalid_setting");
+    }
 }
 
 test "settings api: skip_mem_preflight takes a boolean or null, reaches the next load at once, and a pinning flag keeps it on" {
