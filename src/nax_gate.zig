@@ -96,15 +96,7 @@ pub fn macosProductVersion(buf: []u8) ?[]const u8 {
 /// M4 Max). The returned pointer from mlx is borrowed from the info object,
 /// so the string is copied into the caller's buffer before the info frees.
 pub fn gpuArchitecture(buf: []u8) ?[]const u8 {
-    var dev = mlx.mlx_device{ .ctx = null };
-    if (mlx.mlx_get_default_device(&dev) != 0) return null;
-    defer _ = mlx.mlx_device_free(dev);
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) != 0) return null;
-    var cstr: [*:0]const u8 = undefined;
-    if (mlx.mlx_device_info_get_string(&cstr, info, "architecture") != 0) return null;
-    const arch = std.mem.span(cstr);
+    const arch = mlx.deviceArchitecture();
     if (arch.len == 0 or arch.len > buf.len) return null;
     @memcpy(buf[0..arch.len], arch);
     return buf[0..arch.len];

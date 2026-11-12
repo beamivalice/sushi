@@ -40,19 +40,18 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     if (!config.expert_streaming or config.expert_layout != (if (stq) expert_quant_mod.Layout.exl3_k4 else .mxfp4_w123)) return error.ExpertStreamingRequired;
     // Decided before any kernel is made: the engine records each kernel as it is created.
     const own_decode = dsv41_borrow.ownDecode(&config.dsv41.?);
-    if (own_decode) mlx.engine.enabled = true;
-    if (own_decode) {
-        const dsv41 = &config.dsv41.?;
-        if (dsv41.expert_dec) |dec| expert_exl3_kernels.prepareGemmNax(dec, if (config.expert_tile_order == .pair_major) .tile_major else .pack);
-        if (dsv41.trunk_dec) |dec| expert_exl3_kernels.prepareGemmNax(dec, .pack);
-    }
-    mlx.engine.seal(false);
     // A Cooler load's weights and expert slabs are the engine's own buffers, bound, sliced and cast by the engine: an op
     // on MLX's stream would take one as a second buffer over its pages.
-    const own_load = dsv41_borrow.ownDecode(&config.dsv41.?);
+    const own_load = own_decode;
     if (own_load) mlx.engine.hold();
     errdefer if (own_load) mlx.engine.unhold();
     const model_stream = if (own_load) mlx.engine.stream() else s;
+    if (own_decode) {
+        const dsv41 = &config.dsv41.?;
+        if (dsv41.expert_dec) |dec| expert_exl3_kernels.prepareGemmNax(dec, if (config.expert_tile_order == .pair_major) .tile_major else .pack, model_stream);
+        if (dsv41.trunk_dec) |dec| expert_exl3_kernels.prepareGemmNax(dec, .pack, model_stream);
+    }
+    mlx.engine.seal(false);
     const engine = try Trunk.newExpertEngine(allocator, &config, model_stream);
     errdefer {
         engine.deinit();

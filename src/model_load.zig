@@ -1661,6 +1661,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     defer generate_mod.logMlxCalls();
     const had_error_at_start = mlx.errorPending();
     try model_mod.archGate(params.config);
+    // A load whose arch brings its own stream is the engine's from here on; the model keeps a hold of its own to its
+    // unload.
+    const own_load = @import("arch/life.zig").ownStream(params.config) != null;
+    if (own_load) mlx.engine.hold();
+    defer if (own_load) mlx.engine.unhold();
     if (params.config.unsupported_note) |note| log.warn("{s}\n", .{note});
     var streaming_resident_bytes: ?u64 = null;
     var expert_source_assigned = false;

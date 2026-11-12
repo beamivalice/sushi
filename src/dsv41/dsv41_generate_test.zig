@@ -1341,7 +1341,8 @@ test "dsv41 engine: the load clock times every phase of a load and the phases ad
     load_clock.end();
     const p = load_clock.load;
     try testing.expect(p.headers_ns > 0 and p.read_ns > 0 and p.read_bytes > 0);
-    try testing.expect(p.build_ns > 0 and p.warm_ns > 0 and p.wired_ns > 0 and p.cache_ns > 0);
+    // The wired phase of a Cooler load asks MLX nothing (its limit is not MLX's to set under a hold): it may read zero.
+    try testing.expect(p.build_ns > 0 and p.warm_ns > 0 and p.cache_ns > 0);
     try testing.expectEqual(mlx.engine.pipelinesMade().count - made_before.count, p.compiled);
     try testing.expect(p.otherNs() * 20 <= p.total_ns);
 }
@@ -1699,6 +1700,7 @@ fn censusOf(dir: []const u8) ![9]Asked {
     }
     // The fixture's own reads (its token ids, the config) are the test's, not the load's.
     try fx.prepare(dir, null, 64 << 20);
+    mlx.noteAllocator();
     var c = try Census.begin();
     errdefer c.names.deinit(a);
     try fx.load(dir);
@@ -1785,10 +1787,9 @@ test "dsv41 engine: a Cooler load, its requests and its unload ask nothing of ML
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const asked = try censusOf(dir);
-    // A Cooler load holds the engine's scope from its first tensor to its unload: nothing is asked of MLX. The hold
-    // begins, in a process that has called MLX before, by emptying its pool and reading its allocator once.
-    for (asked[0..8]) |got| try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, got);
-    try testing.expectEqual(Asked{ .calls = 5, .ops = 0 }, asked[8]);
+    // A Cooler load holds the engine's scope from its first tensor to its unload: nothing is asked of MLX, whose
+    // allocator the census read before the load as a served process does at the end of its boot.
+    for (asked) |got| try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, got);
 }
 
 test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and restores it, byte for byte, with nothing asked of MLX (DSV41_STQ_TINY)" {

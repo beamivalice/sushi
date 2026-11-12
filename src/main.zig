@@ -1000,6 +1000,14 @@ fn runCli(init: std.process.Init) !void {
 
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
+    // The process's MLX setup ends here. What a load would ask the device is asked now, once, and MLX's allocator is
+    // read, so a load that is the engine's finds both known and asks MLX nothing.
+    if (metal_avail) {
+        _ = mlx.noGpuBackend();
+        _ = mlx.deviceArchitecture();
+        _ = @import("sushi_exl3").kernels.gemmNaxOn();
+        mlx.noteAllocator();
+    }
     server_state.disk_writer_permit_bytes = @import("kv_disk_writer.zig").permitForRam(@import("status.zig").getTotalMemBytes());
 
     if (serve_mode) {
@@ -1367,15 +1375,7 @@ const isGgufPath = model_discovery.isGgufModelPath;
 /// unlimited (the count cap still applies).
 fn autoResidentMemBytes(flag: ?u64) u64 {
     if (flag) |bytes| return bytes;
-    var dev = mlx.mlx_device{ .ctx = null };
-    _ = mlx.mlx_get_default_device(&dev);
-    defer _ = mlx.mlx_device_free(dev);
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) != 0) return 0;
-    var max_rec: usize = 0;
-    if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) return 0;
-    return @as(u64, max_rec) * 4 / 5;
+    return @as(u64, mlx.maxRecommendedWorkingSet()) * 4 / 5;
 }
 
 /// The ServerConfig fields both boot modes take from the parsed launch flags; a mode

@@ -1121,16 +1121,16 @@ pub fn gemmNaxOn() bool {
     return !gemm_nax_failed and gemmNaxAvailable();
 }
 
-/// Builds and proves the NAX GEMM kernel of `dec` and `order` now. The proof runs MLX work of its own, which a forward
-/// of the engine of our own refuses (and the arm would be declined for good), so a load that runs one calls this first.
-pub fn prepareGemmNax(dec: exl3.Decode, order: TileOrder) void {
+/// Builds and proves the NAX GEMM kernel of `dec` and `order` now, on `s`, the stream the forwards run on: the proof
+/// is a launch like any other, so a load proves the kernel where it will run it.
+pub fn prepareGemmNax(dec: exl3.Decode, order: TileOrder, s: mlx.mlx_stream) void {
     if (!gemmNaxOn()) return;
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
     const previous = active_decode;
     defer active_decode = previous;
     active_decode = dec;
-    _ = getGemmNaxKernelFor(order) catch {};
+    _ = getGemmNaxKernelFor(order, s) catch {};
 }
 
 // Capability is independent of the dispatch failure latch: tests must still
@@ -1157,10 +1157,11 @@ fn gemmNaxAvailable() bool {
 }
 
 fn getGemmNaxKernel() !mlx.mlx_fast_metal_kernel {
-    return getGemmNaxKernelFor(.pack);
+    return getGemmNaxKernelFor(.pack, mlx.gpuStream());
 }
 
-fn getGemmNaxKernelFor(order: TileOrder) !mlx.mlx_fast_metal_kernel {
+/// The kernel of the active decode and `order`, built and proven on `s` at its first use.
+fn getGemmNaxKernelFor(order: TileOrder, s: mlx.mlx_stream) !mlx.mlx_fast_metal_kernel {
     @setEvalBranchQuota(100_000);
     const ref = nax_reference_override and order == .pack;
     const slots = if (ref) &gemm_nax_ref_kernel else if (order == .tile_major) &gemm_nax_tm_kernel else &gemm_nax_kernel;
@@ -1171,11 +1172,11 @@ fn getGemmNaxKernelFor(order: TileOrder) !mlx.mlx_fast_metal_kernel {
                 if (slot.*) |k| return k;
                 const header = try kernel_src.withTableRows(cb, kernel_src.naxHeader(cb, win));
                 const kernel = (if (ref)
-                    buildNaxGemmKernel(GEMM_NAX_REFERENCE_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_ref" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr)
+                    buildNaxGemmKernel(GEMM_NAX_REFERENCE_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_ref" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
                 else if (order == .tile_major)
-                    buildNaxGemmKernel(GEMM_NAX_TM_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_tm" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr)
+                    buildNaxGemmKernel(GEMM_NAX_TM_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_tm" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
                 else
-                    buildNaxGemmKernel(GEMM_NAX_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr)) orelse {
+                    buildNaxGemmKernel(GEMM_NAX_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)) orelse {
                     gemm_nax_failed = true;
                     log.info("[exl3-gemm] NAX arm declined (kernel probe failed); the sorted GEMM serves prefill\n", .{});
                     return error.MetalKernelCompileFailed;
@@ -1190,7 +1191,7 @@ fn getGemmNaxKernelFor(order: TileOrder) !mlx.mlx_fast_metal_kernel {
 /// Metal JIT-compiles a kernel at its first EVAL, not at apply, so a source the
 /// toolchain rejects is proven here on a one-tile problem before any prefill
 /// depends on it. null = the arm is unusable; the latch it raised is dropped.
-fn buildNaxGemmKernel(source: [:0]const u8, header: [:0]const u8, name: [*:0]const u8) ?mlx.mlx_fast_metal_kernel {
+fn buildNaxGemmKernel(source: [:0]const u8, header: [:0]const u8, name: [*:0]const u8, s: mlx.mlx_stream) ?mlx.mlx_fast_metal_kernel {
     const input_names = [_][*:0]const u8{ "x", "trellis", "eids", "wstarts", "wnlive" };
     const output_names = [_][*:0]const u8{"y"};
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
@@ -1199,13 +1200,12 @@ fn buildNaxGemmKernel(source: [:0]const u8, header: [:0]const u8, name: [*:0]con
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const kernel = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
     if (kernel.ctx == null) return null;
-    if (probeNaxGemm(kernel)) return kernel;
+    if (probeNaxGemm(kernel, s)) return kernel;
     _ = mlx.mlx_fast_metal_kernel_free(kernel);
     return null;
 }
 
-fn probeNaxGemm(kernel: mlx.mlx_fast_metal_kernel) bool {
-    const s = mlx.gpuStream();
+fn probeNaxGemm(kernel: mlx.mlx_fast_metal_kernel, s: mlx.mlx_stream) bool {
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -1505,7 +1505,7 @@ pub fn innerGemmSortedTableOrdered(
         // failure's latch is ours to drop: left standing it becomes the next
         // decode tick's `MlxFailure`.
         const had_error = mlx.errorPending();
-        if (getGemmNaxKernelFor(order)) |nk| {
+        if (getGemmNaxKernelFor(order, s)) |nk| {
             const ncfg = try sortedGemmCfg(&gemm_nax_cfgs, key);
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(ncfg, out_dim, tab.nwin, 1));
             const ninputs = [_]mlx.mlx_array{ x, trellis, eids, tab.starts, tab.nlives };
@@ -4179,7 +4179,7 @@ test "exl3 a NAX GEMM source the Metal toolchain rejects is declined at the prob
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     mlx.installErrorHandler();
     try t.expect(!mlx.errorPending());
-    try t.expect(buildNaxGemmKernel("this is not metal;", "", "sushi_exl3_probe_bad") == null);
+    try t.expect(buildNaxGemmKernel("this is not metal;", "", "sushi_exl3_probe_bad", mlx.gpuStream()) == null);
     try t.expect(!mlx.errorPending());
     // Exercise the regression: an earlier failed dispatch may already have
     // latched NAX off, but that must not turn this capability check into a pass.
@@ -4189,7 +4189,7 @@ test "exl3 a NAX GEMM source the Metal toolchain rejects is declined at the prob
     gemm_nax_failed = true;
     try t.expect(gemmNaxAvailable());
     try t.expect(!gemmNaxOn());
-    const real = buildNaxGemmKernel(GEMM_NAX_SOURCE, kernel_src.naxHeader(.mul1, .w16), "sushi_exl3_k4_gemm_nax") orelse return error.TestUnexpectedResult;
+    const real = buildNaxGemmKernel(GEMM_NAX_SOURCE, kernel_src.naxHeader(.mul1, .w16), "sushi_exl3_k4_gemm_nax", mlx.gpuStream()) orelse return error.TestUnexpectedResult;
     _ = mlx.mlx_fast_metal_kernel_free(real);
     try t.expect(!mlx.errorPending());
 }
@@ -9490,7 +9490,7 @@ pub const PrefillGridSupport = struct {
         defer mlx.dropLatchedErrorUnless(had_error);
         switch (dec.codebook) {
             inline else => |cb| switch (dec.window) {
-                inline else => |win| return buildNaxGemmKernel(kernel_source, try kernel_src.withTableRows(cb, kernel_src.naxHeader(cb, win)), (try kernel_src.tableKernelName(cb, comptime "sushi_prefill_grid_transpose" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr) orelse error.MetalKernelCompileFailed,
+                inline else => |win| return buildNaxGemmKernel(kernel_source, try kernel_src.withTableRows(cb, kernel_src.naxHeader(cb, win)), (try kernel_src.tableKernelName(cb, comptime "sushi_prefill_grid_transpose" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, mlx.gpuStream()) orelse error.MetalKernelCompileFailed,
             },
         }
     }

@@ -52,17 +52,8 @@ pub fn getGpuWorkingSetLimit() u64 {
     const cached = working_set_at_start.load(.monotonic);
     if (cached > 0) return cached;
     if (host_tier) return liveRead();
-    var dev = mlx.mlx_device{ .ctx = null };
-    _ = mlx.mlx_get_default_device(&dev);
-    defer _ = mlx.mlx_device_free(dev);
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) == 0) {
-        var max_rec: usize = 0;
-        if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-            return @as(u64, max_rec);
-        }
-    }
+    const max_rec = mlx.maxRecommendedWorkingSet();
+    if (max_rec > 0) return @as(u64, max_rec);
     return bills.getMetalBufferLimit();
 }
 
@@ -106,14 +97,7 @@ pub fn refreshIdleGpuFloor() void {
 /// Main thread, before other threads: resolve MLX's command-buffer cadence the way MLX does
 /// and say what it is, since MLX reads the env once and reports nothing.
 pub fn resolveMlxCadence() void {
-    var arch_z: [*:0]const u8 = "";
-    var dev = mlx.mlx_device{ .ctx = null };
-    _ = mlx.mlx_get_default_device(&dev);
-    defer _ = mlx.mlx_device_free(dev);
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) == 0) _ = mlx.mlx_device_info_get_string(&arch_z, info, "architecture");
-    const arch = std.mem.span(arch_z);
+    const arch = mlx.deviceArchitecture();
     const env_mb: ?[]const u8 = if (std.c.getenv("MLX_MAX_MB_PER_BUFFER")) |v| std.mem.span(v) else null;
     const env_ops: ?[]const u8 = if (std.c.getenv("MLX_MAX_OPS_PER_BUFFER")) |v| std.mem.span(v) else null;
     bills.mlx_mb_per_buffer = bills.mlxPerBufferFromEnv(env_mb, bills.mlxDefaultMbPerBuffer(arch));

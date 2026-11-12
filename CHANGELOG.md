@@ -18,8 +18,8 @@ earlier history is mlx-serve's, in that project's changelog.
   streamed experts as its own buffers, finds a kernel it has already used without rebuilding its key and sets up a
   kernel launch without calling MLX, so the CPU has less to do between GPU passes. Long prompts are read faster, a
   start of the model is faster, and the prefix cache's restore points are taken, saved to SSD and read back by the
-  engine. A request there now runs from its first token to its cached restore point without a call into MLX, and an
-  idle server keeps only the engine's GPU queue awake.
+  engine. A load there, its requests and its unload now run without a call into MLX, and an idle server keeps only
+  the engine's GPU queue awake.
 - **DeepSeek-V4.1-Flash sampled answers draw on Sushi Cooler without MLX**: a seed now gives a different text on Sushi
   Cooler than on MLX, and the same text on every repeat, streamed or not, the first token included; the sampler,
   penalties, logit bias, grammar masks and logprobs of a token no longer run on MLX there.

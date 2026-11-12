@@ -147,13 +147,12 @@ route and the MLX arm still build the bank at prepare time.
 - **A Cooler load, its requests and its unload ask nothing of MLX, pinned phase by phase** (the census test in
   `dsv41_generate_test.zig`: the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore
   point captured and restored, a step after it, an image prompt, the unload; the SSD tier has its own test, with the
-  restored state compared byte for byte). Every row of a request and the unload are zero calls, and a change that
-  adds one fails it.
+  restored state compared byte for byte). Every row is zero calls, and a change that adds one fails it.
   `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry point. The free of an empty handle is no call
   (`mlx_array_free` in the seam): mlx-c holds nothing for one. The census counts a load that is not the process's
   first (it opens and closes the pack once before): what a process asks once (the device's description) is its first
-  load's, and with that kept out a row reads the same alone and after other tests. The load's row is the five calls
-  with which a hold begins in a process that has called MLX. Dispatches
+  load's, and with that kept out a row reads the same alone and after other tests. The census reads MLX's allocator
+  before the load it counts, as a served process does at the end of its boot. Dispatches
   still follow what the process ran before (a 12-token request read 7,336 as a process's only load and 7,017 after
   other loads).
 - **A Cooler load holds the engine's scope from its first tensor to its unload** (`engine.hold`, `engine.unhold`,
@@ -165,17 +164,24 @@ route and the MLX arm still build the bank at prepare time.
   verify's reserved-token mask (`spec_types.verifyArgmax`), the warm-up's token arrays, the think-marker mask, an
   image's patch array, the trunk shell's scalar constants. The `[engine] since load` line counts the refusals; a
   served request counts none.
-- **MLX's allocator is not asked under a hold** (`mlx.zig`, "MLX's allocator"; `engine.MlxAtRest`). The first hold
-  empties MLX's pool and reads its allocator once (active, cache, peak, external; five calls, none in a process that
-  never called MLX). Nothing of MLX's is made or freed under a hold, so those readings stay true to its end and the
-  seam answers with them on any thread: the gauges, the bills, a request's headroom. A pool clear, a peak reset and a
-  limit (`mlx_set_cache_limit`, the transient cap, the command-buffer budget of `DecodeBuffers`) are no call and
-  change nothing, a limit handing back the value given; a hold spans whole jobs, so no set and restore straddle its
-  ends. These were the last calls of a request: 300 to 700 each on the real pack (the per-forward transient cap and
-  command-buffer budget, the headroom readings). A live Cooler process (STQ 1.75bpw, df1b2075 plus this change) makes
-  125 calls into mlx-c by the end of its first request, at boot and in the load before the hold, and none in the
-  requests after it. `SUSHI_MLX_CALLS_TRACE=1` prints the tally by entry point at both ends of a load and after a
-  request ([envvar](envvar.md)).
+- **MLX's allocator is not asked under a hold** (`mlx.zig`, "MLX's allocator"; `engine.MlxAtRest`). A hold begins
+  with MLX's pool emptied and its allocator read once (active, cache, peak, external: five calls), unless nothing has
+  changed in MLX since the last such reading (`mlx.changes` counts every call but a reading of the allocator or the
+  device): then the reading still holds and no call is made. A served process reads at the end of its boot
+  (`mlx.noteAllocator`), so its Cooler loads ask nothing; a load after an MLX-route model reads once more. Nothing of
+  MLX's is made or freed under a hold, so the readings stay true to its end and the seam answers with them on any
+  thread: the gauges, the bills, a request's headroom. A pool clear, a peak reset and a limit
+  (`mlx_set_cache_limit`, the transient cap, the command-buffer budget of `DecodeBuffers`) are no call and change
+  nothing, a limit handing back the value given; a hold spans whole jobs, so no set and restore straddle its ends.
+  These were the last calls of a request: 300 to 700 each on the real pack.
+- **The hold begins with the load job** (`model_load.doLoadOnInferenceThread`, for an arch that brings its own
+  stream; the model keeps a hold of its own from `initDsv41` to its unload). What the job did on MLX before the
+  model was made is under it: the pool cap of the ledger, the readings around the weights, the wired limit.
+- **The device is asked once a process** (`mlx.deviceArchitecture`, `maxRecommendedWorkingSet`; the boot asks what a
+  load would, the NAX question of the EXL3 kernels included). A live Cooler process (STQ 1.75bpw, 348b99fb plus this
+  change) makes 27 calls into mlx-c, all in its boot: the device, the default device and seed, the pool cap, one
+  allocator reading. Its load, its requests and its unload make none. `SUSHI_MLX_CALLS_TRACE=1` prints the tally by
+  entry point at both ends of a load and after a request ([envvar](envvar.md)).
 - **A trial that picks a kernel arm runs on the load's stream.** The attention and index-scan matrix-unit trials
   (`kernels.attnNaxTrial`, `indexNaxTrials`) ran on MLX's stream with MLX's normal draw; inside a held scope both
   were refused, the refusal read as "the trial differs", the SIMD and scalar kernels served and four of five live
@@ -352,10 +358,10 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **Every warm forward of the engine runs under a request's budget** (`dsv41_model.warmBudget`, before each decode-width
   forward; `warmWide` through `forwardDsv41With`). The decode cap follows the position the forward is at, so the
   long-context steps of `warmOwnBlocks` and `warmOwnLong` are billed as a request there is.
-- **The NAX GEMM kernel is proven before the engine warm** (`kernels.prepareGemmNax`, called by `initDsv41` for the
-  experts' and the trunk's decode). Its proof is MLX work of its own, which a forward of the engine refuses; first
-  reached inside one, it was declined for the process (`[exl3-gemm] NAX arm declined`) and every GEMM, prefill
-  included, ran the SIMD arm at a third of the speed.
+- **The NAX GEMM kernel is proven on the stream that runs it** (`kernels.prepareGemmNax(dec, order, s)`, called by
+  `initDsv41` for the expert and trunk decodes under the load's hold). The proof is a one-tile launch; it used to run
+  on MLX's stream before the hold, the last two kernels a Cooler load made and ran on MLX. A forward that meets a
+  kernel not yet built proves it on its own stream the same way.
 - **A failed launch declines a kernel arm only before that arm has ever worked** (`kernels.gemm_nax_worked`). After
   one launch has run, a failure is the launch's own (a pass the engine refuses by name, memory) and is returned: taken
   as "the arm is unavailable" it switched the whole process to another arm, with other bytes, without a word.

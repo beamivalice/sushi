@@ -62,6 +62,7 @@ pub var mlx_at_rest: MlxAtRest = .{};
 /// A load that is the engine's alone holds the engine's scope open from its first tensor to its unload: every host
 /// array and vector made for it is the engine's, and an op on an MLX stream is refused by name.
 pub fn hold() void {
+    enabled = true;
     if (holds == 0) mlx.restAllocator(&mlx_at_rest);
     holds += 1;
     active = true;
@@ -2364,6 +2365,37 @@ test "engine dequantize gives MLX's bytes: affine 4-bit bf16 and mxfp8 to f32" {
     const group_scales = hostArray(u8, &exps, &.{ 3, 10 }, .uint8);
     defer _ = mlx.mlx_array_free(group_scales);
     try expectSame(Build.mxfp8, &.{ w, group_scales });
+}
+
+test "a hold that finds MLX as its allocator was last read asks it nothing; after a change it reads once more" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    mlx.noteAllocator();
+    var calls = mlxCalls();
+    hold();
+    unhold();
+    try std.testing.expectEqual(calls, mlxCalls());
+    // A reading changes nothing in MLX.
+    var held_bytes: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&held_bytes));
+    _ = mlx.deviceArchitecture();
+    calls = mlxCalls();
+    hold();
+    unhold();
+    try std.testing.expectEqual(calls, mlxCalls());
+    // An array does.
+    {
+        var ones = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ones);
+        try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1 << 10, 4 }, 2, .float32, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(ones));
+    }
+    calls = mlxCalls();
+    hold();
+    unhold();
+    try std.testing.expectEqual(calls + 5, mlxCalls());
 }
 
 test "under a hold MLX's allocator is not asked: its readings are the hold's first, and a clear, a reset and a limit are no call and change nothing" {

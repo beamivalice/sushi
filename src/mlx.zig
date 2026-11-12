@@ -81,8 +81,23 @@ fn counted(comptime name: [:0]const u8, comptime F: type) Spread(F, Counted(name
 /// beside the inference thread, hence atomic). A call the seam routes to the engine is not one.
 pub var calls: std.atomic.Value(u64) = .init(0);
 
+/// Calls that may have changed what MLX holds: every call but a reading of its allocator or of the device.
+var changes: std.atomic.Value(u64) = .init(0);
+
+fn readsOnly(comptime name: []const u8) bool {
+    const readings = [_][]const u8{
+        "mlx_get_active_memory",       "mlx_get_cache_memory",     "mlx_get_peak_memory",        "mlx_get_external_memory",
+        "mlx_get_transient_peak",      "mlx_metal_is_available",   "mlx_version",                "mlx_string_data",
+        "mlx_get_default_device",      "mlx_device_info_get",      "mlx_device_info_get_size",   "mlx_device_info_get_string",
+        "mlx_device_info_free",        "mlx_device_free",          "mlx_metal_command_buffer_count",
+    };
+    for (readings) |r| if (std.mem.eql(u8, r, name)) return true;
+    return false;
+}
+
 inline fn tally(comptime name: []const u8) void {
     _ = calls.fetchAdd(1, .monotonic);
+    if (comptime !readsOnly(name)) _ = changes.fetchAdd(1, .monotonic);
     if (comptime builtin.is_test) by_name.add(name) else if (callNamesTraced()) by_name.add(name);
 }
 
@@ -1130,9 +1145,12 @@ fn atRest() ?*engine.MlxAtRest {
     return if (engine.mlx_at_rest.on.load(.acquire)) &engine.mlx_at_rest else null;
 }
 
-/// Empties MLX's pool and reads its allocator for the hold that begins. A process that never called MLX has nothing
-/// there to read.
-pub fn restAllocator(r: *engine.MlxAtRest) void {
+var allocator_read_at: ?u64 = null;
+
+/// MLX's pool emptied and its allocator read into `r`, unless nothing has changed in MLX since the last time: then
+/// what `r` holds is still true and no call is made. A process that never called MLX has nothing there to read.
+fn readAllocator(r: *engine.MlxAtRest) void {
+    if (allocator_read_at) |at| if (at == changes.load(.monotonic)) return;
     var now: [4]usize = @splat(0);
     if (calls.load(.monotonic) != 0) {
         _ = raw.mlx_clear_cache();
@@ -1145,7 +1163,19 @@ pub fn restAllocator(r: *engine.MlxAtRest) void {
     r.cache.store(now[1], .monotonic);
     r.peak.store(now[2], .monotonic);
     r.external.store(now[3], .monotonic);
+    allocator_read_at = changes.load(.monotonic);
+}
+
+/// For the hold that begins (inference thread).
+pub fn restAllocator(r: *engine.MlxAtRest) void {
+    readAllocator(r);
     r.on.store(true, .release);
+}
+
+/// The end of a process's MLX setup, on the thread that loads: a load that is the engine's and finds MLX as it was
+/// left here asks it nothing.
+pub fn noteAllocator() void {
+    readAllocator(&engine.mlx_at_rest);
 }
 
 pub fn mlx_clear_cache() c_int {
@@ -1504,16 +1534,45 @@ pub fn check(ret: c_int) !void {
 // residency for the whole RAM-resident model on every command buffer; the
 // policy wires up to `max_recommended_working_set_size`.
 
-pub fn maxRecommendedWorkingSet() usize {
+/// What the default device says of itself. It does not change, so MLX is asked once a process (a failed query is
+/// asked again).
+const DeviceFacts = struct {
+    arch: [64]u8 = undefined,
+    arch_len: usize = 0,
+    working_set: usize = 0,
+};
+var device_facts: DeviceFacts = .{};
+var device_known: std.atomic.Value(bool) = .init(false);
+
+fn deviceFacts() ?*const DeviceFacts {
+    if (device_known.load(.acquire)) return &device_facts;
     var dev = mlx_device{ .ctx = null };
-    _ = mlx_get_default_device(&dev);
+    if (mlx_get_default_device(&dev) != 0) return null;
     defer _ = mlx_device_free(dev);
     var info = mlx_device_info_new();
     defer _ = mlx_device_info_free(info);
-    if (mlx_device_info_get(&info, dev) != 0) return 0;
-    var max_rec: usize = 0;
-    if (mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0) return 0;
-    return max_rec;
+    if (mlx_device_info_get(&info, dev) != 0) return null;
+    var facts: DeviceFacts = .{};
+    var cstr: [*:0]const u8 = "";
+    if (mlx_device_info_get_string(&cstr, info, "architecture") != 0) return null;
+    const arch = std.mem.span(cstr);
+    if (arch.len == 0 or arch.len > facts.arch.len) return null;
+    @memcpy(facts.arch[0..arch.len], arch);
+    facts.arch_len = arch.len;
+    if (mlx_device_info_get_size(&facts.working_set, info, "max_recommended_working_set_size") != 0) return null;
+    device_facts = facts;
+    device_known.store(true, .release);
+    return &device_facts;
+}
+
+/// The GPU's architecture name ("applegpu_g17s"); empty when the device cannot be asked.
+pub fn deviceArchitecture() []const u8 {
+    const f = deviceFacts() orelse return "";
+    return f.arch[0..f.arch_len];
+}
+
+pub fn maxRecommendedWorkingSet() usize {
+    return (deviceFacts() orelse return 0).working_set;
 }
 
 /// Apply the wired-residency policy. Call on the inference thread AFTER a
