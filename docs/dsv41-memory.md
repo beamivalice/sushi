@@ -32,8 +32,11 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
   bytes, replies byte-equal), a 25.8k-token prefill reads 16.2 GB from the SSD in place of 42.9, and its tok/s does
   not move: cooled pair, one binary, `tests/bench.sh --rungs 32k`, code windows 4k to 32k 1,350 / 1,552 / 1,649 /
   1,554 / 1,539 against 1,351 / 1,615 / 1,651 / 1,571 / 1,556 with the profile split, prose within 4% both ways,
-  decode at 32k equal. The reads a prefill still makes are hidden behind GPU work
-  ([engine-expert-streaming](engine-expert-streaming.md)); the prefill is bound by GPU work per token.
+  decode at 32k equal. On the 25.8k request the GPU's idle time fell from 2,515 to 1,522 ms and its busy time rose
+  from 15,392 to 16,426 ms (`[engine]` line; arms back to back), and in the cooled pair the resident arm's GPU clock
+  reads lower from 16k on (1,463 and 1,513 MHz against 1,495 and 1,540): a sustained prefill is bound by the heat of
+  its GPU work, so idle time won back is paid in clock ([perf-gpu-power](perf-gpu-power.md)). What speeds a long
+  prefill is less GPU work per token, not fewer waits.
 - **The MLX buffer pool is a ledger term, in two phases.** `server.applyMlxCacheLimit` caps freed buffers at RAM/16
   (8 GiB here), and that pool sat outside the plan: a bench went 118 to 126 GB against a 125 GB wired limit. Measured
   (`--ssd-budget-gb 96`, 4k to 128k code and prose, 150 ms samples of `/props`): every 8k prefill window and the cold
