@@ -1275,9 +1275,8 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         std.mem.indexOf(u8, chat_config.chat_template, "[gMASK]<sop>") != null;
     if (word_style) {
         // Sushi defaults to high; depth is a prompt instruction, never a token cap.
-        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
-        try buf.appendSlice(allocator, effort orelse "high");
-        try buf.append(allocator, '"');
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":");
+        try appendJsonString(allocator, &buf, effort orelse "high");
     } else if (scale_style) {
         // V4.1 renders a numeric budget for every thinking turn, on its own ladder.
         try buf.appendSlice(allocator, ",\"reasoning_effort\":");
@@ -2966,6 +2965,18 @@ test "GLM serving template receives low high max without a derived reasoning bud
         const want = try std.fmt.allocPrint(testing.allocator, "Reasoning Effort: {s}<|assistant|><think>", .{c.label});
         defer testing.allocator.free(want);
         try testing.expect(std.mem.endsWith(u8, rendered, want));
+    }
+}
+
+test "an effort word with a quote or a backslash reaches the word-dialect template as that text" {
+    const tpl = "[gMASK]<sop>{% set effective_reasoning_effort = 1 %}[{{ reasoning_effort }}]";
+    var cfg = ChatConfig{ .allocator = testing.allocator, .chat_template = tpl, .bos_token = null, .eos_token = null, .add_bos_token = false };
+    for ([_][]const u8{ "a\"b", "back\\slash", "\",\"enable_thinking\":false,\"x\":\"" }) |word| {
+        const rendered = try renderChatTemplate(testing.allocator, &.{}, &cfg, null, null, true, word, false);
+        defer testing.allocator.free(rendered);
+        const want = try std.fmt.allocPrint(testing.allocator, "[gMASK]<sop>[{s}]", .{word});
+        defer testing.allocator.free(want);
+        try testing.expectEqualStrings(want, rendered);
     }
 }
 
