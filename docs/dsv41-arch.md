@@ -167,6 +167,14 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   rows within 5%. End to end, resident 32K stage profile (`--drop-expert 128 --ssd-budget-gb 94`, one boot each, A e7a7571c, B
   this change, GPU lock, QUIET, fans max): the 2048 chunk ending at 28,672 ran `hc_attn` 40.1 to 31.7 ms and `hc_ffn` 50.8
   to 42.3, total 1,342.4 to 1,327.3 ms; the 32,768-token prefill 1,458.0 to 1,486.2 tok/s.
+  The mix then moved to the matrix units (`dsv41_hc_mix_nax`): it is a `[rows, 20480] x [24, 20480]` product, which the
+  ALU kernel ran as strict-order FMAs. The mix weights are f32 and not bf16 values, so they reach the unit times 1024 as a
+  high and a low half part (two `32 x 16` products a step, about 22 bits kept); the sum of squares stays on the ALUs. The
+  order of the sum is not the stage kernel's, so a wide block's mixes differ from the same rows at decode width in
+  the last bits: output changes at rounding level, it went through the KLD gate, and the SSD namespace moved with it
+  ([prefix cache](#prefix-cache)). `dsv41.hc_stages` at 2048 rows (clean tree, quiet, AC,
+  `taskpolicy -a`, 9 rounds, arms interleaved): mix 1.0 to 0.2 ms, the attention stage 1.2 to 0.4, the FFN stage 2.0 to 1.0;
+  512 rows 0.3 to 0.1, 0.3 to 0.1 and 0.4 to 0.3. Fast bench and the KLD reading: [perf-baselines](perf-baselines.md), [quality-kld](quality-kld.md).
   `dsv41_hc_expand` runs one thread an output element (grid z = copy, same expression and order per element, bytes equal
   the one-thread-a-column grid at 1 to 512 rows, D 40 to 5120, stream magnitudes 1e-3 to 400). `dsv41.hc_expand_decode`, one
   decode row x 40 chained calls (quiet, AC, `taskpolicy -a`, 31 rounds, 76583044 plus this change): 9.14 us a call to 8.90 (paired 0.973,
@@ -566,7 +574,8 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_attn_softmax` | the f16 arm of a wide span (`Model.attn_f16`, off) | wide spans, window + picks <= 1024 columns | within 1/64 of peak of the f32 chain (bf16 outputs); f16 scores change output, so it waits for a KLD run |
 | `dsv41_index_scores`, `dsv41_index_scores_fp4`, `dsv41_index_tile` (`_fp4` also as `dsv41_index_scores_nax`, `_nax_gather` on the matrix units) | the indexer's relu-weighted scores over key tiles, with the unseen groups at -inf | scalar up to 16 rows (`_fp4` reads the packed keys), matrix tiles when 8 divides the heads and the width | scalar and tile no further from the f64 truth than the chain; `_fp4` the unpacked keys' scores bit for bit; a tile scored at its key offset the whole list's columns bit for bit |
 | `dsv41_hc_stage`, `dsv41_hc_stage_x`, `dsv41_hc_stage_z`, `dsv41_hc_split` | `hcMixes`, the previous-mix collapse and rms norm, and (`_x`) the `hcExpand` that feeds the FFN stage; the Sinkhorn split on one simdgroup; `_z` takes the attention's mixes and splits them in every threadgroup (no `dsv41_hc_split` dispatch after the attention stage) | up to 16 rows | mixes and normed collapse no further from the f64 truth than the chain; the expanded stream likewise; the split to 2e-6 of the thread-per-row split; `_z` bit for bit the split kernel plus `_x` (1, 3, 16 rows, bf16 and f32) |
-| `dsv41_hc_mix`, `dsv41_hc_norm` | the same for a wide block (a tile of rows and mixes a threadgroup; split + collapse + norm) | more than 16 rows | bit for bit the stage's z, split and normed collapse |
+| `dsv41_hc_mix`, `dsv41_hc_norm` | the same for a wide block (a tile of rows and mixes a threadgroup; split + collapse + norm) | more than 16 rows; the mix where `dsv41_hc_mix_nax` does not serve | bit for bit the stage's z, split and normed collapse |
+| `dsv41_hc_mix_nax` (`Model.hc_mix_nax`) | the wide mix on the matrix units: 16 rows a threadgroup, 16 simdgroups each summing a sixteenth of the stream, the f32 mix weights as two half parts | more than 16 rows, a bf16 stream whose width times copies 256 divides, at most 32 mixes, where the load's trial against `dsv41_hc_mix` passes | within 2e-6 of the peak of the f64 truth (the ALU kernel is within 1e-6); a row's bytes are the same wherever it sits in a block |
 | `dsv41_hc_expand` | `hcExpand`'s op chain (post x y + comb^T x) on a wide block: the stream in one pass, one thread an output element (grid z = copy) | any rows, GPU stream, 4 copies, where `probeHc` finds the GPU's f32 matmul TF32-class and the kernel equal to the chain | bit for bit the chain (bf16 and f32; 1 to 4096 rows; D 40 to 5120) |
 | `dsv41_engram` | the Engram gate chain after `wkv` | up to 16 rows | bit for bit (MLX's row-reduction order) |
 
@@ -1059,11 +1068,11 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   back to it from RAM instead of reading it. Each logs `[dsv41-prefix] restore points to
   SSD at P: X GB staged, prefill held T ms` (X: the point files and row segments the call staged). With a RAM tier they wait for the commit's flush after the response.
   A prompt under the floor stages nothing and keeps its points in `Live` too, so it rolls back as a longer one does.
-- **Namespace**: `dsv41_prefix.layoutKey` (through the `dsv41_prefix.diskLayoutKey` hook that `model_load.diskLayoutKey` asks) is `namespaceTag` (`dsv41-state-v4`, or
-  `dsv41-state-v5-dspark` when the stages are resident: the per-row attention split moved the verify rows' bytes; the tags moved
-  when segments became shared between entries and points started to be flushed lazily, and no reader of the old layout exists), then `-simd` when the SIMD attention kernel serves, `-composed` for a
+- **Namespace**: `dsv41_prefix.layoutKey` (through the `dsv41_prefix.diskLayoutKey` hook that `model_load.diskLayoutKey` asks) is `namespaceTag` (`dsv41-state-v6`, or
+  `dsv41-state-v6-dspark` when the stages are resident; the tag moves whenever the default boot's bytes or the layout do, last
+  when the wide hyper-connection mix moved to the matrix units, and no reader of an old tag exists), then `-simd` when the SIMD attention kernel serves, `-hcalu` when the ALU mix kernel serves, `-composed` for a
   `SUSHI_DSV41_COMPOSED=1` boot, `-dsparkinexact` for `SUSHI_DSV41_DSPARK_EXACT=0` with DSpark, then the drop list and
-  lossy pick. The key reads `Model.attn_nax` after the load's trial, so a declined trial, `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
+  lossy pick. The key reads `Model.attn_nax` and `Model.hc_mix_nax` after the load's trials, so a declined trial, `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
   or a GPU without NAX never writes into the namespace the matrix-unit boots read (their key is unchanged). It is hashed
   into the tier's fingerprint beside the pack's shard names, sizes and mtimes and `config.json`: another pack, another
   slot set, another arm or a bumped tag never reads these entries. Any change to what a stored state means bumps the

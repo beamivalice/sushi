@@ -745,6 +745,9 @@ pub const Model = struct {
     /// The decode indexer's packed scans run on the matrix units (`kernels.indexScoresPackedNax`) where the GPU has them and
     /// the load's trial gave the scalar kernel's bits (`setIndexNax`); off, the scalar kernel serves. Same bytes either way.
     index_nax: bool = true,
+    /// A wide block's hyper-connection mixes run on the matrix units (`kernels.hcMixNax`) where the stream fits and the
+    /// load's trial passed (`setHcMixNax`); off, the ALU kernel serves, whose mixes are the decode stage's bytes.
+    hc_mix_nax: bool = true,
     /// Keys from which a one-row packed scan takes the matrix units; the load lowers it to make that pipeline.
     index_nax_keys: usize = 131072,
     /// A wide span's attention kernel stores the heads as `wo_a` takes them; off, the op chain does (the tests' oracle).
@@ -2854,7 +2857,9 @@ fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?HcPrev, cpre: A, hc: *const Hc,
         }
         const sp = if (ex) |e| try e.prev.split(sc, m) else null;
         const x1 = if (ex) |e| try hcExpand(sc, m, x, e.y, sp.?.post, sp.?.comb) else x;
-        const n = try kernels.hcNorm(sc, try kernels.hcMix(sc, x1, hw, eps), x1, if (sp) |s| s.pre else cpre, norm_w, c.hc_iters, eps);
+        const nax = m.hc_mix_nax and mlx.mlx_array_dtype(x1) == .bfloat16 and kernels.hcMixNaxFits(c.hc_mult, dim(x1, 2), dim(hc.fn_w, 0));
+        const z = if (nax) try kernels.hcMixNax(sc, x1, hw, eps) else try kernels.hcMix(sc, x1, hw, eps);
+        const n = try kernels.hcNorm(sc, z, x1, if (sp) |s| s.pre else cpre, norm_w, c.hc_iters, eps);
         return .{ .mix = .{ .sp = .{ .pre = n.sp.pre, .post = n.sp.post, .comb = n.sp.comb } }, .h = n.h, .x1 = x1 };
     }
     const sp = if (ex) |e| try e.prev.split(sc, m) else null;
@@ -3505,6 +3510,18 @@ pub fn setAttnNax(m: *Model, bar: f64) !void {
     else
         kernels.attnNaxProbe(m.gpa, m.s, m.cfg.heads, m.cfg.head_dim, m.cfg.rope_dim, m.cfg.o_groups, bar);
     if (m.attn_nax) log.info("[dsv41] attention kernel on the matrix units\n", .{}) else log.debug("[dsv41] attention kernel: the matrix-unit trial differs from the SIMD kernel, SIMD serves\n", .{});
+}
+
+/// Keeps the matrix-unit hyper-connection mix only if its trial against the ALU kernel at this model's stream shape is
+/// within `bar` of the peak; a declined arm leaves the ALU kernel serving.
+pub fn setHcMixNax(m: *Model, bar: f64) !void {
+    const c = &m.cfg;
+    if (!m.hc_mix_nax or !kernels.hcMixNaxFits(c.hc_mult, c.dim, (2 + c.hc_mult) * c.hc_mult)) {
+        m.hc_mix_nax = false;
+        return;
+    }
+    m.hc_mix_nax = if (mlx.engine.isStream(m.s)) try kernels.hcMixNaxTrial(m.gpa, m.s, c.hc_mult, c.dim, bar) else kernels.hcMixNaxProbe(m.gpa, m.s, c.hc_mult, c.dim, bar);
+    if (m.hc_mix_nax) log.info("[dsv41] hyper-connection mix on the matrix units\n", .{}) else log.debug("[dsv41] hyper-connection mix: the matrix-unit trial differs from the ALU kernel, the ALU kernel serves\n", .{});
 }
 
 /// Keeps the matrix-unit index scan only if its trial gave the scalar kernel's bits on this GPU; a declined arm leaves the
@@ -6506,6 +6523,23 @@ test "dsv41 attention NAX trial: the release head shape passes it, and a trial o
     try testing.expect(!m.attn_nax);
 }
 
+test "dsv41 hc mix NAX arm: a load keeps it where the stream fits and its trial passes, and a trial outside its bar leaves the ALU kernel serving" {
+    try mlx.requireGpu();
+    if (!mlx.streamIsGpu(mlx.gpuStream()) or !kernels.hcMixNaxFits(4, 5120, 24)) return error.SkipZigTest;
+    const dir = try epiFixtureDir();
+    const m = try tinyModel(dir, .{ .act = .bfloat16, .qat = true }, mlx.gpuStream());
+    defer m.deinit();
+    const c = &m.cfg;
+    try setHcMixNax(m, kernels.hc_mix_nax_bar);
+    try testing.expectEqual(kernels.hcMixNaxFits(c.hc_mult, c.dim, (2 + c.hc_mult) * c.hc_mult), m.hc_mix_nax);
+    m.hc_mix_nax = true;
+    try setHcMixNax(m, 0);
+    try testing.expect(!m.hc_mix_nax);
+    // a declined arm stays declined
+    try setHcMixNax(m, kernels.hc_mix_nax_bar);
+    try testing.expect(!m.hc_mix_nax);
+}
+
 test "dsv41 NAX trials on the engine's stream: the release shapes pass with nothing asked of MLX, and a trial that cannot run is an error, never a declined arm" {
     try mlx.requireGpu();
     if (!mlx.engine.matrixUnits() or !kernels.attnNaxFits(64, 512) or !kernels.indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return error.SkipZigTest;
@@ -6520,6 +6554,8 @@ test "dsv41 NAX trials on the engine's stream: the release shapes pass with noth
     try testing.expect(try kernels.attnNaxTrial(testing.allocator, s, 64, 512, 64, 8, kernels.attn_nax_bar));
     try testing.expect(!try kernels.attnNaxTrial(testing.allocator, s, 64, 512, 64, 8, 0));
     try testing.expect(try kernels.indexNaxTrials(testing.allocator, s));
+    try testing.expect(try kernels.hcMixNaxTrial(testing.allocator, s, 4, 5120, kernels.hc_mix_nax_bar));
+    try testing.expect(!try kernels.hcMixNaxTrial(testing.allocator, s, 4, 5120, 0));
     try testing.expectEqual(calls, mlx.engine.mlxCalls());
 
     // A trial that meets an MLX stream there: the refusal comes back, the arm is not declined.

@@ -15,6 +15,8 @@ earlier history is mlx-serve's, in that project's changelog.
   missing description and parameters filled like any other.
 - **A chat template that does not parse now fails the model's load**: the log names its line and column
   (`[load] chat template:`) instead of every request failing its render.
+- **DeepSeek-V4.1-Flash prefills faster on Sushi Cooler**: the hyper-connection mixes of a prompt run on the GPU's
+  matrix units. Output moves at rounding level, so the SSD prefix cache starts a new namespace.
 - **DeepSeek-V4.1-Flash's prefill attention does less work for the same output**: the kernel reads each block of
   keys once for both of its products.
 - **DeepSeek-V4.1-Flash prefills long prompts faster on Sushi Cooler**: an expert streamed back from the SSD no

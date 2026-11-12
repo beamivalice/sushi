@@ -85,6 +85,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     dsv41_model.setDsparkExact(mdl, if (std.c.getenv("SUSHI_DSV41_DSPARK_EXACT")) |v| diagEnvValueOn(v) else true);
     try dsv41_model.setAttnNax(mdl, kernels.attn_nax_bar);
     try dsv41_model.setIndexNax(mdl);
+    try dsv41_model.setHcMixNax(mdl, kernels.hc_mix_nax_bar);
     dsv41_model.setReadDiag(diagEnvOn("SUSHI_DSV41_READ_DIAG"));
     if (mdl.ced_split) |split|
         log.info("[dsv41] CED: layers {d}..{d} run the last {d} rows of a prefill chunk\n", .{ split, mdl.cfg.layers - 1, mdl.cfg.window });

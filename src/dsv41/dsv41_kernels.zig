@@ -2478,6 +2478,65 @@ const HC_MIX_SOURCE =
     \\}
 ;
 
+/// `HC_MIX_SOURCE` on the matrix units: a threadgroup takes 16 rows and every mix, its simdgroups a k range each of
+/// 16 rows x 32 mix columns over 16-wide k steps, `fn` split into a high and a low half so the product keeps f32's
+/// bits. The sums' order differs from the ALU kernel's.
+const HC_MIX_NAX_SOURCE =
+    \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+    \\const ushort lane = thread_index_in_simdgroup;
+    \\const int MIX = fn_shape[0], L = x_shape[0];
+    \\const int l0 = threadgroup_position_in_grid.x * 16;
+    \\constexpr int STEPS = NK / 16 / NSG;
+    \\const int k0 = int(sg) * STEPS * 16;
+    \\const int ra = metal::min(l0 + int(dsv41_nax_r(lane, 0)), L - 1), rb = metal::min(l0 + int(dsv41_nax_r(lane, 4)), L - 1);
+    \\const device T* xa = x + size_t(ra) * NK + k0 + dsv41_nax_c(lane, 0);
+    \\const device T* xb = x + size_t(rb) * NK + k0 + dsv41_nax_c(lane, 0);
+    \\float d[16];
+    \\#pragma clang loop unroll(full)
+    \\for (int i = 0; i < 16; ++i) d[i] = 0.0f;
+    \\float ssa = 0.0f, ssb = 0.0f;
+    \\for (int s = 0; s < STEPS; ++s) {
+    \\  T a[8];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int j = 0; j < 4; ++j) { a[j] = xa[s * 16 + j]; a[4 + j] = xb[s * 16 + j]; }
+    \\  half bh[16], bl[16];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < 16; ++i) {
+    \\    const int mix = (i / 8) * 16 + dsv41_nax_c(lane, i % 8);
+    \\    const float f = mix < MIXN ? fn[size_t(mix) * NK + k0 + s * 16 + dsv41_nax_r(lane, i % 8)] * 1024.0f : 0.0f;
+    \\    const half hi = half(f);
+    \\    bh[i] = hi;
+    \\    bl[i] = half(f - float(hi));
+    \\  }
+    \\  dsv41_nax_mma<32, 16>(d, a, bl);
+    \\  dsv41_nax_mma<32, 16>(d, a, bh);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int j = 0; j < 4; ++j) {
+    \\    const float va = float(a[j]), vb = float(a[4 + j]);
+    \\    ssa = metal::fma(va, va, ssa);
+    \\    ssb = metal::fma(vb, vb, ssb);
+    \\  }
+    \\}
+    \\ssa += metal::simd_shuffle_xor(ssa, ushort(1));
+    \\ssa += metal::simd_shuffle_xor(ssa, ushort(8));
+    \\ssb += metal::simd_shuffle_xor(ssb, ushort(1));
+    \\ssb += metal::simd_shuffle_xor(ssb, ushort(8));
+    \\threadgroup float t_d[NSG][16][MIXN], t_s[NSG][16];
+    \\#pragma clang loop unroll(full)
+    \\for (int i = 0; i < 16; ++i) {
+    \\  const int col = (i / 8) * 16 + dsv41_nax_c(lane, i % 8);
+    \\  if (col < MIXN) t_d[sg][dsv41_nax_r(lane, i % 8)][col] = d[i];
+    \\}
+    \\if ((lane & 9) == 0) { t_s[sg][dsv41_nax_r(lane, 0)] = ssa; t_s[sg][dsv41_nax_r(lane, 4)] = ssb; }
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\if (tid < 16 * MIXN) {
+    \\  const int r = tid / MIXN, j = tid % MIXN;
+    \\  float a = 0.0f, b = 0.0f;
+    \\  for (int g = 0; g < NSG; ++g) { a += t_d[g][r][j]; b += t_s[g][r]; }
+    \\  if (l0 + r < L) z[(l0 + r) * MIX + j] = (a * (1.0f / 1024.0f)) * metal::precise::rsqrt(b / float(NK) + eps[0]) * scale[dsv41_scale_at<HC>(j)] + base[j];
+    \\}
+;
+
 /// One hyper-connection stage as two kernels. The staggered collapse reads the PREVIOUS mix (`HC_PRE`), so in
 /// `HC_STAGE_SOURCE` threadgroup 0 collapses and rms-norms the stream without waiting for this stage's mixes, while
 /// threadgroups 1..MIX each take one mix's dot; the FFN side rebuilds the stream from the block output in every
@@ -2678,6 +2737,7 @@ const HC_STAGE_X_SOURCE = HC_STAGE_HEAD ++ HC_COEF_ARRAYS ++ HC_STAGE_LOOP ++ HC
 const HC_STAGE_Z_SOURCE = HC_STAGE_HEAD ++ HC_COEF_Z ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
 
 var hc_mix_def = Def{ .name = "dsv41_hc_mix", .ins = &.{ "x", "fn", "scale", "base", "eps" }, .outs = &.{"z"}, .source = HC_MIX_SOURCE, .header = HC_HEADER };
+var hc_mix_nax_def = Def{ .name = "dsv41_hc_mix_nax", .ins = &.{ "x", "fn", "scale", "base", "eps" }, .outs = &.{"z"}, .source = HC_MIX_NAX_SOURCE, .header = ATTN_NAX_HEADER ++ HC_HEADER };
 var hc_stage_def = Def{ .name = "dsv41_hc_stage", .ins = &.{ "x", "cpre", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z" }, .source = HC_STAGE_SOURCE, .header = HC_HEADER };
 var hc_stage_x_def = Def{ .name = "dsv41_hc_stage_x", .ins = &.{ "x", "y", "spost", "scomb", "cpre", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z", "x1" }, .source = HC_STAGE_X_SOURCE, .header = HC_HEADER };
 var hc_stage_z_def = Def{ .name = "dsv41_hc_stage_z", .ins = &.{ "x", "y", "za", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z", "x1" }, .source = HC_STAGE_Z_SOURCE, .header = HC_HEADER };
@@ -2749,6 +2809,62 @@ pub fn hcSplitZ(sc: *Scope, z: A, hc: usize, iters: usize, eps: A) !HcSplit {
 /// The mixes `z` `[L, mix]` of the stream `x` `[L, hc, D]`, a tile of rows and mixes a threadgroup (wide blocks).
 pub fn hcMix(sc: *Scope, x: A, hw: HcWeights, eps: A) !A {
     return hcMixTiled(sc, x, hw, eps, hc_mix_tile);
+}
+
+/// Simdgroups a matrix-unit mix threadgroup splits the flattened stream over.
+const hc_mix_nsg = 16;
+
+/// Whether `hcMixNax` serves `hc` copies of `d` channels into `mix` mixes here: the stream splits into whole 16-wide k
+/// steps a simdgroup, a tile's 32 columns hold every mix, and the GPU has the units.
+pub fn hcMixNaxFits(hc: usize, d: usize, mix: usize) bool {
+    return (hc * d) % (16 * hc_mix_nsg) == 0 and mix <= 32 and nax_gate.verifyQmmNaxAvailable();
+}
+
+/// `hcMix` on the matrix units for a bf16 stream (`hcMixNaxFits` must hold): the same mixes with the sums in another
+/// order. A row's bytes do not depend on the block's width or on where the row sits in it.
+pub fn hcMixNax(sc: *Scope, x: A, hw: HcWeights, eps: A) !A {
+    const L = dim(x, 0);
+    const mix = dim(hw.fn_w, 0);
+    const n = dim(hw.fn_w, 1);
+    std.debug.assert(mlx.mlx_array_dtype(x) == .bfloat16 and n % (16 * hc_mix_nsg) == 0 and mix <= 32);
+    var o: [1]A = undefined;
+    try launch(sc, &hc_mix_nax_def, &.{ x, hw.fn_w, hw.scale, hw.base, eps }, &.{.{ .shape = &.{ ci(L), ci(mix) }, .dt = .float32 }}, .{ (L + 15) / 16 * hc_mix_nsg * 32, 1, 1 }, .{ hc_mix_nsg * 32, 1, 1 }, &.{
+        .{ .name = "NK", .v = ci(n) }, .{ .name = "NSG", .v = hc_mix_nsg }, .{ .name = "MIXN", .v = ci(mix) }, .{ .name = "HC", .v = ci(dim(x, 1)) },
+    }, &.{.{ .name = "T", .dt = .bfloat16 }}, &o);
+    return o[0];
+}
+
+/// How far the matrix-unit mixes may sit from the ALU kernel's in the load's trial, as a fraction of the peak: both are
+/// within 1e-6 of the f64 truth.
+pub const hc_mix_nax_bar: f64 = 5e-6;
+
+/// One trial of `hcMixNax` against `hcMix` at the model's stream shape, a block with a short last tile: false when a
+/// launch fails or a mix differs by more than `bar` of the peak.
+pub fn hcMixNaxProbe(a: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, d: usize, bar: f64) bool {
+    const had = mlx.errorPending();
+    const ok = hcMixNaxTrial(a, s, hc, d, bar) catch false;
+    if (!ok) mlx.dropLatchedErrorUnless(had);
+    return ok;
+}
+
+/// Whether the matrix-unit mix stays within `bar` of the ALU kernel on stream `s`, the one the forwards run on. An
+/// error is a trial that could not run.
+pub fn hcMixNaxTrial(a: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, d: usize, bar: f64) !bool {
+    const mix = (2 + hc) * hc;
+    if (!hcMixNaxFits(hc, d, mix)) return false;
+    const L = 40;
+    var sc = Scope.plain(a, s);
+    defer sc.deinit();
+    const x = try trialValues(&sc, &.{ L, ci(hc), ci(d) }, .bfloat16, 0x4c1, 1.5);
+    const hw = HcWeights{
+        .fn_w = try trialValues(&sc, &.{ ci(mix), ci(hc * d) }, .float32, 0x4c2, 0.02),
+        .scale = try f32Const(&sc, &.{ 0.3, 0.5, 0.7 }),
+        .base = try trialValues(&sc, &.{ci(mix)}, .float32, 0x4c3, 0.5),
+    };
+    const eps = try hcEps(&sc, 1e-6, 1e-6);
+    const want = try sc_mod.hostF32(try hcMix(&sc, x, hw, eps));
+    const got = try sc_mod.hostF32(try hcMixNax(&sc, x, hw, eps));
+    return maxRelDiff(got, want) <= bar;
 }
 
 pub fn hcMixTiled(sc: *Scope, x: A, hw: HcWeights, eps: A, tile: HcMixTile) !A {
@@ -4178,6 +4294,55 @@ test "dsv41 hc wide: the mix and norm kernels give the decode stage's mixes, spl
         try expectBitEqual("hc norm post", try sc_mod.hostF32(wide.sp.post), try sc_mod.hostF32(sp.post));
         try expectBitEqual("hc norm comb", try sc_mod.hostF32(wide.sp.comb), try sc_mod.hostF32(sp.comb));
     }
+}
+
+test "dsv41 hc mix on the matrix units: every mix within 2e-6 of the peak of the f64 truth, and a row's bytes are the same wherever it sits in a block" {
+    try mlx.requireGpu();
+    if (!hcMixNaxFits(4, 5120, 24)) return error.SkipZigTest;
+    const N = 4 * 5120;
+    {
+        const L = 40;
+        var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const d = try hcData(&sc, L, .bfloat16);
+        const got = try sc_mod.hostF32(try hcMixNax(&sc, d.x, d.hw, d.eps));
+        const xs = try sc_mod.hostF32(try sc.astype(try sc.reshape(d.x, &.{ L, N }), .float32));
+        const fw = try sc_mod.hostF32(d.hw.fn_w);
+        const base = try sc_mod.hostF32(d.hw.base);
+        const scales = [_]f64{ 0.3, 0.5, 0.7 };
+        var worst: f64 = 0;
+        var peak: f64 = 0;
+        for (0..L) |r| {
+            var ss: f64 = 0;
+            for (xs[r * N ..][0..N]) |v| ss += @as(f64, v) * v;
+            const rs = 1.0 / @sqrt(ss / @as(f64, N) + 1e-6);
+            for (0..24) |j| {
+                var dot: f64 = 0;
+                for (xs[r * N ..][0..N], fw[j * N ..][0..N]) |v, f| dot += @as(f64, v) * f;
+                const want = dot * rs * scales[if (j < 4) 0 else if (j < 8) 1 else 2] + base[j];
+                worst = @max(worst, @abs(@as(f64, got[r * 24 + j]) - want));
+                peak = @max(peak, @abs(want));
+            }
+        }
+        try testing.expect(worst <= 2e-6 * peak);
+    }
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const d = try hcData(&sc, 64, .bfloat16);
+    const whole = try sc_mod.hostF32(try hcMixNax(&sc, d.x, d.hw, d.eps));
+    const part = try sc_mod.hostF32(try hcMixNax(&sc, try sc.slice(d.x, 0, 5, 42), d.hw, d.eps));
+    try expectBitEqual("hc mix nax rows 5..42", part, whole[5 * 24 .. 42 * 24]);
+}
+
+test "dsv41 hc mix NAX trial: the release shape passes it, a zero bar and a stream the kernel does not serve decline it" {
+    try mlx.requireGpu();
+    if (!hcMixNaxFits(4, 5120, 24)) return error.SkipZigTest;
+    try testing.expect(hcMixNaxProbe(testing.allocator, mlx.gpuStream(), 4, 5120, hc_mix_nax_bar));
+    try testing.expect(!hcMixNaxProbe(testing.allocator, mlx.gpuStream(), 4, 5120, 0));
+    // 4 x 40 is no multiple of the k split, and 9 copies make more mixes than a tile holds
+    try testing.expect(!hcMixNaxFits(4, 40, 24));
+    try testing.expect(!hcMixNaxFits(9, 5120, 99));
+    try testing.expect(!hcMixNaxProbe(testing.allocator, mlx.gpuStream(), 4, 40, hc_mix_nax_bar));
 }
 
 test "dsv41 hc wide: the release mix tile gives the previous tile's mixes at the release shapes, bit for bit" {

@@ -514,6 +514,25 @@ not rerun.
   ([engine-kernels](engine-kernels.md)). The kernel is 16% of a long prompt's prefill GPU time, so the cells above
   show no loss; the gain is inside their run-to-run spread.
 
+### Hyper-connection mix on the matrix units (fast bench)
+
+`tests/bench.sh --tag p2-hcmix --rungs 4k,8k`, the same pack and flags, the source tree of this change on `42c364c6`,
+M5 Max, AC, fans at max, `taskpolicy -a`, GPU lock, boot at 49 °C, Nominal. Baseline: the attention table above,
+recorded, not rerun.
+
+| rung | code prefill | was | prose prefill | was | code decode | was | prose decode | was |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 1,400 | 1,372 | 1,228 | 1,192 | 91.0 | 94.6 | 55.8 | 53.3 |
+| 8k | 1,546 | 1,560 | 1,435 | 1,431 | 92.8 | 101.8 | 57.6 | 59.0 |
+
+- The micro indicator that decided it: `sushi-ubench run dsv41.hc_stages`, 9 rounds, 2048 rows: mix 1.0 to 0.2 ms, the
+  attention stage 1.2 to 0.4, the FFN stage 2.0 to 1.0 ([dsv41-arch](dsv41-arch.md)). On a profiled 25.8k-token
+  request (`SUSHI_ENGINE_KERNEL_PROF=all`) the mix's 773 dispatches went from 588 ms to 204 ms, 2.5% of the request's
+  GPU time; the prefill cells above carry that inside their run-to-run spread.
+- The decode cells are other texts, not another decode: the prefill's bytes moved at rounding level, the greedy
+  continuation diverged, and a code round at 8k accepted 3.92 to 4.12 tokens against 4.45. The decode forward is
+  unchanged, and the same request sent three times, greedy and seeded, gives one reply each.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.

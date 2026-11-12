@@ -195,6 +195,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - P reaches the bf16 matrix unit as a high and a low bf16 part (two MMAs), which keeps ~16 bits of it; a single bf16 P
   would be 2^-9. The error against the CPU f32 `attnCore` is 4e-6 to 1.3e-5 of peak, the GPU `attnCore` 3.5e-4 to 7e-4
   (its f32 matmul keeps ~11 bits).
+- An f32 operand that is not a bf16 value reaches the unit the same way, scaled first so the low part is a normal
+  half (`dsv41_hc_mix_nax`: the weights times 1024 as two halves, 6e-7 of peak against the f64 truth where the strict
+  ALU sum reads 2.5e-7). A sum of squares of the same rows stays on the ALUs and crosses lanes by `simd_shuffle_xor`.
 - A matrix's per-lane (row, column) is `fm = (lane / 4 & 4) + (lane / 2) % 4`, `fn = (lane / 4 & 2) * 2 + (lane % 2) * 2`
   with `thread_elements()`: the online rescale and the output store use it instead of a threadgroup round trip.
 - Release shape (64 heads x 512, window 128, 512 picks), best of 16 interleaved on the M5 Max, `sushi-ubench run dsv41.attn_span`:
