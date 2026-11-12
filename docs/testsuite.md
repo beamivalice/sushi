@@ -143,6 +143,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `template-superlinear-std` flags, under `src/template/` outside tests, `std.sort` and a `mem.` substring search or
   sort (`indexOf`, `lastIndexOf`, `count`, `replace`, `splitSequence`, `sort`, ...): their time grows with text times
   needle, or they assume a consistent comparator; the engine uses `value.Finder` (KMP) and `value.stableSort`.
+  `arch-test-unlisted` flags a file that declares a test and sits beside an `arch_tests.zig` that does not import
+  it: the buckets select tests by listed file, so its tests would never run.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its
@@ -165,7 +167,7 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
   `-Dmodel=<arch>` runs one folder's tests plus the shared ones. A new test file of an arch is listed in that
   arch's `arch_tests.zig` (`pub const tests`, or `host_tests` for an MLX-free file), never in `src/tests.zig`.
   A source file with tests at its bottom is listed too: the buckets select tests by listed file, so an unlisted
-  file's tests never run and nothing says so.
+  file's tests never run (lint `arch-test-unlisted`).
 - A shared file (`trunk.zig`, `server.zig`, `generate.zig`, `scheduler.zig`, `prefix_cache.zig`, the EXL3 kernels)
   holds only `shared` tests. Code for one arch lives in that arch's files, and so do its tests.
 - A scenario across several modules, or a table of real captures, is its own `<topic>_test.zig`.

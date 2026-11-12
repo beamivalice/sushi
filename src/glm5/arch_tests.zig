@@ -49,9 +49,20 @@ pub const tests = .{
     @import("glm5_kld_capture.zig"),
     @import("glm5_layer_major.zig"),
     @import("glm5_rows_tick.zig"),
+    @import("arch.zig"),
+    @import("glm5_sched.zig"),
+    @import("glm5_dflash_ffn.zig"),
+    @import("glm5_dflash_kda.zig"),
+    @import("glm5_dflash_memory.zig"),
+    @import("glm5_dflash_model.zig"),
+    @import("glm5_dflash_qmm.zig"),
+    @import("glm5_dflash_rows.zig"),
 };
 
 /// The MLX-free test files `src/tests_host.zig` runs for this arch.
 pub const host_tests = .{
     @import("glm5_template_test.zig"),
+    @import("glm5_chat.zig"),
+    @import("glm5_flags.zig"),
+    @import("glm5_bill.zig"),
 };

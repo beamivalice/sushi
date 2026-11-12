@@ -207,6 +207,24 @@ printf '%s\n' 'const std = @import("std");' 'fn f(s: []const u8) ?usize {' '    
 printf '%s\n' 'const std = @import("std");' 'fn outside(s: []const u8) ?usize {' '    return std.mem.indexOf(u8, s, "ab");' '}' > "$TMP/t/src/p.zig"
 expect_green "a scalar search, a test oracle and a search outside src/template/"
 
+# rule arch-test-unlisted
+tree
+mkdir -p "$TMP/t/src/arch1"
+printf '%s\n' 'pub const tests = .{' '    @import("listed.zig"),' '};' > "$TMP/t/src/arch1/arch_tests.zig"
+printf '%s\n' 'pub fn f() void {}' 'test "listed" { f(); }' > "$TMP/t/src/arch1/listed.zig"
+printf '%s\n' 'pub fn g() void {}' 'test "never run" { g(); }' > "$TMP/t/src/arch1/un.zig"
+expect_red "a file with a test its arch_tests.zig does not list" "src/arch1/un.zig:2:1 \[arch-test-unlisted\] -: un.zig declares a test and src/arch1/arch_tests.zig does not list it"
+
+tree
+mkdir -p "$TMP/t/src/arch1" "$TMP/t/src/shared"
+printf '%s\n' 'pub const tests = .{' '    @import("listed.zig"),' '};' '// @import("comment.zig")' > "$TMP/t/src/arch1/arch_tests.zig"
+printf '%s\n' 'pub fn f() void {}' 'test "listed" { f(); }' > "$TMP/t/src/arch1/listed.zig"
+printf '%s\n' 'pub fn h() void {}' > "$TMP/t/src/arch1/no_tests.zig"
+printf '%s\n' 'pub fn k() void {}' 'test "a folder with no list" { k(); }' > "$TMP/t/src/shared/k.zig"
+expect_green "a listed file, a file with no test and a folder with no arch_tests.zig"
+printf '%s\n' 'pub fn c() void {}' 'test "named only in a comment" { c(); }' > "$TMP/t/src/arch1/comment.zig"
+expect_red "a file the list names only in a comment" "\[arch-test-unlisted\] -: comment.zig"
+
 # the allowlist
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn handleOf(s: *S) *S { return s; }' 'fn f(self: *const S) *S {' \
