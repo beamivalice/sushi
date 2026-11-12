@@ -135,18 +135,14 @@ pub fn fillSuppressMask(buf: []bool, ids: []const u32, defined_vocab: usize) voi
     }
 }
 
-/// Derive + install the reserved-token suppression mask on a freshly-built
-/// Trunk (both the serve load path and the CLI run path call this).
-/// The id set is `tokenizer.reservedOutputIds`: `special: true` added tokens
-/// minus EOS/stop ids minus the markers the template may print. Never fails a load — any error logs and
-/// leaves the mask null (suppression off), and engagement is one-shot-logged
-/// so a silent no-op is visible (the silent-fallback class).
-pub fn installSuppressMask(xfm: *Trunk, tok: *const Tokenizer, printed: ?*const tokenizer_mod.TemplateFacts, eos_ids: []const u32) void {
-    const ids = tokenizer_mod.reservedOutputIds(xfm.allocator, tok.flagged_specials, printed, eos_ids) catch |err| {
-        log.warn("[suppress] derivation failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
-        return;
-    };
-    defer xfm.allocator.free(ids);
+/// Install the reserved-token suppression mask on a freshly-built Trunk (both
+/// the serve load path and the CLI run path call this), after
+/// `Tokenizer.bindTemplate` derived the id set: `special: true` added tokens
+/// minus EOS/stop ids minus the markers the template may print. Never fails a
+/// load — a mask build error logs and leaves the mask null (suppression off),
+/// and engagement is one-shot-logged so a silent no-op is visible.
+pub fn installSuppressMask(xfm: *Trunk, tok: *const Tokenizer) void {
+    const ids = tok.reserved_ids;
     const logits_dim: usize = xfm.config.vocab_size;
     // Padding rows past the tokenizer's last defined id.
     const defined_vocab: usize = tok.definedVocabSize();

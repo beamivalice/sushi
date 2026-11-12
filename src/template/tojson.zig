@@ -154,7 +154,7 @@ pub fn dumps(m: *value.Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, o
             if (std.math.isInf(f)) return w.appendSlice(gpa, if (f < 0) "-Infinity" else "Infinity");
             try writeFloatRepr(w, gpa, f);
         },
-        .string, .markup => |s| try writeString(w, gpa, s, opts.ensure_ascii),
+        .string, .markup => |s| try writeString(w, gpa, s.bytes, opts.ensure_ascii),
         .list => |l| {
             if (l.kind != .list and l.kind != .tuple) return error.TemplateRuntime;
             if (l.items.items.len == 0) return w.appendSlice(gpa, "[]");
@@ -206,7 +206,7 @@ fn newlineIndent(w: *std.ArrayList(u8), gpa: Allocator, opts: Options, depth: us
 fn writeKey(m: *value.Meter, w: *std.ArrayList(u8), gpa: Allocator, k: Value, ensure_ascii: bool) value.Failure!void {
     @setRuntimeSafety(true);
     switch (k) {
-        .string, .markup => |s| try writeString(w, gpa, s, ensure_ascii),
+        .string, .markup => |s| try writeString(w, gpa, s.bytes, ensure_ascii),
         .none, .boolean, .int, .bigint, .float => {
             var text = std.ArrayList(u8).empty;
             try dumps(m, &text, gpa, k, .{}, 0);

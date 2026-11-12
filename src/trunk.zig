@@ -805,7 +805,7 @@ pub const Trunk = struct {
     /// Reserved-token suppression mask (`[vocab]` bool, true = never
     /// sample), built once at load by `server`'s install step from the
     /// tokenizer's `special: true` set minus template-emitted markers and
-    /// EOS ids (`tokenizer.reservedOutputIds`). Owned here, freed in deinit;
+    /// EOS ids (`Tokenizer.bindTemplate`). Owned here, freed in deinit;
     /// samplers reference it non-owning via `SamplingParams.suppress_mask`.
     /// Null = suppression off (kill switch, no chat template).
     suppress_mask: ?mlx.mlx_array = null,

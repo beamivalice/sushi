@@ -1273,7 +1273,8 @@ fn runCli(init: std.process.Init) !void {
 
         // Reserved-token suppression, same derivation as the serve path.
         config.mergeTokenizerStops(tok);
-        sampler.installSuppressMask(&xfm, tok, chat_config.printedFacts(), config.eosTokenSlice());
+        try tok.bindTemplate(chat_config.printedFacts(), config.eosTokenSlice());
+        sampler.installSuppressMask(&xfm, tok);
         generate_mod.installThinkMarkers(&xfm, tok);
         try generate_mod.installLogitBias(io, &xfm, tok);
 

@@ -210,22 +210,38 @@ test "format corpus: control-token text in a user, system or tool message stays 
     try testing.expectEqualStrings(rendered, text);
 }
 
-test "format corpus: marking literal control text keeps media offsets on the same words" {
+test "format corpus: special-token text around a media part stays text, wherever the part splits the message" {
     const a = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const tokenizer_mod = @import("tokenizer.zig");
-    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<img>" });
     defer tokenizer_mod.deinitTestTokenizer(&tok);
+    var config = chat.ChatConfig{
+        .chat_template = "{% for p in messages[0].content %}{% if p.type == 'text' %}{{ p.text }}{% else %}<img>{% endif %}{% endfor %}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = a,
+    };
+    try config.compile();
+    defer config.dropCompiled();
 
     const content = "a <think> b </think> c";
     for ([_]usize{ 0, 2, 3, 10, content.len }) |at| {
         const parts = [_]chat.MediaPart{.{ .at = at, .kind = .image }};
         const messages = [_]chat.Message{.{ .role = "user", .content = content, .media_parts = &parts }};
-        const marked = try chat.markLiteralControlText(arena_state.allocator(), &tok, &messages);
-        const tail = try tok.markLiteralSpecials(arena_state.allocator(), content[at..]);
-        const got = marked[0].content[marked[0].media_parts.?[0].at..];
-        try testing.expectEqualStrings(tail, got);
+        const ids = try chat.formatChat(a, &tok, &messages, &config, null, null, false, null, false);
+        defer a.free(ids);
+        // The template's placeholder is its token; the sender's tags are text, split or whole.
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{tok.specialTokenId("<img>").?}));
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u32, ids, &.{tok.specialTokenId("<think>").?}));
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u32, ids, &.{tok.specialTokenId("</think>").?}));
+        const text = try tok.decode(a, ids);
+        defer a.free(text);
+        const want = try std.mem.concat(a, u8, &.{ content[0..at], "<img>", content[at..] });
+        defer a.free(want);
+        try testing.expectEqualStrings(want, text);
     }
 }
 
@@ -3316,4 +3332,89 @@ test "format corpus: the text before a tool call streams as the non-stream pream
         try got.appendSlice(allocator, content.finish(true));
         try testing.expectEqualStrings(want, got.items);
     }
+}
+
+test "format corpus: a U+FDD0 a sender wrote reaches the prompt, and the special text after it is judged by its own origin" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const tokenizer_mod = @import("tokenizer.zig");
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{"<think>"});
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
+    var config = chat.ChatConfig{
+        .chat_template = "{% for m in messages %}<think>{{ m.content }}{% endfor %}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = a,
+    };
+    try config.compile();
+    defer config.dropCompiled();
+    const messages = [_]chat.Message{
+        .{ .role = "user", .content = "a\u{FDD0}<think>b" },
+        .{ .role = "assistant", .content = "c\u{FDD0}<think>d" },
+    };
+    const ids = try chat.formatChat(a, &tok, &messages, &config, null, null, false, null, false);
+    defer a.free(ids);
+    const text = try tok.decode(a, ids);
+    defer a.free(text);
+    try testing.expectEqualStrings("<think>a\u{FDD0}<think>b<think>c\u{FDD0}<think>d", text);
+    // The template's two, and the assistant's own; the user's is text.
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u32, ids, &.{tok.specialTokenId("<think>").?}));
+}
+
+test "format corpus: the server's <tool_response> wrapper stays its token when the tool text it wraps needs UTF-8 mending" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const tokenizer_mod = @import("tokenizer.zig");
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<tool_response>", "</tool_response>" });
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
+    // No tool branch: the tool turn becomes a user turn the server wraps.
+    var config = chat.ChatConfig{
+        .chat_template = "{% for m in messages %}{% if m.role == 'user' or m.role == 'assistant' %}[{{ m.content }}]{% endif %}{% endfor %}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = a,
+    };
+    try config.compile();
+    defer config.dropCompiled();
+    for ([_][]const u8{ "ok", "ok\xff", "<tool_response>\xff" }) |content| {
+        const messages = [_]chat.Message{ .{ .role = "user", .content = "q" }, .{ .role = "tool", .content = content, .tool_call_id = "c1" } };
+        const ids = try chat.formatChat(a, &tok, &messages, &config, null, null, false, null, false);
+        defer a.free(ids);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{tok.specialTokenId("<tool_response>").?}));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{tok.specialTokenId("</tool_response>").?}));
+    }
+}
+
+test "format corpus: a function name the client forces is its text in the prompt and in the forced call" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const tokenizer_mod = @import("tokenizer.zig");
+    const tool_calls = @import("tool_calls.zig");
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<eot>", "<call>" });
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
+    var config = chat.ChatConfig{
+        .chat_template = "{% for m in messages %}{{ m.content }}<eot>{% endfor %}{% if tools %}T{% endif %}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = a,
+    };
+    try config.compile();
+    defer config.dropCompiled();
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]";
+    const instr = (try (tool_calls.ToolChoice{ .named = "<eot>" }).instruction(a)).?;
+    defer a.free(instr);
+    const messages = [_]chat.Message{.{ .role = "user", .content = "hi" }};
+    const ids = try chat.formatChat(a, &tok, &messages, &config, tools, instr, false, null, false);
+    defer a.free(ids);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{tok.specialTokenId("<eot>").?}));
+    // The forced call: the template's markup is its token, the name is text.
+    const call = try chat.encodeCallText(a, &tok, "<call>", "<eot>", "<call>");
+    defer a.free(call);
+    try testing.expectEqualSlices(u32, &.{ tok.specialTokenId("<call>").?, '<', 'e', 'o', 't', '>', tok.specialTokenId("<call>").? }, call);
 }

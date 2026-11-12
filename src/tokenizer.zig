@@ -50,10 +50,6 @@ pub fn reservedOutputIds(
 /// Pre-tokenizer grammar selected from tokenizer.json: `gpt2` here, or one an arch brings (`arch/chat.zig`).
 pub const PretokStyle = arch_chat.PretokStyle;
 
-/// Precedes a special's text that the sender wrote as plain text (see `Tokenizer.markLiteralSpecials`).
-/// A Unicode noncharacter, so it cannot be part of a real message.
-pub const literal_mark = "\u{FDD0}";
-
 /// Earliest-occurrence, longest-at-a-position matcher over the special tokens: bucketed by first
 /// byte once per call, so a scan is O(text) however many specials the vocabulary has.
 const SpecialScan = struct {
@@ -143,6 +139,14 @@ pub const Tokenizer = struct {
     /// arena; the slice itself is owned and freed in deinit.
     flagged_specials: []const FlaggedSpecial = &.{},
 
+    /// The special-token matcher, built once at load (`indexSpecials`). A tokenizer whose specials changed after
+    /// (a test that adds one by hand) gets a matcher built for each encode instead.
+    specials_index: ?SpecialScan = null,
+    /// Sorted ids the sampler masks (`bindTemplate`); owned.
+    reserved_ids: []const u32 = &.{},
+    /// Sorted ids whose text in an assistant message is text, not the token (`bindTemplate`); owned.
+    assistant_blocked: []const u32 = &.{},
+
     const MergePair = struct {
         left: []const u8,
         right: []const u8,
@@ -185,6 +189,7 @@ pub const Tokenizer = struct {
         // JSON is held (e.g., the test-only constructors). Freeing the
         // parsed JSON deinits its arena in one shot.
         if (self.flagged_specials.len > 0) self.allocator.free(self.flagged_specials);
+        self.freeLoadIndexes();
         if (self.parsed_json) |*p| {
             self.vocab.deinit();
             self.id_to_token.deinit();
@@ -218,93 +223,122 @@ pub const Tokenizer = struct {
 
     /// Encode text to token IDs (no BOS/EOS added).
     pub fn encode(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
-        return self.encodeProtected(allocator, text, &.{});
+        return self.encodeSpans(allocator, .{ .bytes = text });
     }
 
-    /// `encode` for text that went through `markLiteralSpecials`: a special's text right after a
-    /// `literal_mark` is plain text, every other special keeps its id. The mark never reaches a token.
-    pub fn encodeMarked(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
-        if (std.mem.indexOf(u8, text, literal_mark) == null) return self.encode(allocator, text);
-        var clean = std.ArrayList(u8).empty;
-        defer clean.deinit(allocator);
-        var protect = std.ArrayList(usize).empty;
-        defer protect.deinit(allocator);
-        var i: usize = 0;
-        while (i < text.len) {
-            if (std.mem.startsWith(u8, text[i..], literal_mark)) {
-                try protect.append(allocator, clean.items.len);
-                i += literal_mark.len;
-            } else {
-                try clean.append(allocator, text[i]);
-                i += 1;
-            }
+    fn freeLoadIndexes(self: *Tokenizer) void {
+        if (self.specials_index) |*scan| scan.deinit(self.allocator);
+        self.specials_index = null;
+        if (self.reserved_ids.len > 0) self.allocator.free(self.reserved_ids);
+        if (self.assistant_blocked.len > 0) self.allocator.free(self.assistant_blocked);
+        self.reserved_ids = &.{};
+        self.assistant_blocked = &.{};
+    }
+
+    /// Builds the special-token matcher every encode reads.
+    pub fn indexSpecials(self: *Tokenizer) !void {
+        const scan = try SpecialScan.init(self, self.allocator);
+        if (self.specials_index) |*old| old.deinit(self.allocator);
+        self.specials_index = scan;
+    }
+
+    /// The matcher built at load, or when the specials changed since, one built into `temp` for this call.
+    fn specialScan(self: *const Tokenizer, allocator: std.mem.Allocator, temp: *?SpecialScan) !*const SpecialScan {
+        if (self.specials_index) |*scan| if (scan.cands.len == self.special_tokens.count()) return scan;
+        temp.* = try SpecialScan.init(self, allocator);
+        return &temp.*.?;
+    }
+
+    /// What the template and the stops say about the specials, once per load and in this one place: the ids the
+    /// sampler masks (`reservedOutputIds`), and the ids whose text inside an assistant message is text: the masked
+    /// ones and the stops, none of which the model writes inside a turn. No template: none of either.
+    pub fn bindTemplate(self: *Tokenizer, printed: ?*const TemplateFacts, stop_ids: []const u32) !void {
+        const reserved = try reservedOutputIds(self.allocator, self.flagged_specials, printed, stop_ids);
+        errdefer self.allocator.free(reserved);
+        std.mem.sort(u32, reserved, {}, std.sort.asc(u32));
+        var blocked = std.ArrayList(u32).empty;
+        errdefer blocked.deinit(self.allocator);
+        if (printed != null) {
+            try blocked.appendSlice(self.allocator, reserved);
+            try blocked.appendSlice(self.allocator, stop_ids);
+            std.mem.sort(u32, blocked.items, {}, std.sort.asc(u32));
+            var n: usize = 0;
+            for (blocked.items) |id| if (n == 0 or blocked.items[n - 1] != id) {
+                blocked.items[n] = id;
+                n += 1;
+            };
+            blocked.shrinkRetainingCapacity(n);
         }
-        return self.encodeProtected(allocator, clean.items, protect.items);
+        const owned = try blocked.toOwnedSlice(self.allocator);
+        if (self.reserved_ids.len > 0) self.allocator.free(self.reserved_ids);
+        if (self.assistant_blocked.len > 0) self.allocator.free(self.assistant_blocked);
+        self.reserved_ids = reserved;
+        self.assistant_blocked = owned;
     }
 
-    /// `text` with a `literal_mark` before every special-token occurrence, so `encodeMarked` keeps
-    /// it as text. Marks already in `text` are dropped: a mark only ever comes from here.
-    pub fn markLiteralSpecials(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-        var scan = try SpecialScan.init(self, allocator);
-        defer scan.deinit(allocator);
-        var out = std.ArrayList(u8).empty;
-        errdefer out.deinit(allocator);
-        var pos: usize = 0;
-        while (pos < text.len) {
-            if (std.mem.startsWith(u8, text[pos..], literal_mark)) {
-                pos += literal_mark.len;
-            } else if (scan.matchAt(text, pos)) |m| {
-                try out.appendSlice(allocator, literal_mark);
-                try out.appendSlice(allocator, m.bytes);
-                pos += m.bytes.len;
-            } else {
-                try out.append(allocator, text[pos]);
-                pos += 1;
-            }
-        }
-        return out.toOwnedSlice(allocator);
-    }
-
-    /// `protect` holds ascending offsets of specials to leave as text.
-    fn encodeProtected(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, protect: []const usize) ![]u32 {
-        // Split text around special tokens, encode segments with BPE, insert special token IDs
+    /// A rendered prompt encoded by origin. A special's text is its token where every byte of it is the template's,
+    /// or an assistant message's and the model can write that special inside a turn (`bindTemplate`); in other
+    /// input, or across two origins, it is text. Text is never split where its origin changes: BPE merges across.
+    pub fn encodeSpans(self: *const Tokenizer, allocator: std.mem.Allocator, text: template_engine.Str) ![]u32 {
+        var temp: ?SpecialScan = null;
+        defer if (temp) |*t| t.deinit(allocator);
+        const scan = try self.specialScan(allocator, &temp);
+        const bytes = text.bytes;
         var result = std.ArrayList(u32).empty;
         errdefer result.deinit(allocator);
-
-        var scan = try SpecialScan.init(self, allocator);
-        defer scan.deinit(allocator);
-
+        var run: usize = 0;
         var pos: usize = 0;
         var seg_start: usize = 0;
-        var next_protect: usize = 0;
-        while (pos < text.len) {
-            const matched = scan.matchAt(text, pos);
-            while (next_protect < protect.len and protect[next_protect] < pos) next_protect += 1;
-            if (matched) |m| {
-                if (next_protect < protect.len and protect[next_protect] == pos) {
-                    pos += m.bytes.len;
-                    continue;
-                }
-                if (pos > seg_start) {
-                    const ids = try self.encodeByteLevel(allocator, text[seg_start..pos]);
-                    defer allocator.free(ids);
-                    try result.appendSlice(allocator, ids);
-                }
-                try result.append(allocator, m.id);
-                pos += m.bytes.len;
-                seg_start = pos;
-            } else {
+        while (pos < bytes.len) {
+            const m = scan.matchAt(bytes, pos) orelse {
                 pos += 1;
+                continue;
+            };
+            const end = pos + m.bytes.len;
+            if (!self.recognised(originOf(text, &run, pos, end), m.id)) {
+                pos = end;
+                continue;
             }
+            if (pos > seg_start) {
+                const ids = try self.encodeByteLevel(allocator, bytes[seg_start..pos]);
+                defer allocator.free(ids);
+                try result.appendSlice(allocator, ids);
+            }
+            try result.append(allocator, m.id);
+            pos = end;
+            seg_start = pos;
         }
-        if (seg_start < text.len) {
-            const ids = try self.encodeByteLevel(allocator, text[seg_start..]);
+        if (seg_start < bytes.len) {
+            const ids = try self.encodeByteLevel(allocator, bytes[seg_start..]);
             defer allocator.free(ids);
             try result.appendSlice(allocator, ids);
         }
-
         return result.toOwnedSlice(allocator);
     }
+
+    /// The one origin of `text`'s bytes `from..to`, null when they straddle two. `run` is a cursor that only moves
+    /// forward, as the scan does.
+    fn originOf(text: template_engine.Str, run: *usize, from: usize, to: usize) ?template_engine.Origin {
+        if (text.runs.len == 0) return text.origin;
+        while (text.runs[run.*].end <= from) run.* += 1;
+        const r = text.runs[run.*];
+        return if (to <= r.end) r.origin else null;
+    }
+
+    fn recognised(self: *const Tokenizer, origin: ?template_engine.Origin, id: u32) bool {
+        return switch (origin orelse return false) {
+            .template => true,
+            .assistant => std.sort.binarySearch(u32, self.assistant_blocked, id, struct {
+                fn order(a: u32, b: u32) std.math.Order {
+                    return std.math.order(a, b);
+                }
+            }.order) == null,
+            .input => false,
+        };
+    }
+
+
+
 
     /// Does token `id` carry a line break? Byte-level vocabularies spell byte 0x0A as U+010A.
     pub fn tokenHasNewline(self: *const Tokenizer, id: u32) bool {
@@ -1011,7 +1045,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         special_tokens.count(),
     });
 
-    const built: Tokenizer = .{
+    var built: Tokenizer = .{
         .vocab = vocab,
         .id_to_token = id_to_token,
         .merge_ranks = merge_ranks,
@@ -1028,6 +1062,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .eos_id = eos_id,
         .parsed_json = parsed,
     };
+    try built.indexSpecials();
     return built;
 }
 
@@ -1107,6 +1142,31 @@ fn parseMergePair(merge_val: std.json.Value) ?Tokenizer.MergePair {
 
 /// A byte-level tokenizer spelling every byte as its own token, plus `specials`
 /// as atomic ids from 256 up. Strings live in `arena`.
+/// Test builds: a byte tokenizer holding a served pack's added tokens (`fixtures/chat_added_tokens.json`), each at its
+/// pack id plus 256 (past the byte ids) and flagged as the pack flags it, with the ids of the pack's stops.
+pub const PackTokenizer = struct { tok: Tokenizer, stops: []const u32 };
+
+pub fn packTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, pack: []const u8) !PackTokenizer {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, @embedFile("fixtures/chat_added_tokens.json"), .{});
+    const entry = (parsed.object.get(pack) orelse return error.UnknownPack).object;
+    const added = entry.get("added").?.array.items;
+    var tok = try byteTokenizerForTests(a, arena, &.{});
+    errdefer deinitTestTokenizer(&tok);
+    var flagged = std.ArrayList(FlaggedSpecial).empty;
+    for (added) |row| {
+        const content = row.array.items[0].string;
+        const id: u32 = @intCast(row.array.items[1].integer + 256);
+        try tok.special_tokens.put(content, id);
+        try tok.id_to_token.put(id, content);
+        if (row.array.items[2].bool) try flagged.append(arena, .{ .id = id, .content = content });
+    }
+    tok.flagged_specials = flagged.items;
+    try tok.indexSpecials();
+    var stops = std.ArrayList(u32).empty;
+    for (entry.get("stops").?.array.items) |s| try stops.append(arena, tok.special_tokens.get(s.string).?);
+    return .{ .tok = tok, .stops = stops.items };
+}
+
 pub fn byteTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, specials: []const []const u8) !Tokenizer {
     var tok = Tokenizer.initEmptyForTests(a);
     for (0..256) |b| {
@@ -1122,10 +1182,14 @@ pub fn byteTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, spe
         try tok.special_tokens.put(sp, id);
         try tok.id_to_token.put(id, sp);
     }
+    try tok.indexSpecials();
     return tok;
 }
 
 pub fn deinitTestTokenizer(tok: *Tokenizer) void {
+    // A pack tokenizer's flagged list lives in the caller's arena.
+    tok.flagged_specials = &.{};
+    tok.freeLoadIndexes();
     tok.vocab.deinit();
     tok.id_to_token.deinit();
     tok.merge_ranks.deinit();
@@ -1219,38 +1283,6 @@ test "encode special-token scan: earliest match, longest tie-break, adjacency" {
     }
 }
 
-test "literal marks: a marked special encodes as text, an unmarked one as its id, stray marks are dropped" {
-    const allocator = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(allocator);
-    defer {
-        tok.vocab.deinit();
-        tok.id_to_token.deinit();
-        tok.merge_ranks.deinit();
-        tok.special_tokens.deinit();
-        tok.unicode_to_byte.deinit();
-    }
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    for (0..256) |b| {
-        var buf: [4]u8 = undefined;
-        const n = try std.unicode.utf8Encode(tok.byte_to_unicode[b], &buf);
-        const piece = try arena.allocator().dupe(u8, buf[0..n]);
-        try tok.vocab.put(piece, @intCast(b));
-        try tok.id_to_token.put(@intCast(b), piece);
-        try tok.unicode_to_byte.put(tok.byte_to_unicode[b], @intCast(b));
-    }
-    try tok.special_tokens.put("<s>", 300);
-    try tok.special_tokens.put("<s>x", 301);
-
-    const marked = try tok.markLiteralSpecials(allocator, "a<s>x\u{FDD0}b<s>");
-    defer allocator.free(marked);
-    try testing.expectEqualStrings("a" ++ literal_mark ++ "<s>xb" ++ literal_mark ++ "<s>", marked);
-
-    // Marked: 'a' '<' 's' '>' 'x' 'b' '<' 's' '>'. Unmarked text in the same string keeps its id.
-    const ids = try tok.encodeMarked(allocator, "a" ++ literal_mark ++ "<s>xb<s>");
-    defer allocator.free(ids);
-    try testing.expectEqualSlices(u32, &.{ 'a', '<', 's', '>', 'x', 'b', 300 }, ids);
-}
 
 // Helper for pre-tokenizer tests: run gpt2PreTokenize and compare the
 // emitted word strings to an expected slice. Owns the dupe'd word memory.
@@ -1881,4 +1913,70 @@ fn reservedOf(alloc: std.mem.Allocator, flagged: []const FlaggedSpecial, source:
     var t = try template_engine.Template.compile(alloc, source, &diag);
     defer t.deinit();
     return reservedOutputIds(alloc, flagged, &t.facts, exempt_ids);
+}
+
+/// A BPE tokenizer read the way a load reads one: bytes `a b < > s t u x`, the merge `a b`, and three added tokens,
+/// `<s>` and `<t>` flagged special, `<u>` not.
+fn spanTestTokenizer(a: std.mem.Allocator) !Tokenizer {
+    const content =
+        \\{"model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "ab": 2, "<": 3, ">": 4, "s": 5, "t": 6, "u": 7, "x": 8},
+        \\  "merges": [["a", "b"]]},
+        \\ "added_tokens": [{"id": 9, "content": "<s>", "special": true}, {"id": 10, "content": "<t>", "special": true},
+        \\  {"id": 11, "content": "<u>", "special": false}],
+        \\ "pre_tokenizer": {"type": "ByteLevel"}}
+    ;
+    return parseTokenizerContent(testing.io, a, content);
+}
+
+test "tokenizer: the special-token matcher is built once, at load" {
+    var tok = try spanTestTokenizer(testing.allocator);
+    defer tok.deinit();
+    try testing.expectEqual(tok.special_tokens.count(), tok.specials_index.?.cands.len);
+}
+
+test "encodeSpans: a special's text is its token only where every byte of it is from an origin that allows it" {
+    const a = testing.allocator;
+    var tok = try spanTestTokenizer(a);
+    defer tok.deinit();
+    var diag: template_engine.Diagnostic = .{};
+    // The template prints `<s>`; `<t>` is flagged and never printed, so the sampler masks it.
+    var t = try template_engine.Template.compile(a, "{{ '<s>' }}", &diag);
+    defer t.deinit();
+    try tok.bindTemplate(&t.facts, &.{});
+    const Run = template_engine.Run;
+    const Case = struct { bytes: []const u8, runs: []const Run, want: []const u32 };
+    const cases = [_]Case{
+        // Template text: every special.
+        .{ .bytes = "<s><t><u>", .runs = &.{.{ .end = 9, .origin = .template }}, .want = &.{ 9, 10, 11 } },
+        // Other input: none, and the bytes around them merge as plain text.
+        .{ .bytes = "a<s>b", .runs = &.{.{ .end = 5, .origin = .input }}, .want = &.{ 0, 3, 5, 4, 1 } },
+        // An assistant turn: what the model writes in a turn (`<s>` printed, `<u>` unflagged), not what it cannot (`<t>`).
+        .{ .bytes = "<s><t><u>", .runs = &.{.{ .end = 9, .origin = .assistant }}, .want = &.{ 9, 3, 6, 4, 11 } },
+        // A special put together from two origins is text.
+        .{ .bytes = "<s>", .runs = &.{ .{ .end = 1, .origin = .template }, .{ .end = 3, .origin = .input } }, .want = &.{ 3, 5, 4 } },
+        .{ .bytes = "<s>", .runs = &.{ .{ .end = 2, .origin = .template }, .{ .end = 3, .origin = .assistant } }, .want = &.{ 3, 5, 4 } },
+        // Text is one segment across an origin change: `a` from the template and `b` from input merge to `ab`.
+        .{ .bytes = "<s>ab<s>", .runs = &.{ .{ .end = 4, .origin = .template }, .{ .end = 5, .origin = .input }, .{ .end = 8, .origin = .template } }, .want = &.{ 9, 2, 9 } },
+    };
+    for (cases) |c| {
+        const ids = try tok.encodeSpans(a, .{ .bytes = c.bytes, .origin = .input, .runs = c.runs });
+        defer a.free(ids);
+        try testing.expectEqualSlices(u32, c.want, ids);
+    }
+}
+
+test "bindTemplate: the sampler masks the flagged specials the template never prints; an assistant turn reads those and the stops as text" {
+    const a = testing.allocator;
+    var tok = try spanTestTokenizer(a);
+    defer tok.deinit();
+    var diag: template_engine.Diagnostic = .{};
+    var t = try template_engine.Template.compile(a, "{{ '<s>' }}", &diag);
+    defer t.deinit();
+    try tok.bindTemplate(&t.facts, &.{9});
+    try testing.expectEqualSlices(u32, &.{10}, tok.reserved_ids);
+    try testing.expectEqualSlices(u32, &.{ 9, 10 }, tok.assistant_blocked);
+    // No template: nothing masked, and assistant text keeps every special, as before templates were read.
+    try tok.bindTemplate(null, &.{9});
+    try testing.expectEqual(@as(usize, 0), tok.reserved_ids.len);
+    try testing.expectEqual(@as(usize, 0), tok.assistant_blocked.len);
 }

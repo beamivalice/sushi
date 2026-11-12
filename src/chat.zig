@@ -142,6 +142,9 @@ pub const Message = struct {
     /// turns read it; templates that strip history reasoning
     /// (Qwen, Gemma) never reference the field and render unchanged.
     reasoning_content: ?[]const u8 = null,
+    /// Who wrote each byte of `content` when the server put it together from its own text and the client's (the tool
+    /// fallbacks); null when all of it is the role's.
+    content_origins: ?[]const template_engine.Run = null,
 };
 
 /// Only a template that reads `preserve_thinking` is handed the switch; `--preserve-thinking` and the per-model key do nothing elsewhere.
@@ -676,11 +679,8 @@ pub fn formatChat(
     /// Extend the trailing assistant message instead of answering after it.
     continue_final: bool,
 ) ![]u32 {
-    var literal_arena = std.heap.ArenaAllocator.init(allocator);
-    defer literal_arena.deinit();
-    const marked = try markLiteralControlText(literal_arena.allocator(), tok, messages);
-    const rendered = try renderChatTemplate(allocator, marked, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
-    defer allocator.free(rendered);
+    const rendered = try renderChatSpans(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
+    defer freeSpans(allocator, rendered);
 
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
@@ -691,8 +691,10 @@ pub fn formatChat(
         }
     }
 
-    try encodeWithSpecialTokens(allocator, tok, rendered, &ids);
-    log.debug("  prompt: {d} chars -> {d} tokens\n", .{ rendered.len, ids.items.len });
+    const body = try tok.encodeSpans(allocator, rendered);
+    defer allocator.free(body);
+    try ids.appendSlice(allocator, body);
+    log.debug("  prompt: {d} chars -> {d} tokens\n", .{ rendered.bytes.len, ids.items.len });
 
     return ids.toOwnedSlice(allocator);
 }
@@ -700,8 +702,60 @@ pub fn formatChat(
 /// Renders whose shipped template raised and fell to the generic format; `/props` reports it.
 pub var template_fallbacks = std.atomic.Value(u64).init(0);
 
-/// Render the Jinja chat template with the given messages.
+/// Render the Jinja chat template with the given messages: `renderChatSpans`'s text.
 pub fn renderChatTemplate(
+    allocator: std.mem.Allocator,
+    messages: []const Message,
+    chat_config: *const ChatConfig,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    effort: ?[]const u8,
+    continue_final: bool,
+) ![]const u8 {
+    const rendered = try renderChatSpans(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
+    allocator.free(rendered.runs);
+    return rendered.bytes;
+}
+
+/// A rendered prompt and who wrote each byte, every piece owned by one allocator (`freeSpans`).
+pub const Spans = template_engine.Str;
+
+pub fn freeSpans(allocator: std.mem.Allocator, s: Spans) void {
+    allocator.free(s.bytes);
+    allocator.free(s.runs);
+}
+
+fn dupeSpans(allocator: std.mem.Allocator, s: Spans) !Spans {
+    const bytes = try allocator.dupe(u8, s.bytes);
+    errdefer allocator.free(bytes);
+    return .{ .bytes = bytes, .origin = s.origin, .runs = try allocator.dupe(template_engine.Run, s.runs) };
+}
+
+/// What `b` built, owned: the builder is spent.
+fn ownBuilt(allocator: std.mem.Allocator, b: *template_engine.Builder) !Spans {
+    const shape = b.str();
+    if (shape.runs.len == 0) b.runs.clearAndFree(allocator);
+    const runs = try b.runs.toOwnedSlice(allocator);
+    errdefer allocator.free(runs);
+    return .{ .bytes = try b.bytes.toOwnedSlice(allocator), .origin = shape.origin, .runs = runs };
+}
+
+fn joinSpans(allocator: std.mem.Allocator, parts: []const Spans) !Spans {
+    var b: template_engine.Builder = .{};
+    errdefer b.deinit(allocator);
+    for (parts) |p| try b.append(allocator, p);
+    return ownBuilt(allocator, &b);
+}
+
+/// The server's own text, read as the template's.
+fn server(text: []const u8) Spans {
+    return .{ .bytes = text };
+}
+
+/// Render the Jinja chat template with the given messages, each byte with who wrote it: the template (and the server's
+/// own text around it), an assistant message, or other request text (`Tokenizer.encodeSpans`).
+pub fn renderChatSpans(
     allocator: std.mem.Allocator,
     messages: []const Message,
     chat_config: *const ChatConfig,
@@ -712,7 +766,7 @@ pub fn renderChatTemplate(
     /// Extend the trailing assistant message instead of answering after it —
     /// the prompt ends mid-turn and generation resumes from its last word.
     continue_final: bool,
-) ![]const u8 {
+) !Spans {
     // Split the partial reply off FIRST, so every transform below (tool
     // fallback synthesis) sees exactly the message list
     // an ordinary turn would have. The template must open the assistant turn
@@ -724,8 +778,8 @@ pub fn renderChatTemplate(
         if (!fallbackIsChatMl(chat_config)) return refuseTemplate("the model has no chat template and no fallback format");
         const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
         if (prefill) |partial| {
-            defer allocator.free(base);
-            return std.mem.concat(allocator, u8, &.{ base, partial });
+            defer freeSpans(allocator, base);
+            return joinSpans(allocator, &.{ base, .{ .bytes = partial, .origin = .assistant } });
         }
         return base;
     }
@@ -808,21 +862,21 @@ pub fn renderChatTemplate(
     var failure: EngineFailure = .{};
     const context = RenderContext{ .messages = effective_messages, .image_atom = chat_config.image_placeholder, .tools = effective_tools_json, .settings = &settings };
     if (try renderEngine(allocator, render_tpl, &context, true, &failure)) |engine_out| {
-        defer allocator.free(engine_out);
+        defer freeSpans(allocator, engine_out);
         const collapsed = try collapseDoubledThinkTags(allocator, engine_out);
         // A continuation commits the content channel and then hands the model
         // its own unfinished sentence. It runs INSTEAD of the thinking-off
         // tail, never beside it — both append the same channel commit, and
         // twice is a malformed turn header.
         if (prefill) |partial| {
-            defer allocator.free(collapsed);
-            return std.mem.concat(allocator, u8, &.{
-                collapsed, think_tags.contentChannelTail(collapsed), partial,
+            defer freeSpans(allocator, collapsed);
+            return joinSpans(allocator, &.{
+                collapsed, server(think_tags.contentChannelTail(collapsed.bytes)), .{ .bytes = partial, .origin = .assistant },
             });
         }
-        if (think_tags.noThinkTailSuffix(collapsed, enable_thinking)) |suffix| {
-            defer allocator.free(collapsed);
-            return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
+        if (think_tags.noThinkTailSuffix(collapsed.bytes, enable_thinking)) |suffix| {
+            defer freeSpans(allocator, collapsed);
+            return joinSpans(allocator, &.{ collapsed, server(suffix) });
         }
         return collapsed;
     }
@@ -842,8 +896,8 @@ pub fn renderChatTemplate(
     log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{reason});
     const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
     if (prefill) |partial| {
-        defer allocator.free(base);
-        return std.mem.concat(allocator, u8, &.{ base, partial });
+        defer freeSpans(allocator, base);
+        return joinSpans(allocator, &.{ base, .{ .bytes = partial, .origin = .assistant } });
     }
     return base;
 }
@@ -862,7 +916,7 @@ fn renderContinuation(
     turn: Message,
     partial: []const u8,
     chat_config: *const ChatConfig,
-) !?[]const u8 {
+) !?Spans {
     const turns = try allocator.alloc(Message, history.len + 1);
     defer allocator.free(turns);
     @memcpy(turns[0..history.len], history);
@@ -870,13 +924,15 @@ fn renderContinuation(
     var failure: EngineFailure = .{};
     const context = RenderContext{ .messages = turns, .image_atom = chat_config.image_placeholder, .tools = tools, .settings = settings };
     const engine_out = try renderEngine(allocator, tmpl, &context, false, &failure) orelse return null;
-    defer allocator.free(engine_out);
+    defer freeSpans(allocator, engine_out);
     const rendered = try collapseDoubledThinkTags(allocator, engine_out);
-    defer allocator.free(rendered);
+    defer freeSpans(allocator, rendered);
     // A template may trim the text's leading whitespace, as transformers allows for.
     const text = std.mem.trimStart(u8, partial, " \t\r\n");
-    const at = try template_engine.lastIndexOf(allocator, rendered, text) orelse return null;
-    return try allocator.dupe(u8, rendered[0 .. at + text.len]);
+    const at = try template_engine.lastIndexOf(allocator, rendered.bytes, text) orelse return null;
+    var cut = std.heap.ArenaAllocator.init(allocator);
+    defer cut.deinit();
+    return try dupeSpans(allocator, try rendered.slice(cut.allocator(), 0, at + text.len));
 }
 
 /// DSV4's chat template emits `</think></think>` between every user→assistant
@@ -890,30 +946,27 @@ fn renderContinuation(
 /// must be tolerating it via reduction-order quirks we don't share. Strip
 /// it here. Safe across all model families because `</think></think>` never
 /// appears legitimately.
-fn collapseDoubledThinkTags(allocator: std.mem.Allocator, rendered: []const u8) ![]u8 {
+fn collapseDoubledThinkTags(allocator: std.mem.Allocator, rendered: Spans) !Spans {
     const tag = "</think>";
     const needle = "</think></think>";
-    if (std.mem.indexOf(u8, rendered, needle) == null) {
-        return allocator.dupe(u8, rendered);
-    }
-    var out = std.ArrayList(u8).empty;
+    const text = rendered.bytes;
+    if (std.mem.indexOf(u8, text, needle) == null) return dupeSpans(allocator, rendered);
+    var out: template_engine.Builder = .{};
     errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, rendered.len);
+    try out.bytes.ensureTotalCapacity(allocator, text.len);
+    // At each `</think></think>` drop the FIRST tag and look again from the survivor, so 3x, 4x, … also collapse
+    // to one; every kept byte keeps its origin.
+    var keep_from: usize = 0;
     var i: usize = 0;
-    while (i < rendered.len) {
-        // If we see `</think></think>...`, drop the FIRST `</think>` and let
-        // the next iteration handle whatever follows — that way 3x, 4x, …
-        // also collapse to a single tag without a separate pass.
-        if (i + needle.len <= rendered.len and
-            std.mem.eql(u8, rendered[i .. i + needle.len], needle))
-        {
-            i += tag.len; // skip the first `</think>`; next iter writes the survivor
-        } else {
-            try out.append(allocator, rendered[i]);
-            i += 1;
-        }
+    while (i < text.len) {
+        if (std.mem.startsWith(u8, text[i..], needle)) {
+            try out.appendPart(allocator, rendered, keep_from, i);
+            i += tag.len;
+            keep_from = i;
+        } else i += 1;
     }
-    return out.toOwnedSlice(allocator);
+    try out.appendPart(allocator, rendered, keep_from, text.len);
+    return ownBuilt(allocator, &out);
 }
 
 /// Execute a tiny role probe instead of trying to infer Jinja control flow
@@ -971,7 +1024,9 @@ fn templateProbeRender(allocator: std.mem.Allocator, tpl: *const Tpl, probe: Pro
 fn renderProbeFresh(allocator: std.mem.Allocator, tpl: *const Tpl, probe: Probe, settings: *const Settings) !?[]u8 {
     var failure: EngineFailure = .{};
     const context = RenderContext{ .messages = probe.messages(), .settings = settings };
-    return renderEngine(allocator, tpl, &context, false, &failure);
+    const rendered = try renderEngine(allocator, tpl, &context, false, &failure) orelse return null;
+    allocator.free(rendered.runs);
+    return @constCast(rendered.bytes);
 }
 
 /// Tests only: the JSON writer of a template's context (`chat_json_test.zig`), never compiled into the served binary.
@@ -984,7 +1039,7 @@ fn contextTexts(arena: std.mem.Allocator, context: *const RenderContext) !Contex
     var tools = context.tools;
     if (context.tools) |t| if (t.len > 0) {
         var diag: template_engine.Diagnostic = .{};
-        if (template_engine.readJson(arena, t, "tools", &diag)) |v| {
+        if (template_engine.readJson(arena, t, "tools", .input, &diag)) |v| {
             if (try fillToolDefKeys(arena, v)) {
                 var buf = std.ArrayList(u8).empty;
                 try test_json.writeValue(arena, &buf, v);
@@ -1045,17 +1100,17 @@ const EngineFailure = struct {
 };
 
 /// The only call into the template engine: the render, owned by `allocator`, or null with why in `failure`.
-fn renderEngine(allocator: std.mem.Allocator, tmpl: *const Tpl, context: *const RenderContext, add_generation_prompt: bool, failure: *EngineFailure) error{OutOfMemory}!?[]u8 {
+fn renderEngine(allocator: std.mem.Allocator, tmpl: *const Tpl, context: *const RenderContext, add_generation_prompt: bool, failure: *EngineFailure) error{OutOfMemory}!?Spans {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var usage: template_engine.Usage = .{};
     const in: template_engine.Inputs = .{ .context = context.context(), .add_generation_prompt = add_generation_prompt, .usage = if (builtin.is_test) &usage else null };
-    const rendered: ?[]u8 = switch (tmpl.tree) {
+    const rendered: ?Spans = switch (tmpl.tree) {
         .bad => |b| blk: {
             failure.* = b;
             break :blk null;
         },
-        .ok => |*t| if (t.render(arena.allocator(), in, &failure.diag)) |out| try allocator.dupe(u8, out) else |e| switch (e) {
+        .ok => |*t| if (t.renderSpans(arena.allocator(), in, &failure.diag)) |out| try dupeSpans(allocator, out) else |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => blk: {
                 failure.err = e;
@@ -1068,7 +1123,7 @@ fn renderEngine(allocator: std.mem.Allocator, tmpl: *const Tpl, context: *const 
         defer json.deinit();
         const texts = contextTexts(json.allocator(), context) catch |e| switch (e) {
             error.OutOfMemory => {
-                if (rendered) |r| allocator.free(r);
+                if (rendered) |r| freeSpans(allocator, r);
                 return error.OutOfMemory;
             },
             else => std.debug.panic("engine spy: the context is not writable as JSON ({s})", .{@errorName(e)}),
@@ -1080,7 +1135,7 @@ fn renderEngine(allocator: std.mem.Allocator, tmpl: *const Tpl, context: *const 
             .tools = texts.tools,
             .extra = texts.extra,
             .add_generation_prompt = add_generation_prompt,
-            .rendered = rendered,
+            .rendered = if (rendered) |r| r.bytes else null,
             .usage = usage,
         });
     };
@@ -1172,14 +1227,18 @@ fn nameByte(c: u8) bool {
 /// turn, else a user turn of its own. Every byte before the last message is
 /// unchanged, so the prefix cache still matches.
 fn appendTurnInstruction(arena: std.mem.Allocator, messages: []const Message, text: []const u8) ![]const Message {
+    // It names the client's function: the client's text.
+    const instruction: template_engine.Str = .{ .bytes = text, .origin = .input };
     const out = try arena.alloc(Message, messages.len + 1);
     @memcpy(out[0..messages.len], messages);
     if (messages.len > 0 and std.mem.eql(u8, messages[messages.len - 1].role, "user")) {
         const last = &out[messages.len - 1];
-        last.content = if (last.content.len == 0) text else try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ last.content, text });
+        const turn = if (last.content.len == 0) try synthesized(arena, "user", &.{instruction}) else try synthesized(arena, "user", &.{ contentSpans(last.*), server("\n\n"), instruction });
+        last.content = turn.content;
+        last.content_origins = turn.content_origins;
         return out[0..messages.len];
     }
-    out[messages.len] = .{ .role = "user", .content = text };
+    out[messages.len] = try synthesized(arena, "user", &.{instruction});
     return out;
 }
 
@@ -1209,17 +1268,17 @@ pub fn synthesizeToolFallbackMessages(
 ) ![]Message {
     var out = std.ArrayList(Message).empty;
 
-    var tool_prompt: ?[]const u8 = null;
+    var tool_prompt: ?template_engine.Str = null;
     if (inject_tool_prompt and tools_json != null) {
-        var buf = std.ArrayList(u8).empty;
-        try tool_calls_mod.appendToolSystemPrompt(arena, &buf, tools_json.?, tool_choice_instruction);
-        tool_prompt = try buf.toOwnedSlice(arena);
+        var b: template_engine.Builder = .{};
+        try appendToolPrompt(arena, &b, tools_json.?, tool_choice_instruction);
+        tool_prompt = b.str();
     }
 
     var injected = false;
     if (tool_prompt) |tp| {
         if (messages.len == 0 or !std.mem.eql(u8, messages[0].role, "system")) {
-            try out.append(arena, .{ .role = "system", .content = tp });
+            try out.append(arena, try synthesized(arena, "system", &.{tp}));
             injected = true;
         }
     }
@@ -1227,50 +1286,41 @@ pub fn synthesizeToolFallbackMessages(
     for (messages, 0..) |msg, i| {
         if (tool_prompt) |tp| {
             if (!injected and i == 0 and std.mem.eql(u8, msg.role, "system")) {
-                const merged = if (msg.content.len > 0)
-                    try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ msg.content, tp })
+                var merged = if (msg.content.len > 0)
+                    try synthesized(arena, "system", &.{ contentSpans(msg), server("\n\n"), tp })
                 else
-                    try arena.dupe(u8, tp);
-                try out.append(arena, .{
-                    .role = "system",
-                    .content = merged,
-                    .tool_calls = msg.tool_calls,
-                    .tool_call_id = msg.tool_call_id,
-                    .images = msg.images,
-                });
+                    try synthesized(arena, "system", &.{tp});
+                merged.tool_calls = msg.tool_calls;
+                merged.tool_call_id = msg.tool_call_id;
+                merged.images = msg.images;
+                try out.append(arena, merged);
                 injected = true;
                 continue;
             }
         }
 
         if (rewrite_tool_role and std.mem.eql(u8, msg.role, "tool")) {
-            const wrapped = try std.fmt.allocPrint(arena, "<tool_response>\n{s}\n</tool_response>", .{msg.content});
-            try out.append(arena, .{
-                .role = "user",
-                .content = wrapped,
-            });
+            try out.append(arena, try synthesized(arena, "user", &.{ server("<tool_response>\n"), contentSpans(msg), server("\n</tool_response>") }));
             continue;
         }
 
         if (rewrite_tool_calls and std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
-            var buf = std.ArrayList(u8).empty;
-            if (msg.content.len > 0) {
-                try buf.appendSlice(arena, msg.content);
-                try buf.append(arena, '\n');
-            }
-            for (msg.tool_calls.?) |tc| {
-                try buf.appendSlice(arena, "<tool_call>\n{\"name\": \"");
-                try buf.appendSlice(arena, tc.name);
-                try buf.appendSlice(arena, "\", \"arguments\": ");
-                try buf.appendSlice(arena, tc.arguments);
-                try buf.appendSlice(arena, "}\n</tool_call>\n");
-            }
-            const owned = try buf.toOwnedSlice(arena);
-            try out.append(arena, .{
-                .role = "assistant",
-                .content = std.mem.trimEnd(u8, owned, "\n"),
-                .images = msg.images,
+            var pieces = std.ArrayList(template_engine.Str).empty;
+            if (msg.content.len > 0) try pieces.appendSlice(arena, &.{ contentSpans(msg), server("\n") });
+            for (msg.tool_calls.?) |tc| try pieces.appendSlice(arena, &.{
+                server("<tool_call>\n{\"name\": \""),
+                .{ .bytes = tc.name, .origin = .assistant },
+                server("\", \"arguments\": "),
+                .{ .bytes = tc.arguments, .origin = .assistant },
+                server("}\n</tool_call>\n"),
             });
+            var b: template_engine.Builder = .{};
+            for (pieces.items) |p| try b.append(arena, p);
+            const built = b.str();
+            const kept = std.mem.trimEnd(u8, built.bytes, "\n").len;
+            var rewritten = try synthesized(arena, "assistant", &.{try built.slice(arena, 0, kept)});
+            rewritten.images = msg.images;
+            try out.append(arena, rewritten);
             continue;
         }
 
@@ -1278,6 +1328,37 @@ pub fn synthesizeToolFallbackMessages(
     }
 
     return out.toOwnedSlice(arena);
+}
+
+/// A message the server writes, its content the pieces in order, each byte with who wrote it.
+fn synthesized(arena: std.mem.Allocator, role: []const u8, pieces: []const template_engine.Str) !Message {
+    var b: template_engine.Builder = .{};
+    for (pieces) |p| try b.append(arena, p);
+    return .{ .role = role, .content = b.bytes.items, .content_origins = b.runs.items };
+}
+
+/// The tool prompt of the fallbacks: the server's instructions before the client's tool list, then the tool_choice
+/// instruction, which names the client's function and so is the client's text.
+fn appendToolPrompt(allocator: std.mem.Allocator, b: *template_engine.Builder, tools_json: []const u8, instruction: ?[]const u8) !void {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try tool_calls_mod.appendToolSystemPrompt(allocator, &buf, tools_json, instruction);
+    const tail = if (instruction) |t| t.len else 0;
+    const head = buf.items.len - tools_json.len - tail;
+    try b.appendBytes(allocator, buf.items[0..head], .template);
+    try b.appendBytes(allocator, buf.items[head .. head + tools_json.len], .input);
+    try b.appendBytes(allocator, buf.items[head + tools_json.len ..], .input);
+}
+
+/// A call's text as the model writes it: the template's markup around a function name the client chose, which is
+/// text whatever it spells.
+pub fn encodeCallText(allocator: std.mem.Allocator, tok: *const Tokenizer, head: []const u8, name: []const u8, tail: []const u8) ![]u32 {
+    var b: template_engine.Builder = .{};
+    defer b.deinit(allocator);
+    try b.appendBytes(allocator, head, .template);
+    try b.appendBytes(allocator, name, .input);
+    try b.appendBytes(allocator, tail, .template);
+    return tok.encodeSpans(allocator, b.str());
 }
 
 /// Deepest `{`/`[` nesting a JSON request may carry: the recursive consumers (echo, schema, template) have no cap of their own.
@@ -1318,9 +1399,9 @@ const TemplateMessage = struct {
     /// `message.reasoning_content is string`, and a null would still pass an `is defined` check.
     reasoning_content: ?[]const u8 = null,
 
-    const Content = union(enum) { text: []const u8, parts: []const Part, none };
+    const Content = union(enum) { text: template_engine.Str, parts: []const Part, none };
     /// A vision template's part list: text pieces, and a placeholder where each image or video sits.
-    const Part = union(enum) { text: struct { type: []const u8 = "text", text: []const u8 }, media: struct { type: []const u8 } };
+    const Part = union(enum) { text: struct { type: []const u8 = "text", text: template_engine.Str }, media: struct { type: []const u8 } };
 };
 
 const TemplateCall = struct {
@@ -1345,8 +1426,8 @@ const Arguments = struct {
         return self.text;
     }
 
-    fn of(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!Arguments {
-        if (!jsonNestingExceeds(text, max_json_nesting)) if (template_engine.fromJson(arena, text)) |v| {
+    fn of(arena: std.mem.Allocator, text: []const u8, origin: template_engine.Origin) error{OutOfMemory}!Arguments {
+        if (!jsonNestingExceeds(text, max_json_nesting)) if (template_engine.fromJson(arena, text, origin)) |v| {
             if (v == .dict) return .{ .text = text, .value = v };
         } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
         const empty = try arena.create(template_engine.Dict);
@@ -1383,6 +1464,11 @@ fn utf8Text(arena: std.mem.Allocator, s: []const u8) error{OutOfMemory}![]const 
     return out.items;
 }
 
+/// Who wrote a message's text: an assistant turn is the model's earlier output, any other the client's.
+fn messageOrigin(role: []const u8) template_engine.Origin {
+    return if (std.mem.eql(u8, role, "assistant")) .assistant else .input;
+}
+
 /// `messages` as a template reads them; an image becomes `image_atom` where it sits when the template takes
 /// `content` as one string (DeepSeek-V4.1).
 fn templateMessages(arena: std.mem.Allocator, messages: []const Message, image_atom: ?[]const u8) error{OutOfMemory}![]const TemplateMessage {
@@ -1398,7 +1484,7 @@ fn templateMessages(arena: std.mem.Allocator, messages: []const Message, image_a
             const calls = try arena.alloc(TemplateCall, tcs.len);
             for (tcs, calls) |tc, *c| c.* = .{
                 .id = if (tc.id.len > 0) try utf8Text(arena, tc.id) else null,
-                .function = .{ .name = try utf8Text(arena, tc.name), .arguments = try Arguments.of(arena, tc.arguments) },
+                .function = .{ .name = try utf8Text(arena, tc.name), .arguments = try Arguments.of(arena, tc.arguments, messageOrigin(msg.role)) },
             };
             t.tool_calls = calls;
         }
@@ -1408,48 +1494,75 @@ fn templateMessages(arena: std.mem.Allocator, messages: []const Message, image_a
 
 fn templateContent(arena: std.mem.Allocator, msg: Message, image_atom: ?[]const u8) error{OutOfMemory}!TemplateMessage.Content {
     if (msg.media_parts) |parts| if (parts.len > 0) {
-        if (image_atom) |atom| return .{ .text = try atomContent(arena, msg.content, parts, atom) };
-        return .{ .parts = try contentParts(arena, msg.content, parts) };
+        if (image_atom) |atom| return .{ .text = try atomContent(arena, msg, parts, atom) };
+        return .{ .parts = try contentParts(arena, msg, parts) };
     };
-    return if (msg.content.len > 0) .{ .text = try utf8Text(arena, msg.content) } else .none;
+    return if (msg.content.len > 0) .{ .text = try contentText(arena, msg, 0, msg.content.len) } else .none;
+}
+
+/// `msg`'s content with who wrote each byte: the role, or as the server recorded it (`Message.content_origins`).
+fn contentSpans(msg: Message) template_engine.Str {
+    const runs = msg.content_origins orelse return .{ .bytes = msg.content, .origin = messageOrigin(msg.role) };
+    var origin: template_engine.Origin = .template;
+    for (runs) |r| origin = origin.strictest(r.origin);
+    return .{ .bytes = msg.content, .origin = origin, .runs = runs };
+}
+
+/// Bytes `from..to` of `msg`'s content as a template reads them (`utf8Text`), each with who wrote it. A piece the
+/// server put together is mended run by run: its own text is ASCII, so a bad sequence never crosses a run.
+fn contentText(arena: std.mem.Allocator, msg: Message, from: usize, to: usize) error{OutOfMemory}!template_engine.Str {
+    const piece = try contentSpans(msg).slice(arena, from, to);
+    const text = try utf8Text(arena, piece.bytes);
+    if (text.ptr == piece.bytes.ptr) return piece;
+    if (piece.runs.len == 0) return piece.derive(text);
+    var mended: template_engine.Builder = .{};
+    var start: usize = 0;
+    for (piece.runs) |run| {
+        try mended.appendBytes(arena, try utf8Text(arena, piece.bytes[start..run.end]), run.origin);
+        start = run.end;
+    }
+    return mended.str();
 }
 
 /// `content` as the typed part list vision templates render, each media part a `{"type":"image"|"video"}`
 /// placeholder at its offset.
-fn contentParts(arena: std.mem.Allocator, content: []const u8, parts: []const MediaPart) error{OutOfMemory}![]const TemplateMessage.Part {
+fn contentParts(arena: std.mem.Allocator, msg: Message, parts: []const MediaPart) error{OutOfMemory}![]const TemplateMessage.Part {
+    const content = msg.content;
     var out = std.ArrayList(TemplateMessage.Part).empty;
     var from: usize = 0;
     for (parts) |p| {
         const at = @max(from, @min(p.at, content.len));
         if (at > from) {
-            try out.append(arena, .{ .text = .{ .text = try utf8Text(arena, content[from..at]) } });
+            try out.append(arena, .{ .text = .{ .text = try contentText(arena, msg, from, at) } });
             from = at;
         }
         try out.append(arena, .{ .media = .{ .type = @tagName(p.kind) } });
     }
-    if (from < content.len) try out.append(arena, .{ .text = .{ .text = try utf8Text(arena, content[from..]) } });
+    if (from < content.len) try out.append(arena, .{ .text = .{ .text = try contentText(arena, msg, from, content.len) } });
     return out.items;
 }
 
 /// `content` as one string for a template that has no part list: an `atom` for each image at its offset, the
-/// text around them, all joined by blank lines. Video has no atom there and is dropped.
-fn atomContent(arena: std.mem.Allocator, content: []const u8, parts: []const MediaPart, atom: []const u8) error{OutOfMemory}![]const u8 {
-    var text = std.ArrayList(u8).empty;
+/// text around them, all joined by blank lines. Video has no atom there and is dropped. The atom and the blank lines
+/// are the server's.
+fn atomContent(arena: std.mem.Allocator, msg: Message, parts: []const MediaPart, atom: []const u8) error{OutOfMemory}!template_engine.Str {
+    const content = msg.content;
+    var text: template_engine.Builder = .{};
     var from: usize = 0;
     for (parts) |p| {
         const at = @max(from, @min(p.at, content.len));
         if (p.kind != .image) continue;
-        if (at > from) try appendJoined(arena, &text, content[from..at]);
-        try appendJoined(arena, &text, atom);
+        if (at > from) try appendJoined(arena, &text, try contentText(arena, msg, from, at));
+        try appendJoined(arena, &text, .{ .bytes = atom });
         from = at;
     }
-    if (from < content.len) try appendJoined(arena, &text, content[from..]);
-    return utf8Text(arena, text.items);
+    if (from < content.len) try appendJoined(arena, &text, try contentText(arena, msg, from, content.len));
+    return text.str();
 }
 
-fn appendJoined(allocator: std.mem.Allocator, text: *std.ArrayList(u8), piece: []const u8) error{OutOfMemory}!void {
-    if (text.items.len > 0) try text.appendSlice(allocator, "\n\n");
-    try text.appendSlice(allocator, piece);
+fn appendJoined(allocator: std.mem.Allocator, text: *template_engine.Builder, piece: template_engine.Str) error{OutOfMemory}!void {
+    if (text.bytes.items.len > 0) try text.appendBytes(allocator, "\n\n", .template);
+    try text.append(allocator, piece);
 }
 
 /// What a template reads besides its messages and tools, in the order a chat template's context has them: the turn
@@ -1496,13 +1609,21 @@ const RenderContext = struct {
 
     fn build(ptr: *const anyopaque, arena: std.mem.Allocator, diag: *template_engine.Diagnostic) template_engine.Error!template_engine.Vars {
         const self: *const RenderContext = @ptrCast(@alignCast(ptr));
-        const messages = try template_engine.fromStruct(arena, try templateMessages(arena, self.messages, self.image_atom));
+        const typed = try templateMessages(arena, self.messages, self.image_atom);
+        const list = try arena.alloc(template_engine.Value, typed.len);
+        for (typed, self.messages, list) |t, m, *v| v.* = try template_engine.fromStruct(arena, t, messageOrigin(m.role));
+        const messages = try template_engine.fromStruct(arena, @as([]const template_engine.Value, list), .template);
         var tools: ?template_engine.Value = null;
         if (self.tools) |t| if (t.len > 0) {
-            tools = try template_engine.readJson(arena, t, "tools", diag);
+            tools = try template_engine.readJson(arena, t, "tools", .input, diag);
             _ = try fillToolDefKeys(arena, tools.?);
         };
-        return .{ .messages = messages, .tools = tools, .extra = try template_engine.fromStruct(arena, self.settings.*) };
+        // The turn tokens are the pack's; the effort word is what the client sent, or a word derived from it.
+        const extra = try template_engine.fromStruct(arena, self.settings.*, .template);
+        for (extra.dict.entries.items) |*e| if (std.mem.eql(u8, e.key.str().?, "reasoning_effort")) {
+            if (e.value == .string) e.value.string.origin = .input;
+        };
+        return .{ .messages = messages, .tools = tools, .extra = extra };
     }
 };
 
@@ -1526,11 +1647,11 @@ fn fillToolDefKeys(arena: std.mem.Allocator, tools: template_engine.Value) error
         if (function != .dict) continue;
         const d = function.dict;
         if (dictField(d, "description") == null) {
-            try d.entries.append(arena, .{ .key = .{ .string = "description" }, .value = .{ .string = "" } });
+            try d.entries.append(arena, .{ .key = .plain("description"), .value = .plain("") });
             changed = true;
         }
         if (dictField(d, "parameters") == null) {
-            try d.entries.append(arena, .{ .key = .{ .string = "parameters" }, .value = try emptyParameters(arena) });
+            try d.entries.append(arena, .{ .key = .plain("parameters"), .value = try emptyParameters(arena) });
             changed = true;
         }
     }
@@ -1539,11 +1660,11 @@ fn fillToolDefKeys(arena: std.mem.Allocator, tools: template_engine.Value) error
 
 /// `{"type": "object", "properties": {}}`: what a no-argument tool means.
 fn emptyParameters(arena: std.mem.Allocator) error{OutOfMemory}!template_engine.Value {
-    return template_engine.fromStruct(arena, .{ .type = @as([]const u8, "object"), .properties = struct {}{} });
+    return template_engine.fromStruct(arena, .{ .type = @as([]const u8, "object"), .properties = struct {}{} }, .template);
 }
 
 fn dictField(d: *const template_engine.Dict, name: []const u8) ?template_engine.Value {
-    for (d.entries.items) |e| if (e.key == .string and std.mem.eql(u8, e.key.string, name)) return e.value;
+    for (d.entries.items) |e| if (e.key == .string and std.mem.eql(u8, e.key.string.bytes, name)) return e.value;
     return null;
 }
 
@@ -1665,59 +1786,6 @@ fn scaleEffort(text: []const u8) Settings.Effort {
     return .{ .budget = std.fmt.parseInt(i64, text, 10) catch unreachable };
 }
 
-/// Encode a rendered prompt: its own control tokens (turn markers, think tags) become ids, and
-/// the control-token text a sender put in a message (see `markLiteralControlText`) stays text.
-fn encodeWithSpecialTokens(
-    allocator: std.mem.Allocator,
-    tok: *const Tokenizer,
-    text: []const u8,
-    ids: *std.ArrayList(u32),
-) !void {
-    const segment_ids = try tok.encodeMarked(allocator, text);
-    defer allocator.free(segment_ids);
-    try ids.appendSlice(allocator, segment_ids);
-}
-
-/// Message text a client sends is data, so a `<think>` or `<|im_end|>` in a user, system or tool
-/// message must not become a control token the model reads as a real boundary. Assistant text is
-/// left alone: the template parses it (`</think>` split) and it is the model's own earlier output.
-pub fn markLiteralControlText(arena: std.mem.Allocator, tok: *const Tokenizer, messages: []const Message) ![]const Message {
-    var out: ?[]Message = null;
-    for (messages, 0..) |m, i| {
-        if (std.mem.eql(u8, m.role, "assistant")) continue;
-        const text = try tok.markLiteralSpecials(arena, m.content);
-        if (std.mem.eql(u8, text, m.content)) continue;
-        if (out == null) out = try arena.dupe(Message, messages);
-        out.?[i].content = text;
-        if (m.media_parts) |parts| {
-            const shifted = try arena.dupe(MediaPart, parts);
-            for (shifted) |*p| p.at = markedOffset(text, p.at);
-            out.?[i].media_parts = shifted;
-        }
-    }
-    return out orelse messages;
-}
-
-/// Where byte `raw_at` of the unmarked content sits in the marked text, just before any mark there.
-fn markedOffset(marked: []const u8, raw_at: usize) usize {
-    var k: usize = 0;
-    var raw: usize = 0;
-    while (k < marked.len and raw < raw_at) {
-        if (std.mem.startsWith(u8, marked[k..], tokenizer_mod.literal_mark)) {
-            k += tokenizer_mod.literal_mark.len;
-        } else {
-            k += 1;
-            raw += 1;
-        }
-    }
-    return k;
-}
-
-const SpecialEntry = struct {
-    text: []const u8,
-    id: u32,
-};
-
 /// What Qwen's template raises for a conversation with no user turn to answer (a system-only or assistant-only chat).
 const NO_USER_QUERY_RAISE = "No user query found in messages.";
 comptime {
@@ -1753,66 +1821,71 @@ fn fallbackFormatChat(
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
-) ![]const u8 {
-    var result = std.ArrayList(u8).empty;
+) !Spans {
+    var result: template_engine.Builder = .{};
     errdefer result.deinit(allocator);
+    const t = struct {
+        fn text(a: std.mem.Allocator, b: *template_engine.Builder, bytes: []const u8) !void {
+            try b.appendBytes(a, bytes, .template);
+        }
+    }.text;
 
     const has_system = messages.len > 0 and std.mem.eql(u8, messages[0].role, "system");
 
     if (tools_json != null and !has_system) {
-        try result.appendSlice(allocator, "<|im_start|>system\n");
-        try tool_calls_mod.appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
-        try result.appendSlice(allocator, "<|im_end|>\n");
+        try t(allocator, &result, "<|im_start|>system\n");
+        try appendToolPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
+        try t(allocator, &result, "<|im_end|>\n");
     }
 
     for (messages) |msg| {
         if (std.mem.eql(u8, msg.role, "system") and tools_json != null) {
-            try result.appendSlice(allocator, "<|im_start|>system\n");
-            try result.appendSlice(allocator, msg.content);
-            try result.appendSlice(allocator, "\n\n");
-            try tool_calls_mod.appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
-            try result.appendSlice(allocator, "<|im_end|>\n");
+            try t(allocator, &result, "<|im_start|>system\n");
+            try result.append(allocator, contentSpans(msg));
+            try t(allocator, &result, "\n\n");
+            try appendToolPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
+            try t(allocator, &result, "<|im_end|>\n");
         } else if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
-            try result.appendSlice(allocator, "<|im_start|>assistant\n");
+            try t(allocator, &result, "<|im_start|>assistant\n");
             if (msg.content.len > 0) {
-                try result.appendSlice(allocator, msg.content);
-                try result.appendSlice(allocator, "\n");
+                try result.append(allocator, contentSpans(msg));
+                try t(allocator, &result, "\n");
             }
             for (msg.tool_calls.?) |tc| {
-                try result.appendSlice(allocator, "<tool_call>\n");
-                try result.appendSlice(allocator, "{\"name\": \"");
-                try result.appendSlice(allocator, tc.name);
-                try result.appendSlice(allocator, "\", \"arguments\": ");
-                try result.appendSlice(allocator, tc.arguments);
-                try result.appendSlice(allocator, "}\n</tool_call>");
+                try t(allocator, &result, "<tool_call>\n");
+                try t(allocator, &result, "{\"name\": \"");
+                try result.appendBytes(allocator, tc.name, .assistant);
+                try t(allocator, &result, "\", \"arguments\": ");
+                try result.appendBytes(allocator, tc.arguments, .assistant);
+                try t(allocator, &result, "}\n</tool_call>");
             }
-            try result.appendSlice(allocator, "<|im_end|>\n");
+            try t(allocator, &result, "<|im_end|>\n");
         } else if (std.mem.eql(u8, msg.role, "tool")) {
-            try result.appendSlice(allocator, "<|im_start|>user\n");
-            try result.appendSlice(allocator, "<tool_response>\n");
-            try result.appendSlice(allocator, msg.content);
-            try result.appendSlice(allocator, "\n</tool_response>");
-            try result.appendSlice(allocator, "<|im_end|>\n");
+            try t(allocator, &result, "<|im_start|>user\n");
+            try t(allocator, &result, "<tool_response>\n");
+            try result.append(allocator, contentSpans(msg));
+            try t(allocator, &result, "\n</tool_response>");
+            try t(allocator, &result, "<|im_end|>\n");
         } else {
-            try result.appendSlice(allocator, "<|im_start|>");
-            try result.appendSlice(allocator, msg.role);
-            try result.appendSlice(allocator, "\n");
-            try result.appendSlice(allocator, msg.content);
-            try result.appendSlice(allocator, "<|im_end|>\n");
+            try t(allocator, &result, "<|im_start|>");
+            try result.appendBytes(allocator, msg.role, messageOrigin(msg.role));
+            try t(allocator, &result, "\n");
+            try result.append(allocator, contentSpans(msg));
+            try t(allocator, &result, "<|im_end|>\n");
         }
     }
-    try result.appendSlice(allocator, "<|im_start|>assistant\n");
+    try t(allocator, &result, "<|im_start|>assistant\n");
     var own: ?*Compiled = null;
     defer if (own) |c| c.deinit(allocator);
     if (asks.enableThinking((try templatesOf(allocator, chat_config, &own)).facts())) {
         if (enable_thinking) {
-            try result.appendSlice(allocator, "<think>\n");
+            try t(allocator, &result, "<think>\n");
         } else {
-            try result.appendSlice(allocator, "<think>\n\n</think>\n\n");
+            try t(allocator, &result, "<think>\n\n</think>\n\n");
         }
     }
 
-    return result.toOwnedSlice(allocator);
+    return ownBuilt(allocator, &result);
 }
 
 /// One UTF-8 sequence starting at `i`: `valid` = well-formed, else `end` is the maximal
@@ -1885,28 +1958,35 @@ const testing = std.testing;
 const arch_fx = @import("arch_fixtures_test.zig");
 
 test "collapseDoubledThinkTags collapses 2x → 1x" {
-    const out = try collapseDoubledThinkTags(testing.allocator, "<|Assistant|></think></think>Hi!");
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings("<|Assistant|></think>Hi!", out);
+    const out = try collapseDoubledThinkTags(testing.allocator, .{ .bytes = "<|Assistant|></think></think>Hi!" });
+    defer freeSpans(testing.allocator, out);
+    try testing.expectEqualStrings("<|Assistant|></think>Hi!", out.bytes);
 }
 
 test "collapseDoubledThinkTags collapses triple → 1x" {
-    const out = try collapseDoubledThinkTags(testing.allocator, "</think></think></think>X");
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings("</think>X", out);
+    const out = try collapseDoubledThinkTags(testing.allocator, .{ .bytes = "</think></think></think>X" });
+    defer freeSpans(testing.allocator, out);
+    try testing.expectEqualStrings("</think>X", out.bytes);
 }
 
 test "collapseDoubledThinkTags leaves single </think> unchanged" {
-    const out = try collapseDoubledThinkTags(testing.allocator, "<think>r</think>Hello");
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings("<think>r</think>Hello", out);
+    const out = try collapseDoubledThinkTags(testing.allocator, .{ .bytes = "<think>r</think>Hello" });
+    defer freeSpans(testing.allocator, out);
+    try testing.expectEqualStrings("<think>r</think>Hello", out.bytes);
 }
 
 test "collapseDoubledThinkTags handles multiple separated doublings" {
     const out = try collapseDoubledThinkTags(testing.allocator,
-        "A</think></think>B</think></think>C");
-    defer testing.allocator.free(out);
-    try testing.expectEqualStrings("A</think>B</think>C", out);
+        .{ .bytes = "A</think></think>B</think></think>C" });
+    defer freeSpans(testing.allocator, out);
+    try testing.expectEqualStrings("A</think>B</think>C", out.bytes);
+}
+
+test "collapseDoubledThinkTags: every kept byte keeps who wrote it" {
+    const out = try collapseDoubledThinkTags(testing.allocator, .{ .bytes = "a</think></think>b", .origin = .assistant, .runs = &.{ .{ .end = 9, .origin = .template }, .{ .end = 18, .origin = .assistant } } });
+    defer freeSpans(testing.allocator, out);
+    try testing.expectEqualStrings("a</think>b", out.bytes);
+    try testing.expectEqualSlices(template_engine.Run, &.{ .{ .end = 1, .origin = .template }, .{ .end = 10, .origin = .assistant } }, out.runs);
 }
 
 test "appendJsonString escapes special chars" {
@@ -2051,12 +2131,12 @@ test "renderChatTemplate: a tool with no description/parameters still renders (n
     var fill_arena = std.heap.ArenaAllocator.init(allocator);
     defer fill_arena.deinit();
     const fa = fill_arena.allocator();
-    try testing.expect(!try fillToolDefKeys(fa, try template_engine.fromJson(fa, complete)));
+    try testing.expect(!try fillToolDefKeys(fa, try template_engine.fromJson(fa, complete, .input)));
     // Only the missing keys are added, and only to the function that lacks them.
     const partial =
         \\[{"type":"function","function":{"name":"a","description":"d"}},{"type":"function","function":{"name":"b","description":"e","parameters":{"type":"object"}}}]
     ;
-    const filled = try template_engine.fromJson(fa, partial);
+    const filled = try template_engine.fromJson(fa, partial, .input);
     try testing.expect(try fillToolDefKeys(fa, filled));
     var text = std.ArrayList(u8).empty;
     try test_json.writeValue(fa, &text, filled);
@@ -2781,8 +2861,9 @@ test "fallbackFormatChat ChatML with tool calls and responses" {
     defer if (config.eos_token) |t| allocator.free(t);
 
     const tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"shell\"}}]";
-    const result = try fallbackFormatChat(allocator, &messages, &config, tools_json, null, false);
-    defer allocator.free(result);
+    const spans = try fallbackFormatChat(allocator, &messages, &config, tools_json, null, false);
+    defer freeSpans(allocator, spans);
+    const result = spans.bytes;
 
     // Should have <tool_call> block for assistant
     try testing.expect(std.mem.indexOf(u8, result, "<tool_call>") != null);
@@ -2808,8 +2889,9 @@ test "fallbackFormatChat ChatML tool response uses user role" {
     };
     defer if (config.eos_token) |t| allocator.free(t);
 
-    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
-    defer allocator.free(result);
+    const spans = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    defer freeSpans(allocator, spans);
+    const result = spans.bytes;
 
     // Tool responses in ChatML use <|im_start|>user role
     try testing.expect(std.mem.indexOf(u8, result, "<|im_start|>user\n<tool_response>") != null);
@@ -2834,8 +2916,9 @@ test "fallbackFormatChat ChatML assistant with empty content and tool_calls" {
     };
     defer if (config.eos_token) |t| allocator.free(t);
 
-    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
-    defer allocator.free(result);
+    const spans = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    defer freeSpans(allocator, spans);
+    const result = spans.bytes;
 
     // Empty content should not produce a blank line before <tool_call>
     try testing.expect(std.mem.indexOf(u8, result, "<|im_start|>assistant\n<tool_call>") != null);
@@ -2866,8 +2949,9 @@ test "fallbackFormatChat multi-round tool calling" {
     };
     defer if (config.eos_token) |t| allocator.free(t);
 
-    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
-    defer allocator.free(result);
+    const spans = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    defer freeSpans(allocator, spans);
+    const result = spans.bytes;
 
     // Should have two <tool_call> blocks
     var count: usize = 0;
@@ -3693,11 +3777,9 @@ const Replay = struct {
 
 pub fn replayTurn(a: std.mem.Allocator, tok: *const Tokenizer, cfg: *const ChatConfig, tools: ?[]const u8, thinking: bool, raw: []const u8) !Replay {
     const first = [_]Message{.{ .role = "user", .content = "q" }};
-    const p1_text = try renderChatTemplate(a, &first, cfg, tools, null, thinking, null, false);
-    defer a.free(p1_text);
-    const p1 = try tok.encodeMarked(a, p1_text);
+    const p1 = try formatChat(a, tok, &first, cfg, tools, null, thinking, null, false);
     defer a.free(p1);
-    const gen = try tok.encodeMarked(a, raw);
+    const gen = try tok.encode(a, raw);
     errdefer a.free(gen);
 
     const split = think_tags.splitThinkBlock(raw, true, thinking);
@@ -3721,9 +3803,7 @@ pub fn replayTurn(a: std.mem.Allocator, tok: *const Tokenizer, cfg: *const ChatC
     };
     const tail: Message = if (parsed != null) .{ .role = "tool", .content = "ok", .tool_call_id = "call_1" } else .{ .role = "user", .content = "next" };
     const second = [_]Message{ first[0], assistant, tail };
-    const p2_text = try renderChatTemplate(a, &second, cfg, tools, null, thinking, null, false);
-    defer a.free(p2_text);
-    const p2 = try tok.encodeMarked(a, p2_text);
+    const p2 = try formatChat(a, tok, &second, cfg, tools, null, thinking, null, false);
     defer a.free(p2);
 
     const keep = p1.len <= p2.len and std.mem.eql(u32, p1, p2[0..p1.len]);
@@ -3804,8 +3884,9 @@ test "chat: what the server asks of each served template is what searching its t
         try testing.expectEqual(has(text, "enable_thinking"), asks.enableThinking(f));
         // The reserved-token mask keeps a special the template may print: every added token of every served
         // tokenizer is kept exactly where the search found it.
-        for (added.value.object.values()) |list| for (list.array.items) |special| {
-            try testing.expectEqual(has(text, special.string), f.emits(special.string));
+        for (added.value.object.values()) |pack| for (pack.object.get("added").?.array.items) |row| {
+            const special = row.array.items[0].string;
+            try testing.expectEqual(has(text, special), f.emits(special));
         };
         try testing.expectEqual(has(text, "<|channel>"), asks.channels(f));
         try testing.expectEqualStrings(if (has(text, "<think")) "<think>" else "(none)", asks.thinkOpener(f) orelse "(none)");

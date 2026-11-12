@@ -8,6 +8,7 @@ const builtins = @import("builtins.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
+const Str = value.Str;
 const Expr = ast.Expr;
 const Node = ast.Node;
 pub const Failure = value.Failure;
@@ -91,7 +92,7 @@ const Flow = enum { normal, break_, continue_ };
 pub const Renderer = struct {
     arena: Allocator,
     limits: Limits,
-    out: *std.ArrayList(u8),
+    out: *value.Builder,
     /// The step budget: `limits.max_steps`, shared with the value walks.
     meter: value.Meter,
     /// The frame address where the render began; the stack grows down from it.
@@ -161,11 +162,11 @@ pub const Renderer = struct {
         return self.tick(bytes / 64 + 1);
     }
 
-    pub fn write(self: *Renderer, bytes: []const u8) Failure!void {
+    pub fn write(self: *Renderer, text: Str) Failure!void {
         @setRuntimeSafety(true);
-        try self.charge(bytes.len);
-        if (self.out.items.len + bytes.len > self.limits.max_string) return self.fail("the render builds more text than its limit", .{});
-        try self.out.appendSlice(self.arena, bytes);
+        try self.charge(text.bytes.len);
+        if (self.out.bytes.items.len + text.bytes.len > self.limits.max_string) return self.fail("the render builds more text than its limit", .{});
+        try self.out.append(self.arena, text);
     }
 
     pub fn newList(self: *Renderer, items: []const Value, kind: value.List.Kind) Failure!Value {
@@ -184,10 +185,17 @@ pub const Renderer = struct {
         return .{ .list = l };
     }
 
-    pub fn newString(self: *Renderer, bytes: []const u8) Failure!Value {
+    pub fn newString(self: *Renderer, text: Str) Failure!Value {
         @setRuntimeSafety(true);
-        try self.charge(bytes.len);
-        return .{ .string = bytes };
+        try self.charge(text.bytes.len);
+        return .{ .string = text };
+    }
+
+    /// Python `str(v)`, its bytes taking the strictest origin of the strings in `v`.
+    pub fn toText(self: *Renderer, v: Value) Failure!Str {
+        @setRuntimeSafety(true);
+        if (v.strOf()) |s| return s;
+        return .{ .bytes = try self.toStr(v), .origin = value.originIn(v, 0) };
     }
 
     /// Python `str(v)` as a new string.
@@ -236,14 +244,14 @@ pub const Renderer = struct {
     /// The body rendered into its own string.
     /// What `nodes` write, and how they ended: a `break` or `continue` leaves the enclosing loop's step, as in
     /// Python, where the captured text is then never assigned or written.
-    fn capture(self: *Renderer, nodes: []const Node, frame: *Frame) Failure!struct { []const u8, Flow } {
+    fn capture(self: *Renderer, nodes: []const Node, frame: *Frame) Failure!struct { Str, Flow } {
         @setRuntimeSafety(true);
-        var buf = std.ArrayList(u8).empty;
+        var buf: value.Builder = .{};
         const saved = self.out;
         self.out = &buf;
         defer self.out = saved;
         const flow = try self.renderBody(nodes, frame);
-        return .{ buf.items, flow };
+        return .{ buf.str(), flow };
     }
 
     fn exec(self: *Renderer, node: *const Node, frame: *Frame) Failure!Flow {
@@ -253,11 +261,8 @@ pub const Renderer = struct {
         self.pos = node.pos;
         try self.stackCheck();
         switch (node.kind) {
-            .data => |text| try self.write(text),
-            .output => |e| {
-                const v = try self.eval(e, frame);
-                if (v.str()) |s| try self.write(s) else try self.write(try self.toStr(v));
-            },
+            .data => |text| try self.write(.{ .bytes = text }),
+            .output => |e| try self.write(try self.toText(try self.eval(e, frame))),
             .if_ => |s| {
                 for (s.branches) |b| if (value.truthy(try self.eval(b.test_, frame))) return self.renderBody(b.body, frame);
                 return self.renderBody(s.else_, frame);
@@ -275,13 +280,13 @@ pub const Renderer = struct {
             .call_block => |s| {
                 const caller = try self.macroValue(s.caller, frame, true);
                 const v = try self.evalCall(s.call, frame, caller);
-                try self.write(try self.toStr(v));
+                try self.write(try self.toText(v));
             },
             .filter_block => |s| {
                 const text, const flow = try self.capture(s.body, frame);
                 if (flow != .normal) return flow;
                 const body: Value = .{ .string = text };
-                try self.write(try self.toStr(try self.evalFilter(s.filter, body, frame)));
+                try self.write(try self.toText(try self.evalFilter(s.filter, body, frame)));
             },
             .generation => |body| return self.renderBody(body, frame),
             .break_ => return .break_,
@@ -377,7 +382,7 @@ pub const Renderer = struct {
         @setRuntimeSafety(true);
         switch (v) {
             .dict => |d| try self.tick(d.entries.items.len),
-            .string, .markup => |s| try self.scan(s.len),
+            .string, .markup => |s| try self.scan(s.bytes.len),
             else => {},
         }
         return switch (v) {
@@ -394,8 +399,9 @@ pub const Renderer = struct {
             },
             .string, .markup => |s| blk: {
                 var chars = std.ArrayList(Value).empty;
-                var it = std.unicode.Utf8View.initUnchecked(s).iterator();
-                while (it.nextCodepointSlice()) |c| try chars.append(self.arena, .{ .string = c });
+                var it = std.unicode.Utf8View.initUnchecked(s.bytes).iterator();
+                var at: usize = 0;
+                while (it.nextCodepointSlice()) |c| : (at += c.len) try chars.append(self.arena, .{ .string = try s.slice(self.arena, at, at + c.len) });
                 break :blk chars.items;
             },
             else => self.fail("'{s}' object is not iterable", .{value.typeName(v)}),
@@ -414,7 +420,7 @@ pub const Renderer = struct {
             .attr => |a| {
                 const ns = lookup(frame, a.namespace) orelse return self.fail("'{s}' is undefined", .{a.namespace});
                 if (ns != .namespace) return self.fail("cannot assign attribute on non-namespace object", .{});
-                try ns.namespace.put(&self.meter, self.arena, .{ .string = a.name }, v);
+                try ns.namespace.put(&self.meter, self.arena, .plain(a.name), v);
             },
         }
     }
@@ -439,7 +445,7 @@ pub const Renderer = struct {
             .int => |i| .{ .int = i },
             .bigint => |t| .{ .bigint = t },
             .float => |f| .{ .float = f },
-            .string => |s| .{ .string = s },
+            .string => |s| .plain(s),
             .name => |n| lookup(frame, n) orelse if (std.meta.stringToEnum(value.Global, n)) |g|
                 try self.function(.{ .global = g })
             else
@@ -490,15 +496,15 @@ pub const Renderer = struct {
                 break :blk if (value.truthy(l)) l else try self.eval(b.right, frame);
             },
             .concat => |parts| blk: {
-                var buf = std.ArrayList(u8).empty;
+                var buf: value.Builder = .{};
                 for (parts) |p| {
                     const v = try self.eval(p, frame);
-                    const s = try self.toStr(v);
-                    try self.scan(s.len);
-                    try self.charge(buf.items.len + s.len);
-                    try buf.appendSlice(self.arena, s);
+                    const s = try self.toText(v);
+                    try self.scan(s.bytes.len);
+                    try self.charge(buf.bytes.items.len + s.bytes.len);
+                    try buf.append(self.arena, s);
                 }
-                break :blk .{ .string = buf.items };
+                break :blk .{ .string = buf.str() };
             },
             .compare => |c| try self.evalCompare(c, frame),
             .cond => |c| if (value.truthy(try self.eval(c.test_, frame)))
@@ -621,7 +627,7 @@ pub const Renderer = struct {
             } else if (std.mem.eql(u8, kw.name, "caller") and !m.is_caller and reads.caller) {
                 try scope.vars.put(self.arena, "caller", kw.value);
             } else if (reads.kwargs) {
-                try extra.put(&self.meter, self.arena, .{ .string = kw.name }, kw.value);
+                try extra.put(&self.meter, self.arena, .plain(kw.name), kw.value);
             } else if (std.mem.eql(u8, kw.name, "caller") and !m.is_caller) {
                 return self.fail("macro '{s}' was invoked with two values for the special caller argument", .{node.name});
             } else return self.fail("macro '{s}' takes no keyword argument '{s}'", .{ node.name, kw.name });
@@ -673,10 +679,12 @@ pub const Renderer = struct {
                 return if (wrapIndex(i, l.items.items.len)) |at| l.items.items[at] else .{ .undefined = "" };
             },
             .string, .markup => |s| if (indexOf(key)) |i| {
-                try self.scan(s.len);
-                const n = cpCount(s);
+                try self.scan(s.bytes.len);
+                const n = cpCount(s.bytes);
                 const at = wrapIndex(i, n) orelse return .{ .undefined = "" };
-                return .{ .string = cpSlice(s, at, at + 1) };
+                const c = cpSlice(s.bytes, at, at + 1);
+                const from = @intFromPtr(c.ptr) - @intFromPtr(s.bytes.ptr);
+                return .{ .string = try s.slice(self.arena, from, from + c.len) };
             },
             .dict => |d| if (try d.get(&self.meter, key)) |v| return v,
             else => {},
@@ -742,16 +750,16 @@ pub const Renderer = struct {
                 return sliced;
             },
             .string, .markup => |str| {
-                try self.scan(str.len);
+                try self.scan(str.bytes.len);
                 var bounds = std.ArrayList(usize).empty;
-                var it = std.unicode.Utf8View.initUnchecked(str).iterator();
+                var it = std.unicode.Utf8View.initUnchecked(str.bytes).iterator();
                 var at: usize = 0;
                 while (it.nextCodepointSlice()) |c| : (at += c.len) try bounds.append(self.arena, at);
-                try bounds.append(self.arena, str.len);
+                try bounds.append(self.arena, str.bytes.len);
                 const picks = try sliceIndices(self.arena, bounds.items.len - 1, start, stop, stride);
-                var buf = std.ArrayList(u8).empty;
-                for (picks) |i| try buf.appendSlice(self.arena, str[bounds.items[i]..bounds.items[i + 1]]);
-                return if (obj == .markup) .{ .markup = buf.items } else .{ .string = buf.items };
+                var buf: value.Builder = .{};
+                for (picks) |i| try buf.appendPart(self.arena, str, bounds.items[i], bounds.items[i + 1]);
+                return if (obj == .markup) .{ .markup = buf.str() } else .{ .string = buf.str() };
             },
             else => unreachable,
         }

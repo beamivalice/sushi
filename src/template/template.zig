@@ -7,6 +7,10 @@ const value = @import("value.zig");
 const render = @import("render.zig");
 pub const ast = @import("ast.zig");
 pub const Value = value.Value;
+pub const Origin = value.Origin;
+pub const Run = value.Run;
+pub const Str = value.Str;
+pub const Builder = value.Builder;
 pub const fromStruct = value.fromStruct;
 pub const fromJson = value.fromJson;
 pub const JsonError = value.JsonError;
@@ -99,6 +103,12 @@ pub const Template = struct {
     /// The rendered prompt, allocated in `arena` as `renderJson` allocates it.
     pub fn render(self: *const Template, arena: std.mem.Allocator, in: Inputs, diag: *Diagnostic) Error![]const u8 {
         @setRuntimeSafety(true);
+        return (try self.renderSpans(arena, in, diag)).bytes;
+    }
+
+    /// The rendered prompt with the origin of each byte: the template's own text, or the context's string it came from.
+    pub fn renderSpans(self: *const Template, arena: std.mem.Allocator, in: Inputs, diag: *Diagnostic) Error!Str {
+        @setRuntimeSafety(true);
         return renderTree(arena, .{ .src = self.src, .body = self.body }, in, diag, null);
     }
 };
@@ -124,7 +134,8 @@ pub const Context = struct {
     build: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, diag: *Diagnostic) Error!Vars,
 };
 
-/// A context read from JSON text, as Python's `json.loads` reads it (the oracle's form).
+/// A context read from JSON text, as Python's `json.loads` reads it (the oracle's form): the messages and tools are
+/// input, the extra context the template's.
 pub const JsonContext = struct {
     messages: []const u8,
     /// Null or empty: the context has no `tools`.
@@ -140,8 +151,8 @@ pub const JsonContext = struct {
     fn build(ptr: *const anyopaque, arena: std.mem.Allocator, diag: *Diagnostic) Error!Vars {
         @setRuntimeSafety(true);
         const self: *const JsonContext = @ptrCast(@alignCast(ptr));
-        const tools: ?Value = if (self.tools) |t| if (t.len > 0) try readJson(arena, t, "tools", diag) else null else null;
-        return .{ .messages = try readJson(arena, self.messages, "messages", diag), .tools = tools, .extra = try readJson(arena, self.extra, "extra context", diag) };
+        const tools: ?Value = if (self.tools) |t| if (t.len > 0) try readJson(arena, t, "tools", .input, diag) else null else null;
+        return .{ .messages = try readJson(arena, self.messages, "messages", .input, diag), .tools = tools, .extra = try readJson(arena, self.extra, "extra context", .template, diag) };
     }
 };
 
@@ -177,12 +188,12 @@ pub const max_template_len = 4 << 20;
 pub fn renderJson(arena: std.mem.Allocator, in: Input, diag: *Diagnostic) Error![]const u8 {
     @setRuntimeSafety(true);
     const json = JsonContext{ .messages = in.messages_json, .tools = in.tools_json, .extra = in.extra_json };
-    return renderTree(arena, null, .{
+    return (try renderTree(arena, null, .{
         .context = json.context(),
         .add_generation_prompt = in.add_generation_prompt,
         .limits = in.limits,
         .usage = in.usage,
-    }, diag, in.template);
+    }, diag, in.template)).bytes;
 }
 
 const Tree = struct { src: []const u8, body: []const ast.Node };
@@ -211,7 +222,7 @@ fn parseTemplate(arena: std.mem.Allocator, source: []const u8, diag: *Diagnostic
 }
 
 /// Renders `tree`, or with `source` set, parses it first inside the same memory budget.
-fn renderTree(arena: std.mem.Allocator, tree: ?Tree, in: Inputs, diag: *Diagnostic, source: ?[]const u8) Error![]const u8 {
+fn renderTree(arena: std.mem.Allocator, tree: ?Tree, in: Inputs, diag: *Diagnostic, source: ?[]const u8) Error!Str {
     @setRuntimeSafety(true);
     var budget = render.Budget{ .child = arena, .limit = in.limits.max_memory };
     defer if (in.usage) |u| {
@@ -224,7 +235,7 @@ fn renderTree(arena: std.mem.Allocator, tree: ?Tree, in: Inputs, diag: *Diagnost
     };
 }
 
-fn renderBudgeted(arena: std.mem.Allocator, given: ?Tree, in: Inputs, diag: *Diagnostic, source: ?[]const u8) Error![]const u8 {
+fn renderBudgeted(arena: std.mem.Allocator, given: ?Tree, in: Inputs, diag: *Diagnostic, source: ?[]const u8) Error!Str {
     @setRuntimeSafety(true);
     const tree = given orelse try parseTemplate(arena, source.?, diag);
     const src = tree.src;
@@ -239,13 +250,13 @@ fn renderBudgeted(arena: std.mem.Allocator, given: ?Tree, in: Inputs, diag: *Dia
         diag.set("", null, "the extra context is not a JSON object");
         return error.TemplateRuntime;
     }
-    for (vars.extra.dict.entries.items) |e| try globals.vars.put(arena, e.key.string, e.value);
+    for (vars.extra.dict.entries.items) |e| try globals.vars.put(arena, e.key.string.bytes, e.value);
 
-    var out = std.ArrayList(u8).empty;
+    var out: value.Builder = .{};
     var r = render.Renderer{ .arena = arena, .limits = in.limits, .out = &out, .meter = .{ .max = in.limits.max_steps }, .stack_base = @frameAddress() };
     defer if (in.usage) |u| {
         u.steps = r.meter.used;
-        u.largest_string = @max(r.largest_string, out.items.len);
+        u.largest_string = @max(r.largest_string, out.bytes.items.len);
     };
     var frame = render.Frame{ .parent = &globals };
     _ = r.renderBody(body, &frame) catch |e| {
@@ -256,13 +267,13 @@ fn renderBudgeted(arena: std.mem.Allocator, given: ?Tree, in: Inputs, diag: *Dia
         }
         return e;
     };
-    return out.items;
+    return out.str();
 }
 
 /// `text` read as `json.loads` reads it, or a failure naming `what` in `diag` (not JSON, or nested too deep).
-pub fn readJson(arena: std.mem.Allocator, text: []const u8, comptime what: []const u8, diag: *Diagnostic) Error!value.Value {
+pub fn readJson(arena: std.mem.Allocator, text: []const u8, comptime what: []const u8, origin: Origin, diag: *Diagnostic) Error!value.Value {
     @setRuntimeSafety(true);
-    return value.fromJson(arena, text) catch |e| switch (e) {
+    return value.fromJson(arena, text, origin) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidJson => {
             diag.set("", null, "the " ++ what ++ " are not valid JSON");
@@ -773,4 +784,137 @@ test "template: a sort whose keys hold a NaN fails by name, whatever its length"
     try testing.expectError(error.TemplateRuntime, renderForTest(arena.allocator(), "{{ xs|map('float')|sort|length }}", "[]", xs.items, .{}, &diag));
     try testing.expectEqualStrings("sort: a NaN cannot be ordered", diag.message());
     try testing.expectError(error.TemplateRuntime, renderForTest(arena.allocator(), "{{ {1.5: 1, (1e308 * 10 - 1e308 * 10): 2}|tojson(sort_keys=true) }}", "[]", "{}", .{}, &diag));
+}
+
+/// Each byte of `s` as 't', 'a' or 'i': the template's, an assistant message's, or other input's.
+fn originMask(arena: std.mem.Allocator, s: Str) ![]u8 {
+    @setRuntimeSafety(true);
+    const mask = try arena.alloc(u8, s.bytes.len);
+    const letter = struct {
+        fn of(o: Origin) u8 {
+            @setRuntimeSafety(true);
+            return switch (o) {
+                .template => 't',
+                .assistant => 'a',
+                .input => 'i',
+            };
+        }
+    }.of;
+    if (s.runs.len == 0) {
+        @memset(mask, letter(s.origin));
+        return mask;
+    }
+    var start: usize = 0;
+    for (s.runs) |run| {
+        @memset(mask[start..run.end], letter(run.origin));
+        start = run.end;
+    }
+    try testing.expectEqual(s.bytes.len, start);
+    return mask;
+}
+
+test "template: every string builtin keeps each byte's origin, the template's and the input's, where it lands" {
+    // Expected text with the input's bytes between « and »; the message's content is `c`, its strings input.
+    const Case = struct { tpl: []const u8, c: []const u8 = "xy", want: []const u8, covers: []const []const u8 = &.{} };
+    const cases = [_]Case{
+        .{ .tpl = "{{ c }}", .want = "«xy»", .covers = &.{"output"} },
+        .{ .tpl = "<{{ c }}>", .want = "<«xy»>" },
+        .{ .tpl = "{{ '<' ~ c ~ '>' }}", .want = "<«xy»>", .covers = &.{"~"} },
+        .{ .tpl = "{{ '<' + c + '>' }}", .want = "<«xy»>", .covers = &.{"+"} },
+        .{ .tpl = "{{ c * 2 }}", .want = "«xyxy»", .covers = &.{"*"} },
+        .{ .tpl = "{{ '<%s>' % c }}", .want = "<«xy»>", .covers = &.{"%"} },
+        .{ .tpl = "{{ '<%s>'|format(c) }}", .want = "<«xy»>", .covers = &.{"format"} },
+        .{ .tpl = "{% macro m(x) %}<{{ x }}>{% endmacro %}{{ m(c) }}", .want = "<«xy»>", .covers = &.{"macro"} },
+        .{ .tpl = "{% set s %}<{{ c }}>{% endset %}{{ s }}", .want = "<«xy»>", .covers = &.{"set block"} },
+        .{ .tpl = "{% filter upper %}<{{ c }}>{% endfilter %}", .want = "<«XY»>", .covers = &.{ "filter block", "upper" } },
+        .{ .tpl = "{% macro w() %}<{{ caller() }}>{% endmacro %}{% call w() %}{{ c }}{% endcall %}", .want = "<«xy»>", .covers = &.{"call block"} },
+        .{ .tpl = "{{ c[1:3] }}-{{ c[0] }}", .c = "wxyz", .want = "«xy»-«w»", .covers = &.{ "slice", "index" } },
+        .{ .tpl = "{% for ch in c %}{{ ch }}.{% endfor %}", .want = "«x».«y».", .covers = &.{"iteration"} },
+        .{ .tpl = "{{ c|trim }}-{{ c|strip }}-{{ c.strip() }}", .c = " xy ", .want = "«xy»-«xy»-«xy»", .covers = &.{ "trim", "strip", "str.strip" } },
+        .{ .tpl = "-{{ c.lstrip() }}-{{ c.rstrip() }}-", .c = " xy ", .want = "-«xy »-« xy»-", .covers = &.{ "str.lstrip", "str.rstrip" } },
+        .{ .tpl = "{{ c.split(',')|join('-') }}", .c = "x,y", .want = "«x»-«y»", .covers = &.{ "str.split", "join" } },
+        .{ .tpl = "{{ c.rsplit(',')[0] }}-{{ c.split()[1] }}", .c = "x y,z", .want = "«x y»-«y,z»", .covers = &.{"str.rsplit"} },
+        .{ .tpl = "{{ c|upper }}-{{ c.upper() }}", .want = "«XY»-«XY»", .covers = &.{"str.upper"} },
+        .{ .tpl = "{{ c|lower }}-{{ c.lower() }}", .c = "Xy", .want = "«xy»-«xy»", .covers = &.{ "lower", "str.lower" } },
+        .{ .tpl = "{{ c|title }}-{{ c.title() }}", .c = "xy z", .want = "«Xy Z»-«Xy Z»", .covers = &.{ "title", "str.title" } },
+        .{ .tpl = "{{ c|capitalize }}-{{ c.capitalize() }}", .c = "xy z", .want = "«Xy z»-«Xy z»", .covers = &.{ "capitalize", "str.capitalize" } },
+        .{ .tpl = "{{ c|replace('y', '-') }}+{{ c.replace('y', '-') }}", .c = "xyx", .want = "«x»-«x»+«x»-«x»", .covers = &.{ "replace", "str.replace" } },
+        .{ .tpl = "{{ '1y1'|replace('y', c) }}-{{ '1y1'.replace('y', c) }}", .want = "1«xy»1-1«xy»1" },
+        .{ .tpl = "{{ c|replace('', '-') }}", .want = "-«x»-«y»-" },
+        .{ .tpl = "{{ [c, c]|join('-') }}+{{ ['1', '2']|join(c) }}", .want = "«xy»-«xy»+1«xy»2" },
+        .{ .tpl = "{{ c|truncate(5, true, '..', 0) }}", .c = "abcdefgh", .want = "«abc»..", .covers = &.{"truncate"} },
+        .{ .tpl = "{{ 'abcdefgh'|truncate(5, true, c, 0) }}", .want = "abc«xy»" },
+        .{ .tpl = "{{ c|first }}{{ c|last }}", .want = "«xy»", .covers = &.{ "first", "last" } },
+        .{ .tpl = "{{ c|reverse }}", .want = "«yx»", .covers = &.{"reverse"} },
+        .{ .tpl = "{{ c|string }}{{ c|safe }}{{ c|default('-') }}{{ d|default('-') }}", .want = "«xyxyxy»-", .covers = &.{ "string", "safe", "default" } },
+        .{ .tpl = "{{ c|indent(2) }}+{{ c.indent(2) }}", .c = "x\ny", .want = "«x\n  y»+«x\n  y»", .covers = &.{ "indent", "str.indent" } },
+        .{ .tpl = "{{ c|tojson }}", .want = "«\"xy\"»", .covers = &.{"tojson"} },
+        .{ .tpl = "{{ messages[0] }}", .want = "«{'role': 'user', 'content': 'xy'}»", .covers = &.{"repr"} },
+        .{ .tpl = "{{ [c]|map('upper')|first }}", .want = "«XY»", .covers = &.{"map"} },
+        .{ .tpl = "{% for k in messages[0] %}{{ k }}.{% endfor %}", .want = "«role».«content».", .covers = &.{"dict keys"} },
+    };
+    // Builtins that make no new string: they return an item they were given, a number, a bool, or a list.
+    const no_string = [_][]const u8{
+        "abs",          "float",        "int",        "items",      "length",     "list",      "sum",       "wordcount",
+        "select",       "reject",       "selectattr", "rejectattr", "sort",       "unique",    "max",       "min",
+        "str.startswith", "str.endswith", "str.get", "str.keys",  "str.values", "str.items", "str.append",
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (cases) |c| {
+        var text = std.ArrayList(u8).empty;
+        var mask = std.ArrayList(u8).empty;
+        var in_input = false;
+        var i: usize = 0;
+        while (i < c.want.len) {
+            if (std.mem.startsWith(u8, c.want[i..], "«") or std.mem.startsWith(u8, c.want[i..], "»")) {
+                in_input = std.mem.startsWith(u8, c.want[i..], "«");
+                i += "«".len;
+                continue;
+            }
+            try text.append(arena, c.want[i]);
+            try mask.append(arena, if (in_input) 'i' else 't');
+            i += 1;
+        }
+        const source = try std.mem.concat(arena, u8, &.{ "{%- set c = messages[0].content -%}", c.tpl });
+        var diag = Diagnostic{};
+        var compiled = try Template.compile(testing.allocator, source, &diag);
+        defer compiled.deinit();
+        const messages = try std.fmt.allocPrint(arena, "[{{\"role\": \"user\", \"content\": {f}}}]", .{std.json.fmt(c.c, .{})});
+        const json = JsonContext{ .messages = messages, .extra = "{}" };
+        const got = try compiled.renderSpans(arena, .{ .context = json.context(), .add_generation_prompt = false }, &diag);
+        testing.expectEqualStrings(text.items, got.bytes) catch |e| {
+            std.debug.print("case {s}\n", .{c.tpl});
+            return e;
+        };
+        testing.expectEqualStrings(mask.items, try originMask(arena, got)) catch |e| {
+            std.debug.print("case {s}\n", .{c.tpl});
+            return e;
+        };
+    }
+    // A string builtin added later gets a case here.
+    const covered = struct {
+        fn has(list: []const Case, extra: []const []const u8, name: []const u8) bool {
+            @setRuntimeSafety(true);
+            for (extra) |n| if (std.mem.eql(u8, n, name)) return true;
+            for (list) |c| for (c.covers) |n| if (std.mem.eql(u8, n, name)) return true;
+            return false;
+        }
+    }.has;
+    inline for (@typeInfo(@import("builtins.zig").Filter).@"enum".field_names) |name| try testing.expect(covered(&cases, &no_string, name));
+    inline for (@typeInfo(value.Method).@"enum".field_names) |name| try testing.expect(covered(&cases, &no_string, "str." ++ name));
+}
+
+test "template: strftime_now keeps the origin of the format it was handed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag = Diagnostic{};
+    var compiled = try Template.compile(testing.allocator, "{{ strftime_now(messages[0].content) }}", &diag);
+    defer compiled.deinit();
+    const json = JsonContext{ .messages = "[{\"role\": \"user\", \"content\": \"<x>\"}]", .extra = "{}" };
+    const got = try compiled.renderSpans(arena, .{ .context = json.context(), .add_generation_prompt = false }, &diag);
+    try testing.expectEqualStrings("<x>", got.bytes);
+    try testing.expectEqualStrings("iii", try originMask(arena, got));
 }

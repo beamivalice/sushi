@@ -491,7 +491,10 @@ pub fn armCallForce(
     }
     const sep_ids: []u32 = if (text.sep.len == 0) &.{} else tok.encode(allocator, text.sep) catch return null;
     defer if (sep_ids.len > 0) allocator.free(sep_ids);
-    const call_ids = tok.encode(allocator, text.call) catch return null;
+    const call_ids = (if (name) |n|
+        chat_mod.encodeCallText(allocator, tok, text.call[0 .. text.call.len - n.len - text.name_tail.len], n, text.name_tail)
+    else
+        tok.encode(allocator, text.call)) catch return null;
     defer allocator.free(call_ids);
     const forced = std.mem.concat(allocator, u32, &.{ sep_ids, call_ids }) catch return null;
     const choice_buf = allocator.alloc(u32, names.slices.len) catch {
@@ -536,8 +539,7 @@ fn nameIds(allocator: std.mem.Allocator, tok: *const Tokenizer, tools_json: []co
     const per_name = try arena.alloc([]u32, declared.len);
     var total: usize = 0;
     for (declared, per_name) |n, *ids| {
-        const text = try std.mem.concat(arena, u8, &.{ n, tail });
-        const encoded = try tok.encode(allocator, text);
+        const encoded = try chat_mod.encodeCallText(allocator, tok, "", n, tail);
         defer allocator.free(encoded);
         ids.* = try arena.dupe(u32, encoded);
         total += ids.len;

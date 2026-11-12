@@ -28,6 +28,118 @@ pub const Meter = struct {
     }
 };
 
+/// Who wrote a string's bytes, from least to most guarded: the template's own text, an assistant message (the model's
+/// earlier output), any other text a request brings. The tokenizer reads a special token's text as that token only
+/// where its bytes' origin allows (`Tokenizer.encodeSpans`).
+pub const Origin = enum(u8) {
+    template,
+    assistant,
+    input,
+
+    pub fn strictest(a: Origin, b: Origin) Origin {
+        @setRuntimeSafety(true);
+        return @enumFromInt(@max(@intFromEnum(a), @intFromEnum(b)));
+    }
+};
+
+/// The bytes from the previous run's end up to `end` are `origin`'s.
+pub const Run = struct { end: usize, origin: Origin };
+
+/// A string's bytes and who wrote them: every byte `origin`'s when `runs` is empty, else the runs in order, the last
+/// ending at `bytes.len`, and `origin` the strictest of them.
+pub const Str = struct {
+    bytes: []const u8,
+    origin: Origin = .template,
+    runs: []const Run = &.{},
+
+    /// Bytes `a..b`, each keeping its origin.
+    pub fn slice(self: Str, arena: Allocator, a: usize, b: usize) error{OutOfMemory}!Str {
+        @setRuntimeSafety(true);
+        if (self.runs.len == 0) return .{ .bytes = self.bytes[a..b], .origin = self.origin };
+        var out: Builder = .{};
+        try out.appendPart(arena, self, a, b);
+        return out.str();
+    }
+
+    /// `bytes`, a map of these bytes one for one (ASCII case), keeping each byte's origin.
+    pub fn remap(self: Str, bytes: []const u8) Str {
+        @setRuntimeSafety(true);
+        std.debug.assert(bytes.len == self.bytes.len);
+        return .{ .bytes = bytes, .origin = self.origin, .runs = self.runs };
+    }
+
+    /// `bytes` made from these by a change with no byte-for-byte map: every byte takes their strictest origin.
+    pub fn derive(self: Str, bytes: []const u8) Str {
+        @setRuntimeSafety(true);
+        return .{ .bytes = bytes, .origin = self.origin };
+    }
+};
+
+/// Builds a string piece by piece, each piece keeping its origins.
+pub const Builder = struct {
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+    runs: std.ArrayListUnmanaged(Run) = .empty,
+
+    pub fn append(self: *Builder, gpa: Allocator, piece: Str) error{OutOfMemory}!void {
+        @setRuntimeSafety(true);
+        return self.appendPart(gpa, piece, 0, piece.bytes.len);
+    }
+
+    /// Bytes `a..b` of `piece`.
+    pub fn appendPart(self: *Builder, gpa: Allocator, piece: Str, a: usize, b: usize) error{OutOfMemory}!void {
+        @setRuntimeSafety(true);
+        if (a >= b) return;
+        try self.bytes.appendSlice(gpa, piece.bytes[a..b]);
+        if (piece.runs.len == 0) return self.mark(gpa, piece.origin);
+        const base = self.bytes.items.len - (b - a);
+        var start: usize = 0;
+        for (piece.runs) |run| {
+            if (run.end > a and start < b) try self.markTo(gpa, base + @min(run.end, b) - a, run.origin);
+            start = run.end;
+            if (start >= b) break;
+        }
+    }
+
+    pub fn appendBytes(self: *Builder, gpa: Allocator, bytes: []const u8, origin: Origin) error{OutOfMemory}!void {
+        @setRuntimeSafety(true);
+        if (bytes.len == 0) return;
+        try self.bytes.appendSlice(gpa, bytes);
+        try self.mark(gpa, origin);
+    }
+
+    /// The bytes not yet in a run are `origin`'s.
+    fn mark(self: *Builder, gpa: Allocator, origin: Origin) error{OutOfMemory}!void {
+        @setRuntimeSafety(true);
+        return self.markTo(gpa, self.bytes.items.len, origin);
+    }
+
+    fn markTo(self: *Builder, gpa: Allocator, end: usize, origin: Origin) error{OutOfMemory}!void {
+        @setRuntimeSafety(true);
+        const runs = self.runs.items;
+        if (runs.len > 0 and runs[runs.len - 1].origin == origin) {
+            runs[runs.len - 1].end = end;
+            return;
+        }
+        try self.runs.append(gpa, .{ .end = end, .origin = origin });
+    }
+
+    pub fn deinit(self: *Builder, gpa: Allocator) void {
+        @setRuntimeSafety(true);
+        self.bytes.deinit(gpa);
+        self.runs.deinit(gpa);
+    }
+
+    /// What was built; it references the builder's memory.
+    pub fn str(self: *const Builder) Str {
+        @setRuntimeSafety(true);
+        const runs = self.runs.items;
+        if (runs.len <= 1) return .{ .bytes = self.bytes.items, .origin = if (runs.len == 1) runs[0].origin else .template };
+        var o: Origin = .template;
+        for (runs) |run| o = o.strictest(run.origin);
+        return .{ .bytes = self.bytes.items, .origin = o, .runs = runs };
+    }
+};
+
 pub const Value = union(enum) {
     /// Jinja2's `Undefined`; the name looked up, for the message when it is used.
     undefined: []const u8,
@@ -37,9 +149,9 @@ pub const Value = union(enum) {
     /// An integer outside i64, as decimal text: printed exactly, never computed with.
     bigint: []const u8,
     float: f64,
-    string: []const u8,
+    string: Str,
     /// Jinja2's `Markup` (the `safe` filter's result): a string that escapes what is added to it.
-    markup: []const u8,
+    markup: Str,
     list: *List,
     dict: *Dict,
     namespace: *Dict,
@@ -47,7 +159,22 @@ pub const Value = union(enum) {
     function: *const Function,
     loop: *const Loop,
 
+    /// The template's own text as a string.
+    pub fn plain(bytes: []const u8) Value {
+        @setRuntimeSafety(true);
+        return .{ .string = .{ .bytes = bytes } };
+    }
+
     pub fn str(self: Value) ?[]const u8 {
+        @setRuntimeSafety(true);
+        return switch (self) {
+            .string, .markup => |s| s.bytes,
+            else => null,
+        };
+    }
+
+    /// A string's bytes with their origins.
+    pub fn strOf(self: Value) ?Str {
         @setRuntimeSafety(true);
         return switch (self) {
             .string, .markup => |s| s,
@@ -238,7 +365,7 @@ pub fn eql(m: *Meter, a: Value, b: Value, depth: usize) Failure!bool {
         };
     }
     switch (a) {
-        .string, .markup => |s| return if (b.str()) |t| strEql(m, s, t) else false,
+        .string, .markup => |s| return if (b.str()) |t| strEql(m, s.bytes, t) else false,
         .none => return b == .none,
         .undefined => return b == .undefined,
         .list => |l| {
@@ -540,7 +667,7 @@ pub fn truthy(v: Value) bool {
         .int => |i| i != 0,
         .bigint => true,
         .float => |f| f != 0,
-        .string, .markup => |s| s.len > 0,
+        .string, .markup => |s| s.bytes.len > 0,
         .list => |l| l.isIterator() or l.items.items.len > 0,
         .dict => |d| d.entries.items.len > 0,
         .namespace, .macro, .function, .loop => true,
@@ -603,12 +730,30 @@ pub fn unprintable(v: Value, depth: usize) ?[]const u8 {
     return null;
 }
 
+/// The strictest origin of a string in `v`, keys included: what text printed from it takes.
+pub fn originIn(v: Value, depth: usize) Origin {
+    @setRuntimeSafety(true);
+    if (depth > max_depth) return .input;
+    var o: Origin = .template;
+    switch (v) {
+        .string, .markup => |s| return s.origin,
+        .list => |l| for (l.items.items) |x| {
+            o = o.strictest(originIn(x, depth + 1));
+        },
+        .dict, .namespace => |d| for (d.entries.items) |e| {
+            o = o.strictest(originIn(e.key, depth + 1)).strictest(originIn(e.value, depth + 1));
+        },
+        else => {},
+    }
+    return o;
+}
+
 /// Python `str(v)`, as `{{ v }}` prints it (an undefined value prints nothing).
 pub fn writeStr(m: *Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, depth: usize) Failure!void {
     @setRuntimeSafety(true);
     switch (v) {
         .undefined => {},
-        .string, .markup => |s| try w.appendSlice(gpa, s),
+        .string, .markup => |s| try w.appendSlice(gpa, s.bytes),
         else => try writeRepr(m, w, gpa, v, depth),
     }
 }
@@ -625,10 +770,10 @@ pub fn writeRepr(m: *Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, dep
         .int => |i| try w.print(gpa, "{d}", .{i}),
         .bigint => |t| try w.appendSlice(gpa, t),
         .float => |f| try pyfloat.writeFloatRepr(w, gpa, f),
-        .string => |s| try writeStrRepr(w, gpa, s),
+        .string => |s| try writeStrRepr(w, gpa, s.bytes),
         .markup => |s| {
             try w.appendSlice(gpa, "Markup(");
-            try writeStrRepr(w, gpa, s);
+            try writeStrRepr(w, gpa, s.bytes);
             try w.append(gpa, ')');
         },
         .list => |l| {
@@ -741,19 +886,19 @@ pub fn isSpace(cp: u21) bool {
 
 /// The value `json.loads` reads from `text`: key order kept, a repeated key's last value at its first place, a
 /// number with a fraction or exponent a float, any other an exact integer.
-pub fn fromJson(arena: Allocator, text: []const u8) JsonError!Value {
+pub fn fromJson(arena: Allocator, text: []const u8, origin: Origin) JsonError!Value {
     @setRuntimeSafety(true);
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{
         .duplicate_field_behavior = .use_last,
         .parse_numbers = false,
     }) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidJson;
-    return convert(arena, parsed, 0);
+    return convert(arena, parsed, origin, 0);
 }
 
 /// Why JSON input was refused: not JSON, or nested past `max_depth`.
 pub const JsonError = error{ OutOfMemory, InvalidJson, TooDeep };
 
-fn convert(arena: Allocator, j: std.json.Value, depth: usize) JsonError!Value {
+fn convert(arena: Allocator, j: std.json.Value, origin: Origin, depth: usize) JsonError!Value {
     @setRuntimeSafety(true);
     noteStack();
     if (depth > max_depth) return error.TooDeep;
@@ -763,12 +908,12 @@ fn convert(arena: Allocator, j: std.json.Value, depth: usize) JsonError!Value {
         .integer => |i| .{ .int = i },
         .float => |f| .{ .float = f },
         .number_string => |n| try number(n),
-        .string => |s| .{ .string = s },
+        .string => |s| .{ .string = .{ .bytes = s, .origin = origin } },
         .array => |a| blk: {
             const l = try arena.create(List);
             l.* = .{};
             try l.items.ensureTotalCapacity(arena, a.items.len);
-            for (a.items) |item| l.items.appendAssumeCapacity(try convert(arena, item, depth + 1));
+            for (a.items) |item| l.items.appendAssumeCapacity(try convert(arena, item, origin, depth + 1));
             break :blk .{ .list = l };
         },
         .object => |o| blk: {
@@ -776,7 +921,7 @@ fn convert(arena: Allocator, j: std.json.Value, depth: usize) JsonError!Value {
             d.* = .{};
             try d.entries.ensureTotalCapacity(arena, o.count());
             var it = o.iterator();
-            while (it.next()) |e| d.entries.appendAssumeCapacity(.{ .key = .{ .string = e.key_ptr.* }, .value = try convert(arena, e.value_ptr.*, depth + 1) });
+            while (it.next()) |e| d.entries.appendAssumeCapacity(.{ .key = .{ .string = .{ .bytes = e.key_ptr.*, .origin = origin } }, .value = try convert(arena, e.value_ptr.*, origin, depth + 1) });
             break :blk .{ .dict = d };
         },
     };
@@ -785,33 +930,35 @@ fn convert(arena: Allocator, j: std.json.Value, depth: usize) JsonError!Value {
 /// `v` as the template reads it, built in `arena` without copying its strings: a struct is a dict of its fields in
 /// order with a null optional left out, as an absent JSON key; a slice is a list, a `[]const u8` a string, a tagged
 /// union its payload's value (a void payload `none`), an enum its tag's name, a `Value` itself, and a type with a
-/// `templateValue()` what that returns (a value parsed from text the caller keeps).
-pub fn fromStruct(arena: Allocator, v: anytype) error{OutOfMemory}!Value {
+/// `templateValue()` what that returns (a value parsed from text the caller keeps). Its strings are `origin`'s, a
+/// `Str` keeping its own, its field names the template's.
+pub fn fromStruct(arena: Allocator, v: anytype, origin: Origin) error{OutOfMemory}!Value {
     @setRuntimeSafety(true);
     const T = @TypeOf(v);
     if (T == Value) return v;
-    if (T == []const u8) return .{ .string = v };
+    if (T == Str) return .{ .string = v };
+    if (T == []const u8) return .{ .string = .{ .bytes = v, .origin = origin } };
     if (comptime (@typeInfo(T) == .@"struct" or @typeInfo(T) == .@"union") and @hasDecl(T, "templateValue")) return v.templateValue();
     switch (@typeInfo(T)) {
         .bool => return .{ .boolean = v },
         .int, .comptime_int => return .{ .int = @intCast(v) },
         .float, .comptime_float => return .{ .float = @floatCast(v) },
-        .optional => return if (v) |x| fromStruct(arena, x) else .none,
-        .@"enum" => return .{ .string = @tagName(v) },
+        .optional => return if (v) |x| fromStruct(arena, x, origin) else .none,
+        .@"enum" => return .{ .string = .{ .bytes = @tagName(v), .origin = origin } },
         .void => return .none,
         .pointer => |p| switch (p.size) {
-            .one => return fromStruct(arena, v.*),
+            .one => return fromStruct(arena, v.*, origin),
             .slice => {
                 const l = try arena.create(List);
                 l.* = .{};
                 try l.items.ensureTotalCapacity(arena, v.len);
-                for (v) |item| l.items.appendAssumeCapacity(try fromStruct(arena, item));
+                for (v) |item| l.items.appendAssumeCapacity(try fromStruct(arena, item, origin));
                 return .{ .list = l };
             },
             else => @compileError("fromStruct: no template value for " ++ @typeName(T)),
         },
         .@"union" => switch (v) {
-            inline else => |payload| return fromStruct(arena, payload),
+            inline else => |payload| return fromStruct(arena, payload, origin),
         },
         .@"struct" => |st| {
             const d = try arena.create(Dict);
@@ -820,7 +967,7 @@ pub fn fromStruct(arena: Allocator, v: anytype) error{OutOfMemory}!Value {
             inline for (st.field_names, st.field_types) |name, F| {
                 const field = @field(v, name);
                 const absent = @typeInfo(F) == .optional and field == null;
-                if (!absent) d.entries.appendAssumeCapacity(.{ .key = .{ .string = name }, .value = try fromStruct(arena, field) });
+                if (!absent) d.entries.appendAssumeCapacity(.{ .key = .plain(name), .value = try fromStruct(arena, field, origin) });
             }
             return .{ .dict = d };
         },
@@ -850,7 +997,7 @@ const testing = std.testing;
 test "template value: a JSON number reads as Python reads it" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const v = try fromJson(arena.allocator(), "[1, 1.0, 1e5, 18446744073709551616, -0, {\"a\":1,\"b\":2,\"a\":3}]");
+    const v = try fromJson(arena.allocator(), "[1, 1.0, 1e5, 18446744073709551616, -0, {\"a\":1,\"b\":2,\"a\":3}]", .template);
     const items = v.list.items.items;
     try testing.expectEqual(@as(i64, 1), items[0].int);
     try testing.expectEqual(@as(f64, 1.0), items[1].float);
@@ -859,7 +1006,7 @@ test "template value: a JSON number reads as Python reads it" {
     try testing.expectEqual(@as(i64, 0), items[4].int);
     const d = items[5].dict;
     try testing.expectEqual(@as(usize, 2), d.entries.items.len);
-    try testing.expectEqualStrings("a", d.entries.items[0].key.string);
+    try testing.expectEqualStrings("a", d.entries.items[0].key.string.bytes);
     try testing.expectEqual(@as(i64, 3), d.entries.items[0].value.int);
 }
 
@@ -870,22 +1017,22 @@ test "template value: a Zig value reads as the JSON of it reads, a null optional
     const Call = struct { name: []const u8, arguments: Value };
     const Content = union(enum) { text: []const u8, parts: []const Value, none };
     const Msg = struct { role: []const u8, content: Content, calls: ?[]const Call = null, id: ?[]const u8 = null, n: i64 = 0, f: f64 = 0.5, ok: bool = true };
-    const args = try fromJson(a, "{\"x\": 1.0}");
+    const args = try fromJson(a, "{\"x\": 1.0}", .template);
     const msgs = [_]Msg{
         .{ .role = "user", .content = .{ .text = "hi" } },
         .{ .role = "assistant", .content = .none, .calls = &.{.{ .name = "f", .arguments = args }}, .id = "c1", .n = -3 },
     };
-    const v = try fromStruct(a, @as([]const Msg, &msgs));
+    const v = try fromStruct(a, @as([]const Msg, &msgs), .template);
     const want = try fromJson(a,
         \\[{"role": "user", "content": "hi", "n": 0, "f": 0.5, "ok": true},
         \\ {"role": "assistant", "content": null, "calls": [{"name": "f", "arguments": {"x": 1.0}}], "id": "c1", "n": -3, "f": 0.5, "ok": true}]
-    );
+    , .template);
     var m: Meter = .{};
     try testing.expect(try eql(&m, want, v, 0));
     const d0 = v.list.items.items[0].dict;
     try testing.expectEqual(@as(usize, 5), d0.entries.items.len);
-    for ([_][]const u8{ "role", "content", "n", "f", "ok" }, d0.entries.items) |k, e| try testing.expectEqualStrings(k, e.key.string);
-    try testing.expect(d0.entries.items[0].value.string.ptr == msgs[0].role.ptr);
+    for ([_][]const u8{ "role", "content", "n", "f", "ok" }, d0.entries.items) |k, e| try testing.expectEqualStrings(k, e.key.string.bytes);
+    try testing.expect(d0.entries.items[0].value.string.bytes.ptr == msgs[0].role.ptr);
     // A type that keeps its text beside the value it parsed gives the template the value.
     const Raw = struct {
         text: []const u8,
@@ -895,8 +1042,8 @@ test "template value: a Zig value reads as the JSON of it reads, a null optional
             return self.parsed;
         }
     };
-    const raw = try fromStruct(a, .{ .arguments = Raw{ .text = "{\"x\": 1.0}", .parsed = args } });
-    try testing.expect(try eql(&m, try fromJson(a, "{\"arguments\": {\"x\": 1.0}}"), raw, 0));
+    const raw = try fromStruct(a, .{ .arguments = Raw{ .text = "{\"x\": 1.0}", .parsed = args } }, .template);
+    try testing.expect(try eql(&m, try fromJson(a, "{\"arguments\": {\"x\": 1.0}}", .template), raw, 0));
 }
 
 test "template value: the stable sort survives a comparator that lies or fails, and loses no item" {

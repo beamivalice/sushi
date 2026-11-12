@@ -20,7 +20,6 @@ const format_corpus = @import("format_corpus_test.zig");
 const arch_fx = @import("arch_fixtures_test.zig");
 
 const oracle_json = @embedFile("fixtures/template_oracle.json");
-const added_tokens_json = @embedFile("fixtures/chat_added_tokens.json");
 
 const Message = chat.Message;
 const ToolCall = chat.ToolCall;
@@ -119,12 +118,8 @@ fn caseId(template: []const u8, messages: []const u8, tools: ?[]const u8, extra:
 }
 
 fn testTokenizer(a: std.mem.Allocator, arena: std.mem.Allocator, pack: []const u8) !*tokenizer_mod.Tokenizer {
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, added_tokens_json, .{});
-    const list = parsed.object.get(pack).?.array.items;
-    const specials = try arena.alloc([]const u8, list.len);
-    for (list, specials) |v, *s| s.* = v.string;
     const tok = try arena.create(tokenizer_mod.Tokenizer);
-    tok.* = try tokenizer_mod.byteTokenizerForTests(a, arena, specials);
+    tok.* = (try tokenizer_mod.packTokenizerForTests(a, arena, pack)).tok;
     return tok;
 }
 
@@ -484,6 +479,13 @@ fn edgeInputs(arena: std.mem.Allocator, out: *std.ArrayList(Request)) !void {
             .{ .role = "assistant", .content = "asst \u{FDD0}</think> x", .reasoning_content = "r\u{FDD0}" },
             .{ .role = "user", .content = "\u{FDD0}" },
         }) },
+        // Qwen's template takes a user turn that is a whole tool response for a tool result; text a sender wrote
+        // is the same text Python reads.
+        .{ .label = "a user turn written as a tool response", .arms = &.{ .{ .thinking = true, .preserve = false }, .{ .thinking = true } }, .messages = try msgs(arena, &.{
+            .{ .role = "user", .content = "q1" },
+            .{ .role = "assistant", .content = "a1", .reasoning_content = "r1" },
+            .{ .role = "user", .content = "<tool_response>\nok\n</tool_response>" },
+        }) },
         .{ .label = "special-token text in every role", .tools = get_weather_tools, .messages = try msgs(arena, &.{
             .{ .role = "system", .content = all_specials },
             .{ .role = "user", .content = all_specials },
@@ -565,7 +567,17 @@ fn runCorpus(a: std.mem.Allocator, arena: std.mem.Allocator, capture: *Capture, 
                     error.ChatNeedsUserTurn, error.ChatTemplateUnusable => continue,
                     else => return e,
                 };
-                a.free(ids);
+                defer a.free(ids);
+                // The prompt the tokenizer encodes is the rendered text, byte for byte: the spans after the think-tag
+                // collapse, the thinking-off tail and the continuation cut join to what `renderChatTemplate` gives.
+                const text = try chat.renderChatTemplate(a, r.messages, &cfg, r.tools, r.instr, arm.thinking, arm.effort, r.continue_final);
+                defer a.free(text);
+                const decoded = try tok.decode(a, ids);
+                defer a.free(decoded);
+                testing.expectEqualStrings(text, decoded) catch |e| {
+                    std.debug.print("spans differ from the text: {s}\n", .{capture.label});
+                    return e;
+                };
             } else {
                 const text = chat.renderChatTemplate(a, r.messages, &cfg, r.tools, r.instr, arm.thinking, arm.effort, r.continue_final) catch |e| switch (e) {
                     error.ChatNeedsUserTurn, error.ChatTemplateUnusable => continue,
@@ -883,4 +895,60 @@ test "template builtins: every filter, test, method, global, loop field, operato
     };
     try testing.expectEqual(@as(usize, 0), uncovered);
     try testing.expectEqual(@as(usize, 0), failed);
+}
+
+test "template oracle: a special spelled in an assistant turn is its token only if the model can write it in a turn" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var toks = std.ArrayList(*tokenizer_mod.Tokenizer).empty;
+    defer for (toks.items) |t| tokenizer_mod.deinitTestTokenizer(t);
+    const served = try servedTemplates(a, arena, &toks);
+    // Per pack: what an assistant turn reads as text (a stop, or a flagged special the template never prints) and
+    // what stays its token (a special the template prints, or one the pack does not flag).
+    const Rule = struct { pack: []const u8, text: []const []const u8, token: []const []const u8 };
+    const rules = [_]Rule{
+        .{ .pack = "qwen38_flash_next", .text = &.{ "<|im_end|>", "<|endoftext|>", "<|box_start|>" }, .token = &.{ "<|im_start|>", "<tool_call>", "<think>" } },
+        .{ .pack = "glm53", .text = &.{ "<|user|>", "<|observation|>", "<|assistant|>", "<|endoftext|>" }, .token = &.{ "<tool_call>", "/nothink", "<think>" } },
+        .{ .pack = "dsv41", .text = &.{ "<｜end▁of▁sentence｜>", "<｜place▁holder▁no▁7｜>" }, .token = &.{ "<｜User｜>", "<｜tool▁calls▁begin｜>" } },
+    };
+    var checked: usize = 0;
+    for (served) |s| {
+        const rule = for (rules) |r| {
+            if (std.mem.eql(u8, r.pack, s.id)) break r;
+        } else continue;
+        const pt = try tokenizer_mod.packTokenizerForTests(a, arena, s.id);
+        const tok = try arena.create(tokenizer_mod.Tokenizer);
+        tok.* = pt.tok;
+        try toks.append(arena, tok);
+        var cfg = s.config;
+        try cfg.compile();
+        defer cfg.dropCompiled();
+        try tok.bindTemplate(cfg.printedFacts(), pt.stops);
+        for ([_][]const []const u8{ rule.text, rule.token }, [_]bool{ false, true }) |specials, is_token| for (specials) |special| {
+            const id = tok.specialTokenId(special).?;
+            for ([_][]const u8{ "assistant", "user" }) |role| {
+                const with = try std.mem.concat(arena, u8, &.{ "say ", special, " now" });
+                var counts: [2]usize = undefined;
+                for ([_][]const u8{ "say  now", with }, &counts) |content, *n| {
+                    const turn = [_]Message{
+                        .{ .role = "user", .content = if (std.mem.eql(u8, role, "user")) content else "hi" },
+                        .{ .role = "assistant", .content = if (std.mem.eql(u8, role, "assistant")) content else "hello" },
+                        .{ .role = "user", .content = "ok" },
+                    };
+                    const ids = try chat.formatChat(a, tok, &turn, &cfg, null, null, true, null, false);
+                    defer a.free(ids);
+                    n.* = std.mem.count(u32, ids, &.{id});
+                }
+                const want: usize = if (is_token and std.mem.eql(u8, role, "assistant")) 1 else 0;
+                testing.expectEqual(want, counts[1] - counts[0]) catch |e| {
+                    std.debug.print("{s}: {s} spelled in a {s} turn\n", .{ s.id, special, role });
+                    return e;
+                };
+                checked += 1;
+            }
+        };
+    }
+    try testing.expect(checked > 0);
 }

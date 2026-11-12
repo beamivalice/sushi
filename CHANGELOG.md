@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Special-token text in an assistant turn is a token only where the model could have written it**: a stop such as
+  `<|im_end|>`, or a special the sampler never draws, spelled out in an earlier reply now reaches the model as text, as
+  in every other role; a function name a client forces is text too; a U+FDD0 a client sends now stays in the prompt,
+  and a Qwen user turn written as a tool response is read as one, as transformers reads it.
 - **A tool declared without a description keeps its schema's numbers as sent**: a whole float such as `1.0`, `1e5`
   or `-0.0` in its parameters no longer reaches the prompt as an integer, and a tool list with a repeated key gets its
   missing description and parameters filled like any other.

@@ -229,7 +229,7 @@ before reading a completed stream and requires clean EOF.
 - Top-k and top-p are ONE pass (`sampler.filterTopKTopP`); a filter cuts by RANK, never by value (bf16 ties at the top
   constantly; `sampler.ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
   `top_p` 0 is GREEDY (`sampler.applyTopP` floors at `floatMin(f32)`).
-- A sampler never draws a RESERVED special or PADDING row (`sampler.installSuppressMask`; logprobs stay RAW).
+- A sampler never draws a RESERVED special or PADDING row (`Tokenizer.bindTemplate` derives the set, `sampler.installSuppressMask` applies it; logprobs stay RAW).
 - **A non-streaming `/v1/completions` reply carries the chat reply's `timings`** (`prompt_n`, `cached_n`, `prompt_ms`, `predicted_ms`; `prompt_ms` includes the prefix restore); `sushi bench` reads it.
 - **A text `/v1/completions` prompt is encoded raw, plus the model's own opening id** (`ModelConfig.textPromptBosId`: DeepSeek's BOS, which its chat template writes literally; its base model answers EOS at once without it). Other families add none, and Qwen's config "BOS" is `<|endoftext|>`.
 - **`ignore_eos: true`** (vLLM's field) decodes a `/v1/completions` request past EOS to `max_tokens`

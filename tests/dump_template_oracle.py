@@ -11,7 +11,7 @@ jinja.cpp's render of each with the render this script commits. The environment 
 
 Three steps, from the repo root:
 
-    # 1. The packs' added tokens, which formatChat marks in message text (once per tokenizer change):
+    # 1. The packs' added tokens and stops, which decide what formatChat encodes as a token (once per tokenizer change):
     python3 -I tests/dump_template_oracle.py tokens --models "${SUSHI_MODELS_DIR:-$HOME/.sushi/models}"
     # 2. The engine inputs of the corpus, from the real code path:
     SUSHI_TEMPLATE_ORACLE_DUMP=<abs path>/inputs.json \\
@@ -43,8 +43,6 @@ ORACLE = ROOT / 'src/fixtures/template_oracle.json'
 BUILTINS = ROOT / 'src/fixtures/template_builtins.json'
 # What a template uses that no request formatChat can build reaches, and why. Anything else unreached fails.
 UNREACHABLE = {
-    'call endswith': 'Qwen tests a user turn for `<tool_response>` with startswith first, and formatChat marks that '
-                     'token text in user text (U+FDD0 before it), so startswith never holds and endswith never runs',
     'call emit_audio': 'GLM renders an audio content part; formatChat sends only text, image and video parts',
     'call tool_references_to_response': 'GLM renders `tool_reference` content parts; formatChat sends none',
 }
@@ -56,12 +54,27 @@ PACKS = {
 }
 
 
+# The texts a load of each pack stops a turn at (its eos ids, and an arch's turn opener: `ModelConfig.mergeTokenizerStops`).
+STOPS = {
+    'qwen38_flash_next': ['<|im_end|>', '<|endoftext|>'],
+    'glm53': ['<|endoftext|>', '<|user|>', '<|observation|>', '<|assistant|>'],
+    'dsv41': ['<｜end▁of▁sentence｜>'],
+}
+
+
 def dump_tokens(models):
-    out = {}
-    for name, pack in PACKS.items():
+    lines = ['{']
+    for i, (name, pack) in enumerate(PACKS.items()):
         added = json.loads((Path(models) / pack / 'tokenizer.json').read_text())['added_tokens']
-        out[name] = [t['content'] for t in sorted(added, key=lambda t: t['id'])]
-    TOKENS.write_text(json.dumps(out, ensure_ascii=False, indent=1) + '\n')
+        rows = [[t['content'], t['id'], t['special']] for t in sorted(added, key=lambda t: t['id'])]
+        contents = {r[0] for r in rows}
+        missing = [s for s in STOPS[name] if s not in contents]
+        if missing:
+            sys.exit(f'{pack}: stop {missing} is not an added token')
+        lines += [f' {json.dumps(name)}: {{', f'  "stops": {json.dumps(STOPS[name], ensure_ascii=False)},', '  "added": [']
+        lines += ['   ' + json.dumps(r, ensure_ascii=False) + (',' if j < len(rows) - 1 else '') for j, r in enumerate(rows)]
+        lines += ['  ]', ' }' + (',' if i < len(PACKS) - 1 else '')]
+    TOKENS.write_text('\n'.join(lines + ['}']) + '\n')
 
 
 def context_of(case):

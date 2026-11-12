@@ -21,10 +21,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups; coercion
   never worsens conformance; a parsed NAME never contains `<|`; no tag leaks. Harness:
   `src/tool_traffic_replay_test.zig` over `src/fixtures/tool_traffic.jsonl`.
-- **Control-token text a client sends is text**: `chat.formatChat` marks every special's text in user, system and tool
-  message content (`Tokenizer.markLiteralSpecials`), `encodeMarked` encodes it as bytes, and only the template's own
-  tags become ids. A file read into Claude Code quoting `<think>`/`<|im_end|>` otherwise read as a real turn or
-  thought boundary. Assistant text is left parsing (the template splits it); media offsets shift with the marks.
+- **Control-token text a client sends is text**: every byte of a render knows who wrote it (`Template.renderSpans`):
+  the template (and the server's own text around it: tool fallbacks, image atoms, tails), an assistant message, or
+  other request text (user, system and tool messages, tools, the effort word, the tool_choice instruction and a forced
+  call's function name, which name the client's function). `Tokenizer.encodeSpans` reads a
+  special's text as its token only where every byte of it is the template's, or an assistant's and the model can
+  write that special inside a turn; in other input, or put together from two origins, it is text, and text is never
+  split where its origin changes. A file read into Claude Code quoting `<think>`/`<|im_end|>` otherwise read as a real
+  turn or thought boundary. The text itself is unchanged: a template reads what the client sent, U+FDD0 included.
+- **Assistant text**: the model's earlier output, so a special it can write stays its token and the next prompt holds
+  the ids it generated. A stop (eos, an arch's turn opener) and a special the sampler masks are text there: the model
+  never writes either inside a turn. `Tokenizer.bindTemplate` derives both sets once per load from the flagged
+  specials, the template's facts and the stops; with no template nothing is masked and assistant text keeps every
+  special. Origins follow bytes through every builtin (`template.zig`'s builtin sweep pins it); a transform with no
+  byte-for-byte map (`tojson`, `indent`, `reverse`, a container's repr) takes the strictest origin of its input.
 - A live failure revealing a CLASS ships the instance test plus a corpus entry or invariant in
   `src/format_corpus_test.zig` plus a rule here. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` →
   `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first.
@@ -73,7 +83,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   macro's or a caller's parameter). A word in a comment counts for nothing. What rides on it:
   rendering the tool list, the tool-role probe, `preserve_thinking`, the think span, each effort dialect, `/v1/models`
   reasoning support, the generated think opener and channel protocol, and the reserved-token mask
-  (`reservedOutputIds` keeps a special the template may print). Limit: a literal only pieced together
+  (`Tokenizer.bindTemplate` keeps a special the template may print). Limit: a literal only pieced together
   (`'<|im_' ~ 'end|>'`) is seen by neither the facts nor a text search. A config built by hand calls `compile`
   (`arch_fixtures_test.qwenChatConfig` does): `ChatConfig.facts` panics on a template never compiled or swapped in
   after its compile (`compiledFacts` returns `TemplateNotCompiled`), so no question answers from empty facts.

@@ -4,7 +4,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const chat = @import("chat.zig");
-const Value = @import("template/template.zig").Value;
+const template_engine = @import("template/template.zig");
+const Value = template_engine.Value;
 
 comptime {
     if (!builtin.is_test) @compileError("chat_json_test.zig is compiled into test binaries only");
@@ -15,6 +16,7 @@ pub fn write(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), v: anytype) !void 
     const T = @TypeOf(v);
     if (T == Value) return writeValue(gpa, buf, v);
     if (T == []const u8) return chat.appendJsonString(gpa, buf, v);
+    if (T == template_engine.Str) return chat.appendJsonString(gpa, buf, v.bytes);
     if (comptime (@typeInfo(T) == .@"struct" or @typeInfo(T) == .@"union") and @hasDecl(T, "templateText")) return buf.appendSlice(gpa, v.templateText());
     switch (@typeInfo(T)) {
         .bool => try buf.appendSlice(gpa, if (v) "true" else "false"),
@@ -68,7 +70,7 @@ pub fn writeValue(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value) !vo
             try buf.print(gpa, "{d}", .{f});
             if (std.mem.indexOfAny(u8, buf.items[start..], ".en") == null) try buf.appendSlice(gpa, ".0");
         },
-        .string, .markup => |s| try chat.appendJsonString(gpa, buf, s),
+        .string, .markup => |s| try chat.appendJsonString(gpa, buf, s.bytes),
         .list => |l| {
             try buf.append(gpa, '[');
             for (l.items.items, 0..) |item, i| {

@@ -10,6 +10,7 @@ const render = @import("render.zig");
 const ast = @import("ast.zig");
 
 const Value = value.Value;
+const Str = value.Str;
 const Failure = value.Failure;
 const Renderer = render.Renderer;
 const Kw = render.Kw;
@@ -158,9 +159,23 @@ fn strArg(r: *Renderer, v: Value, what: []const u8) Failure![]const u8 {
 }
 
 /// `text` with the string kind of `like`: a Markup operand gives Markup.
-fn sameKind(like: Value, text: []const u8) Value {
+fn sameKind(like: Value, text: Str) Value {
     @setRuntimeSafety(true);
     return if (like == .markup) .{ .markup = text } else .{ .string = text };
+}
+
+/// `sub`, a slice of `src`'s bytes, with the origins those bytes have there.
+fn within(r: *Renderer, src: Str, sub: []const u8) Failure!Str {
+    @setRuntimeSafety(true);
+    if (sub.len == 0) return .{ .bytes = sub, .origin = src.origin };
+    const at = @intFromPtr(sub.ptr) - @intFromPtr(src.bytes.ptr);
+    std.debug.assert(at + sub.len <= src.bytes.len);
+    return src.slice(r.arena, at, at + sub.len);
+}
+
+fn piece(r: *Renderer, src: Str, sub: []const u8) Failure!Value {
+    @setRuntimeSafety(true);
+    return .{ .string = try within(r, src, sub) };
 }
 
 fn undefinedFail(r: *Renderer, v: Value) Failure!void {
@@ -314,13 +329,14 @@ fn stripArg(r: *Renderer, v: ?Value) Failure!?[]const u8 {
 }
 
 /// Python `str.split(sep, maxsplit)` and `rsplit`.
-fn split(r: *Renderer, s: []const u8, sep_v: ?Value, max_v: ?Value, from_right: bool) Failure!Value {
+fn split(r: *Renderer, src: Str, sep_v: ?Value, max_v: ?Value, from_right: bool) Failure!Value {
     @setRuntimeSafety(true);
     const sep: ?[]const u8 = if (sep_v) |v| (if (v == .none) null else try strArg(r, v, "split")) else null;
     // A negative maxsplit is Python's "no limit".
     var max = if (max_v) |v| try intArg(r, v, "split") else -1;
     if (max < 0) max = std.math.maxInt(i64);
     if (sep != null and sep.?.len == 0) return r.fail("empty separator", .{});
+    const s = src.bytes;
     var parts = std.ArrayList(Value).empty;
     if (sep) |p| {
         const finder = try value.Finder.init(r.arena, p, from_right);
@@ -328,18 +344,18 @@ fn split(r: *Renderer, s: []const u8, sep_v: ?Value, max_v: ?Value, from_right: 
             var rest = s;
             while (max != 0) : (max -= 1) {
                 const at = try find(r, finder, rest) orelse break;
-                try parts.append(r.arena, .{ .string = rest[0..at] });
+                try parts.append(r.arena, try piece(r, src, rest[0..at]));
                 rest = rest[at + p.len ..];
             }
-            try parts.append(r.arena, .{ .string = rest });
+            try parts.append(r.arena, try piece(r, src, rest));
         } else {
             var rest = s;
             while (max != 0) : (max -= 1) {
                 const at = try find(r, finder, rest) orelse break;
-                try parts.append(r.arena, .{ .string = rest[at + p.len ..] });
+                try parts.append(r.arena, try piece(r, src, rest[at + p.len ..]));
                 rest = rest[0..at];
             }
-            try parts.append(r.arena, .{ .string = rest });
+            try parts.append(r.arena, try piece(r, src, rest));
             std.mem.reverse(Value, parts.items);
         }
         return r.newList(parts.items, .list);
@@ -361,13 +377,13 @@ fn split(r: *Renderer, s: []const u8, sep_v: ?Value, max_v: ?Value, from_right: 
             while (i < cps.items.len and value.isSpace(decode(cps.items[i]))) i += 1;
             if (i == cps.items.len) break;
             if (max == 0) {
-                try parts.append(r.arena, .{ .string = s[off(base, cps.items[i])..] });
+                try parts.append(r.arena, try piece(r, src, s[off(base, cps.items[i])..]));
                 break;
             }
             const start = i;
             while (i < cps.items.len and !value.isSpace(decode(cps.items[i]))) i += 1;
             const end = if (i < cps.items.len) off(base, cps.items[i]) else s.len;
-            try parts.append(r.arena, .{ .string = s[off(base, cps.items[start])..end] });
+            try parts.append(r.arena, try piece(r, src, s[off(base, cps.items[start])..end]));
             max -= 1;
         }
     } else {
@@ -377,13 +393,13 @@ fn split(r: *Renderer, s: []const u8, sep_v: ?Value, max_v: ?Value, from_right: 
             if (i == 0) break;
             const end = off(base, cps.items[i - 1]) + cps.items[i - 1].len;
             if (max == 0) {
-                try parts.append(r.arena, .{ .string = s[0..end] });
+                try parts.append(r.arena, try piece(r, src, s[0..end]));
                 break;
             }
             const stop = i;
             while (i > 0 and !value.isSpace(decode(cps.items[i - 1]))) i -= 1;
             _ = stop;
-            try parts.append(r.arena, .{ .string = s[off(base, cps.items[i])..end] });
+            try parts.append(r.arena, try piece(r, src, s[off(base, cps.items[i])..end]));
             max -= 1;
         }
         std.mem.reverse(Value, parts.items);
@@ -391,38 +407,40 @@ fn split(r: *Renderer, s: []const u8, sep_v: ?Value, max_v: ?Value, from_right: 
     return r.newList(parts.items, .list);
 }
 
-/// Python `str.replace(old, new, count)`.
-fn replace(r: *Renderer, s: []const u8, old: []const u8, new: []const u8, count: i64) Failure![]const u8 {
+/// Python `str.replace(old, new, count)`: the kept bytes keep their origins, and each `new` brings its own.
+fn replace(r: *Renderer, src: Str, old: []const u8, new: Str, count: i64) Failure!Str {
     @setRuntimeSafety(true);
-    var buf = std.ArrayList(u8).empty;
+    const s = src.bytes;
+    var buf: value.Builder = .{};
     // A negative count is Python's "every occurrence".
     var left = if (count < 0) std.math.maxInt(i64) else count;
     if (old.len == 0) {
         var it = std.unicode.Utf8View.initUnchecked(s).iterator();
-        while (it.nextCodepointSlice()) |cs| {
+        var at: usize = 0;
+        while (it.nextCodepointSlice()) |cs| : (at += cs.len) {
             if (left != 0) {
-                try r.charge(buf.items.len + new.len);
-                try buf.appendSlice(r.arena, new);
+                try r.charge(buf.bytes.items.len + new.bytes.len);
+                try buf.append(r.arena, new);
                 left -= 1;
             }
-            try buf.appendSlice(r.arena, cs);
+            try buf.appendPart(r.arena, src, at, at + cs.len);
         }
-        if (left != 0) try buf.appendSlice(r.arena, new);
-        try r.charge(buf.items.len);
-        return buf.items;
+        if (left != 0) try buf.append(r.arena, new);
+        try r.charge(buf.bytes.items.len);
+        return buf.str();
     }
     const finder = try value.Finder.init(r.arena, old, false);
-    var rest = s;
+    var from: usize = 0;
     while (left != 0) : (left -= 1) {
-        const at = try find(r, finder, rest) orelse break;
-        try r.charge(buf.items.len + at + new.len);
-        try buf.appendSlice(r.arena, rest[0..at]);
-        try buf.appendSlice(r.arena, new);
-        rest = rest[at + old.len ..];
+        const at = try find(r, finder, s[from..]) orelse break;
+        try r.charge(buf.bytes.items.len + at + new.bytes.len);
+        try buf.appendPart(r.arena, src, from, from + at);
+        try buf.append(r.arena, new);
+        from += at + old.len;
     }
-    try buf.appendSlice(r.arena, rest);
-    try r.charge(buf.items.len);
-    return buf.items;
+    try buf.appendPart(r.arena, src, from, s.len);
+    try r.charge(buf.bytes.items.len);
+    return buf.str();
 }
 
 /// Python `str.startswith` / `endswith` with an optional `start` and `end` in code points.
@@ -468,24 +486,27 @@ fn escapeHtml(r: *Renderer, s: []const u8) Failure![]const u8 {
 }
 
 /// The text of `v` as Markup adds it: Markup as it is, anything else escaped.
-fn markupOperand(r: *Renderer, v: Value) Failure![]const u8 {
+fn markupOperand(r: *Renderer, v: Value) Failure!Str {
     @setRuntimeSafety(true);
     return switch (v) {
         .markup => |m| m,
-        .string => |s| escapeHtml(r, s),
+        .string => |s| s.derive(try escapeHtml(r, s.bytes)),
         else => r.fail("unsupported operand type for Markup: '{s}'", .{value.typeName(v)}),
     };
 }
 
 /// Python's `str % args`: `%s`, `%r`, `%d`, `%i`, `%f` with an optional precision, `%%`, and `%(name)s` keys.
 /// Python `fmt % args`; `escape` is Markup's `%`, which escapes each argument that is not Markup itself.
-fn percentFormat(r: *Renderer, fmt: []const u8, args: Value, escape: bool) Failure![]const u8 {
+/// Each piece keeps its origin: the format's own text, and each argument's.
+fn percentFormat(r: *Renderer, fmt_s: Str, args: Value, escape: bool) Failure!Str {
     @setRuntimeSafety(true);
+    const fmt = fmt_s.bytes;
     const positional: []const Value = switch (args) {
         .list => |l| if (l.kind == .tuple) l.items.items else &.{args},
         else => &.{args},
     };
     const mapping: ?*const value.Dict = if (args == .dict) args.dict else null;
+    var out: value.Builder = .{};
     var buf = std.ArrayList(u8).empty;
     var next: usize = 0;
     var i: usize = 0;
@@ -493,7 +514,7 @@ fn percentFormat(r: *Renderer, fmt: []const u8, args: Value, escape: bool) Failu
         const c = fmt[i];
         i += 1;
         if (c != '%') {
-            try buf.append(r.arena, c);
+            try out.appendPart(r.arena, fmt_s, i - 1, i);
             continue;
         }
         if (i >= fmt.len) return r.fail("incomplete format", .{});
@@ -515,7 +536,7 @@ fn percentFormat(r: *Renderer, fmt: []const u8, args: Value, escape: bool) Failu
         const conv = fmt[i];
         i += 1;
         if (conv == '%' and arg == null and precision == null) {
-            try buf.append(r.arena, '%');
+            try out.appendPart(r.arena, fmt_s, i - 1, i);
             continue;
         }
         const v = arg orelse blk: {
@@ -524,15 +545,16 @@ fn percentFormat(r: *Renderer, fmt: []const u8, args: Value, escape: bool) Failu
             next += 1;
             break :blk positional[next - 1];
         };
+        buf.clearRetainingCapacity();
         switch (conv) {
             's' => {
-                const text = try r.toStr(v);
-                try buf.appendSlice(r.arena, if (escape and v != .markup) try escapeHtml(r, text) else text);
+                const text = try r.toText(v);
+                try out.append(r.arena, if (escape and v != .markup) text.derive(try escapeHtml(r, text.bytes)) else text);
             },
             'r' => {
                 var repr = std.ArrayList(u8).empty;
                 value.writeRepr(&r.meter, &repr, r.arena, v, 0) catch |e| return r.wrap(e, "the value cannot be printed");
-                try buf.appendSlice(r.arena, if (escape) try escapeHtml(r, repr.items) else repr.items);
+                try out.appendBytes(r.arena, if (escape) try escapeHtml(r, repr.items) else repr.items, value.originIn(v, 0));
             },
             'd', 'i' => switch (v) {
                 .int, .boolean => try buf.print(r.arena, "{d}", .{try intArg(r, v, "format")}),
@@ -551,16 +573,17 @@ fn percentFormat(r: *Renderer, fmt: []const u8, args: Value, escape: bool) Failu
                     else => return r.fail("must be real number, not {s}", .{value.typeName(v)}),
                 };
                 const prec = precision orelse 6;
-                try r.charge(buf.items.len +| prec +| 400);
+                try r.charge(out.bytes.items.len +| prec +| 400);
                 try tojson.writeFixed(&buf, r.arena, f, prec);
             },
             else => return r.fail("unsupported format character '{c}'", .{conv}),
         }
-        try r.charge(buf.items.len);
+        try out.appendBytes(r.arena, buf.items, .template);
+        try r.charge(out.bytes.items.len);
     }
     if (mapping == null and next < positional.len) return r.fail("not all arguments converted during string formatting", .{});
-    try r.charge(buf.items.len);
-    return buf.items;
+    try r.charge(out.bytes.items.len);
+    return out.str();
 }
 
 // ── Numbers ──
@@ -636,7 +659,7 @@ pub fn binary(r: *Renderer, op: ast.BinOp, a: Value, b: Value) Failure!Value {
         if (a.isNumber() and b.isNumber()) return r.fail("arithmetic on an integer past 64 bits is not supported", .{});
     }
     if (op == .mod and a.str() != null) {
-        const text = try percentFormat(r, a.str().?, b, a == .markup);
+        const text = try percentFormat(r, a.strOf().?, b, a == .markup);
         return if (a == .markup) .{ .markup = text } else .{ .string = text };
     }
     if (asInt(a)) |x| if (asInt(b)) |y| {
@@ -666,11 +689,9 @@ pub fn binary(r: *Renderer, op: ast.BinOp, a: Value, b: Value) Failure!Value {
                 if (a == .markup or b == .markup) {
                     const l = try markupOperand(r, a);
                     const rt = try markupOperand(r, b);
-                    try r.charge(l.len + rt.len);
-                    return .{ .markup = try std.mem.concat(r.arena, u8, &.{ l, rt }) };
+                    return .{ .markup = try joined(r, &.{ l, rt }) };
                 }
-                try r.charge(a.string.len + b.string.len);
-                return .{ .string = try std.mem.concat(r.arena, u8, &.{ a.string, b.string }) };
+                return .{ .string = try joined(r, &.{ a.string, b.string }) };
             }
             if (a == .list and b == .list and a.list.kind == b.list.kind and (a.list.kind == .list or a.list.kind == .tuple)) {
                 const items = try std.mem.concat(r.arena, Value, &.{ a.list.items.items, b.list.items.items });
@@ -681,7 +702,7 @@ pub fn binary(r: *Renderer, op: ast.BinOp, a: Value, b: Value) Failure!Value {
             const seq, const n_v = if (asInt(b) != null) .{ a, b } else .{ b, a };
             if (asInt(n_v)) |n_raw| {
                 const n: usize = if (n_raw < 0) 0 else @intCast(n_raw);
-                if (seq.str()) |s| return sameKind(seq, try repeat(r, u8, s, n));
+                if (seq.strOf()) |s| return sameKind(seq, s.derive(try repeat(r, u8, s.bytes, n)));
                 if (seq == .list and (seq.list.kind == .list or seq.list.kind == .tuple))
                     return r.newList(try repeat(r, Value, seq.list.items.items, n), seq.list.kind);
             }
@@ -698,6 +719,17 @@ pub fn binary(r: *Renderer, op: ast.BinOp, a: Value, b: Value) Failure!Value {
     return r.fail("unsupported operand type(s) for {s}: '{s}' and '{s}'", .{ sym, value.typeName(a), value.typeName(b) });
 }
 
+/// `parts` end to end, each keeping its origins.
+fn joined(r: *Renderer, parts: []const Str) Failure!Str {
+    @setRuntimeSafety(true);
+    var len: usize = 0;
+    for (parts) |p| len += p.bytes.len;
+    try r.charge(len);
+    var out: value.Builder = .{};
+    for (parts) |p| try out.append(r.arena, p);
+    return out.str();
+}
+
 /// Python's `item in container`.
 pub fn contains(r: *Renderer, container: Value, item: Value) Failure!bool {
     @setRuntimeSafety(true);
@@ -705,7 +737,7 @@ pub fn contains(r: *Renderer, container: Value, item: Value) Failure!bool {
         .undefined => return false,
         .string, .markup => |s| {
             const t = item.str() orelse return r.fail("'in <string>' requires string as left operand, not {s}", .{value.typeName(item)});
-            return try find(r, try value.Finder.init(r.arena, t, false), s) != null;
+            return try find(r, try value.Finder.init(r.arena, t, false), s.bytes) != null;
         },
         .list => |l| {
             const items = l.items.items;
@@ -788,7 +820,7 @@ fn attrPath(r: *Renderer, item: Value, path: Value) Failure!Value {
         const all_digits = part.len > 0 and for (part) |c| {
             if (!std.ascii.isDigit(c)) break false;
         } else true;
-        const key: Value = if (all_digits) .{ .int = std.fmt.parseInt(i64, part, 10) catch return r.fail("index '{s}' is too large", .{part}) } else .{ .string = part };
+        const key: Value = if (all_digits) .{ .int = std.fmt.parseInt(i64, part, 10) catch return r.fail("index '{s}' is too large", .{part}) } else .plain(part);
         v = try r.getItem(v, key);
     }
     return v;
@@ -798,7 +830,7 @@ fn attrPath(r: *Renderer, item: Value, path: Value) Failure!Value {
 fn caseKey(r: *Renderer, v: Value, case_sensitive: bool) Failure!Value {
     @setRuntimeSafety(true);
     if (case_sensitive) return v;
-    if (v.str()) |s| return .{ .string = try mapCase(r, s, false) };
+    if (v.strOf()) |s| return .{ .string = s.remap(try mapCase(r, s.bytes, false)) };
     return v;
 }
 
@@ -860,18 +892,18 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
         },
         .capitalize, .lower, .upper, .title => {
             _ = try bind(r, @tagName(f), &.{}, args, kws);
-            const s = try r.toStr(input);
-            return sameKind(input, switch (f) {
-                .capitalize => try capitalize(r, s),
-                .lower => try mapCase(r, s, false),
-                .upper => try mapCase(r, s, true),
-                else => try filterTitle(r, s),
-            });
+            const s = try r.toText(input);
+            return sameKind(input, s.remap(switch (f) {
+                .capitalize => try capitalize(r, s.bytes),
+                .lower => try mapCase(r, s.bytes, false),
+                .upper => try mapCase(r, s.bytes, true),
+                else => try filterTitle(r, s.bytes),
+            }));
         },
         .default => {
             const p = try bind(r, "default", &.{ "default_value", "boolean" }, args, kws);
             const boolean = if (p[1]) |b| value.truthy(b) else false;
-            if (input == .undefined or (boolean and !value.truthy(input))) return p[0] orelse .{ .string = "" };
+            if (input == .undefined or (boolean and !value.truthy(input))) return p[0] orelse .plain("");
             return input;
         },
         .first => {
@@ -905,7 +937,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 .float => input,
                 .int, .boolean => .{ .float = asFloat(input).? },
                 .bigint => |t| .{ .float = value.bigToFloat(t) },
-                .string, .markup => |s| if (parsePyFloat(s)) |x| .{ .float = x } else default,
+                .string, .markup => |s| if (parsePyFloat(s.bytes)) |x| .{ .float = x } else default,
                 else => default,
             };
         },
@@ -921,33 +953,35 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 // infinite float raises Python's OverflowError.
                 .float => |x| return if (std.math.isNan(x)) default else floatToInt(r, x),
                 .string, .markup => |s| {
-                    if (parsePyInt(s, base)) |i| return .{ .int = i } else |e| switch (e) {
+                    if (parsePyInt(s.bytes, base)) |i| return .{ .int = i } else |e| switch (e) {
                         error.Overflow => return r.fail("an integer past 64 bits is not supported", .{}),
                         error.Invalid => {},
                     }
-                    const x = parsePyFloat(s) orelse return default;
+                    const x = parsePyFloat(s.bytes) orelse return default;
                     return if (std.math.isFinite(x)) floatToInt(r, x) else default;
                 },
                 else => return default,
             }
         },
         .format => {
-            const text = try r.toStr(input);
+            const text = try r.toText(input);
             if (args.len > 0 and kws.len > 0) return r.fail("can't handle positional and keyword arguments at the same time", .{});
             const fmt_args: Value = if (kws.len > 0) blk: {
                 const d = try r.arena.create(value.Dict);
                 d.* = .{};
-                for (kws) |kw| try d.put(&r.meter, r.arena, .{ .string = kw.name }, kw.value);
+                for (kws) |kw| try d.put(&r.meter, r.arena, .plain(kw.name), kw.value);
                 break :blk .{ .dict = d };
             } else try r.newList(args, .tuple);
             return sameKind(input, try percentFormat(r, text, fmt_args, input == .markup));
         },
         .indent => {
             const p = try bind(r, "indent", &.{ "width", "first", "blank" }, args, kws);
-            const s = input.str() orelse {
+            const src = input.strOf() orelse {
                 try undefinedFail(r, input);
                 return r.fail("indent: expected a string, got '{s}'", .{value.typeName(input)});
             };
+            const s = src.bytes;
+            const pad_origin = if (p[0]) |w| value.originIn(w, 0) else .template;
             const indention: []const u8 = if (p[0]) |w| (w.str() orelse blk: {
                 const n = try intArg(r, w, "indent");
                 const len: usize = if (n < 0) 0 else @intCast(n);
@@ -969,7 +1003,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 try buf.appendSlice(r.arena, line);
                 try r.charge(buf.items.len);
             }
-            return sameKind(input, buf.items);
+            return sameKind(input, .{ .bytes = buf.items, .origin = src.origin.strictest(pad_origin) });
         },
         .items => {
             _ = try bind(r, "items", &.{}, args, kws);
@@ -979,16 +1013,16 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
         },
         .join => {
             const p = try bind(r, "join", &.{ "d", "attribute" }, args, kws);
-            const sep = if (p[0]) |d| try r.toStr(d) else "";
+            const sep: Str = if (p[0]) |d| try r.toText(d) else .{ .bytes = "" };
             const items = try r.iterate(input);
-            var buf = std.ArrayList(u8).empty;
+            var buf: value.Builder = .{};
             for (items, 0..) |item, i| {
-                if (i > 0) try buf.appendSlice(r.arena, sep);
+                if (i > 0) try buf.append(r.arena, sep);
                 const v = if (p[1]) |a| (if (a == .none) item else try attrPath(r, item, a)) else item;
-                try buf.appendSlice(r.arena, try r.toStr(v));
-                try r.charge(buf.items.len);
+                try buf.append(r.arena, try r.toText(v));
+                try r.charge(buf.bytes.items.len);
             }
-            return .{ .string = buf.items };
+            return .{ .string = buf.str() };
         },
         .length => {
             _ = try bind(r, "length", &.{}, args, kws);
@@ -1059,16 +1093,17 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
         },
         .replace => {
             const p = try bind(r, "replace", &.{ "old", "new", "count" }, args, kws);
-            const s = try r.toStr(input);
+            const s = try r.toText(input);
             const old = try r.toStr(try required(r, "replace", p[0]));
-            const new = try r.toStr(try required(r, "replace", p[1]));
+            const new = try r.toText(try required(r, "replace", p[1]));
             const count = if (p[2]) |c| (if (c == .none) -1 else try intArg(r, c, "replace")) else -1;
             return .{ .string = try replace(r, s, old, new, count) };
         },
         .reverse => {
             _ = try bind(r, "reverse", &.{}, args, kws);
             switch (input) {
-                .string, .markup => |s| {
+                .string, .markup => |src| {
+                    const s = src.bytes;
                     var buf = std.ArrayList(u8).empty;
                     var end = s.len;
                     while (end > 0) {
@@ -1077,7 +1112,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                         try buf.appendSlice(r.arena, s[b..end]);
                         end = b;
                     }
-                    return sameKind(input, buf.items);
+                    return sameKind(input, src.derive(buf.items));
                 },
                 .undefined, .dict => {},
                 .list => {},
@@ -1090,7 +1125,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
         },
         .safe => {
             _ = try bind(r, "safe", &.{}, args, kws);
-            return .{ .markup = try r.toStr(input) };
+            return .{ .markup = try r.toText(input) };
         },
         .sort => {
             const p = try bind(r, "sort", &.{ "reverse", "case_sensitive", "attribute" }, args, kws);
@@ -1124,12 +1159,12 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
         .string => {
             _ = try bind(r, "string", &.{}, args, kws);
             if (input == .markup) return input;
-            return .{ .string = try r.toStr(input) };
+            return .{ .string = try r.toText(input) };
         },
         .strip, .trim => {
             const p = try bind(r, @tagName(f), &.{"chars"}, args, kws);
-            const s = try r.toStr(input);
-            return sameKind(input, try stripChars(r, s, try stripArg(r, p[0]), true, true));
+            const s = try r.toText(input);
+            return sameKind(input, try within(r, s, try stripChars(r, s.bytes, try stripArg(r, p[0]), true, true)));
         },
         .sum => {
             const p = try bind(r, "sum", &.{ "attribute", "start" }, args, kws);
@@ -1148,7 +1183,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
             if (p[3]) |b| opts.sort_keys = value.truthy(b);
             if (p[1]) |ind| switch (ind) {
                 .none => {},
-                .string, .markup => |s| opts.indent = s,
+                .string, .markup => |s| opts.indent = s.bytes,
                 else => {
                     const n = try intArg(r, ind, "tojson");
                     const len: usize = if (n < 0) 0 else @intCast(@min(n, 1 << 20));
@@ -1172,15 +1207,17 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 else => return e,
             };
             try r.charge(buf.items.len);
-            return .{ .string = buf.items };
+            return .{ .string = .{ .bytes = buf.items, .origin = value.originIn(input, 0) } };
         },
         .truncate => {
             const p = try bind(r, "truncate", &.{ "length", "killwords", "end", "leeway" }, args, kws);
             if (input == .undefined) return input;
-            const s = try strArg(r, input, "truncate");
+            const src = input.strOf() orelse return r.fail("truncate: expected a string, got '{s}'", .{value.typeName(input)});
+            const s = src.bytes;
             const len = if (p[0]) |v| try intArg(r, v, "truncate") else 255;
             const killwords = if (p[1]) |v| value.truthy(v) else false;
-            const end = if (p[2]) |v| try strArg(r, v, "truncate") else "...";
+            const end_s: Str = if (p[2]) |v| (v.strOf() orelse return r.fail("truncate: expected a string, got '{s}'", .{value.typeName(v)})) else .{ .bytes = "..." };
+            const end = end_s.bytes;
             const leeway = if (p[3]) |v| (if (v == .none) 5 else try intArg(r, v, "truncate")) else 5;
             const end_len: i64 = @intCast(render.cpCount(end));
             if (len < end_len) return r.fail("expected length >= {d}, got {d}", .{ end_len, len });
@@ -1189,7 +1226,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
             if (n <= @as(i128, len) + leeway) return input;
             const head = render.cpSlice(s, 0, @intCast(len - end_len));
             const kept = if (killwords) head else if (std.mem.lastIndexOfScalar(u8, head, ' ')) |at| head[0..at] else head;
-            return .{ .string = try std.mem.concat(r.arena, u8, &.{ kept, end }) };
+            return .{ .string = try joined(r, &.{ try within(r, src, kept), end_s }) };
         },
         .unique => {
             const p = try bind(r, "unique", &.{ "case_sensitive", "attribute" }, args, kws);
@@ -1244,7 +1281,7 @@ fn sortKey(r: *Renderer, item: Value, attr: ?Value, cs: bool) Failure!Value {
     const text = a.str() orelse return r.newList(&.{try keyOf(r, item, a, cs)}, .list);
     var parts = std.ArrayList(Value).empty;
     var it = std.mem.splitScalar(u8, text, ',');
-    while (it.next()) |part| try parts.append(r.arena, try keyOf(r, item, .{ .string = part }, cs));
+    while (it.next()) |part| try parts.append(r.arena, try keyOf(r, item, .plain(part), cs));
     return r.newList(parts.items, .list);
 }
 
@@ -1352,8 +1389,8 @@ pub fn length(r: *Renderer, v: Value) Failure!usize {
     return switch (v) {
         .undefined => 0,
         .string, .markup => |s| blk: {
-            try r.scan(s.len);
-            break :blk render.cpCount(s);
+            try r.scan(s.bytes.len);
+            break :blk render.cpCount(s.bytes);
         },
         .list => |l| if (l.isIterator()) r.fail("object of type '{s}' has no len()", .{@tagName(l.kind)}) else l.items.items.len,
         .dict => |d| d.entries.items.len,
@@ -1426,7 +1463,7 @@ pub fn applyTest(r: *Renderer, t: Test, v: Value, args: []const Value, kws: []co
         .@"true" => v == .boolean and v.boolean,
         .filter, .@"test" => blk: {
             const name = switch (v) {
-                .string, .markup => |s| s,
+                .string, .markup => |s| s.bytes,
                 .list => |l| if (l.kind == .tuple) break :blk false else return r.fail("unhashable type: '{s}'", .{@tagName(l.kind)}),
                 .dict, .namespace => return r.fail("unhashable type: '{s}'", .{value.typeName(v)}),
                 else => break :blk false,
@@ -1461,7 +1498,7 @@ fn sameAs(a: Value, b: Value) bool {
         .none => b == .none,
         .boolean => |x| b == .boolean and b.boolean == x,
         .int => |x| b == .int and b.int == x and x >= -5 and x <= 256,
-        .string, .markup => |s| if (b.str()) |t| s.ptr == t.ptr and s.len == t.len and @intFromEnum(a) == @intFromEnum(b) else false,
+        .string, .markup => |s| if (b.str()) |t| s.bytes.ptr == t.ptr and s.bytes.len == t.len and @intFromEnum(a) == @intFromEnum(b) else false,
         .list => |l| b == .list and b.list == l,
         .dict => |d| b == .dict and b.dict == d,
         .namespace => |d| b == .namespace and b.namespace == d,
@@ -1493,11 +1530,12 @@ fn callMethod(r: *Renderer, recv: Value, m: value.Method, args: []const Value, k
     switch (m) {
         .split, .rsplit => {
             const p = try bind(r, @tagName(m), &.{ "sep", "maxsplit" }, args, kws);
-            return split(r, recv.str().?, p[0], p[1], m == .rsplit);
+            return split(r, recv.strOf().?, p[0], p[1], m == .rsplit);
         },
         .indent => {
             const p = try bind(r, "indent", &.{ "width", "first", "blank" }, args, kws);
-            return .{ .string = try cppIndent(r, recv.str().?, p[0], p[1], p[2]) };
+            const pad_origin: value.Origin = if (p[0]) |w| value.originIn(w, 0) else .template;
+            return .{ .string = .{ .bytes = try cppIndent(r, recv.str().?, p[0], p[1], p[2]), .origin = recv.strOf().?.origin.strictest(pad_origin) } };
         },
         .append => {
             try noKeywords(r, "append", kws);
@@ -1527,27 +1565,29 @@ fn callMethod(r: *Renderer, recv: Value, m: value.Method, args: []const Value, k
         else => {},
     }
     try noKeywords(r, @tagName(m), kws);
-    const s = recv.str().?;
+    const src = recv.strOf().?;
+    const s = src.bytes;
     switch (m) {
         .startswith, .endswith => return .{ .boolean = try affix(r, s, args, m == .endswith) },
         .replace => {
             if (args.len < 2 or args.len > 3) return r.fail("replace expected 2 or 3 arguments, got {d}", .{args.len});
             const count = if (args.len > 2) try intArg(r, args[2], "replace") else -1;
-            return sameKind(recv, try replace(r, s, try strArg(r, args[0], "replace"), try strArg(r, args[1], "replace"), count));
+            const new = args[1].strOf() orelse return r.fail("replace: expected a string, got '{s}'", .{value.typeName(args[1])});
+            return sameKind(recv, try replace(r, src, try strArg(r, args[0], "replace"), new, count));
         },
         .strip, .lstrip, .rstrip => {
             if (args.len > 1) return r.fail("{s} expected at most 1 argument, got {d}", .{ @tagName(m), args.len });
             const chars = try stripArg(r, if (args.len > 0) args[0] else null);
-            return sameKind(recv, try stripChars(r, s, chars, m != .rstrip, m != .lstrip));
+            return sameKind(recv, try within(r, src, try stripChars(r, s, chars, m != .rstrip, m != .lstrip)));
         },
         .upper, .lower, .title, .capitalize => {
             if (args.len > 0) return r.fail("{s}() takes no arguments ({d} given)", .{ @tagName(m), args.len });
-            return sameKind(recv, switch (m) {
+            return sameKind(recv, src.remap(switch (m) {
                 .upper => try mapCase(r, s, true),
                 .lower => try mapCase(r, s, false),
                 .title => try strTitle(r, s),
                 else => try capitalize(r, s),
-            });
+            }));
         },
         else => unreachable,
     }
@@ -1565,7 +1605,7 @@ fn cppIndent(r: *Renderer, s: []const u8, width: ?Value, first_v: ?Value, blank_
             @memset(b, ' ');
             break :blk b;
         },
-        .string, .markup => |t| t,
+        .string, .markup => |t| t.bytes,
         else => "    ",
     } else "    ";
     const first = if (first_v) |v| value.truthy(v) else false;
@@ -1640,7 +1680,7 @@ fn callGlobal(r: *Renderer, g: value.Global, args: []const Value, kws: []const K
                     try d.put(&r.meter, r.arena, kv[0], kv[1]);
                 },
             };
-            for (kws) |kw| try d.put(&r.meter, r.arena, .{ .string = kw.name }, kw.value);
+            for (kws) |kw| try d.put(&r.meter, r.arena, .plain(kw.name), kw.value);
             return .{ .namespace = d };
         },
         .raise_exception => {
@@ -1649,8 +1689,9 @@ fn callGlobal(r: *Renderer, g: value.Global, args: []const Value, kws: []const K
         },
         .strftime_now => {
             const p = try bind(r, "strftime_now", &.{"format"}, args, kws);
-            const fmt = try strArg(r, try required(r, "strftime_now", p[0]), "strftime_now");
-            return .{ .string = try strftimeNow(r, fmt) };
+            const given = try required(r, "strftime_now", p[0]);
+            const fmt = given.strOf() orelse return r.fail("strftime_now: expected a string, got '{s}'", .{value.typeName(given)});
+            return .{ .string = fmt.derive(try strftimeNow(r, fmt.bytes)) };
         },
     }
 }
