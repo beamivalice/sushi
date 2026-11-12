@@ -375,8 +375,7 @@ pub const Table = struct {
         const n = if (only) |o| o.len else ids.len;
         if (self.rows_read) |c| _ = c.fetchAdd(n, .monotonic);
         var job: Job = .{ .t = self, .ids = ids, .only = only, .w = w, .s = sc };
-        // One thread per 16 rows (a verify's rows wait at the first Engram layer), this one included.
-        const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, PAR_THREADS);
+        const parts = readParts(n);
         if (parts > 1) {
             var threads: [PAR_THREADS]?std.Thread = @splat(null);
             for (threads[1..parts], 1..) |*t, k| t.* = std.Thread.spawn(.{}, Job.runVoid, .{ &job, k, parts }) catch null;
@@ -735,9 +734,15 @@ pub const Prefetch = struct {
 };
 
 const PAR_ROWS_PER_THREAD = 16;
-const PAR_THREADS = 16;
-/// Rows of one read from which every thread has `PAR_ROWS_PER_THREAD` of its own.
-const ADVISE_BELOW = PAR_ROWS_PER_THREAD * PAR_THREADS;
+const PAR_THREADS = 64;
+/// Rows of one read from which it is not advised: its threads' preads already queue deep enough.
+const ADVISE_BELOW = 256;
+
+/// Threads a read of `n` rows takes, this one included: one per 16 rows (a verify's rows wait at the first Engram
+/// layer), up to the queue depth past which the SSD answers random rows no sooner.
+fn readParts(n: usize) usize {
+    return std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, PAR_THREADS);
+}
 
 fn preadAll(fd: c_int, dst: []u8, off: u64) bool {
     expert_io.readExact(fd, dst, off) catch return false;
@@ -957,7 +962,12 @@ test "dsv41 engram: rows read together equal rows read one at a time, in any ord
     }
 }
 
-test "dsv41 engram: a batch that fills every thread is read without advise calls, a narrow one with two a row" {
+test "dsv41 engram: a read takes one thread per 16 rows, up to 64" {
+    for ([_][2]usize{ .{ 0, 1 }, .{ 24, 1 }, .{ 32, 2 }, .{ 192, 12 }, .{ 512, 32 }, .{ 1024, 64 }, .{ 49152, 64 } }) |c|
+        try testing.expectEqual(c[1], readParts(c[0]));
+}
+
+test "dsv41 engram: a batch of 256 rows or more is read without advise calls, a narrower one with two a row" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = testing.tmpDir(.{});
     defer td.cleanup();

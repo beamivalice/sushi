@@ -482,6 +482,22 @@ recorded, not rerun.
 - What is left of the idle is the trellis reads of the layers that miss the most (sixty experts a chunk on some
   encoder layers, 47 ms of reads against 16 ms of GEMMs to hide them behind).
 
+### Engram batch reads at 64 threads (fast bench)
+
+`tests/bench.sh --tag p2-engram --rungs 4k,8k`, the same pack and flags, the source tree of this change on `2877a95e`,
+M5 Max, AC, fans at max, `taskpolicy -a`, GPU lock, boot at 49 °C, Nominal. Baseline: the table above, recorded, not rerun.
+
+| rung | code prefill | was | prose prefill | was | code decode | was | prose decode | was |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 1,324 | 1,300 | 1,169 | 893 | 95.7 | 93.3 | 53.1 | 53.1 |
+| 8k | 1,528 | 1,476 | 1,390 | 1,311 | 100.8 | 99.6 | 56.1 | 58.4 |
+
+- The micro indicator that decided it: the read pattern replayed on the layer-1 table (two `pread`s a row, random
+  rows, arms interleaved, third pass): 3,072 rows 17.2 / 13.0 / 12.3 ms at 16 / 32 / 64 threads, 12,288 rows
+  66 / 50 / 47 ms, 49,152 rows 254 / 195 / 180 ms. Past 64 the SSD answers no sooner.
+- The bench reads the same corpus every run, so its Engram rows may sit in the page cache: these cells show no loss,
+  not the gain. A prompt of fresh text waited 309 ms on the rows of its first 2,048-token chunk (one load, uncooled).
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.

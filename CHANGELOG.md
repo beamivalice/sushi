@@ -9,6 +9,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek-V4.1-Flash prefills long prompts faster on Sushi Cooler**: an expert streamed back from the SSD no
   longer re-reads its small scale vectors while the GPU waits, so long prompts on a budget below the whole pack
   process sooner with the same output; the SSD budget sets 0.7 GB aside for them.
+- **DeepSeek-V4.1-Flash reads a fresh prompt's Engram rows sooner**: the SSD is asked at a deeper queue, so the first
+  chunk of a new prompt waits about a quarter less on them.
 - **DeepSeek-V4.1-Flash drafts cost less**: each drafted token reads its bigram table once, in the form the pack
   stores it, so speculative rounds on code and prose finish sooner with the same text, and the load holds 66 MB less.
 - **Chat templates render in sushi's own engine**: numbers in a tool schema or a tool call replayed from history now
