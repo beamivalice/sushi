@@ -445,7 +445,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `readAnthropicMessages`, `responses.parseInput`) records each part's offset in the joined text
   (`Message.media_parts`); the serializer hands the template a typed part list, so the TEMPLATE renders each
   placeholder; `prepareRequestMedia` expands every pad to its block's rows and keys each block for the prefix cache.
-  The engine never inserts pads itself: a template that renders fewer placeholders than blocks is a named 400.
+  The engine never inserts pads itself: a rendered prompt whose placeholder count differs from its blocks (fewer, or a
+  stray id typed in text or carried by an earlier turn) is a named 400 before any row is spliced, so the splice's row
+  count always equals the encoded rows.
   DeepSeek-V4.1's template reads `content` as a string, so `ChatConfig.image_placeholder` renders each image's atom at
   its offset instead, and `placeMedia` expands it to the image's whole span (`dsv41_vision.spanRows`: aligner rows,
   newlines, start and end), not a merged-grid count.

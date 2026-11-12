@@ -1543,6 +1543,60 @@ test "placeMedia expands each placeholder to its block's rows, in prompt order" 
     }, placed.items);
 }
 
+test "a media request whose prompt holds a placeholder id its media did not put there is refused by name, never spliced" {
+    var cfg = model_mod.ModelConfig{};
+    cfg.qwen_vision = true;
+    cfg.qv_merge = 2;
+    cfg.image_token_id = 9;
+    cfg.video_token_id = 8;
+    var entry = model_registry_mod.LoadedModel{
+        .allocator = std.testing.allocator,
+        .id = "m",
+        .path = "",
+        .bytes_on_disk = 0,
+        .arch_hint = "",
+        .config = &cfg,
+        .weights = null,
+        .handle = null,
+        .tokenizer = null,
+        .chat_config = null,
+        // Only its presence is read: placement refuses before any encode.
+        .vision_encoder = @ptrFromInt(0x1000),
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .ready,
+        .error_name = null,
+    };
+    const images = [_]chat_mod.ImageData{testGridImage(4, 4, "a")};
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "what is this", .images = &images }};
+    // The template's placeholder for the image, and a stray one: an image id spelled in the user's text, an earlier
+    // turn's reply re-tokenized, or a video id where no video was sent.
+    const cases = [_][]const u32{
+        &.{ 1, 7, 9, 6, 2, 9, 3 },
+        &.{ 1, 9, 4, 7, 9, 6, 2 },
+        &.{ 1, 7, 9, 6, 2, 8, 3 },
+    };
+    for (cases) |ids| {
+        var flat = try flattenMedia(std.testing.allocator, &messages);
+        defer flat.deinit(std.testing.allocator);
+        switch (try placeRequestMedia(std.testing.allocator, &entry, &messages, flat, ids)) {
+            .placed => |p| {
+                var placed = p;
+                placed.deinit(std.testing.allocator);
+                return error.StrayPlaceholderPlaced;
+            },
+            .refused => |fault| {
+                try std.testing.expectEqual(@as(u16, 400), fault.code());
+                try std.testing.expect(std.mem.indexOf(u8, fault.text(), "placeholders for 1 images and 0 videos") != null);
+            },
+        }
+    }
+}
+
 test "deepseek_v41: the image token spelled in a text-only prompt is text, with no placeholder check" {
     // The released tokenizer splits `<｜deepseek_image｜>` out of any text (an AGENTS.md that names it);
     // only attached media make an id a placeholder, and this arch serves none.
