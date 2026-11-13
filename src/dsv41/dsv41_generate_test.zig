@@ -564,7 +564,7 @@ test "dsv41 engine: a sampled DSpark request on the engine of our own repeats at
     }
 }
 
-test "dsv41 generator: a seeded sampled request verifies at one width whatever the cost model says (DSV41_STQ_TINY)" {
+test "dsv41 generator: on MLX's route a seeded sampled request verifies at one width whatever the cost model says (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
@@ -5212,6 +5212,70 @@ fn engineIds(fx: *EngineFixture, tok: *Tokenizer, prompt: []const u32, want: u32
             }
         },
     }
+}
+
+test "dsv41 engine: a seeded sampled request takes the adaptive widths and copy rounds, and says the fixed width's tokens (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..30];
+    const want: u32 = 60;
+    const seeded: SamplingParams = .{ .temperature = 0.8, .seed = 7 };
+
+    var checked: []const u8 = "the fixed width's run";
+    errdefer std.debug.print("failed at: {s}\n", .{checked});
+    var fixed: std.ArrayList(u32) = .empty;
+    defer fixed.deinit(a);
+    try engineIds(&fx, &tok, prompt, want, seeded, .rows3, &fixed);
+    try testing.expectEqual(@as(usize, want), fixed.items.len);
+
+    // The cost model moves the widths of a seeded request, never its tokens.
+    var widths: [2][dsv41_max_drafts + 2]u32 = undefined;
+    for ([_]bool{ true, false }, &widths) |dear, *hist| {
+        checked = if (dear) "tokens under a dear cost model" else "tokens under a cheap cost model";
+        try fx.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, want, seeded, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_policy.cost = if (dear) .{ .plain_ms = 900, .step_ms = 40, .draft_ms = 40, .prior = 40 } else .{ .plain_ms = 5, .step_ms = 3, .draft_ms = 1, .prior = 3 };
+        var got: std.ArrayList(u32) = .empty;
+        defer got.deinit(a);
+        while (try gen.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            try got.appendSlice(a, r.tokens);
+        }
+        try testing.expectEqualSlices(u32, fixed.items, got.items);
+        hist.* = gen.dspark_stats.rows_hist;
+    }
+    checked = "the widths move with the cost model";
+    try testing.expect(!std.mem.eql(u32, &widths[0], &widths[1]));
+    checked = "tokens and copy rounds";
+
+    // The prompt, the text the request is about to write, and the prompt again: its tail copies its own continuation.
+    const ctx = try a.alloc(u32, prompt.len * 2 + fixed.items.len);
+    defer a.free(ctx);
+    @memcpy(ctx[0..prompt.len], prompt);
+    @memcpy(ctx[prompt.len..][0..fixed.items.len], fixed.items);
+    @memcpy(ctx[prompt.len + fixed.items.len ..], prompt);
+    try fx.xfm.resetCache();
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, want, seeded, &.{}, .{ .dspark_enabled = true, .lookup_prompt = ctx });
+    defer gen.deinit(a);
+    gen.dspark_copy = true;
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(a);
+    while (try gen.nextDspark(a)) |r| {
+        defer a.free(r.tokens);
+        try got.appendSlice(a, r.tokens);
+    }
+    try testing.expectEqualSlices(u32, fixed.items, got.items);
+    try testing.expect(gen.dspark_stats.copy_rounds > 0);
 }
 
 test "dsv41 engine: a seeded request gives the same tokens, the first one included, at every serial mix and at every DSpark round-width mix, streamed or not, and twice (DSV41_STQ_TINY)" {

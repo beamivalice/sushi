@@ -131,6 +131,9 @@ earlier history is mlx-serve's, in that project's changelog.
   value, as Python's `json.loads` does, where the call reached the prompt with no arguments at all.
 - **DeepSeek-V4.1-Flash reuses a short prompt sent again**: a prompt under 512 tokens repeated on the same slot rolls
   back to the state the last request left, where it prefilled from the start.
+- **A seeded DeepSeek-V4.1-Flash request keeps the adaptive draft rounds**: on Sushi Cooler a request with a `seed`
+  and a temperature takes the same draft rounds as an unseeded one, where it verified at one fixed width, and the
+  seed still gives the same text every time, streamed or not.
 
 ## v1.6.0 — Stability, UI and Architecture Refactor
 
