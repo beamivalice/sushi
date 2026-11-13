@@ -2977,6 +2977,10 @@ test "suppress_mask: a mask the engine could not apply fails the draw, and the s
 
 test "sampler: on the engine a sampled step, the sync sampler and a block's rows each draw the rule's token for their position" {
     try mlx.requireGpu();
+    // `sampler_draw`'s kernel launches only on a GPU with matrix units, where the engine serves.
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("test_support.zig").restoreEngine(was_enabled);

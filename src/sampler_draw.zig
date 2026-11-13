@@ -16,6 +16,7 @@ const Arr = mlx.mlx_array;
 
 /// Rows of one launch: a verify block's.
 pub const max_rows = 16;
+/// A row's threadgroup. A GPU without matrix units grants this kernel 768, so it launches only where the engine serves.
 const group_threads = 1024;
 
 // `sushi_draw_mix` is lowbias32, ported from hash-prospector (public domain): NOTICE.
@@ -490,6 +491,11 @@ fn drawHost(a: std.mem.Allocator, s: mlx.mlx_stream, flat: []const f32, n_rows: 
 
 test "sampler draw: the kernel draws what the rule draws, at every filter, with and without ties" {
     try mlx.requireGpu();
+    // The engine draws where it serves a model, a GPU with matrix units; one without grants this kernel 768 threads a
+    // group, under the 1,024 it is laid out on. A failed launch takes its raise with it.
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
     const vocab = 4099;
     const n_rows = 5;
@@ -537,6 +543,11 @@ test "sampler draw: the kernel draws what the rule draws, at every filter, with 
 
 test "sampler draw: a row's draw is the same alone, beside other rows and at any place among them" {
     try mlx.requireGpu();
+    // The engine draws where it serves a model, a GPU with matrix units; one without grants this kernel 768 threads a
+    // group, under the 1,024 it is laid out on. A failed launch takes its raise with it.
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -570,6 +581,11 @@ test "sampler draw: a row's draw is the same alone, beside other rows and at any
 
 test "sampler draw: an id at -inf is never drawn, top-k 1 and a zero nucleus are the lowest top id, and no finite value draws id 0" {
     try mlx.requireGpu();
+    // The engine draws where it serves a model, a GPU with matrix units; one without grants this kernel 768 threads a
+    // group, under the 1,024 it is laid out on. A failed launch takes its raise with it.
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -607,6 +623,11 @@ test "sampler draw: an id at -inf is never drawn, top-k 1 and a zero nucleus are
 
 test "sampler draw: over many keys the kept ids come out at their share of the kept mass" {
     try mlx.requireGpu();
+    // The engine draws where it serves a model, a GPU with matrix units; one without grants this kernel 768 threads a
+    // group, under the 1,024 it is laid out on. A failed launch takes its raise with it.
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
