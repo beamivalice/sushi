@@ -66,8 +66,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   request on another arch that names NO effort gets no server budget: Qwen3.8's template renders an absent word as
   low (`chat.ladderEffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
   `sequence_number` on every event, stateful via
-  `ResponseStore`, WS via Upgrade. A replayed `reasoning` input item (`content[].reasoning_text`, else
-  `summary[].summary_text`) joins the following message and calls as ONE assistant turn's `reasoning_content`, and the
+  `ResponseStore`, WS via Upgrade. Consecutive assistant input items (a `reasoning` item, a message, `function_call`s)
+  are ONE assistant turn, with or without the reasoning item (`responses.joinAssistantTurn`; two texts in a row stay
+  two turns). A replayed `reasoning` input item (`content[].reasoning_text`, else `summary[].summary_text`) is that
+  turn's `reasoning_content`, and the
   store keeps it in the same field, so an input replay and a `previous_response_id` chain render the same prompt;
   an encrypted, empty or malformed item is dropped, never a 400. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
   `/v1/messages`.

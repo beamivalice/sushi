@@ -417,11 +417,11 @@ pub fn parseInput(
             try pi.messages.append(allocator, .{ .role = "user", .content = s });
         },
         .array => |arr| {
-            // The assistant message a preceding reasoning item opened, still open to join.
-            var reasoning_turn: ?usize = null;
+            // The assistant message the items before this one opened, still open to join.
+            var open_turn: ?usize = null;
             for (arr.items, 0..) |item, item_index| {
                 if (item != .object) {
-                    reasoning_turn = null;
+                    open_turn = null;
                     continue;
                 }
                 const obj = item.object;
@@ -430,25 +430,25 @@ pub fn parseInput(
                 const t_val = obj.get("type") orelse {
                     // Bare {role, content} (some clients omit "type":"message")
                     try appendMessageItem(allocator, &pi, obj, sink);
-                    joinReasoningTurn(&pi, &reasoning_turn, before);
+                    joinAssistantTurn(&pi, &open_turn, before);
                     continue;
                 };
                 if (t_val != .string) {
-                    reasoning_turn = null;
+                    open_turn = null;
                     continue;
                 }
                 const t = t_val.string;
-                if (!std.mem.eql(u8, t, "message") and !std.mem.eql(u8, t, "function_call")) reasoning_turn = null;
+                if (!std.mem.eql(u8, t, "message") and !std.mem.eql(u8, t, "function_call")) open_turn = null;
                 if (std.mem.eql(u8, t, "message")) {
                     try appendMessageItem(allocator, &pi, obj, sink);
-                    joinReasoningTurn(&pi, &reasoning_turn, before);
+                    joinAssistantTurn(&pi, &open_turn, before);
                 } else if (std.mem.eql(u8, t, "function_call")) {
                     try appendFunctionCallInputItem(allocator, &pi, obj);
-                    joinReasoningTurn(&pi, &reasoning_turn, before);
+                    joinAssistantTurn(&pi, &open_turn, before);
                 } else if (std.mem.eql(u8, t, "function_call_output")) {
                     try appendFunctionCallOutputItem(allocator, &pi, obj, sink);
                 } else if (std.mem.eql(u8, t, "reasoning")) {
-                    if (try appendReasoningInputItem(allocator, &pi, obj)) reasoning_turn = pi.messages.items.len - 1;
+                    if (try appendReasoningInputItem(allocator, &pi, obj)) open_turn = pi.messages.items.len - 1;
                 } else if (std.mem.eql(u8, t, "compaction")) {
                     appendCompactionInputItem(allocator, &pi, obj) catch {};
                 } else {
@@ -501,22 +501,22 @@ fn appendReasoningInputItem(
     return true;
 }
 
-/// Folds the assistant message just appended (index `before`) into the reasoning turn it follows, so
+/// Folds the assistant message just appended (index `before`) into the assistant turn it follows, so
 /// reasoning, text and parallel calls render as ONE assistant turn like chat completions. Never joins
-/// across a user/tool turn or two nonempty assistant texts.
-fn joinReasoningTurn(pi: *ParsedInput, turn: *?usize, before: usize) void {
-    const index = turn.* orelse return;
-    if (pi.messages.items.len != before + 1) {
+/// across a user/tool turn or two nonempty assistant texts: the message then opens a turn of its own.
+fn joinAssistantTurn(pi: *ParsedInput, turn: *?usize, before: usize) void {
+    if (pi.messages.items.len != before + 1 or !std.mem.eql(u8, pi.messages.items[before].role, "assistant")) {
         turn.* = null;
         return;
     }
+    const index = turn.* orelse {
+        turn.* = before;
+        return;
+    };
     const next = pi.messages.items[before];
     const target = &pi.messages.items[index];
-    if (!std.mem.eql(u8, next.role, "assistant") or
-        (target.content.len > 0 and next.content.len > 0) or
-        (target.images != null and next.images != null))
-    {
-        turn.* = null;
+    if ((target.content.len > 0 and next.content.len > 0) or (target.images != null and next.images != null)) {
+        turn.* = before;
         return;
     }
     if (next.tool_calls) |calls| {
@@ -1266,7 +1266,8 @@ test "ResponseStore evicts LRU at cap" {
     try testing.expect(store.get("id_2") != null);
 }
 
-fn expectSameQwenPrompt(actual: []const chat_mod.Message, expected: []const chat_mod.Message) !void {
+/// `holds`: text the prompt must carry, so two renders that both lost it do not pass as equal.
+fn expectSameQwenPrompt(actual: []const chat_mod.Message, expected: []const chat_mod.Message, holds: []const u8) !void {
     const a = testing.allocator;
     var config = (try arch_fx.qwenChatConfig(a)) orelse return error.SkipZigTest;
     defer config.dropCompiled();
@@ -1277,7 +1278,7 @@ fn expectSameQwenPrompt(actual: []const chat_mod.Message, expected: []const chat
     const want = try chat_mod.renderChatTemplate(a, expected, &config, tools, null, true, null, false);
     defer a.free(want);
     try testing.expectEqualStrings(want, got);
-    try testing.expect(std.mem.indexOf(u8, got, "inspect both") != null);
+    try testing.expect(std.mem.indexOf(u8, got, holds) != null);
 }
 
 test "parseInput: a replayed reasoning item renders the chat-completions prompt" {
@@ -1304,7 +1305,63 @@ test "parseInput: a replayed reasoning item renders the chat-completions prompt"
         .{ .role = "tool", .content = "second", .tool_call_id = "c2" },
     };
     try testing.expectEqual(expected.len, pi.messages.items.len);
-    try expectSameQwenPrompt(pi.messages.items, &expected);
+    try expectSameQwenPrompt(pi.messages.items, &expected, "inspect both");
+}
+
+test "parseInput: an assistant's text and parallel calls are one turn with no reasoning item before them" {
+    const a = testing.allocator;
+    const calls = [_]chat_mod.ToolCall{
+        .{ .id = "c1", .name = "lookup", .arguments = "{\"id\":1}" },
+        .{ .id = "c2", .name = "lookup", .arguments = "{\"id\":2}" },
+    };
+    const results = [_]chat_mod.Message{
+        .{ .role = "tool", .content = "first", .tool_call_id = "c1" },
+        .{ .role = "tool", .content = "second", .tool_call_id = "c2" },
+    };
+    const cases = [_]struct { input: []const u8, turn: chat_mod.Message }{
+        .{ .input =
+        \\[{"role":"user","content":"compare"},
+        \\ {"type":"function_call","call_id":"c1","name":"lookup","arguments":"{\"id\":1}"},
+        \\ {"type":"function_call","call_id":"c2","name":"lookup","arguments":"{\"id\":2}"},
+        \\ {"type":"function_call_output","call_id":"c1","output":"first"},
+        \\ {"type":"function_call_output","call_id":"c2","output":"second"}]
+        , .turn = .{ .role = "assistant", .content = "", .tool_calls = &calls } },
+        .{ .input =
+        \\[{"role":"user","content":"compare"},
+        \\ {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Looking both up."}]},
+        \\ {"type":"function_call","call_id":"c1","name":"lookup","arguments":"{\"id\":1}"},
+        \\ {"type":"function_call","call_id":"c2","name":"lookup","arguments":"{\"id\":2}"},
+        \\ {"type":"function_call_output","call_id":"c1","output":"first"},
+        \\ {"type":"function_call_output","call_id":"c2","output":"second"}]
+        , .turn = .{ .role = "assistant", .content = "Looking both up.", .tool_calls = &calls } },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, case.input, .{});
+        defer parsed.deinit();
+        var pi = try parseInput(a, parsed.value, null, null, null, .{});
+        defer pi.deinit();
+        const expected = [_]chat_mod.Message{ .{ .role = "user", .content = "compare" }, case.turn, results[0], results[1] };
+        try testing.expectEqual(expected.len, pi.messages.items.len);
+        try expectSameQwenPrompt(pi.messages.items, &expected, "second");
+    }
+}
+
+test "parseInput: two assistant texts in a row stay two turns, and calls join the later one" {
+    const a = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"role":"user","content":"compare"},
+        \\ {"type":"message","role":"assistant","content":[{"type":"output_text","text":"One."}]},
+        \\ {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Two."}]},
+        \\ {"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(a, parsed.value, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 3), pi.messages.items.len);
+    try testing.expectEqualStrings("One.", pi.messages.items[1].content);
+    try testing.expect(pi.messages.items[1].tool_calls == null);
+    try testing.expectEqualStrings("Two.", pi.messages.items[2].content);
+    try testing.expectEqualStrings("c1", pi.messages.items[2].tool_calls.?[0].id);
 }
 
 test "parseInput: an unreadable reasoning item is dropped without an error" {
