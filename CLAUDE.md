@@ -111,8 +111,8 @@ macOS 26.2. Box: M5 Max 128 GB, macOS 27. Bumping mlx:
 Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) the subset that
 [testsuite](docs/testsuite.md#what-a-change-runs) names; (4) refactor. A live curl is NOT a test. A landing runs the
 tests its diff can break, once: never a run for ceremony, never a repeat after a rebase that touched none of its files.
-The full suite and the arch drop test run once at the end of a series of landings, and at a version bump. A full suite
-that fails is fixed and run again until it is green: the fixes are part of it, and a narrower rerun does not stand in.
+The full suite and the arch drop test run once at the end of a series of landings, and at a version bump. A run
+that fails is never restarted whole: fix, then run the failed test, the fix's module and the parts not yet reached.
 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test
 red→fix→green. Refactor = characterization test first. A live failure revealing a CLASS ships the instance test plus a

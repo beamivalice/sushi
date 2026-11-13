@@ -32,6 +32,9 @@ Order (owner, 2026-10-31):
 | 7 | Cross-engine (only before a public claim) | start each engine yourself, `npx -y llmprobe@latest <host:port> -m <id> --bench-only` by hand | recorded in `~/.sushi/runs/bench-<tag>/`, engine named beside every win |
 
 **Rules:**
+- **A failed test never restarts the whole run** (suite, guards or the arch drop test). Fix it, then run once each:
+  the test that failed, the tests of the module the fix touches, and the parts the stopped run had not reached. A
+  part that passed and the fix cannot reach is not run again.
 - **Steps 2 and 7 are different questions.** 2 = "did our code regress", sushi only, every release. 7 = the public
   comparison; re-run it only when another engine's version bumps.
 - **The perf gate times on AC power only.** Check `pmset -g batt` right before each model's run and log the power
