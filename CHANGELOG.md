@@ -14,6 +14,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A sampled DeepSeek token is drawn by one GPU kernel on Sushi Cooler**: temperature, top-k, top-p and the draw
   took up to 101 GPU dispatches a round and now take two. A seed still gives one text on every repeat, streamed or
   not, but not the text an earlier version gave for that seed.
+- **DeepSeek on Sushi Cooler no longer slips a random token into sampled text**: with neither top-p nor top-k set,
+  about one token in 130 was drawn from the whole vocabulary whatever its probability (1.6.1-dev2 and 1.7.0-dev1),
+  which broke tool calls in agent sessions. A seed's text changes once more with the fix.
 - **Settings opens with a copyable GPU wired-limit command**: the `sudo sysctl iogpu.wired_limit_mb=…` line sets all
   three wire limits from one adjustable, savable box that defaults to the Mac's memory less 4 GB.
 - **The test builds no longer link a C++ chat-template library**: the jinja.cpp copy under `lib/jinja_cpp/` is gone; the

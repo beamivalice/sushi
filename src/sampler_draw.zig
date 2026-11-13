@@ -35,7 +35,8 @@ const HEADER =
     \\}
     \\static inline float sushi_draw_gumbel(uint id, uint k0, uint k1) {
     \\  const uint h = sushi_draw_mix(sushi_draw_mix(id * 0x9E3779B1u + k0) + k1);
-    \\  const float u = (float(h >> 8) + 0.5f) * 5.9604644775390625e-8f;
+    \\  // 23 bits: the half step is then exact in a float, so u is inside (0, 1) and the noise is finite.
+    \\  const float u = (float(h >> 9) + 0.5f) * 1.1920928955078125e-7f;
     \\  return -metal::precise::log(-metal::precise::log(u));
     \\}
     \\// Whole nats below the row's top value, the last bin taking everything from 31 down.
@@ -376,7 +377,7 @@ fn mix(h0: u32) u32 {
 /// The kernel's Gumbel of id `id` under `key`, on the host.
 pub fn gumbel(id: u32, key: [2]u32) f32 {
     const h = mix(mix(id *% 0x9E37_79B1 +% key[0]) +% key[1]);
-    const u: f32 = (@as(f32, @floatFromInt(h >> 8)) + 0.5) * 5.9604644775390625e-8;
+    const u: f32 = (@as(f32, @floatFromInt(h >> 9)) + 0.5) * 1.1920928955078125e-7;
     return -@log(-@log(u));
 }
 
@@ -663,5 +664,92 @@ test "sampler draw: over many keys the kept ids come out at their share of the k
     for ([_]f64{ @exp(2.0) / z, @exp(1.0) / z, 1.0 / z }, counts) |p, c| {
         const sigma = @sqrt(p * (1 - p) / @as(f64, draws));
         try testing.expect(@abs(c / @as(f64, draws) - p) < 4 * sigma);
+    }
+}
+
+/// The inverse of `mix`: each of its steps is a bijection of u32.
+fn unmix(h0: u32) u32 {
+    const inv = struct {
+        fn of(comptime a: u32) u32 {
+            var x: u32 = a;
+            for (0..5) |_| x *%= 2 -% a *% x;
+            return x;
+        }
+    };
+    var h = h0;
+    h ^= h >> 16;
+    h *%= comptime inv.of(0x846C_A68B);
+    h ^= (h >> 15) ^ (h >> 30);
+    h *%= comptime inv.of(0x7FEB_352D);
+    h ^= h >> 16;
+    return h;
+}
+
+/// A key under which id `id`'s hash is `hash`.
+fn keyHashing(id: u32, hash: u32) [2]u32 {
+    const k1: u32 = 0x1234_5678;
+    return .{ unmix(unmix(hash) -% k1) -% id *% 0x9E37_79B1, k1 };
+}
+
+test "sampler draw: an id's noise is finite at both ends of its hash" {
+    try testing.expectEqual(@as(u32, 0xDEAD_BEEF), mix(unmix(0xDEAD_BEEF)));
+    for ([_]u32{ 0, 1, 0x00FF_FFFF, 0x7FFF_FFFF, 0xFFFF_FE00, 0xFFFF_FF00, 0xFFFF_FFFF }) |hash| {
+        const g = gumbel(2000, keyHashing(2000, hash));
+        try testing.expect(std.math.isFinite(g));
+        // The largest noise is far under the gap between a likely id and a negligible one.
+        try testing.expect(g < 17.0 and g > -3.0);
+    }
+}
+
+test "sampler draw: a key that maxes a negligible id's hash still draws the likely id, on the host and in the kernel" {
+    const a = testing.allocator;
+    const vocab = 4099;
+    const row = try a.alloc(f32, vocab);
+    defer a.free(row);
+    const order = try a.alloc(u32, vocab);
+    defer a.free(order);
+    // Id 7 holds all but 4098 * e^-30 of the mass.
+    @memset(row, -20.0);
+    row[7] = 10.0;
+    const key = keyHashing(2000, 0xFFFF_FFFF);
+    try testing.expectEqual(@as(u32, 7), hostDraw(row, order, 1.0, 1.0, 0, key).id);
+
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {
+        const got = try drawHost(a, mlx.engine.stream(), row, 1, vocab, dtype, 1.0, 1.0, 0, &.{key});
+        defer a.free(got);
+        try testing.expectEqual(@as(u32, 7), got[0]);
+    }
+}
+
+test "sampler draw: at a served vocabulary an unfiltered row never draws an id of negligible mass" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    const vocab = 129_280;
+    const flat = try a.alloc(f32, max_rows * vocab);
+    defer a.free(flat);
+    // Each row's one likely id holds all but 129,279 * e^-40 of its mass.
+    @memset(flat, -30.0);
+    for (0..max_rows) |r| flat[r * vocab + 1000 * r + 3] = 10.0;
+    var keys: [max_rows][2]u32 = undefined;
+    var call: u32 = 0;
+    while (call < 96) : (call += 1) {
+        for (&keys, 0..) |*k, r| k.* = .{ call * 16 + @as(u32, @intCast(r)), 0xc0de };
+        const got = try drawHost(a, s, flat, max_rows, vocab, .float32, 1.0, 1.0, 0, &keys);
+        defer a.free(got);
+        for (got, 0..) |g, r| try testing.expectEqual(@as(u32, @intCast(1000 * r + 3)), g);
     }
 }
