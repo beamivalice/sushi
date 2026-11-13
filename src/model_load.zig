@@ -2508,6 +2508,15 @@ const JobTurn = struct {
     }
 };
 
+/// Takes a resident model out of memory, inside its job turn: its restore points not on SSD are written while the
+/// state they lean on is still there, then its arrays and its arch's process-wide state go. Every unload of a resident
+/// model on the inference thread (an unload request, an eviction by another model's load) runs this.
+fn retire(entry: *LoadedModel, why: []const u8) void {
+    scheduler_mod.flushLiveState(entry, why);
+    entry.unloadResident();
+    if (entry.config) |c| arch_serve.unloadModel(c);
+}
+
 pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     const job = JobTurn.begin(null, req.config);
     defer job.end();
@@ -2525,8 +2534,7 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
         {
             const victim_job = JobTurn.begin(victim.handle, victim.config);
             defer victim_job.end();
-            victim.unloadResident();
-            if (victim.config) |c| arch_serve.unloadModel(c);
+            retire(victim, "evict");
         }
         evicted_bytes +|= victim_bytes;
         sch.registry.mutex.lockUncancelable(sch.io);
@@ -2597,9 +2605,7 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     });
     const wired_before = status.getWiredMemBytes();
     const job = JobTurn.begin(entry.handle, entry.config);
-    scheduler_mod.flushLiveState(entry, "unload");
-    entry.unloadResident();
-    if (entry.config) |c| arch_serve.unloadModel(c);
+    retire(entry, "unload");
     // unloadResident freed the arrays into MLX's allocator cache — clear it
     // so the unload actually returns the memory to the OS (the whole point
     // of the load→generate→unload flow).

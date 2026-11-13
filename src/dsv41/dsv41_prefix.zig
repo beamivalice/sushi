@@ -185,8 +185,9 @@ pub fn restore(m: *model.Model, cp: *const transformer.SSMCheckpoint, ids: []con
 pub const live_point_cap: u32 = 8;
 
 /// One kept restore point: the fixed arrays (`captureState`'s non-row slots) at `pos`.
-/// `flushed`: the point's state is on SSD already (written through, or restored from there).
-pub const LivePoint = struct { pos: usize, slots: []model.Slot, flushed: bool = false };
+/// `disk_id`: the SSD tier entry the point's state was written to or restored from. Whether the tier still holds it
+/// there is the tier's to say (`DiskTier.holdsPoint`): its budget, a cache clear or a poisoned read remove entries.
+pub const LivePoint = struct { pos: usize, slots: []model.Slot, disk_id: ?u64 = null };
 
 /// The slot's last request, as the next one can roll its live state back into: the points it took and the tokens the
 /// state covers. The rows are the live state's own, append-only, so a point costs its fixed arrays alone. Held only
@@ -234,7 +235,7 @@ pub const Live = struct {
     }
 
     /// Keeps the fixed arrays of `cp`, a point of the request now running, and drops the shallowest past the cap.
-    pub fn keep(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint, flushed: bool) !void {
+    pub fn keep(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint, disk_id: ?u64) !void {
         if (self.ready) self.clear(allocator);
         const n_slots = model.slotCount(m);
         if (cp.layers.len != 2 * n_slots) return error.Dsv41CheckpointMismatch;
@@ -262,26 +263,33 @@ pub const Live = struct {
                 try mlx.check(mlx.mlx_array_set(&sl[k], a));
             }
         }
-        try self.points.append(allocator, .{ .pos = cp.pos, .slots = slots, .flushed = flushed });
+        try self.points.append(allocator, .{ .pos = cp.pos, .slots = slots, .disk_id = disk_id });
     }
 
     /// `keep` for the point a request restored from: its rows below it came from a stored entry.
-    pub fn keepRestored(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint, flushed: bool) !void {
-        try self.keep(allocator, m, cp, flushed);
+    pub fn keepRestored(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint, disk_id: ?u64) !void {
+        try self.keep(allocator, m, cp, disk_id);
         self.base = cp.pos;
     }
 
-    fn markFlushed(self: *Live, pos: usize) void {
+    /// Records the tier entry `id` on each point it now holds.
+    fn markOnDisk(self: *Live, disk: *const kv_disk_cache.DiskTier, id: u64) void {
         for (self.points.items) |*p| {
-            if (p.pos == pos) p.flushed = true;
+            if (disk.holdsPoint(id, p.pos)) p.disk_id = id;
         }
     }
 
-    /// Whether a point of the record is still only here, not on SSD.
-    pub fn unflushed(self: *const Live) bool {
+    /// Whether the tier holds `p`'s state where it was put.
+    fn onDisk(p: *const LivePoint, disk: ?*const kv_disk_cache.DiskTier) bool {
+        const id = p.disk_id orelse return false;
+        return (disk orelse return false).holdsPoint(id, p.pos);
+    }
+
+    /// Whether a point of the record is still only here, not on `disk`.
+    pub fn unflushed(self: *const Live, disk: ?*const kv_disk_cache.DiskTier) bool {
         if (!self.ready) return false;
-        for (self.points.items) |p| {
-            if (!p.flushed) return true;
+        for (self.points.items) |*p| {
+            if (!onDisk(p, disk)) return true;
         }
         return false;
     }
@@ -492,9 +500,6 @@ fn rollbackLiveInPlace(
     const cap: usize = if (media_limits.rule) |r| (r.limitFor(r.ctx, live.vision_key, live.media_start) orelse 0) else kv_disk_cache.MediaLimits.UNBOUNDED;
     const idx = live.pick(m, prompt_ids, has_tools, cap) orelse return null;
     const pos = live.points.items[idx].pos;
-    // A prompt that parts from the last turn inside it prefills from an earlier point: the log says where it left.
-    const shared = std.mem.indexOfDiff(u32, live.tokens, prompt_ids) orelse live.tokens.len;
-    if (shared < @min(live.tokens.len, prompt_ids.len)) log.info("[dsv41-prefix] the prompt leaves the last turn's {d} tokens at {d}\n", .{ live.tokens.len, shared });
     var stored: usize = if (ram_match) |rm| blk: {
         const cps = self.entries.items[rm.idx].ssm_checkpoints orelse break :blk 0;
         break :blk (pc.HotPrefixCache.highestCheckpointAtOrBelow(cps, rm.shared) orelse break :blk 0).pos;
@@ -503,6 +508,9 @@ fn rollbackLiveInPlace(
         stored = @max(stored, hm.cp);
     };
     if (stored > pos) return null;
+    // A prompt that parts from the last turn inside it prefills from an earlier point: the log says where it left.
+    const shared = std.mem.indexOfDiff(u32, live.tokens, prompt_ids) orelse live.tokens.len;
+    if (shared < @min(live.tokens.len, prompt_ids.len)) log.info("[dsv41-prefix] the prompt leaves the last turn's {d} tokens at {d}\n", .{ live.tokens.len, shared });
     const handled = Handled.begin();
     live.rollback(self.allocator, m, idx, prompt_ids) catch |err| {
         log.warn("  [dsv41-prefix] live state not rolled back: {s}; a stored point serves\n", .{@errorName(err)});
@@ -556,7 +564,7 @@ pub fn restoreDisk(
         return null;
     };
     self.last_restored_disk_id = d.entries.items[hm.idx].id;
-    liveOf(self).keepRestored(self.allocator, m, &cp, true) catch handled.drop();
+    liveOf(self).keepRestored(self.allocator, m, &cp, d.entries.items[hm.idx].id) catch handled.drop();
     log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (dsv41@{d})\n", .{ hm.cp, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
     return .{ .matched = hm.cp, .full_match = false, .slot_owned = true };
 }
@@ -567,7 +575,7 @@ pub fn restoreEntry(self: *pc.HotPrefixCache, m: State, e: *pc.Entry, restore_ca
     const cp = pc.HotPrefixCache.highestCheckpointAtOrBelow(cps, restore_cap) orelse return 0;
     try restore(m, cp, prompt_ids);
     const handled = Handled.begin();
-    liveOf(self).keepRestored(self.allocator, m, cp, false) catch handled.drop();
+    liveOf(self).keepRestored(self.allocator, m, cp, null) catch handled.drop();
     return cp.pos;
 }
 
@@ -608,19 +616,19 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
     // A point off the row-segment grid would copy the rows past the last segment into its own file; it stays live.
     const span: usize = if (self.disk.?.grown) |g| g.span else 0;
     for (cps) |*cp| if (!cp.isReleased() and span != 0 and cp.pos % span != 0) cp.release();
-    for (cps) |*cp| if (!cp.isReleased()) liveOf(self).markFlushed(cp.pos);
     const staged_before = self.disk.?.point_bytes_written;
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     self.disk.?.rows_base = @intCast(liveOf(self).base);
     defer self.disk.?.rows_base = std.math.maxInt(u32);
     self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, null, cps, &.{}, std.math.maxInt(u64), s);
+    if (self.disk.?.last_store_id) |id| liveOf(self).markOnDisk(&self.disk.?, id);
     const bytes = self.disk.?.point_bytes_written - staged_before;
     // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
     log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, {s} held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(bytes)) / 1e9, held, sw.read() / std.time.ns_per_ms });
 }
 
 fn keepLive(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cps: []SSMCheckpoint) void {
-    for (cps) |*cp| if (!cp.isReleased()) liveOf(self).keep(self.allocator, m, cp, false) catch |err| {
+    for (cps) |*cp| if (!cp.isReleased()) liveOf(self).keep(self.allocator, m, cp, null) catch |err| {
         log.warn("  [dsv41-prefix] live point at {d} not kept: {s}\n", .{ cp.pos, @errorName(err) });
     };
 }
@@ -648,7 +656,7 @@ pub fn keepEndPointDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, pos: u
         return false;
     };
     defer cp.deinit(self.allocator);
-    live.keep(self.allocator, m, &cp, false) catch |err| {
+    live.keep(self.allocator, m, &cp, null) catch |err| {
         log.warn("  [dsv41-prefix] restore point behind the reply at {d} not kept: {s}\n", .{ pos, @errorName(err) });
         return false;
     };
@@ -660,7 +668,7 @@ pub fn keepEndPointDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, pos: u
 pub fn publishLiveDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, quant: kv_quant.KVQuantConfig) bool {
     liveOf(self).publish(self.allocator, m, tokens, has_tools, media.key, media.start);
     liveOf(self).quant = quant;
-    return liveOf(self).unflushed();
+    return liveOf(self).unflushed(if (self.disk) |*d| d else null);
 }
 
 /// The state is about to be replaced: its record reaches SSD (`flushLiveDsv41`), then goes.
@@ -696,7 +704,7 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, why: []co
         cps.deinit(self.allocator);
     }
     for (live.points.items) |*p| {
-        if (p.flushed or p.pos < kv_disk_cache.MIN_PERSIST_TOKENS or p.pos > @min(live.tokens.len, st.n)) continue;
+        if (Live.onDisk(p, &self.disk.?) or p.pos < kv_disk_cache.MIN_PERSIST_TOKENS or p.pos > @min(live.tokens.len, st.n)) continue;
         var cp = captureLive(self.allocator, m, p) catch |err| {
             log.warn("  [dsv41-prefix] live point at {d} not flushed: {s}\n", .{ p.pos, @errorName(err) });
             continue;
@@ -721,7 +729,7 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, why: []co
     defer self.disk.?.rows_base = std.math.maxInt(u32);
     const media = pc.truncatedMediaKey(&.{}, live.vision_key, if (live.media_start) |v| @as(usize, v) else null, top);
     self.writeThroughHybrid(cache.entries, cache.config, live.tokens[0..top], live.has_tools, media, null, cps.items, &.{}, std.math.maxInt(u64), s);
-    for (cps.items) |*cp| live.markFlushed(cp.pos);
+    if (self.disk.?.last_store_id) |id| live.markOnDisk(&self.disk.?, id);
     const bytes = self.disk.?.point_bytes_written - staged_before;
     log.info("[dsv41-prefix] live points to SSD ({s}): {d} points to {d}, {d:.2} GB staged, held {d} ms\n", .{ why, cps.items.len, top, @as(f64, @floatFromInt(bytes)) / 1e9, sw.read() / std.time.ns_per_ms });
 }

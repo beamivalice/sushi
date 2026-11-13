@@ -1154,12 +1154,16 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   wrote 120.2 GB over 1215 turns (101 MB a turn, prompt median 219k; 150-376 MB a turn in sessions at 230-420k), 1.5.0-dev1
   (`f7da31aa`) 2.7 GB over 331 turns (9 MB a turn, median 107k). The contexts differ; the A/B above is the matched reading.
 - **The live record reaches SSD only when the state is about to be lost** (`HotPrefixCache.flushLiveDsv41`, inference
-  thread): another conversation's lookup that does not roll back, a model unload, an idle queue for 300 s
+  thread): another conversation's lookup that does not roll back, a model unload (an unload request or an eviction by
+  another model's load: both go through `model_load.retire`), an idle queue for 300 s
   (`live_flush_idle_secs`) and a clean shutdown write every point of the record that is not on SSD yet (up to 8: the
   prompt-end and thought points; a grid point was written through), as one commit over the record's tokens with rows that
   are views of the live ones (`dsv41_model.captureLiveShared`), before the new prefill touches them. A point a later
   prefill overwrote was popped from the record by its rollback and is not written. A record with images is written under its vision key (a hash of the pixels), so only a prompt with the same images restores past its first image row.
-  A crash flushes nothing: the cache restores from the last grid point (at most 8192 tokens of re-prefill). Log:
+  "On SSD" is the tier's answer, never the record's memory: a point keeps the id of the entry it was written to or
+  restored from (`LivePoint.disk_id`, set once the commit took it) and counts as on SSD only while that entry holds it
+  (`DiskTier.holdsPoint`), since the tier's budget, a cache clear, a poisoned read or a thinning removes points without
+  telling the record. A crash flushes nothing: the cache restores from the last grid point (at most 8192 tokens of re-prefill). Log:
   `[dsv41-prefix] live points to SSD (why): N points to P, X GB staged, held T ms`. The flush needs no bill of its own: the
   points are the record's, the rows views, and the writer's bounded buffers take the bytes.
   A cancelled request (stop sequence, disconnect) publishes at the scheduler's cull (`commitsAtCull`), not at the cleanup

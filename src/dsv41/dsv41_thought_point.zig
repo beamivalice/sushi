@@ -355,7 +355,7 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     const hc = &model.prefix_cache.?;
     var cp = try dsv41_prefix.capture(a, m, 40);
     defer cp.deinit(a);
-    try dsv41_prefix.liveOf(hc).keep(a, m, &cp, false);
+    try dsv41_prefix.liveOf(hc).keep(a, m, &cp, null);
     var slot: Slot = undefined;
     slot.model = &model;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = a, .config = .dense };

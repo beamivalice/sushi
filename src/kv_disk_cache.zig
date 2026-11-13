@@ -610,6 +610,16 @@ pub const DiskTier = struct {
         return std.fmt.parseInt(u64, rest[0..slash], 10) catch null;
     }
 
+    /// Whether entry `id` is still on the tier, unpoisoned, with a restore point at `pos`: the budget, a cache clear,
+    /// a poisoned read or a thinning of the entry's points can each take one away after it was written.
+    pub fn holdsPoint(self: *const DiskTier, id: u64, pos: usize) bool {
+        for (self.entries.items) |*e| {
+            if (e.id != id) continue;
+            return !e.poisoned and std.mem.indexOfScalar(u32, e.ssm_positions, @intCast(pos)) != null;
+        }
+        return false;
+    }
+
     pub fn poisonId(self: *DiskTier, id: u64, err_name: []const u8) bool {
         for (self.entries.items) |*e| {
             if (e.id != id) continue;

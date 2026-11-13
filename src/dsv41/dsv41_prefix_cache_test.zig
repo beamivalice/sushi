@@ -1194,7 +1194,7 @@ test "DeepSeek live rollback: the state rolled back to each kept point is a full
             at = mark;
             var cp = try dsv41_prefix.capture(a, net.m, mark);
             defer cp.deinit(a);
-            try live.keep(a, net.m, &cp, false);
+            try live.keep(a, net.m, &cp, null);
         }
         _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[at..45], .last));
         live.publish(a, net.m, turn[0..45], false, 0, null);
@@ -1267,7 +1267,7 @@ test "DeepSeek live rollback: only a state still standing for the same history s
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[0..20], .last));
     var cp = try dsv41_prefix.capture(a, net.m, 20);
     defer cp.deinit(a);
-    try live.keep(a, net.m, &cp, false);
+    try live.keep(a, net.m, &cp, null);
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[20..], .last));
     const max: usize = std.math.maxInt(u32);
 
@@ -1475,7 +1475,7 @@ test "DeepSeek live rollback: a cancelled request's record, published at the cul
     {
         var cp = try dsv41_prefix.capture(a, net.m, 20);
         defer cp.deinit(a);
-        try live.keep(a, net.m, &cp, false);
+        try live.keep(a, net.m, &cp, null);
     }
     _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn_a[20..40], .last));
     live.publish(a, net.m, turn_a[0..40], false, 0, null);
@@ -1489,7 +1489,7 @@ test "DeepSeek live rollback: a cancelled request's record, published at the cul
     {
         var cp = try dsv41_prefix.capture(a, net.m, 30);
         defer cp.deinit(a);
-        try live.keep(a, net.m, &cp, false);
+        try live.keep(a, net.m, &cp, null);
     }
 
     // C continues A's conversation: B's state is no state for it.

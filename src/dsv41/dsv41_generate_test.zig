@@ -1924,6 +1924,11 @@ test "dsv41 engine: a Cooler load, its requests and its unload ask nothing of ML
 
 /// The SSD tier as the scheduler arms it for a Cooler load, on a 256-token grid.
 fn coolerTier(f: *EngineFixture, at: []const u8) !@import("../prefix_cache.zig").HotPrefixCache {
+    return coolerTierOf(&f.config, at);
+}
+
+/// The SSD-first hybrid tier a Cooler load builds for `config`, at `at`.
+fn coolerTierOf(config: *const model_mod.ModelConfig, at: []const u8) !@import("../prefix_cache.zig").HotPrefixCache {
     const kv_disk_cache = @import("../kv_disk_cache.zig");
     var hc = @import("../prefix_cache.zig").HotPrefixCache.initWithMem(testing.allocator, 0, 0);
     errdefer hc.deinit();
@@ -1933,14 +1938,153 @@ fn coolerTier(f: *EngineFixture, at: []const u8) !@import("../prefix_cache.zig")
     hc.disk.?.ssd_first = true;
     hc.disk.?.armTestSpace(256 << 30, 1 << 40);
     hc.disk.?.enableBackgroundWriter();
-    const c = &f.config.dsv41.?;
+    const c = &config.dsv41.?;
     const divs = try dsv41_prefix.rowDivisors(testing.allocator, c, true);
     defer testing.allocator.free(divs);
     hc.disk.?.ssm_max_per_entry = dsv41_prefix.disk_checkpoint_cap;
     try hc.disk.?.setGrownSpec(256, divs, c.stateBytesPerToken());
-    hc.arrays_on = dsv41_prefix.arraysOn(&f.config);
+    hc.arrays_on = dsv41_prefix.arraysOn(config);
     hc.disk.?.arrays_on = hc.arrays_on;
     return hc;
+}
+
+test "dsv41 serving: a model another model's load evicts writes its live restore points to the SSD tier first (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    const registry_mod = @import("../model_registry.zig");
+    const scheduler_mod = @import("../scheduler.zig");
+    const was_enabled = mlx.engine.enabled;
+    const was_own = dsv41_borrow.own_override;
+    mlx.engine.enabled = true;
+    dsv41_borrow.own_override = true;
+    defer {
+        test_support.restoreEngine(was_enabled);
+        dsv41_borrow.own_override = was_own;
+    }
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const reg = try registry_mod.ModelRegistry.init(a, io, null, 3, 0, null);
+    defer reg.deinit();
+
+    // The victim as a load leaves it: config, weights and trunk on the heap, an SSD-first tier.
+    const victim = try reg.registerStub("victim", dir, 0);
+    const config = try a.create(model_mod.ModelConfig);
+    victim.config = config;
+    config.* = try model_mod.parseConfig(io, a, dir);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try a.dupe(u8, dir);
+    const weights = try a.create(model_mod.Weights);
+    weights.* = try model_mod.loadWeightsForConfig(io, a, dir, config, false);
+    victim.weights = weights;
+    const t = try a.create(Trunk);
+    t.* = try Trunk.init(io, a, config.*, weights);
+    victim.handle = @import("../arch/handle.zig").handleOf(t);
+    victim.prefix_cache = try coolerTierOf(config, base);
+    const hc = &victim.prefix_cache.?;
+
+    // A turn whose prompt ends off the tier's 128-token grid: only the live record holds that point.
+    const m = dsv41_state.modelOf(t).?;
+    var buf: [520]u32 = undefined;
+    for (&buf, 0..) |*id, i| id.* = @intCast((i * 7 + 3) % 90);
+    const point = buf.len;
+    try t.resetCache();
+    var ctx = t.defaultCtx();
+    _ = mlx.mlx_array_free(try forwardIds(t, &ctx, &buf));
+    ctx.cache.step = point;
+    {
+        var cp = try dsv41_prefix.capture(a, m, point);
+        defer cp.deinit(a);
+        try dsv41_prefix.liveOf(hc).keep(a, m, &cp, null);
+    }
+    try testing.expect(dsv41_prefix.publishLiveDsv41(hc, m, &buf, false, .{}, ctx.cache.config));
+    try testing.expect(dsv41_prefix.liveOf(hc).unflushed(&hc.disk.?));
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(victim, 0);
+    reg.markEvictingLocked(victim);
+    reg.mutex.unlock(io);
+
+    // Another model's load evicts it; that load then fails at the arch gate, which leaves the eviction done.
+    const other = try reg.registerStub("other", base, 0);
+    reg.mutex.lockUncancelable(io);
+    try testing.expect(reg.tryBeginLoadLocked(other));
+    reg.mutex.unlock(io);
+    var other_config: model_mod.ModelConfig = .{};
+    var victims = [_]*registry_mod.LoadedModel{victim};
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = io;
+    sch.allocator = a;
+    var req: scheduler_mod.LoadRequest = .{ .entry = other, .config = &other_config, .tok = undefined, .chat_config = undefined, .model_dir = base, .evict_entries = &victims, .allocator = a };
+    @import("../model_load.zig").runLoadRequest(&sch, &req);
+    defer if (req.error_name) |n| a.free(n);
+    try testing.expectEqualStrings("ArchitectureUnsupported", req.error_name.?);
+    try testing.expectEqual(registry_mod.LoadState.unloaded, victim.state);
+    try testing.expect(victim.handle == null);
+    try testing.expect(!mlx.errorPending());
+
+    var tier = try @import("../kv_disk_cache.zig").DiskTier.init(a, io, base, "dsv41-census", 0, 128);
+    defer tier.deinit();
+    var found = false;
+    for (tier.entries.items) |*e| found = found or std.mem.indexOfScalar(u32, e.ssm_positions, point) != null;
+    try testing.expect(found);
+}
+
+test "dsv41 serving: a live point the SSD tier dropped after it was flushed is written again at the next flush (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var hc = try coolerTier(&fx, base);
+    defer hc.deinit();
+    // A prompt end off the tier's 128-token grid: only the live record holds that point until a flush.
+    var buf: [520]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    const point = prompt.len;
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt));
+    ctx.cache.step = point;
+    {
+        var cp = try dsv41_prefix.capture(a, m, point);
+        defer cp.deinit(a);
+        try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, null);
+    }
+    const Tier = struct {
+        fn holds(t: *@import("../prefix_cache.zig").HotPrefixCache, pos: usize) bool {
+            for (t.disk.?.entries.items) |*e| if (std.mem.indexOfScalar(u32, e.ssm_positions, @intCast(pos)) != null) return true;
+            return false;
+        }
+    };
+    try testing.expect(dsv41_prefix.publishLiveDsv41(&hc, m, prompt, false, .{}, ctx.cache.config));
+    dsv41_prefix.flushLiveDsv41(&hc, m, "idle");
+    hc.disk.?.drainWriter();
+    try testing.expect(Tier.holds(&hc, point));
+    try testing.expect(!dsv41_prefix.publishLiveDsv41(&hc, m, prompt, false, .{}, ctx.cache.config));
+
+    // The tier drops the entry without a word to the record (here an admin cache clear).
+    hc.clearDisk();
+    try testing.expect(!Tier.holds(&hc, point));
+    try testing.expect(dsv41_prefix.publishLiveDsv41(&hc, m, prompt, false, .{}, ctx.cache.config));
+    dsv41_prefix.flushLiveDsv41(&hc, m, "idle");
+    hc.disk.?.drainWriter();
+    try testing.expect(Tier.holds(&hc, point));
+    try testing.expect(!mlx.errorPending());
 }
 
 test "dsv41 engine: a write-through or a restore that fails and is handled leaves no error latched for the next request (DSV41_STQ_TINY)" {
@@ -6028,7 +6172,7 @@ test "dsv41 engine: a Cooler state rolled back in place to a point it kept conti
             if (i < 2) {
                 var cp = try dsv41_prefix.capture(a, m, at);
                 defer cp.deinit(a);
-                try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, false);
+                try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, null);
             }
         }
         var all: [31]u32 = undefined;
@@ -6091,7 +6235,7 @@ test "dsv41 engine: a finished request's state is the next turn's deepest point,
             if (i == 0) {
                 var cp = try dsv41_prefix.capture(a, m, at);
                 defer cp.deinit(a);
-                try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, false);
+                try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, null);
             }
         }
         if (through_record) {
@@ -6238,7 +6382,7 @@ test "dsv41 engine: the Cooler's live restore points reach the SSD tier at an id
             ctx.cache.step = point;
             var cp = try dsv41_prefix.capture(a, m, point);
             defer cp.deinit(a);
-            try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, false);
+            try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, null);
             try testing.expect(dsv41_prefix.publishLiveDsv41(&hc, m, prompt[0..point], false, .{}, ctx.cache.config));
             dsv41_borrow.endRequestMlx(&cooler.config);
         }
@@ -6258,7 +6402,7 @@ test "dsv41 engine: the Cooler's live restore points reach the SSD tier at an id
         hc.disk.?.drainWriter();
         try testing.expect(!mlx.errorPending());
         try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-        try testing.expect(!dsv41_prefix.liveOf(&hc).unflushed());
+        try testing.expect(!dsv41_prefix.liveOf(&hc).unflushed(&hc.disk.?));
         try runRequest(&cooler, &tok, prompt[0..40], .{ .temperature = 0.0 }, .{}, 4, null, null);
     }
 }
