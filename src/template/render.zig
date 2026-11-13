@@ -321,23 +321,43 @@ pub const Renderer = struct {
 
     fn forLoop(self: *Renderer, s: anytype, frame: *Frame) Failure!Flow {
         @setRuntimeSafety(true);
-        if (s.filter == null) if (try self.lazyRange(s.iter, frame)) |range| return self.walk(s, frame, &.{}, range);
+        if (s.filter == null) if (try self.lazyRange(s.iter, frame)) |range| return self.walk(s, frame, try self.newLoop(&.{}, range));
         const iterable = try self.eval(s.iter, frame);
         const all = try self.walkable(iterable);
         var items = all;
+        // The index in `all` of each item the filter kept.
+        var kept_at = std.ArrayList(usize).empty;
         if (s.filter) |f| {
             const scope = try self.arena.create(Frame);
             scope.* = .{ .parent = frame };
             var kept = std.ArrayList(Value).empty;
-            for (all) |item| {
+            for (all, 0..) |item, at| {
                 try self.step();
                 scope.vars.clearRetainingCapacity();
                 try self.assign(s.target, item, scope);
-                if (value.truthy(try self.eval(f, scope))) try kept.append(self.arena, item);
+                if (value.truthy(try self.eval(f, scope))) {
+                    try kept.append(self.arena, item);
+                    try kept_at.append(self.arena, at);
+                }
             }
             items = kept.items;
         }
-        return self.walk(s, frame, items, null);
+        const loop = try self.newLoop(items, null);
+        const flow = try self.walk(s, frame, loop);
+        // An iterator keeps what the loop did not take from it, as a Python generator left by a `break` does; a
+        // filtered loop took the source items up to the last one it kept.
+        if (iterable == .list and iterable.list.isIterator()) {
+            const taken = if (loop.reach > items.len) all.len else if (s.filter == null) loop.reach else if (loop.reach == 0) 0 else kept_at.items[loop.reach - 1] + 1;
+            iterable.list.items = .fromOwnedSlice(@constCast(all[taken..]));
+        }
+        return flow;
+    }
+
+    fn newLoop(self: *Renderer, items: []const Value, range: ?value.Loop.Range) Failure!*value.Loop {
+        @setRuntimeSafety(true);
+        const loop = try self.arena.create(value.Loop);
+        loop.* = .{ .index0 = 0, .items = items, .range = range };
+        return loop;
     }
 
     /// The bounds of a loop's iterable when it is a call of the global `range`, null for any other.
@@ -354,15 +374,13 @@ pub const Renderer = struct {
         return .{ .start = b.start, .step = b.stride, .len = b.len };
     }
 
-    /// The iterations of a for loop over `items`, or over the lazy `range`, and its `else`.
-    fn walk(self: *Renderer, s: anytype, frame: *Frame, items: []const Value, range: ?value.Loop.Range) Failure!Flow {
+    /// The iterations of a for loop over `loop`'s items, and its `else`.
+    fn walk(self: *Renderer, s: anytype, frame: *Frame, loop: *value.Loop) Failure!Flow {
         @setRuntimeSafety(true);
         // One scope and one `loop` serve every iteration, cleared between them: a loop costs no memory per
         // iteration, and a macro the body defines keeps a live frame (arena, not stack) after the loop.
         const scope = try self.arena.create(Frame);
         scope.* = .{ .parent = frame };
-        const loop = try self.arena.create(value.Loop);
-        loop.* = .{ .index0 = 0, .items = items, .range = range };
         // Jinja2 marks a loop iterated at the end of a body: `else` runs when no iteration got there, every one
         // left by `break` or `continue`, or there were none.
         var iterated = false;
@@ -370,6 +388,7 @@ pub const Renderer = struct {
             try self.step();
             scope.vars.clearRetainingCapacity();
             loop.index0 = i;
+            loop.took(i + 1);
             try scope.vars.put(self.arena, "loop", .{ .loop = loop });
             try self.assign(s.target, loop.at(i), scope);
             switch (try self.renderBody(s.body, scope)) {
@@ -377,7 +396,7 @@ pub const Renderer = struct {
                 .continue_ => {},
                 .break_ => break,
             }
-        }
+        } else loop.took(loop.len() + 1);
         if (iterated) return .normal;
         // The else body is a scope of its own, as an iteration is.
         scope.vars.clearRetainingCapacity();
@@ -715,12 +734,17 @@ pub const Renderer = struct {
         return .{ .undefined = "" };
     }
 
-    fn loopField(self: *Renderer, l: *const value.Loop, name: []const u8) Failure!Value {
+    fn loopField(self: *Renderer, l: *value.Loop, name: []const u8) Failure!Value {
         @setRuntimeSafety(true);
         const n = l.len();
         const i = l.index0;
         const Field = enum { index, index0, revindex, revindex0, first, last, length, previtem, nextitem, depth, depth0, cycle, changed };
         const field = std.meta.stringToEnum(Field, name) orelse return .{ .undefined = name };
+        switch (field) {
+            .last, .nextitem => l.took(i + 2),
+            .revindex, .revindex0, .length => l.took(n + 1),
+            else => {},
+        }
         return switch (field) {
             .index => .{ .int = @intCast(i + 1) },
             .index0 => .{ .int = @intCast(i) },

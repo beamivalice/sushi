@@ -145,12 +145,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   environment, written by `tests/dump_template_oracle.py`). A change to what formatChat hands the engine fails the corpus test until the fixture is
   regenerated (`SUSHI_TEMPLATE_ORACLE_DUMP`, then the dumper's `render`). The builtin table
   (`src/fixtures/template_builtins.json`, the dumper's `builtins`) holds one case or more per name the engine serves;
-  a name without one fails by name.
+  a name without one fails by name. For a change to the engine, `tests/template_differential.py` renders a random
+  template fuzz or a JSONL corpus on both sides (`SUSHI_TEMPLATE_DIFF`) and prints each case that differs.
 - **Where the engine differs from Python Jinja2 on purpose** (beside `builtin_differences`, which lists fixture cases):
   the context's JSON reader (`value.fromJson`) refuses `NaN` and `Infinity`, which Python's json reads (a request body
   that holds them is not JSON); a filter Python makes a generator (`map`, `select`, `items`) is evaluated where it is
   applied, so an error Python defers to the first read is raised there; Jinja2's `missing` sentinel, which leaks from
   a macro defined in a loop and called after it, is not copied.
+- **A loop over a generator takes from it what Jinja2's loop takes**: the items it walked, the next one when
+  `loop.last` or `loop.nextitem` peeks, all of them for `loop.length`, `loop.revindex` or `loop|length`; a loop
+  left by `break` leaves the rest for the next read (`Loop.reach`). Emptying the generator at the loop's start
+  printed `1|[]` where Python printed `1|['2', '3']` after a `break`.
 - **A loop iteration is its own scope, as in Jinja2**: a body `set` (GLM-5.3's per-message `reasoning_content`)
   neither reaches the next iteration nor leaves the loop (nor does one in the loop's `else`); only a `namespace`
   carries state across. A set block, a filter block and a `generation` body are scopes too, and a `break` crosses

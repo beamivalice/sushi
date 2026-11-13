@@ -266,7 +266,7 @@ pub const Value = union(enum) {
     namespace: *Dict,
     macro: *const Macro,
     function: *const Function,
-    loop: *const Loop,
+    loop: *Loop,
 
     /// The template's own text as a string.
     pub fn plain(bytes: []const u8) Value {
@@ -405,8 +405,18 @@ pub const Loop = struct {
     /// Python's lazy range does, so a loop that breaks early costs only what it walked.
     items: []const Value,
     range: ?Range = null,
+    /// How many items the walk took from its iterable, as Jinja2's `LoopContext` takes them: the current one, the
+    /// next when `last` or `nextitem` peeks at it, all of them for the length; `len() + 1` once it reached past the
+    /// end. An iterator keeps the items after these.
+    reach: usize = 0,
 
     pub const Range = struct { start: i64, step: i64, len: usize };
+
+    /// The walk has taken the items up to `n`.
+    pub fn took(self: *Loop, n: usize) void {
+        @setRuntimeSafety(true);
+        self.reach = @max(self.reach, @min(n, self.len() + 1));
+    }
 
     pub fn len(self: *const Loop) usize {
         @setRuntimeSafety(true);
@@ -907,7 +917,10 @@ pub fn writeRepr(m: *Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, dep
         },
         .macro => |mac| if (mac.is_caller) try w.appendSlice(gpa, "<Macro anonymous>") else try w.print(gpa, "<Macro '{s}'>", .{mac.node.name}),
         .function => return m.fail(.{ .print = "function" }),
-        .loop => |l| try w.print(gpa, "<LoopContext {d}/{d}>", .{ l.index0 + 1, l.len() }),
+        .loop => |l| {
+            l.took(l.len() + 1);
+            try w.print(gpa, "<LoopContext {d}/{d}>", .{ l.index0 + 1, l.len() });
+        },
     }
 }
 

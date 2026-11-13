@@ -1515,7 +1515,10 @@ pub fn length(r: *Renderer, v: Value) Failure!usize {
         },
         .list => |l| if (l.isIterator()) r.fail("object of type '{s}' has no len()", .{@tagName(l.kind)}) else l.items.items.len,
         .dict => |d| d.entries.items.len,
-        .loop => |l| l.len(),
+        .loop => |l| blk: {
+            l.took(l.len() + 1);
+            break :blk l.len();
+        },
         else => r.fail("object of type '{s}' has no len()", .{value.typeName(v)}),
     };
 }

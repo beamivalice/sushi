@@ -218,6 +218,11 @@ def dump_render(inputs):
 D = {'d': {'b': 2, 'a': 1, 'c': None}}
 PEOPLE = {'people': [{'name': 'bo', 'age': 31, 'tags': ['x']}, {'name': 'Al', 'age': 25, 'tags': []},
                      {'name': 'cy', 'age': 31, 'tags': ['y', 'z']}]}
+# Generators of every kind the engine makes, over `ITER`.
+ITER = {'l': [1, 2, 3, 4], 'ws': ['b', 'a', 'c'], 'd': {'a': 1, 'b': 2, 'c': 3}}
+ITER_GENS = ["l|map('string')", "l|select('odd')", "l|reject('odd')", "d|items", "ws|map('upper')", "l|selectattr('x', 'undefined')",
+             "l|map('int')", "ws|unique", "l|reverse", "ws|sort|map('string')", "range(4)|map('string')",
+             "l|map(attribute='x', default=1)", "ws|select('string')"]
 BUILTIN_CASES = [
     # filters
     ('filter abs', '{{ -3|abs }} {{ (-2.5)|abs }} {{ n|abs }}', {'n': -7}),
@@ -500,6 +505,25 @@ BUILTIN_CASES = [
     ('statement for', "{% for x in [1] %}{% if true %}{% set loop = 5 %}{% endif %}{% endfor %}", {}),
     ('statement for', "{% for x in [1] %}{% macro m() %}{% set loop = 5 %}{% endmacro %}{% endfor %}", {}),
     ('statement for', "{% for x in [1] %}x{% else %}{% set loop %}t{% endset %}{% endfor %}", {}),
+    # A loop over a generator takes only the items it walked, and the ones `loop` peeked at.
+    ('statement for', ' '.join("{% set g = " + g + " %}{% for x in g %}{{ x }}{% break %}{% endfor %}{{ g|list }}" for g in ITER_GENS), ITER),
+    ('statement for', ' '.join("{% set g = " + g + " %}{% for x in g %}{{ x }}{% if loop.first %}{% break %}{% endif %}{% endfor %}{{ g|list }}" for g in ITER_GENS), ITER),
+    ('loop nextitem', ' '.join("{% set g = " + g + " %}{% for x in g %}{{ loop.nextitem }}{% break %}{% endfor %}{{ g|list }}" for g in ITER_GENS), ITER),
+    ('loop index', ' '.join("{% set g = " + g + " %}{% for x in g %}{{ loop.index }}{% break %}{% endfor %}{{ g|list }}" for g in ITER_GENS), ITER),
+    ('loop last', "{% set g = l|map('string') %}{% for x in g %}{{ loop.last }}{% break %}{% endfor %}{{ g|list }} "
+                  "{% set g = l|map('string') %}{% for x in g %}{{ loop.length }}{% break %}{% endfor %}{{ g|list }} "
+                  "{% set g = l|map('string') %}{% for x in g %}{{ loop.revindex }}{% break %}{% endfor %}{{ g|list }} "
+                  "{% set g = l|map('string') %}{% for x in g %}{{ x }}{% if loop.index == 2 %}{{ loop.nextitem }}{{ loop.nextitem }}{% break %}{% endif %}{% endfor %}{{ g|list }}", ITER),
+    ('statement for', "{% set g = l|map('string') %}{% for x in g if x != '1' %}{{ x }}{% break %}{% endfor %}{{ g|list }} "
+                      "{% set g = l|map('string') %}{% for x in g if x != '2' %}{{ loop.nextitem }}{% break %}{% endfor %}{{ g|list }} "
+                      "{% set g = l|map('string') %}{% for x in g if x == '3' %}{{ loop.last }}{% break %}{% endfor %}{{ g|list }} "
+                      "{% set g = l|map('string') %}{% for x in g if x == '2' %}{{ x }}{% break %}{% endfor %}{{ g|list }}", ITER),
+    ('statement for', "{% set g = l|map('string') %}{% for x in g %}{{ x }}{% endfor %}{{ g|list }} "
+                      "{% set g = l|map('string') %}{% for x in g %}{% if x == '4' %}{% break %}{% endif %}{% endfor %}{{ g|list }} "
+                      "{% set g = l|map('string') %}{% for x in g %}{{ loop.last }}{% if x == '4' %}{% break %}{% endif %}{% endfor %}{{ g|list }} "
+                      "{% set g = l|map('string') %}{% for x in g %}{{ x }}{% break %}{% else %}E{% endfor %}{% for x in g %}{{ x }}{% break %}{% endfor %}{{ g|list }}", ITER),
+    ('loop length', "{% set g = l|map('string') %}{% for x in g %}{{ loop|length }}{% break %}{% endfor %}{{ g|list }} "
+                    "{% set g = l|map('string') %}{% for x in g %}{{ loop }}{% break %}{% endfor %}{{ g|list }}", ITER),
     ('statement call', "{% macro w(t) %}[{{ t }}:{{ caller() }}]{% endmacro %}{% call w('x') %}inner{% endcall %}", {}),
     ('statement call', "{% macro m() %}x{% endmacro %}{% call m() %}y{% endcall %}", {}),
     ('statement call', "{% macro m() %}{{ caller() if caller is defined }}{% endmacro %}{% call m() %}y{% endcall %}", {}),

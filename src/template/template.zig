@@ -1144,3 +1144,42 @@ test "template: the work of a render stays within a constant of the steps its me
     for (cases) |c| over += @intFromBool(!workWithinSteps(a, c, msgs));
     try testing.expectEqual(@as(usize, 0), over);
 }
+
+/// One case of the differential harness: the template, the messages, extra context and tools as JSON, and
+/// `add_generation_prompt`.
+const DiffCase = struct { t: []const u8, m: []const u8, x: []const u8 = "{}", tools: ?[]const u8 = null, agp: bool = false };
+
+// A dev tool, off unless `SUSHI_TEMPLATE_DIFF` names a JSONL file of cases: one result line per case goes to
+// `<file>.out`, from case `SUSHI_TEMPLATE_DIFF_START` on, so a driver can resume after a case that crashed.
+test "template differential: each case of SUSHI_TEMPLATE_DIFF rendered to one result line" {
+    const in_path = std.mem.span(std.c.getenv("SUSHI_TEMPLATE_DIFF") orelse return);
+    const start: usize = if (std.c.getenv("SUSHI_TEMPLATE_DIFF_START")) |s| try std.fmt.parseInt(usize, std.mem.span(s), 10) else 0;
+    const gpa = std.heap.page_allocator;
+    const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, in_path, gpa, .limited(1 << 30));
+    defer gpa.free(text);
+    const out_path = try std.fmt.allocPrint(gpa, "{s}.out", .{in_path});
+    defer gpa.free(out_path);
+    const file = try std.Io.Dir.createFileAbsolute(testing.io, out_path, .{});
+    defer file.close(testing.io);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var i: usize = 0;
+    while (lines.next()) |line| : (i += 1) {
+        if (line.len == 0 or i < start) continue;
+        var parsed = try std.json.parseFromSlice(DiffCase, gpa, line, .{});
+        defer parsed.deinit();
+        const c = parsed.value;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var diag = Diagnostic{};
+        var usage = Usage{};
+        const rendered = renderJson(arena.allocator(), .{ .usage = &usage, .template = c.t, .messages_json = c.m, .tools_json = c.tools, .extra_json = c.x, .add_generation_prompt = c.agp }, &diag);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        if (rendered) |out| {
+            try buf.print(gpa, "{f}\n", .{std.json.fmt(.{ .i = i, .ok = true, .out = out, .steps = usage.steps, .mem = usage.memory }, .{})});
+        } else |e| {
+            try buf.print(gpa, "{f}\n", .{std.json.fmt(.{ .i = i, .ok = false, .kind = @errorName(e), .msg = diag.message(), .line = diag.line, .steps = usage.steps, .mem = usage.memory }, .{})});
+        }
+        try file.writeStreamingAll(testing.io, buf.items);
+    }
+}
