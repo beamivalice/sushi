@@ -5660,6 +5660,166 @@ test "dsv41 engine: a request dropped after any round or step leaks nothing, and
     };
 }
 
+/// The tokens a serial request publishes when the pool's `k`-th buffer of its fourth step is refused, as the scheduler
+/// sees them: a step that fails, or that returns with an error latched, ends the request. False when no buffer was.
+fn refusedStepTokens(fx: *EngineFixture, t: *Tokenizer, ids: []const u32, sampling: SamplingParams, k: u64, out: *std.ArrayList(u32)) !bool {
+    const a = testing.allocator;
+    try fx.xfm.resetCache();
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, &fx.xfm, t, ids, 12, sampling, &.{}, .{ .skip_lazy_preforward = true });
+    defer gen.deinit(a);
+    for (0..3) |_| try out.append(a, (try gen.next(a)).?);
+    mlx.engine.fault.arm(k);
+    const asks = mlx.engine.fault.count();
+    const step = gen.next(a);
+    mlx.engine.fault.disarm();
+    const fired = k > 0 and mlx.engine.fault.count() - asks >= k;
+    var got = step catch return fired;
+    while (got) |tok| {
+        try out.append(a, tok);
+        if (mlx.errorPending()) return fired;
+        got = gen.next(a) catch return fired;
+    }
+    return fired;
+}
+
+test "dsv41 engine: a serial step refused at any of its pool buffers leaks nothing and loses no token (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    defer mlx.engine.fault.disarm();
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..40];
+    var msg: [300]u8 = undefined;
+    for ([_]SamplingParams{ .{ .temperature = 0.0 }, .{ .temperature = 0.8, .top_p = 0.95, .seed = 7 } }) |sampling| {
+        var want: std.ArrayList(u32) = .empty;
+        defer want.deinit(a);
+        _ = try refusedStepTokens(&fx, &tok, prompt, sampling, 0, &want);
+        try testing.expectEqual(@as(usize, 12), want.items.len);
+        const total = blk: {
+            try fx.xfm.resetCache();
+            var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, &fx.xfm, &tok, prompt, 12, sampling, &.{}, .{ .skip_lazy_preforward = true });
+            defer gen.deinit(a);
+            for (0..3) |_| _ = (try gen.next(a)).?;
+            const c0 = mlx.engine.fault.count();
+            _ = (try gen.next(a)).?;
+            break :blk mlx.engine.fault.count() - c0;
+        };
+        try fx.xfm.resetCache();
+        const base = Sheet.now();
+        var k: u64 = 1;
+        while (k <= total) : (k += @max(1, total / 40)) {
+            var got: std.ArrayList(u32) = .empty;
+            defer got.deinit(a);
+            try testing.expect(try refusedStepTokens(&fx, &tok, prompt, sampling, k, &got));
+            _ = mlx.takeError(&msg);
+            // The refused step ends the request: it emits nothing, or the token before it with the error latched.
+            try testing.expect(got.items.len >= 3 and got.items.len <= 4);
+            try testing.expectEqualSlices(u32, want.items[0..got.items.len], got.items);
+            try fx.xfm.resetCache();
+            // `asked` follows the capacities a cut history leaves, so pages and mappings are the balance.
+            const now = Sheet.now();
+            try testing.expectEqual(base.in_use, now.in_use);
+            try testing.expectEqual(base.mapped, now.mapped);
+        }
+    }
+}
+
+test "dsv41 engine: a short request refused at every third of its pool buffers leaves the Sheet a clean one does (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    defer mlx.engine.fault.disarm();
+    var buf: [80]u32 = undefined;
+    const ids = fx.prompt(&buf);
+    var want = try shortRequest(a, &fx, ids);
+    defer want.deinit(a);
+    try fx.xfm.resetCache();
+    const base = Sheet.now();
+    const before = mlx.engine.fault.count();
+    var once = try shortRequest(a, &fx, ids);
+    once.deinit(a);
+    const total = mlx.engine.fault.count() - before;
+    try fx.xfm.resetCache();
+    try testing.expectEqual(base, Sheet.now());
+    var msg: [300]u8 = undefined;
+    var k: u64 = 1 + before % 3;
+    while (k <= total) : (k += 3) {
+        mlx.engine.fault.arm(k);
+        if (shortRequest(a, &fx, ids)) |ran| {
+            var r = ran;
+            r.deinit(a);
+        } else |_| {}
+        mlx.engine.fault.disarm();
+        _ = mlx.takeError(&msg);
+        try fx.xfm.resetCache();
+        try testing.expectEqual(base, Sheet.now());
+    }
+    var got = try shortRequest(a, &fx, ids);
+    defer got.deinit(a);
+    try testing.expectEqualSlices(u8, want.items, got.items);
+}
+
+test "dsv41 engine: a DSpark round refused at any of its pool buffers leaks nothing, at widths 1 to 16 (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    defer mlx.engine.fault.disarm();
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..40];
+    var msg: [300]u8 = undefined;
+    const opts: Generator.InitOptions = .{ .dspark_enabled = true, .skip_lazy_preforward = true };
+    for ([_]u8{ 1, 2, 3, 5, 8, 12, 16 }) |width| {
+        var base: Sheet = undefined;
+        var total: u64 = 0;
+        // k = 0 measures the third round and the Sheet it leaves; every later k refuses one of its buffers.
+        var k: u64 = 0;
+        while (k == 0 or k <= total) : (k += if (k == 0) 1 else @max(1, total / 40)) {
+            try fx.xfm.resetCache();
+            var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, 64, .{ .temperature = 0.0 }, &.{}, opts);
+            gen.dspark_diag = .{ .rows = width };
+            for (0..2) |_| {
+                const r = (try gen.nextDspark(a)) orelse return error.TurnEndedEarly;
+                a.free(r.tokens);
+            }
+            const c0 = mlx.engine.fault.count();
+            if (k > 0) mlx.engine.fault.arm(k);
+            const r = gen.nextDspark(a);
+            mlx.engine.fault.disarm();
+            if (k == 0) total = mlx.engine.fault.count() - c0;
+            if (r) |maybe| {
+                if (maybe) |x| a.free(x.tokens);
+            } else |_| {}
+            _ = mlx.takeError(&msg);
+            gen.deinit(a);
+            try fx.xfm.resetCache();
+            const now = Sheet.now();
+            if (k == 0) {
+                base = now;
+                continue;
+            }
+            try testing.expectEqual(base.in_use, now.in_use);
+            try testing.expectEqual(base.mapped, now.mapped);
+        }
+    }
+}
+
 test "dsv41 engine: a restore point either route wrote to the SSD tier restores on the other as that route's own cold state (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;

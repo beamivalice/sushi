@@ -294,7 +294,7 @@ pub fn dsparkConstrainedEntry(self: *Generator, allocator: std.mem.Allocator, c:
         const token = (try self.next(allocator)) orelse return .stop;
         return .{ .served = .{ .tokens = try allocator.dupe(u32, &.{token}), .accepted_tokens = 0 } };
     }
-    if (self.has_pending_logits) try dsparkSamplePending(self, allocator, c);
+    if (self.pending != null) try dsparkSamplePending(self, allocator, c);
     return switch (try dsparkJudgePending(self, allocator, c)) {
         .commit => .proceed,
         .stop => .stop,
@@ -304,8 +304,7 @@ pub fn dsparkConstrainedEntry(self: *Generator, allocator: std.mem.Allocator, c:
 
 /// The serial state's pending logits become a pending token, sampled under the mask of the committed state.
 pub fn dsparkSamplePending(self: *Generator, allocator: std.mem.Allocator, c: *Constraint) !void {
-    const logits = self.pending_logits;
-    self.has_pending_logits = false;
+    const logits = try self.takeLogits();
     defer _ = mlx.mlx_array_free(logits);
     var masked = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(masked);
@@ -391,8 +390,7 @@ pub fn dsparkEmitPending(self: *Generator, allocator: std.mem.Allocator) !?u32 {
     const tok_i32: i32 = @intCast(token);
     const tok_input = mlx.mlx_array_new_data(&tok_i32, &[_]c_int{ 1, 1 }, 2, .int32);
     defer _ = mlx.mlx_array_free(tok_input);
-    self.pending_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
-    self.has_pending_logits = true;
+    self.pending = .{ .logits = try self.xfm.forwardWith(&self.ctx, tok_input) };
     return token;
 }
 
@@ -425,6 +423,6 @@ pub fn dsparkResumeAfterForced(self: *Generator, allocator: std.mem.Allocator) !
             return .{ .resumed = closer };
         },
         .stopped => return .stopped,
-        .already_clean, .stay_disabled => return .refused,
+        .already_clean => return .refused,
     }
 }

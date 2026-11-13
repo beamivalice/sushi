@@ -4921,7 +4921,7 @@ pub fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
             continue;
         };
         if (try loopGuardTick(sch, slot, gen)) continue;
-        if (gen.has_pending_logits or gen.has_pending_token) {
+        if (gen.pending != null) {
             const emitted = gen.drainPipelineForBatch(slot.allocator) catch |err| {
                 slot.markError(@errorName(err));
                 continue;
@@ -5008,7 +5008,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         xfm_ptr.cost_moe = 0;
         for (active) |slot| {
             const gen = &slot.legacy_gen.?;
-            if (gen.has_pending_logits or gen.has_pending_token or slot.planner_plain_transition or slot.mtp_plain_tick) price_clean = false;
+            if (gen.pending != null or slot.planner_plain_transition or slot.mtp_plain_tick) price_clean = false;
         }
     }
     defer if (observe_plain) {
@@ -5017,7 +5017,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
 
     // Legacy→batched transition: a slot arriving from a legacy single-slot
     // tick (or fresh from prefill) carries lazy pipeline state — a lookahead
-    // token ALREADY FORWARDED into its KV cache plus `pending_logits` for
+    // token ALREADY FORWARDED into its KV cache plus `pending.logits` for
     // the position after it. Consume that state via `drainPipelineForBatch`
     // (emit the lookahead, sample the new next_token_id from the pending
     // logits). Dropping it and re-forwarding `next_token_id` — the pre-fix

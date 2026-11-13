@@ -371,6 +371,11 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   was MLX's (the wide warm's token arrays, a prefill chunk's scalars). A forward's scope counts its depth on the model
   (`ownBegin`, `ownEnd`), and DeepSeek's `Scope` makes a scalar or a host array on the side of its own stream,
   whether or not a forward is open. Under a Cooler load what they find, and give back, is the load's held scope.
+- **A failed decode step leaves the generator's lookahead with its one owner.** `generate.Pending` holds the step's
+  logits and the lazy token whose forward is already in the cache; a step reads it, stores the next one only once its
+  forward succeeded, and a failure returns its error with the old one still on the generator, which `deinit` frees. A
+  failed lazy forward ends the request by name: its old fallback leaked that token (a 16 KB page a step) and emitted
+  the token after it in its place.
 - **Maps are the engine's inside its scope** (`route.zig`: names to arrays, names to strings, the iterator): a map
   made under `engine.enter` is tagged like a vector, every call that takes one follows it, and a name it lacks
   answers 2 with no error latched, as mlx-c does. The SSD tier's readers hand tensors around in them.

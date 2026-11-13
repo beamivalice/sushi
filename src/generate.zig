@@ -431,6 +431,19 @@ pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelCon
     return reserved;
 }
 
+/// What a decode step leaves for the next one. `logits` are for the position after the last token in the cache;
+/// `token`, when set, is that last token, sampled lazily and forwarded but not yet emitted. A step takes the whole
+/// value and stores a new one only once its forward succeeded, so a failed step leaves one owner of every handle.
+pub const Pending = struct {
+    logits: mlx.mlx_array,
+    token: ?mlx.mlx_array = null,
+
+    pub fn deinit(self: Pending) void {
+        _ = mlx.mlx_array_free(self.logits);
+        if (self.token) |t| _ = mlx.mlx_array_free(t);
+    }
+};
+
 /// Step-based generator. Call `init` to prefill, then `next` per token.
 /// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
 /// built as a single lazy computation graph, async_eval'd together. The GPU
@@ -486,12 +499,8 @@ pub const Generator = struct {
     /// distribution — t1 is sampled from the prefill's final forward, which
     /// this loop never sees.
     pending_logprob: ?sampler.LogprobResult = null,
-    // Async pipeline state: pre-computed forward pass logits for next decode step
-    pending_logits: mlx.mlx_array = .{},
-    has_pending_logits: bool = false,
-    // Deferred token: lazy array from async pipeline, eval'd at start of next iteration
-    pending_token: mlx.mlx_array = .{},
-    has_pending_token: bool = false,
+    /// The decode pipeline's lookahead, owned here and freed by `deinit` whatever state a failed step left.
+    pending: ?Pending = null,
 
     // ── Spec-decode shared state ──
     // Post-final-norm hidden state at the last produced token's position.
@@ -570,7 +579,7 @@ pub const Generator = struct {
     /// The absolute position the last speculative round left the state at.
     spec_round_end: ?usize = null,
     /// A constrained DSpark request: `next_token_id` is sampled under the grammar but not yet emitted or in the cache,
-    /// and `has_pending_logits` is false. Serial decode (`next`) emits it first.
+    /// and `pending` is null. Serial decode (`next`) emits it first.
     dspark_pending: bool = false,
     /// One verify mask per row (`row_grammar.plan`), reused across rounds.
     dspark_masks: std.ArrayList(bool) = .empty,
@@ -1104,10 +1113,10 @@ pub const Generator = struct {
         /// point at the slot's own state. Stored by value on the Generator.
         ctx: ?ForwardCtx = null,
         /// Skip the lazy first-token pre-forward (regular path only). When set,
-        /// init samples t1 synchronously and leaves `pending_logits` /
-        /// `pending_token` empty — cache.step lands at exactly prompt_len with
+        /// init samples t1 synchronously and leaves `pending` empty —
+        /// cache.step lands at exactly prompt_len with
         /// t1 NOT in cache. The first `next()` call's transition shim will
-        /// sync-forward `[t1]` to seed pending_logits before the lazy chain.
+        /// sync-forward `[t1]` to seed `pending.logits` before the lazy chain.
         /// Used by the Phase 2 scheduler so a slot's cache state matches
         /// `forwardBatchedDecode`'s expectation (cache.step == prompt_len at
         /// the start of every decode tick). PLD / drafter paths already skip
@@ -2047,8 +2056,7 @@ pub const Generator = struct {
                 .dspark_diag = arch_dspark.dsparkDiag(),
                 .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, arch_dspark.stageBlock(xfm)),
             };
-            gen.pending_logits = logits;
-            gen.has_pending_logits = true;
+            gen.pending = .{ .logits = logits };
             attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;
         }
@@ -2145,7 +2153,7 @@ pub const Generator = struct {
             mtp_cache = null; // ownership transferred to the Generator
             dflash_ctx = null; // ownership transferred to the Generator
             native_window = null;
-            // pending_logits/pending_token left empty — the lazy pipeline is
+            // `pending` left empty — the lazy pipeline is
             // skipped under drafter / MTP. The speculative `next*` paths
             // drive every subsequent step with predictable cache offset.
             attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
@@ -2262,8 +2270,7 @@ pub const Generator = struct {
             .prompt_ids_alloc = allocator,
         };
 
-        gen.pending_logits = next_logits;
-        gen.has_pending_logits = true;
+        gen.pending = .{ .logits = next_logits };
 
         attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
         return gen;
@@ -2334,7 +2341,7 @@ pub const Generator = struct {
     pub fn forceConstraintTransition(self: *Generator, allocator: std.mem.Allocator) !ConstraintRecovery {
         const constraint = self.sampling.constraint orelse return .refused;
         const proto = constraint.proto orelse return .refused;
-        std.debug.assert(!self.has_pending_token);
+        std.debug.assert(self.pending == null or self.pending.?.token == null);
 
         switch (constraint.pstate.phase) {
             .json_body => return .refused,
@@ -2358,10 +2365,7 @@ pub const Generator = struct {
                 // Complete the opener, close it, then constrain. Fall through
                 // to the shared planner below.
                 log.info("[grammar] completing the generated reasoning opener before the boundary\n", .{});
-                if (self.has_pending_logits) {
-                    _ = mlx.mlx_array_free(self.pending_logits);
-                    self.has_pending_logits = false;
-                }
+                self.dropPending();
                 if (!constraint.pstate.recovering) {
                     var planned: [rp_mod.MAX_TRANSITION_TOKENS]u32 = undefined;
                     const planned_len = proto.planRecovery(&constraint.pstate, &planned) orelse return .refused;
@@ -2375,10 +2379,7 @@ pub const Generator = struct {
             },
             .reasoning, .header => {
                 self.dspark_pending = false;
-                if (self.has_pending_logits) {
-                    _ = mlx.mlx_array_free(self.pending_logits);
-                    self.has_pending_logits = false;
-                }
+                self.dropPending();
                 if (!constraint.pstate.recovering) {
                     var planned: [rp_mod.MAX_TRANSITION_TOKENS]u32 = undefined;
                     const planned_len = proto.planRecovery(&constraint.pstate, &planned) orelse return .refused;
@@ -2397,10 +2398,7 @@ pub const Generator = struct {
     /// then leave its logits pending for the next sample. Called once per
     /// scheduler tick while `pstate.recovering` drains.
     fn commitForcedConstraintToken(self: *Generator, allocator: std.mem.Allocator, constraint: *Constraint) !u32 {
-        if (self.has_pending_logits) {
-            _ = mlx.mlx_array_free(self.pending_logits);
-            self.has_pending_logits = false;
-        }
+        self.dropPending();
         const seq = constraint.pstate.pending[0..constraint.pstate.pending_len];
         const tok = seq[constraint.pstate.forced_cursor];
         constraint.pstate.forced_cursor += 1;
@@ -2420,8 +2418,7 @@ pub const Generator = struct {
         const vec = mlx.mlx_vector_array_new_data(&arr, 1);
         _ = mlx.mlx_async_eval(vec);
         _ = mlx.mlx_vector_array_free(vec);
-        self.pending_logits = next_logits;
-        self.has_pending_logits = true;
+        self.pending = .{ .logits = next_logits };
 
         if (constraint.pstate.forced_cursor >= seq.len) {
             // The transition drained: the next sample is the first constrained
@@ -2448,14 +2445,7 @@ pub const Generator = struct {
         if (self.pending_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
         }
-        if (self.has_pending_logits) {
-            _ = mlx.mlx_array_free(self.pending_logits);
-            self.has_pending_logits = false;
-        }
-        if (self.has_pending_token) {
-            _ = mlx.mlx_array_free(self.pending_token);
-            self.has_pending_token = false;
-        }
+        self.dropPending();
         self.dspark_masks.deinit(allocator);
         if (self.has_last_hidden) {
             _ = mlx.mlx_array_free(self.last_hidden);
@@ -2540,8 +2530,8 @@ pub const Generator = struct {
     /// Legacy→batched transition (scheduler.runBatchedDecodeTick): consume
     /// the lazy pipeline state so the slot can join a batched tick. The
     /// legacy pipelined decode keeps a lookahead token ALREADY FORWARDED
-    /// into the KV cache (`pending_token` / `next_token_id`) plus
-    /// `pending_logits` for the position after it. Dropping that state and
+    /// into the KV cache (`pending.token` / `next_token_id`) plus
+    /// `pending.logits` for the position after it. Dropping that state and
     /// re-forwarding `next_token_id` would append a duplicate position to
     /// the cache and re-emit an already-emitted token — corrupting every
     /// stream whose slot enters a batch mid-generation
@@ -2555,24 +2545,20 @@ pub const Generator = struct {
     pub fn drainPipelineForBatch(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         try self.resolvePendingToken();
         if (try self.checkStop()) {
-            if (self.has_pending_logits) {
-                _ = mlx.mlx_array_free(self.pending_logits);
-                self.has_pending_logits = false;
-            }
+            self.dropPending();
             return null;
         }
         // Both pipeline shapes (fresh-from-prefill and post-`next()` fast
-        // path) carry pending_logits alongside the in-cache lookahead; a
+        // path) carry `pending.logits` alongside the in-cache lookahead; a
         // lookahead without logits would force a re-forward of an in-cache
         // token, which is the corruption this method exists to prevent.
-        if (!self.has_pending_logits) return error.MissingPendingLogits;
+        if (self.pending == null) return error.MissingPendingLogits;
 
         const token = self.next_token_id;
         self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
 
-        const step_logits = self.pending_logits;
-        self.has_pending_logits = false;
+        const step_logits = try self.takeLogits();
         const lazy = blk: {
             defer _ = mlx.mlx_array_free(step_logits);
             break :blk try self.sampleLazy(step_logits, .committed);
@@ -2712,14 +2698,30 @@ pub const Generator = struct {
         return cf.pending();
     }
 
+    /// Emits nothing: makes a token still in flight `next_token_id`. A failure leaves it with its owner.
     fn resolvePendingToken(self: *Generator) !void {
-        if (!self.has_pending_token) return;
-        try mlx.check(mlx.mlx_array_eval(self.pending_token));
+        const p = if (self.pending) |*p| p else return;
+        const t = p.token orelse return;
+        try mlx.check(mlx.mlx_array_eval(t));
         var val: i32 = 0;
-        try mlx.check(mlx.mlx_array_item_int32(&val, self.pending_token));
-        _ = mlx.mlx_array_free(self.pending_token);
-        self.has_pending_token = false;
+        try mlx.check(mlx.mlx_array_item_int32(&val, t));
+        _ = mlx.mlx_array_free(t);
+        p.token = null;
         self.next_token_id = @intCast(val);
+    }
+
+    /// Hands the pending logits to the caller. Its token must have been resolved: a token in flight is emitted first.
+    pub fn takeLogits(self: *Generator) !mlx.mlx_array {
+        const p = self.pending orelse return error.MissingPendingLogits;
+        if (p.token != null) return error.UnresolvedPendingToken;
+        self.pending = null;
+        return p.logits;
+    }
+
+    /// Frees the pipeline's lookahead, if any.
+    pub fn dropPending(self: *Generator) void {
+        if (self.pending) |p| p.deinit();
+        self.pending = null;
     }
 
     const DrainResult = union(enum) {
@@ -2729,32 +2731,24 @@ pub const Generator = struct {
         drained: u32,
         /// The drained token hit a stop condition — generation is over.
         stopped,
-        /// Unexpected half-state; do not re-enable speculation.
-        stay_disabled,
     };
 
     /// Transition from the pipelined `next()` state back to the spec-decode
     /// entry invariant (next_token_id known but NOT in cache, no pending
-    /// state). The pipeline holds `pending_token` (lazy, its forward already
-    /// in the cache) and `pending_logits` (logits for the position after it):
+    /// state). The pipeline holds `pending.token` (lazy, its forward already
+    /// in the cache) and `pending.logits` (logits for the position after it):
     /// resolving the token, emitting it, and sampling its successor from
-    /// `pending_logits` WITHOUT forwarding lands exactly on the invariant.
-    /// One sync. Also handles the shim-seeded state (`pending_logits` only).
+    /// `pending.logits` WITHOUT forwarding lands exactly on the invariant.
+    /// One sync. Also handles the shim-seeded state (`pending.logits` only).
     pub fn drainPipelineForSpec(self: *Generator, allocator: std.mem.Allocator) !DrainResult {
-        if (!self.has_pending_logits) {
-            if (!self.has_pending_token) return .already_clean;
-            // pending_token without pending_logits never occurs in the
-            // pipelined state machine; bail rather than risk the invariant.
-            return .stay_disabled;
-        }
+        if (self.pending == null) return .already_clean;
         try self.resolvePendingToken();
         if (try self.checkStop()) return .stopped;
         const token = self.next_token_id;
         self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
 
-        const step_logits = self.pending_logits;
-        self.has_pending_logits = false;
+        const step_logits = try self.takeLogits();
         // With the latch these checks return instead of ending the process, so the handle needs an owner.
         const val: i32 = blk: {
             const lazy = sampled: {
@@ -2790,17 +2784,14 @@ pub const Generator = struct {
         var input = std.ArrayList(u32).empty;
         defer input.deinit(allocator);
 
-        if (self.has_pending_token or self.has_pending_logits) {
+        if (self.pending != null) {
             // Pipelined or shim-seeded: `next_token_id` is in the cache, unpublished.
             try self.resolvePendingToken();
             if (try self.checkStop()) return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = true };
             try self.generated_ids.append(allocator, self.next_token_id);
             try emitted.append(allocator, self.next_token_id);
             self.advanceStep(1);
-            if (self.has_pending_logits) {
-                _ = mlx.mlx_array_free(self.pending_logits);
-                self.has_pending_logits = false;
-            }
+            self.dropPending();
         } else {
             // Spec exit: `next_token_id` is decided but not in the cache.
             try input.append(allocator, self.next_token_id);
@@ -2837,8 +2828,7 @@ pub const Generator = struct {
         _ = mlx.mlx_async_eval(vec);
         _ = mlx.mlx_vector_array_free(vec);
         host.end();
-        self.pending_logits = logits;
-        self.has_pending_logits = true;
+        self.pending = .{ .logits = logits };
         self.next_token_id = forced[forced.len - 1];
         self.mtp_hidden_stale = true;
         return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = false };
@@ -3248,7 +3238,7 @@ pub const Generator = struct {
     ///   1. Build next step's lazy graph (depends on pending lazy token)
     ///   2. async_eval the next graph — GPU computes pending token as a DEPENDENCY,
     ///      then continues with the forward pass
-    ///   3. eval(pending_token) — returns INSTANTLY since GPU already computed it
+    ///   3. eval(pending.token) — returns INSTANTLY since GPU already computed it
     ///   4. Return the token while GPU continues computing the next forward pass
     ///
     ///   This mirrors mlx-lm's: _step(y) → async_eval(next_y) → yield y.item()
@@ -3260,42 +3250,35 @@ pub const Generator = struct {
         if (self.sampling.constraint != null) return if (self.dspark_pending) self.dsparkEmitPending(allocator) else self.nextConstrained(allocator);
 
         // Transition shim: speculative-decode paths may exit with
-        // `next_token_id` set but `pending_logits` unset (drafter's exit
+        // `next_token_id` set but `pending.logits` unset (drafter's exit
         // invariant is "t1 NOT in cache" — its hand-off to `next()` would
-        // otherwise crash on the slow path which assumes pending_logits is
+        // otherwise crash on the slow path which assumes `pending.logits` is
         // always lazily seeded). When we observe that state, synchronously
-        // forward `[next_token_id]` to seed `pending_logits` so the fast
+        // forward `[next_token_id]` to seed `pending.logits` so the fast
         // path picks up cleanly. the speculative exit state already matches `next()`'s
         // invariant, so this only fires for drafter→next runtime-gate
         // fallbacks (and any future spec methods that share drafter's shape).
-        if (!self.has_pending_logits and !self.has_pending_token and
-            self.step < self.max_tokens and !self.samplesSync())
-        {
+        if (self.pending == null and self.step < self.max_tokens and !self.samplesSync()) {
             const tok_i32: i32 = @intCast(self.next_token_id);
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const t_fwd = tick_prof.mark();
-            self.pending_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
+            self.pending = .{ .logits = try self.xfm.forwardWith(&self.ctx, tok_input) };
             tick_prof.add(.fwd, t_fwd);
-            self.has_pending_logits = true;
         }
 
         // ── Phase 1: Build and submit the NEXT step FIRST ──
         // This forces the GPU to compute the pending token as a dependency,
         // so when we eval it in Phase 2, it's already ready.
-        if (self.has_pending_logits and !self.samplesSync() and self.step + 1 < self.max_tokens and !self.callForcePending()) {
-            const step_logits = self.pending_logits;
-            self.has_pending_logits = false;
-
+        // A failure anywhere in it returns the error with `pending` as the step found it, the new handles freed.
+        if (self.pending != null and !self.samplesSync() and self.step + 1 < self.max_tokens and !self.callForcePending()) {
+            const p = self.pending.?;
             const t_sample = tick_prof.mark();
-            const lazy_token = blk: {
-                defer _ = mlx.mlx_array_free(step_logits);
-                break :blk try self.sampleLazy(step_logits, if (self.has_pending_token)
-                    .{ .pending = self.pending_token }
-                else
-                    .{ .decided = &.{self.next_token_id} });
-            };
+            const lazy_token = try self.sampleLazy(p.logits, if (p.token) |t|
+                .{ .pending = t }
+            else
+                .{ .decided = &.{self.next_token_id} });
             tick_prof.add(.sample, t_sample);
 
             var adopted = false;
@@ -3303,52 +3286,37 @@ pub const Generator = struct {
                 _ = mlx.mlx_array_free(lazy_token);
             };
             const t_fwd = tick_prof.mark();
-            if (lazyForward(self.xfm, &self.ctx, lazy_token, self.ctx.argmax_only)) |next_logits| {
-                tick_prof.add(.fwd, t_fwd);
-                defer if (!adopted) {
-                    _ = mlx.mlx_array_free(next_logits);
-                };
-                const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
-                const host = mlx.engine.enter(self.xfm.outStream());
-                const vec = mlx.mlx_vector_array_new_data(&arr, 2);
-                const t_eval = tick_prof.mark();
-                _ = mlx.mlx_async_eval(vec);
-                tick_prof.add(.eval, t_eval);
-                _ = mlx.mlx_vector_array_free(vec);
-                host.end();
+            const next_logits = try lazyForward(self.xfm, &self.ctx, lazy_token, self.ctx.argmax_only);
+            tick_prof.add(.fwd, t_fwd);
+            defer if (!adopted) {
+                _ = mlx.mlx_array_free(next_logits);
+            };
+            const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
+            const host = mlx.engine.enter(self.xfm.outStream());
+            const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+            const t_eval = tick_prof.mark();
+            _ = mlx.mlx_async_eval(vec);
+            tick_prof.add(.eval, t_eval);
+            _ = mlx.mlx_vector_array_free(vec);
+            host.end();
 
-                // NOW resolve the pending token — GPU already computed it as a
-                // dependency of the graph we just submitted. Should be instant.
-                const t_res = tick_prof.mark();
-                try self.resolvePendingToken();
-                tick_prof.add(.resolve, t_res);
+            // NOW resolve the pending token — GPU already computed it as a
+            // dependency of the graph we just submitted. Should be instant.
+            const t_res = tick_prof.mark();
+            try self.resolvePendingToken();
+            tick_prof.add(.resolve, t_res);
+            self.dropPending();
 
-                // Check stop conditions on the resolved token
-                if (try self.checkStop()) return null;
+            // Check stop conditions on the resolved token
+            if (try self.checkStop()) return null;
 
-                const token = self.next_token_id;
-                self.advanceStep(1);
-                try self.generated_ids.append(allocator, token);
+            const token = self.next_token_id;
+            self.advanceStep(1);
+            try self.generated_ids.append(allocator, token);
 
-                // Store new pending state
-                self.pending_token = lazy_token;
-                self.has_pending_token = true;
-                self.pending_logits = next_logits;
-                self.has_pending_logits = true;
-                adopted = true;
-
-                return token;
-            } else |_| {
-                tick_prof.add(.fwd, t_fwd);
-                // lazyForward failed — fall through to slow path
-                try mlx.check(mlx.mlx_array_eval(lazy_token));
-                var val: i32 = 0;
-                try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
-                _ = mlx.mlx_array_free(lazy_token);
-                adopted = true;
-                self.next_token_id = @intCast(val);
-                self.has_pending_token = false;
-            }
+            self.pending = .{ .logits = next_logits, .token = lazy_token };
+            adopted = true;
+            return token;
         }
 
         // ── Phase 2: Slow path (first token, last token, logprobs, or pipeline miss) ──
@@ -3362,11 +3330,7 @@ pub const Generator = struct {
         self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
 
-        const step_logits = if (self.has_pending_logits) blk: {
-            const logits = self.pending_logits;
-            self.has_pending_logits = false;
-            break :blk logits;
-        } else blk: {
+        const step_logits = if (self.pending != null) try self.takeLogits() else blk: {
             const tok_i32: i32 = @intCast(token);
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
@@ -3420,14 +3384,9 @@ pub const Generator = struct {
 
         if (self.step < self.max_tokens) {
             const t_fwd = tick_prof.mark();
-            const next_logits = lazyForward(self.xfm, &self.ctx, lazy_token, self.ctx.argmax_only) catch {
-                tick_prof.add(.fwd, t_fwd);
-                try mlx.check(mlx.mlx_array_eval(lazy_token));
-                var val: i32 = 0;
-                try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
+            const next_logits = lazyForward(self.xfm, &self.ctx, lazy_token, self.ctx.argmax_only) catch |e| {
                 _ = mlx.mlx_array_free(lazy_token);
-                self.next_token_id = @intCast(val);
-                return token;
+                return e;
             };
             tick_prof.add(.fwd, t_fwd);
 
@@ -3440,10 +3399,7 @@ pub const Generator = struct {
             _ = mlx.mlx_vector_array_free(vec);
             host.end();
 
-            self.pending_token = lazy_token;
-            self.has_pending_token = true;
-            self.pending_logits = next_logits;
-            self.has_pending_logits = true;
+            self.pending = .{ .logits = next_logits, .token = lazy_token };
         } else {
             try mlx.check(mlx.mlx_array_eval(lazy_token));
             var val: i32 = 0;
@@ -3472,8 +3428,7 @@ pub const Generator = struct {
             .json_body => unreachable,
         }
 
-        const step_logits = self.pending_logits;
-        self.has_pending_logits = false;
+        const step_logits = try self.takeLogits();
         var owns_step_logits = true;
         defer {
             if (owns_step_logits) _ = mlx.mlx_array_free(step_logits);
@@ -3580,8 +3535,7 @@ pub const Generator = struct {
             const vec = mlx.mlx_vector_array_new_data(&arr, 1);
             _ = mlx.mlx_async_eval(vec);
             _ = mlx.mlx_vector_array_free(vec);
-            self.pending_logits = next_logits;
-            self.has_pending_logits = true;
+            self.pending = .{ .logits = next_logits };
         } else {
             self.done = true;
             self.finish_reason = "length";
@@ -3605,8 +3559,7 @@ pub const Generator = struct {
             return error.NoValidProtocolToken;
         }
 
-        const step_logits = self.pending_logits;
-        self.has_pending_logits = false;
+        const step_logits = try self.takeLogits();
         defer _ = mlx.mlx_array_free(step_logits);
 
         var masked_logits = mlx.mlx_array_new();
@@ -3690,8 +3643,7 @@ pub const Generator = struct {
             const vec = mlx.mlx_vector_array_new_data(&arr, 1);
             _ = mlx.mlx_async_eval(vec);
             _ = mlx.mlx_vector_array_free(vec);
-            self.pending_logits = next_logits;
-            self.has_pending_logits = true;
+            self.pending = .{ .logits = next_logits };
         } else {
             self.done = true;
             self.finish_reason = "length";
@@ -3705,11 +3657,11 @@ pub const Generator = struct {
     /// grammar by the sampled token's bytes, and pre-launches the next forward
     /// pass to overlap with the next mask build.
     pub fn nextConstrained(self: *Generator, allocator: std.mem.Allocator) !?u32 {
-        if (self.logprobs_n == 0 or !self.has_pending_logits) return self.nextConstrainedToken(allocator);
+        if (self.logprobs_n == 0 or self.pending == null) return self.nextConstrainedToken(allocator);
         // A constrained token belongs to these raw logits, before the grammar mask.
         var logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(logits);
-        try mlx.check(mlx.mlx_array_set(&logits, self.pending_logits));
+        try mlx.check(mlx.mlx_array_set(&logits, self.pending.?.logits));
         const token = (try self.nextConstrainedToken(allocator)) orelse return null;
         const lp = try sampler.computeLogprobs(allocator, logits, token, self.logprobs_n, self.xfm.outStream());
         if (self.last_logprob) |old| allocator.free(old.top_logprobs);
@@ -3720,7 +3672,7 @@ pub const Generator = struct {
     }
 
     fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u32 {
-        if (!self.has_pending_logits) {
+        if (self.pending == null) {
             self.done = true;
             return null;
         }
@@ -3763,8 +3715,7 @@ pub const Generator = struct {
             @memset(constraint.mask_buf, true);
         }
 
-        const step_logits = self.pending_logits;
-        self.has_pending_logits = false;
+        const step_logits = try self.takeLogits();
         defer _ = mlx.mlx_array_free(step_logits);
 
         var masked_logits = mlx.mlx_array_new();
@@ -3842,8 +3793,7 @@ pub const Generator = struct {
         try self.generated_ids.append(allocator, token);
 
         if (next_logits) |nl| {
-            self.pending_logits = nl;
-            self.has_pending_logits = true;
+            self.pending = .{ .logits = nl };
         } else if (self.step < self.max_tokens) {
             // Pipeline miss: forward the realized token.
             const tok_i32: i32 = @intCast(token);
@@ -3855,8 +3805,7 @@ pub const Generator = struct {
             const vec = mlx.mlx_vector_array_new_data(&arr, 1);
             _ = mlx.mlx_async_eval(vec);
             _ = mlx.mlx_vector_array_free(vec);
-            self.pending_logits = nl;
-            self.has_pending_logits = true;
+            self.pending = .{ .logits = nl };
         } else {
             self.done = true;
             self.finish_reason = "length";
@@ -3919,8 +3868,7 @@ pub const Generator = struct {
         _ = mlx.mlx_vector_array_free(vec);
         host.end();
 
-        self.pending_logits = logits;
-        self.has_pending_logits = true;
+        self.pending = .{ .logits = logits };
     }
 };
 

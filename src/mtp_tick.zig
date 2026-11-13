@@ -313,7 +313,7 @@ pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         if (sampler.penaltyActive(slot.sampling)) return false;
         const gen = if (slot.legacy_gen) |*g| g else return false;
         if (arch_state.mropeOf(&gen.ctx.arch_ctx) != null) return false;
-        pending_pipeline = pending_pipeline or gen.has_pending_logits or gen.has_pending_token;
+        pending_pipeline = pending_pipeline or gen.pending != null;
         pending_draft = pending_draft or gen.mtp_pre_draft != null;
         const why = sch.batchVerdict(slot);
         const mtp_row = why == .spec_active and slotMtpGroupable(slot);
@@ -838,8 +838,7 @@ test "a plain batched tick checks the thinking budget before its rows forward" {
     gen.sampling = .{ .think_bound = &tb };
     gen.completion_tokens = 4;
     gen.max_tokens = 4;
-    gen.has_pending_logits = false;
-    gen.has_pending_token = false;
+    gen.pending = null;
     gen.step = 0;
     gen.next_token_id = 9;
     gen.eos_token_ids = &.{2};

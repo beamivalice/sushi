@@ -1171,8 +1171,8 @@ pub fn mtpSerialWallMs(self: *Generator) ?f32 {
 /// May `mtpSerialCaptureTick` run? It forwards the one pending token with capture, so
 /// pipelined logits or a pipelined token would publish a hidden for an uncommitted row.
 /// A runtime check: `std.debug.assert` compiles to nothing in ReleaseFast.
-pub fn mtpSerialCaptureReady(has_pending_logits: bool, has_pending_token: bool) bool {
-    return !has_pending_logits and !has_pending_token;
+pub fn mtpSerialCaptureReady(pending: ?generate_mod.Pending) bool {
+    return pending == null;
 }
 
 /// Abandon the ramp back to MTP and finish this request on the serial arm. Logged once per request.
@@ -1195,7 +1195,6 @@ pub fn mtpSerialTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterSt
     if (self.mtp_serial_exit == .drain) {
         switch (try self.drainPipelineForSpec(allocator)) {
             .stopped => return null,
-            .stay_disabled => return try self.mtpSerialGiveUp(allocator, "unexpected pipeline state"),
             .already_clean => {
                 self.mtp_serial_exit = .capture;
                 return try self.mtpSerialCaptureTick(allocator);
@@ -1218,7 +1217,7 @@ pub fn mtpSerialTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterSt
 /// The one synchronous step that ends a serial block: forward the pending token with
 /// capture and sample its successor without forwarding it (`nextMtp`'s entry invariant).
 pub fn mtpSerialCaptureTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-    if (!mtpSerialCaptureReady(self.has_pending_logits, self.has_pending_token)) {
+    if (!mtpSerialCaptureReady(self.pending)) {
         return try self.mtpSerialGiveUp(allocator, "pipeline not drained");
     }
     if (try self.checkStop()) return null;
@@ -1356,7 +1355,7 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
 
     // A round's pending token is on the host and not forwarded: an end of turn stops here, where the decode-end
     // point stands, instead of the serial block forwarding it and its successor first.
-    if (self.end_point_armed and self.spec_round_end == self.ctx.moe_seq_offset.* and !self.has_pending_token and
+    if (self.end_point_armed and self.spec_round_end == self.ctx.moe_seq_offset.* and (self.pending == null or self.pending.?.token == null) and
         isEosId(self.next_token_id, self.eos_token_ids) and try self.checkStop()) return .{ .done = null };
 
     // Serial block: the runtime-disabled fallback, the bounded probe, or the ramp back.
@@ -2820,10 +2819,10 @@ test "mtpRoundOff0: a pending history stash overrides the stale cache length" {
 
 test "mtpSerialCaptureReady: the capture step's entry invariant is a RUNTIME check, not an assert" {
     const G = Generator;
-    try testing.expect(G.mtpSerialCaptureReady(false, false));
-    try testing.expect(!G.mtpSerialCaptureReady(true, false));
-    try testing.expect(!G.mtpSerialCaptureReady(false, true));
-    try testing.expect(!G.mtpSerialCaptureReady(true, true));
+    const none: mlx.mlx_array = .{ .ctx = null };
+    try testing.expect(G.mtpSerialCaptureReady(null));
+    try testing.expect(!G.mtpSerialCaptureReady(.{ .logits = none }));
+    try testing.expect(!G.mtpSerialCaptureReady(.{ .logits = none, .token = none }));
 }
 
 test "group acceptance: every row's verdict comes from its OWN am, at any accept position" {

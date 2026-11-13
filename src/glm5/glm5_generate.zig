@@ -605,6 +605,65 @@ test "an empty prompt is a typed error at the generator, never an index" {
     try expectError(error.EmptyPrompt, Generator.initWithOptions(testing.io, a, &xfm, &tok, &.{}, 4, .{ .temperature = 0.0 }, &.{}, .{}));
 }
 
+test "a serial step whose MLX call raises at any point ends the request by name and loses no token" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    var weights = model_mod.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glmGeneratorFixture(&weights);
+    var xfm = try Trunk.init(testing.io, a, cfg, &weights);
+    defer xfm.deinit();
+    defer mlx.armLatchingFaultForTest(0);
+    var prompt: [40]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast((i * 7 + i / 3) % 4);
+    const Run = struct {
+        /// The tokens a request publishes when its fourth step's `k`-th checked call raises as mlx-c does, latching the
+        /// error (none at 0): a failed step, or one that returns with the error latched, ends it.
+        fn tokens(x: *Trunk, t: *Tokenizer, ids: []const u32, sampling: SamplingParams, k: u64, out: *std.ArrayList(u32), fired: *bool) !void {
+            try x.resetCache();
+            var gen = try Generator.initWithOptions(testing.io, testing.allocator, x, t, ids, 12, sampling, &.{}, .{ .skip_lazy_preforward = true });
+            defer gen.deinit(testing.allocator);
+            for (0..3) |_| try out.append(testing.allocator, (try gen.next(testing.allocator)).?);
+            mlx.armLatchingFaultForTest(k);
+            const step = gen.next(testing.allocator);
+            fired.* = mlx.latchingFaultFiredForTest();
+            mlx.armLatchingFaultForTest(0);
+            var got = step catch return;
+            while (got) |id| {
+                try out.append(testing.allocator, id);
+                if (mlx.errorPending()) return;
+                got = gen.next(testing.allocator) catch return;
+            }
+        }
+    };
+    // Token 0 is the pad id three of which end a request, and the fixture's argmax is often 0.
+    const no_pad = [_]logit_bias.Bias{.{ .id = 0, .delta = -100, .scope = .all }};
+    var msg: [300]u8 = undefined;
+    for ([_]SamplingParams{ .{ .temperature = 0.0, .think_penalty = .{ .biases = &no_pad } }, .{ .temperature = 0.8, .top_p = 0.95, .seed = 7, .think_penalty = .{ .biases = &no_pad } } }) |sampling| {
+        var want: std.ArrayList(u32) = .empty;
+        defer want.deinit(a);
+        var fired = false;
+        try Run.tokens(&xfm, &tok, &prompt, sampling, 0, &want, &fired);
+        try testing.expectEqual(@as(usize, 12), want.items.len);
+        var refused: usize = 0;
+        var k: u64 = 1;
+        while (true) : (k += k / 8 + 1) {
+            var got: std.ArrayList(u32) = .empty;
+            defer got.deinit(a);
+            try Run.tokens(&xfm, &tok, &prompt, sampling, k, &got, &fired);
+            _ = mlx.takeError(&msg);
+            if (!fired) break;
+            refused += 1;
+            // The refused step ends the request: it emits nothing, or the token before it with the error latched.
+            try testing.expect(got.items.len <= 4);
+            try testing.expectEqualSlices(u32, want.items[0..got.items.len], got.items);
+        }
+        try testing.expect(refused >= 20);
+    }
+}
+
 fn glmGeneratorFixture(weights: *model_mod.Weights) !model_mod.ModelConfig {
     var cfg = try glm5_forward.nonzeroDecodeFixture(weights);
     cfg.max_position_embeddings = 4096;

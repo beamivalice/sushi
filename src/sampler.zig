@@ -3735,9 +3735,7 @@ test "upstream bugfix: constrained logprobs describe the returned token before m
     };
     defer gen.generated_ids.deinit(a);
     defer if (gen.last_logprob) |lp| a.free(lp.top_logprobs);
-    defer if (gen.has_pending_logits) {
-        _ = mlx.mlx_array_free(gen.pending_logits);
-    };
+    defer gen.dropPending();
     for ([_][4]f32{ .{ 0, 2, 1, 4 }, .{ 0, 1, 3, 5 } }, [_]u32{ 1, 2 }) |values, want| {
         var sc: SchemaConstraint = undefined;
         try sc.initFromValue(a, parsed.value, &bytes);
@@ -3745,9 +3743,8 @@ test "upstream bugfix: constrained logprobs describe the returned token before m
         gen.sampling.constraint = &sc.constraint;
         gen.max_tokens = gen.step + 1;
         gen.done = false;
-        gen.pending_logits = mlx.mlx_array_new_data(&values, &.{ 1, 1, 4 }, 3, .float32);
-        gen.has_pending_logits = true;
-        const expected = try computeLogprobs(a, gen.pending_logits, want, 4, s);
+        gen.pending = .{ .logits = mlx.mlx_array_new_data(&values, &.{ 1, 1, 4 }, 3, .float32) };
+        const expected = try computeLogprobs(a, gen.pending.?.logits, want, 4, s);
         defer a.free(expected.top_logprobs);
         try testing.expectEqual(@as(?u32, want), try gen.nextConstrained(a));
         const got = gen.last_logprob orelse return error.NoLogprobs;

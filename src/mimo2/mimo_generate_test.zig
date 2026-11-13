@@ -147,7 +147,7 @@ test "mimo ring marks leave the prefill's logits, cache and greedy tokens unchan
         marked.cache.ring_marks = &.{};
 
         for (&marks) |*m| try testing.expect(marked.cache.ringMarkComplete(m));
-        try testing.expect(try arraysBitEqual(plain_gen.pending_logits, marked_gen.pending_logits, plain.s));
+        try testing.expect(try arraysBitEqual(plain_gen.pending.?.logits, marked_gen.pending.?.logits, plain.s));
         for (plain.cache.entries, 0..) |e, li| {
             try testing.expectEqual(e.offset, marked.cache.entries[li].offset);
             try testing.expect(try kvRowsEqual(&plain, &marked, li, e.offset));
