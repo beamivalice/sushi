@@ -561,7 +561,48 @@ rerun. Since that table: the kept scales, the Engram batch reads, the attention 
 - **Prose decode is level or ahead at Nominal** (4k to 32k) and 2 to 6% under at 64k and 128k, the two cells read at
   Moderate and Heavy pressure against a rested box's.
 
-<a id="sampled-draw"></a>
+<a id="decode-fusions"></a>
+### Decode fusions on Sushi Cooler (phase 2.5)
+
+DeepSeek-V4.1-Flash STQ 1.75bpw, `--ssd-budget-gb 108`, M5 Max, AC, fans at max, GPU lock, `taskpolicy -a`, the load's
+own forward timer at 4096 keys (`SUSHI_DECODE_FWD_UBENCH`), 400 forwards an arm with the arms alternating every 8
+forwards in one load (a temporary switch, removed): passes run one after another drift 5% with the box's heat and
+cannot read 1%. Tree: `b36d14fd` plus the stack. Each number is the stack over main's path; a load's first pair
+compiles the other arm's kernels inside the loop and is left out.
+
+| | dispatches a forward | stack / main, pass by pass |
+|---|---|---|
+| one row (a serial step) | 998 -> 918 | 0.9665, 0.9679; an earlier load 0.9782 |
+| three rows (a verify block) | 1,120 -> 1,000 | 0.9630, 0.9659, 0.9614; an earlier load 0.9669, 0.9607 |
+
+The folds, each over the stack without it where it was read alone (two passes):
+
+| fold | one row | three rows |
+|---|---|---|
+| the stacked attention-input launch norms `wq_a`'s rows in its finish (-39 dispatches) | 0.9958, 0.9953 | 0.9990, 0.9947 |
+| `wo_b` reads `wo_a`'s partials (-39; served at one row) | 0.9974, 0.9932 | 1.0107, 1.0168 |
+| the attention stage's split off the FFN stage's critical path | 0.9858, 0.9824 | 0.9835, 0.9982 |
+| the router's top-k in two barriers | 1.0009 | 0.9992 |
+| `wo_b`'s finish expands the stream, the FFN stage is the plain kernel; the two transposed copies of a verify block go (-120 at three rows) | in the stack | in the stack |
+
+- The pair is served at one row only: at three rows `wo_b` goes from 49.8 to 62.1 us for 8.6 us of dispatches
+  saved, at one row from 45.4 to 47.5 us for 4.0 saved (`SUSHI_ENGINE_KERNEL_PROF=all`, standalone us a kernel).
+- **One row of a layer before the stack, standalone us a kernel**: hc_stage 9.7, wq_a 14.1, finish 3.7, rms 3.5,
+  wq_b 49.3, rope_kv_ring 7.5, attn_split 26.7, attn_merge 5.8, wo_a 36.0, finish 4.0, wo_b 45.4, finish 3.6,
+  hc_stage_z 19.3, gate 10.1, route_split_slots 9.7, fz_prep 4.6, fz_pair 100.8, fz_mid 5.2, fz_down 51.7, reduce
+  7.1: 417 us, the thirteen small kernels 94 us (22%); at three rows a layer is 885 us, `hc_stage_z` 29.6.
+- **What moved** (a later load, whose small kernels all read about 0.7 us higher): hc_stage_z 19.3 -> the plain stage
+  10.1 at one row, 29.6 -> 12.9 at three; finish + rms 7.2 -> 5.5; route 9.7 -> 9.3; two 4.8 us copies gone at three rows.
+- **Fast bench** (`tests/bench.sh --tag p25-stack --rungs 4k,8k`, the stack's tree, same pack and flags, AC, fans max,
+  GPU lock; beside the `cooler-p2d` rows above, recorded, not rerun; the output is the same bytes, so the code rounds
+  are the same rounds): prose decode 57.4 and 60.8 tok/s at 4k and 8k against 56.0 and 58.0 (most prose rounds are
+  one-row steps); code 8k 53.0 to 53.7 ms a round against 54.3 to 56.9 (92.0 tok/s against 91.5); code 4k 92.9
+  against 94.5, inside its samples' spread (88 to 98 both runs).
+- **Not built, priced against these numbers**: the attention merge into `wo_a`'s staging (its exps and unrope would
+  repeat in every threadgroup, as the pair's finish does); a self-preparing expert pair and a fused-mid down
+  ([measured slower](engine-exl3-experts.md)); gate + router in one threadgroup (3.9 MB through one group); a finish
+  summed by the last-arriving threadgroup (recorded at no gain, and it rests on unordered plain writes).
+
 ### Sampled draw as one kernel (micro indicator)
 
 One process, vocabulary 129,280, f32 logits, suppress mask on, temperature 0.8, 300 calls read after 2,000 warm ones,

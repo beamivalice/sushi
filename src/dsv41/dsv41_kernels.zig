@@ -265,8 +265,8 @@ const ROUTE_BODY =
     \\const int e = thread_position_in_threadgroup.x, l = threadgroup_position_in_grid.y;
     \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int E = logits_shape[1];
-    \\threadgroup float t_s[1024], t_v[32];
-    \\threadgroup int t_i[32], t_pick[K];
+    \\threadgroup float t_s[1024], t_cv[32 * K];
+    \\threadgroup int t_pick[K], t_ci[32 * K];
     \\float s = 0.0f, v = -INFINITY;
     \\if (e < E) {
     \\  const float z = logits[size_t(l) * E + e];
@@ -276,20 +276,27 @@ const ROUTE_BODY =
     \\  v = s + bias[(bias_shape[0] == 1 ? 0 : l) * E + e];
     \\  t_s[e] = s;
     \\}
+    \\// A simdgroup's K best, best first, need no barrier; a candidate's place among them all is its pick.
     \\for (int r = 0; r < K; ++r) {
     \\  const float bv = metal::simd_max(v);
     \\  const int bi = metal::simd_min(v == bv && e < E ? e : 0x7fffffff);
-    \\  if (lane == 0) { t_v[sg] = bv; t_i[sg] = bi; }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (e == 0) {
-    \\    const int nsg = (threads_per_threadgroup.x + 31) / 32;
-    \\    float best = t_v[0]; int at = t_i[0];
-    \\    for (int g = 1; g < nsg; ++g) if (t_v[g] > best || (t_v[g] == best && t_i[g] < at)) { best = t_v[g]; at = t_i[g]; }
-    \\    t_pick[r] = at;
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (e == t_pick[r]) v = -INFINITY;
+    \\  if (lane == 0) { t_cv[sg * K + r] = bv; t_ci[sg * K + r] = bi; }
+    \\  if (e == bi) v = -INFINITY;
     \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\const int nc = int((threads_per_threadgroup.x + 31) / 32) * K;
+    \\if (e < nc) {
+    \\  const float cv = t_cv[e];
+    \\  const int ci = t_ci[e];
+    \\  int place = 0;
+    \\  for (int j = 0; j < nc; ++j) {
+    \\    const float u = t_cv[j];
+    \\    const int ui = t_ci[j];
+    \\    place += (u > cv || (u == cv && (ui < ci || (ui == ci && j < e)))) ? 1 : 0;
+    \\  }
+    \\  if (place < K) t_pick[place] = ci;
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\if (e == 0) {
     \\  float sum = 0.0f;
     \\  for (int r = 0; r < K; ++r) sum += t_s[t_pick[r]];
@@ -487,9 +494,11 @@ pub const Routes = struct {
     local: A = .{ .ctx = null },
 };
 
-/// The `k` experts of each row of `logits` `[L, E]` (E <= 1024): picked by sqrt-softplus score plus `bias`
-/// (`[1, E]` or `[L, E]`, f32), weighted by the unbiased score, normalized when `norm`, times `scale`.
+/// The `k` experts of each row of `logits` `[L, E]` (E <= 1024, k <= `ROUTE_MAX_K`): picked by sqrt-softplus score
+/// plus `bias` (`[1, E]` or `[L, E]`, f32), best first, an equal score to the lower expert; weighted by the unbiased
+/// score, normalized when `norm`, times `scale`. A row holds at least `k` finite biased scores.
 pub fn route(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32) !Routes {
+    if (k > ROUTE_MAX_K) return error.RouteTooWide;
     const L = dim(logits, 0);
     const E = dim(logits, 1);
     const tg = (E + 31) / 32 * 32;
@@ -501,10 +510,14 @@ pub fn route(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32) !
     return .{ .idx = o[0], .wts = o[1] };
 }
 
+/// A simdgroup hands its `k` best to the pick, so `k` is at most its lanes.
+pub const ROUTE_MAX_K: usize = 32;
+
 pub const RouteSplit = struct { routes: Routes, split: HcSplit };
 
 /// `route` and `hcSplitZ(z)` in one launch.
 pub fn routeSplit(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32, z: A, hc: usize, iters: usize, eps: A) !RouteSplit {
+    if (k > ROUTE_MAX_K) return error.RouteTooWide;
     const L = dim(logits, 0);
     const E = dim(logits, 1);
     const tg = (E + 31) / 32 * 32;
@@ -521,6 +534,7 @@ pub fn routeSplit(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f
 
 /// `routeSplit` that also gives each pick's slot in a resident layer's bank: `map` `[E]` int32, the slot of each expert.
 pub fn routeSplitSlots(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32, z: A, hc: usize, iters: usize, eps: A, map: A) !RouteSplit {
+    if (k > ROUTE_MAX_K) return error.RouteTooWide;
     const L = dim(logits, 0);
     const E = dim(logits, 1);
     const tg = (E + 31) / 32 * 32;
@@ -884,7 +898,7 @@ const ATTN_DEC_SOURCE = ATTN_DEC_BODY ++
     \\  for (int g = 0; g < NSG; ++g) o += t_acc[g * D + d] * w[g];
     \\  OT ov = dsv41_unrope<OT, RD, D>(OT(o / total), d, p0 + i, freqs);
     \\  if (QAT != 0) ov = dsv41_fp8_store<OT>(ov);
-    \\  out[(i * H + h) * D + d] = ov;
+    \\  out[dsv41_head_at<OG>(i, h, H, meta[1]) * D + d] = ov;
     \\}
 ;
 
@@ -915,6 +929,26 @@ const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++
     \\  const float s = qat_scale<0>(metal::simd_max(metal::fabs(float(v))));
     \\  return static_cast<OT>(qat_round<0>(float(v), s));
     \\}
+    \\// Head h of row i among L rows: `[L, H]`, or grouped `[OG, L, H / OG]` as an output projection's banks read it.
+    \\template <int OG>
+    \\inline size_t dsv41_head_at(int i, int h, int H, int L) {
+    \\  if (OG == 0) return size_t(i) * H + h;
+    \\  const int per = H / metal::max(OG, 1);
+    \\  return (size_t(h / per) * L + i) * per + h % per;
+    \\}
+;
+
+/// Before a decode attention's body: one more threadgroup a row, past the heads', splits the row's hyper-connection
+/// mixes `z` (`HC_SPLIT_BODY`). The attention neither waits for it nor feeds it, and outlasts it.
+const ATTN_RIDE_PRE =
+    \\if (threadgroup_position_in_grid.x == uint(q_shape[1])) {
+    \\#pragma clang fp contract(off)
+    \\  if (simdgroup_index_in_threadgroup != 0u || threadgroup_position_in_grid.z != 0u) return;
+    \\  const int l = threadgroup_position_in_grid.y;
+++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY ++
+    \\  return;
+    \\}
+    \\
 ;
 
 /// `ATTN_DEC_SOURCE` over one of S splits of its rows: the split's max, sum and unnormalized output
@@ -948,7 +982,7 @@ const ATTN_MERGE_SOURCE =
     \\}
     \\OT ov = dsv41_unrope<OT, RD, D>(OT(o / total), d, meta[0] + i, freqs);
     \\if (QAT != 0) ov = dsv41_fp8_store<OT>(ov);
-    \\out[(size_t(i) * H + h) * D + d] = ov;
+    \\out[dsv41_head_at<OG>(i, h, H, meta[1]) * D + d] = ov;
 ;
 
 /// A wide span's softmax, one simdgroup per (row, head): the raw window scores `lw` [L*H, Wk] under the band
@@ -989,6 +1023,8 @@ const ATTN_SOFTMAX_SOURCE =
 
 var attn_dec_def = Def{ .name = "dsv41_attn_decode", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DEC_SOURCE, .header = HEADS_HEADER };
 var attn_split_def = Def{ .name = "dsv41_attn_split", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal" }, .outs = &.{ "pacc", "pm", "pl" }, .source = ATTN_SPLIT_SOURCE };
+var attn_dec_ride_def = Def{ .name = "dsv41_attn_decode_ride", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "freqs", "z", "eps" }, .outs = &.{ "out", "pre", "post", "comb" }, .source = ATTN_RIDE_PRE ++ ATTN_DEC_SOURCE, .header = HEADS_HEADER };
+var attn_split_ride_def = Def{ .name = "dsv41_attn_split_ride", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "z", "eps" }, .outs = &.{ "pacc", "pm", "pl", "pre", "post", "comb" }, .source = ATTN_RIDE_PRE ++ ATTN_SPLIT_SOURCE };
 var attn_merge_def = Def{ .name = "dsv41_attn_merge", .ins = &.{ "pacc", "pm", "pl", "sink", "meta", "freqs" }, .outs = &.{"out"}, .source = ATTN_MERGE_SOURCE, .header = HEADS_HEADER };
 var attn_softmax_def = Def{ .name = "dsv41_attn_softmax", .ins = &.{ "lw", "lc", "topk", "sink", "meta", "scal" }, .outs = &.{ "pw", "pc" }, .source = ATTN_SOFTMAX_SOURCE };
 
@@ -1021,7 +1057,18 @@ pub const DecodeArgs = struct {
     /// The compression ratio the picks were made at: row i carries the min(K, (p0 + i + 1) / ratio) picks its one-row
     /// step would, and splits its columns as that step does. 0: every row carries K.
     ratio: usize = 0,
+    /// Where one launch serves the block the heads leave as `[groups, L, H / groups * D]`, the banks a grouped output
+    /// projection reads, and `grouped` is set; else they leave `[L, H, D]`.
+    groups: usize = 0,
+    grouped: ?*bool = null,
+    /// A stage's mixes for the launch to split beside the heads (`hcSplitZ`), where one launch serves the block:
+    /// `split` is then set.
+    mixes: ?StageMixes = null,
+    split: ?*?HcSplit = null,
 };
+
+/// The mixes `z` `[L, (2 + hc) * hc]` of a hyper-connection stage and what splits them; `eps` is `hcEps`.
+pub const StageMixes = struct { z: A, hc: usize, iters: usize, eps: A };
 
 /// Whether `attnDecode` serves head rows of `d` channels.
 pub fn attnDecodeFits(d: usize) bool {
@@ -1048,6 +1095,8 @@ pub fn attnDecode(sc: *Scope, a: DecodeArgs) !A {
         while (r1 < L and rowSplits(a, K, r1) == s0) r1 += 1;
         if (r0 == 0 and r1 == L) return attnDecodeSplit(sc, a, s0);
         var g = a;
+        g.groups = 0;
+        g.mixes = null;
         g.q = try sc.slice(a.q, 0, r0, r1);
         g.topk = try sc.slice(a.topk, 0, r0, r1);
         g.p0 = a.p0 + r0;
@@ -1070,24 +1119,48 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
     const comp = if (K > 0) try sc.astype(a.comp, kt) else a.ring;
     const ids = if (K > 0) try sc.astype(a.topk, .int32) else meta;
     const freqs = if (a.rd > 0) a.freqs else try sc.zeros(&.{1}, .float32);
-    const grid: Grid = .{ H * attn_dec_nsg * 32, L, splits };
+    const og = a.groups;
+    const out_shape: []const c_int = if (og > 0) &.{ ci(og), ci(L), ci(H / og * D) } else &.{ ci(L), ci(H), ci(D) };
+    if (og > 0) if (a.grouped) |g| {
+        g.* = true;
+    };
+    // A riding split takes one more threadgroup a row, past the heads'.
+    const ride = a.mixes;
+    const grid: Grid = .{ (H + @intFromBool(ride != null)) * attn_dec_nsg * 32, L, splits };
     const tg: Grid = .{ attn_dec_nsg * 32, 1, 1 };
     // The split count is the grid's depth, read by the kernels, so a context crossing a split step compiles nothing.
     const common = [_]Tmpl{ .{ .name = "D", .v = ci(D) }, .{ .name = "NSG", .v = attn_dec_nsg } };
+    const hc = if (ride) |r| r.hc else 0;
+    const rides = [_]Tmpl{ .{ .name = "HC", .v = ci(hc) }, .{ .name = "ITERS", .v = ci(if (ride) |r| r.iters else 0) } };
+    const split_outs = [_]OutSpec{
+        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
+        .{ .shape = &.{ ci(L), ci(hc), ci(hc) }, .dt = .float32 },
+    };
     if (splits == 1) {
-        var o: [1]A = undefined;
-        try launch(sc, &attn_dec_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = a.out_dt }}, grid, tg, &(common ++ [_]Tmpl{ .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) } }), &.{ .{ .name = "KT", .dt = kt }, .{ .name = "OT", .dt = a.out_dt } }, &o);
+        const tm = common ++ [_]Tmpl{ .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) }, .{ .name = "OG", .v = ci(og) } };
+        const dts: []const TDtype = &.{ .{ .name = "KT", .dt = kt }, .{ .name = "OT", .dt = a.out_dt } };
+        const out = [_]OutSpec{.{ .shape = out_shape, .dt = a.out_dt }};
+        var o: [4]A = undefined;
+        if (ride) |r| {
+            try launch(sc, &attn_dec_ride_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs, r.z, r.eps }, &(out ++ split_outs), grid, tg, &(tm ++ rides), dts, &o);
+            if (a.split) |sp| sp.* = .{ .pre = o[1], .post = o[2], .comb = o[3] };
+        } else try launch(sc, &attn_dec_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs }, &out, grid, tg, &tm, dts, o[0..1]);
         return o[0];
     }
-    var parts: [3]A = undefined;
-    try launch(sc, &attn_split_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal }, &.{
+    const part_outs = [_]OutSpec{
         .{ .shape = &.{ ci(L), ci(H), ci(splits), ci(D) }, .dt = .float32 },
         .{ .shape = &.{ ci(L), ci(H), ci(splits) }, .dt = .float32 },
         .{ .shape = &.{ ci(L), ci(H), ci(splits) }, .dt = .float32 },
-    }, grid, tg, &common, &.{.{ .name = "KT", .dt = kt }}, &parts);
+    };
+    var parts: [6]A = undefined;
+    if (ride) |r| {
+        try launch(sc, &attn_split_ride_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, r.z, r.eps }, &(part_outs ++ split_outs), grid, tg, &(common ++ rides), &.{.{ .name = "KT", .dt = kt }}, &parts);
+        if (a.split) |sp| sp.* = .{ .pre = parts[3], .post = parts[4], .comb = parts[5] };
+    } else try launch(sc, &attn_split_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal }, &part_outs, grid, tg, &common, &.{.{ .name = "KT", .dt = kt }}, parts[0..3]);
     var o: [1]A = undefined;
-    try launch(sc, &attn_merge_def, &.{ parts[0], parts[1], parts[2], a.sink, meta, freqs }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = a.out_dt }}, .{ D, H, L }, .{ D, 1, 1 }, &.{
-        .{ .name = "D", .v = ci(D) }, .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) },
+    try launch(sc, &attn_merge_def, &.{ parts[0], parts[1], parts[2], a.sink, meta, freqs }, &.{.{ .shape = out_shape, .dt = a.out_dt }}, .{ D, H, L }, .{ D, 1, 1 }, &.{
+        .{ .name = "D", .v = ci(D) }, .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) }, .{ .name = "OG", .v = ci(og) },
     }, &.{.{ .name = "OT", .dt = a.out_dt }}, &o);
     return o[0];
 }
@@ -3433,6 +3506,42 @@ test "dsv41 route: the experts are the composed chain's, their weights its score
     }
 }
 
+test "dsv41 route: the picks leave best first and equal scores go to the lower expert, at every expert and row count" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const levels = [_]f32{ -2.0, -0.5, 0.75, 2.0, 3.5 };
+    for ([_]usize{ 384, 256, 40, 33 }) |E| for ([_]usize{ 1, 3, 16 }) |L| for ([_]usize{ 6, 4 }) |K| {
+        const z = try testing.allocator.alloc(f32, L * E);
+        defer testing.allocator.free(z);
+        const bias = try testing.allocator.alloc(f32, E);
+        defer testing.allocator.free(bias);
+        @memset(bias, 0);
+        // One expert a low level's score alone would never pick.
+        const lifted = (E * 5) / 7;
+        bias[lifted] = 10.0;
+        for (0..L) |l| {
+            for (0..E) |e| z[l * E + e] = levels[(e * 7 + l * 3) % levels.len];
+            z[l * E + (l * 11) % E] = 6.0;
+            z[l * E + lifted] = -2.0;
+        }
+        const got = try sc_mod.hostI32(try sc.astype((try route(&sc, try sc.floats(z, &.{ ci(L), ci(E) }), try sc.floats(bias, &.{ 1, ci(E) }), K, true, 1.5)).idx, .int32));
+        for (0..L) |l| {
+            var taken: [1024]bool = @splat(false);
+            for (0..K) |r| {
+                var best: usize = E;
+                for (0..E) |e| {
+                    if (taken[e]) continue;
+                    const v = z[l * E + e] + bias[e] * 100.0;
+                    if (best == E or v > z[l * E + best] + bias[best] * 100.0) best = e;
+                }
+                taken[best] = true;
+                try testing.expectEqual(@as(i32, @intCast(best)), got[l * K + r]);
+            }
+        }
+    };
+}
+
 test "dsv41 route split: the router and the hc split in one launch give the two kernels' bytes" {
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
@@ -3903,6 +4012,73 @@ test "dsv41 decode attention: a block of rows is the rows of single-row blocks, 
         args.p0 = c.p0 + r;
         try expectBitEqual("attn rows", got[r * row ..][0..row], try hostOf(&sc, try attnDecode(&sc, args)));
     }
+}
+
+test "dsv41 decode attention: heads asked for in groups leave as the transposed heads, one split and several, 1 to 16 rows" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const freqs = try ropeFreqs(&sc);
+    const og = 8;
+    // 64 picks beside the window take one split, 256 take two.
+    for ([_]usize{ 64, 256 }) |k| for ([_]usize{ 1, 3, 16 }) |rows| {
+        const c: AttnCase = .{ .n_comp = 300, .k = k };
+        var a = try attnData(&sc, c, .bfloat16);
+        a.q = try sc.astype(try randn(&sc, &.{ ci(rows), ci(c.heads), ci(c.d) }, .float32, 131, 1.5), .bfloat16);
+        a.ring = try sc.astype(try randn(&sc, &.{ ci(c.window + 16), ci(c.d) }, .float32, 132, 1.5), .bfloat16);
+        const picks = try testing.allocator.alloc(i32, rows * k);
+        defer testing.allocator.free(picks);
+        for (0..rows) |r| for (0..k) |i| {
+            picks[r * k + i] = if ((i + r) % 11 == 5) -1 else @intCast((i * 7 + r * 13 + 3) % c.n_comp);
+        };
+        a.topk = try sc.ints(picks, &.{ ci(rows), ci(k) });
+        var args = decodeArgs(&a, .bfloat16, freqs);
+        const plain = try attnDecode(&sc, args);
+        const want = try sc.transpose(try sc.reshape(plain, &.{ ci(rows), og, ci(c.heads / og * c.d) }), &.{ 1, 0, 2 });
+        var grouped = false;
+        args.groups = og;
+        args.grouped = &grouped;
+        const got = try attnDecode(&sc, args);
+        try testing.expect(grouped);
+        try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+        // The reshape makes the transposed view a copy in its own order.
+        try expectBitEqual("grouped heads", try hostOf(&sc, got), try hostOf(&sc, try sc.reshape(want, &.{-1})));
+    };
+}
+
+test "dsv41 decode attention: the launch that also splits a stage's mixes gives its own heads and the split kernel's bytes, one split and several, 1 to 16 rows" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const freqs = try ropeFreqs(&sc);
+    const iters = 20;
+    const eps = try hcEps(&sc, 1e-6, 1e-6);
+    for ([_]usize{ 64, 256 }) |k| for ([_]usize{ 1, 3, 16 }) |rows| for ([_]usize{ 0, 8 }) |og| {
+        const c: AttnCase = .{ .n_comp = 300, .k = k };
+        var a = try attnData(&sc, c, .bfloat16);
+        a.q = try sc.astype(try randn(&sc, &.{ ci(rows), ci(c.heads), ci(c.d) }, .float32, 141, 1.5), .bfloat16);
+        a.ring = try sc.astype(try randn(&sc, &.{ ci(c.window + 16), ci(c.d) }, .float32, 142, 1.5), .bfloat16);
+        const picks = try testing.allocator.alloc(i32, rows * k);
+        defer testing.allocator.free(picks);
+        for (0..rows) |r| for (0..k) |i| {
+            picks[r * k + i] = if ((i + r) % 11 == 5) -1 else @intCast((i * 7 + r * 13 + 3) % c.n_comp);
+        };
+        a.topk = try sc.ints(picks, &.{ ci(rows), ci(k) });
+        const za = try randn(&sc, &.{ ci(rows), 24 }, .float32, 143, 2.0);
+        var args = decodeArgs(&a, .bfloat16, freqs);
+        args.groups = og;
+        const want = try attnDecode(&sc, args);
+        const want_sp = try hcSplitZ(&sc, za, 4, iters, eps);
+        var sp: ?HcSplit = null;
+        args.mixes = .{ .z = za, .hc = 4, .iters = iters, .eps = eps };
+        args.split = &sp;
+        const got = try attnDecode(&sc, args);
+        try expectBitEqual("riding heads", try hostOf(&sc, got), try hostOf(&sc, want));
+        const s = sp orelse return error.SplitDidNotRide;
+        try expectBitEqual("riding pre", try sc_mod.hostF32(s.pre), try sc_mod.hostF32(want_sp.pre));
+        try expectBitEqual("riding post", try sc_mod.hostF32(s.post), try sc_mod.hostF32(want_sp.post));
+        try expectBitEqual("riding comb", try sc_mod.hostF32(s.comb), try sc_mod.hostF32(want_sp.comb));
+    };
 }
 
 test "dsv41 decode attention: a verify block's row is its one-row step's bits when the block carries more compressed picks (release shape, two splits)" {

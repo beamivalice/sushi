@@ -223,7 +223,7 @@ test "dsv41 queries: a decode token (DSV41_TINY, DSV41_STQ_TINY)" {
         const got = (try decodeTokens(env)) orelse continue;
         ran = true;
         // The two counts alternate with the compressed-attention cycle.
-        const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1178, 1227, 1178, 1227, 1178, 1227 } else .{ 2372, 2428, 2372, 2428, 2372, 2428 };
+        const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1162, 1211, 1162, 1211, 1162, 1211 } else .{ 2180, 2236, 2180, 2236, 2180, 2236 };
         try testing.expectEqual(want, got);
     }
     if (!ran) return error.SkipZigTest;

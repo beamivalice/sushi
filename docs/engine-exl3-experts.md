@@ -376,6 +376,25 @@ or from 1024 rows the decoded path below.
   threadgroup never straddles two. A threadgroup shifts `suh` to its linear's row (`SB1..SB3`), and the output is
   segment-major: each linear's `[rows, width]` contiguous. Its k split follows the stacked width, so a row's sum order
   may differ from the linear's own launch; each holds its own f32-truth bar (`linears sharing their input`).
+- **A stacked launch can leave its first linear rms-normed** (`linearSharedNormed`, `project_rows.launchRowsNormed`,
+  kernel `sushi_exl3_rows_finish_rms`): one threadgroup a row finishes the row and norms its first segment as MLX's
+  `rms_norm` does, sum for sum, so the finish and the norm are one dispatch. Bytes equal the launch, its finish and
+  `mlx_fast_rms_norm` in bf16 and in f32, on MLX's stream, the engine's and the SIMD arm (`a stacked launch whose
+  first linear leaves rms-normed`). It serves a one-bank launch with a finish whose row is at most 4096 wide.
+- **MLX's compiled `rms_norm` fuses its multiply-add** (`acc += x * x` is one `fma`). A kernel that repeats it writes
+  `fma`; with a separate multiply the sum is an ulp off, which an f32 output shows and a bf16 output rounds away. A
+  byte test of a norm needs its f32 arm.
+- **A launch can read the launch before it as partials** (`linearPair`, `launchRowsParts`, `launchRowsFrom`, kernels
+  `sushi_exl3_rows_pend` and `_rows_nax_pend`): where it reads its input it sums that launch's k-split partials,
+  applies the output H128 and svh and rounds, as `rows_finish` does, so the finish dispatch (and the transpose of a
+  grouped bank) is gone at equal bytes (`a pair whose second launch sums the first's partials`). The finish then runs
+  again in every threadgroup of the reader: it pays at one row only ([perf-baselines](perf-baselines.md#decode-fusions)).
+- **A launch's finish can do the small step after it.** `linearExpanded` (and `linearPair` with an expand; kernel
+  `sushi_exl3_rows_finish_expand`) leaves a one-bank launch's rows as `hc` streams,
+  `fma(post[i], y, sum over j of fma(comb[j][i], x[j], acc))`, `y` rounded to the dtype first: the hyper-connection
+  expand of a block's last projection, at no dispatch (`a launch whose finish expands its rows into streams`, against
+  a host oracle, bf16 and f32). `linearGroupedRows` (`sushi_exl3_rows_finish_row_major`) leaves a bank launch as
+  `[rows, G * out]`, the transposed copy without the copy. Each is its own kernel: the plain finish's text is unchanged.
 - The rows kernel takes a bank `[G, in/16, out/16, n]` with `x` `[G * rows, in]` (the grouped `wo_a`): groups ride
   grid z (`GROUPS`), each shifting its own `x`, trellis, `suh`, `svh` and output. `x` is f16, bf16 or f32 (the load is
   `float(x[..])`, the output f16).

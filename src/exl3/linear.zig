@@ -51,6 +51,95 @@ pub fn linearGroupedWith(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec:
     return out;
 }
 
+/// `x` `[G, rows, in]` through the G-bank `a`, then that result as `[rows, G * mid]` through the one-bank `b`:
+/// `linearGroupedWith` then `linearWith`, bit for bit, in one dispatch fewer, because `b`'s launch sums `a`'s k-split
+/// partials where it reads its input. Null, with nothing made, when the two are not launches this serves: a row count
+/// past one multi-row launch, an `a` whose launch has no finish, a forced arm. With `expand` the result is `b`'s rows
+/// expanded into it (`linearExpanded`), or null where `b`'s finish cannot.
+pub fn linearPair(s: mlx.mlx_stream, x: mlx.mlx_array, a: root.Proj, b: root.Proj, dec_a: exl3.Decode, dec_b: exl3.Decode, opts: Opts, expand: ?project_rows.Expand) !?mlx.mlx_array {
+    if (force_arm != null) return null;
+    const xs = mlx.getShape(x);
+    const ta = mlx.getShape(a.trellis);
+    const tb = mlx.getShape(b.trellis);
+    if (xs.len != 3 or ta.len != 4 or tb.len != 4 or ta[0] != xs[0] or tb[0] != 1) return error.BadExl3Shape;
+    const groups = xs[0];
+    const rows = xs[1];
+    const in = xs[2];
+    const mid = ta[2] * 16;
+    const out = tb[2] * 16;
+    const dt = mlx.mlx_array_dtype(x);
+    if (ta[1] * 16 != in or tb[1] * 16 != groups * mid or @rem(in, 128) != 0 or @rem(mid, 128) != 0 or @rem(out, 128) != 0) return error.BadExl3Shape;
+    if (dt != .bfloat16 and dt != .float16 and dt != .float32) return error.BadExl3Shape;
+    if (rows < 1 or rows > project_rows.rowsMax(opts.rows)) return null;
+    const ga = project_rows.rowsGeometry(in, mid, rows, groups, opts.rows);
+    const gb = project_rows.rowsGeometry(groups * mid, out, rows, 1, opts.rows);
+    for ([_]project_rows.RowsGeom{ ga, gb }) |g| if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) return null;
+    if (!project_rows.hasFinish(ga)) return null;
+    const lb: project_rows.RowsLaunch = .{ .in_dim = groups * mid, .out_dim = out, .rows = rows, .groups = 1, .n = (try kernels.packedRate(tb[3])).n, .out_dt = dt };
+    const fitted = if (expand) |e| project_rows.fitExpand(lb, gb, e) orelse return null else null;
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ groups * rows, in }, 2, s));
+    try dec_a.requireTable();
+    kernels.setDecodeParams(dec_a);
+    const part = try project_rows.launchRowsParts(s, flat, a.trellis, a.suh, a.svh, .{ .in_dim = in, .out_dim = mid, .rows = rows, .groups = groups, .n = (try kernels.packedRate(ta[3])).n, .out_dt = dt }, ga);
+    defer _ = mlx.mlx_array_free(part);
+    try dec_b.requireTable();
+    kernels.setDecodeParams(dec_b);
+    return try project_rows.launchRowsFrom(s, part, a.svh, .{ .xsplit = ga.nsplit, .xodim = mid, .xdt = dt }, b.trellis, b.suh, b.svh, lb, gb, fitted);
+}
+
+/// `linearGroupedWith` whose result leaves as `[rows, G * out]`, bank g's columns from `g * out`: what a transpose and
+/// a reshape of it give, without their copy, because the launch's finish writes the rows that way. Null, with nothing
+/// made, where no such finish serves: a row count past one multi-row launch, a launch that folds its finish, a forced arm.
+pub fn linearGroupedRows(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, opts: Opts) !?mlx.mlx_array {
+    if (force_arm != null) return null;
+    const xs = mlx.getShape(x);
+    const ts = mlx.getShape(p.trellis);
+    if (xs.len != 3 or ts.len != 4 or ts[0] != xs[0] or ts[1] * 16 != xs[2]) return error.BadExl3Shape;
+    const groups = xs[0];
+    const rows = xs[1];
+    const out = ts[2] * 16;
+    if (@rem(xs[2], 128) != 0 or @rem(out, 128) != 0) return null;
+    if (rows < 1 or rows > project_rows.rowsMax(opts.rows)) return null;
+    const g = project_rows.rowsGeometry(xs[2], out, rows, groups, opts.rows);
+    if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX) or !project_rows.hasFinish(g)) return null;
+    const l: project_rows.RowsLaunch = .{ .in_dim = xs[2], .out_dim = out, .rows = rows, .groups = groups, .n = (try kernels.packedRate(ts[3])).n, .out_dt = mlx.mlx_array_dtype(x) };
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ groups * rows, xs[2] }, 2, s));
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    const part = try project_rows.launchRowsParts(s, flat, p.trellis, p.suh, p.svh, l, g);
+    defer _ = mlx.mlx_array_free(part);
+    return try project_rows.rowsFinishRowMajor(s, part, p.svh, l, g.nsplit);
+}
+
+/// `linearWith` whose rows leave expanded into `expand`'s streams `[rows, hc, out]`: stream i of a row y is
+/// `fma(post[i], y, sum over j of fma(comb[j][i], x[j], acc))` in x's dtype, y rounded to it first. The launch's finish
+/// does it, so the expand costs no dispatch. Null, with nothing made, where no such finish serves: a row count past
+/// one multi-row launch, a launch that folds its finish, a forced arm, streams of another dtype or shape.
+pub fn linearExpanded(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, opts: Opts, expand: project_rows.Expand) !?mlx.mlx_array {
+    if (force_arm != null) return null;
+    const xs = mlx.getShape(x);
+    const ts = mlx.getShape(p.trellis);
+    if (xs.len != 2 or ts.len != 4 or ts[0] != 1 or ts[1] * 16 != xs[1]) return error.BadExl3Shape;
+    const rows = xs[0];
+    const out = ts[2] * 16;
+    const dt = mlx.mlx_array_dtype(x);
+    if (@rem(xs[1], 128) != 0 or @rem(out, 128) != 0) return null;
+    if (rows < 1 or rows > project_rows.rowsMax(opts.rows)) return null;
+    const g = project_rows.rowsGeometry(xs[1], out, rows, 1, opts.rows);
+    if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) return null;
+    const l: project_rows.RowsLaunch = .{ .in_dim = xs[1], .out_dim = out, .rows = rows, .groups = 1, .n = (try kernels.packedRate(ts[3])).n, .out_dt = dt };
+    const fitted = project_rows.fitExpand(l, g, expand) orelse return null;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    const part = try project_rows.launchRowsParts(s, x, p.trellis, p.suh, p.svh, l, g);
+    defer _ = mlx.mlx_array_free(part);
+    return try project_rows.rowsFinishExpand(s, part, p.svh, l, g.nsplit, fitted);
+}
+
 /// The most linears one shared-input launch serves.
 pub const SHARED_MAX: usize = 4;
 
@@ -172,6 +261,34 @@ pub fn linearSharedGeo(s: mlx.mlx_stream, x: mlx.mlx_array, rows: c_int, sh: Sha
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_reshape(&flat, y, &[_]c_int{rows * geo.out}, 1, s));
+    try splitShared(s, flat, rows, sh, outs);
+    return true;
+}
+
+/// `linearSharedWith` whose first linear's output leaves as `mlx_fast_rms_norm(it, norm.w, eps)`: the same bytes, the
+/// finish and the norm in one dispatch. False, with nothing made, when the launch is not one this serves.
+pub fn linearSharedNormed(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.Decode, outs: []mlx.mlx_array, opts: Opts, norm: project_rows.Norm) !bool {
+    if (outs.len != sh.count) return error.BadExl3Shape;
+    const xs = mlx.getShape(x);
+    const ts = mlx.getShape(sh.p.trellis);
+    if (xs.len != 2 or ts.len != 4 or ts[0] != 1 or ts[1] * 16 != xs[1]) return error.BadExl3Shape;
+    const rows = xs[0];
+    const out = ts[2] * 16;
+    if (force_arm != null or rows < 1 or rows > project_rows.rowsMax(opts.rows)) return false;
+    const g = project_rows.rowsGeometry(xs[1], out, rows, 1, opts.rows);
+    if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) return false;
+    var bounds: [3]c_int = @splat(sh.cols[sh.count]);
+    for (1..sh.count) |i| bounds[i - 1] = sh.cols[i];
+    const l: project_rows.RowsLaunch = .{ .in_dim = xs[1], .out_dim = out, .rows = rows, .groups = 1, .n = (try kernels.packedRate(ts[3])).n, .out_dt = mlx.mlx_array_dtype(x) };
+    if (!project_rows.normedFits(l, g, bounds, norm)) return false;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    const pin: ?project_rows.PinnedCfg = if (sh.geo) |geo| (if (l.out_dt == .bfloat16 and opts.rows.exact == geo.key.exact) (if (geo.row(rows)) |r| (if (std.meta.eql(r.g, g)) r.pin else null) else null) else null) else null;
+    const y = try project_rows.launchRowsNormed(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, l, g, try project_rows.rowsKernel(g), bounds, pin, norm);
+    defer _ = mlx.mlx_array_free(y);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, y, &[_]c_int{rows * out}, 1, s));
     try splitShared(s, flat, rows, sh, outs);
     return true;
 }
@@ -817,6 +934,292 @@ test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at 
             const w: usize = @intCast(width);
             for (0..sh.groups) |g| try t.expectEqualSlices(u8, std.mem.sliceAsBytes(one_row[g * sh.out ..][0..sh.out]), std.mem.sliceAsBytes(got[g * w * sh.out ..][0..sh.out]));
         }
+    }
+}
+
+test "exl3 linear: a pair whose second launch sums the first's partials gives the two launches' bytes at DeepSeek's wo shapes and small ones, 1 to 16 rows, on the machine's arm and SIMD, MLX's stream and the engine's" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    defer mlx.engine.enabled = was;
+    for ([_]bool{ false, true }) |on_engine| {
+        mlx.engine.enabled = on_engine;
+        try pairCase(if (on_engine) mlx.engine.stream() else mlx.gpuStream());
+    }
+    mlx.engine.enabled = false;
+    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
+    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    try std.testing.expect(!kernels.gemmNaxOn());
+    try pairCase(mlx.gpuStream());
+}
+
+test "exl3 linear: a stacked launch whose first linear leaves rms-normed gives the launch's, its finish's and MLX's rms norm's bytes, 1 to 8 rows, on the machine's arm and SIMD, MLX's stream and the engine's" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    defer mlx.engine.enabled = was;
+    for ([_]bool{ false, true }) |on_engine| {
+        mlx.engine.enabled = on_engine;
+        try normedCase(if (on_engine) mlx.engine.stream() else mlx.gpuStream());
+    }
+    mlx.engine.enabled = false;
+    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
+    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    try std.testing.expect(!kernels.gemmNaxOn());
+    try normedCase(mlx.gpuStream());
+}
+
+test "exl3 linear: a launch whose finish expands its rows into streams gives the host expand of the launch's bytes, alone and as a pair's second, 1 to 8 rows, on the machine's arm and SIMD, MLX's stream and the engine's" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    defer mlx.engine.enabled = was;
+    for ([_]bool{ false, true }) |on_engine| {
+        mlx.engine.enabled = on_engine;
+        try expandedCase(if (on_engine) mlx.engine.stream() else mlx.gpuStream());
+    }
+    mlx.engine.enabled = false;
+    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
+    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    try std.testing.expect(!kernels.gemmNaxOn());
+    try expandedCase(mlx.gpuStream());
+}
+
+/// The oracle is the host's f32 fma chain over the plain launch's rows, rounded to the dtype.
+fn expandedCase(s: mlx.mlx_stream) !void {
+    const t = std.testing;
+    defer kernels.setDecodeParams(.mul1);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0xe8a1);
+    const rnd = prng.random();
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    // DeepSeek's wo_a and wo_b with its four streams, then small ones with two and three.
+    const shapes = [_]struct { groups: usize, in: usize, mid: usize, out: usize, n: u32, hc: usize }{
+        .{ .groups = 8, .in = 4096, .mid = 1024, .out = 5120, .n = 64, .hc = 4 },
+        .{ .groups = 2, .in = 256, .mid = 256, .out = 384, .n = 64, .hc = 2 },
+        .{ .groups = 1, .in = 384, .mid = 256, .out = 128, .n = 96, .hc = 3 },
+    };
+    var served: usize = 0;
+    for (shapes) |sh| {
+        var ha = try Host.init(alloc, rnd, sh.groups, sh.in, sh.mid, sh.n);
+        defer ha.deinit();
+        var hb = try Host.init(alloc, rnd, 1, sh.groups * sh.mid, sh.out, sh.n);
+        defer hb.deinit();
+        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]Opts{ .{}, exact, .{ .rows = .{ .exact = true, .wide = true } } }) |opts| for ([_]usize{ 1, 3, 8 }) |rows| {
+            const hc = sh.hc;
+            const nx = sh.groups * rows * sh.in;
+            const xf = try alloc.alloc(f32, nx);
+            const xb = try alloc.alloc(u16, nx);
+            for (xf, xb) |*f, *bits| {
+                f.* = (rnd.float(f32) * 2 - 1) * 4;
+                bits.* = bf16Bits(f.*);
+            }
+            const x = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(xf.ptr) else @ptrCast(xb.ptr), &[_]c_int{ @intCast(sh.groups), @intCast(rows), @intCast(sh.in) }, 3, dt);
+            defer _ = mlx.mlx_array_free(x);
+            const ns = rows * hc * sh.out;
+            const sf = try alloc.alloc(f32, ns);
+            const sb = try alloc.alloc(u16, ns);
+            for (sf, sb) |*f, *bits| {
+                bits.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
+                if (dt == .float32) f.* = (rnd.float(f32) * 2 - 1) * 3 else f.* = bf16ToF32(bits.*);
+            }
+            const streams = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(sf.ptr) else @ptrCast(sb.ptr), &[_]c_int{ @intCast(rows), @intCast(hc), @intCast(sh.out) }, 3, dt);
+            defer _ = mlx.mlx_array_free(streams);
+            const postv = try alloc.alloc(f32, rows * hc);
+            for (postv) |*v| v.* = rnd.float(f32) * 2;
+            const combv = try alloc.alloc(f32, rows * hc * hc);
+            for (combv) |*v| v.* = rnd.float(f32);
+            const post = mlx.mlx_array_new_data(postv.ptr, &[_]c_int{ @intCast(rows), @intCast(hc) }, 2, .float32);
+            defer _ = mlx.mlx_array_free(post);
+            const comb = mlx.mlx_array_new_data(combv.ptr, &[_]c_int{ @intCast(rows), @intCast(hc), @intCast(hc) }, 3, .float32);
+            defer _ = mlx.mlx_array_free(comb);
+            const e: project_rows.Expand = .{ .x = streams, .post = post, .comb = comb };
+
+            const mid = try linearGroupedWith(s, x, ha.p, dec, opts);
+            defer _ = mlx.mlx_array_free(mid);
+            var turned = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(turned);
+            try mlx.check(mlx.mlx_transpose_axes(&turned, mid, &[_]c_int{ 1, 0, 2 }, 3, s));
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_reshape(&flat, turned, &[_]c_int{ @intCast(rows), @intCast(sh.groups * sh.mid) }, 2, s));
+            const plain = try linearWith(s, flat, hb.p, dec, opts);
+            defer _ = mlx.mlx_array_free(plain);
+            var cp = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cp);
+            const y = try hostF32(s, plain, &cp);
+            const want = try alloc.alloc(f32, ns);
+            for (0..rows) |r| for (0..hc) |i| for (0..sh.out) |d| {
+                var acc: f32 = 0;
+                for (0..hc) |j| acc = @mulAdd(f32, combv[(r * hc + j) * hc + i], sf[(r * hc + j) * sh.out + d], acc);
+                const v = @mulAdd(f32, postv[r * hc + i], y[r * sh.out + d], acc);
+                want[(r * hc + i) * sh.out + d] = if (dt == .float32) v else bf16ToF32(bf16Bits(v));
+            };
+
+            const alone = (try linearExpanded(s, flat, hb.p, dec, opts, e)) orelse return error.ExpandNotServed;
+            defer _ = mlx.mlx_array_free(alone);
+            var ca = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ca);
+            try t.expectEqual(dt, mlx.mlx_array_dtype(alone));
+            try t.expectEqualSlices(c_int, &[_]c_int{ @intCast(rows), @intCast(hc), @intCast(sh.out) }, mlx.getShape(alone));
+            try t.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(try hostF32(s, alone, &ca)));
+
+            const paired = (try linearPair(s, x, ha.p, hb.p, dec, dec, opts, e)) orelse return error.ExpandNotServed;
+            defer _ = mlx.mlx_array_free(paired);
+            var cq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cq);
+            try t.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(try hostF32(s, paired, &cq)));
+            served += 1;
+        };
+    }
+    try t.expectEqual(@as(usize, 3 * 2 * 3 * 3), served);
+}
+
+/// f32 activations show every ulp of the norm's sums, which bf16 outputs round away; bf16 is the served dtype.
+fn normedCase(s: mlx.mlx_stream) !void {
+    const t = std.testing;
+    defer kernels.setDecodeParams(.mul1);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x4a55);
+    const rnd = prng.random();
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    // DeepSeek's wq_a, wkv and a compressor's wkv on one input; then two linears, then one alone.
+    const shapes = [_]struct { in: usize, widths: []const usize, n: u32 }{
+        .{ .in = 5120, .widths = &.{ 1280, 512 }, .n = 64 },
+        .{ .in = 5120, .widths = &.{ 1280, 512, 512 }, .n = 64 },
+        .{ .in = 384, .widths = &.{ 256, 128 }, .n = 96 },
+        .{ .in = 256, .widths = &.{384}, .n = 64 },
+    };
+    var served: usize = 0;
+    for (shapes) |sh| {
+        var total: usize = 0;
+        var cols: [SHARED_MAX + 1]c_int = @splat(0);
+        for (sh.widths, 0..) |w, i| {
+            total += w;
+            cols[i + 1] = @intCast(total);
+        }
+        var h = try Host.init(alloc, rnd, 1, sh.in, total, sh.n);
+        defer h.deinit();
+        const suh_rows = try alloc.alloc(u16, sh.widths.len * sh.in);
+        for (0..sh.widths.len) |i| @memcpy(suh_rows[i * sh.in ..][0..sh.in], h.suh);
+        const tiled = mlx.mlx_array_new_data(suh_rows.ptr, &[_]c_int{ @intCast(sh.widths.len), @intCast(sh.in) }, 2, .float16);
+        defer _ = mlx.mlx_array_free(tiled);
+        const stacked = Shared{ .p = .{ .trellis = h.p.trellis, .suh = tiled, .svh = h.p.svh }, .cols = cols, .count = sh.widths.len };
+        const eps_v = [_]f32{ 1e-6, 0 };
+        const eps = mlx.mlx_array_new_data(&eps_v, &[_]c_int{2}, 1, .float32);
+        defer _ = mlx.mlx_array_free(eps);
+        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
+            const wf = try alloc.alloc(f32, sh.widths[0]);
+            const wb = try alloc.alloc(u16, sh.widths[0]);
+            for (wf, wb) |*f, *bits| {
+                f.* = 0.5 + rnd.float(f32);
+                bits.* = bf16Bits(f.*);
+            }
+            const w = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(wf.ptr) else @ptrCast(wb.ptr), &[_]c_int{@intCast(sh.widths[0])}, 1, dt);
+            defer _ = mlx.mlx_array_free(w);
+            for ([_]Opts{ .{}, exact, .{ .rows = .{ .exact = true, .wide = true } } }) |opts| for ([_]usize{ 1, 3, 8 }) |rows| for ([_]f32{ 4, 1e-3 }) |amp| {
+                const xf = try alloc.alloc(f32, rows * sh.in);
+                const xb = try alloc.alloc(u16, rows * sh.in);
+                for (xf, xb) |*f, *bits| {
+                    f.* = (rnd.float(f32) * 2 - 1) * amp;
+                    bits.* = bf16Bits(f.*);
+                }
+                const x = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(xf.ptr) else @ptrCast(xb.ptr), &[_]c_int{ @intCast(rows), @intCast(sh.in) }, 2, dt);
+                defer _ = mlx.mlx_array_free(x);
+                var want: [SHARED_MAX]mlx.mlx_array = undefined;
+                try linearSharedWith(s, x, stacked, dec, want[0..sh.widths.len], opts);
+                defer for (want[0..sh.widths.len]) |o| {
+                    _ = mlx.mlx_array_free(o);
+                };
+                var normed = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(normed);
+                try mlx.check(mlx.mlx_fast_rms_norm(&normed, want[0], w, 1e-6, s));
+                var got: [SHARED_MAX]mlx.mlx_array = undefined;
+                try t.expect(try linearSharedNormed(s, x, stacked, dec, got[0..sh.widths.len], opts, .{ .w = w, .eps = eps, .cols = @intCast(sh.widths[0]) }));
+                defer for (got[0..sh.widths.len]) |o| {
+                    _ = mlx.mlx_array_free(o);
+                };
+                for (0..sh.widths.len) |i| {
+                    var cw = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(cw);
+                    var cg = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(cg);
+                    const wv = try alloc.dupe(f32, try hostF32(s, if (i == 0) normed else want[i], &cw));
+                    try t.expectEqual(dt, mlx.mlx_array_dtype(got[i]));
+                    try t.expectEqualSlices(u8, std.mem.sliceAsBytes(wv), std.mem.sliceAsBytes(try hostF32(s, got[i], &cg)));
+                }
+                served += 1;
+            };
+        }
+    }
+    try t.expectEqual(@as(usize, 4 * 2 * 3 * 3 * 2), served);
+}
+
+/// Every pair `linearPair` serves equals the grouped launch, its finish and the one-bank launch; past one multi-row
+/// launch it declines.
+fn pairCase(s: mlx.mlx_stream) !void {
+    const t = std.testing;
+    defer kernels.setDecodeParams(.mul1);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x9a17);
+    const rnd = prng.random();
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    // DeepSeek's wo_a and wo_b, then a two-bank and a one-bank first launch.
+    const shapes = [_]struct { groups: usize, in: usize, mid: usize, out: usize, n: u32 }{
+        .{ .groups = 8, .in = 4096, .mid = 1024, .out = 5120, .n = 64 },
+        .{ .groups = 2, .in = 256, .mid = 256, .out = 384, .n = 64 },
+        .{ .groups = 1, .in = 384, .mid = 256, .out = 128, .n = 96 },
+    };
+    for (shapes) |sh| {
+        var ha = try Host.init(alloc, rnd, sh.groups, sh.in, sh.mid, sh.n);
+        defer ha.deinit();
+        var hb = try Host.init(alloc, rnd, 1, sh.groups * sh.mid, sh.out, sh.n);
+        defer hb.deinit();
+        for ([_]Opts{ .{}, exact, .{ .rows = .{ .exact = true, .wide = true } } }) |opts| for ([_]usize{ 1, 3, 8, 16 }) |rows| {
+            const xb = try alloc.alloc(u16, sh.groups * rows * sh.in);
+            for (xb) |*v| v.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4);
+            const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ @intCast(sh.groups), @intCast(rows), @intCast(sh.in) }, 3, .bfloat16);
+            defer _ = mlx.mlx_array_free(x);
+            const got = try linearPair(s, x, ha.p, hb.p, dec, dec, opts, null);
+            defer if (got) |g| {
+                _ = mlx.mlx_array_free(g);
+            };
+            if (rows > project_rows.rowsMax(opts.rows)) {
+                try t.expect(got == null);
+                continue;
+            }
+            const mid = try linearGroupedWith(s, x, ha.p, dec, opts);
+            defer _ = mlx.mlx_array_free(mid);
+            var turned = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(turned);
+            try mlx.check(mlx.mlx_transpose_axes(&turned, mid, &[_]c_int{ 1, 0, 2 }, 3, s));
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_reshape(&flat, turned, &[_]c_int{ @intCast(rows), @intCast(sh.groups * sh.mid) }, 2, s));
+            // The first launch alone, its banks side by side in each row, is that transposed copy.
+            const side = (try linearGroupedRows(s, x, ha.p, dec, opts)) orelse return error.RowMajorNotServed;
+            defer _ = mlx.mlx_array_free(side);
+            var cs = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cs);
+            var cf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cf);
+            try t.expectEqualSlices(c_int, mlx.getShape(flat), mlx.getShape(side));
+            const fv = try alloc.dupe(f32, try hostF32(s, flat, &cf));
+            try t.expectEqualSlices(u8, std.mem.sliceAsBytes(fv), std.mem.sliceAsBytes(try hostF32(s, side, &cs)));
+            const want = try linearWith(s, flat, hb.p, dec, opts);
+            defer _ = mlx.mlx_array_free(want);
+            var cw = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cw);
+            var cg = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cg);
+            const w = try hostF32(s, want, &cw);
+            try t.expect(got != null);
+            try t.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got.?));
+            try t.expectEqualSlices(u8, std.mem.sliceAsBytes(w), std.mem.sliceAsBytes(try hostF32(s, got.?, &cg)));
+        };
     }
 }
 

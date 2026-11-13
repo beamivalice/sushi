@@ -10,6 +10,22 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## Decode kernels
 
+- **Fold a small step into a small kernel, never into a heavy kernel's input staging.** A dependent dispatch costs 3.4
+  to 4.4 us, but work folded into the staging of a kernel with many threadgroups runs again in each of them and sits
+  on its critical path: about 1.1 us a staging iteration on DeepSeek's `wo_b`, +2.2 us at one row and +12.3 us at
+  three for a 4 us finish saved. The expert chain measured the same earlier (a self-preparing pair is 23 us a layer
+  slower than a prepare dispatch). Price a folded step at its repeated cost before building it
+  ([perf-baselines](perf-baselines.md#decode-fusions)).
+- **Look for work a kernel repeats in every threadgroup, and move it to a kernel that does it once.** DeepSeek's FFN
+  stage rebuilt the attention's expand in each of its 25 threadgroups (14.5 us at one row, 27.6 at three); written
+  once by the small finish before it, the stage is the plain 10 us kernel. That fold alone is half of the stack's gain.
+- **Independent work rides a launch that outlasts it, as extra threadgroups.** A new dispatch for it loses (its encode
+  is GPU idle), and a carrier shorter than the rider waits for it: the 9 us hc split added 0.9 us to the 7 us
+  rotation launch and nothing to the 27 us attention launch.
+- **A threadgroup barrier is cheap; count the work behind it.** The router's top-k went from twelve barriers to two for
+  about 1 us of its 9.7, inside the noise of a forward: it lands in the stack, it would not have been built alone.
+- **Small bytes-equal folds are built as a stack and measured once**, arms alternating every 8 forwards in one load:
+  one fold reads 0.2 to 0.5% and drowns in heat, seven read 3.3% and 3.7% the same way three loads running.
 - **A threadgroup is one GPU core's work.** A kernel that reduces a whole row in one group (1024 threads, its limit)
   pays 24 to 33 us for every walk of a 129k-wide row whatever the walk computes (127 ids a thread), and about 2 us a
   barrier: such a kernel is sized by its walks. The sampled draw (`sampler_draw.zig`) went from 70 walks (a bit of

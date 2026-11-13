@@ -2073,8 +2073,16 @@ fn windowRow(sc: *Scope, m: *const Model, ly: *const Layer, proj: A, rope: A, po
     return ropeQ(sc, m, try sc.rms(proj, ly.kv_norm, c.eps), rope, pos, false, .fp8_ue8m0, null);
 }
 
+/// What a block lends its attention to fold the hyper-connection work around it: the stage's mixes `z`, which a launch
+/// splits beside its own work (`out` is set where one did), and the stream `x`, which the output projection's finish
+/// then expands (`expanded` is set, and the attention returns the new stream `[L, hc, dim]` in place of its output).
+const RideSplit = struct { z: A, out: *?qat_mod.Split, x: A, expanded: *bool };
+
+/// The expand an output projection's finish is asked for; `done` where one served it.
+const ExpandReq = struct { e: exl3.project_rows.Expand, done: bool = false };
+
 /// The attention sublayer over a chunk: `h` the normed input `[L, dim]` at positions [p0, p0 + L).
-fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize, sh: *Shared, span: usize) !A {
+fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize, sh: *Shared, span: usize, ride: ?RideSplit) !A {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const ls = &st.layers[li];
@@ -2087,9 +2095,9 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
 
     const fus = fusedOn(sc, m);
     const pf = prof(m, L);
-    const in = try attnIn(sc, m, ly, h);
+    const in = try attnQuery(sc, m, ly, h);
     if (pf) |p| try p.mark(.attn_in, &in);
-    const qr = try sc.rms(in[0], ly.q_norm, c.eps);
+    const qr = in[0];
     try tapInput(m, li, .q_lora, qr);
     const q_proj = try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(L), ci(H), ci(hd) });
     const joint = fus and pf == null and kernels.kvRowFits(hd) and mlx.mlx_array_dtype(q_proj) == mlx.mlx_array_dtype(in[1]);
@@ -2126,6 +2134,8 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
             try t.put("a_q_{d}", .{li}, q);
             if (picks.topk.ctx != null) try t.put("a_topk_{d}", .{li}, picks.topk);
         }
+        var grouped = false;
+        var rode_split: ?kernels.HcSplit = null;
         const o = try kernels.attnDecode(sc, .{
             .q = q,
             .ring = ls.win.buf,
@@ -2140,10 +2150,24 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
             .qat_fp8 = m.qat_on,
             .out_dt = m.act,
             .ratio = picks.ratio,
+            // Grouped, the heads are the output projection's banks as they leave: no transposed copy from two rows on.
+            .mixes = if (ride) |rs| .{ .z = rs.z, .hc = c.hc_mult, .iters = c.hc_iters, .eps = try kernels.hcEps(sc, c.eps, c.hc_eps) } else null,
+            .split = &rode_split,
+            .groups = if (m.tap == null and m.trace == null and width_probe == null and H % c.o_groups == 0) c.o_groups else 0,
+            .grouped = &grouped,
         });
         if (pf) |p| try p.mark(.core, &.{o});
         if (width_probe) |t| try t.put("a_o_{d}", .{li}, o);
-        return attnOut(sc, m, li, ly, o, m.qat_on);
+        if (ride) |rs| if (rode_split) |sp| {
+            rs.out.* = .{ .pre = sp.pre, .post = sp.post, .comb = sp.comb };
+        };
+        if (ride) |rs| if (rs.out.*) |sp| if (ly.wo_b.stq != null and m.trace == null and width_probe == null) {
+            var req: ExpandReq = .{ .e = .{ .x = rs.x, .post = sp.post, .comb = sp.comb } };
+            const y = if (grouped) try attnOutGrouped(sc, m, li, ly, o, &req) else try attnOut(sc, m, li, ly, o, m.qat_on, &req);
+            rs.expanded.* = req.done;
+            return y;
+        };
+        return if (grouped) attnOutGrouped(sc, m, li, ly, o, null) else attnOut(sc, m, li, ly, o, m.qat_on, null);
     }
     const one_pass = fus and L > NARROW_ROWS and mlx.mlx_array_dtype(q) == .bfloat16 and kernels.attnFusedFits(H, hd);
     // The kernel's store does attnOut's rotation, round trip and layout; the heads are no longer a tensor to trace.
@@ -2195,9 +2219,9 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     try ls.win.write(kv, p0, sc.s);
 
     const out = if (fold)
-        try attnOutGrouped(sc, m, li, ly, try sc.concat(heads, 1))
+        try attnOutGrouped(sc, m, li, ly, try sc.concat(heads, 1), null)
     else
-        try attnOut(sc, m, li, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false);
+        try attnOut(sc, m, li, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false, null);
     if (pf) |p| try p.mark(.attn_out, &.{ out, ls.win.buf });
     return out;
 }
@@ -2226,6 +2250,22 @@ fn attnIn(sc: *Scope, m: *const Model, ly: *const Layer, h: A) ![3]A {
     return .{ try ly.wq_a.apply(sc, h), try ly.wkv.apply(sc, h), none };
 }
 
+/// `attnIn` with its first output through `q_norm`: the query's low-rank row, normed. At decode widths the stacked
+/// launch's finish norms it, one dispatch for the two.
+fn attnQuery(sc: *Scope, m: *const Model, ly: *const Layer, h: A) ![3]A {
+    if (ly.in_shared) |sh| if (dim(h, 0) <= exl3.project_rows.PROJECT_ROWS_MAX) {
+        var outs: [3]A = .{ none, none, none };
+        const norm: exl3.project_rows.Norm = .{ .w = ly.q_norm, .eps = try kernels.hcEps(sc, m.cfg.eps, m.cfg.hc_eps), .cols = sh.cols[1] };
+        if (try exl3.linear.linearSharedNormed(sc.s, h, sh, ly.wq_a.stq.?.dec, outs[0..sh.count], .{ .rows = sc.rows }, norm)) {
+            for (outs[0..sh.count]) |o| _ = try sc.keep(o);
+            return outs;
+        }
+    };
+    var in = try attnIn(sc, m, ly, h);
+    in[0] = try sc.rms(in[0], ly.q_norm, m.cfg.eps);
+    return in;
+}
+
 /// A DSpark stage's attention for the draft block `h` `[B, dim]`: every row sees the stage's window of committed main
 /// rows and every row of the block, its own too (there is no causal mask).
 fn dsparkAttention(sc: *Scope, m: *const Model, li: usize, h: A, ds: DsKeys, p0: usize) !A {
@@ -2235,20 +2275,20 @@ fn dsparkAttention(sc: *Scope, m: *const Model, li: usize, h: A, ds: DsKeys, p0:
     const hd = c.head_dim;
     const rope = m.rope_plain.freqs;
     const pos = if (ds.pos.ctx != null) ds.pos else try posArray(sc, p0, B, 1);
-    const in = try attnIn(sc, m, ly, h);
-    const qr = try sc.rms(in[0], ly.q_norm, c.eps);
+    const in = try attnQuery(sc, m, ly, h);
+    const qr = in[0];
     try tapInput(m, li, .q_lora, qr);
     const q = try ropeQ(sc, m, try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(B), ci(c.heads), ci(hd) }), rope, pos, false, .none, null);
     const keys = try sc.concat(&.{ ds.keys, try windowRow(sc, m, ly, in[1], rope, pos) }, 0);
     const band = if (ds.band.ctx != null) ds.band else try sc.ge(try sc.zeros(&.{ ci(B), ci(dim(keys, 0)) }, .float32), try sc.f(0));
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     const heads = try attnCore(sc, ly.sink, q, keys, band, none, none, scale, m.act);
-    return attnOut(sc, m, li, ly, try ropeQ(sc, m, heads, rope, pos, true, .none, null), false);
+    return attnOut(sc, m, li, ly, try ropeQ(sc, m, heads, rope, pos, true, .none, null), false, null);
 }
 
 /// The heads `o` `[L, H, hd]` (already inverse-rotated) through the output projections; `rounded`: they already left
 /// the fp8 round trip (the decode kernels fold it in).
-fn attnOut(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, o: A, rounded: bool) !A {
+fn attnOut(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, o: A, rounded: bool, expand: ?*ExpandReq) !A {
     const c = &m.cfg;
     const L = dim(o, 0);
     const og = c.o_groups;
@@ -2256,13 +2296,27 @@ fn attnOut(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, o: A, round
     const grouped = try sc.reshape(o, &.{ ci(L), ci(og), ci(gin) });
     const ob = if (rounded) grouped else try qatIf(sc, m, grouped, .fp8_ue8m0, 32);
     try tapInput(m, li, .wo_a_in, ob);
-    return attnOutGrouped(sc, m, li, ly, try sc.transpose(ob, &.{ 1, 0, 2 }));
+    return attnOutGrouped(sc, m, li, ly, try sc.transpose(ob, &.{ 1, 0, 2 }), expand);
 }
 
-/// `attnOut` from the heads as `[og, L, in]`, rotated and rounded.
-fn attnOutGrouped(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, obg: A) !A {
+/// `attnOut` from the heads as `[og, L, in]`, rotated and rounded. With `expand`, the last projection's finish may
+/// expand its rows into the request's streams (`done`), which then come back in place of the output.
+fn attnOutGrouped(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, obg: A, expand: ?*ExpandReq) !A {
     const L = dim(obg, 1);
-    const oa = if (ly.wo_a.stq) |q|
+    // Two trellis projections in a row: at one row the second sums the first's partials where it reads its input, a
+    // dispatch fewer. From two rows that finish, repeated in every threadgroup, costs more than the dispatch it saves.
+    if (L == 1 and m.tap == null) if (ly.wo_a.stq) |qa| if (ly.wo_b.stq) |qb| {
+        if (expand) |q| if (try exl3.linear.linearPair(sc.s, obg, qa.p, qb.p, qa.dec, qb.dec, .{ .rows = sc.rows }, q.e)) |x1| {
+            q.done = true;
+            return sc.keep(x1);
+        };
+        if (try exl3.linear.linearPair(sc.s, obg, qa.p, qb.p, qa.dec, qb.dec, .{ .rows = sc.rows }, null)) |y| return sc.keep(y);
+    };
+    // From two rows the first projection's finish lays its banks side by side in each row, as the second reads them.
+    const side: ?A = if (L > 1 and m.tap == null) if (ly.wo_a.stq) |q| try exl3.linear.linearGroupedRows(sc.s, obg, q.p, q.dec, .{ .rows = sc.rows }) else null else null;
+    const oa = if (side != null)
+        none
+    else if (ly.wo_a.stq) |q|
         try q.applyGrouped(sc, obg)
     else if (ly.wo_a.s.ctx == null)
         try sc.matmul(obg, try sc.transpose(ly.wo_a.w, &.{ 0, 2, 1 }))
@@ -2272,8 +2326,12 @@ fn attnOutGrouped(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, obg:
         var ro = mlx.mlx_array_new();
         break :blk try sc.res(mlx.mlx_quantized_matmul(&ro, obg, ly.wo_a.w, ly.wo_a.s, none, true, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", sc.s), &ro);
     };
-    const mid = try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ ci(L), -1 });
+    const mid = if (side) |sd| try sc.keep(sd) else try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ ci(L), -1 });
     try tapInput(m, li, .wo_b_in, mid);
+    if (expand) |q| if (m.tap == null) if (ly.wo_b.stq) |qb| if (try exl3.linear.linearExpanded(sc.s, mid, qb.p, qb.dec, .{ .rows = sc.rows }, q.e)) |x1| {
+        q.done = true;
+        return sc.keep(x1);
+    };
     return ly.wo_b.apply(sc, mid);
 }
 
@@ -2872,7 +2930,7 @@ fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?HcPrev, cpre: A, hc: *const Hc,
 /// (`ds` its window of main rows) attends over those and its own block instead of a backbone window.
 fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: usize, sh: *Shared, span: usize, ds: ?DsKeys) !Pair {
     const ly = &m.layers[li];
-    const pa = try hcPre(sc, m, x, null, cpre, &ly.hc_attn, ly.attn_norm);
+    var pa = try hcPre(sc, m, x, null, cpre, &ly.hc_attn, ly.attn_norm);
     const h = pa.h;
     if (prof(m, dim(x, 0))) |p| {
         const s = pa.mix.sp orelse qat_mod.Split{ .pre = pa.mix.z, .post = pa.mix.z, .comb = pa.mix.z };
@@ -2888,15 +2946,21 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         try t.put("attn_in_{d}", .{li}, h);
     }
     // The attention's and the FFN's intermediates live in scopes of their own, so evaluating the layer can free them.
+    // `expanded`: the attention's last finish wrote the stream the FFN stage reads, and `a` is that stream.
+    var expanded = false;
     const a = blk: {
         var asc = sc.child();
         defer asc.deinit();
-        const o = if (ds) |d| try dsparkAttention(&asc, m, li, h, d, p0) else try attention(&asc, m, st, li, h, p0, sh, span);
+        // The attention's rotation splits this stage's mixes beside itself, so the FFN stage reads the split.
+        var rode: ?qat_mod.Split = null;
+        const ride: ?RideSplit = if (pa.mix.sp == null) .{ .z = pa.mix.z, .out = &rode, .x = x, .expanded = &expanded } else null;
+        const o = if (ds) |d| try dsparkAttention(&asc, m, li, h, d, p0) else try attention(&asc, m, st, li, h, p0, sh, span, ride);
+        if (rode) |r| pa.mix.sp = .{ .pre = try sc.keep(asc.out(r.pre)), .post = try sc.keep(asc.out(r.post)), .comb = try sc.keep(asc.out(r.comb)) };
         break :blk try sc.keep(asc.out(o));
     };
     if (m.trace) |t| try t.put("attn_{d}", .{li}, a);
     if (width_probe) |t| try t.put("attn_{d}", .{li}, a);
-    const pf = try hcPre(sc, m, x, .{ .y = a, .prev = pa.mix }, none, &ly.hc_ffn, ly.ffn_norm);
+    const pf = if (expanded) try hcPre(sc, m, a, null, pa.mix.sp.?.pre, &ly.hc_ffn, ly.ffn_norm) else try hcPre(sc, m, x, .{ .y = a, .prev = pa.mix }, none, &ly.hc_ffn, ly.ffn_norm);
     var mix = pf.mix;
     const x1 = pf.x1;
     const h2 = pf.h;

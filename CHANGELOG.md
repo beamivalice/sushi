@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1-Flash decodes about 3% faster on Sushi Cooler, serial and speculative**: seven small steps of each
+  layer now ride the kernels beside them, so a token issues about 80 fewer GPU dispatches for the same output.
 - **A sampled DeepSeek token is drawn by one GPU kernel on Sushi Cooler**: temperature, top-k, top-p and the draw
   took up to 101 GPU dispatches a round and now take two. A seed still gives one text on every repeat, streamed or
   not, but not the text an earlier version gave for that seed.
