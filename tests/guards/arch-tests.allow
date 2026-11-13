@@ -45,6 +45,7 @@ MiMo EXL3 streaming imported slabs warm and reuse different layer rates
 MiMo MTP state bill is constant and follows retained storage
 MiMo honors the declared wired limit streamed or resident, without enabling long-context paths
 ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only
+Qwen's late-system edit engages on any revision with the branch, and one without it folds
 Qwen3.8-Flash-Next thinks at medium effort by default, under the launch flag and the checkpoint's own word
 Responses: a stored chain and an input replay render the same Qwen prompt
 a GLM raw FP8 config with another block size is refused by name
@@ -62,7 +63,10 @@ applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the che
 bf16 slab kernels hold parity at the Qwen3.8-Flash-Next expert geometry
 capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS_DIR): the layer-streamed capture of a real four-layer slice reproduces the full forward's hidden boundaries, MLP input rows, routing and Hessians
 characterization: a sidecar boot's width-trial SCHEDULE re-reads its period like qwen4
+chat: Qwen's late-system edit reaches only a Qwen-typed config, never another arch's or an untyped one
 chat: the embedded V4.1 template renders through the template engine byte-exact with DeepSeek's encoder
+chat: the shared Qwen test config places a late system turn as a Qwen load does
+chat: tool results a client sends out of call order render byte-exact with DeepSeek's encoder once the messages are ordered
 deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one line naming the keys set
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line
 deepseek_v41 thinks by default, at its native high effort
@@ -97,6 +101,7 @@ exl3 clamped routing preserves GLM production width bytes
 exl3 down GEMV on a prepared middle keeps the self-preparing kernel's bytes (MiMo rates, grouped rows, K4)
 exl3 expert bytes at the MiMo K2.5 geometry size the resident admission
 exl3 grouped decode keeps the ticks' bytes at Flash-Next and DeepSeek geometry
+exl3 linear: a pair whose second launch sums the first's partials gives the two launches' bytes at DeepSeek's wo shapes and small ones, 1 to 16 rows, on the machine's arm and SIMD, MLX's stream and the engine's
 exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at DeepSeek's trunk shapes, and the lm_head keeps its serial launch's
 exl3 pair GEMV on a prepared input keeps the self-preparing kernel's bytes (MiMo rates, grouped rows, K4)
 exl3 paired cooperative projections preserve GLM width and mixed rate fallback
@@ -179,16 +184,15 @@ real mimo_v2 original checkpoint discovers complete streamed expert headers
 real qwen checkpoint is a complete streaming discovery candidate
 real qwen expert store spans and source bytes are exact
 real qwen streaming resident estimate is trunk plus MTP only
+renderChatSpans: GLM-5.3 continuing a reply that spells a think closer keeps the user's turn whole
 renderChatTemplate: preserve_thinking keeps or drops Qwen3.8's prior-turn thinking
 round_cost: a MiMo boot keeps each long-context rung's rounds in its own bucket
 selectEffort: GLM medium re-routes to high and xhigh to max; other missing words stay refused
 selectEffort: Qwen high and max re-route to xhigh; other unknowns stay refused
 selectEffortPick: only Qwen high and max carry a re-route; MiMo's on-fold stays quiet
-serializeExtraContext: DeepSeek-V4.1 maps the client's effort onto the encoder's ladder
 slice (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1, SUSHI_MODELS_DIR and ENCODER_SLICE_OUT): writes a layers-by-experts slice for conversion runs
 source: SafetensorsSource streams per-expert public weights for Qwen, GLM and MiMo and refuses GGUF
 spliceVisionRows: video placeholders are scattered like image rows (Qwen video_token_id)
-stock Qwen adapter engages only on the byte-pinned revisions
 stock Qwen adapter leaves prompts without late notes byte-identical, tools, thinking and media included
 stock Qwen adapter: a late note between media turns renders in place
 stock Qwen adapter: a second leading system turn stays a turn of its own
@@ -197,6 +201,7 @@ streaming layout refusal explains MiMo repacking without assuming Qwen
 sushi coder GPU grouped binders cover qwen mimo and MTP
 sushi coder index recognizes grouped qwen4 and mimo layouts
 sushi coder uniform qwen4 and mimo banks preserve stored handles
+templateSettings: DeepSeek-V4.1 maps the client's effort onto the encoder's ladder
 the GDN state checkpoint bills four bytes per element at f32 and two at bf16; GLM's KDA state is f32 always
 the GPU expert pick matches the host on a sigmoid router's log-sigmoid logits, MiMo's E and K
 the concurrency verdict: a resident GLM and qwen4 batch, an exclusive model queues, another MoE interleaves
