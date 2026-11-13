@@ -145,6 +145,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   needle, or they assume a consistent comparator; the engine uses `value.Finder` (KMP) and `value.stableSort`.
   `device-probe` flags a call that takes the GPU's architecture name, the OS version or the QA switch by name
   outside `src/exl3/device.zig` ([the device profile](engine-kernels.md#the-device-profile)).
+  `log-line-end` flags a `log.info|warn|debug|err` call whose format is one string literal that does not end in
+  `\n` (`"{s}"` alone passes: a line built whole): the logger adds no line end, so the next line starts on that one.
   `arch-test-unlisted` flags a file that declares a test and sits beside an `arch_tests.zig` that does not import
   it: the buckets select tests by listed file, so its tests would never run.
   `template-text-search` flags, outside `src/template/` and tests, a `mem.` search (`indexOf`, `count`, `startsWith`,

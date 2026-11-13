@@ -49,3 +49,5 @@ owned-insert-arg src/ubench_main.zig:main argv and its copies live in the run's 
 owned-insert-arg src/encoder/pack.zig:buildConfig the config tree and its keys live in the build's arena
 owned-insert-arg src/glm5/glm_stream_fixture.zig:add TinyWriter's allocator is the fixture's arena
 owned-insert-arg src/dsv41/repack.zig:buildPlan buildPlan runs on the shard's arena
+log-line-end src/ubench_main.zig:main the usage text it prints last ends the line
+log-line-end src/bench.zig:start the usage text it prints last ends the line

@@ -35,7 +35,7 @@ pub fn applyReadHints(fd: std.c.fd_t, hints: ReadHints) void {
     if (hints.readahead_off and std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)) != 0) failed = true;
     if (failed and !hint_failure_logged) {
         hint_failure_logged = true;
-        log.warn("[expert-io] read hints declined (fd {d})", .{fd});
+        log.warn("[expert-io] read hints declined (fd {d})\n", .{fd});
     }
 }
 

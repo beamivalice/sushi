@@ -310,6 +310,17 @@ printf '%s\n' 'const names = [_][]const u8{ "SUSHI_FORCE_GPU_FAMILY_FALLBACK", "
   'pub fn count() usize {' '    const text = "architecture";' '    return names.len + text.len;' '}' > "$TMP/t/src/p.zig"
 expect_green "the device profile's own reads, and the names in a list or a constant"
 
+# rule log-line-end
+tree
+printf '%s\n' 'const log = @import("log.zig");' 'pub fn skip(name: []const u8) void {' '    log.info("[discovery] skip {s}: no config", .{name});' '}' > "$TMP/t/src/p.zig"
+expect_red "a log line with no line end" "src/p.zig:3:14 \[log-line-end\] skip: log.info format has no line end"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'const log = @import("log.zig");' 'pub fn f(name: []const u8, line: []const u8) void {' \
+  '    log.warn("[load] {s}\n", .{name});' '    log.debug("{s}", .{line});' '    log.err("[load] " ++ "{s}\n", .{name});' \
+  '    std.log.info("no end", .{});' '}' > "$TMP/t/src/p.zig"
+expect_green "a line end, a whole line passed through, a joined format and another logger"
+
 # the allowlist
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn handleOf(s: *S) *S { return s; }' 'fn f(self: *const S) *S {' \

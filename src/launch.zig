@@ -1125,11 +1125,11 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     const oc_config: ?[]u8 = if (parsed.kind == .opencode)
         opencodeJsonWithEffort(allocator, base_url, chosen.id, models.entries, parsed.think) catch |err| {
             if (err != error.UnsupportedReasoningEffort) return err;
-            log.err("reasoning effort '{s}' is not supported by {s}; accepted:", .{ parsed.think orelse "", chosen.id });
+            var accepted: std.ArrayList(u8) = .empty;
             if (chosen.efforts) |words| {
-                for (words) |word| log.err(" {s}", .{word});
+                for (words) |word| try accepted.print(allocator, " {s}", .{word});
             }
-            log.err("\n", .{});
+            log.err("reasoning effort '{s}' is not supported by {s}; accepted:{s}\n", .{ parsed.think orelse "", chosen.id, accepted.items });
             std.process.exit(1);
         }
     else

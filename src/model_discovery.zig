@@ -567,21 +567,21 @@ fn tryAddModel(
         // before they reach the tokenizer/weight loaders.
         break :blk switch (peekConfig(io, allocator, parent, name)) {
             .missing_or_unparseable => {
-                log.info("[discovery] skip {s}: config.json missing or unparseable", .{name});
+                log.info("[discovery] skip {s}: config.json missing or unparseable\n", .{name});
                 return true;
             },
             .unsupported_arch => |mt| {
                 defer allocator.free(mt);
-                log.info("[discovery] skip {s}: unsupported model_type '{s}'", .{ name, mt });
+                log.info("[discovery] skip {s}: unsupported model_type '{s}'\n", .{ name, mt });
                 return true;
             },
             .unsupported_quant => |mode| {
                 defer allocator.free(mode);
-                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, mxfp4, mxfp8)", .{ name, mode });
+                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, mxfp4, mxfp8)\n", .{ name, mode });
                 return true;
             },
             .drafter => {
-                log.info("[discovery] skip {s}: DFlash drafter sidecar, not a standalone model", .{name});
+                log.info("[discovery] skip {s}: DFlash drafter sidecar, not a standalone model\n", .{name});
                 return true;
             },
             .supported => |mt| mt, // ownership moves to the DiscoveredModel
