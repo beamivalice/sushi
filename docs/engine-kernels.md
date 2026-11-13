@@ -35,6 +35,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **A uniform made from hash bits with a half step keeps 23 of them.** `(float(h >> 8) + 0.5) * 2^-24` rounds to 1.0
   at the top hash, whose Gumbel is +inf: once in 2^24 ids, so 0.76% of the unfiltered draws of a 129k-wide row were an
   id of any mass. `(float(h >> 9) + 0.5) * 2^-23` is exact, inside (0, 1) (`sampler_draw.zig`).
+- **A value that enters `exp(v - max)` is made finite where it is made.** A +inf logit (a repeat penalty near 1e-38,
+  which the API accepts, divides a positive one past the float range) made the row's top +inf and its nucleus mass
+  NaN: under a nucleus near zero the draw fell to id 0, and the host rule did so under any nucleus. `sushi_draw_val`
+  reads +inf as the largest float and NaN as -inf, once, so every exponent and bin after it is finite.
 - A custom kernel can be LATENCY-bound rather than op-bound (qwen4 fused hc read; `hcWrite`
   DEFERS into the next read).
 - A kernel keyed on `batch*seq == 1` declines every verify row AND batched slot, so the grid carries the rows

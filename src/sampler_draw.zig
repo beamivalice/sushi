@@ -1,13 +1,14 @@
 //! A sampled draw as one kernel: temperature, top-k by rank, the nucleus and the draw, a threadgroup a row.
 //!
 //! The rule (`hostDraw` is its reference):
-//! - a value is `logit * (1 / temperature)`; values order high to low, equal values by lower id first;
+//! - a value is `logit * (1 / temperature)`, NaN read as -inf and +inf as the largest float, so the row's top value and
+//!   every `exp(value - top)` are finite; values order high to low, equal values by lower id first;
 //! - top-k keeps the first `top_k` in that order (0 or >= vocab: all);
 //! - the nucleus keeps, of those, each one whose mass strictly above it in that order is under `top_p` of their mass
 //!   (the top one always);
 //! - the draw is the kept id with the largest `value + gumbel(key, id)`, the lower id on a tie.
 //! A row's draw is a function of that row, the parameters and its key alone: the same alone and beside other rows.
-//! A row with no finite value draws id 0.
+//! A row whose every value is -inf or NaN draws id 0.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -28,7 +29,7 @@ const HEADER =
     \\static inline float sushi_draw_unkey(uint k) {
     \\  return as_type<float>((k & 0x80000000u) ? (k ^ 0x80000000u) : ~k);
     \\}
-    \\static inline float sushi_draw_val(float x) { return x == x ? x : -INFINITY; }
+    \\static inline float sushi_draw_val(float x) { return x == x ? metal::min(x, FLT_MAX) : -INFINITY; }
     \\static inline uint sushi_draw_mix(uint h) {
     \\  h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
     \\  return h;
@@ -400,7 +401,7 @@ pub fn hostDraw(row: []const f32, order: []u32, temperature: f32, top_p: f32, to
         inv_t: f32,
         fn val(self: @This(), i: u32) f32 {
             const v = self.row[i] * self.inv_t;
-            return if (v == v) v else -std.math.inf(f32);
+            return if (v == v) @min(v, std.math.floatMax(f32)) else -std.math.inf(f32);
         }
         fn before(self: @This(), a: u32, b: u32) bool {
             const ka = keyOf(self.val(a));
@@ -580,7 +581,7 @@ test "sampler draw: a row's draw is the same alone, beside other rows and at any
     for (0..max_rows) |r| try testing.expectEqual(all[max_rows - 1 - r], back[r]);
 }
 
-test "sampler draw: an id at -inf is never drawn, top-k 1 and a zero nucleus are the lowest top id, and no finite value draws id 0" {
+test "sampler draw: an id at -inf is never drawn, one at +inf always is, top-k 1 and a zero nucleus are the lowest top id, and no finite value draws id 0" {
     try mlx.requireGpu();
     // The engine draws where it serves a model, a GPU with matrix units; one without grants this kernel 768 threads a
     // group, under the 1,024 it is laid out on. A failed launch takes its raise with it.
@@ -620,6 +621,193 @@ test "sampler draw: an id at -inf is never drawn, top-k 1 and a zero nucleus are
     const none = try drawHost(a, s, row, 1, vocab, .float32, 1.0, 0.9, 5, &.{.{ 4, 4 }});
     defer a.free(none);
     try testing.expectEqual(@as(u32, 0), none[0]);
+    // One id at +inf, over a floor or alone among -inf: the kernel and the rule draw it under every filter.
+    const order = try a.alloc(u32, vocab);
+    defer a.free(order);
+    for ([_]bool{ false, true }) |alone| {
+        testRow(row, 0x1f1f, false);
+        if (alone) @memset(row, -std.math.inf(f32));
+        row[1234] = std.math.inf(f32);
+        for ([_]u32{ 0, 1, 7, vocab }) |top_k| for ([_]f32{ 1.0, 0.9, 1e-6, 0.0, 1e-45 }) |top_p| for ([_]f32{ 0.01, 1.0 }) |temperature| {
+            const key: [2]u32 = .{ top_k + 5, @bitCast(top_p) };
+            const got = try drawHost(a, s, row, 1, vocab, .float32, temperature, top_p, top_k, &.{key});
+            defer a.free(got);
+            try testing.expectEqual(@as(u32, 1234), got[0]);
+            try testing.expectEqual(@as(u32, 1234), hostDraw(row, order, temperature, top_p, top_k, key).id);
+        };
+    }
+}
+
+test "sampler draw: a repeat penalty that pushes a seen id to +inf draws that id at every filter" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    const seen_penalty = @import("seen_penalty.zig");
+    const vocab = 3000;
+    const row = try a.alloc(f32, vocab);
+    defer a.free(row);
+    testRow(row, 0x2e2e, false);
+    row[777] = 5.0;
+    // The API takes any repeat penalty in (0, 10]: a seen positive logit divided by 1e-38 is past the largest float.
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
+    const logits = mlx.mlx_array_new_data(row.ptr, &[_]c_int{ 1, vocab }, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const counts = try seen_penalty.buildCounts(a, &.{777}, vocab);
+    defer _ = mlx.mlx_array_free(counts);
+    var penalized = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(penalized);
+    try seen_penalty.apply(&penalized, logits, counts, .{ .repeat = 1e-38 }, s);
+    try mlx.check(mlx.mlx_array_eval(penalized));
+    try testing.expect(std.math.isPositiveInf((mlx.mlx_array_data_float32(penalized) orelse return error.TestUnexpectedResult)[777]));
+    for ([_]u32{ 0, 1, 40 }) |top_k| for ([_]f32{ 1.0, 0.9, 0.0, 1e-45 }) |top_p| {
+        const drawn = try rows(penalized, 0.8, top_p, top_k, &.{.{ top_k, 3 }}, s);
+        defer _ = mlx.mlx_array_free(drawn);
+        try mlx.check(mlx.mlx_array_eval(drawn));
+        try testing.expectEqual(@as(u32, 777), (mlx.mlx_array_data_uint32(drawn) orelse return error.TestUnexpectedResult)[0]);
+    };
+}
+
+test "sampler draw: at the edges of width, row count, special values and filters the kernel draws what the rule draws" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    const inf = std.math.inf(f32);
+    var checked: usize = 0;
+    var close: usize = 0;
+    for ([_]usize{ 1, 33, 1025, 5000 }) |vocab| {
+        const order = try a.alloc(u32, vocab);
+        defer a.free(order);
+        for ([_]usize{ 1, 16 }) |n_rows| {
+            const flat = try a.alloc(f32, n_rows * vocab);
+            defer a.free(flat);
+            // A floor, ties, flat, one finite id, two, NaN holes, one +inf, values near the float range's end.
+            for (0..8) |pat| {
+                for (0..n_rows) |r| {
+                    const row = flat[r * vocab ..][0..vocab];
+                    testRow(row, 0x1000 + r * 13 + vocab + pat, pat == 1);
+                    switch (pat) {
+                        2 => @memset(row, 0.5),
+                        3, 4 => {
+                            @memset(row, -inf);
+                            row[(r * 7) % vocab] = 1.0;
+                            if (pat == 4) row[(r * 7 + 1) % vocab] = 1.0;
+                        },
+                        5 => for (row, 0..) |*x, i| {
+                            if (i % 3 == 0) x.* = std.math.nan(f32);
+                        },
+                        6 => row[(r * 11) % vocab] = inf,
+                        7 => for (row) |*x| {
+                            x.* *= 1e30;
+                        },
+                        else => {},
+                    }
+                }
+                for ([_]f32{ 0.7, 100.0 }) |temperature| for ([_]u32{ 0, 1, @intCast(vocab) }) |top_k| for ([_]f32{ 1.0, 0.9, 0.0, 1e-45 }) |top_p| {
+                    var keys: [16][2]u32 = undefined;
+                    for (keys[0..n_rows], 0..) |*k, r| k.* = .{ @intCast(0x77 + r * 3 + top_k), @intCast(0x99 + r + vocab) };
+                    const got = try drawHost(a, s, flat, n_rows, vocab, .float32, temperature, top_p, top_k, keys[0..n_rows]);
+                    defer a.free(got);
+                    for (got, 0..) |g, r| {
+                        const want = hostDraw(flat[r * vocab ..][0..vocab], order, temperature, top_p, top_k, keys[r]);
+                        if (pat == 6) {
+                            try testing.expectEqual(@as(u32, @intCast((r * 11) % vocab)), g);
+                            try testing.expectEqual(g, want.id);
+                            continue;
+                        }
+                        // As in the sweep above: a call the two float orders can make differently is not a verdict,
+                        // but a single finite id is drawn whatever the margins.
+                        if (want.nucleus_margin < 1e-5 or want.gap < 1e-4) {
+                            close += 1;
+                            if (pat == 3) try testing.expectEqual(@as(u32, @intCast((r * 7) % vocab)), g);
+                            if (want.nucleus_margin >= 1e-5) try testing.expect(g == want.id or g == want.second.?);
+                            continue;
+                        }
+                        try testing.expectEqual(want.id, g);
+                        checked += 1;
+                    }
+                };
+            }
+        }
+    }
+    try testing.expect(checked > 4 * close);
+}
+
+test "sampler draw: at served vocabularies, over a plateau and a slope, the kernel draws what the rule draws" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    var checked: usize = 0;
+    var close: usize = 0;
+    test_routes = @splat(@splat(0));
+    for ([_]usize{ 65537, 129280 }) |vocab| {
+        const order = try a.alloc(u32, vocab);
+        defer a.free(order);
+        const n_rows = 4;
+        const flat = try a.alloc(f32, n_rows * vocab);
+        defer a.free(flat);
+        const view = try a.alloc(f32, vocab);
+        defer a.free(view);
+        for (0..5) |pat| {
+            for (0..n_rows) |r| {
+                const row = flat[r * vocab ..][0..vocab];
+                testRow(row, 0x500 + r * 17 + pat * 3 + 1, pat == 1);
+                switch (pat) {
+                    2 => @memset(row, 2.25),
+                    // A plateau of equal ids over a floor, and a slope of many ids within a few nats.
+                    3 => for (row, 0..) |*x, i| {
+                        x.* = if (i % 43 == 0) 5.0 else -3.0;
+                    },
+                    4 => for (row, 0..) |*x, i| {
+                        x.* = -@as(f32, @floatFromInt(i % 977)) * 0.004 + @as(f32, @floatFromInt(r));
+                    },
+                    else => {},
+                }
+            }
+            for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| for ([_]u32{ 0, 1, 1025, 60000 }) |top_k| for ([_]f32{ 1.0, 0.99, 0.3 }) |top_p| {
+                var keys: [n_rows][2]u32 = undefined;
+                for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x11 + r * 5 + top_k), @intCast(0x23 + r + vocab) };
+                const got = try drawHost(a, s, flat, n_rows, vocab, dtype, 1.0, top_p, top_k, &keys);
+                defer a.free(got);
+                for (got, 0..) |g, r| {
+                    // The rule reads what the kernel reads: the row rounded to the dtype, to nearest even.
+                    for (view, flat[r * vocab ..][0..vocab]) |*o, x| {
+                        const u: u32 = @bitCast(x);
+                        o.* = if (dtype == .bfloat16) @bitCast((u +% 0x7FFF +% ((u >> 16) & 1)) & 0xFFFF_0000) else x;
+                    }
+                    const want = hostDraw(view, order, 1.0, top_p, top_k, keys[r]);
+                    if (want.nucleus_margin < 1e-4 or want.gap < 1e-3) {
+                        close += 1;
+                        continue;
+                    }
+                    try testing.expectEqual(want.id, g);
+                    checked += 1;
+                }
+            };
+        }
+    }
+    // A slope and a plateau make many close calls: about one row in four.
+    try testing.expect(checked > 2 * close);
+    // Both routes answered for a filtered row.
+    for (test_routes[1..]) |by_route| for (by_route[1..]) |seen| try testing.expect(seen > 0);
 }
 
 test "sampler draw: over many keys the kept ids come out at their share of the kept mass" {
