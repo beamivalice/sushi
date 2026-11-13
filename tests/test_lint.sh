@@ -291,6 +291,25 @@ printf '%s\n' 'const std = @import("std");' 'fn g(template: []const u8) ?usize {
   '    return std.mem.indexOfScalar(u8, template, 0x7b);' '}' > "$TMP/t/src/template/q.zig"
 expect_green "a search of rendered text, an equality, a test, and the engine itself"
 
+# rule device-probe
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn withheld() bool {' '    return std.c.getenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK") != null;' '}' > "$TMP/t/src/p.zig"
+expect_red "the QA switch read outside the device profile" "src/p.zig:3:25 \[device-probe\] withheld: \"SUSHI_FORCE_GPU_FAMILY_FALLBACK\" is read here"
+
+tree
+printf '%s\n' 'extern fn sysctlbyname(name: [*:0]const u8, a: ?*anyopaque, b: ?*usize, c: ?*anyopaque, d: usize) c_int;' \
+  'pub fn os(buf: []u8) c_int {' '    var n = buf.len;' '    return sysctlbyname("kern.osproductversion", buf.ptr, &n, null, 0);' '}' \
+  'fn info(key: [*:0]const u8) void { _ = key; }' 'pub fn arch() void {' '    info("architecture");' '}' > "$TMP/t/src/p.zig"
+expect_red "the OS version read outside the device profile" "\[device-probe\] os: \"kern.osproductversion\" is read here"
+expect_red "the GPU's name read outside the device profile" "\[device-probe\] arch: \"architecture\" is read here"
+
+tree
+mkdir -p "$TMP/t/src/exl3"
+printf '%s\n' 'const std = @import("std");' 'pub fn withheld() bool {' '    return std.c.getenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK") != null;' '}' > "$TMP/t/src/exl3/device.zig"
+printf '%s\n' 'const names = [_][]const u8{ "SUSHI_FORCE_GPU_FAMILY_FALLBACK", "MLX_METAL_GPU_ARCH" };' \
+  'pub fn count() usize {' '    const text = "architecture";' '    return names.len + text.len;' '}' > "$TMP/t/src/p.zig"
+expect_green "the device profile's own reads, and the names in a list or a constant"
+
 # the allowlist
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn handleOf(s: *S) *S { return s; }' 'fn f(self: *const S) *S {' \

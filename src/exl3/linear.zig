@@ -5,6 +5,7 @@
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const host_side = @import("host_side.zig");
+const device = @import("device.zig");
 const exl3 = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
 const project_rows = @import("project_rows.zig");
@@ -772,8 +773,6 @@ test "exl3 linear: the multi-row kernel gives a row the same bytes at widths 2 t
     }
 }
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const exact: Opts = .{ .rows = .{ .exact = true } };
 
@@ -782,8 +781,8 @@ test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 8 at 
     // The arm follows the hardware, never the row count.
     for (1..9) |rows| try std.testing.expectEqual(kernels.gemmNaxOn(), project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1, exact.rows).nax);
     try exactRowsCase();
-    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
-    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    const simd_only = device.withProfile(device.simdOnly());
+    defer simd_only.end();
     for (1..9) |rows| try std.testing.expect(!project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1, exact.rows).nax);
     try exactRowsCase();
 }
@@ -946,8 +945,8 @@ test "exl3 linear: a pair whose second launch sums the first's partials gives th
         try pairCase(if (on_engine) mlx.engine.stream() else mlx.gpuStream());
     }
     mlx.engine.enabled = false;
-    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
-    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    const simd_only = device.withProfile(device.simdOnly());
+    defer simd_only.end();
     try std.testing.expect(!kernels.gemmNaxOn());
     try pairCase(mlx.gpuStream());
 }
@@ -961,8 +960,8 @@ test "exl3 linear: a stacked launch whose first linear leaves rms-normed gives t
         try normedCase(if (on_engine) mlx.engine.stream() else mlx.gpuStream());
     }
     mlx.engine.enabled = false;
-    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
-    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    const simd_only = device.withProfile(device.simdOnly());
+    defer simd_only.end();
     try std.testing.expect(!kernels.gemmNaxOn());
     try normedCase(mlx.gpuStream());
 }
@@ -976,8 +975,8 @@ test "exl3 linear: a launch whose finish expands its rows into streams gives the
         try expandedCase(if (on_engine) mlx.engine.stream() else mlx.gpuStream());
     }
     mlx.engine.enabled = false;
-    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
-    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    const simd_only = device.withProfile(device.simdOnly());
+    defer simd_only.end();
     try std.testing.expect(!kernels.gemmNaxOn());
     try expandedCase(mlx.gpuStream());
 }

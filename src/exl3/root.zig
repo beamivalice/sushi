@@ -7,6 +7,7 @@ const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 /// The sushi version this copy of the module was cut at; the sushi tests check it against build.zig.zon.
 pub const version: []const u8 = "1.7.0-dev1";
+pub const device = @import("device.zig");
 pub const format = @import("expert_exl3.zig");
 pub const pack = @import("pack.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
@@ -502,6 +503,7 @@ test "exl3 a layer may pack below the rate the config bills, never above it" {
 }
 
 test {
+    _ = device;
     _ = format;
     _ = pack;
     _ = kernels;

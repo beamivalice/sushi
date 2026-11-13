@@ -298,17 +298,6 @@ pub const Device = struct {
         return .{ .raw = state, .max_threads = send(usize, state, "maxTotalThreadsPerThreadgroup", .{}) };
     }
 
-    /// The GPU's architecture name (`applegpu_g17s`), written into `buf`.
-    pub fn architecture(dev: *const Device, buf: []u8) []const u8 {
-        const pool = objc_autoreleasePoolPush();
-        defer objc_autoreleasePoolPop(pool);
-        const name = send(id, send(id, dev.raw, "architecture", .{}), "name", .{});
-        const text = std.mem.span(send([*:0]const u8, name, "UTF8String", .{}));
-        const n = @min(text.len, buf.len);
-        @memcpy(buf[0..n], text[0..n]);
-        return buf[0..n];
-    }
-
     /// A zeroed buffer of `len` bytes that Metal allocates.
     pub fn alloc(dev: *const Device, len: usize) Error!Buffer {
         const raw = send(id, dev.raw, "newBufferWithLength:options:", .{ @max(len, 1), alias_options }) orelse {

@@ -262,6 +262,24 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   stock's worst element (`VerifyQmmParity`); a verify lane is never byte-identical to stock. Sub-4-bit weights fall
   outside it (a 4/5/6-bit specialisation).
 
+## The device profile
+
+`src/exl3/device.zig` (`sushi_exl3.device`) reads the GPU once and every kernel arm is chosen from what it holds.
+
+- **A kernel arm is written for a `Unit`**: `simd` (the shader cores' SIMD groups, every Apple GPU) or `matrix_g17` (the
+  matrix units of generation 17, through `matmul2d`). A gate asks `device.current().has(unit)` and adds its own
+  conditions (a shape, a dtype, an OS floor of its own such as QSA's 26.3).
+- **`unit_rows` is the only place a generation is named**: the first generation with the unit (18 on a phone), the OS
+  whose Metal reaches it, and `until` when a later chip's unit stops running these kernels. A chip with a unit of its
+  own is one `Unit` tag, one row and the arms written for it; a kernel without the new arm keeps its best old one.
+- A generation past the table keeps the newest row's units, as MLX's dispatch assumes; `Profile.untested` says so.
+- `Profile.chip` is what the chip has; `Profile.units` is what a kernel may use (less what the OS is too old for, and
+  `simd` alone under `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`). The stock ops held to MLX's bytes read `chip`, as MLX does.
+- The name is MLX's: `MLX_METAL_GPU_ARCH` when set, else the system GPU's, so the profile and MLX's dispatch agree.
+- **A test's GPU is `device.withProfile(p)`**, ended by its scope (`device.simdOnly()` withholds the matrix units of the
+  box it runs on). A test never sets the QA switch's env: the profile is read once.
+- Nothing else reads the GPU's name, the OS version or the QA switch (lint rule `device-probe`).
+
 ## NAX and Metal pitfalls
 
 - **A cooperative-tensor template arg is `metal::remove_addrspace_t<decltype(t)>`**, never `decltype(t)` (the

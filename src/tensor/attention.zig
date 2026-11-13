@@ -178,7 +178,7 @@ fn vector(g: matmul.Gpu, q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: 
     errdefer core.release(out);
     const k_len: usize = @intCast(k.shape[2]);
     // Two passes for a long key axis on a Max or an Ultra, or for keys shared by many heads.
-    if (((g.class == 'd' or g.class == 's') and k_len >= 1024) or (k.shape[1] < q.shape[1] and k_len >= 4096)) {
+    if (((g.class == .d or g.class == .s) and k_len >= 1024) or (k.shape[1] < q.shape[1] and k_len >= 4096)) {
         try twoPass(g, q, k, v, out, scale, gqa);
     } else {
         try onePass(q, k, v, out, scale, gqa);
@@ -232,12 +232,12 @@ fn onePass(q: *Tensor, k: *Tensor, v: *Tensor, out: *Tensor, scale: f32, gqa: us
 /// MLX's count of partial blocks the keys are cut into.
 fn blocksOf(g: matmul.Gpu, n: usize, n_simds: usize) c_int {
     var blocks: c_int = undefined;
-    if (g.class == 's') {
+    if (g.class == .s) {
         blocks = 64;
         if (n > 1024 and n_simds > 4) {
             blocks = if (n <= 8192) 128 else if (n <= 32768) 256 else if (n <= 65536) 512 else 1024;
         }
-    } else if (g.class == 'd') {
+    } else if (g.class == .d) {
         blocks = 128;
         if (n_simds <= 2 and n > 8192) {
             blocks = 256;

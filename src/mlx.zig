@@ -1634,8 +1634,6 @@ pub fn check(ret: c_int) !void {
 /// What the default device says of itself. It does not change, so MLX is asked once a process (a failed query is
 /// asked again).
 const DeviceFacts = struct {
-    arch: [64]u8 = undefined,
-    arch_len: usize = 0,
     working_set: usize = 0,
 };
 var device_facts: DeviceFacts = .{};
@@ -1656,22 +1654,10 @@ fn deviceFacts() ?*const DeviceFacts {
     defer _ = mlx_device_info_free(info);
     if (mlx_device_info_get(&info, dev) != 0) return null;
     var facts: DeviceFacts = .{};
-    var cstr: [*:0]const u8 = "";
-    if (mlx_device_info_get_string(&cstr, info, "architecture") != 0) return null;
-    const arch = std.mem.span(cstr);
-    if (arch.len == 0 or arch.len > facts.arch.len) return null;
-    @memcpy(facts.arch[0..arch.len], arch);
-    facts.arch_len = arch.len;
     if (mlx_device_info_get_size(&facts.working_set, info, "max_recommended_working_set_size") != 0) return null;
     device_facts = facts;
     device_known.store(true, .release);
     return &device_facts;
-}
-
-/// The GPU's architecture name ("applegpu_g17s"); empty when the device cannot be asked.
-pub fn deviceArchitecture() []const u8 {
-    const f = deviceFacts() orelse return "";
-    return f.arch[0..f.arch_len];
 }
 
 pub fn maxRecommendedWorkingSet() usize {

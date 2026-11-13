@@ -22,6 +22,7 @@ const rules = .{
     @import("owned_insert_arg.zig"),
     @import("arch_test_unlisted.zig"),
     @import("template_text_search.zig"),
+    @import("device_probe.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

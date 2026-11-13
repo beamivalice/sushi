@@ -162,7 +162,8 @@ A call is not a pure function of its arguments in these ways. A host serving sev
 | `linear.Geo.get` table, `project_rows.pinCfg` configs | process-lifetime, unlocked, keyed by shape (the geo also by dtype, bounds, `mode.exact` and the NAX state at bind), immutable once built | bind (`Geo.get`, `trunk.fuse`) and launch on the thread that owns MLX |
 | NAX latch in a geo | `trunk.fuse` and `Geo.get` read `gemmNaxOn()` when they run, so a geo's geometry follows the latch as it stood at bind; each launch rechecks the latch and falls back to the shape-reading path once it has set | nothing |
 | `kernels.gemm_nax_failed` | latches NAX GEMM off for the process when its kernel fails to build, then `gemmNaxOn()` is false | nothing; a host may read `gemmNaxOn()` |
-| env, read once per process | `SUSHI_EXL3_GEMM_WIN` and `SUSHI_EXL3_WIN_ALIGN` (prefill window tunables), `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` (forces the non-NAX arms) | set before the first dispatch, or leave unset |
+| `device.current()` | the GPU's profile, read once from Metal itself (`MTLCreateSystemDefaultDevice`, or MLX's `MLX_METAL_GPU_ARCH`) and `kern.osproductversion`; `gemmNaxOn()` asks it for the matrix units | link Metal, as any MLX GPU host does; nothing to call |
+| env, read once per process | `SUSHI_EXL3_GEMM_WIN` and `SUSHI_EXL3_WIN_ALIGN` (prefill window tunables), `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` (the profile withholds the matrix units: the non-NAX arms) | set before the first dispatch, or leave unset |
 | env, diagnostics | `SUSHI_EXL3_STAGE_PROFILE`, `SUSHI_EXL3_SWIGLU_MAXABS`, `SUSHI_EXL3_UNION_HIST`, `SUSHI_DECODE_TICK_UBENCH` | none; each only adds a log line (`[exl3-union]`, `[exl3-counts]`) or a timing |
 | log lines | `log.info` `[exl3-groups] ... engaged` once per arm | a `log.info` that can write |
 

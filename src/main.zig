@@ -121,8 +121,8 @@ fn commandUsesGpu(proc_args: std.process.Args) bool {
 /// What a load asks the device, asked once before any load: a load that is the engine's then asks MLX nothing.
 fn settleDeviceReads() void {
     if (mlx.noGpuBackend()) return;
-    _ = mlx.deviceArchitecture();
-    _ = @import("sushi_exl3").kernels.gemmNaxOn();
+    _ = mlx.maxRecommendedWorkingSet();
+    _ = @import("sushi_exl3").device.current();
 }
 
 pub fn main(init: std.process.Init) void {
@@ -1690,7 +1690,6 @@ test "the device reads a load makes are asked before it: under a hold they ask M
     try mlx.requireGpu();
     const exl3_kernels = @import("sushi_exl3").kernels;
     mlx.forgetDeviceForTest();
-    exl3_kernels.forgetGpuArchForTest();
     settleDeviceReads();
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -1699,7 +1698,6 @@ test "the device reads a load makes are asked before it: under a hold they ask M
     defer mlx.engine.unhold();
     const breaks = mlx.rest_breaks.load(.monotonic);
     _ = mlx.noGpuBackend();
-    _ = mlx.deviceArchitecture();
     _ = mlx.maxRecommendedWorkingSet();
     _ = exl3_kernels.gemmNaxOn();
     try std.testing.expectEqual(breaks, mlx.rest_breaks.load(.monotonic));

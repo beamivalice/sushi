@@ -19,7 +19,7 @@ const attn_kernels = @import("attn_kernels.zig");
 const QsaCfgCache = attn_kernels.QsaCfgCache;
 const sliceAttentionSeq = attn_kernels.sliceAttentionSeq;
 const nax_gate = @import("nax_gate.zig");
-const gpuArchitecture = nax_gate.gpuArchitecture;
+const device = @import("sushi_exl3").device;
 const naxMinMForBits = nax_gate.naxMinMForBits;
 const verifyQmmNaxAvailable = nax_gate.verifyQmmNaxAvailable;
 const verify_qmm = @import("verify_qmm.zig");
@@ -48,7 +48,6 @@ pub fn prefillDqGemmEnabled() bool {
 /// Test seam: engagement is counted, never inferred from output equality.
 pub var prefill_dq_gemm_engaged: u64 = 0;
 
-var verify_shared_arch: ?bool = null;
 
 // Preserve MLX's affine qmv K reduction while sharing each packed word across a pair.
 const VERIFY_EXPERT_REUSE_SOURCE =
@@ -440,12 +439,8 @@ pub fn verifyIndexedExpertInput(s: mlx.mlx_stream, x: mlx.mlx_array, lhs: mlx.ml
 
 pub fn verifySharedHardware() bool {
     if (!verifyQmmNaxAvailable()) return false;
-    if (verify_shared_arch) |value| return value;
-    var arch_buf: [128]u8 = undefined;
-    const arch = gpuArchitecture(&arch_buf) orelse return false;
-    const value = std.mem.startsWith(u8, arch, "applegpu_g17") and !std.mem.endsWith(u8, arch, "d");
-    verify_shared_arch = value;
-    return value;
+    const p = device.current();
+    return p.generation == 17 and p.class != .d;
 }
 
 pub const VerifyProjectionKind = enum { shared, gdn, lm_head, attention };

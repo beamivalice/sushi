@@ -143,6 +143,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `template-superlinear-std` flags, under `src/template/` outside tests, `std.sort` and a `mem.` substring search or
   sort (`indexOf`, `lastIndexOf`, `count`, `replace`, `splitSequence`, `sort`, ...): their time grows with text times
   needle, or they assume a consistent comparator; the engine uses `value.Finder` (KMP) and `value.stableSort`.
+  `device-probe` flags a call that takes the GPU's architecture name, the OS version or the QA switch by name
+  outside `src/exl3/device.zig` ([the device profile](engine-kernels.md#the-device-profile)).
   `arch-test-unlisted` flags a file that declares a test and sits beside an `arch_tests.zig` that does not import
   it: the buckets select tests by listed file, so its tests would never run.
   `template-text-search` flags, outside `src/template/` and tests, a `mem.` search (`indexOf`, `count`, `startsWith`,

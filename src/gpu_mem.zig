@@ -5,6 +5,7 @@ const log = @import("log.zig");
 const metrics = @import("status.zig");
 const mlx = @import("mlx.zig");
 const bills = @import("bills.zig");
+const device = @import("sushi_exl3").device;
 
 // The host test root links no MLX: a read of the live GPU there is a bug in the test, not a number.
 const host_tier = @import("build_options").host_tier;
@@ -113,11 +114,13 @@ pub fn refreshIdleGpuFloor() void {
 /// Main thread, before other threads: resolve MLX's command-buffer cadence the way MLX does
 /// and say what it is, since MLX reads the env once and reports nothing.
 pub fn resolveMlxCadence() void {
-    const arch = mlx.deviceArchitecture();
+    const class = device.current().class;
+    var arch_buf: [64]u8 = undefined;
+    const arch = device.archName(&arch_buf);
     const env_mb: ?[]const u8 = if (std.c.getenv("MLX_MAX_MB_PER_BUFFER")) |v| std.mem.span(v) else null;
     const env_ops: ?[]const u8 = if (std.c.getenv("MLX_MAX_OPS_PER_BUFFER")) |v| std.mem.span(v) else null;
-    bills.mlx_mb_per_buffer = bills.mlxPerBufferFromEnv(env_mb, bills.mlxDefaultMbPerBuffer(arch));
-    const ops = bills.mlxPerBufferFromEnv(env_ops, bills.mlxDefaultOpsPerBuffer(arch));
+    bills.mlx_mb_per_buffer = bills.mlxPerBufferFromEnv(env_mb, bills.mlxDefaultMbPerBuffer(class));
+    const ops = bills.mlxPerBufferFromEnv(env_ops, bills.mlxDefaultOpsPerBuffer(class));
     log.info("[mem] MLX command buffers: {d} ops / {d} MB ({s}, {s}); prefill bill +{d} MB in flight\n", .{
         ops,
         bills.mlx_mb_per_buffer,

@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const host_side = @import("host_side.zig");
+const device = @import("device.zig");
 const log = @import("mlx_host").log;
 const io_util = @import("mlx_host").io_util;
 const exl3 = @import("expert_exl3.zig");
@@ -1051,7 +1052,6 @@ pub var gemm_nax_failed: bool = false;
 /// A NAX launch has worked in this process. A launch that fails after that is the launch's own failure (a pass the
 /// engine refuses by name, memory), not the arm's: it is returned, and the arm stays on.
 var gemm_nax_worked: bool = false;
-var gemm_nax_cached: ?bool = null;
 const PairPrepKey = struct { in_dim: c_int, nslots: c_int, topk: c_int };
 const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int, topk: c_int, n: u32, layout: GemvLayout, group: c_int };
 const DownFusedKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int, n: u32, layout: GemvLayout, group: c_int = 0 };
@@ -1094,37 +1094,8 @@ pub fn fusedDispatchCount() u32 {
     return fused_dispatches;
 }
 
-fn gpuArch(buf: []u8) ?[]const u8 {
-    var dev = mlx.mlx_device{ .ctx = null };
-    if (mlx.mlx_get_default_device(&dev) != 0) return null;
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) != 0) return null;
-    var cstr: [*:0]const u8 = undefined;
-    if (mlx.mlx_device_info_get_string(&cstr, info, "architecture") != 0) return null;
-    const arch = std.mem.span(cstr);
-    if (arch.len == 0 or arch.len > buf.len) return null;
-    @memcpy(buf[0..arch.len], arch);
-    return buf[0..arch.len];
-}
-
-var force_fallback_cached: ?bool = null;
-
-// Tests flip the env between calls; a served process reads it once.
-fn forceFamilyFallback() bool {
-    if (!@import("builtin").is_test) if (force_fallback_cached) |v| return v;
-    const v = if (std.c.getenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK")) |p| p[0] == '1' else false;
-    force_fallback_cached = v;
-    return v;
-}
-
 pub fn gemmNaxOn() bool {
     return !gemm_nax_failed and gemmNaxAvailable();
-}
-
-/// A test's process as one that has not asked the GPU's architecture yet.
-pub fn forgetGpuArchForTest() void {
-    gemm_nax_cached = null;
 }
 
 /// Builds and proves the NAX GEMM kernel of `dec` and `order` now, on `s`, the stream the forwards run on: the proof
@@ -1147,24 +1118,7 @@ pub fn prepareGemmNax(dec: exl3.Decode, order: TileOrder, s: mlx.mlx_stream) !vo
 // Capability is independent of the dispatch failure latch: tests must still
 // probe the real kernel after an earlier dispatch fell back to SIMD.
 fn gemmNaxAvailable() bool {
-    if (forceFamilyFallback()) return false;
-    if (gemm_nax_cached) |v| return v;
-    var buf: [128]u8 = undefined;
-    const arch = gpuArch(&buf) orelse {
-        gemm_nax_cached = false;
-        return false;
-    };
-    var i: usize = 0;
-    while (i + 2 < arch.len) : (i += 1) {
-        const a = arch[i] | 32;
-        const b = arch[i + 1] | 32;
-        if (a == 'g' and b == '1' and arch[i + 2] >= '7' and arch[i + 2] <= '9') {
-            gemm_nax_cached = true;
-            return true;
-        }
-    }
-    gemm_nax_cached = false;
-    return false;
+    return device.current().has(.matrix_g17);
 }
 
 fn getGemmNaxKernel() !mlx.mlx_fast_metal_kernel {
@@ -4357,8 +4311,8 @@ test "exl3 sorted GEMM matches host MUL1 with the NAX arm forced off" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     if (!gemmNaxOn()) return error.SkipZigTest;
-    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
-    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    const simd_only = device.withProfile(device.simdOnly());
+    defer simd_only.end();
     try t.expect(!gemmNaxOn());
     const fixture = exl3.fixtures.k4;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
@@ -5245,8 +5199,8 @@ test "exl3 sorted GEMM matches the host tile decode at a fractional rate with th
     const t = std.testing;
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
     if (!gemmNaxOn()) return error.SkipZigTest;
-    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
-    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    const simd_only = device.withProfile(device.simdOnly());
+    defer simd_only.end();
     try t.expect(!gemmNaxOn());
     for (0..PARITY_SEEDS) |i| {
         try sortedGemmParity(.{ .n = 40 }, .mcg, 32, 401 + i);
@@ -5281,8 +5235,8 @@ test "exl3 sorted GEMM matches the host tile decode at a narrowed window with th
     const t = std.testing;
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
     if (!gemmNaxOn()) return error.SkipZigTest;
-    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
-    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    const simd_only = device.withProfile(device.simdOnly());
+    defer simd_only.end();
     try t.expect(!gemmNaxOn());
     for (0..PARITY_SEEDS) |i| {
         try sortedGemmParity(.{ .n = 40 }, .{ .codebook = .mcg, .window = .w12 }, 32, 1001 + i);
@@ -5293,7 +5247,7 @@ test "exl3 sorted GEMM matches the host tile decode at a narrowed window with th
 test "exl3 sorted GEMM: the simdgroup-matrix body and the scalar body both match the host tile decode" {
     const t = std.testing;
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
-    var env: FallbackEnv = .{};
+    var env: SimdOnly = .{};
     env.force();
     defer env.restore();
     try t.expect(!gemmNaxOn());
@@ -5367,7 +5321,7 @@ test "exl3 sorted GEMM: tile-major tiles write the pack order's bytes in the NAX
                     defer _ = mlx.mlx_array_free(tab.starts);
                     defer _ = mlx.mlx_array_free(tab.nlives);
                     for (0..3) |body| {
-                        var env: FallbackEnv = .{};
+                        var env: SimdOnly = .{};
                         if (body > 0) env.force();
                         defer if (body > 0) env.restore();
                         gemm_simdmat_force = body == 1;
@@ -5932,13 +5886,12 @@ test "mimo_v2 EXL3 prefill rows match the fused decode arm on every GEMM arm" {
         .seed = 1601,
     };
     for ([_]bool{ true, false }) |nax_off| {
+        var simd_only: SimdOnly = .{};
+        defer simd_only.restore();
         if (nax_off) {
             if (!gemmNaxOn()) continue;
-            _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
+            simd_only.force();
         }
-        defer if (nax_off) {
-            _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
-        };
         for ([_]?[*:0]const u8{ null, "16" }) |win| {
             for ([_]bool{ true, false }) |aligned| try withGemmWindow(win, aligned, base);
         }
@@ -6321,22 +6274,15 @@ test "exl3 a novel row count does not compile another sorted GEMM" {
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
-/// Forces the non-NAX arms for one test and puts back whatever the caller's environment held.
-const FallbackEnv = struct {
-    prior: [64:0]u8 = @splat(0),
-    had: bool = false,
-    fn force(self: *FallbackEnv) void {
-        if (std.c.getenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK")) |p| {
-            const v = std.mem.span(p);
-            if (v.len > self.prior.len) @panic("SUSHI_FORCE_GPU_FAMILY_FALLBACK is too long to restore");
-            @memcpy(self.prior[0..v.len], v);
-            self.prior[v.len] = 0;
-            self.had = true;
-        }
-        _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
+/// Withholds the matrix units for part of a test.
+const SimdOnly = struct {
+    scope: ?device.Scope = null,
+    fn force(self: *SimdOnly) void {
+        self.scope = device.withProfile(device.simdOnly());
     }
-    fn restore(self: *FallbackEnv) void {
-        if (self.had) _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", &self.prior, 1) else _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    fn restore(self: *SimdOnly) void {
+        if (self.scope) |scope| scope.end();
+        self.scope = null;
     }
 };
 
@@ -6734,7 +6680,7 @@ test "exl3 n40 NAX BF16 prefill no worse than composite against f32 truth" {
 
 test "exl3 BF16 prefill on the simdgroup-matrix body no worse than composite against f32 truth" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
-    var env: FallbackEnv = .{};
+    var env: SimdOnly = .{};
     env.force();
     defer env.restore();
     gemm_simdmat_engaged = false;
@@ -7638,7 +7584,7 @@ test "exl3 every admitted rate takes the fast arms, bit-identical to the generic
         try moeChainBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = n }, .dec = w12, .seed = 618 + n, .banks = SERVED_W12_BANKS, .x_scale = 3 });
         naxBodyBytesMatch(.{ .n = n }, w12, 256, 256, 818 + n) catch |e| if (e != error.SkipZigTest) return e;
         for ([_]bool{ false, true }) |fallback| {
-            var env: FallbackEnv = .{};
+            var env: SimdOnly = .{};
             if (fallback) env.force();
             defer if (fallback) env.restore();
             funnel_engaged = @splat(false);
@@ -7696,7 +7642,7 @@ test "exl3 every K1.5 to K2 rate takes the fast arms at every window, bit-identi
             try moeChainBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = n }, .dec = dec, .seed = seed, .banks = SERVED_W12_BANKS, .x_scale = 3 });
             naxBodyBytesMatch(.{ .n = n }, dec, 256, 256, seed) catch |e| if (e != error.SkipZigTest) return e;
             for ([_]bool{ false, true }) |fallback| {
-                var env: FallbackEnv = .{};
+                var env: SimdOnly = .{};
                 if (fallback) env.force();
                 defer if (fallback) env.restore();
                 funnel_engaged = @splat(false);
@@ -7718,7 +7664,7 @@ test "exl3 PAIR1 prefill GEMM holds the host-decode parity bar on the NAX, simdg
     for ([_]exl3.Rate{ .{ .n = 24 }, .{ .n = 32 }, .{ .n = 42 }, .{ .n = 48 }, exl3.Rate.fromK(4) }) |rate| {
         naxBodyBytesMatch(rate, PAIR1_W16, 2560, 640, 900 + rate.n) catch |e| if (e != error.SkipZigTest) return e;
         for ([_]?bool{ null, true, false }) |simdmat| {
-            var env: FallbackEnv = .{};
+            var env: SimdOnly = .{};
             if (simdmat != null) env.force();
             defer if (simdmat != null) env.restore();
             gemm_simdmat_force = simdmat;
@@ -7836,7 +7782,7 @@ fn foldBytesMatch(c: MoeCase, arm: FoldArm) !void {
     prepared_mid_force = arm.prepared;
     grouped_off_for_test = arm.grouped_off;
     funnel_off_for_test = arm.funnel_off;
-    var env: FallbackEnv = .{};
+    var env: SimdOnly = .{};
     if (arm.scalar_gemm) {
         env.force();
         gemm_simdmat_force = false;
@@ -7923,7 +7869,7 @@ test "exl3 SPEC1 per-rate table: the prefill GEMM holds the host-decode parity b
     for ([_]exl3.Rate{ .{ .n = 24 }, .{ .n = 32 }, .{ .n = 42 }, .{ .n = 48 }, .{ .n = 64 } }) |rate| {
         naxBodyBytesMatch(rate, SPEC1_PER_RATE, 2560, 640, 900 + rate.n) catch |e| if (e != error.SkipZigTest) return e;
         for ([_]?bool{ null, true, false }) |simdmat| {
-            var env: FallbackEnv = .{};
+            var env: SimdOnly = .{};
             if (simdmat != null) env.force();
             defer if (simdmat != null) env.restore();
             gemm_simdmat_force = simdmat;
@@ -7983,7 +7929,7 @@ test "exl3 SPEC1 below K1.5 and above K4: the prefill GEMM, the decode chain and
             const rate: exl3.Rate = .{ .n = n };
             naxBodyBytesMatch(rate, dec, 2560, 640, 900 + n) catch |e| if (e != error.SkipZigTest) return e;
             for ([_]?bool{ null, true, false }) |simdmat| {
-                var env: FallbackEnv = .{};
+                var env: SimdOnly = .{};
                 if (simdmat != null) env.force();
                 defer if (simdmat != null) env.restore();
                 gemm_simdmat_force = simdmat;
@@ -8467,7 +8413,7 @@ test "exl3 Sushi GPU decode and prefill match scalar truth at K1 K1.5 K3 K5 K8" 
                 }
                 prepared_mid_force = null;
                 for (0..3) |arm| {
-                    var env: FallbackEnv = .{};
+                    var env: SimdOnly = .{};
                     if (arm != 0) env.force();
                     defer if (arm != 0) env.restore();
                     gemm_simdmat_force = arm != 2;

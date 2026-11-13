@@ -2572,7 +2572,7 @@ test "a hold that finds MLX as its allocator was last read asks it nothing; afte
     // A reading changes nothing in MLX.
     var held_bytes: usize = 0;
     try mlx.check(mlx.mlx_get_active_memory(&held_bytes));
-    _ = mlx.deviceArchitecture();
+    _ = mlx.maxRecommendedWorkingSet();
     calls = mlxCalls();
     hold();
     unhold();

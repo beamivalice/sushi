@@ -81,7 +81,7 @@ pub const Unported = enum { vector_kernels, split_k, simd_tiles };
 
 /// Which plan MLX picks for `m` rows against an `n` by `k` weight, when it is one this port lacks.
 pub fn unported(g: matmul.Gpu, m: usize, n: usize, k: usize, group: usize, dtype: core.Dtype) ?Unported {
-    if (g.gen < 17 or g.class == 'd') return .simd_tiles;
+    if (g.gen < 17 or g.class == .d) return .simd_tiles;
     if (m < vectorLimit(k, n)) return .vector_kernels;
     if (splitsK(m, n, k, group)) return .split_k;
     if (!g.nax or k % 64 != 0 or (dtype == .float32 and !g.tf32)) return .simd_tiles;

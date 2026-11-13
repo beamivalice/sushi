@@ -4,7 +4,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
-const metal = @import("../metal.zig");
+const device = @import("sushi_exl3").device;
 const load_clock = @import("../load_clock.zig");
 const manifest = @import("../pipeline_manifest.zig");
 const model_mod = @import("../model.zig");
@@ -57,7 +57,7 @@ pub fn buildKey(a: std.mem.Allocator, io: std.Io) ![16]u8 {
     var d: manifest.Digest = .{};
     var arch_buf: [64]u8 = undefined;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    try manifest.addBuild(&d, a, io, (try metal.device()).architecture(&arch_buf), try mlx.engine.metallibPath(&path_buf));
+    try manifest.addBuild(&d, a, io, device.archName(&arch_buf), try mlx.engine.metallibPath(&path_buf));
     return d.hex();
 }
 

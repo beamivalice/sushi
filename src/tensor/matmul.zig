@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const metal = @import("../metal.zig");
 const mlx = @import("../mlx.zig");
 const core = @import("core.zig");
+const device = @import("sushi_exl3").device;
 const ops = @import("ops.zig");
 const stock = @import("stock.zig");
 
@@ -15,9 +16,9 @@ const Tensor = core.Tensor;
 const Error = core.Error;
 const max_batch = core.max_dims;
 
-/// The GPU as MLX's dispatch reads it: the last letter of its architecture name, its generation, and whether the
-/// NAX kernels run (macOS 26.2 is this engine's floor) and take f32.
-pub const Gpu = struct { class: u8, gen: u32, nax: bool, tf32: bool };
+/// The GPU as MLX's dispatch reads it: its class letter, its generation, and whether the NAX kernels run (macOS 26.2
+/// is this engine's floor) and take f32.
+pub const Gpu = struct { class: device.Class, gen: u32, nax: bool, tf32: bool };
 
 var gpu_known: ?Gpu = null;
 
@@ -29,25 +30,14 @@ fn atoi(text: []const u8) i64 {
 
 pub fn gpu() Error!Gpu {
     if (gpu_known) |g| return g;
-    var buf: [64]u8 = undefined;
-    var name: []const u8 = (try metal.device()).architecture(&buf);
-    // MLX's own overrides, read as MLX reads them.
-    if (std.c.getenv("MLX_METAL_GPU_ARCH")) |forced| {
-        if (std.mem.span(forced).len > 0) name = std.mem.span(forced);
-    }
-    const digit = struct {
-        fn of(c: u8) u32 {
-            return if (std.ascii.isDigit(c)) c - '0' else 0;
-        }
-    }.of;
-    const gen: u32 = if (name.len >= 3) digit(name[name.len - 3]) * 10 + digit(name[name.len - 2]) else 0;
-    const class: u8 = if (name.len > 0) name[name.len - 1] else 0;
+    const p = device.current();
+    // MLX's own override, read as MLX reads it.
     var tf32 = if (std.c.getenv("MLX_ENABLE_TF32")) |v| atoi(std.mem.span(v)) != 0 else true;
-    const nax = gen >= @as(u32, if (class == 'p') 18 else 17);
+    const nax = p.chip.contains(.matrix_g17);
     if (comptime builtin.is_test) {
         if (nax) tf32 = mlxTf32() catch tf32;
     }
-    gpu_known = .{ .class = class, .gen = gen, .nax = nax, .tf32 = tf32 };
+    gpu_known = .{ .class = p.class, .gen = p.generation, .nax = nax, .tf32 = tf32 };
     return gpu_known.?;
 }
 
@@ -439,7 +429,7 @@ fn gemv(c: Call) Error!void {
 /// MLX's `steel_matmul`: two matrices, by the tiled kernels.
 fn steel(c: Call) Error!void {
     const use_nax = c.g.nax and (c.g.tf32 or c.out.dtype != .float32);
-    const threshold: usize = if (c.g.class == 's' or c.g.class == 'd') 2048 else 1024;
+    const threshold: usize = if (c.g.class == .s or c.g.class == .d) 2048 else 1024;
     const big = @max(c.arm_m, c.n);
     if (!use_nax and c.batch_out == 1 and ((c.arm_m + 15) / 16) * ((c.n + 15) / 16) <= threshold and c.k / 16 >= 8 and c.k >= big) return splitK(c);
     if (use_nax and c.batch_out == 1 and (c.k >= 3 * big or (big <= 1024 and c.k > 2 * big))) return splitKNax(c);
@@ -490,9 +480,9 @@ fn fused(c: Call) Error!void {
     const half = c.out.dtype != .float32;
     const nt_tile: Tile = .{ .bm = 64, .bn = 32, .bk = 32, .wm = 2, .wn = 2 };
     const half_tile: Tile = .{ .bm = 64, .bn = 64, .bk = 16, .wm = 1, .wn = 2 };
-    if (c.g.class == 'g' or c.g.class == 'p') {
+    if (c.g.class == .g or c.g.class == .p) {
         if (nt) t = nt_tile else if (half) t = half_tile;
-    } else if (c.g.class == 'd') {
+    } else if (c.g.class == .d) {
         if (c.batch_out * c.arm_m * c.n >= 1 << 20) {
             if (half) {
                 t = if (2 * @max(c.arm_m, c.n) > c.k) half_tile else if (nt) nt_tile else .{ .bm = 32, .bn = 64, .bk = 16, .wm = 1, .wn = 2 };
@@ -510,16 +500,16 @@ fn fused(c: Call) Error!void {
 fn fusedNax(c: Call) Error!void {
     var t: Tile = .{ .bm = 128, .bn = 128, .bk = 512, .wm = 4, .wn = 4 };
     const class = c.g.class;
-    if (class == 's' or class == 'c') {
+    if (class == .s or class == .c) {
         t.bk = if (c.k >= 8192 and c.k > c.arm_m + c.n) 64 else 256;
         t.bm = 64;
         t.wm = 2;
-    } else if (class == 'd') {
+    } else if (class == .d) {
         t = if (c.n > c.arm_m) .{ .bm = 128, .bn = 64, .bk = 512, .wm = 4, .wn = 2 } else .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4 };
     }
     const tiles_m = (c.m + t.bm - 1) / t.bm;
     var swizzle: u5 = if (tiles_m <= 3) 0 else 1;
-    if (class == 's' or class == 'c') swizzle = 2 else if (class == 'd') swizzle = if (c.m > c.n) 0 else 2;
+    if (class == .s or class == .c) swizzle = 2 else if (class == .d) swizzle = if (c.m > c.n) 0 else 2;
     return fusedLaunch(c, "steel_gemm_fused_nax", t, swizzle);
 }
 
@@ -660,7 +650,7 @@ fn splitK(c: Call) Error!void {
 fn splitKNax(c: Call) Error!void {
     var t: Tile = .{ .bm = 128, .bn = 128, .bk = 512, .wm = 4, .wn = 4 };
     var part_size: usize = 4096;
-    const ultra = c.g.class == 'd';
+    const ultra = c.g.class == .d;
     if (ultra) {
         if (c.arm_m <= 2048 and c.n <= 2048) {
             t = .{ .bm = 64, .bn = 64, .bk = 256, .wm = 2, .wn = 2 };

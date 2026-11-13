@@ -8,6 +8,7 @@ const verify_moe = @import("verify_moe.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const fp8_block = @import("fp8_block.zig");
 const sushi_exl3 = @import("sushi_exl3");
+const device = sushi_exl3.device;
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
@@ -357,21 +358,17 @@ pub fn idleGpuFloor(stored: u64, in_use_system: u64, mlx_active: u64, mlx_cache:
 pub const BILL_FIT_MB_PER_BUFFER: u64 = 50;
 
 /// MLX's per-buffer defaults by architecture suffix (`mlx/backend/metal/device.cpp`).
-pub fn mlxDefaultMbPerBuffer(arch: []const u8) u64 {
-    if (arch.len == 0) return 40;
-    return switch (arch[arch.len - 1]) {
-        'p', 'g' => 40,
-        's', 'd' => 50,
+pub fn mlxDefaultMbPerBuffer(class: device.Class) u64 {
+    return switch (class) {
+        .s, .d => 50,
         else => 40,
     };
 }
 
-pub fn mlxDefaultOpsPerBuffer(arch: []const u8) u64 {
-    if (arch.len == 0) return 40;
-    return switch (arch[arch.len - 1]) {
-        'p' => 20,
-        'g' => 40,
-        's', 'd' => 50,
+pub fn mlxDefaultOpsPerBuffer(class: device.Class) u64 {
+    return switch (class) {
+        .p => 20,
+        .s, .d => 50,
         else => 40,
     };
 }
@@ -2778,10 +2775,10 @@ test "the bill plans the non-MLX GPU floor and the command-buffer size" {
     try t.expectEqual(@as(u64, 0), cadenceInflightBytes(40));
     try t.expectEqual(@as(u64, 950 * mb * 9 / 8), cadenceInflightBytes(1000));
     // MLX's table and env reading.
-    try t.expectEqual(@as(u64, 50), mlxDefaultMbPerBuffer("applegpu_g13s"));
-    try t.expectEqual(@as(u64, 50), mlxDefaultMbPerBuffer("applegpu_g13d"));
-    try t.expectEqual(@as(u64, 40), mlxDefaultMbPerBuffer("applegpu_g13g"));
-    try t.expectEqual(@as(u64, 20), mlxDefaultOpsPerBuffer("applegpu_g14p"));
+    try t.expectEqual(@as(u64, 50), mlxDefaultMbPerBuffer(.s));
+    try t.expectEqual(@as(u64, 50), mlxDefaultMbPerBuffer(.d));
+    try t.expectEqual(@as(u64, 40), mlxDefaultMbPerBuffer(.g));
+    try t.expectEqual(@as(u64, 20), mlxDefaultOpsPerBuffer(.p));
     try t.expectEqual(@as(u64, 1000), mlxPerBufferFromEnv("1000", 50));
     try t.expectEqual(@as(u64, 50), mlxPerBufferFromEnv("0", 50));
     try t.expectEqual(@as(u64, 50), mlxPerBufferFromEnv("lots", 50));
@@ -5902,8 +5899,8 @@ test "bill pin: the machine-limit arithmetic" {
     got.add(gpuCeilingWithWiredFloor(100 * pin_gib, 10 * pin_gib, 20 * pin_gib, 90 * pin_gib));
     got.add(cadenceInflightBytes(50));
     got.add(cadenceInflightBytes(1000));
-    got.add(mlxDefaultMbPerBuffer("applegpu_g13s"));
-    got.add(mlxDefaultOpsPerBuffer("applegpu_g14p"));
+    got.add(mlxDefaultMbPerBuffer(.s));
+    got.add(mlxDefaultOpsPerBuffer(.p));
     got.add(mlxPerBufferFromEnv("1000", 50));
     got.add(mlxCacheLimitBytes(128 * pin_gib));
     got.add(mlxCacheLimitBytes(16 * pin_gib));

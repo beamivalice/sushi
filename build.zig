@@ -892,6 +892,8 @@ fn addExl3HostCheck(b: *std.Build, target: std.Build.ResolvedTarget) [2]*std.Bui
         },
     });
     host.addImport("sushi_exl3", exl3);
+    // Sushi's own files behind the three names reach the module too (the engine's stock ops ask its device profile).
+    files.addImport("sushi_exl3", exl3);
     return .{
         b.addTest(.{ .name = "exl3-host-check-tests", .root_module = exl3, .emit_object = true }),
         b.addTest(.{ .name = "exl3-host-check-decls", .root_module = host, .emit_object = true }),
