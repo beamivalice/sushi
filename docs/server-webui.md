@@ -153,9 +153,14 @@ and the page tooltip share them.
 
 ## Dashboard charts
 
-- Fourteen half-width cards, two per row: Prompt speed | Generation speed, Requests | Response time, GPU speed and load |
+- Fifteen half-width cards, two per row: Prompt speed | Generation speed, Requests | Response time, GPU speed and load |
   Memory, Prompt cache reuse | Prompt cache storage, Draft acceptance | Prompt and generated length, Request outcomes | Why
-  requests weren't batched, Prompt cache writes | Tokens verified per round (DSpark only, hidden until picked).
+  requests weren't batched, Prompt cache writes | Tokens verified per round (DSpark only, hidden until picked), Expert
+  streaming.
+- Expert streaming reads `/metrics.json` `expert_stream` ([server-http-apis](server-http-apis.md#expert-stream-counters)):
+  bars of the routed experts found in memory and read from the SSD, since the server started; its foot gives the share in
+  memory and the SSD read rate between two polls (`expertStream`, none across a restart), the share of forward time spent
+  waiting on the SSD and the cache size. A server that streams nothing says so in the card.
 - One axis per chart: two measures of different scale get two charts (prompt and generation speed) or a common base (the GPU
   clock as a share of its top speed beside utilization). Parts of a whole stack, so the top edge is the total (Requests,
   Memory); a subset of a part is a line over the stack (answered together).

@@ -945,6 +945,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <div class="card chart" data-chart="serial"><h2><span class="tip-u" tabindex="0" data-term="serial decode reasons (decode_serial)" data-tip="Sushi can answer several requests in one shared pass (batching). These are the reasons a request was not batched and took its own pass instead, which is slower when many are running.">Why requests weren't batched</span><span class="sub">steps a request ran alone while others ran</span></h2><div class="vis" id="dashSerial"></div></div>
     <div class="card chart" data-chart="cachewrites"><h2><span class="tip-u" tabindex="0" data-term="prefix cache writes (SSD)" data-tip="How much the cache has written to the SSD, by kind of data.">Prompt cache writes</span><span class="sub">SSD, since the server started</span></h2><div class="vis" id="dashWrites"></div><div class="foot" id="dashWritesFoot">A file written again counts again; this does not measure SSD wear.</div></div>
     <div class="card chart" data-chart="specrows"><h2><span class="tip-u" tabindex="0" data-term="verifier rows per round (DSpark)" data-tip="For DSpark: how many tokens each verification round covered. One is the model's own next token; each extra one is a drafted token.">Tokens verified per round</span><span class="sub">DSpark, rounds by tokens verified</span></h2><div class="vis" id="dashSpecRows"></div></div>
+    <div class="card chart" data-chart="experts"><h2><span class="tip-u" tabindex="0" data-term="expert cache hits (streamed experts)" data-tip="For a model that streams its experts from the SSD: how often a routed expert was already in memory, and what reading the rest cost.">Expert streaming</span><span class="sub">routed experts, since the server started</span></h2><div class="vis" id="dashExperts"></div><div class="foot" id="dashExpertsFoot">Counts each layer's distinct experts once per forward.</div></div>
   </section>
   </div>
 </section>
@@ -4827,7 +4828,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
 
   let paused = false, timer = null, inflight = false, repoll = false, refetch = false, shownWindow = windowMs();
   let dashActive = false, lastData = null, bgStopped = false, lastPollAt = 0, lastServerAt = 0, failures = 0;
-  let restartNote = '', restartAt = 0, metricsOff = false, prevWrites = null, feedOffline = false;
+  let restartNote = '', restartAt = 0, metricsOff = false, prevWrites = null, prevExperts = null, feedOffline = false;
   const restarts = []; // server times the process was seen restarting, drawn on the charts
 
   $('interval').addEventListener('change', () => { store.set('interval', $('interval').value); restart(); });
@@ -4971,6 +4972,16 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       rate: prev && dt > 0 && total >= prev.total ? (total - prev.total) / dt : null,
       amplification: onDisk > 0 ? total / onDisk : null };
   }
+  // The streamed-expert counters as the card shows them: hit rates since the server started and since the previous poll,
+  // the SSD read rate between polls (null on the first poll, across a restart, and for the hit rate when nothing ran).
+  function expertStream(e, prev, now) {
+    if (!e) return null;
+    const dt = prev ? (now - prev.t) / 1000 : 0, same = prev && dt > 0 && e.routes >= prev.routes && e.ssd_read_bytes >= prev.ssd;
+    return { t: now, routes: e.routes, hits: e.hits, misses: Math.max(0, e.routes - e.hits), ssd: e.ssd_read_bytes, cacheBytes: e.cache_bytes,
+      streaming: e.engines > 0 || e.routes > 0, hitRate: e.routes ? e.hits / e.routes : null,
+      recent: same && e.routes > prev.routes ? (e.hits - prev.hits) / (e.routes - prev.routes) : null,
+      readRate: same ? (e.ssd_read_bytes - prev.ssd) / dt : null, waitShare: e.forward_ns ? e.fill_ns / e.forward_ns : null };
+  }
   function push(k, v) { series[k].push(v); }
   // Appends the server samples newer than the last one seen; returns the latest decode and prefill rates (tok/s).
   function ingestHistory(samples, fields) {
@@ -5017,7 +5028,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   // A new process: its counters, request log and history start over, so nothing derived from the old one is kept.
   function forgetProcess() {
-    histPrev = null; lastGen.clear(); propsAt = 0; prevWrites = null;
+    histPrev = null; lastGen.clear(); propsAt = 0; prevWrites = null; prevExperts = null;
     finished.length = 0; reqs.length = 0; specReqs.length = 0; seenReq.clear(); lastReq.pre = lastReq.dec = null;
   }
   // Mean speed since the server started, shown until a request has finished while the page was watching.
@@ -5048,13 +5059,15 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     for (const p of modelProps.values()) if (p && typeof p === 'object') onDisk += p.settings?.prefix_cache?.disk_used_bytes || 0;
     const writes = prefixWrites(d.prefix_cache_writes, prevWrites, now, onDisk);
     prevWrites = writes || prevWrites;
-    lastData = { d, now, gen, pre, writes };
+    const experts = expertStream(d.expert_stream, prevExperts, now);
+    prevExperts = experts || prevExperts;
+    lastData = { d, now, gen, pre, writes, experts };
     if (dashActive) render(lastData);
   }
 
-  function render({ d, now, gen, pre, writes }) {
+  function render({ d, now, gen, pre, writes, experts }) {
     renderCompact();
-    if (!feedOffline) renderCards(d, writes);
+    if (!feedOffline) renderCards(d, writes, experts);
     // The Advanced cards are display:none in Compact; they are filled when the toggle shows them.
     if (document.body.dataset.mode === 'compact') { drawAll(); return; }
     if (feedOffline) {
@@ -5084,7 +5097,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
 
   // The chart cards that are not canvases. A card that is hidden is not filled until it is shown.
-  function renderCards(d, writes) {
+  function renderCards(d, writes, experts) {
     const c = d.counters || {}, g = d.gauges || {}, h = d.histograms || {}, on = cardOn;
     const tip = (t, rows, help, term) => ({ t, rows, h: help, term });
     const tc = d.prefix_cache_tiers || {};
@@ -5099,6 +5112,15 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       bars('writes', rows, writes ? 'Nothing written yet' : NOT_REPORTED);
       const known = writes ? [writes.rate != null && 'SSD writes ' + bytes(writes.rate) + '/s', writes.amplification != null && fmt(writes.amplification, 1) + 'x written per byte kept'].filter(Boolean) : [];
       put($('writes-foot'), (known.length ? known.join(', ') + '. ' : '') + 'A file written again counts again; this does not measure SSD wear.');
+    }
+    if (on('experts')) {
+      const x = experts, pct = v => v == null ? '-' : fmt(100 * v, 0) + '%';
+      const rows = x?.routes ? [['In memory', x.hits, `${pct(x.hits / x.routes)} · ${compact(x.hits)}`, '--ok', tip('In memory', [['Experts', fmtInt(x.hits)], ['Share', pct(x.hits / x.routes)]], 'Routed experts a forward found already in the expert cache in memory.', 'expert cache hits')],
+        ['Read from the SSD', x.misses, `${pct(x.misses / x.routes)} · ${compact(x.misses)}`, '--warn', tip('Read from the SSD', [['Experts', fmtInt(x.misses)], ['Share', pct(x.misses / x.routes)]], 'Routed experts a forward had to read from the SSD before it could run them.', 'expert cache misses')]] : [];
+      bars('experts', rows, !x ? NOT_REPORTED : x.streaming ? 'No streamed forward yet' : 'No loaded model streams its experts from the SSD', x?.routes);
+      const known = x?.routes ? [x.recent != null && `${pct(x.recent)} in memory lately`, x.readRate != null && 'SSD reads ' + bytes(x.readRate) + '/s',
+        x.waitShare != null && `${pct(x.waitShare)} of forward time waiting on the SSD`, x.cacheBytes > 0 && `cache ${bytes(x.cacheBytes)}`].filter(Boolean) : [];
+      put($('experts-foot'), known.length ? known.join(', ') + '.' : 'Counts each layer\'s distinct experts once per forward.');
     }
     if (on('outcomes')) {
       const row = (l, k, color, help) => [l, c[k] || 0, fmtInt(c[k]), color, tip(l, [['Requests', fmtInt(c[k])]], help, k)];
@@ -5821,7 +5843,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // Advanced all but the DSpark-only card.
   const CHARTS = [['prefill', 'Prompt speed'], ['decode', 'Generation speed'], ['requests', 'Requests'], ['latency', 'Response time'], ['gpu', 'GPU speed and load'], ['memory', 'Memory'],
     ['cachereuse', 'Prompt cache reuse'], ['cachetiers', 'Prompt cache storage'], ['specaccept', 'Draft acceptance'], ['length', 'Prompt and generated length'], ['outcomes', 'Request outcomes'],
-    ['serial', "Why requests weren't batched"], ['cachewrites', 'Prompt cache writes'], ['specrows', 'Tokens verified per round']];
+    ['serial', "Why requests weren't batched"], ['cachewrites', 'Prompt cache writes'], ['specrows', 'Tokens verified per round'], ['experts', 'Expert streaming']];
   const COMPACT_SET = ['prefill', 'decode', 'memory', 'gpu'], ADVANCED_OFF = ['specrows'], ALL = CHARTS.map(c => c[0]);
   // Cards merged into another: a stored choice that names them reads as the card that replaced them.
   const MERGED = { memsplit: 'memory', specmodes: 'specaccept', cachetok: 'cachereuse', ttft: 'latency', e2e: 'latency', ptok: 'length', otok: 'length' };
@@ -5845,7 +5867,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     order().forEach((id, i) => { const c = cardOf(id); if (grid.children[i] !== c) grid.insertBefore(c, grid.children[i] ?? null); c.hidden = !cardOn(id); });
     for (const box of $('pick-list').querySelectorAll('input')) box.checked = cardOn(box.dataset.chart);
     markEnds();
-    if (dashActive && lastData && !feedOffline) renderCards(lastData.d, lastData.writes);
+    if (dashActive && lastData && !feedOffline) renderCards(lastData.d, lastData.writes, lastData.experts);
     drawAll();
   }
   grid.addEventListener('keydown', e => {

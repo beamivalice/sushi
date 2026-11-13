@@ -415,6 +415,14 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
   Unlike the request counters they run from process start whatever turns metrics on, and the routes keep the 503-while-off
   rule. `/props settings.prefix_cache.disk_written_bytes` is that model's own total since its tier opened (`disk_stats`,
   the same sequence-locked publish as `disk_used_bytes`), so an unload and reload restarts it while the process total keeps it.
+- <a id="expert-stream-counters"></a>**Streamed-expert counters** (`expert_stats.zig`; from process start like the write
+  counters, the routes keep the 503-while-off rule): `/metrics.json` carries `"expert_stream":{"engines":n,
+  "cache_bytes":n,"forwards":n,"forward_ns":n,"routes":n,"hits":n,"fill_bytes":n,"fill_ns":n,"ssd_read_bytes":n}` after
+  `speculative`. `routes` counts each layer's distinct routed experts once per forward and `hits` those already in the
+  expert cache; `fill_*` is what the forwards waited on, `ssd_read_bytes` every read the engines issued, the prefetcher's
+  included; `engines` and `cache_bytes` are the loaded streaming models now. A forward that fails is not counted.
+  `/metrics`: `sushi:expert_stream_cache_bytes` and `sushi:expert_stream_{forwards,routes,hits,fill_bytes,ssd_read_bytes}_total`,
+  `sushi:expert_stream_{forward,fill}_seconds_total`.
 - <a id="speculative-and-tier-counters"></a>**Speculative and tier counters** (`spec_stats.zig`, `cache_stats.zig`; like the write counters they run from process
   start, and the routes keep the 503-while-off rule). `/metrics.json` carries, after `prefix_cache_writes`:
   - `"prefix_cache_tiers":{"hits":{"hot":n,"ssd":n},"evictions":{...},"evicted_bytes":{...},"hot_bytes":n}`: requests

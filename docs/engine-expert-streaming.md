@@ -14,6 +14,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 |---|---|
 | `src/expert_stream.zig` | `ExpertStore` spans, per-layer group-exact LRU + union bridge, zero-copy slabs, `GroupedLayer` (a rate-grouped layer's pools), `BudgetLedger` (`--ssd-budget-gb`), MTP refusal |
 | `src/expert_store.zig` | `QuantStore`: every routed bank of every layout as per-expert byte spans in the source shards, opened once per load from the safetensors index; `src/expert_quant.zig` re-exports it. EXL3/STQ key and span reading is `src/exl3/pack.zig`; the `--drop-expert` set it bills against is `src/expert_drop.zig` |
+| `src/expert_stats.zig` | process counters every engine's `finishForward` adds to (routes, hits, fill bytes and time, every SSD read, the live engines' cache bytes); `/metrics`, `/metrics.json` `expert_stream` and the dashboard's Expert streaming card read them ([server-http-apis](server-http-apis.md#expert-stream-counters)) |
 | `src/expert_io.zig` | SSD→Metal I/O: F_NOCACHE positioned-read `FillPool`, `PageSlab` epoch leases, verified zero-copy `importSlab` (MLX wraps the slab, or the engine of our own when the stream that asks is the engine's: [engine-own-forward](engine-own-forward.md)) |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab |
 | `src/glm5/glm5_stream.zig` | GLM's routed experts over the engine (BF16, FP8 or EXL3 slabs), the native teacher's capture budget |
