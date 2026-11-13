@@ -2353,7 +2353,7 @@ fn renderButtonsAndLog(dir: []const u8) void {
         \\2026-11-04 09:13:20 [warn] [admission] prefill chunk lowered to 2048 for the free memory
         \\2026-11-04 09:13:31 [info] [spec-stats] accepted 2.31 of 3 drafted
         \\2026-11-04 09:13:34 [info] -> 288 tokens, 142.6 tok/s decode
-        \\2026-11-04 09:14:02 [error] jinja error: unknown filter 'tojson_pretty'
+        \\2026-11-04 09:14:02 [error] [load] chat template: line 1 column 12: unsupported filter 'tojson_pretty'
         \\2026-11-04 09:14:40 [info] [hot-cache] kept 3 entries, 1.2 GB
         \\
     ;

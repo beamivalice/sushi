@@ -1,5 +1,5 @@
 //! Test-only: a chat template's context written as the JSON text the server once handed the engine. The oracle keys
-//! its cases by that text and feeds it to Python and jinja.cpp, and the serializer tests pin it; the served binary
+//! its cases by that text and feeds it to Python, and the serializer tests pin it; the served binary
 //! never compiles this file (the check below fails any build that does).
 const std = @import("std");
 const builtin = @import("builtin");

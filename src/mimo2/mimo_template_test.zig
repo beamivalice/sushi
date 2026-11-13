@@ -1,4 +1,4 @@
-//! MiMo-V2.6's own chat template, rendered through jinja.cpp: late system turns, tools and XML tool history.
+//! MiMo-V2.6's own chat template, rendered through the template engine: late system turns, tools and XML tool history.
 const std = @import("std");
 const chat = @import("../chat.zig");
 const fixtures = @import("mimo_fixtures.zig");

@@ -2112,17 +2112,14 @@ test "format corpus: history round-trip serialization survives any byte content"
     // Inverse direction of the corpus: everything a model emits (and every
     // tool result an agent echoes back) re-enters the NEXT request's history
     // and is serialized by chat.messagesJsonForTest into the JSON that the
-    // C++ Jinja engine (nlohmann, strict) parses. 2026-06-11 pi/gemma-4-31b
-    // failure: a tool result with a raw ESC byte (`\x1b[?25l`, ANSI
-    // hide-cursor from an interactive npm CLI) produced invalid JSON →
-    // jinja_render_chat returned NULL → silent fallback to the wrong prompt
-    // format → the model hallucinated whole conversations.
+    // template oracle keys its cases by. A raw ESC byte (`\x1b[?25l`, ANSI
+    // hide-cursor from an interactive npm CLI) once made that JSON invalid,
+    // and the C++ engine of the time fell back to the wrong prompt format.
     //
     // Invariants, for every corpus entry's raw text AND hostile tool-result
     // samples:
     //   1. The serialized form contains NO raw control byte (< 0x20) and is
-    //      well-formed UTF-8 — the strictest parser downstream (nlohmann)
-    //      rejects either one, with the same silent fallback.
+    //      well-formed UTF-8: a strict JSON parser rejects either one.
     //   2. A strict JSON parse round-trips every content byte exactly, except
     //      that ill-formed UTF-8 (which no prompt can carry) becomes U+FFFD.
     const allocator = testing.allocator;

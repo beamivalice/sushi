@@ -1,6 +1,6 @@
 //! The template oracle: every call `chat.formatChat` makes into the template engine over a corpus of requests,
 //! through each served template, rendered by Python Jinja2 under transformers' chat-template rules
-//! (`tests/dump_template_oracle.py`, committed as `fixtures/template_oracle.json`) and by jinja.cpp.
+//! (`tests/dump_template_oracle.py`, committed as `fixtures/template_oracle.json`).
 //!
 //! The requests: the shapes of the template tests in `format_corpus_test.zig` and its recorded model outputs,
 //! `fixtures/tool_traffic.jsonl` (every tools table and a selection of its outputs), the V4.1 encoder cases of
@@ -10,7 +10,6 @@
 
 const std = @import("std");
 const testing = std.testing;
-const jinja_c = @import("jinja_c");
 const zig_template = @import("template/template.zig");
 const chat = @import("chat.zig");
 const arch_chat = @import("arch/chat.zig");
@@ -664,87 +663,6 @@ test "template oracle: the corpus is every call formatChat makes into the engine
     if (unreached > 0) return error.OracleFixtureStale;
 }
 
-/// A case where jinja.cpp's render is not Python's, and why. Every listed case must still differ.
-const Difference = struct { case: []const u8, what: []const u8, why: []const u8 };
-
-const number_what = "tojson of a number in the tools list and the call arguments: jinja.cpp writes a float that holds an integer " ++
-    "without its `.0` (1.0 -> 1, 1E5 -> 100000, -0.0 -> -0), any other float to six significant digits " ++
-    "(3.141592653589793 -> 3.14159, 1.7976931348623157e308 -> 1.79769e+308, 5e-324 -> 4.94066e-324), an integer past " ++
-    "2^64-1 as such a float (18446744073709551616 -> 1.84467e+19, 10^29 -> 1e+29), and 2^64-1 as -1";
-const filled_what = "tojson of the integer 18446744073709551616 in a tools list whose missing keys formatChat filled (a tool " ++
-    "had no description): jinja.cpp writes 1.84467e+19";
-const number_why = "jinja.cpp keeps a JSON number as an int64 or a double (an unsigned past 2^63 wraps, a larger integer " ++
-    "becomes a double) and prints a double with %g; transformers' tojson is json.dumps over Python's int and float, " ++
-    "which print exactly. Python is right. A served prompt has these bytes only when a client's tool schema or call " ++
-    "arguments carry such a number; no recorded request does.";
-
-const differences = [_]Difference{
-    .{ .case = "a4f63c214f484b68b135e51d", .what = number_what, .why = number_why }, // qwen38_flash_next, thinking true
-    .{ .case = "ce5b77f2cc9d42325822694f", .what = number_what, .why = number_why }, // qwen38_flash_next, thinking false
-    .{ .case = "7edccf3fcc3a12ea107d1913", .what = number_what, .why = number_why }, // glm53, thinking true
-    .{ .case = "e7b17f16d6be96b433531339", .what = number_what, .why = number_why }, // glm53, thinking false
-    .{ .case = "d63a1a94383b5293e3238fe1", .what = number_what, .why = number_why }, // mimo_v26, thinking true
-    .{ .case = "0885ebb8423c54c30f524565", .what = number_what, .why = number_why }, // mimo_v26, thinking false
-    .{ .case = "ca48cb49cf7a32bb3e8f0bec", .what = number_what, .why = number_why }, // dsv41, thinking true
-    .{ .case = "095f228afd32b3a8d0218f79", .what = number_what, .why = number_why }, // dsv41, thinking false
-    .{ .case = "d409857ee965d2a05873e9cd", .what = filled_what, .why = number_why }, // qwen38_flash_next, thinking true
-    .{ .case = "915a88f33d13cefdd96654a4", .what = filled_what, .why = number_why }, // qwen38_flash_next, thinking false
-    .{ .case = "9245030cd0fa62de0c8e8536", .what = filled_what, .why = number_why }, // glm53, thinking true
-    .{ .case = "af5ce95c5b0319468b4b73d2", .what = filled_what, .why = number_why }, // glm53, thinking false
-    .{ .case = "027c37e1f049ee354df073a9", .what = filled_what, .why = number_why }, // mimo_v26, thinking true
-    .{ .case = "898599c9ee6773f3012e63cf", .what = filled_what, .why = number_why }, // mimo_v26, thinking false
-    .{ .case = "7a752a9ffea1cdf9c0c49cb0", .what = filled_what, .why = number_why }, // dsv41, thinking true
-    .{ .case = "a5e007eba80bdc5355798f6d", .what = filled_what, .why = number_why }, // dsv41, thinking false
-};
-
-test "template oracle: jinja.cpp renders the corpus as Python Jinja2 does, except the listed differences" {
-    const a = testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(a);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const oracle = try std.json.parseFromSliceLeaky(Oracle, arena, oracle_json, .{});
-    try testing.expect(oracle.cases.len > 0);
-
-    var listed = std.StringHashMapUnmanaged(bool).empty;
-    for (differences) |d| try listed.put(arena, d.case, false);
-    var unlisted: usize = 0;
-    for (oracle.cases) |c| {
-        const tpl = try arena.dupeSentinel(u8, oracle.templates.map.get(c.template).?, 0);
-        const msgs_z = try arena.dupeSentinel(u8, c.messages, 0);
-        const extra_z = try arena.dupeSentinel(u8, c.extra, 0);
-        const tools_z: ?[:0]u8 = if (c.tools) |t| try arena.dupeSentinel(u8, t, 0) else null;
-        var len: usize = 0;
-        const ptr = jinja_c.jinja_render_chat(tpl.ptr, msgs_z.ptr, if (tools_z) |t| t.ptr else null, extra_z.ptr, @intFromBool(c.add_generation_prompt), &len);
-        defer if (ptr) |p| jinja_c.jinja_str_free(p);
-        const cpp: ?[]const u8 = if (ptr) |p| p[0..len] else null;
-        const same = if (cpp) |r| (c.python != null and std.mem.eql(u8, r, c.python.?)) else c.python == null;
-        if (same) continue;
-        if (listed.getPtr(c.id)) |hit| {
-            hit.* = true;
-            continue;
-        }
-        unlisted += 1;
-        if (unlisted <= 5) {
-            const at = if (cpp != null and c.python != null) std.mem.indexOfDiff(u8, cpp.?, c.python.?) orelse 0 else 0;
-            std.debug.print("\n[{s}] {s}\n  jinja.cpp at {d}: {?s}\n  python    at {d}: {?s} {?s}\n", .{
-                c.id,                                                 c.label,
-                at,                                                   if (cpp) |r| r[at..@min(r.len, at + 120)] else null,
-                at,                                                   if (c.python) |p| p[at..@min(p.len, at + 120)] else null,
-                c.python_error,
-            });
-        }
-    }
-    var stale: usize = 0;
-    var it = listed.iterator();
-    while (it.next()) |e| if (!e.value_ptr.*) {
-        stale += 1;
-        std.debug.print("\nlisted difference renders the same now: {s}\n", .{e.key_ptr.*});
-    };
-    if (unlisted > 0) std.debug.print("\n{d} unlisted differences\n", .{unlisted});
-    try testing.expectEqual(@as(usize, 0), unlisted);
-    try testing.expectEqual(@as(usize, 0), stale);
-}
-
 test "template oracle: the Zig engine renders the corpus as Python Jinja2 does, on every case" {
     const a = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
@@ -797,8 +715,16 @@ const BuiltinCase = struct {
     python_error: ?[]const u8,
 };
 
-/// Names Python's sandbox refuses and jinja.cpp serves: the engine gives jinja.cpp's result.
-const jinja_cpp_only = [_][]const u8{ "filter strip", "method indent", "method append" };
+/// Names Python's sandbox refuses and jinja.cpp serves: every case of one is pinned below.
+const jinja_cpp_names = [_][]const u8{ "filter strip", "method indent", "method append" };
+
+/// Each case of `jinja_cpp_names` with jinja.cpp's render of it: the engine gives it.
+const jinja_cpp_only = [_]struct { label: []const u8, want: []const u8 }{
+    .{ .label = "filter strip #1", .want = "x|a" },
+    .{ .label = "method indent #1", .want = "a\n  b\n\n  c\n|  a\n  b|a\n>\n>b" },
+    .{ .label = "method append #1", .want = "2 1,2 1,2,3" },
+    .{ .label = "method append #2", .want = "12[1,2,3,4]" },
+};
 
 /// A builtin case whose Zig render is not Python's, and why. Every listed case must still differ.
 const builtin_differences = [_]struct { label: []const u8, why: []const u8 }{
@@ -851,6 +777,7 @@ test "template builtins: every filter, test, method, global, loop field, operato
 
     var failed: usize = 0;
     var differ_seen: [builtin_differences.len]bool = @splat(false);
+    var pinned_seen: [jinja_cpp_only.len]bool = @splat(false);
     for (doc.cases) |c| {
         var case_arena = std.heap.ArenaAllocator.init(a);
         defer case_arena.deinit();
@@ -858,17 +785,19 @@ test "template builtins: every filter, test, method, global, loop field, operato
         var diag = zig_template.Diagnostic{};
         const got = zig_template.renderJson(ca, .{ .template = c.template, .messages_json = "[]", .tools_json = null, .extra_json = c.extra, .add_generation_prompt = false }, &diag);
 
-        const cpp_only = for (jinja_cpp_only) |n| {
+        const pinned = for (jinja_cpp_only, 0..) |p, i| {
+            if (std.mem.eql(u8, p.label, c.label)) break i;
+        } else null;
+        const cpp_only = for (jinja_cpp_names) |n| {
             if (std.mem.eql(u8, n, c.covers)) break true;
         } else false;
-        var want: ?[]const u8 = c.python;
-        var cpp_out: ?[*]u8 = null;
-        defer if (cpp_out) |p| jinja_c.jinja_str_free(p);
-        if (cpp_only) {
-            var len: usize = 0;
-            cpp_out = jinja_c.jinja_render_chat((try ca.dupeSentinel(u8, c.template, 0)).ptr, "[]", null, (try ca.dupeSentinel(u8, c.extra, 0)).ptr, 0, &len);
-            want = if (cpp_out) |p| p[0..len] else null;
+        if (pinned) |i| pinned_seen[i] = true;
+        if (cpp_only and pinned == null) {
+            std.debug.print("\n[{s}] covers a jinja.cpp-only name and has no pinned render\n", .{c.label});
+            failed += 1;
+            continue;
         }
+        const want: ?[]const u8 = if (pinned) |i| jinja_cpp_only[i].want else c.python;
         const same = if (got) |text| (want != null and std.mem.eql(u8, text, want.?)) else |e| blk: {
             if (cpp_only or c.python_error == null) break :blk false;
             const perr = c.python_error.?;
@@ -889,6 +818,10 @@ test "template builtins: every filter, test, method, global, loop field, operato
             std.debug.print("\n[{s}] {s}\n  zig:    {s}\n  expect: {?s} {?s}\n", .{ c.label, if (listed != null) "is listed as a difference and renders the same now" else "", text, want, if (cpp_only) "(jinja.cpp)" else c.python_error });
         } else |e| std.debug.print("\n[{s}]\n  zig: {s} at {d}:{d}: {s}\n  expect: {?s} {?s}\n", .{ c.label, @errorName(e), diag.line, diag.column, diag.message(), want, c.python_error });
     }
+    for (jinja_cpp_only, pinned_seen) |p, seen| if (!seen) {
+        std.debug.print("\npinned jinja.cpp case not in the fixture: {s}\n", .{p.label});
+        failed += 1;
+    };
     for (builtin_differences, differ_seen) |d, seen| if (!seen) {
         std.debug.print("\nlisted builtin difference not found or renders the same: {s}\n", .{d.label});
         failed += 1;

@@ -4,9 +4,9 @@
 
 `src/template_oracle_test.zig` captures every call `chat.formatChat` makes into the template engine over its
 request corpus (template, messages JSON, tools JSON, extra-context JSON, add_generation_prompt) and compares
-jinja.cpp's render of each with the render this script commits. The environment is transformers' own
+the Zig engine's render of each with the render this script commits. The environment is transformers' own
 (`_compile_jinja_template`: sandboxed, trim_blocks and lstrip_blocks on, loopcontrols, its `tojson`,
-`raise_exception` and `strftime_now`); the context is built the way `lib/jinja_cpp/jinja_wrapper.cpp` builds it
+`raise_exception` and `strftime_now`); the context is built the way the engine's `renderJson` (`src/template/`) builds it
 (no `tools` key without tools, the extra context merged last).
 
 Three steps, from the repo root:

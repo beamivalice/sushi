@@ -272,8 +272,6 @@ local path.
 - `lib/mlx-src` and `lib/mlxc-src` are the only submodules; they are needed only to rebuild MLX.
 - Pins: `lib/mlx-src` v0.32.3 and `lib/mlxc-src` 56b2d39 (mlx-serve's). Bumping: check out the tag, `git add` the
   submodule, rerun `scripts/build-mlx.sh`, re-diff `src/mlx.zig` externs against `lib/mlxc-src/mlx/c/*.h`.
-- After a `lib/jinja_cpp/*.cpp` change: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/`,
-  then `ar rcs libjinja.a obj/*.o`.
 - Image input links `stb_image` and libwebp; the only non-system dylibs are `libmlxc` and `libwebp`
   (`tests/test_serving_deps.sh`); NAX needs macOS 26.2 (`tests/test_mlx_staged_nax.sh`).
 - `scripts/fetch-zig.sh` replaces a stale `.zig-toolchain` link with its own copy.

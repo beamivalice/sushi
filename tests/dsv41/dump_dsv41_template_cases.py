@@ -2,7 +2,7 @@
 # sushi-test: tier=tool
 """Byte-exact reference for the embedded DeepSeek-V4.1 chat template: the release's own
 `encoding/encoding.py` renders the shapes the server sends, and the Zig test renders the same
-cases through jinja.cpp.
+cases through the template engine.
 
   python3 -I tests/dsv41/dump_dsv41_template_cases.py --encoding <DeepSeek-V4.1-Flash>/encoding \
       [--dump src/fixtures/dsv41_template_cases.json]

@@ -470,9 +470,9 @@ fn dirModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8)
 /// Is this `chat_template` entry just an `{% include %}` POINTER at the
 /// sidecar file? transformers >= 5 saves the real template to
 /// `chat_template.jinja` and writes that one-liner into tokenizer_config.json
-/// (mlx-community oQ4e / oQ5e builds, issue #169). jinja.cpp has
-/// no `include` statement, so rendering the pointer fails and drops SILENTLY to
-/// the generic format — the model then answers in another family's markers.
+/// (mlx-community oQ4e / oQ5e builds, issue #169). The template engine has
+/// no `include` statement, so the pointer taken literally would fail the
+/// template's compile.
 /// The file it names is always the sidecar the caller already falls back to.
 fn isIncludeStub(template: []const u8) bool {
     const t = std.mem.trim(u8, template, " \t\r\n");
@@ -557,9 +557,8 @@ test "chat_template accepts HF's list-of-named-templates shape" {
 
     {   // transformers >= 5 saves the template to chat_template.jinja and leaves
         // an `{% include %}` POINTER in tokenizer_config.json (mlx-community
-        // oQ4e builds, issue #169). jinja.cpp has no `include`, so
-        // taking the pointer literally fails the render and SILENTLY drops to
-        // the generic fallback — wrong-family markers the model then echoes.
+        // oQ4e builds, issue #169). The engine has no `include`, so the
+        // pointer taken literally would fail the template's compile.
         // Read it as "no inline template" so the sidecar file is used.
         const json = \\{"chat_template":"{% include 'chat_template.jinja' %}"}
         ;
@@ -1924,7 +1923,7 @@ pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s
     while (i < s.len) {
         const c = s[i];
         if (c >= 0x80) {
-            // nlohmann rejects ill-formed UTF-8 like a raw control byte.
+            // A strict JSON parser rejects ill-formed UTF-8 like a raw control byte.
             const seq = utf8Next(s, i);
             try buf.appendSlice(allocator, if (seq.valid) s[i..seq.end] else "\u{FFFD}");
             i = seq.end;
@@ -1938,9 +1937,8 @@ pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s
             '\r' => try buf.appendSlice(allocator, "\\r"),
             '\t' => try buf.appendSlice(allocator, "\\t"),
             // Every other control char (e.g. ESC from ANSI codes in tool
-            // results) must be \u-escaped — nlohmann inside jinja_render_chat
-            // rejects raw control bytes, and the render failure silently
-            // downgrades the prompt to fallbackFormatChat.
+            // results) must be \u-escaped: a strict JSON parser rejects raw
+            // control bytes.
             0...8, 0x0B, 0x0C, 0x0E...0x1F => {
                 var esc: [6]u8 = undefined;
                 const n = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
@@ -2009,8 +2007,8 @@ test "appendJsonString empty string" {
 
 test "appendJsonString escapes ALL control characters (2026-06-11 ESC-byte regression)" {
     // Live failure: a tool result carrying raw ANSI terminal codes (ESC = 0x1B
-    // from `\x1b[?25l`) passed through unescaped, nlohmann::json rejected the
-    // messages JSON inside jinja_render_chat, and the prompt silently fell
+    // from `\x1b[?25l`) passed through unescaped, the C++ template engine of the
+    // time rejected the messages JSON, and the prompt silently fell
     // back to the wrong-format fallbackFormatChat — gemma-4-31b then
     // hallucinated entire conversations. JSON strings must escape EVERY
     // control char < 0x20, not just \n \r \t.
@@ -3325,8 +3323,8 @@ test "renderChatTemplate: a NUL byte in message content does not truncate the pr
 }
 
 test "appendJsonString: invalid UTF-8 becomes U+FFFD, valid multibyte is byte-exact" {
-    // Bar: the escaper's output is always well-formed UTF-8 (nlohmann rejects
-    // anything else), and every valid sequence survives unchanged.
+    // Bar: the escaper's output is always well-formed UTF-8 (a strict JSON
+    // parser rejects anything else), and every valid sequence survives unchanged.
     const allocator = testing.allocator;
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);

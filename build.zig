@@ -123,7 +123,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run sushi");
     run_step.dependOn(&run_cmd.step);
 
-    // Unit tests — reuses the same module config (mlx-c, jinja_cpp, etc.)
+    // Unit tests — reuses the same module config (mlx-c, stb, webp, etc.)
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
@@ -131,14 +131,11 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
-            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize) },
             .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize) },
         },
     });
 
-    test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
-    test_mod.addIncludePath(b.path("lib/jinja_cpp"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     test_mod.addCSourceFile(.{ .file = b.path("lib/dflash_cache_space.c"), .flags = &.{"-O2"} });
     test_mod.addCSourceFile(.{ .file = b.path("lib/volume_space.m"), .flags = &.{ "-O2", "-fobjc-arc" } });
@@ -172,10 +169,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tests_host.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = host_options.createModule() },
-            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
         },
     });
     // bills.zig reaches the transformer's and the model's pure helpers, which import these three modules; no MLX symbol is linked.
@@ -185,9 +180,6 @@ pub fn build(b: *std.Build) void {
     host_mod.addIncludePath(b.path("lib"));
     host_mod.addImport("webp", addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize));
     linkApple(host_mod, macos_sdk_frameworks);
-    host_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
-    host_mod.addIncludePath(b.path("lib/jinja_cpp"));
-    host_mod.linkSystemLibrary("c++", .{});
     // A user's filter narrows the host tier to its own tests that the filter selects: a bare substring would also select the
     // MLX-tier tests of the files the host files reach, and those do not link. A filter that selects none builds no binary.
     const host_filters = if (test_filter) |user| hostUserFilters(b, user) else hostFilters(b);
@@ -268,7 +260,7 @@ fn archList(b: *std.Build) []const []const u8 {
     return out.items;
 }
 
-/// `sushibar`: the menu bar app. It links no MLX, jinja or server module, only the Objective-C runtime and AppKit.
+/// `sushibar`: the menu bar app. It links no MLX or server module, only the Objective-C runtime and AppKit.
 fn addSushibar(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, macos_sdk_frameworks: ?[]const u8) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .root_source_file = b.path("src/sushibar_main.zig"),

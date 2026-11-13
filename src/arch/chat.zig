@@ -5,8 +5,8 @@ const std = @import("std");
 const registry = @import("registry.zig");
 const effort = @import("../effort.zig");
 
-/// A chat template the arch serves instead of the one in the checkpoint (its encoder is not jinja.cpp-parseable),
-/// and the atom an image becomes when that template reads `content` as a string.
+/// A chat template the arch serves instead of the one in the checkpoint (which does not parse in the engine), and the
+/// atom an image becomes when that template reads `content` as a string.
 pub const Pin = struct { template: []const u8, image_placeholder: ?[]const u8 = null };
 
 fn faceOf(comptime tag: registry.Tag) type {

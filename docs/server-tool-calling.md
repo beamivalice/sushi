@@ -72,9 +72,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   it): one that does not compile fails the load with `[load] chat template: line L column C: message`; a render only
   reads the tree, on any thread. Each probe render (tool content, late system, forced call) is memoized on its
   compiled template by probe and settings (`ProbeMemo`: 256 entries, started over when full). It reads what
-  jinja.cpp read (the filters, tests, methods, globals and loop fields of
-  `src/template/builtins.zig`, `jinja_cpp_only` names with jinja.cpp's result); any other filter, test or statement
-  (`include`, `extends`, `raw`, `recursive`, `**`, `//`) is a `TemplateSyntax` naming it, and a template leaning on a
+  jinja.cpp read (the filters, tests, methods, globals and loop fields of `src/template/builtins.zig`; the names only
+  jinja.cpp served give its result, pinned in `jinja_cpp_only`); any other filter, test or statement (`include`,
+  `extends`, `raw`, `recursive`, `**`, `//`) is a `TemplateSyntax` naming it, and a template leaning on a
   jinja.cpp leniency (a list mutator but `append`, `|length` of a `map` result) fails at render, both with the failed
   render's handling below. Limits, each a `TemplateRuntime` by name: 200 levels of nesting (a link of `a + b + c` or
   `x|f|g` counts), 100 macro calls deep, 20M steps, a 256 MiB string, 1 GiB of render memory, a `range` of 100000.
@@ -109,7 +109,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **Numbers print as Python prints them**: `tojson` and `{{ }}` write an integer exactly at any size and a float as
   Python's shortest repr (`1.0`, `1e-05`, `3.141592653589793`); jinja.cpp wrote `%g` (`1`, `3.14159`, 2^64 as
   `1.84467e+19`), so a replayed call's arguments carried other bytes than the client sent.
-- **Control bytes**: ONE raw byte <0x20 in history killed jinja.cpp's strict render → `fallbackFormatChat` on a
+- **Control bytes**: ONE raw byte <0x20 in history once killed jinja.cpp's strict render → `fallbackFormatChat` on a
   `<|im_end|>` model (ChatML, the stop token kept), a named 500 `chat template unusable: <reason>` on any other.
   Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first. A NUL byte once
   truncated the rendered prompt (tell: the same `prompt=` count on consecutive turns); the engine returns a slice.
@@ -126,8 +126,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **The template oracle holds the engine to Python Jinja2**: `src/template_oracle_test.zig` captures every engine call
   `formatChat` makes (probes too) over a request corpus through the four served templates, as each pack serves them,
   and requires the Zig engine to give `src/fixtures/template_oracle.json` on every case (transformers' chat-template
-  environment, written by `tests/dump_template_oracle.py`); jinja.cpp, linked into the test builds only, keeps its
-  listed differences. A change to what formatChat hands the engine fails the corpus test until the fixture is
+  environment, written by `tests/dump_template_oracle.py`). A change to what formatChat hands the engine fails the corpus test until the fixture is
   regenerated (`SUSHI_TEMPLATE_ORACLE_DUMP`, then the dumper's `render`). The builtin table
   (`src/fixtures/template_builtins.json`, the dumper's `builtins`) holds one case or more per name the engine serves;
   a name without one fails by name.

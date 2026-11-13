@@ -95,8 +95,9 @@ Skills: `/release` (release order, gates, CHANGELOG, contributor credit), `/benc
 ## Stack and building
 
 Zig 0.17.1 (`scripts/fetch-zig.sh` stages it at `.zig-toolchain/`); mlx + mlx-c are pinned submodules built NAX-enabled
-by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp as `lib/jinja_cpp/libjinja.a`. Min macOS 26.2.
-Box: M5 Max 128 GB, macOS 27. Bumping mlx or rebuilding jinja: [process-measurement](docs/process-measurement.md#build-environment-notes).
+by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); chat templates render in Zig (`src/template/`). Min
+macOS 26.2. Box: M5 Max 128 GB, macOS 27. Bumping mlx:
+[process-measurement](docs/process-measurement.md#build-environment-notes).
 
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug is 2–4× slower ⇒ fake regressions).
   `zig build test` does NOT refresh `zig-out/bin/sushi`: rebuild before any live A/B.
@@ -176,9 +177,9 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
 
 ## Debugging
 
-Server log `~/.sushi/logs/sushi-<port>.log` is THE post-mortem file (`--log-level debug`). Grep its tags: `jinja error:`,
-`<- N+M tokens`, `tool_msgs=`, `[cache]`, `[spec-stats]`, `[mtp-planner]`, `[loop-stop]`, `[admission]`, `[kv-cache]`,
-`[expert-stream]`, `[disk-cache]`, `[hot-cache]`, `[prefill-trace]`, `[engine]`, `[load]`, `[pipelines]`. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` →
+Server log `~/.sushi/logs/sushi-<port>.log` is THE post-mortem file (`--log-level debug`). Grep its tags:
+`jinja render failed`, `[load] chat template:`, `<- N+M tokens`, `tool_msgs=`, `[cache]`, `[spec-stats]`, `[mtp-planner]`,
+`[loop-stop]`, `[admission]`, `[kv-cache]`, `[expert-stream]`, `[disk-cache]`, `[hot-cache]`, `[prefill-trace]`, `[engine]`, `[load]`, `[pipelines]`. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` →
 `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; stop your own server by PID, never
 `pkill`. `/props` reports `active_bytes`,
 `memory.cache_bytes`, `batching`; RSS is blind to Metal.

@@ -2,7 +2,7 @@
 //! gives it under transformers' chat-template environment. A name outside these sets is refused when the template
 //! is parsed (filters and tests) or when it is looked up (methods). The set is jinja.cpp's (wangzhaode/jinja.cpp,
 //! Apache-2.0, see NOTICE), and the names only it has (the `strip` filter, `str.indent`, `list.append`) follow its
-//! routines in `lib/jinja_cpp/value.cpp`.
+//! routines in its `value.cpp`.
 const std = @import("std");
 const value = @import("value.zig");
 const tojson = @import("tojson.zig");

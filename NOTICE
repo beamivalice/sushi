@@ -277,21 +277,11 @@ https://github.com/wangzhaode/jinja.cpp
 Copyright 2025 Wang Zhaode
 Licensed under the Apache License, Version 2.0.
 
-The chat-template engine in `src/template/` (Zig) ports jinja.cpp's behaviour
-and builtin set: the filters, tests, methods and globals it serves, and the
-names only jinja.cpp has (the `strip` filter, `str.indent`, `list.append`),
-with jinja.cpp's result. jinja.cpp itself stays vendored under `lib/jinja_cpp/`,
-compiled to `libjinja.a` and linked into the test builds only, as the
-differential oracle the engine is checked against; the sushi binary does not
-link it.
-
-Modifications by mlx-serve: `value.cpp` and `value.h` were changed to add
-`tojson(sort_keys=..., separators=...)`, which some chat templates require.
-Modification by sushi: `lexer.cpp` and `parser.cpp` read a number after a dot
-(`x.0`, `x.1.0`) as a subscript, as Jinja2 does.
-`runtime.cpp` runs each loop iteration in its own scope, as Jinja2 does.
-`jinja_wrapper.*`, `caps.*`, `jinja_string.*` and `log.h` are sushi
-additions providing the C interface the Zig side calls.
+Behaviour and builtin set ported from jinja.cpp: the chat-template engine in
+`src/template/` (Zig) serves the filters, tests, methods and globals jinja.cpp
+serves, and the names only jinja.cpp has (the `strip` filter, `str.indent`,
+`list.append`) with jinja.cpp's result, read from its `value.cpp`. The engine
+is a fresh Zig design; no jinja.cpp source is vendored or linked.
 
 
 ================================================================================
@@ -579,14 +569,6 @@ Copyright (c) 2023 ml-explore
 Pinned submodule at `lib/mlxc-src`, built by `scripts/build-mlx.sh` and linked
 into the sushi binary. Pinned to an upstream commit chosen for
 compatibility with the pinned MLX version. Unmodified.
-
---------------------------------------------------------------------------------
-nlohmann/json
-https://github.com/nlohmann/json
-SPDX-FileCopyrightText: 2013-2023 Niels Lohmann
-
-Vendored under `lib/jinja_cpp/nlohmann/` as a dependency of jinja.cpp, and
-compiled with it into the test builds only. Unmodified.
 
 --------------------------------------------------------------------------------
 mlxfast-challenge

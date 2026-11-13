@@ -21,7 +21,8 @@ pub const effort: eff.Offer = .{ .table = eff.makeSpec("deepseek_v41", "DeepSeek
 /// The release's image placeholder, which the processor expands into the image's span.
 pub const image_atom = "<\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>";
 
-// The checkpoint's template merges dicts with `**`, which jinja.cpp cannot parse; this one is pinned to the encoder.
+// The checkpoint's template merges dicts with `**`, which the template engine cannot parse; this one is pinned to the
+// encoder.
 pub const fixtures = @import("dsv41_fixtures.zig");
 
 pub const pin: arch_chat.Pin = .{ .template = @embedFile("../fixtures/dsv41_chat_template.jinja"), .image_placeholder = image_atom };

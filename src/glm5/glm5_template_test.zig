@@ -1,4 +1,4 @@
-//! GLM-5.3's own chat template, rendered through jinja.cpp: tool round trips and tool results in their list forms.
+//! GLM-5.3's own chat template, rendered through the template engine: tool round trips and tool results in their list forms.
 const std = @import("std");
 const chat = @import("../chat.zig");
 const fixtures = @import("glm5_fixtures.zig");

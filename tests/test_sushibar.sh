@@ -45,7 +45,7 @@ out=$(SSH_CONNECTION="1.2.3.4 5 6.7.8.9 22" "$BAR" 2>&1); rc=$?
 check "an ssh login exits non-zero saying there is no GUI session" "$(yes_if '[ $rc -ne 0 ] && echo "$out" | grep -qi "GUI session"')"
 
 echo "== link line =="
-stray=$(otool -L "$BAR" | tail -n +2 | grep -E 'libmlx|libwebp|libjinja|libc\+\+')
+stray=$(otool -L "$BAR" | tail -n +2 | grep -E 'libmlx|libwebp|libc\+\+')
 check "no libmlx, libmlxc, libwebp or libc++ is linked" "$(yes_if '[ -z "$stray" ]')"
 
 SUSHI_BIN="$(dirname "$BAR")/sushi"
