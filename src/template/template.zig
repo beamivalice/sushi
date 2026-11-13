@@ -1219,3 +1219,101 @@ test "template differential: each case of SUSHI_TEMPLATE_DIFF rendered to one re
         try file.writeStreamingAll(testing.io, buf.items);
     }
 }
+
+/// The bytes of private-use characters (U+E000..U+F8FF) in `s` whose origin is not the input's, or 1 << 20 when the
+/// origin runs are out of order, end elsewhere than the text's end, or repeat an origin side by side.
+fn markerViolations(s: Str) usize {
+    @setRuntimeSafety(true);
+    if (s.runs.len > 0) {
+        var end: usize = 0;
+        var prev: ?Origin = null;
+        for (s.runs) |r| {
+            if (r.end <= end or (prev != null and prev.? == r.origin)) return 1 << 20;
+            end = r.end;
+            prev = r.origin;
+        }
+        if (end != s.bytes.len) return 1 << 20;
+    }
+    var bad: usize = 0;
+    var b: usize = 0;
+    while (b + 2 < s.bytes.len) : (b += 1) {
+        const lead = s.bytes[b];
+        if (lead != 0xEE and !(lead == 0xEF and s.bytes[b + 1] <= 0xA3)) continue;
+        if (s.bytes[b + 1] & 0xC0 != 0x80 or s.bytes[b + 2] & 0xC0 != 0x80) continue;
+        if (s.originOf(b, b + 3) != .input) bad += 1;
+        b += 2;
+    }
+    return bad;
+}
+
+test "template: request text marked with private-use characters keeps the input's origin through every builtin and every way a value travels" {
+    const a = testing.allocator;
+    // Each message holds markers; the template's own text holds none, so every marker byte out is the input's.
+    const messages =
+        \\[{"role":"user","content":"\u00e9\ue000 h\ue001llo \ue002"},{"role":"user","content":"a\ud83d\ude00\ue003b"},
+        \\{"role":"user","content":"   \ue004x  "},{"role":"user","content":"\ue005\ny\n\n z\ue006"},
+        \\{"role":"user","content":"\ue007"},{"role":"user","content":"a \ue008c"}]
+    ;
+    const pre = "{% set s = messages[0].content %}{% set astral = messages[1].content %}{% set t6 = messages[2].content %}" ++
+        "{% set t7 = messages[3].content %}{% set b = messages[4].content %}{% set ac = messages[5].content %}" ++
+        "{% set l = [b, 1, ac] %}{% set d = {'a': b, 'b': [ac], 'c': none} %}{% set q = {b: ac} %}" ++
+        "{% set people = [{'name': b, 'age': 31}, {'name': ac, 'age': 25}] %}";
+    const exprs = [_][]const u8{
+        "s",                          "s|upper",                     "s|title",                       "s|capitalize",               "s[1:4]",
+        "s[::-1]",                    "s|reverse|join",              "s|list|join('-')",              "s|first",                    "s|last",
+        "astral[1:]",                 "astral|length",               "t6|trim",                       "t6.lstrip()",                "t6.rstrip()",
+        "t6|indent(2)",               "t6|truncate(3)",                "t7|indent(2, true)",         "t7.split('\\n')|join('|')",
+        "t7.rsplit('\\n', 1)|last",   "t7|replace('\\n', t6)",       "t7|replace('', b)",             "t6|replace(' ', t7)",
+        "t7|sort|join",               "t7|unique|join",              "t7|tojson",                     "t7|tojson(indent=1)",        "t7|string",
+        "t7 ~ t6",                    "t7 * 2",                      "t7 + t6",                       "'%s|%s' % (t7, t6)",         "'%(a)s' % {'a': t7}",
+        "'%r' % t7",                  "'%-9s|' % t7",                "'%.3s' % t7",                   "e|default(t7)",              "(t7 if t else t6)",
+        "(e or t7)",                  "[t7, t6]|join(t6)",           "[t7, t6]|max",                  "[t7, t6]|map('upper')|join", "[t7, t6]|select('string')|join",
+        "[t7, t6]|sum(start='')",     "{'k': t7}|tojson",            "{'k': t7}|string",              "{t7: 1}|tojson",             "{t7: 1}|list|first",
+        "namespace(a=t7).a",          "(t7, t6)|join",               "range(3)|map('string')|join(t7)", "t7|trim('\\n')",           "t7.strip(t6)",
+        "t6.split()|join(',')",       "t6.split(none, 1)|last",      "d|tojson",                      "q|items|list|string",        "people|map(attribute='name')|join",
+        "people|selectattr('age', 'gt', 26)|map(attribute='name')|first", "l|join", "l|string",       "d.b|first",                  "q[b]",
+        "l|map('string')|first",      "ac.title()",                  "(t7|tojson)[1:-1]",             "t7|safe ~ t6",               "s|format",
+    };
+    const shapes = [_][2][]const u8{
+        .{ "{{ ", " }}" },
+        .{ "{% set zz = (", ") %}{{ zz }}" },
+        .{ "{% macro m(x) %}{{ x }}{% endmacro %}{{ m(", ") }}" },
+        .{ "{% for i in [1] %}{% set zz = (", ") %}{{ zz }}{% endfor %}" },
+        .{ "{% set ns = namespace(a=none) %}{% set ns.a = (", ") %}{{ ns.a }}" },
+        .{ "{% filter upper %}{{ ", " }}{% endfilter %}" },
+        .{ "{% set zz %}{{ ", " }}{% endset %}{{ zz|trim }}" },
+        .{ "{% macro w() %}[{{ caller() }}]{% endmacro %}{% call w() %}{{ ", " }}{% endcall %}" },
+    };
+    var rendered: usize = 0;
+    var violations: usize = 0;
+    for (exprs) |e| for (shapes) |shape| {
+        var arena_state = std.heap.ArenaAllocator.init(a);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const text = try std.mem.concat(arena, u8, &.{ pre, shape[0], e, shape[1] });
+        var diag = Diagnostic{};
+        var t = Template.compile(a, text, &diag) catch |err| {
+            std.debug.print("{s}: {s} {s}\n", .{ text, @errorName(err), diag.message() });
+            return err;
+        };
+        defer t.deinit();
+        const json = JsonContext{ .messages = messages, .extra = "{\"t\": 1, \"e\": \"\"}" };
+        const out = t.renderSpans(arena, .{ .context = json.context(), .add_generation_prompt = false }, &diag) catch continue;
+        rendered += 1;
+        const bad = markerViolations(out);
+        if (bad > 0) std.debug.print("origin lost: {s}{s}{s} -> {s}\n", .{ shape[0], e, shape[1], out.bytes });
+        violations += bad;
+    };
+    try testing.expectEqual(@as(usize, 0), violations);
+    // Nearly every case renders, so the property is held over them, not passed by failures.
+    try testing.expect(rendered * 10 >= exprs.len * shapes.len * 9);
+    // The check sees a marker the template wrote.
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var diag = Diagnostic{};
+    var t = try Template.compile(a, "{{ messages[0].content }}\u{e000}", &diag);
+    defer t.deinit();
+    const json = JsonContext{ .messages = messages, .extra = "{}" };
+    const control = try t.renderSpans(arena_state.allocator(), .{ .context = json.context(), .add_generation_prompt = false }, &diag);
+    try testing.expectEqual(@as(usize, 1), markerViolations(control));
+}

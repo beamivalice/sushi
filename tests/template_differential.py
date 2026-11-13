@@ -33,7 +33,7 @@ def python_render(case):
     from transformers.utils.chat_template_utils import _compile_jinja_template
     try:
         compiled = _compile_jinja_template(case['t'])
-    except jinja2.exceptions.TemplateError as e:
+    except (jinja2.exceptions.TemplateError, SyntaxError) as e:  # Python's compile of the generated code raises SyntaxError
         return 'err', f'{type(e).__name__}: {e}'
     ctx = {'messages': json.loads(case['m']), 'add_generation_prompt': case['agp']}
     if case['tools']:
@@ -88,7 +88,7 @@ def classify(z, py):
         return 'ENGINE_ERR_PYTHON_OK'
     if py[1].startswith('TemplateError: '):
         return 'both_err' if z['kind'] == 'TemplateRaised' and z['msg'] == py[1][len('TemplateError: '):] else 'RAISE_MISMATCH'
-    syntax = py[1].startswith(('TemplateSyntaxError', 'TemplateAssertionError'))
+    syntax = py[1].startswith(('TemplateSyntaxError', 'TemplateAssertionError', 'SyntaxError'))
     return 'both_err' if z['kind'] == ('TemplateSyntax' if syntax else 'TemplateRuntime') else 'KIND_MISMATCH'
 
 

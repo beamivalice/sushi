@@ -2208,6 +2208,150 @@
 "extra": "{}",
 "python": null,
 "python_error": "ZeroDivisionError: division by zero"
+},
+{
+"covers": "statement filter",
+"label": "statement filter #4",
+"template": "{% filter list %}ab{% endfilter %}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: sequence item 0: expected str instance, list found"
+},
+{
+"covers": "statement filter",
+"label": "statement filter #5",
+"template": "{% filter int %}12{% endfilter %}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: sequence item 0: expected str instance, int found"
+},
+{
+"covers": "statement filter",
+"label": "statement filter #6",
+"template": "{% filter length %}abc{% endfilter %}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: sequence item 0: expected str instance, int found"
+},
+{
+"covers": "statement filter",
+"label": "statement filter #7",
+"template": "{% filter first %}ab{% endfilter %}|{% filter max %}ab{% endfilter %}|{% set x | list %}ab{% endset %}{{ x }}|{% set y | length %}ab{% endset %}{{ y }}",
+"extra": "{}",
+"python": "a|b|['a', 'b']|2",
+"python_error": null
+},
+{
+"covers": "global namespace",
+"label": "global namespace #2",
+"template": "{{ namespace(a=1, a=2).a }}",
+"extra": "{}",
+"python": null,
+"python_error": "SyntaxError: keyword argument repeated: a (<template>, line 12)"
+},
+{
+"covers": "statement macro",
+"label": "statement macro #9",
+"template": "{% macro m(a) %}{{ a }}{% endmacro %}{{ m(a=1, a=2) }}",
+"extra": "{}",
+"python": null,
+"python_error": "SyntaxError: keyword argument repeated: a (<template>, line 23)"
+},
+{
+"covers": "filter default",
+"label": "filter default #2",
+"template": "{{ 'x'|default(d=1, d=2) }}",
+"extra": "{}",
+"python": null,
+"python_error": "SyntaxError: keyword argument repeated: d (<template>, line 17)"
+},
+{
+"covers": "operator %",
+"label": "operator % #11",
+"template": "{{ 'x' % ([1]|map('string')) }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: not all arguments converted during string formatting"
+},
+{
+"covers": "operator %",
+"label": "operator % #12",
+"template": "{{ 'x' % ([1]|reverse) }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: not all arguments converted during string formatting"
+},
+{
+"covers": "operator %",
+"label": "operator % #13",
+"template": "{{ 'x' % d.keys() }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": null,
+"python_error": "TypeError: not all arguments converted during string formatting"
+},
+{
+"covers": "operator %",
+"label": "operator % #14",
+"template": "{{ 'x' % (d|items) }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": null,
+"python_error": "TypeError: not all arguments converted during string formatting"
+},
+{
+"covers": "operator %",
+"label": "operator % #15",
+"template": "{{ 'x' % [] }}|{{ 'x' % {} }}|{{ 'x' % range(2) }}|{{ 'x' % () }}|{{ 'x' % d }}",
+"extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}}",
+"python": "x|x|x|x|x",
+"python_error": null
+},
+{
+"covers": "filter truncate",
+"label": "filter truncate #5",
+"template": "{{ []|truncate(2) }}",
+"extra": "{}",
+"python": null,
+"python_error": "AssertionError: expected length >= 3, got 2"
+},
+{
+"covers": "filter truncate",
+"label": "filter truncate #6",
+"template": "{{ none|truncate(2) }}",
+"extra": "{}",
+"python": null,
+"python_error": "AssertionError: expected length >= 3, got 2"
+},
+{
+"covers": "filter truncate",
+"label": "filter truncate #7",
+"template": "{{ [1]|truncate(2, end=5) }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: object of type 'int' has no len()"
+},
+{
+"covers": "method startswith",
+"label": "method startswith #3",
+"template": "{{ ''.startswith(2, true) }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: startswith first arg must be str or a tuple of str, not int"
+},
+{
+"covers": "method endswith",
+"label": "method endswith #3",
+"template": "{{ ''.endswith(('a', 2), 5) }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: tuple for endswith must only contain str, not int"
+},
+{
+"covers": "filter int",
+"label": "filter int #8",
+"template": "{{ ''|int('b', 'c') }}|{{ '5'|int(0, 'c') }}|{{ '5'|int(0, 2.5) }}|{{ '12'|int(0, true) }}|{{ 7|int(0, 'c') }}",
+"extra": "{}",
+"python": "b|5|5|12|7",
+"python_error": null
 }
 ]
 }

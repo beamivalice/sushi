@@ -804,7 +804,8 @@ test "template builtins: every filter, test, method, global, loop field, operato
             const perr = c.python_error.?;
             if (std.mem.startsWith(u8, perr, "TemplateError: "))
                 break :blk e == error.TemplateRaised and std.mem.eql(u8, perr["TemplateError: ".len..], diag.message());
-            const syntax = std.mem.startsWith(u8, perr, "TemplateSyntaxError") or std.mem.startsWith(u8, perr, "TemplateAssertionError");
+            const syntax = std.mem.startsWith(u8, perr, "TemplateSyntaxError") or std.mem.startsWith(u8, perr, "TemplateAssertionError") or
+                std.mem.startsWith(u8, perr, "SyntaxError");
             break :blk e == if (syntax) error.TemplateSyntax else error.TemplateRuntime;
         };
         const listed = for (builtin_differences, 0..) |d, i| {

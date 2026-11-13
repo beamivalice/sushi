@@ -293,7 +293,10 @@ pub const Renderer = struct {
                 const text, const flow = try self.capture(s.body, try self.bodyFrame(.filter_block, frame));
                 if (flow != .normal) return flow;
                 const body: Value = .{ .string = text };
-                try self.write(try self.toText(try self.evalFilter(s.filter, body, frame)));
+                const v = try self.evalFilter(s.filter, body, frame);
+                // Jinja2 joins a filter block's result into the output as it is, which Python refuses for all but text.
+                if (v.strOf() == null) return self.fail("a filter block gives '{s}', which joins the output only as text", .{value.typeName(v)});
+                try self.write(try self.toText(v));
             },
             .generation => |body| return self.renderBody(body, try self.bodyFrame(.generation, frame)),
             .break_ => return .break_,

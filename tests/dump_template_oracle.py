@@ -557,6 +557,26 @@ BUILTIN_CASES = [
     ('undefined fails', "{{ missing.attr }}", {}),
     ('undefined fails', "{{ missing + 1 }}", {}),
     ('undefined fails', "{{ 1 / 0 }}", {}),
+    # Where Python raises, the engine fails by name.
+    ('statement filter', "{% filter list %}ab{% endfilter %}", {}),
+    ('statement filter', "{% filter int %}12{% endfilter %}", {}),
+    ('statement filter', "{% filter length %}abc{% endfilter %}", {}),
+    ('statement filter', "{% filter first %}ab{% endfilter %}|{% filter max %}ab{% endfilter %}|{% set x | list %}ab{% endset %}{{ x }}|"
+                         "{% set y | length %}ab{% endset %}{{ y }}", {}),
+    ('global namespace', "{{ namespace(a=1, a=2).a }}", {}),
+    ('statement macro', "{% macro m(a) %}{{ a }}{% endmacro %}{{ m(a=1, a=2) }}", {}),
+    ('filter default', "{{ 'x'|default(d=1, d=2) }}", {}),
+    ('operator %', "{{ 'x' % ([1]|map('string')) }}", {}),
+    ('operator %', "{{ 'x' % ([1]|reverse) }}", {}),
+    ('operator %', "{{ 'x' % d.keys() }}", D),
+    ('operator %', "{{ 'x' % (d|items) }}", D),
+    ('operator %', "{{ 'x' % [] }}|{{ 'x' % {} }}|{{ 'x' % range(2) }}|{{ 'x' % () }}|{{ 'x' % d }}", D),
+    ('filter truncate', "{{ []|truncate(2) }}", {}),
+    ('filter truncate', "{{ none|truncate(2) }}", {}),
+    ('filter truncate', "{{ [1]|truncate(2, end=5) }}", {}),
+    ('method startswith', "{{ ''.startswith(2, true) }}", {}),
+    ('method endswith', "{{ ''.endswith(('a', 2), 5) }}", {}),
+    ('filter int', "{{ ''|int('b', 'c') }}|{{ '5'|int(0, 'c') }}|{{ '5'|int(0, 2.5) }}|{{ '12'|int(0, true) }}|{{ 7|int(0, 'c') }}", {}),
 ]
 
 
@@ -572,7 +592,7 @@ def dump_builtins():
         case = {'covers': covers, 'label': f'{covers} #{seen[covers]}', 'template': text, 'extra': extra}
         try:
             compiled = _compile_jinja_template(text)
-        except jinja2.exceptions.TemplateError as e:
+        except (jinja2.exceptions.TemplateError, SyntaxError) as e:  # Python's compile of Jinja2's code: SyntaxError
             cases.append(dict(case, python=None, python_error=f'{type(e).__name__}: {e}'))
             continue
         try:

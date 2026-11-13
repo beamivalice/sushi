@@ -771,6 +771,7 @@ pub const Parser = struct {
         try self.expectOp("(");
         var positional = std.ArrayList(*const Expr).empty;
         var keywords = std.ArrayList(ast.Keyword).empty;
+        var names = std.ArrayList(Named).empty;
         var first = true;
         while (!self.isOp(")")) {
             if (!first) {
@@ -780,15 +781,19 @@ pub const Parser = struct {
             first = false;
             if (self.isOp("*") or self.isOp("**")) return self.fail(self.cur().pos, "unsupported argument unpacking '{s}'", .{self.cur().text});
             if (self.cur().tag == .name and self.peekAt(1).tag == .op and std.mem.eql(u8, self.peekAt(1).text, "=")) {
+                const at = self.cur().pos;
                 const name = self.advance().text;
                 _ = self.advance();
                 try keywords.append(self.arena, .{ .name = name, .value = try self.expression(true) });
+                try names.append(self.arena, .{ .name = name, .pos = at });
             } else {
                 if (keywords.items.len > 0) return self.fail(self.cur().pos, "positional argument follows keyword argument", .{});
                 try positional.append(self.arena, try self.expression(true));
             }
         }
         try self.expectOp(")");
+        // Python's compile of the code Jinja2 makes refuses a keyword given twice.
+        if (try self.firstRepeat(names.items)) |dup| return self.fail(dup.pos, "keyword argument repeated: {s}", .{dup.name});
         return .{ .positional = positional.items, .keywords = keywords.items };
     }
 

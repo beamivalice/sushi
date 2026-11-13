@@ -462,15 +462,16 @@ fn affix(r: *Renderer, s: []const u8, args: []const Value, ends: bool) Failure!b
     if (lo < 0) lo = @max(0, lo + n);
     if (hi < 0) hi = @max(0, hi + n);
     hi = @min(hi, n);
-    // A start past the end matches nothing, not even '', as in CPython's tailmatch.
-    if (lo > n or lo > hi) return false;
-    const sub = render.cpSlice(s, @intCast(lo), @intCast(hi));
+    // A start past the end matches nothing, not even '', as in CPython's tailmatch; each probe is still checked.
+    const none = lo > n or lo > hi;
+    const sub = if (none) "" else render.cpSlice(s, @intCast(lo), @intCast(hi));
     const probes: []const Value = switch (args[0]) {
         .list => |l| if (l.kind == .tuple) l.items.items else return r.fail("{s} first arg must be str or a tuple of str", .{what}),
         else => args[0..1],
     };
     for (probes) |p| {
         const t = p.str() orelse return r.fail("{s} first arg must be str or a tuple of str", .{what});
+        if (none) continue;
         try r.tick(1 + @min(t.len, sub.len) / 64);
         value.spend(1 + @min(t.len, sub.len) / 64);
         if (if (ends) std.mem.endsWith(u8, sub, t) else std.mem.startsWith(u8, sub, t)) return true;
@@ -515,7 +516,7 @@ fn percentFormat(r: *Renderer, fmt_s: Str, args: Value, escape: bool) Failure!St
     const positional = tuple orelse &.{args};
     const mapping: ?*const value.Dict = if (args == .dict) args.dict else null;
     // Python reads an argument with `__getitem__` (not a tuple or a string) as a mapping: one left unused is no error.
-    const mapping_like = tuple == null and (args == .dict or args == .list);
+    const mapping_like = tuple == null and (args == .dict or (args == .list and args.list.isSequence()));
     var out: value.Builder = .{};
     var buf = std.ArrayList(u8).empty;
     var next: usize = 0;
@@ -1117,7 +1118,8 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
         .int => {
             const p = try bind(r, "int", &.{ "default", "base" }, args, kws);
             const default = p[0] orelse Value{ .int = 0 };
-            const base = if (p[1]) |b| try intArg(r, b, "int") else 10;
+            // Python's int(text, base) refuses a base that is no integer, and Jinja2 then reads the text as a float.
+            const base: ?i64 = if (p[1]) |b| asInt(b) else 10;
             try undefinedFail(r, input);
             switch (input) {
                 .int, .bigint => return input,
@@ -1127,10 +1129,10 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 .float => |x| return if (std.math.isNan(x)) default else floatToInt(r, x),
                 .string, .markup => |s| {
                     const t = try asciiNumberText(r, s.bytes) orelse return default;
-                    if (parsePyInt(t, base)) |i| return .{ .int = i } else |e| switch (e) {
+                    if (base) |b| if (parsePyInt(t, b)) |i| return .{ .int = i } else |e| switch (e) {
                         error.Overflow => return r.fail("an integer past 64 bits is not supported", .{}),
                         error.Invalid => {},
-                    }
+                    };
                     const x = parsePyFloat(t) orelse return default;
                     return if (std.math.isFinite(x)) floatToInt(r, x) else default;
                 },
@@ -1374,23 +1376,23 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
         },
         .truncate => {
             const p = try bind(r, "truncate", &.{ "length", "killwords", "end", "leeway" }, args, kws);
-            if (input == .undefined) return input;
             const len = if (p[0]) |v| try intArg(r, v, "truncate") else 255;
-            const src = input.strOf() orelse {
-                // Jinja2's truncate returns any value whose len() is within the length; only text is cut.
-                const leeway_v = if (p[3]) |v| (if (v == .none) 5 else try intArg(r, v, "truncate")) else 5;
-                const n = try length(r, input);
-                if (n <= @as(i128, len) + leeway_v) return input;
-                return r.fail("truncate: expected a string, got '{s}'", .{value.typeName(input)});
-            };
-            const s = src.bytes;
-            const killwords = if (p[1]) |v| value.truthy(v) else false;
             const end_s: Str = if (p[2]) |v| (v.strOf() orelse return r.fail("truncate: expected a string, got '{s}'", .{value.typeName(v)})) else .{ .bytes = "..." };
             const end = end_s.bytes;
             const leeway = if (p[3]) |v| (if (v == .none) 5 else try intArg(r, v, "truncate")) else 5;
             const end_len: i64 = @intCast(render.cpCount(end));
+            // Jinja2 asserts the length and the leeway before it reads the value.
             if (len < end_len) return r.fail("expected length >= {d}, got {d}", .{ end_len, len });
             if (leeway < 0) return r.fail("expected leeway >= 0, got {d}", .{leeway});
+            if (input == .undefined) return input;
+            const src = input.strOf() orelse {
+                // Jinja2's truncate returns any value whose len() is within the length; only text is cut.
+                const n = try length(r, input);
+                if (n <= @as(i128, len) + leeway) return input;
+                return r.fail("truncate: expected a string, got '{s}'", .{value.typeName(input)});
+            };
+            const s = src.bytes;
+            const killwords = if (p[1]) |v| value.truthy(v) else false;
             const n: i64 = @intCast(render.cpCount(s));
             if (n <= @as(i128, len) + leeway) return input;
             const head = render.cpSlice(s, 0, @intCast(len - end_len));

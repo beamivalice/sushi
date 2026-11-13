@@ -155,7 +155,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   that holds them is not JSON); a filter Python makes a generator (`map`, `select`, `reject`, `unique`, `items`)
   over a list, a dict or a string is evaluated where it is applied, so an error Python defers to the first read is
   raised there, and its arguments are checked there over a generator too; Jinja2's `missing` sentinel, which leaks
-  from a macro defined in a loop and called after it, is not copied.
+  from a macro defined in a loop and called after it, is not copied; `list.append` renders where Python's sandbox
+  raises a SecurityError, as jinja.cpp served it (`jinja_cpp_only`).
+- **Where Python raises, the engine fails by name, never renders**: a filter block whose filter gives no text
+  (`{% filter list %}`: Python cannot join it into the output), a keyword given twice in any call (a `TemplateSyntax`,
+  as Python's compile of Jinja2's code), `'x' % ` a generator, a reversed list or a dict view with no specifier, a
+  `truncate` length under its end's (asserted before the value is read), a `startswith`/`endswith` probe that is no
+  text even past the string's end. `int` with a base that is no integer reads the text as a float, as Jinja2 does.
+  Each is a builtin oracle row; `request text marked with private-use characters` holds every output byte of request
+  text to the input's origin over 70 expressions in eight shapes (output, set, macro, loop, namespace, filter block,
+  set block, call block).
 - **A generator is read one item at a time, from one place**: `map`, `select`, `reject` and `unique` over a
   generator make their items as they are read (`builtins.Lazy`, `nextItem`), so `g|map(..)|first` takes one item of
   `g`; a for loop takes from the generator what Jinja2's loop takes (the item it is on, the next one when
