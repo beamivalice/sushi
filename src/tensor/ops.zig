@@ -697,18 +697,38 @@ pub fn take(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
     return out;
 }
 
-/// `start, start + step, ..` below `stop`.
-pub fn arange(start: f64, stop: f64, step: f64, dtype: Dtype) Error!*Tensor {
-    const count: usize = @intFromFloat(@max(0, @ceil((stop - start) / step)));
+/// `start, start + step, ..` below `stop`, as MLX makes it: the length from the f64 arguments, each element
+/// `start + i * step` in the dtype with `start` and `step = dtype(start + step) - start` rounded to it first. What MLX
+/// refuses, and an int32 start or first step with no int32 value, is refused by name.
+pub fn arange(start: f64, stop: f64, step: f64, dtype: Dtype) (Error || error{ ArangeLengthUndefined, ArangeStepZero, ArangeTooLong, ArangeOutOfRange })!*Tensor {
+    if (std.math.isNan(start) or std.math.isNan(stop) or std.math.isNan(step) or std.math.isInf(start) or std.math.isInf(stop)) return error.ArangeLengthUndefined;
+    if (step == 0) return error.ArangeStepZero;
+    // An infinite step toward the stop holds the start alone.
+    const lone = std.math.isInf(step) and ((step > 0 and start < stop) or (step < 0 and start > stop));
+    const real = if (lone) 1 else @ceil((stop - start) / step);
+    if (real > std.math.maxInt(i32)) return error.ArangeTooLong;
+    const count: usize = @intFromFloat(@max(0, real));
     const out = try core.freshForHost(dtype, &.{@intCast(count)});
     errdefer core.release(out);
     const bytes = try core.hostBytes(out);
     switch (dtype) {
-        .int32 => for (@as([]i32, @alignCast(std.mem.bytesAsSlice(i32, bytes))), 0..) |*v, i| {
-            v.* = @intFromFloat(start + step * @as(f64, @floatFromInt(i)));
+        .int32 => {
+            const lo: f64 = std.math.minInt(i32);
+            const hi: f64 = std.math.maxInt(i32);
+            if (!(start >= lo and start <= hi) or (!lone and !(start + step >= lo and start + step <= hi))) return error.ArangeOutOfRange;
+            const first: i32 = @intFromFloat(start);
+            const delta: u32 = if (lone) 0 else @bitCast(@as(i32, @intFromFloat(start + step)) -% first);
+            for (@as([]i32, @alignCast(std.mem.bytesAsSlice(i32, bytes))), 0..) |*v, i| {
+                v.* = @bitCast(@as(u32, @bitCast(first)) +% @as(u32, @intCast(i)) *% delta);
+            }
         },
-        .float32 => for (@as([]f32, @alignCast(std.mem.bytesAsSlice(f32, bytes))), 0..) |*v, i| {
-            v.* = @floatCast(start + step * @as(f64, @floatFromInt(i)));
+        .float32 => {
+            const first: f32 = @floatCast(start);
+            const delta: f32 = if (lone) 0 else @as(f32, @floatCast(start + step)) - first;
+            for (@as([]f32, @alignCast(std.mem.bytesAsSlice(f32, bytes))), 0..) |*v, i| {
+                // MLX's kernel computes `start + index * step`, which Metal contracts into one fused multiply-add.
+                v.* = @mulAdd(f32, @floatFromInt(@as(u32, @intCast(i))), delta, first);
+            }
         },
         else => return error.TensorDtype,
     }

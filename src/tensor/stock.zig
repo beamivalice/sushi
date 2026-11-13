@@ -43,6 +43,12 @@ pub fn preload(recipe: manifest.Recipe, pipeline: metal.Pipeline) Error!bool {
     return registry.putStock(recipe, pipeline) catch error.OutOfMemory;
 }
 
+/// Tests only: `kernel` meets `name` next as a new process does, whatever an earlier test built. A holder of the
+/// pipeline keeps it.
+pub fn forget(name: []const u8) void {
+    _ = pipelines.remove(name);
+}
+
 /// The pipeline of the stock kernel `name`, built once.
 pub fn kernel(name: []const u8) Error!metal.Pipeline {
     if (pipelines.get(name)) |p| return p;

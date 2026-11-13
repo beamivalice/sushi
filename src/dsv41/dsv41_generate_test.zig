@@ -6802,3 +6802,103 @@ test "dsv41 engine: at the filters' edges a sampled token is one the filters all
         if (e.greedy and shape == .spread) try testing.expectEqual(@as(i32, @intCast(top)), drawn);
     };
 }
+
+fn roundIds(fx: *EngineFixture, tok: *Tokenizer, prompt: []const u32, want: u32, sampling: SamplingParams, diag: DsparkDiag, out: *std.ArrayList(u32)) !void {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try fx.xfm.resetCache();
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, tok, prompt, want, sampling, &.{}, .{ .dspark_enabled = true });
+    defer gen.deinit(a);
+    gen.dspark_diag = diag;
+    while (try gen.nextDspark(a)) |r| {
+        defer a.free(r.tokens);
+        try out.appendSlice(a, r.tokens);
+    }
+    try testing.expectEqualStrings("length", gen.finish_reason);
+}
+
+test "dsv41 sampled rounds: a request stopped by max_tokens inside a round is the prefix of the longer one, at every verify width, and every width gives one text (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..30];
+    const cases = [_]SamplingParams{
+        .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 },
+        .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .frequency_penalty = 0.3, .seed = 9 },
+        .{ .temperature = 0, .repeat_penalty = 1.5, .frequency_penalty = 0.4 },
+    };
+    const diags = [_]DsparkDiag{ .{ .rows = 2 }, .{ .rows = 5 }, .{ .rows = 16 }, .sweep, .off };
+    for (cases) |sampling| {
+        var base: std.ArrayList(u32) = .empty;
+        defer base.deinit(a);
+        for (diags, 0..) |diag, di| {
+            var full: std.ArrayList(u32) = .empty;
+            defer full.deinit(a);
+            try roundIds(&fx, &tok, prompt, 30, sampling, diag, &full);
+            try testing.expectEqual(@as(usize, 30), full.items.len);
+            if (di == 0) try base.appendSlice(a, full.items) else try testing.expectEqualSlices(u32, base.items, full.items);
+            for (1..25) |n| {
+                var cut: std.ArrayList(u32) = .empty;
+                defer cut.deinit(a);
+                try roundIds(&fx, &tok, prompt, @intCast(n), sampling, diag, &cut);
+                try testing.expectEqualSlices(u32, full.items[0..n], cut.items);
+            }
+        }
+    }
+}
+
+/// A digest of the logits of `steps` serial steps fed `ids[at..]`.
+fn tailDigest(fx: *EngineFixture, ctx: *trunk_mod.ForwardCtx, ids: []const u32, at: usize, steps: usize) ![32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    const vocab = fx.model().cfg.vocab;
+    for (0..steps) |j| {
+        const lg = try forwardIds(&fx.xfm, ctx, ids[at + j ..][0..1]);
+        defer _ = mlx.mlx_array_free(lg);
+        try mlx.check(mlx.mlx_array_eval(lg));
+        h.update(std.mem.sliceAsBytes((mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..vocab]));
+    }
+    return h.finalResult();
+}
+
+test "dsv41 engine: a verify of w rows cut back to a accepted drafts continues, bit for bit, as the serial feed of a + 1 tokens, at every width and accepted count (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const widest: usize = dsv41_dspark.dsv41_max_verify_rows;
+    var buf: [120]u32 = undefined;
+    const ids = fx.prompt(&buf);
+    for ([_]usize{ 9, 16, 17, 32, 33 }) |lead| {
+        var serial: [dsv41_dspark.dsv41_max_verify_rows + 1][32]u8 = undefined;
+        for (1..widest + 1) |k| {
+            try fx.xfm.resetCache();
+            var ctx = fx.xfm.defaultCtx();
+            _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[0..lead]));
+            for (0..k) |j| _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[lead + j ..][0..1]));
+            serial[k] = try tailDigest(&fx, &ctx, ids, lead + 40, 24);
+        }
+        for (1..widest + 1) |w| for (0..w) |accepted| {
+            try fx.xfm.resetCache();
+            var ctx = fx.xfm.defaultCtx();
+            _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[0..lead]));
+            const v = try dsv41_serving.dsv41VerifyImpl(&fx.xfm, &ctx, ids[lead..][0..w]);
+            defer _ = mlx.mlx_array_free(v);
+            try mlx.check(mlx.mlx_array_eval(v));
+            try dsv41_serving.dsv41FinishImpl(&fx.xfm, &ctx, accepted);
+            const got = try tailDigest(&fx, &ctx, ids, lead + 40, 24);
+            testing.expectEqualSlices(u8, &serial[accepted + 1], &got) catch |e| {
+                std.debug.print("lead {d} width {d} accepted {d}\n", .{ lead, w, accepted });
+                return e;
+            };
+        };
+    }
+}

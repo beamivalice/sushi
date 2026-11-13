@@ -247,10 +247,6 @@ fn blocksOf(g: matmul.Gpu, n: usize, n_simds: usize) c_int {
     } else {
         blocks = if (n_simds >= 4) 64 else 32;
     }
-    if (std.c.getenv("MLX_SDPA_BLOCKS")) |text| {
-        const forced = std.fmt.parseInt(c_int, std.mem.span(text), 10) catch 0;
-        if (forced > 0) blocks = @divTrunc(forced + 31, 32) * 32;
-    }
     return blocks;
 }
 

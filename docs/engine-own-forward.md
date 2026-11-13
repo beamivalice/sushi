@@ -554,6 +554,12 @@ rebuilds one.
   What MLX itself gets wrong or refuses is named in the test ([engine-mlx-gotchas](engine-mlx-gotchas.md#what-mlxs-bytes-depend-on)).
 - An op whose result has no elements returns it without a dispatch; a reduction over an axis of no elements into a
   result that has some is refused by name. An MLX array of no elements imports as an empty tensor of ours.
+- **`arange` does MLX's arithmetic**: the length from the f64 arguments, the step rounded to the
+  dtype as `T(start + step) - T(start)`, each element one fused multiply-add in the dtype; an f64 product cast after
+  differed in the bits at a fractional step. A step of 0, a NaN or infinite bound and a count over `INT_MAX` are
+  refused by name, as MLX refuses them, and so is an int32 range whose start or first step has no int32 value
+  (`engine arange gives MLX's bytes ...`). The stock-op, dense-product and
+  gather grids against MLX are `engine reductions, softmax, ...`, `engine dense products ...` and `engine gathers ...`.
 
 ## Ruled out
 

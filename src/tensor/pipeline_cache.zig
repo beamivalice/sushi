@@ -196,6 +196,7 @@ test "pipeline cache: a source kernel made from its recipe is what a launch find
 test "pipeline cache: a stock kernel made from its recipe is the pipeline kernel() answers" {
     try @import("../mlx.zig").requireGpu();
     const name = "rms_loopedfloat16";
+    stock.forget(name);
     const recipe: Recipe = .{ .kind = .stock, .function = name, .key = name };
     const report = finish(try start(&.{recipe}, 1));
     try testing.expectEqual(@as(usize, 1), report.made);

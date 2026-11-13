@@ -153,6 +153,10 @@ Kept because the launch flag cannot express what the env does.
 
 - *Stale scripts*: benches that export `SUSHI_ROUND_COST_PERSIST=0` set the default (persistence is opt-in); `SUSHI_QSA_NAX_PRECISION` is script-side only.
 
+## Removed 2026-11-13
+
+- *Read by the engine, set by nothing*: `MLX_SDPA_BLOCKS` (the two-pass attention's block count; a value changed the kernel's split and its bytes with no log line). MLX's own route still reads it inside MLX; the engine of our own does not.
+
 ## Removed 2026-11-11
 
 - *Measured, then adopted*: `SUSHI_DSV41_ENGINE` (DeepSeek STQ decode on the engine of our own; now the path on a GPU with matrix units, decided at the load: [engine-own-forward](engine-own-forward.md#where-it-serves)).
