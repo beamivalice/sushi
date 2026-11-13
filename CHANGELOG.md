@@ -11,6 +11,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **An agent turn tokenizes only the text it has not seen before**: each loaded model keeps the token ids of the
   prompt pieces it encoded, bounded in memory and reported on `/metrics`, so a long conversation's next turn no longer
   re-encodes its whole history.
+- **Qwen with MTP on a Mac without matrix units gives the same text as without MTP on an STQ pack**: a round there
+  verifies at most eight rows, where every row keeps its serial step's bits.
 - **Special-token text in an assistant turn is a token only where the model could have written it**: a stop such as
   `<|im_end|>`, or a special the sampler never draws, spelled out in an earlier reply now reaches the model as text, as
   in every other role; a function name a client forces is text too; a U+FDD0 a client sends now stays in the prompt,

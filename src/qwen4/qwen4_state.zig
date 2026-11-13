@@ -16,6 +16,9 @@ const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
 const qwen4_hc = @import("qwen4_hc.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
 const qwen4_ssm_group = @import("qwen4_ssm_group.zig");
+const model = @import("../model.zig");
+const mtp_mod = @import("../mtp.zig");
+const sushi_exl3 = @import("sushi_exl3");
 const Trunk = trunk.Trunk;
 
 /// The model-lifetime state.
@@ -228,6 +231,14 @@ pub const Ctx = struct {
             "  [qsa-arms] qsa={s} calls={d} mask={d} decode={d} verify={d} prefill={d}\n",
             .{ @tagName(arm), c.total(), c.mask, c.decode, c.verify, c.prefill },
         );
+    }
+
+    /// The widest verify block whose rows keep their decode tick's arithmetic: a trellis trunk's linears keep a row's
+    /// one-row arm only to `rowsMax` rows, past which they take the sorted GEMM; an affine trunk's, at every width.
+    pub fn verifyRowsMax(config: *const model.ModelConfig) ?usize {
+        if (config.trunk_quant == null) return null;
+        const rows = sushi_exl3.project_rows.rowsMax(.{ .exact = true, .wide = true });
+        return @min(mtp_mod.MAX_DEPTH + 1, @as(usize, @intCast(rows)));
     }
 };
 

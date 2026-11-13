@@ -1,5 +1,6 @@
 const trunk_mod = @import("../trunk.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
+const qwen4_state = @import("qwen4_state.zig");
 const trunk_helpers_test = @import("../trunk_helpers_test.zig");
 const nax_gate = @import("../nax_gate.zig");
 const ssm_cache = @import("../ssm_cache.zig");
@@ -2264,8 +2265,11 @@ fn gdnRecurLayerCase(wide: bool, proj: GdnProjections) !void {
         _ = mlx.mlx_array_free(e.ssm_state);
     };
 
+    // The widest verify the engine plans for this trunk, where every row still has its decode tick's bits.
+    const rows_max = qwen4_state.Ctx.verifyRowsMax(&xfm.config) orelse gdn_decode.MAX_SEQ;
+    const widest: c_int = @min(gdn_decode.MAX_SEQ, @as(c_int, @intCast(rows_max)));
     var seq: c_int = 1;
-    while (seq <= gdn_decode.MAX_SEQ) : (seq += 1) {
+    while (seq <= widest) : (seq += 1) {
         // A decode step between verifies, as the engine runs them.
         {
             const x = try gdnRecurRand(rnd, &.{ 1, 1, hidden }, 2.0, .bfloat16, s);
@@ -3883,7 +3887,7 @@ test "gdn_decode.step in gatedDeltaNetProjected: equals the chain at decode and 
     try gdnRecurLayerCase(true, .dense);
 }
 
-test "trunk STQ: a GDN layer on trellis projections verifies bit-identically to serial decode at every width" {
+test "trunk STQ: a GDN layer on trellis projections verifies bit-identically to serial decode at every width the engine plans" {
     try gdnRecurLayerCase(true, .trellis);
     try gdnRecurLayerCase(true, .stacked);
 }

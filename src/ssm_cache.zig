@@ -1420,6 +1420,9 @@ test "handOverSsmCheckpoint moves a tight live state without a copy, gives a vie
     };
     var reference = try captureSsmCheckpoint(a, &entries, 10, s);
     defer reference.deinit(a);
+    // The capture's command buffer holds the live state until it completes; a move donates only a buffer the live
+    // handle alone owns, so the hand-over waits for it.
+    try mlx.check(mlx.mlx_synchronize(s));
 
     var cp = try handOverSsmCheckpoint(a, &entries, 10, s);
     defer cp.deinit(a);

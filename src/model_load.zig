@@ -2349,7 +2349,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
         if (mtp_enabled) {
-            const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
+            const cap = @min(
+                generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
+                generate_mod.Generator.mtpVerifyDraftsMax(params.config),
+            );
             arch_load.warmVerify(params.config, xfm_ptr, cap, kv_quant_config) catch |err| {
                 var cause: [512]u8 = undefined;
                 log.warn("[spec-warmup] failed ({s}: {s}); the first round at each width pays its kernel compile inside the round.\n", .{ @errorName(err), latchedCause(&cause) });
@@ -2394,6 +2397,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.mtp_depth = @min(entry.mtp_depth, cap);
         xfm_ptr.mtp_depth_free = @min(xfm_ptr.mtp_depth_free, cap);
     };
+    // A round never drafts past the verify rows that stay byte-identical to serial decode.
+    const verify_drafts = generate_mod.Generator.mtpVerifyDraftsMax(params.config);
+    entry.mtp_depth = @min(entry.mtp_depth, verify_drafts);
+    xfm_ptr.mtp_depth_free = @min(xfm_ptr.mtp_depth_free, verify_drafts);
     if (entry.mtp != null and !arch_config.fact(params.config, "no_mtp_head")) log.info("[mtp] depth range {d}..{d} ({s})\n", .{
         depth_bounds.floorFor(depth_bounds.active, entry.mtp_depth),
         entry.mtp_depth,

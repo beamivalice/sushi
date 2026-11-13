@@ -1161,6 +1161,10 @@ const engine_vision: cfg_mod.Vision = .{ .layers = 2, .hidden = 128, .heads = 2,
 
 test "dsv41 vision: the tower on the engine's stream gives MLX's bytes, with no MLX op, no lend and no pipeline made after the warm" {
     try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    // A failed engine warm leaves its raise latched; taking it keeps it from failing a later test that reads the latch.
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was_enabled;
@@ -1269,6 +1273,8 @@ test "dsv41 vision: every image the release processor admits gives the tower row
     try testing.expect(fine.max_patches <= v.maxPatches() and fine.max_patches > 9000);
     try testing.expect(fine.min_cells >= 164 and fine.min_cells < 170);
     try testing.expect(fine.max_cells <= 1022 and fine.max_cells > 1000);
+    // MLX's plans the engine ports exist only on matrix units.
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     // The rows from which MLX's plan is one the engine ports, per linear.
     const g = try matmul.gpu();
     try testing.expectEqual(@as(usize, 257), portedFrom(g, 1024, 1024));
@@ -1322,6 +1328,9 @@ test "dsv41 vision: the fewest patches and aligner cells any image gives the rel
 
 test "dsv41 vision: at the release's geometry the engine's tower gives MLX's bytes for the smallest, a thin and a large image" {
     try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was_enabled;
@@ -1393,6 +1402,10 @@ test "dsv41 vision: at the release's geometry the engine's tower gives MLX's byt
 
 test "dsv41 vision: the tower's pipelines ride the manifest: a first load warms and stores them, a same-key load warms nothing" {
     try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    // A failed engine warm leaves its raise latched; taking it keeps it from failing a later test that reads the latch.
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was_enabled;

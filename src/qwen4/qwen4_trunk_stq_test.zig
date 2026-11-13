@@ -25,6 +25,7 @@ const Linear = @import("../linear.zig").Linear;
 const layer_weights = @import("../layer_weights.zig");
 const bindLinears = layer_weights.bindLinears;
 const mlx_util = @import("../mlx_util.zig");
+const mtp_policy = @import("../mtp_policy.zig");
 
 /// A trellis projection through the kernels against its host-decoded dense twin in bf16: the kernels' bar plus the
 /// twin's own weight rounding (a GDN layer on it measures 3.6e-3 and 4.7e-3).
@@ -712,4 +713,15 @@ test "trunk: loading and unloading a second trunk leaves the first's cached cons
     try mlx.check(mlx.mlx_astype(&zero, a.consts.?.mask_zero.?, .float32, s));
     try mlx.check(mlx.mlx_array_eval(zero));
     try testing.expectEqual(@as(f32, 0), (mlx.mlx_array_data_float32(zero) orelse return error.Unreadable)[0]);
+}
+
+test "trunk STQ: a Qwen verify plans no more rows than the trellis trunk keeps at each row's decode bits; an affine trunk plans the full depth" {
+    try mlx.requireGpu();
+    const stq = ModelConfig{ .model_type = "qwen4_exp", .trunk_quant = expert_exl3.Decode.tabled(.spec1, .w15) };
+    const exact_rows: u32 = @intCast(sushi_exl3.project_rows.rowsMax(.{ .exact = true, .wide = true }));
+    const drafts = mtp_policy.mtpVerifyDraftsMax(&stq);
+    try testing.expect(drafts + 1 <= exact_rows);
+    try testing.expectEqual(@min(mtp_mod.MAX_DEPTH, exact_rows - 1), drafts);
+    const affine = ModelConfig{ .model_type = "qwen4_exp" };
+    try testing.expectEqual(@as(u32, mtp_mod.MAX_DEPTH), mtp_policy.mtpVerifyDraftsMax(&affine));
 }

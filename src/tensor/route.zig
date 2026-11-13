@@ -3916,6 +3916,7 @@ test "engine erf gives MLX's bytes: f32 under and over the elements MLX takes tw
 
 test "engine quantized matmul gives MLX's bytes at the tower's shapes: the NAX tiles, aligned and not, 64 rows and 32" {
     try mlx.requireGpu();
+    if (!matrixUnits()) return error.SkipZigTest;
     const Build = struct {
         fn product(s: S, in: []const A) !A {
             var o: A = .{};
@@ -3969,6 +3970,7 @@ test "engine quantized matmul refuses by name what MLX sends to the vector and s
 
 test "engine attention gives MLX's bytes and strides at the tower's query chunks: aligned and not, a tail of 8 rows or fewer" {
     try mlx.requireGpu();
+    if (!matrixUnits()) return error.SkipZigTest;
     const Build = struct {
         const heads = 16;
         const dim = 64;

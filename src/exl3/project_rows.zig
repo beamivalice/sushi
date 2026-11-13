@@ -839,6 +839,7 @@ test "exl3 SIMD multi-row: every row equals the one-row launch bit for bit" {
 // sixteen: its head rows go eight or fewer at a time, each still its one-row launch.
 test "exl3 multi-row mode: at the lm_head's shape a wide exact verify of 9 to 16 rows gives each row its one-row launch's bits, on MLX's stream and on the engine's" {
     try mlx.requireGpu();
+    if (rowsMax(.{ .exact = true, .wide = true }) < NAX_ROWS_MAX) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();

@@ -1081,6 +1081,47 @@ test "a Qwen round below 8192 KV prices widths by the table's realized tokens an
     try testing.expect(plan.tau_ln < 0.0);
 }
 
+test "a Qwen STQ round drafts no wider than the rows its trellis trunk keeps at their decode bits, read each round" {
+    const sushi_exl3 = @import("sushi_exl3");
+    var xfm = testTrunk("qwen4_exp");
+    xfm.config.trunk_quant = sushi_exl3.format.Decode.tabled(.spec1, .w15);
+    var prompt: [1000]u32 = @splat(0);
+    var gen = Generator{
+        .opts = .{},
+        .xfm = &xfm,
+        .ctx = undefined,
+        .tok = undefined,
+        .next_token_id = 0,
+        .step = 0,
+        .max_tokens = 1,
+        .sampling = .{ .temperature = 0 },
+        .prompt_tokens = 0,
+        .completion_tokens = 0,
+        .finish_reason = "length",
+        .done = false,
+        .eos_token_ids = &.{},
+        .generated_ids = .empty,
+        .timeout_ns = 0,
+        .timer = io_util.Stopwatch.init(testing.io),
+        .last_hidden = .{ .ctx = null },
+        .has_last_hidden = false,
+        .prompt_ids_owned = &prompt,
+        .mtp_depth = mtp_mod.MAX_DEPTH,
+        .mtp_depth_free = mtp_mod.MAX_DEPTH,
+        .mtp_depth_current = mtp_mod.MAX_DEPTH,
+        .spec_cost_solo = false,
+    };
+    // The wide arm lost after the load, as a failed first launch leaves it: the load's own clamp read the wider cap.
+    const previous = sushi_exl3.kernels.gemm_nax_failed;
+    defer sushi_exl3.kernels.gemm_nax_failed = previous;
+    sushi_exl3.kernels.gemm_nax_failed = true;
+    const rows: u32 = @intCast(sushi_exl3.project_rows.rowsMax(.{ .exact = true, .wide = true }));
+    try testing.expect(rows < mtp_mod.MAX_DEPTH + 1);
+    const plan = gen.mtpRoundPlan();
+    try testing.expectEqual(rows - 1, plan.m_lo);
+    try testing.expectEqual(rows - 1, plan.m_hi);
+}
+
 test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncut rounds do, and the state behind the closer is the newest checkpoint (MTP_TEST_MODEL)" {
     const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
     try mlx.requireGpu();

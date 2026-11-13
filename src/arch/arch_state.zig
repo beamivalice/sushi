@@ -218,7 +218,7 @@ pub fn setVerifyRows(config: *const model.ModelConfig, c: *Ctx, on: bool) void {
 pub fn verifyRowsMax(config: *const model.ModelConfig) ?usize {
     const tag = arch_config.tagOf(config) orelse return null;
     return switch (tag) {
-        inline else => |t| if (comptime has(Decl(t, "Ctx"), "verifyRowsMax")) Decl(t, "Ctx").verifyRowsMax() else null,
+        inline else => |t| if (comptime has(Decl(t, "Ctx"), "verifyRowsMax")) Decl(t, "Ctx").verifyRowsMax(config) else null,
     };
 }
 

@@ -10,7 +10,7 @@ pub const NGRAM: usize = 4;
 pub const MIN_SUFFIX: u32 = 8;
 pub const MAX_DRAFT: u32 = 7;
 /// Nine verify rows: the widest verify whose rows match the decode tick and whose history
-/// stash fits `MtpHistStash` (upstream drafts 14 here).
+/// stash fits `MtpHistStash` (upstream drafts 14 here); `mtpLookupDraftCap` lowers it per arch.
 pub const MAX_DRAFT_STRONG: u32 = 8;
 pub const STRONG_SUFFIX: u32 = 32;
 const SUFFIX_CAP: u32 = 64;

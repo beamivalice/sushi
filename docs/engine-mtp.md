@@ -159,7 +159,8 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   the diff before the rule, -1.6% after). A line's own last token (`):\n`) agrees whatever the next line starts
   with, so a break counts only with agreement after it ([perf-baselines](qwen4-perf.md#mtp-lookup)).
 - **At most 8 drafts (9 verify rows)**: `MtpHistStash.host_ids` holds `MAX_DEPTH + 1` committed ids, and 9 rows is
-  the widest verify whose rows match the decode tick (`sdpaTickIdenticalGroups`). Upstream drafts 14.
+  the widest verify whose rows match the decode tick (`sdpaTickIdenticalGroups`), fewer where the arch's
+  `mtpVerifyDraftsMax` says so (7 drafts on a qwen4 trellis trunk without matrix units). Upstream drafts 14.
 - **The gate prices both rounds from the planner's own `MtpCostSource`** (measured width row, else the EV surface):
   a lookup of k drafts reads the table's runtime lookup row, else the MTP round at k without its k head steps. The
   lookup row is never stored, and the first round at each draft count is dropped as its compile.
@@ -244,14 +245,16 @@ serve up to `SINGLE_VERIFY_ROWS_MAX` (9) rows. `dflash_policy.ladder()` is that 
 ## Reproducibility
 
 - **Greedy MTP output is serial's byte for byte, auto mode included**: every verify row computes its position with
-  the decode tick's arithmetic at any width the plan can pick (`mtpVerifyDraftsMax`: `MAX_DEPTH` drafts on qwen4,
-  `MIMO_VERIFY_ROWS_MAX` rows on MiMo), so the width a round takes cannot flip a greedy token.
+  the decode tick's arithmetic at any width the plan can pick (`mtpVerifyDraftsMax`: `MAX_DEPTH` drafts on an affine
+  qwen4 trunk, at most `rowsMax` rows on a trellis one, `MIMO_VERIFY_ROWS_MAX` rows on MiMo; the load holds its depth
+  range there and every round reads the cap again, since a machine can lose its wide arm after the load), so the width
+  a round takes cannot flip a greedy token.
 - `test_mtp_equivalence.sh` compares full output bytes with `--no-mtp` and acquits nothing
   (`test_mtp_equivalence_strict.py`); its servers boot `--prefix-cache-entries 0`.
 - **Sampled auto-mode output follows the round times**: the plan reads measured round costs, and the draft counts
   decide which draws land where. A seeded byte comparison pins the plan (`SUSHI_MTP_ADAPTIVE=0
   SUSHI_MTP_COST_TABLE=0`, or a pinned depth).
-- **Trellis (STQ) trunk projections are row-invariant per arm**: a verify row equals its serial tick bit for bit on the machine's own arm (NAX where present, else SIMD, exact rows); NAX and SIMD boxes may differ from each other, the accepted cross-hardware rule ([engine-exl3-experts](engine-exl3-experts.md#dense-linears)).
+- **Trellis (STQ) trunk projections are row-invariant per arm**: a verify row equals its serial tick bit for bit on the machine's own arm (NAX where present, else SIMD, exact rows); NAX and SIMD boxes may differ from each other, the accepted cross-hardware rule ([engine-exl3-experts](engine-exl3-experts.md#dense-linears)). Without matrix units that arm holds 8 rows (`rowsMax`) and a ninth sends the block to the sorted GEMM, so qwen4's `Ctx.verifyRowsMax` caps an STQ verify there.
 - Pinned-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on two K3 packs).
 - The router and shared-expert gate run the dense-rows kernel at every width, serial decode included, so one arithmetic
   serves a row whether it decodes alone or verifies beside others on any device

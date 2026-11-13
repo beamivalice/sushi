@@ -53,7 +53,7 @@ pub const Ctx = struct {
     }
 
     /// The widest verify block whose rows keep their decode tick's arithmetic.
-    pub fn verifyRowsMax() usize {
+    pub fn verifyRowsMax(_: *const @import("../model.zig").ModelConfig) usize {
         return @intCast(@import("mimo_forward.zig").MIMO_VERIFY_ROWS_MAX);
     }
 };

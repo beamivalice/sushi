@@ -99,7 +99,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - **A load ends with the latch empty** (`settleLoadLatch`): an MLX error raised during the load that nothing handled is logged (`[load] MLX raised an error nothing handled`) and cleared, because the first request's `checkError` would fail on it as `MlxFailure` ("generation failed"). A step whose result matters must return `error.MlxError` through `mlx.check`; the latch is no channel for a load failure. `Warmup failed` and `[spec-warmup] failed` name the MLX message behind them.
 - A client-supplied PATH is proven on OUR side of the mlx boundary (stat → 400; an MLX error there latches).
 - In the unit-test binary a failing test's MLX error stays latched for the next test: a decode tick consumes it and
-  errors its slot. A test that runs a tick asserts `!mlx.errorPending()` first.
+  errors its slot. A test that runs a tick asserts `!mlx.errorPending()` first; a test whose failure can leave its raise
+  latched takes it on the way out (`errdefer mlx.dropLatchedErrorUnless(had_error)`), so the failure stays its own.
 
 ## Dtypes
 

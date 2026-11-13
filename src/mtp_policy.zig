@@ -968,8 +968,7 @@ pub fn mtpRoundPlanTraced(self: *Generator) MtpRoundPlan {
         "none";
     var cells: [256]u8 = undefined;
     const a = self.mtp_ev_accept;
-    const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
-    const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
+    const cap_row, const cap_free = mtpDepthCaps(self);
     const target = mtpWidthTrialTarget(t, kv_len, plan, cap_free, self.mtp_m_lo_streak >= 2);
     log.debug(
         "  [mtp-plan] r={d} kv={d} bucket={s} m_lo={d} m_hi={d} tau={d:.3} a=[{d:.2},{d:.2},{d:.2},{d:.2},{d:.2},{d:.2}] src={s} trial={s}{d} serial_step={s} streak={d} serial_left={d} drops=t{d}/c{d}/b{d} cap={d}/{d} solo={} rte={d} wt={d}/{d} tgt={?d} cells={s}\n",
@@ -994,14 +993,21 @@ pub fn mtpRoundPlanTraced(self: *Generator) MtpRoundPlan {
     return plan;
 }
 
+/// The round's draft caps, the configured row and its free bound: neither passes the rows a verify keeps at their
+/// decode bits, read each round because a machine can lose its wide arm after the load.
+fn mtpDepthCaps(self: *const Generator) struct { u32, u32 } {
+    const verify_max = @min(mtp_mod.MAX_DEPTH, mtpVerifyDraftsMax(&self.xfm.config));
+    const row = @min(@max(@as(u32, 1), self.mtp_depth), verify_max);
+    return .{ row, @min(@max(row, self.mtp_depth_free), verify_max) };
+}
+
 pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
-    const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
+    const cap_row, const cap_free = mtpDepthCaps(self);
     if (mtpPinnedDepth()) |d| {
         const forced = mtpForcedWidth(@min(d, cap_row), mtpVerifyDraftsMax(&self.xfm.config));
         self.mtp_ev_m_lo_prev = forced;
         return .{ .m_lo = forced, .m_hi = forced, .tau_ln = 0.0 };
     }
-    const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
     var cap: u32 = cap_row;
     const kv_len = self.mtpKvLen();
     if (!mtpAdaptiveEnabled() or self.mtp_ev_rounds < MTP_EV_WARMUP_ROUNDS) {
