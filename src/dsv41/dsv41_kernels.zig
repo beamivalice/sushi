@@ -1065,6 +1065,9 @@ pub const DecodeArgs = struct {
     /// `split` is then set.
     mixes: ?StageMixes = null,
     split: ?*?HcSplit = null,
+    /// Where rows can take two split counts (`ratio`), launch row 0 apart from the rows after it as those are: how a
+    /// load warms their launches at a context that holds one count.
+    apart: bool = false,
 };
 
 /// The mixes `z` `[L, (2 + hc) * hc]` of a hyper-connection stage and what splits them; `eps` is `hcEps`.
@@ -1092,7 +1095,7 @@ pub fn attnDecode(sc: *Scope, a: DecodeArgs) !A {
     while (r0 < L) {
         const s0 = rowSplits(a, K, r0);
         var r1 = r0 + 1;
-        while (r1 < L and rowSplits(a, K, r1) == s0) r1 += 1;
+        while (r1 < L and rowSplits(a, K, r1) == s0 and !(a.apart and a.ratio > 0 and K > 0 and r1 == 1)) r1 += 1;
         if (r0 == 0 and r1 == L) return attnDecodeSplit(sc, a, s0);
         var g = a;
         g.groups = 0;

@@ -2796,6 +2796,44 @@ test "dsv41 engine: after the load a forward of every width from 1 to 16 and a D
     try testing.expectEqual(keys, mlx.kernel_keys.count());
 }
 
+test "dsv41 engine: after the load a round whose rows take two attention split counts compiles nothing, at any width (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    try testing.expect(m.engine_decode);
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    // The fixture's contexts hold one split count, so a round's rows are launched apart by hand.
+    m.attn_apart = true;
+    defer m.attn_apart = false;
+    const late = mlx.engine.latePipelines();
+    for (2..dsv41_max_verify_rows + 1) |w| {
+        try fx.xfm.resetCache();
+        var ctx = fx.xfm.defaultCtx();
+        const lg = try forwardIds(&fx.xfm, &ctx, prompt[0..30]);
+        defer _ = mlx.mlx_array_free(lg);
+        try mlx.check(mlx.mlx_array_eval(lg));
+        // A prompt's last forward is as narrow as a round.
+        const tail = try forwardIds(&fx.xfm, &ctx, prompt[30..][0..w]);
+        defer _ = mlx.mlx_array_free(tail);
+        try mlx.check(mlx.mlx_array_eval(tail));
+        var d = try dsv41_serving.dsv41DraftImpl(&fx.xfm, try argmaxHost(&fx.xfm, tail));
+        defer d.deinit();
+        // Past the block a round repeats its last draft, as a copy round's rows are whatever the context held.
+        var round: [dsv41_max_verify_rows]u32 = undefined;
+        for (round[0..w], 0..) |*id, i| id.* = d.ids[@min(i, d.ids.len - 1)];
+        const logits = try dsv41_serving.dsv41VerifyImpl(&fx.xfm, &ctx, round[0..w]);
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_eval(logits));
+        try dsv41_serving.dsv41FinishImpl(&fx.xfm, &ctx, 0);
+        errdefer std.debug.print("at {d} rows\n", .{w});
+        try testing.expectEqual(late, mlx.engine.latePipelines());
+    }
+}
+
 test "dsv41 engine: after the load's warm no step or round compiles a kernel, whatever its width (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");

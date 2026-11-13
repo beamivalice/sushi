@@ -805,6 +805,8 @@ pub const Model = struct {
     /// TEMPORARY A/B: a decode-width STQ layer queues its routed chain from the stream's cache map before the host
     /// reads its picks (`Experts.Spec`); off, it waits for them.
     route_spec: bool = true,
+    /// A decode block's attention launches its first row apart from the rest (`DecodeArgs.apart`): set by the warm.
+    attn_apart: bool = false,
     /// Layers ahead whose picks a layer's router input predicts for the expert prefetch (`Experts.Hook.prefetch`), for a
     /// forward of 2 or more rows (a one-row step pays more for the prediction than it saves); 0 turns it off. Each row
     /// asks for its `prefetch_m` best uncached of its `prefetch_n` ranked.
@@ -2154,6 +2156,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
             // Grouped, the heads are the output projection's banks as they leave: no transposed copy from two rows on.
             .mixes = if (ride) |rs| .{ .z = rs.z, .hc = c.hc_mult, .iters = c.hc_iters, .eps = try kernels.hcEps(sc, c.eps, c.hc_eps) } else null,
             .split = &rode_split,
+            .apart = m.attn_apart,
             .groups = if (m.tap == null and m.trace == null and width_probe == null and H % c.o_groups == 0) c.o_groups else 0,
             .grouped = &grouped,
         });
@@ -3227,6 +3230,13 @@ fn warmOwn(m: *Model, t1: u32, schedules: enum { both, queued }) !void {
             try warmRun(try extend(m, &.{t1}, .last));
         }
         if (m.dspark != null) for (1..cfg_mod.ring_slack + 1) |w| try warmRound(m, t1, w);
+        // A round whose rows fall on two sides of an attention split step launches them apart, on pipelines that carry
+        // its row count: no context of the warm reaches a step, so the rounds are told to.
+        if (m.dspark != null) {
+            m.attn_apart = true;
+            defer m.attn_apart = false;
+            for (2..cfg_mod.ring_slack + 1) |w| try warmRound(m, t1, w);
+        }
     }
 }
 

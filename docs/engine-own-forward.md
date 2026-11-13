@@ -420,6 +420,10 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   only past 32768 keys; the fold of a second tile takes ids along an axis, a pipeline no shorter prompt makes).
 - **A path a prompt reaches only past a threshold is warmed by lowering the threshold**, never left to the first long
   prompt: the count must be no kernel's template value, and a test seals the engine and runs the path at that setting.
+- **A round whose rows take two attention split counts is warmed by telling the rounds to split** (`Model.attn_apart`,
+  `DecodeArgs.apart`): the split count steps with the context (768, 1408 and 2048 tokens on the release pack), a round
+  across a step launches its rows in parts on pipelines keyed by each part's row count, and no context of the warm
+  reaches a step. The warm runs every width once more with row 0 launched apart from the rows after it.
 - **The sampled verdict is warmed** (`dsv41_serving.warmSampledVerdict`, after `warmKernels`): `sampledDraws`, the
   function a round calls, runs on the engine's stream over zero logits of `[1, w, vocab]` f32 for every verify width
   with a suppress mask. The draw is one kernel (`sampler_draw`) whose temperature, top-k and top-p are inputs and whose
