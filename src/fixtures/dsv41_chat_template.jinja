@@ -1,7 +1,7 @@
-{#- DeepSeek-V4.1, transcribed from the release's encoding/encoding.py (text path) for
-    jinja.cpp: no dict merges or chained comparisons. Pinned byte-exact against the
-    encoder by tests/dsv41/dump_dsv41_template_cases.py over the shapes the server sends. jinja.cpp
-    drops a newline right after a block tag, so those are spelled out.
+{#- DeepSeek-V4.1, transcribed from the release's encoding/encoding.py (text path): the release
+    ships no template. Pinned byte-exact against the encoder by
+    tests/dsv41/dump_dsv41_template_cases.py over the shapes the server sends. A newline right
+    after a block tag is dropped, so those are spelled out.
     Kwargs: thinking_mode ("chat" | "thinking"; enable_thinking also accepted),
     reasoning_effort (low | high | max, or 1-100: the server sends 62 for medium, 87 for xhigh; default high). -#}
 {%- if thinking_mode is not defined -%}
