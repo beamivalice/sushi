@@ -11,14 +11,14 @@ MISSING=$(mktemp -d)/no-such-pack
 FAILED=""
 
 for bad in 101 -1 abc "" 6.5 +5 1000; do
-    out=$("$BIN" --serve --model "$MISSING" --ssd-prefetch "$bad" 2>&1); rc=$?
+    out=$("$BIN" --serve --model "$MISSING" --port 18990 --log-file off --ssd-prefetch "$bad" 2>&1); rc=$?
     if [ "$rc" -eq 0 ] || ! grep -q -- "--ssd-prefetch: expected an integer in 0..100" <<<"$out"; then
         echo "FAIL: --ssd-prefetch '$bad' (exit $rc) was not refused by its own message" >&2; FAILED=1
     fi
 done
 
 for good in 0 65 100; do
-    out=$("$BIN" --serve --model "$MISSING" --ssd-prefetch "$good" 2>&1) || true
+    out=$("$BIN" --serve --model "$MISSING" --port 18990 --log-file off --ssd-prefetch "$good" 2>&1) || true
     if grep -q -- "--ssd-prefetch:" <<<"$out"; then
         echo "FAIL: --ssd-prefetch $good was refused" >&2; FAILED=1
     fi

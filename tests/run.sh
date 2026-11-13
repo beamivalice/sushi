@@ -170,6 +170,23 @@ check_attach() {
     done < "$ENTRIES"
 }
 
+# check_default_port: a script that starts a server names its port. With none the server is the default port's, and
+# its lines land in the log of the server a user runs there.
+check_default_port() {
+    local rel launch
+    while IFS=$'\t' read -r rel _; do
+        # A shell line that holds the flag is a launch; elsewhere (a docstring names it too) only a quoted argument is.
+        case "$rel" in
+            lib/*) continue ;;
+            *.sh) launch='--serve([^a-z-]|$)' ;;
+            *) launch="[\"']--serve[\"']" ;;
+        esac
+        grep -v '^[[:space:]]*#' "$TESTS_DIR/$rel" > "$WORK/body.txt"
+        grep -Eq -- "$launch" "$WORK/body.txt" || continue
+        grep -Eq -- 'lib/boot\.sh|--port' "$WORK/body.txt" || echo "$rel: launches --serve with no --port" >> "$ERRORS"
+    done < "$ENTRIES"
+}
+
 # entries_of <pass>: this pass's runnable scripts in run order: phase, folder before root, name, sleep_inhibit last
 entries_of() {
     awk -F'\t' -v OFS='\t' -v pass="$1" -v tiers=",$TIERS," '
@@ -417,6 +434,7 @@ finish() {
 scan
 if [ "$MODE" = check ]; then
     check_attach
+    check_default_port
     [ "$NO_MATRIX" = 1 ] || check_matrix
     if [ -s "$ERRORS" ]; then
         sort -u "$ERRORS" | sed 's/^/FAIL /'

@@ -260,6 +260,11 @@ prompt), reads `sushi_log_since` (a line the engine logs once per process, such 
 `knobs` are one boot each per model pass (`knobs` keeps every prefix cache off and boots with a model-settings file
 naming `lib/knobs-bias.json`, written by `sushi_profile_settings`); `SUSHI_TEST_PACK_<MODEL>` overrides a pack,
 `SUSHI_BOOT_TIMEOUT_S` and `SUSHI_STOP_WAIT_S` bound the waits.
+
+**A script that runs `--serve` without the helper names its `--port`** (a flag or refusal test whose model never
+loads): with none the process is the default port's server, and its lines land in `~/.sushi/logs/sushi-12345.log`,
+the log of the server a user runs there. Such a script passes `--log-file off` too. `tests/run.sh --check` refuses a
+launch with no `--port`.
 A script that stops its server on purpose (a SIGTERM test) sets `SUSHI_EXPECT_GONE` before `sushi_stop`, so the exit is
 not reported as a crash. A Python `own` script uses `lib/sushi_boot.py` (`Server`, `gpu_lock`, `private_env`, `pack`).
 

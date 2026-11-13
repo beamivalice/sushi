@@ -9,7 +9,7 @@ BIN=${SUSHI_BIN:-zig-out/bin/sushi}
 MISSING=$(mktemp -d)/no-such-pack
 FAILED=""
 
-out=$("$BIN" --serve --model "$MISSING" --ds41-mlx-engine 2>&1) || true
+out=$("$BIN" --serve --model "$MISSING" --port 18990 --log-file off --ds41-mlx-engine 2>&1) || true
 if grep -qi "unrecognized\|unknown argument" <<<"$out"; then
     echo "FAIL: --ds41-mlx-engine was not recognized: $out" >&2; FAILED=1
 fi

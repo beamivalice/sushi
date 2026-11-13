@@ -3,7 +3,8 @@
 # tests/run.sh and tests/lib/boot.sh against a fixture tree and a Python stub `sushi` (serves /health, /props,
 # /v1/models and prints `Model ready`), on a private GPU_LOCK_DIR:
 #   [1] --check: a valid tree passes; a headerless file, a bad header, an unknown folder, a missing matrix row,
-#       a row whose file is gone and an attach script that boots are each refused
+#       a row whose file is gone, an attach script that boots and a script that serves on the default port are
+#       each refused
 #   [2] --list: the plan per pass, tier filters and --only
 #   [3] the helper: pack lookup, profiles, boot/stop (lock, END marker, flags, private HOME and cache root), a boot
 #       that dies or never gets ready, a crash, a server that ignores TERM, the EXIT trap, attach, log slice, require
@@ -102,6 +103,7 @@ m_folder() { mk "$1" other/test_x.sh tier=host; }
 m_norow() { mk "$1" test_new.sh tier=host; }
 m_rowgone() { printf '| `./tests/test_gone.sh` | gone |\n' >> "$1/CLAUDE.md"; }
 m_attachboots() { mk "$1" test_boots.sh tier=live boot=api; printf '"$SUSHI_BIN" --serve --model x\n' >> "$1/test_boots.sh"; matrix "$1"; }
+m_defaultport() { mk "$1" test_dp.sh tier=host; printf '"$BIN" --serve --model "$MISSING" --some-flag\n' >> "$1/test_dp.sh"; matrix "$1"; }
 refused "a headerless file" "test_noheader.sh: no '# sushi-test: ...' header" m_headerless
 refused "a live script without boot=" "a live script needs boot=" m_nolivebo
 refused "an unknown header key" "unknown header key 'flavour'" m_badkey
@@ -113,6 +115,7 @@ refused "an unknown folder" "folder 'other' is not" m_folder
 refused "a script with no matrix row" "test_new.sh: no row in tests/CLAUDE.md" m_norow
 refused "a row whose file is gone" "test_gone.sh: a tests/CLAUDE.md row names a file that is gone" m_rowgone
 refused "an attach script that launches sushi" "test_boots.sh: boot=api is an attach script but launches sushi" m_attachboots
+refused "a script that serves on the default port" "test_dp.sh: launches --serve with no --port" m_defaultport
 d="$WORK/mut-nomatrix"
 cp -R "$FX" "$d"
 m_norow "$d"
