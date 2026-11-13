@@ -215,8 +215,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 | a broad area | `-Dmodel=` (above); a narrow check names its tests with `-Dtest-filter=`, which stays parallel |
 | docs only, or test scripts only | nothing in Zig; `tests/run.sh --check` and the scripts it touched |
 | a landing on main | the row above that fits its change, with the tiny-fixture envs set, plus `python3 tests/suite_guards.py` and the touched area's scripts |
-| the end of a series of landings (shared files, `build.zig`, `mlx.zig`, several areas stacked) | `zig build test` with the tiny-fixture envs set, then `tests/test_arch_drop.sh`, once for the series, never per landing |
-| a version bump (release step 1) | `zig build test` with the tiny-fixture envs set |
+| the end of a series of landings (shared files, `build.zig`, `mlx.zig`, several areas stacked) | `zig build test` with the tiny-fixture envs set, then `tests/test_arch_drop.sh --since <the series' base>`, once for the series, never per landing |
+| a version bump (release step 1) | `zig build test` with the tiny-fixture envs set, then `tests/test_arch_drop.sh --since <the previous version's tag>` |
 | a bisect of an unexplained failure | the subset that fails, widened only if it does not reproduce there |
 
 The full suite is the only run that sees every test in its real binary and order: a test that leaks or fails alone can
@@ -230,8 +230,11 @@ its checks locally. It runs `test-build` (every test compiles), `test-host` and 
 `workflow_dispatch` choice (`tier: all`), because a hosted runner's GPU flips rounding ties the M5 holds.
 The hermetic guards are one list, `tests/hermetic_guards.sh`, which CI calls and every landing runs locally; it fails
 on a skip, so a box without PyYAML (`python3 -m pip install pyyaml`) cannot pass it unseen.
-The arch drop test runs locally, never on CI (about 17 minutes here, several times that on a runner), once at the end
-of a series of landings and at a version bump, never per landing.
+The arch drop test runs locally, never on CI, once at the end of a series of landings and at a version bump, never per
+landing. `--since <ref>` takes only the architectures whose folder `src/<arch>/` changed after that commit: an
+architecture the series did not touch is not dropped, and a series that touched no arch folder drops nothing. Its jobs
+(a drop and a single-arch build for each architecture taken) run at once: all eight took 11.5 minutes on the M5 Max at
+a954450b (the slowest drop's 687 s), against 42 minutes one after another.
 A landing runs what its diff can break and nothing for ceremony: its new tests, the filters of the code it changed, one
 arch bucket when it reaches that arch widely. A rebase that touched none of its files repeats no run.
 

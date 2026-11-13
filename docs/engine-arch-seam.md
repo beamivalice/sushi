@@ -236,19 +236,22 @@ A key the file does not know, or a bench path that is missing, stops the configu
 
 ## Dropping an architecture
 
-`tests/test_arch_drop.sh` proves a drop compiles before anyone makes it: for each arch in `DROPPABLE`, in a temporary
+`tests/test_arch_drop.sh` proves a drop compiles before anyone makes it: for each arch it takes, in a temporary
 worktree of HEAD, it deletes `src/<arch>/` and the `// arch:<arch>` registry lines, then runs `zig build`,
 `zig build test-build` (every test binary compiles) and `zig build test-host` with `-Darchs=<the rest>` (Debug), and
 `tests/test_doc_links.sh`. Deleting the folder is the real
 check: with the folder present, `-Darchs` alone still resolves a stray import. No GPU, no model, no lock; it obeys the
 QUIET marker like any build. Before any drop it checks that each registry entry is one marked line over an existing
 folder. `DROP_TRY=<arch>` runs the same check for an arch not in the list (a stray reference fails it in seconds),
-`DROP_KEEP=1` keeps the worktree.
+`DROP_KEEP=1` keeps the worktrees.
 
-CI runs it on every PR as a step of the build-and-test job, after the test tier, on the runner and build that job
-already set up; the loop covers every arch in `DROPPABLE` (mimo2, dsv41, glm5 and qwen4 today).
+It takes every arch in `DROPPABLE` (mimo2, dsv41, glm5 and qwen4 today) by default, and with `--since <ref>` only those
+whose folder `src/<arch>/` changed after that commit: the run a series' end and a version bump owe
+([testsuite](testsuite.md#what-a-change-runs)). `--plan` prints the choice and builds nothing. It runs locally, never
+on CI. The jobs are independent (a worktree each, an install directory each), so they all run at once and a stop of the
+script stops every step; `tests/test_arch_drop_self.sh` holds the choice, the jobs and the stop to a stand-in compiler.
 
-After the drops it builds each registered arch alone: `zig build -Doptimize=ReleaseFast -Darchs=<it> -p <a directory of
+Beside the drops it builds each arch it takes alone: `zig build -Doptimize=ReleaseFast -Darchs=<it> -p <a directory of
 its own>`, no host tier. A subset build takes comptime branches a full build never does (a union with no prong, a list
 with no entry), and a drop leaves the other archs in, so only this pass catches them. A union or enum built from the
 archs that declare something is empty in a build with none: `UnionOf` in `arch/drafter.zig` returns an empty
