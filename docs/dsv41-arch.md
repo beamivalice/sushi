@@ -1222,6 +1222,10 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   in, are identical bytes, from RAM and from an SSD file written by one tier and read by a fresh one. A restore off the
   cold run's chunk grid differs from cold at rounding level, as on every arch (the GPU forward is not
   batch-invariant); the Generator test restores at the prompt-end snapshot.
+- **A point's file is not byte-stable across round mixes; its continuation is**: `captureStateShared` keeps the
+  whole window ring and the draft stage rings, dead slots too, so the rows a verify cut back stay in them. Of 1,768
+  (lead, width, accepted) combinations on the tiny pack, 1,664 gave another state digest and all 1,768 the same
+  logits for the next 24 steps (the dead slots are never read). Zeroing them is the change if equal files are wanted.
 - **Bills.** The RAM tier's residency is the checkpoints' bytes (`kv_bytes`), released on eviction and unload. A prefill
   holds its list while it runs: the connection-thread and admission bill add `server.dsv41CheckpointReserve`, with a
   RAM tier the capped list plus the copy taken before a thin (each at most the request's state), SSD-first the writer's
