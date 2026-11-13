@@ -64,8 +64,7 @@ Otherwise, output directly after </think> with tool calls or final response.
 {{- m['content'] or '' -}}
 {%- if m['tool_calls'] -%}{{ '\n\n' }}<{{ DSML }} calls>
 {% for tc in m['tool_calls'] %}<{{ DSML }} invoke name="{{ tc['function']['name'] }}">
-{% for k, v in tc['function']['arguments'] | items %}<{{ DSML }} parameter name="{{ k }}" string="{{ 'true' if v is string else 'false' }}">{{ v if v is string else v | tojson }}</{{ DSML }} parameter>
-{% endfor %}</{{ DSML }} invoke>
+{% for k, v in tc['function']['arguments'] | items %}<{{ DSML }} parameter name="{{ k }}" string="{{ 'true' if v is string else 'false' }}">{{ v if v is string else v | tojson }}</{{ DSML }} parameter>{% if not loop.last %}{{ '\n' }}{% endif %}{% endfor %}{{ '\n' }}</{{ DSML }} invoke>
 {% endfor %}</{{ DSML }} calls>
 {%- endif -%}
 <｜end▁of▁sentence｜>

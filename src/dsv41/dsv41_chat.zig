@@ -54,6 +54,64 @@ pub const pretokenizer = struct {
     }
 };
 
+fn userSide(role: []const u8) bool {
+    return std.mem.eql(u8, role, "user") or std.mem.eql(u8, role, "tool");
+}
+
+/// The place among `calls` of the call `msg` answers: the last one of its id, or the first's where no call has it.
+fn callPlace(msg: anytype, calls: anytype) usize {
+    const id = msg.tool_call_id orelse return 0;
+    var place: usize = 0;
+    for (calls, 0..) |call, i| {
+        if (call.id.len > 0 and std.mem.eql(u8, call.id, id)) place = i;
+    }
+    return place;
+}
+
+/// Puts each user turn's tool results in the order of the calls they answer, in place, as the release's encoder does
+/// before it renders a prompt or collects an image (`sort_tool_results_by_call_order`). The prompt carries no call
+/// id, so the model reads a result as the answer of the call at its place. A turn is the user and tool messages in a
+/// row, whose user messages keep their places; the calls are those of the last assistant message that made any;
+/// results of one place keep their order.
+pub fn orderMessages(messages: anytype) void {
+    const Msg = std.meta.Elem(@TypeOf(messages));
+    var calls: @FieldType(Msg, "tool_calls") = null;
+    var i: usize = 0;
+    while (i < messages.len) {
+        if (!userSide(messages[i].role)) {
+            if (std.mem.eql(u8, messages[i].role, "assistant")) if (messages[i].tool_calls) |made| {
+                if (made.len > 0) calls = made;
+            };
+            i += 1;
+            continue;
+        }
+        var end = i;
+        while (end < messages.len and userSide(messages[end].role)) end += 1;
+        const known = if (calls) |made| for (made) |call| {
+            if (call.id.len > 0) break true;
+        } else false else false;
+        if (known) {
+            // An insertion sort over the places the tool messages hold: a turn has a handful.
+            const turn = messages[i..end];
+            for (turn, 0..) |msg, at| {
+                if (!std.mem.eql(u8, msg.role, "tool")) continue;
+                const place = callPlace(msg, calls.?);
+                var hole = at;
+                var back = at;
+                while (back > 0) {
+                    back -= 1;
+                    if (!std.mem.eql(u8, turn[back].role, "tool")) continue;
+                    if (callPlace(turn[back], calls.?) <= place) break;
+                    turn[hole] = turn[back];
+                    hole = back;
+                }
+                turn[hole] = msg;
+            }
+        }
+        i = end;
+    }
+}
+
 test "DeepSeek's built-in effort table is the encoder's 1-100 ladder" {
     const d = effort.table.table;
     for ([_]eff.Effort{ .low, .medium, .high, .xhigh, .max }, [_]u8{ 50, 62, 75, 87, 100 }) |w, n| try std.testing.expectEqualDeep(eff.Row{ .offered = true, .sends = .{ .scale = n } }, d.row(w));
@@ -112,4 +170,67 @@ test "the pinned template renders a prompt's text before its last assistant open
         try std.testing.expect(std.mem.eql(u8, tail, "<think>") or std.mem.eql(u8, tail, "</think>"));
         try std.testing.expect(std.mem.startsWith(u8, next, now[0..at]));
     };
+}
+
+const OrderCall = struct { id: []const u8 };
+const OrderMsg = struct { role: []const u8, content: []const u8 = "", tool_calls: ?[]const OrderCall = null, tool_call_id: ?[]const u8 = null };
+
+fn expectOrder(want: []const []const u8, got: []const OrderMsg) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g.content);
+}
+
+test "orderMessages: a turn's tool results take the order of the calls they answer" {
+    const calls = [_]OrderCall{ .{ .id = "a" }, .{ .id = "b" }, .{ .id = "c" } };
+    var msgs = [_]OrderMsg{
+        .{ .role = "user", .content = "q" },
+        .{ .role = "assistant", .content = "calls", .tool_calls = &calls },
+        .{ .role = "tool", .content = "C", .tool_call_id = "c" },
+        .{ .role = "tool", .content = "A", .tool_call_id = "a" },
+        .{ .role = "tool", .content = "B", .tool_call_id = "b" },
+    };
+    orderMessages(@as([]OrderMsg, &msgs));
+    try expectOrder(&.{ "q", "calls", "A", "B", "C" }, &msgs);
+}
+
+test "orderMessages: a user message keeps its place, a result of no known call sorts with the first call's, equal places keep their order" {
+    const calls = [_]OrderCall{ .{ .id = "a" }, .{ .id = "b" } };
+    var msgs = [_]OrderMsg{
+        .{ .role = "assistant", .content = "calls", .tool_calls = &calls },
+        .{ .role = "tool", .content = "B", .tool_call_id = "b" },
+        .{ .role = "user", .content = "also" },
+        .{ .role = "tool", .content = "stale", .tool_call_id = "zz" },
+        .{ .role = "tool", .content = "none" },
+        .{ .role = "tool", .content = "A", .tool_call_id = "a" },
+    };
+    orderMessages(@as([]OrderMsg, &msgs));
+    try expectOrder(&.{ "calls", "stale", "also", "none", "A", "B" }, &msgs);
+}
+
+test "orderMessages: the last calls order a later turn past an assistant turn without calls, and a system turn ends a turn" {
+    const calls = [_]OrderCall{ .{ .id = "a" }, .{ .id = "b" } };
+    var msgs = [_]OrderMsg{
+        .{ .role = "assistant", .content = "calls", .tool_calls = &calls },
+        .{ .role = "tool", .content = "B1", .tool_call_id = "b" },
+        .{ .role = "system", .content = "note" },
+        .{ .role = "tool", .content = "A1", .tool_call_id = "a" },
+        .{ .role = "assistant", .content = "said" },
+        .{ .role = "tool", .content = "B2", .tool_call_id = "b" },
+        .{ .role = "tool", .content = "A2", .tool_call_id = "a" },
+    };
+    orderMessages(@as([]OrderMsg, &msgs));
+    try expectOrder(&.{ "calls", "B1", "note", "A1", "said", "A2", "B2" }, &msgs);
+}
+
+test "orderMessages: calls without an id order nothing, and results before any call stay as sent" {
+    const blank = [_]OrderCall{ .{ .id = "" }, .{ .id = "" } };
+    var msgs = [_]OrderMsg{
+        .{ .role = "tool", .content = "x", .tool_call_id = "b" },
+        .{ .role = "tool", .content = "y", .tool_call_id = "a" },
+        .{ .role = "assistant", .content = "calls", .tool_calls = &blank },
+        .{ .role = "tool", .content = "B", .tool_call_id = "b" },
+        .{ .role = "tool", .content = "A", .tool_call_id = "a" },
+    };
+    orderMessages(@as([]OrderMsg, &msgs));
+    try expectOrder(&.{ "x", "y", "calls", "B", "A" }, &msgs);
 }

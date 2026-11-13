@@ -657,6 +657,7 @@ fn handleResponsesInner(
         return;
     };
     defer pi.deinit();
+    chat_mod.orderMessages(config.model_type, pi.messages.items);
 
     if (responsesMediaRefusal(&pi)) |fault| {
         log.warn("POST /v1/responses -> 400 ({s})\n", .{fault.text()});

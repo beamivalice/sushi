@@ -8,7 +8,8 @@ cases through the template engine.
       [--dump src/fixtures/dsv41_template_cases.json]
 
 The server hands the template tool-call `arguments` as objects, omits `reasoning_content` when
-absent, and passes `thinking_mode` and the effort it mapped (low|high|max, or 62 for medium and 87 for xhigh).
+absent, passes `thinking_mode` and the effort it mapped (low|high|max, or 62 for medium and 87 for xhigh),
+and puts a turn's tool results in the order of their calls before it renders (the `client_order` cases).
 """
 import argparse
 import importlib.util
@@ -45,6 +46,46 @@ LATE_SYSTEM = [
 ]
 TWO_USERS = [{"role": "user", "content": "First."}, {"role": "user", "content": "Second."}]
 
+def _call(cid, city):
+    return {"id": cid, "type": "function", "function": {"name": "get_weather", "arguments": {"city": city}}}
+
+# Results come back in completion order: the encoder puts them in call order.
+OUT_OF_ORDER = [
+    {"role": "user", "content": "Weather in Paris, Rome and Oslo?"},
+    {"role": "assistant", "content": "", "reasoning_content": "Three calls.", "tool_calls": [_call("a", "Paris"), _call("b", "Rome"), _call("c", "Oslo")]},
+    {"role": "tool", "content": "Oslo: snow, -2C", "tool_call_id": "c"},
+    {"role": "tool", "content": "Paris: sunny, 22C", "tool_call_id": "a"},
+    {"role": "tool", "content": "Rome: cloudy, 19C", "tool_call_id": "b"},
+]
+# A user message keeps its place among the results; an id no call has sorts with the first call's.
+MIXED_TURN = [
+    {"role": "user", "content": "Weather in Paris and Rome?"},
+    {"role": "assistant", "content": "", "tool_calls": [_call("a", "Paris"), _call("b", "Rome")]},
+    {"role": "tool", "content": "Rome: cloudy, 19C", "tool_call_id": "b"},
+    {"role": "user", "content": "Also say which is warmer."},
+    {"role": "tool", "content": "stale result", "tool_call_id": "zz"},
+    {"role": "tool", "content": "Paris: sunny, 22C", "tool_call_id": "a"},
+    {"role": "assistant", "content": "Paris is warmer.", "reasoning_content": "22 over 19."},
+    {"role": "user", "content": "And Oslo?"},
+]
+# A call without arguments keeps the line its parameters would take.
+NO_ARGUMENTS = [
+    {"role": "user", "content": "What is in the scene?"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "a", "type": "function", "function": {"name": "scene_summary", "arguments": {}}},
+        _call("b", "Paris")]},
+    {"role": "tool", "content": "3 objects", "tool_call_id": "a"},
+    {"role": "tool", "content": "Paris: sunny, 22C", "tool_call_id": "b"},
+]
+# The last calls still order a later turn's results, past an assistant turn without calls.
+LATER_TURN = PARALLEL + [
+    {"role": "assistant", "content": "Both fine."},
+    {"role": "tool", "content": "Rome again: rain", "tool_call_id": "b"},
+    {"role": "tool", "content": "Paris again: sun", "tool_call_id": "a"},
+]
+
+CLIENT_ORDER = [OUT_OF_ORDER, MIXED_TURN, LATER_TURN]
+
 # (label, messages, tools, thinking_mode, reasoning_effort)
 CASES = [
     ("simple/chat", SIMPLE, None, "chat", "low"),
@@ -63,6 +104,11 @@ CASES = [
     ("parallel calls/thinking", PARALLEL, TOOLS, "thinking", "high"),
     ("late system turn/thinking", LATE_SYSTEM, None, "thinking", "high"),
     ("consecutive users/chat", TWO_USERS, None, "chat", "low"),
+    ("results out of call order/thinking", OUT_OF_ORDER, TOOLS, "thinking", "high"),
+    ("results out of call order/chat", OUT_OF_ORDER, TOOLS, "chat", "low"),
+    ("a user message and an unknown id among the results/thinking", MIXED_TURN, TOOLS, "thinking", "high"),
+    ("a later turn's results/chat", LATER_TURN, TOOLS, "chat", "low"),
+    ("a call without arguments/thinking", NO_ARGUMENTS, TOOLS, "thinking", "high"),
 ]
 
 
@@ -95,8 +141,12 @@ def main():
     enc = load_encoder(args.encoding)
     out = []
     for label, messages, tools, mode, effort in CASES:
-        out.append({"label": label, "messages": messages, "tools": tools, "thinking_mode": mode,
-                    "reasoning_effort": effort, "expected": reference(enc, messages, tools, mode, effort)})
+        case = {"label": label, "messages": messages, "tools": tools, "thinking_mode": mode,
+                "reasoning_effort": effort, "expected": reference(enc, messages, tools, mode, effort)}
+        # The encoder reorders these before it renders: the server orders its messages first (`chat.orderMessages`).
+        if messages in CLIENT_ORDER:
+            case["client_order"] = True
+        out.append(case)
     if args.dump:
         with open(args.dump, "w") as f:
             json.dump(out, f, ensure_ascii=False, indent=1)

@@ -2381,6 +2381,7 @@ pub fn handleChatCompletions(
     var wire = WireMessages.init(allocator);
     defer wire.deinit();
     try readOpenAiMessages(&wire, messages_val.array.items, request_media.visionPreprocFromConfig(config));
+    chat_mod.orderMessages(config.model_type, wire.messages.items);
     const messages = &wire.messages;
     if (wire.media.refusal()) |fault| {
         log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{fault.text()});

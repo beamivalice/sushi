@@ -77,6 +77,16 @@ pub fn editsLateSystem(model_type: []const u8) bool {
     }
 }
 
+/// Puts `messages` in the order `model_type`'s own encoder renders them in, where its chat face has one
+/// (`orderMessages`), in place; no other arch's messages move. A request is ordered once, before its render and
+/// before its media are collected, so both read one order.
+pub fn orderMessages(model_type: []const u8, messages: anytype) void {
+    const tag = registry.ofModelType(model_type) orelse return;
+    switch (tag) {
+        inline else => |t| if (@hasDecl(faceOf(t), "orderMessages")) faceOf(t).orderMessages(messages),
+    }
+}
+
 /// The first `model_type` the arch `name` serves, or null when the build leaves it out (tests of shared code).
 pub fn modelTypeOf(comptime name: []const u8) ?[]const u8 {
     if (comptime !@hasField(registry.Tag, name)) return null;

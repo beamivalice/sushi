@@ -19,6 +19,8 @@ earlier history is mlx-serve's, in that project's changelog.
   which broke tool calls in agent sessions. A seed's text changes once more with the fix.
 - **A turn that stops because its tool call could not be read says so in the server log**: the reply still goes out
   with the broken markup removed, and a `[tool-parse]` line now records what was cut.
+- **DeepSeek reads parallel tool results in the order it made the calls**: results a client returns in another order,
+  and a tool call with no arguments, now reach the model exactly as DeepSeek's own encoder writes them.
 - **Parallel tool calls replayed through `/v1/responses` are one assistant turn on every model**: without a reasoning
   item before them each call used to open a turn of its own, a prompt no model was trained on and no cache could reuse.
 - **Settings opens with a copyable GPU wired-limit command**: the `sudo sysctl iogpu.wired_limit_mb=…` line sets all

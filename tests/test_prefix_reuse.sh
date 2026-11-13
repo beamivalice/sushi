@@ -5,6 +5,9 @@
 #  A. A repeat of a prompt answers byte-for-byte what its first request did (greedy), and its `cached_n` covers the
 #     prompt: the first request of a fresh nonce text is cold, its repeat restores from the SSD entry.
 #  B. The next turn of a conversation (turn 1 + its reply + a follow-up) restores turn 1's prompt.
+#  C. DeepSeek only: its encoder writes the results of parallel tool calls in the order of the calls. A conversation
+#     whose results arrive in another order is the same prompt, so it reuses the prompt of the one sent in call order,
+#     on all three APIs. Other models render the client's order: the section is skipped there.
 #
 # Restore points sit at each prompt's end less a 30-token backoff, so turn 2 is held to turn 1's prompt less a slack,
 # not to the reply's tokens: those re-render, and only a tool loop's thought point covers them.
@@ -138,6 +141,84 @@ check "turn 2 reuses turn 1's prompt (cached_n >= prompt_tokens - $SLACK)" "$((C
 check "turn 2 logs a restore from SSD" "$(restored_from_ssd; echo $?)" "no '[prefix] reused N of M prompt tokens from SSD' line"
 if [ "$CACHED" -ge $((T1_PN + T1_CN - 8)) ]; then
     echo "  note: turn 2 also reused turn 1's generated tokens (cached_n $CACHED >= $((T1_PN + T1_CN - 8)))"
+fi
+
+# ── C. Tool results in another order than the calls ──
+# post <path> <body>: sets R and REQ_LOG.
+post() {
+    local off
+    off=$(wc -c < "$SUSHI_LOG" | tr -d ' ')
+    R=$(curl -sf -m 900 "$BASE$1" -H 'Content-Type: application/json' -d "$2")
+    REQ_LOG=$(tail -c +$((off + 1)) "$SUSHI_LOG")
+}
+# "<reused> <prompt>" of the request's restore line, "0 0" without one.
+reused() { printf '%s\n' "$REQ_LOG" | sed -nE 's/.*prefix\] reused ([0-9]+) of ([0-9]+) prompt tokens.*/\1 \2/p' | tail -1 | grep . || echo "0 0"; }
+
+# order_pair <api name> <path> <body in call order> <body with the two results swapped>
+order_pair() {
+    local before n m
+    before=$(persisted_count)
+    post "$2" "$3"
+    [ -n "$R" ] || { check "$1: the conversation in call order answers" 1; return; }
+    wait_persisted "$before"
+    post "$2" "$4"
+    [ -n "$R" ] || { check "$1: the conversation with its results swapped answers" 1; return; }
+    read -r n m <<< "$(reused)"
+    echo "  $1: results swapped, reused $n of $m prompt tokens"
+    check "$1: results sent out of call order reuse the in-order prompt (reused >= prompt - $SLACK)" "$((m > 0 && n >= m - SLACK ? 0 : 1))" "reused $n of $m"
+}
+
+echo
+if [ "$SUSHI_ARCH" != deepseek_v41 ]; then
+    echo "--- C: skipped ($SUSHI_ARCH renders tool results in the client's order) ---"
+else
+    echo "--- C: tool results sent out of call order are the in-order prompt ---"
+    # Each result is far longer than the slack, so a prompt that kept the client's order shares neither.
+    RES_A="File a.txt: $(background 12)"
+    RES_B="File b.txt: $(background 12)"
+    ARGS_A='{"path":"a.txt"}'
+    ARGS_B='{"path":"b.txt"}'
+    PARAMS='{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}'
+
+    oai() { # <first result id> <second result id>
+        jq -nc --arg sys "${SUSHI_NONCE}c1 You read files when asked." --arg a "$RES_A" --arg b "$RES_B" --arg aa "$ARGS_A" --arg ab "$ARGS_B" \
+            --argjson params "$PARAMS" --arg first "$1" '
+            {call_a: {role:"tool", tool_call_id:"call_a", content:$a}, call_b: {role:"tool", tool_call_id:"call_b", content:$b}} as $res
+            | {model:"sushi", max_tokens:8, temperature:0, stream:false,
+               tools:[{type:"function", function:{name:"read_file", description:"Read a file.", parameters:$params}}],
+               messages:([{role:"system", content:$sys}, {role:"user", content:"Read both files."},
+                          {role:"assistant", content:"", tool_calls:[
+                              {id:"call_a", type:"function", function:{name:"read_file", arguments:$aa}},
+                              {id:"call_b", type:"function", function:{name:"read_file", arguments:$ab}}]}]
+                         + (if $first == "call_a" then [$res.call_a, $res.call_b] else [$res.call_b, $res.call_a] end))}'
+    }
+    order_pair "chat completions" /v1/chat/completions "$(oai call_a)" "$(oai call_b)"
+
+    ant() {
+        jq -nc --arg sys "${SUSHI_NONCE}c2 You read files when asked." --arg a "$RES_A" --arg b "$RES_B" --argjson aa "$ARGS_A" --argjson ab "$ARGS_B" \
+            --argjson params "$PARAMS" --arg first "$1" '
+            {call_a: {type:"tool_result", tool_use_id:"call_a", content:$a}, call_b: {type:"tool_result", tool_use_id:"call_b", content:$b}} as $res
+            | {model:"sushi", max_tokens:8, temperature:0, system:$sys,
+               tools:[{name:"read_file", description:"Read a file.", input_schema:$params}],
+               messages:[{role:"user", content:"Read both files."},
+                         {role:"assistant", content:[{type:"tool_use", id:"call_a", name:"read_file", input:$aa},
+                                                     {type:"tool_use", id:"call_b", name:"read_file", input:$ab}]},
+                         {role:"user", content:(if $first == "call_a" then [$res.call_a, $res.call_b] else [$res.call_b, $res.call_a] end)}]}'
+    }
+    order_pair "messages" /v1/messages "$(ant call_a)" "$(ant call_b)"
+
+    rsp() {
+        jq -nc --arg sys "${SUSHI_NONCE}c3 You read files when asked." --arg a "$RES_A" --arg b "$RES_B" --arg aa "$ARGS_A" --arg ab "$ARGS_B" \
+            --argjson params "$PARAMS" --arg first "$1" '
+            {call_a: {type:"function_call_output", call_id:"call_a", output:$a}, call_b: {type:"function_call_output", call_id:"call_b", output:$b}} as $res
+            | {model:"sushi", max_output_tokens:16, temperature:0, store:false, instructions:$sys,
+               tools:[{type:"function", name:"read_file", description:"Read a file.", parameters:$params}],
+               input:([{role:"user", content:"Read both files."},
+                       {type:"function_call", call_id:"call_a", name:"read_file", arguments:$aa},
+                       {type:"function_call", call_id:"call_b", name:"read_file", arguments:$ab}]
+                      + (if $first == "call_a" then [$res.call_a, $res.call_b] else [$res.call_b, $res.call_a] end))}'
+    }
+    order_pair "responses" /v1/responses "$(rsp call_a)" "$(rsp call_b)"
 fi
 
 echo

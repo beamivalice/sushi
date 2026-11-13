@@ -87,6 +87,12 @@ pub fn canonicalRole(role: []const u8) []const u8 {
     return role;
 }
 
+/// A request's messages in the order its model's encoder renders them in (`arch_chat.orderMessages`): every surface
+/// calls it where it has read them.
+pub fn orderMessages(model_type: []const u8, messages: []Message) void {
+    arch_chat.orderMessages(model_type, messages);
+}
+
 /// Fold every `system` message past index 0 into the leading one (created
 /// when absent). Qwen3.8's template raises on a system turn that is not first
 /// and the raise is a silent generic fallback; MiMo's renders it in place.
@@ -3659,6 +3665,8 @@ test "chat: the embedded V4.1 template renders through the template engine byte-
     defer parsed.deinit();
     for (parsed.value.array.items) |case| {
         const o = case.object;
+        // Messages the server orders before it renders them: the test after this one.
+        if (o.get("client_order") != null) continue;
         const msgs = try std.json.Stringify.valueAlloc(a, o.get("messages").?, .{});
         defer a.free(msgs);
         const tools: ?[]u8 = if (o.get("tools").? == .null) null else try std.json.Stringify.valueAlloc(a, o.get("tools").?, .{});
@@ -3677,6 +3685,56 @@ test "chat: the embedded V4.1 template renders through the template engine byte-
             return e;
         };
     }
+}
+
+test "chat: tool results a client sends out of call order render byte-exact with DeepSeek's encoder once the messages are ordered" {
+    const model_type = arch_chat.modelTypeOf("dsv41") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const tpl = @embedFile("fixtures/dsv41_chat_template.jinja");
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, @embedFile("fixtures/dsv41_template_cases.json"), .{});
+    defer parsed.deinit();
+    var seen: usize = 0;
+    for (parsed.value.array.items) |case| {
+        const o = case.object;
+        if (o.get("client_order") == null) continue;
+        seen += 1;
+        var arena_state = std.heap.ArenaAllocator.init(a);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var msgs = std.ArrayList(Message).empty;
+        for (o.get("messages").?.array.items) |mv| {
+            const m = mv.object;
+            var calls: ?[]const ToolCall = null;
+            if (m.get("tool_calls")) |tcs| {
+                const list = try arena.alloc(ToolCall, tcs.array.items.len);
+                for (list, tcs.array.items) |*tc, v| {
+                    const f = v.object.get("function").?.object;
+                    tc.* = .{ .id = v.object.get("id").?.string, .name = f.get("name").?.string, .arguments = try std.json.Stringify.valueAlloc(arena, f.get("arguments").?, .{}) };
+                }
+                calls = list;
+            }
+            try msgs.append(arena, .{
+                .role = m.get("role").?.string,
+                .content = m.get("content").?.string,
+                .tool_calls = calls,
+                .tool_call_id = if (m.get("tool_call_id")) |v| v.string else null,
+                .reasoning_content = if (m.get("reasoning_content")) |v| v.string else null,
+            });
+        }
+        const tools = try std.json.Stringify.valueAlloc(arena, o.get("tools").?, .{});
+        const effort = try std.json.Stringify.valueAlloc(arena, o.get("reasoning_effort").?, .{});
+        const extra = try std.fmt.allocPrint(arena, "{{\"thinking_mode\":\"{s}\",\"reasoning_effort\":{s}}}", .{ o.get("thinking_mode").?.string, effort });
+        errdefer std.debug.print("case: {s}\n", .{o.get("label").?.string});
+        // As sent, the render is not the encoder's: the order is what makes it so.
+        const sent = try renderRawForTest(a, tpl, try messagesJsonForTest(arena, msgs.items, null), tools, extra, true);
+        defer a.free(sent);
+        try testing.expect(!std.mem.eql(u8, o.get("expected").?.string, sent));
+        orderMessages(model_type, msgs.items);
+        const out = try renderRawForTest(a, tpl, try messagesJsonForTest(arena, msgs.items, null), tools, extra, true);
+        defer a.free(out);
+        try testing.expectEqualStrings(o.get("expected").?.string, out);
+    }
+    try testing.expect(seen >= 4);
 }
 
 test "chat: the V4.1 effort words map onto the encoder's 1-100 ladder, medium at 62 and xhigh at 87" {

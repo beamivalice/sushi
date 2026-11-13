@@ -791,6 +791,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     }
     const messages = &p.wire.messages;
     try readAnthropicConversation(&p.wire, root.get("system"), messages_val.array.items, visionPreprocFromConfig(config));
+    chat_mod.orderMessages(config.model_type, p.wire.messages.items);
     if (p.wire.media.refusal()) |fault| {
         log.warn("POST {s} -> 400 ({s})\n", .{ route.path(), fault.text() });
         try sendAnthropicError(allocator, stream, if (fault.server_error) "api_error" else "invalid_request_error", fault.text(), fault.code());

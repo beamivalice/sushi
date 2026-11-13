@@ -26,6 +26,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
   (`effort:deepseek_v41`, [server-http-apis](server-http-apis.md#effort-tables)) can send any 1-100 value, cap or refuse each word; a request that names no thinking or effort thinks, at `high` (`ModelConfig.defaultEnableThinking`; an explicit field wins, `enable_thinking: false` or effort `off` is a `chat` render). The template is [src/fixtures/dsv41_chat_template.jinja](../src/fixtures/dsv41_chat_template.jinja),
   pinned byte for byte to the release's `encoding/encoding.py` ([below](#oracle)).
 - Tool calls: DSML with V4.1's leading-space tag names (`<｜DSML｜ invoke name=…>`); the parser takes both spellings.
+- Tool results: inside one user turn (consecutive user and tool messages) the encoder writes the results in the order
+  of the calls the assistant made, whatever order the client sent them, an unknown id first. The server orders the
+  messages themselves as they are read (`dsv41_chat.orderMessages`, through `chat.orderMessages` on all three APIs), so
+  a result's image keeps its place too. A call with no arguments is an invoke with one empty line.
 
 ## Checkpoint geometry
 
