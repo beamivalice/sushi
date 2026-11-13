@@ -424,6 +424,10 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   `DecodeArgs.apart`): the split count steps with the context (768, 1408 and 2048 tokens on the release pack), a round
   across a step launches its rows in parts on pipelines keyed by each part's row count, and no context of the warm
   reaches a step. The warm runs every width once more with row 0 launched apart from the rows after it.
+- **A kernel a request needs only at some positions is warmed at a position that needs it, by construction**: a
+  restore point copies a layer's open pooling group, which holds no row where the layer's ratio divides the position,
+  so `warmOwnCapture` takes the point where the warm forwards left the state and one row on. Taken once "where the
+  warm left it", the copy of the ratio-4 layers' pending rows was made or not by the row count of the warm before it.
 - **The sampled verdict is warmed** (`dsv41_serving.warmSampledVerdict`, after `warmKernels`): `sampledDraws`, the
   function a round calls, runs on the engine's stream over zero logits of `[1, w, vocab]` f32 for every verify width
   with a suppress mask. The draw is one kernel (`sampler_draw`) whose temperature, top-k and top-p are inputs and whose
@@ -461,6 +465,10 @@ rebuilds one.
   A recipe the manifest lacks compiles in the request and shows in `kernels compiled after the load`.
 - **Another build of the same scope.** The newest such manifest is made the same way, then the full warm runs as the
   complete enumeration and the manifest is rewritten; the older builds of the scope are removed and the log says so.
+- **A warm gap hides behind another build's manifest.** That first load holds every pipeline the older build's warm
+  made, among them ones the new warm no longer asks for; the rewritten manifest keeps only what the new warm touched,
+  so the gap shows at the next same-key load. A change to the warm is checked live on two loads in a row: both read
+  `0 kernels compiled after the load`.
 - **No manifest, or one that cannot be read** (the reason is named): today's load, then a manifest is written. A recipe that
   fails to make from a same-key manifest makes it untrusted: the full warm runs.
 - Written only after a warm that returned without error, through a temp file and a rename. One `[pipelines]` line says

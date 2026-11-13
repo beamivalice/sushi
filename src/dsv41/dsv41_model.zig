@@ -3087,13 +3087,23 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
     }
 }
 
-/// The engine's pipelines of a restore point's copies, one per dtype the state's rows have, on the state the warm
-/// forwards left.
-fn warmOwnCapture(m: *Model) !void {
+/// The engine's pipelines of a restore point's copies, one per dtype the state's rows have. A layer's open pooling
+/// group holds the position's remainder by its ratio, so no row where the ratio divides it: the point is taken where
+/// the warm forwards left the state and one row on, and each open group holds a row at one of the two.
+pub fn warmOwnCapture(m: *Model) !void {
     const slots = try m.gpa.alloc(Slot, slotCount(m));
     defer m.gpa.free(slots);
     @memset(slots, nil_slot);
     defer for (slots) |*sl| freeSlot(sl);
+    try captureState(m, slots);
+    {
+        const was = ownBegin(m);
+        defer ownEnd(m, was);
+        warmBudget(m, 1);
+        try warmRun(try extend(m, &.{0}, .last));
+    }
+    for (slots) |*sl| freeSlot(sl);
+    @memset(slots, nil_slot);
     try captureState(m, slots);
 }
 

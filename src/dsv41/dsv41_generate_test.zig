@@ -2834,6 +2834,70 @@ test "dsv41 engine: after the load a round whose rows take two attention split c
     }
 }
 
+test "dsv41 engine: after the load a restore point captured at any position compiles nothing (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    try testing.expect(m.engine_decode);
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf);
+    const late = mlx.engine.latePipelines();
+    // A layer's open pooling group holds the position's remainder by its ratio: every remainder is some length here.
+    for (1..prompt.len + 1) |n| {
+        try fx.xfm.resetCache();
+        var ctx = fx.xfm.defaultCtx();
+        _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..n]));
+        var cp = try dsv41_prefix.capture(testing.allocator, m, n);
+        cp.deinit(testing.allocator);
+        errdefer std.debug.print("at {d} tokens\n", .{n});
+        try testing.expectEqual(late, mlx.engine.latePipelines());
+    }
+}
+
+test "dsv41 engine: the warm's restore-point copies include an open pooling group's rows from any position (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    try testing.expect(m.engine_decode);
+    // A position every layer's ratio divides: no pooling group is open there, so a point taken there copies no such row.
+    var whole: usize = 1;
+    for (m.cfg.ratios[0..m.cfg.layers]) |r| if (r > 1) {
+        whole = whole / std.math.gcd(whole, r) * r;
+    };
+    var ids: [512]u32 = undefined;
+    if (whole == 1 or whole >= ids.len) return error.SkipZigTest;
+    for (&ids, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % m.cfg.vocab);
+    try fx.xfm.resetCache();
+    var ctx = fx.xfm.defaultCtx();
+    _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[0..whole]));
+
+    var from = mlx.engine.stats().dispatches;
+    var closed = try dsv41_prefix.capture(testing.allocator, m, whole);
+    closed.deinit(testing.allocator);
+    const closed_cost = mlx.engine.stats().dispatches - from;
+
+    from = mlx.engine.stats().dispatches;
+    try dsv41_model.warmOwnCapture(m);
+    const warm_cost = mlx.engine.stats().dispatches - from;
+
+    // The warm leaves the state at the position whose groups it copied open.
+    const at = (try dsv41_model.ensureState(m)).n;
+    from = mlx.engine.stats().dispatches;
+    var open = try dsv41_prefix.capture(testing.allocator, m, at);
+    open.deinit(testing.allocator);
+    const open_cost = mlx.engine.stats().dispatches - from;
+    errdefer std.debug.print("whole {d}, left at {d}; dispatches: closed {d}, open {d}, warm {d}\n", .{ whole, at, closed_cost, open_cost, warm_cost });
+    try testing.expect(at % whole != 0);
+    try testing.expect(warm_cost >= closed_cost + open_cost);
+}
+
 test "dsv41 engine: after the load's warm no step or round compiles a kernel, whatever its width (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");

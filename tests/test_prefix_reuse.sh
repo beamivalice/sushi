@@ -8,6 +8,8 @@
 #  C. DeepSeek only: its encoder writes the results of parallel tool calls in the order of the calls. A conversation
 #     whose results arrive in another order is the same prompt, so it reuses the prompt of the one sent in call order,
 #     on all three APIs. Other models render the client's order: the section is skipped there.
+#  D. The boot's log holds no `compiled inside a request` line: every kernel a capture, a restore or a turn takes was
+#     made by the load.
 #
 # Restore points sit at each prompt's end less a 30-token backoff, so turn 2 is held to turn 1's prompt less a slack,
 # not to the reply's tokens: those re-render, and only a tool loop's thought point covers them.
@@ -220,6 +222,14 @@ else
     }
     order_pair "responses" /v1/responses "$(rsp call_a)" "$(rsp call_b)"
 fi
+
+# ── D. Nothing was compiled inside a request ──
+# The engine of our own logs each pipeline it had to make after the load: a restore point, a restore and a next turn
+# ran above, at positions the load's warm did not choose. Read over the whole boot; other engines log no such line.
+echo
+echo "--- D: no kernel was compiled inside a request on this boot ---"
+LATE=$(grep -c 'compiled inside a request' "$SUSHI_LOG")
+check "the boot's log holds no 'compiled inside a request' line" "$((LATE == 0 ? 0 : 1))" "$LATE: $(grep 'compiled inside a request' "$SUSHI_LOG" | head -3 | tr '\n' ' ')"
 
 echo
 if [ "$FAIL" -ne 0 ]; then
