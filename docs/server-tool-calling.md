@@ -35,6 +35,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   specials, the template's facts and the stops; with no template nothing is masked and assistant text keeps every
   special. Origins follow bytes through every builtin (`template.zig`'s builtin sweep pins it); a transform with no
   byte-for-byte map (`tojson`, `indent`, `reverse`, a container's repr) takes the strictest origin of its input.
+- **Token reuse across turns** (`segment_cache.zig`): a segment, the text between two specials the encoder
+  recognised, encodes to the same ids wherever it sits, so each loaded model keeps the ids of the segments it encoded
+  and an agent turn encodes only its new ones. Origin decides where a segment ends, never what it encodes to. The cache
+  is the tokenizer's, dropped with it at unload: 64 MiB per model, everything it allocates billed (each entry pays
+  its node and eight map slots; the map is rebuilt when removals leave tombstones or it outgrows its entries), least
+  recently used out first, one entry at most a sixteenth of that, segments under 32 bytes never kept, one lock for
+  every request thread. Pageable host memory, so admission does not bill it (as the SSD writers' bytes); `/metrics`
+  reports it (`token_cache`). The corpus pin holds cached ids equal to uncached ones on the three pack fixtures, eight
+  threads at once, under eviction too. Measured (`taskpolicy -a` on the M1 Max, Qwen 3.8's real tokenizer, the
+  tool-calling conversation of "the largest served conversation", best of three, one process): 400 turns (0.87 MB,
+  218k ids) encode in 2,235 ms without it, 2,305 ms cold, 41 ms warm, and the next turn in 43 ms; 4,000 turns (8.7 MB,
+  2.2M ids) in 22.3 s, 23.4 s cold, 0.41 s warm and 0.39 s for the next turn, with 21.6 MB held. Rendering takes 4.5
+  and 46 ms. The request cache (`tokenize_cache.zig`) stays: an exact repeat through it costs 0.15 and 1.8 ms.
 - A live failure revealing a CLASS ships the instance test plus a corpus entry or invariant in
   `src/format_corpus_test.zig` plus a rule here. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` →
   `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first.

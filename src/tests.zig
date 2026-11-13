@@ -104,6 +104,7 @@ test {
     _ = @import("mtp_depth_bounds.zig");
     _ = @import("tokenizer.zig");
     _ = @import("tokenize_cache.zig");
+    _ = @import("segment_cache.zig");
     _ = @import("prefix_cache.zig");
     _ = @import("restore_dump.zig");
     _ = @import("metrics.zig");

@@ -23,6 +23,7 @@ const kv_disk_cache = @import("kv_disk_cache.zig");
 const kv_disk_fs = @import("kv_disk_fs.zig");
 const disk_placement = @import("disk_placement.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
+const segment_cache_mod = @import("segment_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
@@ -1903,6 +1904,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // specials): derived per model from tokenizer + template + eos.
     params.config.mergeTokenizerStops(params.tok);
     try params.tok.bindTemplate(params.chat_config.printedFacts(), params.config.eosTokenSlice());
+    try params.tok.enableSegmentCache(segment_cache_mod.default_budget);
     sampler.installSuppressMask(xfm_ptr, params.tok);
     generate_mod.installThinkMarkers(xfm_ptr, params.tok);
     try generate_mod.installLogitBias(sch.io, xfm_ptr, params.tok);

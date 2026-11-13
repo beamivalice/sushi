@@ -952,3 +952,69 @@ test "template oracle: a special spelled in an assistant turn is its token only 
     }
     try testing.expect(checked > 0);
 }
+
+test "template oracle: a prompt encoded through the segment cache is the prompt encoded without it, from eight threads at once" {
+    const a = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var toks = std.ArrayList(*tokenizer_mod.Tokenizer).empty;
+    defer for (toks.items) |t| tokenizer_mod.deinitTestTokenizer(t);
+    const served = try servedTemplates(a, arena, &toks);
+    const requests = try corpusRequests(arena);
+    const Call = struct { r: Request, arm: Arm, want: []const u32 };
+    const segment_cache = @import("segment_cache.zig");
+    var checked: usize = 0;
+    for (served) |s| {
+        if (s.tok == null) continue;
+        const pt = try tokenizer_mod.packTokenizerForTests(a, arena, s.id);
+        const tok = try arena.create(tokenizer_mod.Tokenizer);
+        tok.* = pt.tok;
+        try toks.append(arena, tok);
+        var cfg = s.config;
+        try cfg.compile();
+        defer cfg.dropCompiled();
+        try tok.bindTemplate(cfg.printedFacts(), pt.stops);
+        // Every prompt of the corpus, encoded without a cache.
+        var prompts = std.ArrayList(Call).empty;
+        for (requests) |r| for (r.arms) |arm| {
+            var c2 = cfg;
+            c2.preserve_thinking = arm.preserve;
+            const ids = chat.formatChat(arena, tok, r.messages, &c2, r.tools, r.instr, arm.thinking, arm.effort, r.continue_final) catch |e| switch (e) {
+                error.ChatNeedsUserTurn, error.ChatTemplateUnusable => continue,
+                else => return e,
+            };
+            try prompts.append(arena, .{ .r = r, .arm = arm, .want = ids });
+        };
+        // The default budget, and one small enough that the threads evict each other's segments.
+        for ([_]usize{ segment_cache.default_budget, 64 << 10 }) |budget| {
+            try tok.enableSegmentCache(budget);
+            const Worker = struct {
+                fn run(t: *const tokenizer_mod.Tokenizer, config: *const chat.ChatConfig, list: []const Call, ok: *bool) void {
+                    for (list) |c| {
+                        var c2 = config.*;
+                        c2.preserve_thinking = c.arm.preserve;
+                        const ids = chat.formatChat(std.heap.page_allocator, t, c.r.messages, &c2, c.r.tools, c.r.instr, c.arm.thinking, c.arm.effort, c.r.continue_final) catch return;
+                        defer std.heap.page_allocator.free(ids);
+                        if (!std.mem.eql(u32, ids, c.want)) return;
+                    }
+                    ok.* = true;
+                }
+            };
+            // Cold and warm on one thread, then eight at once.
+            for (0..2) |_| {
+                var ok = false;
+                Worker.run(tok, &cfg, prompts.items, &ok);
+                try testing.expect(ok);
+            }
+            var oks: [8]bool = @splat(false);
+            var threads: [8]std.Thread = undefined;
+            for (&threads, &oks) |*t, *ok| t.* = try std.Thread.spawn(.{}, Worker.run, .{ tok, &cfg, prompts.items, ok });
+            for (threads) |t| t.join();
+            for (oks) |ok| try testing.expect(ok);
+            try testing.expect(tok.segment_cache.?.bytes() <= budget);
+        }
+        checked += prompts.items.len;
+    }
+    try testing.expect(checked > 0);
+}

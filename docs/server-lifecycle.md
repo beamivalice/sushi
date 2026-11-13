@@ -366,7 +366,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **A slot the inference thread drops releases its GLM state there** (`releaseNativeState`: finish, error, cancel
   (also one landing after prefill, `postPrefillTerminal`), failed prefill), not when its connection thread completes it: an errored request's reserve once held 11 GB.
 - `src/generate.zig`: generation, `commitForcedTokens`; `src/mtp_policy.zig` / `src/mtp_round.zig`: MTP policy and rounds; `src/sampler.zig`: sampling;
-  `src/prefill_plan.zig`: prefill chunking; `src/degenerate.zig`: `StallClock`, loop-stop tiers. `src/tokenize_cache.zig`: per-LoadedModel LRU of rendered+encoded prompts.
+  `src/prefill_plan.zig`: prefill chunking; `src/degenerate.zig`: `StallClock`, loop-stop tiers. `src/tokenize_cache.zig`: per-LoadedModel LRU of rendered+encoded prompts; `src/segment_cache.zig`: per-model token ids of prompt segments.
 
 ## sushibar
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const segment_cache_mod = @import("segment_cache.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const pipeline_manifest = @import("pipeline_manifest.zig");
 const http = @import("http.zig");
@@ -1274,6 +1275,7 @@ fn runCli(init: std.process.Init) !void {
         // Reserved-token suppression, same derivation as the serve path.
         config.mergeTokenizerStops(tok);
         try tok.bindTemplate(chat_config.printedFacts(), config.eosTokenSlice());
+        try tok.enableSegmentCache(segment_cache_mod.default_budget);
         sampler.installSuppressMask(&xfm, tok);
         generate_mod.installThinkMarkers(&xfm, tok);
         try generate_mod.installLogitBias(io, &xfm, tok);

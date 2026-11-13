@@ -410,6 +410,10 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
     bytes), and the RAM tier's resident bytes. `/metrics`: `sushi:prefix_cache_tier_hits_total{tier}`,
     `sushi:prefix_cache_evictions_total{tier}`, `sushi:prefix_cache_evicted_bytes_total{tier}`, `sushi:prefix_cache_hot_bytes`
     ([engine-prefix-cache](engine-prefix-cache.md#tier-counters)).
+  - `"token_cache":{"bytes":n,"hits":n,"misses":n,"evictions":n}`: the prompt token caches of every loaded model
+    (`segment_cache.zig`): bytes held now, segments looked up that hit and missed, segments dropped for room.
+    `/metrics`: `sushi:token_cache_bytes`, `sushi:token_cache_hits_total`, `sushi:token_cache_misses_total`,
+    `sushi:token_cache_evictions_total` ([server-tool-calling](server-tool-calling.md)).
   - `"speculative":{"mtp":{...},"dflash":{...},"dspark":{...}}`, one object per drafting mode (MTP: Qwen and MiMo heads;
     DFlash2: GLM; DSpark: DeepSeek) with `requests` (that ran a round), `rounds` (one verify forward each), `drafted`,
     `accepted` (drafted tokens the verifier kept, not the always-committed first token of a round) and `plain_rounds`

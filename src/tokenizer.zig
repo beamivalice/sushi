@@ -4,6 +4,7 @@ const io_util = @import("io_util.zig");
 const unicode_props = @import("tokenizer_unicode.zig");
 const arch_chat = @import("arch/chat.zig");
 const template_engine = @import("template/template.zig");
+const segment_cache_mod = @import("segment_cache.zig");
 
 /// What a compiled chat template may print (`reservedOutputIds`).
 pub const TemplateFacts = template_engine.Facts;
@@ -146,6 +147,9 @@ pub const Tokenizer = struct {
     reserved_ids: []const u32 = &.{},
     /// Sorted ids whose text in an assistant message is text, not the token (`bindTemplate`); owned.
     assistant_blocked: []const u32 = &.{},
+    /// The ids of segments already encoded, shared by every thread that encodes with this tokenizer
+    /// (`enableSegmentCache`); owned, dropped with the tokenizer at unload.
+    segment_cache: ?*segment_cache_mod.SegmentCache = null,
 
     const MergePair = struct {
         left: []const u8,
@@ -233,6 +237,34 @@ pub const Tokenizer = struct {
         if (self.assistant_blocked.len > 0) self.allocator.free(self.assistant_blocked);
         self.reserved_ids = &.{};
         self.assistant_blocked = &.{};
+        if (self.segment_cache) |c| {
+            c.deinit();
+            self.allocator.destroy(c);
+        }
+        self.segment_cache = null;
+    }
+
+    /// Keeps the ids of every segment encoded from here on, up to `budget` bytes (`segment_cache.zig`).
+    pub fn enableSegmentCache(self: *Tokenizer, budget: usize) !void {
+        const c = try self.allocator.create(segment_cache_mod.SegmentCache);
+        c.* = segment_cache_mod.SegmentCache.init(self.allocator, budget);
+        if (self.segment_cache) |old| {
+            old.deinit();
+            self.allocator.destroy(old);
+        }
+        self.segment_cache = c;
+    }
+
+    /// Ids of `segment`, text with no recognised special in it: a function of its bytes alone, so the cache
+    /// answers for any segment it has seen.
+    fn appendSegment(self: *const Tokenizer, allocator: std.mem.Allocator, out: *std.ArrayList(u32), segment: []const u8) !void {
+        const cache = if (segment.len >= segment_cache_mod.min_segment) self.segment_cache else null;
+        if (cache) |c| if (try c.appendIds(allocator, out, segment)) return;
+        const ids = try self.encodeByteLevel(allocator, segment);
+        defer allocator.free(ids);
+        try out.appendSlice(allocator, ids);
+        // A segment the cache could not keep (no memory) is encoded again next time; the prompt is right either way.
+        if (cache) |c| c.put(segment, ids) catch {};
     }
 
     /// Builds the special-token matcher every encode reads.
@@ -299,20 +331,12 @@ pub const Tokenizer = struct {
                 pos = end;
                 continue;
             }
-            if (pos > seg_start) {
-                const ids = try self.encodeByteLevel(allocator, bytes[seg_start..pos]);
-                defer allocator.free(ids);
-                try result.appendSlice(allocator, ids);
-            }
+            if (pos > seg_start) try self.appendSegment(allocator, &result, bytes[seg_start..pos]);
             try result.append(allocator, m.id);
             pos = end;
             seg_start = pos;
         }
-        if (seg_start < bytes.len) {
-            const ids = try self.encodeByteLevel(allocator, bytes[seg_start..]);
-            defer allocator.free(ids);
-            try result.appendSlice(allocator, ids);
-        }
+        if (seg_start < bytes.len) try self.appendSegment(allocator, &result, bytes[seg_start..]);
         return result.toOwnedSlice(allocator);
     }
 

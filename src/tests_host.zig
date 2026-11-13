@@ -34,6 +34,7 @@ test {
     _ = @import("template/facts.zig");
     _ = @import("tool_traffic_replay_test.zig");
     _ = @import("tokenize_cache.zig");
+    _ = @import("segment_cache.zig");
     _ = @import("round_cost.zig");
     _ = @import("bills.zig");
     _ = @import("effort.zig");
