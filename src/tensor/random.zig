@@ -73,13 +73,6 @@ fn mix(x: u64) u64 {
     return z ^ (z >> 31);
 }
 
-/// `categorical` over `axis` under the key `drawKey` made.
-pub fn categoricalAt(logits: *Tensor, axis: c_int, key: [2]u32) Error!*Tensor {
-    const k = try core.fromHost(std.mem.asBytes(&key), .uint32, &.{2});
-    defer core.release(k);
-    return categorical(logits, axis, k);
-}
-
 fn fill(value: f32, dtype: Dtype) Error!*Tensor {
     const as_f32 = try scalar(f32, value, .float32);
     defer core.release(as_f32);

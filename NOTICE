@@ -688,6 +688,16 @@ Public domain (Unlicense), or MIT at your option.
 Vendored under `lib/` and compiled into the sushi binary for image-input
 decoding. Unmodified.
 
+--------------------------------------------------------------------------------
+hash-prospector (lowbias32)
+https://github.com/skeeto/hash-prospector
+Chris Wellons
+Public domain (Unlicense).
+
+`src/sampler_draw.zig` uses its two-round 32-bit integer mix (the shifts 16,
+15, 16 and the multipliers 0x7feb352d, 0x846ca68b) as the counter hash behind
+a sampled draw's Gumbel noise.
+
 
 ================================================================================
 Reference implementations

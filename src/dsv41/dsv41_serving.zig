@@ -21,7 +21,6 @@ const sampler = @import("../sampler.zig");
 const seen_penalty = @import("../seen_penalty.zig");
 const think_penalty = @import("../think_penalty.zig");
 const logit_bias = @import("../logit_bias.zig");
-const random = @import("../tensor/random.zig");
 const spec_types = @import("../spec_types.zig");
 const io_util_mod = @import("../io_util.zig");
 const ModelConfig = model_mod.ModelConfig;
@@ -281,15 +280,22 @@ fn planFits(plan: []const usize, width: usize) bool {
 }
 
 /// The draws of a sampled round: `rows` verify rows of `logits` (`[1, >= rows, vocab]`) filtered by `sampling` and
-/// drawn one per row, row j for the generated position `sampling.draw + j`, gathered as one `[rows]` array not yet
-/// evaluated. On the engine's stream the gathering vector is an engine vector, which the engine makes only while it
-/// is active, and a row's key is `random.drawKey(sampling.draw_root, position)`, the request's seed or its OS-given
-/// root, and MLX is not asked for a key or bits. On MLX's stream the sampler keys by `sampling.seed`.
+/// drawn one per row, row j for the generated position `sampling.draw + j`, as one `[rows]` array not yet evaluated.
+/// The engine draws every row in one kernel under `random.drawKey(sampling.draw_root, position)`, the request's seed
+/// or its OS-given root, and MLX is not asked for a key or bits. On MLX's stream the sampler keys by `sampling.seed`.
 pub fn sampledDraws(sampling: sampler.SamplingParams, logits: mlx.mlx_array, rows: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     const host = mlx.engine.enter(s);
     defer host.end();
+    if (rows > dsv41_config.ring_slack) return error.SpecDecodeUnsupported;
+    if (host.own) {
+        var masked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked);
+        if (sampling.suppress_mask) |m| try sampler.applySuppressMask(&masked, logits, m, s);
+        const rows2d = try spec_types.verifyRows2d(if (sampling.suppress_mask != null) masked else logits, @intCast(rows - 1), s);
+        defer _ = mlx.mlx_array_free(rows2d);
+        return sampler.engineDraws(rows2d, sampling, s);
+    }
     var draws: [dsv41_config.ring_slack]mlx.mlx_array = undefined;
-    if (rows > draws.len) return error.SpecDecodeUnsupported;
     const probs = try sampler.probsAllPositions(logits, sampling, s);
     defer _ = mlx.mlx_array_free(probs);
     const rows2d = try spec_types.verifyRows2d(probs, @intCast(rows - 1), s);
@@ -308,7 +314,7 @@ pub fn sampledDraws(sampling: sampler.SamplingParams, logits: mlx.mlx_array, row
         try mlx.check(mlx.mlx_slice(&row, rows2d, &.{ at, 0 }, 2, &.{ at + 1, vocab }, 2, &.{ 1, 1 }, 2, s));
         var keyed = sampling;
         keyed.draw +%= j;
-        draws[built] = if (host.own) try engineDraw(row, random.drawKey(sampling.draw_root orelse return error.EngineDrawNeedsRoot, keyed.draw), s) else try sampler.sampleFromProbsLazy(row, keyed, s);
+        draws[built] = try sampler.sampleFromProbsLazy(row, keyed, s);
         built += 1;
         _ = mlx.mlx_vector_array_append_value(vec, draws[j]);
     }
@@ -318,20 +324,11 @@ pub fn sampledDraws(sampling: sampler.SamplingParams, logits: mlx.mlx_array, row
     return flat;
 }
 
-/// `sampler.sampleFromProbsLazy` on the engine under a key of its own.
-fn engineDraw(probs: mlx.mlx_array, key: [2]u32, s: mlx.mlx_stream) !mlx.mlx_array {
-    var drawn = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(drawn);
-    try sampler.drawFromProbs(&drawn, probs, key, s);
-    return drawn;
-}
-
 const warm_root: u64 = 1;
 
-/// The sampled verdict's chain on the engine, over every verify width and the four filter settings with a suppress
-/// mask: each stock pipeline it launches compiles here, not inside a request. A seeded and an unseeded request run the
-/// same chain (they differ in the root only), so the warm runs it unseeded. A request's own top-k only changes the
-/// shapes the sorts run at, and so which block-sort variants.
+/// The sampled verdict on the engine at every verify width, with a suppress mask: the mask's pipeline and the draw
+/// kernel's compile here, not inside a request. A seeded and an unseeded request differ in the root only, and the
+/// filters are the kernel's inputs, so one setting warms them all.
 pub fn warmSampledVerdict(mdl: *dsv41_model.Model) !void {
     if (!mdl.engine_decode or mdl.dspark == null) return;
     const s = mlx.engine.stream();
@@ -343,12 +340,9 @@ pub fn warmSampledVerdict(mdl: *dsv41_model.Model) !void {
         var logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(logits);
         try mlx.check(mlx.mlx_zeros(&logits, &[_]c_int{ 1, @intCast(rows), vocab }, 3, .float32, s));
-        for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| {
-            const sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .suppress_mask = mask, .draw_root = warm_root };
-            const draws = try sampledDraws(sampling, logits, rows, s);
-            defer _ = mlx.mlx_array_free(draws);
-            try mlx.check(mlx.mlx_array_eval(draws));
-        }
+        const draws = try sampledDraws(.{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .suppress_mask = mask, .draw_root = warm_root }, logits, rows, s);
+        defer _ = mlx.mlx_array_free(draws);
+        try mlx.check(mlx.mlx_array_eval(draws));
     }
 }
 
@@ -375,17 +369,14 @@ pub fn warmSerialSampler(mdl: *dsv41_model.Model) !void {
         .{ .temperature = 0.8, .repeat_penalty = 1.1, .presence_penalty = 0.5, .frequency_penalty = 0.5 },
     };
     for ([_]bool{ false, true }) |masked| {
-        for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| {
-            var sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .draw_root = warm_root, .suppress_mask = if (masked) mask else null };
-            const drawn = sampler.sampleTokenLazy(logits, sampling, s);
+        var sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .draw_root = warm_root, .suppress_mask = if (masked) mask else null };
+        for ([_]f32{ sampling.temperature, 0 }) |temperature| {
+            var drawn_at = sampling;
+            drawn_at.temperature = temperature;
+            const drawn = sampler.sampleTokenLazy(logits, drawn_at, s);
             defer _ = mlx.mlx_array_free(drawn);
             try mlx.check(mlx.mlx_array_eval(drawn));
-            sampling.temperature = 0;
-            const best = sampler.sampleTokenLazy(logits, sampling, s);
-            defer _ = mlx.mlx_array_free(best);
-            try mlx.check(mlx.mlx_array_eval(best));
         }
-        var sampling: sampler.SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .draw_root = warm_root, .suppress_mask = if (masked) mask else null };
         for (penalties) |p| {
             sampling.repeat_penalty = p.repeat_penalty;
             sampling.presence_penalty = p.presence_penalty;

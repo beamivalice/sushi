@@ -1230,13 +1230,6 @@ pub fn mlx_random_categorical(res: *A, logits: A, axis: c_int, key: A, _: S) c_i
     return put(res, random.categorical(x, axis, k) catch |e| return fail("random_categorical", e));
 }
 
-/// A draw from `logits` under an engine key (`random.drawKey`): no MLX array, call or wait is involved.
-pub fn categoricalAt(res: *A, logits: A, key: [2]u32) c_int {
-    const x = core.take(logits) catch |e| return fail("categorical_at", e);
-    defer core.release(x);
-    return put(res, random.categoricalAt(x, -1, key) catch |e| return fail("categorical_at", e));
-}
-
 // ── Custom kernels ──
 
 /// A kernel, a config or a list of names made while the engine is on is an object of the engine's, its handle the
@@ -3690,55 +3683,6 @@ test "an engine draw key is one function of a root and a position: no two positi
         const key = random.drawKey(7, position);
         try t_std.expect((try far.fetchPut(gpa, @as(u64, key[0]) | @as(u64, key[1]) << 32, {})) == null);
     }
-}
-
-test "an engine draw from a host key follows the filtered distribution, repeats per key, and touches neither MLX nor a lend" {
-    try mlx.requireGpu();
-    const was = enabled;
-    enabled = true;
-    defer enabled = was;
-    const vocab = 8;
-    const draws = 2000;
-    const probs = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
-    var row: [vocab]f32 = @splat(-std.math.inf(f32));
-    for (probs, 0..) |p, i| row[i + 2] = @log(p);
-    const logits = try core.fromHost(std.mem.sliceAsBytes(&row), .float32, &.{ 1, vocab });
-    defer core.release(logits);
-    var only: [vocab]f32 = @splat(-std.math.inf(f32));
-    only[5] = 0;
-    const single = try core.fromHost(std.mem.sliceAsBytes(&only), .float32, &.{ 1, vocab });
-    defer core.release(single);
-
-    const before = core.stats();
-    const ops_before = mlx_ops;
-    var queued: [draws]*Tensor = undefined;
-    for (&queued, 0..) |*out, position| out.* = try random.categoricalAt(logits, -1, random.drawKey(12345, position));
-    var counts: [vocab]u32 = @splat(0);
-    var first: [16]u32 = undefined;
-    for (queued, 0..) |out, position| {
-        defer core.release(out);
-        const token = std.mem.bytesAsSlice(u32, try core.hostBytes(out))[0];
-        counts[token] += 1;
-        if (position < first.len) first[position] = token;
-    }
-    for (0..vocab) |token| {
-        const expect: f32 = if (token >= 2 and token < 6) probs[token - 2] else 0;
-        const seen = @as(f32, @floatFromInt(counts[token])) / draws;
-        try t_std.expect(@abs(seen - expect) < 0.05);
-    }
-    // The same key draws the same token again, and a filter that leaves one token always draws it.
-    for (first, 0..) |token, position| {
-        const again = try random.categoricalAt(logits, -1, random.drawKey(12345, position));
-        defer core.release(again);
-        try t_std.expectEqual(token, std.mem.bytesAsSlice(u32, try core.hostBytes(again))[0]);
-        const lone = try random.categoricalAt(single, -1, random.drawKey(position, position));
-        defer core.release(lone);
-        try t_std.expectEqual(@as(u32, 5), std.mem.bytesAsSlice(u32, try core.hostBytes(lone))[0]);
-    }
-    const after = core.stats();
-    try t_std.expectEqual(ops_before, mlx_ops);
-    try t_std.expectEqual(before.lends, after.lends);
-    try t_std.expectEqual(before.imports, after.imports);
 }
 
 test "the sampler's filters on the engine's stream give MLX's densities: top-k, top-p, both, neither, a suppress mask" {

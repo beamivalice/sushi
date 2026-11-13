@@ -14,6 +14,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `arch/chat.zig` / `<arch>/<arch>_chat.zig` | each arch's MLX-free chat face: effort table, pinned template and image atom, pre-tokenizer; the host tier reads them through `registry.Chat` | engine-arch-seam |
 | `reasoning_protocol.zig` / `json_schema.zig` / `json_grammar.zig` / `token_mask.zig` / `regex.zig` | constrained decoding | server-http-apis |
 | `launch.zig` | `sushi launch <agent>` | server-http-apis |
+| `sampler_draw.zig` | the engine's sampled draw as one kernel (temperature, top-k, nucleus, Gumbel-max) and its host rule | server-http-apis, engine-kernels |
 | `scheduler.zig` / `generate.zig` / `degenerate.zig` / `mtp_plan.zig` / `prefill_plan.zig` / `sampler.zig` / `model_load` / `load_clock.zig` / `slot_admission` / `mtp_tick` / `slot_outcome` / `vision_queue` / `mtp_policy` / `mtp_round` | slots, inference thread, batching, admission, load bills, the `[load]` phase clock; generation; MTP policy/rounds/plan; stop loop, prefill plan, sampler | server-lifecycle |
 | `settings_resolve.zig` | the one resolver, flag > `model-settings.json` > default (`Setting`, `resolve`), the launch flags no load params carry, and the table test that pins every key (MLX-free, host tier) | server-lifecycle |
 | `model.zig` / `effort` / `model_settings.zig` / `model_discovery.zig` / `model_registry.zig` | config + weights, effort words and the per-family effort tables, per-model settings, discovery, registry | server-lifecycle, server-http-apis |

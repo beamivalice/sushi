@@ -94,6 +94,7 @@ test {
     _ = @import("dflash.zig");
     _ = @import("dflash_policy.zig");
     _ = @import("dflash_conv.zig");
+    _ = @import("sampler_draw.zig");
     _ = @import("dflash_qmv.zig");
     _ = @import("mtp.zig");
     _ = @import("mtp_qmv.zig");

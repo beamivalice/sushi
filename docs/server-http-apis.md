@@ -191,6 +191,15 @@ before reading a completed stream and requires clean EOF.
 ## Seeds, logprobs, sampling
 
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`sampler.seedKey`).
+- <a id="sampled-draw"></a>**On DeepSeek on Sushi Cooler a sampled token is one kernel's draw** (`sampler_draw.zig`,
+  `sampler.engineDraws`), a serial step's and a DSpark row's alike. Its rule, which `hostDraw` states on the host:
+  a value is `logit / temperature`; values order high to low, equal values by the lower id; top-k keeps the first k;
+  the nucleus keeps, of those, each id whose mass strictly above it is under `top_p` of their mass (the top one
+  always); the draw is the kept id with the largest `value + Gumbel(key, id)`, the key a host mix of the request's
+  root and the position. A suppressed id sits at -inf and is never drawn. A row draws the same alone and beside other
+  rows, so a seed gives one text; it is another text than the MLX route's, and than a Cooler load's before this
+  kernel. A call two float orders can make differently (a nucleus threshold within 1e-5 of the kept mass) is not part
+  of the rule.
 - Logprobs are the MODEL's distribution (pre-temperature), ids travel WITH values, entry belongs to the RETURNED
   token (one-token delay); `logprobs.content` describes `message.content` (`contentTokenRange`); streaming logprobs
   are a SIBLING of `delta` shipped EXACTLY once against a high-water mark. logprobs>0 + grammar disable spec.

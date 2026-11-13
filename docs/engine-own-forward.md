@@ -420,15 +420,13 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   only past 32768 keys; the fold of a second tile takes ids along an axis, a pipeline no shorter prompt makes).
 - **A path a prompt reaches only past a threshold is warmed by lowering the threshold**, never left to the first long
   prompt: the count must be no kernel's template value, and a test seals the engine and runs the path at that setting.
-- **The sampled verdict is warmed** (`dsv41_serving.warmSampledVerdict`, after `warmKernels`): its op chain
-  (`sampledDraws`, the function a round calls) runs on the engine's stream over zero logits of `[1, w, vocab]` f32 for
-  every verify width, unseeded, at the four filter settings (neither, top-k 40, top-p 0.95, both) with a suppress mask;
-  a seeded request runs the same chain and differs only in its root. A
-  request's own top-k changes only the sorted widths: the single-block sort variant (`bn`, 32 to 512) of the shortlist,
-  the multi-block sort when the chunk maxima or candidates pass 2048, whether the pad runs, and `block_softmax` against
-  `looped_softmax` at a shortlist over 4096; a k other than 40 can compile one of those inside a request.
-- **The serial sampler is warmed** (`warmSerialSampler`, with the sampled verdict): a first-token or serial draw at the
-  four filter settings, greedy, with and without the suppress mask, the three penalty mixes with logprobs, a grammar mask,
+- **The sampled verdict is warmed** (`dsv41_serving.warmSampledVerdict`, after `warmKernels`): `sampledDraws`, the
+  function a round calls, runs on the engine's stream over zero logits of `[1, w, vocab]` f32 for every verify width
+  with a suppress mask. The draw is one kernel (`sampler_draw`) whose temperature, top-k and top-p are inputs and whose
+  only template values are the vocabulary and the logits' dtype, so one setting warms every request's filters; a seeded
+  request differs only in its root.
+- **The serial sampler is warmed** (`warmSerialSampler`, with the sampled verdict): a first-token or serial draw,
+  sampled and greedy, with and without the suppress mask, the three penalty mixes with logprobs, a grammar mask,
   and a verify block of every width under the penalties, the thinking penalty with and without a bias, and a row mask.
 - **A kernel reached only past a threshold of context is found by a bench at that context**, not by the tiny
   fixture: the 128k rung showed three compiles (0.26 s) inside its first decode step.

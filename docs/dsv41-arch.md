@@ -741,7 +741,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   depth flags) and draws each row with the key of the position it predicts: its text is the same on every repeat and streamed or
   not. On Sushi Cooler the key is the engine's own (`random.drawKey`, a host mix of the seed and the position; an unseeded request
   takes one root from the OS, `SamplingParams.draw_root`), and the request's first token and every serial step draw it too, by
-  the same chain as a DSpark row (`sampler.drawFromProbs`), so a position has one key and one draw whoever makes it. A serial
+  the same kernel as a DSpark row (`sampler.engineDraws`, [the rule](server-http-apis.md#sampled-draw)), so a position has one key and one draw whoever makes it. A serial
   request and a round request of one seed are two texts, because a one-row decode and a one-row verify differ in the last bits
   of their logits on the tiny fixture; each repeats at every mix of its own kind. A seed gives another text than on the MLX
   route (`--ds41-mlx-engine`), which keeps MLX's keys (live, STQ 1.75bpw: three runs byte-identical with and without a reasoning budget; 52-60 tok/s against 52-63 adaptive,

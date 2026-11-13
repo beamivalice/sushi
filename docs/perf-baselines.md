@@ -561,6 +561,37 @@ rerun. Since that table: the kept scales, the Engram batch reads, the attention 
 - **Prose decode is level or ahead at Nominal** (4k to 32k) and 2 to 6% under at 64k and 128k, the two cells read at
   Moderate and Heavy pressure against a rested box's.
 
+<a id="sampled-draw"></a>
+### Sampled draw as one kernel (micro indicator)
+
+One process, vocabulary 129,280, f32 logits, suppress mask on, temperature 0.8, 300 calls read after 2,000 warm ones,
+`taskpolicy -a`, no lock (no model), M5 Max, AC; GPU busy per call from the engine's own clock. Old chain: the shared
+sampler's ops on the engine at `2948fa9d` (sort, cumsum, where, softmax, log, random bits, Gumbel, argmax, a draw a
+row); kernel: this change on it. Rows: a head 22 nats over a Gaussian bulk falling 0.5 nat a rank (peaked) or 0.05
+(broad), and the bulk alone (flat). us a call, dispatches in brackets.
+
+| draw | old chain | kernel, peaked | kernel, broad | kernel, flat |
+|---|---:|---:|---:|---:|
+| 3-row block, top_p 0.95 | 574 (99) | 115 (2) | 119 | 375 |
+| 3-row block, top_k 40 and top_p 0.95 | 430 (101) | 121 (2) | 118 | 119 |
+| 3-row block, top_k 40 | 427 (98) | 121 (2) | 117 | 119 |
+| 3-row block, no filter | 333 (78) | 68 (2) | 68 | 68 |
+| serial step, top_p 0.95 | 295 (48) | 110 (2) | 114 | 367 |
+| serial step, top_k 40 and top_p 0.95 | 214 (50) | 116 (2) | 112 | 114 |
+| serial step, top_k 40 | 206 (47) | 115 (2) | 111 | 114 |
+| serial step, no filter | 128 (27) | 63 (2) | 63 | 63 |
+
+- The old chain reads the same on every row kind (within 2 us). The kernel's two dispatches are the suppress mask
+  and the draw.
+- **A sampled three-row DSpark round loses 0.31 to 0.46 ms of GPU time and 97 dispatches**, about 1% of a 41 ms
+  round; a filtered serial step 0.09 to 0.19 ms.
+- **The one loss**: a nucleus alone over a flat row, whose shortlist does not fit, takes the descents (375 us a block,
+  367 us a serial step against the chain's 295). A model's rows are peaked; the route is the exact answer for one
+  that is not.
+- Every kernel cell was read twice. Three of the 48 readings sat 20 to 90 us over their twin (139 against 121, 96
+  against 68, 206 against 115), each in another cell, and the twin is given. A reading taken before the GPU reaches
+  its clock is worse: 244 and 351 us where the warmed one reads 115, hence the 2,000 calls.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.

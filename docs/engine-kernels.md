@@ -10,6 +10,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## Decode kernels
 
+- **A threadgroup is one GPU core's work.** A kernel that reduces a whole row in one group (1024 threads, its limit)
+  pays 24 to 33 us for every walk of a 129k-wide row whatever the walk computes (127 ids a thread), and about 2 us a
+  barrier: such a kernel is sized by its walks. The sampled draw (`sampler_draw.zig`) went from 70 walks (a bit of
+  the key a round: 739 to 1,250 us) to 9 to 16 (five bits a round: 346 to 476 us) to 3 (top value, a count by whole
+  nats below it, collect a shortlist of at most 1,024 ids and rank it in the group: 115 to 121 us); the descents stay
+  as the route of a row whose shortlist would not fit. Numbers: [perf-baselines](perf-baselines.md#sampled-draw).
 - A custom kernel can be LATENCY-bound rather than op-bound (qwen4 fused hc read; `hcWrite`
   DEFERS into the next read).
 - A kernel keyed on `batch*seq == 1` declines every verify row AND batched slot, so the grid carries the rows

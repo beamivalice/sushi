@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A sampled DeepSeek token is drawn by one GPU kernel on Sushi Cooler**: temperature, top-k, top-p and the draw
+  took up to 101 GPU dispatches a round and now take two. A seed still gives one text on every repeat, streamed or
+  not, but not the text an earlier version gave for that seed.
 - **Settings opens with a copyable GPU wired-limit command**: the `sudo sysctl iogpu.wired_limit_mb=…` line sets all
   three wire limits from one adjustable, savable box that defaults to the Mac's memory less 4 GB.
 - **An agent turn tokenizes only the text it has not seen before**: each loaded model keeps the token ids of the

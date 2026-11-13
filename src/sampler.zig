@@ -12,6 +12,7 @@ const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
 const logit_bias = @import("logit_bias.zig");
 const random = @import("tensor/random.zig");
+const sampler_draw = @import("sampler_draw.zig");
 const Trunk = trunk.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const dflash_mod = @import("dflash.zig");
@@ -744,6 +745,11 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
         return result;
     }
 
+    if (host.own) {
+        defer _ = mlx.mlx_array_free(current);
+        return engineDraws(current, sampling, s) catch .{ .ctx = null };
+    }
+
     // Scale by 1/temperature
     if (sampling.temperature != 1.0) {
         const temp_arr = mlx.mlx_array_new_float(sampling.temperature);
@@ -955,32 +961,26 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
     return sampled;
 }
 
-/// One draw from the filtered logits `row`. MLX draws under `seedKey`. The engine draws the density's log under the key
-/// of the position the draw predicts, which is what a DSpark row does (`drawFromProbs`), and refuses a request that
-/// has no root for its keys.
+/// One draw from the filtered logits `row` on MLX, under `seedKey`.
 fn categorical(res: *mlx.mlx_array, row: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !void {
-    if (!mlx.engine.isStream(s)) {
-        const key = seedKey(sampling);
-        defer _ = mlx.mlx_array_free(key);
-        return mlx.check(mlx.mlx_random_categorical(res, row, -1, key, s));
-    }
+    const key = seedKey(sampling);
+    defer _ = mlx.mlx_array_free(key);
+    return mlx.check(mlx.mlx_random_categorical(res, row, -1, key, s));
+}
+
+/// The engine's sampled draws of `rows2d` (`[rows, vocab]`, masked and penalized, before temperature): row j under the
+/// key of the position `sampling.draw + j`, in one kernel (`sampler_draw`). A serial step and a DSpark row both draw
+/// here, so one position gives one token whichever of them draws it. A request with no root for its keys is refused.
+pub fn engineDraws(rows2d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     const root = sampling.draw_root orelse {
         _ = mlx.engine.refuse("sampler draw", "a draw on the engine needs the request's draw root for its key");
         return error.EngineDrawNeedsRoot;
     };
-    var probs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(probs);
-    try mlx.check(mlx.mlx_softmax_axis(&probs, row, -1, true, s));
-    return drawFromProbs(res, probs, random.drawKey(root, sampling.draw), s);
-}
-
-/// The engine's draw from a density `probs`: its log, drawn categorically under `key` (`random.drawKey`). A DSpark row
-/// and a serial step both draw this way, so one position gives one token whichever of them draws it.
-pub fn drawFromProbs(res: *mlx.mlx_array, probs: mlx.mlx_array, key: [2]u32, s: mlx.mlx_stream) !void {
-    var logp = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(logp);
-    try mlx.check(mlx.mlx_log(&logp, probs, s));
-    try mlx.check(mlx.engine.categoricalAt(res, logp, key));
+    const n: usize = @intCast(mlx.getShape(rows2d)[0]);
+    var keys: [sampler_draw.max_rows][2]u32 = undefined;
+    if (n > keys.len) return error.SamplerDrawUnsupported;
+    for (keys[0..n], 0..) |*k, j| k.* = random.drawKey(root, sampling.draw +% j);
+    return sampler_draw.rows(rows2d, sampling.temperature, sampling.top_p, sampling.top_k, keys[0..n], s);
 }
 
 /// PRNG key for one draw: `seed` mixed with the draw index, so a seeded
@@ -1088,7 +1088,8 @@ pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling
         _ = mlx.mlx_array_free(scaled);
     };
 
-    if (sampling.temperature != 1.0) {
+    // The engine's draw takes the temperature and the filters itself (`engineDraws`).
+    if (!host.own and sampling.temperature != 1.0) {
         const temp_arr = mlx.mlx_array_new_float(sampling.temperature);
         defer _ = mlx.mlx_array_free(temp_arr);
         try mlx.check(mlx.mlx_divide(&scaled, current, temp_arr, s));
@@ -1109,17 +1110,20 @@ pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling
         _ = mlx.mlx_array_free(filtered);
     };
 
-    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
+    if (!host.own and (sampling.top_k > 0 or sampling.top_p < 1.0)) {
         try filterTopKTopP(&filtered, current, sampling.top_p, sampling.top_k, s);
         current = filtered;
         filtered_owned = true;
     }
 
     // Sample from categorical distribution
-    var sampled = mlx.mlx_array_new();
+    const sampled = if (host.own) try engineDraws(current, sampling, s) else blk: {
+        var drawn = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(drawn);
+        try categorical(&drawn, current, sampling, s);
+        break :blk drawn;
+    };
     defer _ = mlx.mlx_array_free(sampled);
-
-    try categorical(&sampled, current, sampling, s);
 
     // Eval and extract
     try mlx.check(mlx.mlx_array_eval(sampled));
@@ -2969,6 +2973,70 @@ test "suppress_mask: a mask the engine could not apply fails the draw, and the s
     defer _ = mlx.mlx_array_free(drawn);
     try mlx.check(mlx.mlx_array_eval(drawn));
     try std.testing.expectEqual(@as(u32, 5), mlx.mlx_array_data_uint32(drawn).?[0]);
+}
+
+test "sampler: on the engine a sampled step, the sync sampler and a block's rows each draw the rule's token for their position" {
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was_enabled);
+    const s = mlx.engine.stream();
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    const a = testing.allocator;
+    const V = 1500;
+    const n = 3;
+    const first_draw = 10;
+    const flat = try a.alloc(f32, n * V);
+    defer a.free(flat);
+    var prng = std.Random.DefaultPrng.init(0x51);
+    for (flat) |*x| x.* = prng.random().floatNorm(f32) * 2;
+    // Id 7 would win every unmasked draw; it and the reserved ids from V - 4 up are suppressed.
+    for (0..n) |r| flat[r * V + 7] = 60;
+    const mask = try buildSuppressMask(&[_]u32{7}, V - 4, V, s);
+    defer _ = mlx.mlx_array_free(mask);
+    var sampling: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .draw_root = 99, .suppress_mask = mask };
+
+    const ruled = try a.alloc(f32, V);
+    defer a.free(ruled);
+    const order = try a.alloc(u32, V);
+    defer a.free(order);
+    var want: [n]u32 = undefined;
+    for (&want, 0..) |*w, r| {
+        @memcpy(ruled, flat[r * V ..][0..V]);
+        ruled[7] = -std.math.inf(f32);
+        @memset(ruled[V - 4 ..], -std.math.inf(f32));
+        const rule = sampler_draw.hostDraw(ruled, order, sampling.temperature, sampling.top_p, sampling.top_k, random.drawKey(99, first_draw + r));
+        // The data makes every call a clear one, so the rule's id is the only right answer.
+        try testing.expect(rule.gap > 1e-3 and rule.nucleus_margin > 1e-4);
+        w.* = rule.id;
+
+        const step = mlx.mlx_array_new_data(flat[r * V ..].ptr, &[_]c_int{ 1, 1, V }, 3, .float32);
+        defer _ = mlx.mlx_array_free(step);
+        sampling.draw = first_draw + r;
+        const lazy = sampleTokenLazy(step, sampling, s);
+        defer _ = mlx.mlx_array_free(lazy);
+        try mlx.check(mlx.mlx_array_eval(lazy));
+        try testing.expectEqual(rule.id, mlx.mlx_array_data_uint32(lazy).?[0]);
+        try testing.expectEqual(rule.id, (try sampleToken(a, step, sampling, null, 0, null, s)).token_id);
+    }
+
+    const block = mlx.mlx_array_new_data(flat.ptr, &[_]c_int{ n, V }, 2, .float32);
+    defer _ = mlx.mlx_array_free(block);
+    var masked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked);
+    try applySuppressMask(&masked, block, mask, s);
+    sampling.draw = first_draw;
+    try mlx.check(mlx.mlx_array_eval(masked));
+    const calls = mlx.engine.mlxCalls();
+    const dispatched = mlx.engine.stats().dispatches;
+    const drawn = try engineDraws(masked, sampling, s);
+    defer _ = mlx.mlx_array_free(drawn);
+    try mlx.check(mlx.mlx_array_eval(drawn));
+    try testing.expectEqualSlices(u32, &want, mlx.mlx_array_data_uint32(drawn).?[0..n]);
+    // The block's rows are one launch, and the draw asks nothing of MLX: no key, no bits, no array.
+    try testing.expectEqual(dispatched + 1, mlx.engine.stats().dispatches);
+    try testing.expectEqual(calls, mlx.engine.mlxCalls());
 }
 
 test "suppress_mask: a suppressed id is unreachable from both samplers, everything else stays" {
