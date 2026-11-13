@@ -21,6 +21,7 @@ const sched_policy = @import("sched_policy.zig");
 const write_stats = @import("disk_write_stats.zig");
 const request_log = @import("request_log.zig");
 const spec_stats = @import("spec_stats.zig");
+const expert_stats = @import("expert_stats.zig");
 const cache_stats = @import("cache_stats.zig");
 
 // ---------------------------------------------------------------------------
@@ -298,6 +299,7 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try write_stats.writePrometheus(write_stats.process.snapshot(), w);
     try cache_stats.writePrometheus(cache_stats.process.snapshot(), w);
     try spec_stats.writePrometheus(spec_stats.process.snapshot(), w);
+    try expert_stats.writePrometheus(expert_stats.process.snapshot(), w);
 
     // --- Latency histograms (nanoseconds → seconds) ---
     try writeHistogram(w, "vllm:time_to_first_token_seconds", "Time to first token in seconds", &m.ttft_ns, ns_to_s);
@@ -495,6 +497,8 @@ pub fn renderJsonWith(m: *const Metrics, sessions: []const Session, history: ?[]
     try cache_stats.writeJson(cache_stats.process.snapshot(), w);
     try w.writeAll(",");
     try spec_stats.writeJson(spec_stats.process.snapshot(), w);
+    try w.writeAll(",");
+    try expert_stats.writeJson(expert_stats.process.snapshot(), w);
     try w.print(",\"histograms\":{{", .{});
 
     try writeHistogramJson(w, "time_to_first_token_seconds", &m.ttft_ns, ns_to_s);
@@ -1017,6 +1021,26 @@ test "speculative and prefix cache tier counters are on both surfaces" {
     try testing.expect(std.mem.indexOf(u8, prom, "sushi:spec_rounds_total{mode=\"mtp\"}") != null);
     try testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_tier_hits_total{tier=\"ssd\"}") != null);
     try testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_hot_bytes ") != null);
+}
+
+test "the streamed-expert counters are on both surfaces" {
+    const testing = std.testing;
+    expert_stats.process.recordForward(.{ .wall_ns = 1, .routes = 8, .hits = 6, .fill_bytes = 2, .fill_ns = 1, .ssd_read_bytes = 3 });
+    var m = Metrics.init();
+
+    var jbuf: [64 * 1024]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try renderJson(&m, &.{}, &jw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, jbuf[0..jw.end], .{});
+    defer parsed.deinit();
+    const ex = parsed.value.object.get("expert_stream").?.object;
+    try testing.expect(ex.get("routes").?.integer >= 8);
+    try testing.expect(ex.get("hits").?.integer >= 6);
+
+    var pbuf: [64 * 1024]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try renderPrometheus(&m, &pw);
+    try testing.expect(std.mem.indexOf(u8, pbuf[0..pw.end], "sushi:expert_stream_hits_total ") != null);
 }
 
 test "gpu clock gauges are on both surfaces" {

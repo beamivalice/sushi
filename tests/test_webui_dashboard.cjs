@@ -528,7 +528,7 @@ async function chartPicker(browser) {
     const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced' });
     await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
     const all = await shown(page);
-    assert.equal(all.length, 13, 'Advanced shows all but the DSpark-only chart until a choice is made');
+    assert.equal(all.length, 14, 'Advanced shows all but the DSpark-only chart until a choice is made');
     const widths = await page.evaluate(() => {
       const grid = document.getElementById('dashCharts').getBoundingClientRect(), gap = parseFloat(getComputedStyle(document.getElementById('dashCharts')).columnGap);
       return { half: (grid.width - gap) / 2, cards: [...document.querySelectorAll('#dashCharts .chart:not([hidden])')].map((c) => [c.dataset.chart, c.getBoundingClientRect().width]) };
@@ -791,7 +791,7 @@ async function chartAudit(browser) {
     assert.match(await textOf(page, 'dashHLen'), /Not reported by this server/, 'a histogram the server does not export says so instead of drawing nothing');
     assert.equal(await page.getByRole('group', { name: 'Prompt cache reuse' }).count(), 1, 'each chart card is a named group');
     const named = await page.$$eval('#dashCharts .chart[role="group"]', (cards) => cards.map((c) => [c.getAttribute('aria-label'), c.querySelector('h2 [data-tip]').textContent.replace(/ \([^)]*\)$/, '')]));
-    assert.equal(named.length, 14, 'chart cards');
+    assert.equal(named.length, 15, 'chart cards');
     assert.deepEqual(named.filter(([a, t]) => a !== t), [], 'a chart has one name: the picker, the card and its title agree');
     assert.deepEqual(errors, []);
     await context.close();
@@ -801,7 +801,7 @@ async function chartAudit(browser) {
     const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: specFixture() });
     await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
     const titles = await page.$$eval('#dashCharts .chart', (cards) => cards.map((c) => { const a = c.querySelector('h2 [data-tip]'); return { id: c.dataset.chart, tip: a?.dataset.tip ?? '', tab: a?.tabIndex }; }));
-    assert.equal(titles.length, 14, 'every chart was checked');
+    assert.equal(titles.length, 15, 'every chart was checked');
     for (const t of titles) assert.ok(t.tip.length > 20 && t.tab === 0, `${t.id}: its title has a focusable tooltip`);
     const heads = await page.$$eval('table.sessions thead th', (ths) => ths.filter((th) => th.textContent.trim()).map((th) => ({ text: th.textContent, tip: th.querySelector('[data-tip]')?.dataset.tip ?? '' })));
     for (const h of heads) assert.ok(h.tip.length > 10, `Sessions column ${h.text} has a tooltip`);
@@ -841,7 +841,7 @@ async function chartAudit(browser) {
     const charts = await page.$$eval('#dashCharts .chart', (cards) => Object.fromEntries(cards.map((c) => [c.dataset.chart, c.querySelector('h2 [data-tip]')?.dataset.term ?? ''])));
     const chartTerms = { prefill: /prefill/, decode: /decode/, requests: /prefill.*batched/, gpu: /utilization/, memory: /footprint.*MLX active.*MLX cache/, specaccept: /draft acceptance.*MTP.*DFlash2.*DSpark/,
       specrows: /verifier rows/, cachereuse: /prefix cache.*hit.*computed/, cachetiers: /evict/, cachewrites: /prefix cache/, outcomes: /requests_/, latency: /TTFT.*prefill.*decode.*e2e/,
-      length: /prompt_tokens.*output_tokens/, serial: /decode_serial/ };
+      length: /prompt_tokens.*output_tokens/, serial: /decode_serial/, experts: /expert cache/ };
     assert.equal(Object.keys(charts).length, Object.keys(chartTerms).length, 'every chart title was checked');
     for (const [id, term] of Object.entries(chartTerms)) assert.match(charts[id] ?? '', term, `chart ${id}: its title names the technical term`);
     const rowTerms = (id) => page.$$eval(`#${id} .hb`, (rows) => rows.map((r) => [r.querySelector('span').textContent, r.dataset.term ?? '']));
@@ -926,14 +926,49 @@ const RETIRED_REPLY = /\\brepl(?:y|ies)\\s+(?:speed|length|tok|done|[\\d-])|\\br
 const ALL_ON = { 'sushi-dash:charts': JSON.stringify({ order: [], hidden: [] }) };
 // The merged cards: a saved choice that names the cards they replaced migrates, motion honours reduced motion and a
 // hidden tab, and an empty server gets a readable note in every card.
-const MERGED_IDS = ['prefill', 'decode', 'requests', 'latency', 'gpu', 'memory', 'cachereuse', 'cachetiers', 'specaccept', 'length', 'outcomes', 'serial', 'cachewrites', 'specrows'];
+const MERGED_IDS = ['prefill', 'decode', 'requests', 'latency', 'gpu', 'memory', 'cachereuse', 'cachetiers', 'specaccept', 'length', 'outcomes', 'serial', 'cachewrites', 'specrows', 'experts'];
+// The Expert streaming card: hits and SSD reads as bars of the routes, the rates between polls in its foot, and a line
+// saying why it is empty on a server that streams nothing.
+async function expertCard(browser) {
+  const GiB = 2 ** 30;
+  const counters = (routes, hits, read) => ({ engines: 1, cache_bytes: 12 * GiB, forwards: 9, forward_ns: 4e9, routes, hits, fill_bytes: GiB, fill_ns: 1e9, ssd_read_bytes: read });
+  {
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: { expert_stream: counters(1000, 800, 4 * GiB) } });
+    await page.waitForSelector('#dashExperts .hb');
+    const rows = await page.$$eval('#dashExperts .hb', (r) => r.map((x) => [x.querySelector('span').textContent, x.querySelector('b').textContent]));
+    assert.deepEqual(rows, [['In memory', '80% · 800'], ['Read from the SSD', '20% · 200']]);
+    await page.evaluate((c) => { window.__stub.specData = { expert_stream: c }; }, counters(1400, 1100, 6 * GiB));
+    await page.waitForFunction(() => /lately/.test(document.getElementById('dashExpertsFoot').textContent));
+    const foot = await page.textContent('#dashExpertsFoot');
+    assert.match(foot, /75% in memory lately/, `the hit rate between polls: ${foot}`);
+    assert.match(foot, /SSD reads [\d.,]+ (GiB|MiB)\/s/);
+    assert.match(foot, /25% of forward time waiting on the SSD/);
+    assert.match(foot, /cache 12\.00 GiB/);
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    const off = { engines: 0, cache_bytes: 0, forwards: 0, forward_ns: 0, routes: 0, hits: 0, fill_bytes: 0, fill_ns: 0, ssd_read_bytes: 0 };
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: { expert_stream: off } });
+    await page.waitForFunction(() => /streams its experts/.test(document.getElementById('dashExperts').textContent));
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced' });
+    await page.waitForFunction(() => /Not reported/.test(document.getElementById('dashExperts').textContent));
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+}
+
 async function dashboardV2(browser) {
   const shown = (page) => page.evaluate(() => [...document.querySelectorAll('#dashCharts .chart:not([hidden])')].map((c) => c.dataset.chart));
   const live = (page) => page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
   {
     const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced' });
     await live(page);
-    assert.deepEqual(await page.$$eval('#dashCharts .chart', (c) => c.map((x) => x.dataset.chart)), MERGED_IDS, 'fourteen cards, two per row in this order');
+    assert.deepEqual(await page.$$eval('#dashCharts .chart', (c) => c.map((x) => x.dataset.chart)), MERGED_IDS, 'fifteen cards, two per row in this order');
     assert.deepEqual(await shown(page), MERGED_IDS.filter((id) => id !== 'specrows'), 'Advanced shows all but the DSpark-only card until a choice is made');
     const wrapped = await page.$$eval('section.adv.tiles .tile .k', (ks) => ks.filter((k) => k.offsetHeight > 1.5 * parseFloat(getComputedStyle(k).lineHeight)).map((k) => k.textContent));
     assert.deepEqual(wrapped, [], 'every eight-tile label fits on one line (the short form where the full one wraps)');
@@ -948,9 +983,9 @@ async function dashboardV2(browser) {
     const hidden = ['ttft', 'e2e', 'latency', 'memsplit', 'memory', 'otok', 'specrows', 'cachewrites'];
     const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', storage: { 'sushi-dash:charts': JSON.stringify({ order: old, hidden }) } });
     await live(page);
-    assert.deepEqual(await shown(page), ['prefill', 'decode', 'requests', 'gpu', 'specaccept', 'cachereuse', 'cachetiers', 'outcomes', 'length', 'serial'], 'merged cards take the first place of any part; one hides only when every part was hidden');
+    assert.deepEqual(await shown(page), ['prefill', 'decode', 'requests', 'gpu', 'specaccept', 'cachereuse', 'cachetiers', 'outcomes', 'length', 'serial', 'experts'], 'merged cards take the first place of any part; one hides only when every part was hidden');
     const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('sushi-dash:charts')));
-    assert.deepEqual([...saved.order].sort(), [...MERGED_IDS].sort(), 'the stored order is rewritten with the merged ids only');
+    assert.deepEqual([...saved.order].sort(), MERGED_IDS.filter((id) => id !== 'experts').sort(), 'the stored order is rewritten with the merged ids only (a card added since is shown, not stored)');
     assert.deepEqual([...saved.hidden].sort(), ['cachewrites', 'latency', 'memory', 'specrows'], 'and so is the hidden list');
     const blanks = await page.$$eval('#dashCharts .chart:not([hidden])', (cards) => cards.filter((c) => !c.querySelector('h2 [data-tip]')?.textContent || c.getBoundingClientRect().height < 150).map((c) => c.dataset.chart));
     assert.deepEqual(blanks, [], 'no migrated card is blank');
@@ -1070,6 +1105,7 @@ async function main() {
   }
   try {
     await dashboardV2(browser);
+    await expertCard(browser);
     await dashboardBugs(browser);
     await chartPicker(browser);
     await chartExtras(browser);

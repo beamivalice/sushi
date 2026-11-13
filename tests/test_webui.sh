@@ -201,7 +201,7 @@ check "the page is under 1 MB" "$([ "$(wc -c < "$PAGE")" -lt 1048576 ] && echo 1
 
 echo "[5/5] the page's own functions (node): effort menu, tool loop, SSD prefix-cache meter, Chat/Dashboard navigator"
 if command -v node >/dev/null 2>&1; then
-    for t in effort tools prefix_cache admin; do
+    for t in effort tools prefix_cache admin expert_stream; do
         check "tests/test_webui_$t.cjs passes" "$(node "tests/test_webui_$t.cjs" >/dev/null 2>&1 && echo 1 || echo 0)"
     done
     dash_out="$(node tests/test_webui_dashboard.cjs 2>&1)"; dash_rc=$?

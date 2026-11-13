@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The dashboard shows expert streaming**: for a model that streams its experts from the SSD, a new card shows how many
+  routed experts were already in memory, the SSD read rate and the time spent waiting on it, and `/metrics` carries the
+  same counters.
 - **Chat requests and pack loads are sturdier**: an OpenAI `function`-role message is read as a tool result on every
   model, a pack whose tokenizer files are malformed fails to load with a line that names the key instead of taking
   the server down, and text a client sends is never read as a special token or cut out of a continued reply.

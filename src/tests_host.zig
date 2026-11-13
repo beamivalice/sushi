@@ -71,6 +71,7 @@ test {
     _ = @import("restore_tape.zig");
     _ = @import("cache_stats.zig");
     _ = @import("spec_stats.zig");
+    _ = @import("expert_stats.zig");
     _ = @import("metrics_history.zig");
     _ = @import("request_log.zig");
     _ = @import("json_text.zig");

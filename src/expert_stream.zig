@@ -1,4 +1,5 @@
 const std = @import("std");
+const expert_stats = @import("expert_stats.zig");
 const fill_marks = @import("fill_marks.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
@@ -1993,6 +1994,8 @@ pub const Engine = struct {
     /// The pack's `expert_usage.json` counts, `[routed layer][expert id]`: ranks what `warmCache` preloads.
     warm_usage: ?expert_usage.Usage = null,
     plan: CachePlan,
+    /// `fillStats().bytes_read` already added to `expert_stats.process`.
+    read_reported: u64 = 0,
     store: ExpertStore,
     layers: []LayerState,
     s: mlx.mlx_stream,
@@ -2175,6 +2178,7 @@ pub const Engine = struct {
             @as(f64, @floatFromInt(plan.bounce_bytes)) / 1e9,
             engine.fallback_imports,
         });
+        expert_stats.process.engine(true, plan.cache_bytes);
         return engine;
     }
 
@@ -2216,6 +2220,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        expert_stats.process.engine(false, self.plan.cache_bytes);
         self.stopPrefetch();
         self.drainPendingReaders();
         self.releaseSlabs();
@@ -2387,6 +2392,9 @@ pub const Engine = struct {
             acc.unions += layer.stats.unions;
         }
         self.last = acc;
+        const read_total = self.fillStats().bytes_read;
+        expert_stats.process.recordForward(.{ .wall_ns = wall_ns, .routes = acc.union_members, .hits = acc.hits, .fill_bytes = acc.fill_bytes, .fill_ns = acc.fill_ns, .ssd_read_bytes = read_total -| self.read_reported });
+        self.read_reported = read_total;
         if (self.prefetcher) |pf| {
             const io = std.Io.Threaded.global_single_threaded.io();
             pf.mu.lockUncancelable(io);
@@ -4912,6 +4920,42 @@ test "expert stream route detail buckets by attention class and probes off the p
     try t.expect(!engine.routeProbeActive());
     engine.forward_count = BREAKDOWN_EVERY + BREAKDOWN_EVERY / 2 - 1;
     try t.expect(engine.routeProbeActive());
+}
+
+test "expert stream: every forward and the engine's cache reach the process counters" {
+    const t = std.testing;
+    const before = expert_stats.process.snapshot();
+    var fixture = try TinyEngine.open(2, 4);
+    errdefer fixture.close();
+    const engine = &fixture.engine;
+    const open = expert_stats.process.snapshot();
+    try t.expectEqual(before.engines + 1, open.engines);
+    try t.expectEqual(before.cache_bytes + engine.plan.cache_bytes, open.cache_bytes);
+
+    engine.beginForward();
+    var cold = try engine.prepareHost(0, &.{ 0, 2 });
+    cold.deinit();
+    engine.finishForward(1);
+    const after_cold = expert_stats.process.snapshot();
+    try t.expectEqual(open.forwards + 1, after_cold.forwards);
+    try t.expectEqual(open.routes + 2, after_cold.routes);
+    try t.expectEqual(open.hits, after_cold.hits);
+    try t.expect(after_cold.fill_bytes > open.fill_bytes);
+    try t.expect(after_cold.ssd_read_bytes - open.ssd_read_bytes >= after_cold.fill_bytes - open.fill_bytes);
+
+    engine.beginForward();
+    var warm = try engine.prepareHost(0, &.{ 0, 2 });
+    warm.deinit();
+    engine.finishForward(1);
+    const after_warm = expert_stats.process.snapshot();
+    try t.expectEqual(after_cold.routes + 2, after_warm.routes);
+    try t.expectEqual(after_cold.hits + 2, after_warm.hits);
+    try t.expectEqual(after_cold.fill_bytes, after_warm.fill_bytes);
+
+    fixture.close();
+    const closed = expert_stats.process.snapshot();
+    try t.expectEqual(before.engines, closed.engines);
+    try t.expectEqual(before.cache_bytes, closed.cache_bytes);
 }
 
 test "expert stream a streamed reader holds its slab lease until the next route readback" {
