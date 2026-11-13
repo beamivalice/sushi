@@ -43,7 +43,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     // on MLX's stream would take one as a second buffer over its pages.
     const own_load = own_decode;
     if (own_load) mlx.engine.hold();
-    errdefer if (own_load) mlx.engine.unhold();
+    errdefer if (own_load) @import("../arch/handle.zig").engineHoldEnd();
     const model_stream = if (own_load) mlx.engine.stream() else s;
     // No cap of an earlier model's forward (a load that failed in its warm, a request that never ended) meets this load.
     if (own_load) try mlx.engine.budget(std.math.maxInt(u64));

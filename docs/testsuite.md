@@ -135,6 +135,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `double-free` flags a handle that an `errdefer` frees and a later `defer` frees again.
   `scope-state` flags a hand write of `engine.active` (anywhere outside `src/tensor/`) or of `engine.enabled`
   (outside tests): the guards of [the seam](engine-own-forward.md#the-seam) are the only writers.
+  `engine-hold-end` flags a call of `engine.unhold` outside `arch_handle.engineHoldEnd` and `src/tensor/`: the last
+  hold's end also gives back the EXL3 module's engine-side arrays.
   `template-runtime-safety` flags a fn under `src/template/` whose body does not open with `@setRuntimeSafety(true)`,
   and any `@setRuntimeSafety(false)` there: the engine reads pack text, and in ReleaseFast only that keeps its bounds
   and overflow checks. It covers the engine's own code, not the std functions it calls (those run unchecked); that is

@@ -142,6 +142,22 @@ printf '%s\n' 'fn free(x: u32) void { _ = x; }' 'fn other(x: u32) void { _ = x; 
   '    const c: u32 = 4;' '    defer free(c);' '}' 'fn h() void {' '    const a: u32 = 1;' '    defer free(a);' '}' > "$TMP/t/src/p.zig"
 expect_green "another name, another call, a defer after the errdefer's block closed, and another fn"
 
+# rule engine-hold-end
+tree
+mkdir -p "$TMP/t/src/arch" "$TMP/t/src/tensor"
+printf '%s\n' 'const mlx = struct { const engine = struct { fn hold() void {} fn unhold() void {} }; };' \
+  'fn load() void {' '    mlx.engine.hold();' '    errdefer mlx.engine.unhold();' '}' > "$TMP/t/src/p.zig"
+expect_red "a hold ended by hand" "src/p.zig:4:18 \[engine-hold-end\] load: 'engine.unhold' ends a hold by hand"
+
+tree
+mkdir -p "$TMP/t/src/arch" "$TMP/t/src/tensor"
+printf '%s\n' 'const mlx = struct { const engine = struct { fn unhold() void {} }; };' 'pub fn engineHoldEnd() void {' '    mlx.engine.unhold();' '}' > "$TMP/t/src/arch/handle.zig"
+printf '%s\n' 'const engine = struct { pub fn unhold() void {} };' 'fn turnEnd() void {' '    engine.unhold();' '}' > "$TMP/t/src/tensor/route.zig"
+printf '%s\n' 'const mlx = struct { const engine = struct { fn unhold() void {} }; };' 'pub fn engineHoldEnd() void {' '    mlx.engine.unhold();' '}' > "$TMP/t/src/p.zig"
+expect_red "the owner's name in another file" "src/p.zig:3:9 \[engine-hold-end\] engineHoldEnd"
+rm "$TMP/t/src/p.zig"
+expect_green "the owner and the engine's own files"
+
 # rule scope-state
 tree
 printf '%s\n' 'const mlx = struct { const engine = struct { var active: bool = false; var enabled: bool = false; }; };' \

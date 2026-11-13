@@ -792,7 +792,7 @@ test "dsv41 borrow: beside a Cooler model, a model on MLX has its transient cap 
             defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
             defer own_override = null;
             mlx.engine.hold();
-            defer mlx.engine.unhold();
+            defer @import("../arch/handle.zig").engineHoldEnd();
             {
                 const turn = mlx.engine.turnTo(false);
                 defer turn.end();
@@ -835,7 +835,7 @@ test "dsv41 borrow: beside a Cooler model's forward, a model on MLX drops its po
                 _ = mlx.setTransientLimit(0);
             }
             mlx.engine.hold();
-            defer mlx.engine.unhold();
+            defer @import("../arch/handle.zig").engineHoldEnd();
             {
                 const turn = mlx.engine.turnTo(false);
                 defer turn.end();
@@ -887,7 +887,7 @@ test "dsv41 borrow: a Cooler model's unload leaves MLX's lowered pool cap to the
             }
             own_override = true;
             unloadModelMlx(&config);
-            mlx.engine.unhold();
+            @import("../arch/handle.zig").engineHoldEnd();
             var now: usize = 0;
             try mlx.check(mlx.mlx_set_cache_limit(&now, 3 << 30));
             try testing.expectEqual(@as(usize, 3 << 30), now);

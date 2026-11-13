@@ -31,6 +31,14 @@ pub fn trunk(h: Handle) *Trunk {
     };
 }
 
+/// Ends one hold of the engine (`mlx.engine.hold`). The last hold's end is the last Cooler model's, whether its load
+/// finished or failed: the EXL3 module's arrays on the engine's side go with it. Every hold ends here (lint
+/// `engine-hold-end`): a second exit is how a failed load kept them.
+pub fn engineHoldEnd() void {
+    mlx.engine.unhold();
+    if (!mlx.engine.holding()) sushi_exl3.dropHostArrays(1);
+}
+
 /// Models on MLX's side the registry holds (inference thread). The EXL3 module caches arrays per side for the process;
 /// the last such model's unload gives MLX's back, as the last Cooler unload gives back the engine's.
 const MlxModels = struct {
@@ -164,7 +172,7 @@ test "beside a held scope each side's items run in that side's turn, in their or
     const was_enabled = mlx.engine.enabled;
     defer @import("../test_support.zig").restoreEngine(was_enabled);
     mlx.engine.hold();
-    defer mlx.engine.unhold();
+    defer engineHoldEnd();
     const swallows = mlx.rest_swallows.load(.monotonic);
     var held: Seen = .{};
     try perSide(Item, &items, onEngineOf, &held, Seen.run);

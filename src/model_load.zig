@@ -2503,7 +2503,7 @@ const JobTurn = struct {
     }
 
     fn end(self: JobTurn) void {
-        if (self.own) mlx.engine.unhold();
+        if (self.own) arch_handle.engineHoldEnd();
         self.turn.end();
     }
 };

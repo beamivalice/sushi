@@ -1695,7 +1695,7 @@ test "the device reads a load makes are asked before it: under a hold they ask M
     mlx.engine.enabled = true;
     defer @import("test_support.zig").restoreEngine(was);
     mlx.engine.hold();
-    defer mlx.engine.unhold();
+    defer @import("arch/handle.zig").engineHoldEnd();
     const breaks = mlx.rest_breaks.load(.monotonic);
     _ = mlx.noGpuBackend();
     _ = mlx.maxRecommendedWorkingSet();

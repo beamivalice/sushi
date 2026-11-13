@@ -6634,7 +6634,7 @@ test "dsv41 NAX trials on the engine's stream: the release shapes pass with noth
     const s = mlx.engine.stream();
     // As a load that is the engine's runs them.
     mlx.engine.hold();
-    defer mlx.engine.unhold();
+    defer @import("../arch/handle.zig").engineHoldEnd();
     const calls = mlx.engine.mlxCalls();
     try testing.expect(try kernels.attnNaxTrial(testing.allocator, s, 64, 512, 64, 8, kernels.attn_nax_bar));
     try testing.expect(!try kernels.attnNaxTrial(testing.allocator, s, 64, 512, 64, 8, 0));

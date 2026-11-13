@@ -15,6 +15,7 @@ const rules = .{
     @import("mlx_extern.zig"),
     @import("double_free.zig"),
     @import("scope_state.zig"),
+    @import("engine_hold_end.zig"),
     @import("template_runtime_safety.zig"),
     @import("template_superlinear_std.zig"),
     @import("template_unchecked_utf8.zig"),

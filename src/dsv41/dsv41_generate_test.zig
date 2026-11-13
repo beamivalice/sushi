@@ -2383,7 +2383,7 @@ const LoadJob = struct {
     }
 
     fn end(self: LoadJob) void {
-        if (self.own) mlx.engine.unhold();
+        if (self.own) @import("../arch/handle.zig").engineHoldEnd();
         self.turn.end();
     }
 };
@@ -2602,6 +2602,8 @@ test "dsv41 engine: a Cooler load whose warm does not fit its bill fails by name
     defer kept.deinit(a);
     var want: [2]std.ArrayList(u32) = @splat(.empty);
     defer for (&want) |*w| w.deinit(a);
+    // The engine's pool and mappings as a served model's unload leaves them.
+    var clean: Sheet = undefined;
     for (&want, [_]bool{ false, true }) |*ids, after_failure| {
         if (after_failure) {
             dsv41_borrow.warm_budget_override = 0;
@@ -2613,6 +2615,7 @@ test "dsv41 engine: a Cooler load whose warm does not fit its bill fails by name
             try testing.expect(!mlx.engine.holding());
             try testing.expect(!mlx.engine.active);
             try testing.expect(!mlx.errorPending());
+            try testing.expectEqual(clean, Sheet.now());
         }
         var fx: EngineFixture = undefined;
         try fx.open(dir);
@@ -2625,8 +2628,60 @@ test "dsv41 engine: a Cooler load whose warm does not fit its bill fails by name
         gen.deinit(a);
         fx.deinit();
         dsv41_borrow.unloadModelMlx(&kept);
+        if (!after_failure) clean = Sheet.now();
     }
     try testing.expectEqualSlices(u32, want[0].items, want[1].items);
+}
+
+test "dsv41 engine: a Cooler load refused at any of its pool buffers frees what it made, its warm's module arrays too, and the next load serves (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var kept = try model_mod.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, dir);
+    defer kept.deinit(a);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.engine.fault.disarm();
+    {
+        var fx: EngineFixture = undefined;
+        try fx.open(dir);
+        fx.deinit();
+        dsv41_borrow.unloadModelMlx(&kept);
+    }
+    const base = Sheet.now();
+    const c0 = mlx.engine.fault.count();
+    {
+        var fx: EngineFixture = undefined;
+        try fx.open(dir);
+        fx.deinit();
+        dsv41_borrow.unloadModelMlx(&kept);
+    }
+    const total = mlx.engine.fault.count() - c0;
+    try testing.expectEqual(base, Sheet.now());
+    var msg: [300]u8 = undefined;
+    var refused: usize = 0;
+    var k: u64 = 1;
+    while (k <= total) : (k += @max(1, total / 12)) {
+        var fx: EngineFixture = undefined;
+        try fx.prepare(dir, null, 64 << 20);
+        mlx.engine.fault.arm(k);
+        const r = fx.load(dir);
+        mlx.engine.fault.disarm();
+        if (r) fx.deinit() else |_| {
+            refused += 1;
+            _ = mlx.takeError(&msg);
+        }
+        dsv41_borrow.unloadModelMlx(&kept);
+        try testing.expect(!mlx.engine.holding());
+        try testing.expectEqual(base, Sheet.now());
+    }
+    try testing.expect(refused >= 10);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    fx.deinit();
+    dsv41_borrow.unloadModelMlx(&kept);
 }
 
 test "dsv41 engine: a Cooler load that fails beside a resident Cooler model leaves that model's scope and seal as they were (DSV41_STQ_TINY)" {

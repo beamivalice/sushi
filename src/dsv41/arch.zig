@@ -6,7 +6,6 @@ const trunk = @import("../trunk.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
 const serving = @import("dsv41_serving.zig");
-const sushi_exl3 = @import("sushi_exl3");
 const admission = @import("../arch/admission.zig");
 const registry = @import("../arch/registry.zig");
 const Trunk = trunk.Trunk;
@@ -145,9 +144,7 @@ pub fn deinit(xfm: Model) void {
     xfm.arch_state.dsv41.deinit(xfm.allocator);
     xfm.deinitTrunk();
     if (!held) return;
-    mlx.engine.unhold();
-    // The last Cooler model gone, nothing of the engine's stays in use: the EXL3 module's arrays of its side go too.
-    if (!mlx.engine.holding()) sushi_exl3.dropHostArrays(1);
+    @import("../arch/handle.zig").engineHoldEnd();
     const breaks = mlx.rest_breaks.load(.monotonic);
     const swallows = mlx.rest_swallows.load(.monotonic);
     if (breaks != 0 or swallows != 0) log.warn("[engine] while MLX was at rest it was called {d} times and asked {d} settings that reached nothing (process totals): work outside its model's turn\n", .{ breaks, swallows });
