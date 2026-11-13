@@ -92,7 +92,7 @@ test "mimo_v2 template preserves reasoning and XML tool history" {
 
 test "real mimo_v2 template is the committed fixture" {
     const raw = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
-    var config = try chat.loadChatConfig(testing.io, testing.allocator, std.mem.span(raw));
+    var config = try chat.loadChatConfig(testing.io, testing.allocator, std.mem.span(raw), "mimo_v2");
     defer config.deinit();
     try testing.expectEqualStrings(fixtures.template, config.chat_template);
 }

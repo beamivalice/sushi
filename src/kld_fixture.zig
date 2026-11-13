@@ -156,7 +156,8 @@ pub fn loadPrompts(allocator: std.mem.Allocator, io: std.Io, path: []const u8, l
                 defer allocator.free(text_path);
                 const text = try std.Io.Dir.cwd().readFileAlloc(io, text_path, allocator, .limited(MAX_PROMPT_BYTES));
                 errdefer allocator.free(text);
-                try items.append(allocator, .{ .id = try allocator.dupe(u8, fp.id), .text = text });
+                try items.ensureUnusedCapacity(allocator, 1);
+                items.appendAssumeCapacity(.{ .id = try allocator.dupe(u8, fp.id), .text = text });
             }
         },
         .text_dir => {
@@ -172,7 +173,8 @@ pub fn loadPrompts(allocator: std.mem.Allocator, io: std.Io, path: []const u8, l
                 while (try it.next(io)) |dent| {
                     if (dent.kind == .directory) continue;
                     if (!std.mem.endsWith(u8, dent.name, ".txt")) continue;
-                    try names.append(allocator, try allocator.dupe(u8, dent.name));
+                    try names.ensureUnusedCapacity(allocator, 1);
+                    names.appendAssumeCapacity(try allocator.dupe(u8, dent.name));
                 }
             }
             std.mem.sort([]u8, names.items, {}, struct {

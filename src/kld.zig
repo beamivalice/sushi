@@ -349,7 +349,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
 
     self.tok = try tokenizer_mod.loadTokenizer(io, allocator, opts.model_dir);
     errdefer self.tok.deinit();
-    self.chat_config = try chat_mod.loadChatConfig(io, allocator, opts.model_dir);
+    self.chat_config = try chat_mod.loadChatConfig(io, allocator, opts.model_dir, self.config.model_type);
     errdefer self.chat_config.deinit();
 
     self.weights = try model_mod.loadWeightsForConfig(io, allocator, opts.model_dir, &self.config, false);

@@ -58,7 +58,10 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) !File {
             var meta = entry.value_ptr.*.object.iterator();
             while (meta.next()) |m| {
                 if (m.value_ptr.* != .string) return error.BadSafetensorsHeader;
-                try metadata.put(try allocator.dupe(u8, m.key_ptr.*), try allocator.dupe(u8, m.value_ptr.*.string));
+                try metadata.ensureUnusedCapacity(1);
+                const key = try allocator.dupe(u8, m.key_ptr.*);
+                errdefer allocator.free(key);
+                metadata.putAssumeCapacity(key, try allocator.dupe(u8, m.value_ptr.*.string));
             }
             continue;
         }
@@ -68,12 +71,22 @@ pub fn parse(allocator: std.mem.Allocator, raw: []const u8) !File {
         const shape_v = obj.get("shape") orelse continue;
         const offsets = obj.get("data_offsets") orelse continue;
         if (dtype != .string or shape_v != .array or offsets != .array or offsets.array.items.len != 2) continue;
-        const start: usize = @intCast(offsets.array.items[0].integer);
-        const end: usize = @intCast(offsets.array.items[1].integer);
+        const lo = offsets.array.items[0];
+        const hi = offsets.array.items[1];
+        if (lo != .integer or hi != .integer) return error.TruncatedSafetensors;
+        const start = std.math.cast(usize, lo.integer) orelse return error.TruncatedSafetensors;
+        const end = std.math.cast(usize, hi.integer) orelse return error.TruncatedSafetensors;
         if (end > data.len or start > end) return error.TruncatedSafetensors;
         var shape = try allocator.alloc(usize, shape_v.array.items.len);
-        for (shape_v.array.items, 0..) |d, i| shape[i] = @intCast(d.integer);
-        try tensors.put(try allocator.dupe(u8, entry.key_ptr.*), .{
+        errdefer allocator.free(shape);
+        for (shape_v.array.items, 0..) |d, i| {
+            if (d != .integer) return error.TruncatedSafetensors;
+            shape[i] = std.math.cast(usize, d.integer) orelse return error.TruncatedSafetensors;
+        }
+        try tensors.ensureUnusedCapacity(1);
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key);
+        tensors.putAssumeCapacity(key, .{
             .dtype = try allocator.dupe(u8, dtype.string),
             .shape = shape,
             .bytes = data[start..end],

@@ -524,7 +524,8 @@ const Ledger = struct {
             const nll: f64 = @bitCast(r.nll_bits);
             const id = try a.dupe(u8, r.id);
             errdefer a.free(id);
-            try records.append(a, .{ .id = id, .dir = try a.dupe(u8, r.dir), .prompt_tokens = r.tokens, .generated_tokens = 1, .strict_nll_mean = nll, .strict_perplexity = @exp(nll) });
+            try records.ensureUnusedCapacity(a, 1);
+            records.appendAssumeCapacity(.{ .id = id, .dir = try a.dupe(u8, r.dir), .prompt_tokens = r.tokens, .generated_tokens = 1, .strict_nll_mean = nll, .strict_perplexity = @exp(nll) });
         }
         if (b.hidden) |w| try w.truncateTo(self.committed_tokens);
         if (b.imatrix) |c| try self.restoreImatrix(b.io, c, covered(b, self.records.len));

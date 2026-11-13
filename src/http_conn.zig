@@ -1892,7 +1892,7 @@ test "isStatusRoute: only /props reaches the shared release" {
 test "POST /v1/completions with a prompt that tokenizes to nothing answers 400 before any generation" {
     const t = std.testing;
     const a = t.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var cfg = model_mod.ModelConfig{ .num_hidden_layers = 0, .pinned_context = 4096 };
     var lm: LoadedModel = undefined;

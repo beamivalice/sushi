@@ -578,6 +578,13 @@ pub fn noThinkTailSuffix(rendered: []const u8, enable_thinking: bool) ?[]const u
     return if (tail.len > 0) tail else null;
 }
 
+/// Where the think opener a render ends with (trailing whitespace ignored) starts and ends, or null.
+pub fn tailThinkOpener(rendered: []const u8) ?struct { start: usize, end: usize } {
+    const trimmed = std.mem.trimEnd(u8, rendered, "\n\r\t ");
+    const l = endsWithThinkOpenTag(trimmed) orelse return null;
+    return .{ .start = trimmed.len - l, .end = trimmed.len };
+}
+
 /// What must be appended to a rendered prompt so generation resumes in the
 /// assistant's VISIBLE CONTENT channel rather than inside a reasoning block.
 ///

@@ -86,7 +86,8 @@ pub fn parseTreeJson(allocator: std.mem.Allocator, json: []const u8) ![]RepoFile
         }
         const path = try allocator.dupe(u8, p.string);
         errdefer allocator.free(path);
-        try files.append(allocator, .{ .path = path, .size = size, .oid = try allocator.dupe(u8, oid), .lfs = lfs });
+        try files.ensureUnusedCapacity(allocator, 1);
+        files.appendAssumeCapacity(.{ .path = path, .size = size, .oid = try allocator.dupe(u8, oid), .lfs = lfs });
     }
     return files.toOwnedSlice(allocator);
 }

@@ -620,7 +620,7 @@ fn readPackFacts(io: std.Io, allocator: std.mem.Allocator, row: *ModelRow) void 
     row.fit.window_native = row.rope.native;
     row.fit.window_default = row.rope.cap();
     if (row.loaded != null) return;
-    var chat_config = chat.peekChatConfig(io, allocator, row.path) catch return;
+    var chat_config = chat.peekChatConfig(io, allocator, row.path, if (row.fit.arch.len > 0) row.fit.arch else null) catch return;
     defer chat_config.deinit();
     row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(&chat_config);
     row.fit.template_thinks = chat.templateHasThinkSpan(&chat_config);

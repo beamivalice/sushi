@@ -23,7 +23,8 @@ pub const PackMap = struct {
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
             if (entry.kind != .file or entry.name[0] == '.' or !std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
-            try files.append(allocator, try allocator.dupe(u8, entry.name));
+            try files.ensureUnusedCapacity(allocator, 1);
+            files.appendAssumeCapacity(try allocator.dupe(u8, entry.name));
         }
         var self = PackMap{ .allocator = allocator, .dir = dir, .files = try files.toOwnedSlice(allocator), .map = std.StringHashMap(PackTensor).init(allocator) };
         errdefer self.deinit();
@@ -51,7 +52,8 @@ pub const PackMap = struct {
                 errdefer allocator.free(dtype);
                 const start: u64 = @intCast(offs[0].integer);
                 const end: u64 = @intCast(offs[1].integer);
-                try self.map.put(try allocator.dupe(u8, e.key_ptr.*), .{ .file = fi, .at = 8 + header_len + start, .len = end - start, .dtype = dtype, .shape = shape });
+                try self.map.ensureUnusedCapacity(1);
+                self.map.putAssumeCapacity(try allocator.dupe(u8, e.key_ptr.*), .{ .file = fi, .at = 8 + header_len + start, .len = end - start, .dtype = dtype, .shape = shape });
             }
         }
         return self;
@@ -214,7 +216,8 @@ fn copyRenamedShard(allocator: std.mem.Allocator, io: std.Io, src_dir: std.Io.Di
     var it = parsed.value.object.iterator();
     while (it.next()) |e| {
         if (std.mem.eql(u8, e.key_ptr.*, "__metadata__")) continue;
-        try names_out.append(allocator, try allocator.dupe(u8, e.key_ptr.*));
+        try names_out.ensureUnusedCapacity(allocator, 1);
+        names_out.appendAssumeCapacity(try allocator.dupe(u8, e.key_ptr.*));
     }
     const stat = try f.stat(io);
     var tmp_buf: [96]u8 = undefined;
@@ -243,6 +246,14 @@ fn link(io: std.Io, dir: std.Io.Dir, target_abs: []const u8, name: []const u8) !
     try dir.symLink(io, target_abs, name, .{});
 }
 
+/// One index row, its two copies freed if either copy or the append fails.
+fn appendIndexEntry(allocator: std.mem.Allocator, index: *std.ArrayList(pack.IndexEntry), tensor: []const u8, file: []const u8) !void {
+    try index.ensureUnusedCapacity(allocator, 1);
+    const t = try allocator.dupe(u8, tensor);
+    errdefer allocator.free(t);
+    index.appendAssumeCapacity(.{ .tensor = t, .file = try allocator.dupe(u8, file) });
+}
+
 pub fn stageLayer(allocator: std.mem.Allocator, io: std.Io, map: *const PackMap, root: std.Io.Dir, stage_name: []const u8, stage: Stage) !void {
     const cwd = std.Io.Dir.cwd();
     root.deleteTree(io, stage_name) catch {};
@@ -268,7 +279,7 @@ pub fn stageLayer(allocator: std.mem.Allocator, io: std.Io, map: *const PackMap,
     }
     for (names) |name| {
         if (isLayerTensor(name) or std.mem.startsWith(u8, name, "language_model.mtp.") or std.mem.startsWith(u8, name, "vision_tower.")) continue;
-        try index.append(allocator, .{ .tensor = try allocator.dupe(u8, name), .file = try allocator.dupe(u8, "globals.safetensors") });
+        try appendIndexEntry(allocator, &index, name, "globals.safetensors");
     }
     var globals_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const globals_path = try std.fmt.bufPrint(&globals_path_buf, "{s}/globals.safetensors", .{stage.root_abs});
@@ -299,10 +310,11 @@ pub fn stageLayer(allocator: std.mem.Allocator, io: std.Io, map: *const PackMap,
         const new_name = try renamePrefix(allocator, name, li, null);
         defer allocator.free(new_name);
         try b.add(new_name, t.dtype, t.shape, raw);
-        try layer_names.append(allocator, try allocator.dupe(u8, new_name));
+        try layer_names.ensureUnusedCapacity(allocator, 1);
+        layer_names.appendAssumeCapacity(try allocator.dupe(u8, new_name));
     }
     try b.flush(io, dir, "trunk.safetensors", &.{.{ "format", "mlx" }});
-    for (layer_names.items) |n| try index.append(allocator, .{ .tensor = try allocator.dupe(u8, n), .file = try allocator.dupe(u8, "trunk.safetensors") });
+    for (layer_names.items) |n| try appendIndexEntry(allocator, &index, n, "trunk.safetensors");
     for (stage.overrides) |o| {
         if (std.mem.startsWith(u8, o.base, trunk_prefix)) {
             const rest = o.base[trunk_prefix.len..];
@@ -333,7 +345,7 @@ pub fn stageLayer(allocator: std.mem.Allocator, io: std.Io, map: *const PackMap,
             try copyRenamedShard(allocator, io, root_map_dir, "layer-0.safetensors", dir, "experts.safetensors", 0, &expert_names);
         },
     }
-    for (expert_names.items) |n| try index.append(allocator, .{ .tensor = try allocator.dupe(u8, n), .file = try allocator.dupe(u8, "experts.safetensors") });
+    for (expert_names.items) |n| try appendIndexEntry(allocator, &index, n, "experts.safetensors");
 
     const index_json = try pack.buildIndex(allocator, index.items, 0);
     defer allocator.free(index_json);

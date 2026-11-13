@@ -8,3 +8,44 @@ std-xxhash3 src/xxh3.zig:- the short inputs (240 bytes and under) and the tests'
 scope-state src/dsv41/dsv41_pipelines.zig:init a test fixture's load, in a file that is not a test file: it turns the engine on for its tests' span
 template-superlinear-std src/template/template.zig:expectLimit a test helper: finds the expected words in a diagnostic
 template-superlinear-std src/template/template.zig:expectFinderAgrees a test helper: std.mem is the oracle the finder must agree with
+json-unchecked-shape src/anthropic.zig:handleAnthropicMessages parseAnthropicBody answers 400 to a body that is not an object
+json-unchecked-shape src/anthropic.zig:handleAnthropicCountTokens parseAnthropicBody answers 400 to a body that is not an object
+json-unchecked-shape src/completions.zig:completeIds parses the object literal it formats one line above
+json-unchecked-shape src/opencode_persist.zig:merged `generated` is sushi's own provider config, of a fixed shape
+json-unchecked-shape src/server.zig:handleChatCompletions parseReasoningEffort refuses only a string reasoning_effort
+json-unchecked-shape src/server.zig:testWire test helper over a fixture body
+json-unchecked-shape src/tokenizer.zig:packTokenizerForTests test helper over a fixture file
+json-unchecked-shape src/tokenizer.zig:checkTokenizerRuleFixtures test helper over a fixture file
+json-unchecked-shape src/dsv41/dsv41_config.zig:parseText test helper over the release config
+json-unchecked-shape src/model.zig:yarnOverrideDoc text_config is read only after `tc == .object`
+json-unchecked-shape src/model.zig:indexedResidentSplit indexWeightMap returns only an object whose weight_map is an object
+json-unchecked-shape src/model.zig:loadWeightsFromOpenDirMode indexWeightMap returns only an object whose weight_map is an object
+json-unchecked-shape src/model.zig:loadSafetensorsFileMode SafetensorsHeader.read refuses a header that is not an object
+json-unchecked-shape src/weights_where.zig:loadWhere SafetensorsHeader.read refuses a header that is not an object
+json-unchecked-shape src/dsv41/dsv41_engram.zig:inShard SafetensorsHeader.read refuses a header that is not an object
+json-unchecked-shape src/dsv41/repack.zig:read SafetensorsHeader.read refuses a header that is not an object
+json-unchecked-shape src/dsv41/dsv41_source.zig:validateTileOrder SafetensorsHeader.read refuses a header that is not an object
+json-unchecked-shape src/dsv41/dsv41_source.zig:sumBytes SafetensorsHeader.read refuses a header that is not an object
+json-unchecked-shape src/expert_io.zig:shardOf ShardIndex.open refuses an index whose weight_map is not an object
+json-unchecked-shape src/expert_store.zig:checkTileStamp cacheSourceHeader refuses a header that is not an object
+json-unchecked-shape src/expert_store.zig:cachedTensorRegion cacheSourceHeader refuses a header that is not an object
+json-unchecked-shape src/expert_store.zig:populateBf16IndividualStore validateBf16IndividualMap checks every expert key is present and a string
+json-unchecked-shape src/dsv41/repack_stamp.zig:equalExceptStamp headerStamp returned a string, so __metadata__ is an object
+json-unchecked-shape src/dsv41/kld_capture.zig:foldJob sushi kld reads back the sums file it wrote itself
+json-unchecked-shape src/encoder/driver.zig:indexOfDir sushi convert over a source checkpoint: the converter is not served
+json-unchecked-shape src/encoder/driver.zig:layerKinds sushi convert over a source checkpoint: the converter is not served
+json-unchecked-shape src/encoder/layer_stage.zig:scan sushi convert over a source checkpoint: the converter is not served
+json-unchecked-shape src/encoder/layer_stage.zig:patchedSourceConfig sushi convert over a source checkpoint: the converter is not served
+json-unchecked-shape src/encoder/layer_stage.zig:copyRenamedShard sushi convert over a source checkpoint: the converter is not served
+json-unchecked-shape src/encoder/slice.zig:sliceQwen sushi convert over a source checkpoint: the converter is not served
+json-unchecked-shape src/glm5/glm5_diagnostic.zig:loadWeightsBoundedWithVision the owners loop over the same weight_map refused a value that is not a string
+json-unchecked-shape src/glm5/glm5_kld_capture.zig:auditHeaders the files loop over the same weight_map refused a value that is not a string
+json-unchecked-shape src/settings_api.zig:applyCacheBudget a server edit passed model_settings.validate, an int from 0 to 2^20
+json-unchecked-shape src/model_settings.zig:fromValue accepts() runs validate, which checks each key's kind and range
+owned-insert-arg src/downloads.zig:render the list and its copies live in the render's arena
+owned-insert-arg src/model_settings.zig:writeSectionsLocked the sections and their keys live in the write's arena
+owned-insert-arg src/launch.zig:parseChatEntries the entries and their copies live in the parse's arena
+owned-insert-arg src/ubench_main.zig:main argv and its copies live in the run's arena
+owned-insert-arg src/encoder/pack.zig:buildConfig the config tree and its keys live in the build's arena
+owned-insert-arg src/glm5/glm_stream_fixture.zig:add TinyWriter's allocator is the fixture's arena
+owned-insert-arg src/dsv41/repack.zig:buildPlan buildPlan runs on the shard's arena

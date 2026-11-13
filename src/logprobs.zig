@@ -298,7 +298,7 @@ pub fn formatLogprobsObject(
 
 test "skipToContent keeps the content token when a multi-byte character splits across tokens" {
     const a = std.testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();
@@ -337,7 +337,7 @@ test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tok
     // `top_logprobs` is a map keyed by token TEXT.
     const allocator = std.testing.allocator;
 
-    var tok = Tokenizer.initEmptyForTests(allocator);
+    var tok = Tokenizer.initEmpty(allocator);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();
@@ -406,7 +406,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     // U+FFFD per invalid sequence, which is what OpenAI's own shape does.
     const allocator = std.testing.allocator;
 
-    var tok = Tokenizer.initEmptyForTests(allocator);
+    var tok = Tokenizer.initEmpty(allocator);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();
@@ -485,7 +485,7 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
     // nothing the client could see.
     const allocator = std.testing.allocator;
 
-    var tok = Tokenizer.initEmptyForTests(allocator);
+    var tok = Tokenizer.initEmpty(allocator);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();

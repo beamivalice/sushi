@@ -17,7 +17,8 @@ pub fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8
     while (try it.next(io)) |entry| {
         if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.startsWith(u8, entry.name, "model") or !std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
-        try shards.append(allocator, try allocator.dupe(u8, entry.name));
+        try shards.ensureUnusedCapacity(allocator, 1);
+        shards.appendAssumeCapacity(try allocator.dupe(u8, entry.name));
     }
     std.mem.sort([]const u8, shards.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {

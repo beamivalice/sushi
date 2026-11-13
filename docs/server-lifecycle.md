@@ -366,7 +366,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **A slot the inference thread drops releases its GLM state there** (`releaseNativeState`: finish, error, cancel
   (also one landing after prefill, `postPrefillTerminal`), failed prefill), not when its connection thread completes it: an errored request's reserve once held 11 GB.
 - `src/generate.zig`: generation, `commitForcedTokens`; `src/mtp_policy.zig` / `src/mtp_round.zig`: MTP policy and rounds; `src/sampler.zig`: sampling;
-  `src/prefill_plan.zig`: prefill chunking; `src/degenerate.zig`: `StallClock`, loop-stop tiers. `src/tokenize_cache.zig`: per-LoadedModel LRU of rendered+encoded prompts; `src/segment_cache.zig`: per-model token ids of prompt segments.
+  `src/prefill_plan.zig`: prefill chunking; `src/degenerate.zig`: `StallClock`, loop-stop tiers. `src/tokenize_cache.zig`: per-LoadedModel LRU of rendered+encoded prompts, a hit matched by the key's bytes, never its hash alone; `src/segment_cache.zig`: per-model token ids of prompt segments.
 
 ## sushibar
 
@@ -503,6 +503,11 @@ power, temperature and GPU jobs and print them in their report.
 - `generation_config.json` `eos_token_id` is part of the stop set (additive). Read `text_config` FIRST, then root,
   PER FIELD. A config field HF allows in two SHAPES must be read as both (`chat_template` string OR list); `.string`
   on unchecked `std.json.Value` panics.
+- One fact has one reader: the chat config takes the model type `parseConfig` read, never a second read of
+  config.json with its own limits (a 4 MiB cap once served a DeepSeek pack its unpinned template).
+- A pack file of valid JSON but the wrong shape (`[]` for `tokenizer_config.json`) is a named load error, and the
+  settings page skips that row: check each tag before the read (lint `json-unchecked-shape`; it sees `.?.tag` and
+  `parsed.value.tag`, and a value checked where it is built goes in the allowlist with that reason).
 - When an arch's reference IGNORES a config field, that field is not the truth.
 - A reference probe with SYNTHETIC dtypes proves the reference's SEMANTICS, not the checkpoint; parity fixtures for
   deep stacks are dumped fp32 on CPU.

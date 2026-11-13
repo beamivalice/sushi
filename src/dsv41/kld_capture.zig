@@ -206,7 +206,8 @@ fn sourceStatSha(a: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![64]u8
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, "model") or !std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
-        try names.append(a, try a.dupe(u8, entry.name));
+        try names.ensureUnusedCapacity(a, 1);
+        names.appendAssumeCapacity(try a.dupe(u8, entry.name));
     }
     std.mem.sort([]u8, names.items, {}, struct {
         fn less(_: void, x: []u8, y: []u8) bool {
@@ -933,7 +934,8 @@ const Run = struct {
             const nll: f64 = @bitCast(r.nll_bits);
             const id = try a.dupe(u8, r.id);
             errdefer a.free(id);
-            try records.append(a, .{ .id = id, .dir = try a.dupe(u8, r.dir), .prompt_tokens = r.tokens, .generated_tokens = 1, .strict_nll_mean = nll, .strict_perplexity = @exp(nll) });
+            try records.ensureUnusedCapacity(a, 1);
+            records.appendAssumeCapacity(.{ .id = id, .dir = try a.dupe(u8, r.dir), .prompt_tokens = r.tokens, .generated_tokens = 1, .strict_nll_mean = nll, .strict_perplexity = @exp(nll) });
         }
         try self.capture.truncate(self.committed_tokens);
         var next = self.records.len;

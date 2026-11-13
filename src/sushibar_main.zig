@@ -2501,7 +2501,10 @@ pub fn main(init: std.process.Init) !void {
 
     var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     var list: std.ArrayList([]const u8) = .empty;
-    while (it.next()) |a| try list.append(gpa, try gpa.dupe(u8, a));
+    while (it.next()) |a| {
+        try list.ensureUnusedCapacity(gpa, 1);
+        list.appendAssumeCapacity(try gpa.dupe(u8, a));
+    }
     const args = list.items[1..];
 
     var explicit: ?u16 = null;

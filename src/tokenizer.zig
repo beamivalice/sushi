@@ -56,16 +56,21 @@ pub const PretokStyle = arch_chat.PretokStyle;
 const SpecialScan = struct {
     const Cand = struct { bytes: []const u8, id: u32 };
     cands: []Cand,
+    /// The length of the allocation `cands` is the front of.
+    all_len: usize,
     bucket_start: [257]u32,
 
     fn init(tok: *const Tokenizer, allocator: std.mem.Allocator) !SpecialScan {
-        const cands = try allocator.alloc(Cand, tok.special_tokens.count());
-        errdefer allocator.free(cands);
+        // An empty special would match everywhere and end every bucket at once: it has no place in the index.
+        const all = try allocator.alloc(Cand, tok.special_tokens.count());
+        errdefer allocator.free(all);
         var i: usize = 0;
         var sit = tok.special_tokens.iterator();
-        while (sit.next()) |entry| : (i += 1) {
-            cands[i] = .{ .bytes = entry.key_ptr.*, .id = entry.value_ptr.* };
-        }
+        while (sit.next()) |entry| if (entry.key_ptr.len > 0) {
+            all[i] = .{ .bytes = entry.key_ptr.*, .id = entry.value_ptr.* };
+            i += 1;
+        };
+        const cands = all[0..i];
         std.mem.sort(Cand, cands, {}, struct {
             fn lessThan(_: void, a: Cand, b: Cand) bool {
                 const ab: u8 = if (a.bytes.len > 0) a.bytes[0] else 0;
@@ -82,19 +87,16 @@ const SpecialScan = struct {
             while (ci < cands.len and cands[ci].bytes.len > 0 and cands[ci].bytes[0] == b) ci += 1;
         }
         bucket_start[256] = @intCast(cands.len);
-        return .{ .cands = cands, .bucket_start = bucket_start };
+        return .{ .cands = cands, .all_len = all.len, .bucket_start = bucket_start };
     }
 
     fn deinit(self: *SpecialScan, allocator: std.mem.Allocator) void {
-        allocator.free(self.cands);
+        allocator.free(self.cands.ptr[0..self.all_len]);
     }
 
-    fn matchAt(self: *const SpecialScan, text: []const u8, pos: usize) ?Cand {
-        const b = text[pos];
-        for (self.cands[self.bucket_start[b]..self.bucket_start[@as(usize, b) + 1]]) |c| {
-            if (c.bytes.len <= text.len - pos and std.mem.startsWith(u8, text[pos..], c.bytes)) return c;
-        }
-        return null;
+    /// The specials that start with byte `b`, longest first.
+    fn startingWith(self: *const SpecialScan, b: u8) []const Cand {
+        return self.cands[self.bucket_start[b]..self.bucket_start[@as(usize, b) + 1]];
     }
 };
 
@@ -169,11 +171,9 @@ pub const Tokenizer = struct {
         }
     };
 
-    /// A decode-capable tokenizer with EMPTY maps, for tests in other modules
-    /// that need to turn ids into text without a checkpoint on disk. The caller
-    /// owns every map and must `deinit` them; nothing here reads tokenizer.json,
-    /// so encode is not meaningfully usable — populate `id_to_token` and decode.
-    pub fn initEmptyForTests(allocator: std.mem.Allocator) Tokenizer {
+    /// A tokenizer with EMPTY maps: the load fills it from tokenizer.json, and a test fills what it needs. The
+    /// caller owns every map and must `deinit` them.
+    pub fn initEmpty(allocator: std.mem.Allocator) Tokenizer {
         return .{
             .vocab = std.StringHashMap(u32).init(allocator),
             .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
@@ -276,36 +276,47 @@ pub const Tokenizer = struct {
 
     /// The matcher built at load, or when the specials changed since, one built into `temp` for this call.
     fn specialScan(self: *const Tokenizer, allocator: std.mem.Allocator, temp: *?SpecialScan) !*const SpecialScan {
-        if (self.specials_index) |*scan| if (scan.cands.len == self.special_tokens.count()) return scan;
+        if (self.specials_index) |*scan| if (scan.all_len == self.special_tokens.count()) return scan;
         temp.* = try SpecialScan.init(self, allocator);
         return &temp.*.?;
     }
 
     /// What the template and the stops say about the specials, once per load and in this one place: the ids the
     /// sampler masks (`reservedOutputIds`), and the ids whose text inside an assistant message is text: the masked
-    /// ones and the stops, none of which the model writes inside a turn. No template: none of either.
-    pub fn bindTemplate(self: *Tokenizer, printed: ?*const TemplateFacts, stop_ids: []const u32) !void {
-        const reserved = try reservedOutputIds(self.allocator, self.flagged_specials, printed, stop_ids);
-        errdefer self.allocator.free(reserved);
-        std.mem.sort(u32, reserved, {}, std.sort.asc(u32));
+    /// ones and the stops, none of which the model writes inside a turn. No template: none of either. A media
+    /// placeholder (`media_ids`, 0 for none) is placed by the media path alone: it is in both, template or not.
+    pub fn bindTemplate(self: *Tokenizer, printed: ?*const TemplateFacts, stop_ids: []const u32, media_ids: []const u32) !void {
+        var reserved = std.ArrayList(u32).fromOwnedSlice(try reservedOutputIds(self.allocator, self.flagged_specials, printed, stop_ids));
+        errdefer reserved.deinit(self.allocator);
         var blocked = std.ArrayList(u32).empty;
         errdefer blocked.deinit(self.allocator);
         if (printed != null) {
-            try blocked.appendSlice(self.allocator, reserved);
+            try blocked.appendSlice(self.allocator, reserved.items);
             try blocked.appendSlice(self.allocator, stop_ids);
-            std.mem.sort(u32, blocked.items, {}, std.sort.asc(u32));
-            var n: usize = 0;
-            for (blocked.items) |id| if (n == 0 or blocked.items[n - 1] != id) {
-                blocked.items[n] = id;
-                n += 1;
-            };
-            blocked.shrinkRetainingCapacity(n);
         }
+        for (media_ids) |id| if (id != 0) {
+            try reserved.append(self.allocator, id);
+            try blocked.append(self.allocator, id);
+        };
+        sortUnique(&reserved);
+        sortUnique(&blocked);
         const owned = try blocked.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned);
+        const reserved_owned = try reserved.toOwnedSlice(self.allocator);
         if (self.reserved_ids.len > 0) self.allocator.free(self.reserved_ids);
         if (self.assistant_blocked.len > 0) self.allocator.free(self.assistant_blocked);
-        self.reserved_ids = reserved;
+        self.reserved_ids = reserved_owned;
         self.assistant_blocked = owned;
+    }
+
+    fn sortUnique(ids: *std.ArrayList(u32)) void {
+        std.mem.sort(u32, ids.items, {}, std.sort.asc(u32));
+        var n: usize = 0;
+        for (ids.items) |id| if (n == 0 or ids.items[n - 1] != id) {
+            ids.items[n] = id;
+            n += 1;
+        };
+        ids.shrinkRetainingCapacity(n);
     }
 
     /// A rendered prompt encoded by origin. A special's text is its token where every byte of it is the template's,
@@ -322,15 +333,17 @@ pub const Tokenizer = struct {
         var pos: usize = 0;
         var seg_start: usize = 0;
         while (pos < bytes.len) {
-            const m = scan.matchAt(bytes, pos) orelse {
+            // The longest special at `pos` that is recognised there: a longer one that is not (it straddles an
+            // origin) hides neither a shorter one at the same start nor one that starts inside it.
+            const found: ?SpecialScan.Cand = for (scan.startingWith(bytes[pos])) |c| {
+                const end = pos + c.bytes.len;
+                if (end <= bytes.len and std.mem.startsWith(u8, bytes[pos..], c.bytes) and self.recognised(originOf(text, &run, pos, end), c.id)) break c;
+            } else null;
+            const m = found orelse {
                 pos += 1;
                 continue;
             };
             const end = pos + m.bytes.len;
-            if (!self.recognised(originOf(text, &run, pos, end), m.id)) {
-                pos = end;
-                continue;
-            }
             if (pos > seg_start) try self.appendSegment(allocator, &result, bytes[seg_start..pos]);
             try result.append(allocator, m.id);
             pos = end;
@@ -381,7 +394,7 @@ pub const Tokenizer = struct {
     /// against a declared 248320, so 243 rows decode to nothing at all). Those
     /// rows carry whatever the initializer left and a collapsed distribution
     /// can rank one top-1; `installSuppressMask` masks them out of sampling.
-    /// 0 when nothing is defined (an `initEmptyForTests` tokenizer) — callers
+    /// 0 when nothing is defined (an `initEmpty` tokenizer) — callers
     /// treat that as "no padding known", never as "suppress everything".
     pub fn definedVocabSize(self: *const Tokenizer) usize {
         var highest: ?u32 = null;
@@ -394,11 +407,9 @@ pub const Tokenizer = struct {
 
     fn encodeByteLevel(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
         // Pre-tokenize using GPT-2 regex pattern (hand-coded state machine)
+        // The words are slices of `text`.
         var words = std.ArrayList([]const u8).empty;
-        defer {
-            for (words.items) |w| allocator.free(w);
-            words.deinit(allocator);
-        }
+        defer words.deinit(allocator);
         if (self.pretok_style == .gpt2) {
             try gpt2PreTokenizeRules(allocator, text, self.digit_group, self.word_rules, &words);
         } else try arch_chat.preTokenize(self.pretok_style, allocator, text, &words);
@@ -631,7 +642,7 @@ fn gpt2PreTokenizeRules(allocator: std.mem.Allocator, text: []const u8, digit_gr
             const next = std.ascii.toLower(text[i + 1]);
             if (next == 's' or next == 't' or next == 'm' or next == 'd') {
                 i += 2;
-                try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+                try words.append(allocator, text[start..i]);
                 continue;
             }
             if (i + 2 < text.len) {
@@ -641,7 +652,7 @@ fn gpt2PreTokenizeRules(allocator: std.mem.Allocator, text: []const u8, digit_gr
                     (next == 'l' and next2 == 'l'))
                 {
                     i += 3;
-                    try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+                    try words.append(allocator, text[start..i]);
                     continue;
                 }
             }
@@ -652,7 +663,7 @@ fn gpt2PreTokenizeRules(allocator: std.mem.Allocator, text: []const u8, digit_gr
         // CAN be whitespace or punct), followed by 1+ letters/marks.
         if (matchOptionalNonLnnAndLetters(text, i, rules)) |new_i| {
             i = new_i;
-            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            try words.append(allocator, text[start..i]);
             continue;
         }
 
@@ -666,7 +677,7 @@ fn gpt2PreTokenizeRules(allocator: std.mem.Allocator, text: []const u8, digit_gr
                     if (!ruleNumber(next.cp, rules)) break;
                     i += next.len;
                 }
-                try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+                try words.append(allocator, text[start..i]);
                 continue;
             }
         }
@@ -676,14 +687,14 @@ fn gpt2PreTokenizeRules(allocator: std.mem.Allocator, text: []const u8, digit_gr
         // NOT mark, NOT digit (i.e. punctuation/symbols), then optional \r\n.
         if (matchOptionalSpaceAndPunct(text, i, rules)) |new_i| {
             i = new_i;
-            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            try words.append(allocator, text[start..i]);
             continue;
         }
 
         // ── Pattern 5: `\s*[\r\n]+` — whitespace ending in newline run ──
         if (matchRuleNewline(text, i, rules)) |new_i| {
             i = new_i;
-            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            try words.append(allocator, text[start..i]);
             continue;
         }
 
@@ -692,7 +703,7 @@ fn gpt2PreTokenizeRules(allocator: std.mem.Allocator, text: []const u8, digit_gr
         // so the trailing space gets handed to pattern 2/4 on the next pass.
         if (matchRuleTrailingWhitespace(text, i, rules)) |new_i| {
             i = new_i;
-            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            try words.append(allocator, text[start..i]);
             continue;
         }
 
@@ -703,14 +714,14 @@ fn gpt2PreTokenizeRules(allocator: std.mem.Allocator, text: []const u8, digit_gr
                     if (!ruleWhitespace(c.cp, rules)) break;
                     i += c.len;
                 }
-                try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+                try words.append(allocator, text[start..i]);
                 continue;
             }
         }
 
         // Fallback: single byte (unreachable in well-formed UTF-8 input).
         i += 1;
-        try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+        try words.append(allocator, text[start..i]);
     }
 }
 
@@ -916,10 +927,17 @@ pub fn loadTokenizerSlow(io: std.Io, allocator: std.mem.Allocator, model_dir: []
     const merges_txt = try readFileAllocTok(io, allocator, merges_path);
     defer allocator.free(merges_txt);
 
+    // Read as one JSON value and written back, so its text cannot add keys of its own to the document built here.
+    const vocab = std.json.parseFromSlice(std.json.Value, allocator, vocab_json, .{}) catch return badKey("vocab.json", "one JSON object");
+    defer vocab.deinit();
+    if (vocab.value != .object) return badKey("vocab.json", "one JSON object");
+    const vocab_text = try std.json.Stringify.valueAlloc(allocator, vocab.value, .{});
+    defer allocator.free(vocab_text);
+
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, "{\"pre_tokenizer\":{\"type\":\"ByteLevel\"},\"model\":{\"type\":\"BPE\",\"vocab\":");
-    try buf.appendSlice(allocator, std.mem.trim(u8, vocab_json, " \t\r\n"));
+    try buf.appendSlice(allocator, vocab_text);
     try buf.appendSlice(allocator, ",\"merges\":[");
     var first = true;
     var lines = std.mem.splitScalar(u8, merges_txt, '\n');
@@ -965,129 +983,117 @@ pub fn loadTokenizerAny(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     };
 }
 
+/// A key of `tokenizer.json` that the load cannot read: named in a `[load]` line, and the load fails.
+fn badKey(key: []const u8, want: []const u8) error{InvalidTokenizerJson} {
+    log.err("[load] tokenizer.json: {s} is missing or not {s}\n", .{ key, want });
+    return error.InvalidTokenizerJson;
+}
+
+fn objectAt(v: ?std.json.Value, key: []const u8) error{InvalidTokenizerJson}!std.json.ObjectMap {
+    const o = v orelse return badKey(key, "an object");
+    return if (o == .object) o.object else badKey(key, "an object");
+}
+
+fn idAt(v: ?std.json.Value, key: []const u8) error{InvalidTokenizerJson}!u32 {
+    const i = v orelse return badKey(key, "an id");
+    if (i != .integer) return badKey(key, "an id");
+    return std.math.cast(u32, i.integer) orelse badKey(key, "an id from 0 to 2^32-1");
+}
+
 /// Parse a `tokenizer.json`-shaped JSON document into a `Tokenizer`. Split out
 /// from `loadTokenizer` so the slow-format loader (`loadTokenizerSlow`) can feed
 /// synthesized content. `parsed` (and the string keys borrowed from it) is owned
 /// by the returned `Tokenizer.parsed_json`, so `content` may be freed after.
+/// The tokenizer owns every part from the start, so a failed load is its one `deinit`.
 fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []const u8) !Tokenizer {
     var sw = io_util.Stopwatch.init(io);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
-    errdefer parsed.deinit();
+    var tok = Tokenizer.initEmpty(allocator);
+    tok.parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    errdefer tok.deinit();
     log.info("  parsed tokenizer ({d} MB) in {d}ms\n", .{ content.len / (1024 * 1024), sw.read() / std.time.ns_per_ms });
 
-    const root = parsed.value.object;
-    const model_obj = root.get("model").?.object;
+    const root = try objectAt(tok.parsed_json.?.value, "the root");
+    const model_obj = try objectAt(root.get("model"), "model");
 
-    // Parse vocab — keys borrow directly from `parsed`'s arena (no per-
-    // entry dupe). Pre-size to avoid rehashing during the inserts.
-    var vocab = std.StringHashMap(u32).init(allocator);
-    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
-
-    const vocab_obj = model_obj.get("vocab").?.object;
-    try vocab.ensureTotalCapacity(@intCast(vocab_obj.count()));
-    try id_to_token.ensureTotalCapacity(@intCast(vocab_obj.count()));
+    // Vocab keys borrow directly from `parsed`'s arena (no per-entry dupe). Pre-size to avoid rehashing.
+    const vocab_obj = try objectAt(model_obj.get("vocab"), "model.vocab");
+    try tok.vocab.ensureTotalCapacity(@intCast(vocab_obj.count()));
+    try tok.id_to_token.ensureTotalCapacity(@intCast(vocab_obj.count()));
     sw = io_util.Stopwatch.init(io);
     var vit = vocab_obj.iterator();
     while (vit.next()) |entry| {
         const key = entry.key_ptr.*;
-        const id: u32 = @intCast(entry.value_ptr.integer);
-        try vocab.put(key, id);
-        try id_to_token.put(id, key);
+        const id = try idAt(entry.value_ptr.*, "a model.vocab value");
+        try tok.vocab.put(key, id);
+        try tok.id_to_token.put(id, key);
     }
-    log.info("  loaded {d} vocab entries in {d}ms\n", .{ vocab.count(), sw.read() / std.time.ns_per_ms });
+    log.info("  loaded {d} vocab entries in {d}ms\n", .{ tok.vocab.count(), sw.read() / std.time.ns_per_ms });
 
-    // Parse merges (array format: [["a", "b"], ...]). String halves are
-    // borrowed from `parsed`'s arena.
-    var merge_ranks = std.HashMap(
-        Tokenizer.MergePair,
-        u32,
-        Tokenizer.MergePairContext,
-        std.hash_map.default_max_load_percentage,
-    ).init(allocator);
-
+    // Merges: string halves are borrowed from `parsed`'s arena.
     if (model_obj.get("merges")) |merges_val| {
+        if (merges_val != .array) return badKey("model.merges", "an array");
         const merges_arr = merges_val.array;
-        try merge_ranks.ensureTotalCapacity(@intCast(merges_arr.items.len));
+        try tok.merge_ranks.ensureTotalCapacity(@intCast(merges_arr.items.len));
         sw = io_util.Stopwatch.init(io);
         for (merges_arr.items, 0..) |merge_val, rank| {
             // Two on-disk formats: newer HF tokenizers store each merge as a
             // 2-element array `["a","b"]` (Qwen3, Gemma 4); older / GPT-2-style
             // exports store it as a single space-joined string `"a b"` (Qwen2.5,
-            // many Llama/Mistral). `parseMergePair` handles both. Reading `.array`
-            // off a string Value in ReleaseFast spins the loop on garbage, which
-            // hung Qwen2.5 loads before this fix.
+            // many Llama/Mistral). `parseMergePair` handles both.
             const pair = parseMergePair(merge_val) orelse continue;
-            try merge_ranks.put(pair, @intCast(rank));
+            try tok.merge_ranks.put(pair, @intCast(rank));
         }
-        log.info("  loaded {d} merges in {d}ms\n", .{ merge_ranks.count(), sw.read() / std.time.ns_per_ms });
+        log.info("  loaded {d} merges in {d}ms\n", .{ tok.merge_ranks.count(), sw.read() / std.time.ns_per_ms });
     }
 
-    // Parse added_tokens
-    var special_tokens = std.StringHashMap(u32).init(allocator);
     var flagged = std.ArrayList(FlaggedSpecial).empty;
-    errdefer flagged.deinit(allocator);
-    var bos_id: ?u32 = null;
-    var eos_id: ?u32 = null;
-
+    defer flagged.deinit(allocator);
     if (root.get("added_tokens")) |at_val| {
+        if (at_val != .array) return badKey("added_tokens", "an array");
         for (at_val.array.items) |token_val| {
-            const obj = token_val.object;
-            const content_str = obj.get("content").?.string;
-            const id: u32 = @intCast(obj.get("id").?.integer);
+            const obj = try objectAt(token_val, "an added_tokens item");
+            const content_v = obj.get("content") orelse return badKey("an added_tokens content", "a string");
+            if (content_v != .string) return badKey("an added_tokens content", "a string");
+            // An empty special matches everywhere and nowhere: a pack that has one is malformed.
+            if (content_v.string.len == 0) return badKey("an added_tokens content", "a non-empty string");
+            const content_str = content_v.string;
+            const id = try idAt(obj.get("id"), "an added_tokens id");
             // Include ALL added tokens (both special=true and special=false like <think>, <tool_call>)
-            // so they are tokenized as single atomic units. The string is
-            // borrowed from `parsed`'s arena — no per-entry dupe.
-            try special_tokens.put(content_str, id);
-            // `special: true` entries additionally feed reserved-output
-            // suppression (see `reservedOutputIds`).
+            // so they are tokenized as single atomic units.
+            try tok.special_tokens.put(content_str, id);
+            // `special: true` entries additionally feed reserved-output suppression (see `reservedOutputIds`).
             if (obj.get("special")) |sv| {
-                if (sv == .bool and sv.bool) {
-                    try flagged.append(allocator, .{ .id = id, .content = content_str });
-                }
+                if (sv == .bool and sv.bool) try flagged.append(allocator, .{ .id = id, .content = content_str });
             }
-            if (!vocab.contains(content_str)) {
-                try vocab.put(content_str, id);
-                try id_to_token.put(id, content_str);
+            if (!tok.vocab.contains(content_str)) {
+                try tok.vocab.put(content_str, id);
+                try tok.id_to_token.put(id, content_str);
             }
         }
     }
+    tok.flagged_specials = try flagged.toOwnedSlice(allocator);
 
     // Try to find BOS/EOS from common special token patterns
-    bos_id = special_tokens.get("<bos>") orelse special_tokens.get("<|startoftext|>") orelse special_tokens.get("[CLS]");
-    eos_id = special_tokens.get("<eos>") orelse special_tokens.get("<|im_end|>") orelse special_tokens.get("<|endoftext|>") orelse special_tokens.get("[SEP]");
+    const sp = &tok.special_tokens;
+    tok.bos_id = sp.get("<bos>") orelse sp.get("<|startoftext|>") orelse sp.get("[CLS]");
+    tok.eos_id = sp.get("<eos>") orelse sp.get("<|im_end|>") orelse sp.get("<|endoftext|>") orelse sp.get("[SEP]");
 
-    // Build byte-to-unicode mapping
-    const byte_to_unicode = buildBytesToUnicode();
-    var unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator);
-    for (0..256) |b| {
-        try unicode_to_byte.put(byte_to_unicode[b], @intCast(b));
-    }
+    for (0..256) |b| try tok.unicode_to_byte.put(tok.byte_to_unicode[b], @intCast(b));
 
     log.info("Tokenizer loaded: {d} vocab, {d} merges, {d} special tokens\n", .{
-        vocab.count(),
-        merge_ranks.count(),
-        special_tokens.count(),
+        tok.vocab.count(),
+        tok.merge_ranks.count(),
+        tok.special_tokens.count(),
     });
 
-    var built: Tokenizer = .{
-        .vocab = vocab,
-        .id_to_token = id_to_token,
-        .merge_ranks = merge_ranks,
-        .allocator = allocator,
-        .special_tokens = special_tokens,
-        .flagged_specials = try flagged.toOwnedSlice(allocator),
-        .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
-        .pretok_style = if (root.get("pre_tokenizer")) |pt| arch_chat.pretokStyleOf(pt) else .gpt2,
-        .word_rules = if (root.get("pre_tokenizer")) |pt| wordRulesFromPreTokenizer(pt) else .legacy,
-        .ignore_merges = if (model_obj.get("ignore_merges")) |v| v == .bool and v.bool else false,
-        .byte_to_unicode = byte_to_unicode,
-        .unicode_to_byte = unicode_to_byte,
-        .bos_id = bos_id,
-        .eos_id = eos_id,
-        .parsed_json = parsed,
-    };
-    try built.indexSpecials();
-    return built;
+    if (root.get("pre_tokenizer")) |pt| {
+        tok.digit_group = digitGroupFromPreTokenizer(pt);
+        tok.pretok_style = arch_chat.pretokStyleOf(pt);
+        tok.word_rules = wordRulesFromPreTokenizer(pt);
+    }
+    tok.ignore_merges = if (model_obj.get("ignore_merges")) |v| v == .bool and v.bool else false;
+    try tok.indexSpecials();
+    return tok;
 }
 
 /// Digits per pre-token from the tokenizer.json `pre_tokenizer` spec: a
@@ -1192,7 +1198,7 @@ pub fn packTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, pac
 }
 
 pub fn byteTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, specials: []const []const u8) !Tokenizer {
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     for (0..256) |b| {
         var buf: [4]u8 = undefined;
         const n = try std.unicode.utf8Encode(tok.byte_to_unicode[b], &buf);
@@ -1224,7 +1230,7 @@ pub fn deinitTestTokenizer(tok: *Tokenizer) void {
 const testing = std.testing;
 
 test "tokenHasNewline: byte-level spells the line break as U+010A" {
-    var bl = Tokenizer.initEmptyForTests(std.testing.allocator);
+    var bl = Tokenizer.initEmpty(std.testing.allocator);
     defer bl.deinit();
     try bl.id_to_token.put(1, "\u{010A}\u{0120}\u{0120}return");
     try bl.id_to_token.put(2, "\u{0120}return");
@@ -1316,10 +1322,7 @@ fn expectPreTokens(allocator: std.mem.Allocator, input: []const u8, expected: []
 
 fn expectPreTokensG(allocator: std.mem.Allocator, input: []const u8, digit_group: u8, expected: []const []const u8) !void {
     var words: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (words.items) |w| allocator.free(w);
-        words.deinit(allocator);
-    }
+    defer words.deinit(allocator);
     try gpt2PreTokenize(allocator, input, digit_group, &words);
     if (words.items.len != expected.len) {
         std.debug.print("\n  pre-tokenize on {s}: got {d} words, expected {d}\n", .{
@@ -1952,6 +1955,20 @@ fn spanTestTokenizer(a: std.mem.Allocator) !Tokenizer {
     return parseTokenizerContent(testing.io, a, content);
 }
 
+test "tokenizer: a tokenizer.json of valid JSON but the wrong shape fails by name" {
+    const bodies = [_][]const u8{
+        "[]",                                                              "7",                                     "\"t\"",
+        "null",                                                            "{}",                                    "{\"model\": 7}",
+        "{\"model\": {}}",                                               "{\"model\": {\"vocab\": []}}",      "{\"model\": {\"vocab\": {\"a\": \"x\"}}}",
+        "{\"model\": {\"vocab\": {\"a\": -1}}}",                     "{\"model\": {\"vocab\": {\"a\": 4294967296}}}",
+        "{\"model\": {\"vocab\": {}, \"merges\": 7}}",                "{\"model\": {\"vocab\": {}}, \"added_tokens\": {}}",
+        "{\"model\": {\"vocab\": {}}, \"added_tokens\": [7]}",       "{\"model\": {\"vocab\": {}}, \"added_tokens\": [{\"id\": 1}]}",
+        "{\"model\": {\"vocab\": {}}, \"added_tokens\": [{\"id\": \"1\", \"content\": \"<s>\"}]}",
+        "{\"model\": {\"vocab\": {}}, \"added_tokens\": [{\"id\": -2, \"content\": \"<s>\"}]}",
+    };
+    for (bodies) |body| try testing.expectError(error.InvalidTokenizerJson, parseTokenizerContent(testing.io, testing.allocator, body));
+}
+
 test "tokenizer: the special-token matcher is built once, at load" {
     var tok = try spanTestTokenizer(testing.allocator);
     defer tok.deinit();
@@ -1966,7 +1983,7 @@ test "encodeSpans: a special's text is its token only where every byte of it is 
     // The template prints `<s>`; `<t>` is flagged and never printed, so the sampler masks it.
     var t = try template_engine.Template.compile(a, "{{ '<s>' }}", &diag);
     defer t.deinit();
-    try tok.bindTemplate(&t.facts, &.{});
+    try tok.bindTemplate(&t.facts, &.{}, &.{});
     const Run = template_engine.Run;
     const Case = struct { bytes: []const u8, runs: []const Run, want: []const u32 };
     const cases = [_]Case{
@@ -1996,11 +2013,195 @@ test "bindTemplate: the sampler masks the flagged specials the template never pr
     var diag: template_engine.Diagnostic = .{};
     var t = try template_engine.Template.compile(a, "{{ '<s>' }}", &diag);
     defer t.deinit();
-    try tok.bindTemplate(&t.facts, &.{9});
+    try tok.bindTemplate(&t.facts, &.{9}, &.{});
     try testing.expectEqualSlices(u32, &.{10}, tok.reserved_ids);
     try testing.expectEqualSlices(u32, &.{ 9, 10 }, tok.assistant_blocked);
     // No template: nothing masked, and assistant text keeps every special, as before templates were read.
-    try tok.bindTemplate(null, &.{9});
+    try tok.bindTemplate(null, &.{9}, &.{});
     try testing.expectEqual(@as(usize, 0), tok.reserved_ids.len);
     try testing.expectEqual(@as(usize, 0), tok.assistant_blocked.len);
+}
+
+/// How a forked child that ran `f(arg)` ended: a crash (a panic, a fault or the alarm on a hang) is the failure the
+/// shape tests look for, which an in-process test could not survive.
+const ChildEnd = enum { ok, failed, crashed };
+
+fn inChild(comptime f: anytype, arg: anytype) ChildEnd {
+    const pid = std.c.fork();
+    if (pid == 0) {
+        _ = std.c.alarm(20);
+        std.c._exit(if (f(arg)) |_| 0 else |_| 3);
+    }
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+    const s: u32 = @bitCast(status);
+    if (s & 0x7f != 0) return .crashed;
+    return switch ((s >> 8) & 0xff) {
+        0 => .ok,
+        3 => .failed,
+        else => .crashed,
+    };
+}
+
+fn loadTokenizerDir(dir: []const u8) !void {
+    var tok = try loadTokenizer(testing.io, std.heap.page_allocator, dir);
+    tok.deinit();
+}
+
+test "tokenizer: a tokenizer.json of every wrong shape is a named load error, never a crash" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const vocab = "\"vocab\": {\"a\": 0, \"b\": 1}";
+    const Case = struct { body: ?[]const u8, loads: bool };
+    const cases = [_]Case{
+        .{ .body = "[]", .loads = false },                                                                  .{ .body = "7", .loads = false },
+        .{ .body = "null", .loads = false },                                                                .{ .body = "\"x\"", .loads = false },
+        .{ .body = "{}", .loads = false },                                                                  .{ .body = "{\"model\": []}", .loads = false },
+        .{ .body = "{\"model\": null}", .loads = false },                                                   .{ .body = "{\"model\": {}}", .loads = false },
+        .{ .body = "{\"model\": {\"vocab\": []}}", .loads = false },                                        .{ .body = "{\"model\": {\"vocab\": {\"a\": \"x\"}}}", .loads = false },
+        .{ .body = "{\"model\": {\"vocab\": {\"a\": -1}}}", .loads = false },                               .{ .body = "{\"model\": {\"vocab\": {\"a\": 99999999999}}}", .loads = false },
+        .{ .body = "{\"model\": {\"vocab\": {\"a\": 1.5}}}", .loads = false },                              .{ .body = "{\"model\": {\"vocab\": {\"a\": 0, \"a\": 1}}}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ ", \"merges\": {}}}", .loads = false },                      .{ .body = "{\"model\": {" ++ vocab ++ ", \"merges\": null}}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ ", \"merges\": [5, [\"a\"], [\"a\", 5], null, \"ab\"]}}", .loads = true },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": {}}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [1]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 5}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 5, \"content\": 5}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 5, \"content\": \"\"}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"content\": \"<x>\"}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": \"5\", \"content\": \"<x>\"}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": -5, \"content\": \"<x>\"}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 99999999999, \"content\": \"<x>\"}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": 5}", .loads = true },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": {\"type\": \"Sequence\", \"pretokenizers\": 5}}", .loads = true },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": {\"type\": \"Sequence\", \"pretokenizers\": [5, null, {\"type\": \"Split\", \"pattern\": 5}, {\"type\": \"Split\", \"pattern\": {\"Regex\": 5}}]}}", .loads = true },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": {\"type\": \"Split\", \"pattern\": 5}}", .loads = true },
+        .{ .body = "", .loads = false },                                                                    .{ .body = "{\"model\": {\"vocab\": {\"a\"", .loads = false },
+        .{ .body = "{\"model\": {\"vocab\": {\"\xff\xfe\": 0}}}", .loads = false },                         .{ .body = null, .loads = false },
+    };
+    var wrong: usize = 0;
+    for (cases, 0..) |c, i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "{d}", .{i});
+        var sub = try tmp.dir.createDirPathOpen(io, name, .{});
+        defer sub.close(io);
+        if (c.body) |b| try sub.writeFile(io, .{ .sub_path = "tokenizer.json", .data = b }) else try sub.createDirPath(io, "tokenizer.json");
+        const dir = try sub.realPathFileAlloc(io, ".", testing.allocator);
+        defer testing.allocator.free(dir);
+        const end = inChild(loadTokenizerDir, dir);
+        if (end != (if (c.loads) ChildEnd.ok else ChildEnd.failed)) {
+            std.debug.print("\ntokenizer.json case {d} ({?s}): {t}\n", .{ i, c.body, end });
+            wrong += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), wrong);
+}
+
+const shape_test_tokenizer =
+    \\{"model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "ab": 2, "<": 3, ">": 4, "s": 5, "t": 6, "u": 7, "x": 8},
+    \\  "merges": [["a", "b"]]},
+    \\ "added_tokens": [{"id": 9, "content": "<s>", "special": true}, {"id": 10, "content": "<t>", "special": true},
+    \\  {"id": 11, "content": "<u>", "special": false}],
+    \\ "pre_tokenizer": {"type": "ByteLevel"}}
+;
+
+fn parseAndFree(a: std.mem.Allocator, content: []const u8) !void {
+    var tok = try parseTokenizerContent(testing.io, a, content);
+    tok.deinit();
+}
+
+test "tokenizer: a tokenizer.json read that runs out of memory at any allocation frees all it made" {
+    try testing.checkAllAllocationFailures(testing.allocator, parseAndFree, .{shape_test_tokenizer});
+}
+
+test "tokenizer: an added token with empty content is a named load error" {
+    const content =
+        \\{"model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": []},
+        \\ "added_tokens": [{"id": 9, "content": "<s>", "special": true}, {"id": 12, "content": "", "special": true}]}
+    ;
+    try testing.expectError(error.InvalidTokenizerJson, parseTokenizerContent(testing.io, testing.allocator, content));
+}
+
+test "tokenizer: a longer special that is not recognised hides neither a shorter one at its start nor one in its tail" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    // `<s>` and `<s>x` share a start; `<s>` also sits in the tail of `y<s>`.
+    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<s>", "<s>x", "y<s>" });
+    defer deinitTestTokenizer(&tok);
+    const Run = template_engine.Run;
+    const s_id: u32 = 256;
+    // The template's `<s>` then a client's `x`: `<s>x` straddles, so it is text, but `<s>` is all the template's.
+    const one = try tok.encodeSpans(a, .{ .bytes = "<s>x", .origin = .input, .runs = &[_]Run{ .{ .end = 3, .origin = .template }, .{ .end = 4, .origin = .input } } });
+    defer a.free(one);
+    try testing.expectEqual(s_id, one[0]);
+    // A client's `y` then the template's `<s>`: `y<s>` straddles; the `<s>` inside it is all the template's.
+    const two = try tok.encodeSpans(a, .{ .bytes = "y<s>", .origin = .input, .runs = &[_]Run{ .{ .end = 1, .origin = .input }, .{ .end = 4, .origin = .template } } });
+    defer a.free(two);
+    try testing.expectEqual(s_id, two[two.len - 1]);
+}
+
+fn encodeByteFF(tok: *const Tokenizer) !void {
+    const ids = try tok.encodeSpans(std.heap.page_allocator, .{ .bytes = "a\xffb<s>", .origin = .template });
+    defer std.heap.page_allocator.free(ids);
+    if (ids[ids.len - 1] != 256) return error.TestUnexpectedResult;
+}
+
+test "tokenizer: an empty special made by hand never enters the matcher, so an encode neither spins nor loses the others" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<s>", "" });
+    defer deinitTestTokenizer(&tok);
+    try testing.expectEqual(ChildEnd.ok, inChild(encodeByteFF, @as(*const Tokenizer, &tok)));
+}
+
+test "tokenizer: the vocab.json and merges.txt load takes only a vocab.json that is one JSON object" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "merges.txt", .data = "#version: 0.2\na b\n" });
+    // The last one is not one JSON value: pasted into the document as text, it would add a key of its own.
+    for ([_][]const u8{ "[]", "7", "{\"a\": \"x\"}", "{\"a\": 0, \"b\": 1}, \"ignore_merges\": true" }) |body| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "vocab.json", .data = body });
+        try testing.expectError(error.InvalidTokenizerJson, loadTokenizerSlow(io, testing.allocator, dir));
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "vocab.json", .data = "{\"a\": 0, \"b\": 1, \"ab\": 2}" });
+    var tok = try loadTokenizerSlow(io, testing.allocator, dir);
+    defer tok.deinit();
+    const ids = try tok.encode(testing.allocator, "ab");
+    defer testing.allocator.free(ids);
+    try testing.expectEqualSlices(u32, &.{2}, ids);
+}
+
+fn encodeAndFree(a: std.mem.Allocator, tok: *const Tokenizer, text: []const u8) !void {
+    a.free(try tok.encode(a, text));
+}
+
+test "tokenizer: an encode that runs out of memory at any allocation frees all it made" {
+    var tok = try spanTestTokenizer(testing.allocator);
+    defer tok.deinit();
+    const text = "ab ab abab  a\n\nb 123 4567 <s>ab<t>x<u> tail words here and there, again and again.";
+    try testing.checkAllAllocationFailures(testing.allocator, encodeAndFree, .{ @as(*const Tokenizer, &tok), text });
+}
+
+test "bindTemplate: a media placeholder is never sampled, and its text in an assistant turn is text" {
+    const a = testing.allocator;
+    var tok = try spanTestTokenizer(a);
+    defer tok.deinit();
+    var diag: template_engine.Diagnostic = .{};
+    // The template prints `<u>`, the media placeholder, where a request's image sits.
+    var t = try template_engine.Template.compile(a, "{{ '<s>' }}{{ '<u>' }}", &diag);
+    defer t.deinit();
+    try tok.bindTemplate(&t.facts, &.{9}, &.{ 0, 11 });
+    try testing.expectEqualSlices(u32, &.{ 10, 11 }, tok.reserved_ids);
+    const in_turn = try tok.encodeSpans(a, .{ .bytes = "<u>", .origin = .assistant });
+    defer a.free(in_turn);
+    try testing.expectEqualSlices(u32, &.{ 3, 7, 4 }, in_turn);
+    const placed = try tok.encodeSpans(a, .{ .bytes = "<u>", .origin = .template });
+    defer a.free(placed);
+    try testing.expectEqualSlices(u32, &.{11}, placed);
 }

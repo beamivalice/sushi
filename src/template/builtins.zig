@@ -227,7 +227,7 @@ fn filterTitle(r: *Renderer, s: []const u8) Failure![]const u8 {
     @setRuntimeSafety(true);
     const out: []u8 = @constCast(try mapCase(r, s, false));
     var at_start = true;
-    var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+    var it = value.codepoints(s);
     var i: usize = 0;
     while (it.nextCodepointSlice()) |cs| : (i += cs.len) {
         const cp = decode(cs);
@@ -243,8 +243,10 @@ fn filterTitle(r: *Renderer, s: []const u8) Failure![]const u8 {
 }
 
 /// Python `str.islower` / `str.isupper` over ASCII letters: at least one cased letter, all of the asked case.
-fn hasCase(s: []const u8, upper: bool) bool {
+fn hasCase(r: *Renderer, s: []const u8, upper: bool) Failure!bool {
     @setRuntimeSafety(true);
+    try r.scan(s.len);
+    value.spend(s.len / 64 + 1);
     var cased = false;
     for (s) |c| {
         if (!std.ascii.isAlphabetic(c)) continue;
@@ -265,7 +267,7 @@ const CharSet = struct {
         var set = CharSet{ .space = chars == null };
         const text = chars orelse return set;
         try r.scan(text.len);
-        var it = std.unicode.Utf8View.initUnchecked(text).iterator();
+        var it = value.codepoints(text);
         while (it.nextCodepointSlice()) |cs| {
             const cp = decode(cs);
             if (cp < 128) set.ascii[cp] = true else try set.wide.put(r.arena, cp, {});
@@ -304,7 +306,7 @@ fn strip(s: []const u8, set: *const CharSet, left: bool, right: bool) []const u8
     var start: usize = 0;
     var end: usize = s.len;
     if (left) {
-        var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+        var it = value.codepoints(s);
         while (it.nextCodepointSlice()) |cs| {
             if (!set.has(decode(cs))) break;
             start += cs.len;
@@ -362,8 +364,11 @@ fn split(r: *Renderer, src: Str, sep_v: ?Value, max_v: ?Value, from_right: bool)
     }
     // Runs of white space separate; none are kept, and the rest past `maxsplit` keeps its inner white space.
     var cps = std.ArrayList([]const u8).empty;
-    var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+    var it = value.codepoints(s);
     while (it.nextCodepointSlice()) |cs| try cps.append(r.arena, cs);
+    // A slice per code point: a step each.
+    try r.tick(cps.items.len);
+    value.spend(cps.items.len);
     const base = @intFromPtr(s.ptr);
     const off = struct {
         fn f(b: usize, cs: []const u8) usize {
@@ -415,9 +420,10 @@ fn replace(r: *Renderer, src: Str, old: []const u8, new: Str, count: i64) Failur
     // A negative count is Python's "every occurrence".
     var left = if (count < 0) std.math.maxInt(i64) else count;
     if (old.len == 0) {
-        var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+        var it = value.codepoints(s);
         var at: usize = 0;
         while (it.nextCodepointSlice()) |cs| : (at += cs.len) {
+            try r.tick(1);
             if (left != 0) {
                 try r.charge(buf.bytes.items.len + new.bytes.len);
                 try buf.append(r.arena, new);
@@ -465,6 +471,8 @@ fn affix(r: *Renderer, s: []const u8, args: []const Value, ends: bool) Failure!b
     };
     for (probes) |p| {
         const t = p.str() orelse return r.fail("{s} first arg must be str or a tuple of str", .{what});
+        try r.tick(1 + @min(t.len, sub.len) / 64);
+        value.spend(1 + @min(t.len, sub.len) / 64);
         if (if (ends) std.mem.endsWith(u8, sub, t) else std.mem.startsWith(u8, sub, t)) return true;
     }
     return false;
@@ -472,6 +480,8 @@ fn affix(r: *Renderer, s: []const u8, args: []const Value, ends: bool) Failure!b
 
 fn escapeHtml(r: *Renderer, s: []const u8) Failure![]const u8 {
     @setRuntimeSafety(true);
+    try r.scan(s.len);
+    value.spend(s.len / 64 + 1);
     var buf = std.ArrayList(u8).empty;
     for (s) |c| switch (c) {
         '&' => try buf.appendSlice(r.arena, "&amp;"),
@@ -501,22 +511,25 @@ fn markupOperand(r: *Renderer, v: Value) Failure!Str {
 fn percentFormat(r: *Renderer, fmt_s: Str, args: Value, escape: bool) Failure!Str {
     @setRuntimeSafety(true);
     const fmt = fmt_s.bytes;
-    const positional: []const Value = switch (args) {
-        .list => |l| if (l.kind == .tuple) l.items.items else &.{args},
-        else => &.{args},
-    };
+    const tuple: ?[]const Value = if (args == .list and args.list.kind == .tuple) args.list.items.items else null;
+    const positional = tuple orelse &.{args};
     const mapping: ?*const value.Dict = if (args == .dict) args.dict else null;
+    // Python reads an argument with `__getitem__` (not a tuple or a string) as a mapping: one left unused is no error.
+    const mapping_like = tuple == null and (args == .dict or args == .list);
     var out: value.Builder = .{};
     var buf = std.ArrayList(u8).empty;
     var next: usize = 0;
     var i: usize = 0;
+    try r.scan(fmt.len);
     while (i < fmt.len) {
-        const c = fmt[i];
-        i += 1;
-        if (c != '%') {
-            try out.appendPart(r.arena, fmt_s, i - 1, i);
+        // The format's own text up to the next '%', in one piece.
+        const lit_end = std.mem.indexOfScalarPos(u8, fmt, i, '%') orelse fmt.len;
+        if (lit_end > i) {
+            try out.appendPart(r.arena, fmt_s, i, lit_end);
+            i = lit_end;
             continue;
         }
+        i += 1;
         if (i >= fmt.len) return r.fail("incomplete format", .{});
         var arg: ?Value = null;
         if (fmt[i] == '(') {
@@ -530,7 +543,7 @@ fn percentFormat(r: *Renderer, fmt_s: Str, args: Value, escape: bool) Failure!St
             i += 1;
             const start = i;
             while (i < fmt.len and std.ascii.isDigit(fmt[i])) i += 1;
-            precision = std.fmt.parseInt(usize, fmt[start..i], 10) catch 0;
+            precision = if (i == start) 0 else std.fmt.parseInt(u31, fmt[start..i], 10) catch return r.fail("precision too big", .{});
         }
         if (i >= fmt.len) return r.fail("incomplete format", .{});
         const conv = fmt[i];
@@ -540,21 +553,23 @@ fn percentFormat(r: *Renderer, fmt_s: Str, args: Value, escape: bool) Failure!St
             continue;
         }
         const v = arg orelse blk: {
-            if (mapping != null) break :blk args;
             if (next >= positional.len) return r.fail("not enough arguments for format string", .{});
             next += 1;
             break :blk positional[next - 1];
         };
         buf.clearRetainingCapacity();
         switch (conv) {
+            // A precision keeps that many code points of what is printed, escaped first under Markup as Python's is.
             's' => {
-                const text = try r.toText(v);
-                try out.append(r.arena, if (escape and v != .markup) text.derive(try escapeHtml(r, text.bytes)) else text);
+                const raw = try r.toText(v);
+                const text = if (escape and v != .markup) raw.derive(try escapeHtml(r, raw.bytes)) else raw;
+                try out.append(r.arena, if (precision) |n| try within(r, text, render.cpSlice(text.bytes, 0, n)) else text);
             },
             'r' => {
                 var repr = std.ArrayList(u8).empty;
-                value.writeRepr(&r.meter, &repr, r.arena, v, 0) catch |e| return r.wrap(e, "the value cannot be printed");
-                try out.appendBytes(r.arena, if (escape) try escapeHtml(r, repr.items) else repr.items, value.originIn(v, 0));
+                value.writeRepr(&r.meter, &repr, r.arena, v, 0) catch |e| return r.named(e);
+                const shown = if (escape) try escapeHtml(r, repr.items) else repr.items;
+                try out.appendBytes(r.arena, if (precision) |n| render.cpSlice(shown, 0, n) else shown, (try r.origin(v)));
             },
             'd', 'i' => switch (v) {
                 .int, .boolean => try buf.print(r.arena, "{d}", .{try intArg(r, v, "format")}),
@@ -568,8 +583,10 @@ fn percentFormat(r: *Renderer, fmt_s: Str, args: Value, escape: bool) Failure!St
             'f' => {
                 const f: f64 = switch (v) {
                     .int => |n| @floatFromInt(n),
-                    .boolean => |b| @floatFromInt(@intFromBool(b)),
-                    .float => |f| f,
+                    .boolean => |flag| @floatFromInt(@intFromBool(flag)),
+                    .float => |n| n,
+                    // Python's float(int), correctly rounded.
+                    .bigint => |t| value.bigToFloat(t),
                     else => return r.fail("must be real number, not {s}", .{value.typeName(v)}),
                 };
                 const prec = precision orelse 6;
@@ -578,10 +595,21 @@ fn percentFormat(r: *Renderer, fmt_s: Str, args: Value, escape: bool) Failure!St
             },
             else => return r.fail("unsupported format character '{c}'", .{conv}),
         }
+        // `%.Nd` writes at least N digits, zeros after the sign.
+        if ((conv == 'd' or conv == 'i') and precision != null) {
+            const sign: usize = @intFromBool(buf.items.len > 0 and buf.items[0] == '-');
+            const digits = buf.items.len - sign;
+            if (precision.? > digits) {
+                try r.charge(out.bytes.items.len +| precision.?);
+                const zeros = try r.arena.alloc(u8, precision.? - digits);
+                @memset(zeros, '0');
+                try buf.insertSlice(r.arena, sign, zeros);
+            }
+        }
         try out.appendBytes(r.arena, buf.items, .template);
         try r.charge(out.bytes.items.len);
     }
-    if (mapping == null and next < positional.len) return r.fail("not all arguments converted during string formatting", .{});
+    if (!mapping_like and next < positional.len) return r.fail("not all arguments converted during string formatting", .{});
     try r.charge(out.bytes.items.len);
     return out.str();
 }
@@ -616,6 +644,7 @@ fn trueDivide(x: i64, y: i64) f64 {
 
 fn pyMod(r: *Renderer, a: Value, b: Value) Failure!Value {
     @setRuntimeSafety(true);
+    if ((a == .bigint or b == .bigint) and a.isNumber() and b.isNumber()) return r.fail("arithmetic on an integer past 64 bits is not supported", .{});
     if (asInt(a)) |x| if (asInt(b)) |y| {
         if (y == 0) return r.fail("integer modulo by zero", .{});
         if (y == -1) return .{ .int = 0 };
@@ -741,7 +770,7 @@ pub fn contains(r: *Renderer, container: Value, item: Value) Failure!bool {
         },
         .list => |l| {
             const items = l.items.items;
-            for (items, 0..) |x, i| if (value.eql(&r.meter, x, item, 0) catch |e| return r.wrap(e, "the values nest too deep to compare")) {
+            for (items, 0..) |x, i| if (value.eql(&r.meter, x, item, 0) catch |e| return r.named(e)) {
                 if (l.isIterator()) l.items = .fromOwnedSlice(@constCast(items[i + 1 ..]));
                 return true;
             };
@@ -766,6 +795,17 @@ const str_methods_unsupported = [_][]const u8{
     "swapcase",   "translate", "zfill",
 };
 const dict_mutators = [_][]const u8{ "clear", "pop", "popitem", "setdefault", "update" };
+/// The methods of Python's int, bool and float, which the engine does not call.
+const number_methods = [_][]const u8{ "as_integer_ratio", "bit_count", "bit_length", "conjugate", "from_bytes", "from_number", "fromhex", "hex", "is_integer", "to_bytes" };
+/// The dunder attributes of Python's dict: the sandbox finds these and refuses them, where another dunder name falls
+/// back to the dict's key.
+const dict_dunders = [_][]const u8{
+    "__class__",    "__class_getitem__", "__contains__",      "__delattr__",      "__delitem__", "__dir__",       "__doc__",
+    "__eq__",       "__format__",        "__ge__",            "__getattribute__", "__getitem__", "__getstate__",  "__gt__",
+    "__hash__",     "__init__",          "__init_subclass__", "__ior__",          "__iter__",    "__le__",        "__len__",
+    "__lt__",       "__ne__",            "__new__",           "__or__",           "__reduce__",  "__reduce_ex__", "__repr__",
+    "__reversed__", "__ror__",           "__setattr__",       "__setitem__",      "__sizeof__",  "__str__",       "__subclasshook__",
+};
 const list_mutators = [_][]const u8{ "append", "clear", "extend", "insert", "pop", "remove", "reverse", "sort" };
 
 fn among(name: []const u8, set: []const []const u8) bool {
@@ -778,7 +818,37 @@ fn among(name: []const u8, set: []const []const u8) bool {
 /// goes on to the item; undefined for a method the immutable sandbox refuses (it fails when called).
 pub fn attribute(r: *Renderer, obj: Value, name: []const u8) Failure!?Value {
     @setRuntimeSafety(true);
-    if (std.mem.startsWith(u8, name, "__") and std.mem.endsWith(u8, name, "__")) return .{ .undefined = name };
+    if (std.mem.startsWith(u8, name, "__") and std.mem.endsWith(u8, name, "__"))
+        return if (obj == .dict and !among(name, &dict_dunders)) null else .{ .undefined = name };
+    switch (obj) {
+        .int, .boolean, .float, .bigint => {
+            if (among(name, &number_methods)) return r.fail("unsupported method '{s}.{s}'", .{ value.typeName(obj), name });
+            const whole: Value = switch (obj) {
+                .boolean => |b| .{ .int = @intFromBool(b) },
+                else => obj,
+            };
+            if (std.mem.eql(u8, name, "real")) return whole;
+            if (std.mem.eql(u8, name, "imag")) return if (obj == .float) Value{ .float = 0 } else Value{ .int = 0 };
+            if (obj == .float) return null;
+            if (std.mem.eql(u8, name, "numerator")) return whole;
+            if (std.mem.eql(u8, name, "denominator")) return .{ .int = 1 };
+            return null;
+        },
+        // Jinja2's Macro: a call block's caller has no name.
+        .macro => |m| {
+            if (std.mem.eql(u8, name, "name")) return if (m.is_caller) .none else Value.plain(m.node.name);
+            if (std.mem.eql(u8, name, "arguments")) {
+                const names = try r.arena.alloc(Value, m.node.params.len);
+                for (m.node.params, names) |p, *v| v.* = .plain(p.name);
+                return try r.newList(names, .tuple);
+            }
+            if (std.mem.eql(u8, name, "catch_kwargs")) return .{ .boolean = m.node.reads.kwargs };
+            if (std.mem.eql(u8, name, "catch_varargs")) return .{ .boolean = m.node.reads.varargs };
+            if (std.mem.eql(u8, name, "caller")) return .{ .boolean = m.node.reads.caller };
+            return null;
+        },
+        else => {},
+    }
     const Kind = enum { str, dict, list };
     const kind: Kind = switch (obj) {
         .string, .markup => .str,
@@ -812,8 +882,14 @@ pub fn attribute(r: *Renderer, obj: Value, name: []const u8) Failure!?Value {
 /// getitem.
 fn attrPath(r: *Renderer, item: Value, path: Value) Failure!Value {
     @setRuntimeSafety(true);
-    if (asInt(path)) |i| return r.getItem(item, .{ .int = i });
-    const text = path.str() orelse return r.getItem(item, path);
+    return attrPathOr(r, item, path, null);
+}
+
+/// `attrPath` with Jinja2's getter default: a step that reads undefined becomes `default`, and the walk goes on from it.
+fn attrPathOr(r: *Renderer, item: Value, path: Value, default: ?Value) Failure!Value {
+    @setRuntimeSafety(true);
+    if (asInt(path)) |i| return orDefault(try r.getItem(item, .{ .int = i }), default);
+    const text = path.str() orelse return orDefault(try r.getItem(item, path), default);
     var v = item;
     var it = std.mem.splitScalar(u8, text, '.');
     while (it.next()) |part| {
@@ -821,9 +897,14 @@ fn attrPath(r: *Renderer, item: Value, path: Value) Failure!Value {
             if (!std.ascii.isDigit(c)) break false;
         } else true;
         const key: Value = if (all_digits) .{ .int = std.fmt.parseInt(i64, part, 10) catch return r.fail("index '{s}' is too large", .{part}) } else .plain(part);
-        v = try r.getItem(v, key);
+        v = orDefault(try r.getItem(v, key), default);
     }
     return v;
+}
+
+fn orDefault(v: Value, default: ?Value) Value {
+    @setRuntimeSafety(true);
+    return if (v == .undefined) default orelse v else v;
 }
 
 /// Jinja2's `ignore_case` key: a string lower-cased, anything else as it is.
@@ -861,10 +942,7 @@ fn repeat(r: *Renderer, comptime T: type, unit: []const T, n: usize) Failure![]T
 /// Python's ordering of `a` and `b`, null when unordered (a NaN): then `<`, `>` and `>=` all answer false.
 fn compare(r: *Renderer, a: Value, b: Value) Failure!?std.math.Order {
     @setRuntimeSafety(true);
-    return value.order(&r.meter, a, b, 0) catch |e| return switch (e) {
-        error.TemplateRuntime => if (r.meter.spent()) r.wrap(e, "") else r.fail("'<' not supported between instances of '{s}' and '{s}'", .{ value.typeName(a), value.typeName(b) }),
-        else => e,
-    };
+    return value.order(&r.meter, a, b, 0) catch |e| return r.named(e);
 }
 
 fn lessThan(r: *Renderer, a: Value, b: Value) Failure!bool {
@@ -937,7 +1015,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 .float => input,
                 .int, .boolean => .{ .float = asFloat(input).? },
                 .bigint => |t| .{ .float = value.bigToFloat(t) },
-                .string, .markup => |s| if (parsePyFloat(s.bytes)) |x| .{ .float = x } else default,
+                .string, .markup => |s| if (try asciiNumberText(r, s.bytes)) |t| (if (parsePyFloat(t)) |x| Value{ .float = x } else default) else default,
                 else => default,
             };
         },
@@ -953,11 +1031,12 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 // infinite float raises Python's OverflowError.
                 .float => |x| return if (std.math.isNan(x)) default else floatToInt(r, x),
                 .string, .markup => |s| {
-                    if (parsePyInt(s.bytes, base)) |i| return .{ .int = i } else |e| switch (e) {
+                    const t = try asciiNumberText(r, s.bytes) orelse return default;
+                    if (parsePyInt(t, base)) |i| return .{ .int = i } else |e| switch (e) {
                         error.Overflow => return r.fail("an integer past 64 bits is not supported", .{}),
                         error.Invalid => {},
                     }
-                    const x = parsePyFloat(s.bytes) orelse return default;
+                    const x = parsePyFloat(t) orelse return default;
                     return if (std.math.isFinite(x)) floatToInt(r, x) else default;
                 },
                 else => return default,
@@ -981,7 +1060,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 return r.fail("indent: expected a string, got '{s}'", .{value.typeName(input)});
             };
             const s = src.bytes;
-            const pad_origin = if (p[0]) |w| value.originIn(w, 0) else .template;
+            const pad_origin = if (p[0]) |w| (try r.origin(w)) else .template;
             const indention: []const u8 = if (p[0]) |w| (w.str() orelse blk: {
                 const n = try intArg(r, w, "indent");
                 const len: usize = if (n < 0) 0 else @intCast(n);
@@ -1039,13 +1118,8 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
             } else false;
             if (is_attr) {
                 const p = try bind(r, "map", &.{ "attribute", "default" }, &.{}, kws);
-                for (try r.iterate(input)) |item| {
-                    var v = try attrPath(r, item, p[0].?);
-                    if (v == .undefined) if (p[1]) |d| if (d != .none) {
-                        v = d;
-                    };
-                    try out.append(r.arena, v);
-                }
+                const default: ?Value = if (p[1]) |d| (if (d == .none) null else d) else null;
+                for (try r.iterate(input)) |item| try out.append(r.arena, try attrPathOr(r, item, p[0].?, default));
             } else {
                 if (args.len == 0) return r.fail("map requires a filter argument", .{});
                 const name = try strArg(r, args[0], "map");
@@ -1143,15 +1217,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                     @setRuntimeSafety(true);
                     return if (c.reverse) c.sort.less(b.key, a.key) else c.sort.less(a.key, b.key);
                 }
-            }.lt) catch |e| return switch (e) {
-                error.TemplateRuntime => if (r.meter.spent())
-                    r.wrap(e, "")
-                else if (ctx.sort.unordered)
-                    r.fail("sort: a NaN cannot be ordered", .{})
-                else
-                    r.fail("'<' not supported between the sorted values", .{}),
-                else => e,
-            };
+            }.lt) catch |e| return r.named(e);
             const items = try r.arena.alloc(Value, keyed.len);
             for (keyed, items) |k, *v| v.* = k.item;
             return r.newList(items, .list);
@@ -1169,11 +1235,26 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
         .sum => {
             const p = try bind(r, "sum", &.{ "attribute", "start" }, args, kws);
             var total = p[1] orelse Value{ .int = 0 };
+            if (total.str() != null) return r.fail("sum() can't sum strings [use ''.join(seq) instead]", .{});
+            // Python's float phase: Neumaier's compensation over floats and ints, added once at the end.
+            var comp: f64 = 0;
             for (try r.iterate(input)) |item| {
                 const v = if (p[0]) |a| (if (a == .none) item else try attrPath(r, item, a)) else item;
-                if (total.str() != null) return r.fail("sum() can't sum strings", .{});
+                const x: ?f64 = switch (v) {
+                    .float => |n| n,
+                    .int => |i| @floatFromInt(i),
+                    .boolean => |flag| @floatFromInt(@intFromBool(flag)),
+                    else => null,
+                };
+                if (total == .float and x != null) {
+                    const t = total.float + x.?;
+                    comp += if (@abs(total.float) >= @abs(x.?)) (total.float - t) + x.? else (x.? - t) + total.float;
+                    total.float = t;
+                    continue;
+                }
                 total = try binary(r, .add, total, v);
             }
+            if (total == .float and comp != 0 and std.math.isFinite(comp)) total.float += comp;
             return total;
         },
         .tojson => {
@@ -1186,7 +1267,9 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 .string, .markup => |s| opts.indent = s.bytes,
                 else => {
                     const n = try intArg(r, ind, "tojson");
-                    const len: usize = if (n < 0) 0 else @intCast(@min(n, 1 << 20));
+                    if (n > r.limits.max_string) return r.fail("tojson: indent {d} is longer than the string limit", .{n});
+                    const len: usize = if (n < 0) 0 else @intCast(n);
+                    try r.charge(len);
                     const pad = try r.arena.alloc(u8, len);
                     @memset(pad, ' ');
                     opts.indent = pad;
@@ -1198,23 +1281,22 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 opts.key_separator = try strArg(r, pair[1], "tojson");
             };
             var buf = std.ArrayList(u8).empty;
-            tojson.dumps(&r.meter, &buf, r.arena, input, opts, 0) catch |e| switch (e) {
-                error.TemplateRuntime => {
-                    if (r.meter.spent()) return r.wrap(e, "");
-                    if (buf.items.len > opts.max_len) return r.fail("the render builds more text than its limit", .{});
-                    return r.fail("tojson: a value of type '{s}' is not JSON serializable (or nests deeper than {d})", .{ value.typeName(input), value.max_depth });
-                },
-                else => return e,
-            };
+            tojson.dumps(&r.meter, &buf, r.arena, input, opts, 0) catch |e| return r.named(e);
             try r.charge(buf.items.len);
-            return .{ .string = .{ .bytes = buf.items, .origin = value.originIn(input, 0) } };
+            return .{ .string = .{ .bytes = buf.items, .origin = (try r.origin(input)) } };
         },
         .truncate => {
             const p = try bind(r, "truncate", &.{ "length", "killwords", "end", "leeway" }, args, kws);
             if (input == .undefined) return input;
-            const src = input.strOf() orelse return r.fail("truncate: expected a string, got '{s}'", .{value.typeName(input)});
-            const s = src.bytes;
             const len = if (p[0]) |v| try intArg(r, v, "truncate") else 255;
+            const src = input.strOf() orelse {
+                // Jinja2's truncate returns any value whose len() is within the length; only text is cut.
+                const leeway_v = if (p[3]) |v| (if (v == .none) 5 else try intArg(r, v, "truncate")) else 5;
+                const n = try length(r, input);
+                if (n <= @as(i128, len) + leeway_v) return input;
+                return r.fail("truncate: expected a string, got '{s}'", .{value.typeName(input)});
+            };
+            const s = src.bytes;
             const killwords = if (p[1]) |v| value.truthy(v) else false;
             const end_s: Str = if (p[2]) |v| (v.strOf() orelse return r.fail("truncate: expected a string, got '{s}'", .{value.typeName(v)})) else .{ .bytes = "..." };
             const end = end_s.bytes;
@@ -1237,7 +1319,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 const k = try keyOf(r, item, p[1], cs);
                 try r.hashable(k);
                 const dup = for (seen.items) |s| {
-                    if (value.eql(&r.meter, s, k, 0) catch |e| return r.wrap(e, "the values nest too deep to compare")) break true;
+                    if (value.eql(&r.meter, s, k, 0) catch |e| return r.named(e)) break true;
                 } else false;
                 if (dup) continue;
                 try seen.append(r.arena, k);
@@ -1250,7 +1332,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
             const s = try r.toStr(input);
             var n: i64 = 0;
             var in_word = false;
-            var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+            var it = value.codepoints(s);
             while (it.nextCodepointSlice()) |cs| {
                 const w = isWordChar(decode(cs));
                 if (w and !in_word) n += 1;
@@ -1291,6 +1373,45 @@ fn floatToInt(r: *Renderer, x: f64) Failure!Value {
     const t = @trunc(x);
     if (@abs(t) >= 9.2e18) return r.fail("an integer past 64 bits is not supported", .{});
     return .{ .int = @intFromFloat(t) };
+}
+
+/// The zero of each run of ten Unicode decimal digits (category Nd), as Python 3.14's Unicode 16.0 has them.
+const decimal_zeros = [_]u21{
+    0x30, 0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xBE6, 0xC66, 0xCE6,
+    0xD66, 0xDE6, 0xE50, 0xED0, 0xF20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
+    0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
+    0xFF10, 0x104A0, 0x10D30, 0x10D40, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0, 0x11650,
+    0x116C0, 0x116D0, 0x116DA, 0x11730, 0x118E0, 0x11950, 0x11BF0, 0x11C50, 0x11D50, 0x11DA0, 0x11F50, 0x16130,
+    0x16A60, 0x16AC0, 0x16B50, 0x16D70, 0x1CCF0, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0,
+    0x1E4F0, 0x1E5F1, 0x1E950, 0x1FBF0,
+};
+
+/// The text Python's `int()` and `float()` parse: each Unicode decimal digit as its ASCII digit and each Unicode space
+/// as ' ', as CPython rewrites it first; null when any other non-ASCII character leaves it no number.
+fn asciiNumberText(r: *Renderer, text: []const u8) Failure!?[]const u8 {
+    @setRuntimeSafety(true);
+    for (text) |c| {
+        if (c >= 0x80) break;
+    } else return text;
+    try r.scan(text.len);
+    var out = std.ArrayList(u8).empty;
+    var it = value.codepoints(text);
+    while (it.nextCodepointSlice()) |c| {
+        if (c.len == 1) {
+            try out.append(r.arena, c[0]);
+            continue;
+        }
+        const cp = decode(c);
+        if (value.isSpace(cp)) {
+            try out.append(r.arena, ' ');
+            continue;
+        }
+        const digit = for (decimal_zeros) |z| {
+            if (cp >= z and cp < z + 10) break cp - z;
+        } else return null;
+        try out.append(r.arena, '0' + @as(u8, @intCast(digit)));
+    }
+    return out.items;
 }
 
 /// Python `int(text, base)`: surrounding white space, a sign, a prefix that matches the base (base 0 reads it),
@@ -1416,7 +1537,9 @@ fn appendKeeping(r: *Renderer, l: *value.List, v: Value) Failure!void {
 
 fn dictView(r: *Renderer, d: *const value.Dict, kind: value.List.Kind) Failure!Value {
     @setRuntimeSafety(true);
+    try r.tick(d.entries.items.len);
     const out = try r.arena.alloc(Value, d.entries.items.len);
+    value.spend(out.len);
     for (d.entries.items, out) |e, *o| o.* = switch (kind) {
         .dict_keys => e.key,
         .dict_values => e.value,
@@ -1434,9 +1557,9 @@ pub fn applyTest(r: *Renderer, t: Test, v: Value, args: []const Value, kws: []co
             const p = try bind(r, @tagName(t), &.{"other"}, args, kws);
             const other = try required(r, @tagName(t), p[0]);
             return switch (t) {
-                .divisibleby => value.eql(&r.meter, try pyMod(r, v, other), .{ .int = 0 }, 0) catch |e| r.wrap(e, "the values cannot be compared"),
-                .eq, .equalto => value.eql(&r.meter, v, other, 0) catch |e| r.wrap(e, "the values nest too deep to compare"),
-                .ne => !(value.eql(&r.meter, v, other, 0) catch |e| return r.wrap(e, "the values nest too deep to compare")),
+                .divisibleby => value.eql(&r.meter, try pyMod(r, v, other), .{ .int = 0 }, 0) catch |e| r.named(e),
+                .eq, .equalto => value.eql(&r.meter, v, other, 0) catch |e| r.named(e),
+                .ne => !(value.eql(&r.meter, v, other, 0) catch |e| return r.named(e)),
                 .lt, .lessthan => lessThan(r, v, other),
                 .gt, .greaterthan => lessThan(r, other, v),
                 .ge => if (try compare(r, v, other)) |o| o != .lt else false,
@@ -1457,7 +1580,7 @@ pub fn applyTest(r: *Renderer, t: Test, v: Value, args: []const Value, kws: []co
         .even, .odd => blk: {
             try undefinedFail(r, v);
             const m = try pyMod(r, v, .{ .int = 2 });
-            break :blk value.eql(&r.meter, m, .{ .int = @intFromBool(t == .odd) }, 0) catch |e| return r.wrap(e, "the values cannot be compared");
+            break :blk value.eql(&r.meter, m, .{ .int = @intFromBool(t == .odd) }, 0) catch |e| return r.named(e);
         },
         .@"false" => v == .boolean and !v.boolean,
         .@"true" => v == .boolean and v.boolean,
@@ -1486,7 +1609,7 @@ pub fn applyTest(r: *Renderer, t: Test, v: Value, args: []const Value, kws: []co
             .list => |l| l.isSequence(),
             else => false,
         },
-        .lower, .upper => hasCase(try r.toStr(v), t == .upper),
+        .lower, .upper => try hasCase(r, try r.toStr(v), t == .upper),
         else => unreachable,
     };
 }
@@ -1530,11 +1653,16 @@ fn callMethod(r: *Renderer, recv: Value, m: value.Method, args: []const Value, k
     switch (m) {
         .split, .rsplit => {
             const p = try bind(r, @tagName(m), &.{ "sep", "maxsplit" }, args, kws);
-            return split(r, recv.strOf().?, p[0], p[1], m == .rsplit);
+            const parts = try split(r, recv.strOf().?, p[0], p[1], m == .rsplit);
+            // Markup's split gives Markup parts.
+            if (recv == .markup) for (parts.list.items.items) |*part| {
+                part.* = .{ .markup = part.strOf().? };
+            };
+            return parts;
         },
         .indent => {
             const p = try bind(r, "indent", &.{ "width", "first", "blank" }, args, kws);
-            const pad_origin: value.Origin = if (p[0]) |w| value.originIn(w, 0) else .template;
+            const pad_origin: value.Origin = if (p[0]) |w| (try r.origin(w)) else .template;
             return .{ .string = .{ .bytes = try cppIndent(r, recv.str().?, p[0], p[1], p[2]), .origin = recv.strOf().?.origin.strictest(pad_origin) } };
         },
         .append => {
@@ -1572,6 +1700,8 @@ fn callMethod(r: *Renderer, recv: Value, m: value.Method, args: []const Value, k
         .replace => {
             if (args.len < 2 or args.len > 3) return r.fail("replace expected 2 or 3 arguments, got {d}", .{args.len});
             const count = if (args.len > 2) try intArg(r, args[2], "replace") else -1;
+            // Markup's replace escapes the replacement, not the text it looks for.
+            if (recv == .markup) return .{ .markup = try replace(r, src, try strArg(r, args[0], "replace"), try markupOperand(r, args[1]), count) };
             const new = args[1].strOf() orelse return r.fail("replace: expected a string, got '{s}'", .{value.typeName(args[1])});
             return sameKind(recv, try replace(r, src, try strArg(r, args[0], "replace"), new, count));
         },
@@ -1661,7 +1791,9 @@ fn callGlobal(r: *Renderer, g: value.Global, args: []const Value, kws: []const K
         .range => {
             const b = try rangeOf(r, args, kws);
             const lazy = value.Loop{ .index0 = 0, .items = &.{}, .range = .{ .start = b.start, .step = b.stride, .len = b.len } };
+            try r.tick(b.len);
             const items = try r.arena.alloc(Value, b.len);
+            value.spend(b.len);
             for (items, 0..) |*v, i| v.* = lazy.at(i);
             const range = try r.ownList(items, .range);
             const bounds = try r.arena.create([3]i128);

@@ -77,8 +77,14 @@ pub const VideoData = struct {
 /// OpenAI spells the system turn `developer` for reasoning models (pi does
 /// when `supportsDeveloperRole` is unset). No template we serve tells the two
 /// apart and Qwen's raises on the unknown role, which is a SILENT fallback.
+/// Every role a chat request may give a message.
+pub const request_roles = [_][]const u8{ "system", "developer", "user", "assistant", "tool", "function" };
+
+/// The role a template knows `role` by: OpenAI's `developer` is the system turn and its older `function` result a tool's.
 pub fn canonicalRole(role: []const u8) []const u8 {
-    return if (std.mem.eql(u8, role, "developer")) "system" else role;
+    if (std.mem.eql(u8, role, "developer")) return "system";
+    if (std.mem.eql(u8, role, "function")) return "tool";
+    return role;
 }
 
 /// Fold every `system` message past index 0 into the leading one (created
@@ -145,6 +151,26 @@ pub const Message = struct {
     /// Who wrote each byte of `content` when the server put it together from its own text and the client's (the tool
     /// fallbacks); null when all of it is the role's.
     content_origins: ?[]const template_engine.Run = null,
+
+    /// This message as `role`, its content `before ++ content ++ after`: every other field is carried, and its media
+    /// moves with the text it sat in.
+    pub fn derive(self: Message, arena: std.mem.Allocator, role: []const u8, before: []const template_engine.Str, after: []const template_engine.Str) !Message {
+        var b: template_engine.Builder = .{};
+        for (before) |p| try b.append(arena, p);
+        const shift = b.bytes.items.len;
+        try b.append(arena, contentSpans(self));
+        for (after) |p| try b.append(arena, p);
+        var out = self;
+        out.role = role;
+        out.content = b.bytes.items;
+        out.content_origins = b.runs.items;
+        if (self.media_parts) |parts| if (shift > 0) {
+            const moved = try arena.alloc(MediaPart, parts.len);
+            for (parts, moved) |p, *m| m.* = .{ .at = p.at + shift, .kind = p.kind };
+            out.media_parts = moved;
+        };
+        return out;
+    }
 };
 
 /// Only a template that reads `preserve_thinking` is handed the switch; `--preserve-thinking` and the per-model key do nothing elsewhere.
@@ -184,6 +210,7 @@ pub const ChatConfig = struct {
     }
 
     fn compileSaying(self: *ChatConfig, say: bool) !void {
+        self.dropCompiled();
         if (self.chat_template.len == 0) return;
         const c = try Compiled.init(self.allocator, self.chat_template, true, self.model_type);
         if (c.failure()) |f| {
@@ -449,24 +476,6 @@ fn templatesOf(allocator: std.mem.Allocator, chat_config: *const ChatConfig, own
     return own.*.?;
 }
 
-/// The template the arch of `<model_dir>/config.json` pins, if it pins one. Any read/parse failure is no pin: this
-/// only ARMS a family fallback, never blocks a load.
-fn dirModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
-    const cfg_path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return null;
-    defer allocator.free(cfg_path);
-    const file = std.Io.Dir.openFileAbsolute(io, cfg_path, .{}) catch return null;
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var rs = file.reader(io, &buf);
-    const content = rs.interface.allocRemaining(allocator, .limited(1 << 22)) catch return null;
-    defer allocator.free(content);
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const mt = parsed.value.object.get("model_type") orelse return null;
-    return if (mt == .string) allocator.dupe(u8, mt.string) catch null else null;
-}
-
 /// Is this `chat_template` entry just an `{% include %}` POINTER at the
 /// sidecar file? transformers >= 5 saves the real template to
 /// `chat_template.jinja` and writes that one-liner into tokenizer_config.json
@@ -584,22 +593,41 @@ test "chat_template accepts HF's list-of-named-templates shape" {
 
 /// Load chat template configuration from tokenizer_config.json.
 /// The chat template of `model_dir`, read for a look (the settings page) and never logged; `loadChatConfig` loads one.
-pub fn peekChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ChatConfig {
-    return readChatConfig(io, allocator, model_dir, false);
+pub fn peekChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, model_type: ?[]const u8) !ChatConfig {
+    return readChatConfig(io, allocator, model_dir, model_type, false);
 }
 
-pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ChatConfig {
-    return readChatConfig(io, allocator, model_dir, true);
+pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, model_type: ?[]const u8) !ChatConfig {
+    return readChatConfig(io, allocator, model_dir, model_type, true);
 }
 
+/// A key of `tokenizer_config.json` in a shape the load cannot read: named in a `[load]` line when `say`.
+fn badConfigKey(say: bool, key: []const u8, want: []const u8) error{InvalidTokenizerConfig} {
+    if (say) log.err("[load] tokenizer_config.json: {s} is not {s}\n", .{ key, want });
+    return error.InvalidTokenizerConfig;
+}
+
+/// `bos_token` or `eos_token`: a string, HF's AddedToken object (its `content`), or null for none. Caller frees.
+fn specialTokenText(allocator: std.mem.Allocator, v: ?std.json.Value, key: []const u8, say: bool) !?[]const u8 {
+    const t = switch (v orelse return null) {
+        .null => return null,
+        .string => |text| text,
+        .object => |o| if (o.get("content")) |c| (if (c == .string) c.string else return badConfigKey(say, key, "a string or an AddedToken")) else return badConfigKey(say, key, "a string or an AddedToken"),
+        else => return badConfigKey(say, key, "a string or an AddedToken"),
+    };
+    return try allocator.dupe(u8, t);
+}
+
+/// `model_type` is the one the load parsed from config.json: it picks the arch's pinned template and its edits.
 /// `say`: a load, whose template failure and fold the log states.
-fn readChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, say: bool) !ChatConfig {
+fn readChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, model_type: ?[]const u8, say: bool) !ChatConfig {
+    var config: ChatConfig = .{ .chat_template = &.{}, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    errdefer config.deinit();
+
     const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
     defer allocator.free(path);
-
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
-
     var read_buf: [4096]u8 = undefined;
     var reader_state = file.reader(io, &read_buf);
     const content = try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
@@ -607,15 +635,19 @@ fn readChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
     defer parsed.deinit();
-
+    if (parsed.value != .object) return badConfigKey(say, "the root", "an object");
     const root = parsed.value.object;
 
-    const model_type = dirModelType(io, allocator, model_dir);
-    defer if (model_type) |m| allocator.free(m);
+    if (model_type) |m| config.model_type = try allocator.dupe(u8, m);
     const pin = if (model_type) |m| arch_chat.pinOf(m) else null;
-    const chat_template: []const u8 = if (pin) |p|
+    config.image_placeholder = if (pin) |p| p.image_placeholder else null;
+    const own: ?[]const u8 = switch (root.get("chat_template") orelse .null) {
+        .null, .string, .array => chatTemplateFromValue(root.get("chat_template")),
+        else => return badConfigKey(say, "chat_template", "a string or a list of named templates"),
+    };
+    config.chat_template = if (pin) |p|
         try allocator.dupe(u8, p.template)
-    else if (chatTemplateFromValue(root.get("chat_template"))) |t|
+    else if (own) |t|
         try allocator.dupe(u8, t)
     else blk: {
         // Fall back to chat_template.jinja file (e.g. Qwen3.5 models)
@@ -626,36 +658,16 @@ fn readChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
             var jinja_buf: [4096]u8 = undefined;
             var jinja_reader = f.reader(io, &jinja_buf);
             break :blk try jinja_reader.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024));
-        } else |_| {
-            break :blk try allocator.dupe(u8, "");
-        }
+        } else |_| break :blk &.{};
+    };
+    config.bos_token = try specialTokenText(allocator, root.get("bos_token"), "bos_token", say);
+    config.eos_token = try specialTokenText(allocator, root.get("eos_token"), "eos_token", say);
+    config.add_bos_token = switch (root.get("add_bos_token") orelse .null) {
+        .null => false,
+        .bool => |b| b,
+        else => return badConfigKey(say, "add_bos_token", "a bool"),
     };
 
-    const bos_token: ?[]const u8 = if (root.get("bos_token")) |v|
-        (if (v == .string) try allocator.dupe(u8, v.string) else null)
-    else
-        null;
-
-    const eos_token: ?[]const u8 = if (root.get("eos_token")) |v|
-        (if (v == .string) try allocator.dupe(u8, v.string) else null)
-    else
-        null;
-
-    const add_bos_token = if (root.get("add_bos_token")) |v|
-        (if (v == .bool) v.bool else false)
-    else
-        false;
-
-    var config: ChatConfig = .{
-        .chat_template = chat_template,
-        .bos_token = bos_token,
-        .eos_token = eos_token,
-        .add_bos_token = add_bos_token,
-        .allocator = allocator,
-        .image_placeholder = if (pin) |p| p.image_placeholder else null,
-        .model_type = if (model_type) |m| try allocator.dupe(u8, m) else null,
-    };
-    errdefer config.deinit();
     try config.compileSaying(say);
     if (!say) return config;
     if (model_type) |m| if (config.compiled) |c| if (c.late_system == null and arch_chat.editsLateSystem(m))
@@ -770,7 +782,10 @@ pub fn renderChatSpans(
     // fallback synthesis) sees exactly the message list
     // an ordinary turn would have. The template must open the assistant turn
     // once, which it only does when the trailing assistant is not in `messages`.
-    const prefill = think_tags.continuationPrefill(messages, continue_final);
+    // The partial is joined to the render as it is, so it is mended once here, as the engine mends what it reads.
+    var mend = std.heap.ArenaAllocator.init(allocator);
+    defer mend.deinit();
+    const prefill = if (think_tags.continuationPrefill(messages, continue_final)) |p| try utf8Text(mend.allocator(), p) else null;
     const msgs = if (prefill != null) messages[0 .. messages.len - 1] else messages;
 
     if (chat_config.chat_template.len == 0) {
@@ -846,9 +861,13 @@ pub fn renderChatSpans(
     // The fallback above inlines the instruction with the tools; a template that
     // renders tools itself gets it on the last turn instead. A continuation keeps
     // the client's own prefill.
+    // It stays only where the render keeps every byte it has without it (Qwen3.8 with preserve_thinking off drops the
+    // in-flight turn's reasoning once a user turn follows); else the decode-time CallForce forces the call alone.
+    var unforced: ?[]const Message = null;
     if (tool_choice_instruction) |instr| {
         if (tools_json != null and !needs_inject_tools and prefill == null) {
             if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
+            unforced = effective_messages;
             effective_messages = try appendTurnInstruction(fallback_arena.?.allocator(), effective_messages, std.mem.trim(u8, instr, "\n"));
         }
     }
@@ -860,8 +879,19 @@ pub fn renderChatSpans(
 
     var failure: EngineFailure = .{};
     const context = RenderContext{ .messages = effective_messages, .image_atom = chat_config.image_placeholder, .tools = effective_tools_json, .settings = &settings };
-    if (try renderEngine(allocator, render_tpl, &context, true, &failure)) |engine_out| {
+    if (try renderEngine(allocator, render_tpl, &context, true, &failure)) |first_out| {
+        var engine_out = first_out;
         defer freeSpans(allocator, engine_out);
+        if (unforced) |plain_messages| {
+            var plain_failure: EngineFailure = .{};
+            const plain_context = RenderContext{ .messages = plain_messages, .image_atom = chat_config.image_placeholder, .tools = effective_tools_json, .settings = &settings };
+            if (try renderEngine(allocator, render_tpl, &plain_context, true, &plain_failure)) |plain| {
+                if (keepsEveryByte(plain.bytes, engine_out.bytes)) freeSpans(allocator, plain) else {
+                    freeSpans(allocator, engine_out);
+                    engine_out = plain;
+                }
+            }
+        }
         const collapsed = try collapseDoubledThinkTags(allocator, engine_out);
         // A continuation commits the content channel and then hands the model
         // its own unfinished sentence. It runs INSTEAD of the thinking-off
@@ -870,13 +900,13 @@ pub fn renderChatSpans(
         if (prefill) |partial| {
             defer freeSpans(allocator, collapsed);
             return joinSpans(allocator, &.{
-                collapsed, server(think_tags.contentChannelTail(collapsed.bytes)), .{ .bytes = partial, .origin = .assistant },
+                collapsed, server(channelTail(collapsed)), .{ .bytes = partial, .origin = .assistant },
             });
         }
-        if (think_tags.noThinkTailSuffix(collapsed.bytes, enable_thinking)) |suffix| {
+        if (think_tags.noThinkTailSuffix(collapsed.bytes, enable_thinking)) |suffix| if (channelTail(collapsed).len > 0) {
             defer freeSpans(allocator, collapsed);
             return joinSpans(allocator, &.{ collapsed, server(suffix) });
-        }
+        };
         return collapsed;
     }
 
@@ -926,12 +956,22 @@ fn renderContinuation(
     defer freeSpans(allocator, engine_out);
     const rendered = try collapseDoubledThinkTags(allocator, engine_out);
     defer freeSpans(allocator, rendered);
-    // A template may trim the text's leading whitespace, as transformers allows for.
+    // A template may trim the text's leading whitespace, as transformers allows for. The cut is where the partial
+    // turn's own bytes end, and they must end with its text: a search could land inside an earlier turn.
     const text = std.mem.trimStart(u8, partial, " \t\r\n");
-    const at = try template_engine.lastIndexOf(allocator, rendered.bytes, text) orelse return null;
+    const end = rendered.lastEnd(.assistant) orelse return null;
+    if (end < text.len or !std.mem.eql(u8, rendered.bytes[end - text.len .. end], text)) return null;
+    if (rendered.originOf(end - text.len, end) != .assistant) return null;
     var cut = std.heap.ArenaAllocator.init(allocator);
     defer cut.deinit();
-    return try dupeSpans(allocator, try rendered.slice(cut.allocator(), 0, at + text.len));
+    return try dupeSpans(allocator, try rendered.slice(cut.allocator(), 0, end));
+}
+
+/// `think_tags.contentChannelTail` for a think opener the template wrote; one a request's text spells is left open.
+fn channelTail(rendered: Spans) []const u8 {
+    const at = think_tags.tailThinkOpener(rendered.bytes) orelse return "";
+    if (rendered.originOf(at.start, at.end) != .template) return "";
+    return think_tags.contentChannelTail(rendered.bytes);
 }
 
 /// DSV4's chat template emits `</think></think>` between every user→assistant
@@ -958,7 +998,7 @@ fn collapseDoubledThinkTags(allocator: std.mem.Allocator, rendered: Spans) !Span
     var keep_from: usize = 0;
     var i: usize = 0;
     while (i < text.len) {
-        if (std.mem.startsWith(u8, text[i..], needle)) {
+        if (std.mem.startsWith(u8, text[i..], needle) and rendered.originOf(i, i + needle.len) == .template) {
             try out.appendPart(allocator, rendered, keep_from, i);
             i += tag.len;
             keep_from = i;
@@ -1232,13 +1272,18 @@ fn appendTurnInstruction(arena: std.mem.Allocator, messages: []const Message, te
     @memcpy(out[0..messages.len], messages);
     if (messages.len > 0 and std.mem.eql(u8, messages[messages.len - 1].role, "user")) {
         const last = &out[messages.len - 1];
-        const turn = if (last.content.len == 0) try synthesized(arena, "user", &.{instruction}) else try synthesized(arena, "user", &.{ contentSpans(last.*), server("\n\n"), instruction });
-        last.content = turn.content;
-        last.content_origins = turn.content_origins;
+        last.* = try last.derive(arena, "user", &.{}, if (last.content.len == 0) &.{instruction} else &.{ server("\n\n"), instruction });
         return out[0..messages.len];
     }
     out[messages.len] = try synthesized(arena, "user", &.{instruction});
     return out;
+}
+
+/// Whether `forced` is `plain` with bytes put in at one place: every byte of `plain` stays, in order.
+fn keepsEveryByte(plain: []const u8, forced: []const u8) bool {
+    if (forced.len < plain.len) return false;
+    const at = std.mem.indexOfDiff(u8, plain, forced) orelse return true;
+    return std.mem.endsWith(u8, forced, plain[at..]);
 }
 
 /// True if any message has `role: "tool"` or an assistant message with tool_calls.
@@ -1285,40 +1330,29 @@ pub fn synthesizeToolFallbackMessages(
     for (messages, 0..) |msg, i| {
         if (tool_prompt) |tp| {
             if (!injected and i == 0 and std.mem.eql(u8, msg.role, "system")) {
-                var merged = if (msg.content.len > 0)
-                    try synthesized(arena, "system", &.{ contentSpans(msg), server("\n\n"), tp })
-                else
-                    try synthesized(arena, "system", &.{tp});
-                merged.tool_calls = msg.tool_calls;
-                merged.tool_call_id = msg.tool_call_id;
-                merged.images = msg.images;
-                try out.append(arena, merged);
+                try out.append(arena, try msg.derive(arena, "system", &.{}, if (msg.content.len > 0) &.{ server("\n\n"), tp } else &.{tp}));
                 injected = true;
                 continue;
             }
         }
 
         if (rewrite_tool_role and std.mem.eql(u8, msg.role, "tool")) {
-            try out.append(arena, try synthesized(arena, "user", &.{ server("<tool_response>\n"), contentSpans(msg), server("\n</tool_response>") }));
+            try out.append(arena, try msg.derive(arena, "user", &.{server("<tool_response>\n")}, &.{server("\n</tool_response>")}));
             continue;
         }
 
         if (rewrite_tool_calls and std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
-            var pieces = std.ArrayList(template_engine.Str).empty;
-            if (msg.content.len > 0) try pieces.appendSlice(arena, &.{ contentSpans(msg), server("\n") });
-            for (msg.tool_calls.?) |tc| try pieces.appendSlice(arena, &.{
-                server("<tool_call>\n{\"name\": \""),
+            var b: template_engine.Builder = .{};
+            for (msg.tool_calls.?, 0..) |tc, n| for ([_]template_engine.Str{
+                server(if (n > 0 or msg.content.len > 0) "\n<tool_call>\n{\"name\": \"" else "<tool_call>\n{\"name\": \""),
                 .{ .bytes = tc.name, .origin = .assistant },
                 server("\", \"arguments\": "),
                 .{ .bytes = tc.arguments, .origin = .assistant },
-                server("}\n</tool_call>\n"),
-            });
-            var b: template_engine.Builder = .{};
-            for (pieces.items) |p| try b.append(arena, p);
-            const built = b.str();
-            const kept = std.mem.trimEnd(u8, built.bytes, "\n").len;
-            var rewritten = try synthesized(arena, "assistant", &.{try built.slice(arena, 0, kept)});
-            rewritten.images = msg.images;
+                server("}\n</tool_call>"),
+            }) |p| try b.append(arena, p);
+            // The calls are inlined as text, so the turn carries them no more.
+            var rewritten = try msg.derive(arena, "assistant", &.{}, &.{b.str()});
+            rewritten.tool_calls = null;
             try out.append(arena, rewritten);
             continue;
         }
@@ -1610,15 +1644,15 @@ const RenderContext = struct {
         const self: *const RenderContext = @ptrCast(@alignCast(ptr));
         const typed = try templateMessages(arena, self.messages, self.image_atom);
         const list = try arena.alloc(template_engine.Value, typed.len);
-        for (typed, self.messages, list) |t, m, *v| v.* = try template_engine.fromStruct(arena, t, messageOrigin(m.role));
-        const messages = try template_engine.fromStruct(arena, @as([]const template_engine.Value, list), .template);
+        for (typed, self.messages, list) |t, m, *v| v.* = try template_engine.fromInput(arena, t, messageOrigin(m.role), "messages", diag);
+        const messages = try template_engine.fromInput(arena, @as([]const template_engine.Value, list), .template, "messages", diag);
         var tools: ?template_engine.Value = null;
         if (self.tools) |t| if (t.len > 0) {
             tools = try template_engine.readJson(arena, t, "tools", .input, diag);
             _ = try fillToolDefKeys(arena, tools.?);
         };
         // The turn tokens are the pack's; the effort word is what the client sent, or a word derived from it.
-        const extra = try template_engine.fromStruct(arena, self.settings.*, .template);
+        const extra = try template_engine.fromInput(arena, self.settings.*, .template, "extra context", diag);
         for (extra.dict.entries.items) |*e| if (std.mem.eql(u8, e.key.str().?, "reasoning_effort")) {
             if (e.value == .string) e.value.string.origin = .input;
         };
@@ -1659,7 +1693,15 @@ fn fillToolDefKeys(arena: std.mem.Allocator, tools: template_engine.Value) error
 
 /// `{"type": "object", "properties": {}}`: what a no-argument tool means.
 fn emptyParameters(arena: std.mem.Allocator) error{OutOfMemory}!template_engine.Value {
-    return template_engine.fromStruct(arena, .{ .type = @as([]const u8, "object"), .properties = struct {}{} }, .template);
+    const properties = try arena.create(template_engine.Dict);
+    properties.* = .{};
+    const d = try arena.create(template_engine.Dict);
+    d.* = .{};
+    try d.entries.appendSlice(arena, &.{
+        .{ .key = .plain("type"), .value = .plain("object") },
+        .{ .key = .plain("properties"), .value = .{ .dict = properties } },
+    });
+    return .{ .dict = d };
 }
 
 fn dictField(d: *const template_engine.Dict, name: []const u8) ?template_engine.Value {
@@ -1823,6 +1865,10 @@ fn fallbackFormatChat(
 ) !Spans {
     var result: template_engine.Builder = .{};
     errdefer result.deinit(allocator);
+    // It writes the request's fields itself, so it mends them as the engine does what it reads.
+    var mend = std.heap.ArenaAllocator.init(allocator);
+    defer mend.deinit();
+    const ma = mend.allocator();
     const t = struct {
         fn text(a: std.mem.Allocator, b: *template_engine.Builder, bytes: []const u8) !void {
             try b.appendBytes(a, bytes, .template);
@@ -1840,36 +1886,36 @@ fn fallbackFormatChat(
     for (messages) |msg| {
         if (std.mem.eql(u8, msg.role, "system") and tools_json != null) {
             try t(allocator, &result, "<|im_start|>system\n");
-            try result.append(allocator, contentSpans(msg));
+            try result.append(allocator, try contentText(ma, msg, 0, msg.content.len));
             try t(allocator, &result, "\n\n");
             try appendToolPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
             try t(allocator, &result, "<|im_end|>\n");
         } else if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
             try t(allocator, &result, "<|im_start|>assistant\n");
             if (msg.content.len > 0) {
-                try result.append(allocator, contentSpans(msg));
+                try result.append(allocator, try contentText(ma, msg, 0, msg.content.len));
                 try t(allocator, &result, "\n");
             }
             for (msg.tool_calls.?) |tc| {
                 try t(allocator, &result, "<tool_call>\n");
                 try t(allocator, &result, "{\"name\": \"");
-                try result.appendBytes(allocator, tc.name, .assistant);
+                try result.appendBytes(allocator, try utf8Text(ma, tc.name), .assistant);
                 try t(allocator, &result, "\", \"arguments\": ");
-                try result.appendBytes(allocator, tc.arguments, .assistant);
+                try result.appendBytes(allocator, try utf8Text(ma, tc.arguments), .assistant);
                 try t(allocator, &result, "}\n</tool_call>");
             }
             try t(allocator, &result, "<|im_end|>\n");
         } else if (std.mem.eql(u8, msg.role, "tool")) {
             try t(allocator, &result, "<|im_start|>user\n");
             try t(allocator, &result, "<tool_response>\n");
-            try result.append(allocator, contentSpans(msg));
+            try result.append(allocator, try contentText(ma, msg, 0, msg.content.len));
             try t(allocator, &result, "\n</tool_response>");
             try t(allocator, &result, "<|im_end|>\n");
         } else {
             try t(allocator, &result, "<|im_start|>");
-            try result.appendBytes(allocator, msg.role, messageOrigin(msg.role));
+            try result.appendBytes(allocator, try utf8Text(ma, msg.role), messageOrigin(msg.role));
             try t(allocator, &result, "\n");
-            try result.append(allocator, contentSpans(msg));
+            try result.append(allocator, try contentText(ma, msg, 0, msg.content.len));
             try t(allocator, &result, "<|im_end|>\n");
         }
     }
@@ -1980,11 +2026,15 @@ test "collapseDoubledThinkTags handles multiple separated doublings" {
     try testing.expectEqualStrings("A</think>B</think>C", out.bytes);
 }
 
-test "collapseDoubledThinkTags: every kept byte keeps who wrote it" {
-    const out = try collapseDoubledThinkTags(testing.allocator, .{ .bytes = "a</think></think>b", .origin = .assistant, .runs = &.{ .{ .end = 9, .origin = .template }, .{ .end = 18, .origin = .assistant } } });
+test "collapseDoubledThinkTags: the template's own doubled tags collapse, every kept byte keeping who wrote it" {
+    const out = try collapseDoubledThinkTags(testing.allocator, .{ .bytes = "a</think></think>b", .origin = .assistant, .runs = &.{ .{ .end = 17, .origin = .template }, .{ .end = 18, .origin = .assistant } } });
     defer freeSpans(testing.allocator, out);
     try testing.expectEqualStrings("a</think>b", out.bytes);
-    try testing.expectEqualSlices(template_engine.Run, &.{ .{ .end = 1, .origin = .template }, .{ .end = 10, .origin = .assistant } }, out.runs);
+    try testing.expectEqualSlices(template_engine.Run, &.{ .{ .end = 9, .origin = .template }, .{ .end = 10, .origin = .assistant } }, out.runs);
+    // A pair a message wrote even half of is that message's text.
+    const mixed = try collapseDoubledThinkTags(testing.allocator, .{ .bytes = "a</think></think>b", .origin = .assistant, .runs = &.{ .{ .end = 9, .origin = .template }, .{ .end = 18, .origin = .assistant } } });
+    defer freeSpans(testing.allocator, mixed);
+    try testing.expectEqualStrings("a</think></think>b", mixed.bytes);
 }
 
 test "appendJsonString escapes special chars" {
@@ -2329,7 +2379,7 @@ test "real Qwen pack loaded through ChatConfig keeps late notes in place" {
     const dir = std.c.getenv("QWEN_MID_SYSTEM_MODEL_DIR") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try loadChatConfig(io, a, std.mem.span(dir));
+    var config = try loadChatConfig(io, a, std.mem.span(dir), arch_fx.qwen_model_type);
     defer config.deinit();
     const adapted = try arch_chat.lateSystemTemplate(arch_fx.qwen_model_type.?, a, config.chat_template);
     defer if (adapted) |t| a.free(t);
@@ -3741,8 +3791,6 @@ test "renderChatTemplate: a tool schema nested 120 levels under $defs renders on
 }
 
 test "renderChatTemplate: a continuation the template drops follows the generation prompt" {
-    // The search for the partial in the rendered history is template.lastIndexOf, linear in the history (its
-    // own test pins the bytes it reads); this pins what a miss renders.
     const a = testing.allocator;
     const m = 50_000;
     const hist = try a.alloc(u8, 2 * m);
@@ -3755,7 +3803,7 @@ test "renderChatTemplate: a continuation the template drops follows the generati
     const out = try renderChatTemplate(a, &msgs, &config, null, null, true, null, true);
     defer a.free(out);
     try testing.expect(std.mem.endsWith(u8, out, partial));
-    try testing.expectEqual(@as(?usize, out.len - partial.len), try template_engine.lastIndexOf(a, out, partial));
+    try testing.expect(std.mem.indexOf(u8, out, hist) != null);
 }
 
 /// One turn of a hybrid-state arch replayed the way a client does (the pack's own template and tokenizer): the
@@ -3935,7 +3983,7 @@ test "chat: preserve_thinking, a think closer and reasoning_effort named only in
     const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(root);
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\": \"{# preserve_thinking </think> reasoning_effort #}{% for m in messages %}{{ m.content }}{% endfor %}\"}" });
-    var cc = try loadChatConfig(io, testing.allocator, root);
+    var cc = try loadChatConfig(io, testing.allocator, root, null);
     defer cc.deinit();
     try testing.expect(!templateTakesPreserveThinking(&cc));
     try testing.expect(!templateHasThinkSpan(&cc));
@@ -3950,7 +3998,7 @@ test "loadChatConfig: a template that does not compile fails the load" {
     defer testing.allocator.free(root);
     // A ChatML model too: its ChatML fallback covers a template that raises, never one that cannot be read.
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\": \"{% for m in %}\", \"eos_token\": \"<|im_end|>\"}" });
-    try testing.expectError(error.ChatTemplateInvalid, loadChatConfig(io, testing.allocator, root));
+    try testing.expectError(error.ChatTemplateInvalid, loadChatConfig(io, testing.allocator, root, null));
 }
 
 test "loadChatConfig: a loaded template is compiled once, and every render of it reads the compiled tree" {
@@ -3960,7 +4008,7 @@ test "loadChatConfig: a loaded template is compiled once, and every render of it
     const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(root);
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\": \"{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}\", \"eos_token\": \"<|im_end|>\"}" });
-    var cc = try loadChatConfig(io, testing.allocator, root);
+    var cc = try loadChatConfig(io, testing.allocator, root, null);
     defer cc.deinit();
     try testing.expect(cc.compiled != null);
     const Seen = struct {
@@ -3982,20 +4030,93 @@ test "loadChatConfig: a loaded template is compiled once, and every render of it
     try testing.expectEqual(@as(usize, 0), seen.per_call);
 }
 
-test "loadChatConfig: a config.json that is not an object pins nothing" {
+test "loadChatConfig: a tokenizer_config.json of valid JSON but not an object fails by name, for a load and a look" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(root);
-    for ([_][]const u8{ "[]", "7", "\"deepseek_v41\"", "null" }) |body| {
-        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = body });
-        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"own\"}" });
-        var cc = try loadChatConfig(io, testing.allocator, root);
-        defer cc.deinit();
-        try testing.expectEqualStrings("own", cc.chat_template);
-        try testing.expect(cc.image_placeholder == null);
+    for ([_][]const u8{ "[]", "7", "\"t\"", "null" }) |body| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = body });
+        try testing.expectError(error.InvalidTokenizerConfig, loadChatConfig(io, testing.allocator, root, null));
+        try testing.expectError(error.InvalidTokenizerConfig, peekChatConfig(io, testing.allocator, root, null));
     }
+}
+
+test "loadChatConfig: the model type the load parsed picks the pin, and config.json is not read again" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    // A config.json too large or broken to read once decided the template; now the caller's model type does.
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "[]" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"own\"}" });
+    var pinned = try loadChatConfig(io, testing.allocator, root, "deepseek_v41");
+    defer pinned.deinit();
+    // A build without the arch has no pin for its model type: the checkpoint's own template stands.
+    const want: []const u8 = if (arch_chat.pinOf("deepseek_v41") != null) @embedFile("fixtures/dsv41_chat_template.jinja") else "own";
+    try testing.expectEqualStrings(want, pinned.chat_template);
+    var own = try loadChatConfig(io, testing.allocator, root, null);
+    defer own.deinit();
+    try testing.expectEqualStrings("own", own.chat_template);
+    try testing.expect(own.image_placeholder == null);
+}
+
+test "loadChatConfig: bos and eos in HF's AddedToken form read their content, and null is no token" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data =
+        \\{"chat_template": "x", "bos_token": null, "add_bos_token": null,
+        \\ "eos_token": {"__type": "AddedToken", "content": "<|im_end|>", "lstrip": false}}
+    });
+    var cc = try loadChatConfig(io, testing.allocator, root, null);
+    defer cc.deinit();
+    try testing.expectEqualStrings("<|im_end|>", cc.eos_token.?);
+    try testing.expect(cc.bos_token == null);
+    try testing.expect(!cc.add_bos_token);
+}
+
+test "loadChatConfig: a key of tokenizer_config.json in a shape the load cannot read fails by name" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    for ([_][]const u8{
+        "{\"chat_template\": 7}",               "{\"bos_token\": 5}",                 "{\"eos_token\": []}",
+        "{\"eos_token\": {\"content\": 5}}", "{\"eos_token\": {\"__type\": \"AddedToken\"}}", "{\"add_bos_token\": \"yes\"}",
+    }) |body| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = body });
+        try testing.expectError(error.InvalidTokenizerConfig, loadChatConfig(io, testing.allocator, root, null));
+        try testing.expectError(error.InvalidTokenizerConfig, peekChatConfig(io, testing.allocator, root, null));
+    }
+}
+
+fn loadAndFree(a: std.mem.Allocator, dir: []const u8, model_type: ?[]const u8) !void {
+    var cc = try loadChatConfig(testing.io, a, dir, model_type);
+    cc.deinit();
+}
+
+test "loadChatConfig: a read that runs out of memory at any allocation frees all it made" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\": \"{% for m in messages %}{{ m.content }}{% endfor %}\", \"bos_token\": \"<b>\", \"eos_token\": \"<e>\"}" });
+    try testing.checkAllAllocationFailures(testing.allocator, loadAndFree, .{ root, @as(?[]const u8, null) });
+}
+
+test "ChatConfig.compile: a second compile replaces the first and frees it" {
+    var cc: ChatConfig = .{ .chat_template = try testing.allocator.dupe(u8, "{{ 1 }}"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    defer cc.deinit();
+    try cc.compile();
+    try cc.compile();
+    try testing.expect(cc.compiled != null);
 }
 
 test "loadChatConfig: the checkpoint's own template is read, and a model type with a pin gets its pinned template and image atom" {
@@ -4008,15 +4129,10 @@ test "loadChatConfig: the checkpoint's own template is read, and a model type wi
         const dir = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ root, model_type });
         defer testing.allocator.free(dir);
         try tmp.dir.createDirPath(io, model_type);
-        const config = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{model_type});
-        defer testing.allocator.free(config);
-        const config_json = try std.fmt.allocPrint(testing.allocator, "{{\"model_type\":\"{s}\"}}", .{model_type});
-        defer testing.allocator.free(config_json);
-        try tmp.dir.writeFile(io, .{ .sub_path = config, .data = config_json });
         const tok = try std.fmt.allocPrint(testing.allocator, "{s}/tokenizer_config.json", .{model_type});
         defer testing.allocator.free(tok);
         try tmp.dir.writeFile(io, .{ .sub_path = tok, .data = "{\"chat_template\":\"own\",\"bos_token\":\"<b>\"}" });
-        var cc = try loadChatConfig(io, testing.allocator, dir);
+        var cc = try loadChatConfig(io, testing.allocator, dir, model_type);
         defer cc.deinit();
         if (arch_chat.pinOf(model_type) != null) {
             try testing.expectEqualStrings(@embedFile("fixtures/dsv41_chat_template.jinja"), cc.chat_template);
@@ -4166,14 +4282,11 @@ test "loadChatConfig: a Flash-Next template without the late-system branch loads
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(root);
-    const config_json = try std.fmt.allocPrint(testing.allocator, "{{\"model_type\": \"{s}\"}}", .{arch_fx.qwen_model_type.?});
-    defer testing.allocator.free(config_json);
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\": \"{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('System message must be at the beginning.') }}{% endif %}<|im_start|>{{ m.role }}\\n{{ m.content }}<|im_end|>\\n{% endfor %}\", \"eos_token\": \"<|im_end|>\"}" });
     const log_path = try std.fmt.allocPrint(testing.allocator, "{s}/s.log", .{root});
     defer testing.allocator.free(log_path);
     try log.openFile(log_path, 0);
-    var cc = loadChatConfig(io, testing.allocator, root) catch |e| {
+    var cc = loadChatConfig(io, testing.allocator, root, arch_fx.qwen_model_type) catch |e| {
         log.closeFile();
         return e;
     };
@@ -4255,14 +4368,11 @@ test "settings: reading a stub's chat template logs nothing" {
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(root);
-    const config_json = try std.fmt.allocPrint(testing.allocator, "{{\"model_type\": \"{s}\"}}", .{arch_fx.qwen_model_type.?});
-    defer testing.allocator.free(config_json);
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\": \"{% for m in messages %}{{ m.content }}{% endfor %}\"}" });
     const log_path = try std.fmt.allocPrint(testing.allocator, "{s}/s.log", .{root});
     defer testing.allocator.free(log_path);
     try log.openFile(log_path, 0);
-    var cc = peekChatConfig(io, testing.allocator, root) catch |e| {
+    var cc = peekChatConfig(io, testing.allocator, root, arch_fx.qwen_model_type) catch |e| {
         log.closeFile();
         return e;
     };
@@ -4328,4 +4438,463 @@ test "chat: the shared Qwen test config places a late system turn as a Qwen load
     const got = try renderChatTemplate(a, &msgs, &fixture, null, null, true, null, false);
     defer a.free(got);
     try testing.expect(std.mem.indexOf(u8, got, "<|im_start|>system\nlate note<|im_end|>") != null);
+}
+
+/// Fails the `fail_at`-th allocation once, then serves every other; `induced` says the run reached it.
+const FailOnce = struct {
+    child: std.mem.Allocator,
+    fail_at: usize = std.math.maxInt(usize),
+    count: usize = 0,
+    induced: bool = false,
+
+    fn allocator(self: *FailOnce) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn arm(self: *FailOnce, k: usize) void {
+        self.* = .{ .child = self.child, .fail_at = k };
+    }
+    fn disarm(self: *FailOnce) void {
+        self.fail_at = std.math.maxInt(usize);
+    }
+    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        defer self.count += 1;
+        if (self.count == self.fail_at) {
+            self.induced = true;
+            return null;
+        }
+        return self.child.rawAlloc(len, al, ra);
+    }
+    fn resize(ctx: *anyopaque, mem: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(mem, al, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, mem: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(mem, al, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, mem: []u8, al: std.mem.Alignment, ra: usize) void {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(mem, al, ra);
+    }
+};
+
+const sweep_plain_template = "{% for m in messages %}{% if m.role in ['user','system','assistant'] %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+
+const SweepRequest = struct { msgs: []const Message, tools: ?[]const u8, instr: ?[]const u8, thinking: bool, effort: ?[]const u8, cont: bool };
+
+/// A request with tools, a forced call, a tool turn and a late system turn; the same without tools; a continuation.
+fn sweepRequests() []const SweepRequest {
+    const call = [_]ToolCall{.{ .id = "c1", .name = "get_weather", .arguments = "{\"city\": \"Paris and a long tail of words to pass thirty-two bytes\"}" }};
+    const S = struct {
+        const msgs_a = [_]Message{
+            .{ .role = "system", .content = "You are a careful assistant who answers in full sentences, always." },
+            .{ .role = "user", .content = "What is the weather in Paris today, and what should I wear?" },
+            .{ .role = "assistant", .content = "", .tool_calls = &call, .reasoning_content = "I should call the weather tool for Paris first." },
+            .{ .role = "tool", .content = "{\"temp\": 21, \"sky\": \"clear\", \"note\": \"a long tool result body here\"}", .tool_call_id = "c1" },
+            .{ .role = "system", .content = "A late note from the operator, placed after the first turn on purpose." },
+            .{ .role = "user", .content = "Thanks. And tomorrow? Please answer with <|im_end|> spelled out in text." },
+        };
+        const msgs_b = [_]Message{
+            .{ .role = "user", .content = "Write the start of a story about a lighthouse keeper and a storm." },
+            .{ .role = "assistant", .content = "The keeper climbed the stairs as the storm" },
+        };
+    };
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Weather for a city\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}}]";
+    const reqs = comptime [_]SweepRequest{
+        .{ .msgs = &S.msgs_a, .tools = tools, .instr = "You must call get_weather now.", .thinking = true, .effort = "high", .cont = false },
+        .{ .msgs = &S.msgs_a, .tools = null, .instr = null, .thinking = false, .effort = null, .cont = false },
+        .{ .msgs = &S.msgs_b, .tools = null, .instr = null, .thinking = true, .effort = "low", .cont = true },
+    };
+    return &reqs;
+}
+
+fn clearMemoAndCache(cc: *ChatConfig, tok: *Tokenizer) void {
+    if (cc.compiled) |c| {
+        c.main.memo.clear();
+        if (c.late_system) |*l| l.memo.clear();
+    }
+    if (tok.segment_cache) |sc| sc.clear();
+}
+
+test "formatChat: running out of memory at any allocation is OutOfMemory or the same ids, cold or warm, and the next call gives them" {
+    const segment_cache_mod = @import("segment_cache.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const qwen = arch_fx.qwen_template orelse return error.SkipZigTest;
+    const Case = struct { tpl: []const u8, model_type: ?[]const u8 };
+    for ([_]Case{ .{ .tpl = qwen, .model_type = arch_fx.qwen_model_type }, .{ .tpl = sweep_plain_template, .model_type = null } }) |c| {
+        var fa = FailOnce{ .child = testing.allocator };
+        const A = fa.allocator();
+        const pt = try tokenizer_mod.packTokenizerForTests(A, arena, "qwen38_flash_next");
+        var tok = pt.tok;
+        defer tokenizer_mod.deinitTestTokenizer(&tok);
+        var cc = ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = A, .model_type = c.model_type };
+        try cc.compile();
+        defer cc.dropCompiled();
+        try tok.bindTemplate(cc.printedFacts(), pt.stops, &.{});
+        try tok.enableSegmentCache(segment_cache_mod.default_budget);
+        for (sweepRequests()) |r| {
+            clearMemoAndCache(&cc, &tok);
+            const want = try formatChat(testing.allocator, &tok, r.msgs, &cc, r.tools, r.instr, r.thinking, r.effort, r.cont);
+            defer testing.allocator.free(want);
+            for ([_]bool{ true, false }) |warm| {
+                var k: usize = 0;
+                while (true) : (k += 1) {
+                    if (!warm) clearMemoAndCache(&cc, &tok);
+                    fa.arm(k);
+                    const got = formatChat(A, &tok, r.msgs, &cc, r.tools, r.instr, r.thinking, r.effort, r.cont);
+                    fa.disarm();
+                    if (got) |ids| {
+                        defer A.free(ids);
+                        try testing.expectEqualSlices(u32, want, ids);
+                    } else |e| try testing.expectEqual(error.OutOfMemory, e);
+                    const again = try formatChat(testing.allocator, &tok, r.msgs, &cc, r.tools, r.instr, r.thinking, r.effort, r.cont);
+                    defer testing.allocator.free(again);
+                    try testing.expectEqualSlices(u32, want, again);
+                    if (!fa.induced) break;
+                }
+            }
+        }
+    }
+}
+
+test "renderChatSpans and forcedCallText: running out of memory at any allocation leaks nothing" {
+    const Case = struct { tpl: ?[]const u8, model_type: ?[]const u8 };
+    for ([_]Case{ .{ .tpl = arch_fx.qwen_template, .model_type = arch_fx.qwen_model_type }, .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .model_type = "deepseek_v41" }, .{ .tpl = sweep_plain_template, .model_type = null } }) |c| {
+        var fa = FailOnce{ .child = testing.allocator };
+        const A = fa.allocator();
+        var cc = ChatConfig{ .chat_template = c.tpl orelse continue, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = A, .model_type = c.model_type };
+        try cc.compile();
+        defer cc.dropCompiled();
+        for (sweepRequests()) |r| {
+            var k: usize = 0;
+            while (true) : (k += 1) {
+                fa.arm(k);
+                if (renderChatSpans(A, r.msgs, &cc, r.tools, r.instr, r.thinking, r.effort, r.cont)) |s| freeSpans(A, s) else |e| try testing.expectEqual(error.OutOfMemory, e);
+                const fc = forcedCallText(A, &cc, "get_weather") catch |e| blk: {
+                    try testing.expectEqual(error.OutOfMemory, e);
+                    break :blk null;
+                };
+                if (fc) |f| {
+                    A.free(f.sep);
+                    A.free(f.call);
+                    A.free(f.name_tail);
+                }
+                fa.disarm();
+                if (!fa.induced) break;
+            }
+        }
+    }
+}
+
+test "formatChat: threads on two models, with the memo restarting and the cache evicting, give the single-thread ids" {
+    const gpa = std.heap.smp_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const qwen = arch_fx.qwen_template orelse return error.SkipZigTest;
+    const Model = struct { tok: Tokenizer, cc: ChatConfig };
+    var models: [2]Model = undefined;
+    const specs = [_]struct { pack: []const u8, tpl: []const u8, mt: ?[]const u8, eos: ?[]const u8 }{
+        .{ .pack = "qwen38_flash_next", .tpl = qwen, .mt = arch_fx.qwen_model_type, .eos = "<|im_end|>" },
+        .{ .pack = "glm53", .tpl = @embedFile("fixtures/glm53_chat_template.jinja"), .mt = arch_fx.glm_model_type, .eos = null },
+    };
+    for (&models, specs) |*m, s| {
+        const pt = try tokenizer_mod.packTokenizerForTests(gpa, arena, s.pack);
+        m.tok = pt.tok;
+        m.cc = .{ .chat_template = s.tpl, .bos_token = null, .eos_token = s.eos, .add_bos_token = false, .allocator = gpa, .model_type = s.mt };
+        try m.cc.compile();
+        try m.tok.bindTemplate(m.cc.printedFacts(), pt.stops, &.{});
+    }
+    defer for (&models) |*m| {
+        m.cc.dropCompiled();
+        tokenizer_mod.deinitTestTokenizer(&m.tok);
+    };
+    const Job = struct { model: usize, req: usize, msgs: []const Message, effort: ?[]const u8, thinking: bool, want: []const u32 };
+    var jobs = std.ArrayList(Job).empty;
+    // Many distinct effort words restart the memo; distinct last turns fill and evict the cache.
+    for (0..2) |mi| for (sweepRequests(), 0..) |r, ri| for (0..120) |w| {
+        const effort: ?[]const u8 = if (w == 0) r.effort else try std.fmt.allocPrint(arena, "w{d}", .{w});
+        const msgs = try arena.dupe(Message, r.msgs);
+        msgs[msgs.len - 1].content = try std.fmt.allocPrint(arena, "{s} Question number {d}, asked again with more words around it.", .{ msgs[msgs.len - 1].content, w });
+        const ids = formatChat(arena, &models[mi].tok, msgs, &models[mi].cc, r.tools, r.instr, w % 3 != 0, effort, r.cont) catch |e| switch (e) {
+            error.ChatNeedsUserTurn, error.ChatTemplateUnusable => continue,
+            else => return e,
+        };
+        try jobs.append(arena, .{ .model = mi, .req = ri, .msgs = msgs, .effort = effort, .thinking = w % 3 != 0, .want = ids });
+    };
+    const Shared = struct {
+        models: *[2]Model,
+        jobs: []const Job,
+        bad: std.atomic.Value(usize) = .init(0),
+        fn run(self: *@This(), seed: u64) void {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rnd = prng.random();
+            for (0..400) |_| {
+                const j = self.jobs[rnd.uintLessThan(usize, self.jobs.len)];
+                const m = &self.models[j.model];
+                const r = sweepRequests()[j.req];
+                const ids = formatChat(std.heap.smp_allocator, &m.tok, j.msgs, &m.cc, r.tools, r.instr, j.thinking, j.effort, r.cont) catch {
+                    _ = self.bad.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                defer std.heap.smp_allocator.free(ids);
+                if (!std.mem.eql(u32, ids, j.want)) _ = self.bad.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    for ([_]usize{ 12 << 10, 64 << 10 }) |budget| {
+        for (&models) |*m| try m.tok.enableSegmentCache(budget);
+        var shared = Shared{ .models = &models, .jobs = jobs.items };
+        var threads: [8]std.Thread = undefined;
+        for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Shared.run, .{ &shared, @as(u64, i) * 7919 + budget });
+        for (threads) |t| t.join();
+        try testing.expectEqual(@as(usize, 0), shared.bad.load(.monotonic));
+        for (&models) |*m| try testing.expect(m.tok.segment_cache.?.bytes() <= budget);
+    }
+}
+
+fn peekForPage(dir: []const u8) !void {
+    var cc = try peekChatConfig(testing.io, std.heap.page_allocator, dir, null);
+    defer cc.deinit();
+    _ = templateTakesPreserveThinking(&cc);
+    _ = templateHasThinkSpan(&cc);
+}
+
+/// How a forked child that ran `f(arg)` ended: a crash is the failure the shape cases look for.
+fn childEnd(comptime f: anytype, arg: anytype) enum { ok, failed, crashed } {
+    const pid = std.c.fork();
+    if (pid == 0) {
+        _ = std.c.alarm(20);
+        std.c._exit(if (f(arg)) |_| 0 else |_| 3);
+    }
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+    const s: u32 = @bitCast(status);
+    if (s & 0x7f != 0) return .crashed;
+    return switch ((s >> 8) & 0xff) {
+        0 => .ok,
+        3 => .failed,
+        else => .crashed,
+    };
+}
+
+test "peekChatConfig: a pack folder of any shape the settings page looks at is a template or a named error, never a crash" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const F = struct { name: []const u8, body: ?[]const u8 };
+    const tc = "tokenizer_config.json";
+    const cases = [_][]const F{
+        &.{.{ .name = tc, .body = "{\"chat_template\": 5}" }},
+        &.{.{ .name = tc, .body = "{\"chat_template\": null}" }},
+        &.{.{ .name = tc, .body = "{\"chat_template\": [1, null, {\"template\": 5}, {\"name\": 5, \"template\": \"T\"}]}" }},
+        &.{.{ .name = tc, .body = "{\"chat_template\": \"x\", \"add_bos_token\": \"true\"}" }},
+        &.{.{ .name = tc, .body = "{\"chat_template\": \"x\", \"chat_template\": \"y\"}" }},
+        &.{.{ .name = tc, .body = "" }},
+        &.{.{ .name = tc, .body = "{\"chat_template\": \"x" }},
+        &.{.{ .name = tc, .body = "{\"chat_template\": \"\xff\xfe\"}" }},
+        &.{.{ .name = tc, .body = null }},
+        &.{},
+        &.{ .{ .name = tc, .body = "{}" }, .{ .name = "chat_template.jinja", .body = null } },
+        &.{ .{ .name = tc, .body = "{}" }, .{ .name = "chat_template.jinja", .body = "" } },
+        &.{ .{ .name = tc, .body = "{}" }, .{ .name = "chat_template.jinja", .body = "{{ '\xff' }}" } },
+        &.{.{ .name = tc, .body = "{\"chat_template\": \"{% include 'chat_template.jinja' %}\"}" }},
+    };
+    var crashes: usize = 0;
+    for (cases, 0..) |files, i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "{d}", .{i});
+        var sub = try tmp.dir.createDirPathOpen(io, name, .{});
+        defer sub.close(io);
+        for (files) |f| if (f.body) |b| try sub.writeFile(io, .{ .sub_path = f.name, .data = b }) else try sub.createDirPath(io, f.name);
+        const dir = try sub.realPathFileAlloc(io, ".", testing.allocator);
+        defer testing.allocator.free(dir);
+        if (childEnd(peekForPage, @as([]const u8, dir)) == .crashed) crashes += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), crashes);
+}
+
+test "renderChatSpans: a continuation the template does not render verbatim never cuts the prompt inside an earlier turn" {
+    const a = testing.allocator;
+    // Drops assistant turns, so the partial's text is found only in the user's turn.
+    const tpl = "{%- for message in messages -%}{%- if message['role'] != 'assistant' -%}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
+    var cc = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    try cc.compile();
+    defer cc.dropCompiled();
+    const msgs = [_]Message{
+        .{ .role = "user", .content = "Repeat after me: Hello there, friend. Then go on." },
+        .{ .role = "assistant", .content = "Hello there" },
+    };
+    const out = try renderChatTemplate(a, &msgs, &cc, null, null, true, null, true);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "Then go on.") != null);
+    try testing.expect(std.mem.endsWith(u8, out, "<|im_start|>assistantHello there"));
+}
+
+test "renderChatSpans: GLM-5.3 continuing a reply that spells a think closer keeps the user's turn whole" {
+    const a = testing.allocator;
+    var cc = ChatConfig{ .chat_template = @embedFile("fixtures/glm53_chat_template.jinja"), .bos_token = null, .eos_token = "<|endoftext|>", .add_bos_token = false, .allocator = a };
+    try cc.compile();
+    defer cc.dropCompiled();
+    const partial = "The tag is </think>  then the answer";
+    const msgs = [_]Message{
+        .{ .role = "user", .content = "Finish my sentence: " ++ partial ++ " ... and explain." },
+        .{ .role = "assistant", .content = partial },
+    };
+    const out = try renderChatTemplate(a, &msgs, &cc, null, null, true, null, true);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "and explain.") != null);
+    try testing.expect(std.mem.endsWith(u8, out, partial));
+}
+
+test "renderChatSpans: a client's own doubled think closer reaches the prompt as sent, in any turn" {
+    const a = testing.allocator;
+    const tpl = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n";
+    var cc = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    try cc.compile();
+    defer cc.dropCompiled();
+    for ([_][]const u8{ "user", "tool", "assistant" }) |role| {
+        const msgs = [_]Message{ .{ .role = "user", .content = "q" }, .{ .role = role, .content = "grep says: </think></think> twice" }, .{ .role = "user", .content = "ok" } };
+        const out = try renderChatTemplate(a, &msgs, &cc, null, null, true, null, false);
+        defer a.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "grep says: </think></think> twice") != null);
+    }
+}
+
+test "renderChatSpans: a client's think opener at the end of a render with no generation prompt is not closed for it" {
+    const a = testing.allocator;
+    const tpl = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}{% endfor %}";
+    var cc = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    try cc.compile();
+    defer cc.dropCompiled();
+    const msgs = [_]Message{.{ .role = "user", .content = "the tag is <think>" }};
+    const out = try renderChatTemplate(a, &msgs, &cc, null, null, false, null, false);
+    defer a.free(out);
+    try testing.expectEqualStrings("<|im_start|>user\nthe tag is <think>", out);
+}
+
+test "renderChatSpans: a forced tool_choice keeps every byte of the plain render on every served template" {
+    const a = testing.allocator;
+    const instr = "\nYou MUST call the function \"get_time\". Do not respond with text.";
+    const call = [_]ToolCall{.{ .id = "c1", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+    const msgs = [_]Message{
+        .{ .role = "user", .content = "what time is it" },
+        .{ .role = "assistant", .content = "", .reasoning_content = "I SHOULD CALL THE CLOCK", .tool_calls = &call },
+        .{ .role = "tool", .content = "12:00", .tool_call_id = "c1" },
+    };
+    const served = [_]struct { text: []const u8, eos: ?[]const u8 }{
+        .{ .text = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .eos = "<|im_end|>" },
+        .{ .text = @embedFile("fixtures/glm53_chat_template.jinja"), .eos = "<|endoftext|>" },
+        .{ .text = @embedFile("fixtures/dsv41_chat_template.jinja"), .eos = null },
+        .{ .text = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .eos = "<|im_end|>" },
+    };
+    for (served) |s| for ([_]?bool{ null, true, false }) |preserve| for ([_]bool{ true, false }) |thinking| {
+        var cc = ChatConfig{ .chat_template = s.text, .bos_token = null, .eos_token = s.eos, .add_bos_token = false, .allocator = a, .preserve_thinking = preserve };
+        try cc.compile();
+        defer cc.dropCompiled();
+        const plain = try renderChatTemplate(a, &msgs, &cc, forced_choice_tools, null, thinking, null, false);
+        defer a.free(plain);
+        const forced = try renderChatTemplate(a, &msgs, &cc, forced_choice_tools, instr, thinking, null, false);
+        defer a.free(forced);
+        try testing.expect(keepsEveryByte(plain, forced));
+    };
+}
+
+test "keepsEveryByte: the forced render is the plain one with bytes put in at one place" {
+    try testing.expect(keepsEveryByte("abc", "abc"));
+    try testing.expect(keepsEveryByte("abc", "abXYc"));
+    try testing.expect(keepsEveryByte("abc", "abcXY"));
+    try testing.expect(keepsEveryByte("abc", "XYabc"));
+    try testing.expect(keepsEveryByte("aab", "aaab"));
+    try testing.expect(!keepsEveryByte("abc", "ac"));
+    try testing.expect(!keepsEveryByte("abc", "aXbYc"));
+    try testing.expect(!keepsEveryByte("abc", "abd"));
+}
+
+test "renderChatSpans: a tool result's image keeps its placeholder when the template has no tool branch" {
+    const a = testing.allocator;
+    const tpl =
+        \\{%- for m in messages -%}{%- if m.role in ['system','user','assistant'] -%}<|im_start|>{{ m.role }}
+        \\{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{% if p.type == 'image' %}<|image_pad|>{% else %}{{ p.text }}{% endif %}{% endfor %}{% endif %}<|im_end|>
+        \\{% endif -%}{%- endfor -%}
+    ;
+    var cc = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    try cc.compile();
+    defer cc.dropCompiled();
+    const img = [_]ImageData{.{ .pixels = "", .width = 1, .height = 1 }};
+    const call = [_]ToolCall{.{ .id = "c1", .name = "shot", .arguments = "{}" }};
+    const msgs = [_]Message{
+        .{ .role = "user", .content = "take one" },
+        .{ .role = "assistant", .content = "", .tool_calls = &call },
+        .{ .role = "tool", .content = "hereafter", .tool_call_id = "c1", .images = &img, .media_parts = &.{.{ .at = 4, .kind = .image }} },
+        .{ .role = "user", .content = "describe" },
+    };
+    const out = try renderChatTemplate(a, &msgs, &cc, null, null, true, null, false);
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<tool_response>\nhere<|image_pad|>after\n</tool_response>") != null);
+}
+
+test "renderChatSpans: ill-formed UTF-8 in a continuation or the ChatML fallback reaches the prompt mended" {
+    const a = testing.allocator;
+    const bad = "x\xff\xc0\x80y";
+    const call = [_]ToolCall{.{ .id = "c1", .name = "f" ++ bad, .arguments = "{\"a\":\"" ++ bad ++ "\"}" }};
+    const msgs = [_]Message{
+        .{ .role = "user", .content = "q" ++ bad },
+        .{ .role = "assistant", .content = "", .tool_calls = &call },
+        .{ .role = "tool", .content = "r" ++ bad, .tool_call_id = "c1" },
+        .{ .role = "assistant", .content = "partial " ++ bad },
+    };
+    const tpl = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+    for ([_][]const u8{ tpl, "" }) |text| for ([_]bool{ true, false }) |cont| {
+        var cc = ChatConfig{ .chat_template = text, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        const out = try renderChatTemplate(a, &msgs, &cc, forced_choice_tools, null, true, null, cont);
+        defer a.free(out);
+        try testing.expect(std.unicode.utf8ValidateSlice(out));
+    };
+}
+
+test "templateProbeRender: memoized probes answer as fresh renders for every effort spelling, across a restart of the memo" {
+    const a = testing.allocator;
+    const served = [_]struct { text: []const u8, bos: ?[]const u8, eos: ?[]const u8 }{
+        .{ .text = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .bos = null, .eos = "<|im_end|>" },
+        .{ .text = @embedFile("fixtures/glm53_chat_template.jinja"), .bos = null, .eos = "<|endoftext|>" },
+        .{ .text = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos = null, .eos = null },
+        .{ .text = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .bos = "<s>", .eos = "<|im_end|>" },
+    };
+    var words = std.ArrayList(?[]const u8).empty;
+    defer {
+        for (words.items) |w| if (w) |x| a.free(x);
+        words.deinit(a);
+    }
+    try words.append(a, null);
+    for ([_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "0", "+5", "101", "-1", "1e2", "62.0", "" }) |w| try words.append(a, try a.dupe(u8, w));
+    for (1..101) |n| try words.append(a, try std.fmt.allocPrint(a, "{d}", .{n}));
+    var checked: usize = 0;
+    for (served) |s| {
+        for ([_]?[]const u8{ null, arch_fx.qwen_model_type }) |mt| {
+            const compiled = try Compiled.init(a, s.text, true, mt);
+            defer compiled.deinit(a);
+            var cc = ChatConfig{ .chat_template = s.text, .bos_token = s.bos, .eos_token = s.eos, .add_bos_token = false, .allocator = a, .compiled = compiled };
+            for (0..2) |_| for ([_]?bool{ null, true, false }) |preserve| for ([_]bool{ true, false }) |thinking| for (words.items) |effort| {
+                cc.preserve_thinking = preserve;
+                const settings = try templateSettings(a, &cc, thinking, effort);
+                for ([_]?*const Tpl{ &compiled.main, if (compiled.late_system) |*l| l else null }) |maybe| {
+                    const tpl = maybe orelse continue;
+                    for ([_]Probe{ .tool_content, .late_system, .call }) |probe| {
+                        const fresh = try renderProbeFresh(a, tpl, probe, &settings);
+                        defer if (fresh) |f| a.free(f);
+                        const got = try templateProbeRender(a, tpl, probe, &settings);
+                        defer if (got) |g| a.free(g);
+                        try testing.expectEqual(fresh == null, got == null);
+                        if (fresh) |f| try testing.expectEqualStrings(f, got.?);
+                        checked += 1;
+                    }
+                }
+            };
+        }
+    }
+    try testing.expect(checked > 0);
 }

@@ -21,15 +21,6 @@ pub const Facts = facts_mod.Facts;
 
 pub const Limits = render.Limits;
 
-/// The last index of `needle` in `hay`, as `std.mem.lastIndexOf` gives it, in time linear in `hay`.
-pub fn lastIndexOf(gpa: std.mem.Allocator, hay: []const u8, needle: []const u8) error{OutOfMemory}!?usize {
-    @setRuntimeSafety(true);
-    const finder = try value.Finder.init(gpa, needle, true);
-    defer finder.deinit(gpa);
-    var scanned: usize = 0;
-    return finder.find(hay, &scanned);
-}
-
 pub const Error = error{ TemplateSyntax, TemplateRaised, TemplateRuntime, OutOfMemory };
 
 /// Where and why a render failed. For `TemplateRaised` the message is the template's own `raise_exception` text.
@@ -261,13 +252,25 @@ fn renderBudgeted(arena: std.mem.Allocator, given: ?Tree, in: Inputs, diag: *Dia
     var frame = render.Frame{ .parent = &globals };
     _ = r.renderBody(body, &frame) catch |e| {
         if (e != error.OutOfMemory) {
-            // A bare failure from the value walkers that ran out of steps still names the limit.
-            const spent = if (r.meter.spent()) std.fmt.allocPrint(arena, "the render takes more than {d} steps", .{in.limits.max_steps}) catch "the render takes more steps than its limit" else "the render failed";
-            diag.set(src, r.fail_pos, r.message orelse spent);
+            // A bare failure a walk passed up through a plain `try` is named here, at the node that ran it.
+            if (r.message == null) r.named(e) catch {};
+            diag.set(src, r.fail_pos, r.message orelse "the render failed");
         }
         return e;
     };
     return out.str();
+}
+
+/// `v` as the template reads it (`value.fromStruct`), or a failure naming `what` in `diag` when its text is not UTF-8.
+pub fn fromInput(arena: std.mem.Allocator, v: anytype, origin: Origin, comptime what: []const u8, diag: *Diagnostic) Error!value.Value {
+    @setRuntimeSafety(true);
+    return value.fromStruct(arena, v, origin) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidUtf8 => {
+            diag.set("", null, "the " ++ what ++ " are not valid UTF-8");
+            return error.TemplateRuntime;
+        },
+    };
 }
 
 /// `text` read as `json.loads` reads it, or a failure naming `what` in `diag` (not JSON, or nested too deep).
@@ -337,6 +340,24 @@ test "template: a template that does not compile fails at compile, with its plac
     try testing.expectError(error.TemplateSyntax, Template.compile(testing.allocator, "ok\n{% for x in %}", &diag));
     try testing.expectEqual(@as(u32, 2), diag.line);
     try testing.expect(diag.message().len > 0);
+}
+
+test "template: a macro or call block that names one argument twice does not compile" {
+    for ([_][]const u8{ "{% macro m(a, a) %}{% endmacro %}", "{% macro m(a, b, a=1) %}{% endmacro %}", "{% call(a, a) m() %}{% endcall %}" }) |src| {
+        var diag = Diagnostic{};
+        try testing.expectError(error.TemplateSyntax, Template.compile(testing.allocator, src, &diag));
+        try testing.expectEqualStrings("duplicate argument 'a' in function definition", diag.message());
+    }
+}
+
+test "template: a function, which Python prints with its address, is refused by name when printed" {
+    for ([_][]const u8{ "{{ 'abc'.upper }}", "{{ range }}", "{{ namespace }}", "{{ [raise_exception] }}" }) |src| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var diag = Diagnostic{};
+        try testing.expectError(error.TemplateRuntime, renderForTest(arena.allocator(), src, "[]", "{}", .{}, &diag));
+        try testing.expectEqualStrings("a function cannot be printed: Python prints it with its address", diag.message());
+    }
 }
 
 test "template: a raise reports its text and where it was raised" {
@@ -474,6 +495,9 @@ test "template: a render past its recursion, output, step or memory limit fails 
     // `range` stops at 100000 items, so only nested loops reach the step budget.
     try expectLimit("{% for i in range(100000) %}{% for j in range(100000) %}{% endfor %}{% endfor %}", .{ .max_steps = 1_000_000 }, "more than 1000000 steps");
     try expectLimit("{% for i in range(100000) %}{% set xs = range(100000) %}{% endfor %}", .{ .max_memory = 64 << 20 }, "more memory than its limit");
+    // Python builds the indent first, so one past the string limit is refused whether or not it is written.
+    try expectLimit("{{ 5|tojson(indent=2000) }}", .{ .max_string = 1000 }, "tojson: indent 2000 is longer than the string limit");
+    try expectLimit("{{ [[[[[[1]]]]]]|tojson(indent=900) }}", .{ .max_string = 1000 }, "more text than its limit");
 }
 
 test "template: a loop's iterations reuse their scope, so memory follows what the render keeps" {
@@ -566,7 +590,7 @@ test "template: repeating an empty string or list any number of times is immedia
     try expectSteps("{{ ('' * 9223372036854775807)|length }} {{ ([] * 9223372036854775807)|length }} {{ (() * 9223372036854775807)|length }}", "{}", "0 0 0", 16);
 }
 
-test "template: the finder and lastIndexOf give std.mem's first and last index on ordinary and adversarial text" {
+test "template: the finder gives std.mem's first and last index on ordinary and adversarial text" {
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const rand = prng.random();
     var hay_buf: [64]u8 = undefined;
@@ -599,9 +623,9 @@ fn expectFinderAgrees(hay: []const u8, needle: []const u8) !void {
     try testing.expect(scanned <= hay.len);
     const last = try value.Finder.init(testing.allocator, needle, true);
     defer last.deinit(testing.allocator);
-    _ = last.find(hay, &scanned);
+    scanned = 0;
+    try testing.expectEqual(std.mem.lastIndexOf(u8, hay, needle), last.find(hay, &scanned));
     try testing.expect(scanned <= hay.len);
-    try testing.expectEqual(std.mem.lastIndexOf(u8, hay, needle), try lastIndexOf(testing.allocator, hay, needle));
 }
 
 test "template: a loop that breaks early pays for the items it walked, never the whole list" {
@@ -682,7 +706,9 @@ test "template: a render at every depth limit at once returns on a request threa
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     // 100 macro calls (the whole call depth), and at the bottom an expression nested to the parser's limit printing
-    // a value nested near the value limit. Measured peak: about 0.9 MiB of the 16 MiB a request thread has.
+    // a value nested near the value limit. Measured peak: about 0.9 MiB of the 16 MiB a request thread has, and 4.7 MiB
+    // in a Debug build, whose frames are several times larger.
+    const stack_share: usize = if (@import("builtin").mode == .debug) 2 else 4;
     const deep_value = try repeated(arena, "{\"d\": ", "[", 500, try repeated(arena, "1", "]", 500, "}"));
     var nesting: usize = parser.max_nesting;
     const probe_text = while (nesting > 0) : (nesting -= 1) {
@@ -697,7 +723,7 @@ test "template: a render at every depth limit at once returns on a request threa
     const thread = try std.Thread.spawn(.{ .stack_size = std.Thread.SpawnConfig.default_stack_size }, StackProbe.run, .{ &probe, arena });
     thread.join();
     _ = try probe.result;
-    try testing.expect(probe.peak < std.Thread.SpawnConfig.default_stack_size / 4);
+    try testing.expect(probe.peak < std.Thread.SpawnConfig.default_stack_size / stack_share);
 }
 
 test "template: an input nested past the value limit is named as that, not as invalid JSON" {
@@ -917,4 +943,204 @@ test "template: strftime_now keeps the origin of the format it was handed" {
     const got = try compiled.renderSpans(arena, .{ .context = json.context(), .add_generation_prompt = false }, &diag);
     try testing.expectEqualStrings("<x>", got.bytes);
     try testing.expectEqualStrings("iii", try originMask(arena, got));
+}
+
+test "template: a context built from Zig values with text that is not UTF-8 fails by name before the render reads it" {
+    const Ctx = struct {
+        text: []const u8,
+        fn build(ptr: *const anyopaque, arena: std.mem.Allocator, diag: *Diagnostic) Error!Vars {
+            @setRuntimeSafety(true);
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const msgs = try fromInput(arena, @as([]const []const u8, &.{self.text}), .input, "messages", diag);
+            return .{ .messages = msgs, .extra = try fromInput(arena, .{}, .template, "extra context", diag) };
+        }
+    };
+    for ([_][]const u8{ "ab\xC3", "\xFF", "\x80b", "\xED\xA0\x80", "\xC0\xAF" }) |text| {
+        const ctx = Ctx{ .text = text };
+        var diag = Diagnostic{};
+        var t = try Template.compile(testing.allocator, "{% for c in messages[0] %}{{ c }}{% endfor %}{{ messages[0][::-1] }}", &diag);
+        defer t.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        try testing.expectError(error.TemplateRuntime, t.render(arena.allocator(), .{ .context = .{ .ptr = &ctx, .build = Ctx.build }, .add_generation_prompt = false }, &diag));
+        try testing.expectEqualStrings("the messages are not valid UTF-8", diag.message());
+    }
+}
+
+test "template: a set block, a filter block and a generation body keep their sets to themselves, as Jinja2's inner frames" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_][2][]const u8{
+        .{ "{% set x %}{% set inner = 1 %}{% endset %}[{{ inner }}]", "[]" },
+        .{ "{% filter upper %}{% set q = 1 %}a{% endfilter %}[{{ q }}]", "A[]" },
+        .{ "{% generation %}{% set g = 1 %}G{% endgeneration %}[{{ g }}]", "G[]" },
+        // The body still reads the enclosing scope, and a loop's break still leaves through a set or filter block.
+        .{ "{% set o = 'o' %}{% set x %}{{ o }}{% endset %}{{ x }}", "o" },
+        .{ "{% for i in [1, 2, 3] %}{% filter upper %}{{ i }}{% if i == 2 %}{% break %}{% endif %}{% endfilter %}{% endfor %}", "1" },
+        .{ "{% for i in [1, 2] %}{% set x %}{% if i == 1 %}{% continue %}{% endif %}{{ i }}{% endset %}{{ x }}{% endfor %}", "2" },
+    };
+    for (cases) |c| {
+        var diag = Diagnostic{};
+        const got = renderForTest(a, c[0], "[]", "{}", .{}, &diag) catch |e| {
+            std.debug.print("{s}: {s} {s}\n", .{ c[0], @errorName(e), diag.message() });
+            return e;
+        };
+        try testing.expectEqualStrings(c[1], got);
+    }
+    // A generation body is a call block's: a break in it does not reach an enclosing loop.
+    var diag = Diagnostic{};
+    try testing.expectError(error.TemplateSyntax, renderForTest(a, "{% for i in [1] %}{% generation %}{% break %}{% endgeneration %}{% endfor %}", "[]", "{}", .{}, &diag));
+    try testing.expectEqualStrings("'break' outside a for loop", diag.message());
+}
+
+test "template: a value walk that stops is named for what stopped it: the steps, the nesting, or the types it met" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Two tuples nested 600 deep, equal down to their innermost items (1 and 2).
+    const deep = "{% set ns = namespace(t=1, u=2) %}{% for i in range(600) %}{% set ns.t = (ns.t,) %}{% set ns.u = (ns.u,) %}{% endfor %}{% set t = ns.t %}{% set u = ns.u %}";
+    const nested = std.fmt.comptimePrint("the values nest deeper than {d}", .{value.max_depth});
+    const cases = [_][2][]const u8{
+        .{ deep ++ "{{ {t: 1} }}", nested },
+        .{ deep ++ "{{ {}.get(t) }}", nested },
+        .{ deep ++ "{{ t in {} }}", nested },
+        .{ deep ++ "{{ [u, t]|sort }}", nested },
+        .{ deep ++ "{{ t < u }}", nested },
+        .{ deep ++ "{{ [t, u]|max }}", nested },
+        .{ "{{ [1, 'a']|sort }}", "'<' not supported between instances of 'str' and 'int'" },
+        .{ "{{ 18446744073709551616 is divisibleby 2 }}", "arithmetic on an integer past 64 bits is not supported" },
+    };
+    for (cases) |c| {
+        var diag = Diagnostic{};
+        if (renderForTest(a, c[0], "[]", "{}", .{}, &diag)) |out| {
+            std.debug.print("{s} rendered '{s}'\n", .{ c[0], out });
+            return error.TestUnexpectedResult;
+        } else |e| try testing.expectEqual(error.TemplateRuntime, e);
+        testing.expectEqualStrings(c[1], diag.message()) catch |e| {
+            std.debug.print("{s}\n", .{c[0]});
+            return e;
+        };
+    }
+    var diag = Diagnostic{};
+    try testing.expectEqualStrings("18446744073709551616.0", try renderForTest(a, "{{ '%.1f' % 18446744073709551616 }}", "[]", "{}", .{}, &diag));
+}
+
+test "template: mutated served templates compile and render to a result or a named failure, the same one twice" {
+    const sources = [_][]const u8{
+        @embedFile("../fixtures/qwen38_flash_next_chat_template.jinja"),
+        @embedFile("../fixtures/glm53_chat_template.jinja"),
+        @embedFile("../fixtures/mimo_v26_chat_template.jinja"),
+        @embedFile("../fixtures/dsv41_chat_template.jinja"),
+    };
+    const tokens = [_][]const u8{ "{%", "%}", "{{", "}}", "{#", "#}", "{%-", "-%}", "endif", "endfor", "endmacro", "if ", "for ", " in ", "not ", "(", ")", "'", "\"", "|", "~", ".", "loop", "-", "+", "*", "/", "%", "[", "]", ":", ",", "=", "set ", "macro ", "else", "elif ", "1", "0", "-1", "none", "true", "x", "messages", "raise_exception(", "namespace(", "range(", "|tojson", "|length", "|join", "|map(", ".split(", "[::-1]", "[0]", ".0", "is defined", "is not none", "\\", "\n", " ", "\x00", "é", "{", "}", "#", "loop.index", "caller()", "call ", "endcall", "filter ", "endfilter", "break", "continue", "|sort", "|max", "|unique", " < ", " in {}", "|sum", " % ", "|indent(" };
+    const msgs = [_][]const u8{
+        "[{\"role\": \"system\", \"content\": \"sys\"}, {\"role\": \"user\", \"content\": \"hi <tool_call>\"}, {\"role\": \"assistant\", \"content\": \"<think>a</think>b\", \"reasoning_content\": \"r\", \"tool_calls\": [{\"type\": \"function\", \"id\": \"c1\", \"function\": {\"name\": \"f\", \"arguments\": {\"x\": 1, \"y\": [1.5, \"s\"]}}}]}, {\"role\": \"tool\", \"content\": \"res\", \"tool_call_id\": \"c1\"}, {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"t\"}, {\"type\": \"image\"}]}]",
+        "[{\"role\": \"user\", \"content\": \"\"}]",
+        "[]",
+    };
+    const tools = "[{\"type\": \"function\", \"function\": {\"name\": \"f\", \"description\": \"d\", \"parameters\": {\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"integer\"}}, \"required\": [\"x\"]}}}]";
+    const extra = "{\"enable_thinking\": true, \"reasoning_effort\": \"high\", \"thinking_mode\": 50, \"preserve_thinking\": true, \"bos_token\": \"<s>\", \"eos_token\": \"</s>\"}";
+    var prng = std.Random.DefaultPrng.init(0x7e3);
+    const rand = prng.random();
+    const a = testing.allocator;
+    var runtime_failures: usize = 0;
+    for (0..300) |_| {
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(a);
+        try buf.appendSlice(a, sources[rand.uintLessThan(usize, sources.len)]);
+        for (0..1 + rand.uintLessThan(usize, 4)) |_| {
+            const len = buf.items.len;
+            if (len == 0) break;
+            const at = rand.uintLessThan(usize, len);
+            switch (rand.uintLessThan(u8, 5)) {
+                0 => buf.items.len = at,
+                1 => buf.items[at] = "{}%#-+'\"()[]|.,:~ \n\\_0"[rand.uintLessThan(usize, 22)],
+                2 => try buf.replaceRange(a, at, @min(len, at + 1 + rand.uintLessThan(usize, 64)) - at, ""),
+                3 => {
+                    const piece = try a.dupe(u8, buf.items[at..@min(len, at + 1 + rand.uintLessThan(usize, 200))]);
+                    defer a.free(piece);
+                    try buf.insertSlice(a, rand.uintLessThan(usize, len), piece);
+                },
+                else => try buf.insertSlice(a, at, tokens[rand.uintLessThan(usize, tokens.len)]),
+            }
+        }
+        var diag = Diagnostic{};
+        var t = Template.compile(a, buf.items, &diag) catch |e| {
+            try testing.expectEqual(error.TemplateSyntax, e);
+            try testing.expect(diag.message().len > 0);
+            continue;
+        };
+        defer t.deinit();
+        for (msgs, 0..) |m, mi| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const json = JsonContext{ .messages = m, .tools = if (mi == 0) tools else null, .extra = extra };
+            const limits = Limits{ .max_steps = 2_000_000, .max_memory = 64 << 20, .max_string = 16 << 20 };
+            var d1 = Diagnostic{};
+            var usage = Usage{};
+            value.work = 0;
+            value.work_bytes = 0;
+            const r1 = t.render(arena.allocator(), .{ .context = json.context(), .add_generation_prompt = mi != 1, .limits = limits, .usage = &usage }, &d1);
+            // What the meter charged covers the work done, within a constant.
+            try testing.expect(value.workDone() <= 32 * usage.steps + 1024);
+            var d2 = Diagnostic{};
+            const r2 = t.render(arena.allocator(), .{ .context = json.context(), .add_generation_prompt = mi != 1, .limits = limits }, &d2);
+            if (r1) |x| {
+                try testing.expectEqualStrings(x, try r2);
+                try testing.expect(std.unicode.utf8ValidateSlice(x));
+            } else |e| {
+                try testing.expectError(e, r2);
+                try testing.expectEqualStrings(d1.message(), d2.message());
+                try testing.expect(e == error.TemplateRaised or e == error.TemplateRuntime);
+                if (e == error.TemplateRuntime) {
+                    runtime_failures += 1;
+                    testing.expect(d1.message().len > 0 and !std.mem.eql(u8, d1.message(), "the render failed")) catch |err| {
+                        std.debug.print("an unnamed failure of:\n{s}\n", .{buf.items});
+                        return err;
+                    };
+                }
+            }
+        }
+    }
+    // The corpus reaches the renderer's failures, or it proves nothing about their names.
+    try testing.expect(runtime_failures > 0);
+}
+
+/// The work of rendering `template` over `messages`, against the steps its meter charged: a walk the meter does not
+/// see makes the first outgrow the second.
+fn workWithinSteps(a: std.mem.Allocator, template: []const u8, messages: []const u8) bool {
+    @setRuntimeSafety(true);
+    var diag = Diagnostic{};
+    var usage = Usage{};
+    value.work = 0;
+    value.work_bytes = 0;
+    _ = renderJson(a, .{ .template = template, .messages_json = messages, .tools_json = null, .extra_json = "{}", .add_generation_prompt = false, .usage = &usage }, &diag) catch {};
+    if (value.workDone() <= 32 * usage.steps + 1024) return true;
+    std.debug.print("work {d} against {d} steps: {s}\n", .{ value.workDone(), usage.steps, template });
+    return false;
+}
+
+test "template: the work of a render stays within a constant of the steps its meter charges" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const msgs = "[{\"role\": \"user\", \"content\": \"x\"}]";
+    const cases = [_][]const u8{
+        // A case test walks the whole string each time.
+        "{% set s = 'a' * 100000 %}{% for i in range(300) %}{% if s is lower %}{% endif %}{% endfor %}",
+        // Each probe of a startswith tuple is work.
+        "{% set t = ('b',) * 40000 %}{% for i in range(100) %}{{ 'a'.startswith(t) }}{% endfor %}",
+        // The hash check walks a whole tuple on every `in` against a dict.
+        "{% set t = (1,) * 20000 %}{% for i in range(200) %}{{ t in {} }}{% endfor %}",
+        // Thousands of origin runs, cut a character at a time: a for loop, a slice, split, replace and % format.
+        "{% set s = ([messages[0].content, '|'] * 2000)|join %}{% for c in s %}{% endfor %}",
+        "{% set s = ([messages[0].content, '|'] * 2000)|join %}{{ s[::1]|length }}",
+        "{% set s = ([messages[0].content, ' '] * 2000)|join %}{{ s.split()|length }}",
+        "{% set s = ([messages[0].content, '|'] * 2000)|join %}{{ s.replace('', '-')|length }}",
+        "{% set s = ([messages[0].content, '|'] * 2000)|join %}{{ (s ~ '%%' * 2000) % ()|length }}",
+    };
+    var over: usize = 0;
+    for (cases) |c| over += @intFromBool(!workWithinSteps(a, c, msgs));
+    try testing.expectEqual(@as(usize, 0), over);
 }

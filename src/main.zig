@@ -165,7 +165,8 @@ fn runCli(init: std.process.Init) !void {
         args_list.deinit(allocator);
     }
     while (args_iter.next()) |arg| {
-        try args_list.append(allocator, try allocator.dupe(u8, arg));
+        try args_list.ensureUnusedCapacity(allocator, 1);
+        args_list.appendAssumeCapacity(try allocator.dupe(u8, arg));
     }
     var args: []const []const u8 = args_list.items;
     // Runs after every other defer: an update asked for by /v1/update or the REPL replaces this process only once
@@ -1105,7 +1106,7 @@ fn runCli(init: std.process.Init) !void {
     // Load chat config — heap-allocated, ownership transfers to registry on serve_mode.
     const chat_config = try allocator.create(chat_mod.ChatConfig);
     var chat_config_owned_by_registry = false;
-    chat_config.* = chat_mod.loadChatConfig(io, allocator, model_dir) catch |err| {
+    chat_config.* = chat_mod.loadChatConfig(io, allocator, model_dir, config.model_type) catch |err| {
         // Raw memory only — see the tokenizer catch above.
         allocator.destroy(chat_config);
         return err;
@@ -1274,7 +1275,7 @@ fn runCli(init: std.process.Init) !void {
 
         // Reserved-token suppression, same derivation as the serve path.
         config.mergeTokenizerStops(tok);
-        try tok.bindTemplate(chat_config.printedFacts(), config.eosTokenSlice());
+        try tok.bindTemplate(chat_config.printedFacts(), config.eosTokenSlice(), &.{ config.image_token_id, config.video_token_id });
         try tok.enableSegmentCache(segment_cache_mod.default_budget);
         sampler.installSuppressMask(&xfm, tok);
         generate_mod.installThinkMarkers(&xfm, tok);

@@ -619,7 +619,7 @@ pub fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
 
     const cc = try allocator.create(ChatConfig);
     errdefer allocator.destroy(cc);
-    cc.* = try chat_mod.loadChatConfig(io, allocator, model_dir);
+    cc.* = try chat_mod.loadChatConfig(io, allocator, model_dir, config.model_type);
     errdefer cc.deinit();
 
     // Same EOS-resolution as main.zig — merge the tokenizer's chat-terminator
@@ -1903,7 +1903,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
     // specials): derived per model from tokenizer + template + eos.
     params.config.mergeTokenizerStops(params.tok);
-    try params.tok.bindTemplate(params.chat_config.printedFacts(), params.config.eosTokenSlice());
+    try params.tok.bindTemplate(params.chat_config.printedFacts(), params.config.eosTokenSlice(), &.{ params.config.image_token_id, params.config.video_token_id });
     try params.tok.enableSegmentCache(segment_cache_mod.default_budget);
     sampler.installSuppressMask(xfm_ptr, params.tok);
     generate_mod.installThinkMarkers(xfm_ptr, params.tok);

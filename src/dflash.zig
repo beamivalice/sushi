@@ -487,10 +487,13 @@ pub fn assistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []
             if (bits != 0 and !shipped_packed and isAssistantLinear(key) and shape != null and shape.? == .array and shape.?.array.items.len == 2 and
                 shape.?.array.items[0] == .integer and shape.?.array.items[1] == .integer)
             {
-                const rows: u64 = @intCast(shape.?.array.items[0].integer);
-                const cols: u64 = @intCast(shape.?.array.items[1].integer);
-                if (quantGroupFor(@intCast(cols))) |group| {
-                    out.resident += allocationBytes(rows * cols * bits / 8) + 2 * allocationBytes(rows * (cols / group) * 2);
+                const rows = std.math.cast(u32, shape.?.array.items[0].integer) orelse return error.InvalidSafetensorsHeader;
+                const cols = std.math.cast(u32, shape.?.array.items[1].integer) orelse return error.InvalidSafetensorsHeader;
+                if (quantGroupFor(cols)) |group| {
+                    const r: u64 = rows;
+                    const c: u64 = cols;
+                    const code_bits = std.math.mul(u64, r * c, bits) catch return error.InvalidSafetensorsHeader;
+                    out.resident += allocationBytes(code_bits / 8) + 2 * allocationBytes(r * (c / group) * 2);
                     out.transient += stored;
                     continue;
                 }
@@ -3575,6 +3578,25 @@ test "assistantLoadBytes: a quantizing load bills the packed linears, the dense 
     const dense = try assistantLoadBytes(io, testing.allocator, dir_path, 0);
     try testing.expectEqual(@as(u64, 4194304 + 65536 + g + g), dense.resident);
     try testing.expectEqual(@as(u64, 0), dense.transient);
+}
+
+test "assistantLoadBytes: a linear whose shape is no size fails by name" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "[-1024,2048]", "[4294967296,4294967296]" }) |shape| {
+        const header = try std.fmt.allocPrint(testing.allocator, "{{\"fc.weight\":{{\"dtype\":\"BF16\",\"shape\":{s},\"data_offsets\":[0,64]}}}}", .{shape});
+        defer testing.allocator.free(header);
+        const body = try testing.allocator.alloc(u8, 8 + header.len + 64);
+        defer testing.allocator.free(body);
+        @memset(body, 0);
+        std.mem.writeInt(u64, body[0..8], header.len, .little);
+        @memcpy(body[8 .. 8 + header.len], header);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = body });
+        var path_buf: [512]u8 = undefined;
+        const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+        try testing.expectError(error.InvalidSafetensorsHeader, assistantLoadBytes(io, testing.allocator, dir_path, 8));
+    }
 }
 
 test "assistantLoadBytes: a tiny assistant's bill is never under what its load keeps or peaks at" {

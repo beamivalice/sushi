@@ -2582,7 +2582,7 @@ test "sushi coder load refusals retain named group errors" {
 fn expectSettledAfterEarlyStop(published: u32) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     try tok.id_to_token.put(1, "S");
     var sch: scheduler_mod.Scheduler = undefined;
@@ -2678,7 +2678,7 @@ test "a non-stream early stop inside a speculative block settles the whole block
 
 fn expectNonStreamStopsAt(stop: []const u8, pieces: []const []const u8, stop_token: usize) !void {
     const a = std.testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var ids: [16]u32 = undefined;
     for (pieces, 0..) |p, i| {
@@ -2705,7 +2705,7 @@ test "a non-stream generation ends on the token that completes a stop" {
 
 test "a non-stream generation without a stop in its text runs to the end" {
     const a = std.testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     try tok.id_to_token.put(1, "E");
     try tok.id_to_token.put(2, "N");
@@ -2736,7 +2736,7 @@ test "reasoning usage preserves totals and reports zero" {
 
 test "reasoning usage tokenization ignores SSE boundaries" {
     const a = std.testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();

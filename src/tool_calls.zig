@@ -5214,13 +5214,13 @@ const replay_tools =
     \\[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"},"tags":{"type":"array"}}}}}]
 ;
 
-fn expectReplays(pack: []const u8, cases: []const ReplayCase) !void {
+fn expectReplays(pack: []const u8, model_type: ?[]const u8, cases: []const ReplayCase) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = try @import("test_models.zig").packPath(&buf, pack);
     const a = testing.allocator;
     var tok = tokenizer_mod.loadTokenizer(testing.io, a, dir) catch return error.SkipZigTest;
     defer tok.deinit();
-    var cfg = loadChatConfig(testing.io, a, dir) catch return error.SkipZigTest;
+    var cfg = loadChatConfig(testing.io, a, dir, model_type) catch return error.SkipZigTest;
     defer cfg.deinit();
     for (cases) |c| {
         var r = try replayTurn(a, &tok, &cfg, c.tools, c.thinking, c.raw);
@@ -5241,7 +5241,7 @@ test "qwen4 replay: what the next prompt shares with a generated turn (Flash-Nex
     const call = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.zig\n</parameter>\n</function>\n</tool_call>";
     const call_json = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.zig\n</parameter>\n<parameter=tags>\n[\"a\",\"b\"]\n</parameter>\n<parameter=limit>\n40\n</parameter>\n</function>\n</tool_call>";
     const call_code = "<tool_call>\n<function=write_file>\n<parameter=content>\nconst s = \"a\\nb\"; // <x> & 'y' \\ \xe2\x80\x94 \n\tfn f() void {}\n</parameter>\n</function>\n</tool_call>";
-    try expectReplays("Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", &.{
+    try expectReplays("Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", @import("arch_fixtures_test.zig").qwen_model_type, &.{
         .{ .name = "thinking, tools, content then a call", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\nI will read the file.\n\n" ++ call, .reuse = .whole },
         .{ .name = "thinking, tools, a call alone", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call, .reuse = .whole },
         .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call_json, .reuse = .whole },
@@ -5258,7 +5258,7 @@ test "glm5 replay: what the next prompt shares with a generated turn (GLM-5.3 to
     const reasoning = "The user wants the entry point. I should read src/main.zig first, then look at how the arguments are parsed.";
     const call = "<tool_call>read_file<arg_key>path</arg_key><arg_value>src/main.zig</arg_value></tool_call>";
     const call_json = "<tool_call>read_file<arg_key>path</arg_key><arg_value>src/main.zig</arg_value><arg_key>tags</arg_key><arg_value>[\"a\",\"b\"]</arg_value><arg_key>limit</arg_key><arg_value>40</arg_value></tool_call>";
-    try expectReplays("GLM-5.3-Flash-Sushi-2.4bpw", &.{
+    try expectReplays("GLM-5.3-Flash-Sushi-2.4bpw", @import("arch_fixtures_test.zig").glm_model_type, &.{
         .{ .name = "thinking, tools, content then a call", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>I will read the file." ++ call, .reuse = .whole },
         .{ .name = "thinking, tools, a call alone", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call, .reuse = .whole },
         .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call_json, .reuse = .whole },

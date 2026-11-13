@@ -108,11 +108,15 @@ pub fn sliceQwen(allocator: std.mem.Allocator, io: std.Io, src_dir: std.Io.Dir, 
         defer allocator.free(raw);
         if (override) |o| @memcpy(raw, o) else try src.readRange(loc, 0, raw);
         try builder.add(key, loc.dtype, shape, raw);
-        try names.append(allocator, try allocator.dupe(u8, key));
+        try names.ensureUnusedCapacity(allocator, 1);
+        names.appendAssumeCapacity(try allocator.dupe(u8, key));
         if (builder.size() >= (1 << 30)) {
             const file = try std.fmt.bufPrint(&file_buf, "model-{d:0>5}.safetensors", .{shard_no});
             try builder.flush(io, out, file, &.{.{ "format", "pt" }});
-            for (names.items) |n| try entries.append(allocator, .{ .tensor = n, .file = try allocator.dupe(u8, file) });
+            for (names.items) |n| {
+                try entries.ensureUnusedCapacity(allocator, 1);
+                entries.appendAssumeCapacity(.{ .tensor = n, .file = try allocator.dupe(u8, file) });
+            }
             names.clearRetainingCapacity();
             shard_no += 1;
         }
@@ -120,7 +124,10 @@ pub fn sliceQwen(allocator: std.mem.Allocator, io: std.Io, src_dir: std.Io.Dir, 
     if (builder.count != 0) {
         const file = try std.fmt.bufPrint(&file_buf, "model-{d:0>5}.safetensors", .{shard_no});
         try builder.flush(io, out, file, &.{.{ "format", "pt" }});
-        for (names.items) |n| try entries.append(allocator, .{ .tensor = n, .file = try allocator.dupe(u8, file) });
+        for (names.items) |n| {
+            try entries.ensureUnusedCapacity(allocator, 1);
+            entries.appendAssumeCapacity(.{ .tensor = n, .file = try allocator.dupe(u8, file) });
+        }
         names.clearRetainingCapacity();
     }
     var owned = std.ArrayList(pack.IndexEntry).empty;

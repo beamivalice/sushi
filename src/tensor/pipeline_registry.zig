@@ -100,7 +100,8 @@ var pending_markers: std.ArrayList(Recipe) = .empty;
 var accepted_markers: std.ArrayList(Recipe) = .empty;
 
 pub fn putMarker(r: Recipe) !void {
-    try pending_markers.append(gpa, try dupeRecipe(r));
+    try pending_markers.ensureUnusedCapacity(gpa, 1);
+    pending_markers.appendAssumeCapacity(try dupeRecipe(r));
 }
 
 /// The markers seen are trusted (the manifest's recipes all made), or dropped.

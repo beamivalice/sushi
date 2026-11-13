@@ -117,16 +117,16 @@ fn mainPieces(allocator: std.mem.Allocator, piece: []const u8, words: *std.Array
     var gap: ?usize = null;
     while (i < piece.len) {
         if (matchMain(piece, i)) |end| {
-            if (gap) |g| try words.append(allocator, try allocator.dupe(u8, piece[g..i]));
+            if (gap) |g| try words.append(allocator, piece[g..i]);
             gap = null;
-            try words.append(allocator, try allocator.dupe(u8, piece[i..end]));
+            try words.append(allocator, piece[i..end]);
             i = end;
         } else {
             if (gap == null) gap = i;
             i += (decode(piece, i) orelse break).len;
         }
     }
-    if (gap) |g| try words.append(allocator, try allocator.dupe(u8, piece[g..]));
+    if (gap) |g| try words.append(allocator, piece[g..]);
 }
 
 const Range = struct { start: usize, end: usize };
@@ -184,10 +184,7 @@ const testing = std.testing;
 
 fn expectPieces(input: []const u8, expected: []const []const u8) !void {
     var words: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (words.items) |w| testing.allocator.free(w);
-        words.deinit(testing.allocator);
-    }
+    defer words.deinit(testing.allocator);
     try preTokenize(testing.allocator, input, &words);
     try testing.expectEqual(expected.len, words.items.len);
     for (expected, words.items) |e, a| try testing.expectEqualStrings(e, a);
@@ -217,4 +214,14 @@ test "deepseek pre-tokenizer: digits, CJK and the punctuation grammar split as H
     try expectPieces("if (x == 0) { return -1; }", &.{ "if", " (", "x", " ==", " ", "0", ")", " {", " return", " -", "1", ";", " }" });
     try expectPieces(" \u{3000}x\u{3000} y", &.{ " ", "\u{3000}x", "\u{3000}", " y" });
     try expectPieces("e\u{301}a \u{301}b", &.{ "e\u{301}a", " \u{301}b" });
+}
+
+fn splitAndFree(a: std.mem.Allocator, text: []const u8) !void {
+    var words: std.ArrayList([]const u8) = .empty;
+    defer words.deinit(a);
+    try preTokenize(a, text, &words);
+}
+
+test "deepseek pre-tokenizer: a split that runs out of memory at any allocation frees all it made" {
+    try testing.checkAllAllocationFailures(testing.allocator, splitAndFree, .{"ab 12345 你好世界 abab, tail words: here and there!! again\n\n and again."});
 }

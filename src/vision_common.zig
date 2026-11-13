@@ -766,7 +766,8 @@ pub fn putRandomBf16(allocator: std.mem.Allocator, map: *std.StringHashMap(mlx.m
     defer _ = mlx.mlx_stream_free(cpu);
     try mlx.check(mlx.mlx_astype(&b, f, .bfloat16, cpu));
     try mlx.check(mlx.mlx_array_eval(b));
-    try map.put(try allocator.dupe(u8, name), b);
+    try map.ensureUnusedCapacity(1);
+    map.putAssumeCapacity(try allocator.dupe(u8, name), b);
 }
 
 pub const Gap = struct { cos: f64, max_abs: f64, rel_rms: f64 };

@@ -36,7 +36,7 @@ pub const SegmentCache = struct {
     }
 
     pub fn deinit(self: *SegmentCache) void {
-        self.clear();
+        self.dropAll();
         self.map.deinit(self.gpa);
     }
 
@@ -101,7 +101,14 @@ pub const SegmentCache = struct {
         self.dead = 0;
     }
 
+    /// Forgets every segment, beside threads that are encoding through the cache.
     pub fn clear(self: *SegmentCache) void {
+        const io = self.lock();
+        defer self.mu.unlock(io);
+        self.dropAll();
+    }
+
+    fn dropAll(self: *SegmentCache) void {
         while (self.tail) |node| self.drop(node, false);
     }
 
@@ -279,4 +286,85 @@ test "segment cache: everything it allocates stays within its budget, the map's 
     c.deinit();
     try testing.expectEqual(@as(usize, 0), counting.live);
     try testing.expect(peak <= budget);
+}
+
+/// Fails each allocation and growing remap with odds 1 in `rate` (0: never).
+const RandomFail = struct {
+    child: std.mem.Allocator,
+    rng: std.Random.DefaultPrng,
+    rate: u32 = 0,
+
+    fn allocator(self: *RandomFail) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn fails(self: *RandomFail) bool {
+        return self.rate > 0 and self.rng.random().uintLessThan(u32, self.rate) == 0;
+    }
+    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *RandomFail = @ptrCast(@alignCast(ctx));
+        return if (self.fails()) null else self.child.rawAlloc(len, al, ra);
+    }
+    fn resize(ctx: *anyopaque, mem: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *RandomFail = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(mem, al, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, mem: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *RandomFail = @ptrCast(@alignCast(ctx));
+        if (new_len > mem.len and self.fails()) return null;
+        return self.child.rawRemap(mem, al, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, mem: []u8, al: std.mem.Alignment, ra: usize) void {
+        const self: *RandomFail = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(mem, al, ra);
+    }
+};
+
+/// The list runs both ways, every node is the map's, and the bytes add up within the budget.
+fn expectConsistent(c: *SegmentCache) !void {
+    var n: usize = 0;
+    var bytes_sum: usize = 0;
+    var it = c.head;
+    var prev: ?*SegmentCache.Node = null;
+    while (it) |node| : (it = node.next) {
+        try testing.expect(node.prev == prev);
+        try testing.expect(c.map.get(node.key).? == node);
+        bytes_sum += SegmentCache.cost(node.key.len, node.ids.len);
+        n += 1;
+        prev = node;
+    }
+    try testing.expect(c.tail == prev);
+    try testing.expectEqual(n, c.map.count());
+    try testing.expectEqual(bytes_sum, c.used);
+    try testing.expect(c.used <= c.budget);
+}
+
+test "segment cache: under random allocation failure its list, map, bytes and gauge stay in step" {
+    var fa = RandomFail{ .child = testing.allocator, .rng = .init(42) };
+    const gauge0 = cache_stats.process.snapshot().token_bytes;
+    var c = SegmentCache.init(fa.allocator(), SegmentCache.cost(40, 8) * 64);
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    var key: [40]u8 = undefined;
+    var ids: [8]u32 = undefined;
+    for (0..50_000) |i| {
+        fa.rate = if (i % 1000 < 500) 0 else 3;
+        const k = rnd.uintLessThan(u32, 400);
+        @memset(&key, 'k');
+        _ = std.fmt.bufPrint(&key, "{d}", .{k}) catch unreachable;
+        for (&ids, 0..) |*x, j| x.* = k * 8 + @as(u32, @intCast(j));
+        if (rnd.boolean()) {
+            c.put(&key, &ids) catch {};
+        } else {
+            var out = std.ArrayList(u32).empty;
+            defer out.deinit(fa.allocator());
+            if (c.appendIds(fa.allocator(), &out, &key)) |hit| {
+                if (hit) try testing.expectEqualSlices(u32, &ids, out.items);
+            } else |_| {}
+        }
+        if (i % 97 == 0) try expectConsistent(&c);
+        try testing.expectEqual(@as(u64, c.used), cache_stats.process.snapshot().token_bytes - gauge0);
+    }
+    fa.rate = 0;
+    c.deinit();
+    try testing.expectEqual(gauge0, cache_stats.process.snapshot().token_bytes);
 }

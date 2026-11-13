@@ -191,7 +191,8 @@ pub const Def = struct {
         var attrs: std.ArrayList([]const u8) = .empty;
         for (metal_attributes) |a| {
             if (std.mem.indexOf(u8, source, a[0]) == null) continue;
-            try attrs.append(gpa, try std.fmt.allocPrint(gpa, "  {s} {s} [[{s}]]", .{ a[1], a[0], a[0] }));
+            try attrs.ensureUnusedCapacity(gpa, 1);
+            attrs.appendAssumeCapacity(try std.fmt.allocPrint(gpa, "  {s} {s} [[{s}]]", .{ a[1], a[0], a[0] }));
         }
         d.attributes = try attrs.toOwnedSlice(gpa);
         next_def += 1;
@@ -411,7 +412,8 @@ fn instanceOf(def: *Def, inputs: []const *Tensor, cfg: *const Config) !metal.Pip
     const text = try render(def, name_z, inputs, cfg);
     defer gpa.free(text);
     const pipeline = try core.pipelineFromSource(name_z, text);
-    try def.instances.put(gpa, try gpa.dupe(u8, key_buf.items), pipeline);
+    try def.instances.ensureUnusedCapacity(gpa, 1);
+    def.instances.putAssumeCapacity(try gpa.dupe(u8, key_buf.items), pipeline);
     return pipeline;
 }
 

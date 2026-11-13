@@ -149,6 +149,15 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   ...) whose arguments name a template's source (`chat_template`, `template`, `tmpl`, `tpl`, `template_source`): a
   word in the text may sit in a comment or a comparison, so the server asks the compiled template's facts
   (`chat.asks`). It matches names, not data flow: a copy under another name (`isIncludeStub`'s trimmed `t`) passes.
+  `template-unchecked-utf8` flags `Utf8View.initUnchecked` under `src/template/`: text walks go through the checked
+  `value.codepoints`. `json-unchecked-shape` flags, outside test code (tests, `*_test.zig`, a private fn only tests
+  call), `.object`/`.array`/`.string`/`.integer`/`.float`/`.bool` off `x.?`, `parsed*.value` or a map entry's
+  `value_ptr` with no tag check of that receiver earlier in the fn, and an `@intCast(<expr>.integer)` with no bound
+  on that integer earlier: valid JSON of another shape or range panics (`[]` as a `tokenizer_config.json`). It cannot
+  see a bare read off a `std.json.Value` variable (no Sema).
+  `owned-insert-arg` flags, outside test code, a `try xs.append*/put*/insert*(…)` whose argument makes an owned value
+  (`try a.dupe*(`, `try a.alloc*(`): when the insert fails to grow, that value leaks. Reserve first and insert with
+  `*AssumeCapacity`; an arena's insert goes in the allowlist.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its

@@ -532,7 +532,10 @@ pub fn renderTable(w: *std.Io.Writer, a: std.mem.Allocator, r: Result) !void {
     var header: std.ArrayList([]const u8) = .empty;
     try header.append(a, "rung");
     for (r.arms) |arm| try header.append(a, arm);
-    for (r.arms) |arm| if (!std.mem.eql(u8, arm, r.ref)) try header.append(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ arm, r.ref }));
+    for (r.arms) |arm| if (!std.mem.eql(u8, arm, r.ref)) {
+        try header.ensureUnusedCapacity(a, 1);
+        header.appendAssumeCapacity(try std.fmt.allocPrint(a, "{s}/{s}", .{ arm, r.ref }));
+    };
     const metric_cols = try metricColumns(a, r);
     for (metric_cols) |m| try header.append(a, m.header);
 
@@ -548,7 +551,8 @@ pub fn renderTable(w: *std.Io.Writer, a: std.mem.Allocator, r: Result) !void {
                 try cells.append(a, "");
                 continue;
             };
-            try cells.append(a, if (ref_ns > 0) try std.fmt.allocPrint(a, "{d:.3}", .{stats(c.ns).median / ref_ns}) else "");
+            try cells.ensureUnusedCapacity(a, 1);
+            cells.appendAssumeCapacity(if (ref_ns > 0) try std.fmt.allocPrint(a, "{d:.3}", .{stats(c.ns).median / ref_ns}) else "");
         }
         for (metric_cols) |m| {
             var text: []const u8 = "";
@@ -573,7 +577,8 @@ fn metricColumns(a: std.mem.Allocator, r: Result) ![]const MetricCol {
         } else false;
         if (seen) continue;
         const label = if (std.mem.eql(u8, m.name, m.unit)) m.name else try std.fmt.allocPrint(a, "{s} [{s}]", .{ m.name, m.unit });
-        try cols.append(a, .{ .arm = m.arm, .name = m.name, .header = if (r.arms.len > 1) try std.fmt.allocPrint(a, "{s} {s}", .{ m.arm, label }) else label });
+        try cols.ensureUnusedCapacity(a, 1);
+        cols.appendAssumeCapacity(.{ .arm = m.arm, .name = m.name, .header = if (r.arms.len > 1) try std.fmt.allocPrint(a, "{s} {s}", .{ m.arm, label }) else label });
     }
     return cols.items;
 }
@@ -605,12 +610,14 @@ pub fn compare(w: *std.Io.Writer, a: std.mem.Allocator, x: Result, y: Result) Co
     var body: std.ArrayList([]const []const u8) = .empty;
     for (x.rows) |rx| {
         const ry = rowNamed(y, rx.label) orelse {
-            try dropped.append(a, try std.fmt.allocPrint(a, "rung {s} (only in A)", .{rx.label}));
+            try dropped.ensureUnusedCapacity(a, 1);
+            dropped.appendAssumeCapacity(try std.fmt.allocPrint(a, "rung {s} (only in A)", .{rx.label}));
             continue;
         };
         for (rx.cells) |cx| {
             const cy = y.cell(ry, cx.arm) orelse {
-                try dropped.append(a, try std.fmt.allocPrint(a, "{s} / {s} (only in A)", .{ rx.label, cx.arm }));
+                try dropped.ensureUnusedCapacity(a, 1);
+                dropped.appendAssumeCapacity(try std.fmt.allocPrint(a, "{s} / {s} (only in A)", .{ rx.label, cx.arm }));
                 continue;
             };
             const sx = stats(cx.ns);
@@ -629,7 +636,10 @@ pub fn compare(w: *std.Io.Writer, a: std.mem.Allocator, x: Result, y: Result) Co
         }
     }
     for (y.rows) |ry| {
-        if (rowNamed(x, ry.label) == null) try dropped.append(a, try std.fmt.allocPrint(a, "rung {s} (only in B)", .{ry.label}));
+        if (rowNamed(x, ry.label) == null) {
+            try dropped.ensureUnusedCapacity(a, 1);
+            dropped.appendAssumeCapacity(try std.fmt.allocPrint(a, "rung {s} (only in B)", .{ry.label}));
+        }
     }
     try writeGrid(w, a, &.{ "rung", "arm", "A", "B", "B/A", "~" }, body.items);
     try w.writeAll("~ marks overlapping min-max ranges: the noise call, not a verdict.\n");

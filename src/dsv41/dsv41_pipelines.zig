@@ -267,7 +267,7 @@ const Served = struct {
         errdefer self.weights.deinit();
         self.xfm = try trunk_mod.Trunk.init(io, a, self.config, &self.weights);
         errdefer self.xfm.deinit();
-        self.tok = tokenizer_mod.Tokenizer.initEmptyForTests(a);
+        self.tok = tokenizer_mod.Tokenizer.initEmpty(a);
         dsv41_state.modelOf(&self.xfm).?.engine_decode = true;
         dsv41_borrow.own_override = true;
     }

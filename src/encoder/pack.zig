@@ -178,7 +178,8 @@ pub fn writeQwenTrunk(
         switch (action) {
             .retain_source => {
                 try builder.add(served, loc.dtype, loc.shape, raw);
-                try pending.append(allocator, try allocator.dupe(u8, served));
+                try pending.ensureUnusedCapacity(allocator, 1);
+                pending.appendAssumeCapacity(try allocator.dupe(u8, served));
             },
             .retain_plus_one => {
                 for (0..raw.len / 2) |i| {
@@ -187,11 +188,13 @@ pub fn writeQwenTrunk(
                     std.mem.writeInt(u16, raw[i * 2 ..][0..2], plus, .little);
                 }
                 try builder.add(served, loc.dtype, loc.shape, raw);
-                try pending.append(allocator, try allocator.dupe(u8, served));
+                try pending.ensureUnusedCapacity(allocator, 1);
+                pending.appendAssumeCapacity(try allocator.dupe(u8, served));
             },
             .retain_conv_last => {
                 try builder.add(served, loc.dtype, &.{ loc.shape[0], loc.shape[2], loc.shape[1] }, raw);
-                try pending.append(allocator, try allocator.dupe(u8, served));
+                try pending.ensureUnusedCapacity(allocator, 1);
+                pending.appendAssumeCapacity(try allocator.dupe(u8, served));
             },
             .retain_channels_last => {
                 const moved = try allocator.alloc(u8, raw.len);
@@ -203,7 +206,8 @@ pub fn writeQwenTrunk(
                     @memcpy(moved[((oi * inner + k) * i + ii) * 2 ..][0..2], raw[((oi * i + ii) * inner + k) * 2 ..][0..2]);
                 };
                 try builder.add(served, loc.dtype, &.{ loc.shape[0], loc.shape[2], loc.shape[3], loc.shape[4], loc.shape[1] }, moved);
-                try pending.append(allocator, try allocator.dupe(u8, served));
+                try pending.ensureUnusedCapacity(allocator, 1);
+                pending.appendAssumeCapacity(try allocator.dupe(u8, served));
             },
             .affine => |a| {
                 const rows = loc.shape[0];
@@ -224,7 +228,8 @@ pub fn writeQwenTrunk(
                 for (parts) |part| {
                     const full = try std.fmt.bufPrint(&nm, "{s}{s}", .{ base, part.suffix });
                     try builder.add(full, part.dtype, &.{ rows, part.cols }, part.bytes);
-                    try pending.append(allocator, try allocator.dupe(u8, full));
+                    try pending.ensureUnusedCapacity(allocator, 1);
+                    pending.appendAssumeCapacity(try allocator.dupe(u8, full));
                 }
                 if (a.override_in_config) {
                     const owned = try allocator.dupe(u8, base);
@@ -444,7 +449,10 @@ pub fn copySidecars(allocator: std.mem.Allocator, io: std.Io, src_dir: std.Io.Di
     }
     var it = src_dir.iterate();
     while (try it.next(io)) |entry| {
-        if (sidecarWanted(entry.name, entry.kind)) try names.append(allocator, try allocator.dupe(u8, entry.name));
+        if (sidecarWanted(entry.name, entry.kind)) {
+            try names.ensureUnusedCapacity(allocator, 1);
+            names.appendAssumeCapacity(try allocator.dupe(u8, entry.name));
+        }
     }
     for (names.items) |n| try src_dir.copyFile(n, out_dir, n, io, .{});
     return names.items.len;

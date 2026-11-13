@@ -1509,10 +1509,10 @@ test "tokenize cache keyFor: a media part's position keys the render, its pixels
     const with_b = [_]chat_mod.Message{.{ .role = "user", .content = "what's in this?", .images = &b, .media_parts = &lead }};
     const moved = [_]chat_mod.Message{.{ .role = "user", .content = "what's in this?", .images = &a, .media_parts = &tail }};
     const text = [_]chat_mod.Message{.{ .role = "user", .content = "what's in this?" }};
-    const k_a = tokenize_cache_mod.TokenizeCache.keyFor(&with_a, null, null, false, null, false, null).?;
-    try std.testing.expectEqual(k_a, tokenize_cache_mod.TokenizeCache.keyFor(&with_b, null, null, false, null, false, null).?);
-    try std.testing.expect(k_a != tokenize_cache_mod.TokenizeCache.keyFor(&moved, null, null, false, null, false, null).?);
-    try std.testing.expect(k_a != tokenize_cache_mod.TokenizeCache.keyFor(&text, null, null, false, null, false, null).?);
+    const k_a = (try tokenize_cache_mod.testKey(&with_a, null, null, false, null, false, null));
+    try std.testing.expectEqual(k_a, (try tokenize_cache_mod.testKey(&with_b, null, null, false, null, false, null)));
+    try std.testing.expect(k_a != (try tokenize_cache_mod.testKey(&moved, null, null, false, null, false, null)));
+    try std.testing.expect(k_a != (try tokenize_cache_mod.testKey(&text, null, null, false, null, false, null)));
 }
 
 fn testGridImage(grid_h: u32, grid_w: u32, pixels: []const u8) chat_mod.ImageData {
@@ -1763,7 +1763,7 @@ test "GLM vision serving processor carries image and video token budgets without
     const counts = countMediaPlaceholders(&ids, &cfg);
     try std.testing.expectEqual(@as(usize, 1), counts.images);
     try std.testing.expectEqual(@as(usize, 1), counts.videos);
-    var tok = Tokenizer.initEmptyForTests(std.testing.allocator);
+    var tok = Tokenizer.initEmpty(std.testing.allocator);
     defer tok.deinit();
     try tok.special_tokens.put(try std.testing.allocator.dupe(u8, "0.0 seconds"), 1000);
     try tok.special_tokens.put(try std.testing.allocator.dupe(u8, "1.0 seconds"), 1001);

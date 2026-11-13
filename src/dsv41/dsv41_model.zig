@@ -582,7 +582,8 @@ pub const Trace = struct {
         var o = mlx.mlx_array_new();
         _ = mlx.mlx_array_set(&o, x);
         errdefer _ = mlx.mlx_array_free(o);
-        try self.items.append(self.gpa, .{ .name = try std.fmt.allocPrint(self.gpa, fmt, args), .arr = o });
+        try self.items.ensureUnusedCapacity(self.gpa, 1);
+        self.items.appendAssumeCapacity(.{ .name = try std.fmt.allocPrint(self.gpa, fmt, args), .arr = o });
     }
 
     pub fn get(self: *const Trace, name: []const u8) ?A {

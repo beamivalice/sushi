@@ -29,6 +29,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   write that special inside a turn; in other input, or put together from two origins, it is text, and text is never
   split where its origin changes. A file read into Claude Code quoting `<think>`/`<|im_end|>` otherwise read as a real
   turn or thought boundary. The text itself is unchanged: a template reads what the client sent, U+FDD0 included.
+  At each byte the scan takes the longest special recognised there, so a longer one that is not (it straddles two
+  origins) hides neither a shorter one at its start nor one that starts inside it. An empty added token fails the load.
+  A media placeholder (`image_token_id`, `video_token_id`) is placed by the media path alone: the sampler masks it and
+  an assistant turn's text of it is text (`bindTemplate`); the template's own stays its token.
 - **Assistant text**: the model's earlier output, so a special it can write stays its token and the next prompt holds
   the ids it generated. A stop (eos, an arch's turn opener) and a special the sampler masks are text there: the model
   never writes either inside a turn. `Tokenizer.bindTemplate` derives both sets once per load from the flagged
@@ -59,7 +63,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   maps the client's effort word per template dialect (scale: `thinking_mode`, a 1-100 ladder; ladder: the literal
   `'xhigh'`, xhigh|medium|low; word: `effective_reasoning_effort` with `[gMASK]<sop>`, the word as sent; any other gets
   high/no_think). An arch brings only what a template cannot say: a template it pins when the checkpoint's cannot be
-  parsed by the engine (`pin` in its `<arch>_chat.zig`, read by `loadChatConfig` from the model type in `config.json`;
+  parsed by the engine (`pin` in its `<arch>_chat.zig`, chosen by `loadChatConfig` from the model type the load already parsed, config.json's one reader;
   DeepSeek-V4.1's, with its image atom), and a pre-tokenizer spelling (`pretokenizer`, read by the tokenizer). See
   [engine-arch-seam](engine-arch-seam.md).
 
@@ -78,10 +82,22 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   jinja.cpp leniency (a list mutator but `append`, `|length` of a `map` result) fails at render, both with the failed
   render's handling below. Limits, each a `TemplateRuntime` by name: 200 levels of nesting (a link of `a + b + c` or
   `x|f|g` counts), 100 macro calls deep, 20M steps, a 256 MiB string, 1 GiB of render memory, a `range` of 100000.
+  A value walk that stops says why through its meter (`Meter.why`: the steps, values nested past 512, the two types
+  `<` met, a NaN in a sort, a value Python prints by address or JSON cannot hold), and `Renderer.named` gives it its
+  message wherever it surfaces; a test over mutated served templates requires a message on every `TemplateRuntime`.
+  Work the meter does not see is a bug: every walk of values or bytes ticks it (a case test, each `startswith`
+  probe, the hash check, `originIn`, a value or piece made per code point or item), a string slice walks only the
+  code points it picks, and `Builder.appendPart` finds its first origin run by binary search. Test builds count the
+  work where it is done (`value.work`); a test holds it within 32 steps per step charged, plus 1024, over the hunt's
+  adversarial shapes and the mutation corpus.
   Every fn there opens with `@setRuntimeSafety(true)` (lint `template-runtime-safety`): template text comes from packs.
+  Text enters as UTF-8 or not at all: JSON input is checked by its parser, a context built from Zig values by
+  `template.fromInput` (`the messages are not valid UTF-8`), and every walk of text reads code points with
+  `value.codepoints` (lint `template-unchecked-utf8`). `chat.zig` mends a request's text to U+FFFD (`utf8Text`)
+  wherever it writes it outside the engine: a continuation's partial, once, and every field of the ChatML fallback.
   Work is metered by what it touches (a comparison or a search by its bytes), and searches and sorts are linear or
   n log n whatever the text: `value.Finder` (KMP), `value.stableSort`, which a NaN key fails by name (lint
-  `template-superlinear-std`). The continuation search in `chat.zig` uses the same finder. A loop over `range(...)` is
+  `template-superlinear-std`). A loop over `range(...)` is
   lazy and a loop pays per item walked, as Python's: GLM-5.3 scans `range(i, messages|length)` per tool block and
   breaks at once. The limits hold a 4,000-turn, 7.7 MB conversation on every served template under a quarter of each
   (test "the largest served conversation"); a raise longer than the 1 KiB Diagnostic is cut at a character and never
@@ -130,9 +146,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   regenerated (`SUSHI_TEMPLATE_ORACLE_DUMP`, then the dumper's `render`). The builtin table
   (`src/fixtures/template_builtins.json`, the dumper's `builtins`) holds one case or more per name the engine serves;
   a name without one fails by name.
+- **Where the engine differs from Python Jinja2 on purpose** (beside `builtin_differences`, which lists fixture cases):
+  the context's JSON reader (`value.fromJson`) refuses `NaN` and `Infinity`, which Python's json reads (a request body
+  that holds them is not JSON); a filter Python makes a generator (`map`, `select`, `items`) is evaluated where it is
+  applied, so an error Python defers to the first read is raised there; Jinja2's `missing` sentinel, which leaks from
+  a macro defined in a loop and called after it, is not copied.
 - **A loop iteration is its own scope, as in Jinja2**: a body `set` (GLM-5.3's per-message `reasoning_content`)
   neither reaches the next iteration nor leaves the loop (nor does one in the loop's `else`); only a `namespace`
-  carries state across. One shared scope
+  carries state across. A set block, a filter block and a `generation` body are scopes too, and a `break` crosses
+  only the first two (`ast.bodyOf`, read by the renderer and by the parser). One shared scope
   rendered an earlier turn's thought into a reasoning-less assistant turn instead of `<think></think>`.
 - **A `chat_template` value can be a POINTER** (`{% include 'chat_template.jinja' %}`): `chat.isIncludeStub` reads it
   as "no inline template" so the sidecar loads. Grep the log for `jinja` first.
@@ -163,6 +185,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **A continuation is the template's own rendering of the partial turn**, cut after its text (transformers'
   `continue_final_message` rule): `<think>\n\n</think>\n\n` on Qwen3.8, `<think></think>` on MiMo, thinking on or off.
   The thinking-on prompt plus a bare closer gave `<think>\n</think>` and no block at all; it is only the fallback now.
+- **A rewrite after the render reads byte origins, never bare bytes**: the continuation is cut where the partial turn's
+  assistant bytes end, which must end with its text (else the fallback: a search found it in the user's turn); a
+  doubled `</think></think>` collapses, and a think opener is closed, only where the template wrote it.
 - **Assistant-history reasoning round-trips** (`Message.reasoning_content`, OMITTED when absent). A contract COMMENT
   is read as a spec — pin it with a test.
 
@@ -217,9 +242,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   delimiter when one is named. For `required` the name is then one of the DECLARED names (each with its delimiter, as
   ids: a lone continuation is committed, a branch is a sample among its ids), since the model wrote `getTime` and
   `call: get_time` there. The arguments stay the model's; the parse chain and its valid-JSON invariant run unchanged.
-- **They are also prompt-level**: the instruction closes the last user turn (or opens one after tool results), so every
-  byte before the last message stays and the prefix cache still serves it; the generic fallback inlines it with the
-  tools. A continuation keeps the client's prefill: no instruction, no force.
+- **They are also prompt-level**: the instruction closes the last user turn (or opens one after tool results), only
+  where the render keeps every byte it has without it (`keepsEveryByte`), so the prefix cache still serves it; Qwen3.8
+  with `preserve_thinking` off drops the in-flight reasoning once a user turn follows, so there the force stands alone.
+  The generic fallback inlines it with the tools. A continuation keeps the client's prefill: no instruction, no force.
+- **A server-made turn is `Message.derive`**: every field carried and media offsets moved with the text, so a rewritten
+  tool result keeps its image. The system fold moves no media: a placeholder moved ahead of earlier images would show
+  the wrong image, so a folded turn's image fails the request on the count check instead.
 - **A forced call does not skip the thought**: it runs free (under any reasoning budget) and the call takes the
   position after the closer; a closed-thought prompt takes it at token 0. Where the template leaves the opener to the
   model (MiMo), the opener is committed at token 0, as a prompt-opened block would be. A thought that ends the turn

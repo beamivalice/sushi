@@ -1,4 +1,5 @@
 //! The template tree. Every node keeps its source offset, for the line and column of an error.
+const std = @import("std");
 const builtins = @import("builtins.zig");
 
 pub const Expr = struct {
@@ -55,11 +56,23 @@ pub const Macro = struct {
 /// `caller`, `varargs` and `kwargs` read by a macro body (a macro nested in it included).
 pub const Specials = struct { caller: bool = false, varargs: bool = false, kwargs: bool = false };
 
-/// A name, a tuple of names, or a namespace attribute (`ns.x`, in `set` only).
+/// A name, a tuple of targets (`a, (b, c)`), or a namespace attribute (`ns.x`, in `set` only).
 pub const Target = union(enum) {
     name: []const u8,
-    names: []const []const u8,
+    tuple: []const Target,
     attr: struct { namespace: []const u8, name: []const u8 },
+
+    /// Whether the target stores into `name`.
+    pub fn binds(self: Target, name: []const u8) bool {
+        @setRuntimeSafety(true);
+        return switch (self) {
+            .name => |n| std.mem.eql(u8, n, name),
+            .tuple => |ts| for (ts) |t| {
+                if (t.binds(name)) break true;
+            } else false,
+            .attr => false,
+        };
+    }
 };
 
 pub const Node = struct {
@@ -82,6 +95,21 @@ pub const Node = struct {
         continue_,
     };
 };
+
+/// How a block's body stands to the frame around it, as Jinja2 compiles it: `inline_` runs in that frame (an `if`);
+/// `scope` gets a frame of its own, so its `set`s stay in it, while a `break` still leaves the enclosing loop (a set
+/// block, a filter block, a for loop's body); `call` is a macro body as well, which no `break` crosses (a macro, a
+/// call block's caller, transformers' `generation`, itself a call block).
+pub const Body = enum { inline_, scope, call };
+
+pub fn bodyOf(kind: std.meta.Tag(Node.Kind)) Body {
+    @setRuntimeSafety(true);
+    return switch (kind) {
+        .set_block, .filter_block, .for_ => .scope,
+        .macro, .call_block, .generation => .call,
+        else => .inline_,
+    };
+}
 
 pub const Branch = struct {
     test_: *const Expr,

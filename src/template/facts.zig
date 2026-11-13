@@ -109,13 +109,7 @@ fn bindsInMacro(m: *const ast.Macro) bool {
 
 fn targetBinds(t: ast.Target) bool {
     @setRuntimeSafety(true);
-    return switch (t) {
-        .name => |n| std.mem.eql(u8, n, "raise_exception"),
-        .names => |ns| for (ns) |n| {
-            if (std.mem.eql(u8, n, "raise_exception")) break true;
-        } else false,
-        .attr => false,
-    };
+    return t.binds("raise_exception");
 }
 
 const Walker = struct {

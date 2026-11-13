@@ -12,14 +12,48 @@ pub const Failure = error{ TemplateRuntime, TemplateRaised, OutOfMemory };
 
 /// The work a render may do, shared by everything that walks values: a statement, an iteration, a call, an item
 /// visited, a pair compared or 64 bytes scanned is one step. Past `max` a step fails with `TemplateRuntime`.
+/// It is also where a walk says why it stopped: a walk returns a bare `TemplateRuntime` after `fail`, and the renderer
+/// names it from `why` (`Renderer.named`).
 pub const Meter = struct {
     used: u64 = 0,
     max: u64 = std.math.maxInt(u64),
+    why: ?Why = null,
+
+    pub const Why = union(enum) {
+        steps,
+        depth,
+        /// Python's TypeError for `<` between values of these two types.
+        order: [2][]const u8,
+        /// A NaN met by a sort, whose order Python leaves to its algorithm.
+        nan,
+        /// A value of this type Python prints with its address.
+        print: []const u8,
+        /// A value of this type JSON cannot hold.
+        json: []const u8,
+        /// Text past the render's string limit.
+        text,
+        /// A range whose bounds pass what i128 holds.
+        range,
+    };
 
     pub fn tick(self: *Meter, n: u64) Failure!void {
         @setRuntimeSafety(true);
         self.used +|= n;
-        if (self.used > self.max) return error.TemplateRuntime;
+        if (self.used > self.max) return self.fail(.steps);
+    }
+
+    /// Records why the walk stops, unless an earlier stop is not yet named.
+    pub fn fail(self: *Meter, why: Why) Failure {
+        @setRuntimeSafety(true);
+        if (self.why == null) self.why = why;
+        return error.TemplateRuntime;
+    }
+
+    /// Why the last walk stopped, cleared.
+    pub fn take(self: *Meter) ?Why {
+        @setRuntimeSafety(true);
+        defer self.why = null;
+        return self.why;
     }
 
     pub fn spent(self: *const Meter) bool {
@@ -27,6 +61,23 @@ pub const Meter = struct {
         return self.used > self.max;
     }
 };
+
+/// Test builds only: the work the walks did, in the meter's units (a value, an origin run or a code point visited, 64
+/// bytes read), counted where it is done, so a test can hold it to the steps the meter charged.
+pub threadlocal var work: u64 = 0;
+/// Test builds only: bytes read a code point at a time, 64 of them one unit of `work`.
+pub threadlocal var work_bytes: u64 = 0;
+
+pub inline fn spend(n: u64) void {
+    @setRuntimeSafety(true);
+    if (builtin.is_test) work +|= n;
+}
+
+/// Test builds only: the work done since both counters were zeroed.
+pub fn workDone() u64 {
+    @setRuntimeSafety(true);
+    return work +| work_bytes / 64;
+}
 
 /// Who wrote a string's bytes, from least to most guarded: the template's own text, an assistant message (the model's
 /// earlier output), any other text a request brings. The tokenizer reads a special token's text as that token only
@@ -68,6 +119,34 @@ pub const Str = struct {
         return .{ .bytes = bytes, .origin = self.origin, .runs = self.runs };
     }
 
+    /// The one origin of bytes `a..b`, or null when more than one wrote them.
+    pub fn originOf(self: Str, a: usize, b: usize) ?Origin {
+        @setRuntimeSafety(true);
+        if (self.runs.len == 0) return self.origin;
+        var found: ?Origin = null;
+        var start: usize = 0;
+        for (self.runs) |r| {
+            defer start = r.end;
+            if (r.end <= a or start >= b) continue;
+            if (found) |f| if (f != r.origin) return null;
+            found = r.origin;
+        }
+        return found orelse self.origin;
+    }
+
+    /// The end of the last byte `origin` wrote, or null when it wrote none.
+    pub fn lastEnd(self: Str, origin: Origin) ?usize {
+        @setRuntimeSafety(true);
+        if (self.runs.len == 0) return if (self.origin == origin and self.bytes.len > 0) self.bytes.len else null;
+        var i = self.runs.len;
+        while (i > 0) {
+            i -= 1;
+            const start = if (i == 0) 0 else self.runs[i - 1].end;
+            if (self.runs[i].origin == origin and self.runs[i].end > start) return self.runs[i].end;
+        }
+        return null;
+    }
+
     /// `bytes` made from these by a change with no byte-for-byte map: every byte takes their strictest origin.
     pub fn derive(self: Str, bytes: []const u8) Str {
         @setRuntimeSafety(true);
@@ -89,14 +168,22 @@ pub const Builder = struct {
     pub fn appendPart(self: *Builder, gpa: Allocator, piece: Str, a: usize, b: usize) error{OutOfMemory}!void {
         @setRuntimeSafety(true);
         if (a >= b) return;
+        spend((b - a) / 64 + 1);
         try self.bytes.appendSlice(gpa, piece.bytes[a..b]);
         if (piece.runs.len == 0) return self.mark(gpa, piece.origin);
         const base = self.bytes.items.len - (b - a);
-        var start: usize = 0;
-        for (piece.runs) |run| {
-            if (run.end > a and start < b) try self.markTo(gpa, base + @min(run.end, b) - a, run.origin);
-            start = run.end;
-            if (start >= b) break;
+        // The first run ending past `a`, by binary search: a string cut a character at a time must not rescan its runs.
+        var lo: usize = 0;
+        var hi: usize = piece.runs.len;
+        while (lo < hi) {
+            spend(1);
+            const mid = lo + (hi - lo) / 2;
+            if (piece.runs[mid].end > a) hi = mid else lo = mid + 1;
+        }
+        for (piece.runs[lo..]) |run| {
+            spend(1);
+            try self.markTo(gpa, base + @min(run.end, b) - a, run.origin);
+            if (run.end >= b) break;
         }
     }
 
@@ -139,6 +226,28 @@ pub const Builder = struct {
         return .{ .bytes = self.bytes.items, .origin = o, .runs = runs };
     }
 };
+
+/// The code points of `bytes`, each as its byte slice. Text the engine holds is valid UTF-8 (the template is checked
+/// when it compiles, its input at the door); the walk still never reads past the end, a bad byte being a slice of one.
+pub const Codepoints = struct {
+    bytes: []const u8,
+    i: usize = 0,
+
+    pub fn nextCodepointSlice(self: *Codepoints) ?[]const u8 {
+        @setRuntimeSafety(true);
+        if (self.i >= self.bytes.len) return null;
+        const want = std.unicode.utf8ByteSequenceLength(self.bytes[self.i]) catch 1;
+        const n = @min(want, self.bytes.len - self.i);
+        if (builtin.is_test) work_bytes +|= n;
+        defer self.i += n;
+        return self.bytes[self.i..][0..n];
+    }
+};
+
+pub fn codepoints(bytes: []const u8) Codepoints {
+    @setRuntimeSafety(true);
+    return .{ .bytes = bytes };
+}
 
 pub const Value = union(enum) {
     /// Jinja2's `Undefined`; the name looked up, for the message when it is used.
@@ -314,10 +423,10 @@ pub const Loop = struct {
 
 pub const max_depth = 512;
 
-fn depthCheck(depth: usize) Failure!void {
+fn depthCheck(m: *Meter, depth: usize) Failure!void {
     @setRuntimeSafety(true);
     noteStack();
-    if (depth > max_depth) return error.TemplateRuntime;
+    if (depth > max_depth) return m.fail(.depth);
 }
 
 /// Test builds only: the lowest frame address a render reached on this thread, for the stack-depth test.
@@ -342,7 +451,8 @@ fn numberOf(v: Value) ?union(enum) { int: i64, float: f64, big: []const u8 } {
 /// Python `==`.
 pub fn eql(m: *Meter, a: Value, b: Value, depth: usize) Failure!bool {
     @setRuntimeSafety(true);
-    try depthCheck(depth);
+    try depthCheck(m, depth);
+    spend(1);
     try m.tick(1);
     if (numberOf(a)) |x| {
         const y = numberOf(b) orelse return false;
@@ -425,6 +535,7 @@ pub const Finder = struct {
 
     pub fn init(gpa: Allocator, needle: []const u8, last: bool) error{OutOfMemory}!Finder {
         @setRuntimeSafety(true);
+        spend(needle.len / 64 + 1);
         const f = Finder{ .needle = needle, .border = try gpa.alloc(usize, needle.len), .last = last };
         if (needle.len == 0) return f;
         f.border[0] = 0;
@@ -451,6 +562,7 @@ pub const Finder = struct {
     pub fn find(self: Finder, hay: []const u8, scanned: *usize) ?usize {
         @setRuntimeSafety(true);
         const m = self.needle.len;
+        defer spend(scanned.* / 64 + 1);
         if (m == 0) {
             scanned.* = 0;
             return if (self.last) hay.len else 0;
@@ -475,6 +587,7 @@ pub fn strEql(m: *Meter, s: []const u8, t: []const u8) Failure!bool {
     @setRuntimeSafety(true);
     if (s.len != t.len) return false;
     const diff = std.mem.indexOfDiff(u8, s, t);
+    spend((diff orelse s.len) / 64);
     try m.tick((diff orelse s.len) / 64);
     return diff == null;
 }
@@ -483,14 +596,15 @@ pub fn strEql(m: *Meter, s: []const u8, t: []const u8) Failure!bool {
 /// all answer false); a pair Python refuses to order is a runtime error.
 pub fn order(m: *Meter, a: Value, b: Value, depth: usize) Failure!?std.math.Order {
     @setRuntimeSafety(true);
-    try depthCheck(depth);
+    try depthCheck(m, depth);
+    spend(1);
     try m.tick(1);
     if (numberOf(a)) |x| {
-        const y = numberOf(b) orelse return error.TemplateRuntime;
+        const y = numberOf(b) orelse return m.fail(.{ .order = .{ typeName(a), typeName(b) } });
         return orderNumbers(x, y);
     }
     if (a.str()) |s| {
-        const t = b.str() orelse return error.TemplateRuntime;
+        const t = b.str() orelse return m.fail(.{ .order = .{ typeName(a), typeName(b) } });
         try m.tick((std.mem.indexOfDiff(u8, s, t) orelse @min(s.len, t.len)) / 64);
         return std.mem.order(u8, s, t);
     }
@@ -502,7 +616,7 @@ pub fn order(m: *Meter, a: Value, b: Value, depth: usize) Failure!?std.math.Orde
         }
         return std.math.order(xs.len, ys.len);
     }
-    return error.TemplateRuntime;
+    return m.fail(.{ .order = .{ typeName(a), typeName(b) } });
 }
 
 const Number = @typeInfo(@typeInfo(@TypeOf(numberOf)).@"fn".return_type.?).optional.child;
@@ -600,18 +714,14 @@ fn orderIntFloat(i: i64, f: f64) ?std.math.Order {
     return if (f > t) .lt else if (f < t) .gt else .eq;
 }
 
-/// Python's `<` for `stableSort`: an unordered pair (a NaN) is a failure the caller names, since the order
+/// Python's `<` for `stableSort`: an unordered pair (a NaN) is a failure (`Meter.Why.nan`), since the order
 /// Python gives such keys depends on its sort algorithm.
 pub const SortContext = struct {
     meter: *Meter,
-    unordered: bool = false,
 
     pub fn less(self: *SortContext, a: Value, b: Value) Failure!bool {
         @setRuntimeSafety(true);
-        const o = try order(self.meter, a, b, 0) orelse {
-            self.unordered = true;
-            return error.TemplateRuntime;
-        };
+        const o = try order(self.meter, a, b, 0) orelse return self.meter.fail(.nan);
         return o == .lt;
     }
 };
@@ -695,15 +805,17 @@ pub fn typeName(v: Value) []const u8 {
 
 /// The type Python refuses to hash in `v` (a list, a dict, a set-like view, or one inside a tuple); null when
 /// Python hashes it. A dict key, an `in` against a dict and `unique` need it.
-pub fn unhashable(v: Value, depth: usize) ?[]const u8 {
+pub fn unhashable(m: *Meter, v: Value, depth: usize) Failure!?[]const u8 {
     @setRuntimeSafety(true);
-    if (depth > max_depth) return null;
+    try depthCheck(m, depth);
+    spend(1);
+    try m.tick(1);
     return switch (v) {
         .dict => "dict",
         .list => |l| switch (l.kind) {
             .list, .dict_keys, .dict_items => @tagName(l.kind),
             .tuple => for (l.items.items) |x| {
-                if (unhashable(x, depth + 1)) |t| break t;
+                if (try unhashable(m, x, depth + 1)) |t| break t;
             } else null,
             else => null,
         },
@@ -711,37 +823,20 @@ pub fn unhashable(v: Value, depth: usize) ?[]const u8 {
     };
 }
 
-/// The first value inside `v` Python prints with its address (a generator or an iterator), which the
-/// engine cannot print; null when there is none within the value depth limit.
-pub fn unprintable(v: Value, depth: usize) ?[]const u8 {
-    @setRuntimeSafety(true);
-    if (depth > max_depth) return null;
-    switch (v) {
-        .list => |l| {
-            if (l.isIterator()) return @tagName(l.kind);
-            for (l.items.items) |x| if (unprintable(x, depth + 1)) |k| return k;
-        },
-        .dict, .namespace => |d| for (d.entries.items) |e| {
-            if (unprintable(e.key, depth + 1)) |k| return k;
-            if (unprintable(e.value, depth + 1)) |k| return k;
-        },
-        else => {},
-    }
-    return null;
-}
-
 /// The strictest origin of a string in `v`, keys included: what text printed from it takes.
-pub fn originIn(v: Value, depth: usize) Origin {
+pub fn originIn(m: *Meter, v: Value, depth: usize) Failure!Origin {
     @setRuntimeSafety(true);
     if (depth > max_depth) return .input;
+    spend(1);
+    try m.tick(1);
     var o: Origin = .template;
     switch (v) {
         .string, .markup => |s| return s.origin,
         .list => |l| for (l.items.items) |x| {
-            o = o.strictest(originIn(x, depth + 1));
+            o = o.strictest(try originIn(m, x, depth + 1));
         },
         .dict, .namespace => |d| for (d.entries.items) |e| {
-            o = o.strictest(originIn(e.key, depth + 1)).strictest(originIn(e.value, depth + 1));
+            o = o.strictest(try originIn(m, e.key, depth + 1)).strictest(try originIn(m, e.value, depth + 1));
         },
         else => {},
     }
@@ -761,7 +856,8 @@ pub fn writeStr(m: *Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, dept
 /// Python `repr(v)`.
 pub fn writeRepr(m: *Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, depth: usize) Failure!void {
     @setRuntimeSafety(true);
-    try depthCheck(depth);
+    try depthCheck(m, depth);
+    spend(1);
     try m.tick(1);
     switch (v) {
         .undefined => try w.appendSlice(gpa, "Undefined"),
@@ -770,8 +866,12 @@ pub fn writeRepr(m: *Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, dep
         .int => |i| try w.print(gpa, "{d}", .{i}),
         .bigint => |t| try w.appendSlice(gpa, t),
         .float => |f| try pyfloat.writeFloatRepr(w, gpa, f),
-        .string => |s| try writeStrRepr(w, gpa, s.bytes),
+        .string => |s| {
+            try m.tick(s.bytes.len / 64);
+            try writeStrRepr(w, gpa, s.bytes);
+        },
         .markup => |s| {
+            try m.tick(s.bytes.len / 64);
             try w.appendSlice(gpa, "Markup(");
             try writeStrRepr(w, gpa, s.bytes);
             try w.append(gpa, ')');
@@ -782,13 +882,13 @@ pub fn writeRepr(m: *Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, dep
                 .list, .tuple => {},
                 .dict_keys, .dict_values, .dict_items => try w.print(gpa, "{s}([", .{@tagName(l.kind)}),
                 .range => {
-                    const b = (l.bounds orelse return error.TemplateRuntime).*;
+                    const b = (l.bounds orelse return m.fail(.range)).*;
                     try w.print(gpa, "range({d}, {d}", .{ b[0], b[1] });
                     if (b[2] != 1) try w.print(gpa, ", {d}", .{b[2]});
                     return w.append(gpa, ')');
                 },
                 // Python prints these with their address.
-                .generator, .list_reverseiterator => return error.TemplateRuntime,
+                .generator, .list_reverseiterator => return m.fail(.{ .print = @tagName(l.kind) }),
             }
             if (l.kind != .list and !tuple) {
                 try writeItems(m, w, gpa, l.items.items, depth);
@@ -805,9 +905,9 @@ pub fn writeRepr(m: *Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, dep
             try writeDictRepr(m, w, gpa, d, depth);
             try w.append(gpa, '>');
         },
-        .macro => |mac| try w.print(gpa, "<Macro '{s}'>", .{mac.node.name}),
-        .function => try w.appendSlice(gpa, "<built-in function>"),
-        .loop => |l| try w.print(gpa, "<LoopContext {d}/{d}>", .{ l.index0 + 1, l.items.len }),
+        .macro => |mac| if (mac.is_caller) try w.appendSlice(gpa, "<Macro anonymous>") else try w.print(gpa, "<Macro '{s}'>", .{mac.node.name}),
+        .function => return m.fail(.{ .print = "function" }),
+        .loop => |l| try w.print(gpa, "<LoopContext {d}/{d}>", .{ l.index0 + 1, l.len() }),
     }
 }
 
@@ -836,7 +936,7 @@ fn writeStrRepr(w: *std.ArrayList(u8), gpa: Allocator, s: []const u8) Failure!vo
     @setRuntimeSafety(true);
     const quote: u8 = if (std.mem.indexOfScalar(u8, s, '\'') != null and std.mem.indexOfScalar(u8, s, '"') == null) '"' else '\'';
     try w.append(gpa, quote);
-    var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+    var it = codepoints(s);
     while (it.nextCodepointSlice()) |cs| {
         const cp = std.unicode.utf8Decode(cs) catch 0xFFFD;
         switch (cp) {
@@ -931,13 +1031,14 @@ fn convert(arena: Allocator, j: std.json.Value, origin: Origin, depth: usize) Js
 /// order with a null optional left out, as an absent JSON key; a slice is a list, a `[]const u8` a string, a tagged
 /// union its payload's value (a void payload `none`), an enum its tag's name, a `Value` itself, and a type with a
 /// `templateValue()` what that returns (a value parsed from text the caller keeps). Its strings are `origin`'s, a
-/// `Str` keeping its own, its field names the template's.
-pub fn fromStruct(arena: Allocator, v: anytype, origin: Origin) error{OutOfMemory}!Value {
+/// `Str` keeping its own, its field names the template's. A string that is not UTF-8 is `InvalidUtf8`: every walk of
+/// text past this door reads code points.
+pub fn fromStruct(arena: Allocator, v: anytype, origin: Origin) StructError!Value {
     @setRuntimeSafety(true);
     const T = @TypeOf(v);
     if (T == Value) return v;
-    if (T == Str) return .{ .string = v };
-    if (T == []const u8) return .{ .string = .{ .bytes = v, .origin = origin } };
+    if (T == Str) return .{ .string = try utf8(v) };
+    if (T == []const u8) return .{ .string = try utf8(.{ .bytes = v, .origin = origin }) };
     if (comptime (@typeInfo(T) == .@"struct" or @typeInfo(T) == .@"union") and @hasDecl(T, "templateValue")) return v.templateValue();
     switch (@typeInfo(T)) {
         .bool => return .{ .boolean = v },
@@ -973,6 +1074,13 @@ pub fn fromStruct(arena: Allocator, v: anytype, origin: Origin) error{OutOfMemor
         },
         else => @compileError("fromStruct: no template value for " ++ @typeName(T)),
     }
+}
+
+pub const StructError = error{ OutOfMemory, InvalidUtf8 };
+
+fn utf8(s: Str) error{InvalidUtf8}!Str {
+    @setRuntimeSafety(true);
+    return if (std.unicode.utf8ValidateSlice(s.bytes)) s else error.InvalidUtf8;
 }
 
 /// The integer of decimal `text` (an optional '-', digits, no leading zero): an int when it fits 64 bits, else

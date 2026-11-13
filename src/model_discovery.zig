@@ -957,7 +957,8 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
         var gr = gen.reader(io, &gbuf);
         if (gr.interface.allocRemaining(allocator, .limited(1024 * 1024))) |gen_bytes| {
             defer allocator.free(gen_bytes);
-            meta.enable_thinking = @import("model.zig").parseGenerationDefaultsFromJson(gen_bytes).enable_thinking;
+            // A generation_config.json the load would refuse gives the listing no thinking default.
+            meta.enable_thinking = if (@import("model.zig").parseGenerationDefaultsFromJson(gen_bytes)) |gd| gd.enable_thinking else |_| null;
         } else |_| {}
     } else |_| {}
     return meta;

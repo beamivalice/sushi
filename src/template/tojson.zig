@@ -141,7 +141,9 @@ pub const Options = struct {
 pub fn dumps(m: *value.Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, opts: Options, depth: usize) value.Failure!void {
     @setRuntimeSafety(true);
     value.noteStack();
-    if (depth > value.max_depth or w.items.len > opts.max_len) return error.TemplateRuntime;
+    if (depth > value.max_depth) return m.fail(.depth);
+    if (w.items.len > opts.max_len) return m.fail(.text);
+    value.spend(1);
     try m.tick(1);
     const item_sep = opts.item_separator orelse if (opts.indent != null) "," else ", ";
     switch (v) {
@@ -154,17 +156,20 @@ pub fn dumps(m: *value.Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, o
             if (std.math.isInf(f)) return w.appendSlice(gpa, if (f < 0) "-Infinity" else "Infinity");
             try writeFloatRepr(w, gpa, f);
         },
-        .string, .markup => |s| try writeString(w, gpa, s.bytes, opts.ensure_ascii),
+        .string, .markup => |s| {
+            try m.tick(s.bytes.len / 64);
+            try writeString(w, gpa, s.bytes, opts.ensure_ascii);
+        },
         .list => |l| {
-            if (l.kind != .list and l.kind != .tuple) return error.TemplateRuntime;
+            if (l.kind != .list and l.kind != .tuple) return m.fail(.{ .json = @tagName(l.kind) });
             if (l.items.items.len == 0) return w.appendSlice(gpa, "[]");
             try w.append(gpa, '[');
             for (l.items.items, 0..) |item, i| {
                 if (i > 0) try w.appendSlice(gpa, item_sep);
-                try newlineIndent(w, gpa, opts, depth + 1);
+                try newlineIndent(m, w, gpa, opts, depth + 1);
                 try dumps(m, w, gpa, item, opts, depth + 1);
             }
-            try newlineIndent(w, gpa, opts, depth);
+            try newlineIndent(m, w, gpa, opts, depth);
             try w.append(gpa, ']');
         },
         .dict => |d| {
@@ -183,21 +188,26 @@ pub fn dumps(m: *value.Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, o
             try w.append(gpa, '{');
             for (entries, 0..) |e, i| {
                 if (i > 0) try w.appendSlice(gpa, item_sep);
-                try newlineIndent(w, gpa, opts, depth + 1);
+                try newlineIndent(m, w, gpa, opts, depth + 1);
                 try writeKey(m, w, gpa, e.key, opts.ensure_ascii);
                 try w.appendSlice(gpa, opts.key_separator);
                 try dumps(m, w, gpa, e.value, opts, depth + 1);
             }
-            try newlineIndent(w, gpa, opts, depth);
+            try newlineIndent(m, w, gpa, opts, depth);
             try w.append(gpa, '}');
         },
-        .undefined, .namespace, .macro, .function, .loop => return error.TemplateRuntime,
+        .undefined, .namespace, .macro, .function, .loop => return m.fail(.{ .json = value.typeName(v) }),
     }
 }
 
-fn newlineIndent(w: *std.ArrayList(u8), gpa: Allocator, opts: Options, depth: usize) error{OutOfMemory}!void {
+fn newlineIndent(m: *value.Meter, w: *std.ArrayList(u8), gpa: Allocator, opts: Options, depth: usize) value.Failure!void {
     @setRuntimeSafety(true);
     const unit = opts.indent orelse return;
+    // Checked before it is written: a wide indent at depth is many times the limit in one step.
+    const add = std.math.mul(usize, unit.len, depth) catch return m.fail(.text);
+    if (w.items.len +| 1 +| add > opts.max_len) return m.fail(.text);
+    value.spend(add / 64 + 1);
+    try m.tick(add / 64 + 1);
     try w.append(gpa, '\n');
     for (0..depth) |_| try w.appendSlice(gpa, unit);
 }
@@ -212,7 +222,7 @@ fn writeKey(m: *value.Meter, w: *std.ArrayList(u8), gpa: Allocator, k: Value, en
             try dumps(m, &text, gpa, k, .{}, 0);
             try writeString(w, gpa, text.items, ensure_ascii);
         },
-        else => return error.TemplateRuntime,
+        else => return m.fail(.{ .json = value.typeName(k) }),
     }
 }
 

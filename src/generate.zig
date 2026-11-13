@@ -4291,7 +4291,7 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 test "Tokenizer.definedVocabSize: highest defined id + 1, 0 when nothing is defined" {
     const allocator = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(allocator);
+    var tok = Tokenizer.initEmpty(allocator);
     defer tok.deinit();
     try testing.expectEqual(@as(usize, 0), tok.definedVocabSize());
     // Added specials sit ABOVE the base vocab and are not contiguous with it,

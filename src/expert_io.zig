@@ -1081,6 +1081,18 @@ fn alignedDest(allocator: std.mem.Allocator, len: usize) ![]align(align_bytes) u
     return buf;
 }
 
+test "a shard index whose weight_map is not an object fails at open, by name" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    for ([_][]const u8{ "{\"weight_map\": 5}", "{\"weight_map\": []}", "{\"weight_map\": \"m\"}" }) |body| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = body });
+        try std.testing.expectError(error.InvalidSafetensorsIndex, ShardIndex.open(std.testing.allocator, root));
+    }
+}
+
 test "expert io fill reads identical bytes for aligned and unaligned spans" {
     const t = std.testing;
     const page = pageSize();
@@ -1641,7 +1653,8 @@ pub const ShardIndex = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return error.InvalidSafetensorsIndex;
         errdefer parsed.deinit();
         if (parsed.value != .object) return error.InvalidSafetensorsIndex;
-        if (parsed.value.object.get("weight_map") == null) return error.InvalidSafetensorsIndex;
+        const map = parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
+        if (map != .object) return error.InvalidSafetensorsIndex;
         return .{ .allocator = allocator, .model_dir = model_dir, .parsed = parsed };
     }
 

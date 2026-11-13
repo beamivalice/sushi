@@ -394,7 +394,6 @@ test "tokenIdFault names the first entry that is no token id" {
     }
 }
 
-const chat_roles = [_][]const u8{ "system", "developer", "user", "assistant", "tool", "function" };
 
 /// A tool name the call markup can carry: no whitespace, quote, angle bracket or control byte, at most 128 long.
 fn toolNameCarriable(name: []const u8) bool {
@@ -440,7 +439,7 @@ pub fn chatFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
         if (m != .object) continue;
         const role = m.object.get("role") orelse continue;
         if (role != .string) continue;
-        for (chat_roles) |r| {
+        for (chat_mod.request_roles) |r| {
             if (std.mem.eql(u8, role.string, r)) break;
         } else return fieldFault(buf, "'messages[{d}].role' must be one of system, developer, user, assistant, tool or function; got \"{s}\"", .{ i, role.string[0..@min(role.string.len, 32)] });
     };
@@ -877,8 +876,9 @@ fn cacheKeyOf(body: []const u8) !u64 {
     return requestCacheKey(parsed.value.object);
 }
 
-test "canonicalRole: developer is the system turn; every other role is itself" {
+test "canonicalRole: developer is the system turn, a function result a tool's; every other role is itself" {
     try testing.expectEqualStrings("system", chat_mod.canonicalRole("developer"));
+    try testing.expectEqualStrings("tool", chat_mod.canonicalRole("function"));
     try testing.expectEqualStrings("system", chat_mod.canonicalRole("system"));
     try testing.expectEqualStrings("tool", chat_mod.canonicalRole("tool"));
     try testing.expectEqualStrings("assistant", chat_mod.canonicalRole("assistant"));

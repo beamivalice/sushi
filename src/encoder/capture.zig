@@ -189,7 +189,10 @@ pub const Capture = struct {
             try pack.writeAllChunked(file, self.io, h.bytes);
         }
         try self.scratch.rename(tmp, self.scratch, name, self.io);
-        if (self.trace) |list| try list.append(self.allocator, try self.allocator.dupe(u8, h.bytes[0..h.window_bytes]));
+        if (self.trace) |list| {
+            try list.ensureUnusedCapacity(self.allocator, 1);
+            list.appendAssumeCapacity(try self.allocator.dupe(u8, h.bytes[0..h.window_bytes]));
+        }
         if (layer > 0) {
             var old_buf: [48]u8 = undefined;
             self.scratch.deleteFile(self.io, try hiddenName(&old_buf, layer - 1)) catch {};

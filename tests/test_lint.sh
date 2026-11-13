@@ -191,6 +191,55 @@ printf '%s\n' 'fn f(s: []const u8) usize {' '    @setRuntimeSafety(true);' '    
 printf '%s\n' 'fn outside() void {}' > "$TMP/t/src/p.zig"
 expect_green "a safe fn, an extern, a test and a fn outside src/template/"
 
+# rule template-unchecked-utf8
+tree
+mkdir -p "$TMP/t/src/template"
+printf '%s\n' 'const std = @import("std");' 'fn f(s: []const u8) usize {' '    var it = std.unicode.Utf8View.initUnchecked(s).iterator();' '    var n: usize = 0;' '    while (it.nextCodepointSlice()) |_| n += 1;' '    return n;' '}' 'test "t" { _ = std.unicode.Utf8View.initUnchecked("x"); }' > "$TMP/t/src/template/p.zig"
+expect_red "an unchecked UTF-8 view under src/template/" "src/template/p.zig:3:35 \[template-unchecked-utf8\] f: Utf8View.initUnchecked under src/template/"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'fn f(s: []const u8) void { _ = std.unicode.Utf8View.initUnchecked(s); }' > "$TMP/t/src/p.zig"
+expect_green "an unchecked UTF-8 view outside src/template/"
+
+# rule json-unchecked-shape
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn f(parsed: std.json.Parsed(std.json.Value)) ?std.json.Value {' '    const root = parsed.value.object;' \
+  '    return root.get("k").?.object.get("j");' '}' > "$TMP/t/src/p.zig"
+expect_red "a parsed document read as an object unchecked" "src/p.zig:3:31 \[json-unchecked-shape\] f: unchecked JSON shape 'parsed.value.object'"
+expect_red "an unwrapped field read as an object unchecked" "src/p.zig:4:28 \[json-unchecked-shape\] f: unchecked JSON shape 'root.get(\"k\").?.object'"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn g(parsed: std.json.Parsed(std.json.Value)) !?std.json.Value {' '    if (parsed.value != .object) return error.Shape;' \
+  '    const v = parsed.value.object.get("k") orelse return null;' '    return if (v == .object) v.object.get("j") else null;' '}' \
+  'fn helper(parsed: std.json.Parsed(std.json.Value)) std.json.ObjectMap { return parsed.value.object; }' \
+  'fn h(x: anytype) void { _ = x.hidden.?.array(0); }' 'test "t" { _ = helper; }' > "$TMP/t/src/p.zig"
+printf '%s\n' 'const std = @import("std");' 'pub fn k(parsed: std.json.Parsed(std.json.Value)) std.json.ObjectMap { return parsed.value.object; }' > "$TMP/t/src/p_test.zig"
+expect_green "a checked tag, a test-only helper, a method named like a tag and a test file"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn f(m: std.json.ObjectMap, v: std.json.Value) !u32 {' '    var it = m.iterator();' \
+  '    while (it.next()) |e| _ = e.value_ptr.string;' '    return @intCast(v.integer);' '}' > "$TMP/t/src/p.zig"
+expect_red "a map entry read as a string unchecked" "src/p.zig:4:43 \[json-unchecked-shape\] f: unchecked JSON shape 'e.value_ptr.string'"
+expect_red "an @intCast of a JSON integer" "src/p.zig:5:12 \[json-unchecked-shape\] f: @intCast of a JSON integer"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn g(m: std.json.ObjectMap, v: std.json.Value) !u32 {' '    var it = m.iterator();' \
+  '    while (it.next()) |e| if (e.value_ptr.* == .string) {' '        _ = e.value_ptr.string;' '    };' \
+  '    if (v != .integer or v.integer < 0 or v.integer > 9) return error.Range;' '    return @intCast(v.integer);' '}' > "$TMP/t/src/p.zig"
+expect_green "a map entry checked through .*, and an integer bounded before its cast"
+
+# rule owned-insert-arg
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn f(a: std.mem.Allocator, xs: *std.ArrayList([]u8), s: []const u8) !void {' \
+  '    try xs.append(a, try a.dupe(u8, s));' '}' > "$TMP/t/src/p.zig"
+expect_red "a copy made inside an append" "src/p.zig:3:22 \[owned-insert-arg\] f: 'dupe' makes an owned value inside 'append'"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn g(a: std.mem.Allocator, xs: *std.ArrayList([]u8), s: []const u8) !void {' \
+  '    try xs.ensureUnusedCapacity(a, 1);' '    xs.appendAssumeCapacity(try a.dupe(u8, s));' '    try appendRow(a, try a.dupe(u8, s));' '}' \
+  'fn appendRow(a: std.mem.Allocator, s: []u8) !void { a.free(s); }' > "$TMP/t/src/p.zig"
+expect_green "a reserved insert, and a free function named like an insert"
+
 # rule template-superlinear-std
 tree
 mkdir -p "$TMP/t/src/template"

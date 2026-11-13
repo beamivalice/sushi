@@ -410,7 +410,8 @@ pub const SafetensorsSource = struct {
                 }
             }
         } else |_| {
-            try shard_names.append(allocator, try allocator.dupe(u8, "model.safetensors"));
+            try shard_names.ensureUnusedCapacity(allocator, 1);
+            shard_names.appendAssumeCapacity(try allocator.dupe(u8, "model.safetensors"));
         }
 
         var tensors = std.StringHashMap(TensorLoc).init(allocator);
@@ -457,9 +458,15 @@ pub const SafetensorsSource = struct {
                     if (d != .integer or d.integer < 0) return error.BadSafetensorsHeader;
                     shape[i] = @intCast(d.integer);
                 }
-                const start: u64 = @intCast(offs.array.items[0].integer);
-                const end: u64 = @intCast(offs.array.items[1].integer);
-                try tensors.put(try allocator.dupe(u8, entry.key_ptr.*), .{
+                const lo = offs.array.items[0];
+                const hi = offs.array.items[1];
+                if (lo != .integer or hi != .integer) return error.BadSafetensorsHeader;
+                const start = std.math.cast(u64, lo.integer) orelse return error.BadSafetensorsHeader;
+                const end = std.math.cast(u64, hi.integer) orelse return error.BadSafetensorsHeader;
+                try tensors.ensureUnusedCapacity(1);
+                const key = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(key);
+                tensors.putAssumeCapacity(key, .{
                     .shard_idx = s_idx,
                     .data_start = 8 + hdr_len,
                     .start = start,

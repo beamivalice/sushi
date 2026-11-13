@@ -354,7 +354,8 @@ fn listShards(a: std.mem.Allocator, io: std.Io, dir: []const u8) ![]Shard {
         const path = try repack.pathZ(a, dir, entry.name);
         var st: std.c.Stat = undefined;
         if (repack.lstat(path.ptr, &st) != 0) continue;
-        try out.append(a, .{ .name = try a.dupe(u8, entry.name), .link = std.c.S.ISLNK(st.mode), .size = @intCast(@max(st.size, 0)) });
+        try out.ensureUnusedCapacity(a, 1);
+        out.appendAssumeCapacity(.{ .name = try a.dupe(u8, entry.name), .link = std.c.S.ISLNK(st.mode), .size = @intCast(@max(st.size, 0)) });
     }
     std.mem.sort(Shard, out.items, {}, struct {
         fn lt(_: void, x: Shard, y: Shard) bool {

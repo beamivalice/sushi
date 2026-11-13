@@ -216,7 +216,8 @@ fn safetensorsFiles(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .file or entry.name[0] == '.' or !std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
-        try names.append(allocator, try allocator.dupe(u8, entry.name));
+        try names.ensureUnusedCapacity(allocator, 1);
+        names.appendAssumeCapacity(try allocator.dupe(u8, entry.name));
     }
     std.mem.sortUnstable([]u8, names.items, {}, struct {
         fn lt(_: void, a: []u8, b: []u8) bool {
@@ -333,11 +334,13 @@ pub fn run(
         progress.trunk_done = true;
         try writeProgress(allocator, io, out, progress);
         for (trunk.overrides.items) |o| {
-            try overrides.append(allocator, .{ .base = try allocator.dupe(u8, o.base), .bits = o.bits, .group = o.group });
+            try overrides.ensureUnusedCapacity(allocator, 1);
+            overrides.appendAssumeCapacity(.{ .base = try allocator.dupe(u8, o.base), .bits = o.bits, .group = o.group });
         }
     } else {
         for (progress.overrides) |o| {
-            try overrides.append(allocator, .{ .base = try allocator.dupe(u8, o.base), .bits = o.bits, .group = o.group });
+            try overrides.ensureUnusedCapacity(allocator, 1);
+            overrides.appendAssumeCapacity(.{ .base = try allocator.dupe(u8, o.base), .bits = o.bits, .group = o.group });
         }
     }
 

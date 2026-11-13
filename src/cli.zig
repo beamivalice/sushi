@@ -1639,8 +1639,10 @@ pub fn runToolTurn(allocator: std.mem.Allocator, history: *std.ArrayList(Turn), 
     var round: usize = 0;
     while (true) : (round += 1) {
         const offered = if (round < max_tool_rounds) tools else null;
-        if (tools != null and round == max_tool_rounds)
-            try history.append(allocator, .{ .role = "user", .content = try allocator.dupe(u8, tool_cap_nudge) });
+        if (tools != null and round == max_tool_rounds) {
+            try history.ensureUnusedCapacity(allocator, 1);
+            history.appendAssumeCapacity(.{ .role = "user", .content = try allocator.dupe(u8, tool_cap_nudge) });
+        }
         const body = try buildReplChatBody(allocator, history.items, think, offered);
         defer allocator.free(body);
         const reply = try driver.complete(driver.ptr, body);
@@ -1869,7 +1871,8 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
 
         const mark = history.items.len;
         const images = try pending_images.toOwnedSlice(allocator);
-        try history.append(allocator, .{ .role = "user", .content = try allocator.dupe(u8, trimmed), .images = images });
+        try history.ensureUnusedCapacity(allocator, 1);
+        history.appendAssumeCapacity(.{ .role = "user", .content = try allocator.dupe(u8, trimmed), .images = images });
         driver.requests = 0;
         runToolTurn(allocator, &history, think, opts.toolsJson(vision), driver.turnDriver()) catch |err| {
             try w.print("\n[error: {s}]\n", .{@errorName(err)});

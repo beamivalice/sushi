@@ -196,7 +196,10 @@ fn build(alloc: std.mem.Allocator, a: Launch, b: Launch, b_first: bool, grid_tem
     var ints: std.ArrayList(IntArg) = .empty;
     defer ints.deinit(alloc);
     try ints.appendSlice(alloc, a.ints);
-    for (b.ints) |i| try ints.append(alloc, .{ .name = try std.fmt.allocPrintSentinel(alloc, "{s}{s}", .{ shared_int_prefix, i.name }, 0), .value = i.value });
+    for (b.ints) |i| {
+        try ints.ensureUnusedCapacity(alloc, 1);
+        ints.appendAssumeCapacity(.{ .name = try std.fmt.allocPrintSentinel(alloc, "{s}{s}", .{ shared_int_prefix, i.name }, 0), .value = i.value });
+    }
     const values = [_]c_int{ a.tgs[0], a.tgs[1], b.tgs[0], b.tgs[1], na, nb, @intFromBool(b_first) };
     if (grid_template) for (grid_ints, values) |name, v| try ints.append(alloc, .{ .name = name, .value = v });
     const outs = try std.mem.concat(alloc, Out, &.{ a.outs, b.outs });

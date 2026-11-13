@@ -446,7 +446,10 @@ pub const Writer = struct {
     pub fn stagedPaths(self: *Writer, out: *std.ArrayList([]const u8), a: std.mem.Allocator) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        for (self.queue.items) |b| try out.append(a, try a.dupe(u8, b.path));
+        for (self.queue.items) |b| {
+            try out.ensureUnusedCapacity(a, 1);
+            out.appendAssumeCapacity(try a.dupe(u8, b.path));
+        }
     }
 
     pub fn pendingBytes(self: *Writer) u64 {

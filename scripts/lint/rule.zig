@@ -86,3 +86,45 @@ pub fn testKey(arena: std.mem.Allocator, tree: *const Ast, name_token: ?u32) ![]
     };
     return out;
 }
+
+/// A file only tests compile: `*_test.zig` or a test-support file.
+pub fn testFile(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.mem.endsWith(u8, base, "_test.zig") or std.mem.endsWith(u8, base, "test_support.zig");
+}
+
+/// Marks each private fn whose every use in the file sits in a test or in a fn already marked, to a fixed point.
+pub fn testOnly(arena: std.mem.Allocator, tree: *const Ast, list: []const Owner) ![]bool {
+    const marked = try arena.alloc(bool, list.len);
+    for (list, marked) |o, *m| m.* = o.is_test;
+    var uses: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty;
+    for (list) |o| if (!o.is_test) try uses.put(arena, o.key, .empty);
+    for (0..tree.tokens.len) |i| {
+        const t: u32 = @intCast(i);
+        if (tree.tokenTag(t) != .identifier) continue;
+        if (uses.getPtr(tree.tokenSlice(t))) |at| try at.append(arena, t);
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (list, marked) |o, *m| {
+            if (m.* or o.first == 0 or tree.tokenTag(o.first) != .keyword_fn) continue;
+            var used = false;
+            var only_tests = true;
+            for (uses.get(o.key).?.items) |t| {
+                if (t >= o.first and t <= o.last) continue;
+                used = true;
+                var inner: ?usize = null;
+                for (list, 0..) |c, j| if (t >= c.first and t <= c.last and (inner == null or c.last - c.first < list[inner.?].last - list[inner.?].first)) {
+                    inner = j;
+                };
+                if (inner == null or !(marked[inner.?] or inTest(list, t))) only_tests = false;
+            }
+            if (used and only_tests) {
+                m.* = true;
+                changed = true;
+            }
+        }
+    }
+    return marked;
+}

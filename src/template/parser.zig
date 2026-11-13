@@ -28,6 +28,8 @@ pub const Parser = struct {
     depth: usize = 0,
     /// Inside a for loop body, not across a macro: `break` and `continue` are allowed.
     in_loop: bool = false,
+    /// Inside a for loop's body or else, across macros too: a target may not be `loop`.
+    in_for: bool = false,
     /// The special names read since the innermost macro body began.
     specials: ast.Specials = .{},
 
@@ -177,7 +179,10 @@ pub const Parser = struct {
         if (std.mem.eql(u8, name, "call")) return self.callBlock(pos);
         if (std.mem.eql(u8, name, "filter")) return self.filterBlock(pos);
         if (std.mem.eql(u8, name, "generation")) {
+            const outer = self.in_loop;
+            self.in_loop = outer and ast.bodyOf(.generation) != .call;
             const body = try self.block(&.{"endgeneration"});
+            self.in_loop = outer;
             _ = self.advance();
             return .{ .pos = pos, .kind = .{ .generation = body } };
         }
@@ -212,12 +217,16 @@ pub const Parser = struct {
 
     fn forStatement(self: *Parser, pos: u32) Error!Node {
         @setRuntimeSafety(true);
-        const target = try self.assignTarget(false, &.{"in"});
+        const target = try self.assignTarget(false);
+        if (target.binds("loop")) return self.fail(pos, "Can't assign to special loop variable in for-loop target", .{});
         if (!self.skipName("in")) return self.fail(self.cur().pos, "expected 'in', got '{s}'", .{describe(self.cur())});
         const iter = try self.tuple(.{ .condexpr = false, .end_name = "recursive" });
         const filter = if (self.skipName("if")) try self.expression(true) else null;
         if (self.isName("recursive")) return self.fail(self.cur().pos, "unsupported 'recursive' loop", .{});
         const outer = self.in_loop;
+        const outer_for = self.in_for;
+        defer self.in_for = outer_for;
+        self.in_for = true;
         self.in_loop = true;
         const body = try self.block(&.{ "endfor", "else" });
         self.in_loop = outer;
@@ -231,7 +240,8 @@ pub const Parser = struct {
 
     fn setStatement(self: *Parser, pos: u32) Error!Node {
         @setRuntimeSafety(true);
-        const target = try self.assignTarget(true, &.{});
+        const target = try self.assignTarget(true);
+        if (self.in_for and target.binds("loop")) return self.fail(pos, "Can't assign to special loop variable in for-loop target", .{});
         if (self.skipOp("=")) return .{ .pos = pos, .kind = .{ .set = .{ .target = target, .value = try self.tuple(.{}) } } };
         const filter = if (self.isOp("|")) try self.filterChain(null, false) else null;
         const body = try self.block(&.{"endset"});
@@ -239,7 +249,7 @@ pub const Parser = struct {
         return .{ .pos = pos, .kind = .{ .set_block = .{ .target = target, .filter = filter, .body = body } } };
     }
 
-    fn assignTarget(self: *Parser, with_namespace: bool, end_names: []const []const u8) Error!ast.Target {
+    fn assignTarget(self: *Parser, with_namespace: bool) Error!ast.Target {
         @setRuntimeSafety(true);
         const start = self.cur();
         if (with_namespace and start.tag == .name and self.peekAt(1).tag == .op and std.mem.eql(u8, self.peekAt(1).text, ".")) {
@@ -247,27 +257,39 @@ pub const Parser = struct {
             _ = self.advance();
             return .{ .attr = .{ .namespace = start.text, .name = try self.expectName() } };
         }
-        var names = std.ArrayList([]const u8).empty;
+        return self.targetTuple(false);
+    }
+
+    /// Jinja2's simplified tuple: targets split by commas. A trailing comma or an empty tuple needs parentheses, and one
+    /// target in parentheses is that target (`(a)` is `a`).
+    fn targetTuple(self: *Parser, parens: bool) Error!ast.Target {
+        @setRuntimeSafety(true);
+        try self.enter();
+        defer self.depth -= 1;
+        var items = std.ArrayList(ast.Target).empty;
         var is_tuple = false;
-        const parens = self.skipOp("(");
         while (true) {
-            if (names.items.len > 0) try self.expectOp(",");
-            if (self.isOp(")") or self.isOp("=") or self.cur().tag == .block_end) break;
-            const at_end = for (end_names) |e| {
-                if (self.isName(e)) break true;
-            } else false;
-            if (at_end) break;
-            const t = self.cur();
-            if (t.tag != .name or isKeyword(t.text)) return self.fail(t.pos, "can't assign to '{s}'", .{describe(t)});
-            _ = self.advance();
-            try names.append(self.arena, t.text);
+            if (items.items.len > 0) try self.expectOp(",");
+            if (parens and self.isOp(")")) break;
+            try items.append(self.arena, try self.targetPrimary());
             if (!self.isOp(",")) break;
             is_tuple = true;
         }
-        if (parens) try self.expectOp(")");
-        if (names.items.len == 0) return self.fail(start.pos, "expected an assignment target", .{});
-        if (!is_tuple and !parens) return .{ .name = names.items[0] };
-        return .{ .names = names.items };
+        if (!is_tuple and items.items.len == 1) return items.items[0];
+        return .{ .tuple = items.items };
+    }
+
+    fn targetPrimary(self: *Parser) Error!ast.Target {
+        @setRuntimeSafety(true);
+        if (self.skipOp("(")) {
+            const t = try self.targetTuple(true);
+            try self.expectOp(")");
+            return t;
+        }
+        const t = self.cur();
+        if (t.tag != .name or isKeyword(t.text)) return self.fail(t.pos, "can't assign to '{s}'", .{describe(t)});
+        _ = self.advance();
+        return .{ .name = t.text };
     }
 
     fn isKeyword(name: []const u8) bool {
@@ -284,7 +306,9 @@ pub const Parser = struct {
         while (!self.isOp(")")) {
             if (params.items.len > 0) try self.expectOp(",");
             if (self.isOp(")")) break;
+            const at = self.cur().pos;
             const name = try self.expectName();
+            for (params.items) |p| if (std.mem.eql(u8, p.name, name)) return self.fail(at, "duplicate argument '{s}' in function definition", .{name});
             var default: ?*const Expr = null;
             if (self.skipOp("=")) {
                 default = try self.expression(true);
@@ -296,14 +320,17 @@ pub const Parser = struct {
         return params.items;
     }
 
-    fn macroBody(self: *Parser, name: []const u8, params: []const ast.Param, end: []const u8) Error!*const ast.Macro {
+    fn macroBody(self: *Parser, pos: u32, name: []const u8, params: []const ast.Param, end: []const u8) Error!*const ast.Macro {
         @setRuntimeSafety(true);
         const outer = self.in_loop;
         const outer_specials = self.specials;
-        self.in_loop = false;
+        self.in_loop = outer and ast.bodyOf(.macro) != .call;
         self.specials = .{};
         const body = try self.block(&.{end});
         const reads = self.specials;
+        // A `caller` parameter shadows the caller the body reads, so it must have a default to be called without one.
+        if (reads.caller) for (params) |p| if (p.default == null and std.mem.eql(u8, p.name, "caller"))
+            return self.fail(pos, "When defining macros or call blocks the special \"caller\" argument must be omitted or be given a default.", .{});
         self.in_loop = outer;
         self.specials = .{
             .caller = outer_specials.caller or reads.caller,
@@ -320,7 +347,7 @@ pub const Parser = struct {
         @setRuntimeSafety(true);
         const name = try self.expectName();
         const params = try self.signature();
-        return .{ .pos = pos, .kind = .{ .macro = try self.macroBody(name, params, "endmacro") } };
+        return .{ .pos = pos, .kind = .{ .macro = try self.macroBody(pos, name, params, "endmacro") } };
     }
 
     fn callBlock(self: *Parser, pos: u32) Error!Node {
@@ -328,7 +355,7 @@ pub const Parser = struct {
         const params: []const ast.Param = if (self.isOp("(")) try self.signature() else &.{};
         const call = try self.expression(true);
         if (call.kind != .call) return self.fail(call.pos, "expected a call", .{});
-        return .{ .pos = pos, .kind = .{ .call_block = .{ .call = call, .caller = try self.macroBody("caller", params, "endcall") } } };
+        return .{ .pos = pos, .kind = .{ .call_block = .{ .call = call, .caller = try self.macroBody(pos, "caller", params, "endcall") } } };
     }
 
     fn filterBlock(self: *Parser, pos: u32) Error!Node {

@@ -1176,7 +1176,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         var gen_reader = gen_file.reader(io, &gen_buf);
         if (gen_reader.interface.allocRemaining(allocator, .limited(1024 * 1024))) |gen_content| {
             defer allocator.free(gen_content);
-            const gd = parseGenerationDefaultsFromJson(gen_content);
+            const gd = try parseGenerationDefaultsFromJson(gen_content);
             config.gen_temperature = gd.temperature;
             config.gen_top_p = gd.top_p;
             config.gen_top_k = gd.top_k;
@@ -1317,7 +1317,15 @@ pub fn parseVisionProcessorDefaultsFromJson(content: []const u8) VisionProcessor
 /// sampling to an extreme. (`do_sample` is deliberately ignored: HF uses it
 /// for greedy-vs-sample mode selection, which the request's own temperature
 /// already expresses.)
-pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
+/// An `eos_token_id` of `generation_config.json` that is no token id fails the read by name.
+fn eosTokenId(i: i64) error{InvalidGenerationConfig}!u32 {
+    return std.math.cast(u32, i) orelse {
+        log.err("[load] generation_config.json: eos_token_id {d} is not a token id\n", .{i});
+        return error.InvalidGenerationConfig;
+    };
+}
+
+pub fn parseGenerationDefaultsFromJson(content: []const u8) error{InvalidGenerationConfig}!GenerationDefaults {
     var buf: [16 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const parsed = std.json.parseFromSlice(std.json.Value, fba.allocator(), content, .{}) catch return .{};
@@ -1356,13 +1364,13 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
     }
     if (root.get("eos_token_id")) |v| {
         switch (v) {
-            .integer => |i| if (i >= 0) {
-                gd.eos_token_ids[0] = @intCast(i);
+            .integer => |i| {
+                gd.eos_token_ids[0] = try eosTokenId(i);
                 gd.num_eos = 1;
             },
             .array => |arr| for (arr.items) |item| {
-                if (item == .integer and item.integer >= 0 and gd.num_eos < gd.eos_token_ids.len) {
-                    gd.eos_token_ids[gd.num_eos] = @intCast(item.integer);
+                if (item == .integer and gd.num_eos < gd.eos_token_ids.len) {
+                    gd.eos_token_ids[gd.num_eos] = try eosTokenId(item.integer);
                     gd.num_eos += 1;
                 }
             },
@@ -3019,35 +3027,40 @@ test "defaultEnableThinking: the checkpoint's own generation_config default outr
 }
 
 test "parseGenerationDefaultsFromJson: reads default_chat_template_kwargs.enable_thinking" {
-    const on = parseGenerationDefaultsFromJson(
+    const on = try parseGenerationDefaultsFromJson(
         "{\"default_chat_template_kwargs\": {\"enable_thinking\": true}}",
     );
     try testing.expectEqual(@as(?bool, true), on.enable_thinking);
-    const off = parseGenerationDefaultsFromJson(
+    const off = try parseGenerationDefaultsFromJson(
         "{\"default_chat_template_kwargs\": {\"enable_thinking\": false}}",
     );
     try testing.expectEqual(@as(?bool, false), off.enable_thinking);
     // Absent, wrong shape, or a non-bool value: null, arch default stays.
-    try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson("{\"top_k\": 20}").enable_thinking);
-    try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson(
+    try testing.expectEqual(@as(?bool, null), (try parseGenerationDefaultsFromJson("{\"top_k\": 20}")).enable_thinking);
+    try testing.expectEqual(@as(?bool, null), (try parseGenerationDefaultsFromJson(
         "{\"default_chat_template_kwargs\": \"on\"}",
-    ).enable_thinking);
-    try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson(
+    )).enable_thinking);
+    try testing.expectEqual(@as(?bool, null), (try parseGenerationDefaultsFromJson(
         "{\"default_chat_template_kwargs\": {\"enable_thinking\": \"yes\"}}",
-    ).enable_thinking);
+    )).enable_thinking);
+}
+
+test "parseGenerationDefaultsFromJson: an eos_token_id that is no token id fails by name" {
+    for ([_][]const u8{ "{\"eos_token_id\": 99999999999}", "{\"eos_token_id\": -1}", "{\"eos_token_id\": [1, 99999999999]}", "{\"eos_token_id\": [-2]}" }) |body|
+        try testing.expectError(error.InvalidGenerationConfig, parseGenerationDefaultsFromJson(body));
 }
 
 test "parseGenerationDefaultsFromJson: eos_token_id list merges additively into the stop set" {
-    const gd = parseGenerationDefaultsFromJson("{\"eos_token_id\": [1, 250019]}");
+    const gd = try parseGenerationDefaultsFromJson("{\"eos_token_id\": [1, 250019]}");
     try testing.expectEqual(@as(usize, 2), gd.num_eos);
     var config = ModelConfig{};
     config.addEosToken(1);
     config.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
     try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
     try testing.expect(config.isEosToken(250019));
-    const scalar = parseGenerationDefaultsFromJson("{\"eos_token_id\": 7}");
+    const scalar = try parseGenerationDefaultsFromJson("{\"eos_token_id\": 7}");
     try testing.expectEqual(@as(u32, 7), scalar.eos_token_ids[0]);
-    try testing.expectEqual(@as(usize, 0), parseGenerationDefaultsFromJson("{\"eos_token_id\": \"x\"}").num_eos);
+    try testing.expectEqual(@as(usize, 0), (try parseGenerationDefaultsFromJson("{\"eos_token_id\": \"x\"}")).num_eos);
 }
 
 test "ModelConfig addEosToken" {
@@ -3385,24 +3398,24 @@ test "parseGenerationDefaultsFromJson: reads model sampling recommendations" {
     const json =
         \\{"bos_token_id": 248044, "do_sample": true, "temperature": 1.0, "top_k": 20, "top_p": 0.95}
     ;
-    const gd = parseGenerationDefaultsFromJson(json);
+    const gd = try parseGenerationDefaultsFromJson(json);
     try testing.expectEqual(@as(?f32, 1.0), gd.temperature);
     try testing.expectEqual(@as(?f32, 0.95), gd.top_p);
     try testing.expectEqual(@as(?u32, 20), gd.top_k);
 }
 
 test "parseGenerationDefaultsFromJson: missing keys and malformed input give nulls" {
-    const partial = parseGenerationDefaultsFromJson("{\"eos_token_id\": [1, 2]}");
+    const partial = try parseGenerationDefaultsFromJson("{\"eos_token_id\": [1, 2]}");
     try testing.expectEqual(@as(?f32, null), partial.temperature);
     try testing.expectEqual(@as(?f32, null), partial.top_p);
     try testing.expectEqual(@as(?u32, null), partial.top_k);
 
-    const broken = parseGenerationDefaultsFromJson("not json at all");
+    const broken = try parseGenerationDefaultsFromJson("not json at all");
     try testing.expectEqual(@as(?f32, null), broken.temperature);
 
     // Out-of-range values are dropped, not clamped — a corrupt config must
     // not silently pin sampling to an extreme.
-    const insane = parseGenerationDefaultsFromJson("{\"temperature\": 99.0, \"top_p\": 7.0, \"top_k\": -5}");
+    const insane = try parseGenerationDefaultsFromJson("{\"temperature\": 99.0, \"top_p\": 7.0, \"top_k\": -5}");
     try testing.expectEqual(@as(?f32, null), insane.temperature);
     try testing.expectEqual(@as(?f32, null), insane.top_p);
     try testing.expectEqual(@as(?u32, null), insane.top_k);

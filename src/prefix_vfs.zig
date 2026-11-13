@@ -2040,7 +2040,8 @@ const DiskState = struct {
         defer pdir.close(tio);
         var it = pdir.iterate();
         while (try it.next(tio)) |e| {
-            try names.append(ta, try ta.dupe(u8, e.name));
+            try names.ensureUnusedCapacity(ta, 1);
+            names.appendAssumeCapacity(try ta.dupe(u8, e.name));
             try packs.append(ta, try pdir.readFileAlloc(tio, e.name, ta, .limited(1 << 28)));
         }
         return .{ .journal = journal, .names = try names.toOwnedSlice(ta), .packs = try packs.toOwnedSlice(ta) };

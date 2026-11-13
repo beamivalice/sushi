@@ -512,6 +512,9 @@ pub const LoadedModel = struct {
         }
         self.drafter_block_size = 0;
         self.bytes_resident = 0;
+        // The tokenizer stays for listing and for requests still formatting; the prompt segments it kept are a
+        // resident model's working memory, and the next load builds a tokenizer of its own.
+        if (self.tokenizer) |t| if (t.segment_cache) |c| c.clear();
         // The prefill-chunk pin was resolved from LIVE memory at load, so it
         // can be stale-narrow (pinned while a since-evicted model was
         // resident). Widening a RESIDENT model's pin would let a prefill run
@@ -2150,7 +2153,7 @@ test "ModelRegistry: peek does not refcount" {
 /// to `lm`, the way the real loader hands ownership to the entry.
 fn attachTestTokenizer(lm: *LoadedModel, tokens: []const struct { u32, []const u8 }) !void {
     const tok = try lm.allocator.create(Tokenizer);
-    tok.* = Tokenizer.initEmptyForTests(lm.allocator);
+    tok.* = Tokenizer.initEmpty(lm.allocator);
     for (tokens) |t| try tok.id_to_token.put(t[0], t[1]);
     lm.tokenizer = tok;
 }
@@ -2630,4 +2633,87 @@ test "DiskStats: each model keeps its own tier, and a reader never mixes two pub
     }
     stop.store(true, .seq_cst);
     thread.join();
+}
+
+test "LoadedModel: an unload drops the kept tokenizer's segment cache, and the token gauge is back where it was" {
+    const cache_stats = @import("cache_stats.zig");
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try makeReadyStub(reg, "m", 1024);
+    try attachTestTokenizer(entry, &.{.{ 0, "a" }});
+    const before = cache_stats.process.snapshot().token_bytes;
+    try entry.tokenizer.?.enableSegmentCache(64 << 20);
+    try entry.tokenizer.?.segment_cache.?.put("a segment long enough to be kept by the cache", &.{ 1, 2, 3 });
+    try testing.expect(cache_stats.process.snapshot().token_bytes > before);
+    entry.unloadResident();
+    // The tokenizer stays for listing and reload; what it remembered of prompts does not.
+    try testing.expect(entry.tokenizer != null);
+    try testing.expectEqual(@as(usize, 0), entry.tokenizer.?.segment_cache.?.bytes());
+    try testing.expectEqual(before, cache_stats.process.snapshot().token_bytes);
+}
+
+test "LoadedModel: prompts encoded while the model unloads get the ids a quiet encode gives" {
+    const cache_stats = @import("cache_stats.zig");
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try makeReadyStub(reg, "m", 1024);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const tok = try testing.allocator.create(Tokenizer);
+    tok.* = try tokenizer_mod.byteTokenizerForTests(testing.allocator, arena.allocator(), &.{"<|im_end|>"});
+    entry.tokenizer = tok;
+    defer {
+        entry.tokenizer = null;
+        tokenizer_mod.deinitTestTokenizer(tok);
+        testing.allocator.destroy(tok);
+    }
+    const before = cache_stats.process.snapshot().token_bytes;
+    try tok.enableSegmentCache(1 << 20);
+    const texts = [_][]const u8{
+        "the quick brown fox jumps over the lazy dog, twice over",
+        "a second prompt segment, long enough for the cache to keep<|im_end|>and a tail past the special token",
+        "0123456789 0123456789 0123456789 0123456789 0123456789",
+    };
+    var want: [texts.len][]u32 = undefined;
+    for (texts, &want) |text, *w| w.* = try tok.encode(testing.allocator, text);
+    defer for (want) |w| testing.allocator.free(w);
+    entry.unloadResident();
+
+    const Reader = struct {
+        tok: *const Tokenizer,
+        texts: []const []const u8,
+        want: []const []u32,
+        stop: *std.atomic.Value(bool),
+        wrong: std.atomic.Value(u32) = .init(0),
+        rounds: std.atomic.Value(u32) = .init(0),
+
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                for (self.texts, self.want) |text, w| {
+                    const got = self.tok.encode(std.heap.page_allocator, text) catch {
+                        _ = self.wrong.fetchAdd(1, .monotonic);
+                        continue;
+                    };
+                    defer std.heap.page_allocator.free(got);
+                    if (!std.mem.eql(u32, w, got)) _ = self.wrong.fetchAdd(1, .monotonic);
+                }
+                _ = self.rounds.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    var readers: [8]Reader = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&readers, &threads) |*r, *th| {
+        r.* = .{ .tok = tok, .texts = &texts, .want = &want, .stop = &stop };
+        th.* = try std.Thread.spawn(.{}, Reader.run, .{r});
+    }
+    // Every reader has filled and read the cache between unloads at least a few hundred times.
+    var unloads: usize = 0;
+    while (unloads < 2000 or readers[0].rounds.load(.monotonic) < 200) : (unloads += 1) entry.unloadResident();
+    stop.store(true, .release);
+    for (&threads) |th| th.join();
+    for (&readers) |*r| try testing.expectEqual(@as(u32, 0), r.wrong.load(.monotonic));
+    entry.unloadResident();
+    try testing.expectEqual(before, cache_stats.process.snapshot().token_bytes);
 }

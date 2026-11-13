@@ -40,7 +40,8 @@ pub fn parseOrgPacks(allocator: std.mem.Allocator, json: []const u8, org: []cons
     }
     for (parsed.value) |r| {
         if (r.private or !validRepo(org, r.id) or std.ascii.findIgnoreCase(r.id, "-Sushi-") == null) continue;
-        try ids.append(allocator, try allocator.dupe(u8, r.id));
+        try ids.ensureUnusedCapacity(allocator, 1);
+        ids.appendAssumeCapacity(try allocator.dupe(u8, r.id));
     }
     return ids.toOwnedSlice(allocator);
 }

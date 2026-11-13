@@ -92,7 +92,8 @@ fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, out: *s
                 for (wm.object.values()) |v| {
                     if (v != .string or hasName(out.items, v.string)) continue;
                     _ = dir.statFile(io, v.string, .{}) catch continue;
-                    try out.append(allocator, try allocator.dupe(u8, v.string));
+                    try out.ensureUnusedCapacity(allocator, 1);
+                    out.appendAssumeCapacity(try allocator.dupe(u8, v.string));
                 }
             };
         }
@@ -102,7 +103,8 @@ fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, out: *s
     while (try it.next(io)) |entry| {
         if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
-        try out.append(allocator, try allocator.dupe(u8, entry.name));
+        try out.ensureUnusedCapacity(allocator, 1);
+        out.appendAssumeCapacity(try allocator.dupe(u8, entry.name));
     }
     it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -113,7 +115,8 @@ fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, out: *s
         while (try sit.next(io)) |se| {
             if (se.kind != .file and se.kind != .sym_link) continue;
             if (!std.mem.endsWith(u8, se.name, ".safetensors")) continue;
-            try out.append(allocator, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.name, se.name }));
+            try out.ensureUnusedCapacity(allocator, 1);
+            out.appendAssumeCapacity(try std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.name, se.name }));
         }
     }
 }

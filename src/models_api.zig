@@ -1341,7 +1341,7 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
         defer t.allocator.free(config_json);
         try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
         try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = c.gen });
-        var cfg = model_mod.ModelConfig{ .model_type = c.arch, .gen_enable_thinking = model_mod.parseGenerationDefaultsFromJson(c.gen).enable_thinking };
+        var cfg = model_mod.ModelConfig{ .model_type = c.arch, .gen_enable_thinking = (try model_mod.parseGenerationDefaultsFromJson(c.gen)).enable_thinking };
         var entry = model_registry_mod.LoadedModel{
             .allocator = t.allocator,
             .id = "m",

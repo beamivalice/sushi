@@ -77,7 +77,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `message_delta` restates both since the cache hit is known only after prefill; a `system`-role message past index 0
   (Claude Code's hook output, Codex's mid-input `developer` turn on Responses) renders where it was sent, folded only
   for a template that cannot place it ([server-tool-calling](server-tool-calling.md#templates)); `developer` reads as
-  `system` (`canonicalRole`).
+  `system` and OpenAI's older `function` result as `tool` (`canonicalRole`): every role in `chat.request_roles`
+  reaches every served template's prompt, never a fallback.
 - **`/v1/messages/count_tokens`** takes a `/v1/messages` body (`max_tokens` optional, ignored) and answers
   `{"input_tokens": N}`: the prompt `/v1/messages` prefills for it, through the same `renderAnthropicPrompt`.
   Image and video rows count as `placeMedia` expands them, without the tower (`placeRequestMedia`); a body
@@ -420,7 +421,8 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
     `sushi:prefix_cache_evictions_total{tier}`, `sushi:prefix_cache_evicted_bytes_total{tier}`, `sushi:prefix_cache_hot_bytes`
     ([engine-prefix-cache](engine-prefix-cache.md#tier-counters)).
   - `"token_cache":{"bytes":n,"hits":n,"misses":n,"evictions":n}`: the prompt token caches of every loaded model
-    (`segment_cache.zig`): bytes held now, segments looked up that hit and missed, segments dropped for room.
+    (`segment_cache.zig`): bytes held now, segments looked up that hit and missed, segments dropped for room. An
+    unload empties the model's cache, so `bytes` counts resident models only.
     `/metrics`: `sushi:token_cache_bytes`, `sushi:token_cache_hits_total`, `sushi:token_cache_misses_total`,
     `sushi:token_cache_evictions_total` ([server-tool-calling](server-tool-calling.md)).
   - `"speculative":{"mtp":{...},"dflash":{...},"dspark":{...}}`, one object per drafting mode (MTP: Qwen and MiMo heads;

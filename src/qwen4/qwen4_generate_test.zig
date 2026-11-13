@@ -438,7 +438,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
@@ -580,7 +580,7 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
@@ -677,7 +677,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
@@ -851,7 +851,7 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const previous = group_planner.enabled_override;
     group_planner.enabled_override = true;
@@ -941,7 +941,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prior = group_planner.enabled_override;
     group_planner.enabled_override = true;
@@ -1137,7 +1137,7 @@ test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncu
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
@@ -1244,7 +1244,7 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
     qwen4_forward.compileQwen4Hc(&xfm);
     qwen4_forward.compileGdnGate(&xfm);
     xfm.compileMoeRouting();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);

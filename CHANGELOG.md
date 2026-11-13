@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Chat requests and pack loads are sturdier**: an OpenAI `function`-role message is read as a tool result on every
+  model, a pack whose tokenizer files are malformed fails to load with a line that names the key instead of taking
+  the server down, and text a client sends is never read as a special token or cut out of a continued reply.
 - **DeepSeek-V4.1-Flash decodes about 3% faster on Sushi Cooler, serial and speculative**: seven small steps of each
   layer now ride the kernels beside them, so a token issues about 80 fewer GPU dispatches for the same output.
 - **A sampled DeepSeek token is drawn by one GPU kernel on Sushi Cooler**: temperature, top-k, top-p and the draw

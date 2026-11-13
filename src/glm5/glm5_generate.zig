@@ -570,7 +570,7 @@ test "GLM snapshot backoff lands the prompt-end checkpoint on a pool boundary" {
 test "GLM short prompts and odd chunk widths still checkpoint only on pool boundaries" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -595,7 +595,7 @@ test "GLM short prompts and odd chunk widths still checkpoint only on pool bound
 test "an empty prompt is a typed error at the generator, never an index" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -614,7 +614,7 @@ fn glmGeneratorFixture(weights: *model_mod.Weights) !model_mod.ModelConfig {
 test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefills its suffix exactly like cold" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var first: [300]u32 = undefined;
     for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
@@ -702,7 +702,7 @@ test "a GLM prefill without checkpoints chunks like any other prefill" {
 test "the GLM prefill holds as many checkpoints as its schedule says, and ends on the newest" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -746,7 +746,7 @@ const GlmReleasing = struct {
 test "a GLM prefill whose hook releases landed checkpoints holds at most two states and lists every restore point" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -798,7 +798,7 @@ const GlmStepDown = struct {
 test "GLM checkpoints stay on the grid when a request steps its chunk down, and a restore there with the same widths matches cold" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -864,7 +864,7 @@ fn commitTestRound(gen: *Generator, tokens: []const u32) !void {
 test "GLM thought point: the round that carries the closer is cut to a pool boundary, its state is the newest checkpoint, and a restore from it is the live state" {
     try mlx.requireGpu();
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [300]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 3);

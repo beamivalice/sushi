@@ -378,7 +378,16 @@ pub fn promptOpensThink(
 ) bool {
     if (prompt_ids.len == 0) return false;
     const n = @min(prompt_ids.len, 8);
-    const tail = tok.decode(allocator, prompt_ids[prompt_ids.len - n ..]) catch return false;
+    var ids = prompt_ids[prompt_ids.len - n ..];
+    // Where the opener is one token, the text after it must be whitespace: request text spelling it is not it.
+    if (atomicTokenId(allocator, tok, think_tags.BARE_THINK_OPENER)) |open| {
+        const at = std.mem.lastIndexOfScalar(u32, ids, open) orelse return false;
+        ids = ids[at + 1 ..];
+        const rest = tok.decode(allocator, ids) catch return false;
+        defer allocator.free(rest);
+        return std.mem.trim(u8, rest, "\n\r\t ").len == 0;
+    }
+    const tail = tok.decode(allocator, ids) catch return false;
     defer allocator.free(tail);
     return think_tags.promptTailOpensThink(tail);
 }
@@ -2474,12 +2483,13 @@ pub fn handleChatCompletions(
         if (rf == .object) {
             const rf_type = if (rf.object.get("type")) |t| (if (t == .string) t.string else "") else "";
             if (std.mem.eql(u8, rf_type, "json_schema")) {
-                const declared: ?std.json.Value = if (rf.object.get("json_schema")) |js| (if (js == .object) js.object.get("schema") else null) else null;
+                const js_obj: ?std.json.ObjectMap = if (rf.object.get("json_schema")) |js| (if (js == .object) js.object else null) else null;
+                const declared: ?std.json.Value = if (js_obj) |o| o.get("schema") else null;
                 if (declared == null or declared.? != .object) {
                     try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "response_format.json_schema.schema must be a JSON object (use {\"type\":\"json_object\"} for unconstrained JSON)", 400);
                     return;
                 }
-                if (request_parse.strictSchemaFault(allocator, .{ .obj = rf.object.get("json_schema").?.object, .path = "response_format.json_schema" }, has_tools)) |why| {
+                if (request_parse.strictSchemaFault(allocator, .{ .obj = js_obj.?, .path = "response_format.json_schema" }, has_tools)) |why| {
                     defer allocator.free(why);
                     log.warn("POST /v1/chat/completions -> 400 (strict schema not enforceable)\n", .{});
                     try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
@@ -3140,10 +3150,11 @@ pub fn cachedFormatChat(
     continue_final: bool,
 ) ![]u32 {
     const cache_ptr: ?*tokenize_cache_mod.TokenizeCache = if (lm.tokenize_cache) |*tc| tc else null;
-    const key_opt: ?u64 = if (cache_ptr != null)
-        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final, chat_config.preserve_thinking)
+    const key_opt: ?tokenize_cache_mod.TokenizeCache.Key = if (cache_ptr != null)
+        try tokenize_cache_mod.TokenizeCache.keyFor(allocator, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final, chat_config.preserve_thinking)
     else
         null;
+    defer if (key_opt) |key| allocator.free(key.bytes);
     if (cache_ptr) |cache| if (key_opt) |key| {
         if (try cache.get(io, key, allocator)) |cached| return cached;
     };
@@ -3284,6 +3295,7 @@ fn readOpenAiMessages(wire: *WireMessages, items: []const std.json.Value, vp: ch
         const obj = msg_val.object;
         const role_val = obj.get("role") orelse continue;
         if (role_val != .string) continue;
+        const role = chat_mod.canonicalRole(role_val.string);
 
         var read: ReadContent = .{};
         if (obj.get("content")) |cv| switch (cv) {
@@ -3293,7 +3305,7 @@ fn readOpenAiMessages(wire: *WireMessages, items: []const std.json.Value, vp: ch
         };
 
         var msg_tool_calls: ?[]const chat_mod.ToolCall = null;
-        if (std.mem.eql(u8, role_val.string, "assistant")) {
+        if (std.mem.eql(u8, role, "assistant")) {
             if (obj.get("tool_calls")) |tc_val| {
                 if (tc_val == .array) {
                     var tcs = std.ArrayList(chat_mod.ToolCall).empty;
@@ -3317,7 +3329,7 @@ fn readOpenAiMessages(wire: *WireMessages, items: []const std.json.Value, vp: ch
             }
         }
 
-        const tool_call_id: ?[]const u8 = if (std.mem.eql(u8, role_val.string, "tool"))
+        const tool_call_id: ?[]const u8 = if (std.mem.eql(u8, role, "tool"))
             (if (obj.get("tool_call_id")) |v| (if (v == .string) v.string else null) else null)
         else
             null;
@@ -3326,15 +3338,15 @@ fn readOpenAiMessages(wire: *WireMessages, items: []const std.json.Value, vp: ch
         // starves templates that persist reasoning across turns: every
         // prior turn renders the empty <think></think> nothink signature and
         // the model stops thinking from turn 2 of a session.
-        const msg_reasoning: ?[]const u8 = if (std.mem.eql(u8, role_val.string, "assistant"))
+        const msg_reasoning: ?[]const u8 = if (std.mem.eql(u8, role, "assistant"))
             messageReasoningFromObj(obj)
         else
             null;
 
-        if (read.text.len == 0 and msg_tool_calls == null and read.images == null and read.videos == null and read.audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        if (read.text.len == 0 and msg_tool_calls == null and read.images == null and read.videos == null and read.audio == null and msg_reasoning == null and !std.mem.eql(u8, role, "tool")) continue;
 
         try wire.messages.append(allocator, .{
-            .role = chat_mod.canonicalRole(role_val.string),
+            .role = role,
             .content = read.text,
             .tool_calls = msg_tool_calls,
             .tool_call_id = tool_call_id,
@@ -3972,7 +3984,7 @@ test "defaultEnableMtp: a served MoE pack with its head loaded defaults ON; stre
 
 test "reasoningWithinBudget cuts a thought at the budget and keeps a shorter one whole" {
     const a = std.testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.vocab.deinit();
     defer tok.id_to_token.deinit();
     defer tok.merge_ranks.deinit();
@@ -4361,3 +4373,16 @@ pub fn readAllFromPair(fd: std.posix.fd_t, buf: []u8) []u8 {
     return buf[0..got];
 }
 
+
+test "promptOpensThink: only the think token opens a think block, never its spelling in request text" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{"<think>"});
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
+    var spelled: [10]u32 = undefined;
+    for ("x <think>\n", &spelled) |b, *id| id.* = b;
+    try std.testing.expect(!promptOpensThink(a, &tok, &spelled));
+    try std.testing.expect(promptOpensThink(a, &tok, &.{ 'x', 256, '\n' }));
+    try std.testing.expect(!promptOpensThink(a, &tok, &.{ 256, 'x' }));
+}

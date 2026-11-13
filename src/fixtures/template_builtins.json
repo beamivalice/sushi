@@ -1,5 +1,5 @@
 {
-"generator": "tests/dump_template_oracle.py builtins: transformers 5.22.2 chat-template environment, jinja2 3.1.6, Python 3.14.7",
+"generator": "tests/dump_template_oracle.py builtins: transformers 5.22.2 chat-template environment, jinja2 3.1.6, Python 3.14.8",
 "cases": [
 {
 "covers": "filter abs",
@@ -130,6 +130,14 @@
 "python_error": "OverflowError: cannot convert float infinity to integer"
 },
 {
+"covers": "filter int",
+"label": "filter int #7",
+"template": "{{ '١٢'|int }} {{ '١٢'|float }} {{ ' ٣ '|int }} {{ '１２'|int }} {{ '١٢'|int(base=16) }} {{ '²'|int }} {{ ' 1　'|int }} {{ '　 1.5'|float }} {{ '١.٥'|float }}",
+"extra": "{}",
+"python": "12 12.0 3 12 18 0 1 1.5 1.5",
+"python_error": null
+},
+{
 "covers": "filter items",
 "label": "filter items #1",
 "template": "{% for k, v in d|items %}{{ k }}={{ v }};{% endfor %}",
@@ -199,6 +207,14 @@
 "template": "{{ ['ab', 'c']|map('map', 'upper')|map('list')|list }} {{ ['a']|map('map', 'map', 'upper')|map('map', 'list')|map('list')|list }}",
 "extra": "{}",
 "python": "[['A', 'B'], ['C']] [[['A']]]",
+"python_error": null
+},
+{
+"covers": "filter map",
+"label": "filter map #3",
+"template": "{{ xs|map(attribute='a.b', default='x')|list }} {{ ys|map(attribute='a.0', default='x')|list }}",
+"extra": "{\"xs\": [{\"a\": {\"b\": 1}}, {\"a\": {}}, {}, {\"c\": 1}], \"ys\": [{\"a\": [5]}, {\"a\": []}, {}]}",
+"python": "[1, 'x', 'x', 'x'] [5, 'x', 'x']",
 "python_error": null
 },
 {
@@ -338,6 +354,22 @@
 "python_error": null
 },
 {
+"covers": "filter sum",
+"label": "filter sum #2",
+"template": "{{ [0.1, 0.2, 0.3]|sum }} {{ [1e100, 1.0, -1e100]|sum }} {{ ([0.1] * 10)|sum }} {{ [3, 1e16, 1e-300, -2]|sum }} {{ [0.1, 2, true]|sum(start=0.5) }} {{ [1e308, 1e308, -1e308]|sum }}",
+"extra": "{}",
+"python": "0.6 1.0 1.0 1.0000000000000002e+16 3.6 inf",
+"python_error": null
+},
+{
+"covers": "filter sum",
+"label": "filter sum #3",
+"template": "{{ []|sum(start='a') }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: sum() can't sum strings [use ''.join(seq) instead]"
+},
+{
 "covers": "filter title",
 "label": "filter title #1",
 "template": "{{ 'hello wORLD-foo (bar) x_y'|title }}",
@@ -378,6 +410,14 @@
 "python_error": null
 },
 {
+"covers": "filter tojson",
+"label": "filter tojson #5",
+"template": "{{ ([1]|tojson(indent=3000000))|length }} {{ 5|tojson(indent=3000000) }} {{ [1, [2]]|tojson(indent=-1) }}",
+"extra": "{}",
+"python": "3000005 5 [\n1,\n[\n2\n]\n]",
+"python_error": null
+},
+{
 "covers": "filter trim",
 "label": "filter trim #1",
 "template": "{{ '  x \\n'|trim }}|{{ '--x--'|trim('-') }}",
@@ -400,6 +440,22 @@
 "extra": "{}",
 "python": "abc abcdefghij",
 "python_error": null
+},
+{
+"covers": "filter truncate",
+"label": "filter truncate #3",
+"template": "{{ [1, 2]|truncate(5) }} {{ {'a': 1}|truncate(3) }} {{ range(8)|list|truncate(3) }}",
+"extra": "{}",
+"python": "[1, 2] {'a': 1} [0, 1, 2, 3, 4, 5, 6, 7]",
+"python_error": null
+},
+{
+"covers": "filter truncate",
+"label": "filter truncate #4",
+"template": "{{ range(300)|list|truncate(5) }}",
+"extra": "{}",
+"python": null,
+"python_error": "AttributeError: 'list' object has no attribute 'rsplit'"
 },
 {
 "covers": "filter unique",
@@ -1346,6 +1402,54 @@
 "python_error": null
 },
 {
+"covers": "operator %",
+"label": "operator % #5",
+"template": "{{ '%.2s|%.0s|%.9s' % ('abcdef', 'x', 'ab') }} {{ '%.3d|%.3d|%.1d|%.3i|%.3d' % (7, -7, 1234, true, 1.5) }} {{ '%.3r' % ('abc',) }}",
+"extra": "{}",
+"python": "ab||ab 007|-007|1234|001|001 'ab",
+"python_error": null
+},
+{
+"covers": "operator %",
+"label": "operator % #6",
+"template": "{{ '%.2s'|safe % '<a>' }} {{ '%.4r'|safe % '<a>' }}",
+"extra": "{}",
+"python": "&l &#39",
+"python_error": null
+},
+{
+"covers": "operator %",
+"label": "operator % #7",
+"template": "{{ '' % [1, 2] }}|{{ '%s' % [1, 2] }}|{{ '' % {'a': 1} }}|{{ '%s' % {'a': 1} }}",
+"extra": "{}",
+"python": "|[1, 2]||{'a': 1}",
+"python_error": null
+},
+{
+"covers": "operator %",
+"label": "operator % #8",
+"template": "{{ '%s %s' % {'a': 1} }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: not enough arguments for format string"
+},
+{
+"covers": "operator %",
+"label": "operator % #9",
+"template": "{{ '' % 5 }}",
+"extra": "{}",
+"python": null,
+"python_error": "TypeError: not all arguments converted during string formatting"
+},
+{
+"covers": "operator %",
+"label": "operator % #10",
+"template": "{{ '%.99999999999s' % 'a' }}",
+"extra": "{}",
+"python": null,
+"python_error": "ValueError: precision too big"
+},
+{
 "covers": "operator <",
 "label": "operator < #5",
 "template": "{{ 9223372036854775807 < 9223372036854775808 }} {{ 9223372036854775807 == 9223372036854775808 }} {{ 18446744073709551616 < 18446744073709551617 }} {{ 18446744073709551617 > 18446744073709551616 }} {{ 18446744073709551617 == 18446744073709551616.0 }} {{ 18446744073709551616 == 18446744073709551616.0 }} {{ -18446744073709551617 < -18446744073709551616 }} {{ -18446744073709551617 > -18446744073709551616.0 }} {{ 18446744073709551617 < 18446744073709555712.0 }} {{ 18446744073709551617 > 18446744073709551616.0 }} {{ -9223372036854775809 < -9223372036854775808 }} {{ 1e300 > 99999999999999999999999 }} {{ -1e400 < -99999999999999999999 }}",
@@ -1511,6 +1615,86 @@
 "template": "{{ x[0] }} {{ x[-1] }} {{ d['a'] }} {{ x.0 }} {{ d.b }} {{ y.1.0 }} {{ x[9] }}|",
 "extra": "{\"d\": {\"b\": 2, \"a\": 1, \"c\": null}, \"x\": [1, 2, 3], \"y\": [0, [5]]}",
 "python": "1 3 1 1 2 5 |",
+"python_error": null
+},
+{
+"covers": "attribute",
+"label": "attribute #1",
+"template": "{{ 5.real }} {{ 5.imag }} {{ 5.numerator }} {{ 5.denominator }} {{ x.real }} {{ x.imag }} {{ x.denominator }}|{{ true.real }} {{ true.denominator }}",
+"extra": "{\"x\": 2.5}",
+"python": "5 0 5 1 2.5 0.0 |1 1",
+"python_error": null
+},
+{
+"covers": "attribute",
+"label": "attribute #2",
+"template": "{% macro m(a, b=1) %}{{ caller() }}{{ kwargs }}{% endmacro %}{{ m.name }} {{ m.arguments }} {{ m.catch_kwargs }} {{ m.catch_varargs }} {{ m.caller }}",
+"extra": "{}",
+"python": "m ('a', 'b') True False True",
+"python_error": null
+},
+{
+"covers": "attribute",
+"label": "attribute #3",
+"template": "{% macro m() %}{% endmacro %}{{ m.name }} {{ m.arguments }} {{ m.catch_kwargs }} {{ m.catch_varargs }} {{ m.caller }}|{{ m.defaults }}|{{ m.nope }}|",
+"extra": "{}",
+"python": "m () False False False|||",
+"python_error": null
+},
+{
+"covers": "attribute",
+"label": "attribute #4",
+"template": "{% macro outer() %}{{ caller.name }}|{{ caller.arguments }}{% endmacro %}{% call(a) outer() %}{% endcall %}",
+"extra": "{}",
+"python": "None|('a',)",
+"python_error": null
+},
+{
+"covers": "attribute",
+"label": "attribute #5",
+"template": "{{ d.__x__ }}|{{ d.__len__ }}|{{ d._y }}|{{ d['__x__'] }}|{{ d.__class__ }}|",
+"extra": "{\"d\": {\"__x__\": 1, \"__len__\": 2, \"_y\": 3}}",
+"python": "1||3|1||",
+"python_error": null
+},
+{
+"covers": "attribute",
+"label": "attribute #6",
+"template": "{{ 5.bit_length() }}",
+"extra": "{}",
+"python": "3",
+"python_error": null
+},
+{
+"covers": "print",
+"label": "print #1",
+"template": "{% for i in range(3) %}{{ loop }}{% endfor %}|{% macro m() %}{% endmacro %}{{ m }}|{% macro o() %}{{ caller }}{% endmacro %}{% call o() %}{% endcall %}",
+"extra": "{}",
+"python": "<LoopContext 1/3><LoopContext 2/3><LoopContext 3/3>|<Macro 'm'>|<Macro anonymous>",
+"python_error": null
+},
+{
+"covers": "markup methods",
+"label": "markup methods #1",
+"template": "{{ ('<a>'|safe).replace('a', '<') }}|{{ ('<a>'|safe).replace('<', 'x') }}|{{ ('a&b'|safe).replace('&', '&amp;') }}",
+"extra": "{}",
+"python": "<&lt;>|xa>|a&amp;amp;b",
+"python_error": null
+},
+{
+"covers": "markup methods",
+"label": "markup methods #2",
+"template": "{% set p = ('<a> <b>'|safe).split() %}{{ p[0] ~ '<' }}|{{ p[0] + '<' }}|{{ p|length }}|{% set p = ('<a>,<b>'|safe).split(',') %}{{ p[1] + '&' }}|{% set q = ('<a>,<b>'|safe).rsplit(',', 1) %}{{ q[0] + '&' }}",
+"extra": "{}",
+"python": "<a><|<a>&lt;|2|<b>&amp;|<a>&amp;",
+"python_error": null
+},
+{
+"covers": "markup methods",
+"label": "markup methods #3",
+"template": "{{ ('<a>'|safe).strip('<') }}|{{ ('<a>'|safe).lstrip('<>') }}|{{ ('x<'|safe).rstrip('<') }}|{{ ('<a>'|safe).strip() + '<' }}|{{ ('<a>'|safe).upper() + '<' }}|{{ ('<a>'|safe).title() + '&' }}|{{ ('<a>'|safe).capitalize() + '&' }}|{{ ('<A>'|safe).lower() + '&' }}|{{ ('<a>'|safe).startswith('<') }}|{{ ('&lt;'|safe).startswith('<') }}|{{ ('a<'|safe).endswith('<') }}",
+"extra": "{}",
+"python": "a>|a>|x|<a>&lt;|<A>&lt;|<A>&amp;|<a>&amp;|<a>&amp;|True|False|True",
 "python_error": null
 },
 {
@@ -1712,6 +1896,86 @@
 "extra": "{}",
 "python": "2",
 "python_error": null
+},
+{
+"covers": "statement macro",
+"label": "statement macro #7",
+"template": "{% macro m(caller) %}{% endmacro %}",
+"extra": "{}",
+"python": "",
+"python_error": null
+},
+{
+"covers": "statement macro",
+"label": "statement macro #8",
+"template": "{% macro m(caller=1) %}{{ caller }}{% endmacro %}{{ m() }}",
+"extra": "{}",
+"python": "1",
+"python_error": null
+},
+{
+"covers": "statement set",
+"label": "statement set #3",
+"template": "{% set (a) = [1] %}{{ a }}|{% set (a, b), c = [[1, 2], 3] %}{{ a }}{{ b }}{{ c }}|{% set ((a)) = 1 %}{{ a }}|{% set () = [] %}x|{% set (a), b = 1, 2 %}{{ a }}{{ b }}|{% set loop = 5 %}{{ loop }}",
+"extra": "{}",
+"python": "[1]|123|1|x|12|5",
+"python_error": null
+},
+{
+"covers": "statement set",
+"label": "statement set #4",
+"template": "{% set a, = [1] %}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateSyntaxError: unexpected '='"
+},
+{
+"covers": "statement for",
+"label": "statement for #5",
+"template": "{% for (a) in [[1, 2]] %}{{ a }}{% endfor %}|{% for (a, (b, c)) in [[1, [2, 3]]] %}{{ a }}{{ b }}{{ c }}{% endfor %}|{% for (a,) in [[1]] %}{{ a }}{% endfor %}|{% macro m() %}{{ caller(1) }}{% endmacro %}{% for x in [1] %}{% call(loop) m() %}{{ loop }}{% endcall %}{% endfor %}",
+"extra": "{}",
+"python": "[1, 2]|123|1|1",
+"python_error": null
+},
+{
+"covers": "statement for",
+"label": "statement for #6",
+"template": "{% for a, in [[1]] %}{% endfor %}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateSyntaxError: expected token 'in', got '['"
+},
+{
+"covers": "statement for",
+"label": "statement for #7",
+"template": "{% for loop in [1] %}{% endfor %}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateAssertionError: Can't assign to special loop variable in for-loop target"
+},
+{
+"covers": "statement for",
+"label": "statement for #8",
+"template": "{% for x in [1] %}{% if true %}{% set loop = 5 %}{% endif %}{% endfor %}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateAssertionError: Can't assign to special loop variable in for-loop target"
+},
+{
+"covers": "statement for",
+"label": "statement for #9",
+"template": "{% for x in [1] %}{% macro m() %}{% set loop = 5 %}{% endmacro %}{% endfor %}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateAssertionError: Can't assign to special loop variable in for-loop target"
+},
+{
+"covers": "statement for",
+"label": "statement for #10",
+"template": "{% for x in [1] %}x{% else %}{% set loop %}t{% endset %}{% endfor %}",
+"extra": "{}",
+"python": null,
+"python_error": "TemplateAssertionError: Can't assign to special loop variable in for-loop target"
 },
 {
 "covers": "statement call",

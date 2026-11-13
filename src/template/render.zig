@@ -153,7 +153,7 @@ pub const Renderer = struct {
     /// `n` steps of work.
     pub fn tick(self: *Renderer, n: u64) Failure!void {
         @setRuntimeSafety(true);
-        self.meter.tick(n) catch return self.fail("the render takes more than {d} steps", .{self.limits.max_steps});
+        self.meter.tick(n) catch |e| return self.named(e);
     }
 
     /// The work of a pass over `bytes` bytes: one step per 64.
@@ -195,7 +195,13 @@ pub const Renderer = struct {
     pub fn toText(self: *Renderer, v: Value) Failure!Str {
         @setRuntimeSafety(true);
         if (v.strOf()) |s| return s;
-        return .{ .bytes = try self.toStr(v), .origin = value.originIn(v, 0) };
+        return .{ .bytes = try self.toStr(v), .origin = try self.origin(v) };
+    }
+
+    /// The strictest origin of a string in `v` (`value.originIn`), metered.
+    pub fn origin(self: *Renderer, v: Value) Failure!value.Origin {
+        @setRuntimeSafety(true);
+        return value.originIn(&self.meter, v, 0) catch |e| self.named(e);
     }
 
     /// Python `str(v)` as a new string.
@@ -203,11 +209,7 @@ pub const Renderer = struct {
         @setRuntimeSafety(true);
         if (v.str()) |s| return s;
         var buf = std.ArrayList(u8).empty;
-        value.writeStr(&self.meter, &buf, self.arena, v, 0) catch |e| {
-            if (e == error.TemplateRuntime and !self.meter.spent()) if (value.unprintable(v, 0)) |kind|
-                return self.fail("a {s} cannot be printed: Python prints it with its address", .{kind});
-            return self.wrap(e, "the value nests too deep to print");
-        };
+        value.writeStr(&self.meter, &buf, self.arena, v, 0) catch |e| return self.named(e);
         try self.charge(buf.items.len);
         return buf.items;
     }
@@ -215,18 +217,23 @@ pub const Renderer = struct {
     /// Python's TypeError for a key it cannot hash.
     pub fn hashable(self: *Renderer, key: Value) Failure!void {
         @setRuntimeSafety(true);
-        if (value.unhashable(key, 0)) |t| return self.fail("unhashable type: '{s}'", .{t});
+        if (value.unhashable(&self.meter, key, 0) catch |e| return self.named(e)) |t| return self.fail("unhashable type: '{s}'", .{t});
     }
 
-    /// Gives a bare failure from `value.zig` its message.
-    pub fn wrap(self: *Renderer, e: Failure, comptime what: []const u8) Failure {
+    /// A bare failure from a value walk, named for why it stopped (`Meter.why`); any other failure as it is.
+    pub fn named(self: *Renderer, e: Failure) Failure {
         @setRuntimeSafety(true);
-        return switch (e) {
-            error.TemplateRuntime => if (self.meter.spent())
-                self.fail("the render takes more than {d} steps", .{self.limits.max_steps})
-            else
-                self.fail(what, .{}),
-            else => e,
+        if (e != error.TemplateRuntime) return e;
+        const why = self.meter.take() orelse return e;
+        return switch (why) {
+            .steps => self.fail("the render takes more than {d} steps", .{self.limits.max_steps}),
+            .depth => self.fail("the values nest deeper than {d}", .{value.max_depth}),
+            .order => |t| self.fail("'<' not supported between instances of '{s}' and '{s}'", .{ t[0], t[1] }),
+            .nan => self.fail("sort: a NaN cannot be ordered", .{}),
+            .print => |kind| self.fail("a {s} cannot be printed: Python prints it with its address", .{kind}),
+            .json => |t| self.fail("tojson: a value of type '{s}' is not JSON serializable", .{t}),
+            .text => self.fail("the render builds more text than its limit", .{}),
+            .range => self.fail("a range past 128 bits cannot be printed", .{}),
         };
     }
 
@@ -270,7 +277,7 @@ pub const Renderer = struct {
             .for_ => |s| return self.forLoop(s, frame),
             .set => |s| try self.assign(s.target, try self.eval(s.value, frame), frame),
             .set_block => |s| {
-                const text, const flow = try self.capture(s.body, frame);
+                const text, const flow = try self.capture(s.body, try self.bodyFrame(.set_block, frame));
                 if (flow != .normal) return flow;
                 var v: Value = .{ .string = text };
                 if (s.filter) |f| v = try self.evalFilter(f, v, frame);
@@ -283,16 +290,26 @@ pub const Renderer = struct {
                 try self.write(try self.toText(v));
             },
             .filter_block => |s| {
-                const text, const flow = try self.capture(s.body, frame);
+                const text, const flow = try self.capture(s.body, try self.bodyFrame(.filter_block, frame));
                 if (flow != .normal) return flow;
                 const body: Value = .{ .string = text };
                 try self.write(try self.toText(try self.evalFilter(s.filter, body, frame)));
             },
-            .generation => |body| return self.renderBody(body, frame),
+            .generation => |body| return self.renderBody(body, try self.bodyFrame(.generation, frame)),
             .break_ => return .break_,
             .continue_ => return .continue_,
         }
         return .normal;
+    }
+
+    /// The frame a body of `kind` runs in (`ast.bodyOf`): `frame` itself, or a child of it, in the arena since a macro
+    /// the body defines may outlive it.
+    fn bodyFrame(self: *Renderer, comptime kind: std.meta.Tag(Node.Kind), frame: *Frame) Failure!*Frame {
+        @setRuntimeSafety(true);
+        if (comptime ast.bodyOf(kind) == .inline_) return frame;
+        const child = try self.arena.create(Frame);
+        child.* = .{ .parent = frame };
+        return child;
     }
 
     fn macroValue(self: *Renderer, m: *const ast.Macro, frame: *Frame, is_caller: bool) Failure!Value {
@@ -399,9 +416,14 @@ pub const Renderer = struct {
             },
             .string, .markup => |s| blk: {
                 var chars = std.ArrayList(Value).empty;
-                var it = std.unicode.Utf8View.initUnchecked(s.bytes).iterator();
+                var it = value.codepoints(s.bytes);
                 var at: usize = 0;
-                while (it.nextCodepointSlice()) |c| : (at += c.len) try chars.append(self.arena, .{ .string = try s.slice(self.arena, at, at + c.len) });
+                // A string per character: a step each.
+                while (it.nextCodepointSlice()) |c| : (at += c.len) {
+                    try self.tick(1);
+                    value.spend(1);
+                    try chars.append(self.arena, .{ .string = try s.slice(self.arena, at, at + c.len) });
+                }
                 break :blk chars.items;
             },
             else => self.fail("'{s}' object is not iterable", .{value.typeName(v)}),
@@ -412,10 +434,10 @@ pub const Renderer = struct {
         @setRuntimeSafety(true);
         switch (target) {
             .name => |n| try frame.vars.put(self.arena, n, v),
-            .names => |names| {
+            .tuple => |targets| {
                 const items = try self.iterate(v);
-                if (items.len != names.len) return self.fail("cannot unpack {d} values into {d} names", .{ items.len, names.len });
-                for (names, items) |n, item| try frame.vars.put(self.arena, n, item);
+                if (items.len != targets.len) return self.fail("cannot unpack {d} values into {d} names", .{ items.len, targets.len });
+                for (targets, items) |t, item| try self.assign(t, item, frame);
             },
             .attr => |a| {
                 const ns = lookup(frame, a.namespace) orelse return self.fail("'{s}' is undefined", .{a.namespace});
@@ -535,12 +557,12 @@ pub const Renderer = struct {
         for (c.ops) |op| {
             const right = try self.eval(op.expr, frame);
             const ok = switch (op.op) {
-                .eq => value.eql(&self.meter, left, right, 0) catch |e| return self.wrap(e, "the values nest too deep to compare"),
-                .ne => !(value.eql(&self.meter, left, right, 0) catch |e| return self.wrap(e, "the values nest too deep to compare")),
+                .eq => value.eql(&self.meter, left, right, 0) catch |e| return self.named(e),
+                .ne => !(value.eql(&self.meter, left, right, 0) catch |e| return self.named(e)),
                 .in => try builtins.contains(self, right, left),
                 .notin => !try builtins.contains(self, right, left),
                 else => blk: {
-                    const o = (value.order(&self.meter, left, right, 0) catch |e| return self.wrap(e, "the values cannot be ordered")) orelse break :blk false;
+                    const o = (value.order(&self.meter, left, right, 0) catch |e| return self.named(e)) orelse break :blk false;
                     break :blk switch (op.op) {
                         .lt => o == .lt,
                         .lteq => o != .gt,
@@ -735,6 +757,7 @@ pub const Renderer = struct {
         switch (obj) {
             .list => |l| {
                 const picks = try sliceIndices(self.arena, l.items.items.len, start, stop, stride);
+                try self.tick(picks.len);
                 const out = try self.arena.alloc(Value, picks.len);
                 for (picks, out) |i, *v| v.* = l.items.items[i];
                 const sliced = try self.newList(out, l.kind);
@@ -751,14 +774,25 @@ pub const Renderer = struct {
             },
             .string, .markup => |str| {
                 try self.scan(str.bytes.len);
-                var bounds = std.ArrayList(usize).empty;
-                var it = std.unicode.Utf8View.initUnchecked(str.bytes).iterator();
-                var at: usize = 0;
-                while (it.nextCodepointSlice()) |c| : (at += c.len) try bounds.append(self.arena, at);
-                try bounds.append(self.arena, str.bytes.len);
-                const picks = try sliceIndices(self.arena, bounds.items.len - 1, start, stop, stride);
+                const picks = try sliceIndices(self.arena, cpCount(str.bytes), start, stop, stride);
+                // A piece per pick, a step each; the code points walked are those from the first pick to the last.
+                try self.tick(picks.len);
                 var buf: value.Builder = .{};
-                for (picks) |i| try buf.appendPart(self.arena, str, bounds.items[i], bounds.items[i + 1]);
+                if (picks.len > 0) {
+                    const lo = @min(picks[0], picks[picks.len - 1]);
+                    const hi = @max(picks[0], picks[picks.len - 1]) + 1;
+                    const bounds = try self.arena.alloc(usize, hi - lo + 1);
+                    var it = value.codepoints(str.bytes);
+                    var at: usize = 0;
+                    var i: usize = 0;
+                    while (i < hi) : (i += 1) {
+                        const c = it.nextCodepointSlice().?;
+                        if (i >= lo) bounds[i - lo] = at;
+                        at += c.len;
+                    }
+                    bounds[hi - lo] = at;
+                    for (picks) |p| try buf.appendPart(self.arena, str, bounds[p - lo], bounds[p - lo + 1]);
+                }
                 return if (obj == .markup) .{ .markup = buf.str() } else .{ .string = buf.str() };
             },
             else => unreachable,
@@ -819,6 +853,7 @@ fn sliceIndices(arena: Allocator, len: usize, start: ?i64, stop: ?i64, step: i64
     @setRuntimeSafety(true);
     const ij = sliceEnds(len, start, stop, step);
     var out = std.ArrayList(usize).empty;
+    defer value.spend(out.items.len);
     // i128: a step near the i64 edge must not overflow the index past the end.
     var i: i128 = ij[0];
     if (step > 0) {
@@ -839,6 +874,7 @@ fn rangeSlice(b: [3]i128, i: i64, j: i64, k: i64) ?[3]i128 {
 
 pub fn cpCount(s: []const u8) usize {
     @setRuntimeSafety(true);
+    value.spend(s.len / 64 + 1);
     var n: usize = 0;
     for (s) |c| {
         if (c & 0xC0 != 0x80) n += 1;
@@ -849,6 +885,7 @@ pub fn cpCount(s: []const u8) usize {
 /// Code points `from..to` of `s`.
 pub fn cpSlice(s: []const u8, from: usize, to: usize) []const u8 {
     @setRuntimeSafety(true);
+    value.spend(s.len / 64 + 1);
     var start: usize = s.len;
     var end: usize = s.len;
     var n: usize = 0;

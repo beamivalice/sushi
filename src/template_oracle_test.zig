@@ -739,6 +739,7 @@ const builtin_differences = [_]struct { label: []const u8, why: []const u8 }{
     .{ .label = "operator slice #11", .why = "Jinja2 folds an all-literal slice at compile time through getitem, which makes one Python refuses undefined; the engine raises as Python does at run time" },
     .{ .label = "method title #2", .why = "case mapping is ASCII-only: a non-ASCII letter does not join a word, so the letter after it starts one" },
     .{ .label = "test sameas #2", .why = "`sameas` is identity of the engine's values: equal literals are not one object as CPython's interned constants are" },
+    .{ .label = "attribute #6", .why = "a number's methods (`bit_length`, `is_integer`, ...) are refused by name: no served template calls one" },
 };
 
 fn requiredBuiltinNames(arena: std.mem.Allocator) ![]const []const u8 {
@@ -858,7 +859,7 @@ test "template oracle: a special spelled in an assistant turn is its token only 
         var cfg = s.config;
         try cfg.compile();
         defer cfg.dropCompiled();
-        try tok.bindTemplate(cfg.printedFacts(), pt.stops);
+        try tok.bindTemplate(cfg.printedFacts(), pt.stops, &.{});
         for ([_][]const []const u8{ rule.text, rule.token }, [_]bool{ false, true }) |specials, is_token| for (specials) |special| {
             const id = tok.specialTokenId(special).?;
             for ([_][]const u8{ "assistant", "user" }) |role| {
@@ -907,7 +908,7 @@ test "template oracle: a prompt encoded through the segment cache is the prompt 
         var cfg = s.config;
         try cfg.compile();
         defer cfg.dropCompiled();
-        try tok.bindTemplate(cfg.printedFacts(), pt.stops);
+        try tok.bindTemplate(cfg.printedFacts(), pt.stops, &.{});
         // Every prompt of the corpus, encoded without a cache.
         var prompts = std.ArrayList(Call).empty;
         for (requests) |r| for (r.arms) |arm| {
@@ -950,4 +951,269 @@ test "template oracle: a prompt encoded through the segment cache is the prompt 
         checked += prompts.items.len;
     }
     try testing.expect(checked > 0);
+}
+
+test "served templates: every role a request may carry reaches the prompt on every served template, never a fallback" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var toks = std.ArrayList(*tokenizer_mod.Tokenizer).empty;
+    defer for (toks.items) |t| tokenizer_mod.deinitTestTokenizer(t);
+    const served = try servedTemplates(a, arena_state.allocator(), &toks);
+    for (served) |s| {
+        var cfg = s.config;
+        try cfg.compile();
+        defer cfg.dropCompiled();
+        for (chat.request_roles) |raw_role| {
+            const call = [_]ToolCall{.{ .id = "c1", .name = "get_time", .arguments = "{}" }};
+            const m = [_]Message{
+                .{ .role = "user", .content = "q" },
+                .{ .role = "assistant", .content = "", .tool_calls = &call },
+                .{ .role = chat.canonicalRole(raw_role), .content = "FUNCRESULT", .tool_call_id = "c1" },
+                .{ .role = "user", .content = "next" },
+            };
+            const before = chat.template_fallbacks.load(.monotonic);
+            const out = try chat.renderChatTemplate(a, &m, &cfg, get_time_tools, null, true, null, false);
+            defer a.free(out);
+            try testing.expectEqual(before, chat.template_fallbacks.load(.monotonic));
+            try testing.expect(std.mem.indexOf(u8, out, "FUNCRESULT") != null);
+        }
+    }
+}
+
+// ── Client text spelled as every special, in every field ──
+
+const PoisonField = enum {
+    system,
+    user,
+    tool_content,
+    tool_call_id,
+    tool_description,
+    param_description,
+    forced_name,
+    effort_word,
+    text_around_image,
+    late_system,
+    assistant_content,
+    assistant_reasoning,
+    assistant_arg_value,
+    assistant_arg_key,
+    assistant_call_name,
+};
+
+fn poisonSpecials(arena: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, blocked_only: bool) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    var it = tok.special_tokens.iterator();
+    var n: usize = 0;
+    while (it.next()) |e| {
+        const id = e.value_ptr.*;
+        const blocked = std.sort.binarySearch(u32, tok.assistant_blocked, id, struct {
+            fn order(x: u32, y: u32) std.math.Order {
+                return std.math.order(x, y);
+            }
+        }.order) != null;
+        if (blocked_only and !blocked) continue;
+        // DeepSeek-V4.1 holds 1283 specials: every blocked one, and a sample of the rest.
+        if (tok.special_tokens.count() > 200 and !blocked and n > 60) continue;
+        if (tok.special_tokens.count() > 200 and blocked and n > 120) continue;
+        try buf.appendSlice(arena, e.key_ptr.*);
+        try buf.append(arena, ' ');
+        n += 1;
+    }
+    return buf.items;
+}
+
+fn specialIds(a: std.mem.Allocator, ids: []const u32) ![]u32 {
+    var out = std.ArrayList(u32).empty;
+    for (ids) |id| if (id >= 256) try out.append(a, id);
+    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+    return out.toOwnedSlice(a);
+}
+
+fn jsonText(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    try chat.appendJsonString(arena, &buf, s);
+    return buf.items;
+}
+
+const PoisonOut = struct { ids: []u32, text: []const u8 };
+
+fn poisonRender(a: std.mem.Allocator, arena: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, cfg: *const chat.ChatConfig, field: PoisonField, x: []const u8, xb: []const u8) !PoisonOut {
+    return poisonRenderWith(a, arena, tok, cfg, field, x, xb, null);
+}
+
+fn poisonRenderWith(a: std.mem.Allocator, arena: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, cfg: *const chat.ChatConfig, field: PoisonField, x: []const u8, xb: []const u8, extra_role: ?[]const u8) !PoisonOut {
+    const P = struct {
+        fn pick(f: PoisonField, want: PoisonField, poison: []const u8) []const u8 {
+            return if (f == want) poison else "x";
+        }
+    };
+    const xx = x;
+    const name = try std.mem.concat(arena, u8, &.{ "g", P.pick(field, .forced_name, xx) });
+    const tools = try std.mem.concat(arena, u8, &.{
+        "[{\"type\":\"function\",\"function\":{\"name\":\"fn\",\"description\":",
+        try jsonText(arena, try std.mem.concat(arena, u8, &.{ "d ", P.pick(field, .tool_description, xx), " d" })),
+        ",\"parameters\":{\"type\":\"object\",\"properties\":{\"k\":{\"type\":\"string\",\"description\":",
+        try jsonText(arena, try std.mem.concat(arena, u8, &.{ "p ", P.pick(field, .param_description, xx), " p" })),
+        "}}}}},{\"type\":\"function\",\"function\":{\"name\":",
+        try jsonText(arena, name),
+        ",\"description\":\"g\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]",
+    });
+    const arg_key = try std.mem.concat(arena, u8, &.{ "k", P.pick(field, .assistant_arg_key, xb) });
+    const args = try std.mem.concat(arena, u8, &.{ "{", try jsonText(arena, arg_key), ":", try jsonText(arena, try std.mem.concat(arena, u8, &.{ "v ", P.pick(field, .assistant_arg_value, xb), " v" })), "}" });
+    const call_name = try std.mem.concat(arena, u8, &.{ "fn", P.pick(field, .assistant_call_name, xb) });
+    const call_id = try std.mem.concat(arena, u8, &.{ "c1", P.pick(field, .tool_call_id, xx) });
+    const h_calls = try arena.dupe(ToolCall, &.{.{ .id = call_id, .name = call_name, .arguments = args }});
+    const img = try arena.dupe(chat.ImageData, &.{.{ .pixels = "", .width = 1, .height = 1 }});
+    const around = try std.mem.concat(arena, u8, &.{ "look ", P.pick(field, .text_around_image, xx), " here" });
+    const parts = try arena.dupe(chat.MediaPart, &.{.{ .at = 5, .kind = .image }});
+    var h_msgs = std.ArrayList(Message).empty;
+    try h_msgs.append(arena, .{ .role = "system", .content = try std.mem.concat(arena, u8, &.{ "s ", P.pick(field, .system, xx), " s" }) });
+    try h_msgs.append(arena, .{ .role = "user", .content = try std.mem.concat(arena, u8, &.{ "u ", P.pick(field, .user, xx), " u" }) });
+    try h_msgs.append(arena, .{
+        .role = "assistant",
+        .content = try std.mem.concat(arena, u8, &.{ "a ", P.pick(field, .assistant_content, xb), " a" }),
+        .reasoning_content = try std.mem.concat(arena, u8, &.{ "r ", P.pick(field, .assistant_reasoning, xb), " r" }),
+        .tool_calls = h_calls,
+    });
+    try h_msgs.append(arena, .{ .role = "tool", .content = try std.mem.concat(arena, u8, &.{ "t ", P.pick(field, .tool_content, xx), " t" }), .tool_call_id = call_id });
+    if (field == .late_system) try h_msgs.append(arena, .{ .role = "system", .content = try std.mem.concat(arena, u8, &.{ "late ", xx, " late" }) });
+    if (extra_role) |r| try h_msgs.append(arena, .{ .role = r, .content = "f" });
+    if (field == .text_around_image) {
+        try h_msgs.append(arena, .{ .role = "user", .content = around, .images = img, .media_parts = parts });
+    } else try h_msgs.append(arena, .{ .role = "user", .content = "u2" });
+    const instr = (try (tool_calls_mod.ToolChoice{ .named = name }).instruction(arena)).?;
+    const effort: ?[]const u8 = if (field == .effort_word) try std.mem.concat(arena, u8, &.{ "e", xx }) else "ex";
+    const ids = try chat.formatChat(a, tok, h_msgs.items, cfg, tools, instr, true, effort, false);
+    const text = try chat.renderChatTemplate(arena, h_msgs.items, cfg, tools, instr, true, effort, false);
+    return .{ .ids = ids, .text = text };
+}
+
+
+// Every special of a served pack spelled in each client field: a field the client writes adds no special id, an
+// assistant field only what the model writes in a turn, and the ids decode to the rendered text.
+test "served packs: client text in any field adds no special id, assistant text only what the model can write" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var toks = std.ArrayList(*tokenizer_mod.Tokenizer).empty;
+    defer for (toks.items) |t| tokenizer_mod.deinitTestTokenizer(t);
+    const served = try servedTemplates(a, arena, &toks);
+    var checked: usize = 0;
+    for (served) |s| {
+        if (s.tok == null) continue;
+        const pt = try tokenizer_mod.packTokenizerForTests(a, arena, s.id);
+        const tok = try arena.create(tokenizer_mod.Tokenizer);
+        tok.* = pt.tok;
+        try toks.append(arena, tok);
+        var cfg = s.config;
+        try cfg.compile();
+        defer cfg.dropCompiled();
+        try tok.bindTemplate(cfg.printedFacts(), pt.stops, &.{});
+        const x = try poisonSpecials(arena, tok, false);
+        const xb = try poisonSpecials(arena, tok, true);
+        for (std.enums.values(PoisonField)) |field| {
+            const clean = try poisonRender(a, arena, tok, &cfg, field, "x", "x");
+            defer a.free(clean.ids);
+            const got = try poisonRender(a, arena, tok, &cfg, field, x, xb);
+            defer a.free(got.ids);
+            const decoded = try tok.decode(a, got.ids);
+            defer a.free(decoded);
+            try testing.expectEqualStrings(got.text, decoded);
+            const want_sp = try specialIds(a, clean.ids);
+            defer a.free(want_sp);
+            const got_sp = try specialIds(a, got.ids);
+            defer a.free(got_sp);
+            try testing.expectEqualSlices(u32, want_sp, got_sp);
+            checked += 1;
+        }
+    }
+    if (checked == 0) return error.SkipZigTest;
+}
+
+test "served packs: the fallbacks (ChatML after a raise, a template with no tool branch, no template) keep client text text" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const qwen = arch_fx.qwen_template orelse return error.SkipZigTest;
+    const Cfg = struct { text: []const u8, extra_role: ?[]const u8 };
+    const cfgs = [_]Cfg{
+        // An unknown role makes Qwen3.8's template raise.
+        .{ .text = qwen, .extra_role = "narrator" },
+        .{ .text = "{% for m in messages %}{% if m.role in ['system','user','assistant'] %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}", .extra_role = null },
+        .{ .text = "", .extra_role = null },
+    };
+    for (cfgs) |c| {
+        const pt = try tokenizer_mod.packTokenizerForTests(a, arena, "qwen38_flash_next");
+        const tok = try arena.create(tokenizer_mod.Tokenizer);
+        tok.* = pt.tok;
+        defer tokenizer_mod.deinitTestTokenizer(tok);
+        var cfg: chat.ChatConfig = .{ .chat_template = c.text, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a, .model_type = arch_fx.qwen_model_type };
+        try cfg.compile();
+        defer cfg.dropCompiled();
+        try tok.bindTemplate(cfg.printedFacts(), pt.stops, &.{});
+        const x = try poisonSpecials(arena, tok, false);
+        const xb = try poisonSpecials(arena, tok, true);
+        for (std.enums.values(PoisonField)) |field| {
+            const clean = try poisonRenderWith(a, arena, tok, &cfg, field, "x", "x", c.extra_role);
+            defer a.free(clean.ids);
+            const got = try poisonRenderWith(a, arena, tok, &cfg, field, x, xb, c.extra_role);
+            defer a.free(got.ids);
+            const want_sp = try specialIds(a, clean.ids);
+            defer a.free(want_sp);
+            const got_sp = try specialIds(a, got.ids);
+            defer a.free(got_sp);
+            try testing.expectEqualSlices(u32, want_sp, got_sp);
+        }
+    }
+}
+
+test "served templates: ill-formed UTF-8 in any message field renders mended, with no fallback, and encodes to the render" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var toks = std.ArrayList(*tokenizer_mod.Tokenizer).empty;
+    defer for (toks.items) |t| tokenizer_mod.deinitTestTokenizer(t);
+    const served = try servedTemplates(a, arena, &toks);
+    const bad = "x\xff\xc0\x80\xed\xa0\x80\xe2\x82 y\xf0\x9f\x98";
+    const img = [_]chat.ImageData{.{ .pixels = "", .width = 1, .height = 1 }};
+    for (served) |s| {
+        var cfg = s.config;
+        try cfg.compile();
+        defer cfg.dropCompiled();
+        const tok: ?*tokenizer_mod.Tokenizer = if (s.tok != null) blk: {
+            const pt = try tokenizer_mod.packTokenizerForTests(a, arena, s.id);
+            const t = try arena.create(tokenizer_mod.Tokenizer);
+            t.* = pt.tok;
+            try toks.append(arena, t);
+            try t.bindTemplate(cfg.printedFacts(), pt.stops, &.{});
+            break :blk t;
+        } else null;
+        const call = [_]ToolCall{.{ .id = "c" ++ bad, .name = "get" ++ bad, .arguments = "{\"k\": \"" ++ bad ++ "\"}" }};
+        const m = [_]Message{
+            .{ .role = "system", .content = bad },
+            .{ .role = "user", .content = "look" ++ bad, .images = &img, .media_parts = &.{.{ .at = 6, .kind = .image }} },
+            .{ .role = "assistant", .content = bad, .reasoning_content = bad, .tool_calls = &call },
+            .{ .role = "tool", .content = bad, .tool_call_id = "c" ++ bad },
+            .{ .role = "user", .content = bad },
+            .{ .role = "assistant", .content = "partial " ++ bad },
+        };
+        for ([_]bool{ false, true }) |cont| {
+            const before = chat.template_fallbacks.load(.monotonic);
+            const text = try chat.renderChatTemplate(a, &m, &cfg, get_weather_tools, null, true, null, cont);
+            defer a.free(text);
+            try testing.expectEqual(before, chat.template_fallbacks.load(.monotonic));
+            try testing.expect(std.unicode.utf8ValidateSlice(text));
+            if (tok) |t| {
+                const ids = try chat.formatChat(a, t, &m, &cfg, get_weather_tools, null, true, null, cont);
+                defer a.free(ids);
+                const dec = try t.decode(a, ids);
+                defer a.free(dec);
+                try testing.expectEqualStrings(text, dec);
+            }
+        }
+    }
 }

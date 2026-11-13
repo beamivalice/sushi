@@ -175,7 +175,7 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
     defer mtp_weights.deinit();
     var head = (try mimo_mtp.Head.load(a, mlx.gpuStream(), &config, &mtp_weights)) orelse return error.SkipZigTest;
     defer head.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const want: usize = 64;
     const kv = trunk_mod.KVQuantConfig.affine(8);

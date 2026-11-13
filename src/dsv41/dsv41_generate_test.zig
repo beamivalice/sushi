@@ -70,7 +70,7 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     try testing.expect(dsv41_state.modelOf(&xfm).?.dspark != null and xfm.moduleStateSpecRollback());
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     const prompt = ids[0..30];
@@ -250,7 +250,7 @@ test "dsv41 generator: copy rounds keep greedy text the serial decode's, whole o
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     const prompt = ids[0..30];
@@ -336,7 +336,7 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     try testing.expect(dsv41_state.modelOf(&xfm).?.dspark != null);
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     const prompt = ids[0..30];
@@ -404,7 +404,7 @@ test "dsv41 engine: DSpark rounds on the engine of our own say MLX's tokens at e
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
     try testing.expect(m.dspark != null);
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prompt = ids[0..30];
     const want: u32 = 60;
@@ -502,7 +502,7 @@ test "dsv41 engine: a sampled DSpark request on the engine of our own repeats at
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
     try testing.expect(m.dspark != null);
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prompt = ids[0..30];
     const want: u32 = 60;
@@ -586,7 +586,7 @@ test "dsv41 generator: a seeded sampled request verifies at one width whatever t
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prompt = ids[0..30];
     const want: u32 = 60;
@@ -664,7 +664,7 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     const prompt = ids[0..30];
@@ -734,7 +734,7 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const s = xfm.s;
     var prompt: [600]u32 = undefined;
@@ -893,7 +893,7 @@ test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_T
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
 
     var baseline: usize = 0;
@@ -931,7 +931,7 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prompt = ids[0..30];
     const cases = [_]struct { sampling: SamplingParams, logprobs: u32, want: u32 = 12 }{
@@ -1124,7 +1124,7 @@ fn lazyHeadProof(dir: []const u8, stq: bool, dspark: bool) !void {
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
     try testing.expectEqual(dspark, m.dspark != null);
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prompt = ids[0..30];
     const steps: usize = 24;
@@ -1762,7 +1762,7 @@ fn censusOf(dir: []const u8, work: *[9]u64) ![9]Asked {
     asked[8] = try c.end("the load");
     work[8] = c.dispatched;
     const m = fx.model();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf)[0..40];
@@ -2320,7 +2320,7 @@ test "dsv41 engine: a prompt's tokens and the logits after them do not depend on
     const m = fx.model();
     // Wider than a decode-width pass, as the release's window is.
     m.cfg.window = 20;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [600]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = fx.ids[(i * 5 + 3) % fx.ids.len];
@@ -2412,7 +2412,7 @@ test "dsv41 engine: a Cooler load whose warm does not fit its bill fails by name
         }
         var fx: EngineFixture = undefined;
         try fx.open(dir);
-        var tok = Tokenizer.initEmptyForTests(a);
+        var tok = Tokenizer.initEmpty(a);
         defer tok.deinit();
         var buf: [24]u32 = undefined;
         var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, &fx.xfm, &tok, fx.prompt(&buf), 8, .{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
@@ -3260,7 +3260,7 @@ test "dsv41 engine: a prompt prefilled in chunks on the engine of our own, with 
     const m = dsv41_state.modelOf(&xfm).?;
     // Wider than a decode-width pass, as the release's window is: a narrower replay reads the ring below its floor.
     m.cfg.window = 20;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [1400]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
@@ -3336,7 +3336,7 @@ test "dsv41 engine: after the load's warm a sampled DSpark request, seeded or no
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
     try testing.expect(m.dspark != null);
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     m.engine_decode = true;
     dsv41_borrow.own_override = true;
@@ -3424,7 +3424,7 @@ test "dsv41 generator: a thinking bound fires between DSpark rounds, commits its
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const closer: u32 = 4;
     const forced = [_]u32{ 3, closer, 10 };
@@ -3593,7 +3593,7 @@ fn thinkBoundSparkProof(env: [*:0]const u8, stq: bool) !void {
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prompt = ids[0..30];
     const want: u32 = 30;
@@ -3685,7 +3685,7 @@ test "dsv41 generator: prefill checkpoints sit on chunk boundaries, and a restor
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
 
@@ -3749,7 +3749,7 @@ test "dsv41 generator: a chat prompt's snapshot sits before its last assistant o
     config.expert_source_dir = try a.dupe(u8, dir);
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const opener: u32 = 201;
     try tok.special_tokens.put(try a.dupe(u8, "<\u{ff5c}Assistant\u{ff5c}>"), opener);
@@ -3816,7 +3816,7 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     var prompt: [1400]u32 = undefined;
@@ -3961,7 +3961,7 @@ test "dsv41 generator: a prefill that skips the decoder tails nothing reads give
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [1400]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
@@ -4011,7 +4011,7 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
     config.expert_source_dir = try a.dupe(u8, dir);
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     var prompt: [1400]u32 = undefined;
@@ -4064,7 +4064,7 @@ test "dsv41 generator: after a DSpark request the slot cache marks its rows and 
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     // The scheduler's slot owns a cache with one entry per layer; the Trunk's own is a shell.
     // `initSlot` hands every slot the engine's default KV scheme, whatever the pack reports.
@@ -4147,7 +4147,7 @@ test "dsv41 DSpark: --max-mtp-ctx ends drafting once the context passes it (DSV4
     defer st.deinit(a);
     var xfm = try Trunk.init(io, a, st.config, &st.weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prompt = st.ids[0..30];
     const saved = generate.max_mtp_ctx;
@@ -4180,7 +4180,7 @@ test "dsv41 DSpark: a drafted image-token id rides the verify chunk as a plain t
     defer st.deinit(a);
     var xfm = try Trunk.init(io, a, st.config, &st.weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var g = try Generator.initWithOptions(io, a, &xfm, &tok, st.ids[0..30], 8, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
     defer g.deinit(a);
@@ -4338,7 +4338,7 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     try testing.expect(dsv41_state.modelOf(&xfm).?.dspark != null);
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const greedy = SamplingParams{ .temperature = 0.0 };
     const prompt = ids[0..30];
@@ -4731,7 +4731,7 @@ test "every generator start path copies the launch round options (DSV41_TINY)" {
     defer st.deinit(a);
     var xfm = try Trunk.init(io, a, st.config, &st.weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const saved_lookup = generate.mtp_lookup_disabled;
     const saved_ctx = generate.max_mtp_ctx;
@@ -4758,7 +4758,7 @@ test "dsv41 generator: a DFlash round is refused by name, not asserted (DSV41_TI
     defer st.deinit(a);
     var xfm = try Trunk.init(io, a, st.config, &st.weights);
     defer xfm.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var g = try Generator.initWithOptions(io, a, &xfm, &tok, st.ids[0..30], 8, .{ .temperature = 0.0 }, &.{}, .{});
     defer g.deinit(a);
@@ -4911,7 +4911,7 @@ test "dsv41 engine: a request's first token and every serial step put no op on M
     defer fx.deinit();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf)[0..30];
@@ -4978,7 +4978,7 @@ test "dsv41 engine: a DSpark round with penalties, a thinking penalty, a logit b
     defer fx.deinit();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf)[0..30];
@@ -5060,7 +5060,7 @@ test "dsv41 engine: a seeded request gives the same tokens, the first one includ
     try fx.open(dir);
     defer fx.deinit();
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf)[0..30];
@@ -5148,7 +5148,7 @@ test "dsv41 engine: the serial sampler and a DSpark row draw one token for one p
 fn mlxRouteIds(fx: *EngineFixture, sampling: SamplingParams, rounds: bool, out: *std.ArrayList(u32)) !void {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf)[0..30];
@@ -5375,7 +5375,7 @@ test "dsv41 engine: requests, repeated, leave the engine's pool as they found it
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was_enabled);
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const greedy: SamplingParams = .{ .temperature = 0.0 };
     for (0..3) |_| {
@@ -5409,7 +5409,7 @@ test "dsv41 engine: a request dropped after any round or step leaks nothing, and
     var fx: EngineFixture = undefined;
     try fx.open(dir);
     defer fx.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf)[0..40];
@@ -5698,7 +5698,7 @@ test "dsv41 engine: after a model on MLX beside it served and ended a request, t
     var cooler: EngineFixture = undefined;
     try cooler.open(dir);
     defer cooler.deinit();
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var buf: [48]u32 = undefined;
     const prompt = cooler.prompt(&buf)[0..40];
@@ -5768,7 +5768,7 @@ test "dsv41 engine: the Cooler's live restore points reach the SSD tier at an id
         on_mlx.deinit();
         turn.end();
     }
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var buf: [600]u32 = undefined;
     const prompt = cooler.prompt(&buf);
@@ -5904,7 +5904,7 @@ test "dsv41 engine: forwards and requests give the same bytes whatever the pool'
             try testing.expectEqualSlices(u8, clean.items, got.items);
         }
     }
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prompt = ids[0..30];
     const seeded: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
@@ -5929,7 +5929,7 @@ test "dsv41 engine: a request gives one text serial and in rounds of any width, 
     if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
-    var tok = Tokenizer.initEmptyForTests(a);
+    var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const seeded: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
     const cases = [_]SamplingParams{
