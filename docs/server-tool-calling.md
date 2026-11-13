@@ -262,6 +262,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - Strip pos-0 unclosed openers; `trimTrailingThinkClosers`; unparsed tool markup never rides out as reasoning OR
   content (`trimLeakedToolMarkup`, ONE cut).
+- A reply whose tool markup parsed to no call ends its turn as a plain `stop` with the markup cut: the log names it
+  (`[tool-parse]`, written by `parseToolCallsForRequest`, the bytes cut and where they start).
 - Whether a prompt ends inside a think block is a property of the RENDERED BYTES (`promptOpensThink`), never ANDed
   with `enable_thinking`; `in_think_block` seeds from `prompt_opened_think` ALONE at every stream site; a model can
   open its OWN block (`modelThinkOpener`).

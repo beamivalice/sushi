@@ -179,7 +179,7 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
 
 Server log `~/.sushi/logs/sushi-<port>.log` is THE post-mortem file (`--log-level debug`). Grep its tags:
 `jinja render failed`, `[load] chat template:`, `<- N+M tokens`, `tool_msgs=`, `[cache]`, `[spec-stats]`, `[mtp-planner]`,
-`[loop-stop]`, `[admission]`, `[kv-cache]`, `[expert-stream]`, `[disk-cache]`, `[hot-cache]`, `[prefill-trace]`, `[engine]`, `[load]`, `[pipelines]`. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` →
+`[loop-stop]`, `[tool-parse]`, `[admission]`, `[kv-cache]`, `[expert-stream]`, `[disk-cache]`, `[hot-cache]`, `[prefill-trace]`, `[engine]`, `[load]`, `[pipelines]`. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` →
 `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; stop your own server by PID, never
 `pkill`. `/props` reports `active_bytes`,
 `memory.cache_bytes`, `batching`; RSS is blind to Metal.

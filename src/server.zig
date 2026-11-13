@@ -757,8 +757,10 @@ pub fn parseToolCallsForRequest(
         if (tools_json) |tj| parsed_calls = try tool_schema.filterInferredBySchema(allocator, c, tj);
     }
     var calls = parsed_calls orelse
-        (if (tools_json) |tj| try tool_schema.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
+        (if (tools_json) |tj| try tool_schema.inferBareJsonToolCalls(allocator, text, tj) else null) orelse {
+        noteUnparsedToolMarkup(text);
         return null;
+    };
     if (!allow_parallel and calls.len > 1) {
         log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});
         for (calls[1..]) |tc| {
@@ -781,6 +783,15 @@ pub fn parseToolCallsForRequest(
         }
     }
     return calls;
+}
+
+/// A reply whose tool markup gave no call goes out as text with the markup cut, and its turn ends as a plain stop:
+/// this line is the log's one trace of why.
+fn noteUnparsedToolMarkup(text: []const u8) void {
+    const at = think_tags.leakedToolMarkupStart(text) orelse return;
+    var quoted: [512]u8 = undefined;
+    const n = log.appendQuoted(&quoted, 0, text[at..], 96);
+    log.info("[tool-parse] tool markup parsed to no call and is cut from the reply: {d} bytes from byte {d}, {s}\n", .{ text.len - at, at, quoted[0..n] });
 }
 
 /// Start the HTTP server on the given host and port.
@@ -3687,6 +3698,40 @@ test "parseToolCallsForRequest: truncated DATA object is not promoted to a tool 
         allocator.free(cs);
     };
     try std.testing.expect(calls == null);
+}
+
+test "parseToolCallsForRequest: tool markup that parses to no call leaves one log line, prose leaves none" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const log_path = try std.fmt.allocPrint(allocator, "{s}/s.log", .{root});
+    defer allocator.free(log_path);
+    const tools =
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    // A stray token inside the invoke tag: the block names no call.
+    const wrecked = "I'll list the files.\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}inv\u{793c}oke name=\"bash\">\n" ++
+        "<\u{ff5c}DSML\u{ff5c}parameter name=\"command\" string=\"true\">ls</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>";
+    try log.openFile(log_path, 0);
+    const none = parseToolCallsForRequest(allocator, wrecked, tools, true) catch |e| {
+        log.closeFile();
+        return e;
+    };
+    const prose = parseToolCallsForRequest(allocator, "The files are listed above.", tools, true) catch |e| {
+        log.closeFile();
+        return e;
+    };
+    log.closeFile();
+    try std.testing.expect(none == null);
+    try std.testing.expect(prose == null);
+    const logged = try tmp.dir.readFileAlloc(io, "s.log", allocator, .limited(1 << 16));
+    defer allocator.free(logged);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, logged, "[tool-parse]"));
+    try std.testing.expect(std.mem.indexOf(u8, logged, "inv\u{793c}oke name=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logged, "from byte 22,") != null);
 }
 
 test "parseToolCallsForRequest: raw-JSON call with a DECLARED name still parses" {

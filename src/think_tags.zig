@@ -444,9 +444,8 @@ fn miniCpm5MarkupCut(text: []const u8) ?usize {
     return null;
 }
 
-/// Cut visible text at the first unparsed tool-call marker. Returns a prefix
-/// slice (no alloc); text with no marker is returned untouched.
-pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
+/// Where the first unparsed tool-call marker of `text` starts; null with none.
+pub fn leakedToolMarkupStart(text: []const u8) ?usize {
     var cut: usize = text.len;
     for (tool_markup_openers) |m| {
         if (std.mem.indexOf(u8, text, m)) |p| {
@@ -462,7 +461,13 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
     if (bareInvokeMarkupCut(text)) |p| {
         if (p < cut) cut = p;
     }
-    if (cut == text.len) return text;
+    return if (cut == text.len) null else cut;
+}
+
+/// Cut visible text at the first unparsed tool-call marker. Returns a prefix
+/// slice (no alloc); text with no marker is returned untouched.
+pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
+    const cut = leakedToolMarkupStart(text) orelse return text;
     return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
 }
 
