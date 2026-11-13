@@ -533,6 +533,34 @@ recorded, not rerun.
   continuation diverged, and a code round at 8k accepted 3.92 to 4.12 tokens against 4.45. The decode forward is
   unchanged, and the same request sent three times, greedy and seeded, gives one reply each.
 
+### Release ladder at `96220dc6` (2026-11-13, the series' record)
+
+`tests/bench.sh --tag cooler-p2d`, the same pack and flags, commit `96220dc6`, binary SHA-256 `c3930da767fa3faf`, M5 Max
+128 GB, AC, fans at max, `taskpolicy -a`, GPU lock, boot at 49 °C, no Warnings (no kernel compiled inside a request).
+The box had run the full test suite until a minute before the boot: pressure read Nominal through the code arm and the
+prose arm to 32k, Moderate from prose 40k, Heavy from prose 106k. Beside it the `2aa5ddaf` table above, recorded, not
+rerun. Since that table: the kept scales, the Engram batch reads, the attention scores and the hyper-connection mix
+(the four fast benches above), and the snapshot before the last assistant opener.
+
+| rung | code decode | was | prose decode | was | code prefill | was | prose prefill | was |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4k | 94.5 | 93.3 | 56.0 | 53.1 | 1,395 | 1,300 | 874 | 893 |
+| 8k | 91.5 | 99.6 | 58.0 | 58.4 | 1,578 | 1,476 | 1,437 | 1,311 |
+| 16k | 80.2 | 76.2 | 54.1 | 54.4 | 1,557 | 1,524 | 1,496 | 1,427 |
+| 32k | 91.7 | 88.7 | 58.2 | 54.1 | 1,534 | 1,480 | 1,440 | 1,374 |
+| 64k | 85.4 | 83.4 | 50.5 (Moderate) | 54.0 | 1,462 | 1,417 | 1,370 (Moderate) | 1,313 |
+| 128k | 74.1 | 75.2 | 51.0 (Heavy) | 52.3 | 1,297 | 1,272 | 1,254 (Heavy) | 1,195 |
+
+- **Prefill is 2 to 10% above the `2aa5ddaf` table at every rung but the first prose window**, and above v1.6.0 at
+  every rung (code 2 to 12%, prose 2 to 31%). The first prose window (874) is the cold one: its Engram rows came off
+  the SSD after the suite had turned the page cache over.
+- **Code decode moves with the text, not with the round**: the 8k cell ran 50 to 54 rounds at 54.3 to 56.9 ms where
+  the `2aa5ddaf` run ran 47 to 51 at 54.3 to 56.2 ms. The hyper-connection mix moved the prefill's bytes at rounding
+  level, so the greedy continuations are other texts: 16k ran 67 rounds for 73 and 64k 63 for 65, 32k the same 57
+  (48.3 to 52.3 ms a round against 49.1 to 51.9).
+- **Prose decode is level or ahead at Nominal** (4k to 32k) and 2 to 6% under at 64k and 128k, the two cells read at
+  Moderate and Heavy pressure against a rested box's.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.
