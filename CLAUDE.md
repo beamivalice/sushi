@@ -205,12 +205,14 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
 
 **Landing perf.** A speedup is real when it is outside run-to-run noise with arms interleaved in one session.
 - A real speedup that leaves output bit-identical lands whatever its size.
-- A prefill, decode or batching lever worth 5% or more is built and tested, never only noted; one that changes output
-  goes through the KLD gate ([quality-kld](docs/quality-kld.md)).
+- A prefill, decode or batching lever worth 2.5% or more is built and tested, never only noted, serial decode and
+  spec verify first; one that changes output goes through the KLD gate ([quality-kld](docs/quality-kld.md)).
+- A lever is sized as the combined gain of its set (every fusion of one forward, every step of one chain), never one
+  step at a time: a set over the bar is built even when no single step is.
 - At the gate, a KLD change under 0.01% passes; a larger one goes to the owner with its speed gain to decide.
 - Exactness is judged on one hardware path: a NAX arm whose bytes differ from the SIMD arm's (new vs old hardware) is
   not an output change.
-- An output-changing tweak worth about 1% of a token or less is dropped, not queued.
+- An output-changing tweak whose whole set is worth about 1% of a token or less is dropped, not queued.
 - Judge a tweak on top of the change it builds on, not alone against the old code.
 - An optimization lever is decided by a micro indicator (bytes, a count, `sushi-ubench` arms in one process), confirmed
   by the fast bench (`tests/bench.sh --rungs 4k,8k`, once per landing) and recorded by the release bench (once per
