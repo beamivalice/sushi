@@ -350,6 +350,37 @@ test "template: a macro or call block that names one argument twice does not com
     }
 }
 
+/// The steps the parser's meter charged to compile `source`, at most `max` of them; null when it failed.
+fn compileSteps(arena: std.mem.Allocator, source: []const u8, max: u64) !?u64 {
+    @setRuntimeSafety(true);
+    var syntax: lexer.SyntaxError = .{ .pos = 0, .message = "" };
+    const tokens = try lexer.tokenize(arena, try lexer.Lexer.normalize(arena, source), &syntax);
+    var p = parser.Parser{ .arena = arena, .tokens = tokens, .err = &syntax, .meter = .{ .max = max } };
+    _ = p.subparse(&.{}) catch |e| {
+        if (e != error.TemplateSyntax) return e;
+        if (!std.mem.endsWith(u8, syntax.message, "steps to compile")) return error.TestUnexpectedResult;
+        return null;
+    };
+    return p.meter.used;
+}
+
+test "template: a compile's steps grow with its template, its macro parameters too, and past its limit it fails by name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var steps: [2]u64 = undefined;
+    for ([_]usize{ 4000, 8000 }, &steps) |n, *s| {
+        var src = std.ArrayList(u8).empty;
+        try src.appendSlice(arena, "{% macro m(");
+        for (0..n) |i| try src.print(arena, "{s}a{d}", .{ if (i > 0) "," else "", i });
+        try src.appendSlice(arena, ") %}{% endmacro %}x");
+        s.* = (try compileSteps(arena, src.items, parser.max_compile_steps)).?;
+    }
+    // Twice the parameters, at most a little over twice the steps: the duplicate check is no scan per parameter.
+    try testing.expect(steps[1] * 10 < steps[0] * 25);
+    try testing.expectEqual(@as(?u64, null), try compileSteps(arena, "{% for x in [1, 2, 3] %}{{ x }}{% endfor %}", 10));
+}
+
 test "template: a function, which Python prints with its address, is refused by name when printed" {
     for ([_][]const u8{ "{{ 'abc'.upper }}", "{{ range }}", "{{ namespace }}", "{{ [raise_exception] }}" }) |src| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);

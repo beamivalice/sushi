@@ -18,6 +18,10 @@ pub const Error = lexer.Error;
 /// (`a + b + c`, `x.a.b`, `x|f|g`) nests one deeper, as the tree it builds does.
 pub const max_nesting = 200;
 
+/// The work a compile may do, beside the render's `Limits.max_steps`: a token taken or a pair of names compared is a
+/// step. A template of `template.max_template_len` takes far fewer; past it the compile fails by name.
+pub const max_compile_steps = 64_000_000;
+
 const unsupported_statements = [_][]const u8{ "include", "import", "from", "extends", "block", "with", "do", "autoescape", "trans", "print", "raw", "endraw" };
 
 pub const Parser = struct {
@@ -32,6 +36,8 @@ pub const Parser = struct {
     in_for: bool = false,
     /// The special names read since the innermost macro body began.
     specials: ast.Specials = .{},
+    /// The compile's steps (`max_compile_steps`), checked wherever the parser nests.
+    meter: value.Meter = .{ .max = max_compile_steps },
 
     fn fail(self: *Parser, pos: u32, comptime fmt: []const u8, args: anytype) Error {
         @setRuntimeSafety(true);
@@ -51,6 +57,7 @@ pub const Parser = struct {
 
     fn advance(self: *Parser) Token {
         @setRuntimeSafety(true);
+        self.meter.used +|= 1;
         const t = self.tokens[self.i];
         if (t.tag != .eof) self.i += 1;
         return t;
@@ -114,6 +121,12 @@ pub const Parser = struct {
         @setRuntimeSafety(true);
         self.depth += 1;
         if (self.depth > max_nesting) return self.fail(self.cur().pos, "the template nests deeper than {d}", .{max_nesting});
+        try self.checkSteps();
+    }
+
+    fn checkSteps(self: *Parser) Error!void {
+        @setRuntimeSafety(true);
+        if (self.meter.spent()) return self.fail(self.cur().pos, "the template takes more than {d} steps to compile", .{self.meter.max});
     }
 
     fn mk(self: *Parser, pos: u32, kind: Expr.Kind) Error!*const Expr {
@@ -301,6 +314,7 @@ pub const Parser = struct {
     fn signature(self: *Parser) Error![]const ast.Param {
         @setRuntimeSafety(true);
         var params = std.ArrayList(ast.Param).empty;
+        var names = std.ArrayList(Named).empty;
         try self.expectOp("(");
         var defaults = false;
         while (!self.isOp(")")) {
@@ -308,16 +322,47 @@ pub const Parser = struct {
             if (self.isOp(")")) break;
             const at = self.cur().pos;
             const name = try self.expectName();
-            for (params.items) |p| if (std.mem.eql(u8, p.name, name)) return self.fail(at, "duplicate argument '{s}' in function definition", .{name});
             var default: ?*const Expr = null;
             if (self.skipOp("=")) {
                 default = try self.expression(true);
                 defaults = true;
             } else if (defaults) return self.fail(self.cur().pos, "non-default argument follows default argument", .{});
             try params.append(self.arena, .{ .name = name, .default = default });
+            try names.append(self.arena, .{ .name = name, .pos = at });
         }
         try self.expectOp(")");
+        if (try self.firstRepeat(names.items)) |dup| return self.fail(dup.pos, "duplicate argument '{s}' in function definition", .{dup.name});
         return params.items;
+    }
+
+    const Named = struct { name: []const u8, pos: u32 };
+
+    /// The first name of `names` that an earlier one already has, found by a sort: a compile reads a pack's own
+    /// template, whose names a scan per name would compare in their count squared.
+    fn firstRepeat(self: *Parser, names: []const Named) Error!?Named {
+        @setRuntimeSafety(true);
+        if (names.len < 2) return null;
+        const sorted = try self.arena.dupe(Named, names);
+        const Ctx = struct {
+            meter: *value.Meter,
+            fn less(c: *@This(), a: Named, b: Named) value.Failure!bool {
+                @setRuntimeSafety(true);
+                try c.meter.tick(1 + @min(a.name.len, b.name.len) / 64);
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        };
+        var ctx = Ctx{ .meter = &self.meter };
+        value.stableSort(Named, sorted, try self.arena.alloc(Named, sorted.len), &ctx, Ctx.less) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.fail(self.cur().pos, "the template takes more than {d} steps to compile", .{self.meter.max}),
+        };
+        // Equal names keep their order, so each run's second is that name's first repeat.
+        var first: ?Named = null;
+        for (sorted[1..], sorted[0 .. sorted.len - 1]) |b, a| {
+            if (!std.mem.eql(u8, a.name, b.name)) continue;
+            if (first == null or b.pos < first.?.pos) first = b;
+        }
+        return first;
     }
 
     fn macroBody(self: *Parser, pos: u32, name: []const u8, params: []const ast.Param, end: []const u8) Error!*const ast.Macro {

@@ -90,6 +90,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   code points it picks, and `Builder.appendPart` finds its first origin run by binary search. Test builds count the
   work where it is done (`value.work`); a test holds it within 32 steps per step charged, plus 1024, over the hunt's
   adversarial shapes and the mutation corpus.
+  A compile is metered too (`parser.max_compile_steps`, 64M: a token taken or a pair of names compared is a step,
+  checked wherever the parser nests; past it a `TemplateSyntax` by name), and its checks for a repeated name sort
+  the names: a scan per macro parameter took 3.5 s on 80,000 of them, a 4 MiB template of them minutes at load.
   Every fn there opens with `@setRuntimeSafety(true)` (lint `template-runtime-safety`): template text comes from packs.
   Text enters as UTF-8 or not at all: JSON input is checked by its parser, a context built from Zig values by
   `template.fromInput` (`the messages are not valid UTF-8`), and every walk of text reads code points with
