@@ -323,34 +323,33 @@ pub const Renderer = struct {
         @setRuntimeSafety(true);
         if (s.filter == null) if (try self.lazyRange(s.iter, frame)) |range| return self.walk(s, frame, try self.newLoop(&.{}, range));
         const iterable = try self.eval(s.iter, frame);
+        if (iterable == .list and iterable.list.isIterator()) {
+            const src = try self.arena.create(LoopSource);
+            src.* = .{ .r = self, .source = iterable.list };
+            if (s.filter) |f| {
+                const scope = try self.arena.create(Frame);
+                scope.* = .{ .parent = frame };
+                src.filter = .{ .expr = f, .target = s.target, .scope = scope };
+            }
+            const loop = try self.newLoop(&.{}, null);
+            loop.rest = .{ .ctx = src, .next = LoopSource.next };
+            return self.walk(s, frame, loop);
+        }
         const all = try self.walkable(iterable);
         var items = all;
-        // The index in `all` of each item the filter kept.
-        var kept_at = std.ArrayList(usize).empty;
         if (s.filter) |f| {
             const scope = try self.arena.create(Frame);
             scope.* = .{ .parent = frame };
             var kept = std.ArrayList(Value).empty;
-            for (all, 0..) |item, at| {
+            for (all) |item| {
                 try self.step();
                 scope.vars.clearRetainingCapacity();
                 try self.assign(s.target, item, scope);
-                if (value.truthy(try self.eval(f, scope))) {
-                    try kept.append(self.arena, item);
-                    try kept_at.append(self.arena, at);
-                }
+                if (value.truthy(try self.eval(f, scope))) try kept.append(self.arena, item);
             }
             items = kept.items;
         }
-        const loop = try self.newLoop(items, null);
-        const flow = try self.walk(s, frame, loop);
-        // An iterator keeps what the loop did not take from it, as a Python generator left by a `break` does; a
-        // filtered loop took the source items up to the last one it kept.
-        if (iterable == .list and iterable.list.isIterator()) {
-            const taken = if (loop.reach > items.len) all.len else if (s.filter == null) loop.reach else if (loop.reach == 0) 0 else kept_at.items[loop.reach - 1] + 1;
-            iterable.list.items = .fromOwnedSlice(@constCast(all[taken..]));
-        }
-        return flow;
+        return self.walk(s, frame, try self.newLoop(items, null));
     }
 
     fn newLoop(self: *Renderer, items: []const Value, range: ?value.Loop.Range) Failure!*value.Loop {
@@ -359,6 +358,33 @@ pub const Renderer = struct {
         loop.* = .{ .index0 = 0, .items = items, .range = range };
         return loop;
     }
+
+    /// A loop over an iterator: each item it takes is read from the iterator then, through the loop's filter,
+    /// so the loop and anything its body reads share one place in the iterator.
+    const LoopSource = struct {
+        r: *Renderer,
+        source: *value.List,
+        taken: std.ArrayListUnmanaged(Value) = .empty,
+        filter: ?struct { expr: *const Expr, target: ast.Target, scope: *Frame } = null,
+
+        fn next(ctx: *anyopaque, loop: *value.Loop) Failure!bool {
+            @setRuntimeSafety(true);
+            const self: *LoopSource = @ptrCast(@alignCast(ctx));
+            while (try builtins.nextItem(self.r, self.source)) |item| {
+                if (self.filter) |f| {
+                    try self.r.step();
+                    f.scope.vars.clearRetainingCapacity();
+                    try self.r.assign(f.target, item, f.scope);
+                    if (!value.truthy(try self.r.eval(f.expr, f.scope))) continue;
+                }
+                try self.taken.append(self.r.arena, item);
+                loop.items = self.taken.items;
+                return true;
+            }
+            loop.rest = null;
+            return false;
+        }
+    };
 
     /// The bounds of a loop's iterable when it is a call of the global `range`, null for any other.
     fn lazyRange(self: *Renderer, iter: *const Expr, frame: *Frame) Failure!?value.Loop.Range {
@@ -384,11 +410,11 @@ pub const Renderer = struct {
         // Jinja2 marks a loop iterated at the end of a body: `else` runs when no iteration got there, every one
         // left by `break` or `continue`, or there were none.
         var iterated = false;
-        for (0..loop.len()) |i| {
+        var i: usize = 0;
+        while (try loop.has(i)) : (i += 1) {
             try self.step();
             scope.vars.clearRetainingCapacity();
             loop.index0 = i;
-            loop.took(i + 1);
             try scope.vars.put(self.arena, "loop", .{ .loop = loop });
             try self.assign(s.target, loop.at(i), scope);
             switch (try self.renderBody(s.body, scope)) {
@@ -396,7 +422,7 @@ pub const Renderer = struct {
                 .continue_ => {},
                 .break_ => break,
             }
-        } else loop.took(loop.len() + 1);
+        }
         if (iterated) return .normal;
         // The else body is a scope of its own, as an iteration is.
         scope.vars.clearRetainingCapacity();
@@ -423,11 +449,7 @@ pub const Renderer = struct {
         }
         return switch (v) {
             .undefined => &.{},
-            .list => |l| blk: {
-                const items = l.items.items;
-                if (l.isIterator()) l.items = .empty;
-                break :blk items;
-            },
+            .list => |l| if (l.isIterator()) try self.drain(l) else l.items.items,
             .dict => |d| blk: {
                 const keys = try self.arena.alloc(Value, d.entries.items.len);
                 for (d.entries.items, keys) |e, *k| k.* = e.key;
@@ -447,6 +469,19 @@ pub const Renderer = struct {
             },
             else => self.fail("'{s}' object is not iterable", .{value.typeName(v)}),
         };
+    }
+
+    /// Every item left in iterator `l`, taken from it.
+    fn drain(self: *Renderer, l: *value.List) Failure![]const Value {
+        @setRuntimeSafety(true);
+        if (l.lazy == null) {
+            const items = l.items.items;
+            l.items = .empty;
+            return items;
+        }
+        var out = std.ArrayList(Value).empty;
+        while (try builtins.nextItem(self, l)) |item| try out.append(self.arena, item);
+        return out.items;
     }
 
     fn assign(self: *Renderer, target: ast.Target, v: Value, frame: *Frame) Failure!void {
@@ -736,25 +771,25 @@ pub const Renderer = struct {
 
     fn loopField(self: *Renderer, l: *value.Loop, name: []const u8) Failure!Value {
         @setRuntimeSafety(true);
-        const n = l.len();
         const i = l.index0;
         const Field = enum { index, index0, revindex, revindex0, first, last, length, previtem, nextitem, depth, depth0, cycle, changed };
         const field = std.meta.stringToEnum(Field, name) orelse return .{ .undefined = name };
+        // Jinja2 takes the next item to answer `last` and `nextitem`, and every item left for the length.
         switch (field) {
-            .last, .nextitem => l.took(i + 2),
-            .revindex, .revindex0, .length => l.took(n + 1),
+            .revindex, .revindex0, .length => try l.takeAll(),
             else => {},
         }
+        const n = l.len();
         return switch (field) {
             .index => .{ .int = @intCast(i + 1) },
             .index0 => .{ .int = @intCast(i) },
             .revindex => .{ .int = @intCast(n - i) },
             .revindex0 => .{ .int = @intCast(n - i - 1) },
             .first => .{ .boolean = i == 0 },
-            .last => .{ .boolean = i + 1 == n },
+            .last => .{ .boolean = !try l.has(i + 1) },
             .length => .{ .int = @intCast(n) },
             .previtem => if (i > 0) l.at(i - 1) else .{ .undefined = "previtem" },
-            .nextitem => if (i + 1 < n) l.at(i + 1) else .{ .undefined = "nextitem" },
+            .nextitem => if (try l.has(i + 1)) l.at(i + 1) else .{ .undefined = "nextitem" },
             .depth, .depth0, .cycle, .changed => self.fail("unsupported loop attribute 'loop.{s}'", .{name}),
         };
     }

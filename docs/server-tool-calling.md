@@ -149,13 +149,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   template fuzz or a JSONL corpus on both sides (`SUSHI_TEMPLATE_DIFF`) and prints each case that differs.
 - **Where the engine differs from Python Jinja2 on purpose** (beside `builtin_differences`, which lists fixture cases):
   the context's JSON reader (`value.fromJson`) refuses `NaN` and `Infinity`, which Python's json reads (a request body
-  that holds them is not JSON); a filter Python makes a generator (`map`, `select`, `items`) is evaluated where it is
-  applied, so an error Python defers to the first read is raised there; Jinja2's `missing` sentinel, which leaks from
-  a macro defined in a loop and called after it, is not copied.
-- **A loop over a generator takes from it what Jinja2's loop takes**: the items it walked, the next one when
-  `loop.last` or `loop.nextitem` peeks, all of them for `loop.length`, `loop.revindex` or `loop|length`; a loop
-  left by `break` leaves the rest for the next read (`Loop.reach`). Emptying the generator at the loop's start
-  printed `1|[]` where Python printed `1|['2', '3']` after a `break`.
+  that holds them is not JSON); a filter Python makes a generator (`map`, `select`, `reject`, `unique`, `items`)
+  over a list, a dict or a string is evaluated where it is applied, so an error Python defers to the first read is
+  raised there, and its arguments are checked there over a generator too; Jinja2's `missing` sentinel, which leaks
+  from a macro defined in a loop and called after it, is not copied.
+- **A generator is read one item at a time, from one place**: `map`, `select`, `reject` and `unique` over a
+  generator make their items as they are read (`builtins.Lazy`, `nextItem`), so `g|map(..)|first` takes one item of
+  `g`; a for loop takes from the generator what Jinja2's loop takes (the item it is on, the next one when
+  `loop.last` or `loop.nextitem` looks, all of them for `loop.length`, `loop.revindex`, `loop|length` or a printed
+  `loop`), and `first`, `in`, `list` and a loop's body read the same place (`Loop.rest`). A chain of generators
+  nests against the call depth when it is read. Emptying the generator at the loop's start printed `1[]` where
+  Python printed `1['2', '3']` after a `break`.
 - **A loop iteration is its own scope, as in Jinja2**: a body `set` (GLM-5.3's per-message `reasoning_content`)
   neither reaches the next iteration nor leaves the loop (nor does one in the loop's `else`); only a `namespace`
   carries state across. A set block, a filter block and a `generation` body are scopes too, and a `break` crosses

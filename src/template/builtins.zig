@@ -759,6 +759,107 @@ fn joined(r: *Renderer, parts: []const Str) Failure!Str {
     return out.str();
 }
 
+// ── Generators ──
+
+/// What a filter Python makes a generator does with each item of its input.
+const Step = union(enum) {
+    map_filter: struct { filter: Filter, args: []const Value, kws: []const Kw },
+    map_attribute: struct { path: Value, default: ?Value },
+    select: struct { attr: ?Value, test_: ?Test, args: []const Value, kws: []const Kw, keep_when: bool },
+    unique: struct { attr: ?Value, case_sensitive: bool },
+};
+
+/// A filter applied to an iterator: it reads its input one item at a time, as Python's generator does, so a read
+/// of one item takes from the input only what that item needed.
+const Lazy = struct {
+    source: *value.List,
+    step: Step,
+    /// `unique`'s keys so far.
+    seen: std.ArrayListUnmanaged(Value) = .empty,
+};
+
+/// `step` over `input`'s items as a generator: made now over a list, a dict or a string, read as it is read over
+/// an iterator.
+fn generator(r: *Renderer, input: Value, step: Step) Failure!Value {
+    @setRuntimeSafety(true);
+    if (input == .list and input.list.isIterator()) {
+        const lazy = try r.arena.create(Lazy);
+        lazy.* = .{ .source = input.list, .step = try ownStep(r, step) };
+        const l = try r.arena.create(value.List);
+        l.* = .{ .kind = .generator, .lazy = lazy };
+        return .{ .list = l };
+    }
+    var seen = std.ArrayListUnmanaged(Value).empty;
+    var out = std.ArrayList(Value).empty;
+    // A map that applies a filter nests against the call depth.
+    const nests = step == .map_filter;
+    if (nests) try r.enterCall();
+    defer if (nests) {
+        r.call_depth -= 1;
+    };
+    for (try r.iterate(input)) |item| if (try stepItem(r, step, &seen, item)) |v| try out.append(r.arena, v);
+    return r.newList(out.items, .generator);
+}
+
+/// `step` with its arguments in the arena, since a lazy generator applies it after the call returns.
+fn ownStep(r: *Renderer, step: Step) Failure!Step {
+    @setRuntimeSafety(true);
+    var own = step;
+    switch (own) {
+        .map_filter => |*f| {
+            f.args = try r.arena.dupe(Value, f.args);
+            f.kws = try r.arena.dupe(Kw, f.kws);
+        },
+        .select => |*f| {
+            f.args = try r.arena.dupe(Value, f.args);
+            f.kws = try r.arena.dupe(Kw, f.kws);
+        },
+        .map_attribute, .unique => {},
+    }
+    return own;
+}
+
+/// What `step` makes of `item`; null when it drops it.
+fn stepItem(r: *Renderer, step: Step, seen: *std.ArrayListUnmanaged(Value), item: Value) Failure!?Value {
+    @setRuntimeSafety(true);
+    switch (step) {
+        .map_filter => |f| return try applyFilter(r, f.filter, item, f.args, f.kws),
+        .map_attribute => |f| return try attrPathOr(r, item, f.path, f.default),
+        .select => |f| {
+            const v = if (f.attr) |a| try attrPath(r, item, a) else item;
+            const ok = if (f.test_) |t| try applyTest(r, t, v, f.args, f.kws) else value.truthy(v);
+            return if (ok == f.keep_when) item else null;
+        },
+        .unique => |f| {
+            const k = try keyOf(r, item, f.attr, f.case_sensitive);
+            try r.hashable(k);
+            for (seen.items) |s| if (value.eql(&r.meter, s, k, 0) catch |e| return r.named(e)) return null;
+            try seen.append(r.arena, k);
+            return item;
+        },
+    }
+}
+
+/// The next item of iterator `l`, taken from it; null at its end.
+pub fn nextItem(r: *Renderer, l: *value.List) Failure!?Value {
+    @setRuntimeSafety(true);
+    if (l.items.items.len > 0) {
+        const v = l.items.items[0];
+        l.items = .fromOwnedSlice(l.items.items[1..]);
+        return v;
+    }
+    const lazy: *Lazy = @ptrCast(@alignCast(l.lazy orelse return null));
+    // A generator over a generator reads its input here: the chain nests against the call depth.
+    try r.enterCall();
+    defer r.call_depth -= 1;
+    while (try nextItem(r, lazy.source)) |item| {
+        try r.tick(1);
+        if (try stepItem(r, lazy.step, &lazy.seen, item)) |v| return v;
+    }
+    l.lazy = null;
+    return null;
+}
+
 /// Python's `item in container`.
 pub fn contains(r: *Renderer, container: Value, item: Value) Failure!bool {
     @setRuntimeSafety(true);
@@ -769,12 +870,12 @@ pub fn contains(r: *Renderer, container: Value, item: Value) Failure!bool {
             return try find(r, try value.Finder.init(r.arena, t, false), s.bytes) != null;
         },
         .list => |l| {
-            const items = l.items.items;
-            for (items, 0..) |x, i| if (value.eql(&r.meter, x, item, 0) catch |e| return r.named(e)) {
-                if (l.isIterator()) l.items = .fromOwnedSlice(@constCast(items[i + 1 ..]));
-                return true;
-            };
-            if (l.isIterator()) l.items = .empty;
+            // An iterator is read up to the item, as Python reads it.
+            if (l.isIterator()) {
+                while (try nextItem(r, l)) |x| if (value.eql(&r.meter, x, item, 0) catch |e| return r.named(e)) return true;
+                return false;
+            }
+            for (l.items.items) |x| if (value.eql(&r.meter, x, item, 0) catch |e| return r.named(e)) return true;
             return false;
         },
         .dict => |d| {
@@ -986,13 +1087,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
         },
         .first => {
             _ = try bind(r, "first", &.{}, args, kws);
-            if (input == .list and input.list.isIterator()) {
-                const l = input.list;
-                if (l.items.items.len == 0) return .{ .undefined = "No first item, sequence was empty." };
-                const v = l.items.items[0];
-                l.items = .fromOwnedSlice(l.items.items[1..]);
-                return v;
-            }
+            if (input == .list and input.list.isIterator()) return try nextItem(r, input.list) orelse .{ .undefined = "No first item, sequence was empty." };
             const items = try r.iterate(input);
             return if (items.len > 0) items[0] else .{ .undefined = "No first item, sequence was empty." };
         },
@@ -1112,23 +1207,20 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
             return r.newList(try r.iterate(input), .list);
         },
         .map => {
-            var out = std.ArrayList(Value).empty;
             const is_attr = args.len == 0 and for (kws) |kw| {
                 if (std.mem.eql(u8, kw.name, "attribute")) break true;
             } else false;
-            if (is_attr) {
+            const how: Step = if (is_attr) blk: {
                 const p = try bind(r, "map", &.{ "attribute", "default" }, &.{}, kws);
                 const default: ?Value = if (p[1]) |d| (if (d == .none) null else d) else null;
-                for (try r.iterate(input)) |item| try out.append(r.arena, try attrPathOr(r, item, p[0].?, default));
-            } else {
+                break :blk .{ .map_attribute = .{ .path = p[0].?, .default = default } };
+            } else blk: {
                 if (args.len == 0) return r.fail("map requires a filter argument", .{});
                 const name = try strArg(r, args[0], "map");
                 const inner = std.meta.stringToEnum(Filter, name) orelse return r.fail("unsupported filter '{s}'", .{name});
-                try r.enterCall();
-                defer r.call_depth -= 1;
-                for (try r.iterate(input)) |item| try out.append(r.arena, try applyFilter(r, inner, item, args[1..], kws));
-            }
-            return r.newList(out.items, .generator);
+                break :blk .{ .map_filter = .{ .filter = inner, .args = args[1..], .kws = kws } };
+            };
+            return generator(r, input, how);
         },
         .max, .min => {
             const p = try bind(r, @tagName(f), &.{ "case_sensitive", "attribute" }, args, kws);
@@ -1157,13 +1249,8 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                 break :blk testByName(name) orelse return r.fail("unsupported test '{s}'", .{name});
             } else null;
             const targs = if (args.len > off + 1) args[off + 1 ..] else &[_]Value{};
-            var out = std.ArrayList(Value).empty;
-            if (value.truthy(input)) for (try r.iterate(input)) |item| {
-                const v = if (by_attr) try attrPath(r, item, args[0]) else item;
-                const ok = if (t) |tt| try applyTest(r, tt, v, targs, kws) else value.truthy(v);
-                if (ok == keep_when) try out.append(r.arena, item);
-            };
-            return r.newList(out.items, .generator);
+            if (!value.truthy(input)) return r.newList(&.{}, .generator);
+            return generator(r, input, .{ .select = .{ .attr = if (by_attr) args[0] else null, .test_ = t, .args = targs, .kws = kws, .keep_when = keep_when } });
         },
         .replace => {
             const p = try bind(r, "replace", &.{ "old", "new", "count" }, args, kws);
@@ -1188,14 +1275,14 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
                     }
                     return sameKind(input, src.derive(buf.items));
                 },
-                .undefined, .dict => {},
-                .list => {},
+                .undefined, .dict, .list => {},
                 else => return r.fail("argument must be iterable", .{}),
             }
-            const was_iterator = input == .list and input.list.isIterator();
             const items = try r.arena.dupe(Value, try r.iterate(input));
             std.mem.reverse(Value, items);
-            return r.newList(items, if (was_iterator) .list else .list_reverseiterator);
+            // Python cannot reverse an iterator in place: Jinja2 reverses a list of its items.
+            if (input == .list and input.list.isIterator()) return r.newList(items, .list);
+            return r.newList(items, .list_reverseiterator);
         },
         .safe => {
             _ = try bind(r, "safe", &.{}, args, kws);
@@ -1313,19 +1400,7 @@ pub fn applyFilter(r: *Renderer, f: Filter, input: Value, args: []const Value, k
         .unique => {
             const p = try bind(r, "unique", &.{ "case_sensitive", "attribute" }, args, kws);
             const cs = if (p[0]) |c| value.truthy(c) else false;
-            var out = std.ArrayList(Value).empty;
-            var seen = std.ArrayList(Value).empty;
-            for (try r.iterate(input)) |item| {
-                const k = try keyOf(r, item, p[1], cs);
-                try r.hashable(k);
-                const dup = for (seen.items) |s| {
-                    if (value.eql(&r.meter, s, k, 0) catch |e| return r.named(e)) break true;
-                } else false;
-                if (dup) continue;
-                try seen.append(r.arena, k);
-                try out.append(r.arena, item);
-            }
-            return r.newList(out.items, .generator);
+            return generator(r, input, .{ .unique = .{ .attr = p[1], .case_sensitive = cs } });
         },
         .wordcount => {
             _ = try bind(r, "wordcount", &.{}, args, kws);
@@ -1516,7 +1591,7 @@ pub fn length(r: *Renderer, v: Value) Failure!usize {
         .list => |l| if (l.isIterator()) r.fail("object of type '{s}' has no len()", .{@tagName(l.kind)}) else l.items.items.len,
         .dict => |d| d.entries.items.len,
         .loop => |l| blk: {
-            l.took(l.len() + 1);
+            try l.takeAll();
             break :blk l.len();
         },
         else => r.fail("object of type '{s}' has no len()", .{value.typeName(v)}),

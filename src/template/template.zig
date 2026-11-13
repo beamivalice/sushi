@@ -657,6 +657,11 @@ test "template: a filter that applies a filter nests against the call depth" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     try expectLimit(try repeated(arena_state.allocator(), "{{ 'a'|map(", "'map', ", 100_000, "'upper')|list }}"), .{}, "nest deeper than 100");
+    // A generator over a generator reads its input when it is read: a chain of them nests there.
+    for ([_][]const u8{ "|map('string')", "|select", "|unique", "|reject('none')", "|map(attribute='x', default=1)" }) |link| {
+        try expectLimit(try repeated(arena_state.allocator(), "{% set g = [1, 2]|map('string') %}{{ g", link, 150, "|first }}"), .{}, "nest deeper than 100");
+        try expectLimit(try repeated(arena_state.allocator(), "{% set g = [1, 2]|map('string') %}{% for x in g", link, 150, " %}{% endfor %}"), .{}, "nest deeper than 100");
+    }
 }
 
 test "template: work inside comparisons, lookups, sorts and string scans is metered by the step budget" {

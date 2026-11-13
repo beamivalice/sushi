@@ -305,6 +305,9 @@ pub const List = struct {
     kind: Kind = .list,
     /// A range's start, stop and step, as Python prints it; null past what i128 holds (it then cannot print).
     bounds: ?*const [3]i128 = null,
+    /// An iterator whose items are made as they are read (`*builtins.Lazy`: a filter applied to another iterator),
+    /// after the ones in `items`; null once it is spent. Read it through `builtins.nextItem`.
+    lazy: ?*anyopaque = null,
 
     /// The Python type behind the items: an iterator has no length, no index and is consumed by a walk; a dict
     /// view has a length and no index; a range prints its bounds.
@@ -405,22 +408,35 @@ pub const Loop = struct {
     /// Python's lazy range does, so a loop that breaks early costs only what it walked.
     items: []const Value,
     range: ?Range = null,
-    /// How many items the walk took from its iterable, as Jinja2's `LoopContext` takes them: the current one, the
-    /// next when `last` or `nextitem` peeks at it, all of them for the length; `len() + 1` once it reached past the
-    /// end. An iterator keeps the items after these.
-    reach: usize = 0,
+    /// Set while a loop over an iterator has items left to take: it takes them one at a time into `items`, as
+    /// Jinja2's `LoopContext` does, so what the loop does not take stays in the iterator.
+    rest: ?Rest = null,
 
     pub const Range = struct { start: i64, step: i64, len: usize };
 
-    /// The walk has taken the items up to `n`.
-    pub fn took(self: *Loop, n: usize) void {
-        @setRuntimeSafety(true);
-        self.reach = @max(self.reach, @min(n, self.len() + 1));
-    }
+    /// Takes the iterator's next item into `items` (`render.LoopSource`); false at its end.
+    pub const Rest = struct { ctx: *anyopaque, next: *const fn (ctx: *anyopaque, loop: *Loop) Failure!bool };
 
+    /// The items taken so far: all of them once `rest` is null.
     pub fn len(self: *const Loop) usize {
         @setRuntimeSafety(true);
         return if (self.range) |r| r.len else self.items.len;
+    }
+
+    /// Whether the loop has an item `i`, taking items up to it from the iterator.
+    pub fn has(self: *Loop, i: usize) Failure!bool {
+        @setRuntimeSafety(true);
+        while (i >= self.len()) {
+            const rest = self.rest orelse return false;
+            if (!try rest.next(rest.ctx, self)) return false;
+        }
+        return true;
+    }
+
+    /// Takes every item left, as Jinja2 does for the loop's length.
+    pub fn takeAll(self: *Loop) Failure!void {
+        @setRuntimeSafety(true);
+        while (self.rest) |rest| _ = try rest.next(rest.ctx, self);
     }
 
     pub fn at(self: *const Loop, i: usize) Value {
@@ -918,7 +934,7 @@ pub fn writeRepr(m: *Meter, w: *std.ArrayList(u8), gpa: Allocator, v: Value, dep
         .macro => |mac| if (mac.is_caller) try w.appendSlice(gpa, "<Macro anonymous>") else try w.print(gpa, "<Macro '{s}'>", .{mac.node.name}),
         .function => return m.fail(.{ .print = "function" }),
         .loop => |l| {
-            l.took(l.len() + 1);
+            try l.takeAll();
             try w.print(gpa, "<LoopContext {d}/{d}>", .{ l.index0 + 1, l.len() });
         },
     }

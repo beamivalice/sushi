@@ -2034,6 +2034,38 @@
 "python_error": null
 },
 {
+"covers": "filter first",
+"label": "filter first #3",
+"template": "{% set g = l|map('string') %}{{ g|map('string')|first }}{{ g|list }} {% set g = l|select('odd') %}{{ g|map('string')|first }}{{ g|list }} {% set g = l|reject('odd') %}{{ g|map('string')|first }}{{ g|list }} {% set g = d|items %}{{ g|map('string')|first }}{{ g|list }} {% set g = ws|map('upper') %}{{ g|map('string')|first }}{{ g|list }} {% set g = l|selectattr('x', 'undefined') %}{{ g|map('string')|first }}{{ g|list }} {% set g = l|map('int') %}{{ g|map('string')|first }}{{ g|list }} {% set g = ws|unique %}{{ g|map('string')|first }}{{ g|list }} {% set g = l|reverse %}{{ g|map('string')|first }}{{ g|list }} {% set g = ws|sort|map('string') %}{{ g|map('string')|first }}{{ g|list }} {% set g = range(4)|map('string') %}{{ g|map('string')|first }}{{ g|list }} {% set g = l|map(attribute='x', default=1) %}{{ g|map('string')|first }}{{ g|list }} {% set g = ws|select('string') %}{{ g|map('string')|first }}{{ g|list }}",
+"extra": "{\"l\": [1, 2, 3, 4], \"ws\": [\"b\", \"a\", \"c\"], \"d\": {\"a\": 1, \"b\": 2, \"c\": 3}}",
+"python": "1['2', '3', '4'] 1[3] 2[4] ('a', 1)[('b', 2), ('c', 3)] B['A', 'C'] 1[2, 3, 4] 1[2, 3, 4] b['a', 'c'] 4[3, 2, 1] a['b', 'c'] 0['1', '2', '3'] 1[1, 1, 1] b['a', 'c']",
+"python_error": null
+},
+{
+"covers": "filter select",
+"label": "filter select #2",
+"template": "{% set g = l|map('string') %}{{ g|select('ne', '1')|first }}{{ g|list }} {% set g = l|map('string') %}{{ g|reject('eq', '1')|map('int')|first }}{{ g|list }} {% set g = u|map('lower') %}{{ g|unique|first }}{{ g|unique|first }}{{ g|list }} {% set g = l|map('string') %}{{ '2' in g|map('string') }}{{ g|list }} {% set g = l|map('string') %}{% set h = g|map('int') %}{{ h|first }}{{ g|first }}{{ h|list }}{{ g|list }}",
+"extra": "{\"l\": [1, 2, 3, 4], \"ws\": [\"b\", \"a\", \"c\"], \"d\": {\"a\": 1, \"b\": 2, \"c\": 3}, \"u\": [\"a\", \"A\", \"b\", \"a\", \"c\"]}",
+"python": "2['3', '4'] 2['3', '4'] aa['b', 'a', 'c'] True['3', '4'] 12[3, 4][]",
+"python_error": null
+},
+{
+"covers": "statement for",
+"label": "statement for #15",
+"template": "{% set g = l|map('string') %}{% for x in g %}{{ x }}{{ g|list }}{% endfor %}| {% set g = l|map('string') %}{% for x in g %}{{ x }}{{ g|first }}{% endfor %}| {% set g = l|map('string') %}{% for x in g %}{% for y in g %}{{ x }}{{ y }}{% break %}{% endfor %}{% endfor %}| {% set g = l|map('string') %}{% for x in g|map('int') %}{{ x }}{% if x == 2 %}{% break %}{% endif %}{% endfor %}{{ g|list }}",
+"extra": "{\"l\": [1, 2, 3, 4], \"ws\": [\"b\", \"a\", \"c\"], \"d\": {\"a\": 1, \"b\": 2, \"c\": 3}}",
+"python": "1['2', '3', '4']| 1234| 1234| 12['3', '4']",
+"python_error": null
+},
+{
+"covers": "filter reverse",
+"label": "filter reverse #2",
+"template": "{% set g = l|map('string') %}{% set h = g|map('int') %}{{ g|list }}{{ h|list }} {% set g = l|map('string') %}{{ g|reverse }}{{ g|list }} {% set g = u|unique %}{% for x in g %}{{ x }}{% break %}{% endfor %}{{ g|list }} {% set g = l|map('string') %}{% for x in g|select('ne', '2') if x != '3' %}{{ x }}{% endfor %}{{ g|list }}",
+"extra": "{\"l\": [1, 2, 3, 4], \"ws\": [\"b\", \"a\", \"c\"], \"d\": {\"a\": 1, \"b\": 2, \"c\": 3}, \"u\": [\"a\", \"A\", \"b\", \"a\", \"c\"]}",
+"python": "['1', '2', '3', '4'][] ['4', '3', '2', '1'][] a['b', 'c'] 14[]",
+"python_error": null
+},
+{
 "covers": "loop length",
 "label": "loop length #2",
 "template": "{% set g = l|map('string') %}{% for x in g %}{{ loop|length }}{% break %}{% endfor %}{{ g|list }} {% set g = l|map('string') %}{% for x in g %}{{ loop }}{% break %}{% endfor %}{{ g|list }}",

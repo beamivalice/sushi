@@ -522,6 +522,21 @@ BUILTIN_CASES = [
                       "{% set g = l|map('string') %}{% for x in g %}{% if x == '4' %}{% break %}{% endif %}{% endfor %}{{ g|list }} "
                       "{% set g = l|map('string') %}{% for x in g %}{{ loop.last }}{% if x == '4' %}{% break %}{% endif %}{% endfor %}{{ g|list }} "
                       "{% set g = l|map('string') %}{% for x in g %}{{ x }}{% break %}{% else %}E{% endfor %}{% for x in g %}{{ x }}{% break %}{% endfor %}{{ g|list }}", ITER),
+    # A filter over a generator reads it one item at a time, and everything that reads a generator shares its place.
+    ('filter first', ' '.join("{% set g = " + g + " %}{{ g|map('string')|first }}{{ g|list }}" for g in ITER_GENS), ITER),
+    ('filter select', "{% set g = l|map('string') %}{{ g|select('ne', '1')|first }}{{ g|list }} "
+                      "{% set g = l|map('string') %}{{ g|reject('eq', '1')|map('int')|first }}{{ g|list }} "
+                      "{% set g = u|map('lower') %}{{ g|unique|first }}{{ g|unique|first }}{{ g|list }} "
+                      "{% set g = l|map('string') %}{{ '2' in g|map('string') }}{{ g|list }} "
+                      "{% set g = l|map('string') %}{% set h = g|map('int') %}{{ h|first }}{{ g|first }}{{ h|list }}{{ g|list }}", dict(ITER, u=['a', 'A', 'b', 'a', 'c'])),
+    ('statement for', "{% set g = l|map('string') %}{% for x in g %}{{ x }}{{ g|list }}{% endfor %}| "
+                      "{% set g = l|map('string') %}{% for x in g %}{{ x }}{{ g|first }}{% endfor %}| "
+                      "{% set g = l|map('string') %}{% for x in g %}{% for y in g %}{{ x }}{{ y }}{% break %}{% endfor %}{% endfor %}| "
+                      "{% set g = l|map('string') %}{% for x in g|map('int') %}{{ x }}{% if x == 2 %}{% break %}{% endif %}{% endfor %}{{ g|list }}", ITER),
+    ('filter reverse', "{% set g = l|map('string') %}{% set h = g|map('int') %}{{ g|list }}{{ h|list }} "
+                       "{% set g = l|map('string') %}{{ g|reverse }}{{ g|list }} "
+                       "{% set g = u|unique %}{% for x in g %}{{ x }}{% break %}{% endfor %}{{ g|list }} "
+                       "{% set g = l|map('string') %}{% for x in g|select('ne', '2') if x != '3' %}{{ x }}{% endfor %}{{ g|list }}", dict(ITER, u=['a', 'A', 'b', 'a', 'c'])),
     ('loop length', "{% set g = l|map('string') %}{% for x in g %}{{ loop|length }}{% break %}{% endfor %}{{ g|list }} "
                     "{% set g = l|map('string') %}{% for x in g %}{{ loop }}{% break %}{% endfor %}{{ g|list }}", ITER),
     ('statement call', "{% macro w(t) %}[{{ t }}:{{ caller() }}]{% endmacro %}{% call w('x') %}inner{% endcall %}", {}),
