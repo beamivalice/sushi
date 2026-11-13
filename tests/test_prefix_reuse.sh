@@ -8,11 +8,13 @@
 #  C. DeepSeek only: its encoder writes the results of parallel tool calls in the order of the calls. A conversation
 #     whose results arrive in another order is the same prompt, so it reuses the prompt of the one sent in call order,
 #     on all three APIs. Other models render the client's order: the section is skipped there.
-#  D. The boot's log holds no `compiled inside a request` line: every kernel a capture, a restore or a turn takes was
+#  D. DeepSeek only: the state behind a finished reply is a restore point, so the next turn reuses the prompt and the
+#     reply and prefills only what is new, after a plain answer and after a tool call sent back with its result.
+#  E. The boot's log holds no `compiled inside a request` line: every kernel a capture, a restore or a turn takes was
 #     made by the load.
 #
-# Restore points sit at each prompt's end less a 30-token backoff, so turn 2 is held to turn 1's prompt less a slack,
-# not to the reply's tokens: those re-render, and only a tool loop's thought point covers them.
+# Restore points sit at each prompt's end less a 30-token backoff, so B holds turn 2 to turn 1's prompt less a slack on
+# every arch; the reply's own tokens are D's on DeepSeek and tests/qwen4/test_qwen4_decode_end_point.sh's on Qwen.
 #
 # Attaches to the shared api boot: tests/run.sh --tier live --model <m> --only test_prefix_reuse.sh
 
@@ -223,11 +225,63 @@ else
     order_pair "responses" /v1/responses "$(rsp call_a)" "$(rsp call_b)"
 fi
 
-# ── D. Nothing was compiled inside a request ──
+# ── D. The next turn starts where the reply ended ──
+# next_turn <name> <turn 1 body> <jq filter: turn 1's response -> the messages turn 2 adds after the reply>
+next_turn() {
+    local before points n m pn cn left body2
+    before=$(persisted_count)
+    points=$(sushi_log_since | grep -c "restore point behind the reply at")
+    post /v1/chat/completions "$2"
+    [ -n "$R" ] || { check "$1: turn 1 answers" 1; return; }
+    pn=$(printf '%s' "$R" | jq -r '.usage.prompt_tokens // 0')
+    cn=$(printf '%s' "$R" | jq -r '.usage.completion_tokens // 0')
+    wait_persisted "$before"
+    check "$1: turn 1 leaves a restore point behind its reply" "$(($(sushi_log_since | grep -c "restore point behind the reply at") > points ? 0 : 1))"
+    # The reply goes back as the server delivered it: reasoning, content and calls.
+    body2=$(jq -nc --argjson b "$2" --argjson r "$R" "\$r.choices[0].message as \$msg | \$b | .messages += ([\$msg | del(.refusal, .annotations)] + ($3))")
+    post /v1/chat/completions "$body2"
+    [ -n "$R" ] || { check "$1: turn 2 answers" 1; return; }
+    read -r n m <<< "$(reused)"
+    left=$(printf '%s\n' "$REQ_LOG" | grep -c "the prompt leaves the last turn")
+    echo "  $1: turn 1 was $pn + $cn tokens, turn 2 reused $n of $m"
+    if [ "$left" -gt 0 ]; then
+        # A reply the server delivers trimmed at an edge re-renders as other tokens: the engine names where the prompt left.
+        echo "  note: $(printf '%s\n' "$REQ_LOG" | grep "the prompt leaves the last turn" | tail -1)"
+        check "$1: turn 2 still reuses turn 1's prompt (reused >= prompt - $SLACK)" "$((n >= pn - SLACK ? 0 : 1))" "reused $n, turn 1's prompt $pn"
+    else
+        check "$1: turn 2 reuses turn 1's prompt and reply (reused >= prompt + reply)" "$((n >= pn + cn ? 0 : 1))" "reused $n, turn 1 was $pn + $cn"
+    fi
+}
+
+echo
+if [ "$SUSHI_ARCH" != deepseek_v41 ]; then
+    echo "--- D: skipped ($SUSHI_ARCH keeps its reply-end point elsewhere, or none) ---"
+else
+    echo "--- D: the next turn reuses the previous reply and prefills only what is new ---"
+    SYS_D="You answer in one short sentence.
+
+$(background 40)"
+    PLAIN=$(jq -nc --arg s "${SUSHI_NONCE}d1 $SYS_D" --argjson think "$THINK_OBJ" \
+        '{model:"sushi", max_tokens:200, temperature:0, stream:false,
+          messages:[{role:"system", content:$s}, {role:"user", content:"Name one primary colour."}]} + $think')
+    next_turn "a plain answer" "$PLAIN" '[{role:"user", content:"Name another."}]'
+
+    # Thinking on, with a tool: the model calls it or answers, and either reply is the next prompt's.
+    TOOLS=$(jq -nc --arg s "${SUSHI_NONCE}d2 You read files with the read_file tool when asked. $SYS_D" \
+        '{model:"sushi", max_tokens:2000, temperature:0, stream:false,
+          tools:[{type:"function", function:{name:"read_file", description:"Read a file.",
+                  parameters:{type:"object", properties:{path:{type:"string"}}, required:["path"]}}}],
+          messages:[{role:"system", content:$s}, {role:"user", content:"Read the file notes.txt."}]}')
+    next_turn "a tool loop" "$TOOLS" 'if ($msg.tool_calls // []) | length > 0
+        then [$msg.tool_calls[] | {role:"tool", tool_call_id:.id, content:"notes.txt: buy milk."}]
+        else [{role:"user", content:"Go on."}] end'
+fi
+
+# ── E. Nothing was compiled inside a request ──
 # The engine of our own logs each pipeline it had to make after the load: a restore point, a restore and a next turn
 # ran above, at positions the load's warm did not choose. Read over the whole boot; other engines log no such line.
 echo
-echo "--- D: no kernel was compiled inside a request on this boot ---"
+echo "--- E: no kernel was compiled inside a request on this boot ---"
 LATE=$(grep -c 'compiled inside a request' "$SUSHI_LOG")
 check "the boot's log holds no 'compiled inside a request' line" "$((LATE == 0 ? 0 : 1))" "$LATE: $(grep 'compiled inside a request' "$SUSHI_LOG" | head -3 | tr '\n' ' ')"
 

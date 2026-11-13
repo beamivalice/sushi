@@ -130,7 +130,8 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   the next turn stops re-rendering places it there instead (`arch_config.snapshotBackoff`; DeepSeek-V4.1: before the
   last assistant opener, [dsv41-arch](dsv41-arch.md#prefix-cache)).
 - A speculative Qwen turn also leaves a point right behind its reply ([decode-end points](#decode-end-points)), so the
-  next turn re-prefills none of it; a serial finish keeps only the prompt-end point.
+  next turn re-prefills none of it; a serial finish keeps only the prompt-end point. DeepSeek keeps the same point in
+  its live record ([dsv41-arch](dsv41-arch.md)), whatever decoded the reply.
 - **A ringed (sliding-window) entry restores at its end or at one of its ring checkpoints**
   (`KVCache.ringCheckpoint`, `Entry.ring_cps`, up to `RING_CHECKPOINT_MAX` = 8): each ringed layer's
   window + 30 rows at a position (down to the window when the ring holds no more, as one restored off a checkpoint

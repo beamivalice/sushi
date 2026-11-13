@@ -253,6 +253,18 @@ pub fn rowsThroughId(ids: []const u32, id: ?u32) usize {
     return if (std.mem.indexOfScalar(u32, ids, want)) |at| at + 1 else ids.len;
 }
 
+/// `rowsThroughId` for the first of several ids: an end-of-turn draft ends its round, as nothing after it is published.
+pub fn rowsThroughAny(ids: []const u32, any: []const u32) usize {
+    return if (std.mem.indexOfAny(u32, ids, any)) |at| at + 1 else ids.len;
+}
+
+test "rowsThroughAny: a round ends on the first id of the set, or runs whole" {
+    try testing.expectEqual(@as(usize, 5), rowsThroughAny(&.{ 1, 2, 3, 4, 5 }, &.{}));
+    try testing.expectEqual(@as(usize, 5), rowsThroughAny(&.{ 1, 2, 3, 4, 5 }, &.{ 8, 9 }));
+    try testing.expectEqual(@as(usize, 2), rowsThroughAny(&.{ 1, 2, 3, 4, 3 }, &.{ 3, 2 }));
+    try testing.expectEqual(@as(usize, 0), rowsThroughAny(&.{}, &.{3}));
+}
+
 test "rowsThroughId: a round ends on the id, or runs whole without one" {
     try testing.expectEqual(@as(usize, 5), rowsThroughId(&.{ 1, 2, 3, 4, 5 }, null));
     try testing.expectEqual(@as(usize, 5), rowsThroughId(&.{ 1, 2, 3, 4, 5 }, 9));

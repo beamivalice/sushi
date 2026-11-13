@@ -710,6 +710,66 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
     }
 }
 
+test "dsv41 generator: a DSpark round verifies an end-of-turn draft and nothing past it, with the state standing behind the reply (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dsv41_model = @import("dsv41_model.zig");
+    const dir = try dsv41_model.fixtureDir();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.expert_streaming = true;
+    config.stream_mtp_head = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, dir);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Trunk.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const prompt = ids[0..30];
+    const want: u32 = 30;
+
+    for ([_]u8{ 4, 6 }) |width| {
+        try xfm.resetCache();
+        // The end-of-turn id is read through this slice, so the test names it one round ahead: that round's first draft.
+        var eos = [_]u32{std.math.maxInt(u32)};
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &eos, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_diag = .{ .rows = width };
+        var total: usize = 0;
+        errdefer std.debug.print("[end-draft] width {d}: {d} tokens in, end id {d}\n", .{ width, total, eos[0] });
+        for (0..2) |_| {
+            const r = (try gen.nextDspark(a)) orelse return error.TurnEndedEarly;
+            defer a.free(r.tokens);
+            total += r.tokens.len;
+        }
+        {
+            var block = try dsv41_serving.dsv41DraftImpl(&xfm, gen.next_token_id);
+            defer block.deinit();
+            try testing.expect(block.ids.len >= 3 and block.ids[1] != block.ids[0]);
+            eos[0] = block.ids[1];
+        }
+        const drafted = gen.dspark_stats.drafted;
+        const r = (try gen.nextDspark(a)) orelse return error.TurnEndedEarly;
+        defer a.free(r.tokens);
+        total += r.tokens.len;
+        // The round verified the end-of-turn draft and no row past it, so the state stands on what it committed.
+        try testing.expectEqual(drafted + 1, gen.dspark_stats.drafted);
+        if (std.mem.indexOfScalar(u32, r.tokens, eos[0])) |at| try testing.expectEqual(r.tokens.len - 1, at);
+        var cp = try dsv41_prefix.capture(a, dsv41_state.modelOf(&xfm).?, prompt.len + total);
+        cp.deinit(a);
+    }
+}
+
 test "dsv41 generator: the restore point behind a thought's closer, written mid-decode, restores from an SSD file to the live state's continuation bit for bit (DSV41_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
@@ -5762,6 +5822,66 @@ test "dsv41 engine: a Cooler state rolled back in place to a point it kept conti
         var got = try continueBytes(a, &fx, &next, 20, 6);
         defer got.deinit(a);
         try testing.expectEqualSlices(u8, cold.items, got.items);
+    }
+}
+
+test "dsv41 engine: a finished request's state is the next turn's deepest point, and the turn continues from it as the state itself would (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const pc = @import("../prefix_cache.zig");
+    const dense = trunk_mod.KVQuantConfig.dense;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    var buf: [40]u32 = undefined;
+    const turns = fx.prompt(&buf);
+    const reply_end: usize = 30;
+    var sch: @import("../scheduler.zig").Scheduler = undefined;
+    sch.live_unflushed = .init(false);
+    var lm: @import("../model_registry.zig").LoadedModel = undefined;
+    lm.handle = @import("../arch/handle.zig").handleOf(&fx.xfm);
+    var slot: @import("../scheduler.zig").Slot = undefined;
+    slot.model = &lm;
+    slot.vision_key = 0;
+    slot.media_start = null;
+    slot.has_tools = false;
+    slot.cache = try KVCache.initWithConfig(a, m.cfg.layers, dense);
+    defer slot.cache.deinit();
+    var hc = pc.HotPrefixCache.init(a, 4);
+    defer hc.deinit();
+    var straight: std.ArrayList(u8) = .empty;
+    defer straight.deinit(a);
+    for ([_]bool{ false, true }) |through_record| {
+        errdefer std.debug.print("[reply-end] through the record {}: state at {d}, {d} live points, record ready {}\n", .{ through_record, if (m.dec_state) |st| st.n else 0, dsv41_prefix.liveOf(&hc).points.items.len, dsv41_prefix.liveOf(&hc).ready });
+        // Turn one: a prompt of 20 whose point at 12 is kept live, then the reply's ten tokens as decode forwards.
+        try fx.xfm.resetCache();
+        var at: usize = 0;
+        for ([_]usize{ 12, 8, 1, 3, 1, 5 }, 0..) |n, i| {
+            var ctx = fx.xfm.defaultCtx();
+            ctx.cache.step = at;
+            _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, turns[at .. at + n]));
+            at += n;
+            if (i == 0) {
+                var cp = try dsv41_prefix.capture(a, m, at);
+                defer cp.deinit(a);
+                try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, false);
+            }
+        }
+        if (through_record) {
+            @import("dsv41_sched.zig").publishLive(&sch, &slot, &hc, turns[0..reply_end]);
+            try testing.expect(sch.live_unflushed.load(.acquire));
+            var target = try KVCache.initWithConfig(a, m.cfg.layers, dense);
+            defer target.deinit();
+            var off: usize = 0;
+            const res = dsv41_prefix.rollbackLive(&hc, m, &target, &off, fx.xfm.s, turns, false, .{}, null) orelse return error.NoRollback;
+            try testing.expectEqual(reply_end, res.matched);
+        }
+        var got = try continueBytes(a, &fx, turns, reply_end, 6);
+        defer got.deinit(a);
+        if (through_record) try testing.expectEqualSlices(u8, straight.items, got.items) else try straight.appendSlice(a, got.items);
     }
 }
 

@@ -20,6 +20,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek on Sushi Cooler no longer slips a random token into sampled text**: with neither top-p nor top-k set,
   about one token in 130 was drawn from the whole vocabulary whatever its probability (1.6.1-dev2 and 1.7.0-dev1),
   which broke tool calls in agent sessions. A seed's text changes once more with the fix.
+- **A DeepSeek agent turn no longer prefills the previous reply again**: the next request starts from the state
+  behind the reply it just generated, tool call included, and prefills only the tool results and what else is new.
 - **A turn that stops because its tool call could not be read says so in the server log**: the reply still goes out
   with the broken markup removed, and a `[tool-parse]` line now records what was cut.
 - **DeepSeek reads parallel tool results in the order it made the calls**: results a client returns in another order,

@@ -1158,6 +1158,20 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   A cancelled request (stop sequence, disconnect) publishes at the scheduler's cull (`commitsAtCull`), not at the cleanup
   drain: the cull drops it from `decoding`, so the next request is admitted over the model's state before `complete()`,
   and a later publish would pair this request's tokens with that request's points and epoch.
+- **A finished request leaves a point right behind its reply** (`dsv41_prefix.keepEndPointDsv41`, at the commit): the
+  next prompt repeats the reply token for token (the thought with tools, the answer, the call block), so the state as it
+  stands is the deepest point the turn shares and the turn prefills only what is new, where it prefilled the whole reply
+  again (a 9,000-token file write, 8.6 s). Taken when the state stands exactly on prompt + generated, so a DSpark round
+  ends on an end-of-turn draft (`mtp_plan.rowsThroughAny`: nothing past it is published, and the state would stand past
+  the reply). It is a live point like the prompt-end snapshot: its fixed arrays alone (about 6 MB), under
+  `live_point_cap` and the admission reserve, written to SSD by the idle flush. A request with no live record (a RAM
+  tier, checkpoints off) keeps none. The rollback to it changes nothing, so the turn continues as the state itself
+  would: the reply's rows are the decode's own, not a prefill's (as a thought's have been since its point). A prompt
+  that parts from the last turn inside it (a reply delivered trimmed at an edge, an edited history) falls back to an
+  earlier point and logs `[dsv41-prefix] the prompt leaves the last turn's N tokens at S`. Log:
+  `[dsv41-prefix] restore point behind the reply at N`. Guards: `a finished request's state is the next turn's deepest
+  point` and `a DSpark round verifies an end-of-turn draft and nothing past it` (dsv41_generate_test.zig),
+  `tests/test_prefix_reuse.sh` D.
 - **A thinking request with tools writes one more point mid-decode, right behind its `</think>`**
   (`dsv41_thought_point.writeDsv41ThoughtPoint`; DSpark rounds and an SSD-first tier only). With tools the template re-renders an
   earlier assistant turn as `reasoning_content</think>content` plus the call block, so the next prompt repeats the

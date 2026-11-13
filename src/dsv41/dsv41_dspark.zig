@@ -163,7 +163,9 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     };
     // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
     const wanted: usize = forced orelse policy.rows(conf_buf[0 .. block_len - 1]);
-    var rows: usize = dsparkRowsForRoom(mtp_plan.rowsThroughId(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.dspark_round_ends_at), think_room);
+    // Nothing past an end-of-turn draft is published: the round ends on it, where the reply's restore point stands.
+    const turn = ids_buf[0..mtp_plan.rowsThroughAny(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.eos_token_ids)];
+    var rows: usize = dsparkRowsForRoom(mtp_plan.rowsThroughId(turn, self.dspark_round_ends_at), think_room);
     const vocab: usize = if (dsv41_state.modelOf(xfm)) |m| m.cfg.vocab else 0;
     var rows_masked = false;
     if (constraint) |c| {

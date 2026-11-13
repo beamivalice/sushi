@@ -129,6 +129,7 @@ pub fn dsv41StateBytes(s: *const Slot) u64 {
 pub fn publishLive(sch: *Scheduler, slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache, tokens: []const u32) void {
     const dsv = arch_handle.trunk(slot.model.handle orelse return).arch_state.dsv41.model orelse return;
     const media = prefix_cache_mod.MediaStamp.of(slot.vision_key, slot.media_start);
+    if (dsv41_prefix.keepEndPointDsv41(hc, dsv, tokens.len)) log.info("[dsv41-prefix] restore point behind the reply at {d}\n", .{tokens.len});
     if (dsv41_prefix.publishLiveDsv41(hc, dsv, tokens, slot.has_tools, media, slot.cache.config)) sch.live_unflushed.store(true, .release);
 }
 

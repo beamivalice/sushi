@@ -492,6 +492,9 @@ fn rollbackLiveInPlace(
     const cap: usize = if (media_limits.rule) |r| (r.limitFor(r.ctx, live.vision_key, live.media_start) orelse 0) else kv_disk_cache.MediaLimits.UNBOUNDED;
     const idx = live.pick(m, prompt_ids, has_tools, cap) orelse return null;
     const pos = live.points.items[idx].pos;
+    // A prompt that parts from the last turn inside it prefills from an earlier point: the log says where it left.
+    const shared = std.mem.indexOfDiff(u32, live.tokens, prompt_ids) orelse live.tokens.len;
+    if (shared < @min(live.tokens.len, prompt_ids.len)) log.info("[dsv41-prefix] the prompt leaves the last turn's {d} tokens at {d}\n", .{ live.tokens.len, shared });
     var stored: usize = if (ram_match) |rm| blk: {
         const cps = self.entries.items[rm.idx].ssm_checkpoints orelse break :blk 0;
         break :blk (pc.HotPrefixCache.highestCheckpointAtOrBelow(cps, rm.shared) orelse break :blk 0).pos;
@@ -628,6 +631,28 @@ pub fn writeDecodePointDsv41(self: *pc.HotPrefixCache, cache: *transformer.KVCac
     var cps = [1]SSMCheckpoint{try captureShared(self.allocator, m, tokens.len)};
     defer cps[0].deinit(self.allocator);
     writeThroughDsv41(self, m, cache, tokens, has_tools, media, &cps, "decode");
+}
+
+/// A finished request's state stands right behind `pos`, the reply the next prompt repeats: one more point of the
+/// request's record, where the next turn's rollback changes nothing and prefills only what is new. A request with no
+/// record (a RAM tier, checkpoints off) keeps none, and neither does a state that stands elsewhere.
+pub fn keepEndPointDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, pos: usize) bool {
+    const live = liveOf(self);
+    if (live.ready or live.points.items.len == 0) return false;
+    const st = m.dec_state orelse return false;
+    if (st.n != pos or live.points.items[live.points.items.len - 1].pos >= pos) return false;
+    const handled = Handled.begin();
+    defer handled.drop();
+    var cp = captureShared(self.allocator, m, pos) catch |err| {
+        log.warn("  [dsv41-prefix] restore point behind the reply at {d} not taken: {s}\n", .{ pos, @errorName(err) });
+        return false;
+    };
+    defer cp.deinit(self.allocator);
+    live.keep(self.allocator, m, &cp, false) catch |err| {
+        log.warn("  [dsv41-prefix] restore point behind the reply at {d} not kept: {s}\n", .{ pos, @errorName(err) });
+        return false;
+    };
+    return true;
 }
 
 /// The request over `m`'s state finished with `tokens`: the points it kept are what the next prompt may roll back to.
