@@ -495,7 +495,11 @@ pub const nowNs = core.nowNs;
 /// A model's load has run every forward a request can (true), or a load begins (false).
 pub fn seal(on: bool) void {
     core.sealed = on;
+    // A request's GPU time starts after the load's own forwards.
+    if (on) _ = core.gpuTimeTaken();
 }
+
+pub const gpuTimeTaken = core.gpuTimeTaken;
 
 /// Pipelines may be made from here to `Seal.end`, which seals again if it found the engine sealed: a warm inside a
 /// load, or a tower's own.

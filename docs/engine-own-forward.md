@@ -476,6 +476,9 @@ rebuilds one.
 - `[engine] since load:` (debug, at a request's end) and the decode meter's `[fwd-ubench] engine:` line carry
   dispatches, command buffers, waits, imports, the pool, and the GPU's own times: busy, idle between passes, and
   that idle by pause length and by what the host was building (forward, draft, verify, round end).
+- **Every request states its own GPU time at info**: `[engine] GPU busy N ms, idle between passes M ms (P% busy) in
+  this request`, the union of its command buffers' spans as Metal timed them (`engine.gpuTimeTaken`, reset when the
+  load seals). It is the engine's own reading: the dashboard's "busy" is the whole Mac's GPU as IOKit reports it.
 - **`SUSHI_ENGINE_KERNEL_PROF=1` prices each kernel**: every op's pass is committed and waited for before the next op
   begins, so its command buffer's GPU times are that kernel's (an op of several dispatches is one row, its kernel names
   joined by ` + `). The `[engine-prof] <name>: <n> dispatches, <ms> ms total, <us> us each` lines (debug; the top 40

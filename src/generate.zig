@@ -3960,6 +3960,13 @@ fn drawRoot(io: std.Io, seed: ?u64) !u64 {
     return std.mem.readInt(u64, &bytes, .little);
 }
 
+/// A request's GPU time on the engine, as Metal timed its command buffers (`took`: busy and idle-between-passes ns);
+/// null when it ran none.
+fn gpuShareLine(buf: []u8, took: [2]u64) ?[]const u8 {
+    if (took[0] + took[1] == 0) return null;
+    return std.fmt.bufPrint(buf, "GPU busy {d} ms, idle between passes {d} ms ({d}% busy) in this request", .{ took[0] / std.time.ns_per_ms, took[1] / std.time.ns_per_ms, took[0] * 100 / (took[0] + took[1]) }) catch null;
+}
+
 /// Returns the buffers a request's forwards freed into MLX's pool. A model that forwards on the engine parks none
 /// there: its own pool is held to a cap each forward installs (`engine.budget`).
 /// `SUSHI_MLX_CALLS_TRACE`: every entry point of mlx-c this process has called, with its count.
@@ -3968,6 +3975,8 @@ fn drawRoot(io: std.Io, seed: ?u64) !u64 {
 fn logEngineStats() void {
     if (mlx.engine.enabled) {
         const e = mlx.engine.stats();
+        var gpu_buf: [96]u8 = undefined;
+        if (gpuShareLine(&gpu_buf, mlx.engine.gpuTimeTaken())) |line| log.info("  [engine] {s}\n", .{line});
         log.debug("  [engine] since load: {d} dispatches, {d} command buffers, {d} waits, {d} imports, {d} kernel keys built, {d} lends ({d} of a weight the engine wraps), {d} ops on MLX, {d} calls refused; slice updates {d} in place, {d} copied; pool {d} MB, {d} free, {d} asked by tensors in use, {d} buffers released for the budget; {d} kernels compiled after the load; GPU busy {d} ms, idle between passes {d} ms; pauses under 20 us / 100 us / 1 ms / longer: {d} ({d} ms) / {d} ({d} ms) / {d} ({d} ms) / {d} ({d} ms); before other / forward / draft / verify / round end: {d} / {d} / {d} / {d} / {d} ms; {d} MLX calls\n", .{ e.dispatches, e.submits, e.waits, e.imports, mlx.engine.kernelKeyBuilds(), e.lends, e.mapped_lends, mlx.engine.mlx_ops, mlx.engine.refusals, e.updates_in_place, e.updates_copied, e.pool_bytes >> 20, e.pool_free >> 20, e.pool_asked >> 20, e.pool_evictions, mlx.engine.latePipelines(), e.gpu_busy_ns / std.time.ns_per_ms, e.gpu_gap_ns / std.time.ns_per_ms, e.gpu_gap_count[0], e.gpu_gap_sum[0] / std.time.ns_per_ms, e.gpu_gap_count[1], e.gpu_gap_sum[1] / std.time.ns_per_ms, e.gpu_gap_count[2], e.gpu_gap_sum[2] / std.time.ns_per_ms, e.gpu_gap_count[3], e.gpu_gap_sum[3] / std.time.ns_per_ms, e.gpu_gap_phase[0] / std.time.ns_per_ms, e.gpu_gap_phase[1] / std.time.ns_per_ms, e.gpu_gap_phase[2] / std.time.ns_per_ms, e.gpu_gap_phase[3] / std.time.ns_per_ms, e.gpu_gap_phase[4] / std.time.ns_per_ms, mlx.engine.mlxCalls() });
         mlx.engine.logKernelProfile(1);
         logMlxCalls();
@@ -4492,6 +4501,13 @@ test "a block decoder's entry token stops the round before it drafts" {
     try testing.expect(!tokenStops(0, &eos, &pad));
     try testing.expect(!tokenStops(9, &eos, &pad));
     try testing.expectEqual(@as(u32, 0), pad);
+}
+
+test "gpuShareLine: a request's GPU time reads as busy, idle and a share; a request that ran none says nothing" {
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("GPU busy 19000 ms, idle between passes 1000 ms (95% busy) in this request", gpuShareLine(&buf, .{ 19_000_000_000, 1_000_000_000 }).?);
+    try std.testing.expectEqualStrings("GPU busy 0 ms, idle between passes 2 ms (0% busy) in this request", gpuShareLine(&buf, .{ 0, 2_000_000 }).?);
+    try std.testing.expect(gpuShareLine(&buf, .{ 0, 0 }) == null);
 }
 
 test "specTotals: the prompt-lookup rounds of an MTP request count beside its head rounds" {

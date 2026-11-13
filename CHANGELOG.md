@@ -23,6 +23,8 @@ earlier history is mlx-serve's, in that project's changelog.
   and a tool call with no arguments, now reach the model exactly as DeepSeek's own encoder writes them.
 - **Parallel tool calls replayed through `/v1/responses` are one assistant turn on every model**: without a reasoning
   item before them each call used to open a turn of its own, a prompt no model was trained on and no cache could reuse.
+- **The server log says how busy each DeepSeek request kept the GPU on Sushi Cooler**: one `[engine]` line a request
+  with the GPU's busy and idle time as Metal timed them, and model-discovery `skip` lines no longer run together.
 - **Settings opens with a copyable GPU wired-limit command**: the `sudo sysctl iogpu.wired_limit_mb=…` line sets all
   three wire limits from one adjustable, savable box that defaults to the Mac's memory less 4 GB.
 - **The test builds no longer link a C++ chat-template library**: the jinja.cpp copy under `lib/jinja_cpp/` is gone; the

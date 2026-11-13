@@ -200,6 +200,8 @@ const State = struct {
     burst: bool = false,
     /// When the GPU ended the last command buffer whose times were read; 0 after one that had none.
     gpu_last_end: f64 = 0,
+    /// `Stats.gpu_busy_ns` and `gpu_gap_ns` at the last `takeGpuTime`.
+    gpu_taken: [2]u64 = .{ 0, 0 },
     /// Command buffers that have run and whose GPU times are still to read, oldest first: Metal sets them a moment
     /// after the event a wait returns on.
     untimed: std.ArrayList(Finished) = .empty,
@@ -257,6 +259,17 @@ fn st() Error!*State {
 
 pub fn stats() Stats {
     return if (state) |s| s.stats else .{};
+}
+
+/// GPU busy and idle-between-passes time, in ns, since the last take: what the forwards between two calls took.
+fn takeGpuTime(s: *State) [2]u64 {
+    const now = [2]u64{ s.stats.gpu_busy_ns, s.stats.gpu_gap_ns };
+    defer s.gpu_taken = now;
+    return .{ now[0] - s.gpu_taken[0], now[1] - s.gpu_taken[1] };
+}
+
+pub fn gpuTimeTaken() [2]u64 {
+    return if (state) |*s| takeGpuTime(s) else .{ 0, 0 };
 }
 
 /// `Stats.pool_bytes` and `pool_free` for a thread that is not the inference thread (`stats` is a plain read of
@@ -1567,6 +1580,21 @@ test "GPU time is the union of the command buffers' spans, and a short pause bet
     try t.expectEqual(@as(u64, 1), s.stats.gpu_untimed);
     try t.expectEqual(@as(u64, 1_000_000), (s.stats.gpu_gap_ns + 500) / 1000 * 1000);
     try t.expectEqual(@as(u64, 6_000_000), (s.stats.gpu_busy_ns + 500) / 1000 * 1000);
+}
+
+test "GPU time taken is what ran since the last take" {
+    const t = std.testing;
+    var s: State = .{ .dev = undefined };
+    noteGpuSpan(&s, .{ 1.000, 1.002 }, 0);
+    noteGpuSpan(&s, .{ 1.003, 1.004 }, 0);
+    const first = takeGpuTime(&s);
+    try t.expectEqual(@as(u64, 3_000_000), (first[0] + 500) / 1000 * 1000);
+    try t.expectEqual(@as(u64, 1_000_000), (first[1] + 500) / 1000 * 1000);
+    try t.expectEqual([2]u64{ 0, 0 }, takeGpuTime(&s));
+    noteGpuSpan(&s, .{ 1.006, 1.007 }, 0);
+    const second = takeGpuTime(&s);
+    try t.expectEqual(@as(u64, 1_000_000), (second[0] + 500) / 1000 * 1000);
+    try t.expectEqual(@as(u64, 2_000_000), (second[1] + 500) / 1000 * 1000);
 }
 
 test "a tensor handle carries the tag MLX's handles never have" {
