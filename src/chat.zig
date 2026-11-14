@@ -433,6 +433,8 @@ pub const Compiled = struct {
     fn init(allocator: std.mem.Allocator, text: []const u8, at_load: bool, model_type: ?[]const u8) !*Compiled {
         const c = try allocator.create(Compiled);
         errdefer allocator.destroy(c);
+        c.turns = .{ .turns = &.{}, .outside = &.{} };
+        c.turns_arena = null;
         c.main = try Tpl.init(allocator, text, at_load);
         errdefer c.main.deinit();
         c.late_text = if (model_type) |m| try arch_chat.lateSystemTemplate(m, allocator, text) else null;
