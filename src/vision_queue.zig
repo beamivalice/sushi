@@ -102,14 +102,20 @@ pub fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const D
     for (blocks) |b| rows += b.rows;
     const sw = io_util.Stopwatch.init(sch.io);
     var decode_ns = d.decode_ns;
-    defer log.info("  Multimodal: encoded {d} of {d} image(s) and {d} of {d} video(s), {d} of {d} soft tokens (the restored prefix holds {d}): decode {d} ms, encode {d} ms\n", .{
+    var encoded = false;
+    defer if (encoded) log.info("  Multimodal: encoded {d} of {d} image(s) and {d} of {d} video(s), {d} of {d} soft tokens (the restored prefix holds {d}): decode {d} ms, encode {d} ms\n", .{
         images.len, d.images.len,
         videos.len, d.videos.len,
         rows,       rows + skip.rows,
         skip.rows,  decode_ns / std.time.ns_per_ms,
         sw.read() / std.time.ns_per_ms,
+    }) else log.info("  Multimodal: the encode of {d} image(s) and {d} video(s), {d} soft tokens, failed after {d} ms\n", .{
+        images.len, videos.len, rows, sw.read() / std.time.ns_per_ms,
     });
-    if (blocks.len == 0) return .{ .embeddings = null, .skipped_rows = skip.rows };
+    if (blocks.len == 0) {
+        encoded = true;
+        return .{ .embeddings = null, .skipped_rows = skip.rows };
+    }
 
     const allocator = sch.allocator;
     const pix = try allocator.alloc(VisionImagePixels, images.len);
@@ -139,6 +145,9 @@ pub fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const D
             refusal.* = MediaRefusal.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG, GIF, BMP or WebP image", .{skip.images + req.failed_image + 1});
             return error.MediaRefused;
         }
+        // A refusal for memory is the request's own 503, as a prefill's is.
+        if (std.mem.eql(u8, name, "TransientCapExceeded")) return error.TransientCapExceeded;
+        if (std.mem.eql(u8, name, "OutOfMemory")) return error.OutOfMemory;
         var text: [320]u8 = undefined;
         const fit = if (std.mem.eql(u8, name, vision_headroom_error)) (if (scheduler_mod.vision_fit_fault) |f| f(&text, cfg, images, videos, rows, req.available_bytes) else null) else null;
         refusal.* = if (fit) |msg| MediaRefusal.init(false, "{s}", .{msg}) else MediaRefusal.init(true, "vision encoding failed: {s}", .{name});
@@ -150,6 +159,7 @@ pub fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const D
         _ = mlx.mlx_array_free(arr);
         return error.MediaRefused;
     }
+    encoded = true;
     return .{ .embeddings = arr, .skipped_rows = skip.rows };
 }
 
@@ -434,7 +444,7 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
             defer window.release(next_image);
             break :blk encodeImageBlock(vision_enc, px);
         } else encodeVideoBlock(vision_enc, req.videos[next_video])) catch |err| {
-            failParts(sch, req, emb_parts.items, @errorName(err));
+            failParts(sch, req, emb_parts.items, mlx.settledErrorName(err));
             return;
         };
         const rows: usize = @intCast(mlx.getShape(emb)[1]);
@@ -470,7 +480,8 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         combined = mlx.mlx_array_new();
         if (mlx.mlx_concatenate_axis(&combined, cat_vec, 1, vision_enc.s) != 0) {
             _ = mlx.mlx_array_free(combined);
-            failParts(sch, req, emb_parts.items, "ConcatenateFailed");
+            const settled = mlx.settledErrorName(error.MlxError);
+            failParts(sch, req, emb_parts.items, if (std.mem.eql(u8, settled, "MlxError")) "ConcatenateFailed" else settled);
             return;
         }
     }
@@ -1113,4 +1124,106 @@ test "an encode refused for headroom after the restore names the bill of what it
     refusal = null;
     try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 4, &refusal));
     try testing.expectEqualStrings("1 images, 10 free", refusal.?.text());
+}
+
+test "an encode the engine or MLX refused settles its error: the request gets the refusal's class and the next starts clean" {
+    try mlx.requireGpu();
+    const Probe = struct {
+        var latch: ?[:0]const u8 = null;
+        fn tower(_: VisionImagePixels) anyerror!mlx.mlx_array {
+            if (latch) |msg| {
+                mlx.latchErrorForTest(msg);
+                return error.MlxError;
+            }
+            const data = [_]f32{ 1, 2, 3, 4 };
+            const host = mlx.engine.enter(mlx.engine.stream());
+            defer host.end();
+            return mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+        }
+    };
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was_enabled;
+    defer mlx.engine.fault.disarm();
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    var encoder: VisionEncoder = .{ .allocator = testing.allocator, .s = mlx.engine.stream() };
+    model.vision_encoder = &encoder;
+    vision_block_test_hook = Probe.tower;
+    defer vision_block_test_hook = null;
+    defer Probe.latch = null;
+    const images = [_]chat_mod.ImageData{ .{ .pixels = "\x01", .width = 1, .height = 1 }, .{ .pixels = "\x02", .width = 2, .height = 1 } };
+    const blocks = [_]MediaBlock{ .{ .kind = .image, .rows = 1 }, .{ .kind = .image, .rows = 1 } };
+    const media = DeferredMedia{ .allocator = testing.allocator, .images = &images, .videos = &.{}, .blocks = &blocks };
+    var buf: [512]u8 = undefined;
+    _ = mlx.takeError(&buf);
+    var refusal: ?MediaRefusal = null;
+
+    // The two spans take the pool's first two buffers; the join of them takes the third.
+    mlx.engine.fault.arm(3);
+    try testing.expectError(error.TransientCapExceeded, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expect(!mlx.errorPending());
+
+    mlx.engine.fault.disarm();
+    Probe.latch = "[engine] kernel_apply: PoolOverBudget: a buffer of 16 KB with 10 MB held for the pool, 4 MB of it asked by tensors in use, under a limit of 4 MB";
+    try testing.expectError(error.TransientCapExceeded, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expect(!mlx.errorPending());
+
+    Probe.latch = "[METAL] Command buffer execution failed: Insufficient Memory";
+    try testing.expectError(error.OutOfMemory, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expect(!mlx.errorPending());
+
+    Probe.latch = "[metal] a kernel failed for a reason of its own";
+    refusal = null;
+    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expectEqualStrings("vision encoding failed: MlxError", refusal.?.text());
+    try testing.expect(refusal.?.server_error);
+    try testing.expect(!mlx.errorPending());
+
+    Probe.latch = null;
+    const served = try encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal);
+    defer _ = mlx.mlx_array_free(served.embeddings.?);
+    try testing.expectEqual(@as(i32, 2), mlx.getShape(served.embeddings.?)[1]);
+}
+
+test "a refused encode logs its failure, never an encoded count" {
+    const Probe = struct {
+        fn tower(_: VisionImagePixels) anyerror!mlx.mlx_array {
+            return error.TowerRefused;
+        }
+    };
+    const path = "/tmp/sushi-vision-refused.log";
+    _ = std.c.unlink(path);
+    try log.openFile(path, 0);
+    defer {
+        log.closeFile();
+        _ = std.c.unlink(path);
+    }
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.vision_encoder = @ptrFromInt(@alignOf(VisionEncoder));
+    vision_block_test_hook = Probe.tower;
+    defer vision_block_test_hook = null;
+    const images = [_]chat_mod.ImageData{.{ .pixels = "\x01", .width = 3, .height = 1 }};
+    const blocks = [_]MediaBlock{.{ .kind = .image, .rows = 3 }};
+    const media = DeferredMedia{ .allocator = testing.allocator, .images = &images, .videos = &.{}, .blocks = &blocks };
+    var refusal: ?MediaRefusal = null;
+    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+
+    var buf: [2048]u8 = undefined;
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    const n = std.c.read(fd, &buf, buf.len);
+    const text = buf[0..if (n > 0) @intCast(n) else 0];
+    try testing.expect(std.mem.indexOf(u8, text, "encoded") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "Multimodal: the encode of 1 image(s) and 0 video(s), 3 soft tokens, failed after") != null);
 }

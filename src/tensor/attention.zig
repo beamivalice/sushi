@@ -41,6 +41,34 @@ const AttnParams = extern struct {
 const head_dim = 64;
 /// The vector kernels take at most this many query rows; a longer query takes the full kernel.
 const vector_rows = 8;
+/// The full kernel's query and key tiles.
+const full_bq: usize = 64;
+const full_bk: usize = 32;
+
+/// The pipeline `attention` runs for `q_len` query rows over `k_len` keys, `gqa` query heads to a key head, on `g`:
+/// what its name and function constants follow. A load's warm reads it to reach every pipeline its shapes take.
+pub const Plan = union(enum) {
+    full: Aligned,
+    one_pass,
+    two_pass: struct { blocks: c_int, wide: bool },
+};
+
+/// The full kernel's alignment constants: whether the query and the keys are whole tiles.
+const Aligned = struct { align_q: bool, align_k: bool };
+
+fn alignedOf(q_len: usize, k_len: usize) Aligned {
+    return .{ .align_q = q_len % full_bq == 0, .align_k = k_len % full_bk == 0 };
+}
+
+pub fn planOf(g: matmul.Gpu, q_len: usize, k_len: usize, gqa: usize) Plan {
+    if (q_len > vector_rows) return .{ .full = alignedOf(q_len, k_len) };
+    // Two passes for a long key axis on a Max or an Ultra, or for keys shared by many heads.
+    if (((g.class == .d or g.class == .s) and k_len >= 1024) or (gqa > 1 and k_len >= 4096)) {
+        const gqa_dims = (gqa == 8 and head_dim == 64) or (gqa == 8 and head_dim == 128) or ((gqa == 12 or gqa == 16) and head_dim == 128);
+        return .{ .two_pass = .{ .blocks = blocksOf(g, k_len, gqa * q_len), .wide = q_len == 1 and gqa_dims and k_len >= 8192 } };
+    }
+    return .one_pass;
+}
 
 pub fn attention(q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: f32) Error!*Tensor {
     if (q_pre.ndim != 4 or k_pre.ndim != 4 or v_pre.ndim != 4) return error.TensorShape;
@@ -87,8 +115,8 @@ fn full(q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: f32) Error!*Tenso
     const v = try copyUnlessLastDense(v_pre);
     defer core.release(v);
 
-    const bq: usize = 64;
-    const bk: usize = 32;
+    const bq = full_bq;
+    const bk = full_bk;
     const wm: usize = 4;
     const b: usize = @intCast(q.shape[0]);
     const h: usize = @intCast(q.shape[1]);
@@ -99,8 +127,9 @@ fn full(q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: f32) Error!*Tenso
     const out = try ops.transpose(laid, &.{ 0, 2, 1, 3 });
     errdefer core.release(out);
 
-    const align_q = q_len % bq == 0;
-    const align_k = k_len % bk == 0;
+    const aligned = alignedOf(q_len, k_len);
+    const align_q = aligned.align_q;
+    const align_k = aligned.align_k;
     const type_name = try stock.typeName(q.dtype);
     var name_buf: [160]u8 = undefined;
     const name = try stock.named(&name_buf, "steel_attention_{s}_bq{d}_bk{d}_bd{d}_bv{d}_wm{d}_wn1_mask{s}", .{ type_name, bq, bk, head_dim, head_dim, wm, type_name });
@@ -176,12 +205,9 @@ fn vector(g: matmul.Gpu, q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: 
     defer core.release(v);
     const out = try core.fresh(q.dtype, &.{ q.shape[0], q.shape[1], q.shape[2], v.shape[3] });
     errdefer core.release(out);
-    const k_len: usize = @intCast(k.shape[2]);
-    // Two passes for a long key axis on a Max or an Ultra, or for keys shared by many heads.
-    if (((g.class == .d or g.class == .s) and k_len >= 1024) or (k.shape[1] < q.shape[1] and k_len >= 4096)) {
-        try twoPass(g, q, k, v, out, scale, gqa);
-    } else {
-        try onePass(q, k, v, out, scale, gqa);
+    switch (planOf(g, @intCast(q.shape[2]), @intCast(k.shape[2]), gqa)) {
+        .two_pass => |plan| try twoPass(plan.blocks, plan.wide, q, k, v, out, scale, gqa),
+        else => try onePass(q, k, v, out, scale, gqa),
     }
     return out;
 }
@@ -250,17 +276,14 @@ fn blocksOf(g: matmul.Gpu, n: usize, n_simds: usize) c_int {
     return blocks;
 }
 
-fn twoPass(g: matmul.Gpu, q: *Tensor, k: *Tensor, v: *Tensor, out: *Tensor, scale: f32, gqa: usize) Error!void {
+fn twoPass(blocks: c_int, wide: bool, q: *Tensor, k: *Tensor, v: *Tensor, out: *Tensor, scale: f32, gqa: usize) Error!void {
     const q_len: usize = @intCast(q.shape[2]);
     const n: usize = @intCast(k.shape[2]);
-    const gqa_dims = (gqa == 8 and head_dim == 64) or (gqa == 8 and head_dim == 128) or ((gqa == 12 or gqa == 16) and head_dim == 128);
-    const wide = q_len == 1 and q.shape[1] == @as(c_int, @intCast(gqa)) * k.shape[1] and gqa_dims and n >= 8192;
     var name_buf: [96]u8 = undefined;
     const name = if (wide)
         try stock.named(&name_buf, "sdpa_vector_2pass_1_gqa_{d}_{s}_{d}_{d}", .{ gqa, try stock.cType(q.dtype), head_dim, head_dim })
     else
         try stock.named(&name_buf, "sdpa_vector_2pass_1_{s}_{d}_{d}", .{ try stock.cType(q.dtype), head_dim, head_dim });
-    const blocks = blocksOf(g, n, gqa * q_len);
 
     var mid_shape: [5]c_int = undefined;
     @memcpy(mid_shape[0..3], out.shape[0..3]);

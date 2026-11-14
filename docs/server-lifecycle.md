@@ -464,12 +464,15 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `encodeMediaAfterRestore` decodes again, only the images it encodes, through the same window, freeing each after
   its tower call; an image its restored prefix holds is decoded once, for its key. Qwen, MiMo and GLM take the same
   path; Gemma's fixed square and `x-mlx-pixels` decode on the connection thread. The `Multimodal: encoded N of M` line gives decode and
-  encode ms, and the encode counts in the request's prefill time.
+  encode ms (a failed encode logs `Multimodal: the encode of ... failed after N ms` instead), and the encode counts in
+  the request's prefill time.
 - **Media refusals are named**: an undecodable image is a 400 naming `messages[i]`/`input[i]` and the reason
   (`imageRejectReason`), an `input_audio` part a 400 unless the model encodes audio (`RequestMedia.accepts_audio`),
   more than `chat.MAX_REQUEST_IMAGES` (1024) a 400 with both counts, a prompt the media pushes past the context a 400
   naming the media's tokens, an encode that does not fit a 400 (`towerFitFault`), a failed encode a 500
   (`MediaFault`); both of the last two are raised after the restore as the slot's `MediaRefused`; never a text-only answer.
+  An encode that MLX or the engine refused memory is the 503 a forward gets (`TransientCapExceeded`, or the memory
+  503). Every failed encode takes the MLX error it raised (`mlx.settledErrorName`), so the next request starts clean.
 - **Media is an arch seam** ([engine-arch-seam](engine-arch-seam.md)): `src/request_media.zig` (request shape, placement,
   keys, decode driver) and `src/vision.zig` (the resident tower) name no arch; `src/arch/media.zig` dispatches to each
   arch's `src/<arch>/<arch>_media.zig`. An arch's `media` declares its processor (`mode`, `claims`, `preproc`, `resize` +

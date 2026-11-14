@@ -206,9 +206,10 @@ change, M5 Max, GPU lock held, QUIET, `taskpolicy -a`):
   gain is memory, not speed.
 - The encode's transient peak is the same on both arms (1.198 GiB in that process, which also holds the codes); the quantized
   matmul reads the codes in its kernel and makes no dequantized copy, so `visionEncodeBill` and the phase cap stand.
-- On a Sushi Cooler load the encode's scratch is the engine pool's, not MLX's: the pass sets the pool budget to
-  `encodeScratchBytes` of the image and trims the pool when it ends, so the bill and the phase cap stand; the weights
-  are MLX's buffers, imported, and the span the pass returns is the pool's until the trunk is done with it.
+- On a Sushi Cooler load the encode's scratch is the engine pool's, not MLX's: `enterVision` sets the pool budget to
+  the encode's bill for the whole encode (each image's patches, its pass and the join of the spans), and each pass
+  trims the pool when it ends, so the bill and the phase cap stand; the weights are MLX's buffers, imported, and the
+  span the pass returns is the pool's until the trunk is done with it.
 
 <a id="owned-weights"></a>
 ## Weight memory sushi owns

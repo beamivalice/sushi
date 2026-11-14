@@ -1308,10 +1308,14 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   release processor admits give the tower 1,084 to 9,198 patches and 164 to 1,022 aligner cells, against the 257 rows
   (33 for the aligner) from which MLX's plan is the matrix-unit tile the engine runs, so MLX's vector kernels and
   split-K plan are reached by no request. A pack whose vision config could reach them, or a head dimension but 64,
-  refuses a Cooler load by name (`VisionTowerNotPorted`, with the shape found); the MLX route serves it. The pass runs under the pool budget of `encodeScratchBytes` and trims the pool at its
-  end. The load runs one block over five patch counts so that each pipeline an image reaches (query chunks whole or
-  short of a 64, keys whole 32s or not, a last chunk of 8 rows or fewer) is made then, `[vision] engine tower warmed`
-  reports them, and their recipes ride the pipeline manifest: a same-key load makes them with the rest and runs no
+  refuses a Cooler load by name (`VisionTowerNotPorted`, with the shape found); the MLX route serves it. In a request
+  the engine's pool runs under the encode's bill (`visionEncodeBill`, installed by `dsv41_borrow.enterVision`) from the
+  first pass to the image queue's join of the spans, as MLX's transient cap does on the MLX route; a pass outside a
+  request (the load's warm) runs under the pool budget of `encodeScratchBytes`. Each pass trims the pool at its end.
+  The load runs one block over seven patch counts so that each pipeline an image reaches (query chunks whole or
+  short of a 64, keys whole 32s or not, a last chunk of 8 rows or fewer over at most 8,192 keys or more) is made then,
+  on a Max and on an Ultra (a test checks every patch count the processor reaches against `attention.planOf`),
+  `[vision] engine tower warmed` reports them, and their recipes ride the pipeline manifest: a same-key load makes them with the rest and runs no
   tower warm ([engine-own-forward](engine-own-forward.md#the-pipeline-manifest)). The span stays the engine's tensor; the
   image queue joins several spans there too.
 - **Requantized at load** (`Dsv41Vision.init`, `quantizesAtLoad`): the pack keeps the tower bf16, and the load turns every

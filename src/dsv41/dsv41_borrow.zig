@@ -211,15 +211,34 @@ fn splitOf(rows: u64, seq: u64, c: *const Config) struct { mlx: u64, own: u64 } 
     return .{ .mlx = 0, .own = if (rows > verify_rows) cap else ownCap(c, seq) };
 }
 
-/// An image encode of `bill` bytes (`request_media.visionEncodeBill`) starts: its allocations are capped at it. No bill, no cap.
+/// Whether an image encode on the engine runs under its bill (`enterVision`).
+var vision_billed: bool = false;
+
+/// Whether the engine's cap is an image encode's bill: each pass of the tower keeps it, the bill holding the worst pass.
+pub fn visionBilled() bool {
+    return vision_billed;
+}
+
+/// An image encode of `bill` bytes (`request_media.visionEncodeBill`) starts: its allocations are capped at it, on the
+/// engine its tower's passes, the patch arrays between them and the join of the spans. No bill, no cap.
 pub fn enterVision(bill: u64, config: *const ModelConfig, ops: PoolOps) void {
-    if (pool_ram_cap == 0 or bill == 0 or !arch_config.isOf(config, "dsv41") or ownsEngine(config)) return;
+    if (pool_ram_cap == 0 or bill == 0 or !arch_config.isOf(config, "dsv41")) return;
+    if (ownsEngine(config)) {
+        vision_billed = true;
+        ops.set_own(bill);
+        return;
+    }
     setTransient(phaseLimit(bill, config), ops);
 }
 
 /// The encode is over; the next forward installs its own cap.
 pub fn leaveVision(config: *const ModelConfig, ops: PoolOps) void {
-    if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41") or ownsEngine(config) or !transient_now) return;
+    if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41")) return;
+    if (ownsEngine(config)) {
+        vision_billed = false;
+        return;
+    }
+    if (!transient_now) return;
     setTransient(0, ops);
 }
 
@@ -663,6 +682,15 @@ test "dsv41 borrow: every phase installs the cap it bills and the decode pool be
             // An encode with no bill is not capped to the pool alone.
             const none = PoolProbe.transient_sets;
             enterVision(0, &config, PoolProbe.ops);
+            try testing.expectEqual(none, PoolProbe.transient_sets);
+            // On the engine the bill is the engine's cap for the whole encode, and nothing of MLX's moves.
+            own_override = true;
+            defer own_override = null;
+            enterVision(1_100_000_000, &config, PoolProbe.ops);
+            try testing.expectEqual(@as(u64, 1_100_000_000), PoolProbe.own);
+            try testing.expect(visionBilled());
+            leaveVision(&config, PoolProbe.ops);
+            try testing.expect(!visionBilled());
             try testing.expectEqual(none, PoolProbe.transient_sets);
             // Another architecture is never capped.
             const qwen = ModelConfig{ .model_type = "qwen4_exp" };

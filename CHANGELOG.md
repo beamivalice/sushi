@@ -6,6 +6,13 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A failed image encode no longer fails the request after it**: an encode that MLX or Sushi Cooler refused takes the
+  error it raised, so the next request starts clean, and a refusal for memory answers the 503 a forward gets instead
+  of a 500 `vision encoding failed`. A failed encode logs that it failed instead of `encoded N of N`.
+- **DeepSeek-V4.1 on Sushi Cooler serves many large images followed by a small one, as the MLX route does**: the
+  encode runs under its bill on the engine from the first image to the join of the spans, which failed 500 before.
+- **The DeepSeek-V4.1 tower's warm on Sushi Cooler makes the attention pipeline of an image of more than 8,192
+  patches**: such an image no longer compiles a pipeline inside its request; the load warms two more patch counts.
 - **A reply says the same thing on every API surface**: `/v1/responses` keeps the text a model wrote before its tool
   calls and reports its prefix reuse and timings when streamed, `/v1/messages` now ships a call the model wrote inside
   a thought it never closed, as the other surfaces do, a stop sequence that cuts a call open no longer ships it as a
