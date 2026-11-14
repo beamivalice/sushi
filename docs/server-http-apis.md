@@ -145,10 +145,13 @@ answers while the weights load:
 - Chat usage reports `completion_tokens_details.reasoning_tokens` by tokenizing concatenated delivered reasoning; streaming includes it only with `stream_options.include_usage`.
 
 - **A stream and a non-stream answer are the SAME BYTES**; whitespace is the one thing a stream may withhold: a
-  leading run (`streamContentLead`), and a token's trailing whitespace until text follows (`ContentStream`). The held
+  leading run of a content part, inside its first token too (`streamContentLead`, `ContentStream`; a logprobs entry stays
+  the sampled token, whole, on both), and a token's trailing whitespace until text follows (`ContentStream`). The held
   tail ships at the end of the reply unless the non-stream reply trims it: after a closed thought, or before tool
-  markup (`ContentStream.finish`). The format corpus pins it for any token split. A spent reasoning budget WITHHOLDS the rest of the thought; a non-stream tool-call reply
-  carries the pre-markup text (`visibleToolPreamble`); a non-stream disconnect reports `client_disconnect`, never
+  markup (`ContentStream.finish`). The format corpus pins it for any token split. A spent reasoning budget WITHHOLDS the rest of the thought; a tool-call reply, streamed or not,
+  carries the pre-markup text (`visibleToolPreamble`; Responses lists it as a message item ahead of its `function_call`s,
+  and stores it, so an input replay and a `previous_response_id` chain render the same prompt); a Responses stream's
+  `usage` and `timings` come from `StreamingTokenStream.result`, the one place a stream's stats become a result; a non-stream disconnect reports `client_disconnect`, never
   `length`, and is noticed after every decoded token as well as during prefill, so a client's timed-out retry never
   leaves a ghost decoding to `max_tokens`; a request integer outside the range its field takes is a 400, never narrowed
   (`generationFieldFault`).

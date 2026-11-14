@@ -11,9 +11,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## The pipeline
 
 - With `tools`, tokens buffer for detection; thinking buffers separately. Parse chain strict → tolerant repairs →
-  truncation salvage, then the ONE chokepoint `server.parseToolCallsForRequest` = parse → inferred-name filter →
+  truncation salvage, then the ONE chokepoint `reply.parseToolCallsForRequest` = parse → inferred-name filter →
   parallel clamp → buried-param hoist → schema coercion (last two gated by `--no-tool-autocorrect`; emitted
   `arguments` ALWAYS valid JSON).
+- **A call is a call wherever the generation puts it, on every surface** (`reply.toolReply`, `reply.Origin`): one the
+  model wrote inside a prompt-opened thought it never closed ships, its markup cut out of `reasoning_content`
+  (`splitThinkBlock`), since dropping it turns an agent turn into a bare `stop`; a call inside a thought that closed
+  stays skipped. A stop sequence that matched inside a call (`think_tags.endsInsideToolCall`: the last opener has no
+  closer) leaves no call, the finish stays `stop` and Anthropic's `stop_sequence` stays set, as a loop cut does; a stop
+  after the closer keeps the call. Lint `reply-bypass`: a surface never calls the raw `parseToolCalls`.
 - Template input `chat.templateMessages`: role "tool" native, a call's `arguments` the client's JSON object (`{}` for
   anything else), every string valid UTF-8 (U+FFFD for a bad sequence, as `appendJsonString` writes). Streaming: full args in ONE SSE delta, thinking → `reasoning_content`.
 - Buffered calls may exceed a client's inter-event progress deadline even while SSE keepalives arrive. The omp launcher
@@ -283,6 +289,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - Strip pos-0 unclosed openers; `trimTrailingThinkClosers`; unparsed tool markup never rides out as reasoning OR
   content (`trimLeakedToolMarkup`, ONE cut).
+- **A stream with no tools cuts the markup where the non-stream reply does** (`think_tags.MarkupCut`, in
+  `ContentStream` and the thought arms): text that may open markup waits, text before an opener goes, nothing follows
+  it. A request with tools parses the markup instead, so the cut is off there.
 - A reply whose tool markup parsed to no call ends its turn as a plain `stop` with the markup cut: the log names it
   (`[tool-parse]`, written by `parseToolCallsForRequest`, the bytes cut and where they start).
 - Whether a prompt ends inside a think block is a property of the RENDERED BYTES (`promptOpensThink`), never ANDed

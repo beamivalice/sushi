@@ -148,8 +148,8 @@ pub const ContentStep = union(enum) {
 /// A stream's content arm, token by token, delivering the content the non-stream reply holds
 /// (`normalizeEmbeddedThinkBlocks` + `splitThinkBlock`): a think tag outside a code span is structure, a
 /// thought re-opened after content goes back to the thought arm, and the content parts around thoughts are
-/// trimmed of "\n " and joined by one "\n". A token's leading whitespace ships with its text, as
-/// `streamContentLead` does; its trailing whitespace waits for the next text or the end of the reply.
+/// trimmed of "\n " and joined by one "\n": a part's leading whitespace never ships, even inside its first token,
+/// and a token's trailing whitespace waits for the next text or the end of the reply.
 pub const ContentStream = struct {
     span: CodeSpan = .{},
     /// A visible content byte was sent.
@@ -158,10 +158,14 @@ pub const ContentStream = struct {
     lead: bool = true,
     held: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
+    /// Where the reply's tool markup is cut (`MarkupCut`), and the bytes it has not let go yet.
+    mark: MarkupCut = .{},
+    unsent: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *ContentStream, allocator: std.mem.Allocator) void {
         self.held.deinit(allocator);
         self.out.deinit(allocator);
+        self.unsent.deinit(allocator);
     }
 
     /// The opener a thought starts with when `tt` opens one here, or null: inside a code span a tag is text.
@@ -187,7 +191,8 @@ pub const ContentStream = struct {
             try self.held.appendSlice(allocator, tt);
             return .hold;
         }
-        const text = tt[0..std.mem.trimEnd(u8, tt, "\n ").len];
+        const body = if (self.lead) std.mem.trimStart(u8, tt, "\n ") else tt;
+        const text = body[0..std.mem.trimEnd(u8, body, "\n ").len];
         self.out.clearRetainingCapacity();
         if (self.lead and self.started) try self.out.append(allocator, '\n');
         self.lead = false;
@@ -195,17 +200,31 @@ pub const ContentStream = struct {
         try self.out.appendSlice(allocator, self.held.items);
         self.held.clearRetainingCapacity();
         try self.out.appendSlice(allocator, text);
-        try self.held.appendSlice(allocator, tt[text.len..]);
-        return .{ .send = self.out.items };
+        try self.held.appendSlice(allocator, body[text.len..]);
+        if (!self.mark.on) return .{ .send = self.out.items };
+        try self.unsent.appendSlice(allocator, self.out.items);
+        const n = self.mark.sendable(self.unsent.items);
+        self.out.clearRetainingCapacity();
+        try self.out.appendSlice(allocator, self.unsent.items[0..n]);
+        self.unsent.replaceRangeAssumeCapacity(0, if (self.mark.cut) self.unsent.items.len else n, &.{});
+        return if (n == 0) .hold else .{ .send = self.out.items };
     }
 
     /// The reply ended outside a thought: the withheld whitespace ships, unless the non-stream reply trims
     /// the content's tail (`trim_tail`: a thought closed, or tool markup follows the content).
     /// Valid until the next `deliver`: the length drops without `clearRetainingCapacity`, which poisons the bytes.
-    pub fn finish(self: *ContentStream, trim_tail: bool) []const u8 {
-        const tail = if (trim_tail) "" else self.held.items;
-        self.held.items.len = 0;
-        return tail;
+    pub fn finish(self: *ContentStream, allocator: std.mem.Allocator, trim_tail: bool) ![]const u8 {
+        if (!self.mark.on) {
+            const tail = if (trim_tail) "" else self.held.items;
+            self.held.items.len = 0;
+            return tail;
+        }
+        self.out.clearRetainingCapacity();
+        try self.out.appendSlice(allocator, self.unsent.items[0..self.mark.final(self.unsent.items)]);
+        if (!trim_tail and !self.mark.cut) try self.out.appendSlice(allocator, self.held.items);
+        self.unsent.clearRetainingCapacity();
+        self.held.clearRetainingCapacity();
+        return self.out.items;
     }
 };
 
@@ -464,11 +483,78 @@ pub fn leakedToolMarkupStart(text: []const u8) ?usize {
     return if (cut == text.len) null else cut;
 }
 
+/// Whether `unsent`, the text a stream has not sent, may still turn into markup `trimLeakedToolMarkup` cuts: it ends
+/// in the start of an opener, or holds an opener whose cut only later bytes decide.
+fn markupPending(unsent: []const u8) bool {
+    if (functionOpenerHoldsForTools(unsent) or invokeOpenerHoldsForTools(unsent)) return true;
+    var i = unsent.len -| 32;
+    while (i < unsent.len) : (i += 1) {
+        if (unsent[i] != '<') continue;
+        const tail = unsent[i..];
+        for (tool_markup_openers) |o| if (tail.len < o.len and std.mem.startsWith(u8, o, tail)) return true;
+    }
+    return false;
+}
+
+/// Where a stream stops sending so the reply ends where `trimLeakedToolMarkup` ends it: text that may open tool
+/// markup waits, text before an opener goes, and once one opened nothing more does. Off by default: a request
+/// with tools parses the markup instead.
+pub const MarkupCut = struct {
+    on: bool = false,
+    cut: bool = false,
+
+    /// How many leading bytes of `unsent` may be sent now.
+    pub fn sendable(self: *MarkupCut, unsent: []const u8) usize {
+        if (!self.on) return unsent.len;
+        if (self.cut) return 0;
+        if (leakedToolMarkupStart(unsent)) |at| {
+            self.cut = true;
+            return std.mem.trimEnd(u8, unsent[0..at], "\n\r\t ").len;
+        }
+        return if (markupPending(unsent)) 0 else unsent.len;
+    }
+
+    /// How many leading bytes of `unsent` go when no more text follows.
+    pub fn final(self: *MarkupCut, unsent: []const u8) usize {
+        if (!self.on) return unsent.len;
+        if (self.cut) return 0;
+        const at = leakedToolMarkupStart(unsent) orelse return unsent.len;
+        self.cut = true;
+        return std.mem.trimEnd(u8, unsent[0..at], "\n\r\t ").len;
+    }
+};
+
 /// Cut visible text at the first unparsed tool-call marker. Returns a prefix
 /// slice (no alloc); text with no marker is returned untouched.
 pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
     const cut = leakedToolMarkupStart(text) orelse return text;
     return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
+}
+
+const ToolMarkupFamily = struct { opener: []const u8, closers: []const []const u8 };
+
+/// Each call dialect's opener and the closers that end it, where `tool_markup_openers` knows only the openers.
+const tool_markup_families = [_]ToolMarkupFamily{
+    .{ .opener = "<|tool_call", .closers = &.{"<tool_call|>"} },
+    .{ .opener = "<tool_call", .closers = &.{ "</tool_call>", "</tool_calls>", "</tool>", "</tool_request>", "</tool_requests>" } },
+    .{ .opener = "<｜DSML｜tool_calls", .closers = &.{"</｜DSML｜tool_calls>"} },
+    .{ .opener = "<function_calls>", .closers = &.{"</function_calls>"} },
+};
+
+/// True when the last tool-call opener in `text` has no closer after it: the text stops inside a call.
+pub fn endsInsideToolCall(text: []const u8) bool {
+    var last: ?struct { at: usize, family: *const ToolMarkupFamily } = null;
+    for (&tool_markup_families) |*f| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, text, from, f.opener)) |at| : (from = at + 1) {
+            // Gemma's closer `<tool_call|>` begins with the Hermes opener.
+            if (std.mem.startsWith(u8, text[at..], "<tool_call|>")) continue;
+            if (last == null or at > last.?.at) last = .{ .at = at, .family = f };
+        }
+    }
+    const l = last orelse return false;
+    for (l.family.closers) |c| if (std.mem.indexOfPos(u8, text, l.at, c) != null) return false;
+    return true;
 }
 
 /// The text the model said before the tool markup, byte for byte as the stream flushes it.
@@ -1454,9 +1540,7 @@ pub fn streamTailIsReasoning(in_think_block: bool, prompt_opened_think: bool, sa
 /// `content_started` must flip on the first NON-EMPTY emission, so a suppressed
 /// whitespace token leaves the next one still eligible.
 pub fn streamContentLead(chunk: []const u8, content_started: bool) []const u8 {
-    if (content_started) return chunk;
-    if (std.mem.trimStart(u8, chunk, "\n ").len == 0) return "";
-    return chunk;
+    return if (content_started) chunk else std.mem.trimStart(u8, chunk, "\n ");
 }
 
 /// turn must send only the remainder or the client sees the thought twice.
@@ -1609,7 +1693,7 @@ test "ContentStream: parts around a thought are trimmed and joined by one newlin
     try testing.expect((try content.deliver(allocator, " ")) == .hold);
     try testing.expectEqualStrings(" C", (try content.deliver(allocator, "C")).send);
     try testing.expect((try content.deliver(allocator, "\n")) == .hold);
-    try testing.expectEqualStrings("\n", content.finish(false));
+    try testing.expectEqualStrings("\n", try content.finish(testing.allocator, false));
 }
 
 test "ContentStream: a token's trailing whitespace waits, and a trimmed tail never ships" {
@@ -1619,10 +1703,10 @@ test "ContentStream: a token's trailing whitespace waits, and a trimmed tail nev
     try testing.expectEqualStrings("Checking.", (try content.deliver(allocator, "Checking.\n\n")).send);
     try testing.expectEqualStrings("\n\nNext", (try content.deliver(allocator, "Next")).send);
     try testing.expectEqualStrings("end", (try content.deliver(allocator, "end \n")).send);
-    try testing.expectEqualStrings("", content.finish(true));
-    try testing.expectEqualStrings("", content.finish(false));
+    try testing.expectEqualStrings("", try content.finish(testing.allocator, true));
+    try testing.expectEqualStrings("", try content.finish(testing.allocator, false));
     try testing.expectEqualStrings("more", (try content.deliver(allocator, "more \n")).send);
-    try testing.expectEqualStrings(" \n", content.finish(false));
+    try testing.expectEqualStrings(" \n", try content.finish(testing.allocator, false));
 }
 
 test "ThoughtJoin: a later thought's first delta follows one blank line" {
@@ -2555,9 +2639,9 @@ test "streamContentLead never touches whitespace inside the answer" {
     try testing.expectEqualStrings("  x", streamContentLead("  x", true));
     // And a lead that is not whitespace is untouched.
     try testing.expectEqualStrings("Hello", streamContentLead("Hello", false));
-    // A token is never cut in half: one carrying whitespace AND text rides
-    // whole, so its logprobs entry still describes bytes that reached content.
-    try testing.expectEqualStrings("\nHello", streamContentLead("\nHello", false));
+    // The lead of a token that carries text goes too, as the split trims it.
+    try testing.expectEqualStrings("Hello", streamContentLead("\nHello", false));
+    try testing.expectEqualStrings("\nHello", streamContentLead("\nHello", true));
 }
 
 test "streamShouldBufferForTools: MiniCPM5 <function name=...> open" {

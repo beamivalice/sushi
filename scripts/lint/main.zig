@@ -25,6 +25,7 @@ const rules = .{
     @import("template_text_search.zig"),
     @import("device_probe.zig"),
     @import("log_line_end.zig"),
+    @import("reply_bypass.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

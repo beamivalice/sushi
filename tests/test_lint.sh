@@ -71,6 +71,20 @@ printf '%s\n' 'const std = @import("std");' 'const used = @import("used.zig");' 
   'pub fn f(a: Alias) void { _ = used; _ = a; }' 'test "t" { _ = only_test; }' > "$TMP/t/src/p.zig"
 expect_green "used, pub, test-only, quoted and discard imports"
 
+# rule reply-bypass
+tree
+printf '%s\n' 'const tc = @import("tool_calls.zig");' 'pub fn f(a: u8) void {' '    _ = tc.parseToolCalls(a, "x");' '}' > "$TMP/t/src/anthropic.zig"
+expect_red "a surface calling the raw parser" "src/anthropic.zig:3:12 \[reply-bypass\] f: parseToolCalls: read calls"
+
+tree
+printf '%s\n' 'pub fn f() void {' '    _ = .{ .text = "", .prefill_tps = 0.0 };' '}' > "$TMP/t/src/responses_api.zig"
+expect_red "a surface building a GenerationResult" "src/responses_api.zig:2:25 \[reply-bypass\] f: a GenerationResult literal"
+
+tree
+printf '%s\n' 'const tc = @import("tool_calls.zig");' 'pub fn f(a: u8) void {' '    _ = tc.parseToolCalls(a, "x");' '}' 'test "t" { _ = .{ .prefill_tps = 0.0 }; }' > "$TMP/t/src/other.zig"
+printf '%s\n' 'test "t" { _ = .{ .prefill_tps = 0.0 }; }' > "$TMP/t/src/generation_stream.zig"
+expect_green "the raw parser outside a surface, and a result literal in a test or in generation_stream.zig"
+
 # rule std-xxhash3
 tree
 printf '%s\n' 'const std = @import("std");' 'pub fn f(b: []const u8) u64 {' '    return std.hash.XxHash3.hash(0, b);' '}' > "$TMP/t/src/p.zig"

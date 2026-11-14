@@ -2807,8 +2807,9 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
     errdefer reasoning.deinit(allocator);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    var content = think_tags.ContentStream{};
+    var content = think_tags.ContentStream{ .mark = .{ .on = true } };
     defer content.deinit(allocator);
+    var thought_mark = think_tags.MarkupCut{ .on = true };
     var join = think_tags.ThoughtJoin{};
     var think_buf = std.ArrayList(u8).empty;
     defer think_buf.deinit(allocator);
@@ -2841,7 +2842,8 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
         }
         if (!skipped) continue;
         if (think_tags.indexOfThinkCloseTag(think_buf.items, 0)) |close| {
-            try appendReasoning(allocator, &reasoning, &join, think_tags.closedThoughtDelta(think_buf.items[0..close.pos], shipped));
+            const closed = think_tags.closedThoughtDelta(think_buf.items[0..close.pos], shipped);
+            try appendReasoning(allocator, &reasoning, &join, closed[0..thought_mark.final(closed)]);
             join.close();
             shipped = false;
             in_think = false;
@@ -2854,17 +2856,19 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
             continue;
         }
         const flush = think_tags.openThoughtFlush(think_buf.items, shipped);
-        const delta = think_buf.items[flush.skip..][0..flush.ship];
+        const ship = thought_mark.sendable(think_buf.items[flush.skip..][0..flush.ship]);
+        const delta = think_buf.items[flush.skip..][0..ship];
         try appendReasoning(allocator, &reasoning, &join, delta);
         if (delta.len > 0) shipped = true;
-        const keep = think_buf.items.len - flush.skip - flush.ship;
-        std.mem.copyForwards(u8, think_buf.items[0..keep], think_buf.items[flush.skip + flush.ship ..]);
+        const keep = if (thought_mark.cut) 0 else think_buf.items.len - flush.skip - ship;
+        std.mem.copyForwards(u8, think_buf.items[0..keep], think_buf.items[flush.skip + ship ..][0..keep]);
         think_buf.shrinkRetainingCapacity(keep);
     }
     if (in_think) {
-        try appendReasoning(allocator, &reasoning, &join, join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped, shipped)));
+        const rest = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped, shipped));
+        try appendReasoning(allocator, &reasoning, &join, rest[0..thought_mark.final(rest)]);
     } else {
-        try out.appendSlice(allocator, content.finish(join.closed));
+        try out.appendSlice(allocator, try content.finish(allocator, join.closed));
     }
     const r = try reasoning.toOwnedSlice(allocator);
     errdefer allocator.free(r);
@@ -2883,6 +2887,71 @@ fn expectStreamMatchesReply(allocator: std.mem.Allocator, raw: []const u8, token
     errdefer std.debug.print("\nraw: {s}\nnon-stream: {s} | {s}\nstream: {s} | {s}\n", .{ raw, want_reasoning, split.content, got[0], got[1] });
     try testing.expectEqualStrings(want_reasoning, got[0]);
     try testing.expectEqualStrings(split.content, got[1]);
+}
+
+/// `raw` cut into tokens of `step` code points; each of `whole` stays one token.
+fn tokensOf(allocator: std.mem.Allocator, raw: []const u8, whole: []const []const u8, step: usize) ![][]const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    errdefer out.deinit(allocator);
+    var run: usize = 0;
+    var i: usize = 0;
+    var cps: usize = 0;
+    outer: while (i < raw.len) {
+        for (whole) |w| if (std.mem.startsWith(u8, raw[i..], w)) {
+            if (i > run) try out.append(allocator, raw[run..i]);
+            try out.append(allocator, w);
+            i += w.len;
+            run = i;
+            cps = 0;
+            continue :outer;
+        };
+        i += std.unicode.utf8ByteSequenceLength(raw[i]) catch 1;
+        cps += 1;
+        if (cps == step) {
+            try out.append(allocator, raw[run..i]);
+            run = i;
+            cps = 0;
+        }
+    }
+    if (run < raw.len) try out.append(allocator, raw[run..]);
+    return out.toOwnedSlice(allocator);
+}
+
+test "format corpus: a stream without tools ends where the non-stream reply cuts unparsed tool markup" {
+    // A request with no tools (or tool_choice none) still meets a model that writes a call its history taught it.
+    const allocator = testing.allocator;
+    const qwen_call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
+    const glm_call = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>";
+    const dsml_call = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>";
+    const Case = struct { raw: []const u8, opened: bool };
+    const cases = [_]Case{
+        .{ .raw = "Plan.\n</think>\n\nLet me check.\n\n" ++ qwen_call, .opened = true },
+        .{ .raw = "Plan.</think>Let me check." ++ glm_call, .opened = true },
+        .{ .raw = "Plan.</think>Answer.\n\n" ++ dsml_call ++ "\n\nafter", .opened = true },
+        .{ .raw = "Plan " ++ glm_call ++ "</think>Done.", .opened = true },
+        .{ .raw = "Plan.\n" ++ qwen_call ++ "\n</think>\n\nDone.", .opened = true },
+        .{ .raw = "Plan.</think>Use the <tool_call> tag, 2 < 3 and <b>bold</b>.", .opened = true },
+        .{ .raw = "Plan.</think>It costs <5 and <tool is a word, then <tool_call", .opened = true },
+        .{ .raw = "Hello <function name=\"x\"><param name=\"p\">1</param></function>", .opened = false },
+        .{ .raw = "Hello <invoke name=\"x\"><parameter name=\"p\">1</parameter></invoke>", .opened = false },
+    };
+    const whole = [_][]const u8{ "<think>", "</think>" };
+    const whole_calls = [_][]const u8{ "<think>", "</think>", "<tool_call>", "</tool_call>" };
+    for (cases) |c| for ([_]usize{ 1, 2, 3, 5, 1000 }) |step| for ([_][]const []const u8{ &whole, &whole_calls }) |specials| {
+        const tokens = try tokensOf(allocator, c.raw, specials, step);
+        defer allocator.free(tokens);
+        try expectStreamMatchesReply(allocator, c.raw, tokens, c.opened);
+    };
+}
+
+test "format corpus: a stream drops the whitespace leading a content part, inside its first token too" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { raw: []const u8, tokens: []const []const u8, opened: bool }{
+        .{ .raw = "Plan.</think> The answer is 4.", .tokens = &.{ "Plan", ".", "</think>", " The", " answer", " is", " 4", "." }, .opened = true },
+        .{ .raw = "Plan.</think>\n\nThe answer.", .tokens = &.{ "Plan", ".", "</think>", "\n\nThe", " answer", "." }, .opened = true },
+        .{ .raw = "<think>t</think>A <think>u</think> B", .tokens = &.{ "<think>", "t", "</think>", "A", " ", "<think>", "u", "</think>", " B" }, .opened = false },
+    };
+    for (cases) |c| try expectStreamMatchesReply(allocator, c.raw, c.tokens, c.opened);
 }
 
 test "format corpus: a closer in content after the thought is dropped on the stream and the non-stream reply alike" {
@@ -3326,7 +3395,7 @@ test "format corpus: the text before a tool call streams as the non-stream pream
             .send => |bytes| try got.appendSlice(allocator, bytes),
             else => {},
         };
-        try got.appendSlice(allocator, content.finish(true));
+        try got.appendSlice(allocator, try content.finish(allocator, true));
         try testing.expectEqualStrings(want, got.items);
     }
 }

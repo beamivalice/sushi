@@ -6,6 +6,11 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A reply says the same thing on every API surface**: `/v1/responses` keeps the text a model wrote before its tool
+  calls and reports its prefix reuse and timings when streamed, `/v1/messages` now ships a call the model wrote inside
+  a thought it never closed, as the other surfaces do, a stop sequence that cuts a call open no longer ships it as a
+  finished call, and a stream with no tools cuts stray tool markup and a content part's leading space as the
+  non-stream reply does.
 - **The dashboard shows expert streaming**: for a model that streams its experts from the SSD, a new card shows how many
   routed experts were already in memory, the SSD read rate and the time spent waiting on it, and `/metrics` carries the
   same counters.

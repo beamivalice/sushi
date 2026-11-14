@@ -36,6 +36,7 @@ const nowMsMonotonic = io_util.nowMsMonotonic;
 const Stopwatch = io_util.Stopwatch;
 const nextCompletionId = io_util.nextCompletionId;
 const server_mod = @import("server.zig");
+const reply_mod = @import("reply.zig");
 const server_state = @import("server_state.zig");
 const arch_packs = @import("arch/packs.zig");
 const anthropic = @import("anthropic.zig");
@@ -60,7 +61,7 @@ const logHttpSseData = http.logHttpSseData;
 const memoryContextRefusalMessage = server_mod.memoryContextRefusalMessage;
 const mtpCapable = server_mod.mtpCapable;
 const not_enough_memory_message = http.not_enough_memory_message;
-const parseToolCallsForRequest = server_mod.parseToolCallsForRequest;
+const parseToolCallsForRequest = reply_mod.parseToolCallsForRequest;
 const promptOpensThink = server_mod.promptOpensThink;
 const reasoningWithinBudget = server_mod.reasoningWithinBudget;
 const sendAnthropicError = anthropic.sendAnthropicError;
@@ -71,9 +72,9 @@ const resident_models_cap_message = http.resident_models_cap_message;
 const BUSY_RETRY_AFTER_SECS = http.BUSY_RETRY_AFTER_SECS;
 const sendResponse = http.sendResponse;
 const sendResponsesEvent = responses_api.sendResponsesEvent;
-const shouldParseToolCalls = server_mod.shouldParseToolCalls;
+const shouldParseToolCalls = reply_mod.shouldParseToolCalls;
 const splitConstrainedResponse = responses_api.splitConstrainedResponse;
-const toolCallFinishReason = server_mod.toolCallFinishReason;
+const toolCallFinishReason = reply_mod.toolCallFinishReason;
 
 /// Tokens a client should be shown after a loop cut: everything before the
 /// degenerate span. `start` is an index into the SAME emitted-token sequence,
@@ -585,9 +586,11 @@ pub fn handleNonStreamingGeneration(
     // Apply stop sequences: truncate at the earliest occurrence (`stop_sequences.zig`)
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
+    var stop_cut = false;
     if (stop_seq_mod.earliest(final_text, stop_sequences)) |hit| {
         final_text = final_text[0..hit.index];
         finish_reason = "stop";
+        stop_cut = true;
     }
 
     // Merge re-opened mid-text thought channels into the leading block so the
@@ -637,7 +640,7 @@ pub fn handleNonStreamingGeneration(
     // Check for tool calls in the output
     if (has_tools and shouldParseToolCalls(result.finish_details)) {
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
-        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
+        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools, .{ .stop_cut = stop_cut });
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -903,6 +906,26 @@ pub const StreamingTokenStream = struct {
             self.completion_tokens = g.completion_tokens;
             self.finish_reason = g.finish_reason;
         }
+    }
+
+    /// The finalized stream as the result a non-stream generation returns: the one place the stats are copied.
+    pub fn result(self: *const StreamingTokenStream, text: []u8, token_ids: []u32, finish_reason: []const u8, constraint_payload_byte: ?usize) generate_mod.GenerationResult {
+        return .{
+            .text = text,
+            .token_ids = token_ids,
+            .prompt_tokens = self.prompt_tokens,
+            .completion_tokens = self.completion_tokens,
+            .finish_reason = finish_reason,
+            .prefill_tps = generate_mod.prefillTokensPerSec(self.prompt_tokens, self.cached_tokens, self.prefill_ns),
+            .decode_tps = generate_mod.tokensPerSec(self.completion_tokens, self.decode_ns),
+            .prefill_ns = self.prefill_ns,
+            .decode_ns = self.decode_ns,
+            .cached_tokens = self.cached_tokens,
+            .finish_details = self.finish_details,
+            .constraint_payload_byte = constraint_payload_byte,
+            .restore_ns = if (self.slot) |sl| sl.restore_ns else null,
+            .spec_mode = if (self.slot) |sl| sl.spec_mode else .none,
+        };
     }
 
     const NextOrIdle = union(enum) { token: u32, done, idle };
@@ -1291,8 +1314,9 @@ pub fn handleStreamingGeneration(
     defer if (delivery) |*d| d.deinit(allocator);
     var think_closed = false; // a complete think block was already split+emitted this stream
     // The content arm delivers the non-stream content bytes (think_tags.ContentStream).
-    var content: think_tags.ContentStream = .{};
+    var content: think_tags.ContentStream = .{ .mark = .{ .on = !gated_stream } };
     defer content.deinit(allocator);
+    var thought_mark: think_tags.MarkupCut = .{ .on = !gated_stream };
     var join: think_tags.ThoughtJoin = .{};
     var think_buf = std.ArrayList(u8).empty; // buffer to detect close tag across token boundaries
     var thought_shipped = false; // this thought has streamed a delta (`think_tags.openThoughtFlush`)
@@ -1486,7 +1510,8 @@ pub fn handleStreamingGeneration(
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
                             switch (try content.deliver(allocator, tt)) {
-                                .marker, .hold => {},
+                                .marker => {},
+                                .hold => if (content.mark.cut) lps.dropPending(),
                                 // Suppressed lead: nothing pending describes text the
                                 // client received, so retire it rather than letting it
                                 // ride the next chunk (logprobs.content ↔ content).
@@ -1573,7 +1598,8 @@ pub fn handleStreamingGeneration(
             };
 
             if (close_match) |m| {
-                const last = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                const closed = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                const last = closed[0..thought_mark.final(closed)];
                 thought_shipped = false;
                 if (!budget_exhausted) try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, last);
                 join.close();
@@ -1604,11 +1630,12 @@ pub fn handleStreamingGeneration(
                 // Flush what the closed thought will certainly deliver: a partial
                 // close tag, a trailing "\n " run and a split code point wait.
                 const flush = think_tags.openThoughtFlush(think_buf.items, thought_shipped);
-                const safe_len = flush.skip + flush.ship;
-                if (safe_len > 0) {
+                const ship = thought_mark.sendable(think_buf.items[flush.skip..][0..flush.ship]);
+                const safe_len = flush.skip + ship;
+                if (safe_len > 0 or thought_mark.cut) {
                     if (!budget_exhausted) try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, think_buf.items[flush.skip..safe_len]);
-                    if (flush.ship > 0) thought_shipped = true;
-                    const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
+                    if (ship > 0) thought_shipped = true;
+                    const remaining = try allocator.dupe(u8, if (thought_mark.cut) "" else think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
@@ -1632,7 +1659,8 @@ pub fn handleStreamingGeneration(
             const step = try content.deliver(allocator, token_text);
             channel_armed = step == .marker and !content.started and std.mem.eql(u8, token_text, "<|channel>");
             switch (step) {
-                .marker, .hold => {},
+                .marker => {},
+                .hold => if (content.mark.cut) lps.dropPending(),
                 .drop => lps.dropPending(),
                 .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take() }),
             }
@@ -1663,7 +1691,7 @@ pub fn handleStreamingGeneration(
     // Whitespace the content arm withheld ships unless the non-stream reply trims it: after a closed
     // thought, or before tool markup (a tools request decides below).
     if (!client_gone and !gated_stream) {
-        const held = content.finish(join.closed);
+        const held = try content.finish(allocator, join.closed);
         if (held.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = held }, null, null, null, .{ .logprobs_json = try lps.take() });
     }
 
@@ -1677,10 +1705,12 @@ pub fn handleStreamingGeneration(
         // shipped its whole answer as reasoning with EMPTY content, while
         // non-streaming returned it correctly (live 2026-08-04).
         if (think_tags.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
-            const tail = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+            const rest = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+            const tail = rest[0..thought_mark.final(rest)];
             if (!budget_exhausted) try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, tail);
         } else {
-            const vis_tail = think_tags.streamContentLead(think_buf.items, content.started);
+            const lead = think_tags.streamContentLead(think_buf.items, content.started);
+            const vis_tail = lead[0..content.mark.final(lead)];
             if (vis_tail.len > 0) {
                 content.started = true;
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_tail }, null, null, null, .{ .logprobs_json = try lps.take() });
@@ -1712,7 +1742,7 @@ pub fn handleStreamingGeneration(
         const norm_owned = try think_tags.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
+        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools, .{ .stop_cut = stopped }) else null;
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -1767,7 +1797,7 @@ pub fn handleStreamingGeneration(
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
                 const think_split = think_tags.splitThinkBlock(flush_text, true, opens_think and !think_closed);
-                const held = content.finish(join.closed and think_split.content.len == 0);
+                const held = try content.finish(allocator, join.closed and think_split.content.len == 0);
                 if (held.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = held }, null, null, null, .{ .logprobs_json = try lps.take() });
                 // `budget_exhausted` means the cap was already streamed in full.
                 if (think_tags.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
@@ -2756,4 +2786,29 @@ test "reasoning usage tokenization ignores SSE boundaries" {
     const empty = try formatReasoningDetails(a, &tok, "");
     defer a.free(empty);
     try std.testing.expectEqualStrings(",\"completion_tokens_details\":{\"reasoning_tokens\":0}", empty);
+}
+
+test "a streamed result carries the prefix reuse and the timings its stream finalized" {
+    var text = [_]u8{'x'};
+    var ids = [_]u32{7};
+    const ts = StreamingTokenStream{
+        .mode = .regular,
+        .eos_token_ids = &.{},
+        .prompt_tokens = 683,
+        .cached_tokens = 457,
+        .completion_tokens = 20,
+        .prefill_ns = 500_000_000,
+        .decode_ns = 1_000_000_000,
+        .finish_details = "repetition_loop",
+    };
+    const r = ts.result(&text, &ids, "stop", 3);
+    try std.testing.expectEqual(@as(u32, 683), r.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 457), r.cached_tokens);
+    try std.testing.expectEqual(@as(u32, 20), r.completion_tokens);
+    try std.testing.expectEqual(@as(u64, 500_000_000), r.prefill_ns);
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), r.decode_ns);
+    try std.testing.expectEqual(generate_mod.prefillTokensPerSec(683, 457, 500_000_000), r.prefill_tps);
+    try std.testing.expectEqual(@as(f64, 20), r.decode_tps);
+    try std.testing.expectEqualStrings("repetition_loop", r.finish_details.?);
+    try std.testing.expectEqual(@as(?usize, 3), r.constraint_payload_byte);
 }

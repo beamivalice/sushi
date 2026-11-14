@@ -65,6 +65,7 @@ const nowSecs = io_util.nowSecs;
 const Stopwatch = io_util.Stopwatch;
 const testing = std.testing;
 const server_mod = @import("server.zig");
+const reply_mod = @import("reply.zig");
 const server_state = @import("server_state.zig");
 const anthropic = @import("anthropic.zig");
 const SSE_ALLOW_HEADERS_DEFAULT = http.SSE_ALLOW_HEADERS_DEFAULT;
@@ -86,7 +87,7 @@ const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
 const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
 const parseKvQuantOverride = request_parse.parseKvQuantOverride;
 const parseRequestSeed = request_parse.parseRequestSeed;
-const parseToolCallsForRequest = server_mod.parseToolCallsForRequest;
+const parseToolCallsForRequest = reply_mod.parseToolCallsForRequest;
 const promptOpensThink = server_mod.promptOpensThink;
 const renderConfigFor = server_mod.renderConfigFor;
 const renderQwenForResponsesTest = server_mod.renderQwenForResponsesTest;
@@ -97,7 +98,7 @@ const rowMaskedDrafter = server_mod.rowMaskedDrafter;
 const sendAnthropicEvent = anthropic.sendAnthropicEvent;
 const sendErrorResponse = http.sendErrorResponse;
 const sendResponse = http.sendResponse;
-const shouldParseToolCalls = server_mod.shouldParseToolCalls;
+const shouldParseToolCalls = reply_mod.shouldParseToolCalls;
 
 /// In-memory store for OpenAI Responses API state (`store: true` requests).
 /// Bounded LRU; lost on restart.
@@ -277,6 +278,17 @@ fn shouldInjectResponsesJsonInstruction(wants_json: bool, tools_active: bool, to
     // Required/forced tool calls must keep the prompt focused on tool syntax.
     // Structured-output instructions apply after the tool result is supplied.
     return tool_choice_instruction == null;
+}
+
+/// The text of the message item, or null when the reply has none: beside a call it is the text before the call,
+/// and a call that survives the two drops of the output loop (an undeclared name, non-object arguments) is one.
+fn responsesMessageText(allocator: std.mem.Allocator, tools_val: ?std.json.Value, calls: ?[]const tool_schema.ParsedToolCall, content: []const u8) ?[]const u8 {
+    for (calls orelse return content) |tc| {
+        if (!responsesToolExists(tools_val, tc.name) or !isJsonObjectString(allocator, tc.arguments)) continue;
+        const preamble = think_tags.visibleToolPreamble(content);
+        return if (preamble.len > 0) preamble else null;
+    }
+    return content;
 }
 
 fn isJsonObjectString(allocator: std.mem.Allocator, text: []const u8) bool {
@@ -1005,8 +1017,9 @@ fn handleResponsesInner(
         var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
         defer if (delivery) |*d| d.deinit(allocator);
         var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
-        var content: think_tags.ContentStream = .{};
+        var content: think_tags.ContentStream = .{ .mark = .{ .on = !active_has_tools } };
         defer content.deinit(allocator);
+        var thought_mark: think_tags.MarkupCut = .{ .on = !active_has_tools };
         var join: think_tags.ThoughtJoin = .{};
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
@@ -1127,7 +1140,8 @@ fn handleResponsesInner(
                 };
 
                 if (close_match) |m| {
-                    const before = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                    const closed = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                    const before = closed[0..thought_mark.final(closed)];
                     thought_shipped = false;
                     try emitResponsesReasoning(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, reasoningItemIndex(live_output_index, streamed_message_started, streamed_message_index), &join, before);
                     join.close();
@@ -1151,13 +1165,14 @@ fn handleResponsesInner(
                     // Flush what the closed thought will certainly deliver: a partial
                     // close tag, a trailing "\n " run and a split code point wait.
                     const flush = think_tags.openThoughtFlush(think_buf.items, thought_shipped);
-                    const safe_len = flush.skip + flush.ship;
-                    if (safe_len > 0) {
-                        if (flush.ship > 0) {
+                    const ship = thought_mark.sendable(think_buf.items[flush.skip..][0..flush.ship]);
+                    const safe_len = flush.skip + ship;
+                    if (safe_len > 0 or thought_mark.cut) {
+                        if (ship > 0) {
                             try emitResponsesReasoning(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, reasoningItemIndex(live_output_index, streamed_message_started, streamed_message_index), &join, think_buf.items[flush.skip..safe_len]);
                             thought_shipped = true;
                         }
-                        const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
+                        const remaining = try allocator.dupe(u8, if (thought_mark.cut) "" else think_buf.items[safe_len..]);
                         think_buf.clearRetainingCapacity();
                         try think_buf.appendSlice(allocator, remaining);
                         allocator.free(remaining);
@@ -1193,12 +1208,13 @@ fn handleResponsesInner(
 
         // Whitespace the content arm withheld ships unless a thought followed it.
         if (!client_gone and !active_has_tools) {
-            const held = content.finish(join.closed);
+            const held = try content.finish(allocator, join.closed);
             if (held.len > 0) try emitResponsesMessage(allocator, stream, seq_num, &streamed_message_id, &streamed_message_index, &streamed_message_started, live_output_index, held);
         }
 
         // Flush any remaining think buffer (no close tag found) as reasoning.
-        const think_tail = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+        const think_rest = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+        const think_tail = think_rest[0..thought_mark.final(think_rest)];
         if (!client_gone and in_think_block and !active_has_tools) {
             try emitResponsesReasoning(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, reasoningItemIndex(live_output_index, streamed_message_started, streamed_message_index), &join, think_tail);
         }
@@ -1213,17 +1229,12 @@ fn handleResponsesInner(
             return;
         }
 
-        result = .{
-            .constraint_payload_byte = if (delivery) |d| d.payload_byte else null,
-            .text = try raw_buf.toOwnedSlice(allocator),
-            .token_ids = try token_ids_buf.toOwnedSlice(allocator),
-            .prompt_tokens = ts.prompt_tokens,
-            .completion_tokens = ts.completion_tokens,
-            .finish_reason = if (stopped) "stop" else ts.finish_reason,
-            .prefill_tps = 0.0,
-            .decode_tps = 0.0,
-            .finish_details = ts.finish_details,
-        };
+        result = ts.result(
+            try raw_buf.toOwnedSlice(allocator),
+            try token_ids_buf.toOwnedSlice(allocator),
+            if (stopped) "stop" else ts.finish_reason,
+            if (delivery) |d| d.payload_byte else null,
+        );
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > drafter) so /v1/responses gets the same speedup as /v1/chat/completions.
@@ -1244,9 +1255,11 @@ fn handleResponsesInner(
     // ── apply stop sequences ──
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
+    var stop_cut = false;
     if (stop_seq_mod.earliest(final_text, stop_sequences.items)) |hit| {
         final_text = final_text[0..hit.index];
         finish_reason = "stop";
+        stop_cut = true;
     }
 
     if (!responsesStoresFinish(finish_reason, true)) {
@@ -1273,13 +1286,14 @@ fn handleResponsesInner(
     // never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
-    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, promptOpensThink(allocator, tok, prompt_ids));
+    const opens_think = promptOpensThink(allocator, tok, prompt_ids);
+    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, opens_think);
     const reasoning_text: ?[]const u8 = think_split.reasoning_content;
     const visible_text: []const u8 = think_split.content;
 
     var tool_calls: ?[]tool_schema.ParsedToolCall = null;
     if (active_has_tools and shouldParseToolCalls(result.finish_details)) {
-        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo);
+        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo, .{ .stop_cut = stop_cut });
     }
     defer if (tool_calls) |tcs| {
         for (tcs) |tc| {
@@ -1301,13 +1315,17 @@ fn handleResponsesInner(
         emitted_tool_calls.deinit(allocator);
     }
 
+    // The message item carries the text before the markup beside any call, as chat does.
+    const message_item = responsesMessageText(allocator, root.get("tools"), tool_calls, visible_text);
+    const message_text = message_item orelse "";
+
     const reasoning_first = responsesReasoningFirst(
         if (is_stream and streamed_reasoning_started) streamed_reasoning_index else null,
         if (is_stream and streamed_message_started) streamed_message_index else null,
     );
     if (!reasoning_first) {
-        try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, visible_text);
-        try emitResponsesMessageEnd(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, visible_text);
+        try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, message_text);
+        try emitResponsesMessageEnd(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, message_text);
         emitted += 1;
         output_index += 1;
     }
@@ -1330,6 +1348,24 @@ fn handleResponsesInner(
         emitted += 1;
         output_index += 1;
     };
+
+    if (reasoning_first and message_item != null) {
+        if (emitted > 0) try out_buf.append(allocator, ',');
+        if (is_stream and streamed_message_started) {
+            // Live deltas already streamed; emit just the closing events.
+            try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, message_text);
+            try emitResponsesMessageEnd(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, message_text);
+        } else {
+            const mid = try responses_mod.makeId(stream.io, allocator, "msg");
+            defer allocator.free(mid);
+            try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, message_text);
+            if (is_stream) {
+                try emitResponsesMessageEvents(allocator, stream, seq_num, output_index, mid, message_text);
+            }
+        }
+        emitted += 1;
+        output_index += 1;
+    }
 
     if (tool_calls) |tcs| if (tcs.len > 0) {
         for (tcs) |tc| {
@@ -1359,25 +1395,6 @@ fn handleResponsesInner(
             output_index += 1;
         }
     };
-
-    const has_tool_calls = emitted_tool_calls.items.len > 0;
-    if (!has_tool_calls and reasoning_first) {
-        if (emitted > 0) try out_buf.append(allocator, ',');
-        if (is_stream and streamed_message_started) {
-            // Live deltas already streamed; emit just the closing events.
-            try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, visible_text);
-            try emitResponsesMessageEnd(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, visible_text);
-        } else {
-            const mid = try responses_mod.makeId(stream.io, allocator, "msg");
-            defer allocator.free(mid);
-            try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, visible_text);
-            if (is_stream) {
-                try emitResponsesMessageEvents(allocator, stream, seq_num, output_index, mid, visible_text);
-            }
-        }
-        emitted += 1;
-        output_index += 1;
-    }
 
     try out_buf.append(allocator, ']');
 
@@ -1420,7 +1437,7 @@ fn handleResponsesInner(
     // ── store response ──
     if (responsesStoresFinish(finish_reason, should_store)) {
         const stored_tool_calls: ?[]const chat_mod.ToolCall = if (emitted_tool_calls.items.len > 0) emitted_tool_calls.items else null;
-        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope_noted, pi.messages.items, visible_text, reasoning_text, stored_tool_calls, result.finish_details) catch |err| {
+        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope_noted, pi.messages.items, message_text, reasoning_text, stored_tool_calls, result.finish_details) catch |err| {
             log.warn("[responses] store failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -2330,4 +2347,62 @@ test "Responses output order: a reasoning item streamed past the message stays a
     try std.testing.expect(responsesReasoningFirst(0, null));
     try std.testing.expect(responsesReasoningFirst(null, 0));
     try std.testing.expect(!responsesReasoningFirst(reasoningItemIndex(0, true, 0), 0));
+}
+
+test "a Responses reply with a call carries the text before it as a message item" {
+    const a = testing.allocator;
+    const tools = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"function","name":"lookup","parameters":{"type":"object"}}]
+    , .{});
+    defer tools.deinit();
+    const declared = [_]tool_schema.ParsedToolCall{.{ .name = "lookup", .arguments = "{\"id\":1}" }};
+    const undeclared = [_]tool_schema.ParsedToolCall{.{ .name = "other", .arguments = "{}" }};
+    const not_object = [_]tool_schema.ParsedToolCall{.{ .name = "lookup", .arguments = "[1]" }};
+    try testing.expectEqualStrings("I will look it up.", responsesMessageText(a, tools.value, &declared, "I will look it up.").?);
+    try testing.expect(responsesMessageText(a, tools.value, &declared, " \n") == null);
+    try testing.expect(responsesMessageText(a, tools.value, &declared, "") == null);
+    // Without a surviving call the item is the reply, empty or not.
+    try testing.expectEqualStrings("", responsesMessageText(a, tools.value, null, "").?);
+    try testing.expectEqualStrings("Done.", responsesMessageText(a, tools.value, null, "Done.").?);
+    try testing.expectEqualStrings("Done.", responsesMessageText(a, tools.value, &undeclared, "Done.").?);
+    try testing.expectEqualStrings("Done.", responsesMessageText(a, tools.value, &not_object, "Done.").?);
+}
+
+test "a Responses output replayed as input renders the prompt its stored chain does, a call's preamble included" {
+    deinitGlobalResponseStore();
+    defer deinitGlobalResponseStore();
+    const a = testing.allocator;
+    const tools = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"function","name":"lookup","parameters":{"type":"object"}}]
+    , .{});
+    defer tools.deinit();
+    const parsed = [_]tool_schema.ParsedToolCall{.{ .name = "lookup", .arguments = "{\"id\":1}" }};
+    const text = responsesMessageText(a, tools.value, &parsed, "I will look it up.").?;
+    const calls = [_]chat_mod.ToolCall{.{ .id = "c1", .name = "lookup", .arguments = "{\"id\":1}" }};
+    const first = [_]chat_mod.Message{.{ .role = "user", .content = "compare" }};
+    try storeResponse(testing.io, a, "r1", "model", "completed", "{}", &first, text, "inspect it", &calls, null);
+    const stored = global_response_store.?.map.get("r1").?;
+    const out = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"function_call_output","call_id":"c1","output":"done"}]
+    , .{});
+    defer out.deinit();
+    var chained = try responses_mod.parseInput(a, out.value, null, stored.history, null, .{});
+    defer chained.deinit();
+    const replay_json = try std.fmt.allocPrint(a,
+        \\[{{"role":"user","content":"compare"}},
+        \\ {{"type":"reasoning","summary":[{{"type":"summary_text","text":"inspect it"}}]}},
+        \\ {{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{s}"}}]}},
+        \\ {{"type":"function_call","call_id":"c1","name":"lookup","arguments":"{{\"id\":1}}"}},
+        \\ {{"type":"function_call_output","call_id":"c1","output":"done"}}]
+    , .{text});
+    defer a.free(replay_json);
+    const replay = try std.json.parseFromSlice(std.json.Value, a, replay_json, .{});
+    defer replay.deinit();
+    var replayed = try responses_mod.parseInput(a, replay.value, null, null, null, .{});
+    defer replayed.deinit();
+    const by_chain = try renderQwenForResponsesTest(a, chained.messages.items);
+    defer a.free(by_chain);
+    const by_replay = try renderQwenForResponsesTest(a, replayed.messages.items);
+    defer a.free(by_replay);
+    try testing.expectEqualStrings(by_replay, by_chain);
 }

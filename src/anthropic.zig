@@ -31,7 +31,6 @@ const handleResponses = responses_api.handleResponses;
 const generation_stream = @import("generation_stream.zig");
 const GenErrorWire = generation_stream.GenErrorWire;
 const sendGenerationError = generation_stream.sendGenerationError;
-const visibleToolPreamble = generation_stream.visibleToolPreamble;
 const nonStreamingViaScheduler = generation_stream.nonStreamingViaScheduler;
 const StreamingTokenStream = generation_stream.StreamingTokenStream;
 const requestSpecModes = generation_stream.requestSpecModes;
@@ -78,6 +77,7 @@ const nextCompletionId = io_util.nextCompletionId;
 const byteTokenizerForTests = tokenizer_mod.byteTokenizerForTests;
 const deinitTestTokenizer = tokenizer_mod.deinitTestTokenizer;
 const server_mod = @import("server.zig");
+const reply_mod = @import("reply.zig");
 const server_state = @import("server_state.zig");
 const MAX_TOKENS_DESC_LEN = request_parse.MAX_TOKENS_DESC_LEN;
 const MropeData = server_mod.MropeData;
@@ -108,7 +108,7 @@ const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
 const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
 const parseKvQuantOverride = request_parse.parseKvQuantOverride;
 const parseRequestSeed = request_parse.parseRequestSeed;
-const parseToolCallsForRequest = server_mod.parseToolCallsForRequest;
+const parseToolCallsForRequest = reply_mod.parseToolCallsForRequest;
 const promptOpensThink = server_mod.promptOpensThink;
 const readAllFromPair = server_mod.readAllFromPair;
 const readContentParts = server_mod.readContentParts;
@@ -122,11 +122,11 @@ const rowMaskedDrafter = server_mod.rowMaskedDrafter;
 const sendErrorResponse = http.sendErrorResponse;
 const sendResponse = http.sendResponse;
 const serializeJsonValue = request_parse.serializeJsonValue;
-const shouldParseToolCalls = server_mod.shouldParseToolCalls;
+const shouldParseToolCalls = reply_mod.shouldParseToolCalls;
 const testWire = server_mod.testWire;
 const test_png_blue = server_mod.test_png_blue;
 const test_png_red = server_mod.test_png_red;
-const toolCallFinishReason = server_mod.toolCallFinishReason;
+const toolCallFinishReason = reply_mod.toolCallFinishReason;
 
 /// The `/v1/messages` terminal `error` event payload.
 pub fn buildAnthropicStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
@@ -1092,17 +1092,16 @@ fn handleAnthropicNonStreaming(
 
     // Thinking block.
     //
-    // The split/strip here KEEP unparsed tool markup: unlike every other
-    // surface, this path reassigns `final_text` from the result and hands it
-    // to parseToolCallsForRequest below. Cutting the markup first would make a
-    // real call unparseable. The visible text block is cut at emission instead
-    // (`think_tags.trimLeakedToolMarkup`), which is where the leak matters.
+    // The split here KEEPS unparsed tool markup in the content; the visible text block is cut at emission
+    // (`think_tags.trimLeakedToolMarkup`). The calls are read from the whole generation, as every surface does.
     // Reasoning the model generated is always delivered as a thinking block —
     // the request's thinking flag shaped the prompt, never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
+    const opens_think = promptOpensThink(allocator, tok, prompt_ids);
+    const generated = final_text;
     {
-        const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, promptOpensThink(allocator, tok, prompt_ids));
+        const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, opens_think);
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
             const t = think_tags.trimLeakedToolMarkup(r);
@@ -1136,50 +1135,16 @@ fn handleAnthropicNonStreaming(
 
     // Check for tool calls
     if (has_tools and shouldParseToolCalls(result.finish_details)) {
-        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
-        if (found_calls) |tool_calls| {
-            defer {
-                for (tool_calls) |tc| {
-                    allocator.free(tc.name);
-                    allocator.free(tc.arguments);
-                }
-                allocator.free(tool_calls);
-            }
+        const found_calls = try reply_mod.toolReply(allocator, generated, tools_json, allow_parallel_tools, .{ .opens_think = opens_think, .stop_cut = matched_stop_seq != null });
+        if (found_calls) |tool_reply| {
+            defer tool_reply.deinit(allocator);
 
             var tu_perf_buf: [160]u8 = undefined;
             const tu_perf = formatPerfBracket(&tu_perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
             log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_use: {d}]\n", .{
-                result.prompt_tokens, result.completion_tokens, elapsed_ms, tu_perf, tool_calls.len,
+                result.prompt_tokens, result.completion_tokens, elapsed_ms, tu_perf, tool_reply.calls.len,
             });
-
-            // The same pre-markup text the stream flushes as a text delta.
-            const tu_preamble = visibleToolPreamble(think_tags.trimLeakedToolMarkup(final_text));
-            if (tu_preamble.len > 0) {
-                if (block_count > 0) try content.append(allocator, ',');
-                const esc_pre = try jsonEscape(allocator, tu_preamble);
-                defer allocator.free(esc_pre);
-                const pre_block = try std.fmt.allocPrint(allocator,
-                    \\{{"type":"text","text":{s}}}
-                , .{esc_pre});
-                defer allocator.free(pre_block);
-                try content.appendSlice(allocator, pre_block);
-                block_count += 1;
-            }
-
-            // Emit tool_use content blocks
-            for (tool_calls, 0..) |tc, i| {
-                if (block_count > 0) try content.append(allocator, ',');
-                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ nowMs(stream.io), i });
-                defer allocator.free(tc_id);
-                const esc_name = try jsonEscape(allocator, tc.name);
-                defer allocator.free(esc_name);
-                const tc_block = try std.fmt.allocPrint(allocator,
-                    \\{{"type":"tool_use","id":"{s}","name":{s},"input":{s}}}
-                , .{ tc_id, esc_name, tc.arguments });
-                defer allocator.free(tc_block);
-                try content.appendSlice(allocator, tc_block);
-                block_count += 1;
-            }
+            try appendToolReplyBlocks(allocator, &content, &block_count, tool_reply, nowMs(stream.io));
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
             // No tool calls — emit text block. Nothing parsed, so any tool
@@ -1230,6 +1195,24 @@ fn handleAnthropicNonStreaming(
     });
     defer allocator.free(response);
     try sendResponse(stream, "200 OK", "application/json", response);
+}
+
+/// The text block of what the model said before its calls, then one `tool_use` block per call.
+fn appendToolReplyBlocks(allocator: std.mem.Allocator, content: *std.ArrayList(u8), block_count: *u32, tool_reply: reply_mod.ToolReply, now_ms: i64) !void {
+    if (tool_reply.preamble.len > 0) {
+        if (block_count.* > 0) try content.append(allocator, ',');
+        const esc_pre = try jsonEscape(allocator, tool_reply.preamble);
+        defer allocator.free(esc_pre);
+        try content.print(allocator, "{{\"type\":\"text\",\"text\":{s}}}", .{esc_pre});
+        block_count.* += 1;
+    }
+    for (tool_reply.calls, 0..) |tc, i| {
+        if (block_count.* > 0) try content.append(allocator, ',');
+        const esc_name = try jsonEscape(allocator, tc.name);
+        defer allocator.free(esc_name);
+        try content.print(allocator, "{{\"type\":\"tool_use\",\"id\":\"toolu_{d}_{d}\",\"name\":{s},\"input\":{s}}}", .{ now_ms, i, esc_name, tc.arguments });
+        block_count.* += 1;
+    }
 }
 
 /// Anthropic counts cache reads apart from `input_tokens`: a client adds the two to size its context.
@@ -1375,8 +1358,9 @@ fn handleAnthropicStreaming(
     // branch). Releases the buffer hold AND tells the end-of-stream split
     // that the remaining text has no template-opened semantics.
     var think_closed = false;
-    var content: think_tags.ContentStream = .{};
+    var content: think_tags.ContentStream = .{ .mark = .{ .on = !gated_stream } };
     defer content.deinit(allocator);
+    var thought_mark: think_tags.MarkupCut = .{ .on = !gated_stream };
     var join: think_tags.ThoughtJoin = .{};
     var think_buf = std.ArrayList(u8).empty;
     defer think_buf.deinit(allocator);
@@ -1608,7 +1592,8 @@ fn handleAnthropicStreaming(
             };
 
             if (close_match) |m| {
-                const last = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                const closed = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                const last = closed[0..thought_mark.final(closed)];
                 thought_shipped = false;
                 if (!budget_exhausted) try emitAnthropicThinking(allocator, stream, &block_index, &text_block_open, &thinking_block_open, &join, last);
                 join.close();
@@ -1633,11 +1618,12 @@ fn handleAnthropicStreaming(
                 // Flush what the closed thought will certainly deliver: a partial
                 // close tag, a trailing "\n " run and a split code point wait.
                 const flush = think_tags.openThoughtFlush(think_buf.items, thought_shipped);
-                const safe_len = flush.skip + flush.ship;
-                if (safe_len > 0) {
+                const ship = thought_mark.sendable(think_buf.items[flush.skip..][0..flush.ship]);
+                const safe_len = flush.skip + ship;
+                if (safe_len > 0 or thought_mark.cut) {
                     if (!budget_exhausted) try emitAnthropicThinking(allocator, stream, &block_index, &text_block_open, &thinking_block_open, &join, think_buf.items[flush.skip..safe_len]);
-                    if (flush.ship > 0) thought_shipped = true;
-                    const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
+                    if (ship > 0) thought_shipped = true;
+                    const remaining = try allocator.dupe(u8, if (thought_mark.cut) "" else think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
@@ -1686,12 +1672,13 @@ fn handleAnthropicStreaming(
     // Whitespace the content arm withheld ships unless the non-stream reply trims it: after a closed
     // thought, or before tool markup (a tools request decides below).
     if (!client_gone and !gated_stream) {
-        const held = content.finish(join.closed);
+        const held = try content.finish(allocator, join.closed);
         if (held.len > 0) try emitAnthropicText(allocator, stream, block_index, &text_block_open, held);
     }
 
     // Flush remaining think buffer
-    const think_tail = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+    const think_rest = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+    const think_tail = think_rest[0..thought_mark.final(think_rest)];
     if (!client_gone and !budget_exhausted) {
         try emitAnthropicThinking(allocator, stream, &block_index, &text_block_open, &thinking_block_open, &join, think_tail);
     }
@@ -1715,7 +1702,7 @@ fn handleAnthropicStreaming(
         const norm_owned = try think_tags.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
+        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools, .{ .stop_cut = stopped }) else null;
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -1783,7 +1770,7 @@ fn handleAnthropicStreaming(
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
                 const think_split = think_tags.splitThinkBlock(flush_text, true, opens_think and !think_closed);
-                const held = content.finish(join.closed and think_split.content.len == 0);
+                const held = try content.finish(allocator, join.closed and think_split.content.len == 0);
                 if (held.len > 0) try emitAnthropicText(allocator, stream, block_index, &text_block_open, held);
                 if (!budget_exhausted) if (think_split.reasoning_content) |reasoning| {
                     const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
@@ -2438,4 +2425,23 @@ test "count_tokens: both routes render a body to the same prompt, schema, tools,
         try t.expectEqual(served.enable_thinking, counted.enable_thinking);
         try t.expectEqual(served.has_tools, counted.has_tools);
     }
+}
+
+test "a /v1/messages reply with a call inside a thought the prompt opened and never closed ships the call" {
+    const a = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
+    ;
+    const generated = "I'll check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
+    const tool_reply = (try reply_mod.toolReply(a, generated, tools, true, .{ .opens_think = true })).?;
+    defer tool_reply.deinit(a);
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(a);
+    var block_count: u32 = 0;
+    try appendToolReplyBlocks(a, &content, &block_count, tool_reply, 7);
+    try std.testing.expectEqualStrings("{\"type\":\"tool_use\",\"id\":\"toolu_7_0\",\"name\":\"get_weather\",\"input\":{\"city\":\"Tokyo\"}}", content.items);
+    // The thought carries the words and none of the markup.
+    const split = think_tags.splitThinkBlock(generated, true, true);
+    try std.testing.expectEqualStrings("I'll check.", split.reasoning_content.?);
+    try std.testing.expectEqualStrings("", split.content);
 }
