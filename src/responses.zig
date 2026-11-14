@@ -434,7 +434,7 @@ fn appendReasoningInputItem(
     const content: ?std.json.Value = if (obj.get("content")) |value| (if (value == .null) null else value) else null;
     const parts = content orelse obj.get("summary") orelse return false;
     if (parts != .array) return false;
-    var text = std.ArrayList(u8).empty;
+    var text: chat_mod.TextJoin = .{};
     defer text.deinit(allocator);
     for (parts.array.items) |part| {
         if (part != .object) return false;
@@ -446,13 +446,15 @@ fn appendReasoningInputItem(
         else
             std.mem.eql(u8, kind.string, "summary_text");
         if (!valid) return false;
-        try text.appendSlice(allocator, value.string);
+        try text.add(allocator, value.string);
     }
-    if (text.items.len == 0) return false;
-    const owned = try text.toOwnedSlice(allocator);
-    errdefer allocator.free(owned);
-    try pi.owned_strings.append(allocator, owned);
-    try pi.messages.append(allocator, .{ .role = "assistant", .content = "", .reasoning_content = owned });
+    const joined = try text.finish(allocator);
+    if (joined.text.len == 0) return false;
+    if (joined.owned) pi.owned_strings.append(allocator, joined.text) catch |e| {
+        allocator.free(joined.text);
+        return e;
+    };
+    try pi.messages.append(allocator, .{ .role = "assistant", .content = "", .reasoning_content = joined.text });
     return true;
 }
 
@@ -507,7 +509,7 @@ const InputParts = struct {
 };
 
 fn readInputParts(allocator: std.mem.Allocator, pi: *ParsedInput, parts: []const std.json.Value, sink: ImageSink) !InputParts {
-    var text_parts = std.ArrayList(u8).empty;
+    var text_parts: chat_mod.TextJoin = .{};
     defer text_parts.deinit(allocator);
     var image_list = std.ArrayList(chat_mod.ImageData).empty;
     errdefer {
@@ -523,10 +525,7 @@ fn readInputParts(allocator: std.mem.Allocator, pi: *ParsedInput, parts: []const
         const pt = pt_val.string;
         if (std.mem.eql(u8, pt, "input_text") or std.mem.eql(u8, pt, "text") or std.mem.eql(u8, pt, "output_text")) {
             const tx = part.object.get("text") orelse continue;
-            if (tx == .string) {
-                if (text_parts.items.len > 0) try text_parts.append(allocator, '\n');
-                try text_parts.appendSlice(allocator, tx.string);
-            }
+            if (tx == .string) try text_parts.add(allocator, tx.string);
         } else if (std.mem.eql(u8, pt, "input_image")) {
             pi.n_images += 1;
             const dec = sink.decoder orelse continue;
@@ -540,18 +539,19 @@ fn readInputParts(allocator: std.mem.Allocator, pi: *ParsedInput, parts: []const
             if (reason) |r| {
                 pi.media_fault = .{ .item = sink.item, .reason = r };
             } else {
-                try placed.append(allocator, .{ .at = text_parts.items.len, .kind = .image });
+                try placed.append(allocator, .{ .at = text_parts.len(), .kind = .image });
             }
         } else if (std.mem.eql(u8, pt, "input_audio")) {
             if (pi.media_fault == null) pi.media_fault = .{ .item = sink.item, .kind = .unsupported_audio };
         }
     }
     var out: InputParts = .{};
-    if (text_parts.items.len > 0) {
-        const owned = try allocator.dupe(u8, text_parts.items);
-        try pi.owned_strings.append(allocator, owned);
-        out.text = owned;
-    }
+    const joined = try text_parts.finish(allocator);
+    if (joined.owned) pi.owned_strings.append(allocator, joined.text) catch |e| {
+        allocator.free(joined.text);
+        return e;
+    };
+    out.text = joined.text;
     if (image_list.items.len > 0) {
         const owned = try image_list.toOwnedSlice(allocator);
         try pi.owned_images.append(allocator, owned);
@@ -585,13 +585,8 @@ fn appendMessageItem(
         else => {},
     }
 
-    if (read.text.len == 0 and read.images == null) return;
-    try pi.messages.append(allocator, .{
-        .role = role,
-        .content = read.text,
-        .images = read.images,
-        .media_parts = read.media_parts,
-    });
+    const msg: chat_mod.Message = .{ .role = role, .content = read.text, .images = read.images, .media_parts = read.media_parts };
+    if (!msg.carriesNothing()) try pi.messages.append(allocator, msg);
 }
 
 fn appendFunctionCallInputItem(
@@ -1355,7 +1350,7 @@ test "parseInput: reasoning joins the assistant message that follows it" {
     const a = testing.allocator;
     const parsed = try std.json.parseFromSlice(std.json.Value, a,
         \\[{"role":"user","content":"q"},
-        \\ {"type":"reasoning","content":[{"type":"reasoning_text","text":"think "},{"type":"reasoning_text","text":"hard"}]},
+        \\ {"type":"reasoning","content":[{"type":"reasoning_text","text":"think"},{"type":"reasoning_text","text":"hard"}]},
         \\ {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},
         \\ {"role":"user","content":"next"}]
     , .{});
@@ -1364,7 +1359,8 @@ test "parseInput: reasoning joins the assistant message that follows it" {
     defer pi.deinit();
     try testing.expectEqual(@as(usize, 3), pi.messages.items.len);
     try testing.expectEqualStrings("answer", pi.messages.items[1].content);
-    try testing.expectEqualStrings("think hard", pi.messages.items[1].reasoning_content.?);
+    // Reasoning parts join as a message's text parts do (`chat.TextJoin`).
+    try testing.expectEqualStrings("think\nhard", pi.messages.items[1].reasoning_content.?);
 }
 
 test "parseInput: a function_call whose arguments are a JSON object keeps them" {

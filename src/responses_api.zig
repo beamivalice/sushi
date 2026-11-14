@@ -292,6 +292,28 @@ fn responsesMessageText(allocator: std.mem.Allocator, tools_val: ?std.json.Value
     return content;
 }
 
+/// The messages a prompt renders: `conversation` with the JSON instruction in its leading system turn (one is added when
+/// it has none). The conversation, which a `previous_response_id` chain stores, keeps no instruction. The caller frees
+/// the copy; the joined system text goes to `allocs`.
+fn withJsonInstruction(allocator: std.mem.Allocator, conversation: []const chat_mod.Message, instruction: []const u8, allocs: *std.ArrayList([]const u8)) ![]chat_mod.Message {
+    const leads = conversation.len > 0 and std.mem.eql(u8, conversation[0].role, "system");
+    const out = try allocator.alloc(chat_mod.Message, conversation.len + @intFromBool(!leads));
+    errdefer allocator.free(out);
+    if (leads) {
+        @memcpy(out, conversation);
+        const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ conversation[0].content, instruction });
+        allocs.append(allocator, combined) catch |e| {
+            allocator.free(combined);
+            return e;
+        };
+        out[0].content = combined;
+    } else {
+        out[0] = .{ .role = "system", .content = instruction };
+        @memcpy(out[1..], conversation);
+    }
+    return out;
+}
+
 fn isJsonObjectString(allocator: std.mem.Allocator, text: []const u8) bool {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return false;
     defer parsed.deinit();
@@ -437,6 +459,9 @@ fn handleResponsesInner(
         return;
     }
     const root = parsed.value.object;
+    // The input and the tools are read with numbers as spelled (`request_parse.parseSpelled`).
+    const spelled = try request_parse.parseSpelled(allocator, body);
+    defer spelled.deinit();
 
     var fault_buf: [384]u8 = undefined;
     if (request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &.{ "max_output_tokens", "max_tokens" }, .stop = null })) |reason| {
@@ -446,7 +471,7 @@ fn handleResponsesInner(
     }
 
     // ── input (required) ──
-    const input_val = root.get("input") orelse {
+    const input_val = spelled.value.object.get("input") orelse {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' is a required field", 400);
         return;
     };
@@ -613,7 +638,7 @@ fn handleResponsesInner(
     if (tool_choice == .none) has_tools = false;
 
     if (has_tools) {
-        if (root.get("tools")) |tools_val| if (tools_val == .array) {
+        if (spelled.value.object.get("tools")) |tools_val| if (tools_val == .array) {
             const reshaped = try responses_mod.buildToolsJson(allocator, tools_val.array);
             tools_json = reshaped;
             tools_json_owned = true;
@@ -689,16 +714,14 @@ fn handleResponsesInner(
         rf_allocs.deinit(allocator);
     }
     const inject_json_instruction = shouldInjectResponsesJsonInstruction(wants_json, active_has_tools, active_tool_choice_instruction);
+    var prompt_messages: []const chat_mod.Message = pi.messages.items;
+    var instructed: ?[]chat_mod.Message = null;
+    defer if (instructed) |m| allocator.free(m);
     if (inject_json_instruction) {
         const owned = try buildResponsesJsonInstruction(allocator, grammar_schema_val, active_has_tools);
         try rf_allocs.append(allocator, owned);
-        if (pi.messages.items.len > 0 and std.mem.eql(u8, pi.messages.items[0].role, "system")) {
-            const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ pi.messages.items[0].content, owned });
-            try rf_allocs.append(allocator, combined);
-            pi.messages.items[0].content = combined;
-        } else {
-            try pi.messages.insert(allocator, 0, .{ .role = "system", .content = owned });
-        }
+        instructed = try withJsonInstruction(allocator, pi.messages.items, owned, &rf_allocs);
+        prompt_messages = instructed.?;
         if (active_has_tools) {
             log.info("[grammar] injected JSON schema prompt while tools are available (mask deferred for tool calls)\n", .{});
         }
@@ -710,7 +733,7 @@ fn handleResponsesInner(
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
     const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, template_effort, false);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, prompt_messages, active_tools_json, active_tool_choice_instruction, enable_thinking, template_effort, false);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !active_has_tools and enable_thinking) {
@@ -728,7 +751,7 @@ fn handleResponsesInner(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, template_effort, false);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, prompt_messages, active_tools_json, active_tool_choice_instruction, false, template_effort, false);
             log.info("[grammar] reasoning protocol unsupported for this model/prompt; rerendered with thinking off\n", .{});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -748,7 +771,7 @@ fn handleResponsesInner(
     const cache_key = requestCacheKey(root);
     var req_media: PreparedMedia = .{};
     defer req_media.deinit(allocator);
-    switch (try prepareRequestMedia(allocator, lm, pi.messages.items, &prompt_ids_raw, getEffectiveContextLength(config))) {
+    switch (try prepareRequestMedia(allocator, lm, prompt_messages, &prompt_ids_raw, getEffectiveContextLength(config))) {
         .ready => |r| req_media = r,
         .refused => |fault| {
             allocator.free(prompt_ids_raw);
@@ -2406,4 +2429,39 @@ test "a Responses output replayed as input renders the prompt its stored chain d
     const by_replay = try renderQwenForResponsesTest(a, replayed.messages.items);
     defer a.free(by_replay);
     try testing.expectEqualStrings(by_replay, by_chain);
+}
+
+test "a text.format chain through previous_response_id carries one JSON instruction, and each turn's prompt extends the last" {
+    deinitGlobalResponseStore();
+    defer deinitGlobalResponseStore();
+    const a = testing.allocator;
+    var allocs = std.ArrayList([]const u8).empty;
+    defer {
+        for (allocs.items) |s| a.free(s);
+        allocs.deinit(a);
+    }
+    const instruction = try buildResponsesJsonInstruction(a, null, false);
+    try allocs.append(a, instruction);
+    for ([_]?[]const u8{ "Be terse.", null }) |instructions| {
+        deinitGlobalResponseStore();
+        const in1 = try std.json.parseFromSlice(std.json.Value, a, "[{\"role\":\"user\",\"content\":\"give me json\"}]", .{});
+        defer in1.deinit();
+        var t1 = try responses_mod.parseInput(a, in1.value, instructions, null, null, .{});
+        defer t1.deinit();
+        const m1 = try withJsonInstruction(a, t1.messages.items, instruction, &allocs);
+        defer a.free(m1);
+        const p1 = try renderQwenForResponsesTest(a, m1);
+        defer a.free(p1);
+        try storeResponse(testing.io, a, "r1", "model", "completed", "{}", t1.messages.items, "{\"a\":1}", null, null, null);
+        const in2 = try std.json.parseFromSlice(std.json.Value, a, "[{\"role\":\"user\",\"content\":\"again\"}]", .{});
+        defer in2.deinit();
+        var t2 = try responses_mod.parseInput(a, in2.value, null, global_response_store.?.map.get("r1").?.history, null, .{});
+        defer t2.deinit();
+        const m2 = try withJsonInstruction(a, t2.messages.items, instruction, &allocs);
+        defer a.free(m2);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, m2[0].content, instruction));
+        const p2 = try renderQwenForResponsesTest(a, m2);
+        defer a.free(p2);
+        try testing.expect(std.mem.startsWith(u8, p2, p1[0..std.mem.lastIndexOf(u8, p1, "<|im_start|>assistant").?]));
+    }
 }

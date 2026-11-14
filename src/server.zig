@@ -125,7 +125,6 @@ const parseCancelRequestId = request_parse.parseCancelRequestId;
 const joinedTextParts = request_parse.joinedTextParts;
 pub const requestCacheKey = request_parse.requestCacheKey;
 const nChoicesRejectReason = request_parse.nChoicesRejectReason;
-const extractJsonField = request_parse.extractJsonField;
 const chatTemplateKwargBool = request_parse.chatTemplateKwargBool;
 const parseKvQuantOverride = request_parse.parseKvQuantOverride;
 const unescapeJsonSlashes = request_parse.unescapeJsonSlashes;
@@ -2294,8 +2293,10 @@ pub fn handleChatCompletions(
         return;
     }
 
-    // Extract messages
-    const messages_val = root.get("messages") orelse {
+    // The messages and the tools are read with numbers as spelled (`request_parse.parseSpelled`).
+    const spelled = try request_parse.parseSpelled(allocator, body);
+    defer spelled.deinit();
+    const messages_val = spelled.value.object.get("messages") orelse {
         log.warn("POST /v1/chat/completions -> 400 (missing messages)\n", .{});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'messages' is a required field", 400);
         return;
@@ -2372,11 +2373,9 @@ pub fn handleChatCompletions(
     else
         true;
 
+    defer if (tools_json) |t| allocator.free(t);
     if (has_tools) {
-        // Find the tools array in the raw JSON body and extract it
-        if (extractJsonField(body, "tools")) |tools_str| {
-            tools_json = tools_str;
-        }
+        tools_json = try request_parse.chatToolsJson(allocator, spelled.value.object);
         if (tool_calls_mod.toolChoiceNamesUndeclared(allocator, tool_choice, tools_json)) {
             log.warn("POST /v1/chat/completions -> 400 (tool_choice names an undeclared function)\n", .{});
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", TOOL_CHOICE_UNDECLARED, 400);
@@ -3193,7 +3192,7 @@ pub fn readContentParts(
             var fps: f64 = 24;
             if (part.object.get("video_url")) |vid_obj| if (vid_obj == .object) {
                 if (vid_obj.object.get("fps")) |v| {
-                    const rate: f64 = if (v == .float) v.float else if (v == .integer) @floatFromInt(v.integer) else 0;
+                    const rate: f64 = request_parse.jsonNumber(v) orelse 0;
                     if (std.math.isFinite(rate) and rate > 0) fps = rate;
                 }
                 if (vid_obj.object.get("frames")) |frames| if (frames == .array) {
@@ -3232,6 +3231,12 @@ pub const WireMessages = struct {
 
     pub fn init(allocator: std.mem.Allocator) WireMessages {
         return .{ .allocator = allocator, .media = request_media.RequestMedia.init(allocator) };
+    }
+
+    /// The one way a reader adds a message: one that carries nothing is dropped (`Message.carriesNothing`).
+    pub fn push(self: *WireMessages, msg: chat_mod.Message) !void {
+        if (msg.carriesNothing()) return;
+        try self.messages.append(self.allocator, msg);
     }
 
     pub fn deinit(self: *WireMessages) void {
@@ -3306,9 +3311,7 @@ fn readOpenAiMessages(wire: *WireMessages, items: []const std.json.Value, vp: ch
         else
             null;
 
-        if (read.text.len == 0 and msg_tool_calls == null and read.images == null and read.videos == null and read.audio == null and msg_reasoning == null and !std.mem.eql(u8, role, "tool")) continue;
-
-        try wire.messages.append(allocator, .{
+        try wire.push(.{
             .role = role,
             .content = read.text,
             .tool_calls = msg_tool_calls,
@@ -3358,7 +3361,7 @@ pub const test_png_blue = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEElEQ
 pub fn testWire(body: []const u8, vocab: WireVocab) !struct { parsed: std.json.Parsed(std.json.Value), wire: WireMessages } {
     // The processor is the arch's: a build without it cannot decode these images.
     if (!arch_media.servesMode(media_fx.wire_vp.mode)) return error.SkipZigTest;
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    const parsed = try request_parse.parseSpelled(std.testing.allocator, body);
     errdefer parsed.deinit();
     var wire = WireMessages.init(std.testing.allocator);
     errdefer wire.deinit();

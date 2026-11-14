@@ -138,39 +138,48 @@ pub fn parseCancelRequestId(allocator: std.mem.Allocator, body: []const u8) ?u64
     };
 }
 
-const JoinedText = struct { text: []const u8, owned: bool };
+/// A request body read with every number as the client spelled it (`number_string`). The readers that copy client
+/// JSON into the prompt (messages, tools) read this tree, so `1.0` and `1e22` reach the template as sent; every other
+/// field is read from the default parse.
+pub fn parseSpelled(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .parse_numbers = false });
+}
 
-/// Collect every `{"type":"text"}` part of a content array into one string,
-/// in order, '\n'-joined. A single (or no) text part borrows the JSON's
-/// bytes (`owned=false`); 2+ parts allocate (`owned=true`, caller frees).
-///
-/// Multiple text parts are real traffic: opencode plan mode appends its
-/// "Plan Mode - System Reminder" as a SECOND text part on the user message,
-/// and last-wins here dropped the user's actual prompt — the model answered
-/// "What would you like to accomplish?" to every first plan-mode message
-/// (issue #195).
-pub fn joinedTextParts(allocator: std.mem.Allocator, parts: []const std.json.Value) !JoinedText {
-    var single: []const u8 = "";
+/// A number from either parse: an integer, a float, or a spelled number.
+pub fn jsonNumber(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        .number_string => |n| std.fmt.parseFloat(f64, n) catch null,
+        else => null,
+    };
+}
+
+/// A chat body's `tools` (from `parseSpelled`), written by the one writer; null when it declares none. Caller frees.
+pub fn chatToolsJson(allocator: std.mem.Allocator, spelled_root: std.json.ObjectMap) !?[]u8 {
+    const tools = spelled_root.get("tools") orelse return null;
+    if (tools != .array or tools.array.items.len == 0) return null;
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
-    var n: usize = 0;
+    try json_text.appendValue(allocator, &buf, tools);
+    return try buf.toOwnedSlice(allocator);
+}
+
+pub const JoinedText = chat_mod.JoinedText;
+pub const TextJoin = chat_mod.TextJoin;
+
+/// Every `{"type":"text"}` part of a content array, joined by `TextJoin`.
+pub fn joinedTextParts(allocator: std.mem.Allocator, parts: []const std.json.Value) !JoinedText {
+    var join: TextJoin = .{};
+    errdefer join.deinit(allocator);
     for (parts) |part| {
         if (part != .object) continue;
         const ptype = part.object.get("type") orelse continue;
         if (ptype != .string or !std.mem.eql(u8, ptype.string, "text")) continue;
         const tv = part.object.get("text") orelse continue;
-        if (tv != .string or tv.string.len == 0) continue;
-        n += 1;
-        if (n == 1) {
-            single = tv.string;
-            continue;
-        }
-        if (n == 2) try buf.appendSlice(allocator, single);
-        try buf.append(allocator, '\n');
-        try buf.appendSlice(allocator, tv.string);
+        if (tv == .string) try join.add(allocator, tv.string);
     }
-    if (n <= 1) return .{ .text = single, .owned = false };
-    return .{ .text = try buf.toOwnedSlice(allocator), .owned = true };
+    return join.finish(allocator);
 }
 
 /// Workload key for hot-cache eviction (#378): `prompt_cache_key` (OpenAI's own
@@ -641,52 +650,6 @@ test "JSON-escaped slashes in a model id canonicalize (Swift clients send org\\/
     try t.expectEqualStrings("x\\/y", unescapeJsonSlashes(tiny[0..2], "x\\/y"));
 }
 
-/// Extract a JSON field's raw value from a JSON body string.
-/// Returns the raw substring for the field value (e.g., the array or object).
-pub fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
-    // Search for "field": or "field" :
-    var pos: usize = 0;
-    while (pos < body.len) {
-        const quote_pos = std.mem.indexOf(u8, body[pos..], "\"") orelse return null;
-        const key_start = pos + quote_pos + 1;
-        if (key_start + field.len >= body.len) return null;
-
-        if (std.mem.eql(u8, body[key_start .. key_start + field.len], field) and
-            body[key_start + field.len] == '"')
-        {
-            // Found the key, skip to colon
-            var i = key_start + field.len + 1;
-            while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\n' or body[i] == '\r' or body[i] == '\t')) {
-                i += 1;
-            }
-            if (i >= body.len) return null;
-
-            // Now extract the value - find matching bracket/brace
-            const start = i;
-            const open = body[start];
-            const close: u8 = if (open == '[') ']' else if (open == '{') '}' else return null;
-            var depth: usize = 1;
-            var j = start + 1;
-            var in_string = false;
-            while (j < body.len and depth > 0) {
-                if (body[j] == '\\' and in_string) {
-                    j += 1; // skip escaped char
-                } else if (body[j] == '"') {
-                    in_string = !in_string;
-                } else if (!in_string) {
-                    if (body[j] == open) depth += 1;
-                    if (body[j] == close) depth -= 1;
-                }
-                j += 1;
-            }
-            if (depth == 0) return body[start..j];
-            return null;
-        }
-        pos = key_start;
-    }
-    return null;
-}
-
 /// Build a llama.cpp-style `timings` JSON object (no surrounding key) from
 /// raw nanosecond counts and token totals. Caller frees. Returns an empty
 /// string when `prefill_ns`, `decode_ns`, AND `tokenize_ns` are all zero
@@ -734,9 +697,9 @@ pub fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '[');
-    for (tools_array.items, 0..) |tool_val, i| {
-        if (i > 0) try buf.append(allocator, ',');
+    for (tools_array.items) |tool_val| {
         if (tool_val != .object) continue;
+        if (buf.items.len > 1) try buf.append(allocator, ',');
         const tool = tool_val.object;
         const name = if (tool.get("name")) |v| (if (v == .string) v.string else "") else "";
         const desc = if (tool.get("description")) |v| (if (v == .string) v.string else "") else "";
@@ -758,38 +721,6 @@ pub fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.
     }
     try buf.append(allocator, ']');
     return try buf.toOwnedSlice(allocator);
-}
-
-test "extractJsonField extracts array" {
-    const body =
-        \\{"messages":[{"role":"user","content":"hi"}],"temperature":0.7}
-    ;
-    const result = extractJsonField(body, "messages").?;
-    try testing.expect(std.mem.startsWith(u8, result, "["));
-    try testing.expect(std.mem.endsWith(u8, result, "]"));
-}
-
-test "extractJsonField extracts nested object" {
-    const body =
-        \\{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}}
-    ;
-    const result = extractJsonField(body, "response_format").?;
-    try testing.expect(std.mem.startsWith(u8, result, "{"));
-    try testing.expect(std.mem.endsWith(u8, result, "}"));
-}
-
-test "extractJsonField returns null for missing field" {
-    const body = "{\"messages\":[]}";
-    try testing.expect(extractJsonField(body, "tools") == null);
-}
-
-test "extractJsonField handles escaped quotes in strings" {
-    const body =
-        \\{"tools":[{"type":"function","function":{"name":"say_\"hello\""}}]}
-    ;
-    const result = extractJsonField(body, "tools").?;
-    try testing.expect(std.mem.startsWith(u8, result, "["));
-    try testing.expect(std.mem.endsWith(u8, result, "]"));
 }
 
 test "content-array text parts JOIN in order — plan-mode's [prompt, reminder] shape (issue #195)" {
@@ -974,4 +905,25 @@ test "chat_template_kwargs answers only a bool" {
     try testing.expectEqual(@as(?bool, false), chatTemplateKwargBool(parsed.value.object, "enable_thinking"));
     try testing.expectEqual(@as(?bool, null), chatTemplateKwargBool(parsed.value.object, "n"));
     try testing.expectEqual(@as(?bool, null), chatTemplateKwargBool(parsed.value.object, "absent"));
+}
+
+test "chatToolsJson reads the body's own top-level tools, whatever else names tools before them" {
+    const want = "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"maximum\":1e22}}}}}]";
+    const bodies = [_][]const u8{
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"tools\"}],\"tools\":" ++ want ++ "}",
+        "{\"messages\":[],\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"tools\"}},\"tools\":" ++ want ++ "}",
+        "{\"messages\":[],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":{\"properties\":{\"tools\":{\"type\":\"array\"}}}}},\"tools\":" ++ want ++ "}",
+        "{\"messages\":[],\"metadata\":{\"tools\":[\"x\"]},\"tools\":" ++ want ++ "}",
+        "{\"messages\":[],\"\\u0074ools\":" ++ want ++ "}",
+    };
+    for (bodies) |body| {
+        const spelled = try parseSpelled(testing.allocator, body);
+        defer spelled.deinit();
+        const got = (try chatToolsJson(testing.allocator, spelled.value.object)).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+    const none = try parseSpelled(testing.allocator, "{\"messages\":[],\"tools\":[]}");
+    defer none.deinit();
+    try testing.expect((try chatToolsJson(testing.allocator, none.value.object)) == null);
 }

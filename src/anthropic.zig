@@ -256,7 +256,7 @@ fn readAnthropicConversation(wire: *WireMessages, system: ?std.json.Value, items
             else => "",
         };
         if (sys_text.len > 0) {
-            try wire.messages.append(allocator, .{ .role = "system", .content = sys_text, .tool_calls = null, .tool_call_id = null });
+            try wire.push(.{ .role = "system", .content = sys_text, .tool_calls = null, .tool_call_id = null });
         }
     }
     try readAnthropicMessages(wire, items, vp);
@@ -279,7 +279,7 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
         if (std.mem.eql(u8, role, "user")) {
             if (content_val) |cv| switch (cv) {
                 .string => |s| {
-                    try wire.messages.append(allocator, .{ .role = "user", .content = s });
+                    try wire.push(.{ .role = "user", .content = s });
                 },
                 .array => |arr| {
                     for (arr.items) |block| {
@@ -294,7 +294,7 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
                             .array => |result_arr| result = try readContentParts(allocator, &wire.media, &wire.texts, result_arr.items, .anthropic, pos, vp),
                             else => {},
                         };
-                        try wire.messages.append(allocator, .{
+                        try wire.push(.{
                             .role = "tool",
                             .content = result.text,
                             .tool_call_id = tool_use_id,
@@ -305,7 +305,7 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
 
                     const read = try readContentParts(allocator, &wire.media, &wire.texts, arr.items, .anthropic, pos, vp);
                     if (read.text.len > 0 or read.images != null) {
-                        try wire.messages.append(allocator, .{
+                        try wire.push(.{
                             .role = "user",
                             .content = read.text,
                             .images = read.images,
@@ -318,13 +318,13 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
         } else if (std.mem.eql(u8, role, "assistant")) {
             if (content_val) |cv| switch (cv) {
                 .string => |s| {
-                    try wire.messages.append(allocator, .{ .role = "assistant", .content = s });
+                    try wire.push(.{ .role = "assistant", .content = s });
                 },
                 .array => |arr| {
                     // Extract text, tool_use and thinking blocks
-                    var text_content = std.ArrayList(u8).empty;
+                    var text_content: chat_mod.TextJoin = .{};
                     defer text_content.deinit(allocator);
-                    var think_content = std.ArrayList(u8).empty;
+                    var think_content: chat_mod.TextJoin = .{};
                     defer think_content.deinit(allocator);
                     var tcs = std.ArrayList(chat_mod.ToolCall).empty;
 
@@ -334,7 +334,7 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
 
                         if (std.mem.eql(u8, btype, "text")) {
                             const text = if (block.object.get("text")) |t| (if (t == .string) t.string else "") else "";
-                            try text_content.appendSlice(allocator, text);
+                            try text_content.add(allocator, text);
                         } else if (std.mem.eql(u8, btype, "tool_use")) {
                             const tc_id = if (block.object.get("id")) |v| (if (v == .string) v.string else "") else "";
                             const tc_name = if (block.object.get("name")) |v| (if (v == .string) v.string else "") else "";
@@ -355,10 +355,7 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
                             // starve into nothink without it.
                             // "redacted_thinking" stays skipped (opaque payload).
                             const t = if (block.object.get("thinking")) |v| (if (v == .string) v.string else "") else "";
-                            if (t.len > 0) {
-                                if (think_content.items.len > 0) try think_content.append(allocator, '\n');
-                                try think_content.appendSlice(allocator, t);
-                            }
+                            try think_content.add(allocator, t);
                         }
                     }
 
@@ -371,17 +368,12 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
                         tcs.deinit(allocator);
                     }
 
-                    const content: []const u8 = if (text_content.items.len > 0) blk: {
-                        const duped = try allocator.dupe(u8, text_content.items);
-                        try wire.texts.append(allocator, duped);
-                        break :blk duped;
-                    } else "";
-                    const msg_reasoning: ?[]const u8 = if (think_content.items.len > 0) blk: {
-                        const duped = try allocator.dupe(u8, think_content.items);
-                        try wire.texts.append(allocator, duped);
-                        break :blk duped;
-                    } else null;
-                    try wire.messages.append(allocator, .{ .role = "assistant", .content = content, .tool_calls = msg_tool_calls, .reasoning_content = msg_reasoning });
+                    const content = try text_content.finish(allocator);
+                    if (content.owned) try wire.texts.append(allocator, content.text);
+                    const thought = try think_content.finish(allocator);
+                    if (thought.owned) try wire.texts.append(allocator, thought.text);
+                    const msg_reasoning: ?[]const u8 = if (thought.text.len > 0) thought.text else null;
+                    try wire.push(.{ .role = "assistant", .content = content.text, .tool_calls = msg_tool_calls, .reasoning_content = msg_reasoning });
                 },
                 else => {},
             };
@@ -397,7 +389,7 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
                 else => "",
             } else "";
             if (sys_text.len > 0) {
-                try wire.messages.append(allocator, .{ .role = "system", .content = sys_text });
+                try wire.push(.{ .role = "system", .content = sys_text });
             }
         }
     }
@@ -505,6 +497,8 @@ pub fn handleAnthropicMessages(
     const parsed = (try parseAnthropicBody(allocator, stream, body, "/v1/messages")) orelse return;
     defer parsed.deinit();
     const root = parsed.value.object;
+    const spelled = try request_parse.parseSpelled(allocator, body);
+    defer spelled.deinit();
 
     var fault_buf: [384]u8 = undefined;
     const field_fault = request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &.{"max_tokens"}, .stop = "stop_sequences" }) orelse
@@ -572,7 +566,7 @@ pub fn handleAnthropicMessages(
     var prompt: AnthropicPrompt = .{ .wire = WireMessages.init(allocator) };
     defer prompt.deinit();
     defer clearEffortNotice(stream);
-    if (!try renderAnthropicPrompt(allocator, stream, lm, root, .messages, &prompt)) return;
+    if (!try renderAnthropicPrompt(allocator, stream, lm, root, spelled.value.object, .messages, &prompt)) return;
     if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
@@ -774,13 +768,14 @@ const AnthropicRoute = enum {
     }
 };
 
-/// Renders `root` into `p` exactly as /v1/messages prefills it; false once a 400 is sent.
-fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, root: std.json.ObjectMap, route: AnthropicRoute, p: *AnthropicPrompt) !bool {
+/// Renders `root` into `p` exactly as /v1/messages prefills it; false once a 400 is sent. The conversation and the tools
+/// are read from `spelled` (`request_parse.parseSpelled`), which outlives `p`.
+fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, root: std.json.ObjectMap, spelled: std.json.ObjectMap, route: AnthropicRoute, p: *AnthropicPrompt) !bool {
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
 
-    const messages_val = root.get("messages") orelse {
+    const messages_val = spelled.get("messages") orelse {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' is required", 400);
         return false;
     };
@@ -789,7 +784,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         return false;
     }
     const messages = &p.wire.messages;
-    try readAnthropicConversation(&p.wire, root.get("system"), messages_val.array.items, visionPreprocFromConfig(config));
+    try readAnthropicConversation(&p.wire, spelled.get("system"), messages_val.array.items, visionPreprocFromConfig(config));
     chat_mod.orderMessages(config.model_type, p.wire.messages.items);
     if (p.wire.media.refusal()) |fault| {
         log.warn("POST {s} -> 400 ({s})\n", .{ route.path(), fault.text() });
@@ -801,7 +796,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         return false;
     }
 
-    if (root.get("tools")) |tools_val| {
+    if (spelled.get("tools")) |tools_val| {
         if (tools_val == .array and tools_val.array.items.len > 0) {
             p.has_tools = true;
             // Convert Anthropic tools to OpenAI format for chat template
@@ -968,10 +963,12 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
 pub fn handleAnthropicCountTokens(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel) !void {
     const parsed = (try parseAnthropicBody(allocator, stream, body, "/v1/messages/count_tokens")) orelse return;
     defer parsed.deinit();
+    const spelled = try request_parse.parseSpelled(allocator, body);
+    defer spelled.deinit();
     var prompt: AnthropicPrompt = .{ .wire = WireMessages.init(allocator) };
     defer prompt.deinit();
     defer clearEffortNotice(stream);
-    if (!try renderAnthropicPrompt(allocator, stream, lm, parsed.value.object, .count_tokens, &prompt)) return;
+    if (!try renderAnthropicPrompt(allocator, stream, lm, parsed.value.object, spelled.value.object, .count_tokens, &prompt)) return;
 
     var input_tokens = prompt.ids.len;
     var flat = try flattenMedia(allocator, prompt.wire.messages.items);
@@ -2411,13 +2408,15 @@ test "count_tokens: both routes render a body to the same prompt, schema, tools,
         Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
         defer parsed.deinit();
+        const spelled = try request_parse.parseSpelled(t.allocator, body);
+        defer spelled.deinit();
         var served: AnthropicPrompt = .{ .wire = WireMessages.init(t.allocator) };
         defer served.deinit();
-        try t.expect(try renderAnthropicPrompt(t.allocator, &conn, &f.lm, parsed.value.object, .messages, &served));
+        try t.expect(try renderAnthropicPrompt(t.allocator, &conn, &f.lm, parsed.value.object, spelled.value.object, .messages, &served));
         clearEffortNotice(&conn);
         var counted: AnthropicPrompt = .{ .wire = WireMessages.init(t.allocator) };
         defer counted.deinit();
-        try t.expect(try renderAnthropicPrompt(t.allocator, &conn, &f.lm, parsed.value.object, .count_tokens, &counted));
+        try t.expect(try renderAnthropicPrompt(t.allocator, &conn, &f.lm, parsed.value.object, spelled.value.object, .count_tokens, &counted));
         clearEffortNotice(&conn);
         try t.expect(served.ids.len > 0);
         try t.expectEqualSlices(u32, served.ids, counted.ids);
@@ -2443,4 +2442,127 @@ test "a /v1/messages reply with a call inside a thought the prompt opened and ne
     const split = think_tags.splitThinkBlock(generated, true, true);
     try std.testing.expectEqualStrings("I'll check.", split.reasoning_content.?);
     try std.testing.expectEqualStrings("", split.content);
+}
+
+/// One conversation as each surface reads a body and its tools, the way its handler does, rendered.
+fn renderSurface(a: std.mem.Allocator, cfg: *const chat_mod.ChatConfig, surface: enum { chat, messages, responses }, body: []const u8) ![]const u8 {
+    const spelled = try request_parse.parseSpelled(a, body);
+    defer spelled.deinit();
+    const root = spelled.value.object;
+    var wire = WireMessages.init(a);
+    defer wire.deinit();
+    switch (surface) {
+        .chat => {
+            var t = try server_mod.testWire(body, .openai);
+            defer t.parsed.deinit();
+            defer t.wire.deinit();
+            const tools = try request_parse.chatToolsJson(a, root);
+            defer if (tools) |x| a.free(x);
+            return chat_mod.renderChatTemplate(a, t.wire.messages.items, cfg, tools, null, true, null, false);
+        },
+        .messages => {
+            try readAnthropicConversation(&wire, root.get("system"), root.get("messages").?.array.items, .{});
+            const tools: ?[]const u8 = if (root.get("tools")) |tv| try request_parse.buildOpenAIToolsJson(a, tv.array) else null;
+            defer if (tools) |x| a.free(x);
+            return chat_mod.renderChatTemplate(a, wire.messages.items, cfg, tools, null, true, null, false);
+        },
+        .responses => {
+            var pi = try responses_mod.parseInput(a, root.get("input").?, null, null, null, .{});
+            defer pi.deinit();
+            const tools: ?[]const u8 = if (root.get("tools")) |tv| try responses_mod.buildToolsJson(a, tv.array) else null;
+            defer if (tools) |x| a.free(x);
+            return chat_mod.renderChatTemplate(a, pi.messages.items, cfg, tools, null, true, null, false);
+        },
+    }
+}
+
+test "one conversation renders the same prompt on chat, /v1/messages and /v1/responses" {
+    const a = std.testing.allocator;
+    const Case = struct { chat: []const u8, messages: []const u8, responses: []const u8 };
+    const cases = [_]Case{
+        // Text parts with an empty one between.
+        .{
+            .chat = \\{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":""},{"type":"text","text":"b"}]}]}
+            ,
+            .messages = \\{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":""},{"type":"text","text":"b"}]}]}
+            ,
+            .responses = \\{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"a"},{"type":"input_text","text":""},{"type":"input_text","text":"b"}]}]}
+            ,
+        },
+        // An assistant reply in two text parts.
+        .{
+            .chat = \\{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]},{"role":"user","content":"v"}]}
+            ,
+            .messages = \\{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]},{"role":"user","content":"v"}]}
+            ,
+            .responses = \\{"input":[{"role":"user","content":"u"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"one"},{"type":"output_text","text":"two"}]},{"role":"user","content":"v"}]}
+            ,
+        },
+        // Call arguments whose numbers JSON spells several ways.
+        .{
+            .chat = \\{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{\"n\": 1.0, \"t\": 1e-7, \"z\": -0.0, \"e\": 1e22, \"p\": 2.50}"}}]},{"role":"tool","tool_call_id":"c1","content":"r"},{"role":"user","content":"v"}]}
+            ,
+            .messages = \\{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"f","input":{"n": 1.0, "t": 1e-7, "z": -0.0, "e": 1e22, "p": 2.50}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"r"}]},{"role":"user","content":"v"}]}
+            ,
+            .responses = \\{"input":[{"role":"user","content":"u"},{"type":"function_call","call_id":"c1","name":"f","arguments":"{\"n\": 1.0, \"t\": 1e-7, \"z\": -0.0, \"e\": 1e22, \"p\": 2.50}"},{"type":"function_call_output","call_id":"c1","output":"r"},{"role":"user","content":"v"}]}
+            ,
+        },
+        // A tool schema with the same numbers.
+        .{
+            .chat = \\{"messages":[{"role":"user","content":"u"}],"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object","properties":{"x":{"type":"number","minimum":0.0,"maximum":1e22,"multipleOf":1e-7}}}}}]}
+            ,
+            .messages = \\{"messages":[{"role":"user","content":"u"}],"tools":[{"name":"f","description":"d","input_schema":{"type":"object","properties":{"x":{"type":"number","minimum":0.0,"maximum":1e22,"multipleOf":1e-7}}}}]}
+            ,
+            .responses = \\{"input":[{"role":"user","content":"u"}],"tools":[{"type":"function","name":"f","description":"d","parameters":{"type":"object","properties":{"x":{"type":"number","minimum":0.0,"maximum":1e22,"multipleOf":1e-7}}}}]}
+            ,
+        },
+        // An empty assistant turn between user turns, and an empty user turn last.
+        .{
+            .chat = \\{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":""},{"role":"user","content":"v"},{"role":"assistant","content":"a"},{"role":"user","content":""}]}
+            ,
+            .messages = \\{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":""},{"role":"user","content":"v"},{"role":"assistant","content":"a"},{"role":"user","content":""}]}
+            ,
+            .responses = \\{"input":[{"role":"user","content":"u"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]},{"role":"user","content":"v"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a"}]},{"role":"user","content":""}]}
+            ,
+        },
+        // Reasoning in two pieces.
+        .{
+            .chat = \\{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":"a","reasoning_content":"r1\nr2"},{"role":"user","content":"v"}]}
+            ,
+            .messages = \\{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":[{"type":"thinking","thinking":"r1","signature":""},{"type":"thinking","thinking":"r2","signature":""},{"type":"text","text":"a"}]},{"role":"user","content":"v"}]}
+            ,
+            .responses = \\{"input":[{"role":"user","content":"u"},{"type":"reasoning","summary":[{"type":"summary_text","text":"r1"},{"type":"summary_text","text":"r2"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a"}]},{"role":"user","content":"v"}]}
+            ,
+        },
+    };
+    for ([_]bool{ false, true }) |glm| {
+        var cfg = chat_mod.ChatConfig{
+            .chat_template = if (glm) @embedFile("fixtures/glm53_chat_template.jinja") else @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
+            .bos_token = null,
+            .eos_token = if (glm) "<|endoftext|>" else "<|im_end|>",
+            .add_bos_token = false,
+            .allocator = a,
+        };
+        try cfg.compile();
+        defer cfg.dropCompiled();
+        for (cases) |c| {
+            const chat = try renderSurface(a, &cfg, .chat, c.chat);
+            defer a.free(chat);
+            const messages = try renderSurface(a, &cfg, .messages, c.messages);
+            defer a.free(messages);
+            const responses = try renderSurface(a, &cfg, .responses, c.responses);
+            defer a.free(responses);
+            try std.testing.expectEqualStrings(chat, messages);
+            try std.testing.expectEqualStrings(chat, responses);
+        }
+    }
+}
+
+test "an Anthropic tools array with a non-object entry converts to a JSON array of the tools it holds" {
+    const a = std.testing.allocator;
+    const parsed = try request_parse.parseSpelled(a, "[\"web_search\",{\"name\":\"f\",\"input_schema\":{\"type\":\"object\"}},7]");
+    defer parsed.deinit();
+    const tools = try request_parse.buildOpenAIToolsJson(a, parsed.value.array);
+    defer a.free(tools);
+    try std.testing.expectEqualStrings("[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"description\":\"\",\"parameters\":{\"type\":\"object\"}}}]", tools);
 }

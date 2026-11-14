@@ -140,6 +140,45 @@ pub const MediaPart = struct {
     pub const Kind = enum { image, video };
 };
 
+pub const JoinedText = struct { text: []const u8, owned: bool };
+
+/// The one rule every surface joins a message's text parts (and its reasoning parts) by: an empty part drops, the
+/// rest join with '\n'. One part borrows its bytes (`owned=false`); 2+ allocate (`owned=true`, the caller frees).
+///
+/// Multiple text parts are real traffic: opencode plan mode appends its "Plan Mode - System Reminder" as a SECOND text
+/// part on the user message, and last-wins here dropped the user's actual prompt (issue #195).
+pub const TextJoin = struct {
+    single: []const u8 = "",
+    buf: std.ArrayList(u8) = .empty,
+    n: usize = 0,
+
+    pub fn add(self: *TextJoin, allocator: std.mem.Allocator, text: []const u8) !void {
+        if (text.len == 0) return;
+        self.n += 1;
+        if (self.n == 1) {
+            self.single = text;
+            return;
+        }
+        if (self.n == 2) try self.buf.appendSlice(allocator, self.single);
+        try self.buf.append(allocator, '\n');
+        try self.buf.appendSlice(allocator, text);
+    }
+
+    /// The joined length so far: where a media part between text parts renders.
+    pub fn len(self: *const TextJoin) usize {
+        return if (self.n <= 1) self.single.len else self.buf.items.len;
+    }
+
+    pub fn finish(self: *TextJoin, allocator: std.mem.Allocator) !JoinedText {
+        if (self.n <= 1) return .{ .text = self.single, .owned = false };
+        return .{ .text = try self.buf.toOwnedSlice(allocator), .owned = true };
+    }
+
+    pub fn deinit(self: *TextJoin, allocator: std.mem.Allocator) void {
+        self.buf.deinit(allocator);
+    }
+};
+
 pub const Message = struct {
     role: []const u8,
     content: []const u8,
@@ -158,6 +197,13 @@ pub const Message = struct {
     /// Who wrote each byte of `content` when the server put it together from its own text and the client's (the tool
     /// fallbacks); null when all of it is the role's.
     content_origins: ?[]const template_engine.Run = null,
+
+    /// A message a client sent with nothing in it: no text, call, media or reasoning. Every surface's reader drops
+    /// one, so a conversation renders the same prompt on each; a tool result is kept, empty or not.
+    pub fn carriesNothing(self: Message) bool {
+        return self.content.len == 0 and self.tool_calls == null and self.images == null and self.videos == null and
+            self.audio == null and self.reasoning_content == null and !std.mem.eql(u8, self.role, "tool");
+    }
 
     /// This message as `role`, its content `before ++ content ++ after`: every other field is carried, and its media
     /// moves with the text it sat in.

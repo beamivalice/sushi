@@ -35,6 +35,11 @@ earlier history is mlx-serve's, in that project's changelog.
   a template that reads those keys, so Qwen3.8 and GLM-5.3 prompts match transformers byte for byte.
 - **Qwen3.8 reads decomposed text as transformers does**: text a client sends in NFD (an `e` plus a combining accent,
   Hangul jamo) is composed by the pack's NFC normalizer before it is encoded; a reply keeps its own bytes.
+- **One conversation is the same prompt on every API surface**: chat, `/v1/messages` and `/v1/responses` join text
+  and reasoning parts alike, drop an empty message alike and keep a number's spelling in tool arguments and schemas;
+  chat reads its `tools` from the body's own field (a message that said "tools" could hide them), an Anthropic tools
+  list with a stray non-object entry no longer breaks the prompt, and a Responses chain with `text.format` no longer
+  repeats its JSON instruction each turn.
 - **The dashboard shows expert streaming**: for a model that streams its experts from the SSD, a new card shows how many
   routed experts were already in memory, the SSD read rate and the time spent waiting on it, and `/metrics` carries the
   same counters.

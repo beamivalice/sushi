@@ -113,7 +113,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - **Only an unknown NAME falls back to the default model** (SDK names like `gpt-4`); a PATH (`/…`, `~/…`, never
   `org/repo`) names its own entry as `/v1/load-model` resolves it (`routeRequestModel` → `registry.peekPath`), and an
   unregistered path is a 404 `model_not_found` (Anthropic `not_found_error`), never another model's answer.
-- A content array's text parts JOIN in order (`joinedTextParts`); its media parts render at the offset they sat at.
+- **One conversation renders one prompt on every surface** (the `one conversation renders the same prompt` test in
+  `anthropic.zig`): text parts, Anthropic text and thinking blocks and Responses reasoning parts join by one rule
+  (`chat.TextJoin`: an empty part drops, the rest join with `\n`), and its media parts render at the offset they sat
+  at; a message that carries nothing is dropped by every reader (`Message.carriesNothing`, `WireMessages.push`); the
+  messages and tools are read from the body parsed with numbers as spelled (`request_parse.parseSpelled`) and
+  written by one writer, so `1.0` and `1e22` reach the template as the client sent them. Chat's `tools` is the body's
+  own top-level field (`request_parse.chatToolsJson`), never a text scan.
+- A Responses `text.format` JSON instruction is added to the prompt's copy of the conversation
+  (`withJsonInstruction`); the stored conversation a `previous_response_id` chain replays holds none.
 - A body field the server does not read is ignored, never rejected: a client still sending the removed `kv_attn_mode` is served as if it were absent.
 - **Media is read from EVERY message** on all three surfaces: chat `image_url`/`video_url` parts in any role
   (`tool` included), Anthropic `image` blocks beside the text or inside a `tool_result`, Responses `input_image` in
