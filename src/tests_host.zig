@@ -45,6 +45,8 @@ test {
     _ = @import("token_mask.zig");
     _ = @import("regex.zig");
     _ = @import("tokenizer.zig");
+    _ = @import("tokenizer_nfc.zig");
+    _ = @import("utf8_seq.zig");
     _ = @import("arch/chat.zig");
     _ = @import("arch/packs.zig");
     _ = @import("arch/flags.zig");

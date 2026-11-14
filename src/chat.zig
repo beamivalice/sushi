@@ -227,6 +227,8 @@ pub const ChatConfig = struct {
             return error.ChatTemplateInvalid;
         }
         self.compiled = c;
+        c.turns_arena = std.heap.ArenaAllocator.init(self.allocator);
+        c.turns = try assistantTurnRenders(c.turns_arena.?.allocator(), self);
     }
 
     /// What the compiled template says about itself (`template/facts.zig`); a config with no template has none.
@@ -242,10 +244,12 @@ pub const ChatConfig = struct {
         return self.compiledFacts() catch @panic("ChatConfig: a fact asked of a template never compiled; call compile()");
     }
 
-    /// What the template may print, for the reserved-token mask: null with no template, so suppression stays off.
-    pub fn printedFacts(self: *const ChatConfig) ?*const Facts {
+    /// What the template may print and where, for the reserved-token mask: null with no template, so suppression
+    /// stays off.
+    pub fn printedFacts(self: *const ChatConfig) ?tokenizer_mod.TemplatePrinting {
         if (self.chat_template.len == 0) return null;
-        return self.facts();
+        const turns = self.compiled.?.turns;
+        return .{ .facts = self.facts(), .turns = turns.turns, .outside = turns.outside };
     }
 
     /// Frees what `compile` built, for a config built by hand whose other fields it does not own.
@@ -299,16 +303,22 @@ const Probe = enum {
     tool_content,
     late_system,
     call,
+    call_empty,
+    answer,
 
     const tool_marker = "__mlx_tool_role_probe__";
+    const answer_marker = "__sushi_answer_probe__";
     const late_marker = "__sushi_late_system_probe__";
     const call_tools = [_]ToolCall{.{ .id = "call_probe", .name = probe_name, .arguments = "{\"a\": \"v\"}" }};
+    const call_empty_tools = [_]ToolCall{.{ .id = "call_probe", .name = probe_name, .arguments = "{}" }};
 
     fn messages(self: Probe) []const Message {
         return switch (self) {
             .tool_content => &.{.{ .role = "tool", .content = tool_marker }},
             .late_system => &.{ .{ .role = "user", .content = "u" }, .{ .role = "system", .content = late_marker }, .{ .role = "user", .content = "u" } },
             .call => &.{ .{ .role = "user", .content = "u" }, .{ .role = "assistant", .content = "", .tool_calls = &call_tools, .reasoning_content = "r" } },
+            .call_empty => &.{ .{ .role = "user", .content = "u" }, .{ .role = "assistant", .content = "", .tool_calls = &call_empty_tools, .reasoning_content = "r" } },
+            .answer => &.{ .{ .role = "user", .content = "u" }, .{ .role = "assistant", .content = answer_marker, .reasoning_content = "r" } },
         };
     }
 };
@@ -370,6 +380,9 @@ pub const Compiled = struct {
     main: Tpl,
     late_system: ?Tpl,
     late_text: ?[]const u8,
+    /// `assistantTurnRenders` of a load's compile, in `turns_arena`; empty for a compile no config keeps.
+    turns: TurnRenders = .{ .turns = &.{}, .outside = &.{} },
+    turns_arena: ?std.heap.ArenaAllocator = null,
 
     fn init(allocator: std.mem.Allocator, text: []const u8, at_load: bool, model_type: ?[]const u8) !*Compiled {
         const c = try allocator.create(Compiled);
@@ -388,6 +401,7 @@ pub const Compiled = struct {
     }
 
     fn deinit(self: *Compiled, allocator: std.mem.Allocator) void {
+        if (self.turns_arena) |*a| a.deinit();
         self.main.deinit();
         if (self.late_system) |*l| l.deinit();
         if (self.late_text) |t| allocator.free(t);
@@ -625,6 +639,17 @@ fn specialTokenText(allocator: std.mem.Allocator, v: ?std.json.Value, key: []con
     return try allocator.dupe(u8, t);
 }
 
+/// The pack's `chat_template.jinja`, or null when it has none. Caller frees.
+fn chatTemplateFile(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !?[]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{model_dir});
+    defer allocator.free(path);
+    const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer f.close(io);
+    var buf: [4096]u8 = undefined;
+    var reader = f.reader(io, &buf);
+    return try reader.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024));
+}
+
 /// `model_type` is the one the load parsed from config.json: it picks the arch's pinned template and its edits.
 /// `say`: a load, whose template failure and fold the log states.
 fn readChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, model_type: ?[]const u8, say: bool) !ChatConfig {
@@ -652,21 +677,15 @@ fn readChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
         .null, .string, .array => chatTemplateFromValue(root.get("chat_template")),
         else => return badConfigKey(say, "chat_template", "a string or a list of named templates"),
     };
+    // As transformers loads a pack: its `chat_template.jinja` outranks the copy inside tokenizer_config.json.
     config.chat_template = if (pin) |p|
         try allocator.dupe(u8, p.template)
+    else if (try chatTemplateFile(io, allocator, model_dir)) |file_text|
+        file_text
     else if (own) |t|
         try allocator.dupe(u8, t)
-    else blk: {
-        // Fall back to chat_template.jinja file (e.g. Qwen3.5 models)
-        const jinja_path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{model_dir});
-        defer allocator.free(jinja_path);
-        if (std.Io.Dir.openFileAbsolute(io, jinja_path, .{})) |f| {
-            defer f.close(io);
-            var jinja_buf: [4096]u8 = undefined;
-            var jinja_reader = f.reader(io, &jinja_buf);
-            break :blk try jinja_reader.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024));
-        } else |_| break :blk &.{};
-    };
+    else
+        &.{};
     config.bos_token = try specialTokenText(allocator, root.get("bos_token"), "bos_token", say);
     config.eos_token = try specialTokenText(allocator, root.get("eos_token"), "eos_token", say);
     config.add_bos_token = switch (root.get("add_bos_token") orelse .null) {
@@ -1086,7 +1105,7 @@ fn contextTexts(arena: std.mem.Allocator, context: *const RenderContext) !Contex
     if (context.tools) |t| if (t.len > 0) {
         var diag: template_engine.Diagnostic = .{};
         if (template_engine.readJson(arena, t, "tools", .input, &diag)) |v| {
-            if (try fillToolDefKeys(arena, v)) {
+            if (try fillToolDefKeys(arena, v, context.facts)) {
                 var buf = std.ArrayList(u8).empty;
                 try test_json.writeValue(arena, &buf, v);
                 tools = buf.items;
@@ -1150,7 +1169,9 @@ fn renderEngine(allocator: std.mem.Allocator, tmpl: *const Tpl, context: *const 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var usage: template_engine.Usage = .{};
-    const in: template_engine.Inputs = .{ .context = context.context(), .add_generation_prompt = add_generation_prompt, .usage = if (builtin.is_test) &usage else null };
+    var ctx = context.*;
+    if (tmpl.tree == .ok) ctx.facts = &tmpl.tree.ok.facts;
+    const in: template_engine.Inputs = .{ .context = ctx.context(), .add_generation_prompt = add_generation_prompt, .usage = if (builtin.is_test) &usage else null };
     const rendered: ?Spans = switch (tmpl.tree) {
         .bad => |b| blk: {
             failure.* = b;
@@ -1167,7 +1188,7 @@ fn renderEngine(allocator: std.mem.Allocator, tmpl: *const Tpl, context: *const 
     if (builtin.is_test) if (engine_spy) |spy| {
         var json = std.heap.ArenaAllocator.init(allocator);
         defer json.deinit();
-        const texts = contextTexts(json.allocator(), context) catch |e| switch (e) {
+        const texts = contextTexts(json.allocator(), &ctx) catch |e| switch (e) {
             error.OutOfMemory => {
                 if (rendered) |r| freeSpans(allocator, r);
                 return error.OutOfMemory;
@@ -1188,35 +1209,85 @@ fn renderEngine(allocator: std.mem.Allocator, tmpl: *const Tpl, context: *const 
     return rendered;
 }
 
+pub const TurnRenders = struct { turns: []const []const u8, outside: []const []const u8 };
+
+/// Assistant turns of every shape a reply takes (an answer, a thought, calls, an answer after a tool result), each
+/// last in its conversation.
+const turn_probes = [_][]const Message{
+    &.{ .{ .role = "user", .content = "u" }, .{ .role = "assistant", .content = "a" } },
+    &.{ .{ .role = "user", .content = "u" }, .{ .role = "assistant", .content = "a", .reasoning_content = "r" } },
+    &.{ .{ .role = "user", .content = "u" }, .{ .role = "assistant", .content = "", .reasoning_content = "r", .tool_calls = &Probe.call_tools } },
+    &.{ .{ .role = "user", .content = "u" }, .{ .role = "assistant", .content = "a", .reasoning_content = "r", .tool_calls = &Probe.call_tools } },
+    &.{
+        .{ .role = "system", .content = "s" },
+        .{ .role = "user", .content = "u" },
+        .{ .role = "assistant", .content = "", .reasoning_content = "r", .tool_calls = &Probe.call_tools },
+        .{ .role = "tool", .content = "t", .tool_call_id = "call_probe" },
+        .{ .role = "assistant", .content = "a", .reasoning_content = "r" },
+    },
+};
+const turn_probe_tools =
+    \\[{"type":"function","function":{"name":"__sushi_forced_call_probe__","description":"d","parameters":{"type":"object","properties":{"a":{"type":"string"}}}}}]
+;
+
+/// The template's renders around the last assistant turn of each `turn_probes` conversation, thought on and off, with
+/// and without tools: the generation prompt and the rendered turn (from the first byte the conversation before it
+/// does not share), and the text before them. A probe the template refuses adds nothing.
+fn assistantTurnRenders(arena: std.mem.Allocator, chat_config: *const ChatConfig) !TurnRenders {
+    var turns = std.ArrayList([]const u8).empty;
+    var outside = std.ArrayList([]const u8).empty;
+    const tpl = &chat_config.compiled.?.main;
+    for ([_]bool{ true, false }) |thinking| {
+        const settings = try templateSettings(arena, chat_config, thinking, null);
+        for ([_]?[]const u8{ turn_probe_tools, null }) |tools| for (turn_probes) |msgs| {
+            const head_ctx = RenderContext{ .messages = msgs[0 .. msgs.len - 1], .tools = tools, .settings = &settings };
+            const full_ctx = RenderContext{ .messages = msgs, .tools = tools, .settings = &settings };
+            var failure: EngineFailure = .{};
+            const head = (try renderEngine(arena, tpl, &head_ctx, false, &failure)) orelse continue;
+            const prompt = (try renderEngine(arena, tpl, &head_ctx, true, &failure)) orelse continue;
+            const full = (try renderEngine(arena, tpl, &full_ctx, false, &failure)) orelse continue;
+            const gen_at = std.mem.indexOfDiff(u8, head.bytes, prompt.bytes) orelse continue;
+            const turn_at = std.mem.indexOfDiff(u8, head.bytes, full.bytes) orelse continue;
+            try turns.append(arena, prompt.bytes[gen_at..]);
+            try turns.append(arena, full.bytes[turn_at..]);
+            try outside.append(arena, full.bytes[0..turn_at]);
+        };
+    }
+    return .{ .turns = turns.items, .outside = outside.items };
+}
+
 /// What a forced tool_choice commits once the thought is closed, spelled the
 /// way the template renders a call after a closed think block.
 pub const ForcedCall = struct {
     /// Whitespace between the think closer and the call.
     sep: []u8,
     /// The call up to the model's first free choice: through the function name
-    /// and its closing delimiter when one is named, else up to the name.
+    /// and its closing delimiter when one is named and one delimiter closes it,
+    /// else up to the name.
     call: []u8,
-    /// What closes a name: its delimiter and the whitespace after it.
-    name_tail: []u8,
+    /// What may close a name: the delimiter and the whitespace after it, or,
+    /// where the template follows the name with a tag, each tag it may write.
+    name_tails: []const []const u8,
 
     pub fn deinit(self: *ForcedCall, allocator: std.mem.Allocator) void {
         allocator.free(self.sep);
         allocator.free(self.call);
-        allocator.free(self.name_tail);
+        for (self.name_tails) |t| allocator.free(t);
+        allocator.free(self.name_tails);
     }
 };
 
 /// Read the forced call from the template's own rendering of an assistant tool
 /// call. Null when the template renders no think closer before the call to
-/// anchor on, or no delimiter after the function name.
+/// anchor on, or nothing after the function name to close it.
 const probe_name = "__sushi_forced_call_probe__";
 
 /// The template's rendering of a turn whose assistant calls `probe_name` after a closed thought.
-fn renderProbeCall(allocator: std.mem.Allocator, chat_config: *const ChatConfig) !?[]u8 {
+fn renderProbeCall(allocator: std.mem.Allocator, chat_config: *const ChatConfig, probe: Probe) !?[]u8 {
     const settings = try templateSettings(allocator, chat_config, true, null);
     var own: ?*Compiled = null;
     defer if (own) |c| c.deinit(allocator);
-    return templateProbeRender(allocator, &(try templatesOf(allocator, chat_config, &own)).main, .call, &settings);
+    return templateProbeRender(allocator, &(try templatesOf(allocator, chat_config, &own)).main, probe, &settings);
 }
 
 /// Where the probe's call markup sits: `between` runs from the think closer to the name.
@@ -1231,10 +1302,20 @@ fn locateProbeCall(rendered: []const u8) ?ProbeCall {
     return .{ .between = between, .head = head, .after = rendered[name_at + probe_name.len ..] };
 }
 
+/// What the template writes between a thought's closer and the answer after it (`\n\n` on Qwen, none on GLM), or null
+/// when it writes no closer before an answer. The caller frees it.
+pub fn answerSeparator(allocator: std.mem.Allocator, chat_config: *const ChatConfig) !?[]u8 {
+    const rendered = (try renderProbeCall(allocator, chat_config, .answer)) orelse return null;
+    defer allocator.free(rendered);
+    const at = std.mem.indexOf(u8, rendered, Probe.answer_marker) orelse return null;
+    const closer_at = std.mem.lastIndexOf(u8, rendered[0..at], think_tags.BARE_THINK_CLOSER) orelse return null;
+    return try allocator.dupe(u8, rendered[closer_at + think_tags.BARE_THINK_CLOSER.len .. at]);
+}
+
 /// The `<tag>` the template opens every tool call with (`<tool_call>`), or null when its call
 /// markup does not start with one.
 pub fn callOpener(allocator: std.mem.Allocator, chat_config: *const ChatConfig) !?[]u8 {
-    const rendered = (try renderProbeCall(allocator, chat_config)) orelse return null;
+    const rendered = (try renderProbeCall(allocator, chat_config, .call)) orelse return null;
     defer allocator.free(rendered);
     const head = (locateProbeCall(rendered) orelse return null).head;
     if (head[0] != '<') return null;
@@ -1245,7 +1326,7 @@ pub fn callOpener(allocator: std.mem.Allocator, chat_config: *const ChatConfig) 
 /// The call dialect the template teaches, read from its own rendering of a call; null when it is none of the
 /// parser's families.
 pub fn callDialect(allocator: std.mem.Allocator, chat_config: *const ChatConfig) !?tool_calls_mod.Dialect {
-    const rendered = (try renderProbeCall(allocator, chat_config)) orelse return null;
+    const rendered = (try renderProbeCall(allocator, chat_config, .call)) orelse return null;
     defer allocator.free(rendered);
     const name_at = std.mem.indexOf(u8, rendered, probe_name) orelse return null;
     const before = rendered[name_at -| 48 .. name_at];
@@ -1255,27 +1336,49 @@ pub fn callDialect(allocator: std.mem.Allocator, chat_config: *const ChatConfig)
     return null;
 }
 
+/// What follows a function name in a render, up to the first byte the model chooses: a delimiter of one to four
+/// bytes with the whitespace after it (`>\n`), or, where a tag follows the name, that tag (`<arg_key>`).
+fn nameClose(after: []const u8) ?[]const u8 {
+    var delim: usize = 0;
+    while (delim < after.len and delim < 4 and !nameByte(after[delim]) and !std.ascii.isWhitespace(after[delim]) and after[delim] != '<') delim += 1;
+    var at = delim;
+    while (at < after.len and std.ascii.isWhitespace(after[at])) at += 1;
+    if (delim > 0) return after[0..at];
+    if (at >= after.len or after[at] != '<') return null;
+    const end = std.mem.indexOfScalar(u8, after[at..], '>') orelse return null;
+    return after[0 .. at + end + 1];
+}
+
 pub fn forcedCallText(allocator: std.mem.Allocator, chat_config: *const ChatConfig, name: ?[]const u8) !?ForcedCall {
-    const rendered = (try renderProbeCall(allocator, chat_config)) orelse return null;
+    const rendered = (try renderProbeCall(allocator, chat_config, .call)) orelse return null;
     defer allocator.free(rendered);
     const at = locateProbeCall(rendered) orelse return null;
     const head = at.head;
     const sep = at.between[0 .. at.between.len - head.len];
+    const first = nameClose(at.after) orelse return null;
 
-    const after = at.after;
-    var delim: usize = 0;
-    while (delim < after.len and delim < 4 and !nameByte(after[delim]) and !std.ascii.isWhitespace(after[delim]) and after[delim] != '<') delim += 1;
-    if (delim == 0) return null;
-    var ws = delim;
-    while (ws < after.len and std.ascii.isWhitespace(after[ws])) ws += 1;
-    const tail = after[0..ws];
+    var tails = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (tails.items) |t| allocator.free(t);
+        tails.deinit(allocator);
+    }
+    try tails.ensureTotalCapacity(allocator, 2);
+    tails.appendAssumeCapacity(try allocator.dupe(u8, first));
+    // A tag after the name differs with the arguments: a call with none closes there instead.
+    if (std.mem.trimStart(u8, first, " \t\r\n")[0] == '<') {
+        if (try renderProbeCall(allocator, chat_config, .call_empty)) |bare| {
+            defer allocator.free(bare);
+            const closes = if (locateProbeCall(bare)) |b| nameClose(b.after) else null;
+            if (closes) |c| if (!std.mem.eql(u8, c, first)) tails.appendAssumeCapacity(try allocator.dupe(u8, c));
+        }
+    }
 
     const owned_sep = try allocator.dupe(u8, sep);
     errdefer allocator.free(owned_sep);
-    const owned_tail = try allocator.dupe(u8, tail);
-    errdefer allocator.free(owned_tail);
-    const call = try std.mem.concat(allocator, u8, &.{ head, name orelse "", if (name != null) tail else "" });
-    return .{ .sep = owned_sep, .call = call, .name_tail = owned_tail };
+    const one = tails.items.len == 1;
+    const call = try std.mem.concat(allocator, u8, &.{ head, if (one) name orelse "" else "", if (one and name != null) tails.items[0] else "" });
+    errdefer allocator.free(call);
+    return .{ .sep = owned_sep, .call = call, .name_tails = try tails.toOwnedSlice(allocator) };
 }
 
 fn nameByte(c: u8) bool {
@@ -1655,6 +1758,8 @@ const RenderContext = struct {
     /// The request's tool list as JSON text; null or empty, the template gets no `tools`.
     tools: ?[]const u8 = null,
     settings: *const Settings,
+    /// The facts of the template rendering this context: `renderEngine` sets them.
+    facts: *const Facts = &no_facts,
 
     fn context(self: *const RenderContext) template_engine.Context {
         return .{ .ptr = self, .build = build };
@@ -1669,7 +1774,7 @@ const RenderContext = struct {
         var tools: ?template_engine.Value = null;
         if (self.tools) |t| if (t.len > 0) {
             tools = try template_engine.readJson(arena, t, "tools", .input, diag);
-            _ = try fillToolDefKeys(arena, tools.?);
+            _ = try fillToolDefKeys(arena, tools.?, self.facts);
         };
         // The turn tokens are the pack's; the effort word is what the client sent, or a word derived from it.
         const extra = try template_engine.fromInput(arena, self.settings.*, .template, "extra context", diag);
@@ -1680,18 +1785,14 @@ const RenderContext = struct {
     }
 };
 
-/// Fill the OPTIONAL tool-definition keys a template may dump blindly, in the parsed tool list.
+/// Fill the OPTIONAL tool-definition keys a template reads by name (`facts`), in the parsed tool list.
 ///
-/// `description` is optional in OpenAI's function schema and a no-arg tool
-/// needs no `parameters`, but a template that renders `fn.description | tojson`
-/// or `tool | tojson` wholesale hits `tojson` on Undefined, which is a
-/// jinja RAISE — i.e. a silent `fallbackFormatChat` with no tools preamble at
-/// all, for a request that was perfectly legal. Whether a key was added.
-///
-/// Defaults are the empty ones: `""` says the client supplied no description,
-/// and an empty-properties object is what a no-argument tool means. Neither
-/// invents a capability the client did not declare.
-fn fillToolDefKeys(arena: std.mem.Allocator, tools: template_engine.Value) error{OutOfMemory}!bool {
+/// `description` is optional in OpenAI's function schema and a no-arg tool needs no `parameters`, but a template that
+/// renders `fn.description | tojson` hits `tojson` on Undefined, a jinja RAISE. A template that never reads the key
+/// (one that dumps `tool | tojson` whole) gets the client's tool as sent, as transformers renders it. Whether a key
+/// was added. The defaults are the empty ones: `""` says the client gave no description, and an empty-properties
+/// object is what a no-argument tool means.
+fn fillToolDefKeys(arena: std.mem.Allocator, tools: template_engine.Value, facts: *const Facts) error{OutOfMemory}!bool {
     if (tools != .list) return false;
     var changed = false;
     for (tools.list.items.items) |tool| {
@@ -1699,11 +1800,11 @@ fn fillToolDefKeys(arena: std.mem.Allocator, tools: template_engine.Value) error
         const function = dictField(tool.dict, "function") orelse continue;
         if (function != .dict) continue;
         const d = function.dict;
-        if (dictField(d, "description") == null) {
+        if (facts.readsAttribute("description") and dictField(d, "description") == null) {
             try d.entries.append(arena, .{ .key = .plain("description"), .value = .plain("") });
             changed = true;
         }
-        if (dictField(d, "parameters") == null) {
+        if (facts.readsAttribute("parameters") and dictField(d, "parameters") == null) {
             try d.entries.append(arena, .{ .key = .plain("parameters"), .value = try emptyParameters(arena) });
             changed = true;
         }
@@ -2168,7 +2269,7 @@ test "renderChatTemplate: a tool with no description/parameters still renders (n
     // OpenAI's schema makes `description` optional and a no-arg tool needs no
     // `parameters`, but a template that dumps those keys through `tojson` RAISES
     // on Undefined and fell back to ChatML with no tools preamble at all. The
-    // defaults are filled for ALL templates.
+    // defaults are filled for a template that reads those keys.
     const allocator = testing.allocator;
     var config = ChatConfig{
         .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
@@ -2199,13 +2300,20 @@ test "renderChatTemplate: a tool with no description/parameters still renders (n
     var fill_arena = std.heap.ArenaAllocator.init(allocator);
     defer fill_arena.deinit();
     const fa = fill_arena.allocator();
-    try testing.expect(!try fillToolDefKeys(fa, try template_engine.fromJson(fa, complete, .input)));
+    var diag: template_engine.Diagnostic = .{};
+    var reads = try template_engine.Template.compile(allocator, "{% for t in tools %}{{ t.function.description | tojson }}{{ t.function.parameters | tojson }}{% endfor %}", &diag);
+    defer reads.deinit();
+    try testing.expect(!try fillToolDefKeys(fa, try template_engine.fromJson(fa, complete, .input), &reads.facts));
     // Only the missing keys are added, and only to the function that lacks them.
     const partial =
         \\[{"type":"function","function":{"name":"a","description":"d"}},{"type":"function","function":{"name":"b","description":"e","parameters":{"type":"object"}}}]
     ;
+    // Qwen3.8 dumps each tool whole: it reads neither key, so nothing is added and the tool renders as sent.
+    try config.compile();
+    defer config.dropCompiled();
+    try testing.expect(!try fillToolDefKeys(fa, try template_engine.fromJson(fa, partial, .input), config.facts()));
     const filled = try template_engine.fromJson(fa, partial, .input);
-    try testing.expect(try fillToolDefKeys(fa, filled));
+    try testing.expect(try fillToolDefKeys(fa, filled, &reads.facts));
     var text = std.ArrayList(u8).empty;
     try test_json.writeValue(fa, &text, filled);
     try testing.expectEqualStrings("[{\"type\":\"function\",\"function\":{\"name\":\"a\",\"description\":\"d\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}," ++
@@ -2470,10 +2578,12 @@ test "renderChatTemplate: a forced tool_choice reaches templates that render too
 
 test "forcedCallText reads each family's call markup from its own template" {
     const allocator = testing.allocator;
-    const Case = struct { tpl: []const u8, sep: []const u8, required: []const u8, named: []const u8, name_tail: []const u8 };
+    const Case = struct { tpl: []const u8, sep: []const u8, required: []const u8, named: []const u8, name_tails: []const []const u8 };
     const cases = [_]Case{
-        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .sep = "\n\n", .required = "<tool_call>\n<function=", .named = "<tool_call>\n<function=get_time>\n", .name_tail = ">\n" },
-        .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .sep = "", .required = "<tool_call><function=", .named = "<tool_call><function=get_time>", .name_tail = ">" },
+        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .sep = "\n\n", .required = "<tool_call>\n<function=", .named = "<tool_call>\n<function=get_time>\n", .name_tails = &.{">\n"} },
+        .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .sep = "", .required = "<tool_call><function=", .named = "<tool_call><function=get_time>", .name_tails = &.{">"} },
+        // A tag follows the name: a call with arguments writes `<arg_key>`, one without closes at once, so the name has two tails.
+        .{ .tpl = @embedFile("fixtures/glm53_chat_template.jinja"), .sep = "", .required = "<tool_call>", .named = "<tool_call>", .name_tails = &.{ "<arg_key>", "</tool_call>" } },
     };
     for (cases) |c| {
         var config = ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
@@ -2481,7 +2591,8 @@ test "forcedCallText reads each family's call markup from its own template" {
         defer any.deinit(allocator);
         try testing.expectEqualStrings(c.sep, any.sep);
         try testing.expectEqualStrings(c.required, any.call);
-        try testing.expectEqualStrings(c.name_tail, any.name_tail);
+        try testing.expectEqual(c.name_tails.len, any.name_tails.len);
+        for (c.name_tails, any.name_tails) |want, got| try testing.expectEqualStrings(want, got);
         var one = (try forcedCallText(allocator, &config, "get_time")).?;
         defer one.deinit(allocator);
         try testing.expectEqualStrings(c.sep, one.sep);
@@ -2490,6 +2601,24 @@ test "forcedCallText reads each family's call markup from its own template" {
     // No think block to anchor on: nothing is forced.
     var plain = ChatConfig{ .chat_template = "{% for message in messages %}{{ message.content }}{% endfor %}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
     try testing.expect(try forcedCallText(allocator, &plain, null) == null);
+}
+
+test "answerSeparator reads what each family's template writes between a closed thought and its answer" {
+    const allocator = testing.allocator;
+    const Case = struct { tpl: []const u8, sep: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .sep = "\n\n" },
+        .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .sep = "" },
+        .{ .tpl = @embedFile("fixtures/glm53_chat_template.jinja"), .sep = "" },
+        .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .sep = "" },
+        .{ .tpl = "{% for message in messages %}{{ message.content }}{% endfor %}", .sep = null },
+    };
+    for (cases) |c| {
+        var config = ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+        const got = try answerSeparator(allocator, &config);
+        defer if (got) |g| allocator.free(g);
+        if (c.sep) |want| try testing.expectEqualStrings(want, got.?) else try testing.expect(got == null);
+    }
 }
 
 test "renderChatTemplate: a continuation keeps the client's own prefill, not a forced tool_choice" {
@@ -4137,6 +4266,30 @@ test "loadChatConfig: the model type the load parsed picks the pin, and config.j
     try testing.expect(own.image_placeholder == null);
 }
 
+test "loadChatConfig: a pack's chat_template.jinja outranks the copy in tokenizer_config.json, and a pin outranks both" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"inline copy\",\"eos_token\":\"<e>\"}" });
+    var inline_only = try loadChatConfig(io, testing.allocator, root, null);
+    defer inline_only.deinit();
+    try testing.expectEqualStrings("inline copy", inline_only.chat_template);
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat_template.jinja", .data = "file copy" });
+    var both = try loadChatConfig(io, testing.allocator, root, null);
+    defer both.deinit();
+    try testing.expectEqualStrings("file copy", both.chat_template);
+    var peeked = try peekChatConfig(io, testing.allocator, root, null);
+    defer peeked.deinit();
+    try testing.expectEqualStrings("file copy", peeked.chat_template);
+    if (arch_chat.pinOf("deepseek_v41") != null) {
+        var pinned = try loadChatConfig(io, testing.allocator, root, "deepseek_v41");
+        defer pinned.deinit();
+        try testing.expectEqualStrings(@embedFile("fixtures/dsv41_chat_template.jinja"), pinned.chat_template);
+    }
+}
+
 test "loadChatConfig: bos and eos in HF's AddedToken form read their content, and null is no token" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -4281,7 +4434,7 @@ test "chat: a probe renders once per template and settings, and answers as a fre
             const extra = &settings;
             for ([_]?*const Tpl{ &compiled.main, if (compiled.late_system) |*l| l else null }) |maybe| {
                 const tpl = maybe orelse continue;
-                for ([_]Probe{ .tool_content, .late_system, .call }) |probe| {
+                for ([_]Probe{ .tool_content, .late_system, .call, .call_empty, .answer }) |probe| {
                     const fresh = try renderProbeFresh(a, tpl, probe, extra);
                     defer if (fresh) |f| a.free(f);
                     var count = Count{};
@@ -4636,7 +4789,7 @@ test "formatChat: running out of memory at any allocation is OutOfMemory or the 
 
 test "renderChatSpans and forcedCallText: running out of memory at any allocation leaks nothing" {
     const Case = struct { tpl: ?[]const u8, model_type: ?[]const u8 };
-    for ([_]Case{ .{ .tpl = arch_fx.qwen_template, .model_type = arch_fx.qwen_model_type }, .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .model_type = "deepseek_v41" }, .{ .tpl = sweep_plain_template, .model_type = null } }) |c| {
+    for ([_]Case{ .{ .tpl = arch_fx.qwen_template, .model_type = arch_fx.qwen_model_type }, .{ .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .model_type = "deepseek_v41" }, .{ .tpl = arch_fx.glm_template, .model_type = arch_fx.glm_model_type }, .{ .tpl = sweep_plain_template, .model_type = null } }) |c| {
         var fa = FailOnce{ .child = testing.allocator };
         const A = fa.allocator();
         var cc = ChatConfig{ .chat_template = c.tpl orelse continue, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = A, .model_type = c.model_type };
@@ -4652,9 +4805,8 @@ test "renderChatSpans and forcedCallText: running out of memory at any allocatio
                     break :blk null;
                 };
                 if (fc) |f| {
-                    A.free(f.sep);
-                    A.free(f.call);
-                    A.free(f.name_tail);
+                    var owned = f;
+                    owned.deinit(A);
                 }
                 fa.disarm();
                 if (!fa.induced) break;
@@ -4957,7 +5109,7 @@ test "templateProbeRender: memoized probes answer as fresh renders for every eff
                 const settings = try templateSettings(a, &cc, thinking, effort);
                 for ([_]?*const Tpl{ &compiled.main, if (compiled.late_system) |*l| l else null }) |maybe| {
                     const tpl = maybe orelse continue;
-                    for ([_]Probe{ .tool_content, .late_system, .call }) |probe| {
+                    for ([_]Probe{ .tool_content, .late_system, .call, .call_empty, .answer }) |probe| {
                         const fresh = try renderProbeFresh(a, tpl, probe, &settings);
                         defer if (fresh) |f| a.free(f);
                         const got = try templateProbeRender(a, tpl, probe, &settings);

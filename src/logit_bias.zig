@@ -37,7 +37,7 @@ fn add(a: std.mem.Allocator, out: *std.ArrayList(Bias), kind: []const u8, target
         return appendId(a, out, id, delta, scope, vocab);
     }
     if (std.mem.eql(u8, kind, "token")) {
-        const id = tok.vocab.get(target) orelse return error.LogitBiasUnknownToken;
+        const id = tok.tokenId(target) orelse return error.LogitBiasUnknownToken;
         return appendId(a, out, id, delta, scope, vocab);
     }
     if (!std.mem.eql(u8, kind, "word")) return error.LogitBiasUnknownKind;
@@ -169,11 +169,9 @@ const FakeTokenizer = struct {
         for (words, 0..) |w, i| if (std.mem.eql(u8, w, word)) return a.dupe(u32, &.{@intCast(i)});
         return a.dupe(u32, &.{ 0, 1 });
     }
-    vocab: struct {
-        pub fn get(_: @This(), word: []const u8) ?u32 {
-            return if (std.mem.eql(u8, word, "literal")) 4 else null;
-        }
-    } = .{},
+    pub fn tokenId(_: @This(), word: []const u8) ?u32 {
+        return if (std.mem.eql(u8, word, "literal")) 4 else null;
+    }
 };
 
 test "logit bias CPU: JSON and CSV expand targets and scopes identically" {

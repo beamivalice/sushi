@@ -16,6 +16,25 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Tool arguments keep the model's spelling**: a Qwen string argument such as `3.10`, `1.0` or `null` arrives as
   that string, a number keeps its digits (`0.50`, a 20-digit id), and a request's numbers and object `arguments` in
   chat history reach the template unchanged.
+- **A pack's `chat_template.jinja` outranks the template copied into its tokenizer_config.json**, as transformers loads
+  it, so an edited template file is the one that is served.
+- **GLM `tool_choice` `required` or a named function is now enforced as it is on Qwen**: the call opener and a declared
+  function name are committed while decoding instead of only asked for in the prompt, and a reasoning budget or a loop
+  that closes a thought writes the separator the model's own template writes before an answer.
+- **A reasoning budget never cuts a thought inside a character**: a thought trimmed to its token budget after the fact
+  no longer ends in a replacement character.
+- **A character cut off at the end of a text no longer crashes tokenization**: a lead byte whose continuation bytes
+  are missing reads as one byte instead of reaching undefined behaviour.
+- **A reply never writes a token its template prints only between turns**: Qwen and MiMo `<|im_start|>`, GLM
+  `<|system|>`, `[gMASK]` and `<sop>`, and DeepSeek `<｜User｜>` and `<｜Assistant｜>` can no longer be sampled, and their
+  text in an earlier assistant turn is text.
+- **GLM no longer reads a client's `/nothink` as its token, and a load names what it ignores**: that text, and any
+  other added token's text, in a user, system or tool message is plain text on every model, and a pack load logs the
+  tokenizer.json parts the engine does not apply.
+- **A tool with no `description` or `parameters` reaches the prompt as sent**: the empty defaults are added only for
+  a template that reads those keys, so Qwen3.8 and GLM-5.3 prompts match transformers byte for byte.
+- **Qwen3.8 reads decomposed text as transformers does**: text a client sends in NFD (an `e` plus a combining accent,
+  Hangul jamo) is composed by the pack's NFC normalizer before it is encoded; a reply keeps its own bytes.
 - **The dashboard shows expert streaming**: for a model that streams its experts from the SSD, a new card shows how many
   routed experts were already in memory, the SSD read rate and the time spent waiting on it, and `/metrics` carries the
   same counters.

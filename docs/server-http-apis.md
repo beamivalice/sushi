@@ -148,7 +148,7 @@ answers while the weights load:
   leading run of a content part, inside its first token too (`streamContentLead`, `ContentStream`; a logprobs entry stays
   the sampled token, whole, on both), and a token's trailing whitespace until text follows (`ContentStream`). The held
   tail ships at the end of the reply unless the non-stream reply trims it: after a closed thought, or before tool
-  markup (`ContentStream.finish`). The format corpus pins it for any token split. A spent reasoning budget WITHHOLDS the rest of the thought; a tool-call reply, streamed or not,
+  markup (`ContentStream.finish`). The format corpus pins it for any token split. A spent reasoning budget WITHHOLDS the rest of the thought; a thought cut to a token budget after the fact ends on a whole character (`reasoningWithinBudget` drops the half a token cut); a tool-call reply, streamed or not,
   carries the pre-markup text (`visibleToolPreamble`; Responses lists it as a message item ahead of its `function_call`s,
   and stores it, so an input replay and a `previous_response_id` chain render the same prompt); a Responses stream's
   `usage` and `timings` come from `StreamingTokenStream.result`, the one place a stream's stats become a result; a non-stream disconnect reports `client_disconnect`, never
@@ -306,7 +306,8 @@ Chat and legacy completions accept `repetition_penalty` as an alias for `repeat_
 ## Reasoning budget
 
 Enforced at DECODE (`server.armThinkBound` → `SamplingParams.think_bound`, `scheduler.thinkBoundTick`): at the budget
-the early-stop line + the atomic closer commit as ONE multi-token forward (`commitForcedTokens`); the whole closed
+the early-stop line + the atomic closer + the separator the template writes before an answer (`chat.answerSeparator`:
+`\n\n` on Qwen, none on GLM, so the turn reads back as the template writes it) commit as ONE multi-token forward (`commitForcedTokens`); the whole closed
 thought is delivered. Every decode tick checks it with the loop stop (`loopGuardTick`), the plain batched tick too
 (`batchedTickRows`): skipped there, a budget under `--max-concurrent` overran by up to ~2.5k tokens while its slot
 batched plain. Guard: `tests/test_reasoning_budget_stream.sh`. Effort budgets = pi's ladder

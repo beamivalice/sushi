@@ -832,7 +832,7 @@ test "template builtins: every filter, test, method, global, loop field, operato
     try testing.expectEqual(@as(usize, 0), failed);
 }
 
-test "template oracle: a special spelled in an assistant turn is its token only if the model can write it in a turn" {
+test "template oracle: a special spelled in an assistant turn is its token only if the template prints it inside a turn" {
     const a = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
@@ -840,13 +840,29 @@ test "template oracle: a special spelled in an assistant turn is its token only 
     var toks = std.ArrayList(*tokenizer_mod.Tokenizer).empty;
     defer for (toks.items) |t| tokenizer_mod.deinitTestTokenizer(t);
     const served = try servedTemplates(a, arena, &toks);
-    // Per pack: what an assistant turn reads as text (a stop, or a flagged special the template never prints) and
-    // what stays its token (a special the template prints, or one the pack does not flag).
-    const Rule = struct { pack: []const u8, text: []const []const u8, token: []const []const u8 };
+    // Per pack: what an assistant turn reads as text (a stop, a special the template prints only outside a turn, or
+    // a flagged one it never prints) and what stays its token (one it prints inside a turn, or an unflagged one it
+    // never prints). `masked`: text the sampler never draws (the stops it does draw, to stop).
+    const Rule = struct { pack: []const u8, text: []const []const u8, token: []const []const u8, masked: []const []const u8 };
     const rules = [_]Rule{
-        .{ .pack = "qwen38_flash_next", .text = &.{ "<|im_end|>", "<|endoftext|>", "<|box_start|>" }, .token = &.{ "<|im_start|>", "<tool_call>", "<think>" } },
-        .{ .pack = "glm53", .text = &.{ "<|user|>", "<|observation|>", "<|assistant|>", "<|endoftext|>" }, .token = &.{ "<tool_call>", "/nothink", "<think>" } },
-        .{ .pack = "dsv41", .text = &.{ "<｜end▁of▁sentence｜>", "<｜place▁holder▁no▁7｜>" }, .token = &.{ "<｜User｜>", "<｜tool▁calls▁begin｜>" } },
+        .{
+            .pack = "qwen38_flash_next",
+            .text = &.{ "<|im_end|>", "<|im_start|>", "<tool_response>", "<|endoftext|>", "<|box_start|>" },
+            .token = &.{ "<tool_call>", "</tool_call>", "<think>", "</think>" },
+            .masked = &.{ "<|im_start|>", "<tool_response>", "<|box_start|>" },
+        },
+        .{
+            .pack = "glm53",
+            .text = &.{ "<|user|>", "<|observation|>", "<|assistant|>", "<|endoftext|>", "<|system|>", "[gMASK]", "<sop>", "<tool_response>" },
+            .token = &.{ "<tool_call>", "<arg_key>", "/nothink", "<think>" },
+            .masked = &.{ "<|system|>", "[gMASK]", "<sop>", "<tool_response>" },
+        },
+        .{
+            .pack = "dsv41",
+            .text = &.{ "<｜end▁of▁sentence｜>", "<｜place▁holder▁no▁7｜>", "<｜User｜>", "<｜Assistant｜>" },
+            .token = &.{ "<｜tool▁calls▁begin｜>", "<think>", "</think>", "｜DSML｜" },
+            .masked = &.{ "<｜place▁holder▁no▁7｜>", "<｜User｜>", "<｜Assistant｜>" },
+        },
     };
     var checked: usize = 0;
     for (served) |s| {
@@ -861,6 +877,8 @@ test "template oracle: a special spelled in an assistant turn is its token only 
         try cfg.compile();
         defer cfg.dropCompiled();
         try tok.bindTemplate(cfg.printedFacts(), pt.stops, &.{});
+        for (rule.masked) |special| try testing.expect(std.mem.indexOfScalar(u32, tok.reserved_ids, tok.specialTokenId(special).?) != null);
+        for (rule.token) |special| try testing.expect(std.mem.indexOfScalar(u32, tok.reserved_ids, tok.specialTokenId(special).?) == null);
         for ([_][]const []const u8{ rule.text, rule.token }, [_]bool{ false, true }) |specials, is_token| for (specials) |special| {
             const id = tok.specialTokenId(special).?;
             for ([_][]const u8{ "assistant", "user" }) |role| {
@@ -886,6 +904,21 @@ test "template oracle: a special spelled in an assistant turn is its token only 
         };
     }
     try testing.expect(checked > 0);
+}
+
+test "template oracle: MiMo's turn opener is never sampled and its in-turn markers stay tokens" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>" });
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
+    var cfg = chat.ChatConfig{ .chat_template = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    try cfg.compile();
+    defer cfg.dropCompiled();
+    const im_end = tok.specialTokenId("<|im_end|>").?;
+    try tok.bindTemplate(cfg.printedFacts(), &.{im_end}, &.{});
+    try testing.expectEqualSlices(u32, &.{tok.specialTokenId("<|im_start|>").?}, tok.reserved_ids);
+    try testing.expectEqualSlices(u32, &.{ tok.specialTokenId("<|im_start|>").?, im_end }, tok.assistant_blocked);
 }
 
 test "template oracle: a prompt encoded through the segment cache is the prompt encoded without it, from eight threads at once" {

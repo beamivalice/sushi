@@ -156,7 +156,9 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   word in the text may sit in a comment or a comparison, so the server asks the compiled template's facts
   (`chat.asks`). It matches names, not data flow: a copy under another name (`isIncludeStub`'s trimmed `t`) passes.
   `template-unchecked-utf8` flags `Utf8View.initUnchecked` under `src/template/`: text walks go through the checked
-  `value.codepoints`. `json-unchecked-shape` flags, outside test code (tests, `*_test.zig`, a private fn only tests
+  `value.codepoints`. `utf8-decode-raw` flags `std.unicode.utf8Decode*` outside `src/utf8_seq.zig`: it is `unreachable` on a
+  slice shorter than its lead byte announces (a character cut by a segment end), so every decode asks `utf8_seq.decode`.
+  `json-unchecked-shape` flags, outside test code (tests, `*_test.zig`, a private fn only tests
   call), `.object`/`.array`/`.string`/`.integer`/`.float`/`.bool` off `x.?`, `parsed*.value` or a map entry's
   `value_ptr` with no tag check of that receiver earlier in the fn, and an `@intCast(<expr>.integer)` with no bound
   on that integer earlier: valid JSON of another shape or range panics (`[]` as a `tokenizer_config.json`). It cannot

@@ -20,7 +20,8 @@
 #      model reads its own loop and resumes it; that is the death spiral.
 #      Streaming deliberately keeps the tail: a delta cannot be retracted.
 #
-# Needs any chat model — the prompt loops on all of them.
+# Needs any chat model. The chat prompt loops on all of them; the raw completions prompt loops only if the checkpoint
+# chooses to, and sections 3 and 4 then assert the invariant (the signal rides the cuts the log shows).
 
 set -u
 
@@ -123,23 +124,45 @@ PY
 grep -q "^finish_chunks 1$" "$LOG.usage"; check "finish_reason appears on exactly ONE chunk" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 grep -q "^usage_choices_empty True$" "$LOG.usage"; check "the usage chunk ships \"choices\":[]" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
+# A raw completions prompt loops only when the checkpoint chooses to, so sections 3 and 4 hold the invariant, not the
+# model's choice: finish_details rides a request exactly when the log shows a loop cut for it. A request the model
+# answered without looping is noted and skipped; the signal itself is asserted on a loop in sections 1 and 2.
+COMPLETIONS_PROMPT="$SUSHI_NONCE ping pong ping pong ping pong ping pong ping pong ping pong"
+
+# loop_cuts <log offset taken before the request>: how many loop cuts the log shows since
+loop_cuts() { _sushi_tail_from "$SUSHI_LOG" "$1" | grep -c "\[loop-stop\]"; }
+
 # ── 3. completions, non-streaming ────────────────────────────────────────
 echo "[3/5] /v1/completions non-streaming"
+OFFSET=$(_sushi_size "$SUSHI_LOG")
 CMPL=$(curl -s "$BASE/v1/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"$SUSHI_NONCE ping pong ping pong ping pong ping pong ping pong ping pong\",\"max_tokens\":3000,\"temperature\":0}")
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"$COMPLETIONS_PROMPT\",\"max_tokens\":3000,\"temperature\":0}")
+CUTS=$(loop_cuts "$OFFSET")
 echo "$CMPL" | grep -c '"finish_details":{"type":"repetition_loop"}' > "$LOG.cmpl"
-[ "$(cat "$LOG.cmpl")" -ge 1 ]; check "completions carries finish_details" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-echo "$CMPL" | grep -q '"finish_reason":"stop"'; check "completions finish_reason is \"stop\"" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+if [ "$CUTS" -gt 0 ]; then
+    [ "$(cat "$LOG.cmpl")" -ge 1 ]; check "completions carries finish_details when the log shows the cut" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+    echo "$CMPL" | grep -q '"finish_reason":"stop"'; check "completions finish_reason is \"stop\"" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+else
+    echo "  SKIP the model did not loop on this prompt (its choice); the signal is asserted by sections 1 and 2"
+    [ "$(cat "$LOG.cmpl")" -eq 0 ]; check "completions carries no finish_details when the log shows no cut" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+fi
 
 # ── 4. completions, streaming ────────────────────────────────────────────
 # Same usage-chunk contract as chat: with include_usage the usage rides its
 # own empty-choices chunk, never the finish chunk.
 echo "[4/5] /v1/completions streaming"
+OFFSET=$(_sushi_size "$SUSHI_LOG")
 curl -sN "$BASE/v1/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"$SUSHI_NONCE ping pong ping pong ping pong ping pong ping pong ping pong\",\"max_tokens\":3000,\"temperature\":0,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"$COMPLETIONS_PROMPT\",\"max_tokens\":3000,\"temperature\":0,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" \
   > "$LOG.rawcmpl"
+CUTS=$(loop_cuts "$OFFSET")
 grep -c '"finish_details":{"type":"repetition_loop"}' "$LOG.rawcmpl" > "$LOG.cmplstream"
-[ "$(cat "$LOG.cmplstream")" -ge 1 ]; check "the completions final chunk carries finish_details" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+if [ "$CUTS" -gt 0 ]; then
+    [ "$(cat "$LOG.cmplstream")" -ge 1 ]; check "the completions final chunk carries finish_details when the log shows the cut" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+else
+    echo "  SKIP the model did not loop on this prompt (its choice); the signal is asserted by sections 1 and 2"
+    [ "$(cat "$LOG.cmplstream")" -eq 0 ]; check "the completions stream carries no finish_details when the log shows no cut" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+fi
 python3 - "$LOG.rawcmpl" <<'PY' > "$LOG.cmplusage"
 import json, sys
 usage_ok, finish = None, None
@@ -156,7 +179,9 @@ print("usage_choices_empty", usage_ok)
 print("finish_reason", finish)
 PY
 grep -q "^usage_choices_empty True$" "$LOG.cmplusage"; check "the completions usage chunk ships \"choices\":[]" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-grep -q "^finish_reason stop$" "$LOG.cmplusage"; check "streaming completions finish_reason is \"stop\"" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+if [ "$CUTS" -gt 0 ]; then
+    grep -q "^finish_reason stop$" "$LOG.cmplusage"; check "streaming completions finish_reason is \"stop\"" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+fi
 
 # ── 5. an ORDINARY response must be byte-unchanged ───────────────────────
 echo "[5/5] a normal answer says nothing new"

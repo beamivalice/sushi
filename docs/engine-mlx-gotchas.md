@@ -220,11 +220,19 @@ Found while holding the engine of our own to MLX's bytes ([engine-own-forward](e
   Exact token IDs matter: decoding back to the same text does **not** prove correct segmentation.
   Guards: hermetic cross-grammar BPE fixtures in `tokenizer.zig` + the format corpus;
   `tests/test_tokenizer_reference.sh` compares the three real tokenizer files to HF on CPU without loading weights.
-  Its synthetic inputs are normalized first to isolate Split/BPE: the older missing NFC-normalizer behavior on
-  decomposed text is a separate, still-open issue. `TOKENIZER_CASES_JSON` can add an already-normalized prompt pack.
+  Its synthetic inputs are normalized first to isolate Split/BPE. `TOKENIZER_CASES_JSON` can add an
+  already-normalized prompt pack.
+- **An NFC `normalizer` applies to request text only** (`Tokenizer.nfc_input`, `tokenizer_nfc.zig`; tables from
+  `scripts/gen-tokenizer-nfc.py`, oracle `src/fixtures/nfc_cases.json`): user, system and tool messages and tool
+  definitions are composed before they are encoded, as transformers does; assistant text keeps its bytes, so a reply
+  re-encodes to the ids it was generated as. The load says so in a `[load]` line.
 - GLM's Split regex is the plain Llama-3 pattern (contractions plus `\p{N}{1,3}`): the gpt2 path with `.letters` word
   rules and 3-digit groups. The BPE `ignore_merges` flag
-  (GLM sets it) is honoured in `bpeMerge`. The parity script covers GLM, Qwen and MiMo on code and tool-call text.
+  (GLM sets it) is honoured in `bpeMerge`, which reads `model.vocab` only: an added token is never in that map
+  (`Tokenizer.tokenId` looks a token up by text for `logit_bias`), or client text spelling one would become it.
+- A load names, in one `[load]` line, the tokenizer.json parts it does not apply: a `normalizer` other than NFC,
+  a `decoder` or `post_processor` other than ByteLevel, and a `pre_tokenizer` read with the legacy word rules. The
+  parity script covers GLM, Qwen and MiMo on code and tool-call text.
 - DeepSeek's `Scope.out` handle belongs to the caller: a `block` result chained through a loop in a scope must be
   adopted with `sc.keep` or it leaks every iteration (the DSpark draft leaked its stage outputs per round). Guard: the
   `DSpark requests leave the MLX active memory flat` test in `dsv41/dsv41_generate_test.zig`.

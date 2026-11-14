@@ -416,6 +416,22 @@ pub fn loopCloseBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
     return thinkBoundWithBudget(allocator, lm, tok, prompt_ids, enable_thinking, std.math.maxInt(u32), false);
 }
 
+/// What a budget-closed thought commits: the early-stop line, the closer, and the separator the template writes before
+/// an answer, so the turn reads back as the template would have written it. Null when the template writes no closer.
+fn thinkBoundForced(allocator: std.mem.Allocator, tok: *const Tokenizer, chat_config: *const chat_mod.ChatConfig, closer: u32) !?[]u32 {
+    const sep = (try chat_mod.answerSeparator(allocator, chat_config)) orelse return null;
+    defer allocator.free(sep);
+    const stop_ids = try tok.encode(allocator, THINK_BOUND_EARLY_STOP);
+    defer allocator.free(stop_ids);
+    const sep_ids = try tok.encode(allocator, sep);
+    defer allocator.free(sep_ids);
+    const forced = try allocator.alloc(u32, stop_ids.len + 1 + sep_ids.len);
+    @memcpy(forced[0..stop_ids.len], stop_ids);
+    forced[stop_ids.len] = closer;
+    @memcpy(forced[stop_ids.len + 1 ..], sep_ids);
+    return forced;
+}
+
 fn thinkBoundWithBudget(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: u32, announce: bool) ?mtp_plan.ThinkBound {
     if (!enable_thinking or lm.handle == null) return null;
     const closer = atomicTokenId(allocator, tok, think_tags.BARE_THINK_CLOSER) orelse {
@@ -426,14 +442,12 @@ fn thinkBoundWithBudget(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *co
     const opened = promptOpensThink(allocator, tok, prompt_ids);
     if (opener == null and !opened) return null;
 
-    const stop_ids = tok.encode(allocator, THINK_BOUND_EARLY_STOP) catch return null;
-    defer allocator.free(stop_ids);
-    const sep_ids = tok.encode(allocator, "\n\n") catch return null;
-    defer allocator.free(sep_ids);
-    const forced = allocator.alloc(u32, stop_ids.len + 1 + sep_ids.len) catch return null;
-    @memcpy(forced[0..stop_ids.len], stop_ids);
-    forced[stop_ids.len] = closer;
-    @memcpy(forced[stop_ids.len + 1 ..], sep_ids);
+    const chat_config = lm.chat_config orelse return null;
+    const closed = thinkBoundForced(allocator, tok, chat_config, closer) catch return null;
+    const forced = closed orelse {
+        if (announce) log.info("  reasoning budget {d}: the template writes no closer before an answer, delivery cap only\n", .{budget});
+        return null;
+    };
     if (announce) log.info("  reasoning budget {d}: enforced in-stream\n", .{budget});
     return .{ .budget = budget, .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
 }
@@ -487,11 +501,13 @@ pub fn armCallForce(
     else
         .answer;
 
+    // A name is followed by one of the template's tails: the model picks among them, so the name goes through `names`
+    // when `required` leaves it open or several tails may close it.
     var names: NameIds = .{};
     var armed = false;
     defer if (!armed) names.deinit(allocator);
-    if (name == null) {
-        names = nameIds(allocator, tok, tools_json orelse "[]", text.name_tail) catch return null;
+    if (name == null or text.name_tails.len > 1) {
+        names = nameIds(allocator, tok, name, tools_json orelse "[]", text.name_tails) catch return null;
         if (names.slices.len == 0) {
             log.info("  [tool-choice] forced call is prompt-only: no declared function to name\n", .{});
             return null;
@@ -499,8 +515,8 @@ pub fn armCallForce(
     }
     const sep_ids: []u32 = if (text.sep.len == 0) &.{} else tok.encode(allocator, text.sep) catch return null;
     defer if (sep_ids.len > 0) allocator.free(sep_ids);
-    const call_ids = (if (name) |n|
-        chat_mod.encodeCallText(allocator, tok, text.call[0 .. text.call.len - n.len - text.name_tail.len], n, text.name_tail)
+    const call_ids = (if (name != null and names.slices.len == 0)
+        chat_mod.encodeCallText(allocator, tok, text.call[0 .. text.call.len - name.?.len - text.name_tails[0].len], name.?, text.name_tails[0])
     else
         tok.encode(allocator, text.call)) catch return null;
     defer allocator.free(call_ids);
@@ -538,23 +554,23 @@ const NameIds = struct {
     }
 };
 
-/// Every declared function name followed by `tail`, tokenized.
-fn nameIds(allocator: std.mem.Allocator, tok: *const Tokenizer, tools_json: []const u8, tail: []const u8) !NameIds {
+/// `only`, else every declared function name, each followed by each of `tails`, tokenized.
+fn nameIds(allocator: std.mem.Allocator, tok: *const Tokenizer, only: ?[]const u8, tools_json: []const u8, tails: []const []const u8) !NameIds {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const declared = try tool_calls_mod.declaredToolNames(arena, tools_json);
-    const per_name = try arena.alloc([]u32, declared.len);
+    const declared: []const []const u8 = if (only) |n| &.{n} else try tool_calls_mod.declaredToolNames(arena, tools_json);
+    const per_name = try arena.alloc([]u32, declared.len * tails.len);
     var total: usize = 0;
-    for (declared, per_name) |n, *ids| {
+    for (declared, 0..) |n, i| for (tails, 0..) |tail, j| {
         const encoded = try chat_mod.encodeCallText(allocator, tok, "", n, tail);
         defer allocator.free(encoded);
-        ids.* = try arena.dupe(u32, encoded);
-        total += ids.len;
-    }
+        per_name[i * tails.len + j] = try arena.dupe(u32, encoded);
+        total += encoded.len;
+    };
     const flat = try allocator.alloc(u32, total);
     errdefer allocator.free(flat);
-    const slices = try allocator.alloc([]const u32, declared.len);
+    const slices = try allocator.alloc([]const u32, per_name.len);
     var at: usize = 0;
     for (per_name, slices) |ids, *slice| {
         @memcpy(flat[at..][0..ids.len], ids);
@@ -2767,7 +2783,23 @@ pub fn reasoningWithinBudget(allocator: std.mem.Allocator, tok: *const Tokenizer
     defer allocator.free(ids);
     const n: usize = @intCast(budget);
     if (ids.len <= n) return .{ .text = reasoning, .owned = false };
-    return .{ .text = try tok.decode(allocator, ids[0..n]), .owned = true };
+    const cut = try tok.decode(allocator, ids[0..n]);
+    const whole = wholeCharsLen(cut);
+    if (whole == cut.len) return .{ .text = cut, .owned = true };
+    defer allocator.free(cut);
+    return .{ .text = try allocator.dupe(u8, cut[0..whole]), .owned = true };
+}
+
+/// The length of `text` without a trailing character a token cut left half-written.
+fn wholeCharsLen(text: []const u8) usize {
+    var i = text.len;
+    while (i > text.len -| 3) {
+        i -= 1;
+        if (text[i] & 0xC0 == 0x80) continue;
+        const want = std.unicode.utf8ByteSequenceLength(text[i]) catch return text.len;
+        return if (i + want > text.len) i else text.len;
+    }
+    return text.len;
 }
 
 /// Will this request build the MTP head's cache? The admission bill prices the head's KV, state and QSA ring
@@ -3615,6 +3647,48 @@ test "reasoningWithinBudget cuts a thought at the budget and keeps a shorter one
     try std.testing.expectEqualStrings("aabb", over.text);
 }
 
+test "a budget-closed thought commits the separator its template writes before an answer" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
+    const closer = atomicTokenId(a, &tok, think_tags.BARE_THINK_CLOSER).?;
+    const Case = struct { tpl: ?[]const u8, sep: []const u8 };
+    for ([_]Case{
+        .{ .tpl = arch_fx.qwen_template, .sep = "\n\n" },
+        .{ .tpl = arch_fx.glm_template, .sep = "" },
+    }) |c| {
+        var cc = chat_mod.ChatConfig{ .chat_template = c.tpl orelse continue, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a };
+        try cc.compile();
+        defer cc.dropCompiled();
+        const forced = (try thinkBoundForced(a, &tok, &cc, closer)).?;
+        defer a.free(forced);
+        const text = try tok.decode(a, forced);
+        defer a.free(text);
+        const want = try std.mem.concat(a, u8, &.{ THINK_BOUND_EARLY_STOP, "</think>", c.sep });
+        defer a.free(want);
+        try std.testing.expectEqualStrings(want, text);
+    }
+}
+
+test "reasoningWithinBudget never cuts inside a character" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{});
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
+    const thought = "a\u{e9}\u{4e2d}\u{1F600}b";
+    const ids = try tok.encode(a, thought);
+    defer a.free(ids);
+    for (0..ids.len) |n| {
+        const cut = try reasoningWithinBudget(a, &tok, thought, @intCast(n));
+        defer if (cut.owned) a.free(cut.text);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(cut.text));
+        try std.testing.expect(std.mem.startsWith(u8, thought, cut.text));
+    }
+}
+
 test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     // #126: an idle server with zero models loaded and 21 MB RSS answered
     // "retry after current requests complete", which is unactionable advice
@@ -3677,7 +3751,7 @@ pub fn expectSurfaceForcesCall(tool_choice_json: []const u8, openai_tools: []con
     const a = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
-    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_start|>", "<|im_end|>" });
+    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_start|>", "<|im_end|>", "<arg_key>" });
     defer deinitTestTokenizer(&tok);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, a, tool_choice_json, .{});
@@ -3726,8 +3800,8 @@ pub fn expectSurfaceForcesCall(tool_choice_json: []const u8, openai_tools: []con
             }
             const text = try tok.decode(a, published.items);
             defer a.free(text);
-            // Qwen's template opens the thought in the prompt; MiMo's leaves the opener to the model.
-            const opener: []const u8 = if (thinking and f.sep.len == 0) "<think>" else "";
+            // Qwen's and GLM's templates open the thought in the prompt; MiMo's leaves the opener to the model.
+            const opener: []const u8 = if (thinking and f.leaves_opener) "<think>" else "";
             const want = if (thinking)
                 try std.mem.concat(a, u8, &.{ opener, "hmm</think>", f.sep, call })
             else
@@ -3738,7 +3812,7 @@ pub fn expectSurfaceForcesCall(tool_choice_json: []const u8, openai_tools: []con
     }
 }
 
-test "chat completions: a forced tool_choice is committed at the answer boundary on both families" {
+test "chat completions: a forced tool_choice is committed at the answer boundary on every family" {
     const tools =
         \\[{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}}}}},
         \\ {"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
@@ -3747,7 +3821,7 @@ test "chat completions: a forced tool_choice is committed at the answer boundary
     try expectSurfaceForcesCall("\"required\"", tools, null);
 }
 
-test "responses: a forced tool_choice is committed at the answer boundary on both families" {
+test "responses: a forced tool_choice is committed at the answer boundary on every family" {
     const a = std.testing.allocator;
     const wire =
         \\[{"type":"function","name":"get_time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}}}},

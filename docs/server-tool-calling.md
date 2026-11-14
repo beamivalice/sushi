@@ -38,13 +38,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   turn or thought boundary. The text itself is unchanged: a template reads what the client sent, U+FDD0 included.
   At each byte the scan takes the longest special recognised there, so a longer one that is not (it straddles two
   origins) hides neither a shorter one at its start nor one that starts inside it. An empty added token fails the load.
+  Added tokens stay out of the map the BPE merge reads, so a whole-word lookup (`ignore_merges`) cannot answer one.
   A media placeholder (`image_token_id`, `video_token_id`) is placed by the media path alone: the sampler masks it and
   an assistant turn's text of it is text (`bindTemplate`); the template's own stays its token.
 - **Assistant text**: the model's earlier output, so a special it can write stays its token and the next prompt holds
   the ids it generated. A stop (eos, an arch's turn opener) and a special the sampler masks are text there: the model
   never writes either inside a turn. `Tokenizer.bindTemplate` derives both sets once per load from the flagged
   specials, the template's facts and the stops; with no template nothing is masked and assistant text keeps every
-  special. Origins follow bytes through every builtin (`template.zig`'s builtin sweep pins it); a transform with no
+  special.
+- **Where the template prints an added token decides it, never its `special` flag** (`Tokenizer.framingIds`): from
+  the template's renders of every reply shape (`chat.assistantTurnRenders`: an answer, a thought, calls, an answer after
+  a tool result, thought on and off, with and without tools), a token printed only outside an assistant turn, or as the
+  token a turn starts with, is never sampled and is text in assistant history: Qwen and MiMo `<|im_start|>`, Qwen
+  `<tool_response>`, GLM `<|system|>`, `[gMASK]`, `<sop>`, DeepSeek `<｜User｜>`, `<｜Assistant｜>`. A token printed
+  inside a turn stays its token; one no render shows keeps the facts' answer. The load logs the masked ones. Origins follow bytes through every builtin (`template.zig`'s builtin sweep pins it); a transform with no
   byte-for-byte map (`tojson`, `indent`, `reverse`, a container's repr) takes the strictest origin of its input.
 - **Token reuse across turns** (`segment_cache.zig`): a segment, the text between two specials the encoder
   recognised, encodes to the same ids wherever it sits, so each loaded model keeps the ids of the segments it encoded
@@ -77,11 +84,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **The engine is `src/template/`, a Jinja2 renderer in Zig held to Python Jinja2**: `formatChat` calls it once per
   render through `chat.renderEngine` (`Template.render`: the compiled tree and a `Context` the caller builds in the
   render's own arena, once per render: the messages as `chat.templateMessages` shapes them, the request's tools read
-  once by the engine's `fromJson` (exact digits) with the optional keys `fillToolDefKeys` adds, and the settings of
+  once by the engine's `fromJson` (exact digits) with the optional `description`/`parameters` that `fillToolDefKeys`
+  adds only where the template reads that key by name (Qwen3.8 and GLM-5.3 dump a tool whole and get it as sent,
+  byte for byte as transformers renders it), and the settings of
   `chat.templateSettings`; no JSON text between server and engine, strings referenced, not copied; the prompt, or `TemplateSyntax`, `TemplateRaised`, `TemplateRuntime` with line, column and message
   out). A template compiles once, at load (`template.Template`, `ChatConfig.compiled`, the late-system form beside
   it): one that does not compile fails the load with `[load] chat template: line L column C: message`; a render only
-  reads the tree, on any thread. Each probe render (tool content, late system, forced call) is memoized on its
+  reads the tree, on any thread. Each probe render (tool content, late system, forced call, answer) is memoized on its
   compiled template by probe and settings (`ProbeMemo`: 256 entries, started over when full). It reads what
   jinja.cpp read (the filters, tests, methods, globals and loop fields of `src/template/builtins.zig`; the names only
   jinja.cpp served give its result, pinned in `jinja_cpp_only`); any other filter, test or statement (`include`,
@@ -185,7 +194,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   only the first two (`ast.bodyOf`, read by the renderer and by the parser). One shared scope
   rendered an earlier turn's thought into a reasoning-less assistant turn instead of `<think></think>`.
 - **A `chat_template` value can be a POINTER** (`{% include 'chat_template.jinja' %}`): `chat.isIncludeStub` reads it
-  as "no inline template" so the sidecar loads. Grep the log for `jinja` first.
+  as "no inline template" so the sidecar loads. Grep the log for `jinja` first. The template is picked as transformers
+  picks it: an arch's pinned template, else the pack's `chat_template.jinja`, else the copy in tokenizer_config.json.
 - A template can raise on OUR extra-context values: `templateSettings` sniffs the family; tool-call `arguments`
   stay OBJECTS (a history call whose arguments are empty, null, an array, a scalar or malformed text embeds `{}`:
   `arguments|items` on anything else raises into the silent fallback; an object that repeats a key passes as sent, and
@@ -286,6 +296,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   delimiter when one is named. For `required` the name is then one of the DECLARED names (each with its delimiter, as
   ids: a lone continuation is committed, a branch is a sample among its ids), since the model wrote `getTime` and
   `call: get_time` there. The arguments stay the model's; the parse chain and its valid-JSON invariant run unchanged.
+  The name is closed by the template's own next bytes, read from probe renders: a delimiter (`>\n`), or, where a tag
+  follows the name (GLM `<tool_call>NAME<arg_key>`, `NAME</tool_call>` without arguments), each tag that may follow, and
+  the name then goes through the sample among its ids with the tag as the last one. A template with nothing after the
+  name to read is prompt-only (`[tool-choice] forced call is prompt-only`), which no served template is.
 - **They are also prompt-level**: the instruction closes the last user turn (or opens one after tool results), only
   where the render keeps every byte it has without it (`keepsEveryByte`), so the prefix cache still serves it; Qwen3.8
   with `preserve_thinking` off drops the in-flight reasoning once a user turn follows, so there the force stands alone.

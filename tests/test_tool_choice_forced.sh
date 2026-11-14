@@ -16,7 +16,7 @@
 #      a hybrid: with thinking on only the call names are compared)
 #   4. no tool or think markup leaks into content or reasoning
 #   5. the log shows one `[tool-choice] forced call` line per forced request and
-#      no prompt-only fallback
+#      no prompt-only fallback: every served template can be forced, so the call is committed
 #   6. `none` yields no call; a named choice for an undeclared function is a 400
 #
 # Model choices (which function `required` picks, what the thought says) are
@@ -50,11 +50,6 @@ QUESTION = f"{NONCE} What time is it in Tokyo right now?"
 LEAKS = ("<tool_call>", "</tool_call>", "<function=", "</think>", "<think>")
 passed = failed = 0
 forced_requests = 0
-
-def prompt_only():
-    """True once any forced request fell back to the prompt instruction alone: this template has no call
-    markup to commit after the thought, so the call itself is the checkpoint's choice."""
-    return "forced call is prompt-only" in sushi_test.log_since()
 
 def check(label, ok, detail=""):
     global passed, failed
@@ -192,9 +187,7 @@ for surface, path, body, read, wire in SURFACES:
                 calls, content, reasoning = read(raw, stream)
                 replies[stream] = (calls, content, reasoning)
                 print(f"    {tag}: calls={[c[0] for c in calls]} reasoning={len(reasoning)}c content={len(content)}c")
-                if prompt_only():
-                    print("      (prompt-only force on this template: whether it calls is the checkpoint's choice)")
-                elif kind == "required":
+                if kind == "required":
                     check(f"{tag}: at least one call", len(calls) >= 1)
                 else:
                     check(f"{tag}: the first call is the named function", len(calls) >= 1 and calls[0][0] == kind, f"(calls {calls})")
@@ -226,7 +219,7 @@ for t in threads: t.join()
 forced_requests += 1
 for key, (status, raw) in results.items():
     check(f"concurrent {key}: 200", status == 200, f"(got {status})")
-if results.get("forced", (0,))[0] == 200 and not prompt_only():
+if results.get("forced", (0,))[0] == 200:
     calls = chat_read(results["forced"][1], False)[0]
     check("concurrent forced: the first call is the named function", len(calls) >= 1 and calls[0][0] == "get_weather", f"(calls {calls})")
 
@@ -234,10 +227,7 @@ log = sushi_test.log_since()
 armed = log.count("[tool-choice] forced call ")
 fallbacks = log.count("forced call is prompt-only")
 check(f"log: one arming line per forced request ({armed} for {forced_requests})", armed == forced_requests)
-if ARCH in ("qwen4_exp", "mimo_v2"):
-    check("log: no prompt-only fallback", fallbacks == 0)
-else:
-    print(f"[tool-choice] {fallbacks} prompt-only fallbacks on {ARCH}")
+check(f"log: no prompt-only fallback ({fallbacks})", fallbacks == 0)
 print(f"[tool-choice] {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
 PY

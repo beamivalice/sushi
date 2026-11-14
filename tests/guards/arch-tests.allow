@@ -45,6 +45,7 @@ MiMo EXL3 streaming imported slabs warm and reuse different layer rates
 MiMo MTP state bill is constant and follows retained storage
 MiMo honors the declared wired limit streamed or resident, without enabling long-context paths
 ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only
+Qwen pack: request text in NFD encodes as transformers encodes it, and an NFD reply keeps the ids it was generated as
 Qwen's late-system edit engages on any revision with the branch, and one without it folds
 Qwen3.8-Flash-Next thinks at medium effort by default, under the launch flag and the checkpoint's own word
 Responses: a stored chain and an input replay render the same Qwen prompt
@@ -200,6 +201,7 @@ streaming layout refusal explains MiMo repacking without assuming Qwen
 sushi coder GPU grouped binders cover qwen mimo and MTP
 sushi coder index recognizes grouped qwen4 and mimo layouts
 sushi coder uniform qwen4 and mimo banks preserve stored handles
+template oracle: MiMo's turn opener is never sampled and its in-turn markers stay tokens
 templateSettings: DeepSeek-V4.1 maps the client's effort onto the encoder's ladder
 the GDN state checkpoint bills four bytes per element at f32 and two at bf16; GLM's KDA state is f32 always
 the GPU expert pick matches the host on a sigmoid router's log-sigmoid logits, MiMo's E and K

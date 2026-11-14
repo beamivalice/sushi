@@ -2624,6 +2624,7 @@ test "format corpus: a forced call is the family's own call markup and parses ba
         .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .end = "<｜end▁of▁sentence｜>" },
+        .{ .name = "glm-5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja"), .end = "" },
     };
     const calls = [_]chat.ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
     const history = [_]chat.Message{
@@ -2639,16 +2640,18 @@ test "format corpus: a forced call is the family's own call markup and parses ba
         defer named.deinit(allocator);
         var any = (try chat.forcedCallText(allocator, &config, null)).?;
         defer any.deinit(allocator);
-        // `required` writes a declared name and its delimiter after the head: the named bytes exactly.
-        const required_named = try std.mem.concat(allocator, u8, &.{ any.call, "get_time", any.name_tail });
+        // `required` writes a declared name and its delimiter after the head: the named bytes exactly. Where several
+        // tails may close a name, the call stops at the head and the name goes through the tails.
+        const tail = any.name_tails[0];
+        const required_named = try std.mem.concat(allocator, u8, &.{ any.call, if (any.name_tails.len == 1) "get_time" else "", if (any.name_tails.len == 1) tail else "" });
         defer allocator.free(required_named);
         try testing.expectEqualStrings(named.call, required_named);
 
         const rendered = try chat.renderChatTemplate(allocator, &history, &config, null, null, true, null, false);
         defer allocator.free(rendered);
         const answer_at = std.mem.lastIndexOf(u8, rendered, "</think>").? + "</think>".len;
-        const answer = rendered[answer_at .. answer_at + std.mem.indexOf(u8, rendered[answer_at..], c.end).?];
-        const forced = try std.mem.concat(allocator, u8, &.{ named.sep, named.call });
+        const answer = rendered[answer_at .. answer_at + if (c.end.len == 0) rendered.len - answer_at else std.mem.indexOf(u8, rendered[answer_at..], c.end).?];
+        const forced = try std.mem.concat(allocator, u8, &.{ named.sep, named.call, if (any.name_tails.len == 1) "" else "get_time", if (any.name_tails.len == 1) "" else tail });
         defer allocator.free(forced);
         errdefer std.debug.print("\n[{s}] forced {s}\n answer {s}\n", .{ c.name, forced, answer });
         try testing.expect(std.mem.startsWith(u8, answer, forced));

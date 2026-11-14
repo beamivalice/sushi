@@ -2,6 +2,7 @@
 //! `repr`, and the conversion of JSON input as `json.loads` reads it.
 const std = @import("std");
 const builtin = @import("builtin");
+const utf8_seq = @import("../utf8_seq.zig");
 const ast = @import("ast.zig");
 const pyfloat = @import("tojson.zig");
 
@@ -967,7 +968,7 @@ fn writeStrRepr(w: *std.ArrayList(u8), gpa: Allocator, s: []const u8) Failure!vo
     try w.append(gpa, quote);
     var it = codepoints(s);
     while (it.nextCodepointSlice()) |cs| {
-        const cp = std.unicode.utf8Decode(cs) catch 0xFFFD;
+        const cp = utf8_seq.decode(cs) orelse 0xFFFD;
         switch (cp) {
             '\\' => try w.appendSlice(gpa, "\\\\"),
             '\n' => try w.appendSlice(gpa, "\\n"),

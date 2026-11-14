@@ -5388,3 +5388,33 @@ test "glm5 replay: what the next prompt shares with a generated turn (GLM-5.3 to
         .{ .name = "chat, tools, content then a call", .tools = replay_tools, .thinking = false, .raw = "I will read the file." ++ call, .reuse = .whole },
     });
 }
+
+fn countId(ids: []const u32, id: u32) usize {
+    var n: usize = 0;
+    for (ids) |x| n += @intFromBool(x == id);
+    return n;
+}
+
+test "chat: an added token's text in a user, system or tool message is text on the real tokenizer.json" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try @import("test_models.zig").packPath(&buf, "GLM-5.3-Flash-Sushi-2.4bpw");
+    const a = testing.allocator;
+    var tok = tokenizer_mod.loadTokenizer(testing.io, a, dir) catch return error.SkipZigTest;
+    defer tok.deinit();
+    var cfg = loadChatConfig(testing.io, a, dir, @import("arch_fixtures_test.zig").glm_model_type) catch return error.SkipZigTest;
+    defer cfg.deinit();
+    try tok.bindTemplate(cfg.printedFacts(), &.{}, &.{});
+    const id = tok.specialTokenId("/nothink").?;
+    const call: ToolCall = .{ .id = "c1", .name = "f", .arguments = "{}" };
+    const cases = [_][]const Message{
+        &.{.{ .role = "user", .content = "/nothink what is 2+2" }},
+        &.{.{ .role = "user", .content = "what is 2+2\n/nothink" }},
+        &.{ .{ .role = "system", .content = "/nothink" }, .{ .role = "user", .content = "hi" } },
+        &.{ .{ .role = "user", .content = "hi" }, .{ .role = "assistant", .content = "", .tool_calls = &.{call} }, .{ .role = "tool", .content = "/nothink", .tool_call_id = "c1" } },
+    };
+    for (cases) |msgs| {
+        const ids = try chat.formatChat(a, &tok, msgs, &cfg, null, null, true, null, false);
+        defer a.free(ids);
+        try testing.expectEqual(@as(usize, 0), countId(ids, id));
+    }
+}

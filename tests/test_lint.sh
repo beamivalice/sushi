@@ -231,6 +231,16 @@ tree
 printf '%s\n' 'const std = @import("std");' 'fn f(s: []const u8) void { _ = std.unicode.Utf8View.initUnchecked(s); }' > "$TMP/t/src/p.zig"
 expect_green "an unchecked UTF-8 view outside src/template/"
 
+# rule utf8-decode-raw
+tree
+printf '%s\n' 'const std = @import("std");' 'fn f(s: []const u8) u21 {' '    return std.unicode.utf8Decode(s) catch 0;' '}' > "$TMP/t/src/p.zig"
+expect_red "a raw utf8Decode on a slice" "src/p.zig:3:24 \[utf8-decode-raw\] f: std.unicode.utf8Decode: decode with utf8_seq.decode"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn decode(s: []const u8) ?u21 {' '    return std.unicode.utf8Decode(s) catch null;' '}' > "$TMP/t/src/utf8_seq.zig"
+printf '%s\n' 'const std = @import("std");' 'fn f(s: []const u8) usize {' '    return std.unicode.utf8ByteSequenceLength(s[0]) catch 1;' '}' > "$TMP/t/src/p.zig"
+expect_green "utf8_seq.zig itself, and utf8ByteSequenceLength elsewhere"
+
 # rule json-unchecked-shape
 tree
 printf '%s\n' 'const std = @import("std");' 'pub fn f(parsed: std.json.Parsed(std.json.Value)) ?std.json.Value {' '    const root = parsed.value.object;' \

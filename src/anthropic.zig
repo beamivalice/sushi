@@ -2001,7 +2001,7 @@ test "parseAnthropicOutputConfig: absent, non-object, and non-schema shapes stay
     try std.testing.expectEqualStrings("low", parseAnthropicOutputConfig(parsed.value.object).effort.?);
 }
 
-test "anthropic messages: a forced tool_choice is committed at the answer boundary on both families" {
+test "anthropic messages: a forced tool_choice is committed at the answer boundary on every family" {
     const a = std.testing.allocator;
     const wire =
         \\[{"name":"get_time","description":"Get time","input_schema":{"type":"object","properties":{"timezone":{"type":"string"}}}},

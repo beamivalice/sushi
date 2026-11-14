@@ -5,9 +5,21 @@ const unicode_props = @import("tokenizer_unicode.zig");
 const arch_chat = @import("arch/chat.zig");
 const template_engine = @import("template/template.zig");
 const segment_cache_mod = @import("segment_cache.zig");
+const utf8_seq = @import("utf8_seq.zig");
+const nfc = @import("tokenizer_nfc.zig");
 
 /// What a compiled chat template may print (`reservedOutputIds`).
 pub const TemplateFacts = template_engine.Facts;
+
+/// What a chat template prints and where, for `bindTemplate`: its facts, and its renders around assistant turns.
+pub const TemplatePrinting = struct {
+    facts: *const TemplateFacts,
+    /// Renders of an assistant turn, each from the first byte of its generation prompt. An added token the turn starts
+    /// with opens it; an added token after that is printed inside a turn.
+    turns: []const []const u8,
+    /// The same renders' text before those turns.
+    outside: []const []const u8,
+};
 
 const WordRules = enum { legacy, letters, letters_marks };
 
@@ -101,9 +113,10 @@ const SpecialScan = struct {
 };
 
 pub const Tokenizer = struct {
-    /// Token string -> id
+    /// The BPE model's own token string -> id (`model.vocab`): an added token is never in it, so client text that
+    /// spells one is read as text.
     vocab: std.StringHashMap(u32),
-    /// Id -> token string
+    /// Id -> token string, added tokens included (decode)
     id_to_token: std.AutoHashMap(u32, []const u8),
     /// (left_str, right_str) -> merge rank (lower = higher priority)
     merge_ranks: std.HashMap(MergePair, u32, MergePairContext, std.hash_map.default_max_load_percentage),
@@ -119,6 +132,9 @@ pub const Tokenizer = struct {
     word_rules: WordRules = .legacy,
     /// HF BPE `ignore_merges`: a word the vocab holds whole is that one token, before any merge.
     ignore_merges: bool = false,
+    /// tokenizer.json declares an NFC `normalizer`: request text is composed before it is encoded (`encodeSpans`);
+    /// assistant and template text keep their bytes, so a reply's text re-encodes to the ids it was generated as.
+    nfc_input: bool = false,
     /// Byte-to-unicode mapping for byte-level BPE (256 entries, index = byte value)
     byte_to_unicode: [256]u21,
     /// Unicode-to-byte reverse mapping
@@ -285,9 +301,16 @@ pub const Tokenizer = struct {
     /// sampler masks (`reservedOutputIds`), and the ids whose text inside an assistant message is text: the masked
     /// ones and the stops, none of which the model writes inside a turn. No template: none of either. A media
     /// placeholder (`media_ids`, 0 for none) is placed by the media path alone: it is in both, template or not.
-    pub fn bindTemplate(self: *Tokenizer, printed: ?*const TemplateFacts, stop_ids: []const u32, media_ids: []const u32) !void {
-        var reserved = std.ArrayList(u32).fromOwnedSlice(try reservedOutputIds(self.allocator, self.flagged_specials, printed, stop_ids));
+    pub fn bindTemplate(self: *Tokenizer, printed: ?TemplatePrinting, stop_ids: []const u32, media_ids: []const u32) !void {
+        var reserved = std.ArrayList(u32).fromOwnedSlice(try reservedOutputIds(self.allocator, self.flagged_specials, if (printed) |p| p.facts else null, stop_ids));
         errdefer reserved.deinit(self.allocator);
+        if (printed) |p| {
+            const framing = try self.framingIds(self.allocator, p);
+            defer self.allocator.free(framing);
+            const before = reserved.items.len;
+            for (framing) |id| if (std.mem.indexOfScalar(u32, stop_ids, id) == null) try reserved.append(self.allocator, id);
+            try self.logFraming(reserved.items[before..]);
+        }
         var blocked = std.ArrayList(u32).empty;
         errdefer blocked.deinit(self.allocator);
         if (printed != null) {
@@ -307,6 +330,53 @@ pub const Tokenizer = struct {
         if (self.assistant_blocked.len > 0) self.allocator.free(self.assistant_blocked);
         self.reserved_ids = reserved_owned;
         self.assistant_blocked = owned;
+    }
+
+    /// The added tokens the template prints only outside an assistant turn (its framing, as `<|im_start|>`): a
+    /// reply never writes one, so the sampler masks it and assistant text spells it as text. Keyed by where the
+    /// template prints a token, whatever its `special` flag; a token no render shows keeps the facts' answer.
+    fn framingIds(self: *const Tokenizer, allocator: std.mem.Allocator, p: TemplatePrinting) ![]u32 {
+        var seen = std.AutoArrayHashMapUnmanaged(u32, void).empty;
+        defer seen.deinit(allocator);
+        var inside = std.AutoArrayHashMapUnmanaged(u32, void).empty;
+        defer inside.deinit(allocator);
+        for (p.turns) |turn| {
+            const t = std.mem.trimStart(u8, turn, " \t\r\n");
+            var body = t;
+            var it = self.special_tokens.iterator();
+            var opener: ?u32 = null;
+            var opener_len: usize = 0;
+            while (it.next()) |e| if (e.key_ptr.len > opener_len and std.mem.startsWith(u8, t, e.key_ptr.*)) {
+                opener = e.value_ptr.*;
+                opener_len = e.key_ptr.len;
+            };
+            if (opener) |id| {
+                try seen.put(allocator, id, {});
+                body = t[opener_len..];
+            }
+            it = self.special_tokens.iterator();
+            while (it.next()) |e| if (e.key_ptr.len > 0 and std.mem.indexOf(u8, body, e.key_ptr.*) != null) try inside.put(allocator, e.value_ptr.*, {});
+        }
+        for (p.outside) |text| {
+            var it = self.special_tokens.iterator();
+            while (it.next()) |e| if (e.key_ptr.len > 0 and std.mem.indexOf(u8, text, e.key_ptr.*) != null) try seen.put(allocator, e.value_ptr.*, {});
+        }
+        var out = std.ArrayList(u32).empty;
+        errdefer out.deinit(allocator);
+        for (seen.keys()) |id| if (!inside.contains(id)) try out.append(allocator, id);
+        std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn logFraming(self: *const Tokenizer, framing: []const u32) !void {
+        if (framing.len == 0) return;
+        var line = std.ArrayList(u8).empty;
+        defer line.deinit(self.allocator);
+        for (framing, 0..) |id, i| {
+            if (i > 0) try line.appendSlice(self.allocator, " ");
+            try line.appendSlice(self.allocator, self.id_to_token.get(id) orelse "?");
+        }
+        log.info("[load] chat template: tokens printed only outside an assistant turn (never sampled, text in a reply): {s}\n", .{line.items});
     }
 
     fn sortUnique(ids: *std.ArrayList(u32)) void {
@@ -344,13 +414,40 @@ pub const Tokenizer = struct {
                 continue;
             };
             const end = pos + m.bytes.len;
-            if (pos > seg_start) try self.appendSegment(allocator, &result, bytes[seg_start..pos]);
+            if (pos > seg_start) try self.appendSpanSegment(allocator, &result, text, seg_start, pos);
             try result.append(allocator, m.id);
             pos = end;
             seg_start = pos;
         }
-        if (seg_start < bytes.len) try self.appendSegment(allocator, &result, bytes[seg_start..]);
+        if (seg_start < bytes.len) try self.appendSpanSegment(allocator, &result, text, seg_start, bytes.len);
         return result.toOwnedSlice(allocator);
+    }
+
+    /// `text`'s bytes `from..to` as one segment, each request-origin run of it in NFC when the tokenizer declares it.
+    fn appendSpanSegment(self: *const Tokenizer, allocator: std.mem.Allocator, out: *std.ArrayList(u32), text: template_engine.Str, from: usize, to: usize) !void {
+        const segment = text.bytes[from..to];
+        if (!self.nfc_input) return self.appendSegment(allocator, out, segment);
+        var composed = std.ArrayList(u8).empty;
+        defer composed.deinit(allocator);
+        var changed = false;
+        var at = from;
+        var run: usize = 0;
+        while (at < to) {
+            var end = to;
+            var origin = text.origin;
+            if (text.runs.len > 0) {
+                while (text.runs[run].end <= at) run += 1;
+                end = @min(to, text.runs[run].end);
+                origin = text.runs[run].origin;
+            }
+            const piece = text.bytes[at..end];
+            const normal = if (origin == .input) try nfc.normalize(allocator, piece) else null;
+            defer if (normal) |n| allocator.free(n);
+            if (normal != null) changed = true;
+            try composed.appendSlice(allocator, normal orelse piece);
+            at = end;
+        }
+        try self.appendSegment(allocator, out, if (changed) composed.items else segment);
     }
 
     /// The one origin of `text`'s bytes `from..to`, null when they straddle two. `run` is a cursor that only moves
@@ -381,6 +478,11 @@ pub const Tokenizer = struct {
     pub fn tokenHasNewline(self: *const Tokenizer, id: u32) bool {
         const token = self.id_to_token.get(id) orelse return false;
         return std.mem.indexOf(u8, token, "\u{010A}") != null;
+    }
+
+    /// The id a token's text names, for a client that picks a token by its text: the model's vocabulary, then the added tokens.
+    pub fn tokenId(self: *const Tokenizer, text: []const u8) ?u32 {
+        return self.vocab.get(text) orelse self.special_tokens.get(text);
     }
 
     /// Look up a special token ID by its string representation.
@@ -459,7 +561,7 @@ pub const Tokenizer = struct {
         while (i < token_str.items.len) {
             const cp_len = std.unicode.utf8ByteSequenceLength(token_str.items[i]) catch 1;
             const end = @min(i + cp_len, token_str.items.len);
-            const cp = std.unicode.utf8Decode(token_str.items[i..end]) catch {
+            const cp = utf8_seq.decode(token_str.items[i..end]) orelse {
                 try output.append(allocator, token_str.items[i]);
                 i += 1;
                 continue;
@@ -847,7 +949,7 @@ fn decodeCodepoint(text: []const u8, pos: usize) ?CpInfo {
     if (pos >= text.len) return null;
     const byte_len = std.unicode.utf8ByteSequenceLength(text[pos]) catch return CpInfo{ .cp = text[pos], .len = 1 };
     const end = @min(pos + byte_len, text.len);
-    const cp = std.unicode.utf8Decode(text[pos..end]) catch return CpInfo{ .cp = text[pos], .len = 1 };
+    const cp = utf8_seq.decode(text[pos..end]) orelse return CpInfo{ .cp = text[pos], .len = 1 };
     return CpInfo{ .cp = cp, .len = end - pos };
 }
 
@@ -1065,10 +1167,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
             if (obj.get("special")) |sv| {
                 if (sv == .bool and sv.bool) try flagged.append(allocator, .{ .id = id, .content = content_str });
             }
-            if (!tok.vocab.contains(content_str)) {
-                try tok.vocab.put(content_str, id);
-                try tok.id_to_token.put(id, content_str);
-            }
+            if (!tok.id_to_token.contains(id)) try tok.id_to_token.put(id, content_str);
         }
     }
     tok.flagged_specials = try flagged.toOwnedSlice(allocator);
@@ -1092,8 +1191,47 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         tok.word_rules = wordRulesFromPreTokenizer(pt);
     }
     tok.ignore_merges = if (model_obj.get("ignore_merges")) |v| v == .bool and v.bool else false;
+    tok.nfc_input = if (declaredNode(root, "normalizer")) |n| std.mem.eql(u8, componentType(n), "NFC") else false;
+    if (tok.nfc_input) log.info("[load] tokenizer.json normalizer NFC: applied to request text, never to a reply\n", .{});
+    const unapplied = try unappliedComponents(allocator, root, &tok);
+    defer allocator.free(unapplied);
+    if (unapplied.len > 0) log.info("[load] tokenizer.json components the engine does not apply: {s}\n", .{unapplied});
     try tok.indexSpecials();
     return tok;
+}
+
+fn declaredNode(root: std.json.ObjectMap, key: []const u8) ?std.json.Value {
+    const v = root.get(key) orelse return null;
+    return if (v == .null) null else v;
+}
+
+fn componentType(node: std.json.Value) []const u8 {
+    if (node != .object) return "unnamed";
+    const ty = node.object.get("type") orelse return "unnamed";
+    return if (ty == .string) ty.string else "unnamed";
+}
+
+/// The pipeline parts a tokenizer.json declares that this reader does not honour: it encodes byte-level BPE with
+/// the word rules it recognised and decodes byte-level, whatever the file says.
+fn unappliedComponents(allocator: std.mem.Allocator, root: std.json.ObjectMap, tok: *const Tokenizer) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    if (declaredNode(root, "normalizer")) |n| if (!tok.nfc_input) try appendComponent(allocator, &out, "normalizer", componentType(n));
+    if (tok.word_rules == .legacy and tok.pretok_style == .gpt2) {
+        const ty = if (declaredNode(root, "pre_tokenizer")) |pt| componentType(pt) else "absent";
+        try appendComponent(allocator, &out, "pre_tokenizer (read with the legacy word rules)", ty);
+    }
+    for ([_][]const u8{ "decoder", "post_processor" }) |key| {
+        if (declaredNode(root, key)) |c| {
+            if (!std.mem.eql(u8, componentType(c), "ByteLevel")) try appendComponent(allocator, &out, key, componentType(c));
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendComponent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8, ty: []const u8) !void {
+    if (out.items.len > 0) try out.appendSlice(allocator, "; ");
+    try out.print(allocator, "{s} {s}", .{ key, ty });
 }
 
 /// Digits per pre-token from the tokenizer.json `pre_tokenizer` spec: a
@@ -1983,7 +2121,7 @@ test "encodeSpans: a special's text is its token only where every byte of it is 
     // The template prints `<s>`; `<t>` is flagged and never printed, so the sampler masks it.
     var t = try template_engine.Template.compile(a, "{{ '<s>' }}", &diag);
     defer t.deinit();
-    try tok.bindTemplate(&t.facts, &.{}, &.{});
+    try tok.bindTemplate(.{ .facts = &t.facts, .turns = &.{}, .outside = &.{} }, &.{}, &.{});
     const Run = template_engine.Run;
     const Case = struct { bytes: []const u8, runs: []const Run, want: []const u32 };
     const cases = [_]Case{
@@ -2013,13 +2151,29 @@ test "bindTemplate: the sampler masks the flagged specials the template never pr
     var diag: template_engine.Diagnostic = .{};
     var t = try template_engine.Template.compile(a, "{{ '<s>' }}", &diag);
     defer t.deinit();
-    try tok.bindTemplate(&t.facts, &.{9}, &.{});
+    try tok.bindTemplate(.{ .facts = &t.facts, .turns = &.{}, .outside = &.{} }, &.{9}, &.{});
     try testing.expectEqualSlices(u32, &.{10}, tok.reserved_ids);
     try testing.expectEqualSlices(u32, &.{ 9, 10 }, tok.assistant_blocked);
     // No template: nothing masked, and assistant text keeps every special, as before templates were read.
     try tok.bindTemplate(null, &.{9}, &.{});
     try testing.expectEqual(@as(usize, 0), tok.reserved_ids.len);
     try testing.expectEqual(@as(usize, 0), tok.assistant_blocked.len);
+}
+
+test "bindTemplate: a token the template prints only outside an assistant turn is masked and is text in a reply, flagged or not" {
+    const a = testing.allocator;
+    var tok = try spanTestTokenizer(a);
+    defer tok.deinit();
+    var diag: template_engine.Diagnostic = .{};
+    var t = try template_engine.Template.compile(a, "{{ '<s>' }}{{ '<t>' }}{{ '<u>' }}", &diag);
+    defer t.deinit();
+    // `<s>` opens every turn and frames the user's; `<t>` (flagged) and `<u>` (not) are printed inside a turn.
+    try tok.bindTemplate(.{ .facts = &t.facts, .turns = &.{ "<s>a\n", "\n<s>a\n<t>x<u>" }, .outside = &.{"<s>user\nhi<u>"} }, &.{}, &.{});
+    try testing.expectEqualSlices(u32, &.{9}, tok.reserved_ids);
+    try testing.expectEqualSlices(u32, &.{9}, tok.assistant_blocked);
+    // A turn that starts with no added token has no opener: every token in it is printed inside a turn.
+    try tok.bindTemplate(.{ .facts = &t.facts, .turns = &.{"A: <s>"}, .outside = &.{"<s>"} }, &.{}, &.{});
+    try testing.expectEqual(@as(usize, 0), tok.reserved_ids.len);
 }
 
 /// How a forked child that ran `f(arg)` ended: a crash (a panic, a fault or the alarm on a hang) is the failure the
@@ -2196,7 +2350,7 @@ test "bindTemplate: a media placeholder is never sampled, and its text in an ass
     // The template prints `<u>`, the media placeholder, where a request's image sits.
     var t = try template_engine.Template.compile(a, "{{ '<s>' }}{{ '<u>' }}", &diag);
     defer t.deinit();
-    try tok.bindTemplate(&t.facts, &.{9}, &.{ 0, 11 });
+    try tok.bindTemplate(.{ .facts = &t.facts, .turns = &.{}, .outside = &.{} }, &.{9}, &.{ 0, 11 });
     try testing.expectEqualSlices(u32, &.{ 10, 11 }, tok.reserved_ids);
     const in_turn = try tok.encodeSpans(a, .{ .bytes = "<u>", .origin = .assistant });
     defer a.free(in_turn);
@@ -2204,4 +2358,128 @@ test "bindTemplate: a media placeholder is never sampled, and its text in an ass
     const placed = try tok.encodeSpans(a, .{ .bytes = "<u>", .origin = .template });
     defer a.free(placed);
     try testing.expectEqualSlices(u32, &.{11}, placed);
+}
+
+const ignore_merges_json =
+    \\{"model": {"type": "BPE", "ignore_merges": true, "vocab": {"/": 0, "x": 1, "a": 2}, "merges": []},
+    \\ "added_tokens": [{"id": 9, "content": "/x", "special": false}],
+    \\ "pre_tokenizer": {"type": "ByteLevel"}}
+;
+
+test "ignore_merges: an added token's text in client input is text, and the template's is the token" {
+    const a = testing.allocator;
+    var tok = try parseTokenizerContent(testing.io, a, ignore_merges_json);
+    defer tok.deinit();
+    for ([_][]const u8{ "/x", "a/x" }) |text| {
+        const ids = try tok.encodeSpans(a, .{ .bytes = text, .origin = .input });
+        defer a.free(ids);
+        try testing.expect(std.mem.indexOfScalar(u32, ids, 9) == null);
+    }
+    const typed = try tok.encodeSpans(a, .{ .bytes = "/x", .origin = .input });
+    defer a.free(typed);
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, typed);
+    const placed = try tok.encodeSpans(a, .{ .bytes = "/x", .origin = .template });
+    defer a.free(placed);
+    try testing.expectEqualSlices(u32, &.{9}, placed);
+}
+
+test "an added token still decodes and is found by text for a logit bias" {
+    const a = testing.allocator;
+    var tok = try parseTokenizerContent(testing.io, a, ignore_merges_json);
+    defer tok.deinit();
+    const text = try tok.decode(a, &.{9});
+    defer a.free(text);
+    try testing.expectEqualStrings("/x", text);
+    try testing.expectEqual(@as(?u32, 9), tok.tokenId("/x"));
+    try testing.expectEqual(@as(?u32, 2), tok.tokenId("a"));
+    try testing.expectEqual(@as(?u32, null), tok.tokenId("/y"));
+}
+
+test "a load names the tokenizer.json components it does not apply in one [load] line, and the NFC it applies" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const log_path = try std.fmt.allocPrint(a, "{s}/t.log", .{root});
+    defer a.free(log_path);
+    const content =
+        \\{"model": {"type": "BPE", "vocab": {"a": 0}, "merges": []}, "normalizer": {"type": "NFC"},
+        \\ "decoder": {"type": "Metaspace"}, "post_processor": {"type": "ByteLevel"},
+        \\ "pre_tokenizer": {"type": "ByteLevel"}}
+    ;
+    try log.openFile(log_path, 0);
+    var tok = parseTokenizerContent(io, a, content) catch |e| {
+        log.closeFile();
+        return e;
+    };
+    defer tok.deinit();
+    log.closeFile();
+    const logged = try tmp.dir.readFileAlloc(io, "t.log", a, .limited(1 << 20));
+    defer a.free(logged);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, logged, "[load] tokenizer.json components the engine does not apply: "));
+    try testing.expect(std.mem.indexOf(u8, logged, ": pre_tokenizer (read with the legacy word rules) ByteLevel; decoder Metaspace\n") != null);
+    // An NFC normalizer is applied, to request text only, and the load says so.
+    try testing.expect(std.mem.indexOf(u8, logged, "[load] tokenizer.json normalizer NFC: applied to request text, never to a reply\n") != null);
+    try testing.expect(tok.nfc_input);
+}
+
+test "a tokenizer.json whose pipeline the engine applies in full names nothing" {
+    const a = testing.allocator;
+    var tok = try parseTokenizerContent(testing.io, a,
+        \\{"model": {"type": "BPE", "vocab": {"a": 0}, "merges": []}, "normalizer": null,
+        \\ "decoder": {"type": "ByteLevel"}, "post_processor": {"type": "ByteLevel"}, "pre_tokenizer": {"type": "ByteLevel"}}
+    );
+    defer tok.deinit();
+    tok.word_rules = .letters;
+    const root = tok.parsed_json.?.value.object;
+    const unapplied = try unappliedComponents(a, root, &tok);
+    defer a.free(unapplied);
+    try testing.expectEqualStrings("", unapplied);
+}
+
+test "encode: a lead byte cut off at the end of a segment is read as one byte, whatever follows" {
+    const a = testing.allocator;
+    var tok = try spanTestTokenizer(a);
+    defer tok.deinit();
+    for ([_][]const u8{ "ab\xe4\xb8", "ab\xf0\x9f\x98", "ab\xc3", "\xe4" }) |text| {
+        const alone = try tok.encode(a, text);
+        defer a.free(alone);
+        const spelled = try std.mem.concat(a, u8, &.{ text, "<s>" });
+        defer a.free(spelled);
+        const closed = try tok.encode(a, spelled);
+        defer a.free(closed);
+        try testing.expectEqualSlices(u32, alone, closed[0 .. closed.len - 1]);
+        try testing.expectEqual(@as(u32, 9), closed[closed.len - 1]);
+    }
+}
+
+test "Qwen pack: request text in NFD encodes as transformers encodes it, and an NFD reply keeps the ids it was generated as" {
+    const a = testing.allocator;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try @import("test_models.zig").packPath(&buf, "Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw");
+    var tok = loadTokenizer(testing.io, a, dir) catch return error.SkipZigTest;
+    defer tok.deinit();
+    try testing.expect(tok.nfc_input);
+    // transformers 5.22.2, AutoTokenizer.encode on the pack's tokenizer.json.
+    const cases = [_]struct { text: []const u8, ids: []const u32 }{
+        .{ .text = "e\u{301}", .ids = &.{933} },
+        .{ .text = "caf\u{e9} cafe\u{301}", .ids = &.{ 895, 56868, 50203 } },
+        .{ .text = "\u{c5}ngstr\u{f6}m A\u{30a}ngstro\u{308}m", .ids = &.{ 169111, 938, 485, 82628, 76533, 938, 485, 82628 } },
+        .{ .text = "\u{1100}\u{1161}\u{11a8}", .ids = &.{149252} },
+    };
+    for (cases) |c| {
+        const ids = try tok.encodeSpans(a, .{ .bytes = c.text, .origin = .input });
+        defer a.free(ids);
+        try testing.expectEqualSlices(u32, c.ids, ids);
+        const reply = try tok.encodeSpans(a, .{ .bytes = c.text, .origin = .assistant });
+        defer a.free(reply);
+        const back = try tok.decode(a, reply);
+        defer a.free(back);
+        try testing.expectEqualStrings(c.text, back);
+    }
+    const nfd_reply = try tok.encodeSpans(a, .{ .bytes = "e\u{301}", .origin = .assistant });
+    defer a.free(nfd_reply);
+    try testing.expect(!std.mem.eql(u32, &.{933}, nfd_reply));
 }

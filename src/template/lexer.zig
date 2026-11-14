@@ -1,6 +1,7 @@
 //! Tokens of a template as Jinja2's lexer reads them under transformers' settings: newlines normalized and one
 //! trailing newline dropped, `trim_blocks` and `lstrip_blocks` on, `-` strips and `+` keeps whitespace.
 const std = @import("std");
+const utf8_seq = @import("../utf8_seq.zig");
 const value = @import("value.zig");
 
 const Allocator = std.mem.Allocator;
@@ -405,7 +406,7 @@ fn spaceAt(s: []const u8, at: usize) ?usize {
     if (at >= s.len) return null;
     const len = std.unicode.utf8ByteSequenceLength(s[at]) catch return null;
     if (at + len > s.len) return null;
-    const cp = std.unicode.utf8Decode(s[at .. at + len]) catch return null;
+    const cp = utf8_seq.decode(s[at .. at + len]) orelse return null;
     return if (value.isSpace(cp)) len else null;
 }
 

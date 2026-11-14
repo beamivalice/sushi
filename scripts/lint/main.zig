@@ -19,6 +19,7 @@ const rules = .{
     @import("template_runtime_safety.zig"),
     @import("template_superlinear_std.zig"),
     @import("template_unchecked_utf8.zig"),
+    @import("utf8_decode_raw.zig"),
     @import("json_unchecked_shape.zig"),
     @import("owned_insert_arg.zig"),
     @import("arch_test_unlisted.zig"),

@@ -4,6 +4,7 @@
 //! Apache-2.0, see NOTICE), and the names only it has (the `strip` filter, `str.indent`, `list.append`) follow its
 //! routines in its `value.cpp`.
 const std = @import("std");
+const utf8_seq = @import("../utf8_seq.zig");
 const value = @import("value.zig");
 const tojson = @import("tojson.zig");
 const render = @import("render.zig");
@@ -187,7 +188,7 @@ fn undefinedFail(r: *Renderer, v: Value) Failure!void {
 
 fn decode(cs: []const u8) u21 {
     @setRuntimeSafety(true);
-    return std.unicode.utf8Decode(cs) catch 0xFFFD;
+    return utf8_seq.decode(cs) orelse 0xFFFD;
 }
 
 /// ASCII case mapping; other code points are left as they are.

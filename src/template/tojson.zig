@@ -1,6 +1,7 @@
 //! Python's float `repr` and `json.dumps` as transformers' `tojson` calls it (ensure_ascii, indent, separators,
 //! sort_keys): an integer prints exactly at any size, a float as Python's shortest repr.
 const std = @import("std");
+const utf8_seq = @import("../utf8_seq.zig");
 const value = @import("value.zig");
 
 const Value = value.Value;
@@ -238,7 +239,7 @@ fn writeString(w: *std.ArrayList(u8), gpa: Allocator, s: []const u8, ensure_asci
             if (!ensure_ascii) {
                 try w.appendSlice(gpa, s[i..end]);
             } else {
-                const cp = std.unicode.utf8Decode(s[i..end]) catch 0xFFFD;
+                const cp = utf8_seq.decode(s[i..end]) orelse 0xFFFD;
                 if (cp >= 0x10000) {
                     const v = cp - 0x10000;
                     try w.print(gpa, "\\u{x:0>4}\\u{x:0>4}", .{ 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF) });

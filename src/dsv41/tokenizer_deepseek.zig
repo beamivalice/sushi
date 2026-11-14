@@ -2,6 +2,7 @@
 //! the pieces the one before left. A piece never crosses a run's edge, so a `\s+(?!\S)` at the end of a piece
 //! sees the end of input (`"x  1"` keeps its two spaces whole).
 const std = @import("std");
+const utf8_seq = @import("../utf8_seq.zig");
 const uni = @import("../tokenizer_unicode.zig");
 
 pub const digits_regex = "\\p{N}{1,3}";
@@ -15,7 +16,7 @@ fn decode(text: []const u8, i: usize) ?Cp {
     if (i >= text.len) return null;
     const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return .{ .cp = 0xFFFD, .len = 1 };
     if (i + n > text.len) return .{ .cp = 0xFFFD, .len = 1 };
-    const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return .{ .cp = 0xFFFD, .len = 1 };
+    const cp = utf8_seq.decode(text[i .. i + n]) orelse return .{ .cp = 0xFFFD, .len = 1 };
     return .{ .cp = cp, .len = n };
 }
 

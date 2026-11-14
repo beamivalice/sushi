@@ -14,6 +14,7 @@ pub const qwen_template = declOf("qwen4", "template");
 pub const qwen_model_type = arch_chat.modelTypeOf("qwen4");
 pub const glm_model_type = arch_chat.modelTypeOf("glm5");
 pub const mimo_template = declOf("mimo2", "template");
+pub const glm_template = declOf("glm5", "template");
 
 /// The Flash-Next teacher fixture of `sushi kld`, under the models root.
 pub const qwen_teacher_pack = declOf("qwen4", "teacher_pack");
@@ -43,13 +44,15 @@ pub fn qwenCountConfig() ?model_mod.ModelConfig {
     return .{ .num_hidden_layers = 0, .pinned_context = 4096, .model_type = "qwen4_exp", .gen_enable_thinking = false };
 }
 
-/// How a template spells a call: its opener, what follows the name, and the gap between a thought and the call.
-pub const ForcedFamily = struct { tpl: []const u8, head: []const u8, name_tail: []const u8, sep: []const u8 };
+/// How a template spells a call: its opener, what follows the name (the first of its tails), the gap between a thought
+/// and the call, and whether the template leaves the think opener to the model.
+pub const ForcedFamily = struct { tpl: []const u8, head: []const u8, name_tail: []const u8, sep: []const u8, leaves_opener: bool = false };
 
 /// The families whose template a forced `tool_choice` test renders, for the archs the build holds.
 pub const forced_families: []const ForcedFamily = blk: {
     var out: []const ForcedFamily = &.{};
     if (qwen_template) |t| out = out ++ &[_]ForcedFamily{.{ .tpl = t, .head = "<tool_call>\n<function=", .name_tail = ">\n", .sep = "\n\n" }};
-    if (mimo_template) |t| out = out ++ &[_]ForcedFamily{.{ .tpl = t, .head = "<tool_call><function=", .name_tail = ">", .sep = "" }};
+    if (mimo_template) |t| out = out ++ &[_]ForcedFamily{.{ .tpl = t, .head = "<tool_call><function=", .name_tail = ">", .sep = "", .leaves_opener = true }};
+    if (glm_template) |t| out = out ++ &[_]ForcedFamily{.{ .tpl = t, .head = "<tool_call>", .name_tail = "<arg_key>", .sep = "" }};
     break :blk out;
 };
