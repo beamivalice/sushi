@@ -6,7 +6,6 @@ const mlx = @import("../mlx.zig");
 const io_util = @import("../io_util.zig");
 const report = @import("../ubench_report.zig");
 const trunk = @import("../trunk.zig");
-const nax_gate = @import("../nax_gate.zig");
 const model = @import("../model.zig");
 const glm = @import("glm5_model.zig");
 const attention = @import("glm5_attention.zig");
@@ -54,19 +53,6 @@ fn indexOf(values: []const []const u8, v: []const u8) usize {
 fn parseCount(text: []const u8) !c_int {
     return std.fmt.parseInt(c_int, text, 10);
 }
-
-/// The NAX probe override a bench flips per arm, to force NAX-shaped kernels on a GPU that would not pick them.
-const NaxGate = struct {
-    saved: ?bool,
-
-    fn take() NaxGate {
-        return .{ .saved = nax_gate.vqmm_nax_probe_override };
-    }
-
-    fn restore(g: NaxGate) void {
-        nax_gate.vqmm_nax_probe_override = g.saved;
-    }
-};
 
 // ── glm5.verify_qmm ─────────────────────────────────────────────────────
 
@@ -265,7 +251,9 @@ fn naxOutput(ops: *Ops, in: *const NaxInputs, case: usize, nax: bool) !Arr {
 }
 
 fn sampleNax(c: NaxCase, arm: usize) anyerror!f64 {
-    nax_gate.vqmm_nax_probe_override = arm == 1;
+    // The bench forces NAX-shaped kernels on a GPU that would not pick them.
+    const forced = @import("sushi_exl3").device.forceMatrix(arm == 1);
+    defer forced.end();
     var ops = Ops{ .s = c.s };
     defer ops.deinit();
     const sw = io_util.Stopwatch.init(io());
@@ -279,7 +267,8 @@ fn naxAgreement(s: mlx.mlx_stream, in: *const NaxInputs, case: usize) ![2]f64 {
     var ops = Ops{ .s = s };
     defer ops.deinit();
     for (&outs, 0..) |*o, arm| {
-        nax_gate.vqmm_nax_probe_override = arm == 1;
+        const forced = @import("sushi_exl3").device.forceMatrix(arm == 1);
+        defer forced.end();
         o.* = try ops.contiguous(try ops.cast(try naxOutput(&ops, in, case, arm == 1), .float32));
         try eval(o.*);
     }
@@ -311,8 +300,6 @@ pub const nax_arms: report.Bench = .{
 
 fn runNaxArms(run: *report.Run) anyerror!void {
     const s = mlx.gpuStream();
-    const gate = NaxGate.take();
-    defer gate.restore();
     var fx = Ops{ .s = s };
     defer fx.deinit();
     const arr = glm.syntheticArray;
@@ -640,7 +627,6 @@ const ChunkCase = struct {
     selected: Arr,
     offset: usize,
     rows: c_int,
-    gate: NaxGate,
 };
 
 /// Whole sparse attention of one short chunk: the scalar kernel, the packed head arm with MLX's FP32 composite or with
@@ -650,7 +636,8 @@ fn sampleChunk(c: ChunkCase, arm: usize) anyerror!f64 {
     defer arm_scope.deinit();
     var ops = Ops{ .s = c.s };
     defer ops.deinit();
-    nax_gate.vqmm_nax_probe_override = if (arm == 1) false else c.gate.saved;
+    const forced = @import("sushi_exl3").device.forceMatrix(if (arm == 1) false else null);
+    defer forced.end();
     const history = c.state.processed;
     const sw = io_util.Stopwatch.init(io());
     const out = switch (arm) {
@@ -680,8 +667,6 @@ pub const mla_chunk_attn: report.Bench = .{
 fn runMlaChunk(run: *report.Run) anyerror!void {
     const s = mlx.gpuStream();
     if (run.hasArm("nax") and !glm.naxArms()) return error.NaxArmNeedsNaxGpu;
-    const gate = NaxGate.take();
-    defer gate.restore();
     const a = std.heap.page_allocator;
     for (run.axis("ctx")) |ctx_text| {
         const n = try parseCount(ctx_text);
@@ -705,7 +690,7 @@ fn runMlaChunk(run: *report.Run) anyerror!void {
             const w = try attention.normal(&scope, &.{ rows, 32 }, 33, 0.2);
             try evalAll(&.{ q, iq, w });
             const label = try std.fmt.allocPrint(run.a, "ctx {d} rows {d}", .{ n, rows });
-            try run.interleave(label, ChunkCase{ .s = s, .state = &state, .q = q, .iq = iq, .w = w, .selected = selected, .offset = offset, .rows = rows, .gate = gate }, sampleChunk);
+            try run.interleave(label, ChunkCase{ .s = s, .state = &state, .q = q, .iq = iq, .w = w, .selected = selected, .offset = offset, .rows = rows }, sampleChunk);
         }
     }
 }

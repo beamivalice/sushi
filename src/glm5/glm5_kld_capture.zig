@@ -925,19 +925,17 @@ test "GLM native KLD capture CPU rejects zero norm logits" {
 test "GLM teacher capture takes the NAX arms on a NAX GPU and the reference arms without one" {
     const a = std.testing.allocator;
     const base = @import("glm5_model.zig");
-    const nax_gate = @import("../nax_gate.zig");
     const saved = if (std.c.getenv("MLX_ENABLE_TF32")) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
-    const gate = nax_gate.vqmm_nax_probe_override;
     defer {
-        nax_gate.vqmm_nax_probe_override = gate;
         if (saved) |value| {
             _ = setenv("MLX_ENABLE_TF32", value, 1);
             a.free(value);
         } else _ = unsetenv("MLX_ENABLE_TF32");
         base.leaveTeacher();
     }
-    for ([_]?bool{ gate, false }) |nax| {
-        nax_gate.vqmm_nax_probe_override = nax;
+    for ([_]?bool{ null, false }) |nax| {
+        const forced = @import("sushi_exl3").device.forceMatrix(nax);
+        defer forced.end();
         _ = unsetenv("MLX_ENABLE_TF32");
         try std.testing.expect(!base.teacher);
         try teacherEnvironment();

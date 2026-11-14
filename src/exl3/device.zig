@@ -133,6 +133,10 @@ pub const ThreadLadder = struct {
         return self.rungs[self.at];
     }
 
+    pub fn hasNext(self: ThreadLadder) bool {
+        return self.at + 1 < self.rungs.len;
+    }
+
     /// The GPU refused the current rung: false when it was the last.
     pub fn stepDown(self: *ThreadLadder) bool {
         if (self.at + 1 >= self.rungs.len) return false;
@@ -191,6 +195,25 @@ pub const Scope = struct {
         replaced = self.before;
     }
 };
+
+/// A test's matrix units: `null` leaves the GPU as it is, `true` grants them (a routing or bill test only: on a box without
+/// them no kernel arm may be built), `false` withholds them. The matrix units alone move, so a scope nests inside another.
+pub fn forceMatrix(on: ?bool) Scope {
+    const before = replaced;
+    if (on) |yes| {
+        var p = current();
+        if (yes) {
+            p.chip.insert(.matrix_g17);
+            p.units.insert(.matrix_g17);
+            p.withheld = false;
+        } else {
+            p.units.remove(.matrix_g17);
+            p.withheld = true;
+        }
+        replaced = p;
+    }
+    return .{ .before = before };
+}
 
 /// This process's GPU with every unit past `simd` withheld, as the QA switch gives it.
 pub fn simdOnly() Profile {
@@ -371,6 +394,27 @@ test "device: a thread ladder starts on its widest rung, steps down on a refusal
     try testing.expect(l.stepDown());
     try testing.expectEqual(@as(u32, 512), l.threads());
     try testing.expect(l.stepDown());
+    try testing.expect(!l.hasNext());
     try testing.expect(!l.stepDown());
     try testing.expectEqual(@as(u32, 256), l.threads());
+}
+
+test "device: a test's matrix units follow forceMatrix, null leaves them, and scopes nest and end" {
+    const real = current().has(.matrix_g17);
+    {
+        const off = forceMatrix(false);
+        defer off.end();
+        try testing.expect(!current().has(.matrix_g17));
+        try testing.expect(current().has(.simd));
+        {
+            const on = forceMatrix(true);
+            defer on.end();
+            try testing.expect(current().has(.matrix_g17) and current().chip.contains(.matrix_g17));
+            const same = forceMatrix(null);
+            defer same.end();
+            try testing.expect(current().has(.matrix_g17));
+        }
+        try testing.expect(!current().has(.matrix_g17));
+    }
+    try testing.expectEqual(real, current().has(.matrix_g17));
 }

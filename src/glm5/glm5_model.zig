@@ -1116,9 +1116,6 @@ test "GLM FP8 projection follows MiMo source arithmetic at decode and prefill wi
 
 test "GLM NAX arms and their bills follow the one NAX gate" {
     try mlx.requireGpu();
-    const nax_gate = @import("../nax_gate.zig");
-    const saved = nax_gate.vqmm_nax_probe_override;
-    defer nax_gate.vqmm_nax_probe_override = saved;
     const s = mlx.gpuStream();
     const packed_nax = @import("glm5_attention_nax_packed.zig");
     const index_nax = @import("glm5_indexpool_nax.zig");
@@ -1127,8 +1124,9 @@ test "GLM NAX arms and their bills follow the one NAX gate" {
     const dense_once = @import("glm5_a6_dense_once.zig");
     const mla_prefill = @import("glm5_mla_prefill_batch.zig");
     const mla_verify = @import("glm5_mla_verify_batch.zig");
-    for ([_]?bool{ saved, false }) |gate| {
-        nax_gate.vqmm_nax_probe_override = gate;
+    for ([_]?bool{ null, false }) |gate| {
+        const forced = @import("sushi_exl3").device.forceMatrix(gate);
+        defer forced.end();
         const on = naxArms();
         var ops = Ops{ .s = s };
         defer ops.deinit();

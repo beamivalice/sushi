@@ -6,7 +6,6 @@ const mimo_config = @import("mimo_config.zig");
 const arch_state = @import("../arch/arch_state.zig");
 const forward_diag = @import("../forward_diag.zig");
 const moe_router = @import("../moe_router.zig");
-const nax_gate = @import("../nax_gate.zig");
 const Trunk = trunk_mod.Trunk;
 const std = @import("std");
 const fp8_block = @import("../fp8_block.zig");
@@ -2993,9 +2992,8 @@ test "qkv matmul2d kernel parity: many splits, and the narrower gqa 4 and 24/4 h
 
 test "qkv split-K kernel parity: MiMo global shape (qk 192 / v 128, gqa 16) vs the fp32 truth, no matrix units" {
     try mlx.requireGpu();
-    const saved_nax = nax_gate.vqmm_nax_probe_override;
-    nax_gate.vqmm_nax_probe_override = false;
-    defer nax_gate.vqmm_nax_probe_override = saved_nax;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     defer qkv_splitk_split_override = null;
     var prng = std.Random.DefaultPrng.init(0x3D2D_5A11);
     const rnd = prng.random();

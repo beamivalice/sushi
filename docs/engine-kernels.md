@@ -290,7 +290,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   answer at every rung (`sampler_draw`; the hyper-connection kernels keep `hc_tg`'s own halving).
 - The name is MLX's: `MLX_METAL_GPU_ARCH` when set, else the system GPU's, so the profile and MLX's dispatch agree.
 - **A test's GPU is `device.withProfile(p)`**, ended by its scope (`device.simdOnly()` withholds the matrix units of the
-  box it runs on). A test never sets the QA switch's env: the profile is read once.
+  box it runs on; `device.forceMatrix(on)` moves the matrix units alone, `true` for a routing or bill test only, since on
+  a box without them no arm may be built). It is the one seam: the per-gate overrides of the verify lane and of the
+  hd-256 SDPA are gone, and a withheld unit withholds the EXL3 GEMM arm with them. A test never sets the QA switch's env:
+  the profile is read once.
 - Nothing else reads the GPU's name, the OS version or the QA switch (lint rule `device-probe`).
 
 ## NAX and Metal pitfalls

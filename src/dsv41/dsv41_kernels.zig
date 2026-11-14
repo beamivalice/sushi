@@ -2821,7 +2821,8 @@ var hc_split_def = Def{ .name = "dsv41_hc_split", .ins = &.{ "z", "eps" }, .outs
 var hc_norm_def = Def{ .name = "dsv41_hc_norm", .ins = &.{ "z", "x", "cpre", "w", "eps" }, .outs = &.{ "pre", "post", "comb", "h_out" }, .source = HC_NORM_SOURCE };
 
 /// Threads a hyper-connection threadgroup runs; `probeHc` halves it where the GPU caps register-heavy kernels lower.
-pub var hc_tg: usize = 1024;
+pub const hc_tg_widest: usize = 1024;
+pub var hc_tg: usize = hc_tg_widest;
 /// The row x mix tile a `hcMix` threadgroup takes. Every tile gives the same bytes (each dot keeps its order); the
 /// tile only moves the time, and `hc_mix_tile` is its test seam.
 pub const HcMixTile = struct { rows: usize, cols: usize };
@@ -3027,7 +3028,8 @@ fn hcExpandLaunch(sc: *Scope, x: A, y: A, post: A, comb: A, per_element: bool) !
     return o[0];
 }
 
-/// Launches the top-k kernels (one threadgroup a row, and chunked) at `topk_tg` threads, halving it until they run.
+/// Launches the top-k kernels (one threadgroup a row, chunked, and cut at each row's length) at `topk_tg` threads, halving
+/// it until they run.
 pub fn probeTopk(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
     while (true) {
         probeTopkOnce(gpa, s) catch |e| {
@@ -3045,7 +3047,8 @@ fn probeTopkOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
     const x = try sc.zeros(&.{ 1, 64 }, .float32);
     const one = try topkIndicesSplit(&sc, x, 4, 1);
     const split = try topkIndicesSplit(&sc, x, 4, 2);
-    try sc_mod.evalAll(&.{ one, split });
+    const below = try topkIndicesBelow(&sc, x, 1, 4, try sc.ints(&.{64}, &.{ 1, 1 }));
+    try sc_mod.evalAll(&.{ one, split, below });
 }
 
 /// Metal caps a register-heavy kernel's threadgroup below 1024 on some GPUs (M1, M2): launches every hyper-connection
@@ -3059,7 +3062,51 @@ pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
         };
         break;
     }
+    // The wide mix and norm and the narrow stage sum a row's terms in one order only where the thread count suits D: a
+    // GPU that granted fewer than the widest group is held to it (the widest is the bytes every pack was made on).
+    while (hc_tg < hc_tg_widest and hc_tg > 32 and !try hcStageAgrees(gpa, s, hc, D, iters)) hc_tg /= 2;
     hc_expand_tf32 = hc == 4 and probeHcExpand(gpa, s, D);
+}
+
+/// An f32 array of the shape, uniform in [-scale, scale] (or [0, scale]) from a fixed generator.
+fn hostNoise(sc: *Scope, shape: []const c_int, seed: u64, scale: f32, positive: bool) !A {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const vals = try sc.a.alloc(f32, n);
+    defer sc.a.free(vals);
+    var prng = std.Random.DefaultPrng.init(seed);
+    for (vals) |*v| {
+        const u = prng.random().float(f32);
+        v.* = if (positive) u * scale else (2 * u - 1) * scale;
+    }
+    return sc.floats(vals, shape);
+}
+
+/// Whether a row's mixes and normed input are the same bits through the narrow stage and through the wide pair, in both
+/// dtypes, at the current `hc_tg`: a prompt's cut must not change a byte.
+fn hcStageAgrees(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, iters: usize) !bool {
+    const mix = (2 + hc) * hc;
+    const rows = 3;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
+        var sc = Scope.plain(gpa, s);
+        defer sc.deinit();
+        const l: c_int = rows;
+        // Host-made values: the load may run in the engine's scope, which has no random ops.
+        const cpre = try hostNoise(&sc, &.{ l, ci(hc) }, 133, 0.6, true);
+        const x = try sc.astype(try hostNoise(&sc, &.{ l, ci(hc), ci(D) }, 131, 1.5, false), dt);
+        const w = try sc.astype(try hostNoise(&sc, &.{ci(D)}, 134, 0.2, false), dt);
+        const hw = HcWeights{ .fn_w = try hostNoise(&sc, &.{ ci(mix), ci(hc * D) }, 135, 0.02, false), .scale = try f32Const(&sc, &.{ 0.3, 0.5, 0.7 }), .base = try hostNoise(&sc, &.{ci(mix)}, 136, 0.5, false) };
+        const eps = try hcEps(&sc, 1e-6, 1e-6);
+        const wide_z = try hcMix(&sc, x, hw, eps);
+        const wide = try hcNorm(&sc, wide_z, x, cpre, w, iters, eps);
+        const wz = try sc_mod.hostF32(wide_z);
+        const wh = try hostOf(&sc, wide.h);
+        for (0..rows) |r| {
+            const st = try hcStage(&sc, try sc.slice(x, 0, @intCast(r), @intCast(r + 1)), null, try sc.slice(cpre, 0, @intCast(r), @intCast(r + 1)), w, hw, eps);
+            if (!bitsEqual(try sc_mod.hostF32(st.z), wz[r * mix ..][0..mix]) or !bitsEqual(try hostOf(&sc, st.h), wh[r * D ..][0..D])) return false;
+        }
+    }
+    return true;
 }
 
 /// The fused expand against the chain on random streams of both dtypes at a wide and a narrow row count.
@@ -4715,4 +4762,38 @@ test "a scope on the engine's stream makes its scalars and host arrays there, ou
     for (made) |x| try t.expect(mlx.engine.isOurs(x));
     try t.expectEqual(@as(f32, 0.25), (try sc_mod.hostF32(made[3]))[1]);
     try t.expect(!mlx.engine.active);
+}
+
+test "dsv41 hc kernels: a halved or narrowed hc_tg is settled where the narrow stage and the wide pair give one row the same bits, whatever D" {
+    try mlx.requireGpu();
+    const saved = hc_tg;
+    defer hc_tg = saved;
+    for ([_]usize{ 512, 256 }) |tg| for ([_]usize{ 256, 384, 5120, 4096, 2048 }) |D| {
+        hc_tg = tg;
+        try probeHc(testing.allocator, mlx.gpuStream(), 4, D, 20);
+        try testing.expect(hc_tg <= tg);
+        try testing.expect(try hcStageAgrees(testing.allocator, mlx.gpuStream(), 4, D, 20));
+    };
+}
+
+test "dsv41 topk: the load's probe launches every top-k kernel, so one the GPU grants fewer threads steps topk_tg down" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const saved = topk_tg;
+    defer {
+        topk_tg = saved;
+        mlx.engine.kernel.grant_cap = std.math.maxInt(usize);
+        mlx.engine.kernel.grant_cap_name = "";
+    }
+    for ([_][]const u8{ "dsv41_topk_below", "dsv41_topk_chunk", "dsv41_topk_merge", "dsv41_topk" }) |name| {
+        topk_tg = 1024;
+        mlx.engine.kernel.grant_cap = 512;
+        mlx.engine.kernel.grant_cap_name = name;
+        const scope = mlx.engine.enter(mlx.engine.stream());
+        defer scope.end();
+        try probeTopk(testing.allocator, mlx.engine.stream());
+        try testing.expectEqual(@as(usize, 512), topk_tg);
+    }
 }

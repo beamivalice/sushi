@@ -2,7 +2,6 @@
 const std = @import("std");
 const arch_config = @import("arch/config.zig");
 const model_mod = @import("model.zig");
-const nax_gate = @import("nax_gate.zig");
 const PinCfg = model_mod.ModelConfig;
 const bills = @import("bills.zig");
 const testing = std.testing;
@@ -168,13 +167,12 @@ pub const PinFx = struct {
     mimo: PinCfg,
     glm: PinCfg,
     dsv: PinCfg,
-    saved_nax: ?bool,
+    no_nax: @import("sushi_exl3").device.Scope,
 
     // The NAX probe reads the device: the pins price the SIMD arm on every machine.
     pub fn init() !PinFx {
-        const saved_nax = nax_gate.vqmm_nax_probe_override;
-        nax_gate.vqmm_nax_probe_override = false;
-        errdefer nax_gate.vqmm_nax_probe_override = saved_nax;
+        const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+        errdefer no_nax.end();
         const a = std.testing.allocator;
         var qwen = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/model-configs/qwen4_exp.json"));
         errdefer qwen.deinit(a);
@@ -191,11 +189,11 @@ pub const PinFx = struct {
             c.pinned_context = 262_144;
             c.pinned_prefill_chunk = 2048;
         }
-        return .{ .qwen = qwen, .mimo = mimo, .glm = glm, .dsv = dsv, .saved_nax = saved_nax };
+        return .{ .qwen = qwen, .mimo = mimo, .glm = glm, .dsv = dsv, .no_nax = no_nax };
     }
 
     pub fn deinit(self: *PinFx) void {
-        nax_gate.vqmm_nax_probe_override = self.saved_nax;
+        self.no_nax.end();
         const a = std.testing.allocator;
         self.qwen.deinit(a);
         self.mimo.deinit(a);

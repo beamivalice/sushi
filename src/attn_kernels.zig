@@ -1856,8 +1856,8 @@ test "fusedSdpaPrefill: causal parity vs composed SDPA (GQA, ragged shapes, chun
     // The causal arm yields to the stock fused kernel on NAX silicon, so on an
     // M5-class Mac this parity check would DECLINE instead of running — the
     // kernel under test would never be exercised. Pin the arm, not the host.
-    nax_gate.nax_sdpa_override = false;
-    defer nax_gate.nax_sdpa_override = null;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     var prng = std.Random.DefaultPrng.init(0x256256);
     const rnd = prng.random();
 
@@ -1940,8 +1940,8 @@ test "fusedSdpaPrefill: only the instantiated (qk, value) width pairs are served
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
-    nax_gate.nax_sdpa_override = false;
-    defer nax_gate.nax_sdpa_override = null;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     var prng = std.Random.DefaultPrng.init(0x19288);
     const rnd = prng.random();
     try std.testing.expect(fusedPdDims(256, 256));
@@ -1964,8 +1964,8 @@ test "fusedSdpaPrefillKv: a quantized cache is read per dispatch, never rebuilt 
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
-    nax_gate.nax_sdpa_override = false;
-    defer nax_gate.nax_sdpa_override = null;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     var prng = std.Random.DefaultPrng.init(0x19282);
     const rnd = prng.random();
 
@@ -2013,8 +2013,8 @@ test "fusedSdpaPrefillKv: a kv6 cache is read per dispatch and matches the dense
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
-    nax_gate.nax_sdpa_override = false;
-    defer nax_gate.nax_sdpa_override = null;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     var prng = std.Random.DefaultPrng.init(0x19286);
     const rnd = prng.random();
     const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 16, 70, 192 }, s);
@@ -2043,8 +2043,8 @@ test "fusedSdpaPrefillKv: an unquantized cache view takes the dense arm unchange
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
-    nax_gate.nax_sdpa_override = false;
-    defer nax_gate.nax_sdpa_override = null;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     var prng = std.Random.DefaultPrng.init(0x19283);
     const rnd = prng.random();
     const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 8, 64, 192 }, s);
@@ -2371,8 +2371,8 @@ test "fusedSdpaPrefill: both arms FUSED off NAX, causal yields to stock ON NAX" 
     // written for. The preference is PINNED rather than read off the host:
     // `naxSdpaPreferred()` defaults to whether the machine has NAX, so leaving
     // it to the silicon makes this assertion true on an M4 and false on an M5.
-    nax_gate.nax_sdpa_override = false;
-    defer nax_gate.nax_sdpa_override = null;
+    var no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     {
         const causal = try fusedSdpaPrefill(s, q, k, k, 1.0, 0);
         try std.testing.expect(causal != null);
@@ -2383,7 +2383,8 @@ test "fusedSdpaPrefill: both arms FUSED off NAX, causal yields to stock ON NAX" 
     // kernel) while the BAND arm stays ours — mlx's NAX kernel takes no band.
     // Nothing pinned that asymmetry before; a decline is invisible from the
     // outside, since the composed fallback is output-equivalent.
-    nax_gate.nax_sdpa_override = true;
+    no_nax.end();
+    no_nax = @import("sushi_exl3").device.forceMatrix(true);
     {
         const causal = try fusedSdpaPrefill(s, q, k, k, 1.0, 0);
         try std.testing.expect(causal == null);
@@ -2414,8 +2415,8 @@ test "fusedSdpaPrefill: budgeted kv chunking engages and is exact vs single disp
     fused256_override = true;
     defer fused256_override = null;
     // Causal arm: declines on NAX silicon unless the preference is pinned.
-    nax_gate.nax_sdpa_override = false;
-    defer nax_gate.nax_sdpa_override = null;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     var prng = std.Random.DefaultPrng.init(0xC4A2);
     const rnd = prng.random();
 
@@ -2519,8 +2520,8 @@ test "fusedSdpaPrefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged 64
     fused256_override = true;
     defer fused256_override = null;
     // Causal arm: declines on NAX silicon unless the preference is pinned.
-    nax_gate.nax_sdpa_override = false;
-    defer nax_gate.nax_sdpa_override = null;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     var prng = std.Random.DefaultPrng.init(0x27B27B);
     const rnd = prng.random();
 

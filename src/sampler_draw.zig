@@ -312,7 +312,8 @@ pub fn routed(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []con
     while (true) {
         const tg = ladder.threads();
         return launch(logits, temperature, top_p, top_k, keys, s, tg) catch |e| {
-            const refused = e == error.SamplerDrawGroupRefused or (e == error.MlxError and mlx.takeErrorIf("Thread group size"));
+            // The last rung's refusal keeps its text for the caller: only a rung left to take reads (and clears) it.
+            const refused = ladder.hasNext() and (e == error.SamplerDrawGroupRefused or (e == error.MlxError and mlx.takeErrorIf("Thread group size")));
             if (refused and ladder.stepDown()) {
                 log.warn("[engine] sampler draw: this GPU does not grant {d} threads a group; drawing with {d}\n", .{ tg, ladder.threads() });
                 continue;
@@ -995,4 +996,19 @@ test "sampler draw: at every thread rung the kernel draws what the rule draws, a
         }
     }
     try testing.expect(checked > 100);
+}
+
+test "sampler draw: a GPU that refuses every rung gets the refusal by name, and the ladder stays on its last rung" {
+    try mlx.requireGpu();
+    const saved = ladder;
+    defer ladder = saved;
+    defer grant_for_test = std.math.maxInt(usize);
+    ladder.at = 0;
+    grant_for_test = 0;
+    const flat = [_]f32{ 1, 2, 3, 4 };
+    const logits = mlx.mlx_array_new_data(&flat, &[_]c_int{ 1, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const keys = [_][2]u32{.{ 1, 2 }};
+    try testing.expectError(error.SamplerDrawGroupRefused, routed(logits, 1.0, 1.0, 0, &keys, mlx.gpuStream()));
+    try testing.expectEqual(@as(u32, 256), ladder.threads());
 }

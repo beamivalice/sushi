@@ -68,8 +68,7 @@ pub const cooler_setting_elsewhere = "model-settings.json ds41_cooler is ignored
 
 pub const mlx_engine_elsewhere = "--ds41-mlx-engine has no effect on this model: only deepseek_v41 runs on Sushi Cooler; drop the flag";
 
-/// Why decode cannot run on Sushi Cooler for this pack; null when its experts and trunk are STQ. The Mac's side of
-/// the answer needs MLX and is read where the settings page is served.
+/// Why decode cannot run on Sushi Cooler for this pack; null when its experts and trunk are STQ. Any GPU serves them.
 pub fn coolerUnavailable(config: *const model.ModelConfig) ?[]const u8 {
     const c = config.dsv41 orelse return null;
     return if (c.expert_dec != null and c.trunk_dec != null) null else model_settings.cooler_why_not_stq;

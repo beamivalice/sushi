@@ -1048,11 +1048,9 @@ test "GLM verify decides biased tree rows as serial decode under the same bias, 
 }
 
 test "GLM default verification schedule selects only three NAX rows" {
-    const nax_gate = @import("../nax_gate.zig");
-    const saved = nax_gate.vqmm_nax_probe_override;
-    defer nax_gate.vqmm_nax_probe_override = saved;
     for ([_]bool{ false, true }) |nax| {
-        nax_gate.vqmm_nax_probe_override = nax;
+        const forced = @import("sushi_exl3").device.forceMatrix(nax);
+        defer forced.end();
         const automatic = bindDefaultSchedule();
         defer automatic.restore();
         for ([_]usize{ 1, 2, 3, 4, 16 }) |rows| {

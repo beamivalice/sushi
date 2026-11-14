@@ -1199,8 +1199,8 @@ test "verifyQmm: the plain-SIMD tiles match stock qmm at 5/6/8-bit affine too" {
     defer vqmm_mixed_plain_test_force = null;
     // The NAX probe must not steal these rows on an M5 box: this test is about
     // the plain-SIMD lanes, and M 2..7 is below the NAX takeover anyway.
-    nax_gate.vqmm_nax_probe_override = false;
-    defer nax_gate.vqmm_nax_probe_override = null;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
 
     const cases = [_]struct { k: c_int, n: c_int, gs: u32, label: []const u8 }{
         .{ .k = 5120, .n = 17408, .gs = 64, .label = "mlp" }, // MLP gate/up, split-K
@@ -1422,8 +1422,8 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
         // must NOT reach the split-K family (the measured spill cliff past 7
         // live row vectors), and M=17 is past every lane.
         {
-            nax_gate.vqmm_nax_probe_override = false;
-            defer nax_gate.vqmm_nax_probe_override = null;
+            const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+            defer no_nax.end();
             for ([_]c_int{ 1, 8, 16, 17 }) |bad_m| {
                 const xn: usize = @intCast(bad_m * cs.k);
                 const xbuf = try allocator.alloc(f32, xn);

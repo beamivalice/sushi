@@ -30,38 +30,24 @@ pub fn macosProductVersion(buf: []u8) ?[]const u8 {
     return if (text.len == 0) null else text;
 }
 
-/// Test seam: force the NAX availability probe (null = real probe). Only
-/// ever force FALSE on non-G17 machines — forcing true would let dispatch
-/// build a kernel whose matmul2d pipeline cannot be created off M5-class
-/// hardware.
-pub var vqmm_nax_probe_override: ?bool = null;
-
 /// The matrix units are this GPU's and usable: generation 17 or later under macOS 26.2, and not withheld by
 /// `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`, which has an M5 rehearse the plain-SIMD path of an M1 to M4.
 pub fn verifyQmmNaxAvailable() bool {
-    if (vqmm_nax_probe_override) |v| return v;
-    return computeNaxAvailable();
-}
-
-fn computeNaxAvailable() bool {
     // The MLX-free test tier reaches this through the bill and answers for no device, whatever the box.
     if (@import("build_options").host_tier) return false;
     return device.current().has(.matrix_g17);
 }
 
-var nax_sdpa_avail_cache: ?bool = null;
-pub var nax_sdpa_override: ?bool = null; // test seam
+var nax_sdpa_logged = false;
 
 /// mlx >= 0.32.2 serves hd-256 attention on NAX with a fused full-attention
 /// kernel (`sdpa_full_self_attention_nax`), auto only at >= 1024 causal rows
 /// and reachable below that through `force_fused`. Preferred wherever NAX is
 /// available; elsewhere sushi_attn_p256 and the split/vector path serve.
 pub fn naxSdpaPreferred() bool {
-    if (nax_sdpa_override) |v| return v;
-    if (nax_sdpa_avail_cache) |v| return v;
-    const on = computeNaxAvailable();
-    nax_sdpa_avail_cache = on;
-    if (on) log.info("[nax-sdpa] engaged: stock fused sdpa (force_fused) serves hd-256 causal prefill and verify blocks > 8 rows; sushi_attn_p256 causal arm declined\n", .{});
+    const on = verifyQmmNaxAvailable();
+    if (on and !nax_sdpa_logged) log.info("[nax-sdpa] engaged: stock fused sdpa (force_fused) serves hd-256 causal prefill and verify blocks > 8 rows; sushi_attn_p256 causal arm declined\n", .{});
+    nax_sdpa_logged = on or nax_sdpa_logged;
     return on;
 }
 
@@ -185,9 +171,6 @@ test "naxStatusOf: on for G17 + 26.2, off names the missing leg (--version / Set
 }
 
 test "verifyQmmNaxAvailable and qsaNaxOsOk answer for the profile a test puts in place" {
-    const saved = vqmm_nax_probe_override;
-    defer vqmm_nax_probe_override = saved;
-    vqmm_nax_probe_override = null;
     const host_tier = @import("build_options").host_tier;
     const Os = device.Os;
     const cases = [_]struct { arch: []const u8, os: []const u8, held: bool, nax: bool, qsa: bool }{

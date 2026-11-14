@@ -1804,13 +1804,11 @@ fn fp32GemmExact(s: mlx.mlx_stream) !bool {
 
 test "GLM decode attention: the FP32 composite B3 is three B1, held to an FP64 oracle on every GPU" {
     try mlx.requireGpu();
-    const nax_gate = @import("../nax_gate.zig");
-    const saved = nax_gate.vqmm_nax_probe_override;
-    defer nax_gate.vqmm_nax_probe_override = saved;
     // A NAX GPU's composite runs block-masked GEMMs, exact FP32 whatever MLX's TF32 default: within one
     // BF16 ulp of the oracle (the fused D512 SDPA misses it on ~70% of the cells, a TF32 GEMM on a few).
     if (@import("glm5_model.zig").naxArms()) try decodeCompositeCase(null);
-    nax_gate.vqmm_nax_probe_override = false;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     try decodeCompositeCase(if (try fp32GemmExact(mlx.gpuStream())) 1.0 / 2048.0 else 1.0 / 64.0);
 }
 
@@ -1874,10 +1872,8 @@ fn decodeCompositeCase(fraction: ?f64) !void {
 
 test "GLM sparse prefill without NAX takes the FP32 composite, no worse than the scalar arm" {
     try mlx.requireGpu();
-    const nax_gate = @import("../nax_gate.zig");
-    const saved = nax_gate.vqmm_nax_probe_override;
-    defer nax_gate.vqmm_nax_probe_override = saved;
-    nax_gate.vqmm_nax_probe_override = false;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };

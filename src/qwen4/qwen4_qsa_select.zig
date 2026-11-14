@@ -1,7 +1,6 @@
 const trunk_mod = @import("../trunk.zig");
 const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const moe_gqmv = @import("../moe_gqmv.zig");
-const nax_gate = @import("../nax_gate.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const mrope = @import("../mrope.zig");
@@ -2267,8 +2266,8 @@ test "qsa score kernel: block ids through qsaSelectTopBlocks are identical on bo
 test "qsa score kernel: never built without NAX" {
     qsa_score_fused_override = true;
     defer qsa_score_fused_override = null;
-    nax_gate.vqmm_nax_probe_override = false;
-    defer nax_gate.vqmm_nax_probe_override = null;
+    const no_nax = @import("sushi_exl3").device.forceMatrix(false);
+    defer no_nax.end();
     const saved = qsa_score_kernel_cached;
     qsa_score_kernel_cached = null;
     defer qsa_score_kernel_cached = saved;
@@ -2367,11 +2366,11 @@ test "qsa score kernel: TF32 off declines" {
 
 test "qsa score fused: the bill follows the predicate" {
     const saved_fused = qsa_score_fused_override;
-    const saved_nax = nax_gate.vqmm_nax_probe_override;
     const saved_sheet = qwen4_qsa_attn.qsa_score_sheet_mb_override;
+    var matrix = @import("sushi_exl3").device.forceMatrix(false);
     defer {
         qsa_score_fused_override = saved_fused;
-        nax_gate.vqmm_nax_probe_override = saved_nax;
+        matrix.end();
         qwen4_qsa_attn.qsa_score_sheet_mb_override = saved_sheet;
     }
     qwen4_qsa_attn.qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
@@ -2381,7 +2380,6 @@ test "qsa score fused: the bill follows the predicate" {
     const kv = nb * 4;
     const ratio: u64 = 4;
 
-    nax_gate.vqmm_nax_probe_override = false;
     qsa_score_fused_override = true;
     const composed_rows = qsaScoreRowsPerChunk(n_idx, nb, fwd, 128);
     const composed_bill = qsaPrefillTransientBytes(n_idx, fwd, kv, ratio, 128);
@@ -2402,7 +2400,8 @@ test "qsa score fused: the bill follows the predicate" {
     try testing.expectEqual(composed_bank, cfg.qsaScoreBankBytesPerToken());
 
     qsa_score_fused_override = true;
-    nax_gate.vqmm_nax_probe_override = null;
+    matrix.end();
+    matrix = @import("sushi_exl3").device.forceMatrix(null);
     qsaScoreFusedArm();
     if (qsaScoreFusedActive()) {
         const fused_rows = qsaScoreRowsPerChunk(n_idx, nb, fwd, 128);
@@ -2436,11 +2435,11 @@ test "qsa score fused: sizing policy" {
     try testing.expectEqual(@as(u32, 64), qsaScoreNsh(64, 1, .base));
     try testing.expectEqual(@as(u32, 32), qsaScoreNsh(1024, 8, .h4));
     const saved_fused = qsa_score_fused_override;
-    const saved_nax = nax_gate.vqmm_nax_probe_override;
     const saved_sheet = qwen4_qsa_attn.qsa_score_sheet_mb_override;
+    const matrix = @import("sushi_exl3").device.forceMatrix(null);
     defer {
         qsa_score_fused_override = saved_fused;
-        nax_gate.vqmm_nax_probe_override = saved_nax;
+        matrix.end();
         qwen4_qsa_attn.qsa_score_sheet_mb_override = saved_sheet;
     }
     qwen4_qsa_attn.qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
@@ -2508,13 +2507,12 @@ test "qsa score fused: no bank is built under the fused arm" {
     defer _ = mlx.mlx_array_free(pooled);
     try qwen4_qsa.qsaAppendPooled(&xfm, &entry, pooled, 0);
     const saved_fused = qsa_score_fused_override;
-    const saved_nax = nax_gate.vqmm_nax_probe_override;
+    var matrix = @import("sushi_exl3").device.forceMatrix(false);
     defer {
         qsa_score_fused_override = saved_fused;
-        nax_gate.vqmm_nax_probe_override = saved_nax;
+        matrix.end();
     }
     qsa_score_fused_override = false;
-    nax_gate.vqmm_nax_probe_override = false;
     _ = try qwen4_qsa.qsaScoreOperand(&xfm, &entry, 1, nb, hd, false);
     try testing.expect(entry.qsa_score_bank.ctx != null);
     if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
@@ -2523,7 +2521,8 @@ test "qsa score fused: no bank is built under the fused arm" {
     entry.qsa_score_buf = .{ .ctx = null };
     entry.qsa_score_blocks = 0;
     qsa_score_fused_override = true;
-    nax_gate.vqmm_nax_probe_override = null;
+    matrix.end();
+    matrix = @import("sushi_exl3").device.forceMatrix(null);
     qsaScoreFusedArm();
     if (qsaScoreFusedActive()) {
         _ = try qwen4_qsa.qsaScoreOperand(&xfm, &entry, 1, nb, hd, true);

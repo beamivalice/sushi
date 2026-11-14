@@ -2,7 +2,6 @@ const trunk_mod = @import("../trunk.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const qwen4_state = @import("qwen4_state.zig");
 const trunk_helpers_test = @import("../trunk_helpers_test.zig");
-const nax_gate = @import("../nax_gate.zig");
 const ssm_cache = @import("../ssm_cache.zig");
 const std = @import("std");
 const gdn_decode = @import("gdn_decode.zig");
@@ -3623,21 +3622,20 @@ test "GDN vectorized-gate kernel: a per-channel gate that is UNIFORM per head eq
 
 test "GDN pipelined route: NAX Qwen default, eligibility" {
     const saved_blocked = gdn_blocked_override;
-    const saved_nax = nax_gate.vqmm_nax_probe_override;
-    defer {
-        gdn_blocked_override = saved_blocked;
-        nax_gate.vqmm_nax_probe_override = saved_nax;
-    }
+    defer gdn_blocked_override = saved_blocked;
+    var matrix = @import("sushi_exl3").device.forceMatrix(true);
+    defer matrix.end();
     gdn_blocked_override = true;
-    nax_gate.vqmm_nax_probe_override = true;
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
     for ([_][]const u8{ "mimo_v2", "glm5_next", "not_a_served_arch" }) |model_type| {
         try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute(model_type, 64, 128, 128, 2, 4, false, 2).route);
     }
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
-    nax_gate.vqmm_nax_probe_override = false;
+    matrix.end();
+    matrix = @import("sushi_exl3").device.forceMatrix(false);
     try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
-    nax_gate.vqmm_nax_probe_override = true;
+    matrix.end();
+    matrix = @import("sushi_exl3").device.forceMatrix(true);
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
     for ([_]c_int{ 1, 2, 8, 63 }) |seq_len| {
         try testing.expectEqual(GdnRoute.stock, gdnPrefillRoute("qwen4_exp", seq_len, 128, 128, 2, 4, false, 2).route);

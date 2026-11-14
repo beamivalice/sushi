@@ -419,6 +419,11 @@ fn instanceOf(def: *Def, inputs: []const *Tensor, cfg: *const Config) !metal.Pip
 
 pub const LaunchError = core.Error || error{ThreadGroupTooLarge};
 
+/// A test's grant: a kernel whose name starts with `grant_cap_name` (any, when empty) is given at most `grant_cap`
+/// threads a group, as a GPU that grants it less than it asks would.
+pub var grant_cap: usize = std.math.maxInt(usize);
+pub var grant_cap_name: []const u8 = "";
+
 /// The threadgroup limit of the pipeline a launch refused for.
 pub var refused_limit: usize = 0;
 pub var refused_threads: usize = 0;
@@ -448,8 +453,9 @@ pub fn launch(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tens
         else => |other| @as(LaunchError, @errorCast(other)),
     };
     const threads = @as(usize, @intCast(cfg.group[0])) * @as(usize, @intCast(cfg.group[1])) * @as(usize, @intCast(cfg.group[2]));
-    if (threads > pipeline.max_threads) {
-        refused_limit = pipeline.max_threads;
+    const granted = if (std.mem.startsWith(u8, def.name, grant_cap_name)) @min(pipeline.max_threads, grant_cap) else pipeline.max_threads;
+    if (threads > granted) {
+        refused_limit = granted;
         refused_threads = threads;
         return error.ThreadGroupTooLarge;
     }
