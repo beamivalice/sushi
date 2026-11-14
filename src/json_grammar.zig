@@ -14,15 +14,16 @@
 //!
 //! Schema construct support
 //! ========================
-//! Enforced strictly:
+//! Enforced strictly, with no limit on a schema's size:
 //!   * JSON syntax (RFC 8259), including \uXXXX escapes and control-char rejection
 //!   * `type`: object/array/string/number/integer/boolean/null
-//!   * `properties` + `required` + `additionalProperties: false`
+//!   * `properties` + `required` + `additionalProperties` (false, true or a schema)
 //!   * `items` (homogeneous arrays)
-//!   * `enum` / `const` (prefix-matched against canonical JSON encoding)
+//!   * `enum` / `const`: a string member by its decoded value, any other by its canonical JSON text
 //!   * `minItems` / `maxItems`
-//!   * `minLength` / `maxLength` on strings
+//!   * `minLength` / `maxLength` on strings, in characters (code points), as JSON Schema counts them
 //!   * `$ref` to a local pointer (resolved in json_schema.zig; others relax to any)
+//! An object key is matched by its decoded value too, so `"\u0061"` names property `a`.
 //! Best-effort (relaxed) — accept any valid JSON value, rely on prompt for shape:
 //!   * `anyOf` / `oneOf` — treated as "any JSON value" inside the union
 //!   * `pattern`, `minimum`, `maximum`, `exclusiveMinimum/Maximum` — soft prompt-only
@@ -39,6 +40,7 @@
 
 const std = @import("std");
 const schema_mod = @import("json_schema.zig");
+const utf8_seq = @import("utf8_seq.zig");
 
 pub const Schema = schema_mod.Schema;
 pub const Node = schema_mod.Node;
@@ -81,12 +83,32 @@ fn isWs(b: u8) bool {
 
 // ── Frame state types ─────────────────────────────────────────────────────────
 
-const StringPhase = enum { content, after_backslash, unicode_hex };
+const StrPhase = enum(u2) { content, after_backslash, unicode_hex };
 
+/// Lexes a JSON string body one raw byte at a time. What a byte means (a raw byte, or a UTF-16 code unit an escape
+/// spells) is put to a sink, which decides whether the value may go on that way (`stepStr`).
+const StrLex = struct {
+    phase: StrPhase = .content,
+    hex_left: u3 = 0,
+    /// The hex digits of the `\u` escape read so far.
+    unit: u16 = 0,
+};
+
+/// A string value, counted in characters (code points) for `minLength` / `maxLength`.
 const StringState = struct {
-    byte_count: u32 = 0,
-    phase: StringPhase = .content,
-    hex_remaining: u3 = 0,
+    lex: StrLex = .{},
+    chars: u32 = 0,
+    /// The last thing typed was a high-surrogate escape: a low one now completes that character.
+    high: bool = false,
+};
+
+/// Which names of a sorted list a string being typed can still decode to: `[lo, hi)` share the `pos` decoded bytes
+/// so far, and `high` holds a high-surrogate escape waiting for its low half (0 = none).
+const Match = struct {
+    lo: u32,
+    hi: u32,
+    pos: u32 = 0,
+    high: u16 = 0,
 };
 
 const NumberPhase = enum {
@@ -115,12 +137,14 @@ const ObjectPhase = enum {
 
 const ObjectState = struct {
     phase: ObjectPhase,
-    /// Bitset of property indices already seen (max 64 properties).
-    seen: u64 = 0,
-    /// Buffered key being typed.
-    key_buf: [256]u8 = undefined,
-    key_len: u32 = 0,
-    /// Resolved during `:` handling: index of property whose value we're about to read,
+    /// Where this object's words start in `Grammar.seen`: one bit per entry of `obj_properties`.
+    seen_at: u32,
+    /// Properties seen, and how many of those are required.
+    seen_count: u32 = 0,
+    required_seen: u32 = 0,
+    key: StrLex = .{},
+    key_match: Match = .{ .lo = 0, .hi = 0 },
+    /// Resolved when the key closes: index of the property whose value comes next,
     /// or null for an additional-property (free-form key).
     current_prop: ?u32 = null,
 };
@@ -136,10 +160,17 @@ const ArrayState = struct {
     count: u32 = 0,
 };
 
+/// A non-string enum member being typed: `enum_literals[lo..hi]` start with the `pos` bytes so far.
 const EnumState = struct {
-    /// Bitset of enum_values still alive after the prefix typed so far (max 64).
-    alive: u64,
-    byte_count: u32 = 0,
+    lo: u32,
+    hi: u32,
+    pos: u32 = 0,
+};
+
+/// A string enum member being typed, matched by decoded value against `enum_strings`.
+const EnumStringState = struct {
+    lex: StrLex = .{},
+    match: Match,
 };
 
 const KeywordState = struct {
@@ -154,6 +185,7 @@ const FrameSub = union(enum) {
     in_object: ObjectState,
     in_array: ArrayState,
     in_enum: EnumState,
+    in_enum_string: EnumStringState,
     in_keyword: KeywordState,
     accepted,
 };
@@ -173,6 +205,9 @@ pub const Grammar = struct {
     gpa: std.mem.Allocator,
     schema: *const Schema,
     stack: std.ArrayListUnmanaged(Frame),
+    /// The seen-property bits of every open object, outermost first: an object's words are pushed when it opens
+    /// and dropped when it closes, so a schema's property count is no limit.
+    seen: std.ArrayListUnmanaged(u64) = .empty,
     /// Set true once all configurations have rejected and recovery is impossible.
     dead: bool = false,
     ws_run: u16 = 0,
@@ -191,6 +226,7 @@ pub const Grammar = struct {
 
     pub fn deinit(self: *Grammar) void {
         self.stack.deinit(self.gpa);
+        self.seen.deinit(self.gpa);
     }
 
     pub fn isDead(self: *const Grammar) bool {
@@ -201,17 +237,19 @@ pub const Grammar = struct {
     /// closing byte, so it is complete as soon as it could end.
     pub fn isComplete(self: *const Grammar) bool {
         if (self.stack.items.len != 1) return false;
-        return switch (self.stack.items[0].sub) {
+        const root = self.stack.items[0];
+        return switch (root.sub) {
             .accepted => true,
             .in_number => |n| switch (n.phase) {
                 .leading_zero, .int_digits, .frac_digits, .exp_digits => true,
                 .after_minus, .after_dot, .after_exp, .after_exp_sign => false,
             },
+            .in_enum => |e| enumLiteralWhole(root.schema, e),
             else => false,
         };
     }
 
-    /// Bytes still admissible in the string body the next byte lands in
+    /// Characters still admissible in the string body the next byte lands in
     /// (content phase, no escape in flight): `maxLength` minus what was typed,
     /// or `maxInt` when unbounded. Null in every other state.
     pub fn stringBodyRoom(self: *const Grammar) ?u32 {
@@ -221,9 +259,9 @@ pub const Grammar = struct {
             .in_string => |st| st,
             else => return null,
         };
-        if (s.phase != .content) return null;
+        if (s.lex.phase != .content) return null;
         const max = frame.schema.str_max_len orelse return std.math.maxInt(u32);
-        return max -| s.byte_count;
+        return max -| s.chars;
     }
 
     /// Bitset of bytes that would be accepted by the grammar in its current state.
@@ -290,24 +328,30 @@ pub const Grammar = struct {
 
     pub const Snapshot = struct {
         stack: []Frame, // owned
+        seen: []u64, // owned
         dead: bool,
         ws_run: u16,
     };
 
     pub fn snapshot(self: *const Grammar) std.mem.Allocator.Error!Snapshot {
-        const copy = try self.gpa.dupe(Frame, self.stack.items);
-        return .{ .stack = copy, .dead = self.dead, .ws_run = self.ws_run };
+        const stack = try self.gpa.dupe(Frame, self.stack.items);
+        errdefer self.gpa.free(stack);
+        const seen = try self.gpa.dupe(u64, self.seen.items);
+        return .{ .stack = stack, .seen = seen, .dead = self.dead, .ws_run = self.ws_run };
     }
 
     pub fn restoreFrom(self: *Grammar, snap: Snapshot) std.mem.Allocator.Error!void {
         self.stack.clearRetainingCapacity();
         try self.stack.appendSlice(self.gpa, snap.stack);
+        self.seen.clearRetainingCapacity();
+        try self.seen.appendSlice(self.gpa, snap.seen);
         self.dead = snap.dead;
         self.ws_run = snap.ws_run;
     }
 
     pub fn discardSnapshot(self: *const Grammar, snap: Snapshot) void {
         self.gpa.free(snap.stack);
+        self.gpa.free(snap.seen);
     }
 
     fn top(self: *Grammar) *Frame {
@@ -368,6 +412,7 @@ fn advanceOneInner(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
         .in_object => try stepObject(g, byte),
         .in_array => try stepArray(g, byte),
         .in_enum => try stepEnum(g, byte),
+        .in_enum_string => try stepEnumString(g, byte),
         .in_keyword => try stepKeyword(g, byte),
         .accepted => .reject,
     };
@@ -376,7 +421,7 @@ fn advanceOneInner(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
 fn canAcceptFreeWhitespace(frame: *const Frame) bool {
     return switch (frame.sub) {
         .expect_value, .accepted => true,
-        .in_string, .in_keyword, .in_enum => false,
+        .in_string, .in_keyword, .in_enum, .in_enum_string => false,
         .in_number => false,
         .in_object => |o| switch (o.phase) {
             .expect_first_key_or_close, .expect_key, .after_key, .expect_value, .after_value => true,
@@ -402,8 +447,10 @@ fn stepExpectValue(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
         .integer, .number => startNumber(g, byte),
         .string => startString(g, byte),
         .array => startArray(g, byte),
-        .object => startObject(g, byte),
-        .enum_ => startEnum(g, byte),
+        .object => try startObject(g, byte),
+        .enum_ => try startEnum(g, byte),
+        // The parser keeps `false` only where it forbids a key, so no value is ever asked of it.
+        .never => .reject,
         .any, .any_of => blk: {
             // Relaxed: accept any valid JSON value here. A parsed `any` node allows
             // no extra keys, so swap in the free-form one and re-dispatch.
@@ -416,7 +463,7 @@ fn stepExpectValue(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
 fn startAnyValue(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
     return switch (byte) {
         '"' => startString(g, byte),
-        '{' => startObject(g, byte),
+        '{' => try startObject(g, byte),
         '[' => startArray(g, byte),
         't' => try startKeyword(g, byte, "true"),
         'f' => try startKeyword(g, byte, "false"),
@@ -445,7 +492,276 @@ fn stepKeyword(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
     return .consumed;
 }
 
-// ── string ────────────────────────────────────────────────────────────────────
+// ── string body: lexing, length, and matching by decoded value ────────────────
+
+const StrStep = enum { reject, consumed, close };
+
+fn isHighSurrogate(u: u32) bool {
+    return u >= 0xD800 and u <= 0xDBFF;
+}
+
+fn isLowSurrogate(u: u32) bool {
+    return u >= 0xDC00 and u <= 0xDFFF;
+}
+
+/// A UTF-8 continuation byte: it extends the character before it.
+fn isContinuation(b: u8) bool {
+    return b & 0xC0 == 0x80;
+}
+
+fn hexDigit(b: u8) ?u16 {
+    return switch (b) {
+        '0'...'9' => b - '0',
+        'a'...'f' => b - 'a' + 10,
+        'A'...'F' => b - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Whether some code unit whose top `known` hex digits are `prefix` lies in `[lo, hi]`.
+fn unitPrefixMeets(known: u3, prefix: u16, lo: u32, hi: u32) bool {
+    const shift: u5 = @intCast(4 * (4 - @as(u32, known)));
+    const first = @as(u32, prefix) << shift;
+    const last = first + ((@as(u32, 1) << shift) - 1);
+    return first <= hi and last >= lo;
+}
+
+/// One byte of a string body. The sink answers exactly (some continuation exists), so the grammar never enters a
+/// state with no legal byte: `admitsUnit(k, p)` is whether some code unit whose first `k` hex digits are `p` may
+/// come next (`k` 0: any unit at all).
+fn stepStr(lex: *StrLex, byte: u8, sink: anytype) StrStep {
+    switch (lex.phase) {
+        .content => {
+            if (byte == '"') return if (sink.admitsClose()) .close else .reject;
+            if (byte == '\\') {
+                if (!sink.admitsUnit(0, 0)) return .reject;
+                lex.phase = .after_backslash;
+                return .consumed;
+            }
+            if (byte < 0x20 or !sink.admitsByte(byte)) return .reject;
+            sink.takeByte(byte);
+            return .consumed;
+        },
+        .after_backslash => {
+            if (byte == 'u') {
+                lex.* = .{ .phase = .unicode_hex, .hex_left = 4 };
+                return .consumed;
+            }
+            const unit: u16 = switch (byte) {
+                '"', '\\', '/' => byte,
+                'b' => 0x08,
+                'f' => 0x0C,
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                else => return .reject,
+            };
+            if (!sink.admitsUnit(4, unit)) return .reject;
+            sink.takeUnit(unit);
+            lex.phase = .content;
+            return .consumed;
+        },
+        .unicode_hex => {
+            const unit = (lex.unit << 4) | (hexDigit(byte) orelse return .reject);
+            if (!sink.admitsUnit(5 - lex.hex_left, unit)) return .reject;
+            lex.unit = unit;
+            lex.hex_left -= 1;
+            if (lex.hex_left == 0) {
+                sink.takeUnit(unit);
+                lex.phase = .content;
+            }
+            return .consumed;
+        },
+    }
+}
+
+/// A string value's characters against its `minLength` / `maxLength`.
+const LengthSink = struct {
+    s: *StringState,
+    node: *const Node,
+
+    fn full(self: *const LengthSink) bool {
+        const max = self.node.str_max_len orelse return false;
+        return self.s.chars >= max;
+    }
+
+    fn admitsClose(self: *const LengthSink) bool {
+        return self.s.chars >= (self.node.str_min_len orelse 0);
+    }
+
+    fn admitsByte(self: *const LengthSink, b: u8) bool {
+        return isContinuation(b) or !self.full();
+    }
+
+    fn takeByte(self: *LengthSink, b: u8) void {
+        if (!isContinuation(b)) self.s.chars +|= 1;
+        self.s.high = false;
+    }
+
+    fn admitsUnit(self: *const LengthSink, known: u3, prefix: u16) bool {
+        if (!self.full()) return true;
+        return self.s.high and unitPrefixMeets(known, prefix, 0xDC00, 0xDFFF);
+    }
+
+    fn takeUnit(self: *LengthSink, unit: u16) void {
+        if (self.s.high and isLowSurrogate(unit)) {
+            self.s.high = false;
+            return;
+        }
+        self.s.chars +|= 1;
+        self.s.high = isHighSurrogate(unit);
+    }
+};
+
+/// The next UTF-16 code unit `name` holds at byte `pos`, after the pending high surrogate `high` (0 = none); null
+/// when the name ends there, or `pos` is inside a character, or `high` is not this character's high half.
+fn nextUnit(name: []const u8, pos: u32, high: u16) ?u16 {
+    if (pos >= name.len) return null;
+    const n = std.unicode.utf8ByteSequenceLength(name[pos]) catch return null;
+    if (pos + n > name.len) return null;
+    const cp: u32 = utf8_seq.decode(name[pos..][0..n]) orelse return null;
+    if (cp < 0x10000) return if (high == 0) @intCast(cp) else null;
+    const hi_half: u16 = @intCast(0xD800 + ((cp - 0x10000) >> 10));
+    if (high == 0) return hi_half;
+    return if (hi_half == high) @intCast(0xDC00 + ((cp - 0x10000) & 0x3FF)) else null;
+}
+
+/// The names of a sorted list a string is matched against, and which of them it may still become.
+const PropertyNames = struct {
+    node: *const Node,
+    seen: []const u64,
+
+    fn name(self: PropertyNames, i: u32) []const u8 {
+        return self.node.obj_properties[i].name;
+    }
+
+    /// A key may name a property once, and never one whose schema is `false`.
+    fn eligible(self: PropertyNames, i: u32) bool {
+        return self.node.obj_properties[i].schema.kind != .never and !isSeen(self.seen, i);
+    }
+};
+
+const StringNames = struct {
+    names: []const []const u8,
+
+    fn name(self: StringNames, i: u32) []const u8 {
+        return self.names[i];
+    }
+
+    fn eligible(_: StringNames, _: u32) bool {
+        return true;
+    }
+};
+
+/// The first index of `[lo, hi)` (names sharing `pos` bytes, so a name that ends at `pos` sorts first) whose
+/// byte at `pos` is at least `b`.
+fn lowerBound(names: anytype, lo: u32, hi: u32, pos: u32, b: i32) u32 {
+    var l = lo;
+    var h = hi;
+    while (l < h) {
+        const mid = l + (h - l) / 2;
+        const n = names.name(mid);
+        const at: i32 = if (n.len > pos) n[pos] else -1;
+        if (at < b) l = mid + 1 else h = mid;
+    }
+    return l;
+}
+
+/// `[lo, hi)` narrowed to the names whose byte at `pos` is `b`.
+fn narrow(names: anytype, lo: u32, hi: u32, pos: u32, b: u8) struct { lo: u32, hi: u32 } {
+    const from = lowerBound(names, lo, hi, pos, b);
+    return .{ .lo = from, .hi = lowerBound(names, from, hi, pos, @as(i32, b) + 1) };
+}
+
+/// A string matched by decoded value against sorted `names` (an object key, a string enum member). `free`: any
+/// string may be typed (a key under `additionalProperties`), and the match only says which property it names.
+fn MatchSink(comptime Names: type) type {
+    return struct {
+        m: *Match,
+        names: Names,
+        free: bool,
+
+        const Self = @This();
+
+        /// The name the string so far decodes to exactly, if it is one.
+        fn exact(self: *const Self) ?u32 {
+            const m = self.m;
+            if (m.high != 0 or m.lo == m.hi or self.names.name(m.lo).len != m.pos) return null;
+            return m.lo;
+        }
+
+        /// The eligible name the closed string named; null for a free string.
+        fn matched(self: *const Self) ?u32 {
+            const i = self.exact() orelse return null;
+            return if (self.names.eligible(i)) i else null;
+        }
+
+        fn anyEligible(self: *const Self, lo: u32, hi: u32) bool {
+            var i = lo;
+            while (i < hi) : (i += 1) if (self.names.eligible(i)) return true;
+            return false;
+        }
+
+        fn admitsClose(self: *const Self) bool {
+            // A string that spells an ineligible name exactly is refused even when free: a key named twice, or
+            // named although its schema is `false`.
+            if (self.exact()) |i| return self.names.eligible(i);
+            return self.free;
+        }
+
+        fn admitsByte(self: *const Self, b: u8) bool {
+            if (self.free) return true;
+            if (self.m.high != 0) return false;
+            const r = narrow(self.names, self.m.lo, self.m.hi, self.m.pos, b);
+            return self.anyEligible(r.lo, r.hi);
+        }
+
+        fn takeByte(self: *Self, b: u8) void {
+            if (self.m.high != 0) return self.diverge(); // a lone high surrogate names nothing
+            const r = narrow(self.names, self.m.lo, self.m.hi, self.m.pos, b);
+            self.m.lo = r.lo;
+            self.m.hi = r.hi;
+            self.m.pos += 1;
+        }
+
+        fn admitsUnit(self: *const Self, known: u3, prefix: u16) bool {
+            if (self.free) return true;
+            var i = self.m.lo;
+            while (i < self.m.hi) : (i += 1) {
+                if (!self.names.eligible(i)) continue;
+                const u = nextUnit(self.names.name(i), self.m.pos, self.m.high) orelse continue;
+                if (unitPrefixMeets(known, prefix, u, u)) return true;
+            }
+            return false;
+        }
+
+        fn takeUnit(self: *Self, unit: u16) void {
+            if (self.m.high != 0) {
+                if (!isLowSurrogate(unit)) return self.diverge();
+                const cp: u21 = @intCast(0x10000 + ((@as(u32, self.m.high) - 0xD800) << 10) + (unit - 0xDC00));
+                self.m.high = 0;
+                return self.takeCodepoint(cp);
+            }
+            if (isHighSurrogate(unit)) {
+                self.m.high = unit;
+                return;
+            }
+            if (isLowSurrogate(unit)) return self.diverge();
+            self.takeCodepoint(unit);
+        }
+
+        fn takeCodepoint(self: *Self, cp: u21) void {
+            var buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(cp, &buf) catch unreachable; // never a surrogate here
+            for (buf[0..n]) |b| self.takeByte(b);
+        }
+
+        fn diverge(self: *Self) void {
+            self.m.lo = self.m.hi;
+            self.m.high = 0;
+        }
+    };
+}
 
 fn startString(g: *Grammar, byte: u8) StepResult {
     if (byte != '"') return .reject;
@@ -454,60 +770,15 @@ fn startString(g: *Grammar, byte: u8) StepResult {
 }
 
 fn stepString(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
-    var s = g.top().sub.in_string;
-    const schema = g.top().schema;
-
-    switch (s.phase) {
-        .content => {
-            if (byte == '"') {
-                if (schema.str_min_len) |min| if (s.byte_count < min) return .reject;
-                try popAccepted(g);
-                return .consumed;
-            }
-            if (byte == '\\') {
-                // An escape counts as one byte: none fits once the body is full.
-                if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
-                s.phase = .after_backslash;
-                g.top().sub = .{ .in_string = s };
-                return .consumed;
-            }
-            if (byte < 0x20) return .reject;
-            if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
-            s.byte_count += 1;
-            g.top().sub = .{ .in_string = s };
-            return .consumed;
-        },
-        .after_backslash => {
-            switch (byte) {
-                '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {
-                    if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
-                    s.byte_count += 1;
-                    s.phase = .content;
-                    g.top().sub = .{ .in_string = s };
-                    return .consumed;
-                },
-                'u' => {
-                    s.phase = .unicode_hex;
-                    s.hex_remaining = 4;
-                    g.top().sub = .{ .in_string = s };
-                    return .consumed;
-                },
-                else => return .reject,
-            }
-        },
-        .unicode_hex => {
-            const ok = (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f') or (byte >= 'A' and byte <= 'F');
-            if (!ok) return .reject;
-            s.hex_remaining -= 1;
-            if (s.hex_remaining == 0) {
-                if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
-                s.byte_count += 1;
-                s.phase = .content;
-            }
-            g.top().sub = .{ .in_string = s };
-            return .consumed;
-        },
+    const frame = g.top();
+    var s = frame.sub.in_string;
+    var sink: LengthSink = .{ .s = &s, .node = frame.schema };
+    switch (stepStr(&s.lex, byte, &sink)) {
+        .reject => return .reject,
+        .close => try popAccepted(g),
+        .consumed => frame.sub = .{ .in_string = s },
     }
+    return .consumed;
 }
 
 // ── number ────────────────────────────────────────────────────────────────────
@@ -596,60 +867,71 @@ fn numberEndAndReplay(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult 
 
 // ── enum ──────────────────────────────────────────────────────────────────────
 
-fn startEnum(g: *Grammar, byte: u8) StepResult {
+fn startEnum(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
     const schema = g.top().schema;
-    var alive: u64 = 0;
-    var i: u32 = 0;
-    while (i < 64 and i < schema.enum_values.len) : (i += 1) {
-        const ev = schema.enum_values[i].json;
-        if (ev.len > 0 and ev[0] == byte) alive |= (@as(u64, 1) << @intCast(i));
+    if (byte == '"' and schema.enum_strings.len > 0) {
+        g.top().sub = .{ .in_enum_string = .{ .match = .{ .lo = 0, .hi = @intCast(schema.enum_strings.len) } } };
+        return .consumed;
     }
-    if (alive == 0) return .reject;
-    g.top().sub = .{ .in_enum = .{ .alive = alive, .byte_count = 1 } };
-    maybeCompleteEnum(g) catch unreachable;
-    return .consumed;
+    g.top().sub = .{ .in_enum = .{ .lo = 0, .hi = @intCast(schema.enum_literals.len) } };
+    return stepEnum(g, byte);
+}
+
+/// A literal typed whole, though a longer one may still follow it (`1` before `10`).
+fn enumLiteralWhole(schema: *const Node, e: EnumState) bool {
+    return e.lo < e.hi and schema.enum_literals[e.lo].len == e.pos;
 }
 
 fn stepEnum(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
-    var e = g.top().sub.in_enum;
+    const e = g.top().sub.in_enum;
     const schema = g.top().schema;
-    var new_alive: u64 = 0;
-    var i: u32 = 0;
-    while (i < 64 and i < schema.enum_values.len) : (i += 1) {
-        if ((e.alive >> @intCast(i)) & 1 == 0) continue;
-        const ev = schema.enum_values[i].json;
-        if (ev.len > e.byte_count and ev[e.byte_count] == byte) {
-            new_alive |= (@as(u64, 1) << @intCast(i));
-        }
+    const r = narrow(StringNames{ .names = schema.enum_literals }, e.lo, e.hi, e.pos, byte);
+    if (r.lo == r.hi) {
+        // A whole literal followed by a byte that extends none ends before it: a number's terminator.
+        if (!enumLiteralWhole(schema, e)) return .reject;
+        try popAccepted(g);
+        return .{ .replay = byte };
     }
-    if (new_alive == 0) return .reject;
-    e.alive = new_alive;
-    e.byte_count += 1;
-    g.top().sub = .{ .in_enum = e };
-    try maybeCompleteEnum(g);
+    const next: EnumState = .{ .lo = r.lo, .hi = r.hi, .pos = e.pos + 1 };
+    g.top().sub = .{ .in_enum = next };
+    // Done once every literal left ends here.
+    if (schema.enum_literals[next.hi - 1].len == next.pos) try popAccepted(g);
     return .consumed;
 }
 
-fn maybeCompleteEnum(g: *Grammar) std.mem.Allocator.Error!void {
-    if (g.top().sub != .in_enum) return;
-    const e = g.top().sub.in_enum;
-    const schema = g.top().schema;
-    var i: u32 = 0;
-    while (i < 64 and i < schema.enum_values.len) : (i += 1) {
-        if ((e.alive >> @intCast(i)) & 1 == 0) continue;
-        if (schema.enum_values[i].json.len == e.byte_count) {
-            try popAccepted(g);
-            return;
-        }
+fn stepEnumString(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    const frame = g.top();
+    var e = frame.sub.in_enum_string;
+    var sink: MatchSink(StringNames) = .{ .m = &e.match, .names = .{ .names = frame.schema.enum_strings }, .free = false };
+    switch (stepStr(&e.lex, byte, &sink)) {
+        .reject => return .reject,
+        .close => try popAccepted(g),
+        .consumed => frame.sub = .{ .in_enum_string = e },
     }
+    return .consumed;
 }
 
 // ── object ────────────────────────────────────────────────────────────────────
 
-fn startObject(g: *Grammar, byte: u8) StepResult {
+fn seenWords(n_props: usize) usize {
+    return (n_props + 63) / 64;
+}
+
+fn isSeen(seen: []const u64, i: u32) bool {
+    return (seen[i / 64] >> @intCast(i % 64)) & 1 != 0;
+}
+
+fn startObject(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
     if (byte != '{') return .reject;
-    g.top().sub = .{ .in_object = .{ .phase = .expect_first_key_or_close } };
+    const seen_at: u32 = @intCast(g.seen.items.len);
+    try g.seen.appendNTimes(g.gpa, 0, seenWords(g.top().schema.obj_properties.len));
+    g.top().sub = .{ .in_object = .{ .phase = .expect_first_key_or_close, .seen_at = seen_at } };
     return .consumed;
+}
+
+/// Some key can still be opened: a free-form one, or a property not yet seen.
+fn keyRemains(schema: *const Node, o: ObjectState) bool {
+    return schema.obj_additional or o.seen_count < schema.obj_open;
 }
 
 fn stepObject(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
@@ -659,35 +941,30 @@ fn stepObject(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
     switch (o.phase) {
         .expect_first_key_or_close, .expect_key => |phase| {
             if (phase == .expect_first_key_or_close and byte == '}') {
-                if (!requiredAllSeen(schema, o.seen)) return .reject;
+                if (o.required_seen < schema.obj_required) return .reject;
                 try popAccepted(g);
                 return .consumed;
             }
             if (byte != '"') return .reject;
             // A key with no property left to match and no free-form keys is a dead end.
-            if (!schema.obj_additional and allPropertiesSeen(schema, o.seen)) return .reject;
+            if (!keyRemains(schema, o)) return .reject;
             o.phase = .in_key;
-            o.key_len = 0;
+            o.key = .{};
+            o.key_match = .{ .lo = 0, .hi = @intCast(schema.obj_properties.len) };
             g.top().sub = .{ .in_object = o };
             return .consumed;
         },
         .in_key => {
-            if (byte == '"') {
-                const matched = matchPropertyName(schema, o.key_buf[0..o.key_len], o.seen);
-                if (matched.matched_index == null and !schema.obj_additional) return .reject;
-                o.current_prop = matched.matched_index;
-                o.phase = .after_key;
-                g.top().sub = .{ .in_object = o };
-                return .consumed;
+            const names: PropertyNames = .{ .node = schema, .seen = g.seen.items[o.seen_at..][0..seenWords(schema.obj_properties.len)] };
+            var sink: MatchSink(PropertyNames) = .{ .m = &o.key_match, .names = names, .free = schema.obj_additional };
+            switch (stepStr(&o.key, byte, &sink)) {
+                .reject => return .reject,
+                .consumed => {},
+                .close => {
+                    o.current_prop = sink.matched();
+                    o.phase = .after_key;
+                },
             }
-            if (byte < 0x20) return .reject;
-            // Any byte may extend the key if (a) it could match an unseen property's
-            // next char OR (b) additionalProperties is allowed (free-form key).
-            const matches_property = keyByteMatchesProperty(schema, o.key_buf[0..o.key_len], o.seen, byte);
-            if (!matches_property and !schema.obj_additional) return .reject;
-            if (o.key_len >= o.key_buf.len) return .reject;
-            o.key_buf[o.key_len] = byte;
-            o.key_len += 1;
             g.top().sub = .{ .in_object = o };
             return .consumed;
         },
@@ -698,16 +975,17 @@ fn stepObject(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
             return .consumed;
         },
         .expect_value => {
-            const child_schema = if (o.current_prop) |idx|
-                schema.obj_properties[idx].schema
-            else
-                anyNode();
+            var child = schema.obj_additional_schema orelse anyNode();
             if (o.current_prop) |idx| {
-                o.seen |= (@as(u64, 1) << @intCast(idx));
+                const prop = schema.obj_properties[idx];
+                child = prop.schema;
+                g.seen.items[o.seen_at + idx / 64] |= @as(u64, 1) << @intCast(idx % 64);
+                o.seen_count += 1;
+                o.required_seen += @intFromBool(prop.required);
             }
             o.phase = .after_value;
             g.top().sub = .{ .in_object = o };
-            try g.stack.append(g.gpa, .{ .schema = child_schema, .sub = .expect_value });
+            try g.stack.append(g.gpa, .{ .schema = child, .sub = .expect_value });
             return .{ .replay = byte };
         },
         .after_value => {
@@ -717,62 +995,19 @@ fn stepObject(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
                 // expect_key state it leads to has no legal byte at all — an
                 // empty mask, which the sampler cannot express. Reject here so
                 // `}` stays the only way out.
-                if (!schema.obj_additional and allPropertiesSeen(schema, o.seen)) return .reject;
+                if (!keyRemains(schema, o)) return .reject;
                 o.phase = .expect_key;
                 g.top().sub = .{ .in_object = o };
                 return .consumed;
             }
             if (byte == '}') {
-                if (!requiredAllSeen(schema, o.seen)) return .reject;
+                if (o.required_seen < schema.obj_required) return .reject;
                 try popAccepted(g);
                 return .consumed;
             }
             return .reject;
         },
     }
-}
-
-/// Every declared property already used. With `additionalProperties:false`
-/// this is the point where no further key can be opened. Bitmask compare, not
-/// a loop: `stepObject` runs once per candidate TOKEN per generated token
-/// inside `buildMask`, so anything here is on the mask-build hot path.
-fn allPropertiesSeen(schema: *const Node, seen: u64) bool {
-    const n = @min(schema.obj_properties.len, 64);
-    const all: u64 = if (n == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n)) - 1;
-    return (seen & all) == all;
-}
-
-const PropertyMatchResult = struct {
-    matched_index: ?u32,
-};
-
-fn matchPropertyName(schema: *const Node, name: []const u8, seen: u64) PropertyMatchResult {
-    for (schema.obj_properties, 0..) |p, i| {
-        if (i >= 64) break;
-        if (((seen >> @intCast(i)) & 1) != 0) continue;
-        if (std.mem.eql(u8, p.name, name)) return .{ .matched_index = @intCast(i) };
-    }
-    return .{ .matched_index = null };
-}
-
-fn keyByteMatchesProperty(schema: *const Node, prefix: []const u8, seen: u64, byte: u8) bool {
-    for (schema.obj_properties, 0..) |p, i| {
-        if (i >= 64) break;
-        if (((seen >> @intCast(i)) & 1) != 0) continue;
-        if (p.name.len <= prefix.len) continue;
-        if (!std.mem.startsWith(u8, p.name, prefix)) continue;
-        if (p.name[prefix.len] == byte) return true;
-    }
-    return false;
-}
-
-fn requiredAllSeen(schema: *const Node, seen: u64) bool {
-    for (schema.obj_properties, 0..) |p, i| {
-        if (i >= 64) break;
-        if (!p.required) continue;
-        if (((seen >> @intCast(i)) & 1) == 0) return false;
-    }
-    return true;
 }
 
 // ── array ─────────────────────────────────────────────────────────────────────
@@ -831,7 +1066,10 @@ fn stepArray(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn popAccepted(g: *Grammar) std.mem.Allocator.Error!void {
-    g.top().sub = .accepted;
+    const frame = g.top();
+    // A closed object's seen bits are the top of `seen`: objects close innermost first.
+    if (frame.sub == .in_object) g.seen.shrinkRetainingCapacity(frame.sub.in_object.seen_at);
+    frame.sub = .accepted;
     if (g.stack.items.len <= 1) return; // root accepted, leave on stack
     _ = g.stack.pop();
     // Parent state is already in its post-value phase (e.g., object.after_value);
@@ -1320,6 +1558,11 @@ test "no reachable grammar state is a dead end" {
         "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\"},\"ab\":{\"type\":\"null\"}},\"required\":[\"a\",\"ab\"]}",
         "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"maxLength\":1},\"maxItems\":1},\"minItems\":1}",
         "{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"string\"}]}",
+        "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"},\"é😀\":{\"type\":\"null\"},\"ab\":{\"enum\":[\"x\",\"é\",1,10]}},\"required\":[\"a\"],\"additionalProperties\":false}",
+        "{\"type\":\"string\",\"minLength\":1,\"maxLength\":2}",
+        "{\"type\":\"object\",\"required\":[\"b\"],\"additionalProperties\":{\"type\":\"integer\"}}",
+        "{\"type\":\"array\",\"items\":false}",
+        "{\"enum\":[1,10,1.5,\"1\",\"😀\"]}",
     };
     for (schemas) |src| {
         var schema = try parseSchema(testing.allocator, src);
@@ -1397,4 +1640,99 @@ test "grammar enforces a recursive $ref at every depth" {
     var bad = try Grammar.init(testing.allocator, &schema);
     defer bad.deinit();
     try testing.expectError(error.GrammarRejected, feed(&bad, "{\"name\":\"a\",\"children\":[{\"x"));
+}
+
+/// Whether the grammar takes `doc` whole as a finished value of `schema_src`.
+fn conforms(gpa: std.mem.Allocator, schema_src: []const u8, doc: []const u8) !bool {
+    var schema = try parseSchema(gpa, schema_src);
+    defer schema.deinit();
+    var g = try Grammar.init(gpa, &schema);
+    defer g.deinit();
+    for (doc) |b| if (!try g.acceptByte(b)) return false;
+    return g.isComplete();
+}
+
+// The grammar admits a document exactly when it is valid under the schema: never a valid one masked away, never an
+// invalid one let through. Lengths count characters and strings compare by decoded value, as JSON Schema does.
+test "the grammar admits exactly the documents the schema accepts" {
+    const Case = struct { schema: []const u8, doc: []const u8, valid: bool };
+    const max2 = "{\"type\":\"string\",\"maxLength\":2}";
+    const max1 = "{\"type\":\"string\",\"maxLength\":1}";
+    const min2 = "{\"type\":\"string\",\"minLength\":2}";
+    const req_b = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}},\"required\":[\"b\"],\"additionalProperties\":true}";
+    const extra_int = "{\"type\":\"object\",\"required\":[\"b\"],\"additionalProperties\":{\"type\":\"integer\"}}";
+    const key_a = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}},\"required\":[\"a\"],\"additionalProperties\":false}";
+    const no_x = "{\"type\":\"object\",\"properties\":{\"x\":false},\"additionalProperties\":true}";
+    const nums = "{\"enum\":[1,10,1.5,\"1\"]}";
+    const cases = [_]Case{
+        .{ .schema = max2, .doc = "\"éé\"", .valid = true },
+        .{ .schema = max2, .doc = "\"ééé\"", .valid = false },
+        .{ .schema = max2, .doc = "\"日本\"", .valid = true },
+        .{ .schema = min2, .doc = "\"é\"", .valid = false },
+        .{ .schema = min2, .doc = "\"\\u00e9\"", .valid = false },
+        .{ .schema = min2, .doc = "\"é\\n\"", .valid = true },
+        .{ .schema = max1, .doc = "\"😀\"", .valid = true },
+        .{ .schema = max1, .doc = "\"\\ud83d\\ude00\"", .valid = true },
+        .{ .schema = max1, .doc = "\"\\u00e9\\u00e9\"", .valid = false },
+        .{ .schema = max1, .doc = "\"\\ud83dx\"", .valid = false },
+        .{ .schema = req_b, .doc = "{\"a\":1}", .valid = false },
+        .{ .schema = req_b, .doc = "{\"a\":1,\"b\":[2]}", .valid = true },
+        .{ .schema = extra_int, .doc = "{\"b\":\"x\"}", .valid = false },
+        .{ .schema = extra_int, .doc = "{\"c\":1,\"b\":2}", .valid = true },
+        .{ .schema = extra_int, .doc = "{\"b\":2,\"c\":true}", .valid = false },
+        .{ .schema = key_a, .doc = "{\"\\u0061\":1}", .valid = true },
+        .{ .schema = key_a, .doc = "{\"\\u0062\":1}", .valid = false },
+        .{ .schema = "{\"type\":\"string\",\"enum\":[\"é\"]}", .doc = "\"\\u00e9\"", .valid = true },
+        .{ .schema = "{\"enum\":[\"😀\",\"x\"]}", .doc = "\"\\ud83d\\ude00\"", .valid = true },
+        .{ .schema = "{\"enum\":[\"😀\",\"x\"]}", .doc = "\"\\ud83d\"", .valid = false },
+        .{ .schema = "{\"type\":\"array\",\"items\":false}", .doc = "[]", .valid = true },
+        .{ .schema = "{\"type\":\"array\",\"items\":false}", .doc = "[1]", .valid = false },
+        .{ .schema = no_x, .doc = "{\"x\":1}", .valid = false },
+        .{ .schema = no_x, .doc = "{\"y\":1}", .valid = true },
+        .{ .schema = nums, .doc = "10", .valid = true },
+        .{ .schema = nums, .doc = "1", .valid = true },
+        .{ .schema = nums, .doc = "1.5", .valid = true },
+        .{ .schema = nums, .doc = "\"1\"", .valid = true },
+        .{ .schema = nums, .doc = "15", .valid = false },
+        .{ .schema = "{\"type\":\"array\",\"items\":{\"enum\":[1,10]}}", .doc = "[10,1]", .valid = true },
+    };
+    for (cases) |c| {
+        const got = try conforms(testing.allocator, c.schema, c.doc);
+        errdefer std.debug.print("\nschema {s}\ndoc {s}: admitted={}\n", .{ c.schema, c.doc, got });
+        try testing.expectEqual(c.valid, got);
+    }
+}
+
+// A schema's size is no limit: every enum member and every property stays reachable and required.
+test "the grammar enforces enums and objects past 64 members and names past 256 bytes" {
+    const a = testing.allocator;
+    var src: std.ArrayListUnmanaged(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "{\"enum\":[");
+    for (0..200) |i| try src.print(a, "{s}\"v{d}\"", .{ if (i > 0) "," else "", i });
+    try src.appendSlice(a, "]}");
+    try testing.expect(try conforms(a, src.items, "\"v64\""));
+    try testing.expect(try conforms(a, src.items, "\"v199\""));
+    try testing.expect(!try conforms(a, src.items, "\"v200\""));
+
+    src.clearRetainingCapacity();
+    try src.appendSlice(a, "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{");
+    for (0..65) |i| try src.print(a, "{s}\"p{d:0>3}\":{{\"type\":\"integer\"}}", .{ if (i > 0) "," else "", i });
+    try src.appendSlice(a, "},\"required\":[");
+    for (0..65) |i| try src.print(a, "{s}\"p{d:0>3}\"", .{ if (i > 0) "," else "", i });
+    try src.appendSlice(a, "]}");
+    var doc: std.ArrayListUnmanaged(u8) = .empty;
+    defer doc.deinit(a);
+    try doc.append(a, '{');
+    for (0..64) |i| try doc.print(a, "{s}\"p{d:0>3}\":0", .{ if (i > 0) "," else "", i });
+    const missing_last = doc.items.len;
+    try doc.append(a, '}');
+    try testing.expect(!try conforms(a, src.items, doc.items));
+    doc.shrinkRetainingCapacity(missing_last);
+    try doc.appendSlice(a, ",\"p064\":0}");
+    try testing.expect(try conforms(a, src.items, doc.items));
+
+    const long: [300]u8 = @splat('k');
+    const long_schema = "{\"type\":\"object\",\"properties\":{\"" ++ long ++ "\":{\"type\":\"null\"}},\"required\":[\"" ++ long ++ "\"]}";
+    try testing.expect(try conforms(a, long_schema, "{\"" ++ long ++ "\":null}"));
 }

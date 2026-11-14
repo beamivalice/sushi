@@ -135,6 +135,16 @@ req POST /v1/responses "{\"model\":\"m\",\"max_output_tokens\":20,\"text\":{\"fo
 expect_status 400 "responses: strict text.format schema the grammar cannot parse"
 req POST /v1/responses "{\"model\":\"m\",\"max_output_tokens\":20,\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"x\",\"strict\":true,\"schema\":$GOODSCHEMA}},\"tools\":[{\"type\":\"function\",\"name\":\"noop\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}],\"input\":\"hi\"}"
 expect_status 400 "responses: strict text.format beside tools is refused"
+req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"x\",\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{},\"required\":[\"b\"]}}},\"max_tokens\":20}"
+expect_status 400 "chat: a strict schema no value meets is refused"
+[[ "$(echo "$BODY" | J 'd["error"]["message"]')" == *"required 'b'"* ]] && ok "chat: the refusal names the key" || bad "chat: the refusal names the key" "${BODY:0:160}"
+req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":20,\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"string\",\"maxLength\":4294967296}}},\"messages\":[$U]}"
+expect_status 400 "messages: a count past u32 is refused, not wrapped"
+# A required key outside `properties` takes the additionalProperties schema: the mask makes it present and an integer.
+req POST /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":"'"$N"' Give a JSON object with a key a."}],"response_format":{"type":"json_schema","json_schema":{"name":"x","strict":true,"schema":{"type":"object","properties":{"a":{"type":"integer"}},"required":["a","n"],"additionalProperties":{"type":"integer"}}}},"max_tokens":60,"temperature":0,'"$NT_CHAT"'}'
+C=$(echo "$BODY" | J "$CONTENT")
+echo "$C" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert type(d["a"]) is int and type(d["n"]) is int and all(type(v) is int for v in d.values())' 2>/dev/null \
+    && ok "a required key outside properties is enforced with the additionalProperties schema" || bad "required key outside properties" "${C:0:160}"
 req POST /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":"'"$N"' Describe a cat."}],"response_format":{"type":"json_schema","json_schema":{"name":"x","strict":true,"schema":{"type":"object","properties":{"kind":{"type":"string","enum":["cat","dog"]},"legs":{"type":"integer"},"tags":{"type":"array","items":{"type":"string"}},"meta":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}},"required":["kind","legs","tags","meta"],"additionalProperties":false}}},"max_tokens":160,"temperature":0,'"$NT_CHAT"'}'
 C=$(echo "$BODY" | J "$CONTENT")
 echo "$C" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d["kind"] in ("cat","dog") and isinstance(d["legs"],int) and isinstance(d["tags"],list) and isinstance(d["meta"]["ok"],bool) and set(d)=={"kind","legs","tags","meta"}' 2>/dev/null \

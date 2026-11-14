@@ -357,7 +357,7 @@ pub fn parseRow(f: Family, word: Effort, v: std.json.Value, problem: *?Problem) 
             } else out.offered = x.bool;
         } else if (std.mem.eql(u8, name, "sends")) {
             const s: ?Sends = switch (x) {
-                .integer => |i| if (f.takesScale() and i >= 1 and i <= 100) Sends{ .scale = @intCast(i) } else null,
+                .integer => |i| if (f.takesScale() and i >= 1 and i <= 100) Sends{ .scale = std.math.cast(u8, i).? } else null,
                 .string => |text| if (!f.takesScale()) (if (std.meta.stringToEnum(Effort, text)) |e| Sends{ .word = e } else null) else null,
                 else => null,
             };
@@ -367,7 +367,7 @@ pub fn parseRow(f: Family, word: Effort, v: std.json.Value, problem: *?Problem) 
         } else if (std.mem.eql(u8, name, "cap")) {
             const cap: ?i32 = switch (x) {
                 .null => null,
-                .integer => |i| if (i >= 1 and i <= std.math.maxInt(i32)) @intCast(i) else 0,
+                .integer => |i| if (i >= 1) std.math.cast(i32, i) orelse 0 else 0,
                 else => 0,
             };
             if (checkCap(word, cap)) |why| {

@@ -2,8 +2,8 @@
 //!
 //! Supports the "common" subset:
 //!   * type (single string or array, incl. null/integer/number/string/boolean/object/array)
-//!   * properties / required / additionalProperties
-//!   * items (homogeneous array)
+//!   * properties / required / additionalProperties (a boolean or a schema)
+//!   * items (homogeneous array, `false` for none)
 //!   * anyOf / oneOf (treated identically for grammar purposes)
 //!   * enum / const (treated as a 1-element enum)
 //!   * minLength / maxLength
@@ -11,9 +11,11 @@
 //!   * minimum / maximum / exclusiveMinimum / exclusiveMaximum
 //!   * pattern (regex; see regex.zig)
 //!   * $ref to a local JSON pointer (`#`, `#/$defs/Name`, `#/definitions/Name`),
-//!     recursive refs included; any other ref stays `any`
+//!     recursive refs included; any other ref relaxes to `any` and is named in `Schema.relaxed`
+//!   * the boolean schemas `true` (any value) and `false` (no value)
 //!
 //! Strict OpenAI mode: when `additionalProperties` is unspecified, defaults to `false`.
+//! A schema no value can meet, or a count past u32, is refused by name (`Detail`), never relaxed.
 //!
 //! A `Schema` owns an arena allocator; freeing the schema frees every node, string,
 //! property name, and compiled regex in one shot.
@@ -23,6 +25,8 @@ const regex = @import("regex.zig");
 
 pub const Kind = enum {
     any,
+    /// No value (the schema `false`); kept only as a property's schema, where it forbids that key.
+    never,
     null_,
     boolean,
     integer,
@@ -60,26 +64,31 @@ pub const Node = struct {
     arr_max_items: ?u32 = null,
 
     // object
-    obj_properties: []const Property = &.{}, // sorted alphabetically by name
+    /// Declared properties plus every `required` name `properties` lacks, sorted by name bytes.
+    obj_properties: []const Property = &.{},
     obj_additional: bool = false,
+    /// The schema an undeclared key's value meets when `obj_additional`; null = any value.
+    obj_additional_schema: ?*const Node = null,
+    /// Properties a key may name (schema not `false`), and how many properties are required.
+    obj_open: u32 = 0,
+    obj_required: u32 = 0,
 
     // enum / const
-    enum_values: []const EnumValue = &.{},
+    /// The string members, decoded, sorted by bytes.
+    enum_strings: []const []const u8 = &.{},
+    /// Every other member as canonical JSON text, sorted by bytes.
+    enum_literals: []const []const u8 = &.{},
 
     // any_of (and one_of)
     any_of_options: []const *const Node = &.{},
 };
 
-/// A single enum/const value rendered as canonical JSON text.
-/// Keeping the textual form lets the grammar prefix-match incrementally.
-pub const EnumValue = struct {
-    /// Canonical JSON encoding, e.g. `"text"`, `42`, `true`, `null`, `{"a":1}`.
-    json: []const u8,
-};
-
 pub const Schema = struct {
     arena: std.heap.ArenaAllocator,
     root: *const Node,
+    /// The first construct the parser relaxed to `any` (an unresolved `$ref`), named; null when there is none.
+    /// The grammar's own best-effort constructs (anyOf, pattern, numeric bounds) are not counted here.
+    relaxed: ?[]const u8 = null,
 
     pub fn deinit(self: *Schema) void {
         self.arena.deinit();
@@ -98,7 +107,7 @@ pub const ParseError = error{
 
 /// What `parseExplained` could not enforce, in words a client can act on.
 pub const Detail = struct {
-    buf: [96]u8 = undefined,
+    buf: [128]u8 = undefined,
     len: usize = 0,
 
     pub fn text(self: *const Detail) []const u8 {
@@ -126,6 +135,8 @@ pub fn parseExplained(gpa: std.mem.Allocator, value: std.json.Value, detail: ?*D
     var ctx: Ctx = .{ .arena = schema.arena.allocator(), .root = value, .detail = detail };
     // The root is the `#` ref, so a recursive ref back to it lands on this node.
     schema.root = try parseRef(&ctx, "#", 0);
+    if (schema.root.kind == .never) return ctx.invalid("the schema is false: no value conforms", .{});
+    schema.relaxed = ctx.relaxed;
     return schema;
 }
 
@@ -134,26 +145,48 @@ const Ctx = struct {
     root: std.json.Value,
     refs: std.StringHashMapUnmanaged(*Node) = .empty,
     detail: ?*Detail = null,
+    relaxed: ?[]const u8 = null,
+
+    fn refuse(self: *Ctx, err: ParseError, comptime fmt: []const u8, args: anytype) ParseError {
+        if (self.detail) |d| d.set(fmt, args);
+        return err;
+    }
 
     fn unsupported(self: *Ctx, comptime fmt: []const u8, args: anytype) ParseError {
-        if (self.detail) |d| d.set(fmt, args);
-        return error.UnsupportedConstruct;
+        return self.refuse(error.UnsupportedConstruct, fmt, args);
+    }
+
+    fn invalid(self: *Ctx, comptime fmt: []const u8, args: anytype) ParseError {
+        return self.refuse(error.InvalidSchema, fmt, args);
+    }
+
+    /// A construct the grammar cannot enforce becomes `any`, and the first one is named for the strict gate.
+    fn relax(self: *Ctx, comptime fmt: []const u8, args: anytype) ParseError!*const Node {
+        if (self.relaxed == null) self.relaxed = try std.fmt.allocPrint(self.arena, fmt, args);
+        return leaf(self.arena, .any);
     }
 };
+
+/// A client's name or value cut to what a message can carry.
+fn clip(s: []const u8) []const u8 {
+    return s[0..@min(s.len, 40)];
+}
 
 /// The slot is memoised before its target parses, so a recursive ref points back at it;
 /// the grammar only follows a child when it descends into it.
 fn parseRef(ctx: *Ctx, ref: []const u8, depth: usize) ParseError!*const Node {
     if (ctx.refs.get(ref)) |slot| return slot;
-    var target = resolvePointer(ctx.root, ref) orelse return anyLeaf(ctx.arena);
+    var target = resolvePointer(ctx.root, ref) orelse return ctx.relax("$ref '{s}' does not resolve to a local schema", .{clip(ref)});
     var hops: u8 = 0;
     while (target == .object) : (hops += 1) {
         const next = target.object.get("$ref") orelse break;
         if (next != .string) break;
-        if (hops == 16) return anyLeaf(ctx.arena); // a ref chain that never reaches a schema
-        target = resolvePointer(ctx.root, next.string) orelse return anyLeaf(ctx.arena);
+        if (hops == 16) return ctx.relax("$ref '{s}' never reaches a schema", .{clip(ref)});
+        target = resolvePointer(ctx.root, next.string) orelse return ctx.relax("$ref '{s}' does not resolve to a local schema", .{clip(next.string)});
     }
     const slot = try ctx.arena.create(Node);
+    // What a ref back into this slot reads while its target parses: a cycle is never the schema `false`.
+    slot.* = .{ .kind = .any };
     try ctx.refs.put(ctx.arena, ref, slot);
     slot.* = (try parseNode(ctx, target, depth)).*;
     return slot;
@@ -183,24 +216,17 @@ fn resolvePointer(root: std.json.Value, ref: []const u8) ?std.json.Value {
     return node;
 }
 
-fn anyLeaf(arena: std.mem.Allocator) ParseError!*const Node {
+fn leaf(arena: std.mem.Allocator, kind: Kind) ParseError!*const Node {
     const node = try arena.create(Node);
-    node.* = .{ .kind = .any };
+    node.* = .{ .kind = kind };
     return node;
 }
 
 fn parseNode(ctx: *Ctx, value: std.json.Value, depth: usize) ParseError!*const Node {
     const arena = ctx.arena;
-    if (depth > max_schema_depth) return error.InvalidSchema;
-    if (value != .object) {
-        // Boolean schema: `true` (any), `false` (none — we don't model "none").
-        if (value == .bool) {
-            const node = try arena.create(Node);
-            node.* = .{ .kind = .any };
-            return node;
-        }
-        return error.InvalidSchema;
-    }
+    if (depth > max_schema_depth) return ctx.invalid("schema nesting is deeper than {d}", .{max_schema_depth});
+    if (value == .bool) return leaf(arena, if (value.bool) .any else .never);
+    if (value != .object) return ctx.invalid("a schema must be an object or a boolean", .{});
     const obj = value.object;
 
     if (obj.get("$ref")) |r| {
@@ -208,40 +234,25 @@ fn parseNode(ctx: *Ctx, value: std.json.Value, depth: usize) ParseError!*const N
     }
 
     // anyOf / oneOf — branching schemas. Both compile to a Kind.any_of node.
-    if (obj.get("anyOf")) |v| return try parseAnyOf(ctx, v, depth);
-    if (obj.get("oneOf")) |v| return try parseAnyOf(ctx, v, depth);
+    if (obj.get("anyOf")) |v| return try parseAnyOf(ctx, "anyOf", v, depth);
+    if (obj.get("oneOf")) |v| return try parseAnyOf(ctx, "oneOf", v, depth);
 
     // enum / const — one or more allowed literal values.
-    if (obj.get("const")) |v| {
-        const node = try arena.create(Node);
-        node.* = .{
-            .kind = .enum_,
-            .enum_values = try makeEnumValues(arena, &.{v}),
-        };
-        return node;
-    }
+    if (obj.get("const")) |v| return makeEnum(ctx, &.{v});
     if (obj.get("enum")) |v| {
-        if (v != .array) return error.InvalidSchema;
-        const node = try arena.create(Node);
-        node.* = .{
-            .kind = .enum_,
-            .enum_values = try makeEnumValues(arena, v.array.items),
-        };
-        return node;
+        if (v != .array) return ctx.invalid("'enum' must be an array", .{});
+        return makeEnum(ctx, v.array.items);
     }
 
     // type — may be a string or an array of strings. Array form compiles to anyOf.
-    const type_val = obj.get("type") orelse {
-        // Unspecified type — treat as `any`. Consumers will allow any JSON value.
-        const node = try arena.create(Node);
-        node.* = .{ .kind = .any };
-        return node;
-    };
+    // Unspecified type — `any`: consumers allow any JSON value.
+    const type_val = obj.get("type") orelse return leaf(arena, .any);
 
     if (type_val == .array) {
+        if (type_val.array.items.len == 0) return ctx.invalid("'type' lists no type", .{});
         var options = try arena.alloc(*const Node, type_val.array.items.len);
         for (type_val.array.items, 0..) |t, i| {
-            if (t != .string) return error.InvalidSchema;
+            if (t != .string) return ctx.invalid("'type' must be a string or an array of strings", .{});
             // Synthesize a single-type schema by cloning `obj` minus the `type` array.
             options[i] = try parseSingleType(ctx, obj, t.string, depth);
         }
@@ -249,20 +260,24 @@ fn parseNode(ctx: *Ctx, value: std.json.Value, depth: usize) ParseError!*const N
         node.* = .{ .kind = .any_of, .any_of_options = options };
         return node;
     }
-    if (type_val != .string) return error.InvalidSchema;
+    if (type_val != .string) return ctx.invalid("'type' must be a string or an array of strings", .{});
     return try parseSingleType(ctx, obj, type_val.string, depth);
 }
 
-fn parseAnyOf(ctx: *Ctx, v: std.json.Value, depth: usize) ParseError!*const Node {
+fn parseAnyOf(ctx: *Ctx, key: []const u8, v: std.json.Value, depth: usize) ParseError!*const Node {
     const arena = ctx.arena;
-    if (v != .array) return error.InvalidSchema;
-    if (v.array.items.len == 0) return error.InvalidSchema;
+    if (v != .array or v.array.items.len == 0) return ctx.invalid("'{s}' must be a non-empty array", .{key});
     var options = try arena.alloc(*const Node, v.array.items.len);
-    for (v.array.items, 0..) |item, i| {
-        options[i] = try parseNode(ctx, item, depth + 1);
+    var n: usize = 0;
+    for (v.array.items) |item| {
+        const option = try parseNode(ctx, item, depth + 1);
+        if (option.kind == .never) continue; // an option no value meets adds nothing to the union
+        options[n] = option;
+        n += 1;
     }
+    if (n == 0) return ctx.invalid("every '{s}' option is false: no value conforms", .{key});
     const node = try arena.create(Node);
-    node.* = .{ .kind = .any_of, .any_of_options = options };
+    node.* = .{ .kind = .any_of, .any_of_options = options[0..n] };
     return node;
 }
 
@@ -274,17 +289,9 @@ fn parseSingleType(ctx: *Ctx, obj: std.json.ObjectMap, t: []const u8, depth: usi
         node.* = .{ .kind = .null_ };
     } else if (std.mem.eql(u8, t, "boolean")) {
         node.* = .{ .kind = .boolean };
-    } else if (std.mem.eql(u8, t, "integer")) {
+    } else if (std.mem.eql(u8, t, "integer") or std.mem.eql(u8, t, "number")) {
         node.* = .{
-            .kind = .integer,
-            .num_min = readF64(obj, "minimum"),
-            .num_max = readF64(obj, "maximum"),
-            .num_excl_min = readF64(obj, "exclusiveMinimum"),
-            .num_excl_max = readF64(obj, "exclusiveMaximum"),
-        };
-    } else if (std.mem.eql(u8, t, "number")) {
-        node.* = .{
-            .kind = .number,
+            .kind = if (t[0] == 'i') .integer else .number,
             .num_min = readF64(obj, "minimum"),
             .num_max = readF64(obj, "maximum"),
             .num_excl_min = readF64(obj, "exclusiveMinimum"),
@@ -293,104 +300,131 @@ fn parseSingleType(ctx: *Ctx, obj: std.json.ObjectMap, t: []const u8, depth: usi
     } else if (std.mem.eql(u8, t, "string")) {
         var pattern_nfa: ?*const regex.Nfa = null;
         if (obj.get("pattern")) |pv| {
-            if (pv != .string) return error.InvalidSchema;
-            pattern_nfa = regex.compile(arena, pv.string) catch {
-                if (ctx.detail) |d| d.set("string 'pattern' {s}", .{pv.string[0..@min(pv.string.len, 48)]});
-                return error.InvalidPattern;
-            };
+            if (pv != .string) return ctx.invalid("'pattern' must be a string", .{});
+            pattern_nfa = regex.compile(arena, pv.string) catch
+                return ctx.refuse(error.InvalidPattern, "string 'pattern' {s} does not compile", .{pv.string[0..@min(pv.string.len, 48)]});
         }
-        node.* = .{
-            .kind = .string,
-            .str_min_len = readU32(obj, "minLength"),
-            .str_max_len = readU32(obj, "maxLength"),
-            .str_pattern = pattern_nfa,
-        };
+        const min = try readCount(ctx, obj, "minLength");
+        const max = try readCount(ctx, obj, "maxLength");
+        if (min != null and max != null and min.? > max.?) return ctx.invalid("'minLength' {d} exceeds 'maxLength' {d}", .{ min.?, max.? });
+        node.* = .{ .kind = .string, .str_min_len = min, .str_max_len = max, .str_pattern = pattern_nfa };
     } else if (std.mem.eql(u8, t, "array")) {
+        const min = try readCount(ctx, obj, "minItems");
+        var max = try readCount(ctx, obj, "maxItems");
         var items_node: ?*const Node = null;
         if (obj.get("items")) |iv| {
             // Tuple form (`items: [a, b]`) is not in our subset.
-            if (iv == .array) return ctx.unsupported("array 'items' as a list of schemas (tuple form)", .{});
-            items_node = try parseNode(ctx, iv, depth + 1);
+            if (iv == .array) return ctx.unsupported("array 'items' as a list of schemas (tuple form) is not supported", .{});
+            const items = try parseNode(ctx, iv, depth + 1);
+            if (items.kind == .never) {
+                if ((min orelse 0) > 0) return ctx.invalid("'items' is false but 'minItems' is {d}", .{min.?});
+                max = 0;
+            } else items_node = items;
         }
-        node.* = .{
-            .kind = .array,
-            .arr_items = items_node,
-            .arr_min_items = readU32(obj, "minItems"),
-            .arr_max_items = readU32(obj, "maxItems"),
-        };
+        if (min != null and max != null and min.? > max.?) return ctx.invalid("'minItems' {d} exceeds 'maxItems' {d}", .{ min.?, max.? });
+        node.* = .{ .kind = .array, .arr_items = items_node, .arr_min_items = min, .arr_max_items = max };
     } else if (std.mem.eql(u8, t, "object")) {
-        // additionalProperties defaults to `false` (OpenAI strict semantics).
-        var additional: bool = false;
-        if (obj.get("additionalProperties")) |ap| {
-            if (ap == .bool) additional = ap.bool
-            // `additionalProperties: <schema>` would constrain extra keys; we don't
-            // model that yet, so treat any non-bool form as "allow any extra".
-            else additional = true;
-        }
-        const props = if (obj.get("properties")) |pv|
-            try parseProperties(ctx, pv, obj.get("required"), depth)
-        else
-            &[_]Property{};
-        node.* = .{
-            .kind = .object,
-            .obj_properties = props,
-            .obj_additional = additional,
-        };
+        node.* = try parseObject(ctx, obj, depth);
     } else {
-        return ctx.unsupported("type '{s}'", .{t[0..@min(t.len, 48)]});
+        return ctx.unsupported("type '{s}' is not supported", .{t[0..@min(t.len, 48)]});
     }
 
     return node;
 }
 
-fn parseProperties(
-    ctx: *Ctx,
-    properties: std.json.Value,
-    required: ?std.json.Value,
-    depth: usize,
-) ParseError![]Property {
+/// An object node: its declared properties, plus each `required` name they lack, which takes the
+/// `additionalProperties` schema, so the grammar holds one required set.
+fn parseObject(ctx: *Ctx, obj: std.json.ObjectMap, depth: usize) ParseError!Node {
     const arena = ctx.arena;
-    if (properties != .object) return error.InvalidSchema;
-    const map = properties.object;
-
-    // Build required set
-    var req_set: std.StringHashMapUnmanaged(void) = .empty;
-    if (required) |r| {
-        if (r != .array) return error.InvalidSchema;
-        for (r.array.items) |item| {
-            if (item != .string) return error.InvalidSchema;
-            try req_set.put(arena, item.string, {});
+    // additionalProperties defaults to `false` (OpenAI strict semantics).
+    var additional = false;
+    var extra: ?*const Node = null;
+    if (obj.get("additionalProperties")) |ap| {
+        if (ap == .bool) additional = ap.bool else {
+            const s = try parseNode(ctx, ap, depth + 1);
+            additional = s.kind != .never;
+            if (additional) extra = s;
         }
     }
 
-    var props = try arena.alloc(Property, map.count());
-    var i: usize = 0;
-    var it = map.iterator();
-    while (it.next()) |entry| : (i += 1) {
-        const name_owned = try arena.dupe(u8, entry.key_ptr.*);
-        const child = try parseNode(ctx, entry.value_ptr.*, depth + 1);
-        props[i] = .{
-            .name = name_owned,
-            .schema = child,
-            .required = req_set.contains(name_owned),
-        };
+    var required: std.StringArrayHashMapUnmanaged(void) = .empty;
+    if (obj.get("required")) |r| {
+        if (r != .array) return ctx.invalid("'required' must be an array of strings", .{});
+        for (r.array.items) |item| {
+            if (item != .string) return ctx.invalid("'required' must be an array of strings", .{});
+            try required.put(arena, item.string, {});
+        }
     }
-    // Sort alphabetically — keeps prefix-matching deterministic regardless of
-    // the JSON parser's internal map order.
-    std.mem.sort(Property, props, {}, lessThanProperty);
-    return props;
+    const declared: std.json.ObjectMap = if (obj.get("properties")) |pv| blk: {
+        if (pv != .object) return ctx.invalid("'properties' must be an object", .{});
+        break :blk pv.object;
+    } else .empty;
+
+    var props: std.ArrayListUnmanaged(Property) = .empty;
+    try props.ensureTotalCapacity(arena, declared.count() + required.count());
+    var it = declared.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const child = try parseNode(ctx, entry.value_ptr.*, depth + 1);
+        const is_required = required.contains(name);
+        if (is_required and child.kind == .never) return ctx.invalid("required '{s}' has the schema false", .{clip(name)});
+        props.appendAssumeCapacity(.{ .name = try arena.dupe(u8, name), .schema = child, .required = is_required });
+    }
+    for (required.keys()) |name| {
+        if (declared.contains(name)) continue;
+        if (!additional) return ctx.invalid("required '{s}' is not in 'properties' and 'additionalProperties' is false", .{clip(name)});
+        props.appendAssumeCapacity(.{ .name = try arena.dupe(u8, name), .schema = extra orelse try leaf(arena, .any), .required = true });
+    }
+    // Sorted by bytes: the grammar narrows a key being typed to a run of this list.
+    std.mem.sort(Property, props.items, {}, lessThanProperty);
+
+    var open: u32 = 0;
+    for (props.items) |p| open += @intFromBool(p.schema.kind != .never);
+    return .{
+        .kind = .object,
+        .obj_properties = props.items,
+        .obj_additional = additional,
+        .obj_additional_schema = extra,
+        .obj_open = open,
+        .obj_required = @intCast(required.count()),
+    };
 }
 
 fn lessThanProperty(_: void, a: Property, b: Property) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-fn makeEnumValues(arena: std.mem.Allocator, items: []const std.json.Value) ParseError![]EnumValue {
-    var out = try arena.alloc(EnumValue, items.len);
-    for (items, 0..) |v, i| {
-        out[i] = .{ .json = try canonicalJson(arena, v) };
+fn lessThanBytes(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// String members compare by decoded value, so they stay decoded; the rest match their canonical text.
+fn makeEnum(ctx: *Ctx, items: []const std.json.Value) ParseError!*const Node {
+    const arena = ctx.arena;
+    if (items.len == 0) return ctx.invalid("'enum' lists no value", .{});
+    var n_strings: usize = 0;
+    for (items) |v| n_strings += @intFromBool(v == .string);
+    const strings = try arena.alloc([]const u8, n_strings);
+    const literals = try arena.alloc([]const u8, items.len - n_strings);
+    var s: usize = 0;
+    var l: usize = 0;
+    for (items) |v| {
+        if (v == .string) {
+            strings[s] = try arena.dupe(u8, v.string);
+            s += 1;
+        } else {
+            literals[l] = canonicalJson(arena, v) catch |err| return switch (err) {
+                error.InvalidSchema => ctx.invalid("an 'enum' value nests deeper than {d}", .{max_schema_depth}),
+                else => err,
+            };
+            l += 1;
+        }
     }
-    return out;
+    std.mem.sort([]const u8, strings, {}, lessThanBytes);
+    std.mem.sort([]const u8, literals, {}, lessThanBytes);
+    const node = try arena.create(Node);
+    node.* = .{ .kind = .enum_, .enum_strings = strings, .enum_literals = literals };
+    return node;
 }
 
 /// Render a `std.json.Value` to canonical JSON text (no extraneous whitespace).
@@ -431,11 +465,7 @@ fn writeCanonical(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), va
             var it = o.iterator();
             var i: usize = 0;
             while (it.next()) |entry| : (i += 1) keys[i] = entry.key_ptr.*;
-            std.mem.sort([]const u8, keys, {}, struct {
-                fn lt(_: void, a: []const u8, b: []const u8) bool {
-                    return std.mem.lessThan(u8, a, b);
-                }
-            }.lt);
+            std.mem.sort([]const u8, keys, {}, lessThanBytes);
             for (keys, 0..) |k, j| {
                 if (j > 0) try buf.append(arena, ',');
                 try writeJsonString(arena, buf, k);
@@ -467,12 +497,22 @@ fn writeJsonString(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), s
     try buf.append(arena, '"');
 }
 
-fn readU32(obj: std.json.ObjectMap, key: []const u8) ?u32 {
+/// A count keyword (`minLength`, `maxItems`, ...): a whole number that fits u32, in any spelling the JSON reader
+/// gives; anything else is refused by name rather than dropped or wrapped.
+fn readCount(ctx: *Ctx, obj: std.json.ObjectMap, key: []const u8) ParseError!?u32 {
     const v = obj.get(key) orelse return null;
-    return switch (v) {
-        .integer => |i| if (i < 0) null else @intCast(i),
+    const n: ?u32 = switch (v) {
+        .integer => |i| std.math.cast(u32, i),
+        .float => |f| wholeU32(f),
+        .number_string => |s| std.fmt.parseInt(u32, s, 10) catch if (std.fmt.parseFloat(f64, s)) |f| wholeU32(f) else |_| null,
         else => null,
     };
+    return n orelse ctx.invalid("'{s}' must be a whole number from 0 to {d}", .{ key, std.math.maxInt(u32) });
+}
+
+fn wholeU32(f: f64) ?u32 {
+    if (!(f >= 0 and f <= std.math.maxInt(u32)) or @floor(f) != f) return null;
+    return @intFromFloat(f);
 }
 
 fn readF64(obj: std.json.ObjectMap, key: []const u8) ?f64 {
@@ -540,26 +580,27 @@ test "type as array compiles to any_of" {
     try testing.expectEqual(@as(usize, 2), s.root.any_of_options.len);
 }
 
-test "enum values render to canonical JSON" {
+test "enum strings stay decoded and the other values render to canonical JSON, each sorted" {
     var s = try parseStr(testing.allocator,
-        \\{"enum":["text","cruise_cards",42,true,null]}
+        \\{"enum":["text","cruise_cards",42,true,null,"\u00e9",{"b":1,"a":[2]}]}
     );
     defer s.deinit();
     try testing.expectEqual(Kind.enum_, s.root.kind);
-    try testing.expectEqual(@as(usize, 5), s.root.enum_values.len);
-    try testing.expectEqualStrings("\"text\"", s.root.enum_values[0].json);
-    try testing.expectEqualStrings("\"cruise_cards\"", s.root.enum_values[1].json);
-    try testing.expectEqualStrings("42", s.root.enum_values[2].json);
-    try testing.expectEqualStrings("true", s.root.enum_values[3].json);
-    try testing.expectEqualStrings("null", s.root.enum_values[4].json);
+    const strings = [_][]const u8{ "cruise_cards", "text", "\u{e9}" };
+    try testing.expectEqual(strings.len, s.root.enum_strings.len);
+    for (strings, s.root.enum_strings) |want, got| try testing.expectEqualStrings(want, got);
+    const literals = [_][]const u8{ "42", "null", "true", "{\"a\":[2],\"b\":1}" };
+    try testing.expectEqual(literals.len, s.root.enum_literals.len);
+    for (literals, s.root.enum_literals) |want, got| try testing.expectEqualStrings(want, got);
 }
 
 test "const collapses to single-element enum" {
     var s = try parseStr(testing.allocator, "{\"const\":\"hello\"}");
     defer s.deinit();
     try testing.expectEqual(Kind.enum_, s.root.kind);
-    try testing.expectEqual(@as(usize, 1), s.root.enum_values.len);
-    try testing.expectEqualStrings("\"hello\"", s.root.enum_values[0].json);
+    try testing.expectEqual(@as(usize, 1), s.root.enum_strings.len);
+    try testing.expectEqualStrings("hello", s.root.enum_strings[0]);
+    try testing.expectEqual(@as(usize, 0), s.root.enum_literals.len);
 }
 
 test "string constraints are captured" {
@@ -638,7 +679,7 @@ test "nested cruise-app-style schema" {
         if (std.mem.eql(u8, p.name, "type")) {
             found_type = true;
             try testing.expectEqual(Kind.enum_, p.schema.kind);
-            try testing.expectEqualStrings("\"text\"", p.schema.enum_values[0].json);
+            try testing.expectEqualStrings("text", p.schema.enum_strings[0]);
         }
     }
     try testing.expect(found_type);
@@ -707,6 +748,7 @@ test "$ref resolves through $defs and definitions; a recursive ref points back a
     try testing.expectEqual(Kind.integer, props[1].schema.kind);
     try testing.expectEqual(Kind.any, props[2].schema.kind);
     try testing.expectEqual(s.root, props[3].schema);
+    try testing.expect(std.mem.indexOf(u8, s.relaxed.?, "https://example.com/x.json") != null);
 }
 
 test "a $ref chain that never reaches a schema relaxes to any" {
@@ -715,6 +757,7 @@ test "a $ref chain that never reaches a schema relaxes to any" {
     );
     defer s.deinit();
     try testing.expectEqual(Kind.any, s.root.obj_properties[0].schema.kind);
+    try testing.expect(std.mem.indexOf(u8, s.relaxed.?, "never reaches a schema") != null);
 }
 
 test "a JSON pointer keeps an unknown ~ escape and decodes ~0 and ~1" {
@@ -726,4 +769,52 @@ test "a JSON pointer keeps an unknown ~ escape and decodes ~0 and ~1" {
     try testing.expectEqual(Kind.string, s.root.obj_properties[0].schema.kind);
     try testing.expectEqual(Kind.integer, s.root.obj_properties[1].schema.kind);
     try testing.expectEqual(Kind.boolean, s.root.obj_properties[2].schema.kind);
+    try testing.expectEqual(@as(?[]const u8, null), s.relaxed);
+}
+
+// A schema no value can meet, or a bound past what the IR holds, is refused by name: the grammar would otherwise
+// reach a state with no legal byte, or enforce a different number than the client sent.
+test "a schema no value meets, or a bound out of range, is refused by name" {
+    const Case = struct { schema: []const u8, names: []const u8 };
+    const cases = [_]Case{
+        .{ .schema = "false", .names = "false" },
+        .{ .schema = "{\"type\":\"string\",\"maxLength\":4294967296}", .names = "'maxLength'" },
+        .{ .schema = "{\"type\":\"string\",\"maxLength\":99999999999999999999}", .names = "'maxLength'" },
+        .{ .schema = "{\"type\":\"string\",\"maxLength\":-1}", .names = "'maxLength'" },
+        .{ .schema = "{\"type\":\"string\",\"minLength\":2.5}", .names = "'minLength'" },
+        .{ .schema = "{\"type\":\"array\",\"maxItems\":\"3\"}", .names = "'maxItems'" },
+        .{ .schema = "{\"type\":\"string\",\"minLength\":3,\"maxLength\":2}", .names = "'minLength'" },
+        .{ .schema = "{\"type\":\"array\",\"minItems\":2,\"maxItems\":1}", .names = "'minItems'" },
+        .{ .schema = "{\"type\":\"array\",\"items\":false,\"minItems\":1}", .names = "'items'" },
+        .{ .schema = "{\"type\":\"object\",\"properties\":{},\"required\":[\"b\"]}", .names = "'b'" },
+        .{ .schema = "{\"type\":\"object\",\"required\":[\"b\"],\"additionalProperties\":false}", .names = "'b'" },
+        .{ .schema = "{\"type\":\"object\",\"properties\":{\"x\":false},\"required\":[\"x\"]}", .names = "'x'" },
+        .{ .schema = "{\"enum\":[]}", .names = "'enum'" },
+        .{ .schema = "{\"anyOf\":[false]}", .names = "'anyOf'" },
+        .{ .schema = "{\"type\":[]}", .names = "'type'" },
+    };
+    for (cases) |c| {
+        const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.schema, .{});
+        defer v.deinit();
+        var detail: Detail = .{};
+        const got = parseExplained(testing.allocator, v.value, &detail);
+        if (got) |s| {
+            var owned = s;
+            owned.deinit();
+        } else |_| {}
+        errdefer std.debug.print("\nschema {s}: detail '{s}'\n", .{ c.schema, detail.text() });
+        try testing.expect(std.meta.isError(got));
+        try testing.expect(std.mem.indexOf(u8, detail.text(), c.names) != null);
+    }
+}
+
+test "a bound spelled as a whole float or as the client's digits is read" {
+    for ([_]std.json.ParseOptions{ .{}, .{ .parse_numbers = false } }) |opts| {
+        const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"type\":\"string\",\"minLength\":1.0,\"maxLength\":4294967295}", opts);
+        defer v.deinit();
+        var s = try parse(testing.allocator, v.value);
+        defer s.deinit();
+        try testing.expectEqual(@as(?u32, 1), s.root.str_min_len);
+        try testing.expectEqual(@as(?u32, std.math.maxInt(u32)), s.root.str_max_len);
+    }
 }

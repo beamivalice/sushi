@@ -1,8 +1,9 @@
 //! Rule `json-unchecked-shape`: a `std.json.Value` read by its shape without checking it: `.object`, `.array`,
 //! `.string`, `.integer`, `.float` or `.bool` taken off an unwrapped optional (`x.get("k").?.object`), off a parsed
 //! document's `.value` (`parsed.value.object`) or off a map entry's `value_ptr`, with no comparison of that same
-//! receiver to a tag (`== .object`, `!= .array`) earlier in the function; and any `@intCast(<expr>.integer)`, which
-//! panics on a value out of range whatever its tag (`std.math.cast` it and fail by name). A file whose JSON is valid but of another shape then panics or reads the
+//! receiver to a tag (`== .object`, `!= .array`) earlier in the function; and any `@intCast(<expr>.integer)` or
+//! `@intCast` of an `.integer => |i|` prong's capture, which panics or wraps on a value out of range (`std.math.cast` it
+//! and fail by name). A file whose JSON is valid but of another shape then panics or reads the
 //! wrong union field: one bad pack folder took the server down. Test code is exempt: tests, test files, and a
 //! private fn that only tests (or other such fns) call. Token scan, no Sema.
 const std = @import("std");
@@ -117,5 +118,39 @@ pub fn check(arena: std.mem.Allocator, tree: *const Ast, report: rule.Report) !v
         };
         if (held) continue;
         try report.add(tree, t, if (owner) |o| o.key else "-", "@intCast of a JSON integer: cast it with std.math.cast and fail by name", .{});
+    }
+    // `.integer => |i| ... @intCast(i)`: a prong's capture is the same integer, and a one-sided guard
+    // (`if (i < 0) null else`) still wraps past the target's top, so the capture is never cast unchecked.
+    t = 0;
+    while (t + 5 < tree.tokens.len) : (t += 1) {
+        if (tree.tokenTag(t) != .period or tree.tokenTag(t + 1) != .identifier or !std.mem.eql(u8, tree.tokenSlice(t + 1), "integer")) continue;
+        if (tree.tokenTag(t + 2) != .equal_angle_bracket_right or tree.tokenTag(t + 3) != .pipe or tree.tokenTag(t + 4) != .identifier or tree.tokenTag(t + 5) != .pipe) continue;
+        if (rule.inTest(owners.items, t)) continue;
+        const capture = tree.tokenSlice(t + 4);
+        // The prong body runs to the `,` or `}` that closes it at its own depth.
+        var depth: isize = 0;
+        var b = t + 6;
+        while (b + 3 < tree.tokens.len) : (b += 1) {
+            switch (tree.tokenTag(b)) {
+                .l_paren, .l_brace, .l_bracket => depth += 1,
+                .r_paren, .r_bracket => depth -= 1,
+                .r_brace => {
+                    if (depth == 0) break;
+                    depth -= 1;
+                },
+                .comma => if (depth == 0) break,
+                else => {},
+            }
+            if (tree.tokenTag(b) != .builtin or !std.mem.eql(u8, tree.tokenSlice(b), "@intCast")) continue;
+            if (tree.tokenTag(b + 1) != .l_paren or tree.tokenTag(b + 2) != .identifier or tree.tokenTag(b + 3) != .r_paren) continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(b + 2), capture)) continue;
+            const owner = rule.ownerOf(owners.items, b);
+            var held = false;
+            for (owners.items, test_only) |o, m| if (m and b >= o.first and b <= o.last) {
+                held = true;
+            };
+            if (held) continue;
+            try report.add(tree, b, if (owner) |o| o.key else "-", "@intCast of a JSON integer: cast it with std.math.cast and fail by name", .{});
+        }
     }
 }

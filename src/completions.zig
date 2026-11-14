@@ -200,7 +200,7 @@ pub fn handleCompletions(
     // silently ignored field, which reads to a client as "this model has no
     // opinion" rather than "this server never asked".
     const logprobs_n: u32 = if (root.get("logprobs")) |v| switch (v) {
-        .integer => |i| if (i >= 0 and i <= request_parse.MAX_TOP_LOGPROBS) @intCast(i) else {
+        .integer => |i| if (i >= 0 and i <= request_parse.MAX_TOP_LOGPROBS) std.math.cast(u32, i).? else {
             log.warn("POST /v1/completions -> 400 (logprobs out of range)\n", .{});
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'logprobs' must be an integer from 0 to 20", 400);
             return;

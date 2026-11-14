@@ -1267,7 +1267,7 @@ pub const VisionProcessorDefaults = struct {
 fn positiveJsonU32(value: ?std.json.Value) ?u32 {
     const actual = value orelse return null;
     return switch (actual) {
-        .integer => |i| if (i > 0 and i <= std.math.maxInt(u32)) @intCast(i) else null,
+        .integer => |i| if (i > 0) std.math.cast(u32, i) else null,
         else => null,
     };
 }
@@ -1357,7 +1357,7 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) error{InvalidGenerat
     if (root.get("top_k")) |v| {
         switch (v) {
             .integer => |i| if (i > 0 and i <= 1000) {
-                gd.top_k = @intCast(i);
+                gd.top_k = std.math.cast(u32, i);
             },
             else => {},
         }

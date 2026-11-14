@@ -414,7 +414,7 @@ fn floatField(obj: std.json.ObjectMap, key: []const u8) f64 {
 
 fn intField(obj: std.json.ObjectMap, key: []const u8) u64 {
     if (obj.get(key)) |v| switch (v) {
-        .integer => |n| return if (n < 0) 0 else @intCast(n),
+        .integer => |n| return std.math.cast(u64, n) orelse 0,
         .float => |f| return if (f < 0) 0 else @intFromFloat(f),
         else => {},
     };

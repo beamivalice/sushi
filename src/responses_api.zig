@@ -548,7 +548,7 @@ fn handleResponsesInner(
     // back into the response envelope to satisfy the OpenAI Responses schema) ──
     const top_logprobs_echo: u32 = if (root.get("top_logprobs")) |v| (if (request_parse.wholeNumber(v)) |n| @intCast(n) else 0) else 0;
     const max_tool_calls_echo: ?u32 = if (root.get("max_tool_calls")) |v| switch (v) {
-        .integer => |i| if (i >= 0) @as(?u32, @intCast(i)) else null,
+        .integer => |i| std.math.cast(u32, i),
         else => null,
     } else null;
     const truncation_echo: []const u8 = if (root.get("truncation")) |v|

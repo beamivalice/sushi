@@ -212,7 +212,8 @@ pub fn buildMask(
     var probed: u32 = 0;
     if (grammar.stringBodyRoom()) |room| {
         for (token_bytes.string_plain) |id| {
-            if (token_bytes.bytes[id].?.len <= room) {
+            const bytes = token_bytes.bytes[id].?;
+            if (bytes.len <= room or charCount(bytes) <= room) {
                 mask[id] = true;
                 count += 1;
             }
@@ -255,6 +256,14 @@ pub fn buildMask(
 
     try grammar.restoreFrom(snap);
     return .{ .allowed = count, .probed = probed };
+}
+
+/// The characters a quote-free token adds to a string body, as the grammar counts them: every byte that does not
+/// continue a UTF-8 sequence.
+fn charCount(bytes: []const u8) usize {
+    var n: usize = 0;
+    for (bytes) |b| n += @intFromBool(b & 0xC0 != 0x80);
+    return n;
 }
 
 fn probeToken(grammar: *Grammar, snap: Grammar.Snapshot, bytes: []const u8) !bool {
@@ -514,4 +523,35 @@ test "buildMask: a step walks only tokens that can start in the current state" {
     r = try buildMask(&g, &tb, mask);
     try testing.expect(r.probed <= tb.string_other.len);
     try testing.expect(r.allowed > tb.string_plain.len);
+}
+
+// `maxLength` counts characters, so the string fast path admits a quote-free token by its character count.
+test "buildMask: a multi-byte token fits a string's room by characters, and agrees with the full walk" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"string\",\"maxLength\":3}");
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const vocab = try syntheticVocab(arena.allocator());
+    var tb = try TokenBytes.init(arena, vocab, @intCast(vocab.len - 1));
+    defer tb.deinit();
+    const fast = try testing.allocator.alloc(bool, vocab.len);
+    defer testing.allocator.free(fast);
+    const brute = try testing.allocator.alloc(bool, vocab.len);
+    defer testing.allocator.free(brute);
+
+    var nihon: ?usize = null;
+    for (vocab, 0..) |t, id| if (t != null and std.mem.eql(u8, t.?, "日本")) {
+        nihon = id;
+    };
+    const doc = "\"é日本\"";
+    for (doc, 0..) |byte, i| {
+        _ = try buildMask(&g, &tb, fast);
+        try bruteMask(&g, &tb, brute);
+        try testing.expectEqualSlices(bool, brute, fast);
+        if (i == 1) try testing.expect(fast[nihon.?]);
+        try testing.expect(try g.acceptByte(byte));
+    }
+    try testing.expect(g.isComplete());
 }

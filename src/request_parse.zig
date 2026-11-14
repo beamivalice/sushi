@@ -22,8 +22,8 @@ pub fn parseJsonFloatOpt(root: std.json.ObjectMap, key: []const u8) ?f32 {
 /// Optional top_k body field after `generationFieldFault`; null = omitted, 0 disables top-k.
 pub fn parseJsonTopKOpt(root: std.json.ObjectMap, key: []const u8) ?u32 {
     return switch (root.get(key) orelse return null) {
-        .integer => |i| @intCast(i),
-        .float => |f| @intFromFloat(f),
+        .integer => |i| std.math.cast(u32, i),
+        .float => |f| if (f >= 0 and f <= std.math.maxInt(u32)) @intFromFloat(f) else null,
         else => null,
     };
 }
@@ -132,7 +132,7 @@ pub fn parseCancelRequestId(allocator: std.mem.Allocator, body: []const u8) ?u64
     const obj = parsed.value.object;
     const v = obj.get("id") orelse obj.get("request_id") orelse return null;
     return switch (v) {
-        .integer => |i| if (i >= 0) @intCast(i) else null,
+        .integer => |i| std.math.cast(u64, i),
         .string => |s| std.fmt.parseInt(u64, s, 10) catch null,
         else => null,
     };
@@ -377,10 +377,11 @@ pub fn strictSchemaFault(allocator: std.mem.Allocator, holder: SchemaHolder, has
     var detail: json_schema.Detail = .{};
     var parsed = json_schema.parseExplained(allocator, schema, &detail) catch |err| {
         const what = if (detail.len > 0) detail.text() else @errorName(err);
-        return std.fmt.allocPrint(allocator, "{s}.schema cannot be enforced as a strict schema: unsupported {s}", .{ holder.path, what }) catch null;
+        return std.fmt.allocPrint(allocator, "{s}.schema cannot be enforced as a strict schema: {s}", .{ holder.path, what }) catch null;
     };
-    parsed.deinit();
-    return null;
+    defer parsed.deinit();
+    const relaxed = parsed.relaxed orelse return null;
+    return std.fmt.allocPrint(allocator, "{s}.schema cannot be enforced as a strict schema: {s}", .{ holder.path, relaxed }) catch null;
 }
 
 /// The first entry of a `/detokenize` list that is no id of a `vocab`-sized vocabulary, as a message naming it.
@@ -554,6 +555,13 @@ test "strictSchemaFault refuses a strict schema the grammar cannot enforce or to
         .{ .body = "{" ++ bad ++ "}", .tools = false, .implied = true, .names = "type 'nonsense'" },
         .{ .body = "{" ++ good ++ "}", .tools = true, .implied = true, .names = null },
         .{ .body = "{\"strict\":false," ++ bad ++ "}", .tools = false, .implied = true, .names = null },
+        // The parser owns what the grammar enforces: a construct it relaxes, or a schema it refuses, is the fault.
+        .{ .body = "{\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{\"r\":{\"$ref\":\"https://example.com/r.json\"}}}}", .tools = false, .names = "$ref" },
+        .{ .body = "{\"strict\":false,\"schema\":{\"type\":\"object\",\"properties\":{\"r\":{\"$ref\":\"#/$defs/none\"}}}}", .tools = false, .names = null },
+        .{ .body = "{\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{},\"required\":[\"b\"]}}", .tools = false, .names = "'b'" },
+        .{ .body = "{\"strict\":true,\"schema\":{\"type\":\"string\",\"maxLength\":4294967296}}", .tools = false, .names = "'maxLength'" },
+        .{ .body = "{\"strict\":true,\"schema\":{\"type\":\"array\",\"items\":false}}", .tools = false, .names = null },
+        .{ .body = "{\"strict\":true,\"schema\":{\"type\":\"object\",\"required\":[\"b\"],\"additionalProperties\":{\"type\":\"integer\"}}}", .tools = false, .names = null },
     };
     for (cases) |c| {
         var parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});

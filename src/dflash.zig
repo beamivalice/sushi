@@ -286,7 +286,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
 
 fn jsonU32(v: std.json.Value) !u32 {
     return switch (v) {
-        .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else error.InvalidDflashConfigValue,
+        .integer => |i| std.math.cast(u32, i) orelse error.InvalidDflashConfigValue,
         else => error.InvalidDflashConfigValue,
     };
 }

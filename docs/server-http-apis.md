@@ -373,6 +373,13 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
 - DeepSeek's DSpark verifies each row under that row's mask (`row_grammar.zig`), before and after the reasoning close; logprobs and forced calls still disable spec.
 - Every schema-mask surface uses ONE thinking policy (`schemaMasksThinking`); tools present = no mask. Per-model
   grammar table lives on `LoadedModel`.
+- The parser owns what the grammar enforces (`json_schema.parseExplained`): it refuses by name a schema no value can
+  meet (root `false`, a required `false` property, min above max, a required name `additionalProperties: false`
+  forbids) and a count past u32, and names in `Schema.relaxed` what it relaxed to any value (an unresolved `$ref`); the
+  strict gate answers both with a 400. anyOf/oneOf, `pattern` and numeric bounds stay best-effort, never refused.
+- The grammar has no size limit: enum members, properties (seen bits on a stack beside the frames) and key length are
+  unbounded. `minLength`/`maxLength` count code points (a surrogate pair is one), and a key or enum string is matched by
+  decoded value, so an escape spells the same name; every other enum member matches its canonical JSON text.
 - Code: `src/json_schema.zig` / `src/json_grammar.zig` / `src/token_mask.zig` / `src/regex.zig` (schema IR →
   streaming grammar → per-token mask), `src/reasoning_protocol.zig`.
 

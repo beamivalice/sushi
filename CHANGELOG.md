@@ -6,6 +6,11 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A strict JSON schema is enforced as written, or refused with a 400 naming why**: an `enum` or object of any size,
+  a `required` key outside `properties`, `items: false`, a `false` property and an `additionalProperties` schema are now
+  enforced; `minLength`/`maxLength` count characters, and a key or enum string written with `\u` escapes matches its
+  value. A schema no value can meet, a count past 4294967295 or an unresolved `$ref` is a 400 under `strict` instead of
+  a silently different grammar.
 - **A failed image encode no longer fails the request after it**: an encode that MLX or Sushi Cooler refused takes the
   error it raised, so the next request starts clean, and a refusal for memory answers the 503 a forward gets instead
   of a 500 `vision encoding failed`. A failed encode logs that it failed instead of `encoded N of N`.

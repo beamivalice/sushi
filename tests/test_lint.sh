@@ -268,6 +268,16 @@ printf '%s\n' 'const std = @import("std");' 'pub fn g(m: std.json.ObjectMap, v: 
   '    if (v != .integer or v.integer < 0 or v.integer > 9) return error.Range;' '    return @intCast(v.integer);' '}' > "$TMP/t/src/p.zig"
 expect_green "a map entry checked through .*, and an integer bounded before its cast"
 
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn f(v: std.json.Value) ?u32 {' '    return switch (v) {' \
+  '        .integer => |i| if (i < 0) null else @intCast(i),' '        .float => |x| @intFromFloat(x),' '        else => null,' '    };' '}' > "$TMP/t/src/p.zig"
+expect_red "an @intCast of an .integer prong's capture" "src/p.zig:4:46 \[json-unchecked-shape\] f: @intCast of a JSON integer"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn g(v: std.json.Value, w: u64) ?u32 {' '    return switch (v) {' \
+  '        .integer => |i| std.math.cast(u32, i),' '        .string => |i| @intCast(i.len + w),' '        else => @intCast(w),' '    };' '}' > "$TMP/t/src/p.zig"
+expect_green "an .integer capture narrowed by std.math.cast, and a cast in another prong"
+
 # rule owned-insert-arg
 tree
 printf '%s\n' 'const std = @import("std");' 'pub fn f(a: std.mem.Allocator, xs: *std.ArrayList([]u8), s: []const u8) !void {' \
