@@ -6,6 +6,11 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek-V4.1 STQ decodes and prefills on Sushi Cooler on an M1 to M4 as well**: the engine takes the SIMD arms where
+  there are no matrix units, MLX stays one flag away (`--ds41-mlx-engine`), and the vision tower's quantized and attention
+  tiles follow the GPU's. Proven as an M1 Max on an M5; no real M1 to M4 run is recorded yet.
+- **A sampled DeepSeek-V4.1 draw on Sushi Cooler steps down to a smaller threadgroup where the GPU grants fewer threads
+  than the kernel asks**, with the same draw as the rule's at every size.
 - **A strict JSON schema is enforced as written, or refused with a 400 naming why**: an `enum` or object of any size,
   a `required` key outside `properties`, `items: false`, a `false` property and an `additionalProperties` schema are now
   enforced; `minLength`/`maxLength` count characters, and a key or enum string written with `\u` escapes matches its

@@ -223,7 +223,9 @@ test "dsv41 queries: a decode token (DSV41_TINY, DSV41_STQ_TINY)" {
         const got = (try decodeTokens(env)) orelse continue;
         ran = true;
         // The two counts alternate with the compressed-attention cycle.
-        const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1162, 1211, 1162, 1211, 1162, 1211 } else .{ 2180, 2236, 2180, 2236, 2180, 2236 };
+        // A GPU whose f32 matmul is true f32 keeps the op chain where the fused expand would serve: 40 queries more or fewer.
+        const folds = @import("dsv41_kernels.zig").hcExpandProbed();
+        const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1162, 1211, 1162, 1211, 1162, 1211 } else if (folds) .{ 2180, 2236, 2180, 2236, 2180, 2236 } else .{ 2140, 2196, 2140, 2196, 2140, 2196 };
         try testing.expectEqual(want, got);
     }
     if (!ran) return error.SkipZigTest;

@@ -5,6 +5,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const metal = @import("../metal.zig");
+const device = @import("sushi_exl3").device;
 const core = @import("core.zig");
 const ops = @import("ops.zig");
 pub const kernel = @import("kernel.zig");
@@ -164,17 +165,6 @@ pub var mlx_ops: u64 = 0;
 pub fn mlxCalls() u64 {
     return mlx.calls.load(.monotonic);
 }
-
-/// Whether kernels and their configs are noted for the engine as they are made. A module keeps both for the life of
-/// the process, and a load on MLX may come before one on the engine: so they are noted wherever the engine can serve
-/// (a GPU with matrix units), on or not yet. A test process turns the engine on after other tests made theirs.
-pub fn noting() bool {
-    if (enabled or (@import("builtin").is_test and !noting_as_served)) return true;
-    return matrixUnits();
-}
-
-/// A test takes a served process's rule: without it a test process notes everything.
-pub var noting_as_served: bool = false;
 
 pub const Side = enum {
     mlx,
@@ -521,7 +511,6 @@ pub fn sealed() bool {
     return core.sealed;
 }
 
-/// Pipelines made while sealed: each was a stall inside a request.
 pub const matrixUnits = @import("matmul.zig").matrixUnits;
 
 pub const pipeline_cache = @import("pipeline_cache.zig");
@@ -534,6 +523,7 @@ pub fn preloadedPipelines() u64 {
     return core.pipelines_preloaded;
 }
 
+/// Pipelines made while sealed: each was a stall inside a request.
 pub fn latePipelines() u64 {
     return core.pipelines_late;
 }
@@ -2024,11 +2014,8 @@ test "a custom kernel launched on the engine writes what it writes under MLX" {
 
 test "a kernel and a config MLX made while the engine was off launch on the engine once it is on, as a served process needs" {
     try mlx.requireGpu();
-    if (!matrixUnits()) return error.SkipZigTest;
     const was = enabled;
     defer enabled = was;
-    noting_as_served = true;
-    defer noting_as_served = false;
     // A load on MLX comes first: its module keeps the kernel and the config for the life of the process.
     enabled = false;
     const names_in = [_][*:0]const u8{"x"};
@@ -3909,9 +3896,42 @@ test "engine erf gives MLX's bytes: f32 under and over the elements MLX takes tw
     }
 }
 
-test "engine quantized matmul gives MLX's bytes at the tower's shapes: the NAX tiles, aligned and not, 64 rows and 32" {
+test "engine f32 matmul on the SIMD tiles: the first use of a tile before the seal makes every alignment of it, so no length compiles inside a request" {
     try mlx.requireGpu();
-    if (!matrixUnits()) return error.SkipZigTest;
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const gpu_scope = device.withProfile(device.simdOnly());
+    defer gpu_scope.end();
+    const sealed_was = core.sealed;
+    defer core.sealed = sealed_was;
+    const Product = struct {
+        fn run(m: usize, n: usize, k: usize) !void {
+            const a_vals = try rampBuf(f32, m * k, 2, -1);
+            defer std.testing.allocator.free(a_vals);
+            const b_vals = try rampBuf(f32, k * n, 2, -1);
+            defer std.testing.allocator.free(b_vals);
+            const a = hostArray(f32, a_vals, &.{ @intCast(m), @intCast(k) }, .float32);
+            defer _ = mlx.mlx_array_free(a);
+            const b = hostArray(f32, b_vals, &.{ @intCast(k), @intCast(n) }, .float32);
+            defer _ = mlx.mlx_array_free(b);
+            var o: A = .{};
+            defer _ = mlx.mlx_array_free(o);
+            try mlx.check(mlx.mlx_matmul(&o, a, b, core.stream()));
+            try mlx.check(mlx.mlx_array_eval(o));
+        }
+    };
+    // Inner axes under 128 take the fused tile, not split-K.
+    core.sealed = false;
+    try Product.run(48, 64, 48);
+    core.sealed = true;
+    const late = core.pipelines_late;
+    for ([_]usize{ 64, 100 }) |m| for ([_]usize{ 64, 70 }) |n| for ([_]usize{ 48, 50 }) |k| try Product.run(m, n, k);
+    try t_std.expectEqual(late, core.pipelines_late);
+}
+
+test "engine quantized matmul gives MLX's bytes at the tower's shapes: the GPU's tiles, aligned and not, 64 rows and 32" {
+    try mlx.requireGpu();
     const Build = struct {
         fn product(s: S, in: []const A) !A {
             var o: A = .{};
@@ -3965,7 +3985,6 @@ test "engine quantized matmul refuses by name what MLX sends to the vector and s
 
 test "engine attention gives MLX's bytes and strides at the tower's query chunks: aligned and not, a tail of 8 rows or fewer" {
     try mlx.requireGpu();
-    if (!matrixUnits()) return error.SkipZigTest;
     const Build = struct {
         const heads = 16;
         const dim = 64;

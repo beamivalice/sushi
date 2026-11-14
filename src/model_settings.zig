@@ -85,7 +85,6 @@ pub const VisionChoice = struct {
 };
 
 pub const cooler_why_not_stq = "This pack is not STQ: Sushi Cooler has no kernels for its FP8 trunk and MXFP4 experts, so decode runs on MLX.";
-pub const cooler_why_no_matrix_units = "This Mac's GPU has no matrix units, which Sushi Cooler needs, so decode runs on MLX.";
 
 /// Whether the arch decodes on Sushi Cooler: the launch flag that turns it off > the model's `ds41_cooler` > on.
 pub const CoolerChoice = struct {

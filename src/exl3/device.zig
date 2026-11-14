@@ -123,6 +123,24 @@ pub const Profile = struct {
     }
 };
 
+/// A kernel's threadgroup sizes, the widest first. A GPU may grant a register-heavy kernel fewer threads than it asks;
+/// the launch it refuses for size takes the next rung, and the kernel is written to give the same bytes at each.
+pub const ThreadLadder = struct {
+    rungs: []const u32,
+    at: usize = 0,
+
+    pub fn threads(self: ThreadLadder) u32 {
+        return self.rungs[self.at];
+    }
+
+    /// The GPU refused the current rung: false when it was the last.
+    pub fn stepDown(self: *ThreadLadder) bool {
+        if (self.at + 1 >= self.rungs.len) return false;
+        self.at += 1;
+        return true;
+    }
+};
+
 const Arch = struct { generation: u32 = 0, class: Class = .other };
 
 fn parseArch(arch: []const u8) Arch {
@@ -345,4 +363,14 @@ test "device: the process's own profile with its units withheld keeps the chip a
     try testing.expect(p.units.eql(Units.initOne(.simd)));
     try testing.expectEqual(current().generation, p.generation);
     try testing.expect(p.chip.eql(current().chip));
+}
+
+test "device: a thread ladder starts on its widest rung, steps down on a refusal and stops on the last" {
+    var l: ThreadLadder = .{ .rungs = &.{ 1024, 512, 256 } };
+    try testing.expectEqual(@as(u32, 1024), l.threads());
+    try testing.expect(l.stepDown());
+    try testing.expectEqual(@as(u32, 512), l.threads());
+    try testing.expect(l.stepDown());
+    try testing.expect(!l.stepDown());
+    try testing.expectEqual(@as(u32, 256), l.threads());
 }

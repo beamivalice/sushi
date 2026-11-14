@@ -3,7 +3,7 @@
 # `--ds41-mlx-engine` moves DeepSeek-V4.1's decode from Sushi Cooler to MLX at the load and changes no byte.
 # Boot 1 (default) records a greedy reply and the decode-side load line; boot 2 (`--ds41-mlx-engine`) must say MLX
 # decodes because the flag was given, report `ds41_cooler` locked by the flag on /v1/settings, and answer with the
-# same bytes. A Mac without matrix units runs both boots on MLX; the line then names the hardware, and the script says so.
+# same bytes, on a GPU with matrix units or without.
 # COOLER_BOOT=default|mlx runs one boot only, keeping its reply in COOLER_REF (a directory the caller names), and the
 # second one compares: a caller that wants a notice around each load runs the two apart.
 set -u
@@ -50,8 +50,8 @@ sushi_boot cooler-mlx "$MODEL" $FLAGS --ds41-mlx-engine || exit $?
 LINE2=$(grep -a "\[dsv41\] decode forwards" "$SUSHI_LOG" | tail -1)
 case "$LINE2" in
     *"on MLX because --ds41-mlx-engine was given (Sushi Cooler is off)"*) ;;
-    *"Sushi Cooler is proven on a GPU with matrix units only"* | *"Sushi Cooler has no quantized_matmul"*)
-        echo "  NOTE: this Mac or pack cannot run Sushi Cooler; the flag has nothing to move: $LINE2" ;;
+    *"Sushi Cooler has no quantized_matmul"*)
+        echo "  NOTE: this pack cannot run Sushi Cooler; the flag has nothing to move: $LINE2" ;;
     *) fail "boot 2 line does not say the flag moved decode to MLX: '$LINE2'" ;;
 esac
 echo "$PAYLOAD" | post | text_of > "$WORK/mlx.txt"

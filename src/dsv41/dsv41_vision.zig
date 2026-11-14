@@ -259,7 +259,7 @@ pub const Gap = struct { what: []const u8, rows: u64, out: usize, in: usize };
 /// The fewest rows from which a linear of this shape takes only ported plans.
 fn portedFrom(g: matmul.Gpu, out: usize, in: usize) usize {
     var m: usize = 1;
-    while (m < 1 << 14 and quantized.unported(g, m, out, in, QUANT_GROUP, .bfloat16) != null) m += 1;
+    while (m < 1 << 14 and quantized.unported(g, m, out, in, QUANT_GROUP) != null) m += 1;
     return m;
 }
 
@@ -1163,7 +1163,6 @@ const engine_vision: cfg_mod.Vision = .{ .layers = 2, .hidden = 128, .heads = 2,
 
 test "dsv41 vision: the tower on the engine's stream gives MLX's bytes, with no MLX op, no lend and no pipeline made after the warm" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     // A failed engine warm leaves its raise latched; taking it keeps it from failing a later test that reads the latch.
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
@@ -1229,35 +1228,34 @@ fn ownTowerOf(v: cfg_mod.Vision, dim: u32) !model.Weights {
 
 /// Whether one of the warm's runs takes the attention pipeline a query chunk of `rows` over `keys` takes on `g`.
 fn warmTakes(g: matmul.Gpu, rows: usize, keys: usize) bool {
-    const want = attention_plan.planOf(g, rows, keys, 1);
+    const want = attention_plan.planOf(g, .bfloat16, rows, keys, 1);
     for (Dsv41Vision.warm_patches) |w| {
         var lo: usize = 0;
         while (lo < w) : (lo += QUERY_CHUNK) {
-            if (std.meta.eql(want, attention_plan.planOf(g, @min(w - lo, QUERY_CHUNK), w, 1))) return true;
+            if (std.meta.eql(want, attention_plan.planOf(g, .bfloat16, @min(w - lo, QUERY_CHUNK), w, 1))) return true;
         }
     }
     return false;
 }
 
-test "dsv41 vision: the warm reaches every attention pipeline an admissible image's chunks take, on every GPU class" {
+test "dsv41 vision: the warm reaches every attention pipeline an admissible image's chunks take, on every GPU class and both tile arms" {
     const r = reachOf(Processor.of(try releaseVision()), 1.06).?;
-    for (std.enums.values(@FieldType(matmul.Gpu, "class"))) |class| {
-        const g: matmul.Gpu = .{ .class = class, .gen = 17, .nax = true, .tf32 = true };
+    for (std.enums.values(@FieldType(matmul.Gpu, "class"))) |class| for ([_]bool{ true, false }) |nax| {
+        const g: matmul.Gpu = .{ .class = class, .gen = 17, .nax = nax, .tf32 = true };
         var n: usize = @intCast(r.min_patches);
         while (n <= r.max_patches) : (n += 1) {
             const last = n % QUERY_CHUNK;
             const whole = n >= QUERY_CHUNK and warmTakes(g, QUERY_CHUNK, n);
             if (!(n < QUERY_CHUNK or whole) or !(last == 0 or warmTakes(g, last, n))) {
-                std.debug.print("{s}: {d} patches, a last chunk of {d} rows, takes a pipeline the warm does not\n", .{ @tagName(class), n, last });
+                std.debug.print("{s} nax {}: {d} patches, a last chunk of {d} rows, takes a pipeline the warm does not\n", .{ @tagName(class), nax, n, last });
                 return error.TestUnexpectedResult;
             }
         }
-    }
+    };
 }
 
 test "dsv41 vision: a Cooler encode of large images and a small last one joins their spans under the encode's bill" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const was_enabled = mlx.engine.enabled;
@@ -1338,13 +1336,14 @@ test "dsv41 vision: an image the engine's quantized matmul cannot take is refuse
     defer tower.deinit();
     tower.own = true;
     defer mlx.engine.budget(1 << 62) catch {};
-    var px: [4 * 4 * 48]f32 = @splat(0.25);
-    const patches = mlx.mlx_array_new_data(&px, &[_]c_int{ 16, 48 }, 2, .float32);
+    // Four rows: under the vector limit of every generation (6 rows at the least).
+    var px: [2 * 2 * 48]f32 = @splat(0.25);
+    const patches = mlx.mlx_array_new_data(&px, &[_]c_int{ 4, 48 }, 2, .float32);
     defer _ = mlx.mlx_array_free(patches);
     var buf: [512]u8 = undefined;
     _ = mlx.takeError(&buf);
     const ops_before = mlx.engine.mlx_ops;
-    try testing.expectError(error.MlxError, tower.forward(patches, 4, 4));
+    try testing.expectError(error.MlxError, tower.forward(patches, 2, 2));
     try testing.expect(std.mem.indexOf(u8, mlx.takeError(&buf).?, "[engine] quantized_matmul") != null);
     try testing.expectEqual(ops_before, mlx.engine.mlx_ops);
     try testing.expect(!mlx.engine.active);
@@ -1358,8 +1357,8 @@ test "dsv41 vision: an image the engine's quantized matmul cannot take is refuse
 //   - aligner cells, the rows of the aligner's two linears: 164 at the fewest (a 3 x 481 image) to 1,022;
 //   - an attention call's query chunk: 512 rows, and a last chunk of 1 to 512, against those keys.
 // MLX takes its vector kernels below 33 rows (13 for the aligner's 9,216 inner width) and its split-K plan while the
-// output tiles are few: from 257 rows against 1,024 outputs and 33 against the aligner's 5,120 the plan is the NAX
-// tile this port covers (`quantized.unported`). Every admitted image gives 4x that or more, so the vector kernels and
+// output tiles are few: from 257 rows against 1,024 outputs and 33 against the aligner's 5,120 the plan is the tile
+// this port covers (`quantized.unported`). Every admitted image gives 4x that or more, so the vector kernels and
 // split-K are reached by no request; `engineGap` checks it at the load, with a factor of two for the sampling, and a
 // pack whose vision config could reach them keeps its tower on MLX, said in a log line.
 
@@ -1375,13 +1374,17 @@ test "dsv41 vision: every image the release processor admits gives the tower row
     try testing.expect(fine.max_patches <= v.maxPatches() and fine.max_patches > 9000);
     try testing.expect(fine.min_cells >= 164 and fine.min_cells < 170);
     try testing.expect(fine.max_cells <= 1022 and fine.max_cells > 1000);
-    // MLX's plans the engine ports exist only on matrix units.
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
-    // The rows from which MLX's plan is one the engine ports, per linear.
-    const g = try matmul.gpu();
-    try testing.expectEqual(@as(usize, 257), portedFrom(g, 1024, 1024));
-    try testing.expectEqual(@as(usize, 33), portedFrom(g, 5120, 9216));
-    try testing.expectEqual(@as(usize, 65), portedFrom(g, 3072, 1024));
+    // The rows from which MLX's plan is one the engine ports, per linear, on each generation's vector limits.
+    for ([_]matmul.Gpu{
+        .{ .class = .s, .gen = 17, .nax = true, .tf32 = true },
+        .{ .class = .s, .gen = 15, .nax = false, .tf32 = true },
+        .{ .class = .s, .gen = 13, .nax = false, .tf32 = true },
+        .{ .class = .d, .gen = 13, .nax = false, .tf32 = true },
+    }) |g| {
+        try testing.expectEqual(@as(usize, 257), portedFrom(g, 1024, 1024));
+        try testing.expectEqual(@as(usize, 33), portedFrom(g, 5120, 9216));
+        try testing.expectEqual(@as(usize, 65), portedFrom(g, 3072, 1024));
+    }
     try testing.expect(try engineGap(v, 5120, true) == null);
 
     // A processor with no pixel floor admits a one-patch image, which no chunk of keys covers; with a floor of about
@@ -1430,7 +1433,6 @@ test "dsv41 vision: the fewest patches and aligner cells any image gives the rel
 
 test "dsv41 vision: at the release's geometry the engine's tower gives MLX's bytes for the smallest, a thin and a large image" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const was_enabled = mlx.engine.enabled;
@@ -1505,7 +1507,6 @@ test "dsv41 vision: at the release's geometry the engine's tower gives MLX's byt
 
 test "dsv41 vision: the tower's pipelines ride the manifest: a first load warms and stores them, a same-key load warms nothing" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     // A failed engine warm leaves its raise latched; taking it keeps it from failing a later test that reads the latch.
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);

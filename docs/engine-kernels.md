@@ -281,7 +281,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   own is one `Unit` tag, one row and the arms written for it; a kernel without the new arm keeps its best old one.
 - A generation past the table keeps the newest row's units, as MLX's dispatch assumes; `Profile.untested` says so.
 - `Profile.chip` is what the chip has; `Profile.units` is what a kernel may use (less what the OS is too old for, and
-  `simd` alone under `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`). The stock ops held to MLX's bytes read `chip`, as MLX does.
+  `simd` alone under `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`). The engine's stock ops (`tensor/matmul.gpu`) read `units`, so a
+  withheld unit or a test's profile is theirs too; with only the QA switch they no longer match MLX's NAX tiles, which MLX
+  keeps. Their SIMD arms are held to MLX's bytes by running the tests as another GPU (`MLX_METAL_GPU_ARCH`,
+  `tests/dsv41/test_g13_rehearsal.sh`).
+- **A kernel's threadgroup is a `ThreadLadder`** where a GPU may grant it fewer threads than it asks (an M1 grants the
+  sampler's draw 768): a launch the GPU refuses for size steps the process down one rung, and the kernel gives the rule's
+  answer at every rung (`sampler_draw`; the hyper-connection kernels keep `hc_tg`'s own halving).
 - The name is MLX's: `MLX_METAL_GPU_ARCH` when set, else the system GPU's, so the profile and MLX's dispatch agree.
 - **A test's GPU is `device.withProfile(p)`**, ended by its scope (`device.simdOnly()` withholds the matrix units of the
   box it runs on). A test never sets the QA switch's env: the profile is read once.

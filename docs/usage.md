@@ -212,7 +212,7 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
   cap; it pays on a fast SSD at a mid budget and nothing elsewhere. `ssd_prefetch` in `model-settings.json` sets it per model,
   and a flag outranks it. Other models refuse the flag.
 - **`--ds41-mlx-engine` runs DeepSeek-V4.1 on MLX instead of Sushi Cooler**, the engine sushi built for this Mac, which
-  generates the same tokens with less processor power on an STQ pack and a Mac with matrix units (M5). Cooler is on by
+  generates the same tokens with less processor power on an STQ pack. Cooler is on by
   default. Use the flag, or untick "Use Sushi's Cooler Engine instead of MLX" under DeepSeek 4.1 Inference on the
   model's settings (`ds41_cooler: false` in `model-settings.json`; the flag outranks it and locks the checkbox), if
   Cooler misbehaves, and report it at <https://github.com/beamivalice/sushi/issues/new>. The load line says which side

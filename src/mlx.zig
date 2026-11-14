@@ -935,9 +935,7 @@ pub fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_in
         engine.configFree(cls);
         return 0;
     }
-    if (engine.noting()) {
-        engine.forgetConfig(cls);
-    }
+    engine.forgetConfig(cls);
     kernel_keys.configFree(cls);
     return raw_kernel.mlx_fast_metal_kernel_config_free(cls);
 }
@@ -946,9 +944,7 @@ pub fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_co
         dropConfigTwin(engine.configOf(cls));
         return engine.configOutput(cls, shape, size, dtype);
     }
-    if (engine.noting()) {
-        engine.noteOutput(cls, shape, size, dtype);
-    }
+    engine.noteOutput(cls, shape, size, dtype);
     kernel_keys.configNote(cls, " ->{t}", .{dtype});
     return raw_kernel.mlx_fast_metal_kernel_config_add_output_arg(cls, shape, size, dtype);
 }
@@ -964,10 +960,8 @@ pub fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, 
         }
         return raw_kernel.mlx_fast_metal_kernel_config_set_grid(.{ .ctx = twin }, g1, g2, g3);
     }
-    if (engine.noting()) {
-        engine.noteGrid(cls, g1, g2, g3);
-        if (engine.keepsBehind(cls)) return 0;
-    }
+    engine.noteGrid(cls, g1, g2, g3);
+    if (engine.keepsBehind(cls)) return 0;
     return raw_kernel.mlx_fast_metal_kernel_config_set_grid(cls, g1, g2, g3);
 }
 pub fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int {
@@ -981,10 +975,8 @@ pub fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_
         }
         return raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(.{ .ctx = twin }, t1, t2, t3);
     }
-    if (engine.noting()) {
-        engine.noteGroup(cls, t1, t2, t3);
-        if (engine.keepsBehind(cls)) return 0;
-    }
+    engine.noteGroup(cls, t1, t2, t3);
+    if (engine.keepsBehind(cls)) return 0;
     return raw_kernel.mlx_fast_metal_kernel_config_set_thread_group(cls, t1, t2, t3);
 }
 pub fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int {
@@ -992,9 +984,7 @@ pub fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_k
         dropConfigTwin(engine.configOf(cls));
         return engine.configTemplate(cls, name, .{ .dtype = dtype });
     }
-    if (engine.noting()) {
-        engine.noteTemplate(cls, name, .{ .dtype = dtype });
-    }
+    engine.noteTemplate(cls, name, .{ .dtype = dtype });
     kernel_keys.configNote(cls, " {s}={t}", .{ name, dtype });
     return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_dtype(cls, name, dtype);
 }
@@ -1004,9 +994,7 @@ pub fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_ker
         dropConfigTwin(engine.configOf(cls));
         return engine.configTemplate(cls, name, .{ .int = value });
     }
-    if (engine.noting()) {
-        engine.noteTemplate(cls, name, .{ .int = value });
-    }
+    engine.noteTemplate(cls, name, .{ .int = value });
     kernel_keys.configNote(cls, " {s}={d}", .{ name, value });
     return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_int(cls, name, value);
 }
@@ -1053,7 +1041,7 @@ pub fn kernelNewSource(name: [*:0]const u8, input_names: mlx_vector_string, outp
     const outs = MlxStrings.of(output_names) orelse return .{};
     defer outs.deinit();
     const k = raw_kernel.mlx_fast_metal_kernel_new(name, ins.vec, outs.vec, source, header, ensure_row_contiguous, atomic_outputs);
-    if (engine.noting()) engine.kernelNew(k, name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
+    engine.kernelNew(k, name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
     kernel_keys.kernelNew(k, name, source, header, ensure_row_contiguous, atomic_outputs);
     return k;
 }
@@ -1124,7 +1112,7 @@ pub fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int {
         kernel_keys.kernelFree(twin);
         return raw_kernel.mlx_fast_metal_kernel_free(twin);
     }
-    if (engine.noting()) engine.kernelFree(cls);
+    engine.kernelFree(cls);
     kernel_keys.kernelFree(cls);
     return raw_kernel.mlx_fast_metal_kernel_free(cls);
 }

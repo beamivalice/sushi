@@ -2,9 +2,10 @@
 //! `ScaledDotProductAttention::eval_gpu` with `sdpa_full_self_attention_nax`, `sdpa_vector` and `sdpa_vector_2pass`
 //! (mlx/backend/metal/scaled_dot_product_attention.cpp) over the compiled kernels of `mlx.metallib`, so the output
 //! has the bytes and the strides it has under MLX. Ported from MLX's Metal backend (MIT, see NOTICE). Ported: no mask
-//! and no sinks, one dtype, head dimension 64 on the NAX tiles. Refused by name, each one because the tower never asks:
+//! and no sinks, one dtype, head dimension 64, on the NAX tiles or, as MLX does without matrix units or for f32 without
+//! TF32, the SIMD tiles (`sdpa_full_self_attention_metal`). Refused by name, each one because the tower never asks:
 //! a mask or sinks (it passes none), another head dimension (the release's is 64, and `engineGap` checks it at the
-//! load), mixed dtypes (q, k and v are all bf16), the SIMD tiles (DeepSeek serves on the engine only with matrix units).
+//! load), mixed dtypes (q, k and v are all bf16).
 
 const std = @import("std");
 const metal = @import("../metal.zig");
@@ -41,9 +42,16 @@ const AttnParams = extern struct {
 const head_dim = 64;
 /// The vector kernels take at most this many query rows; a longer query takes the full kernel.
 const vector_rows = 8;
-/// The full kernel's query and key tiles.
-const full_bq: usize = 64;
-const full_bk: usize = 32;
+/// The full kernel's query and key tiles, on the NAX arm and on the SIMD arm.
+const Tiles = struct { bq: usize, bk: usize };
+const nax_tiles: Tiles = .{ .bq = 64, .bk = 32 };
+const simd_tiles: Tiles = .{ .bq = 32, .bk = 32 };
+
+/// The tiles MLX's `sdpa_full_self_attention_metal` takes for a head dimension of 64: NAX with matrix units, and for f32
+/// only with TF32.
+fn tilesOf(g: matmul.Gpu, dtype: core.Dtype) Tiles {
+    return if (g.nax and (dtype != .float32 or g.tf32)) nax_tiles else simd_tiles;
+}
 
 /// The pipeline `attention` runs for `q_len` query rows over `k_len` keys, `gqa` query heads to a key head, on `g`:
 /// what its name and function constants follow. A load's warm reads it to reach every pipeline its shapes take.
@@ -56,12 +64,12 @@ pub const Plan = union(enum) {
 /// The full kernel's alignment constants: whether the query and the keys are whole tiles.
 const Aligned = struct { align_q: bool, align_k: bool };
 
-fn alignedOf(q_len: usize, k_len: usize) Aligned {
-    return .{ .align_q = q_len % full_bq == 0, .align_k = k_len % full_bk == 0 };
+fn alignedOf(t: Tiles, q_len: usize, k_len: usize) Aligned {
+    return .{ .align_q = q_len % t.bq == 0, .align_k = k_len % t.bk == 0 };
 }
 
-pub fn planOf(g: matmul.Gpu, q_len: usize, k_len: usize, gqa: usize) Plan {
-    if (q_len > vector_rows) return .{ .full = alignedOf(q_len, k_len) };
+pub fn planOf(g: matmul.Gpu, dtype: core.Dtype, q_len: usize, k_len: usize, gqa: usize) Plan {
+    if (q_len > vector_rows) return .{ .full = alignedOf(tilesOf(g, dtype), q_len, k_len) };
     // Two passes for a long key axis on a Max or an Ultra, or for keys shared by many heads.
     if (((g.class == .d or g.class == .s) and k_len >= 1024) or (gqa > 1 and k_len >= 4096)) {
         const gqa_dims = (gqa == 8 and head_dim == 64) or (gqa == 8 and head_dim == 128) or ((gqa == 12 or gqa == 16) and head_dim == 128);
@@ -90,9 +98,8 @@ pub fn attention(q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: f32) Err
     const gqa: usize = @intCast(@divExact(heads, k_heads));
 
     if (q_len > vector_rows) {
-        // `has_fused_kernel` and `use_fallback` take this shape to the full kernel; the SIMD tiles are not ported.
-        if (!g.nax or (q_pre.dtype == .float32 and !g.tf32)) return error.TensorUnsupported;
-        return full(q_pre, k_pre, v_pre, scale);
+        // `has_fused_kernel` and `use_fallback` take this shape to the full kernel at head dimension 64.
+        return full(tilesOf(g, q_pre.dtype), q_pre, k_pre, v_pre, scale);
     }
     if (q_len > k_len or q_len * gqa > 32) return error.TensorUnsupported;
     return vector(g, q_pre, k_pre, v_pre, scale, gqa);
@@ -106,8 +113,8 @@ fn copyUnlessLastDense(t: *Tensor) Error!*Tensor {
     return if (t.strides[3] == 1) core.share(t) else ops.contiguousCopy(t);
 }
 
-/// `sdpa_full_self_attention_nax`: the output is laid out `[B, qL, H, D]` and read as `[B, H, qL, D]`.
-fn full(q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: f32) Error!*Tensor {
+/// `sdpa_full_self_attention_nax` or `_metal`: the output is laid out `[B, qL, H, D]` and read as `[B, H, qL, D]`.
+fn full(tiles: Tiles, q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: f32) Error!*Tensor {
     const q = try copyUnlessLastDense(q_pre);
     defer core.release(q);
     const k = try copyUnlessLastDense(k_pre);
@@ -115,8 +122,8 @@ fn full(q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: f32) Error!*Tenso
     const v = try copyUnlessLastDense(v_pre);
     defer core.release(v);
 
-    const bq = full_bq;
-    const bk = full_bk;
+    const bq = tiles.bq;
+    const bk = tiles.bk;
     const wm: usize = 4;
     const b: usize = @intCast(q.shape[0]);
     const h: usize = @intCast(q.shape[1]);
@@ -127,7 +134,7 @@ fn full(q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: f32) Error!*Tenso
     const out = try ops.transpose(laid, &.{ 0, 2, 1, 3 });
     errdefer core.release(out);
 
-    const aligned = alignedOf(q_len, k_len);
+    const aligned = alignedOf(tiles, q_len, k_len);
     const align_q = aligned.align_q;
     const align_k = aligned.align_k;
     const type_name = try stock.typeName(q.dtype);
@@ -205,7 +212,7 @@ fn vector(g: matmul.Gpu, q_pre: *Tensor, k_pre: *Tensor, v_pre: *Tensor, scale: 
     defer core.release(v);
     const out = try core.fresh(q.dtype, &.{ q.shape[0], q.shape[1], q.shape[2], v.shape[3] });
     errdefer core.release(out);
-    switch (planOf(g, @intCast(q.shape[2]), @intCast(k.shape[2]), gqa)) {
+    switch (planOf(g, q.dtype, @intCast(q.shape[2]), @intCast(k.shape[2]), gqa)) {
         .two_pass => |plan| try twoPass(plan.blocks, plan.wide, q, k, v, out, scale, gqa),
         else => try onePass(q, k, v, out, scale, gqa),
     }

@@ -12,13 +12,20 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const log = @import("log.zig");
+const device = @import("sushi_exl3").device;
 
 const Arr = mlx.mlx_array;
 
 /// Rows of one launch: a verify block's.
 pub const max_rows = 16;
-/// A row's threadgroup. A GPU without matrix units grants this kernel 768, so it launches only where the engine serves.
-const group_threads = 1024;
+/// A row's threadgroup sizes, the widest first. A GPU may grant a register-heavy kernel fewer threads than it asks (an
+/// M1 grants this one 768): a launch it refuses for size takes the next rung for the process, and the draw is the
+/// rule's at every rung.
+var ladder: device.ThreadLadder = .{ .rungs = &.{ 1024, 512, 256 } };
+
+/// A test's grant: a launch of more threads than this is refused as a GPU that granted less would refuse it.
+var grant_for_test: usize = std.math.maxInt(usize);
 
 // `sushi_draw_mix` is lowbias32, ported from hash-prospector (public domain): NOTICE.
 const HEADER =
@@ -42,7 +49,7 @@ const HEADER =
     \\}
     \\// Whole nats below the row's top value, the last bin taking everything from 31 down.
     \\static inline uint sushi_draw_bin(float m, float v) { return uint(metal::min(m - v, 31.0f)); }
-    \\#define SD_CAP 1024u
+    \\#define SD_CAP uint(TG)
     \\#define SD_VAL(j) sushi_draw_val(float(x[j]) * inv_t)
     \\#define SD_INK ((!do_k) || k > kth || (k == kth && (base_k + ko++) < tk))
     \\#define SD_BARRIER threadgroup_barrier(metal::mem_flags::mem_threadgroup)
@@ -54,11 +61,11 @@ const HEADER =
     \\  uint b_ = pre_; for (uint g = 0u; g < sg; ++g) b_ += pu[0][g]; out = b_; SD_BARRIER; }
 ;
 
-/// One thread owns `STRIPE` consecutive ids, in simdgroup then lane order, so "lower id first" is "earlier thread
-/// first". A filtered row takes one of two routes to the same rule:
+/// A threadgroup of `TG` threads, `TG / 32` simdgroups. One thread owns `STRIPE` consecutive ids, in simdgroup then lane
+/// order, so "lower id first" is "earlier thread first". A filtered row takes one of two routes to the same rule:
 /// - the shortlist: one walk counts the ids by whole nats below the row's top value, the bins from the top that hold
 ///   the top-k's count (or, by the bins' bounds, surely the nucleus's mass) are collected in id order, at most
-///   `SD_CAP` ids, and every thread ranks one of them against the rest;
+///   `SD_CAP` (one a thread) ids, and every thread ranks one of them against the rest;
 /// - the descents, when the shortlist would not fit: a level (the top-k's last key, the nucleus's last key) is found
 ///   five key bits a round, every thread binning its ids of the live bucket.
 /// A barrier follows every shared write and every shared read.
@@ -66,7 +73,8 @@ const SOURCE =
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint row = threadgroup_position_in_grid.x;
-    \\constexpr uint STRIPE = (uint(V) + 1023u) / 1024u;
+    \\constexpr uint NSG = uint(TG) / 32u;
+    \\constexpr uint STRIPE = (uint(V) + uint(TG) - 1u) / uint(TG);
     \\const uint i0 = (sg * 32u + lane) * STRIPE;
     \\const uint n = i0 < uint(V) ? metal::min(STRIPE, uint(V) - i0) : 0u;
     \\const device T* x = logits + size_t(row) * V + i0;
@@ -93,7 +101,7 @@ const SOURCE =
     \\  s = metal::simd_max(s);
     \\  if (lane == 0u) pf[0][sg] = s;
     \\  SD_BARRIER;
-    \\  for (uint g = 0u; g < 32u; ++g) m = metal::max(m, pf[0][g]);
+    \\  for (uint g = 0u; g < NSG; ++g) m = metal::max(m, pf[0][g]);
     \\  SD_BARRIER;
     \\}
     \\
@@ -110,7 +118,7 @@ const SOURCE =
     \\    // Lane d holds bin d. Top-k cuts at the first bin down to which the count is the k. A nucleus cuts where the
     \\    // bins above surely hold its mass: an id of bin d weighs between e^-(d+1) and e^-d of the top one.
     \\    uint c = 0u;
-    \\    for (uint g = 0u; g < 32u; ++g) c += pu[lane][g];
+    \\    for (uint g = 0u; g < NSG; ++g) c += pu[lane][g];
     \\    const uint cc = metal::simd_prefix_exclusive_sum(c) + c;
     \\    const float lo = lane < 31u ? float(c) * metal::precise::exp(-float(lane + 1u)) : 0.0f;
     \\    const float up = float(c) * metal::precise::exp(-float(lane));
@@ -165,8 +173,8 @@ const SOURCE =
     \\      const float s = metal::simd_sum(ink ? ce[t] : 0.0f);
     \\      if (lane == 0u) pf[2][sg] = s;
     \\      SD_BARRIER;
-    \\      for (uint g = 0u; g < 32u; ++g) zs += pf[2][g];
-    \\      if (!do_k) for (uint g = 0u; g < 32u; ++g) zs += pf[1][g];
+    \\      for (uint g = 0u; g < NSG; ++g) zs += pf[2][g];
+    \\      if (!do_k) for (uint g = 0u; g < NSG; ++g) zs += pf[1][g];
     \\    }
     \\    if (ink && (!do_p || above < metal::max(top_p, 1.17549435e-38f) * zs)) {
     \\      best = sushi_draw_unkey(kt) + sushi_draw_gumbel(ci[t], key0, key1);
@@ -192,7 +200,7 @@ const SOURCE =
     \\      SD_BARRIER;
     \\      if (sg == 0u) {
     \\        uint t = 0u;
-    \\        if (lane < nb) for (uint g = 0u; g < 32u; ++g) t += pu[nb - 1u - lane][g];
+    \\        if (lane < nb) for (uint g = 0u; g < NSG; ++g) t += pu[nb - 1u - lane][g];
     \\        const uint exc = above + metal::simd_prefix_exclusive_sum(t);
     \\        const uint sel = metal::min(metal::simd_min((lane < nb && exc + t >= top_k) ? lane : 0xFFu), nb - 1u);
     \\        above = metal::simd_sum(lane == sel ? exc : 0u);
@@ -230,7 +238,7 @@ const SOURCE =
     \\      SD_BARRIER;
     \\      if (sg == 0u) {
     \\        float t = 0.0f;
-    \\        if (lane < nb) for (uint g = 0u; g < 32u; ++g) t += pf[nb - 1u - lane][g];
+    \\        if (lane < nb) for (uint g = 0u; g < NSG; ++g) t += pf[nb - 1u - lane][g];
     \\        if (r == 0u) lim = metal::max(top_p, 1.17549435e-38f) * metal::simd_sum(t);
     \\        const float exc = above + metal::simd_prefix_exclusive_sum(t);
     \\        const uint sel = metal::min(metal::simd_min((lane < nb && exc + t >= lim) ? lane : 0xFFu), nb - 1u);
@@ -266,7 +274,7 @@ const SOURCE =
     \\if (sg == 0u && lane == 0u) {
     \\  float fb = -INFINITY;
     \\  uint fi = 0xFFFFFFFFu;
-    \\  for (uint g = 0u; g < 32u; ++g) {
+    \\  for (uint g = 0u; g < NSG; ++g) {
     \\    const float s = pf[0][g];
     \\    const uint c = pi[g];
     \\    if (c != 0xFFFFFFFFu && (fi == 0xFFFFFFFFu || s > fb || (s == fb && c < fi))) { fb = s; fi = c; }
@@ -278,10 +286,10 @@ const SOURCE =
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 
-const Key = struct { rows: c_int, vocab: c_int, dtype: mlx.mlx_dtype, own: bool };
+const Key = struct { rows: c_int, vocab: c_int, dtype: mlx.mlx_dtype, own: bool, tg: u32 };
 const Entry = struct { key: Key, value: mlx.mlx_fast_metal_kernel_config };
 /// One config a (rows, vocab, dtype): a load draws at one vocab and dtype, at up to `max_rows` widths.
-var configs: [4 * max_rows]?Entry = @splat(null);
+var configs: [12 * max_rows]?Entry = @splat(null);
 
 /// Whether the kernel serves `rows` rows of `dtype` logits.
 pub fn fits(n_rows: usize, dtype: mlx.mlx_dtype) bool {
@@ -301,9 +309,24 @@ pub const Routed = struct { tok: Arr, route: Arr };
 
 /// `rows` with the route of each row beside its draw.
 pub fn routed(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []const [2]u32, s: mlx.mlx_stream) !Routed {
+    while (true) {
+        const tg = ladder.threads();
+        return launch(logits, temperature, top_p, top_k, keys, s, tg) catch |e| {
+            const refused = e == error.SamplerDrawGroupRefused or (e == error.MlxError and mlx.takeErrorIf("Thread group size"));
+            if (refused and ladder.stepDown()) {
+                log.warn("[engine] sampler draw: this GPU does not grant {d} threads a group; drawing with {d}\n", .{ tg, ladder.threads() });
+                continue;
+            }
+            return e;
+        };
+    }
+}
+
+fn launch(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []const [2]u32, s: mlx.mlx_stream, tg: u32) !Routed {
     const shape = mlx.getShape(logits);
     const dtype = mlx.mlx_array_dtype(logits);
     if (shape.len != 2 or shape[0] != @as(c_int, @intCast(keys.len)) or !fits(keys.len, dtype) or !(temperature > 0)) return error.SamplerDrawUnsupported;
+    if (tg > grant_for_test) return error.SamplerDrawGroupRefused;
     const scope = mlx.engine.enter(s);
     defer scope.end();
     if (kernel == null) {
@@ -315,7 +338,7 @@ pub fn routed(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []con
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         kernel = k;
     }
-    const key = Key{ .rows = shape[0], .vocab = shape[1], .dtype = dtype, .own = scope.own };
+    const key = Key{ .rows = shape[0], .vocab = shape[1], .dtype = dtype, .own = scope.own, .tg = tg };
     var cached: ?mlx.mlx_fast_metal_kernel_config = null;
     for (configs) |item| if (item) |entry| if (std.meta.eql(key, entry.key)) {
         cached = entry.value;
@@ -328,9 +351,10 @@ pub fn routed(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []con
     };
     if (cached == null) {
         for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{key.rows}, 1, .uint32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, key.rows * group_threads, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, group_threads, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, key.rows * @as(c_int, @intCast(tg)), 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @intCast(tg), 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "V", key.vocab));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", @intCast(tg)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dtype));
         for (&configs) |*item| if (item.* == null) {
             item.* = .{ .key = key, .value = cfg };
@@ -493,9 +517,6 @@ fn drawHost(a: std.mem.Allocator, s: mlx.mlx_stream, flat: []const f32, n_rows: 
 
 test "sampler draw: the kernel draws what the rule draws, at every filter, with and without ties" {
     try mlx.requireGpu();
-    // The engine draws where it serves a model, a GPU with matrix units; one without grants this kernel 768 threads a
-    // group, under the 1,024 it is laid out on. A failed launch takes its raise with it.
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
@@ -545,9 +566,6 @@ test "sampler draw: the kernel draws what the rule draws, at every filter, with 
 
 test "sampler draw: a row's draw is the same alone, beside other rows and at any place among them" {
     try mlx.requireGpu();
-    // The engine draws where it serves a model, a GPU with matrix units; one without grants this kernel 768 threads a
-    // group, under the 1,024 it is laid out on. A failed launch takes its raise with it.
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
@@ -583,9 +601,6 @@ test "sampler draw: a row's draw is the same alone, beside other rows and at any
 
 test "sampler draw: an id at -inf is never drawn, one at +inf always is, top-k 1 and a zero nucleus are the lowest top id, and no finite value draws id 0" {
     try mlx.requireGpu();
-    // The engine draws where it serves a model, a GPU with matrix units; one without grants this kernel 768 threads a
-    // group, under the 1,024 it is laid out on. A failed launch takes its raise with it.
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
@@ -640,7 +655,6 @@ test "sampler draw: an id at -inf is never drawn, one at +inf always is, top-k 1
 
 test "sampler draw: a repeat penalty that pushes a seen id to +inf draws that id at every filter" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
@@ -676,7 +690,6 @@ test "sampler draw: a repeat penalty that pushes a seen id to +inf draws that id
 
 test "sampler draw: at the edges of width, row count, special values and filters the kernel draws what the rule draws" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
@@ -747,7 +760,6 @@ test "sampler draw: at the edges of width, row count, special values and filters
 
 test "sampler draw: at served vocabularies, over a plateau and a slope, the kernel draws what the rule draws" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
@@ -812,9 +824,6 @@ test "sampler draw: at served vocabularies, over a plateau and a slope, the kern
 
 test "sampler draw: over many keys the kept ids come out at their share of the kept mass" {
     try mlx.requireGpu();
-    // The engine draws where it serves a model, a GPU with matrix units; one without grants this kernel 768 threads a
-    // group, under the 1,024 it is laid out on. A failed launch takes its raise with it.
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
@@ -903,7 +912,6 @@ test "sampler draw: a key that maxes a negligible id's hash still draws the like
     try testing.expectEqual(@as(u32, 7), hostDraw(row, order, 1.0, 1.0, 0, key).id);
 
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const was = mlx.engine.enabled;
@@ -918,7 +926,6 @@ test "sampler draw: a key that maxes a negligible id's hash still draws the like
 
 test "sampler draw: at a served vocabulary an unfiltered row never draws an id of negligible mass" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const a = testing.allocator;
@@ -940,4 +947,52 @@ test "sampler draw: at a served vocabulary an unfiltered row never draws an id o
         defer a.free(got);
         for (got, 0..) |g, r| try testing.expectEqual(@as(u32, @intCast(1000 * r + 3)), g);
     }
+}
+
+test "sampler draw: at every thread rung the kernel draws what the rule draws, and a refused rung is left for the process" {
+    try mlx.requireGpu();
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    const saved = ladder;
+    defer ladder = saved;
+    defer grant_for_test = std.math.maxInt(usize);
+    const vocab = 9000;
+    const n_rows = 4;
+    const flat = try a.alloc(f32, n_rows * vocab);
+    defer a.free(flat);
+    const order = try a.alloc(u32, vocab);
+    defer a.free(order);
+    var checked: usize = 0;
+    for ([_]usize{ 1024, 512, 256 }) |grant| {
+        ladder.at = 0;
+        grant_for_test = grant;
+        for ([_]bool{ false, true }) |ties| {
+            for (0..n_rows) |r| testRow(flat[r * vocab ..][0..vocab], 0xc0de + r, ties);
+            for ([_][2]f32{ .{ 1.0, 0 }, .{ 0.9, 0 }, .{ 1.0, 5 }, .{ 0.95, 40 }, .{ 0.5, 3000 }, .{ 1.0, 8999 } }) |f| {
+                const top_p = f[0];
+                const top_k: u32 = @intFromFloat(f[1]);
+                var keys: [n_rows][2]u32 = undefined;
+                for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x4000 + r * 3 + top_k), @intCast(0x77 + r) };
+                const got = try drawHost(a, s, flat, n_rows, vocab, .float32, 0.9, top_p, top_k, &keys);
+                defer a.free(got);
+                try testing.expectEqual(@as(u32, @intCast(grant)), ladder.threads());
+                for (got, 0..) |g, r| {
+                    const want = hostDraw(flat[r * vocab ..][0..vocab], order, 0.9, top_p, top_k, keys[r]);
+                    if (want.nucleus_margin < 1e-5) continue;
+                    if (want.gap < 1e-4) {
+                        try testing.expect(g == want.id or g == want.second.?);
+                        continue;
+                    }
+                    try testing.expectEqual(want.id, g);
+                    checked += 1;
+                }
+            }
+        }
+    }
+    try testing.expect(checked > 100);
 }

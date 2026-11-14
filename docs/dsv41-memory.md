@@ -127,7 +127,7 @@ state's 890 B a token is 204 B; the cap carries 603 B (x 5/4).
 | decode or verify block | 9k / 225k / 1M | 0.55 / 0.71 / 1.33 | 0.28 / 0.44 / 1.06 |
 | image encode | any | unchanged: the bill already covered the measured peak by a quarter | |
 
-On a Cooler load (an STQ pack on a GPU with matrix units, [engine-own-forward](engine-own-forward.md#memory)) the request
+On a Cooler load (an STQ pack, [engine-own-forward](engine-own-forward.md#memory)) the request
 bill is the state and one forward's cap: the engine's pool is that cap (its free buffers are inside it), a prefill chunk
 gives its cap whole to the pool (the state rows it appends grow there too), and MLX allocates nothing, so MLX's parked
 decode pool (1 GiB on the MLX route) is not billed. The ledger's pool line of a Cooler load is what the engine parks

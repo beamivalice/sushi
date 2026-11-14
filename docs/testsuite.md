@@ -65,6 +65,9 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   A filter may hold any character; a test name with a quote is selected by its longest quote-free piece that no
   skipped test holds (the response file the compiler reads cannot carry a quote), and a name with none is renamed.
 - `SUSHI_TEST_NO_GPU=1` makes a test build see no Metal backend, so `requireGpu` skips (diagnostic, test builds only).
+- **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device
+  profile and the engine dispatch as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`). A test about one arm's bytes names it
+  (`device.current().has(.matrix_g17)`), never a chip.
 - The pack tier's envs: `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/test-fixtures/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
   folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
   `{p0, ratio, keys, group}`, `wscale` and the kernel's `scores`; the test skips without it), `QWEN4_TEST_MODEL`,

@@ -14,11 +14,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 - Off, by name: `--kv-quant` (the state is the activation dtype;
   `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` or `--mtp-greedy-tail` refuses the load (DSpark accepts by the exact rule only), a settings `kv_quant`, `mtp_acceptance` or `mtp_greedy_tail` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
   ([below](#dspark)), the checkpoint's own drafter, on by default like every served MTP head; `--no-mtp` turns it off.
-- An STQ pack's decode forwards run on the engine of our own (shipped as Sushi Cooler) on a GPU with matrix units, and
-  on MLX elsewhere or when the user opts out with `--ds41-mlx-engine` or the model's `ds41_cooler: false` (flag, then
-  file, then on); the load line says which and why
+- An STQ pack's decode forwards run on the engine of our own (shipped as Sushi Cooler) on any GPU, the SIMD arms where
+  there are no matrix units, and on MLX for any other pack or when the user opts out with `--ds41-mlx-engine` or the
+  model's `ds41_cooler: false` (flag, then file, then on); the load line says which and why
   ([engine-own-forward](engine-own-forward.md#where-it-serves)). The ask is decided in `dsv41_borrow.decodeSide`
-  (`.mlx_by_flag`, `.mlx_by_setting`), after the pack and the GPU: a pack or Mac the engine cannot serve keeps its own reason.
+  (`.mlx_by_flag`, `.mlx_by_setting`), after the pack: a pack the engine cannot serve keeps its own reason. The
+  no-matrix-unit path is proven on an M5 dispatching as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`); no real
+  M1 to M4 run (thread grants, speed, host CPU) is recorded yet.
 - Routed experts always stream: 289 GB of FP4 against a 128 GB box. `--ssd-budget-gb` (or `ssd_budget_gb` in
   model-settings) is required, as on every streamed load; without one the load fails with `ExpertStreamingRequired`.
 - Thinking: `low` 50, `medium` 62, `high` 75, `xhigh` 87, `max` 100 on the encoder's 1-100 effort scale (its own

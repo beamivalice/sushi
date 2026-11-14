@@ -20,8 +20,7 @@ chunk of any width included, and a pack that decodes on MLX prefills on MLX.
 
 | pack and GPU | forwards on the engine |
 |---|---|
-| DeepSeek-V4.1 STQ (experts and trunk), a GPU with matrix units (M5) | every forward: decode, DSpark draft and verify, every prefill chunk, wider than 16 rows or not, with image rows or without |
-| DeepSeek-V4.1 STQ, a GPU without matrix units | none: the engine's other matmul tiles have not run on one |
+| DeepSeek-V4.1 STQ (experts and trunk), any GPU | every forward: decode, DSpark draft and verify, every prefill chunk, wider than 16 rows or not, with image rows or without; on a GPU with matrix units (M5) the NAX arms, on one without (M1 to M4) the SIMD arms of the same kernels and of the stock tiles |
 | DeepSeek-V4.1 with an FP8 trunk or MXFP4 experts | none: the engine runs neither |
 | every other architecture | none: MLX |
 
@@ -192,8 +191,8 @@ route and the MLX arm still build the bank at prepare time.
   grid or threadgroup when it next launches on MLX (`Config.behind`), never from inside the engine's scope. The EXL3
   module asks its host which side a stream is (`src/exl3/host_side.zig`, which names no engine: mlx-serve vendors
   the module) and keeps its GEMM input ring and zero-slot rows one per side.
-- **A kernel is noted in a served process whatever the engine's state** (`route.noting`: a GPU with matrix units),
-  so a kernel or config a module made before the first Cooler load launches on the engine like one made after it.
+- **A kernel is noted in a served process whatever the engine's state**, so a kernel or config a module made before
+  the first Cooler load launches on the engine like one made after it.
 - **A Cooler pack loads again after its unload.** `dsv41_borrow.unloadModel` leaves the pool empty and uncapped, and
   `initDsv41` sets its own budget and unseals the pipelines before it proves a kernel. The NAX GEMM arm proven on the
   engine's side stays proven: a later build that fails there is an error, never a switch to another arm.

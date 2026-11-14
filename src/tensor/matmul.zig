@@ -20,7 +20,9 @@ const max_batch = core.max_dims;
 /// is this engine's floor) and take f32.
 pub const Gpu = struct { class: device.Class, gen: u32, nax: bool, tf32: bool };
 
-var gpu_known: ?Gpu = null;
+/// Whether MLX takes f32 products on TF32 tiles, read once: MLX keeps its first reading of the variable for the process,
+/// and its tiles follow the chip, so the chip's units decide how it is read, not what the profile withholds.
+var tf32_known: ?bool = null;
 
 fn atoi(text: []const u8) i64 {
     var end: usize = 0;
@@ -28,17 +30,18 @@ fn atoi(text: []const u8) i64 {
     return std.fmt.parseInt(i64, text[0..end], 10) catch 0;
 }
 
+/// The GPU as the profile gives it, so a withheld unit or a test's profile is the engine's too.
 pub fn gpu() Error!Gpu {
-    if (gpu_known) |g| return g;
     const p = device.current();
-    // MLX's own override, read as MLX reads it.
-    var tf32 = if (std.c.getenv("MLX_ENABLE_TF32")) |v| atoi(std.mem.span(v)) != 0 else true;
-    const nax = p.chip.contains(.matrix_g17);
-    if (comptime builtin.is_test) {
-        if (nax) tf32 = mlxTf32() catch tf32;
+    if (tf32_known == null) {
+        // MLX's own override, read as MLX reads it.
+        var tf32 = if (std.c.getenv("MLX_ENABLE_TF32")) |v| atoi(std.mem.span(v)) != 0 else true;
+        if (comptime builtin.is_test) {
+            if (p.chip.contains(.matrix_g17)) tf32 = mlxTf32() catch tf32;
+        }
+        tf32_known = tf32;
     }
-    gpu_known = .{ .class = p.class, .gen = p.generation, .nax = nax, .tf32 = tf32 };
-    return gpu_known.?;
+    return .{ .class = p.class, .gen = p.generation, .nax = p.has(.matrix_g17), .tf32 = tf32_known.? };
 }
 
 /// Whether the GPU has the matrix units MLX's NAX kernels run on.
@@ -513,17 +516,16 @@ fn fusedNax(c: Call) Error!void {
     return fusedLaunch(c, "steel_gemm_fused_nax", t, swizzle);
 }
 
-fn fusedLaunch(c: Call, comptime family: []const u8, t: Tile, swizzle: u5) Error!void {
+/// The fused kernel of `family` for a product whose M, N and K are whole tiles or not: MLX specializes it by those three
+/// facts, so a prompt's length alone picks which of the eight a request launches.
+fn fusedKernel(comptime family: []const u8, c: Call, t: Tile, align_m: bool, align_n: bool, align_k: bool) Error!metal.Pipeline {
     const type_name = try stock.typeName(c.out.dtype);
     var name_buf: [128]u8 = undefined;
     const name = try stock.named(&name_buf, family ++ "_{c}{c}_{s}_{s}_bm{d}_bn{d}_bk{d}_wm{d}_wn{d}", .{ letter(c.a.transposed), letter(c.b.transposed), type_name, type_name, t.bm, t.bn, t.bk, t.wm, t.wn });
     const has_batch = c.batches.n > 1;
-    const align_m = c.m % t.bm == 0;
-    const align_n = c.n % t.bn == 0;
-    const align_k = c.k % t.bk == 0;
     var hash_buf: [256]u8 = undefined;
     const hash = try stock.named(&hash_buf, "{s}_has_batch_{c}_use_out_source_n_do_axpby_n_align_M_{c}_align_N_{c}_align_K_{c}", .{ name, letter(has_batch), letter(align_m), letter(align_n), letter(align_k) });
-    const kern = try stock.kernelFlags(name, hash, &.{
+    return stock.kernelFlags(name, hash, &.{
         .{ .index = 10, .value = has_batch },
         .{ .index = 100, .value = false },
         .{ .index = 110, .value = false },
@@ -531,6 +533,16 @@ fn fusedLaunch(c: Call, comptime family: []const u8, t: Tile, swizzle: u5) Error
         .{ .index = 201, .value = align_n },
         .{ .index = 202, .value = align_k },
     });
+}
+
+fn fusedLaunch(c: Call, comptime family: []const u8, t: Tile, swizzle: u5) Error!void {
+    const has_batch = c.batches.n > 1;
+    const kern = try fusedKernel(family, c, t, c.m % t.bm == 0, c.n % t.bn == 0, c.k % t.bk == 0);
+    // Until the load seals the pipelines, a SIMD tile's other seven alignments are made with it, those the library holds:
+    // a request's lengths pick them.
+    if (!core.sealed and comptime std.mem.eql(u8, family, "steel_gemm_fused")) for (0..8) |bits| {
+        _ = fusedKernel(family, c, t, bits & 1 != 0, bits & 2 != 0, bits & 4 != 0) catch continue;
+    };
     var tiles_n = (c.n + t.bn - 1) / t.bn;
     var tiles_m = (c.m + t.bm - 1) / t.bm;
     const params: GemmParams = .{
@@ -605,6 +617,11 @@ fn nextPowerOfTwo(v: usize) usize {
     return if (v <= 1) v else std.math.ceilPowerOfTwo(usize, v) catch v;
 }
 
+fn splitKKernel(c: Call, t: Tile, aligned_mn: bool, aligned_k: bool) Error!metal.Pipeline {
+    var buf: [160]u8 = undefined;
+    return stock.kernel(try stock.named(&buf, "steel_gemm_splitk_{c}{c}_{s}_float32_bm{d}_bn{d}_bk{d}_wm{d}_wn{d}_MN_{c}aligned_K_{c}aligned", .{ letter(c.a.transposed), letter(c.b.transposed), try stock.typeName(c.out.dtype), t.bm, t.bn, t.bk, t.wm, t.wn, letter(aligned_mn), letter(aligned_k) }));
+}
+
 /// `steel_gemm_splitk_axpby`: a long inner axis cut into parts, each a product into f32, then summed.
 fn splitK(c: Call) Error!void {
     const tm = (c.arm_m + 31) / 32;
@@ -615,10 +632,13 @@ fn splitK(c: Call) Error!void {
     const iterations = (c.k / t.bk) / parts_n;
     const parts = try core.fresh(.float32, &.{ Call.int(parts_n), Call.int(c.m), Call.int(c.n) });
     defer core.release(parts);
-    const aligned_mn = c.m % t.bm == 0 and c.n % t.bn == 0;
-    const aligned_k = c.k % t.bk == 0;
-    var buf: [160]u8 = undefined;
-    const kern = try stock.kernel(try stock.named(&buf, "steel_gemm_splitk_{c}{c}_{s}_float32_bm{d}_bn{d}_bk{d}_wm{d}_wn{d}_MN_{c}aligned_K_{c}aligned", .{ letter(c.a.transposed), letter(c.b.transposed), try stock.typeName(c.out.dtype), t.bm, t.bn, t.bk, t.wm, t.wn, letter(aligned_mn), letter(aligned_k) }));
+    const kern = try splitKKernel(c, t, c.m % t.bm == 0 and c.n % t.bn == 0, c.k % t.bk == 0);
+    // Until the load seals the pipelines, the other alignments and tile sizes are made with it, those the library holds: a
+    // request's lengths pick them.
+    if (!core.sealed) for (0..16) |bits| {
+        const other: Tile = .{ .bm = if (bits & 4 != 0) 32 else 16, .bn = if (bits & 8 != 0) 32 else 16, .bk = t.bk, .wm = t.wm, .wn = t.wn };
+        _ = splitKKernel(c, other, bits & 1 != 0, bits & 2 != 0) catch continue;
+    };
     const tiles_n = (c.n + t.bn - 1) / t.bn;
     const tiles_m = (c.m + t.bm - 1) / t.bm;
     const params: SplitKParams = .{

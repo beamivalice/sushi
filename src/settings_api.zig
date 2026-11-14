@@ -5,7 +5,6 @@ const std = @import("std");
 const http = @import("http.zig");
 const log = @import("log.zig");
 const model_settings = @import("model_settings.zig");
-const mlx = @import("mlx.zig");
 const scheduler = @import("scheduler.zig");
 const default_port = @import("default_port.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -648,9 +647,7 @@ fn heldRow(e: *model_registry_mod.LoadedModel) ModelRow {
 /// Why Sushi Cooler cannot serve a row's pack or this Mac, which the page shows beside a disabled key.
 fn judgeCooler(fit: *model_settings.Fit) void {
     if (!fit.cooler_offered or fit.cooler_why.len > 0) return;
-    if (!fit.stq_experts) {
-        fit.cooler_why = model_settings.cooler_why_not_stq;
-    } else if (!mlx.engine.matrixUnits()) fit.cooler_why = model_settings.cooler_why_no_matrix_units;
+    if (!fit.stq_experts) fit.cooler_why = model_settings.cooler_why_not_stq;
 }
 
 fn collectRows(allocator: std.mem.Allocator, registry: *model_registry_mod.ModelRegistry) ![]ModelRow {

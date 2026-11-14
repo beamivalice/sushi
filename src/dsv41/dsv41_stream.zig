@@ -1504,7 +1504,8 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
         const redone = model.spec_redone - redone0;
         if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 stq route-spec prepared {?} slots {d}: {d} layers kept, {d} rebuilt, {d} of them recomputing only the missed picks ({d} of {d} picks)\n", .{ prepared, slots, kept, rebuilt, redone, model.spec_redo_picks - redo_picks0, model.spec_rebuilt_picks - rebuilt_picks0 });
         // The queued and eager packs' decode layers write their stream in the reduce; the drained pack's expand is the kernel.
-        try testing.expectEqual(slots != 8, model.expands_folded > folded0);
+        // A GPU whose f32 matmul is true f32 fails the expand kernel's probe and keeps the chain, so no layer folds.
+        try testing.expectEqual(slots != 8 and @import("dsv41_kernels.zig").hcExpandProbed(), model.expands_folded > folded0);
         if (slots == 8) {
             try testing.expectEqual(@as(u64, 0), kept + rebuilt);
         } else if (slots <= 3) {
@@ -2733,6 +2734,8 @@ fn relErr(a: []const f32, t: []const f32) f64 {
 const F16_ULP: f64 = 0x1p-10;
 
 /// How far the served path's relative error may sit above the twin's: a quarter f16 ulp, the scale these traces' errors sit at.
+/// Where the twin's f32 matmul is true f32 (no matrix units) the twin is exact and the served path's error is the trunk
+/// linears' f16 prepared input alone, as large as on the matrix units (a TF32 twin carries its own): only the cap holds.
 const NO_WORSE_F16_ULPS = 0.25;
 
 test "dsv41 stq: the served path is no farther from the f32 CPU truth than the GPU twin, layers 0 to 4 (DSV41_STQ_TINY)" {
@@ -2795,7 +2798,8 @@ test "dsv41 stq: the served path is no farther from the f32 CPU truth than the G
         const twin_err = relErr(a, t);
         const served_err = relErr(b, t);
         if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 stq truth {s}: twin {e:.3} served {e:.3}\n", .{ name, twin_err, served_err });
-        try testing.expect(served_err <= twin_err + NO_WORSE_F16_ULPS * F16_ULP and served_err < 2e-2);
+        const near_twin = !mlx.engine.matrixUnits() or served_err <= twin_err + NO_WORSE_F16_ULPS * F16_ULP;
+        try testing.expect(near_twin and served_err < 2e-2);
     };
 }
 

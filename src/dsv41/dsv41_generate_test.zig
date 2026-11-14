@@ -1337,7 +1337,6 @@ test "dsv41 engine: a serial step and a one-row round give one position the same
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     for ([_]bool{ true, false }) |on_engine| {
-        if (on_engine and !mlx.engine.matrixUnits()) continue;
         var fx: EngineFixture = undefined;
         if (on_engine) try fx.open(dir) else try fx.openMlx(dir);
         defer fx.deinit();
@@ -1577,7 +1576,6 @@ fn shortPrefillBytes(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, lea
 
 test "dsv41 engine: the same greedy tokens come from a load with Sushi Cooler on and with the setting or the flag off, and an off load runs no engine dispatch (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var bytes: [3]std.ArrayList(u8) = @splat(.empty);
@@ -1683,7 +1681,6 @@ const ImageStandIn = struct {
 
 test "dsv41 engine: a forward that splices image rows runs on the engine at a prefill width and at a decode width, with MLX's logits and no op on MLX (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     // One chunk wider than a verify block with the whole span; and cuts through the span at decode widths.
@@ -1720,7 +1717,6 @@ test "dsv41 engine: a forward that splices image rows runs on the engine at a pr
 
 test "dsv41 engine: a forward through the Trunk while a verify is open runs on the engine, with the MLX route's logits and no op on MLX (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const dsv41_model = @import("dsv41_model.zig");
@@ -1910,7 +1906,6 @@ fn censusOf(dir: []const u8, work: *[9]u64) ![9]Asked {
 
 test "dsv41 engine: a Cooler load, its requests and its unload ask nothing of MLX, phase by phase, and dispatch the same work at a later load (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var work: [2][9]u64 = undefined;
     const asked = try censusOf(dir, &work[0]);
@@ -1950,7 +1945,6 @@ fn coolerTierOf(config: *const model_mod.ModelConfig, at: []const u8) !@import("
 
 test "dsv41 serving: a model another model's load evicts writes its live restore points to the SSD tier first (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = testing.io;
@@ -2038,7 +2032,6 @@ test "dsv41 serving: a model another model's load evicts writes its live restore
 
 test "dsv41 serving: a live point the SSD tier dropped after it was flushed is written again at the next flush (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = testing.io;
@@ -2089,7 +2082,6 @@ test "dsv41 serving: a live point the SSD tier dropped after it was flushed is w
 
 test "dsv41 engine: a write-through or a restore that fails and is handled leaves no error latched for the next request (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = testing.io;
@@ -2153,7 +2145,6 @@ test "dsv41 engine: a write-through or a restore that fails and is handled leave
 
 test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and restores it, byte for byte, with nothing asked of MLX (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = testing.io;
@@ -2227,7 +2218,6 @@ test "dsv41 engine: a Cooler load writes a restore point to the SSD tier and res
 
 test "dsv41 engine: a Cooler load holds the engine's scope from its load to its unload, its trunk's stream the engine's (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const dsv41_model = @import("dsv41_model.zig");
     try testing.expect(!mlx.engine.active and !mlx.engine.holding());
@@ -2277,7 +2267,6 @@ test "dsv41 engine: a Cooler load holds the engine's scope from its load to its 
 
 test "dsv41 engine: beside a resident Cooler model, a model on MLX loads, runs and unloads inside its own turn, and the Cooler's hold is as it was after (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var cooler: EngineFixture = undefined;
     try cooler.open(dir);
@@ -2334,7 +2323,6 @@ test "dsv41 engine: beside a resident Cooler model, a model on MLX loads, runs a
 
 test "dsv41 engine: a Cooler load beside a model on MLX leaves MLX a wired limit less the mappings the engine wraps, from that model's next turn (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const max_rec = mlx.maxRecommendedWorkingSet();
     if (max_rec == 0) return error.SkipZigTest;
@@ -2390,7 +2378,6 @@ const LoadJob = struct {
 
 test "dsv41 engine: a Cooler model and a model on MLX loaded beside it each serve their own bytes, the Cooler asks MLX nothing, and its unload first leaves the other serving (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const was_enabled = mlx.engine.enabled;
@@ -2472,15 +2459,15 @@ test "dsv41 engine: a Cooler model and a model on MLX loaded beside it each serv
 
 test "dsv41 engine: each row of a verify, at every width the model accepts, is the bits of the serial step at its position, on either route, an image id the model emitted among them or not (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
-    const widest: usize = @import("dsv41_dspark.zig").dsv41_max_verify_rows;
     for ([_][2]bool{ .{ true, false }, .{ true, true }, .{ false, false }, .{ false, true } }) |arm| {
         const on_engine, const emits_image_id = arm;
         var fx: EngineFixture = undefined;
         if (on_engine) try fx.open(dir) else try fx.openMlx(dir);
         defer fx.deinit();
+        // The widest verify whose rows are the serial step's bits on this GPU (`Model.exactVerifyRows`).
+        const widest: usize = @min(dsv41_max_verify_rows, fx.model().exactVerifyRows());
         const vocab = fx.model().cfg.vocab;
         var buf: [48]u32 = undefined;
         const ids = fx.prompt(&buf);
@@ -2514,7 +2501,6 @@ test "dsv41 engine: each row of a verify, at every width the model accepts, is t
 
 test "dsv41 engine: a prompt's tokens and the logits after them do not depend on the width its prefill was cut at (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -2569,7 +2555,6 @@ test "dsv41 engine: a prompt's tokens and the logits after them do not depend on
 
 test "dsv41 engine: a Cooler pack loads again after its unload in the same process (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     // The engine outlives both loads, as it does in a server.
@@ -2591,7 +2576,6 @@ test "dsv41 engine: a Cooler pack loads again after its unload in the same proce
 
 test "dsv41 engine: a Cooler load whose warm does not fit its bill fails by name, frees what it made once, and the next load serves (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const was_enabled = mlx.engine.enabled;
@@ -2635,7 +2619,6 @@ test "dsv41 engine: a Cooler load whose warm does not fit its bill fails by name
 
 test "dsv41 engine: a Cooler load refused at any of its pool buffers frees what it made, its warm's module arrays too, and the next load serves (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var kept = try model_mod.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, dir);
@@ -2686,7 +2669,6 @@ test "dsv41 engine: a Cooler load refused at any of its pool buffers frees what 
 
 test "dsv41 engine: a Cooler load that fails beside a resident Cooler model leaves that model's scope and seal as they were (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -2730,7 +2712,6 @@ fn shortRequest(a: std.mem.Allocator, fx: *EngineFixture, ids: []const u32) !std
 
 test "dsv41 engine: a request refused at any one of its pool buffers leaves the next request its clean bytes (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var fx: EngineFixture = undefined;
@@ -2765,7 +2746,6 @@ test "dsv41 engine: a request refused at any one of its pool buffers leaves the 
 
 test "dsv41 engine: GEMM inputs the pool refused are an error, nothing of them is kept, and an op given an empty handle says so (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -2813,7 +2793,6 @@ test "dsv41 engine: a NAX GEMM kernel that cannot be proven on the engine is the
 
 test "dsv41 engine: the first step after a restore from a point someone keeps copies no rows of the state: what it takes beyond a cold step does not grow with the context (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var fx: EngineFixture = undefined;
@@ -2861,7 +2840,6 @@ test "dsv41 engine: the first step after a restore from a point someone keeps co
 
 test "dsv41 engine: a Cooler load answers the fused hyper-connection kernel's probe as the MLX route does: the probe runs on the engine's stream (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const kernels = @import("dsv41_kernels.zig");
     var probed: [2]bool = undefined;
@@ -2878,7 +2856,6 @@ test "dsv41 engine: a Cooler load answers the fused hyper-connection kernel's pr
 
 test "dsv41 engine: a restore point's copies take their own room in the pool, whatever cap the last forward left (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var fx: EngineFixture = undefined;
@@ -3015,7 +2992,6 @@ test "dsv41 engine: a prefill forward of 2 to 16 rows costs MLX's queue what a o
 
 test "dsv41 engine: a load with decode on the engine keeps the NAX GEMM arm (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -3517,7 +3493,6 @@ test "dsv41 engine: after the load's wide warm, prompts cut at other widths comp
 
 test "dsv41 engine: an image warm and an image prompt whose routes read experts take the engine's order on a Cooler load, with MLX's logits (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const a = testing.allocator;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     // A cache this small misses at every forward, so each route fills slabs before its kernels read them.
@@ -5235,7 +5210,6 @@ fn stepCalls(fx: *EngineFixture, prompt: []const u32, steps: usize) !StepCalls {
 
 test "dsv41 engine: a one-row decode step in steady state makes no call into MLX (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -5265,7 +5239,6 @@ fn opsOver(gen: *Generator, a: std.mem.Allocator, want: usize) !u64 {
 
 test "dsv41 engine: a request's first token and every serial step put no op on MLX, greedy, seeded, penalized, with logprobs or a mask (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -5332,7 +5305,6 @@ test "dsv41 engine: a request's first token and every serial step put no op on M
 
 test "dsv41 engine: a DSpark round with penalties, a thinking penalty, a logit bias or a row mask puts no op on MLX (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -5415,7 +5387,6 @@ fn engineIds(fx: *EngineFixture, tok: *Tokenizer, prompt: []const u32, want: u32
 
 test "dsv41 engine: a seeded sampled request takes the adaptive widths and copy rounds, and says the fixed width's tokens (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -5479,7 +5450,6 @@ test "dsv41 engine: a seeded sampled request takes the adaptive widths and copy 
 
 test "dsv41 engine: a seeded request gives the same tokens, the first one included, at every serial mix and at every DSpark round-width mix, streamed or not, and twice (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -5531,7 +5501,6 @@ test "dsv41 engine: a seeded request gives the same tokens, the first one includ
 
 test "dsv41 engine: the serial sampler and a DSpark row draw one token for one position, at every filter, with a mask and under a penalty (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -5593,7 +5562,6 @@ fn mlxRouteIds(fx: *EngineFixture, sampling: SamplingParams, rounds: bool, out: 
 
 test "dsv41 engine: the MLX route's ids are pinned, and a seeded request gives the same ids serial and in DSpark rounds (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.openMlx(dir);
@@ -5607,14 +5575,19 @@ test "dsv41 engine: the MLX route's ids are pinned, and a seeded request gives t
         .{ .sampling = seeded, .rounds = true, .ids = .{ 116, 250, 45, 140, 74, 163, 10, 167, 27, 239, 132, 31 } },
         .{ .sampling = .{ .temperature = 0.0 }, .rounds = false, .ids = .{ 116, 250, 208, 14, 139, 226, 6, 223, 159, 221, 109, 193 } },
     };
-    for (cases) |c| {
+    // The pins are the matrix-unit arm's bytes; another arm's stock tiles sum in another order, so it keeps the claim
+    // that follows and none of the values.
+    const pinned = @import("sushi_exl3").device.current().has(.matrix_g17);
+    var seeded_ids: [2][12]u32 = undefined;
+    for (cases, 0..) |c, i| {
         var ids: std.ArrayList(u32) = .empty;
         defer ids.deinit(testing.allocator);
         try mlxRouteIds(&fx, c.sampling, c.rounds, &ids);
-        try testing.expectEqualSlices(u32, &c.ids, ids.items);
+        if (pinned) try testing.expectEqualSlices(u32, &c.ids, ids.items);
+        if (i == 0 or i == 2) @memcpy(&seeded_ids[i / 2], ids.items[0..12]);
     }
-    // Beside a drafter a serial step takes the round's arm: the pins of the seeded request, serial and in rounds, are one.
-    try testing.expectEqualSlices(u32, &cases[0].ids, &cases[2].ids);
+    // Beside a drafter a serial step takes the round's arm: the ids of the seeded request, serial and in rounds, are one.
+    try testing.expectEqualSlices(u32, &seeded_ids[0], &seeded_ids[1]);
 }
 
 /// The calls into MLX's `name` since `before`.
@@ -5634,7 +5607,6 @@ fn namedSince(before: []const mlx.NameCount, name: []const u8) !u64 {
 
 test "dsv41 engine: a request's rings are the engine's from its first forward: MLX makes none, and no step asks MLX who holds one (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -5668,7 +5640,6 @@ fn greedyRun(fx: *EngineFixture, prompt: []const u32, comptime n: usize) ![n]u32
 
 test "dsv41 engine: a Cooler load wraps its weights itself: the MLX route's greedy tokens, steps that import no weight and lend none, and an unload that unmaps them (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var buf: [48]u32 = undefined;
     var want: [8]u32 = undefined;
@@ -5792,7 +5763,6 @@ fn stateBytes(a: std.mem.Allocator, m: *@import("dsv41_model.zig").Model, pos: u
 
 test "dsv41 engine: requests, repeated, leave the engine's pool as they found it, and an unload gives back everything, load after load (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var kept = try model_mod.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, dir);
@@ -5828,7 +5798,6 @@ test "dsv41 engine: requests, repeated, leave the engine's pool as they found it
 
 test "dsv41 engine: a request dropped after any round or step leaks nothing, and the next request's tokens are as they were (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var fx: EngineFixture = undefined;
@@ -5883,7 +5852,6 @@ fn refusedStepTokens(fx: *EngineFixture, t: *Tokenizer, ids: []const u32, sampli
 
 test "dsv41 engine: a serial step refused at any of its pool buffers leaks nothing and loses no token (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var fx: EngineFixture = undefined;
@@ -5931,7 +5899,6 @@ test "dsv41 engine: a serial step refused at any of its pool buffers leaks nothi
 
 test "dsv41 engine: a short request refused at every third of its pool buffers leaves the Sheet a clean one does (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var fx: EngineFixture = undefined;
@@ -5970,7 +5937,6 @@ test "dsv41 engine: a short request refused at every third of its pool buffers l
 
 test "dsv41 engine: a DSpark round refused at any of its pool buffers leaks nothing, at widths 1 to 16 (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -6021,7 +5987,6 @@ test "dsv41 engine: a DSpark round refused at any of its pool buffers leaks noth
 
 test "dsv41 engine: a restore point either route wrote to the SSD tier restores on the other as that route's own cold state (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = testing.io;
@@ -6077,7 +6042,6 @@ test "dsv41 engine: a restore point either route wrote to the SSD tier restores 
 
 test "dsv41 engine: on a Cooler load a prefill that releases the decoder's pools and reads them back gives the same logits, with nothing asked of MLX and no slab left waiting (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const es = @import("../expert_stream.zig");
@@ -6148,7 +6112,6 @@ fn coldContinue(a: std.mem.Allocator, fx: *EngineFixture, ids: []const u32) !std
 
 test "dsv41 engine: a RAM entry restored twice on a Cooler load continues like cold both times (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const pc = @import("../prefix_cache.zig");
@@ -6198,7 +6161,6 @@ test "dsv41 engine: a RAM entry restored twice on a Cooler load continues like c
 
 test "dsv41 engine: a Cooler state rolled back in place to a point it kept continues like cold, turn after turn (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const pc = @import("../prefix_cache.zig");
@@ -6250,7 +6212,6 @@ test "dsv41 engine: a Cooler state rolled back in place to a point it kept conti
 
 test "dsv41 engine: a finished request's state is the next turn's deepest point, and the turn continues from it as the state itself would (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const pc = @import("../prefix_cache.zig");
@@ -6335,7 +6296,6 @@ const ServedCaps = struct {
 
 test "dsv41 engine: after a model on MLX beside it served and ended a request, the Cooler's next request of any kind has the engine's room (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const caps = ServedCaps.install();
@@ -6392,7 +6352,6 @@ test "dsv41 engine: after a model on MLX beside it served and ended a request, t
 
 test "dsv41 engine: the Cooler's live restore points reach the SSD tier at an idle flush, a model on MLX having served in between or not (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = testing.io;
@@ -6464,7 +6423,6 @@ test "dsv41 engine: the Cooler's live restore points reach the SSD tier at an id
 
 test "dsv41 engine: each forward's pool peak stays inside its cap, a wide chunk's inside the cap less its slack, at the widths the router pads and at a decode step (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var fx: EngineFixture = undefined;
@@ -6529,7 +6487,6 @@ fn greedyBytes(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, lead: usi
 
 test "dsv41 engine: forwards and requests give the same bytes whatever the pool's buffers held: each one handed out, and the free ones, written over (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -6571,7 +6528,6 @@ test "dsv41 engine: forwards and requests give the same bytes whatever the pool'
 
 test "dsv41 engine: a request gives one text serial and in rounds of any width, after other requests, and at a second load of the process (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var tok = Tokenizer.initEmpty(a);
@@ -6640,7 +6596,6 @@ fn roundMixBytes(a: std.mem.Allocator, fx: *EngineFixture, prompt: []const u32, 
 
 test "dsv41 engine: rounds and steps through an expert cache too small to hold a pass's experts give the big cache's bytes, a few layers rebuilt or all (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     var buf: [80]u32 = undefined;
@@ -6703,7 +6658,6 @@ fn imageSpanBytes(a: std.mem.Allocator, fx: *EngineFixture, rows: mlx.mlx_array,
 
 test "dsv41 engine: image spans cut at their edges and inside, a chunk of image rows only, two images, a span at row 0: MLX's bytes, the pool's buffers written over or not (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const Case = struct { spans: []const [2]usize, cuts: []const usize };
@@ -6750,7 +6704,6 @@ test "dsv41 engine: image spans cut at their edges and inside, a chunk of image 
 
 test "dsv41 engine: at the filters' edges a sampled token is one the filters allow, and the serial draw and the round's draw are the same token (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -6819,7 +6772,6 @@ fn roundIds(fx: *EngineFixture, tok: *Tokenizer, prompt: []const u32, want: u32,
 
 test "dsv41 sampled rounds: a request stopped by max_tokens inside a round is the prefix of the longer one, at every verify width, and every width gives one text (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
@@ -6834,7 +6786,7 @@ test "dsv41 sampled rounds: a request stopped by max_tokens inside a round is th
         .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .frequency_penalty = 0.3, .seed = 9 },
         .{ .temperature = 0, .repeat_penalty = 1.5, .frequency_penalty = 0.4 },
     };
-    const diags = [_]DsparkDiag{ .{ .rows = 2 }, .{ .rows = 5 }, .{ .rows = 16 }, .sweep, .off };
+    const diags = [_]DsparkDiag{ .{ .rows = 2 }, .{ .rows = 5 }, .{ .rows = @intCast(@min(dsv41_max_verify_rows, fx.model().exactVerifyRows())) }, .sweep, .off };
     for (cases) |sampling| {
         var base: std.ArrayList(u32) = .empty;
         defer base.deinit(a);
@@ -6869,12 +6821,11 @@ fn tailDigest(fx: *EngineFixture, ctx: *trunk_mod.ForwardCtx, ids: []const u32, 
 
 test "dsv41 engine: a verify of w rows cut back to a accepted drafts continues, bit for bit, as the serial feed of a + 1 tokens, at every width and accepted count (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    if (!mlx.engine.matrixUnits()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
     try fx.open(dir);
     defer fx.deinit();
-    const widest: usize = dsv41_dspark.dsv41_max_verify_rows;
+    const widest: usize = @min(dsv41_dspark.dsv41_max_verify_rows, fx.model().exactVerifyRows());
     var buf: [120]u32 = undefined;
     const ids = fx.prompt(&buf);
     for ([_]usize{ 9, 16, 17, 32, 33 }) |lead| {
