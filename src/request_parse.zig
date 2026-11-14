@@ -3,6 +3,7 @@
 const chat_mod = @import("chat.zig");
 const log = @import("log.zig");
 const std = @import("std");
+const json_text = @import("json_text.zig");
 const jsonEscape = @import("http.zig").jsonEscape;
 const trunk = @import("trunk.zig");
 const json_schema = @import("json_schema.zig");
@@ -728,53 +729,6 @@ pub fn parseKvQuantOverride(root: std.json.ObjectMap) ?trunk.KVQuantConfig {
     return kq;
 }
 
-/// Serialize a std.json.Value to JSON text, appending to buf.
-pub fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: std.json.Value) !void {
-    switch (value) {
-        .null => try buf.appendSlice(allocator, "null"),
-        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-        .integer => |i| {
-            var num_buf: [24]u8 = undefined;
-            const s = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch "0";
-            try buf.appendSlice(allocator, s);
-        },
-        .float => |f| {
-            var num_buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&num_buf, "{d}", .{f}) catch "0";
-            try buf.appendSlice(allocator, s);
-        },
-        .string => |s| {
-            const escaped = try jsonEscape(allocator, s);
-            defer allocator.free(escaped);
-            try buf.appendSlice(allocator, escaped);
-        },
-        .array => |arr| {
-            try buf.append(allocator, '[');
-            for (arr.items, 0..) |item, idx| {
-                if (idx > 0) try buf.append(allocator, ',');
-                try serializeJsonValue(allocator, buf, item);
-            }
-            try buf.append(allocator, ']');
-        },
-        .object => |obj| {
-            try buf.append(allocator, '{');
-            var iter = obj.iterator();
-            var first = true;
-            while (iter.next()) |entry| {
-                if (!first) try buf.append(allocator, ',');
-                first = false;
-                const ek = try jsonEscape(allocator, entry.key_ptr.*);
-                defer allocator.free(ek);
-                try buf.appendSlice(allocator, ek);
-                try buf.append(allocator, ':');
-                try serializeJsonValue(allocator, buf, entry.value_ptr.*);
-            }
-            try buf.append(allocator, '}');
-        },
-        .number_string => |s| try buf.appendSlice(allocator, s),
-    }
-}
-
 /// Convert Anthropic tools format to OpenAI tools format for chat template compatibility.
 pub fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Array) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
@@ -796,7 +750,7 @@ pub fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.
         try buf.appendSlice(allocator, esc_d);
         try buf.appendSlice(allocator, ",\"parameters\":");
         if (tool.get("input_schema")) |schema_val| {
-            try serializeJsonValue(allocator, &buf, schema_val);
+            try json_text.appendValue(allocator, &buf, schema_val);
         } else {
             try buf.appendSlice(allocator, "{}");
         }

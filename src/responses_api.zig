@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_text = @import("json_text.zig");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
 const generate_mod = @import("generate.zig");
@@ -1293,7 +1294,7 @@ fn handleResponsesInner(
 
     var tool_calls: ?[]tool_schema.ParsedToolCall = null;
     if (active_has_tools and shouldParseToolCalls(result.finish_details)) {
-        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo, .{ .stop_cut = stop_cut });
+        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo, .{ .stop_cut = stop_cut, .dialect = try chat_mod.callDialect(allocator, chat_config) });
     }
     defer if (tool_calls) |tcs| {
         for (tcs) |tc| {
@@ -1514,7 +1515,7 @@ fn renderResponsesToolsEcho(allocator: std.mem.Allocator, tools_val: ?std.json.V
             }
             try buf.appendSlice(allocator, ",\"parameters\":");
             if (params_v) |pv| if (pv == .object) {
-                try responses_mod.serializeJsonValue(allocator, &buf, pv);
+                try json_text.appendValue(allocator, &buf, pv);
             } else {
                 try buf.appendSlice(allocator, "null");
             } else {
@@ -1570,14 +1571,14 @@ fn renderResponsesTextEcho(allocator: std.mem.Allocator, root: std.json.ObjectMa
     if (root.get("text")) |tv| if (tv == .object) {
         var buf = std.ArrayList(u8).empty;
         errdefer buf.deinit(allocator);
-        try responses_mod.serializeJsonValue(allocator, &buf, tv);
+        try json_text.appendValue(allocator, &buf, tv);
         return try buf.toOwnedSlice(allocator);
     };
     if (root.get("response_format")) |rf| if (rf == .object) {
         var buf = std.ArrayList(u8).empty;
         errdefer buf.deinit(allocator);
         try buf.appendSlice(allocator, "{\"format\":");
-        try responses_mod.serializeJsonValue(allocator, &buf, rf);
+        try json_text.appendValue(allocator, &buf, rf);
         try buf.append(allocator, '}');
         return try buf.toOwnedSlice(allocator);
     };
@@ -1617,7 +1618,7 @@ fn renderResponsesMetadataEcho(allocator: std.mem.Allocator, root: std.json.Obje
     if (root.get("metadata")) |mv| if (mv == .object) {
         var buf = std.ArrayList(u8).empty;
         errdefer buf.deinit(allocator);
-        try responses_mod.serializeJsonValue(allocator, &buf, mv);
+        try json_text.appendValue(allocator, &buf, mv);
         return try buf.toOwnedSlice(allocator);
     };
     return try allocator.dupe(u8, "{}");

@@ -46,8 +46,24 @@ fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, text: []const u8) !?[
     return try o.toOwnedSlice(allocator);
 }
 
-/// Parse tool calls from model output text.
+/// A tool-call family a chat template teaches (`chat.callDialect`).
+pub const Dialect = enum {
+    /// `<tool_call><function=NAME><parameter=KEY>V</parameter>` (Qwen, MiMo).
+    function_tag,
+    /// `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>` (GLM).
+    arg_key,
+    /// `<｜DSML｜ invoke name="NAME"><｜DSML｜ parameter name="K">V</｜DSML｜ parameter>` (DeepSeek).
+    dsml,
+};
+
+/// Parse tool calls from model output of no known dialect.
 pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]ParsedToolCall {
+    return parseToolCallsAs(allocator, text, null);
+}
+
+/// Parse tool calls from model output. The served dialect is read first and the others only when it finds no call:
+/// a parameter VALUE carrying another family's markup must never decide the call.
+pub fn parseToolCallsAs(allocator: std.mem.Allocator, text: []const u8, dialect: ?Dialect) !?[]ParsedToolCall {
     // Strip thinking blocks if present
     var effective_text = text;
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
@@ -95,12 +111,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // DeepSeek-V4 native DSML (`<｜DSML｜invoke …>`): distinctive fullwidth-bar
     // marker no other family emits, and the generic `<tool` scan never sees
     // it (the byte before "tool_calls" is `｜`, not `<`).
-    try parseDsmlToolCalls(allocator, effective_text, &calls);
-    // GLM's bare `<tool_call>NAME<arg_key>…` format is tried FIRST among the
-    // tag families: the generic `<tool` scan below would misread its non-JSON
-    // arg_key/arg_value body. When it matched, the generic scans are skipped
-    // but the shared safety net at the bottom still runs.
-    try parseArgKeyToolCalls(allocator, effective_text, &calls);
+    // GLM's bare `<tool_call>NAME<arg_key>…` format is tried before the generic `<tool` scan, which would misread
+    // its non-JSON arg_key/arg_value body; when a family above it matched, the generic scan is skipped but the
+    // shared safety net at the bottom still runs. The function-tag dialect reads the generic scan first.
+    if (dialect != .function_tag) try parseTaggedFamilies(allocator, effective_text, &calls, dialect);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
         const rel = std.mem.indexOf(u8, effective_text[search_pos..], "<tool") orelse break;
@@ -412,6 +426,8 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         }
     }
 
+    if (dialect == .function_tag and calls.items.len == 0) try parseTaggedFamilies(allocator, effective_text, &calls, dialect);
+
     // Gemma 4 format: <|tool_call>call:name{args}<tool_call|>
     if (calls.items.len == 0) {
         search_pos = 0;
@@ -516,18 +532,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         for (calls.items) |*tc| tc.inferred = true;
     }
 
-    // A nameless placeholder cannot be executed or repaired by a client.
-    var named: usize = 0;
-    for (calls.items) |tc| {
-        if (std.mem.trim(u8, tc.name, " \t\r\n").len == 0) {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-            continue;
-        }
-        calls.items[named] = tc;
-        named += 1;
-    }
-    calls.items.len = named;
+    dropUnnamedCalls(allocator, &calls);
     if (calls.items.len == 0) {
         calls.deinit(allocator);
         return null;
@@ -559,6 +564,38 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     }
 
     return try calls.toOwnedSlice(allocator);
+}
+
+/// A tool name is one identifier: a client cannot execute or repair a nameless placeholder, and a name that spans a
+/// line or holds a tag is another family's markup read as a name.
+fn isToolName(name: []const u8) bool {
+    return std.mem.trim(u8, name, " \t\r\n").len > 0 and std.mem.indexOfAny(u8, name, "\r\n<>") == null;
+}
+
+/// Drops the calls whose name is not `isToolName`, in place.
+fn dropUnnamedCalls(allocator: std.mem.Allocator, calls: *std.ArrayList(ParsedToolCall)) void {
+    var named: usize = 0;
+    for (calls.items) |tc| {
+        if (!isToolName(tc.name)) {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+            continue;
+        }
+        calls.items[named] = tc;
+        named += 1;
+    }
+    calls.items.len = named;
+}
+
+/// DeepSeek's DSML and GLM's arg_key calls, each family's calls kept only under a valid name. A served dialect's family
+/// is read first and the other only when it found no call; with no dialect both are read, DSML first.
+fn parseTaggedFamilies(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall), dialect: ?Dialect) !void {
+    const dsml_first = dialect != .arg_key;
+    for ([_]bool{ dsml_first, !dsml_first }) |dsml| {
+        if (dialect != null and calls.items.len > 0) return;
+        if (dsml) try parseDsmlToolCalls(allocator, text, calls) else try parseArgKeyToolCalls(allocator, text, calls);
+        dropUnnamedCalls(allocator, calls);
+    }
 }
 
 /// Strip a leading `<parameters>` / trailing `</parameters>` pair if both
@@ -924,18 +961,50 @@ const DSML_INVOKE_TAG: DsmlTag = .{ .open = "<｜DSML｜", .name = "invoke" };
 const DSML_INVOKE_CLOSE: DsmlTag = .{ .open = "</｜DSML｜", .name = "invoke>" };
 const DSML_PARAM_TAG: DsmlTag = .{ .open = "<｜DSML｜", .name = "parameter" };
 const DSML_PARAM_CLOSE: DsmlTag = .{ .open = "</｜DSML｜", .name = "parameter>" };
+const DSML_CALLS_CLOSE: DsmlTag = .{ .open = "</｜DSML｜", .name = "calls>" };
+const DSML_TOOL_CALLS_CLOSE: DsmlTag = .{ .open = "</｜DSML｜", .name = "tool_calls>" };
 
 const DsmlHit = struct { at: usize, end: usize };
 
 fn dsmlFind(text: []const u8, from: usize, comptime tag: DsmlTag) ?DsmlHit {
     var p = from;
     while (std.mem.indexOfPos(u8, text, p, tag.open)) |at| {
-        var q = at + tag.open.len;
-        if (q < text.len and text[q] == ' ') q += 1;
-        if (std.mem.startsWith(u8, text[q..], tag.name)) return .{ .at = at, .end = q + tag.name.len };
+        if (dsmlAt(text, at, tag)) |end| return .{ .at = at, .end = end };
         p = at + 1;
     }
     return null;
+}
+
+/// The end of `tag` when it starts at `at`.
+fn dsmlAt(text: []const u8, at: usize, comptime tag: DsmlTag) ?usize {
+    if (!std.mem.startsWith(u8, text[at..], tag.open)) return null;
+    var q = at + tag.open.len;
+    if (q < text.len and text[q] == ' ') q += 1;
+    if (!std.mem.startsWith(u8, text[q..], tag.name)) return null;
+    return q + tag.name.len;
+}
+
+/// The parameter close that ends the value starting at `vstart`: the first one the next parameter or the call's close
+/// follows (a value may spell any tag, its own close included); with none, the first close.
+fn dsmlParamClose(text: []const u8, vstart: usize) ?DsmlHit {
+    var from = vstart;
+    while (dsmlFind(text, from, DSML_PARAM_CLOSE)) |hit| : (from = hit.at + 1) {
+        if (dsmlParamEndsAt(text, hit.end)) return hit;
+    }
+    return dsmlFind(text, vstart, DSML_PARAM_CLOSE);
+}
+
+fn dsmlParamEndsAt(text: []const u8, p: usize) bool {
+    var i = skipSpace(text, p);
+    if (i == text.len) return true;
+    if (dsmlAt(text, i, DSML_PARAM_TAG) != null or dsmlAt(text, i, DSML_INVOKE_TAG) != null) return true;
+    var closed = false;
+    while (true) {
+        const end = dsmlAt(text, i, DSML_INVOKE_CLOSE) orelse dsmlAt(text, i, DSML_CALLS_CLOSE) orelse dsmlAt(text, i, DSML_TOOL_CALLS_CLOSE) orelse break;
+        closed = true;
+        i = skipSpace(text, end);
+    }
+    return closed and dsmlAt(text, i, DSML_PARAM_CLOSE) == null;
 }
 
 /// Tolerant quoted-attribute extraction from a tag-attribute segment:
@@ -1019,7 +1088,7 @@ fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
             const pkey = dsmlAttr(attrs, "name");
             const pstring = dsmlAttr(attrs, "string");
             const vstart = ptag_end + 1;
-            const vclose = dsmlFind(text, vstart, DSML_PARAM_CLOSE) orelse {
+            const vclose = dsmlParamClose(text, vstart) orelse {
                 // unterminated value = server-cut fragment; drop it, end scan
                 p = text.len;
                 break;
@@ -1027,12 +1096,8 @@ fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
             q = vclose.end;
             if (pkey) |k| {
                 const value = text[vstart..vclose.at];
-                // string attr absent (mangled opener): treat JSON-parseable
-                // values as JSON, everything else as a string.
-                const is_string = if (pstring) |sf|
-                    !std.mem.eql(u8, sf, "false")
-                else
-                    !dsmlValueIsJson(allocator, value);
+                // Only the template's own `string="false"` marks a JSON value; an absent attr is a string.
+                const is_string = if (pstring) |sf| !std.mem.eql(u8, sf, "false") else true;
                 // dedup: last wins
                 var replaced = false;
                 for (params.items) |*prm| {
@@ -1081,10 +1146,9 @@ fn dsmlValueIsJson(allocator: std.mem.Allocator, value: []const u8) bool {
 
 // ── Claude-style `<invoke>` tool calls ──
 //
-// String parameters are RAW bytes (the reference explicitly does not strip
-// spaces — the Hermes trim gap stays Hermes'); lists/objects/bools/null/
-// numbers are spelled as JSON and keep their spelled type (the schema
-// coercion chokepoint still gets the final word). The parser keys on the
+// Every parameter is a RAW string (the reference explicitly does not strip
+// spaces — the Hermes trim gap stays Hermes'); the schema coercion chokepoint
+// types it, never its spelling. The parser keys on the
 // INVOKE tag so a dropped wrapper still parses (delimiter-drop class), and
 // truncation salvages NAME + completed parameters — never fragment values.
 const InvokeDialect = struct {
@@ -1160,8 +1224,7 @@ fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
 }
 
 /// Assemble `<parameter name="k">v</parameter>` runs into a JSON
-/// object string. A value that parses as COMPLETE JSON keeps its spelled type;
-/// everything else is a raw string, exact bytes. Keys are escaped + deduped
+/// object string of raw string values, exact bytes. Keys are escaped + deduped
 /// (last wins) via ObjectMap+Stringify, so emitted arguments are ALWAYS valid
 /// JSON. Returns null when no complete parameter was found.
 fn invokeParamsToJson(allocator: std.mem.Allocator, body: []const u8, comptime d: InvokeDialect) !?[]const u8 {
@@ -1184,10 +1247,7 @@ fn invokeParamsToJson(allocator: std.mem.Allocator, body: []const u8, comptime d
         // newlines/quotes/`<` survive; no close by end of text = fragment,
         // dropped.
         const vend_rel = std.mem.indexOf(u8, body[vstart..], d.param_close) orelse break;
-        const raw = body[vstart .. vstart + vend_rel];
-        const v: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, aa, raw, .{}) catch
-            std.json.Value{ .string = raw };
-        try map.put(aa, pname, v);
+        try map.put(aa, pname, .{ .string = body[vstart .. vstart + vend_rel] });
         found = true;
         pos = vstart + vend_rel + d.param_close.len;
     }
@@ -1257,8 +1317,9 @@ fn parseArgKeyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
         // a weak model closes it with </arg_value>. The well-formed path is
         // unchanged: </arg_key> is the earliest close.
         var i: usize = name_end;
-        const call_end = std.mem.indexOfPos(u8, text, i, "</tool_call") orelse text.len;
         while (true) {
+            // Past the previous value, so a close a value spelled is not this call's.
+            const call_end = std.mem.indexOfPos(u8, text, i, "</tool_call") orelse text.len;
             const ak_at = std.mem.indexOfPos(u8, text, i, "<arg_key") orelse break;
             if (ak_at >= call_end) break;
             const ak_len = tagLenAt(text[ak_at..], "<arg_key") orelse {
@@ -1280,7 +1341,7 @@ fn parseArgKeyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
             while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
             const av_len = tagLenAt(text[i..], "<arg_value") orelse break;
             const val_start = i + av_len;
-            const av_close = std.mem.indexOfPos(u8, text, val_start, "</arg_value") orelse break;
+            const av_close = argValueClose(text, val_start) orelse break;
             const av_close_len = tagLenAt(text[av_close..], "</arg_value") orelse break;
             const value = text[val_start..av_close];
             i = av_close + av_close_len;
@@ -1302,6 +1363,27 @@ fn parseArgKeyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
             pos = i;
         }
     }
+}
+
+/// The `</arg_value>` that ends the value starting at `val_start`: the first the next key or the call's close
+/// follows (a value may spell any tag, its own close included); with none, the first close.
+fn argValueClose(text: []const u8, val_start: usize) ?usize {
+    var from = val_start;
+    while (std.mem.indexOfPos(u8, text, from, "</arg_value")) |at| : (from = at + 1) {
+        const len = tagLenAt(text[at..], "</arg_value") orelse continue;
+        if (argValueEndsAt(text, at + len)) return at;
+    }
+    return std.mem.indexOfPos(u8, text, val_start, "</arg_value");
+}
+
+fn argValueEndsAt(text: []const u8, p: usize) bool {
+    const i = skipSpace(text, p);
+    if (i == text.len) return true;
+    inline for (.{ "<arg_key", "<tool_call>", "<|" }) |opener| {
+        if (std.mem.startsWith(u8, text[i..], opener)) return true;
+    }
+    const close = tagLenAt(text[i..], "</tool_call") orelse return false;
+    return !std.mem.startsWith(u8, text[skipSpace(text, i + close)..], "</arg_");
 }
 
 fn parseXmlElementToolCall(allocator: std.mem.Allocator, body: []const u8) ?ParsedToolCall {
@@ -1452,7 +1534,7 @@ fn appendJsonToolCallArray(
     arr_text: []const u8,
     calls: *std.ArrayList(ParsedToolCall),
 ) !void {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arr_text, .{}) catch return;
+    const parsed = tool_schema.parseArgs(allocator, arr_text) catch return;
     defer parsed.deinit();
     if (parsed.value != .array) return;
     const items = parsed.value.array.items;
@@ -1751,7 +1833,7 @@ fn looseEmitString(
 }
 
 fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedToolCall {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch blk: {
+    var parsed = tool_schema.parseArgs(allocator, text) catch blk: {
         // Strict parse failed. Try a chain of repairs for known shapes:
         //   1. {"name":"shell", {"command":"ls"}}           — missing `"arguments":` key entirely (Qwen MoE)
         //   2. {"name":"shell", arguments":{"command":..}}   — missing OPENING quote on `arguments` (Qwen MoE)
@@ -1760,7 +1842,7 @@ fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedT
         // Repairs are cheap and run only on the parse-failure path.
         if (repairBrokenToolCallJson(allocator, text)) |repaired| {
             defer allocator.free(repaired);
-            if (std.json.parseFromSlice(std.json.Value, allocator, repaired, .{})) |reparsed| {
+            if (tool_schema.parseArgs(allocator, repaired)) |reparsed| {
                 break :blk reparsed;
             } else |_| {}
         }
@@ -1771,14 +1853,14 @@ fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedT
         //      mis-recovery that yields invalid JSON is silently discarded.
         if (looseRepairToolCallJson(allocator, text)) |repaired| {
             defer allocator.free(repaired);
-            if (std.json.parseFromSlice(std.json.Value, allocator, repaired, .{})) |reparsed| {
+            if (tool_schema.parseArgs(allocator, repaired)) |reparsed| {
                 log.info("  [tool-parse] loose-repair recovered mangled tool-call JSON (raw control bytes / unescaped quotes)\n", .{});
                 break :blk reparsed;
             } else |_| {}
         }
         const completed = completeUnbalancedJsonObject(allocator, text) orelse return null;
         defer allocator.free(completed);
-        const reparsed = std.json.parseFromSlice(std.json.Value, allocator, completed, .{}) catch return null;
+        const reparsed = tool_schema.parseArgs(allocator, completed) catch return null;
         break :blk reparsed;
     };
     defer parsed.deinit();
@@ -2338,9 +2420,13 @@ fn convertGemma4Value(
     return pos + first_sep;
 }
 
-/// End of a `<parameter=…>` value: the LAST `</parameter>` before the next opener (a value may
-/// spell its own close tag); an unclosed parameter falls back to the first close.
+/// End of a `<parameter=…>` value: the first `</parameter>` that the next parameter or the call's close follows (a
+/// value may spell any tag, its own close included); with none, the LAST close before the next opener.
 fn hermesValueEnd(body: []const u8, val_start: usize) ?usize {
+    var from = val_start;
+    while (std.mem.indexOfPos(u8, body, from, "</parameter>")) |at| : (from = at + 1) {
+        if (hermesParamEndsAt(body, at + "</parameter>".len)) return at;
+    }
     const bound = std.mem.indexOfPos(u8, body, val_start, "<parameter=") orelse body.len;
     var best: ?usize = null;
     var i = val_start;
@@ -2350,6 +2436,31 @@ fn hermesValueEnd(body: []const u8, val_start: usize) ?usize {
         i = at + 1;
     }
     return best orelse std.mem.indexOfPos(u8, body, val_start, "</parameter>");
+}
+
+/// Whether a parameter may end at `p`, just past a `</parameter>`: the next parameter, or the call's close that no
+/// further `</parameter>` follows, or the end of the text.
+fn hermesParamEndsAt(body: []const u8, p: usize) bool {
+    var i = skipSpace(body, p);
+    if (i == body.len) return true;
+    inline for (.{ "<parameter=", "<function=", "<tool_call>" }) |opener| {
+        if (std.mem.startsWith(u8, body[i..], opener)) return true;
+    }
+    var closed = false;
+    while (true) {
+        const close = inline for (.{ "</function>", "</tool_call>" }) |c| {
+            if (std.mem.startsWith(u8, body[i..], c)) break c;
+        } else break;
+        closed = true;
+        i = skipSpace(body, i + close.len);
+    }
+    return closed and !std.mem.startsWith(u8, body[i..], "</parameter>");
+}
+
+fn skipSpace(text: []const u8, from: usize) usize {
+    var i = from;
+    while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+    return i;
 }
 
 /// If `at` falls inside a `<parameter=…>` value, the position just past that value's close; else null.
@@ -2447,18 +2558,8 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
         appendJsonString(allocator, &args_map, p_name) catch return null;
         args_map.append(allocator, ':') catch return null;
 
-        // Whitespace around a NUMBER/BOOLEAN/null carries no meaning, so a
-        // padded scalar is still typed from its spelling. A STRING's own
-        // whitespace is PAYLOAD and ships verbatim: an `old_string` must match
-        // the file "exactly, including indentation", and trimming it either
-        // failed the edit or — worse — matched a different, un-indented
-        // occurrence mid-line. Only the template framing is removed.
-        const literal_val = std.mem.trim(u8, p_val, " \t\r\n");
-        if (isJsonLiteral(literal_val)) {
-            args_map.appendSlice(allocator, literal_val) catch return null;
-        } else {
-            appendJsonString(allocator, &args_map, p_val) catch return null;
-        }
+        // Every value is a string, its own whitespace payload: the schema types it at the chokepoint.
+        appendJsonString(allocator, &args_map, p_val) catch return null;
 
         param_search = p_val_start + p_val_end + "</parameter>".len;
     }
@@ -2720,7 +2821,7 @@ fn isJsonLiteral(s: []const u8) bool {
 }
 
 /// JSON's number grammar; `parseFloat` is wider (`Infinity`, `0755`, `.5`) and the literal is spliced UNQUOTED.
-fn isJsonNumber(s: []const u8) bool {
+pub fn isJsonNumber(s: []const u8) bool {
     var i: usize = 0;
     if (i < s.len and s[i] == '-') i += 1;
     if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
@@ -3335,27 +3436,22 @@ test "parseHermesToolCall strips only the ONE framing newline on each side" {
     try testing.expectEqualStrings("\n# Title\n", parsed.value.object.get("content").?.string);
 }
 
-test "parseHermesToolCall still types a space-padded scalar from its spelling" {
-    // The other half: whitespace around a NUMBER or BOOLEAN carries no meaning,
-    // so a one-line `<parameter=limit> 5 </parameter>` must still ship JSON 5,
-    // not the string " 5 " — fixing the string class must not break the literal
-    // class (`isJsonLiteral` never matches a padded token).
+test "parseHermesToolCall: the schema types a space-padded scalar, the call carries it as written" {
+    // A value is a string until the chokepoint types it: whitespace around a number or boolean carries no meaning
+    // there, so `<parameter=limit> 5 </parameter>` still ships JSON 5 for an integer param.
     const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"ls","parameters":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"},"recursive":{"type":"boolean"}}}}}]
+    ;
     const text = "<tool_call>\n<function=ls>\n<parameter=path>\n./src\n</parameter>\n" ++
         "<parameter=limit> 5 </parameter>\n<parameter=recursive>\n true \n</parameter>\n" ++
         "</function>\n</tool_call>";
-    const calls = (try parseToolCalls(allocator, text)).?;
-    defer {
-        for (calls) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(calls);
-    }
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
-    defer parsed.deinit();
-    try testing.expectEqual(@as(i64, 5), parsed.value.object.get("limit").?.integer);
-    try testing.expectEqual(true, parsed.value.object.get("recursive").?.bool);
+    const raw = (try parseToolCalls(allocator, text)).?;
+    defer tool_schema.freeParsedCalls(raw);
+    try testing.expectEqualStrings("{\"path\":\"./src\",\"limit\":\" 5 \",\"recursive\":\" true \"}", raw[0].arguments);
+    const typed = (try tool_schema.parseForRequest(allocator, text, tools, .{ .allow_parallel = true, .autocorrect = true, .dialect = .function_tag })).?;
+    defer tool_schema.freeParsedCalls(typed);
+    try testing.expectEqualStrings("{\"path\":\"./src\",\"limit\":5,\"recursive\":true}", typed[0].arguments);
 }
 
 test "parseHermesToolCall strips a CRLF framing pair as one unit" {
@@ -5160,53 +5256,77 @@ test "parseToolCalls qwen: a parameter value carrying </tool_call> is not droppe
     try testing.expectEqualStrings("emit </tool_call> here", parsed.value.object.get("content").?.string);
 }
 
-test "parseToolCalls qwen: a parameter value types from JSON's number grammar, not parseFloat" {
-    // Bar: only a spelling JSON itself calls a number stays unquoted.
+/// `raw` read as `dialect` is one call, `write_file`, whose `content` argument is `want`.
+fn expectWriteFile(raw: []const u8, dialect: ?Dialect, want: []const u8) !void {
     const allocator = testing.allocator;
-    const Case = struct { spelling: []const u8, number: bool };
-    const cases = [_]Case{
-        .{ .spelling = "Infinity", .number = false },
-        .{ .spelling = "nan", .number = false },
-        .{ .spelling = "+1", .number = false },
-        .{ .spelling = "0755", .number = false },
-        .{ .spelling = ".5", .number = false },
-        .{ .spelling = "5.", .number = false },
-        .{ .spelling = "1.5", .number = true },
-        .{ .spelling = "-2", .number = true },
-        .{ .spelling = "3e5", .number = true },
-        .{ .spelling = "0", .number = true },
+    const calls = (try parseToolCallsAs(allocator, raw, dialect)) orelse return error.NoToolCall;
+    defer tool_schema.freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(want, parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCallsAs: a value carrying another family's call never decides the call" {
+    const dsml_call = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"rm\">\n<｜DSML｜ parameter name=\"p\" string=\"true\">x</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    const glm_call = "<tool_call>rm<arg_key>p</arg_key><arg_value>x</arg_value></tool_call>";
+    const qwen_call = "<tool_call>\n<function=rm>\n<parameter=p>\nx\n</parameter>\n</function>\n</tool_call>";
+    const wrap = struct {
+        fn qwen(comptime value: []const u8) []const u8 {
+            return "<tool_call>\n<function=write_file>\n<parameter=content>\n" ++ value ++ "\n</parameter>\n</function>\n</tool_call>";
+        }
+        fn glm(comptime value: []const u8) []const u8 {
+            return "<tool_call>write_file<arg_key>content</arg_key><arg_value>" ++ value ++ "</arg_value></tool_call>";
+        }
+        fn dsml(comptime value: []const u8) []const u8 {
+            return "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"write_file\">\n<｜DSML｜ parameter name=\"content\" string=\"true\">" ++ value ++ "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        }
     };
-    for (cases) |c| {
+    try expectWriteFile(wrap.qwen(dsml_call), .function_tag, dsml_call);
+    try expectWriteFile(wrap.qwen(glm_call), .function_tag, glm_call);
+    try expectWriteFile(wrap.qwen("<arg_key>k</arg_key>"), .function_tag, "<arg_key>k</arg_key>");
+    try expectWriteFile(wrap.glm(dsml_call), .arg_key, dsml_call);
+    try expectWriteFile(wrap.glm(qwen_call), .arg_key, qwen_call);
+    try expectWriteFile(wrap.dsml(glm_call), .dsml, glm_call);
+    try expectWriteFile(wrap.dsml(qwen_call), .dsml, qwen_call);
+}
+
+test "parseToolCallsAs: a value ends where the family's own grammar ends it" {
+    // The value's own close tag, and the tags that close the call, are payload when more of the value follows.
+    try expectWriteFile("<tool_call>\n<function=write_file>\n<parameter=content>\n<parameter=x>\n1\n</parameter>\n</parameter>\n</function>\n</tool_call>", .function_tag, "<parameter=x>\n1\n</parameter>");
+    try expectWriteFile("<tool_call>\n<function=write_file>\n<parameter=content>\n</parameter>\n</function>\n</tool_call>\n</parameter>\n</function>\n</tool_call>", .function_tag, "</parameter>\n</function>\n</tool_call>");
+    try expectWriteFile("<tool_call>write_file<arg_key>content</arg_key><arg_value></arg_value></arg_value></tool_call>", .arg_key, "</arg_value>");
+    try expectWriteFile("<tool_call>write_file<arg_key>content</arg_key><arg_value></tool_call></arg_value></tool_call>", .arg_key, "</tool_call>");
+    try expectWriteFile("<tool_call>write_file<arg_key>content</arg_key><arg_value><tool_call>get<arg_key>a</arg_key><arg_value>b</arg_value></tool_call></arg_value></tool_call>", .arg_key, "<tool_call>get<arg_key>a</arg_key><arg_value>b</arg_value></tool_call>");
+    try expectWriteFile("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"write_file\">\n<｜DSML｜ parameter name=\"content\" string=\"true\"></｜DSML｜ parameter></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>", .dsml, "</｜DSML｜ parameter>");
+    // A GLM key after a value that spelled the call's close is still read.
+    const allocator = testing.allocator;
+    const calls = (try parseToolCallsAs(allocator, "<tool_call>write_file<arg_key>content</arg_key><arg_value></tool_call></arg_value><arg_key>path</arg_key><arg_value>a.txt</arg_value></tool_call>", .arg_key)).?;
+    defer tool_schema.freeParsedCalls(calls);
+    try testing.expectEqualStrings("{\"content\":\"</tool_call>\",\"path\":\"a.txt\"}", calls[0].arguments);
+}
+
+test "parseToolCalls: a name that spans a line or holds a tag is dropped, never shipped" {
+    // With no served dialect the arg_key family is read first and takes a Qwen call whose value spells `<arg_key>`
+    // for a GLM call named by the text up to it; that name is markup, so the generic scan reads the real call.
+    try expectWriteFile("<tool_call>\n<function=write_file>\n<parameter=content>\n<arg_key>k</arg_key>\n</parameter>\n</function>\n</tool_call>", null, "<arg_key>k</arg_key>");
+}
+
+test "parseToolCalls function tag: a parameter value is the string the model wrote, whatever it spells" {
+    // The chokepoint types it from the schema; a string param keeps `1.0`, `3.10`, `null` and ` 7 ` byte for byte.
+    const allocator = testing.allocator;
+    const spellings = [_][]const u8{ "Infinity", "nan", "+1", "0755", ".5", "5.", "1.5", "1.0", "3.10", "-2", "3e5", "1e5", "0", "-0", "12345678901234567890", "true", "null", " 7 " };
+    for (spellings) |spelling| {
         const raw = try std.mem.concat(allocator, u8, &.{
-            "<tool_call>\n<function=edit>\n<parameter=mode>\n", c.spelling, "\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=edit>\n<parameter=mode>\n", spelling, "\n</parameter>\n</function>\n</tool_call>",
         });
         defer allocator.free(raw);
         const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
-        defer {
-            for (calls) |tc| {
-                allocator.free(tc.name);
-                allocator.free(tc.arguments);
-            }
-            allocator.free(calls);
-        }
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{}) catch {
-            std.debug.print("\n{s}: args not valid JSON: {s}\n", .{ c.spelling, calls[0].arguments });
-            return error.ArgsNotValidJson;
-        };
+        defer tool_schema.freeParsedCalls(calls);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
         defer parsed.deinit();
-        const v = parsed.value.object.get("mode") orelse return error.MissingParam;
-        if (c.number) {
-            if (v == .string) {
-                std.debug.print("\n{s}: shipped as a string\n", .{c.spelling});
-                return error.NumberQuoted;
-            }
-        } else {
-            if (v != .string) {
-                std.debug.print("\n{s}: shipped unquoted as {s}\n", .{ c.spelling, @tagName(v) });
-                return error.NonNumberUnquoted;
-            }
-            try testing.expectEqualStrings(c.spelling, v.string);
-        }
+        try testing.expectEqualStrings(spelling, parsed.value.object.get("mode").?.string);
     }
 }
 
@@ -5229,6 +5349,7 @@ fn expectReplays(pack: []const u8, model_type: ?[]const u8, cases: []const Repla
         switch (c.reuse) {
             .whole => try testing.expectEqual(r.gen.len, r.reused),
             .thought_short => try testing.expect(r.reused <= r.think_close_at.?),
+            .until_typed_value => try testing.expect(r.reused > r.think_close_at.? and r.reused < r.gen.len),
             .none => try testing.expect(!r.prefix_kept or r.reused == 0),
         }
         // The state behind the closer is a restore point the next prompt reaches only when it repeats the closer.
@@ -5244,7 +5365,7 @@ test "qwen4 replay: what the next prompt shares with a generated turn (Flash-Nex
     try expectReplays("Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", @import("arch_fixtures_test.zig").qwen_model_type, &.{
         .{ .name = "thinking, tools, content then a call", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\nI will read the file.\n\n" ++ call, .reuse = .whole },
         .{ .name = "thinking, tools, a call alone", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call, .reuse = .whole },
-        .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call_json, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call_json, .reuse = .until_typed_value },
         .{ .name = "thinking, tools, a call with code in a string", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call_code, .reuse = .whole },
         .{ .name = "thinking, tools, plain answer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\nThe entry point is `src/main.zig`.", .reuse = .whole },
         .{ .name = "thinking, no tools", .tools = null, .thinking = true, .raw = reasoning ++ "\n</think>\n\nThe entry point is `src/main.zig`.", .reuse = .whole },
@@ -5261,7 +5382,7 @@ test "glm5 replay: what the next prompt shares with a generated turn (GLM-5.3 to
     try expectReplays("GLM-5.3-Flash-Sushi-2.4bpw", @import("arch_fixtures_test.zig").glm_model_type, &.{
         .{ .name = "thinking, tools, content then a call", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>I will read the file." ++ call, .reuse = .whole },
         .{ .name = "thinking, tools, a call alone", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call, .reuse = .whole },
-        .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call_json, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call_json, .reuse = .until_typed_value },
         .{ .name = "thinking, tools, plain answer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>The entry point is `src/main.zig`.", .reuse = .whole },
         .{ .name = "thinking, tools, the thought ends in a newline", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>" ++ call, .reuse = .thought_short },
         .{ .name = "chat, tools, content then a call", .tools = replay_tools, .thinking = false, .raw = "I will read the file." ++ call, .reuse = .whole },

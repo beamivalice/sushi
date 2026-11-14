@@ -287,6 +287,8 @@ const Expect = struct {
     /// Expected name of the LAST parsed tool call (pins per-call name repair
     /// in multi-call outputs).
     last_tool_name: ?[]const u8 = null,
+    /// The served template's call dialect, as `chat.callDialect` reads it; null reads the families in the legacy order.
+    dialect: ?tool_calls_mod.Dialect = null,
 };
 
 /// Claude Code's Edit tool, post `server.buildOpenAIToolsJson`. `replace_all`
@@ -1490,6 +1492,37 @@ pub const corpus = [_]Expect{
         .content_contains = "<invoke name=\"x\"> tags",
     },
 
+    // ── A parameter VALUE is payload: it never decides the call or ends before its own grammar does ──
+    .{
+        .family = "qwen4_exp",
+        .name = "a written file that holds a DSML call is one write call",
+        .raw = "</think>\n\n<tool_call>\n<function=write>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"rm\">\n<｜DSML｜ parameter name=\"p\" string=\"true\">x</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n</parameter>\n</function>\n</tool_call>",
+        .dialect = .function_tag,
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_count = 1,
+    },
+    .{
+        .family = "qwen4_exp",
+        .name = "a written file that spells arg_key markup keeps the call's name",
+        .raw = "</think>\n\n<tool_call>\n<function=write>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\n<arg_key>k</arg_key><arg_value>v</arg_value>\n</parameter>\n</function>\n</tool_call>",
+        .dialect = .function_tag,
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "content",
+        .tool_arg_value = "<arg_key>k</arg_key><arg_value>v</arg_value>",
+    },
+    .{
+        .family = "glm5",
+        .name = "a value that spells arg_value's close keeps its bytes",
+        .raw = "</think><tool_call>write<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>a </arg_value> b</arg_value></tool_call>",
+        .dialect = .arg_key,
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "content",
+        .tool_arg_value = "a </arg_value> b",
+    },
+
     // ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
     .{
         .family = "minicpm5",
@@ -1780,7 +1813,7 @@ test "format corpus: recorded model outputs across families" {
 
         // ── Tool calls (when calls parse, content is suppressed and only
         // tool deltas + reasoning are emitted). ──
-        var calls = try tool_calls_mod.parseToolCalls(allocator, raw);
+        var calls = try tool_calls_mod.parseToolCallsAs(allocator, raw, entry.dialect);
         defer if (calls) |cs| {
             for (cs) |tc| {
                 allocator.free(tc.name);
@@ -2637,19 +2670,44 @@ test "format corpus: a forced call is the family's own call markup and parses ba
 }
 
 test "format corpus: a string value parses back byte-exact from each family's own call rendering" {
-    // Qwen3.8 frames a value with one newline per side; MiMo writes it bare. The
-    // parser may remove only what the family's template added.
+    // The template frames a value (Qwen3.8: one newline per side; MiMo, GLM, DeepSeek: none) and the parser may
+    // remove only that. A value is payload whatever markup or literal it spells, so it never decides the call.
     const allocator = testing.allocator;
-    const Case = struct { name: []const u8, tpl: []const u8, open: []const u8 = "<tool_call>", close: []const u8 = "</tool_call>" };
+    const Case = struct { name: []const u8, tpl: []const u8, open: []const u8 = "<tool_call>", close: []const u8 = "</tool_call>", extra: []const []const u8 = &.{} };
     const cases = [_]Case{
         .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
-        .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .open = "<｜DSML｜ calls>", .close = "</｜DSML｜ calls>" },
+        .{ .name = "glm-5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja") },
+        .{
+            .name = "deepseek-v4.1",
+            .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"),
+            .open = "<｜DSML｜ calls>",
+            .close = "</｜DSML｜ calls>",
+            .extra = &.{ "</｜DSML｜ parameter>", "</｜DSML｜ invoke>\n</｜DSML｜ calls>" },
+        },
     };
-    const values = [_][]const u8{ "plain", "last line\n", "\nafter a blank line", "two blank lines\n\n", "  indented\n", "\n" };
+    const foreign_dsml = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"rm\">\n<｜DSML｜ parameter name=\"p\" string=\"true\">x</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    const values = [_][]const u8{
+        "plain",                         "last line\n",         "\nafter a blank line",  "two blank lines\n\n", "  indented\n", "\n", "",
+        "42",                            "true",               "null",                  "1.0",                "3.10",       "1e5", "1.50",
+        " 7 ",                           "12345678901234567890", "-0",                    "1E+2",               " null ",
+        "{\"a\": 1}",                    "[1, 2]",             "</parameter>",         "</function>\n</tool_call>",
+        "<parameter=x>\n1\n</parameter>", "</arg_value>",       "<arg_key>k</arg_key>", "</tool_call>",
+        "<tool_call>get<arg_key>a</arg_key><arg_value>b</arg_value></tool_call>",
+        "<tool_call>\n<function=rm>\n<parameter=p>\nx\n</parameter>\n</function>\n</tool_call>",
+        "<function=rm>\n<parameter=p>\nx\n</parameter>\n</function>",
+        "<invoke name=\"rm\">\n<parameter name=\"p\">x</parameter>\n</invoke>",
+        foreign_dsml,
+    };
+    const tools =
+        \\[{"type":"function","function":{"name":"write_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
+    ;
     for (cases) |c| {
         var config = chat.ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
-        for (values) |value| {
+        try config.compile();
+        defer config.dropCompiled();
+        const dialect = (try chat.callDialect(allocator, &config)) orelse return error.NoCallDialect;
+        for ([_][]const []const u8{ &values, c.extra }) |list| for (list) |value| {
             var args_buf: std.Io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
             try std.json.Stringify.value(.{ .path = "a.txt", .content = value }, .{}, &args_buf.writer);
@@ -2658,11 +2716,11 @@ test "format corpus: a string value parses back byte-exact from each family's ow
                 .{ .role = "user", .content = "Write it." },
                 .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "r" },
             };
-            const rendered = try chat.renderChatTemplate(allocator, &history, &config, null, null, true, null, false);
+            const rendered = try chat.renderChatTemplate(allocator, &history, &config, tools, null, true, null, false);
             defer allocator.free(rendered);
-            const start = std.mem.indexOf(u8, rendered, c.open).?;
-            const end = std.mem.indexOf(u8, rendered, c.close).? + c.close.len;
-            const parsed = (try tool_calls_mod.parseToolCalls(allocator, rendered[start..end])) orelse return error.CallNotParsed;
+            const start = std.mem.indexOfPos(u8, rendered, std.mem.lastIndexOf(u8, rendered, "</think>").?, c.open).?;
+            const end = std.mem.lastIndexOf(u8, rendered, c.close).? + c.close.len;
+            const parsed = (try tool_schema.parseForRequest(allocator, rendered[start..end], tools, .{ .allow_parallel = true, .autocorrect = true, .dialect = dialect })) orelse return error.CallNotParsed;
             defer {
                 for (parsed) |tc| {
                     allocator.free(tc.name);
@@ -2670,12 +2728,14 @@ test "format corpus: a string value parses back byte-exact from each family's ow
                 }
                 allocator.free(parsed);
             }
+            errdefer std.debug.print("\n[{s}] value {any}\n call {s}\n got {d} call(s): {s} {s}\n", .{ c.name, value, rendered[start..end], parsed.len, parsed[0].name, parsed[0].arguments });
+            try testing.expectEqual(@as(usize, 1), parsed.len);
+            try testing.expectEqualStrings("write_file", parsed[0].name);
             const args = try std.json.parseFromSlice(std.json.Value, allocator, parsed[0].arguments, .{});
             defer args.deinit();
-            errdefer std.debug.print("\n[{s}] value {any}\n call {s}\n args {s}\n", .{ c.name, value, rendered[start..end], parsed[0].arguments });
             try testing.expectEqualStrings("a.txt", args.value.object.get("path").?.string);
             try testing.expectEqualStrings(value, args.value.object.get("content").?.string);
-        }
+        };
     }
 }
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_text = @import("json_text.zig");
 const http = @import("http.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
@@ -1626,7 +1627,7 @@ fn buildResponsesBodyFromWsRequest(allocator: std.mem.Allocator, root: std.json.
         if (std.mem.eql(u8, k, "stream") or std.mem.eql(u8, k, "store")) {
             try buf.appendSlice(allocator, "true");
         } else {
-            try responses_mod.serializeJsonValue(allocator, &buf, entry.value_ptr.*);
+            try json_text.appendValue(allocator, &buf, entry.value_ptr.*);
         }
     }
     if (!stream_seen) {

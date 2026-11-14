@@ -157,7 +157,6 @@ parseToolCalls Qwen3.6 MoE nested-name garbage (real capture)
 parseToolCalls flat Qwen MoE shape (no arguments wrapper)
 parseToolCalls qwen: a parameter value carrying </parameter> is not emptied
 parseToolCalls qwen: a parameter value carrying </tool_call> is not dropped
-parseToolCalls qwen: a parameter value types from JSON's number grammar, not parseFloat
 parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma
 parseVisionProcessorDefaultsFromJson supports current and legacy Qwen layouts
 prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-only

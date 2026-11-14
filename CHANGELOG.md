@@ -11,6 +11,11 @@ earlier history is mlx-serve's, in that project's changelog.
   a thought it never closed, as the other surfaces do, a stop sequence that cuts a call open no longer ships it as a
   finished call, and a stream with no tools cuts stray tool markup and a content part's leading space as the
   non-stream reply does.
+- **A tool call's parameter text can no longer change the call**: Qwen, MiMo, GLM and DeepSeek read the call in their own
+  template's dialect first, and a value that holds another family's call or a close tag of its own comes back byte for byte.
+- **Tool arguments keep the model's spelling**: a Qwen string argument such as `3.10`, `1.0` or `null` arrives as
+  that string, a number keeps its digits (`0.50`, a 20-digit id), and a request's numbers and object `arguments` in
+  chat history reach the template unchanged.
 - **The dashboard shows expert streaming**: for a model that streams its experts from the SSD, a new card shows how many
   routed experts were already in memory, the SSD read rate and the time spent waiting on it, and `/metrics` carries the
   same counters.

@@ -640,7 +640,7 @@ pub fn handleNonStreamingGeneration(
     // Check for tool calls in the output
     if (has_tools and shouldParseToolCalls(result.finish_details)) {
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
-        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools, .{ .stop_cut = stop_cut });
+        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools, .{ .stop_cut = stop_cut, .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?) });
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -1742,7 +1742,7 @@ pub fn handleStreamingGeneration(
         const norm_owned = try think_tags.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools, .{ .stop_cut = stopped }) else null;
+        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools, .{ .stop_cut = stopped, .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?) }) else null;
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {

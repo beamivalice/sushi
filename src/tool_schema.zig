@@ -16,6 +16,16 @@ pub fn jsonIsValidObject(allocator: std.mem.Allocator, s: []const u8) bool {
     return parsed.value == .object;
 }
 
+/// JSON read so that a rewrite never reprints a number: every number stays its spelling (`number_string`), `1.50` is
+/// not `1.5`.
+pub fn parseArgs(allocator: std.mem.Allocator, text: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, text, .{ .parse_numbers = false });
+}
+
+fn isIntegerSpelling(number: []const u8) bool {
+    return std.mem.indexOfAny(u8, number, ".eE") == null;
+}
+
 pub const ParsedToolCall = struct {
     name: []const u8,
     arguments: []const u8, // JSON string
@@ -156,8 +166,8 @@ fn looseBoolSpelling(raw: []const u8) ?bool {
 /// key repeated with different values: the two are told apart by parsing
 /// first-wins and last-wins and comparing the documents.
 fn parseContainerAllowingRepeats(allocator: std.mem.Allocator, text: []const u8) ?std.json.Parsed(std.json.Value) {
-    var first = std.json.parseFromSlice(std.json.Value, allocator, text, .{ .duplicate_field_behavior = .use_first }) catch return null;
-    var last = std.json.parseFromSlice(std.json.Value, allocator, text, .{ .duplicate_field_behavior = .use_last }) catch {
+    var first = std.json.parseFromSlice(std.json.Value, allocator, text, .{ .duplicate_field_behavior = .use_first, .parse_numbers = false }) catch return null;
+    var last = std.json.parseFromSlice(std.json.Value, allocator, text, .{ .duplicate_field_behavior = .use_last, .parse_numbers = false }) catch {
         first.deinit();
         return null;
     };
@@ -180,14 +190,13 @@ fn parseContainerAllowingRepeats(allocator: std.mem.Allocator, text: []const u8)
 }
 
 /// Coerce ONE value to the declared type. Returns null when the value already
-/// matches or the spelling is undecidable. Allocated replacements are appended
-/// to `owned`; parsed sub-documents to `docs` — both are freed by the caller
-/// AFTER the object is re-serialized, because the returned Value borrows them.
+/// matches or the spelling is undecidable. Parsed sub-documents are appended to
+/// `docs`, freed by the caller AFTER the object is re-serialized, because the
+/// returned Value borrows them.
 fn coerceValueToType(
     allocator: std.mem.Allocator,
     v: std.json.Value,
     want: []const u8,
-    owned: *std.ArrayList([]const u8),
     docs: *std.ArrayList(std.json.Parsed(std.json.Value)),
 ) !?std.json.Value {
     // A CONTAINER param carried through a tag format arrives as a STRING — no tag
@@ -235,14 +244,16 @@ fn coerceValueToType(
         return switch (v) {
             .bool => null,
             .string => |s| if (looseBoolSpelling(s)) |b| std.json.Value{ .bool = b } else null,
-            .integer => |i| if (i == 0 or i == 1) std.json.Value{ .bool = i == 1 } else null,
+            .number_string => |n| if (std.mem.eql(u8, n, "0") or std.mem.eql(u8, n, "1")) std.json.Value{ .bool = n[0] == '1' } else null,
             else => null,
         };
     }
     if (std.mem.eql(u8, want, "integer")) {
         return switch (v) {
             .string => |s| blk: {
-                const n = std.fmt.parseInt(i64, std.mem.trim(u8, s, " \t\r\n"), 10) catch break :blk null;
+                const t = std.mem.trim(u8, s, " \t\r\n");
+                if (tool_calls_mod.isJsonNumber(t) and isIntegerSpelling(t)) break :blk std.json.Value{ .number_string = t };
+                const n = std.fmt.parseInt(i64, t, 10) catch break :blk null;
                 break :blk std.json.Value{ .integer = n };
             },
             else => null,
@@ -252,6 +263,7 @@ fn coerceValueToType(
         return switch (v) {
             .string => |s| blk: {
                 const t = std.mem.trim(u8, s, " \t\r\n");
+                if (tool_calls_mod.isJsonNumber(t)) break :blk std.json.Value{ .number_string = t };
                 if (std.fmt.parseInt(i64, t, 10)) |n| break :blk std.json.Value{ .integer = n } else |_| {}
                 const f = std.fmt.parseFloat(f64, t) catch break :blk null;
                 if (std.math.isNan(f) or std.math.isInf(f)) break :blk null; // not representable in JSON
@@ -261,22 +273,10 @@ fn coerceValueToType(
         };
     }
     if (std.mem.eql(u8, want, "string")) {
-        // The inverse repair: the tag/custom formats infer type from the value's
-        // SPELLING (isJsonLiteral), so a string param whose content happens to
-        // read as `false`/`42` was shipped as a bool/number. The schema is the
-        // only thing that can tell those apart.
+        // The inverse repair: a JSON dialect writes a string param's content `false` or `42` as a bool or a number.
+        // The schema alone tells those apart; a number keeps its spelling.
         return switch (v) {
             .bool => |b| std.json.Value{ .string = if (b) "true" else "false" },
-            .integer => |i| blk: {
-                const s = try std.fmt.allocPrint(allocator, "{d}", .{i});
-                try owned.append(allocator, s);
-                break :blk std.json.Value{ .string = s };
-            },
-            .float => |f| blk: {
-                const s = try std.fmt.allocPrint(allocator, "{d}", .{f});
-                try owned.append(allocator, s);
-                break :blk std.json.Value{ .string = s };
-            },
             .number_string => |s| std.json.Value{ .string = s },
             else => null,
         };
@@ -287,8 +287,8 @@ fn coerceValueToType(
 fn jsonTypeMatches(v: std.json.Value, want: []const u8) bool {
     if (v == .null) return true; // an explicit null satisfies any optional field
     if (std.mem.eql(u8, want, "boolean")) return v == .bool;
-    if (std.mem.eql(u8, want, "integer")) return v == .integer or v == .number_string;
-    if (std.mem.eql(u8, want, "number")) return v == .integer or v == .float or v == .number_string;
+    if (std.mem.eql(u8, want, "integer")) return v == .number_string and isIntegerSpelling(v.number_string);
+    if (std.mem.eql(u8, want, "number")) return v == .number_string;
     if (std.mem.eql(u8, want, "string")) return v == .string;
     if (std.mem.eql(u8, want, "array")) return v == .array;
     if (std.mem.eql(u8, want, "object")) return v == .object;
@@ -310,7 +310,7 @@ pub fn toolCallConformsToSchema(
     const params = toolParametersFor(tools.value, call.name) orelse return true;
     const props = propertiesOf(params) orelse return true;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch return true;
+    var parsed = parseArgs(allocator, call.arguments) catch return true;
     defer parsed.deinit();
     if (parsed.value != .object) return true;
 
@@ -346,7 +346,7 @@ pub fn requiredParamIsBuried(
     if (props_v != .object or required_v != .array) return false;
     const props = props_v.object;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch return false;
+    var parsed = parseArgs(allocator, call.arguments) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
 
@@ -405,15 +405,10 @@ pub fn coerceToolArgsToSchema(
         const params = toolParametersFor(tools.value, call.name) orelse continue;
         const props = propertiesOf(params) orelse continue;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch continue;
+        var parsed = parseArgs(allocator, call.arguments) catch continue;
         defer parsed.deinit();
         if (parsed.value != .object) continue;
 
-        var owned = std.ArrayList([]const u8).empty;
-        defer {
-            for (owned.items) |s| allocator.free(s);
-            owned.deinit(allocator);
-        }
         // Parsed container sub-documents: the rewritten object BORROWS from these,
         // so they must outlive the Stringify below.
         var docs = std.ArrayList(std.json.Parsed(std.json.Value)).empty;
@@ -437,7 +432,7 @@ pub fn coerceToolArgsToSchema(
                 if (fits) continue;
             }
             const new_val = for (types.slice()) |want| {
-                if (try coerceValueToType(allocator, entry.value_ptr.*, want, &owned, &docs)) |nv| break nv;
+                if (try coerceValueToType(allocator, entry.value_ptr.*, want, &docs)) |nv| break nv;
             } else continue;
             entry.value_ptr.* = new_val;
             changed = true;
@@ -471,7 +466,7 @@ fn containerItemDeclares(prop: std.json.Value, name: []const u8) bool {
 fn jsonScalarEql(a: std.json.Value, b: std.json.Value) bool {
     return switch (a) {
         .string => |s| b == .string and std.mem.eql(u8, s, b.string),
-        .integer => |i| b == .integer and i == b.integer,
+        .number_string => |n| b == .number_string and std.mem.eql(u8, n, b.number_string),
         .bool => |x| b == .bool and x == b.bool,
         else => false,
     };
@@ -558,7 +553,7 @@ pub fn hoistMisplacedRequiredParams(
         if (props_v != .object or required_v != .array) continue;
         const props = props_v.object;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch continue;
+        var parsed = parseArgs(allocator, call.arguments) catch continue;
         defer parsed.deinit();
         if (parsed.value != .object) continue;
 
@@ -765,6 +760,60 @@ const test_tools_write_bash =
     \\[{"type":"function","function":{"name":"Write","description":"Write a file","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}}},
     \\ {"type":"function","function":{"name":"Bash","description":"Run a command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
 ;
+
+pub const RequestOptions = struct {
+    /// false keeps only the first parsed call (client-requested, never a repair heuristic).
+    allow_parallel: bool,
+    /// `--no-tool-autocorrect` turns this off: the hoist and the schema coercion.
+    autocorrect: bool,
+    /// The served template's call dialect; null reads the families in the legacy order.
+    dialect: ?tool_calls_mod.Dialect,
+};
+
+/// The ONE tool-call extraction path: parse in the served dialect, fall back to bare-JSON inference, clamp to
+/// `allow_parallel`, then hoist and coerce the arguments to the schema the request declared.
+pub fn parseForRequest(allocator: std.mem.Allocator, text: []const u8, tools_json: ?[]const u8, opts: RequestOptions) !?[]ParsedToolCall {
+    var parsed_calls = try tool_calls_mod.parseToolCallsAs(allocator, text, opts.dialect);
+    // An inferred raw-JSON call must name a DECLARED tool: a truncated data object is not a call. Not gated on
+    // autocorrect, which only gates repairs of the model's own output.
+    if (parsed_calls) |c| {
+        if (tools_json) |tj| parsed_calls = try filterInferredBySchema(allocator, c, tj);
+    }
+    var calls = parsed_calls orelse
+        (if (tools_json) |tj| try inferBareJsonToolCalls(allocator, text, tj) else null) orelse {
+        noteUnparsedToolMarkup(text);
+        return null;
+    };
+    if (!opts.allow_parallel and calls.len > 1) {
+        log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});
+        for (calls[1..]) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        const kept = calls[0];
+        allocator.free(calls);
+        const one = try allocator.alloc(ParsedToolCall, 1);
+        one[0] = kept;
+        calls = one;
+    }
+    if (opts.autocorrect) {
+        if (tools_json) |tj| {
+            // A buried required param goes back where the schema says it lives BEFORE the types are coerced.
+            try hoistMisplacedRequiredParams(allocator, calls, tj);
+            try coerceToolArgsToSchema(allocator, calls, tj);
+        }
+    }
+    return calls;
+}
+
+/// A reply whose tool markup gave no call goes out as text with the markup cut, and its turn ends as a plain stop:
+/// this line is the log's one trace of why.
+pub fn noteUnparsedToolMarkup(text: []const u8) void {
+    const at = think_tags.leakedToolMarkupStart(text) orelse return;
+    var quoted: [512]u8 = undefined;
+    const n = log.appendQuoted(&quoted, 0, text[at..], 96);
+    log.info("[tool-parse] tool markup parsed to no call and is cut from the reply: {d} bytes from byte {d}, {s}\n", .{ text.len - at, at, quoted[0..n] });
+}
 
 test "inferBareJsonToolCalls maps bare-args fenced JSON to the unique matching tool (Claude Code capture)" {
     const allocator = testing.allocator;
@@ -1577,6 +1626,50 @@ test "coerceToolArgsToSchema: quoted integer/number strings coerce to numeric" {
     try testing.expectEqualStrings("a.txt", parsed.value.object.get("path").?.string);
 }
 
+test "coerceToolArgsToSchema: a number keeps the model's spelling and a string param keeps its digits" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"E","parameters":{"type":"object","properties":{"ratio":{"type":"number"},"limit":{"type":"integer"},"label":{"type":"string"},"tag":{"type":"string"}}}}}]
+    ;
+    const qwen = "<tool_call>\n<function=E>\n<parameter=ratio>\n0.50\n</parameter>\n<parameter=limit>\n 7 \n</parameter>\n" ++
+        "<parameter=label>\n1.50\n</parameter>\n<parameter=tag>\nnull\n</parameter>\n</function>\n</tool_call>";
+    const typed = (try parseForRequest(allocator, qwen, tools, .{ .allow_parallel = true, .autocorrect = true, .dialect = .function_tag })).?;
+    defer freeParsedCalls(typed);
+    try testing.expectEqualStrings("{\"ratio\":0.50,\"limit\":7,\"label\":\"1.50\",\"tag\":\"null\"}", typed[0].arguments);
+    // A JSON dialect's number in a string param becomes that param's text; the numbers beside it are untouched.
+    const json = "<tool_call>{\"name\":\"E\",\"arguments\":{\"label\":1.50,\"ratio\":2.0,\"limit\":\"3\",\"tag\":true}}</tool_call>";
+    const fixed = (try parseForRequest(allocator, json, tools, .{ .allow_parallel = true, .autocorrect = true, .dialect = null })).?;
+    defer freeParsedCalls(fixed);
+    try testing.expectEqualStrings("{\"label\":\"1.50\",\"ratio\":2.0,\"limit\":3,\"tag\":\"true\"}", fixed[0].arguments);
+}
+
+test "coerceToolArgsToSchema: an integer param past i64 is still a number, spelled as written" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"E","parameters":{"type":"object","properties":{"id":{"type":"integer"}}}}}]
+    ;
+    const qwen = "<tool_call>\n<function=E>\n<parameter=id>\n12345678901234567890\n</parameter>\n</function>\n</tool_call>";
+    const typed = (try parseForRequest(allocator, qwen, tools, .{ .allow_parallel = true, .autocorrect = true, .dialect = .function_tag })).?;
+    defer freeParsedCalls(typed);
+    try testing.expectEqualStrings("{\"id\":12345678901234567890}", typed[0].arguments);
+}
+
+test "hoistMisplacedRequiredParams: a number elsewhere in the call keeps its spelling" {
+    const allocator = testing.allocator;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, "{\"edits\":[{\"newText\":\"b\",\"oldText\":\"a\",\"path\":\"p.txt\",\"weight\":1.50}]}"),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    try hoistMisplacedRequiredParams(allocator, &calls, pi_edit_tools_json_test);
+    try testing.expectEqualStrings("{\"edits\":[{\"newText\":\"b\",\"oldText\":\"a\",\"weight\":1.50}],\"path\":\"p.txt\"}", calls[0].arguments);
+}
+
 test "coerceToolArgsToSchema: nullable union type [\"string\",\"null\"] coerces to the non-null member" {
     // Real schemas declare optional params as a type UNION. declaredJsonType
     // picks the first non-null member, so a boolean-spelled value under
@@ -1727,7 +1820,8 @@ test "toolCallConformsToSchema: a value matching any anyOf branch conforms" {
 
 // ── DeepSeek-V4 native DSML tool calls ─────────────────────────────────
 
-fn freeParsedCalls(calls: []ParsedToolCall) void {
+/// Tests only: frees calls parsed with `testing.allocator`.
+pub fn freeParsedCalls(calls: []ParsedToolCall) void {
     for (calls) |tc| {
         testing.allocator.free(tc.name);
         testing.allocator.free(tc.arguments);
@@ -1839,7 +1933,7 @@ test "parseToolCalls: Claude-style bare <invoke> markup is an inferred call" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("cd /x && ls -la", parsed.value.object.get("command").?.string);
-    try testing.expectEqual(@as(i64, 30), parsed.value.object.get("timeout").?.integer);
+    try testing.expectEqualStrings("30", parsed.value.object.get("timeout").?.string);
     try testing.expect((try parseToolCalls(allocator, "I <invoked> it with <parameters> set.")) == null);
     // An unparsed block never reaches content; prose naming the tag stays.
     try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls"));

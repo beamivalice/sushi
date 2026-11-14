@@ -27,7 +27,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--timeout` | `300` → stall timeout in seconds, 0 = none (main.zig:690) | operator | help, server-http-apis; 1 test | keep |
 | `--no-prevent-sleep` | off → allow idle sleep during inference (main.zig:697) | operator | help; 1 test | keep |
 | `--gpu-warm-secs` | `60` → keep the GPU awake this long after a request (main.zig:953) | machine | help, server-lifecycle; 0 tests | keep: a power-against-latency choice |
-| `--no-tool-autocorrect` | off → stop coercing tool-call arguments to the schema's types (main.zig:706) | dev | help, server-tool-calling; 0 tests | cut: kill switch of an adopted default, no test, no measurement |
+| `--no-tool-autocorrect` | off → stop coercing tool-call arguments to the schema's types; a tag dialect's values then ship as strings (main.zig:706) | dev | help, server-tool-calling; 0 tests | cut: kill switch of an adopted default, no test, no measurement |
 | `--no-update-check` | off → never ask GitHub for a newer release or Hugging Face for a pack revision; pins the settings keys `server.update_check` and `server.pack_update_check` off, reported locked (main.zig:818) | operator | help, server-lifecycle; 3 tests | keep |
 
 ## Model, memory and context

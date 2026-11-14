@@ -385,7 +385,8 @@ reply every turn. A thinking request with tools now takes one more point mid-dec
 - **The closer is what every turn shares** (`replay` tests in `tool_calls.zig`, pack tokenizer and real template): Qwen re-renders
   `<think>\n` + trimmed thought + `\n</think>\n\n`, GLM `<think>` + thought + `</think>`, and both repeat the whole reply. A thought
   starting in whitespace or ending in any the template does not write is re-rendered (`mtp_plan.thoughtEdgesSurvive`) and
-  its point dropped; a client must send `reasoning_content` back as delivered.
+  its point dropped; a client must send `reasoning_content` back as delivered. A call value the schema types (an array
+  spelled `["a","b"]`) comes back in the template's own `tojson` spelling, so reuse ends at that value.
 - **Armed** by `scheduler.armThoughtPoint` for thinking + tools, a prompt of 512 tokens or more ending in `<think>`, and a
   speculative round; a thought under 512 tokens takes none, and serial decode (state one token ahead) none either. On
   Qwen a [decode-end point](#decode-end-points) supersedes it.

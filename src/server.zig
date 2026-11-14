@@ -3242,8 +3242,12 @@ fn readOpenAiMessages(wire: *WireMessages, items: []const std.json.Value, vp: ch
                         const func = tc_item.object.get("function") orelse continue;
                         if (func != .object) continue;
                         const fn_name = if (func.object.get("name")) |v| (if (v == .string) v.string else "") else "";
-                        const fn_args = if (func.object.get("arguments")) |v| (if (v == .string) v.string else "{}") else "{}";
-                        try tcs.append(allocator, .{ .id = tc_id, .name = fn_name, .arguments = fn_args });
+                        const args = try json_text.callArguments(allocator, func.object.get("arguments"));
+                        if (args.owned) wire.texts.append(allocator, args.text) catch |e| {
+                            allocator.free(args.text);
+                            return e;
+                        };
+                        try tcs.append(allocator, .{ .id = tc_id, .name = fn_name, .arguments = args.text });
                     }
                     if (tcs.items.len > 0) {
                         const owned = try tcs.toOwnedSlice(allocator);
@@ -3357,6 +3361,18 @@ test "an undecodable image is refused naming its message and the reason" {
     defer t.parsed.deinit();
     defer t.wire.deinit();
     try std.testing.expect(std.mem.startsWith(u8, t.wire.media.refusal().?.text(), "messages[0]: image could not be decoded"));
+}
+
+test "a chat history call whose arguments are a JSON object keeps them" {
+    var t = try testWire(
+        \\{"messages":[{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":{"path":"a.txt","n":2}}},
+        \\{"id":"c2","type":"function","function":{"name":"g","arguments":"{\"k\":1}"}}]}]}
+    , .openai);
+    defer t.parsed.deinit();
+    defer t.wire.deinit();
+    const calls = t.wire.messages.items[0].tool_calls.?;
+    try std.testing.expectEqualStrings("{\"path\":\"a.txt\",\"n\":2}", calls[0].arguments);
+    try std.testing.expectEqualStrings("{\"k\":1}", calls[1].arguments);
 }
 
 test "a body past the image limit is refused with both counts" {

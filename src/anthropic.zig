@@ -121,7 +121,6 @@ const responseBody = http.responseBody;
 const rowMaskedDrafter = server_mod.rowMaskedDrafter;
 const sendErrorResponse = http.sendErrorResponse;
 const sendResponse = http.sendResponse;
-const serializeJsonValue = request_parse.serializeJsonValue;
 const shouldParseToolCalls = reply_mod.shouldParseToolCalls;
 const testWire = server_mod.testWire;
 const test_png_blue = server_mod.test_png_blue;
@@ -342,7 +341,7 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
                             // Serialize input object to JSON string
                             var args_buf = std.ArrayList(u8).empty;
                             if (block.object.get("input")) |input_val| {
-                                try serializeJsonValue(allocator, &args_buf, input_val);
+                                try json_text.appendValue(allocator, &args_buf, input_val);
                             } else {
                                 try args_buf.appendSlice(allocator, "{}");
                             }
@@ -1135,7 +1134,7 @@ fn handleAnthropicNonStreaming(
 
     // Check for tool calls
     if (has_tools and shouldParseToolCalls(result.finish_details)) {
-        const found_calls = try reply_mod.toolReply(allocator, generated, tools_json, allow_parallel_tools, .{ .opens_think = opens_think, .stop_cut = matched_stop_seq != null });
+        const found_calls = try reply_mod.toolReply(allocator, generated, tools_json, allow_parallel_tools, .{ .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?), .opens_think = opens_think, .stop_cut = matched_stop_seq != null });
         if (found_calls) |tool_reply| {
             defer tool_reply.deinit(allocator);
 
@@ -1702,7 +1701,7 @@ fn handleAnthropicStreaming(
         const norm_owned = try think_tags.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools, .{ .stop_cut = stopped }) else null;
+        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools, .{ .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?), .stop_cut = stopped }) else null;
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -2433,7 +2432,7 @@ test "a /v1/messages reply with a call inside a thought the prompt opened and ne
         \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
     ;
     const generated = "I'll check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
-    const tool_reply = (try reply_mod.toolReply(a, generated, tools, true, .{ .opens_think = true })).?;
+    const tool_reply = (try reply_mod.toolReply(a, generated, tools, true, .{ .dialect = .function_tag, .opens_think = true })).?;
     defer tool_reply.deinit(a);
     var content = std.ArrayList(u8).empty;
     defer content.deinit(a);

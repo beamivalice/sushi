@@ -6,6 +6,7 @@
 
 const arch_fx = @import("arch_fixtures_test.zig");
 const std = @import("std");
+const json_text = @import("json_text.zig");
 const chat_mod = @import("chat.zig");
 
 // ─── small json helpers (intentionally duplicated from server.zig to avoid
@@ -45,52 +46,6 @@ fn jsonEscapeValid(allocator: std.mem.Allocator, input: []const u8) ![]const u8 
     }
     try buf.append(allocator, '"');
     return try buf.toOwnedSlice(allocator);
-}
-
-pub fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: std.json.Value) !void {
-    switch (value) {
-        .null => try buf.appendSlice(allocator, "null"),
-        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-        .integer => |i| {
-            var n: [24]u8 = undefined;
-            const s = std.fmt.bufPrint(&n, "{d}", .{i}) catch "0";
-            try buf.appendSlice(allocator, s);
-        },
-        .float => |f| {
-            var n: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&n, "{d}", .{f}) catch "0";
-            try buf.appendSlice(allocator, s);
-        },
-        .string => |s| {
-            const e = try jsonEscape(allocator, s);
-            defer allocator.free(e);
-            try buf.appendSlice(allocator, e);
-        },
-        .array => |arr| {
-            try buf.append(allocator, '[');
-            for (arr.items, 0..) |item, i| {
-                if (i > 0) try buf.append(allocator, ',');
-                try serializeJsonValue(allocator, buf, item);
-            }
-            try buf.append(allocator, ']');
-        },
-        .object => |obj| {
-            try buf.append(allocator, '{');
-            var iter = obj.iterator();
-            var first = true;
-            while (iter.next()) |entry| {
-                if (!first) try buf.append(allocator, ',');
-                first = false;
-                const ek = try jsonEscape(allocator, entry.key_ptr.*);
-                defer allocator.free(ek);
-                try buf.appendSlice(allocator, ek);
-                try buf.append(allocator, ':');
-                try serializeJsonValue(allocator, buf, entry.value_ptr.*);
-            }
-            try buf.append(allocator, '}');
-        },
-        .number_string => |s| try buf.appendSlice(allocator, s),
-    }
 }
 
 // ─── ID generation ────────────────────────────────────────────────────────
@@ -236,7 +191,7 @@ pub fn buildToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Array)
         try buf.appendSlice(allocator, esc_d);
         try buf.appendSlice(allocator, ",\"parameters\":");
         if (tool.get("parameters")) |params_val| {
-            try serializeJsonValue(allocator, &buf, params_val);
+            try json_text.appendValue(allocator, &buf, params_val);
         } else {
             try buf.appendSlice(allocator, "{}");
         }
@@ -646,11 +601,15 @@ fn appendFunctionCallInputItem(
 ) !void {
     const call_id = if (obj.get("call_id")) |v| (if (v == .string) v.string else "") else "";
     const name = if (obj.get("name")) |v| (if (v == .string) v.string else "") else "";
-    const args = if (obj.get("arguments")) |v| (if (v == .string) v.string else "{}") else "{}";
+    const args = try json_text.callArguments(allocator, obj.get("arguments"));
+    if (args.owned) pi.owned_strings.append(allocator, args.text) catch |e| {
+        allocator.free(args.text);
+        return e;
+    };
 
     const tcs = try allocator.alloc(chat_mod.ToolCall, 1);
     errdefer allocator.free(tcs);
-    tcs[0] = .{ .id = call_id, .name = name, .arguments = args };
+    tcs[0] = .{ .id = call_id, .name = name, .arguments = args.text };
     try pi.owned_tool_calls.append(allocator, tcs);
     try pi.messages.append(allocator, .{
         .role = "assistant",
@@ -1406,4 +1365,27 @@ test "parseInput: reasoning joins the assistant message that follows it" {
     try testing.expectEqual(@as(usize, 3), pi.messages.items.len);
     try testing.expectEqualStrings("answer", pi.messages.items[1].content);
     try testing.expectEqualStrings("think hard", pi.messages.items[1].reasoning_content.?);
+}
+
+test "parseInput: a function_call whose arguments are a JSON object keeps them" {
+    const a = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"role":"user","content":"q"},
+        \\ {"type":"function_call","call_id":"c1","name":"f","arguments":{"path":"a.txt","n":2}},
+        \\ {"type":"function_call","call_id":"c2","name":"g","arguments":"{\"k\":1}"},
+        \\ {"type":"function_call","call_id":"c3","name":"h","arguments":7}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(a, parsed.value, null, null, null, .{});
+    defer pi.deinit();
+    var args: [3][]const u8 = undefined;
+    var n: usize = 0;
+    for (pi.messages.items) |m| if (m.tool_calls) |tcs| for (tcs) |tc| {
+        args[n] = tc.arguments;
+        n += 1;
+    };
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualStrings("{\"path\":\"a.txt\",\"n\":2}", args[0]);
+    try testing.expectEqualStrings("{\"k\":1}", args[1]);
+    try testing.expectEqualStrings("{}", args[2]);
 }

@@ -9,6 +9,7 @@ const log = @import("log.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;
 const tool_calls_mod = @import("tool_calls.zig");
+const tool_schema = @import("tool_schema.zig");
 const think_tags = @import("think_tags.zig");
 
 pub const ToolCall = struct {
@@ -1239,6 +1240,19 @@ pub fn callOpener(allocator: std.mem.Allocator, chat_config: *const ChatConfig) 
     if (head[0] != '<') return null;
     const end = std.mem.indexOfScalar(u8, head, '>') orelse return null;
     return try allocator.dupe(u8, head[0 .. end + 1]);
+}
+
+/// The call dialect the template teaches, read from its own rendering of a call; null when it is none of the
+/// parser's families.
+pub fn callDialect(allocator: std.mem.Allocator, chat_config: *const ChatConfig) !?tool_calls_mod.Dialect {
+    const rendered = (try renderProbeCall(allocator, chat_config)) orelse return null;
+    defer allocator.free(rendered);
+    const name_at = std.mem.indexOf(u8, rendered, probe_name) orelse return null;
+    const before = rendered[name_at -| 48 .. name_at];
+    if (std.mem.indexOf(u8, before, "<function=") != null) return .function_tag;
+    if (std.mem.indexOf(u8, before, "DSML") != null) return .dsml;
+    if (std.mem.startsWith(u8, rendered[name_at + probe_name.len ..], "<arg_key>")) return .arg_key;
+    return null;
 }
 
 pub fn forcedCallText(allocator: std.mem.Allocator, chat_config: *const ChatConfig, name: ?[]const u8) !?ForcedCall {
@@ -3887,7 +3901,7 @@ pub fn replayTurn(a: std.mem.Allocator, tok: *const Tokenizer, cfg: *const ChatC
     errdefer a.free(gen);
 
     const split = think_tags.splitThinkBlock(raw, true, thinking);
-    const parsed = if (tools != null) try tool_calls_mod.parseToolCalls(a, raw) else null;
+    const parsed = if (tools) |tj| try tool_schema.parseForRequest(a, raw, tj, .{ .allow_parallel = true, .autocorrect = true, .dialect = try callDialect(a, cfg) }) else null;
     defer if (parsed) |calls| {
         for (calls) |c| {
             a.free(c.name);
@@ -3930,6 +3944,8 @@ const NextReuse = enum {
     whole,
     /// Through the thought, short of the closer: the template re-renders the thought's edges.
     thought_short,
+    /// Past the closer, short of a call value the schema typed: the template reprints it (`tojson` spaces an array).
+    until_typed_value,
     /// The turn is not re-rendered as it was generated.
     none,
 };

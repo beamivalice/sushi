@@ -29,6 +29,31 @@ pub fn write(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 }
 
 /// The escaped content without its quotes, for a format string that supplies them. Caller frees.
+/// `value` as JSON text appended to `buf`: a number keeps its digits as the parser read them (`std.json.Stringify`),
+/// the one writer for a request's JSON that is read again later.
+pub fn appendValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: std.json.Value) std.mem.Allocator.Error!void {
+    const text = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(text);
+    try buf.appendSlice(allocator, text);
+}
+
+/// A tool call's `arguments` as the text a message carries: a string as sent, an object as its JSON, anything else
+/// `{}`. `owned` is set when `text` was allocated here.
+pub const CallArguments = struct { text: []const u8, owned: bool };
+
+pub fn callArguments(allocator: std.mem.Allocator, value: ?std.json.Value) std.mem.Allocator.Error!CallArguments {
+    switch (value orelse return .{ .text = "{}", .owned = false }) {
+        .string => |s| return .{ .text = s, .owned = false },
+        .object => |o| {
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            try appendValue(allocator, &buf, .{ .object = o });
+            return .{ .text = try buf.toOwnedSlice(allocator), .owned = true };
+        },
+        else => return .{ .text = "{}", .owned = false },
+    }
+}
+
 pub fn innerAlloc(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -66,4 +91,49 @@ test "json text: the unquoted form drops only the quotes" {
     const inner = try innerAlloc(testing.allocator, "a\"b");
     defer testing.allocator.free(inner);
     try testing.expectEqualStrings("a\\\"b", inner);
+}
+
+fn numberValue(v: std.json.Value) !f64 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        .number_string => |s| try std.fmt.parseFloat(f64, s),
+        else => error.NotANumber,
+    };
+}
+
+test "json text: a re-serialized request value keeps every number's value" {
+    const a = testing.allocator;
+    const body = "{\"big\":1e40,\"one\":1.0,\"tiny\":-1e-30,\"huge_int\":12345678901234567890,\"pi\":3.141592653589793}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try appendValue(a, &buf, parsed.value);
+    var back = try std.json.parseFromSlice(std.json.Value, a, buf.items, .{});
+    defer back.deinit();
+    const o = back.value.object;
+    try testing.expectEqual(@as(f64, 1e40), try numberValue(o.get("big").?));
+    try testing.expectEqual(@as(f64, 1.0), try numberValue(o.get("one").?));
+    try testing.expectEqual(@as(f64, -1e-30), try numberValue(o.get("tiny").?));
+    try testing.expectEqual(@as(f64, 12345678901234567890.0), try numberValue(o.get("huge_int").?));
+    try testing.expectEqual(@as(f64, 3.141592653589793), try numberValue(o.get("pi").?));
+}
+
+test "json text: call arguments sent as a JSON object are the object's text, a string is as sent, anything else is {}" {
+    const a = testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"o\":{\"x\":1.50},\"s\":\"{\\\"y\\\":2}\",\"n\":5,\"z\":null}", .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    const obj = try callArguments(a, o.get("o"));
+    defer if (obj.owned) a.free(obj.text);
+    try testing.expectEqualStrings("{\"x\":1.5}", obj.text);
+    try testing.expect(obj.owned);
+    const str = try callArguments(a, o.get("s"));
+    try testing.expectEqualStrings("{\"y\":2}", str.text);
+    try testing.expect(!str.owned);
+    for ([_]?std.json.Value{ o.get("n"), o.get("z"), null }) |other| {
+        const c = try callArguments(a, other);
+        try testing.expectEqualStrings("{}", c.text);
+    }
 }

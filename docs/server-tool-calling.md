@@ -11,9 +11,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## The pipeline
 
 - With `tools`, tokens buffer for detection; thinking buffers separately. Parse chain strict → tolerant repairs →
-  truncation salvage, then the ONE chokepoint `reply.parseToolCallsForRequest` = parse → inferred-name filter →
-  parallel clamp → buried-param hoist → schema coercion (last two gated by `--no-tool-autocorrect`; emitted
-  `arguments` ALWAYS valid JSON).
+  truncation salvage, then the ONE chokepoint `reply.parseToolCallsForRequest` (body `tool_schema.parseForRequest`,
+  which `chat.replayTurn` runs too; `Origin.dialect` is the served template's, `chat.callDialect`) = parse →
+  inferred-name filter → parallel clamp → buried-param hoist → schema coercion (last two gated by
+  `--no-tool-autocorrect`; emitted `arguments` ALWAYS valid JSON).
 - **A call is a call wherever the generation puts it, on every surface** (`reply.toolReply`, `reply.Origin`): one the
   model wrote inside a prompt-opened thought it never closed ships, its markup cut out of `reasoning_content`
   (`splitThinkBlock`), since dropping it turns an agent turn into a bare `stop`; a call inside a thought that closed
@@ -222,9 +223,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - Nameless calls are discarded; XML function names reject empty placeholders and whitespace or tag fragments from prose.
 
+- **The served template's dialect is read first** (`chat.callDialect`: the template's own rendering of a call, `function_tag`
+  for Qwen and MiMo, `arg_key` for GLM, `dsml` for DeepSeek; none for a template that is no family, which reads the
+  families in the legacy order). The other families are read only when it finds no call, so a parameter VALUE carrying
+  another family's markup never decides the call. Every surface passes the dialect (`generation_stream` and
+  `responses_api`; `replayTurn` runs the same chokepoint).
+- **A value ends where its family's grammar ends it, never at the first close tag**: the first `</parameter>`,
+  `</arg_value>` or `</｜DSML｜ parameter>` that the next parameter or the call's close follows (`hermesParamEndsAt`,
+  `argValueEndsAt`, `dsmlParamEndsAt`); a close that another close follows is the value's own bytes. A value that forges
+  its own next parameter is the one ambiguity left.
+- **A parsed NAME is one identifier** (`isToolName`, applied after every tagged family and at the end): no line break,
+  no `<` or `>`; a call under a name that fails it is dropped, so another family's markup read as a name never ships.
 - **A `<tool_call>` body carrying `<function=` is the XML dialect and is read FIRST** (qwen 3.5+ template mandates
   it); a parameter VALUE never decides the call. A `<parameter>` VALUE may spell the dialect's own close tags
-  (`hermesValueEnd` = LAST `</parameter>` before the next opener). A Hermes value keeps its own whitespace
+  (`hermesValueEnd`). A Hermes value keeps its own whitespace
   (`stripHermesValueFraming`).
 - **Framing is removed only where the family writes it**: a newline-framed `<function=>` body (Qwen3.8) loses one
   newline per value side, an unframed one (MiMo) keeps the value verbatim, so a written file keeps its last newline.
@@ -247,6 +259,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **A `</think>` inside a tool ARGUMENT is payload** (`thinkCloseIsToolCallPayload`): decline a close whose nearest
   preceding tool opener is still OPEN AND whose block closes afterwards.
 - **Types come from the SCHEMA, never the value's spelling** (`coerceToolArgsToSchema`; undecidable → untouched).
+  A tag dialect's value (Qwen, GLM, `<invoke>`, DSML without `string="false"`) is the string the model wrote; with
+  `--no-tool-autocorrect` it ships as that string. Arguments are read with numbers kept as spelled
+  (`tool_schema.parseArgs`), so a rewrite never reprints one (`0.50` stays `0.50`); a request's JSON is re-written by
+  the one writer `json_text.appendValue`, and a history call's object `arguments` keep their JSON
+  (`json_text.callArguments`).
   A property's types resolve through `type` arrays, `anyOf`/`oneOf` (every branch), `allOf` (first typed branch) and
   a local `$ref` into `$defs`/`definitions` (depth-bounded); a value already fitting one candidate stays, else the
   candidates are tried in declaration order (`collectJsonTypes`).

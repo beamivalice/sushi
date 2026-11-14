@@ -29,6 +29,8 @@ pub fn shouldParseToolCalls(finish_details: ?[]const u8) bool {
 
 /// How the text came to be.
 pub const Origin = struct {
+    /// The served template's call dialect (`chat.callDialect`), read first; null reads the families in the legacy order.
+    dialect: ?tool_calls_mod.Dialect,
     /// The prompt ended inside a think block (`promptOpensThink`): text with no closer is reasoning.
     opens_think: bool = false,
     /// A stop sequence cut `text`: markup it left open is no call.
@@ -80,53 +82,14 @@ pub fn parseToolCallsForRequest(
 ) !?[]tool_schema.ParsedToolCall {
     // A stop that cut a call open left no complete call (the loop cut declines the same way).
     if (origin.stop_cut and think_tags.endsInsideToolCall(text)) {
-        noteUnparsedToolMarkup(text);
+        tool_schema.noteUnparsedToolMarkup(text);
         return null;
     }
-    var parsed_calls = try tool_calls_mod.parseToolCalls(allocator, text);
-    // Heuristically-inferred raw-JSON calls must name a DECLARED tool — a
-    // truncated data object ({"name": "George Washington", …}) is not a call.
-    // Deliberately NOT gated on g_tool_autocorrect: this corrects our own
-    // heuristic's false positive, not the model's output.
-    if (parsed_calls) |c| {
-        if (tools_json) |tj| parsed_calls = try tool_schema.filterInferredBySchema(allocator, c, tj);
-    }
-    var calls = parsed_calls orelse
-        (if (tools_json) |tj| try tool_schema.inferBareJsonToolCalls(allocator, text, tj) else null) orelse {
-        noteUnparsedToolMarkup(text);
-        return null;
-    };
-    if (!allow_parallel and calls.len > 1) {
-        log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});
-        for (calls[1..]) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        const kept = calls[0];
-        allocator.free(calls);
-        const one = try allocator.alloc(tool_schema.ParsedToolCall, 1);
-        one[0] = kept;
-        calls = one;
-    }
-    if (server_state.g_tool_autocorrect) {
-        if (tools_json) |tj| {
-            // Order matters: put a buried required param back where the schema
-            // says it lives BEFORE coercing types, so the hoisted value is
-            // type-checked like any other top-level arg.
-            try tool_schema.hoistMisplacedRequiredParams(allocator, calls, tj);
-            try tool_schema.coerceToolArgsToSchema(allocator, calls, tj);
-        }
-    }
-    return calls;
-}
-
-/// A reply whose tool markup gave no call goes out as text with the markup cut, and its turn ends as a plain stop:
-/// this line is the log's one trace of why.
-fn noteUnparsedToolMarkup(text: []const u8) void {
-    const at = think_tags.leakedToolMarkupStart(text) orelse return;
-    var quoted: [512]u8 = undefined;
-    const n = log.appendQuoted(&quoted, 0, text[at..], 96);
-    log.info("[tool-parse] tool markup parsed to no call and is cut from the reply: {d} bytes from byte {d}, {s}\n", .{ text.len - at, at, quoted[0..n] });
+    return tool_schema.parseForRequest(allocator, text, tools_json, .{
+        .allow_parallel = allow_parallel,
+        .autocorrect = server_state.g_tool_autocorrect,
+        .dialect = origin.dialect,
+    });
 }
 
 test "parseToolCallsForRequest coerces args to the schema (server-side chokepoint wiring)" {
@@ -141,7 +104,7 @@ test "parseToolCallsForRequest coerces args to the schema (server-side chokepoin
     ;
     const text = "<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n" ++
         "<parameter=file_path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{})).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -155,7 +118,7 @@ test "parseToolCallsForRequest coerces args to the schema (server-side chokepoin
     try std.testing.expect(ra == .bool); // coerced from the STRING "False"
     try std.testing.expectEqual(false, ra.bool);
     // Null tools_json path must still parse (no coercion, no crash).
-    const calls2 = try parseToolCallsForRequest(allocator, text, null, true, .{});
+    const calls2 = try parseToolCallsForRequest(allocator, text, null, true, .{ .dialect = null });
     defer if (calls2) |cs| {
         for (cs) |tc| {
             allocator.free(tc.name);
@@ -181,7 +144,7 @@ test "parseToolCallsForRequest hoists a misplaced required param (server-side ch
     const text = "<tool_call>{\"name\":\"edit\",\"arguments\":{\"edits\":[{\"newText\":\"new\",\"oldText\":\"old\"," ++
         "\"path\":\"us_presidents/generate_site.sh\"}]}}</tool_call>";
 
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{})).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -200,7 +163,7 @@ test "parseToolCallsForRequest hoists a misplaced required param (server-side ch
     // (unlike the inferred-name filter, which corrects our own heuristic).
     server_state.g_tool_autocorrect = false;
     defer server_state.g_tool_autocorrect = true;
-    const raw_calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{})).?;
+    const raw_calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })).?;
     defer {
         for (raw_calls) |tc| {
             allocator.free(tc.name);
@@ -228,7 +191,7 @@ test "parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim" {
 
     server_state.g_tool_autocorrect = false;
     defer server_state.g_tool_autocorrect = true; // restore the default for other tests
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{})).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -263,7 +226,7 @@ test "parseToolCallsForRequest: truncated DATA object is not promoted to a tool 
         "presidents = [\n" ++
         "  {\"name\": \"George Washington\", \"num\": 1, \"party\": \"None (Federalist-leaning)\", \"term\": \"1789\u{2013}1797\", \"vice\": \"John Adams\"},\n" ++
         "  {\"name\": \"John Adams\", \"num\": 2, \"party\": \"Federalist\",";
-    const calls = try parseToolCallsForRequest(allocator, text, tools, true, .{});
+    const calls = try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null });
     defer if (calls) |cs| {
         for (cs) |tc| {
             allocator.free(tc.name);
@@ -290,11 +253,11 @@ test "parseToolCallsForRequest: tool markup that parses to no call leaves one lo
     const wrecked = "I'll list the files.\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}inv\u{793c}oke name=\"bash\">\n" ++
         "<\u{ff5c}DSML\u{ff5c}parameter name=\"command\" string=\"true\">ls</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>";
     try log.openFile(log_path, 0);
-    const none = parseToolCallsForRequest(allocator, wrecked, tools, true, .{}) catch |e| {
+    const none = parseToolCallsForRequest(allocator, wrecked, tools, true, .{ .dialect = null }) catch |e| {
         log.closeFile();
         return e;
     };
-    const prose = parseToolCallsForRequest(allocator, "The files are listed above.", tools, true, .{}) catch |e| {
+    const prose = parseToolCallsForRequest(allocator, "The files are listed above.", tools, true, .{ .dialect = null }) catch |e| {
         log.closeFile();
         return e;
     };
@@ -317,7 +280,7 @@ test "parseToolCallsForRequest: raw-JSON call with a DECLARED name still parses"
         \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
     ;
     const text = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n```";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{})) orelse
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })) orelse
         return error.ExpectedToolCall;
     defer {
         for (calls) |tc| {
@@ -339,7 +302,7 @@ test "parseToolCallsForRequest: tag-format call with an UNDECLARED name is kept"
         \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
     ;
     const text = "<tool_call>{\"name\":\"searchWeb\",\"arguments\":{\"q\":\"zig\"}}</tool_call>";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{})) orelse
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })) orelse
         return error.ExpectedToolCall;
     defer {
         for (calls) |tc| {
@@ -363,7 +326,7 @@ test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST ca
         "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"b\"}}</tool_call>";
 
     // allow_parallel=true (default wiring): both calls survive.
-    const both = (try parseToolCallsForRequest(allocator, text, null, true, .{})).?;
+    const both = (try parseToolCallsForRequest(allocator, text, null, true, .{ .dialect = null })).?;
     defer {
         for (both) |tc| {
             allocator.free(tc.name);
@@ -374,7 +337,7 @@ test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST ca
     try std.testing.expectEqual(@as(usize, 2), both.len);
 
     // allow_parallel=false: only the FIRST survives, intact.
-    const one = (try parseToolCallsForRequest(allocator, text, null, false, .{})).?;
+    const one = (try parseToolCallsForRequest(allocator, text, null, false, .{ .dialect = null })).?;
     defer {
         for (one) |tc| {
             allocator.free(tc.name);
@@ -387,7 +350,7 @@ test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST ca
 
     // A single call with the flag off passes through untouched.
     const single_text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a\"}}</tool_call>";
-    const single = (try parseToolCallsForRequest(allocator, single_text, null, false, .{})).?;
+    const single = (try parseToolCallsForRequest(allocator, single_text, null, false, .{ .dialect = null })).?;
     defer {
         for (single) |tc| {
             allocator.free(tc.name);
@@ -408,7 +371,7 @@ test "parseToolCallsForRequest: MiniCPM5 V3 XML through the real server chokepoi
         \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
     ;
     const text = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{})) orelse
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })) orelse
         return error.ExpectedToolCall;
     defer {
         for (calls) |tc| {
@@ -449,7 +412,7 @@ test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma
     };
 
     for (cases) |c| {
-        const calls = (try parseToolCallsForRequest(allocator, c.text, c.tools, true, .{})) orelse {
+        const calls = (try parseToolCallsForRequest(allocator, c.text, c.tools, true, .{ .dialect = null })) orelse {
             std.debug.print("\n[{s}] no tool call parsed\n", .{c.name});
             return error.NoToolCall;
         };
@@ -527,12 +490,12 @@ test "a call inside a thought the prompt opened and the model never closed is a 
         defer testing.allocator.free(after);
         const inside = try std.mem.concat(testing.allocator, u8, &.{ "Maybe ", call, " no.\n</think>\n\nIt is sunny." });
         defer testing.allocator.free(inside);
-        try expectCalls(open, .{ .opens_think = true }, 1);
-        try expectCalls(after, .{ .opens_think = true }, 1);
+        try expectCalls(open, .{ .dialect = null, .opens_think = true }, 1);
+        try expectCalls(after, .{ .dialect = null, .opens_think = true }, 1);
         // A call inside a thought that closed stays skipped.
-        try expectCalls(inside, .{ .opens_think = true }, 0);
+        try expectCalls(inside, .{ .dialect = null, .opens_think = true }, 0);
 
-        const reply = (try toolReply(testing.allocator, open, test_tools, true, .{ .opens_think = true })).?;
+        const reply = (try toolReply(testing.allocator, open, test_tools, true, .{ .dialect = null, .opens_think = true })).?;
         defer reply.deinit(testing.allocator);
         try testing.expectEqualStrings("get_weather", reply.calls[0].name);
         try testing.expectEqualStrings("", reply.preamble);
@@ -550,10 +513,10 @@ test "a stop that cut a call open leaves no call, in every dialect" {
         "<|tool_call>call:write_file{path:<|\"|>notes.md<|\"|>,content:<|\"|>line one\n",
     };
     for (cut) |text| {
-        try expectCalls(text, .{ .stop_cut = true }, 0);
+        try expectCalls(text, .{ .dialect = null, .stop_cut = true }, 0);
         // Without a stop the same text is a length cut, whose salvage ships as it did.
         errdefer std.debug.print("salvage changed for {f}\n", .{std.zig.fmtString(text)});
-        try expectCalls(text, .{}, 1);
+        try expectCalls(text, .{ .dialect = null }, 1);
     }
 }
 
@@ -564,5 +527,5 @@ test "a stop after a call closed leaves the call" {
         "<|tool_call>call:get_weather{city:<|\"|>Tokyo<|\"|>}<tool_call|>",
         "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     };
-    for (whole) |text| try expectCalls(text, .{ .stop_cut = true }, 1);
+    for (whole) |text| try expectCalls(text, .{ .dialect = null, .stop_cut = true }, 1);
 }
