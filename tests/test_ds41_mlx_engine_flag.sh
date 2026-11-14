@@ -3,6 +3,7 @@
 # `--ds41-mlx-engine` takes no value: it passes the parser (a stray value after it is the next argument, not its
 # own), and `--help` lists it with Sushi Cooler's name and the report link. Hermetic: the model path never exists.
 set -uo pipefail
+. "$(dirname "$0")/private_cache.sh"
 
 BIN=${SUSHI_BIN:-zig-out/bin/sushi}
 [ -x "$BIN" ] || { echo "FAIL: missing binary $BIN" >&2; exit 1; }
