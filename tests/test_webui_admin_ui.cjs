@@ -303,20 +303,6 @@ async function main() {
     }
 
     {
-      // A pack the engine cannot serve shows the key disabled, unticked, with the reason (Advanced lists a disabled key).
-      const server = makeServer({ limits: true });
-      server.state.models[2].keys = BASE_KEYS;
-      server.state.models[2].limits = { ds41_cooler: { disabled: true, why: 'This pack is not STQ: Sushi Cooler has no kernels for its FP8 trunk and MXFP4 experts, so decode runs on MLX.' } };
-      const { page, context } = await open(browser, server, '/models#Deep-C', { mode: 'advanced' });
-      const box = `${row('ds41_cooler')} input[type="checkbox"]`;
-      await page.waitForSelector(box);
-      assert.equal(await page.isDisabled(box), true);
-      assert.equal(await page.isChecked(box), false, 'it does not pretend the engine is in use');
-      assert.match(await page.textContent(`${row('ds41_cooler')} .help`), /not STQ/);
-      await context.close();
-    }
-
-    {
       // The user's choice for the "More settings" fold, and the model they picked, survive polls.
       const server = makeServer();
       const { page, context } = await open(browser, server, '/models#Qwen-A', { mode: 'advanced' });

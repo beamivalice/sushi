@@ -3,7 +3,6 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const flags = @import("../arch/flags.zig");
-const model_settings = @import("../model_settings.zig");
 const expert_usage = @import("../expert_usage.zig");
 const repack = @import("repack.zig");
 const borrow = @import("dsv41_borrow.zig");
@@ -67,12 +66,6 @@ pub const drop_expert_elsewhere = "--drop-expert has no effect on this model: on
 pub const cooler_setting_elsewhere = "model-settings.json ds41_cooler is ignored: only deepseek_v41 runs on Sushi Cooler";
 
 pub const mlx_engine_elsewhere = "--ds41-mlx-engine has no effect on this model: only deepseek_v41 runs on Sushi Cooler; drop the flag";
-
-/// Why decode cannot run on Sushi Cooler for this pack; null when its experts and trunk are STQ. Any GPU serves them.
-pub fn coolerUnavailable(config: *const model.ModelConfig) ?[]const u8 {
-    const c = config.dsv41 orelse return null;
-    return if (c.expert_dec != null and c.trunk_dec != null) null else model_settings.cooler_why_not_stq;
-}
 
 pub const settings_kv_quant_ignored = "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";
 

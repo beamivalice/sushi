@@ -136,14 +136,6 @@ fn mlxEngineElsewhere() []const u8 {
     return "--ds41-mlx-engine has no effect on this model; drop the flag";
 }
 
-/// Why Sushi Cooler cannot serve this config's pack or Mac; empty where it can, and where the arch has none.
-fn coolerWhy(config: *const model.ModelConfig) []const u8 {
-    const tag = arch_config.tagOf(config) orelse return "";
-    switch (tag) {
-        inline else => |t| return if (comptime hasDecl(t, "coolerUnavailable")) flagsOf(t).coolerUnavailable(config) orelse "" else "",
-    }
-}
-
 /// The facts `model_settings.applies` decides a key's reach from, so the settings API and the loader's ignored-key lines agree.
 pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
     const unserved = arch_config.fact(config, "mtp_unserved");
@@ -160,7 +152,6 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .context_cap = config.contextCap(),
         .reads_yarn = arch_config.fact(config, "reads_yarn"),
         .cooler_offered = admission.expertStream(config).cooler,
-        .cooler_why = coolerWhy(config),
     };
 }
 

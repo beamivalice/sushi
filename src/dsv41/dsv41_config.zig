@@ -143,6 +143,9 @@ pub const Config = struct {
     trunk_dec: ?sushi_exl3.format.Decode = null,
     /// Stamped at the load from `--ds41-mlx-engine` and the model's `ds41_cooler`; config.json never carries it.
     mlx_ask: MlxAsk = .none,
+    /// A test names the side its load decodes on, before the load; every copy of the load's config carries it for the
+    /// load's life. A served load never sets it.
+    cooler_for_test: ?bool = null,
 
     pub fn isDsparkTarget(self: *const Config, l: usize) bool {
         for (self.dspark.targets[0..self.dspark.n_targets]) |t| if (t == l) return true;

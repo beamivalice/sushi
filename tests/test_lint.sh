@@ -27,6 +27,19 @@ expect_red() { # <what> <text the report holds>
 }
 expect_green() { lint || fail "$1 should pass"; [ ! -s "$TMP/out" ] || fail "$1 should print nothing"; }
 
+# rule shape-offset-write
+tree
+printf '%s\n' 'const max_dims = 8;' 'fn f(dims: []const c_int) void {' '    var shape: [max_dims]c_int = undefined;' '    @memcpy(shape[1..][0..dims.len], dims);' '}' > "$TMP/t/src/p.zig"
+expect_red "an offset write into a shape buffer" "src/p.zig:4:5 \[shape-offset-write\] f: @memcpy into shape buffer 'shape' at an offset"
+
+tree
+printf '%s\n' 'const core = struct { const max_dims = 8; };' 'fn g(dims: []const c_int, at: usize) void {' '    var s: [core.max_dims]c_int = undefined;' '    @memcpy(s[at..][0..dims.len], dims);' '}' > "$TMP/t/src/p.zig"
+expect_red "an offset write into a core.max_dims buffer" "\[shape-offset-write\] g: @memcpy into shape buffer 's'"
+
+tree
+printf '%s\n' 'const max_dims = 8;' 'fn h(dims: []const c_int) void {' '    var shape: [max_dims]c_int = undefined;' '    @memcpy(shape[0..dims.len], dims);' '    _ = shape;' '}' > "$TMP/t/src/p.zig"
+expect_green "a write from axis 0"
+
 # rule const-write
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn f(self: *const S) void {' '    @constCast(self).x = 1;' '}' > "$TMP/t/src/p.zig"

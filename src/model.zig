@@ -2344,12 +2344,18 @@ pub const TensorArray = struct {
 /// below it, the scratch copy into a fresh MLX buffer costs less than a page per tensor.
 pub var import_min_bytes: usize = 1 << 20;
 
+/// The size from which the load maps a weight: every weight when the engine of our own holds the weights, since a
+/// weight in its pool would sit under every forward's cap; `import_min_bytes` when MLX does.
+pub fn importFloor(engine_weights: bool) usize {
+    return if (engine_weights) 1 else import_min_bytes;
+}
+
 /// `len` bytes at `offset` as a `shape`/`dtype` array, read around the file cache with the read
 /// and copy of its chunks spread over several threads (`expert_io.ParallelReader`). A large tensor
 /// lands at offset 0 of an anonymous mapping MLX imports as its buffer: a view at an offset
 /// inside a buffer is not safe in this engine. Caller frees `array`.
 pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset: u64, len: usize, shape: []const c_int, dtype: mlx.mlx_dtype) !TensorArray {
-    if (len < import_min_bytes) {
+    if (len == 0 or len < importFloor(mlx.engine.own_weights)) {
         const host = try reader.allocator.alloc(u8, @max(len, 1));
         defer reader.allocator.free(host);
         try reader.fill(fd, host[0..len], offset);
@@ -2457,9 +2463,13 @@ fn wrapRegion(region: *MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype)
     return .{ .array = array, .aliased = mlx.mlx_array_data_uint8(array) == ptr };
 }
 
-/// `region` as an evaluated `shape`/`dtype` array whose buffer is the region itself; the region goes with the array.
-/// A mapping Metal refuses is copied by MLX into its own allocator, which is `error.OwnedImportCopied`.
-pub fn wrapOwned(region: *MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+/// `held.*` as an evaluated `shape`/`dtype` array whose buffer is the region itself. The region is taken, and `held`
+/// nulled, before anything can fail: on success it goes with the array, on failure it is already released, so a
+/// caller's `errdefer` over `held` frees nothing twice. A mapping Metal refuses is copied by MLX into its own
+/// allocator, which is `error.OwnedImportCopied`.
+pub fn wrapOwned(held: *?*MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    const region = held.*.?;
+    held.* = null;
     const wrapped = try wrapRegion(region, shape, dtype);
     if (wrapped.aliased) return wrapped.array;
     _ = refused_imports.fetchAdd(1, .monotonic);
@@ -4339,8 +4349,9 @@ test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned b
     const spans_start = ownedRegionCount();
 
     // The control: a page-aligned region is imported as it is.
-    const good = try ownedRegion(100);
-    const kept = try wrapOwned(good, &.{100}, .uint8);
+    var good: ?*MappedRegion = try ownedRegion(100);
+    const kept = try wrapOwned(&good, &.{100}, .uint8);
+    try testing.expect(good == null);
     try testing.expect(ownsPointer(mlx.mlx_array_data_uint8(kept)));
     try testing.expectEqual(start + expert_io.pageRoundUp(100), owned_bytes.load(.monotonic));
     _ = mlx.mlx_array_free(kept);
@@ -4348,8 +4359,9 @@ test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned b
     try testing.expectEqual(spans_start, ownedRegionCount());
 
     // Empty.
-    const empty = try ownedRegion(1);
-    try testing.expectError(error.OwnedImportCopied, wrapOwned(empty, &.{0}, .uint8));
+    var empty: ?*MappedRegion = try ownedRegion(1);
+    try testing.expectError(error.OwnedImportCopied, wrapOwned(&empty, &.{0}, .uint8));
+    try testing.expect(empty == null);
     try testing.expectEqual(start, owned_bytes.load(.monotonic));
     try testing.expectEqual(refused + 1, refused_imports.load(.monotonic));
 }

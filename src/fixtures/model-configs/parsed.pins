@@ -423,6 +423,7 @@ dsv41.image_token_id=129264
 dsv41.expert_dec=null
 dsv41.trunk_dec=null
 dsv41.mlx_ask=.none
+dsv41.cooler_for_test=null
 serve_defaults.context=1000000
 serve_defaults.max_tokens=256000
 serve_defaults.ram_budget=true

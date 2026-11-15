@@ -110,10 +110,11 @@ pub const parseConfig = config_file.parseFamily;
 
 pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {
     const source = @import("dsv41_source.zig");
+    const engine = @import("dsv41_borrow.zig").ownDecode(&config.dsv41.?);
     return .{
-        .trunk = try source.residentBytes(io, allocator, model_dir),
-        .mtp = if (config.dsv41.?.dspark.block > 0) try source.dsparkBytes(io, allocator, model_dir) else 0,
-        .vision = if (config.has_vision) try source.visionBytes(io, allocator, model_dir, @import("../vision_common.zig").vision_bf16) else 0,
+        .trunk = try source.residentBytes(io, allocator, model_dir, engine),
+        .mtp = if (config.dsv41.?.dspark.block > 0) try source.dsparkBytes(io, allocator, model_dir, engine) else 0,
+        .vision = if (config.has_vision) try source.visionBytes(io, allocator, model_dir, @import("../vision_common.zig").vision_bf16, engine) else 0,
     };
 }
 
@@ -140,7 +141,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
 pub const ownStream = dsv41_prefix.arraysOn;
 
 pub fn deinit(xfm: Model) void {
-    const held = if (xfm.arch_state.dsv41.model) |m| m.engine_decode else false;
+    const held = if (xfm.arch_state.dsv41.model) |m| m.onEngine() else false;
     xfm.arch_state.dsv41.deinit(xfm.allocator);
     xfm.deinitTrunk();
     if (!held) return;

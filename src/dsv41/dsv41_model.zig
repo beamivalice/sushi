@@ -779,14 +779,9 @@ pub const Model = struct {
     /// A decode forward queues layer 0 behind the computation of its token before the host reads it (`extendLazy`);
     /// off, the token is read first (the tests' oracle).
     lazy_start: bool = true,
-    /// Decode forwards (one row, DSpark draft, verify rows) run on the engine of our own (`src/tensor`), not on MLX:
-    /// `dsv41_borrow.ownDecode` at the load.
-    engine_decode: bool = false,
     /// `ownBegin`s open on this model, and whether the engine's scope was open before the first of them.
     own_depth: u32 = 0,
     own_side: mlx.engine.Makers = .{ .was = false },
-    /// Prefill chunks wider than a verify block run there too: set with `engine_decode` at the load.
-    engine_prefill: bool = false,
     /// Decode forwards that queued layer 0 ahead of their token.
     lazy_starts: u64 = 0,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
@@ -939,6 +934,12 @@ pub const Model = struct {
         return o;
     }
 
+    /// Whether this model's forwards (decode, DSpark rounds and prefill chunks of every width) run on the engine of our
+    /// own (`src/tensor`), not on MLX: the side its load decided (`dsv41_borrow.ownDecode`), for its whole life.
+    pub fn onEngine(self: *const Model) bool {
+        return @import("dsv41_borrow.zig").ownDecode(&self.cfg);
+    }
+
     /// Frees `x`, an array the model owns, ahead of `deinit`.
     fn disown(self: *Model, x: A) void {
         for (self.owned.items, 0..) |a, i| if (a.ctx == x.ctx) {
@@ -1020,6 +1021,11 @@ fn loadLin(m: *Model, w: *model_mod.Weights, base: []const u8, dense: ?mlx.mlx_d
         var codes = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_view(&codes, wt, .uint32, m.s));
         _ = try m.own(codes);
+        // A scale is a weight: built on the host, never an op's result in the pool a forward is capped by.
+        if (try owned_mod.repeatRows(scales, out)) |rows| {
+            try evalAll(&.{codes});
+            return .{ .w = codes, .s = try m.own(rows) };
+        }
         var rep = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(rep);
         try mlx.check(mlx.mlx_repeat_axis(&rep, scales, 32, 0, m.s));
@@ -1143,12 +1149,18 @@ fn loadBank(m: *Model, w: *model_mod.Weights, pfx: []const u8, id: usize, compti
     }
     var out: Bank = .{ .w = undefined, .s = undefined };
     inline for (.{ .{ "w", codes }, .{ "s", scales } }) |f| {
-        const vec = mlx.mlx_vector_array_new_data(f[1].ptr, f[1].len);
-        defer _ = mlx.mlx_vector_array_free(vec);
-        var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_stack_axis(&o, vec, 0, m.s));
-        @field(out, f[0]) = try m.own(o);
-        try mlx.check(mlx.mlx_array_eval(o));
+        // A bank is a weight: on the engine an op would make it in the pool a forward is capped by.
+        if (try owned_mod.stack(f[1], .experts)) |stacked| {
+            m.built.stacks += mlx.mlx_array_size(stacked) * mlx.mlx_array_itemsize(stacked);
+            @field(out, f[0]) = try m.own(stacked);
+        } else {
+            const vec = mlx.mlx_vector_array_new_data(f[1].ptr, f[1].len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_stack_axis(&o, vec, 0, m.s));
+            @field(out, f[0]) = try m.own(o);
+            try mlx.check(mlx.mlx_array_eval(o));
+        }
     }
     for (0..experts) |e| {
         var b1: NameBuf = undefined;
@@ -1395,9 +1407,10 @@ pub fn logMemory(m: *const Model) void {
         }
     }.of;
     const a = memoryAudit(m) catch |e| return log.warn("[dsv41-mem] audit failed: {s}\n", .{@errorName(e)});
-    log.info("[dsv41-mem] owned {d:.2} GB in {d} regions (built here: DSpark storage {d:.2}, f32 widenings {d:.2}, shared stacks {d:.2}), MLX-owned weights {d:.2} GB in {d} arrays ({d} of 1 MiB or more), refused {d}\n", .{
+    log.info("[dsv41-mem] owned {d:.2} GB in {d} regions (built here: DSpark storage {d:.2}, f32 widenings {d:.2}, shared stacks {d:.2}), MLX-owned weights {d:.2} GB in {d} arrays ({d} of 1 MiB or more), in the engine's pool {d:.4} GB in {d} arrays, refused {d}\n", .{
         gb(model_mod.owned_bytes.load(.monotonic)), model_mod.ownedRegionCount(), gb(m.built.ragged), gb(m.built.widened),                        gb(m.built.stacks),
-        gb(a.mlx_bytes),                            a.mlx_arrays,                 a.mlx_large,        model_mod.refused_imports.load(.monotonic),
+        gb(a.mlx_bytes),                            a.mlx_arrays,                 a.mlx_large,        gb(a.pool_bytes),
+        a.pool_arrays,                              model_mod.refused_imports.load(.monotonic),
     });
 }
 
@@ -1421,6 +1434,9 @@ fn initEngram(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !void {
         try mlx.check(mlx.mlx_multiply(&prod, qw, kw, m.s));
         _ = try m.own(prod);
         try mlx.check(mlx.mlx_array_eval(prod));
+        // Only the product is read.
+        m.disown(qw);
+        m.disown(kw);
         var table = try engram.Table.open(m.gpa, dir_path, l, e.rows[i], e.head_dim);
         errdefer table.close();
         const rows = @min(engram.cache_rows, e.rows[i]);
@@ -1437,7 +1453,7 @@ fn closeEngram(e: *EngramLayer) void {
 
 /// Where a request's state is made, copied and viewed: the engine's stream on a load whose forwards run there.
 pub fn stateStream(m: *const Model) S {
-    return if (m.engine_decode) mlx.engine.stream() else m.s;
+    return if (m.onEngine()) mlx.engine.stream() else m.s;
 }
 
 pub fn newState(m: *const Model) !State {
@@ -3045,7 +3061,7 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
     var ids: [exl3.kernels.DECODE_ROWS_MAX]u32 = undefined;
     for (&ids, 0..) |*t, i| t.* = @intCast(i % m.cfg.vocab);
     // With decode on the engine, MLX runs no forward, so only the engine's decode widths are warmed.
-    if (!m.engine_decode) {
+    if (!m.onEngine()) {
         // The first steps hold one compressed row a layer: an input under 8 elements binds as another library.
         for ([_]usize{ 1, 1, 2 }) |w| try warmRun(try extend(m, ids[0..w], .last));
         for (1..ids.len + 1) |w| try warmRun(try extend(m, ids[0..w], .last));
@@ -3063,21 +3079,21 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
     // Where prefill is the engine's, MLX runs no forward at all: with the engine's pipelines read from a manifest there
     // is nothing left to warm, and without one these chunks run on the engine and leave the state its other warms
     // start from.
-    if (m.engine_prefill and scope == .mlx) return;
+    if (m.onEngine() and scope == .mlx) return;
     // The last is the held-back span a prompt's last forward runs (`prefill_plan.ssmSnapshotBackoff` + its last token).
     for ([_]usize{ n, n / 6, @import("../prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1 }) |w| {
-        const was = if (m.engine_prefill) ownBegin(m) else m.s;
+        const was = if (m.onEngine()) ownBegin(m) else m.s;
         warmBudget(m, w);
         const chunk = extend(m, wide[0..w], .last);
-        if (m.engine_prefill) ownEnd(m, was);
+        if (m.onEngine()) ownEnd(m, was);
         try warmRun(try chunk);
     }
-    if (!m.engine_decode) {
+    if (!m.onEngine()) {
         for ([_]usize{ 1, 6 }) |w| try warmRun(try extend(m, ids[0..w], .last));
         if (m.dspark != null) try warmRound(m, ids[0], m.cfg.dspark.block + 1);
     }
     // The engine's kernels have one signature each, so the widths it ran above are not other pipelines here.
-    if (m.engine_decode and scope == .all) {
+    if (m.onEngine() and scope == .all) {
         try warmOwnFills(m, ids[0]);
         try warmOwnBlocks(m, ids[0]);
         try warmOwnLong(m, ids[0]);
@@ -3162,10 +3178,10 @@ fn warmOwnBlocks(m: *Model, t1: u32) !void {
     defer m.gpa.free(ctx);
     for (ctx, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % c.vocab);
     // The context is a prefill chunk: the engine's where prefill is, as in a request.
-    const was = if (m.engine_prefill) ownBegin(m) else m.s;
+    const was = if (m.onEngine()) ownBegin(m) else m.s;
     warmBudget(m, rows);
     const chunk = extend(m, ctx, .last);
-    if (m.engine_prefill) ownEnd(m, was);
+    if (m.onEngine()) ownEnd(m, was);
     try warmRun(try chunk);
     // The indexer's kernels are the same under either schedule of the routed chains.
     try warmOwn(m, t1, .queued);
@@ -3176,7 +3192,7 @@ fn warmOwnBlocks(m: *Model, t1: u32) !void {
 /// and, as `warmOwnBlocks`, fewer blocks kept: neither count is a kernel's template value.
 fn warmOwnStream(m: *Model) !void {
     const c = &m.cfg;
-    if (!m.engine_prefill) return;
+    if (!m.onEngine()) return;
     const tile = indexStreamTileMin(m);
     var r_min: usize = std.math.maxInt(usize);
     var r_max: usize = 0;
@@ -3239,6 +3255,25 @@ fn warmOwn(m: *Model, t1: u32, schedules: enum { both, queued }) !void {
             warmBudget(m, 1);
             try warmRun(try extend(m, &.{t1}, .last));
         }
+        // Without a drafter no verify warms the narrow widths a prompt's tail or a cached turn's last forward takes;
+        // a short prompt's first forward also meets a state of no compressed row or one, which takes other kernels.
+        if (m.dspark == null) {
+            const tail: [exl3.kernels.DECODE_ROWS_MAX]u32 = @splat(t1);
+            for (2..tail.len + 1) |w| {
+                warmBudget(m, w);
+                try warmRun(try extend(m, tail[0..w], .last));
+            }
+            for (0..2) |lead| for (2..tail.len + 1) |w| {
+                resetState(m);
+                if (lead > 0) {
+                    warmBudget(m, lead);
+                    try warmRun(try extend(m, tail[0..lead], .last));
+                }
+                warmBudget(m, w);
+                try warmRun(try extend(m, tail[0..w], .last));
+            };
+            resetState(m);
+        }
         if (m.dspark != null) for (1..cfg_mod.ring_slack + 1) |w| try warmRound(m, t1, w);
         // A round whose rows fall on two sides of an attention split step launches them apart, on pipelines that carry
         // its row count: no context of the warm reaches a step, so the rounds are told to.
@@ -3268,7 +3303,7 @@ fn warmRound(m: *Model, t1: u32, w: usize) !void {
 /// load without the image bias takes no image and warms nothing.
 pub fn warmOwnImages(m: *Model) !void {
     const c = &m.cfg;
-    if (!m.engine_decode or c.image_token_id == 0) return;
+    if (!m.onEngine() or c.image_token_id == 0) return;
     for (m.layers[0..c.layers]) |*ly| if (ly.gate_bias_vl.ctx == null) return;
     resetState(m);
     defer resetState(m);
@@ -3291,7 +3326,7 @@ pub fn warmOwnImages(m: *Model) !void {
 
 /// While the load's warm runs, the engine budget a request's forward of `rows` at the state's position has.
 pub fn warmBudget(m: *const Model, rows: usize) void {
-    if (!m.engine_decode) return;
+    if (!m.onEngine()) return;
     const at = if (m.dec_state) |st| st.n else 0;
     dsv41_borrow.enterWarmMlx(rows, at + rows, &m.cfg);
 }
@@ -5571,7 +5606,7 @@ test "dsv41 DSpark bills: the load's resident bytes and the state's windows are 
     defer with.deinit();
     const without = try tinyModel(dir, .{ .act = .bfloat16 }, cpu);
     defer without.deinit();
-    try testing.expectEqual(try source.dsparkBytes(io, testing.allocator, dir), dsparkHeldBytes(with));
+    try testing.expectEqual(try source.dsparkBytes(io, testing.allocator, dir, false), dsparkHeldBytes(with));
     try testing.expect(source.shipsDspark(io, testing.allocator, dir));
 
     var st_with = try newState(with);

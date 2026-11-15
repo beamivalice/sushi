@@ -215,18 +215,28 @@ change, M5 Max, GPU lock held, QUIET, `taskpolicy -a`):
 ## Weight memory sushi owns
 
 The weight load builds every long-lived weight of 1 MiB or more in a mapping of its own that MLX imports without a copy
-(`model.ownedRegion` and `wrapOwned`); `/props` `memory.owned_bytes` and the `[dsv41-mem]` load line report it.
+(`model.ownedRegion` and `wrapOwned`); a Cooler load maps every weight, whatever its size (`model.importFloor`), since a
+weight in the engine's pool sits under every forward's cap, which counts what tensors ask, not the size classes they
+take. `/props` `memory.owned_bytes` and the `[dsv41-mem]` load line report it, the pool's share apart.
+- `model.wrapOwned` takes the caller's region handle and nulls it before anything can fail, so a builder's
+  `errdefer` over the handle never frees a region the wrap has released (a failed wrap of a stack crashed on it).
 - A shard tensor is read into its mapping (`readTensorArray`); the weight load refuses one MLX copied instead
   (`OwnedImportCopied`), since a copy would sit outside the ledger.
 - The DSpark stage's trellis experts are nine regions (trellis, `suh`, `svh` per projection), the groups' bytes back to
   back, copied on the host; each group's source is dropped after its copy, so a stage's load peak is its storage plus
   one group (`dsv41_owned.raggedOwned`, into `Ragged.initPools`).
-- f32 widenings (bf16 to f32 is the bits shifted up, as MLX's cast) and the fused-stack bank of `fuseShared` are built
-  in regions; the slices into the stack stay views.
-- Left in MLX: tensors under 1 MiB, the meta tables, the rope tables, Engram's q.k product and the vision tower's
-  requantized codes ([above](#vision-requant)).
-- The bill (`dsv41_source.sumBytes`) rounds each tensor from 1 MiB, and each DSpark (stage, projection, part) as one
-  region, up to the page. MLX refuses no page-aligned mapping; it also accepts a start inside a page, so the
+- The DSpark stage's mxfp4 experts (the release's layout) are six regions (codes and scales per projection), every
+  expert's bytes back to back, copied on the host (`dsv41_owned.stack`, `.experts`). An op would make the bank in the
+  engine's pool on a Cooler load, where a forward's cap would count it (7.5 GB on the release pack).
+- f32 widenings (bf16 to f32 is the bits shifted up, as MLX's cast), the fp8 block scales repeated down their 32 rows
+  (`dsv41_owned.repeatRows`) and the fused-stack bank of `fuseShared` are built in regions; the slices stay views.
+- Left outside the regions (MLX's, or the engine's pool on a Cooler load): tensors under the floor, the meta tables, the
+  rope tables, Engram's q.k product (its q and k are dropped once it is made) and the vision tower's requantized codes
+  ([above](#vision-requant)), billed at the pool's size classes on a Cooler load.
+- The bill (`dsv41_source.sumBytes`, per side) rounds each tensor from the load's floor, and each DSpark (stage,
+  projection, part) as one region (a bank under the floor is a stack's, at its stored bytes), up to the page. It holds
+  a pooling compressor's weights and Engram's product in f32. A test holds the bill to what each side's load of the
+  release layout holds (`the trunk bill is what the release layout's load holds`). MLX refuses no page-aligned mapping; it also accepts a start inside a page, so the
   `OwnedImportCopied` check is the data-pointer test, not an alignment rule.
 
 ## Plans that lost

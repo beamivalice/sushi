@@ -144,6 +144,9 @@ Found while holding the engine of our own to MLX's bytes ([engine-own-forward](e
   result therefore changes with the rows beside it: DeepSeek's router (rows x 384 experts over 5,120 channels)
   switched at about 1,707 rows, between a 1,024-row and a 2,048-row prefill chunk. A product whose rows must not
   depend on their company runs in fixed tiles ([dsv41-arch](dsv41-arch.md#prefill-width)).
+- **A sorted `gather_qmm` over an x broadcast to the ids computes one row** (`GatherQMM::eval_gpu` passes the x before
+  its broadcast, `x.size() / K`, as `gather_qmm_rhs`'s M): the other rows are what MLX's allocator held. The engine
+  computes every pair, MLX's bytes for the x broadcast explicitly; no served forward broadcasts there.
 - **A scan (`cumsum`) picks its kernel by the scanned axis's stride**: one element, the kernel of contiguous rows; any
   other, the strided one, which sums floats in another order. A view that fills its memory (a transpose) is scanned
   where it lies, one with gaps or a broadcast as a row-major copy.

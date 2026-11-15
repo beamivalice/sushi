@@ -721,6 +721,14 @@ pub fn quantizedBytes(out: u64, in: u64, group: u64) u64 {
     return out * in * QUANT_BITS / 8 + 2 * 2 * out * (in / group);
 }
 
+/// `quantizedBytes` as a load holds them: on the engine of our own the codes, scales and biases are each a pool
+/// tensor of its size class.
+pub fn quantizedHeldBytes(out: u64, in: u64, group: u64, engine: bool) u64 {
+    if (!engine) return quantizedBytes(out, in, group);
+    const side = 2 * out * (in / group);
+    return mlx.engine.poolBytes(out * in * QUANT_BITS / 8) + 2 * mlx.engine.poolBytes(side);
+}
+
 /// `raw` (a bf16 `[out, in]` matrix) as evaluated affine 8-bit codes of `group`; the caller owns `raw` and the result.
 pub fn requantize(raw: mlx.mlx_array, group: u32, s: mlx.mlx_stream) !dflash.DflashLinear {
     var q = try dflash.quantizeDense(raw, QUANT_BITS, group, s);

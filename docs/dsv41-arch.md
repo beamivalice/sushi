@@ -14,11 +14,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 - Off, by name: `--kv-quant` (the state is the activation dtype;
   `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` or `--mtp-greedy-tail` refuses the load (DSpark accepts by the exact rule only), a settings `kv_quant`, `mtp_acceptance` or `mtp_greedy_tail` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
   ([below](#dspark)), the checkpoint's own drafter, on by default like every served MTP head; `--no-mtp` turns it off.
-- An STQ pack's decode forwards run on the engine of our own (shipped as Sushi Cooler) on any GPU, the SIMD arms where
-  there are no matrix units, and on MLX for any other pack or when the user opts out with `--ds41-mlx-engine` or the
-  model's `ds41_cooler: false` (flag, then file, then on); the load line says which and why
-  ([engine-own-forward](engine-own-forward.md#where-it-serves)). The ask is decided in `dsv41_borrow.decodeSide`
-  (`.mlx_by_flag`, `.mlx_by_setting`), after the pack: a pack the engine cannot serve keeps its own reason. The
+- Every pack's forwards, STQ or the release's own FP8 trunk and MXFP4 experts, run on the engine of our own (shipped
+  as Sushi Cooler) on any GPU, the SIMD arms where there are no matrix units, and on MLX only when the user opts out
+  with `--ds41-mlx-engine` or the model's `ds41_cooler: false` (flag, then file, then on); the load line says which and
+  why ([engine-own-forward](engine-own-forward.md#where-it-serves)). The ask is decided in `dsv41_borrow.decodeSide`
+  (`.mlx_by_flag`, `.mlx_by_setting`). The
   no-matrix-unit path is proven on an M5 dispatching as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`); no real
   M1 to M4 run (thread grants, speed, host CPU) is recorded yet.
 - Routed experts always stream: 289 GB of FP4 against a 128 GB box. `--ssd-budget-gb` (or `ssd_budget_gb` in
@@ -1306,11 +1306,10 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   (`Dsv41Vision.useEngine`), byte for byte what MLX's stream gives: the requantized linears, the fused attention and the
   aligner's erf are MLX's own kernels launched by the engine (`quantized.zig`, `attention.zig`, `stock.erf`), and
   a pass adds no MLX op and no lend (the weights are imported). `--ds41-mlx-engine` or `ds41_cooler: false` keeps the
-  tower on MLX. Only the shapes an image reaches are ported, and the load checks that (`engineGap`): the images the
-  release processor admits give the tower 1,084 to 9,198 patches and 164 to 1,022 aligner cells, against the 257 rows
-  (33 for the aligner) from which MLX's plan is the matrix-unit tile the engine runs, so MLX's vector kernels and
-  split-K plan are reached by no request. A pack whose vision config could reach them, or a head dimension but 64,
-  refuses a Cooler load by name (`VisionTowerNotPorted`, with the shape found); the MLX route serves it. In a request
+  tower on MLX. Every plan MLX picks for the requantized linears is ported; the attention's shapes are checked at the
+  load (`engineGap`): the images the release processor admits give the tower 1,084 to 9,198 patches and 164 to 1,022
+  aligner cells. A pack whose vision config admits an image of fewer keys than a vector attention chunk, or a head
+  dimension but 64, refuses a Cooler load by name (`VisionTowerNotPorted`, with what was found); the MLX route serves it. In a request
   the engine's pool runs under the encode's bill (`visionEncodeBill`, installed by `dsv41_borrow.enterVision`) from the
   first pass to the image queue's join of the spans, as MLX's transient cap does on the MLX route; a pass outside a
   request (the load's warm) runs under the pool budget of `encodeScratchBytes`. Each pass trims the pool at its end.

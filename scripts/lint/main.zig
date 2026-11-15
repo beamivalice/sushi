@@ -27,6 +27,7 @@ const rules = .{
     @import("device_probe.zig"),
     @import("log_line_end.zig"),
     @import("reply_bypass.zig"),
+    @import("shape_offset_write.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

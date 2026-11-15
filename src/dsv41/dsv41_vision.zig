@@ -23,7 +23,6 @@ const transient_peak = @import("transient_peak.zig");
 const dflash = @import("../dflash.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
 const dsv41_pipelines = @import("dsv41_pipelines.zig");
-const quantized = @import("../tensor/quantized.zig");
 const matmul = @import("../tensor/matmul.zig");
 const attention_plan = @import("../tensor/attention.zig");
 const metal = @import("../metal.zig");
@@ -222,11 +221,15 @@ pub fn quantizedBytes(out: u64, in: u64) u64 {
     return common.quantizedBytes(out, in, QUANT_GROUP);
 }
 
+pub fn quantizedHeldBytes(out: u64, in: u64, engine: bool) u64 {
+    return common.quantizedHeldBytes(out, in, QUANT_GROUP, engine);
+}
+
 /// The rows the tower sees for the images a processor admits: ViT patches (every ViT linear's rows, and the keys of
 /// every attention call) and aligner cells (the aligner's rows). Read off `planGrid` over image sizes from 1 px to
 /// 16,384 px a side: a geometric grid on both axes (`step`), and every width under 128 px (and every height) against a
 /// geometric grid of the other side, where the thin canvases are. A sample cannot undercut the true minimum; it can
-/// miss it, so `engineGap` asks for twice what a plan needs.
+/// miss it.
 pub const Reach = struct { min_patches: u64, max_patches: u64, min_cells: u64, max_cells: u64 };
 
 fn grow(r: *?Reach, p: Processor, w: u32, h: u32) void {
@@ -254,38 +257,15 @@ pub fn reachOf(p: Processor, step: f64) ?Reach {
 }
 
 /// An image the engine's tower would have to refuse: the plan MLX takes for it and the engine lacks.
-pub const Gap = struct { what: []const u8, rows: u64, out: usize, in: usize };
+pub const Gap = struct { what: []const u8, rows: u64 };
 
-/// The fewest rows from which a linear of this shape takes only ported plans.
-fn portedFrom(g: matmul.Gpu, out: usize, in: usize) usize {
-    var m: usize = 1;
-    while (m < 1 << 14 and quantized.unported(g, m, out, in, QUANT_GROUP) != null) m += 1;
-    return m;
-}
-
-/// The first shape an admissible image can give a quantized linear or the attention that the engine does not port, else
-/// null. Decided at the load, so no request meets a refusal MLX would not give.
-pub fn engineGap(v: cfg_mod.Vision, out_dim: u32, quantize: bool) !?Gap {
-    if (v.headDim() != 64) return .{ .what = "attention head dimension other than 64", .rows = 0, .out = v.headDim(), .in = 0 };
-    const r = reachOf(Processor.of(v), 1.06) orelse return .{ .what = "no admissible image", .rows = 0, .out = 0, .in = 0 };
+/// The first shape an admissible image can give the attention that the engine does not port, else null. Decided at
+/// the load, so no request meets a refusal MLX would not give. Every plan MLX picks for a quantized linear is ported.
+pub fn engineGap(v: cfg_mod.Vision) ?Gap {
+    if (v.headDim() != 64) return .{ .what = "attention head dimension other than 64", .rows = 0 };
+    const r = reachOf(Processor.of(v), 1.06) orelse return .{ .what = "no admissible image", .rows = 0 };
     // The last chunk of a query is at most as long as the keys.
-    if (r.min_patches < 8) return .{ .what = "fewer keys than a vector attention chunk", .rows = r.min_patches, .out = 0, .in = 0 };
-    if (!quantize) return null;
-    const g = try matmul.gpu();
-    const h: usize = v.hidden;
-    const shapes = [_]struct { out: usize, in: usize, rows: u64 }{
-        .{ .out = 3 * h, .in = h, .rows = r.min_patches },
-        .{ .out = h, .in = h, .rows = r.min_patches },
-        .{ .out = 2 * @as(usize, v.inter), .in = h, .rows = r.min_patches },
-        .{ .out = h, .in = v.inter, .rows = r.min_patches },
-        .{ .out = out_dim, .in = h * v.downsample * v.downsample, .rows = r.min_cells },
-        .{ .out = out_dim, .in = out_dim, .rows = r.min_cells },
-    };
-    for (shapes) |sh| {
-        if (sh.in % QUANT_GROUP != 0) continue;
-        const from = portedFrom(g, sh.out, sh.in);
-        if (sh.rows < 2 * from) return .{ .what = "a plan the engine does not port", .rows = sh.rows, .out = sh.out, .in = sh.in };
-    }
+    if (r.min_patches < 8) return .{ .what = "fewer keys than a vector attention chunk", .rows = r.min_patches };
     return null;
 }
 
@@ -389,8 +369,8 @@ pub const Dsv41Vision = struct {
         var own = false;
         if (dsv41_borrow.ownDecode(&c)) {
             // Decided here, once: a Cooler load runs nothing on MLX, so a tower the engine cannot run refuses the load.
-            if (try engineGap(v, c.dim, quantize_at_load)) |g| {
-                log.err("[vision] the engine does not port this tower: an image of {d} rows reaches {s} for a {d} x {d} linear; --ds41-mlx-engine serves it\n", .{ g.rows, g.what, g.out, g.in });
+            if (engineGap(v)) |g| {
+                log.err("[vision] the engine does not port this tower: an image of {d} rows reaches {s}; --ds41-mlx-engine serves it\n", .{ g.rows, g.what });
                 return error.VisionTowerNotPorted;
             }
             if (!mlx.engine.enabled) return error.EngineNotEnabled;
@@ -1276,8 +1256,7 @@ test "dsv41 vision: a Cooler encode of large images and a small last one joins t
     // The request's end closes the pass the join left open, as `endRequestMlx` does.
     defer mlx.engine.close();
     // The encode's caps follow a pack that decodes on the engine.
-    dsv41_borrow.own_override = true;
-    defer dsv41_borrow.own_override = null;
+    config.dsv41.?.cooler_for_test = true;
     const ram_cap = dsv41_borrow.pool_ram_cap;
     dsv41_borrow.pool_ram_cap = 8 << 30;
     defer dsv41_borrow.pool_ram_cap = ram_cap;
@@ -1325,28 +1304,44 @@ test "dsv41 vision: a Cooler encode of large images and a small last one joins t
     try testing.expectEqual(@as(c_int, @intCast(rows)), mlx.getShape(joined)[1]);
 }
 
-test "dsv41 vision: an image the engine's quantized matmul cannot take is refused by name, not run on MLX" {
+test "dsv41 vision: an image under every generation's vector limit runs its linears on the engine's vector kernels, with MLX's bytes and no op on MLX" {
     try mlx.requireGpu();
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was_enabled;
-    var w = try towerOf(engine_vision, tiny_dim);
-    defer w.deinit();
-    var tower = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &w);
-    defer tower.deinit();
-    tower.own = true;
+    var wm = try towerOf(engine_vision, tiny_dim);
+    defer wm.deinit();
+    var we = try towerOf(engine_vision, tiny_dim);
+    defer we.deinit();
+    var on_mlx = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &wm);
+    defer on_mlx.deinit();
+    var on_engine = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &we);
+    defer on_engine.deinit();
+    on_engine.own = true;
     defer mlx.engine.budget(1 << 62) catch {};
-    // Four rows: under the vector limit of every generation (6 rows at the least).
-    var px: [2 * 2 * 48]f32 = @splat(0.25);
+    // Four patches: under the vector limit of every generation (6 rows at the least).
+    var px: [2 * 2 * 48]f32 = undefined;
+    for (&px, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 17)) / 8 - 1;
     const patches = mlx.mlx_array_new_data(&px, &[_]c_int{ 4, 48 }, 2, .float32);
     defer _ = mlx.mlx_array_free(patches);
-    var buf: [512]u8 = undefined;
-    _ = mlx.takeError(&buf);
+    const want = try on_mlx.forward(patches, 2, 2);
+    defer _ = mlx.mlx_array_free(want);
     const ops_before = mlx.engine.mlx_ops;
-    try testing.expectError(error.MlxError, tower.forward(patches, 2, 2));
-    try testing.expect(std.mem.indexOf(u8, mlx.takeError(&buf).?, "[engine] quantized_matmul") != null);
+    const got = try on_engine.forward(patches, 2, 2);
+    defer _ = mlx.mlx_array_free(got);
     try testing.expectEqual(ops_before, mlx.engine.mlx_ops);
-    try testing.expect(!mlx.engine.active);
+    try testing.expect(mlx.engine.isOurs(got) and !mlx.engine.isOurs(want));
+    try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    var wc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wc);
+    try mlx.check(mlx.mlx_contiguous(&wc, want, false, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_array_eval(wc));
+    var gc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gc);
+    try mlx.check(mlx.mlx_contiguous(&gc, got, false, mlx.engine.stream()));
+    try mlx.check(mlx.mlx_array_eval(gc));
+    const n = mlx.mlx_array_size(wc) * mlx.mlx_array_itemsize(wc);
+    try testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(wc).?[0..n], mlx.mlx_array_data_uint8(gc).?[0..n]);
 }
 
 // Rows the tower can see, for any image the release processor admits (`reachOf`; `planGrid` over every width under 128 px
@@ -1356,17 +1351,15 @@ test "dsv41 vision: an image the engine's quantized matmul cannot take is refuse
 //     9,198 (`maxPatches`, 1,022 aligner cells of nine);
 //   - aligner cells, the rows of the aligner's two linears: 164 at the fewest (a 3 x 481 image) to 1,022;
 //   - an attention call's query chunk: 512 rows, and a last chunk of 1 to 512, against those keys.
-// MLX takes its vector kernels below 33 rows (13 for the aligner's 9,216 inner width) and its split-K plan while the
-// output tiles are few: from 257 rows against 1,024 outputs and 33 against the aligner's 5,120 the plan is the tile
-// this port covers (`quantized.unported`). Every admitted image gives 4x that or more, so the vector kernels and
-// split-K are reached by no request; `engineGap` checks it at the load, with a factor of two for the sampling, and a
-// pack whose vision config could reach them keeps its tower on MLX, said in a log line.
+// Every plan MLX picks for the tower's quantized linears at those rows is the engine's (`tensor/quantized.zig`);
+// `engineGap` checks the attention at the load, and a pack whose vision config could reach a gap keeps its tower on
+// MLX, said in a log line.
 
 fn releaseVision() !cfg_mod.Vision {
     return (try cfg_mod.parseText(cfg_mod.release_config)).vision.?;
 }
 
-test "dsv41 vision: every image the release processor admits gives the tower rows the engine's plans cover" {
+test "dsv41 vision: every image the release processor admits gives the tower rows the engine covers" {
     try mlx.requireGpu();
     const v = try releaseVision();
     const fine = reachOf(Processor.of(v), 1.013).?;
@@ -1374,31 +1367,18 @@ test "dsv41 vision: every image the release processor admits gives the tower row
     try testing.expect(fine.max_patches <= v.maxPatches() and fine.max_patches > 9000);
     try testing.expect(fine.min_cells >= 164 and fine.min_cells < 170);
     try testing.expect(fine.max_cells <= 1022 and fine.max_cells > 1000);
-    // The rows from which MLX's plan is one the engine ports, per linear, on each generation's vector limits.
-    for ([_]matmul.Gpu{
-        .{ .class = .s, .gen = 17, .nax = true, .tf32 = true },
-        .{ .class = .s, .gen = 15, .nax = false, .tf32 = true },
-        .{ .class = .s, .gen = 13, .nax = false, .tf32 = true },
-        .{ .class = .d, .gen = 13, .nax = false, .tf32 = true },
-    }) |g| {
-        try testing.expectEqual(@as(usize, 257), portedFrom(g, 1024, 1024));
-        try testing.expectEqual(@as(usize, 33), portedFrom(g, 5120, 9216));
-        try testing.expectEqual(@as(usize, 65), portedFrom(g, 3072, 1024));
-    }
-    try testing.expect(try engineGap(v, 5120, true) == null);
+    try testing.expect(engineGap(v) == null);
 
     // A processor with no pixel floor admits a one-patch image, which no chunk of keys covers; with a floor of about
-    // forty patches the linears take MLX's vector kernels.
+    // forty patches the linears take MLX's vector kernels, which the engine has too.
     var floorless = v;
     floorless.min_pixels = 0;
-    try testing.expectEqualStrings("fewer keys than a vector attention chunk", (try engineGap(floorless, 5120, true)).?.what);
+    try testing.expectEqualStrings("fewer keys than a vector attention chunk", engineGap(floorless).?.what);
     floorless.min_pixels = 196 * 40;
-    const gap = (try engineGap(floorless, 5120, true)).?;
-    try testing.expectEqualStrings("a plan the engine does not port", gap.what);
-    try testing.expect(gap.rows < 100);
+    try testing.expect(engineGap(floorless) == null);
     var wide_head = v;
     wide_head.hidden = 2048;
-    try testing.expect((try engineGap(wide_head, 5120, true)) != null);
+    try testing.expectEqualStrings("attention head dimension other than 64", engineGap(wide_head).?.what);
 }
 
 test "dsv41 vision: a Cooler load refuses a tower the engine does not port by name; the MLX route loads it" {
@@ -1409,14 +1389,15 @@ test "dsv41 vision: a Cooler load refuses a tower the engine does not port by na
     // No pixel floor: a one-patch image is admissible, and no chunk of keys covers it.
     var w = try towerOf(engine_vision, tiny_dim);
     defer w.deinit();
-    try testing.expect(try engineGap(engine_vision, tiny_dim, true) != null);
-    dsv41_borrow.own_override = true;
-    defer dsv41_borrow.own_override = null;
+    try testing.expect(engineGap(engine_vision) != null);
+    var cooler = configOf(engine_vision, tiny_dim);
+    cooler.dsv41.?.cooler_for_test = true;
     const calls = mlx.engine.mlxCalls();
-    try testing.expectError(error.VisionTowerNotPorted, Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &w));
+    try testing.expectError(error.VisionTowerNotPorted, Dsv41Vision.init(testing.allocator, cooler, &w));
     try testing.expectEqual(calls, mlx.engine.mlxCalls());
-    dsv41_borrow.own_override = false;
-    var on_mlx = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &w);
+    var mlx_side = configOf(engine_vision, tiny_dim);
+    mlx_side.dsv41.?.cooler_for_test = false;
+    var on_mlx = try Dsv41Vision.init(testing.allocator, mlx_side, &w);
     defer on_mlx.deinit();
     try testing.expect(!on_mlx.own and on_mlx.ownStream() == null);
 }
@@ -1452,13 +1433,13 @@ test "dsv41 vision: at the release's geometry the engine's tower gives MLX's byt
     try mlx.engine.budget(8 << 20);
     const load_ops = mlx.engine.mlx_ops;
     const load_stats = mlx.engine.stats();
-    dsv41_borrow.own_override = true;
-    defer dsv41_borrow.own_override = null;
+    var cooler = configOf(v, 5120);
+    cooler.dsv41.?.cooler_for_test = true;
     // The model's load has sealed the engine by the time the tower loads.
     mlx.engine.seal(true);
     defer mlx.engine.seal(false);
     const late = mlx.engine.latePipelines();
-    var on_engine = try Dsv41Vision.init(testing.allocator, configOf(v, 5120), &we);
+    var on_engine = try Dsv41Vision.init(testing.allocator, cooler, &we);
     defer on_engine.deinit();
     try testing.expectEqual(late, mlx.engine.latePipelines());
     // The Cooler load requantized on the engine: nothing asked of MLX, no weight taken from it or lent to it.

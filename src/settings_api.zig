@@ -644,12 +644,6 @@ fn heldRow(e: *model_registry_mod.LoadedModel) ModelRow {
     return row;
 }
 
-/// Why Sushi Cooler cannot serve a row's pack or this Mac, which the page shows beside a disabled key.
-fn judgeCooler(fit: *model_settings.Fit) void {
-    if (!fit.cooler_offered or fit.cooler_why.len > 0) return;
-    if (!fit.stq_experts) fit.cooler_why = model_settings.cooler_why_not_stq;
-}
-
 fn collectRows(allocator: std.mem.Allocator, registry: *model_registry_mod.ModelRegistry) ![]ModelRow {
     var rows = std.ArrayList(ModelRow).empty;
     errdefer rows.deinit(allocator);
@@ -659,10 +653,7 @@ fn collectRows(allocator: std.mem.Allocator, registry: *model_registry_mod.Model
         var it = registry.entries.valueIterator();
         while (it.next()) |p| try rows.append(allocator, heldRow(p.*));
     }
-    for (rows.items) |*row| {
-        readPackFacts(registry.io, allocator, row);
-        judgeCooler(&row.fit);
-    }
+    for (rows.items) |*row| readPackFacts(registry.io, allocator, row);
     std.mem.sort(ModelRow, rows.items, {}, struct {
         fn lt(_: void, a: ModelRow, b: ModelRow) bool {
             return std.mem.lessThan(u8, a.id, b.id);
@@ -1669,7 +1660,6 @@ test "settings api: ds41_cooler is offered only where the arch has Sushi Cooler,
     const rows = [_]ModelRow{
         .{ .id = "ds", .path = "/m/a", .state = "ready", .bytes = 5, .fit = .{ .arch = "d", .streams_experts = true, .has_vision = false }, .loaded = .{ .ds41_cooler = false }, .defaults = .{ .ds41_cooler = true } },
         .{ .id = "dense", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "q", .streams_experts = false, .has_vision = false, .cooler_offered = false } },
-        .{ .id = "plain-pack", .path = "/m/c", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "d", .streams_experts = true, .has_vision = false, .cooler_why = model_settings.cooler_why_not_stq } },
     };
     const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
     defer testing.allocator.free(body);
@@ -1690,9 +1680,6 @@ test "settings api: ds41_cooler is offered only where the arch has Sushi Cooler,
     try testing.expect(set.get("locked").?.bool);
     try testing.expect(!models[0].object.get("loaded_with").?.object.get("ds41_cooler").?.bool);
     try testing.expect(models[0].object.get("defaults").?.object.get("ds41_cooler").?.bool);
-    const lim = models[2].object.get("limits").?.object.get("ds41_cooler").?.object;
-    try testing.expect(lim.get("disabled").?.bool);
-    try testing.expect(std.mem.indexOf(u8, lim.get("why").?.string, "not STQ") != null);
     try testing.expect(models[0].object.get("limits").?.object.get("ds41_cooler") == null);
     try testing.expect(reachesLoad("ds41_cooler"));
 }

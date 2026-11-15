@@ -50,8 +50,6 @@ sushi_boot cooler-mlx "$MODEL" $FLAGS --ds41-mlx-engine || exit $?
 LINE2=$(grep -a "\[dsv41\] decode forwards" "$SUSHI_LOG" | tail -1)
 case "$LINE2" in
     *"on MLX because --ds41-mlx-engine was given (Sushi Cooler is off)"*) ;;
-    *"Sushi Cooler has no quantized_matmul"*)
-        echo "  NOTE: this pack cannot run Sushi Cooler; the flag has nothing to move: $LINE2" ;;
     *) fail "boot 2 line does not say the flag moved decode to MLX: '$LINE2'" ;;
 esac
 echo "$PAYLOAD" | post | text_of > "$WORK/mlx.txt"

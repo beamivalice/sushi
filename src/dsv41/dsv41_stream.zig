@@ -3122,8 +3122,8 @@ test "dsv41 pair-major: the resident bill and load of a padded pair-major pack e
     defer pm.deinit();
     const io = std.Io.Threaded.global_single_threaded.io();
     const source = @import("dsv41_source.zig");
-    try testing.expectEqual(try source.residentBytes(io, testing.allocator, dir), try source.residentBytes(io, testing.allocator, pm.path));
-    try testing.expectEqual(try source.dsparkBytes(io, testing.allocator, dir), try source.dsparkBytes(io, testing.allocator, pm.path));
+    try testing.expectEqual(try source.residentBytes(io, testing.allocator, dir, false), try source.residentBytes(io, testing.allocator, pm.path, false));
+    try testing.expectEqual(try source.dsparkBytes(io, testing.allocator, dir, false), try source.dsparkBytes(io, testing.allocator, pm.path, false));
 }
 
 test "dsv41 pair-major: the repacker's pair-major copy of the tiny pack gives the same bytes (DSV41_STQ_TINY, its -pm sibling)" {

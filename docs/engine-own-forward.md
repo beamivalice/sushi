@@ -20,9 +20,17 @@ chunk of any width included, and a pack that decodes on MLX prefills on MLX.
 
 | pack and GPU | forwards on the engine |
 |---|---|
-| DeepSeek-V4.1 STQ (experts and trunk), any GPU | every forward: decode, DSpark draft and verify, every prefill chunk, wider than 16 rows or not, with image rows or without; on a GPU with matrix units (M5) the NAX arms, on one without (M1 to M4) the SIMD arms of the same kernels and of the stock tiles |
-| DeepSeek-V4.1 with an FP8 trunk or MXFP4 experts | none: the engine runs neither |
+| DeepSeek-V4.1, STQ or the release's own FP8 trunk and MXFP4 experts, any GPU | every forward: decode, DSpark draft and verify, every prefill chunk, wider than 16 rows or not, with image rows or without; on a GPU with matrix units (M5) the NAX arms, on one without (M1 to M4) the SIMD arms of the same kernels and of the stock tiles |
 | every other architecture | none: MLX |
+
+The release's own layout reaches two ops an STQ pack does not, both MLX's plans on `mlx.metallib`'s kernels
+(`tensor/quantized.zig`): `quantized_matmul` in `mxfp8` (every trunk linear, the grouped output projection as a batch
+of weights) with the vector, quad, wide, split-K and tile plans MLX picks by rows, and `gather_qmm` in `mxfp4` (the
+routed experts: `gather_qmv` for a decode row, the tiles for many rows a pick, and the sorted `gather_qmm_rhs` with
+`gather_mm_offsets` for a wide chunk). On the tiny release-layout fixture (`DSV41_TINY`) a Cooler load asks nothing of
+MLX from load to unload and gives the MLX route's logits and DSpark tokens at each round-width mix. A verify wider than
+one row takes other product plans than a one-row step on either route, so greedy tokens on that random model depend
+on the round mix; each mix is held to MLX's at the same mix.
 
 The vision tower of an image request (once per image, on a load that decodes on the engine) runs on the engine whole:
 the table's `quantized_matmul`, `fast::scaled_dot_product_attention` and `erf` rows. Its load-time requantization
@@ -61,13 +69,27 @@ patch in), two sessions on 90c83d71 and 537e8e91. Engine: two runs of this chang
 - The round-cost policy picks row counts from measured times, so two runs of one request can take different
   rounds; compare `[spec-stats]` round mixes before reading a tok/s gap as a kernel's.
 
+The release's own checkpoint (`DeepSeek-V4.1-Flash-1017`, mxfp8 trunk, mxfp4 experts), `--ssd-budget-gb 76`, M5 Max,
+greedy 160 tokens, binary of cooler-p4 01b25a4c, one boot per arm in one session (engine, MLX by
+`--ds41-mlx-engine`, engine), decode tok/s:
+
+| prompt | engine | MLX | engine |
+|---|---:|---:|---:|
+| prose (47 tokens) | 6.48 | 6.88 | 7.38 |
+| code (57) | 6.47 | 6.41 | 7.11 |
+| copy (88) | 7.58 | 7.26 | 7.72 |
+| 4,856 tokens, three 2048-row chunks | 6.96 (prefill 161) | 6.64 (163) | 7.10 (166) |
+
+- Every reply is the same bytes in all three boots; the engine boots ran 0 ops on MLX and compiled nothing after the
+  load. The two engine boots differ by up to 14%, more than any engine-MLX gap: parity.
+
 ## A prefill chunk on the engine
 
 A chunk of any width goes through the engine (`forwardDsv41With`), a state-only chunk (`extendState`) included. On the tiny STQ fixture a chunk of 17 to 513
 rows, a prompt cut in chunks with restore points between and state-only chunks, and the decode after it give MLX's
 restore-point digests, last-row logits and tokens. What the wide path reached that decode does not: `abs`, `logaddexp`
 (the router's softplus) and an unsigned `floor_divide` (the routed slots' rows). The pack's indexer `weights_proj` is
-dense, so `quantized_matmul` is not reached on an STQ pack; an FP8-trunk fixture stops there.
+dense, so `quantized_matmul` is not reached on an STQ pack; the release's layout reaches it (above).
 
 A wide chunk whose experts stream (cache below the pack) cannot hand the GPU the engine's whole open pass at a rate
 group's start (`EarlyPlanes.start`, the MLX arm's way): the engine encodes each op into the pass as it is called, so the
@@ -207,7 +229,7 @@ route and the MLX arm still build the bank at prepare time.
   replies changed bytes. On the engine's stream the inputs are made on the host (`trialValues`) and a trial that
   cannot run fails the load (`setAttnNax`, `setIndexNax`); on MLX's stream a failed launch still declines the arm,
   as a GPU without matrix units needs.
-- **A tower the engine cannot run refuses a Cooler load** (`error.VisionTowerNotPorted`, with the shape that
+- **A tower the engine cannot run refuses a Cooler load** (`error.VisionTowerNotPorted`, with what
   `engineGap` found); it no longer stays on MLX beside the engine. The MLX route serves such a pack. The image
   encoder's own stream is the tower's (`Tower.ownStream`): the patch arrays and the join of several images' spans are
   the engine's there.
@@ -387,9 +409,19 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 
 ## Load
 
+- **A weight the load builds is owned, never an op's result.** On a Cooler load an op's tensor is the pool's, and every
+  forward's cap counts the pool: the DSpark mxfp4 banks stacked by an op held 7.5 GB of it on the release pack and the
+  load warm's first sampled verdict was refused; the fp8 block scales held 231 MB. Both are host copies into owned
+  regions, and a Cooler load maps every weight, small ones included ([dsv41-memory](dsv41-memory.md#owned-weights)).
+- **A load decides its side for its life.** The side is its config's (`mlx_ask`, or a test's `cooler_for_test` set
+  before the load) and every hook reads it through `Model.onEngine`, so no switch can flip it over a load. A Cooler
+  load holds the engine's scope until it is freed: a test that leaks one runs every later test inside it.
 - **A pipeline is compiled per side.** MLX's warm at load compiles MLX's; the engine's are its own, so the load runs
   the engine's decode widths too (`dsv41_model.warmOwn`). Without it the first verify of each width paid its compile
   inside a request (up to 2 s), and the round-cost policy stopped drafting for the rest of that request.
+- **A load with no drafter warms widths 2 to 16 itself** (`warmOwn`), from a state of some rows, of none and of one:
+  a forward's attention over no compressed row or a single one takes other kernels (a gemv), and a short first prompt
+  meets them. The pin sweeps positions 0 to 8 and 30.
 - **With decode on the engine the load does not warm MLX's widths 1 to 16.** No forward of 16 rows or fewer is MLX's
   any more (see the table), so `warmKernels` skips MLX's decode widths and DSpark rounds and keeps MLX's prefill
   (256, 42 and 31 rows), which the image forwards still run. An MLX-decode load warms as before.
@@ -530,6 +562,15 @@ rebuilds one.
 - A new op: a case in `route.zig` beside its family, red before the op exists.
 - DeepSeek: `dsv41 engine:` tests on the tiny STQ fixture hold one-row decode logits, DSpark drafts, confidences and
   verify logits to MLX's bytes at every verify width, and the tokens at every round-width mix.
+- **An op takes every count MLX takes.** `stack`, `concatenate` and a kernel's inputs held their parts in a fixed
+  64-slot buffer; the release's DSpark bank stacks 256 experts, which no tiny fixture has. A cap is the kernel's own
+  (`kernel.max_inputs`), named where it refuses; the real-pack test (`SUSHI_DSV41_REAL_PACK`) runs before a phase closes.
+- **A refusal says what it refuses**: an op returns `core.refusing(why, err)`, and the route's message carries the
+  restriction (`[engine] quantized_matmul: TensorUnsupported: affine bits 3, 5 and 6 are not ported`) and counts it in
+  `refusals`. A caller's int is read with `std.math.cast`: a negative group size is a named refusal, not a wrapped cast.
+- **A shape is built with `core.Dims`**, whose pieces past `max_dims` are `TensorShape`: split-K wrote index 8 of an
+  8-entry buffer for an 8-axis x. A `[max_dims]c_int` written at an offset is the lint rule `shape-offset-write`.
+  Split-K's partial sums are `[split, M, N]`, so it takes rows given as any number of axes, as MLX does.
 - `src/tensor/` is in `build.zig`'s test scan; a new folder under `src/` has to be added there or its tests never
   compile.
 - **In a test the engine takes TF32 from what MLX does, not from the environment** (`matmul.mlxTf32`): MLX reads

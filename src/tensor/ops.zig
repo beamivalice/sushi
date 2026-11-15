@@ -722,6 +722,13 @@ pub fn arange(start: f64, stop: f64, step: f64, dtype: Dtype) (Error || error{ A
                 v.* = @bitCast(@as(u32, @bitCast(first)) +% @as(u32, @intCast(i)) *% delta);
             }
         },
+        .uint32 => {
+            const hi: f64 = std.math.maxInt(u32);
+            if (!(start >= 0 and start <= hi) or (!lone and !(start + step >= 0 and start + step <= hi))) return error.ArangeOutOfRange;
+            const first: u32 = @intFromFloat(start);
+            const delta: u32 = if (lone) 0 else @as(u32, @intFromFloat(start + step)) -% first;
+            for (@as([]u32, @alignCast(std.mem.bytesAsSlice(u32, bytes))), 0..) |*v, i| v.* = first +% @as(u32, @intCast(i)) *% delta;
+        },
         .float32 => {
             const first: f32 = @floatCast(start);
             const delta: f32 = if (lone) 0 else @as(f32, @floatCast(start + step)) - first;
@@ -760,8 +767,9 @@ pub fn repeat(t: *Tensor, count: c_int, axis_in: c_int) Error!*Tensor {
 
 /// `parts` joined along a new axis.
 pub fn stack(parts: []const *Tensor, axis: c_int) Error!*Tensor {
-    var wide: [64]*Tensor = undefined;
-    if (parts.len == 0 or parts.len > wide.len) return error.TensorShape;
+    if (parts.len == 0) return error.TensorShape;
+    const wide = try gpa.alloc(*Tensor, parts.len);
+    defer gpa.free(wide);
     var n: usize = 0;
     defer for (wide[0..n]) |w| core.release(w);
     const at = if (axis < 0) axis + @as(c_int, parts[0].ndim) + 1 else axis;

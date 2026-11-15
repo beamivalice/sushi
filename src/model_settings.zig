@@ -84,7 +84,6 @@ pub const VisionChoice = struct {
     }
 };
 
-pub const cooler_why_not_stq = "This pack is not STQ: Sushi Cooler has no kernels for its FP8 trunk and MXFP4 experts, so decode runs on MLX.";
 
 /// Whether the arch decodes on Sushi Cooler: the launch flag that turns it off > the model's `ds41_cooler` > on.
 pub const CoolerChoice = struct {
@@ -503,8 +502,6 @@ pub const Fit = struct {
     window_default: u32 = 0,
     /// The arch has Sushi Cooler to turn off (`ds41_cooler`).
     cooler_offered: bool = true,
-    /// Why Sushi Cooler cannot serve this pack or Mac; empty = it can.
-    cooler_why: []const u8 = "",
 };
 
 /// The context window the model has once `yarn_factor` (null = unset) is applied; 0 = unknown.
@@ -613,7 +610,6 @@ const unset_budget = [_][]const u8{"ssd_budget_gb"};
 pub fn limit(key: []const u8, fit: Fit) Limit {
     const eql = std.mem.eql;
     if (unavailable(key, fit)) |why| return .{ .disabled = true, .why = why };
-    if (eql(u8, key, "ds41_cooler") and fit.cooler_why.len > 0) return .{ .disabled = true, .why = fit.cooler_why };
     var l: Limit = .{};
     const tail = eql(u8, key, "mtp_acceptance") or eql(u8, key, "mtp_greedy_tail");
     if ((tail or eql(u8, key, "mtp")) and budgetDropsHead(fit)) {
@@ -1532,9 +1528,7 @@ test "model_settings: ds41_cooler is a bool, anything else is unset, and the pag
     try t.expect(findKey(&model_keys, "ds41_cooler").?.kind == .bool);
     try t.expect(applies("ds41_cooler", .{ .arch = "deepseek_v41", .streams_experts = true, .has_vision = true, .cooler_offered = true }));
     try t.expect(!applies("ds41_cooler", .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false, .cooler_offered = false }));
-    const blocked = limit("ds41_cooler", .{ .arch = "deepseek_v41", .streams_experts = true, .has_vision = true, .cooler_offered = true, .cooler_why = "This pack is not STQ." });
-    try t.expect(blocked.disabled);
-    try t.expectEqualStrings("This pack is not STQ.", blocked.why);
+    try t.expect(limit("ds41_cooler", .{ .arch = "deepseek_v41", .streams_experts = true, .has_vision = true, .cooler_offered = true }).isEmpty());
 }
 
 test "model_settings: Sushi Cooler is on unless the flag, else the model's ds41_cooler, turns it off" {

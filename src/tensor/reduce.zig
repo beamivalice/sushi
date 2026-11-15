@@ -262,8 +262,9 @@ fn foldParts(op: Op, p: metal.Pass, parts: *Tensor, out: *Tensor, blocks: usize,
     core.dispatch(p, .{ .x = threads * ((out.size() + 31) / 32) }, .{ .x = threads });
 }
 
-/// MLX's `strided_reduce_general_dispatch`: the axis steps over the memory that follows it.
-fn strided(op: Op, in: *Tensor, out: *Tensor, axis: usize) Error!void {
+/// MLX's `strided_reduce_general_dispatch`: the axis steps over the memory that follows it. `out` is any tensor of the
+/// remaining elements, laid out in rows: a caller of MLX's dispatch hands it an output of its own shape.
+pub fn strided(op: Op, in: *Tensor, out: *Tensor, axis: usize) Error!void {
     const size: usize = @intCast(in.shape[axis]);
     const stride: usize = in.strides[axis];
     var walk = Walk.without(in, axis);
@@ -298,14 +299,14 @@ fn strided(op: Op, in: *Tensor, out: *Tensor, axis: usize) Error!void {
         return;
     }
 
-    var parts_shape: [max_dims]c_int = undefined;
-    if (out.ndim + 1 > max_dims) return error.TensorShape;
-    @memcpy(parts_shape[1..][0..out.ndim], out.dims());
+    // `[parts, out...]`, its first axis set by the branch that cuts the parts.
+    var parts_shape = try core.Dims.of(&.{0});
+    try parts_shape.appendSlice(out.dims());
 
     if (stride < 32 and size >= 1024) {
         const blocks: usize = if (size >= 32768) 128 else 32;
-        parts_shape[0] = @intCast(blocks);
-        const parts = try core.fresh(in.dtype, parts_shape[0 .. out.ndim + 1]);
+        parts_shape.buf[0] = @intCast(blocks);
+        const parts = try core.fresh(in.dtype, parts_shape.slice());
         defer core.release(parts);
         p.pipeline(try kernelOf("col_reduce_longcolumn_1_reduce_", op, in));
         core.bind(p, in, 0);
@@ -318,8 +319,8 @@ fn strided(op: Op, in: *Tensor, out: *Tensor, axis: usize) Error!void {
 
     if (size > 256 and out.size() / 32 < 1024) {
         const blocks = 32;
-        parts_shape[0] = blocks;
-        const parts = try core.fresh(in.dtype, parts_shape[0 .. out.ndim + 1]);
+        parts_shape.buf[0] = blocks;
+        const parts = try core.fresh(in.dtype, parts_shape.slice());
         defer core.release(parts);
         p.pipeline(try kernelOf("col_reduce_2pass_1_32_32_reduce_", op, in));
         core.bind(p, in, 0);

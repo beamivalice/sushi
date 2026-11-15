@@ -73,11 +73,8 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     errdefer if (mdl_mine) |m| m.deinit();
     const mdl = mdl_mine.?;
     dsv41_model.logMemory(mdl);
-    mdl.engine_decode = own_decode;
     const side: dsv41_borrow.DecodeSide = if (own_decode) .engine else dsv41_borrow.decodeSideOf(&config.dsv41.?);
     if (own_decode or side != .engine) log.info("{s}\n", .{dsv41_borrow.decodeLine(side)});
-    // Prefill follows decode: a chunk of any width runs where a decode step does.
-    mdl.engine_prefill = own_decode;
     if (own_decode) log.info("{s}\n", .{dsv41_borrow.prefill_line});
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
     if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
@@ -175,7 +172,7 @@ pub fn warmAllAt(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqS
 
 fn warmForwards(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, scope: dsv41_model.WarmScope, width: usize) !void {
     try dsv41_model.warmKernelsFor(mdl, scope);
-    const after = warmAfter(scope, mdl.engine_prefill);
+    const after = warmAfter(scope, mdl.onEngine());
     if (after.sampled_verdict) {
         dsv41_model.warmBudget(mdl, dsv41_config.verify_rows);
         try warmSampledVerdict(mdl);
@@ -207,51 +204,45 @@ pub fn beginPipelines(allocator: std.mem.Allocator, config: *const ModelConfig, 
 /// state-only chunk and a head chunk (CED), head chunks whose rows fill the GEMM tiles whole, in part and not at all, the
 /// held-back tail, and one chunk per pick-sort plan (`sort.planOf`: its block size follows the picks, a row's `top_k` of
 /// them). Chunks wider than `width` are left out. Leaves no state.
+/// The chunks `warmWide` runs, each `{rows, tail}` (a tail of 0 is one chunk): every wide-chunk kernel a request can
+/// take, so none compiles inside one. As many as the ratios ask for.
+pub fn widePlans(gpa: std.mem.Allocator, width: usize, k: usize, ratios: []const u8) ![][2]usize {
+    const tail = @import("../prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1;
+    var plans: std.ArrayList([2]usize) = .empty;
+    errdefer plans.deinit(gpa);
+    try plans.append(gpa, .{ width, width });
+    for ([_]usize{ width * 17 / 32, width * 1100 / 2048 }) |w| try plans.append(gpa, .{ w, tail });
+    // Rows that fill the narrow GEMM tiles whole.
+    for ([_]usize{ 64, 128 }) |rows| try plans.append(gpa, .{ rows, 0 });
+    // A compressing layer's projection takes the chunk's compressed rows (`rows / ratio`), and a kernel of under 17 rows has
+    // that count in its name: one chunk per count.
+    var seen: [17]bool = @splat(false);
+    for (ratios) |ratio| {
+        if (ratio < 2 or ratio > 16 or seen[ratio]) continue;
+        seen[ratio] = true;
+        for (1..17) |c| {
+            const rows = @max(c * ratio, dsv41_borrow.verify_rows + 1);
+            if (rows >= (c + 1) * ratio or rows > width) continue;
+            try plans.append(gpa, .{ rows, 0 });
+        }
+    }
+    // The widest chunk of each single-block sort size, and one past them all.
+    for ([_]usize{ 128, 256, 512, 1024, 2048 }) |picks| try plans.append(gpa, .{ picks / k, 0 });
+    try plans.append(gpa, .{ width, 0 });
+    return plans.toOwnedSlice(gpa);
+}
+
 pub fn warmWide(self: *Trunk, m: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, width: usize) !void {
     // The split chain is a wide chunk's work but no forward: it takes the budget such a chunk has, not the one the
     // decode-width forward before it left.
     dsv41_borrow.enterWarmMlx(width, width, &m.cfg);
     if (stq) |st| try st.warmSplit(m, width, true);
-    const tail = @import("../prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1;
-    const k: usize = m.layers[0].top_k;
-    var plans: [64][2]usize = undefined;
-    var n_plans: usize = 0;
-    const heads = [_]usize{ width, width * 17 / 32, width * 1100 / 2048 };
-    plans[0] = .{ width, width };
-    n_plans = 1;
-    for (heads[1..]) |w| {
-        plans[n_plans] = .{ w, tail };
-        n_plans += 1;
-    }
-    // Rows that fill the narrow GEMM tiles whole.
-    for ([_]usize{ 64, 128 }) |rows| {
-        plans[n_plans] = .{ rows, 0 };
-        n_plans += 1;
-    }
-    // A compressing layer's projection takes the chunk's compressed rows (`rows / ratio`), and a kernel of under 17 rows has
-    // that count in its name: one chunk per count.
-    var seen: [256]bool = @splat(false);
-    for (m.cfg.ratios[0..m.cfg.layers]) |ratio| {
-        if (ratio < 2 or ratio > 16 or seen[ratio]) continue;
-        seen[ratio] = true;
-        for (1..17) |c| {
-            const rows = @max(c * ratio, dsv41_borrow.verify_rows + 1);
-            if (rows >= (c + 1) * ratio or rows > width or n_plans == plans.len) continue;
-            plans[n_plans] = .{ rows, 0 };
-            n_plans += 1;
-        }
-    }
-    // The widest chunk of each single-block sort size, and one past them all.
-    for ([_]usize{ 128, 256, 512, 1024, 2048 }) |picks| {
-        plans[n_plans] = .{ picks / k, 0 };
-        n_plans += 1;
-    }
-    plans[n_plans] = .{ width, 0 };
-    n_plans += 1;
+    const plans = try widePlans(m.gpa, width, m.layers[0].top_k, m.cfg.ratios[0..m.cfg.layers]);
+    defer m.gpa.free(plans);
     const ids = try m.gpa.alloc(i32, width);
     defer m.gpa.free(ids);
     for (ids, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % m.cfg.vocab);
-    for (plans[0..n_plans]) |plan| {
+    for (plans) |plan| {
         const chunks = if (plan[1] == 0) plan[0..1] else plan[0..2];
         if (!planFits(chunks, width)) continue;
         var plan_clock = expert_stream_mod.Clock.init();
@@ -330,7 +321,7 @@ const warm_root: u64 = 1;
 /// kernel's compile here, not inside a request. A seeded and an unseeded request differ in the root only, and the
 /// filters are the kernel's inputs, so one setting warms them all.
 pub fn warmSampledVerdict(mdl: *dsv41_model.Model) !void {
-    if (!mdl.engine_decode or mdl.dspark == null) return;
+    if (!mdl.onEngine() or mdl.dspark == null) return;
     const s = mlx.engine.stream();
     const vocab: c_int = @intCast(mdl.cfg.vocab);
     var mask = mlx.mlx_array_new();
@@ -350,7 +341,7 @@ pub fn warmSampledVerdict(mdl: *dsv41_model.Model) !void {
 /// block at every width: each pipeline a request's first token, a serial step or a round with penalties launches
 /// compiles here. The chains are the shared sampler's own functions, so what a request runs is what is warmed.
 pub fn warmSerialSampler(mdl: *dsv41_model.Model) !void {
-    if (!mdl.engine_decode) return;
+    if (!mdl.onEngine()) return;
     const s = mlx.engine.stream();
     const host = mlx.engine.enter(s);
     defer host.end();
@@ -496,7 +487,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     defer armed.end();
     // Where decode runs on the engine every forward does, at a decode width or a prefill's, with image rows or without.
     // On MLX a one-row greedy decode reads its token while layer 0 runs (`extendLazy`).
-    const decode_width = m.engine_decode and (n <= expert_exl3_kernels.DECODE_ROWS_MAX or m.engine_prefill);
+    const decode_width = m.onEngine();
     const lazy = !(decode_width and ctx.vision_embeddings == null) and n == 1 and ctx.lazy_logits and ctx.vision_embeddings == null and ctx.ahead_ids.len == 0 and st.verify == null and dsv41_model.lazyStartOk(m);
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
@@ -544,8 +535,8 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
 pub fn dsv41DraftImpl(self: *Trunk, t1: u32) !dsv41_model.Draft {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     m.s = self.s;
-    if (m.engine_decode) _ = dsv41_model.ownBegin(m);
-    defer if (m.engine_decode) dsv41_model.ownEnd(m, self.s);
+    if (m.onEngine()) _ = dsv41_model.ownBegin(m);
+    defer if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
     mlx.engine.phase(2);
     defer mlx.engine.phase(0);
     return dsv41_model.draftHeads(m, t1, .conf);
@@ -562,11 +553,11 @@ pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.ml
         try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len);
         engine.beginForward();
     }
-    if (m.engine_decode) _ = dsv41_model.ownBegin(m);
+    if (m.onEngine()) _ = dsv41_model.ownBegin(m);
     mlx.engine.phase(3);
     defer mlx.engine.phase(0);
     const verified = dsv41_model.verify(m, ids);
-    if (m.engine_decode) dsv41_model.ownEnd(m, self.s);
+    if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
     const all = try verified;
     defer _ = mlx.mlx_array_free(all);
     if (self.expert_stream) |engine| engine.finishForward(ids.len);
@@ -581,7 +572,7 @@ pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.ml
 /// verify's own passes and its read is the round's one wait.
 pub fn verdictStream(self: *Trunk, s: mlx.mlx_stream) mlx.mlx_stream {
     const m = dsv41_state.modelOf(self) orelse return s;
-    return if (m.engine_decode) mlx.engine.stream() else s;
+    return if (m.onEngine()) mlx.engine.stream() else s;
 }
 
 /// Keeps the first `accepted + 1` rows of the open verify chunk.
@@ -589,8 +580,8 @@ pub fn dsv41FinishImpl(self: *Trunk, ctx: *ForwardCtx, accepted: usize) !void {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     m.s = self.s;
     {
-        if (m.engine_decode) _ = dsv41_model.ownBegin(m);
-        defer if (m.engine_decode) dsv41_model.ownEnd(m, self.s);
+        if (m.onEngine()) _ = dsv41_model.ownBegin(m);
+        defer if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
         mlx.engine.phase(4);
         defer mlx.engine.phase(0);
         try dsv41_model.finishVerify(m, accepted);
@@ -628,4 +619,21 @@ test "tailUnread: a chunk is state only when no point is taken and the next chun
     try t.expect(tailUnread(128, 2048, 129, false));
     try t.expect(!tailUnread(128, 128, 2048, false));
     try t.expect(!tailUnread(0, 2048, 2048, false));
+}
+
+test "dsv41 warm: the wide warm plans every compressed-row count of every ratio, however many ratios a model has" {
+    var ratios: [15]u8 = undefined;
+    for (&ratios, 2..) |*r, v| r.* = @intCast(v);
+    const width = 2048;
+    const plans = try widePlans(std.testing.allocator, width, 6, &ratios);
+    defer std.testing.allocator.free(plans);
+    for (ratios) |ratio| for (1..17) |c| {
+        const rows = @max(c * ratio, dsv41_borrow.verify_rows + 1);
+        if (rows >= (c + 1) * ratio) continue;
+        var found = false;
+        for (plans) |p| found = found or (p[0] == rows and p[1] == 0);
+        try std.testing.expect(found);
+    };
+    try std.testing.expect(plans.len > 64);
+    try std.testing.expectEqual([2]usize{ width, 0 }, plans[plans.len - 1]);
 }

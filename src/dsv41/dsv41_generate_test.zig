@@ -379,63 +379,39 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
 
 test "dsv41 engine: DSpark rounds on the engine of our own say MLX's tokens at every round-width mix (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was);
-    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
-    defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
-    defer sc.deinit();
-    const ids = try dsv41_model.tokens(&sc, &fx);
-    defer a.free(ids);
-    var config = try model_mod.parseConfig(io, a, dir);
-    defer config.deinit(a);
-    config.expert_streaming = true;
-    config.stream_mtp_head = true;
-    config.expert_cache_bytes = 64 << 20;
-    config.expert_source_dir = try a.dupe(u8, dir);
-    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
-    defer weights.deinit();
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    const m = dsv41_state.modelOf(&xfm).?;
-    try testing.expect(m.dspark != null);
-    var tok = Tokenizer.initEmpty(a);
-    defer tok.deinit();
-    const prompt = ids[0..30];
     const want: u32 = 60;
     var first: std.ArrayList(u32) = .empty;
     defer first.deinit(a);
-    // MLX alone, then the engine's drafts and verifies under rounds of one row, of three rows, a cycle through every
-    // width, and the adaptive policy. The prompt is MLX's either way, so each request crosses once.
-    const Arm = struct { engine: bool, mode: ?DsparkDiag };
-    const arms = [_]Arm{ .{ .engine = false, .mode = .{ .rows = 1 } }, .{ .engine = true, .mode = .{ .rows = 1 } }, .{ .engine = true, .mode = .{ .rows = 3 } }, .{ .engine = true, .mode = .sweep }, .{ .engine = true, .mode = null } };
-    for (arms, 0..) |arm, i| {
-        m.engine_decode = arm.engine;
-        defer m.engine_decode = false;
-        const before = mlx.engine.stats();
-        try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
-        defer gen.deinit(a);
-        if (arm.mode) |d| gen.dspark_diag = d;
-        var got: std.ArrayList(u32) = .empty;
-        defer got.deinit(a);
-        while (try gen.nextDspark(a)) |r| {
-            defer a.free(r.tokens);
-            try got.appendSlice(a, r.tokens);
-        }
-        try testing.expectEqual(@as(usize, want), got.items.len);
-        if (i == 0) try first.appendSlice(a, got.items) else try testing.expectEqualSlices(u32, first.items, got.items);
-        if (i == 1) try testing.expect(mlx.engine.stats().dispatches > before.dispatches and mlx.engine.stats().lends > before.lends);
+    {
+        var ref: EngineFixture = undefined;
+        try ref.openAsking(dir, .flag);
+        defer ref.deinit();
+        try testing.expect(!ref.model().onEngine());
+        first = try dsparkTokens(a, &ref, ref.ids[0..30], want, .{ .rows = 1 });
     }
+    // The engine's drafts and verifies under rounds of one row, of three rows, a cycle through every width, and the
+    // adaptive policy: one Cooler load, which asks MLX nothing.
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    try testing.expect(fx.model().onEngine() and fx.model().dspark != null);
+    const ops = mlx.engine.mlx_ops;
+    const before = mlx.engine.stats().dispatches;
+    for ([_]?DsparkDiag{ .{ .rows = 1 }, .{ .rows = 3 }, .sweep, null }) |mode| {
+        var got = try dsparkTokens(a, &fx, fx.ids[0..30], want, mode);
+        defer got.deinit(a);
+        try testing.expectEqualSlices(u32, first.items, got.items);
+    }
+    try testing.expect(mlx.engine.stats().dispatches > before);
+    try testing.expectEqual(ops, mlx.engine.mlx_ops);
 }
 
 /// The first word of the bits MLX would draw from its next key.
 fn mlxNextWord() !u32 {
+    const turn = mlx.engine.turnTo(false);
+    defer turn.end();
     const s = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(s);
     var bits = mlx.mlx_array_new();
@@ -447,10 +423,8 @@ fn mlxNextWord() !u32 {
 
 /// One sampled DSpark request over `prompt`, at `mode`; on the engine no round lends to MLX, and the request leaves
 /// MLX's key sequence where it was.
-fn sampledRun(a: std.mem.Allocator, io: std.Io, xfm: *Trunk, tok: *Tokenizer, prompt: []const u32, want: u32, sampled: SamplingParams, mode: ?DsparkDiag, mask: ?mlx.mlx_array, on_engine: bool) !std.ArrayList(u32) {
-    const m = dsv41_state.modelOf(xfm).?;
-    m.engine_decode = on_engine;
-    defer m.engine_decode = false;
+fn sampledRun(a: std.mem.Allocator, io: std.Io, xfm: *Trunk, tok: *Tokenizer, prompt: []const u32, want: u32, sampled: SamplingParams, mode: ?DsparkDiag, mask: ?mlx.mlx_array) !std.ArrayList(u32) {
+    const on_engine = dsv41_state.modelOf(xfm).?.onEngine();
     try xfm.resetCache();
     var gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, want, sampled, &.{}, .{ .dspark_enabled = true });
     defer gen.deinit(a);
@@ -477,90 +451,73 @@ fn sampledRun(a: std.mem.Allocator, io: std.Io, xfm: *Trunk, tok: *Tokenizer, pr
 
 test "dsv41 engine: a sampled DSpark request on the engine of our own repeats at every round-width mix, a seed or a root of its own gives other tokens, and no round touches MLX (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was);
-    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
-    defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
-    defer sc.deinit();
-    const ids = try dsv41_model.tokens(&sc, &fx);
-    defer a.free(ids);
-    var config = try model_mod.parseConfig(io, a, dir);
-    defer config.deinit(a);
-    config.expert_streaming = true;
-    config.stream_mtp_head = true;
-    config.expert_cache_bytes = 64 << 20;
-    config.expert_source_dir = try a.dupe(u8, dir);
-    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
-    defer weights.deinit();
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    const m = dsv41_state.modelOf(&xfm).?;
-    try testing.expect(m.dspark != null);
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
-    const prompt = ids[0..30];
     const want: u32 = 60;
     const modes = [_]?DsparkDiag{ .{ .rows = 1 }, .{ .rows = 3 }, .sweep, null };
-    // Every seventh id suppressed: the mask is the model's own array, which the engine imports.
-    const vocab: usize = m.cfg.vocab;
-    const flags = try a.alloc(bool, vocab);
-    defer a.free(flags);
-    for (flags, 0..) |*f, id| f.* = id % 7 == 0;
-    const mask = mlx.mlx_array_new_data(flags.ptr, &[_]c_int{@intCast(vocab)}, 1, .bool_);
-    defer _ = mlx.mlx_array_free(mask);
-
-    // A seeded draw is keyed by its position, so every round mix says the same tokens, on each route by its own keys.
-    var engine_ref: [2]std.ArrayList(u32) = .{ .empty, .empty };
-    var mlx_ref: [2]std.ArrayList(u32) = .{ .empty, .empty };
-    defer for (&engine_ref) |*r| r.deinit(a);
-    defer for (&mlx_ref) |*r| r.deinit(a);
     const sampled = SamplingParams{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
-    for ([_]bool{ false, true }) |masked| for (modes) |mode| for ([_]bool{ true, false }) |on_engine| {
-        var got = try sampledRun(a, io, &xfm, &tok, prompt, want, sampled, mode, if (masked) mask else null, on_engine);
-        defer got.deinit(a);
-        const ref = &(if (on_engine) engine_ref else mlx_ref)[@intFromBool(masked)];
-        if (ref.items.len == 0) try ref.appendSlice(a, got.items) else try testing.expectEqualSlices(u32, ref.items, got.items);
-    };
-    // A request that stops sooner is a prefix: how a stream ends moves no draw.
-    var short = try sampledRun(a, io, &xfm, &tok, prompt, 37, sampled, .sweep, null, true);
-    defer short.deinit(a);
-    try testing.expectEqualSlices(u32, engine_ref[0].items[0..37], short.items);
+    // A seeded draw is keyed by its position, so every round mix says the same tokens, on each route by its own keys:
+    // MLX's load and the Cooler load each hold their own, masked and not.
+    var refs: [2][2]std.ArrayList(u32) = .{ .{ .empty, .empty }, .{ .empty, .empty } };
+    defer for (&refs) |*side| for (side) |*r| r.deinit(a);
+    for ([_]bool{ false, true }) |cooler| {
+        var fx: EngineFixture = undefined;
+        if (cooler) try fx.open(dir) else try fx.openAsking(dir, .flag);
+        defer fx.deinit();
+        const m = fx.model();
+        try testing.expect(m.dspark != null and m.onEngine() == cooler);
+        const prompt = fx.ids[0..30];
+        // Every seventh id suppressed: the mask is the model's own array, which the engine imports.
+        const vocab: usize = m.cfg.vocab;
+        const flags = try a.alloc(bool, vocab);
+        defer a.free(flags);
+        for (flags, 0..) |*f, id| f.* = id % 7 == 0;
+        const mask = mlx.mlx_array_new_data(flags.ptr, &[_]c_int{@intCast(vocab)}, 1, .bool_);
+        defer _ = mlx.mlx_array_free(mask);
+        for ([_]bool{ false, true }) |masked| for (modes) |mode| {
+            var got = try sampledRun(a, io, &fx.xfm, &tok, prompt, want, sampled, mode, if (masked) mask else null);
+            defer got.deinit(a);
+            const ref = &refs[@intFromBool(cooler)][@intFromBool(masked)];
+            if (ref.items.len == 0) try ref.appendSlice(a, got.items) else try testing.expectEqualSlices(u32, ref.items, got.items);
+        };
+        if (!cooler) continue;
+        const engine_ref = refs[1];
+        // A request that stops sooner is a prefix: how a stream ends moves no draw.
+        var short = try sampledRun(a, io, &fx.xfm, &tok, prompt, 37, sampled, .sweep, null);
+        defer short.deinit(a);
+        try testing.expectEqualSlices(u32, engine_ref[0].items[0..37], short.items);
 
-    // Another seed, and two requests with none, draw other tokens (the first token is the serial sampler's, on MLX).
-    var other = try sampledRun(a, io, &xfm, &tok, prompt, want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 8 }, .{ .rows = 3 }, null, true);
-    defer other.deinit(a);
-    try testing.expect(!std.mem.eql(u32, engine_ref[0].items[1..], other.items[1..]));
-    var unseeded: [2]std.ArrayList(u32) = .{ .empty, .empty };
-    defer for (&unseeded) |*r| r.deinit(a);
-    for (&unseeded) |*r| r.* = try sampledRun(a, io, &xfm, &tok, prompt, want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95 }, .{ .rows = 3 }, null, true);
-    try testing.expect(!std.mem.eql(u32, unseeded[0].items[1..], unseeded[1].items[1..]));
-    try testing.expect(!std.mem.eql(u32, engine_ref[0].items[1..], unseeded[0].items[1..]));
+        // Another seed, and two requests with none, draw other tokens.
+        var other = try sampledRun(a, io, &fx.xfm, &tok, prompt, want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 8 }, .{ .rows = 3 }, null);
+        defer other.deinit(a);
+        try testing.expect(!std.mem.eql(u32, engine_ref[0].items[1..], other.items[1..]));
+        var unseeded: [2]std.ArrayList(u32) = .{ .empty, .empty };
+        defer for (&unseeded) |*r| r.deinit(a);
+        for (&unseeded) |*r| r.* = try sampledRun(a, io, &fx.xfm, &tok, prompt, want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95 }, .{ .rows = 3 }, null);
+        try testing.expect(!std.mem.eql(u32, unseeded[0].items[1..], unseeded[1].items[1..]));
+        try testing.expect(!std.mem.eql(u32, engine_ref[0].items[1..], unseeded[0].items[1..]));
 
-    // The verdict itself puts no op on MLX and lends nothing, seeded or not, with a mask or without.
-    m.engine_decode = true;
-    defer m.engine_decode = false;
-    const rows = 4;
-    var host: [rows * 64]f32 = undefined;
-    for (&host, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 2654435761) % 1000)) / 250.0;
-    const logits = mlx.mlx_array_new_data(&host, &[_]c_int{ 1, rows, 64 }, 3, .float32);
-    defer _ = mlx.mlx_array_free(logits);
-    const drafts = [_]u32{ 3, 9, 20 };
-    for ([_]?u64{ 7, null }) |seed| {
-        try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = seed }, &.{}, .{ .dspark_enabled = true });
-        defer gen.deinit(a);
-        const before = mlx.engine.stats();
-        const ops = mlx.engine.mlx_ops;
-        const verdict = try dsv41_dspark.dsparkSampledVerdict(&gen, logits, &drafts);
-        try testing.expect(verdict.accepted <= drafts.len);
-        try testing.expectEqual(ops, mlx.engine.mlx_ops);
-        try testing.expectEqual(before.lends, mlx.engine.stats().lends);
+        // The verdict itself puts no op on MLX and lends nothing, seeded or not.
+        const rows = 4;
+        var host: [rows * 64]f32 = undefined;
+        for (&host, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 2654435761) % 1000)) / 250.0;
+        const logits = mlx.mlx_array_new_data(&host, &[_]c_int{ 1, rows, 64 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(logits);
+        const drafts = [_]u32{ 3, 9, 20 };
+        for ([_]?u64{ 7, null }) |seed| {
+            try fx.xfm.resetCache();
+            var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = seed }, &.{}, .{ .dspark_enabled = true });
+            defer gen.deinit(a);
+            const before = mlx.engine.stats();
+            const ops = mlx.engine.mlx_ops;
+            const verdict = try dsv41_dspark.dsparkSampledVerdict(&gen, logits, &drafts);
+            try testing.expect(verdict.accepted <= drafts.len);
+            try testing.expectEqual(ops, mlx.engine.mlx_ops);
+            try testing.expectEqual(before.lends, mlx.engine.stats().lends);
+        }
     }
 }
 
@@ -1263,43 +1220,35 @@ test "dsv41 generator: a one-row decode that hands its logits back unevaluated a
     try lazyHeadProof(dir, true, true);
 }
 
-/// Greedy one-row decode on the engine of our own against the same steps on MLX.
+/// Greedy one-row decode on the engine of our own against the same steps on MLX: a load of each side.
 fn engineDecodeProof(dir: []const u8, stq: bool) !void {
     try mlx.requireGpu();
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const dsv41_model = @import("dsv41_model.zig");
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was);
-    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
-    defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
-    defer sc.deinit();
-    const ids = try dsv41_model.tokens(&sc, &fx);
-    defer a.free(ids);
-    var config = try model_mod.parseConfig(io, a, dir);
-    defer config.deinit(a);
-    config.expert_streaming = true;
-    config.expert_cache_bytes = if (stq) 64 << 20 else 3 * config.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&config.dsv41.?);
-    config.expert_source_dir = try a.dupe(u8, dir);
-    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
-    defer weights.deinit();
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    const m = dsv41_state.modelOf(&xfm).?;
-    const prompt = ids[0..30];
+    var probe = try model_mod.parseConfig(io, a, dir);
+    defer probe.deinit(a);
+    const cache: u64 = if (stq) 64 << 20 else 3 * probe.num_hidden_layers * try @import("dsv41_stream.zig").expertBytes(&probe.dsv41.?);
     const steps: usize = 24;
-    var want = try lazyHeadSteps(a, &xfm, prompt, steps, false);
+    var want: LazyHeadRun = .{};
     defer want.deinit(a);
-    m.engine_decode = true;
-    defer m.engine_decode = false;
-    const before = mlx.engine.stats();
-    var got = try lazyHeadSteps(a, &xfm, prompt, steps, false);
-    defer got.deinit(a);
-    try testing.expect(mlx.engine.stats().dispatches > before.dispatches);
-    try testing.expectEqualSlices(u32, want.tokens.items, got.tokens.items);
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(got.logits.items));
+    for ([_]bool{ false, true }) |cooler| {
+        var fx: EngineFixture = undefined;
+        try fx.prepare(dir, if (cooler) null else .flag, cache);
+        fx.config.stream_mtp_head = false;
+        try fx.load(dir);
+        defer fx.deinit();
+        try testing.expectEqual(cooler, fx.model().onEngine());
+        const before = mlx.engine.stats().dispatches;
+        var run = try lazyHeadSteps(a, &fx.xfm, fx.ids[0..30], steps, false);
+        if (!cooler) {
+            want = run;
+            continue;
+        }
+        defer run.deinit(a);
+        try testing.expect(mlx.engine.stats().dispatches > before);
+        try testing.expectEqualSlices(u32, want.tokens.items, run.tokens.items);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits.items), std.mem.sliceAsBytes(run.logits.items));
+    }
 }
 
 /// Every byte `rounds` DSpark rounds hand the generator: each draft's ids and confidences, then the logits of its
@@ -1374,41 +1323,26 @@ test "dsv41 engine: a serial step and a one-row round give one position the same
 
 test "dsv41 engine: a DSpark round on the engine gives MLX's draft, confidences and verify logits bit for bit at every width (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was);
-    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
-    defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
-    defer sc.deinit();
-    const ids = try dsv41_model.tokens(&sc, &fx);
-    defer a.free(ids);
-    var config = try model_mod.parseConfig(io, a, dir);
-    defer config.deinit(a);
-    config.expert_streaming = true;
-    config.stream_mtp_head = true;
-    config.expert_cache_bytes = 64 << 20;
-    config.expert_source_dir = try a.dupe(u8, dir);
-    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
-    defer weights.deinit();
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    const m = dsv41_state.modelOf(&xfm).?;
-    try testing.expect(m.dspark != null);
     const rounds = 2 * @as(usize, dsv41_max_verify_rows);
-    var want = try dsparkRoundBytes(a, &xfm, ids[0..30], rounds);
+    var want: std.ArrayList(u8) = .empty;
     defer want.deinit(a);
-    m.engine_decode = true;
-    defer m.engine_decode = false;
-    const before = mlx.engine.stats();
-    var got = try dsparkRoundBytes(a, &xfm, ids[0..30], rounds);
-    defer got.deinit(a);
-    try testing.expect(mlx.engine.stats().dispatches > before.dispatches);
-    try testing.expectEqualSlices(u8, want.items, got.items);
+    for ([_]bool{ false, true }) |cooler| {
+        var fx: EngineFixture = undefined;
+        if (cooler) try fx.open(dir) else try fx.openMlx(dir);
+        defer fx.deinit();
+        try testing.expect(fx.model().dspark != null and fx.model().onEngine() == cooler);
+        const before = mlx.engine.stats().dispatches;
+        var got = try dsparkRoundBytes(a, &fx.xfm, fx.ids[0..30], rounds);
+        if (!cooler) {
+            want = got;
+            continue;
+        }
+        defer got.deinit(a);
+        try testing.expect(mlx.engine.stats().dispatches > before);
+        try testing.expectEqualSlices(u8, want.items, got.items);
+    }
 }
 
 test "dsv41 engine: the load clock times every phase of a load and the phases add up to its total (DSV41_STQ_TINY)" {
@@ -1420,15 +1354,13 @@ test "dsv41 engine: the load clock times every phase of a load and the phases ad
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was);
-    const own_was = dsv41_borrow.own_override;
-    dsv41_borrow.own_override = true;
-    defer dsv41_borrow.own_override = own_was;
     var config = try model_mod.parseConfig(io, a, dir);
     defer config.deinit(a);
     config.expert_streaming = true;
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try a.dupe(u8, dir);
+    config.dsv41.?.cooler_for_test = true;
     const made_before = mlx.engine.pipelinesMade();
     load_clock.begin();
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
@@ -1459,7 +1391,6 @@ const EngineFixture = struct {
     xfm: Trunk,
     ids: []u32,
     was_enabled: bool,
-    was_own: ?bool,
 
     fn open(self: *EngineFixture, dir: []const u8) !void {
         return self.openAsking(dir, null);
@@ -1488,9 +1419,7 @@ const EngineFixture = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
         const dsv41_model = @import("dsv41_model.zig");
         self.was_enabled = mlx.engine.enabled;
-        self.was_own = dsv41_borrow.own_override;
         mlx.engine.enabled = true;
-        dsv41_borrow.own_override = true;
         errdefer self.restore();
         var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
         defer fx.deinit();
@@ -1504,10 +1433,9 @@ const EngineFixture = struct {
         self.config.stream_mtp_head = true;
         self.config.expert_cache_bytes = cache_bytes;
         self.config.expert_source_dir = try a.dupe(u8, dir);
-        if (ask) |x| {
-            self.config.dsv41.?.mlx_ask = x;
-            dsv41_borrow.own_override = dsv41_borrow.decodeSideOf(&self.config.dsv41.?) == .engine;
-        }
+        // The side is the load's: every copy of this config carries it for the model's life.
+        if (ask) |x| self.config.dsv41.?.mlx_ask = x;
+        self.config.dsv41.?.cooler_for_test = dsv41_borrow.decodeSideOf(&self.config.dsv41.?) == .engine;
     }
 
     /// The load itself: the weights and the model over them.
@@ -1526,7 +1454,6 @@ const EngineFixture = struct {
 
     fn restore(self: *EngineFixture) void {
         test_support.restoreEngine(self.was_enabled);
-        dsv41_borrow.own_override = self.was_own;
     }
 
     fn deinit(self: *EngineFixture) void {
@@ -1576,7 +1503,15 @@ fn shortPrefillBytes(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, lea
 
 test "dsv41 engine: the same greedy tokens come from a load with Sushi Cooler on and with the setting or the flag off, and an off load runs no engine dispatch (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    try expectCoolerChoiceKeepsTokens(std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest));
+}
+
+test "dsv41 engine: the release's layout (FP8 trunk, MXFP4 experts) decodes on Sushi Cooler at its load, with the tokens of a load with the setting or the flag off (DSV41_TINY)" {
+    try mlx.requireGpu();
+    try expectCoolerChoiceKeepsTokens(std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest));
+}
+
+fn expectCoolerChoiceKeepsTokens(dir: []const u8) !void {
     const a = testing.allocator;
     var bytes: [3]std.ArrayList(u8) = @splat(.empty);
     defer for (&bytes) |*b| b.deinit(a);
@@ -1584,7 +1519,7 @@ test "dsv41 engine: the same greedy tokens come from a load with Sushi Cooler on
         var fx: EngineFixture = undefined;
         try fx.openAsking(dir, ask);
         defer fx.deinit();
-        try testing.expectEqual(ask == .none, fx.model().engine_decode);
+        try testing.expectEqual(ask == .none, fx.model().onEngine());
         var buf: [48]u32 = undefined;
         const prompt = fx.prompt(&buf);
         const before = mlx.engine.stats().dispatches;
@@ -1906,7 +1841,15 @@ fn censusOf(dir: []const u8, work: *[9]u64) ![9]Asked {
 
 test "dsv41 engine: a Cooler load, its requests and its unload ask nothing of MLX, phase by phase, and dispatch the same work at a later load (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    try expectCoolerAsksNothing(std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest));
+}
+
+test "dsv41 engine: a Cooler load of the release's layout (FP8 trunk, MXFP4 experts), its requests and its unload ask nothing of MLX, phase by phase, and dispatch the same work at a later load (DSV41_TINY)" {
+    try mlx.requireGpu();
+    try expectCoolerAsksNothing(std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest));
+}
+
+fn expectCoolerAsksNothing(dir: []const u8) !void {
     var work: [2][9]u64 = undefined;
     const asked = try censusOf(dir, &work[0]);
     // A Cooler load holds the engine's scope from its first tensor to its unload: nothing is asked of MLX, whose
@@ -1951,13 +1894,8 @@ test "dsv41 serving: a model another model's load evicts writes its live restore
     const registry_mod = @import("../model_registry.zig");
     const scheduler_mod = @import("../scheduler.zig");
     const was_enabled = mlx.engine.enabled;
-    const was_own = dsv41_borrow.own_override;
     mlx.engine.enabled = true;
-    dsv41_borrow.own_override = true;
-    defer {
-        test_support.restoreEngine(was_enabled);
-        dsv41_borrow.own_override = was_own;
-    }
+    defer test_support.restoreEngine(was_enabled);
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var path_buf: [512]u8 = undefined;
@@ -1974,6 +1912,7 @@ test "dsv41 serving: a model another model's load evicts writes its live restore
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try a.dupe(u8, dir);
+    config.dsv41.?.cooler_for_test = true;
     const weights = try a.create(model_mod.Weights);
     weights.* = try model_mod.loadWeightsForConfig(io, a, dir, config, false);
     victim.weights = weights;
@@ -2383,14 +2322,12 @@ test "dsv41 engine: a Cooler model and a model on MLX loaded beside it each serv
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was_enabled);
-    // The two fixtures below close in the order they opened, so each would put back what the other had set.
-    const was_own = dsv41_borrow.own_override;
-    defer dsv41_borrow.own_override = was_own;
     defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
     var buf: [24]u32 = undefined;
-    // The server's unload hook runs on a config that outlives the model.
+    // The server's unload hook runs on a config that outlives the model: the Cooler's, which names its side.
     var kept = try model_mod.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, dir);
     defer kept.deinit(a);
+    kept.dsv41.?.cooler_for_test = true;
     var want_mlx: std.ArrayList(u8) = .empty;
     defer want_mlx.deinit(a);
     var want_own: std.ArrayList(u8) = .empty;
@@ -3009,7 +2946,7 @@ test "dsv41 engine: after the load a forward of every width from 1 to 16 and a D
     try fx.open(dir);
     defer fx.deinit();
     const m = fx.model();
-    try testing.expect(m.engine_decode);
+    try testing.expect(m.onEngine());
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf);
     const late = mlx.engine.latePipelines();
@@ -3034,6 +2971,36 @@ test "dsv41 engine: after the load a forward of every width from 1 to 16 and a D
     try testing.expectEqual(keys, mlx.kernel_keys.count());
 }
 
+test "dsv41 engine: a load with no drafter compiles nothing after the load at any forward width from 1 to 16 from any position, STQ or the release's layout (DSV41_STQ_TINY, DSV41_TINY)" {
+    try mlx.requireGpu();
+    for ([_][*:0]const u8{ "DSV41_STQ_TINY", "DSV41_TINY" }) |env| {
+        const dir = std.mem.span(std.c.getenv(env) orelse continue);
+        var fx: EngineFixture = undefined;
+        try fx.prepare(dir, null, 64 << 20);
+        fx.config.stream_mtp_head = false;
+        try fx.load(dir);
+        defer fx.deinit();
+        const m = fx.model();
+        try testing.expect(m.onEngine() and m.dspark == null);
+        var buf: [48]u32 = undefined;
+        const prompt = fx.prompt(&buf);
+        const late = mlx.engine.latePipelines();
+        const keys = mlx.kernel_keys.trackForTest();
+        // A forward's kernels depend on how many rows the state already holds (a span of one compressed row): the
+        // first positions and one well past them.
+        for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 30 }) |lead| for (1..17) |k| {
+            try fx.xfm.resetCache();
+            var ctx = fx.xfm.defaultCtx();
+            if (lead > 0) _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt[0..lead]));
+            const lg = try forwardIds(&fx.xfm, &ctx, prompt[lead..][0..k]);
+            defer _ = mlx.mlx_array_free(lg);
+            try mlx.check(mlx.mlx_array_eval(lg));
+        };
+        try testing.expectEqual(late, mlx.engine.latePipelines());
+        try testing.expectEqual(keys, mlx.kernel_keys.count());
+    }
+}
+
 test "dsv41 engine: after the load a round whose rows take two attention split counts compiles nothing, at any width (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
@@ -3041,7 +3008,7 @@ test "dsv41 engine: after the load a round whose rows take two attention split c
     try fx.open(dir);
     defer fx.deinit();
     const m = fx.model();
-    try testing.expect(m.engine_decode);
+    try testing.expect(m.onEngine());
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf);
     // The fixture's contexts hold one split count, so a round's rows are launched apart by hand.
@@ -3079,7 +3046,7 @@ test "dsv41 engine: after the load a restore point captured at any position comp
     try fx.open(dir);
     defer fx.deinit();
     const m = fx.model();
-    try testing.expect(m.engine_decode);
+    try testing.expect(m.onEngine());
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf);
     const late = mlx.engine.latePipelines();
@@ -3103,7 +3070,7 @@ test "dsv41 engine: the warm's restore-point copies include an open pooling grou
     try fx.open(dir);
     defer fx.deinit();
     const m = fx.model();
-    try testing.expect(m.engine_decode);
+    try testing.expect(m.onEngine());
     // A position every layer's ratio divides: no pooling group is open there, so a point taken there copies no such row.
     var whole: usize = 1;
     for (m.cfg.ratios[0..m.cfg.layers]) |r| if (r > 1) {
@@ -3157,14 +3124,13 @@ test "dsv41 engine: after the load's warm no step or round compiles a kernel, wh
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try a.dupe(u8, dir);
+    config.dsv41.?.cooler_for_test = true;
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
     try testing.expect(m.dspark != null);
-    m.engine_decode = true;
-    defer m.engine_decode = false;
     try dsv41_model.warmKernels(m);
     mlx.engine.seal(true);
     defer mlx.engine.seal(false);
@@ -3216,14 +3182,13 @@ test "dsv41 engine: after the load's warm a draft compiles no kernel at any fill
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try a.dupe(u8, dir);
+    config.dsv41.?.cooler_for_test = true;
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
     try testing.expect(m.dspark != null);
-    m.engine_decode = true;
-    defer m.engine_decode = false;
     // The fixture's window of 8 rows is under every size at which MLX changes kernels: a wider one crosses them.
     m.cfg.window = 80;
     try dsv41_model.warmKernels(m);
@@ -3260,13 +3225,12 @@ test "dsv41 engine: the load's warm makes the split top-k a one-row step takes o
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try a.dupe(u8, dir);
+    config.dsv41.?.cooler_for_test = true;
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
-    m.engine_decode = true;
-    defer m.engine_decode = false;
     try dsv41_model.warmKernels(m);
     mlx.engine.seal(true);
     defer mlx.engine.seal(false);
@@ -3345,8 +3309,8 @@ fn wideRun(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, chunks: []con
     return run;
 }
 
-/// Each of `plans` (a prompt cut into chunks) run on MLX and then on the engine of our own, with the wide chunks sent
-/// there too.
+/// Each of `plans` (a prompt cut into chunks) run on an MLX load and then on a Cooler load, whose wide chunks are the
+/// engine's too.
 /// `cache_bytes` below the experts of the pack makes the chunks stream (the union and the staged fill); `stall_ns` pauses
 /// the staged fill after each rate group, on the engine's run only. With `refused`, the engine's run stages the fill on the
 /// engine, which must stop with an error that names it.
@@ -3368,66 +3332,73 @@ fn wideChunkProof(dir: []const u8, plans: []const []const usize, cache_bytes: u6
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
-    var config = try model_mod.parseConfig(io, a, dir);
-    defer config.deinit(a);
-    config.expert_streaming = true;
-    config.expert_cache_bytes = cache_bytes;
-    config.expert_source_dir = try a.dupe(u8, dir);
-    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
-    defer weights.deinit();
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    const m = dsv41_state.modelOf(&xfm).?;
-    const hook = dsv41_state.stqExpertsOf(&xfm).?;
     var prompt: [1100]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
-    for (plans) |chunks| {
-        var want = try wideRun(a, &xfm, &prompt, chunks, 12);
-        defer want.deinit(a);
-        m.engine_decode = true;
-        m.engine_prefill = true;
-        hook.stall_ns = stall_ns;
-        hook.stage_on_engine = refused != null;
-        try hook.engine.keepScales();
-        const filled = hook.engine.fill_bytes_total;
-        defer {
-            m.engine_decode = false;
-            m.engine_prefill = false;
-            hook.stall_ns = 0;
-            hook.stage_on_engine = false;
-        }
-        if (refused) |name| {
-            if (wideRun(a, &xfm, &prompt, chunks, 12)) |ran| {
-                var r = ran;
-                r.deinit(a);
-                return error.ExpectedRefusal;
-            } else |_| {}
-            var buf: [512]u8 = undefined;
-            const said = mlx.takeError(&buf) orelse return error.NoRefusalMessage;
-            // A refused forward gives the scope back as it found it.
-            try testing.expect(!mlx.engine.active);
-            try testing.expect(std.mem.indexOf(u8, said, name) != null);
-            // A refused launch is its own failure: the kernel arm it used stays on for the process.
-            try testing.expect(!@import("sushi_exl3").kernels.gemm_nax_failed);
-            return;
-        }
-        var got = wideRun(a, &xfm, &prompt, chunks, 12) catch |e| {
-            var buf: [512]u8 = undefined;
-            if (mlx.takeError(&buf)) |said| std.debug.print("{s}\n", .{said});
-            return e;
-        };
-        defer got.deinit(a);
-        try testing.expectEqual(@as(u64, 0), want.prefill_dispatches);
-        try testing.expect(got.prefill_dispatches > 0);
-        try testing.expectEqual(cache_bytes < (64 << 20), hook.engine.fill_bytes_total > filled);
-        // The GPU has everything encoded before a read of the route began.
-        try testing.expectEqual(@as(u64, 0), hook.held_at_read);
-        try want.expectSame(&got);
-        if (cache_bytes < (64 << 20)) {
-            // An expert's scales are read from the SSD once; a later miss of it copies them and reads its trellis only.
-            const kept = hook.engine.kept.?;
-            try testing.expect(kept.read > 0 and kept.read <= kept.entries.len);
-            try testing.expect(kept.served > 0);
+    var wants: std.ArrayList(WideRun) = .empty;
+    defer {
+        for (wants.items) |*w| w.deinit(a);
+        wants.deinit(a);
+    }
+    for ([_]bool{ false, true }) |cooler| {
+        var config = try model_mod.parseConfig(io, a, dir);
+        defer config.deinit(a);
+        config.expert_streaming = true;
+        config.expert_cache_bytes = cache_bytes;
+        config.expert_source_dir = try a.dupe(u8, dir);
+        config.dsv41.?.cooler_for_test = cooler;
+        var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+        defer weights.deinit();
+        var xfm = try Trunk.init(io, a, config, &weights);
+        defer xfm.deinit();
+        try testing.expectEqual(cooler, dsv41_state.modelOf(&xfm).?.onEngine());
+        const hook = dsv41_state.stqExpertsOf(&xfm).?;
+        for (plans, 0..) |chunks, pi| {
+            if (!cooler) {
+                try wants.append(a, try wideRun(a, &xfm, &prompt, chunks, 12));
+                continue;
+            }
+            const want = &wants.items[pi];
+            hook.stall_ns = stall_ns;
+            hook.stage_on_engine = refused != null;
+            const filled = hook.engine.fill_bytes_total;
+            defer {
+                hook.stall_ns = 0;
+                hook.stage_on_engine = false;
+            }
+            if (refused) |name| {
+                const scope_was = mlx.engine.active;
+                if (wideRun(a, &xfm, &prompt, chunks, 12)) |ran| {
+                    var r = ran;
+                    r.deinit(a);
+                    return error.ExpectedRefusal;
+                } else |_| {}
+                var buf: [512]u8 = undefined;
+                const said = mlx.takeError(&buf) orelse return error.NoRefusalMessage;
+                // A refused forward gives the scope back as it found it.
+                try testing.expectEqual(scope_was, mlx.engine.active);
+                try testing.expect(std.mem.indexOf(u8, said, name) != null);
+                // A refused launch is its own failure: the kernel arm it used stays on for the process.
+                try testing.expect(!@import("sushi_exl3").kernels.gemm_nax_failed);
+                return;
+            }
+            var got = wideRun(a, &xfm, &prompt, chunks, 12) catch |e| {
+                var buf: [512]u8 = undefined;
+                if (mlx.takeError(&buf)) |said| std.debug.print("{s}\n", .{said});
+                return e;
+            };
+            defer got.deinit(a);
+            try testing.expectEqual(@as(u64, 0), want.prefill_dispatches);
+            try testing.expect(got.prefill_dispatches > 0);
+            try testing.expectEqual(cache_bytes < (64 << 20), hook.engine.fill_bytes_total > filled);
+            // The GPU has everything encoded before a read of the route began.
+            try testing.expectEqual(@as(u64, 0), hook.held_at_read);
+            try want.expectSame(&got);
+            if (cache_bytes < (64 << 20)) {
+                // An expert's scales are read from the SSD once; a later miss of it copies them and reads its trellis only.
+                const kept = hook.engine.kept.?;
+                try testing.expect(kept.read > 0 and kept.read <= kept.entries.len);
+                try testing.expect(kept.served > 0);
+            }
         }
     }
 }
@@ -3467,19 +3438,13 @@ test "dsv41 engine: after the load's wide warm, prompts cut at other widths comp
     config.expert_streaming = true;
     config.expert_cache_bytes = 3 * 8 * (256 * 128 * 3 * 64 / 128);
     config.expert_source_dir = try a.dupe(u8, dir);
+    config.dsv41.?.cooler_for_test = true;
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
-    m.engine_decode = true;
-    m.engine_prefill = true;
-    dsv41_borrow.own_override = true;
-    defer {
-        m.engine_decode = false;
-        m.engine_prefill = false;
-        dsv41_borrow.own_override = null;
-    }
+    try testing.expect(m.onEngine());
     try dsv41_serving.warmAllAt(&xfm, m, dsv41_state.stqExpertsOf(&xfm), .all, 256);
     mlx.engine.seal(true);
     defer mlx.engine.seal(false);
@@ -3538,16 +3503,16 @@ test "dsv41 engine: the load's warm runs every engine forward, decode-width and 
     config.expert_streaming = true;
     config.expert_cache_bytes = 3 * 8 * (256 * 128 * 3 * 64 / 128);
     config.expert_source_dir = try a.dupe(u8, dir);
+    config.dsv41.?.cooler_for_test = true;
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    // The Cooler load holds the engine's scope until it is freed: the tests after this one need it gone.
     var xfm = try Trunk.init(io, a, config, &weights);
+    defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
     const stq = dsv41_state.stqExpertsOf(&xfm);
-    m.engine_decode = true;
-    dsv41_borrow.own_override = true;
+    try testing.expect(m.onEngine());
     defer {
-        m.engine_decode = false;
-        m.engine_prefill = false;
-        dsv41_borrow.own_override = null;
         dsv41_borrow.warm_budget = false;
         dsv41_borrow.warm_budget_override = null;
         // The budget is the engine's for the process: the tests after this one run with none.
@@ -3557,7 +3522,6 @@ test "dsv41 engine: the load's warm runs every engine forward, decode-width and 
     try dsv41_serving.warmAllAt(&xfm, m, stq, .all, 256);
     // The wide warm installs a wide chunk's budget before its first work on the engine: the one a decode-width forward
     // left before it (a few KB here) covers no chunk.
-    m.engine_prefill = true;
     dsv41_borrow.warm_budget = true;
     try mlx.engine.budget(16 << 10);
     try dsv41_serving.warmWide(&xfm, m, stq, 256);
@@ -3565,7 +3529,6 @@ test "dsv41 engine: the load's warm runs every engine forward, decode-width and 
     dsv41_borrow.warm_budget_override = 0;
     try testing.expectError(error.PoolOverBudget, dsv41_serving.warmAllAt(&xfm, m, stq, .all, 256));
     // And the wide chunks do when the decode-width forwards come from a manifest.
-    m.engine_prefill = true;
     dsv41_borrow.warm_budget = true;
     try testing.expectError(error.MlxError, dsv41_serving.warmWide(&xfm, m, stq, 256));
     try testing.expect(mlx.takeErrorIf("PoolOverBudget"));
@@ -3586,19 +3549,6 @@ test "dsv41 engine: a prompt prefilled in chunks on the engine of our own, with 
     defer sc.deinit();
     const ids = try dsv41_model.tokens(&sc, &fx);
     defer a.free(ids);
-    var config = try model_mod.parseConfig(io, a, dir);
-    defer config.deinit(a);
-    config.expert_streaming = true;
-    config.stream_mtp_head = true;
-    config.expert_cache_bytes = 64 << 20;
-    config.expert_source_dir = try a.dupe(u8, dir);
-    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
-    defer weights.deinit();
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    const m = dsv41_state.modelOf(&xfm).?;
-    // Wider than a decode-width pass, as the release's window is: a narrower replay reads the ring below its floor.
-    m.cfg.window = 20;
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     var prompt: [1400]u32 = undefined;
@@ -3620,13 +3570,22 @@ test "dsv41 engine: a prompt prefilled in chunks on the engine of our own, with 
         r.points.deinit(a);
         r.positions.deinit(a);
     };
-    for (&runs, [_]bool{ false, true }) |*r, on_engine| {
-        m.engine_decode = on_engine;
-        m.engine_prefill = on_engine;
-        defer {
-            m.engine_decode = false;
-            m.engine_prefill = false;
-        }
+    for (&runs, [_]bool{ false, true }) |*r, cooler| {
+        var config = try model_mod.parseConfig(io, a, dir);
+        defer config.deinit(a);
+        config.expert_streaming = true;
+        config.stream_mtp_head = true;
+        config.expert_cache_bytes = 64 << 20;
+        config.expert_source_dir = try a.dupe(u8, dir);
+        config.dsv41.?.cooler_for_test = cooler;
+        var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+        defer weights.deinit();
+        var xfm = try Trunk.init(io, a, config, &weights);
+        defer xfm.deinit();
+        const m = dsv41_state.modelOf(&xfm).?;
+        try testing.expectEqual(cooler, m.onEngine());
+        // Wider than a decode-width pass, as the release's window is: a narrower replay reads the ring below its floor.
+        m.cfg.window = 20;
         try xfm.resetCache();
         const only_before = m.state_only_used;
         var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 12, .{ .temperature = 0.0 }, &.{}, opts);
@@ -3669,6 +3628,7 @@ test "dsv41 engine: after the load's warm a sampled DSpark request, seeded or no
     config.stream_mtp_head = true;
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try a.dupe(u8, dir);
+    config.dsv41.?.cooler_for_test = true;
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
@@ -3677,13 +3637,8 @@ test "dsv41 engine: after the load's warm a sampled DSpark request, seeded or no
     try testing.expect(m.dspark != null);
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
-    m.engine_decode = true;
-    dsv41_borrow.own_override = true;
-    defer {
-        m.engine_decode = false;
-        dsv41_borrow.own_override = null;
-        mlx.engine.budget(std.math.maxInt(u64)) catch {};
-    }
+    try testing.expect(m.onEngine());
+    defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
     try dsv41_serving.warmAll(&xfm, m, null, .all);
     mlx.engine.seal(true);
     defer mlx.engine.seal(false);
@@ -4984,14 +4939,9 @@ test "dsv41 DSpark: on the real pack each row of a wide verify is the bits of it
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
-test "dsv41 engine: on the real pack one-row steps and DSpark rounds on the engine give MLX's bytes (SUSHI_DSV41_REAL_PACK)" {
-    try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("SUSHI_DSV41_REAL_PACK") orelse return error.SkipZigTest);
-    const a = testing.allocator;
+/// The real pack's bytes of DSpark rounds and one-row steps, from a load that decides its side as a served load does.
+fn realPackBytes(a: std.mem.Allocator, dir: []const u8, own: bool, prompt_text: []const u8) !struct { rounds: std.ArrayList(u8), steps: LazyHeadRun } {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was);
     var config = try model_mod.parseConfig(io, a, dir);
     defer config.deinit(a);
     config.stream_mtp_head = true;
@@ -5001,32 +4951,44 @@ test "dsv41 engine: on the real pack one-row steps and DSpark rounds on the engi
     const plan = try model_load.planExpertStreamingWith(io, a, &config, dir, budget, false, 0);
     model_load.applyStreamingPlan(&config, plan, budget);
     config.expert_source_dir = try a.dupe(u8, dir);
+    if (!own) config.dsv41.?.mlx_ask = .flag;
+    config.dsv41.?.cooler_for_test = dsv41_borrow.decodeSideOf(&config.dsv41.?) == .engine;
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     const m = dsv41_state.modelOf(&xfm).?;
     try testing.expect(m.dspark != null);
+    try testing.expectEqual(own, m.onEngine());
     var tok = try tokenizer_mod.loadTokenizer(io, a, dir);
     defer tok.deinit();
-    const prompt = try tok.encode(a, "Write a long, detailed story about a lighthouse keeper and the storms of one winter. The keeper climbed the iron stairs each night, counting the steps as the wind rose over the black water.");
+    const prompt = try tok.encode(a, prompt_text);
     defer a.free(prompt);
-    const rounds = 3 * @as(usize, dsv41_max_verify_rows);
-    var want_rounds = try dsparkRoundBytes(a, &xfm, prompt, rounds);
-    defer want_rounds.deinit(a);
-    var want_steps = try lazyHeadSteps(a, &xfm, prompt, 24, false);
-    defer want_steps.deinit(a);
-    m.engine_decode = true;
-    defer m.engine_decode = false;
-    const before = mlx.engine.stats();
-    var got_rounds = try dsparkRoundBytes(a, &xfm, prompt, rounds);
-    defer got_rounds.deinit(a);
-    var got_steps = try lazyHeadSteps(a, &xfm, prompt, 24, false);
-    defer got_steps.deinit(a);
-    try testing.expect(mlx.engine.stats().dispatches > before.dispatches);
-    try testing.expectEqualSlices(u32, want_steps.tokens.items, got_steps.tokens.items);
-    try testing.expect(std.mem.eql(u8, std.mem.sliceAsBytes(want_steps.logits.items), std.mem.sliceAsBytes(got_steps.logits.items)));
-    try testing.expect(std.mem.eql(u8, want_rounds.items, got_rounds.items));
+    const before = mlx.engine.stats().dispatches;
+    var rounds = try dsparkRoundBytes(a, &xfm, prompt, 3 * @as(usize, dsv41_max_verify_rows));
+    errdefer rounds.deinit(a);
+    const steps = try lazyHeadSteps(a, &xfm, prompt, 24, false);
+    try testing.expectEqual(own, mlx.engine.stats().dispatches > before);
+    return .{ .rounds = rounds, .steps = steps };
+}
+
+test "dsv41 engine: on the real pack one-row steps and DSpark rounds of a Cooler load give the MLX load's bytes (SUSHI_DSV41_REAL_PACK)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("SUSHI_DSV41_REAL_PACK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    const text = "Write a long, detailed story about a lighthouse keeper and the storms of one winter. The keeper climbed the iron stairs each night, counting the steps as the wind rose over the black water.";
+    var want = try realPackBytes(a, dir, false, text);
+    defer want.rounds.deinit(a);
+    defer want.steps.deinit(a);
+    var got = try realPackBytes(a, dir, true, text);
+    defer got.rounds.deinit(a);
+    defer got.steps.deinit(a);
+    try testing.expectEqualSlices(u32, want.steps.tokens.items, got.steps.tokens.items);
+    try testing.expect(std.mem.eql(u8, std.mem.sliceAsBytes(want.steps.logits.items), std.mem.sliceAsBytes(got.steps.logits.items)));
+    try testing.expect(std.mem.eql(u8, want.rounds.items, got.rounds.items));
 }
 
 /// A cache of 1.5 MB is under the tiny pack's experts, so the load streams; 64 MB holds them all.
@@ -5217,7 +5179,7 @@ test "dsv41 engine: a one-row decode step in steady state makes no call into MLX
     var fx: EngineFixture = undefined;
     try fx.open(dir);
     defer fx.deinit();
-    try testing.expect(fx.model().engine_decode);
+    try testing.expect(fx.model().onEngine());
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf);
     // The first run fills the expert cache and the pools; the next two walk the same tokens and must agree. The prompt's
@@ -6275,17 +6237,15 @@ test "dsv41 engine: a finished request's state is the next turn's deepest point,
 /// The caps as `serve` installs them, with the engine's own budget live: what a forward and a request's end move.
 const ServedCaps = struct {
     was_cap: u64,
-    was_override: ?bool,
 
     fn install() ServedCaps {
-        const self: ServedCaps = .{ .was_cap = dsv41_borrow.pool_ram_cap, .was_override = dsv41_borrow.own_override };
+        const self: ServedCaps = .{ .was_cap = dsv41_borrow.pool_ram_cap };
         dsv41_borrow.pool_ram_cap = 1 << 40;
         return self;
     }
 
     fn restore(self: ServedCaps) void {
         dsv41_borrow.pool_ram_cap = self.was_cap;
-        dsv41_borrow.own_override = self.was_override;
         mlx.engine.budget(std.math.maxInt(u64)) catch {};
     }
 
@@ -6336,7 +6296,6 @@ test "dsv41 engine: after a model on MLX beside it served and ended a request, t
     for (variants) |v| {
         {
             // The other model's request and its end, in its own turn as the scheduler runs them.
-            dsv41_borrow.own_override = false;
             const turn = mlx.engine.turnTo(false);
             defer turn.end();
             var ids: [24]u32 = undefined;
@@ -6344,7 +6303,6 @@ test "dsv41 engine: after a model on MLX beside it served and ended a request, t
             bytes.deinit(a);
             dsv41_borrow.endRequestMlx(&on_mlx.config);
         }
-        dsv41_borrow.own_override = true;
         const turn = mlx.engine.turnTo(true);
         defer turn.end();
         try runRequest(&cooler, &tok, prompt, v.sampling, v.opts, 6, null, null);
@@ -6389,7 +6347,6 @@ test "dsv41 engine: the Cooler's live restore points reach the SSD tier at an id
         defer hc.deinit();
         {
             // The Cooler's request: a prefill to the point, which it keeps live, then its end.
-            dsv41_borrow.own_override = true;
             const turn = mlx.engine.turnTo(true);
             defer turn.end();
             try cooler.xfm.resetCache();
@@ -6404,7 +6361,6 @@ test "dsv41 engine: the Cooler's live restore points reach the SSD tier at an id
             dsv41_borrow.endRequestMlx(&cooler.config);
         }
         if (other_served) {
-            dsv41_borrow.own_override = false;
             const turn = mlx.engine.turnTo(false);
             defer turn.end();
             var ids: [24]u32 = undefined;
@@ -6412,7 +6368,6 @@ test "dsv41 engine: the Cooler's live restore points reach the SSD tier at an id
             bytes.deinit(a);
             dsv41_borrow.endRequestMlx(&on_mlx.config);
         }
-        dsv41_borrow.own_override = true;
         const turn = mlx.engine.turnTo(true);
         defer turn.end();
         dsv41_prefix.flushLiveDsv41(&hc, m, "idle");
@@ -6854,5 +6809,160 @@ test "dsv41 engine: a verify of w rows cut back to a accepted drafts continues, 
                 return e;
             };
         };
+    }
+}
+
+
+test "dsv41 engine: a Cooler load of the release's layout builds the DSpark expert banks in owned memory, out of the forward pool, with the MLX load's DSpark tokens (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    // The release's banks are gigabytes; the fixture's are under the import floor, which the test lowers.
+    const min = model_mod.import_min_bytes;
+    model_mod.import_min_bytes = 1;
+    defer model_mod.import_min_bytes = min;
+    var buf: [48]u32 = undefined;
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(a);
+    {
+        var ref: EngineFixture = undefined;
+        try ref.openAsking(dir, .flag);
+        defer ref.deinit();
+        want = try dsparkTokens(a, &ref, ref.prompt(&buf)[0..30], 40, .sweep);
+    }
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    try testing.expect(m.onEngine());
+    for (m.dspark.?.banks) |set| inline for (.{ set.gate, set.up, set.down }) |bank| {
+        inline for (.{ bank.w, bank.s }) |arr| {
+            try testing.expect(mlx.engine.isOurs(arr));
+            try testing.expect(mlx.engine.isMapped(arr));
+        }
+    };
+    var got = try dsparkTokens(a, &fx, fx.prompt(&buf)[0..30], 40, .sweep);
+    defer got.deinit(a);
+    try testing.expectEqualSlices(u32, want.items, got.items);
+}
+
+/// The arrays `m` owns that lie outside every owned region, the rope tables and Engram's q.k products (MLX-made
+/// from a few KiB, the documented exception) not counted.
+fn weightsOutsideRegions(m: *@import("dsv41_model.zig").Model) !usize {
+    var outside: usize = 0;
+    for (m.owned.items) |arr| {
+        if (arr.ctx == null) continue;
+        try mlx.check(mlx.mlx_array_eval(arr));
+        if (model_mod.ownsPointer(mlx.engine.storePointer(arr))) continue;
+        var exempt = arr.ctx == m.rope_plain.freqs.ctx or arr.ctx == m.rope_yarn.freqs.ctx;
+        for (m.engrams) |e| exempt = exempt or arr.ctx == e.qk.ctx;
+        if (!exempt) outside += 1;
+    }
+    return outside;
+}
+
+test "dsv41 engine: a Cooler load of the release's layout holds every weight in an owned region, none in the forward pool (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    try testing.expect(m.onEngine() and m.dspark != null);
+    try testing.expectEqual(@as(usize, 0), try weightsOutsideRegions(m));
+}
+
+test "dsv41 engine: the trunk bill is what the release layout's load holds, on Sushi Cooler and on MLX (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const a = testing.allocator;
+    for ([_]?dsv41_config.MlxAsk{ null, .flag }) |ask| {
+        const owned0 = model_mod.owned_bytes.load(.monotonic);
+        var fx: EngineFixture = undefined;
+        try fx.prepare(dir, ask, 64 << 20);
+        fx.config.stream_mtp_head = false;
+        try fx.load(dir);
+        defer fx.deinit();
+        const m = fx.model();
+        try testing.expect(m.dspark == null);
+        try testing.expectEqual(ask == null, m.onEngine());
+        // Mapped weights are their regions; every other array its bytes, once per buffer.
+        var seen: std.AutoHashMapUnmanaged(usize, u64) = .empty;
+        defer seen.deinit(a);
+        for (m.owned.items) |arr| {
+            if (arr.ctx == null) continue;
+            try mlx.check(mlx.mlx_array_eval(arr));
+            const p: [*]const u8 = if (mlx.engine.isOurs(arr)) mlx.engine.storePointer(arr) else mlx.mlx_array_data_uint8(arr) orelse continue;
+            if (model_mod.ownsPointer(p)) continue;
+            if (arr.ctx == m.rope_plain.freqs.ctx or arr.ctx == m.rope_yarn.freqs.ctx) continue;
+            const gop = try seen.getOrPut(a, @intFromPtr(p));
+            const n = mlx.mlx_array_size(arr) * mlx.mlx_array_itemsize(arr);
+            if (!gop.found_existing or gop.value_ptr.* < n) gop.value_ptr.* = n;
+        }
+        var held: u64 = model_mod.owned_bytes.load(.monotonic) - owned0;
+        var it = seen.valueIterator();
+        while (it.next()) |v| held += v.*;
+        try testing.expectEqual(try @import("dsv41_source.zig").residentBytes(io, a, dir, m.onEngine()), held);
+    }
+}
+
+/// `want` greedy DSpark tokens over `prompt` at `mode`.
+fn dsparkTokens(a: std.mem.Allocator, fx: *EngineFixture, prompt: []const u32, want: u32, mode: ?DsparkDiag) !std.ArrayList(u32) {
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    try fx.xfm.resetCache();
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, &fx.xfm, &tok, prompt, want, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+    defer gen.deinit(a);
+    if (mode) |d| gen.dspark_diag = d;
+    var got: std.ArrayList(u32) = .empty;
+    errdefer got.deinit(a);
+    while (try gen.nextDspark(a)) |r| {
+        defer a.free(r.tokens);
+        try got.appendSlice(a, r.tokens);
+    }
+    try testing.expectEqual(@as(usize, want), got.items.len);
+    return got;
+}
+
+test "dsv41 engine: the release's layout (FP8 trunk, MXFP4 experts) on Sushi Cooler gives the MLX route's logits and DSpark tokens at each round-width mix, every expert cached or read at each forward, and compiles nothing after the load (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    // Three experts a layer: a cache this small misses at every forward, so each route reads its slabs first.
+    const small = 3 * 8 * try @import("../expert_stream.zig").mxfp4ExpertBytes(128, 128);
+    // A verify wider than a row takes other product plans than a one-row step, on either route: each mix is held to
+    // the MLX route's at the same mix.
+    const modes = [_]?DsparkDiag{ .{ .rows = 1 }, .{ .rows = 3 }, .sweep };
+    for ([_]u64{ 64 << 20, small }) |cache_bytes| {
+        var buf: [48]u32 = undefined;
+        var want_logits: std.ArrayList(u8) = .empty;
+        defer want_logits.deinit(a);
+        var want_tokens: [modes.len]std.ArrayList(u32) = @splat(.empty);
+        defer for (&want_tokens) |*t| t.deinit(a);
+        {
+            var ref: EngineFixture = undefined;
+            try ref.openSized(dir, .flag, cache_bytes);
+            defer ref.deinit();
+            try testing.expect(!ref.model().onEngine());
+            want_logits = try shortPrefillBytes(a, &ref.xfm, ref.prompt(&buf), 30, 4, 6);
+            for (modes, &want_tokens) |mode, *t| t.* = try dsparkTokens(a, &ref, ref.prompt(&buf)[0..30], 40, mode);
+        }
+        var fx: EngineFixture = undefined;
+        try fx.openSized(dir, null, cache_bytes);
+        defer fx.deinit();
+        try testing.expect(fx.model().onEngine());
+        const ops = mlx.engine.mlx_ops;
+        const made = mlx.engine.pipelinesMade().count;
+        var got = try shortPrefillBytes(a, &fx.xfm, fx.prompt(&buf), 30, 4, 6);
+        defer got.deinit(a);
+        try testing.expectEqualSlices(u8, want_logits.items, got.items);
+        for (modes, want_tokens) |mode, want| {
+            var tokens = try dsparkTokens(a, &fx, fx.prompt(&buf)[0..30], 40, mode);
+            defer tokens.deinit(a);
+            try testing.expectEqualSlices(u32, want.items, tokens.items);
+        }
+        try testing.expectEqual(ops, mlx.engine.mlx_ops);
+        try testing.expectEqual(made, mlx.engine.pipelinesMade().count);
     }
 }

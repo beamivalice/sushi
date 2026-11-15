@@ -181,22 +181,21 @@ pub fn matmul(a_in: *Tensor, b_in: *Tensor) Error!*Tensor {
         const an = a.ndim - 2;
         const bn = b.ndim - 2;
         const batch = @max(an, bn);
-        if (batch + 2 > core.max_dims) return error.TensorShape;
-        var sa: [core.max_dims]c_int = undefined;
-        var sb: [core.max_dims]c_int = undefined;
+        var sa: core.Dims = .{};
+        var sb: core.Dims = .{};
         for (0..batch) |i| {
             const da: c_int = if (i + an >= batch) a.shape[i + an - batch] else 1;
             const db: c_int = if (i + bn >= batch) b.shape[i + bn - batch] else 1;
             const d = if (da == db or db == 1) da else if (da == 1) db else return error.TensorShape;
-            sa[i] = d;
-            sb[i] = d;
+            try sa.append(d);
+            try sb.append(d);
         }
-        @memcpy(sa[batch..][0..2], a.shape[an..][0..2]);
-        @memcpy(sb[batch..][0..2], b.shape[bn..][0..2]);
-        const wide_a = try ops.broadcastTo(a, sa[0 .. batch + 2]);
+        try sa.appendSlice(a.shape[an..][0..2]);
+        try sb.appendSlice(b.shape[bn..][0..2]);
+        const wide_a = try ops.broadcastTo(a, sa.slice());
         core.release(a);
         a = wide_a;
-        const wide_b = try ops.broadcastTo(b, sb[0 .. batch + 2]);
+        const wide_b = try ops.broadcastTo(b, sb.slice());
         core.release(b);
         b = wide_b;
     }

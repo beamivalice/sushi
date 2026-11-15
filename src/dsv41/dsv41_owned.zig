@@ -31,16 +31,34 @@ fn hostBytes(x: A, want: usize) ![]const u8 {
 }
 
 /// Bf16 `x` as f32 in an owned region, bit-equal to MLX's `astype`: the f32 bits are the bf16 bits shifted up.
-/// Null when `x` is not bf16 or the f32 copy is under `import_min_bytes`; the caller then casts in MLX.
+/// Null when `x` is not bf16 or the f32 copy is under the load's floor (`model.importFloor`); the caller then casts.
 pub fn widenF32(x: A) !?A {
     if (mlx.mlx_array_dtype(x) != .bfloat16) return null;
     const n = mlx.mlx_array_size(x);
-    if (n * 4 < model.import_min_bytes) return null;
+    if (n * 4 < model.importFloor(mlx.engine.own_weights)) return null;
     const src = std.mem.bytesAsSlice(u16, try hostBytes(x, n * 2));
-    const region = try model.ownedRegion(n * 4);
-    const dst = std.mem.bytesAsSlice(u32, region.ptr[0 .. n * 4]);
+    var region: ?*model.MappedRegion = try model.ownedRegion(n * 4);
+    const dst = std.mem.bytesAsSlice(u32, region.?.ptr[0 .. n * 4]);
     for (dst, src) |*d, b| d.* = @as(u32, b) << 16;
-    return try model.wrapOwned(region, mlx.getShape(x), .float32);
+    return try model.wrapOwned(&region, mlx.getShape(x), .float32);
+}
+
+/// An fp8 weight's `[ceil(out / 32), in / 32]` block scales, each row repeated down its 32 weight rows, as
+/// `mlx_repeat_axis` on axis 0 would, in an owned region viewed as the first `out` rows; null under the load's floor.
+pub fn repeatRows(scales: A, out: usize) !?A {
+    const sh = mlx.getShape(scales);
+    if (sh.len != 2 or mlx.mlx_array_itemsize(scales) != 1) return error.OwnedSourceLayout;
+    const blocks: usize = @intCast(sh[0]);
+    const cols: usize = @intCast(sh[1]);
+    if (out > blocks * 32) return error.OwnedSourceLayout;
+    const total = blocks * 32 * cols;
+    if (total < model.importFloor(mlx.engine.own_weights)) return null;
+    const src = try hostBytes(scales, blocks * cols);
+    var region: ?*model.MappedRegion = try model.ownedRegion(total);
+    errdefer if (region) |r| model.destroyRegion(r);
+    const dst = region.?.ptr[0..total];
+    for (0..blocks * 32) |r| @memcpy(dst[r * cols ..][0..cols], src[(r / 32) * cols ..][0..cols]);
+    return try model.wrapOwned(&region, &.{ @intCast(out), @intCast(cols) }, mlx.mlx_array_dtype(scales));
 }
 
 /// How `stack` joins its parts.
@@ -51,23 +69,27 @@ pub const StackKind = enum {
     rows,
     /// `[1, w_i]` joined on axis 1 (`svh`).
     cols,
+    /// Each expert's `[rows, cols]` on a new leading axis, as `mlx_stack_axis` on axis 0 (a routed bank).
+    experts,
 };
 
-/// `parts` stacked as `mlx_concatenate_axis` would on the axis of `kind`, in an owned region; null when the
-/// result is under `import_min_bytes`.
+/// `parts` stacked as `mlx_concatenate_axis` (or, for `experts`, `mlx_stack_axis`) would on the axis of `kind`, in an
+/// owned region; null when the result is under the load's floor (`model.importFloor`).
 pub fn stack(parts: []const A, kind: StackKind) !?A {
     const first = parts[0];
     const item = mlx.mlx_array_itemsize(first);
     const dtype = mlx.mlx_array_dtype(first);
     var total: usize = 0;
     for (parts) |p| total += mlx.mlx_array_size(p) * item;
-    if (total < model.import_min_bytes) return null;
+    if (total < model.importFloor(mlx.engine.own_weights)) return null;
     const sh0 = mlx.getShape(first);
+    const ndim = sh0.len + @intFromBool(kind == .experts);
+    if (ndim > 4) return error.OwnedSourceLayout;
     var shape: [4]c_int = @splat(0);
-    @memcpy(shape[0..sh0.len], sh0);
+    @memcpy(shape[ndim - sh0.len .. ndim], sh0);
     switch (kind) {
         .trellis => shape[2] = 0,
-        .rows => shape[0] = 0,
+        .rows, .experts => shape[0] = 0,
         .cols => shape[1] = 0,
     }
     for (parts) |p| {
@@ -77,11 +99,15 @@ pub fn stack(parts: []const A, kind: StackKind) !?A {
             .trellis => shape[2] += sh[2],
             .rows => shape[0] += sh[0],
             .cols => shape[1] += sh[1],
+            .experts => {
+                if (!std.mem.eql(c_int, sh, sh0)) return error.OwnedSourceLayout;
+                shape[0] += 1;
+            },
         }
     }
-    const region = try model.ownedRegion(total);
-    errdefer model.destroyRegion(region);
-    const out = region.ptr[0..total];
+    var region: ?*model.MappedRegion = try model.ownedRegion(total);
+    errdefer if (region) |r| model.destroyRegion(r);
+    const out = region.?.ptr[0..total];
     var at: usize = 0;
     switch (kind) {
         .trellis => {
@@ -97,13 +123,13 @@ pub fn stack(parts: []const A, kind: StackKind) !?A {
                 }
             }
         },
-        .rows, .cols => for (parts) |p| {
+        .rows, .cols, .experts => for (parts) |p| {
             const bytes = mlx.mlx_array_size(p) * item;
             @memcpy(out[at..][0..bytes], try hostBytes(p, bytes));
             at += bytes;
         },
     }
-    return try model.wrapOwned(region, shape[0..sh0.len], dtype);
+    return try model.wrapOwned(&region, shape[0..ndim], dtype);
 }
 
 /// Called after group `g`'s source arrays are copied, so the caller can free them before the next group.
@@ -175,20 +201,13 @@ pub fn raggedOwned(s: mlx.mlx_stream, banks: []const exl3.Bank, order: exl3.form
     defer for (arrays) |a| if (a.ctx != null) {
         _ = mlx.mlx_array_free(a);
     };
-    // `wrapOwned` takes the region whether it succeeds or not.
-    const taken = struct {
-        fn of(r: *?*model.MappedRegion) *model.MappedRegion {
-            defer r.* = null;
-            return r.*.?;
-        }
-    }.of;
     for (0..3) |pi| {
         const in: c_int = @intCast(if (pi == 2) inter else hidden);
         const out: c_int = @intCast(if (pi == 2) hidden else inter);
         const rc: c_int = @intCast(rows);
-        arrays[pi] = try model.wrapOwned(taken(&regions[pi]), &.{@intCast(trellis_bytes[pi] / 2)}, .uint16);
-        arrays[3 + pi] = try model.wrapOwned(taken(&regions[3 + pi]), &.{ rc, in }, .float16);
-        arrays[6 + pi] = try model.wrapOwned(taken(&regions[6 + pi]), &.{ rc, out }, .float16);
+        arrays[pi] = try model.wrapOwned(&regions[pi], &.{@intCast(trellis_bytes[pi] / 2)}, .uint16);
+        arrays[3 + pi] = try model.wrapOwned(&regions[3 + pi], &.{ rc, in }, .float16);
+        arrays[6 + pi] = try model.wrapOwned(&regions[6 + pi], &.{ rc, out }, .float16);
     }
     var rb = try exl3.Ragged.initPools(s, @intCast(hidden), @intCast(inter), pools[0..banks.len], arrays[0..3].*, arrays[3..6].*, arrays[6..9].*);
     rb.tile_major = order == .pair_major;
@@ -205,6 +224,9 @@ pub const Audit = struct {
     mlx_bytes: u64 = 0,
     /// Of those, the arrays of at least `import_min_bytes`.
     mlx_large: usize = 0,
+    /// Tensors of the engine of our own outside every region: its pool's, under every forward's cap.
+    pool_arrays: usize = 0,
+    pool_bytes: u64 = 0,
 };
 
 /// Classifies `arrays` by whether their data pointer lies in an owned region. Evaluates them.
@@ -224,6 +246,11 @@ pub fn audit(gpa: std.mem.Allocator, arrays: []const A) !Audit {
             continue;
         }
         if ((try seen.getOrPut(gpa, @intFromPtr(ptr))).found_existing) continue;
+        if (mlx.engine.isOurs(a)) {
+            out.pool_arrays += 1;
+            out.pool_bytes += bytes;
+            continue;
+        }
         out.mlx_arrays += 1;
         out.mlx_bytes += bytes;
         if (bytes >= model.import_min_bytes) out.mlx_large += 1;
@@ -380,4 +407,36 @@ test "dsv41 owned: a bf16 tensor widens to MLX's astype f32 bits, NaN, Inf and d
     try testing.expect((try widenF32(wide)) == null);
     model.import_min_bytes = 1 << 20;
     try testing.expect((try widenF32(x)) == null);
+}
+
+test "dsv41 owned: a stack whose wrap fails gives its region back once, on MLX's side and the engine's" {
+    try mlx.requireGpu();
+    const min = model.import_min_bytes;
+    model.import_min_bytes = 1;
+    defer model.import_min_bytes = min;
+    var bytes: [4096]u8 = undefined;
+    for (&bytes, 0..) |*b, i| b.* = @truncate(i);
+    var parts: [2]A = undefined;
+    for (&parts) |*p| p.* = mlx.mlx_array_new_data(&bytes, &[_]c_int{ 64, 64 }, 2, .uint8);
+    defer for (parts) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    const was_enabled = mlx.engine.enabled;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    for ([_]bool{ false, true }) |engine_side| {
+        mlx.engine.enabled = engine_side;
+        mlx.engine.own_weights = engine_side;
+        defer mlx.engine.own_weights = false;
+        const owned0 = model.owned_bytes.load(.monotonic);
+        const regions0 = model.ownedRegionCount();
+        // Each part's host read is one checked call; the next is the wrap's evaluation.
+        mlx.fault.arm(parts.len + 1);
+        const got = stack(&parts, .experts);
+        mlx.fault.disarm();
+        try testing.expect(mlx.fault.didFire());
+        try testing.expectError(error.MlxError, got);
+        mlx.engine.close();
+        try testing.expectEqual(owned0, model.owned_bytes.load(.monotonic));
+        try testing.expectEqual(regions0, model.ownedRegionCount());
+    }
 }

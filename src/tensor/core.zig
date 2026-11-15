@@ -20,6 +20,44 @@ pub const Dtype = mlx.mlx_dtype;
 
 pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, TensorNull, MlxAtRest, PoolOverBudget, ReadsFillingSlab };
 
+/// The restriction behind the last `TensorUnsupported` or `TensorDtype` an op returned through `refusing`; the route
+/// that reports the refusal names it once and clears it.
+pub var refused_why: ?[]const u8 = null;
+
+/// `e` for a call the port refuses, with the restriction it enforces.
+pub fn refusing(comptime why: []const u8, e: Error) Error {
+    refused_why = why;
+    return e;
+}
+
+/// A shape built a piece at a time: past `max_dims` axes a piece is `TensorShape`, never a write past the buffer.
+pub const Dims = struct {
+    buf: [max_dims]c_int = undefined,
+    len: usize = 0,
+
+    pub fn of(dims: []const c_int) Error!Dims {
+        var d: Dims = .{};
+        try d.appendSlice(dims);
+        return d;
+    }
+
+    pub fn append(self: *Dims, d: c_int) Error!void {
+        if (self.len == max_dims) return error.TensorShape;
+        self.buf[self.len] = d;
+        self.len += 1;
+    }
+
+    pub fn appendSlice(self: *Dims, ds: []const c_int) Error!void {
+        if (ds.len > max_dims - self.len) return error.TensorShape;
+        @memcpy(self.buf[self.len..][0..ds.len], ds);
+        self.len += ds.len;
+    }
+
+    pub fn slice(self: *const Dims) []const c_int {
+        return self.buf[0..self.len];
+    }
+};
+
 pub fn itemSize(d: Dtype) usize {
     return switch (d) {
         .bool_, .uint8, .int8 => 1,
@@ -489,6 +527,11 @@ fn classOf(len: usize) usize {
         top = steps;
     }
     return steps - 1 + shift * steps + (top - steps);
+}
+
+/// What a tensor of `len` bytes takes from the pool: its size class.
+pub fn poolBytes(len: usize) usize {
+    return if (len == 0) 0 else classBytes(classOf(len));
 }
 
 fn classBytes(class: usize) usize {

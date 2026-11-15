@@ -231,7 +231,6 @@ const generate = @import("../generate.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const test_support = @import("../test_support.zig");
 const dsv41_serving = @import("dsv41_serving.zig");
-const dsv41_borrow = @import("dsv41_borrow.zig");
 const dsv41_scope = @import("dsv41_scope.zig");
 
 /// A tiny STQ DeepSeek served on the engine of our own, as a load builds it, without the warm.
@@ -263,20 +262,16 @@ const Served = struct {
         self.config.stream_mtp_head = true;
         self.config.expert_cache_bytes = 64 << 20;
         self.config.expert_source_dir = try a.dupe(u8, dir);
+        self.config.dsv41.?.cooler_for_test = true;
         self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &self.config, false);
         errdefer self.weights.deinit();
         self.xfm = try trunk_mod.Trunk.init(io, a, self.config, &self.weights);
         errdefer self.xfm.deinit();
         self.tok = tokenizer_mod.Tokenizer.initEmpty(a);
-        dsv41_state.modelOf(&self.xfm).?.engine_decode = true;
-        dsv41_borrow.own_override = true;
     }
 
     fn deinit(self: *Served) void {
-        dsv41_borrow.own_override = null;
         mlx.engine.budget(std.math.maxInt(u64)) catch {};
-        dsv41_state.modelOf(&self.xfm).?.engine_decode = false;
-        dsv41_state.modelOf(&self.xfm).?.engine_prefill = false;
         self.tok.deinit();
         self.xfm.deinit();
         self.weights.deinit();
@@ -404,7 +399,6 @@ test "dsv41 pipelines: the wide chunks' recipes are in the manifest, and a load 
     try served.init(testing.allocator);
     defer served.deinit();
     const m = served.model();
-    m.engine_prefill = true;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const key = testKey("d1d1d1d1d1d1d1d1");
@@ -444,7 +438,6 @@ test "dsv41 pipelines: a chunk whose index top-k streams over key tiles compiles
     try served.init(testing.allocator);
     defer served.deinit();
     const m = served.model();
-    m.engine_prefill = true;
     // The fixture's window of 8 rows is a span the indexer scans a row at a time: a wider one is scored in tiles.
     m.cfg.window = 32;
     var tmp = testing.tmpDir(.{ .iterate = true });

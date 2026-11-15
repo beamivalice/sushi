@@ -40,7 +40,7 @@ pub const State = struct {
     /// The stream the sampler and the token arrays run on after a forward: the engine's while decode runs there.
     pub fn outStream(self: *const State, s: mlx.mlx_stream) mlx.mlx_stream {
         const m = self.model orelse return s;
-        return if (m.engine_decode) mlx.engine.stream() else s;
+        return if (m.onEngine()) mlx.engine.stream() else s;
     }
 
     pub fn reset(self: *State) void {

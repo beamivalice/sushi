@@ -249,17 +249,14 @@ test "a default context never exceeds the checkpoint's window, and --ctx-size or
 
 test "DeepSeek's request bill on a Cooler load is the state and one forward's cap: the engine's pool is that cap, and MLX's parked pool is not billed" {
     const t = std.testing;
-    const dsv41_borrow = @import("dsv41_borrow.zig");
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
-    const was = dsv41_borrow.own_override;
-    defer dsv41_borrow.own_override = was;
     for ([_]u64{ 9_000, 225_000, 1_000_000 }) |seq| {
-        dsv41_borrow.own_override = false;
+        config.dsv41.?.cooler_for_test = false;
         const off = bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{});
-        dsv41_borrow.own_override = true;
+        config.dsv41.?.cooler_for_test = true;
         try t.expectEqual(off - dsv41_config.dsv41_pool_bytes, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
     }
 }
