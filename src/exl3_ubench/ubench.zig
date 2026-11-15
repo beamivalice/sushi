@@ -279,10 +279,18 @@ const PREFILL_STEPS: usize = 4;
 const PREFILL_LAYOUTS: usize = 3;
 
 /// A layer layout: each group's (gate, up, down) n, and for routed slot j the groups it draws from.
-const RgLayout = struct { key: []const u8, rates: []const [3]u32, picks: []const []const u8 };
+/// `sizes` is each group's expert count (empty: equal shares); `prefill` runs the layout's prefill rungs too.
+const RgLayout = struct { key: []const u8, rates: []const [3]u32, picks: []const []const u8, sizes: []const u32 = &.{}, prefill: bool = false };
 
 fn rep(comptime n: usize, comptime v: []const u8) [n][]const u8 {
     return @splat(v);
+}
+
+/// A slot's choice list: group 0 `a` times and group 1 `b` times, so a draw takes group 1 with odds b / (a + b).
+fn odds(comptime a: usize, comptime b: usize) [a + b]u8 {
+    var v: [a + b]u8 = undefined;
+    for (&v, 0..) |*x, i| x.* = if (i < a) 0 else 1;
+    return v;
 }
 
 const EVERY_N = blk: {
@@ -318,6 +326,12 @@ const RG_LAYOUTS = [_]RgLayout{
     .{ .key = "every21", .rates = &EVERY_N, .picks = &rep(10, &.{4}) },
     // The switch-free twin of the two above: twenty n32 groups, every slot in group 4.
     .{ .key = "n32x20", .rates = &@as([20][3]u32, @splat(.{ 32, 32, 32 })), .picks = &rep(10, &.{4}) },
+    // K4 and K5 on one layer: the plan's 435 K4 and 77 K5 experts; a slot draws K5 with 15% (k45) or 30% (k45h, hot K5
+    // experts) odds, and k4 / k5 are the single-rate layers beside them.
+    .{ .key = "k4", .rates = &.{.{ 64, 64, 64 }}, .picks = &rep(10, &.{0}), .prefill = true },
+    .{ .key = "k5", .rates = &.{.{ 80, 80, 80 }}, .picks = &rep(10, &.{0}), .prefill = true },
+    .{ .key = "k45", .rates = &.{ .{ 64, 64, 64 }, .{ 80, 80, 80 } }, .sizes = &.{ 435, 77 }, .prefill = true, .picks = &rep(10, &odds(17, 3)) },
+    .{ .key = "k45h", .rates = &.{ .{ 64, 64, 64 }, .{ 80, 80, 80 } }, .sizes = &.{ 435, 77 }, .prefill = true, .picks = &rep(10, &odds(14, 6)) },
 };
 
 const Arm = enum { uniform, masked, grouped };
@@ -462,7 +476,7 @@ pub const exl3_rate_groups: report.Bench = .{
     .unit = .us,
     .steps = DECODE_STEPS,
     .axes = &.{
-        .{ .name = "layout", .values = &.{ "g2", "pairs3", "mix20", "mix20_floor", "mix20_n32", "every21", "n32x20" }, .numeric = false },
+        .{ .name = "layout", .values = &.{ "g2", "pairs3", "mix20", "mix20_floor", "mix20_n32", "every21", "n32x20", "k4", "k5", "k45", "k45h" }, .numeric = false },
         .{ .name = "rows", .values = &.{ "1", "4", "512", "2048" } },
         .{ .name = "codebook", .values = &.{ "spec1", "pair1" }, .numeric = false },
     },
@@ -487,7 +501,7 @@ fn runRateGroups(run: *report.Run) anyerror!void {
         var banks: [group_layout.max_groups]root.Bank = undefined;
         const per: u32 = FLASH_EXPERTS / @as(u32, @intCast(lay.rates.len));
         for (lay.rates, 0..) |r, gi| {
-            const e = if (gi + 1 == lay.rates.len) FLASH_EXPERTS - per * @as(u32, @intCast(gi)) else per;
+            const e = if (lay.sizes.len != 0) lay.sizes[gi] else if (gi + 1 == lay.rates.len) FLASH_EXPERTS - per * @as(u32, @intCast(gi)) else per;
             banks[gi] = try bench.makeBank(rnd, FLASH_HIDDEN, FLASH_INTER, r, e, 0.9, 0.9);
         }
         var rb = try rate_groups.Ragged.init(s, banks[0..lay.rates.len]);
@@ -500,7 +514,7 @@ fn runRateGroups(run: *report.Run) anyerror!void {
         for (run.axis("rows")) |rows_text| {
             const rows = try std.fmt.parseInt(usize, rows_text, 10);
             const prefill = rows > kernels.DECODE_ROWS_MAX;
-            if (prefill and li >= PREFILL_LAYOUTS) continue;
+            if (prefill and li >= PREFILL_LAYOUTS and !lay.prefill) continue;
             const sets: usize = if (prefill) 1 else FLASH_ROUTE_SETS;
             var routes_buf: [FLASH_ROUTE_SETS]mlx.mlx_array = undefined;
             var uroutes_buf: [FLASH_ROUTE_SETS]mlx.mlx_array = undefined;
