@@ -299,7 +299,7 @@ fn matrix(arch: []const u8, os: Os, held: bool) bool {
 test "device: the system chip is the hardware's whatever MLX_METAL_GPU_ARCH names" {
     const saved = std.c.getenv("MLX_METAL_GPU_ARCH");
     var keep: [64]u8 = undefined;
-    const kept: ?[:0]u8 = if (saved) |v| std.fmt.bufPrintZ(&keep, "{s}", .{std.mem.span(v)}) catch unreachable else null;
+    const kept: ?[:0]u8 = if (saved) |v| std.fmt.bufPrintSentinel(&keep, "{s}", .{std.mem.span(v)}, 0) catch unreachable else null;
     defer if (kept) |v| {
         _ = setenv("MLX_METAL_GPU_ARCH", v.ptr, 1);
     } else {
