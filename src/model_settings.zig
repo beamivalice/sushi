@@ -908,9 +908,11 @@ pub const LaunchLocks = struct {
         return null;
     }
 
-    pub fn modelMut(self: *LaunchLocks, name: []const u8) *Lock {
-        for (model_keys, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) return &self.models[i];
-        unreachable;
+    pub fn modelMut(self: *LaunchLocks, comptime name: []const u8) *Lock {
+        const i = comptime for (model_keys, 0..) |k, i| {
+            if (std.mem.eql(u8, k.name, name)) break i;
+        } else @compileError("no model setting named " ++ name);
+        return &self.models[i];
     }
 };
 

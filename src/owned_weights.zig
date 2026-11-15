@@ -1,13 +1,12 @@
-//! DeepSeek-V4.1 weights that sushi builds in its own mappings instead of MLX's allocator: a build step writes
-//! the bytes on the host into a `model.ownedRegion` and wraps it as an array (`model.wrapOwned`, no copy), so
-//! the weight memory is the engine's and a refused import is an error.
+//! Weights a load builds in its own mappings instead of MLX's allocator, for any arch on Sushi Cooler: a build step
+//! writes the bytes on the host into a `model.ownedRegion` and wraps it as an array (`model.wrapOwned`, no copy), so
+//! the weight memory is the engine's and a refused import is an error. The helpers name formats, never archs.
 const std = @import("std");
-const mlx = @import("../mlx.zig");
-const model = @import("../model.zig");
-const sc_mod = @import("dsv41_scope.zig");
+const mlx = @import("mlx.zig");
+const model = @import("model.zig");
 const exl3 = @import("sushi_exl3");
 
-const A = sc_mod.A;
+const A = mlx.mlx_array;
 
 fn rowContiguous(x: A) bool {
     const sh = mlx.getShape(x);
@@ -92,9 +91,18 @@ pub fn stack(parts: []const A, kind: StackKind) !?A {
         .rows, .experts => shape[0] = 0,
         .cols => shape[1] = 0,
     }
+    const axis: usize = switch (kind) {
+        .trellis => 2,
+        .rows, .experts => 0,
+        .cols => 1,
+    };
     for (parts) |p| {
         const sh = mlx.getShape(p);
         if (sh.len != sh0.len or mlx.mlx_array_dtype(p) != dtype) return error.OwnedSourceLayout;
+        if (kind != .experts and axis >= sh.len) return error.OwnedSourceLayout;
+        for (sh, sh0, 0..) |d, d0, i| {
+            if (kind != .experts and i != axis and d != d0) return error.OwnedSourceLayout;
+        }
         switch (kind) {
             .trellis => shape[2] += sh[2],
             .rows => shape[0] += sh[0],
@@ -281,7 +289,7 @@ fn expectSameBytes(want: A, got: A) !void {
     try testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..n], mlx.mlx_array_data_uint8(got).?[0..n]);
 }
 
-test "dsv41 owned: the owned ragged bank is exl3.Ragged.init's storage, meta, views and offsets" {
+test "owned weights: the owned ragged bank is exl3.Ragged.init's storage, meta, views and offsets" {
     try mlx.requireGpu();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
@@ -340,7 +348,7 @@ test "dsv41 owned: the owned ragged bank is exl3.Ragged.init's storage, meta, vi
     }
 }
 
-test "dsv41 owned: the stacks are mlx_concatenate_axis's bytes on each axis" {
+test "owned weights: the stacks are mlx_concatenate_axis's bytes on each axis" {
     try mlx.requireGpu();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
@@ -376,7 +384,7 @@ test "dsv41 owned: the stacks are mlx_concatenate_axis's bytes on each axis" {
     try testing.expect((try stack(&.{ tiny, tiny }, .rows)) == null);
 }
 
-test "dsv41 owned: a bf16 tensor widens to MLX's astype f32 bits, NaN, Inf and denormals included" {
+test "owned weights: a bf16 tensor widens to MLX's astype f32 bits, NaN, Inf and denormals included" {
     try mlx.requireGpu();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
@@ -409,7 +417,7 @@ test "dsv41 owned: a bf16 tensor widens to MLX's astype f32 bits, NaN, Inf and d
     try testing.expect((try widenF32(x)) == null);
 }
 
-test "dsv41 owned: a stack whose wrap fails gives its region back once, on MLX's side and the engine's" {
+test "owned weights: a stack whose wrap fails gives its region back once, on MLX's side and the engine's" {
     try mlx.requireGpu();
     const min = model.import_min_bytes;
     model.import_min_bytes = 1;
@@ -422,7 +430,7 @@ test "dsv41 owned: a stack whose wrap fails gives its region back once, on MLX's
         _ = mlx.mlx_array_free(p);
     };
     const was_enabled = mlx.engine.enabled;
-    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    defer @import("test_support.zig").restoreEngine(was_enabled);
     for ([_]bool{ false, true }) |engine_side| {
         mlx.engine.enabled = engine_side;
         mlx.engine.own_weights = engine_side;
@@ -439,4 +447,38 @@ test "dsv41 owned: a stack whose wrap fails gives its region back once, on MLX's
         try testing.expectEqual(owned0, model.owned_bytes.load(.monotonic));
         try testing.expectEqual(regions0, model.ownedRegionCount());
     }
+}
+
+/// `stack` of parts that disagree off the joined axis is refused, as `mlx_concatenate_axis` refuses them.
+fn expectStackRefused(rng: *std.Random.DefaultPrng, kind: StackKind, axis: c_int, shapes: []const []const c_int, dtype: mlx.mlx_dtype) !void {
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var parts: [4]A = undefined;
+    for (shapes, 0..) |sh, i| parts[i] = try randomArray(rng, sh, dtype);
+    defer for (parts[0..shapes.len]) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    const vec = mlx.mlx_vector_array_new_data(&parts, shapes.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try testing.expectError(error.MlxError, mlx.check(mlx.mlx_concatenate_axis(&want, vec, axis, cpu)));
+    var msg: [300]u8 = undefined;
+    _ = mlx.takeError(&msg);
+    try testing.expectError(error.OwnedSourceLayout, stack(parts[0..shapes.len], kind));
+}
+
+test "owned weights: a stack whose parts disagree off the joined axis is refused, as mlx_concatenate_axis refuses it" {
+    try mlx.requireGpu();
+    // The GPU stream installs the latching error handler that MLX's refusal below needs.
+    const g = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(g);
+    const min = model.import_min_bytes;
+    model.import_min_bytes = 1;
+    defer model.import_min_bytes = min;
+    var rng = std.Random.DefaultPrng.init(5);
+    try expectStackRefused(&rng, .rows, 0, &.{ &.{ 1, 128 }, &.{ 1, 64 } }, .float16);
+    try expectStackRefused(&rng, .cols, 1, &.{ &.{ 1, 96 }, &.{ 2, 64 } }, .float16);
+    try expectStackRefused(&rng, .trellis, 2, &.{ &.{ 1, 8, 6, 32 }, &.{ 1, 8, 4, 16 } }, .uint16);
+    try expectStackRefused(&rng, .trellis, 2, &.{ &.{ 1, 8, 6, 32 }, &.{ 1, 4, 4, 32 } }, .uint16);
 }

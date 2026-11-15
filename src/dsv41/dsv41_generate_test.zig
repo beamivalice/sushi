@@ -2557,56 +2557,6 @@ test "dsv41 engine: a Cooler load whose warm does not fit its bill fails by name
     try testing.expectEqualSlices(u32, want[0].items, want[1].items);
 }
 
-test "dsv41 engine: a Cooler load refused at any of its pool buffers frees what it made, its warm's module arrays too, and the next load serves (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    const a = testing.allocator;
-    var kept = try model_mod.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, dir);
-    defer kept.deinit(a);
-    const was_enabled = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was_enabled);
-    defer mlx.engine.fault.disarm();
-    {
-        var fx: EngineFixture = undefined;
-        try fx.open(dir);
-        fx.deinit();
-        dsv41_borrow.unloadModelMlx(&kept);
-    }
-    const base = Sheet.now();
-    const c0 = mlx.engine.fault.count();
-    {
-        var fx: EngineFixture = undefined;
-        try fx.open(dir);
-        fx.deinit();
-        dsv41_borrow.unloadModelMlx(&kept);
-    }
-    const total = mlx.engine.fault.count() - c0;
-    try testing.expectEqual(base, Sheet.now());
-    var msg: [300]u8 = undefined;
-    var refused: usize = 0;
-    var k: u64 = 1;
-    while (k <= total) : (k += @max(1, total / 12)) {
-        var fx: EngineFixture = undefined;
-        try fx.prepare(dir, null, 64 << 20);
-        mlx.engine.fault.arm(k);
-        const r = fx.load(dir);
-        mlx.engine.fault.disarm();
-        if (r) fx.deinit() else |_| {
-            refused += 1;
-            _ = mlx.takeError(&msg);
-        }
-        dsv41_borrow.unloadModelMlx(&kept);
-        try testing.expect(!mlx.engine.holding());
-        try testing.expectEqual(base, Sheet.now());
-    }
-    try testing.expect(refused >= 10);
-    var fx: EngineFixture = undefined;
-    try fx.open(dir);
-    fx.deinit();
-    dsv41_borrow.unloadModelMlx(&kept);
-}
-
 test "dsv41 engine: a Cooler load that fails beside a resident Cooler model leaves that model's scope and seal as they were (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
@@ -6846,32 +6796,6 @@ test "dsv41 engine: a Cooler load of the release's layout builds the DSpark expe
     try testing.expectEqualSlices(u32, want.items, got.items);
 }
 
-/// The arrays `m` owns that lie outside every owned region, the rope tables and Engram's q.k products (MLX-made
-/// from a few KiB, the documented exception) not counted.
-fn weightsOutsideRegions(m: *@import("dsv41_model.zig").Model) !usize {
-    var outside: usize = 0;
-    for (m.owned.items) |arr| {
-        if (arr.ctx == null) continue;
-        try mlx.check(mlx.mlx_array_eval(arr));
-        if (model_mod.ownsPointer(mlx.engine.storePointer(arr))) continue;
-        var exempt = arr.ctx == m.rope_plain.freqs.ctx or arr.ctx == m.rope_yarn.freqs.ctx;
-        for (m.engrams) |e| exempt = exempt or arr.ctx == e.qk.ctx;
-        if (!exempt) outside += 1;
-    }
-    return outside;
-}
-
-test "dsv41 engine: a Cooler load of the release's layout holds every weight in an owned region, none in the forward pool (DSV41_TINY)" {
-    try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
-    var fx: EngineFixture = undefined;
-    try fx.open(dir);
-    defer fx.deinit();
-    const m = fx.model();
-    try testing.expect(m.onEngine() and m.dspark != null);
-    try testing.expectEqual(@as(usize, 0), try weightsOutsideRegions(m));
-}
-
 test "dsv41 engine: the trunk bill is what the release layout's load holds, on Sushi Cooler and on MLX (DSV41_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
@@ -6965,4 +6889,62 @@ test "dsv41 engine: the release's layout (FP8 trunk, MXFP4 experts) on Sushi Coo
         try testing.expectEqual(ops, mlx.engine.mlx_ops);
         try testing.expectEqual(made, mlx.engine.pipelinesMade().count);
     }
+}
+
+test "dsv41 engine: two Cooler loads in one process each find their own engine budget at their turn, whatever the other installed (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const arch_handle = @import("../arch/handle.zig");
+    var first: EngineFixture = undefined;
+    try first.open(dir);
+    defer first.deinit();
+    var second: EngineFixture = undefined;
+    try second.open(dir);
+    defer second.deinit();
+    defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    const loads = [_]*EngineFixture{ &first, &second };
+    const caps = [_]u64{ 7 << 20, 2 << 20 };
+    for (loads, caps) |fx, cap| {
+        const turn = arch_handle.turnFor(arch_handle.handleOf(&fx.xfm), &fx.config);
+        defer turn.end();
+        try mlx.engine.budget(cap);
+    }
+    for ([_]usize{ 0, 1, 0 }) |i| {
+        const asked = mlx.engine.stats().pool_asked;
+        const turn = arch_handle.turnFor(arch_handle.handleOf(&loads[i].xfm), &loads[i].config);
+        defer turn.end();
+        try testing.expectEqual(asked + caps[i], mlx.engine.poolLimit().?);
+    }
+}
+
+test "dsv41 engine: of two Cooler loads, one with no cap yet starts its first request under no cap the other installed, and says the other's tokens (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const arch_handle = @import("../arch/handle.zig");
+    var first: EngineFixture = undefined;
+    try first.open(dir);
+    defer first.deinit();
+    var second: EngineFixture = undefined;
+    try second.open(dir);
+    defer second.deinit();
+    defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    // As serve sets it: each forward and each request end installs the model's cap.
+    dsv41_borrow.pool_ram_cap = 1 << 40;
+    defer dsv41_borrow.pool_ram_cap = 0;
+    var buf: [48]u32 = undefined;
+    const want = blk: {
+        const turn = arch_handle.turnFor(arch_handle.handleOf(&first.xfm), &first.config);
+        defer turn.end();
+        const out = try greedyRun(&first, first.prompt(&buf), 8);
+        dsv41_borrow.endRequestMlx(&first.config);
+        break :blk out;
+    };
+    const firsts = mlx.engine.poolLimit();
+    const turn = arch_handle.turnFor(arch_handle.handleOf(&second.xfm), &second.config);
+    defer turn.end();
+    try testing.expect(firsts != null);
+    try testing.expect(mlx.engine.poolLimit() != firsts);
+    const got = try greedyRun(&second, second.prompt(&buf), 8);
+    dsv41_borrow.endRequestMlx(&second.config);
+    try testing.expectEqualSlices(u32, &want, &got);
 }

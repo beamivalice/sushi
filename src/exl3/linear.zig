@@ -306,8 +306,8 @@ fn splitShared(s: mlx.mlx_stream, flat: mlx.mlx_array, rows: c_int, sh: Shared, 
         defer _ = mlx.mlx_array_free(part);
         try mlx.check(mlx.mlx_slice(&part, flat, &[_]c_int{c0 * rows}, 1, &[_]c_int{c1 * rows}, 1, &[_]c_int{1}, 1, s));
         o.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(o, part, &[_]c_int{ rows, c1 - c0 }, 2, s));
         made += 1;
+        try mlx.check(mlx.mlx_reshape(o, part, &[_]c_int{ rows, c1 - c0 }, 2, s));
     }
 }
 

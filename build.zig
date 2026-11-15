@@ -185,7 +185,7 @@ pub fn build(b: *std.Build) void {
     const host_filters = if (test_filter) |user| hostUserFilters(b, user) else hostFilters(b);
     const count_guard = addCountGuard(b, target);
     if (host_filters.len > 0) {
-        const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = host_filters });
+        const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = host_filters, .test_runner = testRunner(b) });
         test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_host_tests = b.addRunArtifact(host_tests);
         test_host_step.dependOn(&run_host_tests.step);
@@ -231,6 +231,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const encoder_tests = b.addTest(.{
+        .test_runner = testRunner(b),
         .name = "encoder-test",
         .root_module = encoder_mod,
         .filters = test_filter orelse &.{},
@@ -569,7 +570,7 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
         }
         if (filters.items.len == 0) continue;
         const name = if (i < test_buckets.len) b.fmt("test-{s}", .{test_buckets[i][0]}) else "test-rest";
-        out.append(b.allocator, b.addTest(.{ .name = name, .root_module = root, .filters = filters.items })) catch @panic("OOM");
+        out.append(b.allocator, b.addTest(.{ .name = name, .root_module = root, .filters = filters.items, .test_runner = testRunner(b) })) catch @panic("OOM");
     }
     return out.items;
 }
@@ -829,7 +830,7 @@ fn addExl3TestBins(b: *std.Build, root: *std.Build.Module, user: ?[]const []cons
         var filters: std.ArrayList([]const u8) = .empty;
         for (tests.items) |t| if (t.bin == i) filters.append(b.allocator, t.filter) catch @panic("OOM");
         if (filters.items.len == 0) continue;
-        out.append(b.allocator, b.addTest(.{ .name = b.fmt("exl3-test-{d}", .{i + 1}), .root_module = root, .filters = filters.items })) catch @panic("OOM");
+        out.append(b.allocator, b.addTest(.{ .name = b.fmt("exl3-test-{d}", .{i + 1}), .root_module = root, .filters = filters.items, .test_runner = testRunner(b) })) catch @panic("OOM");
     }
     return out.items;
 }
@@ -1149,4 +1150,9 @@ test "an arch_tests.zig lists its host tests one import a line, and a stray line
         \\    @import("a.zig")
         \\};
     , "host_tests"));
+}
+
+/// Every test binary runs under sushi's runner: std's, plus the check after each test that the engine is at rest.
+fn testRunner(b: *std.Build) std.Build.Step.Compile.TestRunner {
+    return .{ .path = b.path("scripts/test_runner.zig"), .mode = .server };
 }

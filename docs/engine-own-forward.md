@@ -413,9 +413,14 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   forward's cap counts the pool: the DSpark mxfp4 banks stacked by an op held 7.5 GB of it on the release pack and the
   load warm's first sampled verdict was refused; the fp8 block scales held 231 MB. Both are host copies into owned
   regions, and a Cooler load maps every weight, small ones included ([dsv41-memory](dsv41-memory.md#owned-weights)).
+- **A Cooler model's budget is its own.** Each trunk keeps the engine budget it last installed (`cooler_budget`);
+  `arch_handle.turnFor` makes that slot the turn's (`engine.turnToModel`), `engine.budget` records into it, and a
+  turn puts it back when another model installed the cap in force. Two Cooler models in one process never run under
+  each other's cap; one model alone sees its own cap with what `core.room` added, untouched.
 - **A load decides its side for its life.** The side is its config's (`mlx_ask`, or a test's `cooler_for_test` set
   before the load) and every hook reads it through `Model.onEngine`, so no switch can flip it over a load. A Cooler
-  load holds the engine's scope until it is freed: a test that leaks one runs every later test inside it.
+  load holds the engine's scope until it is freed, and its seal ends with the last hold: a test that leaves either
+  open fails by name after it ends (the test runner's rest check, [testsuite](testsuite.md)).
 - **A pipeline is compiled per side.** MLX's warm at load compiles MLX's; the engine's are its own, so the load runs
   the engine's decode widths too (`dsv41_model.warmOwn`). Without it the first verify of each width paid its compile
   inside a request (up to 2 s), and the round-cost policy stopped drafting for the rest of that request.

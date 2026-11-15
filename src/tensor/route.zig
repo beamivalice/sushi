@@ -3,6 +3,7 @@
 //! name, never passed on.
 
 const std = @import("std");
+const log = @import("../log.zig");
 const mlx = @import("../mlx.zig");
 const metal = @import("../metal.zig");
 const device = @import("sushi_exl3").device;
@@ -60,15 +61,18 @@ pub fn enter(s: S) Scope {
     const own = core.isStream(s);
     const was = active;
     if (own) active = true;
-    return .{ .own = own, .was = was };
+    return .{ .own = own, .was = was, .held = holds > 0 };
 }
 
 pub const Scope = struct {
     own: bool,
     was: bool,
+    held: bool,
 
     pub fn end(self: Scope) void {
-        if (self.own) active = self.was;
+        if (!self.own) return;
+        // The last hold may have gone inside the scope (the model's unload): the engine's scope went with it.
+        active = self.was and !(self.held and holds == 0);
     }
 };
 
@@ -99,12 +103,55 @@ pub fn unhold() void {
     holds -= 1;
     if (holds != 0) return;
     active = false;
+    // A seal is a load's: with no load of the engine's left, the next one's pipelines are its own warm, not late.
+    core.sealed = false;
     mlx_at_rest.on.store(false, .release);
     mlx.payOwed();
 }
 
 pub fn holding() bool {
     return holds > 0;
+}
+
+/// Test builds, after each test (`scripts/test_runner.zig`): what the engine was left holding, written to `w`, with
+/// its turns, scope and seal put back at rest; the holds stay for the caller to end (`arch_handle.engineHoldEnd`).
+pub fn leftByTest(w: *std.Io.Writer) !bool {
+    var left = false;
+    if (holds > 0) {
+        try w.print(" {d} Sushi Cooler hold(s) open;", .{holds});
+        left = true;
+    }
+    if (depth > 0) {
+        try w.print(" {d} turn(s) open;", .{depth});
+        depth = 0;
+        left = true;
+    }
+    if (active and holds == 0) {
+        try w.writeAll(" a forward scope open;");
+        left = true;
+    }
+    if (turn_slot != null or (budget_slot != null and budget_slot != &no_model)) {
+        try w.writeAll(" a model's budget slot still in force;");
+        left = true;
+    }
+    turn_slot = null;
+    budget_slot = null;
+    if (core.sealed and holds == 0) {
+        try w.writeAll(" the engine sealed with no model loaded;");
+        core.sealed = false;
+        left = true;
+    }
+    if (own_weights) {
+        try w.writeAll(" own_weights set;");
+        own_weights = false;
+        left = true;
+    }
+    if (core.fault.armed()) {
+        try w.writeAll(" the pool fault injector armed;");
+        core.fault.disarm();
+        left = true;
+    }
+    return left;
 }
 
 /// The inference thread turns to work for one model, a load of which is the engine's (`own`) or not. While a load
@@ -114,8 +161,32 @@ pub fn holding() bool {
 /// its pool left to the model that filled it; what MLX was owed while at rest is done as its turn begins. In a process
 /// no load holds, a turn is nothing.
 pub fn turnTo(own: bool) Turn {
+    return turnToModel(own, null);
+}
+
+/// The budget slot of the Cooler model whose turn it is (null: MLX's side, or the engine's work of no model): each
+/// model keeps the cap it last installed, so its work never runs under the cap another left.
+var turn_slot: ?*?u64 = null;
+/// The owner of the cap in force: a model's slot, `no_model` for a cap of work with no model (a load), null for none.
+var budget_slot: ?*?u64 = null;
+var no_model: ?u64 = null;
+
+/// The model slot each open turn found, innermost last: what its `end` gives back. Engine-owned, so a model that goes
+/// is scrubbed from every turn still open (`forgetSlot`).
+var frames: [32]?*?u64 = undefined;
+var depth: usize = 0;
+
+/// `turnTo` for one model's work (`slot`, its budget slot; null for work of no model). On the engine's side the cap
+/// in force becomes the model's: the bytes it last installed, over what the pool asks now, or none when it installed
+/// none. Its `end` puts back the cap of the model whose turn it was inside; at the top level the cap stays.
+pub fn turnToModel(own: bool, slot: ?*?u64) Turn {
     if (holds == 0) return .{};
+    if (depth == frames.len) @panic("engine: turns nested past 32");
+    frames[depth] = turn_slot;
+    depth += 1;
     const was: Turn = .{ .took = true, .active = active, .rest = mlx_at_rest.on.load(.acquire) };
+    turn_slot = if (own) slot else null;
+    if (turn_slot) |mine| installCap(mine);
     active = own;
     if (own == was.rest) return was;
     if (own) {
@@ -127,6 +198,26 @@ pub fn turnTo(own: bool) Turn {
     return was;
 }
 
+/// `mine`'s cap goes in force when another's is. The open pass ends first: the free buffers it still binds are the
+/// other's scratch, which no trim could give back under this cap.
+fn installCap(mine: *?u64) void {
+    if (mine == budget_slot) return;
+    if (mine.* == null and budget_slot == null) return;
+    core.close();
+    budget_slot = mine;
+    const bytes = mine.* orelse std.math.maxInt(u64);
+    core.budget(bytes) catch |e| log.warn("[engine] pool: the model's cap of {d} MB was not installed at its turn: {s}\n", .{ bytes >> 20, @errorName(e) });
+}
+
+/// A model that goes: no turn, open or to come, and no cap in force keeps its slot.
+pub fn forgetSlot(slot: *?u64) void {
+    for (frames[0..depth]) |*f| {
+        if (f.* == slot) f.* = null;
+    }
+    if (turn_slot == slot) turn_slot = null;
+    if (budget_slot == slot) budget_slot = null;
+}
+
 pub const Turn = struct {
     took: bool = false,
     active: bool = false,
@@ -134,8 +225,11 @@ pub const Turn = struct {
 
     pub fn end(self: Turn) void {
         if (!self.took) return;
+        depth -= 1;
+        turn_slot = frames[depth];
         // The last hold may have gone inside the turn (the model's unload): nothing is given back then.
         if (holds == 0) return;
+        if (turn_slot) |outer| installCap(outer);
         active = self.active;
         if (self.rest == mlx_at_rest.on.load(.acquire)) return;
         if (self.rest) return mlx.restAllocator(&mlx_at_rest, false);
@@ -454,6 +548,7 @@ pub const poolBytes = core.poolBytes;
 pub const storePointer = core.storePointer;
 pub const stream = core.stream;
 pub const stats = core.stats;
+pub const poolLimit = core.poolLimit;
 pub const poolTotal = core.poolTotal;
 pub const poolFree = core.poolFree;
 pub const fault = core.fault;
@@ -475,8 +570,22 @@ pub const touch = core.touch;
 pub fn kernelKeyBuilds() u64 {
     return kernel.key_builds;
 }
-pub const budget = core.budget;
-pub const room = core.room;
+/// Installs the engine's budget (`core.budget`) and records it as the cap of the model whose turn it is, which a
+/// turn to that model installs again (`turnToModel`).
+pub fn budget(bytes: u64) core.Error!void {
+    const owner = turn_slot orelse &no_model;
+    owner.* = bytes;
+    budget_slot = owner;
+    return core.budget(bytes);
+}
+
+/// `core.room`, recorded as part of the cap of its owner, which a turn back to that model installs again.
+pub fn room(lens: []const usize) void {
+    const before = core.poolLimit() orelse return;
+    core.room(lens);
+    const owner = budget_slot orelse return;
+    if (owner.*) |bytes| owner.* = bytes +| (core.poolLimit().? - before);
+}
 pub const uncapped = core.uncapped;
 pub const capped = core.capped;
 pub const close = core.close;
@@ -5192,4 +5301,229 @@ test "engine gathers at negative indices, pad, repeat, stack and concatenate giv
     }
     try expectSameAs("stack, 256 parts", Build.stack, &parts);
     try expectSameAs("concatenate, 256 parts", Build.cat, &parts);
+}
+
+test "engine: a turn to a Cooler model installs the budget that model last set, whatever another model set since" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    hold();
+    defer @import("../arch/handle.zig").engineHoldEnd();
+    defer core.budget(1 << 62) catch {};
+    var made: A = .{};
+    defer _ = mlx.mlx_array_free(made);
+    try mlx.check(mlx.mlx_zeros(&made, &[_]c_int{64}, 1, .float32, stream()));
+    try mlx.check(mlx.mlx_array_eval(made));
+    var a: ?u64 = null;
+    var b: ?u64 = null;
+    for ([_]struct { slot: *?u64, bytes: u64 }{ .{ .slot = &a, .bytes = 1 << 20 }, .{ .slot = &b, .bytes = 3 << 20 } }) |m| {
+        const turn = turnToModel(true, m.slot);
+        defer turn.end();
+        try budget(m.bytes);
+    }
+    try std.testing.expectEqual(@as(?u64, 1 << 20), a);
+    try std.testing.expectEqual(@as(?u64, 3 << 20), b);
+    const asked = core.stats().pool_asked;
+    for ([_]struct { slot: *?u64, bytes: u64 }{ .{ .slot = &a, .bytes = 1 << 20 }, .{ .slot = &b, .bytes = 3 << 20 }, .{ .slot = &a, .bytes = 1 << 20 } }) |m| {
+        const turn = turnToModel(true, m.slot);
+        defer turn.end();
+        try std.testing.expectEqual(asked + m.bytes, core.poolLimit().?);
+    }
+    // The model whose cap is in force keeps what `room` added to it.
+    {
+        const turn = turnToModel(true, &a);
+        defer turn.end();
+        core.room(&.{1 << 20});
+    }
+    const roomy = core.poolLimit().?;
+    {
+        const turn = turnToModel(true, &a);
+        defer turn.end();
+        try std.testing.expectEqual(roomy, core.poolLimit().?);
+    }
+    // A turn of the engine's side with no model (a load's job) records nothing.
+    const job = turnTo(true);
+    try budget(5 << 20);
+    job.end();
+    try std.testing.expectEqual(@as(?u64, 1 << 20), a);
+}
+
+/// Two Cooler models' turns under one hold, each test leaving no slot or cap of its own behind.
+const TurnFixture = struct {
+    was_enabled: bool,
+
+    fn begin() TurnFixture {
+        const was_enabled = enabled;
+        hold();
+        return .{ .was_enabled = was_enabled };
+    }
+
+    fn end(self: TurnFixture) void {
+        turn_slot = null;
+        budget_slot = null;
+        core.budget(1 << 62) catch {};
+        @import("../arch/handle.zig").engineHoldEnd();
+        @import("../test_support.zig").restoreEngine(self.was_enabled);
+    }
+
+    /// A pool tensor of `n` floats, made and run.
+    fn made(n: c_int) !A {
+        var out: A = .{};
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_zeros(&out, &[_]c_int{n}, 1, .float32, stream()));
+        try mlx.check(mlx.mlx_array_eval(out));
+        return out;
+    }
+};
+
+test "engine: a turn inside another Cooler model's turn gives the outer model its cap back at its end, over what the pool asks then" {
+    try mlx.requireGpu();
+    const fx = TurnFixture.begin();
+    defer fx.end();
+    const base = try TurnFixture.made(64);
+    defer _ = mlx.mlx_array_free(base);
+    var a: ?u64 = null;
+    var b: ?u64 = null;
+    const outer = turnToModel(true, &a);
+    defer outer.end();
+    try budget(1 << 20);
+    var inner_made: A = .{};
+    defer _ = mlx.mlx_array_free(inner_made);
+    {
+        const inner = turnToModel(true, &b);
+        defer inner.end();
+        try budget(3 << 20);
+        inner_made = try TurnFixture.made(16 << 10);
+    }
+    try std.testing.expectEqual(core.stats().pool_asked + (1 << 20), core.poolLimit().?);
+    try std.testing.expectEqual(&a, budget_slot.?);
+}
+
+test "engine: work of no model inside a Cooler model's turn records nothing into that model's slot, and the model's cap is back at its end" {
+    try mlx.requireGpu();
+    const fx = TurnFixture.begin();
+    defer fx.end();
+    const base = try TurnFixture.made(64);
+    defer _ = mlx.mlx_array_free(base);
+    var a: ?u64 = null;
+    const outer = turnToModel(true, &a);
+    defer outer.end();
+    try budget(1 << 20);
+    {
+        const job = turnTo(true);
+        defer job.end();
+        try budget(5 << 20);
+    }
+    try std.testing.expectEqual(@as(?u64, 1 << 20), a);
+    try std.testing.expectEqual(core.stats().pool_asked + (1 << 20), core.poolLimit().?);
+}
+
+test "engine: a Cooler model with no cap yet runs under none, never under the cap another model installed" {
+    try mlx.requireGpu();
+    const fx = TurnFixture.begin();
+    defer fx.end();
+    const base = try TurnFixture.made(64);
+    defer _ = mlx.mlx_array_free(base);
+    var a: ?u64 = null;
+    var b: ?u64 = null;
+    {
+        const turn = turnToModel(true, &a);
+        defer turn.end();
+        try budget(1 << 20);
+    }
+    {
+        const turn = turnToModel(true, &b);
+        defer turn.end();
+        try std.testing.expect(core.poolLimit().? > 1 << 62);
+    }
+    {
+        const turn = turnToModel(true, &a);
+        defer turn.end();
+        try std.testing.expectEqual(core.stats().pool_asked + (1 << 20), core.poolLimit().?);
+    }
+}
+
+test "engine: what room adds to the cap in force is its model's, and that model's next turn after another's keeps it" {
+    try mlx.requireGpu();
+    const fx = TurnFixture.begin();
+    defer fx.end();
+    const base = try TurnFixture.made(64);
+    defer _ = mlx.mlx_array_free(base);
+    var a: ?u64 = null;
+    var b: ?u64 = null;
+    {
+        const turn = turnToModel(true, &a);
+        defer turn.end();
+        try budget(1 << 20);
+        room(&.{1 << 20});
+        try std.testing.expectEqual(core.poolLimit().? - core.stats().pool_asked, a.?);
+    }
+    {
+        const turn = turnToModel(true, &b);
+        defer turn.end();
+        try budget(3 << 20);
+    }
+    {
+        const turn = turnToModel(true, &a);
+        defer turn.end();
+        try std.testing.expectEqual(core.stats().pool_asked + a.?, core.poolLimit().?);
+        try std.testing.expect(a.? >= 2 << 20);
+    }
+}
+
+test "engine: a model forgotten while a turn inside its own runs is no turn's slot again when that turn ends" {
+    try mlx.requireGpu();
+    const fx = TurnFixture.begin();
+    defer fx.end();
+    var a: ?u64 = null;
+    var b: ?u64 = null;
+    const outer = turnToModel(true, &a);
+    {
+        const inner = turnToModel(true, &b);
+        defer inner.end();
+        forgetSlot(&a);
+    }
+    try std.testing.expect(turn_slot != &a);
+    outer.end();
+    try std.testing.expect(turn_slot == null and budget_slot != &a);
+}
+
+test "engine: a forward scope open across the last hold's end leaves the engine's scope off" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    hold();
+    const scope = enter(stream());
+    @import("../arch/handle.zig").engineHoldEnd();
+    scope.end();
+    defer active = false;
+    try std.testing.expect(!active);
+}
+
+test "engine: a Cooler model's turn after another's runs under its own cap, never under buffers the other's open pass still binds" {
+    try mlx.requireGpu();
+    const fx = TurnFixture.begin();
+    defer fx.end();
+    var a: ?u64 = null;
+    var b: ?u64 = null;
+    const n: c_int = 64 << 10;
+    {
+        const turn = turnToModel(true, &a);
+        defer turn.end();
+        try budget(1 << 30);
+        const x = try TurnFixture.made(n);
+        var y: A = .{};
+        try mlx.check(mlx.mlx_add(&y, x, x, stream()));
+        _ = mlx.mlx_array_free(x);
+        _ = mlx.mlx_array_free(y);
+    }
+    {
+        const turn = turnToModel(true, &b);
+        defer turn.end();
+        // Room for `z` beyond what the tensors in use already round up to: no more.
+        const st = core.stats();
+        try budget(st.pool_bytes - st.pool_free - st.pool_asked + @as(u64, @intCast(n)) * 4);
+        const z = try TurnFixture.made(n);
+        _ = mlx.mlx_array_free(z);
+    }
 }

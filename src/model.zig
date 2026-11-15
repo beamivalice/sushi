@@ -25,8 +25,8 @@ pub var ssd_prefetch: ?u8 = null;
 
 pub const default_ssd_prefetch: u8 = 0;
 
-/// The launch flag that turns Sushi Cooler, the engine of our own, off for the arch that has it (`--ds41-mlx-engine`).
-pub var cooler_off_flag: bool = false;
+/// The archs whose Sushi Cooler opt-out flag was given (`arch_config.CoolerOptOut.flag`).
+pub var cooler_off: std.EnumSet(arch_config.Tag) = .empty;
 
 /// The `--ssd-prefetch` value: an integer 0..100, else null.
 pub fn parseSsdPrefetch(value: []const u8) ?u8 {
@@ -1130,7 +1130,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     config.gdn_state_f32 = qwen_gdn_f32;
     config.drop_expert = drop_expert;
     config.ssd_prefetch = ssd_prefetch;
-    config.cooler_flag = if (cooler_off_flag) false else null;
+    config.cooler_flag = if (arch_config.tagOf(&config)) |t| (if (cooler_off.contains(t)) false else null) else null;
     try arch_config.parseDir(&config, allocator, model_dir);
     if (config.supportsExpertStreaming()) {
         const layers: u16 = std.math.cast(u16, config.num_hidden_layers) orelse return error.InvalidQwen4ConfigField;
@@ -2082,9 +2082,16 @@ pub fn isServedArch(model_type: []const u8) bool {
 
 /// The arch gate, also run at the top of a server load so its refusal lands before the listener serves.
 pub fn archGate(config: *const ModelConfig) error{ArchitectureUnsupported}!void {
-    if (arch_config.tagOf(config) != null) return;
-    log.err("model_type \"{s}\" is not served by this build (" ++ arch_config.gate_text ++ " only)\n", .{config.model_type});
+    var buf: [384]u8 = undefined;
+    const line = archGateLine(&buf, config) orelse return;
+    log.err("{s}\n", .{line});
     return error.ArchitectureUnsupported;
+}
+
+/// The arch gate's refusal of `config`, null when its arch is served.
+pub fn archGateLine(buf: []u8, config: *const ModelConfig) ?[]const u8 {
+    if (arch_config.tagOf(config) != null) return null;
+    return std.fmt.bufPrint(buf, "model_type \"{s}\" is not served by this build (" ++ arch_config.gate_text ++ " only)", .{config.model_type}) catch "this model_type is not served by this build (" ++ arch_config.gate_text ++ " only)";
 }
 
 /// The ONE weight-loader decision. A second construction site is how a

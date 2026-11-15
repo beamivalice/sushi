@@ -1553,6 +1553,9 @@ pub const fault = struct {
     pub fn disarm() void {
         remaining = 0;
     }
+    pub fn armed() bool {
+        return remaining != 0;
+    }
     /// Did the armed fault actually fire? False means the call under test
     /// returned before reaching its k-th checked op — an assertion the test
     /// needs, or the sweep silently stops covering anything.

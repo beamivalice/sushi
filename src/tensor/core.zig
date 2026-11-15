@@ -552,6 +552,9 @@ pub const fault = struct {
     pub fn disarm() void {
         remaining = 0;
     }
+    pub fn armed() bool {
+        return remaining != 0;
+    }
     /// Buffers the pool was asked for since the process began: the difference over a request is its sweep's length.
     pub fn count() u64 {
         return asked;
@@ -672,6 +675,11 @@ fn evict(s: *State, bytes: u64) bool {
     metal.commitResident();
     publishPool(s);
     return s.stats.pool_bytes <= bytes;
+}
+
+/// The pool's cap in force: the in-use bytes when the budget went in plus the budget; null with none.
+pub fn poolLimit() ?u64 {
+    return if (state) |s| s.pool_limit else null;
 }
 
 /// Releases every free buffer no pass still binds; the budget stays as it was.

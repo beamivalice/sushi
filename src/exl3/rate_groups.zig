@@ -122,19 +122,16 @@ pub const Ragged = struct {
         self.meta = try metaTable(s, meta.items);
         var at: [3]c_int = @splat(0);
         for (banks, 0..) |bank, g| {
-            var view: root.Bank = undefined;
+            const view = self.openView(g);
             for (0..3) |pi| {
                 const p = projOf(bank, pi);
                 const len: c_int = @intCast(mlx.mlx_array_size(p.trellis));
-                const dst = projPtr(&view, pi);
-                dst.* = .{ .trellis = .{ .ctx = null }, .suh = .{ .ctx = null }, .svh = .{ .ctx = null } };
+                const dst = projPtr(view, pi);
                 dst.trellis = try rowsView(s, self.trellis[pi], at[pi], at[pi] + len, mlx.getShape(p.trellis));
                 dst.suh = try rowsView(s, self.suh[pi], @intCast(self.base[g]), @intCast(self.base[g] + self.experts_of[g]), mlx.getShape(p.suh));
                 dst.svh = try rowsView(s, self.svh[pi], @intCast(self.base[g]), @intCast(self.base[g] + self.experts_of[g]), mlx.getShape(p.svh));
                 at[pi] += len;
             }
-            self.views[g] = view;
-            self.view_count += 1;
         }
         return self;
     }
@@ -191,11 +188,20 @@ pub const Ragged = struct {
         return self;
     }
 
+    /// Pool `p`'s view, empty and counted before its first handle: a view that fails leaves `deinit` the ones made.
+    fn openView(self: *Ragged, p: usize) *root.Bank {
+        std.debug.assert(p == self.view_count);
+        const view = &self.views[p];
+        for (0..3) |pi| projPtr(view, pi).* = .{ .trellis = .{ .ctx = null }, .suh = .{ .ctx = null }, .svh = .{ .ctx = null } };
+        self.view_count += 1;
+        return view;
+    }
+
     /// Each pool's bank over the flat storage, as a view: the prefill GEMMs read these.
     fn poolViews(self: *Ragged, s: mlx.mlx_stream) !void {
         var at: [3]c_int = @splat(0);
         for (0..self.count) |g| {
-            var view: root.Bank = undefined;
+            const view = self.openView(g);
             const slots: c_int = @intCast(self.experts_of[g]);
             for (&at) |*a| a.* = @intCast(std.mem.alignForward(u64, @intCast(a.*), self.align_words));
             for (0..3) |pi| {
@@ -203,15 +209,12 @@ pub const Ragged = struct {
                 const out_dim: c_int = if (pi == 2) self.hidden else self.inter;
                 const n: c_int = @intCast(self.rates[g][pi]);
                 const len: c_int = slots * @divExact(in_dim, 16) * @divExact(out_dim, 16) * n;
-                const dst = projPtr(&view, pi);
-                dst.* = .{ .trellis = .{ .ctx = null }, .suh = .{ .ctx = null }, .svh = .{ .ctx = null } };
+                const dst = projPtr(view, pi);
                 dst.trellis = try rowsView(s, self.trellis[pi], at[pi], at[pi] + len, &[_]c_int{ slots, @divExact(in_dim, 16), @divExact(out_dim, 16), n });
                 dst.suh = try rowsView(s, self.suh[pi], @intCast(self.base[g]), @intCast(self.base[g] + self.experts_of[g]), &[_]c_int{ slots, in_dim });
                 dst.svh = try rowsView(s, self.svh[pi], @intCast(self.base[g]), @intCast(self.base[g] + self.experts_of[g]), &[_]c_int{ slots, out_dim });
                 at[pi] += len;
             }
-            self.views[g] = view;
-            self.view_count += 1;
         }
     }
 
@@ -230,27 +233,28 @@ pub const Ragged = struct {
         var svh: [3][max_groups]mlx.mlx_array = undefined;
         var made: usize = 0;
         defer for (0..made) |p| for (0..3) |pi| {
-            _ = mlx.mlx_array_free(suh[pi][p]);
-            _ = mlx.mlx_array_free(svh[pi][p]);
+            freeHandle(&suh[pi][p]);
+            freeHandle(&svh[pi][p]);
         };
         for (0..cache.count) |g| {
             for ([_]struct { bank: *const Ragged, slots: u32 }{ .{ .bank = cache, .slots = cache.experts_of[g] }, .{ .bank = spill, .slots = overflow[g] } }) |part| {
                 if (part.slots == 0) continue;
                 if (self.count == max_groups) return error.Exl3GroupMissing;
                 const p = self.count;
-                var view: root.Bank = undefined;
+                const view = self.openView(p);
+                for (0..3) |pi| {
+                    suh[pi][p] = .{ .ctx = null };
+                    svh[pi][p] = .{ .ctx = null };
+                }
+                made += 1;
                 for (0..3) |pi| {
                     const src = projOf(part.bank.views[g], pi);
                     const sh = mlx.getShape(src.trellis);
-                    const dst = projPtr(&view, pi);
-                    dst.* = .{ .trellis = .{ .ctx = null }, .suh = .{ .ctx = null }, .svh = .{ .ctx = null } };
+                    const dst = projPtr(view, pi);
                     dst.trellis = try rowsView(s, src.trellis, 0, @intCast(part.slots), &[_]c_int{ @intCast(part.slots), sh[1], sh[2], sh[3] });
                     suh[pi][p] = try rowsView(s, src.suh, 0, @intCast(part.slots), &[_]c_int{ @intCast(part.slots), mlx.getShape(src.suh)[1] });
                     svh[pi][p] = try rowsView(s, src.svh, 0, @intCast(part.slots), &[_]c_int{ @intCast(part.slots), mlx.getShape(src.svh)[1] });
                 }
-                made += 1;
-                self.views[p] = view;
-                self.view_count += 1;
                 self.rates[p] = cache.rates[g];
                 self.origin[p] = @intCast(g);
                 self.base[p] = self.experts;

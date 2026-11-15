@@ -224,12 +224,12 @@ take. `/props` `memory.owned_bytes` and the `[dsv41-mem]` load line report it, t
   (`OwnedImportCopied`), since a copy would sit outside the ledger.
 - The DSpark stage's trellis experts are nine regions (trellis, `suh`, `svh` per projection), the groups' bytes back to
   back, copied on the host; each group's source is dropped after its copy, so a stage's load peak is its storage plus
-  one group (`dsv41_owned.raggedOwned`, into `Ragged.initPools`).
+  one group (`owned_weights.raggedOwned`, into `Ragged.initPools`).
 - The DSpark stage's mxfp4 experts (the release's layout) are six regions (codes and scales per projection), every
-  expert's bytes back to back, copied on the host (`dsv41_owned.stack`, `.experts`). An op would make the bank in the
+  expert's bytes back to back, copied on the host (`owned_weights.stack`, `.experts`). An op would make the bank in the
   engine's pool on a Cooler load, where a forward's cap would count it (7.5 GB on the release pack).
 - f32 widenings (bf16 to f32 is the bits shifted up, as MLX's cast), the fp8 block scales repeated down their 32 rows
-  (`dsv41_owned.repeatRows`) and the fused-stack bank of `fuseShared` are built in regions; the slices stay views.
+  (`owned_weights.repeatRows`) and the fused-stack bank of `fuseShared` are built in regions; the slices stay views.
 - Left outside the regions (MLX's, or the engine's pool on a Cooler load): tensors under the floor, the meta tables, the
   rope tables, Engram's q.k product (its q and k are dropped once it is made) and the vision tower's requantized codes
   ([above](#vision-requant)), billed at the pool's size classes on a Cooler load.

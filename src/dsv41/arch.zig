@@ -94,6 +94,18 @@ pub fn cacheLayoutNamespace(config: *const Config) ?[]const u8 {
     return dsv41_prefix.namespaceTag(dsparkOn(config));
 }
 
+pub const cooler_opt_out: @import("../arch/config.zig").CoolerOptOut = .{
+    .flag = "--ds41-mlx-engine",
+    .setting = "ds41_cooler",
+};
+
+/// What the shared Sushi Cooler contract suite asks of this arch (`src/cooler_contract_test.zig`).
+pub const cooler_contract = @import("dsv41_contract.zig");
+
+pub fn coolerForTest(config: *Config, on: bool) void {
+    if (config.dsv41) |*c| c.cooler_for_test = on;
+}
+
 /// Records who asked for decode on MLX, which `dsv41_borrow.decodeSideOf` and the bills read.
 pub fn stampCooler(config: *Config, on: bool, by_flag: bool) void {
     if (config.dsv41) |*c| c.mlx_ask = if (on) .none else if (by_flag) .flag else .setting;
@@ -177,7 +189,7 @@ pub fn ownsModuleDecodeState(xfm: Model) bool {
 }
 
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {
-    return .{ .drop_expert = true, .prefetch = true, .cooler = true, .tile_major = config.expert_layout == .exl3_k4, .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false };
+    return .{ .drop_expert = true, .prefetch = true, .tile_major = config.expert_layout == .exl3_k4, .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false };
 }
 
 test "a model stamped as dsv41 is dispatched to dsv41" {

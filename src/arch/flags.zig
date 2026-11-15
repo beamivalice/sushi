@@ -28,7 +28,6 @@ pub const LaunchFlagUse = struct {
     mtp_head_kv_quant: bool = false,
     drop_expert: bool = false,
     ssd_prefetch: bool = false,
-    cooler_off: bool = false,
     mtp_typical: bool = false,
     mtp_tokenv3: bool = false,
     mtp_greedy_tail: bool = false,
@@ -57,6 +56,16 @@ pub const Command = struct {
     runs_gpu: bool,
 };
 
+/// The opt-out flag of arch `t`: its loads decode on MLX; another arch's model loads as it would without it.
+fn coolerOffOption(comptime t: registry.Tag, comptime o: arch_config.CoolerOptOut) Option {
+    return .{ .name = o.flag, .takes_value = false, .apply = struct {
+        fn f(_: []const u8) bool {
+            model.cooler_off.insert(t);
+            return true;
+        }
+    }.f };
+}
+
 fn hasDecl(comptime tag: registry.Tag, comptime name: []const u8) bool {
     return @hasDecl(registry.Mod(tag).flags, name);
 }
@@ -65,10 +74,11 @@ fn flagsOf(comptime tag: registry.Tag) type {
     return registry.Mod(tag).flags;
 }
 
-/// Every enabled arch's options, in registry order.
+/// Every enabled arch's options, in registry order, its Sushi Cooler opt-out first.
 pub const options = blk: {
     var out: []const Option = &.{};
     for (std.meta.tags(registry.Tag)) |t| {
+        if (arch_config.coolerOptOut(t)) |o| out = out ++ [_]Option{coolerOffOption(t, o)};
         if (hasDecl(t, "options")) out = out ++ @as([]const Option, &flagsOf(t).options);
     }
     const final = out[0..out.len].*;
@@ -115,7 +125,6 @@ pub fn archFlagRefusal(config: *const model.ModelConfig, use: LaunchFlagUse) ?[]
     const traits = admission.expertStream(config);
     if (use.drop_expert and !traits.drop_expert) return dropExpertElsewhere();
     if (use.ssd_prefetch and !traits.prefetch) return "--ssd-prefetch has no effect on this model: it has no expert prefetcher; drop the flag";
-    if (use.cooler_off and !traits.cooler) return mlxEngineElsewhere();
     const tag = arch_config.tagOf(config) orelse return null;
     switch (tag) {
         inline else => |t| return if (comptime hasDecl(t, "refusal")) flagsOf(t).refusal(config, use) else null,
@@ -129,11 +138,35 @@ fn dropExpertElsewhere() []const u8 {
     return "--drop-expert has no effect on this model; drop the flag";
 }
 
-fn mlxEngineElsewhere() []const u8 {
-    inline for (comptime std.meta.tags(registry.Tag)) |t| {
-        if (comptime hasDecl(t, "mlx_engine_elsewhere")) return flagsOf(t).mlx_engine_elsewhere;
+const cooler_archs = blk: {
+    var n: usize = 0;
+    for (std.meta.tags(registry.Tag)) |t| {
+        if (arch_config.coolerOptOut(t) != null) n += 1;
     }
-    return "--ds41-mlx-engine has no effect on this model; drop the flag";
+    break :blk n;
+};
+
+/// For each Sushi Cooler opt-out flag given for another arch than the model's, the line its load says: the flag
+/// keeps that arch's loads on MLX and leaves this one as it is.
+pub fn coolerOffIgnoredLines(config: *const model.ModelConfig) [cooler_archs]?[]const u8 {
+    var out: [cooler_archs]?[]const u8 = @splat(null);
+    const own = arch_config.tagOf(config);
+    var at: usize = 0;
+    inline for (comptime std.meta.tags(registry.Tag)) |t| {
+        if (comptime arch_config.coolerOptOut(t)) |o| {
+            if (model.cooler_off.contains(t) and own != t) out[at] = o.flag ++ " has no effect on this model: it keeps " ++ registry.Mod(t).model_types[0] ++ " loads on MLX";
+            at += 1;
+        }
+    }
+    return out;
+}
+
+/// Whether the model's arch runs on Sushi Cooler, and so has an opt-out to turn it off.
+fn coolerOffered(config: *const model.ModelConfig) bool {
+    const tag = arch_config.tagOf(config) orelse return false;
+    return switch (tag) {
+        inline else => |t| comptime arch_config.coolerOptOut(t) != null,
+    };
 }
 
 /// The facts `model_settings.applies` decides a key's reach from, so the settings API and the loader's ignored-key lines agree.
@@ -151,7 +184,7 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .kv_choices = kvQuantChoices(config),
         .context_cap = config.contextCap(),
         .reads_yarn = arch_config.fact(config, "reads_yarn"),
-        .cooler_offered = admission.expertStream(config).cooler,
+        .cooler_offered = coolerOffered(config),
     };
 }
 
@@ -172,7 +205,7 @@ pub fn settingsSsdPrefetchIgnoredLine(config: *const model.ModelConfig) ?[]const
 
 /// A model-settings.json `ds41_cooler` on an arch with no Sushi Cooler is ignored with this one line, as `ssd_prefetch` is.
 pub fn settingsCoolerIgnoredLine(config: *const model.ModelConfig) ?[]const u8 {
-    if (admission.expertStream(config).cooler or config.cooler_override == null) return null;
+    if (coolerOffered(config) or config.cooler_override == null) return null;
     inline for (comptime std.meta.tags(registry.Tag)) |t| {
         if (comptime hasDecl(t, "cooler_setting_elsewhere")) return flagsOf(t).cooler_setting_elsewhere;
     }
@@ -428,26 +461,31 @@ test "a latent KV cache refuses a request width it does not store, and an arch w
     try testing.expect(mtpOffLine(&qwen4) == null);
 }
 
-test "--ds41-mlx-engine takes no value, is refused on every arch without Sushi Cooler before the weights load, and its model setting is ignored there" {
+test "--ds41-mlx-engine takes no value and keeps DeepSeek loads on MLX; a model of another arch loads as it would, its load naming the flag, and its model setting is ignored there" {
     if (!built("deepseek_v41")) return error.SkipZigTest;
-    const saved = model.cooler_off_flag;
-    defer model.cooler_off_flag = saved;
-    model.cooler_off_flag = false;
+    const saved = model.cooler_off;
+    defer model.cooler_off = saved;
+    model.cooler_off = .empty;
     var i: usize = 0;
     try testing.expectEqual(Parsed.applied, parseOption(&.{ "--ds41-mlx-engine", "--next" }, &i).?);
     try testing.expectEqual(@as(usize, 0), i);
-    try testing.expect(model.cooler_off_flag);
-    const use = LaunchFlagUse{ .cooler_off = true };
+    try testing.expectEqual(@as(usize, 1), model.cooler_off.count());
     var dsv41 = model.ModelConfig{ .model_type = "deepseek_v41" };
     dsv41.cooler_override = false;
-    try testing.expect(archFlagRefusal(&dsv41, use) == null);
+    for (coolerOffIgnoredLines(&dsv41)) |line| try testing.expect(line == null);
+    try testing.expect(archFlagRefusal(&dsv41, .{}) == null);
     try testing.expect(settingsCoolerIgnoredLine(&dsv41) == null);
     try testing.expect(model_settings.applies("ds41_cooler", settingsFit(&dsv41)));
     for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" }) |arch| {
         if (!built(arch)) continue;
         var cfg = model.ModelConfig{ .model_type = arch };
-        try testing.expectEqualStrings("--ds41-mlx-engine has no effect on this model: only deepseek_v41 runs on Sushi Cooler; drop the flag", archFlagRefusal(&cfg, use) orelse return error.TestExpectedRefusal);
         try testing.expect(archFlagRefusal(&cfg, .{}) == null);
+        var named: usize = 0;
+        for (coolerOffIgnoredLines(&cfg)) |line| if (line) |l| {
+            try testing.expectEqualStrings("--ds41-mlx-engine has no effect on this model: it keeps deepseek_v41 loads on MLX", l);
+            named += 1;
+        };
+        try testing.expectEqual(@as(usize, 1), named);
         try testing.expect(settingsCoolerIgnoredLine(&cfg) == null);
         try testing.expect(!model_settings.applies("ds41_cooler", settingsFit(&cfg)));
         cfg.cooler_override = false;

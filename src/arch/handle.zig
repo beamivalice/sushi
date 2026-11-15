@@ -64,6 +64,7 @@ pub fn adopt(t: *Trunk) Handle {
 /// Frees the model of a handle `adopt` made, the arch's own state first, and the handle's allocation.
 pub fn destroy(h: Handle, allocator: std.mem.Allocator) void {
     const on_engine = mlx.engine.isStream(stream(h));
+    mlx.engine.forgetSlot(&trunk(h).cooler_budget);
     arch_life.deinit(h);
     switch (h) {
         inline else => |m| allocator.destroy(m),
@@ -80,7 +81,7 @@ pub fn stream(h: Handle) mlx.mlx_stream {
 /// scope for its span (`engine.turnTo`); in a process no load holds, a turn is nothing.
 pub fn turnFor(h: ?Handle, cfg: ?*const trunk_mod.ModelConfig) mlx.engine.Turn {
     if (!mlx.engine.holding()) return .{};
-    return mlx.engine.turnTo(onEngine(h, cfg));
+    return mlx.engine.turnToModel(onEngine(h, cfg), if (h) |m| &trunk(m).cooler_budget else null);
 }
 
 /// Whether the model of `h`, or before it has one the model `cfg` will load, runs on the engine's own stream.

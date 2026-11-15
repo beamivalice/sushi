@@ -258,10 +258,12 @@ pub fn contextWindowRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32
     return model_settings.ctxAboveWindowLine(buf, pick.value, config.contextCap(), config.yarn_factor_override, pick.source);
 }
 
-pub const LaunchRefusal = struct { err: error{ GlmKvQuantUnsupported, LaunchFlagUnsupported }, line: []const u8 };
+pub const LaunchRefusal = struct { err: error{ ArchitectureUnsupported, GlmKvQuantUnsupported, LaunchFlagUnsupported, ContextSizeAboveWindow }, line: []const u8 };
 
-/// The launch flag, or the saved kv_quant, this model cannot act on; the cold-load pre-check and the load itself ask the same question.
-pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQuantConfig) ?LaunchRefusal {
+/// Why a load of `config` is refused before it reads a weight: its arch, a launch flag or saved kv_quant it cannot act
+/// on, a context above its window. The cold-load pre-check, the load and offline mode ask the same question.
+pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQuantConfig, ctx_flag: u32) ?LaunchRefusal {
+    if (model_mod.archGateLine(buf, config)) |line| return .{ .err = error.ArchitectureUnsupported, .line = line };
     const launch_kv = trunk.KvCacheChoice.resolve(kv_quant, config.kv_quant_override);
     if (arch_flags.kvQuantRequestRefusal(config, launch_kv.config)) |why| {
         const line = std.fmt.bufPrint(buf, "[kv-cache] {s}", .{why}) catch why;
@@ -273,14 +275,23 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
         .mtp_head_kv_quant = trunk.Trunk.mtp_head_kv_quant_flag,
         .drop_expert = config.drop_expert != 0,
         .ssd_prefetch = config.ssd_prefetch != null,
-        .cooler_off = config.cooler_flag != null,
         .mtp_typical = if (settings_resolve.launch.mtp_acceptance) |m| m == .typical else false,
         .mtp_tokenv3 = if (settings_resolve.launch.mtp_acceptance) |m| m == .tokenv3 else false,
         .mtp_greedy_tail = settings_resolve.launch.mtp_greedy_tail != null,
         .mtp_min_depth = if (depth_bounds.active.min > 1) depth_bounds.active.min else 0,
         .mtp_max_depth = depth_bounds.active.max,
     })) |why| return .{ .err = error.LaunchFlagUnsupported, .line = why };
+    if (contextWindowRefusal(buf, config, ctx_flag)) |line| return .{ .err = error.ContextSizeAboveWindow, .line = line };
     return null;
+}
+
+/// The load lines for each setting and flag the model takes no effect from.
+pub fn logIgnoredSettings(config: *const ModelConfig) void {
+    if (arch_flags.settingsSsdPrefetchIgnoredLine(config)) |line| log.info("{s}\n", .{line});
+    if (arch_flags.settingsCoolerIgnoredLine(config)) |line| log.info("{s}\n", .{line});
+    for (arch_flags.coolerOffIgnoredLines(config)) |line| if (line) |l| log.info("{s}\n", .{l});
+    if (arch_flags.settingsKvQuantIgnoredLine(config)) |line| log.info("{s}\n", .{line});
+    if (arch_flags.settingsMtpIgnoredLine(config)) |line| log.info("{s}\n", .{line});
 }
 
 /// A load's MTP decision: `--mtp`/`--no-mtp` > the per-model `mtp` > on.
@@ -1683,19 +1694,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         params.config.expert_source_dir = null;
     };
     var launch_buf: [384]u8 = undefined;
-    if (launchRefusal(&launch_buf, params.config, params.kv_quant)) |r| {
+    if (launchRefusal(&launch_buf, params.config, params.kv_quant, sch.ctx_size_flag)) |r| {
         log.err("{s}\n", .{r.line});
         return r.err;
     }
-    var window_buf: [256]u8 = undefined;
-    if (contextWindowRefusal(&window_buf, params.config, sch.ctx_size_flag)) |line| {
-        log.err("{s}\n", .{line});
-        return error.ContextSizeAboveWindow;
-    }
-    if (arch_flags.settingsSsdPrefetchIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
-    if (arch_flags.settingsCoolerIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
-    if (arch_flags.settingsKvQuantIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
-    if (arch_flags.settingsMtpIgnoredLine(params.config)) |line| log.info("{s}\n", .{line});
+    logIgnoredSettings(params.config);
     const streaming_budget = resolveSsdBudget(params.ssd_budget_bytes, params.config.ssd_budget_gb_override, params.config.supportsExpertStreaming());
     const streamed = expert_stream_mod.expertStreamingEngaged(
         params.config.supportsExpertStreaming(),
@@ -2491,18 +2494,18 @@ fn logWiredPolicy(limit: ?usize) void {
 /// One model's load or unload job on the inference thread. A model on the engine's own stream has the job held to
 /// its end, so what the job does around the model itself (a pool clear, a limit) asks MLX nothing; beside such a
 /// model, any other model's job steps out of the held scope for its span.
-const JobTurn = struct {
+pub const JobTurn = struct {
     turn: mlx.engine.Turn,
     own: bool,
 
-    fn begin(handle: ?arch_handle.Handle, config: ?*const ModelConfig) JobTurn {
-        const own = if (handle) |h| mlx.engine.isStream(arch_handle.stream(h)) else if (config) |c| @import("arch/life.zig").ownStream(c) != null else false;
+    pub fn begin(handle: ?arch_handle.Handle, config: ?*const ModelConfig) JobTurn {
+        const own = arch_handle.onEngine(handle, config);
         const turn = mlx.engine.turnTo(own);
         if (own) mlx.engine.hold();
         return .{ .turn = turn, .own = own };
     }
 
-    fn end(self: JobTurn) void {
+    pub fn end(self: JobTurn) void {
         if (self.own) arch_handle.engineHoldEnd();
         self.turn.end();
     }
@@ -3171,8 +3174,16 @@ test "a launch flag or saved kv_quant the arch cannot act on is refused with its
     if (@import("arch/registry.zig").ofModelType("deepseek_v41") == null) return error.SkipZigTest;
     var buf: [384]u8 = undefined;
     const dsv = ModelConfig{ .model_type = "deepseek_v41" };
-    const r = launchRefusal(&buf, &dsv, trunk.KVQuantConfig.affine(8)).?;
+    const r = launchRefusal(&buf, &dsv, trunk.KVQuantConfig.affine(8), 0).?;
     try testing.expect(r.err == error.LaunchFlagUnsupported);
     try testing.expect(std.mem.startsWith(u8, r.line, "--kv-quant has no effect on "));
-    try testing.expect(launchRefusal(&buf, &dsv, null) == null);
+    try testing.expect(launchRefusal(&buf, &dsv, null, 0) == null);
+}
+
+test "a model of no served arch is refused as such before any launch flag it cannot act on" {
+    var buf: [384]u8 = undefined;
+    const other = ModelConfig{ .model_type = "mistral", .drop_expert = 4 };
+    const r = launchRefusal(&buf, &other, trunk.KVQuantConfig.affine(8), 0).?;
+    try testing.expect(r.err == error.ArchitectureUnsupported);
+    try testing.expect(std.mem.startsWith(u8, r.line, "model_type \"mistral\" is not served by this build ("));
 }

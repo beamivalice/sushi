@@ -252,7 +252,7 @@ fn bankSlot(key: []const u8) ?usize {
 }
 
 /// A DSpark stage's trellis expert tensor `mtp.<s>.mlp.switch_mlp.<proj>_proj[.gN].<part>` as the one owned region
-/// its (stage, projection, part) is built into (`dsv41_owned.raggedOwned`), or null for any other key.
+/// its (stage, projection, part) is built into (`owned_weights.raggedOwned`), or null for any other key.
 fn raggedSlot(key: []const u8) ?usize {
     const head = "mtp.";
     if (!std.mem.startsWith(u8, key, head)) return null;

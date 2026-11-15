@@ -1925,6 +1925,11 @@ pub const Generator = struct {
             has_captured_hidden = true;
             break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
         } else try xfm.forwardWith(&ctx, last_input);
+        // The prefill's last logits are this function's until a path frees them or hands them to the Generator.
+        var held = raw_logits;
+        errdefer if (held.ctx != null) {
+            _ = mlx.mlx_array_free(held);
+        };
         // History entries for the held-back span: (hidden[j], token[j+1]) for
         // j in [final_start, prefix_len) — same pairing as the chunk loop.
         // The last row's pair (hidden[last], t1) is appended by the first
@@ -1970,14 +1975,17 @@ pub const Generator = struct {
         // so downstream sampling/grammar paths see the classic shape.
         const logits = if (tail_len == 1) raw_logits else blk: {
             defer _ = mlx.mlx_array_free(raw_logits);
+            held = .{ .ctx = null };
             const lshape = mlx.getShape(raw_logits);
             var sliced = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(sliced);
             const start = [_]c_int{ 0, lshape[1] - 1, 0 };
             const stop = [_]c_int{ lshape[0], lshape[1], lshape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(&sliced, raw_logits, &start, 3, &stop, 3, &strides, 3, xfm.outStream()));
             break :blk sliced;
         };
+        held = logits;
         if (trace_enabled) {
             const last_ns = prefill_sw.read() - last_start_ns;
             const total_ns = prefill_sw.read();
@@ -2057,6 +2065,7 @@ pub const Generator = struct {
                 .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, arch_dspark.stageBlock(xfm)),
             };
             gen.pending = .{ .logits = logits };
+            held = .{ .ctx = null };
             attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;
         }
@@ -2082,11 +2091,12 @@ pub const Generator = struct {
         // every verify forward.
         if (sampling.call_force == null and (mtp_active or dflash_active)) {
             const sample_lazy = try sampler.firstTokenSample(xfm, logits, sampling, xfm.outStream());
+            defer _ = mlx.mlx_array_free(sample_lazy);
             _ = mlx.mlx_array_free(logits);
+            held = .{ .ctx = null };
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
-            _ = mlx.mlx_array_free(sample_lazy);
 
             if (native_dflash) try drafter.reserveNativeDflash(&xfm.config, ctx, &dflash_ctx.?, max_tokens, s);
             var native_window: ?SpecWindow = if (native_dflash and want_ssm_cp) .{ .snapshot = try dflash_ctx.?.cache.snapshot(), .base_pos = dflash_ctx.?.base_pos } else null;
@@ -2167,15 +2177,16 @@ pub const Generator = struct {
         // shim handles the bootstrap on the first decode tick.
         if (options.skip_lazy_preforward or options.dspark_enabled) {
             const sample_lazy = try sampler.firstTokenSample(xfm, logits, sampling, xfm.outStream());
+            defer _ = mlx.mlx_array_free(sample_lazy);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
-            _ = mlx.mlx_array_free(sample_lazy);
             // t1's own distribution comes from the prefill's final forward and
             // is invisible to the decode loop — read it here or the first
             // returned token has no logprobs and the array shifts by one.
             const first_lp = try sampler.firstTokenLogprobs(allocator, logits, @intCast(first_val), options.logprobs_n, xfm.outStream());
             _ = mlx.mlx_array_free(logits);
+            held = .{ .ctx = null };
 
             var gen = Generator{
                 .opts = round_opts,
@@ -2215,8 +2226,10 @@ pub const Generator = struct {
 
         // Regular path: sample first token lazily, then build the next forward pass
         const lazy_token = try sampler.firstTokenSample(xfm, logits, sampling, xfm.outStream());
+        defer _ = mlx.mlx_array_free(lazy_token);
 
         const next_logits = try lazyForward(xfm, &ctx, lazy_token, ctx.argmax_only);
+        errdefer _ = mlx.mlx_array_free(next_logits);
 
         // Async-eval the decode pipeline (single-token graphs, much smaller)
         {
@@ -2233,12 +2246,12 @@ pub const Generator = struct {
         try mlx.check(mlx.mlx_array_eval(lazy_token));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
-        _ = mlx.mlx_array_free(lazy_token);
         // See the skip_lazy_preforward branch: t1's distribution lives only in
         // the prefill's own output, so it is read here, against the id that was
         // actually drawn.
         const first_lp = try sampler.firstTokenLogprobs(allocator, logits, @intCast(val), options.logprobs_n, xfm.outStream());
         _ = mlx.mlx_array_free(logits);
+        held = .{ .ctx = null };
 
         var gen = Generator{
             .opts = round_opts,

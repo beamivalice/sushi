@@ -98,6 +98,15 @@ tests/dsv41/dump_dsv41_template_cases.py, tests/dsv41/dump_dsv41_token_map.py an
 tests/dsv41/dump_dsv41_vision_fixtures.py run the unmodified reference externally to
 generate independent numerical fixtures.
 
+--------------------------------------------------------------------------------
+Zig standard test runner
+https://codeberg.org/ziglang/zig (lib/compiler/test_runner.zig, 0.17.1)
+Copyright (c) Zig contributors
+Licensed under the MIT License (Expat), with the terms quoted above.
+
+scripts/test_runner.zig is that runner, unchanged but for `runTest`, which asks
+the engine after every test whether it is at rest.
+
 ================================================================================
 Apache License, Version 2.0
 ================================================================================

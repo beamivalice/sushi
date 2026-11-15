@@ -1722,16 +1722,10 @@ pub const Scheduler = struct {
         defer if (owned_active) model_load.freeCpuState(self.allocator, &owned);
         model_load.applyModelSettings(owned.config, settings);
         var launch_buf: [384]u8 = undefined;
-        if (model_load.launchRefusal(&launch_buf, owned.config, self.kv_quant)) |r| {
+        if (model_load.launchRefusal(&launch_buf, owned.config, self.kv_quant, self.ctx_size_flag)) |r| {
             log.err("{s}\n", .{r.line});
             recordLoadWindowRefusal(r.line);
             return r.err;
-        }
-        var window_buf: [256]u8 = undefined;
-        if (model_load.contextWindowRefusal(&window_buf, owned.config, self.ctx_size_flag)) |line| {
-            log.err("{s}\n", .{line});
-            recordLoadWindowRefusal(line);
-            return error.ContextSizeAboveWindow;
         }
 
         // Victims selected by the eviction planner (multi-victim: one load may
@@ -6185,7 +6179,8 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     const io = testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"not_a_served_arch\"}" });
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -6206,11 +6201,20 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     sch.allocator = testing.allocator;
     sch.ssd_budget_bytes = 0;
     sch.mtp = null;
+    sch.kv_quant = null;
+    sch.ctx_size_flag = 0;
 
     try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoaded("b"));
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
     try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
     // The failed claim unlocked once: a second unlock would leave this free or release another thread's hold.
+    try testing.expect(reg.mutex.tryLock());
+    reg.mutex.unlock(io);
+
+    // A model of no served arch is refused as that before the eviction gate plans for it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"not_a_served_arch\"}" });
+    try testing.expectError(error.ArchitectureUnsupported, sch.ensureLoaded("b"));
+    try testing.expectEqual(model_registry_mod.LoadState.ready, resident.state);
     try testing.expect(reg.mutex.tryLock());
     reg.mutex.unlock(io);
     resident.refcount.store(0, .release);
@@ -6220,7 +6224,8 @@ test "ensureLoadedFresh: a model whose load failed is tried again, not answered 
     const io = testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"not_a_served_arch\"}" });
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -6242,6 +6247,8 @@ test "ensureLoadedFresh: a model whose load failed is tried again, not answered 
     sch.allocator = testing.allocator;
     sch.ssd_budget_bytes = 0;
     sch.mtp = null;
+    sch.kv_quant = null;
+    sch.ctx_size_flag = 0;
 
     // An ordinary request keeps failing fast, and the failure stays on /v1/models.
     try testing.expectError(error.InsufficientMemory, sch.ensureLoaded("b"));

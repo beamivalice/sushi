@@ -12,6 +12,10 @@ pub const model_handle = @import("model_handle.zig");
 
 const std = @import("std");
 const registry = @import("arch/registry.zig");
+
+comptime {
+    _ = @import("test_rest.zig");
+}
 const expert_stream = @import("expert_stream.zig");
 const expert_bf16_kernels = @import("expert_bf16_kernels.zig");
 
@@ -50,6 +54,8 @@ test {
     _ = @import("models_api.zig");
     _ = @import("logprobs.zig");
     _ = @import("model.zig");
+    _ = @import("owned_weights.zig");
+    _ = @import("cooler_contract_test.zig");
     _ = @import("effort.zig");
     _ = @import("exl3_flat_layout_test.zig");
     _ = @import("generate.zig");

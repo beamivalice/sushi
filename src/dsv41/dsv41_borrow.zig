@@ -107,10 +107,11 @@ pub fn decodeSideOf(c: *const Config) DecodeSide {
 
 /// Whether this pack's decode forwards run on the engine of our own. The load and every bill ask here.
 pub fn ownDecode(c: *const Config) bool {
-    if (c.cooler_for_test) |own| return own;
-    // The tests written against MLX's decode say nothing and keep it; the engine's own tests turn it on.
-    if (comptime builtin.is_test) return false;
-    return decodeSideOf(c) == .engine;
+    if (decodeSideOf(c) != .engine) return false;
+    // The tests written against MLX's decode say nothing and keep it; the engine's own tests turn it on. The user's
+    // opt-out (above) outranks both.
+    if (comptime builtin.is_test) return c.cooler_for_test orelse false;
+    return true;
 }
 
 /// Whether the load keeps each expert's scale vectors in host memory once read (`expert_stream.KeptScales`): an STQ
@@ -951,4 +952,41 @@ test "dsv41 borrow: the ledger bills the pool that is parked: MLX's decode pool,
         }
     };
     try withPoolState(8 << 30, &Body.run);
+}
+
+test "the opt-out flag reaches a DeepSeek load's decode side through the parse and the settings stamp, and outranks a test's side" {
+    const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const model_load = @import("../model_load.zig");
+    const model_mod = @import("../model.zig");
+    const saved = model_mod.cooler_off;
+    defer model_mod.cooler_off = saved;
+    {
+        model_mod.cooler_off = .empty;
+        var cfg = try model_mod.parseConfig(io, a, dir);
+        defer cfg.deinit(a);
+        model_load.applyModelSettings(&cfg, .{});
+        try testing.expectEqual(DecodeSide.engine, decodeSideOf(&cfg.dsv41.?));
+        try testing.expect(!ownDecode(&cfg.dsv41.?));
+        cfg.dsv41.?.cooler_for_test = true;
+        try testing.expect(ownDecode(&cfg.dsv41.?));
+    }
+    {
+        model_mod.cooler_off = .empty;
+        model_mod.cooler_off.insert(.dsv41);
+        var cfg = try model_mod.parseConfig(io, a, dir);
+        defer cfg.deinit(a);
+        model_load.applyModelSettings(&cfg, .{ .ds41_cooler = true });
+        try testing.expectEqual(DecodeSide.mlx_by_flag, decodeSideOf(&cfg.dsv41.?));
+        cfg.dsv41.?.cooler_for_test = true;
+        try testing.expect(!ownDecode(&cfg.dsv41.?));
+    }
+    {
+        model_mod.cooler_off = .empty;
+        var cfg = try model_mod.parseConfig(io, a, dir);
+        defer cfg.deinit(a);
+        model_load.applyModelSettings(&cfg, .{ .ds41_cooler = false });
+        try testing.expectEqual(DecodeSide.mlx_by_setting, decodeSideOf(&cfg.dsv41.?));
+    }
 }

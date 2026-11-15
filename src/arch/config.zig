@@ -293,12 +293,42 @@ pub fn kvBytesPerToken(config: *const model.ModelConfig) ?u64 {
     };
 }
 
+/// A Sushi Cooler arch's opt-out to MLX, declared by its arch module as `cooler_opt_out`: the launch flag, the
+/// model-settings key, and the refusal when that flag is given for a model of another arch.
+/// An arch on Sushi Cooler declares its opt-out once: the launch flag that keeps its loads on MLX (parsed from here,
+/// `arch_flags.options`) and its model setting.
+pub const CoolerOptOut = struct { flag: []const u8, setting: []const u8 };
+
+/// The opt-out of the arch `t`; null for an arch without Sushi Cooler.
+pub fn coolerOptOut(comptime t: Tag) ?CoolerOptOut {
+    return if (@hasDecl(registry.Mod(t), "cooler_opt_out")) registry.Mod(t).cooler_opt_out else null;
+}
+
+comptime {
+    for (std.meta.tags(Tag)) |t| if (coolerOptOut(t)) |o| {
+        const M = registry.Mod(t);
+        for ([_][]const u8{ "stampCooler", "coolerForTest", "cooler_contract" }) |decl| {
+            if (!@hasDecl(M, decl)) @compileError(@tagName(t) ++ " declares the Sushi Cooler opt-out " ++ o.flag ++ " without " ++ decl);
+        }
+        if (@import("../model_settings.zig").findKey(&@import("../model_settings.zig").model_keys, o.setting) == null) @compileError(o.flag ++ " names no model setting " ++ o.setting);
+    };
+}
+
 /// Hands the Sushi Cooler choice (`on`; when off, `by_flag` says the launch flag asked, else the model setting) to an
 /// arch that has the engine; the other archs have nothing to stamp.
 pub fn stampCooler(config: *model.ModelConfig, on: bool, by_flag: bool) void {
     const tag = tagOf(config) orelse return;
     switch (tag) {
         inline else => |t| if (@hasDecl(registry.Mod(t), "stampCooler")) registry.Mod(t).stampCooler(config, on, by_flag),
+    }
+}
+
+/// A test names the side its load runs on, before the load, for any arch on Sushi Cooler (its `coolerForTest`); an
+/// arch without the engine has nothing to stamp.
+pub fn coolerForTest(config: *model.ModelConfig, on: bool) void {
+    const tag = tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| if (@hasDecl(registry.Mod(t), "coolerForTest")) registry.Mod(t).coolerForTest(config, on),
     }
 }
 

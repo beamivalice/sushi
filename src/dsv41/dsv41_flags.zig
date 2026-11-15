@@ -15,7 +15,6 @@ const log = @import("../log.zig");
 
 pub const options = [_]flags.Option{
     .{ .name = "--drop-expert", .takes_value = true, .apply = setDropExpert, .expected = "expected a multiple of 8 routed experts per layer (0 = off)" },
-    .{ .name = "--ds41-mlx-engine", .takes_value = false, .apply = setMlxEngine },
 };
 
 pub const help = [_]flags.HelpChunk{
@@ -65,7 +64,6 @@ pub const drop_expert_elsewhere = "--drop-expert has no effect on this model: on
 
 pub const cooler_setting_elsewhere = "model-settings.json ds41_cooler is ignored: only deepseek_v41 runs on Sushi Cooler";
 
-pub const mlx_engine_elsewhere = "--ds41-mlx-engine has no effect on this model: only deepseek_v41 runs on Sushi Cooler; drop the flag";
 
 pub const settings_kv_quant_ignored = "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";
 
@@ -110,11 +108,6 @@ pub const serve = struct {
         }
     }
 };
-
-fn setMlxEngine(_: []const u8) bool {
-    model.cooler_off_flag = true;
-    return true;
-}
 
 fn setDropExpert(value: []const u8) bool {
     model.drop_expert = expert_usage.parseCount(value) orelse return false;

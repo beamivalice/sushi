@@ -9,6 +9,7 @@ pub const mlx = @import("mlx.zig");
 const gpu_mem = @import("gpu_mem.zig");
 pub const io_util = @import("io_util.zig");
 const model_mod = @import("model.zig");
+const arch_config = @import("arch/config.zig");
 const effort_mod = @import("effort.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 pub const tokenizer = tokenizer_mod;
@@ -1263,6 +1264,12 @@ fn runCli(init: std.process.Init) !void {
             log.err("This checkpoint requires expert streaming. Use `run <model>` or `--serve` with --ssd-budget-gb.\n", .{});
             return error.ExpertStreamingRequired;
         }
+        var launch_buf: [384]u8 = undefined;
+        if (model_load.launchRefusal(&launch_buf, config, kv_quant_flag, ctx_size)) |r| {
+            log.err("{s}\n", .{r.line});
+            return r.err;
+        }
+        model_load.logIgnoredSettings(config);
         log.info("Loading weights...\n", .{});
         var weights = try model_mod.loadWeightsForConfig(io, allocator, model_dir, config, load_vision);
         defer weights.deinit();
@@ -1548,7 +1555,9 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
     if (settings_resolve.launch.mtp_greedy_tail != null) locks.modelMut("mtp_greedy_tail").pin("--mtp-greedy-tail", .{});
     if (ssd_budget_bytes != 0) locks.modelMut("ssd_budget_gb").pin("{d}", .{ssd_budget_bytes >> 30});
     if (model_mod.ssd_prefetch) |p| locks.modelMut("ssd_prefetch").pin("{d}", .{p});
-    if (model_mod.cooler_off_flag) locks.modelMut("ds41_cooler").pin("--ds41-mlx-engine", .{});
+    inline for (comptime std.meta.tags(arch_config.Tag)) |t| {
+        if (comptime arch_config.coolerOptOut(t)) |o| if (model_mod.cooler_off.contains(t)) locks.modelMut(o.setting).pin("{s}", .{o.flag});
+    }
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
     if (serve_default_max_tokens > 0) locks.modelMut("max_tokens").pin("{d}", .{serve_default_max_tokens});
@@ -1672,18 +1681,22 @@ test "launch flags: --config-overrides pins yarn_factor only when it names the R
     try std.testing.expectEqualStrings("--config-overrides", model_settings_mod.launch_locks.model("yarn_factor").?.text());
 }
 
-test "launch flags: --ds41-mlx-engine pins the model's ds41_cooler, and no flag leaves it free" {
-    const saved_flag = model_mod.cooler_off_flag;
-    defer model_mod.cooler_off_flag = saved_flag;
+test "launch flags: each arch's Sushi Cooler opt-out flag pins that arch's model setting, and no flag leaves it free" {
+    const saved_off = model_mod.cooler_off;
+    defer model_mod.cooler_off = saved_off;
     const saved = model_settings_mod.launch_locks;
     defer model_settings_mod.launch_locks = saved;
-    model_settings_mod.launch_locks = .{};
-    model_mod.cooler_off_flag = false;
-    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
-    try std.testing.expect(!model_settings_mod.launch_locks.model("ds41_cooler").?.set);
-    model_mod.cooler_off_flag = true;
-    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
-    try std.testing.expectEqualStrings("--ds41-mlx-engine", model_settings_mod.launch_locks.model("ds41_cooler").?.text());
+    inline for (comptime std.meta.tags(arch_config.Tag)) |t| {
+        if (comptime arch_config.coolerOptOut(t)) |o| {
+            model_settings_mod.launch_locks = .{};
+            model_mod.cooler_off = .empty;
+            pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+            try std.testing.expect(!model_settings_mod.launch_locks.model(o.setting).?.set);
+            model_mod.cooler_off.insert(t);
+            pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+            try std.testing.expectEqualStrings(o.flag, model_settings_mod.launch_locks.model(o.setting).?.text());
+        }
+    }
 }
 
 test "the device reads a load makes are asked before it: under a hold they ask MLX nothing" {

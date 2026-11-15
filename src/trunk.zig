@@ -770,6 +770,8 @@ pub const Trunk = struct {
     config: ModelConfig,
     cache: KVCache,
     s: mlx.mlx_stream,
+    /// On Sushi Cooler, the engine's budget this model last installed; a turn to it installs it again.
+    cooler_budget: ?u64 = null,
     allocator: std.mem.Allocator,
 
     emb_w: mlx.mlx_array,

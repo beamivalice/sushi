@@ -91,9 +91,8 @@ pub fn applyKernel(sc: *Scope, k: mlx.mlx_fast_metal_kernel, inputs: []const A, 
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, gpu));
     }
     for (outs, 0..) |*o, i| {
-        o.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(o, ov, i));
-        _ = try sc.keep(o.*);
+        var made = mlx.mlx_array_new();
+        o.* = try sc.res(mlx.mlx_vector_array_get(&made, ov, i), &made);
     }
 }
 

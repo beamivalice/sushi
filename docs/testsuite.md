@@ -65,10 +65,19 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   A filter may hold any character; a test name with a quote is selected by its longest quote-free piece that no
   skipped test holds (the response file the compiler reads cannot carry a quote), and a name with none is renamed.
 - `SUSHI_TEST_NO_GPU=1` makes a test build see no Metal backend, so `requireGpu` skips (diagnostic, test builds only).
+- **Tests run under sushi's runner** (`scripts/test_runner.zig`, std's with one check): after each test it asks
+  `sushi_after_each` (`src/test_rest.zig`), which fails that test by name when it left a hold, a turn, a model's budget
+  slot, a forward scope, a seal, an armed fault, an opt-out or a latched MLX error, then puts the engine back at rest.
+- **The Sushi Cooler contract** (`src/cooler_contract_test.zig`, tests `cooler contract:`) runs on every tiny fixture of
+  every arch that declares `cooler_contract`: the side, every weight in an owned region, a request and the model's
+  teardown asking MLX nothing, the opt-out's tokens, fault sweeps over the load and a request, nothing compiled after
+  it. Requests run in the model's turn and end as serve ends them; unloads run serve's teardown. An arch on Sushi
+  Cooler is admitted by declaring it; a test runs every fixture present and is reported skipped when any is missing.
+  Its no-late-kernel test proves its property only on a fresh pipeline cache (run it alone): the cache is the process's.
 - **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device
   profile and the engine dispatch as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`). A test about one arm's bytes names it
   (`device.current().has(.matrix_g17)`), never a chip.
-- The pack tier's envs: `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/test-fixtures/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
+- The pack tier's envs: `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/test-fixtures/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_STQ_TINY_PM` (its pair-major copy), `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
   folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
   `{p0, ratio, keys, group}`, `wscale` and the kernel's `scores`; the test skips without it), `QWEN4_TEST_MODEL`,
   `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`, `SUSHI_DSV41_REAL_PACK` (the DeepSeek width probe: every row of a verify is its one-row round's bits on the real pack, and the engine's proof: one-row steps and DSpark rounds on the engine of our own give MLX's bytes;

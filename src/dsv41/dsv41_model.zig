@@ -15,7 +15,7 @@ const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const engram = @import("dsv41_engram.zig");
 const source = @import("dsv41_source.zig");
-const owned_mod = @import("dsv41_owned.zig");
+const owned_mod = @import("../owned_weights.zig");
 const model_mod = @import("../model.zig");
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("../expert_usage.zig");
@@ -338,15 +338,16 @@ pub const Rows = struct {
     /// `buf` grown to `cap` rows of `cols`, its first `used` rows kept.
     fn grow(buf: *A, used: usize, cap: usize, cols: usize, dt: mlx.mlx_dtype, s: S) !void {
         var z = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(z);
         try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ ci(cap), ci(cols) }, 2, dt, s));
         if (used > 0) {
             var old = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(old);
             try mlx.check(mlx.mlx_slice(&old, buf.*, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(used), ci(cols) }, 2, &[_]c_int{ 1, 1 }, 2, s));
-            const zeros = z;
-            defer _ = mlx.mlx_array_free(zeros);
             var up = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice_update(&up, zeros, old, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(used), ci(cols) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            errdefer _ = mlx.mlx_array_free(up);
+            try mlx.check(mlx.mlx_slice_update(&up, z, old, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(used), ci(cols) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            _ = mlx.mlx_array_free(z);
             z = up;
         }
         if (buf.ctx != null) _ = mlx.mlx_array_free(buf.*);
@@ -357,6 +358,7 @@ pub const Rows = struct {
         const n = dim(x, 0);
         const cols = dim(x, 1);
         var up = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(up);
         try mlx.check(mlx.mlx_slice_update(&up, buf.*, x, &[_]c_int{ ci(at), 0 }, 2, &[_]c_int{ ci(at + n), ci(cols) }, 2, &[_]c_int{ 1, 1 }, 2, s));
         _ = mlx.mlx_array_free(buf.*);
         buf.* = up;
@@ -425,6 +427,7 @@ const Ring = struct {
 
     fn init(cap: usize, width: usize, dt: mlx.mlx_dtype, s: S) !Ring {
         var z = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(z);
         try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ ci(cap), ci(width) }, 2, dt, s));
         return .{ .buf = z, .cap = cap, .width = width, .dt = dt };
     }
@@ -449,6 +452,7 @@ const Ring = struct {
             defer _ = mlx.mlx_array_free(cast);
             try mlx.check(mlx.mlx_astype(&cast, part, mlx.mlx_array_dtype(self.buf), s));
             var up = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(up);
             try mlx.check(mlx.mlx_slice_update(&up, self.buf, cast, &[_]c_int{ ci(slot), 0 }, 2, &[_]c_int{ ci(slot + run), ci(self.width) }, 2, &[_]c_int{ 1, 1 }, 2, s));
             _ = mlx.mlx_array_free(self.buf);
             self.buf = up;
@@ -911,15 +915,23 @@ pub const Model = struct {
         return x;
     }
 
+    /// The result `o` of the op whose status is `rc`, owned by the model; freed when the op failed.
+    fn res(self: *Model, rc: c_int, o: *const A) !A {
+        mlx.check(rc) catch |e| {
+            _ = mlx.mlx_array_free(o.*);
+            return e;
+        };
+        return self.own(o.*);
+    }
+
     /// `x` cast to `dt` and evaluated, owned by the model. A bf16 tensor widened to f32 is built in an owned region.
     fn ownCast(self: *Model, x: A, dt: mlx.mlx_dtype) !A {
         if (dt == .float32) if (try owned_mod.widenF32(x)) |wide| {
             self.built.widened += mlx.mlx_array_size(wide) * 4;
             return self.own(wide);
         };
-        var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&o, x, dt, self.s));
-        _ = try self.own(o);
+        var made = mlx.mlx_array_new();
+        const o = try self.res(mlx.mlx_astype(&made, x, dt, self.s), &made);
         try mlx.check(mlx.mlx_array_eval(o));
         return o;
     }
@@ -927,9 +939,8 @@ pub const Model = struct {
     /// The view `x[start..stop]`, evaluated and owned by the model.
     fn ownSlice(self: *Model, x: A, start: []const c_int, stop: []const c_int) !A {
         var ones: [4]c_int = @splat(1);
-        var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_slice(&o, x, start.ptr, start.len, stop.ptr, stop.len, &ones, start.len, self.s));
-        _ = try self.own(o);
+        var made = mlx.mlx_array_new();
+        const o = try self.res(mlx.mlx_slice(&made, x, start.ptr, start.len, stop.ptr, stop.len, &ones, start.len, self.s), &made);
         try mlx.check(mlx.mlx_array_eval(o));
         return o;
     }
@@ -949,9 +960,8 @@ pub const Model = struct {
     }
 
     fn ownReshape(self: *Model, x: A, shape: []const c_int) !A {
-        var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&o, x, shape.ptr, shape.len, self.s));
-        _ = try self.own(o);
+        var made = mlx.mlx_array_new();
+        const o = try self.res(mlx.mlx_reshape(&made, x, shape.ptr, shape.len, self.s), &made);
         try mlx.check(mlx.mlx_array_eval(o));
         return o;
     }
@@ -1018,20 +1028,19 @@ fn loadLin(m: *Model, w: *model_mod.Weights, base: []const u8, dense: ?mlx.mlx_d
             log.err("deepseek_v41: {s} scale grid {d}x{d} does not tile a {d}x{d} weight by 32\n", .{ base, dim(scales, 0), dim(scales, 1), out, inp });
             return error.Dsv41WeightLayout;
         }
-        var codes = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_view(&codes, wt, .uint32, m.s));
-        _ = try m.own(codes);
+        var made = mlx.mlx_array_new();
+        const codes = try m.res(mlx.mlx_view(&made, wt, .uint32, m.s), &made);
         // A scale is a weight: built on the host, never an op's result in the pool a forward is capped by.
-        if (try owned_mod.repeatRows(scales, out)) |rows| {
+        if (try owned_mod.repeatRows(scales, out)) |host_rows| {
+            const rows = try m.own(host_rows);
             try evalAll(&.{codes});
-            return .{ .w = codes, .s = try m.own(rows) };
+            return .{ .w = codes, .s = rows };
         }
         var rep = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(rep);
         try mlx.check(mlx.mlx_repeat_axis(&rep, scales, 32, 0, m.s));
-        var rows = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_slice(&rows, rep, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(out), ci(inp / 32) }, 2, &[_]c_int{ 1, 1 }, 2, m.s));
-        _ = try m.own(rows);
+        var sliced = mlx.mlx_array_new();
+        const rows = try m.res(mlx.mlx_slice(&sliced, rep, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(out), ci(inp / 32) }, 2, &[_]c_int{ 1, 1 }, 2, m.s), &sliced);
         try evalAll(&.{ codes, rows });
         return .{ .w = codes, .s = rows };
     }
@@ -1156,9 +1165,9 @@ fn loadBank(m: *Model, w: *model_mod.Weights, pfx: []const u8, id: usize, compti
         } else {
             const vec = mlx.mlx_vector_array_new_data(f[1].ptr, f[1].len);
             defer _ = mlx.mlx_vector_array_free(vec);
-            var o = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_stack_axis(&o, vec, 0, m.s));
-            @field(out, f[0]) = try m.own(o);
+            var stacked_o = mlx.mlx_array_new();
+            const o = try m.res(mlx.mlx_stack_axis(&stacked_o, vec, 0, m.s), &stacked_o);
+            @field(out, f[0]) = o;
             try mlx.check(mlx.mlx_array_eval(o));
         }
     }
@@ -1178,9 +1187,8 @@ fn maskDropped(m: *Model, bias: A, drop: *const expert_usage.Drop, layer: usize,
     for (mask[0..experts], 0..) |*v, e| v.* = if (drop.isDropped(layer, e)) -std.math.inf(f32) else 0;
     const arr = mlx.mlx_array_new_data(&mask, &[_]c_int{ 1, ci(experts) }, 2, .float32);
     defer _ = mlx.mlx_array_free(arr);
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&o, bias, arr, m.s));
-    _ = try m.own(o);
+    var made = mlx.mlx_array_new();
+    const o = try m.res(mlx.mlx_add(&made, bias, arr, m.s), &made);
     try mlx.check(mlx.mlx_array_eval(o));
     return o;
 }
@@ -1306,9 +1314,8 @@ fn fuseShared(m: *Model, lins: []const *Lin) !?exl3.linear.Shared {
         }
         const v = mlx.mlx_vector_array_new_data(&parts[k], lins.len);
         defer _ = mlx.mlx_vector_array_free(v);
-        var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_concatenate_axis(&o, v, @as(c_int, if (k == 0) 2 else if (k == 1) 0 else 1), m.s));
-        cat[k] = try m.own(o);
+        var made = mlx.mlx_array_new();
+        cat[k] = try m.res(mlx.mlx_concatenate_axis(&made, v, @as(c_int, if (k == 0) 2 else if (k == 1) 0 else 1), m.s), &made);
     }
     try evalAll(&cat);
     const in = t0[1] * 16;
@@ -1430,9 +1437,8 @@ fn initEngram(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !void {
         const wkv = try loadLin(m, w, try key(&base, "layers.{d}.engram.wkv", .{l}), m.act);
         const qw = try loadDense(m, w, try key(&b, "layers.{d}.engram.q_weight", .{l}), .float32);
         const kw = try loadDense(m, w, try key(&b, "layers.{d}.engram.k_weight", .{l}), .float32);
-        var prod = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&prod, qw, kw, m.s));
-        _ = try m.own(prod);
+        var made = mlx.mlx_array_new();
+        const prod = try m.res(mlx.mlx_multiply(&made, qw, kw, m.s), &made);
         try mlx.check(mlx.mlx_array_eval(prod));
         // Only the product is read.
         m.disown(qw);
@@ -2277,7 +2283,10 @@ fn attnQuery(sc: *Scope, m: *const Model, ly: *const Layer, h: A) ![3]A {
         var outs: [3]A = .{ none, none, none };
         const norm: exl3.project_rows.Norm = .{ .w = ly.q_norm, .eps = try kernels.hcEps(sc, m.cfg.eps, m.cfg.hc_eps), .cols = sh.cols[1] };
         if (try exl3.linear.linearSharedNormed(sc.s, h, sh, ly.wq_a.stq.?.dec, outs[0..sh.count], .{ .rows = sc.rows }, norm)) {
-            for (outs[0..sh.count]) |o| _ = try sc.keep(o);
+            for (outs[0..sh.count], 0..) |o, i| _ = sc.keep(o) catch |e| {
+                for (outs[i + 1 .. sh.count]) |rest| _ = mlx.mlx_array_free(rest);
+                return e;
+            };
             return outs;
         }
     };

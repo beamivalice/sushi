@@ -1,6 +1,7 @@
 # Tests named for a model that stay outside src/<model>/ because they test shared code at that model's geometry.
 # Generated: python3 tests/suite_guards.py --write. One test name per line; it keys the name, not the file.
 --drop-expert is refused on every arch but deepseek_v41, before the weights load
+--ds41-mlx-engine takes no value and keeps DeepSeek loads on MLX; a model of another arch loads as it would, its load naming the flag, and its model setting is ignored there
 --qwen-gdn is what parseConfig reads, on a loaded config; the f32 state is the default; GLM keeps its own gate
 --qwen-gdn takes 16 or 32 and nothing else
 DFlash block tail engages only for the native GLM drafter

@@ -9,6 +9,11 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek-V4.1-Flash's own release checkpoint (FP8 trunk, MXFP4 experts) now runs on Sushi Cooler too**, with
   the tokens MLX gives and at MLX's speed, so every DeepSeek pack decodes on the engine of our own at its load;
   `--ds41-mlx-engine` keeps MLX until 1.8.0.
+- **`--ds41-mlx-engine` no longer stops a model of another architecture from loading**: it keeps DeepSeek-V4.1 loads on
+  MLX, and any other model loads as it would, its load log saying the flag has no effect on it.
+- **A one-prompt run without `--serve` now refuses what a served load refuses**: a launch flag or context size the model
+  cannot take, by name, before any weight is read; and a model of no served architecture is refused as that, whatever
+  flags it was given.
 - **DeepSeek-V4.1 STQ decodes and prefills on Sushi Cooler on an M1 to M4 as well**: the engine takes the SIMD arms where
   there are no matrix units, MLX stays one flag away (`--ds41-mlx-engine`), and the vision tower's quantized and attention
   tiles follow the GPU's. Proven as an M1 Max on an M5; no real M1 to M4 run is recorded yet.

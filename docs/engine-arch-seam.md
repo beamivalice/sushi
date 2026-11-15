@@ -76,7 +76,11 @@ without it. An arch added later joins the list in the landing that adds it.
 - **Load, prefill and bill hooks an arch may declare** (every one optional; the default is stated where it is called).
   `arch.zig`: the `prefill_start_width` fact, `ubench`, `tools`, `ownStream(config)` (the stream a load runs on
   when the arch brings one: `Trunk.init` takes the thread's GPU stream otherwise; a tower's `ownStream()` says the same
-  to the image encoder). The `load` slot (`arch/load.zig`) beside its
+  to the image encoder), `cooler_opt_out` (an arch on Sushi Cooler: its opt-out flag, which `arch_flags.options` parses from here, and its
+  model-settings key, checked at compile time; an arch that declares it must declare `stampCooler`, `coolerForTest`
+  and `cooler_contract` too; `model.cooler_off` holds the archs whose flag was given, each load stamps only its own, a
+  model of another arch loads as it would and its load names the flag, and `main` pins each given flag's setting), `coolerForTest` (a test's side, set before
+  the load), `cooler_contract` (the fixtures and the arch's own reads the shared Sushi Cooler contract runs on). The `load` slot (`arch/load.zig`) beside its
   `weights` and `residentLoadBytes`: `drafterOff`, `stageDrafter`, `prepareDrafter`, `loadDflash`, `bindDflash`,
   `dflashRowBounds(min, max, drafter_block)`, `logLoad`, `logDflashReady`, `warmUbench`, which `model_load.zig` calls by the
   config's arch; `bindDflash` returns whether the arch takes the drafter (an error is a bind that failed), and the refusal that

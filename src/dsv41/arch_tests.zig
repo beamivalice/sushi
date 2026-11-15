@@ -9,7 +9,6 @@ pub const tests = .{
     @import("dsv41_qat.zig"),
     @import("dsv41_engram.zig"),
     @import("dsv41_source.zig"),
-    @import("dsv41_owned.zig"),
     @import("dsv41_model.zig"),
     @import("dsv41_stream.zig"),
     @import("dsv41_state.zig"),
