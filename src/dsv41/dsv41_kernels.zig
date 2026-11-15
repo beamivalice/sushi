@@ -3,6 +3,7 @@
 //! Ported from mlx-serve's `deepseek_v41.zig` (MIT) and adapted to the original checkpoint layout: routed
 //! experts are `mxfp4` banks with separate gate and up, the shared expert and the trunk are `mxfp8`.
 const std = @import("std");
+const log = @import("../log.zig");
 const mlx = @import("../mlx.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
@@ -3031,12 +3032,17 @@ fn hcExpandLaunch(sc: *Scope, x: A, y: A, post: A, comb: A, per_element: bool) !
 /// Launches the top-k kernels (one threadgroup a row, chunked, and cut at each row's length) at `topk_tg` threads, halving
 /// it until they run.
 pub fn probeTopk(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
+    defer mlx.expected_refusal = null;
+    const widest = topk_tg;
     while (true) {
+        // The floor's refusal is the load's error, logged as one.
+        mlx.expected_refusal = if (topk_tg > 32) "Thread group size" else null;
         probeTopkOnce(gpa, s) catch |e| {
             if (e != error.MlxError or topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
             topk_tg /= 2;
             continue;
         };
+        if (topk_tg < widest) log.info("[dsv41] top-k kernels run {d} threads a group on this GPU (widest {d})\n", .{ topk_tg, widest });
         return;
     }
 }
@@ -3054,7 +3060,10 @@ fn probeTopkOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
 /// Metal caps a register-heavy kernel's threadgroup below 1024 on some GPUs (M1, M2): launches every hyper-connection
 /// kernel once at `hc_tg` threads and halves it until they run, then checks `hcExpandFused` against the chain.
 pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, iters: usize) !void {
+    defer mlx.expected_refusal = null;
     while (true) {
+        // The floor's refusal is the load's error, logged as one.
+        mlx.expected_refusal = if (hc_tg > 32) "Thread group size" else null;
         probeHcOnce(gpa, s, hc, D, iters) catch |e| {
             if (e != error.MlxError or hc_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
             hc_tg /= 2;
@@ -3062,9 +3071,11 @@ pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
         };
         break;
     }
+    mlx.expected_refusal = null;
     // The wide mix and norm and the narrow stage sum a row's terms in one order only where the thread count suits D: a
     // GPU that granted fewer than the widest group is held to it (the widest is the bytes every pack was made on).
     while (hc_tg < hc_tg_widest and hc_tg > 32 and !try hcStageAgrees(gpa, s, hc, D, iters)) hc_tg /= 2;
+    if (hc_tg < hc_tg_widest) log.info("[dsv41] hyper-connection kernels run {d} threads a group on this GPU (widest {d})\n", .{ hc_tg, hc_tg_widest });
     hc_expand_tf32 = hc == 4 and probeHcExpand(gpa, s, D);
 }
 

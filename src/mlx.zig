@@ -1766,7 +1766,16 @@ fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
         mlx_error_len = n;
         mlx_error_latched.store(true, .release);
     }
-    log.err("[mlx] {s}\n", .{span});
+    log.atLevel(errorLogLevel(span), "[mlx] {s}\n", .{span});
+}
+
+/// Text of the refusal a probe on this thread is about to provoke and will settle itself (it names its step in a
+/// line of its own): MLX's raise of it is logged at debug, not as an error.
+pub threadlocal var expected_refusal: ?[]const u8 = null;
+
+fn errorLogLevel(span: []const u8) log.Level {
+    const want = expected_refusal orelse return .err;
+    return if (std.mem.indexOf(u8, span, want) != null) .debug else .err;
 }
 
 /// Install the latching handler (mlx-c's default exits the process). Called once from `main()`.
@@ -1946,6 +1955,16 @@ pub fn resetFaultChunkForTest() void {
     fault_step.reset();
     var buf: [512]u8 = undefined;
     _ = takeError(&buf);
+}
+
+test "a refusal the thread's probe expects logs at debug, any other error and an unexpected one as errors" {
+    const t = std.testing;
+    const refusal = "[engine] Thread group size (1024) is greater than the maximum allowed threads per threadgroup (832).";
+    try t.expectEqual(log.Level.err, errorLogLevel(refusal));
+    expected_refusal = "Thread group size";
+    defer expected_refusal = null;
+    try t.expectEqual(log.Level.debug, errorLogLevel(refusal));
+    try t.expectEqual(log.Level.err, errorLogLevel("[matmul] Last dimension of first input must match."));
 }
 
 test "a threadgroup-size refusal names the pipeline limit and only it is consumed" {

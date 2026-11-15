@@ -159,9 +159,23 @@ pub const FileCache = struct {
 
 pub fn openHinted(path: [:0]const u8, hints: ReadHints) !std.c.fd_t {
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return error.FillOpenFailed;
+    if (fd < 0) {
+        var buf: [2 * std.fs.max_path_bytes + 128]u8 = undefined;
+        log.err("{s}\n", .{openFailureLine(&buf, path, std.posix.errno(fd))});
+        return error.FillOpenFailed;
+    }
     applyReadHints(fd, hints);
     return fd;
+}
+
+/// The log line of a failed open: the path and errno, and the target when the path is a link to nothing (a pack copied
+/// from another Mac whose shard links point into that Mac's folders).
+pub fn openFailureLine(buf: []u8, path: [:0]const u8, e: std.posix.E) []const u8 {
+    var target: [std.fs.max_path_bytes]u8 = undefined;
+    const n = std.c.readlink(path.ptr, &target, target.len);
+    if (n > 0 and e == .NOENT)
+        return std.fmt.bufPrint(buf, "cannot open {s}: a link to {s}, which does not exist", .{ path, target[0..@intCast(n)] }) catch "cannot open a shard";
+    return std.fmt.bufPrint(buf, "cannot open {s}: {s}", .{ path, @tagName(e) }) catch "cannot open a shard";
 }
 
 /// A trellis span's tile grid: the fill lands it in `layout.tileMajor` order instead of the file's.
@@ -1079,6 +1093,29 @@ fn alignedDest(allocator: std.mem.Allocator, len: usize) ![]align(align_bytes) u
     const buf = try allocator.alignedAlloc(u8, .fromByteUnits(align_bytes), pageRoundUp(len));
     @memset(buf, 0);
     return buf;
+}
+
+test "a shard that cannot be opened is named, with the missing target of a dangling link" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try tmp.dir.symLink(io, "/nonexistent-sushi-test/model-00047.safetensors", "engram.safetensors", .{});
+    const link = try std.fmt.allocPrintSentinel(a, "{s}/engram.safetensors", .{root}, 0);
+    defer a.free(link);
+    try std.testing.expectError(error.FillOpenFailed, openHinted(link, .{}));
+    var buf: [2 * std.fs.max_path_bytes + 128]u8 = undefined;
+    const dangling = openFailureLine(&buf, link, .NOENT);
+    try std.testing.expect(std.mem.indexOf(u8, dangling, link) != null);
+    try std.testing.expect(std.mem.indexOf(u8, dangling, "a link to /nonexistent-sushi-test/model-00047.safetensors, which does not exist") != null);
+    const plain = try std.fmt.allocPrintSentinel(a, "{s}/absent.safetensors", .{root}, 0);
+    defer a.free(plain);
+    const missing = openFailureLine(&buf, plain, .NOENT);
+    try std.testing.expect(std.mem.indexOf(u8, missing, plain) != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "NOENT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "a link") == null);
 }
 
 test "a shard index whose weight_map is not an object fails at open, by name" {

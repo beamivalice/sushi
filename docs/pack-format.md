@@ -318,6 +318,9 @@ revision beside files of another, which `sushi pull` once left when a file kept 
   `unstamped` names. Another revision or no stamp is `PackRevisionMixed` (503 `pack_revision_mixed`; `--model` exits),
   and the log names each file: `model-trunk-03.safetensors is pack revision 1.0 (unstamped), the pack is 2.0: the folder
   mixes two revisions; run `sushi pull <name>` again or re-download it`. An unstamped shard reads as revision 1.0.
+- A shard the check cannot open is left to the loader, whose every shard open (`expert_io.openHinted`) logs the path and
+  errno, and for a link to nothing its target: `cannot open <pack>/engram-model-00047-of-00048.safetensors: a link to
+  <target>, which does not exist` (a folder copied from another Mac with its unstamped links pointing into that Mac's).
 - `/v1/models` loaded rows carry `meta.pack_revision` and `/props` carries `pack_revision`: the id, or `null` for a pack
   that names none.
 - `sushi pull` leaves `.sushi-pull.json` in the folder (not a pack file; discovery ignores it) so the next pull compares

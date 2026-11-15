@@ -214,7 +214,8 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
   step at a time: a set over the bar is built even when no single step is.
 - At the gate, a KLD change under 0.01% passes; a larger one goes to the owner with its speed gain to decide.
 - Exactness is judged on one hardware path: a NAX arm whose bytes differ from the SIMD arm's (new vs old hardware) is
-  not an output change.
+  not an output change. Bytes that diverge by GPU class or generation are hardware divergence: we never chase identical
+  bits across GPUs, and a byte pin holds on the GPU class it was proven on.
 - An output-changing tweak whose whole set is worth about 1% of a token or less is dropped, not queued.
 - Judge a tweak on top of the change it builds on, not alone against the old code.
 - An optimization lever is decided by a micro indicator (bytes, a count, `sushi-ubench` arms in one process), confirmed

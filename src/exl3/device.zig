@@ -238,6 +238,8 @@ extern "c" fn objc_msgSend() void;
 extern "c" fn sel_registerName(name: [*:0]const u8) ?*anyopaque;
 extern "c" fn objc_autoreleasePoolPush() ?*anyopaque;
 extern "c" fn objc_autoreleasePoolPop(pool: ?*anyopaque) void;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
 
 fn send(comptime R: type, target: id, name: [*:0]const u8) R {
@@ -252,6 +254,18 @@ pub fn archName(buf: []u8) []const u8 {
         const text = std.mem.span(forced);
         if (text.len > 0) return copyInto(buf, text);
     }
+    return systemArchName(buf);
+}
+
+/// The units of the system GPU itself, whatever `MLX_METAL_GPU_ARCH` names: the GPU class a byte pin was proven on is
+/// the hardware's, which a rehearsal as another GPU does not change.
+pub fn systemChip() Units {
+    var buf: [64]u8 = undefined;
+    return Profile.from(systemArchName(&buf), .{ .major = 0, .minor = 0 }, false).chip;
+}
+
+/// The system GPU's own name; empty without a GPU.
+fn systemArchName(buf: []u8) []const u8 {
     const pool = objc_autoreleasePoolPush();
     defer objc_autoreleasePoolPop(pool);
     const gpu = MTLCreateSystemDefaultDevice() orelse return "";
@@ -280,6 +294,23 @@ const ok_os: Os = .{ .major = 26, .minor = 6 };
 
 fn matrix(arch: []const u8, os: Os, held: bool) bool {
     return Profile.from(arch, os, held).has(.matrix_g17);
+}
+
+test "device: the system chip is the hardware's whatever MLX_METAL_GPU_ARCH names" {
+    const saved = std.c.getenv("MLX_METAL_GPU_ARCH");
+    var keep: [64]u8 = undefined;
+    const kept: ?[:0]u8 = if (saved) |v| std.fmt.bufPrintZ(&keep, "{s}", .{std.mem.span(v)}) catch unreachable else null;
+    defer if (kept) |v| {
+        _ = setenv("MLX_METAL_GPU_ARCH", v.ptr, 1);
+    } else {
+        _ = unsetenv("MLX_METAL_GPU_ARCH");
+    };
+    _ = unsetenv("MLX_METAL_GPU_ARCH");
+    const real = systemChip();
+    for ([_][*:0]const u8{ "applegpu_g13s", "applegpu_g17s" }) |name| {
+        _ = setenv("MLX_METAL_GPU_ARCH", name, 1);
+        try std.testing.expect(real.eql(systemChip()));
+    }
 }
 
 test "device: a name that is no Apple GPU generation has the SIMD arm alone" {

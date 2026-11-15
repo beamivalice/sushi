@@ -323,6 +323,11 @@ Pools held are the profile split after each pool's floor rounding (0.65-0.75 GB 
   of a prompt past a few thousand tokens borrows two layers: ~+0.15 s a chunk and ~0.6 s of refill a turn. Decode gains
   little for it: the simulated misses at 108-112 GB of cache are ~0.4-0.6 a token (~0.3% of a token's time).
 
+- **A 32 GB Mac** (no RAM tier: `--ssd-budget-gb` is required) serves the STQ 1.75bpw pack at 18: trunk 5.20, MTP 3.85,
+  vision 0.50, workspace 3.70, bounce 0.54, pool 0.27, kept scales 0.68 GB, an expert cache of 4.23 GB (11 slots a layer).
+  There the decoder pools hold ~2.1 GB, under a 2048-row chunk's 6.5 GB, and the per-request width does not read the
+  borrow's headroom: a 4k prompt is refused `PrefillDoesNotFit` unless `--prefill-chunk 512` (an open finding).
+
 <a id="resident"></a>
 ## Fully resident
 

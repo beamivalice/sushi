@@ -309,7 +309,10 @@ pub const Routed = struct { tok: Arr, route: Arr };
 
 /// `rows` with the route of each row beside its draw.
 pub fn routed(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []const [2]u32, s: mlx.mlx_stream) !Routed {
+    defer mlx.expected_refusal = null;
     while (true) {
+        // Only a rung left to take expects the refusal: the last one's is the caller's error.
+        mlx.expected_refusal = if (ladder.hasNext()) "Thread group size" else null;
         const tg = ladder.threads();
         return launch(logits, temperature, top_p, top_k, keys, s, tg) catch |e| {
             // The last rung's refusal keeps its text for the caller: only a rung left to take reads (and clears) it.
@@ -968,10 +971,20 @@ test "sampler draw: at every thread rung the kernel draws what the rule draws, a
     defer a.free(flat);
     const order = try a.alloc(u32, vocab);
     defer a.free(order);
+    // The chip's own grant bounds the simulated one: an M1 refuses this kernel 1024 threads.
+    for (0..n_rows) |r| testRow(flat[r * vocab ..][0..vocab], 0xc0de + r, false);
+    ladder.at = 0;
+    {
+        var probe_keys: [n_rows][2]u32 = undefined;
+        for (&probe_keys, 0..) |*k, r| k.* = .{ @intCast(r), 1 };
+        a.free(try drawHost(a, s, flat, n_rows, vocab, .float32, 0.9, 1.0, 0, &probe_keys));
+    }
+    const chip = ladder.threads();
     var checked: usize = 0;
     for ([_]usize{ 1024, 512, 256 }) |grant| {
         ladder.at = 0;
         grant_for_test = grant;
+        const want_rung: u32 = @intCast(@min(grant, chip));
         for ([_]bool{ false, true }) |ties| {
             for (0..n_rows) |r| testRow(flat[r * vocab ..][0..vocab], 0xc0de + r, ties);
             for ([_][2]f32{ .{ 1.0, 0 }, .{ 0.9, 0 }, .{ 1.0, 5 }, .{ 0.95, 40 }, .{ 0.5, 3000 }, .{ 1.0, 8999 } }) |f| {
@@ -981,7 +994,7 @@ test "sampler draw: at every thread rung the kernel draws what the rule draws, a
                 for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x4000 + r * 3 + top_k), @intCast(0x77 + r) };
                 const got = try drawHost(a, s, flat, n_rows, vocab, .float32, 0.9, top_p, top_k, &keys);
                 defer a.free(got);
-                try testing.expectEqual(@as(u32, @intCast(grant)), ladder.threads());
+                try testing.expectEqual(want_rung, ladder.threads());
                 for (got, 0..) |g, r| {
                     const want = hostDraw(flat[r * vocab ..][0..vocab], order, 0.9, top_p, top_k, keys[r]);
                     if (want.nucleus_margin < 1e-5) continue;

@@ -288,7 +288,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **A kernel's threadgroup is a `ThreadLadder`** where a GPU may grant it fewer threads than it asks (an M1 grants the
   sampler's draw 768): a launch the GPU refuses for size steps the process down one rung, and the kernel gives the rule's
   answer at every rung (`sampler_draw`; the hyper-connection kernels keep `hc_tg`'s own halving).
+- **A probe that provokes a size refusal declares it** (`mlx.expected_refusal`): MLX's raise is logged at debug, and the
+  probe names the rung it settled on in one info line; only the last rung's refusal logs as an error.
 - The name is MLX's: `MLX_METAL_GPU_ARCH` when set, else the system GPU's, so the profile and MLX's dispatch agree.
+- **A byte pin holds on the GPU class it was proven on**: a test gates it on `device.systemChip()`, the hardware's own
+  units, which a rehearsal as another GPU leaves as they are (a real M1 sums the tiny pack's two-head op chain otherwise).
 - **A test's GPU is `device.withProfile(p)`**, ended by its scope (`device.simdOnly()` withholds the matrix units of the
   box it runs on; `device.forceMatrix(on)` moves the matrix units alone, `true` for a routing or bill test only, since on
   a box without them no arm may be built). It is the one seam: the per-gate overrides of the verify lane and of the

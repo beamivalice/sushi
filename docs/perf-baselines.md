@@ -425,6 +425,29 @@ is the same on the three sides. About 160 of a request's 210 rounds are plain on
   against 296 to 302): a wide chunk's Engram rows are read without `F_RDADVISE` since `0d43d77d`.
 - The decode right after the prefill (position 1): 39.3, 39.7 and 47.2 tok/s at 1399, 1404 and 1298 GPU mJ/token.
 
+## DeepSeek-V4.1 STQ on an M1 Max 32 GB: Sushi Cooler against MLX (2026-11-15)
+
+The first run on a GPU without matrix units. M1 Max (`applegpu_g13s`, 32 GPU cores) 32 GB, macOS 26.5.2, STQ 1.75bpw on
+the internal SSD, binary `b772d2a6` (ReleaseFast), `taskpolicy -a`, GPU lock, one load each (engine, then MLX), no
+cooldown parity. `sushi bench --rungs 4k --code-only --tokens 128 --ssd-budget-gb 18 --prefill-chunk 512 --ctx-size 16384`
+(budget 18: an expert cache of 4.23 GB, 11 slots a layer; `--prefill-chunk 512`: see the note below). The cold 4k request
+only: both repeats were cut by the bench's clock rule (below), so this is one sample an arm.
+
+| decode side | prefill tok/s | ttft s | decode tok/s | round ms | decode CPU ms/token | CPU mJ/token | Minstr/token | GPU mJ/token |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Sushi Cooler (default) | 51 | 80.4 | 2.41 | 510 | 133 | 262 | 775 | 1997 |
+| MLX (`--ds41-mlx-engine`) | 48 | 85.8 | 2.14 | 574 | 159 | 315 | 921 | 1945 |
+
+- **The same work on both sides**: the same DSpark round mix (104 attempts, 24 accepts, 93 plain steps). The engine is 13%
+  faster in decode and 6% in prefill, for 16 to 17% less host CPU and instructions a token; GPU energy is level (a record).
+- **Decode is the SSD's**: a one-row forward takes ~470 ms, ~290 ms of it the expert fill at ~5 GB/s (45 to 51 hits of
+  240 picks with 11 slots a layer). The load's warm takes ~330 s on this box (its two 2048-row warm forwards stream 30
+  and 47 GB of experts).
+- The repeats (4,065 tokens restored, 31 new, 2.4 / 2.2 tok/s) read a median busy clock of 941 / 801 MHz at Nominal
+  pressure, under the bench's 1100 MHz abort bar: the GPU waits on the SSD on a chip whose top clock is ~1296 MHz.
+- Without `--prefill-chunk`, the 4k request is refused `PrefillDoesNotFit`: the per-request width admits 2048 rows that
+  the decoder-pool borrow then cannot cover on 32 GB ([dsv41-memory](dsv41-memory.md#borrow)).
+
 ## DeepSeek-V4.1 STQ on Sushi Cooler: release ladder at `2aa5ddaf` (2026-11-12)
 
 The working baseline of the DeepSeek optimization rounds: `tests/bench.sh --tag cooler-p2c
