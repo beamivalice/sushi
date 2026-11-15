@@ -71,7 +71,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - **The Sushi Cooler contract** (`src/cooler_contract_test.zig`, tests `cooler contract:`) runs on every tiny fixture of
   every arch that declares `cooler_contract`: the side, every weight in an owned region, a request and the model's
   teardown asking MLX nothing, the opt-out's tokens, fault sweeps over the load and a request, nothing compiled after
-  it. Requests run in the model's turn and end as serve ends them; unloads run serve's teardown. An arch on Sushi
+  it, and a load of more than one row (`coolerRows`) giving each row its solo request's tokens (the arch's
+  `greedyRows`; skipped at one row). Requests run in the model's turn and end as serve ends them; unloads run serve's teardown. An arch on Sushi
   Cooler is admitted by declaring it; a test runs every fixture present and is reported skipped when any is missing.
   Its no-late-kernel test proves its property only on a fresh pipeline cache (run it alone): the cache is the process's.
 - **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device

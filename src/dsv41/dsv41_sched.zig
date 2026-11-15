@@ -27,6 +27,13 @@ pub fn facts(config: *const ModelConfig) sched.Facts {
     return .{ .always_write_through = true };
 }
 
+/// A DeepSeek Cooler load serves one row: a streamed load's expert cache is one request's working set, and a resident
+/// load keeps the decode state of one request.
+pub fn coolerRows(config: *const ModelConfig) sched.CoolerRows {
+    if (config.expert_streaming) return .{ .rows = 1, .why = "its routed experts stream from SSD (the expert cache is one request's working set)" };
+    return .{ .rows = 1, .why = "a resident DeepSeek load keeps one request's decode state" };
+}
+
 pub fn modelStateBytes(slot: *const Slot) u64 {
     return thought_point.dsv41StateBytes(slot);
 }

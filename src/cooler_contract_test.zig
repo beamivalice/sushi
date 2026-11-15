@@ -1,8 +1,9 @@
 //! The Sushi Cooler contract: what every load on the engine of our own owes, whatever its arch. An arch on Sushi
 //! Cooler declares `cooler_contract` (its tiny fixtures by env var and the reads only it can make: `prepare`,
-//! `prompt`, `weightsOutsideRegions`, `headLoaded`, and optionally `specTokens`); each test runs on every such fixture
-//! present and is reported skipped when any is missing. Loads, requests and unloads take the turns and hooks serve
-//! takes.
+//! `prompt`, `weightsOutsideRegions`, `headLoaded`, optionally `specTokens`, and `greedyRows`, required when its
+//! `coolerRows` gives more than one (the rows test fails by name without it); each test runs on every such fixture
+//! present and is reported skipped when any is missing or when no fixture's load applied to it.
+//! Loads, requests and unloads take the turns and hooks serve takes.
 const std = @import("std");
 const testing = std.testing;
 const mlx = @import("mlx.zig");
@@ -109,31 +110,74 @@ const Sheet = struct {
     }
 };
 
-/// `body` on each fixture of each arch that declares `cooler_contract`; a skip when none is present.
+/// What `eachFixture` saw over the fixtures. A body that skips (a load the test does not apply to) moves on to the next
+/// fixture; any other error ends the test. The test is a skip when a fixture is missing or no body ran.
+const Tally = struct {
+    ran: bool = false,
+    missing: bool = false,
+
+    fn absent(self: *Tally) void {
+        self.missing = true;
+    }
+
+    fn took(self: *Tally, result: anyerror!void) anyerror!void {
+        result catch |e| {
+            if (e == error.SkipZigTest) return;
+            return e;
+        };
+        self.ran = true;
+    }
+
+    fn verdict(self: Tally) error{SkipZigTest}!void {
+        if (!self.ran or self.missing) return error.SkipZigTest;
+    }
+};
+
+/// `body` on each fixture of each arch that declares `cooler_contract` (`Tally` says what a skip or a missing one does).
 fn eachFixture(comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
     try mlx.requireGpu();
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was_enabled);
-    var ran = false;
-    var missing = false;
+    var tally: Tally = .{};
     inline for (comptime std.meta.tags(registry.Tag)) |t| {
         if (comptime @hasDecl(registry.Mod(t), "cooler_contract")) {
             const C = registry.Mod(t).cooler_contract;
             for (C.fixtures) |env| {
                 const dir = std.mem.span(std.c.getenv(env) orelse {
-                    missing = true;
+                    tally.absent();
                     continue;
                 });
-                ran = true;
-                errdefer std.debug.print("cooler contract: fixture {s} ({s})\n", .{ env, dir });
-                const ids = try C.prompt(testing.allocator, dir);
+                const ids = C.prompt(testing.allocator, dir) catch |e| return named(env, dir, e);
                 defer testing.allocator.free(ids);
-                try body(C, dir, ids);
+                tally.took(body(C, dir, ids)) catch |e| return named(env, dir, e);
             }
         }
     }
-    if (!ran or missing) return error.SkipZigTest;
+    try tally.verdict();
+}
+
+test "cooler contract runner: a fixture whose body skips does not stop the next; the test skips only when none ran or one is missing" {
+    var first_skips: Tally = .{};
+    try first_skips.took(error.SkipZigTest);
+    try first_skips.took({});
+    try first_skips.verdict();
+    var all_skip: Tally = .{};
+    try all_skip.took(error.SkipZigTest);
+    try all_skip.took(error.SkipZigTest);
+    try testing.expectError(error.SkipZigTest, all_skip.verdict());
+    var one_missing: Tally = .{};
+    try one_missing.took({});
+    one_missing.absent();
+    try testing.expectError(error.SkipZigTest, one_missing.verdict());
+    var fails: Tally = .{};
+    try testing.expectError(error.TestUnexpectedResult, fails.took(error.TestUnexpectedResult));
+}
+
+/// `e`, after naming the fixture it came from.
+fn named(env: []const u8, dir: []const u8, e: anyerror) anyerror {
+    std.debug.print("cooler contract: fixture {s} ({s})\n", .{ env, dir });
+    return e;
 }
 
 /// `n` greedy tokens over `ids` in serial steps, one request in the model's turn, ended as serve ends one.
@@ -152,6 +196,52 @@ fn greedy(ld: *Load, ids: []const u32, n: u32) !std.ArrayList(u32) {
     errdefer got.deinit(a);
     while (try gen.next(a)) |t| try got.append(a, t);
     return got;
+}
+
+test "cooler contract: a Cooler load that serves more than one row gives each row its solo request's tokens" {
+    // Each row's tokens equal its request run alone: rows of ragged lengths decoded as one forward, each against the same
+    // prompt run alone. A load of one row has nothing to compare and is skipped.
+    try eachFixture(struct {
+        fn body(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.prepare(C, dir, true);
+            const rows = arch_sched.coolerRows(&ld.config);
+            if (rows.rows <= 1) {
+                ld.config.deinit(a);
+                return error.SkipZigTest;
+            }
+            if (comptime !@hasDecl(C, "greedyRows")) {
+                ld.config.deinit(a);
+                return error.CoolerRowsWithoutGreedyRows;
+            } else try rowsAgainstSolo(C, &ld, dir, ids, rows.rows);
+        }
+
+        fn rowsAgainstSolo(comptime C: type, ld: *Load, dir: []const u8, ids: []const u32, rows: usize) !void {
+            const a = testing.allocator;
+            try ld.load(dir);
+            defer _ = ld.close();
+            const n = @min(rows, 3);
+            var prompts: [3][]const u32 = undefined;
+            for (0..n) |i| prompts[i] = ids[0 .. ids.len - @min(ids.len - 1, i * 2)];
+            // The rows run in the model's turn and end as serve ends a request: the arch's decl takes neither.
+            const got = blk: {
+                const turn = arch_handle.turnFor(ld.h, &ld.config);
+                defer turn.end();
+                defer arch_sched.endRequest(&ld.config);
+                break :blk try C.greedyRows(a, ld.xfm, prompts[0..n], 6);
+            };
+            defer {
+                for (got) |*g| g.deinit(a);
+                a.free(got);
+            }
+            for (prompts[0..n], got) |p, row| {
+                var solo = try greedy(ld, p, 6);
+                defer solo.deinit(a);
+                try testing.expectEqualSlices(u32, solo.items, row.items);
+            }
+        }
+    }.body);
 }
 
 test "cooler contract: a Cooler load runs on the engine and holds every weight in an owned region, none in the forward pool" {

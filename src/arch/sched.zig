@@ -129,28 +129,75 @@ pub fn facts(config: *const ModelConfig) Facts {
     return f;
 }
 
-/// Does this config decode concurrent slots as one batch?
+/// What one forward of a Sushi Cooler load carries: its rows, and at one, why.
+pub const CoolerRows = struct {
+    rows: usize,
+    /// Why the load serves one row; null when it serves more.
+    why: ?[]const u8 = null,
+};
+
+const no_cooler_rows = "its arch declares no Cooler rows";
+
+/// The rows of a Cooler load of `config`. An arch with Sushi Cooler declares them (a compile error otherwise,
+/// `arch/config.zig`); only an arch that is never a Cooler load takes the one-row default.
+pub fn coolerRows(config: *const ModelConfig) CoolerRows {
+    const tag = tagOfConfig(config) orelse return .{ .rows = 1, .why = no_cooler_rows };
+    return switch (tag) {
+        inline else => |t| if (comptime has(t, "coolerRows")) S(t).coolerRows(config) else .{ .rows = 1, .why = no_cooler_rows },
+    };
+}
+
+/// A load on Sushi Cooler batches when its arch batches and its Cooler rows are more than one; on MLX the arch answers.
+pub fn coolerBatches(on_engine: bool, rows: CoolerRows, arch_batches: bool) bool {
+    return arch_batches and (!on_engine or rows.rows > 1);
+}
+
+/// A load on Sushi Cooler carries at most its Cooler rows, under the arch's own cap; on MLX the arch's cap stands.
+pub fn coolerRowCap(on_engine: bool, rows: CoolerRows, arch_cap: ?usize) ?usize {
+    if (!on_engine) return arch_cap;
+    return @min(arch_cap orelse rows.rows, rows.rows);
+}
+
+/// The load line of a Cooler load's rows; null for a load on MLX.
+pub fn coolerRowsLine(buf: []u8, config: *const ModelConfig) ?[]const u8 {
+    return coolerRowsLineOf(buf, arch_handle.onEngine(null, config), coolerRows(config));
+}
+
+pub fn coolerRowsLineOf(buf: []u8, on_engine: bool, rows: CoolerRows) ?[]const u8 {
+    if (!on_engine) return null;
+    if (rows.rows > 1) return std.fmt.bufPrint(buf, "[cooler] one forward carries {d} rows", .{rows.rows}) catch null;
+    return std.fmt.bufPrint(buf, "[cooler] one forward carries one row: {s}", .{rows.why orelse no_cooler_rows}) catch null;
+}
+
+/// Does this config decode concurrent slots as one batch? A Cooler load answers through its Cooler rows.
 pub fn batches(config: *const ModelConfig) bool {
     const tag = tagOfConfig(config) orelse return false;
-    return switch (tag) {
+    const arch_batches = switch (tag) {
         inline else => |t| if (comptime has(t, "batches")) S(t).batches(config) else false,
     };
+    if (!arch_batches) return false;
+    return coolerBatches(arch_handle.onEngine(null, config), coolerRows(config), true);
 }
 
-/// The rows one batched forward carries for this config, when the arch bounds it below `MAX_BATCH_GROUP`.
+/// The rows one batched forward carries for this config, when the arch bounds it below `MAX_BATCH_GROUP`; a Cooler
+/// load is bounded by its Cooler rows as well.
 pub fn rowCap(config: *const ModelConfig) ?usize {
     const tag = tagOfConfig(config) orelse return null;
-    return switch (tag) {
+    const cap = switch (tag) {
         inline else => |t| if (comptime has(t, "rowCap")) S(t).rowCap(config) else null,
     };
+    if (!arch_handle.onEngine(null, config)) return cap;
+    return coolerRowCap(true, coolerRows(config), cap);
 }
 
-/// The loaded model batches (the config's answer, and the layers it built).
+/// The loaded model batches (the config's answer, and the layers it built); a Cooler load through its Cooler rows.
 pub fn modelBatches(xfm: *const Trunk) bool {
     const tag = tagOfModel(xfm) orelse return false;
-    return switch (tag) {
+    const arch_batches = switch (tag) {
         inline else => |t| if (comptime has(t, "modelBatches")) S(t).modelBatches(xfm) else false,
     };
+    if (!arch_batches) return false;
+    return coolerBatches(arch_handle.onEngine(null, &xfm.config), coolerRows(&xfm.config), true);
 }
 
 /// Whether the slot whose context this is can merge into this tick's batch; one that cannot yet decodes serially.
@@ -445,7 +492,7 @@ pub fn flushResident(entry: *model_registry.LoadedModel, why: []const u8) void {
 
 const known_hooks = [_][]const u8{
     "facts",           "batches",       "rowCap",         "modelBatches",             "padsBatch",       "batchArm",
-    "readyToBatch",
+    "readyToBatch",    "coolerRows",
     "batchedForward",  "plannerObservesPlainRows",        "tickClass",                "mtpGroupable",    "initRequest",
     "checkKvQuant",    "coldLoadBill",  "modelStateBytes",                          "commitsAtCull",
     "prepareCommit",   "publishLive",   "commitOwn",      "cancelledNeedsCheckpoints", "handoffHistory",  "mtpHeadCommit",
@@ -491,6 +538,51 @@ test "batching per model type: what batches, and the rows one forward carries" {
         try std.testing.expectEqual(r.batches, batches(&config));
         try std.testing.expectEqual(r.cap, rowCap(&config));
     }
+}
+
+test "Cooler rows: an arch that declares none serves one row on Sushi Cooler, and says why" {
+    var config = ModelConfig{ .model_type = "mistral" };
+    const r = coolerRows(&config);
+    try std.testing.expectEqual(@as(usize, 1), r.rows);
+    try std.testing.expectEqualStrings("its arch declares no Cooler rows", r.why.?);
+}
+
+test "Cooler rows gate admission on a Cooler load only: one row batches nothing, more rows cap the arch's own" {
+    const one: CoolerRows = .{ .rows = 1, .why = "one" };
+    const four: CoolerRows = .{ .rows = 4 };
+    // On MLX the arch's answers stand, whatever its Cooler rows.
+    try std.testing.expect(coolerBatches(false, one, true));
+    try std.testing.expect(!coolerBatches(false, four, false));
+    try std.testing.expectEqual(@as(?usize, 8), coolerRowCap(false, one, 8));
+    try std.testing.expectEqual(@as(?usize, null), coolerRowCap(false, four, null));
+    // On Sushi Cooler a batch needs the arch's batching and more than one row; the cap is the smaller.
+    try std.testing.expect(!coolerBatches(true, one, true));
+    try std.testing.expect(!coolerBatches(true, four, false));
+    try std.testing.expect(coolerBatches(true, four, true));
+    try std.testing.expectEqual(@as(?usize, 4), coolerRowCap(true, four, 8));
+    try std.testing.expectEqual(@as(?usize, 4), coolerRowCap(true, four, null));
+    try std.testing.expectEqual(@as(?usize, 2), coolerRowCap(true, four, 2));
+    try std.testing.expectEqual(@as(?usize, 1), coolerRowCap(true, one, 8));
+}
+
+test "Cooler rows: the load line names the rows, and at one row why; a load on MLX has none" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("[cooler] one forward carries 4 rows", coolerRowsLineOf(&buf, true, .{ .rows = 4 }).?);
+    try std.testing.expectEqualStrings("[cooler] one forward carries one row: its arch declares no Cooler rows", coolerRowsLineOf(&buf, true, .{ .rows = 1, .why = "its arch declares no Cooler rows" }).?);
+    try std.testing.expect(coolerRowsLineOf(&buf, false, .{ .rows = 4 }) == null);
+}
+
+test "Cooler rows: a DeepSeek load serves one row, streamed or resident, and names why" {
+    var config = ModelConfig{ .model_type = "deepseek_v41" };
+    if (registry.ofModelType(config.model_type) == null) return error.SkipZigTest;
+    config.expert_streaming = true;
+    const streamed = coolerRows(&config);
+    try std.testing.expectEqual(@as(usize, 1), streamed.rows);
+    try std.testing.expect(std.mem.indexOf(u8, streamed.why.?, "stream") != null);
+    config.expert_streaming = false;
+    const resident = coolerRows(&config);
+    try std.testing.expectEqual(@as(usize, 1), resident.rows);
+    try std.testing.expect(std.mem.indexOf(u8, resident.why.?, "one request's decode state") != null);
 }
 
 test "only Flash-Next gates its long-context rules and caps its checkpoints; only the thinking-point archs arm one" {

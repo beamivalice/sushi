@@ -299,7 +299,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   reached through `src/arch/sched.zig`; a hook an arch omits leaves the default stated on its dispatch function, and a
   test fails on a declaration no dispatch reads. It answers:
   - what batches (`batches`, `rowCap`, `modelBatches`, `padsBatch`; the row cap and whether a group pads are in
-    `Slot.facts`), and the kernel a group takes (`batchArm`,
+    `Slot.facts`). A Sushi Cooler load also answers through `coolerRows(config)`, the rows one forward of it carries
+    or why one (no default for an arch on Sushi Cooler): it batches only past one row, under the smaller cap, and its
+    load line says `[cooler] one forward carries ...`; and the kernel a group takes (`batchArm`,
     `batchedForward`: the arch's arm says whether rows are positioned by `moe_seq_offset` and whether the tick moves
     it, so a per-row forward and a padded one share the tick);
   - how a speculating slot ticks (`tickClass`: `mtp_group` joins the grouped verify or drops to a plain row when

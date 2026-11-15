@@ -37,6 +37,7 @@ const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
 const arch_handle = @import("arch/handle.zig");
 const arch_load = @import("arch/load.zig");
+const arch_sched = @import("arch/sched.zig");
 const arch_packs = @import("arch/packs.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -1938,6 +1939,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const mtp_enabled = mtp.on and !mtp_streaming_off and !arch_config.fact(params.config, "no_mtp_head");
     arch_serve.loadLines(params.config, .{ .io = sch.io, .allocator = sch.allocator, .model_dir = params.model_dir, .mtp_source = mtp.sourceName() });
     arch_load.logLoad(params.config, kv_quant_config, mtp.on, params);
+    var rows_buf: [192]u8 = undefined;
+    if (arch_sched.coolerRowsLine(&rows_buf, params.config)) |line| log.info("{s}\n", .{line});
     if (@import("chat.zig").templateTakesPreserveThinking(params.chat_config)) {
         const keep = settings_resolve.resolve(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, model_settings.default_preserve_thinking);
         log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", settings_resolve.sourceLabel(keep.source, "--preserve-thinking") });

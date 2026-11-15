@@ -310,6 +310,8 @@ comptime {
         for ([_][]const u8{ "stampCooler", "coolerForTest", "cooler_contract" }) |decl| {
             if (!@hasDecl(M, decl)) @compileError(@tagName(t) ++ " declares the Sushi Cooler opt-out " ++ o.flag ++ " without " ++ decl);
         }
+        // The rows one forward of its Cooler load carries, or why one: never a silent default (`arch/sched.coolerRows`).
+        if (!@hasDecl(M.sched, "coolerRows")) @compileError(@tagName(t) ++ " declares the Sushi Cooler opt-out " ++ o.flag ++ " without sched.coolerRows");
         if (@import("../model_settings.zig").findKey(&@import("../model_settings.zig").model_keys, o.setting) == null) @compileError(o.flag ++ " names no model setting " ++ o.setting);
     };
 }
