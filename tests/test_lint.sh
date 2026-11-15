@@ -337,6 +337,28 @@ expect_green "a listed file, a file with no test and a folder with no arch_tests
 printf '%s\n' 'pub fn c() void {}' 'test "named only in a comment" { c(); }' > "$TMP/t/src/arch1/comment.zig"
 expect_red "a file the list names only in a comment" "\[arch-test-unlisted\] -: comment.zig"
 
+# rule test-unrooted
+tree
+mkdir -p "$TMP/t/src/sub" "$TMP/t/src/exl3"
+printf '%s\n' 'test {' '    _ = @import("listed.zig");' '    _ = @import("sub/nested.zig");' '}' '// _ = @import("comment.zig");' > "$TMP/t/src/tests.zig"
+printf '%s\n' 'test {' '    _ = @import("own.zig");' '    _ = @import("../up.zig");' '}' > "$TMP/t/src/exl3/root.zig"
+printf '%s\n' 'pub fn f() void {}' 'test "listed" { f(); }' > "$TMP/t/src/listed.zig"
+printf '%s\n' 'pub fn f() void {}' 'test "nested" { f(); }' > "$TMP/t/src/sub/nested.zig"
+printf '%s\n' 'pub fn f() void {}' 'test "own" { f(); }' > "$TMP/t/src/exl3/own.zig"
+printf '%s\n' 'pub fn f() void {}' 'test "up" { f(); }' > "$TMP/t/src/up.zig"
+printf '%s\n' 'pub fn h() void {}' > "$TMP/t/src/sub/no_tests.zig"
+expect_green "files a test root names, by a path from the root's folder, and a file with no test"
+printf '%s\n' 'pub fn g() void {}' 'test "never run" { g(); }' > "$TMP/t/src/sub/un.zig"
+expect_red "a file with a test no test root names" "src/sub/un.zig:2:1 \[test-unrooted\] -: sub/un.zig declares a test and no test root imports it"
+rm "$TMP/t/src/sub/un.zig"
+printf '%s\n' 'pub fn c() void {}' 'test "named only in a comment" { c(); }' > "$TMP/t/src/comment.zig"
+expect_red "a file a root names only in a comment" "\[test-unrooted\] -: comment.zig"
+rm "$TMP/t/src/comment.zig"
+mkdir -p "$TMP/t/src/arch1"
+printf '%s\n' 'pub const tests = .{};' > "$TMP/t/src/arch1/arch_tests.zig"
+printf '%s\n' 'pub fn g() void {}' 'test "an arch file" { g(); }' > "$TMP/t/src/arch1/un.zig"
+lint; grep -q "test-unrooted" "$TMP/out" && fail "a file beside an arch_tests.zig is arch-test-unlisted's, reported once"
+
 # rule template-text-search
 tree
 printf '%s\n' 'const std = @import("std");' 'const mem = std.mem;' 'const C = struct { chat_template: []const u8 };' \

@@ -164,6 +164,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `\n` (`"{s}"` alone passes: a line built whole): the logger adds no line end, so the next line starts on that one.
   `arch-test-unlisted` flags a file that declares a test and sits beside an `arch_tests.zig` that does not import
   it: the buckets select tests by listed file, so its tests would never run.
+  `test-unrooted` flags any other `src/` file that declares a test and that no test root (`tests.zig`,
+  `tests_host.zig`, `test_rest.zig`, the exl3 and encoder roots) imports: Zig runs only the tests a root reaches.
   `template-text-search` flags, outside `src/template/` and tests, a `mem.` search (`indexOf`, `count`, `startsWith`,
   ...) whose arguments name a template's source (`chat_template`, `template`, `tmpl`, `tpl`, `template_source`): a
   word in the text may sit in a comment or a comparison, so the server asks the compiled template's facts
@@ -201,7 +203,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
   `-Dmodel=<arch>` runs one folder's tests plus the shared ones. A new test file of an arch is listed in that
   arch's `arch_tests.zig` (`pub const tests`, or `host_tests` for an MLX-free file), never in `src/tests.zig`.
   A source file with tests at its bottom is listed too: the buckets select tests by listed file, so an unlisted
-  file's tests never run (lint `arch-test-unlisted`).
+  file's tests never run (lint `arch-test-unlisted`). A shared file with tests is imported from `src/tests.zig`, or
+  `src/tests_host.zig` when MLX-free (lint `test-unrooted`).
 - A shared file (`trunk.zig`, `server.zig`, `generate.zig`, `scheduler.zig`, `prefix_cache.zig`, the EXL3 kernels)
   holds only `shared` tests. Code for one arch lives in that arch's files, and so do its tests.
 - A scenario across several modules, or a table of real captures, is its own `<topic>_test.zig`.

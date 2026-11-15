@@ -169,4 +169,8 @@ test {
     _ = @import("arch/admission.zig");
     _ = @import("arch/config.zig");
     _ = @import("arch/load.zig");
+    _ = @import("arch/arch_state.zig");
+    _ = @import("arch/media.zig");
+    _ = @import("arch/offline.zig");
+    _ = @import("arch/prefix.zig");
 }

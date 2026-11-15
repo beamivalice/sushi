@@ -23,6 +23,7 @@ const rules = .{
     @import("json_unchecked_shape.zig"),
     @import("owned_insert_arg.zig"),
     @import("arch_test_unlisted.zig"),
+    @import("test_unrooted.zig"),
     @import("template_text_search.zig"),
     @import("device_probe.zig"),
     @import("log_line_end.zig"),
