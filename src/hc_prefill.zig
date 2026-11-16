@@ -5,7 +5,8 @@ const testing = std.testing;
 const prefill_plan = @import("prefill_plan.zig");
 
 var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
-var sigmoid_table: ?mlx.mlx_array = null;
+/// One a side: an array belongs to the side that made it (1 the engine's, 0 MLX's).
+var sigmoid_tables: [2]?mlx.mlx_array = .{ null, null };
 var announced = false;
 
 // Include the final remainder that the chunker may merge into an 8192-token chunk.
@@ -100,7 +101,10 @@ pub fn norm(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, iw: mlx.mlx_a
 
 // Use MLX sigmoid for every BF16 bit pattern, including rounding-boundary inputs.
 pub fn sigmoidTable(s: mlx.mlx_stream) !mlx.mlx_array {
-    if (sigmoid_table) |table| return table;
+    const side = &sigmoid_tables[@intFromBool(mlx.engine.isStream(s))];
+    if (side.*) |table| return table;
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
     var bits: [65536]u16 = undefined;
     for (&bits, 0..) |*v, i| v.* = @intCast(i);
     const x = mlx.mlx_array_new_data(&bits, &[_]c_int{65536}, 1, .bfloat16);
@@ -108,8 +112,14 @@ pub fn sigmoidTable(s: mlx.mlx_stream) !mlx.mlx_array {
     var table = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(table);
     try mlx.check(mlx.mlx_sigmoid(&table, x, s));
-    sigmoid_table = table;
+    side.* = table;
     return table;
+}
+
+/// Frees side `side`'s table, when the side's last model is gone.
+pub fn dropSide(side: u1) void {
+    if (sigmoid_tables[side]) |t| _ = mlx.mlx_array_free(t);
+    sigmoid_tables[side] = null;
 }
 
 pub fn mix(s: mlx.mlx_stream, up: mlx.mlx_array, normalized: mlx.mlx_array, batch: c_int, seq: c_int) !?mlx.mlx_array {

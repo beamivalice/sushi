@@ -12,7 +12,6 @@ const model_load = @import("model_load.zig");
 const model_settings_mod = @import("model_settings.zig");
 const server_mod = @import("server.zig");
 const arch_flags = @import("arch/flags.zig");
-const arch_state = @import("arch/arch_state.zig");
 const server_state = @import("server_state.zig");
 const hidden_capture = @import("hidden_capture.zig");
 const fp8_block = @import("fp8_block.zig");
@@ -362,12 +361,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         try self.xfm.cache.reinit(self.config.num_hidden_layers, opts.kv_quant_config);
     }
     _ = mlx.applyWiredPolicy();
-    if (self.config.hidden_act == .gelu_approx) {
-        self.xfm.compileGelu();
-        self.xfm.compileGeglu();
-    }
-    if (self.xfm.moe_layers != null) self.xfm.compileMoeRouting();
-    arch_state.compile(&self.xfm, .gates);
+    model_load.compileClosures(&self.xfm, .gates);
     try offline.afterLoad(&self.xfm, self.config, opts.kv_quant_config);
     return self;
 }

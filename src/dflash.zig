@@ -529,6 +529,7 @@ pub const DflashLinear = struct {
 
     pub fn apply(self: *const DflashLinear, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         if (!self.isQuantized()) {
             try mlx.check(mlx.mlx_matmul(&out, x, self.w, s));
             return out;
@@ -773,6 +774,7 @@ fn scalarAs(v: f32, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     const f = mlx.mlx_array_new_float(v);
     defer _ = mlx.mlx_array_free(f);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, f, dtype, s));
     return out;
 }
@@ -785,6 +787,7 @@ fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
         return error.MissingDflashWeight;
     };
     var owned = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(owned);
     try mlx.check(mlx.mlx_array_set(&owned, arr));
     return owned;
 }
@@ -1061,6 +1064,7 @@ pub const DflashCtx = struct {
 
 inline fn rmsNormFn(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_fast_rms_norm(&out, x, w, eps, s));
     return out;
 }
@@ -1074,6 +1078,7 @@ fn swiglu(gate: mlx.mlx_array, up: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_ar
     defer _ = mlx.mlx_array_free(silu_out);
     try mlx.check(mlx.mlx_multiply(&silu_out, gate, sig, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_multiply(&out, silu_out, up, s));
     return out;
 }
@@ -1105,11 +1110,15 @@ fn projectHeads(
 
     const perm = [_]c_int{ 0, 2, 1, 3 };
     var transposed = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_transpose_axes(&transposed, normed, &perm, 4, s));
+    {
+        errdefer _ = mlx.mlx_array_free(transposed);
+        try mlx.check(mlx.mlx_transpose_axes(&transposed, normed, &perm, 4, s));
+    }
     if (!apply_rope) return transposed;
     defer _ = mlx.mlx_array_free(transposed);
 
     var roped = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(roped);
     try mlx.check(mlx.mlx_fast_rope(
         &roped,
         transposed,
@@ -1198,6 +1207,7 @@ fn buildBlockMask(
     try mlx.check(mlx.mlx_astype(&bias_bf16, bias_f32, .bfloat16, s));
 
     var bias_4d = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(bias_4d);
     const out_shape = [_]c_int{ 1, 1, @intCast(q_len), @intCast(kv_len) };
     try mlx.check(mlx.mlx_reshape(&bias_4d, bias_bf16, &out_shape, 4, s));
     return bias_4d;
@@ -1305,6 +1315,7 @@ pub fn groupedDynConvReference(
     }
 
     var flat = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(flat);
     const out_shape = [_]c_int{ 1, len, h };
     try mlx.check(mlx.mlx_reshape(&flat, out, &out_shape, 3, s));
     _ = mlx.mlx_array_free(out);
@@ -1404,6 +1415,7 @@ fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !m
     const strides = [_]c_int{ 1, 1, 1 };
     try mlx.check(mlx.mlx_slice(&cut, base_kernel, &start, 3, &stop, 3, &strides, 3, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     const out_shape = [_]c_int{ bsh[1], bsh[2] };
     try mlx.check(mlx.mlx_reshape(&out, cut, &out_shape, 2, s));
     return out;
@@ -1796,6 +1808,7 @@ fn projectHeadsNoNorm(
     try mlx.check(mlx.mlx_reshape(&reshaped, proj, &hs, 4, s));
     const perm = [_]c_int{ 0, 2, 1, 3 };
     var transposed = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(transposed);
     try mlx.check(mlx.mlx_transpose_axes(&transposed, reshaped, &perm, 4, s));
     return transposed;
 }
@@ -1842,6 +1855,7 @@ fn tailMask(q_len: u32, ctx_len: usize, relative: usize, window: u32, s: mlx.mlx
         tail_mask_shape = shape;
     }
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_array_set(&out, tail_mask.?));
     return out;
 }
@@ -3156,6 +3170,7 @@ fn fixtureArr(vals: []const f32, n: usize, h: usize, s: mlx.mlx_stream) !mlx.mlx
     const f32_arr = mlx.mlx_array_new_data(vals.ptr, &shape, 3, .float32);
     defer _ = mlx.mlx_array_free(f32_arr);
     var bf = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(bf);
     try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, s));
     return bf;
 }

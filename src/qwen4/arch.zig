@@ -85,16 +85,60 @@ test {
 }
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *trunk.Weights, s: mlx.mlx_stream) !Trunk {
+    const side = qwen4_cooler.sideOf(&config);
+    @import("../log.zig").info("{s}\n", .{qwen4_cooler.line(side)});
+    // A Cooler model holds the engine's scope from here to its unload (`deinit`).
+    const held = mlx.engine.isStream(s);
+    if (held) mlx.engine.hold();
+    errdefer if (held) @import("../arch/handle.zig").engineHoldEnd();
+    // What the init builds from the weights lands in owned regions the engine wraps, as the weights did.
+    mlx.engine.own_weights = held;
+    defer mlx.engine.own_weights = false;
     if (config.indexer_budget != 0) {
-        qwen4_qsa_select.qsaScoreFusedArm();
-        qwen4_qsa_gather.qsaNaxArm();
+        try qwen4_qsa_select.qsaScoreFusedArm(s);
+        try qwen4_qsa_gather.qsaNaxArm(s);
     }
-    return Trunk.initTrunk(io, allocator, config, weights, s);
+    var xfm = try Trunk.initTrunk(io, allocator, config, weights, s);
+    if (held) qwen4_cooler.ownBuiltWeights(&xfm) catch |e| {
+        xfm.arch_state.qwen4.deinit(allocator);
+        xfm.deinitTrunk();
+        return e;
+    };
+    return xfm;
 }
 
 pub fn deinit(xfm: Model) void {
+    const held = mlx.engine.isStream(xfm.s);
     xfm.arch_state.qwen4.deinit(xfm.allocator);
     xfm.deinitTrunk();
+    if (held) @import("../arch/handle.zig").engineHoldEnd();
+}
+
+const qwen4_cooler = @import("qwen4_cooler.zig");
+
+/// What the shared Sushi Cooler contract suite asks of this arch (`src/cooler_contract_test.zig`).
+pub const cooler_opt_out: @import("../arch/config.zig").CoolerOptOut = .{
+    .flag = "--qwen-mlx-engine",
+    .setting = "qwen_cooler",
+};
+
+pub const cooler_contract = @import("qwen4_contract.zig");
+
+/// A Cooler load runs on the engine's stream.
+pub const ownStream = qwen4_cooler.ownStream;
+
+/// Frees the arch's process-wide arrays of side `side` (1 the engine's, 0 MLX's) when that side's last model is gone.
+pub fn dropHostArrays(side: u1) void {
+    @import("qwen4_hc.zig").dropSide(side);
+}
+
+pub fn coolerForTest(config: *Config, on: bool) void {
+    config.cooler_for_test = on;
+}
+
+/// Records who asked for MLX, which `qwen4_cooler.sideOf` reads.
+pub fn stampCooler(config: *Config, on: bool, by_flag: bool) void {
+    config.cooler_ask = if (on) .none else if (by_flag) .flag else .setting;
 }
 
 pub fn resetCache(xfm: Model) !void {

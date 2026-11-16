@@ -34,7 +34,7 @@
 const std = @import("std");
 const testTrunk = @import("test_support.zig").testTrunk;
 const arch_handle = @import("arch/handle.zig");
-const settings_resolve = @import("settings_resolve.zig");
+const arch_flags = @import("arch/flags.zig");
 const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
 const arch_state = @import("arch/arch_state.zig");
@@ -4003,8 +4003,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // Use the resolved thinking mode and normalize the M5/block-16
             // calibration to this machine's effective assistant width.
             .mtp_enabled = use_head_mtp,
-            .mtp_acceptance = settings_resolve.acceptanceFor(slot.model.config.?.mtp_acceptance_override).value,
-            .mtp_greedy_tail = settings_resolve.greedyTailFor(slot.model.config.?.mtp_greedy_tail_override).value,
+            .mtp_acceptance = arch_flags.mtpAcceptanceOf(slot.model.config.?).value,
+            .mtp_greedy_tail = arch_flags.greedyTailOf(slot.model.config.?).value,
             .mtp = if (use_head_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,

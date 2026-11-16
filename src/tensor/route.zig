@@ -13,9 +13,10 @@ pub const kernel = @import("kernel.zig");
 const stock = @import("stock.zig");
 const sorting = @import("sort.zig");
 const scan = @import("scan.zig");
+const dtype_rule = @import("dtype_rule.zig");
 const random = @import("random.zig");
 const quantized = @import("quantized.zig");
-const attention = @import("attention.zig");
+pub const attention = @import("attention.zig");
 
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
@@ -252,6 +253,15 @@ pub fn wrapMapped(ptr: [*]u8, dims: []const c_int, dtype: mlx.mlx_dtype, payload
     return core.handle(t);
 }
 
+/// `core.moveToMapped` of tensor `a`; false (the error latched) when the engine refused it.
+pub fn moveToMapped(a: A, ptr: [*]u8, len: usize, payload: ?*anyopaque, release: core.MappedRelease) bool {
+    core.moveToMapped(core.of(a), ptr, len, payload, release) catch |e| {
+        _ = fail("move_to_mapped", e);
+        return false;
+    };
+    return true;
+}
+
 /// Ops that went to MLX while the engine is on: what a request still builds there.
 pub var mlx_ops: u64 = 0;
 
@@ -348,7 +358,15 @@ pub fn lentVector(items: []const A) V {
     return mlx.raw.mlx_vector_array_new_data(lent.ptr, lent.len);
 }
 
-fn fail(comptime what: []const u8, e: anyerror) c_int {
+var refusal_trace_env: ?bool = null;
+
+/// `SUSHI_ENGINE_REFUSAL_TRACE`: the stack of every op the engine fails or refuses, to find the call that reached it.
+pub fn traceRefusal() void {
+    if (@import("../io_util.zig").diagEnvOnCached(&refusal_trace_env, "SUSHI_ENGINE_REFUSAL_TRACE")) std.debug.dumpCurrentStackTrace(.{});
+}
+
+fn fail(what: []const u8, e: anyerror) c_int {
+    traceRefusal();
     var buf: [512]u8 = undefined;
     const said = metal.lastError();
     const msg = switch (e) {
@@ -366,6 +384,10 @@ fn fail(comptime what: []const u8, e: anyerror) c_int {
     } catch "[engine] error";
     mlx.latchError(msg);
     return 1;
+}
+
+fn negativeWidth(comptime what: []const u8) c_int {
+    return fail(what, core.refusing("a negative group size or bits", error.TensorUnsupported));
 }
 
 /// An optional int of MLX's API as a width, or `default`; null for a negative one, which MLX refuses too.
@@ -546,6 +568,11 @@ pub const isOurs = core.isOurs;
 pub const isMapped = core.isMapped;
 pub const poolBytes = core.poolBytes;
 pub const storePointer = core.storePointer;
+
+/// The bytes of the store under tensor `a`: the length a mapping that takes its place must have.
+pub fn storeLen(a: A) usize {
+    return core.of(a).store.len;
+}
 pub const stream = core.stream;
 pub const stats = core.stats;
 pub const poolLimit = core.poolLimit;
@@ -1026,9 +1053,29 @@ fn bin(comptime op: ops.Binary) fn (*A, A, A, S) c_int {
             defer core.release(x);
             const y = core.take(b) catch |e| return fail(@tagName(op), e);
             defer core.release(y);
-            return put(res, ops.binary(op, x, y) catch |e| return fail(@tagName(op), e));
+            return put(res, binaryOf(op, x, y) catch |e| return fail(@tagName(op), e));
         }
     }.f;
+}
+
+/// The dtype MLX's op gives two operands: a division and logaddexp at least a float, a logical op bool, any other
+/// the promoted type (`ops.promoteTypes`). Both operands are cast to it first, as MLX casts them.
+fn binaryOf(comptime op: ops.Binary, x: *Tensor, y: *Tensor) core.Error!*Tensor {
+    const promoted = ops.promoteTypes(x.dtype, y.dtype);
+    const to: core.Dtype = switch (op) {
+        .divide, .logaddexp => switch (promoted) {
+            .float16, .bfloat16, .float32, .float64 => promoted,
+            else => .float32,
+        },
+        .logical_and, .logical_or => .bool_,
+        else => promoted,
+    };
+    if (x.dtype == to and y.dtype == to) return if (op == .floor_divide) floorDivideOf(x, y) else ops.binary(op, x, y);
+    const cx = try ops.astype(x, to);
+    defer core.release(cx);
+    const cy = try ops.astype(y, to);
+    defer core.release(cy);
+    return binaryOf(op, cx, cy);
 }
 
 fn un(comptime op: ops.Unary) fn (*A, A, S) c_int {
@@ -1036,9 +1083,36 @@ fn un(comptime op: ops.Unary) fn (*A, A, S) c_int {
         fn f(res: *A, a: A, _: S) c_int {
             const x = core.take(a) catch |e| return fail(@tagName(op), e);
             defer core.release(x);
-            return put(res, ops.unary(op, x) catch |e| return fail(@tagName(op), e));
+            return put(res, unaryAsMlx(op, x) catch |e| return fail(@tagName(op), e));
         }
     }.f;
+}
+
+/// `op` under MLX's dtype rule: the float ops take `at_least_float` of their input, abs and floor keep an integer's or
+/// a bool's dtype through MLX's own kernels for it, and negative refuses a bool as MLX does.
+fn unaryAsMlx(comptime op: ops.Unary, x: *Tensor) core.Error!*Tensor {
+    switch (op) {
+        .exp, .log, .sigmoid, .sqrt, .rsqrt => return onFloat(struct {
+            fn g(t: *Tensor) core.Error!*Tensor {
+                return ops.unary(op, t);
+            }
+        }.g)(x),
+        .abs, .floor => if (!dtype_rule.isFloat(x.dtype)) return stock.unaryOf(if (op == .abs) "Abs" else "Floor", .all, x),
+        .negative => if (x.dtype == .bool_) return core.refusing("negative of a bool, which MLX refuses", error.TensorDtype),
+        .square => {},
+    }
+    return ops.unary(op, x);
+}
+
+/// `f` over `at_least_float` of its input, as MLX's float ops cast theirs.
+fn onFloat(comptime f: fn (*Tensor) core.Error!*Tensor) fn (*Tensor) core.Error!*Tensor {
+    return struct {
+        fn g(x: *Tensor) core.Error!*Tensor {
+            const t = try dtype_rule.as(x, dtype_rule.atLeastFloat(x.dtype));
+            defer core.release(t);
+            return f(t);
+        }
+    }.g;
 }
 
 pub const mlx_add = bin(.add);
@@ -1053,6 +1127,8 @@ pub const mlx_greater = bin(.greater);
 pub const mlx_greater_equal = bin(.greater_equal);
 pub const mlx_equal = bin(.equal);
 pub const mlx_logical_and = bin(.logical_and);
+pub const mlx_logical_or = bin(.logical_or);
+
 pub const mlx_logaddexp = bin(.logaddexp);
 pub const mlx_exp = un(.exp);
 pub const mlx_log = un(.log);
@@ -1066,19 +1142,18 @@ pub const mlx_negative = un(.negative);
 
 /// MLX's integer floor divide of unsigned operands is their quotient (the remainder step cannot fire); of floats it is
 /// the floor of the quotient.
-pub fn mlx_floor_divide(res: *A, a: A, b: A, _: S) c_int {
-    return op2("floor_divide", res, a, b, floorDivideOf, .{});
-}
+pub const mlx_floor_divide = bin(.floor_divide);
 
 fn floorDivideOf(x: *Tensor, y: *Tensor) core.Error!*Tensor {
     switch (x.dtype) {
         .uint8, .uint16, .uint32, .uint64 => return ops.binary(.divide, x, y),
+        .int8, .int16, .int32, .int64 => return ops.binary(.floor_divide, x, y),
         .float32, .float16, .bfloat16 => {
             const q = try ops.binary(.divide, x, y);
             defer core.release(q);
             return ops.unary(.floor, q);
         },
-        else => return error.TensorDtype,
+        else => return core.refusing("floor_divide of a dtype other than an integer or a float", error.TensorDtype),
     }
 }
 
@@ -1097,7 +1172,9 @@ pub fn mlx_sum_axis(res: *A, a: A, axis: c_int, keepdims: bool, _: S) c_int {
 }
 
 fn sumOf(x: *Tensor, axis: c_int, keepdims: bool) core.Error!*Tensor {
-    return ops.reduce(.sum, x, axis, keepdims);
+    const t = try dtype_rule.as(x, dtype_rule.sumOf(x.dtype));
+    defer core.release(t);
+    return ops.reduce(.sum, t, axis, keepdims);
 }
 
 pub fn mlx_max_axis(res: *A, a: A, axis: c_int, keepdims: bool, _: S) c_int {
@@ -1108,6 +1185,112 @@ fn maxOf(x: *Tensor, axis: c_int, keepdims: bool) core.Error!*Tensor {
     return ops.reduce(.max, x, axis, keepdims);
 }
 
+pub fn mlx_max(res: *A, a: A, keepdims: bool, _: S) c_int {
+    return op1("max", res, a, ops.maxAll, .{keepdims});
+}
+
+pub fn mlx_any_axes(res: *A, a: A, axes: [*]const c_int, n: usize, keepdims: bool, _: S) c_int {
+    return op1("any", res, a, ops.anyAxes, .{ axes[0..n], keepdims });
+}
+
+/// MLX's Metal `ArgPartition` is its argsort (`gpu_merge_sort`); `kth` is checked as MLX checks it.
+pub fn mlx_argpartition_axis(res: *A, a: A, kth: c_int, axis: c_int, _: S) c_int {
+    const x = core.take(a) catch |e| return fail("argpartition", e);
+    defer core.release(x);
+    const at = if (axis < 0) axis + @as(c_int, x.ndim) else axis;
+    if (at < 0 or at >= x.ndim) return fail("argpartition", error.TensorShape);
+    const k = if (kth < 0) kth + x.shape[@intCast(at)] else kth;
+    if (k < 0 or k >= x.shape[@intCast(at)]) return fail("argpartition", error.TensorShape);
+    return put(res, sorting.sort(x, at, true) catch |e| return fail("argpartition", e));
+}
+
+pub fn mlx_all(res: *A, a: A, keepdims: bool, _: S) c_int {
+    return op1("all", res, a, ops.allOf, .{keepdims});
+}
+
+pub fn mlx_isfinite(res: *A, a: A, _: S) c_int {
+    return op1("isfinite", res, a, ops.isFinite, .{});
+}
+
+pub fn mlx_array_equal(res: *A, a: A, b: A, equal_nan: bool, _: S) c_int {
+    return op2("array_equal", res, a, b, ops.arrayEqual, .{equal_nan});
+}
+
+pub fn mlx_logsumexp_axis(res: *A, a: A, axis: c_int, keepdims: bool, _: S) c_int {
+    const x = core.take(a) catch |e| return fail("logsumexp", e);
+    defer core.release(x);
+    if (axis != -1 and axis != @as(c_int, x.ndim) - 1) return fail("logsumexp", core.refusing("an axis but the last is not ported", error.TensorUnsupported));
+    return put(res, stock.logsumexpLast(x, keepdims) catch |e| return fail("logsumexp", e));
+}
+
+pub fn mlx_conv1d(res: *A, input: A, weight: A, stride: c_int, padding: c_int, dilation: c_int, groups: c_int, _: S) c_int {
+    const x = core.take(input) catch |e| return fail("conv1d", e);
+    defer core.release(x);
+    const w = core.take(weight) catch |e| return fail("conv1d", e);
+    defer core.release(w);
+    const depthwise = x.ndim == 3 and w.ndim == 3 and groups == x.shape[2] and groups == w.shape[0] and w.shape[2] == 1;
+    if (!depthwise or stride != 1 or padding != 0 or dilation < 1)
+        return fail("conv1d", core.refusing("a conv1d that is not depthwise at stride 1 with no padding is not ported", error.TensorUnsupported));
+    // `conv_1D_gpu`: its depthwise kernel undilated, the steel implicit GEMM dilated.
+    if (dilation == 1) return put(res, stock.depthwiseConv1d(x, w) catch |e| return fail("conv1d", e));
+    return put(res, stock.dilatedDepthwiseConv1d(x, w, @intCast(dilation)) catch |e| return fail("conv1d", e));
+}
+
+pub fn mlx_fast_rope(res: *A, x: A, dims: c_int, traditional: bool, base: mlx.mlx_optional_float, scale: f32, offset: c_int, freqs: A, s: S) c_int {
+    const at = core.fromHost(std.mem.asBytes(&offset), .int32, &.{}) catch |e| return fail("rope", e);
+    defer core.release(at);
+    return ropeOf(res, x, dims, traditional, base, scale, core.handle(at), freqs, s);
+}
+
+pub fn mlx_fast_rope_dynamic(res: *A, x: A, dims: c_int, traditional: bool, base: mlx.mlx_optional_float, scale: f32, offset: A, freqs: A, s: S) c_int {
+    return ropeOf(res, x, dims, traditional, base, scale, offset, freqs, s);
+}
+
+fn ropeOf(res: *A, x: A, dims: c_int, traditional: bool, base: mlx.mlx_optional_float, scale: f32, offset: A, freqs: A, _: S) c_int {
+    if ((freqs.ctx != null) == base.has_value) return fail("rope", core.refusing("one of base and freqs, never both or neither", error.TensorUnsupported));
+    if (dims <= 0) return fail("rope", error.TensorShape);
+    const t = core.take(x) catch |e| return fail("rope", e);
+    defer core.release(t);
+    const o = core.take(offset) catch |e| return fail("rope", e);
+    defer core.release(o);
+    const f = if (freqs.ctx != null) core.take(freqs) catch |e| return fail("rope", e) else null;
+    defer if (f) |v| core.release(v);
+    return put(res, stock.rope(t, @intCast(dims), traditional, if (base.has_value) base.value else 1.0, scale, o, f) catch |e| return fail("rope", e));
+}
+
+pub fn mlx_tile(res: *A, a: A, reps: [*]const c_int, n: usize, _: S) c_int {
+    return op1("tile", res, a, ops.tile, .{reps[0..n]});
+}
+
+pub fn mlx_split(res: *V, a: A, parts: c_int, axis: c_int, _: S) c_int {
+    const x = core.take(a) catch |e| return fail("split", e);
+    defer core.release(x);
+    if (parts <= 0 or parts > 64) return fail("split", core.refusing("a split into more than 64 parts", error.TensorUnsupported));
+    var pieces: [64]*Tensor = undefined;
+    const got = pieces[0..@intCast(parts)];
+    ops.split(x, parts, axis, got) catch |e| return fail("split", e);
+    const v = newVec() orelse {
+        for (got) |t| core.release(t);
+        return fail("split", error.OutOfMemory);
+    };
+    for (got) |t| v.items.append(gpa, core.handle(t)) catch {
+        core.release(t);
+    };
+    if (res.ctx != null) _ = if (isVec(res.*)) mlx_vector_array_free(res.*) else mlx.raw.mlx_vector_array_free(res.*);
+    res.* = vecHandle(v);
+    return 0;
+}
+
+pub fn mlx_full(res: *A, dims: [*]const c_int, n: usize, val: A, dtype: mlx.mlx_dtype, _: S) c_int {
+    const v = core.take(val) catch |e| return fail("full", e);
+    defer core.release(v);
+    return put(res, ops.full(dims[0..n], v, dtype) catch |e| return fail("full", e));
+}
+
+pub fn mlx_ones(res: *A, dims: [*]const c_int, n: usize, dtype: mlx.mlx_dtype, _: S) c_int {
+    return put(res, ops.onesOf(dims[0..n], dtype) catch |e| return fail("ones", e));
+}
+
 pub fn mlx_argmax_axis(res: *A, a: A, axis: c_int, keepdims: bool, _: S) c_int {
     return op1("argmax", res, a, ops.argmax, .{ axis, keepdims });
 }
@@ -1116,15 +1299,17 @@ pub fn mlx_mean_axis(res: *A, a: A, axis: c_int, keepdims: bool, _: S) c_int {
     return op1("mean", res, a, meanOf, .{ axis, keepdims });
 }
 
-/// MLX's mean: the sum times `1 / n`, the reciprocal taken in double and stored in the array's dtype.
+/// MLX's mean: the sum times `1 / n`, the reciprocal taken in double and stored in the array's float dtype.
 fn meanOf(x: *Tensor, axis: c_int, keepdims: bool) core.Error!*Tensor {
-    if (x.dtype != .float32) return error.TensorUnsupported;
+    switch (x.dtype) {
+        .float32, .float16, .bfloat16 => {},
+        else => return core.refusing("a mean over a dtype that is not float", error.TensorUnsupported),
+    }
     const at: usize = @intCast(if (axis < 0) axis + @as(c_int, x.ndim) else axis);
     if (at >= x.ndim) return error.TensorShape;
     const sum = try ops.reduce(.sum, x, axis, keepdims);
     defer core.release(sum);
-    const inverse: f32 = @floatCast(1.0 / @as(f64, @floatFromInt(x.shape[at])));
-    const scale = try core.fromHost(std.mem.asBytes(&inverse), .float32, &.{});
+    const scale = try core.scalar(1.0 / @as(f64, @floatFromInt(x.shape[at])), x.dtype);
     defer core.release(scale);
     return ops.binary(.multiply, sum, scale);
 }
@@ -1136,7 +1321,7 @@ pub fn mlx_softmax_axis(res: *A, a: A, axis: c_int, precise: bool, _: S) c_int {
 /// MLX's softmax: its fused kernel over the last axis, and `exp(x - max) / sum` over any other.
 fn softmaxOf(x: *Tensor, axis: c_int, precise: bool) core.Error!*Tensor {
     if (x.size() == 0) return core.share(x);
-    if (x.dtype != .float32 and x.dtype != .float16 and x.dtype != .bfloat16) return error.TensorDtype;
+    if (x.dtype != .float32 and x.dtype != .float16 and x.dtype != .bfloat16) return core.refusing("softmax of a dtype other than f32, f16 and bf16", error.TensorDtype);
     if (axis == -1 or axis == @as(c_int, x.ndim) - 1) return stock.softmaxLast(x, precise);
     const in = if (precise) try ops.astype(x, .float32) else try core.share(x);
     defer core.release(in);
@@ -1163,24 +1348,89 @@ pub fn matmulRowsAs(res: *A, a: A, b: A, rows_as: usize) c_int {
     return op2("matmul", res, a, b, @import("matmul.zig").matmulRowsAs, .{rows_as});
 }
 
+pub fn mlx_fast_layer_norm(res: *A, x: A, weight: A, bias: A, eps: f32, _: S) c_int {
+    const tx = core.take(x) catch |e| return fail("layer_norm", e);
+    defer core.release(tx);
+    const tw: ?*Tensor = if (weight.ctx != null) core.take(weight) catch |e| return fail("layer_norm", e) else null;
+    defer if (tw) |t| core.release(t);
+    const tb: ?*Tensor = if (bias.ctx != null) core.take(bias) catch |e| return fail("layer_norm", e) else null;
+    defer if (tb) |t| core.release(t);
+    return put(res, layerNormOf(tx, tw, tb, eps) catch |e| return fail("layer_norm", e));
+}
+
+/// `fast::layer_norm`: x, the weight and the bias in their result type, which must be a float; a missing weight is a
+/// 0-d one, a missing bias a 0-d zero.
+fn layerNormOf(x: *Tensor, w: ?*Tensor, b: ?*Tensor, eps: f32) core.Error!*Tensor {
+    var d = x.dtype;
+    if (w) |t| d = ops.promoteTypes(d, t.dtype);
+    if (w != null) if (b) |t| {
+        d = ops.promoteTypes(d, t.dtype);
+    };
+    if (!dtype_rule.isFloat(d)) return core.refusing("a layer norm in a dtype that is not a float, which MLX refuses", error.TensorDtype);
+    const px = try dtype_rule.as(x, d);
+    defer core.release(px);
+    const pw = try paramOr(w, 1, d);
+    defer core.release(pw);
+    const pb = try paramOr(b, 0, d);
+    defer core.release(pb);
+    return stock.layerNorm(px, pw, pb, eps);
+}
+
+/// `t` as `d`, or a 0-d `value` of `d` when there is none.
+fn paramOr(t: ?*Tensor, value: f32, d: core.Dtype) core.Error!*Tensor {
+    if (t) |given| return dtype_rule.as(given, d);
+    const v = value;
+    const one = try core.fromHost(std.mem.asBytes(&v), .float32, &.{});
+    defer core.release(one);
+    return dtype_rule.as(one, d);
+}
+
 pub fn mlx_fast_rms_norm(res: *A, x: A, weight: A, eps: f32, _: S) c_int {
     return op2("rms_norm", res, x, weight, stock.rmsNorm, .{eps});
 }
 
 pub fn mlx_erf(res: *A, a: A, _: S) c_int {
-    return op1("erf", res, a, stock.erf, .{});
+    return op1("erf", res, a, onFloat(stock.erf), .{});
+}
+pub fn mlx_power(res: *A, a: A, b: A, _: S) c_int {
+    return op2("power", res, a, b, powerOf, .{});
+}
+
+/// MLX's `power`: both operands in their promoted dtype, through MLX's Power kernel for it.
+fn powerOf(x: *Tensor, y: *Tensor) core.Error!*Tensor {
+    const d = ops.promoteTypes(x.dtype, y.dtype);
+    const px = try dtype_rule.as(x, d);
+    defer core.release(px);
+    const py = try dtype_rule.as(y, d);
+    defer core.release(py);
+    return stock.binaryOf("Power", .all, px, py);
+}
+
+pub fn mlx_tanh(res: *A, a: A, _: S) c_int {
+    return op1("tanh", res, a, onFloat(stock.tanh), .{});
+}
+pub fn mlx_cos(res: *A, a: A, _: S) c_int {
+    return op1("cos", res, a, onFloat(stock.cos), .{});
+}
+pub fn mlx_sin(res: *A, a: A, _: S) c_int {
+    return op1("sin", res, a, onFloat(stock.sin), .{});
+}
+pub fn mlx_sign(res: *A, a: A, _: S) c_int {
+    return op1("sign", res, a, stock.sign, .{});
+}
+pub fn mlx_log1p(res: *A, a: A, _: S) c_int {
+    return op1("log1p", res, a, onFloat(stock.log1p), .{});
 }
 
 pub fn mlx_quantized_matmul(res: *A, x: A, w: A, scales: A, biases: A, transpose_w: bool, group_size: mlx.mlx_optional_int, bits: mlx.mlx_optional_int, mode: [*:0]const u8, _: S) c_int {
     const what = std.meta.stringToEnum(quantized.Mode, std.mem.span(mode)) orelse return fail("quantized_matmul", core.refusing("a mode other than affine, mxfp4 and mxfp8 (nvfp4) is not ported", error.TensorUnsupported));
     if (!transpose_w) return fail("quantized_matmul", core.refusing("a weight that is not transposed is not ported", error.TensorUnsupported));
     // `quantization_params_from_mode`: affine defaults to 64 and 4, the mx modes have their own.
-    const negative = core.refusing("a negative group size or bits", error.TensorUnsupported);
-    const group = widthOf(group_size, if (what == .affine) 64 else 32) orelse return fail("quantized_matmul", negative);
+    const group = widthOf(group_size, if (what == .affine) 64 else 32) orelse return negativeWidth("quantized_matmul");
     const width = widthOf(bits, switch (what) {
         .affine, .mxfp4 => 4,
         .mxfp8 => 8,
-    }) orelse return fail("quantized_matmul", negative);
+    }) orelse return negativeWidth("quantized_matmul");
     const tx = core.take(x) catch |e| return fail("quantized_matmul", e);
     defer core.release(tx);
     const tw = core.take(w) catch |e| return fail("quantized_matmul", e);
@@ -1189,18 +1439,46 @@ pub fn mlx_quantized_matmul(res: *A, x: A, w: A, scales: A, biases: A, transpose
     defer core.release(ts);
     const tb: ?*Tensor = if (biases.ctx != null) core.take(biases) catch |e| return fail("quantized_matmul", e) else null;
     defer if (tb) |b| core.release(b);
-    return put(res, quantized.quantizedMatmul(tx, tw, ts, tb, what, group, width) catch |e| return fail("quantized_matmul", e));
+    const pr = quantizedOperands(what, tx, ts, tb) catch |e| return fail("quantized_matmul", e);
+    defer pr.release();
+    return put(res, quantized.quantizedMatmul(pr.x, tw, pr.scales, pr.biases, what, group, width) catch |e| return fail("quantized_matmul", e));
+}
+
+/// The operands of a quantized product in the dtype MLX computes it in: an affine one in `promote_types(x, scales)`,
+/// x, scales and biases cast to it; an mx one as given.
+const Promoted = struct {
+    x: *Tensor,
+    scales: *Tensor,
+    biases: ?*Tensor,
+
+    fn release(self: Promoted) void {
+        core.release(self.x);
+        core.release(self.scales);
+        if (self.biases) |b| core.release(b);
+    }
+};
+
+fn quantizedOperands(mode: quantized.Mode, x: *Tensor, scales: *Tensor, biases: ?*Tensor) core.Error!Promoted {
+    const d = if (mode == .affine)
+        dtype_rule.promoteFloats(x.dtype, scales.dtype) orelse return core.refusing("an affine product over a non-float x or scales, which MLX refuses", error.TensorDtype)
+    else
+        x.dtype;
+    const px = try dtype_rule.as(x, d);
+    errdefer core.release(px);
+    const ps = if (mode == .affine) try dtype_rule.as(scales, d) else try core.share(scales);
+    errdefer core.release(ps);
+    const pb: ?*Tensor = if (biases) |b| (if (mode == .affine) try dtype_rule.as(b, d) else try core.share(b)) else null;
+    return .{ .x = px, .scales = ps, .biases = pb };
 }
 
 pub fn mlx_gather_qmm(res: *A, x: A, w: A, scales: A, biases: A, lhs_indices: A, rhs_indices: A, transpose_w: bool, group_size: mlx.mlx_optional_int, bits: mlx.mlx_optional_int, mode: [*:0]const u8, sorted_indices: bool, _: S) c_int {
     const what = std.meta.stringToEnum(quantized.Mode, std.mem.span(mode)) orelse return fail("gather_qmm", core.refusing("a mode other than affine, mxfp4 and mxfp8 (nvfp4) is not ported", error.TensorUnsupported));
     if (!transpose_w) return fail("gather_qmm", core.refusing("a weight that is not transposed is not ported", error.TensorUnsupported));
-    const negative = core.refusing("a negative group size or bits", error.TensorUnsupported);
-    const group = widthOf(group_size, if (what == .affine) 64 else 32) orelse return fail("gather_qmm", negative);
+    const group = widthOf(group_size, if (what == .affine) 64 else 32) orelse return negativeWidth("gather_qmm");
     const width = widthOf(bits, switch (what) {
         .affine, .mxfp4 => 4,
         .mxfp8 => 8,
-    }) orelse return fail("gather_qmm", negative);
+    }) orelse return negativeWidth("gather_qmm");
     const tx = core.take(x) catch |e| return fail("gather_qmm", e);
     defer core.release(tx);
     const tw = core.take(w) catch |e| return fail("gather_qmm", e);
@@ -1209,22 +1487,146 @@ pub fn mlx_gather_qmm(res: *A, x: A, w: A, scales: A, biases: A, lhs_indices: A,
     defer core.release(ts);
     const tb: ?*Tensor = if (biases.ctx != null) core.take(biases) catch |e| return fail("gather_qmm", e) else null;
     defer if (tb) |b| core.release(b);
+    const pr = quantizedOperands(what, tx, ts, tb) catch |e| return fail("gather_qmm", e);
+    defer pr.release();
     const tl: ?*Tensor = if (lhs_indices.ctx != null) core.take(lhs_indices) catch |e| return fail("gather_qmm", e) else null;
     defer if (tl) |t| core.release(t);
     const tr: ?*Tensor = if (rhs_indices.ctx != null) core.take(rhs_indices) catch |e| return fail("gather_qmm", e) else null;
     defer if (tr) |t| core.release(t);
-    return put(res, quantized.gatherQmm(tx, tw, ts, tb, tl, tr, what, group, width, sorted_indices) catch |e| return fail("gather_qmm", e));
+    return put(res, quantized.gatherQmm(pr.x, tw, pr.scales, pr.biases, tl, tr, what, group, width, sorted_indices) catch |e| return fail("gather_qmm", e));
 }
 
-pub fn mlx_fast_scaled_dot_product_attention(res: *A, queries: A, keys: A, values: A, scale: f32, mask_mode: [*:0]const u8, mask_arr: A, sinks: A, _: bool, _: S) c_int {
-    if (mask_mode[0] != 0 or mask_arr.ctx != null or sinks.ctx != null) return fail("scaled_dot_product_attention", error.TensorUnsupported);
-    const q = core.take(queries) catch |e| return fail("scaled_dot_product_attention", e);
+pub fn mlx_fast_scaled_dot_product_attention(res: *A, queries: A, keys: A, values: A, scale: f32, mask_mode: [*:0]const u8, mask_arr: A, sinks: A, force_fused: bool, s: S) c_int {
+    const what = "scaled_dot_product_attention";
+    if (sinks.ctx != null) return fail(what, core.refusing("sinks are not ported", error.TensorUnsupported));
+    const mode = std.mem.span(mask_mode);
+    const kind: attention.MaskKind = if (std.mem.eql(u8, mode, "causal")) .causal else if (std.mem.eql(u8, mode, "array") or (mode.len == 0 and mask_arr.ctx != null)) .array else if (mode.len == 0) .none else return fail(what, core.refusing("a mask mode MLX does not name", error.TensorUnsupported));
+    if ((kind == .array) != (mask_arr.ctx != null)) return fail(what, core.refusing("a mask array that does not match its mode", error.TensorUnsupported));
+    const q = core.take(queries) catch |e| return fail(what, e);
     defer core.release(q);
-    const k = core.take(keys) catch |e| return fail("scaled_dot_product_attention", e);
+    const k = core.take(keys) catch |e| return fail(what, e);
     defer core.release(k);
-    const v = core.take(values) catch |e| return fail("scaled_dot_product_attention", e);
+    const v = core.take(values) catch |e| return fail(what, e);
     defer core.release(v);
-    return put(res, attention.attention(q, k, v, scale) catch |e| return fail("scaled_dot_product_attention", e));
+    if (q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or k.shape[1] == 0 or @rem(q.shape[1], k.shape[1]) != 0) return fail(what, error.TensorShape);
+    if (k.dtype != q.dtype or v.dtype != q.dtype) return fail(what, core.refusing("queries, keys and values of mixed dtypes", error.TensorUnsupported));
+    const g = @import("matmul.zig").gpu() catch |e| return fail(what, e);
+    const route = attention.routeOf(g, .{
+        .q_len = @intCast(q.shape[2]),
+        .k_len = @intCast(k.shape[2]),
+        .heads = @intCast(q.shape[1]),
+        .kv_heads = @intCast(k.shape[1]),
+        .q_dim = @intCast(q.shape[3]),
+        .v_dim = @intCast(v.shape[3]),
+        .dtype = q.dtype,
+        .mask = kind,
+        .force_fused = force_fused,
+    });
+    switch (route) {
+        .invalid => |why| return fail(what, core.refusing(why, error.TensorUnsupported)),
+        .fallback => {
+            const mask_type: mlx.mlx_dtype = if (kind == .array) blk: {
+                const m = core.take(mask_arr) catch |e| return fail(what, e);
+                defer core.release(m);
+                break :blk m.dtype;
+            } else .bool_;
+            return attentionChain(res, .{ queries, keys, values }, .{ q.shape[0], q.shape[1], q.shape[2], q.shape[3], k.shape[1], k.shape[2], v.shape[3] }, q.dtype, scale, kind, mask_arr, mask_type, s);
+        },
+        .vector, .full => if (kind == .array) return fail(what, core.refusing("a fused attention kernel with an array mask is not ported", error.TensorUnsupported)),
+    }
+    return put(res, attention.attention(q, k, v, scale, kind == .causal) catch |e| return fail(what, e));
+}
+
+/// `fast::scaled_dot_product_attention`'s `fallback` (mlx/fast.cpp) with the mask MLX hands it, op for op on the
+/// engine's own routes, so each step has the bytes and dtype it has under MLX. `dims`: B, H, qL, D, kv heads, kL, vD.
+fn attentionChain(res: *A, qkv: [3]A, dims: [7]c_int, dtype: mlx.mlx_dtype, scale: f32, kind: attention.MaskKind, mask_in: A, mask_type: mlx.mlx_dtype, s: S) c_int {
+    var held: [24]A = undefined;
+    var n_held: usize = 0;
+    defer for (held[0..n_held]) |a| {
+        _ = mlx_array_free(a);
+    };
+    const Chain = struct {
+        held: *[24]A,
+        n: *usize,
+        /// A fresh result slot: a route frees what its result slot held before.
+        fn slot(c: @This()) *A {
+            c.held[c.n.*] = .{};
+            return &c.held[c.n.*];
+        }
+        fn keep(c: @This(), rc: c_int) error{Chain}!A {
+            if (rc != 0) return error.Chain;
+            c.n.* += 1;
+            return c.held[c.n.* - 1];
+        }
+    };
+    const c: Chain = .{ .held = &held, .n = &n_held };
+    const out = attentionSteps(c, qkv, dims, dtype, scale, kind, mask_in, mask_type, s) catch return 1;
+    res.* = out;
+    n_held -= 1;
+    return 0;
+}
+
+fn attentionSteps(c: anytype, qkv: [3]A, dims: [7]c_int, dtype: mlx.mlx_dtype, scale: f32, kind: attention.MaskKind, mask_in: A, mask_type: mlx.mlx_dtype, s: S) error{Chain}!A {
+    const b, const heads, const q_len, const q_dim, const kv_heads, const k_len, const v_dim = dims;
+    const repeats = @divExact(heads, kv_heads);
+    // fast.cpp before the fallback: an additive mask in the output dtype, broadcast to [B, H, qL, kL].
+    var mask: A = .{};
+    if (kind == .array) {
+        const typed = if (mask_type == .bool_) mask_in else try c.keep(mlx_astype(c.slot(), mask_in, dtype, s));
+        mask = try c.keep(mlx_broadcast_to(c.slot(), typed, &[_]c_int{ b, heads, q_len, k_len }, 4, s));
+    }
+    const scale_f = mlx.mlx_array_new_float(scale);
+    defer _ = mlx.mlx_array_free(scale_f);
+    const scale_t = try c.keep(mlx_astype(c.slot(), scale_f, dtype, s));
+    var q = try c.keep(mlx_multiply(c.slot(), scale_t, qkv[0], s));
+    var k = qkv[1];
+    var v = qkv[2];
+    if (repeats > 1) {
+        q = try c.keep(mlx_reshape(c.slot(), q, &[_]c_int{ b, kv_heads, repeats, q_len, q_dim }, 5, s));
+        k = try c.keep(mlx_expand_dims(c.slot(), k, 2, s));
+        v = try c.keep(mlx_expand_dims(c.slot(), v, 2, s));
+    }
+    const rank: usize = if (repeats > 1) 5 else 4;
+    var swap: [5]c_int = .{ 0, 1, 2, 3, 4 };
+    std.mem.swap(c_int, &swap[rank - 1], &swap[rank - 2]);
+    const kt = try c.keep(mlx_transpose_axes(c.slot(), k, &swap, rank, s));
+    var scores = try c.keep(mlx_matmul(c.slot(), q, kt, s));
+    if (kind != .none) {
+        var m = mask;
+        var keep_rows = mask_type == .bool_;
+        if (kind == .causal) {
+            const offset = k_len - q_len;
+            const qi = try c.keep(mlx_arange(c.slot(), @floatFromInt(offset), @floatFromInt(q_len + offset), 1, .int32, s));
+            const ki = try c.keep(mlx_arange(c.slot(), 0, @floatFromInt(k_len), 1, .int32, s));
+            const qc = try c.keep(mlx_expand_dims(c.slot(), qi, 1, s));
+            const kr = try c.keep(mlx_expand_dims(c.slot(), ki, 0, s));
+            m = try c.keep(mlx_greater_equal(c.slot(), qc, kr, s));
+            keep_rows = true;
+        } else if (repeats > 1) {
+            m = try c.keep(mlx_reshape(c.slot(), m, &[_]c_int{ b, kv_heads, repeats, q_len, k_len }, 5, s));
+        }
+        if (keep_rows) {
+            const low_f = mlx.mlx_array_new_float(lowest(dtype));
+            defer _ = mlx.mlx_array_free(low_f);
+            const low = try c.keep(mlx_astype(c.slot(), low_f, dtype, s));
+            scores = try c.keep(mlx_where(c.slot(), m, scores, low, s));
+        } else {
+            scores = try c.keep(mlx_add(c.slot(), scores, m, s));
+        }
+    }
+    const weights = try c.keep(mlx_softmax_axis(c.slot(), scores, -1, true, s));
+    var out = try c.keep(mlx_matmul(c.slot(), weights, v, s));
+    if (repeats > 1) out = try c.keep(mlx_reshape(c.slot(), out, &[_]c_int{ b, heads, q_len, v_dim }, 4, s));
+    return out;
+}
+
+/// `finfo(dtype).min`: the lowest finite value.
+fn lowest(dtype: mlx.mlx_dtype) f32 {
+    return switch (dtype) {
+        .float16 => -65504.0,
+        .bfloat16 => -3.3895313892515355e38,
+        else => -std.math.floatMax(f32),
+    };
 }
 
 pub fn mlx_dequantize(res: *A, w: A, scales: A, biases: A, group_size: mlx.mlx_optional_int, bits: mlx.mlx_optional_int, mode: [*:0]const u8, global_scale: A, dtype: mlx.mlx_optional_dtype, _: S) c_int {
@@ -1237,13 +1639,12 @@ pub fn mlx_dequantize(res: *A, w: A, scales: A, biases: A, group_size: mlx.mlx_o
     defer if (tb) |t| core.release(t);
     const tg: ?*Tensor = if (global_scale.ctx != null) core.take(global_scale) catch |e| return fail("dequantize", e) else null;
     defer if (tg) |t| core.release(t);
-    const negative = core.refusing("a negative group size or bits", error.TensorUnsupported);
     const group = widthOf(group_size, switch (what) {
         .affine => 64,
         .nvfp4 => 16,
         .mxfp4, .mxfp8 => 32,
-    }) orelse return fail("dequantize", negative);
-    const width = widthOf(bits, if (what == .mxfp8) 8 else 4) orelse return fail("dequantize", negative);
+    }) orelse return negativeWidth("dequantize");
+    const width = widthOf(bits, if (what == .mxfp8) 8 else 4) orelse return negativeWidth("dequantize");
     const out_type = if (dtype.has_value) dtype.value else if (what == .affine) ts.dtype else .float32;
     return put(res, stock.dequantize(tw, ts, tb, group, width, what, tg, out_type) catch |e| return fail("dequantize", e));
 }
@@ -1254,9 +1655,8 @@ pub fn mlx_quantize(res: *V, w: A, group_size: mlx.mlx_optional_int, bits: mlx.m
     if (what != .affine or global_scale.ctx != null) return fail("quantize", core.refusing("only the affine quantizer is ported", error.TensorUnsupported));
     const tw = core.take(w) catch |e| return fail("quantize", e);
     defer core.release(tw);
-    const negative = core.refusing("a negative group size or bits", error.TensorUnsupported);
-    const group = widthOf(group_size, 64) orelse return fail("quantize", negative);
-    const width = widthOf(bits, 4) orelse return fail("quantize", negative);
+    const group = widthOf(group_size, 64) orelse return negativeWidth("quantize");
+    const width = widthOf(bits, 4) orelse return negativeWidth("quantize");
     const parts = stock.quantize(tw, group, width) catch |e| return fail("quantize", e);
     const v = newVec() orelse {
         for (parts) |t| core.release(t);
@@ -1291,7 +1691,13 @@ fn argsortOf(x: *Tensor, axis: c_int) core.Error!*Tensor {
 }
 
 pub fn mlx_cumsum(res: *A, a: A, axis: c_int, reverse: bool, inclusive: bool, _: S) c_int {
-    return op1("cumsum", res, a, scan.cumsum, .{ axis, reverse, inclusive });
+    return op1("cumsum", res, a, cumsumOf, .{ axis, reverse, inclusive });
+}
+
+fn cumsumOf(x: *Tensor, axis: c_int, reverse: bool, inclusive: bool) core.Error!*Tensor {
+    const t = try dtype_rule.as(x, dtype_rule.cumsumOf(x.dtype));
+    defer core.release(t);
+    return scan.cumsum(t, axis, reverse, inclusive);
 }
 
 pub fn mlx_put_along_axis(res: *A, a: A, indices: A, values: A, axis: c_int, _: S) c_int {
@@ -1305,7 +1711,7 @@ pub fn mlx_put_along_axis(res: *A, a: A, indices: A, values: A, axis: c_int, _: 
 }
 
 pub fn mlx_pad(res: *A, a: A, axes: [*]const c_int, n_axes: usize, low: [*]const c_int, n_low: usize, high: [*]const c_int, n_high: usize, pad_value: A, mode: [*:0]const u8, _: S) c_int {
-    if (!std.mem.eql(u8, std.mem.span(mode), "constant")) return fail("pad", error.TensorUnsupported);
+    if (!std.mem.eql(u8, std.mem.span(mode), "constant")) return fail("pad", core.refusing("a pad mode other than constant", error.TensorUnsupported));
     return op2("pad", res, a, pad_value, padOf, .{ axes[0..n_axes], low[0..n_low], high[0..n_high] });
 }
 
@@ -1325,7 +1731,7 @@ pub fn mlx_stack_axis(res: *A, arrays: V, axis: c_int, _: S) c_int {
 
 pub fn mlx_slice_update(res: *A, src: A, update: A, start: [*]const c_int, n_start: usize, stop: [*]const c_int, n_stop: usize, step: [*]const c_int, n_step: usize, _: S) c_int {
     for (step[0..n_step]) |s| {
-        if (s != 1) return fail("slice_update", error.TensorUnsupported);
+        if (s != 1) return fail("slice_update", core.refusing("a slice update with a step other than 1", error.TensorUnsupported));
     }
     return op2("slice_update", res, src, update, ops.sliceUpdate, .{ start[0..n_start], stop[0..n_stop] });
 }
@@ -1568,14 +1974,17 @@ pub fn forgetConfig(c: mlx.mlx_fast_metal_kernel_config) void {
 }
 
 pub fn mlx_fast_metal_kernel_apply(outputs: *V, k: mlx.mlx_fast_metal_kernel, inputs: V, c: mlx.mlx_fast_metal_kernel_config, _: S) c_int {
-    const def = if (isKernel(k)) kernelOf(k) else defs.get(@intFromPtr(k.ctx)) orelse return fail("kernel_apply: the kernel was made before the engine was on", error.TensorUnsupported);
-    const cfg = if (isConfig(c)) configOf(c) else mirrors.get(@intFromPtr(c.ctx)) orelse return fail("kernel_apply: the config was made before the engine was on", error.TensorUnsupported);
-    if (cfg.partial) return fail("kernel_apply: the config holds more outputs or template arguments than the engine mirrors", error.TensorUnsupported);
+    const def = if (isKernel(k)) kernelOf(k) else defs.get(@intFromPtr(k.ctx)) orelse return fail("kernel_apply", core.refusing("the kernel was made before the engine was on", error.TensorUnsupported));
+    const cfg = if (isConfig(c)) configOf(c) else mirrors.get(@intFromPtr(c.ctx)) orelse return fail("kernel_apply", core.refusing("the config was made before the engine was on", error.TensorUnsupported));
+    if (cfg.partial) return fail("kernel_apply", core.refusing("the config holds more outputs or template arguments than the engine mirrors", error.TensorUnsupported));
     const ins = takeAll(inputs) catch |e| return fail("kernel_apply", e);
     defer releaseAll(ins);
     var out_buf: [kernel.max_outputs]*Tensor = undefined;
     const outs = out_buf[0..cfg.n_out];
-    kernel.launch(def, ins, cfg, outs) catch |e| return fail("kernel_apply", e);
+    kernel.launch(def, ins, cfg, outs) catch |e| {
+        var what: [96]u8 = undefined;
+        return fail(std.fmt.bufPrint(&what, "kernel_apply {s}", .{def.name}) catch "kernel_apply", e);
+    };
     const v = newVec() orelse {
         for (outs) |t| core.release(t);
         return fail("kernel_apply", error.OutOfMemory);
@@ -2174,6 +2583,427 @@ test "a custom kernel launched on the engine writes what it writes under MLX" {
     };
 }
 
+test "a matmul whose batch axis broadcasts (one key head to several query heads) gives MLX's bytes on the engine" {
+    const Build = struct {
+        fn f(s: S, in: []const A) !A {
+            var wide: A = .{};
+            defer _ = mlx.mlx_array_free(wide);
+            try mlx.check(mlx.mlx_expand_dims(&wide, in[1], 2, s));
+            var turned: A = .{};
+            defer _ = mlx.mlx_array_free(turned);
+            try mlx.check(mlx.mlx_transpose_axes(&turned, wide, &[_]c_int{ 0, 1, 2, 4, 3 }, 5, s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_matmul(&o, in[0], turned, s));
+            return o;
+        }
+    };
+    const xs = ramp(f32, 2 * 4 * 9 * 256, 2, -1);
+    const ys = ramp(f32, 2 * 256 * 9, 2, -1);
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    for ([_]c_int{ 64, 256 }) |dim| for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dt| {
+        const a32 = hostArray(f32, xs[0..@intCast(2 * 4 * 9 * dim)], &.{ 1, 2, 4, 9, dim }, .float32);
+        defer _ = mlx.mlx_array_free(a32);
+        const b32 = hostArray(f32, ys[0..@intCast(2 * 9 * dim)], &.{ 1, 2, 9, dim }, .float32);
+        defer _ = mlx.mlx_array_free(b32);
+        var a: A = .{};
+        defer _ = mlx.mlx_array_free(a);
+        var b: A = .{};
+        defer _ = mlx.mlx_array_free(b);
+        try mlx.check(mlx.mlx_astype(&a, a32, dt, gpu));
+        try mlx.check(mlx.mlx_astype(&b, b32, dt, gpu));
+        try mlx.check(mlx.mlx_array_eval(a));
+        try mlx.check(mlx.mlx_array_eval(b));
+        try expectSame(Build.f, &.{ a, b });
+    };
+}
+
+test "the full attention kernel gives MLX's bytes on the engine at head dimension 256 under a causal mask, keys sliced from a cache or not" {
+    const g = try @import("matmul.zig").gpu();
+    if (!g.nax) return error.SkipZigTest;
+    const Build = struct {
+        fn of(comptime forced: bool, comptime sliced: c_int) fn (S, []const A) anyerror!A {
+            return struct {
+                fn f(s: S, in: []const A) !A {
+                    var k = in[1];
+                    var v = in[2];
+                    var ks: A = .{};
+                    defer _ = mlx.mlx_array_free(ks);
+                    var vs: A = .{};
+                    defer _ = mlx.mlx_array_free(vs);
+                    if (sliced > 0) {
+                        const start = [_]c_int{ 0, 0, 0, 0 };
+                        const stop = [_]c_int{ 1, 2, sliced, 256 };
+                        const step = [_]c_int{ 1, 1, 1, 1 };
+                        try mlx.check(mlx.mlx_slice(&ks, k, &start, 4, &stop, 4, &step, 4, s));
+                        try mlx.check(mlx.mlx_slice(&vs, v, &start, 4, &stop, 4, &step, 4, s));
+                        k = ks;
+                        v = vs;
+                    }
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, in[0], k, v, 0.0625, "causal", .{}, .{}, forced, s));
+                    return o;
+                }
+            }.f;
+        }
+    };
+    const vals = try t_std.allocator.alloc(f32, 24 * 1100 * 256);
+    defer t_std.allocator.free(vals);
+    const pattern = ramp(f32, 4099, 2, -1);
+    for (vals, 0..) |*x, i| x.* = pattern[i % pattern.len];
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    const Case = struct { q_len: c_int, k_len: c_int };
+    for ([_]Case{ .{ .q_len = 64, .k_len = 64 }, .{ .q_len = 100, .k_len = 100 }, .{ .q_len = 100, .k_len = 340 }, .{ .q_len = 1024, .k_len = 1024 } }) |c| {
+        const q32 = hostArray(f32, vals[0..@intCast(24 * c.q_len * 256)], &.{ 1, 24, c.q_len, 256 }, .float32);
+        defer _ = mlx.mlx_array_free(q32);
+        const k32 = hostArray(f32, vals[5 .. 5 + @as(usize, @intCast(2 * c.k_len * 256))], &.{ 1, 2, c.k_len, 256 }, .float32);
+        defer _ = mlx.mlx_array_free(k32);
+        const v32 = hostArray(f32, vals[77 .. 77 + @as(usize, @intCast(2 * c.k_len * 256))], &.{ 1, 2, c.k_len, 256 }, .float32);
+        defer _ = mlx.mlx_array_free(v32);
+        var q: A = .{};
+        defer _ = mlx.mlx_array_free(q);
+        var k: A = .{};
+        defer _ = mlx.mlx_array_free(k);
+        var v: A = .{};
+        defer _ = mlx.mlx_array_free(v);
+        try mlx.check(mlx.mlx_astype(&q, q32, .bfloat16, gpu));
+        try mlx.check(mlx.mlx_astype(&k, k32, .bfloat16, gpu));
+        try mlx.check(mlx.mlx_astype(&v, v32, .bfloat16, gpu));
+        for ([_]A{ q, k, v }) |x| try mlx.check(mlx.mlx_array_eval(x));
+        try expectSame(Build.of(true, 0), &.{ q, k, v });
+        if (c.q_len >= 1024) try expectSame(Build.of(false, 0), &.{ q, k, v });
+        // Keys a slice of a longer cache, a length that is no whole tile: MLX reads them to the tile's end.
+        if (c.k_len == 340) try expectSame(Build.of(true, 300), &.{ q, k, v });
+    }
+}
+
+test "keys sliced from a longer cache back the rows of a whole last tile; keys at the cache's end do not" {
+    try mlx.requireGpu();
+    const cache = try core.fresh(.bfloat16, &.{ 1, 2, 340, 256 });
+    defer core.release(cache);
+    const head = try ops.slice(cache, &.{ 0, 0, 0, 0 }, &.{ 1, 2, 300, 256 }, &.{ 1, 1, 1, 1 });
+    defer core.release(head);
+    try t_std.expect(attention.backsRows(head, 320));
+    try t_std.expect(!attention.backsRows(head, 352));
+    const tail = try ops.slice(cache, &.{ 0, 0, 30, 0 }, &.{ 1, 2, 330, 256 }, &.{ 1, 1, 1, 1 });
+    defer core.release(tail);
+    try t_std.expect(!attention.backsRows(tail, 320));
+    try t_std.expect(attention.backsRows(tail, 310));
+}
+
+test "the vector attention kernels give MLX's bytes on the engine at head dimension 256, causal or not, one and two passes" {
+    const Build = struct {
+        fn of(comptime mode: [*:0]const u8) fn (S, []const A) anyerror!A {
+            return struct {
+                fn f(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, in[0], in[1], in[2], 0.0625, mode, .{}, .{}, false, s));
+                    return o;
+                }
+            }.f;
+        }
+    };
+    const vals = ramp(f32, 2 * 1500 * 256 + 64, 2, -1);
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    for ([_]c_int{ 300, 1500 }) |k_len| for ([_]c_int{ 1, 2 }) |q_len| {
+        const q32 = hostArray(f32, vals[0..@intCast(24 * q_len * 256)], &.{ 1, 24, q_len, 256 }, .float32);
+        defer _ = mlx.mlx_array_free(q32);
+        const k32 = hostArray(f32, vals[3 .. 3 + @as(usize, @intCast(2 * k_len * 256))], &.{ 1, 2, k_len, 256 }, .float32);
+        defer _ = mlx.mlx_array_free(k32);
+        const v32 = hostArray(f32, vals[61 .. 61 + @as(usize, @intCast(2 * k_len * 256))], &.{ 1, 2, k_len, 256 }, .float32);
+        defer _ = mlx.mlx_array_free(v32);
+        var q: A = .{};
+        defer _ = mlx.mlx_array_free(q);
+        var k: A = .{};
+        defer _ = mlx.mlx_array_free(k);
+        var v: A = .{};
+        defer _ = mlx.mlx_array_free(v);
+        try mlx.check(mlx.mlx_astype(&q, q32, .bfloat16, gpu));
+        try mlx.check(mlx.mlx_astype(&k, k32, .bfloat16, gpu));
+        try mlx.check(mlx.mlx_astype(&v, v32, .bfloat16, gpu));
+        for ([_]A{ q, k, v }) |x| try mlx.check(mlx.mlx_array_eval(x));
+        try expectSame(Build.of(""), &.{ q, k, v });
+        try expectSame(Build.of("causal"), &.{ q, k, v });
+    };
+}
+
+test "an attention call MLX answers with its op chain gives MLX's bytes on the engine: masks, GQA, dtypes" {
+    const Build = struct {
+        fn of(comptime mode: [*:0]const u8, comptime with_mask: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn f(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    const mask: A = if (with_mask) in[3] else .{};
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, in[0], in[1], in[2], 0.0625, mode, mask, .{}, false, s));
+                    return o;
+                }
+            }.f;
+        }
+    };
+    const vals = ramp(f32, 8 * 104 * 256, 2, -1);
+    const marks = ramp(f32, 64 * 104, 4, -3);
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 4, 1 }) |gqa| for ([_]c_int{ 9, 64 }) |q_len| for ([_]c_int{ 0, 40 }) |more| {
+        const k_len = q_len + more;
+        const heads = 2 * gqa;
+        const q32 = hostArray(f32, vals[0..@intCast(heads * q_len * 256)], &.{ 1, heads, q_len, 256 }, .float32);
+        defer _ = mlx.mlx_array_free(q32);
+        const k32 = hostArray(f32, vals[1 .. 1 + @as(usize, @intCast(2 * k_len * 256))], &.{ 1, 2, k_len, 256 }, .float32);
+        defer _ = mlx.mlx_array_free(k32);
+        const v32 = hostArray(f32, vals[7 .. 7 + @as(usize, @intCast(2 * k_len * 256))], &.{ 1, 2, k_len, 256 }, .float32);
+        defer _ = mlx.mlx_array_free(v32);
+        const add32 = hostArray(f32, marks[0..@intCast(q_len * k_len)], &.{ q_len, k_len }, .float32);
+        defer _ = mlx.mlx_array_free(add32);
+        var q: A = .{};
+        defer _ = mlx.mlx_array_free(q);
+        var k: A = .{};
+        defer _ = mlx.mlx_array_free(k);
+        var v: A = .{};
+        defer _ = mlx.mlx_array_free(v);
+        var add: A = .{};
+        defer _ = mlx.mlx_array_free(add);
+        var keep: A = .{};
+        defer _ = mlx.mlx_array_free(keep);
+        const cpu = mlx.gpuStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        try mlx.check(mlx.mlx_astype(&q, q32, dt, cpu));
+        try mlx.check(mlx.mlx_astype(&k, k32, dt, cpu));
+        try mlx.check(mlx.mlx_astype(&v, v32, dt, cpu));
+        try mlx.check(mlx.mlx_astype(&add, add32, dt, cpu));
+        const zero = mlx.mlx_array_new_float(0);
+        defer _ = mlx.mlx_array_free(zero);
+        try mlx.check(mlx.mlx_greater_equal(&keep, add32, zero, cpu));
+        for ([_]A{ q, k, v, add, keep }) |x| try mlx.check(mlx.mlx_array_eval(x));
+        try expectSame(Build.of("", false), &.{ q, k, v });
+        try expectSame(Build.of("causal", false), &.{ q, k, v });
+        try expectSame(Build.of("array", true), &.{ q, k, v, add });
+        try expectSame(Build.of("array", true), &.{ q, k, v, keep });
+    };
+}
+
+fn sdpaTally(name: []const u8) u64 {
+    var got: std.ArrayList(mlx.NameCount) = .empty;
+    defer got.deinit(t_std.allocator);
+    mlx.callsByName(&got, t_std.allocator) catch return 0;
+    var sum: u64 = 0;
+    for (got.items) |n| if (std.mem.eql(u8, n.name, name) or (name.len == 0 and std.mem.startsWith(u8, n.name, "sdpa "))) {
+        sum += n.count;
+    };
+    return sum;
+}
+
+test "an attention call MLX runs is tallied under its route, mask, head dimension and query rows; one on the engine is not" {
+    try mlx.requireGpu();
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    const Call = struct { q_len: c_int, k_len: c_int, dim: c_int, mode: [*:0]const u8, name: []const u8 };
+    const calls = [_]Call{
+        .{ .q_len = 1, .k_len = 300, .dim = 64, .mode = "", .name = "sdpa vector none D64 q1 k>q gqa4 bfloat16" },
+        .{ .q_len = 9, .k_len = 9, .dim = 256, .mode = "causal", .name = "sdpa fallback causal D256 q9-1023 k=q gqa4 bfloat16" },
+    };
+    for (calls) |c| {
+        var q: A = .{};
+        defer _ = mlx.mlx_array_free(q);
+        var k: A = .{};
+        defer _ = mlx.mlx_array_free(k);
+        try mlx.check(mlx.mlx_zeros(&q, &[_]c_int{ 1, 8, c.q_len, c.dim }, 4, .bfloat16, gpu));
+        try mlx.check(mlx.mlx_zeros(&k, &[_]c_int{ 1, 2, c.k_len, c.dim }, 4, .bfloat16, gpu));
+        const before = sdpaTally(c.name);
+        for (0..2) |_| {
+            var o: A = .{};
+            defer _ = mlx.mlx_array_free(o);
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, k, 0.125, c.mode, .{}, .{}, false, gpu));
+        }
+        try t_std.expectEqual(before + 2, sdpaTally(c.name));
+    }
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    active = true;
+    defer active = false;
+    const xs = ramp(f32, 2 * 4 * 64, 1, 0);
+    const x = hostArray(f32, &xs, &.{ 1, 2, 4, 64 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const before = sdpaTally("");
+    var o: A = .{};
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, x, x, x, 0.125, "", .{}, .{}, false, core.stream()));
+    try t_std.expectEqual(before, sdpaTally(""));
+}
+
+test "routeOf sends each attention call where MLX sends it: fused kernel, op chain, or MLX's own refusal" {
+    try mlx.requireGpu();
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    const g = try @import("matmul.zig").gpu();
+    var tmp = t_std.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(t_std.io, &dir_buf)];
+    var path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/graph.txt", .{dir}, 0);
+    var msg: [512]u8 = undefined;
+    var checked: usize = 0;
+    for ([_]usize{ 1, 8, 9, 1023, 1024, 2047, 2048 }) |q_len| for ([_]usize{ 0, 512, 1 }) |more| for ([_]usize{ 64, 128, 192, 256 }) |dim|
+        for ([_]attention.MaskKind{ .none, .causal, .array }) |mask| for ([_]usize{ 4, 8 }) |gqa| for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt|
+            for ([_]bool{ false, true }) |ff| {
+                // `more` 1 gives fewer keys than queries.
+                const k_len = if (more == 1) @max(q_len / 2, 1) else q_len + more;
+                const ask: attention.Ask = .{ .q_len = q_len, .k_len = k_len, .heads = 2 * gqa, .kv_heads = 2, .q_dim = dim, .v_dim = dim, .dtype = dt, .mask = mask, .force_fused = ff };
+                var q: A = .{};
+                defer _ = mlx.mlx_array_free(q);
+                var k: A = .{};
+                defer _ = mlx.mlx_array_free(k);
+                var m: A = .{};
+                defer _ = mlx.mlx_array_free(m);
+                try mlx.check(mlx.mlx_zeros(&q, &[_]c_int{ 1, @intCast(2 * gqa), @intCast(q_len), @intCast(dim) }, 4, dt, gpu));
+                try mlx.check(mlx.mlx_zeros(&k, &[_]c_int{ 1, 2, @intCast(k_len), @intCast(dim) }, 4, dt, gpu));
+                if (mask == .array) try mlx.check(mlx.mlx_zeros(&m, &[_]c_int{ @intCast(q_len), @intCast(k_len) }, 2, dt, gpu));
+                const mode: [*:0]const u8 = switch (mask) {
+                    .none => "",
+                    .causal => "causal",
+                    .array => "array",
+                };
+                var o: A = .{};
+                defer _ = mlx.mlx_array_free(o);
+                const rc = mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, k, 0.125, mode, m, .{}, ff, gpu);
+                const want = attention.routeOf(g, ask);
+                if (rc != 0) {
+                    _ = mlx.takeError(&msg);
+                    try t_std.expect(want == .invalid);
+                    checked += 1;
+                    continue;
+                }
+                const f = std.c.fopen(path, "w") orelse return error.TestGraphFile;
+                const outs = mlx.mlx_vector_array_new_value(o);
+                defer _ = mlx.mlx_vector_array_free(outs);
+                const namer = mlx.mlx_node_namer_new();
+                defer _ = mlx.mlx_node_namer_free(namer);
+                try mlx.check(mlx.mlx_print_graph(f, namer, outs));
+                _ = std.c.fclose(f);
+                const said = try tmp.dir.readFileAlloc(t_std.io, "graph.txt", t_std.allocator, .limited(1 << 20));
+                defer t_std.allocator.free(said);
+                const fused = std.mem.indexOf(u8, said, "ScaledDotProductAttention") != null;
+                if (fused != (want == .vector or want == .full)) {
+                    std.debug.print("q {d} k {d} D {d} {s} gqa {d} {s} ff {}: MLX {s}, routeOf {s}\n", .{ q_len, k_len, dim, @tagName(mask), gqa, @tagName(dt), ff, if (fused) "fused" else "op chain", @tagName(want) });
+                    return error.TestRouteDiffers;
+                }
+                checked += 1;
+            };
+    try t_std.expect(checked == 7 * 3 * 4 * 3 * 2 * 2 * 2);
+}
+
+test "a refusal on the engine gives its own reason, never one an earlier call left behind" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    active = true;
+    defer active = false;
+    var msg: [512]u8 = undefined;
+    _ = mlx.takeError(&msg);
+    const ws = ramp(f32, 4 * 64, 1, 0);
+    const w = hostArray(f32, &ws, &.{ 4, 64 }, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    var parts: V = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    try mlx.check(mlx.mlx_quantize(&parts, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, core.stream()));
+    const xs = ramp(f32, 2 * 4 * 64, 1, 0);
+    const x = hostArray(f32, &xs, &.{ 1, 2, 4, 64 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    var o: A = .{};
+    defer _ = mlx.mlx_array_free(o);
+    const ms = ramp(f32, 4 * 4, 1, 0);
+    const m = hostArray(f32, &ms, &.{ 4, 4 }, .float32);
+    defer _ = mlx.mlx_array_free(m);
+    try t_std.expect(mlx.mlx_fast_scaled_dot_product_attention(&o, x, x, x, 0.125, "array", m, .{}, false, core.stream()) != 0);
+    const said = mlx.takeError(&msg) orelse return error.TestNoLatchedError;
+    try t_std.expect(std.mem.indexOf(u8, said, "group size") == null);
+    try t_std.expect(std.mem.indexOf(u8, said, "mask") != null);
+}
+
+test "a custom kernel's bfloat math and simd calls compile on the engine to MLX's bytes" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const source =
+        \\uint i = thread_position_in_grid.x;
+        \\T v = T(x[i]);
+        \\out[i] = metal::abs(v) + metal::precise::exp(v) * T(0.5f) + simd_sum(v) + simd_shuffle_down(v, 1u) + metal::fast::tanh(v);
+    ;
+    const names_in = [_][*:0]const u8{"x"};
+    const names_out = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&names_in, names_in.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&names_out, names_out.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_engine_bfloat_math", iv, ov, source, "", true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const xs = ramp(f32, 64, 0.37, -11);
+    const x = hostArray(f32, &xs, &.{64}, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    var bytes: [2][64 * 2]u8 = undefined;
+    for ([_]S{ gpu, core.stream() }, 0..) |s, which| {
+        active = which == 1;
+        defer active = false;
+        const inputs = mlx.mlx_vector_array_new_data(&[_]A{x}, 1);
+        defer _ = mlx.mlx_vector_array_free(inputs);
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{64}, 1, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 64, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+        var outs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outs);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, k, inputs, cfg, s));
+        var y: A = .{};
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+        try mlx.check(mlx.mlx_array_eval(y));
+        @memcpy(&bytes[which], mlx.mlx_array_data_uint8(y).?[0 .. 64 * 2]);
+    }
+    try t_std.expectEqualSlices(u8, &bytes[0], &bytes[1]);
+}
+
+test "a custom kernel the engine cannot compile fails by the kernel's own name" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const names_in = [_][*:0]const u8{"x"};
+    const names_out = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&names_in, names_in.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&names_out, names_out.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_engine_uncompilable", iv, ov, "out[0] = no_such_function(x[0]);", "", true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const xs = ramp(f32, 4, 1, 0);
+    const x = hostArray(f32, &xs, &.{4}, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    active = true;
+    defer active = false;
+    const inputs = mlx.mlx_vector_array_new_data(&[_]A{x}, 1);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1, 1, 1));
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try t_std.expect(mlx.mlx_fast_metal_kernel_apply(&outs, k, inputs, cfg, core.stream()) != 0);
+    var msg: [512]u8 = undefined;
+    const said = mlx.takeError(&msg) orelse return error.TestNoLatchedError;
+    try t_std.expect(std.mem.indexOf(u8, said, "sushi_engine_uncompilable") != null);
+    try t_std.expect(std.mem.indexOf(u8, said, "MetalCompile") != null);
+}
+
 test "a kernel and a config MLX made while the engine was off launch on the engine once it is on, as a served process needs" {
     try mlx.requireGpu();
     const was = enabled;
@@ -2450,8 +3280,9 @@ test "an op the engine lacks, and a threadgroup past the pipeline's limit, are r
     const b = hostArray(i32, &b_data, &.{2}, .int32);
     defer _ = mlx.mlx_array_free(b);
     var o: A = .{};
-    try t_std.expectError(error.MlxError, mlx.check(mlx.mlx_add(&o, a, b, s)));
-    try t_std.expect(std.mem.indexOf(u8, mlx.takeError(&buf).?, "TensorDtype") != null);
+    // A mean over integers keeps MLX's promotion, which the engine has not ported.
+    try t_std.expectError(error.MlxError, mlx.check(mlx.mlx_mean_axis(&o, b, 0, false, s)));
+    try t_std.expect(std.mem.indexOf(u8, mlx.takeError(&buf).?, "a mean over a dtype that is not float") != null);
 
     const names_in = [_][*:0]const u8{"x"};
     const names_out = [_][*:0]const u8{"out"};
@@ -2682,8 +3513,8 @@ test "an MLX stream inside a forward of the engine is refused by name" {
         try t_std.expect(std.mem.indexOf(u8, said, "mlx_add") != null);
         try t_std.expect(std.mem.indexOf(u8, said, "MLX stream inside a forward of the engine") != null);
         // An op the engine has no kernel for names itself.
-        try t_std.expectError(error.MlxError, mlx.check(mlx.mlx_argpartition_axis(&o, a, 1, -1, core.stream())));
-        try t_std.expect(std.mem.indexOf(u8, mlx.takeError(&buf).?, "mlx_argpartition_axis: the engine has no such op") != null);
+        try t_std.expectError(error.MlxError, mlx.check(mlx.mlx_log2(&o, a, core.stream())));
+        try t_std.expect(std.mem.indexOf(u8, mlx.takeError(&buf).?, "mlx_log2: the engine has no such op") != null);
     }
     try mlx.check(mlx.mlx_add(&o, a, a, gpu));
     _ = mlx.mlx_array_free(o);
@@ -4058,6 +4889,346 @@ test "engine erf gives MLX's bytes: f32 under and over the elements MLX takes tw
     }
 }
 
+test "engine cos, sin, sign and log1p give MLX's bytes: f32 under and over the elements MLX takes two to a thread, bf16, f16, and sign of int32" {
+    try mlx.requireGpu();
+    named_failures = 0;
+    const Build = struct {
+        fn of(comptime f: anytype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(f(&o, in[0], s));
+                    return o;
+                }
+            }.run;
+        }
+    };
+    inline for (.{ .{ "cos", mlx.mlx_cos }, .{ "sin", mlx.mlx_sin }, .{ "sign", mlx.mlx_sign }, .{ "log1p", mlx.mlx_log1p }, .{ "tanh", mlx.mlx_tanh } }) |p| {
+        for ([_]usize{ 1000, 70000 }) |n| {
+            const values = try rampBuf(f32, n, 8, -4);
+            defer std.testing.allocator.free(values);
+            const x = hostArray(f32, values, &.{@intCast(n)}, .float32);
+            defer _ = mlx.mlx_array_free(x);
+            try expectNamed("f32 " ++ p[0], Build.of(p[1]), &.{x});
+            inline for (.{ .{ "bf16", mlx.mlx_dtype.bfloat16 }, .{ "f16", mlx.mlx_dtype.float16 } }) |d| {
+                const y = try castByMlx(x, d[1]);
+                defer _ = mlx.mlx_array_free(y);
+                try expectNamed(d[0] ++ " " ++ p[0], Build.of(p[1]), &.{y});
+            }
+        }
+    }
+    const ints = [_]i32{ -7, 0, 3, -1, 1, 2147483647, -2147483648, 0 };
+    const xi = hostArray(i32, &ints, &.{ints.len}, .int32);
+    defer _ = mlx.mlx_array_free(xi);
+    try expectNamed("i32 sign", Build.of(mlx.mlx_sign), &.{xi});
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+}
+
+test "engine logsumexp, tile, split, full, ones, max, all, isfinite and array_equal give MLX's bytes" {
+    try mlx.requireGpu();
+    named_failures = 0;
+    const B = struct {
+        fn lse(comptime keep: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_logsumexp_axis(&o, in[0], -1, keep, s));
+                    return o;
+                }
+            }.run;
+        }
+        fn tile(comptime reps: []const c_int) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_tile(&o, in[0], reps.ptr, reps.len, s));
+                    return o;
+                }
+            }.run;
+        }
+        fn split(comptime parts: c_int, comptime axis: c_int, comptime which: usize) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var v = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(v);
+                    try mlx.check(mlx.mlx_split(&v, in[0], parts, axis, s));
+                    if (mlx.mlx_vector_array_size(v) != parts) return error.SplitCount;
+                    var o = mlx.mlx_array_new();
+                    errdefer _ = mlx.mlx_array_free(o);
+                    try mlx.check(mlx.mlx_vector_array_get(&o, v, which));
+                    return o;
+                }
+            }.run;
+        }
+        fn full(comptime dims: []const c_int, comptime dtype: mlx.mlx_dtype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_full(&o, dims.ptr, dims.len, in[0], dtype, s));
+                    return o;
+                }
+            }.run;
+        }
+        fn ones(comptime dims: []const c_int, comptime dtype: mlx.mlx_dtype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, _: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_ones(&o, dims.ptr, dims.len, dtype, s));
+                    return o;
+                }
+            }.run;
+        }
+        fn whole(comptime f: anytype, comptime keep: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(f(&o, in[0], keep, s));
+                    return o;
+                }
+            }.run;
+        }
+        fn finite(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_isfinite(&o, in[0], s));
+            return o;
+        }
+        fn eq(comptime nan: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_array_equal(&o, in[0], in[1], nan, s));
+                    return o;
+                }
+            }.run;
+        }
+    };
+    // logsumexp over the last axis: the block kernel (900) and the looped one (past 4096), f32 and bf16.
+    for ([_]c_int{ 900, 6000 }) |width| {
+        const n: usize = @intCast(3 * width);
+        const values = try rampBuf(f32, n, 30, -15);
+        defer std.testing.allocator.free(values);
+        const x = hostArray(f32, values, &.{ 3, width }, .float32);
+        defer _ = mlx.mlx_array_free(x);
+        const x16 = try castByMlx(x, .bfloat16);
+        defer _ = mlx.mlx_array_free(x16);
+        try expectNamed("f32 logsumexp keepdims", B.lse(true), &.{x});
+        try expectNamed("f32 logsumexp", B.lse(false), &.{x});
+        try expectNamed("bf16 logsumexp", B.lse(true), &.{x16});
+    }
+    const vals = ramp(f32, 6 * 8, 8, -4);
+    const x = hostArray(f32, &vals, &.{ 6, 8 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const x16 = try castByMlx(x, .bfloat16);
+    defer _ = mlx.mlx_array_free(x16);
+    try expectNamed("tile 2x1x3", B.tile(&.{ 2, 1, 3 }), &.{x});
+    try expectNamed("tile 4", B.tile(&.{4}), &.{x});
+    try expectNamed("bf16 tile 3x2", B.tile(&.{ 3, 2 }), &.{x16});
+    inline for (0..2) |i| try expectNamed("split 2 on axis 1", B.split(2, 1, i), &.{x});
+    inline for (0..3) |i| try expectNamed("split 3 on axis 0", B.split(3, 0, i), &.{x});
+    inline for (0..4) |i| try expectNamed("bf16 split 4 on axis -1", B.split(4, -1, i), &.{x16});
+    const one = hostArray(f32, &[_]f32{2.5}, &.{}, .float32);
+    defer _ = mlx.mlx_array_free(one);
+    const row = hostArray(f32, vals[0..8], &.{8}, .float32);
+    defer _ = mlx.mlx_array_free(row);
+    try expectNamed("full scalar to bf16", B.full(&.{ 4, 7 }, .bfloat16), &.{one});
+    try expectNamed("full row", B.full(&.{ 3, 8 }, .float32), &.{row});
+    try expectNamed("full scalar to int32", B.full(&.{5}, .int32), &.{one});
+    try expectNamed("ones f32", B.ones(&.{ 3, 4 }, .float32), &.{});
+    try expectNamed("ones bf16", B.ones(&.{ 2, 3, 5 }, .bfloat16), &.{});
+    try expectNamed("ones int32", B.ones(&.{7}, .int32), &.{});
+    const edge = edgeF32(301, 0x77);
+    const xe = hostArray(f32, &edge, &.{ 7, 43 }, .float32);
+    defer _ = mlx.mlx_array_free(xe);
+    const fin = ramp(f32, 7 * 43, 100, -50);
+    const xf = hostArray(f32, &fin, &.{ 7, 43 }, .float32);
+    defer _ = mlx.mlx_array_free(xf);
+    try expectNamed("max", B.whole(mlx.mlx_max, false), &.{xf});
+    try expectNamed("max keepdims", B.whole(mlx.mlx_max, true), &.{xf});
+    try expectNamed("max over specials", B.whole(mlx.mlx_max, false), &.{xe});
+    try expectNamed("isfinite f32", B.finite, &.{xe});
+    const xe16 = try castByMlx(xe, .bfloat16);
+    defer _ = mlx.mlx_array_free(xe16);
+    try expectNamed("isfinite bf16", B.finite, &.{xe16});
+    const ints = hostArray(i32, &[_]i32{ 1, -2, 3 }, &.{3}, .int32);
+    defer _ = mlx.mlx_array_free(ints);
+    try expectNamed("isfinite int32", B.finite, &.{ints});
+    const yes = hostArray(bool, &[_]bool{ true, true, true, true }, &.{ 2, 2 }, .bool_);
+    defer _ = mlx.mlx_array_free(yes);
+    const no = hostArray(bool, &[_]bool{ true, true, false, true }, &.{ 2, 2 }, .bool_);
+    defer _ = mlx.mlx_array_free(no);
+    try expectNamed("all true", B.whole(mlx.mlx_all, false), &.{yes});
+    try expectNamed("all with a false", B.whole(mlx.mlx_all, false), &.{no});
+    try expectNamed("all keepdims", B.whole(mlx.mlx_all, true), &.{no});
+    var other = vals;
+    other[13] += 1;
+    const xo = hostArray(f32, &other, &.{ 6, 8 }, .float32);
+    defer _ = mlx.mlx_array_free(xo);
+    try expectNamed("array_equal same", B.eq(false), &.{ x, x });
+    try expectNamed("array_equal one differs", B.eq(false), &.{ x, xo });
+    try expectNamed("array_equal shapes differ", B.eq(false), &.{ x, row });
+    try expectNamed("array_equal NaN, equal_nan off", B.eq(false), &.{ xe, xe });
+    try expectNamed("array_equal NaN, equal_nan on", B.eq(true), &.{ xe, xe });
+    try expectNamed("array_equal f32 against bf16", B.eq(false), &.{ x, x16 });
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+}
+
+test "engine depthwise conv1d gives MLX's bytes: prefill and decode widths, dilated as the PLE conv, f32 and bf16, a turned input; any other conv1d is refused by name" {
+    try mlx.requireGpu();
+    named_failures = 0;
+    const B = struct {
+        fn conv(comptime dilation: c_int) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    const groups: c_int = mlx.getShape(in[0])[2];
+                    try mlx.check(mlx.mlx_conv1d(&o, in[0], in[1], 1, 0, dilation, groups, s));
+                    return o;
+                }
+            }.run;
+        }
+        fn turned(s: S, in: []const A) !A {
+            var t: A = .{};
+            defer _ = mlx.mlx_array_free(t);
+            try mlx.check(mlx.mlx_transpose_axes(&t, in[0], &[_]c_int{ 0, 2, 1 }, 3, s));
+            var o: A = .{};
+            const groups: c_int = mlx.getShape(t)[2];
+            try mlx.check(mlx.mlx_conv1d(&o, t, in[1], 1, 0, 1, groups, s));
+            return o;
+        }
+    };
+    const C = 192;
+    const K = 4;
+    const wv = ramp(f32, C * K, 2, -1);
+    const w = hostArray(f32, &wv, &.{ C, K, 1 }, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    const w16 = try castByMlx(w, .bfloat16);
+    defer _ = mlx.mlx_array_free(w16);
+    inline for (.{ 3 + K, K, 2048 + K - 1 }) |T| {
+        const xv = try rampBuf(f32, 2 * T * C, 8, -4);
+        defer std.testing.allocator.free(xv);
+        const x = hostArray(f32, xv, &.{ 2, T, C }, .float32);
+        defer _ = mlx.mlx_array_free(x);
+        try expectNamed("f32 depthwise conv1d", B.conv(1), &.{ x, w });
+        const x16 = try castByMlx(x, .bfloat16);
+        defer _ = mlx.mlx_array_free(x16);
+        try expectNamed("bf16 depthwise conv1d", B.conv(1), &.{ x16, w16 });
+    }
+    const xt_v = try rampBuf(f32, 2 * C * 9, 8, -4);
+    defer std.testing.allocator.free(xt_v);
+    const xt = hostArray(f32, xt_v, &.{ 2, C, 9 }, .float32);
+    defer _ = mlx.mlx_array_free(xt);
+    try expectNamed("depthwise conv1d of a turned input", B.turned, &.{ xt, w });
+    // The PLE conv: dilation the n-gram size (3), its state of (K - 1) * 3 rows before the new ones.
+    inline for (.{ 9 + 1, 9 + 6, 9 + 300 }) |T| {
+        const xv = try rampBuf(f32, T * C, 8, -4);
+        defer std.testing.allocator.free(xv);
+        const xd = hostArray(f32, xv, &.{ 1, T, C }, .float32);
+        defer _ = mlx.mlx_array_free(xd);
+        try expectNamed("f32 dilated depthwise conv1d", B.conv(3), &.{ xd, w });
+        const xd16 = try castByMlx(xd, .bfloat16);
+        defer _ = mlx.mlx_array_free(xd16);
+        try expectNamed("bf16 dilated depthwise conv1d", B.conv(3), &.{ xd16, w16 });
+    }
+    const x2v = try rampBuf(f32, 2 * 40 * C, 8, -4);
+    defer std.testing.allocator.free(x2v);
+    const x2 = hostArray(f32, x2v, &.{ 2, 40, C }, .float32);
+    defer _ = mlx.mlx_array_free(x2);
+    try expectNamed("dilation 2, two rows", B.conv(2), &.{ x2, w });
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+
+    // A strided conv is neither kernel's: the engine refuses it by name.
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const xv = try rampBuf(f32, 2 * 16 * C, 8, -4);
+    defer std.testing.allocator.free(xv);
+    const x = hostArray(f32, xv, &.{ 2, 16, C }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    var o: A = .{};
+    defer if (o.ctx != null) {
+        _ = mlx.mlx_array_free(o);
+    };
+    try t_std.expect(mlx.mlx_conv1d(&o, x, w, 2, 0, 1, C, core.stream()) != 0);
+    var said: [256]u8 = undefined;
+    const why = mlx.takeError(&said) orelse "";
+    try t_std.expect(std.mem.indexOf(u8, why, "conv1d") != null);
+}
+
+test "engine rope gives MLX's bytes: partial and whole, a prefill and a decode step, base and freqs, a turned input, per-row offsets, f32 and bf16" {
+    try mlx.requireGpu();
+    named_failures = 0;
+    const B = struct {
+        fn rope(comptime dims: c_int, comptime offset: c_int, comptime with_freqs: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    const base = if (with_freqs) mlx.mlx_optional_float.none() else mlx.mlx_optional_float{ .value = 1.0e7, .has_value = true };
+                    const freqs = if (with_freqs) in[1] else A{};
+                    try mlx.check(mlx.mlx_fast_rope(&o, in[0], dims, false, base, 1.0, offset, freqs, s));
+                    return o;
+                }
+            }.run;
+        }
+        fn turned(comptime dims: c_int) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var t: A = .{};
+                    defer _ = mlx.mlx_array_free(t);
+                    try mlx.check(mlx.mlx_transpose_axes(&t, in[0], &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_fast_rope(&o, t, dims, false, .{ .value = 1.0e7, .has_value = true }, 1.0, 11, .{}, s));
+                    return o;
+                }
+            }.run;
+        }
+        fn rows(comptime dims: c_int) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_fast_rope_dynamic(&o, in[0], dims, false, .{ .value = 1.0e7, .has_value = true }, 1.0, in[1], .{}, s));
+                    return o;
+                }
+            }.run;
+        }
+    };
+    const pre_v = ramp(f32, 2 * 4 * 7 * 128, 4, -2);
+    const pre = hostArray(f32, &pre_v, &.{ 2, 4, 7, 128 }, .float32);
+    defer _ = mlx.mlx_array_free(pre);
+    const pre16 = try castByMlx(pre, .bfloat16);
+    defer _ = mlx.mlx_array_free(pre16);
+    const dec_v = ramp(f32, 3 * 4 * 1 * 64, 4, -2);
+    const dec = hostArray(f32, &dec_v, &.{ 3, 4, 1, 64 }, .float32);
+    defer _ = mlx.mlx_array_free(dec);
+    const dec16 = try castByMlx(dec, .bfloat16);
+    defer _ = mlx.mlx_array_free(dec16);
+    try expectNamed("prefill partial (32 of 128)", B.rope(32, 5, false), &.{pre});
+    try expectNamed("prefill whole", B.rope(128, 5, false), &.{pre});
+    try expectNamed("bf16 prefill partial", B.rope(32, 2041, false), &.{pre16});
+    try expectNamed("decode step whole", B.rope(64, 300, false), &.{dec});
+    try expectNamed("decode step partial", B.rope(16, 300, false), &.{dec});
+    try expectNamed("bf16 decode step", B.rope(64, 300, false), &.{dec16});
+    var fv: [16]f32 = undefined;
+    for (&fv, 0..) |*f, i| f.* = std.math.pow(f32, 1.0e7, -@as(f32, @floatFromInt(i)) / 16.0) * 0.75;
+    const freqs = hostArray(f32, &fv, &.{16}, .float32);
+    defer _ = mlx.mlx_array_free(freqs);
+    try expectNamed("prefill with freqs", B.rope(32, 9, true), &.{ pre, freqs });
+    try expectNamed("decode step with freqs", B.rope(32, 9, true), &.{ dec, freqs });
+    const seq_v = ramp(f32, 2 * 7 * 4 * 128, 4, -2);
+    const seq = hostArray(f32, &seq_v, &.{ 2, 7, 4, 128 }, .float32);
+    defer _ = mlx.mlx_array_free(seq);
+    try expectNamed("turned heads and sequence, whole", B.turned(128), &.{seq});
+    try expectNamed("turned heads and sequence, partial", B.turned(32), &.{seq});
+    const offs = hostArray(i32, &[_]i32{ 4, 900, 17 }, &.{3}, .int32);
+    defer _ = mlx.mlx_array_free(offs);
+    try expectNamed("per-row offsets, decode", B.rows(64), &.{ dec, offs });
+    try expectNamed("per-row offsets, partial", B.rows(32), &.{ dec, offs });
+    const pre3_v = ramp(f32, 3 * 4 * 5 * 64, 4, -2);
+    const pre3 = hostArray(f32, &pre3_v, &.{ 3, 4, 5, 64 }, .float32);
+    defer _ = mlx.mlx_array_free(pre3);
+    try expectNamed("per-row offsets, verify rows", B.rows(64), &.{ pre3, offs });
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+}
+
 test "engine f32 matmul on the SIMD tiles: the first use of a tile before the seal makes every alignment of it, so no length compiles inside a request" {
     try mlx.requireGpu();
     const was = enabled;
@@ -4119,6 +5290,38 @@ test "engine quantized matmul gives MLX's bytes at the tower's shapes: the GPU's
         defer _ = mlx.mlx_array_free(biases);
         try expectSameLayout(Build.product, &.{ x, w, scales, biases });
     }
+}
+
+fn affineProduct(comptime group: c_int, comptime bits: c_int) type {
+    return struct {
+        fn product(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_quantized_matmul(&o, in[0], in[1], in[2], in[3], true, mlx.mlx_optional_int.some(group), mlx.mlx_optional_int.some(bits), "affine", s));
+            return o;
+        }
+    };
+}
+
+test "engine quantized matmul in affine bits 3, 5 and 6 gives MLX's bytes: the MTP rerank's coarse head and every plan MLX picks" {
+    try mlx.requireGpu();
+    // {rows, inner, outputs}: the coarse head (one row and a verify's eight against the vocab at hidden 2560), the
+    // quad plan's inner widths, the wide plan, split-K and the tiles, aligned and not.
+    const cases = [_][3]usize{ .{ 1, 2560, 248320 }, .{ 8, 2560, 8192 }, .{ 1, 128, 64 }, .{ 4, 64, 256 }, .{ 6, 1024, 3072 }, .{ 13, 5120, 1280 }, .{ 100, 1024, 1000 }, .{ 300, 2048, 1024 } };
+    inline for (.{ 3, 5, 6 }) |bits| for (cases) |c| {
+        const m, const k, const n = c;
+        errdefer std.debug.print("affine bits {d}: {d} x {d} against {d}\n", .{ bits, m, k, n });
+        const x = try bf16Array(m * k, &.{ @intCast(m), @intCast(k) }, 4, -2);
+        defer _ = mlx.mlx_array_free(x);
+        const codes = try rampBuf(u32, n * k * bits / 32, 4.0e9, 0);
+        defer std.testing.allocator.free(codes);
+        const w = hostArray(u32, codes, &.{ @intCast(n), @intCast(k * bits / 32) }, .uint32);
+        defer _ = mlx.mlx_array_free(w);
+        const scales = try bf16Array(n * k / 64, &.{ @intCast(n), @intCast(k / 64) }, 0.02, 0.001);
+        defer _ = mlx.mlx_array_free(scales);
+        const biases = try bf16Array(n * k / 64, &.{ @intCast(n), @intCast(k / 64) }, 2, -1);
+        defer _ = mlx.mlx_array_free(biases);
+        try expectSameLayout(affineProduct(64, bits).product, &.{ x, w, scales, biases });
+    };
 }
 
 /// An mx weight of `batch` matrices `[n, k]`: codes with no NaN byte (e4m3 0x7f, 0xff) and e8m0 scales near 2^0.
@@ -4420,6 +5623,65 @@ test "engine attention gives MLX's bytes and strides at the tower's query chunks
     try expectSameLayout(Build.chunk(512, 1024), &.{short});
 }
 
+test "engine any over axes and argpartition give MLX's bytes: one axis or both, kept or not; kth along the last axis" {
+    const Build = struct {
+        fn any(comptime axes: []const c_int, comptime keep: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn f(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_any_axes(&o, in[0], axes.ptr, axes.len, keep, s));
+                    return o;
+                }
+            }.f;
+        }
+        fn part(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_argpartition_axis(&o, in[0], 4, -1, s));
+            return o;
+        }
+    };
+    var bs: [35]bool = undefined;
+    for (&bs, 0..) |*v, i| v.* = (i * 7919) % 11 == 0;
+    const b = hostArray(bool, &bs, &.{ 5, 7 }, .bool_);
+    defer _ = mlx.mlx_array_free(b);
+    try expectSame(Build.any(&.{0}, false), &.{b});
+    try expectSame(Build.any(&.{1}, true), &.{b});
+    try expectSame(Build.any(&.{ 0, 1 }, false), &.{b});
+    const xs = ramp(f32, 30, 8, -4);
+    const x = hostArray(f32, &xs, &.{ 3, 10 }, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    try expectSame(Build.part, &.{x});
+}
+
+test "engine logical and and or give MLX's bytes on bool operands, broadcast, and on float operands MLX casts to bool" {
+    const Build = struct {
+        fn of(comptime f: anytype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn g(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(f(&o, in[0], in[1], s));
+                    return o;
+                }
+            }.g;
+        }
+    };
+    var xs: [24]bool = undefined;
+    for (&xs, 0..) |*v, i| v.* = i % 3 == 0;
+    var ys: [8]bool = undefined;
+    for (&ys, 0..) |*v, i| v.* = i % 2 == 1;
+    const x = hostArray(bool, &xs, &.{ 3, 8 }, .bool_);
+    defer _ = mlx.mlx_array_free(x);
+    const y = hostArray(bool, &ys, &.{8}, .bool_);
+    defer _ = mlx.mlx_array_free(y);
+    try expectSame(Build.of(mlx.mlx_logical_and), &.{ x, y });
+    try expectSame(Build.of(mlx.mlx_logical_or), &.{ x, y });
+    const fs = ramp(f32, 8, 2, -1);
+    const f = hostArray(f32, &fs, &.{8}, .float32);
+    defer _ = mlx.mlx_array_free(f);
+    try expectSame(Build.of(mlx.mlx_logical_or), &.{ x, f });
+    try expectSame(Build.of(mlx.mlx_logical_and), &.{ f, f });
+}
+
 test "engine abs, logaddexp and floor divide give MLX's bytes: signed zeros and infinities, the router's softplus, unsigned quotients" {
     try mlx.requireGpu();
     const Build = struct {
@@ -4476,6 +5738,19 @@ test "engine abs, logaddexp and floor divide give MLX's bytes: signed zeros and 
     defer _ = mlx.mlx_array_free(d);
     try expectSame(Build.binary(mlx.mlx_floor_divide), &.{ n, d });
     try expectSame(Build.binary(mlx.mlx_floor_divide), &.{ x, y });
+    // Signed: every sign pair, exact and inexact quotients, and a scalar divisor broadcast (QSA's block of a token).
+    var signed_n: [48]i32 = undefined;
+    for (&signed_n, 0..) |*v, i| v.* = @as(i32, @intCast(i * 7919 % 1000)) - 500;
+    var signed_d: [48]i32 = undefined;
+    for (&signed_d, 0..) |*v, i| v.* = (if (i % 2 == 0) @as(i32, 1) else -1) * @as(i32, @intCast(1 + i % 7));
+    const sn = hostArray(i32, &signed_n, &.{ 6, 8 }, .int32);
+    defer _ = mlx.mlx_array_free(sn);
+    const sd = hostArray(i32, &signed_d, &.{ 6, 8 }, .int32);
+    defer _ = mlx.mlx_array_free(sd);
+    try expectSame(Build.binary(mlx.mlx_floor_divide), &.{ sn, sd });
+    const ratio = mlx.mlx_array_new_int(4);
+    defer _ = mlx.mlx_array_free(ratio);
+    try expectSame(Build.binary(mlx.mlx_floor_divide), &.{ sn, ratio });
 }
 
 test "engine copy shares its input, a view included, and gives MLX's bytes" {
@@ -4731,12 +6006,12 @@ test "engine elementwise ops, casts, reductions, sorts and scans give MLX's byte
             return o;
         }
     };
-    inline for (.{ .{ "exp", mlx.mlx_exp }, .{ "log", mlx.mlx_log }, .{ "abs", mlx.mlx_abs }, .{ "sigmoid", mlx.mlx_sigmoid }, .{ "sqrt", mlx.mlx_sqrt }, .{ "rsqrt", mlx.mlx_rsqrt }, .{ "square", mlx.mlx_square }, .{ "floor", mlx.mlx_floor }, .{ "negative", mlx.mlx_negative }, .{ "erf", mlx.mlx_erf } }) |p| {
+    inline for (.{ .{ "exp", mlx.mlx_exp }, .{ "log", mlx.mlx_log }, .{ "abs", mlx.mlx_abs }, .{ "sigmoid", mlx.mlx_sigmoid }, .{ "sqrt", mlx.mlx_sqrt }, .{ "rsqrt", mlx.mlx_rsqrt }, .{ "square", mlx.mlx_square }, .{ "floor", mlx.mlx_floor }, .{ "negative", mlx.mlx_negative }, .{ "erf", mlx.mlx_erf }, .{ "cos", mlx.mlx_cos }, .{ "sin", mlx.mlx_sin }, .{ "sign", mlx.mlx_sign }, .{ "log1p", mlx.mlx_log1p }, .{ "tanh", mlx.mlx_tanh } }) |p| {
         try expectNamed("f32 " ++ p[0], build1(p[1]), &.{x});
         try expectNamed("bf16 " ++ p[0], build1(p[1]), &.{x16});
         try expectNamed("f16 " ++ p[0], build1(p[1]), &.{xh});
     }
-    inline for (.{ .{ "add", mlx.mlx_add }, .{ "subtract", mlx.mlx_subtract }, .{ "multiply", mlx.mlx_multiply }, .{ "divide", mlx.mlx_divide }, .{ "maximum", mlx.mlx_maximum }, .{ "minimum", mlx.mlx_minimum }, .{ "less", mlx.mlx_less }, .{ "less_equal", mlx.mlx_less_equal }, .{ "greater", mlx.mlx_greater }, .{ "greater_equal", mlx.mlx_greater_equal }, .{ "equal", mlx.mlx_equal }, .{ "logaddexp", mlx.mlx_logaddexp }, .{ "floor_divide", mlx.mlx_floor_divide } }) |p| {
+    inline for (.{ .{ "power", mlx.mlx_power }, .{ "add", mlx.mlx_add }, .{ "subtract", mlx.mlx_subtract }, .{ "multiply", mlx.mlx_multiply }, .{ "divide", mlx.mlx_divide }, .{ "maximum", mlx.mlx_maximum }, .{ "minimum", mlx.mlx_minimum }, .{ "less", mlx.mlx_less }, .{ "less_equal", mlx.mlx_less_equal }, .{ "greater", mlx.mlx_greater }, .{ "greater_equal", mlx.mlx_greater_equal }, .{ "equal", mlx.mlx_equal }, .{ "logaddexp", mlx.mlx_logaddexp }, .{ "floor_divide", mlx.mlx_floor_divide } }) |p| {
         try expectNamed("f32 " ++ p[0], B.b2(p[1]), &.{ x, y });
     }
     try expectNamed("where", B.where, &.{ x, y });
@@ -4765,6 +6040,97 @@ test "engine elementwise ops, casts, reductions, sorts and scans give MLX's byte
     try expectNamed("finite sort", B.sortv, &.{xf});
     try expectNamed("finite argsort", B.argsortv, &.{xf});
     try expectNamed("finite cumsum", B.cumsum, &.{xf});
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+}
+
+test "engine binary ops, a concatenate and a where of two dtypes take MLX's promoted dtype and its bytes" {
+    try mlx.requireGpu();
+    named_failures = 0;
+    const vals = ramp(f32, 257, 12, -6);
+    const x = hostArray(f32, &vals, &.{257}, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const ys = ramp(f32, 257, 10, -3);
+    const y = hostArray(f32, &ys, &.{257}, .float32);
+    defer _ = mlx.mlx_array_free(y);
+    const dtypes = [_]mlx.mlx_dtype{ .bool_, .uint8, .uint16, .uint32, .int8, .int16, .int32, .int64, .float16, .bfloat16, .float32 };
+    var xs: [dtypes.len]A = undefined;
+    var yv: [dtypes.len]A = undefined;
+    for (dtypes, 0..) |d, i| {
+        xs[i] = try castByMlx(x, d);
+        yv[i] = try castByMlx(y, d);
+    }
+    defer for (xs ++ yv) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const B = struct {
+        fn b2(comptime f: anytype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var o: A = .{};
+                    try mlx.check(f(&o, in[0], in[1], s));
+                    return o;
+                }
+            }.build;
+        }
+        fn wh(s: S, in: []const A) anyerror!A {
+            var cond: A = .{};
+            defer _ = mlx.mlx_array_free(cond);
+            try mlx.check(mlx.mlx_greater(&cond, in[0], in[1], s));
+            var o: A = .{};
+            try mlx.check(mlx.mlx_where(&o, cond, in[0], in[1], s));
+            return o;
+        }
+        fn whValue(s: S, in: []const A) anyerror!A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_where(&o, in[0], in[0], in[1], s));
+            return o;
+        }
+        fn cat(s: S, in: []const A) anyerror!A {
+            const v = mlx.mlx_vector_array_new_data(in.ptr, in.len);
+            defer _ = mlx.mlx_vector_array_free(v);
+            var o: A = .{};
+            try mlx.check(mlx.mlx_concatenate_axis(&o, v, 0, s));
+            return o;
+        }
+    };
+    for (dtypes, 0..) |da, i| for (dtypes, 0..) |db, j| {
+        if (i == j) continue;
+        var name: [64]u8 = undefined;
+        try expectNamed(std.fmt.bufPrint(&name, "{s} concatenate {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.cat, &.{ xs[i], yv[j] });
+        try expectNamed(std.fmt.bufPrint(&name, "{s} where {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.wh, &.{ xs[i], yv[j] });
+        try expectNamed(std.fmt.bufPrint(&name, "where by {s} value {s}", .{ @tagName(da), @tagName(db) }) catch "pair", B.whValue, &.{ xs[i], yv[j] });
+        inline for (.{ .{ "add", mlx.mlx_add }, .{ "subtract", mlx.mlx_subtract }, .{ "multiply", mlx.mlx_multiply }, .{ "divide", mlx.mlx_divide }, .{ "maximum", mlx.mlx_maximum }, .{ "minimum", mlx.mlx_minimum }, .{ "less", mlx.mlx_less }, .{ "less_equal", mlx.mlx_less_equal }, .{ "greater", mlx.mlx_greater }, .{ "greater_equal", mlx.mlx_greater_equal }, .{ "equal", mlx.mlx_equal }, .{ "logaddexp", mlx.mlx_logaddexp }, .{ "floor_divide", mlx.mlx_floor_divide }, .{ "logical_and", mlx.mlx_logical_and }, .{ "logical_or", mlx.mlx_logical_or } }) |p| {
+            // An integer division by zero has no defined value: those pairs are not compared.
+            const ints = ops.promoteTypes(da, db) != .float32 and ops.promoteTypes(da, db) != .float16 and ops.promoteTypes(da, db) != .bfloat16;
+            const divides = comptime std.mem.eql(u8, p[0], "floor_divide");
+            if (!(divides and ints)) try expectNamed(std.fmt.bufPrint(&name, "{s} {s} {s}", .{ @tagName(da), p[0], @tagName(db) }) catch "pair", B.b2(p[1]), &.{ xs[i], yv[j] });
+        }
+    };
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+}
+
+test "engine take reads indices of every integer dtype, as MLX does" {
+    try mlx.requireGpu();
+    named_failures = 0;
+    const vals = ramp(f32, 9 * 13, 4, -2);
+    const table = hostArray(f32, &vals, &.{ 9, 13 }, .float32);
+    defer _ = mlx.mlx_array_free(table);
+    const picks = [_]i32{ 0, 8, 3, 3, 7, 1 };
+    const idx = hostArray(i32, &picks, &.{6}, .int32);
+    defer _ = mlx.mlx_array_free(idx);
+    const B = struct {
+        fn take(s: S, in: []const A) anyerror!A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_take_axis(&o, in[0], in[1], 0, s));
+            return o;
+        }
+    };
+    for ([_]mlx.mlx_dtype{ .uint8, .uint16, .uint32, .uint64, .int8, .int16, .int32, .int64 }) |d| {
+        const cast = try castByMlx(idx, d);
+        defer _ = mlx.mlx_array_free(cast);
+        var name: [48]u8 = undefined;
+        try expectNamed(std.fmt.bufPrint(&name, "take by {s}", .{@tagName(d)}) catch "take", B.take, &.{ table, cast });
+    }
     try t_std.expectEqual(@as(usize, 0), named_failures);
 }
 
@@ -5127,8 +6493,8 @@ test "engine reductions, softmax, RMS norm, sort and scans give MLX's bytes over
                 try expectSameAs(tag, Build.over(mlx.mlx_sum_axis, -1, false), &.{x});
                 try expectSameAs(tag, Build.over(mlx.mlx_max_axis, -1, true), &.{x});
                 try expectSameAs(tag, Build.over(mlx.mlx_argmax_axis, -1, false), &.{x});
-                // the engine refuses a half-precision mean by name
-                if (dt == .float32) try expectSameAs(tag, Build.over(mlx.mlx_mean_axis, -1, false), &.{x});
+                try expectSameAs(tag, Build.over(mlx.mlx_mean_axis, -1, false), &.{x});
+                try expectSameAs(tag, Build.over(mlx.mlx_mean_axis, 0, true), &.{x});
                 try expectSameAs(tag, Build.over(mlx.mlx_sum_axis, 0, false), &.{x});
                 try expectSameAs(tag, Build.over(mlx.mlx_max_axis, 0, false), &.{x});
                 try expectSameAs(tag, Build.over(mlx.mlx_argmax_axis, 0, false), &.{x});
@@ -5526,4 +6892,297 @@ test "engine: a Cooler model's turn after another's runs under its own cap, neve
         const z = try TurnFixture.made(n);
         _ = mlx.mlx_array_free(z);
     }
+}
+
+/// MLX's answer for `build` over `inputs`, from the engine too: where MLX refuses, the engine refuses; where MLX
+/// answers, the engine gives its dtype, shape and bytes.
+fn expectAsMlx(comptime build: anytype, inputs: []const A) !void {
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    var said: [256]u8 = undefined;
+    if (build(gpu, inputs)) |o| {
+        _ = mlx.mlx_array_free(o);
+    } else |_| {
+        _ = mlx.takeError(&said);
+        const was = enabled;
+        enabled = true;
+        defer enabled = was;
+        if (build(core.stream(), inputs)) |o| {
+            _ = mlx.mlx_array_free(o);
+            return error.EngineAnswersWhatMlxRefuses;
+        } else |_| {
+            _ = mlx.takeError(&said);
+            return;
+        }
+    }
+    return expectSame(build, inputs);
+}
+
+test "engine entries apply MLX's dtype rules: every unary op, sum, cumsum, slice_update and the affine product over every dtype" {
+    try mlx.requireGpu();
+    named_failures = 0;
+    const B = struct {
+        fn one(comptime f: anytype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(f(&o, in[0], s));
+                    return o;
+                }
+            }.run;
+        }
+        fn sum(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_sum_axis(&o, in[0], -1, false, s));
+            return o;
+        }
+        fn cumsum(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_cumsum(&o, in[0], -1, false, true, s));
+            return o;
+        }
+        fn update(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_slice_update(&o, in[0], in[1], &[_]c_int{ 0, 2 }, 2, &[_]c_int{ 2, 4 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            return o;
+        }
+        fn pow(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_power(&o, in[0], in[1], s));
+            return o;
+        }
+        fn qmm(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_quantized_matmul(&o, in[0], in[1], in[2], in[3], true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+            return o;
+        }
+    };
+    // Small non-negative values every dtype holds; int8 sums of 300 of them overflow int8.
+    const n = 300;
+    const base = try rampBuf(f32, n, 6, 0);
+    defer std.testing.allocator.free(base);
+    const x32 = hostArray(f32, base, &.{ 3, 100 }, .float32);
+    defer _ = mlx.mlx_array_free(x32);
+    const dtypes = .{ .{ "f32", mlx.mlx_dtype.float32 }, .{ "bf16", mlx.mlx_dtype.bfloat16 }, .{ "f16", mlx.mlx_dtype.float16 }, .{ "i32", mlx.mlx_dtype.int32 }, .{ "u32", mlx.mlx_dtype.uint32 }, .{ "i8", mlx.mlx_dtype.int8 }, .{ "u8", mlx.mlx_dtype.uint8 }, .{ "bool", mlx.mlx_dtype.bool_ } };
+    inline for (dtypes) |d| {
+        const x = if (d[1] == .float32) x32 else try castByMlx(x32, d[1]);
+        defer if (d[1] != .float32) {
+            _ = mlx.mlx_array_free(x);
+        };
+        inline for (.{ .{ "exp", mlx.mlx_exp }, .{ "log", mlx.mlx_log }, .{ "abs", mlx.mlx_abs }, .{ "sigmoid", mlx.mlx_sigmoid }, .{ "sqrt", mlx.mlx_sqrt }, .{ "rsqrt", mlx.mlx_rsqrt }, .{ "square", mlx.mlx_square }, .{ "floor", mlx.mlx_floor }, .{ "negative", mlx.mlx_negative }, .{ "erf", mlx.mlx_erf }, .{ "cos", mlx.mlx_cos }, .{ "sin", mlx.mlx_sin }, .{ "sign", mlx.mlx_sign }, .{ "log1p", mlx.mlx_log1p }, .{ "tanh", mlx.mlx_tanh } }) |p| {
+            expectAsMlx(B.one(p[1]), &.{x}) catch |e| {
+                std.debug.print("{s} {s}: {s}\n", .{ p[0], d[0], @errorName(e) });
+                named_failures += 1;
+            };
+        }
+        inline for (.{ .{ "sum", B.sum }, .{ "cumsum", B.cumsum } }) |p| {
+            expectAsMlx(p[1], &.{x}) catch |e| {
+                std.debug.print("{s} {s}: {s}\n", .{ p[0], d[0], @errorName(e) });
+                named_failures += 1;
+            };
+        }
+        // Power by a scalar 3 of this dtype and of bf16 (the vision tower's cube), and of two full operands.
+        const three32 = hostArray(f32, &.{3}, &.{}, .float32);
+        defer _ = mlx.mlx_array_free(three32);
+        const three = try castByMlx(three32, d[1]);
+        defer _ = mlx.mlx_array_free(three);
+        const three16 = try castByMlx(three32, .bfloat16);
+        defer _ = mlx.mlx_array_free(three16);
+        inline for (.{ .{ "power by its own scalar", 0 }, .{ "power by a bf16 scalar", 1 }, .{ "power of two full operands", 2 } }) |pc| {
+            const rhs = switch (pc[1]) {
+                0 => three,
+                1 => three16,
+                else => x,
+            };
+            expectAsMlx(B.pow, &.{ x, rhs }) catch |e| {
+                std.debug.print("{s} {s}: {s}\n", .{ pc[0], d[0], @errorName(e) });
+                named_failures += 1;
+            };
+        }
+        // An update of this dtype into a bf16 destination and a bf16 update into one of this dtype.
+        const dst16 = try castByMlx(x32, .bfloat16);
+        defer _ = mlx.mlx_array_free(dst16);
+        inline for (.{ .{ "into bf16", 0 }, .{ "from bf16", 1 } }) |dir| {
+            const pair = if (dir[1] == 0) [_]A{ dst16, x } else [_]A{ x, dst16 };
+            expectAsMlx(B.update, &pair) catch |e| {
+                std.debug.print("slice_update {s} {s}: {s}\n", .{ dir[0], d[0], @errorName(e) });
+                named_failures += 1;
+            };
+        }
+    }
+    // The affine product with x and the scales/biases in mixed float dtypes: MLX promotes the pair.
+    const codes = try rampBuf(u32, 64 * 128 * 4 / 32, 4.0e9, 0);
+    defer std.testing.allocator.free(codes);
+    const w = hostArray(u32, codes, &.{ 64, 128 * 4 / 32 }, .uint32);
+    defer _ = mlx.mlx_array_free(w);
+    const xq32 = try bf16Array(2 * 128, &.{ 2, 128 }, 4, -2);
+    defer _ = mlx.mlx_array_free(xq32);
+    const sc32 = try bf16Array(64 * 2, &.{ 64, 2 }, 0.02, 0.001);
+    defer _ = mlx.mlx_array_free(sc32);
+    const bi32 = try bf16Array(64 * 2, &.{ 64, 2 }, 2, -1);
+    defer _ = mlx.mlx_array_free(bi32);
+    const floats = .{ .{ "f32", mlx.mlx_dtype.float32 }, .{ "bf16", mlx.mlx_dtype.bfloat16 }, .{ "f16", mlx.mlx_dtype.float16 } };
+    inline for (floats) |xd| inline for (floats) |sd| {
+        const xq = try castByMlx(xq32, xd[1]);
+        defer _ = mlx.mlx_array_free(xq);
+        const sc = try castByMlx(sc32, sd[1]);
+        defer _ = mlx.mlx_array_free(sc);
+        const bi = try castByMlx(bi32, sd[1]);
+        defer _ = mlx.mlx_array_free(bi);
+        expectAsMlx(B.qmm, &.{ xq, w, sc, bi }) catch |e| {
+            std.debug.print("quantized_matmul x {s} scales {s}: {s}\n", .{ xd[0], sd[0], @errorName(e) });
+            named_failures += 1;
+        };
+    };
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+}
+
+test "engine layer norm gives MLX's bytes: with weight and bias, either or neither, promoted dtypes, odd and looped widths" {
+    try mlx.requireGpu();
+    named_failures = 0;
+    const B = struct {
+        fn ln(comptime has_w: bool, comptime has_b: bool) fn (S, []const A) anyerror!A {
+            return struct {
+                fn run(s: S, in: []const A) !A {
+                    var o: A = .{};
+                    try mlx.check(mlx.mlx_fast_layer_norm(&o, in[0], if (has_w) in[1] else .{}, if (has_b) in[2] else .{}, 1e-6, s));
+                    return o;
+                }
+            }.run;
+        }
+    };
+    const forms = .{ .{ "weight and bias", true, true }, .{ "weight", true, false }, .{ "bias", false, true }, .{ "neither", false, false } };
+    for ([_]usize{ 100, 1280, 7000 }) |width| {
+        const rows: usize = 3;
+        const xv = try rampBuf(f32, rows * width, 6, -3);
+        defer std.testing.allocator.free(xv);
+        const x32 = hostArray(f32, xv, &.{ @intCast(rows), @intCast(width) }, .float32);
+        defer _ = mlx.mlx_array_free(x32);
+        const wv = try rampBuf(f32, width, 2, 0.1);
+        defer std.testing.allocator.free(wv);
+        const w32 = hostArray(f32, wv, &.{@intCast(width)}, .float32);
+        defer _ = mlx.mlx_array_free(w32);
+        const bv = try rampBuf(f32, width, 1, -0.5);
+        defer std.testing.allocator.free(bv);
+        const b32 = hostArray(f32, bv, &.{@intCast(width)}, .float32);
+        defer _ = mlx.mlx_array_free(b32);
+        inline for (.{ .{ "f32", mlx.mlx_dtype.float32 }, .{ "bf16", mlx.mlx_dtype.bfloat16 }, .{ "f16", mlx.mlx_dtype.float16 }, .{ "i32", mlx.mlx_dtype.int32 } }) |d| {
+            const x = try castByMlx(x32, d[1]);
+            defer _ = mlx.mlx_array_free(x);
+            // Weight and bias in x's dtype, and in f32 under a narrower x (MLX promotes the three).
+            inline for (.{ .{ "own", d[1] }, .{ "f32", mlx.mlx_dtype.float32 } }) |wd| {
+                const w = try castByMlx(w32, if (wd[1] == .int32) .float32 else wd[1]);
+                defer _ = mlx.mlx_array_free(w);
+                const b = try castByMlx(b32, if (wd[1] == .int32) .float32 else wd[1]);
+                defer _ = mlx.mlx_array_free(b);
+                inline for (forms) |f| {
+                    expectAsMlx(B.ln(f[1], f[2]), &.{ x, w, b }) catch |e| {
+                        std.debug.print("layer norm {d} wide, x {s}, {s} params, {s}: {s}\n", .{ width, d[0], wd[0], f[0], @errorName(e) });
+                        named_failures += 1;
+                    };
+                }
+            }
+        }
+    }
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+}
+
+/// An affine weight `[batch, n, k]` (batch 1 drops the axis), its scales and biases in `dtype`.
+const AffineWeight = struct {
+    w: A,
+    scales: A,
+    biases: A,
+
+    fn make(batch: usize, n: usize, k: usize, bits: usize, group: usize, dtype: mlx.mlx_dtype) !AffineWeight {
+        const codes = try rampBuf(u32, batch * n * k * bits / 32, 4.0e9, 0);
+        defer std.testing.allocator.free(codes);
+        var wd: [3]c_int = .{ @intCast(batch), @intCast(n), @intCast(k * bits / 32) };
+        var sd: [3]c_int = .{ @intCast(batch), @intCast(n), @intCast(k / group) };
+        const from: usize = if (batch == 1) 1 else 0;
+        const ns = batch * n * k / group;
+        const sc = try floatArray(ns, sd[from..], 0.02, 0.001, dtype);
+        errdefer _ = mlx.mlx_array_free(sc);
+        return .{ .w = hostArray(u32, codes, wd[from..], .uint32), .scales = sc, .biases = try floatArray(ns, sd[from..], 2, -1, dtype) };
+    }
+
+    fn free(self: AffineWeight) void {
+        _ = mlx.mlx_array_free(self.w);
+        _ = mlx.mlx_array_free(self.scales);
+        _ = mlx.mlx_array_free(self.biases);
+    }
+};
+
+/// A ramp of `n` values in `dtype`, cast by MLX.
+fn floatArray(n: usize, dims: []const c_int, scale: f32, shift: f32, dtype: mlx.mlx_dtype) !A {
+    const v = try rampBuf(f32, n, scale, shift);
+    defer std.testing.allocator.free(v);
+    const wide = hostArray(f32, v, dims, .float32);
+    if (dtype == .float32) return wide;
+    defer _ = mlx.mlx_array_free(wide);
+    return castByMlx(wide, dtype);
+}
+
+fn affineGather(comptime group: c_int, comptime bits: c_int, comptime sorted: bool) type {
+    return struct {
+        fn product(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_gather_qmm(&o, in[0], in[1], in[2], in[3], .{}, in[4], true, mlx.mlx_optional_int.some(group), mlx.mlx_optional_int.some(bits), "affine", sorted, s));
+            return o;
+        }
+    };
+}
+
+test "engine affine products give MLX's bytes in bits 2, 4 and 8, groups 32 and 128, f16 and f32 x, gathered, and on both sides of this GPU's vector limit" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    named_failures = 0;
+    const ids = try expertIds(64, 8, true);
+    defer a.free(ids);
+    const picks = try expertIds(6, 8, false);
+    defer a.free(picks);
+    inline for (.{ 2, 4, 8 }) |bits| inline for (.{ 32, 128 }) |group| {
+        for ([_]mlx.mlx_dtype{ .float16, .float32 }) |dt| {
+            var name: [96]u8 = undefined;
+            // {k, n}: the small and the large limits; m below, at and past each, then the quad's k, a k off qmv_fast's
+            // alignment, and a batched weight.
+            for ([_][2]usize{ .{ 1024, 1000 }, .{ 4352, 2560 } }) |kn| {
+                const lim = try quantized.vectorLimitHere(kn[0], kn[1]);
+                for ([_]usize{ 1, 2, lim - 1, lim, lim + 7 }) |m| {
+                    const x = try floatArray(m * kn[0], &.{ @intCast(m), @intCast(kn[0]) }, 4, -2, dt);
+                    defer _ = mlx.mlx_array_free(x);
+                    const wt = try AffineWeight.make(1, kn[1], kn[0], bits, group, dt);
+                    defer wt.free();
+                    try expectNamed(std.fmt.bufPrint(&name, "b{d} g{d} {s} {d}x{d}x{d}", .{ bits, group, @tagName(dt), m, kn[0], kn[1] }) catch "case", affineProduct(group, bits).product, &.{ x, wt.w, wt.scales, wt.biases });
+                }
+            }
+            for ([_][4]usize{ .{ 1, 1, 128, 256 }, .{ 1, 1, 640, 500 }, .{ 2, 40, 384, 96 } }) |c| {
+                const b, const m, const k, const n = c;
+                var xd: [3]c_int = .{ @intCast(b), @intCast(m), @intCast(k) };
+                const x = try floatArray(b * m * k, if (b == 1) xd[1..] else xd[0..], 4, -2, dt);
+                defer _ = mlx.mlx_array_free(x);
+                const wt = try AffineWeight.make(b, n, k, bits, group, dt);
+                defer wt.free();
+                try expectNamed(std.fmt.bufPrint(&name, "b{d} g{d} {s} batch {d} {d}x{d}x{d}", .{ bits, group, @tagName(dt), b, m, k, n }) catch "case", affineProduct(group, bits).product, &.{ x, wt.w, wt.scales, wt.biases });
+            }
+            // Gathered: a decode row over six picks, the sorted rows of a wide chunk, and the tiles.
+            const wt = try AffineWeight.make(8, 256, 384, bits, group, dt);
+            defer wt.free();
+            const one = try floatArray(384, &.{ 1, 1, 1, 384 }, 4, -2, dt);
+            defer _ = mlx.mlx_array_free(one);
+            const six = hostArray(u32, picks, &.{ 1, 6 }, .uint32);
+            defer _ = mlx.mlx_array_free(six);
+            try expectNamed(std.fmt.bufPrint(&name, "gather b{d} g{d} {s} decode", .{ bits, group, @tagName(dt) }) catch "case", affineGather(group, bits, false).product, &.{ one, wt.w, wt.scales, wt.biases, six });
+            const rows = try floatArray(64 * 384, &.{ 64, 1, 384 }, 4, -2, dt);
+            defer _ = mlx.mlx_array_free(rows);
+            const sorted = hostArray(u32, ids, &.{64}, .uint32);
+            defer _ = mlx.mlx_array_free(sorted);
+            try expectNamed(std.fmt.bufPrint(&name, "gather b{d} g{d} {s} sorted", .{ bits, group, @tagName(dt) }) catch "case", affineGather(group, bits, true).product, &.{ rows, wt.w, wt.scales, wt.biases, sorted });
+            const two = try floatArray(2 * 40 * 384, &.{ 2, 40, 384 }, 4, -2, dt);
+            defer _ = mlx.mlx_array_free(two);
+            const pair = hostArray(u32, picks[0..2], &.{2}, .uint32);
+            defer _ = mlx.mlx_array_free(pair);
+            try expectNamed(std.fmt.bufPrint(&name, "gather b{d} g{d} {s} tiles", .{ bits, group, @tagName(dt) }) catch "case", affineGather(group, bits, false).product, &.{ two, wt.w, wt.scales, wt.biases, pair });
+        }
+    };
+    try t_std.expectEqual(@as(usize, 0), named_failures);
 }

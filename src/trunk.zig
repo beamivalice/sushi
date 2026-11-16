@@ -109,6 +109,41 @@ pub const handOverSsmCheckpoint = ssm_cache.handOverSsmCheckpoint;
 pub const attn256Base16Aligned = attn_kernels.attn256Base16Aligned;
 const cachedScalarInt = verify_qmm.cachedScalarInt;
 pub const bf16Scalar = mlx_util.bf16Scalar;
+
+/// The trunk's scalar constants, made together: a refused one frees those made before it.
+pub const ScalarConsts = struct {
+    gelu_coeff: ?mlx.mlx_array = null,
+    gelu_inner: ?mlx.mlx_array = null,
+    three: ?mlx.mlx_array = null,
+    neg_one: ?mlx.mlx_array = null,
+    half: mlx.mlx_array = .{},
+    one: mlx.mlx_array = .{},
+    rms_eps_arr: mlx.mlx_array = .{},
+
+    pub fn make(s: mlx.mlx_stream, eps: f32, gelu: bool, silu: bool) !ScalarConsts {
+        var c: ScalarConsts = .{};
+        errdefer c.free();
+        if (gelu) {
+            c.gelu_coeff = try bf16Scalar(0.7978845608028654, s);
+            c.gelu_inner = try bf16Scalar(0.044715, s);
+            c.three = try bf16Scalar(3.0, s);
+        }
+        if (silu) c.neg_one = try bf16Scalar(-1.0, s);
+        c.half = try bf16Scalar(0.5, s);
+        c.one = try bf16Scalar(1.0, s);
+        c.rms_eps_arr = try mlx_util.f32Scalar(eps);
+        return c;
+    }
+
+    pub fn free(c: *const ScalarConsts) void {
+        inline for (.{ c.gelu_coeff, c.gelu_inner, c.three, c.neg_one }) |o| if (o) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        inline for (.{ c.half, c.one, c.rms_eps_arr }) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+    }
+};
 pub const compactConvStateEnabled = ssm_cache.compactConvStateEnabled;
 pub const computeQuantParams = layer_weights.computeQuantParams;
 pub const decodeRowsProjection = verify_moe.decodeRowsProjection;
@@ -762,6 +797,16 @@ pub fn computeYarnFreqs(
     for (out) |*v| v.* = 1.0 / v.*;
 }
 
+/// Rows the trunk's head projected, in tests: a forward whose logits nobody reads asks for none.
+pub var head_rows_for_test: u64 = 0;
+
+fn rowsOf(x: mlx.mlx_array) u64 {
+    const sh = mlx.getShape(x);
+    var n: u64 = 1;
+    for (sh[0 .. sh.len -| 1]) |d| n *= @intCast(d);
+    return n;
+}
+
 pub const Trunk = struct {
     /// The arch this model was loaded as, stamped once by `life.init`; every dispatch reads it.
     arch: arch_registry.Tag = undefined,
@@ -975,7 +1020,7 @@ pub const Trunk = struct {
             };
 
         const emb_scale: ?mlx.mlx_array = if (config.scale_embeddings)
-            bf16Scalar(@sqrt(@as(f32, @floatFromInt(config.hidden_size))), s)
+            try bf16Scalar(@sqrt(@as(f32, @floatFromInt(config.hidden_size))), s)
         else
             null;
 
@@ -1055,6 +1100,9 @@ pub const Trunk = struct {
 
         const need_gelu = config.hidden_act == .gelu_approx;
         const need_silu = config.hidden_act == .silu;
+        // Made before the weights and state: nothing after them can fail, so a refused one leaves nothing.
+        const consts = try ScalarConsts.make(s, config.rms_norm_eps, need_gelu, need_silu);
+        errdefer consts.free();
 
         var ssm_entries: ?[]SSMCacheEntry = null;
         const loaded = try initMoeLayers(allocator, config, weights, &name_buf, s);
@@ -1084,14 +1132,33 @@ pub const Trunk = struct {
             }
             allocator.free(loaded.ssm_entries);
         }
+        // A failure from here on frees what the layers loaded, as `deinitTrunk` does.
+        errdefer {
+            if (ssm_entries) |entries| {
+                for (entries) |*e| {
+                    _ = mlx.mlx_array_free(e.conv_state);
+                    _ = mlx.mlx_array_free(e.ssm_state);
+                    prefix_arch.aux.ssmFreeQsaState(e);
+                }
+                allocator.free(entries);
+            }
+            allocator.free(loaded.moe_layers);
+            if (moe_owned_bf16) |arrs| {
+                for (arrs) |a| _ = mlx.mlx_array_free(a);
+                allocator.free(arrs);
+            }
+        }
 
         const cells = try TrunkCells.create(allocator);
         errdefer cells.destroy(allocator);
 
         // A hyper-connected trunk: ones(hidden_size) for its weight-less RMS norm.
         var ones_hidden: ?mlx.mlx_array = null;
+        errdefer if (ones_hidden) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
         if (arch_config.hyperConnected(&config)) {
-            const one_val = bf16Scalar(1.0, s);
+            const one_val = try bf16Scalar(1.0, s);
             defer _ = mlx.mlx_array_free(one_val);
             const h_shape = [_]c_int{@intCast(config.hidden_size)};
             ones_hidden = mlx.mlx_array_new();
@@ -1105,6 +1172,11 @@ pub const Trunk = struct {
         var rope_freqs_yarn: ?mlx.mlx_array = null;
         var yarn_mscale: ?mlx.mlx_array = null;
         var yarn_inv_freq: ?[]const f64 = null;
+        errdefer {
+            if (rope_freqs_yarn) |a| _ = mlx.mlx_array_free(a);
+            if (yarn_mscale) |a| _ = mlx.mlx_array_free(a);
+            if (yarn_inv_freq) |f| allocator.free(f);
+        }
         if (config.rope_yarn) {
             const spec = yarnSpec(&config);
             const rotary_dim: u32 = config.yarnRotaryDim();
@@ -1126,9 +1198,8 @@ pub const Trunk = struct {
             // `ropeAtPositions` multiply positions by inv_freq (host f64), while
             // mlx_fast_rope divides by freqs — two spellings, one spectrum.
             const inv_f64 = try allocator.alloc(f64, half);
-            errdefer allocator.free(inv_f64);
-            spec.invFreq(inv_f64);
             yarn_inv_freq = inv_f64;
+            spec.invFreq(inv_f64);
             const freqs_f32 = try allocator.alloc(f32, half);
             defer allocator.free(freqs_f32);
             for (freqs_f64, 0..) |v, i| freqs_f32[i] = @floatCast(v);
@@ -1171,37 +1242,14 @@ pub const Trunk = struct {
             const all_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(all_vec);
 
-            _ = mlx.mlx_vector_array_append_value(all_vec, emb_w);
-            // Dense bf16 models have null-ctx embedding/lm_head scales/biases —
-            // appending a null array aborts in mlx (vector.cpp "non-empty" guard).
-            if (emb_s_arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, emb_s_arr);
-            if (emb_b_arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, emb_b_arr);
-            _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_w);
-            if (lm_head_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_s);
-            if (lm_head_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_b);
-            if (moe_layers) |ml| {
-                for (ml) |lw| {
-                    // qwen4_exp has no per-layer norms (null-ctx); its
-                    // hyper-connection + PLE arrays are appended below.
-                    if (lw.input_norm.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.input_norm);
-                    if (lw.post_attn_norm.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.post_attn_norm);
-                    if (lw.hc_attn) |*hw| appendStructArrays(all_vec, hw);
-                    if (lw.hc_mlp) |*hw| appendStructArrays(all_vec, hw);
-                    if (lw.ple) |*pw| appendStructArrays(all_vec, pw);
-                    appendHybridMlpWeights(all_vec, &lw.mlp);
-                    switch (lw.attn) {
-                        .full => |*fa| appendFullAttnWeights(all_vec, fa),
-                        .linear => |*la| appendLinearAttnWeights(all_vec, la),
-                    }
-                }
-            }
+            appendWeightArrays(all_vec, .{ emb_w, emb_s_arr, emb_b_arr, lm_head_w, lm_head_s, lm_head_b }, moe_layers);
 
             try mlx.check(mlx.mlx_eval(all_vec));
             const eval_ms: i64 = @intCast(@divTrunc(eval_start.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
             log.info("Batch eval all weights: {d}ms\n", .{eval_ms});
         }
 
-        // The arch's own state loads after the trunk's weights; nothing below can fail.
+        // The arch's own state loads after the trunk's weights.
         var state: arch_state_mod.State = .{};
         const stream_parts = try arch_state_mod.initState(&state, .{
             .allocator = allocator,
@@ -1235,13 +1283,13 @@ pub const Trunk = struct {
             .decode_async_ladder = decodeAsyncLadderStride(
                 if (std.c.getenv("SUSHI_DECODE_ASYNC_LADDER")) |v| std.mem.span(v) else null,
             ),
-            .gelu_coeff = if (need_gelu) bf16Scalar(0.7978845608028654, s) else null,
-            .gelu_inner = if (need_gelu) bf16Scalar(0.044715, s) else null,
-            .half = bf16Scalar(0.5, s),
-            .one = bf16Scalar(1.0, s),
-            .rms_eps_arr = mlx.mlx_array_new_float(config.rms_norm_eps),
-            .three = if (need_gelu) bf16Scalar(3.0, s) else null,
-            .neg_one = if (need_silu) bf16Scalar(-1.0, s) else null,
+            .gelu_coeff = consts.gelu_coeff,
+            .gelu_inner = consts.gelu_inner,
+            .half = consts.half,
+            .one = consts.one,
+            .rms_eps_arr = consts.rms_eps_arr,
+            .three = consts.three,
+            .neg_one = consts.neg_one,
             .ones_hidden = ones_hidden,
             .rope_freqs_yarn = rope_freqs_yarn,
             .yarn_mscale = yarn_mscale,
@@ -1488,6 +1536,11 @@ pub const Trunk = struct {
     }
 
     /// The arch-neutral part of `deinit`; the arch frees its own state first (`life.deinit`).
+    /// The weights the load evaluated (`appendWeightArrays`), appended to `vec`.
+    pub fn appendWeights(self: *const Trunk, vec: mlx.mlx_vector_array) !void {
+        appendWeightArrays(vec, .{ self.emb_w, self.emb_s, self.emb_b, self.lm_head_w, self.lm_head_s, self.lm_head_b }, self.moe_layers);
+    }
+
     pub fn deinitTrunk(self: *Trunk) void {
         self.flushImatrix(); // `/v1/unload-model` reaches here on the inference thread
         self.releaseCells();
@@ -1560,6 +1613,7 @@ pub const Trunk = struct {
     /// `argmax_only` (the Generator's request-level gate, via ForwardCtx) permits
     /// the arch's shortlist readout (`arch_state.headShortlist`); false = the full head.
     pub inline fn lmHeadProject(self: *const Trunk, x: mlx.mlx_array, argmax_only: bool) !mlx.mlx_array {
+        if (comptime @import("builtin").is_test) head_rows_for_test +%= rowsOf(x);
         if (self.lm_head_s.ctx == null) {
             // Load built the view; a hand-built trunk has none and transposes per call.
             var own: mlx.mlx_array = .{ .ctx = null };
@@ -1629,6 +1683,7 @@ pub const Trunk = struct {
 
     pub inline fn rmsNorm(self: *const Trunk, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_fast_rms_norm(&result, x, w, self.config.rms_norm_eps, self.s));
         return result;
     }
@@ -1692,6 +1747,7 @@ pub const Trunk = struct {
 
         const out_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
         var reshaped = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(reshaped);
         try mlx.check(mlx.mlx_reshape(&reshaped, emb, &out_shape, 3, self.s));
         return reshaped;
     }
@@ -1703,6 +1759,7 @@ pub const Trunk = struct {
         if (self.emb_scale) |scale| {
             defer _ = mlx.mlx_array_free(raw);
             var scaled = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(scaled);
             try mlx.check(mlx.mlx_multiply(&scaled, raw, scale, self.s));
             return scaled;
         }
@@ -1831,6 +1888,7 @@ pub const Trunk = struct {
 
         // Reshape back to [B, seq_len, hidden]
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_reshape(&result, result_flat, h_shape.ptr, 3, s));
         _ = mlx.mlx_array_free(h);
         return result;
@@ -1866,6 +1924,7 @@ pub const Trunk = struct {
             try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
             var result = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(result);
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
         }
@@ -1896,6 +1955,7 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(x_times);
         try mlx.check(mlx.mlx_multiply(&x_times, x, one_plus, self.s));
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_multiply(&result, x_times, self.half, self.s));
         return result;
     }
@@ -1905,6 +1965,7 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(sig);
         try mlx.check(mlx.mlx_sigmoid(&sig, x, self.s));
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_multiply(&result, x, sig, self.s));
         return result;
     }
@@ -1953,6 +2014,7 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(x_times);
         try mlx.check(mlx.mlx_multiply(&x_times, x, one_plus, self.s));
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_multiply(&result, x_times, self.half, self.s));
         return result;
     }
@@ -1960,10 +2022,11 @@ pub const Trunk = struct {
     fn reluSquared(self: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array {
         var relu = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(relu);
-        const mask_scalars = self.maskScalars();
+        const mask_scalars = try self.maskScalars();
         defer mask_scalars.deinit();
         try mlx.check(mlx.mlx_maximum(&relu, x, mask_scalars.zero, self.s));
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_square(&result, relu, self.s));
         return result;
     }
@@ -1981,6 +2044,7 @@ pub const Trunk = struct {
             try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
             var result = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(result);
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
         }
@@ -1992,6 +2056,7 @@ pub const Trunk = struct {
         const activated = try self.mlpActivation(gate);
         defer _ = mlx.mlx_array_free(activated);
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_multiply(&result, activated, up, self.s));
         return result;
     }
@@ -2001,6 +2066,7 @@ pub const Trunk = struct {
         const activated = try self.silu(gate);
         defer _ = mlx.mlx_array_free(activated);
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_multiply(&result, activated, x, self.s));
         return result;
     }
@@ -2582,7 +2648,7 @@ pub const Trunk = struct {
         kv_max: c_int,
     ) !mlx.mlx_array {
         const pad_axes = [_]c_int{2};
-        const pad_value = bf16Scalar(0.0, self.s);
+        const pad_value = try bf16Scalar(0.0, self.s);
         defer _ = mlx.mlx_array_free(pad_value);
 
         const padded_vec = mlx.mlx_vector_array_new();
@@ -2619,6 +2685,7 @@ pub const Trunk = struct {
         }
 
         var stacked = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(stacked);
         try mlx.check(mlx.mlx_concatenate_axis(&stacked, padded_vec, 0, self.s));
         return stacked;
     }
@@ -2657,9 +2724,10 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(valid);
         try mlx.check(mlx.mlx_less(&valid, pos_4d, lens_4d, self.s));
 
-        const mask_scalars = self.maskScalars();
+        const mask_scalars = try self.maskScalars();
         defer mask_scalars.deinit();
         var mask = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(mask);
         try mlx.check(mlx.mlx_where(&mask, valid, mask_scalars.zero, mask_scalars.neg_inf, self.s));
         return mask;
     }
@@ -2712,6 +2780,7 @@ pub const Trunk = struct {
         if (self.consts) |c| for (c.rope_inv) |entry| if (entry) |e| {
             if (e.dims == rope_dims and e.theta == theta) {
                 var shared = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(shared);
                 try mlx.check(mlx.mlx_array_set(&shared, e.arr));
                 return shared;
             }
@@ -2836,6 +2905,7 @@ pub const Trunk = struct {
         const ovec = mlx.mlx_vector_array_new_data(&oparts, 2);
         defer _ = mlx.mlx_vector_array_free(ovec);
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_concatenate_axis(&out, ovec, -1, self.s));
         return out;
     }
@@ -3090,6 +3160,7 @@ pub const Trunk = struct {
 
         if (hd == rope_dims) {
             var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_astype(&out, out_rot, .bfloat16, self.s));
             return out;
         }
@@ -3100,6 +3171,7 @@ pub const Trunk = struct {
         const cat_vec = mlx.mlx_vector_array_new_data(&cat_arrs, 2);
         defer _ = mlx.mlx_vector_array_free(cat_vec);
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_concatenate_axis(&out, cat_vec, -1, self.s));
         return out;
     }
@@ -4387,6 +4459,7 @@ pub const Trunk = struct {
         // Weight by scores: down_out * norm_scores[..., None] → sum over K.
         // The fused down+reduce path already did both inside its one dispatch.
         var expert_sum = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(expert_sum);
         if (moe_reduced) {
             _ = mlx.mlx_array_set(&expert_sum, down_out); // [B, S, hidden]
         } else {
@@ -4416,17 +4489,22 @@ pub const Trunk = struct {
 
         // No shared-expert gate: the routed sum is the whole output.
         if (mw.shared_expert_gate_w == null or arch_kernels.moeStandin().moe_shared) return expert_sum;
-        defer _ = mlx.mlx_array_free(expert_sum);
-        return self.moeAddGatedShared(expert_sum, expert_x, mw, if (routed.gate_logit.ctx != null) routed.gate_logit else null);
+        const combined = try self.moeAddGatedShared(expert_sum, expert_x, mw, if (routed.gate_logit.ctx != null) routed.gate_logit else null);
+        _ = mlx.mlx_array_free(expert_sum);
+        return combined;
     }
 
     // ── Mask helpers ──
 
     /// The bf16 zero and -inf every mask is built from.
-    fn maskScalars(self: *const Trunk) MaskScalars {
-        const c = self.consts orelse return .{ .zero = bf16Scalar(0.0, self.s), .neg_inf = bf16Scalar(-std.math.inf(f32), self.s), .owned = true };
-        if (c.mask_zero == null) c.mask_zero = bf16Scalar(0.0, self.s);
-        if (c.mask_neg_inf == null) c.mask_neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
+    fn maskScalars(self: *const Trunk) !MaskScalars {
+        const c = self.consts orelse {
+            const zero = try bf16Scalar(0.0, self.s);
+            errdefer _ = mlx.mlx_array_free(zero);
+            return .{ .zero = zero, .neg_inf = try bf16Scalar(-std.math.inf(f32), self.s), .owned = true };
+        };
+        if (c.mask_zero == null) c.mask_zero = try bf16Scalar(0.0, self.s);
+        if (c.mask_neg_inf == null) c.mask_neg_inf = try bf16Scalar(-std.math.inf(f32), self.s);
         return .{ .zero = c.mask_zero.?, .neg_inf = c.mask_neg_inf.?, .owned = false };
     }
 
@@ -4455,12 +4533,13 @@ pub const Trunk = struct {
         var bool_upper = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(bool_upper);
         try mlx.check(mlx.mlx_astype(&bool_upper, upper, .bool_, self.s));
-        const mask_scalars = self.maskScalars();
+        const mask_scalars = try self.maskScalars();
         defer mask_scalars.deinit();
         var mask = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_where(&mask, bool_upper, mask_scalars.neg_inf, mask_scalars.zero, self.s));
         const mask_shape = [_]c_int{ 1, 1, q_len, kv_len };
         var mask_4d = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(mask_4d);
         try mlx.check(mlx.mlx_reshape(&mask_4d, mask, &mask_shape, 4, self.s));
         _ = mlx.mlx_array_free(mask);
         return mask_4d;
@@ -4496,7 +4575,7 @@ pub const Trunk = struct {
         var too_far = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(too_far);
         try mlx.check(mlx.mlx_greater_equal(&too_far, dist, window_arr, self.s));
-        const mask_scalars = self.maskScalars();
+        const mask_scalars = try self.maskScalars();
         defer mask_scalars.deinit();
         var sw_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sw_mask);
@@ -4506,12 +4585,23 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(sw_4d);
         try mlx.check(mlx.mlx_reshape(&sw_4d, sw_mask, &mask_shape, 4, self.s));
         var combined = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(combined);
         try mlx.check(mlx.mlx_add(&combined, causal, sw_4d, self.s));
         return combined;
     }
 };
 
 // ── Init helpers ──
+
+/// The trunk's weights a load evaluates at once: the embedding and lm_head arrays present, then each layer's.
+fn appendWeightArrays(vec: mlx.mlx_vector_array, ends: [6]mlx.mlx_array, moe_layers: ?[]MoeLayerWeights) void {
+    // Dense bf16 models have null-ctx embedding/lm_head scales/biases; appending a null array aborts in mlx.
+    for (ends) |arr| if (arr.ctx != null) {
+        _ = mlx.mlx_vector_array_append_value(vec, arr);
+    };
+    const ml = moe_layers orelse return;
+    for (ml) |*lw| layer_weights.appendLayerWeights(vec, lw);
+}
 
 pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !struct { moe_layers: []MoeLayerWeights, ssm_entries: []SSMCacheEntry, owned_bf16: []mlx.mlx_array } {
     log.info("Precomputing MoE layer weights...\n", .{});
@@ -4743,7 +4833,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                 .down_w = mlx.mlx_array_new(),
                 .down_s = mlx.mlx_array_new(),
                 .down_b = mlx.mlx_array_new(),
-            } else try loadSwitchMlpBank(weights, name_buf, prefix, li, exl3, &config);
+            } else try loadSwitchMlpBank(weights, name_buf, prefix, li, exl3, &config, s);
             if (switch_bank.ragged) |*rb| try rb.handOff(allocator, &owned_bf16);
             lw.mlp = .{ .moe = .{
                 .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
@@ -4811,7 +4901,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                 .down_w = mlx.mlx_array_new(),
                 .down_s = mlx.mlx_array_new(),
                 .down_b = mlx.mlx_array_new(),
-            } else try loadSwitchMlpBank(weights, name_buf, prefix, li, exl3, &config);
+            } else try loadSwitchMlpBank(weights, name_buf, prefix, li, exl3, &config, s);
             if (switch_bank.ragged) |*rb| try rb.handOff(allocator, &owned_bf16);
             var sh_gate = try layerProj(weights, name_buf, &config, li, "mlp.shared_expert.gate_proj", .absent_ok, &owned_bf16, allocator, s);
             var sh_up = try layerProj(weights, name_buf, &config, li, "mlp.shared_expert.up_proj", .absent_ok, &owned_bf16, allocator, s);
@@ -4894,7 +4984,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
             }
         }
 
-        try layer_weights.bindLayer(lw, &config);
+        try layer_weights.bindLayer(lw, &config, s);
 
         ssm_entries[i] = .{
             .conv_state = mlx.mlx_array_new(),
@@ -5140,15 +5230,26 @@ const SWIGLU_SOURCE =
 ;
 
 /// `mlx_sigmoid` tabulated over every 16-bit float pattern, indexed [bf16, f16].
-var swiglu_sig_tables: [2]?mlx.mlx_array = @splat(null);
+var swiglu_sig_tables: [2][2]?mlx.mlx_array = @splat(@splat(null));
 
+/// Frees side `side`'s tables (1 the engine's, 0 MLX's), when the side's last model is gone.
+pub fn dropSwigluSigTables(side: u1) void {
+    for (&swiglu_sig_tables[side]) |*t| if (t.*) |a| {
+        _ = mlx.mlx_array_free(a);
+        t.* = null;
+    };
+}
+
+/// The sigmoid of every 16-bit pattern of `dt`, made once a process on each side: an array belongs to the side that
+/// made it (MLX's streams or the engine's).
 pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Allocator) !mlx.mlx_array {
+    const tables = &swiglu_sig_tables[@intFromBool(mlx.engine.isStream(s))];
     const slot: usize = switch (dt) {
         .bfloat16 => 0,
         .float16 => 1,
         else => return error.UnsupportedSwigluDtype,
     };
-    if (swiglu_sig_tables[slot]) |t| return t;
+    if (tables[slot]) |t| return t;
 
     const N: usize = 1 << 16;
     const buf = try allocator.alloc(f32, N);
@@ -5170,7 +5271,7 @@ pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.A
     try mlx.check(mlx.mlx_sigmoid(&table, vals, s));
     // Materialize now: the table outlives every graph that reads it.
     try mlx.check(mlx.mlx_array_eval(table));
-    swiglu_sig_tables[slot] = table;
+    tables[slot] = table;
     return table;
 }
 
@@ -5205,8 +5306,7 @@ fn getSwigluKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 const SwigluCfgKey = struct { shape: ShapeKey, dtype: mlx.mlx_dtype };
-var swiglu_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var swiglu_cfg_key: SwigluCfgKey = std.mem.zeroes(SwigluCfgKey);
+var swiglu_cfgs = QsaCfgCache(SwigluCfgKey, 1){};
 
 /// `silu(gate) * up`, elementwise, one dispatch. Null → caller keeps the chain.
 /// Exact by construction (bit-level sigmoid table), so callers outside this
@@ -5240,18 +5340,19 @@ pub fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?
 
     const tg: c_int = @min(@as(c_int, 256), @max(@as(c_int, 32), @divTrunc(ni + 31, 32) * 32));
     const key = SwigluCfgKey{ .shape = ShapeKey.from(gsh), .dtype = dt };
-    if (swiglu_cfg == null or !std.meta.eql(swiglu_cfg_key, key)) {
-        if (swiglu_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const swiglu_cfg = blk: {
+        if (swiglu_cfgs.get(key)) |hit| break :blk hit[0];
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, gsh.ptr, gsh.len, dt));
         // Grid is rounded UP to the threadgroup so the launch is uniform; the
         // kernel's own bound check drops the tail threads.
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(ni + tg - 1, tg) * tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
-        swiglu_cfg = config;
-        swiglu_cfg_key = key;
-    }
+        swiglu_cfgs.put(key, .{config});
+        break :blk config;
+    };
 
     const sigtab = try swigluSigTable(s, dt, std.heap.c_allocator);
     const inputs_arr = [_]mlx.mlx_array{ gate, up, sigtab, cachedScalarInt(ni) };
@@ -5260,7 +5361,7 @@ pub fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?
     const kernel = try getSwigluKernel();
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, swiglu_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, swiglu_cfg, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var y = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(y);

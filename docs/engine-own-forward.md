@@ -138,6 +138,9 @@ route and the MLX arm still build the bank at prepare time.
 
 - **The stream decides the side.** An op on `engine.stream()` runs on the engine; an op the engine lacks is refused
   by name (`[engine] <op>: ...`), never handed to MLX. An op on an MLX stream runs on MLX.
+- **An entry takes MLX's dtype rule from `dtype_rule.zig`** (the cast to `at_least_float`, a sum's or a scan's output
+  type, an affine product's promotion), never one of its own; a dtype the engine refuses is named through
+  `core.refusing`, and lint rule `refusal-unnamed` holds it.
 - **`engine.active`** is on while a forward of ours runs. An MLX stream inside it is refused by name
   (`an MLX stream inside a forward of the engine`): a stray stream would silently move work back to MLX.
 - **`engine.enabled`** turns on at the first load whose decode the engine serves, before that load's first kernel
@@ -296,6 +299,9 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **A host read waits for the pass that wrote the bytes, not for the queue.** Waiting for everything in flight loses
   the layer the forward queued ahead (25.5 against 20.4 ms per forward).
 - The pool never hands out a store the open pass binds.
+- **A custom kernel compiles after what MLX puts before it.** `kernel.zig`'s preamble carries MLX's bfloat math and simd
+  overloads (`mlx_bf16_math.metal`): without them `metal::abs` on a bfloat does not compile and `metal::exp` returns
+  float where MLX rounds to bfloat. A launch that fails names its kernel.
 - **Residency is kept the way MLX keeps it** (`metal.zig`, after mlx/backend/metal/resident.cpp): every buffer of
   ours sits in a residency set attached to our queue with a standing request, and the sets are capped at 5% of the
   working set (floor 64 MiB, at most 32, first fit; a buffer over the cap has a set of its own). The cap bounds what
@@ -318,7 +324,29 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   waits on an MLX evaluation of every slab view; decode tok/s unchanged; a new binary's load 30.9 s against 44.4 s.
 - **An array cached for the process belongs to one side** (`rate_groups.unitScore`): a constant made once and kept in
   a global is MLX's or the engine's by whoever made it first, and the other side then imports or lends it at every
-  launch. A cached array is kept per side, chosen by the stream of the op that takes it.
+  launch. A cached array is kept per side, chosen by the stream of the op that takes it, and dropped when that side's
+  last model goes (`arch_handle.dropHostArrays(side)`, an arch's `dropHostArrays` hook).
+- **The engine runs each op as it is built; MLX runs it at the eval.** A leaf MLX lets a caller fill after the graph is
+  built (Qwen's deferred n-gram gather) is read empty on the engine: on the engine's stream it is filled first
+  (`qwen4_hc.pleEmbedding`).
+- **A kernel arm's verdict is the GPU's, kept for the process.** The QSA probes run on the load's stream; a probe the
+  engine refuses fails the load (`error.QsaProbeRefused`) instead of reading as "the arm differs".
+- **An MLX error is never a fallback.** A fused arm returns null when it does not apply and an error when a call failed;
+  `catch null` before the fallback ran a failed request on through the composed chain (lint `error-fallback`).
+- **Every draw on the engine takes the engine's key** (`sampler.drawRowsLogProbs`, lint `random-draw-seam`): MTP's
+  proposal and its correction drew with MLX's key, so every sampled MTP round on a Qwen Cooler load failed.
+- **A Cooler arch declares where its cache arrays live** (`prefix.arraysOn`): Qwen's did not, and the first SSD
+  restore of a served Cooler load read its checkpoint on MLX's CPU stream inside the request and crashed.
+- **A Cooler load compiles no MLX closure** (`model_load.compileClosures`; `qwen4_hc.hcReadPreparedWidth` declines on
+  the engine's stream): a closure applied on the engine's arrays leaves the engine, and crashed the request. The engine
+  runs each chain op by op, which is MLX's unfused chain byte for byte; only the f32 GDN gate's compiled kernel differs
+  from that chain, by a few ulps.
+- **Every width MLX takes, before a real pack needs it**: Qwen's MTP rerank reads a 3-bit coarse head, so affine
+  bits 3, 5 and 6 are served (MLX's own kernels, its `qmv_fast` K step per width); a served request refused there, in
+  the middle of a reply. `where` promotes its values and reads its condition as bool, as MLX does.
+- **A cached kernel config never names a freed one.** A rebuild that failed after freeing the old config left the slot
+  naming it under its old key; the next call launched freed memory. A cache builds, then puts (`QsaCfgCache`; lint
+  `config-free-stale`).
 - **A route is a load's for its life**: no load mixes an MLX forward with the engine's weights or slabs. A test that
   wants MLX's bytes loads the pack on the MLX route (`EngineFixture.openMlx`), takes them and closes it before the
   Cooler load opens. One forward of the load's warm had stayed on MLX (the context chunk of `warmOwnBlocks`, 536 rows
@@ -403,9 +431,17 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **Maps are the engine's inside its scope** (`route.zig`: names to arrays, names to strings, the iterator): a map
   made under `engine.enter` is tagged like a vector, every call that takes one follows it, and a name it lacks
   answers 2 with no error latched, as mlx-c does. The SSD tier's readers hand tensors around in them.
-- **DeepSeek installs and bills it** (`dsv41_borrow`, `dsv41_bill`): the budget is a decode forward's cap
-  (`Config.forwardCap`), set as every forward begins, and the request bill carries that cap a second time, beside
-  MLX's. A request's end leaves the pool what the shortest request bills; an unload leaves it nothing free.
+- **One seam owns the pool for every Cooler arch** (`arch/cooler.zig`): the first decode forward after a prefill trims
+  the free buffers to its transient bill (`bills.prefillTransientReserveAtKv` at a verify block's rows), a request's
+  end trims them to the arch's resting cap, and an unload, and the last Cooler hold's end, leave the pool empty.
+- **The shared bill trims and never caps.** As a hard cap it refused a Qwen verify after a 10k prefill on the
+  release pack (762 MB in use, a 1290 MB limit): buffers an open pass binds outlive their tensors, which no bill term
+  counts. A hard cap needs a measured forward cap, as DeepSeek's.
+- **A forward whose logits nobody reads asks for no head** (`skip_lm_head`, a prefill chunk before the tail): MLX
+  never evaluates such logits, an eager engine does (344 MB at 700 rows on the tiny fixture, ~4 GB at an 8k chunk).
+- **DeepSeek installs and bills its own** (`cooler_own_caps`, `dsv41_borrow`, `dsv41_bill`), a hard cap: a decode
+  forward's measured cap (`Config.forwardCap`), set as every forward begins beside the expert pools a prefill releases, and the
+  request bill carries that cap a second time, beside MLX's. Its resting cap is the decode pool its ledger parks.
 
 ## Load
 
@@ -482,6 +518,8 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   and a verify block of every width under the penalties, the thinking penalty with and without a bias, and a row mask.
 - **A kernel reached only past a threshold of context is found by a bench at that context**, not by the tiny
   fixture: the 128k rung showed three compiles (0.26 s) inside its first decode step.
+- **A Cooler load whose warm fails does not serve** (`model_load.warmLoad`): a forward that fails in the warm fails in a
+  request. A warm that ends seals the engine and trims its transients (`arch_cooler.warmEnded`), for every Cooler arch.
 - **A pipeline made after the warm is logged** (`engine.seal`): `[engine] compiled inside a request (N ms): <name>`
   at warning level, and the request-end debug line counts them. The count is 0 on the release pack.
 
@@ -571,7 +609,7 @@ rebuilds one.
   64-slot buffer; the release's DSpark bank stacks 256 experts, which no tiny fixture has. A cap is the kernel's own
   (`kernel.max_inputs`), named where it refuses; the real-pack test (`SUSHI_DSV41_REAL_PACK`) runs before a phase closes.
 - **A refusal says what it refuses**: an op returns `core.refusing(why, err)`, and the route's message carries the
-  restriction (`[engine] quantized_matmul: TensorUnsupported: affine bits 3, 5 and 6 are not ported`) and counts it in
+  restriction (`[engine] quantized_matmul: TensorUnsupported: a mode other than affine, mxfp4 and mxfp8 (nvfp4) is not ported`) and counts it in
   `refusals`. A caller's int is read with `std.math.cast`: a negative group size is a named refusal, not a wrapped cast.
 - **A shape is built with `core.Dims`**, whose pieces past `max_dims` are `TensorShape`: split-K wrote index 8 of an
   8-entry buffer for an 8-axis x. A `[max_dims]c_int` written at an offset is the lint rule `shape-offset-write`.

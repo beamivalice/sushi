@@ -76,6 +76,7 @@ pub fn standinOnes(shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     if (standin_ones) |a| {
         if (std.mem.eql(c_int, mlx.getShape(a), shape)) {
             var r = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(r);
             try mlx.check(mlx.mlx_array_set(&r, a));
             return r;
         }
@@ -86,11 +87,13 @@ pub fn standinOnes(shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     try mlx.check(mlx.mlx_array_eval(a));
     standin_ones = a;
     var r = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(r);
     try mlx.check(mlx.mlx_array_set(&r, a));
     return r;
 }
 pub fn standinRef(x: mlx.mlx_array) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(r);
     try mlx.check(mlx.mlx_array_set(&r, x));
     return r;
 }

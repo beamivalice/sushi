@@ -62,7 +62,6 @@ pub const command = struct {
 
 pub const drop_expert_elsewhere = "--drop-expert has no effect on this model: only deepseek_v41 packs carry an expert usage list; drop the flag";
 
-pub const cooler_setting_elsewhere = "model-settings.json ds41_cooler is ignored: only deepseek_v41 runs on Sushi Cooler";
 
 
 pub const settings_kv_quant_ignored = "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";

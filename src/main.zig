@@ -461,6 +461,7 @@ fn runCli(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--drafter") and flag_value.follows(args, i)) {
             i += 1;
             drafter_dir = args[i];
+            settings_resolve.launch.drafter = true;
         } else if (std.mem.eql(u8, args[i], "--metrics")) {
             metrics_enabled = true;
         } else if (std.mem.eql(u8, args[i], "--no-metrics")) {
@@ -1304,14 +1305,7 @@ fn runCli(init: std.process.Init) !void {
         {
             if (mlx.applyWiredPolicy()) |limit| log.debug("[wired] limit={d} MB\n", .{limit / (1024 * 1024)});
         }
-        if (config.hidden_act == .gelu_approx) {
-            xfm.compileGelu();
-            xfm.compileGeglu();
-        }
-        if (xfm.moe_layers != null) {
-            xfm.compileMoeRouting();
-        }
-        arch_state.compile(&xfm, .gates);
+        model_load.compileClosures(&xfm, .gates);
         log.info("Model ready.\n", .{});
 
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";

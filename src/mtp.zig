@@ -217,6 +217,7 @@ pub fn maskAndArgmax(s: mlx.mlx_stream, logits_in: mlx.mlx_array, suppress_mask:
     defer _ = mlx.mlx_array_free(amax);
     try mlx.check(mlx.mlx_argmax_axis(&amax, logits, -1, false, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, amax, .int32, s));
     return out;
 }
@@ -356,6 +357,7 @@ pub fn shortlistArgmax(s: mlx.mlx_stream, sl: Shortlist) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(picked);
     try mlx.check(mlx.mlx_take_axis(&picked, sl.cands, amax, 0, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, picked, .int32, s));
     return out;
 }
@@ -562,6 +564,7 @@ pub fn rerankSelectBatched(
     const vec = mlx.mlx_vector_array_new_data(id_parts[0..N].ptr, N);
     defer _ = mlx.mlx_vector_array_free(vec);
     var stacked = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(stacked);
     try mlx.check(mlx.mlx_concatenate_axis(&stacked, vec, 0, s));
     return stacked;
 }
@@ -1036,6 +1039,7 @@ pub fn draftTop32(s: mlx.mlx_stream, row: mlx.mlx_array, rows: c_int) !mlx.mlx_a
     defer _ = mlx.mlx_vector_array_free(outputs);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, fk, inputs, cfg, s));
     var token_ids = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(token_ids);
     try mlx.check(mlx.mlx_vector_array_get(&token_ids, outputs, 0));
     return token_ids;
 }
@@ -1175,6 +1179,7 @@ test "mtp: headQuantParams never mis-resolves a non-affine lm_head as affine (is
     const mk = struct {
         fn arr(shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
             var a = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(a);
             try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st));
             return a;
         }
@@ -1293,6 +1298,7 @@ pub const RerankFixture = struct {
         const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
         defer _ = mlx.mlx_array_free(f32_arr);
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_astype(&out, f32_arr, .bfloat16, s));
         return out;
     }
@@ -1302,6 +1308,7 @@ pub const RerankFixture = struct {
     fn exactLogits(self: *const RerankFixture, s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array {
         const qp = headQuantParams(&self.xfm.config, self.xfm.lm_head_w, self.xfm.lm_head_s);
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_quantized_matmul(
             &out,
             x,

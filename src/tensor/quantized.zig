@@ -5,7 +5,7 @@
 //! `gather_qmm_rhs{,_nax}`. Ported from MLX's Metal backend (MIT, see NOTICE). Ported: a transposed weight in the
 //! affine, `mxfp4` or `mxfp8` mode, every plan MLX picks for it, one weight or a batch of them. Refused by name, each
 //! with its reason (`core.refusing`), and reached by no caller: a weight that is not transposed (`qvm`, `qmm_n`,
-//! `gather_qvm`), `nvfp4` (its global scale), affine bits 3, 5 and 6, x batch axes MLX would broadcast to w's, and
+//! `gather_qvm`), `nvfp4` (its global scale), x batch axes MLX would broadcast to w's, and
 //! indices of an integer type other than int32 and uint32.
 
 const std = @import("std");
@@ -43,6 +43,11 @@ fn vectorLimit(g: matmul.Gpu, k: usize, n: usize) usize {
     }
     if (ultra) return if (small) 32 else if (mid) 18 else 12;
     return if (small) 18 else if (mid) 12 else 10;
+}
+
+/// The vector limit on this GPU, for a test to probe both sides of it.
+pub fn vectorLimitHere(k: usize, n: usize) !usize {
+    return vectorLimit(try matmul.gpu(), k, n);
 }
 
 /// `get_pack_factor(bits, 32)`: codes a u32 holds.
@@ -413,18 +418,18 @@ fn gatherMmOffsets(indices: *const Tensor, groups: usize, rows: usize) Error!*Te
 fn validate(x: *const Tensor, w: *const Tensor, scales: *const Tensor, biases: ?*const Tensor, mode: Mode, group: usize, bits: usize) Error!struct { usize, usize } {
     switch (x.dtype) {
         .float16, .bfloat16, .float32 => {},
-        else => return error.TensorDtype,
+        else => return core.refusing("a quantized product with an x that is not a float", error.TensorDtype),
     }
     if (w.dtype != .uint32 or x.ndim < 1 or w.ndim < 2 or scales.ndim != w.ndim) return error.TensorShape;
     switch (mode) {
         .affine => {
             const b = biases orelse return core.refusing("an affine weight needs its biases", error.TensorUnsupported);
-            if (scales.dtype != x.dtype or b.dtype != x.dtype) return error.TensorDtype;
-            if (group == 0 or bits == 0 or 32 % bits != 0) return core.refusing("affine bits 3, 5 and 6 are not ported", error.TensorUnsupported);
+            if (scales.dtype != x.dtype or b.dtype != x.dtype) return core.refusing("an affine product whose scales or biases are not x's dtype: the seam promotes them first", error.TensorDtype);
+            if (group == 0 or !(bits >= 2 and bits <= 6 or bits == 8)) return core.refusing("affine bits are 2, 3, 4, 5, 6 or 8", error.TensorUnsupported);
         },
         .mxfp4, .mxfp8 => {
             if (biases != null) return core.refusing("an mx weight has no biases", error.TensorUnsupported);
-            if (scales.dtype != .uint8) return error.TensorDtype;
+            if (scales.dtype != .uint8) return core.refusing("an mx product whose scales are not uint8", error.TensorDtype);
             if (group != 32 or bits != @as(usize, if (mode == .mxfp4) 4 else 8)) return core.refusing("an mx mode takes group 32 and its own bits", error.TensorUnsupported);
         },
     }

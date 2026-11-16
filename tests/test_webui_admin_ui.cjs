@@ -22,7 +22,7 @@ const KEYS = [
   { name: 'ctx_size', type: 'int', min: 1, max: 4294967295 }, { name: 'kv_quant', type: 'choice', choices: ['off', '4', '6', '8'] },
   { name: 'mtp', type: 'bool' }, { name: 'mtp_acceptance', type: 'choice', choices: ['exact', 'typical', 'tokenv3'] }, { name: 'mtp_greedy_tail', type: 'bool' },
   { name: 'ssd_budget_gb', type: 'int', min: 1, max: 512 }, { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 },
-  { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' }, { name: 'ds41_cooler', type: 'bool' },
+  { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' }, { name: 'ds41_cooler', type: 'bool' }, { name: 'qwen_cooler', type: 'bool' },
   { name: 'max_tokens', type: 'int', min: 1, max: 4294967295 }, { name: 'yarn_factor', type: 'choice', choices: ['2', '4'] },
 ];
 const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
@@ -299,6 +299,34 @@ async function main() {
       assert.equal(await second.page.isDisabled(box), true);
       assert.equal(await second.page.isChecked(box), false, 'the flag means MLX');
       assert.match(await second.page.textContent(row('ds41_cooler')), /--ds41-mlx-engine/);
+      await second.context.close();
+    }
+
+    {
+      // Qwen3.8's Sushi Cooler engine: its own heading and key, the same checkbox; its launch flag locks it unticked.
+      const server = makeServer();
+      server.state.models[0].keys = [...BASE_KEYS, 'vision', 'qwen_cooler'];
+      const { page, context, errors } = await open(browser, server, '/models#Qwen-A');
+      const box = `${row('qwen_cooler')} input[type="checkbox"]`;
+      await page.waitForSelector(box);
+      assert.equal(await page.textContent('.grp > h4'), 'Qwen3.8 Inference');
+      assert.match(await page.textContent(`${row('qwen_cooler')} .lab`), /Use Sushi's Cooler Engine instead of MLX/);
+      assert.equal(await page.isChecked(box), true, 'ticked by default');
+      assert.equal(await page.getAttribute(`${row('qwen_cooler')} a.report`, 'href'), 'https://github.com/beamivalice/sushi/issues/new');
+      await page.click(box);
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForSelector('.toast');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'Qwen-A', set: { qwen_cooler: false } }, 'unticking saves false');
+      assert.deepEqual(errors, []);
+      await context.close();
+      const locked = makeServer();
+      locked.state.models[0].keys = [...BASE_KEYS, 'vision', 'qwen_cooler'];
+      locked.state.models[0].settings = allKeys({ qwen_cooler: keyState({ flag: '--qwen-mlx-engine', source: 'flag', locked: true }) });
+      const second = await open(browser, locked, '/models#Qwen-A');
+      await second.page.waitForSelector(box);
+      assert.equal(await second.page.isDisabled(box), true);
+      assert.equal(await second.page.isChecked(box), false, 'the flag means MLX');
+      assert.match(await second.page.textContent(row('qwen_cooler')), /--qwen-mlx-engine/);
       await second.context.close();
     }
 

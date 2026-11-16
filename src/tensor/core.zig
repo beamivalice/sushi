@@ -24,8 +24,8 @@ pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, Not
 /// that reports the refusal names it once and clears it.
 pub var refused_why: ?[]const u8 = null;
 
-/// `e` for a call the port refuses, with the restriction it enforces.
-pub fn refusing(comptime why: []const u8, e: Error) Error {
+/// `e` for a call the port refuses, with the restriction it enforces: a string that outlives the call.
+pub fn refusing(why: []const u8, e: Error) Error {
     refused_why = why;
     return e;
 }
@@ -904,6 +904,21 @@ pub fn freshHost(dtype: Dtype, shape: []const c_int) Error!*Tensor {
     return freshFor(dtype, shape, true);
 }
 
+/// MLX's `array(value, dtype)` for a float dtype: the value through float, rounded to the dtype on the host.
+pub fn scalar(value: f64, dtype: Dtype) Error!*Tensor {
+    const f: f32 = @floatCast(value);
+    return switch (dtype) {
+        .float32 => fromHost(std.mem.asBytes(&f), dtype, &.{}),
+        .float16 => fromHost(std.mem.asBytes(&@as(f16, @floatCast(f))), dtype, &.{}),
+        .bfloat16 => blk: {
+            const bits: u32 = @bitCast(f);
+            const rounded: u16 = if (std.math.isNan(f)) 0x7FC0 else @intCast((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
+            break :blk fromHost(std.mem.asBytes(&rounded), dtype, &.{});
+        },
+        else => refusing("a host scalar of a dtype that is not float", error.TensorDtype),
+    };
+}
+
 /// A tensor holding a copy of `bytes`.
 pub fn fromHost(bytes: []const u8, dtype: Dtype, shape: []const c_int) Error!*Tensor {
     const t = try freshFor(dtype, shape, true);
@@ -931,6 +946,30 @@ pub fn wrapMapped(ptr: [*]u8, dtype: Dtype, shape: []const c_int, payload: ?*any
     s.stats.mapped_bytes += len;
     mapped_total.store(s.stats.mapped_bytes, .monotonic);
     return t;
+}
+
+/// Moves the pool buffer under `t` into the mapping at `ptr` (`len` bytes, at least the store's), which the engine
+/// wraps as `wrapMapped` would: every tensor on the store reads the mapping from here on, and the pool takes its buffer
+/// back. For a weight a load built with an op, which would otherwise sit in the pool under every forward's cap.
+pub fn moveToMapped(t: *Tensor, ptr: [*]u8, len: usize, payload: ?*anyopaque, release_fn: MappedRelease) Error!void {
+    const s = try st();
+    const store = t.store;
+    if (store.origin != .pool) return refusing("a move into a mapping of a tensor not in the pool", error.TensorUnsupported);
+    if (t.twin.ctx != null or t.pending != null) return refusing("a move into a mapping of a tensor lent to MLX or with a write pending", error.TensorUnsupported);
+    if (len < store.len) return refusing("a move into a mapping smaller than the tensor's store", error.TensorUnsupported);
+    try syncState(s);
+    @memcpy(ptr[0..store.len], store.ptr[0..store.len]);
+    const buffer = try (try metal.device()).wrap(ptr, len);
+    const old = gpa.create(Store) catch {
+        buffer.release();
+        return error.OutOfMemory;
+    };
+    old.* = store.*;
+    old.refs = 1;
+    store.* = .{ .buffer = buffer, .at = 0, .ptr = ptr, .len = len, .refs = store.refs, .origin = .{ .mapped = .{ .payload = payload, .release = release_fn } } };
+    s.stats.mapped_bytes += len;
+    mapped_total.store(s.stats.mapped_bytes, .monotonic);
+    dropStore(old);
 }
 
 /// Another tensor on `base`'s bytes, to be given its own shape, strides and offset.

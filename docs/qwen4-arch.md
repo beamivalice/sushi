@@ -194,6 +194,23 @@ native tree.
   student's ([quality-kld](quality-kld.md#the-tool)).
 - Extension can lower quality on short prompts, and the longer window needs more KV memory; the page says both.
 
+## On Sushi Cooler
+
+- **Which loads**: an STQ pack (STQ experts, an affine or STQ trunk) runs on Sushi Cooler; any other pack runs on MLX
+  with the reason in its `[qwen4] forwards:` load line (`qwen4_cooler.sideOf`). Until Qwen passes its gate a served
+  load takes Cooler only under the `SUSHI_QWEN4_COOLER` dev lever; `--qwen-mlx-engine` and the model's `qwen_cooler`
+  setting keep it on MLX.
+- **What it refuses by name**: `--mtp-typical`, `--mtp-tokenv3`, `--mtp-greedy-tail` and `--drafter` (DFlash2): a Cooler
+  load accepts drafts by the exact rule only, and its `mtp_acceptance` / `mtp_greedy_tail` settings do not reach it.
+- **Vision**: the engine does not run the tower, so a Cooler load with vision is refused by name
+  (`error.VisionTowerNotPorted`); `--no-vision` or `--qwen-mlx-engine` serves the pack.
+- **One row**: its joined decode rows are not ported, so a Cooler load serves one row (`qwen4_sched.coolerRows`).
+- **The contract** (`src/cooler_contract_test.zig`, fixture `QWEN4_STQ_TINY` on the served geometry, head dim 256):
+  owned weights, no MLX call in a request or the unload, MLX's tokens greedy and through MTP rounds, every checked
+  failure of a load or a request freed, and an unload that gives back everything.
+- **Closures**: a Cooler load compiles none; each chain runs op by op, MLX's unfused bytes (the f32 GDN gate's compiled
+  kernel sits a few ulps from that chain).
+
 ## Oracle and fixtures
 
 - `tests/qwen4/dump_qwen4_exp_fixtures.py` is the oracle dumper. HF `hidden_states[i]` is the INPUT of layer i: compare

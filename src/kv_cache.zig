@@ -2083,6 +2083,7 @@ test "KVCache affine quant carries an asymmetric K/V too (--kv-quant on MLA)" {
         fn f(str: mlx.mlx_stream, len: c_int, d: c_int) !mlx.mlx_array {
             const shape = [_]c_int{ 1, 2, len, d };
             var a = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(a);
             try mlx.check(mlx.mlx_ones(&a, &shape, 4, .bfloat16, str));
             return a;
         }

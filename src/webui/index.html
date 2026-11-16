@@ -3650,6 +3650,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       "Turn it off if you only chat in text and want the memory back.", ""],
     ds41_cooler: ["Use Sushi's Cooler Engine instead of MLX", "Generates DeepSeek 4.1 text on Sushi Cooler, the engine built for this Mac, which uses less processor power than MLX. Untick it to go back to MLX if something breaks, and please report the problem.", "--ds41-mlx-engine",
       "Ticked is the default and the better choice. Untick it only if DeepSeek 4.1 answers wrongly or crashes, then report the issue so it can be fixed. It takes effect the next time the model loads.", "Sushi Cooler engine"],
+    qwen_cooler: ["Use Sushi's Cooler Engine instead of MLX", "Generates Qwen3.8 text on Sushi Cooler, the engine built for this Mac, which uses less processor power than MLX. Untick it to go back to MLX if something breaks, and please report the problem.", "--qwen-mlx-engine",
+      "Ticked is the default and the better choice. Untick it only if Qwen3.8 answers wrongly or crashes, then report the issue so it can be fixed. It takes effect the next time the model loads.", "Sushi Cooler engine"],
     max_tokens: ["Max generated tokens", "The most tokens a request may generate, thinking included, when an app sets no limit of its own. An app's own limit wins.", "--max-tokens",
       "A token is about three quarters of a word. Empty uses the model's default.", ""],
     yarn_factor: ["Context extension", "Stretches the model's context window with YaRN. It can lower quality on short prompts, and a longer context needs more memory.", "",
@@ -3675,7 +3677,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (factor) return `RoPE: yarn, factor ${factor}, original ${n(r.native)} · up to ${n(r.native * factor)} tokens`;
     return r.method === "yarn" ? `Model default: yarn, factor ${r.factor}, original ${n(r.native)} · up to ${n(r.window)} tokens` : `Model default: no extension · up to ${n(r.window)} tokens`;
   };
-  const isOff = (flag) => flag === "off" || flag === "false" || flag === "--ds41-mlx-engine" || /^--no-/.test(flag);
+  const isOff = (flag) => flag === "off" || flag === "false" || flag === "--ds41-mlx-engine" || flag === "--qwen-mlx-engine" || /^--no-/.test(flag);
   // The server may send a flag's whole spelling ("--mtp-tokenv3 0.5") or just its value ("8").
   const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check", skip_mem_preflight: "--skip-mem-preflight" }[key] ?? "";
   // The model-settings.json key beside its launch flag, after any engineering name the plain label replaced.
@@ -3978,11 +3980,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     return { row, badge, help, ctl, hint, bad };
   }
   // Keys whose bool control is a checkbox, ticked by default, rather than the Default/On/Off segments.
-  const CHECKBOX_KEYS = ["ds41_cooler"];
+  const CHECKBOX_KEYS = ["ds41_cooler", "qwen_cooler"];
   // The page that takes a report of a breaking bug.
   const ISSUES_URL = "https://github.com/beamivalice/sushi/issues/new";
   // A key's settings group: its rows sit under this heading, outside the "More settings" fold.
-  const GROUP_OF = { ds41_cooler: "DeepSeek 4.1 Inference" };
+  const GROUP_OF = { ds41_cooler: "DeepSeek 4.1 Inference", qwen_cooler: "Qwen3.8 Inference" };
   // A control for one key: a segmented Default/On/Off, a select, or a text box. `lock` disables it (showing the launch flag's
   // value when it has one); `allow` limits a select to the choices this model supports.
   function control(spec, onChange) {
@@ -4037,7 +4039,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     S.control = control(spec, onChange);
     S.remove = h("button", { class: "btn sm", type: "button", text: "Remove saved value", hidden: true, onclick: () => removeSaved(F, key) });
     S.ctl.append(S.control.node, S.hint, S.bad, S.remove);
-    if (key === "ds41_cooler") S.ctl.append(h("a", { class: "report", href: ISSUES_URL, target: "_blank", rel: "noopener noreferrer", text: "Report an issue on GitHub" }));
+    if (CHECKBOX_KEYS.includes(key)) S.ctl.append(h("a", { class: "report", href: ISSUES_URL, target: "_blank", rel: "noopener noreferrer", text: "Report an issue on GitHub" }));
     return S;
   }
   function patchSet(F, S, m) {

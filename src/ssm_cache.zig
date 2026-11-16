@@ -1392,6 +1392,7 @@ test "handOverSsmCheckpoint moves a tight live state without a copy, gives a vie
             defer _ = mlx.mlx_array_free(flat);
             try mlx.check(mlx.mlx_arange(&flat, 0.0, n, 1.0, .float32, st));
             var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_reshape(&out, flat, shape.ptr, shape.len, st));
             try mlx.check(mlx.mlx_array_eval(out));
             return out;

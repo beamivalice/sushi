@@ -113,6 +113,7 @@ pub fn quantize(rows: Arr, bits: u8, s: mlx.mlx_stream) !kv_quant.QuantizedKV {
 pub fn readable(rows: Arr, bits: u8, s: mlx.mlx_stream) !Arr {
     if (bits == 0) {
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_set(&out, rows));
         return out;
     }
@@ -187,6 +188,7 @@ pub fn randomRows(rows: c_int, cols: c_int, seed: u64, s: mlx.mlx_stream) !Arr {
     defer _ = mlx.mlx_array_free(scaled);
     try mlx.check(mlx.mlx_multiply(&scaled, normal, column, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, scaled, .bfloat16, s));
     return out;
 }
@@ -225,6 +227,7 @@ fn probe(latent: Latent, s: mlx.mlx_stream) !Arr {
     defer _ = mlx.mlx_vector_array_free(ov);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, slot.*.?, iv, cfg, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
     return out;
 }

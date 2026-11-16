@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`--qwen-mlx-engine` and the web UI's `qwen_cooler` checkbox keep a Qwen3.8 load on MLX**, the opt-out for when
+  Qwen STQ packs move to Sushi Cooler; until then every Qwen load decodes on MLX, and its load line says so.
+- **A Sushi Cooler load whose warm-up fails no longer serves**: the load fails by name instead of the first request
+  paying the failure.
 - **DeepSeek-V4.1-Flash's own release checkpoint (FP8 trunk, MXFP4 experts) now runs on Sushi Cooler too**, with
   the tokens MLX gives and at MLX's speed, so every DeepSeek pack decodes on the engine of our own at its load;
   `--ds41-mlx-engine` keeps MLX until 1.8.0.

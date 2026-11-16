@@ -15,6 +15,8 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const model_settings = @import("../model_settings.zig");
+const settings_resolve = @import("../settings_resolve.zig");
+const mtp_acceptance = @import("../mtp_acceptance.zig");
 const kv_quant = @import("../kv_quant.zig");
 const registry = @import("registry.zig");
 const arch_config = @import("config.zig");
@@ -31,6 +33,8 @@ pub const LaunchFlagUse = struct {
     mtp_typical: bool = false,
     mtp_tokenv3: bool = false,
     mtp_greedy_tail: bool = false,
+    /// `--drafter`: a DFlash2 assistant beside the model.
+    drafter: bool = false,
     /// `--mtp-min-depth` / `--mtp-max-depth` as given; 0 = not given.
     mtp_min_depth: u32 = 0,
     mtp_max_depth: u32 = 0,
@@ -161,12 +165,60 @@ pub fn coolerOffIgnoredLines(config: *const model.ModelConfig) [cooler_archs]?[]
     return out;
 }
 
-/// Whether the model's arch runs on Sushi Cooler, and so has an opt-out to turn it off.
-fn coolerOffered(config: *const model.ModelConfig) bool {
+/// Whether the model accepts drafts by the exact rule only, with no MTP tail, whatever its settings say.
+fn exactDraftsOnly(config: *const model.ModelConfig) bool {
     const tag = arch_config.tagOf(config) orelse return false;
     return switch (tag) {
-        inline else => |t| comptime arch_config.coolerOptOut(t) != null,
+        inline else => |t| if (comptime hasDecl(t, "exactDraftsOnly")) flagsOf(t).exactDraftsOnly(config) else false,
     };
+}
+
+/// The model's acceptance rule: its `mtp_acceptance` only where the key reaches it (`model_settings.applies`).
+pub fn mtpAcceptanceOf(config: *const model.ModelConfig) settings_resolve.Setting(mtp_acceptance.Mode) {
+    const reaches = model_settings.applies("mtp_acceptance", settingsFit(config));
+    return settings_resolve.acceptanceFor(if (reaches) config.mtp_acceptance_override else null);
+}
+
+/// The model's greedy tail: its `mtp_greedy_tail` only where the key reaches it.
+pub fn greedyTailOf(config: *const model.ModelConfig) settings_resolve.Setting(bool) {
+    const reaches = model_settings.applies("mtp_greedy_tail", settingsFit(config));
+    return settings_resolve.greedyTailFor(if (reaches) config.mtp_greedy_tail_override else null);
+}
+
+/// The model setting that turns the model's arch off Sushi Cooler; null for an arch without the engine.
+fn coolerSettingName(config: *const model.ModelConfig) ?[]const u8 {
+    const tag = arch_config.tagOf(config) orelse return null;
+    return switch (tag) {
+        inline else => |t| if (comptime arch_config.coolerOptOut(t)) |o| o.setting else null,
+    };
+}
+
+/// The model's own Sushi Cooler setting out of its settings row; null when unset or the arch has no engine.
+pub fn coolerSettingOf(config: *const model.ModelConfig, o: model_settings.Override) ?bool {
+    const tag = arch_config.tagOf(config) orelse return null;
+    return switch (tag) {
+        inline else => |t| if (comptime arch_config.coolerOptOut(t)) |opt| @field(o, opt.setting) else null,
+    };
+}
+
+/// Sets the model's own Sushi Cooler setting in `o` to `v`; an arch without the engine has none to set.
+pub fn putCoolerSetting(config: *const model.ModelConfig, o: *model_settings.Override, v: ?bool) void {
+    const tag = arch_config.tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| if (comptime arch_config.coolerOptOut(t)) |opt| {
+            @field(o, opt.setting) = v;
+        },
+    }
+}
+
+/// A Sushi Cooler setting the row carries for another arch than the model's: its load names it as ignored.
+pub fn strayCoolerSetting(config: *const model.ModelConfig, o: model_settings.Override) ?[]const u8 {
+    const own = coolerSettingName(config);
+    inline for (comptime std.meta.tags(registry.Tag)) |t| if (comptime arch_config.coolerOptOut(t)) |opt| {
+        const mine = if (own) |n| std.mem.eql(u8, n, opt.setting) else false;
+        if (!mine and @field(o, opt.setting) != null) return opt.setting;
+    };
+    return null;
 }
 
 /// The facts `model_settings.applies` decides a key's reach from, so the settings API and the loader's ignored-key lines agree.
@@ -184,7 +236,8 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .kv_choices = kvQuantChoices(config),
         .context_cap = config.contextCap(),
         .reads_yarn = arch_config.fact(config, "reads_yarn"),
-        .cooler_offered = coolerOffered(config),
+        .cooler_setting = coolerSettingName(config),
+        .exact_drafts_only = exactDraftsOnly(config),
     };
 }
 
@@ -203,13 +256,13 @@ pub fn settingsSsdPrefetchIgnoredLine(config: *const model.ModelConfig) ?[]const
     return "model-settings.json ssd_prefetch is ignored: this model has no expert prefetcher";
 }
 
-/// A model-settings.json `ds41_cooler` on an arch with no Sushi Cooler is ignored with this one line, as `ssd_prefetch` is.
+/// Another arch's Sushi Cooler setting in the model's row is ignored with this one line, as `ssd_prefetch` is.
 pub fn settingsCoolerIgnoredLine(config: *const model.ModelConfig) ?[]const u8 {
-    if (coolerOffered(config) or config.cooler_override == null) return null;
-    inline for (comptime std.meta.tags(registry.Tag)) |t| {
-        if (comptime hasDecl(t, "cooler_setting_elsewhere")) return flagsOf(t).cooler_setting_elsewhere;
-    }
-    return "model-settings.json ds41_cooler is ignored: this model has no Sushi Cooler engine";
+    const stray = config.cooler_setting_stray orelse return null;
+    inline for (comptime std.meta.tags(registry.Tag)) |t| if (comptime arch_config.coolerOptOut(t)) |opt| {
+        if (std.mem.eql(u8, stray, opt.setting)) return "model-settings.json " ++ opt.setting ++ " is ignored: it turns Sushi Cooler off for " ++ registry.Mod(t).model_types[0] ++ " only";
+    };
+    return null;
 }
 
 /// A model-settings.json `kv_quant` on an arch with no KV cache is ignored with this one line, never a refusal:
@@ -471,7 +524,9 @@ test "--ds41-mlx-engine takes no value and keeps DeepSeek loads on MLX; a model 
     try testing.expectEqual(@as(usize, 0), i);
     try testing.expectEqual(@as(usize, 1), model.cooler_off.count());
     var dsv41 = model.ModelConfig{ .model_type = "deepseek_v41" };
-    dsv41.cooler_override = false;
+    dsv41.cooler_override = coolerSettingOf(&dsv41, .{ .ds41_cooler = false });
+    try testing.expectEqual(@as(?bool, false), dsv41.cooler_override);
+    dsv41.cooler_setting_stray = strayCoolerSetting(&dsv41, .{ .ds41_cooler = false });
     for (coolerOffIgnoredLines(&dsv41)) |line| try testing.expect(line == null);
     try testing.expect(archFlagRefusal(&dsv41, .{}) == null);
     try testing.expect(settingsCoolerIgnoredLine(&dsv41) == null);
@@ -488,7 +543,54 @@ test "--ds41-mlx-engine takes no value and keeps DeepSeek loads on MLX; a model 
         try testing.expectEqual(@as(usize, 1), named);
         try testing.expect(settingsCoolerIgnoredLine(&cfg) == null);
         try testing.expect(!model_settings.applies("ds41_cooler", settingsFit(&cfg)));
-        cfg.cooler_override = false;
-        try testing.expectEqualStrings("model-settings.json ds41_cooler is ignored: only deepseek_v41 runs on Sushi Cooler", settingsCoolerIgnoredLine(&cfg).?);
+        try testing.expectEqual(@as(?bool, null), coolerSettingOf(&cfg, .{ .ds41_cooler = false }));
+        cfg.cooler_setting_stray = strayCoolerSetting(&cfg, .{ .ds41_cooler = false });
+        try testing.expectEqualStrings("model-settings.json ds41_cooler is ignored: it turns Sushi Cooler off for deepseek_v41 only", settingsCoolerIgnoredLine(&cfg).?);
     }
+}
+
+test "--qwen-mlx-engine takes no value and keeps Flash-Next loads on MLX; a model of another arch loads as it would, its load naming the flag, and qwen_cooler is ignored there" {
+    if (!built("qwen4_exp")) return error.SkipZigTest;
+    const saved = model.cooler_off;
+    defer model.cooler_off = saved;
+    model.cooler_off = .empty;
+    var i: usize = 0;
+    try testing.expectEqual(Parsed.applied, parseOption(&.{ "--qwen-mlx-engine", "--next" }, &i).?);
+    try testing.expectEqual(@as(usize, 0), i);
+    var qwen = model.ModelConfig{ .model_type = "qwen4_exp" };
+    for (coolerOffIgnoredLines(&qwen)) |line| try testing.expect(line == null);
+    try testing.expect(archFlagRefusal(&qwen, .{}) == null);
+    try testing.expect(model_settings.applies("qwen_cooler", settingsFit(&qwen)));
+    try testing.expect(!model_settings.applies("ds41_cooler", settingsFit(&qwen)));
+    try testing.expectEqual(@as(?bool, false), coolerSettingOf(&qwen, .{ .qwen_cooler = false, .ds41_cooler = true }));
+    qwen.cooler_setting_stray = strayCoolerSetting(&qwen, .{ .qwen_cooler = false, .ds41_cooler = true });
+    try testing.expectEqualStrings("model-settings.json ds41_cooler is ignored: it turns Sushi Cooler off for deepseek_v41 only", settingsCoolerIgnoredLine(&qwen).?);
+    for ([_][]const u8{ "deepseek_v41", "mimo_v2", "glm5_next" }) |arch| {
+        if (!built(arch)) continue;
+        var cfg = model.ModelConfig{ .model_type = arch };
+        try testing.expect(archFlagRefusal(&cfg, .{}) == null);
+        var named: usize = 0;
+        for (coolerOffIgnoredLines(&cfg)) |line| if (line) |l| {
+            try testing.expectEqualStrings("--qwen-mlx-engine has no effect on this model: it keeps qwen4_exp loads on MLX", l);
+            named += 1;
+        };
+        try testing.expectEqual(@as(usize, 1), named);
+        try testing.expect(!model_settings.applies("qwen_cooler", settingsFit(&cfg)));
+        cfg.cooler_setting_stray = strayCoolerSetting(&cfg, .{ .qwen_cooler = false });
+        try testing.expectEqualStrings("model-settings.json qwen_cooler is ignored: it turns Sushi Cooler off for qwen4_exp only", settingsCoolerIgnoredLine(&cfg).?);
+    }
+}
+
+test "a Qwen load on Sushi Cooler accepts drafts by the exact rule whatever its settings say; on MLX its settings reach it" {
+    if (!built("qwen4_exp")) return error.SkipZigTest;
+    var c = model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .expert_quant_codebook = .spec1, .cooler_for_test = true };
+    c.mtp_acceptance_override = .{ .typical = .{ .delta = 0.1 } };
+    c.mtp_greedy_tail_override = true;
+    try testing.expect(!model_settings.applies("mtp_acceptance", settingsFit(&c)));
+    try testing.expectEqualStrings("On Sushi Cooler, drafts are accepted by the exact rule only, with no MTP tail.", model_settings.unavailable("mtp_greedy_tail", settingsFit(&c)).?);
+    try testing.expect(mtpAcceptanceOf(&c).value == .exact);
+    try testing.expect(!greedyTailOf(&c).value);
+    c.cooler_ask = .setting;
+    try testing.expect(mtpAcceptanceOf(&c).value == .typical);
+    try testing.expect(greedyTailOf(&c).value);
 }

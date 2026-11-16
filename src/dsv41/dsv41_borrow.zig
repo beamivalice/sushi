@@ -235,11 +235,8 @@ pub fn leaveVision(config: *const ModelConfig, ops: PoolOps) void {
 /// state before its first forward) and the pool cap drops back to the decode cap.
 pub fn endRequest(config: *const ModelConfig, ops: PoolOps) bool {
     if (pool_ram_cap == 0 or !arch_config.isOf(config, "dsv41")) return false;
-    if (ownsEngine(config)) {
-        // The next request bills the engine's cap from its own length: the shortest one covers what stays.
-        ops.set_own(ownCap(&config.dsv41.?, 1));
-        return false;
-    }
+    // The engine's rest is the shared Cooler seam's (`arch/cooler.zig`): the decode pool the ledger parks.
+    if (ownsEngine(config)) return false;
     const was_on = transient_now;
     if (was_on) setTransient(0, ops);
     return moveCap(config.expertPoolBytes(), config, ops) or was_on;
@@ -741,7 +738,7 @@ test "dsv41 borrow: unloading DeepSeek gives the next model the process-wide poo
     try withPoolState(8 << 30, &Body.run);
 }
 
-test "dsv41 borrow: with decode on the engine of our own every forward installs its cap there, and a request's end the shortest one" {
+test "dsv41 borrow: with decode on the engine of our own every forward installs its cap there, and a request's end leaves it to the shared seam" {
     const Body = struct {
         fn run() anyerror!void {
             var config = try dsv41Config();
@@ -755,8 +752,10 @@ test "dsv41 borrow: with decode on the engine of our own every forward installs 
             // A prefill chunk takes the cap less MLX's share.
             _ = enterForward(2048, 225_000, &config, c, PoolProbe.ops);
             try testing.expectEqual(c.forwardCap(2048, 225_000), PoolProbe.own);
+            const sets = PoolProbe.own_sets;
             _ = endRequest(&config, PoolProbe.ops);
-            try testing.expectEqual(c.forwardCap(verify_rows, 1), PoolProbe.own);
+            try testing.expectEqual(sets, PoolProbe.own_sets);
+            try testing.expectEqual(c.forwardCap(verify_rows, 1), @import("../arch/cooler.zig").restCap(&config));
             // The unload trims the engine's pool and leaves it without a cap for the next load.
             _ = unloadModel(&config, PoolProbe.ops);
             try testing.expectEqual(@as(u64, std.math.maxInt(u64)), PoolProbe.own);
@@ -943,15 +942,7 @@ test "dsv41 borrow: the ledger bills the pool that is parked: MLX's decode pool,
     try testing.expectEqual(c.forwardCap(verify_rows, 1), config.expertPoolBytes());
     try testing.expect(config.expertPoolBytes() < cfg_mod.dsv41_pool_bytes);
     // What a request's end leaves the engine is what the ledger billed.
-    const Body = struct {
-        fn run() anyerror!void {
-            var cfg = try dsv41Config();
-            cfg.dsv41.?.cooler_for_test = true;
-            _ = endRequest(&cfg, PoolProbe.ops);
-            try testing.expectEqual(cfg.expertPoolBytes(), PoolProbe.own);
-        }
-    };
-    try withPoolState(8 << 30, &Body.run);
+    try testing.expectEqual(config.expertPoolBytes(), @import("../arch/cooler.zig").restCap(&config));
 }
 
 test "the opt-out flag reaches a DeepSeek load's decode side through the parse and the settings stamp, and outranks a test's side" {

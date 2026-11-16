@@ -158,12 +158,12 @@ fn letter(yes: bool) u8 {
 /// and a batched `a` against one matrix is flattened into rows.
 pub fn matmul(a_in: *Tensor, b_in: *Tensor) Error!*Tensor {
     if (a_in.ndim == 0 or b_in.ndim == 0) return error.TensorShape;
-    if (a_in.dtype != b_in.dtype) return error.TensorDtype;
+    if (a_in.dtype != b_in.dtype) return core.refusing("a matmul of operands of two dtypes", error.TensorDtype);
     switch (a_in.dtype) {
         .float16, .bfloat16, .float32 => {},
-        else => return error.TensorDtype,
+        else => return core.refusing("a matmul in a dtype other than f32, f16 and bf16", error.TensorDtype),
     }
-    if (a_in.size() == 0 or b_in.size() == 0) return error.TensorUnsupported;
+    if (a_in.size() == 0 or b_in.size() == 0) return core.refusing("a matmul of an empty operand", error.TensorUnsupported);
     var a = if (a_in.ndim == 1) try ops.expandDims(a_in, 0) else try core.share(a_in);
     defer core.release(a);
     var b = if (b_in.ndim == 1) try ops.expandDims(b_in, 1) else try core.share(b_in);
@@ -233,9 +233,9 @@ pub fn matmul(a_in: *Tensor, b_in: *Tensor) Error!*Tensor {
 /// nothing is padded.
 pub fn matmulRowsAs(a: *Tensor, b: *Tensor, rows_as: usize) Error!*Tensor {
     if (a.ndim != 2 or b.ndim != 2 or a.dtype != b.dtype) return error.TensorShape;
-    if (a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return error.TensorDtype;
+    if (a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return core.refusing("a matmul in a dtype other than f32, f16 and bf16", error.TensorDtype);
     if (a.shape[1] != b.shape[0]) return error.TensorShape;
-    if (a.size() == 0 or b.size() == 0 or rows_as < 2) return error.TensorUnsupported;
+    if (a.size() == 0 or b.size() == 0 or rows_as < 2) return core.refusing("a rows-as matmul of an empty operand or under two rows", error.TensorUnsupported);
     return product(a, b, rows_as);
 }
 

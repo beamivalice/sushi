@@ -336,6 +336,7 @@ fn bf16Rows(values: []const f32, shape: []const c_int, s: mlx.mlx_stream) !mlx.m
     const f = mlx.mlx_array_new_data(values.ptr, shape.ptr, @intCast(shape.len), .float32);
     defer _ = mlx.mlx_array_free(f);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
     return out;
 }

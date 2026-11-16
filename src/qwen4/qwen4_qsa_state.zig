@@ -224,6 +224,7 @@ fn qsaTestMeanBlocks(keys: mlx.mlx_array, row0: c_int, n_blocks: c_int, ratio: c
     defer _ = mlx.mlx_array_free(mean);
     try mlx.check(mlx.mlx_mean_axis(&mean, f32b, 2, false, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, mean, .bfloat16, s));
     return out;
 }
@@ -786,6 +787,7 @@ test "ssmEntryBytes bills each QSA capacity buffer once, never the view beside i
         fn rows(buf: mlx.mlx_array, n: c_int, st: mlx.mlx_stream) !mlx.mlx_array {
             const sh = mlx.getShape(buf);
             var v = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(v);
             try mlx.check(mlx.mlx_slice(&v, buf, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ sh[0], n, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, st));
             return v;
         }

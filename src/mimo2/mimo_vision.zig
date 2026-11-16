@@ -446,6 +446,7 @@ pub const MimoVision = struct {
         const idx = hostI32(order);
         defer _ = mlx.mlx_array_free(idx);
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_take_axis(&out, x, idx, 0, self.s));
         return out;
     }
@@ -634,12 +635,14 @@ fn hostI32(v: []const i32) mlx.mlx_array {
 
 fn unary(comptime f: anytype, a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(f(&out, a, s));
     return out;
 }
 
 fn copyOf(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_contiguous(&out, a, false, s));
     return out;
 }
@@ -648,12 +651,14 @@ fn rmsNorm(x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array
     const wf = try astype(w, .float32, s);
     defer _ = mlx.mlx_array_free(wf);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_fast_rms_norm(&out, x, wf, MimoVision.EPS, s));
     return out;
 }
 
 fn transposeAxes(a: mlx.mlx_array, axes: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_transpose_axes(&out, a, axes.ptr, axes.len, s));
     return out;
 }
@@ -661,6 +666,7 @@ fn transposeAxes(a: mlx.mlx_array, axes: []const c_int, s: mlx.mlx_stream) !mlx.
 fn slice(a: mlx.mlx_array, start: []const c_int, stop: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     var strides: [4]c_int = @splat(1);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_slice(&out, a, start.ptr, start.len, stop.ptr, stop.len, &strides, start.len, s));
     return out;
 }
@@ -674,6 +680,7 @@ fn padAxis(a: mlx.mlx_array, axis: c_int, low: c_int, high: c_int, s: mlx.mlx_st
     const lo = [_]c_int{low};
     const hi = [_]c_int{high};
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_pad(&out, a, &axes, 1, &lo, 1, &hi, 1, zero, "constant", s));
     return out;
 }
@@ -688,6 +695,7 @@ fn blocksOf(a: mlx.mlx_array, heads: c_int, nb: c_int, b: c_int, d: c_int, s: ml
 
 fn sdpa(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, mask: ?mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     const none = mlx.mlx_array{ .ctx = null };
     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k, v, scale, if (mask != null) "array" else "", mask orelse none, none, false, s));
     return out;

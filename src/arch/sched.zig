@@ -468,6 +468,7 @@ pub fn afterSpecBlock(slot: *Slot, gen: *Generator, block: []const u32) void {
 
 /// A request ended on this model.
 pub fn endRequest(config: *const ModelConfig) void {
+    defer @import("cooler.zig").endRequest(config);
     const tag = tagOfConfig(config) orelse return;
     switch (tag) {
         inline else => |t| if (comptime has(t, "endRequest")) S(t).endRequest(config),

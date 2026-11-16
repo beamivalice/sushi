@@ -110,6 +110,35 @@ inline fn tally(comptime name: []const u8) void {
     if (comptime builtin.is_test) by_name.add(name) else if (callNamesTraced()) by_name.add(name);
 }
 
+/// The tally's own reads of an array: not calls of the process it describes.
+const untallied = struct {
+    const ndim = @extern(*const fn (mlx_array) callconv(.c) usize, .{ .name = "mlx_array_ndim" });
+    const shape = @extern(*const fn (mlx_array) callconv(.c) [*]const c_int, .{ .name = "mlx_array_shape" });
+    const dtype = @extern(*const fn (mlx_array) callconv(.c) mlx_dtype, .{ .name = "mlx_array_dtype" });
+};
+
+/// An attention call MLX runs, tallied as `sdpa <route> ...` (`attention.tallyKey`), for the arms a load reaches.
+fn noteAttention(q: mlx_array, k: mlx_array, v: mlx_array, mode: [*:0]const u8, mask: mlx_array, force_fused: bool) void {
+    if (comptime !builtin.is_test) if (!callNamesTraced()) return;
+    if (untallied.ndim(q) != 4 or untallied.ndim(k) != 4 or untallied.ndim(v) != 4) return;
+    const qs = untallied.shape(q);
+    const ks = untallied.shape(k);
+    const kind: engine.attention.MaskKind = if (std.mem.eql(u8, std.mem.span(mode), "causal")) .causal else if (mask.ctx != null) .array else .none;
+    var buf: [96]u8 = undefined;
+    const key = engine.attention.tallyKey(&buf, .{
+        .q_len = @intCast(qs[2]),
+        .k_len = @intCast(ks[2]),
+        .heads = @intCast(qs[1]),
+        .kv_heads = @intCast(@max(ks[1], 1)),
+        .q_dim = @intCast(qs[3]),
+        .v_dim = @intCast(untallied.shape(v)[3]),
+        .dtype = untallied.dtype(q),
+        .mask = kind,
+        .force_fused = force_fused,
+    }) catch return;
+    by_name.addJoined("sdpa ", key);
+}
+
 var call_names_env: ?bool = null;
 
 /// `SUSHI_MLX_CALLS_TRACE`: a served process tallies its calls by entry point too, for the request log.
@@ -120,7 +149,9 @@ pub fn callNamesTraced() bool {
 /// Tallies per entry point, to split a count by kind: in tests, and in a process that traces them. An op that took a wrapped mapping of the engine's (a
 /// weight) on MLX's side is also counted under `lend <op>`, which is no call.
 const Tally = struct {
-    const capacity = 512;
+    const capacity = 1024;
+    /// Counts past a full table land here, so a census reads that it missed some instead of losing them.
+    const full = "(tally full)";
     names: [capacity][]const u8 = undefined,
     counts: [capacity]u64 = @splat(0),
     used: usize = 0,
@@ -135,9 +166,37 @@ const Tally = struct {
                 return;
             }
         }
+        self.insert(name);
+    }
+
+    fn insert(self: *Tally, name: []const u8) void {
+        if (self.used >= capacity - 1) {
+            for (self.names[0..self.used], self.counts[0..self.used]) |n, *c| if (n.ptr == full.ptr) {
+                c.* += 1;
+                return;
+            };
+            self.names[self.used] = full;
+            self.counts[self.used] = 1;
+            self.used += 1;
+            return;
+        }
         self.names[self.used] = name;
         self.counts[self.used] = 1;
         self.used += 1;
+    }
+
+    /// `prefix ++ name` for a name known only at run time: copied for the process on its first count.
+    fn addJoined(self: *Tally, comptime prefix: []const u8, name: []const u8) void {
+        while (self.busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        defer self.busy.store(false, .release);
+        for (self.names[0..self.used], self.counts[0..self.used]) |n, *c| {
+            if (n.len == prefix.len + name.len and std.mem.startsWith(u8, n, prefix) and std.mem.endsWith(u8, n, name)) {
+                c.* += 1;
+                return;
+            }
+        }
+        if (self.used >= capacity - 1) return self.insert(full);
+        self.insert(std.mem.concat(std.heap.page_allocator, u8, &.{ prefix, name }) catch full);
     }
 
     fn list(self: *Tally, out: *std.ArrayList(NameCount), gpa: std.mem.Allocator) !void {
@@ -147,6 +206,20 @@ const Tally = struct {
     }
 };
 var by_name: Tally = .{};
+
+test "a full call tally counts what it cannot name under one entry, and writes nothing past its table" {
+    const t = std.testing;
+    const tally_box = try std.heap.page_allocator.create(Tally);
+    defer std.heap.page_allocator.destroy(tally_box);
+    tally_box.* = .{};
+    var buf: [16]u8 = undefined;
+    const extra = 77;
+    for (0..Tally.capacity - 1 + extra) |i| tally_box.addJoined("n", try std.fmt.bufPrint(&buf, "{d}", .{i}));
+    tally_box.add("one more");
+    try t.expectEqual(@as(usize, Tally.capacity), tally_box.used);
+    try t.expectEqualStrings(Tally.full, tally_box.names[Tally.capacity - 1]);
+    try t.expectEqual(@as(u64, extra + 1), tally_box.counts[Tally.capacity - 1]);
+}
 var ops_by_name: Tally = .{};
 
 /// TEST-ONLY: counts `a` under `lend <where>` when it is a wrapped mapping of the engine's taken on MLX's side.
@@ -165,6 +238,11 @@ pub inline fn noteWeightLend(comptime where: []const u8, a: mlx_array) void {
 }
 
 pub const NameCount = struct { name: []const u8, count: u64 };
+
+/// A custom kernel launched on MLX's side, counted under `kernel <name>`: which of a model's kernels a census reaches.
+pub fn noteKernelLaunch(name: []const u8) void {
+    if (comptime builtin.is_test) by_name.addJoined("kernel ", name) else if (callNamesTraced()) by_name.addJoined("kernel ", name);
+}
 
 /// TEST-ONLY: the calls so far, per entry point.
 pub fn callsByName(out: *std.ArrayList(NameCount), gpa: std.mem.Allocator) !void {
@@ -194,6 +272,7 @@ fn Counted(comptime name: [:0]const u8, comptime F: type) type {
     return struct {
         inline fn go(args: std.meta.ArgsTuple(F)) @typeInfo(F).@"fn".return_type.? {
             tally(name);
+            if (comptime std.mem.eql(u8, name, "mlx_fast_scaled_dot_product_attention")) noteAttention(args[1], args[2], args[3], args[5], args[6], args[8]);
             return @call(.auto, @extern(*const F, .{ .name = name }), args);
         }
     };
@@ -225,7 +304,10 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
                     if (R != c_int) @compileError("routed: the engine has no " ++ name);
                     return engine.refuse(name, "the engine has no such op");
                 },
-                .leak => return if (R == c_int) engine.refuse(name, "an MLX stream inside a forward of the engine") else unreachable,
+                .leak => return if (R == c_int) blk: {
+                    engine.traceRefusal();
+                    break :blk engine.refuse(name, "an MLX stream inside a forward of the engine");
+                } else unreachable,
                 .mlx => {
                     // An op carries a stream; a free or a read of a handle does not.
                     if (comptime carriesStream()) {
@@ -1813,6 +1895,11 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     mlx_error_len = 0;
     mlx_error_latched.store(false, .release);
     return buf[0..n];
+}
+
+/// Whether an error is latched, left for its reader.
+pub fn errorLatched() bool {
+    return mlx_error_latched.load(.acquire);
 }
 
 /// The latched message copied into `buf` without clearing it, for a log line that names the cause of a failure.

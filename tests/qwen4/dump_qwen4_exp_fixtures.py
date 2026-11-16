@@ -122,6 +122,20 @@ TINY = dict(
     norm_topk_prob=True,
 )
 
+# A trellis bank's sides are multiples of 128 (the encoder's `bankOk`) and an affine trunk linear's input a multiple
+# of its group of 64: the toy at those widths, for an STQ pack. Its heads are 64 wide, the affine8 KV cache's group.
+# 64 experts top-8: the grouped verify serves a group while tokens x top_k / experts < 4
+# (`qwen4VerifyRowsEligible`), so 8 experts top-8 refused every group of 4 tokens or more.
+# Its attention and GatedDeltaNet heads are the served pack's (24 query and 2 key heads of 256, a 4-head indexer of 128,
+# 16 key and 48 value heads of 128), so a test on it takes the attention and QSA kernels a served pack takes; only the
+# QSA budget stays small, so a short prompt reaches it.
+STQ_GEOMETRY = dict(hidden_size=128, moe_intermediate_size=128, shared_expert_intermediate_size=128, hc_lowrank=64,
+                    num_experts=64, num_attention_heads=24, num_key_value_heads=2, head_dim=256,
+                    indexer_n_heads=4, indexer_kv_heads=1, indexer_head_dim=128,
+                    linear_num_key_heads=16, linear_num_value_heads=48, linear_key_head_dim=128, linear_value_head_dim=128,
+                    rope_parameters=dict(TINY["rope_parameters"], mrope_section=[11, 11, 10]))
+REAL_VOCAB = dict(vocab_size=248320, bos_token_id=248044, eos_token_id=248044)
+
 T_PREFILL = 14
 T_DECODE = 6
 
@@ -225,6 +239,8 @@ def build(out, vision=False):
     text_cfg["model_type"] = "qwen4_exp_text"
     text_cfg["layer_types"] = ["full_attention" if (i + 1) % 4 == 0 else "linear_attention"
                                for i in range(TINY["num_hidden_layers"])]
+    # As the released checkpoint's config: the encoder rounds the head's experts only when it names its layers.
+    text_cfg["mtp_num_hidden_layers"] = 1
     full = {"architectures": ["Qwen4ExpForConditionalGeneration"], "model_type": "qwen4_exp",
             "text_config": text_cfg, "tie_word_embeddings": False}
     if vision:
@@ -633,6 +649,10 @@ def main():
     b.add_argument("--topk", type=int, default=None,
                    help="num_experts_per_tok (< num_experts covers top-k SELECTION; ties then acquit more rows)")
     b.add_argument("--yarn", action="store_true", help="YaRN rope_parameters (window 8 -> 32): the context-extension oracle")
+    b.add_argument("--geometry", choices=["default", "stq"], default="default",
+                   help="stq: hidden and expert widths of 128, the narrowest a trellis bank takes")
+    b.add_argument("--real-vocab", action="store_true",
+                   help="the released checkpoint's vocabulary and bos/eos ids, so tests written with real token ids run")
     d = sub.add_parser("dump")
     d.add_argument("--hf", required=True)
     d.add_argument("--pack", required=True)
@@ -645,6 +665,10 @@ def main():
         if a.yarn:
             TINY["rope_parameters"] = dict(TINY["rope_parameters"], **YARN)
             TINY["max_position_embeddings"] = YARN_MAX_POS
+        if a.geometry == "stq":
+            TINY.update(STQ_GEOMETRY)
+        if a.real_vocab:
+            TINY.update(REAL_VOCAB)
         build(os.path.expanduser(a.out), a.vision)
     else:
         # The reference is built from TINY, so a `build --topk` checkpoint
@@ -656,6 +680,9 @@ def main():
         # ... and its rope block: a `build --yarn` checkpoint renders with YaRN.
         TINY["rope_parameters"] = tc.get("rope_parameters", TINY["rope_parameters"])
         TINY["max_position_embeddings"] = tc.get("max_position_embeddings", TINY["max_position_embeddings"])
+        # ... and its widths: a `build --geometry stq` checkpoint is 128 wide.
+        for k in list(STQ_GEOMETRY) + list(REAL_VOCAB):
+            TINY[k] = tc.get(k, TINY[k])
         dump(os.path.expanduser(a.hf), os.path.expanduser(a.pack), a.out, a.vision)
 
 

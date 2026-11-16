@@ -25,6 +25,12 @@ pub const flags = @import("dsv41_flags.zig"); // slot:flags (S2h)
 
 pub const drafter = @import("dsv41_drafter.zig");
 
+/// Its forwards install their own caps beside the expert pools they release (`dsv41_borrow`), and a request's end leaves
+/// the engine the decode pool the ledger parks (`arch/cooler.zig`).
+pub const cooler_own_caps = true;
+pub fn coolerRestCap(config: *const Config) u64 {
+    return config.expertPoolBytes();
+}
 pub const sched = @import("dsv41_sched.zig"); // slot:sched (S2b)
 
 pub const prefix = @import("dsv41_prefix.zig"); // slot:prefix (S2c)

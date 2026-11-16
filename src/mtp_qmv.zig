@@ -142,14 +142,15 @@ var stream_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
-const Key = struct { dims: [8]c_int = @splat(0), ndim: usize, n: c_int, gs: c_int };
+/// `side`: an entry's scalars belong to the side that made them (1 the engine's, 0 MLX's).
+const Key = struct { dims: [8]c_int = @splat(0), ndim: usize, n: c_int, gs: c_int, side: u1 };
 const Entry = struct { key: Key, arm: Arm, cfg: mlx.mlx_fast_metal_kernel_config, k_size: mlx.mlx_array, n_size: mlx.mlx_array, tick: u64 };
 var entries: [128]Entry = undefined;
 var count: usize = 0;
 var tick: u64 = 0;
 
-fn configuration(xs: []const c_int, n: c_int, k: c_int, m: c_int, gs: c_int) !*const Entry {
-    var key = Key{ .ndim = xs.len, .n = n, .gs = gs };
+fn configuration(s: mlx.mlx_stream, xs: []const c_int, n: c_int, k: c_int, m: c_int, gs: c_int) !*const Entry {
+    var key = Key{ .ndim = xs.len, .n = n, .gs = gs, .side = @intFromBool(mlx.engine.isStream(s)) };
     @memcpy(key.dims[0..xs.len], xs);
     tick +%= 1;
     for (entries[0..count]) |*entry| {
@@ -194,6 +195,22 @@ fn configuration(xs: []const c_int, n: c_int, k: c_int, m: c_int, gs: c_int) !*c
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FAST", @intFromBool(fast)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RPS", rps));
     return store(key, .tile, cfg, k_size, n_size);
+}
+
+/// Frees side `side`'s entries, when the side's last model is gone.
+pub fn dropSide(side: u1) void {
+    var kept: usize = 0;
+    for (entries[0..count]) |entry| {
+        if (entry.key.side != side) {
+            entries[kept] = entry;
+            kept += 1;
+            continue;
+        }
+        _ = mlx.mlx_fast_metal_kernel_config_free(entry.cfg);
+        _ = mlx.mlx_array_free(entry.k_size);
+        _ = mlx.mlx_array_free(entry.n_size);
+    }
+    count = kept;
 }
 
 fn store(key: Key, arm: Arm, cfg: mlx.mlx_fast_metal_kernel_config, k_size: mlx.mlx_array, n_size: mlx.mlx_array) *const Entry {
@@ -245,7 +262,7 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx
         engaged = true;
         @import("log.zig").info("[mtp-qmv] row-identical affine8 projections engaged\n", .{});
     }
-    const cfg = try configuration(xs, n, k, @intCast(rows), gs);
+    const cfg = try configuration(s, xs, n, k, @intCast(rows), gs);
     rows_arm_calls[@intFromEnum(cfg.arm)] +%= 1;
     const tile_inputs = [_]mlx.mlx_array{ x, w, sc, bi, cfg.k_size, cfg.n_size };
     const stream_inputs = [_]mlx.mlx_array{ x, w, sc, bi };

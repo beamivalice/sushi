@@ -428,8 +428,8 @@ fn cachedConfig(key: CfgKey) !mlx.mlx_fast_metal_kernel_config {
     const cfg = try buildConfig(key);
     const victim = cfg_next % CFG_CAP;
     if (cfg_vals[victim]) |old| _ = mlx.mlx_fast_metal_kernel_config_free(old);
-    cfg_keys[victim] = key;
     cfg_vals[victim] = cfg;
+    cfg_keys[victim] = key;
     cfg_next += 1;
     return cfg;
 }
@@ -874,6 +874,7 @@ fn bf16Route(alloc: std.mem.Allocator, s: mlx.mlx_stream, tw: *const TestWeight,
     defer _ = mlx.mlx_array_free(wt);
     try mlx.check(mlx.mlx_transpose(&wt, wb, s));
     var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
     try mlx.check(mlx.mlx_matmul(&y, xa, wt, s));
     return y;
 }
@@ -882,6 +883,7 @@ fn uploadX(s: mlx.mlx_stream, x: []const f32, m: usize, k: usize, dtype: mlx.mlx
     const a = mlx.mlx_array_new_data(x.ptr, &[_]c_int{ 1, @intCast(m), @intCast(k) }, 3, .float32);
     defer _ = mlx.mlx_array_free(a);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, a, dtype, s));
     return out;
 }

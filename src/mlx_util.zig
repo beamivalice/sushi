@@ -26,6 +26,7 @@ pub fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     perm[ndim - 2] = @intCast(ndim - 1);
     perm[ndim - 1] = @intCast(ndim - 2);
     var w_t = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(w_t);
     try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, @intCast(ndim), s));
     return w_t;
 }
@@ -35,22 +36,27 @@ pub fn scalarOf(val: f32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     const raw = mlx.mlx_array_new_float(val);
     defer _ = mlx.mlx_array_free(raw);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, raw, dt, s));
     return out;
 }
 
-pub fn bf16Scalar(val: f32, s: mlx.mlx_stream) mlx.mlx_array {
-    const f32_arr = mlx.mlx_array_new_float(val);
-    defer _ = mlx.mlx_array_free(f32_arr);
-    var bf16_arr = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&bf16_arr, f32_arr, .bfloat16, s);
-    return bf16_arr;
+pub fn bf16Scalar(val: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    return scalarOf(val, .bfloat16, s);
+}
+
+/// A 0-d f32 host scalar, kept as is. Made on the engine it takes a pool buffer, which can be refused.
+pub fn f32Scalar(val: f32) !mlx.mlx_array {
+    const a = mlx.mlx_array_new_float(val);
+    if (a.ctx == null) return error.MlxError;
+    return a;
 }
 
 pub fn addOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const one = bf16Scalar(1.0, s);
+    const one = try bf16Scalar(1.0, s);
     defer _ = mlx.mlx_array_free(one);
     var result = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_add(&result, one, arr, s));
     return result;
 }
@@ -94,15 +100,16 @@ pub fn slidingDecodeMask(s: mlx.mlx_stream, kv_len: c_int, window: c_int) !mlx.m
     var too_old = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(too_old);
     try mlx.check(mlx.mlx_less(&too_old, positions, window_start, s));
-    const zero = bf16Scalar(0.0, s);
+    const zero = try bf16Scalar(0.0, s);
     defer _ = mlx.mlx_array_free(zero);
-    const neg_inf = bf16Scalar(-std.math.inf(f32), s);
+    const neg_inf = try bf16Scalar(-std.math.inf(f32), s);
     defer _ = mlx.mlx_array_free(neg_inf);
     var sw_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sw_mask);
     try mlx.check(mlx.mlx_where(&sw_mask, too_old, neg_inf, zero, s));
     const mask_shape = [_]c_int{ 1, 1, 1, kv_len };
     var mask_4d = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(mask_4d);
     try mlx.check(mlx.mlx_reshape(&mask_4d, sw_mask, &mask_shape, 4, s));
     return mask_4d;
 }
@@ -150,4 +157,26 @@ pub fn concatAxis0(s: mlx.mlx_stream, parts: []const mlx.mlx_array) !mlx.mlx_arr
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
     return out;
+}
+
+test "a scalar the engine's pool refuses is an error, never a handle kept with the refusal latched" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    defer mlx.engine.fault.disarm();
+    var said: [256]u8 = undefined;
+    mlx.engine.fault.arm(1);
+    try std.testing.expectError(error.MlxError, bf16Scalar(0.5, es));
+    _ = mlx.takeError(&said);
+    mlx.engine.fault.arm(1);
+    try std.testing.expectError(error.MlxError, f32Scalar(1e-6));
+    _ = mlx.takeError(&said);
+    mlx.engine.fault.disarm();
+    const ok = try f32Scalar(1e-6);
+    defer _ = mlx.mlx_array_free(ok);
+    try std.testing.expect(!mlx.errorPending());
 }

@@ -114,6 +114,7 @@ fn bf16Row(s: mlx.mlx_stream, rows: c_int, buf: []const f32) !mlx.mlx_array {
     const xf = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, rows, 512 }, 3, .float32);
     defer _ = mlx.mlx_array_free(xf);
     var x = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(x);
     try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
     return x;
 }

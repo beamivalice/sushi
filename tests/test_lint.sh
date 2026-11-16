@@ -254,6 +254,97 @@ printf '%s\n' 'const std = @import("std");' 'pub fn decode(s: []const u8) ?u21 {
 printf '%s\n' 'const std = @import("std");' 'fn f(s: []const u8) usize {' '    return std.unicode.utf8ByteSequenceLength(s[0]) catch 1;' '}' > "$TMP/t/src/p.zig"
 expect_green "utf8_seq.zig itself, and utf8ByteSequenceLength elsewhere"
 
+# rule refusing-eager
+tree
+printf '%s\n' 'const core = @import("core.zig");' 'fn f(g: ?usize) core.Error!usize {' '    const negative = core.refusing("a negative width", error.TensorUnsupported);' \
+  '    return g orelse negative;' '}' > "$TMP/t/src/p.zig"
+expect_red "a refusal reason bound before any refusal" "src/p.zig:3:27 \[refusing-eager\] f: core.refusing bound to 'negative' before it refuses"
+
+tree
+printf '%s\n' 'const core = @import("core.zig");' 'fn f(g: ?usize) core.Error!usize {' '    return g orelse core.refusing("a negative width", error.TensorUnsupported);' \
+  '}' 'pub fn refusing(comptime why: []const u8, e: core.Error) core.Error {' '    _ = why;' '    return e;' '}' > "$TMP/t/src/p.zig"
+expect_green "a refusal reason given where it refuses, and refusing's own definition"
+
+# rule refusal-unnamed
+tree
+mkdir -p "$TMP/t/src/tensor"
+printf '%s\n' 'const core = @import("core.zig");' 'fn f(n: usize) core.Error!usize {' '    if (n == 0) return error.TensorUnsupported;' '    return n;' '}' > "$TMP/t/src/tensor/p.zig"
+expect_red "an engine refusal with no reason" "src/tensor/p.zig:3:24 \[refusal-unnamed\] f: error.TensorUnsupported refused with no reason: give one through core.refusing"
+
+tree
+mkdir -p "$TMP/t/src/tensor"
+printf '%s\n' 'const core = @import("core.zig");' 'fn f(n: usize) core.Error!usize {' '    if (n == 0) return error.TensorDtype;' '    return n;' '}' > "$TMP/t/src/tensor/p.zig"
+expect_red "a dtype refusal with no reason" "src/tensor/p.zig:3:24 \[refusal-unnamed\] f: error.TensorDtype refused with no reason: give one through core.refusing"
+
+tree
+mkdir -p "$TMP/t/src/tensor"
+printf '%s\n' 'const core = @import("core.zig");' 'fn f(n: usize) core.Error!usize {' '    if (n == 0) return core.refusing("an empty tensor", error.TensorUnsupported);' \
+  '    return n;' '}' 'fn g(e: core.Error) bool {' '    return switch (e) {' '        error.TensorUnsupported => true,' '        else => e == error.TensorUnsupported,' '    };' '}' > "$TMP/t/src/tensor/p.zig"
+printf '%s\n' 'fn h(n: usize) !usize {' '    if (n == 0) return error.TensorUnsupported;' '    return n;' '}' > "$TMP/t/src/q.zig"
+expect_green "a refusal with its reason, a prong or comparison, and a file outside src/tensor/"
+
+# rule disk-read-stream
+tree
+printf '%s\n' 'fn load() void {' '    const cpu = mlx.mlx_default_cpu_stream_new();' '    _ = cpu;' '}' > "$TMP/t/src/kv_disk_cache.zig"
+expect_red "a disk-tier read on its own CPU stream" "src/kv_disk_cache.zig:2:21 \[disk-read-stream\] load: a CPU stream of its own in the disk tier"
+
+tree
+printf '%s\n' 'fn reading() void {' '    _ = mlx.mlx_default_cpu_stream_new();' '}' 'test "t" {' '    _ = mlx.mlx_default_cpu_stream_new();' '}' > "$TMP/t/src/kv_disk_cache.zig"
+printf '%s\n' 'fn other() void {' '    _ = mlx.mlx_default_cpu_stream_new();' '}' > "$TMP/t/src/model.zig"
+expect_green "reading itself, a test, and a file outside the disk tier"
+
+# rule random-draw-seam
+tree
+printf '%s\n' 'fn draw(o: *A, l: A, k: A, s: S) void {' '    _ = mlx.mlx_random_categorical(o, l, -1, k, s);' '}' > "$TMP/t/src/p.zig"
+expect_red "a draw keyed outside the sampler" "src/p.zig:2:13 \[random-draw-seam\] draw: a categorical draw outside src/sampler.zig"
+
+tree
+printf '%s\n' 'fn draw(o: *A, l: A, k: A, s: S) void {' '    _ = mlx.mlx_random_categorical(o, l, -1, k, s);' '}' > "$TMP/t/src/sampler.zig"
+printf '%s\n' 'test "t" {' '    _ = mlx.mlx_random_categorical(o, l, -1, k, s);' '}' > "$TMP/t/src/p.zig"
+expect_green "the sampler itself, and a test"
+
+# rule closure-compile-seam
+tree
+printf '%s\n' 'const arch_state = @import("arch_state.zig");' 'fn load(x: *T) void {' '    x.compileMoeRouting();' '    arch_state.compile(x, .gates);' '}' > "$TMP/t/src/p.zig"
+expect_red "a loader compiling its own closures" "src/p.zig:3:7 \[closure-compile-seam\] load: 'compileMoeRouting' compiled outside model_load.compileClosures"
+
+tree
+printf '%s\n' 'const arch_state = @import("arch_state.zig");' 'pub fn compileClosures(x: *T) void {' '    x.compileMoeRouting();' '    arch_state.compile(x, .all);' '}' > "$TMP/t/src/model_load.zig"
+printf '%s\n' 'fn f(x: *T) void {' '    x.compile();' '}' 'test "t" {' '    x.compileMoeRouting();' '}' > "$TMP/t/src/p.zig"
+printf '%s\n' 'fn g(x: *T) void {' '    x.compileGelu();' '}' > "$TMP/t/src/p_test.zig"
+expect_green "the seam itself, another compile, a test, and a test file"
+
+# rule error-fallback
+tree
+printf '%s\n' 'fn fused() !?u8 { return null; }' 'fn f() u8 {' '    blk: {' '        const v = (fused() catch null) orelse break :blk;' '        return v;' '    }' '    return 0;' '}' > "$TMP/t/src/p.zig"
+expect_red "an error caught into the null fallback" "src/p.zig:4:28 \[error-fallback\] f: an error caught into the null fallback"
+
+tree
+printf '%s\n' 'fn fused() !?u8 { return null; }' 'fn f() !u8 {' '    blk: {' '        const v = (try fused()) orelse break :blk;' '        return v;' '    }' '    return 0;' '}' \
+  'fn g() ?u8 {' '    return (fused() catch null) orelse return null;' '}' > "$TMP/t/src/p.zig"
+expect_green "a tried fused arm, and a catch null that is not a fallback break"
+
+# rule config-free-stale
+tree
+printf '%s\n' 'const mlx = @import("mlx.zig");' 'var cfg: ?u8 = null;' 'fn f() !void {' '    if (cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);' '    try build();' '}' 'fn build() !void {}' > "$TMP/t/src/p.zig"
+expect_red "a freed config left in its slot" "src/p.zig:4:5 \[config-free-stale\] f: a kernel config freed and left in its slot"
+
+tree
+printf '%s\n' 'const mlx = @import("mlx.zig");' 'var cfgs: [2]?u8 = .{ null, null };' 'fn f(i: usize) void {' '    if (cfgs[i]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);' '    cfgs[i] = null;' '}' \
+  'fn g(i: usize, n: u8) void {' '    if (cfgs[i]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);' '    cfgs[i] = n;' '}' > "$TMP/t/src/p.zig"
+expect_green "a freed slot nulled or given the new config next"
+
+# rule returned-handle-unguarded
+tree
+printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn f(x: mlx.mlx_array) !mlx.mlx_array {' '    var out = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_sigmoid(&out, x, null));' '    return out;' '}' > "$TMP/t/src/p.zig"
+expect_red "a returned handle with no errdefer" "src/p.zig:5:5 \[returned-handle-unguarded\] f: 'out' is returned, and an error before it leaks it"
+
+tree
+printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn f(x: mlx.mlx_array) !mlx.mlx_array {' '    var out = mlx.mlx_array_new();' '    errdefer _ = mlx.mlx_array_free(out);' '    try mlx.check(mlx.mlx_sigmoid(&out, x, null));' '    return out;' '}' \
+  'fn g(x: mlx.mlx_array) !void {' '    var t = mlx.mlx_array_new();' '    defer _ = mlx.mlx_array_free(t);' '    try mlx.check(mlx.mlx_sigmoid(&t, x, null));' '}' 'fn h() mlx.mlx_array {' '    var e = mlx.mlx_array_new();' '    return e;' '}' > "$TMP/t/src/p.zig" \
+  && printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn k(x: mlx.mlx_array) !mlx.mlx_array {' '    var out = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_sigmoid(&out, x, null));' '    return out;' '}' > "$TMP/t/src/p_test.zig"
+expect_green "a guarded returned handle, a deferred local, a return with no try, and a _test file"
+
 # rule json-unchecked-shape
 tree
 printf '%s\n' 'const std = @import("std");' 'pub fn f(parsed: std.json.Parsed(std.json.Value)) ?std.json.Value {' '    const root = parsed.value.object;' \

@@ -277,6 +277,8 @@ test "trunk gemm: real pack trunk banks, every shape the gate allows writes the 
             n_banks += 1;
         }
     }
+    // A pack whose trunk is affine holds no trellis banks to check.
+    if (n_banks == 0) return error.SkipZigTest;
     try t.expect(n_banks >= 5);
 
     var prng = std.Random.DefaultPrng.init(0x7e9);

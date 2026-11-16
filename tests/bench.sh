@@ -85,7 +85,8 @@ git -C "$ROOT" diff --quiet --ignore-submodules=dirty HEAD || die "the tree is d
 until [ ! -e "$QUIET" ]; do sleep 10; done
 (cd "$ROOT" && taskpolicy -a "$ZIG" build -Doptimize=ReleaseFast) || die "build failed"
 touch "$QUIET"
-while pgrep -x zig >/dev/null || pgrep -x clang >/dev/null; do sleep 5; done
+# A test binary already running when QUIET went up finishes before the boot (process-measurement 4d).
+while pgrep -x zig >/dev/null || pgrep -x clang >/dev/null || ps -axo comm= | grep -qE '/\.zig-cache/o/[^/]+/test[^/]*$'; do sleep 5; done
 
 COMMIT="$(git -C "$ROOT" rev-parse --short=8 HEAD)"
 SHA="$(shasum -a 256 "$BINARY" | cut -c1-16)"

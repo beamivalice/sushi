@@ -30,6 +30,8 @@ pub fn sourceLabel(source: Source, flag_name: []const u8) []const u8 {
 pub const Launch = struct {
     mtp_acceptance: ?mtp_acceptance.Mode = null,
     mtp_greedy_tail: ?bool = null,
+    /// `--drafter` was given.
+    drafter: bool = false,
 };
 
 pub var launch: Launch = .{};

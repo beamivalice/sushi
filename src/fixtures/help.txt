@@ -197,6 +197,11 @@ Options:
                       every cache checkpoint (about 54 MB each on
                       Flash-Next) to save memory on smaller machines.
                       No effect on GLM or MiMo, which have no GDN arm.
+  --qwen-mlx-engine   Qwen3.8 only: decode on MLX instead of Sushi Cooler,
+                      the engine of our own, on an STQ pack. An opt-out
+                      if Sushi Cooler misbehaves; report it at
+                      https://github.com/beamivalice/sushi/issues/new.
+                      Outranks the model's qwen_cooler setting.
   --ds41-mlx-engine   DeepSeek-V4.1 only: decode on MLX instead of Sushi Cooler,
                       the engine of our own (the default on an STQ pack
                       with a matrix-unit GPU). An opt-out if Sushi Cooler

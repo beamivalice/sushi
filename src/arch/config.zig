@@ -299,6 +299,9 @@ pub fn kvBytesPerToken(config: *const model.ModelConfig) ?u64 {
 /// `arch_flags.options`) and its model setting.
 pub const CoolerOptOut = struct { flag: []const u8, setting: []const u8 };
 
+/// Who asked a load onto MLX instead of Sushi Cooler: nobody, the launch flag, or the model setting.
+pub const CoolerAsk = enum { none, flag, setting };
+
 /// The opt-out of the arch `t`; null for an arch without Sushi Cooler.
 pub fn coolerOptOut(comptime t: Tag) ?CoolerOptOut {
     return if (@hasDecl(registry.Mod(t), "cooler_opt_out")) registry.Mod(t).cooler_opt_out else null;

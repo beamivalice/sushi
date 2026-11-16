@@ -157,6 +157,7 @@ fn insideRows(ids: mlx.mlx_array, p: ThinkPenalty, s: mlx.mlx_stream) !mlx.mlx_a
         gate = both;
     }
     var rows = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(rows);
     try mlx.check(mlx.mlx_expand_dims(&rows, gate, 2, s));
     return rows;
 }
@@ -254,6 +255,7 @@ fn testBlock(rows: usize, v: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     const f = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
     defer _ = mlx.mlx_array_free(f);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
     return out;
 }

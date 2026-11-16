@@ -146,7 +146,7 @@ pub fn categorical(logits: *Tensor, axis_in: c_int, key: *Tensor) Error!*Tensor 
     if (axis >= logits.ndim) return error.TensorShape;
     switch (logits.dtype) {
         .float16, .bfloat16, .float32 => {},
-        else => return error.TensorDtype,
+        else => return core.refusing("categorical over logits that are not floats", error.TensorDtype),
     }
     var rest: [core.max_dims]c_int = undefined;
     var n_rest: usize = 0;

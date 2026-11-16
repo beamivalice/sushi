@@ -403,10 +403,11 @@ test "qwen4: the spec warm-up runs a prefill-shaped forward through the grouped 
     var xfm = try Trunk.init(io, a, config, &weights);
     defer xfm.deinit();
     if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
-    const rate_groups = @import("sushi_exl3").rate_groups;
-    const before = rate_groups.prefill_chains;
+    // A rate-group pack prefills through its grouped chains, a uniform one through the grouped GEMM.
+    const api = @import("sushi_exl3");
+    const before = api.rate_groups.prefill_chains + api.kernels.prefill_calls;
     try @import("qwen4_load.zig").warmVerify(&xfm.config, &xfm, 1, @import("../kv_quant.zig").KVQuantConfig.engine_default);
-    try testing.expect(rate_groups.prefill_chains > before);
+    try testing.expect(api.rate_groups.prefill_chains + api.kernels.prefill_calls > before);
 }
 
 test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
@@ -540,16 +541,20 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
             }
         }
     }
-    if (trunk.verifySharedHardware()) {
-        try testing.expect(trunk.mtp_coarse_pair_dispatches > coarse_before);
-        {
-            try testing.expect(qwen4_forward.mtp_verify_hc_prepared_calls > hc_prepared_before);
-        }
-        inline for (0..3) |i| {
-            {
-                try testing.expect(trunk.mtp_verify_kernel_calls[i] > verify_kernel_before[i]);
-            }
-        }
+    // The coarse pairs, the prepared hyper-connection read and the verify kernels serve the served geometry (hidden
+    // 2560, experts 640 wide): a narrower pack verifies through the general paths, and its rows above still match.
+    // Each verify kernel serves one pack layout, at the served geometry: the coarse pairs an affine head, the joined
+    // trunk projection an affine trunk, the prepared hyper-connection read and its kernel every served pack, the
+    // sorted routing pack affine (split) experts. A pack without the layout verifies through the general path.
+    if (trunk.verifySharedHardware() and config.hidden_size == 2560) {
+        const affine_head = xfm.lm_head_s.ctx != null and mlx.mlx_array_dtype(xfm.lm_head_w) == .uint32;
+        const affine_trunk = config.trunk_quant == null;
+        const affine_experts = config.expert_layout == .quantized_split;
+        try testing.expectEqual(affine_head, trunk.mtp_coarse_pair_dispatches > coarse_before);
+        try testing.expect(qwen4_forward.mtp_verify_hc_prepared_calls > hc_prepared_before);
+        try testing.expectEqual(affine_trunk, trunk.mtp_verify_kernel_calls[0] > verify_kernel_before[0]);
+        try testing.expect(trunk.mtp_verify_kernel_calls[1] > verify_kernel_before[1]);
+        try testing.expectEqual(affine_experts, trunk.mtp_verify_kernel_calls[2] > verify_kernel_before[2]);
     }
 }
 

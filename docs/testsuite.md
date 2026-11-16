@@ -181,6 +181,10 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `owned-insert-arg` flags, outside test code, a `try xs.append*/put*/insert*(…)` whose argument makes an owned value
   (`try a.dupe*(`, `try a.alloc*(`): when the insert fails to grow, that value leaks. Reserve first and insert with
   `*AssumeCapacity`; an arena's insert goes in the allowlist.
+  `refusing-eager` flags `core.refusing(..)` bound to a `const` or `var`: it sets the engine's refusal reason as it
+  runs, so a value made ahead of a refusal hands its reason to the next, unrelated refusal.
+  `refusal-unnamed` flags, under `src/tensor/`, an `error.TensorUnsupported` returned or handed to `fail` without
+  `core.refusing`: the bare error names no reason and is not counted in the engine's refusals.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its
@@ -242,6 +246,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 The full suite is the only run that sees every test in its real binary and order: a test that leaks or fails alone can
 pass after its neighbours warm a cache. That is why a wide change and a version bump pay for it; a landing confined to
 one area does not.
+A full-suite run (series end, version bump) also sets `QWEN4_TEST_MODEL` to a Qwen cut fixture
+(`QWEN4_STQ_CUT`, then `QWEN4_STQ4_CUT`): the real-pack Qwen tests run nowhere else, and left unset they rot unseen.
 A full-suite run compares its test total (`Build Summary` plus `test-host`) with the previous full run's: an
 unexplained drop means tests were not built, and blocks the push.
 

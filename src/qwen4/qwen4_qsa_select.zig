@@ -134,10 +134,12 @@ pub fn qsaScoreFusedProbeReset() void {
     qsa_score_probe_state.store(0, .release);
 }
 
-pub fn qsaScoreFusedArm() void {
+/// Probes the fused score kernel once a process, on `s`: the load's stream or a forward's.
+pub fn qsaScoreFusedArm(s: mlx.mlx_stream) !void {
     if (qsa_score_probe_state.load(.acquire) != 0) return;
     if (!qsaScoreFusedEnabled() or !verifyQmmNaxAvailable() or !qsaScoreTf32Enabled()) return;
-    const ok = qsaScoreFusedRunProbe();
+    const ok = qsaScoreFusedRunProbe(s);
+    try qwen4_qsa_gather.probeRan(s, ok);
     qsa_score_probe_state.store(if (ok) 2 else 1, .release);
 }
 
@@ -391,6 +393,7 @@ pub fn qsaScoreSheetComposed(s: mlx.mlx_stream, q: mlx.mlx_array, k32t: mlx.mlx_
     defer _ = mlx.mlx_array_free(relu);
     try mlx.check(mlx.mlx_maximum(&relu, sc, zero, s));
     var scores = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(scores);
     try mlx.check(mlx.mlx_sum_axis(&scores, relu, 1, false, s));
     return scores;
 }
@@ -405,6 +408,7 @@ pub fn qsaScoreK32tFromPooled(s: mlx.mlx_stream, pooled: mlx.mlx_array) !mlx.mlx
     defer _ = mlx.mlx_array_free(kt);
     try mlx.check(mlx.mlx_transpose_axes(&kt, k4, &perm, 4, s));
     var k32 = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(k32);
     try mlx.check(mlx.mlx_astype(&k32, kt, .float32, s));
     return k32;
 }
@@ -451,6 +455,7 @@ pub fn qsaScoreFusedDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.ml
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, score_cfgs[0], s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (qsa_score_engaged_bits.take(qsaWidthBucket(rows))) {
         log.debug(
@@ -485,12 +490,11 @@ fn qsaScoreFusedProbeLayout(s: mlx.mlx_stream, rows: c_int, nb: c_int) bool {
     return true;
 }
 
-fn qsaScoreFusedRunProbe() bool {
+fn qsaScoreFusedRunProbe(s: mlx.mlx_stream) bool {
     if (mlx.noGpuBackend()) {
         log.info("[qsa-score] disabled: no gpu\n", .{});
         return false;
     }
-    const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) {
         log.info("[qsa-score] disabled: not gpu stream\n", .{});
         return false;
@@ -712,6 +716,7 @@ pub fn qsaPoolNormRopeFused(
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qsa_pool_rope_cfg.?, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     qsa_pool_rope_dispatches += 1;
     if (!qsa_pool_rope_engaged) {
@@ -752,6 +757,7 @@ fn qsaPoolTestKeys(rnd: std.Random, b: c_int, nb: c_int, ratio: c_int, lo_exp: f
     const f = mlx.mlx_array_new_data(data.ptr, &shape, 4, .float32);
     defer _ = mlx.mlx_array_free(f);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, f, dt, s));
     return out;
 }
@@ -771,6 +777,7 @@ fn qsaPoolCancelKeys(rnd: std.Random, nb: c_int, ratio: c_int, s: mlx.mlx_stream
     const f = mlx.mlx_array_new_data(data.ptr, &shape, 4, .float32);
     defer _ = mlx.mlx_array_free(f);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
     return out;
 }
@@ -877,6 +884,7 @@ fn qsaVisSheetForTest(s: mlx.mlx_stream, row0: c_int, rows: c_int, nb: c_int, ra
     defer _ = mlx.mlx_array_free(vis);
     try mlx.check(mlx.mlx_less_equal(&vis, blk_end2, pos2, s));
     var vis3 = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(vis3);
     try mlx.check(mlx.mlx_expand_dims(&vis3, vis, 0, s));
     return vis3;
 }
@@ -889,6 +897,7 @@ fn qsaTieBiasForTest(s: mlx.mlx_stream, nb: c_int) !mlx.mlx_array {
     const eps = mlx.mlx_array_new_float(1e-7);
     defer _ = mlx.mlx_array_free(eps);
     var bias = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(bias);
     try mlx.check(mlx.mlx_multiply(&bias, idx, eps, s));
     return bias;
 }
@@ -1628,6 +1637,40 @@ test "qsa select kernel: past the bias's f32 resolution the chain's tie rule is 
     }
 }
 
+test "qsa select kernel: under 8 scores it declines and the composed chain picks the blocks the kernel picks from 8 up" {
+    // MLX binds a custom kernel's input of fewer than 8 elements as `constant` (`max_constant_array_size` in
+    // `metal_kernel.cpp`), where the kernel body reads `scores` as a device pointer: a tiny pack's short prompt.
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const none = mlx.mlx_array{ .ctx = null };
+    const k: c_int = 2;
+    const all = [_]f32{ 3.0, 9.0, 1.0, 7.0, 0.0, 5.0, 8.0, 2.0 };
+    for ([_]c_int{ 6, 7, 8 }) |nb| {
+        const buf = all[0..@intCast(nb)];
+        const scores = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, 1, nb }, 3, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+        const bounds_host = [_]i32{nb};
+        const bounds = mlx.mlx_array_new_data(&bounds_host, &[_]c_int{1}, 1, .int32);
+        defer _ = mlx.mlx_array_free(bounds);
+        const want = try qsaExactTopHost(ta, buf, 1, nb, &bounds_host, k);
+        defer ta.free(want);
+        const bias = try qsaTieBiasForTest(s, nb);
+        defer _ = mlx.mlx_array_free(bias);
+        const chain = try qsaSelectComposedOps(s, scores, none, bias, 1, nb, k, k, true);
+        defer _ = mlx.mlx_array_free(chain);
+        try qsaExpectMatchesHost(chain, want, 1, k, "the composed chain");
+        const fused = try qsaSelectTopBlocks(s, scores, bounds, k);
+        if (nb < 8) {
+            try testing.expect(fused == null);
+        } else {
+            const got = fused orelse return error.SelectKernelDeclined;
+            defer _ = mlx.mlx_array_free(got);
+            try qsaExpectMatchesHost(got, want, 1, k, "the fused kernel at 8 blocks");
+        }
+    }
+}
+
 test "qsa select kernel: on a near-tie the exact rule and the bias trick DISAGREE, and the kernel takes the exact one" {
     // The bias is exact only on exact ties: at nb = 262144 it spans 0.026, so a genuinely higher
     // score loses to a lower-indexed rival. torch.topk and the kernel take the higher score.
@@ -2295,7 +2338,7 @@ test "qsa score fused: a probe mismatch latches the composed arm" {
     qsa_score_fused_override = true;
     qsa_score_probe_flip_override = true;
     qsaScoreFusedProbeReset();
-    qsaScoreFusedArm();
+    try qsaScoreFusedArm(mlx.gpuStream());
     try testing.expect(qsaScoreFusedProbeFailed());
     try testing.expect(!qsaScoreFusedActive());
     var prng = std.Random.DefaultPrng.init(0xF11);
@@ -2328,7 +2371,7 @@ test "qsa score fused: probe passes on this machine" {
     qsa_score_fused_override = true;
     qsa_score_probe_flip_override = false;
     qsaScoreFusedProbeReset();
-    qsaScoreFusedArm();
+    try qsaScoreFusedArm(mlx.gpuStream());
     try testing.expect(!qsaScoreFusedProbeFailed());
     try testing.expect(qsaScoreFusedActive());
 }
@@ -2402,7 +2445,7 @@ test "qsa score fused: the bill follows the predicate" {
     qsa_score_fused_override = true;
     matrix.end();
     matrix = @import("sushi_exl3").device.forceMatrix(null);
-    qsaScoreFusedArm();
+    try qsaScoreFusedArm(mlx.gpuStream());
     if (qsaScoreFusedActive()) {
         const fused_rows = qsaScoreRowsPerChunk(n_idx, nb, fwd, 128);
         try testing.expectEqual(composed_rows * 4, fused_rows);
@@ -2523,7 +2566,7 @@ test "qsa score fused: no bank is built under the fused arm" {
     qsa_score_fused_override = true;
     matrix.end();
     matrix = @import("sushi_exl3").device.forceMatrix(null);
-    qsaScoreFusedArm();
+    try qsaScoreFusedArm(mlx.gpuStream());
     if (qsaScoreFusedActive()) {
         _ = try qwen4_qsa.qsaScoreOperand(&xfm, &entry, 1, nb, hd, true);
         try testing.expect(entry.qsa_score_bank.ctx == null);

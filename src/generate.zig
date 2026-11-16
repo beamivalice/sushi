@@ -1626,6 +1626,9 @@ pub const Generator = struct {
                 errdefer if (dflash_active) {
                     for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
                 };
+                // No row of a chunk before the tail is sampled: MLX never evaluates its logits, an eager engine would.
+                ctx.skip_lm_head = true;
+                defer ctx.skip_lm_head = false;
                 const chunk_logits = if (mtp_active) blk: {
                     var last_unused = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(last_unused);
@@ -3940,8 +3943,8 @@ fn logEngineStats() void {
         if (gpuShareLine(&gpu_buf, mlx.engine.gpuTimeTaken())) |line| log.info("  [engine] {s}\n", .{line});
         log.debug("  [engine] since load: {d} dispatches, {d} command buffers, {d} waits, {d} imports, {d} kernel keys built, {d} lends ({d} of a weight the engine wraps), {d} ops on MLX, {d} calls refused; slice updates {d} in place, {d} copied; pool {d} MB, {d} free, {d} asked by tensors in use, {d} buffers released for the budget; {d} kernels compiled after the load; GPU busy {d} ms, idle between passes {d} ms; pauses under 20 us / 100 us / 1 ms / longer: {d} ({d} ms) / {d} ({d} ms) / {d} ({d} ms) / {d} ({d} ms); before other / forward / draft / verify / round end: {d} / {d} / {d} / {d} / {d} ms; {d} MLX calls\n", .{ e.dispatches, e.submits, e.waits, e.imports, mlx.engine.kernelKeyBuilds(), e.lends, e.mapped_lends, mlx.engine.mlx_ops, mlx.engine.refusals, e.updates_in_place, e.updates_copied, e.pool_bytes >> 20, e.pool_free >> 20, e.pool_asked >> 20, e.pool_evictions, mlx.engine.latePipelines(), e.gpu_busy_ns / std.time.ns_per_ms, e.gpu_gap_ns / std.time.ns_per_ms, e.gpu_gap_count[0], e.gpu_gap_sum[0] / std.time.ns_per_ms, e.gpu_gap_count[1], e.gpu_gap_sum[1] / std.time.ns_per_ms, e.gpu_gap_count[2], e.gpu_gap_sum[2] / std.time.ns_per_ms, e.gpu_gap_count[3], e.gpu_gap_sum[3] / std.time.ns_per_ms, e.gpu_gap_phase[0] / std.time.ns_per_ms, e.gpu_gap_phase[1] / std.time.ns_per_ms, e.gpu_gap_phase[2] / std.time.ns_per_ms, e.gpu_gap_phase[3] / std.time.ns_per_ms, e.gpu_gap_phase[4] / std.time.ns_per_ms, mlx.engine.mlxCalls() });
         mlx.engine.logKernelProfile(1);
-        logMlxCalls();
     }
+    logMlxCalls();
 }
 
 pub fn logMlxCalls() void {

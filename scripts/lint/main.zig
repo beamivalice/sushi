@@ -29,6 +29,14 @@ const rules = .{
     @import("log_line_end.zig"),
     @import("reply_bypass.zig"),
     @import("shape_offset_write.zig"),
+    @import("refusing_eager.zig"),
+    @import("refusal_unnamed.zig"),
+    @import("error_fallback.zig"),
+    @import("config_free_stale.zig"),
+    @import("returned_handle_unguarded.zig"),
+    @import("closure_compile_seam.zig"),
+    @import("random_draw_seam.zig"),
+    @import("disk_read_stream.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

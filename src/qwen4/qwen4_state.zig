@@ -253,6 +253,11 @@ fn load(self: *State, args: arch_state.InitArgs) !?Trunk.ExpertStreamParts {
     const owned_bf16 = args.owned_bf16;
     var extra: std.ArrayList(mlx.mlx_array) = .empty;
     defer extra.deinit(allocator);
+    // Until `owned_bf16` takes them, the mixer's arrays are this load's to free.
+    var extra_taken = false;
+    errdefer if (!extra_taken) for (extra.items) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
     var mb: [160]u8 = undefined;
     var mixer = try layer_weights.loadHcWeights(weights, std.fmt.bufPrint(&mb, "{s}.hyper_connection_mixer", .{prefix}) catch unreachable, false, config.hc_count, config.hidden_size, &extra, allocator, s);
     try layer_weights.bindHcLinears(&mixer, &config);
@@ -261,6 +266,7 @@ fn load(self: *State, args: arch_state.InitArgs) !?Trunk.ExpertStreamParts {
         const merged = try std.mem.concat(allocator, mlx.mlx_array, &.{ old, extra.items });
         if (owned_bf16.*) |o| allocator.free(o);
         owned_bf16.* = merged;
+        extra_taken = true;
     }
     const eos: u32 = config.ngram_eos;
     // The `0` is the PLE's ordinal among the config's injection points, not

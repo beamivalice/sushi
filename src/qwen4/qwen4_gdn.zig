@@ -1,4 +1,5 @@
 const trunk_mod = @import("../trunk.zig");
+const QsaCfgCache = trunk_mod.QsaCfgCache;
 const qwen4_forward = @import("qwen4_forward.zig");
 const qwen4_state = @import("qwen4_state.zig");
 const trunk_helpers_test = @import("../trunk_helpers_test.zig");
@@ -535,8 +536,7 @@ fn getGdnPreworkKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 const GdnPreworkCfgKey = struct { hk: c_int, hv: c_int, seq: c_int, batch: c_int, c: c_int, qs: c_int, qo: c_int, bs: c_int, bo: c_int, as: c_int, ao: c_int, gate: mlx.mlx_dtype };
-var gdn_prework_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var gdn_prework_cfg_key: GdnPreworkCfgKey = std.mem.zeroes(GdnPreworkCfgKey);
+var gdn_prework_cfgs = QsaCfgCache(GdnPreworkCfgKey, 1){};
 
 pub const GdnPrework = struct {
     q: mlx.mlx_array, // [B, S, Hk, 128] normed + scaled
@@ -611,9 +611,10 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
 
     const nkeep: c_int = 3;
     const key = GdnPreworkCfgKey{ .hk = in.hk, .hv = in.hv, .seq = in.seq, .batch = in.batch, .c = c_dim, .qs = in.qkv_stride, .qo = in.qkv_off, .bs = in.b_stride, .bo = in.b_off, .as = in.a_stride, .ao = in.a_off, .gate = in.gate_dtype };
-    if (gdn_prework_cfg == null or !std.meta.eql(gdn_prework_cfg_key, key)) {
-        if (gdn_prework_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const gdn_prework_cfg = blk: {
+        if (gdn_prework_cfgs.get(key)) |hit| break :blk hit[0];
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const q_shape = [_]c_int{ in.batch, in.seq, in.hk, in.dk };
         const v_shape = [_]c_int{ in.batch, in.seq, in.hv, in.dv };
         const st_shape = [_]c_int{ in.batch, nkeep, c_dim };
@@ -630,9 +631,9 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "GT", in.gate_dtype));
         const ints = .{ .{ "HK", in.hk }, .{ "HV", in.hv }, .{ "DK", in.dk }, .{ "DV", in.dv }, .{ "NKEEP", nkeep }, .{ "C", c_dim }, .{ "TAB", @as(c_int, @intFromBool(in.seq >= 17)) }, .{ "QSTRIDE", in.qkv_stride }, .{ "QOFF", in.qkv_off }, .{ "BSTRIDE", in.b_stride }, .{ "BOFF", in.b_off }, .{ "ASTRIDE", in.a_stride }, .{ "AOFF", in.a_off } };
         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
-        gdn_prework_cfg = config;
-        gdn_prework_cfg_key = key;
-    }
+        gdn_prework_cfgs.put(key, .{config});
+        break :blk config;
+    };
 
     const kernel = try getGdnPreworkKernel();
     const seq_arr = mlx.mlx_array_new_int(in.seq);
@@ -642,7 +643,7 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gdn_prework_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gdn_prework_cfg, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 6) return error.MetalKernelBadOutputCount;
     var out = GdnPrework{
         .q = mlx.mlx_array_new(),
@@ -705,8 +706,7 @@ var gdn_normgate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gdn_normgate_engaged: bool = false;
 var gdn_normgate_declined: bool = false;
 const GdnNormGateCfgKey = struct { hv: c_int, seq: c_int, batch: c_int, zs: c_int, zo: c_int, swish: bool };
-var gdn_normgate_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var gdn_normgate_cfg_key: GdnNormGateCfgKey = std.mem.zeroes(GdnNormGateCfgKey);
+var gdn_normgate_cfgs = QsaCfgCache(GdnNormGateCfgKey, 1){};
 
 fn getGdnNormGateKernel() !mlx.mlx_fast_metal_kernel {
     if (gdn_normgate_kernel) |k| return k;
@@ -760,9 +760,10 @@ pub fn gdnNormGateFused(
         return null;
     }
     const key = GdnNormGateCfgKey{ .hv = hv, .seq = seq, .batch = batch, .zs = z_stride, .zo = z_off, .swish = swish };
-    if (gdn_normgate_cfg == null or !std.meta.eql(gdn_normgate_cfg_key, key)) {
-        if (gdn_normgate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const gdn_normgate_cfg = blk: {
+        if (gdn_normgate_cfgs.get(key)) |hit| break :blk hit[0];
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const out_shape = [_]c_int{ batch, seq, hv * dv };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 3, .bfloat16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, batch * seq, hv));
@@ -771,18 +772,19 @@ pub fn gdnNormGateFused(
         const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off }, .{ "TAB", @as(c_int, @intFromBool(seq >= 17)) } };
         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SWISH", @intFromBool(swish)));
-        gdn_normgate_cfg = config;
-        gdn_normgate_cfg_key = key;
-    }
+        gdn_normgate_cfgs.put(key, .{config});
+        break :blk config;
+    };
     const kernel = try getGdnNormGateKernel();
     const inputs_arr = [_]mlx.mlx_array{ y, z, norm_w, eps, if (seq >= 17) try @import("../hc_prefill.zig").sigmoidTable(s) else y };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gdn_normgate_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gdn_normgate_cfg, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (!gdn_normgate_engaged) {
         gdn_normgate_engaged = true;
@@ -799,6 +801,7 @@ fn sliceLastDim(arr: mlx.mlx_array, start: c_int, stop: c_int, s: mlx.mlx_stream
     const en = [_]c_int{ sh[0], sh[1], stop };
     const strides = [_]c_int{ 1, 1, 1 };
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_slice(&out, arr, &st, 3, &en, 3, &strides, 3, s));
     return out;
 }
@@ -844,6 +847,7 @@ fn gdnTestRun(comptime seq: bool, comptime vec: bool, q: mlx.mlx_array, k: mlx.m
         // Final state comes from the dedicated state_out output — after the
         // capture-tail trim, state_seq[T-1] is never written.
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 2));
         return out;
     } else {
@@ -853,6 +857,7 @@ fn gdnTestRun(comptime seq: bool, comptime vec: bool, q: mlx.mlx_array, k: mlx.m
         const kern = try getGdnKernel(vec);
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kern, inputs_vec, config, s));
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 1));
         return out;
     }
@@ -925,6 +930,7 @@ fn gdnTestRunSeqAt(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.
     try mlx.check(mlx.mlx_slice(&sliced, ss, &start, 5, &stop, 5, &strides, 5, s));
     const fshape = [_]c_int{ B, Hv, Dv, Dk };
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, sliced, &fshape, 4, s));
     return out;
 }
@@ -1344,9 +1350,9 @@ fn gdnPreworkCase(gate_dt: mlx.mlx_dtype) !void {
     const key_dim: c_int = hk * dk;
     const value_dim: c_int = hv * dv;
 
-    const q_scale = bf16Scalar(1.0 / 128.0, s);
+    const q_scale = try bf16Scalar(1.0 / 128.0, s);
     defer _ = mlx.mlx_array_free(q_scale);
-    const k_scale = bf16Scalar(@sqrt(1.0 / 128.0), s);
+    const k_scale = try bf16Scalar(@sqrt(1.0 / 128.0), s);
     defer _ = mlx.mlx_array_free(k_scale);
     var ones_w = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ones_w);
@@ -1551,6 +1557,7 @@ fn gdnPreworkCase(gate_dt: mlx.mlx_dtype) !void {
                     const vec = mlx.mlx_vector_array_new_data(&arr, 2);
                     defer _ = mlx.mlx_vector_array_free(vec);
                     var out = mlx.mlx_array_new();
+                    errdefer _ = mlx.mlx_array_free(out);
                     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, st));
                     return out;
                 }
@@ -1564,6 +1571,7 @@ fn gdnPreworkCase(gate_dt: mlx.mlx_dtype) !void {
                     for (1..sh.len) |d| stop[d] = sh[d];
                     _ = &start;
                     var out = mlx.mlx_array_new();
+                    errdefer _ = mlx.mlx_array_free(out);
                     try mlx.check(mlx.mlx_slice(&out, x, &start, @intCast(sh.len), &stop, @intCast(sh.len), &strides, @intCast(sh.len), st));
                     return out;
                 }
@@ -1674,9 +1682,9 @@ fn gdnPreworkBatchedCase(gate_dt: mlx.mlx_dtype) !void {
     const dv: c_int = 128;
     const c_dim: c_int = hk * dk * 2 + hv * dv;
     const seq: c_int = 1;
-    const q_scale = bf16Scalar(1.0 / 128.0, s);
+    const q_scale = try bf16Scalar(1.0 / 128.0, s);
     defer _ = mlx.mlx_array_free(q_scale);
-    const k_scale = bf16Scalar(@sqrt(1.0 / 128.0), s);
+    const k_scale = try bf16Scalar(@sqrt(1.0 / 128.0), s);
     defer _ = mlx.mlx_array_free(k_scale);
     var ones_w = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ones_w);
@@ -1701,6 +1709,7 @@ fn gdnPreworkBatchedCase(gate_dt: mlx.mlx_dtype) !void {
             const strides: [4]c_int = .{ 1, 1, 1, 1 };
             for (1..sh.len) |d| stop[d] = sh[d];
             var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_slice(&out, x, &start, @intCast(sh.len), &stop, @intCast(sh.len), &strides, @intCast(sh.len), st));
             return out;
         }
@@ -1902,6 +1911,7 @@ fn gdnRecurRand(rnd: std.Random, shape: []const c_int, scale: f32, dt: mlx.mlx_d
     if (dt == .float32) return f32arr;
     defer _ = mlx.mlx_array_free(f32arr);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, f32arr, dt, s));
     return out;
 }
@@ -1916,12 +1926,14 @@ fn gdnRecurRows(x: mlx.mlx_array, from: c_int, to: c_int, s: mlx.mlx_stream) !ml
     start[1] = from;
     stop[1] = to;
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_slice(&out, x, &start, sh.len, &stop, sh.len, &strides, sh.len, s));
     return out;
 }
 
 fn gdnRecurRef(a: mlx.mlx_array) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(r);
     try mlx.check(mlx.mlx_array_set(&r, a));
     return r;
 }
@@ -1972,9 +1984,9 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, fol
     const dv: c_int = 128;
     const c_dim = 2 * hk * dk + hv * dv;
     const value_dim = hv * dv;
-    const q_scale = bf16Scalar(1.0 / 128.0, s);
+    const q_scale = try bf16Scalar(1.0 / 128.0, s);
     defer _ = mlx.mlx_array_free(q_scale);
-    const k_scale = bf16Scalar(@sqrt(1.0 / 128.0), s);
+    const k_scale = try bf16Scalar(@sqrt(1.0 / 128.0), s);
     defer _ = mlx.mlx_array_free(k_scale);
     const eps_arr = mlx.mlx_array_new_float(1e-6);
     defer _ = mlx.mlx_array_free(eps_arr);
@@ -2127,6 +2139,7 @@ fn gdnRecurRowsAxis0(x: mlx.mlx_array, i: c_int, s: mlx.mlx_stream) !mlx.mlx_arr
     start[0] = i;
     stop[0] = i + 1;
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_slice(&out, x, &start, sh.len, &stop, sh.len, &strides, sh.len, s));
     return out;
 }
@@ -2693,10 +2706,11 @@ pub fn gatedDeltaNetProjected(
     const kernel: c_int = @intCast(cfg.linear_conv_kernel_dim);
 
     // Projections: the caller's, or separate (qkv+z+a+b)
-    var qkv: mlx.mlx_array = undefined;
-    var z_proj: mlx.mlx_array = undefined;
-    var a_proj: mlx.mlx_array = undefined;
-    var b_proj: mlx.mlx_array = undefined;
+    // Empty until set, so a projection that fails frees only what was made.
+    var qkv: mlx.mlx_array = .{};
+    var z_proj: mlx.mlx_array = .{};
+    var a_proj: mlx.mlx_array = .{};
+    var b_proj: mlx.mlx_array = .{};
     defer _ = mlx.mlx_array_free(qkv);
     defer _ = mlx.mlx_array_free(z_proj);
     defer _ = mlx.mlx_array_free(a_proj);
@@ -2718,8 +2732,10 @@ pub fn gatedDeltaNetProjected(
     // used to be rebuilt every layer every decode step.
     if (self.arch_state.qwen4.gdn_q_scale == null) {
         const inv_scale = 1.0 / @as(f32, @floatFromInt(cfg.linear_key_head_dim));
-        self.arch_state.qwen4.gdn_q_scale = bf16Scalar(inv_scale, self.s);
-        self.arch_state.qwen4.gdn_k_scale = bf16Scalar(@sqrt(inv_scale), self.s);
+        const q = try bf16Scalar(inv_scale, self.s);
+        errdefer _ = mlx.mlx_array_free(q);
+        self.arch_state.qwen4.gdn_k_scale = try bf16Scalar(@sqrt(inv_scale), self.s);
+        self.arch_state.qwen4.gdn_q_scale = q;
     }
     const inv_scale_sq = self.arch_state.qwen4.gdn_q_scale.?;
     const inv_sqrt_sc = self.arch_state.qwen4.gdn_k_scale.?;
@@ -2841,7 +2857,7 @@ pub fn gatedDeltaNetProjected(
             try mlx.check(mlx.mlx_zeros(&zero_conv, &[_]c_int{ batch, 3, conv_dim }, 3, .bfloat16, self.s));
         }
         const incoming_conv = if (cold) zero_conv else ssm.conv_state;
-        const pre = (gdnPreworkFused(self.s, .{
+        const pre = (try gdnPreworkFused(self.s, .{
             .qkv = qkv,
             .qkv_off = 0,
             .qkv_stride = conv_dim,
@@ -2864,7 +2880,7 @@ pub fn gatedDeltaNetProjected(
             .seq = seq_len,
             .batch = batch,
             .gate_dtype = cfg.gdnGateDtype(),
-        }) catch null) orelse break :blk;
+        })) orelse break :blk;
         // Spec-capture rollback slices the conv INPUT; build the concat
         // the composed path would have stashed (lazy, one launch).
         if (self.spec_capture_ssm) {
@@ -2873,16 +2889,9 @@ pub fn gatedDeltaNetProjected(
             defer _ = mlx.mlx_vector_array_free(vec);
             if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
             ssm.spec_conv_input = mlx.mlx_array_new();
-            mlx.check(mlx.mlx_concatenate_axis(&ssm.spec_conv_input, vec, 1, self.s)) catch {
-                // Free the fused outputs and fall back to the composed
-                // chain rather than adopt state with no rollback capture.
-                _ = mlx.mlx_array_free(pre.q);
-                _ = mlx.mlx_array_free(pre.k);
-                _ = mlx.mlx_array_free(pre.v);
-                _ = mlx.mlx_array_free(pre.conv_state);
-                _ = mlx.mlx_array_free(pre.g);
-                _ = mlx.mlx_array_free(pre.beta);
-                break :blk;
+            mlx.check(mlx.mlx_concatenate_axis(&ssm.spec_conv_input, vec, 1, self.s)) catch |e| {
+                inline for (.{ pre.q, pre.k, pre.v, pre.conv_state, pre.g, pre.beta }) |a| _ = mlx.mlx_array_free(a);
+                return e;
             };
         }
         if (diagEnvOnCached(&gdn_check_env, "QWEN4_GDN_CHECK")) gdnCheckFused(self, la, qkv, incoming_conv, b_proj, a_proj, &pre, layer_idx, num_k_heads, num_v_heads, dk, dv, batch, seq_len) catch |e| log.warn("[gdn-check] failed: {s}\n", .{@errorName(e)});
@@ -3118,6 +3127,7 @@ pub fn gatedDeltaNetProjected(
             try mlx.check(mlx.mlx_vector_array_get(&y_bthd, outputs_vec, 0));
 
             var new_state = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(new_state);
             try mlx.check(mlx.mlx_vector_array_get(&new_state, outputs_vec, 1));
             _ = mlx.mlx_array_free(ssm.ssm_state);
             ssm.ssm_state = new_state;
@@ -3179,7 +3189,7 @@ pub fn conv1dWithCache(
     apply_silu: bool,
 ) !mlx.mlx_array {
     // Prepend conv_state or zeros
-    var conv_input: mlx.mlx_array = undefined;
+    var conv_input: mlx.mlx_array = .{};
     defer _ = mlx.mlx_array_free(conv_input);
     if (ssm.initialized) {
         const arr = [_]mlx.mlx_array{ ssm.conv_state, x };
@@ -3236,11 +3246,13 @@ pub fn conv1dWithCache(
 
     // Depthwise conv1d (groups = cdim)
     var conv_out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(conv_out);
     try mlx.check(mlx.mlx_conv1d(&conv_out, conv_input, conv_w, 1, 0, 1, cdim, self.s));
 
     // Optional bias
     if (conv_b) |cb| {
         var biased = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(biased);
         try mlx.check(mlx.mlx_add(&biased, conv_out, cb, self.s));
         _ = mlx.mlx_array_free(conv_out);
         conv_out = biased;
@@ -3331,6 +3343,7 @@ pub fn computeGdnGate(self: *const Trunk, A_log: mlx.mlx_array, a: mlx.mlx_array
         defer _ = mlx.mlx_vector_array_free(out_vec);
         if (mlx.mlx_vector_array_size(out_vec) == 1) {
             var g = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(g);
             try mlx.check(mlx.mlx_vector_array_get(&g, out_vec, 0));
             return g;
         }
@@ -3857,7 +3870,7 @@ test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 
     const hk: c_int = 2;
     const hv: c_int = 8;
     const c_dim: c_int = 2 * hk * 128 + hv * 128;
-    const scale = bf16Scalar(0.1, s);
+    const scale = try bf16Scalar(0.1, s);
     defer _ = mlx.mlx_array_free(scale);
     for ([_][2]mlx.mlx_dtype{ .{ .float16, .bfloat16 }, .{ .bfloat16, .bfloat16 } }, 0..) |dts, case| {
         const dt = dts[0];
@@ -4072,9 +4085,9 @@ test "gdn gate at f32: compiled closure, graph chain and prework kernel agree fa
     const hk: c_int = 2;
     const hv: c_int = 48;
     const c_dim: c_int = 2 * hk * 128 + hv * 128;
-    const q_scale = bf16Scalar(1.0 / 128.0, s);
+    const q_scale = try bf16Scalar(1.0 / 128.0, s);
     defer _ = mlx.mlx_array_free(q_scale);
-    const k_scale = bf16Scalar(@sqrt(1.0 / 128.0), s);
+    const k_scale = try bf16Scalar(@sqrt(1.0 / 128.0), s);
     defer _ = mlx.mlx_array_free(k_scale);
     const A_log = try attn256RandBf16(rnd, &[_]c_int{hv}, s);
     defer _ = mlx.mlx_array_free(A_log);

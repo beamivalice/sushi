@@ -505,6 +505,7 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
     if (sc.ctx == null) {
         if (try @import("mtp_qmv.zig").denseMatmul(s, x, w)) |out| return out;
         var fp_result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(fp_result);
         try mlx.check(mlx.mlx_matmul(&fp_result, x, w, s));
         return fp_result;
     }
@@ -515,6 +516,7 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
     // would misroute e.g. an mxfp4 weight to mxfp8.
     if (mode != .affine) {
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_quantized_matmul(
             &result,
             x,
@@ -549,6 +551,7 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
 
         const null_bi = mlx.mlx_array{ .ctx = null };
         var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_quantized_matmul(
             &result,
             x,
@@ -583,6 +586,7 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
     if (try prefillDqGemm(x, w, sc, bi, bits, group_size, s)) |py| return py;
 
     var result = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_quantized_matmul(
         &result,
         x,

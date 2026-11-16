@@ -335,6 +335,7 @@ fn streamedExpertSwiglu(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_arra
     defer _ = mlx.mlx_array_free(activated);
     try mlx.check(mlx.mlx_multiply(&activated, gate, sig, s));
     var result = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_multiply(&result, activated, up, s));
     return result;
 }
@@ -357,6 +358,7 @@ fn streamedExpertUnsortedDown(s: mlx.mlx_stream, op: StreamedExpertOperands, act
     const sh = mlx.getShape(squeezed);
     const hidden = sh[sh.len - 1];
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, squeezed, &[_]c_int{ rows, topk, hidden }, 3, s));
     return out;
 }
@@ -430,6 +432,7 @@ fn streamedExpertCompositeDown(s: mlx.mlx_stream, op: StreamedExpertOperands, ro
         try mlx.check(mlx.mlx_take_axis(&down_unsorted, down_squeezed, inv_order, 0, s));
         const hidden = mlx.getShape(down_unsorted)[1];
         var down_out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(down_out);
         try mlx.check(mlx.mlx_reshape(&down_out, down_unsorted, &[_]c_int{ rows, topk, hidden }, 3, s));
         return down_out;
     }
@@ -465,6 +468,7 @@ fn streamedExpertWeightedReduce(s: mlx.mlx_stream, down_out: mlx.mlx_array, weig
     defer _ = mlx.mlx_array_free(weighted);
     try mlx.check(mlx.mlx_multiply(&weighted, down_out, w_exp, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_sum_axis(&out, weighted, -2, false, s));
     return out;
 }

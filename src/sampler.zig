@@ -390,6 +390,7 @@ pub fn pldOneHotRow(index: u32, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_array 
 
     const out_shape = [_]c_int{ 1, vocab };
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, mask_f32, &out_shape, 2, s));
     return out;
 }
@@ -641,13 +642,36 @@ pub fn sampleFromProbsLazy(probs: mlx.mlx_array, sampling: SamplingParams, s: ml
     var logp = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(logp);
     try mlx.check(mlx.mlx_log(&logp, probs, s));
+    return drawRowsLogProbs(logp, sampling, s);
+}
+
+/// One categorical draw per row of `logp2d` (`[rows, vocab]` log-probabilities, -inf where a token is out) under the
+/// draw index `sampling.draw`. On the engine's stream row j takes the key of that index under the request's root
+/// salted by j, in one kernel: MLX is asked for nothing, and the rows of one verify block never share a key. On MLX's
+/// stream every row takes `seedKey`, as before.
+pub fn drawRowsLogProbs(logp2d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    if (host.own) {
+        const root = sampling.draw_root orelse {
+            _ = mlx.engine.refuse("mtp draw", "a draw on the engine needs the request's draw root for its key");
+            return error.EngineDrawNeedsRoot;
+        };
+        const n: usize = @intCast(mlx.getShape(logp2d)[0]);
+        var keys: [sampler_draw.max_rows][2]u32 = undefined;
+        if (n > keys.len) return error.SamplerDrawUnsupported;
+        for (keys[0..n], 0..) |*k, j| k.* = random.drawKey(root ^ (@as(u64, j) *% row_salt), sampling.draw);
+        return sampler_draw.rows(logp2d, 1.0, 1.0, 0, keys[0..n], s);
+    }
     var sampled = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(sampled);
     const key = seedKey(sampling);
     defer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_categorical(&sampled, logp, -1, key, s));
+    try mlx.check(mlx.mlx_random_categorical(&sampled, logp2d, -1, key, s));
     return sampled;
 }
+
+const row_salt: u64 = 0xD1B5_4A32_D192_ED03;
 
 /// `sampleTokenLazy` under the request's penalties over `generated_ids`.
 pub fn penalizedSampleLazy(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -826,6 +850,7 @@ fn sampleRowsAllGreedy(params: []const SamplingParams) bool {
 fn concatLogitRows(rows: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     if (rows.len == 1) {
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_set(&out, rows[0]));
         return out;
     }

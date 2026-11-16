@@ -1,0 +1,119 @@
+//! What every load on the engine of our own owes, whatever its arch, in one place:
+//! - the first narrow forward after a wide one (decode after a prefill) trims the free buffers to its bill's transient,
+//!   so a decode does not park a prefill's scratch; nothing is refused, since the shared bill is not a measured cap
+//!   of the engine's own forward (buffers an open pass binds outlive their tensors);
+//! - a request's end closes its pass and leaves the pool at most its resting cap of free buffers (what the next
+//!   request's first verify forward takes, which the ledger bills as parked);
+//! - an unload leaves the pool empty;
+//! - a load whose warm fails does not serve (`model_load`'s warm), and a load whose warm ends is sealed: a pipeline made
+//!   after it is late.
+//! An arch whose own module installs its forwards' measured caps (`cooler_own_caps`, DeepSeek's beside the expert pools
+//! it releases) keeps them and its unload's, and names its resting cap (`coolerRestCap`); the rest are the same for all.
+const std = @import("std");
+const mlx = @import("../mlx.zig");
+const log = @import("../log.zig");
+const bills = @import("../bills.zig");
+const registry = @import("registry.zig");
+const arch_life = @import("life.zig");
+const model_mod = @import("../model.zig");
+const model_handle = @import("../model_handle.zig");
+const ModelConfig = model_mod.ModelConfig;
+
+/// A verify block's rows: every forward of a request is billed at no fewer.
+const verify_rows: u64 = @import("../sampler_draw.zig").max_rows;
+
+comptime {
+    for (std.enums.values(registry.Tag)) |t| {
+        const M = registry.Mod(t);
+        if (@hasDecl(M, "cooler_own_caps") and M.cooler_own_caps and !@hasDecl(M, "coolerRestCap"))
+            @compileError(@tagName(t) ++ " keeps its own pool caps and names no resting cap (coolerRestCap)");
+    }
+}
+
+fn onEngine(config: *const ModelConfig) bool {
+    return arch_life.ownStream(config) != null;
+}
+
+/// Whether the arch's own module installs and lifts its caps (DeepSeek's beside the expert pools it releases).
+fn ownCaps(config: *const ModelConfig) bool {
+    const tag = registry.ofModelType(config.model_type) orelse return false;
+    switch (tag) {
+        inline else => |t| return comptime @hasDecl(registry.Mod(t), "cooler_own_caps") and registry.Mod(t).cooler_own_caps,
+    }
+}
+
+/// PURE: the bytes a forward of `rows` ending at `seq` is billed to add to the pool: its transient at no fewer rows than
+/// a verify block.
+pub fn forwardCap(config: *const ModelConfig, rows: u64, seq: u64) u64 {
+    const kv = bills.configuredKvQuantFor(config);
+    const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+    return bills.prefillTransientReserveAtKv(config, kv_bits, @max(rows, verify_rows), seq);
+}
+
+/// PURE: the free buffers a request's end leaves the pool at most.
+pub fn restCap(config: *const ModelConfig) u64 {
+    const tag = registry.ofModelType(config.model_type) orelse return forwardCap(config, verify_rows, 1);
+    switch (tag) {
+        inline else => |t| if (comptime @hasDecl(registry.Mod(t), "coolerRestCap")) return registry.Mod(t).coolerRestCap(config),
+    }
+    return forwardCap(config, verify_rows, 1);
+}
+
+/// A forward wider than a verify block ran since the last trim: the next narrow one trims its scratch.
+var after_wide = false;
+
+/// A forward of the model of `config` begins.
+pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.ForwardCtx, ids: mlx.mlx_array) void {
+    if (!onEngine(config) or ownCaps(config)) return;
+    const shape = mlx.getShape(ids);
+    const rows: u64 = if (shape.len == 0) 1 else @intCast(shape[shape.len - 1]);
+    if (rows > verify_rows) {
+        after_wide = true;
+        return;
+    }
+    if (!after_wide) return;
+    after_wide = false;
+    mlx.engine.close();
+    trimTo(forwardCap(config, rows, @as(u64, ctx.cache.kvLenForBatching()) + rows));
+}
+
+fn install(bytes: u64) void {
+    mlx.engine.budget(bytes) catch |e| log.warn("[engine] pool: the cap of {d} MB was not installed: {s}\n", .{ bytes >> 20, @errorName(e) });
+}
+
+/// The free buffers past `bytes` go, and no cap stays in force.
+fn trimTo(bytes: u64) void {
+    install(bytes);
+    install(std.math.maxInt(u64));
+}
+
+/// A request on the model of `config` ended: its pass closes, and the free buffers past its resting cap go back. Every
+/// Cooler arch's: the rest is what its ledger parks. An arch with its own caps keeps the rest as its cap in force
+/// (DeepSeek lifts it around a restore); for the rest no cap stays.
+pub fn endRequest(config: *const ModelConfig) void {
+    if (!onEngine(config)) return;
+    mlx.engine.close();
+    after_wide = false;
+    if (ownCaps(config)) install(restCap(config)) else trimTo(restCap(config));
+}
+
+/// Whether the arch installs its own forward caps, which a test's budget would not outlive.
+pub fn ownsCaps(config: *const ModelConfig) bool {
+    return ownCaps(config);
+}
+
+/// The model of `config` is unloaded: the pool's free buffers go, then any cap, since a cap is a forward's and the
+/// next load makes tensors before any.
+pub fn unloadModel(config: *const ModelConfig) void {
+    if (!onEngine(config) or ownCaps(config)) return;
+    mlx.engine.close();
+    trimTo(0);
+}
+
+/// A Cooler load's warm ended: a pipeline made from here is late (`engine.seal`), and the warm's transients leave the
+/// pool, so the load's memory reading is the model's.
+pub fn warmEnded() void {
+    mlx.engine.seal(true);
+    mlx.engine.close();
+    mlx.engine.trim();
+}

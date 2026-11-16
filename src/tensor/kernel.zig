@@ -22,7 +22,7 @@ const preamble =
     \\typedef bfloat bfloat16_t;
     \\typedef half float16_t;
     \\
-;
+++ @embedFile("mlx_bf16_math.metal");
 
 pub fn typeName(d: Dtype) core.Error![]const u8 {
     return switch (d) {

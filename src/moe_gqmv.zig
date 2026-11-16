@@ -248,8 +248,7 @@ fn affineQmvPackUnits(K: c_int, bits: u32) c_int {
 }
 
 const GateUpCfgKey = struct { topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
-var gateup_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var gateup_cfg_key: GateUpCfgKey = std.mem.zeroes(GateUpCfgKey);
+var gateup_cfgs = QsaCfgCache(GateUpCfgKey, 1){};
 var gqmv_gateup_engaged: bool = false;
 pub var gqmv_gateup_override: ?bool = null;
 
@@ -305,9 +304,10 @@ pub fn gatherQmvGateUp(
     if (@rem(N, sgs_per_tg) != 0) return null;
 
     const key = GateUpCfgKey{ .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd };
-    if (gateup_cfg == null or !std.meta.eql(gateup_cfg_key, key)) {
-        if (gateup_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const gateup_cfg = blk: {
+        if (gateup_cfgs.get(key)) |hit| break :blk hit[0];
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const y_shape = [_]c_int{ topk, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, N, topk));
@@ -316,9 +316,9 @@ pub fn gatherQmvGateUp(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", affineQmvPackUnits(K, bits)));
-        gateup_cfg = config;
-        gateup_cfg_key = key;
-    }
+        gateup_cfgs.put(key, .{config});
+        break :blk config;
+    };
 
     const sigtab = try swigluSigTable(s, xd, std.heap.c_allocator);
     const K_arr = cachedScalarInt(K);
@@ -330,7 +330,7 @@ pub fn gatherQmvGateUp(
     const kernel = try getGatherQmvGateUpKernel();
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gateup_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gateup_cfg, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var y = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(y);
@@ -421,8 +421,7 @@ fn getGatherQmvGateUpRowsKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 const GateUpRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
-var gateup_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var gateup_rows_cfg_key: GateUpRowsCfgKey = std.mem.zeroes(GateUpRowsCfgKey);
+var gateup_rows_cfgs = QsaCfgCache(GateUpRowsCfgKey, 1){};
 var gqmv_gateup_rows_engaged: bool = false;
 pub var moe_rows_fused_override: ?bool = null;
 pub var moe_rows_fused_layers: u32 = 0;
@@ -490,9 +489,10 @@ pub fn gatherQmvGateUpRows(
     if (@rem(N, sgs_per_tg) != 0) return null;
 
     const key = GateUpRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd };
-    if (gateup_rows_cfg == null or !std.meta.eql(gateup_rows_cfg_key, key)) {
-        if (gateup_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const gateup_rows_cfg = blk: {
+        if (gateup_rows_cfgs.get(key)) |hit| break :blk hit[0];
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const y_shape = [_]c_int{ nrows, topk, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 3, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, N, nrows * topk));
@@ -502,9 +502,9 @@ pub fn gatherQmvGateUpRows(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", affineQmvPackUnits(K, bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TOPK", topk));
-        gateup_rows_cfg = config;
-        gateup_rows_cfg_key = key;
-    }
+        gateup_rows_cfgs.put(key, .{config});
+        break :blk config;
+    };
 
     const sigtab = try swigluSigTable(s, xd, std.heap.c_allocator);
     const K_arr = cachedScalarInt(K);
@@ -516,7 +516,7 @@ pub fn gatherQmvGateUpRows(
     const kernel = try getGatherQmvGateUpRowsKernel();
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gateup_rows_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gateup_rows_cfg, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var y = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(y);
@@ -565,11 +565,7 @@ const GqmvCfgKey = struct {
     dtype: mlx.mlx_dtype,
     x_per_expert: bool,
 };
-const GqmvCfgSlot = struct {
-    cfg: ?mlx.mlx_fast_metal_kernel_config = null,
-    key: GqmvCfgKey = std.mem.zeroes(GqmvCfgKey),
-};
-var gqmv_cfg_cache: [2]GqmvCfgSlot = .{ .{}, .{} };
+var gqmv_cfgs = QsaCfgCache(GqmvCfgKey, 1){};
 
 pub var gqmv_engaged: bool = false;
 pub var decode_ladder_engaged: bool = false;
@@ -627,10 +623,10 @@ pub fn gatherQmv(
     // +0.4 ms of CPU graph build per token on a 40-layer MoE, which is roughly 60%
     // of the margin this path was being charged against stock `gather_qmm`.
     const key = GqmvCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .x_per_expert = x_per_expert };
-    const slot = &gqmv_cfg_cache[@intFromBool(x_per_expert)];
-    if (slot.cfg == null or !std.meta.eql(slot.key, key)) {
-        if (slot.cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const config = blk: {
+        if (gqmv_cfgs.get(key)) |hit| break :blk hit[0];
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         const y_shape = [_]c_int{ topk, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 2, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, N, topk));
@@ -638,9 +634,9 @@ pub fn gatherQmv(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)));
-        slot.* = .{ .cfg = cfg, .key = key };
-    }
-    const config = slot.cfg.?;
+        gqmv_cfgs.put(key, .{cfg});
+        break :blk cfg;
+    };
 
     const K_arr = cachedScalarInt(K);
     const N_arr = cachedScalarInt(N);
@@ -766,8 +762,7 @@ fn getGatherQmvDownReduceKernel() !mlx.mlx_fast_metal_kernel {
 /// 4 spills its hoisted packs, 16 measured the same as 8 on the shipped shapes.
 const DOWNRED_LPR: c_int = 8;
 const DownRedCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
-var downred_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var downred_cfg_key: DownRedCfgKey = std.mem.zeroes(DownRedCfgKey);
+var downred_cfgs = QsaCfgCache(DownRedCfgKey, 1){};
 pub var downred_engaged: bool = false;
 pub var downred_override: ?bool = null;
 
@@ -821,9 +816,10 @@ pub fn gatherQmvDownReduce(
     if (@rem(N, rows) != 0) return null;
 
     const key = DownRedCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
-    if (downred_cfg == null or !std.meta.eql(downred_cfg_key, key)) {
-        if (downred_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const downred_cfg = blk: {
+        if (downred_cfgs.get(key)) |hit| break :blk hit[0];
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         const y_shape = [_]c_int{N};
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 1, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(N, rows) * topk * 32, 1, 1));
@@ -835,9 +831,9 @@ pub fn gatherQmvDownReduce(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", DOWNRED_LPR));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
-        downred_cfg = cfg;
-        downred_cfg_key = key;
-    }
+        downred_cfgs.put(key, .{cfg});
+        break :blk cfg;
+    };
 
     const K_arr = cachedScalarInt(K);
     const N_arr = cachedScalarInt(N);
@@ -848,7 +844,7 @@ pub fn gatherQmvDownReduce(
     const kernel = try getGatherQmvDownReduceKernel();
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, downred_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, downred_cfg, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var y = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(y);
@@ -940,8 +936,7 @@ fn getGatherQmvDownReduceRowsKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
-var downred_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var downred_rows_cfg_key: DownRedRowsCfgKey = std.mem.zeroes(DownRedRowsCfgKey);
+var downred_rows_cfgs = QsaCfgCache(DownRedRowsCfgKey, 1){};
 var downred_rows_engaged: bool = false;
 
 /// Asked BEFORE the gate/up dispatch: a decline is static per geometry and
@@ -1004,9 +999,10 @@ pub fn gatherQmvDownReduceRows(
     if (@rem(N, rows) != 0) return null;
 
     const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
-    if (downred_rows_cfg == null or !std.meta.eql(downred_rows_cfg_key, key)) {
-        if (downred_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const downred_rows_cfg = blk: {
+        if (downred_rows_cfgs.get(key)) |hit| break :blk hit[0];
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         const y_shape = [_]c_int{ nrows, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 2, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(N, rows) * topk * 32, nrows, 1));
@@ -1018,9 +1014,9 @@ pub fn gatherQmvDownReduceRows(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", DOWNRED_LPR));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
-        downred_rows_cfg = cfg;
-        downred_rows_cfg_key = key;
-    }
+        downred_rows_cfgs.put(key, .{cfg});
+        break :blk cfg;
+    };
 
     const K_arr = cachedScalarInt(K);
     const N_arr = cachedScalarInt(N);
@@ -1031,7 +1027,7 @@ pub fn gatherQmvDownReduceRows(
     const kernel = try getGatherQmvDownReduceRowsKernel();
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, downred_rows_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, downred_rows_cfg, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var y = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(y);

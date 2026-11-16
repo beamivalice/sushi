@@ -126,8 +126,13 @@ test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" 
     Trunk.mtp_head_kv_quant_flag = true;
     try xfm.cache.reinit(config.num_hidden_layers, trunk_mod.KVQuantConfig.affine(8));
     try arch_state.applyHeadKvQuant(&xfm, trunk_mod.KVQuantConfig.affine(8));
-    try testing.expect(arch_state.buildDraftRerank(&xfm));
-    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_mixed_4_8_gs64, qwen4G17CostProfile(&xfm));
+    // The mixed profile's costs were measured on the served geometry over the 8-bit group-64 trunk; any other pack
+    // never takes them, whether or not its head builds a rerank.
+    const served = config.hidden_size == 2560 and @import("qwen4_test_support.zig").joinedRowsTrunk(&xfm);
+    const rerank = arch_state.buildDraftRerank(&xfm);
+    if (served) try testing.expect(rerank);
+    const want: MtpCostProfile = if (served) .g17_nax_qwen4_mixed_4_8_gs64 else .generic;
+    try testing.expectEqual(want, qwen4G17CostProfile(&xfm));
     try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, trunk_mod.KVQuantConfig.dense));
     try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, trunk_mod.KVQuantConfig.affine(4)));
     const head = qwen4_state.mtpOf(&xfm).?;

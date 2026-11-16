@@ -80,7 +80,8 @@ without it. An arch added later joins the list in the landing that adds it.
   model-settings key, checked at compile time; an arch that declares it must declare `stampCooler`, `coolerForTest`,
   `cooler_contract` and its sched module's `coolerRows` too; `model.cooler_off` holds the archs whose flag was given, each load stamps only its own, a
   model of another arch loads as it would and its load names the flag, and `main` pins each given flag's setting), `coolerForTest` (a test's side, set before
-  the load), `cooler_contract` (the fixtures and the arch's own reads the shared Sushi Cooler contract runs on). The `load` slot (`arch/load.zig`) beside its
+  the load), `cooler_own_caps` with `coolerRestCap` (an arch that installs its forwards' pool caps itself and the cap a
+  request's end leaves; without them `arch/cooler.zig` trims to the transient bill and caps nothing), `cooler_contract` (the fixtures and the arch's own reads the shared Sushi Cooler contract runs on). The `load` slot (`arch/load.zig`) beside its
   `weights` and `residentLoadBytes`: `drafterOff`, `stageDrafter`, `prepareDrafter`, `loadDflash`, `bindDflash`,
   `dflashRowBounds(min, max, drafter_block)`, `logLoad`, `logDflashReady`, `warmUbench`, which `model_load.zig` calls by the
   config's arch; `bindDflash` returns whether the arch takes the drafter (an error is a bind that failed), and the refusal that

@@ -32,7 +32,7 @@ fn sortable(d: core.Dtype) bool {
 /// `t` sorted along `axis_in`, or with `arg` the uint32 indices that sort it. Another axis than the last is sorted as
 /// the last one of a turned view, as MLX does.
 pub fn sort(t: *Tensor, axis_in: c_int, comptime arg: bool) Error!*Tensor {
-    if (t.ndim == 0 or !sortable(t.dtype)) return error.TensorDtype;
+    if (t.ndim == 0 or !sortable(t.dtype)) return core.refusing("a sort of a scalar or of a dtype MLX's sort does not take", error.TensorDtype);
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
     if (axis >= t.ndim) return error.TensorShape;
     if (axis != t.ndim - 1) {
@@ -182,7 +182,7 @@ fn multiBlock(t: *Tensor, n: usize, bn: usize, n_blocks: usize, comptime arg: bo
 /// `SearchSorted`: for each of `values`, where it goes in the sorted 1-D `seq`, after (`right`) or before the
 /// elements equal to it.
 pub fn searchSorted(seq: *Tensor, values_in: *Tensor, right: bool) Error!*Tensor {
-    if (seq.ndim != 1 or seq.dtype != values_in.dtype or !sortable(seq.dtype) or seq.size() == 0 or seq.size() > std.math.maxInt(u32)) return error.TensorUnsupported;
+    if (seq.ndim != 1 or seq.dtype != values_in.dtype or !sortable(seq.dtype) or seq.size() == 0 or seq.size() > std.math.maxInt(u32)) return core.refusing("a search of other than one sorted, non-empty axis of the values' dtype under 2^32 elements", error.TensorUnsupported);
     const values = try ops.contiguous(values_in);
     defer core.release(values);
     const out = try core.fresh(.uint32, values.dims());

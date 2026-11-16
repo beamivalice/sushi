@@ -837,8 +837,8 @@ const MtpAcceptanceReport = struct {
 fn mtpAcceptanceReport(config: *const model_mod.ModelConfig) MtpAcceptanceReport {
     const applies = model_settings.applies("mtp_acceptance", arch_flags.settingsFit(config));
     return .{
-        .acceptance = settings_resolve.acceptanceFor(if (applies) config.mtp_acceptance_override else null),
-        .greedy_tail = settings_resolve.greedyTailFor(if (applies) config.mtp_greedy_tail_override else null),
+        .acceptance = arch_flags.mtpAcceptanceOf(config),
+        .greedy_tail = arch_flags.greedyTailOf(config),
         .applies = applies,
     };
 }

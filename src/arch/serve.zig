@@ -66,6 +66,7 @@ fn serveOf(config: *const model.ModelConfig, comptime name: []const u8, args: an
 /// A model is unloaded: whatever pool cap its arch raised or lowered is given back.
 pub fn unloadModel(config: *const model.ModelConfig) void {
     serveOf(config, "unloadModel", .{config});
+    @import("cooler.zig").unloadModel(config);
 }
 
 /// An image encode of `bill` bytes starts on the vision thread.

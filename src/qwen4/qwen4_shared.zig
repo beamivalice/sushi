@@ -490,7 +490,7 @@ fn storedLayer(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, s: mlx.mlx_stre
     const trunk_dec: ?api.format.Decode = if (c.trellis_bits != 0) api.format.Decode.tabled(.spec1, .w15) else null;
     var cfg: ModelConfig = .{ .hidden_size = hidden, .trunk_quant = trunk_dec, .expert_layout = .exl3_k4 };
     var mw = layerOf(w, if (c.ragged) .{ .ragged = rb } else .{ .bank = bank }, c.dense_gate);
-    try layer_weights.bindSharedGeometry(&mw, &cfg);
+    try layer_weights.bindSharedGeometry(&mw, &cfg, s);
     var geo_only = mw;
     geo_only.routed_shape = null;
     var bare = geo_only;

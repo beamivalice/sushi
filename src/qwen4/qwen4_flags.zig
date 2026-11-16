@@ -27,6 +27,14 @@ pub const help = [_]flags.HelpChunk{
         \\                      No effect on GLM or MiMo, which have no GDN arm.
         \\
     },
+    .{ .before = "  --kv-quant", .text =
+        \\  --qwen-mlx-engine   Qwen3.8 only: decode on MLX instead of Sushi Cooler,
+        \\                      the engine of our own, on an STQ pack. An opt-out
+        \\                      if Sushi Cooler misbehaves; report it at
+        \\                      https://github.com/beamivalice/sushi/issues/new.
+        \\                      Outranks the model's qwen_cooler setting.
+        \\
+    },
 };
 
 pub const think_rank = 1;
@@ -66,4 +74,36 @@ fn qwenGdnLine(config: *const model.ModelConfig, use: flags.LaunchFlagUse) ?[]co
     if (arch_config.isOf(config, "glm5")) return "GDN state: --qwen-gdn 16 has no effect on GLM (its KDA state is f32 already)";
     if (arch_config.isOf(config, "mimo2")) return "GDN state: --qwen-gdn 16 has no effect on mimo_v2 (no GatedDeltaNet layers)";
     return "GDN state: bf16 between tokens (--qwen-gdn 16; f32 is the default; the decay gate is f32 either way)";
+}
+
+/// On Sushi Cooler a draft is accepted by the exact rule only, and DFlash2 runs on MLX only: each flag that asks
+/// otherwise is refused by name before the load reads a weight.
+pub fn refusal(config: *const model.ModelConfig, use: flags.LaunchFlagUse) ?[]const u8 {
+    if (!qwen4_cooler.ownDecode(config)) return null;
+    if (use.mtp_typical) return "--mtp-typical is not served on Sushi Cooler: drafts are accepted by the exact rule only; drop the flag, or pass --qwen-mlx-engine";
+    if (use.mtp_tokenv3) return "--mtp-tokenv3 is not served on Sushi Cooler: drafts are accepted by the exact rule only; drop the flag, or pass --qwen-mlx-engine";
+    if (use.mtp_greedy_tail) return "--mtp-greedy-tail is not served on Sushi Cooler: drafts are accepted by the exact rule only; drop the flag, or pass --qwen-mlx-engine";
+    if (use.drafter) return "--drafter is not served on Sushi Cooler: DFlash2 runs on MLX only; drop the flag, or pass --qwen-mlx-engine";
+    return null;
+}
+
+/// A Cooler load accepts drafts by the exact rule only, so `mtp_acceptance` and `mtp_greedy_tail` do not reach it.
+pub fn exactDraftsOnly(config: *const model.ModelConfig) bool {
+    return qwen4_cooler.ownDecode(config);
+}
+
+const qwen4_cooler = @import("qwen4_cooler.zig");
+
+test "qwen4 flags: a Cooler load refuses lossy acceptance, the greedy tail and DFlash2 by name; a load on MLX takes them" {
+    const std = @import("std");
+    var c: model.ModelConfig = .{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .expert_quant_codebook = .spec1, .cooler_for_test = true };
+    try std.testing.expect(exactDraftsOnly(&c));
+    try std.testing.expect(refusal(&c, .{}) == null);
+    try std.testing.expectEqualStrings("--mtp-typical is not served on Sushi Cooler: drafts are accepted by the exact rule only; drop the flag, or pass --qwen-mlx-engine", refusal(&c, .{ .mtp_typical = true }).?);
+    try std.testing.expect(std.mem.startsWith(u8, refusal(&c, .{ .mtp_tokenv3 = true }).?, "--mtp-tokenv3 is not served on Sushi Cooler"));
+    try std.testing.expect(std.mem.startsWith(u8, refusal(&c, .{ .mtp_greedy_tail = true }).?, "--mtp-greedy-tail is not served on Sushi Cooler"));
+    try std.testing.expectEqualStrings("--drafter is not served on Sushi Cooler: DFlash2 runs on MLX only; drop the flag, or pass --qwen-mlx-engine", refusal(&c, .{ .drafter = true }).?);
+    c.cooler_ask = .flag;
+    try std.testing.expect(!exactDraftsOnly(&c));
+    try std.testing.expect(refusal(&c, .{ .mtp_typical = true, .mtp_greedy_tail = true, .drafter = true }) == null);
 }

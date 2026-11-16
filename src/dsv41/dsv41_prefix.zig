@@ -99,6 +99,7 @@ fn orPlaceholder(a: mlx.mlx_array, first: *mlx.mlx_array) !mlx.mlx_array {
         return first.*;
     }
     var again = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(again);
     try mlx.check(mlx.mlx_array_set(&again, first.*));
     return again;
 }

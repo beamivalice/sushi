@@ -77,8 +77,8 @@ fn missing(name: []const u8) error{TrunkStqLayout} {
 
 fn view(owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, a: mlx.mlx_array, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&o, a, shape.ptr, shape.len, s));
     errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_reshape(&o, a, shape.ptr, shape.len, s));
     try owned.append(allocator, o);
     return o;
 }

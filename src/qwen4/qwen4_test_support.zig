@@ -280,3 +280,19 @@ pub fn expectSlotStateEqual(alloc: std.mem.Allocator, s: mlx.mlx_stream, a: *Qwe
     try testing.expectEqual(a.head.entry.initialized, b.head.entry.initialized);
     try testing.expectEqualSlices(u32, &a.head.entry.ple_prev, &b.head.entry.ple_prev);
 }
+
+/// Whether the pack's GDN projections are 8-bit group-64 affine: the one trunk layout the joined-row verify
+/// projections take (`verify_moe.verifyJoinedProjection`). A group-128 trunk, as every served pack has, verifies
+/// each row through its own projections.
+pub fn joinedRowsTrunk(xfm: *const Trunk) bool {
+    for (xfm.moe_layers orelse return false) |*layer| switch (layer.attn) {
+        .linear => |la| {
+            if (la.qkv_s.ctx == null or mlx.mlx_array_dtype(la.qkv_w) != .uint32) return false;
+            const ws = mlx.getShape(la.qkv_w);
+            const ss = mlx.getShape(la.qkv_s);
+            return ws.len == 2 and ss.len == 2 and ws[1] * 4 == ss[1] * 64;
+        },
+        .full => {},
+    };
+    return false;
+}

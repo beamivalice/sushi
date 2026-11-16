@@ -83,3 +83,9 @@ pub fn headDigest(xfm: *trunk_mod.Trunk, h: *std.crypto.hash.sha2.Sha256, s: mlx
         try restore_dump.feedArray(h, mark.rows, s);
     }
 }
+
+/// A Cooler load's state is the engine's, and so is every array the caches make of it: an SSD restore read on MLX's
+/// CPU stream inside a Cooler request crashed on a map of the other side.
+pub fn arraysOn(config: *const @import("../model.zig").ModelConfig) ?mlx.mlx_stream {
+    return if (@import("qwen4_cooler.zig").ownDecode(config)) mlx.engine.stream() else null;
+}

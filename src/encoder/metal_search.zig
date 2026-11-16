@@ -571,6 +571,7 @@ fn decodeTable(allocator: std.mem.Allocator, s: mlx.mlx_stream, dec: format.Deco
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, s));
     var table = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(table);
     try mlx.check(mlx.mlx_vector_array_get(&table, outputs_vec, 0));
     try mlx.check(mlx.mlx_array_eval(table));
     for (&cached_tables, 0..) |*slot, i| if (slot.* == null) {

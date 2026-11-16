@@ -79,6 +79,8 @@ and the page tooltip share them.
   keeps an explicit `true`), an untick saves `ds41_cooler: false`; like every model key it applies at the next load and
   the Reload callout follows `loaded_with`. `--ds41-mlx-engine` locks it unticked and names the flag; every
   DeepSeek pack on every Mac is served by Sushi Cooler, so the server never disables it. A key group is one entry in `GROUP_OF`.
+- Qwen3.8 Inference: the same checkbox for `qwen_cooler`, under its own heading; `--qwen-mlx-engine` locks it. Each arch's
+  Cooler key is offered only on that arch's models (`model_settings.Fit.cooler_setting`).
 
 ## Tooltips
 

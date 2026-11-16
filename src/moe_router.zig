@@ -409,9 +409,29 @@ const RouterCfgKey = struct {
 const RouterCfgSlot = struct {
     cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null },
     key: RouterCfgKey = std.mem.zeroes(RouterCfgKey),
-    scale_arr: mlx.mlx_array = .{ .ctx = null },
 };
 var router_cfg_cache: [4]RouterCfgSlot = .{ .{}, .{}, .{}, .{} };
+
+const RouteScale = struct { value: f32 = 0, arr: ?mlx.mlx_array = null };
+var route_scales: [2]RouteScale = .{ .{}, .{} };
+
+/// The route scale as an array of the stream's side: a cached array belongs to the side that made it.
+fn routeScale(s: mlx.mlx_stream, v: f32) !mlx.mlx_array {
+    const side = &route_scales[@intFromBool(mlx.engine.isStream(s))];
+    if (side.arr) |a| {
+        if (side.value == v) return a;
+        _ = mlx.mlx_array_free(a);
+        side.* = .{};
+    }
+    side.* = .{ .value = v, .arr = try mlx_util.f32Scalar(v) };
+    return side.arr.?;
+}
+
+/// Drops the route scale of one side, when its last model goes (`arch_handle.dropHostArrays`).
+pub fn dropSide(side: u1) void {
+    if (route_scales[side].arr) |a| _ = mlx.mlx_array_free(a);
+    route_scales[side] = .{};
+}
 
 pub var moe_router_fused_override: ?bool = null;
 var moe_router_engaged: bool = false;
@@ -511,9 +531,8 @@ pub fn moeRouterTopKGate(
     };
     const slot = &router_cfg_cache[@backingInt(mode)];
     if (slot.cfg.ctx == null or !std.meta.eql(slot.key, key)) {
-        if (slot.cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(slot.cfg);
-        if (slot.scale_arr.ctx != null) _ = mlx.mlx_array_free(slot.scale_arr);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         // Outputs keep the caller's leading dims with the expert axis replaced by K.
         var out_shape: [4]c_int = undefined;
         for (lsh[0 .. lsh.len - 1], 0..) |d, i| out_shape[i] = d;
@@ -537,13 +556,15 @@ pub fn moeRouterTopKGate(
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GSZ", @divExact(num_experts, n_group)));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TOPKG", topk_group));
         }
-        slot.* = .{ .cfg = config, .key = key, .scale_arr = mlx.mlx_array_new_float(route_scale) };
+        if (slot.cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(slot.cfg);
+        slot.* = .{ .cfg = config, .key = key };
     }
     const config = slot.cfg;
 
     const softmax_inputs = [_]mlx.mlx_array{logits};
     const gate_inputs = [_]mlx.mlx_array{ logits, if (gate) |gt| gt.x else logits, if (gate) |gt| gt.w else logits };
-    const sigmoid_inputs = [_]mlx.mlx_array{ logits, bias, slot.scale_arr };
+    const sigmoid = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped;
+    const sigmoid_inputs = [_]mlx.mlx_array{ logits, bias, if (sigmoid) try routeScale(s, route_scale) else logits };
     const inputs_arr: []const mlx.mlx_array = switch (mode) {
         .softmax => &softmax_inputs,
         .softmax_gate => &gate_inputs,
@@ -565,6 +586,7 @@ pub fn moeRouterTopKGate(
     errdefer _ = mlx.mlx_array_free(scores);
     try mlx.check(mlx.mlx_vector_array_get(&scores, outputs_vec, 1));
     var gate_logit = mlx.mlx_array{ .ctx = null };
+    errdefer _ = mlx.mlx_array_free(gate_logit);
     if (mode == .softmax_gate) {
         gate_logit = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_vector_array_get(&gate_logit, outputs_vec, 2));
@@ -753,6 +775,7 @@ test "fused softmax router folds the shared-expert gate dot bit-identically to t
             const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
             defer _ = mlx.mlx_array_free(a32);
             var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st));
             return out;
         }
@@ -830,6 +853,7 @@ test "the router declines the gate fold when it has no idle simdgroups or the do
     const ones = struct {
         fn f(n: c_int, st: mlx.mlx_stream) !mlx.mlx_array {
             var o = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(o);
             try mlx.check(mlx.mlx_ones(&o, &[_]c_int{n}, 1, .bfloat16, st));
             return o;
         }
@@ -925,4 +949,25 @@ test "moeRoutingChain produces top-K indices and renormalized softmax weights" {
     try testing.expect(@abs(gs[1] - 15.0) < tol);
     try testing.expect(@abs(ss[0] - 1.0) < tol);
     try testing.expect(@abs(ss[1] - 1.0) < tol);
+}
+
+test "a route scale the engine's pool refuses is an error and is not kept: the next call makes it" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    defer dropSide(1);
+    defer mlx.engine.fault.disarm();
+    var said: [256]u8 = undefined;
+    dropSide(1);
+    mlx.engine.fault.arm(1);
+    try std.testing.expectError(error.MlxError, routeScale(es, 2.5));
+    _ = mlx.takeError(&said);
+    mlx.engine.fault.disarm();
+    const a = try routeScale(es, 2.5);
+    try std.testing.expect(a.ctx != null);
+    try std.testing.expect(!mlx.errorPending());
 }

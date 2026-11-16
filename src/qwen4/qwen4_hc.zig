@@ -61,29 +61,14 @@ pub fn hcMixCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, pa
     defer _ = mlx.mlx_array_free(up4);
     const n4 = qwen4_forward.closureIn(input, 1) orelse return -1;
     defer _ = mlx.mlx_array_free(n4);
-    var mix = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mix);
-    if (mlx.mlx_sigmoid(&mix, up4, self.s) != 0) return -1;
-    var prod = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(prod);
-    if (mlx.mlx_multiply(&prod, mix, n4, self.s) != 0) return -1;
-    var mixed = mlx.mlx_array_new();
-    if (mlx.mlx_mean_axis(&mixed, prod, 2, false, self.s) != 0) return -1;
-    return qwen4_forward.closureOut(res, mixed);
+    return qwen4_forward.closureOut(res, hcMixChain(self, up4, n4) catch return -1);
 }
 
 pub fn hcInjCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
     const self: *Trunk = @ptrCast(@alignCast(payload.?));
     const x = qwen4_forward.closureIn(input, 0) orelse return -1;
     defer _ = mlx.mlx_array_free(x);
-    var sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sig);
-    if (mlx.mlx_sigmoid(&sig, x, self.s) != 0) return -1;
-    const two = scalarOf(2.0, mlx.mlx_array_dtype(x), self.s) catch return -1;
-    defer _ = mlx.mlx_array_free(two);
-    var g = mlx.mlx_array_new();
-    if (mlx.mlx_multiply(&g, sig, two, self.s) != 0) return -1;
-    return qwen4_forward.closureOut(res, g);
+    return qwen4_forward.closureOut(res, hcInjChain(self, x) catch return -1);
 }
 
 pub fn hcWriteCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
@@ -94,12 +79,45 @@ pub fn hcWriteCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, 
     defer _ = mlx.mlx_array_free(out4);
     const inj = qwen4_forward.closureIn(input, 2) orelse return -1;
     defer _ = mlx.mlx_array_free(inj);
+    return qwen4_forward.closureOut(res, hcWriteChain(self, stream4, out4, inj) catch return -1);
+}
+
+/// `mean(sigmoid(up4) * n4, axis 2)`: the mix closure's body and the forward's chain where it is not compiled.
+pub fn hcMixChain(self: *const Trunk, up4: mlx.mlx_array, n4: mlx.mlx_array) !mlx.mlx_array {
+    var mix = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mix);
+    try mlx.check(mlx.mlx_sigmoid(&mix, up4, self.s));
+    var prod = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(prod);
+    try mlx.check(mlx.mlx_multiply(&prod, mix, n4, self.s));
+    var mixed = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(mixed);
+    try mlx.check(mlx.mlx_mean_axis(&mixed, prod, 2, false, self.s));
+    return mixed;
+}
+
+/// `2 * sigmoid(raw)` in raw's dtype: the inject closure's body and the forward's chain.
+pub fn hcInjChain(self: *const Trunk, raw: mlx.mlx_array) !mlx.mlx_array {
+    var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, raw, self.s));
+    const two = try scalarOf(2.0, mlx.mlx_array_dtype(raw), self.s);
+    defer _ = mlx.mlx_array_free(two);
+    var g = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(g);
+    try mlx.check(mlx.mlx_multiply(&g, sig, two, self.s));
+    return g;
+}
+
+/// `stream4 + out4 * inj`: the write closure's body and the forward's chain.
+pub fn hcWriteChain(self: *const Trunk, stream4: mlx.mlx_array, out4: mlx.mlx_array, inj: mlx.mlx_array) !mlx.mlx_array {
     var add4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(add4);
-    if (mlx.mlx_multiply(&add4, out4, inj, self.s) != 0) return -1;
+    try mlx.check(mlx.mlx_multiply(&add4, out4, inj, self.s));
     var next = mlx.mlx_array_new();
-    if (mlx.mlx_add(&next, stream4, add4, self.s) != 0) return -1;
-    return qwen4_forward.closureOut(res, next);
+    errdefer _ = mlx.mlx_array_free(next);
+    try mlx.check(mlx.mlx_add(&next, stream4, add4, self.s));
+    return next;
 }
 
 pub const HcRead = struct {
@@ -286,6 +304,7 @@ pub fn hcGroupNorm(self: *Trunk, x: mlx.mlx_array, w: mlx.mlx_array, batch: c_in
     defer _ = mlx.mlx_array_free(n4);
     try mlx.check(mlx.mlx_fast_rms_norm(&n4, x4, self.ones_hidden.?, self.config.rms_norm_eps, self.s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_multiply(&out, n4, w, self.s));
     return out;
 }
@@ -328,31 +347,16 @@ pub fn hcReadNormed(self: *Trunk, n4: mlx.mlx_array, w: *const HcWeights, batch:
     } else if (try qwen4_forward.applyClosure(self.arch_state.qwen4.compiled_hc_mix, &.{ up4, n4 })) |m| {
         mixed = m;
     } else {
-        var mix = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(mix);
-        try mlx.check(mlx.mlx_sigmoid(&mix, up4, self.s));
-        var prod = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(prod);
-        try mlx.check(mlx.mlx_multiply(&prod, mix, n4, self.s));
-        mixed = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_mean_axis(&mixed, prod, 2, false, self.s));
+        mixed = try hcMixChain(self, up4, n4);
     }
     errdefer _ = mlx.mlx_array_free(mixed);
 
     var inj = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(inj);
     if (w.inject_w.ctx != null) {
         const raw = if (raw_inject) |r| try standinRef(r) else try self.qmatmul(n_flat, &w.inject);
         defer _ = mlx.mlx_array_free(raw);
-        const g = (try qwen4_forward.applyClosure(self.arch_state.qwen4.compiled_hc_inj, &.{raw})) orelse blk: {
-            var sig = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sig);
-            try mlx.check(mlx.mlx_sigmoid(&sig, raw, self.s));
-            const two = try scalarOf(2.0, mlx.mlx_array_dtype(raw), self.s);
-            defer _ = mlx.mlx_array_free(two);
-            var g2 = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_multiply(&g2, sig, two, self.s));
-            break :blk g2;
-        };
+        const g = (try qwen4_forward.applyClosure(self.arch_state.qwen4.compiled_hc_inj, &.{raw})) orelse try hcInjChain(self, raw);
         defer _ = mlx.mlx_array_free(g);
         const inj_shape = [_]c_int{ batch, seq_len, hc, 1 };
         try mlx.check(mlx.mlx_reshape(&inj, g, &inj_shape, 4, self.s));
@@ -377,11 +381,7 @@ pub fn hcWrite(self: *Trunk, stream: mlx.mlx_array, out: mlx.mlx_array, inj: mlx
     if (try qwen4_forward.applyClosure(self.arch_state.qwen4.compiled_hc_write, &.{ stream4, out4, inj })) |n| {
         next4 = n;
     } else {
-        var add4 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(add4);
-        try mlx.check(mlx.mlx_multiply(&add4, out4, inj, self.s));
-        next4 = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&next4, stream4, add4, self.s));
+        next4 = try hcWriteChain(self, stream4, out4, inj);
     }
     defer _ = mlx.mlx_array_free(next4);
     var next = mlx.mlx_array_new();
@@ -419,7 +419,8 @@ pub fn pleEmbedding(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, en
         }
         break :blk pleClaimSpecCapture(self, entry, n);
     };
-    if (ctx.lazy_ids and pleDeferrable(&self.config, n)) {
+    // The engine of our own runs each op as it is built: a leaf filled after the build would already have been read.
+    if (ctx.lazy_ids and !mlx.engine.isStream(self.s) and pleDeferrable(&self.config, n)) {
         if (ctx.arch_ctx.qwen4.ple_pending != null) return error.PlePendingAlreadySet;
         @memset(pk, 0);
         const emb = mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
@@ -580,6 +581,7 @@ pub fn pleForward(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_i
         try mlx.check(mlx.mlx_array_set(&entry.spec_ple_input, cat));
     }
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_add(&out, gv, conv_act, self.s));
     if (qwen4_forward.qwen4_trace) |tr| qwen4_forward.Qwen4Trace.set(&tr.ple_out, out);
     return out;
@@ -807,9 +809,16 @@ pub var hc_fused_cfg_builds: usize = 0;
 /// Rows one D/U dispatch group carries (each lane holds four accumulators per row).
 pub const HC_ROW_GROUP: c_int = 8;
 
-pub var hc_fused_eps: ?mlx.mlx_array = null;
+/// One a side: an array belongs to the side that made it (1 the engine's, 0 MLX's).
+pub var hc_fused_eps: [2]?mlx.mlx_array = .{ null, null };
 
-pub var hc_fused_eps_val: f32 = 0;
+pub var hc_fused_eps_val: [2]f32 = .{ 0, 0 };
+
+/// Frees side `side`'s epsilon, when the side's last model is gone.
+pub fn dropSide(side: u1) void {
+    if (hc_fused_eps[side]) |e| _ = mlx.mlx_array_free(e);
+    hc_fused_eps[side] = null;
+}
 
 pub var hc_fused_engaged = false;
 
@@ -881,7 +890,8 @@ pub fn hcReadPrepared(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: 
 }
 
 pub fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending, max_width: c_int) !?HcFusedOut {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or width < 2 or width > max_width) return null;
+    // An MLX closure would leave the engine of our own; the caller's fallback is the closure's own body.
+    if (!mlx.streamIsGpu(s) or mlx.engine.isStream(s) or !verifySharedHardware() or width < 2 or width > max_width) return null;
     if (x.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(x), &.{ 1, width, 10240 })) return null;
     const arrays = [_]mlx.mlx_array{ x, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, if (pending) |pd| pd.out else x, if (pending) |pd| pd.inj else x };
     const shapes = .{ &[_]c_int{ 4, 2560 }, &[_]c_int{ 320, 2560 }, &[_]c_int{ 320, 160 }, &[_]c_int{ 320, 160 }, &[_]c_int{ 10240, 80 }, &[_]c_int{ 10240, 5 }, &[_]c_int{ 10240, 5 }, &[_]c_int{ 10240, 4 } };
@@ -1113,12 +1123,15 @@ pub fn hcReadFused(
         hc_fused_cfg_builds += 1;
     }
     const cfgs = slot.*.?.cfgs;
-    if (hc_fused_eps == null or hc_fused_eps_val != eps) {
-        if (hc_fused_eps) |e| _ = mlx.mlx_array_free(e);
+    const side: u1 = @intFromBool(mlx.engine.isStream(s));
+    if (hc_fused_eps[side] == null or hc_fused_eps_val[side] != eps) {
+        if (hc_fused_eps[side]) |e| _ = mlx.mlx_array_free(e);
         const esh = [_]c_int{1};
         var ev = eps;
-        hc_fused_eps = mlx.mlx_array_new_data(&ev, &esh, 1, .float32);
-        hc_fused_eps_val = eps;
+        const scope = mlx.engine.enter(s);
+        defer scope.end();
+        hc_fused_eps[side] = mlx.mlx_array_new_data(&ev, &esh, 1, .float32);
+        hc_fused_eps_val[side] = eps;
     }
 
     const apply = struct {
@@ -1144,7 +1157,7 @@ pub fn hcReadFused(
     var n_out: [3]mlx.mlx_array = undefined;
     const wo = if (pend) |pd| pd.out else nw;
     const wi = if (pend) |pd| pd.inj else nw;
-    try apply(s, 0, cfgs[0], &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi }, 3, &n_out);
+    try apply(s, 0, cfgs[0], &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps[side].?, wo, wi }, 3, &n_out);
     const xn = n_out[0];
     defer _ = mlx.mlx_array_free(xn);
     const ipart = n_out[1];
@@ -1183,6 +1196,7 @@ pub fn hcReadFused(
     if (inj == 1) {
         const ishape = [_]c_int{ batch, seq, hc, 1 };
         inj_out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(inj_out);
         try mlx.check(mlx.mlx_reshape(&inj_out, inj_flat, &ishape, 4, s));
     }
     if (!hc_fused_engaged) {
@@ -1416,6 +1430,7 @@ test "fused hyper-connection read keeps one config set per row count, inject and
     const filled = struct {
         fn f(st: mlx.mlx_stream, shape: []const c_int) !mlx.mlx_array {
             var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_ones(&out, shape.ptr, shape.len, .bfloat16, st));
             return out;
         }
@@ -1524,6 +1539,7 @@ test "fused hyper-connection read matches the op chain per element" {
             const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
             defer _ = mlx.mlx_array_free(a32);
             var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st));
             return out;
         }
@@ -1832,9 +1848,9 @@ test "hc write compilation preserves the serial pending-write rounding" {
     var compiled = mlx.mlx_closure{ .ctx = null };
     try mlx.check(mlx.mlx_compile(&compiled, raw, true));
     defer _ = mlx.mlx_closure_free(compiled);
-    const base = bf16Scalar(-1.015625, s);
+    const base = try bf16Scalar(-1.015625, s);
     defer _ = mlx.mlx_array_free(base);
-    const val = bf16Scalar(1.0078125, s);
+    const val = try bf16Scalar(1.0078125, s);
     defer _ = mlx.mlx_array_free(val);
     for ([_]c_int{ 1, 2, 3, 8 }) |rows| {
         var stream = mlx.mlx_array_new();
@@ -1895,3 +1911,119 @@ test "fused hyper-connection gate: banks solved at load decide as the per-call s
         try testing.expectEqual(b[0] == b[1], bound != null);
     }
 }
+
+test "qwen4 hc: on the engine's stream the prepared verify read declines, so no MLX closure is compiled or applied mid-forward" {
+    try mlx.requireGpu();
+    if (!verifySharedHardware()) return error.SkipZigTest;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const gpu = mlx.gpuStream();
+    var owned: [9]mlx.mlx_array = undefined;
+    var made: usize = 0;
+    defer for (owned[0..made]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const specs = [_]struct { shape: []const c_int, dtype: mlx.mlx_dtype }{
+        .{ .shape = &.{ 1, 4, 10240 }, .dtype = .bfloat16 },
+        .{ .shape = &.{ 4, 2560 }, .dtype = .bfloat16 },
+        .{ .shape = &.{ 320, 2560 }, .dtype = .uint32 },
+        .{ .shape = &.{ 320, 160 }, .dtype = .bfloat16 },
+        .{ .shape = &.{ 320, 160 }, .dtype = .bfloat16 },
+        .{ .shape = &.{ 10240, 80 }, .dtype = .uint32 },
+        .{ .shape = &.{ 10240, 5 }, .dtype = .bfloat16 },
+        .{ .shape = &.{ 10240, 5 }, .dtype = .bfloat16 },
+        .{ .shape = &.{ 10240, 4 }, .dtype = .bfloat16 },
+    };
+    for (specs, &owned) |spec, *o| {
+        o.* = mlx.mlx_array_new();
+        made += 1;
+        try mlx.check(mlx.mlx_zeros(o, spec.shape.ptr, spec.shape.len, spec.dtype, gpu));
+        try mlx.check(mlx.mlx_array_eval(o.*));
+    }
+    const w: HcWeights = .{ .norm_w = owned[1], .down_w = owned[2], .down_s = owned[3], .down_b = owned[4], .up_w = owned[5], .up_s = owned[6], .up_b = owned[7], .inject_flat = owned[8] };
+    const calls = mlx.engine.mlxCalls();
+    try std.testing.expect((try hcReadPreparedWidth(mlx.engine.stream(), owned[0], w, 4, 1e-6, null, 16)) == null);
+    try std.testing.expectEqual(calls, mlx.engine.mlxCalls());
+    for (hc_prepared_entries) |e| try std.testing.expect(e.stream.ctx == null or !mlx.engine.isStream(e.stream));
+}
+
+test "a closure's op chain gives MLX's bytes on the engine's stream with no MLX op; compiled, its bf16 tails keep those bytes" {
+    try mlx.requireGpu();
+    const gpu = mlx.gpuStream();
+    var xfm = testTrunk("qwen4_exp");
+    xfm.s = gpu;
+    xfm.config.hc_count = 4;
+    xfm.config.hidden_size = 64;
+    qwen4_forward.compileGdnGate(&xfm);
+    qwen4_forward.compileQwen4Hc(&xfm);
+    defer xfm.arch_state.qwen4.clearCompiled();
+    const st = &xfm.arch_state.qwen4;
+
+    var prng = std.Random.DefaultPrng.init(0x0C3);
+    const rnd = prng.random();
+    const Input = struct { shape: []const c_int, scale: f32 = 4 };
+    // `exact`: the compiled closure has the chain's bytes. The f32 gate's compiled kernel is ulps off MLX's own chain
+    // (the bar of "gdn gate at f32"); a bf16 output rounds that away.
+    const Case = struct { name: []const u8, closure: ?mlx.mlx_closure, inputs: []const Input, exact: bool = true };
+    const cases = [_]Case{
+        .{ .name = "gdn gate", .closure = st.compiled_gdn_gate, .inputs = &.{ .{ .shape = &.{48} }, .{ .shape = &.{ 1, 3, 48 }, .scale = 16 }, .{ .shape = &.{48} } }, .exact = false },
+        .{ .name = "hc silu", .closure = st.compiled_hc_silu, .inputs = &.{.{ .shape = &.{ 1, 3, 40 } }} },
+        .{ .name = "hc mix", .closure = st.compiled_hc_mix, .inputs = &.{ .{ .shape = &.{ 1, 3, 4, 64 } }, .{ .shape = &.{ 1, 3, 4, 64 } } } },
+        .{ .name = "hc inj", .closure = st.compiled_hc_inj, .inputs = &.{.{ .shape = &.{ 1, 3, 4 } }} },
+        .{ .name = "hc write", .closure = st.compiled_hc_write, .inputs = &.{ .{ .shape = &.{ 1, 3, 4, 64 } }, .{ .shape = &.{ 1, 3, 1, 64 } }, .{ .shape = &.{ 1, 3, 4, 1 } } } },
+    };
+    for (cases) |c| {
+        var in: [3]mlx.mlx_array = undefined;
+        for (c.inputs, 0..) |spec, i| in[i] = try test_support.attn256RandBf16Scaled(rnd, spec.shape, spec.scale, gpu);
+        defer for (in[0..c.inputs.len]) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const args = in[0..c.inputs.len];
+        xfm.s = gpu;
+        const want = try closureChain(&xfm, c.name, args);
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_array_eval(want));
+        if (c.exact) {
+            const fused = (try qwen4_forward.applyClosure(c.closure, args)) orelse return error.ClosureNotCompiled;
+            defer _ = mlx.mlx_array_free(fused);
+            try mlx.check(mlx.mlx_array_eval(fused));
+            errdefer std.debug.print("closure {s}: compiled\n", .{c.name});
+            try expectSameBytes(want, fused);
+        }
+
+        const was = mlx.engine.enabled;
+        mlx.engine.enabled = true;
+        defer mlx.engine.enabled = was;
+        const es = mlx.engine.stream();
+        const scope = mlx.engine.enter(es);
+        defer scope.end();
+        xfm.s = es;
+        const ops_before = mlx.engine.mlx_ops;
+        const got = try closureChain(&xfm, c.name, args);
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_array_eval(got));
+        errdefer std.debug.print("closure {s}: engine\n", .{c.name});
+        try testing.expectEqual(ops_before, mlx.engine.mlx_ops);
+        try testing.expect(mlx.engine.isOurs(got) and !mlx.engine.isOurs(want));
+        try expectSameBytes(want, got);
+    }
+}
+
+fn expectSameBytes(want: mlx.mlx_array, got: mlx.mlx_array) !void {
+    try testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(got));
+    try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    const n = mlx.mlx_array_size(want) * mlx.mlx_array_itemsize(want);
+    try testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..n], mlx.mlx_array_data_uint8(got).?[0..n]);
+}
+
+/// The op chain the forward runs where a closure is not compiled, by the closure's name.
+fn closureChain(xfm: *Trunk, name: []const u8, in: []const mlx.mlx_array) !mlx.mlx_array {
+    if (std.mem.eql(u8, name, "gdn gate")) return @import("qwen4_gdn.zig").gdnGateChain(in[0], in[1], in[2], xfm.config.gdnGateDtype(), xfm.s);
+    if (std.mem.eql(u8, name, "hc silu")) return xfm.silu(in[0]);
+    if (std.mem.eql(u8, name, "hc mix")) return hcMixChain(xfm, in[0], in[1]);
+    if (std.mem.eql(u8, name, "hc inj")) return hcInjChain(xfm, in[0]);
+    if (std.mem.eql(u8, name, "hc write")) return hcWriteChain(xfm, in[0], in[1], in[2]);
+    unreachable;
+}
+

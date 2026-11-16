@@ -655,18 +655,21 @@ test "qwen roundHalfEven matches python banker's rounding" {
 
 pub fn binary(comptime f: anytype, a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(f(&out, a, b, s));
     return out;
 }
 
 pub fn astype(a: mlx.mlx_array, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, a, dtype, s));
     return out;
 }
 
 pub fn reshape(a: mlx.mlx_array, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, a, shape.ptr, shape.len, s));
     return out;
 }

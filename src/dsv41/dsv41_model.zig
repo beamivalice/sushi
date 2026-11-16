@@ -3404,18 +3404,22 @@ fn ownedRows(x: A, n: usize, s: S) !A {
     defer _ = mlx.mlx_array_free(raw);
     try mlx.check(mlx.mlx_view(&raw, head, raw_dt, s));
     var copy = mlx.mlx_array_new();
-    if (mlx.engine.isStream(s)) {
-        // The engine copies into one buffer of the pool; MLX's own copy shares, so there an add of zero makes one.
-        try mlx.check(mlx.engine.copyOwned(&copy, raw));
-    } else {
-        var zero = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(zero);
-        try mlx.check(mlx.mlx_zeros(&zero, &[_]c_int{1}, 1, raw_dt, s));
-        try mlx.check(mlx.mlx_add(&copy, raw, zero, s));
+    {
+        errdefer _ = mlx.mlx_array_free(copy);
+        if (mlx.engine.isStream(s)) {
+            // The engine copies into one buffer of the pool; MLX's own copy shares, so there an add of zero makes one.
+            try mlx.check(mlx.engine.copyOwned(&copy, raw));
+        } else {
+            var zero = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(zero);
+            try mlx.check(mlx.mlx_zeros(&zero, &[_]c_int{1}, 1, raw_dt, s));
+            try mlx.check(mlx.mlx_add(&copy, raw, zero, s));
+        }
     }
     if (raw_dt == dt) return copy;
     defer _ = mlx.mlx_array_free(copy);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_view(&out, copy, dt, s));
     return out;
 }

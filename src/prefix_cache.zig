@@ -8092,6 +8092,7 @@ fn pcQsaBf16Equal(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !void {
 pub fn pcQsaSliceAxis1(s: mlx.mlx_stream, arr: mlx.mlx_array, from: c_int, to: c_int) !mlx.mlx_array {
     const sh = mlx.getShape(arr);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_slice(&out, arr, &[_]c_int{ 0, from, 0 }, 3, &[_]c_int{ sh[0], to, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
     return out;
 }
@@ -9659,6 +9660,7 @@ test "prefix cache: the trim's row price is the entry's own bytes divided by its
             fn f(str: mlx.mlx_stream, len: c_int) !mlx.mlx_array {
                 const shape = [_]c_int{ 1, 2, len, 256 };
                 var a = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(a);
                 try mlx.check(mlx.mlx_ones(&a, &shape, 4, .bfloat16, str));
                 return a;
             }

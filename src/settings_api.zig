@@ -77,6 +77,7 @@ fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
     if (eql(u8, name, "think_penalty")) return if (o.think_penalty) |v| .{ .float = v } else null;
     if (eql(u8, name, "vision")) return if (o.vision) |v| .{ .bool = v } else null;
     if (eql(u8, name, "ds41_cooler")) return if (o.ds41_cooler) |v| .{ .bool = v } else null;
+    if (eql(u8, name, "qwen_cooler")) return if (o.qwen_cooler) |v| .{ .bool = v } else null;
     if (eql(u8, name, "max_tokens")) return if (o.max_tokens) |v| .{ .integer = v } else null;
     if (eql(u8, name, "yarn_factor")) return if (o.yarn_factor) |v| .{ .string = if (v == 2) "2" else "4" } else null;
     return null;
@@ -84,7 +85,7 @@ fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
 
 /// The settings a ready model's load stamped on its config.
 fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
-    return .{
+    var o: model_settings.Override = .{
         .ctx_size = if (config.ctx_override > 0) config.ctx_override else null,
         .kv_quant = config.kv_quant_override,
         .mtp = config.mtp_override,
@@ -95,10 +96,11 @@ fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
         .preserve_thinking = config.preserve_thinking_override,
         .think_penalty = config.think_penalty_override,
         .vision = config.vision_override,
-        .ds41_cooler = config.cooler_override,
         .max_tokens = config.max_tokens_override,
         .yarn_factor = config.yarn_factor_override,
     };
+    arch_flags.putCoolerSetting(config, &o, config.cooler_override);
+    return o;
 }
 
 /// What a loaded model's keys resolve to when the file and the launch flags say nothing, read from the loader's own
@@ -108,7 +110,7 @@ pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Ove
     model_load.applyModelSettings(&bare, .{});
     bare.ssd_prefetch = null;
     bare.cooler_flag = null;
-    return .{
+    var o: model_settings.Override = .{
         .kv_quant = server.kvCacheForLaunch(&bare, null).config,
         .mtp = model_load.mtpChoiceFor(null, &bare).on,
         .mtp_acceptance = model_settings.default_mtp_acceptance,
@@ -117,9 +119,10 @@ pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Ove
         .preserve_thinking = model_settings.default_preserve_thinking,
         .think_penalty = model_settings.default_think_penalty,
         .vision = model_settings.VisionChoice.resolve(null, null, model_load.visionDefaultOn(&bare, bare.expert_streaming)).on,
-        .ds41_cooler = bare.coolerChoice().on,
         .max_tokens = bare.defaultMaxTokens(),
     };
+    arch_flags.putCoolerSetting(&bare, &o, bare.coolerChoice().on);
+    return o;
 }
 
 fn writeJson(w: *std.Io.Writer, v: anytype) !void {
@@ -829,13 +832,13 @@ fn savesSsdTier(plan: Plan) bool {
 
 /// Whether saving `key` changes what a load or its preflight reads, so a model that failed to load deserves another try.
 pub fn reachesLoad(key: []const u8) bool {
-    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" };
+    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" };
     for (reads) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
 
 test "settings api: every saved key is classified, and the ones a load reads clear a stored load failure" {
-    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" }) |key| {
+    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" }) |key| {
         try std.testing.expect(reachesLoad(key));
     }
     for ([_][]const u8{ "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" }) |key| {
@@ -855,7 +858,7 @@ test "settings api: only the two SSD size keys re-arm a declined SSD tier, and b
 }
 
 fn classified(key: []const u8) bool {
-    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" };
+    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" };
     for (known) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
@@ -1658,8 +1661,9 @@ test "settings api: ds41_cooler is offered only where the arch has Sushi Cooler,
     var locks: model_settings.LaunchLocks = .{};
     locks.modelMut("ds41_cooler").pin("--ds41-mlx-engine", .{});
     const rows = [_]ModelRow{
-        .{ .id = "ds", .path = "/m/a", .state = "ready", .bytes = 5, .fit = .{ .arch = "d", .streams_experts = true, .has_vision = false }, .loaded = .{ .ds41_cooler = false }, .defaults = .{ .ds41_cooler = true } },
-        .{ .id = "dense", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "q", .streams_experts = false, .has_vision = false, .cooler_offered = false } },
+        .{ .id = "ds", .path = "/m/a", .state = "ready", .bytes = 5, .fit = .{ .arch = "d", .streams_experts = true, .has_vision = false, .cooler_setting = "ds41_cooler" }, .loaded = .{ .ds41_cooler = false }, .defaults = .{ .ds41_cooler = true } },
+        .{ .id = "dense", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "g", .streams_experts = false, .has_vision = false } },
+        .{ .id = "qwen", .path = "/m/c", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "q", .streams_experts = false, .has_vision = false, .cooler_setting = "qwen_cooler" } },
     };
     const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
     defer testing.allocator.free(body);
@@ -1672,8 +1676,9 @@ test "settings api: ds41_cooler is offered only where the arch has Sushi Cooler,
             return false;
         }
     }.key;
-    try testing.expect(has(models[0], "ds41_cooler"));
-    try testing.expect(!has(models[1], "ds41_cooler"));
+    try testing.expect(has(models[0], "ds41_cooler") and !has(models[0], "qwen_cooler"));
+    try testing.expect(!has(models[1], "ds41_cooler") and !has(models[1], "qwen_cooler"));
+    try testing.expect(has(models[2], "qwen_cooler") and !has(models[2], "ds41_cooler"));
     const set = models[0].object.get("settings").?.object.get("ds41_cooler").?.object;
     try testing.expect(!set.get("file").?.bool);
     try testing.expectEqualStrings("--ds41-mlx-engine", set.get("flag").?.string);
@@ -1681,5 +1686,5 @@ test "settings api: ds41_cooler is offered only where the arch has Sushi Cooler,
     try testing.expect(!models[0].object.get("loaded_with").?.object.get("ds41_cooler").?.bool);
     try testing.expect(models[0].object.get("defaults").?.object.get("ds41_cooler").?.bool);
     try testing.expect(models[0].object.get("limits").?.object.get("ds41_cooler") == null);
-    try testing.expect(reachesLoad("ds41_cooler"));
+    try testing.expect(reachesLoad("ds41_cooler") and reachesLoad("qwen_cooler"));
 }

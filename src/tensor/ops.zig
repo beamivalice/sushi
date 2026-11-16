@@ -71,7 +71,7 @@ pub fn slice(t: *Tensor, start: []const c_int, stop: []const c_int, step: []cons
     var skip: usize = 0;
     for (0..t.ndim) |i| {
         const n = t.shape[i];
-        if (step[i] <= 0) return error.TensorUnsupported;
+        if (step[i] <= 0) return core.refusing("a slice step of zero or below", error.TensorUnsupported);
         const lo = std.math.clamp(if (start[i] < 0) start[i] + n else start[i], 0, n);
         const hi = std.math.clamp(if (stop[i] < 0) stop[i] + n else stop[i], lo, n);
         skip += @as(usize, @intCast(lo)) * t.strides[i];
@@ -243,9 +243,9 @@ var pipelines: std.StringHashMapUnmanaged(metal.Pipeline) = .empty;
 fn pipelineFor(comptime tag: []const u8, source: []const u8, in_types: []const Dtype, out_type: Dtype) Error!metal.Pipeline {
     var key_buf: [96]u8 = undefined;
     var key: std.ArrayList(u8) = .initBuffer(&key_buf);
-    key.appendSliceBounded(tag) catch return error.TensorUnsupported;
-    for (in_types) |d| key.appendBounded(@intCast(@intFromEnum(d) + 'a')) catch return error.TensorUnsupported;
-    key.appendBounded(@intCast(@intFromEnum(out_type) + 'A')) catch return error.TensorUnsupported;
+    key.appendSliceBounded(tag) catch return core.refusing("a pipeline key past 96 bytes", error.TensorUnsupported);
+    for (in_types) |d| key.appendBounded(@intCast(@intFromEnum(d) + 'a')) catch return core.refusing("a pipeline key past 96 bytes", error.TensorUnsupported);
+    key.appendBounded(@intCast(@intFromEnum(out_type) + 'A')) catch return core.refusing("a pipeline key past 96 bytes", error.TensorUnsupported);
     if (pipelines.get(key.items)) |p| return p;
 
     var text: std.ArrayList(u8) = .empty;
@@ -385,13 +385,47 @@ fn broadcastShape(a: *const Tensor, b: *const Tensor, out: *[max_dims]c_int) Err
     return out[0..n];
 }
 
-pub const Binary = enum { add, subtract, multiply, divide, maximum, minimum, less, less_equal, greater, greater_equal, equal, logical_and, logical_or, logaddexp };
+pub const Binary = enum { add, subtract, multiply, divide, floor_divide, maximum, minimum, less, less_equal, greater, greater_equal, equal, logical_and, logical_or, logaddexp };
 
-/// An elementwise op of two tensors of one dtype, broadcast together. A comparison gives bool.
+/// MLX's `promote_types` (mlx/dtype.cpp `type_rules`), indexed by `mlx_dtype`.
+const promote_table = blk: {
+    const D = Dtype;
+    const r = [14][14]D{
+        .{ .bool_, .uint8, .uint16, .uint32, .uint64, .int8, .int16, .int32, .int64, .float16, .float32, .float64, .bfloat16, .complex64 },
+        .{ .uint8, .uint8, .uint16, .uint32, .uint64, .int16, .int16, .int32, .int64, .float16, .float32, .float64, .bfloat16, .complex64 },
+        .{ .uint16, .uint16, .uint16, .uint32, .uint64, .int32, .int32, .int32, .int64, .float16, .float32, .float64, .bfloat16, .complex64 },
+        .{ .uint32, .uint32, .uint32, .uint32, .uint64, .int64, .int64, .int64, .int64, .float16, .float32, .float64, .bfloat16, .complex64 },
+        .{ .uint64, .uint64, .uint64, .uint64, .uint64, .float32, .float32, .float32, .float32, .float16, .float32, .float64, .bfloat16, .complex64 },
+        .{ .int8, .int16, .int32, .int64, .float32, .int8, .int16, .int32, .int64, .float16, .float32, .float64, .bfloat16, .complex64 },
+        .{ .int16, .int16, .int32, .int64, .float32, .int16, .int16, .int32, .int64, .float16, .float32, .float64, .bfloat16, .complex64 },
+        .{ .int32, .int32, .int32, .int64, .float32, .int32, .int32, .int32, .int64, .float16, .float32, .float64, .bfloat16, .complex64 },
+        .{ .int64, .int64, .int64, .int64, .float32, .int64, .int64, .int64, .int64, .float16, .float32, .float64, .bfloat16, .complex64 },
+        .{ .float16, .float16, .float16, .float16, .float16, .float16, .float16, .float16, .float16, .float16, .float32, .float64, .float32, .complex64 },
+        .{ .float32, .float32, .float32, .float32, .float32, .float32, .float32, .float32, .float32, .float32, .float32, .float64, .float32, .complex64 },
+        .{ .float64, .float64, .float64, .float64, .float64, .float64, .float64, .float64, .float64, .float64, .float64, .float64, .float64, .complex64 },
+        .{ .bfloat16, .bfloat16, .bfloat16, .bfloat16, .bfloat16, .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32, .float32, .float64, .bfloat16, .complex64 },
+        .{ .complex64, .complex64, .complex64, .complex64, .complex64, .complex64, .complex64, .complex64, .complex64, .complex64, .complex64, .complex64, .complex64, .complex64 },
+    };
+    break :blk r;
+};
+
+pub fn promoteTypes(a: Dtype, b: Dtype) Dtype {
+    return promote_table[@intCast(@intFromEnum(a))][@intCast(@intFromEnum(b))];
+}
+
+/// An elementwise op of two tensors broadcast together, each cast first to the type they promote to, as MLX does. A
+/// comparison gives bool.
 pub fn binary(comptime op: Binary, a: *Tensor, b: *Tensor) Error!*Tensor {
-    if (a.dtype != b.dtype) return error.TensorDtype;
+    if (a.dtype != b.dtype) {
+        const to = promoteTypes(a.dtype, b.dtype);
+        const ca = try astype(a, to);
+        defer core.release(ca);
+        const cb = try astype(b, to);
+        defer core.release(cb);
+        return binary(op, ca, cb);
+    }
     // Its arithmetic is MLX's compiled kernel's: a source of ours rounded differently in the last bits.
-    if (op == .logaddexp) return stock.binaryOf("LogAddExp", a, b);
+    if (op == .logaddexp) return stock.binaryOf("LogAddExp", .float, a, b);
     var shape_buf: [max_dims]c_int = undefined;
     const shape = try broadcastShape(a, b, &shape_buf);
     const compare = switch (op) {
@@ -403,6 +437,8 @@ pub fn binary(comptime op: Binary, a: *Tensor, b: *Tensor) Error!*Tensor {
         .subtract => "x - y",
         .multiply => "x * y",
         .divide => "x / y",
+        // MLX's `FloorDivide` for signed integers: truncate, then one less when the remainder and divisor differ in sign.
+        .floor_divide => "$O(x / y - $O((x % y) != 0 && ((x < 0) != (y < 0))))",
         .maximum => "sushi_maximum(x, y)",
         .minimum => "sushi_minimum(x, y)",
         .less => "x < y",
@@ -420,7 +456,7 @@ pub fn binary(comptime op: Binary, a: *Tensor, b: *Tensor) Error!*Tensor {
 pub const Unary = enum { exp, log, abs, sigmoid, sqrt, rsqrt, square, floor, negative };
 
 pub fn unary(comptime op: Unary, a: *Tensor) Error!*Tensor {
-    if ((op == .log or op == .abs) and a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return error.TensorDtype;
+    if ((op == .log or op == .abs) and a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return core.refusing("log or abs of a non-float here: the seam casts it or takes MLX's integer kernel first", error.TensorDtype);
     const expr = switch (op) {
         .exp => "$O(metal::precise::exp(x))",
         .log => "$O(metal::precise::log(x))",
@@ -436,8 +472,15 @@ pub fn unary(comptime op: Unary, a: *Tensor) Error!*Tensor {
 }
 
 /// `cond ? a : b`, the three broadcast together.
-pub fn where(cond: *Tensor, a: *Tensor, b: *Tensor) Error!*Tensor {
-    if (cond.dtype != .bool_ or a.dtype != b.dtype) return error.TensorDtype;
+pub fn where(cond_in: *Tensor, a_in: *Tensor, b_in: *Tensor) Error!*Tensor {
+    // As MLX: the condition is read as bool, and values of two dtypes are cast to the type they promote to.
+    const dtype = promoteTypes(a_in.dtype, b_in.dtype);
+    const cond = if (cond_in.dtype == .bool_) try core.share(cond_in) else try astype(cond_in, .bool_);
+    defer core.release(cond);
+    const a = if (a_in.dtype == dtype) try core.share(a_in) else try astype(a_in, dtype);
+    defer core.release(a);
+    const b = if (b_in.dtype == dtype) try core.share(b_in) else try astype(b_in, dtype);
+    defer core.release(b);
     var buf_ab: [max_dims]c_int = undefined;
     const ab = try broadcastShape(a, b, &buf_ab);
     var probe: Tensor = cond.*;
@@ -466,7 +509,7 @@ pub fn reduce(comptime op: Reduce, t: *Tensor, axis_in: c_int, keepdims: bool) E
             shape[n] = if (i == axis) 1 else d;
             n += 1;
         }
-        if (holds != 0) return error.TensorUnsupported;
+        if (holds != 0) return core.refusing("a reduction over an empty axis into a result with elements", error.TensorUnsupported);
         return core.fresh(t.dtype, shape[0..n]);
     }
     switch (t.dtype) {
@@ -534,7 +577,7 @@ pub fn reduce(comptime op: Reduce, t: *Tensor, axis_in: c_int, keepdims: bool) E
 /// first used (`settle`): if by then the result is the last holder of `base`'s bytes, as it is once the caller has
 /// dropped `base`, the update goes into them and nothing else is copied.
 pub fn sliceUpdate(base: *Tensor, update: *Tensor, start: []const c_int, stop: []const c_int) Error!*Tensor {
-    if (base.dtype != update.dtype) return error.TensorDtype;
+    if (base.dtype != update.dtype) return core.refusing("a slice update whose dtype is not its destination's: the seam casts it first", error.TensorDtype);
     if (start.len != base.ndim or stop.len != base.ndim) return error.TensorShape;
     var ones: [max_dims]c_int = @splat(1);
     const window = try slice(base, start, stop, ones[0..base.ndim]);
@@ -605,14 +648,17 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
     var shape: [max_dims]c_int = undefined;
     @memcpy(shape[0..first.ndim], first.dims());
     shape[axis] = 0;
+    // As MLX: the parts of two dtypes are cast to the type they promote to.
+    var dtype = first.dtype;
     for (parts) |part| {
-        if (part.ndim != first.ndim or part.dtype != first.dtype) return error.TensorShape;
+        if (part.ndim != first.ndim) return error.TensorShape;
         for (0..first.ndim) |i| {
             if (i != axis and part.shape[i] != first.shape[i]) return error.TensorShape;
         }
         shape[axis] += part.shape[axis];
+        dtype = promoteTypes(dtype, part.dtype);
     }
-    const out = try core.fresh(first.dtype, shape[0..first.ndim]);
+    const out = try core.fresh(dtype, shape[0..first.ndim]);
     errdefer core.release(out);
     if (out.size() == 0) return out;
     var start: [max_dims]c_int = @splat(0);
@@ -634,7 +680,10 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
 pub fn take(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
     if (axis >= t.ndim) return error.TensorShape;
-    if (indices.dtype != .int32 and indices.dtype != .uint32) return error.TensorDtype;
+    switch (indices.dtype) {
+        .uint8, .uint16, .uint32, .uint64, .int8, .int16, .int32, .int64 => {},
+        else => return core.refusing("take with indices that are not integers", error.TensorDtype),
+    }
     if (t.ndim + indices.ndim - 1 > max_dims) return error.TensorShape;
     // The kernel walks the result as [before.., index.., after..]: an index axis moves the table's `axis` stride
     // by the index it reads, every other axis moves its own.
@@ -737,9 +786,169 @@ pub fn arange(start: f64, stop: f64, step: f64, dtype: Dtype) (Error || error{ A
                 v.* = @mulAdd(f32, @floatFromInt(@as(u32, @intCast(i))), delta, first);
             }
         },
-        else => return error.TensorDtype,
+        else => return core.refusing("arange in a dtype other than int32, uint32 and f32", error.TensorDtype),
     }
     return out;
+}
+
+/// MLX's `full`: `vals` cast to `dtype` and broadcast to `shape`, written out (the `Full` primitive's copy).
+pub fn full(shape: []const c_int, vals: *Tensor, dtype: Dtype) Error!*Tensor {
+    for (shape) |d| if (d < 0) return error.TensorShape;
+    const cast = try astype(vals, dtype);
+    defer core.release(cast);
+    const wide = try broadcastTo(cast, shape);
+    defer core.release(wide);
+    return contiguousCopy(wide);
+}
+
+/// MLX's `ones`: `full` of a one of `dtype`.
+pub fn onesOf(shape: []const c_int, dtype: Dtype) Error!*Tensor {
+    const one: i32 = 1;
+    const v = try core.fromHost(std.mem.asBytes(&one), .int32, &.{});
+    defer core.release(v);
+    return full(shape, v, dtype);
+}
+
+/// MLX's `tile`: `t` reshaped with a unit axis before each repeated one, broadcast over the repeats, and flattened back.
+pub fn tile(t: *Tensor, reps_in: []const c_int) Error!*Tensor {
+    const rank = @max(reps_in.len, t.ndim);
+    var reps: core.Dims = .{};
+    var shape: core.Dims = .{};
+    for (0..rank - reps_in.len) |_| try reps.append(1);
+    try reps.appendSlice(reps_in);
+    for (0..rank - t.ndim) |_| try shape.append(1);
+    try shape.appendSlice(t.dims());
+    var expand: core.Dims = .{};
+    var broad: core.Dims = .{};
+    var final: core.Dims = .{};
+    for (reps.slice(), shape.slice()) |r, d| {
+        if (r < 0) return error.TensorShape;
+        if (r != 1) {
+            try expand.append(1);
+            try broad.append(r);
+        }
+        try expand.append(d);
+        try broad.append(d);
+        try final.append(std.math.mul(c_int, r, d) catch return error.TensorShape);
+    }
+    const x = try reshape(t, expand.slice());
+    defer core.release(x);
+    const wide = try broadcastTo(x, broad.slice());
+    defer core.release(wide);
+    return reshape(wide, final.slice());
+}
+
+/// MLX's `split` into `parts` equal pieces along `axis`: views of `t`.
+pub fn split(t: *Tensor, parts: c_int, axis_in: c_int, out: []*Tensor) Error!void {
+    const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
+    if (axis >= t.ndim or parts <= 0 or out.len != parts) return error.TensorShape;
+    const width = t.shape[axis];
+    if (@rem(width, parts) != 0) return error.TensorShape;
+    const each = @divExact(width, parts);
+    var start: [max_dims]c_int = @splat(0);
+    var stop: [max_dims]c_int = undefined;
+    const step: [max_dims]c_int = @splat(1);
+    @memcpy(stop[0..t.ndim], t.dims());
+    var made: usize = 0;
+    errdefer for (out[0..made]) |o| core.release(o);
+    for (out, 0..) |*o, i| {
+        start[axis] = each * @as(c_int, @intCast(i));
+        stop[axis] = start[axis] + each;
+        o.* = try slice(t, start[0..t.ndim], stop[0..t.ndim], step[0..t.ndim]);
+        made += 1;
+    }
+}
+
+/// MLX's `isfinite`: neither infinite nor NaN; every integer and bool is.
+pub fn isFinite(t: *Tensor) Error!*Tensor {
+    switch (t.dtype) {
+        .float32, .float16, .bfloat16 => return elementwise("isfinite", "bool(metal::isfinite(float(x)))", &.{t}, .bool_, t.dims()),
+        .bool_, .uint8, .uint16, .uint32, .uint64, .int8, .int16, .int32, .int64 => {
+            const yes: u8 = 1;
+            const v = try core.fromHost(std.mem.asBytes(&yes), .bool_, &.{});
+            defer core.release(v);
+            return full(t.dims(), v, .bool_);
+        },
+        else => return core.refusing("isfinite of a dtype other than a float, an integer or bool", error.TensorDtype),
+    }
+}
+
+/// A reduction over every axis: a result of no axes, or of `t`'s axes each one wide.
+fn wholeOf(r: *Tensor, t: *const Tensor, keepdims: bool) Error!*Tensor {
+    if (!keepdims) return r;
+    defer core.release(r);
+    const ones_shape: [max_dims]c_int = @splat(1);
+    return reshape(r, ones_shape[0..t.ndim]);
+}
+
+/// MLX's `max` over every axis.
+pub fn maxAll(t: *Tensor, keepdims: bool) Error!*Tensor {
+    if (t.size() == 0) return core.refusing("the max of no elements", error.TensorShape);
+    const flat = try reshape(t, &.{@intCast(t.size())});
+    defer core.release(flat);
+    return wholeOf(try reduce(.max, flat, 0, false), t, keepdims);
+}
+
+/// MLX's `all` over every axis, of a bool array: no element false.
+pub fn allOf(t: *Tensor, keepdims: bool) Error!*Tensor {
+    if (t.dtype != .bool_) return core.refusing("all of an array that is not bool", error.TensorDtype);
+    if (t.size() == 0) {
+        const yes: u8 = 1;
+        return wholeOf(try core.fromHost(std.mem.asBytes(&yes), .bool_, &.{}), t, keepdims);
+    }
+    const flat = try reshape(t, &.{@intCast(t.size())});
+    defer core.release(flat);
+    const miss = try elementwise("all_miss", "$O(!x)", &.{flat}, .uint8, flat.dims());
+    defer core.release(miss);
+    const any = try reduce(.max, miss, 0, false);
+    defer core.release(any);
+    return wholeOf(try elementwise("all_none", "x == 0", &.{any}, .bool_, any.dims()), t, keepdims);
+}
+
+/// MLX's `any` over `axes` of a bool array (`Reduce::Or`): some element true. A bool OR is exact, so the reduction of
+/// its 0/1 bytes gives MLX's bytes whatever kernel runs it.
+pub fn anyAxes(t: *Tensor, axes: []const c_int, keepdims: bool) Error!*Tensor {
+    if (t.dtype != .bool_) return core.refusing("any of an array that is not bool", error.TensorDtype);
+    if (t.size() == 0) return core.refusing("any over an array of no elements", error.TensorUnsupported);
+    var norm: [max_dims]c_int = undefined;
+    for (axes, 0..) |ax, i| {
+        const at = if (ax < 0) ax + @as(c_int, t.ndim) else ax;
+        if (at < 0 or at >= t.ndim) return error.TensorShape;
+        norm[i] = at;
+    }
+    var x = try elementwise("any_bytes", "$O(x)", &.{t}, .uint8, t.dims());
+    defer core.release(x);
+    for (norm[0..axes.len]) |at| {
+        const r = try reduce(.max, x, at, true);
+        core.release(x);
+        x = r;
+    }
+    const kept = try elementwise("any_true", "x != 0", &.{x}, .bool_, x.dims());
+    if (keepdims) return kept;
+    defer core.release(kept);
+    return squeeze(kept, norm[0..axes.len]);
+}
+
+/// MLX's `array_equal`: false for two shapes, else every element equal in the promoted type (NaN equal to NaN under
+/// `equal_nan`, for floats).
+pub fn arrayEqual(a: *Tensor, b: *Tensor, equal_nan: bool) Error!*Tensor {
+    if (!std.mem.eql(c_int, a.dims(), b.dims())) {
+        const no: u8 = 0;
+        return core.fromHost(std.mem.asBytes(&no), .bool_, &.{});
+    }
+    const floats = [_]Dtype{ .float16, .bfloat16, .float32 };
+    const dtype = promoteTypes(a.dtype, b.dtype);
+    const af = std.mem.indexOfScalar(Dtype, &floats, dtype) != null;
+    const ca = try astype(a, dtype);
+    defer core.release(ca);
+    const cb = try astype(b, dtype);
+    defer core.release(cb);
+    const eq = if (equal_nan and af)
+        try elementwise("eq_nan", "x == y || (metal::isnan(float(x)) && metal::isnan(float(y)))", &.{ ca, cb }, .bool_, ca.dims())
+    else
+        try elementwise("eq_all", "x == y", &.{ ca, cb }, .bool_, ca.dims());
+    defer core.release(eq);
+    return allOf(eq, false);
 }
 
 pub fn zeros(shape: []const c_int, dtype: Dtype) Error!*Tensor {
@@ -784,7 +993,7 @@ pub fn stack(parts: []const *Tensor, axis: c_int) Error!*Tensor {
 pub fn takeAlong(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
     if (axis >= t.ndim or indices.ndim != t.ndim) return error.TensorShape;
-    if (indices.dtype != .int32 and indices.dtype != .uint32) return error.TensorDtype;
+    if (indices.dtype != .int32 and indices.dtype != .uint32) return core.refusing("take_along with indices other than int32 and uint32", error.TensorDtype);
     for (0..t.ndim) |i| {
         if (i != axis and t.shape[i] != indices.shape[i]) return error.TensorShape;
     }
@@ -838,7 +1047,7 @@ pub fn takeAlong(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
 pub fn putAlong(t: *Tensor, indices: *Tensor, values_in: *Tensor, axis_in: c_int) Error!*Tensor {
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
     if (axis >= t.ndim or indices.ndim != t.ndim) return error.TensorShape;
-    if (indices.dtype != .int32 and indices.dtype != .uint32) return error.TensorDtype;
+    if (indices.dtype != .int32 and indices.dtype != .uint32) return core.refusing("put_along with indices other than int32 and uint32", error.TensorDtype);
     for (0..t.ndim) |i| {
         if (i != axis and t.shape[i] != indices.shape[i]) return error.TensorShape;
     }

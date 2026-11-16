@@ -30,7 +30,7 @@ fn rowGrid(shape: []const c_int, divisor_in: usize) Error![2]usize {
         if (x > std.math.maxInt(u32) or y > std.math.maxInt(u32)) return error.TensorShape;
         return .{ @max(x, y), @min(x, y) };
     }
-    return error.TensorUnsupported;
+    return core.refusing("a scan whose shape the threadgroup's rows do not divide", error.TensorUnsupported);
 }
 
 /// The axes of `t` from the slowest in memory to the fastest, when `t` reads every element of one block once: what
@@ -62,8 +62,8 @@ fn memoryOrder(t: *const Tensor) ?[core.max_dims]u8 {
 pub fn cumsum(t_in: *Tensor, axis_in: c_int, reverse: bool, inclusive: bool) Error!*Tensor {
     if (t_in.ndim == 0) return error.TensorShape;
     switch (t_in.dtype) {
-        .float16, .bfloat16, .float32, .int32, .uint32 => {},
-        else => return error.TensorDtype,
+        .float16, .bfloat16, .float32, .int8, .int16, .int32, .uint8, .uint16, .uint32 => {},
+        else => return core.refusing("a cumsum over a dtype MLX's scan kernels do not take here", error.TensorDtype),
     }
     const ndim: usize = t_in.ndim;
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t_in.ndim) else axis_in);
@@ -114,7 +114,7 @@ pub fn cumsum(t_in: *Tensor, axis_in: c_int, reverse: bool, inclusive: bool) Err
         rows = try rowGrid(t.dims(), size);
     } else {
         group = (32 / n_reads) * 32;
-        if (group > k.max_threads) return error.TensorUnsupported;
+        if (group > k.max_threads) return core.refusing("a strided scan wider than the pipeline's threadgroup", error.TensorUnsupported);
         rows = try rowGrid(t.dims(), size * stride);
         if (rows[0] * blocks <= std.math.maxInt(u32)) rows[0] *= blocks else rows[1] *= blocks;
     }

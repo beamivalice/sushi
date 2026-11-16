@@ -420,6 +420,9 @@ pub fn qsaSelectTopBlocks(
     const nb = ssh[2];
     if (rows <= 0 or nb <= 0 or bsh[0] != rows) return null;
     if (kb <= 0 or kb > nb) return null;
+    // MLX binds a custom kernel's input of fewer than 8 elements as `constant` (`max_constant_array_size`), and the
+    // select reads `scores` as a device pointer: the composed chain serves such a row with the same blocks.
+    if (@as(i64, rows) * nb < 8) return null;
 
     qsa_select_used_split = false;
     if (qsaSelectSplitEnabled() and qsaSelectSplitServes(rows, nb, kb)) {
@@ -455,6 +458,7 @@ pub fn qsaSelectTopBlocks(
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, sel_cfgs[0], s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     qsa_index_select_graphs += 1;
     if (qsa_select_engaged_bits.take(qsaWidthBucket(rows))) {
@@ -564,6 +568,7 @@ pub fn qsaSelectTopBlocksSplit(
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&merge_out_vec, merge_kernel, merge_in_vec, cfgs[1], s));
     if (mlx.mlx_vector_array_size(merge_out_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, merge_out_vec, 0));
     if (qsa_select_split_engaged_bits.take(qsaWidthBucket(rows))) {
         log.info(
@@ -604,7 +609,7 @@ pub fn qsaPooledRowContiguous(pooled: mlx.mlx_array) bool {
 }
 
 pub fn qsaScoreFused(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_array) !?mlx.mlx_array {
-    qsaScoreFusedArm();
+    try qsaScoreFusedArm(s);
     if (!qsaScoreFusedEligibleFrom(q, pooled)) return null;
     if (!mlx.streamIsGpu(s)) return null;
     if (!qsaPooledRowContiguous(pooled)) return null;
@@ -681,6 +686,7 @@ pub fn qsaTopBlocksOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_a
     try mlx.check(mlx.mlx_subtract(&biased, scores, tie_bias, s));
     if (vis3.ctx == null) {
         var part_all = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(part_all);
         try mlx.check(mlx.mlx_argpartition_axis(&part_all, biased, nb - block_topk, -1, s));
         return part_all;
     }
@@ -690,6 +696,7 @@ pub fn qsaTopBlocksOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_a
     defer _ = mlx.mlx_array_free(masked);
     try mlx.check(mlx.mlx_where(&masked, vis3, biased, neg_inf, s));
     var part = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(part);
     try mlx.check(mlx.mlx_argpartition_axis(&part, masked, nb - block_topk, -1, s));
     return part;
 }
@@ -1022,6 +1029,7 @@ pub fn qsaPooledKeys(self: *Trunk, ctx: *ForwardCtx, kb4: mlx.mlx_array, norm_w:
     const roped = try self.applyMrope(pn4, cs.cos, cs.sin, rope_dims);
     defer _ = mlx.mlx_array_free(roped);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, roped, &[_]c_int{ sh[0], sh[1], sh[3] }, 3, self.s));
     return out;
 }
@@ -1414,6 +1422,7 @@ pub fn qsaBlockVisibility(self: *Trunk, offset: c_int, seq_len: c_int, nb: c_int
     defer _ = mlx.mlx_array_free(vis);
     try mlx.check(mlx.mlx_less_equal(&vis, self.arch_state.qwen4.qsa_consts.blk_end2, pos2, s)); // [S, nb]
     var vis3 = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(vis3);
     try mlx.check(mlx.mlx_expand_dims(&vis3, vis, 0, s)); // [1,S,nb]
     return vis3;
 }
@@ -1494,6 +1503,7 @@ pub fn qsaSelectBlocks(self: *Trunk, q_rope: mlx.mlx_array, k32t: mlx.mlx_array,
     const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     var merged = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(merged);
     try mlx.check(mlx.mlx_concatenate_axis(&merged, vec, 1, self.s));
     return merged;
 }
@@ -1694,6 +1704,7 @@ pub fn qsaPooledRopeComposed(self: *Trunk, pn: mlx.mlx_array, rope_dims: c_int, 
     const roped = try self.ropeApplyCosSin(pn4, rope_dims, cosv, sinv);
     defer _ = mlx.mlx_array_free(roped);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, roped, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, self.s));
     return out;
 }

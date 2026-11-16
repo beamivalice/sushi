@@ -128,9 +128,9 @@ fn kernelOf(comptime fmt: []const u8, op: Op, t: *const Tensor) Error!metal.Pipe
 pub fn reduce(op: Op, t: *Tensor, axis: usize) Error!*Tensor {
     switch (t.dtype) {
         .float16, .bfloat16, .float32 => {},
-        else => return error.TensorDtype,
+        else => return core.refusing("this reduction of a dtype other than f32, f16 and bf16", error.TensorDtype),
     }
-    if (t.size() == 0 or t.size() > std.math.maxInt(i32)) return error.TensorUnsupported;
+    if (t.size() == 0 or t.size() > std.math.maxInt(i32)) return core.refusing("a reduction of no elements or of more than 2^31", error.TensorUnsupported);
     // One element along the axis: MLX copies.
     if (t.shape[axis] == 1) return ops.contiguousCopy(t);
     var kept: [max_dims]c_int = undefined;
@@ -340,7 +340,7 @@ pub fn strided(op: Op, in: *Tensor, out: *Tensor, axis: usize) Error!void {
 
 /// MLX's `ArgReduce::eval_gpu`: the index of the largest element along `axis` (u32), the axis kept with one element.
 pub fn argmax(t: *Tensor, axis: usize) Error!*Tensor {
-    if (t.size() == 0) return error.TensorUnsupported;
+    if (t.size() == 0) return core.refusing("an argmax of no elements", error.TensorUnsupported);
     var kept: [max_dims]c_int = undefined;
     @memcpy(kept[0..t.ndim], t.dims());
     kept[axis] = 1;

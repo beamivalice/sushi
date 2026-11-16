@@ -308,6 +308,7 @@ pub fn attn256Reference(
     s: mlx.mlx_stream,
 ) !mlx.mlx_array {
     var ref = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(ref);
     const none = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, k, v, scale, mode, if (mask.ctx != null) mask else none, .{ .ctx = null }, false, s));
     return ref;
@@ -322,6 +323,7 @@ pub fn attn256RandBf16(rnd: std.Random, shape: []const c_int, s: mlx.mlx_stream)
     const f32arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
     defer _ = mlx.mlx_array_free(f32arr);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, f32arr, .bfloat16, s));
     return out;
 }
@@ -340,6 +342,7 @@ pub fn testRandUniformBf16(rnd: std.Random, shape: []const c_int, lo: f32, hi: f
     defer _ = mlx.mlx_array_free(u);
     try mlx.check(mlx.mlx_random_uniform(&u, lo_a, hi_a, shape.ptr, shape.len, .float32, key, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, u, .bfloat16, s));
     return out;
 }
@@ -357,6 +360,7 @@ pub fn attn256RandBf16Scaled(rnd: std.Random, shape: []const c_int, scale: f32, 
     defer _ = mlx.mlx_array_free(wide);
     try mlx.check(mlx.mlx_multiply(&wide, unit, k, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, wide, .bfloat16, s));
     return out;
 }

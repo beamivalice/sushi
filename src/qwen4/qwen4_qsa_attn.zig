@@ -519,9 +519,9 @@ pub fn qsaDecodeGatherAttn(
     try mlx.check(mlx.mlx_astype(&idx_u32, idx, .uint32, s));
 
     // Additive validity mask, same bf16 convention as the sliding masks.
-    const zero_f = bf16Scalar(0.0, s);
+    const zero_f = try bf16Scalar(0.0, s);
     defer _ = mlx.mlx_array_free(zero_f);
-    const neg_inf = bf16Scalar(-std.math.inf(f32), s);
+    const neg_inf = try bf16Scalar(-std.math.inf(f32), s);
     defer _ = mlx.mlx_array_free(neg_inf);
     var addv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(addv);
@@ -1005,9 +1005,9 @@ pub fn qsaVerifyGatherAttn(
     var vis = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(vis);
     try mlx.check(mlx.mlx_logical_and(&vis, any_vis, causal, s));
-    const zero_f = bf16Scalar(0.0, s);
+    const zero_f = try bf16Scalar(0.0, s);
     defer _ = mlx.mlx_array_free(zero_f);
-    const neg_inf = bf16Scalar(-std.math.inf(f32), s);
+    const neg_inf = try bf16Scalar(-std.math.inf(f32), s);
     defer _ = mlx.mlx_array_free(neg_inf);
     var addv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(addv);
@@ -1178,6 +1178,7 @@ pub fn qsaMaskFromBlockSel(s: mlx.mlx_stream, blk_sel: mlx.mlx_array, offset: c_
     defer _ = mlx.mlx_array_free(mask3);
     try mlx.check(mlx.mlx_logical_and(&mask3, tok_mask, causal, s));
     var mask = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(mask);
     try mlx.check(mlx.mlx_reshape(&mask, mask3, &[_]c_int{ batch, 1, seq_len, kv }, 4, s));
     return mask;
 }
@@ -1430,6 +1431,7 @@ pub fn qsaGatherF32Reference(
     defer _ = mlx.mlx_array_free(wv);
     try mlx.check(mlx.mlx_multiply(&wv, pe, vgr, stream));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_sum_axis(&out, wv, 3, false, stream));
     return out;
 }
@@ -1499,6 +1501,7 @@ pub fn qsaBoostLastTileK(
     const k_host = mlx.mlx_array_new_data(buf.ptr, &kshape, 4, .float32);
     defer _ = mlx.mlx_array_free(k_host);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, k_host, .bfloat16, stream));
     return out;
 }

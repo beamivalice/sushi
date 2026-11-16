@@ -26,6 +26,12 @@ pub fn facts(config: *const ModelConfig) sched.Facts {
     };
 }
 
+/// Flash-Next's joined decode rows are not ported to Sushi Cooler: a Cooler load serves one row.
+pub fn coolerRows(config: *const ModelConfig) sched.CoolerRows {
+    _ = config;
+    return .{ .rows = 1, .why = "Flash-Next's joined decode rows are not ported to Sushi Cooler yet" };
+}
+
 pub fn batches(config: *const ModelConfig) bool {
     return qwen4_config.supportsBatchedGdnDecode(config);
 }

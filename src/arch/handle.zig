@@ -31,12 +31,29 @@ pub fn trunk(h: Handle) *Trunk {
     };
 }
 
+/// The process-wide arrays of side `side` (1 the engine's, 0 MLX's): the EXL3 module's and the trunk's.
+fn dropHostArrays(side: u1) void {
+    sushi_exl3.dropHostArrays(side);
+    @import("../trunk.zig").dropSwigluSigTables(side);
+    @import("../mtp_qmv.zig").dropSide(side);
+    @import("../hc_prefill.zig").dropSide(side);
+    @import("../verify_qmm.zig").dropSide(side);
+    @import("../moe_router.zig").dropSide(side);
+    inline for (comptime std.enums.values(registry.Tag)) |t| {
+        if (comptime @hasDecl(registry.Mod(t), "dropHostArrays")) registry.Mod(t).dropHostArrays(side);
+    }
+}
+
 /// Ends one hold of the engine (`mlx.engine.hold`). The last hold's end is the last Cooler model's, whether its load
 /// finished or failed: the EXL3 module's arrays on the engine's side go with it. Every hold ends here (lint
 /// `engine-hold-end`): a second exit is how a failed load kept them.
 pub fn engineHoldEnd() void {
     mlx.engine.unhold();
-    if (!mlx.engine.holding()) sushi_exl3.dropHostArrays(1);
+    if (mlx.engine.holding()) return;
+    dropHostArrays(1);
+    // The side's arrays went back to the pool after the unload emptied it: the last Cooler model leaves it empty.
+    mlx.engine.close();
+    mlx.engine.trim();
 }
 
 /// Models on MLX's side the registry holds (inference thread). The EXL3 module caches arrays per side for the process;
@@ -50,7 +67,7 @@ const MlxModels = struct {
 
     fn gone(self: *MlxModels) void {
         self.n -= 1;
-        if (self.n == 0) sushi_exl3.dropHostArrays(0);
+        if (self.n == 0) dropHostArrays(0);
     }
 };
 var on_mlx: MlxModels = .{};
@@ -190,7 +207,7 @@ test "beside a held scope each side's items run in that side's turn, in their or
 
 test "the last model on MLX's side gives back the arrays the EXL3 module cached for that side; one still held keeps them" {
     try mlx.requireGpu();
-    sushi_exl3.dropHostArrays(0);
+    dropHostArrays(0);
     const active = struct {
         fn read() usize {
             var n: usize = 0;

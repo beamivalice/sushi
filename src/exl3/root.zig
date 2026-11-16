@@ -176,6 +176,7 @@ fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.m
     try mlx.check(mlx.mlx_reshape(&out, y, xsh.ptr, @intCast(xsh.len), s));
     if (mlx.mlx_array_dtype(out) != xd) {
         var cast = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(cast);
         try mlx.check(mlx.mlx_astype(&cast, out, xd, s));
         _ = mlx.mlx_array_free(out);
         return cast;

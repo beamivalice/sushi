@@ -938,8 +938,9 @@ pub const DiskTier = struct {
     /// Load ring file `pos` as a checkpoint snapshot (`KVCache.ringCheckpoint`'s shape): each
     /// ringed layer's rows `[pos - rows, pos)`, every other layer empty.
     fn loadRingFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize, quant: kv_quant.KVQuantConfig, window: u32) !trunk.KVCacheSnapshot {
-        const cpu = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(cpu);
+        const rd = self.reading();
+        defer rd.end();
+        const cpu = rd.s;
         const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/r{d:0>7}.safetensors\x00", .{ self.root, id, pos });
         defer self.allocator.free(path);
         if (self.fs.size(path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
@@ -1379,18 +1380,20 @@ pub const DiskTier = struct {
         };
     }
 
-    /// A read's stream, and the handles a read makes without one (maps, vectors) on that stream's side until `end`.
-    const Reading = struct {
+    /// A read's stream, and the handles a read makes without one (maps, vectors) on that stream's side until `end`. Every
+    /// load of the tier reads through it: a Cooler load's restore read on MLX's CPU stream crashed on a map of the other
+    /// side.
+    pub const Reading = struct {
         s: mlx.mlx_stream,
         scope: mlx.engine.Scope,
 
-        fn end(r: Reading) void {
+        pub fn end(r: Reading) void {
             r.scope.end();
             _ = mlx.mlx_stream_free(r.s);
         }
     };
 
-    fn reading(self: *const DiskTier) Reading {
+    pub fn reading(self: *const DiskTier) Reading {
         const s = self.arrays_on orelse mlx.mlx_default_cpu_stream_new();
         return .{ .s = s, .scope = mlx.engine.enter(s) };
     }
@@ -2739,8 +2742,9 @@ pub const DiskTier = struct {
             return null;
         }
 
-        const cpu = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(cpu);
+        const rd = self.reading();
+        defer rd.end();
+        const cpu = rd.s;
         const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/spec.safetensors\x00", .{ self.root, e.id }) catch return null;
         defer self.allocator.free(path);
         var tensor_map = mlx.mlx_map_string_to_array_new();

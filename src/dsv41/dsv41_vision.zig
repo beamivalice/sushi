@@ -1208,11 +1208,11 @@ fn ownTowerOf(v: cfg_mod.Vision, dim: u32) !model.Weights {
 
 /// Whether one of the warm's runs takes the attention pipeline a query chunk of `rows` over `keys` takes on `g`.
 fn warmTakes(g: matmul.Gpu, rows: usize, keys: usize) bool {
-    const want = attention_plan.planOf(g, .bfloat16, rows, keys, 1);
+    const want = attention_plan.planOf(g, .bfloat16, rows, keys, 1, 64);
     for (Dsv41Vision.warm_patches) |w| {
         var lo: usize = 0;
         while (lo < w) : (lo += QUERY_CHUNK) {
-            if (std.meta.eql(want, attention_plan.planOf(g, .bfloat16, @min(w - lo, QUERY_CHUNK), w, 1))) return true;
+            if (std.meta.eql(want, attention_plan.planOf(g, .bfloat16, @min(w - lo, QUERY_CHUNK), w, 1, 64))) return true;
         }
     }
     return false;

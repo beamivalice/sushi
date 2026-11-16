@@ -767,11 +767,8 @@ pub fn mtpBatchedAcceptGraph(
         var log_stack = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(log_stack);
         try mlx.check(mlx.mlx_log(&log_stack, stack, s));
-        const key = sampler.seedKey(sampling);
-        defer _ = mlx.mlx_array_free(key);
-        var sampled = mlx.mlx_array_new();
+        const sampled = try sampler.drawRowsLogProbs(log_stack, sampling, s);
         defer _ = mlx.mlx_array_free(sampled);
-        try mlx.check(mlx.mlx_random_categorical(&sampled, log_stack, -1, key, s));
         try mlx.check(mlx.mlx_astype(&corr_samples, sampled, .int32, s));
     }
 
@@ -970,11 +967,8 @@ pub fn mtpBatchedLossyGraph(
         var log_stack = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(log_stack);
         try mlx.check(mlx.mlx_log(&log_stack, stack, s));
-        const key = sampler.seedKey(sampling);
-        defer _ = mlx.mlx_array_free(key);
-        var sampled = mlx.mlx_array_new();
+        const sampled = try sampler.drawRowsLogProbs(log_stack, sampling, s);
         defer _ = mlx.mlx_array_free(sampled);
-        try mlx.check(mlx.mlx_random_categorical(&sampled, log_stack, -1, key, s));
         try mlx.check(mlx.mlx_astype(&corr_samples, sampled, .int32, s));
     }
 

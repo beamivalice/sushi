@@ -342,6 +342,7 @@ fn nextQuery(s: mlx.mlx_stream, out: mlx.mlx_array) !mlx.mlx_array {
     const vec = mlx.mlx_vector_array_new_data(&parts, 2);
     defer _ = mlx.mlx_vector_array_free(vec);
     var q = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(q);
     try mlx.check(mlx.mlx_concatenate_axis(&q, vec, 3, s));
     return q;
 }
@@ -402,6 +403,7 @@ fn uniformBf16(seed: u64, shape: []const c_int, lo: f32, hi: f32, s: mlx.mlx_str
     defer _ = mlx.mlx_array_free(u);
     try mlx.check(mlx.mlx_random_uniform(&u, lo_a, hi_a, shape.ptr, shape.len, .float32, key, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, u, .bfloat16, s));
     return out;
 }

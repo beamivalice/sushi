@@ -2104,6 +2104,7 @@ fn qkvTruthF32(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, sc
             try mlx.check(mlx.mlx_astype(&sc32, sc, .float32, st));
             try mlx.check(mlx.mlx_astype(&bi32, bi, .float32, st));
             var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_dequantize(&out, w, sc32, bi32, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, .{ .value = .float32, .has_value = true }, st));
             return out;
         }
@@ -2153,6 +2154,7 @@ fn qkvTruthF32(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, sc
     defer _ = mlx.mlx_array_free(o);
     try mlx.check(mlx.mlx_matmul(&o, p, v32, s));
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, o, &[_]c_int{ 1, qs[1], qs[2], mlx.getShape(v32)[3] }, 4, s));
     return out;
 }
@@ -2313,6 +2315,7 @@ fn qkvSinks(s: mlx.mlx_stream, heads: c_int) !mlx.mlx_array {
     const raw = mlx.mlx_array_new_data(&buf, &[_]c_int{heads}, 1, .float32);
     defer _ = mlx.mlx_array_free(raw);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_astype(&out, raw, .bfloat16, s));
     return out;
 }
@@ -2328,7 +2331,7 @@ fn mimoSlidingRowsCase(config: KVQuantConfig, prefix: c_int, width: c_int, gain:
     var cache = try KVCache.initWithConfig(testing.allocator, 1, config);
     defer cache.deinit();
     cache.setSwaRing(@intCast(window));
-    const g = bf16Scalar(gain, s);
+    const g = try bf16Scalar(gain, s);
     defer _ = mlx.mlx_array_free(g);
     var arrays: [3]mlx.mlx_array = @splat(.{});
     defer for (arrays) |a| {

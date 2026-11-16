@@ -498,6 +498,7 @@ test "exl3 trunk: a 9- to 16-row spec verify keeps each row's decode tick bytes,
         fn f(st: mlx.mlx_stream, a: mlx.mlx_array, r0: usize, r1: usize, list: *std.ArrayList(mlx.mlx_array)) !mlx.mlx_array {
             const ash = mlx.getShape(a);
             var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_slice(&out, a, &[_]c_int{ 0, @intCast(r0), 0 }, 3, &[_]c_int{ 1, @intCast(r1), ash[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, st));
             try list.append(testing.allocator, out);
             return out;

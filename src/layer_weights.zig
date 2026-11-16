@@ -8,7 +8,6 @@ const linear_mod = @import("linear.zig");
 const expert_exl3 = sushi_exl3.format;
 const mlx = @import("mlx.zig");
 const mlx_util = @import("mlx_util.zig");
-const bf16Scalar = mlx_util.bf16Scalar;
 const transposeBf16Weight = mlx_util.transposeBf16Weight;
 const test_support = @import("test_support.zig");
 const attn256RandBf16 = test_support.attn256RandBf16;
@@ -293,7 +292,7 @@ pub fn bindHcLinears(w: *HcWeights, config: *const ModelConfig) !void {
     if (w.up == .affine) _ = w.up.affine.solve(config, @intCast(mlx.getShape(w.down_w)[0]));
 }
 
-pub fn bindLayer(lw: *MoeLayerWeights, config: *const ModelConfig) !void {
+pub fn bindLayer(lw: *MoeLayerWeights, config: *const ModelConfig, s: mlx.mlx_stream) !void {
     if (lw.hc_attn) |*hc| try bindHcLinears(hc, config);
     if (lw.hc_mlp) |*hc| try bindHcLinears(hc, config);
     if (lw.ple) |*ple| try bindLinears(ple, config);
@@ -305,7 +304,7 @@ pub fn bindLayer(lw: *MoeLayerWeights, config: *const ModelConfig) !void {
     }
     if (lw.mlp == .moe) {
         bindSwitchParams(&lw.mlp.moe, config);
-        try bindSharedGeometry(&lw.mlp.moe, config);
+        try bindSharedGeometry(&lw.mlp.moe, config, s);
     }
 }
 
@@ -331,10 +330,9 @@ fn foldAffine(w: mlx.mlx_array, s: ?mlx.mlx_array, b: ?mlx.mlx_array) sushi_exl3
 
 /// Reads the folded shared expert's launch geometry for each row count its launches serve, once its arrays are final.
 /// A dense gate's logit is handed to the fold, an affine gate's computed by it, and the geometry follows that.
-pub fn bindSharedGeometry(mw: *MoeMlpWeights, config: *const ModelConfig) !void {
+pub fn bindSharedGeometry(mw: *MoeMlpWeights, config: *const ModelConfig, s: mlx.mlx_stream) !void {
     const gate_s = mw.shared_expert_gate_s orelse return;
     if (config.expert_layout != .exl3_k4) return;
-    const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return;
     const sigmoid = try trunk.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
     const sh = mw.foldShared(sigmoid, config.trunk_quant, gate_s.ctx != null, false) orelse return;
@@ -435,6 +433,7 @@ fn groupedNormView(weights: *const Weights, name: []const u8, hc: u32, hidden: u
     };
     const shape = [_]c_int{ @intCast(hc), @intCast(hidden) };
     var view = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(view);
     try mlx.check(mlx.mlx_reshape(&view, raw, &shape, 2, s));
     try owned_bf16.append(allocator, view);
     return view;
@@ -487,6 +486,7 @@ fn scaleTriple(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array, k: mlx
             defer _ = mlx.mlx_array_free(kt);
             try mlx.check(mlx.mlx_astype(&kt, k_raw, mlx.mlx_array_dtype(a), st));
             var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_multiply(&out, a, kt, st));
             try mlx.check(mlx.mlx_array_eval(out));
             return out;
@@ -537,6 +537,21 @@ pub fn appendStructArrays(vec: mlx.mlx_vector_array, w: anytype) void {
         if (comptime field.type != mlx.mlx_array) continue;
         const arr = @field(w, field.name);
         if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
+    }
+}
+
+/// One layer's weights: its norms, hyper-connection and PLE arrays, MLP and attention.
+pub fn appendLayerWeights(vec: mlx.mlx_vector_array, lw: *const MoeLayerWeights) void {
+    // qwen4_exp has no per-layer norms (null-ctx); its hyper-connection + PLE arrays follow.
+    if (lw.input_norm.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, lw.input_norm);
+    if (lw.post_attn_norm.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, lw.post_attn_norm);
+    if (lw.hc_attn) |*hw| appendStructArrays(vec, hw);
+    if (lw.hc_mlp) |*hw| appendStructArrays(vec, hw);
+    if (lw.ple) |*pw| appendStructArrays(vec, pw);
+    appendHybridMlpWeights(vec, &lw.mlp);
+    switch (lw.attn) {
+        .full => |*fa| appendFullAttnWeights(vec, fa),
+        .linear => |*la| appendLinearAttnWeights(vec, la),
     }
 }
 
@@ -774,7 +789,7 @@ fn bindExl3SwitchBank(st: mlx.mlx_stream, trellis: []const c_int, rate: expert_e
     }
     var buf: [256]u8 = undefined;
     const config = exl3SwitchBankConfig(rate);
-    return loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true, &config);
+    return loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true, &config, mlx.gpuStream());
 }
 
 /// `{prefix}.{base}.{suffix}` with a RUNTIME base — the embedding table's name
@@ -917,7 +932,7 @@ pub const SwitchMlpBank = struct {
 /// `[E, in/16, out/16, n]` at a rate the CONFIG's bill covers. Decode reads n
 /// off the tensor and a layer may carry fewer bits than the pack's widest — a
 /// wider one under-bills, and an under-bill here is an uncatchable Metal OOM.
-pub fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, exl3: bool, config: *const ModelConfig) !SwitchMlpBank {
+pub fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, exl3: bool, config: *const ModelConfig, s: mlx.mlx_stream) !SwitchMlpBank {
     if (exl3) {
         var plan = sushi_exl3.GroupLayout.init(config.hidden_size, config.moe_intermediate_size, config.expert_quant_rate);
         plan.rates = config.expert_quant_rates;
@@ -966,7 +981,11 @@ pub fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const
         if (config.moe_n_group > 1 and (plan.grouped.? or experts != config.num_experts)) return error.Exl3RouterGroupsUnsupported;
         var ragged: ?sushi_exl3.Ragged = null;
         if (plan.grouped.?) {
-            ragged = try sushi_exl3.Ragged.init(mlx.gpuStream(), groups[0..plan.count]);
+            // A Cooler load's storage is owned regions, never an op's result in the engine's pool.
+            ragged = if (mlx.engine.isStream(s))
+                try @import("owned_weights.zig").raggedOwned(s, groups[0..plan.count], config.expert_tile_order, null)
+            else
+                try sushi_exl3.Ragged.init(s, groups[0..plan.count]);
             errdefer ragged.?.deinit();
             // The pack's group tensors become views of the ragged storage, so the loaded originals
             // are freed once it is evaluated and the layer's bytes stay resident once.
@@ -981,6 +1000,7 @@ pub fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const
                     else => bank.down,
                 };
                 var view = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(view);
                 try mlx.check(mlx.mlx_array_set(&view, switch (name.part) {
                     0 => proj.trellis,
                     1 => proj.suh,
@@ -1074,6 +1094,8 @@ pub fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, 
 }
 
 pub fn initModuleShell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Trunk {
+    const consts = try trunk.ScalarConsts.make(s, config.rms_norm_eps, true, false);
+    errdefer consts.free();
     const cache = try KVCache.init(allocator, 0);
     var shell: Trunk = .{
         .config = config,
@@ -1090,20 +1112,31 @@ pub fn initModuleShell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx
         .lm_head_b = mlx.mlx_array_new(),
         .owns_lm_head = false,
         .owns_norms = false,
-        .gelu_coeff = bf16Scalar(0.7978845608028654, s),
-        .gelu_inner = bf16Scalar(0.044715, s),
-        .half = bf16Scalar(0.5, s),
-        .one = bf16Scalar(1.0, s),
-        .rms_eps_arr = mlx.mlx_array_new_float(config.rms_norm_eps),
-        .three = bf16Scalar(3.0, s),
+        .gelu_coeff = consts.gelu_coeff,
+        .gelu_inner = consts.gelu_inner,
+        .half = consts.half,
+        .one = consts.one,
+        .rms_eps_arr = consts.rms_eps_arr,
+        .three = consts.three,
         .neg_one = null,
         .moe_layers = null,
         .ssm_entries = null,
         .moe_seq_offset = 0,
     };
     errdefer shell.cache.deinit();
+    // A warm inside the arch's own init dispatches on the shell: it names its arch from birth.
+    shell.arch = @import("arch/registry.zig").ofModelType(config.model_type) orelse return error.ArchitectureUnsupported;
     try shell.attachCells();
     return shell;
+}
+
+test "a module shell names its arch from birth, so a dispatch inside the arch's init reaches that arch" {
+    try mlx.requireGpu();
+    const registry = @import("arch/registry.zig");
+    const tag = registry.ofModelType("deepseek_v41") orelse return error.SkipZigTest;
+    var shell = try initModuleShell(std.testing.allocator, .{ .model_type = "deepseek_v41" }, mlx.gpuStream());
+    defer shell.deinit();
+    try std.testing.expectEqual(tag, std.meta.activeTag(registry.handleOf(&shell)));
 }
 
 /// [E, out, in] affine-4/g64 expert bank — the stand-in for a streamed MXFP4
@@ -1172,7 +1205,7 @@ test "exl3 MTP switch_mlp binds restacked trellis/suh/svh under the head prefix"
     }
     var buf: [256]u8 = undefined;
     const config = exl3SwitchBankConfig(.{ .n = 64 });
-    const bank = try loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true, &config);
+    const bank = try loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true, &config, mlx.gpuStream());
     try t.expectEqual(@as(usize, 4), mlx.getShape(bank.gate_w).len);
     try t.expectEqual(@as(c_int, 4), mlx.getShape(bank.gate_w)[0]);
     try t.expectEqual(mlx.mlx_dtype.uint16, mlx.mlx_array_dtype(bank.gate_w));
@@ -1205,7 +1238,7 @@ test "exl3 MTP switch_mlp refuses a missing restacked tensor by MissingWeight" {
     }
     var buf: [256]u8 = undefined;
     const config = exl3SwitchBankConfig(.{ .n = 64 });
-    try t.expectError(error.MissingWeight, loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true, &config));
+    try t.expectError(error.MissingWeight, loadSwitchMlpBank(&w, &buf, "language_model.mtp", 0, true, &config, mlx.gpuStream()));
 }
 
 test "exl3 a trellis the kernels cannot decode refuses at load" {
@@ -1244,6 +1277,7 @@ test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar qu
     const mk = struct {
         fn arr(shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
             var a = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(a);
             try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st));
             return a;
         }
@@ -1310,6 +1344,7 @@ test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 emb
     const mk = struct {
         fn arr(shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
             var a = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(a);
             try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st));
             return a;
         }
@@ -1886,7 +1921,7 @@ test "sushi coder uniform qwen4 and mimo banks preserve stored handles" {
             }
         }
         const cfg = exl3SwitchBankConfig(.{ .n = 48 });
-        const bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg);
+        const bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg, mlx.gpuStream());
         const key = try std.fmt.bufPrint(&buf, "{s}.layers.0.mlp.switch_mlp.gate_proj.trellis", .{prefix});
         try t.expectEqual(w.get(key).?.ctx, bank.gate_w.ctx);
         try t.expectEqualSlices(c_int, &.{ 4, 8, 8, 48 }, mlx.getShape(bank.gate_w));
@@ -1918,7 +1953,7 @@ test "sushi coder GPU grouped binders cover qwen mimo and MTP" {
         var cfg = exl3SwitchBankConfig(.{ .n = 64 });
         cfg.num_experts = 512;
         cfg.num_experts_per_tok = 2;
-        var bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg);
+        var bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg, mlx.gpuStream());
         defer bank.ragged.?.deinit();
         try t.expectEqual(@as(usize, 2), bank.ragged.?.count);
         try t.expectEqual(@as(c_int, 2), mlx.getShape(bank.ragged.?.views[1].up.trellis)[0]);
@@ -1927,7 +1962,7 @@ test "sushi coder GPU grouped binders cover qwen mimo and MTP" {
         const key = try std.fmt.bufPrint(&buf, "{s}.layers.0.mlp.switch_mlp.down_proj.g1.trellis", .{prefix});
         try t.expectEqualSlices(c_int, &.{ 2, 8, 8, 32 }, mlx.getShape(w.get(key).?));
         cfg.num_experts_per_tok = 4;
-        try t.expectError(error.Exl3TopKExceedsExperts, loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg));
+        try t.expectError(error.Exl3TopKExceedsExperts, loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg, mlx.gpuStream()));
     }
 }
 
@@ -1968,7 +2003,7 @@ test "sushi coder GPU a loaded grouped layer keeps its stored bytes resident onc
     cfg.moe_intermediate_size = 256;
     cfg.num_experts = 128;
     cfg.num_experts_per_tok = 8;
-    var bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg);
+    var bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg, mlx.gpuStream());
     defer bank.ragged.?.deinit();
     const vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(vec);

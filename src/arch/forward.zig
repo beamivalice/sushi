@@ -2,10 +2,12 @@
 const mlx = @import("../mlx.zig");
 const model_handle = @import("../model_handle.zig");
 const registry = @import("registry.zig");
+const arch_cooler = @import("cooler.zig");
 const Arch = registry.Arch;
 
 /// One prefill chunk, decode step or verify block, as `ctx` says.
 pub fn forward(a: Arch, ctx: *model_handle.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_array {
+    arch_cooler.enterForward(@import("handle.zig").config(a), ctx, ids);
     return switch (a) {
         inline else => |m, t| registry.Mod(t).forward(m, ctx, ids),
     };

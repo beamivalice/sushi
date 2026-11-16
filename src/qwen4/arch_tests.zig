@@ -35,6 +35,8 @@ pub const tests = .{
     @import("qwen4_profile_env.zig"),
     @import("arch.zig"),
     @import("qwen4_kld.zig"),
+    @import("qwen4_cooler.zig"),
+    @import("qwen4_flags.zig"),
     @import("qwen4_load.zig"),
 };
 

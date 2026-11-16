@@ -684,9 +684,9 @@ test "trunk: loading and unloading a second trunk leaves the first's cached cons
     defer cache_b.deinit();
     var a = bareTransformer(s, cache_a);
     var b = bareTransformer(s, cache_b);
-    a.one = mlx_util.bf16Scalar(1.0, s);
+    a.one = try mlx_util.bf16Scalar(1.0, s);
     defer _ = mlx.mlx_array_free(a.one);
-    b.one = mlx_util.bf16Scalar(1.0, s);
+    b.one = try mlx_util.bf16Scalar(1.0, s);
     defer _ = mlx.mlx_array_free(b.one);
     try a.attachCells();
     defer a.releaseCells();

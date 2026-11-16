@@ -420,7 +420,14 @@ pub fn qsaNaxKernelBuilds() usize {
     return qsa_nax_kernel_builds;
 }
 
-pub fn qsaNaxArm() void {
+/// A probe on the engine's stream that could not run is the load's error, never a declined arm: an op it refused
+/// is latched by name. On MLX's stream it declines the arm, as a GPU without the kernel's features needs.
+pub fn probeRan(s: mlx.mlx_stream, ok: bool) !void {
+    if (!ok and mlx.engine.isStream(s) and mlx.errorLatched()) return error.QsaProbeRefused;
+}
+
+/// Probes the NAX gather once a process, on `s`: the load's stream or a forward's.
+pub fn qsaNaxArm(s: mlx.mlx_stream) !void {
     if (qsa_nax_probe_fail_override) {
         qsa_nax_probe_state.store(1, .release);
         return;
@@ -434,7 +441,8 @@ pub fn qsaNaxArm() void {
     }
     if (!verifyQmmNaxAvailable()) return;
     if (!qsaNaxOsOk()) return;
-    const ok = qsaNaxRunProbe();
+    const ok = qsaNaxRunProbe(s);
+    try probeRan(s, ok);
     qsa_nax_probe_state.store(if (ok) 2 else 1, .release);
 }
 
@@ -508,9 +516,8 @@ fn qsaGatherProbeDispatch(
     return out;
 }
 
-fn qsaNaxRunProbe() bool {
+fn qsaNaxRunProbe(s: mlx.mlx_stream) bool {
     if (mlx.noGpuBackend()) return false;
-    const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return false;
     const q = qsaProbeLcgBf16(s, &[_]c_int{ 1, 24, 16, 256 }, 0x9A7E016) orelse return false;
     defer _ = mlx.mlx_array_free(q);
@@ -733,7 +740,7 @@ fn gatherQsa256Impl(
     if (ratio <= 0) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16) return null;
 
-    qsaNaxArm();
+    try qsaNaxArm(s);
     const qst = mlx.mlx_array_strides(q);
     const kst = mlx.mlx_array_strides(k);
     const vst = mlx.mlx_array_strides(v);
@@ -801,6 +808,7 @@ fn gatherQsa256Impl(
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfgs[0], s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (is_packed) {
         if (qsa_gather_packed_engaged_bits.take(@intFromBool(use_nax))) {
@@ -988,6 +996,7 @@ fn attn256ReferenceRows(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, sc
     const vec = mlx.mlx_vector_array_new_data(&parts, n);
     defer _ = mlx.mlx_vector_array_free(vec);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
     return out;
 }
@@ -1030,6 +1039,7 @@ fn qsaWideUbench(kvs: []const c_int, widths: []const c_int, arms_run: []const Qs
             if (try fusedSdpa256Masked(st, q, k, vv, scale, mask)) |o| return o;
             if (try splitMaskedSdpa256(st, q, k, vv, scale, mask)) |o| return o;
             var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k, vv, scale, "array", mask, .{ .ctx = null }, false, st));
             return out;
         }
@@ -1039,6 +1049,7 @@ fn qsaWideUbench(kvs: []const c_int, widths: []const c_int, arms_run: []const Qs
             switch (arm) {
                 .empty => {
                     var out = mlx.mlx_array_new();
+                    errdefer _ = mlx.mlx_array_free(out);
                     try mlx.check(mlx.mlx_add(&out, q, q, st));
                     return out;
                 },
@@ -1059,12 +1070,10 @@ fn qsaWideUbench(kvs: []const c_int, widths: []const c_int, arms_run: []const Qs
 
         fn run(c: @This(), st: mlx.mlx_stream, q0: mlx.mlx_array, n: usize, arm: Arm) !mlx.mlx_array {
             var q = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(q);
             try mlx.check(mlx.mlx_array_set(&q, q0));
             for (0..n) |_| {
-                const next = c.layer(st, q, arm) catch |e| {
-                    _ = mlx.mlx_array_free(q);
-                    return e;
-                };
+                const next = try c.layer(st, q, arm);
                 _ = mlx.mlx_array_free(q);
                 q = next;
             }
@@ -1533,7 +1542,7 @@ test "gatherQsa256 NAX: a packed probe mismatch at 8 or at 6 bits latches the st
     for ([_]?u8{ 8, 6, null }) |flipped| {
         qsa_nax_probe_flip_packed_bits = flipped;
         qsaNaxProbeReset();
-        qsaNaxArm();
+        try qsaNaxArm(mlx.gpuStream());
         try std.testing.expectEqual(flipped != null, qsaNaxProbeFailed());
     }
 }
@@ -1555,7 +1564,7 @@ test "gatherQsa256 NAX: probe passes on this machine" {
     qsa_nax_probe_flip_override = false;
     qsa_nax_override = true;
     qsaNaxProbeReset();
-    qsaNaxArm();
+    try qsaNaxArm(mlx.gpuStream());
     try std.testing.expect(!qsaNaxProbeFailed());
     try std.testing.expect(qsaNaxEnabled());
 }
@@ -1570,7 +1579,7 @@ test "gatherQsa256 NAX: latch is consulted before NAX kernel construction" {
     }
     qsa_nax_probe_fail_override = true;
     qsaNaxProbeReset();
-    qsaNaxArm();
+    try qsaNaxArm(mlx.gpuStream());
     try std.testing.expect(qsaNaxProbeFailed());
     try std.testing.expect(!qsaNaxEnabled());
     const builds = qsaNaxKernelBuilds();

@@ -168,6 +168,12 @@ pub const ModelConfig = struct {
     /// `ds41_cooler`; the flag wins (`coolerChoice`).
     cooler_flag: ?bool = null,
     cooler_override: ?bool = null,
+    /// A Cooler setting of another arch the model's settings carry, which its load names as ignored.
+    cooler_setting_stray: ?[]const u8 = null,
+    /// Who kept a Sushi Cooler load on MLX, stamped from `coolerChoice` for an arch whose own config has no such field.
+    cooler_ask: arch_config.CoolerAsk = .none,
+    /// A test names the side its load runs on, before the load; a served load never sets it.
+    cooler_for_test: ?bool = null,
     expert_ssd_budget_bytes: u64 = 0,
     expert_workspace_bytes: u64 = 0,
     /// What the streamed store bills beyond its mean expert, set by the streaming plan.
@@ -1846,6 +1852,7 @@ fn foldDeltaNorm(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(one);
     try mlx.check(mlx.mlx_astype(&one, one_f32, mlx.mlx_array_dtype(value), s));
     var result = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_add(&result, value, one, s));
     return result;
 }
@@ -1861,6 +1868,7 @@ fn transposeFusedConv(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(view);
     try mlx.check(mlx.mlx_transpose_axes(&view, value, &axes, 3, s));
     var result = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_contiguous(&result, view, false, s));
     return result;
 }
@@ -2108,6 +2116,11 @@ pub fn loadWeightsForConfig(
     if (config.pack_revision) |rev| try pack_revision_mod.verify(io, allocator, model_dir, rev);
     if (config.expert_layout == .exl3_k4 and !(arch_config.facts(config) orelse arch_config.Facts{}).reads_own_source) try @import("pack_index.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (try arch_load.weights(io, allocator, model_dir, config, load_vision)) |weights| return weights;
+    return loadWeightsGeneric(io, allocator, model_dir, config, load_vision);
+}
+
+/// The loaders that read a pack's shards by their names, for an arch with no reader of its own.
+pub fn loadWeightsGeneric(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout, load_vision, config.stream_mtp_head);
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
@@ -2439,6 +2452,18 @@ pub fn ownedRegion(len: usize) !*MappedRegion {
     };
     region.* = .{ .ptr = @ptrCast(@alignCast(mapped)), .len = size };
     return region;
+}
+
+/// A weight a Cooler load built with an op, moved from the engine's pool into an owned region in place: every handle
+/// and view on it reads the region from here on. A weight already mapped, or one of MLX's, stays where it is.
+pub fn ownInPlace(arr: mlx.mlx_array) !void {
+    if (arr.ctx == null or !mlx.engine.isOurs(arr) or mlx.engine.isMapped(arr)) return;
+    const region = try ownedRegion(mlx.engine.storeLen(arr));
+    trackRegion(region);
+    if (!mlx.engine.moveToMapped(arr, region.ptr, region.len, region, unmapRegion)) {
+        unmapRegion(region);
+        return error.EngineWeightWrap;
+    }
 }
 
 /// Releases a region that was never wrapped.
@@ -4371,6 +4396,48 @@ test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned b
     try testing.expect(empty == null);
     try testing.expectEqual(start, owned_bytes.load(.monotonic));
     try testing.expectEqual(refused + 1, refused_imports.load(.monotonic));
+}
+
+test "ownInPlace: a weight built in the engine's pool moves into an owned region, its views read the same bytes, and the pool takes its buffer back" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    var vals: [64 * 64]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @floatFromInt(@as(i32, @intCast(i % 97)) - 48);
+    const host = mlx.engine.mlx_array_new_data(&vals, &[_]c_int{ 64, 64 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(host);
+    const two = mlx.engine.mlx_array_new_data(&[_]f32{2}, &[_]c_int{1}, 1, .float32);
+    defer _ = mlx.mlx_array_free(two);
+    var built = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(built);
+    try mlx.check(mlx.mlx_multiply(&built, host, two, s));
+    var view = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(view);
+    try mlx.check(mlx.mlx_slice(&view, built, &[_]c_int{ 3, 5 }, 2, &[_]c_int{ 40, 61 }, 2, &[_]c_int{ 2, 3 }, 2, s));
+    var before = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(before);
+    try mlx.check(mlx.mlx_contiguous(&before, view, false, s));
+    try mlx.check(mlx.mlx_array_eval(before));
+    mlx.engine.close();
+    const pool0 = mlx.engine.stats();
+    const owned0 = owned_bytes.load(.monotonic);
+    try ownInPlace(built);
+    try testing.expect(ownsPointer(mlx.engine.storePointer(built)));
+    try testing.expect(ownsPointer(mlx.engine.storePointer(view)));
+    try testing.expect(owned_bytes.load(.monotonic) > owned0);
+    mlx.engine.close();
+    const pool1 = mlx.engine.stats();
+    try testing.expectEqual(pool0.pool_asked - 64 * 64 * 4, pool1.pool_asked);
+    var after = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(after);
+    try mlx.check(mlx.mlx_contiguous(&after, view, false, s));
+    try mlx.check(mlx.mlx_array_eval(after));
+    const n = mlx.mlx_array_size(before) * 4;
+    try testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(before).?[0..n], mlx.mlx_array_data_uint8(after).?[0..n]);
+    // Moved again it stays: a mapping is not the pool's.
+    try ownInPlace(built);
 }
 
 test "a text prompt's BOS comes from the release config, whose bos_token_id sits outside text_config" {

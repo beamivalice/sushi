@@ -1324,7 +1324,9 @@ test "qwen4 hc_mean capture is the mean of the four HC streams at the layer outp
     const hc: usize = 4;
     const hidden: usize = @intCast(config.hidden_size);
     const prompt = [_]i32{ 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000 };
-    const layer_ids = [_]u32{ 5, 15 };
+    // Layers 5 and 15 of the served 48; a smaller pack (the tiny fixture's 8) takes its own last two.
+    const n_layers: u32 = config.num_hidden_layers;
+    const layer_ids = [_]u32{ @min(5, n_layers - 2), @min(15, n_layers - 1) };
     var raw_out = [_]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
     var mean_out = [_]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
     defer for (raw_out ++ mean_out) |a| {
@@ -1537,8 +1539,8 @@ test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/le
 
     // Slots 0 and 1 run together, 2 joins, 0 leaves as 3 joins, 2 is cancelled, 0 comes back.
     const active = [_][]const usize{
-        &.{ 0, 1 },    &.{ 0, 1 },    &.{ 0, 1, 2 }, &.{ 0, 1, 2 }, &.{ 1, 2, 3 },
-        &.{ 1, 2, 3 }, &.{ 1, 3 },    &.{ 0, 1, 3 }, &.{ 0, 1, 3 }, &.{ 0, 1, 2, 3 },
+        &.{ 0, 1 },    &.{ 0, 1 }, &.{ 0, 1, 2 }, &.{ 0, 1, 2 }, &.{ 1, 2, 3 },
+        &.{ 1, 2, 3 }, &.{ 1, 3 }, &.{ 0, 1, 3 }, &.{ 0, 1, 3 }, &.{ 0, 1, 2, 3 },
     };
     var mismatched: usize = 0;
     for (active, 0..) |set, tick| {
@@ -1991,7 +1993,7 @@ test "qwen4 MTP verify token values equal serial ticks without near-tie acquitta
     if (mismatch) return error.MtpSerialTokenDivergence;
 }
 
-test "batched PLE defer engages at N=2 and matches eager at S=1 and S=4" {
+test "batched PLE defer engages at N=2 and matches eager at S=1 and S=4, with the decode ladder off and on" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     try mlx.requireGpu();
     const allocator = testing.allocator;
@@ -2011,72 +2013,80 @@ test "batched PLE defer engages at N=2 and matches eager at S=1 and S=4" {
     qwen4_forward.compileGdnGate(&xfm);
     xfm.compileMoeRouting();
 
-    const n_layers = config.num_hidden_layers;
-    const prompt_a = [_]i32{ 5, 17, 42, 9, 23, 8, 31, 2 };
-    const prompt_b = [_]i32{ 11, 4, 19, 7, 28, 3 };
-    const a_e = try Qwen4TestSlot.init(allocator, n_layers);
-    defer a_e.deinit(allocator);
-    const b_e = try Qwen4TestSlot.init(allocator, n_layers);
-    defer b_e.deinit(allocator);
-    const a_d = try Qwen4TestSlot.init(allocator, n_layers);
-    defer a_d.deinit(allocator);
-    const b_d = try Qwen4TestSlot.init(allocator, n_layers);
-    defer b_d.deinit(allocator);
-    _ = mlx.mlx_array_free(try a_e.forward(&xfm, &prompt_a));
-    _ = mlx.mlx_array_free(try b_e.forward(&xfm, &prompt_b));
-    _ = mlx.mlx_array_free(try a_d.forward(&xfm, &prompt_a));
-    _ = mlx.mlx_array_free(try b_d.forward(&xfm, &prompt_b));
+    const ladder_default = xfm.arch_state.qwen4.decode_async_ladder;
+    try testing.expect(ladder_default != 0);
+    defer xfm.arch_state.qwen4.decode_async_ladder = ladder_default;
+    // The decode ladder (one-row steps only) fills a pending PLE leaf at its first step past the PLE layer: with it
+    // on, a decode step's deferral ends filled and a verify's stays pending; the bytes match eager either way.
+    for ([_]bool{ false, true }) |ladder| {
+        xfm.arch_state.qwen4.decode_async_ladder = if (ladder) ladder_default else 0;
+        const n_layers = config.num_hidden_layers;
+        const prompt_a = [_]i32{ 5, 17, 42, 9, 23, 8, 31, 2 };
+        const prompt_b = [_]i32{ 11, 4, 19, 7, 28, 3 };
+        const a_e = try Qwen4TestSlot.init(allocator, n_layers);
+        defer a_e.deinit(allocator);
+        const b_e = try Qwen4TestSlot.init(allocator, n_layers);
+        defer b_e.deinit(allocator);
+        const a_d = try Qwen4TestSlot.init(allocator, n_layers);
+        defer a_d.deinit(allocator);
+        const b_d = try Qwen4TestSlot.init(allocator, n_layers);
+        defer b_d.deinit(allocator);
+        _ = mlx.mlx_array_free(try a_e.forward(&xfm, &prompt_a));
+        _ = mlx.mlx_array_free(try b_e.forward(&xfm, &prompt_b));
+        _ = mlx.mlx_array_free(try a_d.forward(&xfm, &prompt_a));
+        _ = mlx.mlx_array_free(try b_d.forward(&xfm, &prompt_b));
 
-    const widths = [_]c_int{ 1, 4 };
-    const decode_ids = [_]i32{ 13, 6 };
-    const verify_ids = [_]i32{ 13, 6, 27, 3, 19, 40, 12, 8 };
-    for (widths) |w| {
-        const ids: []const i32 = if (w == 1) &decode_ids else &verify_ids;
-        const capture = w > 1;
-        const eager_slots = [_]*Qwen4TestSlot{ a_e, b_e };
-        const defer_slots = [_]*Qwen4TestSlot{ a_d, b_d };
-        const eager = try qwen4BatchedPleForward(&xfm, &eager_slots, ids, w, capture, false, true);
-        defer _ = mlx.mlx_array_free(eager.logits);
-        try testing.expect(!eager.pending);
-        const deferred = try qwen4BatchedPleForward(&xfm, &defer_slots, ids, w, capture, true, true);
-        defer _ = mlx.mlx_array_free(deferred.logits);
-        try testing.expect(deferred.pending);
-        const ea = try qwen4ReadF32(allocator, eager.logits, s);
-        defer allocator.free(ea);
-        const da = try qwen4ReadF32(allocator, deferred.logits, s);
-        defer allocator.free(da);
-        try testing.expectEqualSlices(f32, ea, da);
-        for (a_e.entries, a_d.entries) |*ee, *de| {
-            try testing.expectEqual(ee.ple_prev_valid, de.ple_prev_valid);
-            try testing.expectEqualSlices(u32, &ee.ple_prev, &de.ple_prev);
-            try testing.expectEqual(ee.spec_ple_len, de.spec_ple_len);
-            const n: usize = ee.spec_ple_len;
-            try testing.expectEqualSlices(u32, ee.spec_ple_tokens[0..n], de.spec_ple_tokens[0..n]);
-        }
-        for (b_e.entries, b_d.entries) |*ee, *de| {
-            try testing.expectEqual(ee.ple_prev_valid, de.ple_prev_valid);
-            try testing.expectEqualSlices(u32, &ee.ple_prev, &de.ple_prev);
-            try testing.expectEqual(ee.spec_ple_len, de.spec_ple_len);
-            const n: usize = ee.spec_ple_len;
-            try testing.expectEqualSlices(u32, ee.spec_ple_tokens[0..n], de.spec_ple_tokens[0..n]);
-        }
-        if (capture) {
-            const acc: u32 = 1;
-            const vl: u32 = @intCast(w);
+        const widths = [_]c_int{ 1, 4 };
+        const decode_ids = [_]i32{ 13, 6 };
+        const verify_ids = [_]i32{ 13, 6, 27, 3, 19, 40, 12, 8 };
+        for (widths) |w| {
+            const ids: []const i32 = if (w == 1) &decode_ids else &verify_ids;
+            const capture = w > 1;
+            const eager_slots = [_]*Qwen4TestSlot{ a_e, b_e };
+            const defer_slots = [_]*Qwen4TestSlot{ a_d, b_d };
+            const eager = try qwen4BatchedPleForward(&xfm, &eager_slots, ids, w, capture, false, true);
+            defer _ = mlx.mlx_array_free(eager.logits);
+            try testing.expect(!eager.pending);
+            const deferred = try qwen4BatchedPleForward(&xfm, &defer_slots, ids, w, capture, true, true);
+            defer _ = mlx.mlx_array_free(deferred.logits);
+            try testing.expectEqual(!(ladder and w == 1), deferred.pending);
+            const ea = try qwen4ReadF32(allocator, eager.logits, s);
+            defer allocator.free(ea);
+            const da = try qwen4ReadF32(allocator, deferred.logits, s);
+            defer allocator.free(da);
+            try testing.expectEqualSlices(f32, ea, da);
             for (a_e.entries, a_d.entries) |*ee, *de| {
-                try ssmRollbackFromCapture(ee, acc, vl, s);
-                try ssmRollbackFromCapture(de, acc, vl, s);
+                try testing.expectEqual(ee.ple_prev_valid, de.ple_prev_valid);
                 try testing.expectEqualSlices(u32, &ee.ple_prev, &de.ple_prev);
+                try testing.expectEqual(ee.spec_ple_len, de.spec_ple_len);
+                const n: usize = ee.spec_ple_len;
+                try testing.expectEqualSlices(u32, ee.spec_ple_tokens[0..n], de.spec_ple_tokens[0..n]);
             }
             for (b_e.entries, b_d.entries) |*ee, *de| {
-                try ssmRollbackFromCapture(ee, acc, vl, s);
-                try ssmRollbackFromCapture(de, acc, vl, s);
+                try testing.expectEqual(ee.ple_prev_valid, de.ple_prev_valid);
                 try testing.expectEqualSlices(u32, &ee.ple_prev, &de.ple_prev);
+                try testing.expectEqual(ee.spec_ple_len, de.spec_ple_len);
+                const n: usize = ee.spec_ple_len;
+                try testing.expectEqualSlices(u32, ee.spec_ple_tokens[0..n], de.spec_ple_tokens[0..n]);
             }
-            for (a_e.entries) |*e| ssmFreeSpecCapture(e);
-            for (b_e.entries) |*e| ssmFreeSpecCapture(e);
-            for (a_d.entries) |*e| ssmFreeSpecCapture(e);
-            for (b_d.entries) |*e| ssmFreeSpecCapture(e);
+            if (capture) {
+                const acc: u32 = 1;
+                const vl: u32 = @intCast(w);
+                for (a_e.entries, a_d.entries) |*ee, *de| {
+                    try ssmRollbackFromCapture(ee, acc, vl, s);
+                    try ssmRollbackFromCapture(de, acc, vl, s);
+                    try testing.expectEqualSlices(u32, &ee.ple_prev, &de.ple_prev);
+                }
+                for (b_e.entries, b_d.entries) |*ee, *de| {
+                    try ssmRollbackFromCapture(ee, acc, vl, s);
+                    try ssmRollbackFromCapture(de, acc, vl, s);
+                    try testing.expectEqualSlices(u32, &ee.ple_prev, &de.ple_prev);
+                }
+                for (a_e.entries) |*e| ssmFreeSpecCapture(e);
+                for (b_e.entries) |*e| ssmFreeSpecCapture(e);
+                for (a_d.entries) |*e| ssmFreeSpecCapture(e);
+                for (b_d.entries) |*e| ssmFreeSpecCapture(e);
+            }
         }
     }
 }
@@ -2795,19 +2805,24 @@ test "qwen4MtpForward: every error path of the MTP head forward releases its str
         var errs: usize = 0;
         var k: u64 = 1;
         while (k <= n_ops) : (k += 1) {
-            try qwen4_forward.qwen4MtpReset(&xfm);
-            const base = mlxSettledActiveBytes(s);
-            mlx.fault.arm(k);
-            const r = qwen4_forward.qwen4MtpForward(&xfm, stream_prev, ids, 1, null, proj);
-            mlx.fault.disarm();
-            if (r) |o| {
-                // Reachable only where a fallback arm below the head swallowed
-                // the injected error; the outputs are still ours to free.
-                if (o.logits.ctx != null) _ = mlx.mlx_array_free(o.logits);
-                if (o.mixed.ctx != null) _ = mlx.mlx_array_free(o.mixed);
-                if (o.stream.ctx != null) _ = mlx.mlx_array_free(o.stream);
-            } else |_| {
-                errs += 1;
+            // The first faulted run may take a fallback arm the warm-up never did and build its lazy tables; the
+            // second runs the same path with them built, so only what a faulted call leaves each time moves the bytes.
+            var base: usize = 0;
+            for (0..2) |pass| {
+                try qwen4_forward.qwen4MtpReset(&xfm);
+                base = mlxSettledActiveBytes(s);
+                mlx.fault.arm(k);
+                const r = qwen4_forward.qwen4MtpForward(&xfm, stream_prev, ids, 1, null, proj);
+                mlx.fault.disarm();
+                if (r) |o| {
+                    // Reachable only where a fallback arm below the head swallowed
+                    // the injected error; the outputs are still ours to free.
+                    if (o.logits.ctx != null) _ = mlx.mlx_array_free(o.logits);
+                    if (o.mixed.ctx != null) _ = mlx.mlx_array_free(o.mixed);
+                    if (o.stream.ctx != null) _ = mlx.mlx_array_free(o.stream);
+                } else |_| {
+                    if (pass == 1) errs += 1;
+                }
             }
             try qwen4_forward.qwen4MtpReset(&xfm);
             try testing.expectEqual(base, mlxSettledActiveBytes(s));
@@ -2901,11 +2916,15 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
     try testing.expectEqual(indexed_before, trunk.mtp_verify_indexed_input_calls);
     try testing.expectEqual(reduce_before, trunk.mtp_verify_expert_reduce_calls);
     try testing.expectEqual(expert_before, trunk.mtp_verify_expert_pairs_calls);
-    try testing.expect(trunk.mtp_verify_expert_rows_calls > rows_before);
-    try testing.expect(qwen4_forward.mtp_verify_gdn_rows_calls > gdn_before);
-    try testing.expect(trunk.mtp_verify_shared_gate_rows_calls > shared_gate_before);
-    try testing.expect(qwen4_forward.mtp_verify_attn_rows_calls > attn_before);
-    try testing.expect(qwen4_forward.mtp_verify_lmhead_rows_calls > lmhead_before);
+    // The joined-row projections take only an 8-bit group-64 affine trunk: any other runs each row's own
+    // projections, so the rows are still byte-identical and the counters stay put.
+    if (@import("qwen4_test_support.zig").joinedRowsTrunk(&xfm)) {
+        try testing.expect(trunk.mtp_verify_expert_rows_calls > rows_before);
+        try testing.expect(qwen4_forward.mtp_verify_gdn_rows_calls > gdn_before);
+        try testing.expect(trunk.mtp_verify_shared_gate_rows_calls > shared_gate_before);
+        try testing.expect(qwen4_forward.mtp_verify_attn_rows_calls > attn_before);
+        try testing.expect(qwen4_forward.mtp_verify_lmhead_rows_calls > lmhead_before);
+    }
     try testing.expect(qwen4_forward.mtp_verify_moe_group_last_ops > 0);
 }
 
@@ -3456,7 +3475,8 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         }
         errdefer std.debug.print("[single-verify-exact] context={d} width={d} before={any} after={any}\n", .{ prefix_len, width, before, after });
         for (before, after, 0..) |old, new, feature| {
-            if (feature == 4 and verifySharedHardware() and width >= 2 and width <= trunk.SINGLE_VERIFY_ROWS_MAX) {
+            // The prepared hyper-connection read serves hidden 2560 only (`hcReadFusedFor`): a narrower pack reads unprepared.
+            if (feature == 4 and verifySharedHardware() and config.hidden_size == 2560 and width >= 2 and width <= trunk.SINGLE_VERIFY_ROWS_MAX) {
                 try testing.expect(new > old);
             } else try testing.expectEqual(old, new);
         }

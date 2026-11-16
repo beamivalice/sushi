@@ -55,6 +55,15 @@ pub fn fusedStreamFoldsNorm(key: []const u8) bool {
     return false;
 }
 
+/// A Cooler load's weights are the engine's own buffers: the engine is on before the first one is wrapped.
+pub fn weights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const model_mod.ModelConfig, load_vision: bool) !?model_mod.Weights {
+    if (!@import("qwen4_cooler.zig").ownDecode(config)) return null;
+    mlx.engine.enable();
+    mlx.engine.own_weights = true;
+    defer mlx.engine.own_weights = false;
+    return try model_mod.loadWeightsGeneric(io, allocator, model_dir, config, load_vision);
+}
+
 pub fn drafterChosen(io: std.Io, allocator: std.mem.Allocator, config: *model_mod.ModelConfig, drafter_dir: []const u8, no_drafter: bool, mtp_on: bool) !void {
     if (drafter_dir.len > 0) return model_load.stampDflashRequestTerms(io, allocator, config, drafter_dir);
     const why: []const u8 = if (no_drafter) "--no-drafter" else "DFlash2: --drafter <path>";

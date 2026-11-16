@@ -4,6 +4,8 @@
 --ds41-mlx-engine takes no value and keeps DeepSeek loads on MLX; a model of another arch loads as it would, its load naming the flag, and its model setting is ignored there
 --qwen-gdn is what parseConfig reads, on a loaded config; the f32 state is the default; GLM keeps its own gate
 --qwen-gdn takes 16 or 32 and nothing else
+--qwen-mlx-engine takes no value and keeps Flash-Next loads on MLX; a model of another arch loads as it would, its load naming the flag, and qwen_cooler is ignored there
+Cooler rows: a DeepSeek load serves one row, streamed or resident, and names why
 DFlash block tail engages only for the native GLM drafter
 DeepSeek expert keys round trip and the layout claims only the trunk's experts
 DeepSeek vision serving: the processor carries the release's budgets, a placeholder expands to the whole span, and its encode is billed
@@ -52,6 +54,7 @@ Qwen3.8-Flash-Next thinks at medium effort by default, under the launch flag and
 Responses: a stored chain and an input replay render the same Qwen prompt
 a GLM raw FP8 config with another block size is refused by name
 a MiMo slot bills the decode rebuilds the other rows of its batched decode hold
+a Qwen load on Sushi Cooler accepts drafts by the exact rule whatever its settings say; on MLX its settings reach it
 a Qwen or MiMo request owes no growth after admission, its reserved capacity is taken at its first grow
 a freed MiMo slot returns its KV to the OS, not to MLX's pool
 a qwen4_exp config refusal keeps its own name in the 503 text

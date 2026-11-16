@@ -399,8 +399,9 @@ fn getVerifyQmmKernel(m: c_int, bn: c_int) !mlx.mlx_fast_metal_kernel {
 /// verify path builds ~300 kernel nodes per round (inference thread only,
 /// same single-caller discipline as the kernel caches above).
 const VqmmScalar = struct { v: c_int, arr: mlx.mlx_array, tick: u64 };
-var vqmm_scalar_cache: [16]VqmmScalar = undefined;
-var vqmm_scalar_count: usize = 0;
+/// One a side: a scalar belongs to the side that made it, which is the engine's while a scope of its own is open.
+var vqmm_scalar_cache: [2][16]VqmmScalar = undefined;
+var vqmm_scalar_count: [2]usize = .{ 0, 0 };
 var vqmm_scalar_tick: u64 = 0;
 
 /// Which slot may be evicted: the LEAST RECENTLY USED one, never a fixed slot.
@@ -432,23 +433,32 @@ fn vqmmScalarEvictIndex(entries: []const VqmmScalar) usize {
 }
 
 pub fn cachedScalarInt(v: c_int) mlx.mlx_array {
+    const side: u1 = @intFromBool(mlx.engine.active);
+    const cache = &vqmm_scalar_cache[side];
+    const count = &vqmm_scalar_count[side];
     vqmm_scalar_tick += 1;
-    for (vqmm_scalar_cache[0..vqmm_scalar_count]) |*e| {
+    for (cache[0..count.*]) |*e| {
         if (e.v == v) {
             e.tick = vqmm_scalar_tick;
             return e.arr;
         }
     }
     const arr = mlx.mlx_array_new_int(v);
-    if (vqmm_scalar_count < vqmm_scalar_cache.len) {
-        vqmm_scalar_cache[vqmm_scalar_count] = .{ .v = v, .arr = arr, .tick = vqmm_scalar_tick };
-        vqmm_scalar_count += 1;
+    if (count.* < cache.len) {
+        cache[count.*] = .{ .v = v, .arr = arr, .tick = vqmm_scalar_tick };
+        count.* += 1;
     } else {
-        const victim = vqmmScalarEvictIndex(vqmm_scalar_cache[0..vqmm_scalar_count]);
-        _ = mlx.mlx_array_free(vqmm_scalar_cache[victim].arr);
-        vqmm_scalar_cache[victim] = .{ .v = v, .arr = arr, .tick = vqmm_scalar_tick };
+        const victim = vqmmScalarEvictIndex(cache[0..count.*]);
+        _ = mlx.mlx_array_free(cache[victim].arr);
+        cache[victim] = .{ .v = v, .arr = arr, .tick = vqmm_scalar_tick };
     }
     return arr;
+}
+
+/// Frees side `side`'s scalars, when the side's last model is gone.
+pub fn dropSide(side: u1) void {
+    for (vqmm_scalar_cache[side][0..vqmm_scalar_count[side]]) |e| _ = mlx.mlx_array_free(e.arr);
+    vqmm_scalar_count[side] = 0;
 }
 
 pub var verify_qmm_override: ?bool = null;

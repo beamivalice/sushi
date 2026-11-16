@@ -158,6 +158,11 @@ pub const QwenVision = struct {
 
     /// `quantize` false keeps every matrix bf16 (parity tests against the reference).
     pub fn initWith(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, quantize: bool) !QwenVision {
+        // A Cooler load runs nothing on MLX, and the engine does not run this tower: the load is refused, never split.
+        if (@import("qwen4_cooler.zig").ownDecode(&config)) {
+            log.err("[vision] Sushi Cooler does not run the Qwen3.8 vision tower yet; --no-vision or --qwen-mlx-engine serves this pack\n", .{});
+            return error.VisionTowerNotPorted;
+        }
         const s = mlx.mlx_default_gpu_stream_new();
         var buf: [256]u8 = undefined;
         var kbuf: [256]u8 = undefined;
@@ -299,6 +304,7 @@ pub const QwenVision = struct {
     /// y = x · Wᵀ (+ bias). W is [out, in] (bf16 `w`, or the affine codes `q` when the load requantized it), x is [..., in].
     fn denseLinear(self: *QwenVision, x: mlx.mlx_array, w: mlx.mlx_array, b: ?mlx.mlx_array, q: ?dflash.DflashLinear) !mlx.mlx_array {
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         if (q) |codes| {
             try mlx.check(common.quantizedMatmul(&out, x, codes, self.s));
         } else {
@@ -309,6 +315,7 @@ pub const QwenVision = struct {
         }
         if (b) |bv| {
             var biased = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(biased);
             try mlx.check(mlx.mlx_add(&biased, out, bv, self.s));
             _ = mlx.mlx_array_free(out);
             out = biased;
@@ -318,6 +325,7 @@ pub const QwenVision = struct {
 
     fn layerNorm6(self: *QwenVision, x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array) !mlx.mlx_array {
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_fast_layer_norm(&out, x, w, b, 1e-6, self.s));
         return out;
     }
@@ -357,6 +365,7 @@ pub const QwenVision = struct {
         defer _ = mlx.mlx_array_free(xt);
         try mlx.check(mlx.mlx_multiply(&xt, x, onep, self.s));
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_multiply(&out, xt, c_half, self.s));
         return out;
     }
@@ -382,6 +391,7 @@ pub const QwenVision = struct {
         defer _ = mlx.mlx_array_free(xt);
         try mlx.check(mlx.mlx_multiply(&xt, x, onep, self.s));
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_multiply(&out, xt, c_half, self.s));
         return out;
     }
@@ -407,6 +417,7 @@ pub const QwenVision = struct {
         const vec = mlx.mlx_vector_array_new_data(&arrs, 2);
         defer _ = mlx.mlx_vector_array_free(vec);
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_concatenate_axis(&out, vec, -1, self.s));
         return out;
     }
@@ -427,6 +438,7 @@ pub const QwenVision = struct {
         defer _ = mlx.mlx_array_free(rsin);
         try mlx.check(mlx.mlx_multiply(&rsin, rh, sin, self.s));
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_add(&out, xcos, rsin, self.s));
         return out;
     }
@@ -585,6 +597,7 @@ pub const QwenVision = struct {
         const idx_shape = [_]c_int{@intCast(n)};
         const wshape = [_]c_int{ @intCast(n), 1 };
         var acc = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(acc);
         var first = true;
         inline for (0..4) |c| {
             const ix = mlx.mlx_array_new_data(idx[c].ptr, &idx_shape, 1, .int32);
@@ -606,6 +619,7 @@ pub const QwenVision = struct {
                 first = false;
             } else {
                 var sum = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(sum);
                 try mlx.check(mlx.mlx_add(&sum, acc, weighted, self.s));
                 _ = mlx.mlx_array_free(acc);
                 acc = sum;
@@ -824,6 +838,7 @@ pub const QwenVision = struct {
         const cat_vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
         defer _ = mlx.mlx_vector_array_free(cat_vec);
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_concatenate_axis(&out, cat_vec, 1, self.s));
         return out;
     }
@@ -1642,4 +1657,10 @@ test "qwen vision: the requantized tower stays within bf16's drift of the bf16 t
         std.debug.print("[vision-q8] 640 tokens, median of {d}: bf16 {d:.1} ms, q8 {d:.1} ms\n", .{ reps, common.median(&t[0]), common.median(&t[1]) });
     }
     try std.testing.expect(g.cos > 0.998);
+}
+
+test "qwen vision: a Cooler load refuses the tower by name before it reads a weight" {
+    var weights: Weights = undefined;
+    const config: ModelConfig = .{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .expert_quant_codebook = .spec1, .cooler_for_test = true };
+    try std.testing.expectError(error.VisionTowerNotPorted, QwenVision.initWith(std.testing.allocator, config, &weights, true));
 }

@@ -2939,6 +2939,9 @@ fn projectSortedWithRuns(
     return finishIndexed(s, inner, svh, slots_sorted);
 }
 
+/// Uniform-rate grouped prefills run: what a warm-up ran, for a test (a rate-group pack counts `rate_groups.prefill_chains`).
+pub var prefill_calls: u64 = 0;
+
 pub fn moePrefill(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -2960,6 +2963,7 @@ pub fn moePrefill(
     const rows = xsh[0];
     const hidden = xsh[1];
     const nslots = rows * topk;
+    prefill_calls += 1;
     var order = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(order);
     try mlx.check(mlx.mlx_argsort_axis(&order, slots, 0, s));

@@ -238,6 +238,7 @@ fn buildSmoothBf16(s: mlx.mlx_stream, head_dim: c_int) !mlx.mlx_array {
     const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
     defer _ = mlx.mlx_array_free(f32_arr);
     var bf16_arr = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(bf16_arr);
     try mlx.check(mlx.mlx_astype(&bf16_arr, f32_arr, .bfloat16, s));
     return bf16_arr;
 }

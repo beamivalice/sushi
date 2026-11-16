@@ -217,6 +217,8 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
   model's settings (`ds41_cooler: false` in `model-settings.json`; the flag outranks it and locks the checkbox), if
   Cooler misbehaves, and report it at <https://github.com/beamivalice/sushi/issues/new>. The load line says which side
   decodes and why. A change applies at the next load. Other models refuse the flag.
+- **`--qwen-mlx-engine` runs Qwen3.8 on MLX instead of Sushi Cooler**, the same opt-out for an STQ Qwen pack: the flag,
+  or untick the checkbox under Qwen3.8 Inference (`qwen_cooler: false`; the flag outranks it and locks the checkbox).
 - **Refused flags:** `--kv-quant`, `--qwen-gdn`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` and
   `--mtp-greedy-tail` stop the load, since the model has none of those parts ([dsv41-parity](dsv41-parity.md)).
 

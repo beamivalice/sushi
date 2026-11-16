@@ -234,7 +234,8 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.ssd_budget_gb_override = o.ssd_budget_gb orelse 0;
     config.ssd_prefetch_override = o.ssd_prefetch;
-    config.cooler_override = o.ds41_cooler;
+    config.cooler_override = arch_flags.coolerSettingOf(config, o);
+    config.cooler_setting_stray = arch_flags.strayCoolerSetting(config, o);
     config.stampCooler();
     config.preserve_thinking_override = o.preserve_thinking;
     config.think_penalty_override = o.think_penalty;
@@ -259,6 +260,49 @@ pub fn contextWindowRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32
     return model_settings.ctxAboveWindowLine(buf, pick.value, config.contextCap(), config.yarn_factor_override, pick.source);
 }
 
+/// The load's warm: faults weight pages and compiles the decode path's kernels with throwaway forwards on this thread's
+/// stream (~600-900 ms at boot, so the first request skips a cold path), then the verify widths up to `verify_cap` when
+/// MTP is on, then the arch's spec warm. On MLX a failed step warns and the load serves. On Sushi Cooler a forward that
+/// fails in the warm fails in a request, so the load does not serve; a warm that ends seals the engine.
+pub fn warmLoad(io: std.Io, config: *const ModelConfig, xfm: *Trunk, verify_cap: ?u32, aux_head: ?*anyopaque, kv: trunk.KVQuantConfig) !void {
+    const warmup_start = std.Io.Timestamp.now(io, .awake);
+    const on_engine = arch_handle.onEngine(null, config);
+    xfm.warmup() catch |err| {
+        var cause: [512]u8 = undefined;
+        if (on_engine) {
+            log.err("Warmup failed ({s}: {s}); a load on Sushi Cooler does not serve without it\n", .{ @errorName(err), latchedCause(&cause) });
+            return err;
+        }
+        log.warn("Warmup failed ({s}: {s}); continuing without it — first request may be slow.\n", .{ @errorName(err), latchedCause(&cause) });
+    };
+    const warmup_ns: u64 = @intCast(warmup_start.untilNow(io, .awake).nanoseconds);
+    log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
+    if (verify_cap) |cap| arch_load.warmVerify(config, xfm, cap, kv) catch |err| {
+        var cause: [512]u8 = undefined;
+        if (on_engine) {
+            log.err("[spec-warmup] failed ({s}: {s}); a load on Sushi Cooler does not serve without it\n", .{ @errorName(err), latchedCause(&cause) });
+            return err;
+        }
+        log.warn("[spec-warmup] failed ({s}: {s}); the first round at each width pays its kernel compile inside the round.\n", .{ @errorName(err), latchedCause(&cause) });
+    };
+    arch_load.warmSpec(io, config, xfm, aux_head, kv);
+    if (on_engine) @import("arch/cooler.zig").warmEnded();
+}
+
+/// JIT-compiles the activation kernels, bound to this thread's MLX stream. Skipped when there's no GPU backend
+/// (iOS Simulator's CPU-only MLX): mlx_compile is Metal kernel fusion and asks for a GPU stream that doesn't exist;
+/// the runtime falls back to the uncompiled paths when compiled_* stays null. A Cooler load compiles none: an MLX
+/// closure would run its forwards' chains off the engine of our own, which runs each chain op by op instead.
+pub fn compileClosures(xfm: *Trunk, set: arch_state.CompileSet) void {
+    if (mlx.noGpuBackend() or mlx.engine.isStream(xfm.s)) return;
+    if (xfm.config.hidden_act == .gelu_approx) {
+        xfm.compileGelu();
+        xfm.compileGeglu();
+    }
+    if (xfm.moe_layers != null) xfm.compileMoeRouting();
+    arch_state.compile(xfm, set);
+}
+
 pub const LaunchRefusal = struct { err: error{ ArchitectureUnsupported, GlmKvQuantUnsupported, LaunchFlagUnsupported, ContextSizeAboveWindow }, line: []const u8 };
 
 /// Why a load of `config` is refused before it reads a weight: its arch, a launch flag or saved kv_quant it cannot act
@@ -279,6 +323,7 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
         .mtp_typical = if (settings_resolve.launch.mtp_acceptance) |m| m == .typical else false,
         .mtp_tokenv3 = if (settings_resolve.launch.mtp_acceptance) |m| m == .tokenv3 else false,
         .mtp_greedy_tail = settings_resolve.launch.mtp_greedy_tail != null,
+        .drafter = settings_resolve.launch.drafter,
         .mtp_min_depth = if (depth_bounds.active.min > 1) depth_bounds.active.min else 0,
         .mtp_max_depth = depth_bounds.active.max,
     })) |why| return .{ .err = error.LaunchFlagUnsupported, .line = why };
@@ -367,8 +412,8 @@ const LaunchPicks = struct {
     fn of(mtp_flag: ?bool, kv_flag: ?trunk.KVQuantConfig, config: *const ModelConfig) LaunchPicks {
         return .{
             .mtp = mtpChoiceFor(mtp_flag, config),
-            .acceptance = settings_resolve.acceptanceFor(config.mtp_acceptance_override),
-            .greedy_tail = settings_resolve.greedyTailFor(config.mtp_greedy_tail_override),
+            .acceptance = arch_flags.mtpAcceptanceOf(config),
+            .greedy_tail = arch_flags.greedyTailOf(config),
             .kv = trunk.KvCacheChoice.resolve(kv_flag, config.kv_quant_override),
         };
     }
@@ -1928,8 +1973,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const kv_quant_config = kv_cache.config;
     const mtp = mtpChoiceFor(params.mtp, params.config);
     const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming, params.config.stream_mtp_head);
-    const acceptance = settings_resolve.acceptanceFor(params.config.mtp_acceptance_override);
-    const greedy_tail = settings_resolve.greedyTailFor(params.config.mtp_greedy_tail_override);
+    const acceptance = arch_flags.mtpAcceptanceOf(params.config);
+    const greedy_tail = arch_flags.greedyTailOf(params.config);
     // GLM has no MTP head; the server's `MTP: off` line already says so.
     if (!arch_config.fact(params.config, "no_mtp_head")) log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
         if (mtp_streaming_off) "off" else mtp.label(), if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
@@ -1961,21 +2006,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     logWiredPolicy(mlx.applyWiredPolicy());
     load_clock.wiredDone(wired_t0);
 
-    // JIT-compile activation kernels. These are bound to THIS thread's mlx
-    // stream — that's exactly the point of doing them here. Skipped entirely
-    // when there's no GPU backend (iOS Simulator's CPU-only MLX): mlx_compile
-    // is Metal kernel fusion and requests a GPU stream that doesn't exist; the
-    // runtime falls back to the uncompiled paths when compiled_* stays null.
-    if (!mlx.noGpuBackend()) {
-        if (params.config.hidden_act == .gelu_approx) {
-            xfm_ptr.compileGelu();
-            xfm_ptr.compileGeglu();
-        }
-        if (xfm_ptr.moe_layers != null) {
-            xfm_ptr.compileMoeRouting();
-        }
-        arch_state.compile(xfm_ptr, .all);
-    }
+    compileClosures(xfm_ptr, .all);
 
     if (trunk.diagEnvOn("SUSHI_PREFILL_UBENCH")) prefillUbench(sch.allocator, xfm_ptr, params.config, params.tok);
     arch_load.warmUbench(sch.allocator, xfm_ptr, kv_quant_config, params.tok);
@@ -2347,24 +2378,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // on this thread's stream. ~600-900 ms at boot but the first user request
     // skips a cold path.
     if (params.warmup_eager) {
-        const warmup_start = std.Io.Timestamp.now(sch.io, .awake);
-        xfm_ptr.warmup() catch |err| {
-            var cause: [512]u8 = undefined;
-            log.warn("Warmup failed ({s}: {s}); continuing without it — first request may be slow.\n", .{ @errorName(err), latchedCause(&cause) });
-        };
-        const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
-        log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
-        if (mtp_enabled) {
-            const cap = @min(
-                generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
-                generate_mod.Generator.mtpVerifyDraftsMax(params.config),
-            );
-            arch_load.warmVerify(params.config, xfm_ptr, cap, kv_quant_config) catch |err| {
-                var cause: [512]u8 = undefined;
-                log.warn("[spec-warmup] failed ({s}: {s}); the first round at each width pays its kernel compile inside the round.\n", .{ @errorName(err), latchedCause(&cause) });
-            };
-        }
-        arch_load.warmSpec(sch.io, params.config, xfm_ptr, aux_head, kv_quant_config);
+        const verify_cap: ?u32 = if (mtp_enabled) @min(
+            generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
+            generate_mod.Generator.mtpVerifyDraftsMax(params.config),
+        ) else null;
+        try warmLoad(sch.io, params.config, xfm_ptr, verify_cap, aux_head, kv_quant_config);
     }
     settleLoadLatch(had_error_at_start);
 

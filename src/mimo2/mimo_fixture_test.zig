@@ -116,7 +116,7 @@ test "mimo_v2 EXL3 real shard routed fork matches CPU dump oracle" {
         while (it.next()) |entry| try weights.map.put(entry.key_ptr.*, entry.value_ptr.*);
     }
     var buf: [256]u8 = undefined;
-    const bank = try loadSwitchMlpBank(&weights, &buf, "model", layer, true, &config);
+    const bank = try loadSwitchMlpBank(&weights, &buf, "model", layer, true, &config, s);
     var h = try MimoExl3MoeHarness.init(alloc, s, .{ .n = 40 }, 1, 191, .mcg);
     defer h.deinit();
     h.xfm.config = config;

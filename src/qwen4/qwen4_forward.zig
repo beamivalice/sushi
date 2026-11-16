@@ -6,6 +6,7 @@ const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const qwen4_ssm_group = @import("qwen4_ssm_group.zig");
 const trunk_mod = @import("../trunk.zig");
+const QsaCfgCache = trunk_mod.QsaCfgCache;
 const forward_diag = @import("../forward_diag.zig");
 const linear_mod = @import("../linear.zig");
 const Linear = linear_mod.Linear;
@@ -348,6 +349,8 @@ pub fn gdnGateClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_
 
 /// qwen4_exp: compile the four hyper-connection elementwise tails.
 pub fn compileQwen4Hc(self: *Trunk) void {
+    // The KLD loader calls this beside model_load.compileClosures: a Cooler load applies no MLX closure.
+    if (mlx.engine.isStream(self.s)) return;
     const specs = .{
         .{ &self.arch_state.qwen4.compiled_hc_silu, &qwen4_hc.hcSiluCallback, true },
         .{ &self.arch_state.qwen4.compiled_hc_mix, &qwen4_hc.hcMixCallback, false },
@@ -386,10 +389,13 @@ pub fn applyClosure(compiled: ?mlx.mlx_closure, inputs: []const mlx.mlx_array) !
     const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var out_vec = mlx.mlx_vector_array{ .ctx = null };
+    defer if (out_vec.ctx != null) {
+        _ = mlx.mlx_vector_array_free(out_vec);
+    };
     try mlx.check(mlx.mlx_closure_apply(&out_vec, c, in_vec));
-    defer _ = mlx.mlx_vector_array_free(out_vec);
     if (mlx.mlx_vector_array_size(out_vec) != 1) return null;
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, out_vec, 0));
     return out;
 }
@@ -922,6 +928,7 @@ pub fn mtpPadSeq(self: *Trunk, arr: mlx.mlx_array, want: c_int) !mlx.mlx_array {
     const sh = mlx.getShape(arr);
     if (sh[1] == want) {
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_set(&out, arr));
         return out;
     }
@@ -929,6 +936,7 @@ pub fn mtpPadSeq(self: *Trunk, arr: mlx.mlx_array, want: c_int) !mlx.mlx_array {
     const z = mlx.mlx_array_new_int(0);
     defer _ = mlx.mlx_array_free(z);
     var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_pad(&out, arr, &[_]c_int{1}, 1, &[_]c_int{0}, 1, &high, 1, z, "constant", self.s));
     return out;
 }
@@ -1935,12 +1943,12 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
 
     const reps = [_]c_int{ 1, 1, hc };
     var h = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(h);
     if (ctx.arch_ctx.qwen4.stream_in) |stream| {
         try mlx.check(mlx.mlx_array_set(&h, stream));
     } else {
         try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
     }
-    errdefer _ = mlx.mlx_array_free(h);
     if (self.arch_state.qwen4.stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
         var h32 = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
@@ -2315,7 +2323,7 @@ pub fn gatedFullAttnProjected(
             try constTableAs(self.yarn_mscale.?, mlx.mlx_array_dtype(queries), &self.yarn_mscale_cast, self.s)
         else
             null;
-        const pair = (fusedQkNormRope(self.s, queries, k_r, fa.q_norm, fa.k_norm, angles, ms, self.rms_eps_arr, h_count, kv_h, rope_dims) catch null) orelse break :blk;
+        const pair = (try fusedQkNormRope(self.s, queries, k_r, fa.q_norm, fa.k_norm, angles, ms, self.rms_eps_arr, h_count, kv_h, rope_dims)) orelse break :blk;
         _ = mlx.mlx_array_free(q_rope);
         _ = mlx.mlx_array_free(k_rope);
         q_rope = pair[0];
@@ -2335,7 +2343,7 @@ pub fn gatedFullAttnProjected(
         // rotated slice, so folding it into the angle rows scales exactly the
         // rotation and nothing else (the pass-through dims never appear).
         const angles = self.qkAngleRowsFor(rope_family, rope_dims, rope_base, rope_freqs, eff_off, seq_len, rope_mscale) catch break :blk;
-        const pair = (fusedQkNormRope256(self.s, queries, k_r, fa.q_norm, fa.k_norm, angles, self.rms_eps_arr, h_count, kv_h, seq_len, rope_dims) catch null) orelse break :blk;
+        const pair = (try fusedQkNormRope256(self.s, queries, k_r, fa.q_norm, fa.k_norm, angles, self.rms_eps_arr, h_count, kv_h, seq_len, rope_dims)) orelse break :blk;
         _ = mlx.mlx_array_free(q_rope);
         _ = mlx.mlx_array_free(k_rope);
         q_rope = pair[0];
@@ -2439,7 +2447,7 @@ pub fn gatedFullAttnProjected(
                     // to every slot in it — the tally is per REQUEST.
                     noteQsaArmForSlots(slots, .mask);
                     if (self.cost_trace_active) self.cost_attention |= 16;
-                    const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
+                    const neg_inf = try bf16Scalar(-std.math.inf(f32), self.s);
                     defer _ = mlx.mlx_array_free(neg_inf);
                     var narrowed = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_where(&narrowed, ctx.arch_ctx.qwen4.qsa_mask, stacked_mask, neg_inf, self.s));
@@ -3393,8 +3401,7 @@ fn getQkNormRopeKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 const QkFusedCfgKey = struct { hq: c_int, hk: c_int, rd: c_int, scaled: bool, dtype: mlx.mlx_dtype };
-var qk_fused_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var qk_fused_cfg_key: QkFusedCfgKey = std.mem.zeroes(QkFusedCfgKey);
+var qk_fused_cfgs = QsaCfgCache(QkFusedCfgKey, 1){};
 
 /// One fused dispatch: per-head RMSNorm + RoPE (+ optional mscale) for q AND
 /// k, emitting the transposed [1,H,1,128] layout attention consumes (at L==1
@@ -3422,9 +3429,10 @@ pub fn fusedQkNormRope(
     if (q_norm_w.ctx == null or k_norm_w.ctx == null) return null;
 
     const key = QkFusedCfgKey{ .hq = hq, .hk = hk, .rd = rd, .scaled = ms != null, .dtype = dt };
-    if (qk_fused_cfg == null or !std.meta.eql(qk_fused_cfg_key, key)) {
-        if (qk_fused_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const qk_fused_cfg = blk: {
+        if (qk_fused_cfgs.get(key)) |hit| break :blk hit[0];
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const oq_shape = [_]c_int{ 1, hq, 1, 128 };
         const ok_shape = [_]c_int{ 1, hk, 1, 128 };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &oq_shape, 4, dt));
@@ -3435,9 +3443,9 @@ pub fn fusedQkNormRope(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HQ", hq));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RD", rd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SCALED", if (ms != null) 1 else 0));
-        qk_fused_cfg = config;
-        qk_fused_cfg_key = key;
-    }
+        qk_fused_cfgs.put(key, .{config});
+        break :blk config;
+    };
 
     const kernel = try getQkNormRopeKernel();
     // The unscaled variant never reads `ms` (SCALED == 0 guards the index),
@@ -3447,10 +3455,12 @@ pub fn fusedQkNormRope(
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qk_fused_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qk_fused_cfg, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
     var oq = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(oq);
     var ok = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(ok);
     try mlx.check(mlx.mlx_vector_array_get(&oq, outputs_vec, 0));
     try mlx.check(mlx.mlx_vector_array_get(&ok, outputs_vec, 1));
     if (!qk_fused_engaged) {
@@ -3570,8 +3580,7 @@ fn getQkNormRope256Kernel() !mlx.mlx_fast_metal_kernel {
 }
 
 const Qk256CfgKey = struct { hq: c_int, hk: c_int, seq: c_int, rd: c_int, dtype: mlx.mlx_dtype };
-var qk256_fused_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var qk256_fused_cfg_key: Qk256CfgKey = std.mem.zeroes(Qk256CfgKey);
+var qk256_fused_cfgs = QsaCfgCache(Qk256CfgKey, 1){};
 
 /// One fused dispatch for hd-256 heads at S in 1..16: per-head RMSNorm +
 /// partial RoPE for q AND k, emitting the transposed [1,H,S,256] layout.
@@ -3600,9 +3609,10 @@ pub fn fusedQkNormRope256(
     if (q_norm_w.ctx == null or k_norm_w.ctx == null) return null;
 
     const key = Qk256CfgKey{ .hq = hq, .hk = hk, .seq = seq, .rd = rd, .dtype = dt };
-    if (qk256_fused_cfg == null or !std.meta.eql(qk256_fused_cfg_key, key)) {
-        if (qk256_fused_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const qk256_fused_cfg = blk: {
+        if (qk256_fused_cfgs.get(key)) |hit| break :blk hit[0];
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const oq_shape = [_]c_int{ 1, hq, seq, 256 };
         const ok_shape = [_]c_int{ 1, hk, seq, 256 };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &oq_shape, 4, dt));
@@ -3614,9 +3624,9 @@ pub fn fusedQkNormRope256(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HK", hk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "S", seq));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RD", rd));
-        qk256_fused_cfg = config;
-        qk256_fused_cfg_key = key;
-    }
+        qk256_fused_cfgs.put(key, .{config});
+        break :blk config;
+    };
 
     const kernel = try getQkNormRope256Kernel();
     const inputs_arr = [_]mlx.mlx_array{ q_in, k_in, q_norm_w, k_norm_w, angles, eps_arr };
@@ -3624,10 +3634,12 @@ pub fn fusedQkNormRope256(
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qk256_fused_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qk256_fused_cfg, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
     var oq = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(oq);
     var ok = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(ok);
     try mlx.check(mlx.mlx_vector_array_get(&oq, outputs_vec, 0));
     try mlx.check(mlx.mlx_vector_array_get(&ok, outputs_vec, 1));
     if (!qk256_fused_engaged) {
@@ -3687,9 +3699,11 @@ fn qkComposedRef(
     defer _ = mlx.mlx_array_free(t);
     try mlx.check(mlx.mlx_transpose_axes(&t, normed, &perm, 4, s));
     var roped = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(roped);
     try mlx.check(mlx.mlx_fast_rope(&roped, t, rd, false, base, 1.0, offset, freqs, s));
     if (ms) |m| {
         var scaled = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(scaled);
         try mlx.check(mlx.mlx_multiply(&scaled, roped, m, s));
         _ = mlx.mlx_array_free(roped);
         return scaled;

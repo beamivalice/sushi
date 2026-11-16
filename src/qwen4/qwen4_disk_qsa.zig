@@ -199,8 +199,9 @@ fn writeQsaHistory(self: *DiskTier, dir_rel: []const u8, cp: *const trunk_mod.SS
 }
 
 pub fn loadQsaHistoryFile(self: *DiskTier, id: u64, n_layers: usize) !trunk_mod.SSMCheckpoint {
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
+    const rd = self.reading();
+    defer rd.end();
+    const cpu = rd.s;
     const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors\x00", .{ self.root, id });
     defer self.allocator.free(path);
     if (self.fs.size(path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
