@@ -285,6 +285,7 @@ fn outstandingGrowth(commit: u64, resident: u64) u64 {
 
 fn slotOutstandingGrowth(s: *const Slot) u64 {
     var resident = s.cache.residentBytes();
+    // A running request's own state (DeepSeek's decode state too) exists and `requestBytes` bills it.
     resident +|= sched.requestBytes(s);
     return outstandingGrowth(s.growth_commit, resident);
 }

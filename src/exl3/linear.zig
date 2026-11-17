@@ -447,9 +447,9 @@ const Host = struct {
         for (svh) |*v| v.* = exl3.f32ToF16Bits((if (rnd.boolean()) @as(f32, 1) else -1) * (0.5 + rnd.float(f32)));
         const g: c_int = @intCast(groups);
         return .{ .words = words, .suh = suh, .svh = svh, .p = .{
-            .trellis = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ g, @intCast(in / 16), @intCast(out / 16), @intCast(n) }, 4, .uint16),
-            .suh = mlx.mlx_array_new_data(suh.ptr, &[_]c_int{ g, @intCast(in) }, 2, .float16),
-            .svh = mlx.mlx_array_new_data(svh.ptr, &[_]c_int{ g, @intCast(out) }, 2, .float16),
+            .trellis = try host_side.made(mlx.mlx_array_new_data(words.ptr, &[_]c_int{ g, @intCast(in / 16), @intCast(out / 16), @intCast(n) }, 4, .uint16)),
+            .suh = try host_side.made(mlx.mlx_array_new_data(suh.ptr, &[_]c_int{ g, @intCast(in) }, 2, .float16)),
+            .svh = try host_side.made(mlx.mlx_array_new_data(svh.ptr, &[_]c_int{ g, @intCast(out) }, 2, .float16)),
         } };
     }
 
@@ -805,7 +805,7 @@ fn exactRowsCase() !void {
         defer h.deinit();
         const xb = try alloc.alloc(u16, 8 * sh[0]);
         for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4);
-        const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 8, @intCast(sh[0]) }, 2, .bfloat16);
+        const x = try host_side.made(mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 8, @intCast(sh[0]) }, 2, .bfloat16));
         defer _ = mlx.mlx_array_free(x);
         var solo: [8][]const f32 = undefined;
         var solo_arrays: [8]mlx.mlx_array = undefined;
@@ -847,7 +847,7 @@ fn exactRowsCase() !void {
     const stacked = Shared{ .p = .{ .trellis = h.p.trellis, .suh = tiled, .svh = h.p.svh }, .cols = .{ 0, 1280, 1792, 2304, 0 }, .count = 3 };
     const xb = try alloc.alloc(u16, 8 * in);
     for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4);
-    const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 8, @intCast(in) }, 2, .bfloat16);
+    const x = try host_side.made(mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 8, @intCast(in) }, 2, .bfloat16));
     defer _ = mlx.mlx_array_free(x);
     var want: [3][8][]const f32 = undefined;
     var want_arrays: [24]mlx.mlx_array = undefined;
@@ -1012,7 +1012,7 @@ fn expandedCase(s: mlx.mlx_stream) !void {
                 f.* = (rnd.float(f32) * 2 - 1) * 4;
                 bits.* = bf16Bits(f.*);
             }
-            const x = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(xf.ptr) else @ptrCast(xb.ptr), &[_]c_int{ @intCast(sh.groups), @intCast(rows), @intCast(sh.in) }, 3, dt);
+            const x = try host_side.made(mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(xf.ptr) else @ptrCast(xb.ptr), &[_]c_int{ @intCast(sh.groups), @intCast(rows), @intCast(sh.in) }, 3, dt));
             defer _ = mlx.mlx_array_free(x);
             const ns = rows * hc * sh.out;
             const sf = try alloc.alloc(f32, ns);
@@ -1021,15 +1021,15 @@ fn expandedCase(s: mlx.mlx_stream) !void {
                 bits.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
                 if (dt == .float32) f.* = (rnd.float(f32) * 2 - 1) * 3 else f.* = bf16ToF32(bits.*);
             }
-            const streams = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(sf.ptr) else @ptrCast(sb.ptr), &[_]c_int{ @intCast(rows), @intCast(hc), @intCast(sh.out) }, 3, dt);
+            const streams = try host_side.made(mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(sf.ptr) else @ptrCast(sb.ptr), &[_]c_int{ @intCast(rows), @intCast(hc), @intCast(sh.out) }, 3, dt));
             defer _ = mlx.mlx_array_free(streams);
             const postv = try alloc.alloc(f32, rows * hc);
             for (postv) |*v| v.* = rnd.float(f32) * 2;
             const combv = try alloc.alloc(f32, rows * hc * hc);
             for (combv) |*v| v.* = rnd.float(f32);
-            const post = mlx.mlx_array_new_data(postv.ptr, &[_]c_int{ @intCast(rows), @intCast(hc) }, 2, .float32);
+            const post = try host_side.made(mlx.mlx_array_new_data(postv.ptr, &[_]c_int{ @intCast(rows), @intCast(hc) }, 2, .float32));
             defer _ = mlx.mlx_array_free(post);
-            const comb = mlx.mlx_array_new_data(combv.ptr, &[_]c_int{ @intCast(rows), @intCast(hc), @intCast(hc) }, 3, .float32);
+            const comb = try host_side.made(mlx.mlx_array_new_data(combv.ptr, &[_]c_int{ @intCast(rows), @intCast(hc), @intCast(hc) }, 3, .float32));
             defer _ = mlx.mlx_array_free(comb);
             const e: project_rows.Expand = .{ .x = streams, .post = post, .comb = comb };
 
@@ -1102,11 +1102,11 @@ fn normedCase(s: mlx.mlx_stream) !void {
         defer h.deinit();
         const suh_rows = try alloc.alloc(u16, sh.widths.len * sh.in);
         for (0..sh.widths.len) |i| @memcpy(suh_rows[i * sh.in ..][0..sh.in], h.suh);
-        const tiled = mlx.mlx_array_new_data(suh_rows.ptr, &[_]c_int{ @intCast(sh.widths.len), @intCast(sh.in) }, 2, .float16);
+        const tiled = try host_side.made(mlx.mlx_array_new_data(suh_rows.ptr, &[_]c_int{ @intCast(sh.widths.len), @intCast(sh.in) }, 2, .float16));
         defer _ = mlx.mlx_array_free(tiled);
         const stacked = Shared{ .p = .{ .trellis = h.p.trellis, .suh = tiled, .svh = h.p.svh }, .cols = cols, .count = sh.widths.len };
         const eps_v = [_]f32{ 1e-6, 0 };
-        const eps = mlx.mlx_array_new_data(&eps_v, &[_]c_int{2}, 1, .float32);
+        const eps = try host_side.made(mlx.mlx_array_new_data(&eps_v, &[_]c_int{2}, 1, .float32));
         defer _ = mlx.mlx_array_free(eps);
         for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
             const wf = try alloc.alloc(f32, sh.widths[0]);
@@ -1115,7 +1115,7 @@ fn normedCase(s: mlx.mlx_stream) !void {
                 f.* = 0.5 + rnd.float(f32);
                 bits.* = bf16Bits(f.*);
             }
-            const w = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(wf.ptr) else @ptrCast(wb.ptr), &[_]c_int{@intCast(sh.widths[0])}, 1, dt);
+            const w = try host_side.made(mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(wf.ptr) else @ptrCast(wb.ptr), &[_]c_int{@intCast(sh.widths[0])}, 1, dt));
             defer _ = mlx.mlx_array_free(w);
             for ([_]Opts{ .{}, exact, .{ .rows = .{ .exact = true, .wide = true } } }) |opts| for ([_]usize{ 1, 3, 8 }) |rows| for ([_]f32{ 4, 1e-3 }) |amp| {
                 const xf = try alloc.alloc(f32, rows * sh.in);
@@ -1124,7 +1124,7 @@ fn normedCase(s: mlx.mlx_stream) !void {
                     f.* = (rnd.float(f32) * 2 - 1) * amp;
                     bits.* = bf16Bits(f.*);
                 }
-                const x = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(xf.ptr) else @ptrCast(xb.ptr), &[_]c_int{ @intCast(rows), @intCast(sh.in) }, 2, dt);
+                const x = try host_side.made(mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(xf.ptr) else @ptrCast(xb.ptr), &[_]c_int{ @intCast(rows), @intCast(sh.in) }, 2, dt));
                 defer _ = mlx.mlx_array_free(x);
                 var want: [SHARED_MAX]mlx.mlx_array = undefined;
                 try linearSharedWith(s, x, stacked, dec, want[0..sh.widths.len], opts);
@@ -1180,7 +1180,7 @@ fn pairCase(s: mlx.mlx_stream) !void {
         for ([_]Opts{ .{}, exact, .{ .rows = .{ .exact = true, .wide = true } } }) |opts| for ([_]usize{ 1, 3, 8, 16 }) |rows| {
             const xb = try alloc.alloc(u16, sh.groups * rows * sh.in);
             for (xb) |*v| v.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4);
-            const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ @intCast(sh.groups), @intCast(rows), @intCast(sh.in) }, 3, .bfloat16);
+            const x = try host_side.made(mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ @intCast(sh.groups), @intCast(rows), @intCast(sh.in) }, 3, .bfloat16));
             defer _ = mlx.mlx_array_free(x);
             const got = try linearPair(s, x, ha.p, hb.p, dec, dec, opts, null);
             defer if (got) |g| {

@@ -368,11 +368,11 @@ fn launch(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []const [
     }
     const fp = [2]f32{ 1.0 / temperature, top_p };
     const up = [1]u32{top_k};
-    const fparams = mlx.mlx_array_new_data(&fp, &[_]c_int{2}, 1, .float32);
+    const fparams = try mlx.newData(&fp, &[_]c_int{2}, .float32);
     defer _ = mlx.mlx_array_free(fparams);
-    const uparams = mlx.mlx_array_new_data(&up, &[_]c_int{1}, 1, .uint32);
+    const uparams = try mlx.newData(&up, &[_]c_int{1}, .uint32);
     defer _ = mlx.mlx_array_free(uparams);
-    const key_arr = mlx.mlx_array_new_data(keys.ptr, &[_]c_int{ key.rows, 2 }, 2, .uint32);
+    const key_arr = try mlx.newData(keys.ptr, &[_]c_int{ key.rows, 2 }, .uint32);
     defer _ = mlx.mlx_array_free(key_arr);
     const ins = mlx.mlx_vector_array_new_data(&.{ logits, fparams, uparams, key_arr }, 4);
     defer _ = mlx.mlx_vector_array_free(ins);
@@ -500,7 +500,7 @@ var test_routes: [4][3]usize = @splat(@splat(0));
 fn drawHost(a: std.mem.Allocator, s: mlx.mlx_stream, flat: []const f32, n_rows: usize, vocab: usize, dtype: mlx.mlx_dtype, temperature: f32, top_p: f32, top_k: u32, keys: []const [2]u32) ![]u32 {
     const scope = mlx.engine.enter(s);
     defer scope.end();
-    const f32_arr = mlx.mlx_array_new_data(flat.ptr, &[_]c_int{ @intCast(n_rows), @intCast(vocab) }, 2, .float32);
+    const f32_arr = try mlx.newData(flat.ptr, &[_]c_int{ @intCast(n_rows), @intCast(vocab) }, .float32);
     defer _ = mlx.mlx_array_free(f32_arr);
     var typed = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(typed);

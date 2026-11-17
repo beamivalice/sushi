@@ -149,7 +149,9 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `scope-state` flags a hand write of `engine.active` (anywhere outside `src/tensor/`) or of `engine.enabled`
   (outside tests): the guards of [the seam](engine-own-forward.md#the-seam) are the only writers.
   `engine-hold-end` flags a call of `engine.unhold` outside `arch_handle.engineHoldEnd` and `src/tensor/`: the last
-  hold's end also gives back the EXL3 module's engine-side arrays.
+  hold's end also gives back the EXL3 module's engine-side arrays. `engine-lifecycle` flags a load's engine step
+  (`enable`, `hold`, setting `own_weights`, `unsealed`, `seal`) outside `arch/cooler.zig` and `arch/handle.zig`;
+  `cooler-side-query` flags `cooler_ask` or `cooler_for_test` outside `cooler_side.zig`.
   `template-runtime-safety` flags a fn under `src/template/` whose body does not open with `@setRuntimeSafety(true)`,
   and any `@setRuntimeSafety(false)` there: the engine reads pack text, and in ReleaseFast only that keeps its bounds
   and overflow checks. It covers the engine's own code, not the std functions it calls (those run unchecked); that is
@@ -248,6 +250,10 @@ pass after its neighbours warm a cache. That is why a wide change and a version 
 one area does not.
 A full-suite run (series end, version bump) also sets `QWEN4_TEST_MODEL` to a Qwen cut fixture
 (`QWEN4_STQ_CUT`, then `QWEN4_STQ4_CUT`): the real-pack Qwen tests run nowhere else, and left unset they rot unseen.
+Only a box of 64 GB or more sets it: the contract holds an MLX reference load and a Cooler load of the cut at once,
+beside the served warm's widest chunk (about 6 GB of transient).
+It sets `QWEN4_BF16_TINY` to `test-fixtures/qwen4-bf16-tiny-hd256` (the HF BF16 source of the STQ hd256 tiny), so the
+Cooler contract holds the BF16 checkpoint's format at served head geometry.
 A full-suite run compares its test total (`Build Summary` plus `test-host`) with the previous full run's: an
 unexplained drop means tests were not built, and blocks the push.
 

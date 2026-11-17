@@ -71,16 +71,20 @@ without it. An arch added later joins the list in the landing that adds it.
   and a folder test needs no skip for it. A `prefix` module may declare
   `diskLayoutKey`, the arch's own SSD namespace key (DeepSeek names its drop list and arms there; `arch/prefix.zig` asks
   it, and the config's tag is the fallback). The request a slot owns beside its KV cache is `arch_state.SlotRequest`,
-  the type of the one `Ctx.request` a built arch declares (`NoRequest` when none does). A moved field leaves `Trunk` in
+  a union with a member per arch whose `Ctx` declares `request` (`NoRequest` when none does); a slot holds its own
+  arch's member, never two. A forward reaches it as `arch_state.requestOf(ctx)` (`RequestRef`), and the prefill loop
+  chunks and checkpoints by it only when the arch's `prefix` module declares `captureRequest`
+  (`prefix_arch.prefillRequest`). A moved field leaves `Trunk` in
   the commit that fills its `State`: two owners of one pointer release it twice.
 - **Load, prefill and bill hooks an arch may declare** (every one optional; the default is stated where it is called).
-  `arch.zig`: the `prefill_start_width` fact, `ubench`, `tools`, `ownStream(config)` (the stream a load runs on
-  when the arch brings one: `Trunk.init` takes the thread's GPU stream otherwise; a tower's `ownStream()` says the same
-  to the image encoder), `cooler_opt_out` (an arch on Sushi Cooler: its opt-out flag, which `arch_flags.options` parses from here, and its
-  model-settings key, checked at compile time; an arch that declares it must declare `stampCooler`, `coolerForTest`,
-  `cooler_contract` and its sched module's `coolerRows` too; `model.cooler_off` holds the archs whose flag was given, each load stamps only its own, a
-  model of another arch loads as it would and its load names the flag, and `main` pins each given flag's setting), `coolerForTest` (a test's side, set before
-  the load), `cooler_own_caps` with `coolerRestCap` (an arch that installs its forwards' pool caps itself and the cap a
+  `arch.zig`: the `prefill_start_width` fact, `ubench`, `tools` (a tower's `ownStream()` gives the image encoder its
+  stream), `cooler_opt_out` (an arch on Sushi Cooler: its opt-out flag, which `arch_flags.options` parses from here, and its
+  model-settings key, checked at compile time; an arch that declares it must declare `coolerGap` (the loads it cannot
+  run on Sushi Cooler yet, with the reason), `cooler_contract` and its sched module's `coolerRows` too; `model.cooler_off`
+  holds the archs whose flag was given, each load stamps only its own, a model of another arch loads as it would and its
+  load names the flag, and `main` pins each given flag's setting). A load's side is one decision for every arch,
+  `cooler_side.sideOf` (the opt-out, then the arch's gap, then a test's side; lint `cooler-side-query`), and its stream
+  is `cooler_side.stream`. `cooler_own_caps` with `coolerRestCap` (an arch that installs its forwards' pool caps itself and the cap a
   request's end leaves; without them `arch/cooler.zig` trims to the transient bill and caps nothing), `cooler_contract` (the fixtures and the arch's own reads the shared Sushi Cooler contract runs on). The `load` slot (`arch/load.zig`) beside its
   `weights` and `residentLoadBytes`: `drafterOff`, `stageDrafter`, `prepareDrafter`, `loadDflash`, `bindDflash`,
   `dflashRowBounds(min, max, drafter_block)`, `logLoad`, `logDflashReady`, `warmUbench`, which `model_load.zig` calls by the

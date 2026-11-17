@@ -34,11 +34,7 @@ pub fn trunk(h: Handle) *Trunk {
 /// The process-wide arrays of side `side` (1 the engine's, 0 MLX's): the EXL3 module's and the trunk's.
 fn dropHostArrays(side: u1) void {
     sushi_exl3.dropHostArrays(side);
-    @import("../trunk.zig").dropSwigluSigTables(side);
     @import("../mtp_qmv.zig").dropSide(side);
-    @import("../hc_prefill.zig").dropSide(side);
-    @import("../verify_qmm.zig").dropSide(side);
-    @import("../moe_router.zig").dropSide(side);
     inline for (comptime std.enums.values(registry.Tag)) |t| {
         if (comptime @hasDecl(registry.Mod(t), "dropHostArrays")) registry.Mod(t).dropHostArrays(side);
     }

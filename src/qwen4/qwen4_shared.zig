@@ -35,9 +35,9 @@ fn affineBank(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, rows: usize, k: 
     const shape = [_]c_int{ @intCast(rows), @intCast(k / 4) };
     const grid = [_]c_int{ @intCast(rows), @intCast(k / group) };
     return .{
-        .weight = try ops.own(mlx.mlx_array_new_data(codes.ptr, &shape, 2, .uint32)),
-        .scales = try ops.own(mlx.mlx_array_new_data(scales.ptr, &grid, 2, .bfloat16)),
-        .biases = try ops.own(mlx.mlx_array_new_data(biases.ptr, &grid, 2, .bfloat16)),
+        .weight = try ops.own(try mlx.newData(codes.ptr, &shape, .uint32)),
+        .scales = try ops.own(try mlx.newData(scales.ptr, &grid, .bfloat16)),
+        .biases = try ops.own(try mlx.newData(biases.ptr, &grid, .bfloat16)),
     };
 }
 
@@ -47,7 +47,7 @@ pub fn randomBf16(ops: *Ops, a: std.mem.Allocator, rnd: std.Random, shape: []con
     const values = try a.alloc(u16, n);
     defer a.free(values);
     for (values) |*v| v.* = bf16((rnd.float(f32) - 0.5) * spread);
-    return ops.own(mlx.mlx_array_new_data(values.ptr, shape.ptr, @intCast(shape.len), .bfloat16));
+    return ops.own(try mlx.newData(values.ptr, shape, .bfloat16));
 }
 
 /// A routed bank of `experts` at gate/up rate `n` and down rate `down_n`, random codewords at Qwen's width.
@@ -82,8 +82,8 @@ pub fn routing(ops: *Ops, rnd: std.Random, rows: usize, experts: usize) !struct 
         }
     }
     const shape = [_]c_int{ 1, @intCast(rows), topk };
-    const f32_scores = try ops.own(mlx.mlx_array_new_data(&probs, &shape, 3, .float32));
-    return .{ .ids = try ops.own(mlx.mlx_array_new_data(&ids, &shape, 3, .uint32)), .scores = try ops.cast(f32_scores, .bfloat16) };
+    const f32_scores = try ops.own(try mlx.newData(&probs, &shape, .float32));
+    return .{ .ids = try ops.own(try mlx.newData(&ids, &shape, .uint32)), .scores = try ops.cast(f32_scores, .bfloat16) };
 }
 
 pub const Weights = struct {

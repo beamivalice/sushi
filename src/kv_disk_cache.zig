@@ -3668,7 +3668,7 @@ pub const DiskTier = struct {
                 ple[0] = 1;
                 for (l.ple_prev, 0..) |t, i| ple[1 + i] = t;
                 // `mlx_array_new_data` copies, so `ple` may die at the end of this block.
-                const ple_arr = mlx.mlx_array_new_data(&ple, &[_]c_int{9}, 1, .uint32);
+                const ple_arr = try mlx.newData(&ple, &[_]c_int{9}, .uint32);
                 errdefer _ = mlx.mlx_array_free(ple_arr);
                 const key = try std.fmt.allocPrint(self.allocator, "l{d}.ple", .{li});
                 errdefer self.allocator.free(key);

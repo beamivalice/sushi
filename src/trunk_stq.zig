@@ -88,7 +88,7 @@ fn view(owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, a: m
 const testing = std.testing;
 
 fn putBank(weights: *model_mod.Weights, base: []const u8, bank: *const TestBank) !void {
-    const t = bank.tensors();
+    const t = try bank.tensors();
     inline for (.{ "trellis", "suh", "svh" }, 0..) |suffix, i| {
         const key = try std.fmt.allocPrint(weights.allocator, "{s}." ++ suffix, .{base});
         try weights.map.put(key, t[i]);

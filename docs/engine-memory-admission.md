@@ -385,7 +385,8 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   where the pools cannot cover it; its transient cap (`Config.chunkCap`, the pool inside it) is that working set; admission bills that term only past the lendable bytes, plus a decode forward's
   working set and the decode pool parked in MLX's cache (1 GiB, outside the active bytes admission reads; counted once, in the bill, and taken off the live headroom), and SSD-first its restore points' in-flight bytes ([dsv41-memory](dsv41-memory.md#borrow)).
 - DeepSeek's resident bill (`dsv41_source.sumBytes`) is page-rounded per weight mapping: a tensor from 1 MiB, and a DSpark stage's nine ragged
-  regions each ([dsv41-memory](dsv41-memory.md#owned-weights)).
+  regions each ([dsv41-memory](dsv41-memory.md#owned-weights)). Qwen's (`model.indexedResidentSplit`) rounds every
+  tensor on a Cooler load, which reads each into its own region.
 - qwen4_exp bills a warm request AFTER its restore, so a disk-restored buffer is live memory at the bill. The SSD
   tier fills buffers the slot owns (`LookupResult.slot_owned`), so its rows are credited like a checkout's: the
   first append grows each layer and its old rows are freed at that layer's eval window, which is all the bill keeps
@@ -521,7 +522,7 @@ phase installs `active - imported + (its bill + the decode pool)` and the bill I
 prefill chunk or a decode and verify forward, `visionEncodeBill` for an image encode
 ([dsv41-memory](dsv41-memory.md#transient-caps)). A refused allocation fails the request as `TransientCapExceeded`,
 a named 503. The pool is inside the cap, so a prefill's pool is no separate bill. A request's end lifts it.
-`SUSHI_DSV41_TRANSIENT_PEAK=1` logs the peak per phase, which the caps were sized from.
+`SUSHI_TRANSIENT_PEAK=1` logs the peak per phase, which the caps were sized from.
 
 ## Observing memory
 
@@ -532,7 +533,9 @@ a named 503. The pool is inside the cap, so a prefill's pool is no separate bill
 `gpu_mem.peakBytes` is MLX's peak plus the engine's pool at its fullest (`core.poolPeak`, kept where the pool's
 counters change) and the mappings it wraps; `resetPeak` starts both again, each from what it has in use (MLX's own
 reset starts from zero, so `mlx.mlx_get_peak_memory` reads at least MLX's active bytes). `/props`, `sushi kld`, the prefill trace
-and `[fwd-ubench]` read it, and `[transient-peak]` adds the pool's high-water of the phase.
+and `[fwd-ubench]` read it, and `[transient-peak]` adds the pool's high-water of the phase. The engine's pool keeps two
+high-waters, in use (`poolPeak`) and held, free buffers included (`poolHeldPeak`, what Metal counts); `peakBytes` and the
+line's `held_gb` read the held one.
 `gpu_mem.activeBytes` is MLX's active bytes plus the engine's pool buffers bound to live tensors
 (`pool_bytes - pool_free`) and the mappings it wraps as buffers of its own (`core.mappedTotal`: a Cooler load's weights and
 expert slabs, which MLX then no longer counts); `gpu_mem.cacheBytes` is MLX's cache plus the engine's free buffers (`pool_free`). Not

@@ -310,31 +310,19 @@ pub fn coolerOptOut(comptime t: Tag) ?CoolerOptOut {
 comptime {
     for (std.meta.tags(Tag)) |t| if (coolerOptOut(t)) |o| {
         const M = registry.Mod(t);
-        for ([_][]const u8{ "stampCooler", "coolerForTest", "cooler_contract" }) |decl| {
+        for ([_][]const u8{ "coolerGap", "cooler_contract" }) |decl| {
             if (!@hasDecl(M, decl)) @compileError(@tagName(t) ++ " declares the Sushi Cooler opt-out " ++ o.flag ++ " without " ++ decl);
         }
+        // Every drafter kind a Cooler load serves (DFlash2 runs on MLX only) is held to the contract, greedy and sampled.
+        if (@hasDecl(M, "drafter")) for (M.drafter.kinds) |k| if (k != .dflash2) {
+            for ([_][]const u8{ "specTokens", "specTokensWith" }) |decl| {
+                if (!@hasDecl(M.cooler_contract, decl)) @compileError(@tagName(t) ++ " serves " ++ @tagName(k) ++ " drafts on Sushi Cooler without cooler_contract." ++ decl);
+            }
+        };
         // The rows one forward of its Cooler load carries, or why one: never a silent default (`arch/sched.coolerRows`).
         if (!@hasDecl(M.sched, "coolerRows")) @compileError(@tagName(t) ++ " declares the Sushi Cooler opt-out " ++ o.flag ++ " without sched.coolerRows");
         if (@import("../model_settings.zig").findKey(&@import("../model_settings.zig").model_keys, o.setting) == null) @compileError(o.flag ++ " names no model setting " ++ o.setting);
     };
-}
-
-/// Hands the Sushi Cooler choice (`on`; when off, `by_flag` says the launch flag asked, else the model setting) to an
-/// arch that has the engine; the other archs have nothing to stamp.
-pub fn stampCooler(config: *model.ModelConfig, on: bool, by_flag: bool) void {
-    const tag = tagOf(config) orelse return;
-    switch (tag) {
-        inline else => |t| if (@hasDecl(registry.Mod(t), "stampCooler")) registry.Mod(t).stampCooler(config, on, by_flag),
-    }
-}
-
-/// A test names the side its load runs on, before the load, for any arch on Sushi Cooler (its `coolerForTest`); an
-/// arch without the engine has nothing to stamp.
-pub fn coolerForTest(config: *model.ModelConfig, on: bool) void {
-    const tag = tagOf(config) orelse return;
-    switch (tag) {
-        inline else => |t| if (@hasDecl(registry.Mod(t), "coolerForTest")) registry.Mod(t).coolerForTest(config, on),
-    }
 }
 
 /// Whether this load keeps the arch's DSpark drafter stages resident.

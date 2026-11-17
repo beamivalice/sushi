@@ -66,7 +66,7 @@ pub fn routerSwapLogits(out: *mlx.mlx_array, router_logits: mlx.mlx_array, kind:
     var neg = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(neg);
     try mlx.check(mlx.mlx_negative(&neg, wide, s));
-    const zero = mlx.mlx_array_new_float(0);
+    const zero = try mlx.newFloat(0);
     defer _ = mlx.mlx_array_free(zero);
     var softplus = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(softplus);
@@ -173,7 +173,7 @@ pub fn expertPickGpu(ids: mlx.mlx_array, logits: mlx.mlx_array, map: mlx.mlx_arr
         break :blk made;
     };
     const gap_value: f32 = @log(1.0 - @min(tolerance, expert_stream_mod.MAX_PICK_TOLERANCE));
-    const gap = mlx.mlx_array_new_data(&gap_value, &[_]c_int{1}, 1, .float32);
+    const gap = try mlx.newData(&gap_value, &[_]c_int{1}, .float32);
     defer _ = mlx.mlx_array_free(gap);
     const config = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
@@ -198,6 +198,23 @@ pub fn expertPickGpu(ids: mlx.mlx_array, logits: mlx.mlx_array, map: mlx.mlx_arr
     var picked = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&picked, outputs, 1));
     return .{ .slots = slots, .picked = picked };
+}
+
+/// `slabMoeWeights` over a rate-grouped layer's `bank`, which the expert GEMMs index by global slot.
+pub fn raggedMoeWeights(mw: *const MoeMlpWeights, raw: *const [expert_stream_mod.quant.component_count]mlx.mlx_array, bank: *const @import("sushi_exl3").Ragged) MoeMlpWeights {
+    var out = slabMoeWeights(mw, raw);
+    const first = bank.views[0];
+    out.exl3_ragged = bank.*;
+    out.switch_gate_w = first.gate.trellis;
+    out.switch_gate_s = first.gate.suh;
+    out.switch_gate_b = first.gate.svh;
+    out.switch_up_w = first.up.trellis;
+    out.switch_up_s = first.up.suh;
+    out.switch_up_b = first.up.svh;
+    out.switch_down_w = first.down.trellis;
+    out.switch_down_s = first.down.suh;
+    out.switch_down_b = first.down.svh;
+    return out;
 }
 
 pub fn slabMoeWeights(mw: *const MoeMlpWeights, raw: *const [expert_stream_mod.quant.component_count]mlx.mlx_array) MoeMlpWeights {
@@ -381,7 +398,7 @@ fn streamedExpertCompositeDown(s: mlx.mlx_stream, op: StreamedExpertOperands, ro
         var sorted_inds = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sorted_inds);
         try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, s));
-        const k_arr = mlx.mlx_array_new_int(topk);
+        const k_arr = try mlx.newInt(topk);
         defer _ = mlx.mlx_array_free(k_arr);
         var lhs_idx = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(lhs_idx);
@@ -642,7 +659,7 @@ fn gpuPickMatchesHost(comptime E: usize, comptime K: usize, seed: u64, log_sigmo
             for (&logits) |*v| if (rand.float(f32) < 0.05) {
                 v.* = -120;
             };
-            const raw = mlx.mlx_array_new_data(&logits, &[_]c_int{ 1, 1, E }, 3, .float32);
+            const raw = try mlx.newData(&logits, &[_]c_int{ 1, 1, E }, .float32);
             defer _ = mlx.mlx_array_free(raw);
             var swap = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(swap);
@@ -675,13 +692,13 @@ fn gpuPickMatchesHost(comptime E: usize, comptime K: usize, seed: u64, log_sigmo
 
         var ids_i32: [K]i32 = undefined;
         for (&ids_i32, ids) |*d, v| d.* = v;
-        const a_ids = mlx.mlx_array_new_data(&ids_i32, &[_]c_int{ 1, 1, K }, 3, .int32);
+        const a_ids = try mlx.newData(&ids_i32, &[_]c_int{ 1, 1, K }, .int32);
         defer _ = mlx.mlx_array_free(a_ids);
-        const a_logits = mlx.mlx_array_new_data(&logits, &[_]c_int{ 1, 1, E }, 3, .float32);
+        const a_logits = try mlx.newData(&logits, &[_]c_int{ 1, 1, E }, .float32);
         defer _ = mlx.mlx_array_free(a_logits);
-        const a_map = mlx.mlx_array_new_data(&map, &[_]c_int{E}, 1, .int32);
+        const a_map = try mlx.newData(&map, &[_]c_int{E}, .int32);
         defer _ = mlx.mlx_array_free(a_map);
-        const a_starved = mlx.mlx_array_new_data(&starved, &[_]c_int{E}, 1, .uint8);
+        const a_starved = try mlx.newData(&starved, &[_]c_int{E}, .uint8);
         defer _ = mlx.mlx_array_free(a_starved);
         const pick = try expertPickGpu(a_ids, a_logits, a_map, a_starved, tolerance, s);
         defer _ = mlx.mlx_array_free(pick.slots);

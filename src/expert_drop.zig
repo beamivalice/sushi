@@ -13,6 +13,11 @@ pub const DropSet = struct {
     rows: [][words]u64,
     /// Where the ranking came from, as the file states it.
     source: []u8,
+    /// The share of the routed rows the list counts that the kept experts held: how much of the routing a drop keeps.
+    kept_share: f64 = 1,
+    /// Experts the ranking kept to leave each rate group one, a less-used one dropped in each place; 0 when the plain
+    /// ranking left every group an expert.
+    moved: u32 = 0,
 
     pub fn deinit(self: *DropSet) void {
         self.allocator.free(self.rows);

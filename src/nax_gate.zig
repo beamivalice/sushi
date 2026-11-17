@@ -84,7 +84,7 @@ pub fn qsaProbeLcgBf16(s: mlx.mlx_stream, shape: []const c_int, seed: u32) ?mlx.
         state = state *% 1664525 +% 1013904223;
         x.* = @as(f32, @floatFromInt(state >> 8)) * (1.0 / 16777216.0) - 0.5;
     }
-    const host = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+    const host = mlx.newData(buf.ptr, shape, .float32) catch return null;
     defer _ = mlx.mlx_array_free(host);
     var out = mlx.mlx_array_new();
     if (mlx.mlx_astype(&out, host, .bfloat16, s) != 0) {
@@ -120,7 +120,7 @@ pub fn qsaProbeCorruptFirst(s: mlx.mlx_stream, arr: mlx.mlx_array) ?mlx.mlx_arra
     @memcpy(buf, src[0..n]);
     buf[0] += 1.0;
     const shape = mlx.getShape(arr);
-    const host = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+    const host = mlx.newData(buf.ptr, shape, .float32) catch return null;
     defer _ = mlx.mlx_array_free(host);
     var out = mlx.mlx_array_new();
     if (mlx.mlx_astype(&out, host, mlx.mlx_array_dtype(arr), s) != 0) {

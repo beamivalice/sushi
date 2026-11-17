@@ -141,6 +141,8 @@ pub const ModelConfig = struct {
     quant_group_size: u32 = 64,
     quant_mode: QuantMode = .affine,
     expert_streaming: bool = false,
+    /// The streaming plan holds every routed expert (`CachePlan.resident`): no union workspace, no misses.
+    expert_resident: bool = false,
     /// A streamed load that serves `--mtp` keeps the head, and its own routed experts, resident.
     stream_mtp_head: bool = false,
     expert_layout: expert_quant.Layout = .bf16_fused,
@@ -170,7 +172,7 @@ pub const ModelConfig = struct {
     cooler_override: ?bool = null,
     /// A Cooler setting of another arch the model's settings carry, which its load names as ignored.
     cooler_setting_stray: ?[]const u8 = null,
-    /// Who kept a Sushi Cooler load on MLX, stamped from `coolerChoice` for an arch whose own config has no such field.
+    /// Who kept a Sushi Cooler load on MLX, stamped from `coolerChoice` (`cooler_side.stamp`).
     cooler_ask: arch_config.CoolerAsk = .none,
     /// A test names the side its load runs on, before the load; a served load never sets it.
     cooler_for_test: ?bool = null,
@@ -845,10 +847,10 @@ pub const ModelConfig = struct {
         return model_settings_mod.CoolerChoice.resolve(self.cooler_flag != null, self.cooler_override);
     }
 
-    /// Hands the Sushi Cooler choice to the arch config its decode side and bills read.
+    /// Records who kept the load on MLX, which the one side decision reads (`cooler_side`).
     pub fn stampCooler(self: *ModelConfig) void {
         const choice = self.coolerChoice();
-        arch_config.stampCooler(self, choice.on, choice.source == .flag);
+        @import("cooler_side.zig").stamp(self, choice.on, choice.source == .flag);
     }
 
     /// The context an auto boot serves when memory admits it, ahead of the margined memory ceiling; 0 = none.
@@ -1846,7 +1848,7 @@ pub fn streamingWeightKey(layout: expert_quant.Layout, buf: []u8, key: []const u
 }
 
 fn foldDeltaNorm(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const one_f32 = mlx.mlx_array_new_float(1.0);
+    const one_f32 = try mlx.newFloat(1.0);
     defer _ = mlx.mlx_array_free(one_f32);
     var one = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(one);
@@ -1926,8 +1928,8 @@ fn towerQuantGroupAtLoad(key: []const u8, bf16: bool, dims: []const u64) ?u32 {
 }
 
 /// A pack's resident tensor payloads from its shard headers, with the loader's vision filter and optional native head.
-pub fn residentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool, mtp_on: bool) !ResidentSplit {
-    const split = try indexedResidentSplit(io, allocator, model_dir, null, mtp_on);
+pub fn residentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool, mtp_on: bool, engine: bool) !ResidentSplit {
+    const split = try indexedResidentSplit(io, allocator, model_dir, null, mtp_on, engine);
     return .{ .trunk = split.trunk +| (if (vision) split.vision else 0), .mtp = split.mtp, .stq_head = split.stq_head };
 }
 
@@ -1935,10 +1937,12 @@ pub fn residentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: 
 /// with the tower apart.
 pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig) !ResidentSplit {
     if (try arch_config.streamedResidentSplit(io, allocator, model_dir, config)) |split| return split;
-    return indexedResidentSplit(io, allocator, model_dir, config.expert_layout, true);
+    return indexedResidentSplit(io, allocator, model_dir, config.expert_layout, true, @import("cooler_side.zig").onEngine(config));
 }
 
-fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, streaming: ?expert_quant.Layout, mtp_on: bool) !ResidentSplit {
+/// `engine`: the load runs on the engine of our own, where a tower's requantized codes are pool tensors of their size
+/// class and its other tensors page-rounded mappings.
+fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, streaming: ?expert_quant.Layout, mtp_on: bool, engine: bool) !ResidentSplit {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
     var referenced = model_discovery.indexShardSet(io, dir) orelse return error.InvalidSafetensorsIndex;
@@ -1989,13 +1993,14 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
             const end = offsets.array.items[1].integer;
             if (start < 0 or end < start or @as(u64, @intCast(end)) > stat.size -| header_len -| 8) return error.InvalidSafetensorsHeader;
             var size: u64 = @intCast(end - start);
+            // A Cooler load reads each tensor into its own page-rounded region (`readTensorArray`, floor 1).
+            if (engine) size = expert_io.pageRoundUp(size);
             if (tensor.value_ptr.object.get("shape")) |shape| if (shape == .array and shape.array.items.len != 0 and shape.array.items[0] == .integer) {
                 size += expert_quant.rateGroupMetaBytes(canonical, std.math.cast(u64, shape.array.items[0].integer) orelse 0);
             };
             // A tower its arch requantizes at load (`media.quantGroupAtLoad`) is billed as the codes.
             if (is_vision and !@import("vision_common.zig").vision_bf16) if (@import("vision_common.zig").headerMatrix(tensor.value_ptr.object)) |m| {
-                if (towerQuantGroupAtLoad(canonical, m.bf16, &m.dims)) |group|
-                    size = @import("vision_common.zig").quantizedBytes(m.dims[0], m.dims[1], group);
+                if (towerQuantGroupAtLoad(canonical, m.bf16, &m.dims)) |group| size = @import("vision_common.zig").quantizedHeldBytes(m.dims[0], m.dims[1], group, engine);
             };
             if (std.mem.eql(u8, canonical, "language_model.lm_head.trellis")) stq_head = true;
             const bucket = if (is_mtp) &mtp else if (is_vision) &tower else &total;
@@ -2115,6 +2120,8 @@ pub fn loadWeightsForConfig(
     try archGate(config);
     if (config.pack_revision) |rev| try pack_revision_mod.verify(io, allocator, model_dir, rev);
     if (config.expert_layout == .exl3_k4 and !(arch_config.facts(config) orelse arch_config.Facts{}).reads_own_source) try @import("pack_index.zig").validateExl3Pack(io, allocator, model_dir, config);
+    const scope = @import("arch/cooler.zig").LoadScope.weights(config);
+    defer scope.end();
     if (try arch_load.weights(io, allocator, model_dir, config, load_vision)) |weights| return weights;
     return loadWeightsGeneric(io, allocator, model_dir, config, load_vision);
 }
@@ -2180,8 +2187,13 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
+    // A checkpoint's tensors are reshaped as they load (a norm's +1, a fused conv's axes): on a load whose weights are the
+    // engine's own (`arch_cooler.LoadScope`), the engine does it, as it runs every op of that load.
+    const own = mlx.engine.own_weights;
+    const s = if (own) mlx.engine.stream() else mlx.mlx_default_cpu_stream_new();
+    defer if (!own) {
+        _ = mlx.mlx_stream_free(s);
+    };
 
     // The index names the shards; anything else is dead weight (issue #274:
     // a pack shipped two shards no weight_map entry names — RAM for nothing)
@@ -2381,10 +2393,9 @@ pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset
         try reader.fill(fd, host[0..len], offset);
         // A load whose weights are the engine's makes its small tensors there too: MLX's would be imported at every use.
         const array = if (mlx.engine.own_weights)
-            mlx.engine.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), dtype)
+            mlx.made(mlx.engine.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), dtype)) catch return error.EngineWeightWrap
         else
-            mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), dtype);
-        if (array.ctx == null) return if (mlx.engine.own_weights) error.EngineWeightWrap else error.OutOfMemory;
+            mlx.newData(host.ptr, shape, dtype) catch return error.OutOfMemory;
         errdefer _ = mlx.mlx_array_free(array);
         try mlx.check(mlx.mlx_array_eval(array));
         return .{ .array = array, .bytes = if (len == 0) &.{} else mlx.mlx_array_data_uint8(array).?[0..len] };

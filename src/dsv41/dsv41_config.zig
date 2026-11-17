@@ -77,7 +77,6 @@ pub const Vision = struct {
 };
 
 /// Who asked for decode on MLX instead of the engine of our own.
-pub const MlxAsk = enum { none, flag, setting };
 
 pub const Config = struct {
     /// DeepSeek's recommended serving for V4.1-Flash: a 1M window and a generation budget of at least 256K.
@@ -141,11 +140,6 @@ pub const Config = struct {
     /// FP4 experts and FP8 trunk.
     expert_dec: ?sushi_exl3.format.Decode = null,
     trunk_dec: ?sushi_exl3.format.Decode = null,
-    /// Stamped at the load from `--ds41-mlx-engine` and the model's `ds41_cooler`; config.json never carries it.
-    mlx_ask: MlxAsk = .none,
-    /// A test names the side its load decodes on, before the load; every copy of the load's config carries it for the
-    /// load's life. A served load never sets it.
-    cooler_for_test: ?bool = null,
 
     pub fn isDsparkTarget(self: *const Config, l: usize) bool {
         for (self.dspark.targets[0..self.dspark.n_targets]) |t| if (t == l) return true;
@@ -244,6 +238,14 @@ pub const Config = struct {
 
     fn growthBytes(self: *const Config, ctx: u64) u64 {
         return ctx * (self.stateBytesPerToken() / rows_grow_div + self.worstLayerBytesPerToken());
+    }
+
+    /// `forwardCap` of a joined decode forward, a row per request at `seqs`: each request's scores and state growth are
+    /// its own, the slack is the forward's.
+    pub fn joinedCap(self: *const Config, seqs: []const u64) u64 {
+        var sum: u64 = 0;
+        for (seqs) |seq| sum +|= self.forwardCap(1, seq) - cap_slack_bytes;
+        return sum +| cap_slack_bytes;
     }
 
     /// `forwardCap` of a prefill chunk of `chunk` rows ending at `seq`: the last chunk of a prompt absorbs a tail of
@@ -605,6 +607,13 @@ test "dsv41 forward cap: covers a quarter over what every measured peak added to
         const added = gibs(m.peak) -| m.ctx * c.stateBytesPerToken();
         try testing.expect(c.forwardCap(m.rows, m.ctx) >= added * 5 / 4);
     }
+}
+
+test "dsv41 forward cap: a joined decode forward bills each request's one-row cap, the slack once" {
+    const c = try parseText(release_config);
+    for ([_]u64{ 1, 4096, 1 << 20 }) |seq| try testing.expectEqual(c.forwardCap(1, seq), c.joinedCap(&.{seq}));
+    try testing.expectEqual(c.forwardCap(1, 4096) + c.forwardCap(1, 90_000) - cap_slack_bytes, c.joinedCap(&.{ 4096, 90_000 }));
+    try testing.expectEqual(3 * c.forwardCap(1, 9_000) - 2 * cap_slack_bytes, c.joinedCap(&.{ 9_000, 9_000, 9_000 }));
 }
 
 test "dsv41 forward cap: grows with the rows and the context, a chunk's tail merge is priced, and 1M fits" {

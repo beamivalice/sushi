@@ -1013,7 +1013,7 @@ pub fn importHostBytes(
         return .{ .array = array, .aliased = true, .data_ptr = @ptrCast(bytes.ptr), .host_ptr = @ptrCast(bytes.ptr) };
     }
     const array = if (opts.copy)
-        mlx.mlx_array_new_data(@ptrCast(bytes.ptr), shape.ptr, @intCast(shape.len), dtype)
+        try mlx.newData(@ptrCast(bytes.ptr), shape, dtype)
     else
         mlx.mlx_array_new_data_managed_payload(
             @ptrCast(bytes.ptr),

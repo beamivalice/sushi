@@ -41,8 +41,18 @@ pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u
     // may release (`dsv41_borrow`); a decode forward's never does. On MLX the decode pool is parked beside either. On
     // a Cooler load the engine's pool is the cap itself (its free buffers are inside it) and MLX holds nothing.
     const forward = @max(c.forwardCap(dsv41_borrow.verify_rows, seq), c.chunkCap(chunk, seq) -| bills.borrowableBytes(config));
-    const work = forward +| (if (dsv41_borrow.ownDecode(&c)) 0 else config.expertPoolBytes());
+    const work = forward +| (if (@import("../cooler_side.zig").onEngine(config)) 0 else config.expertPoolBytes());
     return (held +| checkpointReserve(config, seq, chunk)) *| 5 / 4 +| work +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+}
+
+/// A fully resident load joins rows (`dsv41_sched.coolerRows`): a request's decode state is its own, made at its first
+/// forward, so all of it grows after admission. At one row the model's parked state is resident already.
+pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64) ?u64 {
+    _ = kv_bits;
+    const c = config.dsv41 orelse return null;
+    // As `dsv41_sched.coolerRows`: rows are a resident load's on Sushi Cooler.
+    if (!config.expert_resident or !@import("../cooler_side.zig").onEngine(config)) return null;
+    return (@as(u64, prompt_len) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
 }
 
 pub fn transientReserve(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64, seq: u64) ?u64 {
@@ -101,6 +111,9 @@ pub fn dsv41Headroom(config: *const model_mod.ModelConfig) u64 {
 /// `engine_free`, the engine's free pool buffers, comes off too: MLX makes what a borrow frees room for, and nothing on
 /// MLX's side can reclaim a buffer the engine holds.
 pub fn dsv41HeadroomFrom(ceiling: u64, active: u64, engine_free: u64, config: *const model_mod.ModelConfig) u64 {
+    // On a Cooler load the parked pool IS the engine's free buffers under its cap: off once, at the larger of the two.
+    if (@import("../cooler_side.zig").onEngine(config))
+        return bills.admissionAvailable(ceiling, active) -| @max(engine_free, config.expertPoolBytes());
     return dsv41HeadroomOf(bills.admissionAvailable(ceiling, active +| engine_free), config);
 }
 

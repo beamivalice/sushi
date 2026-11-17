@@ -210,7 +210,7 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     // Nothing is built by construction...
     try testing.expect(fx.xfm.arch_state.qwen4.mtp.?.rerank == null);
     // ...the eager build stands on its own...
-    try testing.expect(qwen4_forward.qwen4BuildDraftRerank(&fx.xfm));
+    try testing.expect(try qwen4_forward.qwen4BuildDraftRerank(&fx.xfm));
     const built = fx.xfm.arch_state.qwen4.mtp.?.rerank orelse return error.NoCoarseHead;
     try testing.expectEqual(fx.vocab, built.rows);
     try testing.expect(built.bits > 0 and built.bits < 8);
@@ -224,7 +224,7 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
 
     // One-shot: a second eager build (both load paths firing, a re-probe)
     // keeps the head it already has.
-    try testing.expect(qwen4_forward.qwen4BuildDraftRerank(&fx.xfm));
+    try testing.expect(try qwen4_forward.qwen4BuildDraftRerank(&fx.xfm));
     try testing.expectEqual(head_ctx, fx.xfm.arch_state.qwen4.mtp.?.rerank.?.q.w.ctx);
 }
 

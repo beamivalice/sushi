@@ -16,7 +16,11 @@ fn route(model_type: []const u8) error{ArchitectureUnsupported}!registry.Tag {
 
 /// Builds the model of `config.model_type` and stamps the arch it was built as, which every later dispatch reads.
 pub fn init(io: std.Io, allocator: std.mem.Allocator, config: trunk.ModelConfig, weights: *trunk.Weights, s: mlx.mlx_stream) !trunk.Trunk {
-    return switch (try route(config.model_type)) {
+    const tag = try route(config.model_type);
+    const scope = try @import("cooler.zig").LoadScope.build(&config);
+    errdefer scope.fail();
+    defer scope.end();
+    return switch (tag) {
         inline else => |t| blk: {
             var m = try registry.Mod(t).init(io, allocator, config, weights, s);
             m.arch = t;
@@ -25,18 +29,19 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: trunk.ModelConfig,
     };
 }
 
-/// The stream a load of `config` runs on when its arch brings one; null for the thread's GPU stream.
-pub fn ownStream(config: *const trunk.ModelConfig) ?mlx.mlx_stream {
-    const tag = registry.ofModelType(config.model_type) orelse return null;
-    switch (tag) {
-        inline else => |t| return if (comptime @hasDecl(registry.Mod(t), "ownStream")) registry.Mod(t).ownStream(config) else null,
-    }
-}
+/// The stream a load of `config` runs on: the engine's for a Cooler load (`cooler_side`), null for the thread's GPU
+/// stream.
+pub const ownStream = @import("../cooler_side.zig").stream;
 
 /// Frees the arch's own state, then the trunk's.
 pub fn deinit(a: Arch) void {
     switch (a) {
-        inline else => |m, t| registry.Mod(t).deinit(m),
+        inline else => |m, t| {
+            const held = mlx.engine.isStream(m.s);
+            registry.Mod(t).deinit(m);
+            // The hold `init`'s load scope took is the model's to here (`arch_cooler.LoadScope.build`).
+            if (held) @import("handle.zig").engineHoldEnd();
+        },
     }
 }
 

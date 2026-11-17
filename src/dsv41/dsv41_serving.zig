@@ -6,6 +6,7 @@ const dsv41_stream = @import("dsv41_stream.zig");
 const kernels = @import("dsv41_kernels.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
 const dsv41_pipelines = @import("dsv41_pipelines.zig");
+const cooler_pipelines = @import("../arch/cooler_pipelines.zig");
 const dsv41_config = @import("dsv41_config.zig");
 const expert_stream_mod = @import("../expert_stream.zig");
 const PrefetchCredit = @import("../prefetch_plan.zig").PrefetchCredit;
@@ -38,19 +39,11 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const stq = config.dsv41.?.expert_dec != null;
     if (!config.expert_streaming or config.expert_layout != (if (stq) expert_quant_mod.Layout.exl3_k4 else .mxfp4_w123)) return error.ExpertStreamingRequired;
     // Decided before any kernel is made: the engine records each kernel as it is created.
-    const own_decode = dsv41_borrow.ownDecode(&config.dsv41.?);
+    const own_decode = @import("../cooler_side.zig").onEngine(&config);
     // A Cooler load's weights and expert slabs are the engine's own buffers, bound, sliced and cast by the engine: an op
-    // on MLX's stream would take one as a second buffer over its pages.
-    const own_load = own_decode;
-    if (own_load) mlx.engine.hold();
-    errdefer if (own_load) @import("../arch/handle.zig").engineHoldEnd();
-    const model_stream = if (own_load) mlx.engine.stream() else s;
-    // No cap of an earlier model's forward (a load that failed in its warm, a request that never ended) meets this load.
-    if (own_load) try mlx.engine.budget(std.math.maxInt(u64));
-    // The seal of an earlier load is lifted before this one makes its first pipeline, and stands again if this one fails.
-    // A load on MLX makes none: the engine's seal, pool and budget are not its to move.
-    const making: ?mlx.engine.Seal = if (own_load) mlx.engine.unsealed() else null;
-    errdefer if (making) |seal| seal.end();
+    // on MLX's stream would take one as a second buffer over its pages. The engine's hold, budget and seal are the
+    // shared load scope's (`arch_cooler.LoadScope`).
+    const model_stream = if (own_decode) mlx.engine.stream() else s;
     if (own_decode) {
         const dsv41 = &config.dsv41.?;
         if (dsv41.expert_dec) |dec| try expert_exl3_kernels.prepareGemmNax(dec, if (config.expert_tile_order == .pair_major) .tile_major else .pack, model_stream);
@@ -63,18 +56,15 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         allocator.destroy(e);
     };
     const engine = engine_mine.?;
-    if (dsv41_borrow.keepsScales(&config.dsv41.?) and !engine.plan.resident) try engine.keepScales();
+    if (dsv41_borrow.keepsScales(&config) and !engine.plan.resident) try engine.keepScales();
     var plan = beginPipelines(allocator, &config, engine, own_decode);
     defer plan.deinit();
-    // The load drops each tensor from the map once its arrays are bound.
-    mlx.engine.own_weights = own_load;
-    defer mlx.engine.own_weights = false;
-    var mdl_mine: ?*dsv41_model.Model = try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop });
+    var mdl_mine: ?*dsv41_model.Model = try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop, .on_engine = own_decode });
     errdefer if (mdl_mine) |m| m.deinit();
     const mdl = mdl_mine.?;
     dsv41_model.logMemory(mdl);
-    const side: dsv41_borrow.DecodeSide = if (own_decode) .engine else dsv41_borrow.decodeSideOf(&config.dsv41.?);
-    if (own_decode or side != .engine) log.info("{s}\n", .{dsv41_borrow.decodeLine(side)});
+    var line_buf: [256]u8 = undefined;
+    log.info("{s}\n", .{@import("../cooler_side.zig").line(&line_buf, "[dsv41] decode forwards (one row, DSpark draft and verify rows)", &config)});
     if (own_decode) log.info("{s}\n", .{dsv41_borrow.prefill_line});
     dsv41_model.setFused(mdl, diagEnvOn("SUSHI_DSV41_COMPOSED"));
     if (diagEnvOn("SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD")) mdl.decode_engram_ahead = false;
@@ -83,6 +73,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     try dsv41_model.setIndexNax(mdl);
     try dsv41_model.setHcMixNax(mdl, kernels.hc_mix_nax_bar);
     dsv41_model.setReadDiag(diagEnvOn("SUSHI_DSV41_READ_DIAG"));
+    try applyRows(mdl, @import("dsv41_sched.zig").coolerRows(&config).rows, engine.plan.resident);
     if (mdl.ced_split) |split|
         log.info("[dsv41] CED: layers {d}..{d} run the last {d} rows of a prefill chunk\n", .{ split, mdl.cfg.layers - 1, mdl.cfg.window });
     log.info("[dsv41] prefill pipeline: {d} layers in flight\n", .{mdl.pipe_depth});
@@ -120,7 +111,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const had_error = mlx.errorPending();
     const warm_t0 = load_clock.now();
     const made_before = mlx.engine.pipelinesMade();
-    const scope = plan.settle();
+    const scope = warmScopeOf(plan.settle());
     if (warmAll(&shell, mdl, shell.arch_state.dsv41.stq_experts, scope)) {
         log.info("[dsv41] kernels warmed for 1..{d} rows{s}{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", if (scope == .mlx) " (the engine's from the manifest)" else "", clock.lap() / std.time.ns_per_ms });
         if (scope == .all and own_decode) plan.store();
@@ -134,11 +125,9 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const made = mlx.engine.pipelinesMade();
     const count_before = @import("dsv41_load.zig").takePipelinesBefore() orelse made_before.count;
     load_clock.warmDone(warm_t0, made.ns - made_before.ns + plan.made_ns, made.count - count_before + plan.made_count);
-    // The warm's transients leave the pool, so the load's memory reading is the model's.
-    if (own_load) {
-        mlx.engine.seal(true);
-        mlx.engine.trim();
-    } else _ = mlx.mlx_clear_cache();
+    // The warm's transients leave the pool, so the load's memory reading is the model's. The seal is the served warm's
+    // to set (`arch_cooler.warmEnded`), after the requests it runs.
+    if (own_decode) mlx.engine.trim() else _ = mlx.mlx_clear_cache();
     return shell;
 }
 
@@ -171,10 +160,13 @@ pub fn warmAllAt(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqS
 }
 
 fn warmForwards(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, scope: dsv41_model.WarmScope, width: usize) !void {
+    // A warm runs throwaway forwards on the model's own state, whichever request is lent around it.
+    const own = dsv41_model.lendOwn(mdl);
+    defer own.end();
     try dsv41_model.warmKernelsFor(mdl, scope);
     const after = warmAfter(scope, mdl.onEngine());
     if (after.sampled_verdict) {
-        dsv41_model.warmBudget(mdl, dsv41_config.verify_rows);
+        try dsv41_model.warmBudget(mdl, dsv41_config.verify_rows);
         try warmSampledVerdict(mdl);
         try warmSerialSampler(mdl);
     }
@@ -187,17 +179,16 @@ fn warmForwards(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqSt
 }
 
 /// The manifest to start the load from, its pipelines already being made. A load whose decode is on MLX makes none.
-pub fn beginPipelines(allocator: std.mem.Allocator, config: *const ModelConfig, engine: *const expert_stream_mod.Engine, own_decode: bool) dsv41_pipelines.Plan {
+pub fn beginPipelines(allocator: std.mem.Allocator, config: *const ModelConfig, engine: *const expert_stream_mod.Engine, own_decode: bool) cooler_pipelines.Plan {
     const io = std.Io.Threaded.global_single_threaded.io();
     const none: manifest_mod.Key = .{ .scope = @splat('0'), .build = @splat('0') };
-    if (!own_decode) return dsv41_pipelines.begin(allocator, io, null, "decode runs on MLX", none, 0);
-    const t0 = load_clock.now();
-    const scope = dsv41_pipelines.scopeKey(allocator, io, config, engine) catch |e| return dsv41_pipelines.begin(allocator, io, null, @errorName(e), none, 0);
-    const build = dsv41_pipelines.buildKey(allocator, io) catch |e| return dsv41_pipelines.begin(allocator, io, null, @errorName(e), none, 0);
-    const key_ms = (load_clock.now() - t0) / std.time.ns_per_ms;
-    var reason: []const u8 = "";
-    const root = dsv41_pipelines.openRoot(io, &reason);
-    return dsv41_pipelines.begin(allocator, io, root, reason, .{ .scope = scope, .build = build }, key_ms);
+    if (!own_decode) return cooler_pipelines.begin(allocator, io, null, "decode runs on MLX", none, 0);
+    return cooler_pipelines.beginScope(allocator, io, dsv41_pipelines.scopeKey(allocator, io, config, engine));
+}
+
+/// The warm a load runs after its manifest: the forwards on MLX only when the manifest made every engine pipeline.
+pub fn warmScopeOf(made_all: bool) dsv41_model.WarmScope {
+    return if (made_all) .mlx else .all;
 }
 
 /// The wide forwards a prompt reaches, run once on the engine at the load so their kernels compile here: a full-width
@@ -235,7 +226,7 @@ pub fn widePlans(gpa: std.mem.Allocator, width: usize, k: usize, ratios: []const
 pub fn warmWide(self: *Trunk, m: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, width: usize) !void {
     // The split chain is a wide chunk's work but no forward: it takes the budget such a chunk has, not the one the
     // decode-width forward before it left.
-    dsv41_borrow.enterWarmMlx(width, width, &m.cfg);
+    dsv41_borrow.enterWarmMlx(width, width, &m.cfg, m.onEngine());
     if (stq) |st| try st.warmSplit(m, width, true);
     const plans = try widePlans(m.gpa, width, m.layers[0].top_k, m.cfg.ratios[0..m.cfg.layers]);
     defer m.gpa.free(plans);
@@ -254,7 +245,7 @@ pub fn warmWide(self: *Trunk, m: *dsv41_model.Model, stq: ?*dsv41_stream.StqStre
             ctx.ahead_min_rows = if (i + 1 < chunks.len) chunks[i + 1] else 0;
             // The chunk's token ids, on the side the forward runs on as a request's are.
             const host = mlx.engine.enter(self.outStream());
-            const arr = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(w) }, 2, .int32);
+            const arr = try mlx.newData(ids.ptr, &[_]c_int{ 1, @intCast(w) }, .int32);
             host.end();
             defer _ = mlx.mlx_array_free(arr);
             const out = try forwardDsv41With(self, &ctx, arr, m);
@@ -364,7 +355,7 @@ pub fn warmSerialSampler(mdl: *dsv41_model.Model) !void {
         for ([_]f32{ sampling.temperature, 0 }) |temperature| {
             var drawn_at = sampling;
             drawn_at.temperature = temperature;
-            const drawn = sampler.sampleTokenLazy(logits, drawn_at, s);
+            const drawn = try sampler.sampleTokenLazy(logits, drawn_at, s);
             defer _ = mlx.mlx_array_free(drawn);
             try mlx.check(mlx.mlx_array_eval(drawn));
         }
@@ -400,7 +391,7 @@ fn warmShiftRows(mdl: *dsv41_model.Model, rows: usize, marker_mask: mlx.mlx_arra
     try mlx.check(mlx.mlx_zeros(&block, &[_]c_int{ 1, @intCast(rows), vocab }, 3, .float32, s));
     var ids_host: [dsv41_config.ring_slack]i32 = undefined;
     for (ids_host[0..rows], 0..) |*id, i| id.* = @intCast(i + 1);
-    const ids = mlx.mlx_array_new_data(&ids_host, &[_]c_int{ 1, @intCast(rows) }, 2, .int32);
+    const ids = try mlx.newData(&ids_host, &[_]c_int{ 1, @intCast(rows) }, .int32);
     defer _ = mlx.mlx_array_free(ids);
     const committed = try seen_penalty.buildCounts(a, &.{ 1, 2, 2 }, mdl.cfg.vocab);
     defer _ = mlx.mlx_array_free(committed);
@@ -474,8 +465,11 @@ pub fn tailUnread(window: usize, rows: usize, ahead_min_rows: usize, holds_point
     return window > 0 and !holds_point and rows > window and ahead_min_rows > window;
 }
 
-/// One request at a time: the model holds its state, which `cache.step` mirrors. Logits are the last row.
+/// A forward over one request's state, which `cache.step` mirrors. Logits are the last row. A slot's forward runs its
+/// request's state; a context without one (a load's warm, the CLI) runs the state lent around it, else the model's own.
 pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *dsv41_model.Model) !mlx.mlx_array {
+    const scope = try dsv41_model.enterForward(m, dsv41_state.requestOf(ctx));
+    defer scope.endForward();
     if (ctx.cache.step == 0) dsv41_model.resetState(m);
     const st = try dsv41_model.ensureState(m);
     if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
@@ -531,9 +525,55 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     return out;
 }
 
+/// Requests joined as rows of one decode forward: each steps by its one id over its own state (`dsv41_model.extendRows`).
+/// The logits f32 `[rows, vocab]` in `segs` order. A load whose experts all stay resident only: a streamed load's
+/// expert cache is one request's working set.
+/// The rows the scheduler joins (`dsv41_sched.coolerRows`): a load whose config says every expert is resident serves
+/// them (`serves_rows`); a config that says so over a streamed plan, or more rows than a joined forward carries, is
+/// refused by name.
+pub fn applyRows(mdl: *dsv41_model.Model, rows: usize, plan_resident: bool) !void {
+    if (rows <= 1) return;
+    if (!plan_resident) {
+        log.err("[cooler] the DeepSeek config claims every expert resident, but the expert plan streams them\n", .{});
+        return error.Dsv41ResidencyMismatch;
+    }
+    if (rows > mdl.maxJoinedRows()) {
+        log.err("[cooler] {d} DeepSeek rows: a joined forward carries at most {d} on this GPU\n", .{ rows, mdl.maxJoinedRows() });
+        return error.Dsv41RowsPastJoinCap;
+    }
+    mdl.serves_rows = true;
+}
+
+pub fn forwardRows(self: *Trunk, segs: []const dsv41_model.Seg) !mlx.mlx_array {
+    const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoModel;
+    if (self.expert_stream) |engine| if (!engine.plan.resident) return error.Dsv41RowsStreamed;
+    m.s = self.s;
+    // The ledger bills each request's own terms at its position (`Config.joinedCap`).
+    var seqs: [16]u64 = undefined;
+    if (segs.len > seqs.len) return error.Dsv41RowsWidth;
+    for (segs, seqs[0..segs.len]) |sg, *seq| seq.* = (sg.request.state orelse return error.Dsv41NoLiveState).n + sg.ids.len;
+    const armed = m.arm(.rows);
+    defer armed.end();
+    if (self.expert_stream) |engine| {
+        try dsv41_borrow.beforeRowsForward(engine, &self.config, &m.cfg, seqs[0..segs.len]);
+        engine.beginForward();
+    }
+    const own = m.onEngine();
+    if (own) _ = dsv41_model.ownBegin(m);
+    if (own) mlx.engine.phase(1);
+    defer mlx.engine.phase(0);
+    const joined = dsv41_model.extendRows(m, segs);
+    if (own) dsv41_model.ownEnd(m, self.s);
+    const out = try joined;
+    if (self.expert_stream) |engine| engine.finishForward(segs.len);
+    return out;
+}
+
 /// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
-pub fn dsv41DraftImpl(self: *Trunk, t1: u32) !dsv41_model.Draft {
+pub fn dsv41DraftImpl(self: *Trunk, ctx: *ForwardCtx, t1: u32) !dsv41_model.Draft {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
+    const scope = try dsv41_model.enterForward(m, dsv41_state.requestOf(ctx));
+    defer scope.endForward();
     m.s = self.s;
     if (m.onEngine()) _ = dsv41_model.ownBegin(m);
     defer if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
@@ -546,6 +586,8 @@ pub fn dsv41DraftImpl(self: *Trunk, t1: u32) !dsv41_model.Draft {
 /// f32 `[1, L, vocab]`.
 pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
+    const scope = try dsv41_model.enterForward(m, dsv41_state.requestOf(ctx));
+    defer scope.endForward();
     m.s = self.s;
     const st = try dsv41_model.ensureState(m);
     if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
@@ -578,6 +620,8 @@ pub fn verdictStream(self: *Trunk, s: mlx.mlx_stream) mlx.mlx_stream {
 /// Keeps the first `accepted + 1` rows of the open verify chunk.
 pub fn dsv41FinishImpl(self: *Trunk, ctx: *ForwardCtx, accepted: usize) !void {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
+    const scope = try dsv41_model.enterForward(m, dsv41_state.requestOf(ctx));
+    defer scope.endForward();
     m.s = self.s;
     {
         if (m.onEngine()) _ = dsv41_model.ownBegin(m);

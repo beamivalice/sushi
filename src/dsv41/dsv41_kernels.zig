@@ -5,6 +5,7 @@
 const std = @import("std");
 const log = @import("../log.zig");
 const mlx = @import("../mlx.zig");
+const arm_trial = @import("../arm_trial.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 const nax_gate = @import("../nax_gate.zig");
@@ -1720,16 +1721,6 @@ fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const 
 /// are within 1.3e-5 of the f32 truth.
 pub const attn_nax_bar: f64 = 3e-5;
 
-/// One trial of the matrix-unit arm against the SIMD kernel at the model's head shape, over the plain kernel in f32 and
-/// the packed one with its epilogue store: false when a launch fails or the heads differ by more than `bar` of the peak
-/// (the epilogue's fp8 rounding may flip a value by a quantum, so its bar is 5000 x `bar`).
-pub fn attnNaxProbe(a: std.mem.Allocator, s: mlx.mlx_stream, h: usize, d: usize, rd: usize, og: usize, bar: f64) bool {
-    const had = mlx.errorPending();
-    const ok = attnNaxTrial(a, s, h, d, rd, og, bar) catch false;
-    if (!ok) mlx.dropLatchedErrorUnless(had);
-    return ok;
-}
-
 fn maxRelDiff(got: []const f32, want: []const f32) f64 {
     var peak: f64 = 1e-30;
     var worst: f64 = 0;
@@ -2400,16 +2391,8 @@ pub fn indexNaxTrial(a: std.mem.Allocator, s: mlx.mlx_stream, spec: IndexNaxSpec
 
 /// Whether the integer matrix arm scores packed keys of every kind a trial can hold (spans inside and outside its
 /// bound, partials at the integer bound, a q off the FP4 grid) with the scalar kernel's bits on this GPU, over the whole
-/// scan and a gather: false when a launch fails or a bit differs. Its row counts take every tiling, so every kernel variant
-/// compiles at the load, not inside a request.
-pub fn indexNaxProbe(a: std.mem.Allocator, s: mlx.mlx_stream) bool {
-    const had = mlx.errorPending();
-    const ok = indexNaxTrials(a, s) catch false;
-    if (!ok) mlx.dropLatchedErrorUnless(had);
-    return ok;
-}
-
-/// Every trial of `indexNaxProbe` on stream `s`; an error is a trial that could not run.
+/// scan and a gather, on stream `s`; an error is a trial that could not run (`arm_trial.run`). Its row counts take every
+/// tiling, so every kernel variant compiles at the load, not inside a request.
 pub fn indexNaxTrials(a: std.mem.Allocator, s: mlx.mlx_stream) !bool {
     if (!indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return false;
     const specs = [_]IndexNaxSpec{
@@ -2915,15 +2898,6 @@ pub fn hcMixNax(sc: *Scope, x: A, hw: HcWeights, eps: A) !A {
 /// How far the matrix-unit mixes may sit from the ALU kernel's in the load's trial, as a fraction of the peak: both are
 /// within 1e-6 of the f64 truth.
 pub const hc_mix_nax_bar: f64 = 5e-6;
-
-/// One trial of `hcMixNax` against `hcMix` at the model's stream shape, a block with a short last tile: false when a
-/// launch fails or a mix differs by more than `bar` of the peak.
-pub fn hcMixNaxProbe(a: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, d: usize, bar: f64) bool {
-    const had = mlx.errorPending();
-    const ok = hcMixNaxTrial(a, s, hc, d, bar) catch false;
-    if (!ok) mlx.dropLatchedErrorUnless(had);
-    return ok;
-}
 
 /// Whether the matrix-unit mix stays within `bar` of the ALU kernel on stream `s`, the one the forwards run on. An
 /// error is a trial that could not run.
@@ -4574,12 +4548,12 @@ test "dsv41 hc mix on the matrix units: every mix within 2e-6 of the peak of the
 test "dsv41 hc mix NAX trial: the release shape passes it, a zero bar and a stream the kernel does not serve decline it" {
     try mlx.requireGpu();
     if (!hcMixNaxFits(4, 5120, 24)) return error.SkipZigTest;
-    try testing.expect(hcMixNaxProbe(testing.allocator, mlx.gpuStream(), 4, 5120, hc_mix_nax_bar));
-    try testing.expect(!hcMixNaxProbe(testing.allocator, mlx.gpuStream(), 4, 5120, 0));
+    try testing.expect(try arm_trial.run(mlx.gpuStream(), hcMixNaxTrial, .{ testing.allocator, mlx.gpuStream(), 4, 5120, hc_mix_nax_bar }));
+    try testing.expect(!try arm_trial.run(mlx.gpuStream(), hcMixNaxTrial, .{ testing.allocator, mlx.gpuStream(), 4, 5120, 0 }));
     // 4 x 40 is no multiple of the k split, and 9 copies make more mixes than a tile holds
     try testing.expect(!hcMixNaxFits(4, 40, 24));
     try testing.expect(!hcMixNaxFits(9, 5120, 99));
-    try testing.expect(!hcMixNaxProbe(testing.allocator, mlx.gpuStream(), 4, 40, hc_mix_nax_bar));
+    try testing.expect(!try arm_trial.run(mlx.gpuStream(), hcMixNaxTrial, .{ testing.allocator, mlx.gpuStream(), 4, 40, hc_mix_nax_bar }));
 }
 
 test "dsv41 hc wide: the release mix tile gives the previous tile's mixes at the release shapes, bit for bit" {

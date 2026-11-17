@@ -5,6 +5,7 @@
 //! `docs/pack-format.md#qwen4-stq`: `<base>.{trellis,suh,svh}` under a config `trunk_quant` block.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 const format = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
 const project_rows = @import("project_rows.zig");
@@ -208,17 +209,17 @@ pub const TestBank = struct {
     }
 
     /// The stored tensors: trellis `[in/16, out/16, n]`, `suh [in]`, `svh [out]`.
-    pub fn tensors(self: *const TestBank) [3]mlx.mlx_array {
+    pub fn tensors(self: *const TestBank) error{HostArrayRefused}![3]mlx.mlx_array {
         return .{
-            mlx.mlx_array_new_data(self.words.ptr, &[_]c_int{ @intCast(self.in / 16), @intCast(self.out / 16), @intCast(self.n) }, 3, .uint16),
-            mlx.mlx_array_new_data(self.suh.ptr, &[_]c_int{@intCast(self.in)}, 1, .float16),
-            mlx.mlx_array_new_data(self.svh.ptr, &[_]c_int{@intCast(self.out)}, 1, .float16),
+            try host_side.made(mlx.mlx_array_new_data(self.words.ptr, &[_]c_int{ @intCast(self.in / 16), @intCast(self.out / 16), @intCast(self.n) }, 3, .uint16)),
+            try host_side.made(mlx.mlx_array_new_data(self.suh.ptr, &[_]c_int{@intCast(self.in)}, 1, .float16)),
+            try host_side.made(mlx.mlx_array_new_data(self.svh.ptr, &[_]c_int{@intCast(self.out)}, 1, .float16)),
         };
     }
 
     /// The triple a loader hands the weight structs (the caller frees each array).
     pub fn triple(self: *const TestBank, s: mlx.mlx_stream) !Triple {
-        const raw = self.tensors();
+        const raw = try self.tensors();
         defer for (raw) |a| {
             _ = mlx.mlx_array_free(a);
         };
@@ -239,7 +240,7 @@ pub const TestBank = struct {
     /// The dense twin of the bank as the affine loader stores a plain weight: bf16 `[in, out]`, scales and biases empty.
     pub fn twin(self: *const TestBank, alloc: std.mem.Allocator, dec: format.Decode, s: mlx.mlx_stream) !Triple {
         const w = try self.dense(alloc, dec);
-        const f = mlx.mlx_array_new_data(w.ptr, &[_]c_int{ @intCast(self.in), @intCast(self.out) }, 2, .float32);
+        const f = try host_side.made(mlx.mlx_array_new_data(w.ptr, &[_]c_int{ @intCast(self.in), @intCast(self.out) }, 2, .float32));
         defer _ = mlx.mlx_array_free(f);
         var t: Triple = .{ .w = mlx.mlx_array_new(), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() };
         try mlx.check(mlx.mlx_astype(&t.w, f, .bfloat16, s));

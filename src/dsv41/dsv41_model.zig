@@ -7,7 +7,9 @@
 //! a time over all its rows: a layer's experts are read once per chunk.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const arm_trial = @import("../arm_trial.zig");
 const log = @import("../log.zig");
+const builtin = @import("builtin");
 const cfg_mod = @import("dsv41_config.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
 const sc_mod = @import("dsv41_scope.zig");
@@ -19,7 +21,7 @@ const owned_mod = @import("../owned_weights.zig");
 const model_mod = @import("../model.zig");
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("../expert_usage.zig");
-const transient_peak = @import("transient_peak.zig");
+const transient_peak = @import("../transient_peak.zig");
 
 const A = sc_mod.A;
 const S = sc_mod.S;
@@ -507,6 +509,9 @@ const Verify = struct {
 
 pub const State = struct {
     gpa: std.mem.Allocator,
+    /// Which state this is, for a record of it (`dsv41_prefix.Live`): a made state takes a new one, and the state keeps
+    /// it as it rolls back or moves between its model and a request.
+    id: u64 = 0,
     n: usize = 0,
     layers: []LState,
     /// The request's compressed token ids (Engram look-back).
@@ -573,6 +578,8 @@ pub const Opts = struct {
     dspark: bool = false,
     /// `--drop-expert`: the backbone routers never pick these. Read while the layers load.
     drop: ?*const expert_usage.Drop = null,
+    /// The side the load decided (`cooler_side`): the engine of our own for its whole life.
+    on_engine: bool = false,
 };
 
 pub const Want = enum { last, all };
@@ -710,6 +717,7 @@ pub const Model = struct {
     gpa: std.mem.Allocator,
     s: S,
     cfg: Config,
+    on_engine: bool,
     act: mlx.mlx_dtype,
     qat_on: bool,
     embed: Embed,
@@ -731,9 +739,13 @@ pub const Model = struct {
     /// Bytes this load built in owned regions rather than read from the shards: widened f32 tensors, shared stacks,
     /// the DSpark ragged storage.
     built: struct { widened: u64 = 0, stacks: u64 = 0, ragged: u64 = 0 } = .{},
+    /// The decode state while no request holds it: between requests it is the last one's, parked for the next turn's
+    /// rollback (`dsv41_prefix.Live`). A request takes it at its first forward (`bind`).
     dec_state: ?State = null,
-    /// Counts the states dropped: a record of the live state (`dsv41_prefix.Live`) holds only while it is unchanged.
-    state_epoch: u64 = 0,
+    /// The slot request whose state the model runs; null runs `dec_state`.
+    bound: ?*Request = null,
+    /// Tests: the error the next `pipeDrain` returns, its ring left as it was.
+    drain_fault: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
     /// Tests: named intermediates of a chunk.
     trace: ?*Trace = null,
     /// A calibration capture's view of the linears' inputs.
@@ -765,6 +777,11 @@ pub const Model = struct {
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
     /// text does not depend on the round mix (`SUSHI_DSV41_DSPARK_EXACT=0` takes the faster arms, which sum by width).
     dspark_exact: bool = true,
+    /// The load joins requests as rows of one decode forward (`extendRows`), so a one-row step takes the exact arm.
+    serves_rows: bool = false,
+    /// With joined rows, the model's own state is lent (`lendOwn`): a forward that carries no slot request (a warm, a
+    /// test, a tool's run) runs it, as every forward does at one row.
+    own_lent: bool = false,
     /// The launch mode of the trellis linears of the pass in flight (`arm` sets it).
     rows: exl3.project_rows.Mode = .{},
     /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
@@ -829,18 +846,26 @@ pub const Model = struct {
         step,
         /// A round's verify chunk.
         verify,
+        /// Requests joined as rows of one decode forward (`extendRows`).
+        rows,
     };
 
     /// A step beside a drafter and a verify row are one token by two roads, so both take the arm whose rows have
     /// their one-row bytes at every width a verify accepts (`Mode.wide`: on a machine with matrix units the rows past
     /// `PROJECT_ROWS_MAX` stay on that arm). With no drafter there are no rounds, and a step keeps the one-row arm
-    /// that costs less.
+    /// that costs less, unless the load joins requests as rows: a joined row is its request's step by two roads too.
     fn rowsOf(self: *const Model, kind: Forward) exl3.project_rows.Mode {
         return switch (kind) {
             .prefill => .{},
-            .step => .{ .exact = self.dspark != null and self.dspark_exact },
+            .step => .{ .exact = (self.dspark != null and self.dspark_exact) or self.serves_rows },
             .verify => .{ .exact = self.dspark_exact, .wide = true },
+            .rows => .{ .exact = true, .wide = true },
         };
+    }
+
+    /// The most requests one joined forward takes: the widest whose rows are their one-row steps' bits.
+    pub fn maxJoinedRows(self: *const Model) usize {
+        return @intCast(exl3.project_rows.rowsMax(self.rowsOf(.rows)));
     }
 
     /// The widest verify whose rows are their one-row step's bits: 16 on a machine with matrix units, 8 without, where
@@ -883,6 +908,11 @@ pub const Model = struct {
         pipeDrain(self) catch {};
         if (self.profile) |pf| self.gpa.destroy(pf);
         if (self.dec_state) |*st| st.deinit();
+        if (self.bound) |r| {
+            if (r.state) |*st| st.deinit();
+            r.state = null;
+            r.model = null;
+        }
         self.dropAhead();
         for (self.engrams) |*e| closeEngram(e);
         self.gpa.free(self.engrams);
@@ -946,9 +976,9 @@ pub const Model = struct {
     }
 
     /// Whether this model's forwards (decode, DSpark rounds and prefill chunks of every width) run on the engine of our
-    /// own (`src/tensor`), not on MLX: the side its load decided (`dsv41_borrow.ownDecode`), for its whole life.
+    /// own (`src/tensor`), not on MLX: the side its load decided (`cooler_side`), for its whole life.
     pub fn onEngine(self: *const Model) bool {
-        return @import("dsv41_borrow.zig").ownDecode(&self.cfg);
+        return self.on_engine;
     }
 
     /// Frees `x`, an array the model owns, ahead of `deinit`.
@@ -1185,7 +1215,7 @@ fn loadBank(m: *Model, w: *model_mod.Weights, pfx: []const u8, id: usize, compti
 fn maskDropped(m: *Model, bias: A, drop: *const expert_usage.Drop, layer: usize, experts: usize) !A {
     var mask: [expert_usage.max_experts]f32 = undefined;
     for (mask[0..experts], 0..) |*v, e| v.* = if (drop.isDropped(layer, e)) -std.math.inf(f32) else 0;
-    const arr = mlx.mlx_array_new_data(&mask, &[_]c_int{ 1, ci(experts) }, 2, .float32);
+    const arr = try mlx.newData(&mask, &[_]c_int{ 1, ci(experts) }, .float32);
     defer _ = mlx.mlx_array_free(arr);
     var made = mlx.mlx_array_new();
     const o = try m.res(mlx.mlx_add(&made, bias, arr, m.s), &made);
@@ -1346,6 +1376,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
         .gpa = gpa,
         .s = s,
         .cfg = cfg,
+        .on_engine = opts.on_engine,
         .act = opts.act,
         .qat_on = opts.qat,
         .embed = .{ .w = none },
@@ -1368,9 +1399,9 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     var freqs: [256]f32 = undefined;
     const half = c.rope_dim / 2;
     qat_mod.invFreqs(freqs[0..half], c.rope_dim, 0, c.rope_theta, 1, c.beta_fast, c.beta_slow);
-    m.rope_plain.freqs = try m.own(mlx.mlx_array_new_data(&freqs, &[_]c_int{ci(half)}, 1, .float32));
+    m.rope_plain.freqs = try m.own(try mlx.newData(&freqs, &[_]c_int{ci(half)}, .float32));
     qat_mod.invFreqs(freqs[0..half], c.rope_dim, c.yarn_orig, c.compress_rope_theta, c.yarn_factor, c.beta_fast, c.beta_slow);
-    m.rope_yarn.freqs = try m.own(mlx.mlx_array_new_data(&freqs, &[_]c_int{ci(half)}, 1, .float32));
+    m.rope_yarn.freqs = try m.own(try mlx.newData(&freqs, &[_]c_int{ci(half)}, .float32));
 
     m.layers = try gpa.alloc(Layer, c.layers);
     @memset(m.layers, std.mem.zeroes(Layer));
@@ -1462,6 +1493,9 @@ pub fn stateStream(m: *const Model) S {
     return if (m.onEngine()) mlx.engine.stream() else m.s;
 }
 
+/// The last id a made state took (inference thread).
+var state_ids: u64 = 0;
+
 pub fn newState(m: *const Model) !State {
     const c = &m.cfg;
     const layers = try m.gpa.alloc(LState, c.layers);
@@ -1497,7 +1531,8 @@ pub fn newState(m: *const Model) !State {
             rings += 1;
         }
     }
-    return .{ .gpa = m.gpa, .layers = layers, .ds = ds };
+    state_ids += 1;
+    return .{ .gpa = m.gpa, .id = state_ids, .layers = layers, .ds = ds };
 }
 
 // ── hyper-connections ────────────────────────────────────────────────────
@@ -1630,8 +1665,10 @@ fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize,
         const total = dim(kv, 0);
         groups = total / r;
         const full = groups * r;
-        const new_kv = if (full < total) sc.out(try sc.slice(kv, 0, full, total)) else none;
-        const new_gate = if (full < total) sc.out(try sc.slice(gate, 0, full, total)) else none;
+        // Both slices before either leaves the scope: a failed second one leaves the first to the scope.
+        const tail: [2]mlx.mlx_array = if (full < total) .{ try sc.slice(kv, 0, full, total), try sc.slice(gate, 0, full, total) } else .{ none, none };
+        const new_kv = if (full < total) sc.out(tail[0]) else none;
+        const new_gate = if (full < total) sc.out(tail[1]) else none;
         if (st.verify) |*v| {
             v.pend_kv[li] = sc.out(kv);
             v.pend_gate[li] = sc.out(gate);
@@ -2125,17 +2162,13 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     const qr = in[0];
     try tapInput(m, li, .q_lora, qr);
     const q_proj = try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(L), ci(H), ci(hd) });
+    if (decodeAttnFits(sc, m, st, li, L)) {
+        const dh = try decodeHeads(sc, m, st, li, h, L, in, q_proj, p0, sh, if (ride) |rs| rs.z else null);
+        return decodeOut(sc, m, li, dh, ride);
+    }
     const joint = fus and pf == null and kernels.kvRowFits(hd) and mlx.mlx_array_dtype(q_proj) == mlx.mlx_array_dtype(in[1]);
     const window = c.window;
-    // A decode block's heads read the ring after this step's write (below); that launch writes the row into it.
-    const decode_attn = fus and L <= NARROW_ROWS and rd > 0 and kernels.attnDecodeFits(hd) and ls.win.cap >= window + L - 1;
-    const ring_joint = joint and decode_attn and ls.win.dt == mlx.mlx_array_dtype(in[1]) and ls.win.width == hd and hd % 8 == 0;
-    var next_ring = none;
-    const rk: ?kernels.QKv = if (ring_joint) blk: {
-        const r = try kernels.ropeKvRing(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on, ls.win.buf, ls.win.cap, ls.win.width);
-        next_ring = r.ring;
-        break :blk .{ .q = r.q, .kv = none };
-    } else if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
+    const rk: ?kernels.QKv = if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
     const q = if (rk) |r| r.q else try ropeQ(sc, m, q_proj, rope, pos, false, .none, null);
     if (pf) |p| try p.mark(.q, &.{ qr, q });
     const kv = if (rk) |r| r.kv else try windowRow(sc, m, ly, in[1], rope, pos);
@@ -2150,51 +2183,6 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     }
 
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-    if (decode_attn) {
-        // The ring holds this chunk's rows before the kernel reads them; the heads leave inverse-rotated.
-        if (ring_joint) ls.win.replace(sc.out(next_ring)) else try ls.win.write(kv, p0, sc.s);
-        const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false);
-        if (pf) |p| try p.mark(.indexer, &.{ ls.win.buf, picks.comp_rows, picks.topk });
-        if (width_probe) |t| {
-            try t.put("a_q_{d}", .{li}, q);
-            if (picks.topk.ctx != null) try t.put("a_topk_{d}", .{li}, picks.topk);
-        }
-        var grouped = false;
-        var rode_split: ?kernels.HcSplit = null;
-        const o = try kernels.attnDecode(sc, .{
-            .q = q,
-            .ring = ls.win.buf,
-            .comp = picks.comp_rows,
-            .topk = picks.topk,
-            .sink = ly.sink,
-            .p0 = p0,
-            .window = window,
-            .scale = scale,
-            .freqs = rope,
-            .rd = rd,
-            .qat_fp8 = m.qat_on,
-            .out_dt = m.act,
-            .ratio = picks.ratio,
-            // Grouped, the heads are the output projection's banks as they leave: no transposed copy from two rows on.
-            .mixes = if (ride) |rs| .{ .z = rs.z, .hc = c.hc_mult, .iters = c.hc_iters, .eps = try kernels.hcEps(sc, c.eps, c.hc_eps) } else null,
-            .split = &rode_split,
-            .apart = m.attn_apart,
-            .groups = if (m.tap == null and m.trace == null and width_probe == null and H % c.o_groups == 0) c.o_groups else 0,
-            .grouped = &grouped,
-        });
-        if (pf) |p| try p.mark(.core, &.{o});
-        if (width_probe) |t| try t.put("a_o_{d}", .{li}, o);
-        if (ride) |rs| if (rode_split) |sp| {
-            rs.out.* = .{ .pre = sp.pre, .post = sp.post, .comb = sp.comb };
-        };
-        if (ride) |rs| if (rs.out.*) |sp| if (ly.wo_b.stq != null and m.trace == null and width_probe == null) {
-            var req: ExpandReq = .{ .e = .{ .x = rs.x, .post = sp.post, .comb = sp.comb } };
-            const y = if (grouped) try attnOutGrouped(sc, m, li, ly, o, &req) else try attnOut(sc, m, li, ly, o, m.qat_on, &req);
-            rs.expanded.* = req.done;
-            return y;
-        };
-        return if (grouped) attnOutGrouped(sc, m, li, ly, o, null) else attnOut(sc, m, li, ly, o, m.qat_on, null);
-    }
     const one_pass = fus and L > NARROW_ROWS and mlx.mlx_array_dtype(q) == .bfloat16 and kernels.attnFusedFits(H, hd);
     // The kernel's store does attnOut's rotation, round trip and layout; the heads are no longer a tensor to trace.
     const fold = one_pass and rd > 0 and m.attn_epilogue and m.trace == null and m.tap == null and kernels.attnEpilogueFits(H, hd, c.o_groups);
@@ -2250,6 +2238,150 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         try attnOut(sc, m, li, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false, null);
     if (pf) |p| try p.mark(.attn_out, &.{ out, ls.win.buf });
     return out;
+}
+
+/// Whether the decode kernel serves `L` rows of `st` at layer `li`: a decode block's heads read the ring after this step's
+/// write, which the kernel's launch makes.
+fn decodeAttnFits(sc: *const Scope, m: *const Model, st: *const State, li: usize, L: usize) bool {
+    const c = &m.cfg;
+    return fusedOn(sc, m) and L <= NARROW_ROWS and c.rope_dim > 0 and kernels.attnDecodeFits(c.head_dim) and st.layers[li].win.cap >= c.window + L - 1;
+}
+
+/// What a decode-width attention leaves before its output projection: the heads (`[og, L, in]` when `grouped`, else
+/// `[L, H * hd]`), and the hc split its kernel rode.
+const DecodeHeads = struct { o: A, grouped: bool, split: ?kernels.HcSplit };
+
+/// The decode branch of `attention` up to its heads, for one request's rows `h` over its state: `in` (`attnQuery`) and
+/// `q_proj` (`wq_b`, `[L, H, hd]`) are its rows of projections that read no state, so a joined layer makes them once
+/// for every request (`attentionRows`); `z` the mixes the kernel rides.
+fn decodeHeads(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, L: usize, in: [3]A, q_proj: A, p0: usize, sh: *Shared, z: ?A) !DecodeHeads {
+    const c = &m.cfg;
+    const ly = &m.layers[li];
+    const ls = &st.layers[li];
+    const hd = c.head_dim;
+    const rd = c.rope_dim;
+    const rope = m.ropeFor(li).freqs;
+    const pos = try sh.pos(sc, p0, L, 1);
+    const pf = prof(m, L);
+    const qr = in[0];
+    const joint = fusedOn(sc, m) and pf == null and kernels.kvRowFits(hd) and mlx.mlx_array_dtype(q_proj) == mlx.mlx_array_dtype(in[1]);
+    const ring_joint = joint and ls.win.dt == mlx.mlx_array_dtype(in[1]) and ls.win.width == hd and hd % 8 == 0;
+    var next_ring = none;
+    const rk: ?kernels.QKv = if (ring_joint) blk: {
+        const r = try kernels.ropeKvRing(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on, ls.win.buf, ls.win.cap, ls.win.width);
+        next_ring = r.ring;
+        break :blk .{ .q = r.q, .kv = none };
+    } else if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
+    const q = if (rk) |r| r.q else try ropeQ(sc, m, q_proj, rope, pos, false, .none, null);
+    if (pf) |p| try p.mark(.q, &.{ qr, q });
+    const kv = if (rk) |r| r.kv else try windowRow(sc, m, ly, in[1], rope, pos);
+    if (pf) |p| try p.mark(.kv_row, &.{kv});
+
+    if (ly.comp != null and sh.floor == null) try compress(sc, m, st, li, h, p0, in[2], sh);
+    if (pf) |p| {
+        var ev: std.ArrayList(A) = .empty;
+        defer ev.deinit(sc.a);
+        try appendStateArrays(sc.a, &ev, ls);
+        try p.mark(.compress, ev.items);
+    }
+
+    // The ring holds this chunk's rows before the kernel reads them; the heads leave inverse-rotated.
+    if (ring_joint) ls.win.replace(sc.out(next_ring)) else try ls.win.write(kv, p0, sc.s);
+    const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false);
+    if (pf) |p| try p.mark(.indexer, &.{ ls.win.buf, picks.comp_rows, picks.topk });
+    if (width_probe) |t| {
+        try t.put("a_q_{d}", .{li}, q);
+        if (picks.topk.ctx != null) try t.put("a_topk_{d}", .{li}, picks.topk);
+    }
+    var grouped = false;
+    var rode_split: ?kernels.HcSplit = null;
+    const o = try kernels.attnDecode(sc, .{
+        .q = q,
+        .ring = ls.win.buf,
+        .comp = picks.comp_rows,
+        .topk = picks.topk,
+        .sink = ly.sink,
+        .p0 = p0,
+        .window = c.window,
+        .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
+        .freqs = rope,
+        .rd = rd,
+        .qat_fp8 = m.qat_on,
+        .out_dt = m.act,
+        .ratio = picks.ratio,
+        // Grouped, the heads are the output projection's banks as they leave: no transposed copy from two rows on.
+        .mixes = if (z) |zz| .{ .z = zz, .hc = c.hc_mult, .iters = c.hc_iters, .eps = try kernels.hcEps(sc, c.eps, c.hc_eps) } else null,
+        .split = &rode_split,
+        .apart = m.attn_apart,
+        .groups = if (m.tap == null and m.trace == null and width_probe == null and c.heads % c.o_groups == 0) c.o_groups else 0,
+        .grouped = &grouped,
+    });
+    if (pf) |p| try p.mark(.core, &.{o});
+    if (width_probe) |t| try t.put("a_o_{d}", .{li}, o);
+    return .{ .o = o, .grouped = grouped, .split = rode_split };
+}
+
+/// The output projection of decode heads `dh` (every request's rows of a joined layer, or one request's), expanding into
+/// the streams where `ride` asks and the projection's finish can.
+fn decodeOut(sc: *Scope, m: *const Model, li: usize, dh: DecodeHeads, ride: ?RideSplit) !A {
+    const ly = &m.layers[li];
+    if (ride) |rs| if (dh.split) |sp| {
+        rs.out.* = .{ .pre = sp.pre, .post = sp.post, .comb = sp.comb };
+    };
+    if (ride) |rs| if (rs.out.*) |sp| if (ly.wo_b.stq != null and m.trace == null and width_probe == null) {
+        var req: ExpandReq = .{ .e = .{ .x = rs.x, .post = sp.post, .comb = sp.comb } };
+        const y = if (dh.grouped) try attnOutGrouped(sc, m, li, ly, dh.o, &req) else try attnOut(sc, m, li, ly, dh.o, m.qat_on, &req);
+        rs.expanded.* = req.done;
+        return y;
+    };
+    return if (dh.grouped) attnOutGrouped(sc, m, li, ly, dh.o, null) else attnOut(sc, m, li, ly, dh.o, m.qat_on, null);
+}
+
+/// `attentionRows` at decode widths with the projections that read no state joined: `attnQuery` and `wq_b` over every
+/// row, each request's heads over its own state (`decodeHeads`), then one output projection. Null where a request's
+/// rows are not decode rows, or a probe or the profile reads the layer per request.
+fn attentionRowsJoined(sc: *Scope, m: *const Model, li: usize, h: A, segs: []const AttnSeg, ride: ?RideSplit) !?A {
+    const L = dim(h, 0);
+    if (prof(m, L) != null or m.tap != null or m.trace != null or width_probe != null) return null;
+    for (segs) |sg| if (!decodeAttnFits(sc, m, sg.st, li, sg.rows)) return null;
+    const c = &m.cfg;
+    const ly = &m.layers[li];
+    const n = segs.len;
+    const in = try attnQuery(sc, m, ly, h);
+    const q_all = try sc.reshape(try ly.wq_b.apply(sc, in[0]), &.{ ci(L), ci(c.heads), ci(c.head_dim) });
+    const os = try sc.a.alloc(A, n);
+    defer sc.a.free(os);
+    const parts = try sc.a.alloc(A, 3 * n);
+    defer sc.a.free(parts);
+    var grouped: ?bool = null;
+    var rode: ?bool = null;
+    for (segs, 0..) |sg, i| {
+        const r0 = sg.row;
+        const r1 = sg.row + sg.rows;
+        var mine: [3]A = .{ none, none, none };
+        for (in, &mine) |a, *o| if (a.ctx != null) {
+            o.* = try sc.contiguous(try sc.slice(a, 0, r0, r1));
+        };
+        const z: ?A = if (ride) |rs| try sc.slice(rs.z, 0, r0, r1) else null;
+        const dh = try decodeHeads(sc, m, sg.st, li, try sc.slice(h, 0, r0, r1), r1 - r0, mine, try sc.contiguous(try sc.slice(q_all, 0, r0, r1)), sg.p0, sg.sh, z);
+        // Every request takes the same road: the joined output projection reads one layout.
+        if (grouped) |g| if (g != dh.grouped) return error.Dsv41RowsRoadsDiffer;
+        grouped = dh.grouped;
+        if (rode) |r| if (r != (dh.split != null)) return error.Dsv41RowsRoadsDiffer;
+        rode = dh.split != null;
+        os[i] = dh.o;
+        if (dh.split) |sp| {
+            parts[i] = sp.pre;
+            parts[n + i] = sp.post;
+            parts[2 * n + i] = sp.comb;
+        }
+    }
+    const joined: DecodeHeads = .{
+        .o = try sc.concat(os, if (grouped.?) 1 else 0),
+        .grouped = grouped.?,
+        .split = if (rode.?) .{ .pre = try sc.concat(parts[0..n], 0), .post = try sc.concat(parts[n .. 2 * n], 0), .comb = try sc.concat(parts[2 * n ..], 0) } else null,
+    };
+    return try decodeOut(sc, m, li, joined, ride);
 }
 
 /// `kernels.attnFused` over a span's `picks`: a packed store is decoded inside the kernel when `q` is the store's dtype.
@@ -2726,6 +2858,7 @@ fn waitFree(x: A) !void {
 /// Waits for every pipelined layer and for the rest queued on the stream. A failed wait still empties the ring.
 /// Returns at once with nothing in flight, so decode and verify passes pay no stream sync for it.
 pub fn pipeDrain(m: *Model) !void {
+    if (comptime builtin.is_test) if (m.drain_fault) |e| return e;
     if (m.pipe.n == 0) return;
     var first: ?anyerror = null;
     while (m.pipe.pop()) |x| waitFree(x) catch |e| {
@@ -2957,7 +3090,52 @@ fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?HcPrev, cpre: A, hc: *const Hc,
 /// A block: attention, then the FFN, each between a collapse of the stream and an expand back. The
 /// collapse weights an attention takes are the previous FFN's; the FFN's are this attention's. A DSpark stage
 /// (`ds` its window of main rows) attends over those and its own block instead of a backbone window.
-fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: usize, sh: *Shared, span: usize, ds: ?DsKeys) !Pair {
+/// The attention of a joined layer: each request's rows over its own state and positions, as its own forward runs
+/// them (its ride on its slice too), the outputs and the rides' splits joined in row order.
+fn attentionRows(sc: *Scope, m: *const Model, li: usize, h: A, segs: []const AttnSeg, ride: ?RideSplit) !A {
+    if (try attentionRowsJoined(sc, m, li, h, segs, ride)) |y| {
+        if (ride) |rs| if (rs.out.* == null) {
+            rs.expanded.* = false;
+        };
+        return y;
+    }
+    const n = segs.len;
+    const outs = try sc.a.alloc(A, n);
+    defer sc.a.free(outs);
+    const parts = try sc.a.alloc(A, 3 * n);
+    defer sc.a.free(parts);
+    var rode: ?bool = null;
+    var expanded: ?bool = null;
+    for (segs, 0..) |sg, i| {
+        const r0 = sg.row;
+        const r1 = sg.row + sg.rows;
+        var split: ?qat_mod.Split = null;
+        var exp = false;
+        const own: ?RideSplit = if (ride) |rs| .{ .z = try sc.slice(rs.z, 0, r0, r1), .out = &split, .x = try sc.slice(rs.x, 0, r0, r1), .expanded = &exp } else null;
+        outs[i] = try attention(sc, m, sg.st, li, try sc.slice(h, 0, r0, r1), sg.p0, sg.sh, sg.span, own);
+        // Every request takes the same road: one stream of the joined layer cannot be part expanded.
+        if (expanded) |e| if (e != exp) return error.Dsv41RowsRoadsDiffer;
+        expanded = exp;
+        if (rode) |r| if (r != (split != null)) return error.Dsv41RowsRoadsDiffer;
+        rode = split != null;
+        if (split) |sp| {
+            parts[i] = sp.pre;
+            parts[n + i] = sp.post;
+            parts[2 * n + i] = sp.comb;
+        }
+    }
+    if (ride) |rs| {
+        rs.expanded.* = expanded.?;
+        if (rode.?) rs.out.* = .{ .pre = try sc.concat(parts[0..n], 0), .post = try sc.concat(parts[n .. 2 * n], 0), .comb = try sc.concat(parts[2 * n ..], 0) };
+    }
+    return sc.concat(outs, 0);
+}
+
+/// One request's rows in a joined layer (`extendRows`): its state, positions and pass, and where its rows sit.
+const AttnSeg = struct { st: *State, p0: usize, sh: *Shared, span: usize, row: usize, rows: usize };
+
+/// `segs`, when any, are the requests whose rows the layer joins: the attention runs per request, the rest over all rows.
+fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: usize, sh: *Shared, span: usize, ds: ?DsKeys, segs: []const AttnSeg) !Pair {
     const ly = &m.layers[li];
     var pa = try hcPre(sc, m, x, null, cpre, &ly.hc_attn, ly.attn_norm);
     const h = pa.h;
@@ -2983,7 +3161,12 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         // The attention's rotation splits this stage's mixes beside itself, so the FFN stage reads the split.
         var rode: ?qat_mod.Split = null;
         const ride: ?RideSplit = if (pa.mix.sp == null) .{ .z = pa.mix.z, .out = &rode, .x = x, .expanded = &expanded } else null;
-        const o = if (ds) |d| try dsparkAttention(&asc, m, li, h, d, p0) else try attention(&asc, m, st, li, h, p0, sh, span, ride);
+        const o = if (ds) |d|
+            try dsparkAttention(&asc, m, li, h, d, p0)
+        else if (segs.len > 0)
+            try attentionRows(&asc, m, li, h, segs, ride)
+        else
+            try attention(&asc, m, st, li, h, p0, sh, span, ride);
         if (rode) |r| pa.mix.sp = .{ .pre = try sc.keep(asc.out(r.pre)), .post = try sc.keep(asc.out(r.post)), .comb = try sc.keep(asc.out(r.comb)) };
         break :blk try sc.keep(asc.out(o));
     };
@@ -3040,18 +3223,171 @@ fn appendVerifyArrays(gpa: std.mem.Allocator, ev: *std.ArrayList(A), st: *const 
     if (v.pend_gate[li].ctx != null) try ev.append(gpa, v.pend_gate[li]);
 }
 
+/// A slot's DeepSeek request: the decode state while the request runs. One state is resident at a time: the request
+/// takes the model's parked one at its first forward and parks it again at its end, so the next turn rolls back onto it.
+pub const Request = struct {
+    state: ?State = null,
+    /// The model the request is bound to while it holds the state.
+    model: ?*Model = null,
+    /// With joined rows, the position its restore took from a stored entry: the rows below it are that entry's, so the
+    /// SSD tier links them (at one row the live record keeps it, `dsv41_prefix.Live.base`).
+    rows_base: usize = 0,
+
+    pub fn init(_: std.mem.Allocator, _: usize) !Request {
+        return .{};
+    }
+
+    /// Parks the state on the model it came from; a request never bound frees its own.
+    pub fn deinit(self: *Request) void {
+        self.park();
+        if (self.state) |*st| st.deinit();
+        self.state = null;
+    }
+
+    /// The request ended: its state is the model's again. With joined rows it stays the request's until the slot goes
+    /// (`deinit`), so the slot's commit still writes its points from it.
+    pub fn reset(self: *Request) void {
+        if (self.model) |m| if (m.serves_rows) {
+            if (m.bound == self) m.bound = null;
+            return;
+        };
+        self.park();
+    }
+
+    pub fn residentBytes(self: *const Request) u64 {
+        return if (self.state) |*st| stateBytes(st) else 0;
+    }
+
+    pub fn position(self: *const Request) usize {
+        return if (self.state) |st| st.n else 0;
+    }
+
+    fn park(self: *Request) void {
+        const m = self.model orelse return;
+        // A failed wait still empties the ring, so nothing in flight reads the state where it moves from.
+        pipeDrain(m) catch |e| log.warn("[dsv41] a pipelined layer failed as its request ended: {s}\n", .{@errorName(e)});
+        if (m.bound == self) m.bound = null;
+        self.model = null;
+        var st = self.state orelse return;
+        self.state = null;
+        // Joined rows keep no RAM record of a finished request (its points went to the SSD tier): nothing parks.
+        if (m.serves_rows) return st.deinit();
+        // The bound request held the one resident state, so the model parked none (`bind`).
+        if (m.dec_state != null) @panic("dsv41: two decode states resident at one row");
+        m.dec_state = st;
+    }
+};
+
+/// Runs `r`'s state from here on: `r` takes the model's parked state. One state is resident at one row, so a request
+/// holds one only while bound; one that holds another is refused, never dropped beside the parked one. A load that
+/// joins rows keeps a state per request and parks none: `r` runs its own (made at its first forward), and only until
+/// the forward ends (`unbindRows`).
+pub fn bind(m: *Model, r: *Request) !void {
+    if (m.bound == r) return;
+    // Layers in flight read the state where it is: a failed wait moves nothing.
+    try pipeDrain(m);
+    if (m.serves_rows) {
+        r.model = m;
+        m.bound = r;
+        return;
+    }
+    if (r.state != null) return error.Dsv41TwoStatesResident;
+    if (m.bound) |other| other.park();
+    r.state = m.dec_state;
+    m.dec_state = null;
+    r.model = m;
+    m.bound = r;
+}
+
+/// A forward of a load that joins rows ran its request's state for its span only: off the forward, a hook lends the
+/// state it means. `was` is what was bound before the forward bound its own.
+pub fn unbindRows(m: *Model, was: ?*Request) void {
+    if (!m.serves_rows) return;
+    m.bound = was;
+    m.own_lent = false;
+}
+
+/// The model runs `r`'s state until `end`, without taking or parking any: a joined forward's request, a hook's
+/// slot, or a test's.
+pub fn lend(m: *Model, r: *Request) Lent {
+    const was: Lent = .{ .m = m, .was = m.bound, .was_own = m.own_lent };
+    m.bound = r;
+    m.own_lent = false;
+    return was;
+}
+
+/// The model runs its own state until `end`: with joined rows, what a forward that carries no slot request runs.
+pub fn lendOwn(m: *Model) Lent {
+    const was: Lent = .{ .m = m, .was = m.bound, .was_own = m.own_lent };
+    m.bound = null;
+    m.own_lent = true;
+    return was;
+}
+
+/// A forward's scope over the request its context carries (`bind`); with none, the state lent around it, else the model's
+/// own. With joined rows it ends with the forward (`Lent.endForward`); at one row the bound request stays bound.
+pub fn enterForward(m: *Model, r: ?*Request) !Lent {
+    const was: Lent = .{ .m = m, .was = m.bound, .was_own = m.own_lent };
+    if (r) |req| try bind(m, req) else if (m.serves_rows and m.bound == null) m.own_lent = true;
+    return was;
+}
+
+/// `lend` of a load that joins rows, for the request a forward context or a slot carries; null at one row, where the
+/// bound request is the one running, or with no request.
+pub fn lendFor(m: *Model, r: ?*Request) ?Lent {
+    if (!m.serves_rows) return null;
+    return lend(m, r orelse return null);
+}
+
+pub const Lent = struct {
+    m: *Model,
+    was: ?*Request,
+    was_own: bool = false,
+
+    pub fn end(self: Lent) void {
+        self.m.bound = self.was;
+        self.m.own_lent = self.was_own;
+    }
+
+    /// `end` of a forward's scope (`enterForward`): only joined rows close it.
+    pub fn endForward(self: Lent) void {
+        if (self.m.serves_rows) self.end();
+    }
+};
+
+/// A load that joins rows reads a state only where one is lent, so a hook that lends none reads no other request's.
+pub fn checkLent(m: *const Model) !void {
+    if (m.serves_rows and m.bound == null and !m.own_lent) return error.Dsv41StateNotLent;
+}
+
+/// Where the state the model runs is kept: the bound request's, else the model's own.
+fn liveSlot(m: *Model) !*?State {
+    try checkLent(m);
+    return if (m.bound) |r| &r.state else &m.dec_state;
+}
+
+/// The state the model runs; null when it holds none.
+pub fn currentState(m: *const Model) !?*const State {
+    try checkLent(m);
+    const at: *const ?State = if (m.bound) |r| &r.state else &m.dec_state;
+    return if (at.*) |*st| st else null;
+}
+
 pub fn ensureState(m: *Model) !*State {
-    if (m.dec_state == null) m.dec_state = try newState(m);
-    return &m.dec_state.?;
+    const at = try liveSlot(m);
+    if (at.* == null) at.* = try newState(m);
+    return &at.*.?;
 }
 
 pub fn resetState(m: *Model) void {
+    // Reached only through a bound forward or a hook that checked its lend.
+    const at = liveSlot(m) catch @panic("dsv41: a state reset with no state lent (Dsv41StateNotLent)");
     // Layers in flight read the state about to be freed.
     pipeDrain(m) catch {};
     m.dropAhead();
-    if (m.dec_state) |*st| st.deinit();
-    m.dec_state = null;
-    m.state_epoch +%= 1;
+    if (at.*) |*st| st.deinit();
+    at.* = null;
+    if (m.bound) |r| r.rows_base = 0;
 }
 
 /// Every decode width a request can take (1..16 rows, after a short prefill so compressed rows exist), with DSpark a
@@ -3092,7 +3428,7 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
     // The last is the held-back span a prompt's last forward runs (`prefill_plan.ssmSnapshotBackoff` + its last token).
     for ([_]usize{ n, n / 6, @import("../prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1 }) |w| {
         const was = if (m.onEngine()) ownBegin(m) else m.s;
-        warmBudget(m, w);
+        try warmBudget(m, w);
         const chunk = extend(m, wide[0..w], .last);
         if (m.onEngine()) ownEnd(m, was);
         try warmRun(try chunk);
@@ -3124,7 +3460,7 @@ pub fn warmOwnCapture(m: *Model) !void {
     {
         const was = ownBegin(m);
         defer ownEnd(m, was);
-        warmBudget(m, 1);
+        try warmBudget(m, 1);
         try warmRun(try extend(m, &.{0}, .last));
     }
     for (slots) |*sl| freeSlot(sl);
@@ -3141,7 +3477,7 @@ fn warmOwnLong(m: *Model, t1: u32) !void {
     const keys = m.index_nax_keys;
     m.index_nax_keys = 0;
     defer m.index_nax_keys = keys;
-    warmBudget(m, 1);
+    try warmBudget(m, 1);
     try warmRun(try extend(m, &.{t1}, .last));
     var sc = m.scope();
     defer sc.deinit();
@@ -3163,7 +3499,7 @@ fn warmOwnFills(m: *Model, t1: u32) !void {
     defer ownEnd(m, was);
     for (1..@min(full, m.cfg.window)) |fill| {
         st.n = fill;
-        warmBudget(m, 1);
+        try warmBudget(m, 1);
         var d = try draftHeads(m, t1, .conf);
         d.deinit();
     }
@@ -3188,7 +3524,7 @@ fn warmOwnBlocks(m: *Model, t1: u32) !void {
     for (ctx, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % c.vocab);
     // The context is a prefill chunk: the engine's where prefill is, as in a request.
     const was = if (m.onEngine()) ownBegin(m) else m.s;
-    warmBudget(m, rows);
+    try warmBudget(m, rows);
     const chunk = extend(m, ctx, .last);
     if (m.onEngine()) ownEnd(m, was);
     try warmRun(try chunk);
@@ -3228,7 +3564,7 @@ fn warmOwnStream(m: *Model) !void {
     for (ctx, 0..) |*t, i| t.* = @intCast((i * 7 + 3) % c.vocab);
     const was = ownBegin(m);
     defer ownEnd(m, was);
-    warmBudget(m, rows);
+    try warmBudget(m, rows);
     try warmRun(try extend(m, ctx, .last));
 }
 
@@ -3261,7 +3597,7 @@ fn warmOwn(m: *Model, t1: u32, schedules: enum { both, queued }) !void {
     for (arms[0..if (schedules == .both) 2 else 1]) |spec| {
         m.route_spec = spec;
         for (0..2) |_| {
-            warmBudget(m, 1);
+            try warmBudget(m, 1);
             try warmRun(try extend(m, &.{t1}, .last));
         }
         // Without a drafter no verify warms the narrow widths a prompt's tail or a cached turn's last forward takes;
@@ -3269,16 +3605,16 @@ fn warmOwn(m: *Model, t1: u32, schedules: enum { both, queued }) !void {
         if (m.dspark == null) {
             const tail: [exl3.kernels.DECODE_ROWS_MAX]u32 = @splat(t1);
             for (2..tail.len + 1) |w| {
-                warmBudget(m, w);
+                try warmBudget(m, w);
                 try warmRun(try extend(m, tail[0..w], .last));
             }
             for (0..2) |lead| for (2..tail.len + 1) |w| {
                 resetState(m);
                 if (lead > 0) {
-                    warmBudget(m, lead);
+                    try warmBudget(m, lead);
                     try warmRun(try extend(m, tail[0..lead], .last));
                 }
-                warmBudget(m, w);
+                try warmBudget(m, w);
                 try warmRun(try extend(m, tail[0..w], .last));
             };
             resetState(m);
@@ -3297,7 +3633,7 @@ fn warmOwn(m: *Model, t1: u32, schedules: enum { both, queued }) !void {
 /// A DSpark draft from `t1` and a verify of `w` rows, all kept: the draft's, and past the block its last one again,
 /// as a copy round's rows are whatever the context held.
 fn warmRound(m: *Model, t1: u32, w: usize) !void {
-    warmBudget(m, w);
+    try warmBudget(m, w);
     var d = try draftHeads(m, t1, .conf);
     defer d.deinit();
     var round: [cfg_mod.ring_slack]u32 = undefined;
@@ -3324,20 +3660,20 @@ pub fn warmOwnImages(m: *Model) !void {
     defer _ = mlx.mlx_array_free(rows);
     try mlx.check(mlx.mlx_zeros(&rows, &[_]c_int{ ci(wide), ci(c.dim) }, 2, m.act, m.s));
     for (1..exl3.kernels.DECODE_ROWS_MAX + 1) |w| {
-        warmBudget(m, w);
+        try warmBudget(m, w);
         try warmRun(try extendVision(m, ids[0..w], .last, SPAN, .{ .rows = rows, .offset = 0 }));
     }
     // A chunk whose first rows are text: the splice picks between the two.
     ids[0] = 0;
-    warmBudget(m, wide);
+    try warmBudget(m, wide);
     try warmRun(try extendVision(m, ids[0..wide], .last, SPAN, .{ .rows = rows, .offset = 0 }));
 }
 
 /// While the load's warm runs, the engine budget a request's forward of `rows` at the state's position has.
-pub fn warmBudget(m: *const Model, rows: usize) void {
+pub fn warmBudget(m: *const Model, rows: usize) !void {
     if (!m.onEngine()) return;
-    const at = if (m.dec_state) |st| st.n else 0;
-    dsv41_borrow.enterWarmMlx(rows, at + rows, &m.cfg);
+    const at = if (try currentState(m)) |st| st.n else 0;
+    dsv41_borrow.enterWarmMlx(rows, at + rows, &m.cfg, m.onEngine());
 }
 
 fn warmRun(logits: A) !void {
@@ -3555,8 +3891,8 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
 
 /// Whether no row buffer of the live state is larger than a `prompt_len`-token request's own would be, with the
 /// quarter its bill adds (`server.prefillNeededAtChunk`): the live buffers are kept whole by `rollbackState`, so only then are they paid for.
-pub fn liveRowsFit(m: *const Model, prompt_len: usize) bool {
-    const st = m.dec_state orelse return false;
+pub fn liveRowsFit(m: *const Model, prompt_len: usize) !bool {
+    const st = (try currentState(m)) orelse return false;
     for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |r| {
         const own = (prompt_len / m.ratio(li) + 1) * 5 / 4;
         if (r.cap > @max(own, 64)) return false;
@@ -3569,7 +3905,7 @@ pub fn liveRowsFit(m: *const Model, prompt_len: usize) bool {
 /// `n / ratio`, because rows are append-only. The arrays are shared, never written. Checked whole before anything
 /// changes; the caller guarantees the first `n` of `ids` are the tokens the state was built from.
 pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) !void {
-    const st = &(m.dec_state orelse return error.Dsv41NoLiveState);
+    const st = if ((try liveSlot(m)).*) |*st| st else return error.Dsv41NoLiveState;
     if (st.verify != null or slots.len != slotCount(m) or ids.len < n or st.n < n) return error.Dsv41CheckpointMismatch;
     if (m.hash != null and st.hist.items.len < n) return error.Dsv41CheckpointMismatch;
     for (st.layers, 0..) |*ls, li| {
@@ -3601,7 +3937,7 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
 /// has since moved on: the fixed arrays are shared, and the compressed and index rows are views of the live rows' first
 /// `n / ratio`, which are the point's own because rows are append-only. Checked whole before anything is taken.
 pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) !void {
-    const st = &(m.dec_state orelse return error.Dsv41NoLiveState);
+    const st = if ((try liveSlot(m)).*) |*st| st else return error.Dsv41NoLiveState;
     if (st.verify != null or fixed.len != slotCount(m) or out.len != slotCount(m) or st.n < n) return error.Dsv41CheckpointMismatch;
     for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |rows| if (rows.used < n / m.ratio(li)) return error.Dsv41CheckpointMismatch;
     errdefer for (out) |*sl| freeSlot(sl);
@@ -3637,11 +3973,7 @@ pub fn setAttnNax(m: *Model, bar: f64) !void {
         m.attn_nax = false;
         return;
     }
-    // On the engine a trial that cannot run fails the load: there a launch is never refused for the GPU's sake.
-    m.attn_nax = if (mlx.engine.isStream(m.s))
-        try kernels.attnNaxTrial(m.gpa, m.s, m.cfg.heads, m.cfg.head_dim, m.cfg.rope_dim, m.cfg.o_groups, bar)
-    else
-        kernels.attnNaxProbe(m.gpa, m.s, m.cfg.heads, m.cfg.head_dim, m.cfg.rope_dim, m.cfg.o_groups, bar);
+    m.attn_nax = try arm_trial.run(m.s, kernels.attnNaxTrial, .{ m.gpa, m.s, m.cfg.heads, m.cfg.head_dim, m.cfg.rope_dim, m.cfg.o_groups, bar });
     if (m.attn_nax) log.info("[dsv41] attention kernel on the matrix units\n", .{}) else log.debug("[dsv41] attention kernel: the matrix-unit trial differs from the SIMD kernel, SIMD serves\n", .{});
 }
 
@@ -3653,7 +3985,7 @@ pub fn setHcMixNax(m: *Model, bar: f64) !void {
         m.hc_mix_nax = false;
         return;
     }
-    m.hc_mix_nax = if (mlx.engine.isStream(m.s)) try kernels.hcMixNaxTrial(m.gpa, m.s, c.hc_mult, c.dim, bar) else kernels.hcMixNaxProbe(m.gpa, m.s, c.hc_mult, c.dim, bar);
+    m.hc_mix_nax = try arm_trial.run(m.s, kernels.hcMixNaxTrial, .{ m.gpa, m.s, c.hc_mult, c.dim, bar });
     if (m.hc_mix_nax) log.info("[dsv41] hyper-connection mix on the matrix units\n", .{}) else log.debug("[dsv41] hyper-connection mix: the matrix-unit trial differs from the ALU kernel, the ALU kernel serves\n", .{});
 }
 
@@ -3664,7 +3996,7 @@ pub fn setIndexNax(m: *Model) !void {
         m.index_nax = false;
         return;
     }
-    m.index_nax = if (mlx.engine.isStream(m.s)) try kernels.indexNaxTrials(m.gpa, m.s) else kernels.indexNaxProbe(m.gpa, m.s);
+    m.index_nax = try arm_trial.run(m.s, kernels.indexNaxTrials, .{ m.gpa, m.s });
     if (m.index_nax) log.info("[dsv41] index scan on the matrix units\n", .{}) else log.info("[dsv41] index scan: the matrix-unit trial differs from the scalar kernel, the scalar kernel serves\n", .{});
 }
 
@@ -4080,19 +4412,10 @@ pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
     return passLayer(m, p, li);
 }
 
-fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
+/// What a request's own rows take before layer `li`'s block: its Engram write and the DSpark targets its state keeps.
+fn layerInput(m: *Model, p: *Pass, li: usize, sc: *Scope, ev: *std.ArrayList(A), wait: bool) !void {
     const gpa = m.gpa;
-    if (p.tail) |t| if (li == m.ced_split.?) {
-        try cedReplay(m, p, li, t);
-        p.tail = null;
-    };
     const L = p.ids.len;
-    var sc = m.scope();
-    defer sc.deinit();
-    if (prof(m, L)) |pf| {
-        pf.restart();
-        pf.decoder = if (m.ced_split) |split| li >= split else false;
-    }
     if (m.cfg.engram.layerAt(li)) |ei| {
         const hs = &m.hash.?;
         const nc = hs.cols();
@@ -4113,7 +4436,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
             } else sc.out(try sc.keep(try e.table.gather(gpa, mine, m.s))); // [L * cols, head_dim]
         }
         const table_rows = p.engram_rows[ei];
-        const nx = sc.out(try engramWrite(&sc, m, e, p.x, table_rows, p.img));
+        const nx = sc.out(try engramWrite(sc, m, e, p.x, table_rows, p.img));
         _ = mlx.mlx_array_free(p.x);
         p.x = nx;
         if (prof(m, L)) |pf| try pf.mark(.engram, &.{nx});
@@ -4124,19 +4447,35 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     }
     if (m.cfg.engram.layerAt(li)) |ei| if (ei + 1 == m.engrams.len) aheadEngram(m, p) catch {};
     const c = &m.cfg;
-    // At decode widths a layer is submitted, not waited on: the next layer's router picks are the one host read.
-    const piped = pipeOn(m, L);
-    const wait = (m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX) and !piped;
-    var ev: std.ArrayList(A) = .empty;
-    defer ev.deinit(gpa);
     if (p.st.ds.len > 0) for (c.dspark.targets[0..c.dspark.n_targets], 0..) |tl, t| if (tl == li) {
         if (p.targets[t].ctx != null) _ = mlx.mlx_array_free(p.targets[t]);
         p.targets[t] = sc.out(try sc.astype(try sc.mean(try sc.astype(p.x, .float32), 1, false), m.act));
         try if (wait) mlx.check(mlx.mlx_array_eval(p.targets[t])) else ev.append(gpa, p.targets[t]);
     };
+}
+
+fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
+    const gpa = m.gpa;
+    if (p.tail) |t| if (li == m.ced_split.?) {
+        try cedReplay(m, p, li, t);
+        p.tail = null;
+    };
+    const L = p.ids.len;
+    var sc = m.scope();
+    defer sc.deinit();
+    if (prof(m, L)) |pf| {
+        pf.restart();
+        pf.decoder = if (m.ced_split) |split| li >= split else false;
+    }
+    // At decode widths a layer is submitted, not waited on: the next layer's router picks are the one host read.
+    const piped = pipeOn(m, L);
+    const wait = (m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX) and !piped;
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    try layerInput(m, p, li, &sc, &ev, wait);
     p.sh.img = p.img;
     if (width_probe) |t| try t.put("x_in_{d}", .{li}, p.x);
-    const out = try block(&sc, m, p.st, li, p.x, p.cpre, p.p0, &p.sh, p.span, null);
+    const out = try block(&sc, m, p.st, li, p.x, p.cpre, p.p0, &p.sh, p.span, null, &.{});
     _ = mlx.mlx_array_free(p.x);
     _ = mlx.mlx_array_free(p.cpre);
     p.x = out.x;
@@ -4246,6 +4585,7 @@ pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision:
     errdefer m.dropAhead();
     const st = try ensureState(m);
     transient_peak.begin();
+    defer transient_peak.end(if (st.verify != null) .verify else if (ids.len > NARROW_ROWS) .prefill_chunk else .decode, ids.len, null);
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
     pass.ahead = ahead;
@@ -4253,8 +4593,149 @@ pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision:
     try prefetchEngram(m, &pass);
     for (0..m.cfg.layers) |li| try passLayer(m, &pass, li);
     const logits = try finishPass(m, &pass, want);
-    transient_peak.end(if (st.verify != null) .dspark_verify else if (ids.len > NARROW_ROWS) .prefill_chunk else .decode, ids.len);
     return logits;
+}
+
+/// One request in a joined forward: its own state, and the ids it steps by.
+pub const Seg = struct { request: *Request, ids: []const u32 };
+
+/// Advances each request of `segs` by its one id in one forward, and returns the logits of its row (f32
+/// `[segs.len, vocab]` in `segs` order; the caller frees). Each request keeps its own pass, so its embedding, Engram
+/// rows, DSpark targets, head and state's advance are its one-row step's; a layer joins the rows for everything but
+/// the attention, which runs per request over its state. A row is its request's one-row step bit for bit (the
+/// model's `.rows` arm, `serves_rows`). Solo only, by design: the lazy first layer, layer pipelining and the CED
+/// decoder (none runs at one row of a resident load) and route speculation (a streamed load's).
+pub fn extendRows(m: *Model, segs: []const Seg) !A {
+    const n = segs.len;
+    if (n == 0 or n > m.maxJoinedRows()) return error.Dsv41RowsWidth;
+    for (segs, 0..) |sg, i| {
+        if (sg.ids.len != 1) return error.Dsv41RowsOneIdEach;
+        if (sg.request.state == null) return error.Dsv41NoLiveState;
+        for (segs[0..i]) |other| if (other.request == sg.request) return error.Dsv41RowsSameRequest;
+    }
+    const gpa = m.gpa;
+    errdefer m.dropAhead();
+    transient_peak.begin();
+    const passes = try gpa.alloc(Pass, n);
+    defer gpa.free(passes);
+    var begun: usize = 0;
+    defer for (passes[0..begun]) |*p| p.deinit(gpa);
+    for (segs, passes) |sg, *p| {
+        const st = &sg.request.state.?;
+        p.* = try beginPassWith(m, st, sg.ids, st.n, SPAN, null);
+        begun += 1;
+    }
+    var joined = try Shared.init(gpa, 1);
+    defer joined.deinit(gpa);
+    var rows: JoinedRows = .{};
+    defer rows.deinit();
+    for (0..m.cfg.layers) |li| try buildLayerRows(m, passes, &joined, li, &rows);
+    try rows.split(m, passes);
+    const heads = try gpa.alloc(A, n);
+    defer gpa.free(heads);
+    var made: usize = 0;
+    defer for (heads[0..made]) |h| {
+        _ = mlx.mlx_array_free(h);
+    };
+    for (passes, heads) |*p, *h| {
+        h.* = try finishPass(m, p, .last);
+        made += 1;
+    }
+    transient_peak.end(.decode, n, null);
+    var sc = m.scope();
+    defer sc.deinit();
+    const out = sc.out(try sc.concat(heads, 0));
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+/// Test seam: true splits a joined forward's rows at every layer, as it did before `layerTakesOwnInput`.
+pub var split_every_layer: bool = false;
+
+/// Whether layer `li` reads or writes a request's own rows before its block: its Engram rows, a DSpark target, the tap.
+pub fn layerTakesOwnInput(m: *const Model, li: usize) bool {
+    if (split_every_layer or m.tap != null or m.cfg.engram.layerAt(li) != null) return true;
+    const c = &m.cfg;
+    for (c.dspark.targets[0..c.dspark.n_targets]) |tl| if (tl == li) return true;
+    return false;
+}
+
+/// A joined forward's rows between layers: every request's rows in one array, split per request (`Pass.x`, `Pass.cpre`)
+/// only before a layer that takes a request's own input and after the last.
+const JoinedRows = struct {
+    x: A = none,
+    pre: A = none,
+
+    fn deinit(self: *JoinedRows) void {
+        if (self.x.ctx != null) _ = mlx.mlx_array_free(self.x);
+        if (self.pre.ctx != null) _ = mlx.mlx_array_free(self.pre);
+        self.* = .{};
+    }
+
+    /// Each request's rows back into its pass, owned there.
+    fn split(self: *JoinedRows, m: *Model, ps: []Pass) !void {
+        var sc = m.scope();
+        defer sc.deinit();
+        var row: usize = 0;
+        for (ps) |*p| {
+            const r1 = row + p.ids.len;
+            p.x = sc.out(try sc.contiguous(try sc.slice(self.x, 0, row, r1)));
+            p.cpre = sc.out(try sc.contiguous(try sc.slice(self.pre, 0, row, r1)));
+            row = r1;
+        }
+        self.deinit();
+    }
+};
+
+/// Layer `li` of a joined forward: each request's own input, then one block over all rows.
+fn buildLayerRows(m: *Model, ps: []Pass, joined: *Shared, li: usize, rows: *JoinedRows) !void {
+    const gpa = m.gpa;
+    var sc = m.scope();
+    defer sc.deinit();
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    const segs = try gpa.alloc(AttnSeg, ps.len);
+    defer gpa.free(segs);
+    var row: usize = 0;
+    for (ps, segs) |*p, *sg| {
+        sg.* = .{ .st = p.st, .p0 = p.p0, .sh = &p.sh, .span = p.span, .row = row, .rows = p.ids.len };
+        row += p.ids.len;
+    }
+    var x = rows.x;
+    var pre = rows.pre;
+    if (x.ctx == null or layerTakesOwnInput(m, li)) {
+        if (x.ctx != null) try rows.split(m, ps);
+        const xs = try gpa.alloc(A, ps.len);
+        defer gpa.free(xs);
+        const pres = try gpa.alloc(A, ps.len);
+        defer gpa.free(pres);
+        for (ps, xs, pres) |*p, *xx, *pp| {
+            try layerInput(m, p, li, &sc, &ev, false);
+            xx.* = p.x;
+            pp.* = p.cpre;
+        }
+        x = try sc.concat(xs, 0);
+        pre = try sc.concat(pres, 0);
+        for (ps) |*p| {
+            _ = mlx.mlx_array_free(p.x);
+            _ = mlx.mlx_array_free(p.cpre);
+            p.x = none;
+            p.cpre = none;
+        }
+    }
+    const out = try block(&sc, m, ps[0].st, li, x, pre, 0, joined, SPAN, null, segs);
+    rows.deinit();
+    rows.* = .{ .x = out.x, .pre = out.pre };
+    try ev.append(gpa, rows.x);
+    try ev.append(gpa, rows.pre);
+    for (ps) |*p| {
+        try appendStateArrays(gpa, &ev, &p.st.layers[li]);
+        try appendVerifyArrays(gpa, &ev, p.st, li);
+    }
+    const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try asyncEval(vec);
 }
 
 /// Whether a decode forward can queue its layer 0 before the host has read its token: that layer reads no Engram rows.
@@ -4269,6 +4750,7 @@ pub fn extendLazy(m: *Model, id: A, host: *[1]u32) !A {
     errdefer m.dropAhead();
     const st = try ensureState(m);
     transient_peak.begin();
+    defer transient_peak.end(.decode, 1, null);
     try flushMain(st);
     var pass: Pass = .{ .st = st, .ids = host, .p0 = st.n, .span = SPAN, .rows = &.{}, .x = none, .cpre = none, .sh = try Shared.init(m.gpa, 1) };
     defer pass.deinit(m.gpa);
@@ -4290,7 +4772,6 @@ pub fn extendLazy(m: *Model, id: A, host: *[1]u32) !A {
     for (1..m.cfg.layers) |li| try passLayer(m, &pass, li);
     m.lazy_starts += 1;
     const logits = try finishPass(m, &pass, .last);
-    transient_peak.end(.decode, 1);
     return logits;
 }
 
@@ -4406,6 +4887,7 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     const st = try ensureState(m);
     if (st.verify != null or ids.len <= m.cfg.window) return error.Dsv41NoCedSplit;
     transient_peak.begin();
+    defer transient_peak.end(.prefill_chunk, ids.len, null);
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
     pass.ahead = ahead;
@@ -4427,7 +4909,6 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
         pf.restart();
         pf.report(ids.len, pass.p0);
     }
-    transient_peak.end(.prefill_chunk, ids.len);
 }
 
 /// The CED decoder's first layer `li` over every row of the pass: only its compressor, whose ratio-1 rows (and index
@@ -4548,8 +5029,8 @@ pub fn draft(m: *Model, t1: u32, with_heads: bool) !Draft {
 /// token to token.
 pub fn draftHeads(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     transient_peak.begin();
+    defer transient_peak.end(.draft, m.cfg.dspark.block, null);
     const out = try draftPass(m, t1, heads_wanted);
-    transient_peak.end(.dspark_draft, m.cfg.dspark.block);
     return out;
 }
 
@@ -4578,7 +5059,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     const window = @min(c.window, n);
     for (0..c.n_mtp) |si| {
         const keys = try st.ds[si].read(&sc, n - window, n);
-        const out = try block(&sc, m, st, c.layers + si, x, pre, n, &dummy, SPAN, .{ .keys = keys });
+        const out = try block(&sc, m, st, c.layers + si, x, pre, n, &dummy, SPAN, .{ .keys = keys }, &.{});
         x = try sc.keep(out.x);
         pre = try sc.keep(out.pre);
     }
@@ -4674,11 +5155,13 @@ pub fn finishVerify(m: *Model, accepted: usize) !void {
                 const first = v.n0 - v.n0 % r; // the position of row 0 of the saved open group
                 const lo = end - end % r - first;
                 const hi = end - first;
+                // Slices of the round's evaluated rows, left lazy: the next pass's layer evaluation takes them as inputs.
+                // Both are made before the old pair goes, so a failed slice leaves the layer its old pair, not freed handles.
+                const tail: [2]mlx.mlx_array = if (hi > lo) .{ try sc.slice(v.pend_kv[li], 0, lo, hi), try sc.slice(v.pend_gate[li], 0, lo, hi) } else .{ none, none };
                 if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
                 if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
-                // Slices of the round's evaluated rows, left lazy: the next pass's layer evaluation takes them as inputs.
-                ls.pend_kv = if (hi > lo) sc.out(try sc.slice(v.pend_kv[li], 0, lo, hi)) else none;
-                ls.pend_gate = if (hi > lo) sc.out(try sc.slice(v.pend_gate[li], 0, lo, hi)) else none;
+                ls.pend_kv = if (hi > lo) sc.out(tail[0]) else none;
+                ls.pend_gate = if (hi > lo) sc.out(tail[1]) else none;
             }
         }
         st.n = end;
@@ -4849,6 +5332,20 @@ pub fn tokens(sc: *Scope, fx: *model_mod.Weights) ![]u32 {
 }
 
 const TINY_S = 40;
+
+test "dsv41 rows: a load that joins requests as rows steps one row on the exact arm, drafter or not, and joins rows only as wide as stay exact" {
+    var m: Model = undefined;
+    m.dspark = null;
+    m.dspark_exact = true;
+    m.serves_rows = false;
+    try testing.expect(!m.rowsOf(.step).exact);
+    m.serves_rows = true;
+    try testing.expect(m.rowsOf(.step).exact);
+    try testing.expect(m.rowsOf(.rows).exact and m.rowsOf(.rows).wide);
+    m.dspark_exact = false;
+    try testing.expect(m.rowsOf(.rows).exact and m.rowsOf(.step).exact);
+    try testing.expectEqual(@as(usize, @intCast(exl3.project_rows.rowsMax(.{ .exact = true, .wide = true }))), m.maxJoinedRows());
+}
 
 test "dsv41 fixture: prefill matches DeepSeek's reference in f32 with the QAT round trips off, whole and in chunks (DSV41_TINY)" {
     try mlx.requireGpu();
@@ -6640,10 +7137,10 @@ test "dsv41 attention epilogue: the kernel's store gives attnOut's rotated, fp8-
 test "dsv41 attention NAX trial: the release head shape passes it, and a trial outside its bar declines the arm so the SIMD kernel serves" {
     try mlx.requireGpu();
     if (!mlx.streamIsGpu(mlx.gpuStream()) or !kernels.attnNaxFits(64, 512)) return error.SkipZigTest;
-    try testing.expect(kernels.attnNaxProbe(testing.allocator, mlx.gpuStream(), 64, 512, 64, 8, kernels.attn_nax_bar));
-    try testing.expect(!kernels.attnNaxProbe(testing.allocator, mlx.gpuStream(), 64, 512, 64, 8, 0));
+    try testing.expect(try arm_trial.run(mlx.gpuStream(), kernels.attnNaxTrial, .{ testing.allocator, mlx.gpuStream(), 64, 512, 64, 8, kernels.attn_nax_bar }));
+    try testing.expect(!try arm_trial.run(mlx.gpuStream(), kernels.attnNaxTrial, .{ testing.allocator, mlx.gpuStream(), 64, 512, 64, 8, 0 }));
     // a head shape the kernel does not serve is declined without a launch
-    try testing.expect(!kernels.attnNaxProbe(testing.allocator, mlx.gpuStream(), 8, 512, 64, 8, kernels.attn_nax_bar));
+    try testing.expect(!try arm_trial.run(mlx.gpuStream(), kernels.attnNaxTrial, .{ testing.allocator, mlx.gpuStream(), 8, 512, 64, 8, kernels.attn_nax_bar }));
 
     const dir = try epiFixtureDir();
     const m = try tinyModel(dir, .{ .act = .bfloat16, .qat = true }, mlx.gpuStream());
@@ -6700,7 +7197,7 @@ test "dsv41 NAX trials on the engine's stream: the release shapes pass with noth
 test "dsv41 index NAX trial: the release shape passes it, and a model whose index heads the kernel does not serve keeps the scalar kernel" {
     try mlx.requireGpu();
     if (!mlx.streamIsGpu(mlx.gpuStream()) or !kernels.indexNaxFits(.fp4_ue8m0, 32, 32, 128)) return error.SkipZigTest;
-    try testing.expect(kernels.indexNaxProbe(testing.allocator, mlx.gpuStream()));
+    try testing.expect(try arm_trial.run(mlx.gpuStream(), kernels.indexNaxTrials, .{ testing.allocator, mlx.gpuStream() }));
     const m = try tinyModel(try epiFixtureDir(), .{ .act = .bfloat16, .qat = true }, mlx.gpuStream());
     defer m.deinit();
     try testing.expect(m.index_nax);

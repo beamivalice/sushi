@@ -3585,7 +3585,7 @@ fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
     slot.handover_token = t1;
 }
 
-fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const turn = arch_handle.turnFor(slot.model.handle, slot.model.config);
     defer turn.end();
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
@@ -3725,6 +3725,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
             slot.restore_ns = lookup_sw.read();
+            if (target != null) sched.restoreEnd(slot, xfm_ptr);
             var restore_line_buf: [192]u8 = undefined;
             if (prefix_cache_mod.restoreLogLine(
                 &restore_line_buf,

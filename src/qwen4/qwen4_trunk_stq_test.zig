@@ -118,7 +118,7 @@ fn putZeros(weights: *Weights, name: []const u8, shape: []const c_int, dt: mlx.m
 }
 
 fn putBank(weights: *Weights, base: []const u8, bank: *const trunk_stq.TestBank) !void {
-    const t = bank.tensors();
+    const t = try bank.tensors();
     inline for (.{ "trellis", "suh", "svh" }, 0..) |suffix, i| {
         const key = try std.fmt.allocPrint(weights.allocator, "{s}." ++ suffix, .{base});
         try weights.map.put(key, t[i]);
@@ -305,7 +305,7 @@ test "trunk STQ: a trellis lm_head reads through the full head and keeps no coar
     try testing.expect(try relRms(s, rows, want) < STQ_PROJECTION_BAR);
 
     // No rows to gather: the coarse head declines, and the draft reads the head whole.
-    try testing.expect(mtp_mod.buildRerankCoarse(s, &xfm, 3) == null);
+    try testing.expect((try mtp_mod.buildRerankCoarse(s, &xfm, 3)) == null);
     const x1 = try rand(rnd, &.{ 1, 1, 128 }, 4.0, s);
     defer _ = mlx.mlx_array_free(x1);
     const picked = try mtp_mod.fullReadoutArgmax(s, &xfm, x1, null);

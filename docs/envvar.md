@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (61)
+## Diagnostics (62)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -43,6 +43,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `QWEN4_PROFILE_QSA` | `qwen4_qsa.zig:1359, qwen4_forward.zig:2521` | logs synced QSA indexer/gather laps | once | no |
 | `QWEN4_STANDIN` | `qwen4_forward.zig:2898` | comma list (`gdn,attn,mlp,hc,moe_*,...`) replaces blocks with free stand-ins for ablation under the decode meter | once | yes: engine-kernels, qwen4-perf |
 | `QWEN4_STREAM_F32` | `qwen4_forward.zig:1518, 1780, 1968` | runs the Qwen4 residual streams in f32 (math oracle) | once | yes: qwen4-arch |
+| `SUSHI_TRANSIENT_PEAK` | `transient_peak.zig` (`arch/forward.zig`, `dsv41_model.zig`, `dsv41_vision.zig`) | `1` logs `[transient-peak]` per forward phase of any arch: the high-water of what MLX and the engine allocated past what was in use when the phase began, what the engine's pool grew to hold (`held_gb`, free buffers included), both pools' free bytes, and the bill the phase was admitted under where known; was `SUSHI_DSV41_TRANSIENT_PEAK`, DeepSeek only | load | yes: engine-mlx-gotchas |
 | `SUSHI_DSV41_PREFILL_PROFILE` | `dsv41_serving.zig:41` | logs a synced per-stage `[dsv41-prof]` line per wide DeepSeek chunk | load | yes: dsv41-arch |
 | `SUSHI_DECODE_FWD_GRAPH` | `model_load.zig:1872` | `<path>` writes one decode forward's primitive list at the forward meter; inert without `SUSHI_DECODE_FWD_UBENCH` | load | yes: mimo2-arch |
 | `SUSHI_DECODE_PROFILE` | `forward_diag.zig:119, 127` | arms the decode sub-block profiler; `=<rows>` also times verify widths | once | no |
@@ -50,7 +51,6 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `MLX_ENABLE_TF32`, `MLX_METAL_GPU_ARCH` | `tensor/matmul.zig`, `exl3/device.zig` | MLX's own variables, read as MLX reads them so the engine's matmul takes the kernel MLX takes: f32 on the NAX tiles (default on), and a GPU architecture name in place of the device's, which the [device profile](engine-kernels.md#the-device-profile) takes for every gate | once | yes: engine-own-forward, engine-kernels |
 | `SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD` | `dsv41_serving.zig` | TEMPORARY A/B: decode-width passes read their Engram rows at the layer; deleted after the live measurement | load | no |
 | `SUSHI_ENGINE_KERNEL_PROF` | `tensor/core.zig` (`kernelProfOn`) | `1` hands every engine op over as its own command buffer and waits for it, so the GPU times are per kernel; logs `[engine-prof] <name>: <n> dispatches, <ms> ms total, <us> us each` at debug level, top 40 kernels by GPU time (`all`: every kernel), in `[engine] since load:` and the decode meter (the forward runs slower: one wait per op) | once | yes: engine-own-forward |
-| `SUSHI_QWEN4_COOLER` | `qwen4/qwen4_cooler.zig` (`sideOf`) | TEMPORARY dev lever: `1` puts a Qwen STQ load on Sushi Cooler while Qwen on Cooler is in development (the load line says which side); goes when Qwen on Cooler passes its gate | once | yes: engine-own-forward |
 | `SUSHI_ENGINE_REFUSAL_TRACE` | `tensor/route.zig` (`traceRefusal`), `mlx.zig` | `1` prints the stack of every op the engine fails or refuses (an MLX stream inside a forward of ours included), to find the call that reached it | once | yes: engine-own-forward |
 | `SUSHI_DSV41_READ_DIAG` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` counts the blocking host reads of decode-width DeepSeek forwards by site (route-spec settle, settle before a successor, waiting-schedule picks, Engram rows, DSpark state, logits) and logs `[dsv41] reads/forward <site>` per 64 forwards at debug level | load | yes: engine-expert-streaming |
 | `SUSHI_DSV41_COMPOSED` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` runs deepseek_v41 on the op chains instead of the fused kernels (the KLD A/B's teacher arm; the load logs `[dsv41] fused kernels on\|off`) | load | yes: dsv41-arch |
@@ -155,6 +155,11 @@ Kept because the launch flag cannot express what the env does.
 ## Reads to fix
 
 - *Stale scripts*: benches that export `SUSHI_ROUND_COST_PERSIST=0` set the default (persistence is opt-in); `SUSHI_QSA_NAX_PRECISION` is script-side only.
+
+## Removed 2026-11-16
+
+- `SUSHI_QWEN4_COOLER`: the dev lever that put a served Qwen STQ load on Sushi Cooler. Qwen runs there by default;
+  `--qwen-mlx-engine` and the `qwen_cooler` setting opt out.
 
 ## Removed 2026-11-13
 

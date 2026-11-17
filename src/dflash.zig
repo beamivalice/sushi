@@ -771,7 +771,7 @@ pub fn applyLogitTransforms(logits: mlx.mlx_array, multiplier: f32, softcap: f32
 
 /// 0-dim scalar in the given dtype.
 fn scalarAs(v: f32, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
-    const f = mlx.mlx_array_new_float(v);
+    const f = try mlx.newFloat(v);
     defer _ = mlx.mlx_array_free(f);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -1188,15 +1188,15 @@ fn buildBlockMask(
     var abs_diff = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(abs_diff);
     try mlx.check(mlx.mlx_abs(&abs_diff, diff, s));
-    const win_arr = mlx.mlx_array_new_float(@floatFromInt(window));
+    const win_arr = try mlx.newFloat(@floatFromInt(window));
     defer _ = mlx.mlx_array_free(win_arr);
     var allowed = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(allowed);
     try mlx.check(mlx.mlx_less(&allowed, abs_diff, win_arr, s));
 
-    const zero = mlx.mlx_array_new_float(0.0);
+    const zero = try mlx.newFloat(0.0);
     defer _ = mlx.mlx_array_free(zero);
-    const ninf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    const ninf = try mlx.newFloat(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(ninf);
     var bias_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(bias_f32);
@@ -1536,7 +1536,7 @@ pub fn selectPath(
     {
         const aid: i32 = @intCast(anchor_id);
         const a_shape = [_]c_int{1};
-        const aid_arr = mlx.mlx_array_new_data(&aid, &a_shape, 1, .int32);
+        const aid_arr = try mlx.newData(&aid, &a_shape, .int32);
         defer _ = mlx.mlx_array_free(aid_arr);
         var anchor_row = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(anchor_row);
@@ -2345,9 +2345,9 @@ pub const TinyFix = struct {
         const shape2 = [_]c_int{ @intCast(rows), @intCast(cols) };
         const shape1 = [_]c_int{@intCast(rows)};
         const f32_arr = if (cols > 0)
-            mlx.mlx_array_new_data(data.ptr, &shape2, 2, .float32)
+            try mlx.newData(data.ptr, &shape2, .float32)
         else
-            mlx.mlx_array_new_data(data.ptr, &shape1, 1, .float32);
+            try mlx.newData(data.ptr, &shape1, .float32);
         defer _ = mlx.mlx_array_free(f32_arr);
         var bf = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(bf);
@@ -2362,7 +2362,7 @@ pub const TinyFix = struct {
         defer testing.allocator.free(data);
         for (data, 0..) |*x, i| x.* = 1.0 + val(i, 5) * 0.1;
         const shape = [_]c_int{@intCast(n)};
-        const f32_arr = mlx.mlx_array_new_data(data.ptr, &shape, 1, .float32);
+        const f32_arr = try mlx.newData(data.ptr, &shape, .float32);
         defer _ = mlx.mlx_array_free(f32_arr);
         var bf = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(bf);
@@ -2558,7 +2558,7 @@ pub const TinyFix = struct {
         const data = try testing.allocator.alloc(f32, total);
         defer testing.allocator.free(data);
         for (data, 0..) |*x, i| x.* = val(i, seed);
-        const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+        const f32_arr = try mlx.newData(data.ptr, shape, .float32);
         defer _ = mlx.mlx_array_free(f32_arr);
         var bf = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(bf);
@@ -2637,7 +2637,7 @@ pub const TinyFix = struct {
         defer testing.allocator.free(data);
         for (data, 0..) |*x, i| x.* = val(i, seed);
         const shape = [_]c_int{ 1, @intCast(n), HIDDEN };
-        const f32_arr = mlx.mlx_array_new_data(data.ptr, &shape, 3, .float32);
+        const f32_arr = try mlx.newData(data.ptr, &shape, .float32);
         defer _ = mlx.mlx_array_free(f32_arr);
         var bf = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(bf);
@@ -3167,7 +3167,7 @@ fn fixtureF32Slice(allocator: std.mem.Allocator, v: std.json.Value) ![]f32 {
 /// [1, n, H] bf16 mlx array from a flat f32 slice.
 fn fixtureArr(vals: []const f32, n: usize, h: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     const shape = [_]c_int{ 1, @intCast(n), @intCast(h) };
-    const f32_arr = mlx.mlx_array_new_data(vals.ptr, &shape, 3, .float32);
+    const f32_arr = try mlx.newData(vals.ptr, &shape, .float32);
     defer _ = mlx.mlx_array_free(f32_arr);
     var bf = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(bf);

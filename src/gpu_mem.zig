@@ -32,14 +32,14 @@ pub fn cacheBytes() usize {
     return cache + mlx.engine.poolFree();
 }
 
-/// The high-water since `resetPeak`: MLX's own peak, and beside it the engine's pool at its fullest with the mappings
-/// it wraps now. The two peaks need not have met, so the sum errs high. MLX starts its peak from zero at a reset, so
+/// The high-water since `resetPeak`: MLX's own peak, and beside it the engine's pool at its fullest, free buffers held
+/// included (what Metal counts), with the mappings it wraps now. The two peaks need not have met, so the sum errs high. MLX starts its peak from zero at a reset, so
 /// until it next allocates this reads below `activeBytes` by what MLX holds.
 pub fn peakBytes() usize {
     if (host_tier) return liveRead();
     var peak: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak);
-    return peak + mlx.engine.poolPeak(.process) + mlx.engine.mappedTotal();
+    return peak + mlx.engine.poolHeldPeak(.process) + mlx.engine.mappedTotal();
 }
 
 pub fn resetPeak() void {
@@ -146,8 +146,10 @@ pub fn applyMlxCacheLimit() void {
     if (prev < cap) {
         var tmp: usize = 0;
         _ = mlx.mlx_set_cache_limit(&tmp, prev);
+        mlx.engine.setFreeCap(prev);
         return;
     }
+    mlx.engine.setFreeCap(cap);
     log.info("[mem] MLX buffer-pool cap {d} MB (was {d} MB)\n", .{ cap >> 20, prev >> 20 });
 }
 
@@ -160,6 +162,7 @@ pub fn capMlxPool(bytes: u64) void {
         _ = mlx.mlx_set_cache_limit(&tmp, prev);
         return;
     }
+    mlx.engine.setFreeCap(bytes);
     arch_serve.poolCapped(prev);
     log.info("[mem] MLX buffer-pool cap {d} MB from the ssd-budget ledger (was {d} MB)\n", .{ bytes >> 20, prev >> 20 });
 }

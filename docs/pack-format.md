@@ -378,7 +378,9 @@ How a load uses it:
 <a id="expert-usage"></a>
 ## Optional: `expert_usage.json`
 
-A DeepSeek-V4.1 pack may carry the routing counts `--drop-expert n` ranks ([dsv41-arch](dsv41-arch.md#drop-expert)).
+A DeepSeek-V4.1 pack or a Qwen3.8 quantized pack may carry the routing counts `--drop-expert n` ranks
+([dsv41-arch](dsv41-arch.md#drop-expert), [qwen4-arch](qwen4-arch.md#drop-expert)). The counts are in the pack's own expert
+order: an STQ pack reorders experts into rate groups, so a list taken in the source's order is mapped by router rows.
 
 Format: `{"version": 1, "source": "...", "tokens": N, "top_k": K, "layers": [[count per expert id], ...]}`.
 - One row per routed layer, in layer order, one count per expert id in the router's numbering (the shard order).

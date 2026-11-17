@@ -357,7 +357,7 @@ fn encodeImageBlock(vision_enc: *VisionEncoder, img: VisionImagePixels) !mlx.mlx
         const pixel_arr = blk: {
             const host = mlx.engine.enter(vision_enc.s);
             defer host.end();
-            break :blk mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
+            break :blk try mlx.newData(img.pixels.ptr, &shape, .float32);
         };
         defer _ = mlx.mlx_array_free(pixel_arr);
         return vision_enc.forwardPatches(pixel_arr, img.grid_h, img.grid_w);
@@ -369,7 +369,7 @@ pub fn encodeVideoBlock(vision_enc: *VisionEncoder, vid: VisionVideoPixels) !mlx
     const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
     const feat: usize = (vid.pixels.len / 4) / n;
     const shape = [_]c_int{ @intCast(n), @intCast(feat) };
-    const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 2, .float32);
+    const pixel_arr = try mlx.newData(vid.pixels.ptr, &shape, .float32);
     defer _ = mlx.mlx_array_free(pixel_arr);
     return vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w);
 }

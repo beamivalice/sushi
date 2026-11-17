@@ -1036,7 +1036,7 @@ test "GLM verify decides biased tree rows as serial decode under the same bias, 
                 state.phase = p.phaseAfter(ids[0..rows_on_path.len]);
                 const shifted = try ops.slot();
                 try think_penalty.shiftScoped(shifted, raw, markers, state, null, s);
-                const decided = try ops.own(sampler.sampleTokenLazy(shifted.*, .{ .temperature = 0, .suppress_mask = reserved }, s));
+                const decided = try ops.own(try sampler.sampleTokenLazy(shifted.*, .{ .temperature = 0, .suppress_mask = reserved }, s));
                 try mlx.check(mlx.mlx_array_eval(decided));
                 var want: i32 = 0;
                 try mlx.check(mlx.mlx_array_item_int32(&want, decided));

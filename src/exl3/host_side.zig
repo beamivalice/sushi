@@ -24,7 +24,7 @@ pub fn making() u1 {
 }
 
 /// A host array just made, or the error of a host that could not make it: MLX's maker never fails, an engine's may
-/// (its pool refuses the buffer and hands back an empty handle). Nothing unchecked goes into a cache.
+/// (its pool refuses the buffer and hands back an empty handle). Nothing unchecked goes into a cache (`side_cache`).
 pub fn made(a: mlx.mlx_array) error{HostArrayRefused}!mlx.mlx_array {
     return if (a.ctx == null) error.HostArrayRefused else a;
 }

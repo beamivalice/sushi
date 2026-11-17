@@ -14,6 +14,7 @@ const kv_disk_cache = @import("../kv_disk_cache.zig");
 const model_registry_mod = @import("../model_registry.zig");
 const model_settings = @import("../model_settings.zig");
 const log = @import("../log.zig");
+const dsv41_model = @import("dsv41_model.zig");
 const Trunk = transformer_mod.Trunk;
 const ModelConfig = model_mod.ModelConfig;
 const Generator = generate_mod.Generator;
@@ -115,8 +116,8 @@ test "a streamed DeepSeek load bills its union workspace and MLX pool and no fil
     try testing.expectEqual(fill, loadStagingBytes(&mimo, billedFillPeakBytes(&mimo, fill), workspace));
 }
 
-/// DeepSeek's request state lives in the model, not in `slot.cache` (a one-byte-a-token row marker): its window
-/// rings, compressed and index rows, DSpark windows, and the live restore points the request keeps.
+/// DeepSeek's decode state outside the slot request: the state the model parks between requests (a running request's
+/// is billed as its slot request's, `sched.requestBytes`), and the live restore points the record keeps.
 pub fn dsv41StateBytes(s: *const Slot) u64 {
     const dsv = arch_handle.trunk(s.model.handle orelse return 0).arch_state.dsv41.model orelse return 0;
     var bytes: u64 = if (dsv.dec_state) |*st| @import("dsv41_model.zig").stateBytes(st) else 0;
@@ -129,8 +130,23 @@ pub fn dsv41StateBytes(s: *const Slot) u64 {
 pub fn publishLive(sch: *Scheduler, slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache, tokens: []const u32) void {
     const dsv = arch_handle.trunk(slot.model.handle orelse return).arch_state.dsv41.model orelse return;
     const media = prefix_cache_mod.MediaStamp.of(slot.vision_key, slot.media_start);
-    if (dsv41_prefix.keepEndPointDsv41(hc, dsv, tokens.len)) log.info("[dsv41-prefix] restore point behind the reply at {d}\n", .{tokens.len});
-    if (dsv41_prefix.publishLiveDsv41(hc, dsv, tokens, slot.has_tools, media, slot.cache.config)) sch.live_unflushed.store(true, .release);
+    if (dsv.serves_rows) return writeEndPoint(hc, dsv, slot, tokens, media);
+    const kept = dsv41_prefix.keepEndPointDsv41(hc, dsv, tokens.len) catch |e| return log.err("[dsv41-prefix] the request's record not published: {s}\n", .{@errorName(e)});
+    if (kept) log.info("[dsv41-prefix] restore point behind the reply at {d}\n", .{tokens.len});
+    const unflushed = dsv41_prefix.publishLiveDsv41(hc, dsv, tokens, slot.has_tools, media, slot.cache.config) catch |e| return log.err("[dsv41-prefix] the request's record not published: {s}\n", .{@errorName(e)});
+    if (unflushed) sch.live_unflushed.store(true, .release);
+}
+
+/// Joined rows keep no live record: the restore point behind the reply goes straight to the SSD tier, where the
+/// record's handover would have written it.
+fn writeEndPoint(hc: *prefix_cache_mod.HotPrefixCache, dsv: *dsv41_model.Model, slot: *Slot, tokens: []const u32, media: prefix_cache_mod.MediaStamp) void {
+    if (hc.disk == null or !hc.ssd_first or tokens.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+    const lent = dsv41_model.lendFor(dsv, if (slot.request) |*r| r.as(.dsv41) else null);
+    defer if (lent) |l| l.end();
+    const st = (dsv41_model.currentState(dsv) catch |e| return log.err("[dsv41-prefix] no restore point behind the reply: {s}\n", .{@errorName(e)})) orelse return;
+    if (st.n != tokens.len) return;
+    dsv41_prefix.writeDecodePointDsv41(hc, &slot.cache, dsv, tokens, slot.has_tools, media) catch |e| return log.warn("[dsv41-prefix] no restore point behind the reply: {s}\n", .{@errorName(e)});
+    log.info("[dsv41-prefix] restore point behind the reply at {d}, to SSD\n", .{tokens.len});
 }
 
 /// DeepSeek: a thinking request with tools is re-rendered with its thought, so the state right behind the generated
@@ -333,7 +349,6 @@ test "a DSpark round that finished the slot leaves the thought point to the comm
 test "a DeepSeek slot's state bytes hold the model's rows and windows and the live points (DSV41_TINY)" {
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
-    const dsv41_model = @import("dsv41_model.zig");
     const a = testing.allocator;
     const dir = try dsv41_model.fixtureDir();
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");

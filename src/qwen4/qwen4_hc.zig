@@ -8,6 +8,7 @@ const Trunk = trunk.Trunk;
 const std = @import("std");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3_kernels = sushi_exl3.kernels;
+const chains = @import("../tensor/chains.zig");
 const mlx = @import("../mlx.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const testing = std.testing;
@@ -98,6 +99,7 @@ pub fn hcMixChain(self: *const Trunk, up4: mlx.mlx_array, n4: mlx.mlx_array) !ml
 
 /// `2 * sigmoid(raw)` in raw's dtype: the inject closure's body and the forward's chain.
 pub fn hcInjChain(self: *const Trunk, raw: mlx.mlx_array) !mlx.mlx_array {
+    if (try mlx.engine.fusedChain(chains.twice_sigmoid, self.s, &.{raw})) |g| return g;
     var sig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sig);
     try mlx.check(mlx.mlx_sigmoid(&sig, raw, self.s));
@@ -111,6 +113,7 @@ pub fn hcInjChain(self: *const Trunk, raw: mlx.mlx_array) !mlx.mlx_array {
 
 /// `stream4 + out4 * inj`: the write closure's body and the forward's chain.
 pub fn hcWriteChain(self: *const Trunk, stream4: mlx.mlx_array, out4: mlx.mlx_array, inj: mlx.mlx_array) !mlx.mlx_array {
+    if (try mlx.engine.fusedChain(chains.multiply_add, self.s, &.{ stream4, out4, inj })) |next| return next;
     var add4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(add4);
     try mlx.check(mlx.mlx_multiply(&add4, out4, inj, self.s));
@@ -423,7 +426,7 @@ pub fn pleEmbedding(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, en
     if (ctx.lazy_ids and !mlx.engine.isStream(self.s) and pleDeferrable(&self.config, n)) {
         if (ctx.arch_ctx.qwen4.ple_pending != null) return error.PlePendingAlreadySet;
         @memset(pk, 0);
-        const emb = mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+        const emb = try mlx.newData(pk.ptr, &shape, .bfloat16);
         errdefer _ = mlx.mlx_array_free(emb);
         var emb_ref = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(emb_ref);
@@ -435,7 +438,7 @@ pub fn pleEmbedding(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, en
         return emb;
     }
     try pleGatherBf16(self, ctx, token_ids, entry, layer, seq_len, pk, capture);
-    return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+    return try mlx.newData(pk.ptr, &shape, .bfloat16);
 }
 
 /// A build that reads its routing back on the HOST cannot carry a deferred
@@ -469,6 +472,42 @@ pub fn plePreEval(self: *Trunk, ctx: *ForwardCtx) !void {
 
 /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend. Batched
 /// decode hands in the MERGED conv window as `entry.aux_state`.
+/// The PLE gate, `sigmoid(sqrt(max(|g / sqrt(hidden)|, 1e-6)) * sign(g / sqrt(hidden)))` over `gate` `[B,S,hc,1]`,
+/// each step rounded to the activation dtype as its op rounds. On the engine it is one kernel of the same bytes.
+pub fn pleGate(self: *Trunk, gate: mlx.mlx_array, hidden: c_int) !mlx.mlx_array {
+    // Scalars in the activation dtype: an f32 scalar promotes the gate
+    // and, through the value product, the whole residual stream.
+    const gate_dt = mlx.mlx_array_dtype(gate);
+    const inv_sqrt_h = try scalarOf(1.0 / @sqrt(@as(f32, @floatFromInt(hidden))), gate_dt, self.s);
+    defer _ = mlx.mlx_array_free(inv_sqrt_h);
+    if (try mlx.engine.fusedChain(mlx.engine.chains.ple_gate, self.s, &.{ gate, inv_sqrt_h })) |g| return g;
+    var gate_sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gate_sc);
+    try mlx.check(mlx.mlx_multiply(&gate_sc, gate, inv_sqrt_h, self.s));
+    // sqrt(max(|g|, 1e-6)) · sign(g)
+    var g_abs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_abs);
+    try mlx.check(mlx.mlx_abs(&g_abs, gate_sc, self.s));
+    const floor = try scalarOf(1e-6, gate_dt, self.s);
+    defer _ = mlx.mlx_array_free(floor);
+    var g_max = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_max);
+    try mlx.check(mlx.mlx_maximum(&g_max, g_abs, floor, self.s));
+    var g_sqrt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_sqrt);
+    try mlx.check(mlx.mlx_sqrt(&g_sqrt, g_max, self.s));
+    var g_sign = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_sign);
+    try mlx.check(mlx.mlx_sign(&g_sign, gate_sc, self.s));
+    var g_signed = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_signed);
+    try mlx.check(mlx.mlx_multiply(&g_signed, g_sqrt, g_sign, self.s));
+    var g_sig = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(g_sig);
+    try mlx.check(mlx.mlx_sigmoid(&g_sig, g_signed, self.s));
+    return g_sig;
+}
+
 pub fn pleForward(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
     const cfg = &self.config;
     const hc: c_int = @intCast(cfg.hc_count);
@@ -492,35 +531,8 @@ pub fn pleForward(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_i
     var gate = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gate);
     try mlx.check(mlx.mlx_sum_axis(&gate, kq, -1, true, self.s)); // [B,S,hc,1]
-    // Scalars in the activation dtype: an f32 scalar promotes the gate
-    // and, through the value product, the whole residual stream.
-    const gate_dt = mlx.mlx_array_dtype(gate);
-    const inv_sqrt_h = try scalarOf(1.0 / @sqrt(@as(f32, @floatFromInt(hidden))), gate_dt, self.s);
-    defer _ = mlx.mlx_array_free(inv_sqrt_h);
-    var gate_sc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gate_sc);
-    try mlx.check(mlx.mlx_multiply(&gate_sc, gate, inv_sqrt_h, self.s));
-    // sqrt(max(|g|, 1e-6)) · sign(g)
-    var g_abs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_abs);
-    try mlx.check(mlx.mlx_abs(&g_abs, gate_sc, self.s));
-    const floor = try scalarOf(1e-6, gate_dt, self.s);
-    defer _ = mlx.mlx_array_free(floor);
-    var g_max = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_max);
-    try mlx.check(mlx.mlx_maximum(&g_max, g_abs, floor, self.s));
-    var g_sqrt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_sqrt);
-    try mlx.check(mlx.mlx_sqrt(&g_sqrt, g_max, self.s));
-    var g_sign = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_sign);
-    try mlx.check(mlx.mlx_sign(&g_sign, gate_sc, self.s));
-    var g_signed = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_signed);
-    try mlx.check(mlx.mlx_multiply(&g_signed, g_sqrt, g_sign, self.s));
-    var g_sig = mlx.mlx_array_new();
+    const g_sig = try pleGate(self, gate, hidden);
     defer _ = mlx.mlx_array_free(g_sig);
-    try mlx.check(mlx.mlx_sigmoid(&g_sig, g_signed, self.s));
 
     const v_shape = [_]c_int{ batch, seq_len, 1, hidden };
     var value4 = mlx.mlx_array_new();
@@ -810,15 +822,7 @@ pub var hc_fused_cfg_builds: usize = 0;
 pub const HC_ROW_GROUP: c_int = 8;
 
 /// One a side: an array belongs to the side that made it (1 the engine's, 0 MLX's).
-pub var hc_fused_eps: [2]?mlx.mlx_array = .{ null, null };
-
-pub var hc_fused_eps_val: [2]f32 = .{ 0, 0 };
-
-/// Frees side `side`'s epsilon, when the side's last model is gone.
-pub fn dropSide(side: u1) void {
-    if (hc_fused_eps[side]) |e| _ = mlx.mlx_array_free(e);
-    hc_fused_eps[side] = null;
-}
+var hc_fused_eps: @import("sushi_exl3").side_cache.SideCache(f32, 1) = .{};
 
 pub var hc_fused_engaged = false;
 
@@ -1124,15 +1128,11 @@ pub fn hcReadFused(
     }
     const cfgs = slot.*.?.cfgs;
     const side: u1 = @intFromBool(mlx.engine.isStream(s));
-    if (hc_fused_eps[side] == null or hc_fused_eps_val[side] != eps) {
-        if (hc_fused_eps[side]) |e| _ = mlx.mlx_array_free(e);
-        const esh = [_]c_int{1};
-        var ev = eps;
+    const eps_arr = hc_fused_eps.get(side, eps) orelse blk: {
         const scope = mlx.engine.enter(s);
         defer scope.end();
-        hc_fused_eps[side] = mlx.mlx_array_new_data(&ev, &esh, 1, .float32);
-        hc_fused_eps_val[side] = eps;
-    }
+        break :blk try hc_fused_eps.put(side, eps, mlx.mlx_array_new_data(&eps, &[_]c_int{1}, 1, .float32));
+    };
 
     const apply = struct {
         fn f(st: mlx.mlx_stream, which: usize, cfg: mlx.mlx_fast_metal_kernel_config, ins: []const mlx.mlx_array, n_out: usize, outs: []mlx.mlx_array) !void {
@@ -1157,7 +1157,7 @@ pub fn hcReadFused(
     var n_out: [3]mlx.mlx_array = undefined;
     const wo = if (pend) |pd| pd.out else nw;
     const wi = if (pend) |pd| pd.inj else nw;
-    try apply(s, 0, cfgs[0], &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps[side].?, wo, wi }, 3, &n_out);
+    try apply(s, 0, cfgs[0], &.{ x, nw, if (inj == 1) iw else nw, eps_arr, wo, wi }, 3, &n_out);
     const xn = n_out[0];
     defer _ = mlx.mlx_array_free(xn);
     const ipart = n_out[1];
@@ -1325,6 +1325,15 @@ pub fn pleGatherBf16(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, e
 
 /// The gather ids as one contiguous int32 array, still LAZY: a group evaluates every
 /// row's ids together so the flush costs ONE host sync, not one per row.
+/// On the engine, hands the pass that writes `token_ids` (a sampled token) to the GPU before a forward encodes on it:
+/// the PLE's host read of the ids then waits for that pass alone, as MLX waits for the sample's graph alone.
+pub fn handOverIdsWriter(s: mlx.mlx_stream, token_ids: mlx.mlx_array) !void {
+    if (!mlx.engine.isStream(s)) return;
+    var ready = false;
+    try mlx.check(mlx._mlx_array_is_available(&ready, token_ids));
+    if (!ready) try mlx.engine.submit();
+}
+
 pub fn plePrepareIds(self: *Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
     var ids_i32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ids_i32);
@@ -2027,3 +2036,76 @@ fn closureChain(xfm: *Trunk, name: []const u8, in: []const mlx.mlx_array) !mlx.m
     unreachable;
 }
 
+
+test "a forward's PLE read of a sampled token waits for the sample's pass, not for the forward's layers encoded after it" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    var xfm = test_support.testTrunk("qwen4_exp");
+    xfm.s = mlx.engine.stream();
+    const vals = [_]f32{ 0.5, 3.0, -1.0, 2.0 };
+    const host = mlx.mlx_array_new_data(&vals, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(host);
+    var logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_add(&logits, host, host, xfm.s));
+    try mlx.check(mlx.mlx_array_eval(logits));
+    var token = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(token);
+    try mlx.check(mlx.mlx_argmax_axis(&token, logits, -1, false, xfm.s));
+    try handOverIdsWriter(xfm.s, token);
+    // The forward's first layers, encoded before the PLE layer reads the ids.
+    var layer = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(layer);
+    try mlx.check(mlx.mlx_multiply(&layer, logits, logits, xfm.s));
+    const ids = try plePrepareIds(&xfm, token);
+    defer _ = mlx.mlx_array_free(ids);
+    try mlx.check(mlx.mlx_array_eval(ids));
+    try t.expectEqual(@as(i32, 1), mlx.mlx_array_data_int32(ids).?[0]);
+    try t.expect(mlx.engine.openDispatches() > 0);
+}
+
+test "the PLE gate on the engine is one dispatch with MLX's bytes, at decode and prefill widths" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    var xfm = test_support.testTrunk("qwen4_exp");
+    var rng = std.Random.DefaultPrng.init(0x91e);
+    for ([_]c_int{ 1, 7, 4096 }) |rows| {
+        const n: usize = @intCast(rows * 4);
+        const host = try t.allocator.alloc(u16, n);
+        defer t.allocator.free(host);
+        for (host, 0..) |*v, i| v.* = switch (i % 8) {
+            0 => 0,
+            1 => 0x8000,
+            2 => 0x3380, // about 6e-8: under the floor once scaled
+            else => @truncate(@as(u32, @bitCast((rng.random().float(f32) - 0.5) * 400.0)) >> 16),
+        };
+        var bytes: [2][]u8 = undefined;
+        var made: usize = 0;
+        defer for (bytes[0..made]) |b| t.allocator.free(b);
+        for ([_]mlx.mlx_stream{ mlx.gpuStream(), mlx.engine.stream() }, 0..) |s, side| {
+            xfm.s = s;
+            const scope = if (side == 1) mlx.engine.enter(s) else null;
+            defer if (scope) |sc| sc.end();
+            const h = try mlx.newData(host.ptr, &.{ 1, rows, 4, 1 }, .bfloat16);
+            defer _ = mlx.mlx_array_free(h);
+            var gate = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate);
+            try mlx.check(mlx.mlx_contiguous(&gate, h, false, s));
+            try mlx.check(mlx.mlx_array_eval(gate));
+            const d0 = mlx.engine.stats().dispatches;
+            const out = try pleGate(&xfm, gate, 2560);
+            defer _ = mlx.mlx_array_free(out);
+            if (side == 1) try t.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - d0);
+            try mlx.check(mlx.mlx_array_eval(out));
+            bytes[side] = try t.allocator.dupe(u8, mlx.mlx_array_data_uint8(out).?[0 .. n * 2]);
+            made += 1;
+        }
+        try t.expectEqualSlices(u8, bytes[0], bytes[1]);
+    }
+}

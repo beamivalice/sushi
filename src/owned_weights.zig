@@ -275,7 +275,7 @@ fn randomArray(rng: *std.Random.DefaultPrng, shape: []const c_int, dtype: mlx.ml
     const bytes = try testing.allocator.alloc(u8, n * 2);
     defer testing.allocator.free(bytes);
     rng.random().bytes(bytes);
-    const a = mlx.mlx_array_new_data(bytes.ptr, shape.ptr, @intCast(shape.len), dtype);
+    const a = try mlx.newData(bytes.ptr, shape, dtype);
     try mlx.check(mlx.mlx_array_eval(a));
     return a;
 }

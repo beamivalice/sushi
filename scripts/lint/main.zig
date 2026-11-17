@@ -36,7 +36,10 @@ const rules = .{
     @import("returned_handle_unguarded.zig"),
     @import("closure_compile_seam.zig"),
     @import("random_draw_seam.zig"),
+    @import("cooler_side_query.zig"),
+    @import("engine_lifecycle.zig"),
     @import("disk_read_stream.zig"),
+    @import("host_maker_unchecked.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

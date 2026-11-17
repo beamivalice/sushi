@@ -262,11 +262,18 @@ pub fn contextWindowRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32
 
 /// The load's warm: faults weight pages and compiles the decode path's kernels with throwaway forwards on this thread's
 /// stream (~600-900 ms at boot, so the first request skips a cold path), then the verify widths up to `verify_cap` when
-/// MTP is on, then the arch's spec warm. On MLX a failed step warns and the load serves. On Sushi Cooler a forward that
-/// fails in the warm fails in a request, so the load does not serve; a warm that ends seals the engine.
-pub fn warmLoad(io: std.Io, config: *const ModelConfig, xfm: *Trunk, verify_cap: ?u32, aux_head: ?*anyopaque, kv: trunk.KVQuantConfig) !void {
+/// MTP is on, then the arch's spec warm; on Sushi Cooler then served requests at every templated width
+/// (`cooler_warm.warmServed`). On MLX a failed step warns and the load serves. On Sushi Cooler a forward that fails in
+/// the warm fails in a request, so the load does not serve; a warm that ends seals the engine.
+pub fn warmLoad(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xfm: *Trunk, verify_cap: ?u32, aux_head: ?*anyopaque, kv: trunk.KVQuantConfig) !void {
     const warmup_start = std.Io.Timestamp.now(io, .awake);
     const on_engine = arch_handle.onEngine(null, config);
+    // A Cooler load first makes what its manifest lists (the warm's and what earlier requests compiled late), on worker
+    // threads; the warm then makes nothing it lists.
+    const cooler_pipelines = @import("arch/cooler_pipelines.zig");
+    var plan: ?cooler_pipelines.Plan = if (on_engine) cooler_pipelines.beginFor(a, io, config) else null;
+    defer if (plan) |*p| p.deinit();
+    const made_all = if (plan) |*p| p.settle() else false;
     xfm.warmup() catch |err| {
         var cause: [512]u8 = undefined;
         if (on_engine) {
@@ -286,7 +293,18 @@ pub fn warmLoad(io: std.Io, config: *const ModelConfig, xfm: *Trunk, verify_cap:
         log.warn("[spec-warmup] failed ({s}: {s}); the first round at each width pays its kernel compile inside the round.\n", .{ @errorName(err), latchedCause(&cause) });
     };
     arch_load.warmSpec(io, config, xfm, aux_head, kv);
-    if (on_engine) @import("arch/cooler.zig").warmEnded();
+    if (!on_engine) return;
+    // The served warm runs to make pipelines: a manifest that made every one leaves it nothing, and a request that
+    // compiles one late writes it in for the next load.
+    if (made_all) {
+        log.info("[warm] served requests skipped: the manifest made every pipeline they would\n", .{});
+    } else @import("cooler_warm.zig").warmServed(io, a, xfm, generate_mod.MtpHeadRef.fromModel(xfm, verify_cap != null, aux_head)) catch |err| {
+        var cause: [512]u8 = undefined;
+        log.err("[warm] a served request failed ({s}: {s}); a load on Sushi Cooler does not serve without it\n", .{ @errorName(err), latchedCause(&cause) });
+        return err;
+    };
+    @import("arch/cooler.zig").warmEnded();
+    if (plan) |*p| p.store() else cooler_pipelines.rewriteLate();
 }
 
 /// JIT-compiles the activation kernels, bound to this thread's MLX stream. Skipped when there's no GPU backend
@@ -738,14 +756,14 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
 pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, budget_bytes: u64, vision: bool, assistant_bytes: u64) !StreamingPlan {
     var geometry = config.expertGeometry();
     if (config.drop_expert != 0 and !admission.expertStream(config).drop_expert) return error.LaunchFlagUnsupported;
-    var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else expert_usage.load(allocator, model_dir, config.expertDropRequest()) catch |err| {
+    var streamed = config.*;
+    streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
+    var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else expert_stream_mod.quant.loadDrop(allocator, model_dir, geometry, streamed.expert_layout, config.expertDropRequest()) catch |err| {
         log.err("{s}\n", .{expert_usage.describe(err)});
         return error.ExpertDropRefused;
     };
     defer if (drop) |*d| d.deinit();
     if (drop) |*d| geometry.drop = d;
-    var streamed = config.*;
-    streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
     if (config.stream_mtp_head and !admission.streamedMtpHead(config, streamed.expert_layout)) {
         log.err("[expert-stream] {s}; drop --mtp\n", .{expert_stream_mod.MTP_UNSUPPORTED});
         return error.ExpertStreamingMtpUnsupported;
@@ -821,6 +839,7 @@ fn visionLoadLine(buf: []u8, choice: model_settings.VisionChoice, streamed: bool
 pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_bytes: u64) void {
     config.expert_layout = plan.layout;
     config.expert_streaming = true;
+    config.expert_resident = plan.cache.resident;
     config.expert_cache_bytes = plan.cache.cache_bytes;
     config.expert_ssd_budget_bytes = if (plan.resolved.ledger != null) budget_bytes else 0;
     config.expert_workspace_bytes = plan.cache.workspace_bytes;
@@ -1013,7 +1032,7 @@ fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: 
 }
 
 fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
-    const split = try model_mod.residentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
+    const split = try model_mod.residentWeightBytes(io, allocator, model_dir, load_vision, mtp_on, @import("cooler_side.zig").onEngine(config));
     return split.trunk +| split.mtp +| bills.rerankCoarseBill(split, config, mtp_on, mtp_mod.rerankCoarseBits());
 }
 
@@ -1539,7 +1558,7 @@ fn plainFilesNeedMlx(backend: kv_disk_fs.Backend, arrays_on: ?mlx.mlx_stream) bo
 /// Brings up the model's SSD tier and the hot prefix cache hanging off it, and bills the tier on the config.
 /// `entry` has its config, path and handle; `disk_bytes` is the SSD ask. A re-arm of a declined tier logs nothing
 /// when it fails and leaves the config declined; one that finds the cache built (a RAM tier) attaches the tier to it.
-fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedModel, p: CacheAttach, disk_bytes: u64, mode: AttachMode) !void {
+pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedModel, p: CacheAttach, disk_bytes: u64, mode: AttachMode) !void {
     const config = entry.config.?;
     const xfm: ?*trunk.Trunk = if (entry.handle) |h| arch_handle.trunk(h) else null;
     const failed: log.Level = if (mode == .rearm) .debug else .warn;
@@ -1984,7 +2003,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const mtp_enabled = mtp.on and !mtp_streaming_off and !arch_config.fact(params.config, "no_mtp_head");
     arch_serve.loadLines(params.config, .{ .io = sch.io, .allocator = sch.allocator, .model_dir = params.model_dir, .mtp_source = mtp.sourceName() });
     arch_load.logLoad(params.config, kv_quant_config, mtp.on, params);
-    var rows_buf: [192]u8 = undefined;
+    var rows_buf: [320]u8 = undefined;
     if (arch_sched.coolerRowsLine(&rows_buf, params.config)) |line| log.info("{s}\n", .{line});
     if (@import("chat.zig").templateTakesPreserveThinking(params.chat_config)) {
         const keep = settings_resolve.resolve(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, model_settings.default_preserve_thinking);
@@ -2054,7 +2073,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 while (done_pre < kv_pre) {
                     const n_chunk = @min(2048, kv_pre - done_pre);
                     const psh = [_]c_int{ 1, @intCast(n_chunk) };
-                    const ti = mlx.mlx_array_new_data(pre_buf.ptr, &psh, 2, .int32);
+                    const ti = try mlx.newData(pre_buf.ptr, &psh, .int32);
                     defer _ = mlx.mlx_array_free(ti);
                     const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                     _ = mlx.mlx_array_eval(lg);
@@ -2078,7 +2097,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             defer if (tick) |k| k.end();
             // Warm: first forward pays kernel JIT + lazy weight materialization.
             for (0..3) |_| {
-                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                const ti = try mlx.newData(tok, &tsh, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -2103,7 +2122,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             gpu_mem.resetPeak();
             const active0 = gpu_mem.activeBytes();
             for (0..n) |_| {
-                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                const ti = try mlx.newData(tok, &tsh, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const ops_before = mlx.op_count.load(.monotonic);
                 var swb = io_u.Stopwatch.init(tio);
@@ -2174,7 +2193,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // SUSHI_DECODE_FWD_GRAPH=<abs path>: one forward's unevaluated tape, one primitive per
             // line; a primitive is at most one dispatch, so a histogram of it is the dispatch plan.
             if (std.c.getenv("SUSHI_DECODE_FWD_GRAPH")) |path| {
-                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                const ti = try mlx.newData(tok, &tsh, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = try xfm_ptr.forwardWith(&ctx, ti);
                 defer _ = mlx.mlx_array_free(lg);
@@ -2196,7 +2215,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // this the one sound ablation in the probe.
             ctx.skip_lm_head = true;
             for (0..3) |_| {
-                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                const ti = try mlx.newData(tok, &tsh, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -2205,7 +2224,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var sw_nolm = io_u.Stopwatch.init(tio);
             var done_nolm: usize = 0;
             for (0..n) |_| {
-                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                const ti = try mlx.newData(tok, &tsh, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -2218,7 +2237,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (profile_pass) {
                 trunk.decodeProfileSession(@intCast(rows));
                 for (0..n) |_| {
-                    const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                    const ti = try mlx.newData(tok, &tsh, .int32);
                     defer _ = mlx.mlx_array_free(ti);
                     const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                     _ = mlx.mlx_array_eval(lg);
@@ -2355,7 +2374,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Gated exactly like `entry.mtp`'s `.qwen4` arm below: `--no-mtp` never
     // drafts, so it never pays. One-shot, so the draft path's ask stays a
     // pure read; if this ever does not run, that ask still builds.
-    if (mtp_enabled) _ = arch_state.buildDraftRerank(xfm_ptr);
+    if (mtp_enabled) _ = try arch_state.buildDraftRerank(xfm_ptr);
 
     if (xfm_ptr.expert_stream) |engine| warm: {
         if (engine.plan.resident) break :warm;
@@ -2378,11 +2397,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // on this thread's stream. ~600-900 ms at boot but the first user request
     // skips a cold path.
     if (params.warmup_eager) {
-        const verify_cap: ?u32 = if (mtp_enabled) @min(
+        const verify_cap: ?u32 = if (mtp_enabled) generate_mod.Generator.mtpWarmVerifyCap(
+            params.config,
             generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
-            generate_mod.Generator.mtpVerifyDraftsMax(params.config),
         ) else null;
-        try warmLoad(sch.io, params.config, xfm_ptr, verify_cap, aux_head, kv_quant_config);
+        try warmLoad(sch.io, sch.allocator, params.config, xfm_ptr, verify_cap, aux_head, kv_quant_config);
     }
     settleLoadLatch(had_error_at_start);
 
@@ -2741,7 +2760,7 @@ fn prefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, cfg: *const ModelConfig,
             xfm.resetCache() catch return;
             var ctx = xfm.defaultCtx();
             ctx.skip_lm_head = true;
-            const ti = mlx.mlx_array_new_data(ids.ptr, &shape, 2, .int32);
+            const ti = mlx.newData(ids.ptr, &shape, .int32) catch return;
             defer _ = mlx.mlx_array_free(ti);
             var sw = io_util.Stopwatch.init(tio);
             const out = xfm.forwardWith(&ctx, ti) catch |err| {

@@ -1,9 +1,8 @@
-//! DeepSeek-V4.1's launch face (the `flags` slot of `arch.zig`): `--drop-expert`, `repack`, the launch flags it
+//! DeepSeek-V4.1's launch face (the `flags` slot of `arch.zig`): `repack`, the launch flags it
 //! cannot act on, and the borrow hooks the server installs.
 const std = @import("std");
 const model = @import("../model.zig");
 const flags = @import("../arch/flags.zig");
-const expert_usage = @import("../expert_usage.zig");
 const repack = @import("repack.zig");
 const borrow = @import("dsv41_borrow.zig");
 const dsv41_bill = @import("dsv41_bill.zig");
@@ -12,10 +11,6 @@ const source = @import("dsv41_source.zig");
 const arch_serve = @import("../arch/serve.zig");
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const log = @import("../log.zig");
-
-pub const options = [_]flags.Option{
-    .{ .name = "--drop-expert", .takes_value = true, .apply = setDropExpert, .expected = "expected a multiple of 8 routed experts per layer (0 = off)" },
-};
 
 pub const help = [_]flags.HelpChunk{
     .{ .before = "  update ", .text =
@@ -42,12 +37,6 @@ pub const help = [_]flags.HelpChunk{
         \\                      misbehaves; report it at
         \\                      https://github.com/beamivalice/sushi/issues/new.
         \\                      Outranks the model's ds41_cooler setting.
-        \\  --drop-expert <n>   DeepSeek-V4.1 only: never load or pick the n least-used
-        \\                      routed experts of every layer, ranked by the pack's
-        \\                      expert_usage.json (n a multiple of 8; default 0 =
-        \\                      off). A token's pick moves to its next-best expert;
-        \\                      the memory bill shrinks by the dropped bytes. Answers
-        \\                      change, so score it with `sushi kld compare`.
         \\
     },
 };
@@ -59,8 +48,6 @@ pub const command = struct {
         return repack.cmdRepack(allocator, io, args);
     }
 };
-
-pub const drop_expert_elsewhere = "--drop-expert has no effect on this model: only deepseek_v41 packs carry an expert usage list; drop the flag";
 
 
 
@@ -107,11 +94,6 @@ pub const serve = struct {
         }
     }
 };
-
-fn setDropExpert(value: []const u8) bool {
-    model.drop_expert = expert_usage.parseCount(value) orelse return false;
-    return true;
-}
 
 /// A launch flag with nothing to act on here; null when every flag given applies.
 pub fn refusal(config: *const model.ModelConfig, use: flags.LaunchFlagUse) ?[]const u8 {

@@ -338,6 +338,8 @@ pub const Request = struct {
     kind: Kind,
     /// The prompt length whose end point this request should restore; 0 = cold.
     base: usize,
+    /// What the request before it generated: a live state holds those tokens past `base`.
+    tail: u32 = 0,
 };
 
 fn isRung(rungs: []const usize, len: usize) bool {
@@ -361,8 +363,9 @@ pub fn plan(allocator: std.mem.Allocator, decode_tokens: u32, rungs: []const usi
     var step: usize = 0;
     while (true) : (step += 1) {
         const decode = isRung(rungs, len);
-        try list.append(allocator, .{ .prompt_len = len, .max_tokens = if (decode) decode_tokens else 1, .kind = .ladder, .base = prev });
-        if (decode) for (1..samples_per_rung) |_| try list.append(allocator, .{ .prompt_len = len, .max_tokens = decode_tokens, .kind = .repeat, .base = len });
+        const tail: u32 = if (list.items.len > 0) list.items[list.items.len - 1].max_tokens else 0;
+        try list.append(allocator, .{ .prompt_len = len, .max_tokens = if (decode) decode_tokens else 1, .kind = .ladder, .base = prev, .tail = tail });
+        if (decode) for (1..samples_per_rung) |_| try list.append(allocator, .{ .prompt_len = len, .max_tokens = decode_tokens, .kind = .repeat, .base = len, .tail = decode_tokens });
         prev = len;
         if (len >= rungs[rungs.len - 1]) break;
         len = window * (step + 1);
@@ -377,6 +380,7 @@ pub const Sample = struct {
     prompt_len: usize,
     kind: Kind,
     base: usize,
+    tail: u32 = 0,
     max_tokens: u32,
     prompt_n: u32,
     cached_n: u32,
@@ -602,7 +606,7 @@ pub fn check(s: Sample) ?Problem {
     if (s.compiled > 0) return .compiled_in_request;
     if (s.base == 0) {
         if (s.cached_n != 0) return .restore_missed;
-    } else if (s.cached_n + restore_slack < s.base or s.cached_n > s.base) return .restore_missed;
+    } else if (s.cached_n + restore_slack < s.base or s.cached_n > s.base + s.tail) return .restore_missed;
     if (!s.restore_logged) return .no_restore_line;
     if (s.max_tokens > 1 and s.completion_n < s.max_tokens and !s.loop_stop) return .short_decode;
     return null;
@@ -1279,6 +1283,7 @@ fn runRequest(a: std.mem.Allocator, io: std.Io, client: *std.http.Client, url: [
         .prompt_len = req.prompt_len,
         .kind = req.kind,
         .base = req.base,
+        .tail = req.tail,
         .max_tokens = req.max_tokens,
         .prompt_n = c.prompt_n,
         .cached_n = c.cached_n,
@@ -1449,6 +1454,7 @@ const LocalBackend = struct {
             .prompt_len = req.prompt_len,
             .kind = req.kind,
             .base = req.base,
+            .tail = req.tail,
             .max_tokens = req.max_tokens,
             .prompt_n = r.prompt_tokens,
             .cached_n = r.cached_tokens,
@@ -1905,6 +1911,16 @@ test "bench table: one row a decode rung with the window that ends at it, the de
     try testing.expect(std.mem.indexOf(u8, prose4, "mixed") != null);
     try testing.expectEqualStrings("", lines.next().?);
     try testing.expect(lines.next() == null);
+}
+
+test "bench samples: a restore may run past the previous prompt end by the tokens that request generated, and no further" {
+    var s: Sample = .{
+        .prompt_len = 32768, .kind = .ladder, .base = 24576, .tail = 1, .max_tokens = 1, .prompt_n = 32768, .cached_n = 24577,
+        .completion_n = 1, .prompt_ms = 5000, .predicted_ms = 50, .wall_ms = 5100, .restore_ms = 1000, .restore_logged = true, .mode = "",
+    };
+    try testing.expect(check(s) == null);
+    s.cached_n = 24578;
+    try testing.expectEqual(Problem.restore_missed, check(s).?);
 }
 
 test "bench samples: the restore comes out of the prefill time, and a missed restore is flagged" {

@@ -52,3 +52,4 @@ owned-insert-arg src/dsv41/repack.zig:buildPlan buildPlan runs on the shard's ar
 log-line-end src/ubench_main.zig:main the usage text it prints last ends the line
 log-line-end src/bench.zig:start the usage text it prints last ends the line
 test-unrooted src/arch/slice_check.zig:- build.zig compiles it as its own per-arch root with the arch_slice module, which no shared test root has
+engine-lifecycle src/model_load.zig:begin a job's turn on the engine holds it for the job's span, not a load's

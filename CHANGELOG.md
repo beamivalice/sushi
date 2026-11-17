@@ -6,8 +6,22 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
-- **`--qwen-mlx-engine` and the web UI's `qwen_cooler` checkbox keep a Qwen3.8 load on MLX**, the opt-out for when
-  Qwen STQ packs move to Sushi Cooler; until then every Qwen load decodes on MLX, and its load line says so.
+- **Qwen3.8 runs on Sushi Cooler, the engine of our own, by default**: its STQ packs and its BF16 checkpoint. Pass
+  `--qwen-mlx-engine`, or clear the web UI's `qwen_cooler` checkbox, to keep it on MLX; the load line names the side.
+- **A Qwen3.8 load on Sushi Cooler runs its vision tower there too**, so images no longer need `--no-vision` or MLX; an
+  image or video encode there runs inside its memory bill and is refused by name, never a Metal out-of-memory.
+- **Sushi Cooler runs Qwen3.8's elementwise chains as one kernel each and waits on the GPU only where MLX does**, with
+  the same tokens and less CPU time per token.
+- **A Sushi Cooler prefill chunk holds about what it was admitted under**: buffers a chunk frees return to the pool
+  within it, and the engine keeps no more free buffers than MLX's cache may, so a wide chunk no longer runs a 32 GB
+  Mac out of memory.
+- **A prompt longer than one prefill chunk reserves its KV cache once**, instead of regrowing it at every chunk.
+- **DeepSeek-V4.1 on Sushi Cooler counts its parked decode pool once**, so it no longer admits a narrower prefill
+  chunk, or refuses a request, that fits.
+- **A Qwen3.8 load on Sushi Cooler decodes concurrent requests as joined rows**, as on MLX, instead of one at a time.
+- **Qwen3.8's BF16 checkpoint runs on Sushi Cooler**, its streamed experts through the engine's dense expert gather.
+- **A Sushi Cooler load compiles nothing inside a request after its first on a machine**: what a request had to compile
+  is kept with the warm's in the pack's pipeline manifest, and the next load makes it ahead and skips the warm.
 - **A Sushi Cooler load whose warm-up fails no longer serves**: the load fails by name instead of the first request
   paying the failure.
 - **DeepSeek-V4.1-Flash's own release checkpoint (FP8 trunk, MXFP4 experts) now runs on Sushi Cooler too**, with

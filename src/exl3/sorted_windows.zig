@@ -1,6 +1,7 @@
 const kernel_src = @import("kernel_source.zig");
 const log = @import("mlx_host").log;
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 const std = @import("std");
 const kernels = @import("expert_exl3_kernels.zig");
 
@@ -58,7 +59,7 @@ pub fn buildGpuWindowTable(s: mlx.mlx_stream, eids: mlx.mlx_array, order: mlx.ml
         break :blk c;
     };
     const nn: u32 = @intCast(n);
-    const count = mlx.mlx_array_new_data(&nn, &.{1}, 1, .uint32);
+    const count = try host_side.made(mlx.mlx_array_new_data(&nn, &.{1}, 1, .uint32));
     defer _ = mlx.mlx_array_free(count);
     const kernel = try kernels.getNamedKernel(&gpu_window_kernel, "sushi_exl3_gpu_windows", &.{ "eids", "order", "count" }, &.{ "starts", "nlives", "inverse" }, GPU_WINDOW_SOURCE, "");
     const outputs = try kernels.applyOuts(s, kernel, &.{ eids, order, count }, cfg, 3);
@@ -91,9 +92,9 @@ fn gpuWindowCapacityCase(s: mlx.mlx_stream, experts: c_int) !void {
             id.* = @intCast(@min((i / 97) * 3, ne - 1));
             o.* = @intCast((i + 7) % n);
         }
-        const ea = mlx.mlx_array_new_data(ids.ptr, &.{@intCast(n)}, 1, .uint32);
+        const ea = try host_side.made(mlx.mlx_array_new_data(ids.ptr, &.{@intCast(n)}, 1, .uint32));
         defer _ = mlx.mlx_array_free(ea);
-        const oa = mlx.mlx_array_new_data(ord.ptr, &.{@intCast(n)}, 1, .uint32);
+        const oa = try host_side.made(mlx.mlx_array_new_data(ord.ptr, &.{@intCast(n)}, 1, .uint32));
         defer _ = mlx.mlx_array_free(oa);
         const m = try buildGpuWindowTable(s, ea, oa, @intCast(n), 32, experts);
         defer _ = mlx.mlx_array_free(m.table.starts);

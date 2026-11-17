@@ -3,6 +3,7 @@ const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const moe_gqmv = @import("../moe_gqmv.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const arm_trial = @import("../arm_trial.zig");
 const mrope = @import("../mrope.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
 const QSA_SELECT_SPLIT_MAX_ROWS = qwen4_qsa.QSA_SELECT_SPLIT_MAX_ROWS;
@@ -120,27 +121,28 @@ pub fn qsaScoreFusedActive() bool {
     return qsaScoreFusedProbeOk();
 }
 
-var qsa_score_probe_state: std.atomic.Value(u8) = .init(0);
+/// The fused score kernel's trial, for each side of the host (`arm_trial.Verdict`), read on the side a forward makes
+/// arrays on now.
+var qsa_score_trial: arm_trial.Verdict = .{};
 
 fn qsaScoreFusedProbeOk() bool {
-    return qsa_score_probe_state.load(.acquire) == 2;
+    return qsa_score_trial.kept(arm_trial.making());
 }
 
 pub fn qsaScoreFusedProbeFailed() bool {
-    return qsa_score_probe_state.load(.acquire) == 1;
+    return qsa_score_trial.declined(arm_trial.making());
 }
 
 pub fn qsaScoreFusedProbeReset() void {
-    qsa_score_probe_state.store(0, .release);
+    qsa_score_trial.reset();
 }
 
 /// Probes the fused score kernel once a process, on `s`: the load's stream or a forward's.
 pub fn qsaScoreFusedArm(s: mlx.mlx_stream) !void {
-    if (qsa_score_probe_state.load(.acquire) != 0) return;
+    const side = arm_trial.sideOf(s);
+    if (qsa_score_trial.tried(side)) return;
     if (!qsaScoreFusedEnabled() or !verifyQmmNaxAvailable() or !qsaScoreTf32Enabled()) return;
-    const ok = qsaScoreFusedRunProbe(s);
-    try qwen4_qsa_gather.probeRan(s, ok);
-    qsa_score_probe_state.store(if (ok) 2 else 1, .release);
+    qsa_score_trial.set(side, try arm_trial.run(s, qwen4_qsa_gather.probeTrial(qsaScoreFusedRunProbe), .{s}));
 }
 
 pub fn qsaScoreFusedActiveFor(batch: c_int, n_idx: c_int, idx_hd: c_int) bool {
@@ -387,7 +389,7 @@ pub fn qsaScoreSheetComposed(s: mlx.mlx_stream, q: mlx.mlx_array, k32t: mlx.mlx_
     var sc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sc);
     try mlx.check(mlx.mlx_matmul(&sc, q32, k32t, s));
-    const zero = mlx.mlx_array_new_float(0.0);
+    const zero = try mlx.newFloat(0.0);
     defer _ = mlx.mlx_array_free(zero);
     var relu = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(relu);
@@ -579,7 +581,7 @@ pub const QsaBlockConsts = struct {
         var blk_idx_f = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(blk_idx_f);
         try mlx.check(mlx.mlx_arange(&blk_idx_f, 0, @floatFromInt(nb), 1.0, .float32, s));
-        const tie_eps = mlx.mlx_array_new_float(1e-7);
+        const tie_eps = try mlx.newFloat(1e-7);
         defer _ = mlx.mlx_array_free(tie_eps);
         self.tie_bias = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_multiply(&self.tie_bias, blk_idx_f, tie_eps, s));
@@ -701,12 +703,12 @@ pub fn qsaPoolNormRopeFused(
         qsa_pool_rope_cfg_key = key;
     }
     const kernel = try getQsaPoolRopeKernel();
-    const eps_a = mlx.mlx_array_new_float(eps);
+    const eps_a = try mlx.newFloat(eps);
     defer _ = mlx.mlx_array_free(eps_a);
     // MLX's mean multiplies by NumberOfElements: f32(1.0 / n) computed in f64.
-    const inv_r = mlx.mlx_array_new_float(@floatCast(1.0 / @as(f64, @floatFromInt(ksh[2]))));
+    const inv_r = try mlx.newFloat(@floatCast(1.0 / @as(f64, @floatFromInt(ksh[2]))));
     defer _ = mlx.mlx_array_free(inv_r);
-    const nblk = mlx.mlx_array_new_int(ksh[1]);
+    const nblk = try mlx.newInt(ksh[1]);
     defer _ = mlx.mlx_array_free(nblk);
     const inputs_arr = [_]mlx.mlx_array{ kb4, norm_w, cosv, sinv, eps_a, inv_r, nblk };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
@@ -754,7 +756,7 @@ fn qsaPoolTestKeys(rnd: std.Random, b: c_int, nb: c_int, ratio: c_int, lo_exp: f
         const mag = std.math.pow(f32, 10.0, lo_exp + (hi_exp - lo_exp) * rnd.float(f32));
         x.* = if (rnd.boolean()) mag else -mag;
     }
-    const f = mlx.mlx_array_new_data(data.ptr, &shape, 4, .float32);
+    const f = try mlx.newData(data.ptr, &shape, .float32);
     defer _ = mlx.mlx_array_free(f);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -774,7 +776,7 @@ fn qsaPoolCancelKeys(rnd: std.Random, nb: c_int, ratio: c_int, s: mlx.mlx_stream
         data[at] = if (c % 2 == 1) rnd.float(f32) - 0.5 else if (r > 1 and p == 0) 16777216.0 else if (r > 1 and p == r / 2) -16777216.0 else 1.0;
     };
     const shape = [_]c_int{ 1, nb, ratio, 128 };
-    const f = mlx.mlx_array_new_data(data.ptr, &shape, 4, .float32);
+    const f = try mlx.newData(data.ptr, &shape, .float32);
     defer _ = mlx.mlx_array_free(f);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -789,7 +791,7 @@ const QsaPoolTestTrunk = struct {
     inv: [32]f64,
     freqs: mlx.mlx_array,
 
-    pub fn init(self: *QsaPoolTestTrunk, s: mlx.mlx_stream, yarn: bool) void {
+    pub fn init(self: *QsaPoolTestTrunk, s: mlx.mlx_stream, yarn: bool) !void {
         const t = &self.t;
         t.s = s;
         t.allocator = testing.allocator;
@@ -818,7 +820,7 @@ const QsaPoolTestTrunk = struct {
         yarnSpec(&t.config).invFreq(&self.inv);
         var den: [32]f32 = undefined;
         for (self.inv, 0..) |v, i| den[i] = @floatCast(1.0 / v);
-        self.freqs = mlx.mlx_array_new_data(&den, &[_]c_int{32}, 1, .float32);
+        self.freqs = try mlx.newData(&den, &[_]c_int{32}, .float32);
         t.rope_freqs_yarn = self.freqs;
         t.yarn_inv_freq = &self.inv;
     }
@@ -863,7 +865,7 @@ fn qsaRandScoresF32(rnd: std.Random, shape: []const c_int) !mlx.mlx_array {
         const v = rnd.float(f32) - 0.35;
         x.* = if (v > 0) v else 0.0;
     }
-    return mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+    return try mlx.newData(data.ptr, shape, .float32);
 }
 
 /// The `[1, rows, nb]` bool visibility sheet the composed arm masks with, free of a Trunk.
@@ -894,7 +896,7 @@ fn qsaTieBiasForTest(s: mlx.mlx_stream, nb: c_int) !mlx.mlx_array {
     var idx = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(idx);
     try mlx.check(mlx.mlx_arange(&idx, 0, @floatFromInt(nb), 1.0, .float32, s));
-    const eps = mlx.mlx_array_new_float(1e-7);
+    const eps = try mlx.newFloat(1e-7);
     defer _ = mlx.mlx_array_free(eps);
     var bias = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(bias);
@@ -990,6 +992,80 @@ fn qsaSelectMakeSheet(kind: u8, buf: []f32, rnd: std.Random) void {
     }
 }
 
+test "qsa select on the engine before the seal makes the split's pipelines, so a long select after it compiles none" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    const s = mlx.engine.stream();
+    // A block budget no other test takes: its pipelines are this test's to make.
+    const kb: c_int = 37;
+    var narrow_host: [64]f32 = undefined;
+    for (&narrow_host, 0..) |*v, i| v.* = @floatFromInt(i);
+    {
+        const mk = mlx.engine.makers(true);
+        defer mk.end();
+        const scores = mlx.mlx_array_new_data(&narrow_host, &[_]c_int{ 1, 1, 64 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+        var b = [_]i32{64};
+        const bounds = mlx.mlx_array_new_data(&b, &[_]c_int{1}, 1, .int32);
+        defer _ = mlx.mlx_array_free(bounds);
+        const picks = (try qwen4_qsa.qsaSelectTopBlocks(s, scores, bounds, kb)) orelse return error.SelectKernelDeclined;
+        _ = mlx.mlx_array_free(picks);
+    }
+    mlx.engine.seal(true);
+    defer mlx.engine.seal(false);
+    const late = mlx.engine.latePipelines();
+    const nb: c_int = qwen4_qsa.QSA_SELECT_SPLIT_MIN_NB;
+    const wide_host = try testing.allocator.alloc(f32, @intCast(nb));
+    defer testing.allocator.free(wide_host);
+    for (wide_host, 0..) |*v, i| v.* = @floatFromInt(i % 977);
+    const mk = mlx.engine.makers(true);
+    defer mk.end();
+    const scores = mlx.mlx_array_new_data(wide_host.ptr, &[_]c_int{ 1, 1, nb }, 3, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    var b = [_]i32{nb};
+    const bounds = mlx.mlx_array_new_data(&b, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(bounds);
+    const picks = (try qwen4_qsa.qsaSelectTopBlocks(s, scores, bounds, kb)) orelse return error.SelectKernelDeclined;
+    defer _ = mlx.mlx_array_free(picks);
+    try testing.expect(qwen4_qsa.qsa_select_used_split);
+    try testing.expectEqual(late, mlx.engine.latePipelines());
+}
+
+test "qsa below the block budget before the seal makes the select every row class past it picks, so a long select compiles none" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    const s = mlx.engine.stream();
+    // A block budget no other test takes: its pipelines are this test's to make.
+    const kb: c_int = 41;
+    // A forward whose blocks fit the budget selects none; it makes them ahead.
+    try qwen4_qsa.makeSelectAhead(s, kb);
+    mlx.engine.seal(true);
+    defer mlx.engine.seal(false);
+    const late = mlx.engine.latePipelines();
+    const nb: c_int = kb * 3;
+    for ([_]c_int{ 1, 16, 64, 256 }) |rows| {
+        const host = try testing.allocator.alloc(f32, @intCast(rows * nb));
+        defer testing.allocator.free(host);
+        for (host, 0..) |*v, i| v.* = @floatFromInt(i % 977);
+        const bound = try testing.allocator.alloc(i32, @intCast(rows));
+        defer testing.allocator.free(bound);
+        @memset(bound, nb);
+        const mk = mlx.engine.makers(true);
+        defer mk.end();
+        const scores = mlx.mlx_array_new_data(host.ptr, &[_]c_int{ 1, rows, nb }, 3, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+        const bounds = mlx.mlx_array_new_data(bound.ptr, &[_]c_int{rows}, 1, .int32);
+        defer _ = mlx.mlx_array_free(bounds);
+        const picks = (try qwen4_qsa.qsaSelectTopBlocks(s, scores, bounds, kb)) orelse return error.SelectKernelDeclined;
+        _ = mlx.mlx_array_free(picks);
+    }
+    try testing.expectEqual(late, mlx.engine.latePipelines());
+}
+
 test "MTP head row widths pick the verify lane, the MoE arm and the QSA score kernel" {
     const t = std.testing;
     try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 248320, false, 8));
@@ -1035,7 +1111,7 @@ test "qsa pooled keys: the fused kernel is bit-identical to the composed chain a
     };
     for ([_]bool{ true, false }) |yarn| {
         var tr: QsaPoolTestTrunk = undefined;
-        tr.init(s, yarn);
+        try tr.init(s, yarn);
         defer tr.deinit();
         for (cases) |c| {
             const kb4 = try qsaPoolTestKeys(rnd, @intFromFloat(c[0]), @intFromFloat(c[1]), 4, c[3], c[4], .bfloat16, s);
@@ -1050,7 +1126,7 @@ test "qsa pooled keys: the fused kernel reads a strided raw-key view bit-identic
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
-    tr.init(s, true);
+    try tr.init(s, true);
     defer tr.deinit();
     var prng = std.Random.DefaultPrng.init(0x5171_DE);
     const rnd = prng.random();
@@ -1072,7 +1148,7 @@ test "qsa pooled keys: order-sensitive block sums match at ratios 1..8, and larg
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
-    tr.init(s, true);
+    try tr.init(s, true);
     defer tr.deinit();
     var prng = std.Random.DefaultPrng.init(0xCA2CE1);
     const rnd = prng.random();
@@ -1101,7 +1177,7 @@ test "qsa pooled keys: f16 and f32 operands, other head and rope widths, and a C
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
-    tr.init(s, true);
+    try tr.init(s, true);
     defer tr.deinit();
     var prng = std.Random.DefaultPrng.init(0xDEC1);
     const rnd = prng.random();
@@ -1155,7 +1231,7 @@ test "qsa pooled keys: block counts 1, 2, 7 and 512 share one fused pipeline" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tr: QsaPoolTestTrunk = undefined;
-    tr.init(s, true);
+    try tr.init(s, true);
     defer tr.deinit();
     var prng = std.Random.DefaultPrng.init(0x919E);
     const rnd = prng.random();
@@ -1178,7 +1254,7 @@ test "qsa pooled keys: the pooled bank after prefill, decode and verify is bit-i
     const s = mlx.gpuStream();
     defer qwen4_qsa.qsa_pool_rope_fused_override = null;
     var tr: QsaPoolTestTrunk = undefined;
-    tr.init(s, true);
+    try tr.init(s, true);
     defer tr.deinit();
     var prng = std.Random.DefaultPrng.init(0xB4_2CE);
     const rnd = prng.random();

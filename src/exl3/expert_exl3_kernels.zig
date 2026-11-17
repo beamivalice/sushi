@@ -1187,18 +1187,18 @@ fn probeNaxGemm(kernel: mlx.mlx_fast_metal_kernel, s: mlx.mlx_stream) bool {
     if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WIN", gemmWindowRows()) != 0) return false;
     if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NHW", 64) != 0) return false;
     const xh = std.mem.zeroes([16]u16);
-    const x = mlx.mlx_array_new_data(&xh, &[_]c_int{ 1, in_dim }, 2, .float16);
+    const x = host_side.made(mlx.mlx_array_new_data(&xh, &[_]c_int{ 1, in_dim }, 2, .float16)) catch return false;
     defer _ = mlx.mlx_array_free(x);
     const th = std.mem.zeroes([8 * 64]u16);
-    const trellis = mlx.mlx_array_new_data(&th, &[_]c_int{ 1, 1, 8, 64 }, 4, .uint16);
+    const trellis = host_side.made(mlx.mlx_array_new_data(&th, &[_]c_int{ 1, 1, 8, 64 }, 4, .uint16)) catch return false;
     defer _ = mlx.mlx_array_free(trellis);
     const zero = [_]u32{0};
     const one = [_]u32{1};
-    const eids = mlx.mlx_array_new_data(&zero, &[_]c_int{1}, 1, .uint32);
+    const eids = host_side.made(mlx.mlx_array_new_data(&zero, &[_]c_int{1}, 1, .uint32)) catch return false;
     defer _ = mlx.mlx_array_free(eids);
-    const starts = mlx.mlx_array_new_data(&zero, &[_]c_int{1}, 1, .uint32);
+    const starts = host_side.made(mlx.mlx_array_new_data(&zero, &[_]c_int{1}, 1, .uint32)) catch return false;
     defer _ = mlx.mlx_array_free(starts);
-    const nlive = mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .uint32);
+    const nlive = host_side.made(mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .uint32)) catch return false;
     defer _ = mlx.mlx_array_free(nlive);
     const inputs = [_]mlx.mlx_array{ x, trellis, eids, starts, nlive };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
@@ -1329,9 +1329,9 @@ fn buildWindowTableHost(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c
             off += live;
         }
     }
-    const starts = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
+    const starts = try host_side.made(mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32));
     errdefer _ = mlx.mlx_array_free(starts);
-    const nlives = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
+    const nlives = try host_side.made(mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32));
     if (stageProfileOn()) {
         stagePrint("[exl3-stage] win_table_host nwin={d} n={d} win={d} eval=eids\n", .{ nwin_u, n, win });
     }
@@ -1352,9 +1352,9 @@ fn buildStrideTable(n: c_int, win: c_int) !WindowTable {
         sh[i] = st;
         lh[i] = @min(w, nn - st);
     }
-    const starts = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
+    const starts = try host_side.made(mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32));
     errdefer _ = mlx.mlx_array_free(starts);
-    const nlives = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
+    const nlives = try host_side.made(mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32));
     if (stageProfileOn()) {
         stagePrint("[exl3-stage] win_table_stride nwin={d} n={d} win={d}\n", .{ nwin_u, n, win });
     }
@@ -3230,11 +3230,11 @@ fn indexedParityStats(rate: exl3.Rate, in_dim: usize, out_dim: usize, e: usize, 
     for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
     const slots_h = try alloc.alloc(u32, topk);
     for (slots_h, 0..) |*v, i| v.* = @intCast(i % e);
-    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(topk), @intCast(in_dim) }, 2, .float16);
+    const x_arr = try host_side.made(mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(topk), @intCast(in_dim) }, 2, .float16));
     defer _ = mlx.mlx_array_free(x_arr);
-    const tr_arr = mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(e), @intCast(in_tiles), @intCast(out_tiles), @intCast(packed_n) }, 4, .uint16);
+    const tr_arr = try host_side.made(mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(e), @intCast(in_tiles), @intCast(out_tiles), @intCast(packed_n) }, 4, .uint16));
     defer _ = mlx.mlx_array_free(tr_arr);
-    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{@intCast(topk)}, 1, .uint32);
+    const slots = try host_side.made(mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{@intCast(topk)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(slots);
     const got = try indexedGemvCoopF16(s, x_arr, tr_arr, slots);
     defer _ = mlx.mlx_array_free(got);
@@ -3526,11 +3526,11 @@ fn measureInnerGemmParityOn(
     out_dim: usize,
 ) !Exl3GemmParityStats {
     const rows = eids.len;
-    const w_arr = mlx.mlx_array_new_data(w.ptr, &[_]c_int{ @intCast(w.len / (in_dim * out_dim)), @intCast(in_dim), @intCast(out_dim) }, 3, .float16);
+    const w_arr = try host_side.made(mlx.mlx_array_new_data(w.ptr, &[_]c_int{ @intCast(w.len / (in_dim * out_dim)), @intCast(in_dim), @intCast(out_dim) }, 3, .float16));
     defer _ = mlx.mlx_array_free(w_arr);
-    const eid_arr = mlx.mlx_array_new_data(eids.ptr, &[_]c_int{@intCast(rows)}, 1, .uint32);
+    const eid_arr = try host_side.made(mlx.mlx_array_new_data(eids.ptr, &[_]c_int{@intCast(rows)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(eid_arr);
-    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), 1, @intCast(in_dim) }, 3, .float16);
+    const x_arr = try host_side.made(mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), 1, @intCast(in_dim) }, 3, .float16));
     defer _ = mlx.mlx_array_free(x_arr);
     var w_sel = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(w_sel);
@@ -4123,11 +4123,11 @@ fn sortedGemmSmallShape(dec: exl3.Decode) !void {
     const xh = try alloc.alloc(u16, n * dim);
     for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
     const eids = [_]u32{ 0, 0, 0, 0, 2, 2, 1, 1 };
-    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(n), @intCast(dim) }, 2, .float16);
+    const x_arr = try host_side.made(mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(n), @intCast(dim) }, 2, .float16));
     defer _ = mlx.mlx_array_free(x_arr);
-    const tr_arr = mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), 8, 8, 64 }, 4, .uint16);
+    const tr_arr = try host_side.made(mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), 8, 8, 64 }, 4, .uint16));
     defer _ = mlx.mlx_array_free(tr_arr);
-    const eid_a = mlx.mlx_array_new_data(&eids, &[_]c_int{@intCast(n)}, 1, .uint32);
+    const eid_a = try host_side.made(mlx.mlx_array_new_data(&eids, &[_]c_int{@intCast(n)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(eid_a);
     const got = try innerGemmSorted(s, x_arr, tr_arr, eid_a);
     defer _ = mlx.mlx_array_free(got);
@@ -4968,17 +4968,17 @@ fn fusedChainMatchesHost(fixture: []const u8, rate: exl3.Rate, dec: exl3.Decode)
     const sc = try alloc.alloc(f32, topk);
     for (sl, 0..) |*v, i| v.* = @intCast(i % E);
     for (sc) |*v| v.* = rnd.float(f32);
-    const xa = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{@intCast(dim)}, 1, .float16);
+    const xa = try host_side.made(mlx.mlx_array_new_data(xh.ptr, &[_]c_int{@intCast(dim)}, 1, .float16));
     defer _ = mlx.mlx_array_free(xa);
-    const tr = mlx.mlx_array_new_data(st.ptr, &[_]c_int{ @intCast(E), 8, 8, @intCast(rate.halfwords()) }, 4, .uint16);
+    const tr = try host_side.made(mlx.mlx_array_new_data(st.ptr, &[_]c_int{ @intCast(E), 8, 8, @intCast(rate.halfwords()) }, 4, .uint16));
     defer _ = mlx.mlx_array_free(tr);
-    const suh = mlx.mlx_array_new_data(su.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
+    const suh = try host_side.made(mlx.mlx_array_new_data(su.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16));
     defer _ = mlx.mlx_array_free(suh);
-    const svh = mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
+    const svh = try host_side.made(mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16));
     defer _ = mlx.mlx_array_free(svh);
-    const sa = mlx.mlx_array_new_data(sl.ptr, &[_]c_int{@intCast(topk)}, 1, .uint32);
+    const sa = try host_side.made(mlx.mlx_array_new_data(sl.ptr, &[_]c_int{@intCast(topk)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(sa);
-    const ca = mlx.mlx_array_new_data(sc.ptr, &[_]c_int{@intCast(topk)}, 1, .float32);
+    const ca = try host_side.made(mlx.mlx_array_new_data(sc.ptr, &[_]c_int{@intCast(topk)}, 1, .float32));
     defer _ = mlx.mlx_array_free(ca);
     const fused = try moeSwigluFused(s, xa, tr, suh, svh, tr, suh, svh, tr, suh, svh, sa, ca, .float16);
     defer _ = mlx.mlx_array_free(fused);
@@ -5087,11 +5087,11 @@ fn indexedGemvMatchesFixtureInner(fixture: []const u8, rate: exl3.Rate, dec: exl
     const eids = try alloc.alloc(u32, rows);
     for (eids, 0..) |*v, i| v.* = @intCast(i % E);
 
-    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(dim) }, 2, .float16);
+    const x_arr = try host_side.made(mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(dim) }, 2, .float16));
     defer _ = mlx.mlx_array_free(x_arr);
-    const tr_arr = mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), 8, 8, @intCast(rate.halfwords()) }, 4, .uint16);
+    const tr_arr = try host_side.made(mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), 8, 8, @intCast(rate.halfwords()) }, 4, .uint16));
     defer _ = mlx.mlx_array_free(tr_arr);
-    const slots = mlx.mlx_array_new_data(eids.ptr, &[_]c_int{@intCast(rows)}, 1, .uint32);
+    const slots = try host_side.made(mlx.mlx_array_new_data(eids.ptr, &[_]c_int{@intCast(rows)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(slots);
     const got = try indexedGemvCoopF16(s, x_arr, tr_arr, slots);
     defer _ = mlx.mlx_array_free(got);
@@ -5164,11 +5164,11 @@ fn sortedGemmParityShape(rate: exl3.Rate, dec: exl3.Decode, win: c_int, seed: u6
     }
     const xh = try alloc.alloc(u16, rows * in_dim);
     for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
-    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(in_dim) }, 2, .float16);
+    const x_arr = try host_side.made(mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(in_dim) }, 2, .float16));
     defer _ = mlx.mlx_array_free(x_arr);
-    const tr_arr = mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), @intCast(in_dim / 16), @intCast(out_dim / 16), @intCast(packed_n) }, 4, .uint16);
+    const tr_arr = try host_side.made(mlx.mlx_array_new_data(stacked.ptr, &[_]c_int{ @intCast(E), @intCast(in_dim / 16), @intCast(out_dim / 16), @intCast(packed_n) }, 4, .uint16));
     defer _ = mlx.mlx_array_free(tr_arr);
-    const eid_a = mlx.mlx_array_new_data(eids.ptr, &[_]c_int{@intCast(rows)}, 1, .uint32);
+    const eid_a = try host_side.made(mlx.mlx_array_new_data(eids.ptr, &[_]c_int{@intCast(rows)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(eid_a);
     const got = try innerGemmSortedWinAlign(s, x_arr, tr_arr, eid_a, win, shape.aligned);
     defer _ = mlx.mlx_array_free(got);
@@ -5549,16 +5549,16 @@ pub fn moeFixture(alloc: std.mem.Allocator, c: MoeCase) !MoeFixture {
     }.i;
     return .{
         .arrays = .{
-            mlx.mlx_array_new_data(gate_t.ptr, &[_]c_int{ ci(c.e), ci(ith), ci(iti), ci(n) }, 4, .uint16),
-            mlx.mlx_array_new_data(up_t.ptr, &[_]c_int{ ci(c.e), ci(ith), ci(iti), ci(n) }, 4, .uint16),
-            mlx.mlx_array_new_data(down_t.ptr, &[_]c_int{ ci(c.e), ci(iti), ci(ith), ci(n) }, 4, .uint16),
-            mlx.mlx_array_new_data(suh_h.ptr, &[_]c_int{ ci(c.e), ci(c.hidden) }, 2, .float16),
-            mlx.mlx_array_new_data(svh_i.ptr, &[_]c_int{ ci(c.e), ci(c.inter) }, 2, .float16),
-            mlx.mlx_array_new_data(suh_i.ptr, &[_]c_int{ ci(c.e), ci(c.inter) }, 2, .float16),
-            mlx.mlx_array_new_data(svh_h.ptr, &[_]c_int{ ci(c.e), ci(c.hidden) }, 2, .float16),
-            mlx.mlx_array_new_data(slots.ptr, &[_]c_int{ci(c.rows * c.topk)}, 1, .uint32),
-            mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ ci(c.rows), ci(c.hidden) }, 2, .float16),
-            mlx.mlx_array_new_data(scores.ptr, &[_]c_int{ci(c.rows * c.topk)}, 1, .float32),
+            try host_side.made(mlx.mlx_array_new_data(gate_t.ptr, &[_]c_int{ ci(c.e), ci(ith), ci(iti), ci(n) }, 4, .uint16)),
+            try host_side.made(mlx.mlx_array_new_data(up_t.ptr, &[_]c_int{ ci(c.e), ci(ith), ci(iti), ci(n) }, 4, .uint16)),
+            try host_side.made(mlx.mlx_array_new_data(down_t.ptr, &[_]c_int{ ci(c.e), ci(iti), ci(ith), ci(n) }, 4, .uint16)),
+            try host_side.made(mlx.mlx_array_new_data(suh_h.ptr, &[_]c_int{ ci(c.e), ci(c.hidden) }, 2, .float16)),
+            try host_side.made(mlx.mlx_array_new_data(svh_i.ptr, &[_]c_int{ ci(c.e), ci(c.inter) }, 2, .float16)),
+            try host_side.made(mlx.mlx_array_new_data(suh_i.ptr, &[_]c_int{ ci(c.e), ci(c.inter) }, 2, .float16)),
+            try host_side.made(mlx.mlx_array_new_data(svh_h.ptr, &[_]c_int{ ci(c.e), ci(c.hidden) }, 2, .float16)),
+            try host_side.made(mlx.mlx_array_new_data(slots.ptr, &[_]c_int{ci(c.rows * c.topk)}, 1, .uint32)),
+            try host_side.made(mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ ci(c.rows), ci(c.hidden) }, 2, .float16)),
+            try host_side.made(mlx.mlx_array_new_data(scores.ptr, &[_]c_int{ci(c.rows * c.topk)}, 1, .float32)),
         },
         .gate_t = gate_t,
         .up_t = up_t,
@@ -6359,17 +6359,17 @@ pub fn rowsParityStats(c: RowsCase) !Exl3GemmParityStats {
     for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
     const zeros = try alloc.alloc(u32, c.rows);
     @memset(zeros, 0);
-    const x_a = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(c.rows), @intCast(c.in_dim) }, 2, .float16);
+    const x_a = try host_side.made(mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(c.rows), @intCast(c.in_dim) }, 2, .float16));
     defer _ = mlx.mlx_array_free(x_a);
-    const tr3 = mlx.mlx_array_new_data(tr.ptr, &[_]c_int{ @intCast(it), @intCast(ot), @intCast(nh) }, 3, .uint16);
+    const tr3 = try host_side.made(mlx.mlx_array_new_data(tr.ptr, &[_]c_int{ @intCast(it), @intCast(ot), @intCast(nh) }, 3, .uint16));
     defer _ = mlx.mlx_array_free(tr3);
-    const tr4 = mlx.mlx_array_new_data(tr.ptr, &[_]c_int{ 1, @intCast(it), @intCast(ot), @intCast(nh) }, 4, .uint16);
+    const tr4 = try host_side.made(mlx.mlx_array_new_data(tr.ptr, &[_]c_int{ 1, @intCast(it), @intCast(ot), @intCast(nh) }, 4, .uint16));
     defer _ = mlx.mlx_array_free(tr4);
-    const suh_a = mlx.mlx_array_new_data(suh.ptr, &[_]c_int{ 1, @intCast(c.in_dim) }, 2, .float16);
+    const suh_a = try host_side.made(mlx.mlx_array_new_data(suh.ptr, &[_]c_int{ 1, @intCast(c.in_dim) }, 2, .float16));
     defer _ = mlx.mlx_array_free(suh_a);
-    const svh_a = mlx.mlx_array_new_data(svh.ptr, &[_]c_int{ 1, @intCast(c.out_dim) }, 2, .float16);
+    const svh_a = try host_side.made(mlx.mlx_array_new_data(svh.ptr, &[_]c_int{ 1, @intCast(c.out_dim) }, 2, .float16));
     defer _ = mlx.mlx_array_free(svh_a);
-    const slots = mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{@intCast(c.rows)}, 1, .uint32);
+    const slots = try host_side.made(mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{@intCast(c.rows)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(slots);
     const geom = c.geom orelse project_rows.rowsGeometry(@intCast(c.in_dim), @intCast(c.out_dim), @intCast(c.rows), 1, .{});
     const got_a = try project_rows.projectRowsWith(s, x_a, tr3, suh_a, svh_a, geom, if (c.mutant_rows) try rowsMutantKernel(geom) else try project_rows.rowsKernel(geom), null);
@@ -6534,7 +6534,7 @@ pub fn weightReaderExactAt(comptime n: u32, comptime cb: exl3.Codebook, comptime
     var trellis_data: [128 * n]u16 = undefined;
     var prng = std.Random.DefaultPrng.init(430);
     for (&trellis_data) |*v| v.* = prng.random().int(u16);
-    const tr = mlx.mlx_array_new_data(&trellis_data, &.{ 128, @intCast(n) }, 2, .uint16);
+    const tr = try host_side.made(mlx.mlx_array_new_data(&trellis_data, &.{ 128, @intCast(n) }, 2, .uint16));
     defer _ = mlx.mlx_array_free(tr);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -6608,7 +6608,7 @@ fn bf16TruthCaseAnyArm(c: MoeCase, win: c_int, decode: bool) !void {
         v.* = @bitCast(@as(u32, b.*) << 16);
     }
     _ = mlx.mlx_array_free(f.arrays[8]);
-    f.arrays[8] = mlx.mlx_array_new_data(xb.ptr, &.{ @intCast(rows), @intCast(hidden) }, 2, .bfloat16);
+    f.arrays[8] = try host_side.made(mlx.mlx_array_new_data(xb.ptr, &.{ @intCast(rows), @intCast(hidden) }, 2, .bfloat16));
     resetFusedDispatchCount();
     const ar = f.arrays;
     const y = if (decode)
@@ -6633,11 +6633,11 @@ fn bf16TruthCaseAnyArm(c: MoeCase, win: c_int, decode: bool) !void {
         const slots = f.slots[r * c.topk ..][0..c.topk];
         const scores = f.scores[r * c.topk ..][0..c.topk];
         try exl3SwigluF32(alloc, f.xf[r * c.hidden ..][0..c.hidden], &f, c, slots, scores, &peaks, truth);
-        const xr = mlx.mlx_array_new_data(xb[r * c.hidden ..].ptr, &.{@intCast(hidden)}, 1, .bfloat16);
+        const xr = try host_side.made(mlx.mlx_array_new_data(xb[r * c.hidden ..].ptr, &.{@intCast(hidden)}, 1, .bfloat16));
         defer _ = mlx.mlx_array_free(xr);
-        const sr = mlx.mlx_array_new_data(slots.ptr, &.{@intCast(c.topk)}, 1, .uint32);
+        const sr = try host_side.made(mlx.mlx_array_new_data(slots.ptr, &.{@intCast(c.topk)}, 1, .uint32));
         defer _ = mlx.mlx_array_free(sr);
-        const cr = mlx.mlx_array_new_data(scores.ptr, &.{@intCast(c.topk)}, 1, .float32);
+        const cr = try host_side.made(mlx.mlx_array_new_data(scores.ptr, &.{@intCast(c.topk)}, 1, .float32));
         defer _ = mlx.mlx_array_free(cr);
         const a = f.arrays;
         const composite = try moeSwigluIndexed(s, xr, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], sr, cr);
@@ -7525,7 +7525,7 @@ fn moeChainBytesMatch(c: MoeCase) !void {
     const xb = try alloc.alloc(u16, f.xf.len);
     for (f.xf, xb) |v, *b| b.* = @truncate(@as(u32, @bitCast(v)) >> 16);
     _ = mlx.mlx_array_free(f.arrays[8]);
-    f.arrays[8] = mlx.mlx_array_new_data(xb.ptr, &.{ @intCast(c.rows), @intCast(c.hidden) }, 2, .bfloat16);
+    f.arrays[8] = try host_side.made(mlx.mlx_array_new_data(xb.ptr, &.{ @intCast(c.rows), @intCast(c.hidden) }, 2, .bfloat16));
     const ar = f.arrays;
     var ys: [2]mlx.mlx_array = undefined;
     var cs: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
@@ -7983,7 +7983,7 @@ fn verifyRowsMatchDecodeTicks(c: MoeCase) !void {
     const xb = try alloc.alloc(u16, f.xf.len);
     for (f.xf, xb) |v, *b| b.* = @truncate(@as(u32, @bitCast(v)) >> 16);
     _ = mlx.mlx_array_free(f.arrays[8]);
-    f.arrays[8] = mlx.mlx_array_new_data(xb.ptr, &.{ @intCast(c.rows), @intCast(c.hidden) }, 2, .bfloat16);
+    f.arrays[8] = try host_side.made(mlx.mlx_array_new_data(xb.ptr, &.{ @intCast(c.rows), @intCast(c.hidden) }, 2, .bfloat16));
     const ar = f.arrays;
     grouped_engaged = false;
     const block = try moeSwigluFused(s, ar[8], ar[0], ar[3], ar[4], ar[1], ar[3], ar[4], ar[2], ar[5], ar[6], ar[7], ar[9], .bfloat16);
@@ -8074,11 +8074,11 @@ fn groupedRowsMatchTicks(c: MoeCase, route: GroupRoute, bucket: c_int, selfprep:
     var prng = std.Random.DefaultPrng.init(c.seed ^ 0x9e3779b9);
     const slots = try plantedRouting(alloc, route, c.rows, c.topk, e_case.e, prng.random());
     _ = mlx.mlx_array_free(f.arrays[7]);
-    f.arrays[7] = mlx.mlx_array_new_data(slots.ptr, &.{@intCast(slots.len)}, 1, .uint32);
+    f.arrays[7] = try host_side.made(mlx.mlx_array_new_data(slots.ptr, &.{@intCast(slots.len)}, 1, .uint32));
     const xb = try alloc.alloc(u16, f.xf.len);
     for (f.xf, xb) |v, *b| b.* = @truncate(@as(u32, @bitCast(v)) >> 16);
     _ = mlx.mlx_array_free(f.arrays[8]);
-    f.arrays[8] = mlx.mlx_array_new_data(xb.ptr, &.{ @intCast(c.rows), @intCast(c.hidden) }, 2, .bfloat16);
+    f.arrays[8] = try host_side.made(mlx.mlx_array_new_data(xb.ptr, &.{ @intCast(c.rows), @intCast(c.hidden) }, 2, .bfloat16));
     const ar = f.arrays;
     prepared_mid_force = true;
     group_force = bucket;
@@ -8285,11 +8285,11 @@ pub fn carriedBlock(alloc: std.mem.Allocator, real: MoeCase, carry: f32) !Carrie
     var f = try moeFixture(alloc, c);
     errdefer f.deinit();
     _ = mlx.mlx_array_free(f.arrays[7]);
-    f.arrays[7] = mlx.mlx_array_new_data(slots.ptr, &.{@intCast(slots.len)}, 1, .uint32);
+    f.arrays[7] = try host_side.made(mlx.mlx_array_new_data(slots.ptr, &.{@intCast(slots.len)}, 1, .uint32));
     const xb = try alloc.alloc(u16, f.xf.len);
     for (f.xf, xb) |v, *b| b.* = @truncate(@as(u32, @bitCast(v)) >> 16);
     _ = mlx.mlx_array_free(f.arrays[8]);
-    f.arrays[8] = mlx.mlx_array_new_data(xb.ptr, &.{ @intCast(real.rows), @intCast(real.hidden) }, 2, .bfloat16);
+    f.arrays[8] = try host_side.made(mlx.mlx_array_new_data(xb.ptr, &.{ @intCast(real.rows), @intCast(real.hidden) }, 2, .bfloat16));
     return .{ .f = f, .slots = slots, .used = used };
 }
 
@@ -8555,7 +8555,7 @@ fn naxBodyBytesMatch(rate: exl3.Rate, dec: exl3.Decode, in_dim: c_int, out_dim: 
     const nhw: c_int = @intCast(rate.n);
     const tr_h = try alloc.alloc(u16, @intCast(E * it * ot * nhw));
     for (tr_h) |*v| v.* = @truncate(rnd.int(u32));
-    const tr = mlx.mlx_array_new_data(tr_h.ptr, &[_]c_int{ E, it, ot, nhw }, 4, .uint16);
+    const tr = try host_side.made(mlx.mlx_array_new_data(tr_h.ptr, &[_]c_int{ E, it, ot, nhw }, 4, .uint16));
     defer _ = mlx.mlx_array_free(tr);
     var nslots: usize = 0;
     for (runs) |r| nslots += r;
@@ -8565,11 +8565,11 @@ fn naxBodyBytesMatch(rate: exl3.Rate, dec: exl3.Decode, in_dim: c_int, out_dim: 
         ids[at] = @intCast(e);
         at += 1;
     };
-    const eids = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(nslots)}, 1, .uint32);
+    const eids = try host_side.made(mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(nslots)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(eids);
     const xh = try alloc.alloc(u16, nslots * @as(usize, @intCast(in_dim)));
     for (xh) |*v| v.* = exl3.f32ToF16Bits((rnd.float(f32) - 0.5) * 6.0);
-    const x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(nslots), in_dim }, 2, .float16);
+    const x = try host_side.made(mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(nslots), in_dim }, 2, .float16));
     defer _ = mlx.mlx_array_free(x);
     for ([_]bool{ true, false }) |aligned| {
         const tab = try gemmWindowTable(s, eids, @intCast(nslots), 32, aligned);
@@ -9010,7 +9010,7 @@ fn clampedWindowBytes(hidden: usize, inter: usize, n: u32, aligned: bool) !void 
             1 => (i * 17) % experts,
             else => if ((i / topk) % 11 == 0) 280 + i % topk else i % topk,
         });
-        const slots = mlx.mlx_array_new_data(&ids, &.{rows * topk}, 1, .uint32);
+        const slots = try host_side.made(mlx.mlx_array_new_data(&ids, &.{rows * topk}, 1, .uint32));
         defer _ = mlx.mlx_array_free(slots);
         const reference = try clampedSortedReference(s, x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], slots, v[9], topk, 10, .bfloat16);
         defer _ = mlx.mlx_array_free(reference);
@@ -9243,12 +9243,12 @@ fn clampedMiddleDownCase(hidden: usize, inter: usize, rows: usize, rate: u32, ti
     for (&planes) |*p| {
         const data = try a.alloc(u16, rows * 8 * inter);
         for (data) |*v| v.* = exl3.f32ToF16Bits((prng.random().float(f32) - 0.5) * 128);
-        p.* = mlx.mlx_array_new_data(data.ptr, &.{ @intCast(rows * 8), @intCast(inter) }, 2, .float16);
+        p.* = try host_side.made(mlx.mlx_array_new_data(data.ptr, &.{ @intCast(rows * 8), @intCast(inter) }, 2, .float16));
         made += 1;
     }
     const scale = try a.alloc(u16, 8 * inter);
     for (scale) |*v| v.* = exl3.f32ToF16Bits((prng.random().float(f32) - 0.5) * 0.5);
-    const up_scale = mlx.mlx_array_new_data(scale.ptr, &.{ 8, @intCast(inter) }, 2, .float16);
+    const up_scale = try host_side.made(mlx.mlx_array_new_data(scale.ptr, &.{ 8, @intCast(inter) }, 2, .float16));
     defer _ = mlx.mlx_array_free(up_scale);
     const v = f.arrays;
     const mid = try midSwigluPrepWithLimit(s, planes[0], planes[1], v[4], up_scale, v[5], v[7], @intCast(inter), @intCast(rows * 8), 10);
@@ -9684,12 +9684,12 @@ fn downLaneCase(hidden: usize, inter: usize, rows: usize, rate: u32, tiles: c_in
     for (&planes) |*p| {
         const data = try a.alloc(u16, rows * 8 * inter);
         for (data) |*v| v.* = exl3.f32ToF16Bits((prng.random().float(f32) - 0.5) * 128);
-        p.* = mlx.mlx_array_new_data(data.ptr, &.{ @intCast(rows * 8), @intCast(inter) }, 2, .float16);
+        p.* = try host_side.made(mlx.mlx_array_new_data(data.ptr, &.{ @intCast(rows * 8), @intCast(inter) }, 2, .float16));
         made += 1;
     }
     const scale = try a.alloc(u16, 8 * inter);
     for (scale) |*v| v.* = exl3.f32ToF16Bits((prng.random().float(f32) - 0.5) * 0.5);
-    const up_scale = mlx.mlx_array_new_data(scale.ptr, &.{ 8, @intCast(inter) }, 2, .float16);
+    const up_scale = try host_side.made(mlx.mlx_array_new_data(scale.ptr, &.{ 8, @intCast(inter) }, 2, .float16));
     defer _ = mlx.mlx_array_free(up_scale);
     const v = f.arrays;
     const args = DownLaneArgs{ .s = s, .g = planes[0], .u = planes[1], .v = v, .up_scale = up_scale, .inter = @intCast(inter), .slots = @intCast(rows * 8), .tiles = tiles };

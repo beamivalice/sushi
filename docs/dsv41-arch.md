@@ -10,7 +10,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 ## Scope
 
 - It serves `deepseek_v41` from the ORIGINAL checkpoint (`config.json`, `model-*.safetensors`, the index). Text in,
-  text out, one request at a time (the model holds the request's state: `ownsModuleDecodeState`).
+  text out; a streamed load one request at a time (`ownsModuleDecodeState`), a fully resident one up to
+  `maxJoinedRows` requests as rows of one decode forward ([below](#prefix-cache)).
 - Off, by name: `--kv-quant` (the state is the activation dtype;
   `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` or `--mtp-greedy-tail` refuses the load (DSpark accepts by the exact rule only), a settings `kv_quant`, `mtp_acceptance` or `mtp_greedy_tail` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
   ([below](#dspark)), the checkpoint's own drafter, on by default like every served MTP head; `--no-mtp` turns it off.
@@ -1044,8 +1045,10 @@ the bound counts on the l-qwen4b tree over `3d4b4277`):
 ## Expert drop (`--drop-expert n`)
 
 The pack's optional `expert_usage.json` ([pack-format](pack-format.md#expert-usage)) counts how often each routed expert was
-picked per layer. `--drop-expert n` (a multiple of 8, 0 = off, DeepSeek-V4.1 only; other archs refuse the flag at load)
+picked per layer. `--drop-expert n` (a multiple of 8, 0 = off; a streamed Qwen3.8 quantized pack takes it too, [qwen4-arch](qwen4-arch.md#drop-expert))
 drops the `n` least-used experts of every backbone layer (ties by expert id): they are never read, billed, cached or picked.
+A drop that would empty a rate group keeps that group's most-used expert and drops the next least-used instead (the load
+line counts them); one that leaves every group an expert is the plain ranking's set, bit for bit.
 
 - **Router.** The dropped experts' `gate_bias` entries are -inf, so the pick (score plus bias, before top-k) goes to the
   next-best kept expert, and the weights are the unbiased scores of the kept picks, normalized and scaled as the normal
@@ -1139,10 +1142,43 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   (`live_point_cap`; those it writes through and the point it restored from) and publishes them at its commit with its
   tokens. The next prompt rolls back to the deepest point at or below its shared prefix (under the prompt's end, the
   media rule's ceiling, equal `has_tools`) unless a stored point reaches further; the result is byte-identical to an
-  SSD restore of that point. It is skipped when the state was replaced (`state_epoch`), the request never finished,
+  SSD restore of that point. It is skipped when the state was replaced (the record's `State.id`), the request never finished,
   or a row buffer exceeds what the prompt's own state would be billed with its quarter (`liveRowsFit`): the live rows
   past the point stay allocated, so they must fit that bill. The admission reserve adds 8 sets of fixed rings
   (`dsv41CheckpointReserve`). Log: `[dsv41-prefix] reused N of M prompt tokens from the live state`.
+- **One decode state is resident, and the slot running holds it** (`dsv41_model.Request`, `bind`): a slot's first
+  forward takes the state the model parked, the slot's request bills it (`sched.requestBytes`), and its end parks it
+  again (`Request.reset`), where the model bills it (`dsv41StateBytes`). The rollback above runs on the parked state
+  before the next slot takes it; a miss resets that same storage.
+- **Requests joined as rows of one decode forward** (`dsv41_model.extendRows`, `dsv41_serving.forwardRows`): each
+  request keeps its own pass (embedding, Engram rows, DSpark targets, head, its state's advance), and a layer joins
+  the rows for everything but the attention, which runs per request over its own state, the hc split's ride on its
+  slice. A row is its request's one-row step bit for bit: the `.rows` arm is exact and wide, a load that joins rows
+  steps one row on the exact arm too (`serves_rows`), and a forward joins at most `maxJoinedRows`. Resident loads only.
+- **A load that joins rows keeps a state per request and parks none** (`serves_rows`): a slot's first forward makes
+  its request's state, and a forward runs it only for its own span (`bind`, `unbindRows`). Off a forward a hook reads a
+  state only where it lends one (`lend`, `lendFor`: the restore through `restoreTarget`/`restoreEnd`, a write-through,
+  a thought or end point, a prefill's checkpoint); an unlent read is `Dsv41StateNotLent` and a lookup refuses before it
+  touches anything (`prefix_arch.checkLent`). There is no live record: every point the record would hold goes to the
+  SSD tier as it is taken (off the row-segment grid too), the point behind the reply at the request's end
+  (`writeEndPoint`); the request keeps its restore position (`Request.rows_base`), so its write-through links the
+  stored entry's row segments below it as at one row. A next turn restores from SSD at the position a one-row load rolls back to, ~25 ms for 1.5k
+  tokens on the M5 against none from RAM. A per-request record would win that back for ~50 MB a running request.
+- **A fully resident load joins rows** (`dsv41_sched.coolerRows`, the owner's call: batching for full residence, never
+  for streaming; on Sushi Cooler only, so the opt-out to MLX keeps one request at a time): when the expert plan holds
+  every routed expert (`ModelConfig.expert_resident`, from
+  `CachePlan.resident`; only an STQ pack's rate-grouped store can), one forward carries up to `maxJoinedRows` requests
+  (16 with matrix units, 8 without), each its solo step's bytes, and every one-row step takes the exact arm. The load
+  sets `serves_rows` (`dsv41_serving.applyRows`, which refuses a resident claim over a streamed plan), is no longer one
+  request at a time (`ownsModuleDecodeState`), and the scheduler's plain decode tick joins the slots
+  (`dsv41_sched.batchedForward` over `forwardRows`, each slot's position moved as its solo step would). A slot joins
+  once its prefill made its state (`readyToBatch`), an image prompt's too (its decode rows carry no image rows); a
+  DSpark slot ticks alone as a spec slot does, beside the joined rows. Admission bills each request's state as growth
+  after admission (`dsv41_bill.commitBytes`). Decode rows take no lazy first layer, layer pipelining or CED, none of
+  which runs at a resident load's decode anyway. A forward with no slot request (a warm, a test) runs the state lent
+  around it, else the model's own (`lendOwn`). Load line: `[cooler] one forward carries N rows; steps run the exact
+  arm (+~0.6 ms a step on NAX); a next turn restores from the SSD tier`. The Cooler contract's rows test runs on the
+  STQ fixtures (`cooler_contract.greedyRows`).
 - **Write cost of an agent conversation** (`DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw-repack-test`, default flags, `--log-level debug`,
   30 turns of a tool-result chat from a 72k-token prompt to 176k, thinking on, greedy, max_tokens 512, `taskpolicy -a`, GPU lock, M5 Max;
   main 543c25fd against the branch head 3a867948): staged restore points 3.63 GB over 51 writes (29 of them 0.07-0.16 GB) against
@@ -1302,7 +1338,7 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   half of each rotate-half pair, column angles in the second, f32) and a SwiGLU MLP, then `Aligner`
   (zero-pad to multiples of 3, unfold channel-major, `w2(gelu(w1(x)))`). It returns the whole span including the three
   learned delimiter rows. Queries run in chunks of 512; `encodeScratchBytes` bills the worst block.
-  **On the engine**: a load that decodes on Sushi Cooler (`dsv41_borrow.ownDecode`) runs the whole tower there
+  **On the engine**: a load that decodes on Sushi Cooler (`cooler_side.onEngine`) runs the whole tower there
   (`Dsv41Vision.useEngine`), byte for byte what MLX's stream gives: the requantized linears, the fused attention and the
   aligner's erf are MLX's own kernels launched by the engine (`quantized.zig`, `attention.zig`, `stock.erf`), and
   a pass adds no MLX op and no lend (the weights are imported). `--ds41-mlx-engine` or `ds41_cooler: false` keeps the

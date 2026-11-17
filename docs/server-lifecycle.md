@@ -315,8 +315,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
     `releases_checkpoints`, `always_write_through`, `thought_point`, `row_cap`, `pads_batch`), resolved once at admission, so no tick evaluates
     a `model_type` compare. Dispatch reads the arch tag of the slot's transformer config (its model config before a
     transformer exists), so a test slot needs a config, or `model.config = null` for an arch-less one.
-  - `Slot.request`'s type is `sched.NativeRequest` (`arch_state.SlotRequest`), and the slot's
-    context points the arch at it through `arch_state.ctxForSlot`.
+  - `Slot.request`'s type is `sched.NativeRequest` (`arch_state.SlotRequest`, a member per arch that keeps one;
+    `sched.initRequest` builds the slot's arch's), and the slot's context points that arch at it through
+    `arch_state.ctxForSlot`.
 - `src/model_load.zig`: load plan, streaming plan, load bills; `src/slot_admission.zig`: slot and memory admission, batching
   policy; `src/mtp_tick.zig`: grouped MTP tick; `src/slot_outcome.zig`: slot end, finish outcome, loop-stop reasons;
   `src/vision_queue.zig`: vision encode queue, media deferral.

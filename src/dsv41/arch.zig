@@ -5,6 +5,7 @@ const log = @import("../log.zig");
 const trunk = @import("../trunk.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
+const cooler_side = @import("../cooler_side.zig");
 const serving = @import("dsv41_serving.zig");
 const admission = @import("../arch/admission.zig");
 const registry = @import("../arch/registry.zig");
@@ -14,6 +15,7 @@ pub const model_types = chat.model_types;
 pub const Config = @import("../model.zig").ModelConfig;
 pub const Model = *Trunk;
 pub const State = dsv41_state.State;
+pub const Ctx = dsv41_state.Ctx;
 
 pub const packs = struct { // slot:packs (S2h)
     pub const product = "DeepSeek-V4.1-Flash";
@@ -53,13 +55,13 @@ pub const streamed_mtp_head = struct {
 pub fn expertPoolBytes(config: *const Config) u64 {
     const c = config.dsv41 orelse return config_file.dsv41_pool_bytes;
     const borrow = @import("dsv41_borrow.zig");
-    return if (borrow.ownDecode(&c)) borrow.ownCap(&c, 1) else config_file.dsv41_pool_bytes;
+    return if (cooler_side.onEngine(config)) borrow.ownCap(&c, true, 1) else config_file.dsv41_pool_bytes;
 }
 
 /// An STQ pack on Sushi Cooler keeps the scales of the experts it has read (`dsv41_borrow.keepsScales`).
 pub fn expertKeepsScales(config: *const Config) bool {
-    const c = config.dsv41 orelse return false;
-    return @import("dsv41_borrow.zig").keepsScales(&c);
+    if (config.dsv41 == null) return false;
+    return @import("dsv41_borrow.zig").keepsScales(config);
 }
 
 /// Where a prompt's last forward starts (`dsv41_prefix.snapshotBackoff`); `tok` names the assistant opener.
@@ -108,15 +110,6 @@ pub const cooler_opt_out: @import("../arch/config.zig").CoolerOptOut = .{
 /// What the shared Sushi Cooler contract suite asks of this arch (`src/cooler_contract_test.zig`).
 pub const cooler_contract = @import("dsv41_contract.zig");
 
-pub fn coolerForTest(config: *Config, on: bool) void {
-    if (config.dsv41) |*c| c.cooler_for_test = on;
-}
-
-/// Records who asked for decode on MLX, which `dsv41_borrow.decodeSideOf` and the bills read.
-pub fn stampCooler(config: *Config, on: bool, by_flag: bool) void {
-    if (config.dsv41) |*c| c.mlx_ask = if (on) .none else if (by_flag) .flag else .setting;
-}
-
 /// Does this load keep the DSpark stages resident? They are its MTP head: `--mtp` under streaming.
 pub fn dsparkOn(config: *const Config) bool {
     const c = config.dsv41 orelse return false;
@@ -128,7 +121,7 @@ pub const parseConfig = config_file.parseFamily;
 
 pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {
     const source = @import("dsv41_source.zig");
-    const engine = @import("dsv41_borrow.zig").ownDecode(&config.dsv41.?);
+    const engine = cooler_side.onEngine(config);
     return .{
         .trunk = try source.residentBytes(io, allocator, model_dir, engine),
         .mtp = if (config.dsv41.?.dspark.block > 0) try source.dsparkBytes(io, allocator, model_dir, engine) else 0,
@@ -156,14 +149,17 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
 }
 
 /// A Cooler load runs on the engine's stream.
-pub const ownStream = dsv41_prefix.arraysOn;
+/// Every DeepSeek pack runs on Sushi Cooler, STQ or the release's own FP8 trunk and MXFP4 experts, on any GPU (the
+/// arms a GPU has are `device`'s): only the user's opt-out keeps one on MLX.
+pub fn coolerGap(_: *const Config) ?[]const u8 {
+    return null;
+}
 
 pub fn deinit(xfm: Model) void {
     const held = if (xfm.arch_state.dsv41.model) |m| m.onEngine() else false;
     xfm.arch_state.dsv41.deinit(xfm.allocator);
     xfm.deinitTrunk();
     if (!held) return;
-    @import("../arch/handle.zig").engineHoldEnd();
     const breaks = mlx.rest_breaks.load(.monotonic);
     const swallows = mlx.rest_swallows.load(.monotonic);
     if (breaks != 0 or swallows != 0) log.warn("[engine] while MLX was at rest it was called {d} times and asked {d} settings that reached nothing (process totals): work outside its model's turn\n", .{ breaks, swallows });
@@ -189,9 +185,10 @@ pub fn lmHeadForDraft(xfm: Model, x: mlx.mlx_array) !mlx.mlx_array {
     return error.DraftHeadUnsupported;
 }
 
+/// One request at a time, unless the load joins rows: each request then runs a decode state of its own.
 pub fn ownsModuleDecodeState(xfm: Model) bool {
-    _ = xfm;
-    return true;
+    const m = dsv41_state.modelOf(xfm) orelse return true;
+    return !m.serves_rows;
 }
 
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {

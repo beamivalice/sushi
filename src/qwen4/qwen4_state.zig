@@ -206,6 +206,14 @@ pub const Ctx = struct {
     /// skips the PLE injection (it is not the PLE layer).
     stream_in: ?mlx.mlx_array = null,
     skip_ple: bool = false,
+    /// A speculative verify block: its hidden captures stay lazy and ride the lm_head's dispatch, where a prefill
+    /// chunk's settle so the chunk's arrays go.
+    verify_rows: bool = false,
+
+    /// Marks the forward a speculative verify block (`on`) or not.
+    pub fn setVerifyRows(self: *Ctx, on: bool) void {
+        self.verify_rows = on;
+    }
 
     pub fn mrope(self: *const Ctx) ?mrope_mod.PositionContext {
         const pos = self.mrope_pos orelse return null;
@@ -330,4 +338,14 @@ test "Flash-Next state: an empty state releases as a no-op, twice" {
     state.deinit(std.testing.allocator);
     state.deinit(std.testing.allocator);
     try std.testing.expect(state.model == null and state.mtp == null);
+}
+
+test "Flash-Next state: a speculative verify marks the forward's context, and only for its span" {
+    var cfg = model.ModelConfig{};
+    cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
+    var c: arch_state.Ctx = .{};
+    arch_state.setVerifyRows(&cfg, &c, true);
+    try std.testing.expect(c.qwen4.verify_rows);
+    arch_state.setVerifyRows(&cfg, &c, false);
+    try std.testing.expect(!c.qwen4.verify_rows);
 }

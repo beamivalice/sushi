@@ -121,7 +121,7 @@ pub fn buildSuppressMask(ids: []const u32, defined_vocab: usize, vocab: usize, s
     defer alloc.free(buf);
     fillSuppressMask(buf, ids, defined_vocab);
     const shape = [_]c_int{@intCast(vocab)};
-    return mlx.mlx_array_new_data(buf.ptr, &shape, 1, .bool_);
+    return try mlx.newData(buf.ptr, &shape, .bool_);
 }
 
 /// The host half of `buildSuppressMask`, pure so the row set is testable
@@ -166,7 +166,7 @@ pub fn installSuppressMask(xfm: *Trunk, tok: *const Tokenizer) void {
 /// (never an additive -inf, whose 0×-inf/NaN edge the parity rules exist
 /// for). `[V]` broadcasts over both `[1, V]` and `[1, 1, V]` logits.
 pub fn applySuppressMask(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: mlx.mlx_array, s: mlx.mlx_stream) !void {
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    const neg_inf = try mlx.newFloat(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(out, mask, neg_inf, logits, s));
 }
@@ -212,7 +212,7 @@ pub fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: 
     }
 
     if (sampling.temperature != 1.0) {
-        const t = mlx.mlx_array_new_float(sampling.temperature);
+        const t = try mlx.newFloat(sampling.temperature);
         defer _ = mlx.mlx_array_free(t);
         var scaled = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(scaled);
@@ -301,7 +301,7 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
     errdefer _ = mlx.mlx_array_free(current);
     // Apply temperature → top-k → top-p (same order as `sampleTokenLazy`).
     if (sampling.temperature != 1.0) {
-        const t = mlx.mlx_array_new_float(sampling.temperature);
+        const t = try mlx.newFloat(sampling.temperature);
         defer _ = mlx.mlx_array_free(t);
         var scaled = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(scaled);
@@ -329,7 +329,7 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
 pub fn probAt(probs: mlx.mlx_array, token_id: u32, s: mlx.mlx_stream) !f32 {
     const idx_val: i32 = @intCast(token_id);
     const idx_shape = [_]c_int{1};
-    const idx_arr = mlx.mlx_array_new_data(&idx_val, &idx_shape, 1, .int32);
+    const idx_arr = try mlx.newData(&idx_val, &idx_shape, .int32);
     defer _ = mlx.mlx_array_free(idx_arr);
 
     var taken = mlx.mlx_array_new();
@@ -377,7 +377,7 @@ pub fn pldOneHotRow(index: u32, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_array 
 
     const target_val: i32 = @intCast(index);
     const tgt_shape = [_]c_int{1};
-    const target_idx = mlx.mlx_array_new_data(&target_val, &tgt_shape, 1, .int32);
+    const target_idx = try mlx.newData(&target_val, &tgt_shape, .int32);
     defer _ = mlx.mlx_array_free(target_idx);
 
     var mask_bool = mlx.mlx_array_new();
@@ -406,9 +406,9 @@ pub fn selectorQRow(sp: *const dflash_mod.SelectedPath, step: usize, m: u32, voc
     const z_shape = [_]c_int{ 1, vocab };
     try mlx.check(mlx.mlx_zeros(&zeros, &z_shape, 2, .float32, s));
     const row_shape = [_]c_int{ 1, @intCast(kk) };
-    const ids_arr = mlx.mlx_array_new_data(sp.cand_ids.ptr + step * kk, &row_shape, 2, .int32);
+    const ids_arr = try mlx.newData(sp.cand_ids.ptr + step * kk, &row_shape, .int32);
     defer _ = mlx.mlx_array_free(ids_arr);
-    const vals_arr = mlx.mlx_array_new_data(sp.q.?.ptr + step * kk, &row_shape, 2, .float32);
+    const vals_arr = try mlx.newData(sp.q.?.ptr + step * kk, &row_shape, .float32);
     defer _ = mlx.mlx_array_free(vals_arr);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -487,7 +487,7 @@ pub fn shortlistStepProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s:
 pub fn logitsStepProposal(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !StepProposal {
     if (isGreedyTemperature(sampling.temperature)) {
         const shape = mlx.getShape(logits);
-        return argmaxStepProposal(sampleTokenLazy(logits, sampling, s), shape[shape.len - 1], s);
+        return argmaxStepProposal(try sampleTokenLazy(logits, sampling, s), shape[shape.len - 1], s);
     }
     const q = try probsAtLastPos(logits, sampling, s);
     errdefer _ = mlx.mlx_array_free(q);
@@ -625,7 +625,7 @@ pub fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s
     defer _ = mlx.mlx_array_free(diff);
     try mlx.check(mlx.mlx_subtract(&diff, target_probs, draft_probs, s));
 
-    const zero = mlx.mlx_array_new_float(0.0);
+    const zero = try mlx.newFloat(0.0);
     defer _ = mlx.mlx_array_free(zero);
     var residual = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(residual);
@@ -681,9 +681,9 @@ pub fn penalizedSampleLazy(allocator: std.mem.Allocator, logits: mlx.mlx_array, 
         var penalized = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(penalized);
         try applyPenaltiesWithAllocator(allocator, &penalized, logits, generated_ids, penaltiesOf(sampling), s);
-        return sampleTokenLazy(penalized, sampling, s);
+        return try sampleTokenLazy(penalized, sampling, s);
     }
-    return sampleTokenLazy(logits, sampling, s);
+    return try sampleTokenLazy(logits, sampling, s);
 }
 
 /// Prefill's first token under the think penalty when the prompt leaves the span open.
@@ -691,24 +691,24 @@ pub fn firstTokenSample(xfm: *Trunk, logits: mlx.mlx_array, sampling: SamplingPa
     const host = mlx.engine.enter(s);
     defer host.end();
     const tp = sampling.think_penalty;
-    if (!tp.active()) return firstTokenLazy(logits, sampling, s);
-    if (!tp.hasBias() and (xfm.think_marker_mask == null or tp.phase != .inside)) return firstTokenLazy(logits, sampling, s);
+    if (!tp.active()) return try firstTokenLazy(logits, sampling, s);
+    if (!tp.hasBias() and (xfm.think_marker_mask == null or tp.phase != .inside)) return try firstTokenLazy(logits, sampling, s);
     var shifted = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(shifted);
     try think_penalty.shiftScoped(&shifted, logits, xfm.think_marker_mask, tp, null, s);
-    return firstTokenLazy(shifted, sampling, s);
+    return try firstTokenLazy(shifted, sampling, s);
 }
 
 /// Prefill's first token: a forced call's when it owns token 0, else a sample.
-fn firstTokenLazy(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) mlx.mlx_array {
+fn firstTokenLazy(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     if (sampling.call_force) |cf| switch (cf.decide(&.{})) {
-        .force => |id| return tokenArray(id),
+        .force => |id| return try tokenArray(id),
         .sample, .choose => {},
     };
-    return sampleTokenLazy(logits, sampling, s);
+    return try sampleTokenLazy(logits, sampling, s);
 }
 
-pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) mlx.mlx_array {
+pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     const host = mlx.engine.enter(s);
     defer host.end();
     // Reserved-token suppression first, so every path below (greedy fast
@@ -724,7 +724,7 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
     const logits = if (sampling.suppress_mask) |m| blk: {
         suppressed = mlx.mlx_array_new();
         // A mask that could not be applied fails the draw: the unmasked row would hand out a reserved id.
-        applySuppressMask(&suppressed, logits_in, m, s) catch return .{ .ctx = null };
+        try applySuppressMask(&suppressed, logits_in, m, s);
         break :blk suppressed;
     } else logits_in;
 
@@ -738,45 +738,50 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
     // argmax-on-2D combo cuts ~one FFI call per decode step.
     if (seq_len == 1 and isGreedyTemperature(sampling.temperature)) {
         var result = mlx.mlx_array_new();
-        _ = mlx.mlx_argmax_axis(&result, logits, -1, false, s);
+        errdefer _ = mlx.mlx_array_free(result);
+        try mlx.check(mlx.mlx_argmax_axis(&result, logits, -1, false, s));
         return result;
     }
 
     // Extract last position: [1, seq_len, vocab] -> [1, vocab]
     // `current` is the single owned intermediate — freed before each reassignment.
     var current = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(current);
 
     if (seq_len == 1) {
         const sq_shape = [_]c_int{ 1, shape[2] };
-        _ = mlx.mlx_reshape(&current, logits, &sq_shape, 2, s);
+        try mlx.check(mlx.mlx_reshape(&current, logits, &sq_shape, 2, s));
     } else {
         const start = [_]c_int{ 0, seq_len - 1, 0 };
         const stop = [_]c_int{ 1, seq_len, shape[2] };
         const strides = [_]c_int{ 1, 1, 1 };
         var sliced = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sliced);
-        _ = mlx.mlx_slice(&sliced, logits, &start, 3, &stop, 3, &strides, 3, s);
+        try mlx.check(mlx.mlx_slice(&sliced, logits, &start, 3, &stop, 3, &strides, 3, s));
 
         const sq_shape = [_]c_int{ 1, shape[2] };
-        _ = mlx.mlx_reshape(&current, sliced, &sq_shape, 2, s);
+        try mlx.check(mlx.mlx_reshape(&current, sliced, &sq_shape, 2, s));
     }
 
     // Greedy: argmax (no temperature)
     if (isGreedyTemperature(sampling.temperature)) {
         var result = mlx.mlx_array_new();
-        _ = mlx.mlx_argmax_axis(&result, current, -1, false, s);
+        errdefer _ = mlx.mlx_array_free(result);
+        try mlx.check(mlx.mlx_argmax_axis(&result, current, -1, false, s));
         _ = mlx.mlx_array_free(current);
         return result;
     }
 
     if (host.own) {
-        defer _ = mlx.mlx_array_free(current);
-        return engineDraws(current, sampling, s) catch .{ .ctx = null };
+        const drawn = engineDraws(current, sampling, s);
+        _ = mlx.mlx_array_free(current);
+        current = .{};
+        return drawn;
     }
 
     // Scale by 1/temperature
     if (sampling.temperature != 1.0) {
-        const temp_arr = mlx.mlx_array_new_float(sampling.temperature);
+        const temp_arr = try mlx.newFloat(sampling.temperature);
         defer _ = mlx.mlx_array_free(temp_arr);
         var next = mlx.mlx_array_new();
         _ = mlx.mlx_divide(&next, current, temp_arr, s);
@@ -898,7 +903,7 @@ fn sampleRowsLazyConcat(row_logits: []const mlx.mlx_array, params: []const Sampl
     }
     const one = [_]c_int{1};
     for (row_logits, params) |logits, p| {
-        const raw = sampleTokenLazy(logits, p, s);
+        const raw = try sampleTokenLazy(logits, p, s);
         defer _ = mlx.mlx_array_free(raw);
         parts[n_parts] = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_reshape(&parts[n_parts], raw, &one, 1, s));
@@ -955,7 +960,7 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
     }
 
     if (p0.temperature != 1.0) {
-        const temp_arr = mlx.mlx_array_new_float(p0.temperature);
+        const temp_arr = try mlx.newFloat(p0.temperature);
         defer _ = mlx.mlx_array_free(temp_arr);
         var next = mlx.mlx_array_new();
         mlx.check(mlx.mlx_divide(&next, current, temp_arr, s)) catch |err| {
@@ -1115,7 +1120,7 @@ pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling
 
     // The engine's draw takes the temperature and the filters itself (`engineDraws`).
     if (!host.own and sampling.temperature != 1.0) {
-        const temp_arr = mlx.mlx_array_new_float(sampling.temperature);
+        const temp_arr = try mlx.newFloat(sampling.temperature);
         defer _ = mlx.mlx_array_free(temp_arr);
         try mlx.check(mlx.mlx_divide(&scaled, current, temp_arr, s));
         current = scaled;
@@ -1358,10 +1363,10 @@ pub fn applyGrammarMask(allocator: std.mem.Allocator, res: *mlx.mlx_array, logit
 
     // Zig's `bool` is one byte and matches MLX's `.bool_` storage exactly.
     const arr_shape = [_]c_int{@intCast(vocab_size)};
-    const mask_arr = mlx.mlx_array_new_data(@ptrCast(logit_mask.slice.ptr), &arr_shape, 1, .bool_);
+    const mask_arr = try mlx.newData(@ptrCast(logit_mask.slice.ptr), &arr_shape, .bool_);
     defer _ = mlx.mlx_array_free(mask_arr);
 
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    const neg_inf = try mlx.newFloat(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
 
     try mlx.check(mlx.mlx_where(res, mask_arr, logits, neg_inf, s));
@@ -1372,9 +1377,9 @@ pub fn applyRowMasks(res: *mlx.mlx_array, logits: mlx.mlx_array, masks: []const 
     const host = mlx.engine.enter(s);
     defer host.end();
     const shape = [_]c_int{ 1, @intCast(rows), @intCast(vocab) };
-    const mask_arr = mlx.mlx_array_new_data(@ptrCast(masks.ptr), &shape, 3, .bool_);
+    const mask_arr = try mlx.newData(@ptrCast(masks.ptr), &shape, .bool_);
     defer _ = mlx.mlx_array_free(mask_arr);
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    const neg_inf = try mlx.newFloat(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(res, mask_arr, logits, neg_inf, s));
 }
@@ -1480,7 +1485,7 @@ fn topRanksDescending(
     var padded = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(padded);
     if (groups * chunk != v) {
-        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        const neg_inf = try mlx.newFloat(-std.math.inf(f32));
         defer _ = mlx.mlx_array_free(neg_inf);
         var pad_val = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pad_val);
@@ -1537,7 +1542,7 @@ fn topRanksDescending(
     try mlx.check(mlx.mlx_take_along_axis(&cand_2d, blk, gather_idx, @intCast(lead), s));
 
     // Column id of every candidate: chunk id * chunk + offset within the chunk.
-    const chunk_arr = mlx.mlx_array_new_int(@intCast(chunk));
+    const chunk_arr = try mlx.newInt(@intCast(chunk));
     defer _ = mlx.mlx_array_free(chunk_arr);
     var base = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(base);
@@ -1558,7 +1563,7 @@ fn topRanksDescending(
     try mlx.check(mlx.mlx_reshape(&cand_ids_flat, cand_ids_2d, &dims, lead + 1, s));
     // A padded tail column is -inf, so it only ranks when the row holds fewer
     // than `want` finite values; clamp so the scatter stays in range regardless.
-    const last_col = mlx.mlx_array_new_int(@intCast(v - 1));
+    const last_col = try mlx.newInt(@intCast(v - 1));
     defer _ = mlx.mlx_array_free(last_col);
     var cand_ids = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cand_ids);
@@ -1597,12 +1602,12 @@ fn keepByIndex(res: *mlx.mlx_array, logits: mlx.mlx_array, keep_idx: mlx.mlx_arr
     var zeros = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(zeros);
     try mlx.check(mlx.mlx_zeros(&zeros, shape.ptr, shape.len, .bool_, s));
-    const t = mlx.mlx_array_new_bool(true);
+    const t = try mlx.newBool(true);
     defer _ = mlx.mlx_array_free(t);
     var mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(mask);
     try mlx.check(mlx.mlx_put_along_axis(&mask, zeros, keep_idx, t, -1, s));
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    const neg_inf = try mlx.newFloat(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
 }
@@ -1659,7 +1664,7 @@ fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, nucleus_bou
     var above = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(above);
     try mlx.check(mlx.mlx_cumsum(&above, probs, -1, false, false, s));
-    const threshold = mlx.mlx_array_new_float(@max(top_p, std.math.floatMin(f32)));
+    const threshold = try mlx.newFloat(@max(top_p, std.math.floatMin(f32)));
     defer _ = mlx.mlx_array_free(threshold);
     var in_nucleus = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(in_nucleus);
@@ -1671,7 +1676,7 @@ fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, nucleus_bou
     var mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(mask);
     try mlx.check(mlx.mlx_put_along_axis(&mask, zeros, ids, in_nucleus, -1, s));
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    const neg_inf = try mlx.newFloat(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
 }
@@ -2051,7 +2056,7 @@ test "seeded lazy sampling replays the same draws and advances per draw" {
     for (&runs) |*run| {
         var params = SamplingParams{ .temperature = 1.0, .seed = 42 };
         for (run) |*out| {
-            const lazy = sampleTokenLazy(logits, params, s);
+            const lazy = try sampleTokenLazy(logits, params, s);
             defer _ = mlx.mlx_array_free(lazy);
             try mlx.check(mlx.mlx_array_eval(lazy));
             try mlx.check(mlx.mlx_array_item_int32(out, lazy));
@@ -2078,8 +2083,8 @@ test "batched greedy ids equal two solo ids and one sampling eval" {
     defer _ = mlx.mlx_array_free(r1);
 
     const greedy = SamplingParams{ .temperature = 0.0 };
-    const solo0 = try evalLazyToken(sampleTokenLazy(r0, greedy, s));
-    const solo1 = try evalLazyToken(sampleTokenLazy(r1, greedy, s));
+    const solo0 = try evalLazyToken(try sampleTokenLazy(r0, greedy, s));
+    const solo1 = try evalLazyToken(try sampleTokenLazy(r1, greedy, s));
 
     sample_rows_evals = 0;
     var ids: [2]i32 = undefined;
@@ -2105,7 +2110,7 @@ test "batched mixed greedy and sampled rows produce two ids" {
 
     const greedy = SamplingParams{ .temperature = 0.0 };
     const sampled = SamplingParams{ .temperature = 0.7 };
-    const solo_g = try evalLazyToken(sampleTokenLazy(r0, greedy, s));
+    const solo_g = try evalLazyToken(try sampleTokenLazy(r0, greedy, s));
 
     sample_rows_evals = 0;
     var ids: [2]i32 = undefined;
@@ -2130,8 +2135,8 @@ test "batched stacked seedless top_k top_p rows equal solo draws" {
     defer _ = mlx.mlx_array_free(r1);
 
     const p = SamplingParams{ .temperature = 0.7, .top_k = 1, .top_p = 0.9 };
-    const solo0 = try evalLazyToken(sampleTokenLazy(r0, p, s));
-    const solo1 = try evalLazyToken(sampleTokenLazy(r1, p, s));
+    const solo0 = try evalLazyToken(try sampleTokenLazy(r0, p, s));
+    const solo1 = try evalLazyToken(try sampleTokenLazy(r1, p, s));
 
     sample_rows_evals = 0;
     var ids: [2]i32 = undefined;
@@ -2189,8 +2194,8 @@ test "batched stacked seedless rows honour a suppress mask" {
     defer _ = mlx.mlx_array_free(r1);
 
     const p = SamplingParams{ .temperature = 0.7, .top_k = 1, .top_p = 0.9, .suppress_mask = mask };
-    const solo0 = try evalLazyToken(sampleTokenLazy(r0, p, s));
-    const solo1 = try evalLazyToken(sampleTokenLazy(r1, p, s));
+    const solo0 = try evalLazyToken(try sampleTokenLazy(r0, p, s));
+    const solo1 = try evalLazyToken(try sampleTokenLazy(r1, p, s));
 
     sample_rows_evals = 0;
     var ids: [2]i32 = undefined;
@@ -2218,8 +2223,8 @@ test "batched seeded draws keep per-row keys" {
 
     const p0 = SamplingParams{ .temperature = 1.0, .seed = 7, .draw = 2 };
     const p1 = SamplingParams{ .temperature = 1.0, .seed = 99, .draw = 5 };
-    const solo0 = try evalLazyToken(sampleTokenLazy(r0, p0, s));
-    const solo1 = try evalLazyToken(sampleTokenLazy(r1, p1, s));
+    const solo0 = try evalLazyToken(try sampleTokenLazy(r0, p0, s));
+    const solo1 = try evalLazyToken(try sampleTokenLazy(r1, p1, s));
 
     sample_rows_evals = 0;
     var ids: [2]i32 = undefined;
@@ -2970,7 +2975,7 @@ test "suppress_mask: the mask is an array of the stream it is built for, the eng
     try std.testing.expectEqualSlices(bool, mlx.mlx_array_data_bool(on_mlx).?[0..8], mlx.mlx_array_data_bool(ours).?[0..8]);
 }
 
-test "suppress_mask: a mask the engine could not apply fails the draw, and the suppressed id is not drawn in its place" {
+test "suppress_mask: a mask the engine could not apply fails the draw by its error, and the suppressed id is not drawn in its place" {
     try mlx.requireGpu();
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -2986,15 +2991,14 @@ test "suppress_mask: a mask the engine could not apply fails the draw, and the s
     defer _ = mlx.mlx_array_free(mask);
     defer mlx.engine.fault.disarm();
     mlx.engine.fault.arm(1);
-    const tok = sampleTokenLazy(logits, .{ .temperature = 0.0, .suppress_mask = mask }, s);
-    defer _ = mlx.mlx_array_free(tok);
+    const refused = sampleTokenLazy(logits, .{ .temperature = 0.0, .suppress_mask = mask }, s);
     mlx.engine.fault.disarm();
-    try std.testing.expect(tok.ctx == null);
+    if (refused) |tok| {
+        _ = mlx.mlx_array_free(tok);
+        return error.TestUnexpectedResult;
+    } else |_| {}
     try std.testing.expect(mlx.takeErrorIf("PoolOverBudget"));
-    // What a caller does next with the draw is refused by name.
-    try std.testing.expectError(error.MlxError, mlx.check(mlx.mlx_array_eval(tok)));
-    try std.testing.expect(mlx.takeErrorIf("empty handle"));
-    const drawn = sampleTokenLazy(logits, .{ .temperature = 0.0, .suppress_mask = mask }, s);
+    const drawn = try sampleTokenLazy(logits, .{ .temperature = 0.0, .suppress_mask = mask }, s);
     defer _ = mlx.mlx_array_free(drawn);
     try mlx.check(mlx.mlx_array_eval(drawn));
     try std.testing.expectEqual(@as(u32, 5), mlx.mlx_array_data_uint32(drawn).?[0]);
@@ -3041,7 +3045,7 @@ test "sampler: on the engine a sampled step, the sync sampler and a block's rows
         const step = mlx.mlx_array_new_data(flat[r * V ..].ptr, &[_]c_int{ 1, 1, V }, 3, .float32);
         defer _ = mlx.mlx_array_free(step);
         sampling.draw = first_draw + r;
-        const lazy = sampleTokenLazy(step, sampling, s);
+        const lazy = try sampleTokenLazy(step, sampling, s);
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         try testing.expectEqual(rule.id, mlx.mlx_array_data_uint32(lazy).?[0]);
@@ -3095,14 +3099,14 @@ test "suppress_mask: a suppressed id is unreachable from both samplers, everythi
     defer _ = mlx.mlx_array_free(logits3);
     const masked_sp = SamplingParams{ .temperature = 0.0, .suppress_mask = mask };
     const open_sp = SamplingParams{ .temperature = 0.0 };
-    try testing.expectEqual(@as(u32, 5), try evalLazyToken(sampleTokenLazy(logits3, masked_sp, s)));
-    try testing.expectEqual(@as(u32, 3), try evalLazyToken(sampleTokenLazy(logits3, open_sp, s)));
+    try testing.expectEqual(@as(u32, 5), try evalLazyToken(try sampleTokenLazy(logits3, masked_sp, s)));
+    try testing.expectEqual(@as(u32, 3), try evalLazyToken(try sampleTokenLazy(logits3, open_sp, s)));
 
     // Categorical path at temp 1.0 (exercises the seq_len==1 reshape arm and
     // the sampler proper; the masked lane's probability is exactly 0 and the
     // -1000 lanes underflow, so the draw is deterministic).
     const masked_t1 = SamplingParams{ .temperature = 1.0, .suppress_mask = mask };
-    try testing.expectEqual(@as(u32, 5), try evalLazyToken(sampleTokenLazy(logits3, masked_t1, s)));
+    try testing.expectEqual(@as(u32, 5), try evalLazyToken(try sampleTokenLazy(logits3, masked_t1, s)));
 
     // Sync sampler (logprobs/penalty path): same policy, and the reported
     // distribution stays the model's own — rank 1 is the SUPPRESSED id.
@@ -3689,7 +3693,7 @@ fn suppressedArgmaxCase(allocator: std.mem.Allocator, s: mlx.mlx_stream, v: usiz
         row[100 + r] = 7.0; // the best LEGAL id, different per position
     }
     const shape = [_]c_int{ 1, @intCast(rows), @intCast(v) };
-    const f32_block = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+    const f32_block = try mlx.newData(host.ptr, &shape, .float32);
     defer _ = mlx.mlx_array_free(f32_block);
     var block = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(block);

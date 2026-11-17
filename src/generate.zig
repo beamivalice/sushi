@@ -416,8 +416,8 @@ pub const SpecWindow = struct { snapshot: trunk.KVCacheSnapshot, base_pos: usize
 
 /// A prefill checkpoint at absolute `pos`: the slot's SSM entries, the GLM request's KDA state, or DeepSeek's whole request state.
 /// `to_ssd`: a write-through takes the point to the SSD tier before the next forward, so DeepSeek's shares its rows.
-fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *const ForwardCtx, arch_request: ?*arch_state.SlotRequest, pos: usize, to_ssd: bool) !SSMCheckpoint {
-    if (try prefix_arch.captureCheckpoint(allocator, xfm, pos, to_ssd)) |cp| return cp;
+fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *const ForwardCtx, arch_request: ?arch_state.RequestRef, pos: usize, to_ssd: bool) !SSMCheckpoint {
+    if (try prefix_arch.captureCheckpoint(allocator, xfm, ctx, pos, to_ssd)) |cp| return cp;
     if (arch_request) |request| return prefix_arch.captureRequest(allocator, request, pos, xfm.s);
     return captureSsmCheckpoint(allocator, ctx.ssm_entries.?, pos, xfm.s);
 }
@@ -1262,6 +1262,8 @@ pub const Generator = struct {
     ) !Generator {
         // The logits forward starts at the prompt's last token; there is none to index.
         if (prompt_ids.len == 0) return error.EmptyPrompt;
+        // The embedding gather reads past its table for an id outside the vocabulary; the server refuses one at parse.
+        for (prompt_ids) |id| if (id >= xfm.config.vocab_size) return error.PromptTokenOutOfVocab;
         const round_opts: spec_types.RoundOpts = .{ .lookup_disabled = mtp_lookup_disabled, .max_mtp_ctx = max_mtp_ctx };
         // Reserved-token suppression rides the sampling params from HERE —
         // the one chokepoint every init site funnels through — so every
@@ -1367,7 +1369,7 @@ pub const Generator = struct {
             ssm_checkpoints.deinit(allocator);
         }
         const has_vision = ctx.vision_embeddings != null;
-        const arch_request = arch_state.requestOf(&ctx);
+        const arch_request = prefix_arch.prefillRequest(&ctx);
         const want_ssm_cp = prefill_plan.shouldCheckpointSsmPrefill(
             options.ssm_checkpoint_stride,
             (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or arch_request != null or prefix_arch.restorePointModel(xfm),
@@ -1613,7 +1615,7 @@ pub const Generator = struct {
                 defer ctx.holds_point = false;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
-                const chunk_input = idsArray(xfm, @ptrCast(&ids_i32[pos]), &chunk_shape);
+                const chunk_input = try idsArray(xfm, @ptrCast(&ids_i32[pos]), &chunk_shape);
                 defer _ = mlx.mlx_array_free(chunk_input);
 
                 const chunk_start_ns = if (trace_enabled) prefill_sw.read() else 0;
@@ -1896,7 +1898,7 @@ pub const Generator = struct {
         // position so every consumer sees the classic [1, 1, V] shape.
         const tail_len: usize = prompt_ids.len - final_start;
         const last_shape = [_]c_int{ 1, @as(c_int, @intCast(tail_len)) };
-        const last_input = idsArray(xfm, @ptrCast(&ids_i32[final_start]), &last_shape);
+        const last_input = try idsArray(xfm, @ptrCast(&ids_i32[final_start]), &last_shape);
         defer _ = mlx.mlx_array_free(last_input);
 
         // The MTP head needs the post-final-norm hidden as its first-step h_prev.
@@ -1907,6 +1909,8 @@ pub const Generator = struct {
         const need_capture = mtp_active;
         var captured_hidden: mlx.mlx_array = mlx.mlx_array_new();
         var has_captured_hidden = false;
+        // A forward that fails may already have written the capture.
+        errdefer _ = mlx.mlx_array_free(captured_hidden);
         const last_start_ns = if (trace_enabled) prefill_sw.read() else 0;
         const tail_mtp_capture = mtp_active and tail_len > 1;
         var tail_hidden_all = mlx.mlx_array_new();
@@ -2009,9 +2013,6 @@ pub const Generator = struct {
                 },
             );
         }
-        errdefer if (has_captured_hidden) {
-            _ = mlx.mlx_array_free(captured_hidden);
-        };
 
         // Attach the SSM-checkpoint buffer to whichever Generator variant
         // we're about to return. Clears the local list so the errdefer above
@@ -2427,7 +2428,7 @@ pub const Generator = struct {
 
         const tok_i32: i32 = @intCast(tok);
         const tok_shape = [_]c_int{ 1, 1 };
-        const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
+        const tok_input = try idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
         defer _ = mlx.mlx_array_free(tok_input);
         const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
         const arr = [_]mlx.mlx_array{next_logits};
@@ -2828,7 +2829,7 @@ pub const Generator = struct {
         defer allocator.free(ids_i32);
         for (input.items, 0..) |t, i| ids_i32[i] = @intCast(t);
         const shape = [_]c_int{ 1, @intCast(input.items.len) };
-        const tok_input = idsArray(self.xfm, ids_i32.ptr, &shape);
+        const tok_input = try idsArray(self.xfm, ids_i32.ptr, &shape);
         defer _ = mlx.mlx_array_free(tok_input);
         const all_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
         defer _ = mlx.mlx_array_free(all_logits);
@@ -2852,7 +2853,7 @@ pub const Generator = struct {
 
     /// The absolute position the request's state stands at: GLM's request offset, else the model's position counter.
     fn thoughtStatePos(self: *const Generator) usize {
-        if (arch_state.requestOf(&self.ctx)) |request| return request.offset;
+        if (prefix_arch.prefillRequest(&self.ctx)) |request| return request.position();
         return self.ctx.moe_seq_offset.*;
     }
 
@@ -2893,7 +2894,7 @@ pub const Generator = struct {
             log.debug("[prefix] no thought restore point: the state stands at {d}, not {d}\n", .{ pos, tp.at });
             return;
         }
-        var cp = capturePrefillCheckpoint(a, self.xfm, &self.ctx, arch_state.requestOf(&self.ctx), pos, false) catch |err| {
+        var cp = capturePrefillCheckpoint(a, self.xfm, &self.ctx, prefix_arch.prefillRequest(&self.ctx), pos, false) catch |err| {
             log.warn("[prefix] thought restore point at {d} not taken: {s}\n", .{ pos, @errorName(err) });
             return;
         };
@@ -2946,8 +2947,12 @@ pub const Generator = struct {
         const id: i32 = @intCast(token);
         var hidden = mlx.mlx_array_new();
         if (mlx.mlx_array_set(&hidden, self.last_hidden) != 0) return;
+        const ids = mlx.newData(&id, &[_]c_int{1}, .int32) catch {
+            _ = mlx.mlx_array_free(hidden);
+            return;
+        };
         self.mtp_hist_stash = .{
-            .ids = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32),
+            .ids = ids,
             .hidden = hidden,
             .n = 1,
             .off0 = rows,
@@ -3162,6 +3167,7 @@ pub const Generator = struct {
     pub const mtpTraceRoundEnd = mtp_policy.mtpTraceRoundEnd;
     pub const mtpTraceSub = mtp_policy.mtpTraceSub;
     pub const mtpVerifyDraftsMax = mtp_policy.mtpVerifyDraftsMax;
+    pub const mtpWarmVerifyCap = mtp_policy.mtpWarmVerifyCap;
     pub const mtpWidthTrialForce = mtp_policy.mtpWidthTrialForce;
     pub const mtpWidthTrialPeriod = mtp_policy.mtpWidthTrialPeriod;
     pub const mtpWidthTrialPlan = mtp_policy.mtpWidthTrialPlan;
@@ -3277,7 +3283,7 @@ pub const Generator = struct {
         if (self.pending == null and self.step < self.max_tokens and !self.samplesSync()) {
             const tok_i32: i32 = @intCast(self.next_token_id);
             const tok_shape = [_]c_int{ 1, 1 };
-            const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
+            const tok_input = try idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const t_fwd = tick_prof.mark();
             self.pending = .{ .logits = try self.xfm.forwardWith(&self.ctx, tok_input) };
@@ -3349,7 +3355,7 @@ pub const Generator = struct {
         const step_logits = if (self.pending != null) try self.takeLogits() else blk: {
             const tok_i32: i32 = @intCast(token);
             const tok_shape = [_]c_int{ 1, 1 };
-            const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
+            const tok_input = try idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const t_fwd = tick_prof.mark();
             const out = try self.xfm.forwardWith(&self.ctx, tok_input);
@@ -3392,7 +3398,7 @@ pub const Generator = struct {
             defer _ = mlx.mlx_array_free(step_logits);
             break :blk switch (self.forcedNext()) {
                 .sample => try self.sampleLazy(step_logits, .committed),
-                .force => |id| tokenArray(id),
+                .force => |id| try tokenArray(id),
                 .choose => |ids| try self.sampleAmong(allocator, step_logits, ids),
             };
         };
@@ -3417,10 +3423,11 @@ pub const Generator = struct {
 
             self.pending = .{ .logits = next_logits, .token = lazy_token };
         } else {
+            // Freed on the error paths too: a failed read of the last token kept its buffer for the load's life.
+            defer _ = mlx.mlx_array_free(lazy_token);
             try mlx.check(mlx.mlx_array_eval(lazy_token));
             var val: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
-            _ = mlx.mlx_array_free(lazy_token);
             self.next_token_id = @intCast(val);
         }
 
@@ -3544,7 +3551,7 @@ pub const Generator = struct {
         if (self.step < self.max_tokens) {
             const tok_i32: i32 = @intCast(token);
             const tok_shape = [_]c_int{ 1, 1 };
-            const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
+            const tok_input = try idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
             const arr = [_]mlx.mlx_array{next_logits};
@@ -3652,7 +3659,7 @@ pub const Generator = struct {
         if (self.step < self.max_tokens) {
             const tok_i32: i32 = @intCast(token);
             const tok_shape = [_]c_int{ 1, 1 };
-            const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
+            const tok_input = try idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
             const arr = [_]mlx.mlx_array{next_logits};
@@ -3814,7 +3821,7 @@ pub const Generator = struct {
             // Pipeline miss: forward the realized token.
             const tok_i32: i32 = @intCast(token);
             const tok_shape = [_]c_int{ 1, 1 };
-            const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
+            const tok_input = try idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
             defer _ = mlx.mlx_array_free(tok_input);
             const nl = try self.xfm.forwardWith(&self.ctx, tok_input);
             const arr = [_]mlx.mlx_array{nl};
@@ -3873,7 +3880,7 @@ pub const Generator = struct {
     fn startAsyncForward(self: *Generator, token_id: u32) void {
         const tok_i32: i32 = @intCast(token_id);
         const tok_shape = [_]c_int{ 1, 1 };
-        const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
+        const tok_input = idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape) catch return;
         defer _ = mlx.mlx_array_free(tok_input);
 
         const logits = self.xfm.forwardWith(&self.ctx, tok_input) catch return;
@@ -3956,23 +3963,23 @@ pub fn logMlxCalls() void {
     for (names.items) |n| log.debug("  [mlx-calls] {s} {d}\n", .{ n.name, n.count });
 }
 
+/// Between prefill chunks and before decode: the free buffers no pass still binds go back, on either side.
 fn clearPool(xfm: *const Trunk) void {
-    if (!mlx.engine.isStream(xfm.outStream())) _ = mlx.mlx_clear_cache();
+    if (mlx.engine.isStream(xfm.outStream())) mlx.engine.trim() else _ = mlx.mlx_clear_cache();
 }
 
 /// Token ids as the `[1, n]` int32 array a forward takes, made on the side its output is on (`Trunk.outStream`): the
 /// engine's own array for a model that forwards there, with no array of MLX's to take in.
-fn idsArray(xfm: *const Trunk, ids: [*]const i32, shape: *const [2]c_int) mlx.mlx_array {
+pub fn idsArray(xfm: *const Trunk, ids: [*]const i32, shape: *const [2]c_int) mlx.HostArrayRefused!mlx.mlx_array {
     const host = mlx.engine.enter(xfm.outStream());
     defer host.end();
-    return mlx.mlx_array_new_data(ids, shape, 2, .int32);
+    return mlx.newData(ids, shape, .int32);
 }
 
 /// A committed token as the `[1]` int32 array a sample would be.
-pub fn tokenArray(id: u32) mlx.mlx_array {
+pub fn tokenArray(id: u32) mlx.HostArrayRefused!mlx.mlx_array {
     const v: i32 = @intCast(id);
-    const shape = [_]c_int{1};
-    return mlx.mlx_array_new_data(&v, &shape, 1, .int32);
+    return mlx.newData(&v, &.{1}, .int32);
 }
 
 /// Convenience: generate all tokens at once (non-streaming).

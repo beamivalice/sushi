@@ -235,7 +235,7 @@ fn buildSmoothBf16(s: mlx.mlx_stream, head_dim: c_int) !mlx.mlx_array {
         }
     }
     const shape = [_]c_int{ 1, 1, @intCast(T), head_dim };
-    const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
+    const f32_arr = try mlx.newData(buf.ptr, &shape, .float32);
     defer _ = mlx.mlx_array_free(f32_arr);
     var bf16_arr = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(bf16_arr);
@@ -357,7 +357,7 @@ fn roundTripRms(bits: u8) !f64 {
     defer testing.allocator.free(host);
     for (host) |*v| v.* = rnd.floatNorm(f32) * 3.0;
     const shape = [_]c_int{ 64, 256 };
-    const f32_arr = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+    const f32_arr = try mlx.newData(host.ptr, &shape, .float32);
     defer _ = mlx.mlx_array_free(f32_arr);
     var src = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(src);

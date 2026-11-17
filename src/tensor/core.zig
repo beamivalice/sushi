@@ -234,6 +234,8 @@ const State = struct {
     /// Dispatches in the open pass, and how many an early hand-over waits for (`pass`).
     pass_dispatches: u32 = 0,
     kick_after: u32 = kick_first,
+    /// Pool bytes freed while the open pass still binds them (`pass_freed_cap`).
+    pass_freed: u64 = 0,
     /// A pass was handed over early since the host last waited: the ones after it follow without the GPU being idle.
     burst: bool = false,
     /// When the GPU ended the last command buffer whose times were read; 0 after one that had none.
@@ -264,6 +266,10 @@ pub const Stats = struct {
     pool_evictions: u64 = 0,
     /// Passes handed over early: a burst's first because the GPU had none of ours to run, the rest behind it.
     kicks: u64 = 0,
+    /// Passes handed over because they had freed `pass_freed_cap` bytes they still bind.
+    freed_kicks: u64 = 0,
+    /// Passes a caller handed over by `submit`, outside the kicks and the waits.
+    handovers: u64 = 0,
     /// GPU time of our command buffers, and the time between one ending and the next beginning when that is under
     /// `gap_limit_s`: the GPU had none of ours to run. Buffers whose times Metal had not set yet are counted apart.
     gpu_busy_ns: u64 = 0,
@@ -341,14 +347,21 @@ pub fn touch() void {
 /// Which high-water of the pool's bytes in use: the one the process's peak reading resets, or a forward phase's.
 pub const Peak = enum { process, phase };
 var pool_peaks: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
+var held_peaks: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
 
 pub fn poolPeak(which: Peak) u64 {
     return pool_peaks[@intFromEnum(which)].load(.monotonic);
 }
 
-/// The high-water starts again from what is in use now.
+/// The high-water of what the pool holds, its free buffers included: what Metal counts against the device.
+pub fn poolHeldPeak(which: Peak) u64 {
+    return held_peaks[@intFromEnum(which)].load(.monotonic);
+}
+
+/// Both high-waters start again from now: in use, and held.
 pub fn resetPoolPeak(which: Peak) void {
     pool_peaks[@intFromEnum(which)].store(poolTotal() - poolFree(), .monotonic);
+    held_peaks[@intFromEnum(which)].store(poolTotal(), .monotonic);
 }
 
 fn publishPool(s: *const State) void {
@@ -356,6 +369,7 @@ fn publishPool(s: *const State) void {
     pool_unused.store(s.stats.pool_free, .monotonic);
     const in_use = s.stats.pool_bytes - s.stats.pool_free;
     for (&pool_peaks) |*peak| if (in_use > peak.load(.monotonic)) peak.store(in_use, .monotonic);
+    for (&held_peaks) |*peak| if (s.stats.pool_bytes > peak.load(.monotonic)) peak.store(s.stats.pool_bytes, .monotonic);
 }
 
 // ── Kernel profile ──
@@ -548,19 +562,33 @@ pub const fault = struct {
 
     pub fn arm(k: u64) void {
         remaining = k;
+        sites.armed();
     }
     pub fn disarm() void {
         remaining = 0;
+        sites.disarmed();
+    }
+    /// Refuses the buffer of the n-th ask at `p.site`, whatever order the asks come in.
+    pub fn armAt(p: mlx.FaultSites.SitePoint) void {
+        remaining = 0;
+        sites.armAt(p);
     }
     pub fn armed() bool {
-        return remaining != 0;
+        return remaining != 0 or sites.target != null;
     }
     /// Buffers the pool was asked for since the process began: the difference over a request is its sweep's length.
     pub fn count() u64 {
         return asked;
     }
+    /// Recording for a sweep by site (`mlx.sweepPoints`).
+    pub var sites: mlx.FaultSites = .{};
     fn hit() bool {
         asked += 1;
+        switch (sites.take()) {
+            .noted, .pass => return false,
+            .fail => return true,
+            .count => {},
+        }
         if (remaining == 0) return false;
         remaining -= 1;
         return remaining == 0;
@@ -744,6 +772,10 @@ fn dropStore(store: *Store) void {
             s.stats.pool_asked -= store.len;
             if (s.free[class].append(gpa, store)) |_| {
                 s.stats.pool_free += classBytes(class);
+                if (store.seq == s.seq and s.pass != null) s.pass_freed += classBytes(class);
+                if (free_cap) |cap| if (s.stats.pool_free > cap) {
+                    _ = evict(s, s.stats.pool_bytes - (s.stats.pool_free - cap));
+                };
             } else |_| {
                 // No room to keep it: it goes once the passes that bind it have run.
                 if (store.seq > s.done) waitFor(s, store.seq) catch {};
@@ -1097,6 +1129,14 @@ pub fn freePending(p: *Pending) void {
 /// The first early hand-over of a burst comes after this many dispatches; each one after takes twice as many.
 const kick_first = 4;
 
+/// Bytes the open pass may free yet still bind before it is handed over: the pool cannot hand them out again until
+/// then, so a pass grown by the kicks' doubling held every buffer it freed. MLX commits a command buffer by bytes too.
+pub const pass_freed_cap: u64 = 64 * 1024 * 1024;
+
+/// The most free bytes the pool keeps, MLX's cache limit beside it (`gpu_mem`): past it a freed buffer's size class is
+/// released at once, as MLX's cache releases past its own; null keeps every free buffer.
+pub var free_cap: ?u64 = null;
+
 /// The open pass, begun now if none is. Work encoded while the GPU has none of ours to run is handed over early,
 /// in steps that double, so the GPU starts on a draft or a layer while the host still builds the rest of it. The
 /// steps after the first do not wait for the GPU to run dry: a pass handed over behind one that has not started
@@ -1116,6 +1156,11 @@ pub fn pass() Error!metal.Pass {
             s.kick_after *|= 2;
             s.burst = true;
             s.stats.kicks += 1;
+        } else if (s.pass_freed >= pass_freed_cap and s.next_in.count() == 0 and s.next_out.count() == 0) {
+            // What it freed goes back to the pool once handed over: a later pass may take it.
+            s.pass = null;
+            try commitPass(s, open);
+            s.stats.freed_kicks += 1;
         }
     }
     if (s.pass == null) s.pass = s.dev.beginConcurrent();
@@ -1197,6 +1242,8 @@ pub var pipelines_late: u64 = 0;
 /// Pipelines a launch took from those a manifest made ahead: no compile, so neither counted above nor late.
 pub var pipelines_preloaded: u64 = 0;
 pub var sealed: bool = false;
+/// Where the inference thread is, for the late line: a caller's own words for the step that may make a pipeline.
+pub var late_where: []const u8 = "outside a forward";
 
 /// The pipeline `pipeline`, named `name`, was made since `t0`.
 pub fn madePipeline(name: []const u8, t0: u64, pipeline: metal.Pipeline) void {
@@ -1207,8 +1254,31 @@ pub fn madePipeline(name: []const u8, t0: u64, pipeline: metal.Pipeline) void {
     const log = @import("../log.zig");
     if (!sealed) return log.debug("[engine] compiled {s}\n", .{name});
     pipelines_late += 1;
-    log.warn("[engine] compiled inside a request ({d} ms): {s}\n", .{ ns / std.time.ns_per_ms, name });
+    if (comptime builtin.is_test) late_names.add(name);
+    log.warn("[engine] compiled inside a request ({d} ms, {s}): {s}\n", .{ ns / std.time.ns_per_ms, late_where, name });
 }
+
+/// The first late pipelines' names in a test process, for a test that finds one to say which.
+pub const late_names = struct {
+    var buf: [16384]u8 = undefined;
+    var len: usize = 0;
+
+    fn add(name: []const u8) void {
+        const line = name[0..@min(name.len, 120)];
+        if (len + line.len + 1 > buf.len) return;
+        @memcpy(buf[len..][0..line.len], line);
+        buf[len + line.len] = '\n';
+        len += line.len + 1;
+    }
+
+    pub fn text() []const u8 {
+        return buf[0..len];
+    }
+
+    pub fn clear() void {
+        len = 0;
+    }
+};
 
 fn nameOf(name: []const u8, pipeline: metal.Pipeline) void {
     if (gpa.dupe(u8, name)) |owned| pipeline_names.put(gpa, @intFromPtr(pipeline.raw), owned) catch gpa.free(owned) else |_| {}
@@ -1280,6 +1350,7 @@ fn commitPass(s: *State, open: metal.Pass) Error!void {
     s.stats.commit_ns += nowNs() - t0;
     s.seq += 1;
     s.pass_dispatches = 0;
+    s.pass_freed = 0;
     s.stats.submits += 1;
 }
 
@@ -1308,6 +1379,7 @@ fn refuseFillingReads(s: *State, open: metal.Pass) Error!void {
     clearPassBinds(s);
     s.pass_kernels = .{};
     s.pass_dispatches = 0;
+    s.pass_freed = 0;
     return error.ReadsFillingSlab;
 }
 
@@ -1331,6 +1403,7 @@ pub fn submit() Error!void {
     const open = s.pass orelse return;
     s.pass = null;
     try commitPass(s, open);
+    s.stats.handovers += 1;
 }
 
 /// Dispatches encoded into the open pass and not yet handed to the GPU.
@@ -1487,12 +1560,66 @@ pub fn freshForHost(dtype: Dtype, shape: []const c_int) Error!*Tensor {
     return freshFor(dtype, shape, true);
 }
 
-/// `t`'s bytes on the host once every pass that binds them has run. Row-contiguous tensors only.
+/// `t`'s bytes for the host to read once the pass that last wrote them has run: a queued pass that only reads them
+/// may still be running. Row-contiguous tensors only. A host write takes `hostBytes`.
+pub fn hostRead(t: *const Tensor) Error![]u8 {
+    if (!t.rowContiguous()) return error.NotRowContiguous;
+    const s = try st();
+    if (t.store.seq > s.done) {
+        if (s.pass != null and s.pass_writes.contains(t.store)) {
+            try waitFor(s, s.seq);
+        } else if (s.writers.get(t.store)) |w| {
+            if (w.seq > s.done) try waitFor(s, w.seq);
+        }
+    }
+    return (t.store.ptr + t.offset)[0..t.nbytes()];
+}
+
+/// `t`'s bytes on the host once every pass that binds them has run, for the host to write. Row-contiguous tensors only.
 pub fn hostBytes(t: *const Tensor) Error![]u8 {
     if (!t.rowContiguous()) return error.NotRowContiguous;
     const s = try st();
     if (t.store.seq > s.done) try waitFor(s, t.store.seq);
     return (t.store.ptr + t.offset)[0..t.nbytes()];
+}
+
+test "a long open pass holds no more than it uses plus the bytes it may free before it is handed over" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    const ops = @import("ops.zig");
+    try sync();
+    trim();
+    // 8 MB a step, each step's input freed after it: in use stays at two steps while the pass grows.
+    const rows = 2048;
+    var x = try fresh(.float32, &.{ rows, 1024 });
+    @memset(try hostBytes(x), 0);
+    const held0 = stats().pool_bytes;
+    var step: usize = 0;
+    while (step < 400) : (step += 1) {
+        const y = try ops.unary(.negative, x);
+        release(x);
+        x = y;
+    }
+    defer release(x);
+    const in_use = stats().pool_bytes - stats().pool_free;
+    try t.expect(stats().pool_bytes - held0 <= in_use + pass_freed_cap + 2 * 8 * 1024 * 1024);
+}
+
+test "the pool keeps no more free bytes than its free cap, as MLX's cache keeps no more than its limit" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    try sync();
+    trim();
+    const was = free_cap;
+    defer free_cap = was;
+    free_cap = 32 * 1024 * 1024;
+    // Buffers of eleven size classes, each freed once no pass binds it: none is asked for again.
+    var mb: usize = 1;
+    while (mb <= 1024) : (mb *= 2) {
+        const a = try fresh(.uint8, &.{@intCast(mb * 1024 * 1024 / 4 * 3)});
+        release(a);
+        try t.expect(stats().pool_free <= free_cap.?);
+    }
 }
 
 test "a fresh tensor comes from the pool and goes back to it" {
@@ -1528,6 +1655,25 @@ test "a second release of a tensor is refused by name: its box and its store are
     const c = try fresh(.uint8, &.{100});
     defer release(c);
     try t.expect(b != c and b.store != c.store);
+}
+
+test "the pool's held high-water counts the free buffers it keeps, which the in-use one does not" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    const mb = 1 << 20;
+    try sync();
+    resetPoolPeak(.process);
+    try t.expectEqual(poolTotal(), poolHeldPeak(.process));
+    const a = try fresh(.uint8, &.{9 * mb + 5});
+    release(a);
+    // `a` is free but kept: what Metal holds stays at its fullest after the in-use bytes fell back.
+    const held = poolTotal();
+    const b = try fresh(.uint8, &.{17 * mb + 5});
+    release(b);
+    try t.expect(poolHeldPeak(.process) >= held + 17 * mb);
+    try t.expect(poolHeldPeak(.process) > poolPeak(.process));
+    resetPoolPeak(.process);
+    try t.expectEqual(poolTotal(), poolHeldPeak(.process));
 }
 
 test "the pool's high-waters keep what was in use at its fullest, each from its own reset" {

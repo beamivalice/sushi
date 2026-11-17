@@ -441,3 +441,36 @@ pub fn qsaArraysAllEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) 
     try mlx.check(mlx.mlx_array_item_bool(&out, all));
     return out;
 }
+
+/// Every entry of `fixture` linked into `tmp`: a scratch pack a test can add a file to.
+pub fn linkPack(tmp: *testing.TmpDir, fixture: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var src = try std.Io.Dir.openDirAbsolute(io, fixture, .{ .iterate = true });
+    defer src.close(io);
+    var it = src.iterate();
+    while (try it.next(io)) |entry| {
+        var target: [1024]u8 = undefined;
+        try tmp.dir.symLink(io, try std.fmt.bufPrint(&target, "{s}/{s}", .{ fixture, entry.name }), entry.name, .{});
+    }
+}
+
+/// A scratch pack: `fixture` linked in, plus an `expert_usage.json` of `layers` rows that counts every fourth expert
+/// most used, so a drop of up to three quarters keeps experts spread over every rate group. The caller frees the path.
+pub fn usagePack(tmp: *testing.TmpDir, fixture: []const u8, layers: usize, experts: usize, top_k: usize) ![:0]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try linkPack(tmp, fixture);
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(testing.allocator);
+    var buf: [96]u8 = undefined;
+    try json.appendSlice(testing.allocator, try std.fmt.bufPrint(&buf, "{{\"version\":1,\"source\":\"unit\",\"tokens\":1,\"top_k\":{d},\"layers\":[", .{top_k}));
+    for (0..layers) |li| {
+        try json.appendSlice(testing.allocator, if (li == 0) "[" else ",[");
+        for (0..experts) |e| {
+            try json.appendSlice(testing.allocator, try std.fmt.bufPrint(&buf, "{s}{d}", .{ if (e == 0) "" else ",", if (e % 4 == 0) 100 + e else 1 }));
+        }
+        try json.appendSlice(testing.allocator, "]");
+    }
+    try json.appendSlice(testing.allocator, "]}");
+    try tmp.dir.writeFile(io, .{ .sub_path = @import("expert_usage.zig").file_name, .data = json.items });
+    return tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+}

@@ -53,7 +53,8 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
     ([below](#transient-caps)) bounds the pool together with the forward's allocations, so MLX trims the pool on demand
     at it and the parked pool never passes what was billed. The decode cap is a standing term of the live headroom
     (`server.dsv41Headroom` takes it off ceiling less active, since the parked pool sits in MLX's cache, not its active
-    bytes); a lower cap clears the pool. Admission (`prefillNeededAtChunk`) bills the decode cap beside every request;
+    bytes; on a Cooler load it is the engine's free buffers under the cap, taken off once, at the larger of the two);
+    a lower cap clears the pool. Admission (`prefillNeededAtChunk`) bills the decode cap beside every request;
     at load `expertStreamingServingBytes` leaves it out, the ledger's staging term already holds it.
   - Unloading a DeepSeek model gives the next model the process-wide cap `applyMlxCacheLimit` installed, forgets the
     raised cap and lifts the transient cap (`dsv41_borrow.unloadModel`, in the scheduler's unload and eviction paths).
@@ -93,6 +94,7 @@ The phase's bytes are the bill: `Config.forwardCap(rows, seq)` for a forward, `r
 
     prefill-width forward (> 17 rows):  (rows x dim x 480 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
     decode or verify forward (<= 17):   (seq x 16 x 4 x 3 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
+    joined decode forward (a row each): the sum of each request's decode term at its own seq, + 256 MiB once
 
 The per-row 480 B a channel is the 2.3 MiB a row measured from 256 to 2048 rows, rounded up (one 363-row chunk read 2.8
 MiB with its state rows); the per-context term is a decode block's scores (16 rows, 3 copies, f32) and the row stores'
@@ -100,7 +102,8 @@ growth (a sixteenth of the state, plus one layer's old rows beside the new buffe
 twice the 0.12 GiB of small tensors a decode forward holds. A last chunk absorbs a tail, so a chunk bills
 `chunk + 511` rows (`chunkCap`).
 
-Measured peaks of MLX's own bytes, imported weights left out and the state's rows in (`SUSHI_DSV41_TRANSIENT_PEAK=1`,
+Measured peaks of MLX's own bytes, imported weights left out and the state's rows in (the reading then counted what
+was resident at the phase's start; it now counts only what the phase adds past it) (`SUSHI_TRANSIENT_PEAK=1`,
 binary 26a28040, STQ-1.75bpw, `--ssd-budget-gb 108`, DSpark, one 225k-token cold prefill, raw
 `p2b-1028`), and the cap beside them (the pool allowance, 1 GiB, is added on top):
 

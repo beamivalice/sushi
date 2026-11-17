@@ -14,9 +14,9 @@ const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
 const bills = @import("../bills.zig");
 const registry = @import("registry.zig");
-const arch_life = @import("life.zig");
 const model_mod = @import("../model.zig");
 const model_handle = @import("../model_handle.zig");
+const cooler_side = @import("../cooler_side.zig");
 const ModelConfig = model_mod.ModelConfig;
 
 /// A verify block's rows: every forward of a request is billed at no fewer.
@@ -30,9 +30,7 @@ comptime {
     }
 }
 
-fn onEngine(config: *const ModelConfig) bool {
-    return arch_life.ownStream(config) != null;
-}
+const onEngine = cooler_side.onEngine;
 
 /// Whether the arch's own module installs and lifts its caps (DeepSeek's beside the expert pools it releases).
 fn ownCaps(config: *const ModelConfig) bool {
@@ -62,19 +60,26 @@ pub fn restCap(config: *const ModelConfig) u64 {
 /// A forward wider than a verify block ran since the last trim: the next narrow one trims its scratch.
 var after_wide = false;
 
-/// A forward of the model of `config` begins.
-pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.ForwardCtx, ids: mlx.mlx_array) void {
-    if (!onEngine(config) or ownCaps(config)) return;
+pub const Rows = struct { rows: u64, seq: u64 };
+
+/// A forward of the model of `config` begins: its rows, and the position its last row ends at, read only when the
+/// shared seam acts on them or `want` asks (each read of a shape is a query of MLX's on an MLX load).
+pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.ForwardCtx, ids: mlx.mlx_array, want: bool) ?Rows {
+    const seam = onEngine(config) and !ownCaps(config);
+    if (!seam and !want) return null;
     const shape = mlx.getShape(ids);
     const rows: u64 = if (shape.len == 0) 1 else @intCast(shape[shape.len - 1]);
+    const at: Rows = .{ .rows = rows, .seq = @as(u64, ctx.cache.kvLenForBatching()) + rows };
+    if (!seam) return at;
     if (rows > verify_rows) {
         after_wide = true;
-        return;
+        return at;
     }
-    if (!after_wide) return;
+    if (!after_wide) return at;
     after_wide = false;
     mlx.engine.close();
-    trimTo(forwardCap(config, rows, @as(u64, ctx.cache.kvLenForBatching()) + rows));
+    trimTo(forwardCap(config, rows, at.seq));
+    return at;
 }
 
 fn install(bytes: u64) void {
@@ -92,6 +97,7 @@ fn trimTo(bytes: u64) void {
 /// (DeepSeek lifts it around a restore); for the rest no cap stays.
 pub fn endRequest(config: *const ModelConfig) void {
     if (!onEngine(config)) return;
+    @import("cooler_pipelines.zig").requestEnded();
     mlx.engine.close();
     after_wide = false;
     if (ownCaps(config)) install(restCap(config)) else trimTo(restCap(config));
@@ -116,4 +122,52 @@ pub fn warmEnded() void {
     mlx.engine.seal(true);
     mlx.engine.close();
     mlx.engine.trim();
+}
+
+/// What a load on the engine of our own owes the engine while it reads its weights and builds its model, in one place
+/// for every arch: the engine on before the first weight is wrapped, every region the load makes wrapped as the
+/// engine's, and while the model builds the engine's scope held (to the unload, `arch_handle.destroy`), no cap of an
+/// earlier model's forward in force, and the seal of an earlier load lifted, standing again if this one fails.
+pub const LoadScope = struct {
+    on: bool,
+    held: bool = false,
+    seal: ?mlx.engine.Seal = null,
+
+    /// The weights of `config` are read from here to `end`.
+    pub fn weights(config: *const ModelConfig) LoadScope {
+        const on = cooler_side.onEngine(config);
+        if (on) mlx.engine.enable();
+        mlx.engine.own_weights = on;
+        return .{ .on = on };
+    }
+
+    /// The model of `config` is built from here to `end` (or `fail`): the hold it takes is the model's to its unload.
+    pub fn build(config: *const ModelConfig) error{EngineBudget}!LoadScope {
+        const on = cooler_side.onEngine(config);
+        if (!on) return .{ .on = false };
+        mlx.engine.hold();
+        errdefer @import("handle.zig").engineHoldEnd();
+        mlx.engine.budget(std.math.maxInt(u64)) catch return error.EngineBudget;
+        mlx.engine.own_weights = true;
+        return .{ .on = true, .held = true, .seal = mlx.engine.unsealed() };
+    }
+
+    /// The weights are read or the model is built: the model keeps its hold, and the seal stays lifted until its warm
+    /// ends (`warmEnded`).
+    pub fn end(_: LoadScope) void {
+        mlx.engine.own_weights = false;
+    }
+
+    /// The build failed: the hold goes and the earlier seal stands again.
+    pub fn fail(self: LoadScope) void {
+        mlx.engine.own_weights = false;
+        if (self.seal) |s| s.end();
+        if (self.held) @import("handle.zig").engineHoldEnd();
+    }
+};
+
+/// A step of a load that makes its own pipelines outside the model's build (an image tower's load or warm): the seal is
+/// lifted for it and stands again at `end`. Null on MLX.
+pub fn making(on: bool) ?mlx.engine.Seal {
+    return if (on) mlx.engine.unsealed() else null;
 }

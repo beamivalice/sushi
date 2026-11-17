@@ -458,7 +458,7 @@ fn randBf16(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, shape:
 }
 
 fn fromF32(alloc: std.mem.Allocator, s: mlx.mlx_stream, vals: []const f32, shape: []const c_int) !Bf16Array {
-    const a32 = mlx.mlx_array_new_data(vals.ptr, shape.ptr, @intCast(shape.len), .float32);
+    const a32 = try mlx.newData(vals.ptr, shape, .float32);
     defer _ = mlx.mlx_array_free(a32);
     var ab = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(ab);
@@ -660,7 +660,7 @@ fn runGateUpShape(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, 
     defer slab.deinit(alloc);
     const slots_host = try randomSlots(alloc, rnd, @intCast(R), @intCast(topk), @intCast(U));
     defer alloc.free(slots_host);
-    const slots = mlx.mlx_array_new_data(slots_host.ptr, &[_]c_int{ R, topk }, 2, .int32);
+    const slots = try mlx.newData(slots_host.ptr, &[_]c_int{ R, topk }, .int32);
     defer _ = mlx.mlx_array_free(slots);
 
     const truth = try gateUpTruth(alloc, x.bits, slab.bits, slots_host, @intCast(R), @intCast(topk), @intCast(N), @intCast(K));
@@ -691,12 +691,12 @@ fn runDownShape(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, U:
     defer slab.deinit(alloc);
     const slots_host = try randomSlots(alloc, rnd, @intCast(R), @intCast(topk), @intCast(U));
     defer alloc.free(slots_host);
-    const slots = mlx.mlx_array_new_data(slots_host.ptr, &[_]c_int{ R, topk }, 2, .int32);
+    const slots = try mlx.newData(slots_host.ptr, &[_]c_int{ R, topk }, .int32);
     defer _ = mlx.mlx_array_free(slots);
     const w_host = try alloc.alloc(f32, @intCast(R * topk));
     defer alloc.free(w_host);
     for (w_host) |*v| v.* = rnd.float(f32);
-    const w = mlx.mlx_array_new_data(w_host.ptr, &[_]c_int{ R, topk }, 2, .float32);
+    const w = try mlx.newData(w_host.ptr, &[_]c_int{ R, topk }, .float32);
     defer _ = mlx.mlx_array_free(w);
 
     const truth = try downTruth(alloc, h.bits, slab.bits, slots_host, w_host, @intCast(R), @intCast(topk), @intCast(N), @intCast(K));

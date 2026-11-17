@@ -22,7 +22,7 @@ pub const Kind = enum { mtp, dspark, dflash2 };
 /// A scalar in the array's own dtype, so a masked bf16 block is not widened to
 /// f32 by its own `-inf`.
 fn scalarLike(v: f32, like: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const raw = mlx.mlx_array_new_float(v);
+    const raw = try mlx.newFloat(v);
     defer _ = mlx.mlx_array_free(raw);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);

@@ -317,6 +317,10 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   two or more take NAX, so a row beside others need not equal itself alone. The
   Flash-Next trunk passes it on each trellis projection (`exl3/trunk.zig`); DeepSeek's scopes carry it through its
   DSpark verify. No launch mode is a process global: a host running several models cannot leak one into another.
+- **NAX holds every exact width on DeepSeek's trunk, though it loses at one row** (M5 Max, `shared.exl3_trunk_rows`
+  simd arm, 057a5b52): one row costs 5-35% more per shape on NAX, while SIMD loses 12-90% at 5 to 8 rows. Weighted by a
+  served DSpark request's widths (one row in 8 of 26 forwards), the best arm per shape saves 1.0% of the trunk's
+  projection time and changes bytes, so it is dropped. Only a joined-rows load without a drafter is mostly one row.
 - The parity bar scores each 128-wide output block in inner space: its error L2 (divided by svh) against the L2 of the
   block's summand magnitudes. The output transform is an orthonormal rotation, so this keeps the inner GEMV bar's
   scale. The composite is `projectIndexed` per row, which shares the bitstream, so it cannot convict a codeword flip;

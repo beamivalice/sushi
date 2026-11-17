@@ -85,15 +85,9 @@ test {
 }
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *trunk.Weights, s: mlx.mlx_stream) !Trunk {
-    const side = qwen4_cooler.sideOf(&config);
-    @import("../log.zig").info("{s}\n", .{qwen4_cooler.line(side)});
-    // A Cooler model holds the engine's scope from here to its unload (`deinit`).
+    var line_buf: [256]u8 = undefined;
+    @import("../log.zig").info("{s}\n", .{@import("../cooler_side.zig").line(&line_buf, "[qwen4] forwards", &config)});
     const held = mlx.engine.isStream(s);
-    if (held) mlx.engine.hold();
-    errdefer if (held) @import("../arch/handle.zig").engineHoldEnd();
-    // What the init builds from the weights lands in owned regions the engine wraps, as the weights did.
-    mlx.engine.own_weights = held;
-    defer mlx.engine.own_weights = false;
     if (config.indexer_budget != 0) {
         try qwen4_qsa_select.qsaScoreFusedArm(s);
         try qwen4_qsa_gather.qsaNaxArm(s);
@@ -108,10 +102,8 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
 }
 
 pub fn deinit(xfm: Model) void {
-    const held = mlx.engine.isStream(xfm.s);
     xfm.arch_state.qwen4.deinit(xfm.allocator);
     xfm.deinitTrunk();
-    if (held) @import("../arch/handle.zig").engineHoldEnd();
 }
 
 const qwen4_cooler = @import("qwen4_cooler.zig");
@@ -125,20 +117,27 @@ pub const cooler_opt_out: @import("../arch/config.zig").CoolerOptOut = .{
 pub const cooler_contract = @import("qwen4_contract.zig");
 
 /// A Cooler load runs on the engine's stream.
-pub const ownStream = qwen4_cooler.ownStream;
+pub const coolerGap = qwen4_cooler.coolerGap;
 
-/// Frees the arch's process-wide arrays of side `side` (1 the engine's, 0 MLX's) when that side's last model is gone.
-pub fn dropHostArrays(side: u1) void {
-    @import("qwen4_hc.zig").dropSide(side);
-}
-
-pub fn coolerForTest(config: *Config, on: bool) void {
-    config.cooler_for_test = on;
-}
-
-/// Records who asked for MLX, which `qwen4_cooler.sideOf` reads.
-pub fn stampCooler(config: *Config, on: bool, by_flag: bool) void {
-    config.cooler_ask = if (on) .none else if (by_flag) .flag else .setting;
+/// The pipeline manifest a Qwen load reads and writes (`arch/cooler_pipelines.zig`): kernels follow the pack's shapes
+/// and formats, never its weights, so two packs alike in these share one.
+pub fn coolerPipelineScope(config: *const Config) [16]u8 {
+    const manifest = @import("../pipeline_manifest.zig");
+    var d: manifest.Digest = .{};
+    d.add("model type", config.model_type);
+    for ([_]struct { []const u8, u64 }{
+        .{ "layers", config.num_hidden_layers },        .{ "hidden", config.hidden_size },
+        .{ "heads", config.num_attention_heads },       .{ "vocab", config.vocab_size },
+        .{ "experts", config.num_experts },             .{ "expert width", config.moe_intermediate_size },
+        .{ "indexer budget", config.indexer_budget },   .{ "expert layout", @intFromEnum(config.expert_layout) },
+        .{ "codebook", @intFromEnum(config.expert_quant_codebook) }, .{ "window", @intFromEnum(config.expert_quant_window) },
+        .{ "table", config.expert_quant_table orelse 0xff }, .{ "rate", config.expert_quant_rate.n },
+        .{ "rates", @truncate(config.expert_quant_rates orelse 0) }, .{ "tile order", @intFromEnum(config.expert_tile_order) },
+        .{ "quant bits", config.quant_bits },           .{ "quant group", config.quant_group_size },
+        .{ "trunk codebook", if (config.trunk_quant) |t| @intFromEnum(t.codebook) else 0xff },
+    }) |f| d.addInt(f[0], f[1]);
+    @import("../arch/cooler_pipelines.zig").addRecipeEnv(&d);
+    return d.hex();
 }
 
 pub fn resetCache(xfm: Model) !void {
@@ -164,9 +163,10 @@ pub fn ownsModuleDecodeState(xfm: Model) bool {
     return false;
 }
 
+/// A quantized pack drops experts by its usage list; the BF16 checkpoint's fused banks are read whole.
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {
-    _ = config;
-    return .{};
+    const bf16 = config.expert_layout == .bf16_fused or config.expert_layout == .bf16_individual;
+    return .{ .drop_expert = !bf16 };
 }
 
 test "a model stamped as qwen4 is dispatched to qwen4" {

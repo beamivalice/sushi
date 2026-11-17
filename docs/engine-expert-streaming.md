@@ -136,6 +136,17 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   bill). Without one, every layer gets the same bytes ([dsv41-memory](dsv41-memory.md)).
 - **Dropped experts** (`--drop-expert n`, [dsv41-arch](dsv41-arch.md#drop-expert)): the plan, the ledger, the profile split, the per-group
   pools and the union bank count the kept experts only; a route that names a dropped id is `ExpertDropped`, and the warm skips them.
+  The ranking keeps each rate group's most-used expert (a group's last is never dropped; the next least-used goes
+  instead, so `n` stays exact), read from the pack by `expert_store.loadDrop`, which the plan and the engine share.
+  An arch's router never picks one: DeepSeek's bias is -inf there, and a softmax router adds `Engine.dropMask` (0 or -inf
+  in the logits' dtype) before its top-k, so the kept picks and their renormalized weights are the unmasked ones. The
+  load line states the share of the list's routed rows the kept experts held (`DropSet.kept_share`); under half, its
+  answers are a speed reading only. A layer past the list (an MTP head) keeps every expert.
+- **Resident route.** A resident rate-grouped layer maps its picks to slots on the GPU (`Engine.residentRoute`), in
+  DeepSeek's stream and the trunk's streamed MoE alike, so its decode reads no picks on the host; a lossy pick or an
+  imatrix capture keeps the host route. The contract's drop cell holds a resident one-row request to no host route.
+  On Sushi Cooler the route hands nothing over early: no host read follows it, the engine's kicks already start the
+  GPU, and a pass per layer leaves the GPU idle at each boundary (the drop cell counts `Stats.handovers`).
 - **Lending pools** (`Engine.borrowLayer`, `restoreLayer`, from `borrow_from` on): a whole rate-grouped layer's pool can be
   released (its bank dropped, its slabs unmapped once their holder lets go; the active bytes fall by the pool) and later
   rebuilt with the experts it held. A released layer's routes read every distinct pick into the union workspace and

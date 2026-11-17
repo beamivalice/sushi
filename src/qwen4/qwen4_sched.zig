@@ -26,10 +26,10 @@ pub fn facts(config: *const ModelConfig) sched.Facts {
     };
 }
 
-/// Flash-Next's joined decode rows are not ported to Sushi Cooler: a Cooler load serves one row.
+/// A Cooler load joins as many decode rows as on MLX (`rowCap`), each its solo request's tokens.
 pub fn coolerRows(config: *const ModelConfig) sched.CoolerRows {
-    _ = config;
-    return .{ .rows = 1, .why = "Flash-Next's joined decode rows are not ported to Sushi Cooler yet" };
+    const rows = rowCap(config) orelse return .{ .rows = 1, .why = "this Flash-Next pack has no joined decode rows" };
+    return .{ .rows = rows };
 }
 
 pub fn batches(config: *const ModelConfig) bool {

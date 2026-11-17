@@ -9,7 +9,7 @@ the stream a call carries says which side runs it.
 
 ## Where it serves
 
-One decision at the load, `dsv41_borrow.ownDecode`, which the bills ask too; the load line names the side and, on
+One decision at the load for every arch, `cooler_side.sideOf`, which the bills ask too; the load line names the side and, on
 MLX, the reason. A user opts out of the engine up front, never per forward: `--ds41-mlx-engine` or the model's
 `ds41_cooler: false` (the settings page's "Use Sushi's Cooler Engine instead of MLX" checkbox, ticked by default) moves
 every forward of the table below to MLX at the next load (`DecodeSide.mlx_by_flag` / `.mlx_by_setting`); the flag
@@ -32,6 +32,11 @@ MLX from load to unload and gives the MLX route's logits and DSpark tokens at ea
 one row takes other product plans than a one-row step on either route, so greedy tokens on that random model depend
 on the round mix; each mix is held to MLX's at the same mix.
 
+Qwen's BF16 checkpoint reaches the dense gathered product (`tensor/gather_mm.zig`, MLX's `gather_mm`): `gather_mv` for
+a decode row (both kernel orientations), the wide gather for up to fifteen rows a pick against a transposed bank, and
+the steel tiles past it, each held to MLX's bytes. MLX's sorted one-row kernels (`gather_mm_rhs`) are refused by name:
+no caller asks for them, since MLX's dense sorted path gives wrong rows (`gatherExpertMm`).
+
 The vision tower of an image request (once per image, on a load that decodes on the engine) runs on the engine whole:
 the table's `quantized_matmul`, `fast::scaled_dot_product_attention` and `erf` rows. Its load-time requantization
 (bf16 to affine 8-bit in groups of 128) is the engine's too (`stock.quantize`: MLX's own `affine_quantize` kernel,
@@ -48,6 +53,18 @@ own on a Cooler load.
 A DSpark round's verdict, greedy or sampled, is decided on the engine wherever its verify ran there.
 
 ## Speed against MLX
+
+Qwen3.8 STQ 2.75bpw, the decode-forward meter (`SUSHI_DECODE_FWD_UBENCH=30`, `_S=1,7`, `_KV`), M5 Max, AC, one boot an
+arm in one session, ms a forward (one row; seven, a verify):
+
+| keys | Cooler before | Cooler | MLX |
+|---|---:|---:|---:|
+| 4,096 | 16.4 / 32.5 | | 16.2 / 33.2 |
+| 131,072 | 33.3 / 58.7 | 16.4 / 37.2 | 17.4 / 34.7 |
+
+- "Before" built each full-attention layer's dense KV pair every forward, whole range, unread past the indexer's budget
+  (`affine_dequantize` 25 a forward at 382 µs each, and the strided triples' copies ahead of it, at 131k).
+- A verify still grows 4.7 ms from 4k to 131k on Cooler against 1.5 ms on MLX: open.
 
 Release bench (`tests/bench.sh --tokens 256`, `--ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000`), M5 Max,
 AC, DeepSeek-V4.1 STQ 1.75bpw, decode tok/s, median of 3. MLX: the same tree with decode on MLX (the host overhead
@@ -149,6 +166,15 @@ route and the MLX arm still build the bank at prepare time.
   arguments more on the way to mlx-c.
 - A handle of ours is a tagged pointer (low bit set); the makers that take no stream (a host array, a vector) make
   engine objects while `active` is on.
+- **A host array can be refused.** MLX's maker never fails; the engine's hands back an empty handle when the pool
+  refuses the buffer, which unchecked crashed at the next shape read or reached MLX as a call at rest. Code a Cooler
+  load runs makes them with `mlx.newData`/`newInt`/`newFloat`/`newBool` (`host_side.made` in the EXL3 module), which
+  return `error.HostArrayRefused`; lint rule `host-maker-unchecked` holds it, and `mlx.shapeOf` reads a rank it
+  checks. The contract's pool sweep refuses each pool ask site of a request, at its first and last ask: the request
+  fails by its error and the next one says the same tokens, with the engine's pool as it was.
+- **A best-effort path never declines on the engine.** MLX-side fallbacks that drop a feature on a failed launch (the
+  MTP coarse rerank's build and shortlist) return the error on the engine's stream, so a refusal fails that request or
+  load and never leaves later ones on a different path.
 - A kernel, its config and its lists of names made while the engine is on are objects of the engine's (tagged
   handles), so making and filling them calls nothing in mlx-c. A module keeps the kernels and configs it builds and
   may launch one on MLX's side later: MLX's kernel and config (the twins) are made at that first launch, the config
@@ -184,8 +210,10 @@ route and the MLX arm still build the bank at prepare time.
   still follow what the process ran before (a 12-token request read 7,336 as a process's only load and 7,017 after
   other loads).
 - **A Cooler load holds the engine's scope from its first tensor to its unload** (`engine.hold`, `engine.unhold`,
-  counted, so a second load's unload leaves the first one's). Its trunk's stream is the engine's (`arch_life.ownStream`,
-  the arch hook `Trunk.init` asks before it would take the thread's GPU stream), so `xfm.s`, `m.s` and
+  counted, so a second load's unload leaves the first one's). One shared scope does a load's engine steps for every
+  arch (`arch_cooler.LoadScope`: the engine on and regions wrapped while `loadWeightsForConfig` reads, the hold, no
+  earlier cap and the seal lifted while `arch_life.init` builds; lint `engine-lifecycle`): one arch's step the other
+  lacked made a second Cooler load's warm count as late. Its trunk's stream is the engine's (`cooler_side.stream`), so `xfm.s`, `m.s` and
   `Trunk.outStream` are one stream, every host array, scalar and vector made for the load is the engine's wherever it
   is made, and an op that reaches an MLX stream is refused by name instead of lending a tensor. What a held scope
   turned up, each of which had been a call or an import per round or per request: the `-inf` scalar of the greedy
@@ -229,9 +257,10 @@ route and the MLX arm still build the bank at prepare time.
 - **A trial that picks a kernel arm runs on the load's stream.** The attention and index-scan matrix-unit trials
   (`kernels.attnNaxTrial`, `indexNaxTrials`) ran on MLX's stream with MLX's normal draw; inside a held scope both
   were refused, the refusal read as "the trial differs", the SIMD and scalar kernels served and four of five live
-  replies changed bytes. On the engine's stream the inputs are made on the host (`trialValues`) and a trial that
-  cannot run fails the load (`setAttnNax`, `setIndexNax`); on MLX's stream a failed launch still declines the arm,
-  as a GPU without matrix units needs.
+  replies changed bytes. On the engine's stream the inputs are made on the host (`trialValues`). One rule for every
+  arch, `arm_trial.run`: on the engine's stream a trial that cannot run fails the load; on MLX's a failed launch
+  declines the arm, as a GPU without matrix units needs, and drops what it latched. A verdict is kept per side
+  (`arm_trial.Verdict`), so a trial on MLX's side decides nothing for a later Cooler load.
 - **A tower the engine cannot run refuses a Cooler load** (`error.VisionTowerNotPorted`, with what
   `engineGap` found); it no longer stays on MLX beside the engine. The MLX route serves such a pack. The image
   encoder's own stream is the tower's (`Tower.ownStream`): the patch arrays and the join of several images' spans are
@@ -288,6 +317,38 @@ route and the MLX arm still build the bank at prepare time.
 
 Each one cost a wrong result or a large slowdown before it was a rule.
 
+- **The engine runs every op it is given; MLX skips an unread graph.** Code that builds an array "for free because MLX
+  is lazy" pays on the engine whether or not it is read. A quantized KV view's dense pair is the case that cost: Qwen's
+  attention dequantized every full-attention layer's whole range each forward, read only by the mask and prefill arms
+  (about 2.4 KB of scratch per token of context, and its bandwidth). A reader of the triples takes
+  `KVCache.updatePacked` and builds the pair only on the arms that read it (`DenseKVView.dense`).
+- **A fused elementwise chain rounds each step itself.** MLX's ops round every intermediate to the dtype in memory; one
+  kernel does not, and a bfloat product keeps float precision even when cast back to bfloat. A chain
+  (`tensor/chains.zig`, `route.fusedChain`) rounds a step as `$0(float(a) * float(b))`, which gives the ops' bytes; it
+  takes bf16 and f16 only, since an f32 chain may contract into an fma. The chain test pins 1, 7 and 4,096 rows.
+- **A host read waits for the pass that wrote the bytes, a host write for every pass that binds them**
+  (`core.hostRead`, `core.hostBytes`): a store's sequence number is stamped by every bind, reads included, so a read of
+  the token ids at Qwen's PLE layer drained the embedding and layers 0-1 with them, once a forward, on the engine only.
+  A sampled token's pass is handed over before the forward encodes on it (`qwen4_hc.handOverIdsWriter`), so that read
+  waits for the sample alone.
+- **A reshape is a view where MLX's is** (`ops.viewStrides`, MLX's `prepare_reshape`): only a reshape that does not
+  split into the input's runs of joined axes copies. An elementwise op over contiguous or one-element inputs takes the
+  flat arm (32-bit indices, four elements a thread); strided or broadcast inputs take the strided location, on 32-bit
+  integers when the output and every input reach under 2^31 elements (`generalSource`), and a grid of three axes or
+  fewer reads each location straight off the thread's position (`_g3`, MLX's `g3`), with no divide. A
+  concatenate of two to four row-contiguous parts of one dtype is one dispatch (`concatSource`), where MLX copies
+  each part.
+- **A float scalar is made on the host in its dtype** (`mlx_util.scalarOf`, rounded to nearest even as the GPU's cast):
+  a constant costs no dispatch.
+- **An open pass is handed over once it has freed `pass_freed_cap` (64 MB) it still binds**: the pool hands no
+  buffer the open pass binds out again, so a pass grown by the kicks' doubling held every intermediate it freed (a
+  4096-row tiny-STQ chunk grew the pool 1.9 GB, over its bill). MLX commits a command buffer by bytes too.
+- **The pool keeps no more free bytes than MLX's cache may** (`core.free_cap`, set beside `mlx_set_cache_limit` by
+  `gpu_mem`): past it a freed buffer's class is released at once. Without it a Qwen prefill chunk on the 32 GB M1 held
+  2.3 GB of free buffers of sizes nothing asked for again.
+- **Hand the GPU nothing a layer early.** On the engine an async eval commits the open pass, and the next one waits on
+  its fence; the kicks already start the GPU. A resident expert route that handed each layer over cut a decode
+  forward into 52 command buffers and left the GPU idle 2.2 ms a forward on an M1 Max (`Stats.handovers` counts them).
 - **Bind MLX's buffer, never a second buffer over MLX's memory.** A second no-copy buffer over pages MLX wires counts
   again toward the wired limit; past it every command buffer wires its buffers again (1.4 s per forward at the full
   expert budget).
@@ -324,8 +385,9 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   waits on an MLX evaluation of every slab view; decode tok/s unchanged; a new binary's load 30.9 s against 44.4 s.
 - **An array cached for the process belongs to one side** (`rate_groups.unitScore`): a constant made once and kept in
   a global is MLX's or the engine's by whoever made it first, and the other side then imports or lends it at every
-  launch. A cached array is kept per side, chosen by the stream of the op that takes it, and dropped when that side's
-  last model goes (`arch_handle.dropHostArrays(side)`, an arch's `dropHostArrays` hook).
+  launch. A cached array lives in a `sushi_exl3.side_cache.SideCache`: kept per side, chosen by the stream of the op
+  that takes it, an empty handle refused at `put`, and enrolled by its first `put` in the list
+  `sushi_exl3.dropHostArrays(side)` drops when that side's last model goes, so no cache is left off by hand.
 - **The engine runs each op as it is built; MLX runs it at the eval.** A leaf MLX lets a caller fill after the graph is
   built (Qwen's deferred n-gram gather) is read empty on the engine: on the engine's stream it is filled first
   (`qwen4_hc.pleEmbedding`).
@@ -335,12 +397,14 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   `catch null` before the fallback ran a failed request on through the composed chain (lint `error-fallback`).
 - **Every draw on the engine takes the engine's key** (`sampler.drawRowsLogProbs`, lint `random-draw-seam`): MTP's
   proposal and its correction drew with MLX's key, so every sampled MTP round on a Qwen Cooler load failed.
-- **A Cooler arch declares where its cache arrays live** (`prefix.arraysOn`): Qwen's did not, and the first SSD
+- **A Cooler load's cache arrays live on its side** (`prefix.arraysOn`, the shared `cooler_side.stream`): Qwen's did not
+  declare it when each arch did, and the first SSD
   restore of a served Cooler load read its checkpoint on MLX's CPU stream inside the request and crashed.
 - **A Cooler load compiles no MLX closure** (`model_load.compileClosures`; `qwen4_hc.hcReadPreparedWidth` declines on
   the engine's stream): a closure applied on the engine's arrays leaves the engine, and crashed the request. The engine
-  runs each chain op by op, which is MLX's unfused chain byte for byte; only the f32 GDN gate's compiled kernel differs
-  from that chain, by a few ulps.
+  runs each such chain as one kernel where `tensor/chains.zig` has it (shared gate tail, hc inject and write, SiLU, the
+  attention output gate, the PLE gate) and op by op otherwise, MLX's unfused chain byte for byte; only the f32 GDN gate's compiled
+  kernel differs from that chain, by a few ulps.
 - **Every width MLX takes, before a real pack needs it**: Qwen's MTP rerank reads a 3-bit coarse head, so affine
   bits 3, 5 and 6 are served (MLX's own kernels, its `qmv_fast` K step per width); a served request refused there, in
   the middle of a reply. `where` promotes its values and reads its condition as bool, as MLX does.
@@ -374,7 +438,7 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   a GB on the committing thread; after 120 s idle the next short request paid 0.75 s more with MLX's twenty-odd
   sets of 5% and 1.61 s more with one set of everything, 2.1 times slower. Hence the cap.
 - **A Cooler load's weights are the engine's own buffers** (`core.wrapMapped`, `metal.Device.wrap`; decided with
-  the decode side, `dsv41_borrow.ownDecode`). Every large DeepSeek weight is a page-aligned mapping sushi fills and
+  the decode side, `cooler_side.sideOf`). Every large DeepSeek weight is a page-aligned mapping sushi fills and
   hands over without a copy at one place, `model.wrapRegion`; there the engine wraps it (a no-copy Metal buffer of
   the tensor's bytes, in our residency sets) instead of MLX, and the load binds, slices and casts the weights on the
   engine's stream. A tensor under the mapping size (`model.import_min_bytes`, 1 MiB) is a copy either way; on a
@@ -470,7 +534,7 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   model's seal): one block over five patch counts, the seal lifted for its span. Its recipes ride the manifest with a
   `marker` recipe (`vision tower`, keyed by the tower's widths) that says the warm is whole; a same-key load makes the
   recipes with the rest, trusts the marker, and runs no tower warm. A load that ran the warm writes the manifest again
-  (`dsv41_pipelines.rewriteLate`). A manifest whose recipes did not all make drops its markers. The tower's load is
+  (`cooler_pipelines.rewriteLate`). A manifest whose recipes did not all make drops its markers. The tower's load is
   inside the lifted seal too (`Dsv41Vision.init`): its requantization makes one stock kernel, whose recipe rides the
   manifest with the warm's.
 - **Every warm forward of the engine runs under a request's budget** (`dsv41_model.warmBudget`, before each decode-width
@@ -518,6 +582,26 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   and a verify block of every width under the penalties, the thinking penalty with and without a bias, and a row mask.
 - **A kernel reached only past a threshold of context is found by a bench at that context**, not by the tiny
   fixture: the 128k rung showed three compiles (0.26 s) inside its first decode step.
+- **Every Cooler load ends its warm with served requests** (`cooler_warm.warmServed`): the Generator as the scheduler
+  runs it, at every chunk width to 33 rows (kernels take a narrow width as a template value), 100 and 128 rows (off
+  and on the GEMM tiles), and one prompt of a short request's whole chunk, past a sparse indexer's budget when it has
+  one (a module's path chosen from a row count, as EXL3's decoded trunk GEMM from 1024 rows, runs only there), then
+  every narrow width appended after it (a prompt restored from the prefix cache prefills its tail there), greedy
+  and each sampler filter mix, with the load's drafter and without. The contract holds it: after the warm no prompt of 1 to 40 tokens compiles a pipeline.
+- **The warm's widest chunk is what fits the live headroom** (`bills.widestChunkAdmitted`, nothing borrowed): it runs
+  before the server installs a request's adaptive width and borrow, so a fixed widest chunk (8192 rows, 23.6 GB billed)
+  wired past a `--ssd-budget-gb 108` DeepSeek load and the watchdog panicked the box (2026-11-17). DeepSeek's forwards
+  run under the warm budget (`servedWarmBegin`), the cap a request of that width has.
+- **A synthetic prompt stays inside the vocabulary; `Generator` refuses an id past it** (`PromptTokenOutOfVocab`): the
+  embedding gather reads past its table, and on a tiny fixture (vocab 96) the warm's ids up to 1420 fed the router
+  whatever an earlier load left there, so a DeepSeek warm failed `ExpertOutOfRange` one run in two.
+- **A tiled product's first launch before the seal makes what every row count picks** (`matmul.completeRows`): the
+  rows choose split-K or fused, the tile and its K step, so a warm width of 2346 rows took split-K and a 4096-row chunk
+  then compiled its fused tile inside the request. Every row count to 16384 is prepared, in every alignment, once per
+  operand shape; so are a matrix-vector product's tiles by output length and each elementwise op's two sizes.
+- **The warm verifies as wide as a round can** (`Generator.mtpWarmVerifyCap`): a prompt-lookup chain drafts past the
+  MTP head's depth cap (8 drafts against 6 on an M5 Max), so the warm's verify cap is the wider of the two, and the
+  contract pins every such width past a sparse indexer's budget on the served-geometry cut.
 - **A Cooler load whose warm fails does not serve** (`model_load.warmLoad`): a forward that fails in the warm fails in a
   request. A warm that ends seals the engine and trims its transients (`arch_cooler.warmEnded`), for every Cooler arch.
 - **A pipeline made after the warm is logged** (`engine.seal`): `[engine] compiled inside a request (N ms): <name>`
@@ -535,9 +619,16 @@ itself; a short, changed or foreign file is refused by name and never read partl
 and in the build key, so a manifest of an older format is never read: its directory is another key's, and the load
 rebuilds one.
 
-- **Key.** `scope` (16 hex) is the pack (its config.json, its index, the name and size of each shard: not their bytes) and
-  what shapes the warm (context, window, YaRN factor, candidate blocks, DSpark, tile order, expert-cache and SSD bytes,
-  resident or streamed, dropped experts, and the `recipe_env` variables of `dsv41_pipelines.zig`). `build` (16 hex) is the
+- **Every Cooler load keeps one** (`arch/cooler_pipelines.zig`): the arch names its scope (`coolerPipelineScope`, or
+  DeepSeek's own load, which also decides from it which warm forwards run); `model_load.warmLoad` makes the manifest's
+  recipes before the warm and writes it after; a request that compiled a pipeline late writes it again
+  (`arch_cooler.endRequest`), so the next load of the pack makes it ahead. A shape only a served request reaches costs
+  its compile once per box, not once per load. A load whose manifest made every pipeline skips the served warm, which
+  exists only to make them (`[warm] served requests skipped`): 14.6 s of the real Qwen pack's load.
+- **Key.** `scope` (16 hex) is, for DeepSeek, the pack (its config.json, its index, the name and size of each shard: not
+  their bytes) and what shapes the warm (context, window, YaRN factor, candidate blocks, DSpark, tile order,
+  expert-cache and SSD bytes, resident or streamed, dropped experts, and its `recipe_env` variables); for Qwen, the
+  shapes and formats its kernels follow. Both add the shared kernels' `recipe_env`. `build` (16 hex) is the
   SHA-256 of the running binary, the size and mtime of `mlx.metallib`, the GPU architecture, the OS build and the manifest
   version. A diagnostic that changes no recipe (the kernel profile, the report, probe and profile switches) is not in it.
 - **Same key.** The recipes are made on up to 8 worker threads (our own Metal binding only, never MLX), after the model is built;
@@ -624,9 +715,13 @@ rebuilds one.
 - **A cleanup is checked by the full suite**: a filter compiles only the tests it names, and a type removed as
   unused was still a test's.
 
-- **Error paths are swept, not reasoned about**: `mlx.engine.fault.arm(k)` refuses the pool's k-th buffer, and a test
-  walks k over a whole request (`a request refused at any one of its pool buffers leaves the next request its clean
-  bytes`). A tensor released twice is latched and counted (`core.double_releases`), never returned to the pool twice.
+- **Error paths are swept by site, not reasoned about or sampled**: one clean run records where each checked call or
+  pool ask sits (`mlx.sweepPoints`, `mlx.sweepSites`: the stack above it, hashed), and the sweep fails every site once,
+  at its first call and, where the run is short, its last; every armed point must fire. A request is told by the op
+  and its three callers; a load by phase, from each phase's root: `load` four frames deep, the warm three (its
+  forwards are the request sweeps'), and a fixture whose phase makes another's very calls is not swept twice. A pool
+  ask is armed as a site's n-th (`fault.armAt`), since a speculative request's asks do not come in one order. The
+  sampled sweeps before reached about 0.04% of a load's 300k to 740k calls and stepped over a request's last token. A tensor released twice is latched and counted (`core.double_releases`), never returned to the pool twice.
 - **A read of bytes nothing wrote is caught by poison** (`mlx.engine.poison`): every buffer the pool hands out and
   every free one written over, the forwards and requests must give the clean bytes.
 - **The census counts the engine's work too**: every phase of a Cooler load's life dispatches the same at a later

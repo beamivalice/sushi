@@ -147,6 +147,24 @@ test "DeepSeek's live headroom is the ceiling less the active bytes and the engi
     try t.expectEqual(@as(u64, 0), dsv41_bill.dsv41HeadroomFrom(100 * gb, 60 * gb, 50 * gb, &config));
 }
 
+test "on a Cooler load DeepSeek's live headroom counts the parked pool once: it is the engine's free buffers" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    @import("../cooler_side.zig").forTest(&config, true);
+    defer @import("../cooler_side.zig").forTest(&config, false);
+    const gb: u64 = 1 << 30;
+    const pool = config.expertPoolBytes();
+    try t.expect(pool > 0);
+    // The pool parked, held as the engine's free buffers: taken off once.
+    try t.expectEqual(40 * gb - pool, dsv41_bill.dsv41HeadroomFrom(100 * gb, 60 * gb, pool, &config));
+    // Not grown to its cap yet: the cap is still reserved.
+    try t.expectEqual(40 * gb - pool, dsv41_bill.dsv41HeadroomFrom(100 * gb, 60 * gb, 0, &config));
+    // Free buffers past the cap come off too.
+    try t.expectEqual(40 * gb - pool - 2 * gb, dsv41_bill.dsv41HeadroomFrom(100 * gb, 60 * gb, pool + 2 * gb, &config));
+}
+
 test "DeepSeek's request bill takes its prefill working set out of the decoder pools a prefill may release" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
@@ -254,10 +272,25 @@ test "DeepSeek's request bill on a Cooler load is the state and one forward's ca
     config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
     for ([_]u64{ 9_000, 225_000, 1_000_000 }) |seq| {
-        config.dsv41.?.cooler_for_test = false;
+        config.cooler_for_test = false;
         const off = bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{});
-        config.dsv41.?.cooler_for_test = true;
+        config.cooler_for_test = true;
         try t.expectEqual(off - dsv41_config.dsv41_pool_bytes, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
     }
 }
 
+
+test "DeepSeek: a request's decode state is billed as growth after admission only on a fully resident load, which joins rows" {
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    // A streamed load serves one row: the model's parked state is resident before the request is admitted.
+    try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16));
+    // A fully resident load joins rows: the request makes its own state at its first forward, all of it after admission.
+    config.expert_resident = true;
+    // Rows are Sushi Cooler's: a resident load on MLX keeps the one-row decode and its parked state.
+    try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16));
+    config.cooler_for_test = true;
+    const c = &config.dsv41.?;
+    const state = (4096 + 512) * c.stateBytesPerToken() + c.stateFixedBytes(config.dsparkOn());
+    try std.testing.expectEqual(state, bills.admissionCommitBytes(&config, 4096, 512, 16));
+}

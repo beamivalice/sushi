@@ -1,5 +1,7 @@
-//! DeepSeek-V4.1 as the scheduler sees it: one request at a time over state the model holds, restore points that
-//! always go to SSD, and a thought point written behind a DSpark round.
+//! DeepSeek-V4.1 as the scheduler sees it: a streamed load runs one request at a time over a decode state its slot
+//! request holds while it runs and the model parks between requests; a fully resident load joins its slots' requests as
+//! rows of one decode forward, each over a state of its own. Restore points always go to SSD, and a thought point is
+//! written behind a DSpark round.
 const std = @import("std");
 const testTrunk = @import("../test_support.zig").testTrunk;
 const arch_handle = @import("../arch/handle.zig");
@@ -15,10 +17,15 @@ const sched = @import("../arch/sched.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
 const thought_point = @import("dsv41_thought_point.zig");
+const dsv41_model = @import("dsv41_model.zig");
+const dsv41_state = @import("dsv41_state.zig");
+const dsv41_serving = @import("dsv41_serving.zig");
+const log = @import("../log.zig");
 
 const Slot = scheduler.Slot;
 const Scheduler = scheduler.Scheduler;
 const Trunk = transformer.Trunk;
+const ForwardCtx = transformer.ForwardCtx;
 const Generator = generate.Generator;
 const ModelConfig = model.ModelConfig;
 
@@ -27,11 +34,125 @@ pub fn facts(config: *const ModelConfig) sched.Facts {
     return .{ .always_write_through = true };
 }
 
-/// A DeepSeek Cooler load serves one row: a streamed load's expert cache is one request's working set, and a resident
-/// load keeps the decode state of one request.
+/// A fully resident DeepSeek Cooler load joins requests as rows of one decode forward, each over a decode state of its
+/// own, as many as a joined forward carries on this GPU (`joinedRowsMax`); a streamed one serves one row. Every Cooler
+/// load runs its experts through the stream engine (`expert_streaming`), resident ones too: the plan's answer is
+/// `expert_resident`, and the load refuses a config that claims it over a streamed plan (`dsv41_serving.applyRows`).
 pub fn coolerRows(config: *const ModelConfig) sched.CoolerRows {
-    if (config.expert_streaming) return .{ .rows = 1, .why = "its routed experts stream from SSD (the expert cache is one request's working set)" };
-    return .{ .rows = 1, .why = "a resident DeepSeek load keeps one request's decode state" };
+    if (!config.expert_resident) return .{ .rows = 1, .why = "its routed experts stream from SSD (the expert cache is one request's working set)" };
+    // Rows are Sushi Cooler's: the user's opt-out to MLX keeps the one-request decode it had.
+    if (!@import("../cooler_side.zig").onEngine(config)) return .{ .rows = 1, .why = "its decode runs on MLX" };
+    return .{ .rows = joinedRowsMax(), .note = "steps run the exact arm (+~0.6 ms a step on NAX); a next turn restores from the SSD tier" };
+}
+
+/// The rows a joined forward carries with each row its one-row step's bytes (`Model.maxJoinedRows`): 16 with matrix
+/// units, 8 without.
+fn joinedRowsMax() usize {
+    return @intCast(@import("sushi_exl3").project_rows.rowsMax(.{ .exact = true, .wide = true }));
+}
+
+/// The rows the load joins; 1 for a streamed load.
+fn joinedRows(config: *const ModelConfig) usize {
+    return coolerRows(config).rows;
+}
+
+pub fn batches(config: *const ModelConfig) bool {
+    return joinedRows(config) > 1;
+}
+
+pub fn rowCap(config: *const ModelConfig) ?usize {
+    const n = joinedRows(config);
+    return if (n > 1) n else null;
+}
+
+pub fn modelBatches(xfm: *const Trunk) bool {
+    const m = xfm.arch_state.dsv41.model orelse return false;
+    return m.serves_rows;
+}
+
+/// Each row's attention reads its own request's state: nothing pads.
+pub fn padsBatch(config: *const ModelConfig) bool {
+    return joinedRows(config) <= 1;
+}
+
+/// A slot joins once its prefill made its request's state.
+pub fn readyToBatch(xfm: *const Trunk, ctx: *ForwardCtx) bool {
+    const m = xfm.arch_state.dsv41.model orelse return true;
+    if (!m.serves_rows) return true;
+    const r = dsv41_state.requestOf(ctx) orelse return false;
+    return r.state != null;
+}
+
+/// Rows are positioned by each request's state; the tick moves the slot's offset as a solo step would leave it.
+pub fn batchArm(xfm: *Trunk, ctxs: []const *ForwardCtx) ?sched.BatchArm {
+    const m = xfm.arch_state.dsv41.model orelse return null;
+    if (!m.serves_rows) return null;
+    for (ctxs) |c| if (!readyToBatch(xfm, c)) return null;
+    return .{ .moe_positions = false, .advances_offset = true };
+}
+
+/// One decode forward over the group's requests (`dsv41_serving.forwardRows`): each row is its request's one-row step,
+/// and each slot's cache position follows its state as a solo step leaves it.
+pub fn batchedForward(
+    sch: *Scheduler,
+    allocator: std.mem.Allocator,
+    xfm: *Trunk,
+    batch: *[]*Slot,
+    next_tokens: []const u32,
+    ctxs: []const *ForwardCtx,
+    rope_offsets: []const u32,
+    arm: sched.BatchArm,
+    hidden_rows: ?*?[]mlx.mlx_array,
+) ![]mlx.mlx_array {
+    _ = .{ sch, batch, rope_offsets, arm, hidden_rows };
+    var segs: [max_rows]dsv41_model.Seg = undefined;
+    var ids: [max_rows][1]u32 = undefined;
+    if (ctxs.len > max_rows) return error.Dsv41RowsWidth;
+    for (ctxs, next_tokens, 0..) |ctx, t, i| {
+        ids[i] = .{t};
+        segs[i] = .{ .request = dsv41_state.requestOf(ctx) orelse return error.Dsv41NoRequest, .ids = &ids[i] };
+    }
+    if (!rows_logged) {
+        rows_logged = true;
+        log.info("[dsv41-rows] joined decode tick engaged: {d} rows\n", .{ctxs.len});
+    }
+    const joined = try dsv41_serving.forwardRows(xfm, segs[0..ctxs.len]);
+    defer _ = mlx.mlx_array_free(joined);
+    for (ctxs, segs[0..ctxs.len]) |ctx, sg| ctx.cache.step = sg.request.state.?.n;
+    return rowsOf(allocator, joined, ctxs.len, xfm.s);
+}
+
+const max_rows = 16;
+var rows_logged = false;
+
+/// Row `i` of `[n, vocab]` logits as the `[1, 1, vocab]` a one-row step returns, for each row.
+fn rowsOf(allocator: std.mem.Allocator, joined: mlx.mlx_array, n: usize, s: mlx.mlx_stream) ![]mlx.mlx_array {
+    const out = try allocator.alloc(mlx.mlx_array, n);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |o| _ = mlx.mlx_array_free(o);
+        allocator.free(out);
+    }
+    const vocab: c_int = mlx.getShape(joined)[1];
+    for (0..n) |i| {
+        const start = [2]c_int{ @intCast(i), 0 };
+        const stop = [2]c_int{ @intCast(i + 1), vocab };
+        const step = [2]c_int{ 1, 1 };
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_slice(&row, joined, &start, 2, &stop, 2, &step, 2, s));
+        out[i] = mlx.mlx_array_new();
+        made = i + 1;
+        const shape = [3]c_int{ 1, 1, vocab };
+        try mlx.check(mlx.mlx_reshape(&out[i], row, &shape, 3, s));
+    }
+    return out;
+}
+
+/// A slot's request holds the decode state while it runs; the model parks it between requests.
+pub fn initRequest(allocator: std.mem.Allocator, config: *const ModelConfig) !?dsv41_model.Request {
+    _ = config;
+    return try dsv41_model.Request.init(allocator, 0);
 }
 
 pub fn modelStateBytes(slot: *const Slot) u64 {
@@ -64,10 +185,34 @@ pub fn cancelledNeedsCheckpoints() bool {
     return true;
 }
 
+/// With joined rows the restore installs into the slot's own request, lent until `restoreEnd`.
 pub fn restoreTarget(slot: *Slot, xfm: *Trunk) ?sched.RestoreTarget {
-    _ = slot;
     const dsv = xfm.arch_state.dsv41.model orelse return null;
+    if (dsv.serves_rows) {
+        // Nothing is lent at a lookup, so `restoreEnd` ends this lend by clearing it.
+        std.debug.assert(dsv.bound == null);
+        _ = dsv41_model.lendFor(dsv, slotRequest(slot));
+    }
     return .{ .rec = prefix_arch.recurrent("dsv41", dsv), .log_tag = "[dsv41-prefix]" };
+}
+
+/// The lookup runs off any forward, where nothing is lent: the lend `restoreTarget` opened is the only one to end.
+pub fn restoreEnd(slot: *Slot, xfm: *Trunk) void {
+    const dsv = xfm.arch_state.dsv41.model orelse return;
+    if (!dsv.serves_rows) return;
+    std.debug.assert(dsv.bound == slotRequest(slot));
+    dsv41_model.unbindRows(dsv, null);
+}
+
+/// The slot's DeepSeek request; null when it holds none.
+fn slotRequest(slot: *Slot) ?*dsv41_model.Request {
+    return if (slot.request) |*r| r.as(.dsv41) else null;
+}
+
+/// With joined rows a hook reads the slot's own state, lent for its span (`dsv41_model.lendFor`).
+fn lendSlot(slot: *Slot) ?dsv41_model.Lent {
+    const xfm = arch_handle.trunk(slot.model.handle orelse return null);
+    return dsv41_model.lendFor(xfm.arch_state.dsv41.model orelse return null, slotRequest(slot));
 }
 
 pub fn writeThrough(
@@ -81,6 +226,8 @@ pub fn writeThrough(
 ) bool {
     _ = entry_id;
     const dsv = arch_handle.trunk(slot.model.handle orelse return false).arch_state.dsv41.model orelse return false;
+    const lent = lendSlot(slot);
+    defer if (lent) |l| l.end();
     dsv41_prefix.writeThroughDsv41(hc, dsv, &slot.cache, prompt, slot.has_tools, media, cps, "prefill");
     return true;
 }
@@ -90,6 +237,8 @@ pub fn armThoughtPoint(slot: *Slot, gen: *Generator, tier_takes_points: bool) vo
 }
 
 pub fn afterSpecBlock(slot: *Slot, gen: *Generator, block: []const u32) void {
+    const lent = lendSlot(slot);
+    defer if (lent) |l| l.end();
     thought_point.writeDsv41ThoughtPoint(slot, gen, block);
 }
 
@@ -105,7 +254,11 @@ test "an arch whose request state lives in the model restores into it under its 
     var xfm = testTrunk("deepseek_v41");
     var lm: model_registry.LoadedModel = undefined;
     var slot = sched.testSlot(&xfm, &lm, .{ .model_type = "deepseek_v41" });
-    xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
+    // A model the hooks only name, and read only as a one-row load.
+    const m = try std.testing.allocator.create(@import("dsv41_model.zig").Model);
+    defer std.testing.allocator.destroy(m);
+    m.serves_rows = false;
+    xfm.arch_state.dsv41.model = m;
     const target = sched.restoreTarget(&slot, &xfm).?;
     try std.testing.expectEqualStrings("[dsv41-prefix]", target.log_tag);
     try std.testing.expect(!target.takes_dflash and !target.takes_mtp);
@@ -114,4 +267,15 @@ test "an arch whose request state lives in the model restores into it under its 
     xfm.arch_state.dsv41.model = null;
     try std.testing.expect(sched.restoreTarget(&slot, &xfm) == null);
     try std.testing.expect(!sched.commitsAtCull(&slot));
+}
+
+test "a DeepSeek DSpark slot ticks alone beside the joined rows, and a plain slot joins them" {
+    const sched_policy = @import("../sched_policy.zig");
+    var xfm = testTrunk("deepseek_v41");
+    var lm: model_registry.LoadedModel = undefined;
+    const slot = sched.testSlot(&xfm, &lm, .{ .model_type = "deepseek_v41" });
+    // No DeepSeek slot rides another bucket: a DSpark one (a spec slot) runs its own round each tick.
+    try std.testing.expectEqual(sched.TickClass.none, sched.tickClass(&slot));
+    try std.testing.expectEqual(sched_policy.TickBucket.serial, sched_policy.bucketOf(.spec_active, .none, .{}));
+    try std.testing.expectEqual(sched_policy.TickBucket.batch, sched_policy.bucketOf(.ok, .none, .{}));
 }

@@ -113,13 +113,13 @@ pub fn buildMask(allocator: std.mem.Allocator, ids: []const u32, vocab: usize) !
         if (id < vocab) buf[id] = true;
     }
     const shape = [_]c_int{@intCast(vocab)};
-    return mlx.mlx_array_new_data(buf.ptr, &shape, 1, .bool_);
+    return try mlx.newData(buf.ptr, &shape, .bool_);
 }
 
 /// `out = where(cond, logits - lambda, logits)`, lambda in the logits' own dtype so a
 /// shifted row keeps the dtype an unshifted one has.
 fn shiftWhere(out: *mlx.mlx_array, logits: mlx.mlx_array, cond: mlx.mlx_array, lambda: f32, s: mlx.mlx_stream) !void {
-    const raw = mlx.mlx_array_new_float(lambda);
+    const raw = try mlx.newFloat(lambda);
     defer _ = mlx.mlx_array_free(raw);
     var lam = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(lam);
@@ -136,16 +136,16 @@ pub fn shift(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: mlx.mlx_array, la
 }
 
 fn insideRows(ids: mlx.mlx_array, p: ThinkPenalty, s: mlx.mlx_stream) !mlx.mlx_array {
-    if (p.phase == .after) return mlx.mlx_array_new_bool(false);
+    if (p.phase == .after) return try mlx.newBool(false);
     const open = try seenThrough(ids, p.closer_id, s);
     defer _ = mlx.mlx_array_free(open);
-    const zero = mlx.mlx_array_new_int(0);
+    const zero = try mlx.newInt(0);
     defer _ = mlx.mlx_array_free(zero);
     var gate = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gate);
     try mlx.check(mlx.mlx_equal(&gate, open, zero, s));
     if (p.phase == .before) {
-        const opener = p.opener_id orelse return mlx.mlx_array_new_bool(false);
+        const opener = p.opener_id orelse return try mlx.newBool(false);
         const opened = try seenThrough(ids, opener, s);
         defer _ = mlx.mlx_array_free(opened);
         var after_open = mlx.mlx_array_new();
@@ -176,7 +176,7 @@ pub fn shiftRows(out: *mlx.mlx_array, logits: mlx.mlx_array, ids: mlx.mlx_array,
 
 /// How many times `id` occurs in each prefix of `ids` (`[1, L]` int32).
 fn seenThrough(ids: mlx.mlx_array, id: u32, s: mlx.mlx_stream) !mlx.mlx_array {
-    const target = mlx.mlx_array_new_int(@intCast(id));
+    const target = try mlx.newInt(@intCast(id));
     defer _ = mlx.mlx_array_free(target);
     var hit = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(hit);
@@ -252,7 +252,7 @@ fn testBlock(rows: usize, v: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     defer testing.allocator.free(host);
     for (host, 0..) |*x, i| x.* = @as(f32, @floatFromInt((i * 37) % 23)) * 0.375 - 3.0;
     const shape = [_]c_int{ 1, @intCast(rows), @intCast(v) };
-    const f = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+    const f = try mlx.newData(host.ptr, &shape, .float32);
     defer _ = mlx.mlx_array_free(f);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -351,9 +351,9 @@ pub const Prepared = struct {
         bias_mod.fillDeltas(host[vocab..], p.file_biases, false);
         bias_mod.addDeltas(host[vocab..], p.biases, false);
         const vshape = [_]c_int{@intCast(vocab)};
-        var inside = mlx.mlx_array_new_data(host.ptr, &vshape, 1, .float32);
+        var inside = try mlx.newData(host.ptr, &vshape, .float32);
         errdefer _ = mlx.mlx_array_free(inside);
-        const outside = mlx.mlx_array_new_data(host[vocab..].ptr, &vshape, 1, .float32);
+        const outside = try mlx.newData(host[vocab..].ptr, &vshape, .float32);
         errdefer _ = mlx.mlx_array_free(outside);
         if (mask) |m| if (p.lambda > 0) {
             var combined = mlx.mlx_array_new();
@@ -400,7 +400,7 @@ pub fn shiftScoped(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: ?mlx.mlx_ar
 /// `shiftScoped`'s arithmetic: a draft tree's rows have no prefix order for `ids` to gate by.
 pub fn shiftDecided(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: ?mlx.mlx_array, p: ThinkPenalty, inside: []const bool, s: mlx.mlx_stream) !void {
     if (!p.hasBias() and (mask == null or p.lambda <= 0)) return mlx.check(mlx.mlx_array_set(out, logits));
-    const gate = mlx.mlx_array_new_data(inside.ptr, &[_]c_int{ 1, @intCast(inside.len), 1 }, 3, .bool_);
+    const gate = try mlx.newData(inside.ptr, &[_]c_int{ 1, @intCast(inside.len), 1 }, .bool_);
     defer _ = mlx.mlx_array_free(gate);
     if (!p.hasBias()) {
         var cond = mlx.mlx_array_new();
@@ -423,7 +423,7 @@ fn addDeltas(out: *mlx.mlx_array, logits: mlx.mlx_array, deltas: mlx.mlx_array, 
     var shifted = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(shifted);
     try mlx.check(mlx.mlx_add(&shifted, logits, typed, s));
-    const zero = mlx.mlx_array_new_float(0);
+    const zero = try mlx.newFloat(0);
     defer _ = mlx.mlx_array_free(zero);
     var changed = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(changed);

@@ -57,7 +57,7 @@ test "dsv41 bills: a prefill holds its restore points beside the state with a RA
     try t.expectEqual(@as(u64, 0), bills.checkpointReserve(&cfg, seq, 512));
 }
 
-test "the peak reading counts the engine's pool at its fullest beside MLX's, and a reset starts the pool's from what is in use" {
+test "the peak reading counts the engine's pool at its fullest beside MLX's, and a reset starts the pool's from what it holds" {
     try mlx.requireGpu();
     const t = std.testing;
     const gpu_mem = @import("../gpu_mem.zig");
@@ -66,11 +66,13 @@ test "the peak reading counts the engine's pool at its fullest beside MLX's, and
     try core.sync();
     gpu_mem.resetPeak();
     const base = gpu_mem.peakBytes();
-    // Each part starts from what it has in use.
-    try t.expect(base >= (mlx.engine.poolTotal() -| mlx.engine.poolFree()) + mlx.engine.mappedTotal());
+    const held = mlx.engine.poolTotal();
+    // Each part starts from what it holds: the engine's pool, its free buffers included, as Metal counts it.
+    try t.expect(base >= held + mlx.engine.mappedTotal());
     const a = try core.fresh(.uint8, &.{9 * mb + 5});
     core.release(a);
     try t.expect(gpu_mem.peakBytes() >= base + 9 * mb);
     gpu_mem.resetPeak();
-    try t.expectEqual(base, gpu_mem.peakBytes());
+    // `a` went back to the pool, which still holds it.
+    try t.expectEqual(base + (mlx.engine.poolTotal() - held), gpu_mem.peakBytes());
 }

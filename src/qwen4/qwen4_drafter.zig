@@ -154,7 +154,7 @@ pub fn appendHistory(t: Head, _: *Trunk, cache: *Cache, token_ids: []const u32, 
     defer if (on_heap) allocator.free(ids_i32);
     for (token_ids, 0..) |tok, i| ids_i32[i] = @intCast(tok);
     const shape = [_]c_int{@intCast(token_ids.len)};
-    const id_arr = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 1, .int32);
+    const id_arr = try mlx.newData(ids_i32.ptr, &shape, .int32);
     defer _ = mlx.mlx_array_free(id_arr);
     cache.activate();
     const out = try step(t, id_arr, hidden, rope_offset, .none, mrope_ctx);

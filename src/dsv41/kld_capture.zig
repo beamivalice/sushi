@@ -121,7 +121,7 @@ fn captureFloor(io: std.Io, a: std.mem.Allocator, cfg: *const model.ModelConfig,
     const dc = cfg.dsv41.?;
     // What the load's plan bills resident: the trunk, the Engram row caches and the MLX buffer pool. The DSpark stages
     // and the vision tower stay out of a kld load.
-    const resident = try dsv_source.residentBytes(io, a, model_dir, @import("dsv41_borrow.zig").ownDecode(&dc)) +| @import("dsv41_engram.zig").cacheBytes(dc.engram) +| cfg.expertPoolBytes();
+    const resident = try dsv_source.residentBytes(io, a, model_dir, @import("../cooler_side.zig").onEngine(cfg)) +| @import("dsv41_engram.zig").cacheBytes(dc.engram) +| cfg.expertPoolBytes();
     return floorBudget(&dc, resident, try dsv_stream.expertBytes(&dc));
 }
 

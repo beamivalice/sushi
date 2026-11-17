@@ -25,6 +25,7 @@ pub const biasesOf = store.biasesOf;
 pub const tensorKey = store.tensorKey;
 pub const exl3TensorKey = store.exl3TensorKey;
 pub const streamingLayoutOfDir = store.streamingLayoutOfDir;
+pub const loadDrop = store.loadDrop;
 pub const fusedTensorKey = store.fusedTensorKey;
 pub const mxfp4TensorKey = store.mxfp4TensorKey;
 pub const mxfp4IndividualTensorKey = store.mxfp4IndividualTensorKey;

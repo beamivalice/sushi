@@ -108,7 +108,7 @@ pub const Scope = struct {
     pub fn f(sc: *Scope, v: f32) !A {
         const host = mlx.engine.enter(sc.s);
         defer host.end();
-        return sc.keep(mlx.mlx_array_new_float(v));
+        return sc.keep(try mlx.newFloat(v));
     }
     /// A scalar of `dt`.
     pub fn fl(sc: *Scope, v: f32, dt: mlx.mlx_dtype) !A {
@@ -117,17 +117,17 @@ pub const Scope = struct {
     pub fn i(sc: *Scope, v: i32) !A {
         const host = mlx.engine.enter(sc.s);
         defer host.end();
-        return sc.keep(mlx.mlx_array_new_int(v));
+        return sc.keep(try mlx.newInt(v));
     }
     pub fn ints(sc: *Scope, data: []const i32, shape: []const c_int) !A {
         const host = mlx.engine.enter(sc.s);
         defer host.end();
-        return sc.keep(mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .int32));
+        return sc.keep(try mlx.newData(data.ptr, shape, .int32));
     }
     pub fn floats(sc: *Scope, data: []const f32, shape: []const c_int) !A {
         const host = mlx.engine.enter(sc.s);
         defer host.end();
-        return sc.keep(mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32));
+        return sc.keep(try mlx.newData(data.ptr, shape, .float32));
     }
 
     pub fn astype(sc: *Scope, x: A, dt: mlx.mlx_dtype) !A {

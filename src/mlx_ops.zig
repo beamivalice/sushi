@@ -78,7 +78,7 @@ pub const Ops = struct {
     }
 
     pub fn scalar(self: *Ops, value: f32, dtype: mlx.mlx_dtype) !Arr {
-        return self.cast(try self.own(mlx.mlx_array_new_float(value)), dtype);
+        return self.cast(try self.own(try mlx.newFloat(value)), dtype);
     }
 
     pub fn ones(self: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype) !Arr {

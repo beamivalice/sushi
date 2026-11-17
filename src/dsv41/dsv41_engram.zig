@@ -390,9 +390,9 @@ pub const Table = struct {
     /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (the caller frees).
     pub fn dequant(self: *const Table, raw: Raw, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
         const rows: c_int = @intCast(n);
-        const wa = mlx.mlx_array_new_data(raw.w.ptr, &[_]c_int{ rows, @intCast(self.head_dim / 4) }, 2, .uint32);
+        const wa = try mlx.newData(raw.w.ptr, &[_]c_int{ rows, @intCast(self.head_dim / 4) }, .uint32);
         defer _ = mlx.mlx_array_free(wa);
-        const sa = mlx.mlx_array_new_data(raw.s.ptr, &[_]c_int{ rows, @intCast(self.sdim) }, 2, .uint8);
+        const sa = try mlx.newData(raw.s.ptr, &[_]c_int{ rows, @intCast(self.sdim) }, .uint8);
         defer _ = mlx.mlx_array_free(sa);
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);

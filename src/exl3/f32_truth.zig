@@ -2,6 +2,7 @@
 //! and a routed sum in f64 against which the grouped chains are scored by relative RMS.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 const kernels = @import("expert_exl3_kernels.zig");
 const exl3 = @import("expert_exl3.zig");
 const rate_groups = @import("rate_groups.zig");
@@ -49,7 +50,7 @@ pub fn activations(alloc: std.mem.Allocator, rnd: std.Random, rows: usize, in: u
         b.* = @intCast((u + 0x7fff + ((u >> 16) & 1)) >> 16);
         v.* = @bitCast(@as(u32, b.*) << 16);
     }
-    return .{ .x = mlx.mlx_array_new_data(bits.ptr, &[_]c_int{ @intCast(rows), @intCast(in) }, 2, .bfloat16), .vals = vals };
+    return .{ .x = try host_side.made(mlx.mlx_array_new_data(bits.ptr, &[_]c_int{ @intCast(rows), @intCast(in) }, 2, .bfloat16)), .vals = vals };
 }
 
 /// y = x . W over a dense f32 `[in, out]` in f64.
@@ -138,9 +139,9 @@ pub fn routedErr(
         try dense[ids[r * topk + k]].run(alloc, act.vals[r * hidden ..][0..hidden], hidden, inter, LIMIT, tmp);
         for (want[r * hidden ..][0..hidden], tmp) |*o, v| o.* += wts[r * topk + k] * v;
     };
-    const slots = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .uint32);
+    const slots = try host_side.made(mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(slots);
-    const scores = mlx.mlx_array_new_data(wts.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .float32);
+    const scores = try host_side.made(mlx.mlx_array_new_data(wts.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .float32));
     defer _ = mlx.mlx_array_free(scores);
     const y = if (rows <= kernels.DECODE_ROWS_MAX)
         try rate_groups.moeDecodeClamped(s, act.x, rb, slots, scores, @intCast(topk), .float32, null, null, LIMIT)

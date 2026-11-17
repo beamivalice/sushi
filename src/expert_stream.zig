@@ -1433,6 +1433,8 @@ const LayerStats = struct {
     misses: u64 = 0,
     fill_bytes: u64 = 0,
     host_sync_ns: u64 = 0,
+    /// Routes whose picks the host read before the experts ran.
+    host_routes: u64 = 0,
     fill_ns: u64 = 0,
     compute_ns: u64 = 0,
 };
@@ -1686,10 +1688,10 @@ const LayerState = struct {
         }
         const scope = mlx.engine.enter(s);
         defer scope.end();
-        const fresh = mlx.mlx_array_new_data(gpu.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
+        const fresh = try mlx.newData(gpu.ptr, &[_]c_int{@intCast(experts)}, .int32);
         if (fresh.ctx == null) return error.ExpertSpecMapAlloc;
         errdefer _ = mlx.mlx_array_free(fresh);
-        const raw = mlx.mlx_array_new_data(self.spec_host.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
+        const raw = try mlx.newData(self.spec_host.ptr, &[_]c_int{@intCast(experts)}, .int32);
         if (raw.ctx == null) return error.ExpertSpecMapAlloc;
         if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
         self.spec_slots = fresh;
@@ -1986,11 +1988,17 @@ const probe_ns: u64 = 50 * std.time.ns_per_ms;
 /// What `Engine.probeReadRate` read: the rate at each of `probe_widths` and the best of them, in bytes a second.
 pub const ProbeReading = struct { bps: [probe_widths.len]f64, max_bps: f64 };
 
+/// Below this share of the routed rows kept, a drop's answers say nothing of the model's quality (`kept_share`).
+const drop_quality_floor = 0.5;
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     geometry: Geometry,
     kept: ?KeptScales = null,
     drop_owned: ?*expert_usage.Drop = null,
+    /// Per routed layer, the `[experts]` row a router adds to its logits so it never picks a dropped expert
+    /// (`dropMask`), made on the first forward that asks.
+    drop_masks: []mlx.mlx_array = &.{},
     /// The pack's `expert_usage.json` counts, `[routed layer][expert id]`: ranks what `warmCache` preloads.
     warm_usage: ?expert_usage.Usage = null,
     plan: CachePlan,
@@ -2169,6 +2177,11 @@ pub const Engine = struct {
             log.info("[expert-drop] n={d} per layer, {d} experts, {d:.2} GB not loaded, list from {s}\n", .{
                 d.n, @as(u64, d.n) * moeLayerCount(geometry), @as(f64, @floatFromInt(engine.droppedBytes())) / 1e9, d.source,
             });
+            const speed_only = d.kept_share < drop_quality_floor;
+            log.info("[expert-drop] the kept experts held {d:.1}% of the routed rows the list counts{s}; a layer past its {d} keeps every expert\n", .{
+                d.kept_share * 100, if (speed_only) ": its answers are a speed reading only, never a quality one" else "", d.rows.len,
+            });
+            if (d.moved != 0) log.info("[expert-drop] {d} experts kept to leave each rate group one, a less-used expert dropped in each place\n", .{d.moved});
         } else engine.drop_owned = opts.drop_owned;
         if (!plan.resident) engine.warm_usage = readWarmUsage(allocator, model_dir, moeLayerCount(geometry), geometry.experts);
         log.info("[expert-stream] cache {d:.3} GB, {d} slots/layer, workspace {d:.3} GB, bounce {d:.3} GB, fallback_imports={d}\n", .{
@@ -2228,6 +2241,10 @@ pub const Engine = struct {
         self.allocator.free(self.layers);
         self.age_log.deinit(self.allocator);
         self.store.deinit();
+        for (self.drop_masks) |m| if (m.ctx != null) {
+            _ = mlx.mlx_array_free(m);
+        };
+        if (self.drop_masks.len != 0) self.allocator.free(self.drop_masks);
         if (self.drop_owned) |d| {
             d.deinit();
             self.allocator.destroy(d);
@@ -2319,13 +2336,23 @@ pub const Engine = struct {
     }
 
     pub fn noteRoute(self: *Engine, layer: u16, full_attn: bool, detail: RouteDetail) void {
-        if (layer < self.layers.len) self.layers[layer].stats.host_sync_ns +|= detail.totalNs();
+        if (layer < self.layers.len) {
+            self.layers[layer].stats.host_sync_ns +|= detail.totalNs();
+            self.layers[layer].stats.host_routes += 1;
+        }
         if (full_attn) self.route_full.add(detail) else self.route_linear.add(detail);
     }
 
     pub fn routeProbeActive(self: *const Engine) bool {
         const next = self.forward_count + 1;
         return next <= 3 or next % BREAKDOWN_EVERY == BREAKDOWN_EVERY / 2;
+    }
+
+    /// Routes of every layer whose picks the host read (`noteRoute`) since the engine began.
+    pub fn hostRoutes(self: *const Engine) u64 {
+        var n: u64 = 0;
+        for (self.layers) |*layer| n += layer.stats.host_routes;
+        return n;
     }
 
     pub fn noteExpertCompute(self: *Engine, layer: u16, nanoseconds: u64) void {
@@ -3021,7 +3048,7 @@ pub const Engine = struct {
         if (layer.resident_map.ctx != null) _ = mlx.mlx_array_free(layer.resident_map);
         const scope = mlx.engine.enter(self.s);
         defer scope.end();
-        layer.resident_map = mlx.mlx_array_new_data(host.ptr, &[_]c_int{@intCast(host.len)}, 1, .int32);
+        layer.resident_map = try mlx.newData(host.ptr, &[_]c_int{@intCast(host.len)}, .int32);
     }
 
     /// The lossy pick on a rate-grouped layer: a missed expert may take any expert already in one of the layer's pools,
@@ -3519,6 +3546,32 @@ pub const Engine = struct {
         errdefer self.allocator.destroy(bank);
         bank.* = try Ragged.initSplit(s, &gl.cache_ragged, &gl.union_ragged, overflow);
         return bank;
+    }
+
+    /// `0` for a kept expert and `-inf` for a dropped one, in the router logits' `dtype`, for a router that picks by
+    /// softmax and renormalizes over its picks: added to the logits, the kept picks and their weights stay the
+    /// unmasked ones. Null where layer `layer` drops nothing (no drop, or a layer the list does not cover).
+    pub fn dropMask(self: *Engine, layer: u16, dtype: mlx.mlx_dtype) !?mlx.mlx_array {
+        const d = self.geometry.drop orelse return null;
+        if (layer < d.first_layer or layer - d.first_layer >= d.rows.len) return null;
+        const row = layer - d.first_layer;
+        if (self.drop_masks.len == 0) {
+            self.drop_masks = try self.allocator.alloc(mlx.mlx_array, d.rows.len);
+            @memset(self.drop_masks, .{ .ctx = null });
+        }
+        if (self.drop_masks[row].ctx == null) {
+            const experts = self.geometry.experts;
+            var mask: [expert_usage.max_experts]f32 = undefined;
+            for (mask[0..experts], 0..) |*v, e| v.* = if (d.isDropped(layer, e)) -std.math.inf(f32) else 0;
+            const f = try mlx.newData(&mask, &[_]c_int{@intCast(experts)}, .float32);
+            defer _ = mlx.mlx_array_free(f);
+            var typed = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(typed);
+            try mlx.check(mlx.mlx_astype(&typed, f, dtype, self.s));
+            try mlx.check(mlx.mlx_array_eval(typed));
+            self.drop_masks[row] = typed;
+        }
+        return self.drop_masks[row];
     }
 
     /// Whether `--drop-expert` left this layer's expert unloaded: it has no slot and no bytes are ever read for it.
@@ -4992,9 +5045,9 @@ pub const TinyQuantPack = struct {
         return if (quant.partOf(@fromBackingInt(@intCast(ci))) == .weight) .uint32 else .bfloat16;
     }
 
-    pub fn residentBank(self: *const TinyQuantPack, experts: u16, ci: usize) mlx.mlx_array {
+    pub fn residentBank(self: *const TinyQuantPack, experts: u16, ci: usize) mlx.HostArrayRefused!mlx.mlx_array {
         const shape = [_]c_int{ @intCast(experts), @intCast(self.rows[ci]), @intCast(self.cols[ci]) };
-        return mlx.mlx_array_new_data(self.data[ci].ptr, &shape, 3, dtypeOf(ci));
+        return try mlx.newData(self.data[ci].ptr, &shape, dtypeOf(ci));
     }
 
     pub fn deinit(self: *TinyQuantPack) void {

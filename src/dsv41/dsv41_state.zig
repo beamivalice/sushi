@@ -1,10 +1,11 @@
-//! What a DeepSeek-V4.1 model owns beyond the trunk shell: its native model, whose one request's state it keeps, and
-//! the streams its routed experts come through. They live in `Trunk.arch_state.dsv41` (`arch/arch_state.zig`).
+//! What a DeepSeek-V4.1 model owns beyond the trunk shell: its native model, which parks the decode state between
+//! requests, and the streams its routed experts come through. They live in `Trunk.arch_state.dsv41` (`arch/arch_state.zig`).
 const std = @import("std");
 const trunk = @import("../trunk.zig");
 const arch_state = @import("../arch/arch_state.zig");
 const dsv41_model = @import("dsv41_model.zig");
 const dsv41_stream = @import("dsv41_stream.zig");
+const dsv41_borrow = @import("dsv41_borrow.zig");
 const mlx = @import("../mlx.zig");
 const Trunk = trunk.Trunk;
 
@@ -13,6 +14,8 @@ pub const State = struct {
     model: ?*dsv41_model.Model = null,
     experts: ?*dsv41_stream.Stream = null,
     stq_experts: ?*dsv41_stream.StqStream = null,
+    /// What `lendOwn` replaced, for `endOwn`.
+    own_run: ?dsv41_model.Lent = null,
 
     /// `Model.deinit` frees the model itself, and a `Stream` holds no resource of its own (the engine it reads is the
     /// trunk's `expert_stream`): neither takes more than the destroy below.
@@ -43,10 +46,38 @@ pub const State = struct {
         return if (m.onEngine()) mlx.engine.stream() else s;
     }
 
+    /// The served warm's forwards run under the caps a request of their rows has (`dsv41_borrow.enterWarm`), and its
+    /// requests, which no slot carries, read the model's own state: with joined rows it is lent for the warm.
+    pub fn servedWarmBegin(self: *State) void {
+        dsv41_borrow.warm_budget = true;
+        const m = self.model orelse return;
+        if (m.serves_rows and m.bound == null) self.own_run = dsv41_model.lendOwn(m);
+    }
+
+    pub fn servedWarmEnd(self: *State) void {
+        dsv41_borrow.endWarmMlx();
+        if (self.own_run) |l| l.end();
+        self.own_run = null;
+    }
+
+    /// The state a forward with no slot request runs is reset: the model's own, with joined rows lent for the reset.
     pub fn reset(self: *State) void {
-        if (self.model) |m| dsv41_model.resetState(m);
+        const m = self.model orelse return;
+        const own: ?dsv41_model.Lent = if (m.serves_rows and m.bound == null) dsv41_model.lendOwn(m) else null;
+        defer if (own) |l| l.end();
+        dsv41_model.resetState(m);
     }
 };
+
+/// A forward's DeepSeek part: the slot request whose decode state it runs (`dsv41_model.bind`).
+pub const Ctx = struct {
+    request: ?*dsv41_model.Request = null,
+};
+
+/// The slot request a forward context carries; null when it carries none or the build has no dsv41.
+pub fn requestOf(ctx: *const trunk.ForwardCtx) ?*dsv41_model.Request {
+    return if (comptime @hasField(arch_state.Ctx, "dsv41")) ctx.arch_ctx.dsv41.request else null;
+}
 
 /// DeepSeek's state on `t`; null in a build without dsv41.
 pub fn stateOf(t: *Trunk) ?*State {

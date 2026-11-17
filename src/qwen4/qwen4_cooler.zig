@@ -1,21 +1,7 @@
 //! Where a Flash-Next load runs, decided once at the load: Sushi Cooler, the engine of our own, or MLX.
 const std = @import("std");
-const builtin = @import("builtin");
 const mlx = @import("../mlx.zig");
-const io_util = @import("../io_util.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
-
-pub const Side = enum {
-    engine,
-    /// `--qwen-mlx-engine`.
-    mlx_by_flag,
-    /// The model setting turned Sushi Cooler off.
-    mlx_by_setting,
-    /// Only an STQ pack runs on Sushi Cooler.
-    mlx_not_stq,
-    /// Until Qwen on Sushi Cooler passes its gate, a served load takes it only under `SUSHI_QWEN4_COOLER`.
-    mlx_until_gated,
-};
 
 /// An STQ pack: its routed experts are trellis banks of the STQ codebook, its trunk affine or STQ banks.
 pub fn isStq(config: *const ModelConfig) bool {
@@ -24,62 +10,50 @@ pub fn isStq(config: *const ModelConfig) bool {
     return t.codebook == .spec1;
 }
 
-pub fn sideOf(config: *const ModelConfig) Side {
-    switch (config.cooler_ask) {
-        .flag => return .mlx_by_flag,
-        .setting => return .mlx_by_setting,
-        .none => {},
-    }
-    if (!isStq(config)) return .mlx_not_stq;
-    // The tests written against MLX keep it; the engine's own tests name the engine.
-    if (comptime builtin.is_test) return if (config.cooler_for_test orelse false) .engine else .mlx_until_gated;
-    return if (io_util.diagEnvOnCached(&dev_knob, "SUSHI_QWEN4_COOLER")) .engine else .mlx_until_gated;
+/// The formats a Flash-Next load runs on Sushi Cooler, and no other: an STQ pack (trellis experts and trunk) and the
+/// release's own BF16 checkpoint. Affine and MXFP4 packs keep MLX.
+pub const Format = enum { stq, bf16 };
+
+pub fn formatOf(config: *const ModelConfig) ?Format {
+    if (isStq(config)) return .stq;
+    const bf16_experts = config.expert_layout == .bf16_individual or config.expert_layout == .bf16_fused;
+    if (bf16_experts and config.quant_bits == 0 and config.trunk_quant == null) return .bf16;
+    return null;
 }
 
-var dev_knob: ?bool = null;
-
-/// Whether this load's forwards run on the engine of our own. The load and every bill ask here.
-pub fn ownDecode(config: *const ModelConfig) bool {
-    return sideOf(config) == .engine;
+/// The loads a Flash-Next pack cannot run on Sushi Cooler (`cooler_side.sideOf` asks): any but its formats.
+pub fn coolerGap(config: *const ModelConfig) ?[]const u8 {
+    if (formatOf(config) == null) return "Sushi Cooler runs Flash-Next's STQ packs and its BF16 checkpoint only";
+    return null;
 }
 
-/// The stream a Cooler load runs on; null for the thread's GPU stream.
-pub fn ownStream(config: *const ModelConfig) ?mlx.mlx_stream {
-    return if (ownDecode(config)) mlx.engine.stream() else null;
-}
-
-/// The load line for a side. The engine of our own ships as Sushi Cooler.
-pub fn line(side: Side) []const u8 {
-    return switch (side) {
-        .engine => "[qwen4] forwards: on Sushi Cooler, the engine of our own",
-        .mlx_by_flag => "[qwen4] forwards: on MLX because --qwen-mlx-engine was given (Sushi Cooler is off)",
-        .mlx_by_setting => "[qwen4] forwards: on MLX because the model setting turned Sushi Cooler off",
-        .mlx_not_stq => "[qwen4] forwards: on MLX: Sushi Cooler runs STQ packs only",
-        .mlx_until_gated => "[qwen4] forwards: on MLX: Sushi Cooler for Qwen is in development (SUSHI_QWEN4_COOLER=1 turns it on)",
-    };
-}
-
-test "qwen4 cooler: only an STQ pack takes the engine, and the opt-out outranks it" {
+test "qwen4 cooler: an STQ pack and the BF16 checkpoint take the engine, no other format, and the opt-out outranks it" {
+    const cooler_side = @import("../cooler_side.zig");
     var c: ModelConfig = .{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .expert_quant_codebook = .spec1, .cooler_for_test = true };
-    try std.testing.expectEqual(Side.engine, sideOf(&c));
+    try std.testing.expect(cooler_side.sideOf(&c) == .engine);
     c.trunk_quant = .{ .codebook = .spec1 };
-    try std.testing.expectEqual(Side.engine, sideOf(&c));
+    try std.testing.expect(cooler_side.sideOf(&c) == .engine);
     c.cooler_ask = .flag;
-    try std.testing.expectEqual(Side.mlx_by_flag, sideOf(&c));
+    try std.testing.expect(cooler_side.sideOf(&c) == .mlx_by_flag);
     c.cooler_ask = .setting;
-    try std.testing.expectEqual(Side.mlx_by_setting, sideOf(&c));
+    try std.testing.expect(cooler_side.sideOf(&c) == .mlx_by_setting);
     c.cooler_ask = .none;
     c.trunk_quant = .{ .codebook = .mcg };
-    try std.testing.expectEqual(Side.mlx_not_stq, sideOf(&c));
+    try std.testing.expect(cooler_side.sideOf(&c) == .mlx_gap);
     c.trunk_quant = null;
     c.expert_quant_codebook = .mcg;
-    try std.testing.expectEqual(Side.mlx_not_stq, sideOf(&c));
+    try std.testing.expect(cooler_side.sideOf(&c) == .mlx_gap);
     c.expert_quant_codebook = .spec1;
-    c.expert_layout = .bf16_fused;
-    try std.testing.expectEqual(Side.mlx_not_stq, sideOf(&c));
+    c.expert_layout = .bf16_individual;
+    try std.testing.expect(cooler_side.sideOf(&c) == .engine);
+    c.quant_bits = 4;
+    try std.testing.expectEqualStrings("Sushi Cooler runs Flash-Next's STQ packs and its BF16 checkpoint only", cooler_side.sideOf(&c).mlx_gap);
+    c.quant_bits = 0;
+    c.expert_layout = .mxfp4_split;
+    try std.testing.expect(cooler_side.sideOf(&c) == .mlx_gap);
     c.expert_layout = .exl3_k4;
     c.cooler_for_test = null;
-    try std.testing.expectEqual(Side.mlx_until_gated, sideOf(&c));
+    try std.testing.expect(cooler_side.sideOf(&c) == .mlx_in_test);
 }
 
 const Trunk = @import("../trunk.zig").Trunk;

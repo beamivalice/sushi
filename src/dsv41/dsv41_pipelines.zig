@@ -3,20 +3,21 @@
 
 const std = @import("std");
 const mlx = @import("../mlx.zig");
-const log = @import("../log.zig");
-const device = @import("sushi_exl3").device;
-const load_clock = @import("../load_clock.zig");
 const manifest = @import("../pipeline_manifest.zig");
 const model_mod = @import("../model.zig");
 const stream_mod = @import("../expert_stream.zig");
 const dsv41_model = @import("dsv41_model.zig");
+const shared = @import("../arch/cooler_pipelines.zig");
+const Plan = shared.Plan;
+const forget = shared.forget;
+const rewriteLate = shared.rewriteLate;
+const begin = shared.begin;
+const Case = shared.Case;
 
-const cache = mlx.engine.pipeline_cache;
-const registry = mlx.engine.pipeline_registry;
 const ModelConfig = model_mod.ModelConfig;
 
-/// Variables that select which kernels the engine makes or what their source says. The profile, report and probe
-/// switches change no recipe and are left out, so a debug session does not write a second manifest.
+/// DeepSeek's variables that select which kernels the engine makes or what their source says (beside
+/// `cooler_pipelines.recipe_env`).
 const recipe_env = [_][*:0]const u8{
     "SUSHI_DSV41_COMPOSED",
     "SUSHI_DSV41_DSPARK_EXACT",
@@ -26,15 +27,9 @@ const recipe_env = [_][*:0]const u8{
     "SUSHI_DSV41_ENGRAM_REUSE",
     "SUSHI_DSV41_STQ_ROUTER_SCALE",
     "SUSHI_DSV41_CAPTURE_LEAN",
-    "SUSHI_EXL3_GEMM_WIN",
-    "SUSHI_EXL3_WIN_ALIGN",
-    "SUSHI_EXL3_SWIGLU_MAXABS",
-    "SUSHI_FORCE_GPU_FAMILY_FALLBACK",
-    "MLX_METAL_GPU_ARCH",
-    "MLX_ENABLE_TF32",
 };
 
-/// Which pack and which warm; the build part is `buildKey`.
+/// Which pack and which warm; the build part is `cooler_pipelines.buildKey`.
 pub fn scopeKey(a: std.mem.Allocator, io: std.Io, config: *const ModelConfig, engine: *const stream_mod.Engine) ![16]u8 {
     var d: manifest.Digest = .{};
     try manifest.addPack(&d, a, io, config.expert_source_dir orelse return error.MissingExpertSourceDir);
@@ -50,176 +45,8 @@ pub fn scopeKey(a: std.mem.Allocator, io: std.Io, config: *const ModelConfig, en
     d.addInt("resident", @intFromBool(engine.plan.resident));
     d.addInt("dropped experts", engine.geometry.drop_n);
     for (recipe_env) |name| if (std.c.getenv(name)) |v| d.add(std.mem.span(name), std.mem.span(v));
+    shared.addRecipeEnv(&d);
     return d.hex();
-}
-
-pub fn buildKey(a: std.mem.Allocator, io: std.Io) ![16]u8 {
-    var d: manifest.Digest = .{};
-    var arch_buf: [64]u8 = undefined;
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    try manifest.addBuild(&d, a, io, device.archName(&arch_buf), try mlx.engine.metallibPath(&path_buf));
-    return d.hex();
-}
-
-pub const Case = enum { off, none, unreadable, other_build, same };
-
-/// A test's directory, in place of the process's root.
-pub var root_hook: ?std.Io.Dir = null;
-
-/// The root directory the process was given (`manifest.setRootFromHome`), made if it is missing. `reason` names why
-/// there is none: nothing derives a default, so a process that was not given one keeps no manifest.
-pub fn openRoot(io: std.Io, reason: *[]const u8) ?std.Io.Dir {
-    if (root_hook) |dir| return dir;
-    const path = manifest.configuredRoot() orelse {
-        reason.* = "no manifest root was given";
-        return null;
-    };
-    return std.Io.Dir.cwd().createDirPathOpen(io, path, .{}) catch |e| {
-        reason.* = @errorName(e);
-        return null;
-    };
-}
-
-pub fn threadCount() usize {
-    return @min(std.Thread.getCpuCount() catch 4, 8);
-}
-
-pub const Plan = struct {
-    a: std.mem.Allocator,
-    io: std.Io,
-    root: ?std.Io.Dir,
-    key: manifest.Key,
-    key_ms: u64,
-    found: manifest.Lookup,
-    case: Case,
-    why: []const u8 = "",
-    threads: usize,
-    /// What the last `settle` spent making pipelines ahead, and how many it made.
-    made_ns: u64 = 0,
-    made_count: u64 = 0,
-
-    pub fn deinit(p: *Plan) void {
-        p.found.deinit();
-    }
-
-    /// Makes the pipelines of the manifest found, on worker threads, and says which case runs. The warm that follows is
-    /// the scope returned.
-    pub fn settle(p: *Plan) dsv41_model.WarmScope {
-        // A later warm adds to a manifest only where a complete one stands: the one found, or the one `store` writes.
-        last = null;
-        var dir_buf: [manifest.Key.dir_len]u8 = undefined;
-        const dir = p.key.dirName(&dir_buf);
-        const recipes: []const manifest.Recipe = switch (p.found) {
-            .same, .other => |l| l.recipes,
-            else => &.{},
-        };
-        if (recipes.len > 0) {
-            const t0 = load_clock.now();
-            const report = if (cache.start(recipes, p.threads)) |job| cache.finish(job) else |e| {
-                log.warn("[pipelines] manifest {s}: the workers did not start ({s}); the warm forwards run and rebuild it\n", .{ dir, @errorName(e) });
-                p.case = .unreadable;
-                return .all;
-            };
-            const wall = load_clock.now() - t0;
-            p.made_ns = wall;
-            p.made_count = report.made;
-            const wall_ms = wall / std.time.ns_per_ms;
-            if (report.failed > 0) {
-                registry.settleMarkers(false);
-                log.warn("[pipelines] manifest {s}: {d} of {d} recipes did not make ({s}); not trusted, the warm forwards run and rebuild it\n", .{ dir, report.failed, recipes.len, report.firstError() });
-                p.case = .unreadable;
-                return .all;
-            }
-            registry.settleMarkers(p.case == .same);
-            if (p.case == .same) {
-                // Every recipe of the file made, so every one is a pipeline of this process: a manifest rewritten
-                // after a late warm keeps the ones this load never launched.
-                for (recipes) |r| registry.record(r);
-                remember(p);
-                log.info("[pipelines] made {d} pipelines from the manifest {s} on {d} threads in {d} ms; the engine's warm forwards are skipped (key {d} ms)\n", .{ report.made, dir, p.threads, wall_ms, p.key_ms });
-                return .mlx;
-            }
-            log.info("[pipelines] manifest of another build, recompiled {d} on {d} threads in {d} ms; the warm forwards run and the manifest {s} is rewritten (key {d} ms)\n", .{ report.made, p.threads, wall_ms, dir, p.key_ms });
-            return .all;
-        }
-        registry.settleMarkers(false);
-        switch (p.case) {
-            .none => log.info("[pipelines] no manifest; the warm forwards run and write {s} (key {d} ms)\n", .{ dir, p.key_ms }),
-            .unreadable => log.warn("[pipelines] manifest unreadable ({s}); the warm forwards run and rebuild it (key {d} ms)\n", .{ p.why, p.key_ms }),
-            else => log.info("[pipelines] manifest off ({s}); the warm forwards run\n", .{p.why}),
-        }
-        return .all;
-    }
-
-    /// After a complete warm: the recipes the process made, written for this key, and the older builds of the scope
-    /// removed. A failure is a warning, not a failed load.
-    pub fn store(p: *Plan) void {
-        const root = p.root orelse return;
-        remember(p);
-        if (!write(p.a, p.io, root, p.key)) return;
-        var removed: std.ArrayList([manifest.Key.dir_len]u8) = .empty;
-        defer removed.deinit(p.a);
-        manifest.prune(p.a, p.io, root, p.key, &removed) catch |e| log.warn("[pipelines] older manifests not removed: {s}\n", .{@errorName(e)});
-        var dir_buf: [manifest.Key.dir_len]u8 = undefined;
-        log.info("[pipelines] manifest {s} written: {d} recipes\n", .{ p.key.dirName(&dir_buf), registry.recipes().len });
-        for (removed.items) |name| log.info("[pipelines] removed the manifest {s} of an older build\n", .{name});
-    }
-};
-
-/// Where this load's manifest lives once it holds a complete warm, for a warm that runs after the load's own (the
-/// vision tower's).
-var last: ?struct { a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: manifest.Key } = null;
-
-fn remember(p: *const Plan) void {
-    last = if (p.root) |root| .{ .a = p.a, .io = p.io, .root = root, .key = p.key } else null;
-}
-
-fn write(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: manifest.Key) bool {
-    if (registry.lost > 0) {
-        log.warn("[pipelines] manifest not written: {d} recipes could not be kept\n", .{registry.lost});
-        return false;
-    }
-    manifest.write(a, io, root, key, registry.recipes()) catch |e| {
-        log.warn("[pipelines] manifest not written: {s}\n", .{@errorName(e)});
-        return false;
-    };
-    return true;
-}
-
-/// A test's directory is gone with the test: nothing is rewritten after it.
-pub fn forget() void {
-    last = null;
-}
-
-/// Pipelines made after the load's manifest was settled or written: the manifest of the load's key, written again with
-/// them. A load with no manifest root writes nothing.
-pub fn rewriteLate() void {
-    const l = last orelse return;
-    if (!write(l.a, l.io, l.root, l.key)) return;
-    var dir_buf: [manifest.Key.dir_len]u8 = undefined;
-    log.info("[pipelines] manifest {s} written again with a later warm: {d} recipes\n", .{ l.key.dirName(&dir_buf), registry.recipes().len });
-}
-
-/// Looks up this key's manifest. A problem with the directory or the
-/// file is a case, never an error.
-pub fn begin(a: std.mem.Allocator, io: std.Io, root: ?std.Io.Dir, why_no_root: []const u8, key: manifest.Key, key_ms: u64) Plan {
-    var plan: Plan = .{ .a = a, .io = io, .root = root, .key = key, .key_ms = key_ms, .found = .none, .case = .off, .why = why_no_root, .threads = threadCount() };
-    const dir = root orelse return plan;
-    plan.found = manifest.lookup(a, io, dir, key) catch |e| {
-        plan.why = @errorName(e);
-        plan.found = .none;
-        return plan;
-    };
-    switch (plan.found) {
-        .none => plan.case = .none,
-        .unreadable => |u| {
-            plan.case = .unreadable;
-            plan.why = u.reason;
-        },
-        .same => plan.case = .same,
-        .other => plan.case = .other_build,
-    }
-    return plan;
 }
 
 // ── Tests ──
@@ -262,7 +89,7 @@ const Served = struct {
         self.config.stream_mtp_head = true;
         self.config.expert_cache_bytes = 64 << 20;
         self.config.expert_source_dir = try a.dupe(u8, dir);
-        self.config.dsv41.?.cooler_for_test = true;
+        @import("../cooler_side.zig").forTest(&self.config, true);
         self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &self.config, false);
         errdefer self.weights.deinit();
         self.xfm = try trunk_mod.Trunk.init(io, a, self.config, &self.weights);
@@ -286,7 +113,7 @@ const Served = struct {
 
     /// One load's warm as `initDsv41` runs it: settle the plan, warm what it says, store after a full warm.
     fn load(self: *Served, plan: *Plan) !dsv41_model.WarmScope {
-        const scope = plan.settle();
+        const scope = dsv41_serving.warmScopeOf(plan.settle());
         try dsv41_serving.warmAllAt(&self.xfm, self.model(), null, scope, 256);
         if (scope == .all) plan.store();
         return scope;
@@ -295,9 +122,9 @@ const Served = struct {
     /// One wide chunk through the forward a request takes, from the start of the cache when `ids` is the first.
     fn prefillChunk(self: *Served, ids: []const u32) !void {
         var ctx = self.xfm.defaultCtx();
-        if (self.model().dec_state == null) try self.xfm.resetCache();
-        ctx.cache.step = if (self.model().dec_state) |st| st.n else 0;
-        const arr = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(ids.len) }, 2, .int32);
+        if ((try dsv41_model.currentState(self.model())) == null) try self.xfm.resetCache();
+        ctx.cache.step = if (try dsv41_model.currentState(self.model())) |st| st.n else 0;
+        const arr = try mlx.newData(ids.ptr, &[_]c_int{ 1, @intCast(ids.len) }, .int32);
         defer _ = mlx.mlx_array_free(arr);
         const out = try dsv41_serving.forwardDsv41With(&self.xfm, &ctx, arr, self.model());
         defer _ = mlx.mlx_array_free(out);
@@ -380,7 +207,7 @@ test "dsv41 pipelines: a load whose warm did not finish leaves no manifest, and 
     const key = testKey("c2c2c2c2c2c2c2c2");
     var plan = plainBegin(tmp.dir, key);
     defer plan.deinit();
-    try testing.expectEqual(dsv41_model.WarmScope.all, plan.settle());
+    try testing.expect(!plan.settle());
     rewriteLate();
     var unfinished = try manifest.lookup(testing.allocator, io, tmp.dir, key);
     defer unfinished.deinit();

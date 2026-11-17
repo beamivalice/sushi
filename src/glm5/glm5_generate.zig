@@ -175,7 +175,7 @@ pub fn sampleGlmNode(raw: *anyopaque, row: usize) !u32 {
     var ops = @import("glm5_model.zig").Ops{ .s = gen.xfm.s };
     defer ops.deinit();
     const logits = try ops.slice(context.logits, 1, @intCast(row), @intCast(row + 1));
-    const sampled = sampler.sampleTokenLazy(logits, gen.sampling, gen.xfm.s);
+    const sampled = try sampler.sampleTokenLazy(logits, gen.sampling, gen.xfm.s);
     defer _ = mlx.mlx_array_free(sampled);
     try mlx.check(mlx.mlx_array_eval(sampled));
     var token: i32 = 0;

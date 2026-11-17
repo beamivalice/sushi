@@ -698,6 +698,13 @@ pub fn mtpVerifyDraftsMax(config: *const @import("model.zig").ModelConfig) u32 {
     return if (arch_state.verifyRowsMax(config)) |rows| @intCast(rows - 1) else mtp_mod.MAX_DEPTH;
 }
 
+/// The widest drafts a round of the load verifies, which its warm compiles: the MTP head's depth cap `depth_cap`, or
+/// a prompt-lookup chain's (`--mtp-max-depth` holds both), never past the rows a verify keeps at their decode bits.
+pub fn mtpWarmVerifyCap(config: *const @import("model.zig").ModelConfig, depth_cap: u32) u32 {
+    const lookup = depth_bounds.lookupCap(@import("mtp_round.zig").mtpLookupDraftCap(config), depth_bounds.active);
+    return @min(@max(depth_cap, lookup), mtpVerifyDraftsMax(config));
+}
+
 /// The width a pinned round drafts: never past the verify row budget.
 pub fn mtpForcedWidth(forced: u32, verify_max: u32) u32 {
     return @min(forced, verify_max);
@@ -1001,8 +1008,39 @@ fn mtpDepthCaps(self: *const Generator) struct { u32, u32 } {
     return .{ row, @min(@max(row, self.mtp_depth_free), verify_max) };
 }
 
+/// The served warm's rounds take these plans in turn, each extending, so every two-chunk shape the planner can pick
+/// runs once whatever the costs it measures; empty for a request.
+pub var warm_plans: []const MtpRoundPlan = &.{};
+/// Rounds that took a warm plan, for a test.
+pub var warm_plan_at: usize = 0;
+
+/// Every plan up to `cap` drafts: each single-chunk width, then each two-chunk shape extending past its first chunk.
+pub fn everyPlan(buf: []MtpRoundPlan, cap: u32) []const MtpRoundPlan {
+    var n: usize = 0;
+    var w: u32 = 1;
+    while (w <= cap and n < buf.len) : (w += 1) {
+        buf[n] = .{ .m_lo = w, .m_hi = w, .tau_ln = 0 };
+        n += 1;
+    }
+    var lo: u32 = 1;
+    while (lo < cap) : (lo += 1) {
+        var hi: u32 = lo + 1;
+        while (hi <= cap and n < buf.len) : (hi += 1) {
+            buf[n] = .{ .m_lo = lo, .m_hi = hi, .tau_ln = -std.math.inf(f32) };
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
 pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
     const cap_row, const cap_free = mtpDepthCaps(self);
+    if (warm_plans.len > 0) {
+        const plan = warm_plans[warm_plan_at % warm_plans.len];
+        warm_plan_at +%= 1;
+        self.mtp_ev_m_lo_prev = plan.m_lo;
+        return plan;
+    }
     if (mtpPinnedDepth()) |d| {
         const forced = mtpForcedWidth(@min(d, cap_row), mtpVerifyDraftsMax(&self.xfm.config));
         self.mtp_ev_m_lo_prev = forced;

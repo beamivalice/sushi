@@ -330,7 +330,7 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
         mtp_coarse_pairs_cfgs.put(xs[0], .{value});
         break :blk value;
     };
-    const values = [_]mlx.mlx_array{ x, w, sc, bi, cachedScalarInt(2560), cachedScalarInt(248320) };
+    const values = [_]mlx.mlx_array{ x, w, sc, bi, try cachedScalarInt(2560), try cachedScalarInt(248320) };
     const iv = mlx.mlx_vector_array_new_data(&values, values.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -1247,7 +1247,7 @@ test "verify route packing preserves stable order and row indices" {
             try mlx.check(mlx.mlx_argsort_axis(&order, input, 0, s));
             try mlx.check(mlx.mlx_argsort_axis(&inverse, order, 0, s));
             try mlx.check(mlx.mlx_take_axis(&sorted, input, order, 0, s));
-            try mlx.check(mlx.mlx_floor_divide(&lhs, order, cachedScalarInt(10), s));
+            try mlx.check(mlx.mlx_floor_divide(&lhs, order, try cachedScalarInt(10), s));
             try testing.expect(try qsaArraysAllEqual(got.inverse, inverse, s));
             try testing.expect(try qsaArraysAllEqual(got.sorted, sorted, s));
             try testing.expect(try qsaArraysAllEqual(got.lhs, lhs, s));

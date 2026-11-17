@@ -141,9 +141,9 @@ fn probeRun(k: mlx.mlx_fast_metal_kernel, s: mlx.mlx_stream, dtype: mlx.mlx_dtyp
     var b_vals: [64]f32 = undefined;
     for (0..out.len) |i| x_vals[i] = 0.5 * @as(f32, @floatFromInt(i));
     for (0..@intCast(b_len)) |i| b_vals[i] = 0.25 * @as(f32, @floatFromInt(i + 1));
-    const x32 = mlx.mlx_array_new_data(&x_vals, &[_]c_int{n}, 1, .float32);
+    const x32 = try mlx.newData(&x_vals, &[_]c_int{n}, .float32);
     defer _ = mlx.mlx_array_free(x32);
-    const b32 = mlx.mlx_array_new_data(&b_vals, &[_]c_int{b_len}, 1, .float32);
+    const b32 = try mlx.newData(&b_vals, &[_]c_int{b_len}, .float32);
     defer _ = mlx.mlx_array_free(b32);
     var x = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x);

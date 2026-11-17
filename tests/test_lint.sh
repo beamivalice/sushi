@@ -159,6 +159,11 @@ printf '%s\n' 'fn free(x: u32) void { _ = x; }' 'fn work(x: u32) !u32 { return x
 expect_red "a handle freed by an errdefer and a later defer" "src/p.zig:7:5 \[double-free\] f: 'y' is freed by the errdefer on line 5 and by this defer"
 
 tree
+printf '%s\n' 'fn free(x: u32) void { _ = x; }' 'fn join(p: []u32) !void { _ = p; }' 'fn v(parts: []u32) !void {' '    var built: usize = 0;' \
+  '    errdefer for (parts[0..built]) |p| free(p);' '    built = parts.len;' '    defer for (parts) |p| free(p);' '    try join(parts);' '}' > "$TMP/t/src/p.zig"
+expect_red "a slice freed by an errdefer loop and a later defer loop" "src/p.zig:7:5 \[double-free\] v: 'parts' is freed by the errdefer on line 5 and by this defer"
+
+tree
 printf '%s\n' 'const m = struct { fn free(x: u32) u32 { return x; } };' 'test "two frees" {' '    const y: u32 = 1;' \
   '    errdefer _ = m.free(y);' '    {' '        defer _ = m.free(y);' '    }' '}' > "$TMP/t/src/p.zig"
 expect_red "the same call through a namespace, discarded, in a nested block" "\[double-free\] two_frees: 'y' is freed"
@@ -293,6 +298,27 @@ printf '%s\n' 'fn reading() void {' '    _ = mlx.mlx_default_cpu_stream_new();' 
 printf '%s\n' 'fn other() void {' '    _ = mlx.mlx_default_cpu_stream_new();' '}' > "$TMP/t/src/model.zig"
 expect_green "reading itself, a test, and a file outside the disk tier"
 
+# rule cooler-side-query
+tree
+printf '%s\n' 'fn side(c: *const C) bool {' '    return c.cooler_ask == .none;' '}' > "$TMP/t/src/p.zig"
+expect_red "a side input read outside cooler_side" "src/p.zig:2:14 \[cooler-side-query\] side: cooler_ask outside src/cooler_side.zig"
+
+tree
+printf '%s\n' 'fn side(c: *const C) bool {' '    return c.cooler_ask == .none;' '}' > "$TMP/t/src/cooler_side.zig"
+printf '%s\n' 'test "t" {' '    c.cooler_for_test = true;' '}' > "$TMP/t/src/p.zig"
+expect_green "cooler_side itself, and a test"
+
+# rule engine-lifecycle
+tree
+printf '%s\n' 'fn load() void {' '    mlx.engine.hold();' '    mlx.engine.own_weights = true;' '}' > "$TMP/t/src/p.zig"
+expect_red "a load's engine hold outside the shared seam" "src/p.zig:2:16 \[engine-lifecycle\] load: engine.hold outside the shared Cooler seam"
+
+tree
+mkdir -p "$TMP/t/src/arch"
+printf '%s\n' 'fn load() void {' '    mlx.engine.hold();' '}' > "$TMP/t/src/arch/cooler.zig"
+printf '%s\n' 'fn wrap() bool {' '    return mlx.engine.own_weights;' '}' 'test "t" {' '    mlx.engine.seal(true);' '}' > "$TMP/t/src/p.zig"
+expect_green "the seam itself, a read of own_weights, and a test"
+
 # rule random-draw-seam
 tree
 printf '%s\n' 'fn draw(o: *A, l: A, k: A, s: S) void {' '    _ = mlx.mlx_random_categorical(o, l, -1, k, s);' '}' > "$TMP/t/src/p.zig"
@@ -302,6 +328,18 @@ tree
 printf '%s\n' 'fn draw(o: *A, l: A, k: A, s: S) void {' '    _ = mlx.mlx_random_categorical(o, l, -1, k, s);' '}' > "$TMP/t/src/sampler.zig"
 printf '%s\n' 'test "t" {' '    _ = mlx.mlx_random_categorical(o, l, -1, k, s);' '}' > "$TMP/t/src/p.zig"
 expect_green "the sampler itself, and a test"
+
+# rule host-maker-unchecked
+tree
+printf '%s\n' 'fn ids(v: *const i32) A {' '    return mlx.mlx_array_new_data(v, &.{1}, 1, .int32);' '}' > "$TMP/t/src/p.zig"
+expect_red "a raw maker on the shared path" "src/p.zig:2:16 \[host-maker-unchecked\] ids: mlx_array_new_data unchecked"
+
+tree
+mkdir -p "$TMP/t/src/glm5"
+printf '%s\n' 'fn ids(v: *const i32) !A {' '    const a = try host_side.made(mlx.mlx_array_new_data(v, &.{1}, 1, .int32));' '    _ = try cache.put(0, 1, mlx.mlx_array_new_int(1));' '    return a;' '}' > "$TMP/t/src/p.zig"
+printf '%s\n' 'fn one() A {' '    return mlx.mlx_array_new_int(1);' '}' > "$TMP/t/src/glm5/g.zig"
+printf '%s\n' 'test "t" {' '    _ = mlx.mlx_array_new_float(1);' '}' > "$TMP/t/src/q.zig"
+expect_green "a maker made or put, an MLX-only arch, and a test"
 
 # rule closure-compile-seam
 tree

@@ -4,6 +4,7 @@ const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
 const glm5_flags = @import("glm5_flags.zig");
 const glm5_state = @import("glm5_state.zig");
+const arch_state = @import("../arch/arch_state.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const generate_mod = @import("../generate.zig");
 const glm5_generate = @import("glm5_generate.zig");
@@ -434,7 +435,7 @@ test "a resident GLM batches plain rows four at a time, a streamed one stays ser
 }
 
 test "every GLM slot owns its native request and hands it to its forward context" {
-    if (comptime @import("../arch/arch_state.zig").SlotRequest != glm5_forward_mod.Request) return error.SkipZigTest;
+    if (comptime !@hasField(arch_state.Ctx, "glm5")) return error.SkipZigTest;
     const allocator = testing.allocator;
     var sch: Scheduler = undefined;
     sch.allocator = allocator;
@@ -462,7 +463,7 @@ test "every GLM slot owns its native request and hands it to its forward context
     var slots: [2]*Slot = undefined;
     for (&slots) |*slot| slot.* = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
     for (slots) |slot| {
-        const request = &slot.request.?;
+        const request = slot.request.?.as(.glm5).?;
         try testing.expectEqual(request, glm5_state.requestOf(&slot.ctx).?);
         try testing.expectEqual(@as(usize, cfg.num_hidden_layers), request.layers.len);
         try testing.expect(request.dense_prefill and request.prefill_async);
@@ -502,7 +503,7 @@ test "a GLM slot submitted with a kv4 override is refused by the same name admis
 }
 
 test "culling an errored or cancelled GLM slot releases its native state, a live one keeps it" {
-    if (comptime @import("../arch/arch_state.zig").SlotRequest != glm5_forward_mod.Request) return error.SkipZigTest;
+    if (comptime !@hasField(arch_state.Ctx, "glm5")) return error.SkipZigTest;
     var mm = metrics_mod.Metrics.init();
     var sch: Scheduler = undefined;
     sch.io = testing.io;
@@ -538,8 +539,8 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
         slot.finished = false;
         slot.error_code = null;
         slot.cancelled = .init(false);
-        slot.request = try glm5_forward_mod.Request.init(testing.allocator, 2);
-        slot.request.?.offset = 4;
+        slot.request = arch_state.SlotRequest.of(.glm5, try glm5_forward_mod.Request.init(testing.allocator, 2));
+        slot.request.?.as(.glm5).?.offset = 4;
         try sch.decoding.append(testing.allocator, slot);
     }
     defer for (&slots) |*slot| slot.request.?.deinit();
@@ -548,13 +549,13 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
     cullDecoding(&sch);
     try testing.expectEqual(@as(usize, 1), sch.decoding.items.len);
     try testing.expectEqual(&slots[2], sch.decoding.items[0]);
-    try testing.expectEqual(@as(usize, 0), slots[0].request.?.offset);
-    try testing.expectEqual(@as(usize, 0), slots[1].request.?.offset);
-    try testing.expectEqual(@as(usize, 4), slots[2].request.?.offset);
+    try testing.expectEqual(@as(usize, 0), slots[0].request.?.as(.glm5).?.offset);
+    try testing.expectEqual(@as(usize, 0), slots[1].request.?.as(.glm5).?.offset);
+    try testing.expectEqual(@as(usize, 4), slots[2].request.?.as(.glm5).?.offset);
 }
 
 test "a GLM cancel landing between the cull passes is committed once before its native reset" {
-    if (comptime @import("../arch/arch_state.zig").SlotRequest != glm5_forward_mod.Request) return error.SkipZigTest;
+    if (comptime !@hasField(arch_state.Ctx, "glm5")) return error.SkipZigTest;
     const Hook = struct {
         var commits: [2]usize = .{ 0, 0 };
         var offset_at_commit: [2]usize = .{ 0, 0 };
@@ -562,7 +563,7 @@ test "a GLM cancel landing between the cull passes is committed once before its 
         fn commit(_: *Scheduler, s: *Slot) void {
             const i: usize = if (s == slots[0]) 0 else 1;
             commits[i] += 1;
-            offset_at_commit[i] = s.request.?.offset;
+            offset_at_commit[i] = s.request.?.as(.glm5).?.offset;
             slots[1].cancelled.store(true, .release);
         }
     };
@@ -598,8 +599,8 @@ test "a GLM cancel landing between the cull passes is committed once before its 
         slot.finished = false;
         slot.error_code = null;
         slot.cancelled = .init(false);
-        slot.request = try glm5_forward_mod.Request.init(testing.allocator, 2);
-        slot.request.?.offset = 4;
+        slot.request = arch_state.SlotRequest.of(.glm5, try glm5_forward_mod.Request.init(testing.allocator, 2));
+        slot.request.?.as(.glm5).?.offset = 4;
         Hook.slots[i] = slot;
         try sch.decoding.append(testing.allocator, slot);
     }
@@ -610,16 +611,16 @@ test "a GLM cancel landing between the cull passes is committed once before its 
     cullDecodingWith(&sch, Hook.commit);
     // The late cancel stays in `decoding` with its state, and the next cull commits it.
     try testing.expectEqual(@as(usize, 1), sch.decoding.items.len);
-    try testing.expectEqual(@as(usize, 4), slots[1].request.?.offset);
+    try testing.expectEqual(@as(usize, 4), slots[1].request.?.as(.glm5).?.offset);
     cullDecodingWith(&sch, Hook.commit);
     try testing.expectEqual(@as(usize, 0), sch.decoding.items.len);
     try testing.expectEqual([2]usize{ 1, 1 }, Hook.commits);
     try testing.expectEqual([2]usize{ 4, 4 }, Hook.offset_at_commit);
-    try testing.expectEqual(@as(usize, 0), slots[1].request.?.offset);
+    try testing.expectEqual(@as(usize, 0), slots[1].request.?.as(.glm5).?.offset);
 }
 
 test "postPrefillTerminal releases native GLM state for a cancelled slot but not a live one" {
-    if (comptime @import("../arch/arch_state.zig").SlotRequest != glm5_forward_mod.Request) return error.SkipZigTest;
+    if (comptime !@hasField(arch_state.Ctx, "glm5")) return error.SkipZigTest;
     var cfg = ModelConfig{ .model_type = "glm5_next" };
     var model: LoadedModel = undefined;
     model.handle = null;
@@ -628,16 +629,16 @@ test "postPrefillTerminal releases native GLM state for a cancelled slot but not
     cancelled_slot.model = &model;
     cancelled_slot.state = .decoding;
     cancelled_slot.cancelled = .init(true);
-    cancelled_slot.request = try glm5_forward_mod.Request.init(testing.allocator, 2);
-    cancelled_slot.request.?.offset = 4;
+    cancelled_slot.request = arch_state.SlotRequest.of(.glm5, try glm5_forward_mod.Request.init(testing.allocator, 2));
+    cancelled_slot.request.?.as(.glm5).?.offset = 4;
     defer cancelled_slot.request.?.deinit();
 
     var live_slot: Slot = undefined;
     live_slot.model = &model;
     live_slot.state = .decoding;
     live_slot.cancelled = .init(false);
-    live_slot.request = try glm5_forward_mod.Request.init(testing.allocator, 2);
-    live_slot.request.?.offset = 4;
+    live_slot.request = arch_state.SlotRequest.of(.glm5, try glm5_forward_mod.Request.init(testing.allocator, 2));
+    live_slot.request.?.as(.glm5).?.offset = 4;
     defer live_slot.request.?.deinit();
 
     var errored_slot: Slot = undefined;
@@ -647,10 +648,10 @@ test "postPrefillTerminal releases native GLM state for a cancelled slot but not
     errored_slot.request = null;
 
     try testing.expect(postPrefillTerminal(&cancelled_slot));
-    try testing.expectEqual(@as(usize, 0), cancelled_slot.request.?.offset);
+    try testing.expectEqual(@as(usize, 0), cancelled_slot.request.?.as(.glm5).?.offset);
 
     try testing.expect(!postPrefillTerminal(&live_slot));
-    try testing.expectEqual(@as(usize, 4), live_slot.request.?.offset);
+    try testing.expectEqual(@as(usize, 4), live_slot.request.?.as(.glm5).?.offset);
 
     try testing.expect(postPrefillTerminal(&errored_slot));
 }

@@ -5,6 +5,7 @@
 //! The contract is docs/mlx-serve-integration.md.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 /// The sushi version this copy of the module was cut at; the sushi tests check it against build.zig.zon.
 pub const version: []const u8 = "1.7.0-dev3";
 pub const device = @import("device.zig");
@@ -34,13 +35,14 @@ pub const Ragged = rate_groups.Ragged;
 pub const linear = @import("linear.zig");
 pub const trunk_gemm = @import("trunk_gemm.zig");
 pub const trunk = @import("trunk.zig");
+pub const side_cache = @import("side_cache.zig");
 pub const Bank = struct { gate: Proj, up: Proj, down: Proj };
 
-/// Frees the arrays the module caches for side `side` of the host (`host_side.of`): the GEMM inputs and the unit
-/// score. For a side no model uses any more; the next model's first asks make them again.
+/// Frees the arrays cached for side `side` of the host (`host_side.of`): the GEMM inputs and every `side_cache`, the
+/// host's own included. For a side no model uses any more; the next model's first asks make them again.
 pub fn dropHostArrays(side: u1) void {
     linear.dropGemmInputs(side);
-    rate_groups.dropUnitScore(side);
+    side_cache.dropAll(side);
 }
 
 /// Routed SwiGLU experts over `x` [B, S, D] for the top-k `inds`/`scores` [B, S, K],
@@ -74,6 +76,7 @@ pub fn moeWithGatedShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds:
         return moeOutput(s, x, bank, inds, scores, dec, verify_rows, .bfloat16, down, gate);
     const routed = try moe(s, x, bank, inds, scores, dec, verify_rows);
     defer _ = mlx.mlx_array_free(routed);
+    if (try mlx.engine.fusedChain(mlx.engine.chains.sigmoid_gated_add, s, &.{ routed, gate, down })) |out| return out;
     var sig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sig);
     try mlx.check(mlx.mlx_sigmoid(&sig, gate, s));
@@ -685,6 +688,7 @@ pub fn moeRagged(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: m
         routed = mlx.mlx_array_new();
         return whole;
     }
+    if (shared_gate) |logit| if (try mlx.engine.fusedChain(mlx.engine.chains.sigmoid_gated_add, s, &.{ routed, logit, value })) |out| return out;
     var gated = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gated);
     if (shared_gate) |logit| {
@@ -707,13 +711,13 @@ pub fn moeGroups(s: mlx.mlx_stream, x: mlx.mlx_array, banks: []const Bank, inds:
         _ = mlx.mlx_array_free(total);
     };
     var offset: c_int = 0;
-    const zero = mlx.mlx_array_new_int(0);
+    const zero = try host_side.made(mlx.mlx_array_new_int(0));
     defer _ = mlx.mlx_array_free(zero);
     for (banks) |bank| {
         const count = mlx.getShape(bank.gate.trellis)[0];
-        const lo = mlx.mlx_array_new_int(offset);
+        const lo = try host_side.made(mlx.mlx_array_new_int(offset));
         defer _ = mlx.mlx_array_free(lo);
-        const hi = mlx.mlx_array_new_int(offset + count);
+        const hi = try host_side.made(mlx.mlx_array_new_int(offset + count));
         defer _ = mlx.mlx_array_free(hi);
         var lower = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(lower);

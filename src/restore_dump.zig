@@ -148,7 +148,7 @@ fn zfmt(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
 }
 
 fn putInt(map: mlx.mlx_map_string_to_array, key: [:0]const u8, v: c_int) !void {
-    const arr = mlx.mlx_array_new_int(v);
+    const arr = try mlx.newInt(v);
     defer _ = mlx.mlx_array_free(arr);
     _ = mlx.mlx_array_eval(arr);
     try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, arr));
@@ -163,7 +163,7 @@ fn putArr(map: mlx.mlx_map_string_to_array, key: [:0]const u8, arr: mlx.mlx_arra
 
 fn putPlePrev(map: mlx.mlx_map_string_to_array, key: [:0]const u8, e: *const SSMCacheEntry) !void {
     const shape = [_]c_int{@intCast(e.ple_prev.len)};
-    const arr = mlx.mlx_array_new_data(@ptrCast(&e.ple_prev), &shape, 1, .uint32);
+    const arr = try mlx.newData(@ptrCast(&e.ple_prev), &shape, .uint32);
     defer _ = mlx.mlx_array_free(arr);
     _ = mlx.mlx_array_eval(arr);
     try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, arr));

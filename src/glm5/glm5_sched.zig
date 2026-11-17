@@ -78,8 +78,13 @@ pub fn tickClass(slot: *const Slot) sched.TickClass {
     return if (rows_tick.slotGlmRowable(slot)) .rows_company else .none;
 }
 
-pub fn initRequest(allocator: std.mem.Allocator, config: *const ModelConfig) !?sched.NativeRequest {
+pub fn initRequest(allocator: std.mem.Allocator, config: *const ModelConfig) !?forward.Request {
     return try forward.Request.initServing(allocator, config.num_hidden_layers);
+}
+
+/// The slot's GLM request; null when it holds none.
+fn slotRequest(slot: *Slot) ?*forward.Request {
+    return if (slot.request) |*r| r.as(.glm5) else null;
 }
 
 /// The same fact as the request-side refusal (`glm5_flags`): the latent's schemes are one list.
@@ -99,7 +104,7 @@ pub fn commitOwn(
     cps: ?[]trunk_mod.SSMCheckpoint,
     prompt_len: usize,
 ) bool {
-    const request = if (slot.request) |*r| r else return false;
+    const request = slotRequest(slot) orelse return false;
     const window: ?trunk_mod.KVCache = if (gen) |g| if (g.native_prefill_window) |*w|
         .{ .entries = w.snapshot.entries, .step = w.snapshot.step, .allocator = w.snapshot.allocator, .config = w.snapshot.config }
     else
@@ -111,7 +116,7 @@ pub fn commitOwn(
 
 pub fn restoreTarget(slot: *Slot, xfm: *Trunk) ?sched.RestoreTarget {
     _ = xfm;
-    const request = if (slot.request) |*r| r else return null;
+    const request = slotRequest(slot) orelse return null;
     return .{ .rec = prefix_arch.recurrent("glm5", request), .takes_dflash = true };
 }
 
@@ -124,7 +129,7 @@ pub fn writeThrough(
     cps: []trunk_mod.SSMCheckpoint,
     s: mlx.mlx_stream,
 ) bool {
-    const request = if (slot.request) |*r| r else return false;
+    const request = slotRequest(slot) orelse return false;
     glm5_prefix.writeThroughGlm(hc, entry_id, request, prompt, slot.has_tools, media, cps, s);
     return true;
 }
@@ -141,15 +146,15 @@ test "an arch with a native request restores into it with the assistant context 
     var xfm: Trunk = undefined;
     var lm: model_registry.LoadedModel = undefined;
     var slot = sched.testSlot(&xfm, &lm, .{ .model_type = "glm5_next", .num_hidden_layers = 2 });
-    slot.request = (try initRequest(std.testing.allocator, &xfm.config)).?;
+    slot.request = (try sched.initRequest(std.testing.allocator, &xfm.config)).?;
     defer slot.request.?.deinit();
     const target = sched.restoreTarget(&slot, &xfm).?;
     try std.testing.expectEqualStrings("[prefix]", target.log_tag);
     try std.testing.expect(target.takes_dflash and !target.takes_mtp);
     try std.testing.expect(sched.commitsAtCull(&slot));
-    slot.request.?.offset = 4;
+    slotRequest(&slot).?.offset = 4;
     sched.releaseState(&slot);
-    try std.testing.expectEqual(@as(usize, 0), slot.request.?.offset);
+    try std.testing.expectEqual(@as(usize, 0), slotRequest(&slot).?.offset);
     try std.testing.expectError(error.GlmKvQuantUnsupported, sched.checkKvQuant(&xfm.config, .{ .scheme = .affine, .bits = 4, .group_size = 64 }));
 }
 

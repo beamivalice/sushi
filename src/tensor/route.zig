@@ -16,6 +16,7 @@ const scan = @import("scan.zig");
 const dtype_rule = @import("dtype_rule.zig");
 const random = @import("random.zig");
 const quantized = @import("quantized.zig");
+const gather_mm = @import("gather_mm.zig");
 pub const attention = @import("attention.zig");
 
 const A = mlx.mlx_array;
@@ -507,7 +508,7 @@ pub fn mlx_array_itemsize(a: A) usize {
 /// The bytes are there once the pass that last wrote them has run.
 pub fn mlx_array_eval(a: A) c_int {
     const t = core.ready(a) catch |e| return fail("array_eval", e);
-    _ = core.hostBytes(t) catch |e| switch (e) {
+    _ = core.hostRead(t) catch |e| switch (e) {
         error.NotRowContiguous => core.sync() catch |e2| return fail("array_eval", e2),
         else => return fail("array_eval", e),
     };
@@ -524,7 +525,7 @@ pub fn data(comptime T: type, a: A) ?[*]const T {
         _ = fail("array_data", e);
         return null;
     };
-    const bytes = core.hostBytes(t) catch |e| {
+    const bytes = core.hostRead(t) catch |e| {
         _ = fail("array_data", e);
         return null;
     };
@@ -534,7 +535,7 @@ pub fn data(comptime T: type, a: A) ?[*]const T {
 pub fn item(comptime T: type, res: *T, a: A) c_int {
     const t = core.ready(a) catch |e| return fail("array_item", e);
     if (t.size() != 1) return fail("array_item", error.TensorShape);
-    const bytes = core.hostBytes(t) catch |e| return fail("array_item", e);
+    const bytes = core.hostRead(t) catch |e| return fail("array_item", e);
     res.* = std.mem.bytesToValue(T, bytes[0..@sizeOf(T)]);
     return 0;
 }
@@ -585,6 +586,12 @@ pub fn poolRefusals() u64 {
 }
 pub const poolPeak = core.poolPeak;
 pub const resetPoolPeak = core.resetPoolPeak;
+pub const poolHeldPeak = core.poolHeldPeak;
+
+/// The engine's pool keeps no more free bytes than `bytes`, the limit MLX's cache was given beside it.
+pub fn setFreeCap(bytes: u64) void {
+    core.free_cap = bytes;
+}
 
 /// What the pool refused last for its budget (`core.refused_budget`).
 pub fn refusedBudget() @TypeOf(core.refused_budget) {
@@ -626,6 +633,7 @@ pub fn phase(now: u8) void {
     core.phase = now;
 }
 pub const trim = core.trim;
+pub const makeCopiesAhead = ops.makeCopiesAhead;
 pub const settleMlxAliases = core.settleMlxAliases;
 
 pub const nowNs = core.nowNs;
@@ -676,11 +684,26 @@ pub fn latePipelines() u64 {
     return core.pipelines_late;
 }
 
+pub const late_names = core.late_names;
+
+/// Names the step the inference thread is in for the late-compile line; returns the step it replaces.
+pub fn lateWhere(text: []const u8) []const u8 {
+    defer core.late_where = text;
+    return core.late_where;
+}
+
 /// Pipelines the engine has made in this process and the time they took.
 pub fn pipelinesMade() struct { count: u64, ns: u64 } {
     return .{ .count = core.pipelines, .ns = core.pipeline_ns };
 }
 pub const isStream = core.isStream;
+
+/// The bytes from an array of the engine's buffer start to its element 0; null for an array of MLX's.
+pub fn byteOffset(a: A) ?usize {
+    if (!core.isOurs(a)) return null;
+    const t = core.of(a);
+    return t.store.at + t.offset;
+}
 
 // ── Vectors ──
 
@@ -1115,6 +1138,34 @@ fn onFloat(comptime f: fn (*Tensor) core.Error!*Tensor) fn (*Tensor) core.Error!
     }.g;
 }
 
+/// An elementwise chain the engine runs as one kernel (`tensor/chains.zig`): null off the engine's stream, and for inputs
+/// that are not bf16 or f16 of one dtype (an f32 chain may contract into an fma), where the caller runs the ops.
+pub const chains = @import("chains.zig");
+
+pub fn fusedChain(comptime c: chains.Chain, s: S, inputs: []const A) !?A {
+    if (!core.isStream(s)) return null;
+    var ts: [3]*Tensor = undefined;
+    var n: usize = 0;
+    defer for (ts[0..n]) |t| core.release(t);
+    for (inputs) |a| {
+        ts[n] = core.take(a) catch |e| {
+            _ = fail(c.tag, e);
+            return error.MlxError;
+        };
+        n += 1;
+    }
+    const dt = ts[0].dtype;
+    if (dt != .bfloat16 and dt != .float16) return null;
+    for (ts[1..n]) |t| if (t.dtype != dt) return null;
+    const out = ops.chain(c.tag, c.expr, ts[0..n]) catch |e| {
+        _ = fail(c.tag, e);
+        return error.MlxError;
+    };
+    var res: A = .{ .ctx = null };
+    _ = put(&res, out);
+    return res;
+}
+
 pub const mlx_add = bin(.add);
 pub const mlx_subtract = bin(.subtract);
 pub const mlx_multiply = bin(.multiply);
@@ -1130,6 +1181,18 @@ pub const mlx_logical_and = bin(.logical_and);
 pub const mlx_logical_or = bin(.logical_or);
 
 pub const mlx_logaddexp = bin(.logaddexp);
+pub const mlx_remainder = bin(.remainder);
+
+/// MLX's take without an axis: a take along the first axis of the array read flat.
+pub fn mlx_take(res: *A, a: A, indices: A, _: S) c_int {
+    const x = core.take(a) catch |e| return fail("take", e);
+    defer core.release(x);
+    const flat = ops.reshape(x, &.{@intCast(x.size())}) catch |e| return fail("take", e);
+    defer core.release(flat);
+    const i = core.take(indices) catch |e| return fail("take", e);
+    defer core.release(i);
+    return put(res, ops.take(flat, i, 0) catch |e| return fail("take", e));
+}
 pub const mlx_exp = un(.exp);
 pub const mlx_log = un(.log);
 pub const mlx_abs = un(.abs);
@@ -1494,6 +1557,18 @@ pub fn mlx_gather_qmm(res: *A, x: A, w: A, scales: A, biases: A, lhs_indices: A,
     const tr: ?*Tensor = if (rhs_indices.ctx != null) core.take(rhs_indices) catch |e| return fail("gather_qmm", e) else null;
     defer if (tr) |t| core.release(t);
     return put(res, quantized.gatherQmm(pr.x, tw, pr.scales, pr.biases, tl, tr, what, group, width, sorted_indices) catch |e| return fail("gather_qmm", e));
+}
+
+pub fn mlx_gather_mm(res: *A, a: A, b: A, lhs_indices: A, rhs_indices: A, sorted_indices: bool, _: S) c_int {
+    const ta = core.take(a) catch |e| return fail("gather_mm", e);
+    defer core.release(ta);
+    const tb = core.take(b) catch |e| return fail("gather_mm", e);
+    defer core.release(tb);
+    const tl: ?*Tensor = if (lhs_indices.ctx != null) core.take(lhs_indices) catch |e| return fail("gather_mm", e) else null;
+    defer if (tl) |t| core.release(t);
+    const tr: ?*Tensor = if (rhs_indices.ctx != null) core.take(rhs_indices) catch |e| return fail("gather_mm", e) else null;
+    defer if (tr) |t| core.release(t);
+    return put(res, gather_mm.gatherMm(ta, tb, tl, tr, sorted_indices) catch |e| return fail("gather_mm", e));
 }
 
 pub fn mlx_fast_scaled_dot_product_attention(res: *A, queries: A, keys: A, values: A, scale: f32, mask_mode: [*:0]const u8, mask_arr: A, sinks: A, force_fused: bool, s: S) c_int {
@@ -2006,6 +2081,186 @@ fn hostArray(comptime T: type, values: []const T, dims: []const c_int, dtype: ml
     return mlx.raw.mlx_array_new_data(values.ptr, dims.ptr, @intCast(dims.len), dtype);
 }
 
+test "an engine reshape of a strided view is a view where MLX's is, with MLX's strides and bytes, and copies only where MLX copies" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    const vals = ramp(f32, 256, 10, -5);
+    const host = hostArray(f32, &vals, &.{ 4, 8, 8 }, .float32);
+    defer _ = mlx.mlx_array_free(host);
+    // [4, 6, 8] of [4, 8, 8]: its last two axes are one run, the first is not joined to them.
+    for ([_][]const c_int{ &.{ 4, 6, 2, 4 }, &.{ 4, 48 }, &.{ 4, 1, 6, 8 }, &.{ 24, 8 }, &.{192} }) |dims| {
+        var strides: [2][8]usize = undefined;
+        var bytes: [2][192]f32 = undefined;
+        var dispatched: u64 = 0;
+        for ([_]S{ gpu, core.stream() }, 0..) |s, arm| {
+            var src: A = .{};
+            defer _ = mlx.mlx_array_free(src);
+            try mlx.check(mlx.mlx_contiguous(&src, host, false, s));
+            try mlx.check(mlx.mlx_array_eval(src));
+            var view: A = .{};
+            defer _ = mlx.mlx_array_free(view);
+            try mlx.check(mlx.mlx_slice(&view, src, &[_]c_int{ 0, 1, 0 }, 3, &[_]c_int{ 4, 7, 8 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            const d0 = core.stats().dispatches;
+            var r: A = .{};
+            defer _ = mlx.mlx_array_free(r);
+            try mlx.check(mlx.mlx_reshape(&r, view, dims.ptr, dims.len, s));
+            if (arm == 1) dispatched = core.stats().dispatches - d0;
+            try mlx.check(mlx.mlx_array_eval(r));
+            @memcpy(strides[arm][0..dims.len], mlx.mlx_array_strides(r)[0..dims.len]);
+            var c: A = .{};
+            defer _ = mlx.mlx_array_free(c);
+            try mlx.check(mlx.mlx_contiguous(&c, r, false, s));
+            try mlx.check(mlx.mlx_array_eval(c));
+            @memcpy(&bytes[arm], mlx.mlx_array_data_float32(c).?[0..192]);
+        }
+        try t_std.expectEqualSlices(usize, strides[0][0..dims.len], strides[1][0..dims.len]);
+        try t_std.expectEqualSlices(f32, &bytes[0], &bytes[1]);
+        // A view where MLX's strides are not row-major ones: no copy was made.
+        var row_major = true;
+        var stride: usize = 1;
+        var axis = dims.len;
+        while (axis > 0) {
+            axis -= 1;
+            if (dims[axis] != 1 and strides[0][axis] != stride) row_major = false;
+            stride *= @intCast(dims[axis]);
+        }
+        if (!row_major) try t_std.expectEqual(@as(u64, 0), dispatched);
+    }
+}
+
+test "an engine concatenate of two to four parts is one dispatch with MLX's bytes, along every axis" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    const va = ramp(u16, 2 * 3 * 4, 7, 3);
+    const vb = ramp(u16, 2 * 5 * 4, 11, 5);
+    for ([_]c_int{ 0, 1, 2, -1 }) |axis| {
+        // Part shapes that differ only along `axis`.
+        var sa = [_]c_int{ 2, 3, 4 };
+        var sb = [_]c_int{ 2, 3, 4 };
+        const ax: usize = @intCast(if (axis < 0) axis + 3 else axis);
+        sb[ax] = sa[ax] + 2;
+        var na: usize = 1;
+        var nb: usize = 1;
+        for (sa, sb) |x, y| {
+            na *= @intCast(x);
+            nb *= @intCast(y);
+        }
+        var bytes: [2][256]u16 = undefined;
+        var n: usize = 0;
+        var dispatched: u64 = 0;
+        for ([_]S{ gpu, core.stream() }, 0..) |s, arm| {
+            const ha = hostArray(u16, va[0..na], &sa, .bfloat16);
+            defer _ = mlx.mlx_array_free(ha);
+            const hb = hostArray(u16, vb[0..nb], &sb, .bfloat16);
+            defer _ = mlx.mlx_array_free(hb);
+            var a: A = .{};
+            defer _ = mlx.mlx_array_free(a);
+            var b: A = .{};
+            defer _ = mlx.mlx_array_free(b);
+            try mlx.check(mlx.mlx_contiguous(&a, ha, false, s));
+            try mlx.check(mlx.mlx_contiguous(&b, hb, false, s));
+            try mlx.check(mlx.mlx_array_eval(a));
+            try mlx.check(mlx.mlx_array_eval(b));
+            const d0 = core.stats().dispatches;
+            const vec = mlx.mlx_vector_array_new_data(&[_]A{ a, b }, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var c: A = .{};
+            defer _ = mlx.mlx_array_free(c);
+            try mlx.check(mlx.mlx_concatenate_axis(&c, vec, axis, s));
+            if (arm == 1) dispatched = core.stats().dispatches - d0;
+            try mlx.check(mlx.mlx_array_eval(c));
+            n = mlx.mlx_array_size(c);
+            @memcpy(bytes[arm][0..n], mlx.mlx_array_data_uint16(c).?[0..n]);
+        }
+        try t_std.expectEqualSlices(u16, bytes[0][0..n], bytes[1][0..n]);
+        try t_std.expectEqual(@as(u64, 1), dispatched);
+    }
+}
+
+test "an engine concatenate of three and four parts, as a verify's sdpa groups, is one dispatch with MLX's bytes" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    const vals = ramp(u16, 512, 13, 1);
+    for ([_]usize{ 3, 4 }) |count| for ([_]c_int{ 0, 1, 2 }) |axis| {
+        const ax: usize = @intCast(axis);
+        var shapes: [4][3]c_int = undefined;
+        var total: usize = 0;
+        for (0..count) |i| {
+            shapes[i] = .{ 2, 3, 4 };
+            shapes[i][ax] = @intCast(i + 1);
+            total += @intCast(shapes[i][0] * shapes[i][1] * shapes[i][2]);
+        }
+        var bytes: [2][256]u16 = undefined;
+        var dispatched: u64 = 0;
+        for ([_]S{ gpu, core.stream() }, 0..) |s, arm| {
+            var parts: [4]A = undefined;
+            var off: usize = 0;
+            for (0..count) |i| {
+                const n: usize = @intCast(shapes[i][0] * shapes[i][1] * shapes[i][2]);
+                const h = hostArray(u16, vals[off .. off + n], &shapes[i], .bfloat16);
+                defer _ = mlx.mlx_array_free(h);
+                off += n;
+                parts[i] = .{};
+                try mlx.check(mlx.mlx_contiguous(&parts[i], h, false, s));
+                try mlx.check(mlx.mlx_array_eval(parts[i]));
+            }
+            defer for (parts[0..count]) |x| {
+                _ = mlx.mlx_array_free(x);
+            };
+            const vec = mlx.mlx_vector_array_new_data(&parts, count);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            const d0 = core.stats().dispatches;
+            var c: A = .{};
+            defer _ = mlx.mlx_array_free(c);
+            try mlx.check(mlx.mlx_concatenate_axis(&c, vec, axis, s));
+            if (arm == 1) dispatched = core.stats().dispatches - d0;
+            try mlx.check(mlx.mlx_array_eval(c));
+            @memcpy(bytes[arm][0..total], mlx.mlx_array_data_uint16(c).?[0..total]);
+        }
+        try t_std.expectEqualSlices(u16, bytes[0][0..total], bytes[1][0..total]);
+        try t_std.expectEqual(@as(u64, 1), dispatched);
+    };
+}
+
+test "a host read of an array waits for the pass that wrote it, not for a later pass that only reads it" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    try core.sync();
+    const vals = [_]f32{ 1, 2, 3, 4 };
+    const host = mlx.mlx_array_new_data(&vals, &[_]c_int{4}, 1, .float32);
+    defer _ = mlx.mlx_array_free(host);
+    var x: A = .{};
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_add(&x, host, host, core.stream()));
+    try mlx.check(mlx.mlx_array_eval(x));
+    // A pass that reads `x` and is still open: the bytes `x` holds are already there.
+    var y: A = .{};
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_multiply(&y, x, x, core.stream()));
+    const before = core.stats().waits;
+    const got = mlx.mlx_array_data_float32(x) orelse return error.TestUnexpectedResult;
+    try t_std.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, got[0..4]);
+    try t_std.expectEqual(before, core.stats().waits);
+    // A read of `y` waits for the pass that writes it.
+    const gy = mlx.mlx_array_data_float32(y) orelse return error.TestUnexpectedResult;
+    try t_std.expectEqualSlices(f32, &.{ 4, 16, 36, 64 }, gy[0..4]);
+    try t_std.expect(core.stats().waits > before);
+}
+
 test "work built while the GPU is idle is handed over early, in steps that double, and gives the same value" {
     try mlx.requireGpu();
     const was = enabled;
@@ -2064,7 +2319,9 @@ test "once a burst's first pass is handed over, the passes after it follow while
         _ = mlx.mlx_array_free(sum);
         sum = next;
     }
-    try t_std.expect(core.stats().kicks - before.kicks >= 4);
+    // Handed over by the dispatch count or, as each 128 MB `wide` freed in the pass passes the freed cap, by bytes.
+    const after = core.stats();
+    try t_std.expect((after.kicks - before.kicks) + (after.freed_kicks - before.freed_kicks) >= 4);
     try t_std.expectEqual(before.waits, core.stats().waits);
     var value: f32 = 0;
     try mlx.check(mlx.mlx_array_item_float32(&value, sum));
@@ -3797,6 +4054,27 @@ test "an array of MLX's the engine still binds when MLX's turn ends is freed ins
     try std.testing.expectEqual(breaks, mlx.rest_breaks.load(.monotonic));
 }
 
+test "a kernel config of MLX's freed at rest is owed to MLX's next turn, with no call into MLX until then" {
+    try mlx.requireGpu();
+    const was_enabled = enabled;
+    // A config MLX made while the engine was off, as a shared cache holds one a model on MLX launched.
+    enabled = false;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    hold();
+    var is_held = true;
+    defer if (is_held) unhold();
+    const calls = mlxCalls();
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_free(cfg));
+    try std.testing.expectEqual(calls, mlxCalls());
+    try std.testing.expect(mlx.owes());
+    turnTo(false).end();
+    try std.testing.expect(!mlx.owes());
+    unhold();
+    is_held = false;
+}
+
 test "a setting asked of MLX at rest is counted and reaches nothing; inside MLX's turn it is MLX's and none is counted" {
     try mlx.requireGpu();
     const was_enabled = enabled;
@@ -5263,6 +5541,101 @@ test "engine f32 matmul on the SIMD tiles: the first use of a tile before the se
     try t_std.expectEqual(late, core.pipelines_late);
 }
 
+test "engine bf16 matmul on the NAX tiles: a weight's first product before the seal makes what every row count to the widest chunk picks, so no length compiles inside a request" {
+    try mlx.requireGpu();
+    const g = try @import("matmul.zig").gpu();
+    if (!g.nax) return error.SkipZigTest;
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const sealed_was = core.sealed;
+    defer core.sealed = sealed_was;
+    const n = 2048;
+    const k = 10240;
+    const w_vals = try rampBuf(f32, k * n, 2, -1);
+    defer std.testing.allocator.free(w_vals);
+    const w32 = hostArray(f32, w_vals, &.{ n, k }, .float32);
+    defer _ = mlx.mlx_array_free(w32);
+    var w: A = .{};
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_astype(&w, w32, .bfloat16, core.stream()));
+    var wt: A = .{};
+    defer _ = mlx.mlx_array_free(wt);
+    try mlx.check(mlx.mlx_transpose(&wt, w, core.stream()));
+    const Product = struct {
+        fn run(weight: A, m: usize) !void {
+            const x_vals = try rampBuf(f32, m * k, 2, -1);
+            defer std.testing.allocator.free(x_vals);
+            const x32 = hostArray(f32, x_vals, &.{ @intCast(m), k }, .float32);
+            defer _ = mlx.mlx_array_free(x32);
+            var x: A = .{};
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, core.stream()));
+            var o: A = .{};
+            defer _ = mlx.mlx_array_free(o);
+            try mlx.check(mlx.mlx_matmul(&o, x, weight, core.stream()));
+            try mlx.check(mlx.mlx_array_eval(o));
+        }
+    };
+    // The warm's widest prompt takes split-K here (K is over three times M); the rows past it take the fused tiles,
+    // whose K step changes again where K stops passing M + N.
+    core.sealed = false;
+    try Product.run(wt, 2346);
+    core.sealed = true;
+    const late = core.pipelines_late;
+    core.late_names.clear();
+    for ([_]usize{ 129, 1500, 3000, 3500, 4095, 4096, 8191, 8192 }) |m| try Product.run(wt, m);
+    errdefer std.debug.print("engine bf16 NAX matmul: compiled after the seal:\n{s}", .{core.late_names.text()});
+    try t_std.expectEqual(late, core.pipelines_late);
+}
+
+test "engine kernels a request's lengths pick by size: an elementwise op's and a matrix-vector product's first use before the seal makes every size's, so a long prompt compiles nothing" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const sealed_was = core.sealed;
+    defer core.sealed = sealed_was;
+    const k = 256;
+    const Run = struct {
+        fn at(rows: usize) !void {
+            const x_vals = try rampBuf(f32, rows * k, 2, -1);
+            defer std.testing.allocator.free(x_vals);
+            const x = hostArray(f32, x_vals, &.{ @intCast(rows), k }, .float32);
+            defer _ = mlx.mlx_array_free(x);
+            var xb: A = .{};
+            defer _ = mlx.mlx_array_free(xb);
+            try mlx.check(mlx.mlx_astype(&xb, x, .bfloat16, core.stream()));
+            var c: A = .{};
+            defer _ = mlx.mlx_array_free(c);
+            try mlx.check(mlx.mlx_cos(&c, x, core.stream()));
+            var sum: A = .{};
+            defer _ = mlx.mlx_array_free(sum);
+            try mlx.check(mlx.mlx_add(&sum, c, x, core.stream()));
+            const v_vals = try rampBuf(f32, k, 2, -1);
+            defer std.testing.allocator.free(v_vals);
+            const v = hostArray(f32, v_vals, &.{ k, 1 }, .float32);
+            defer _ = mlx.mlx_array_free(v);
+            var vb: A = .{};
+            defer _ = mlx.mlx_array_free(vb);
+            try mlx.check(mlx.mlx_astype(&vb, v, .bfloat16, core.stream()));
+            var o: A = .{};
+            defer _ = mlx.mlx_array_free(o);
+            try mlx.check(mlx.mlx_matmul(&o, xb, vb, core.stream()));
+            try mlx.check(mlx.mlx_array_eval(sum));
+            try mlx.check(mlx.mlx_array_eval(o));
+        }
+    };
+    core.sealed = false;
+    try Run.at(16);
+    core.sealed = true;
+    const late = core.pipelines_late;
+    core.late_names.clear();
+    for ([_]usize{ 300, 600, 2100, 4096, 8191 }) |rows| try Run.at(rows);
+    errdefer std.debug.print("engine kernels by size: compiled after the seal:\n{s}", .{core.late_names.text()});
+    try t_std.expectEqual(late, core.pipelines_late);
+}
+
 test "engine quantized matmul gives MLX's bytes at the tower's shapes: the GPU's tiles, aligned and not, 64 rows and 32, and the vector plans" {
     try mlx.requireGpu();
     const Build = struct {
@@ -5518,6 +5891,108 @@ test "engine gather_qmm in mxfp4 gives MLX's bytes at the routed experts' plans:
     try expectGather(&.{ 2, 40, 160 }, 8, 96, six[0..2], &.{2}, false, .bfloat16);
 }
 
+/// How a test's dense expert bank reaches `gather_mm`: as stored `[e, k, n]`, as the transposed view of a stored
+/// `[e, n, k]`, or as that view of the second half of a stored `[e, 2n, k]` (a fused gate and up bank).
+const BankView = enum { stored, transposed, half_transposed };
+
+fn gatherMmProduct(comptime view: BankView, comptime sorted: bool) type {
+    return struct {
+        fn product(s: S, in: []const A) !A {
+            var part: A = .{};
+            defer if (part.ctx != null) {
+                _ = mlx.mlx_array_free(part);
+            };
+            var w = in[1];
+            if (view == .half_transposed) {
+                const sh = mlx.getShape(in[1]);
+                try mlx.check(mlx.mlx_slice(&part, in[1], &[_]c_int{ 0, @divExact(sh[1], 2), 0 }, 3, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+                w = part;
+            }
+            var t: A = .{};
+            defer if (t.ctx != null) {
+                _ = mlx.mlx_array_free(t);
+            };
+            if (view != .stored) {
+                try mlx.check(mlx.mlx_transpose_axes(&t, w, &[_]c_int{ 0, 2, 1 }, 3, s));
+                w = t;
+            }
+            var o: A = .{};
+            try mlx.check(mlx.mlx_gather_mm(&o, in[0], w, .{}, in[2], sorted, s));
+            return o;
+        }
+    };
+}
+
+/// `x` (`dims`, the last one k) through `e` dense experts with `n` outputs, `view` as the bank reaches the product,
+/// picked by `ids` (`id_dims`): bytes and strides equal to MLX's.
+fn expectGatherMm(comptime view: BankView, dims: []const c_int, e: usize, n: usize, ids: []const u32, id_dims: []const c_int, dtype: mlx.mlx_dtype) !void {
+    var elems: usize = 1;
+    for (dims) |d| elems *= @intCast(d);
+    const k: c_int = dims[dims.len - 1];
+    const ec: c_int = @intCast(e);
+    const nc: c_int = @intCast(n);
+    const w_dims: [3]c_int = switch (view) {
+        .stored => .{ ec, k, nc },
+        .transposed => .{ ec, nc, k },
+        .half_transposed => .{ ec, 2 * nc, k },
+    };
+    const w_elems: usize = @intCast(w_dims[0] * w_dims[1] * w_dims[2]);
+    const x = try denseArray(elems, dims, 4, -2, dtype);
+    defer _ = mlx.mlx_array_free(x);
+    const w = try denseArray(w_elems, &w_dims, 0.5, -0.25, dtype);
+    defer _ = mlx.mlx_array_free(w);
+    const idx = hostArray(u32, ids, id_dims, .uint32);
+    defer _ = mlx.mlx_array_free(idx);
+    try expectSameLayout(gatherMmProduct(view, false).product, &.{ x, w, idx });
+}
+
+fn denseArray(n: usize, dims: []const c_int, scale: f32, shift: f32, dtype: mlx.mlx_dtype) !A {
+    if (dtype == .bfloat16) return bf16Array(n, dims, scale, shift);
+    const v = try rampBuf(f32, n, scale, shift);
+    defer std.testing.allocator.free(v);
+    return hostArray(f32, v, dims, .float32);
+}
+
+test "engine gather_mm gives MLX's bytes on every route a dense expert bank takes: the gather vector kernels both ways, the wide gather, the tiles" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const ids = try expertIds(18, 8, false);
+    defer a.free(ids);
+    // A decode row's gate and up from a fused bank, and its down over every pick (the default lhs): gemv_gather.
+    try expectGatherMm(.half_transposed, &.{ 3, 1, 1, 256 }, 8, 512, ids, &.{ 3, 6 }, .bfloat16);
+    try expectGatherMm(.transposed, &.{ 3, 6, 1, 256 }, 8, 512, ids, &.{ 3, 6 }, .bfloat16);
+    try expectGatherMm(.transposed, &.{ 1, 1, 1, 256 }, 8, 4096, ids[0..2], &.{ 1, 2 }, .bfloat16);
+    try expectGatherMm(.transposed, &.{ 1, 1, 1, 128 }, 8, 3, ids[0..2], &.{ 1, 2 }, .float32);
+    // A bank stored as it multiplies: gemv_t_gather, at each of its column blocks and a tiny output.
+    for ([_]usize{ 3, 256, 512, 2048 }) |n| try expectGatherMm(.stored, &.{ 2, 1, 1, 256 }, 8, n, ids[0..4], &.{ 2, 2 }, .bfloat16);
+    // Rows a pick: the wide gather at one and two passes, past it the tiles, both bank layouts, K off the tile.
+    for ([_]c_int{ 2, 4, 7, 15 }) |m| try expectGatherMm(.transposed, &.{ 2, m, 256 }, 8, 512, ids[0..2], &.{2}, .bfloat16);
+    try expectGatherMm(.transposed, &.{ 2, 40, 160 }, 8, 96, ids[0..2], &.{2}, .bfloat16);
+    try expectGatherMm(.stored, &.{ 2, 40, 160 }, 8, 96, ids[0..2], &.{2}, .bfloat16);
+    try expectGatherMm(.stored, &.{ 3, 16, 128 }, 8, 128, ids[0..3], &.{3}, .float32);
+}
+
+test "engine gather_mm refuses by name the sorted kernels of a one-row product" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const s = core.stream();
+    var buf: [512]u8 = undefined;
+    _ = mlx.takeError(&buf);
+    const x = try bf16Array(4 * 128, &.{ 4, 1, 128 }, 1, 0);
+    defer _ = mlx.mlx_array_free(x);
+    const w = try bf16Array(8 * 128 * 64, &.{ 8, 128, 64 }, 1, 0);
+    defer _ = mlx.mlx_array_free(w);
+    const idx = hostArray(u32, &.{ 0, 1, 1, 5 }, &.{4}, .uint32);
+    defer _ = mlx.mlx_array_free(idx);
+    var o: A = .{};
+    defer if (o.ctx != null) {
+        _ = mlx.mlx_array_free(o);
+    };
+    try expectRefused(mlx.mlx_gather_mm(&o, x, w, .{}, idx, true, s), "gather_mm", "sorted");
+}
+
 test "engine quantized products refuse by name and reason what MLX takes and the port does not, and a negative group or width" {
     try mlx.requireGpu();
     const was = enabled;
@@ -5680,6 +6155,63 @@ test "engine logical and and or give MLX's bytes on bool operands, broadcast, an
     defer _ = mlx.mlx_array_free(f);
     try expectSame(Build.of(mlx.mlx_logical_or), &.{ x, f });
     try expectSame(Build.of(mlx.mlx_logical_and), &.{ f, f });
+}
+
+test "engine remainder and a take without an axis give MLX's bytes: signed and float operands, a scalar divisor, an image splice's gather" {
+    try mlx.requireGpu();
+    const Build = struct {
+        fn binary(comptime f: anytype) fn (S, []const A) anyerror!A {
+            return struct {
+                fn build(s: S, in: []const A) anyerror!A {
+                    var o: A = .{};
+                    try mlx.check(f(&o, in[0], in[1], s));
+                    return o;
+                }
+            }.build;
+        }
+        fn takeFlat(s: S, in: []const A) !A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_take(&o, in[0], in[1], s));
+            return o;
+        }
+    };
+    const xi = ramp(i32, 257, 4000, -2000);
+    const yi = ramp(i32, 257, 37, 1);
+    const xa = hostArray(i32, &xi, &.{257}, .int32);
+    defer _ = mlx.mlx_array_free(xa);
+    const ya = hostArray(i32, &yi, &.{257}, .int32);
+    defer _ = mlx.mlx_array_free(ya);
+    var neg_y: [257]i32 = undefined;
+    for (&neg_y, yi) |*o, v| o.* = -v;
+    const yn = hostArray(i32, &neg_y, &.{257}, .int32);
+    defer _ = mlx.mlx_array_free(yn);
+    try expectSame(Build.binary(mlx.mlx_remainder), &.{ xa, ya });
+    try expectSame(Build.binary(mlx.mlx_remainder), &.{ xa, yn });
+    const divisor = mlx.mlx_array_new_int(60);
+    defer _ = mlx.mlx_array_free(divisor);
+    try expectSame(Build.binary(mlx.mlx_remainder), &.{ xa, divisor });
+    const xu = ramp(u32, 257, 4000, 0);
+    const xua = hostArray(u32, &xu, &.{257}, .uint32);
+    defer _ = mlx.mlx_array_free(xua);
+    const yu = ramp(u32, 257, 37, 1);
+    const yua = hostArray(u32, &yu, &.{257}, .uint32);
+    defer _ = mlx.mlx_array_free(yua);
+    try expectSame(Build.binary(mlx.mlx_remainder), &.{ xua, yua });
+    const xf = ramp(f32, 257, 40, -20);
+    const xfa = hostArray(f32, &xf, &.{257}, .float32);
+    defer _ = mlx.mlx_array_free(xfa);
+    const yf = ramp(f32, 257, 6, -3);
+    const yfa = hostArray(f32, &yf, &.{257}, .float32);
+    defer _ = mlx.mlx_array_free(yfa);
+    try expectSame(Build.binary(mlx.mlx_remainder), &.{ xfa, yfa });
+    // The splice's gather: a flat source read at indices taken modulo its size.
+    const src = ramp(f32, 60, 8, -4);
+    const sa = hostArray(f32, &src, &.{ 3, 4, 5 }, .float32);
+    defer _ = mlx.mlx_array_free(sa);
+    const idx = [_]i32{ 0, 59, 7, 7, 31, 12, 58, 1, 44 };
+    const ia = hostArray(i32, &idx, &.{ 3, 3 }, .int32);
+    defer _ = mlx.mlx_array_free(ia);
+    try expectSame(Build.takeFlat, &.{ sa, ia });
 }
 
 test "engine abs, logaddexp and floor divide give MLX's bytes: signed zeros and infinities, the router's softplus, unsigned quotients" {
@@ -6106,6 +6638,40 @@ test "engine binary ops, a concatenate and a where of two dtypes take MLX's prom
             if (!(divides and ints)) try expectNamed(std.fmt.bufPrint(&name, "{s} {s} {s}", .{ @tagName(da), p[0], @tagName(db) }) catch "pair", B.b2(p[1]), &.{ xs[i], yv[j] });
         }
     };
+    try t_std.expectEqual(@as(usize, 0), named_failures);
+}
+
+test "engine take_along and put_along read indices of every integer dtype, as MLX does" {
+    try mlx.requireGpu();
+    named_failures = 0;
+    const vals = ramp(f32, 4 * 13, 4, -2);
+    const table = hostArray(f32, &vals, &.{ 4, 13 }, .float32);
+    defer _ = mlx.mlx_array_free(table);
+    const picks = [_]i32{ 0, 12, 3, 7, 5, 1, 9, 2 };
+    const idx = hostArray(i32, &picks, &.{ 4, 2 }, .int32);
+    defer _ = mlx.mlx_array_free(idx);
+    const upd_vals = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const upd = hostArray(f32, &upd_vals, &.{ 4, 2 }, .float32);
+    defer _ = mlx.mlx_array_free(upd);
+    const B = struct {
+        fn takeAlong(s: S, in: []const A) anyerror!A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_take_along_axis(&o, in[0], in[1], -1, s));
+            return o;
+        }
+        fn putAlong(s: S, in: []const A) anyerror!A {
+            var o: A = .{};
+            try mlx.check(mlx.mlx_put_along_axis(&o, in[0], in[1], in[2], -1, s));
+            return o;
+        }
+    };
+    for ([_]mlx.mlx_dtype{ .uint8, .uint16, .uint32, .uint64, .int8, .int16, .int32, .int64 }) |d| {
+        const cast = try castByMlx(idx, d);
+        defer _ = mlx.mlx_array_free(cast);
+        var name: [48]u8 = undefined;
+        try expectNamed(std.fmt.bufPrint(&name, "take_along by {s}", .{@tagName(d)}) catch "take_along", B.takeAlong, &.{ table, cast });
+        try expectNamed(std.fmt.bufPrint(&name, "put_along by {s}", .{@tagName(d)}) catch "put_along", B.putAlong, &.{ table, cast, upd });
+    }
     try t_std.expectEqual(@as(usize, 0), named_failures);
 }
 

@@ -12,6 +12,7 @@ const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
 const registry = @import("registry.zig");
 const arch_config = @import("config.zig");
+const arch_state = @import("arch_state.zig");
 const pc = @import("../prefix_cache.zig");
 const kv_quant = @import("../kv_quant.zig");
 const model_handle = @import("../model_handle.zig");
@@ -29,7 +30,7 @@ const ForwardCtx = model_handle.ForwardCtx;
 const ModelConfig = model.ModelConfig;
 
 /// The request state a slot owns beside its KV cache (`arch_state.SlotRequest`).
-pub const NativeRequest = @import("arch_state.zig").SlotRequest;
+pub const NativeRequest = arch_state.SlotRequest;
 
 pub const ThoughtPoint = enum {
     off,
@@ -134,6 +135,8 @@ pub const CoolerRows = struct {
     rows: usize,
     /// Why the load serves one row; null when it serves more.
     why: ?[]const u8 = null,
+    /// What serving more rows costs or changes, for the load line; null when nothing.
+    note: ?[]const u8 = null,
 };
 
 const no_cooler_rows = "its arch declares no Cooler rows";
@@ -165,7 +168,7 @@ pub fn coolerRowsLine(buf: []u8, config: *const ModelConfig) ?[]const u8 {
 
 pub fn coolerRowsLineOf(buf: []u8, on_engine: bool, rows: CoolerRows) ?[]const u8 {
     if (!on_engine) return null;
-    if (rows.rows > 1) return std.fmt.bufPrint(buf, "[cooler] one forward carries {d} rows", .{rows.rows}) catch null;
+    if (rows.rows > 1) return std.fmt.bufPrint(buf, "[cooler] one forward carries {d} rows{s}{s}", .{ rows.rows, if (rows.note != null) "; " else "", rows.note orelse "" }) catch null;
     return std.fmt.bufPrint(buf, "[cooler] one forward carries one row: {s}", .{rows.why orelse no_cooler_rows}) catch null;
 }
 
@@ -282,7 +285,10 @@ pub fn rowsInCompany(slot: *const Slot, drafting: []const *Slot, plain: []const 
 pub fn initRequest(allocator: std.mem.Allocator, config: *const ModelConfig) !?NativeRequest {
     const tag = tagOfConfig(config) orelse return null;
     return switch (tag) {
-        inline else => |t| if (comptime has(t, "initRequest")) try S(t).initRequest(allocator, config) else null,
+        inline else => |t| if (comptime has(t, "initRequest") and arch_state.keepsRequest(t))
+            NativeRequest.of(t, try S(t).initRequest(allocator, config) orelse return null)
+        else
+            null,
     };
 }
 
@@ -418,6 +424,14 @@ pub fn restoreTarget(slot: *Slot, xfm: *Trunk) ?RestoreTarget {
     };
 }
 
+/// The restore `restoreTarget` named is over: an arch that lent it a state takes the lend back.
+pub fn restoreEnd(slot: *Slot, xfm: *Trunk) void {
+    const tag = tagOfModel(xfm) orelse return;
+    switch (tag) {
+        inline else => |t| if (comptime has(t, "restoreEnd")) S(t).restoreEnd(slot, xfm),
+    }
+}
+
 /// A write-through prefill chunk the arch stores its own way (true), or the generic hybrid write (false).
 pub fn writeThrough(
     hc: *pc.HotPrefixCache,
@@ -497,7 +511,7 @@ const known_hooks = [_][]const u8{
     "batchedForward",  "plannerObservesPlainRows",        "tickClass",                "mtpGroupable",    "initRequest",
     "checkKvQuant",    "coldLoadBill",  "modelStateBytes",                          "commitsAtCull",
     "prepareCommit",   "publishLive",   "commitOwn",      "cancelledNeedsCheckpoints", "handoffHistory",  "mtpHeadCommit",
-    "restoreTarget",   "writeThrough",  "nativeDflashArmed",                          "thoughtGrid",     "armThoughtPoint",
+    "restoreTarget",   "restoreEnd",    "writeThrough",  "nativeDflashArmed",                          "thoughtGrid",     "armThoughtPoint",
     "afterSpecBlock",  "endRequest",    "resetForRetry",  "flushResident",
     "logCheckpointsKept", "prepare_commit_label", "cancelled_entry_label",
 };
@@ -569,21 +583,27 @@ test "Cooler rows gate admission on a Cooler load only: one row batches nothing,
 test "Cooler rows: the load line names the rows, and at one row why; a load on MLX has none" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("[cooler] one forward carries 4 rows", coolerRowsLineOf(&buf, true, .{ .rows = 4 }).?);
+    try std.testing.expectEqualStrings("[cooler] one forward carries 4 rows; a cost", coolerRowsLineOf(&buf, true, .{ .rows = 4, .note = "a cost" }).?);
     try std.testing.expectEqualStrings("[cooler] one forward carries one row: its arch declares no Cooler rows", coolerRowsLineOf(&buf, true, .{ .rows = 1, .why = "its arch declares no Cooler rows" }).?);
     try std.testing.expect(coolerRowsLineOf(&buf, false, .{ .rows = 4 }) == null);
 }
 
-test "Cooler rows: a DeepSeek load serves one row, streamed or resident, and names why" {
+test "Cooler rows: a streamed DeepSeek load serves one row and names why; a fully resident one joins rows and names their cost" {
     var config = ModelConfig{ .model_type = "deepseek_v41" };
     if (registry.ofModelType(config.model_type) == null) return error.SkipZigTest;
     config.expert_streaming = true;
     const streamed = coolerRows(&config);
     try std.testing.expectEqual(@as(usize, 1), streamed.rows);
     try std.testing.expect(std.mem.indexOf(u8, streamed.why.?, "stream") != null);
-    config.expert_streaming = false;
+    // A resident plan still runs through the stream engine: the plan's answer is `expert_resident`.
+    config.expert_resident = true;
+    // Rows are Sushi Cooler's: a resident load on MLX keeps one row.
+    try std.testing.expectEqual(@as(usize, 1), coolerRows(&config).rows);
+    config.cooler_for_test = true;
     const resident = coolerRows(&config);
-    try std.testing.expectEqual(@as(usize, 1), resident.rows);
-    try std.testing.expect(std.mem.indexOf(u8, resident.why.?, "one request's decode state") != null);
+    try std.testing.expect(resident.rows >= 8);
+    try std.testing.expect(resident.why == null);
+    try std.testing.expect(std.mem.indexOf(u8, resident.note.?, "exact arm") != null);
 }
 
 test "only Flash-Next gates its long-context rules and caps its checkpoints; only the thinking-point archs arm one" {
@@ -646,11 +666,11 @@ test "a slot's own request state is billed, released and culled with no config t
     slot.request = null;
     try std.testing.expectEqual(@as(u64, 0), requestBytes(&slot));
     try std.testing.expect(!commitsAtCull(&slot));
-    slot.request = try NativeRequest.init(std.testing.allocator, 2);
+    slot.request = NativeRequest.of(.glm5, try arch_state.RequestType(.glm5).init(std.testing.allocator, 2));
     defer slot.request.?.deinit();
-    slot.request.?.offset = 4;
+    slot.request.?.as(.glm5).?.offset = 4;
     try std.testing.expectEqual(slot.request.?.residentBytes(), requestBytes(&slot));
     try std.testing.expect(commitsAtCull(&slot));
     releaseState(&slot);
-    try std.testing.expectEqual(@as(usize, 0), slot.request.?.offset);
+    try std.testing.expectEqual(@as(usize, 0), slot.request.?.as(.glm5).?.offset);
 }

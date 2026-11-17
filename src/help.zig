@@ -183,6 +183,13 @@ const shared =
     \\                        bound is inclusive (<n> itself still drafts)
     \\                        and it outranks `enable_mtp:true` in the
     \\                        request body.
+    \\  --drop-expert <n>   Never load or pick the n least-used routed experts of
+    \\                      every layer, ranked by the pack's expert_usage.json,
+    \\                      on a quantized pack that carries one and streams its
+    \\                      experts (n a multiple of 8; default 0 = off). A
+    \\                      token's pick moves to its next-best expert; the
+    \\                      memory bill shrinks by the dropped bytes. Answers
+    \\                      change, so score it with `sushi kld compare`.
     \\  --kv-quant <mode>   KV-cache quantization scheme:
     \\                        8, 6 or 4 — affine group quant; default 8 on
     \\                          every model but DeepSeek-V4.1, which has no

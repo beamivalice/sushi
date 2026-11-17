@@ -1,6 +1,7 @@
 //! Synthetic random banks for tests and the microbenches: test-only API, not part of the serving contract.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 const exl3 = @import("expert_exl3.zig");
 const root = @import("root.zig");
 
@@ -31,9 +32,9 @@ pub fn makeBank(rnd: std.Random, hidden: usize, inter: usize, n: [3]u32, experts
         for (su) |*v| v.* = exl3.f32ToF16Bits(if (rnd.boolean()) suh_mag else -suh_mag);
         for (sv) |*v| v.* = exl3.f32ToF16Bits(if (rnd.boolean()) svh_mag else -svh_mag);
         p.* = .{
-            .trellis = mlx.mlx_array_new_data(words.ptr, &shape, 4, .uint16),
-            .suh = mlx.mlx_array_new_data(su.ptr, &[_]c_int{ e, in_d }, 2, .float16),
-            .svh = mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ e, out_d }, 2, .float16),
+            .trellis = try host_side.made(mlx.mlx_array_new_data(words.ptr, &shape, 4, .uint16)),
+            .suh = try host_side.made(mlx.mlx_array_new_data(su.ptr, &[_]c_int{ e, in_d }, 2, .float16)),
+            .svh = try host_side.made(mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ e, out_d }, 2, .float16)),
         };
     }
     return bank;

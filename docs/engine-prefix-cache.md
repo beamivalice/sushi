@@ -65,8 +65,8 @@ over the enabled archs:
   its own (`TierRows`), trims and shares them through the wrapper, and the SSD flush writes them with the arch's own
   layout (`persistRows`); `keepThrough` drops the checkpoints past the rows.
 - **`CacheState`**: `HotPrefixCache.arch.<arch>` (DeepSeek's live-state record).
-- **`arraysOn(config)`**: the stream the arch's cached state lives on when it is not MLX's (DeepSeek on a Sushi Cooler
-  load: the engine's). The load sets it on the hot cache and the SSD tier as it arms them (`arrays_on`); from then it
+- **`arraysOn(config)`**: the stream a load's cached state lives on when it is not MLX's: a Sushi Cooler load's
+  (`cooler_side.stream`), the engine's. The load sets it on the hot cache and the SSD tier as it arms them (`arrays_on`); from then it
   outranks the stream a caller passes, the tier's reads build on it instead of MLX's CPU stream, and the maps and
   vectors a read or a write makes are of its side (`engine.enter`). On the content-addressed layer a tensor file then
   loads straight from its blocks into the engine's own tensors (`prefix_vfs_tensors.loadTensors`), the same names,
@@ -183,7 +183,7 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
 - **DeepSeek rolls its live state back before any stored restore** (`prefix_arch.rollbackLive` into
   `dsv41_prefix.rollbackLive`, `dsv41_prefix.Live` as `HotPrefixCache.arch.dsv41`; [dsv41-arch](dsv41-arch.md#prefix-cache)): the slot's last request keeps the fixed arrays of its
   deepest 8 points in RAM, and a prompt sharing its history rolls the model's state back to the deepest one it reaches
-  unless a stored point reaches further. Valid only while `Model.state_epoch` is unchanged and a request finished over it.
+  unless a stored point reaches further. Valid only while the model runs the `State.id` the record was published on and a request finished over it.
   Its off-grid points (prompt end, thought) are not written through; `flushLiveDsv41` writes them when the state is about to
   be lost (handover, unload, 300 s idle, shutdown). A crash restores from the last grid point.
 - **With both tiers on, a flushed ringed entry keeps only its newest two ring checkpoints in RAM**

@@ -333,7 +333,7 @@ fn writeAll(fd: std.c.fd_t, bytes: []const u8) !void {
 const testing = std.testing;
 
 fn bf16Rows(values: []const f32, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const f = mlx.mlx_array_new_data(values.ptr, shape.ptr, @intCast(shape.len), .float32);
+    const f = try mlx.newData(values.ptr, shape, .float32);
     defer _ = mlx.mlx_array_free(f);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);

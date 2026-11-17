@@ -349,7 +349,7 @@ pub fn tileMajorCopy(s: mlx.mlx_stream, src: *const Ragged) !Ragged {
                 at += len;
             }
         }
-        out.trellis[pi] = mlx.mlx_array_new_data(to.ptr, &[_]c_int{@intCast(to.len)}, 1, .uint16);
+        out.trellis[pi] = try host_side.made(mlx.mlx_array_new_data(to.ptr, &[_]c_int{@intCast(to.len)}, 1, .uint16));
     }
     out.meta = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_array_set(&out.meta, src.meta));
@@ -873,16 +873,14 @@ var fused_reduce_redo_kernel: ?mlx.mlx_fast_metal_kernel = null;
 pub var fused_shared_first: bool = false;
 
 /// One set for each side of the host: an array belongs to the side that made it.
-var zero_slot_rows: [2][kernels.DECODE_ROWS_MAX + 1]?mlx.mlx_array = @splat(@splat(null));
+var zero_slot_rows: @import("side_cache.zig").SideCache(usize, kernels.DECODE_ROWS_MAX + 1) = .{};
 
 /// The shared expert's slot ids: expert 0, once per row.
 fn zeroSlots(rows: usize) !mlx.mlx_array {
-    const slot = &zero_slot_rows[host_side.making()][rows];
-    if (slot.*) |a| return a;
+    const side = host_side.making();
+    if (zero_slot_rows.get(side, rows)) |a| return a;
     const zeros: [kernels.DECODE_ROWS_MAX]u32 = @splat(0);
-    const a = try host_side.made(mlx.mlx_array_new_data(&zeros, &[_]c_int{@intCast(rows)}, 1, .uint32));
-    slot.* = a;
-    return a;
+    return zero_slot_rows.put(side, rows, mlx.mlx_array_new_data(&zeros, &[_]c_int{@intCast(rows)}, 1, .uint32));
 }
 
 fn intArgs(alloc: std.mem.Allocator, pairs: anytype) ![]const fuse.IntArg {
@@ -1164,23 +1162,15 @@ const REDUCE_EXPAND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.met
     "");
 
 /// One for MLX's streams and one for the engine's: an array belongs to the side that made it.
-var unit_score: [2]?mlx.mlx_array = .{ null, null };
-
-/// Frees side `side`'s scalar (`host_side.of`).
-pub fn dropUnitScore(side: u1) void {
-    if (unit_score[side]) |a| _ = mlx.mlx_array_free(a);
-    unit_score[side] = null;
-}
+var unit_score: @import("side_cache.zig").SideCache(void, 1) = .{};
 
 fn unitScore(s: mlx.mlx_stream) !mlx.mlx_array {
-    const side = &unit_score[host_side.of(s)];
-    if (side.*) |a| return a;
+    const side = host_side.of(s);
+    if (unit_score.get(side, {})) |a| return a;
     const scope = host_side.enter(s);
     defer scope.end();
     const one: f32 = 1;
-    const a = try host_side.made(mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .float32));
-    side.* = a;
-    return a;
+    return unit_score.put(side, {}, mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .float32));
 }
 
 /// A settle's recomputed picks: their planes, and for each slot its row of `part` or -1.
@@ -1386,11 +1376,11 @@ pub fn moeDecodeClampedSharedRedo(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *cons
         at[p] = @intCast(j);
     }
     const nb: c_int = @intCast(bad.len);
-    const slots_b = mlx.mlx_array_new_data(&bad_slots, &[_]c_int{nb}, 1, .uint32);
+    const slots_b = try host_side.made(mlx.mlx_array_new_data(&bad_slots, &[_]c_int{nb}, 1, .uint32));
     defer _ = mlx.mlx_array_free(slots_b);
-    const rows_b = mlx.mlx_array_new_data(&bad_rows, &[_]c_int{nb}, 1, .int32);
+    const rows_b = try host_side.made(mlx.mlx_array_new_data(&bad_rows, &[_]c_int{nb}, 1, .int32));
     defer _ = mlx.mlx_array_free(rows_b);
-    const redo_at = mlx.mlx_array_new_data(&at, &[_]c_int{@intCast(n)}, 1, .int32);
+    const redo_at = try host_side.made(mlx.mlx_array_new_data(&at, &[_]c_int{@intCast(n)}, 1, .int32));
     defer _ = mlx.mlx_array_free(redo_at);
     var xr = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(xr);
@@ -1743,7 +1733,7 @@ fn groupWindows(s: mlx.mlx_stream, rb: *const Ragged, sorted: mlx.mlx_array, ord
     // The expert and group counts of a split bank change per chunk, so they ride in `count`, not the kernel name.
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "MAX_EXPERTS", @intCast(PREFILL_MAX_EXPERTS)));
     const nn = [2]u32{ @intCast(n), @intCast(rb.count) };
-    const count = mlx.mlx_array_new_data(&nn, &.{2}, 1, .uint32);
+    const count = try host_side.made(mlx.mlx_array_new_data(&nn, &.{2}, 1, .uint32));
     defer _ = mlx.mlx_array_free(count);
     const kernel = try kernels.getNamedKernel(&group_window_kernel, "sushi_exl3_rg_windows", &.{ "eids", "order", "count", "meta" }, &.{ "starts", "nlives", "inverse", "local" }, GROUP_WINDOW_SOURCE, "");
     const ov = try kernels.applyOuts(s, kernel, &.{ sorted, order, count, rb.meta }, cfg, 4);
@@ -2190,7 +2180,7 @@ fn prefillFused(stage: PrefillStage, g: PrefillGeo) !PrefillFused {
 
 fn applyPrefillFused(s: mlx.mlx_stream, f: PrefillFused, a: []const mlx.mlx_array, b: []const mlx.mlx_array, n_out: usize) !mlx.mlx_vector_array {
     defer _ = mlx.mlx_fast_metal_kernel_config_free(f.cfg);
-    const grid = mlx.mlx_array_new_data(&f.grid, &[_]c_int{f.grid.len}, 1, .uint32);
+    const grid = try host_side.made(mlx.mlx_array_new_data(&f.grid, &[_]c_int{f.grid.len}, 1, .uint32));
     defer _ = mlx.mlx_array_free(grid);
     var all: [32]mlx.mlx_array = undefined;
     @memcpy(all[0..a.len], a);
@@ -2406,9 +2396,9 @@ pub fn sharedPrefillSeparate(s: mlx.mlx_stream, x: mlx.mlx_array, se: SharedExpe
     defer _ = mlx.mlx_array_free(gf);
     const uf = try cast(s, u, .float32);
     defer _ = mlx.mlx_array_free(uf);
-    const lim = mlx.mlx_array_new_float(@floatFromInt(limit));
+    const lim = try host_side.made(mlx.mlx_array_new_float(@floatFromInt(limit)));
     defer _ = mlx.mlx_array_free(lim);
-    const neg = mlx.mlx_array_new_float(-@as(f32, @floatFromInt(limit)));
+    const neg = try host_side.made(mlx.mlx_array_new_float(-@as(f32, @floatFromInt(limit))));
     defer _ = mlx.mlx_array_free(neg);
     var gc = gf;
     var uc = uf;
@@ -2507,9 +2497,9 @@ const Fixture = struct {
                 f.svh[g][p] = sv;
                 const ci: c_int = @intCast(e);
                 projPtr(&f.banks[g], p).* = .{
-                    .trellis = mlx.mlx_array_new_data(w.ptr, &[_]c_int{ ci, @intCast(in_d / 16), @intCast(out_d / 16), @intCast(r[p]) }, 4, .uint16),
-                    .suh = mlx.mlx_array_new_data(su.ptr, &[_]c_int{ ci, @intCast(in_d) }, 2, .float16),
-                    .svh = mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ ci, @intCast(out_d) }, 2, .float16),
+                    .trellis = try host_side.made(mlx.mlx_array_new_data(w.ptr, &[_]c_int{ ci, @intCast(in_d / 16), @intCast(out_d / 16), @intCast(r[p]) }, 4, .uint16)),
+                    .suh = try host_side.made(mlx.mlx_array_new_data(su.ptr, &[_]c_int{ ci, @intCast(in_d) }, 2, .float16)),
+                    .svh = try host_side.made(mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ ci, @intCast(out_d) }, 2, .float16)),
                 };
             }
             f.experts += e;
@@ -2534,9 +2524,9 @@ const Fixture = struct {
         }
         f.score_vals = try alloc.alloc(f32, f.slot_ids.len);
         for (f.score_vals) |*v| v.* = 0.05 + rnd.float(f32) * 0.3;
-        f.x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(spec.rows), @intCast(spec.hidden) }, 2, .float16);
-        f.slots = mlx.mlx_array_new_data(f.slot_ids.ptr, &[_]c_int{@intCast(f.slot_ids.len)}, 1, .uint32);
-        f.scores = mlx.mlx_array_new_data(f.score_vals.ptr, &[_]c_int{@intCast(f.score_vals.len)}, 1, .float32);
+        f.x = try host_side.made(mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(spec.rows), @intCast(spec.hidden) }, 2, .float16));
+        f.slots = try host_side.made(mlx.mlx_array_new_data(f.slot_ids.ptr, &[_]c_int{@intCast(f.slot_ids.len)}, 1, .uint32));
+        f.scores = try host_side.made(mlx.mlx_array_new_data(f.score_vals.ptr, &[_]c_int{@intCast(f.score_vals.len)}, 1, .float32));
         return f;
     }
 
@@ -2578,7 +2568,7 @@ fn servedComposition(s: mlx.mlx_stream, f: *const Fixture, out_dtype: mlx.mlx_dt
         const g = f.rb.groupOf(e);
         const b = f.banks[g];
         const local: u32 = e - f.rb.base[g];
-        const one = mlx.mlx_array_new_data(&local, &[_]c_int{1}, 1, .uint32);
+        const one = try host_side.made(mlx.mlx_array_new_data(&local, &[_]c_int{1}, 1, .uint32));
         defer _ = mlx.mlx_array_free(one);
         var row = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(row);
@@ -3031,9 +3021,9 @@ fn sharedBankAt(rnd: std.Random, hidden: usize, inter: usize, n: u32, mags: [4]f
         for (su) |*v| v.* = exl3.f32ToF16Bits(if (rnd.boolean()) m[0] else -m[0]);
         for (sv) |*v| v.* = exl3.f32ToF16Bits(if (rnd.boolean()) m[1] else -m[1]);
         projPtr(&bank, p).* = .{
-            .trellis = mlx.mlx_array_new_data(words.ptr, &shape, 4, .uint16),
-            .suh = mlx.mlx_array_new_data(su.ptr, &[_]c_int{ 1, in_d }, 2, .float16),
-            .svh = mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ 1, out_d }, 2, .float16),
+            .trellis = try host_side.made(mlx.mlx_array_new_data(words.ptr, &shape, 4, .uint16)),
+            .suh = try host_side.made(mlx.mlx_array_new_data(su.ptr, &[_]c_int{ 1, in_d }, 2, .float16)),
+            .svh = try host_side.made(mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ 1, out_d }, 2, .float16)),
         };
     }
     return bank;
@@ -3049,9 +3039,9 @@ fn separateShared(s: mlx.mlx_stream, xb: mlx.mlx_array, rb: *const Ragged, slots
     try mlx.check(mlx.mlx_reshape(&x3, xb, &[_]c_int{ 1, rows, sh[1] }, 3, s));
     var zi: [16]i32 = @splat(0);
     var one: [16]f32 = @splat(1);
-    const zeros = mlx.mlx_array_new_data(&zi, &[_]c_int{ 1, rows, 1 }, 3, .int32);
+    const zeros = try host_side.made(mlx.mlx_array_new_data(&zi, &[_]c_int{ 1, rows, 1 }, 3, .int32));
     defer _ = mlx.mlx_array_free(zeros);
-    const ones = mlx.mlx_array_new_data(&one, &[_]c_int{ 1, rows, 1 }, 3, .float32);
+    const ones = try host_side.made(mlx.mlx_array_new_data(&one, &[_]c_int{ 1, rows, 1 }, 3, .float32));
     defer _ = mlx.mlx_array_free(ones);
     const sy3 = try root.moeClamped(s, x3, se.bank, zeros, ones, se.dec, limit);
     defer _ = mlx.mlx_array_free(sy3);
@@ -3134,11 +3124,11 @@ fn expandedReduceCase(t: std.mem.Allocator, s: mlx.mlx_stream, f: *const Fixture
     for (comb) |*v| v.* = rnd.float(f32);
     const r: c_int = @intCast(rows);
     const h: c_int = @intCast(hidden);
-    const xa = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ r, 4, h }, 3, .bfloat16);
+    const xa = try host_side.made(mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ r, 4, h }, 3, .bfloat16));
     defer _ = mlx.mlx_array_free(xa);
-    const pa = mlx.mlx_array_new_data(post.ptr, &[_]c_int{ r, 4 }, 2, .float32);
+    const pa = try host_side.made(mlx.mlx_array_new_data(post.ptr, &[_]c_int{ r, 4 }, 2, .float32));
     defer _ = mlx.mlx_array_free(pa);
-    const ca = mlx.mlx_array_new_data(comb.ptr, &[_]c_int{ r, 4, 4 }, 3, .float32);
+    const ca = try host_side.made(mlx.mlx_array_new_data(comb.ptr, &[_]c_int{ r, 4, 4 }, 3, .float32));
     defer _ = mlx.mlx_array_free(ca);
     const xb = try cast(s, f.x, .bfloat16);
     defer _ = mlx.mlx_array_free(xb);
@@ -3249,18 +3239,18 @@ fn redoCase(t: std.mem.Allocator, s: mlx.mlx_stream, hidden: usize, inter: usize
     defer t.free(zeros);
     @memset(zeros, 0);
     const r: c_int = @intCast(rows);
-    const xa = mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{ r, 4, @intCast(hidden) }, 3, .bfloat16);
+    const xa = try host_side.made(mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{ r, 4, @intCast(hidden) }, 3, .bfloat16));
     defer _ = mlx.mlx_array_free(xa);
-    const pa = mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{ r, 4 }, 2, .float32);
+    const pa = try host_side.made(mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{ r, 4 }, 2, .float32));
     defer _ = mlx.mlx_array_free(pa);
-    const ca = mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{ r, 4, 4 }, 3, .float32);
+    const ca = try host_side.made(mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{ r, 4, 4 }, 3, .float32));
     defer _ = mlx.mlx_array_free(ca);
     const stream_out: StreamExpand = .{ .x = xa, .post = pa, .comb = ca };
     for (cases) |bad| for ([_]bool{ false, true }) |folded| {
         var stale: [128]u32 = undefined;
         @memcpy(stale[0..n], f.slot_ids);
         for (bad) |p| stale[p] = (f.slot_ids[p] + 1) % f.experts;
-        const queued = mlx.mlx_array_new_data(&stale, &[_]c_int{@intCast(n)}, 1, .uint32);
+        const queued = try host_side.made(mlx.mlx_array_new_data(&stale, &[_]c_int{@intCast(n)}, 1, .uint32));
         defer _ = mlx.mlx_array_free(queued);
         var kept: Kept = .{};
         defer kept.deinit();

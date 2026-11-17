@@ -664,7 +664,7 @@ fn projectRoute(
         try mlx.check(mlx.mlx_matmul(&out[p], x, wt, s));
     }
     if (split.outputs() == 3 and split.v_scale != 1.0) {
-        const raw = mlx.mlx_array_new_float(split.v_scale);
+        const raw = try mlx.newFloat(split.v_scale);
         defer _ = mlx.mlx_array_free(raw);
         var scalar = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(scalar);
@@ -747,8 +747,8 @@ const TestWeight = struct {
             .n = n,
             .k = k,
             .split = split,
-            .w = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ @intCast(n), @intCast(k) }, 2, .uint8),
-            .sc = mlx.mlx_array_new_data(scales.ptr, &[_]c_int{ @intCast(srows), @intCast(k / BLOCK) }, 2, .float32),
+            .w = try mlx.newData(codes.ptr, &[_]c_int{ @intCast(n), @intCast(k) }, .uint8),
+            .sc = try mlx.newData(scales.ptr, &[_]c_int{ @intCast(srows), @intCast(k / BLOCK) }, .float32),
         };
     }
 
@@ -868,7 +868,7 @@ fn bf16Route(alloc: std.mem.Allocator, s: mlx.mlx_stream, tw: *const TestWeight,
         if (d.part != part) continue;
         for (0..tw.k) |j| bits[d.row * tw.k + j] = bf16Rne(tw.value(row, j));
     }
-    const wb = mlx.mlx_array_new_data(bits.ptr, &[_]c_int{ @intCast(rows), @intCast(tw.k) }, 2, .bfloat16);
+    const wb = try mlx.newData(bits.ptr, &[_]c_int{ @intCast(rows), @intCast(tw.k) }, .bfloat16);
     defer _ = mlx.mlx_array_free(wb);
     var wt = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wt);
@@ -880,7 +880,7 @@ fn bf16Route(alloc: std.mem.Allocator, s: mlx.mlx_stream, tw: *const TestWeight,
 }
 
 fn uploadX(s: mlx.mlx_stream, x: []const f32, m: usize, k: usize, dtype: mlx.mlx_dtype) !mlx.mlx_array {
-    const a = mlx.mlx_array_new_data(x.ptr, &[_]c_int{ 1, @intCast(m), @intCast(k) }, 3, .float32);
+    const a = try mlx.newData(x.ptr, &[_]c_int{ 1, @intCast(m), @intCast(k) }, .float32);
     defer _ = mlx.mlx_array_free(a);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -1308,17 +1308,17 @@ fn gpuRandomFp8(s: mlx.mlx_stream, split: RowSplit, k: c_int, seed: u64) !struct
     // Codes 0..253 skip both NaN encodings (0x7f, 0xff).
     var bits = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(bits);
-    const lo = mlx.mlx_array_new_int(0);
+    const lo = try mlx.newInt(0);
     defer _ = mlx.mlx_array_free(lo);
-    const hi = mlx.mlx_array_new_int(254);
+    const hi = try mlx.newInt(254);
     defer _ = mlx.mlx_array_free(hi);
     try mlx.check(mlx.mlx_random_randint(&bits, lo, hi, &[_]c_int{ n, k }, 2, .int32, k0, s));
-    const nan_lo = mlx.mlx_array_new_int(0x7f);
+    const nan_lo = try mlx.newInt(0x7f);
     defer _ = mlx.mlx_array_free(nan_lo);
     var is_nan = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(is_nan);
     try mlx.check(mlx.mlx_equal(&is_nan, bits, nan_lo, s));
-    const zero = mlx.mlx_array_new_int(0);
+    const zero = try mlx.newInt(0);
     defer _ = mlx.mlx_array_free(zero);
     var fixed = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(fixed);
@@ -1326,9 +1326,9 @@ fn gpuRandomFp8(s: mlx.mlx_stream, split: RowSplit, k: c_int, seed: u64) !struct
     var w = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(w);
     try mlx.check(mlx.mlx_astype(&w, fixed, .uint8, s));
-    const s_lo = mlx.mlx_array_new_float(2e-5);
+    const s_lo = try mlx.newFloat(2e-5);
     defer _ = mlx.mlx_array_free(s_lo);
-    const s_hi = mlx.mlx_array_new_float(1e-3);
+    const s_hi = try mlx.newFloat(1e-3);
     defer _ = mlx.mlx_array_free(s_hi);
     var u = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(u);

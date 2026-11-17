@@ -528,7 +528,7 @@ pub fn warmupMimoVerify(self: *Trunk, kv_config: KVQuantConfig) !MimoWarmRows {
     }
     if (self.config.swaRingTokens() > 0) sl.cache.setSwaRing(self.config.sliding_window);
     var prompt_ids: [8]i32 = undefined;
-    const prompt = Trunk.specWarmIds(&prompt_ids);
+    const prompt = try Trunk.specWarmIds(&prompt_ids);
     defer _ = mlx.mlx_array_free(prompt);
     Trunk.specWarmEvalFree(&[_]mlx.mlx_array{try self.forwardWith(&sl.ctx, prompt)});
     var warmed: MimoWarmRows = 0;
@@ -536,7 +536,7 @@ pub fn warmupMimoVerify(self: *Trunk, kv_config: KVQuantConfig) !MimoWarmRows {
     var rows: usize = 2;
     while (rows <= MIMO_VERIFY_ROWS_MAX) : (rows += 1) {
         var ids: [@intCast(MIMO_VERIFY_ROWS_MAX)]i32 = undefined;
-        const block = Trunk.specWarmIds(ids[0..rows]);
+        const block = try Trunk.specWarmIds(ids[0..rows]);
         defer _ = mlx.mlx_array_free(block);
         var last = mlx.mlx_array_new();
         var all = mlx.mlx_array_new();

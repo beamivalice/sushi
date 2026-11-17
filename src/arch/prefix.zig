@@ -196,6 +196,14 @@ pub fn headDigest(xfm: *trunk.Trunk, h: *std.crypto.hash.sha2.Sha256, st: mlx.ml
     }
 }
 
+/// A lookup may read the arch's state: an arch whose state is lent per request refuses one with none lent, before
+/// anything is touched.
+pub fn checkLent(s: State) !void {
+    switch (s) {
+        inline else => |p, t| if (comptime isVoid(@TypeOf(p))) unreachable else if (comptime @hasDecl(P(t), "checkLent")) try P(t).checkLent(p),
+    }
+}
+
 /// The request's state is about to be replaced: what the arch keeps of the last one reaches SSD first.
 pub fn handover(hc: *pc.HotPrefixCache, s: State, st: mlx.mlx_stream) void {
     switch (s) {
@@ -275,9 +283,9 @@ pub fn restorePointModel(xfm: *trunk.Trunk) bool {
 
 /// A prefill checkpoint of a restore-point model at `pos`; `to_ssd` says a write-through takes it before the next
 /// forward, so the arch may share its rows. Null for a model that checkpoints by other means.
-pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *trunk.Trunk, pos: usize, to_ssd: bool) !?trunk.SSMCheckpoint {
+pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *trunk.Trunk, ctx: *const trunk.ForwardCtx, pos: usize, to_ssd: bool) !?trunk.SSMCheckpoint {
     switch (registry.handleOf(xfm)) {
-        inline else => |m, t| return if (comptime @hasDecl(P(t), "captureCheckpoint")) try P(t).captureCheckpoint(allocator, m, pos, to_ssd) else null,
+        inline else => |m, t| return if (comptime @hasDecl(P(t), "captureCheckpoint")) try P(t).captureCheckpoint(allocator, m, ctx, pos, to_ssd) else null,
     }
 }
 
@@ -297,13 +305,8 @@ pub fn diskCheckpointCap(config: *const model.ModelConfig) ?u32 {
     }
 }
 
-/// The stream the arch's cached state lives on when it is not MLX's; null for MLX's own.
-pub fn arraysOn(config: *const model.ModelConfig) ?mlx.mlx_stream {
-    const tag = registry.ofModelType(config.model_type) orelse return null;
-    switch (tag) {
-        inline else => |t| return if (comptime @hasDecl(P(t), "arraysOn")) P(t).arraysOn(config) else null,
-    }
-}
+/// The stream a prefix cache's arrays live on: a Cooler load's side (`cooler_side`), null for MLX's.
+pub const arraysOn = @import("../cooler_side.zig").stream;
 
 /// Tells the SSD tier how the arch's restore points split into rows that grow with the prompt and fixed arrays.
 pub fn setDiskGrownSpec(allocator: std.mem.Allocator, config: *const model.ModelConfig, tier: *kv_disk_cache.DiskTier) !void {
@@ -313,8 +316,8 @@ pub fn setDiskGrownSpec(allocator: std.mem.Allocator, config: *const model.Model
     }
 }
 
-// The hooks below serve the arch whose slots keep a request beside the KV (`arch_state.SlotRequest`); every call
-// sits behind a non-null request, so a build with no such arch never reaches one.
+// The hooks below serve the archs whose prefill checkpoints a slot request (`captureRequest`); every call sits behind
+// a request `prefillRequest` returned, so a build with no such arch never reaches one.
 fn requestHook(comptime name: []const u8, comptime R: type, args: anytype) R {
     inline for (tags) |t| {
         if (comptime @hasDecl(P(t), name)) return @call(.auto, @field(P(t), name), args);
@@ -322,15 +325,33 @@ fn requestHook(comptime name: []const u8, comptime R: type, args: anytype) R {
     @panic("no arch keeps a slot request");
 }
 
+/// The forward context's request when its arch's prefill chunks and checkpoints by it; null otherwise (an arch whose
+/// restore points come from its model, `captureCheckpoint`, keeps its request out of the prefill loop).
+pub fn prefillRequest(ctx: *const trunk.ForwardCtx) ?arch_state.RequestRef {
+    const request = arch_state.requestOf(ctx) orelse return null;
+    switch (request.arch()) {
+        inline else => |t| return if (comptime @hasDecl(P(t), "captureRequest")) request else null,
+    }
+}
+
 /// A prefill checkpoint of the request at absolute `pos`.
-pub fn captureRequest(allocator: std.mem.Allocator, request: *arch_state.SlotRequest, pos: usize, s: mlx.mlx_stream) !trunk.SSMCheckpoint {
-    return requestHook("captureRequest", anyerror!trunk.SSMCheckpoint, .{ allocator, request, pos, s });
+pub fn captureRequest(allocator: std.mem.Allocator, request: arch_state.RequestRef, pos: usize, s: mlx.mlx_stream) !trunk.SSMCheckpoint {
+    if (comptime arch_state.request_archs.len == 0) unreachable;
+    switch (request.member) {
+        inline else => |r, m| {
+            const t = @field(Tag, @tagName(m));
+            if (comptime !@hasDecl(P(t), "captureRequest")) unreachable;
+            return P(t).captureRequest(allocator, r, pos, s);
+        },
+    }
 }
 
 /// Whether a checkpoint may be kept at `pos`: any position without a request, the arch's own boundaries with one.
-pub fn restorableCheckpoint(request: ?*arch_state.SlotRequest, pos: usize) bool {
-    if (request == null) return true;
-    return requestHook("restorableAt", bool, .{pos});
+pub fn restorableCheckpoint(request: ?arch_state.RequestRef, pos: usize) bool {
+    const r = request orelse return true;
+    switch (r.arch()) {
+        inline else => |t| return if (comptime @hasDecl(P(t), "restorableAt")) P(t).restorableAt(pos) else true,
+    }
 }
 
 /// The absolute-position grid a request's prefill chunks on.

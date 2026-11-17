@@ -68,6 +68,7 @@ test {
     _ = @import("trunk.zig");
     _ = @import("model_handle.zig");
     _ = @import("mlx_util.zig");
+    _ = @import("arm_trial.zig");
     _ = @import("trunk_helpers_test.zig");
     _ = @import("vision.zig");
     _ = @import("vision_common.zig");
@@ -101,6 +102,7 @@ test {
     _ = @import("dflash_policy.zig");
     _ = @import("dflash_conv.zig");
     _ = @import("sampler_draw.zig");
+    _ = @import("transient_peak.zig");
     _ = @import("dflash_qmv.zig");
     _ = @import("mtp.zig");
     _ = @import("mtp_qmv.zig");

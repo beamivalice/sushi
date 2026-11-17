@@ -21,13 +21,19 @@ const io_util = @import("../io_util.zig");
 // ─────────────────────────────────────────────────────────────────────────────
 /// Transient GPU bytes one image's encode needs on top of the resident tower, at
 /// `n_patches` patches. The stream is evaluated per block, so the peak is one
-/// block: its f32 score sheet (heads x N^2) and its row activations. Covers the
-/// measured peak (`qwen vision ubench`) by >= 25% from 196 to 9216 patches.
+/// block: its f32 score sheets (heads x N^2) and its row activations. On MLX the
+/// lazy graph reuses a sheet's buffer (`qwen vision ubench`); the engine runs each
+/// op as it is built and holds four sheets' worth in its pool (the served-widths test).
+/// Either covers its measured peak by >= 25%.
 pub fn encodeScratchBytes(config: *const ModelConfig, n_patches: u64) u64 {
-    const heads: u64 = @max(config.qv_heads, 1);
-    const scores = 4 * heads * n_patches * n_patches;
-    const per_patch: u64 = 4 * (12 * @as(u64, config.qv_hidden) + 3 * @as(u64, config.qv_intermediate));
-    return (32 << 20) + scores * 13 / 10 + n_patches * per_patch;
+    return scratchOf(config.qv_heads, config.qv_hidden, config.qv_intermediate, @import("../cooler_side.zig").onEngine(config), n_patches);
+}
+
+fn scratchOf(heads: u32, hidden: u32, intermediate: u32, on_engine: bool, n_patches: u64) u64 {
+    const scores = 4 * @as(u64, @max(heads, 1)) * n_patches * n_patches;
+    const per_patch: u64 = 4 * (12 * @as(u64, hidden) + 3 * @as(u64, intermediate));
+    const sheets = if (on_engine) scores * 4 else scores * 13 / 10;
+    return (32 << 20) + sheets + n_patches * per_patch;
 }
 
 // Qwen3-VL ViT encoder. Mirrors mlx-vlm qwen3_vl/vision.py for a SINGLE still
@@ -124,6 +130,8 @@ const Load = struct {
 
 pub const QwenVision = struct {
     s: mlx.mlx_stream,
+    /// The tower runs on Sushi Cooler, the engine of our own: the load's side (`cooler_side`), decided at its init.
+    own: bool = false,
     allocator: std.mem.Allocator,
     /// Evaluate the stream after every block and the output at the end, so one
     /// block's buffers are the encode's peak (`encodeScratchBytes`).
@@ -133,6 +141,7 @@ pub const QwenVision = struct {
     hidden: u32,
     heads: u32,
     head_dim: u32,
+    intermediate: u32,
     merge: u32,
     num_grid_per_side: u32, // = sqrt(num_position_embeddings), e.g. 48
     out_hidden: u32,
@@ -158,12 +167,16 @@ pub const QwenVision = struct {
 
     /// `quantize` false keeps every matrix bf16 (parity tests against the reference).
     pub fn initWith(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, quantize: bool) !QwenVision {
-        // A Cooler load runs nothing on MLX, and the engine does not run this tower: the load is refused, never split.
-        if (@import("qwen4_cooler.zig").ownDecode(&config)) {
-            log.err("[vision] Sushi Cooler does not run the Qwen3.8 vision tower yet; --no-vision or --qwen-mlx-engine serves this pack\n", .{});
-            return error.VisionTowerNotPorted;
-        }
-        const s = mlx.mlx_default_gpu_stream_new();
+        // A Cooler load runs its tower on the engine too, never split: every op below takes the engine's stream.
+        const own = @import("../cooler_side.zig").onEngine(&config);
+        if (own and !mlx.engine.enabled) return error.EngineNotEnabled;
+        // The requantization's kernels are this load's to make, as the warm's are.
+        const making = @import("../arch/cooler.zig").making(own);
+        defer if (making) |seal| seal.end();
+        const s = if (own) mlx.engine.stream() else mlx.mlx_default_gpu_stream_new();
+        errdefer if (!own) {
+            _ = mlx.mlx_stream_free(s);
+        };
         var buf: [256]u8 = undefined;
         var kbuf: [256]u8 = undefined;
 
@@ -197,6 +210,7 @@ pub const QwenVision = struct {
         };
         log.info("[vision] qwen patch_embed layout: {s}\n", .{@tagName(layout)});
         var patch_w = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(patch_w);
         {
             const flat_shape = [_]c_int{ out_c, flat_in };
             switch (layout) {
@@ -206,6 +220,9 @@ pub const QwenVision = struct {
                     defer _ = mlx.mlx_array_free(transposed);
                     try mlx.check(mlx.mlx_transpose_axes(&transposed, conv_w, &perm, 5, s));
                     try mlx.check(mlx.mlx_reshape(&patch_w, transposed, &flat_shape, 2, s));
+                    // The flattened copy replaces the stored weight, which the resident bill names once.
+                    try mlx.check(mlx.mlx_array_eval(patch_w));
+                    if (weights.take(fmtKey(&kbuf, prefix, "patch_embed.proj.weight"))) |stored| _ = mlx.mlx_array_free(stored);
                 },
                 // Already [out, C, kT, ps, ps] — flatten as-is.
                 .channels_first => try mlx.check(mlx.mlx_reshape(&patch_w, conv_w, &flat_shape, 2, s)),
@@ -236,11 +253,13 @@ pub const QwenVision = struct {
 
         var self = QwenVision{
             .s = s,
+            .own = own,
             .allocator = allocator,
             .depth = depth,
             .hidden = config.qv_hidden,
             .heads = config.qv_heads,
             .head_dim = config.qv_head_dim,
+            .intermediate = config.qv_intermediate,
             .merge = config.qv_merge,
             .num_grid_per_side = @intFromFloat(@sqrt(@as(f64, @floatFromInt(config.qv_num_pos_emb)))),
             .out_hidden = config.qv_out_hidden,
@@ -291,13 +310,15 @@ pub const QwenVision = struct {
         self.release();
         _ = mlx.mlx_array_free(self.patch_w);
         self.allocator.free(self.blocks);
+        if (!self.own) _ = mlx.mlx_stream_free(self.s);
     }
 
-    fn bf16Scalar(self: *QwenVision, v: f32) mlx.mlx_array {
-        const f = mlx.mlx_array_new_float(v);
+    fn bf16Scalar(self: *QwenVision, v: f32) !mlx.mlx_array {
+        const f = try mlx.newFloat(v);
         defer _ = mlx.mlx_array_free(f);
         var out = mlx.mlx_array_new();
-        _ = mlx.mlx_astype(&out, f, .bfloat16, self.s);
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, self.s));
         return out;
     }
 
@@ -332,15 +353,15 @@ pub const QwenVision = struct {
 
     /// nn.GELU(approx="tanh"): 0.5·x·(1+tanh(√(2/π)·(x+0.044715·x³))).
     fn geluTanh(self: *QwenVision, x: mlx.mlx_array) !mlx.mlx_array {
-        const c_coeff = self.bf16Scalar(0.7978845608028654);
+        const c_coeff = try self.bf16Scalar(0.7978845608028654);
         defer _ = mlx.mlx_array_free(c_coeff);
-        const c_inner = self.bf16Scalar(0.044715);
+        const c_inner = try self.bf16Scalar(0.044715);
         defer _ = mlx.mlx_array_free(c_inner);
-        const c_three = self.bf16Scalar(3.0);
+        const c_three = try self.bf16Scalar(3.0);
         defer _ = mlx.mlx_array_free(c_three);
-        const c_one = self.bf16Scalar(1.0);
+        const c_one = try self.bf16Scalar(1.0);
         defer _ = mlx.mlx_array_free(c_one);
-        const c_half = self.bf16Scalar(0.5);
+        const c_half = try self.bf16Scalar(0.5);
         defer _ = mlx.mlx_array_free(c_half);
 
         var x3 = mlx.mlx_array_new();
@@ -372,11 +393,11 @@ pub const QwenVision = struct {
 
     /// nn.GELU() exact: 0.5·x·(1+erf(x/√2)). Used by the PatchMerger.
     fn geluExact(self: *QwenVision, x: mlx.mlx_array) !mlx.mlx_array {
-        const inv_sqrt2 = self.bf16Scalar(0.7071067811865476);
+        const inv_sqrt2 = try self.bf16Scalar(0.7071067811865476);
         defer _ = mlx.mlx_array_free(inv_sqrt2);
-        const c_one = self.bf16Scalar(1.0);
+        const c_one = try self.bf16Scalar(1.0);
         defer _ = mlx.mlx_array_free(c_one);
-        const c_half = self.bf16Scalar(0.5);
+        const c_half = try self.bf16Scalar(0.5);
         defer _ = mlx.mlx_array_free(c_half);
         var t = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(t);
@@ -499,13 +520,15 @@ pub const QwenVision = struct {
         }
 
         const shape = [_]c_int{ @intCast(n), 1, @intCast(hd) };
-        const cos_f = mlx.mlx_array_new_data(cos_buf.ptr, &shape, 3, .float32);
+        const cos_f = try mlx.newData(cos_buf.ptr, &shape, .float32);
         defer _ = mlx.mlx_array_free(cos_f);
-        const sin_f = mlx.mlx_array_new_data(sin_buf.ptr, &shape, 3, .float32);
+        const sin_f = try mlx.newData(sin_buf.ptr, &shape, .float32);
         defer _ = mlx.mlx_array_free(sin_f);
         var cos = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(cos);
         try mlx.check(mlx.mlx_astype(&cos, cos_f, .bfloat16, self.s));
         var sin = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(sin);
         try mlx.check(mlx.mlx_astype(&sin, sin_f, .bfloat16, self.s));
         return .{ .cos = cos, .sin = sin };
     }
@@ -537,30 +560,20 @@ pub const QwenVision = struct {
             }
         }.f;
 
-        const ha = try mkAxis(self.allocator, grid_h, G);
-        defer {
-            self.allocator.free(ha.floor);
-            self.allocator.free(ha.ceil);
-            self.allocator.free(ha.frac);
-        }
-        const wa = try mkAxis(self.allocator, grid_w, G);
-        defer {
-            self.allocator.free(wa.floor);
-            self.allocator.free(wa.ceil);
-            self.allocator.free(wa.frac);
-        }
+        // The host scratch of one call, freed whole on every path.
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const ha = try mkAxis(sa, grid_h, G);
+        const wa = try mkAxis(sa, grid_w, G);
 
         // Four corner index arrays + weights, emitted directly in merge-block order.
         var idx: [4][]i32 = undefined;
         var wgt: [4][]f32 = undefined;
         inline for (0..4) |c| {
-            idx[c] = try self.allocator.alloc(i32, n);
-            wgt[c] = try self.allocator.alloc(f32, n);
+            idx[c] = try sa.alloc(i32, n);
+            wgt[c] = try sa.alloc(f32, n);
         }
-        defer inline for (0..4) |c| {
-            self.allocator.free(idx[c]);
-            self.allocator.free(wgt[c]);
-        };
 
         var token: usize = 0;
         var bh: usize = 0;
@@ -600,12 +613,12 @@ pub const QwenVision = struct {
         errdefer _ = mlx.mlx_array_free(acc);
         var first = true;
         inline for (0..4) |c| {
-            const ix = mlx.mlx_array_new_data(idx[c].ptr, &idx_shape, 1, .int32);
+            const ix = try mlx.newData(idx[c].ptr, &idx_shape, .int32);
             defer _ = mlx.mlx_array_free(ix);
             var gathered = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gathered);
             try mlx.check(mlx.mlx_take_axis(&gathered, self.pos_embed, ix, 0, self.s)); // [N, hidden]
-            const wf = mlx.mlx_array_new_data(wgt[c].ptr, &wshape, 2, .float32);
+            const wf = try mlx.newData(wgt[c].ptr, &wshape, .float32);
             defer _ = mlx.mlx_array_free(wf);
             var wbf = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(wbf);
@@ -628,6 +641,11 @@ pub const QwenVision = struct {
         return acc;
     }
 
+    fn dropSheet(_: *QwenVision, sheet: *mlx.mlx_array) void {
+        _ = mlx.mlx_array_free(sheet.*);
+        sheet.* = .{ .ctx = null };
+    }
+
     /// Self-attention over all patches (single image → full bidirectional).
     fn attention(self: *QwenVision, normed: mlx.mlx_array, blk: QBlock, cos: mlx.mlx_array, sin: mlx.mlx_array, n: c_int) !mlx.mlx_array {
         const hd: c_int = @intCast(self.head_dim);
@@ -642,6 +660,10 @@ pub const QwenVision = struct {
 
         const sl_strides = [_]c_int{ 1, 1, 1, 1 };
         var parts: [3]mlx.mlx_array = undefined;
+        var made: usize = 0;
+        defer for (parts[0..made]) |p| {
+            _ = mlx.mlx_array_free(p);
+        };
         inline for (0..3) |j| {
             const start = [_]c_int{ 0, @intCast(j), 0, 0 };
             const stop = [_]c_int{ n, @intCast(j + 1), heads, hd };
@@ -649,13 +671,10 @@ pub const QwenVision = struct {
             defer _ = mlx.mlx_array_free(sliced);
             try mlx.check(mlx.mlx_slice(&sliced, r, &start, 4, &stop, 4, &sl_strides, 4, self.s));
             const flat = [_]c_int{ n, heads, hd };
-            var part = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_reshape(&part, sliced, &flat, 3, self.s));
-            parts[j] = part; // [N, heads, hd]
+            parts[j] = mlx.mlx_array_new(); // [N, heads, hd]
+            made += 1;
+            try mlx.check(mlx.mlx_reshape(&parts[j], sliced, &flat, 3, self.s));
         }
-        defer for (parts) |p| {
-            _ = mlx.mlx_array_free(p);
-        };
 
         const q_rope = try self.applyVisionRope(parts[0], cos, sin, n, hd);
         defer _ = mlx.mlx_array_free(q_rope);
@@ -685,20 +704,26 @@ pub const QwenVision = struct {
         var kt = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(kt);
         try mlx.check(mlx.mlx_transpose_axes(&kt, kh, &kperm, 3, self.s));
-        var scores = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(scores);
-        try mlx.check(mlx.mlx_matmul(&scores, qh, kt, self.s));
-        const scale = mlx.mlx_array_new_float(1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim))));
+        // Each [heads, N, N] f32 sheet goes as soon as the next is made. The engine runs every op as it is built and
+        // reuses a buffer only once its pass has run, so there each step is evaluated: two sheets at a time, not four.
+        var sheets: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+        defer for (sheets) |sh| {
+            if (sh.ctx != null) _ = mlx.mlx_array_free(sh);
+        };
+        try mlx.check(mlx.mlx_matmul(&sheets[0], qh, kt, self.s)); // scores
+        if (self.own) try mlx.check(mlx.mlx_array_eval(sheets[0]));
+        const scale = try mlx.newFloat(1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim))));
         defer _ = mlx.mlx_array_free(scale);
-        var scaled = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(scaled);
-        try mlx.check(mlx.mlx_multiply(&scaled, scores, scale, self.s));
-        var probs = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(probs);
-        try mlx.check(mlx.mlx_softmax_axis(&probs, scaled, -1, true, self.s));
+        try mlx.check(mlx.mlx_multiply(&sheets[1], sheets[0], scale, self.s)); // scaled
+        self.dropSheet(&sheets[0]);
+        if (self.own) try mlx.check(mlx.mlx_array_eval(sheets[1]));
+        try mlx.check(mlx.mlx_softmax_axis(&sheets[2], sheets[1], -1, true, self.s)); // probs
+        self.dropSheet(&sheets[1]);
+        if (self.own) try mlx.check(mlx.mlx_array_eval(sheets[2]));
         var ctx32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ctx32);
-        try mlx.check(mlx.mlx_matmul(&ctx32, probs, vh, self.s)); // [heads, N, hd] f32
+        try mlx.check(mlx.mlx_matmul(&ctx32, sheets[2], vh, self.s)); // [heads, N, hd] f32
+        self.dropSheet(&sheets[2]);
         var ctx = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ctx);
         try mlx.check(mlx.mlx_astype(&ctx, ctx32, .bfloat16, self.s));
@@ -715,10 +740,74 @@ pub const QwenVision = struct {
         return self.denseLinear(flat, blk.proj_w, blk.proj_b, blk.proj_q);
     }
 
+    /// Patch counts whose blocks (N rows) and merger (N/4) reach every plan the engine picks for the tower's products:
+    /// the vector kernels, split-K and whole tiles, N aligned and not; and a two-group video for the join.
+    const warm_patches = [_]u32{ 4, 16, 60, 64, 256, 1020, 1024 };
+    /// Warms that ran in this process: a test reads it to see that a load from a manifest ran none.
+    pub var warms: u32 = 0;
+
+    /// A Cooler load's tower, before the load seals: one block at each of `warm_patches`, so an image compiles nothing
+    /// inside a request. A manifest of the tower's key that holds the warm makes its pipelines instead.
+    pub fn warmEngine(self: *QwenVision) !void {
+        if (!self.own or self.blocks.len == 0) return;
+        var key_buf: [96]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}/{d}.{d}.{d}.{d}.{d}/w1", .{ if (self.blocks[0].qkv_q != null) "q8" else "bf16", self.hidden, self.heads, self.intermediate, self.merge, self.out_hidden }) catch return error.TensorShape;
+        if (mlx.engine.pipeline_registry.takeMarker(key)) {
+            log.info("[vision] engine tower: pipelines made from the manifest, no warm\n", .{});
+            return;
+        }
+        warms += 1;
+        const making = @import("../arch/cooler.zig").making(true).?;
+        defer making.end();
+        var clock = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
+        const made_before = mlx.engine.pipelinesMade().count;
+        const feat: usize = @intCast(mlx.getShape(self.patch_w)[1]);
+        const all = self.blocks;
+        self.blocks = all[0..1];
+        defer self.blocks = all;
+        for (warm_patches ++ [_]u32{0}) |n_or_video| {
+            const video = n_or_video == 0;
+            const n: u32 = if (video) 2 * self.merge * self.merge else n_or_video;
+            const zeros = try self.allocator.alloc(f32, n * feat);
+            defer self.allocator.free(zeros);
+            @memset(zeros, 0);
+            // The engine's own array, made between forwards: the pool's cap rises by it until the encode's replaces it.
+            mlx.engine.room(&.{zeros.len * @sizeOf(f32)});
+            const patches = blk: {
+                const scope = mlx.engine.enter(self.s);
+                defer scope.end();
+                break :blk try mlx.newData(zeros.ptr, &[_]c_int{ @intCast(n), @intCast(feat) }, .float32);
+            };
+            defer _ = mlx.mlx_array_free(patches);
+            const out = if (video) try self.forwardVideo(patches, 2, self.merge, self.merge) else try self.forward(patches, n / self.merge, self.merge);
+            _ = mlx.mlx_array_free(out);
+        }
+        mlx.engine.trim();
+        log.info("[vision] engine tower warmed: {d} pipelines, {d} ms\n", .{ mlx.engine.pipelinesMade().count - made_before, clock.read() / std.time.ns_per_ms });
+        mlx.engine.pipeline_registry.recordMarker("vision tower", key);
+        @import("../arch/cooler_pipelines.zig").rewriteLate();
+    }
+
     /// Encode one image. `patches` = pixel_values [N, C*tps*ps*ps] (merge order).
+
+    /// The engine's stream when the tower runs there: where its caller makes patch arrays and joins spans.
+    pub fn ownStream(self: *const QwenVision) ?mlx.mlx_stream {
+        return if (self.own) self.s else null;
+    }
+
     pub fn forward(self: *QwenVision, patches: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+        // On the engine its ops take over the pass, and an MLX stream among them is refused by name.
+        const run: ?mlx.engine.Makers = if (self.own) mlx.engine.makers(true) else null;
+        defer if (run) |made| made.end();
         const n: c_int = @intCast(grid_h * grid_w);
+        // On the engine the encode runs inside its bill: an over-run is a named refusal, never a Metal OOM.
+        if (self.own) try mlx.engine.budget(scratchOf(self.heads, self.hidden, self.intermediate, true, @intCast(n)));
+        defer if (self.own) mlx.engine.budget(std.math.maxInt(u64)) catch {};
+        // The residual: replaced in place, and freed on any failure.
         var x = mlx.mlx_array_new();
+        errdefer if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
         try mlx.check(mlx.mlx_astype(&x, patches, .bfloat16, self.s));
 
         // patch_embed (Linear) + interpolated pos_embed.
@@ -776,6 +865,7 @@ pub const QwenVision = struct {
         // Merger: LayerNorm(hidden) → reshape [N/merge², hidden·merge²] → fc2(gelu(fc1)).
         const normed = try self.layerNorm6(x, self.merger_norm_w, self.merger_norm_b);
         _ = mlx.mlx_array_free(x);
+        x = .{ .ctx = null };
         defer _ = mlx.mlx_array_free(normed);
         const merge2: c_int = @intCast(self.merge * self.merge);
         const n_merged = @divExact(n, merge2);
@@ -808,6 +898,8 @@ pub const QwenVision = struct {
     /// only and already correct per group), concatenating the merged token
     /// outputs along the token axis.
     pub fn forwardVideo(self: *QwenVision, patches: mlx.mlx_array, grid_t: u32, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+        const run: ?mlx.engine.Makers = if (self.own) mlx.engine.makers(true) else null;
+        defer if (run) |made| made.end();
         std.debug.assert(grid_t > 0);
         if (grid_t == 1) return self.forward(patches, grid_h, grid_w);
 
@@ -819,7 +911,9 @@ pub const QwenVision = struct {
         var parts = try self.allocator.alloc(mlx.mlx_array, grid_t);
         defer self.allocator.free(parts);
         var built: usize = 0;
-        errdefer for (parts[0..built]) |p| { _ = mlx.mlx_array_free(p); };
+        defer for (parts[0..built]) |p| {
+            _ = mlx.mlx_array_free(p);
+        };
 
         var t: u32 = 0;
         while (t < grid_t) : (t += 1) {
@@ -833,7 +927,6 @@ pub const QwenVision = struct {
             parts[t] = try self.forward(group, grid_h, grid_w);
             built += 1;
         }
-        defer for (parts) |p| { _ = mlx.mlx_array_free(p); };
 
         const cat_vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
         defer _ = mlx.mlx_vector_array_free(cat_vec);
@@ -1036,6 +1129,54 @@ test "qwen preprocessing parity vs reference pixel_values (QWEN_PREPROCESS_FIXTU
 // preprocessing), then compares post-merger embeddings. Build the fixture first:
 //   python3 tests/qwen4/build_qwen_vision_fixture.py --model <dir> --image <img> --out <fix>
 // then run via tests/qwen4/test_qwen_vision_parity.sh (sets the env vars below).
+test "qwen vision on Sushi Cooler at a real pack gives MLX's bytes and asks nothing of MLX (QWEN_VISION_TEST_MODEL)" {
+    const model_raw = std.c.getenv("QWEN_VISION_TEST_MODEL") orelse return error.SkipZigTest;
+    const dir = std.mem.sliceTo(model_raw, 0);
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    var on_mlx_cfg = try model_mod.parseConfig(io, a, dir);
+    defer on_mlx_cfg.deinit(a);
+    try std.testing.expect(on_mlx_cfg.qwen_vision);
+    var on_engine_cfg = on_mlx_cfg;
+    on_mlx_cfg.cooler_for_test = false;
+    on_engine_cfg.cooler_for_test = true;
+    var wm = try model_mod.loadWeightsWithVision(io, a, dir);
+    defer wm.deinit();
+    var we = try model_mod.loadWeightsWithVision(io, a, dir);
+    defer we.deinit();
+    var on_mlx = try QwenVision.init(a, on_mlx_cfg, &wm);
+    defer on_mlx.deinit();
+    var on_engine = try QwenVision.init(a, on_engine_cfg, &we);
+    defer on_engine.deinit();
+    try std.testing.expect(on_engine.ownStream() != null and on_mlx.ownStream() == null);
+    const feat: usize = 3 * @as(usize, on_mlx_cfg.qv_temporal_patch) * on_mlx_cfg.qv_patch * on_mlx_cfg.qv_patch;
+    // A small image and a wide one: the attention takes another plan past its first chunk.
+    for ([_][2]u32{ .{ 8, 8 }, .{ 32, 48 } }) |grid| {
+        const n: usize = @as(usize, grid[0]) * grid[1];
+        const px = try a.alloc(f32, n * feat);
+        defer a.free(px);
+        var prng = std.Random.DefaultPrng.init(grid[1]);
+        for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+        const patches = mlx.mlx_array_new_data(px.ptr, &[_]c_int{ @intCast(n), @intCast(feat) }, 2, .float32);
+        defer _ = mlx.mlx_array_free(patches);
+        const want = try on_mlx.forward(patches, grid[0], grid[1]);
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_array_eval(want));
+        const ops_before = mlx.engine.mlx_ops;
+        const got = try on_engine.forward(patches, grid[0], grid[1]);
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_array_eval(got));
+        try std.testing.expectEqual(ops_before, mlx.engine.mlx_ops);
+        try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+        const bytes = mlx.mlx_array_size(want) * mlx.mlx_array_itemsize(want);
+        try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..bytes], mlx.mlx_array_data_uint8(got).?[0..bytes]);
+    }
+}
+
 test "qwen vision parity vs reference embeddings (QWEN_VISION_TEST_MODEL)" {
     const model_raw = std.c.getenv("QWEN_VISION_TEST_MODEL") orelse return error.SkipZigTest;
     const fix_raw = std.c.getenv("QWEN_VISION_FIXTURE") orelse return error.SkipZigTest;
@@ -1165,6 +1306,7 @@ test "qwen forwardVideo == per-group forward()+concat (self-consistency)" {
         .hidden = 4,
         .heads = 1,
         .head_dim = 4,
+        .intermediate = 8,
         .merge = 1,
         .num_grid_per_side = 2,
         .out_hidden = 4,
@@ -1498,6 +1640,102 @@ fn tinyTower() !Weights {
     return w;
 }
 
+fn servedTowerConfig(depth: u32, hidden: u32, heads: u32, inter: u32, out_hidden: u32, num_pos: u32) ModelConfig {
+    var cfg: ModelConfig = .{};
+    cfg.qv_depth = depth;
+    cfg.qv_hidden = hidden;
+    cfg.qv_heads = heads;
+    cfg.qv_head_dim = hidden / heads;
+    cfg.qv_intermediate = inter;
+    cfg.qv_patch = 4;
+    cfg.qv_temporal_patch = 2;
+    cfg.qv_merge = 2;
+    cfg.qv_num_pos_emb = num_pos;
+    cfg.qv_out_hidden = out_hidden;
+    cfg.model_type = "qwen4_exp";
+    cfg.expert_layout = .exl3_k4;
+    cfg.expert_quant_codebook = .spec1;
+    return cfg;
+}
+
+/// A synthetic Qwen3-VL tower of `cfg`'s widths (channels-first Conv3d, patch 4, tps 2).
+fn servedTower(cfg: ModelConfig) !Weights {
+    var w = Weights.init(std.testing.allocator);
+    errdefer w.deinit();
+    const h: c_int = @intCast(cfg.qv_hidden);
+    const I: c_int = @intCast(cfg.qv_intermediate);
+    const m: c_int = h * 4;
+    const o: c_int = @intCast(cfg.qv_out_hidden);
+    const P = struct { name: []const u8, shape: []const c_int, scale: f32 = 0.08, base: f32 = 0 };
+    var buf: [96]u8 = undefined;
+    const top = [_]P{
+        .{ .name = "patch_embed.proj.weight", .shape = &.{ h, 3, 2, 4, 4 } },
+        .{ .name = "patch_embed.proj.bias", .shape = &.{h}, .scale = 0.05 },
+        .{ .name = "pos_embed.weight", .shape = &.{ @intCast(cfg.qv_num_pos_emb), h }, .scale = 0.1 },
+        .{ .name = "merger.norm.weight", .shape = &.{h}, .scale = 0.1, .base = 1 },
+        .{ .name = "merger.norm.bias", .shape = &.{h}, .scale = 0.05 },
+        .{ .name = "merger.linear_fc1.weight", .shape = &.{ m, m }, .scale = 0.03 },
+        .{ .name = "merger.linear_fc1.bias", .shape = &.{m}, .scale = 0.05 },
+        .{ .name = "merger.linear_fc2.weight", .shape = &.{ o, m }, .scale = 0.03 },
+        .{ .name = "merger.linear_fc2.bias", .shape = &.{o}, .scale = 0.05 },
+    };
+    var seed: u64 = 300;
+    for (top) |p| {
+        seed += 1;
+        const name = try std.fmt.bufPrint(&buf, "vision_tower.{s}", .{p.name});
+        try common.putRandomBf16(std.testing.allocator, &w.map, name, p.shape, seed, p.scale, p.base);
+    }
+    for (0..cfg.qv_depth) |b| {
+        const blk = [_]P{
+            .{ .name = "norm1.weight", .shape = &.{h}, .scale = 0.1, .base = 1 },
+            .{ .name = "norm1.bias", .shape = &.{h}, .scale = 0.05 },
+            .{ .name = "norm2.weight", .shape = &.{h}, .scale = 0.1, .base = 1 },
+            .{ .name = "norm2.bias", .shape = &.{h}, .scale = 0.05 },
+            .{ .name = "attn.qkv.weight", .shape = &.{ 3 * h, h }, .scale = 0.03 },
+            .{ .name = "attn.qkv.bias", .shape = &.{3 * h}, .scale = 0.05 },
+            .{ .name = "attn.proj.weight", .shape = &.{ h, h }, .scale = 0.03 },
+            .{ .name = "attn.proj.bias", .shape = &.{h}, .scale = 0.05 },
+            .{ .name = "mlp.linear_fc1.weight", .shape = &.{ I, h }, .scale = 0.03 },
+            .{ .name = "mlp.linear_fc1.bias", .shape = &.{I}, .scale = 0.05 },
+            .{ .name = "mlp.linear_fc2.weight", .shape = &.{ h, I }, .scale = 0.03 },
+            .{ .name = "mlp.linear_fc2.bias", .shape = &.{h}, .scale = 0.05 },
+        };
+        for (blk) |p| {
+            seed += 1;
+            const name = try std.fmt.bufPrint(&buf, "vision_tower.blocks.{d}.{s}", .{ b, p.name });
+            try common.putRandomBf16(std.testing.allocator, &w.map, name, p.shape, seed, p.scale, p.base);
+        }
+    }
+    return w;
+}
+
+
+fn servedPatches(n: usize, seed: u64) !mlx.mlx_array {
+    const a = std.testing.allocator;
+    const px = try a.alloc(f32, n * 96);
+    defer a.free(px);
+    var prng = std.Random.DefaultPrng.init(seed);
+    for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+    return mlx.newData(px.ptr, &[_]c_int{ @intCast(n), 96 }, .float32);
+}
+
+/// `tinyTower` with every weight the engine's own tensor, as a Cooler load's weights are.
+fn tinyTowerOnEngine() !Weights {
+    var w = try tinyTower();
+    errdefer w.deinit();
+    const run = mlx.engine.makers(true);
+    defer run.end();
+    var it = w.map.iterator();
+    while (it.next()) |e| {
+        const src = e.value_ptr.*;
+        try mlx.check(mlx.mlx_array_eval(src));
+        const t = try mlx.newData(mlx.mlx_array_data_bfloat16(src).?, mlx.getShape(src), .bfloat16);
+        _ = mlx.mlx_array_free(src);
+        e.value_ptr.* = t;
+    }
+    return w;
+}
+
 test "qwen vision: requantized tower holds affine 8-bit codes, frees the bf16 copies and tracks the bf16 tower" {
     try mlx.requireGpu();
     const a = std.testing.allocator;
@@ -1659,8 +1897,313 @@ test "qwen vision: the requantized tower stays within bf16's drift of the bf16 t
     try std.testing.expect(g.cos > 0.998);
 }
 
-test "qwen vision: a Cooler load refuses the tower by name before it reads a weight" {
-    var weights: Weights = undefined;
-    const config: ModelConfig = .{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .expert_quant_codebook = .spec1, .cooler_for_test = true };
-    try std.testing.expectError(error.VisionTowerNotPorted, QwenVision.initWith(std.testing.allocator, config, &weights, true));
+test "qwen vision: on Sushi Cooler the tower gives MLX's bytes, requantized and bf16, asking nothing of MLX" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    for ([_]bool{ true, false }) |quantize| {
+        var wm = try tinyTower();
+        defer wm.deinit();
+        var we = try tinyTower();
+        defer we.deinit();
+        var on_mlx_cfg = tinyConfig();
+        on_mlx_cfg.model_type = "qwen4_exp";
+        on_mlx_cfg.expert_layout = .exl3_k4;
+        on_mlx_cfg.expert_quant_codebook = .spec1;
+        var on_engine_cfg = on_mlx_cfg;
+        on_mlx_cfg.cooler_for_test = false;
+        on_engine_cfg.cooler_for_test = true;
+        var on_mlx = try QwenVision.initWith(a, on_mlx_cfg, &wm, quantize);
+        defer on_mlx.deinit();
+        var on_engine = try QwenVision.initWith(a, on_engine_cfg, &we, quantize);
+        defer on_engine.deinit();
+        try std.testing.expect(on_engine.ownStream() != null and on_mlx.ownStream() == null);
+        for ([_][2]u32{ .{ 4, 4 }, .{ 8, 6 } }) |grid| {
+            const n: usize = @as(usize, grid[0]) * grid[1];
+            const px = try a.alloc(f32, n * 96);
+            defer a.free(px);
+            var prng = std.Random.DefaultPrng.init(grid[0]);
+            for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+            const patches = mlx.mlx_array_new_data(px.ptr, &[_]c_int{ @intCast(n), 96 }, 2, .float32);
+            defer _ = mlx.mlx_array_free(patches);
+            const want = try on_mlx.forward(patches, grid[0], grid[1]);
+            defer _ = mlx.mlx_array_free(want);
+            try mlx.check(mlx.mlx_array_eval(want));
+            const ops_before = mlx.engine.mlx_ops;
+            const lends_before = mlx.engine.stats().lends;
+            const got = try on_engine.forward(patches, grid[0], grid[1]);
+            defer _ = mlx.mlx_array_free(got);
+            try mlx.check(mlx.mlx_array_eval(got));
+            try std.testing.expectEqual(ops_before, mlx.engine.mlx_ops);
+            try std.testing.expectEqual(lends_before, mlx.engine.stats().lends);
+            try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+            const bytes = mlx.mlx_array_size(want) * mlx.mlx_array_itemsize(want);
+            try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..bytes], mlx.mlx_array_data_uint8(got).?[0..bytes]);
+        }
+    }
+}
+
+test "qwen vision: an encode on the engine, image or video, refused at a checked call or a pool buffer fails, frees each array once and leaves the pool as it was" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    defer mlx.fault.disarm();
+    defer mlx.engine.fault.disarm();
+    const core = @import("../tensor/core.zig");
+    const H = struct {
+        t: *QwenVision,
+        p: mlx.mlx_array,
+        gt: u32,
+        fn run(h: *const @This()) !mlx.mlx_array {
+            return if (h.gt > 1) h.t.forwardVideo(h.p, h.gt, 4, 4) else h.t.forward(h.p, 4, 4);
+        }
+        fn inUse() u64 {
+            mlx.engine.close();
+            const st = mlx.engine.stats();
+            return st.pool_bytes - st.pool_free;
+        }
+        fn bytesOf(x: mlx.mlx_array) ![]u8 {
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_array_eval(x));
+            const n = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+            return std.testing.allocator.dupe(u8, mlx.mlx_array_data_uint8(x).?[0..n]);
+        }
+    };
+    var w = try tinyTowerOnEngine();
+    defer w.deinit();
+    var cfg = tinyConfig();
+    cfg.model_type = "qwen4_exp";
+    cfg.expert_layout = .exl3_k4;
+    cfg.expert_quant_codebook = .spec1;
+    cfg.cooler_for_test = true;
+    var tower = try QwenVision.initWith(a, cfg, &w, true);
+    defer tower.deinit();
+    for ([_]u32{ 1, 2 }) |gt| {
+        const px = try a.alloc(f32, 16 * gt * 96);
+        defer a.free(px);
+        var prng = std.Random.DefaultPrng.init(gt);
+        for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+        const p = blk: {
+            const scope = mlx.engine.enter(mlx.engine.stream());
+            defer scope.end();
+            break :blk try mlx.newData(px.ptr, &[_]c_int{ @intCast(16 * gt), 96 }, .float32);
+        };
+        defer _ = mlx.mlx_array_free(p);
+        const h: H = .{ .t = &tower, .p = p, .gt = gt };
+        const want = try H.bytesOf(try h.run());
+        defer a.free(want);
+        for ([_]bool{ false, true }) |pool| {
+            // One clean encode records the site of every checked call, or pool buffer; each is refused at its first
+            // and last, the pool's as a site's n-th ask.
+            const G = struct {
+                // The encode alone, as the sweep arms it.
+                fn go(hh: H) anyerror!void {
+                    _ = mlx.mlx_array_free(try hh.run());
+                }
+            };
+            const calls: []const u64 = if (pool) &.{} else try mlx.sweepPoints(a, &mlx.fault.sites, h, G.go);
+            defer if (!pool) a.free(calls);
+            const asks: []const mlx.FaultSites.SitePoint = if (pool) try mlx.sweepSites(a, &mlx.engine.fault.sites, h, G.go) else &.{};
+            defer if (pool) a.free(asks);
+            for (0..if (pool) asks.len else calls.len) |k| {
+                const base = H.inUse();
+                const doubles = core.double_releases;
+                if (pool) mlx.engine.fault.armAt(asks[k]) else mlx.fault.arm(calls[k]);
+                const r = h.run();
+                const fired = if (pool) !mlx.engine.fault.armed() else mlx.fault.didFire();
+                mlx.fault.disarm();
+                mlx.engine.fault.disarm();
+                if (pool and !fired and !asks[k].strict) {
+                    if (r) |o| _ = mlx.mlx_array_free(o) else |_| {}
+                    continue;
+                }
+                if (!fired or (if (r) |_| true else |_| false)) {
+                    std.debug.print("qwen vision: an encode of {d} groups armed at {s} {d}: {s}\n", .{ gt, if (pool) "pool buffer" else "checked call", k, if (!fired) "never reached it" else "succeeded" });
+                    if (r) |o| _ = mlx.mlx_array_free(o) else |_| {}
+                    return error.TestUnexpectedResult;
+                }
+                if (r) |o| {
+                    _ = mlx.mlx_array_free(o);
+                } else |_| {
+                    var said: [300]u8 = undefined;
+                    _ = mlx.takeError(&said);
+                }
+                try std.testing.expectEqual(doubles, core.double_releases);
+                try std.testing.expectEqual(base, H.inUse());
+                const again = try H.bytesOf(try h.run());
+                defer a.free(again);
+                try std.testing.expectEqualSlices(u8, want, again);
+            }
+        }
+    }
+}
+
+test "qwen vision: a tower load on the engine refused at a checked call or a pool buffer, or missing a tensor, leaves the pool as it was" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    defer mlx.fault.disarm();
+    defer mlx.engine.fault.disarm();
+    const inUse = struct {
+        fn f() u64 {
+            mlx.engine.close();
+            const st = mlx.engine.stats();
+            return st.pool_bytes - st.pool_free;
+        }
+    }.f;
+    var cfg = tinyConfig();
+    cfg.model_type = "qwen4_exp";
+    cfg.expert_layout = .exl3_k4;
+    cfg.expert_quant_codebook = .spec1;
+    cfg.cooler_for_test = true;
+    for ([_]bool{ false, true }) |pool| {
+        var total: u64 = 0;
+        {
+            var w = try tinyTowerOnEngine();
+            defer w.deinit();
+            const c0 = if (pool) mlx.engine.fault.count() else mlx.op_count.load(.monotonic);
+            var t = try QwenVision.initWith(a, cfg, &w, true);
+            total = (if (pool) mlx.engine.fault.count() else mlx.op_count.load(.monotonic)) - c0;
+            t.deinit();
+        }
+        // The weights' own bytes come and go with them: what a load leaves is what outlives them.
+        var k: u64 = 1;
+        while (k <= total) : (k += 1) {
+            const base = inUse();
+            {
+                var w = try tinyTowerOnEngine();
+                defer w.deinit();
+                if (pool) mlx.engine.fault.arm(k) else mlx.fault.arm(k);
+                const r = QwenVision.initWith(a, cfg, &w, true);
+                mlx.fault.disarm();
+                mlx.engine.fault.disarm();
+                if (r) |t| {
+                    var tt = t;
+                    tt.deinit();
+                } else |_| {
+                    var said: [300]u8 = undefined;
+                    _ = mlx.takeError(&said);
+                }
+            }
+            try std.testing.expectEqual(base, inUse());
+        }
+    }
+    // A pack missing a tower tensor declines the tower: the load keeps nothing.
+    const base = inUse();
+    {
+        var w = try tinyTowerOnEngine();
+        defer w.deinit();
+        _ = mlx.mlx_array_free(w.take("vision_tower.patch_embed.proj.bias").?);
+        try std.testing.expectError(error.MissingVisionWeights, QwenVision.initWith(a, cfg, &w, true));
+    }
+    try std.testing.expectEqual(base, inUse());
+}
+
+test "qwen vision: on the engine an encode's bill covers what the pool holds for it at the served widths" {
+    // The engine runs each op as it is built, so a block's buffers are held together; MLX's lazy graph reuses them.
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    var cfg = servedTowerConfig(2, 1152, 16, 4304, 2560, 2304);
+    @import("../cooler_side.zig").forTest(&cfg, true);
+    var w = try servedTower(cfg);
+    defer w.deinit();
+    var tower = try QwenVision.init(a, cfg, &w);
+    defer tower.deinit();
+    for ([_][2]u32{ .{ 16, 16 }, .{ 32, 32 }, .{ 40, 48 } }) |grid| {
+        const n: usize = @as(usize, grid[0]) * grid[1];
+        const patches = try servedPatches(n, grid[0]);
+        defer _ = mlx.mlx_array_free(patches);
+        try mlx.check(mlx.mlx_array_eval(patches));
+        mlx.engine.trim();
+        const in_use = mlx.engine.poolTotal() - mlx.engine.poolFree();
+        const pool_before = mlx.engine.poolTotal();
+        mlx.engine.resetPoolPeak(.process);
+        const out = try tower.forward(patches, grid[0], grid[1]);
+        defer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_array_eval(out));
+        const held = @max(mlx.engine.poolTotal() -| pool_before, mlx.engine.poolPeak(.process) -| in_use);
+        try std.testing.expect(encodeScratchBytes(&cfg, n) >= held + held / 4);
+    }
+}
+
+test "qwen vision: a Cooler load's tower warms before the seal, so images and videos of any grid compile nothing inside a request" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    var cfg = servedTowerConfig(1, 1152, 16, 4304, 2560, 2304);
+    @import("../cooler_side.zig").forTest(&cfg, true);
+    var w = try servedTower(cfg);
+    defer w.deinit();
+    var tower = try @import("qwen4_media.zig").initTower(a, cfg, &w);
+    defer tower.deinit();
+    mlx.engine.seal(true);
+    defer mlx.engine.seal(false);
+    const late = mlx.engine.latePipelines();
+    mlx.engine.late_names.clear();
+    // Videos of two to five frame groups: their encodes are joined two, three or four at a time, or part by part past.
+    for ([_][3]u32{ .{ 1, 2, 2 }, .{ 1, 4, 4 }, .{ 1, 8, 6 }, .{ 1, 6, 10 }, .{ 1, 16, 16 }, .{ 1, 30, 34 }, .{ 1, 46, 40 }, .{ 2, 4, 4 }, .{ 3, 8, 6 }, .{ 4, 2, 2 }, .{ 5, 2, 2 } }) |g| {
+        const n: usize = @as(usize, g[0]) * g[1] * g[2];
+        const patches = blk: {
+            const scope = mlx.engine.enter(mlx.engine.stream());
+            defer scope.end();
+            break :blk try servedPatches(n, n);
+        };
+        defer _ = mlx.mlx_array_free(patches);
+        const out = if (g[0] > 1) try tower.forwardVideo(patches, g[0], g[1], g[2]) else try tower.forward(patches, g[1], g[2]);
+        defer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_array_eval(out));
+    }
+    errdefer std.debug.print("qwen vision: compiled after the seal:\n{s}", .{mlx.engine.late_names.text()});
+    try std.testing.expectEqual(late, mlx.engine.latePipelines());
+}
+
+test "qwen vision: a channels-last patch embedding is held once, flattened, and still gives the channels-first tower's bytes" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    var wf = try tinyTower();
+    defer wf.deinit();
+    var wl = try tinyTower();
+    defer wl.deinit();
+    {
+        // The same weight stored channels-last, [out, kT, ps, ps, C], as mlx_lm writes a Conv3d.
+        const first = wl.take("vision_tower.patch_embed.proj.weight").?;
+        defer _ = mlx.mlx_array_free(first);
+        var last = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(last);
+        try mlx.check(mlx.mlx_transpose_axes(&last, first, &[_]c_int{ 0, 2, 3, 4, 1 }, 5, mlx.gpuStream()));
+        var copy = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_contiguous(&copy, last, false, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(copy));
+        try wl.map.put(try a.dupe(u8, "vision_tower.patch_embed.proj.weight"), copy);
+    }
+    var tf = try QwenVision.init(a, tinyConfig(), &wf);
+    defer tf.deinit();
+    var tl = try QwenVision.init(a, tinyConfig(), &wl);
+    defer tl.deinit();
+    try std.testing.expect(wl.get("vision_tower.patch_embed.proj.weight") == null);
+    const px = try a.alloc(f32, 16 * 96);
+    defer a.free(px);
+    var prng = std.Random.DefaultPrng.init(3);
+    for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+    const p = try mlx.newData(px.ptr, &[_]c_int{ 16, 96 }, .float32);
+    defer _ = mlx.mlx_array_free(p);
+    const of = try tf.forward(p, 4, 4);
+    defer _ = mlx.mlx_array_free(of);
+    const ol = try tl.forward(p, 4, 4);
+    defer _ = mlx.mlx_array_free(ol);
+    try mlx.check(mlx.mlx_array_eval(of));
+    try mlx.check(mlx.mlx_array_eval(ol));
+    const n = mlx.mlx_array_size(of) * mlx.mlx_array_itemsize(of);
+    try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(of).?[0..n], mlx.mlx_array_data_uint8(ol).?[0..n]);
 }

@@ -316,18 +316,73 @@ test "Sushi quant memory bills resident routed banks and enabled vision and MTP 
     const path = try createFixture(io, a, &tmp);
     defer a.free(path);
     // Text trunk (3136) plus all three resident expert projections (1152).
-    const text = try model.residentWeightBytes(io, a, path, false, false);
+    const text = try model.residentWeightBytes(io, a, path, false, false, false);
     try std.testing.expectEqual(@as(u64, 4288), text.trunk);
     try std.testing.expectEqual(@as(u64, 0), text.mtp);
-    const all = try model.residentWeightBytes(io, a, path, true, true);
+    const all = try model.residentWeightBytes(io, a, path, true, true, false);
     try std.testing.expectEqual(text.trunk + 4, all.trunk);
     try std.testing.expectEqual(@as(u64, 1408), all.mtp);
     // A duplicate of an indexed tensor in another indexed shard must not double its bill.
     var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
     defer dir.close(io);
     try writeSafetensors(io, a, dir, "model-vision.safetensors", &.{ VISION_SPEC, TRUNK_SPEC });
-    const duplicate = try model.residentWeightBytes(io, a, path, true, true);
+    const duplicate = try model.residentWeightBytes(io, a, path, true, true, false);
     try std.testing.expectEqual(all, duplicate);
+}
+
+const TOWER_MATRIX_SHAPE = [_]u64{ 256, 256 };
+const TOWER_MATRIX_SPEC = TensorSpec{
+    .key = "model.visual.merger.linear_fc1.weight",
+    .dtype = "BF16",
+    .shape = TOWER_MATRIX_SHAPE[0..],
+    .bytes = 256 * 256 * 2,
+};
+
+test "Sushi quant memory bills a tower on the engine as the engine holds it: requantized codes by pool size class, the rest page-rounded" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try createFixture(io, a, &tmp);
+    defer a.free(path);
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+    defer dir.close(io);
+    try writeSafetensors(io, a, dir, "model-vision.safetensors", &.{ VISION_SPEC, TOWER_MATRIX_SPEC });
+    const vision_common = @import("vision_common.zig");
+    const group = @import("qwen4/qwen_vision.zig").quantGroupAtLoad(TOWER_MATRIX_SPEC.key, true, TOWER_MATRIX_SHAPE[0..]).?;
+    const text = try model.residentWeightBytes(io, a, path, false, false, false);
+    const on_mlx = try model.residentWeightBytes(io, a, path, true, false, false);
+    try std.testing.expectEqual(text.trunk + 4 + vision_common.quantizedBytes(256, 256, group), on_mlx.trunk);
+    const text_engine = try model.residentWeightBytes(io, a, path, false, false, true);
+    const on_engine = try model.residentWeightBytes(io, a, path, true, false, true);
+    try std.testing.expectEqual(text_engine.trunk + @import("expert_io.zig").pageRoundUp(4) + vision_common.quantizedHeldBytes(256, 256, group, true), on_engine.trunk);
+}
+
+const TRUNK_ODD_SHAPE = [_]u64{3};
+const TRUNK_ODD_SPEC = TensorSpec{
+    .key = "language_model.model.layers.0.post_attention_layernorm.extra",
+    .dtype = "BF16",
+    .shape = TRUNK_ODD_SHAPE[0..],
+    .bytes = 6,
+};
+
+test "Sushi quant memory bills a trunk tensor on the engine as the page-rounded region it is read into" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try createFixture(io, a, &tmp);
+    defer a.free(path);
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+    defer dir.close(io);
+    try writeSafetensors(io, a, dir, "model-vision.safetensors", &.{VISION_SPEC});
+    const mlx_before = try model.residentWeightBytes(io, a, path, false, false, false);
+    const engine_before = try model.residentWeightBytes(io, a, path, false, false, true);
+    try writeSafetensors(io, a, dir, "model-vision.safetensors", &.{ VISION_SPEC, TRUNK_ODD_SPEC });
+    const mlx_after = try model.residentWeightBytes(io, a, path, false, false, false);
+    const engine_after = try model.residentWeightBytes(io, a, path, false, false, true);
+    try std.testing.expectEqual(mlx_before.trunk + 6, mlx_after.trunk);
+    try std.testing.expectEqual(engine_before.trunk + @import("expert_io.zig").pageRoundUp(6), engine_after.trunk);
 }
 
 const BankGroup = struct { experts: u64, n: u64, group: ?u32 };
@@ -370,7 +425,7 @@ test "Sushi quant memory bills a rate-grouped layer's per-expert table" {
     const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     var stored: u64 = 0;
     for (specs.items) |spec| stored += spec.bytes;
-    const bill = try model.residentWeightBytes(io, a, path, false, false);
+    const bill = try model.residentWeightBytes(io, a, path, false, false, false);
     try std.testing.expectEqual(stored + 6 * @import("sushi_exl3").rate_groups.META_WORDS * 4, bill.trunk);
 }
 
@@ -1045,7 +1100,7 @@ test "Sushi quant memory bills a trellis trunk as stored and flags a trellis hea
     try writeIndex(io, a, tmp.dir, &entries);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    const bill = try model.residentWeightBytes(io, a, path, false, false);
+    const bill = try model.residentWeightBytes(io, a, path, false, false, false);
     // The trellis, both scale vectors and the head are billed as stored, beside the affine k_proj.
     try std.testing.expectEqual(@as(u64, 256 + 64 + 64 + 256 + 1024), bill.trunk);
     try std.testing.expect(bill.stq_head);

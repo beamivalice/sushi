@@ -45,8 +45,9 @@ hidden 2560, expert intermediate 640.
   A host token read inside the graph build serialized the build with the GPU.
 - **Decode kernels**: the fused hc read is LATENCY-bound (`hcWrite` DEFERS into the next
   read); HC + GDN prefill fusions take the chunk WIDTH as a scalar input. Each of the 36 GDN layers decodes and
-  verifies (S <= 8) in two dispatches: `gdn_decode.step` (`src/qwen4/gdn_decode.zig`), then the norm-gate. Details in
-  [engine-kernels](engine-kernels.md).
+  verifies (S <= 8) in two dispatches: `gdn_decode.step` (`src/qwen4/gdn_decode.zig`), then the norm-gate. A
+  full-attention layer's q/k norm and RoPE are one kernel at every width (`fusedQkNormRope256` reads S from q's shape:
+  one pipeline, the composed chain's bytes); only M-RoPE image chunks compose. Details in [engine-kernels](engine-kernels.md).
 - **Trunk storage is per tensor** ([pack-format](pack-format.md#qwen4-stq)): a projection is the affine/dense `(w, s, b)`
   triple or a trellis bank carried in the same three slots (`w` the U16 trellis `[1, in/16, out/16, n]`, `s` and `b` the
   F16 scales), and `Transformer.qmatmul` tells them apart by `w`'s dtype, so every call site serves a mixed pack. Tensors
@@ -81,6 +82,21 @@ hidden 2560, expert intermediate 640.
   0.026, relative RMS 0.0317; load 32 ms; encode 211.5 ms against 209.7 ms (a tie; the transient peak is the same,
   0.918 GiB). M5 Max, base 2db0e8d5 plus this change, GPU lock held, QUIET, `taskpolicy -a`, median of 9 interleaved warm
   runs (`SUSHI_VISION_Q8_REPORT=1`, the `requantized tower stays within bf16's drift` test).
+- **Every array of an encode or a tower load has one owner on every path**: a refused encode or load (an MLX call, a pool
+  buffer, a missing tensor) fails by its error, frees each array once and leaves the engine's pool as it was; a video's
+  groups are freed by one `defer` over those built. Pinned by the two `qwen vision: ... on the engine ... refused` sweeps.
+- **On Sushi Cooler an encode is billed and capped as the engine holds it**: the engine runs each op as it is built,
+  so a block's score sheets are held together; attention frees each sheet once the next is made and evaluates between
+  them, and `encodeScratchBytes` bills four sheets on the engine (1.3 on MLX). The encode runs under `engine.budget` of
+  its bill, so an over-run is `PoolOverBudget`, never a Metal OOM (the served-widths bill test).
+- **The resident weights are billed as their side holds them** (`model.indexedResidentSplit`, `engine`): on Sushi
+  Cooler a requantized tower matrix is its codes, scales and biases at their pool size classes (`quantizedHeldBytes`)
+  and every other tensor, trunk, head and tower, a page-rounded mapping (`readTensorArray`'s own region per tensor). A channels-last patch embedding is held once: its flattened copy replaces it.
+- **A Cooler load's tower warms before the seal** (`QwenVision.warmEngine`, from `qwen4_media.initTower`): one block at
+  4, 16, 60, 64, 256, 1,020 and 1,024 patches and a two-group video, reaching every product plan of its blocks and its
+  merger, so an image or video of any grid compiles nothing inside a request (a video's three- and four-group joins are
+  made with the two-group one, by the concatenate rule). A `vision tower` marker keyed by the
+  tower's widths rides the manifest as DeepSeek's does; softmax's looped kernel past 4,096 keys is left to the manifest.
 - **The tower evaluates after every block and at its output** (`QwenVision.eval_per_block`): a lazy 27-block graph
   also held every block's transposed weights (~1 GB at any size) and more than one block's score sheets. The encode
   bill (`encodeScratchBytes`: 32 MB + 1.3 x one f32 score sheet + 107 KB per patch) covers the per-block peak by
@@ -194,17 +210,41 @@ native tree.
   student's ([quality-kld](quality-kld.md#the-tool)).
 - Extension can lower quality on short prompts, and the longer window needs more KV memory; the page says both.
 
+<a id="drop-expert"></a>
+## Expert drop (`--drop-expert n`)
+
+A quantized pack whose experts stream takes `--drop-expert n` as DeepSeek does
+([dsv41-arch](dsv41-arch.md#drop-expert)): the `n` least-used experts of each of the 48 routed layers, by the pack's
+`expert_usage.json`, are never read, billed, cached or picked. The BF16 checkpoint refuses it (its fused banks are read whole).
+- **Router.** The softmax router adds `Engine.dropMask` (0, or -inf on a dropped expert, in the logits' dtype) to its
+  logits before the top-k; it renormalizes over its picks, so the kept picks and their weights are the unmasked ones.
+- **Rate groups.** Each layer's smallest groups (5 to 11 experts) are its least routed, so a plain ranking empties them
+  past a drop of 24; the drop keeps each group's most-used expert instead ([engine-expert-streaming](engine-expert-streaming.md)).
+- **MTP.** The head's layer is past the list and keeps every expert.
+- **The list.** The STQ 2.75 pack's file maps the imatrix calibration's routed rows (source order) to the pack's rate-group
+  order by router rows. Its counts are flat: 16 kept experts a layer hold about a tenth of the routed rows, so such a drop
+  reads decode speed at the served shapes on a box the whole pack does not fit, never quality.
+- The contract's drop cell holds a Cooler load dropping three quarters of the tiny STQ pack's experts to the MLX load's tokens.
+- **M1 Max 32 GB decode** (STQ 2.75, `--drop-expert 496 --ssd-budget-gb 12`, 4k code rung, 256 tokens, no MTP, one
+  load an arm): MLX 30.3 tok/s, Cooler 28.2 on eba96e6d and 29.3 once the resident route stopped handing each layer's
+  pass over (52 command buffers a forward to 12, GPU idle 2.2 to 1.2 ms, host CPU 8.7 to 6.2 ms a token).
+
 ## On Sushi Cooler
 
-- **Which loads**: an STQ pack (STQ experts, an affine or STQ trunk) runs on Sushi Cooler; any other pack runs on MLX
-  with the reason in its `[qwen4] forwards:` load line (`qwen4_cooler.sideOf`). Until Qwen passes its gate a served
-  load takes Cooler only under the `SUSHI_QWEN4_COOLER` dev lever; `--qwen-mlx-engine` and the model's `qwen_cooler`
-  setting keep it on MLX.
-- **What it refuses by name**: `--mtp-typical`, `--mtp-tokenv3`, `--mtp-greedy-tail` and `--drafter` (DFlash2): a Cooler
-  load accepts drafts by the exact rule only, and its `mtp_acceptance` / `mtp_greedy_tail` settings do not reach it.
-- **Vision**: the engine does not run the tower, so a Cooler load with vision is refused by name
-  (`error.VisionTowerNotPorted`); `--no-vision` or `--qwen-mlx-engine` serves the pack.
-- **One row**: its joined decode rows are not ported, so a Cooler load serves one row (`qwen4_sched.coolerRows`).
+- **Which loads**: an STQ pack (STQ experts, an affine or STQ trunk) and the BF16 checkpoint run on Sushi Cooler by
+  default; any other pack runs on MLX with the reason in its `[qwen4] forwards:` load line (`qwen4_cooler.coolerGap`,
+  asked by `cooler_side.sideOf`). `--qwen-mlx-engine` and the model's `qwen_cooler` setting keep it on MLX.
+- **What it refuses by name**: `--mtp-typical`, `--mtp-tokenv3`, `--mtp-greedy-tail` and `--drafter` (DFlash2), as every
+  Cooler load does (`arch_flags.archFlagRefusal`, after the arch's own refusals): drafts are accepted by the exact rule
+  only, and its `mtp_acceptance` / `mtp_greedy_tail` settings do not reach it (`arch_flags.exactDraftsOnly`).
+- **Vision**: the tower runs on the load's side (`QwenVision.own`): on Sushi Cooler every op takes the engine's stream
+  and gives MLX's bytes (requantized and bf16, asking nothing of MLX), its requantize kernels made under the load's
+  lifted seal; the patch arrays and spans take its stream (`ownStream`).
+- **Formats** (`qwen4_cooler.Format`): an STQ pack and the release's BF16 checkpoint (streamed experts through the
+  engine's `gather_mm`, the loader's norm fold and conv transpose on the engine's stream). Affine and MXFP4 packs keep
+  MLX, refused by name.
+- **Rows**: a Cooler load joins as many decode rows as on MLX (`qwen4_sched.coolerRows` = `rowCap`, 8 on a
+  non-streamed pack), each row its solo request's tokens (the contract's rows test, `qwen4_contract.greedyRows`).
 - **The contract** (`src/cooler_contract_test.zig`, fixture `QWEN4_STQ_TINY` on the served geometry, head dim 256):
   owned weights, no MLX call in a request or the unload, MLX's tokens greedy and through MTP rounds, every checked
   failure of a load or a request freed, and an unload that gives back everything.

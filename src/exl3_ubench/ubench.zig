@@ -113,7 +113,8 @@ pub const dsv41_experts: report.Bench = .{
         .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "5", "6", "16", "256" } },
         .{ .name = "mode", .values = &.{ "uniform", "highest", "lowest", "shared" }, .numeric = false },
     },
-    .arms = &.{"chain"},
+    // chain: as served (prepared, rows paired); ungrouped: prepared, one threadgroup a slot; plain: the unprepared chain.
+    .arms = &.{ "chain", "ungrouped", "plain" },
     .ref = "chain",
     .run = runExperts,
 };
@@ -121,7 +122,13 @@ pub const dsv41_experts: report.Bench = .{
 const Sample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, c: Ctx, steps: usize };
 
 /// Nanoseconds of one call: the chain less the link floor measured beside it.
-fn sampleChain(smp: Sample, _: usize) anyerror!f64 {
+fn sampleChain(smp: Sample, arm: usize) anyerror!f64 {
+    rate_groups.group_force = if (arm == 1) 0 else null;
+    rate_groups.prepared_force = if (arm == 2) false else null;
+    defer {
+        rate_groups.group_force = null;
+        rate_groups.prepared_force = null;
+    }
     const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, smp.c, step);
     const floor = try bench.chainNs(smp.s, smp.x0, smp.steps, {}, bench.linkOnly);
     return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(smp.steps));
@@ -1613,7 +1620,8 @@ pub const trunk_rows: report.Bench = .{
         .{ .name = "shape", .values = &.{ "wq_a", "wq_b", "wkv", "wo_a", "wo_b", "shared_w1", "shared_w2", "comp_wkv", "idx_wq_b", "idx_wk", "head" }, .numeric = false },
         .{ .name = "rows", .values = &.{ "1", "2", "3", "5", "8", "256" } },
     },
-    .arms = &.{ "served", "exact", "gemv", "mxfp8", "affine4", "floor" },
+    // simd: the SIMD rows arm at every width, the per-shape alternative to exact's NAX that keeps a row's bytes.
+    .arms = &.{ "served", "exact", "gemv", "mxfp8", "affine4", "floor", "simd" },
     .ref = "served",
     .run = runTrunkRows,
 };
@@ -1674,11 +1682,15 @@ fn trunkStep(t: Trunk, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!m
     const dec = kernels.SPEC1_W15;
     const sh = t.sh;
     switch (t.arm) {
-        0, 1, 2 => {
+        0, 1, 2, 6 => {
             const served = t.rows <= @as(usize, @intCast(project_rows.PROJECT_ROWS_MAX));
             const opts: root.linear.Opts = .{ .rows = .{ .exact = t.arm == 1 } };
-            root.linear.force_arm = if (t.arm == 2 and served) .gemv else null;
-            defer root.linear.force_arm = null;
+            root.linear.force_arm = if (t.arm == 2 and served) .gemv else if (t.arm == 6 and served) .rows else null;
+            project_rows.nax_force = if (t.arm == 6) false else null;
+            defer {
+                root.linear.force_arm = null;
+                project_rows.nax_force = null;
+            }
             if (sh.groups > 1) return root.linear.linearGroupedWith(s, x, t.stq[c], dec, opts);
             var x2 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x2);

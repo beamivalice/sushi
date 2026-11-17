@@ -2,6 +2,7 @@ const std = @import("std");
 const io_mod = @import("expert_io.zig");
 const arch_config = @import("arch/config.zig");
 const expert_drop = @import("expert_drop.zig");
+const expert_usage = @import("expert_usage.zig");
 pub const expert_exl3 = @import("sushi_exl3").format;
 const pack = @import("sushi_exl3").pack;
 
@@ -776,6 +777,30 @@ const SourceFile = struct {
     fd: std.c.fd_t,
     header: ?SourceHeader = null,
 };
+
+/// The drop `req` asks of the pack at `model_dir` in `layout`, ranked so each rate group of a layer keeps an expert
+/// (`expert_usage.Request.groups`): the one drop a streamed load's plan and its engine both take.
+pub fn loadDrop(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, layout: Layout, req: expert_usage.Request) !expert_usage.Drop {
+    var whole = geometry;
+    whole.drop = null;
+    whole.drop_n = 0;
+    var store = try QuantStore.openForLayout(allocator, model_dir, whole, layout);
+    defer store.deinit();
+    const rows = try allocator.alloc([]const u16, req.layers);
+    defer allocator.free(rows);
+    var grouped = false;
+    for (rows, 0..) |*row, i| {
+        const lg = store.groupsOf(@intCast(req.first_layer + i)) orelse {
+            row.* = &.{};
+            continue;
+        };
+        row.* = lg.experts[0..lg.count];
+        grouped = true;
+    }
+    var fitted = req;
+    if (grouped) fitted.groups = rows;
+    return expert_usage.load(allocator, model_dir, fitted);
+}
 
 pub fn moeLayerCount(geometry: Geometry) u16 {
     if (geometry.first_moe_layer >= geometry.layers) return 0;

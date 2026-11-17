@@ -412,25 +412,12 @@ const RouterCfgSlot = struct {
 };
 var router_cfg_cache: [4]RouterCfgSlot = .{ .{}, .{}, .{}, .{} };
 
-const RouteScale = struct { value: f32 = 0, arr: ?mlx.mlx_array = null };
-var route_scales: [2]RouteScale = .{ .{}, .{} };
+var route_scales: @import("sushi_exl3").side_cache.SideCache(f32, 1) = .{};
 
 /// The route scale as an array of the stream's side: a cached array belongs to the side that made it.
 fn routeScale(s: mlx.mlx_stream, v: f32) !mlx.mlx_array {
-    const side = &route_scales[@intFromBool(mlx.engine.isStream(s))];
-    if (side.arr) |a| {
-        if (side.value == v) return a;
-        _ = mlx.mlx_array_free(a);
-        side.* = .{};
-    }
-    side.* = .{ .value = v, .arr = try mlx_util.f32Scalar(v) };
-    return side.arr.?;
-}
-
-/// Drops the route scale of one side, when its last model goes (`arch_handle.dropHostArrays`).
-pub fn dropSide(side: u1) void {
-    if (route_scales[side].arr) |a| _ = mlx.mlx_array_free(a);
-    route_scales[side] = .{};
+    const side: u1 = @intFromBool(mlx.engine.isStream(s));
+    return route_scales.get(side, v) orelse route_scales.put(side, v, mlx.mlx_array_new_float(v));
 }
 
 pub var moe_router_fused_override: ?bool = null;
@@ -959,12 +946,12 @@ test "a route scale the engine's pool refuses is an error and is not kept: the n
     const es = mlx.engine.stream();
     const scope = mlx.engine.enter(es);
     defer scope.end();
-    defer dropSide(1);
+    defer route_scales.drop(1);
     defer mlx.engine.fault.disarm();
     var said: [256]u8 = undefined;
-    dropSide(1);
+    route_scales.drop(1);
     mlx.engine.fault.arm(1);
-    try std.testing.expectError(error.MlxError, routeScale(es, 2.5));
+    try std.testing.expectError(error.HostArrayRefused, routeScale(es, 2.5));
     _ = mlx.takeError(&said);
     mlx.engine.fault.disarm();
     const a = try routeScale(es, 2.5);

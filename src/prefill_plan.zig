@@ -304,12 +304,10 @@ pub fn reservedPrefillTokens(
     chunk: u64,
 ) u64 {
     if (!config.reservesKvCapacity()) return 0;
-    return trunk.KVCache.reservedTokens(
-        seq,
-        max_tokens,
-        chunk,
-        config.max_position_embeddings,
-    );
+    const long = trunk.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings);
+    // A shorter prompt of several chunks reserves its own length, which its prefill fills anyway and the bill
+    // already floors at: else every chunk regrows each attention layer's buffers (a zero fill and a copy).
+    return if (long == 0 and seq > chunk) seq else long;
 }
 
 /// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing

@@ -55,15 +55,6 @@ pub fn fusedStreamFoldsNorm(key: []const u8) bool {
     return false;
 }
 
-/// A Cooler load's weights are the engine's own buffers: the engine is on before the first one is wrapped.
-pub fn weights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const model_mod.ModelConfig, load_vision: bool) !?model_mod.Weights {
-    if (!@import("qwen4_cooler.zig").ownDecode(config)) return null;
-    mlx.engine.enable();
-    mlx.engine.own_weights = true;
-    defer mlx.engine.own_weights = false;
-    return try model_mod.loadWeightsGeneric(io, allocator, model_dir, config, load_vision);
-}
-
 pub fn drafterChosen(io: std.Io, allocator: std.mem.Allocator, config: *model_mod.ModelConfig, drafter_dir: []const u8, no_drafter: bool, mtp_on: bool) !void {
     if (drafter_dir.len > 0) return model_load.stampDflashRequestTerms(io, allocator, config, drafter_dir);
     const why: []const u8 = if (no_drafter) "--no-drafter" else "DFlash2: --drafter <path>";
@@ -136,7 +127,7 @@ fn specWarmVerify(self: *Trunk, slots: []const *SpecWarmSlot, seq: usize) !void 
         _ = mlx.mlx_array_free(r);
     };
     for (slots, 0..) |sl, i| {
-        rows[i] = specWarmIds(ids[i][0..seq]);
+        rows[i] = try specWarmIds(ids[i][0..seq]);
         ctxs[i] = &sl.ctx;
     }
     var logits: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
@@ -177,17 +168,25 @@ fn warmupSpecVerify(self: *Trunk, max_width: u32, kv_config: KVQuantConfig) !voi
     defer if (head_in.ctx != null) {
         _ = mlx.mlx_array_free(head_in);
     };
-    while (n_slots < max_rows) : (n_slots += 1) {
+    while (n_slots < max_rows) {
+        const first = n_slots == 0;
         slots[n_slots] = try SpecWarmSlot.init(self, kv_config);
+        // Counted before its forward, so a forward that fails gives the slot back with the rest.
+        const sl = slots[n_slots];
+        n_slots += 1;
         var prompt_ids: [SPEC_WARM_PREFILL_ROWS]i32 = undefined;
         // The first slot's prompt is prefill-shaped, so the first request does not pay the prefill kernels' first use.
-        const prompt = specWarmIds(prompt_ids[0..if (n_slots == 0) SPEC_WARM_PREFILL_ROWS else 8]);
+        const prompt = try specWarmIds(prompt_ids[0..if (first) SPEC_WARM_PREFILL_ROWS else 8]);
         defer _ = mlx.mlx_array_free(prompt);
         var stream = mlx.mlx_array_new();
-        qwen4_state.ctxOf(&slots[n_slots].ctx).capture_stream_all = if (n_slots == 0) &stream else null;
-        const logits = try self.forwardWith(&slots[n_slots].ctx, prompt);
-        qwen4_state.ctxOf(&slots[n_slots].ctx).capture_stream_all = null;
-        if (n_slots == 0 and stream.ctx != null) {
+        errdefer if (stream.ctx != null) {
+            _ = mlx.mlx_array_free(stream);
+        };
+        qwen4_state.ctxOf(&sl.ctx).capture_stream_all = if (first) &stream else null;
+        defer qwen4_state.ctxOf(&sl.ctx).capture_stream_all = null;
+        const logits = try self.forwardWith(&sl.ctx, prompt);
+        errdefer _ = mlx.mlx_array_free(logits);
+        if (first and stream.ctx != null) {
             const sh = mlx.getShape(stream);
             try mlx.check(mlx.mlx_slice(&head_in, stream, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ sh[0], 1, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
         }
@@ -225,7 +224,7 @@ fn specWarmHead(self: *Trunk, stream_row: mlx.mlx_array) !void {
     var st = try qwen4_forward.qwen4MtpStateNew(self);
     defer st.deinit();
     var id_buf: [1]i32 = undefined;
-    const id_arr = specWarmIds(&id_buf);
+    const id_arr = try specWarmIds(&id_buf);
     defer _ = mlx.mlx_array_free(id_arr);
     for ([_]qwen4_forward.Qwen4MtpProject{ .mixed_last_row, .none }, 0..) |project, i| {
         const out = try qwen4_forward.qwen4MtpForwardOn(self, &st, stream_row, id_arr, @intCast(1 + i), null, project);

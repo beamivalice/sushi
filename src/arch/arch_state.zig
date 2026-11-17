@@ -67,6 +67,21 @@ pub fn runsOwnModel(s: *const State) bool {
     return false;
 }
 
+/// A load's served warm (`cooler_warm.warmServed`) runs from here to `servedWarmEnd`: its requests carry no slot and
+/// pass no admission, so an arch that caps a request's forwards by its bill opens its warm budget, and one that keeps a
+/// state per request lends its own (`State.servedWarmBegin`).
+pub fn servedWarmBegin(s: *State) void {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "State"), "servedWarmBegin")) @field(s, @tagName(t)).servedWarmBegin();
+    }
+}
+
+pub fn servedWarmEnd(s: *State) void {
+    inline for (tags) |t| {
+        if (comptime has(Decl(t, "State"), "servedWarmEnd")) @field(s, @tagName(t)).servedWarmEnd();
+    }
+}
+
 pub fn sharesReadonly(s: *const State) bool {
     inline for (tags) |t| {
         if (comptime has(Decl(t, "State"), "sharesReadonly")) if (@field(s, @tagName(t)).sharesReadonly()) return true;
@@ -108,10 +123,10 @@ pub fn applyHeadKvQuant(t: *Trunk, kv: trunk.KVQuantConfig) !void {
 }
 
 /// Builds the MTP head's draft rerank; whether one is built.
-pub fn buildDraftRerank(t: *Trunk) bool {
+pub fn buildDraftRerank(t: *Trunk) !bool {
     inline for (tags) |tag| {
         const S = Decl(tag, "State");
-        if (comptime has(S, "buildDraftRerank")) if (S.buildDraftRerank(t)) return true;
+        if (comptime has(S, "buildDraftRerank")) if (try S.buildDraftRerank(t)) return true;
     }
     return false;
 }
@@ -317,20 +332,53 @@ pub fn headShortlist(t: *const Trunk, x: mlx.mlx_array) !?mlx.mlx_array {
     return null;
 }
 
-/// The arch whose `Ctx` points at a request the slot owns; null when no built arch keeps one.
-const request_arch: ?registry.Tag = blk: {
-    var found: ?registry.Tag = null;
+/// The archs whose `Ctx` points at a request the slot owns beside its KV cache.
+pub const request_archs = blk: {
+    var list: [tags.len]registry.Tag = undefined;
+    var n: usize = 0;
     for (tags) |t| if (Decl(t, "Ctx") != void and @hasField(Decl(t, "Ctx"), "request")) {
-        if (found != null) @compileError("two archs keep a slot request; Slot holds one");
-        found = t;
+        list[n] = t;
+        n += 1;
     };
-    break :blk found;
+    const out = list[0..n].*;
+    break :blk out;
 };
+
+/// Whether the arch `t` keeps a slot request.
+pub fn keepsRequest(comptime t: registry.Tag) bool {
+    for (request_archs) |r| if (r == t) return true;
+    return false;
+}
+
+/// The request type the arch `t`'s `Ctx` points at.
+pub fn RequestType(comptime t: registry.Tag) type {
+    return @typeInfo(@typeInfo(@FieldType(Decl(t, "Ctx"), "request")).optional.child).pointer.child;
+}
+
+/// The arch tag of a request member's name.
+fn tagOf(comptime m: anytype) registry.Tag {
+    return @field(registry.Tag, @tagName(m));
+}
+
+/// A union over `request_archs`, each member of the type `Of(t)` gives.
+fn RequestUnion(comptime Of: fn (comptime registry.Tag) type) type {
+    var names: [request_archs.len][]const u8 = undefined;
+    var values: [request_archs.len]u8 = undefined;
+    var types: [request_archs.len]type = undefined;
+    for (request_archs, &names, &values, &types, 0..) |t, *name, *value, *ty, i| {
+        name.* = @tagName(t);
+        value.* = i;
+        ty.* = Of(t);
+    }
+    return @Union(.auto, @Enum(u8, .exhaustive, &names, &values), &names, &types, &@splat(.{}));
+}
+
+fn RequestPtr(comptime t: registry.Tag) type {
+    return *RequestType(t);
+}
 
 /// Stands in for the slot request in a build where no arch keeps one: there is never one to hold.
 pub const NoRequest = struct {
-    offset: usize = 0,
-
     pub fn deinit(_: *NoRequest) void {}
     pub fn reset(_: *NoRequest) void {}
     pub fn residentBytes(_: *const NoRequest) u64 {
@@ -338,23 +386,109 @@ pub const NoRequest = struct {
     }
 };
 
-/// The request a slot owns beside its KV cache, the one `request_arch`'s `Ctx` points at.
-pub const SlotRequest = if (request_arch) |t|
-    @typeInfo(@typeInfo(@FieldType(Decl(t, "Ctx"), "request")).optional.child).pointer.child
-else
-    NoRequest;
+/// The request a slot owns beside its KV cache: a member for each arch that keeps one, and one member a slot (its
+/// model's arch), never two.
+pub const SlotRequest = if (request_archs.len == 0) NoRequest else struct {
+    member: RequestUnion(RequestType),
 
-/// The request a forward context carries; null when it carries none or no built arch keeps one.
-pub fn requestOf(ctx: *const ForwardCtx) ?*SlotRequest {
-    if (comptime request_arch) |t| return @field(ctx.arch_ctx, @tagName(t)).request;
+    pub fn of(comptime t: registry.Tag, request: RequestType(t)) @This() {
+        return .{ .member = @unionInit(@FieldType(@This(), "member"), @tagName(t), request) };
+    }
+
+    /// The arch `t`'s request, null when the slot holds another arch's.
+    pub fn as(self: *@This(), comptime t: registry.Tag) ?*RequestType(t) {
+        return switch (self.member) {
+            inline else => |*r, m| if (comptime tagOf(m) == t) r else null,
+        };
+    }
+
+    /// Its member, as a forward context reaches it.
+    pub fn ref(self: *@This()) RequestRef {
+        return switch (self.member) {
+            inline else => |*r, m| .{ .member = @unionInit(@FieldType(RequestRef, "member"), @tagName(m), r) },
+        };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        switch (self.member) {
+            inline else => |*r| r.deinit(),
+        }
+    }
+
+    pub fn reset(self: *@This()) void {
+        switch (self.member) {
+            inline else => |*r| r.reset(),
+        }
+    }
+
+    pub fn residentBytes(self: *const @This()) u64 {
+        return switch (self.member) {
+            inline else => |*r| r.residentBytes(),
+        };
+    }
+};
+
+/// The request a forward context carries: a pointer at the member of the arch whose `Ctx.request` is set.
+pub const RequestRef = if (request_archs.len == 0) struct {
+    pub fn arch(_: RequestRef) registry.Tag {
+        unreachable;
+    }
+    pub fn position(_: RequestRef) usize {
+        unreachable;
+    }
+} else struct {
+    member: RequestUnion(RequestPtr),
+
+    /// The arch whose request this is.
+    pub fn arch(self: RequestRef) registry.Tag {
+        return switch (self.member) {
+            inline else => |_, m| tagOf(m),
+        };
+    }
+
+    /// The positions the request holds: its `position()`, else its `offset`.
+    pub fn position(self: RequestRef) usize {
+        return switch (self.member) {
+            inline else => |r| if (comptime @hasDecl(@TypeOf(r.*), "position")) r.position() else r.offset,
+        };
+    }
+};
+
+/// The request a forward context carries; null when it carries none.
+pub fn requestOf(ctx: *const ForwardCtx) ?RequestRef {
+    inline for (request_archs) |t| {
+        if (@field(ctx.arch_ctx, @tagName(t)).request) |r| return .{ .member = @unionInit(@FieldType(RequestRef, "member"), @tagName(t), r) };
+    }
     return null;
 }
 
-/// The context a slot's forward carries: `request_arch` pointed at the slot's request.
+/// The context a slot's forward carries: the arch of the slot's request pointed at its member.
 pub fn ctxForSlot(request: ?*SlotRequest) Ctx {
     var out: Ctx = .{};
-    if (comptime request_arch) |t| @field(out, @tagName(t)).request = request;
+    if (comptime request_archs.len == 0) return out;
+    const r = request orelse return out;
+    switch (r.member) {
+        inline else => |*own, m| @field(out, @tagName(m)).request = own,
+    }
     return out;
+}
+
+test "a slot request is one arch's: each arch that keeps one has its own member, and the context points only its own arch at it" {
+    if (comptime request_archs.len == 0) return error.SkipZigTest;
+    inline for (request_archs) |t| {
+        var r = SlotRequest.of(t, try RequestType(t).init(std.testing.allocator, 2));
+        defer r.deinit();
+        try std.testing.expect(r.as(t) != null);
+        try std.testing.expectEqual(t, r.ref().arch());
+        var fctx: ForwardCtx = undefined;
+        fctx.arch_ctx = ctxForSlot(&r);
+        try std.testing.expectEqual(t, requestOf(&fctx).?.arch());
+        inline for (request_archs) |other| {
+            const points = @field(fctx.arch_ctx, @tagName(other)).request != null;
+            try std.testing.expectEqual(other == t, points);
+            if (other != t) try std.testing.expect(r.as(other) == null);
+        }
+    }
 }
 
 test "arch_state and arch_ctx have a field per enabled arch, its declared type or void" {

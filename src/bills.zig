@@ -2286,9 +2286,22 @@ pub fn prefillChunkCost(
     width: u64,
     kv_len: u64,
 ) u64 {
+    return chunkCostLending(config, kv_bits, width, kv_len, borrowableBytes(config));
+}
+
+fn chunkCostLending(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, lent: u64) u64 {
     const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
         statePerTokenBilled(config);
-    return (prefillTransientReserveAtKv(config, kv_bits, width, kv_len) -| borrowableBytes(config)) +| (width *| per_tok);
+    return (prefillTransientReserveAtKv(config, kv_bits, width, kv_len) -| lent) +| (width *| per_tok);
+}
+
+/// The widest ladder width, at most `top`, whose first chunk fits `headroom` with no decoder pool borrowed: a load's
+/// served warm runs before the server installs the borrow. 0 when none does.
+pub fn widestChunkAdmitted(config: *const model_mod.ModelConfig, kv_bits: u64, top: u64, headroom: u64) u32 {
+    for (PREFILL_CHUNK_LADDER) |w| {
+        if (w <= top and chunkCostLending(config, kv_bits, w, 0, 0) <= headroom) return w;
+    }
+    return 0;
 }
 
 /// The decoder pools a prefill may still release for its working set (`ModelConfig.expert_borrow_bytes`); 0 where the arch lends none.
@@ -3049,6 +3062,25 @@ test "the user-wire warning fires when the wired bytes pass the lower macOS limi
     const none = userWireWarning(&buf, 95 * GiB, .{ limit96, limit96 }, 0, ram96).?;
     try t.expect(std.mem.indexOf(u8, none, "sudo") == null);
     try t.expect(std.mem.indexOf(u8, none, "--ssd-budget-gb") != null);
+}
+
+test "a load's served warm prefills at most the widest ladder chunk the headroom holds with nothing borrowed, stepping down as it shrinks" {
+    const t = std.testing;
+    var cfg = fixtures.qwen4ExpLive364kConfig();
+    cfg.expert_borrow_bytes = 4 << 30;
+    const kv_bits: u64 = 8;
+    const unborrowed = struct {
+        fn cost(c: *const model_mod.ModelConfig, w: u64) u64 {
+            var own = c.*;
+            own.expert_borrow_bytes = 0;
+            return prefillChunkCost(&own, 8, w, 0);
+        }
+    }.cost;
+    try t.expectEqual(@as(u32, 8192), widestChunkAdmitted(&cfg, kv_bits, 8192, std.math.maxInt(u64)));
+    try t.expectEqual(@as(u32, 4096), widestChunkAdmitted(&cfg, kv_bits, 8192, unborrowed(&cfg, 8192) - 1));
+    try t.expectEqual(@as(u32, 4096), widestChunkAdmitted(&cfg, kv_bits, 8192, unborrowed(&cfg, 4096)));
+    try t.expectEqual(@as(u32, 2048), widestChunkAdmitted(&cfg, kv_bits, 2048, std.math.maxInt(u64)));
+    try t.expectEqual(@as(u32, 0), widestChunkAdmitted(&cfg, kv_bits, 8192, unborrowed(&cfg, 512) - 1));
 }
 
 test "ssd budget parses GiB and admits against the wired limit" {
@@ -4748,6 +4780,21 @@ test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
     try t.expect(!plain.reservesKvCapacity());
     try t.expectEqual(PrefillRequestTerms{}, prefillRequestTerms(&plain, seq, 2048, 8, chunk, .{}));
     try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&plain, seq, 2048, chunk));
+}
+
+test "a prompt of several chunks under the long-prompt threshold reserves its own length (one grow, as a reserved cache takes), billed as before" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const cfg = fixtures.qwen4ExpOomConfig();
+    try t.expect(cfg.reservesKvCapacity());
+    const chunk: u64 = 1024;
+    for ([_]u64{ 1025, 5000, 32767 }) |seq| {
+        try t.expectEqual(seq, prefill_plan.reservedPrefillTokens(&cfg, seq, 2048, chunk));
+        // The bill floors its reservation at the prompt: no headroom past it to bill.
+        try t.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{}).reserved_kv_bytes);
+    }
+    // One chunk grows once either way: nothing reserved.
+    try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&cfg, chunk, 2048, chunk));
 }
 
 test "mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sheets" {

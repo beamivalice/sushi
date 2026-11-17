@@ -423,18 +423,17 @@ pub fn qsaDecodeGatherAttn(
     const head_dim: c_int = qs[3];
     if (h_q <= 0 or head_dim <= 0) return dq.no(.geometry);
 
-    // Cache geometry off the dense K (present in every scheme; shapes are
-    // known without executing the lazy dequant graph).
-    if (kv_view.k.ctx == null or kv_view.v.ctx == null) return dq.no(.geometry);
-    const ks = mlx.getShape(kv_view.k);
-    if (ks.len != 4 or ks[0] != 1) return dq.no(.geometry);
+    // Cache geometry off the view's dense shapes, built or not (`kShape`).
+    if (!kv_view.deferred and (kv_view.k.ctx == null or kv_view.v.ctx == null)) return dq.no(.geometry);
+    const ks = kv_view.kShape();
+    if (ks[0] != 1) return dq.no(.geometry);
     const h_kv: c_int = ks[1];
     const kv: c_int = ks[2];
     dq.kv = kv;
     if (h_kv <= 0 or kv <= 0 or @rem(h_q, h_kv) != 0) return dq.no(.geometry);
     if (ks[3] != head_dim) return dq.no(.geometry);
-    const vs = mlx.getShape(kv_view.v);
-    if (vs.len != 4 or vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return dq.no(.geometry);
+    const vs = kv_view.vShape();
+    if (vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return dq.no(.geometry);
 
     const nb: c_int = @divTrunc(kv, ratio);
     const tail_start: c_int = nb * ratio;
@@ -450,12 +449,12 @@ pub fn qsaDecodeGatherAttn(
     // sentinels — every complete block is visible from the last position, so
     // visible == nb >= kb — and this stays ascending; the mask is the
     // backstop, not the plan.
-    const nb_arr = mlx.mlx_array_new_int(nb);
+    const nb_arr = try mlx.newInt(nb);
     defer _ = mlx.mlx_array_free(nb_arr);
     var valid_b = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(valid_b);
     try mlx.check(mlx.mlx_less(&valid_b, blocks, nb_arr, s)); // [1,1,kb] bool
-    const zero_i = mlx.mlx_array_new_int(0);
+    const zero_i = try mlx.newInt(0);
     defer _ = mlx.mlx_array_free(zero_i);
     var safe_b = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(safe_b);
@@ -469,7 +468,7 @@ pub fn qsaDecodeGatherAttn(
     var r4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(r4);
     try mlx.check(mlx.mlx_reshape(&r4, rvec, &[_]c_int{ 1, 1, 1, ratio }, 4, s));
-    const ratio_arr = mlx.mlx_array_new_int(ratio);
+    const ratio_arr = try mlx.newInt(ratio);
     defer _ = mlx.mlx_array_free(ratio_arr);
     var blk_scaled = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(blk_scaled);
@@ -847,16 +846,16 @@ pub fn qsaVerifyGatherAttn(
     if (bs[0] != 1 or bs[1] != seq_len or bs[2] <= 0) return dq.no(.geometry);
     const kb: c_int = bs[2];
 
-    if (kv_view.k.ctx == null or kv_view.v.ctx == null) return dq.no(.geometry);
-    const ks = mlx.getShape(kv_view.k);
-    if (ks.len != 4 or ks[0] != 1) return dq.no(.geometry);
+    if (!kv_view.deferred and (kv_view.k.ctx == null or kv_view.v.ctx == null)) return dq.no(.geometry);
+    const ks = kv_view.kShape();
+    if (ks[0] != 1) return dq.no(.geometry);
     const h_kv: c_int = ks[1];
     const kv: c_int = ks[2];
     dq.kv = kv;
     if (h_kv <= 0 or kv <= 0 or @rem(h_q, h_kv) != 0) return dq.no(.geometry);
     if (ks[3] != head_dim) return dq.no(.geometry);
-    const vs = mlx.getShape(kv_view.v);
-    if (vs.len != 4 or vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return dq.no(.geometry);
+    const vs = kv_view.vShape();
+    if (vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return dq.no(.geometry);
     if (kv <= qsaVerifyGatherMinKvFor(kv_view.has_quant_triple)) return dq.no(.kv_floor);
 
     const geom = QsaVerifyGeom.compute(seq_len, kv, ratio, kb) orelse return dq.no(.width);
@@ -868,9 +867,9 @@ pub fn qsaVerifyGatherAttn(
     // sentinel sink.
 
     // Per-row block selection [S, nb+2] bool.
-    const nb_arr = mlx.mlx_array_new_int(nb);
+    const nb_arr = try mlx.newInt(nb);
     defer _ = mlx.mlx_array_free(nb_arr);
-    const sink_arr = mlx.mlx_array_new_int(nb + 1);
+    const sink_arr = try mlx.newInt(nb + 1);
     defer _ = mlx.mlx_array_free(sink_arr);
     var valid_b = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(valid_b);
@@ -881,7 +880,7 @@ pub fn qsaVerifyGatherAttn(
     var falses = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(falses);
     try mlx.check(mlx.mlx_zeros(&falses, &[_]c_int{ 1, seq_len, sel_w }, 3, .bool_, s));
-    const true_v = mlx.mlx_array_new_bool(true);
+    const true_v = try mlx.newBool(true);
     defer _ = mlx.mlx_array_free(true_v);
     var sel3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sel3);
@@ -904,7 +903,7 @@ pub fn qsaVerifyGatherAttn(
     var lo_idx = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(lo_idx);
     try mlx.check(mlx.mlx_arange(&lo_idx, 0, @floatFromInt(geom.nb_lo), 1.0, .int32, s));
-    const nb_lo_arr = mlx.mlx_array_new_int(geom.nb_lo);
+    const nb_lo_arr = try mlx.newInt(geom.nb_lo);
     defer _ = mlx.mlx_array_free(nb_lo_arr);
     var lo_shift = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(lo_shift);
@@ -926,7 +925,7 @@ pub fn qsaVerifyGatherAttn(
     try mlx.check(mlx.mlx_sort_axis(&ids, picked, -1, s)); // [K] ascending
 
     // Token ids: each picked block's `ratio` tokens, then the union tail.
-    const ratio_arr = mlx.mlx_array_new_int(ratio);
+    const ratio_arr = try mlx.newInt(ratio);
     defer _ = mlx.mlx_array_free(ratio_arr);
     var ids2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ids2);
@@ -979,7 +978,7 @@ pub fn qsaVerifyGatherAttn(
     var pos2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(pos2);
     try mlx.check(mlx.mlx_reshape(&pos2, pos, &[_]c_int{ seq_len, 1 }, 2, s));
-    const one_i = mlx.mlx_array_new_int(1);
+    const one_i = try mlx.newInt(1);
     defer _ = mlx.mlx_array_free(one_i);
     var p1 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(p1);
@@ -1088,7 +1087,7 @@ pub fn qsaMaskFromBlocks(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ra
     const batch = bs[0];
     const seq_len = bs[1];
     const nb: c_int = @divTrunc(kv, ratio);
-    const nb_i = mlx.mlx_array_new_int(nb);
+    const nb_i = try mlx.newInt(nb);
     defer _ = mlx.mlx_array_free(nb_i);
     var valid = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(valid);
@@ -1099,7 +1098,7 @@ pub fn qsaMaskFromBlocks(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ra
     var falses = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(falses);
     try mlx.check(mlx.mlx_zeros(&falses, &[_]c_int{ batch, seq_len, nb + 1 }, 3, .bool_, s));
-    const true_v = mlx.mlx_array_new_bool(true);
+    const true_v = try mlx.newBool(true);
     defer _ = mlx.mlx_array_free(true_v);
     var put = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(put);
@@ -1152,9 +1151,9 @@ pub fn qsaMaskFromBlockSel(s: mlx.mlx_stream, blk_sel: mlx.mlx_array, offset: c_
     defer _ = mlx.mlx_array_free(kv_idx2);
     try mlx.check(mlx.mlx_reshape(&kv_idx2, kv_idx, &[_]c_int{ 1, kv }, 2, s));
     // tail_start[p] = ratio * floor((p+1)/ratio), via integer arithmetic.
-    const one_i = mlx.mlx_array_new_int(1);
+    const one_i = try mlx.newInt(1);
     defer _ = mlx.mlx_array_free(one_i);
-    const ratio_i = mlx.mlx_array_new_int(ratio);
+    const ratio_i = try mlx.newInt(ratio);
     defer _ = mlx.mlx_array_free(ratio_i);
     var p1 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(p1);
@@ -1358,9 +1357,9 @@ pub fn qsaGatherF32Reference(
     }
     const ishape = [_]c_int{ qL, lmax };
     const vshape = [_]c_int{ 1, 1, qL, lmax };
-    const idx_arr = mlx.mlx_array_new_data(idx.ptr, &ishape, 2, .uint32);
+    const idx_arr = try mlx.newData(idx.ptr, &ishape, .uint32);
     defer _ = mlx.mlx_array_free(idx_arr);
-    const vis_arr = mlx.mlx_array_new_data(vis.ptr, &vshape, 4, .bool_);
+    const vis_arr = try mlx.newData(vis.ptr, &vshape, .bool_);
     defer _ = mlx.mlx_array_free(vis_arr);
 
     var q32 = mlx.mlx_array_new();
@@ -1410,13 +1409,13 @@ pub fn qsaGatherF32Reference(
     var scores_u = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(scores_u);
     try mlx.check(mlx.mlx_sum_axis(&scores_u, dots, 4, false, stream));
-    const scl = mlx.mlx_array_new_float(scale);
+    const scl = try mlx.newFloat(scale);
     defer _ = mlx.mlx_array_free(scl);
     var scores = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(scores);
     try mlx.check(mlx.mlx_multiply(&scores, scores_u, scl, stream));
 
-    const ninf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    const ninf = try mlx.newFloat(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(ninf);
     var masked = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(masked);
@@ -1498,7 +1497,7 @@ pub fn qsaBoostLastTileK(
         }
     }
     const kshape = [_]c_int{ 1, Hk, kL, hd };
-    const k_host = mlx.mlx_array_new_data(buf.ptr, &kshape, 4, .float32);
+    const k_host = try mlx.newData(buf.ptr, &kshape, .float32);
     defer _ = mlx.mlx_array_free(k_host);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -1815,7 +1814,8 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
         const view1 = DenseKVView{ .k = k1, .v = v1, .owned = false };
         const solo0 = (try qsaSparseAttn(s, q0, &view0, fx0.blocks, ratio, scale)) orelse return error.GatherDeclined;
         defer _ = mlx.mlx_array_free(solo0);
-        const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &.{view0}, &.{fx0.blocks}, &.{}, ratio, scale, &.{}, 0);
+        var one_view = [_]DenseKVView{view0};
+        const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &one_view, &.{fx0.blocks}, &.{}, ratio, scale, &.{}, 0);
         defer _ = mlx.mlx_array_free(bat1);
         try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat1, solo0, s));
 
@@ -1825,7 +1825,7 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
         const qvec = mlx.mlx_vector_array_new_data(&qparts, 2);
         defer _ = mlx.mlx_vector_array_free(qvec);
         try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
-        const views = [_]DenseKVView{ view0, view1 };
+        var views = [_]DenseKVView{ view0, view1 };
         const blks = [_]mlx.mlx_array{ fx0.blocks, fx1.blocks };
         const bat2 = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &.{}, ratio, scale, &.{}, 0);
         defer _ = mlx.mlx_array_free(bat2);
@@ -3061,6 +3061,42 @@ test "QSA verify rows are bit-identical to decode at both KV tile sizes" {
                 }
             }
         }
+    }
+}
+
+test "QSA aligned sparse attention past the budget reads only the quant triples: a deferred view stays deferred, same bytes" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const budget: c_int = 64;
+    const ratio: c_int = 4;
+    const length: c_int = 300;
+    var random = std.Random.DefaultPrng.init(0x5eed);
+    const kd = try qkvIdentityArray(s, 2, length, 256, 0.7, .bfloat16);
+    defer _ = mlx.mlx_array_free(kd);
+    const vd = try qkvIdentityArray(s, 2, length, 256, 1.7, .bfloat16);
+    defer _ = mlx.mlx_array_free(vd);
+    for ([_]c_int{ 1, 8 }) |width| {
+        var built_cache = try KVCache.initWithConfig(a, 1, KVQuantConfig.affine(8));
+        defer built_cache.deinit();
+        var built = try built_cache.update(0, kd, vd, s, 0);
+        defer built.deinit();
+        var packed_cache = try KVCache.initWithConfig(a, 1, KVQuantConfig.affine(8));
+        defer packed_cache.deinit();
+        var deferred = try packed_cache.updatePacked(0, kd, vd, s, 0);
+        defer deferred.deinit();
+        const q = try qkvIdentityArray(s, 24, width, 256, 0.31, .bfloat16);
+        defer _ = mlx.mlx_array_free(q);
+        const bh = try qsaVerifyBlocksHost(a, random.random(), width, length, budget / ratio, ratio);
+        defer a.free(bh);
+        const blocks = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{ 1, width, budget / ratio }, 3, .int32);
+        defer _ = mlx.mlx_array_free(blocks);
+        const want = (try qsaAlignedSparseAttn(s, q, &built, blocks, ratio, 1.0 / 16.0, budget)) orelse return error.QsaDeclined;
+        defer _ = mlx.mlx_array_free(want);
+        const got = (try qsaAlignedSparseAttn(s, q, &deferred, blocks, ratio, 1.0 / 16.0, budget)) orelse return error.QsaDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        try testing.expect(deferred.deferred);
+        try qkvExpectBitsEqual(s, want, got);
     }
 }
 

@@ -118,7 +118,7 @@ pub fn build(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32
                     c.n_qp = i + 1;
                     c.draft_arrs[i] = prop.id;
                 } else {
-                    c.draft_arrs[i] = sampler.sampleTokenLazy(outs[k].logits, draft_sampling, xfm.s);
+                    c.draft_arrs[i] = try sampler.sampleTokenLazy(outs[k].logits, draft_sampling, xfm.s);
                 }
                 c.n_drafted = i + 1;
                 if (c.conf_arrs != null and i < c.plan.m_lo) {

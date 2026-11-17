@@ -380,7 +380,7 @@ pub const Collector = struct {
     fn putDense(self: *Collector, map: mlx.mlx_map_string_to_array, held: *std.ArrayList(mlx.mlx_array), name: []const u8, d: *const Dense) !usize {
         if (d.rows == 0 or d.acc.ctx == null) return 0;
         var key_buf: [192]u8 = undefined;
-        const denom = mlx.mlx_array_new_float(@floatFromInt(d.rows));
+        const denom = try mlx.newFloat(@floatFromInt(d.rows));
         defer _ = mlx.mlx_array_free(denom);
         var mean = mlx.mlx_array_new();
         mlx.check(mlx.mlx_divide(&mean, d.acc, denom, self.s)) catch |e| {
@@ -394,7 +394,7 @@ pub const Collector = struct {
         try mlx.check(mlx.mlx_array_eval(mean));
         try mlx.check(mlx.mlx_map_string_to_array_insert(map, try std.fmt.bufPrintSentinel(&key_buf, "{s}", .{name}, 0), mean));
         const count: f32 = @floatFromInt(d.rows);
-        const rows = mlx.mlx_array_new_data(&count, &[_]c_int{1}, 1, .float32);
+        const rows = try mlx.newData(&count, &[_]c_int{1}, .float32);
         held.append(self.allocator, rows) catch |e| {
             _ = mlx.mlx_array_free(rows);
             return e;
@@ -431,7 +431,7 @@ pub const Collector = struct {
                 try mlx.check(mlx.mlx_map_string_to_array_insert(map, try std.fmt.bufPrintSentinel(&key_buf, "{s}.{d}", .{ entry[0], li }, 0), entry[1].*));
             }
         }
-        const count = mlx.mlx_array_new_data(tokens.ptr, &[_]c_int{@intCast(tokens.len)}, 1, .uint32);
+        const count = try mlx.newData(tokens.ptr, &[_]c_int{@intCast(tokens.len)}, .uint32);
         defer _ = mlx.mlx_array_free(count);
         try mlx.check(mlx.mlx_map_string_to_array_insert(map, "tokens", count));
         const meta = mlx.mlx_map_string_to_string_new();
@@ -485,7 +485,7 @@ pub const Collector = struct {
         var entries: usize = 0;
         for (self.layers, 0..) |*slot, li| {
             if (slot.tokens == 0 or slot.gu.ctx == null or slot.down.ctx == null) continue;
-            const denom = mlx.mlx_array_new_float(@floatFromInt(slot.tokens));
+            const denom = try mlx.newFloat(@floatFromInt(slot.tokens));
             defer _ = mlx.mlx_array_free(denom);
             const gu = try self.scaledFlat(slot.gu, denom);
             try held.append(self.allocator, gu);

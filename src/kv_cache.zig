@@ -134,6 +134,36 @@ pub const DenseKVView = struct {
     /// (`KVCache.handOffRingViews`); otherwise they are the cache's.
     owns_triple: bool = false,
 
+    /// The dense pair is not built yet (`KVCache.updatePacked`): `dense` builds it.
+    deferred: bool = false,
+
+    /// Builds the dense pair of a deferred view; a view that has it is left as it is. MLX would skip an unread dequant;
+    /// the engine runs every op it is given, so a reader that needs the pair asks for it here.
+    pub fn dense(self: *DenseKVView, s: mlx.mlx_stream) !void {
+        if (!self.deferred) return;
+        const k = try kv_quant.dequantizeAffine(s, self.k_triple_q, self.k_triple_scales, self.k_triple_biases, self.group_size, self.bits);
+        errdefer _ = mlx.mlx_array_free(k);
+        const v = try kv_quant.dequantizeAffine(s, self.v_triple_q, self.v_triple_scales, self.v_triple_biases, self.group_size, self.bits);
+        self.k = k;
+        self.v = v;
+        self.owned = true;
+        self.deferred = false;
+    }
+
+    /// The dense K's shape `[B, heads, len, dim]`, built or not.
+    pub fn kShape(self: *const DenseKVView) [4]c_int {
+        return if (self.deferred) denseShapeOf(self.k_triple_q, self.k_triple_scales, self.group_size) else mlx.getShape(self.k)[0..4].*;
+    }
+
+    pub fn vShape(self: *const DenseKVView) [4]c_int {
+        return if (self.deferred) denseShapeOf(self.v_triple_q, self.v_triple_scales, self.group_size) else mlx.getShape(self.v)[0..4].*;
+    }
+
+    fn denseShapeOf(q: mlx.mlx_array, scales: mlx.mlx_array, group_size: u32) [4]c_int {
+        const qs = mlx.getShape(q);
+        return .{ qs[0], qs[1], qs[2], mlx.getShape(scales)[3] * @as(c_int, @intCast(group_size)) };
+    }
+
     pub fn deinit(self: *DenseKVView) void {
         if (self.owned) {
             _ = mlx.mlx_array_free(self.k);
@@ -650,10 +680,19 @@ pub const KVCache = struct {
         }
     }
 
+    /// `update` for a reader of the quant triples: a quantized view's dense pair is built only when the reader asks
+    /// (`DenseKVView.dense`).
+    pub fn updatePacked(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+        switch (self.config.scheme) {
+            .off => return self.updateDense(layer, new_k, new_v, s, max_seq),
+            .affine => return self.updateAffine(layer, new_k, new_v, s, max_seq, true),
+        }
+    }
+
     pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
         switch (self.config.scheme) {
             .off => return self.updateDense(layer, new_k, new_v, s, max_seq),
-            .affine => return self.updateAffine(layer, new_k, new_v, s, max_seq),
+            .affine => return self.updateAffine(layer, new_k, new_v, s, max_seq, false),
         }
     }
 
@@ -773,7 +812,7 @@ pub const KVCache = struct {
         }
     }
 
-    fn updateAffine(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+    fn updateAffine(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32, deferred: bool) !DenseKVView {
         const cfg = self.config;
         const group_size: u32 = cfg.group_size;
         const bits: u8 = cfg.bits;
@@ -791,11 +830,15 @@ pub const KVCache = struct {
         //    K-derived packed width writes a 16-u32 chunk into a 24-u32 window
         //    (an mlx slice_update mismatch we cannot catch). Identical on every
         //    symmetric arch — the same generalization `updateDense` carries.
-        return self.appendQuantized(layer, new_kq, new_vq, s, max_seq);
+        return self.appendQuantizedMode(layer, new_kq, new_vq, s, max_seq, deferred);
     }
 
     /// `update` for rows the caller already quantized with this cache's scheme.
     pub fn appendQuantized(self: *KVCache, layer: u32, new_kq: kv_quant.QuantizedKV, new_vq: kv_quant.QuantizedKV, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+        return self.appendQuantizedMode(layer, new_kq, new_vq, s, max_seq, false);
+    }
+
+    fn appendQuantizedMode(self: *KVCache, layer: u32, new_kq: kv_quant.QuantizedKV, new_vq: kv_quant.QuantizedKV, s: mlx.mlx_stream, max_seq: u32, deferred: bool) !DenseKVView {
         const entry = &self.entries[layer];
         const group_size: u32 = self.config.group_size;
         const bits: u8 = self.config.bits;
@@ -810,9 +853,26 @@ pub const KVCache = struct {
         //    DenseKVView returned to the caller. The quant triples ride along
         //    as borrows so fused call sites can skip the dense read — mlx is
         //    lazy, so the dequant graph below costs nothing unless SDPA
-        //    actually reads `.k`/`.v`. (Engagement bug class: the decode
+        //    actually reads `.k`/`.v`; the engine is not, so a reader of the
+        //    triples defers the pair (`updatePacked`). (Engagement bug class: the decode
         //    forward calls update(), not denseView() — omitting the triples
         //    here made the packed arms a silent no-op.)
+        if (deferred) return .{
+            .k = .{ .ctx = null },
+            .v = .{ .ctx = null },
+            .owned = false,
+            .deferred = true,
+            .k_triple_q = trip[0],
+            .k_triple_scales = trip[1],
+            .k_triple_biases = trip[2],
+            .v_triple_q = trip[3],
+            .v_triple_scales = trip[4],
+            .v_triple_biases = trip[5],
+            .has_quant_triple = true,
+            .bits = bits,
+            .group_size = group_size,
+            .owns_triple = compacted,
+        };
         const dense_k = try kv_quant.dequantizeAffine(s, trip[0], trip[1], trip[2], group_size, bits);
         errdefer _ = mlx.mlx_array_free(dense_k);
         const dense_v = try kv_quant.dequantizeAffine(s, trip[3], trip[4], trip[5], group_size, bits);
@@ -1069,6 +1129,15 @@ pub const KVCache = struct {
     /// triples (the returned arrays are owned and freed by `deinit`).
     /// SDPA call sites use this so they don't have to know the scheme.
     pub fn denseView(self: *KVCache, layer: u32, s: mlx.mlx_stream) !DenseKVView {
+        return self.denseViewMode(layer, s, false);
+    }
+
+    /// `denseView` for a reader of the quant triples: the dense pair is built when it asks (`DenseKVView.dense`).
+    pub fn denseViewPacked(self: *KVCache, layer: u32, s: mlx.mlx_stream) !DenseKVView {
+        return self.denseViewMode(layer, s, true);
+    }
+
+    fn denseViewMode(self: *KVCache, layer: u32, s: mlx.mlx_stream, deferred: bool) !DenseKVView {
         const entry = &self.entries[layer];
         switch (self.config.scheme) {
             .off => return .{ .k = entry.key_view, .v = entry.value_view, .owned = false },
@@ -1076,6 +1145,21 @@ pub const KVCache = struct {
                 if (!entry.initialized) {
                     return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
                 }
+                if (deferred) return .{
+                    .k = .{ .ctx = null },
+                    .v = .{ .ctx = null },
+                    .owned = false,
+                    .deferred = true,
+                    .k_triple_q = entry.key_view,
+                    .k_triple_scales = entry.key_scales_view,
+                    .k_triple_biases = entry.key_biases_view,
+                    .v_triple_q = entry.value_view,
+                    .v_triple_scales = entry.value_scales_view,
+                    .v_triple_biases = entry.value_biases_view,
+                    .has_quant_triple = true,
+                    .bits = self.config.bits,
+                    .group_size = self.config.group_size,
+                };
                 const dense_k = try kv_quant.dequantizeAffine(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, self.config.group_size, self.config.bits);
                 errdefer _ = mlx.mlx_array_free(dense_k);
                 const dense_v = try kv_quant.dequantizeAffine(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, self.config.group_size, self.config.bits);
@@ -2282,6 +2366,40 @@ test "KVCache updateAffine returns quant triples so fused attention can engage" 
     try testing.expect(dv.v_triple_q.ctx != null);
     try testing.expectEqual(@as(u8, 8), dv.bits);
     try testing.expectEqual(@as(u32, 64), dv.group_size);
+}
+
+test "KVCache updatePacked on the engine builds no dense pair until asked, then update's shapes and bytes" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    var eager = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
+    defer eager.deinit();
+    var deferred = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
+    defer deferred.deinit();
+    const k = try qkvIdentityArray(s, 2, 300, 256, 0.5, .bfloat16);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try qkvIdentityArray(s, 2, 300, 256, 0.25, .bfloat16);
+    defer _ = mlx.mlx_array_free(v);
+    const at_eager = mlx.engine.stats().dispatches;
+    var whole = try eager.update(0, k, v, s, 0);
+    defer whole.deinit();
+    const eager_dispatches = mlx.engine.stats().dispatches - at_eager;
+    const at_packed = mlx.engine.stats().dispatches;
+    var view = try deferred.updatePacked(0, k, v, s, 0);
+    defer view.deinit();
+    try testing.expect(mlx.engine.stats().dispatches - at_packed < eager_dispatches);
+    try testing.expect(view.k.ctx == null and view.v.ctx == null and view.has_quant_triple);
+    try testing.expectEqualSlices(c_int, mlx.getShape(whole.k), &view.kShape());
+    try testing.expectEqualSlices(c_int, mlx.getShape(whole.v), &view.vShape());
+    try view.dense(s);
+    for ([_][2]mlx.mlx_array{ .{ whole.k, view.k }, .{ whole.v, view.v } }) |pair| {
+        try mlx.check(mlx.mlx_array_eval(pair[0]));
+        try mlx.check(mlx.mlx_array_eval(pair[1]));
+        const n = mlx.mlx_array_size(pair[0]) * mlx.mlx_array_itemsize(pair[0]);
+        try testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(pair[0]).?[0..n], mlx.mlx_array_data_uint8(pair[1]).?[0..n]);
+    }
 }
 
 test "KVCache step resets on truncate" {

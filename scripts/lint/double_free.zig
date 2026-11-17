@@ -1,7 +1,8 @@
 //! Rule `double-free`: one name freed by an `errdefer` and, later in that errdefer's scope, by a `defer` with the same
 //! call. On an error both run, so the handle is freed twice: a double delete in mlx-c, a tensor released twice on the
-//! engine. Parse only: the statements compared are the plain forms `[err]defer [_ =] callee(name);`, and a name
-//! reassigned between the two is still reported (allowlist it with the reason).
+//! engine. Parse only: the statements compared are the plain forms `[err]defer [_ =] callee(name);` and loops
+//! `[err]defer for (name...)` over one slice, and a name reassigned between the two is still reported (allowlist it
+//! with the reason).
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Node = Ast.Node;
@@ -17,6 +18,9 @@ fn freeAt(tree: *const Ast, start: u32) ?Free {
     var t = start + 1;
     const n = tree.tokens.len;
     if (t + 1 < n and tree.tokenTag(t) == .identifier and std.mem.eql(u8, tree.tokenSlice(t), "_") and tree.tokenTag(t + 1) == .equal) t += 2;
+    // `[err]defer for (name...) |x| ...`: a loop over the same slice frees each of its handles.
+    if (t + 2 < n and tree.tokenTag(t) == .keyword_for and tree.tokenTag(t + 1) == .l_paren and tree.tokenTag(t + 2) == .identifier)
+        return .{ .token = start, .callee_first = t, .callee_last = t, .arg = t + 2, .end = scopeEnd(tree, start) };
     if (t >= n or tree.tokenTag(t) != .identifier) return null;
     const first = t;
     while (t + 2 < n and tree.tokenTag(t + 1) == .period and tree.tokenTag(t + 2) == .identifier) t += 2;

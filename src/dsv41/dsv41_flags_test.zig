@@ -25,15 +25,22 @@ test "the Sushi Cooler choice reaches the DeepSeek config: the flag, else the se
     var cfg = model.ModelConfig{ .model_type = "deepseek_v41" };
     cfg.dsv41 = .{};
     cfg.stampCooler();
-    try std.testing.expectEqual(.none, cfg.dsv41.?.mlx_ask);
+    try std.testing.expectEqual(.none, cfg.cooler_ask);
     cfg.cooler_override = false;
     cfg.stampCooler();
-    try std.testing.expectEqual(.setting, cfg.dsv41.?.mlx_ask);
+    try std.testing.expectEqual(.setting, cfg.cooler_ask);
     cfg.cooler_flag = false;
     cfg.stampCooler();
-    try std.testing.expectEqual(.flag, cfg.dsv41.?.mlx_ask);
+    try std.testing.expectEqual(.flag, cfg.cooler_ask);
     cfg.cooler_flag = null;
     cfg.cooler_override = true;
     cfg.stampCooler();
-    try std.testing.expectEqual(.none, cfg.dsv41.?.mlx_ask);
+    try std.testing.expectEqual(.none, cfg.cooler_ask);
+}
+
+test "dsv41 flags: a Cooler load refuses DFlash2 by the rule every Cooler load takes, naming its own opt-out; its own reasons come first" {
+    var c: model.ModelConfig = .{ .model_type = "deepseek_v41", .cooler_for_test = true };
+    try std.testing.expect(flags.exactDraftsOnly(&c));
+    try std.testing.expectEqualStrings("--drafter is not served on Sushi Cooler: DFlash2 runs on MLX only; drop the flag, or pass --ds41-mlx-engine", flags.archFlagRefusal(&c, .{ .drafter = true }).?);
+    try std.testing.expect(std.mem.startsWith(u8, flags.archFlagRefusal(&c, .{ .mtp_typical = true }).?, "--mtp-typical has no effect on deepseek_v41"));
 }

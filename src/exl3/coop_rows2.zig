@@ -2,6 +2,7 @@
 //! Routing IDs must be valid for the supplied expert bank, as in the baseline API.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 const base = @import("expert_exl3_kernels.zig");
 const support = base.Group2Support;
 const Arr = mlx.mlx_array;
@@ -356,7 +357,7 @@ const Owned = struct {
         defer std.testing.allocator.free(data);
         var rng = std.Random.DefaultPrng.init(seed);
         for (data) |*v| v.* = (rng.random().float(f32) - 0.5) * scale;
-        const input = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+        const input = try host_side.made(mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32));
         defer _ = mlx.mlx_array_free(input);
         var out = mlx.mlx_array_new();
         mlx.check(mlx.mlx_astype(&out, input, dtype, s)) catch |err| {
@@ -489,7 +490,7 @@ fn laneInput(owned: *Owned, x: Arr, s: mlx.mlx_stream) !Arr {
     for (0..width / 16) |tile| for (0..4) |q| for ([_]usize{ 0, 1, 8, 9 }, 0..) |offset, j| {
         indices[tile * 16 + q * 4 + j] = @intCast(tile * 16 + q * 2 + offset);
     };
-    const ids = mlx.mlx_array_new_data(indices.ptr, &[_]c_int{@intCast(width)}, 1, .uint32);
+    const ids = try host_side.made(mlx.mlx_array_new_data(indices.ptr, &[_]c_int{@intCast(width)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(ids);
     var result = mlx.mlx_array_new();
     mlx.check(mlx.mlx_take_axis(&result, x, ids, 1, s)) catch |err| {

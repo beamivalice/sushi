@@ -107,7 +107,7 @@ fn mimoFixture(fx: *mtp_mod.RerankFixture, cell: *shortlist_mod.Cell, bits: u32)
     fx.xfm.bits_cache = null;
     fx.xfm.arch_state = .{};
     fx.xfm.arch_state.mimo2.shortlist = cell;
-    if (bits > 0) cell.coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), &fx.xfm, bits) orelse return error.CoarseBuildDeclined;
+    if (bits > 0) cell.coarse = (try mtp_mod.buildRerankCoarse(mlx.gpuStream(), &fx.xfm, bits)) orelse return error.CoarseBuildDeclined;
 }
 
 fn bf16Row(s: mlx.mlx_stream, rows: c_int, buf: []const f32) !mlx.mlx_array {

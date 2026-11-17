@@ -998,6 +998,10 @@ Ms per forward at 8K context:
 At 1K context the same binaries read 16.50 / 19.80 / 22.29 / 25.32 / 28.46 / 31.70 / 35.80 / 38.79 (466b7ec6) and
 16.75 / 19.84 / 21.79 / 24.62 / 27.44 / 30.56 / 34.58 / 37.23 (8044906b). Context barely moves a verify; rows do.
 
+The seven-row arm is per GPU (`mtp_qmv.rowsArm`): s1x4 on a GPU with matrix units, the tile arm without. Per call,
+K 2560, engine stream: on the M5 Max s1x4 is 3.7% faster at the lm_head (1618 vs 1681 us); on an M1 Max the tile arm
+is (lm_head 248320: 6.00 vs 7.28-7.39 ms; 6144: 317-326 vs 382-394 us; 12288 gs64: 467-510 vs 531-557 us).
+
 - Before: steps of +3.5 / +2.4 / +3.8 / **+5.2** / +2.7 / **+4.4** / +4.6 ms. After (mean of four boots at 1K and 8K, f96a99e9 and
   8044906b): 17.22 / 20.38 / 22.37 / 25.07 / 27.46 / 30.78 / 34.53 / 37.37, steps +3.2 / +2.0 / +2.7 / +2.4 / +3.3 / +3.8 / +2.8.
   The 4-to-5 cliff is gone; 6-to-7 and 7-to-8 are still the high steps. Eight rows cost 37.4 ms instead of 44.5 (-16%).

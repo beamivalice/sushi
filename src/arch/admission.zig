@@ -80,7 +80,8 @@ test "expert-stream traits per model type and layout" {
         .{ .model_type = "deepseek_v41", .layout = .exl3_k4, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = true } },
         .{ .model_type = "deepseek_v41", .layout = .mxfp4_w123, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = false } },
         .{ .model_type = "glm5_next", .layout = .exl3_k4, .want = .{} },
-        .{ .model_type = "qwen4_exp", .layout = .exl3_k4, .want = .{} },
+        .{ .model_type = "qwen4_exp", .layout = .exl3_k4, .want = .{ .drop_expert = true } },
+        .{ .model_type = "qwen4_exp", .layout = .bf16_fused, .want = .{} },
         .{ .model_type = "mimo_v2", .layout = .exl3_k4, .want = .{} },
         .{ .model_type = "mistral", .layout = .exl3_k4, .want = .{} },
     };

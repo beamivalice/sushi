@@ -68,11 +68,11 @@ fn mlxTf32() !bool {
     return got[0] == n;
 }
 
-const Operand = struct { t: *Tensor, transposed: bool, ld: i64 };
+pub const Operand = struct { t: *Tensor, transposed: bool, ld: i64 };
 
 /// MLX's `check_transpose`: the operand as it is when its last two axes are a row-major or a column-major matrix,
 /// else a row-contiguous copy.
-fn matrixOperand(t: *Tensor, is_vector: bool) Error!Operand {
+pub fn matrixOperand(t: *Tensor, is_vector: bool) Error!Operand {
     const stx: i64 = @intCast(t.strides[t.ndim - 2]);
     const sty: i64 = @intCast(t.strides[t.ndim - 1]);
     if (sty == 1 and (!is_vector or stx == t.shape[t.ndim - 1])) return .{ .t = try core.share(t), .transposed = false, .ld = stx };
@@ -370,16 +370,12 @@ fn gemvWide(c: Call) Error!bool {
 }
 
 /// MLX's `gemv`: one side is a single row or column per batch.
-fn gemv(c: Call) Error!void {
+const GemvTile = struct { bm: usize, bn: usize, sm: usize, sn: usize, tm: usize, tn: usize, per_group: usize };
+
+fn gemvTile(c: Call) GemvTile {
     const b_is_matrix = c.n != 1;
-    const mat = if (b_is_matrix) c.b else c.a;
-    const vec = if (b_is_matrix) c.a else c.b;
     const transpose_mat = if (b_is_matrix) !c.b.transposed else c.a.transposed;
     const out_len = if (b_is_matrix) c.n else c.m;
-    const strides_mat = if (b_is_matrix) &c.batches.b else &c.batches.a;
-    const strides_vec = if (b_is_matrix) &c.batches.a else &c.batches.b;
-    const contiguous = c.batches.n == 1;
-
     var tm: usize = 4;
     var tn: usize = 4;
     var sm: usize = 1;
@@ -411,8 +407,38 @@ fn gemv(c: Call) Error!void {
         if (out_len < tm) tm = 1;
         per_group = bm * sm * tm;
     }
+    return .{ .bm = bm, .bn = bn, .sm = sm, .sn = sn, .tm = tm, .tn = tn, .per_group = per_group };
+}
+
+fn gemvKernel(c: Call, t: GemvTile) Error!metal.Pipeline {
+    const b_is_matrix = c.n != 1;
+    const transpose_mat = if (b_is_matrix) !c.b.transposed else c.a.transposed;
     var buf: [96]u8 = undefined;
-    const kern = try stock.kernel(try stock.named(&buf, "gemv_{s}{s}_bm{d}_bn{d}_sm{d}_sn{d}_tm{d}_tn{d}_nc{d}_axpby0", .{ if (transpose_mat) "t_" else "", try stock.typeName(c.out.dtype), bm, bn, sm, sn, tm, tn, @intFromBool(!contiguous) }));
+    return stock.kernel(try stock.named(&buf, "gemv_{s}{s}_bm{d}_bn{d}_sm{d}_sn{d}_tm{d}_tn{d}_nc{d}_axpby0", .{ if (transpose_mat) "t_" else "", try stock.typeName(c.out.dtype), t.bm, t.bn, t.sm, t.sn, t.tm, t.tn, @intFromBool(c.batches.n != 1) }));
+}
+
+fn gemv(c: Call) Error!void {
+    const b_is_matrix = c.n != 1;
+    const mat = if (b_is_matrix) c.b else c.a;
+    const vec = if (b_is_matrix) c.a else c.b;
+    const out_len = if (b_is_matrix) c.n else c.m;
+    const strides_mat = if (b_is_matrix) &c.batches.b else &c.batches.a;
+    const strides_vec = if (b_is_matrix) &c.batches.a else &c.batches.b;
+
+    const t = gemvTile(c);
+    const per_group = t.per_group;
+    // Until the load seals the pipelines, a product whose output runs along `a`'s rows makes the kernels every row
+    // count to the widest chunk picks: the length of the output picks the tile.
+    if (!core.sealed and !b_is_matrix and c.arm_m == c.m) {
+        var m: usize = 2;
+        while (m <= rows_ceiling) : (m = @max(m + 1, m + m / 8)) {
+            var at = c;
+            at.m = m;
+            at.arm_m = m;
+            _ = gemvKernel(at, gemvTile(at)) catch {};
+        }
+    }
+    const kern = try gemvKernel(c, t);
     const p = try core.pass();
     p.pipeline(kern);
     core.bind(p, mat.t, 0);
@@ -425,23 +451,88 @@ fn gemv(c: Call) Error!void {
     p.bytes(std.mem.sliceAsBytes(c.batches.shape[0..c.batches.n]), 10);
     p.bytes(std.mem.sliceAsBytes(strides_vec[0..c.batches.n]), 11);
     p.bytes(std.mem.sliceAsBytes(strides_mat[0..c.batches.n]), 12);
-    core.dispatchGroups(p, .{ .x = (out_len + per_group - 1) / per_group, .y = 1, .z = c.batch_out }, .{ .x = 32, .y = bn, .z = bm });
+    core.dispatchGroups(p, .{ .x = (out_len + per_group - 1) / per_group, .y = 1, .z = c.batch_out }, .{ .x = 32, .y = t.bn, .z = t.bm });
+}
+
+const SteelPath = enum { split_k, split_k_nax, fused, fused_nax };
+
+/// PURE: which of MLX's tiled kernels `steel` takes for `c`.
+fn steelPath(c: Call) SteelPath {
+    const use_nax = c.g.nax and (c.g.tf32 or c.out.dtype != .float32);
+    const threshold: usize = if (c.g.class == .s or c.g.class == .d) 2048 else 1024;
+    const big = @max(c.arm_m, c.n);
+    if (!use_nax and c.batch_out == 1 and ((c.arm_m + 15) / 16) * ((c.n + 15) / 16) <= threshold and c.k / 16 >= 8 and c.k >= big) return .split_k;
+    if (use_nax and c.batch_out == 1 and (c.k >= 3 * big or (big <= 1024 and c.k > 2 * big))) return .split_k_nax;
+    return if (use_nax) .fused_nax else .fused;
 }
 
 /// MLX's `steel_matmul`: two matrices, by the tiled kernels.
 fn steel(c: Call) Error!void {
-    const use_nax = c.g.nax and (c.g.tf32 or c.out.dtype != .float32);
-    const threshold: usize = if (c.g.class == .s or c.g.class == .d) 2048 else 1024;
-    const big = @max(c.arm_m, c.n);
-    if (!use_nax and c.batch_out == 1 and ((c.arm_m + 15) / 16) * ((c.n + 15) / 16) <= threshold and c.k / 16 >= 8 and c.k >= big) return splitK(c);
-    if (use_nax and c.batch_out == 1 and (c.k >= 3 * big or (big <= 1024 and c.k > 2 * big))) return splitKNax(c);
-    return if (use_nax) fusedNax(c) else fused(c);
+    if (!core.sealed and c.arm_m == c.m) completeRows(c);
+    return switch (steelPath(c)) {
+        .split_k => splitK(c),
+        .split_k_nax => splitKNax(c),
+        .fused => fused(c),
+        .fused_nax => fusedNax(c),
+    };
 }
 
-const Tile = struct { bm: usize, bn: usize, bk: usize, wm: usize, wn: usize };
+/// The widest product a request's rows make: a prefill chunk at its widest.
+const rows_ceiling: usize = 16384;
+
+/// The operands' shapes, layouts and dtype whose kernels for every row count are made (`completeRows`).
+const RowsKey = struct { n: usize, k: usize, a_t: bool, b_t: bool, dtype: core.Dtype, batch_out: usize, batched: bool };
+var rows_done: std.AutoHashMapUnmanaged(RowsKey, void) = .empty;
+
+/// Until the load seals the pipelines, the first product of an operand pair makes the kernels every row count up to
+/// `rows_ceiling` takes: the row count picks the path, its tile and its K step, and only the warm's few widths run.
+fn completeRows(c: Call) void {
+    const key: RowsKey = .{ .n = c.n, .k = c.k, .a_t = c.a.transposed, .b_t = c.b.transposed, .dtype = c.out.dtype, .batch_out = c.batch_out, .batched = c.batches.n > 1 };
+    const seen = rows_done.getOrPut(std.heap.c_allocator, key) catch return;
+    if (seen.found_existing) return;
+    var m: usize = 2;
+    while (m <= rows_ceiling) : (m = @max(m + 1, m + m / 8)) prepareAt(c, m);
+    for ([_]usize{ c.k / 3, c.k / 2, c.k -| c.n, c.n, (1 << 20) / @max(c.n, 1) }) |edge| for ([_]usize{ edge, edge + 1 }) |e| {
+        if (e >= 2 and e <= rows_ceiling) prepareAt(c, e);
+    };
+}
+
+fn prepareAt(c: Call, m: usize) void {
+    var at = c;
+    at.m = m;
+    at.arm_m = m;
+    prepare(at);
+}
+
+/// Makes, without launching, the kernels `steel` launches for `c` in every alignment a request's lengths pick.
+fn prepare(c: Call) void {
+    switch (steelPath(c)) {
+        .split_k => {
+            const t = splitKTile(c);
+            for (0..16) |bits| {
+                const other: Tile = .{ .bm = if (bits & 4 != 0) 32 else 16, .bn = if (bits & 8 != 0) 32 else 16, .bk = t.bk, .wm = t.wm, .wn = t.wn };
+                _ = splitKKernel(c, other, bits & 1 != 0, bits & 2 != 0) catch continue;
+            }
+        },
+        .split_k_nax => {
+            const t = splitKNaxTile(c).t;
+            for (0..8) |bits| _ = splitKNaxKernel(c, t, bits & 1 != 0, bits & 2 != 0, bits & 4 != 0) catch continue;
+        },
+        .fused => {
+            const t = fusedTile(c);
+            for (0..8) |bits| _ = fusedKernel("steel_gemm_fused", c, t, bits & 1 != 0, bits & 2 != 0, bits & 4 != 0) catch continue;
+        },
+        .fused_nax => {
+            const t = fusedNaxTile(c).t;
+            for (0..8) |bits| _ = fusedKernel("steel_gemm_fused_nax", c, t, bits & 1 != 0, bits & 2 != 0, bits & 4 != 0) catch continue;
+        },
+    }
+}
+
+pub const Tile = struct { bm: usize, bn: usize, bk: usize, wm: usize, wn: usize };
 
 /// `GEMMParams` of mlx/backend/metal/kernels/steel/gemm/params.h.
-const GemmParams = extern struct {
+pub const GemmParams = extern struct {
     m: c_int,
     n: c_int,
     k: c_int,
@@ -477,17 +568,26 @@ const SplitKParams = extern struct {
 
 /// `steel_matmul_regular_axpby`'s tile, MLX's `GEMM_TPARAM_MACRO`.
 fn fused(c: Call) Error!void {
+    return fusedLaunch(c, "steel_gemm_fused", fusedTile(c), 0);
+}
+
+fn fusedTile(c: Call) Tile {
+    return gemmTile(c.g, c.out.dtype, c.a.transposed, c.b.transposed, c.batch_out, c.arm_m, c.n, c.k);
+}
+
+/// PURE: MLX's `GEMM_TPARAM_MACRO`, for every steel product that takes it.
+pub fn gemmTile(g: Gpu, dtype: core.Dtype, transpose_a: bool, transpose_b: bool, batch_out: usize, m: usize, n: usize, k: usize) Tile {
     var t: Tile = .{ .bm = 64, .bn = 64, .bk = 16, .wm = 2, .wn = 2 };
-    const nt = !c.a.transposed and c.b.transposed;
-    const half = c.out.dtype != .float32;
+    const nt = !transpose_a and transpose_b;
+    const half = dtype != .float32;
     const nt_tile: Tile = .{ .bm = 64, .bn = 32, .bk = 32, .wm = 2, .wn = 2 };
     const half_tile: Tile = .{ .bm = 64, .bn = 64, .bk = 16, .wm = 1, .wn = 2 };
-    if (c.g.class == .g or c.g.class == .p) {
+    if (g.class == .g or g.class == .p) {
         if (nt) t = nt_tile else if (half) t = half_tile;
-    } else if (c.g.class == .d) {
-        if (c.batch_out * c.arm_m * c.n >= 1 << 20) {
+    } else if (g.class == .d) {
+        if (batch_out * m * n >= 1 << 20) {
             if (half) {
-                t = if (2 * @max(c.arm_m, c.n) > c.k) half_tile else if (nt) nt_tile else .{ .bm = 32, .bn = 64, .bk = 16, .wm = 1, .wn = 2 };
+                t = if (2 * @max(m, n) > k) half_tile else if (nt) nt_tile else .{ .bm = 32, .bn = 64, .bk = 16, .wm = 1, .wn = 2 };
             }
         } else if (half) {
             t = if (nt) nt_tile else half_tile;
@@ -495,11 +595,16 @@ fn fused(c: Call) Error!void {
             t = if (nt) .{ .bm = 32, .bn = 64, .bk = 16, .wm = 1, .wn = 2 } else nt_tile;
         }
     }
-    return fusedLaunch(c, "steel_gemm_fused", t, 0);
+    return t;
 }
 
 /// `steel_matmul_regular_axpby_nax`'s tile and swizzle.
 fn fusedNax(c: Call) Error!void {
+    const ts = fusedNaxTile(c);
+    return fusedLaunch(c, "steel_gemm_fused_nax", ts.t, ts.swizzle);
+}
+
+fn fusedNaxTile(c: Call) struct { t: Tile, swizzle: u5 } {
     var t: Tile = .{ .bm = 128, .bn = 128, .bk = 512, .wm = 4, .wn = 4 };
     const class = c.g.class;
     if (class == .s or class == .c) {
@@ -512,7 +617,7 @@ fn fusedNax(c: Call) Error!void {
     const tiles_m = (c.m + t.bm - 1) / t.bm;
     var swizzle: u5 = if (tiles_m <= 3) 0 else 1;
     if (class == .s or class == .c) swizzle = 2 else if (class == .d) swizzle = if (c.m > c.n) 0 else 2;
-    return fusedLaunch(c, "steel_gemm_fused_nax", t, swizzle);
+    return .{ .t = t, .swizzle = swizzle };
 }
 
 /// The fused kernel of `family` for a product whose M, N and K are whole tiles or not: MLX specializes it by those three
@@ -537,11 +642,7 @@ fn fusedKernel(comptime family: []const u8, c: Call, t: Tile, align_m: bool, ali
 fn fusedLaunch(c: Call, comptime family: []const u8, t: Tile, swizzle: u5) Error!void {
     const has_batch = c.batches.n > 1;
     const kern = try fusedKernel(family, c, t, c.m % t.bm == 0, c.n % t.bn == 0, c.k % t.bk == 0);
-    // Until the load seals the pipelines, a SIMD tile's other seven alignments are made with it, those the library holds:
-    // a request's lengths pick them.
-    if (!core.sealed and comptime std.mem.eql(u8, family, "steel_gemm_fused")) for (0..8) |bits| {
-        _ = fusedKernel(family, c, t, bits & 1 != 0, bits & 2 != 0, bits & 4 != 0) catch continue;
-    };
+    if (!core.sealed and c.arm_m != c.m) prepare(c);
     var tiles_n = (c.n + t.bn - 1) / t.bn;
     var tiles_m = (c.m + t.bm - 1) / t.bm;
     const params: GemmParams = .{
@@ -621,23 +722,22 @@ fn splitKKernel(c: Call, t: Tile, aligned_mn: bool, aligned_k: bool) Error!metal
     return stock.kernel(try stock.named(&buf, "steel_gemm_splitk_{c}{c}_{s}_float32_bm{d}_bn{d}_bk{d}_wm{d}_wn{d}_MN_{c}aligned_K_{c}aligned", .{ letter(c.a.transposed), letter(c.b.transposed), try stock.typeName(c.out.dtype), t.bm, t.bn, t.bk, t.wm, t.wn, letter(aligned_mn), letter(aligned_k) }));
 }
 
+fn splitKTile(c: Call) Tile {
+    return .{ .bm = if (c.arm_m < 40) 16 else 32, .bn = if (c.n < 40) 16 else 32, .bk = 16, .wm = 2, .wn = 2 };
+}
+
 /// `steel_gemm_splitk_axpby`: a long inner axis cut into parts, each a product into f32, then summed.
 fn splitK(c: Call) Error!void {
     const tm = (c.arm_m + 31) / 32;
     const tn = (c.n + 31) / 32;
     const tk = c.k / 16;
-    const t: Tile = .{ .bm = if (c.arm_m < 40) 16 else 32, .bn = if (c.n < 40) 16 else 32, .bk = 16, .wm = 2, .wn = 2 };
+    const t = splitKTile(c);
     const parts_n = @min(@max(2, nextPowerOfTwo(tk / (tm * tn))), 32);
     const iterations = (c.k / t.bk) / parts_n;
     const parts = try core.fresh(.float32, &.{ Call.int(parts_n), Call.int(c.m), Call.int(c.n) });
     defer core.release(parts);
     const kern = try splitKKernel(c, t, c.m % t.bm == 0 and c.n % t.bn == 0, c.k % t.bk == 0);
-    // Until the load seals the pipelines, the other alignments and tile sizes are made with it, those the library holds: a
-    // request's lengths pick them.
-    if (!core.sealed) for (0..16) |bits| {
-        const other: Tile = .{ .bm = if (bits & 4 != 0) 32 else 16, .bn = if (bits & 8 != 0) 32 else 16, .bk = t.bk, .wm = t.wm, .wn = t.wn };
-        _ = splitKKernel(c, other, bits & 1 != 0, bits & 2 != 0) catch continue;
-    };
+    if (!core.sealed and c.arm_m != c.m) prepare(c);
     const tiles_n = (c.n + t.bn - 1) / t.bn;
     const tiles_m = (c.m + t.bm - 1) / t.bm;
     const params: SplitKParams = .{
@@ -665,12 +765,10 @@ fn splitK(c: Call) Error!void {
     try accumulate(c, parts, parts_n);
 }
 
-/// `steel_gemm_splitk_axpby_nax`.
-fn splitKNax(c: Call) Error!void {
+fn splitKNaxTile(c: Call) struct { t: Tile, part_size: usize } {
     var t: Tile = .{ .bm = 128, .bn = 128, .bk = 512, .wm = 4, .wn = 4 };
     var part_size: usize = 4096;
-    const ultra = c.g.class == .d;
-    if (ultra) {
+    if (c.g.class == .d) {
         if (c.arm_m <= 2048 and c.n <= 2048) {
             t = .{ .bm = 64, .bn = 64, .bk = 256, .wm = 2, .wn = 2 };
             part_size = 2048;
@@ -682,17 +780,28 @@ fn splitKNax(c: Call) Error!void {
     }
     if ((c.arm_m + c.n) / 2 < 512 or c.k <= 4096) t = .{ .bm = 64, .bn = 64, .bk = 256, .wm = 2, .wn = 2 };
     if (c.k <= 1024) part_size = c.k / 2 else if (c.k <= 2048) part_size = 1024 else if (c.k <= 4096) part_size = 2048;
-    const parts_n = (c.k + part_size - 1) / part_size;
-    const parts = try core.fresh(.float32, &.{ Call.int(parts_n), Call.int(c.m), Call.int(c.n) });
-    defer core.release(parts);
-    const align_m = c.m % t.bm == 0;
-    const align_n = c.n % t.bn == 0;
-    const align_k = c.k % t.bk == 0;
+    return .{ .t = t, .part_size = part_size };
+}
+
+fn splitKNaxKernel(c: Call, t: Tile, align_m: bool, align_n: bool, align_k: bool) Error!metal.Pipeline {
     var name_buf: [128]u8 = undefined;
     const name = try stock.named(&name_buf, "steel_gemm_splitk_nax_{c}{c}_{s}_float32_bm{d}_bn{d}_bk{d}_wm{d}_wn{d}", .{ letter(c.a.transposed), letter(c.b.transposed), try stock.typeName(c.out.dtype), t.bm, t.bn, t.bk, t.wm, t.wn });
     var hash_buf: [192]u8 = undefined;
     const hash = try stock.named(&hash_buf, "{s}_align_M_{c}_align_N_{c}_align_K_{c}", .{ name, letter(align_m), letter(align_n), letter(align_k) });
-    const kern = try stock.kernelFlags(name, hash, &.{ .{ .index = 200, .value = align_m }, .{ .index = 201, .value = align_n } });
+    return stock.kernelFlags(name, hash, &.{ .{ .index = 200, .value = align_m }, .{ .index = 201, .value = align_n } });
+}
+
+/// `steel_gemm_splitk_axpby_nax`.
+fn splitKNax(c: Call) Error!void {
+    const tp = splitKNaxTile(c);
+    const t = tp.t;
+    const part_size = tp.part_size;
+    const ultra = c.g.class == .d;
+    const parts_n = (c.k + part_size - 1) / part_size;
+    const parts = try core.fresh(.float32, &.{ Call.int(parts_n), Call.int(c.m), Call.int(c.n) });
+    defer core.release(parts);
+    const kern = try splitKNaxKernel(c, t, c.m % t.bm == 0, c.n % t.bn == 0, c.k % t.bk == 0);
+    if (!core.sealed and c.arm_m != c.m) prepare(c);
     const tiles_n = (c.n + t.bn - 1) / t.bn;
     const tiles_m = (c.m + t.bm - 1) / t.bm;
     var swizzle: u5 = if (tiles_m <= 3) 0 else 1;

@@ -32,7 +32,7 @@ const tmpRoot = kd.tmpRoot;
 
 /// A test tensor of `shape` filled with `v` (f32). Owned by the caller.
 fn filledArray(shape: []const c_int, v: f32, s: mlx.mlx_stream) !mlx.mlx_array {
-    const scalar = mlx.mlx_array_new_float(v);
+    const scalar = try mlx.newFloat(v);
     defer _ = mlx.mlx_array_free(scalar);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);

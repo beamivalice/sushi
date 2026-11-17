@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """A served Qwen3.8-Flash-Next pack cut to its first N decoder layers, the test fixture that reaches every kernel a
 served load runs (each kernel is gated on the served widths, which no toy built at small widths has).
 

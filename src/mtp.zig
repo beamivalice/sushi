@@ -150,9 +150,9 @@ pub const RerankCoarse = struct {
 };
 
 /// The coarse readout head: a low-bit/gs64 requantized copy of the target's
-/// lm_head, materialized so the first draft does not pay for it. Infallible —
-/// every refusal returns null and the caller keeps its full-readout path.
-pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Trunk, bits: u32) ?RerankCoarse {
+/// lm_head, materialized so the first draft does not pay for it. On MLX's stream every refusal returns null and the
+/// caller keeps its full-readout path; on the engine's a failed build is the load's error.
+pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Trunk, bits: u32) !?RerankCoarse {
     if (bits == 0) return null;
     if (target.lm_head_s.ctx == null) return null; // dense bf16 - row-gather rerank unbuilt/unmeasured
     const w_shape = mlx.getShape(target.lm_head_w);
@@ -172,6 +172,7 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Trunk, bits: u32) ?RerankCo
         bits,
         32768,
     ) catch |err| {
+        if (mlx.engine.isStream(s)) return err;
         log.warn("[mtp] draft rerank coarse build failed ({s}) - keeping the full-readout path\n", .{@errorName(err)});
         return null;
     };
@@ -180,8 +181,9 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Trunk, bits: u32) ?RerankCo
     _ = mlx.mlx_vector_array_append_value(eval_vec, rc.w);
     _ = mlx.mlx_vector_array_append_value(eval_vec, rc.s);
     _ = mlx.mlx_vector_array_append_value(eval_vec, rc.b);
-    mlx.check(mlx.mlx_eval(eval_vec)) catch {
+    mlx.check(mlx.mlx_eval(eval_vec)) catch |err| {
         rc.deinit();
+        if (mlx.engine.isStream(s)) return err;
         log.warn("[mtp] draft rerank coarse eval failed - keeping the full-readout path\n", .{});
         return null;
     };
@@ -206,7 +208,7 @@ pub fn maskAndArgmax(s: mlx.mlx_stream, logits_in: mlx.mlx_array, suppress_mask:
     defer _ = mlx.mlx_array_free(logits);
     try mlx.check(mlx.mlx_array_set(&logits, logits_in));
     if (suppress_mask) |m| {
-        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        const neg_inf = try mlx.newFloat(-std.math.inf(f32));
         defer _ = mlx.mlx_array_free(neg_inf);
         var masked = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits, s));
@@ -266,7 +268,7 @@ fn rerankMaskCoarse(s: mlx.mlx_stream, logits: *mlx.mlx_array, suppress_mask: ?m
     // The mask goes on the COARSE row: a reserved id that never enters the
     // shortlist cannot be re-scored back into the draft.
     const m = suppress_mask orelse return;
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    const neg_inf = try mlx.newFloat(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     var masked = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits.*, s));
@@ -309,6 +311,9 @@ fn rerankShortlistRow(
     x_row: mlx.mlx_array,
 ) !?Shortlist {
     const cands = draftTop32(s, flat, rows) catch |err| {
+        // On the engine's stream a launch is never refused for the GPU's sake: a refusal is the request's error, and
+        // the head stays for the next request. Only a shape the kernel does not serve declines it there.
+        if (mlx.engine.isStream(s) and err != error.UnsupportedTop32Shape) return err;
         log.warn("[mtp] draft rerank shortlist failed ({s}) - dropping to the full readout\n", .{@errorName(err)});
         retireCoarse(coarse);
         return null;
@@ -1246,7 +1251,7 @@ pub const RerankFixture = struct {
         // must not differ by a rounding the test would read as a rerank miss.
         for (buf) |*v| v.* = @as(f32, @floatFromInt(rand.intRangeAtMost(i32, -128, 127))) * 0.0078125;
         const shape = [_]c_int{ vocab, hidden };
-        const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 2, .float32);
+        const f32_arr = try mlx.newData(buf.ptr, &shape, .float32);
         defer _ = mlx.mlx_array_free(f32_arr);
         var dense = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&dense, f32_arr, .bfloat16, s));
@@ -1295,7 +1300,7 @@ pub const RerankFixture = struct {
         defer testing.allocator.free(buf);
         for (buf) |*v| v.* = @as(f32, @floatFromInt(rand.intRangeAtMost(i32, -64, 63))) * 0.015625;
         const shape = [_]c_int{ 1, 1, self.hidden };
-        const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
+        const f32_arr = try mlx.newData(buf.ptr, &shape, .float32);
         defer _ = mlx.mlx_array_free(f32_arr);
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
@@ -1368,7 +1373,7 @@ test "mtp: draft rerank returns the exact argmax whenever it is inside the coars
     var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0x5EED);
     defer fx.deinit();
 
-    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    const coarse = (try buildRerankCoarse(s, &fx.xfm, 3)) orelse return error.CoarseBuildDeclined;
     var slot: ?RerankCoarse = coarse;
     defer if (slot) |*q| q.deinit();
     var logged = false;
@@ -1488,7 +1493,7 @@ test "mtp: the coarse rerank head drafts at its BUILT width, not the env's curre
     defer fx.deinit();
 
     // Built at 3 bits...
-    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    const coarse = (try buildRerankCoarse(s, &fx.xfm, 3)) orelse return error.CoarseBuildDeclined;
     var slot: ?RerankCoarse = coarse;
     defer if (slot) |*q| q.deinit();
     // ...and the head SAYS so, without asking the environment.
@@ -1574,7 +1579,7 @@ test "mtp: batched rerank ids equal N solo rerankSelect" {
     const s = mlx.gpuStream();
     var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xBA7C);
     defer fx.deinit();
-    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    const coarse = (try buildRerankCoarse(s, &fx.xfm, 3)) orelse return error.CoarseBuildDeclined;
     var slot: ?RerankCoarse = coarse;
     defer if (slot) |*q| q.deinit();
     var logged = false;
@@ -1638,6 +1643,75 @@ test "mtp: rerankSelect declines without a coarse head, and the full readout is 
     try testing.expectEqual(want, try readIdScalar(got));
 }
 
+test "mtp: on the engine's stream a coarse build or a shortlist refused at any checked call or pool buffer fails by its error, and the head stays" {
+    // A launch there is never refused for the GPU's sake: declining would serve the load or every later request on
+    // the full readout, a different load from the one that was asked for.
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    defer mlx.fault.disarm();
+    const es = mlx.engine.stream();
+    var fx = try RerankFixture.init(es, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xFA17);
+    defer fx.deinit();
+    const x = try fx.randomX(es, 3);
+    defer _ = mlx.mlx_array_free(x);
+
+    var k: u64 = 1;
+    while (true) : (k += 1) {
+        mlx.fault.arm(k);
+        const got = buildRerankCoarse(es, &fx.xfm, 3);
+        const fired = mlx.fault.didFire();
+        mlx.fault.disarm();
+        if (got) |built| {
+            var b = built;
+            if (b) |*q| q.deinit();
+            try testing.expect(!fired);
+            break;
+        } else |_| try testing.expect(fired);
+    }
+
+    var coarse: ?RerankCoarse = (try buildRerankCoarse(es, &fx.xfm, 3)) orelse return error.CoarseBuildDeclined;
+    defer if (coarse) |*q| q.deinit();
+    var logged = false;
+    k = 1;
+    while (true) : (k += 1) {
+        mlx.fault.arm(k);
+        const got = rerankShortlist(es, &fx.xfm, &coarse, &logged, x, null);
+        const fired = mlx.fault.didFire();
+        mlx.fault.disarm();
+        try testing.expect(coarse != null);
+        if (got) |sl| {
+            var l = (sl orelse return error.ShortlistDeclined);
+            l.deinit();
+            try testing.expect(!fired);
+            break;
+        } else |_| try testing.expect(fired);
+    }
+
+    // The pool refusing any one buffer of a shortlist (the engine's own kernels among them) is its error alike.
+    defer mlx.engine.fault.disarm();
+    const c0 = mlx.engine.fault.count();
+    {
+        var l = (try rerankShortlist(es, &fx.xfm, &coarse, &logged, x, null)) orelse return error.ShortlistDeclined;
+        l.deinit();
+    }
+    const total = mlx.engine.fault.count() - c0;
+    try testing.expect(total > 0);
+    var b: u64 = 1;
+    while (b <= total) : (b += 1) {
+        mlx.engine.fault.arm(b);
+        const got = rerankShortlist(es, &fx.xfm, &coarse, &logged, x, null);
+        mlx.engine.fault.disarm();
+        var said: [300]u8 = undefined;
+        if (got) |sl| {
+            var l = (sl orelse return error.ShortlistDeclined);
+            l.deinit();
+        } else |_| _ = mlx.takeError(&said);
+        try testing.expect(coarse != null);
+    }
+}
+
 test "mtp: a suppressed id is never drafted, through the coarse shortlist or the full readout" {
     // The mask goes on the COARSE row, not the re-scored 32: a reserved id
     // that never enters the shortlist cannot be re-scored back into the draft.
@@ -1670,7 +1744,7 @@ test "mtp: a suppressed id is never drafted, through the coarse shortlist or the
     const mask = mlx.mlx_array_new_data(mask_buf.ptr, &mask_shape, 1, .bool_);
     defer _ = mlx.mlx_array_free(mask);
 
-    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    const coarse = (try buildRerankCoarse(s, &fx.xfm, 3)) orelse return error.CoarseBuildDeclined;
     var slot: ?RerankCoarse = coarse;
     defer if (slot) |*q| q.deinit();
     var logged = false;
@@ -1821,7 +1895,7 @@ test "mtp: row-axis coarse logits equal each solo readout" {
     const s = mlx.gpuStream();
     var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 2560, 8, 64, 0x3B17);
     defer fx.deinit();
-    var rc = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    var rc = (try buildRerankCoarse(s, &fx.xfm, 3)) orelse return error.CoarseBuildDeclined;
     defer rc.deinit();
     {
         for ([_]usize{ 2, 4, 8, 17 }) |n| {

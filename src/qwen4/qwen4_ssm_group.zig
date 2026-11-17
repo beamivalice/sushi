@@ -455,7 +455,7 @@ pub fn ssmBindTickState(
 }
 
 fn ssmTickDummyArr(s: mlx.mlx_stream, v: f32, nd: usize) !mlx.mlx_array {
-    const val = mlx.mlx_array_new_float(v);
+    const val = try mlx.newFloat(v);
     defer _ = mlx.mlx_array_free(val);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -519,7 +519,7 @@ const SsmTickSlot = struct {
 };
 
 fn ssmTickBumpArr(s: mlx.mlx_stream, arr: mlx.mlx_array) !mlx.mlx_array {
-    const one = mlx.mlx_array_new_float(1.0);
+    const one = try mlx.newFloat(1.0);
     defer _ = mlx.mlx_array_free(one);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);

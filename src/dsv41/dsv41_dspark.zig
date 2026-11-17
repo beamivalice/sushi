@@ -153,7 +153,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     defer if (block) |*b| b.deinit();
     var block_len: usize = 1 + copied;
     if (copied == 0 and (forced == null or forced.? > 1)) {
-        block = try dsv41_serving.dsv41DraftImpl(xfm, t1);
+        block = try dsv41_serving.dsv41DraftImpl(xfm, &self.ctx, t1);
         block_len = block.?.ids.len;
         @memcpy(ids_buf[0..block_len], block.?.ids);
         @memcpy(conf_buf[0 .. block_len - 1], block.?.conf);
@@ -185,7 +185,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         var row_ids: [dsv41_max_drafts + 1]i32 = undefined;
         if (rows > row_ids.len) return error.SpecDecodeUnsupported;
         for (ids_buf[0..rows], row_ids[0..rows]) |id, *o| o.* = @intCast(id);
-        const row_ids_arr = mlx.mlx_array_new_data(&row_ids, &[_]c_int{ 1, @intCast(rows) }, 2, .int32);
+        const row_ids_arr = try mlx.newData(&row_ids, &[_]c_int{ 1, @intCast(rows) }, .int32);
         defer _ = mlx.mlx_array_free(row_ids_arr);
         _ = try self.thinkShiftRows(&logits, row_ids_arr);
         _ = try self.penaltyShiftRows(&logits, row_ids_arr);
@@ -388,7 +388,7 @@ pub fn dsparkEmitPending(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         return token;
     }
     const tok_i32: i32 = @intCast(token);
-    const tok_input = mlx.mlx_array_new_data(&tok_i32, &[_]c_int{ 1, 1 }, 2, .int32);
+    const tok_input = try mlx.newData(&tok_i32, &[_]c_int{ 1, 1 }, .int32);
     defer _ = mlx.mlx_array_free(tok_input);
     self.pending = .{ .logits = try self.xfm.forwardWith(&self.ctx, tok_input) };
     return token;

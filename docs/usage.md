@@ -172,7 +172,9 @@ DeepSeek serves a 1,000,000-token context and a 256,000-token budget for a reque
 authors recommend; `--ctx-size` and `--max-tokens` still override them.
 
 - **`--ssd-budget-gb` defaults to 80 on 96 GB Macs; 128 GB Macs default to 96, or 108 with `iogpu.wired_limit_mb` at 120000 or more (the recommended 125000); pass `--ssd-budget-gb` to change it.** 192 and
-  256 GB Macs load the pack fully resident by default. Any other RAM size must pass it. The default steps down to the
+  256 GB Macs load the pack fully resident by default, and a fully resident load serves up to 16 requests at once (8 on
+  a Mac without matrix units) as rows of one decode forward, each its single-request output; a streamed load serves one
+  at a time ([dsv41-arch](dsv41-arch.md)). Any other RAM size must pass it. The default steps down to the
   largest budget the Mac's limits hold beside a 1M request and an image encode, and the load log says which limit bound
   it; a flag outranks `ssd_budget_gb` in `model-settings.json`, which outranks the default. The budget is everything the load keeps resident (trunk, DSpark, vision tower, workspace)
   plus the expert cache, which gets the rest; more budget means more expert slots and fewer SSD reads. Budget, the

@@ -359,6 +359,8 @@ fn inputsFit(g: Geometry, t_len: c_int, in: Inputs) bool {
 /// a state or gate that is neither bf16 nor f32.
 pub fn step(g: Geometry, t_len: c_int, in: Inputs, capture: bool, s: mlx.mlx_stream) !?Recur {
     if (!mlx.streamIsGpu(s) or !inputsFit(g, t_len, in)) return null;
+    // Either verify can be rebuilt at a shorter accepted count: from its per-step states or from a Replay.
+    if (t_len > 1) try makeReplayAhead(g, t_len, in, s);
 
     const seq = t_len > 1 and capture;
     const kernel = if (t_len > 1)
@@ -403,6 +405,39 @@ pub fn step(g: Geometry, t_len: c_int, in: Inputs, capture: bool, s: mlx.mlx_str
     try mlx.check(mlx.mlx_vector_array_get(&out.ssm_state, o, 2));
     if (seq) try mlx.check(mlx.mlx_vector_array_get(&out.state_seq, o, 3));
     return out;
+}
+
+var replay_ahead: [MAX_SEQ + 1]bool = @splat(false);
+var replay_ahead_key: ?Widths = null;
+
+/// A partial accept replays a verify's first rows without capture (`replayState`), at counts the warm's mostly accepted
+/// rounds may never take: before the seal, on the engine, a captured verify also runs that kernel at each count up to
+/// its own, so a request compiles none.
+fn makeReplayAhead(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) anyerror!void {
+    if (mlx.engine.sealed() or !mlx.engine.isStream(s)) return;
+    const widths = Widths{ .g = g, .state = mlx.mlx_array_dtype(in.ssm_state), .gate = in.gate_dtype };
+    if (replay_ahead_key == null or !std.meta.eql(replay_ahead_key.?, widths)) {
+        replay_ahead = @splat(false);
+        replay_ahead_key = widths;
+    }
+    var rows: c_int = 2;
+    while (rows <= t_len) : (rows += 1) {
+        const i: usize = @intCast(rows);
+        if (replay_ahead[i]) continue;
+        replay_ahead[i] = true;
+        const qkv = try rowsOf(in.qkv, 0, rows, s);
+        defer _ = mlx.mlx_array_free(qkv);
+        const a = try rowsOf(in.a, 0, rows, s);
+        defer _ = mlx.mlx_array_free(a);
+        const b = try rowsOf(in.b, 0, rows, s);
+        defer _ = mlx.mlx_array_free(b);
+        var sub = in;
+        sub.qkv = qkv;
+        sub.a = a;
+        sub.b = b;
+        var r = (try step(g, rows, sub, false, s)) orelse continue;
+        r.deinit();
+    }
 }
 
 /// What a verify that stored only its final state keeps so a partial accept can rebuild the state
@@ -571,7 +606,7 @@ pub fn stepFold(g: Geometry, t_len: c_int, in: Inputs, z: mlx.mlx_array, norm_w:
             try mlx.check(mlx.mlx_zeros(&dummy[i], shape.ptr, shape.len, mlx.mlx_array_dtype(a), s));
         }
         _ = mlx.mlx_array_free(dummy[12]);
-        dummy[12] = mlx.mlx_array_new_float(1e-6);
+        dummy[12] = try mlx.newFloat(1e-6);
         const pv = mlx.mlx_vector_array_new_data(&dummy, dummy.len);
         defer _ = mlx.mlx_vector_array_free(pv);
         var po = mlx.mlx_vector_array_new();
@@ -597,6 +632,100 @@ pub fn stepFold(g: Geometry, t_len: c_int, in: Inputs, z: mlx.mlx_array, norm_w:
     inline for (.{ &out.gated, &out.conv_state, &out.ssm_state, &out.state_seq, &out.conv_input }, 0..) |a, i|
         try mlx.check(mlx.mlx_vector_array_get(a, ov, i));
     return out;
+}
+
+test "gdn recur: on the engine before the seal a captured verify makes the replay kernel at each count up to its own" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    const s = mlx.engine.stream();
+    // One key head and one value head: a geometry no other test takes, so its pipelines are this test's to make.
+    const g: Geometry = .{ .hk = 1, .hv = 1, .dk = 128, .dv = 128 };
+    const c: c_int = 2 * 128 + 128;
+    const t: c_int = 4;
+    const Arr = struct {
+        fn zeros(shape: []const c_int, dtype: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_zeros(&out, shape.ptr, shape.len, dtype, st));
+            return out;
+        }
+    };
+    var held: [10]mlx.mlx_array = undefined;
+    const shapes = [_][]const c_int{ &.{ 1, t, c }, &.{ 1, t, 1 }, &.{ 1, t, 1 }, &.{ 1, 3, c }, &.{ 1, 1, 128, 128 }, &.{ c, 4, 1 }, &.{1}, &.{1}, &.{}, &.{} };
+    const dtypes = [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32, .bfloat16, .float32, .bfloat16, .bfloat16, .bfloat16 };
+    for (&held, shapes, dtypes) |*h, shape, dtype| h.* = try Arr.zeros(shape, dtype, s);
+    defer for (held) |h| {
+        _ = mlx.mlx_array_free(h);
+    };
+    const in = Inputs{ .qkv = held[0], .a = held[1], .b = held[2], .conv_state = held[3], .ssm_state = held[4], .conv_w = held[5], .A_log = held[6], .dt_bias = held[7], .q_scale = held[8], .k_scale = held[9], .gate_dtype = .float32 };
+    var verify = (try step(g, t, in, true, s)) orelse return error.GdnStepDeclined;
+    verify.deinit();
+    mlx.engine.seal(true);
+    defer mlx.engine.seal(false);
+    const late = mlx.engine.latePipelines();
+    var rows: c_int = 2;
+    while (rows < t) : (rows += 1) {
+        const qkv = try rowsOf(in.qkv, 0, rows, s);
+        defer _ = mlx.mlx_array_free(qkv);
+        const a = try rowsOf(in.a, 0, rows, s);
+        defer _ = mlx.mlx_array_free(a);
+        const b = try rowsOf(in.b, 0, rows, s);
+        defer _ = mlx.mlx_array_free(b);
+        var sub = in;
+        sub.qkv = qkv;
+        sub.a = a;
+        sub.b = b;
+        var replay = (try step(g, rows, sub, false, s)) orelse return error.GdnStepDeclined;
+        replay.deinit();
+    }
+    try testing.expectEqual(late, mlx.engine.latePipelines());
+}
+
+test "gdn recur: on the engine before the seal a verify that keeps only its final state makes the replay at each count up to its own" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    const s = mlx.engine.stream();
+    // One key head and two value heads: a geometry no other test takes, so its pipelines are this test's to make.
+    const g: Geometry = .{ .hk = 1, .hv = 2, .dk = 128, .dv = 128 };
+    const c: c_int = 2 * 128 + 2 * 128;
+    const t: c_int = 5;
+    var held: [10]mlx.mlx_array = undefined;
+    const shapes = [_][]const c_int{ &.{ 1, t, c }, &.{ 1, t, 2 }, &.{ 1, t, 2 }, &.{ 1, 3, c }, &.{ 1, 2, 128, 128 }, &.{ c, 4, 1 }, &.{2}, &.{2}, &.{}, &.{} };
+    const dtypes = [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32, .bfloat16, .float32, .bfloat16, .bfloat16, .bfloat16 };
+    for (&held, shapes, dtypes) |*h, shape, dtype| {
+        h.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(h, shape.ptr, shape.len, dtype, s));
+    }
+    defer for (held) |h| {
+        _ = mlx.mlx_array_free(h);
+    };
+    const in = Inputs{ .qkv = held[0], .a = held[1], .b = held[2], .conv_state = held[3], .ssm_state = held[4], .conv_w = held[5], .A_log = held[6], .dt_bias = held[7], .q_scale = held[8], .k_scale = held[9], .gate_dtype = .float32 };
+    // A verify that keeps a Replay: a partial accept rebuilds the state at the accepted count.
+    var verify = (try step(g, t, in, false, s)) orelse return error.GdnStepDeclined;
+    verify.deinit();
+    mlx.engine.seal(true);
+    defer mlx.engine.seal(false);
+    const late = mlx.engine.latePipelines();
+    var rows: c_int = 2;
+    while (rows < t) : (rows += 1) {
+        const qkv = try rowsOf(in.qkv, 0, rows, s);
+        defer _ = mlx.mlx_array_free(qkv);
+        const a = try rowsOf(in.a, 0, rows, s);
+        defer _ = mlx.mlx_array_free(a);
+        const b = try rowsOf(in.b, 0, rows, s);
+        defer _ = mlx.mlx_array_free(b);
+        var sub = in;
+        sub.qkv = qkv;
+        sub.a = a;
+        sub.b = b;
+        var replay = (try step(g, rows, sub, false, s)) orelse return error.GdnStepDeclined;
+        replay.deinit();
+    }
+    try testing.expectEqual(late, mlx.engine.latePipelines());
 }
 
 test "logical capture includes every defined state and the separate final state" {

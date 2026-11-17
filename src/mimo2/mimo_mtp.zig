@@ -37,7 +37,8 @@ pub const MAX_HEADS: usize = 3;
 /// Builds `t`'s coarse lm_head copy if its shortlist cell holds none; whether the cell holds one after.
 pub fn buildCoarseHead(s: mlx.mlx_stream, t: *Trunk) bool {
     const slot = mimo2_state.coarseHead(t) orelse return false;
-    if (slot.* == null) slot.* = mtp_mod.buildRerankCoarse(s, t, rerankBits());
+    // MiMo never loads on the engine, where alone a build fails rather than declines.
+    if (slot.* == null) slot.* = mtp_mod.buildRerankCoarse(s, t, rerankBits()) catch null;
     return slot.* != null;
 }
 

@@ -27,7 +27,7 @@ pub fn buildCounts(allocator: std.mem.Allocator, ids: []const u32, vocab: usize)
         if (id < vocab) buf[id] += 1;
     }
     const shape = [_]c_int{@intCast(vocab)};
-    return mlx.mlx_array_new_data(buf.ptr, &shape, 1, .int32);
+    return try mlx.newData(buf.ptr, &shape, .int32);
 }
 
 fn asFloat32(out: *mlx.mlx_array, a: mlx.mlx_array, s: mlx.mlx_stream) !void {
@@ -38,7 +38,7 @@ fn asFloat32(out: *mlx.mlx_array, a: mlx.mlx_array, s: mlx.mlx_stream) !void {
 /// `logits`). The serial sampler and the MTP verify rows both come here, so a row equals its serial tick.
 pub fn apply(res: *mlx.mlx_array, logits: mlx.mlx_array, counts: mlx.mlx_array, pen: Penalties, s: mlx.mlx_stream) !void {
     var current = logits;
-    const zero_i = mlx.mlx_array_new_int(0);
+    const zero_i = try mlx.newInt(0);
     defer _ = mlx.mlx_array_free(zero_i);
     var seen = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(seen);
@@ -52,11 +52,11 @@ pub fn apply(res: *mlx.mlx_array, logits: mlx.mlx_array, counts: mlx.mlx_array, 
     };
 
     if (repeatOn(pen.repeat)) {
-        const rp = mlx.mlx_array_new_float(pen.repeat);
+        const rp = try mlx.newFloat(pen.repeat);
         defer _ = mlx.mlx_array_free(rp);
-        const inv_rp = mlx.mlx_array_new_float(1.0 / pen.repeat);
+        const inv_rp = try mlx.newFloat(1.0 / pen.repeat);
         defer _ = mlx.mlx_array_free(inv_rp);
-        const zero = mlx.mlx_array_new_float(0.0);
+        const zero = try mlx.newFloat(0.0);
         defer _ = mlx.mlx_array_free(zero);
 
         var positive_mask = mlx.mlx_array_new();
@@ -91,9 +91,9 @@ pub fn apply(res: *mlx.mlx_array, logits: mlx.mlx_array, counts: mlx.mlx_array, 
     var counts_f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(counts_f);
     try asFloat32(&counts_f, counts, s);
-    const pp = mlx.mlx_array_new_float(pen.presence);
+    const pp = try mlx.newFloat(pen.presence);
     defer _ = mlx.mlx_array_free(pp);
-    const fp = mlx.mlx_array_new_float(pen.frequency);
+    const fp = try mlx.newFloat(pen.frequency);
     defer _ = mlx.mlx_array_free(fp);
     var by_presence = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(by_presence);

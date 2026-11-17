@@ -10,6 +10,7 @@ const trunk_stq = @import("trunk_stq.zig");
 // so has no head-shaped state of its own. mtp.zig imports this file back for
 // `Trunk`; neither type closes a comptime loop.
 pub const mtp_mod = @import("mtp.zig");
+const chains = @import("tensor/chains.zig");
 const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
@@ -1204,7 +1205,7 @@ pub const Trunk = struct {
             defer allocator.free(freqs_f32);
             for (freqs_f64, 0..) |v, i| freqs_f32[i] = @floatCast(v);
             const fshape = [_]c_int{@intCast(half)};
-            rope_freqs_yarn = mlx.mlx_array_new_data(freqs_f32.ptr, &fshape, 1, .float32);
+            rope_freqs_yarn = try mlx.newData(freqs_f32.ptr, &fshape, .float32);
             // mscale vector [head_dim]: af on rotary dims, 1.0 on the tail.
             // Multiplying the post-rope q/k by this is exactly the reference's
             // cos/sin *= attention_factor (rotated dims only, pass dims untouched).
@@ -1212,7 +1213,7 @@ pub const Trunk = struct {
             defer allocator.free(mscale_f32);
             for (mscale_f32, 0..) |*m, i| m.* = if (i < rotary_dim) config.yarn_attention_factor else 1.0;
             const mshape = [_]c_int{@intCast(config.head_dim)};
-            yarn_mscale = mlx.mlx_array_new_data(mscale_f32.ptr, &mshape, 1, .float32);
+            yarn_mscale = try mlx.newData(mscale_f32.ptr, &mshape, .float32);
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             _ = mlx.mlx_vector_array_append_value(eval_vec, rope_freqs_yarn.?);
@@ -1697,9 +1698,7 @@ pub const Trunk = struct {
     /// `[B, L, hidden]` bf16 (MiMo dense tables retain their dtype), caller frees.
     pub fn rawEmbedding(self: *const Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (self.emb_w.ctx == null) return error.MissingWeight;
-        const id_shape = mlx.getShape(token_ids);
-        const batch = id_shape[0];
-        const seq_len = id_shape[1];
+        const batch, const seq_len = try mlx.shapeOf(token_ids, 2);
 
         const flat_shape = [_]c_int{batch * seq_len};
         var flat_ids = mlx.mlx_array_new();
@@ -1787,7 +1786,7 @@ pub const Trunk = struct {
         const h_shape = mlx.getShape(h);
 
         // mask = (token_ids == image_token_id) [| (token_ids == video_token_id)].
-        const img_id_arr = mlx.mlx_array_new_int(@intCast(image_token_id));
+        const img_id_arr = try mlx.newInt(@intCast(image_token_id));
         defer _ = mlx.mlx_array_free(img_id_arr);
         var mask_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_2d);
@@ -1797,7 +1796,7 @@ pub const Trunk = struct {
         // placeholder runs sit in the prompt.
         for ([_]u32{video_token_id}) |extra_id| {
             if (extra_id == 0) continue;
-            const extra_arr = mlx.mlx_array_new_int(@intCast(extra_id));
+            const extra_arr = try mlx.newInt(@intCast(extra_id));
             defer _ = mlx.mlx_array_free(extra_arr);
             var extra_mask = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(extra_mask);
@@ -1845,7 +1844,7 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(cumsum_arr);
         try mlx.check(mlx.mlx_cumsum(&cumsum_arr, mask_int, 0, false, true, s));
         const elem_offset: i64 = @as(i64, @intCast(row_offset)) * @as(i64, @intCast(h_shape[2]));
-        const off_i = mlx.mlx_array_new_int(@intCast(elem_offset - 1));
+        const off_i = try mlx.newInt(@intCast(elem_offset - 1));
         defer _ = mlx.mlx_array_free(off_i);
         var indices = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(indices);
@@ -1860,7 +1859,7 @@ pub const Trunk = struct {
         try mlx.check(mlx.mlx_reshape(&source_flat, vision_emb, &source_shape, 1, s));
 
         // indices_mod = indices % source_size
-        const source_size_arr = mlx.mlx_array_new_int(source_size);
+        const source_size_arr = try mlx.newInt(source_size);
         defer _ = mlx.mlx_array_free(source_size_arr);
         var indices_mod = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(indices_mod);
@@ -1961,6 +1960,7 @@ pub const Trunk = struct {
     }
 
     pub fn silu(self: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array {
+        if (try mlx.engine.fusedChain(chains.silu, self.s, &.{x})) |y| return y;
         var sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sig);
         try mlx.check(mlx.mlx_sigmoid(&sig, x, self.s));
@@ -2264,7 +2264,7 @@ pub const Trunk = struct {
         defer forward_diag.moe_dump_warmup_depth -= 1;
         const dummy_id: i32 = 0; // BOS-ish placeholder; the actual id doesn't matter for warmup
         const decode_shape = [_]c_int{ 1, 1 };
-        const decode_input = mlx.mlx_array_new_data(&dummy_id, &decode_shape, 2, .int32);
+        const decode_input = try mlx.newData(&dummy_id, &decode_shape, .int32);
         defer _ = mlx.mlx_array_free(decode_input);
         const decode_logits = try self.forward(decode_input);
         _ = mlx.mlx_array_free(decode_logits);
@@ -2287,7 +2287,7 @@ pub const Trunk = struct {
 
         const ids_8 = [_]i32{ 0, 0, 0, 0, 0, 0, 0, 0 };
         const prefill_shape = [_]c_int{ 1, 8 };
-        const prefill_input = mlx.mlx_array_new_data(&ids_8, &prefill_shape, 2, .int32);
+        const prefill_input = try mlx.newData(&ids_8, &prefill_shape, .int32);
         defer _ = mlx.mlx_array_free(prefill_input);
         const prefill_logits = try self.forward(prefill_input);
         _ = mlx.mlx_array_free(prefill_logits);
@@ -2346,10 +2346,10 @@ pub const Trunk = struct {
         }
     };
 
-    pub fn specWarmIds(buf: []i32) mlx.mlx_array {
+    pub fn specWarmIds(buf: []i32) mlx.HostArrayRefused!mlx.mlx_array {
         for (buf, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % 40000);
         const shape = [_]c_int{ 1, @intCast(buf.len) };
-        return mlx.mlx_array_new_data(buf.ptr, &shape, 2, .int32);
+        return try mlx.newData(buf.ptr, &shape, .int32);
     }
 
     pub fn specWarmEvalFree(arrays: []const mlx.mlx_array) void {
@@ -2717,7 +2717,7 @@ pub const Trunk = struct {
             for (0..@intCast(seq_len)) |j| lim_buf[n * @as(usize, @intCast(seq_len)) + j] = kl - seq_len + 1 + @as(i32, @intCast(j));
         }
         const lim_shape = [_]c_int{ N, 1, seq_len, 1 };
-        const lens_4d = mlx.mlx_array_new_data(lim_buf[0 .. kv_lens.len * @as(usize, @intCast(seq_len))].ptr, &lim_shape, 4, .int32);
+        const lens_4d = try mlx.newData(lim_buf[0 .. kv_lens.len * @as(usize, @intCast(seq_len))].ptr, &lim_shape, .int32);
         defer _ = mlx.mlx_array_free(lens_4d);
 
         var valid = mlx.mlx_array_new();
@@ -2775,7 +2775,7 @@ pub const Trunk = struct {
             defer self.allocator.free(f32s);
             for (yf, 0..) |v, i| f32s[i] = @floatCast(v);
             const shape = [_]c_int{@intCast(yf.len)};
-            return mlx.mlx_array_new_data(f32s.ptr, &shape, 1, .float32);
+            return try mlx.newData(f32s.ptr, &shape, .float32);
         }
         if (self.consts) |c| for (c.rope_inv) |entry| if (entry) |e| {
             if (e.dims == rope_dims and e.theta == theta) {
@@ -2789,7 +2789,7 @@ pub const Trunk = struct {
         defer _ = mlx.mlx_array_free(j);
         try mlx.check(mlx.mlx_arange(&j, 0, @floatFromInt(half), 1.0, .float32, self.s));
         // inv_freq_j = theta^(-2j/rope_dims) = exp(-j * 2 ln(theta) / rope_dims)
-        const neg = mlx.mlx_array_new_float(-2.0 * @log(theta) / @as(f32, @floatFromInt(rope_dims)));
+        const neg = try mlx.newFloat(-2.0 * @log(theta) / @as(f32, @floatFromInt(rope_dims)));
         defer _ = mlx.mlx_array_free(neg);
         var jl = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(jl);
@@ -2939,7 +2939,7 @@ pub const Trunk = struct {
             if (!traits.drop_expert) return error.LaunchFlagUnsupported;
             const d = try allocator.create(expert_usage.Drop);
             errdefer allocator.destroy(d);
-            d.* = try expert_usage.load(allocator, dir, config.expertDropRequest());
+            d.* = try expert_stream_mod.quant.loadDrop(allocator, dir, config.expertGeometry(), config.expert_layout, config.expertDropRequest());
             break :blk d;
         };
         errdefer if (drop) |d| {
@@ -3093,9 +3093,9 @@ pub const Trunk = struct {
         defer self.allocator.free(sin_buf);
         mrope.fillCosSin(cos_buf, sin_buf, positions, start, stride, n, inv_freq, sel, rope_dims, yarnMscale(cfg));
         const shape = [_]c_int{ 1, 1, @intCast(n), @intCast(rope_dims) };
-        const cf = mlx.mlx_array_new_data(cos_buf.ptr, &shape, 4, .float32);
+        const cf = try mlx.newData(cos_buf.ptr, &shape, .float32);
         defer _ = mlx.mlx_array_free(cf);
-        const sf = mlx.mlx_array_new_data(sin_buf.ptr, &shape, 4, .float32);
+        const sf = try mlx.newData(sin_buf.ptr, &shape, .float32);
         defer _ = mlx.mlx_array_free(sf);
         var cos = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&cos, cf, dtype, self.s));
@@ -3286,6 +3286,7 @@ pub const Trunk = struct {
     }
 
     pub fn moeSharedGateTail(self: *Trunk, expert_sum: mlx.mlx_array, gate_logit: mlx.mlx_array, down: mlx.mlx_array) !mlx.mlx_array {
+        if (try mlx.engine.fusedChain(chains.sigmoid_gated_add, self.s, &.{ expert_sum, gate_logit, down })) |y| return y;
         var gate_sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate_sig);
         try mlx.check(mlx.mlx_sigmoid(&gate_sig, gate_logit, self.s));
@@ -3567,6 +3568,20 @@ pub const Trunk = struct {
             try routerSwapLogits(&swap_logits, router_logits, kind, self.s);
         };
         detail.build_ns = sync_clock.lap();
+        // A resident rate-grouped layer maps a decode's picks to slots on the GPU: no host read stalls the forward on it.
+        // A wider route keeps the host's, which stages its experts' work rather than run every row at once.
+        const decode_rows = streamRows(mlx.getShape(inds)) <= sushi_exl3.kernels.DECODE_ROWS_MAX;
+        if (decode_rows and swap_logits.ctx == null and self.imatrix == null) if (engine.residentRoute(stream_ctx.layer)) |rr| {
+            var slots = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(slots);
+            try mlx.check(mlx.mlx_take_axis(&slots, rr.map, ids_contiguous, 0, self.s));
+            const none: [expert_stream_mod.quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
+            const mw_bank = moe_stream_compute.raggedMoeWeights(mw, &none, rr.bank);
+            const out = try self.moeMLP2WithRouter(expert_x, expert_x, &mw_bank, null, false, null, .{ .inds = slots, .norm_scores = norm_scores });
+            errdefer _ = mlx.mlx_array_free(out);
+            if (!mlx.engine.isStream(self.s)) try handOffStreamedResult(out, streamRows(mlx.getShape(inds)));
+            return out;
+        };
         if (engine.routeProbeActive()) {
             try mlx.check(mlx.mlx_array_eval(expert_x));
             detail.x_wait_ns = sync_clock.lap();
@@ -3581,7 +3596,7 @@ pub const Trunk = struct {
             _ = mlx.mlx_array_free(picked_slots);
         };
         if (spec_route) |route| if (swap_logits.ctx != null and streamRows(mlx.getShape(inds)) == 1) {
-            const starved = mlx.mlx_array_new_data(route.starved.ptr, &[_]c_int{@intCast(route.starved.len)}, 1, .uint8);
+            const starved = try mlx.newData(route.starved.ptr, &[_]c_int{@intCast(route.starved.len)}, .uint8);
             defer _ = mlx.mlx_array_free(starved);
             // A shape the kernel does not take just skips speculation for the lossy pick.
             if (expertPickGpu(ids_contiguous, swap_logits, route.raw, starved, swap_tolerance, self.s)) |pick| {
@@ -3620,7 +3635,7 @@ pub const Trunk = struct {
             if (picked_slots.ctx != null) {
                 const shape = mlx.getShape(inds);
                 try mlx.check(mlx.mlx_reshape(&gathered, picked_slots, shape.ptr, shape.len, self.s));
-            } else try mlx.check(mlx.mlx_take(&gathered, route.slots, ids_contiguous, self.s));
+            } else try mlx.check(mlx.mlx_take_axis(&gathered, route.slots, ids_contiguous, 0, self.s));
             const mw_spec = slabMoeWeights(mw, &route.operands);
             spec_result = try self.moeMLP2WithRouter(expert_x, expert_x, &mw_spec, null, false, null, .{
                 .inds = gathered,
@@ -3716,22 +3731,9 @@ pub const Trunk = struct {
             }
         }
         if (prepared.quantized) {
-            const slab_inds = mlx.mlx_array_new_data(remapped_host.ptr, inds_shape.ptr, @intCast(inds_shape.len), .int32);
+            const slab_inds = try mlx.newData(remapped_host.ptr, inds_shape, .int32);
             defer _ = mlx.mlx_array_free(slab_inds);
-            var mw_slab = slabMoeWeights(mw, &prepared.quant_raw);
-            if (prepared.ragged) |bank| {
-                const first = bank.views[0];
-                mw_slab.exl3_ragged = bank.*;
-                mw_slab.switch_gate_w = first.gate.trellis;
-                mw_slab.switch_gate_s = first.gate.suh;
-                mw_slab.switch_gate_b = first.gate.svh;
-                mw_slab.switch_up_w = first.up.trellis;
-                mw_slab.switch_up_s = first.up.suh;
-                mw_slab.switch_up_b = first.up.svh;
-                mw_slab.switch_down_w = first.down.trellis;
-                mw_slab.switch_down_s = first.down.suh;
-                mw_slab.switch_down_b = first.down.svh;
-            }
+            const mw_slab = if (prepared.ragged) |bank| moe_stream_compute.raggedMoeWeights(mw, &prepared.quant_raw, bank) else slabMoeWeights(mw, &prepared.quant_raw);
             const slab_result = try self.moeMLP2WithRouter(expert_x, expert_x, &mw_slab, null, false, null, .{
                 .inds = slab_inds,
                 .norm_scores = norm_scores,
@@ -3743,7 +3745,7 @@ pub const Trunk = struct {
             try handOffStreamedResult(slab_result, rows);
             return slab_result;
         }
-        const remapped_inds = mlx.mlx_array_new_data(remapped_host.ptr, &[_]c_int{ rows, topk }, 2, .int32);
+        const remapped_inds = try mlx.newData(remapped_host.ptr, &[_]c_int{ rows, topk }, .int32);
         defer _ = mlx.mlx_array_free(remapped_inds);
         const x_shape = mlx.getShape(expert_x);
         var x_rows = mlx.mlx_array_new();
@@ -4080,7 +4082,7 @@ pub const Trunk = struct {
             self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null),
         };
 
-        const router_logits = if (routing_override != null)
+        var router_logits = if (routing_override != null)
             mlx.mlx_array{ .ctx = null }
         else if (router_override) |given| blk: {
             var owned = mlx.mlx_array_new();
@@ -4089,6 +4091,15 @@ pub const Trunk = struct {
         } else try self.moeRouterLogits(router_x, mw);
         defer if (router_logits.ctx != null) {
             _ = mlx.mlx_array_free(router_logits);
+        };
+        // `--drop-expert`: the router never picks an expert the stream left unloaded.
+        if (router_logits.ctx != null) if (stream_ctx) |sc| if (self.expert_stream) |engine| {
+            if (try engine.dropMask(sc.layer, mlx.mlx_array_dtype(router_logits))) |mask| {
+                var masked = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&masked, router_logits, mask, self.s));
+                _ = mlx.mlx_array_free(router_logits);
+                router_logits = masked;
+            }
         };
 
         // Top-K + softmax/renormalize as a single fused kernel (when compiled).
@@ -4171,7 +4182,9 @@ pub const Trunk = struct {
             };
             const shared = if (routing_override) |given| given.shared_gated else null;
             const fold_shared = shared != null and moeDumpDir() == null;
-            const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !arch_kernels.moeStandin().moe_shared;
+            // A route handed in alone (a resident streamed layer's) folds as the layer's own does.
+            const own_shared = if (routing_override) |given| given.imatrix == null and given.shared_gated == null else true;
+            const tail_shared = own_shared and !skip_shared and mw.shared_expert_gate_w != null and !arch_kernels.moeStandin().moe_shared;
             if (tail_shared and moeDumpDir() == null) {
                 // A dense gate (the packs' bf16 [1, hidden]) has no affine bank for the fold to read: its logit comes in.
                 const dense_gate = mw.shared_expert_gate_s.?.ctx == null;
@@ -4285,7 +4298,7 @@ pub const Trunk = struct {
                 try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, self.s));
                 try mlx.check(mlx.mlx_argsort_axis(&inv_order, order, 0, self.s));
                 try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, self.s));
-                const k_arr = mlx.mlx_array_new_int(K);
+                const k_arr = try mlx.newInt(K);
                 defer _ = mlx.mlx_array_free(k_arr);
                 try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, self.s));
             } else {
@@ -4570,7 +4583,7 @@ pub const Trunk = struct {
         var dist = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(dist);
         try mlx.check(mlx.mlx_subtract(&dist, row_r, col_r, self.s));
-        const window_arr = mlx.mlx_array_new_int(window);
+        const window_arr = try mlx.newInt(window);
         defer _ = mlx.mlx_array_free(window_arr);
         var too_far = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(too_far);
@@ -5082,7 +5095,7 @@ pub fn ropeAngleRows(
     defer allocator.free(buf);
     for (buf, 0..) |*v, i| v.* = if ((i % n) < n / 2) 1.0 else 0.0;
     const shape = [_]c_int{ 1, 1, rows, rd };
-    const probe = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
+    const probe = try mlx.newData(buf.ptr, &shape, .float32);
     defer _ = mlx.mlx_array_free(probe);
     var rotated = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(rotated);
@@ -5098,7 +5111,7 @@ pub fn ropeAngleRows(
     // success path too (an errdefer leaked one array per decode tick to the MTLSharedEvent cap).
     var scaled = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(scaled);
-    const ms = mlx.mlx_array_new_float(mscale);
+    const ms = try mlx.newFloat(mscale);
     defer _ = mlx.mlx_array_free(ms);
     try mlx.check(mlx.mlx_multiply(&scaled, rotated, ms, s));
     var flat = mlx.mlx_array_new();
@@ -5229,27 +5242,15 @@ const SWIGLU_SOURCE =
     \\y[i] = act * up[i];
 ;
 
-/// `mlx_sigmoid` tabulated over every 16-bit float pattern, indexed [bf16, f16].
-var swiglu_sig_tables: [2][2]?mlx.mlx_array = @splat(@splat(null));
-
-/// Frees side `side`'s tables (1 the engine's, 0 MLX's), when the side's last model is gone.
-pub fn dropSwigluSigTables(side: u1) void {
-    for (&swiglu_sig_tables[side]) |*t| if (t.*) |a| {
-        _ = mlx.mlx_array_free(a);
-        t.* = null;
-    };
-}
+/// `mlx_sigmoid` tabulated over every 16-bit float pattern, by dtype.
+var swiglu_sig_tables: @import("sushi_exl3").side_cache.SideCache(mlx.mlx_dtype, 2) = .{};
 
 /// The sigmoid of every 16-bit pattern of `dt`, made once a process on each side: an array belongs to the side that
 /// made it (MLX's streams or the engine's).
 pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Allocator) !mlx.mlx_array {
-    const tables = &swiglu_sig_tables[@intFromBool(mlx.engine.isStream(s))];
-    const slot: usize = switch (dt) {
-        .bfloat16 => 0,
-        .float16 => 1,
-        else => return error.UnsupportedSwigluDtype,
-    };
-    if (tables[slot]) |t| return t;
+    const side: u1 = @intFromBool(mlx.engine.isStream(s));
+    if (dt != .bfloat16 and dt != .float16) return error.UnsupportedSwigluDtype;
+    if (swiglu_sig_tables.get(side, dt)) |t| return t;
 
     const N: usize = 1 << 16;
     const buf = try allocator.alloc(f32, N);
@@ -5261,7 +5262,7 @@ pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.A
         else => @floatCast(@as(f16, @bitCast(@as(u16, @intCast(i))))),
     };
     const sh = [_]c_int{@intCast(N)};
-    const v32 = mlx.mlx_array_new_data(buf.ptr, &sh, 1, .float32);
+    const v32 = try mlx.newData(buf.ptr, &sh, .float32);
     defer _ = mlx.mlx_array_free(v32);
     var vals = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(vals);
@@ -5271,8 +5272,7 @@ pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.A
     try mlx.check(mlx.mlx_sigmoid(&table, vals, s));
     // Materialize now: the table outlives every graph that reads it.
     try mlx.check(mlx.mlx_array_eval(table));
-    tables[slot] = table;
-    return table;
+    return swiglu_sig_tables.put(side, dt, table);
 }
 
 var swiglu_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -5355,7 +5355,7 @@ pub fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?
     };
 
     const sigtab = try swigluSigTable(s, dt, std.heap.c_allocator);
-    const inputs_arr = [_]mlx.mlx_array{ gate, up, sigtab, cachedScalarInt(ni) };
+    const inputs_arr = [_]mlx.mlx_array{ gate, up, sigtab, try cachedScalarInt(ni) };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     const kernel = try getSwigluKernel();
@@ -5922,6 +5922,62 @@ test "spliceVisionRows: the rows of a skipped leading block are not needed once 
     const b = mlx.mlx_array_data_float32(f_tail).?[0..12];
     try std.testing.expectEqualSlices(f32, a, b);
     try std.testing.expectEqual(@as(f32, 102), b[4]);
+}
+
+test "spliceVisionRows: on the engine's stream the splice gives MLX's bytes, image and video rows at any offset" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    const hidden: usize = 64;
+    const Case = struct { ids: []const i32, rows: usize, offset: usize, video: u32 };
+    const cases = [_]Case{
+        .{ .ids = &.{ 1, 2, 9, 9, 9, 9, 3 }, .rows = 4, .offset = 0, .video = 0 },
+        .{ .ids = &.{ 9, 9, 3, 4 }, .rows = 6, .offset = 4, .video = 0 },
+        .{ .ids = &.{ 1, 9, 11, 11, 9, 2 }, .rows = 4, .offset = 0, .video = 11 },
+        .{ .ids = &.{ 1, 2, 3 }, .rows = 4, .offset = 0, .video = 0 },
+        .{ .ids = &.{ 1, 9, 9, 9 }, .rows = 2, .offset = 1, .video = 0 },
+    };
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    for (cases, 0..) |c, ci| {
+        const t = c.ids.len;
+        const hv = try a.alloc(f32, t * hidden);
+        defer a.free(hv);
+        const ev = try a.alloc(f32, c.rows * hidden);
+        defer a.free(ev);
+        var prng = std.Random.DefaultPrng.init(ci + 1);
+        for (hv) |*x| x.* = prng.random().float(f32) * 2 - 1;
+        for (ev) |*x| x.* = prng.random().float(f32) * 8 - 4;
+        var bytes: [2][]u8 = undefined;
+        var made: usize = 0;
+        defer for (bytes[0..made]) |b| a.free(b);
+        for ([_]mlx.mlx_stream{ gpu, mlx.engine.stream() }) |s| {
+            const hf = try mlx.newData(hv.ptr, &[_]c_int{ 1, @intCast(t), @intCast(hidden) }, .float32);
+            defer _ = mlx.mlx_array_free(hf);
+            // The splice takes `h`.
+            var h = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&h, hf, .bfloat16, s));
+            const ef = try mlx.newData(ev.ptr, &[_]c_int{ 1, @intCast(c.rows), @intCast(hidden) }, .float32);
+            defer _ = mlx.mlx_array_free(ef);
+            var e = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(e);
+            try mlx.check(mlx.mlx_astype(&e, ef, .bfloat16, s));
+            const ids = try mlx.newData(c.ids.ptr, &[_]c_int{ 1, @intCast(t) }, .int32);
+            defer _ = mlx.mlx_array_free(ids);
+            const out = try Trunk.spliceVisionRows(h, ids, e, 9, c.video, c.offset, s);
+            defer _ = mlx.mlx_array_free(out);
+            var cont = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cont);
+            try mlx.check(mlx.mlx_contiguous(&cont, out, false, s));
+            try mlx.check(mlx.mlx_array_eval(cont));
+            const n = mlx.mlx_array_size(cont) * mlx.mlx_array_itemsize(cont);
+            bytes[made] = try a.dupe(u8, mlx.mlx_array_data_uint8(cont).?[0..n]);
+            made += 1;
+        }
+        try std.testing.expectEqualSlices(u8, bytes[0], bytes[1]);
+    }
 }
 
 test "spliceVisionRows: video placeholders are scattered like image rows (Qwen video_token_id)" {

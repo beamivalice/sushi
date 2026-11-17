@@ -6,7 +6,7 @@ const prefill_plan = @import("prefill_plan.zig");
 
 var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 /// One a side: an array belongs to the side that made it (1 the engine's, 0 MLX's).
-var sigmoid_tables: [2]?mlx.mlx_array = .{ null, null };
+var sigmoid_tables: @import("sushi_exl3").side_cache.SideCache(void, 1) = .{};
 var announced = false;
 
 // Include the final remainder that the chunker may merge into an 8192-token chunk.
@@ -101,25 +101,18 @@ pub fn norm(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, iw: mlx.mlx_a
 
 // Use MLX sigmoid for every BF16 bit pattern, including rounding-boundary inputs.
 pub fn sigmoidTable(s: mlx.mlx_stream) !mlx.mlx_array {
-    const side = &sigmoid_tables[@intFromBool(mlx.engine.isStream(s))];
-    if (side.*) |table| return table;
+    const side: u1 = @intFromBool(mlx.engine.isStream(s));
+    if (sigmoid_tables.get(side, {})) |table| return table;
     const scope = mlx.engine.enter(s);
     defer scope.end();
     var bits: [65536]u16 = undefined;
     for (&bits, 0..) |*v, i| v.* = @intCast(i);
-    const x = mlx.mlx_array_new_data(&bits, &[_]c_int{65536}, 1, .bfloat16);
+    const x = try mlx.newData(&bits, &.{65536}, .bfloat16);
     defer _ = mlx.mlx_array_free(x);
     var table = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(table);
     try mlx.check(mlx.mlx_sigmoid(&table, x, s));
-    side.* = table;
-    return table;
-}
-
-/// Frees side `side`'s table, when the side's last model is gone.
-pub fn dropSide(side: u1) void {
-    if (sigmoid_tables[side]) |t| _ = mlx.mlx_array_free(t);
-    sigmoid_tables[side] = null;
+    return sigmoid_tables.put(side, {}, table);
 }
 
 pub fn mix(s: mlx.mlx_stream, up: mlx.mlx_array, normalized: mlx.mlx_array, batch: c_int, seq: c_int) !?mlx.mlx_array {
@@ -140,7 +133,7 @@ pub fn mix(s: mlx.mlx_stream, up: mlx.mlx_array, normalized: mlx.mlx_array, batc
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", hc));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", hidden));
-    const rows = mlx.mlx_array_new_int(batch * seq);
+    const rows = try mlx.newInt(batch * seq);
     defer _ = mlx.mlx_array_free(rows);
     const ins = mlx.mlx_vector_array_new_data(&.{ up, normalized, try sigmoidTable(s), rows }, 4);
     defer _ = mlx.mlx_vector_array_free(ins);

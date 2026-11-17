@@ -39,7 +39,7 @@ what MLX allocates itself (graph intermediates, custom-kernel outputs, the freed
   flushes the open streams before it rethrows, so the throw unwinds.
 - The limit is absolute and the peak is too, so a phase installs `active - external + its bill` at its start
   (`dsv41_borrow`, [dsv41-memory](dsv41-memory.md#transient-caps)); a cap is judged against a peak less the state it started from.
-- `SUSHI_DSV41_TRANSIENT_PEAK=1` logs `[transient-peak]` per DeepSeek phase (decode, DSpark draft/verify, prefill chunk,
+- `SUSHI_TRANSIENT_PEAK=1` logs `[transient-peak]` per forward phase of any arch, with the bill it was admitted under where `arch/forward.zig` knows it (decode, draft, verify, prefill chunk,
   vision encode). Guards: the `transient cap` tests in `mlx.zig`.
 
 <a id="metal-buffer"></a>

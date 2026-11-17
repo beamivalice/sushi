@@ -73,8 +73,32 @@ fn routed(comptime name: [:0]const u8, comptime F: type) Spread(F, Routed(name, 
 }
 
 /// `name` of mlx-c, counted in `calls`.
-fn counted(comptime name: [:0]const u8, comptime F: type) Spread(F, Counted(name, F).go).Fn {
-    return Spread(F, Counted(name, F).go).pick();
+fn counted(comptime name: [:0]const u8, comptime F: type) Spread(F, CountedEntry(name, F).go).Fn {
+    return Spread(F, CountedEntry(name, F).go).pick();
+}
+
+/// A counted call as callers reach it: the armed `fault` takes it at its entry (`faultAtEntry`).
+fn CountedEntry(comptime name: [:0]const u8, comptime F: type) type {
+    return struct {
+        inline fn go(args: std.meta.ArgsTuple(F)) @typeInfo(F).@"fn".return_type.? {
+            if (comptime faultable(F)) if (faultAtEntry()) return 1;
+            return Counted(name, F).go(args);
+        }
+    };
+}
+
+/// A call `fault` may take: one that reports failure by its `c_int` and carries a stream, so it makes a result.
+fn faultable(comptime F: type) bool {
+    const info = @typeInfo(F).@"fn";
+    if (info.return_type.? != c_int) return false;
+    for (info.param_types) |T| if (T == mlx_stream) return true;
+    return false;
+}
+
+/// TEST-ONLY: whether the armed `fault` fails this call. It fails at the call's entry, before anything runs, as a raise
+/// in mlx-c or a refusal of the engine leaves a result slot unassigned.
+inline fn faultAtEntry() bool {
+    return if (comptime builtin.is_test) fault.hit() else false;
 }
 
 /// Calls into mlx-c since the process started, from any thread (the gauge sampler and request threads call MLX
@@ -293,6 +317,7 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
         const viaMlx = Counted(name, F).go;
 
         inline fn go(args: Args) R {
+            if (comptime faultable(F)) if (faultAtEntry()) return 1;
             if (!engine.enabled) {
                 // A handle of the engine's can outlive the switch in a cache; MLX's free would read memory MLX never made.
                 if (comptime std.mem.eql(u8, name, "mlx_array_free")) if (engine.isOurs(args[0])) return engine.mlx_array_free(args[0]);
@@ -545,6 +570,26 @@ pub fn mlx_array_new_bool(val: bool) mlx_array {
 pub fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array {
     return if (engine.active) engine.mlx_array_new_data(data, shape, dim, dtype) else raw.mlx_array_new_data(data, shape, dim, dtype);
 }
+/// MLX's makers never fail; an engine's may (its pool refuses the buffer and hands back an empty handle), so a host
+/// array a request or a cache makes comes from these.
+pub const HostArrayRefused = error{HostArrayRefused};
+
+/// A host array just made, or the error of a host that could not make it.
+pub fn made(a: mlx_array) HostArrayRefused!mlx_array {
+    return if (a.ctx == null) error.HostArrayRefused else a;
+}
+pub fn newData(data: ?*const anyopaque, shape: []const c_int, dtype: mlx_dtype) HostArrayRefused!mlx_array {
+    return made(mlx_array_new_data(data, shape.ptr, @intCast(shape.len), dtype));
+}
+pub fn newInt(val: c_int) HostArrayRefused!mlx_array {
+    return made(mlx_array_new_int(val));
+}
+pub fn newFloat(val: f32) HostArrayRefused!mlx_array {
+    return made(mlx_array_new_float(val));
+}
+pub fn newBool(val: bool) HostArrayRefused!mlx_array {
+    return made(mlx_array_new_bool(val));
+}
 pub const mlx_array_new_data_managed = counted("mlx_array_new_data_managed", fn (data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, dtor: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) mlx_array);
 pub const mlx_array_new_data_managed_payload = counted("mlx_array_new_data_managed_payload", fn (data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) mlx_array);
 /// The Metal buffer (`id<MTLBuffer>`, not retained) of an evaluated array and the byte offset of its data in it.
@@ -594,6 +639,7 @@ pub inline fn mlx_array_dtype(arr: mlx_array) mlx_dtype {
 }
 pub const mlx_array_strides = routed("mlx_array_strides", fn (arr: mlx_array) callconv(.c) [*]const usize);
 pub fn mlx_array_eval(arr: mlx_array) c_int {
+    if (faultAtEntry()) return 1;
     // What a maker or an op that failed left its caller: mlx-c would read through it.
     if (arr.ctx == null) {
         latchError("[mlx] eval: an empty handle, the result of an op that failed");
@@ -925,21 +971,22 @@ fn dropConfigTwin(c: *engine.kernel.Config) void {
     kernel_keys.configFree(twin);
     c.twin = null;
     // A model on the engine drops a config a model on MLX launched: MLX frees its twin at its next turn.
-    if (atRest() != null) if (owed.twins.append(std.heap.c_allocator, twin)) |_| return else |_| {};
+    if (atRest() != null) if (owed.configs.append(std.heap.c_allocator, twin)) |_| return else |_| {};
     _ = raw_kernel.mlx_fast_metal_kernel_config_free(twin);
 }
 
 /// MLX work asked for while its allocator is at rest, done when the inference thread next turns to a model on MLX or
-/// the last hold ends (`payOwed`): the free of a config's twin, and the wired limit a load or an unload moved.
+/// the last hold ends (`payOwed`): the free of a config of MLX's (a twin, or one a cache shared by both sides
+/// evicts), and the wired limit a load or an unload moved.
 const owed = struct {
-    var twins: std.ArrayList(mlx_fast_metal_kernel_config) = .empty;
+    var configs: std.ArrayList(mlx_fast_metal_kernel_config) = .empty;
     var wired: bool = false;
 };
 
 /// Inference thread, MLX's allocator not at rest.
 pub fn payOwed() void {
-    for (owed.twins.items) |twin| _ = raw_kernel.mlx_fast_metal_kernel_config_free(twin);
-    owed.twins.clearRetainingCapacity();
+    for (owed.configs.items) |twin| _ = raw_kernel.mlx_fast_metal_kernel_config_free(twin);
+    owed.configs.clearRetainingCapacity();
     if (!owed.wired) return;
     owed.wired = false;
     _ = applyWiredPolicy();
@@ -947,7 +994,7 @@ pub fn payOwed() void {
 
 /// Whether MLX is owed work for its next turn.
 pub fn owes() bool {
-    return owed.wired or owed.twins.items.len != 0;
+    return owed.wired or owed.configs.items.len != 0;
 }
 
 /// MLX's config for a launch on MLX's side: `cls` itself, or the twin of a config of the engine's own, filled in the
@@ -1019,6 +1066,7 @@ pub fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_in
     }
     engine.forgetConfig(cls);
     kernel_keys.configFree(cls);
+    if (atRest() != null) if (owed.configs.append(std.heap.c_allocator, cls)) |_| return 0 else |_| {};
     return raw_kernel.mlx_fast_metal_kernel_config_free(cls);
 }
 pub fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int {
@@ -1200,7 +1248,8 @@ pub fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int {
 }
 pub fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int {
     if (engine.enabled) switch (engine.side(.{ inputs, config, s })) {
-        .engine => return engine.mlx_fast_metal_kernel_apply(outputs, cls, inputs, config, s),
+        // The MLX path's entry is counted (`raw_kernel`); the engine's is this one.
+        .engine => return if (faultAtEntry()) 1 else engine.mlx_fast_metal_kernel_apply(outputs, cls, inputs, config, s),
         .leak => return engine.refuse("mlx_fast_metal_kernel_apply", "an MLX stream inside a forward of the engine"),
         .mlx => if (engine.isVec(inputs)) return engine.refuse("mlx_fast_metal_kernel_apply", "a vector of the engine on an MLX stream"),
     };
@@ -1254,10 +1303,12 @@ pub fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int {
 
 // ── Batch eval ──
 pub fn mlx_eval(outputs: mlx_vector_array) c_int {
+    if (faultAtEntry()) return 1;
     if (engine.enabled and engine.isVec(outputs)) return engine.mlx_eval(outputs);
     return eval_raw.mlx_eval(outputs);
 }
 pub fn mlx_async_eval(outputs: mlx_vector_array) c_int {
+    if (faultAtEntry()) return 1;
     if (engine.enabled and engine.isVec(outputs)) return engine.mlx_async_eval(outputs);
     return eval_raw.mlx_async_eval(outputs);
 }
@@ -1500,6 +1551,15 @@ pub fn printArray(label: []const u8, arr: mlx_array) void {
 }
 
 /// Get array shape as a Zig slice
+/// The dims of `arr`, which must have `rank` of them: an empty handle (a refused host array) or another rank is an
+/// error, where indexing `getShape` would read past its slice.
+pub fn shapeOf(arr: mlx_array, comptime rank: usize) error{ EmptyArray, ShapeRank }![rank]c_int {
+    if (arr.ctx == null) return error.EmptyArray;
+    const dims = getShape(arr);
+    if (dims.len != rank) return error.ShapeRank;
+    return dims[0..rank].*;
+}
+
 pub fn getShape(arr: mlx_array) []const c_int {
     if (arr.ctx == null) return &.{};
     const ndim = mlx_array_ndim(arr);
@@ -1612,28 +1672,318 @@ pub const DtypeTrace = struct {
 /// path that already does an FFI call, so it does not move any benchmark.
 pub var op_count: std.atomic.Value(u64) = .init(0);
 
-/// TEST-ONLY fault injection at the ONE chokepoint every checked mlx-c call
-/// goes through: `fault.arm(k)` makes the k-th SUBSEQUENT call that would have
-/// SUCCEEDED report `error.MlxError` instead, so an ownership audit can walk
-/// every error path of a function without patching the function. Failing calls
-/// are not counted (they already take the error path on their own). The op
-/// itself has already executed when `check` sees its return code — the
-/// argument is evaluated first — so what is injected is a succeeding op
-/// REPORTING failure; the caller's `&out` handle is a valid, freeable array,
-/// which is exactly the state its cleanup must survive. Compiled only under
-/// `builtin.is_test`, so a release build carries neither the branch nor the
-/// symbols.
+/// TEST-ONLY fault injection: `fault.arm(k)` makes the k-th SUBSEQUENT op (a call that carries a stream and reports
+/// by its `c_int`) or eval fail at its entry, without running, so an ownership audit can walk every error path of a
+/// function without patching it. The result slot is left as a real failure leaves it: unassigned. Compiled only under
+/// `builtin.is_test`, so a release build carries neither the branch nor the symbols.
+/// TEST-ONLY: a fault's recording, for a sweep by site. While `list` is set, every call the fault counts appends its site
+/// in call order and fails none; between a `disarm` and the next `arm` it notes nothing, as an armed fault counts nothing. A site is the stack of the call, hashed over `frames` frames: from the call itself
+/// (`.leaf`), so each op under each caller is a site, or from the sweep's root down (`.root`), so a site is where in the
+/// swept code the call sits, `frames` calls deep, and the frames below are the units' own tests' to sweep.
+pub const FaultSites = struct {
+    list: ?*std.ArrayList(u64) = null,
+    gpa: std.mem.Allocator = undefined,
+    frames: usize = 4,
+    from: enum { leaf, root } = .leaf,
+    /// Each site's last call is armed too, not only its first: worth it where the run is short.
+    lasts: bool = true,
+    /// The return address of the sweep's root frame: a call's stack holds it just outside the swept code.
+    root_ret: usize = 0,
+    failed: bool = false,
+    paused: bool = false,
+    /// Armed by site (`armAt`): the call that fails is the target site's n-th, whatever order the run's calls come in.
+    target: ?SitePoint = null,
+    target_seen: u64 = 0,
+
+    /// A site and which of its calls (from 1): a sweep's point where a run's call order is not the same every time.
+    pub const SitePoint = struct {
+        site: u64,
+        n: u64,
+        /// Every run reaches it: a point that does not fire is a run that made other calls than recorded.
+        strict: bool = true,
+    };
+
+    pub fn armAt(self: *FaultSites, p: SitePoint) void {
+        self.target = p;
+        self.target_seen = 0;
+    }
+    /// What a fault does with a call: recording notes it; armed by site, the target's n-th call fails and any other
+    /// passes; otherwise the fault's own count decides. One entry for both, so a call's site is the same stack either way.
+    pub const Take = enum { count, noted, fail, pass };
+    pub noinline fn take(self: *FaultSites) Take {
+        if (self.list == null and self.target == null) return .count;
+        if (self.list != null and self.paused) return .noted;
+        // One walk, from one place in this frame, so recording and matching hash the same stack.
+        const site = self.siteHere();
+        if (self.list) |list| {
+            list.append(self.gpa, site) catch {
+                self.failed = true;
+            };
+            return .noted;
+        }
+        const t = self.target.?;
+        if (site != t.site) return .pass;
+        self.target_seen += 1;
+        if (self.target_seen != t.n) return .pass;
+        self.target = null;
+        return .fail;
+    }
+
+    noinline fn siteHere(self: *const FaultSites) u64 {
+        var addrs: [256]usize = undefined;
+        const all = std.debug.captureCurrentStackTrace(.{}, &addrs).return_addresses;
+        const st = switch (self.from) {
+            .leaf => all[0..@min(self.frames, all.len)],
+            .root => blk: {
+                // The trampoline's own frame sits just inside the root's return address; the swept code inside that.
+                const at = std.mem.indexOfScalar(usize, all, self.root_ret) orelse all.len;
+                const below = at -| 1;
+                break :blk all[below -| self.frames..below];
+            },
+        };
+        return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(st));
+    }
+    /// A fault's `arm` while recording: calls count from here, as the armed fault's do.
+    pub fn armed(self: *FaultSites) void {
+        if (self.list) |l| l.clearRetainingCapacity();
+        self.paused = false;
+    }
+    pub fn disarmed(self: *FaultSites) void {
+        self.paused = true;
+        self.target = null;
+    }
+};
+
+/// A fault sweep's points: the call number (from 1) of the first and the last call of each distinct site in `sites`,
+/// ascending. The first proves the site's unwinding; the last proves it again with all the run built before it held,
+/// as a later prefill chunk or layer holds more than the first.
+pub fn sweepPointsOf(gpa: std.mem.Allocator, sites: []const u64, lasts: bool) ![]u64 {
+    var span: std.AutoArrayHashMapUnmanaged(u64, [2]u64) = .empty;
+    defer span.deinit(gpa);
+    for (sites, 1..) |site, k| {
+        const g = try span.getOrPut(gpa, site);
+        if (!g.found_existing) g.value_ptr.* = .{ k, k } else g.value_ptr[1] = k;
+    }
+    var points: std.ArrayList(u64) = .empty;
+    errdefer points.deinit(gpa);
+    for (span.values()) |ends| {
+        try points.append(gpa, ends[0]);
+        if (lasts and ends[1] != ends[0]) try points.append(gpa, ends[1]);
+    }
+    std.mem.sort(u64, points.items, {}, std.sort.asc(u64));
+    return points.toOwnedSlice(gpa);
+}
+
+/// Records the calls `run(ctx)` makes through `rec` (from the leaf), none failed, twice, and returns each site's first
+/// call and, with `rec.lasts`, its last, as site points for `armAt`. A site whose count the two runs agree on is
+/// `strict`: its points must fire. One they do not (a speculative request's rounds follow its load's acceptance so far)
+/// has its last at the fewer, and that point, or the first of a site one run never reached, may not fire.
+pub fn sweepSites(gpa: std.mem.Allocator, rec: *FaultSites, ctx: anytype, comptime run: fn (@TypeOf(ctx)) anyerror!void) ![]FaultSites.SitePoint {
+    std.debug.assert(rec.from == .leaf);
+    var counts: [2]std.AutoArrayHashMapUnmanaged(u64, u64) = .{ .empty, .empty };
+    defer for (&counts) |*c| c.deinit(gpa);
+    for (&counts) |*count| {
+        var list: std.ArrayList(u64) = .empty;
+        defer list.deinit(gpa);
+        rec.* = .{ .list = &list, .gpa = gpa, .frames = rec.frames, .lasts = rec.lasts };
+        const r = run(ctx);
+        const failed = rec.failed;
+        rec.* = .{ .frames = rec.frames, .lasts = rec.lasts };
+        try r;
+        if (failed) return error.OutOfMemory;
+        for (list.items) |site| {
+            const g = try count.getOrPut(gpa, site);
+            g.value_ptr.* = if (g.found_existing) g.value_ptr.* + 1 else 1;
+        }
+    }
+    var points: std.ArrayList(FaultSites.SitePoint) = .empty;
+    errdefer points.deinit(gpa);
+    for (counts, 0..) |count, i| {
+        const other = counts[1 - i];
+        var it = count.iterator();
+        while (it.next()) |e| {
+            const site = e.key_ptr.*;
+            const theirs = other.get(site);
+            if (i == 1 and theirs != null) continue; // Both runs reached it: the first pass took it.
+            const n = @min(e.value_ptr.*, theirs orelse e.value_ptr.*);
+            const strict = theirs == e.value_ptr.*;
+            try points.append(gpa, .{ .site = site, .n = 1, .strict = theirs != null });
+            if (rec.lasts and n > 1) try points.append(gpa, .{ .site = site, .n = n, .strict = strict });
+        }
+    }
+    return points.toOwnedSlice(gpa);
+}
+
+/// Records the sites of the calls `run(ctx)` makes through `rec` (`mlx.fault.sites`, or the engine pool's
+/// `fault.sites`), none failed, and returns their `sweepPointsOf`. `run` must make the same calls in the same order each
+/// time; the sweep proves it, as every armed point must fire.
+pub fn sweepPoints(gpa: std.mem.Allocator, rec: *FaultSites, ctx: anytype, comptime run: fn (@TypeOf(ctx)) anyerror!void) ![]u64 {
+    var list: std.ArrayList(u64) = .empty;
+    defer list.deinit(gpa);
+    const Root = struct {
+        // A frame of its own whose return address marks, in every call's stack, where the swept code begins.
+        noinline fn go(r: *FaultSites, list_: *std.ArrayList(u64), gpa_: std.mem.Allocator, c: @TypeOf(ctx)) anyerror!void {
+            r.* = .{ .list = list_, .gpa = gpa_, .frames = r.frames, .from = r.from, .lasts = r.lasts, .root_ret = @returnAddress() };
+            // Work after the call keeps it from being a tail call, which would take this frame off the stack.
+            defer std.mem.doNotOptimizeAway(r.root_ret);
+            return @call(.never_inline, run, .{c});
+        }
+    };
+    const r = Root.go(rec, &list, gpa, ctx);
+    const failed = rec.failed;
+    rec.* = .{ .frames = rec.frames, .from = rec.from, .lasts = rec.lasts };
+    try r;
+    if (failed) return error.OutOfMemory;
+    return sweepPointsOf(gpa, list.items, rec.lasts);
+}
+
+test "a fault sweep arms each site's first call, and its last unless told not to, once each, in call order" {
+    const a = std.testing.allocator;
+    const points = try sweepPointsOf(a, &.{ 7, 9, 7, 7, 4, 9, 5 }, true);
+    defer a.free(points);
+    // 7 at 1..4, 9 at 2..6, 4 once at 5, 5 once at 7.
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 4, 5, 6, 7 }, points);
+    const firsts = try sweepPointsOf(a, &.{ 7, 9, 7, 7, 4, 9, 5 }, false);
+    defer a.free(firsts);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 5, 7 }, firsts);
+    const none = try sweepPointsOf(a, &.{}, true);
+    defer a.free(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "a fault armed at a site fails that site's n-th call, whatever calls come before it" {
+    const a = std.testing.allocator;
+    const Run = struct {
+        var run_calls: u64 = 0;
+        var failed_at: u64 = 0;
+        var extra: bool = false;
+        var vary: bool = false;
+        var runs: usize = 0;
+        fn at(r: *FaultSites) void {
+            run_calls += 1;
+            if (r.take() == .fail) failed_at = run_calls;
+        }
+        noinline fn viaOne(r: *FaultSites) void {
+            at(r);
+            std.mem.doNotOptimizeAway(r.frames);
+        }
+        noinline fn viaTwo(r: *FaultSites) void {
+            // A body of its own, so the linker does not fold it into viaOne.
+            at(r);
+            std.mem.doNotOptimizeAway(r.frames *% 3);
+        }
+        fn run(r: *FaultSites) anyerror!void {
+            run_calls = 0;
+            // A run may make a call another did not: the site's n-th call is still the one armed.
+            if (extra) viaTwo(r);
+            // With `vary`, each run takes one more step than the last, as a speculative request's rounds may.
+            var n: usize = 3 + (if (vary) runs else 0);
+            runs += 1;
+            std.mem.doNotOptimizeAway(&n);
+            var i: usize = 0;
+            while (i < n) : (i += 1) step(r, i);
+        }
+        noinline fn step(r: *FaultSites, i: usize) void {
+            viaOne(r);
+            if (i == 1) viaTwo(r);
+            std.mem.doNotOptimizeAway(i);
+        }
+    };
+    var rec: FaultSites = .{};
+    const points = try sweepSites(a, &rec, &rec, Run.run);
+    defer a.free(points);
+    // viaOne at calls 1, 2 and 4 (first and last), viaTwo at 3 (once); both runs agree, so every point is strict.
+    try std.testing.expectEqual(@as(usize, 3), points.len);
+    for (points) |p| try std.testing.expect(p.strict);
+    {
+        // Runs that disagree on a site's count: its last is the fewer, and need not fire.
+        Run.vary = true;
+        Run.runs = 0;
+        defer Run.vary = false;
+        const varied = try sweepSites(a, &rec, &rec, Run.run);
+        defer a.free(varied);
+        try std.testing.expectEqual(@as(usize, 3), varied.len);
+        try std.testing.expectEqual(FaultSites.SitePoint{ .site = varied[0].site, .n = 1, .strict = true }, varied[0]);
+        try std.testing.expectEqual(FaultSites.SitePoint{ .site = varied[0].site, .n = 3, .strict = false }, varied[1]);
+        try std.testing.expect(varied[2].strict and varied[2].n == 1);
+    }
+    Run.extra = true;
+    defer Run.extra = false;
+    // With a viaTwo call first, from another caller: viaOne's first call is call 2, its third call 5, and the step's
+    // viaTwo is call 4.
+    const want = [_]u64{ 2, 5, 4 };
+    for (points, want) |p, w| {
+        Run.failed_at = 0;
+        rec.armAt(p);
+        try Run.run(&rec);
+        try std.testing.expectEqual(w, Run.failed_at);
+        try std.testing.expect(rec.target == null);
+    }
+}
+
+test "a fault's recording fails no call and tells a call's site by its callers" {
+    const a = std.testing.allocator;
+    var rec: FaultSites = .{};
+    const Run = struct {
+        fn at(r: *FaultSites) void {
+            _ = r.take();
+        }
+        // Each call is followed by work, so none is a tail call that takes its caller's frame away.
+        noinline fn viaOne(r: *FaultSites) void {
+            at(r);
+            std.mem.doNotOptimizeAway(r.frames);
+        }
+        noinline fn viaTwo(r: *FaultSites) void {
+            // A body of its own, so the linker does not fold it into viaOne.
+            at(r);
+            std.mem.doNotOptimizeAway(r.frames *% 3);
+        }
+        fn run(r: *FaultSites) anyerror!void {
+            // A trip count the compiler cannot see, so the loop's one call stays one site.
+            var n: usize = 3;
+            std.mem.doNotOptimizeAway(&n);
+            var i: usize = 0;
+            while (i < n) : (i += 1) step(r, i);
+        }
+        noinline fn step(r: *FaultSites, i: usize) void {
+            viaOne(r);
+            if (i == 1) viaTwo(r);
+            std.mem.doNotOptimizeAway(i);
+        }
+    };
+    const points = try sweepPoints(a, &rec, &rec, Run.run);
+    defer a.free(points);
+    // viaOne's site at calls 1, 2 and 4, viaTwo's at 3.
+    try std.testing.expectEqualSlices(u64, &.{ 1, 3, 4 }, points);
+    // From the root: one frame down every call sits in the loop's step, one site; two frames down, viaOne's and viaTwo's.
+    rec = .{ .from = .root, .frames = 1 };
+    const one = try sweepPoints(a, &rec, &rec, Run.run);
+    defer a.free(one);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 4 }, one);
+    rec = .{ .from = .root, .frames = 2 };
+    const two = try sweepPoints(a, &rec, &rec, Run.run);
+    defer a.free(two);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 3, 4 }, two);
+    try std.testing.expect(rec.list == null);
+}
+
 pub const fault = struct {
     var remaining: u64 = 0; // 0 = disarmed
     var fired: bool = false;
+    /// Print the stack of the call the fault fails, so a sweep that finds a leak names the op.
+    pub var trace: bool = false;
+    /// Recording for a sweep by site (`sweepPoints`).
+    pub var sites: FaultSites = .{};
 
     /// Fail the k-th checked call from here (k >= 1). `arm(0)` is a no-op arm.
     pub fn arm(k: u64) void {
         remaining = k;
         fired = false;
+        sites.armed();
     }
     pub fn disarm() void {
         remaining = 0;
+        sites.disarmed();
     }
     pub fn armed() bool {
         return remaining != 0;
@@ -1645,10 +1995,20 @@ pub const fault = struct {
         return fired;
     }
     fn hit() bool {
+        switch (sites.take()) {
+            .noted, .pass => return false,
+            .fail => {
+                fired = true;
+                if (trace) std.debug.dumpCurrentStackTrace(.{});
+                return true;
+            },
+            .count => {},
+        }
         if (remaining == 0) return false;
         remaining -= 1;
         if (remaining != 0) return false;
         fired = true;
+        if (trace) std.debug.dumpCurrentStackTrace(.{});
         return true;
     }
 };
@@ -1688,7 +2048,6 @@ pub fn check(ret: c_int) !void {
     _ = op_count.fetchAdd(1, .monotonic);
     if (ret != 0) return error.MlxError;
     if (comptime builtin.is_test) {
-        if (fault.hit()) return error.MlxError;
         if (latchFaultHit()) {
             latchMlxError(latch_msg, null);
             return error.MlxError;

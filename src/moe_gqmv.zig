@@ -321,8 +321,8 @@ pub fn gatherQmvGateUp(
     };
 
     const sigtab = try swigluSigTable(s, xd, std.heap.c_allocator);
-    const K_arr = cachedScalarInt(K);
-    const N_arr = cachedScalarInt(N);
+    const K_arr = try cachedScalarInt(K);
+    const N_arr = try cachedScalarInt(N);
     const inputs_arr = [_]mlx.mlx_array{ x, gw, gs_arr, gb, uw, us_arr, ub, inds, sigtab, K_arr, N_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -507,8 +507,8 @@ pub fn gatherQmvGateUpRows(
     };
 
     const sigtab = try swigluSigTable(s, xd, std.heap.c_allocator);
-    const K_arr = cachedScalarInt(K);
-    const N_arr = cachedScalarInt(N);
+    const K_arr = try cachedScalarInt(K);
+    const N_arr = try cachedScalarInt(N);
     const inputs_arr = [_]mlx.mlx_array{ x, gw, gs_arr, gb, uw, us_arr, ub, inds, sigtab, K_arr, N_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -638,8 +638,8 @@ pub fn gatherQmv(
         break :blk cfg;
     };
 
-    const K_arr = cachedScalarInt(K);
-    const N_arr = cachedScalarInt(N);
+    const K_arr = try cachedScalarInt(K);
+    const N_arr = try cachedScalarInt(N);
     const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, inds, K_arr, N_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -835,8 +835,8 @@ pub fn gatherQmvDownReduce(
         break :blk cfg;
     };
 
-    const K_arr = cachedScalarInt(K);
-    const N_arr = cachedScalarInt(N);
+    const K_arr = try cachedScalarInt(K);
+    const N_arr = try cachedScalarInt(N);
     const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, inds, scores, K_arr, N_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -1018,8 +1018,8 @@ pub fn gatherQmvDownReduceRows(
         break :blk cfg;
     };
 
-    const K_arr = cachedScalarInt(K);
-    const N_arr = cachedScalarInt(N);
+    const K_arr = try cachedScalarInt(K);
+    const N_arr = try cachedScalarInt(N);
     const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, inds, scores, K_arr, N_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -1221,8 +1221,8 @@ pub fn msvQmvRows(
         break :blk cfg;
     };
 
-    const K_arr = cachedScalarInt(K);
-    const N_arr = cachedScalarInt(Nout);
+    const K_arr = try cachedScalarInt(K);
+    const N_arr = try cachedScalarInt(Nout);
     const inputs = [_]mlx.mlx_array{ x2, w, sc, bi, K_arr, N_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -1272,7 +1272,7 @@ fn moeRowsFusedCase(s: mlx.mlx_stream, rnd: std.Random, E: c_int, hid: c_int, in
         const base = perm[r % perm.len] * 17;
         for (0..10) |k| idata[r * 10 + k] = (base + @as(u32, @intCast(k)) * 13) % @as(u32, @intCast(E));
     }
-    const inds = mlx.mlx_array_new_data(idata.ptr, &[_]c_int{ nrows, topk }, 2, .uint32);
+    const inds = try mlx.newData(idata.ptr, &[_]c_int{ nrows, topk }, .uint32);
     defer _ = mlx.mlx_array_free(inds);
     const scores = try attn256RandBf16(rnd, &[_]c_int{ nrows, topk }, s);
     defer _ = mlx.mlx_array_free(scores);
@@ -1337,7 +1337,7 @@ fn moeDownReduceParityCase(s: mlx.mlx_stream, rnd: std.Random, t: anytype, E: us
         defer t.allocator.free(wdata);
         for (wdata) |*v| v.* = rnd.int(u32);
         const w_shape = [_]c_int{ @intCast(E), N, @intCast(words_per_row) };
-        const w = mlx.mlx_array_new_data(wdata.ptr, &w_shape, 3, .uint32);
+        const w = try mlx.newData(wdata.ptr, &w_shape, .uint32);
         defer _ = mlx.mlx_array_free(w);
 
         const sn = E * @as(usize, @intCast(N)) * groups_per_row;
@@ -1352,9 +1352,9 @@ fn moeDownReduceParityCase(s: mlx.mlx_stream, rnd: std.Random, t: anytype, E: us
         const bf = try t.allocator.alloc(f32, sn);
         defer t.allocator.free(bf);
         for (bf) |*v| v.* = rnd.float(f32) - 0.5;
-        const sc_src = mlx.mlx_array_new_data(sf.ptr, &s_shape, 3, .float32);
+        const sc_src = try mlx.newData(sf.ptr, &s_shape, .float32);
         defer _ = mlx.mlx_array_free(sc_src);
-        const bi_src = mlx.mlx_array_new_data(bf.ptr, &s_shape, 3, .float32);
+        const bi_src = try mlx.newData(bf.ptr, &s_shape, .float32);
         defer _ = mlx.mlx_array_free(bi_src);
         try mlx.check(mlx.mlx_astype(&sc, sc_src, .bfloat16, s));
         try mlx.check(mlx.mlx_astype(&bi, bi_src, .bfloat16, s));
@@ -1367,7 +1367,7 @@ fn moeDownReduceParityCase(s: mlx.mlx_stream, rnd: std.Random, t: anytype, E: us
         defer _ = mlx.mlx_array_free(scores);
         var idata: [8]u32 = undefined;
         for (&idata) |*v| v.* = rnd.uintLessThan(u32, @intCast(E));
-        const inds = mlx.mlx_array_new_data(&idata, &sc_shape, 1, .uint32);
+        const inds = try mlx.newData(&idata, &sc_shape, .uint32);
         defer _ = mlx.mlx_array_free(inds);
 
         const mode: QuantMode = .affine;
@@ -2079,7 +2079,7 @@ test "a streamed quantized slab matches the resident bank through the same kerne
         const per_expert = try expert_stream_mod.expertBytesFor(alloc, path, geom, .quantized_split);
 
         var bank: [expert_stream_mod.quant.component_count]mlx.mlx_array = undefined;
-        for (&bank, 0..) |*value, ci| value.* = pack.residentBank(experts, ci);
+        for (&bank, 0..) |*value, ci| value.* = try pack.residentBank(experts, ci);
         defer for (bank) |value| {
             _ = mlx.mlx_array_free(value);
         };

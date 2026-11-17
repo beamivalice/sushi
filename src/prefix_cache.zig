@@ -1395,6 +1395,7 @@ pub const HotPrefixCache = struct {
         self.last_restored_used = null;
         self.last_restored_disk_id = null;
         self.last_restored_live = false;
+        if (rec == .arch) try prefix_arch.checkLent(rec.arch);
         if (skip) {
             if (rec == .arch) prefix_arch.handover(self, rec.arch, s);
             try target_cache.truncate(0, s);

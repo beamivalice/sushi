@@ -627,6 +627,8 @@ pub fn unaryOf(comptime op: []const u8, comptime types: UnaryTypes, x_in: *Tenso
     const per_thread: usize = if (size < 1 << 16) 1 else @max(1, 8 / core.itemSize(x.dtype));
     var buf: [64]u8 = undefined;
     const k = try kernel(try named(&buf, "{s}_" ++ op ++ "{s}{s}", .{ if (per_thread > 1) "vn" else "v", type_name, type_name }));
+    // Until the load seals the pipelines, the other size's kernel is made with it: a request's length picks it.
+    if (!core.sealed) _ = kernel(try named(&buf, "{s}_" ++ op ++ "{s}{s}", .{ if (per_thread > 1) "v" else "vn", type_name, type_name })) catch {};
     const threads = (size + per_thread - 1) / per_thread;
     const p = try core.pass();
     p.pipeline(k);
@@ -675,6 +677,7 @@ pub fn binaryOf(comptime op: []const u8, comptime types: UnaryTypes, a: *Tensor,
     const per_thread: usize = if (flat and size >= 1 << 16) @max(1, 8 / core.itemSize(a.dtype)) else 1;
     var buf: [96]u8 = undefined;
     const k = try kernel(try named(&buf, "{s}{s}_" ++ op ++ "{s}", .{ kind, if (flat and per_thread > 1) "n" else "", try typeName(a.dtype) }));
+    if (!core.sealed and flat) _ = kernel(try named(&buf, "{s}{s}_" ++ op ++ "{s}", .{ kind, if (per_thread > 1) "" else "n", try typeName(a.dtype) })) catch {};
     const threads = (size + per_thread - 1) / per_thread;
     const p = try core.pass();
     p.pipeline(k);

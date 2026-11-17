@@ -842,6 +842,51 @@ test "qsa raw-key ring is O(RING_ROWS) at N rows" {
     try t.expectEqual(ring_cap, raw);
 }
 
+test "qsa raw-key ring: on the engine a decode row appended to a full ring is one dispatch and keeps the newest rows" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    const s = mlx.engine.stream();
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
+    var xfm: Trunk = undefined;
+    xfm.s = s;
+    xfm.allocator = t.allocator;
+    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    defer ssmFreeQsaState(&entry);
+    entry.qsa_ratio = 4;
+    const hd: c_int = 16;
+    const rows: usize = @intCast(QSA_RING_ROWS + 3);
+    const host = try t.allocator.alloc(u16, rows * @as(usize, @intCast(hd)));
+    defer t.allocator.free(host);
+    for (host, 0..) |*v, i| v.* = @intCast(0x3c00 + i % 4000);
+    const all = try mlx.newData(host.ptr, &.{ 1, @intCast(rows), hd }, .bfloat16);
+    defer _ = mlx.mlx_array_free(all);
+    var at: c_int = 0;
+    while (at < rows) : (at += 1) {
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_slice(&row, all, &.{ 0, at, 0 }, 3, &.{ 1, at + 1, hd }, 3, &.{ 1, 1, 1 }, 3, s));
+        var own = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(own);
+        try mlx.check(mlx.mlx_contiguous(&own, row, false, s));
+        try mlx.check(mlx.mlx_array_eval(own));
+        const d0 = mlx.engine.stats().dispatches;
+        try qwen4_qsa.qsaAppendKeys(&xfm, &entry, own, at);
+        // From the second shift on: the first also settles the last in-place append's deferred write.
+        if (at > QSA_RING_ROWS) try t.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - d0);
+    }
+    var tight = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tight);
+    try mlx.check(mlx.mlx_contiguous(&tight, entry.aux_state, false, s));
+    try mlx.check(mlx.mlx_array_eval(tight));
+    const got = mlx.mlx_array_data_uint16(tight).?;
+    const keep: usize = @intCast(QSA_RING_ROWS);
+    try t.expectEqualSlices(u16, host[(rows - keep) * @as(usize, @intCast(hd)) ..], got[0 .. keep * @as(usize, @intCast(hd))]);
+}
+
 test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identically to a full bank" {
     try mlx.requireGpu();
     const t = std.testing;

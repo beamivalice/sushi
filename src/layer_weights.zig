@@ -454,7 +454,7 @@ pub fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: boo
     };
     // The reference divides the down and inject projections by hc_count;
     // fold that into the (de)quantization affine or the dense weight.
-    const inv_hc = mlx.mlx_array_new_float(1.0 / @as(f32, @floatFromInt(hc)));
+    const inv_hc = try mlx.newFloat(1.0 / @as(f32, @floatFromInt(hc)));
     defer _ = mlx.mlx_array_free(inv_hc);
     try scaleTriple(&out.down_w, &out.down_s, &out.down_b, inv_hc, owned_bf16, allocator, s);
     if (with_inject) {
@@ -1145,7 +1145,7 @@ fn imxQuantBank(s: mlx.mlx_stream, alloc: std.mem.Allocator, rnd: std.Random, e:
     const buf = try alloc.alloc(f32, @intCast(e * out_dim * in_dim));
     defer alloc.free(buf);
     for (buf) |*v| v.* = (rnd.float(f32) - 0.5) * 0.4;
-    const a32 = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ e, out_dim, in_dim }, 3, .float32);
+    const a32 = try mlx.newData(buf.ptr, &[_]c_int{ e, out_dim, in_dim }, .float32);
     defer _ = mlx.mlx_array_free(a32);
     var bf = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(bf);
@@ -2182,9 +2182,9 @@ fn routedParamsCase(bits: u32, group: u32, rows: c_int) !void {
         probs[2 * r] = 0x3f00;
         probs[2 * r + 1] = 0x3e80;
     }
-    const inds = mlx.mlx_array_new_data(&ids, &.{ 1, rows, 2 }, 3, .uint32);
+    const inds = try mlx.newData(&ids, &.{ 1, rows, 2 }, .uint32);
     defer _ = mlx.mlx_array_free(inds);
-    const scores = mlx.mlx_array_new_data(&probs, &.{ 1, rows, 2 }, 3, .bfloat16);
+    const scores = try mlx.newData(&probs, &.{ 1, rows, 2 }, .bfloat16);
     defer _ = mlx.mlx_array_free(scores);
 
     const probed = try xfm.moeMLP2WithRouter(x, x, &mw, null, false, null, .{ .inds = inds, .norm_scores = scores });

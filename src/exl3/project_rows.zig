@@ -1,6 +1,7 @@
 const exl3 = @import("expert_exl3.zig");
 const kernel_src = @import("kernel_source.zig");
 const mlx = @import("mlx_host").mlx;
+const host_side = @import("host_side.zig");
 const std = @import("std");
 const kernels = @import("expert_exl3_kernels.zig");
 
@@ -602,8 +603,11 @@ fn rowsChunk(in_dim: c_int, rows: c_int, nsplit: c_int) c_int {
 /// Picked on dependent chains of calls: a threadgroup walking a whole k range is
 /// latency-bound in a forward, so k splits into ranges of at most 512 over at least 320 threadgroups; only an
 /// lm_head-wide output fills the GPU with whole 128-wide blocks and folds the finish.
+/// A bench arm: null follows the mode, a value forces the NAX arm on or off at every width.
+pub var nax_force: ?bool = null;
+
 pub fn rowsGeometry(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, mode: Mode) RowsGeom {
-    const nax = if (mode.exact) !isLmHead(in_dim, out_dim, groups) else rows >= 2;
+    const nax = nax_force orelse if (mode.exact) !isLmHead(in_dim, out_dim, groups) else rows >= 2;
     return rowsGeometryFor(in_dim, out_dim, rows, groups, nax and kernels.gemmNaxOn());
 }
 
@@ -1043,13 +1047,13 @@ const RowsRig = struct {
         const xs = try alloc.alloc(u16, self.groups * rows * self.in);
         for (0..self.groups) |g| @memcpy(xs[g * rows * self.in ..][0 .. rows * self.in], self.xh[(g * pool + first) * self.in ..][0 .. rows * self.in]);
         const rate: exl3.Rate = .{ .n = self.n };
-        const x = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ @intCast(self.groups * rows), @intCast(self.in) }, 2, .float16);
+        const x = try host_side.made(mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ @intCast(self.groups * rows), @intCast(self.in) }, 2, .float16));
         defer _ = mlx.mlx_array_free(x);
-        const tr = mlx.mlx_array_new_data(self.tr.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.in / 16), @intCast(self.out / 16), @intCast(rate.halfwords()) }, 4, .uint16);
+        const tr = try host_side.made(mlx.mlx_array_new_data(self.tr.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.in / 16), @intCast(self.out / 16), @intCast(rate.halfwords()) }, 4, .uint16));
         defer _ = mlx.mlx_array_free(tr);
-        const suh = mlx.mlx_array_new_data(self.suh.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.in) }, 2, .float16);
+        const suh = try host_side.made(mlx.mlx_array_new_data(self.suh.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.in) }, 2, .float16));
         defer _ = mlx.mlx_array_free(suh);
-        const svh = mlx.mlx_array_new_data(self.svh.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.out) }, 2, .float16);
+        const svh = try host_side.made(mlx.mlx_array_new_data(self.svh.ptr, &[_]c_int{ @intCast(self.groups), @intCast(self.out) }, 2, .float16));
         defer _ = mlx.mlx_array_free(svh);
         const y = try projectRowsWith(s, x, tr, suh, svh, geom, kernel, null);
         defer _ = mlx.mlx_array_free(y);
@@ -1066,10 +1070,10 @@ const RowsRig = struct {
             const host = mlx.engine.enter(s);
             defer host.end();
             held = .{
-                mlx.mlx_array_new_data(self.xh[first * self.in ..].ptr, &[_]c_int{ @intCast(rows), @intCast(self.in) }, 2, .float16),
-                mlx.mlx_array_new_data(self.tr.ptr, &[_]c_int{ 1, @intCast(self.in / 16), @intCast(self.out / 16), @intCast(self.n) }, 4, .uint16),
-                mlx.mlx_array_new_data(self.suh.ptr, &[_]c_int{ 1, @intCast(self.in) }, 2, .float16),
-                mlx.mlx_array_new_data(self.svh.ptr, &[_]c_int{ 1, @intCast(self.out) }, 2, .float16),
+                try host_side.made(mlx.mlx_array_new_data(self.xh[first * self.in ..].ptr, &[_]c_int{ @intCast(rows), @intCast(self.in) }, 2, .float16)),
+                try host_side.made(mlx.mlx_array_new_data(self.tr.ptr, &[_]c_int{ 1, @intCast(self.in / 16), @intCast(self.out / 16), @intCast(self.n) }, 4, .uint16)),
+                try host_side.made(mlx.mlx_array_new_data(self.suh.ptr, &[_]c_int{ 1, @intCast(self.in) }, 2, .float16)),
+                try host_side.made(mlx.mlx_array_new_data(self.svh.ptr, &[_]c_int{ 1, @intCast(self.out) }, 2, .float16)),
             };
         }
         defer for (held) |h| {

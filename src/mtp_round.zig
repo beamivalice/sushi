@@ -173,7 +173,7 @@ pub fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRou
         .off0 = mtpRoundOff0(self.mtp_hist_stash, self.mtp_cache.?.step()),
         .head_input_rows = @intCast(1 + if (self.mtp_hist_stash) |stash| stash.n else @as(usize, 0)),
         .t1 = t1,
-        .t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 1, .int32),
+        .t1_arr = try mlx.newData(&t1_i32, &t1_shape, .int32),
         .drafts = drafts,
         .draft_arrs = undefined,
         .n_drafted = 0,
@@ -305,7 +305,7 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
     const one = [_]c_int{1};
     for (drafts, draft_arrs[0..k]) |d, *arr| {
         const v: i32 = @intCast(d);
-        arr.* = mlx.mlx_array_new_data(&v, &one, 1, .int32);
+        arr.* = try mlx.newData(&v, &one, .int32);
     }
     const t1_i32: i32 = @intCast(t1);
     var lplan = plan;
@@ -317,7 +317,7 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
         .off0 = mtpRoundOff0(self.mtp_hist_stash, self.mtp_cache.?.step()),
         .head_input_rows = 0,
         .t1 = t1,
-        .t1_arr = mlx.mlx_array_new_data(&t1_i32, &one, 1, .int32),
+        .t1_arr = try mlx.newData(&t1_i32, &one, .int32),
         .drafts = drafts,
         .draft_arrs = draft_arrs,
         .n_drafted = k,
@@ -338,6 +338,8 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
 /// append (consumes `self.mtp_hist_stash`); a chunk-B call resumes from
 /// `chain.h_chain`.
 pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) !void {
+    const late_was = mlx.engine.lateWhere("an MTP draft chain");
+    defer _ = mlx.engine.lateWhere(late_was);
     const xfm = self.xfm;
     const s = xfm.s;
     const head = self.mtp.?;
@@ -437,7 +439,7 @@ pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) 
             chain.n_qp = i + 1;
             chain.draft_arrs[i] = prop.id;
         } else {
-            chain.draft_arrs[i] = sampler.sampleTokenLazy(step_out.logits, draft_sampling, s);
+            chain.draft_arrs[i] = try sampler.sampleTokenLazy(step_out.logits, draft_sampling, s);
         }
         chain.n_drafted = i + 1;
         if (chain.conf_arrs != null and i < chain.plan.m_lo) {
@@ -701,9 +703,13 @@ pub fn mtpBatchedAcceptGraph(
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
         for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+        var joined = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(joined);
+        try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 0, s));
+        // A round's drafts mix int32 and uint32 ids, which join as int64: one index dtype keeps one set of kernels.
         var flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat);
-        try mlx.check(mlx.mlx_concatenate_axis(&flat, vec, 0, s));
+        try mlx.check(mlx.mlx_astype(&flat, joined, .int32, s));
         const id2_shape = [_]c_int{ mi, 1 };
         try mlx.check(mlx.mlx_reshape(&ids_2d, flat, &id2_shape, 2, s));
     }
@@ -750,7 +756,7 @@ pub fn mtpBatchedAcceptGraph(
         var diff = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(diff);
         try mlx.check(mlx.mlx_subtract(&diff, p_rows, proposal, s));
-        const zero = mlx.mlx_array_new_float(0.0);
+        const zero = try mlx.newFloat(0.0);
         defer _ = mlx.mlx_array_free(zero);
         var residual = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(residual);
@@ -912,14 +918,14 @@ pub fn mtpBatchedLossyGraph(
         var peak = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(peak);
         try mlx.check(mlx.mlx_max_axis(&peak, p_rows, 1, true, s));
-        const complement = mlx.mlx_array_new_float(1.0 - param);
+        const complement = try mlx.newFloat(1.0 - param);
         defer _ = mlx.mlx_array_free(complement);
         var cutoff = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(cutoff);
         try mlx.check(mlx.mlx_multiply(&cutoff, peak, complement, s));
         defer_mask = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_less(&defer_mask, p_rows, cutoff, s));
-        const zero = mlx.mlx_array_new_float(0.0);
+        const zero = try mlx.newFloat(0.0);
         defer _ = mlx.mlx_array_free(zero);
         var deferred_q = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(deferred_q);
@@ -952,7 +958,7 @@ pub fn mtpBatchedLossyGraph(
             var diff = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(diff);
             try mlx.check(mlx.mlx_subtract(&diff, pi, proposal, s));
-            const zero = mlx.mlx_array_new_float(0.0);
+            const zero = try mlx.newFloat(0.0);
             defer _ = mlx.mlx_array_free(zero);
             corr_rows = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_maximum(&corr_rows, diff, zero, s));
@@ -992,7 +998,7 @@ pub fn mtpBatchedLossyGraph(
     if (comptime mode == .typical) {
         // H(p) = -sum p*log(p), with log(0) safely masked by clamping
         // only the log operand. The p factor remains exactly zero.
-        const tiny = mlx.mlx_array_new_float(1e-30);
+        const tiny = try mlx.newFloat(1e-30);
         defer _ = mlx.mlx_array_free(tiny);
         var safe_p = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(safe_p);
@@ -1009,12 +1015,12 @@ pub fn mtpBatchedLossyGraph(
         var scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(scaled);
         try mlx.check(mlx.mlx_exp(&scaled, sum, s)); // exp(-H)
-        const delta = mlx.mlx_array_new_float(param);
+        const delta = try mlx.newFloat(param);
         defer _ = mlx.mlx_array_free(delta);
         var raw_floor = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(raw_floor);
         try mlx.check(mlx.mlx_multiply(&raw_floor, scaled, delta, s));
-        const eps = mlx.mlx_array_new_float(1.0);
+        const eps = try mlx.newFloat(1.0);
         defer _ = mlx.mlx_array_free(eps);
         accept_q = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_minimum(&accept_q, raw_floor, eps, s));
@@ -1102,6 +1108,8 @@ pub fn mtpDetachHead(self: *Generator, allocator: std.mem.Allocator, apply_stash
 /// Append the deferred history stash to the head cache now, as a
 /// history-only head forward (lazy; the next head forward realizes it).
 pub fn mtpApplyStash(self: *Generator) !void {
+    const late_was = mlx.engine.lateWhere("an MTP history re-append");
+    defer _ = mlx.engine.lateWhere(late_was);
     var st = self.mtp_hist_stash orelse return;
     self.mtp_hist_stash = null;
     defer st.deinit();
@@ -1185,6 +1193,8 @@ pub fn mtpSerialGiveUp(self: *Generator, allocator: std.mem.Allocator, why: []co
 
 /// One tick of a serial block. `.none` is the real serial arm; `.drain` and `.capture` are the exit ramp.
 pub fn mtpSerialTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+    const late_was = mlx.engine.lateWhere("a serial step of an MTP request");
+    defer _ = mlx.engine.lateWhere(late_was);
     if (self.mtp_serial_exit == .capture) return try self.mtpSerialCaptureTick(allocator);
     if (self.mtp_serial_exit == .drain) {
         switch (try self.drainPipelineForSpec(allocator)) {
@@ -1211,6 +1221,8 @@ pub fn mtpSerialTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterSt
 /// The one synchronous step that ends a serial block: forward the pending token with
 /// capture and sample its successor without forwarding it (`nextMtp`'s entry invariant).
 pub fn mtpSerialCaptureTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+    const late_was = mlx.engine.lateWhere("a serial capture step of an MTP request");
+    defer _ = mlx.engine.lateWhere(late_was);
     if (!mtpSerialCaptureReady(self.pending)) {
         return try self.mtpSerialGiveUp(allocator, "pipeline not drained");
     }
@@ -1218,7 +1230,7 @@ pub fn mtpSerialCaptureTick(self: *Generator, allocator: std.mem.Allocator) !?Dr
     const token = self.next_token_id;
     const tok_i32: i32 = @intCast(token);
     const tok_shape = [_]c_int{ 1, 1 };
-    const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+    const tok_input = try mlx.newData(&tok_i32, &tok_shape, .int32);
     defer _ = mlx.mlx_array_free(tok_input);
 
     var hidden = mlx.mlx_array_new();
@@ -1290,6 +1302,8 @@ pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResu
 
 /// Phases 0–2: serial-block dispatch, the draft chain, rollback anchors, the verify input.
 pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBegin {
+    const late_was = mlx.engine.lateWhere("an MTP round's opening");
+    defer _ = mlx.engine.lateWhere(late_was);
     if (self.done) return .{ .done = null };
     std.debug.assert(self.mtp != null);
     std.debug.assert(self.mtp_cache != null);
@@ -1440,6 +1454,8 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
 }
 
 pub fn mtpRoundContinue(self: *Generator, allocator: std.mem.Allocator, open: MtpRoundOpen) !MtpRoundState {
+    const late_was = mlx.engine.lateWhere("an MTP round after its verify");
+    defer _ = mlx.engine.lateWhere(late_was);
     var chain = open.chain;
     if (chain.n_drafted < chain.m) {
         const chain_lap = SubLap.start(open.tracing, self.timer.io);
@@ -2080,7 +2096,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         ids_i32[0] = @intCast(t1);
         for (drafts[0..n_commit], 0..) |d, idx| ids_i32[1 + idx] = @intCast(d);
         const id_shape = [_]c_int{@intCast(1 + n_commit)};
-        const stash_ids = mlx.mlx_array_new_data(ids_i32.ptr, &id_shape, 1, .int32);
+        const stash_ids = try mlx.newData(ids_i32.ptr, &id_shape, .int32);
         errdefer _ = mlx.mlx_array_free(stash_ids);
 
         var hist_hidden = mlx.mlx_array_new();
@@ -2118,6 +2134,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     st.retained = mtpRetained(accepted);
     if (mtpFullAccept(accepted, m, st.verify_len)) {
         const tokens = try allocator.alloc(u32, 1 + m);
+        errdefer allocator.free(tokens);
         tokens[0] = t1;
         for (drafts[0..m], 0..) |d, idx| tokens[1 + idx] = d;
 
@@ -2216,7 +2233,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         re_input_buf[0] = @intCast(t1);
         for (drafts[0..accepted], 0..) |d, idx| re_input_buf[1 + idx] = @intCast(d);
         const re_shape = [_]c_int{ 1, re_seq_len };
-        const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
+        const re_input = try mlx.newData(re_input_buf.ptr, &re_shape, .int32);
         defer _ = mlx.mlx_array_free(re_input);
 
         const re_logits = try xfm.forwardWithCapture(&self.ctx, re_input, &re_new_hidden);
@@ -2232,6 +2249,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     }
 
     const tokens = try allocator.alloc(u32, 1 + accepted);
+    errdefer allocator.free(tokens);
     tokens[0] = t1;
     for (drafts[0..accepted], 0..) |d, idx| tokens[1 + idx] = d;
 

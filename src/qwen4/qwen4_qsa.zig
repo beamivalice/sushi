@@ -430,7 +430,7 @@ pub fn qsaSelectTopBlocks(
             qsa_select_used_split = true;
             return picks;
         }
-    }
+    } else try makeSplitAhead(s, kb);
 
     const kernel = getQsaSelectKernel() catch return null;
     const tg = qsaSelectTgFor(rows);
@@ -504,6 +504,62 @@ pub fn qsaSelectSplitServes(rows: c_int, nb: c_int, kb: c_int) bool {
 }
 
 pub var qsa_select_split_local_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+/// The block budgets whose split pipelines the engine made ahead (`makeSplitAhead`).
+var split_made: [8]c_int = @splat(0);
+
+/// A load's warm never reaches the split's width (tens of thousands of blocks): before the seal, on the engine, the
+/// first select of a block budget runs the split once over a sheet of that width, so a long request compiles nothing.
+/// Before the seal, the select a forward past `kb` blocks takes at each row class (`qsaSelectTgFor`, the radix width
+/// of `qsaSelectDigitBits`): a forward whose blocks fit the budget selects none, and a warm's context never passes it.
+pub fn makeSelectAhead(s: mlx.mlx_stream, kb: c_int) !void {
+    if (!qsaSelectKernelEnabled() or mlx.engine.sealed() or !mlx.engine.isStream(s)) return;
+    const slot = for (&select_made) |*k| {
+        if (k.* == kb) return;
+        if (k.* == 0) break k;
+    } else return;
+    slot.* = kb;
+    const nb = kb + 1;
+    for ([_]c_int{ 1, QSA_SELECT_SPLIT_MAX_ROWS + 1, 64, 256 }) |rows| {
+        const n: usize = @intCast(rows * nb);
+        const sheet = try std.heap.page_allocator.alloc(f32, n);
+        defer std.heap.page_allocator.free(sheet);
+        @memset(sheet, 0);
+        const bound = try std.heap.page_allocator.alloc(i32, @intCast(rows));
+        defer std.heap.page_allocator.free(bound);
+        @memset(bound, nb);
+        const mk = mlx.engine.makers(true);
+        defer mk.end();
+        const scores = try mlx.newData(sheet.ptr, &[_]c_int{ 1, rows, nb }, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+        const bounds = try mlx.newData(bound.ptr, &[_]c_int{rows}, .int32);
+        defer _ = mlx.mlx_array_free(bounds);
+        if (try qsaSelectTopBlocks(s, scores, bounds, kb)) |picks| _ = mlx.mlx_array_free(picks);
+    }
+}
+
+var select_made: [8]c_int = @splat(0);
+
+fn makeSplitAhead(s: mlx.mlx_stream, kb: c_int) !void {
+    if (!qsaSelectSplitEnabled() or mlx.engine.sealed() or !mlx.engine.isStream(s)) return;
+    const slot = for (&split_made) |*k| {
+        if (k.* == kb) return;
+        if (k.* == 0) break k;
+    } else return;
+    slot.* = kb;
+    const nb = @max(QSA_SELECT_SPLIT_MIN_NB, kb * QSA_SELECT_SPLIT_G * 2);
+    const sheet = try std.heap.page_allocator.alloc(f32, @intCast(nb));
+    defer std.heap.page_allocator.free(sheet);
+    @memset(sheet, 0);
+    const mk = mlx.engine.makers(true);
+    defer mk.end();
+    const scores = try mlx.newData(sheet.ptr, &[_]c_int{ 1, 1, nb }, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    var bound = [_]i32{nb};
+    const bounds = try mlx.newData(&bound, &[_]c_int{1}, .int32);
+    defer _ = mlx.mlx_array_free(bounds);
+    if (try qsaSelectTopBlocksSplit(s, scores, bounds, kb, 1, nb)) |picks| _ = mlx.mlx_array_free(picks);
+}
 
 pub var qsa_select_split_merge_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -690,7 +746,7 @@ pub fn qsaTopBlocksOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_a
         try mlx.check(mlx.mlx_argpartition_axis(&part_all, biased, nb - block_topk, -1, s));
         return part_all;
     }
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    const neg_inf = try mlx.newFloat(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     var masked = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(masked);
@@ -709,7 +765,7 @@ pub fn qsaSortWithInvisible(s: mlx.mlx_stream, top_idx: mlx.mlx_array, vis3: mlx
         try mlx.check(mlx.mlx_sort_axis(&sorted, top_idx, -1, s));
         return sorted;
     }
-    const int_max = mlx.mlx_array_new_int(std.math.maxInt(i32));
+    const int_max = try mlx.newInt(std.math.maxInt(i32));
     defer _ = mlx.mlx_array_free(int_max);
     var picked_vis = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(picked_vis);
@@ -750,12 +806,14 @@ pub fn noteQsaArmForSlots(slots: []const *ForwardCtx, arm: QsaArm) void {
     for (slots) |slot_ctx| slot_ctx.arch_ctx.qwen4.qsa_arms.note(arm);
 }
 
-pub fn qsaAlignedSparseAttn(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, blocks: mlx.mlx_array, ratio: c_int, scale: f32, budget: c_int) !?mlx.mlx_array {
+/// Rows still inside the indexer's budget read the dense prefix (`view.dense`); past it the rows read the quant triples.
+pub fn qsaAlignedSparseAttn(s: mlx.mlx_stream, q: mlx.mlx_array, view: *DenseKVView, blocks: mlx.mlx_array, ratio: c_int, scale: f32, budget: c_int) !?mlx.mlx_array {
     const width = mlx.getShape(q)[2];
-    const length = mlx.getShape(view.k)[2];
+    const length = view.kShape()[2];
     const cut = std.math.clamp(budget + ratio - 1 - (length - width), 0, width);
     if (budget <= 0 or cut == 0) return qsaSparseAttn(s, q, view, blocks, ratio, scale);
     if (width >= FUSED256_MIN_Q_LEN) return null;
+    try view.dense(s);
     var parts: [FUSED256_MIN_Q_LEN]mlx.mlx_array = @splat(.{});
     var count: usize = 0;
     defer for (parts[0..count]) |part| {
@@ -792,7 +850,7 @@ pub fn qsaBatchedGatherAttn(
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
     q_rope: mlx.mlx_array,
-    views: []const DenseKVView,
+    views: []DenseKVView,
     blocks: []const mlx.mlx_array,
     masks: []const mlx.mlx_array,
     ratio: c_int,
@@ -844,10 +902,12 @@ pub fn qsaBatchedGatherAttn(
             gathered = try qsaVerifyGatherAttn(s, q_slot, kv_view, blk, ratio, attn_scale);
         }
         if (gathered == null and qsa_ok and seq_len >= FUSED256_MIN_Q_LEN and kv_view.has_quant_triple) {
-            gathered = if (qsaPackedGatherServes(seq_len, mlx.getShape(kv_view.k)[2], mlx.getShape(blk)[2], ratio))
+            gathered = if (qsaPackedGatherServes(seq_len, kv_view.kShape()[2], mlx.getShape(blk)[2], ratio))
                 try gatherQsa256Packed(s, q_slot, kv_view, attn_scale, blk, ratio)
-            else
-                try gatherQsa256(s, q_slot, kv_view.k, kv_view.v, attn_scale, blk, ratio);
+            else blk: {
+                try kv_view.dense(s);
+                break :blk try gatherQsa256(s, q_slot, kv_view.k, kv_view.v, attn_scale, blk, ratio);
+            };
         }
         if (gathered) |g| {
             outs[i] = g;
@@ -859,6 +919,8 @@ pub fn qsaBatchedGatherAttn(
             };
             continue;
         }
+        // The mask and causal arms read the whole dense range.
+        try kv_view.dense(s);
         var mask_tmp: mlx.mlx_array = .{ .ctx = null };
         defer if (mask_tmp.ctx != null) {
             _ = mlx.mlx_array_free(mask_tmp);
@@ -1125,7 +1187,7 @@ pub fn qsaMaskBatched(self: *Trunk, slots: []const *ForwardCtx, qk: mlx.mlx_arra
     defer for (padded) |m| {
         if (m.ctx != null) _ = mlx.mlx_array_free(m);
     };
-    const false_v = mlx.mlx_array_new_bool(false);
+    const false_v = try mlx.newBool(false);
     defer _ = mlx.mlx_array_free(false_v);
     for (0..N) |i| {
         var row = mlx.mlx_array_new();
@@ -1364,18 +1426,18 @@ pub fn qsaSelectMaskOps(
             const bounds_host = try alloc.alloc(i32, @intCast(seq_len));
             defer alloc.free(bounds_host);
             qsaVisibleBoundsHost(bounds_host, offset, seq_len, nb, ratio, vis3.ctx == null);
-            const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{seq_len}, 1, .int32);
+            const bounds = try mlx.newData(bounds_host.ptr, &[_]c_int{seq_len}, .int32);
             defer _ = mlx.mlx_array_free(bounds);
             if (qsaSelectTopBlocks(s, scores, bounds, block_topk) catch null) |picks| {
                 defer _ = mlx.mlx_array_free(picks);
                 // The kernel pads a short row with INT_MAX; clamping those to 0 is safe because
                 // the `logical_and` with the sheet below clears block 0 when it is not visible.
-                const nb_v = mlx.mlx_array_new_int(nb);
+                const nb_v = try mlx.newInt(nb);
                 defer _ = mlx.mlx_array_free(nb_v);
                 var valid = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(valid);
                 try mlx.check(mlx.mlx_less(&valid, picks, nb_v, s));
-                const zero_i = mlx.mlx_array_new_int(0);
+                const zero_i = try mlx.newInt(0);
                 defer _ = mlx.mlx_array_free(zero_i);
                 try mlx.check(mlx.mlx_where(&top_idx, valid, picks, zero_i, s));
                 have_exact = true;
@@ -1392,7 +1454,7 @@ pub fn qsaSelectMaskOps(
         var falses = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(falses);
         try mlx.check(mlx.mlx_zeros(&falses, &[_]c_int{ batch, seq_len, nb }, 3, .bool_, s));
-        const true_v = mlx.mlx_array_new_bool(true);
+        const true_v = try mlx.newBool(true);
         defer _ = mlx.mlx_array_free(true_v);
         var picked = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(picked);
@@ -1436,7 +1498,7 @@ pub fn qsaChunkSelect(self: *Trunk, scores: mlx.mlx_array, canonical: mlx.mlx_ar
         const bounds_host = try self.allocator.alloc(i32, @intCast(rows));
         defer self.allocator.free(bounds_host);
         qsaVisibleBoundsHost(bounds_host, row0, rows, nb, ratio, all_vis);
-        const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
+        const bounds = try mlx.newData(bounds_host.ptr, &[_]c_int{rows}, .int32);
         defer _ = mlx.mlx_array_free(bounds);
         if (try qsaSelectTopBlocks(self.s, scores, bounds, kb)) |fused| return fused;
     }
@@ -1473,6 +1535,7 @@ pub fn qsaSelectBlocks(self: *Trunk, q_rope: mlx.mlx_array, k32t: mlx.mlx_array,
         _ = mlx.mlx_array_free(canonical);
     };
     if (nb <= block_topk) {
+        try makeSelectAhead(self.s, block_topk);
         var ar = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ar);
         try mlx.check(mlx.mlx_arange(&ar, 0, @floatFromInt(nb), 1.0, .int32, self.s));
@@ -1538,7 +1601,7 @@ pub fn qsaBatchedAttn(
     const arms = try self.allocator.alloc(QsaArm, slots.len);
     defer self.allocator.free(arms);
     for (slots, 0..) |slot_ctx, i| {
-        views[i] = try slot_ctx.cache.denseView(layer, self.s);
+        views[i] = try slot_ctx.cache.denseViewPacked(layer, self.s);
         blks[i] = slot_ctx.arch_ctx.qwen4.qsa_blocks;
         slot_masks[i] = slot_ctx.arch_ctx.qwen4.qsa_mask;
     }
@@ -1574,7 +1637,8 @@ pub fn markQsaPooledRopeStale(self: *Trunk) void {
     self.arch_state.qwen4.qsa_pooled_rope.stale.store(true, .release);
 }
 
-pub fn qsaInstallRing(_: *Trunk, entry: *SSMCacheEntry, src: mlx.mlx_array, s: mlx.mlx_stream) !void {
+/// `fresh`: `src` is a result no one else holds, which the ring keeps as its buffer when it fits whole.
+pub fn qsaInstallRing(_: *Trunk, entry: *SSMCacheEntry, src: mlx.mlx_array, s: mlx.mlx_stream, fresh: bool) !void {
     const sh = mlx.getShape(src);
     const rows = sh[1];
     const n: c_int = @min(rows, QSA_RING_ROWS);
@@ -1600,7 +1664,11 @@ pub fn qsaInstallRing(_: *Trunk, entry: *SSMCacheEntry, src: mlx.mlx_array, s: m
     entry.aux_state = .{ .ctx = null };
     entry.qsa_key_buf = .{ .ctx = null };
     entry.qsa_key_rows = 0;
-    entry.qsa_key_buf = try seedCapBuf(s, view, 1, @intCast(QSA_RING_ROWS));
+    entry.qsa_key_buf = if (fresh and n == rows and rows == QSA_RING_ROWS) blk: {
+        var kept = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&kept, src));
+        break :blk kept;
+    } else try seedCapBuf(s, view, 1, @intCast(QSA_RING_ROWS));
     entry.qsa_key_rows = n;
     var start = [_]c_int{ 0, 0, 0 };
     var stop = [_]c_int{ sh[0], n, sh[2] };
@@ -1632,7 +1700,7 @@ pub fn qsaAppendKeys(self: *Trunk, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, 
 
     const ring_cap: usize = @intCast(QSA_RING_ROWS);
     if (add >= QSA_RING_ROWS) {
-        try qsaInstallRing(self, entry, k_raw, s);
+        try qsaInstallRing(self, entry, k_raw, s, false);
     } else if (held + add <= QSA_RING_ROWS) {
         try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1, ring_cap);
     } else {
@@ -1657,7 +1725,7 @@ pub fn qsaAppendKeys(self: *Trunk, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, 
         const vec = mlx.mlx_vector_array_new_data(&parts, 2);
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 1, s));
-        try qsaInstallRing(self, entry, cat, s);
+        try qsaInstallRing(self, entry, cat, s, true);
     }
     entry.qsa_hist_rows = offset + add;
 }

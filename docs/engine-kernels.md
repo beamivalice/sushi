@@ -239,7 +239,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   for byte; it replaces the gather on wide bf16 spans. `sushi-ubench run dsv41.picks_span` (c5fec957 + this kernel, quiet box, AC, 7
   rounds): span 256 3.4 ms against 6.1 for gather + fused, span 128 1.8 against 3.1; peak beyond the inputs 16 MB
   against 182 MB. Resident 32K prefill (`--drop-expert 128`, one boot an arm, profiled): 1016.5 to 1078.4 tok/s.
-- `dsv41_attn_nax` (`_fp4`, `Model.attn_nax`, on where `attnNaxFits` holds and the load's trial `attnNaxProbe` against the SIMD kernel passes) runs both products on NAX `matmul2d`
+- `dsv41_attn_nax` (`_fp4`, `Model.attn_nax`, on where `attnNaxFits` holds and the load's trial `attnNaxTrial` against the SIMD kernel passes (`arm_trial.run`)) runs both products on NAX `matmul2d`
   fragments (16 keys x 16 heads over 32-channel steps for the scores, the keys the left operand so a lane reads a tile's key fragments
   once and reuses them as the right operand of P x V; 16 heads x 32 channels for P x V, lo then hi P), everything else
   as the fused kernel: the epilogue store maps the 16 x 16 fragment (a lane holds four contiguous columns of rows `r` and `r + 8`, the

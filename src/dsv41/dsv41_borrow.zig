@@ -4,7 +4,6 @@
 //! prefill reads the pools back. Every forward runs under a transient cap (`Config.forwardCap`), which is what admission
 //! bills: a request's state, a decode forward's cap and the part of a prefill's the pools cannot cover.
 const std = @import("std");
-const builtin = @import("builtin");
 const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
 const log = @import("../log.zig");
@@ -13,7 +12,7 @@ const stream = @import("../expert_stream.zig");
 const cfg_mod = @import("dsv41_config.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const Config = cfg_mod.Config;
-const MlxAsk = cfg_mod.MlxAsk;
+const cooler_side = @import("../cooler_side.zig");
 
 /// The live headroom (the GPU ceiling less MLX's active bytes), installed by the server. Unset (tests, `sushi kld`),
 /// nothing is ever released.
@@ -48,7 +47,7 @@ var ram_cappers: u32 = 0;
 /// Whether `config`'s forwards allocate on the engine of our own. Such a model moves the engine's budget and nothing
 /// of MLX's; a model on MLX moves MLX's caps and nothing of the engine's. Each hook below takes one branch.
 fn ownsEngine(config: *const ModelConfig) bool {
-    return if (config.dsv41) |*c| ownDecode(c) else false;
+    return config.dsv41 != null and cooler_side.onEngine(config);
 }
 
 pub const PoolOps = struct {
@@ -59,34 +58,6 @@ pub const PoolOps = struct {
     /// Caps what the engine of our own may hold beyond what its tensors in use ask for, its free buffers included.
     set_own: *const fn (bytes: u64) void,
 };
-
-/// Where a pack's decode forwards (one row, DSpark draft, verify rows) run, and why not on the engine of our own.
-pub const DecodeSide = enum {
-    engine,
-    /// `--ds41-mlx-engine`.
-    mlx_by_flag,
-    /// The model's `ds41_cooler` is off.
-    mlx_by_setting,
-};
-
-/// PURE: the side for any DeepSeek pack, STQ or the release's own FP8 trunk and MXFP4 experts, on any GPU (the arms a
-/// GPU has are `device`'s): the engine, unless the user asks for MLX.
-pub fn decodeSide(ask: MlxAsk) DecodeSide {
-    return switch (ask) {
-        .none => .engine,
-        .flag => .mlx_by_flag,
-        .setting => .mlx_by_setting,
-    };
-}
-
-/// The load line for a side. The engine of our own ships as Sushi Cooler.
-pub fn decodeLine(side: DecodeSide) []const u8 {
-    return switch (side) {
-        .engine => "[dsv41] decode forwards (one row, DSpark draft and verify rows): on Sushi Cooler, the engine of our own",
-        .mlx_by_flag => "[dsv41] decode forwards: on MLX because --ds41-mlx-engine was given (Sushi Cooler is off)",
-        .mlx_by_setting => "[dsv41] decode forwards: on MLX because model-settings.json ds41_cooler is off (Sushi Cooler is off)",
-    };
-}
 
 /// Set while the load's warm runs. `serve` installs the caps after the load, so each engine forward of the warm takes the
 /// budget a request's forward of the same rows and position has (`enterWarm`), or it would hold any amount.
@@ -101,29 +72,16 @@ var warm_budget_set: bool = false;
 /// The load line of a pack whose decode is on the engine: its prefill chunks run there too, at every width.
 pub const prefill_line = "[dsv41] prefill chunks wider than 16 rows: on Sushi Cooler, the engine of our own";
 
-pub fn decodeSideOf(c: *const Config) DecodeSide {
-    return decodeSide(c.mlx_ask);
-}
-
-/// Whether this pack's decode forwards run on the engine of our own. The load and every bill ask here.
-pub fn ownDecode(c: *const Config) bool {
-    if (decodeSideOf(c) != .engine) return false;
-    // The tests written against MLX's decode say nothing and keep it; the engine's own tests turn it on. The user's
-    // opt-out (above) outranks both.
-    if (comptime builtin.is_test) return c.cooler_for_test orelse false;
-    return true;
-}
-
 /// Whether the load keeps each expert's scale vectors in host memory once read (`expert_stream.KeptScales`): an STQ
 /// pack on Sushi Cooler. The load turns it on and the ssd-budget ledger bills it from this one answer.
-pub fn keepsScales(c: *const Config) bool {
-    return c.expert_dec != null and ownDecode(c);
+pub fn keepsScales(config: *const ModelConfig) bool {
+    return config.dsv41.?.expert_dec != null and cooler_side.onEngine(config);
 }
 
 /// What the engine of our own may hold during a request at `seq`, beside MLX's cap: a decode forward's cap again,
 /// since a forward of ours makes on its own queue what MLX's would have made on MLX's.
-pub fn ownCap(c: *const Config, seq: u64) u64 {
-    return if (ownDecode(c)) c.forwardCap(verify_rows, seq) else 0;
+pub fn ownCap(c: *const Config, own: bool, seq: u64) u64 {
+    return if (own) c.forwardCap(verify_rows, seq) else 0;
 }
 
 fn rowsCap(rows: u64, config: *const ModelConfig) u64 {
@@ -155,12 +113,13 @@ fn setTransient(bytes: u64, ops: PoolOps) void {
 /// thread. True when the pool cap moved.
 pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const Config, ops: PoolOps) bool {
     if (!arch_config.isOf(config, "dsv41")) return false;
+    const own = cooler_side.onEngine(config);
     if (pool_ram_cap == 0) {
-        enterWarm(rows, seq, c, ops);
+        enterWarm(rows, seq, c, own, ops);
         return false;
     }
-    const split = splitOf(rows, seq, c);
-    if (ownDecode(c)) {
+    const split = splitOf(rows, seq, c, own);
+    if (own) {
         ops.set_own(split.own);
         return false;
     }
@@ -168,16 +127,43 @@ pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const C
     return moveCap(rowsCap(rows, config), config, ops);
 }
 
-/// A forward of the load's warm: the engine's share of the cap a request's forward of `rows` ending at `seq` has. Nothing
-/// outside the warm.
-pub fn enterWarm(rows: u64, seq: u64, c: *const Config, ops: PoolOps) void {
-    if (!warm_budget or !ownDecode(c)) return;
-    warm_budget_set = true;
-    ops.set_own(warm_budget_override orelse splitOf(rows, seq, c).own);
+/// `enterForward` of a joined decode forward, a row per request at `seqs`: its cap is `Config.joinedCap`.
+pub fn enterRows(seqs: []const u64, config: *const ModelConfig, c: *const Config, ops: PoolOps) bool {
+    if (!arch_config.isOf(config, "dsv41")) return false;
+    const cap = c.joinedCap(seqs);
+    if (pool_ram_cap == 0) {
+        if (warm_budget and cooler_side.onEngine(config)) {
+            warm_budget_set = true;
+            ops.set_own(warm_budget_override orelse cap);
+        }
+        return false;
+    }
+    if (cooler_side.onEngine(config)) {
+        ops.set_own(cap);
+        return false;
+    }
+    setTransient(phaseLimit(cap, config), ops);
+    return moveCap(rowsCap(seqs.len, config), config, ops);
 }
 
-pub fn enterWarmMlx(rows: u64, seq: u64, c: *const Config) void {
-    enterWarm(rows, seq, c, mlx_ops);
+/// `beforeForward` of a joined decode forward (`enterRows`).
+pub fn beforeRowsForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, seqs: []const u64) !void {
+    _ = enterRows(seqs, config, c, mlx_ops);
+    const headroom = headroom_fn orelse return;
+    if (engine.borrow_from >= engine.layers.len) return;
+    return restore(engine, config, headroom, c.joinedCap(seqs));
+}
+
+/// A forward of the load's warm: the engine's share of the cap a request's forward of `rows` ending at `seq` has. Nothing
+/// outside the warm.
+pub fn enterWarm(rows: u64, seq: u64, c: *const Config, own: bool, ops: PoolOps) void {
+    if (!warm_budget or !own) return;
+    warm_budget_set = true;
+    ops.set_own(warm_budget_override orelse splitOf(rows, seq, c, own).own);
+}
+
+pub fn enterWarmMlx(rows: u64, seq: u64, c: *const Config, own: bool) void {
+    enterWarm(rows, seq, c, own, mlx_ops);
 }
 
 /// The warm is over: the engine runs under no budget until a request's forward installs its own.
@@ -194,10 +180,10 @@ pub fn endWarmMlx() void {
 
 /// What a forward's cap leaves to MLX and to the engine of our own. A wide chunk on the engine takes the whole cap its
 /// bill reserves: the state rows it appends grow in the engine's pool with the rest, and MLX allocates nothing.
-fn splitOf(rows: u64, seq: u64, c: *const Config) struct { mlx: u64, own: u64 } {
+fn splitOf(rows: u64, seq: u64, c: *const Config, own: bool) struct { mlx: u64, own: u64 } {
     const cap = c.forwardCap(rows, seq);
-    if (!ownDecode(c)) return .{ .mlx = cap, .own = 0 };
-    return .{ .mlx = 0, .own = if (rows > verify_rows) cap else ownCap(c, seq) };
+    if (!own) return .{ .mlx = cap, .own = 0 };
+    return .{ .mlx = 0, .own = if (rows > verify_rows) cap else ownCap(c, own, seq) };
 }
 
 /// Whether an image encode on the engine runs under its bill (`enterVision`).
@@ -573,7 +559,7 @@ test "dsv41 borrow: a wide chunk on the engine gives the engine's pool the whole
         fn run() anyerror!void {
             var config = try dsv41Config();
             const c = &config.dsv41.?;
-            config.dsv41.?.cooler_for_test = true;
+            config.cooler_for_test = true;
             for ([_][2]u64{ .{ 2048, 2048 }, .{ 1100, 1 << 20 }, .{ 31, 4096 } }) |chunk| {
                 _ = enterForward(chunk[0], chunk[1], &config, c, PoolProbe.ops);
                 try testing.expectEqual(c.forwardCap(chunk[0], chunk[1]), PoolProbe.own);
@@ -586,12 +572,35 @@ test "dsv41 borrow: a wide chunk on the engine gives the engine's pool the whole
     try withPoolState(8 << 30, &Body.run);
 }
 
+test "dsv41 borrow: a joined decode forward of one request installs that request's decode cap, of more each one's with the slack once" {
+    const Body = struct {
+        fn run() anyerror!void {
+            var config = try dsv41Config();
+            const c = &config.dsv41.?;
+            for ([_]bool{ true, false }) |cooler| {
+                config.cooler_for_test = cooler;
+                PoolProbe.reset();
+                _ = enterForward(1, 4097, &config, c, PoolProbe.ops);
+                const solo = .{ PoolProbe.own, PoolProbe.transient };
+                PoolProbe.reset();
+                _ = enterRows(&.{4097}, &config, c, PoolProbe.ops);
+                try testing.expectEqual(solo, .{ PoolProbe.own, PoolProbe.transient });
+                PoolProbe.reset();
+                _ = enterRows(&.{ 4097, 70_000 }, &config, c, PoolProbe.ops);
+                const two = c.forwardCap(1, 4097) + c.forwardCap(1, 70_000) - cfg_mod.cap_slack_bytes;
+                if (cooler) try testing.expectEqual(two, PoolProbe.own) else try testing.expectEqual(two, PoolProbe.transient - config.expertPoolBytes());
+            }
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+}
+
 test "dsv41 borrow: a wide chunk of a pack that decodes on MLX keeps the whole cap on MLX" {
     const Body = struct {
         fn run() anyerror!void {
             var config = try dsv41Config();
             const c = &config.dsv41.?;
-            config.dsv41.?.cooler_for_test = false;
+            config.cooler_for_test = false;
             _ = enterForward(2048, 2048, &config, c, PoolProbe.ops);
             try testing.expectEqual(c.forwardCap(2048, 2048), PoolProbe.transient - config.expertPoolBytes());
             try testing.expectEqual(@as(u64, 0), PoolProbe.own);
@@ -605,22 +614,22 @@ test "dsv41 borrow: the load's warm gives each engine forward, of any width, the
         fn run() anyerror!void {
             var config = try dsv41Config();
             const c = &config.dsv41.?;
-            config.dsv41.?.cooler_for_test = true;
+            config.cooler_for_test = true;
             defer {
                 warm_budget = false;
                 warm_budget_set = false;
             }
             // Outside the warm a forward is not capped before `serve` installs the caps, as `sushi kld` and the tests are not.
             _ = enterForward(2048, 2048, &config, c, PoolProbe.ops);
-            enterWarm(1, 4096, c, PoolProbe.ops);
+            enterWarm(1, 4096, c, true, PoolProbe.ops);
             try testing.expectEqual(@as(u64, 0), PoolProbe.own);
             warm_budget = true;
             // A wide chunk takes the one cap whole; a decode-width forward, whatever its rows, the decode cap at its position.
             try testing.expect(!enterForward(2048, 2048, &config, c, PoolProbe.ops));
             try testing.expectEqual(c.forwardCap(2048, 2048), PoolProbe.own);
             for ([_]u64{ 1, 3, verify_rows }) |rows| {
-                enterWarm(rows, 4096 + rows, c, PoolProbe.ops);
-                try testing.expectEqual(ownCap(c, 4096 + rows), PoolProbe.own);
+                enterWarm(rows, 4096 + rows, c, true, PoolProbe.ops);
+                try testing.expectEqual(ownCap(c, true, 4096 + rows), PoolProbe.own);
             }
             try testing.expectEqual(@as(usize, 0), PoolProbe.n);
             try testing.expectEqual(@as(usize, 0), PoolProbe.transient_sets);
@@ -667,7 +676,7 @@ test "dsv41 borrow: every phase installs the cap it bills and the decode pool be
             enterVision(0, &config, PoolProbe.ops);
             try testing.expectEqual(none, PoolProbe.transient_sets);
             // On the engine the bill is the engine's cap for the whole encode, and nothing of MLX's moves.
-            config.dsv41.?.cooler_for_test = true;
+            config.cooler_for_test = true;
             enterVision(1_100_000_000, &config, PoolProbe.ops);
             try testing.expectEqual(@as(u64, 1_100_000_000), PoolProbe.own);
             try testing.expect(visionBilled());
@@ -743,10 +752,10 @@ test "dsv41 borrow: with decode on the engine of our own every forward installs 
         fn run() anyerror!void {
             var config = try dsv41Config();
             const c = &config.dsv41.?;
-            config.dsv41.?.cooler_for_test = false;
+            config.cooler_for_test = false;
             _ = enterForward(1, 9_000, &config, c, PoolProbe.ops);
             try testing.expectEqual(@as(u64, 0), PoolProbe.own);
-            config.dsv41.?.cooler_for_test = true;
+            config.cooler_for_test = true;
             _ = enterForward(1, 9_000, &config, c, PoolProbe.ops);
             try testing.expectEqual(c.forwardCap(verify_rows, 9_000), PoolProbe.own);
             // A prefill chunk takes the cap less MLX's share.
@@ -766,21 +775,27 @@ test "dsv41 borrow: with decode on the engine of our own every forward installs 
 }
 
 test "dsv41 borrow: decode runs on the engine for every pack, the release's own as an STQ one, unless the user asks for MLX by name" {
-    try testing.expectEqual(DecodeSide.engine, decodeSide(.none));
-    try testing.expectEqual(DecodeSide.mlx_by_flag, decodeSide(.flag));
-    try testing.expectEqual(DecodeSide.mlx_by_setting, decodeSide(.setting));
+    var config = try dsv41Config();
     // A config with no trellis decode is the release's own layout.
-    var c: Config = .{};
-    try testing.expect(c.expert_dec == null and c.trunk_dec == null);
-    try testing.expectEqual(DecodeSide.engine, decodeSideOf(&c));
-    c.mlx_ask = .setting;
-    try testing.expectEqual(DecodeSide.mlx_by_setting, decodeSideOf(&c));
+    try testing.expect(config.dsv41.?.expert_dec == null and config.dsv41.?.trunk_dec == null);
+    config.cooler_for_test = true;
+    try testing.expect(cooler_side.sideOf(&config) == .engine);
+    config.cooler_ask = .flag;
+    try testing.expect(cooler_side.sideOf(&config) == .mlx_by_flag);
+    config.cooler_ask = .setting;
+    try testing.expect(cooler_side.sideOf(&config) == .mlx_by_setting);
 }
 
 test "dsv41 borrow: the load line names the side and why, with Sushi Cooler as the engine's name" {
-    try testing.expectEqualStrings("[dsv41] decode forwards (one row, DSpark draft and verify rows): on Sushi Cooler, the engine of our own", decodeLine(.engine));
-    try testing.expectEqualStrings("[dsv41] decode forwards: on MLX because --ds41-mlx-engine was given (Sushi Cooler is off)", decodeLine(.mlx_by_flag));
-    try testing.expectEqualStrings("[dsv41] decode forwards: on MLX because model-settings.json ds41_cooler is off (Sushi Cooler is off)", decodeLine(.mlx_by_setting));
+    const what = "[dsv41] decode forwards (one row, DSpark draft and verify rows)";
+    var buf: [256]u8 = undefined;
+    var config = try dsv41Config();
+    config.cooler_for_test = true;
+    try testing.expectEqualStrings(what ++ ": on Sushi Cooler, the engine of our own", cooler_side.line(&buf, what, &config));
+    config.cooler_ask = .flag;
+    try testing.expectEqualStrings(what ++ ": on MLX because --ds41-mlx-engine was given (Sushi Cooler is off)", cooler_side.line(&buf, what, &config));
+    config.cooler_ask = .setting;
+    try testing.expectEqualStrings(what ++ ": on MLX because model-settings.json ds41_cooler is off (Sushi Cooler is off)", cooler_side.line(&buf, what, &config));
 }
 
 test "dsv41 borrow: beside a Cooler model, a model on MLX has its transient cap lifted at its request's end" {
@@ -799,18 +814,18 @@ test "dsv41 borrow: beside a Cooler model, a model on MLX has its transient cap 
                 const turn = mlx.engine.turnTo(false);
                 defer turn.end();
                 try testing.expectEqual(@as(usize, 0), mlx.setTransientLimit(0));
-                config.dsv41.?.cooler_for_test = false;
+                config.cooler_for_test = false;
                 _ = enterForward(1, 9_000, &config, c, mlx_ops);
             }
             {
                 const turn = mlx.engine.turnTo(true);
                 defer turn.end();
-                config.dsv41.?.cooler_for_test = true;
+                config.cooler_for_test = true;
                 _ = endRequest(&config, mlx_ops);
             }
             const turn = mlx.engine.turnTo(false);
             defer turn.end();
-            config.dsv41.?.cooler_for_test = false;
+            config.cooler_for_test = false;
             _ = endRequest(&config, mlx_ops);
             try testing.expectEqual(@as(usize, 0), mlx.setTransientLimit(0));
         }
@@ -840,18 +855,18 @@ test "dsv41 borrow: beside a Cooler model's forward, a model on MLX drops its po
             {
                 const turn = mlx.engine.turnTo(false);
                 defer turn.end();
-                config.dsv41.?.cooler_for_test = false;
+                config.cooler_for_test = false;
                 try testing.expect(enterForward(2048, 2048, &config, c, mlx_ops));
             }
             {
                 const turn = mlx.engine.turnTo(true);
                 defer turn.end();
-                config.dsv41.?.cooler_for_test = true;
+                config.cooler_for_test = true;
                 _ = enterForward(1, 4097, &config, c, mlx_ops);
             }
             const turn = mlx.engine.turnTo(false);
             defer turn.end();
-            config.dsv41.?.cooler_for_test = false;
+            config.cooler_for_test = false;
             _ = enterForward(1, 2049, &config, c, mlx_ops);
             var now: usize = 0;
             try mlx.check(mlx.mlx_set_cache_limit(&now, 1 << 40));
@@ -885,13 +900,13 @@ test "dsv41 borrow: a Cooler model's unload leaves MLX's lowered pool cap to the
                 try mlx.check(mlx.mlx_set_cache_limit(&prev, 3 << 30));
                 poolCapped(prev);
             }
-            config.dsv41.?.cooler_for_test = true;
+            config.cooler_for_test = true;
             unloadModelMlx(&config);
             @import("../arch/handle.zig").engineHoldEnd();
             var now: usize = 0;
             try mlx.check(mlx.mlx_set_cache_limit(&now, 3 << 30));
             try testing.expectEqual(@as(usize, 3 << 30), now);
-            config.dsv41.?.cooler_for_test = false;
+            config.cooler_for_test = false;
             unloadModelMlx(&config);
             try mlx.check(mlx.mlx_set_cache_limit(&now, 1 << 40));
             try testing.expectEqual(@as(usize, 1 << 40), now);
@@ -905,7 +920,7 @@ test "dsv41 borrow: a model on MLX never moves the engine's budget, at a forward
         fn run() anyerror!void {
             var config = try dsv41Config();
             const c = &config.dsv41.?;
-            config.dsv41.?.cooler_for_test = false;
+            config.cooler_for_test = false;
             const sets = PoolProbe.own_sets;
             _ = enterForward(1, 9_000, &config, c, PoolProbe.ops);
             _ = enterForward(2048, 2048, &config, c, PoolProbe.ops);
@@ -921,7 +936,7 @@ test "dsv41 borrow: two models on MLX: the lowered pool cap goes back when the s
     const Body = struct {
         fn run() anyerror!void {
             var config = try dsv41Config();
-            config.dsv41.?.cooler_for_test = false;
+            config.cooler_for_test = false;
             poolCapped(8 << 30);
             poolCapped(1 << 30);
             try testing.expect(!unloadModel(&config, PoolProbe.ops));
@@ -936,9 +951,9 @@ test "dsv41 borrow: two models on MLX: the lowered pool cap goes back when the s
 test "dsv41 borrow: the ledger bills the pool that is parked: MLX's decode pool, or a Cooler load's engine buffers under its idle cap" {
     var config = try dsv41Config();
     const c = &config.dsv41.?;
-    config.dsv41.?.cooler_for_test = false;
+    config.cooler_for_test = false;
     try testing.expectEqual(cfg_mod.dsv41_pool_bytes, config.expertPoolBytes());
-    config.dsv41.?.cooler_for_test = true;
+    config.cooler_for_test = true;
     try testing.expectEqual(c.forwardCap(verify_rows, 1), config.expertPoolBytes());
     try testing.expect(config.expertPoolBytes() < cfg_mod.dsv41_pool_bytes);
     // What a request's end leaves the engine is what the ledger billed.
@@ -958,10 +973,9 @@ test "the opt-out flag reaches a DeepSeek load's decode side through the parse a
         var cfg = try model_mod.parseConfig(io, a, dir);
         defer cfg.deinit(a);
         model_load.applyModelSettings(&cfg, .{});
-        try testing.expectEqual(DecodeSide.engine, decodeSideOf(&cfg.dsv41.?));
-        try testing.expect(!ownDecode(&cfg.dsv41.?));
-        cfg.dsv41.?.cooler_for_test = true;
-        try testing.expect(ownDecode(&cfg.dsv41.?));
+        try testing.expect(cooler_side.sideOf(&cfg) == .mlx_in_test);
+        cfg.cooler_for_test = true;
+        try testing.expect(cooler_side.onEngine(&cfg));
     }
     {
         model_mod.cooler_off = .empty;
@@ -969,15 +983,28 @@ test "the opt-out flag reaches a DeepSeek load's decode side through the parse a
         var cfg = try model_mod.parseConfig(io, a, dir);
         defer cfg.deinit(a);
         model_load.applyModelSettings(&cfg, .{ .ds41_cooler = true });
-        try testing.expectEqual(DecodeSide.mlx_by_flag, decodeSideOf(&cfg.dsv41.?));
-        cfg.dsv41.?.cooler_for_test = true;
-        try testing.expect(!ownDecode(&cfg.dsv41.?));
+        cfg.cooler_for_test = true;
+        try testing.expect(cooler_side.sideOf(&cfg) == .mlx_by_flag);
     }
     {
         model_mod.cooler_off = .empty;
         var cfg = try model_mod.parseConfig(io, a, dir);
         defer cfg.deinit(a);
         model_load.applyModelSettings(&cfg, .{ .ds41_cooler = false });
-        try testing.expectEqual(DecodeSide.mlx_by_setting, decodeSideOf(&cfg.dsv41.?));
+        try testing.expect(cooler_side.sideOf(&cfg) == .mlx_by_setting);
     }
 }
+
+test "dsv41 borrow: a load's served warm runs its forwards under the warm budget, which its end lifts" {
+    const arch_state = @import("../arch/arch_state.zig");
+    defer {
+        warm_budget = false;
+        warm_budget_set = false;
+    }
+    var s: arch_state.State = .{};
+    arch_state.servedWarmBegin(&s);
+    try testing.expect(warm_budget);
+    arch_state.servedWarmEnd(&s);
+    try testing.expect(!warm_budget);
+}
+

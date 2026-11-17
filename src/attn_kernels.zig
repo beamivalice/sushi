@@ -477,7 +477,7 @@ fn attnPdNaxProbeCase(s: mlx.mlx_stream, banded: bool, had_error: bool) bool {
     const v = qsaProbeLcgBf16(s, &[_]c_int{ 1, 1, kl, 128 }, 0xA77D03) orelse return false;
     defer _ = mlx.mlx_array_free(v);
     const sink_data = [_]f32{ 0.25, -0.5 };
-    const sinks: mlx.mlx_array = if (banded) mlx.mlx_array_new_data(&sink_data, &[_]c_int{2}, 1, .float32) else .{ .ctx = null };
+    const sinks: mlx.mlx_array = if (banded) (mlx.newData(&sink_data, &[_]c_int{2}, .float32) catch return false) else .{ .ctx = null };
     defer if (sinks.ctx != null) {
         _ = mlx.mlx_array_free(sinks);
     };
@@ -501,7 +501,7 @@ fn attnPdNaxProbeCase(s: mlx.mlx_stream, banded: bool, had_error: bool) bool {
         const col: c_int = @intCast(c);
         mask_buf[r * kl + c] = col <= row and (window == 0 or row - col < window);
     };
-    const mask = mlx.mlx_array_new_data(&mask_buf, &[_]c_int{ 1, 1, ql, kl }, 4, .bool_);
+    const mask = mlx.newData(&mask_buf, &[_]c_int{ 1, 1, ql, kl }, .bool_) catch return false;
     defer _ = mlx.mlx_array_free(mask);
     var wide: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
     defer for (wide) |a| {
@@ -747,6 +747,8 @@ fn logAttnPdEngaged(arm: AttnPdArm, qk_dim: c_int, v_dim: c_int, q_len: c_int, k
 /// True when a bf16 view's bound address is 16-byte aligned, which every `uint4` K/V staging load needs. A lazy
 /// array has no address yet and passes: the stride gates are all that can be checked for it.
 pub fn attn256Base16Aligned(a: mlx.mlx_array) bool {
+    // An array of the engine's knows its byte offset (its buffer is page aligned): no host read, evaluated or not.
+    if (mlx.engine.byteOffset(a)) |off| return off % 16 == 0;
     var avail = false;
     if (mlx._mlx_array_is_available(&avail, a) != 0 or !avail) return true;
     const p = mlx.mlx_array_data_uint32(a) orelse return true;
@@ -762,7 +764,7 @@ fn qsaSkipTable(s: mlx.mlx_stream, mask: mlx.mlx_array) !mlx.mlx_array {
     const axes = [_]c_int{ 2, 3 };
     const low = [_]c_int{ 0, 0 };
     const high = [_]c_int{ nq * 64 - ms[2], nk * 32 - ms[3] };
-    const falsev = mlx.mlx_array_new_bool(false);
+    const falsev = try mlx.newBool(false);
     defer _ = mlx.mlx_array_free(falsev);
     var padded = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(padded);
@@ -1231,7 +1233,7 @@ pub fn splitKAttnDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, blocks: mlx.mlx_a
     const seq_len = qs[2];
     const scl_data = [_]f32{attn_scale};
     const one = [_]c_int{1};
-    const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
+    const scl = try mlx.newData(&scl_data, &one, .float32);
     defer _ = mlx.mlx_array_free(scl);
 
     const cfgs: [2]mlx.mlx_fast_metal_kernel_config = qsa_attn_cfgs.get(key) orelse blk: {
@@ -1411,10 +1413,10 @@ fn attnPdDispatch(
 
     const one = [_]c_int{1};
     const scl_data = [_]f32{scale};
-    const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
+    const scl = try mlx.newData(&scl_data, &one, .float32);
     defer _ = mlx.mlx_array_free(scl);
     const win_data = [_]i32{@intCast(window)};
-    const win = mlx.mlx_array_new_data(&win_data, &one, 1, .int32);
+    const win = try mlx.newData(&win_data, &one, .int32);
     defer _ = mlx.mlx_array_free(win);
 
     // Budgeted kv-axis chunking (CAUSAL arm only — the band arm's in-kernel
@@ -1432,12 +1434,12 @@ fn attnPdDispatch(
 
     // Dummy 1-elem f32 stands in for absent carry inputs / unwritten outputs.
     const dummy_data = [_]f32{0};
-    const dummy = mlx.mlx_array_new_data(&dummy_data, &one, 1, .float32);
+    const dummy = try mlx.newData(&dummy_data, &one, .float32);
     defer _ = mlx.mlx_array_free(dummy);
     // 4-D so `mask_strides[..3]` exists for the QSA=0 template too.
     const dummy_b_data = [_]bool{false};
     const dummy_b_shape = [_]c_int{ 1, 1, 1, 1 };
-    const dummy_b = mlx.mlx_array_new_data(&dummy_b_data, &dummy_b_shape, 4, .bool_);
+    const dummy_b = try mlx.newData(&dummy_b_data, &dummy_b_shape, .bool_);
     defer _ = mlx.mlx_array_free(dummy_b);
     var skip = mlx.mlx_array{ .ctx = null };
     defer if (skip.ctx != null) {
@@ -1480,7 +1482,7 @@ fn attnPdDispatch(
             if (packed_kv != null) @as(i32, @intCast(k0)) else 0,
             @intCast(kL),
         };
-        const kr = mlx.mlx_array_new_data(&kr_data, &four, 1, .int32);
+        const kr = try mlx.newData(&kr_data, &four, .int32);
         defer _ = mlx.mlx_array_free(kr);
 
         // One dispatch's keys, dequantized here and freed as the graph runs
@@ -1497,7 +1499,7 @@ fn attnPdDispatch(
             v_slice = try dequantKvSlice(s, pk.v_q, pk.v_scales, pk.v_biases, k0, k1, pk.group_size, pk.bits);
         }
         const phase_data = [_]i32{(if (has_carry) @as(i32, 1) else 0) | (if (final) @as(i32, 2) else 0)};
-        const phase = mlx.mlx_array_new_data(&phase_data, &one, 1, .int32);
+        const phase = try mlx.newData(&phase_data, &one, .int32);
         defer _ = mlx.mlx_array_free(phase);
 
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -1649,7 +1651,7 @@ fn swaSinkParityWalk(kv_cfg: KVQuantConfig, seed: u64, schedule: []const c_int) 
     var sink_f: [16]f32 = undefined;
     for (&sink_f) |*x| x.* = rnd.float(f32) * 6.0 - 2.0;
     const sink_shape = [_]c_int{16};
-    const sinks_f32 = mlx.mlx_array_new_data(&sink_f, &sink_shape, 1, .float32);
+    const sinks_f32 = try mlx.newData(&sink_f, &sink_shape, .float32);
     defer _ = mlx.mlx_array_free(sinks_f32);
     var sinks = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sinks);
@@ -2548,3 +2550,27 @@ test "fusedSdpaPrefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged 64
     const max_diff = try attn256MaxDiff(fused, ref, s);
     try std.testing.expect(max_diff < 0.005);
 }
+
+test "attn256 base alignment of an engine view is read off its offset, whether or not it has been evaluated, with no host read" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    var base = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(base);
+    try mlx.check(mlx.mlx_zeros(&base, &[_]c_int{ 1, 2, 64, 256 }, 4, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(base));
+    // One element in: a 2-byte offset, strided as a cache's prefix view is.
+    var view = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(view);
+    try mlx.check(mlx.mlx_slice(&view, base, &[_]c_int{ 0, 0, 0, 1 }, 4, &[_]c_int{ 1, 2, 64, 256 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+    var buf: [512]u8 = undefined;
+    _ = mlx.takeError(&buf);
+    try std.testing.expect(!attn256Base16Aligned(view));
+    try mlx.check(mlx.mlx_array_eval(view));
+    try std.testing.expect(!attn256Base16Aligned(view));
+    try std.testing.expect(attn256Base16Aligned(base));
+    try std.testing.expect(mlx.takeError(&buf) == null);
+}
+

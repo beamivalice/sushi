@@ -29,7 +29,9 @@ pub fn preproc(config: *const model.ModelConfig) chat.VisionPreproc {
 }
 
 pub fn initTower(allocator: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights) !Tower {
-    const tower = try Tower.init(allocator, config, weights);
+    var tower = try Tower.init(allocator, config, weights);
+    errdefer tower.deinit();
+    try tower.warmEngine();
     log.info("Vision encoder: Qwen3-VL ViT (depth={d}, hidden={d}, heads={d}, merge={d}, out_hidden={d})\n", .{
         config.qv_depth, config.qv_hidden, config.qv_heads, config.qv_merge, config.qv_out_hidden,
     });

@@ -211,7 +211,7 @@ pub fn gatherQmm(x_in: *Tensor, w_in: *Tensor, scales_in: *Tensor, biases_in: ?*
 }
 
 /// `indices_or_default`: the indices given as uint32, or `arange` over the batch of `of`.
-fn indicesOrDefault(given: ?*Tensor, of: *const Tensor) Error!*Tensor {
+pub fn indicesOrDefault(given: ?*Tensor, of: *const Tensor) Error!*Tensor {
     if (given) |t| {
         switch (t.dtype) {
             .uint32 => return core.share(t),
@@ -231,7 +231,7 @@ fn indicesOrDefault(given: ?*Tensor, of: *const Tensor) Error!*Tensor {
 }
 
 /// The broadcast shape of two index arrays, aligned at their last axes.
-fn broadcastShape(a: *const Tensor, b: *const Tensor, out: *[core.max_dims]c_int) Error![]const c_int {
+pub fn broadcastShape(a: *const Tensor, b: *const Tensor, out: *[core.max_dims]c_int) Error![]const c_int {
     const nd = @max(a.ndim, b.ndim);
     for (0..nd) |i| {
         const da: c_int = if (i < nd - a.ndim) 1 else a.shape[i - (nd - a.ndim)];

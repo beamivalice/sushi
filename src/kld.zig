@@ -236,7 +236,7 @@ pub const USAGE =
     \\  --qwen-gdn <32|16>    Qwen only: bits of the GatedDeltaNet recurrent state (default 32 =
     \\                        f32; 16 = bf16, the decay gate is f32 either way). A student at 16 is
     \\                        scored against the f32 teacher. A GLM pack has no GDN arm and refuses it.
-    \\  --drop-expert <n>     compare only, DeepSeek-V4.1 only: drop the n least-used routed experts of every layer by
+    \\  --drop-expert <n>     compare only, on a pack with an expert usage list: drop the n least-used routed experts of every layer by
     \\                        the pack's expert_usage.json (a multiple of 8; 0 = off). The teacher is never pruned.
     \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
     \\  --ssd-prefetch <n>    streamed-expert prefetch read cap: percent (0..100, default 0) of the SSD read rate; 0 = no prefetch
@@ -444,7 +444,7 @@ pub fn forwardPromptChunks(allocator: std.mem.Allocator, l: *Loaded, ctx: *model
     var start: usize = 0;
     while (start < ids.len) {
         const end = @min(ids.len, start + chunk);
-        const part = mlx.mlx_array_new_data(prompt_i32[start..end].ptr, &[_]c_int{ 1, @intCast(end - start) }, 2, .int32);
+        const part = try mlx.newData(prompt_i32[start..end].ptr, &[_]c_int{ 1, @intCast(end - start) }, .int32);
         defer _ = mlx.mlx_array_free(part);
         const next = try l.xfm.forwardWith(ctx, part);
         _ = mlx.mlx_array_free(logits);
@@ -480,7 +480,7 @@ fn forwardPromptCapture(allocator: std.mem.Allocator, l: *Loaded, ctx: *model_ha
 
 fn forwardOne(l: *Loaded, ctx: *model_handle.ForwardCtx, token: u32) !mlx.mlx_array {
     const data = [_]i32{@intCast(token)};
-    const input = mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 1 }, 2, .int32);
+    const input = try mlx.newData(&data, &[_]c_int{ 1, 1 }, .int32);
     defer _ = mlx.mlx_array_free(input);
     return l.xfm.forwardWith(ctx, input);
 }

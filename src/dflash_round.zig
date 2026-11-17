@@ -95,7 +95,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     noise_ids[0] = @intCast(t1);
     for (noise_ids[1..]) |*v| v.* = @intCast(model.config.mask_token_id);
     const noise_shape = [_]c_int{ 1, @intCast(noise_rows) };
-    const noise_input = mlx.mlx_array_new_data(noise_ids.ptr, &noise_shape, 2, .int32);
+    const noise_input = try mlx.newData(noise_ids.ptr, &noise_shape, .int32);
     defer _ = mlx.mlx_array_free(noise_input);
     // RAW table rows — no embed norm, no scale (the DFlash contract).
     const noise_embeds = try xfm.rawEmbedding(noise_input);
@@ -163,7 +163,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         defer allocator.free(ids_i32);
         for (sel_path.?.ids[0..m], ids_i32) |v, *d| d.* = @intCast(v);
         const row_shape = [_]c_int{ 1, @intCast(m) };
-        const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
+        const host_arr = try mlx.newData(ids_i32.ptr, &row_shape, .int32);
         defer _ = mlx.mlx_array_free(host_arr);
         try mlx.check(mlx.mlx_array_set(&draft_ids, host_arr));
     } else {
@@ -181,7 +181,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     // ── Phase 2: verify input [t1, drafts...] — [1, bs] int32, lazy ──
     const t1_i32: i32 = @intCast(t1);
     const t1_shape = [_]c_int{ 1, 1 };
-    const t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 2, .int32);
+    const t1_arr = try mlx.newData(&t1_i32, &t1_shape, .int32);
     defer _ = mlx.mlx_array_free(t1_arr);
     var verify_input = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(verify_input);

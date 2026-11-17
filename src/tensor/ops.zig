@@ -34,6 +34,15 @@ pub fn reshape(t: *Tensor, shape_in: []const c_int) Error!*Tensor {
         shape[i] = @intCast(total / known);
     } else if (known != total) return error.TensorShape;
 
+    if (!t.rowContiguous() and total != 0) if (viewStrides(t, shape[0..shape_in.len])) |strides| {
+        const view = try core.share(t);
+        view.ndim = @intCast(shape_in.len);
+        for (0..shape_in.len) |i| {
+            view.shape[i] = shape[i];
+            view.strides[i] = strides[i];
+        }
+        return view;
+    };
     const base = if (t.rowContiguous()) try core.share(t) else try contiguousCopy(t);
     base.ndim = @intCast(shape_in.len);
     var stride: usize = 1;
@@ -45,6 +54,46 @@ pub fn reshape(t: *Tensor, shape_in: []const c_int) Error!*Tensor {
         stride *= @intCast(shape[axis]);
     }
     return base;
+}
+
+/// MLX's `Reshape::prepare_reshape` (mlx/primitives.cpp): `t`'s strides as `shape` when its runs of joined axes
+/// (`collapse_contiguous_dims`) split into it, or null where MLX copies.
+fn viewStrides(t: *const Tensor, shape: []const c_int) ?[max_dims]usize {
+    // The runs: axes whose stride times extent is the stride before them, a run's size kept under 2^31.
+    var runs: [max_dims]usize = undefined;
+    var run_strides: [max_dims]usize = undefined;
+    var n: usize = 0;
+    var open = false;
+    var size: usize = 0;
+    for (0..t.ndim) |i| {
+        const d: usize = @intCast(t.shape[i]);
+        const joined = i > 0 and t.strides[i] * d == t.strides[i - 1] and size * d <= std.math.maxInt(i32);
+        size = if (joined) size * d else d;
+        if (!joined) open = false;
+        if (d == 1) continue;
+        if (open) {
+            runs[n - 1] *= d;
+            run_strides[n - 1] = t.strides[i];
+        } else {
+            runs[n] = d;
+            run_strides[n] = t.strides[i];
+            n += 1;
+            open = true;
+        }
+    }
+    var out: [max_dims]usize = undefined;
+    var j: usize = 0;
+    for (shape, 0..) |d_in, i| {
+        const d: usize = @intCast(d_in);
+        if (j < n and runs[j] % d == 0) {
+            runs[j] /= d;
+            out[i] = runs[j] * run_strides[j];
+            if (runs[j] == 1) j += 1;
+        } else if (d == 1) {
+            out[i] = if (i > 0) out[i - 1] else 1;
+        } else return null;
+    }
+    return out;
 }
 
 pub fn transpose(t: *Tensor, axes: []const c_int) Error!*Tensor {
@@ -208,6 +257,15 @@ const helpers =
     \\  }
     \\  return loc;
     \\}
+    \\inline int sushi_loc32(uint3 at, const constant int* shape, const constant int* strides, int ndim) {
+    \\  int loc = int(at.x) * strides[ndim - 1] + int(at.y) * strides[ndim - 2];
+    \\  uint z = at.z;
+    \\  for (int d = ndim - 3; d >= 0; --d) {
+    \\    loc += int(z % uint(shape[d])) * strides[d];
+    \\    z /= uint(shape[d]);
+    \\  }
+    \\  return loc;
+    \\}
     \\inline long sushi_flat(uint3 at, uint3 grid) {
     \\  return long(at.x) + long(grid.x) * (long(at.y) + long(grid.y) * long(at.z));
     \\}
@@ -318,17 +376,58 @@ fn block(size: metal.Size, max_threads: usize) metal.Size {
     return b;
 }
 
-/// `out[i] = expr` over the broadcast of up to three inputs, each read as `x`, `y`, `z` in its own type.
-fn elementwise(comptime tag: []const u8, comptime expr: []const u8, inputs: []const *Tensor, out_dtype: Dtype, out_shape: []const c_int) Error!*Tensor {
+/// Elements one thread of the flat kernel takes.
+const flat_per_thread = 4;
+
+/// `elementwise` over inputs each row-major at the output's size or a single element: flat 32-bit indices, several
+/// elements a thread, MLX's contiguous kernels' shape. `scalars` bit `i` reads input `i` at element 0.
+fn flatSource(comptime tag: []const u8, comptime expr: []const u8, comptime n_in: usize, comptime scalars: u3) []const u8 {
     const names = [_][]const u8{ "x", "y", "z" };
-    comptime var source: []const u8 = "[[kernel]] void sushi_" ++ tag ++ "(\n";
-    comptime var n_in = 0;
-    inline for (names, 0..) |name, i| {
-        if (comptime std.mem.indexOf(u8, expr, name) != null or i == 0) {
-            source = source ++ std.fmt.comptimePrint("  const device ${d}* in{d} [[buffer({d})]],\n  const constant long* s{d} [[buffer({d})]],\n", .{ i, i, 2 * i, i, 2 * i + 1 });
-            n_in = i + 1;
-        }
+    comptime var src: []const u8 = "[[kernel]] void sushi_" ++ tag ++ std.fmt.comptimePrint("_v{d}(\n", .{scalars});
+    inline for (0..n_in) |i| src = src ++ std.fmt.comptimePrint("  const device ${d}* in{d} [[buffer({d})]],\n", .{ i, i, i });
+    src = src ++ std.fmt.comptimePrint(
+        \\  device $O* out [[buffer({d})]],
+        \\  const constant uint& n [[buffer({d})]],
+        \\  uint at [[thread_position_in_grid]]) {{
+        \\  for (uint e = at * {d}u; e < min(n, at * {d}u + {d}u); ++e) {{
+        \\
+    , .{ n_in, n_in + 1, flat_per_thread, flat_per_thread, flat_per_thread });
+    inline for (0..n_in) |i| src = src ++ std.fmt.comptimePrint("    const ${d} {s} = in{d}[{s}];\n", .{ i, names[i], i, if ((scalars >> i) & 1 == 1) "0" else "e" });
+    return src ++ "    out[e] = " ++ expr ++ ";\n  }\n}\n";
+}
+
+/// The flat kernel's mask of single-element inputs, or null when an input is strided or broadcast along an axis.
+fn flatMask(inputs: []const *Tensor, size: usize) ?u3 {
+    if (size == 0 or size > std.math.maxInt(u32) - flat_per_thread) return null;
+    var mask: u3 = 0;
+    for (inputs, 0..) |in, i| {
+        if (in.size() == 1 and size > 1) {
+            mask |= @as(u3, 1) << @intCast(i);
+        } else if (!in.rowContiguous() or in.size() != size) return null;
     }
+    return mask;
+}
+
+/// `out[i] = expr` over the broadcast of up to three inputs, each read as `x`, `y`, `z` in its own type.
+/// Inputs `expr` reads: `x` always, then `y` and `z` where it names them.
+fn exprInputs(comptime expr: []const u8) usize {
+    const names = [_][]const u8{ "x", "y", "z" };
+    var n = 1;
+    for (names[1..], 1..) |name, i| if (std.mem.indexOf(u8, expr, name) != null) {
+        n = i + 1;
+    };
+    return n;
+}
+
+/// The strided kernel: each input read at its location in the output's grid, on 64-bit locations (`wide`) or 32-bit;
+/// `three`: a grid of three axes, each location read straight off the thread's position, as MLX's `g3` kernels.
+fn generalSource(comptime tag: []const u8, comptime expr: []const u8, comptime wide: bool, comptime three: bool) []const u8 {
+    const names = [_][]const u8{ "x", "y", "z" };
+    const n_in = exprInputs(expr);
+    const idx = if (wide) "long" else "int";
+    const loc = if (wide) "sushi_loc" else "sushi_loc32";
+    comptime var source: []const u8 = "[[kernel]] void sushi_" ++ tag ++ (if (wide) "" else if (three) "_g3" else "_i32") ++ "(\n";
+    inline for (0..n_in) |i| source = source ++ std.fmt.comptimePrint("  const device ${d}* in{d} [[buffer({d})]],\n  const constant {s}* s{d} [[buffer({d})]],\n", .{ i, i, 2 * i, idx, i, 2 * i + 1 });
     const base = 2 * n_in;
     source = source ++ std.fmt.comptimePrint(
         \\  device $O* out [[buffer({d})]],
@@ -338,25 +437,66 @@ fn elementwise(comptime tag: []const u8, comptime expr: []const u8, inputs: []co
         \\  uint3 grid [[threads_per_grid]]) {{
         \\
     , .{ base, base + 1, base + 2 });
-    inline for (0..n_in) |i| {
-        source = source ++ std.fmt.comptimePrint("  const ${d} {s} = in{d}[sushi_loc(at, shape, s{d}, ndim)];\n", .{ i, names[i], i, i });
+    inline for (0..n_in) |i| source = source ++ if (three)
+        std.fmt.comptimePrint("  const ${d} {s} = in{d}[int(at.x) * s{d}[2] + int(at.y) * s{d}[1] + int(at.z) * s{d}[0]];\n", .{ i, names[i], i, i, i, i })
+    else
+        std.fmt.comptimePrint("  const ${d} {s} = in{d}[{s}(at, shape, s{d}, ndim)];\n", .{ i, names[i], i, loc, i });
+    const flat = if (wide) "sushi_flat(at, grid)" else "at.x + grid.x * (at.y + grid.y * at.z)";
+    return source ++ "  out[" ++ flat ++ "] = " ++ expr ++ ";\n}\n";
+}
+
+/// `out[i] = expr` over the broadcast of up to three inputs, each read as `x`, `y`, `z` in its own type.
+/// Before the seal: the contiguous copy at each dtype a model's state holds. A restore that rolls a live state back
+/// copies whole tensors, a path no warm request takes.
+pub fn makeCopiesAhead() Error!void {
+    inline for (.{ Dtype.bfloat16, Dtype.float16, Dtype.float32, Dtype.int32, Dtype.uint32, Dtype.uint8 }) |d| {
+        _ = try pipelineFor("copy_v0", comptime flatSource("copy", "x", 1, 0), &.{d}, d);
     }
-    source = source ++ "  out[sushi_flat(at, grid)] = " ++ expr ++ ";\n}\n";
+}
+
+fn elementwise(comptime tag: []const u8, comptime expr: []const u8, inputs: []const *Tensor, out_dtype: Dtype, out_shape: []const c_int) Error!*Tensor {
+    const n_in = comptime exprInputs(expr);
+    const base = 2 * n_in;
     if (inputs.len != n_in) return error.TensorShape;
 
     var types: [3]Dtype = undefined;
     for (inputs, 0..) |in, i| types[i] = in.dtype;
-    const pipeline = try pipelineFor(tag, source, types[0..n_in], out_dtype);
-    const g = Grid.of(out_shape);
     const out = try core.fresh(out_dtype, out_shape);
     errdefer core.release(out);
     if (out.size() == 0) return out;
+    if (flatMask(inputs, out.size())) |mask| {
+        const pipeline = switch (mask) {
+            inline else => |m| try pipelineFor(tag ++ std.fmt.comptimePrint("_v{d}", .{m}), comptime flatSource(tag, expr, n_in, m), types[0..n_in], out_dtype),
+        };
+        const p = try core.pass();
+        p.pipeline(pipeline);
+        for (inputs, 0..) |in, i| core.bind(p, in, i);
+        core.bindOut(p, out, n_in);
+        const n: u32 = @intCast(out.size());
+        p.constant(n, n_in + 1);
+        const threads = (out.size() + flat_per_thread - 1) / flat_per_thread;
+        core.dispatch(p, .{ .x = threads }, .{ .x = @min(threads, 256) });
+        return out;
+    }
+    var narrow = out.size() <= std.math.maxInt(i32);
+    for (inputs) |in| narrow = narrow and in.reach() <= std.math.maxInt(i32);
+    const g = Grid.of(out_shape);
+    const pipeline = if (narrow and g.ndim == 3)
+        try pipelineFor(tag ++ "_g3", comptime generalSource(tag, expr, false, true), types[0..n_in], out_dtype)
+    else if (narrow)
+        try pipelineFor(tag ++ "_i32", comptime generalSource(tag, expr, false, false), types[0..n_in], out_dtype)
+    else
+        try pipelineFor(tag, comptime generalSource(tag, expr, true, false), types[0..n_in], out_dtype);
     const p = try core.pass();
     p.pipeline(pipeline);
     for (inputs, 0..) |in, i| {
         core.bind(p, in, 2 * i);
         const s = g.strides(in);
-        p.bytes(std.mem.sliceAsBytes(s[0..g.ndim]), 2 * i + 1);
+        if (narrow) {
+            var s32: [max_dims]i32 = undefined;
+            for (0..g.ndim) |d| s32[d] = @intCast(s[d]);
+            p.bytes(std.mem.sliceAsBytes(s32[0..g.ndim]), 2 * i + 1);
+        } else p.bytes(std.mem.sliceAsBytes(s[0..g.ndim]), 2 * i + 1);
     }
     core.bindOut(p, out, base);
     p.bytes(std.mem.sliceAsBytes(g.shape[0..g.ndim]), base + 1);
@@ -375,17 +515,31 @@ pub fn contiguous(t: *Tensor) Error!*Tensor {
 }
 
 fn broadcastShape(a: *const Tensor, b: *const Tensor, out: *[max_dims]c_int) Error![]const c_int {
-    const n = @max(a.ndim, b.ndim);
+    return broadcastDims(a.dims(), b.dims(), out);
+}
+
+fn broadcastDims(a: []const c_int, b: []const c_int, out: *[max_dims]c_int) Error![]const c_int {
+    const n = @max(a.len, b.len);
+    var r: [max_dims]c_int = undefined;
     for (0..n) |i| {
-        const da: c_int = if (i + a.ndim >= n) a.shape[i + a.ndim - n] else 1;
-        const db: c_int = if (i + b.ndim >= n) b.shape[i + b.ndim - n] else 1;
+        const da: c_int = if (i + a.len >= n) a[i + a.len - n] else 1;
+        const db: c_int = if (i + b.len >= n) b[i + b.len - n] else 1;
         if (da != db and da != 1 and db != 1) return error.TensorShape;
-        out[i] = if (da == 1) db else da;
+        r[i] = if (da == 1) db else da;
     }
+    @memcpy(out[0..n], r[0..n]);
     return out[0..n];
 }
 
-pub const Binary = enum { add, subtract, multiply, divide, floor_divide, maximum, minimum, less, less_equal, greater, greater_equal, equal, logical_and, logical_or, logaddexp };
+/// An elementwise chain as one kernel: `expr` over one to three inputs of one dtype, broadcast together, in that dtype.
+pub fn chain(comptime tag: []const u8, comptime expr: []const u8, inputs: []const *Tensor) Error!*Tensor {
+    var buf: [max_dims]c_int = undefined;
+    var shape: []const c_int = inputs[0].dims();
+    for (inputs[1..]) |t| shape = try broadcastDims(shape, t.dims(), &buf);
+    return elementwise("chain_" ++ tag, expr, inputs, inputs[0].dtype, shape);
+}
+
+pub const Binary = enum { add, subtract, multiply, divide, floor_divide, remainder, maximum, minimum, less, less_equal, greater, greater_equal, equal, logical_and, logical_or, logaddexp };
 
 /// MLX's `promote_types` (mlx/dtype.cpp `type_rules`), indexed by `mlx_dtype`.
 const promote_table = blk: {
@@ -426,6 +580,8 @@ pub fn binary(comptime op: Binary, a: *Tensor, b: *Tensor) Error!*Tensor {
     }
     // Its arithmetic is MLX's compiled kernel's: a source of ours rounded differently in the last bits.
     if (op == .logaddexp) return stock.binaryOf("LogAddExp", .float, a, b);
+    // The sign of a divisor's rule, a float's fmod and an integer's in one of MLX's kernels.
+    if (op == .remainder) return stock.binaryOf("Remainder", .all, a, b);
     var shape_buf: [max_dims]c_int = undefined;
     const shape = try broadcastShape(a, b, &shape_buf);
     const compare = switch (op) {
@@ -448,7 +604,7 @@ pub fn binary(comptime op: Binary, a: *Tensor, b: *Tensor) Error!*Tensor {
         .equal => "x == y",
         .logical_and => "x && y",
         .logical_or => "x || y",
-        .logaddexp => unreachable,
+        .logaddexp, .remainder => unreachable,
     };
     return elementwise("bin_" ++ @tagName(op), expr, &.{ a, b }, if (compare) .bool_ else a.dtype, shape);
 }
@@ -661,6 +817,34 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
     const out = try core.fresh(dtype, shape[0..first.ndim]);
     errdefer core.release(out);
     if (out.size() == 0) return out;
+    var joinable = parts.len >= 2 and parts.len <= 4 and out.size() <= std.math.maxInt(u32);
+    for (parts) |part| joinable = joinable and part.dtype == dtype and part.rowContiguous();
+    if (joinable) {
+        // Two to four row-contiguous parts in one dispatch: each element copied from the part its axis position falls in.
+        var inner: u32 = 1;
+        for (first.dims()[axis + 1 ..]) |d| inner *= @intCast(d);
+        // Until the seal, a dtype's first concatenate makes every part count's kernel: a verify's joins take the count
+        // its row groups have, which the warm's widths do not all reach.
+        if (!core.sealed) inline for (2..5) |k| {
+            _ = try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ dtype, dtype }, dtype);
+        };
+        const pipeline = switch (parts.len) {
+            inline 2, 3, 4 => |k| try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ dtype, dtype }, dtype),
+            else => unreachable,
+        };
+        const p = try core.pass();
+        p.pipeline(pipeline);
+        for (parts, 0..) |part, i| core.bind(p, part, i);
+        core.bindOut(p, out, parts.len);
+        var extents: [4]u32 = @splat(0);
+        for (parts, 0..) |part, i| extents[i] = @intCast(part.shape[axis]);
+        const n: u32 = @intCast(out.size());
+        p.constant(inner, parts.len + 1);
+        p.bytes(std.mem.sliceAsBytes(&extents), parts.len + 2);
+        p.constant(n, parts.len + 3);
+        core.dispatch(p, .{ .x = n }, .{ .x = @min(n, 256) });
+        return out;
+    }
     var start: [max_dims]c_int = @splat(0);
     var stop: [max_dims]c_int = shape;
     var ones: [max_dims]c_int = @splat(1);
@@ -674,6 +858,40 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
         at = stop[axis];
     }
     return out;
+}
+
+/// The kernel joining `k` row-contiguous parts along one axis: `inner` elements after the axis, each part's extent
+/// along it in `ext`.
+fn concatSource(comptime k: usize) []const u8 {
+    const names = [_][]const u8{ "a", "b", "c", "d" };
+    comptime var src: []const u8 = std.fmt.comptimePrint("[[kernel]] void sushi_concat{d}(\n", .{k});
+    inline for (0..k) |i| src = src ++ std.fmt.comptimePrint("  const device $0* {s} [[buffer({d})]],\n", .{ names[i], i });
+    src = src ++ std.fmt.comptimePrint(
+        \\  device $O* out [[buffer({d})]],
+        \\  const constant uint& inner [[buffer({d})]],
+        \\  const constant uint* ext [[buffer({d})]],
+        \\  const constant uint& n [[buffer({d})]],
+        \\  uint i [[thread_position_in_grid]]) {{
+        \\  if (i >= n) return;
+        \\  uint total = 0;
+        \\  for (uint j = 0; j < {d}u; ++j) total += ext[j];
+        \\  uint within = i % inner;
+        \\  uint row = i / inner;
+        \\  uint pos = row % total;
+        \\  uint outer = row / total;
+        \\
+    , .{ k, k + 1, k + 2, k + 3, k });
+    comptime var start: []const u8 = "0u";
+    inline for (0..k) |i| {
+        const at = std.fmt.comptimePrint("ext[{d}]", .{i});
+        const read = std.fmt.comptimePrint("{s}[(outer * {s} + pos - ({s})) * inner + within]", .{ names[i], at, start });
+        src = src ++ if (i + 1 < k)
+            std.fmt.comptimePrint("  if (pos < {s} + {s}) {{ out[i] = {s}; return; }}\n", .{ start, at, read })
+        else
+            std.fmt.comptimePrint("  out[i] = {s};\n", .{read});
+        start = start ++ " + " ++ at;
+    }
+    return src ++ "}\n";
 }
 
 /// `t[indices]` along `axis`: the result has `indices`' shape in that axis's place.
@@ -993,7 +1211,10 @@ pub fn stack(parts: []const *Tensor, axis: c_int) Error!*Tensor {
 pub fn takeAlong(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
     if (axis >= t.ndim or indices.ndim != t.ndim) return error.TensorShape;
-    if (indices.dtype != .int32 and indices.dtype != .uint32) return core.refusing("take_along with indices other than int32 and uint32", error.TensorDtype);
+    switch (indices.dtype) {
+        .uint8, .uint16, .uint32, .uint64, .int8, .int16, .int32, .int64 => {},
+        else => return core.refusing("take_along with indices that are not integers", error.TensorDtype),
+    }
     for (0..t.ndim) |i| {
         if (i != axis and t.shape[i] != indices.shape[i]) return error.TensorShape;
     }
@@ -1047,7 +1268,10 @@ pub fn takeAlong(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
 pub fn putAlong(t: *Tensor, indices: *Tensor, values_in: *Tensor, axis_in: c_int) Error!*Tensor {
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
     if (axis >= t.ndim or indices.ndim != t.ndim) return error.TensorShape;
-    if (indices.dtype != .int32 and indices.dtype != .uint32) return core.refusing("put_along with indices other than int32 and uint32", error.TensorDtype);
+    switch (indices.dtype) {
+        .uint8, .uint16, .uint32, .uint64, .int8, .int16, .int32, .int64 => {},
+        else => return core.refusing("put_along with indices that are not integers", error.TensorDtype),
+    }
     for (0..t.ndim) |i| {
         if (i != axis and t.shape[i] != indices.shape[i]) return error.TensorShape;
     }

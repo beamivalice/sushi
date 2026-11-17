@@ -55,7 +55,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 
 - The head = the checkpoint's own QSA+MoE layer over the PRE-mixer stream (`Qwen4Mtp`, `MtpHeadRef.qwen4`):
   `capture_hidden(_all)` = `[B,L,hc*hidden]`, never the mixed 2560; head row r = (stream at r, token r+1) at query
-  position r+1, so QSA takes a `pos_base`.
+  position r+1, so QSA takes a `pos_base`. A verify's captures stay lazy (`Ctx.verify_rows`) and ride the lm_head's
+  dispatch; only a prefill chunk's settle, to let the chunk go.
 - Per-request state is a `Qwen4MtpState` swapped onto the module (`qwen4MtpActivate` before EVERY head touch);
   nothing is module-owned, so MTP slots are not exclusive.
 - `--no-mtp` gates the IN-CHECKPOINT head too (`entry.mtp` reads `mtpChoiceFor`, logged `[mtp] on|off (<source>)`);

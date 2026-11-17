@@ -670,9 +670,9 @@ fn ownDense(sc: *Scope, m: *model.Model, p: exl3.Proj, dec: exl3.format.Decode, 
     const out: c_int = sh[2] * 16;
     const in: c_int = sh[1] * 16;
     const a = if (flat and G == 1)
-        mlx.mlx_array_new_data(all.ptr, &[_]c_int{ out, in }, 2, .float32)
+        try mlx.newData(all.ptr, &[_]c_int{ out, in }, .float32)
     else
-        mlx.mlx_array_new_data(all.ptr, &[_]c_int{ @intCast(G), out, in }, 3, .float32);
+        try mlx.newData(all.ptr, &[_]c_int{ @intCast(G), out, in }, .float32);
     try m.owned.append(m.gpa, a);
     return a;
 }
@@ -2172,23 +2172,12 @@ test "dsv41 drop: the STQ pack with experts dropped gives the logits of the full
     }
 }
 
-/// Every entry of `fixture` linked into `tmp`.
-fn linkPack(tmp: *testing.TmpDir, fixture: []const u8) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var src = try std.Io.Dir.openDirAbsolute(io, fixture, .{ .iterate = true });
-    defer src.close(io);
-    var it = src.iterate();
-    while (try it.next(io)) |entry| {
-        var target: [1024]u8 = undefined;
-        try tmp.dir.symLink(io, try std.fmt.bufPrint(&target, "{s}/{s}", .{ fixture, entry.name }), entry.name, .{});
-    }
-}
 
 /// A scratch pack: `fixture` linked in, plus an `expert_usage.json` that counts the experts `model.testDropIds` names
 /// least used in each of `layers` layers. The caller frees the path.
 fn usageDir(tmp: *testing.TmpDir, fixture: []const u8, layers: usize, experts: usize) ![:0]u8 {
     const io = std.Io.Threaded.global_single_threaded.io();
-    try linkPack(tmp, fixture);
+    try @import("../test_support.zig").linkPack(tmp, fixture);
     var json: std.ArrayList(u8) = .empty;
     defer json.deinit(testing.allocator);
     try json.appendSlice(testing.allocator, "{\"version\":1,\"source\":\"unit\",\"tokens\":1,\"top_k\":3,\"layers\":[");
@@ -2282,7 +2271,7 @@ test "dsv41 drop: a real STQ pack's headers and its usage file plan a drop of 8 
     const model_load = @import("../model_load.zig");
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try linkPack(&tmp, pack);
+    try @import("../test_support.zig").linkPack(&tmp, pack);
     var link: [1024]u8 = undefined;
     try tmp.dir.symLink(io, try std.fmt.bufPrint(&link, "{s}/{s}", .{ usage, expert_usage.file_name }), expert_usage.file_name, .{});
     const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
@@ -2918,7 +2907,7 @@ test "dsv41 kernels: the load's warm leaves no state, and the served logits are 
         defer served.deinit();
         if (warm) {
             try model.warmKernels(served.m);
-            try testing.expect(served.m.dec_state == null);
+            try testing.expect((try @import("dsv41_model.zig").currentState(served.m)) == null);
         }
         var all: std.ArrayList(f32) = .empty;
         errdefer all.deinit(testing.allocator);

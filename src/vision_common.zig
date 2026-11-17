@@ -770,7 +770,7 @@ pub fn putRandomBf16(allocator: std.mem.Allocator, map: *std.StringHashMap(mlx.m
     defer allocator.free(data);
     var prng = std.Random.DefaultPrng.init(seed);
     for (data) |*x| x.* = base + scale * (prng.random().float(f32) * 2 - 1);
-    const f = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+    const f = try mlx.newData(data.ptr, shape, .float32);
     defer _ = mlx.mlx_array_free(f);
     var b = mlx.mlx_array_new();
     const cpu = mlx.mlx_default_cpu_stream_new();

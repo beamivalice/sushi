@@ -7,7 +7,6 @@
 //! - `think_rank`, `think_help`, `think_refusal`: the arch's words for `--think`;
 //! - `command`: a subcommand (`name`, `runs_gpu`, `help`, `run`);
 //! - `refusal(use)`: a launch flag this arch cannot act on;
-//! - `drop_expert_elsewhere`: why `--drop-expert` has no effect on the other archs;
 //! - `mtp_off_line`, `kvQuantRequestRefusal(kv)`, `kv_quant_choices` (the spellings its cache stores),
 //!   `settings_kv_quant_ignored`, `settingsMtpIgnoredLine(config)`: the arch's lines and refusals where it differs
 //!   from the shared rule;
@@ -78,9 +77,19 @@ fn flagsOf(comptime tag: registry.Tag) type {
     return registry.Mod(tag).flags;
 }
 
-/// Every enabled arch's options, in registry order, its Sushi Cooler opt-out first.
+/// `--drop-expert`, which any arch whose streamed experts carry a usage list takes (`ExpertStreamTraits.drop_expert`).
+const shared_options = [_]Option{
+    .{ .name = "--drop-expert", .takes_value = true, .apply = setDropExpert, .expected = "expected a multiple of 8 routed experts per layer (0 = off)" },
+};
+
+fn setDropExpert(value: []const u8) bool {
+    model.drop_expert = @import("../expert_usage.zig").parseCount(value) orelse return false;
+    return true;
+}
+
+/// The shared options, then every enabled arch's, in registry order, its Sushi Cooler opt-out first.
 pub const options = blk: {
-    var out: []const Option = &.{};
+    var out: []const Option = &shared_options;
     for (std.meta.tags(registry.Tag)) |t| {
         if (arch_config.coolerOptOut(t)) |o| out = out ++ [_]Option{coolerOffOption(t, o)};
         if (hasDecl(t, "options")) out = out ++ @as([]const Option, &flagsOf(t).options);
@@ -127,20 +136,33 @@ pub fn bootLines(config: *const model.ModelConfig, use: LaunchFlagUse, out: *[op
 /// An explicit flag is refused rather than ignored, before the weights load.
 pub fn archFlagRefusal(config: *const model.ModelConfig, use: LaunchFlagUse) ?[]const u8 {
     const traits = admission.expertStream(config);
-    if (use.drop_expert and !traits.drop_expert) return dropExpertElsewhere();
+    if (use.drop_expert and !traits.drop_expert) return "--drop-expert has no effect on this model: only a quantized pack whose experts stream drops them; drop the flag";
     if (use.ssd_prefetch and !traits.prefetch) return "--ssd-prefetch has no effect on this model: it has no expert prefetcher; drop the flag";
     const tag = arch_config.tagOf(config) orelse return null;
     switch (tag) {
-        inline else => |t| return if (comptime hasDecl(t, "refusal")) flagsOf(t).refusal(config, use) else null,
+        inline else => |t| {
+            if (comptime hasDecl(t, "refusal")) if (flagsOf(t).refusal(config, use)) |r| return r;
+            return coolerRefusal(t, config, use);
+        },
     }
 }
 
-fn dropExpertElsewhere() []const u8 {
-    inline for (comptime std.meta.tags(registry.Tag)) |t| {
-        if (comptime hasDecl(t, "drop_expert_elsewhere")) return flagsOf(t).drop_expert_elsewhere;
-    }
-    return "--drop-expert has no effect on this model; drop the flag";
+/// What a Cooler load serves, whatever its arch: drafts accepted by the exact rule only, and no DFlash2, which runs on
+/// MLX only. A flag that asks otherwise is refused by name, with the arch's own way back to MLX.
+const cooler_refused = [_]struct { field: []const u8, flag: []const u8, why: []const u8 }{
+    .{ .field = "mtp_typical", .flag = "--mtp-typical", .why = "drafts are accepted by the exact rule only" },
+    .{ .field = "mtp_tokenv3", .flag = "--mtp-tokenv3", .why = "drafts are accepted by the exact rule only" },
+    .{ .field = "mtp_greedy_tail", .flag = "--mtp-greedy-tail", .why = "drafts are accepted by the exact rule only" },
+    .{ .field = "drafter", .flag = "--drafter", .why = "DFlash2 runs on MLX only" },
+};
+
+fn coolerRefusal(comptime t: registry.Tag, config: *const model.ModelConfig, use: LaunchFlagUse) ?[]const u8 {
+    if (!@import("../cooler_side.zig").onEngine(config)) return null;
+    const back = comptime if (arch_config.coolerOptOut(t)) |o| ", or pass " ++ o.flag else "";
+    inline for (cooler_refused) |r| if (@field(use, r.field)) return r.flag ++ " is not served on Sushi Cooler: " ++ r.why ++ "; drop the flag" ++ back;
+    return null;
 }
+
 
 const cooler_archs = blk: {
     var n: usize = 0;
@@ -165,12 +187,9 @@ pub fn coolerOffIgnoredLines(config: *const model.ModelConfig) [cooler_archs]?[]
     return out;
 }
 
-/// Whether the model accepts drafts by the exact rule only, with no MTP tail, whatever its settings say.
-fn exactDraftsOnly(config: *const model.ModelConfig) bool {
-    const tag = arch_config.tagOf(config) orelse return false;
-    return switch (tag) {
-        inline else => |t| if (comptime hasDecl(t, "exactDraftsOnly")) flagsOf(t).exactDraftsOnly(config) else false,
-    };
+/// Whether the model accepts drafts by the exact rule only, with no MTP tail, whatever its settings say: a Cooler load.
+pub fn exactDraftsOnly(config: *const model.ModelConfig) bool {
+    return @import("../cooler_side.zig").onEngine(config);
 }
 
 /// The model's acceptance rule: its `mtp_acceptance` only where the key reaches it (`model_settings.applies`).
@@ -490,15 +509,18 @@ test "--ssd-prefetch is refused where there is no expert prefetcher, before the 
     }
 }
 
-test "--drop-expert is refused on every arch but deepseek_v41, before the weights load" {
-    if (!built("deepseek_v41")) return error.SkipZigTest;
+test "--drop-expert is refused on every pack but a quantized one whose experts stream, before the weights load" {
     const use = LaunchFlagUse{ .drop_expert = true };
-    const dsv41 = model.ModelConfig{ .model_type = "deepseek_v41" };
-    try testing.expect(archFlagRefusal(&dsv41, use) == null);
-    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" }) |arch| {
+    const why = "--drop-expert has no effect on this model: only a quantized pack whose experts stream drops them; drop the flag";
+    if (built("deepseek_v41")) try testing.expect(archFlagRefusal(&model.ModelConfig{ .model_type = "deepseek_v41" }, use) == null);
+    if (built("qwen4_exp")) {
+        try testing.expect(archFlagRefusal(&model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4 }, use) == null);
+        try testing.expectEqualStrings(why, archFlagRefusal(&model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .bf16_fused }, use) orelse return error.TestExpectedRefusal);
+    }
+    for ([_][]const u8{ "mimo_v2", "glm5_next" }) |arch| {
         if (!built(arch)) continue;
         const cfg = model.ModelConfig{ .model_type = arch };
-        try testing.expectEqualStrings("--drop-expert has no effect on this model: only deepseek_v41 packs carry an expert usage list; drop the flag", archFlagRefusal(&cfg, use) orelse return error.TestExpectedRefusal);
+        try testing.expectEqualStrings(why, archFlagRefusal(&cfg, use) orelse return error.TestExpectedRefusal);
         try testing.expect(archFlagRefusal(&cfg, .{}) == null);
     }
 }

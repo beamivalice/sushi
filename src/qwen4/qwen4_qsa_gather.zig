@@ -3,6 +3,7 @@ const attn_kernels = @import("../attn_kernels.zig");
 const std = @import("std");
 const qwen4_mod = @import("qwen4_exp.zig");
 const mlx = @import("../mlx.zig");
+const arm_trial = @import("../arm_trial.zig");
 const kv_quant = @import("../kv_quant.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
@@ -399,7 +400,8 @@ pub fn qsaNaxEligible(
     );
 }
 
-var qsa_nax_probe_state: std.atomic.Value(u8) = .init(0);
+/// The NAX gather's trial, for each side of the host (`arm_trial.Verdict`).
+var qsa_nax_trial: arm_trial.Verdict = .{};
 pub var qsa_nax_probe_fail_override: bool = false;
 pub var qsa_nax_probe_flip_override: bool = false;
 pub var qsa_nax_probe_flip_packed_bits: ?u8 = null;
@@ -408,31 +410,38 @@ pub var qsa_gather_used_nax: bool = false;
 pub var qsa_gather_engaged_stock: u32 = 0;
 pub var qsa_gather_engaged_nax: u32 = 0;
 
+/// Whether the trial declined the arm on the side a forward makes arrays on now.
 pub fn qsaNaxProbeFailed() bool {
-    return qsa_nax_probe_state.load(.acquire) == 1;
+    return qsa_nax_trial.declined(arm_trial.making());
 }
 
 pub fn qsaNaxProbeReset() void {
-    qsa_nax_probe_state.store(0, .release);
+    qsa_nax_trial.reset();
 }
 
 pub fn qsaNaxKernelBuilds() usize {
     return qsa_nax_kernel_builds;
 }
 
-/// A probe on the engine's stream that could not run is the load's error, never a declined arm: an op it refused
-/// is latched by name. On MLX's stream it declines the arm, as a GPU without the kernel's features needs.
-pub fn probeRan(s: mlx.mlx_stream, ok: bool) !void {
-    if (!ok and mlx.engine.isStream(s) and mlx.errorLatched()) return error.QsaProbeRefused;
+/// A probe as a trial (`arm_trial.run`): one whose op was refused, which the probe latches by name, could not run.
+pub fn probeTrial(comptime probe: fn (mlx.mlx_stream) bool) fn (mlx.mlx_stream) anyerror!bool {
+    return struct {
+        fn trial(s: mlx.mlx_stream) anyerror!bool {
+            const ok = probe(s);
+            if (!ok and mlx.errorLatched()) return error.QsaProbeRefused;
+            return ok;
+        }
+    }.trial;
 }
 
 /// Probes the NAX gather once a process, on `s`: the load's stream or a forward's.
 pub fn qsaNaxArm(s: mlx.mlx_stream) !void {
+    const side = arm_trial.sideOf(s);
     if (qsa_nax_probe_fail_override) {
-        qsa_nax_probe_state.store(1, .release);
+        qsa_nax_trial.set(side, false);
         return;
     }
-    if (qsa_nax_probe_state.load(.acquire) != 0) return;
+    if (qsa_nax_trial.tried(side)) return;
     if (qsa_nax_override) |v| {
         if (!v) return;
     } else {
@@ -441,9 +450,7 @@ pub fn qsaNaxArm(s: mlx.mlx_stream) !void {
     }
     if (!verifyQmmNaxAvailable()) return;
     if (!qsaNaxOsOk()) return;
-    const ok = qsaNaxRunProbe(s);
-    try probeRan(s, ok);
-    qsa_nax_probe_state.store(if (ok) 2 else 1, .release);
+    qsa_nax_trial.set(side, try arm_trial.run(s, probeTrial(qsaNaxRunProbe), .{s}));
 }
 
 const QSA_NAX_PROBE_FLOOR: f32 = 4.9e-4;
@@ -478,7 +485,7 @@ fn qsaGatherProbeDispatch(
     const bk: c_int = QSA_GATHER_BK;
     const one = [_]c_int{1};
     const scl_data = [_]f32{scale};
-    const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
+    const scl = mlx.newData(&scl_data, &one, .float32) catch return null;
     defer _ = mlx.mlx_array_free(scl);
     const config = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
@@ -531,7 +538,7 @@ fn qsaNaxRunProbe(s: mlx.mlx_stream) bool {
         for (0..512) |b| blk[r * 512 + b] = if (b < complete) @intCast(b) else std.math.maxInt(i32);
     }
     const bshape = [_]c_int{ 1, 16, 512 };
-    const blocks = mlx.mlx_array_new_data(&blk, &bshape, 3, .int32);
+    const blocks = mlx.newData(&blk, &bshape, .int32) catch return false;
     defer _ = mlx.mlx_array_free(blocks);
     const scale: f32 = 1.0 / 16.0;
     const ratio: c_int = 4;
@@ -754,7 +761,7 @@ fn gatherQsa256Impl(
     const kernel = blk: {
         if (use_nax) {
             break :blk (if (is_packed) getQsaGatherPackedKernel(true) else getQsaNaxKernel()) catch {
-                qsa_nax_probe_state.store(1, .release);
+                qsa_nax_trial.set(arm_trial.sideOf(s), false);
                 use_nax = false;
                 break :blk (if (is_packed) getQsaGatherPackedKernel(false) else getAttnQsa256Kernel()) catch return null;
             };
@@ -764,7 +771,7 @@ fn gatherQsa256Impl(
     qsa_gather_used_nax = use_nax;
     const one = [_]c_int{1};
     const scl_data = [_]f32{scale};
-    const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
+    const scl = try mlx.newData(&scl_data, &one, .float32);
     defer _ = mlx.mlx_array_free(scl);
     const nsg: c_int = @divTrunc(gqa + 7, 8);
     const bk: c_int = QSA_GATHER_BK;
@@ -933,8 +940,8 @@ pub const QsaBlockFixture = struct {
         const bshape = [_]c_int{ 1, qL, kb };
         const mshape = [_]c_int{ 1, 1, qL, kL };
         return .{
-            .blocks = mlx.mlx_array_new_data(blocks.ptr, &bshape, 3, .int32),
-            .mask = mlx.mlx_array_new_data(mask.ptr, &mshape, 4, .bool_),
+            .blocks = try mlx.newData(blocks.ptr, &bshape, .int32),
+            .mask = try mlx.newData(mask.ptr, &mshape, .bool_),
         };
     }
     pub fn deinit(self: *QsaBlockFixture) void {
@@ -1103,7 +1110,7 @@ fn qsaWideUbench(kvs: []const c_int, widths: []const c_int, arms_run: []const Qs
             if (sq > kv) continue;
             const bh = try qsaVerifyBlocksHost(ta, rnd, sq, kv, kb, ratio);
             defer ta.free(bh);
-            const blocks = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{ 1, sq, kb }, 3, .int32);
+            const blocks = try mlx.newData(bh.ptr, &[_]c_int{ 1, sq, kb }, .int32);
             defer _ = mlx.mlx_array_free(blocks);
             const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, sq, 256 }, s);
             defer _ = mlx.mlx_array_free(q);
@@ -1759,7 +1766,8 @@ test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slo
 
     const solo0 = (try qsaDecodeGatherAttn(s, q0, &view0, fx0.blocks, ratio, scale)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(solo0);
-    const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &.{view0}, &.{fx0.blocks}, &.{}, ratio, scale, &.{}, 0);
+    var one_view = [_]DenseKVView{view0};
+    const bat1 = try qsaBatchedGatherAttn(ta, s, q0, &one_view, &.{fx0.blocks}, &.{}, ratio, scale, &.{}, 0);
     defer _ = mlx.mlx_array_free(bat1);
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat1, solo0, s));
 
@@ -1769,7 +1777,7 @@ test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slo
     const qvec = mlx.mlx_vector_array_new_data(&qparts, 2);
     defer _ = mlx.mlx_vector_array_free(qvec);
     try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
-    const views = [_]DenseKVView{ view0, view1 };
+    var views = [_]DenseKVView{ view0, view1 };
     const blks = [_]mlx.mlx_array{ fx0.blocks, fx1.blocks };
     const bat2 = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &.{}, ratio, scale, &.{}, 0);
     defer _ = mlx.mlx_array_free(bat2);
@@ -1830,7 +1838,7 @@ test "qsa batched gather mixed group: a mask-only slot matches its solo masked S
     const qvec = mlx.mlx_vector_array_new_data(&qparts, 2);
     defer _ = mlx.mlx_vector_array_free(qvec);
     try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
-    const views = [_]DenseKVView{ view0, view1 };
+    var views = [_]DenseKVView{ view0, view1 };
     const blks = [_]mlx.mlx_array{ fx0.blocks, .{ .ctx = null } };
     const masks = [_]mlx.mlx_array{ .{ .ctx = null }, fx1.mask };
     const bat = try qsaBatchedGatherAttn(ta, s, q_n2, &views, &blks, &masks, ratio, scale, &.{}, 0);

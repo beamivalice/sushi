@@ -19,15 +19,14 @@ const common = @import("../vision_common.zig");
 const cfg_mod = @import("dsv41_config.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const log = @import("../log.zig");
-const transient_peak = @import("transient_peak.zig");
+const transient_peak = @import("../transient_peak.zig");
 const dflash = @import("../dflash.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
-const dsv41_pipelines = @import("dsv41_pipelines.zig");
+const cooler_pipelines = @import("../arch/cooler_pipelines.zig");
 const matmul = @import("../tensor/matmul.zig");
 const attention_plan = @import("../tensor/attention.zig");
 const metal = @import("../metal.zig");
 const manifest = @import("../pipeline_manifest.zig");
-const dsv41_model = @import("dsv41_model.zig");
 const io_util = @import("../io_util.zig");
 
 const A = sc_mod.A;
@@ -367,7 +366,7 @@ pub const Dsv41Vision = struct {
         const c = config.dsv41 orelse return error.MissingVisionWeights;
         const v = c.vision orelse return error.MissingVisionWeights;
         var own = false;
-        if (dsv41_borrow.ownDecode(&c)) {
+        if (@import("../cooler_side.zig").onEngine(&config)) {
             // Decided here, once: a Cooler load runs nothing on MLX, so a tower the engine cannot run refuses the load.
             if (engineGap(v)) |g| {
                 log.err("[vision] the engine does not port this tower: an image of {d} rows reaches {s}; --ds41-mlx-engine serves it\n", .{ g.rows, g.what });
@@ -377,7 +376,7 @@ pub const Dsv41Vision = struct {
             own = true;
         }
         // The requantization's kernel is this load's to make, as the warm's are.
-        const making: ?mlx.engine.Seal = if (own) mlx.engine.unsealed() else null;
+        const making = @import("../arch/cooler.zig").making(own);
         defer if (making) |seal| seal.end();
         var self = try load(allocator, config, weights, quantize_at_load, own);
         errdefer self.deinit();
@@ -505,13 +504,12 @@ pub const Dsv41Vision = struct {
 
     fn encode(self: *Dsv41Vision, patches: A, grid_h: u32, grid_w: u32) !A {
         transient_peak.begin();
+        defer transient_peak.end(.vision_encode, grid_h * grid_w, null);
         const run = try self.engage(@as(usize, grid_h) * grid_w);
         defer run.end();
         const hidden = try self.towerHidden(patches, grid_h, grid_w);
         defer _ = mlx.mlx_array_free(hidden);
-        const out = try self.tail(hidden, grid_h, grid_w);
-        transient_peak.end(.vision_encode, grid_h * grid_w);
-        return out;
+        return self.tail(hidden, grid_h, grid_w);
     }
 
     /// The aligner and the span of a tower output `hidden`, evaluated.
@@ -544,7 +542,7 @@ pub const Dsv41Vision = struct {
             return;
         }
         warms += 1;
-        const making = mlx.engine.unsealed();
+        const making = @import("../arch/cooler.zig").making(true).?;
         defer making.end();
         var clock = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
         const made_before = mlx.engine.pipelinesMade().count;
@@ -556,7 +554,7 @@ pub const Dsv41Vision = struct {
             // The engine's own array, made between forwards: the pool's cap rises by it until the pass's cap replaces it.
             mlx.engine.room(&.{zeros.len * @sizeOf(f32)});
             const scope = mlx.engine.enter(self.stream());
-            const patches = mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{ ci(n), ci(feat) }, 2, .float32);
+            const patches = try mlx.newData(zeros.ptr, &[_]c_int{ ci(n), ci(feat) }, .float32);
             scope.end();
             defer _ = mlx.mlx_array_free(patches);
             const run = try self.engage(n);
@@ -568,7 +566,7 @@ pub const Dsv41Vision = struct {
         mlx.engine.trim();
         log.info("[vision] engine tower warmed: {d} pipelines, {d} ms\n", .{ mlx.engine.pipelinesMade().count - made_before, clock.read() / std.time.ns_per_ms });
         mlx.engine.pipeline_registry.recordMarker("vision tower", key);
-        dsv41_pipelines.rewriteLate();
+        cooler_pipelines.rewriteLate();
     }
 
     /// The ViT through its final norm: `[grid_h * grid_w, hidden]`, evaluated; the caller frees it.
@@ -649,7 +647,7 @@ pub const Dsv41Vision = struct {
             }
         };
         const shape = [_]c_int{ ci(n), 1, ci(half) };
-        return .{ .cos = try sc.keep(mlx.mlx_array_new_data(cos.ptr, &shape, 3, .float32)), .sin = try sc.keep(mlx.mlx_array_new_data(sin.ptr, &shape, 3, .float32)) };
+        return .{ .cos = try sc.keep(try mlx.newData(cos.ptr, &shape, .float32)), .sin = try sc.keep(try mlx.newData(sin.ptr, &shape, .float32)) };
     }
 
     /// `x [n, heads, head_dim]` rotated in f32, back in its dtype.
@@ -712,7 +710,7 @@ pub const Dsv41Vision = struct {
         var x = try sc.reshape(hidden, &.{ ci(grid_h), ci(grid_w), ci(c) });
         if (lh * r != grid_h or lw * r != grid_w) {
             var padded = mlx.mlx_array_new();
-            const zero = try sc.keep(mlx.mlx_array_new_float(0.0));
+            const zero = try sc.keep(try mlx.newFloat(0.0));
             x = try sc.res(mlx.mlx_pad(&padded, x, &[_]c_int{ 0, 1 }, 2, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(lh * r - grid_h), ci(lw * r - grid_w) }, 2, zero, "constant", sc.s), &padded);
         }
         // [lh, r, lw, r, C] -> [lh, lw, C, r, r]: torch's unfold orders a block's features (c, ky, kx).
@@ -1052,7 +1050,7 @@ fn tinyConfig() model.ModelConfig {
 }
 
 fn configOf(v: cfg_mod.Vision, dim: u32) model.ModelConfig {
-    var cfg: model.ModelConfig = .{};
+    var cfg: model.ModelConfig = .{ .model_type = "deepseek_v41" };
     cfg.dsv41 = .{ .dim = dim, .vision = v };
     return cfg;
 }
@@ -1256,7 +1254,7 @@ test "dsv41 vision: a Cooler encode of large images and a small last one joins t
     // The request's end closes the pass the join left open, as `endRequestMlx` does.
     defer mlx.engine.close();
     // The encode's caps follow a pack that decodes on the engine.
-    config.dsv41.?.cooler_for_test = true;
+    config.cooler_for_test = true;
     const ram_cap = dsv41_borrow.pool_ram_cap;
     dsv41_borrow.pool_ram_cap = 8 << 30;
     defer dsv41_borrow.pool_ram_cap = ram_cap;
@@ -1391,12 +1389,12 @@ test "dsv41 vision: a Cooler load refuses a tower the engine does not port by na
     defer w.deinit();
     try testing.expect(engineGap(engine_vision) != null);
     var cooler = configOf(engine_vision, tiny_dim);
-    cooler.dsv41.?.cooler_for_test = true;
+    cooler.cooler_for_test = true;
     const calls = mlx.engine.mlxCalls();
     try testing.expectError(error.VisionTowerNotPorted, Dsv41Vision.init(testing.allocator, cooler, &w));
     try testing.expectEqual(calls, mlx.engine.mlxCalls());
     var mlx_side = configOf(engine_vision, tiny_dim);
-    mlx_side.dsv41.?.cooler_for_test = false;
+    mlx_side.cooler_for_test = false;
     var on_mlx = try Dsv41Vision.init(testing.allocator, mlx_side, &w);
     defer on_mlx.deinit();
     try testing.expect(!on_mlx.own and on_mlx.ownStream() == null);
@@ -1419,7 +1417,7 @@ test "dsv41 vision: at the release's geometry the engine's tower gives MLX's byt
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was_enabled;
-    dsv41_pipelines.forget();
+    cooler_pipelines.forget();
     var v = try releaseVision();
     v.layers = 2;
     var wm = try towerOf(v, 5120);
@@ -1434,7 +1432,7 @@ test "dsv41 vision: at the release's geometry the engine's tower gives MLX's byt
     const load_ops = mlx.engine.mlx_ops;
     const load_stats = mlx.engine.stats();
     var cooler = configOf(v, 5120);
-    cooler.dsv41.?.cooler_for_test = true;
+    cooler.cooler_for_test = true;
     // The model's load has sealed the engine by the time the tower loads.
     mlx.engine.seal(true);
     defer mlx.engine.seal(false);
@@ -1495,7 +1493,7 @@ test "dsv41 vision: the tower's pipelines ride the manifest: a first load warms 
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was_enabled;
     defer mlx.engine.seal(false);
-    defer dsv41_pipelines.forget();
+    defer cooler_pipelines.forget();
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1509,9 +1507,9 @@ test "dsv41 vision: the tower's pipelines ride the manifest: a first load warms 
     // First load: no manifest, the load stores its own after its warm, then the tower warms and the manifest is
     // written again with the warm's marker.
     pipelines_registry.resetForTest();
-    var first = dsv41_pipelines.begin(testing.allocator, io, tmp.dir, "", key, 0);
+    var first = cooler_pipelines.begin(testing.allocator, io, tmp.dir, "", key, 0);
     defer first.deinit();
-    try testing.expectEqual(dsv41_pipelines.Case.none, first.case);
+    try testing.expectEqual(cooler_pipelines.Case.none, first.case);
     _ = first.settle();
     first.store();
     var one = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &w1);
@@ -1529,10 +1527,10 @@ test "dsv41 vision: the tower's pipelines ride the manifest: a first load warms 
 
     // Same-key load, as a new process: the manifest's recipes make, the marker is trusted, and the tower runs no warm.
     pipelines_registry.resetForTest();
-    var second = dsv41_pipelines.begin(testing.allocator, io, tmp.dir, "", key, 0);
+    var second = cooler_pipelines.begin(testing.allocator, io, tmp.dir, "", key, 0);
     defer second.deinit();
-    try testing.expectEqual(dsv41_pipelines.Case.same, second.case);
-    try testing.expectEqual(dsv41_model.WarmScope.mlx, second.settle());
+    try testing.expectEqual(cooler_pipelines.Case.same, second.case);
+    try testing.expect(second.settle());
     var two = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &w2);
     defer two.deinit();
     const late = mlx.engine.latePipelines();
