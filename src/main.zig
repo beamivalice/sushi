@@ -601,6 +601,12 @@ fn runCli(init: std.process.Init) !void {
                 log.err("--expert-pick-tolerance: expected a number from 0 to 0.6, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--expert-cache-bias") and flag_value.follows(args, i)) {
+            i += 1;
+            expert_stream_mod.cache_bias = expert_stream_mod.parseCacheBias(args[i]) catch {
+                log.err("--expert-cache-bias: expected a number from 0 to 8, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and flag_value.follows(args, i)) {
             i += 1;
             decode_share_flag = args[i];

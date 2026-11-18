@@ -223,6 +223,9 @@ pub const Experts = union(enum) {
         can_prefetch: ?*const fn (ctx: *anyopaque, layer: usize) bool = null,
         /// Decode widths: the routed chain queued before the host knows the picks, checked one layer late.
         spec: ?Spec = null,
+        /// The layer's pick-score penalty (`--expert-cache-bias`), f32 `[experts]`, added to the router's bias at decode
+        /// widths. Null leaves the pick exact.
+        penalty: ?*const fn (ctx: *anyopaque, layer: usize) anyerror!?A = null,
     };
 
     pub const Spec = struct {
@@ -2516,7 +2519,14 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix, qu
     const K = ly.top_k;
     const norm = c.norm_topk and K > 1;
     // `img` rows pick by the image bias; the kernel reads a `[L, E]` bias row by row.
-    const bias = if (img.ctx != null and ly.gate_bias_vl.ctx != null) try sc.where(try sc.expand(img, -1), ly.gate_bias_vl, ly.gate_bias) else ly.gate_bias;
+    var bias = if (img.ctx != null and ly.gate_bias_vl.ctx != null) try sc.where(try sc.expand(img, -1), ly.gate_bias_vl, ly.gate_bias) else ly.gate_bias;
+    // An expert the layer's cache lacks scores lower in a decode-width text pick; the weights stay unbiased.
+    if (img.ctx == null and li < c.layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX) switch (m.experts) {
+        .hook => |hk| if (hk.penalty) |pen_fn| {
+            if (try pen_fn(hk.ctx, li)) |pen| bias = try sc.add(bias, pen);
+        },
+        .resident => {},
+    };
     if (fusedOn(sc, m) and c.experts <= 1024) {
         const logits = if (dim(h, 0) <= NARROW_ROWS and c.dim % 8 == 0)
             try kernels.gateLogits(sc, h, ly.gate_w)

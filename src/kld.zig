@@ -45,6 +45,7 @@ pub const Options = struct {
     ssd_budget_bytes: u64 = 0,
     ssd_prefetch: ?u8 = null,
     pick_tolerance: f32 = 0,
+    cache_bias: f32 = 0,
     wired_margin_bytes: u64 = 0,
     /// `--mtp` / `--no-mtp`; null = not given (the head stays off).
     mtp: ?bool = null,
@@ -94,6 +95,7 @@ const ValueFlag = enum {
     ssd_budget_gb,
     ssd_prefetch,
     expert_pick_tolerance,
+    expert_cache_bias,
     wired_margin_gib,
     batch_windows,
     imatrix_windows,
@@ -117,6 +119,7 @@ const value_flags = [_]struct { []const u8, ValueFlag }{
         .{ "--ssd-budget-gb", .ssd_budget_gb },
         .{ "--ssd-prefetch", .ssd_prefetch },
         .{ "--expert-pick-tolerance", .expert_pick_tolerance },
+        .{ "--expert-cache-bias", .expert_cache_bias },
         .{ "--wired-margin-gib", .wired_margin_gib },
         .{ "--batch-windows", .batch_windows },
         .{ "--imatrix-windows", .imatrix_windows },
@@ -179,6 +182,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
                 .ssd_prefetch => o.ssd_prefetch = model_mod.parseSsdPrefetch(v) orelse return error.BadFlagValue,
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
+                .expert_cache_bias => o.cache_bias = expert_stream_mod.parseCacheBias(v) catch return error.BadFlagValue,
                 .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
                 .batch_windows => o.batch_windows = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .imatrix_windows => o.imatrix_windows = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
@@ -195,7 +199,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
         .capture => {
             if (o.prompts.len == 0) return error.MissingPrompts;
             if (o.out_dir.len == 0) return error.MissingOut;
-            if (o.pick_tolerance > 0 or o.drop_expert != 0) return error.TeacherMustBeLossless;
+            if (o.pick_tolerance > 0 or o.cache_bias > 0 or o.drop_expert != 0) return error.TeacherMustBeLossless;
         },
         .compare => {
             if (o.fixture.len == 0) return error.MissingFixture;
@@ -243,6 +247,7 @@ pub const USAGE =
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
+    \\  --expert-cache-bias <n>  compare only, LOSSY, DeepSeek-V4.1: score an uncached expert n lower at decode widths (0..8)
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
     \\  --layer-major         native GLM BF16 teacher or a streamed checkpoint's calibration capture, --tokens 1:
     \\                        batches of windows run layer by layer, each layer's experts read once per batch;
@@ -849,6 +854,7 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         try w.writeAll(",\n  \"kv_cache_format\": ");
         try fixture_mod.writeJsonString(w, kvCacheFormat(opts.kv_quant_config));
         try w.print(",\n  \"expert_pick_tolerance\": {d}", .{opts.pick_tolerance});
+        try w.print(",\n  \"expert_cache_bias\": {d}", .{opts.cache_bias});
         try writeRopeField(w, "teacher_rope", base.rope);
         try writeRopeField(w, "student_rope", student_rope);
         try w.writeAll(",\n  ");
@@ -959,6 +965,7 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     if (try offline.tryRun(allocator, io, opts, &out)) return;
     if (opts.layer_major) return error.LayerMajorNeedsNativeGlmTeacher;
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
+    expert_stream_mod.cache_bias = opts.cache_bias;
     if (opts.wired_margin_bytes > 0) server_state.wired_limit_margin_bytes = opts.wired_margin_bytes;
     const loaded = try loadModel(io, allocator, opts);
     defer loaded.deinit();
@@ -1043,6 +1050,10 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
 
     const routed = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-pick-tolerance", "0.3", "--wired-margin-gib", "5" });
     try testing.expectEqual(@as(f32, 0.3), routed.pick_tolerance);
+    const biased = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-cache-bias", "0.2" });
+    try testing.expectEqual(@as(f32, 0.2), biased.cache_bias);
+    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-cache-bias", "9" }));
+    try testing.expectError(error.TeacherMustBeLossless, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--expert-cache-bias", "0.2" }));
     try testing.expectEqual(@as(u64, 5) << 30, routed.wired_margin_bytes);
     try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-pick-tolerance", "0.7" }));
     try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--wired-margin-gib", "0" }));

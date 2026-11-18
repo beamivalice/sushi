@@ -522,6 +522,23 @@ pub fn parsePickTolerance(raw: []const u8) error{InvalidPickTolerance}!f32 {
     return value;
 }
 
+pub const MAX_CACHE_BIAS: f32 = 8;
+
+/// Decode-width picks score an expert the layer's cache lacks this much lower (`--expert-cache-bias`, 0 = exact), in the
+/// router's own sqrt-softplus units. DeepSeek-V4.1 only; the weights stay the unbiased scores.
+pub var cache_bias: f32 = 0;
+
+pub fn parseCacheBias(raw: []const u8) error{InvalidCacheBias}!f32 {
+    const value = std.fmt.parseFloat(f32, raw) catch return error.InvalidCacheBias;
+    if (!(value >= 0) or value > MAX_CACHE_BIAS) return error.InvalidCacheBias;
+    return value;
+}
+
+/// The pick-score penalty of each expert: 0 where the cache holds it ready (`host_map` slot >= 0), -`bias` elsewhere.
+pub fn biasPenalty(host_map: []const i32, bias: f32, out: []f32) void {
+    for (out, host_map) |*v, slot| v.* = if (slot >= 0) 0 else -bias;
+}
+
 pub const PICK_STARVE_LIMIT: u8 = 3;
 
 /// The line for a lossy pick asked of a resident load: every expert is pooled, so no route misses and none is swapped.
@@ -1658,6 +1675,8 @@ const LayerState = struct {
     spec_host: []i32 = &.{},
     spec_slots: mlx.mlx_array = .{ .ctx = null },
     spec_raw: mlx.mlx_array = .{ .ctx = null },
+    /// f32 `[experts]` pick-score penalty of `spec_host` (`biasPenalty`); null context while `cache_bias` is off.
+    spec_pen: mlx.mlx_array = .{ .ctx = null },
 
     /// Brings the host map and its GPU copy up to the cache. The pair only ever
     /// changes together: a failure leaves no GPU map and a host map that forces
@@ -1677,6 +1696,8 @@ const LayerState = struct {
             self.spec_slots = .{ .ctx = null };
             if (self.spec_raw.ctx != null) _ = mlx.mlx_array_free(self.spec_raw);
             self.spec_raw = .{ .ctx = null };
+            if (self.spec_pen.ctx != null) _ = mlx.mlx_array_free(self.spec_pen);
+            self.spec_pen = .{ .ctx = null };
             @memset(self.spec_host, -2);
         }
         const gpu = try allocator.alloc(i32, experts);
@@ -1691,12 +1712,24 @@ const LayerState = struct {
         const fresh = try mlx.newData(gpu.ptr, &[_]c_int{@intCast(experts)}, .int32);
         if (fresh.ctx == null) return error.ExpertSpecMapAlloc;
         errdefer _ = mlx.mlx_array_free(fresh);
+        var pen: mlx.mlx_array = .{ .ctx = null };
+        if (cache_bias > 0) {
+            const host_pen = try allocator.alloc(f32, experts);
+            defer allocator.free(host_pen);
+            biasPenalty(self.spec_host, cache_bias, host_pen);
+            pen = try mlx.newData(host_pen.ptr, &[_]c_int{@intCast(experts)}, .float32);
+        }
+        errdefer if (pen.ctx != null) {
+            _ = mlx.mlx_array_free(pen);
+        };
         const raw = try mlx.newData(self.spec_host.ptr, &[_]c_int{@intCast(experts)}, .int32);
         if (raw.ctx == null) return error.ExpertSpecMapAlloc;
         if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
         self.spec_slots = fresh;
         if (self.spec_raw.ctx != null) _ = mlx.mlx_array_free(self.spec_raw);
         self.spec_raw = raw;
+        if (self.spec_pen.ctx != null) _ = mlx.mlx_array_free(self.spec_pen);
+        self.spec_pen = pen;
     }
 };
 
@@ -2044,6 +2077,7 @@ pub const Engine = struct {
     swapped_ids: u64 = 0,
     swap_seen_ids: u64 = 0,
     swap_reported_at: u64 = 0,
+    bias_logged: bool = false,
 
     pub fn pendingReaders(self: *const Engine) usize {
         var n: usize = 0;
@@ -2208,6 +2242,8 @@ pub const Engine = struct {
             layer.spec_slots = .{ .ctx = null };
             if (layer.spec_raw.ctx != null) _ = mlx.mlx_array_free(layer.spec_raw);
             layer.spec_raw = .{ .ctx = null };
+            if (layer.spec_pen.ctx != null) _ = mlx.mlx_array_free(layer.spec_pen);
+            layer.spec_pen = .{ .ctx = null };
             if (layer.resident_map.ctx != null) _ = mlx.mlx_array_free(layer.resident_map);
             layer.resident_map = .{ .ctx = null };
             if (layer.starved.len != 0) self.allocator.free(layer.starved);
@@ -2541,6 +2577,23 @@ pub const Engine = struct {
         if (!layer.active or layer.borrowed or layer.resident_map.ctx != null or layer.slabs.len != quant.component_count) return null;
         try layer.refreshSpec(self.allocator, self.s);
         return .{ .slots = layer.spec_slots, .host = layer.spec_host, .bank = &gl.cache_ragged };
+    }
+
+    /// The pick-score penalty `--expert-cache-bias` gives a rate-grouped layer's decode-width router (f32 `[experts]`).
+    /// Null where the bias is off, `--expert-pick-tolerance` is set (it swaps on the host and keeps nothing queued), or
+    /// the layer has no map (the cases `specGrouped` answers null for).
+    pub fn penaltyGrouped(self: *Engine, layer_index: u16) !?mlx.mlx_array {
+        if (!(cache_bias > 0)) return null;
+        if (pick_tolerance > 0) {
+            if (!self.bias_logged) log.warn("[expert-bias] --expert-cache-bias is ignored: --expert-pick-tolerance is set\n", .{});
+            self.bias_logged = true;
+            return null;
+        }
+        if (try self.specGrouped(layer_index) == null) return null;
+        const pen = self.layers[layer_index].spec_pen;
+        if (pen.ctx != null and !self.bias_logged) log.info("[expert-bias] engaged on rate-grouped layers: bias={d:.2} (lossy: an expert the cache lacks scores that much lower at decode widths; the chain stays queued)\n", .{cache_bias});
+        self.bias_logged = true;
+        return if (pen.ctx != null) pen else null;
     }
 
     pub fn prepareHost(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
@@ -5627,6 +5680,17 @@ test "expert pick tolerance accepts 0 through 0.6 and names a bad value" {
     try t.expectError(error.InvalidPickTolerance, parsePickTolerance(""));
 }
 
+test "expert cache bias accepts 0 through 8 and penalizes only the experts the cache lacks" {
+    const t = std.testing;
+    try t.expectEqual(@as(f32, 0.0), try parseCacheBias("0"));
+    try t.expectEqual(@as(f32, 0.2), try parseCacheBias("0.2"));
+    try t.expectEqual(@as(f32, 8.0), try parseCacheBias("8"));
+    for ([_][]const u8{ "8.5", "-0.1", "nan", "inf", "nope", "" }) |bad| try t.expectError(error.InvalidCacheBias, parseCacheBias(bad));
+    var pen: [4]f32 = undefined;
+    biasPenalty(&.{ 3, -1, 0, -1 }, 0.25, &pen);
+    try t.expectEqualSlices(f32, &.{ 0, -0.25, 0, -0.25 }, &pen);
+}
+
 fn PickScratch(comptime experts: usize) type {
     return struct {
         taken: [experts]bool = undefined,
@@ -5887,6 +5951,33 @@ test "a failed spec map refresh leaves no GPU map until a rebuild matches the ca
     const gpu = mlx.mlx_array_data_int32(layer.spec_slots).?;
     for (layer.spec_host, 0..) |host, e| try t.expectEqual(@max(host, 0), gpu[e]);
     try t.expectEqual(layer.cache.expert_to_slot[2], layer.spec_host[2]);
+}
+
+test "the spec map refresh builds the cache-bias penalty only while the bias is on" {
+    const t = std.testing;
+    const saved = cache_bias;
+    defer cache_bias = saved;
+    var layer = LayerState{ .cache = try GroupCache.init(t.allocator, 2, 4) };
+    defer {
+        if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
+        if (layer.spec_raw.ctx != null) _ = mlx.mlx_array_free(layer.spec_raw);
+        if (layer.spec_pen.ctx != null) _ = mlx.mlx_array_free(layer.spec_pen);
+        t.allocator.free(layer.spec_host);
+        layer.cache.deinit();
+    }
+    var resolved = try layer.cache.resolve(t.allocator, &.{ 0, 1 });
+    defer resolved.deinit(t.allocator);
+    markResolvedReady(&layer.cache, &resolved);
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    cache_bias = 0;
+    try layer.refreshSpec(t.allocator, s);
+    try t.expect(layer.spec_pen.ctx == null);
+    cache_bias = 0.25;
+    layer.spec_host[0] = -2;
+    try layer.refreshSpec(t.allocator, s);
+    const pen = mlx.mlx_array_data_float32(layer.spec_pen).?;
+    for (layer.spec_host, 0..) |host, e| try t.expectEqual(if (host >= 0) @as(f32, 0) else -0.25, pen[e]);
 }
 
 test "expert cache profile: the split spends the uniform bytes, gives the most reused layer more, and caps a layer at its experts" {

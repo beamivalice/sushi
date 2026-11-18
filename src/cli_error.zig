@@ -20,7 +20,7 @@ pub fn describe(err: anyerror) ?[]const u8 {
         error.MissingPrompts => "--prompts <fixture folder, .jsonl, or standard4> is required",
         error.MissingOut => "--out <folder> is required",
         error.MissingFixture => "--fixture <teacher fixture folder> is required",
-        error.TeacherMustBeLossless => "a teacher capture is lossless: drop --expert-pick-tolerance and --drop-expert",
+        error.TeacherMustBeLossless => "a teacher capture is lossless: drop --expert-pick-tolerance, --expert-cache-bias and --drop-expert",
         error.LayerMajorFlagWithoutLayerMajor => "--batch-windows, --imatrix-windows and --pause-file need --layer-major",
         error.LayerMajorNeedsNativeGlmTeacher => "--layer-major needs the native GLM BF16 teacher as --model",
         error.BaselineUnreadable => "no baseline.json there: pass the folder `sushi kld capture` wrote",
