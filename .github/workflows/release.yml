@@ -1,23 +1,24 @@
 name: Release
 
+# A release is cut only by ./release.sh's dispatch, which names the commit the local gate passed on; a pushed tag
+# starts nothing.
 on:
-  push:
-    tags:
-      - 'v*'
-      # A -dev tag names a pre-release packaged by hand; build.zig.zon then carries -devN, which this workflow refuses.
-      - '!v*-dev*'
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build + test + package only — skip tag, notarize, and release. Use to verify the workflow on a branch before cutting a real release."
+        description: "Build + package only — skip tag, notarize, and release; needs no gate_sha. Use to verify the workflow on a branch before cutting a real release."
         type: boolean
         default: false
       pre_release:
         description: "Cut this as a pre-release: tag v<MAJOR.MINOR.PATCH>-pre-release.<n> instead of v<MAJOR.MINOR.PATCH>"
         type: boolean
         default: false
+      gate_sha:
+        description: "The commit tests/gate.sh passed on (./release.sh fills it); a release run that builds another commit refuses"
+        type: string
+        default: ""
 
-# Pull requests run ci.yml only. Release runs (tag push / dispatch) are never cancelled.
+# No pull request starts this workflow; the tests are the local gate's (tests/gate.sh). Release runs are never cancelled.
 concurrency:
   group: release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
@@ -30,6 +31,16 @@ jobs:
       contents: write
 
     steps:
+      # The suite ran locally on one commit; a release run that builds any other would ship it untested.
+      # A dry run tags and releases nothing, so it needs no gate.
+      - name: Local gate passed on this commit
+        env:
+          GATE_SHA: ${{ inputs.gate_sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          [ "$DRY_RUN" = true ] || [ "$GATE_SHA" = "$GITHUB_SHA" ] \
+            || { echo "::error::the local gate passed on '$GATE_SHA', but this run builds $GITHUB_SHA: run tests/gate.sh on $GITHUB_SHA, then ./release.sh"; exit 1; }
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -38,6 +49,7 @@ jobs:
         run: bash tests/test_no_local_paths.sh
 
       - name: Set up the build
+        id: setup
         uses: ./.github/actions/setup-build
 
       # Without a Developer ID in the repo secrets the binary ships ad-hoc signed and not notarized.
@@ -79,31 +91,31 @@ jobs:
           source ./release.sh
           BASE="$(zon_version build.zig.zon)"
           is_semver "$BASE" || { echo "::error::build.zig.zon version '$BASE' is not MAJOR.MINOR.PATCH"; exit 1; }
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ "${{ inputs.pre_release }}" = "true" ]; then
-              # A pre-release does NOT consume the version: it tags
-              # v<BASE>-pre-release.<P>, P counting this version's pre-releases
-              # from 1 off the existing tags, so a sequence reads
-              # v1.0.0-pre-release.1, .2 and then v1.0.0.
-              LAST_P=$(git ls-remote --tags origin "v${BASE}-pre-release.*" \
-                | sed -n "s#.*refs/tags/v${BASE}-pre-release\\.\\([0-9][0-9]*\\)\$#\\1#p" \
-                | sort -n | tail -1)
-              VERSION="${BASE}-pre-release.$(( ${LAST_P:-0} + 1 ))"
-            else
-              VERSION="$(release_version CHANGELOG.md build.zig.zon)"
-            fi
-            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.pre_release }}" = "true" ]; then
+            # A pre-release does NOT consume the version: it tags
+            # v<BASE>-pre-release.<P>, P counting this version's pre-releases
+            # from 1 off the existing tags, so a sequence reads
+            # v1.0.0-pre-release.1, .2 and then v1.0.0.
+            LAST_P=$(git ls-remote --tags origin "v${BASE}-pre-release.*" \
+              | sed -n "s#.*refs/tags/v${BASE}-pre-release\\.\\([0-9][0-9]*\\)\$#\\1#p" \
+              | sort -n | tail -1)
+            VERSION="${BASE}-pre-release.$(( ${LAST_P:-0} + 1 ))"
           else
-            VERSION="${GITHUB_REF_NAME#v}"
-            tag_version_ok "$VERSION" "$BASE" \
-              || { echo "::error::tag $GITHUB_REF_NAME is neither v$BASE nor v$BASE-pre-release.<n>"; exit 1; }
-            if [ "$VERSION" = "$BASE" ]; then
-              release_version CHANGELOG.md build.zig.zon >/dev/null
-            fi
-            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            VERSION="$(release_version CHANGELOG.md build.zig.zon)"
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Bounded: the key is written once per toolchain/build/submodule set, so
+      # later runs restore it and never re-save a growing cache. Xcode is in the
+      # key because zig caches configure-time SDK paths.
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.setup.outputs.submodules }}-${{ steps.setup.outputs.xcode }}
 
       - name: Build sushi (Zig)
         run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }} -Dgit-sha=${{ github.sha }}
@@ -114,18 +126,14 @@ jobs:
           ./zig-out/bin/sushi --help > /dev/null
 
       # Static guard: the staged metallib contains the *_nax kernels, minos
-      # >= 26.2, and the built binary links no leftover brew mlx/mlx-c. ci.yml
-      # runs the same check, but a cache-miss rebuild on THIS runner is the
-      # stage that actually ships in the tarball — guard it here too.
+      # >= 26.2, and the built binary links no leftover brew mlx/mlx-c. A
+      # cache-miss rebuild on this runner is the stage that ships in the tarball.
       - name: Verify staged mlx (NAX kernels + minos)
         run: bash tests/test_mlx_staged_nax.sh
 
-      - name: Test tier
-        uses: ./.github/actions/test-host
-
-      # Tagged only once the suite is green, so a failed test leaves no tag behind.
-      - name: Create tag (manual dispatch)
-        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+      # Tagged only once the build and its checks are green, so a failed one leaves no tag behind.
+      - name: Create tag
+        if: ${{ !inputs.dry_run }}
         run: |
           git tag v${{ steps.version.outputs.version }}
           git push origin v${{ steps.version.outputs.version }}

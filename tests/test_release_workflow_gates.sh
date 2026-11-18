@@ -3,9 +3,9 @@
 # Static guard for .github/workflows/release.yml event gating.
 #
 # The release workflow doubles as (1) the tag/dispatch RELEASE pipeline and
-# (2) the dry-run packaging check. Neither workflow runs on a pull request; ci.yml is dispatched by hand, one macOS
-# job a run. The class of bug this pins: someone edits a step's `if:` and a
-# dry run creates a tag or a GitHub release.
+# (2) the dry-run packaging check. It never runs on a pull request, and it runs no test tier: every check a local
+# run can prove is tests/gate.sh's, and a dispatch must name the commit that gate passed on. The class of bug this
+# pins: someone edits a step's `if:` and a dry run creates a tag or a GitHub release.
 #
 # Hermetic — parses the YAML, no network, no runners.
 set -euo pipefail
@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 python3 -c 'import yaml' 2> /dev/null || { echo "SKIP: needs PyYAML (python3 -m pip install pyyaml)"; exit 3; }
 
 python3 - <<'EOF'
-import os, re, sys, yaml
+import os, re, subprocess, sys, yaml
 
 FAIL = 0
 def check(cond, msg):
@@ -30,11 +30,10 @@ wf = yaml.safe_load(open(".github/workflows/release.yml"))
 
 # YAML 1.1 parses the bare key `on` as boolean True.
 triggers = wf.get("on", wf.get(True, {}))
-check("pull_request" not in triggers, "no pull_request trigger: a PR runs ci.yml alone")
-check("push" in triggers and "workflow_dispatch" in triggers,
-      "tag-push + workflow_dispatch triggers still present")
-check("!v*-dev*" in (triggers.get("push") or {}).get("tags", []),
-      "a dev tag (a hand-packaged pre-release) starts no release run")
+check("pull_request" not in triggers, "no pull_request trigger")
+# A release is cut only by release.sh's dispatch, which carries the commit the local gate passed on; a pushed tag
+# would cut a commit no gate saw.
+check(set(triggers) == {"workflow_dispatch"}, f"workflow_dispatch is the only trigger, not {sorted(triggers)}")
 
 job = wf["jobs"]["build"]
 
@@ -47,8 +46,7 @@ def step_if(name):
 # Release-only steps must be OFF for a dry run.
 rel_if = step_if("Create Release")
 check("!inputs.dry_run" in rel_if, "Create Release gated off for a dry run")
-check("workflow_dispatch" in step_if("Create tag (manual dispatch)"),
-      "tag creation restricted to workflow_dispatch")
+check("!inputs.dry_run" in step_if("Create tag"), "tag creation gated off for a dry run")
 
 # ── The pre_release checkbox exists so a build can be cut WITHOUT consuming the
 # version: it tags v<MAJOR.MINOR.PATCH>-pre-release.<n>, so the plain version is
@@ -94,9 +92,8 @@ check(any("-Dgit-sha=${{ github.sha }}" in str(s.get("run", ""))
           for s in sushi_builds),
       "release sushi build passes -Dgit-sha=${{ github.sha }}")
 
-# The NAX static guard must run in the RELEASE pipeline itself — ci.yml
-# checking the same cache key doesn't cover a cache-miss rebuild on the
-# release runner, and that stage is what actually ships in the tarball.
+# The NAX static guard runs in the release pipeline itself: a cache-miss rebuild
+# on the release runner is the stage that ships in the tarball.
 nax_steps = [s for s in job["steps"]
              if "test_mlx_staged_nax.sh" in str(s.get("run", ""))]
 check(len(nax_steps) == 1, "NAX metallib static guard step present")
@@ -119,14 +116,13 @@ check("pull_request" not in open(".github/workflows/release.yml").read(),
       "release.yml has no pull_request branch left")
 
 # ── SemVer. build.zig.zon's `.version` is the one version source; the version
-# step sources release.sh so a dispatch and a tag push apply the same checks
-# release.sh does, and no version comes from the clock.
+# step sources release.sh so a dispatch applies the same checks release.sh
+# does, and no version comes from the clock.
 wf_text = open(".github/workflows/release.yml").read()
 version_run = str(version_step.get("run", ""))
 check("release.sh" in version_run and "build.zig.zon" in version_run,
       "the version step reads build.zig.zon through release.sh")
-check("release_version" in version_run and "tag_version_ok" in version_run,
-      "the version step checks the CHANGELOG heading and a pushed tag")
+check("release_version" in version_run, "the version step checks the CHANGELOG heading")
 check("date +%y" not in wf_text and "date -u +%y" not in wf_text,
       "no version is computed from the date")
 
@@ -157,10 +153,6 @@ with tempfile.TemporaryDirectory() as d:
           "an Unreleased top entry is refused even with an older version below it")
     check(release_version("## v1.1.0 — Next", "1.0.0")[0] != 0,
           "a heading that disagrees with build.zig.zon is refused")
-for tag, ok in (("1.0.0", True), ("1.0.0-pre-release.2", True), ("26.9.1", False),
-                ("1.0.1", False), ("1.0.0-pre-release.0", False), ("1x0x0", False)):
-    check((sh('tag_version_ok "$1" 1.0.0', tag)[0] == 0) == ok,
-          f"a pushed tag v{tag} is {'accepted' if ok else 'refused'} for 1.0.0")
 
 # ── Third-party attribution must travel WITH the binary. The shipped binary
 # links Apache-2.0 code (MTPLX/dflash/oMLX Metal kernels, a port of jinja.cpp), and
@@ -206,14 +198,47 @@ for p in sorted(notice_paths):
     for q in expand_braces(p):
         check(os.path.exists(q), f"NOTICE names an existing path: {q}")
 
-# ── The arch drop test runs locally before a landing that touches shared code, never on CI's runners (several times
-# slower there). No ci.yml job runs it.
-ci = yaml.safe_load(open(".github/workflows/ci.yml"))
-check(not any("test_arch_drop.sh" in str(st.get("run", "")) for j in ci["jobs"].values() for st in j.get("steps", [])),
-      "no ci.yml job runs the arch drop test")
-# Remote CI runs only when dispatched (the owner dispatches it at a version bump): no pull request or push starts it.
-ci_on = ci.get("on", ci.get(True, {}))
-check(set(ci_on) == {"workflow_dispatch"}, f"ci.yml runs on workflow_dispatch only, not {sorted(set(ci_on) - {'workflow_dispatch'})}")
+# ── The tests are the local gate's (tests/gate.sh, once, on the exact commit); the runner proves only what a clean
+# checkout alone can. A dispatch names the commit the gate passed on, and a run that builds any other refuses before
+# it sets anything up, so a stale record cannot cut a different commit.
+check(not any("test-host" in str(s.get("uses", "")) for s in job["steps"]), "release.yml runs no test tier action")
+check(not any(re.search(r"zig build (test|test-host|test-build|lint|ubench)\b", str(s.get("run", ""))) for s in job["steps"]),
+      "release.yml runs no zig test, lint or ubench step")
+check(not any("hermetic_guards" in str(s.get("run", "")) for s in job["steps"]), "release.yml runs no hermetic guards")
+# A dry run (packaging only, no tag, no release) needs no gate sha; every other run needs the one it builds.
+check("gate_sha" in inputs, "workflow_dispatch offers a gate_sha input")
+gate_steps = [s for s in job["steps"] if "inputs.gate_sha" in str(s.get("env", ""))]
+check(len(gate_steps) == 1, "one step checks the gate sha")
+gate_step = gate_steps[0] if gate_steps else {}
+gate_env = gate_step.get("env", {})
+check("if" not in gate_step, "the gate sha check runs on every run")
+check(gate_env.get("GATE_SHA") == "${{ inputs.gate_sha }}" and gate_env.get("DRY_RUN") == "${{ inputs.dry_run }}",
+      "the gate sha step reads the gate_sha and dry_run inputs")
+def gate_check(dry_run, gate_sha, built="c" * 40):
+    r = subprocess.run(["bash", "-ec", str(gate_step.get("run", "exit 9"))], capture_output=True, text=True,
+                       env={**os.environ, "DRY_RUN": dry_run, "GATE_SHA": gate_sha, "GITHUB_SHA": built})
+    return r.returncode
+check(gate_check("false", "c" * 40) == 0, "a release run whose gate sha is the commit built goes on")
+check(gate_check("false", "d" * 40) != 0, "a release run whose gate sha is another commit fails")
+check(gate_check("false", "") != 0, "a release run without a gate sha fails")
+check(gate_check("true", "") == 0, "a dry run without a gate sha goes on")
+names = [s.get("name", "") for s in job["steps"]]
+check(gate_step.get("name") in names and names.index(gate_step.get("name")) < names.index("Set up the build"),
+      "the gate sha is checked before the build is set up")
+
+# The Zig build cache: restored before the release build, keyed on the toolchain, the build files, the submodules and
+# the Xcode the setup selected (zig caches configure-time SDK paths).
+zig_cache = [s for s in job["steps"] if s.get("uses", "").startswith("actions/cache")]
+check(len(zig_cache) == 1, "one Zig cache step")
+zc = zig_cache[0].get("with", {}) if zig_cache else {}
+check(".zig-cache" in str(zc.get("path", "")) and "~/.cache/zig" in str(zc.get("path", "")),
+      "the Zig cache holds .zig-cache and ~/.cache/zig")
+check(str(zc.get("key", "")) == "zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-"
+      "${{ steps.setup.outputs.submodules }}-${{ steps.setup.outputs.xcode }}", "the Zig cache key")
+check(next((s for s in job["steps"] if s.get("name") == "Set up the build"), {}).get("id") == "setup",
+      "the setup step's outputs feed the cache key")
+check(names.index(zig_cache[0].get("name")) < names.index("Build sushi (Zig)") if zig_cache else False,
+      "the Zig cache is restored before the build")
 
 sys.exit(FAIL)
 EOF

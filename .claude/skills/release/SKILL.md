@@ -12,22 +12,22 @@ loads take the GPU lock; step 2 waits for a quiet box (no builds, no AirDrop or 
 Order (owner, 2026-10-31):
 0. Read `docs/private/future.md` (main checkout) and tell the owner, before anything runs, every entry this release
    gates or is due with it (e.g. a pack upload that waits for the published release), and what each still needs.
-1. Step 1, then the version bump (Release steps 1 and 2 below), committed and pushed.
+1. The version bump (Release step 1 below), committed and pushed; then step 1, the local gate on that pushed commit.
 2. Two tracks start together and should finish about together:
-   - remote: `./release.sh` (`release.yml` builds, tests and leaves the DRAFT);
+   - remote: `./release.sh` (it needs step 1's record; `release.yml` builds and leaves the DRAFT);
    - local: steps 2, 3 and 4.
 3. Both green: publish the draft (Release step 3).
 4. Any issue on either track: fix it on main and push. Delete the failed draft and its tag
-   (`gh release delete v<ver> --cleanup-tag --yes`), then rerun `./release.sh`. Rerun only the local steps the fix can
-   reach.
+   (`gh release delete v<ver> --cleanup-tag --yes`), then run the gate on the new head and `./release.sh`. Rerun only
+   the local steps 2-4 the fix can reach.
 
 | # | Step | Command | Pass |
 |---|---|---|---|
-| 1 | Suite + binary | `zig build test -Doptimize=ReleaseFast`; `zig build -Doptimize=ReleaseFast`; `sushi --version` | 0 fail; names `build.zig.zon`'s version |
+| 1 | **Local gate** + binary | `git fetch && tests/gate.sh` (origin/main: lint, hermetic guards, ubench, the full suite with the tiny-fixture envs, in a clean worktree); `zig build -Doptimize=ReleaseFast`; `sushi --version` | `~/.sushi/runs/gate/<sha>.json` written; names `build.zig.zon`'s version |
 | 2 | **Perf gate** | `tests/bench.sh --version <ver> [--tokens 512] <pack>` (below; `--tokens 512` for Qwen and GLM) on Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, Sushi-4bpw, GLM-5.3-Flash-Sushi-2.4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
 | 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on Qwen Sushi-STQ-2.75bpw and the DeepSeek STQ pack | within ~1% of its row in `docs/quality-kld.md` |
 | 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh` on the `qwen4`, `glm5` and `dsv41` passes, plus the live test of each area the release changed (step 2's bench covers the rest) | all pass |
-| 5 | CI | `./release.sh` beside steps 2-4 (never `ci.yml`): `release.yml` runs the full suite on the macOS 26.2 runner before it packages, and a failed test leaves no draft | green, a DRAFT exists |
+| 5 | CI | `./release.sh` beside steps 2-4: it refuses without step 1's record for origin's main head; `release.yml` builds that commit from the pins on the macOS 26.2 runner, smoke-tests, checks the staged mlx and packages it, and a failure leaves no draft | green, a DRAFT exists |
 | 6 | Packs | each HF pack repo holds the shards, `ngram_table.bin` and its model card | card numbers match `docs/quality-kld.md` |
 | 7 | Cross-engine (only before a public claim) | start each engine yourself, `npx -y llmprobe@latest <host:port> -m <id> --bench-only` by hand | recorded in `~/.sushi/runs/bench-<tag>/`, engine named beside every win |
 
@@ -66,8 +66,9 @@ adds a model, a feature or a flag; PATCH fixes without adding.
 
 **The version source is `build.zig.zon`'s `.version`**: a plain `zig build` stamps it into `sushi --version`, and
 `-Dversion` (CI) must be SemVer or the build stops. `release.sh` dispatches only when the FIRST `## ` heading of
-`CHANGELOG.md` names that same version and no GitHub release or tag carries it yet; the workflow's "Extract version"
-step sources `release.sh` and applies the same checks (a pushed tag must be `v<zon>` or `v<zon>-pre-release.<n>`).
+`CHANGELOG.md` names that same version, no GitHub release or tag carries it yet and the local gate passed on origin's
+main head; the workflow's "Extract version" step sources `release.sh` and applies the same checks. Only that dispatch
+starts `release.yml` (a pushed tag starts nothing); a `dry_run` dispatch packages without a gate sha, tag or release.
 Nothing is computed from the date.
 
 **Signing**: there is no Apple Developer ID, so the release binary ships ad-hoc signed and not notarized. The
@@ -79,8 +80,8 @@ workflow signs with a Developer ID and notarizes only when the `APPLE_*` repo se
    `## v<version> — Headline` (check `gh release list --limit 1` first — never reuse an existing tag)
    - Every bump, a `-dev` one too, also sets `src/exl3/root.zig`'s `version` (the vendorable module's own); run
      `zig build test -Doptimize=ReleaseFast -Dtest-filter="version:"` before committing, which pins the two equal.
-2. Commit the version bump with the CHANGELOG heading, push it, and run `./release.sh` beside the local gates (Order
-   above).
+2. Commit the version bump with the CHANGELOG heading, push it, run `tests/gate.sh` on it, then `./release.sh` beside
+   the local gates (Order above).
 3. The Release workflow leaves a DRAFT. Once the local gates are green too, check its tarball against the
    `.sha256` and run its `sushi --version`, then publish it. Right after publishing, run `scripts/bump-tap.sh`: it
    triggers `beamivalice/homebrew-tap`'s bump with this machine's `gh` login (no repo-secret token) and fails unless

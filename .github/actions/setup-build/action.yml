@@ -33,7 +33,6 @@ runs:
     # disabled (MLX_METAL_NO_NAX). scripts/build-mlx.sh asserts the built
     # metallib actually contains *_nax kernels. Compiling needs no M5: the
     # runtime probe (GPU gen >= 17) gates dispatch on user machines.
-    # The key is shared by CI and release runs, so each keeps the other's cache warm.
     - name: Compute mlx pin cache key
       id: mlxpin
       shell: bash

@@ -21,7 +21,11 @@ has() { check "$1" "$(printf '%s' "$2" | grep -qF -- "$3" && echo 1 || { echo " 
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-export GPU_LOCK_DIR="$WORK/lock.d" GPU_LOCK_POLL_S=0.2
+# A stub holds no memory, so a boot never waits for memory to settle; the meter logs a read that would mean it did.
+export GPU_LOCK_DIR="$WORK/lock.d" GPU_LOCK_POLL_S=0.2 GPU_LOCK_SETTLE_MAX_S=0
+export GPU_LOCK_MEM_CMD="$WORK/mem_read"
+printf '#!/bin/bash\necho read >> "%s"\necho 1000\n' "$WORK/mem_reads.log" > "$GPU_LOCK_MEM_CMD"
+chmod +x "$GPU_LOCK_MEM_CMD"
 LOCK="$PWD/scripts/gpu-lock.sh"
 RUN="$TESTS/run.sh"
 
@@ -584,6 +588,8 @@ RUN_MODELS="$WORK/nopacks" runrun "$WORK/out5" --tier live --model qwen4
 eq "a pass whose pack is missing SKIPs every boot script and exits 0" "$?" "0"
 has "  naming the pack" "$(cat "$WORK/out5.stdout")" "SKIP: pack 'qwen4' missing"
 check "  without booting anything" "$([ ! -e "$WORK/out5/qwen4-api.END" ] && echo 1 || echo 0)"
+
+check "no boot waited for memory to settle" "$([ ! -e "$WORK/mem_reads.log" ] && echo 1 || echo 0)"
 
 echo
 echo "  passed: $PASS   failed: $FAIL"

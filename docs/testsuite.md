@@ -45,7 +45,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 
 | tier | means | where it runs |
 |---|---|---|
-| host | touches no MLX array; its file reaches no `mlx.zig` | `zig build test-host`: anywhere, beside a live server, no GPU lock, and in CI |
+| host | touches no MLX array; its file reaches no `mlx.zig` | `zig build test-host`: anywhere, beside a live server, no GPU lock |
 | gpu | Metal kernels on small synthetic tensors; the first line is `try mlx.requireGpu();` | `zig build test` |
 | pack | needs a fixture or pack named by an env var; skips when it is unset | `zig build test` with the env set |
 
@@ -91,7 +91,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
   `{p0, ratio, keys, group}`, `wscale` and the kernel's `scores`; the test skips without it), `QWEN4_TEST_MODEL`,
   `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`, `SUSHI_DSV41_REAL_PACK` (the DeepSeek width probe: every row of a verify is its one-row round's bits on the real pack, and the engine's proof: one-row steps and DSpark rounds on the engine of our own give MLX's bytes;
-  its `SUSHI_DSV41_PROBE_*` knobs are in [envvar](envvar.md); a ~40 GB-budget run, GPU lock). A landing on main sets the tiny-fixture envs; the real-pack envs run with the release gate. Without them a green
+  its `SUSHI_DSV41_PROBE_*` knobs are in [envvar](envvar.md); a ~40 GB-budget run, GPU lock). A landing on main sets the tiny-fixture envs (`source tests/lib/fixture_envs.sh`); the real-pack envs run with the release gate. Without them a green
   suite proves nothing there.
 - Three real-weight runs have no script. The encoder's real-checkpoint capture:
   `SUSHI_ENCODER_REAL_MODEL=1 SUSHI_MODELS_DIR=<root holding Qwen/Qwen3.8-Flash-Next> zig build test -Doptimize=ReleaseFast -Dmodel=enc`.
@@ -121,7 +121,7 @@ a test that skips only inside a helper counts as gpu or cpu.
 | `src/dsv41/` | dsv41 | 23 | 22 | 148 | 40 | 112 | 322 |
 | total | | 270 | 1099 | 655 | 324 | 2343 | 4421 |
 
-A hermetic guard keeps the folders honest. It is checked by `python3 tests/test_suite_guards.py` (CI runs it) and
+A hermetic guard keeps the folders honest. It is checked by `python3 tests/test_suite_guards.py` (the hermetic guards run it) and
 reads an allowlist that `python3 tests/suite_guards.py --write` regenerates; run it after every landing that moves code,
 and commit the allowlist diff with it. `python3 tests/suite_guards.py` alone checks.
 
@@ -207,7 +207,7 @@ on, and it runs every time, so a new or edited file is always read. A report rea
 
 ## Microbenches
 
-`sushi-ubench` is not a tier: `zig build test` never builds it, CI only compiles it, and its files hold no `test`
+`sushi-ubench` is not a tier: `zig build test` never builds it, `tests/gate.sh` only compiles it, and its files hold no `test`
 block (the build refuses one). Its output is ms across rungs, never pass/fail; see [process-ubench](process-ubench.md).
 Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 
@@ -254,7 +254,7 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 | docs only, or test scripts only | nothing in Zig; `tests/run.sh --check` and the scripts it touched |
 | a landing on main | the row above that fits its change, with the tiny-fixture envs set, plus `python3 tests/suite_guards.py` and the touched area's scripts |
 | the end of a series of landings (shared files, `build.zig`, `mlx.zig`, several areas stacked) | `zig build test` with the tiny-fixture envs set |
-| a version bump (release step 1) | `zig build test` with the tiny-fixture envs set |
+| a version bump (release step 1) | `tests/gate.sh` on the pushed bump commit (below) |
 | an architecture joins the family, or one is dropped for real | `tests/test_arch_drop.sh` (the only time it runs) |
 | a bisect of an unexplained failure | the subset that fails, widened only if it does not reproduce there |
 
@@ -270,12 +270,20 @@ Cooler contract holds the BF16 checkpoint's format at served head geometry.
 A full-suite run compares its test total (`Build Summary` plus `test-host`) with the previous full run's: an
 unexplained drop means tests were not built, and blocks the push.
 
-CI runs only when dispatched by hand, at a version bump; no pull request or push starts it, and a landing runs
-its checks locally. It runs `test-build` (every test compiles), `test-host` and the hermetic guards; the GPU tier is a
-`workflow_dispatch` choice (`tier: all`), because a hosted runner's GPU flips rounding ties the M5 holds.
-The hermetic guards are one list, `tests/hermetic_guards.sh`, which CI calls and every landing runs locally; it fails
-on a skip, so a box without PyYAML (`python3 -m pip install pyyaml`) cannot pass it unseen.
-The arch drop test runs locally, never on CI, and only when an architecture joins the family or one is dropped for
+**The local gate.** Every check a local run can prove runs locally, once, on the exact commit a release cuts:
+`tests/gate.sh [<ref>]` (default `origin/main`; fetch first) makes a clean worktree of it (no untracked file can mask a
+missing one) and runs, under `taskpolicy -a`, `zig build lint`, `tests/hermetic_guards.sh`, `zig build ubench` and
+`zig build test -Doptimize=ReleaseFast --summary all` with the tiny-fixture envs of `tests/lib/fixture_envs.sh`.
+Its zig builds share a persistent local cache, `~/.sushi/runs/gate/zig-cache` (`--cache-dir`), so a fresh worktree is
+not a cold build; remove it after a toolchain or SDK change, as a checkout's `.zig-cache`.
+Green writes `~/.sushi/runs/gate/<sha>.json` (sha, time, Zig version, the Build Summary counts, each step's minutes,
+per-test times when the runner has `SUSHI_TEST_TIMES`); a failed step names itself and writes none.
+`./release.sh` dispatches only with a record for origin's main head and passes its sha; `release.yml` starts only
+from a dispatch and refuses a release run that builds any other commit (a `dry_run` packaging check needs none). The runner keeps only what a clean checkout alone proves: the build from the pins,
+the shipped binary's smoke test and staged-mlx check, `test_no_local_paths.sh`, signing and packaging.
+The hermetic guards are one list, `tests/hermetic_guards.sh`, which the gate and every landing run; it fails on a skip,
+so a box without PyYAML (`python3 -m pip install pyyaml`; the gate takes `SUSHI_GATE_PYTHON`) cannot pass it unseen.
+The arch drop test runs only when an architecture joins the family or one is dropped for
 real: never per landing, at a series' end or at a version bump. `--since <ref>` takes only the architectures whose folder `src/<arch>/` changed after that commit: an
 architecture the series did not touch is not dropped, and a series that touched no arch folder drops nothing. Its jobs
 (a drop and a single-arch build for each architecture taken) run at once: all eight took 11.5 minutes on the M5 Max at
@@ -319,7 +327,7 @@ A script that stops its server on purpose (a SIGTERM test) sets `SUSHI_EXPECT_GO
 not reported as a crash. A Python `own` script uses `lib/sushi_boot.py` (`Server`, `gpu_lock`, `private_env`, `pack`).
 
 **Runner.** `tests/run.sh [--tier hermetic,host,pack,live|all] [--model qwen4|mimo2|glm5|dsv41|shared|all] [--only glob]
-[--list] [--check] [--keep-going] [--no-build] [--out dir]`. The default (`hermetic,host`, every pass) is what CI runs. A selection that holds no script exits 2: an `--only` that
+[--list] [--check] [--keep-going] [--no-build] [--out dir]`. The default is `hermetic,host`, every pass. A selection that holds no script exits 2: an `--only` that
 matches nothing, or names a script outside the selected `--tier` or `--model` pass (it names the tier or pass to give;
 `boot=own` scripts on the default pack run in the `shared` pass), is refused, never a green empty run.
 `--list` prints the plan and boots nothing; `--check` refuses a missing or invalid header, a missing or stale matrix
