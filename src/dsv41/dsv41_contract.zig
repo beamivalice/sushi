@@ -11,6 +11,9 @@ const Tokenizer = @import("../tokenizer.zig").Tokenizer;
 
 pub const fixtures = [_][:0]const u8{ "DSV41_STQ_TINY", "DSV41_STQ_TINY_PM", "DSV41_TINY" };
 
+/// A forward reads out its last row alone (`dsv41_model.Want.last`), however wide, under its own caps.
+pub const reads_out_last_row_only = true;
+
 /// Prompt lengths a request of the contract takes: one row, the decode widths' edge, a chunk past it.
 pub const prompt_lengths = [_]usize{ 1, 2, 7, 16, 17, 40 };
 

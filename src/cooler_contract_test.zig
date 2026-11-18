@@ -1,7 +1,8 @@
 //! The Sushi Cooler contract: what every load on the engine of our own owes, whatever its arch. An arch on Sushi
 //! Cooler declares `cooler_contract` (its tiny fixtures by env var and the reads only it can make: `prepare`,
 //! `prompt`, `weightsOutsideRegions`, `headLoaded`, optionally `specTokens` and `specTokensWith` (sampled), and
-//! `greedyRows`, required when its `coolerRows` gives more than one (the rows test fails by name without it); each test
+//! `greedyRows`, required when its `coolerRows` gives more than one (the rows test fails by name without it), and
+//! `reads_out_last_row_only` where its forward reads out a wide forward's last row alone; each test
 //! runs on every such fixture present and is reported skipped when any is missing or when no fixture's load applied to
 //! it. Loads, requests and unloads take the turns and hooks serve takes.
 const std = @import("std");
@@ -1189,7 +1190,8 @@ test "cooler contract: a wide forward that reads out every row's logits, as `sus
                 const logits = try @import("model_handle.zig").forwardWith(ld.xfm, &ctx, arr);
                 defer _ = mlx.mlx_array_free(logits);
                 try mlx.check(mlx.mlx_array_eval(logits));
-                try testing.expectEqual(@as(c_int, @intCast(width)), mlx.getShape(logits)[1]);
+                const read: usize = if (@hasDecl(C, "reads_out_last_row_only")) 1 else width;
+                try testing.expectEqual(@as(c_int, @intCast(read)), mlx.getShape(logits)[1]);
             }
         }
     }.run);
@@ -1255,6 +1257,32 @@ test "cooler contract: every prefill width a Cooler load serves, on its first re
                 if (grew > bill) std.debug.print("cooler contract: the pool grew {d} MB\n", .{grew >> 20});
                 try testing.expect(grew <= bill);
             }
+        }
+    }.run);
+}
+
+test "cooler contract: a served cold prefill past the reservation floor, whose first chunk grows the request's whole reserved cache, runs under its chunks' caps" {
+    try eachFixture(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            // The owner's agent turn, 40,388 tokens cold at 4,096 a chunk. A cut's one attention layer reserves the
+            // context's whole rest to outgrow its first chunk's cap, as the real pack's twelve do at 256,000.
+            const len: usize = 40388;
+            const max_tokens: u32 = 1_000_000;
+            if (!ld.config.reservesKvCapacity() or ld.config.max_position_embeddings < len + max_tokens) return error.SkipZigTest;
+            const long = try a.alloc(u32, len);
+            defer a.free(long);
+            for (long, 0..) |*t, i| t.* = ids[i % ids.len];
+            const Body = struct {
+                fn reserved(l: *Load, _: *Generator) anyerror!void {
+                    try testing.expect(l.xfm.cache.reserve_tokens >= len + max_tokens);
+                }
+            };
+            errdefer std.debug.print("cooler contract: a cold {d}-token prefill at 4096 rows a chunk reserving {d} more\n", .{ len, max_tokens });
+            try withPrefilled(&ld, long, max_tokens, 4096, &ld, Body.reserved);
         }
     }.run);
 }

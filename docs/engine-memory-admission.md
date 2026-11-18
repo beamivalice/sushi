@@ -478,6 +478,12 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   (`oldBuffersInEvalWindow`) for a donated restore and nothing for a share. At a 128k entry, kv8: +170 MiB on
   qwen4_exp and +212.5 MiB on mimo_v2 over the bill without the grow; growing at the first decode step instead
   held every layer's old rows at once.
+- **A cold prefill grows the request's cache to its reservation inside its first chunk** (the KV of every attention
+  layer and the MTP head, and the QSA history): those buffers are the request's commit, billed at admission, so the
+  chunk's pool cap rises by their exact bytes as they are made (`engine.roomFor` in `KVCache.growQuantBuf` and
+  `ssm_cache.capBufAppend`), not by its transient bill. Billed as scratch, a 40,388-token cold turn reserving 256,000
+  more (Qwen STQ 4bpw, kv8: 12 layers x 312 MiB of KV) outgrew its 4,096-row chunk's ~3.1 GB cap with `PoolOverBudget`
+  (r-68). The contract cell `a served cold prefill past the reservation floor...` holds it on both cuts.
 - A decode or verify forward past its cache's capacity grows it before it builds (`KVCache.growAhead`, from
   `model_handle.forwardWith` for forwards of up to 64 rows): one buffer at a time, each the kept rows joined to a zero
   tail, evaluated, and its old copy released. The release is `mlx.engine.trim()` on the engine's stream:

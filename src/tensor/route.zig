@@ -621,6 +621,13 @@ pub fn room(lens: []const usize) void {
     const owner = budget_slot orelse return;
     if (owner.*) |bytes| owner.* = bytes +| (core.poolLimit().? - before);
 }
+/// `room` for one tensor of `dims` and `dtype` about to be made: a request's cache buffer a forward grows, which
+/// admission bills as the request's commit, not the forward's cap as its scratch.
+pub fn roomFor(dims: []const c_int, dtype: mlx.mlx_dtype) void {
+    var bytes: usize = core.itemSize(dtype);
+    for (dims) |d| bytes *= @intCast(d);
+    room(&.{bytes});
+}
 pub const uncapped = core.uncapped;
 pub const capped = core.capped;
 pub const close = core.close;

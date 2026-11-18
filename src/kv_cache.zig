@@ -1250,6 +1250,8 @@ pub const KVCache = struct {
     /// the operand it is writing, which is what lets K and V differ.
     fn growQuantBuf(s: mlx.mlx_stream, buf: *mlx.mlx_array, initialized: bool, offset: usize, new_cap: c_int, B: c_int, heads: c_int, last_dim: c_int, dtype: mlx.mlx_dtype) !void {
         const buf_shape = [_]c_int{ B, heads, new_cap, last_dim };
+        // A cold prefill's first chunk grows each layer to the whole reservation inside its forward.
+        mlx.engine.roomFor(&buf_shape, dtype);
         if (initialized and offset > 0) {
             // The kept rows, then a zero tail to the new capacity, joined into the one new buffer: a zeros buffer of
             // the whole capacity written by slice_update held a second new-size buffer while the copy ran.

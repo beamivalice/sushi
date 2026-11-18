@@ -173,6 +173,7 @@ pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array
         var shape = [_]c_int{ 0, 0, 0, 0 };
         for (csh, 0..) |d, i| shape[i] = d;
         shape[axis] = @intCast(plan.new_cap);
+        mlx.engine.roomFor(shape[0..nd], mlx.mlx_array_dtype(chunk));
         var grown = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(grown);
         try mlx.check(mlx.mlx_zeros(&grown, &shape, nd, mlx.mlx_array_dtype(chunk), s));

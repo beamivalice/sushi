@@ -494,7 +494,8 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **What is made between forwards and outlives them asks for room** (`core.room`): a restore point's copies are taken
   under the cap the last forward left, which covers a forward's scratch and not state that stays. The capture names
   the sizes it is about to copy and the cap rises by their buffers; the next forward's cap starts from what is in use
-  then. A restore point's absent slots share one placeholder. The vision tower's requantized codes, scales and biases
+  then. A request's cache a forward grows (a cold prefill's first chunk to the reservation) asks the same way
+  (`engine.roomFor`): admission bills it as the request's commit. A restore point's absent slots share one placeholder. The vision tower's requantized codes, scales and biases
   are made the same way, after the model's warm left its cap (`dsv41_vision.lin`). State read back from the SSD tier
   has no sizes to name ahead: the cap is lifted for the read and the install and comes back raised by the buffers
   that came into use (`core.uncapped`, `core.capped`).
