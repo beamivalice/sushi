@@ -72,9 +72,12 @@ Processes spawned from an agent harness inherit background QoS (priority 4 vs 31
 timed jobs with `taskpolicy -a <cmd>` (or restore the running PID), and state the QoS used beside the number. A number
 2-4x worse than a terminal run points at QoS before anything else.
 
-Agent shells also run reniced (nice 5, detached jobs nice 10), and only root can lower that again. A `sushibar` an agent
-left running passed nice 10 to every server it started: the GPU stayed under 1 GHz and a DeepSeek decode ran ~30%
-slow. The owner starts their own `sushibar` and servers.
+Agent shells also run reniced (nice 5, detached jobs nice 10), and only root can lower that again: a server started
+from an agent shell (`taskpolicy -a` does not reset nice) ran its GPU at half clock. An agent's server therefore starts
+as a launchd job in the user's gui domain (`launchctl bootstrap gui/$UID <plist>` with `ProcessType` Interactive and
+`Nice` 0, `KeepAlive` false, `launchctl bootout` to stop), never as a child of its shell; at nice 0 the M5 Max's GPU
+held 1,536-1,546 of its 1,620 MHz under decode. A `sushibar` an agent left running passed nice 10 to every server it
+started: the GPU stayed under 1 GHz and a DeepSeek decode ran ~30% slow. The owner starts their own `sushibar`.
 
 The same holds for builds and tests: on the M5 Max an agent-launched process with inherited QoS stays on the 12
 Performance cores and never reaches the 6 Super cores (CPUs 12-17); under `taskpolicy -a` it does. Run every CPU-heavy
