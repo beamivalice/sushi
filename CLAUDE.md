@@ -113,10 +113,9 @@ Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; 
 [testsuite](docs/testsuite.md#what-a-change-runs) names; (4) refactor. A live curl is NOT a test. A landing runs the
 tests its diff can break, once, by name (`-Dtest-filter=` per cell, `SUSHI_CONTRACT_FIXTURE` per fixture, in the
 brief); a family filter or all fixtures is full-suite work. No rerun on a no-op rebase.
-The full suite runs once at the end of a series of landings and at a version bump, and so does the arch drop test, for
-the architectures touched since the last one (`tests/test_arch_drop.sh --since <ref>`: one whose folder is unchanged
-is not dropped). A run that fails is never restarted whole: fix, then run the failed test, the fix's module and the
-parts not yet reached.
+The full suite runs once at the end of a series of landings and at a version bump. The arch drop test
+(`tests/test_arch_drop.sh`) runs only when an architecture joins the family or one is really dropped. A run that
+fails is never restarted whole: fix, then run the failed test, the fix's module and the parts not yet reached.
 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test
 red→fix→green. Refactor = characterization test first. A live failure revealing a CLASS ships the instance test plus a
@@ -258,7 +257,7 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
 changes to ALL live workers at once; checks each landing updated its matching doc, and this index when a doc appears.
 
 **Remote CI.** `ci.yml` runs only when dispatched by hand at a version bump (no PR or push starts it); every other
-check runs locally: a landing's own subset before it lands, the full suite and the arch drop test at a series' end.
+check runs locally: a landing's own subset before it lands, the full suite at a series' end.
 
 **Workers.** Report progress and blockers to the coordinator; commit per step; don't push or merge unless told; put new
 knowledge in the matching doc in the branch.
