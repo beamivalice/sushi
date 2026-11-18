@@ -211,15 +211,18 @@ first EOS, against the previous release's reading (within ~1%). The fixture and 
 Public numbers (pack cards, the README) are the eight-category reading ([below](#eight-category)). A 16-prompt prose
 fixture is a regression gate only: without the other categories its mean leans on raw prose, so it is never reported.
 
-| pack | fixture (`kld-teacher/`) | extra flags | 1.4.0 | 1.5.0 (`f8ec7254`) | 1.5.1 (`399895f6`) | 1.6.0 (`ac3da7aa`) |
-|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions | 0.065924, 91.94%, 7061 positions | 0.061834, 92.30%, 7061 positions, pack revision 2.0 |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | `--ssd-budget-gb 110` | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions | 0.209123, 86.84%, 7533 positions, pack revision 2.0 | 0.210305, 86.46%, 7533 positions |
+| pack | fixture (`kld-teacher/`) | extra flags | 1.4.0 | 1.5.0 (`f8ec7254`) | 1.5.1 (`399895f6`) | 1.6.0 (`ac3da7aa`) | 1.7.0 |
+|---|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions | 0.065924, 91.94%, 7061 positions | 0.061834, 92.30%, 7061 positions, pack revision 2.0 | 0.061793, 92.48%, 7061 positions (`c59df290`) |
+| Qwen3.8-Flash-Next-Sushi-STQ-4bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | | | | 0.031214, 94.42%, 7061 positions (`c59df290`) |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | `--ssd-budget-gb 110` | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions | 0.209123, 86.84%, 7533 positions, pack revision 2.0 | 0.210305, 86.46%, 7533 positions | 0.210682, 86.38%, 7533 positions (`b039659c`, `--ssd-budget-gb 108`) |
 
 DeepSeek moved to pack revision 2.0 after 1.5.0; the 1.5.0 binary read it at 0.210305, 86.46% (`--ssd-budget-gb 64`), so
 1.5.1 is within 0.6%. Qwen 1.5.1 equals 1.5.0 to the last digit.
 The published Qwen pack moved to revision 2.0 (6-bit STQ trunk) after 1.5.1: on the 1.5.1 code (`88c0173a`, the same
 flags) it reads 0.061834, 92.30%, 7061 positions, and 1.6.0 reads the same to the last digit. DeepSeek on 1.6.0 reads 0.6% above 1.5.1, equal to the 1.5.0 binary's reading of revision 2.0.
+1.7.0 reads Qwen STQ 2.75bpw 0.07% under 1.6.0 and DeepSeek 0.18% above it, both on Sushi Cooler. Its Qwen readings
+ran on `c59df290` and DeepSeek's on `b039659c`, the 1.7.0 code before its last merges, which touched no KLD path.
 On Sushi Cooler with no call into MLX from load to unload (`df84c004`, the row's flags with `--tokens 512 --top-k 10
 --ctx-size 8192 --no-mtp`, AC power) DeepSeek reads 0.210305, 86.46%, 7533 positions: 1.6.0's reading on MLX.
 With the router's product in fixed tiles (`f71dfd5c`, the same flags) it reads 0.211004, 86.51%, 7533 positions: +0.33%
