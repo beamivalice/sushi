@@ -17,8 +17,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-arch-seam](engine-
   The engine therefore needs a way to declare an arch that is on Sushi Cooler with no opt-out ([seam R1](#r1)).
 - The existing archs' MLX opt-outs (`--ds41-mlx-engine`, `--qwen-mlx-engine`) stay through 1.7, 1.8 and 1.9.
 - From 2.0, sushi is Sushi Cooler only, with no MLX route for any arch.
-- Text first, then images. Video and the DFly2 drafter are outside the 1.8.0 core
-  ([open questions](#open-questions)).
+- Text first, then images, then the DFly2 drafter: all three ship in 1.8.0. Video is outside 1.8.0.
 
 ## Sources
 
@@ -109,7 +108,8 @@ Sushi reads the checkpoint's own names, as DeepSeek's loader does.
 | vision merger (two convs, newline) | — | new arch code |
 | chat template, tool calls | the Zig Jinja engine; GLM's `arg_key` tool-call family | reused as is; tool calls with a parameter (the `:opensource` tag spelling) |
 | prefix cache restore point | DeepSeek's whole-state checkpoint and row segments | reused with a parameter |
-| DFly2 drafter | — | new arch code (outside the 1.8.0 core) |
+| 8-bit KV latent (default) | the attention core and the row writes | new kernel arms: e4m3 tiles with f32 scales, rope dims BF16 ([KV width](#kv-width)) |
+| DFly2 drafter | DSpark's block rounds (`dspark_rows.zig`, the drafter slot's `dspark_rounds`) | round machinery reused with a parameter (block 6, a mask token for the noise rows); the drafter's forward is new arch code |
 
 ## The forward, component by component
 
@@ -297,17 +297,44 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
 
 ### Drafter: DFly2
 
-- **What the checkpoint holds**: 5 layers. Each has MLA attention with a sink, a gate and a post norm (no indexer),
-  and a dense SwiGLU MLP. Around them sit `mtp_fusion` (`enorm`, `hnorm`, `eh_proj`, a `gate`), `hidden_correction`
-  (a gated MLP over an embedding norm and a hidden norm), `confidence_head` and `final_norm`.
-- **What the README and config say**: the draft layers share the target's KV cache and the indexer's selection at
-  layers 25, 29, 33, 37 and 41 (`dfly_target_kv_layers`). 5 draft tokens a round (block 6), mask token 120009,
-  probabilistic draft sampling.
+- **What the checkpoint holds** (shard 148's header):
+  - 5 layers, each with MLA attention in the sparse layers' shape: 32 heads, `q_a` 1024, its own `kv_a` (576), `kv_b`
+    `[14336, 512]`, a sink per head, the gate (8192) and `post_proj_norm`. No indexer.
+  - Each layer's dense SwiGLU MLP is 3072 → 9216 → 3072.
+  - Around them:
+    - `mtp_fusion`: `enorm`, `hnorm`, `eh_proj` `[3072, 6144]` over the two normed inputs, and a per-channel `gate`
+      `[3072]`;
+    - `hidden_correction`: a gated MLP, 6144 → 3072 → 3072, over `embed_norm` and `hidden_norm`;
+    - `confidence_head`: `[1, 3072]` plus a bias, one scalar a position;
+    - `final_norm`.
+  - There is no head of its own: the drafter reads the target's f32 head.
+  - 0.85B parameters, 1.69 GB BF16.
+- **What the README and config say**:
+  - Draft layer i shares the target's KV cache and the indexer's selection (up to 2048 positions,
+    `dfly_target_index_topk`) at target layer 25, 29, 33, 37 or 41 (`dfly_target_kv_layers`). It keeps no KV of its
+    own.
+  - 5 draft tokens a round (block 6) from one pass over the block, mask token 120009, probabilistic draft sampling.
+  - The fusion runs at slot 0 (`dfly_mtp_fusion: slot0`), with the hidden correction on and no local window
+    (`dfly_context_local_window: null`).
+  - The README says the drafter is not involved in prefill: the prefill-to-decode handover is the last layer's hidden
+    state.
 - **Pinned by**: README, `config.json` (`speculative_config`, `dfly_*`), the index. transformers ignores the keys
   (`_keys_to_ignore_on_load_unexpected`). llama.cpp#32517 drives a one-layer `model.mtp_layers.*` block instead,
   which the released checkpoint does not carry. No public modeling code for DFly2 was found.
-- **Cooler**: new arch code. Sushi's DFlash family (GLM's native tree, Qwen's generic round) is the nearest
-  machinery. Outside the 1.8.0 core: decode is serial first.
+- **The spec**: there is no public modeling code, so the README, the config and these tensors are the spec. Where
+  they leave the wiring open, part 1z settles it by measurement:
+  - which token's embedding and which position's hidden state reach `enorm`, `hnorm` and the correction;
+  - how the `gate` vector mixes the fusion;
+  - the block rows' rope positions;
+  - how the block's own `kv_a` rows join the target's selected rows;
+  - the confidence head's activation.
+- **Cooler**: in 1.8.0.
+  - The forward is new arch code.
+  - The rounds are DeepSeek's DSpark rounds, which already draft a block `[t, noise…]` in one pass on Sushi Cooler,
+    with verify, rollback and the adaptive row policy. Here the noise rows become mask rows and the block is 6.
+  - The drafter adds no KV bytes: its attention reads the target's rows and picks of the shared layers. Its block
+    rows live for one round.
+  - How parity is checked without a reference implementation: [parity plan](#dfly2-parity).
 
 ### Vision tower and merger
 
@@ -342,8 +369,20 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   `hy_start`; EOS 120025 is `hy_end`; pad is 120002.
 - **System turn**: a leading system turn always carries `<｜reasoning_mode:opensource｜>reasoning_effort:<e>` and,
   with tools, the tools prompt. The template synthesizes one when there is none.
-- **Effort words**: `no_think`, `high` (the default) and `max`. The generation prompt ends in
+- **Effort words**: the template takes `no_think`, `high` (its default) and `max`. The generation prompt ends in
   `<think:opensource>`, or `<think:opensource></think:opensource>` for `no_think`.
+- **Sushi's effort words** (owner's ruling):
+
+  | sushi | template | thinking budget |
+  |---|---|---|
+  | `off` | `no_think` | none |
+  | `low` | `high` | 2,048 tokens |
+  | `medium` | `high` | 16,384 tokens |
+  | `high` | `high` | uncapped |
+  | `xhigh` | `max` | uncapped |
+
+  The budgets are the effort table's caps (`effort:hy_v4_flash`), which an operator may change as on every arch.
+  Sushi's `max` word is not in the ruling ([open questions](#open-questions)).
 - **Tool calls**:
   `<tool_calls:opensource><tool_call:opensource>NAME<arg_key:opensource>K</arg_key:opensource><arg_value:opensource>V</arg_value:opensource>…</tool_call:opensource></tool_calls:opensource>`.
   Non-string values are written as JSON.
@@ -370,11 +409,14 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
 
 ## The state and the prefix cache
 
-- **Per token**: each sparse layer keeps its latent row (576 BF16) and, per completed group, its pooled index key
-  (128 BF16, rotated). That is 12 × 1,152 + 12 × 64 = **14,592 B a token**, 15.3 GB at 1,048,576 tokens. Token keys of
-  closed groups are not kept: a group's pooled key is final once its fourth token arrives.
+- **Per token**: each sparse layer keeps its latent row and, per completed group, its pooled index key (128 BF16,
+  rotated). Token keys of closed groups are not kept: a group's pooled key is final once its fourth token arrives.
+  - With the default 8-bit latent (656 B a row, [below](#kv-width)): 12 × 656 + 12 × 64 = **8,640 B a token**, 9.06 GB
+    at 1,048,576 tokens.
+  - With the BF16 latent (576 × 2 = 1,152 B a row): 12 × 1,152 + 12 × 64 = **14,592 B a token**, 15.3 GB at
+    1,048,576 tokens.
 - **Per request, fixed**:
-  - 30 sliding rings of 512 × 576 BF16: 17,694,720 B;
+  - 30 sliding rings of 512 latent rows: 10,076,160 B at 8 bits, 17,694,720 B at BF16;
   - each sparse layer's open group: up to 3 token keys of 128 BF16, 9,216 B in all;
   - the Engram history: the last 2 token ids.
 - **A restore point is the whole state at one position**, as DeepSeek's is ([dsv41-arch](dsv41-arch.md#prefix-cache)):
@@ -385,9 +427,28 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   
   A follow-up turn rolls the live state back to the deepest point at or below its shared prefix: rows are
   append-only, so a point is the fixed arrays plus each row buffer's used length. The SSD namespace tag names the
-  arch, the kernel arms and the KV dtype.
-- **KV dtype**: BF16, lossless against the reference. No quantized latent is planned: GLM's 8-bit latent is an
-  affine format, which leaves with MLX in 2.0.
+  arch, the kernel arms and the KV width (8 or 16), so a restore point never crosses widths.
+
+<a id="kv-width"></a>
+**KV width: an 8-bit latent by default, BF16 also served** (owner's ruling).
+- **The format**: per latent row, e4m3 codes for the 512 latent values in 4 tiles of 128, each tile with one f32
+  scale (its largest magnitude over 448), and the 64 rope values kept BF16. That is 512 + 16 + 128 = **656 B a row**,
+  against 1,152 at BF16.
+  - It is the layout of DeepSeek's public FP8 sparse cache in [FlashMLA](https://github.com/deepseek-ai/FlashMLA).
+  - It has no zero point, so it is not an affine format and stays on Sushi Cooler past 2.0. GLM's 8-bit latent is
+    affine and leaves with MLX.
+- **What it covers**: the latent rows of the sparse layers and the sliding rings. The pooled index keys stay BF16:
+  they decide the selection, as GLM keeps its pooled index lossless.
+- **The widths are served** as `--kv-quant 8` (the default) and `--kv-quant 16`, as on GLM's latent.
+- **Error budget** (the design point to measure):
+  - An e4m3 code holds a value to within 2^-4 of it, relative, in the normal range (3 mantissa bits). The tile's
+    scale keeps its largest value at the top of that range.
+  - The error reaches K (the 512 latent values) and V (the same values) of every layer. The rope values, the
+    indexer and the pooling are exact.
+  - The budget is read as the KLD of the 8-bit latent against BF16 KV: the 8-category 16x512 fixture, with the BF16
+    checkpoint as the teacher. The reading goes to the owner beside the decode speed it buys (part 1y).
+  - A value more than about 2^14.8 below its tile's largest (448 over e4m3's smallest normal, 2^-6) falls into the
+    subnormal range and keeps fewer bits. That tail is what the KLD reading prices.
 
 ## The memory bill
 
@@ -399,8 +460,8 @@ On Sushi Cooler a bill is the exact bytes held plus `BILL_MARGIN_BYTES`, once
 | resident trunk (BF16 checkpoint) | ~14.7 GB: sliding attention 8.22, sparse attention 1.70, head widened to f32 1.48, shared experts 1.16, latent projections 0.77, embedding 0.74, dense FFN 0.25, Engram projections 0.19, router 0.13, indexer 0.06, hyper-connections 0.03; an STQ pack bills its banks' stored bytes |
 | expert cache | `--ssd-budget-gb` less the trunk, the union workspace, the selected slab and the bounce, as on every streamed load. A BF16 expert is 14,155,776 B; a layer's 512 are 7.25 GB, which is the prefill union workspace at BF16 |
 | Engram row caches | one `RowCache` per module, its rows times the row bytes (192 B BF16, 98 B as FP8 with a row scale), billed with the trunk |
-| state per token | 14,592 B (above), times the request's concrete context |
-| state per request | 17,703,936 B (rings and open groups) |
+| state per token | 8,640 B at the 8-bit default, 14,592 B at BF16 (above), times the request's concrete context |
+| state per request | 10,085,376 B at 8 bits, 17,703,936 B at BF16 (rings and open groups) |
 | per chunk of `C` rows at context `T` | the four streams (`4 × 3072 × C`, BF16, plus the f32 mix rows), the attention rows of the widest layer (64 heads), the routed union and its planes, the selection (`C × 2048` int32), the index scores (one tile of `C × tile` f32, never `C × T/4` whole, as DeepSeek's `indexStream`), the Engram rows of the chunk and the next (`C × 64 × 192` B host); each term is its arrays' exact bytes, pinned by a bill test against the engine's pool peak |
 | vision encode | the tower's per-sheet buffers, as Qwen's on Sushi Cooler (`EngineHeld`) |
 
@@ -519,25 +580,45 @@ seam is generalized first, as its own part, with every existing arch's bytes, bi
 **The teacher.**
 - The BF16 checkpoint, experts streamed, is the lossless KLD teacher for every pack ([quality-kld](quality-kld.md)).
 
+<a id="dfly2-parity"></a>
+**DFly2 without a reference implementation.** A drafter cannot change what the target emits, only how fast. Its
+checks are therefore two kinds: exactness, which needs no reference, and acceptance, which reads the spec's own
+claims off the release checkpoint.
+- **Exactness (the tiny, random drafter weights).**
+  - Greedy rounds give the serial greedy tokens byte for byte, at every accepted count, text and image.
+  - Seeded sampled rounds give the seeded serial request's tokens under the exact accept rule.
+  - A partial accept rolls the target's rows, open groups and Engram history back as DSpark's verify does.
+  - The drafter's reads of the shared layers' rows and picks equal the target's own, row for row.
+  - These hold whatever the drafter's weights are, so a random tiny proves them.
+- **Acceptance (the release checkpoint).** The trained wiring is the one the weights fit, and a wrong wiring
+  drafts near-misses that verify rejects.
+  - For each open wiring choice, the candidates run behind a test-only switch on a held prompt set (code, prose,
+    reasoning, agent traffic). The one with the clearly highest accepted tokens a round is kept, and its margin over
+    the next is recorded.
+  - Each component the spec names (the fusion gate, the hidden correction) is switched off once. It must lower
+    acceptance; a component whose removal raises it is wired wrong.
+  - The confidence head's output is held against the measured acceptance per slot. A head that ranks the slots as
+    they verify confirms its inputs are the trained ones.
+  - Where the margin between candidates is too small to call, the vLLM and SGLang images the README names are the
+    only other public trace of the wiring.
+
 <a id="open-questions"></a>
 ## Open questions
 
 1. **Engram norm ε**: torch's unset ε for a BF16 row is 2^-7, against llama.cpp's fp32 machine ε. Which one the
-   checkpoint was trained with decides the parity bar of every Engram layer.
+   checkpoint was trained with decides the parity bar of every Engram layer. Still open: the real-checkpoint parity
+   run (part 1r) decides it.
 2. **Engram FP8 in the GGUF**: which 8-bit type the table shard uses, and how its codes were scaled (one byte an
    element, no row scale stored).
 3. **Indexer ties**: torch's `topk` order among equal scores. Exact ties are common, since relu zeroes whole groups.
    DeepSeek's kernels tie to the lower index.
-4. **DFly2**: no public modeling code. The 1.8.0 scope (serial decode only, or DFly2 too) is the owner's call.
-5. **Effort words**: Hy4 has `no_think`, `high`, `max`. The mapping of sushi's `low`, `medium` and `xhigh` is the
-   owner's call.
-6. **Vision**: the encoder's GELU (erf in transformers, tanh in llama.cpp), and the unread `rope_2d_*` config keys.
-7. **KV dtype**: BF16 is lossless and costs 15.3 GB at 1M tokens; whether a narrower latent is worth an STQ-era
-   format of its own is a question for after the core.
-8. **The streams' dtype between sublayers**: BF16 as the reference rounds them, or f32 as llama.cpp keeps them;
+4. **Vision**: the encoder's GELU (erf in transformers, tanh in llama.cpp), and the unread `rope_2d_*` config keys.
+5. **The streams' dtype between sublayers**: BF16 as the reference rounds them, or f32 as llama.cpp keeps them;
    Cooler follows the reference.
-9. **Batched decode**: a streamed load serves one request at a time, as DeepSeek's does. Joining requests as rows on a
+6. **Batched decode**: a streamed load serves one request at a time, as DeepSeek's does. Joining requests as rows on a
    fully resident pack follows DeepSeek's `coolerRows`, after the core.
+7. **Sushi's `max` effort word**: the ruling maps `off` through `xhigh`. Whether `max` also takes the template's
+   `max`, or is refused, is the owner's call.
 
 ## Implementation plan
 
@@ -563,11 +644,13 @@ test first (TDD), then the subset of the suite its diff reaches. The seam parts 
 | 1n | sliding MLA layers on the tiny (ring, sink, gate, sandwich) | 1h, 1l | sliding layers' traces within the bars, prefill and decode |
 | 1o | sparse layers, dense phase, and the latent MoE on the tiny | 1n | every layer within the bars at contexts under the budget; router picks identical |
 | 1p | indexer pooling and selection on the tiny | 1f, 1o | pooled keys, scores and picks identical past slot 16; logits within 2e-3; chunked prefill gives the same state |
-| 1q | decode, chunked prefill, the request loop, chat face and tool-call parse | 1p | greedy tokens after a prefill equal the oracle's; the template byte-exact against `apply_chat_template` on its cases; format-corpus entries for the tool-call spelling |
-| 1r | the real checkpoint against llama.cpp | 1q | greedy tokens agree up to a recorded near-tie on the prompt set; logits cosine and top-k overlap recorded; each listed difference decided |
+| 1q | decode, chunked prefill, the request loop, chat face and tool-call parse | 1p | greedy tokens after a prefill equal the oracle's; the template byte-exact against `apply_chat_template` on its cases; format-corpus entries for the tool-call spelling; the effort words render and cap as ruled (`off` → `no_think`, `low` → `high` + 2,048, `medium` → `high` + 16,384, `high` → `high` uncapped, `xhigh` → `max`), pinned by a test |
+| 1r | the real checkpoint against llama.cpp | 1q | greedy tokens agree up to a recorded near-tie on the prompt set; logits cosine and top-k overlap recorded; each listed difference decided, the Engram norm ε among them |
 | 1s | bills: per token, per request, per chunk, exact bytes plus the margin | 1q | bill pins on the committed config; a live bill test holds the engine's pool peak under each bill |
 | 1t | warm and the pipeline manifest | 1s | a request compiles no kernel (`compiled inside a request` 0); `[pipelines]` cases as DeepSeek's |
 | 1u | prefix cache: restore points, row segments, namespace, live rollback | 1s | a restored turn's state and logits equal a cold prefill's, byte for byte, both tiers |
 | 1v | vision: tower parameters, merger, M-RoPE positions | 1q | merger output and the first image row's logits within the bars against the oracle's image case |
 | 1w | pack format, STQ only: the `pack-format` section, STQ experts and trunk, the Engram table forms | 1r | a tiny STQ pack loads and serves; served against its dense twin within DeepSeek's STQ bars; KLD measured against the BF16 teacher |
-| 1x | DFly2 drafter | 1u, owner's scope call | out of the 1.8.0 core unless the owner adds it |
+| 1x | DFly2 on the tiny: the loader (`model.dfly_layers.*`), the forward over the shared layers' rows and picks, DSpark's rounds with a mask block of 6 | 1u | greedy rounds equal serial greedy byte for byte at every accepted count, text and image; seeded sampled rounds equal the seeded serial request; rollback restores rows, open groups and Engram history; the drafter's reads equal the target's rows and picks; its bill adds weights and one round's block rows, no KV |
+| 1y | KV width: the 8-bit latent (e4m3 tiles of 128 with f32 scales, rope dims BF16) as the default, BF16 also served | 1u | both widths serve; a row's 8-bit round trip matches the format's reference within one e4m3 step; KLD of 8-bit against BF16 KV recorded (16x512 fixture, BF16 teacher); bills pinned for both widths (8,640 and 14,592 B a token); the prefix-cache namespace names the width and a restore never crosses it |
+| 1z | DFly2 on the release checkpoint: the open wiring settled, the adaptive round policy | 1x, 1r | each wiring choice's accepted tokens a round recorded with its margin; every spec-named component lowers acceptance when switched off; confidence ranks the slots as they verify; the round policy never loses to serial decode on the prompt set |
