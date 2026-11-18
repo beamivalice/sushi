@@ -543,11 +543,7 @@ pub fn testFlipTensorByte(fs: *const Fs, path: []const u8) !void {
     defer v.unpinFile(fs.allocator, pf, &.{});
     for (pf.placed) |pl| {
         if (pl.tensor == prefix_vfs.UNTAGGED) continue;
-        var one: [1]u8 = undefined;
-        const at = pl.off + pl.len / 2;
-        _ = try pl.file.readPositionalAll(fs.io, &one, at);
-        one[0] ^= 0x5a;
-        return pl.file.writePositionalAll(fs.io, &one, at);
+        return v.testFlipPlacedByte(pl);
     }
     return error.FileNotFound;
 }

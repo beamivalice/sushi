@@ -39,6 +39,7 @@ const responses_api = @import("responses_api.zig");
 const generation_stream = @import("generation_stream.zig");
 const http_conn = @import("http_conn.zig");
 const boot_gate = @import("boot_gate.zig");
+const fd_limits = @import("fd_limits.zig");
 const request_media = @import("request_media.zig");
 const arch_media = @import("arch/media.zig");
 const request_policy = @import("request_policy.zig");
@@ -740,6 +741,8 @@ pub fn serve(
     port: u16,
     cfg: server_state.ServerConfig,
 ) !void {
+    // Before the listener and the SSD tier take their descriptors.
+    fd_limits.raiseOpenFileLimit();
     server_state.server_config = cfg;
     // Before `Scheduler.init`: that call starts the model load and every load-time bill inside it
     // asks for the KV width.
@@ -1006,6 +1009,9 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.S
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
+    // Out of descriptors, every accept fails alike: the census is logged once, until an accept succeeds again, and the
+    // loop pauses between tries.
+    var fd_quota_logged = false;
 
     while (!server_state.shutdown_requested.load(.acquire)) {
         // Poll with 1-second timeout so we can check shutdown flag
@@ -1019,9 +1025,19 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.S
 
         const accepted_stream = listener.?.accept(io) catch |err| {
             if (server_state.shutdown_requested.load(.acquire)) break;
-            log.err("accept error: {}\n", .{err});
+            const pause_ms = fd_limits.acceptPauseMs(err);
+            if (pause_ms == 0) {
+                log.err("accept error: {}\n", .{err});
+                continue;
+            }
+            if (!fd_quota_logged) {
+                fd_quota_logged = true;
+                logFdQuota(allocator, err);
+            }
+            std.Io.sleep(io, .fromMilliseconds(pause_ms), .awake) catch {};
             continue;
         };
+        fd_quota_logged = false;
 
         // When the scheduler is engaged AND the model is pure-attention,
         // Spawn a per-connection thread so HTTP I/O for one request can
@@ -1053,6 +1069,13 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.S
         // Detach: a joinable handle dropped per request leaks a stack region; no spawn site may discard its handle.
         conn_thread.detach();
     }
+}
+
+fn logFdQuota(allocator: std.mem.Allocator, err: anyerror) void {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var line_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+    const c = fd_limits.takeCensus(allocator, &dir_buf) catch |e| return log.err("accept error: {s} (no census: {s})\n", .{ @errorName(err), @errorName(e) });
+    log.err("{s}\n", .{fd_limits.quotaLine(&line_buf, err, c)});
 }
 
 /// Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): stop the accept

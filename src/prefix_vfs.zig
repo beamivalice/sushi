@@ -35,6 +35,9 @@ const FRAME_HEAD = 12;
 pub const state_record_bytes: u64 = FRAME_HEAD + 1 + 8 + 3 * 8;
 /// `F_PUNCHHOLE` frees whole filesystem blocks only: APFS's are 4 KiB.
 const HOLE_ALIGN: u64 = 4096;
+/// Pack descriptors the layer holds at once, the pack being written among them: a tier of any size keeps this many
+/// open, so its descriptors never grow with its bytes.
+pub const max_open_packs = 16;
 
 /// One block of a file. `tensor` and `group` are the caller's tags and come back from `readPayload`.
 pub const Segment = struct {
@@ -97,9 +100,26 @@ const Ext = struct {
 };
 const Block = struct { pack: u32, off: u32, kind: Kind, refs: u32, verified: bool };
 const Ref = struct { ext: Ext, pack: u32, off: u32, kind: Kind };
-/// `unfilled` counts blocks placed in the pack that their `fillBlocks` has not written yet: the pack stays open.
+/// `on_disk`: its file was found at open or made here (a pack the journal names but the volume lacks reads as corrupt).
+/// `unfilled` counts blocks placed in the pack that their `fillBlocks` has not written yet: the pack stays.
 /// `holes` are the bytes `reclaim` punched out of its dead runs.
-const Pack = struct { file: ?File = null, size: u64 = 0, live_blocks: u32 = 0, live_bytes: u64 = 0, unfilled: u32 = 0, holes: u64 = 0, dead: DeadRuns = .{} };
+const Pack = struct { on_disk: bool = false, size: u64 = 0, live_blocks: u32 = 0, live_bytes: u64 = 0, unfilled: u32 = 0, holes: u64 = 0, dead: DeadRuns = .{} };
+
+/// The open pack descriptors, at most `max_open_packs`: the pack being written stays open, the others open on demand
+/// and the least recently used one no call is using closes first. Taken after the Vfs lock, never before it.
+const PackFiles = struct {
+    mutex: std.Io.Mutex = .init,
+    slots: [max_open_packs]?Slot = @splat(null),
+    clock: u64 = 0,
+    writing: ?u32 = null,
+
+    /// `dropped`: the pack went while a call used it; its last user closes it.
+    const Slot = struct { id: u32, file: File, users: u32, used: u64, dropped: bool = false };
+};
+
+/// A pack's descriptor for one call, given back by `releasePack` before the call returns. `cached` is false for one
+/// opened while every slot was in use: its release closes it.
+const PackUse = struct { id: u32, file: File, cached: bool };
 /// A pack's dead byte runs, merged, by both ends: a run that dies beside another joins it, so the pages they share
 /// are freed too.
 const DeadRuns = struct {
@@ -183,7 +203,7 @@ const Fill = struct {
     const Slot = union(enum) {
         empty,
         shared: Ext,
-        at: struct { ext: Ext, pack: u32, off: u32, file: File },
+        at: struct { ext: Ext, pack: u32, off: u32 },
         repeat: usize,
     };
 
@@ -432,6 +452,7 @@ pub const Vfs = struct {
 
     blocks: std.AutoHashMapUnmanaged(Key, Block) = .empty,
     packs: std.AutoHashMapUnmanaged(u32, Pack) = .empty,
+    files: PackFiles = .{},
     active: ?u32 = null,
     next_pack: u32 = 0,
 
@@ -507,11 +528,12 @@ pub const Vfs = struct {
         self.removeNode(.{ .dir = self.root }, false);
         self.blocks.deinit(a);
         var pit = self.packs.valueIterator();
-        while (pit.next()) |p| {
-            if (p.file) |f| f.close(self.io);
-            p.dead.deinit(a);
-        }
+        while (pit.next()) |p| p.dead.deinit(a);
         self.packs.deinit(a);
+        for (&self.files.slots) |*s| if (s.*) |sl| {
+            sl.file.close(self.io);
+            s.* = null;
+        };
         self.holes.deinit(a);
         var tit = self.tickets.valueIterator();
         while (tit.next()) |t| {
@@ -705,7 +727,7 @@ pub const Vfs = struct {
                     slot.* = .{ .repeat = j };
                 } else {
                     const at = try self.place(e.len);
-                    slot.* = .{ .at = .{ .ext = e, .pack = at.pack, .off = at.off, .file = at.file } };
+                    slot.* = .{ .at = .{ .ext = e, .pack = at.pack, .off = at.off } };
                     first.putAssumeCapacity(e.key(), i);
                     placed += e.len;
                 }
@@ -736,16 +758,26 @@ pub const Vfs = struct {
         defer fill.deinit(a);
 
         var failed: ?anyerror = null;
+        var use: ?PackUse = null;
         for (fill.slots, fill.payload.segments) |slot, sg| switch (slot) {
             .at => |at| {
                 self.passGate(.pack_write);
-                at.file.writePositionalAll(self.io, sg.bytes, at.off) catch |e| {
+                if (use == null or use.?.id != at.pack) {
+                    if (use) |u| self.releasePack(u);
+                    use = null;
+                    use = self.usePack(at.pack) catch |e| {
+                        failed = e;
+                        break;
+                    };
+                }
+                use.?.file.writePositionalAll(self.io, sg.bytes, at.off) catch |e| {
                     failed = e;
                     break;
                 };
             },
             else => {},
         };
+        if (use) |u| self.releasePack(u);
         const exts = a.alloc(Ext, fill.slots.len) catch |e| {
             failed = failed orelse e;
             self.lock();
@@ -984,9 +1016,9 @@ pub const Vfs = struct {
 
     // ------------------------------------------------------------ public: lock-free reads
 
-    /// One extent of a file where a reader finds it: its pack file and offset, its tags, its hash, and whether this
+    /// One extent of a file where a reader finds it: its pack and offset, its tags, its hash, and whether this
     /// process has checked its bytes against the hash.
-    pub const Placed = struct { file: File, off: u64, len: u32, tensor: u32, group: u32, xxh: u64, verified: bool };
+    pub const Placed = struct { pack: u32, off: u64, len: u32, tensor: u32, group: u32, xxh: u64, verified: bool };
 
     /// A file's extents in order, pinned: no pack under them goes until `unpinFile`, so a reader reads them
     /// (`readPlaced`) with no lock held.
@@ -1003,7 +1035,8 @@ pub const Vfs = struct {
         for (exts, placed) |e, *pl| {
             const b = self.blocks.get(e.key()) orelse return error.VfsCorrupt;
             const p = self.packs.get(b.pack) orelse return error.VfsCorrupt;
-            pl.* = .{ .file = p.file orelse return error.VfsCorrupt, .off = b.off, .len = e.len, .tensor = e.tensor, .group = e.group, .xxh = e.addr.xxh, .verified = b.verified };
+            if (!p.on_disk) return error.VfsCorrupt;
+            pl.* = .{ .pack = b.pack, .off = b.off, .len = e.len, .tensor = e.tensor, .group = e.group, .xxh = e.addr.xxh, .verified = b.verified };
         }
         self.acquireAll(exts);
         return .{ .exts = exts, .placed = placed };
@@ -1013,8 +1046,38 @@ pub const Vfs = struct {
     pub fn readPlaced(self: *Vfs, pl: Placed, from: u64, dst: []u8) !void {
         if (from + dst.len > pl.len) return error.VfsCorrupt;
         self.passGate(.read);
-        const got = try pl.file.readPositionalAll(self.io, dst, pl.off + from);
+        const use = try self.usePack(pl.pack);
+        defer self.releasePack(use);
+        const got = try use.file.readPositionalAll(self.io, dst, pl.off + from);
         if (got != dst.len) return error.VfsCorrupt;
+    }
+
+    /// Test builds: puts `f` in pack `id`'s slot, opening the pack into one first, and returns the descriptor it held.
+    fn testSwapPackFile(self: *Vfs, id: u32, f: File) File {
+        self.releasePack(self.usePack(id) catch unreachable);
+        for (&self.files.slots) |*s| if (s.*) |*sl| if (sl.id == id) {
+            const old = sl.file;
+            sl.file = f;
+            return old;
+        };
+        unreachable;
+    }
+
+    /// Test builds: whether pack `id` holds an open descriptor.
+    fn testPackOpen(self: *Vfs, id: u32) bool {
+        for (self.files.slots) |s| if (s) |sl| if (sl.id == id) return true;
+        return false;
+    }
+
+    /// Test builds: flips one byte in the middle of a pinned extent on the volume, rot only its hash can tell.
+    pub fn testFlipPlacedByte(self: *Vfs, pl: Placed) !void {
+        const use = try self.usePack(pl.pack);
+        defer self.releasePack(use);
+        var one: [1]u8 = undefined;
+        const at = pl.off + pl.len / 2;
+        _ = try use.file.readPositionalAll(self.io, &one, at);
+        one[0] ^= 0x5a;
+        try use.file.writePositionalAll(self.io, &one, at);
     }
 
     /// Releases `pinFile`'s pins. `checked[i]` says the reader matched extent i's bytes to its hash, so later reads
@@ -1245,17 +1308,22 @@ pub const Vfs = struct {
         var done: usize = 0;
         for (self.holes.items) |h| {
             if (builtin.is_test) if (self.punch_limit) |n| if (done == n) break;
+            const p = self.packs.getPtr(h.pack);
+            if (self.holes_refused or p == null or !p.?.on_disk) {
+                done += 1;
+                continue;
+            }
+            // A pack that cannot open now keeps its holes queued for the next reclaim.
+            const use = self.usePack(h.pack) catch break;
             done += 1;
-            if (self.holes_refused) continue;
-            const p = self.packs.getPtr(h.pack) orelse continue;
-            const f = p.file orelse continue;
-            const err = punchHole(f, h.off, h.len);
+            const err = punchHole(use.file, h.off, h.len);
+            self.releasePack(use);
             if (err != .SUCCESS) {
                 self.holes_refused = true;
                 log.warn("  [prefix-vfs] the volume refuses to free a pack's dead pages ({s}): they now go only with their pack\n", .{@tagName(err)});
                 continue;
             }
-            p.holes += h.len;
+            p.?.holes += h.len;
             freed += h.len;
         }
         const left = self.holes.items.len - done;
@@ -1419,7 +1487,9 @@ pub const Vfs = struct {
         if (p.size + bytes.len > std.math.maxInt(u32)) return error.BlockTooLarge;
         try self.blocks.ensureUnusedCapacity(a, 1);
         self.passGate(.pack_write);
-        try p.file.?.writePositionalAll(self.io, bytes, p.size);
+        const use = try self.usePack(id);
+        defer self.releasePack(use);
+        try use.file.writePositionalAll(self.io, bytes, p.size);
         self.blocks.putAssumeCapacity(e.key(), .{ .pack = id, .off = @intCast(p.size), .kind = kind, .refs = 0, .verified = true });
         p.size += bytes.len;
     }
@@ -1434,7 +1504,7 @@ pub const Vfs = struct {
     }
 
     /// Room for a block of `len` bytes at the end of the active pack, counted in its size now and written later.
-    fn place(self: *Vfs, len: u32) !struct { pack: u32, off: u32, file: File } {
+    fn place(self: *Vfs, len: u32) !struct { pack: u32, off: u32 } {
         if (self.active) |id| {
             const p = self.packs.getPtr(id).?;
             if (p.size > 0 and p.size + len > self.opts.pack_limit) self.active = null;
@@ -1446,17 +1516,99 @@ pub const Vfs = struct {
         const off: u32 = @intCast(p.size);
         p.size += len;
         p.unfilled += 1;
-        return .{ .pack = id, .off = off, .file = p.file.? };
+        return .{ .pack = id, .off = off };
     }
 
     fn newPack(self: *Vfs) !void {
-        var name_buf: [32]u8 = undefined;
-        const name = packName(&name_buf, self.next_pack);
-        const f = try self.vdir.createFile(self.io, name, .{ .read = true, .truncate = true });
-        errdefer f.close(self.io);
-        try self.packs.put(self.allocator, self.next_pack, .{ .file = f });
-        self.active = self.next_pack;
+        const id = self.next_pack;
+        try self.packs.ensureUnusedCapacity(self.allocator, 1);
+        {
+            const fc = &self.files;
+            fc.mutex.lockUncancelable(self.io);
+            defer fc.mutex.unlock(self.io);
+            const slot = self.freeSlot();
+            const f = try self.openPackFile(id, true);
+            if (slot) |s| s.* = .{ .id = id, .file = f, .users = 0, .used = fc.clock } else f.close(self.io);
+            fc.writing = id;
+        }
+        self.packs.putAssumeCapacity(id, .{ .on_disk = true });
+        self.active = id;
         self.next_pack += 1;
+    }
+
+    /// Pack `id`'s descriptor for one call: the cached one, else opened into a slot.
+    fn usePack(self: *Vfs, id: u32) !PackUse {
+        const fc = &self.files;
+        fc.mutex.lockUncancelable(self.io);
+        defer fc.mutex.unlock(self.io);
+        fc.clock += 1;
+        for (&fc.slots) |*s| if (s.*) |*sl| if (sl.id == id and !sl.dropped) {
+            sl.users += 1;
+            sl.used = fc.clock;
+            return .{ .id = id, .file = sl.file, .cached = true };
+        };
+        const slot = self.freeSlot();
+        const f = try self.openPackFile(id, false);
+        const s = slot orelse return .{ .id = id, .file = f, .cached = false };
+        s.* = .{ .id = id, .file = f, .users = 1, .used = fc.clock };
+        return .{ .id = id, .file = f, .cached = true };
+    }
+
+    fn releasePack(self: *Vfs, use: PackUse) void {
+        if (!use.cached) return use.file.close(self.io);
+        const fc = &self.files;
+        fc.mutex.lockUncancelable(self.io);
+        defer fc.mutex.unlock(self.io);
+        for (&fc.slots) |*s| if (s.*) |*sl| if (sl.file.handle == use.file.handle) {
+            sl.users -= 1;
+            if (sl.dropped and sl.users == 0) {
+                sl.file.close(self.io);
+                s.* = null;
+            }
+            return;
+        };
+        unreachable;
+    }
+
+    /// An empty slot, made by closing the least recently used idle pack when every slot is taken; null when every
+    /// slot is in use. Under `files.mutex`.
+    fn freeSlot(self: *Vfs) ?*?PackFiles.Slot {
+        for (&self.files.slots) |*s| if (s.* == null) return s;
+        return self.closeLru();
+    }
+
+    /// Closes the least recently used pack no call is using, the pack being written aside, and returns its slot.
+    /// Under `files.mutex`.
+    fn closeLru(self: *Vfs) ?*?PackFiles.Slot {
+        const fc = &self.files;
+        var lru: ?*?PackFiles.Slot = null;
+        for (&fc.slots) |*s| if (s.*) |sl| {
+            if (sl.users != 0 or sl.id == fc.writing) continue;
+            if (lru == null or sl.used < lru.?.*.?.used) lru = s;
+        };
+        const s = lru orelse return null;
+        s.*.?.file.close(self.io);
+        s.* = null;
+        return s;
+    }
+
+    /// Opens (or makes) pack `id`'s file. Past the process's descriptor quota it closes the least recently used idle
+    /// pack and tries once more. Under `files.mutex`.
+    fn openPackFile(self: *Vfs, id: u32, make: bool) !File {
+        var name_buf: [32]u8 = undefined;
+        const name = packName(&name_buf, id);
+        var retried = false;
+        while (true) {
+            const got = if (make)
+                self.vdir.createFile(self.io, name, .{ .read = true, .truncate = true })
+            else
+                self.vdir.openFile(self.io, name, .{ .mode = .read_write });
+            return got catch |e| {
+                if (e != error.ProcessFdQuotaExceeded or retried or self.closeLru() == null) return e;
+                retried = true;
+                continue;
+            };
+        }
     }
 
     fn packName(buf: []u8, id: u32) []const u8 {
@@ -1497,7 +1649,18 @@ pub const Vfs = struct {
     fn dropPack(self: *Vfs, id: u32) void {
         var kv = self.packs.fetchRemove(id) orelse return;
         kv.value.dead.deinit(self.allocator);
-        if (kv.value.file) |f| f.close(self.io);
+        {
+            const fc = &self.files;
+            fc.mutex.lockUncancelable(self.io);
+            defer fc.mutex.unlock(self.io);
+            if (fc.writing == id) fc.writing = null;
+            for (&fc.slots) |*s| if (s.*) |*sl| if (sl.id == id and !sl.dropped) {
+                if (sl.users == 0) {
+                    sl.file.close(self.io);
+                    s.* = null;
+                } else sl.dropped = true;
+            };
+        }
         var name_buf: [32]u8 = undefined;
         self.vdir.deleteFile(self.io, packName(&name_buf, id)) catch {};
         if (self.active == id) self.active = null;
@@ -1561,7 +1724,7 @@ pub const Vfs = struct {
                 at = @max(at, spans[i].end);
             }
             const p = self.packs.get(id) orelse continue;
-            if (p.file != null and p.size > at) self.markDead(id, at, @intCast(p.size - at));
+            if (p.on_disk and p.size > at) self.markDead(id, at, @intCast(p.size - at));
         }
     }
 
@@ -1569,8 +1732,10 @@ pub const Vfs = struct {
     fn readBlock(self: *Vfs, e: Ext, dst: []u8) !void {
         const b = self.blocks.getPtr(e.key()) orelse return error.VfsCorrupt;
         const p = self.packs.get(b.pack) orelse return error.VfsCorrupt;
-        const f = p.file orelse return error.VfsCorrupt;
-        const got = try f.readPositionalAll(self.io, dst, b.off);
+        if (!p.on_disk) return error.VfsCorrupt;
+        const use = try self.usePack(b.pack);
+        defer self.releasePack(use);
+        const got = try use.file.readPositionalAll(self.io, dst, b.off);
         if (got != dst.len) return error.VfsCorrupt;
         if (b.verified) return;
         self.verify_count += 1;
@@ -2086,7 +2251,8 @@ pub const Vfs = struct {
         self.snapshot_len = 0;
     }
 
-    /// Opens the pack files the replay named, trims what no record references, deletes the rest.
+    /// Opens the pack files the replay named, one at a time, trims what no record references, deletes the rest. No
+    /// pack stays open.
     fn attachPacks(self: *Vfs) !void {
         const a = self.allocator;
         var pdir = try self.vdir.openDir(self.io, "packs", .{ .iterate = true });
@@ -2102,13 +2268,14 @@ pub const Vfs = struct {
                 continue;
             };
             const f = try pdir.openFile(self.io, ent.name, .{ .mode = .read_write });
-            p.file = f;
+            defer f.close(self.io);
             const size = try f.length(self.io);
             const refd = self.seen_end.get(id) orelse 0;
             if (size > refd) {
                 self.recovered.pack_tail_bytes += size - refd;
                 try f.setLength(self.io, refd);
             }
+            p.on_disk = true;
             p.size = @min(size, refd);
         }
         for (stray.items) |id| {
@@ -2126,11 +2293,12 @@ pub const Vfs = struct {
         var best: ?u32 = null;
         var bit = self.packs.iterator();
         while (bit.next()) |kv| {
-            if (kv.value_ptr.file != null and (best == null or kv.key_ptr.* > best.?)) best = kv.key_ptr.*;
+            if (kv.value_ptr.on_disk and (best == null or kv.key_ptr.* > best.?)) best = kv.key_ptr.*;
         }
         if (best) |id| {
             if (self.packs.get(id).?.size < self.opts.pack_limit) self.active = id;
         }
+        self.files.writing = self.active;
     }
 };
 
@@ -3693,10 +3861,9 @@ test "prefix_vfs: a volume that refuses a punch keeps its dead bytes counted and
     defer ta.free(pack_path);
     const ro = try Dir.openFileAbsolute(tio, pack_path, .{});
     defer ro.close(tio);
-    const rw = v.packs.getPtr(id).?.file.?;
-    v.packs.getPtr(id).?.file = ro;
+    const rw = v.testSwapPackFile(id, ro);
     try testing.expectEqual(@as(u64, 0), v.reclaim());
-    v.packs.getPtr(id).?.file = rw;
+    _ = v.testSwapPackFile(id, rw);
     try testing.expect(v.holes_refused);
     try testing.expectEqual(dead, v.deadBytes());
     try testing.expectEqual(phys, v.physicalBytes());
@@ -3707,4 +3874,145 @@ test "prefix_vfs: a volume that refuses a punch keeps its dead bytes counted and
     const got = try v.readBytes(ta, "f5");
     defer ta.free(got);
     try testing.expectEqualSlices(u8, bufs[5], got);
+}
+
+/// The descriptors this process holds open, probed one by one below 4096.
+fn openFds() usize {
+    var n: usize = 0;
+    for (0..4096) |fd| {
+        if (std.c.fcntl(@intCast(fd), std.c.F.GETFD) != -1) n += 1;
+    }
+    return n;
+}
+
+fn highestFd(limit: u64) usize {
+    var top: usize = 0;
+    for (0..@min(limit, 4096)) |fd| {
+        if (std.c.fcntl(@intCast(fd), std.c.F.GETFD) != -1) top = fd;
+    }
+    return top;
+}
+
+fn packFileName(buf: []u8, i: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "f{d}", .{i}) catch unreachable;
+}
+
+test "prefix_vfs: the open pack descriptors stay bounded whatever the number of packs" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const packs = 3 * max_open_packs;
+    var bufs: [packs][2][]u8 = undefined;
+    for (&bufs, 0..) |*b, i| b.* = .{ try blob(4096, 2 * i + 1), try blob(4096, 2 * i + 2) };
+    defer for (bufs) |b| for (b) |x| ta.free(x);
+    var name_buf: [16]u8 = undefined;
+
+    const v = try openAt(&env, .{ .pack_limit = 8192 });
+    var reopened = false;
+    defer if (!reopened) v.close();
+    const bound = openFds() + max_open_packs;
+    for (bufs, 0..) |b, i| {
+        const segs = [_]Segment{ .{ .bytes = b[0] }, .{ .bytes = b[1] } };
+        _ = try v.create(packFileName(&name_buf, i), .{ .kind = .kv, .segments = &segs });
+        try testing.expect(openFds() <= bound);
+    }
+    try testing.expectEqual(@as(usize, packs), try packCount(&env));
+    // Every pack read, under the layer's lock and with none held, then written: its second block dies and is punched.
+    for (bufs, 0..) |b, i| {
+        const name = packFileName(&name_buf, i);
+        const got = try v.readBytes(ta, name);
+        defer ta.free(got);
+        try testing.expectEqualSlices(u8, b[0], got[0..4096]);
+        try testing.expect(openFds() <= bound);
+    }
+    for (bufs, 0..) |b, i| {
+        const pf = try v.pinFile(ta, packFileName(&name_buf, i));
+        defer v.unpinFile(ta, pf, &.{});
+        var got: [4096]u8 = undefined;
+        try v.readPlaced(pf.placed[1], 0, &got);
+        try testing.expectEqualSlices(u8, b[1], &got);
+        try testing.expect(openFds() <= bound);
+    }
+    for (bufs, 0..) |b, i| {
+        _ = try v.replace(packFileName(&name_buf, i), onePayload(.kv, b[0]));
+        try testing.expect(v.reclaim() > 0);
+        try testing.expect(openFds() <= bound);
+    }
+    v.close();
+    reopened = true;
+
+    const r = try openAt(&env, .{ .pack_limit = 8192 });
+    defer r.close();
+    try testing.expect(openFds() <= bound);
+    for (bufs, 0..) |b, i| {
+        const got = try r.readBytes(ta, packFileName(&name_buf, i));
+        defer ta.free(got);
+        try testing.expectEqualSlices(u8, b[0], got);
+        try testing.expect(openFds() <= bound);
+    }
+}
+
+test "prefix_vfs: a layer of more packs than the soft descriptor limit writes, reads and reopens" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const saved = try std.posix.getrlimit(.NOFILE);
+    defer std.posix.setrlimit(.NOFILE, saved) catch {};
+    // Room for the layer's directory, its journal and a listing beside the packs it keeps open.
+    const soft = highestFd(saved.cur) + 1 + 8 + max_open_packs;
+    try std.posix.setrlimit(.NOFILE, .{ .cur = soft, .max = saved.max });
+    const packs = soft + 8;
+    var name_buf: [16]u8 = undefined;
+
+    {
+        const w = try openAt(&env, .{ .pack_limit = 4096 });
+        defer w.close();
+        for (0..packs) |i| {
+            const b = try blob(4096, i + 1);
+            defer ta.free(b);
+            _ = try w.create(packFileName(&name_buf, i), onePayload(.kv, b));
+        }
+    }
+    const v = try openAt(&env, .{ .pack_limit = 4096 });
+    defer v.close();
+    try testing.expectEqual(@as(usize, packs), try packCount(&env));
+    for (0..packs) |i| {
+        const want = try blob(4096, i + 1);
+        defer ta.free(want);
+        const got = try v.readBytes(ta, packFileName(&name_buf, i));
+        defer ta.free(got);
+        try testing.expectEqualSlices(u8, want, got);
+    }
+}
+
+test "prefix_vfs: a pack open past the descriptor quota closes the least recently used idle pack and tries once more" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    var name_buf: [16]u8 = undefined;
+    var bufs: [3][]u8 = undefined;
+    for (&bufs, 0..) |*b, i| b.* = try blob(4096, i + 1);
+    defer for (bufs) |b| ta.free(b);
+    {
+        const w = try openAt(&env, .{ .pack_limit = 4096 });
+        defer w.close();
+        for (bufs, 0..) |b, i| _ = try w.create(packFileName(&name_buf, i), onePayload(.kv, b));
+    }
+    const v = try openAt(&env, .{ .pack_limit = 4096 });
+    defer v.close();
+    const saved = try std.posix.getrlimit(.NOFILE);
+    defer std.posix.setrlimit(.NOFILE, saved) catch {};
+    for (0..2) |i| ta.free(try v.readBytes(ta, packFileName(&name_buf, i)));
+
+    // No descriptor left: pack 2 opens in place of pack 0, the least recently used.
+    try std.posix.setrlimit(.NOFILE, .{ .cur = highestFd(saved.cur) + 1, .max = saved.max });
+    const got = try v.readBytes(ta, packFileName(&name_buf, 2));
+    defer ta.free(got);
+    try testing.expectEqualSlices(u8, bufs[2], got);
+    try testing.expect(!v.testPackOpen(0) and v.testPackOpen(1) and v.testPackOpen(2));
+
+    // Closing one pack frees no descriptor under the limit: the second try fails, and the open says why.
+    try std.posix.setrlimit(.NOFILE, .{ .cur = 3, .max = saved.max });
+    try testing.expectError(error.ProcessFdQuotaExceeded, v.readBytes(ta, packFileName(&name_buf, 0)));
+    try testing.expect(!v.testPackOpen(1) and v.testPackOpen(2));
 }

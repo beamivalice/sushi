@@ -113,6 +113,15 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
    handlers, `on_ready`, the pinned context, the route list and `chat in your browser:`. Then `releaseStartupPin` and
    `boot_gate.process.open`: a request that got the model earlier waits at the gate for this step, so it never runs
    before the context is pinned or the hooks are in.
+- **`serve` first raises the soft open-file limit** (`fd_limits.raiseOpenFileLimit`, before the listener and the SSD
+  tier): to the hard limit, capped at `kern.maxfilesperproc`, never lower, as Go does since 1.19. One line says what it
+  did: `[limits] open files: soft 256 -> 245760 (hard unlimited)`, `soft N, unchanged (hard H)`, or `raising it to N
+  failed (<error>); serving goes on`. Processes the server starts inherit the raised limit. Guards: `fd limits:`
+  (`fd_limits.zig`).
+- **Out of descriptors, the accept loop names the cause once and pauses** (`logFdQuota`, `fd_limits.acceptPauseMs`): on
+  `ProcessFdQuotaExceeded` or `SystemFdQuotaExceeded` it logs `accept error: <error>: N descriptors open of a soft limit
+  of S, K of them files under <dir>` (or sockets, pipes) and `accepts retried every 100 ms`, again only after an accept
+  succeeds, and waits `fd_quota_pause_ms` (100 ms) before the next poll: the listener stays readable, so it would spin.
 - The signal handlers stay after the load: until then SIGTERM (and `--parent-pid`) ends the process at once, as a
   load cannot be cancelled.
 - `SUSHI_TEST_LOAD_DELAY_MS` holds the startup load after its refusals (test seam, [envvar](envvar.md)). Guard:
@@ -500,6 +509,7 @@ The engine runs on the user's machine and reads no more of it than the job needs
 - aggregate readings only: system memory and CPU percent for `/metrics` and the status bar, wired bytes to wait out a
   Metal free (`status.zig`);
 - its own I/O timings (expert fills);
+- its own open descriptors, grouped by directory or kind, only when they run out (`fd_limits.takeCensus`);
 - other processes only to protect its own files, and only by path: `sushi update` refuses while a sushi binary runs from
   the install dir, `sushi repack` while any process holds a shard open.
 

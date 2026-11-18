@@ -666,6 +666,15 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   layer's entries (manifest mtime, a shared inode once) and deletes through it. The admin listing reads a layer
   read-only (`Options.read_only`: it replays the journal and changes no file, so a live tier's layer is safe) and
   lists its entries, file bytes and newest manifest as the plain files would.
+- **The layer holds at most `max_open_packs` (16) pack descriptors, whatever the tier's size** (`Vfs.usePack`,
+  `PackFiles`). The pack being written stays open; any other opens for the one call that reads, writes or punches it
+  and keeps its slot until the least recently used idle pack makes room. A call holds a descriptor only while it runs,
+  so a closed pack leaves no handle behind; a pack opened while every slot is in use closes at its release. An open
+  past the process's descriptor quota closes that idle pack and tries once more, then fails with the quota error. An
+  open layer keeps no pack open (`attachPacks` checks and trims each pack, one at a time). One descriptor per 1 GiB
+  pack once filled the soft limit of 256 a Terminal or launchd start inherits, and the server stopped accepting
+  connections. Guards: `the open pack descriptors stay bounded whatever the number of packs`, `a layer of more packs
+  than the soft descriptor limit`, `a pack open past the descriptor quota` (`prefix_vfs.zig`).
 - **A dead block's whole pages go back to the volume, as a plain file's go at its unlink** (`Vfs.reclaim`: `F_PUNCHHOLE`
   over a pack's merged dead runs; a pack still goes with its last live block). The tier reclaims at every GC and entry
   delete, the sibling sweep before it closes a layer, and an open queues every pack byte outside a live block, so a

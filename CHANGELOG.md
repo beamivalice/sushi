@@ -4,6 +4,13 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **A large SSD prompt cache no longer stops the server from accepting connections**: the cache keeps a fixed
+  handful of files open whatever its size, the server raises its open-file limit at startup and states it in a
+  `[limits]` line, and a server that runs out of descriptors says once how many are open and what holds most of them.
+  Thanks @nikolay-bratanov for the report (#104).
+
 ## v1.7.0 — Sushi Cooler by default, faster DeepSeek, a lighter prompt cache
 
 - **Qwen3.8 and DeepSeek-V4.1 run on Sushi Cooler, sushi's own Metal engine, by default**: every Qwen3.8 STQ pack and

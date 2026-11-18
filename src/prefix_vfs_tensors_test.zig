@@ -925,14 +925,9 @@ test "tensor files on the vfs: a flipped byte in any block of a file, header, fi
         const pf = try vfs.pinFile(ta, "a");
         const pl = pf.placed[i];
         vfs.unpinFile(ta, pf, &.{});
-        var one: [1]u8 = undefined;
-        const at = pl.off + pl.len / 2;
-        _ = try pl.file.readPositionalAll(tio, &one, at);
-        one[0] ^= 0x5a;
-        try pl.file.writePositionalAll(tio, &one, at);
+        try vfs.testFlipPlacedByte(pl);
         try testing.expectError(error.MlxError, loadMlx(vfs, "a"));
-        one[0] ^= 0x5a;
-        try pl.file.writePositionalAll(tio, &one, at);
+        try vfs.testFlipPlacedByte(pl);
     }
 
     var vfs = try Vfs.open(ta, tio, vroot, .{});

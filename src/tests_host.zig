@@ -70,6 +70,7 @@ test {
     _ = @import("kv_disk_writer.zig");
     _ = @import("disk_write_stats.zig");
     _ = @import("prefix_vfs.zig");
+    _ = @import("fd_limits.zig");
     _ = @import("xxh3.zig");
     _ = @import("restore_tape.zig");
     _ = @import("cache_stats.zig");
