@@ -817,7 +817,7 @@ test "cooler contract: a Cooler request ends with its pass closed and at most it
                     const rest = arch_cooler.restCap(&ld.config);
                     errdefer std.debug.print("cooler contract: after a request over {d} tokens, {d} dispatches open, {d} B free in the pool beside {d} B asked, resting cap {d} B\n", .{ len, mlx.engine.openDispatches(), st.pool_free, st.pool_asked, rest });
                     try testing.expectEqual(@as(u32, 0), mlx.engine.openDispatches());
-                    try testing.expect(st.pool_bytes <= st.pool_asked +| rest);
+                    try testing.expect(st.pool_free <= rest);
                 }
             }
             _ = ld.close();

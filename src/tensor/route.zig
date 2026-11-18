@@ -7296,11 +7296,11 @@ test "engine: a turn to a Cooler model installs the budget that model last set, 
     }
     try std.testing.expectEqual(@as(?u64, 1 << 20), a);
     try std.testing.expectEqual(@as(?u64, 3 << 20), b);
-    const asked = core.stats().pool_asked;
+    const held = inUse();
     for ([_]struct { slot: *?u64, bytes: u64 }{ .{ .slot = &a, .bytes = 1 << 20 }, .{ .slot = &b, .bytes = 3 << 20 }, .{ .slot = &a, .bytes = 1 << 20 } }) |m| {
         const turn = turnToModel(true, m.slot);
         defer turn.end();
-        try std.testing.expectEqual(asked + m.bytes, core.poolLimit().?);
+        try std.testing.expectEqual(held + m.bytes, core.poolLimit().?);
     }
     // The model whose cap is in force keeps what `room` added to it.
     {
@@ -7322,6 +7322,12 @@ test "engine: a turn to a Cooler model installs the budget that model last set, 
 }
 
 /// Two Cooler models' turns under one hold, each test leaving no slot or cap of its own behind.
+/// What the tensors in use hold in the pool, which a budget counts from.
+fn inUse() u64 {
+    const st = core.stats();
+    return st.pool_bytes - st.pool_free;
+}
+
 const TurnFixture = struct {
     was_enabled: bool,
 
@@ -7349,7 +7355,7 @@ const TurnFixture = struct {
     }
 };
 
-test "engine: a turn inside another Cooler model's turn gives the outer model its cap back at its end, over what the pool asks then" {
+test "engine: a turn inside another Cooler model's turn gives the outer model its cap back at its end, over what the tensors in use hold then" {
     try mlx.requireGpu();
     const fx = TurnFixture.begin();
     defer fx.end();
@@ -7368,7 +7374,7 @@ test "engine: a turn inside another Cooler model's turn gives the outer model it
         try budget(3 << 20);
         inner_made = try TurnFixture.made(16 << 10);
     }
-    try std.testing.expectEqual(core.stats().pool_asked + (1 << 20), core.poolLimit().?);
+    try std.testing.expectEqual(inUse() + (1 << 20), core.poolLimit().?);
     try std.testing.expectEqual(&a, budget_slot.?);
 }
 
@@ -7388,7 +7394,7 @@ test "engine: work of no model inside a Cooler model's turn records nothing into
         try budget(5 << 20);
     }
     try std.testing.expectEqual(@as(?u64, 1 << 20), a);
-    try std.testing.expectEqual(core.stats().pool_asked + (1 << 20), core.poolLimit().?);
+    try std.testing.expectEqual(inUse() + (1 << 20), core.poolLimit().?);
 }
 
 test "engine: a Cooler model with no cap yet runs under none, never under the cap another model installed" {
@@ -7412,7 +7418,7 @@ test "engine: a Cooler model with no cap yet runs under none, never under the ca
     {
         const turn = turnToModel(true, &a);
         defer turn.end();
-        try std.testing.expectEqual(core.stats().pool_asked + (1 << 20), core.poolLimit().?);
+        try std.testing.expectEqual(inUse() + (1 << 20), core.poolLimit().?);
     }
 }
 
@@ -7429,7 +7435,7 @@ test "engine: what room adds to the cap in force is its model's, and that model'
         defer turn.end();
         try budget(1 << 20);
         room(&.{1 << 20});
-        try std.testing.expectEqual(core.poolLimit().? - core.stats().pool_asked, a.?);
+        try std.testing.expectEqual(core.poolLimit().? - inUse(), a.?);
     }
     {
         const turn = turnToModel(true, &b);
@@ -7439,7 +7445,7 @@ test "engine: what room adds to the cap in force is its model's, and that model'
     {
         const turn = turnToModel(true, &a);
         defer turn.end();
-        try std.testing.expectEqual(core.stats().pool_asked + a.?, core.poolLimit().?);
+        try std.testing.expectEqual(inUse() + a.?, core.poolLimit().?);
         try std.testing.expect(a.? >= 2 << 20);
     }
 }
@@ -7493,9 +7499,8 @@ test "engine: a Cooler model's turn after another's runs under its own cap, neve
     {
         const turn = turnToModel(true, &b);
         defer turn.end();
-        // Room for `z` beyond what the tensors in use already round up to: no more.
-        const st = core.stats();
-        try budget(st.pool_bytes - st.pool_free - st.pool_asked + @as(u64, @intCast(n)) * 4);
+        // Room for `z`: no more.
+        try budget(@as(u64, @intCast(n)) * 4);
         const z = try TurnFixture.made(n);
         _ = mlx.mlx_array_free(z);
     }

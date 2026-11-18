@@ -2798,9 +2798,8 @@ test "dsv41 engine: a restore point's copies take their own room in the pool, wh
     _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, prompt));
     // A later test sees no limit.
     defer mlx.engine.budget(1 << 62) catch {};
-    // A cap with nothing to spare: what the tensors in use hold, their buffers' rounding included.
-    const held = mlx.engine.stats();
-    try mlx.engine.budget(held.pool_bytes - held.pool_free - held.pool_asked);
+    // A cap with nothing to spare beyond what the tensors in use hold.
+    try mlx.engine.budget(0);
     const made = mlx.engine.pipelinesMade().count;
     var cp = try dsv41_prefix.capture(a, m, prompt.len);
     defer cp.deinit(a);
@@ -7122,10 +7121,10 @@ test "dsv41 engine: two Cooler loads in one process each find their own engine b
         try mlx.engine.budget(cap);
     }
     for ([_]usize{ 0, 1, 0 }) |i| {
-        const asked = mlx.engine.stats().pool_asked;
+        const st = mlx.engine.stats();
         const turn = arch_handle.turnFor(arch_handle.handleOf(&loads[i].xfm), &loads[i].config);
         defer turn.end();
-        try testing.expectEqual(asked + caps[i], mlx.engine.poolLimit().?);
+        try testing.expectEqual(st.pool_bytes - st.pool_free + caps[i], mlx.engine.poolLimit().?);
     }
 }
 

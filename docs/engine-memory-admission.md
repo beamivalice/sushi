@@ -484,6 +484,11 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   `ssm_cache.capBufAppend`), not by its transient bill. Billed as scratch, a 40,388-token cold turn reserving 256,000
   more (Qwen STQ 4bpw, kv8: 12 layers x 312 MiB of KV) outgrew its 4,096-row chunk's ~3.1 GB cap with `PoolOverBudget`
   (r-68). The contract cell `a served cold prefill past the reservation floor...` holds it on both cuts.
+- **A chunk's cap counts from the buffers in use, not their asks** (`core.budget`): a turn restored at 58,180 tokens
+  of a 58,334-token prompt (Qwen STQ 4bpw, kv8, reserving 256,000 more) holds 8.8 GB of state as its 154-row chunk's
+  564 MB cap goes in; at the refusal the pool held 9,366 MB for tensors asking 9,109 (257 MB of size rounding, no
+  free buffer left). Counted from the asks, that rounding came off the cap, and the chunk met `PoolOverBudget` asking
+  58 MB (one layer's K rebuild) beside 261 MB of its own. No bill term was short (r-70).
 - A decode or verify forward past its cache's capacity grows it before it builds (`KVCache.growAhead`, from
   `model_handle.forwardWith` for forwards of up to 64 rows): one buffer at a time, each the kept rows joined to a zero
   tail, evaluated, and its old copy released. The release is `mlx.engine.trim()` on the engine's stream:

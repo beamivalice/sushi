@@ -487,8 +487,10 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **The pool's bytes are published for other threads**: `core.poolTotal` and `core.poolFree` mirror `Stats.pool_bytes` and
   `pool_free` as atomics, stored where the pool changes; `gpu_mem` adds them to MLX's counters
   ([engine-memory-admission](engine-memory-admission.md#gpu-memory-readers)).
-- **A forward runs under a budget** (`core.budget`): Metal holds for the pool at most the budget beyond what the
-  tensors in use ask for, free buffers and size rounding included. A new buffer that would pass it first takes the
+- **A forward runs under a budget** (`core.budget`): Metal holds for the pool at most the budget beyond the buffers
+  the tensors in use hold when it goes in, free buffers and the size rounding of what is made after included. Counted
+  from what those tensors ask, the rounding of a restored long request's whole state (257 MB over 9.1 GB, under 1/16
+  a buffer) came off its next chunk's cap (r-70). A new buffer that would pass it first takes the
   room of free ones, the largest first (waiting for a pass that still binds them); with none left the op is refused
   (`PoolOverBudget`).
 - **What is made between forwards and outlives them asks for room** (`core.room`): a restore point's copies are taken

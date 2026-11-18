@@ -776,12 +776,14 @@ pub fn trim() void {
     s.pool_limit = limit;
 }
 
-/// From here Metal holds at most `bytes` for the pool beyond what the tensors in use ask for, free buffers
-/// included: a forward's cap, installed as it begins. Free buffers past it go now.
+/// From here Metal holds at most `bytes` for the pool beyond the buffers of the tensors in use, free buffers and the
+/// size rounding of what is made from here included: a forward's cap, installed as it begins. Free buffers past it
+/// go now. The base is what those tensors hold, not what they ask: a long request's state rounds up by hundreds of MB,
+/// which no forward's bill names.
 pub fn budget(bytes: u64) Error!void {
     const s = &(state orelse return);
     takeBack();
-    s.pool_limit = s.stats.pool_asked +| bytes;
+    s.pool_limit = (s.stats.pool_bytes - s.stats.pool_free) +| bytes;
     _ = try trimTo(s, s.pool_limit.?);
 }
 
@@ -1872,21 +1874,41 @@ test "under a budget the pool gives its free buffers up for a new one, and refus
     release(a);
     release(b);
     try sync();
-    // The budget counts what the tensors in use ask for; the free buffers past it go, the largest first.
+    // The budget counts from the buffers of the tensors in use; the free buffers past it go, the largest first.
+    const in_use = stats().pool_bytes - stats().pool_free;
     try budget(6 * mb);
     const held = stats();
-    try t.expect(held.pool_bytes <= held.pool_asked + 6 * mb);
+    try t.expect(held.pool_bytes <= in_use + 6 * mb);
     try t.expectEqual(@as(usize, 0), s.free[classOf(7 * mb + 5)].items.len);
     try t.expectEqual(@as(usize, 1), s.free[classOf(5 * mb + 5)].items.len);
     // A new size inside the budget takes the room of the free buffer.
     const c = try fresh(.uint8, &.{4 * mb + 5});
     try t.expectEqual(@as(usize, 0), s.free[classOf(5 * mb + 5)].items.len);
-    try t.expect(stats().pool_bytes <= held.pool_asked + 6 * mb);
+    try t.expect(stats().pool_bytes <= in_use + 6 * mb);
     // One past it is refused, and the pool is as it was.
     const before = stats().pool_bytes;
     try t.expectError(error.PoolOverBudget, fresh(.uint8, &.{9 * mb}));
     try t.expectEqual(before, stats().pool_bytes);
     release(c);
+}
+
+test "a budget bounds what is made after it, never the size rounding of the tensors in use before it" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    const s = try st();
+    const was = s.pool_limit;
+    defer s.pool_limit = was;
+    const mb = 1 << 20;
+    try sync();
+    trim();
+    // A tensor one byte past a size class holds its whole next class: 4 MB more than it asks at 64 MB.
+    const held = try fresh(.uint8, &.{64 * mb + 1});
+    defer release(held);
+    try t.expect(classBytes(classOf(64 * mb + 1)) - (64 * mb + 1) > 3 * mb);
+    const want = classBytes(classOf(8 * mb));
+    try budget(want);
+    const made = try fresh(.uint8, &.{8 * mb});
+    release(made);
 }
 
 test "under a budget the pool hands the open pass over for the free buffers it binds, rather than refuse" {
