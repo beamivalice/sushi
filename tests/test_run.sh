@@ -97,7 +97,7 @@ m_nolivebo() { mk "$1" test_x.sh tier=live; }
 m_badkey() { mk "$1" test_x.sh tier=host flavour=spicy; }
 m_badtier() { mk "$1" test_x.sh tier=slow; }
 m_bootnotlive() { mk "$1" bench_z.sh tier=bench boot=api; }
-m_packonapi() { mk "$1" test_x.sh tier=live boot=api pack=glm5; }
+m_packonapi() { mk "$1" test_x.sh tier=live boot=api pack=Some-Pack-4bpw; }
 m_second() { mk "$1" test_x.sh tier=host; printf '# sushi-test: boots=2\n' >> "$1/test_x.sh"; }
 m_folder() { mk "$1" other/test_x.sh tier=host; }
 m_norow() { mk "$1" test_new.sh tier=host; }
@@ -109,7 +109,7 @@ refused "a live script without boot=" "a live script needs boot=" m_nolivebo
 refused "an unknown header key" "unknown header key 'flavour'" m_badkey
 refused "an unknown tier" "tier 'slow' is not" m_badtier
 refused "boot= on a bench" "boot= is for tier=live only" m_bootnotlive
-refused "pack= on an api script" "pack= is for boot=own and tier=pack only" m_packonapi
+refused "pack= on an api script" "pack= is for boot=own and tier=pack" m_packonapi
 refused "a second line that is not needs=" "a second header line may only hold needs=" m_second
 refused "an unknown folder" "folder 'other' is not" m_folder
 refused "a script with no matrix row" "test_new.sh: no row in tests/CLAUDE.md" m_norow

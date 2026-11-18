@@ -1,11 +1,10 @@
 # Tests named for a model that stay outside src/<model>/ because they test shared code at that model's geometry.
 # Generated: python3 tests/suite_guards.py --write. One test name per line; it keys the name, not the file.
---drop-expert is refused on every arch but deepseek_v41, before the weights load
 --ds41-mlx-engine takes no value and keeps DeepSeek loads on MLX; a model of another arch loads as it would, its load naming the flag, and its model setting is ignored there
 --qwen-gdn is what parseConfig reads, on a loaded config; the f32 state is the default; GLM keeps its own gate
 --qwen-gdn takes 16 or 32 and nothing else
 --qwen-mlx-engine takes no value and keeps Flash-Next loads on MLX; a model of another arch loads as it would, its load naming the flag, and qwen_cooler is ignored there
-Cooler rows: a DeepSeek load serves one row, streamed or resident, and names why
+Cooler rows: a streamed DeepSeek load serves one row and names why; a fully resident one joins rows and names their cost
 DFlash block tail engages only for the native GLM drafter
 DeepSeek expert keys round trip and the layout claims only the trunk's experts
 DeepSeek vision serving: the processor carries the release's budgets, a placeholder expands to the whole span, and its encode is billed
@@ -54,7 +53,7 @@ Qwen3.8-Flash-Next thinks at medium effort by default, under the launch flag and
 Responses: a stored chain and an input replay render the same Qwen prompt
 a GLM raw FP8 config with another block size is refused by name
 a MiMo slot bills the decode rebuilds the other rows of its batched decode hold
-a Qwen or MiMo request owes no growth after admission, its reserved capacity is taken at its first grow
+a Qwen request commits its whole cache at admission, as admission counts what it is still to grow; MiMo commits none
 a freed MiMo slot returns its KV to the OS, not to MLX's pool
 a qwen4_exp config refusal keeps its own name in the 503 text
 a resident MiMo batches decode in groups of the FP8 GEMV's row-identical width; a streamed one stays serial
@@ -71,6 +70,14 @@ chat: Qwen's late-system edit reaches only a Qwen-typed config, never another ar
 chat: the embedded V4.1 template renders through the template engine byte-exact with DeepSeek's encoder
 chat: the shared Qwen test config places a late system turn as a Qwen load does
 chat: tool results a client sends out of call order render byte-exact with DeepSeek's encoder once the messages are ordered
+cooler contract: a Qwen prompt that re-renders an earlier reply restores from that turn's own point, written when the held points pass the cap
+cooler contract: a held Qwen restore point another conversation pushes out of RAM is written, not dropped, and restores
+cooler contract: a held Qwen restore point restores the same tokens as its file after a flush
+cooler contract: a held Qwen restore point whose write fails as it gives way to a staged write mid-commit leaves no listed point without bytes
+cooler contract: a regenerated Qwen turn restores from its own prompt end, live and after a flush
+cooler contract: a rewind past a Qwen conversation's held restore points restores from the grid point, the same tokens every time
+cooler contract: a served Qwen conversation keeps its newest off-grid restore points in RAM, writes none while the next turn extends them, and a flush writes the held ones
+cooler contract: held Qwen restore points give way to a staged write that needs the writer's permit
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line
 deepseek_v41 thinks by default, at its native high effort
 deepseek_v41: the image token spelled in a text-only prompt is text, with no placeholder check
@@ -145,6 +152,7 @@ mimo_v2 streaming discovery validates MXFP4 headers without a PLE table
 mimo_v2 warm bill credits only the restored global rows, never the ring
 mimo_v2 with an SSD tier bills a restored global layer beside its first grow
 mimo_v2: a 64k prompt keeps 2048 rows at every chunk where its box has room
+model_settings: expert_cache_bias shows only for a DeepSeek pack whose STQ experts stream
 mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial, DSpark does not
 mtpLookupAllowed: the qwen4 and MiMo heads, also at a pinned depth, never a batched head or a planner-owned round
 ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got
