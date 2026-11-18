@@ -432,7 +432,7 @@ pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const @import("../mo
 }
 
 /// The SSD namespace of one boot: `namespaceTag` plus what changes the numbers a stored state was computed
-/// under. `drop` is the ranked list in use; a non-zero `pick_tolerance` stores states built on cache-dependent
+/// under. `drop` is the ranked list in use; a non-zero `pick_tolerance` (or `--expert-cache-bias`) stores states built on cache-dependent
 /// picks, so no exact boot reads them. `attn_nax` is the attention arm that serves: the SIMD arm sums in another
 /// order, so its states are no NAX boot's, and so does the ALU hyper-connection mix (`hc_mix_nax` off). A composed boot (`fused` off) runs the op chains, and DSpark rounds that
 /// sum by width (`dspark_exact` off) change the verify rows; neither writes into the served namespace. A boot with
@@ -447,6 +447,8 @@ pub fn layoutKey(allocator: std.mem.Allocator, dspark: bool, attn_nax: bool, fus
     if (dspark and !dspark_exact) try key.appendSlice(allocator, "-dsparkinexact");
     if (drop) |d| try key.print(allocator, "-drop{d}-{x:0>16}", .{ d.n, d.digest() });
     if (pick_tolerance > 0) try key.print(allocator, "-pick{x:0>8}", .{@as(u32, @bitCast(pick_tolerance))});
+    const cache_bias = @import("../expert_stream.zig").cache_bias;
+    if (cache_bias > 0) try key.print(allocator, "-cbias{x:0>8}", .{@as(u32, @bitCast(cache_bias))});
     return key.toOwnedSlice(allocator);
 }
 
@@ -847,6 +849,14 @@ test "layoutKey: a boot that drops other experts or picks leniently has its own 
     try testing.expectEqualStrings(k8, k8_same);
     const distinct = [_][]const u8{ full, k8, k8_other, k16, k8_dspark, k_lossy, k_lossier, k8_lossy, k_simd, k8_simd, k_composed, k_composed_simd, k_dspark, k_dspark_inexact, k_dspark_composed };
     for (distinct, 0..) |x, i| for (distinct[i + 1 ..]) |y| try testing.expect(!std.mem.eql(u8, x, y));
+
+    // A cache-biased boot stores states no exact boot may read.
+    const expert_stream = @import("../expert_stream.zig");
+    expert_stream.cache_bias = 0.2;
+    defer expert_stream.cache_bias = 0;
+    const k_bias = try layoutKey(a, false, true, true, true, null, 0, true);
+    defer a.free(k_bias);
+    try testing.expect(std.mem.startsWith(u8, k_bias, full) and k_bias.len > full.len);
 }
 
 /// Thought tokens under which the prompt-end snapshot's re-prefill is cheap enough to skip a decode restore point.

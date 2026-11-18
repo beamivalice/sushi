@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`--expert-cache-bias <n>` (lossy, DeepSeek-V4.1, off by default)** scores an expert the layer's cache lacks n lower
+  at decode widths, so a streamed load reads fewer experts from SSD; unlike `--expert-pick-tolerance` it keeps the
+  routed chain queued ahead of the host.
 - **Qwen3.8 runs on Sushi Cooler, the engine of our own, by default**: its STQ packs and its BF16 checkpoint. Pass
   `--qwen-mlx-engine`, or clear the web UI's `qwen_cooler` checkbox, to keep it on MLX; the load line names the side.
 - **A Qwen3.8 load on Sushi Cooler runs its vision tower there too**, so images no longer need `--no-vision` or MLX; an
