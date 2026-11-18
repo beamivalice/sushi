@@ -121,20 +121,21 @@ Feature = unit test that fails without it (+ integration script if HTTP-observab
 red→fix→green. Refactor = characterization test first. A live failure revealing a CLASS ships the instance test plus a
 corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the matching doc.
 
-`zig build test-host` runs the MLX-free tier beside a live server. Hermetic suites: `-Dtest-filter="format corpus"`,
+`zig build test-host` runs the MLX-free tier beside a live server. Hermetic: `-Dtest-filter="format corpus"`,
 `-Dtest-filter="tool traffic"`. Live scripts and their matrix: `tests/CLAUDE.md`.
 
 - **A test never writes to stdout**: under `zig build test` fd 1 is the build runner's protocol pipe; one stray line
   hangs the runner.
 - **A PASSING test prints NOTHING, on either stream**: Zig renders any test stderr as a failure. Diagnostics ride an env
   switch (`SUSHI_EXL3_PARITY_TRACE`). Guard: `tests/test_test_runner_quiet.sh`.
-- **A test checks behaviour, never source text** (no `@embedFile` + "this string appears in that function").
+- **A test checks behaviour, never source text** (no `@embedFile` + "this string appears").
 - **A source pattern we never want is a lint rule**, as clippy does: one file in `scripts/lint/` on `std.zig.Ast`
   (never a regex), a red probe in `tests/test_lint.sh`, a reason per allowlist entry. `zig build lint` runs in every
   test step.
 - **An integration assertion that a MODEL must think/answer/call is a checkpoint expectation**: assert the INVARIANT,
   branch on the model's choice.
-- A first `zig build test` run sometimes fails and a re-run is green (Metal contention, benign).
+- **A test exists to catch an error a change can make.** A parity test against another engine goes once the new one
+  is proven; no check repeats over fixtures, lengths or arms on one code path.
 
 ## Releases and packs
 

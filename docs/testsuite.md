@@ -29,6 +29,12 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - A test of code no served path reaches. Dead code goes with its tests in the same commit.
 - An assertion that a model must think, answer or call a tool. Assert the invariant, branch on the model's choice.
 - A second copy of a check another test already makes on the same input with as strong an assertion.
+- A parity test between two engines (Sushi Cooler against MLX, a kernel against its replaced kernel) once the new
+  one is proven: it proves a fact, then repeats it on every run and catches nothing. It goes in the landing that
+  proves it, with its numbers in the commit; the oracle tests against a reference model stay.
+- A repetition: the same check over fixtures, prompt lengths, arms or sweep points that run the same code path.
+  One input per distinct path is the test; more catch no new error. A fault sweep refuses one point per distinct
+  error path, not every site at every ask.
 - A read of a field the test never set. A `= undefined` struct is garbage in ReleaseFast, and a field write into its
   nested config (`xfm.config.model_type = ...`) leaves `config.arch.tag`, which the arch dispatch reads, garbage too.
   A hand-built Trunk comes from `test_support.testTrunk(model_type)` (config and arch state defined), and the
