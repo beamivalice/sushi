@@ -40,9 +40,11 @@ pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u
     // The cap a forward runs under (`Config.forwardCap`) is its bill. The prefill's comes out of the decoder pools it
     // may release (`dsv41_borrow`); a decode forward's never does. On MLX the decode pool is parked beside either. On
     // a Cooler load the engine's pool is the cap itself (its free buffers are inside it) and MLX holds nothing.
-    const forward = @max(c.forwardCap(dsv41_borrow.verify_rows, seq), c.chunkCap(chunk, seq) -| bills.borrowableBytes(config));
+    const forward = @max(c.forwardCap(dsv41_borrow.verify_rows, seq), c.chunkCapOn(@import("../cooler_side.zig").onEngine(config), chunk, seq) -| bills.borrowableBytes(config));
     const work = forward +| (if (@import("../cooler_side.zig").onEngine(config)) 0 else config.expertPoolBytes());
-    return (held +| checkpointReserve(config, seq, chunk)) *| 5 / 4 +| work +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+    const stored = held +| checkpointReserve(config, seq, chunk);
+    // On Sushi Cooler the bill is exact (`bills.billMargin` adds the one margin); MLX keeps its calibrated quarter.
+    return (if (@import("../cooler_side.zig").onEngine(config)) stored else stored *| 5 / 4) +| work +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 
 /// A fully resident load joins rows (`dsv41_sched.coolerRows`): a request's decode state is its own, made at its first
@@ -58,7 +60,7 @@ pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_
 pub fn transientReserve(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64, seq: u64) ?u64 {
     _ = kv_bits;
     const c = config.dsv41 orelse return null;
-    return c.chunkCap(chunk, seq) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+    return c.chunkCapOn(@import("../cooler_side.zig").onEngine(config), chunk, seq) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 
 pub fn sessionBytes(config: *const model_mod.ModelConfig, kv_bits: u64) ?u64 {
@@ -104,7 +106,7 @@ pub fn prefillChunkLoadLine(config: *const model_mod.ModelConfig, buf: []u8, pin
 /// `dsv41_borrow.headroom_fn`: what admission reads as available, live.
 pub fn dsv41Headroom(config: *const model_mod.ModelConfig) u64 {
     const active_mem: u64 = gpu_mem.activeBytes();
-    return dsv41HeadroomFrom(bills.currentGpuMemoryCeiling(config, active_mem), active_mem, mlx.engine.poolFree(), config);
+    return dsv41HeadroomFrom(bills.liveGpuMemoryCeiling(config, active_mem), active_mem, mlx.engine.poolFree(), config);
 }
 
 /// PURE: `dsv41HeadroomOf` over the readings. `active` is `gpu_mem.activeBytes`, MLX's and the engine's bytes in use.

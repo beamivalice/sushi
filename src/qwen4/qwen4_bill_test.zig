@@ -710,29 +710,33 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     // the prompt's own rows, not a second copy of the cache.
     const terms = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
-    try t.expectEqual((2048 + chunk) * kv_per_tok, terms.reserved_kv_bytes);
+    const cap = bills.cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg));
+    try t.expect(cap >= seq + 2048 + chunk);
+    try t.expectEqual((cap - seq) * kv_per_tok, terms.reserved_kv_bytes);
     try t.expect(terms.reserved_kv_bytes * 4 < seq * kv_per_tok); // headroom, not a copy
     // The indexer history is billed at one copy plus the score bank (`statePerTokenBilled`).
     try t.expectEqual(cfg.qsaHistoryBytesPerToken() + cfg.qsaScoreBankBytesPerToken(), statePerTokenBilled(&cfg));
-    try t.expectEqual((seq + 2048 + chunk) * statePerTokenBilled(&cfg), terms.state_bytes);
+    try t.expectEqual(cap * statePerTokenBilled(&cfg), terms.state_bytes);
     try t.expectEqual(held, terms.checkpoint_bytes);
 
     // 3. The bill moved by more than 3 GB, toward a 503 instead of a corpse.
     const with_terms = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(&cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), terms);
     const without = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(&cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{});
     try t.expect(with_terms > without + 3_000_000_000);
-    // The sentinel runs through the same path: an omitted max_tokens must not move the bill past the context.
-    const sentinel: u64 = request_policy.omittedMaxTokensDefault(&cfg);
-    const with_sentinel = prefillRequestTerms(&cfg, seq, sentinel, 8, chunk, .{});
+    // The filled default runs through the same path: an omitted max_tokens must not move the bill past the context.
+    const filled: u64 = request_policy.filledMaxTokens(&cfg);
+    const with_filled = prefillRequestTerms(&cfg, seq, filled, 8, chunk, .{});
     const with_explicit = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
-    try t.expect(with_sentinel.reserved_kv_bytes < 8 * 1024 * 1024 * 1024);
-    try t.expect(with_sentinel.state_bytes < 4 * with_explicit.state_bytes);
-    try t.expectEqual(with_explicit.checkpoint_bytes, with_sentinel.checkpoint_bytes);
+    try t.expect(with_filled.reserved_kv_bytes < 8 * 1024 * 1024 * 1024);
+    try t.expect(with_filled.state_bytes < 4 * with_explicit.state_bytes);
+    try t.expectEqual(with_explicit.checkpoint_bytes, with_filled.checkpoint_bytes);
 
-    // A short prompt is untouched.
+    // A short prompt reserves nothing past itself, and is billed the cache its reply grows it to.
     const short = prefillRequestTerms(&cfg, 4096, 2048, 8, chunk, .{});
-    try t.expectEqual(@as(u64, 0), short.reserved_kv_bytes);
-    try t.expectEqual(4096 * statePerTokenBilled(&cfg), short.state_bytes);
+    const short_cap = bills.cacheCapacityTokens(&cfg, 4096, 2048, chunk, getEffectiveContextLength(&cfg));
+    try t.expect(short_cap >= 4096 + 2048);
+    try t.expectEqual((short_cap - 4096) * kv_per_tok, short.reserved_kv_bytes);
+    try t.expectEqual(short_cap * statePerTokenBilled(&cfg), short.state_bytes);
 }
 
 test "the QSA history is billed at the one copy a slot HOLDS, plus the score bank" {
@@ -749,7 +753,7 @@ test "the QSA history is billed at the one copy a slot HOLDS, plus the score ban
 
     const seq: u64 = 458_832;
     const terms = prefillRequestTerms(&cfg, seq, 2048, 8, 4096, .{});
-    try t.expectEqual((seq + 2048 + 4096) * (one + bank), terms.state_bytes);
+    try t.expectEqual(bills.cacheCapacityTokens(&cfg, seq, 2048, 4096, getEffectiveContextLength(&cfg)) * (one + bank), terms.state_bytes);
 
     var dense = model_mod.ModelConfig{};
     dense.num_hidden_layers = 32;
@@ -1176,13 +1180,15 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
     const cfg = fixtures.qwen4ExpLive364kConfig();
     const mb: u64 = 1024 * 1024;
     const kv_bits: u64 = 8;
-    // Turn A, width 2048, prompt 364,509, max_gen 421,923.
+    // Turn A, width 2048, prompt 364,509, max_gen 421,923: the reply is billed whole, so the turn the incident admitted
+    // at 13,269 MB is refused by name now unless 20,845 MB fit.
     try t.expectEqual(
-        @as(u64, 13_269),
+        @as(u64, 20_845),
         prefillNeededAtChunk(&cfg, 364_509, 421_923, kv_bits, 2048, .{}) / mb,
     );
+    // Turn B: 11,854 MB with the 8192-token headroom, 19,362 MB with its reply billed whole.
     try t.expectEqual(
-        @as(u64, 11_854),
+        @as(u64, 19_362),
         prefillNeededAtChunk(&cfg, 368_208, 418_224, kv_bits, 512, .{}) / mb,
     );
 }
@@ -1492,7 +1498,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     const chunk: u64 = 512;
     const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
-    const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg)), seq);
+    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
 
     // Pessimal reading of the entry: capacity exactly the rows it matched, so the append DOES
     // grow every attention layer.
@@ -1504,8 +1510,9 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u32, 1), attnLayersPerEvalWindow(&cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS));
     try t.expectEqual(@as(u64, 465), g.grow_coexist_bytes / mb);
     // The bill at the narrowest and a wider width.
-    try t.expectEqual(@as(u64, 5_057), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
-    try t.expectEqual(@as(u64, 6_548), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
+    // The reply is billed whole: 5,057 MB under the 8192-token headroom.
+    try t.expectEqual(@as(u64, 11_092), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
+    try t.expectEqual(@as(u64, 12_584), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
 
     // A buffer the previous turn sized above this prompt but below the reservation is grown to
     // it before the prefill writes, one attention layer per eval: one window of old rows.
@@ -1513,7 +1520,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     const f = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, fits);
     try t.expect(reserved > 450_048);
     try t.expectEqual(450_048 *| kv_per_tok / 12, f.grow_coexist_bytes);
-    try t.expectEqual(@as(u64, 5_059), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
+    try t.expectEqual(@as(u64, 11_094), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
 
     // Byte-identical arms: a SHARED restore is copied whole by the first append, so it credits
     // nothing and bills no window either; a COLD prompt has nothing to credit.
@@ -1532,9 +1539,9 @@ test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the 
     qwen4_qsa_select.qsa_score_fused_override = false;
     defer qwen4_qsa_select.qsa_score_fused_override = null;
     // A 383,067-token prompt with no `max_tokens` was admitted by eviction and then refused on
-    // the inference thread: `clampMaxTokens` made the reservation cover the whole context
-    // (~13 GB for a generation that would never run). The reservation exists to stop buffer
-    // coexistence during prefill, not to pre-buy a generation.
+    // the inference thread: the reservation covered the whole context (~13 GB for a generation
+    // that would never run). The reservation exists to stop buffer coexistence during prefill,
+    // not to pre-buy a generation.
     const KVCache = trunk.KVCache;
     const MB: u64 = 1024 * 1024;
     const cfg = fixtures.qwen4ExpOomConfig();
@@ -1542,20 +1549,23 @@ test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the 
     try t.expectEqual(@as(u64, 1_048_576), ctx);
     const seq: u64 = 383_067;
     const chunk: u64 = 4096;
-    const clamped: u64 = request_policy.clampMaxTokens(@intCast(request_policy.omittedMaxTokensDefault(&cfg)), @intCast(seq), @intCast(ctx));
-    try t.expectEqual(ctx - seq, clamped); // 665,509 — the live number
+    const clamped: u64 = request_policy.clampMaxTokens(request_policy.filledMaxTokens(&cfg), false, @intCast(seq), @intCast(ctx));
+    try t.expectEqual(@as(u64, request_policy.ENGINE_DEFAULT_MAX_TOKENS), clamped); // not ctx - seq = 665,509
 
-    // The reservation is bounded by the headroom, not by the context.
+    // The reservation is the request's whole cache: the prompt, the 32,768 tokens it may generate and a chunk.
     const reserved = KVCache.reservedTokens(seq, clamped, chunk, ctx);
-    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + chunk, reserved);
+    try t.expectEqual(@as(u64, 419_931), reserved);
     try t.expect(reserved < seq + ctx / 8);
     try t.expectEqual(seq + 512 + chunk, KVCache.reservedTokens(seq, 512, chunk, ctx));
     try t.expectEqual(ctx + chunk, KVCache.reservedTokens(ctx - 16, clamped, chunk, ctx));
 
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
+    // Billed at the capacity the cache allocates for it, the reservation at the cache's 256-row step.
+    const cap = bills.cacheCapacityTokens(&cfg, seq, clamped, chunk, ctx);
+    try t.expectEqual(@as(u64, 420_096), cap);
     const terms = prefillRequestTerms(&cfg, seq, clamped, 8, chunk, .{});
-    try t.expectEqual((KVCache.RESERVE_GEN_HEADROOM + chunk) * kv_per_tok, terms.reserved_kv_bytes);
-    try t.expectEqual(reserved * statePerTokenBilled(&cfg), terms.state_bytes);
+    try t.expectEqual((cap - seq) * kv_per_tok, terms.reserved_kv_bytes);
+    try t.expectEqual(cap * statePerTokenBilled(&cfg), terms.state_bytes);
 
     // ...and the whole bill drops by more than 10 GB, from above the live headroom to under it.
     const ctx_bounded: PrefillRequestTerms = .{
@@ -1822,7 +1832,7 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const off = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{});
     try t.expectEqual(@as(u64, 0), off.mtp_head_kv_bytes);
     const on = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{ .mtp_on = true });
-    const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg)), seq);
+    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
     try t.expectEqual(reserved * 2048, on.mtp_head_kv_bytes);
     const n: u64 = cfg.attnCacheLayerCount();
     try t.expectEqual(cfg.qsaRingBytes() + cfg.qsaRingBytes() / n, on.qsa_ring_bytes);
@@ -1857,7 +1867,7 @@ test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_q
     try t.expectEqual(@as(u64, 576), request_head);
     try t.expectEqual(@as(u64, 1088), mtpHeadKvBytesPerToken(&cfg));
     const on = prefillRequestTerms(&cfg, seq, max_tokens, request_bits, chunk, .{ .mtp_on = true });
-    const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg)), seq);
+    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
     try t.expectEqual(reserved * 1088, on.mtp_head_kv_bytes);
 }
 
@@ -1899,14 +1909,16 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
 
     // The bill term by term, from the same inputs `prefillMemoryNeeded` reads.
     const kv_bits: u64 = 8;
-    const max_tokens: u32 = 418_224;
+    // 8192 tokens of generation: the reservation the turn ran under (a max_tokens is billed whole now; the 418,224 the
+    // client sent would be refused by name).
+    const max_tokens: u32 = 8192;
     // The restored buffer is smaller than the reservation, so it grows and the rows it holds
     // are still credited. This block keeps the original turn-B decomposition by pricing the
     // SHARED restore of the same span, whose credit is zero for the other reason.
     const turn_b_donating = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = true };
     const turn_b = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = false };
     const reserve_rows = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
-    try t.expectEqual(seq + trunk.KVCache.RESERVE_GEN_HEADROOM + chunk, reserve_rows);
+    try t.expectEqual(seq + max_tokens + chunk, reserve_rows);
     try t.expect(reserve_rows > turn_b.capacity_tokens);
     try t.expectEqual(@as(u64, 0), turn_b.creditedRows(reserve_rows));
     try t.expectEqual(@as(u64, 364_478), turn_b_donating.creditedRows(reserve_rows));
@@ -1933,13 +1945,13 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
     try t.expectEqual(gross * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq), needed);
 
-    // AND THE VERDICT MOVES. 11,854 MB refused against 10,000 MB available;
-    // the honest checkpoint term brings it to 9,789 MB, so the turn is served.
+    // AND THE VERDICT MOVES. 11,857 MB refused against 10,000 MB available;
+    // the honest checkpoint term brings it to 9,793 MB, so the turn is served.
     const available: u64 = 10_000 * mb;
     try t.expect(needed < available);
-    try t.expectEqual(@as(u64, 9_789), needed / mb);
+    try t.expectEqual(@as(u64, 9_793), needed / mb);
     const before = gross - terms.checkpoint_bytes + @as(u64, launch_state.ssm_checkpoint_max) * per_cp;
-    try t.expectEqual(@as(u64, 11_854), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
+    try t.expectEqual(@as(u64, 11_857), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
     try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) > available);
 }
 
@@ -1963,4 +1975,112 @@ test "an arch without QSA bills its requests and transients free of the QSA kern
         const got = [2]u64{ prefillTransientReserve(&glm, 8, 4096), prefillNeededAtChunk(&glm, 70_000, 4096, 8, 4096, .{}) };
         if (first) |want| try t.expectEqualSlices(u64, &want, &got) else first = got;
     };
+}
+
+test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a reserved token costs its storage, no net" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    const whole_rebuild = qsaWholeRebuildGuard();
+    defer whole_rebuild.deinit();
+    qwen4_qsa_select.qsa_score_fused_override = false;
+    defer qwen4_qsa_select.qsa_score_fused_override = null;
+    // The live session's request on an STQ pack, which Sushi Cooler runs.
+    var cfg = fixtures.qwen4ExpLive364kConfig();
+    cfg.cooler_for_test = true;
+    cfg.expert_layout = .exl3_k4;
+    cfg.expert_quant_codebook = .spec1;
+    cfg.trunk_quant = null;
+    cfg.quant_bits = 0;
+    try t.expect(@import("../cooler_side.zig").onEngine(&cfg));
+    const ctx = getEffectiveContextLength(&cfg);
+    const seq: u64 = 364_509;
+    const short = bills.cacheCapacityTokens(&cfg, seq, 8192, 2048, ctx);
+    const long = bills.cacheCapacityTokens(&cfg, seq, 421_923, 2048, ctx);
+    // Each reserved token costs its KV and state, held at the pool's size class (at most a sixteenth over).
+    const pooled = struct {
+        fn of(b: u64) u64 {
+            return b + b / 16;
+        }
+    }.of;
+    const kv = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
+    const exact = pooled((long - seq) * kv) - pooled((short - seq) * kv) + pooled(long * statePerTokenBilled(&cfg)) - pooled(short * statePerTokenBilled(&cfg));
+    const held = bills.requestHeldBytes(&cfg, seq, 421_923, 8, 2048, .{});
+    try t.expectEqual(exact, held - bills.requestHeldBytes(&cfg, seq, 8192, 8, 2048, .{}));
+    // The bill is what it holds and the margin, once.
+    try t.expectEqual(held + bills.BILL_MARGIN_BYTES, prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}));
+    // Turn A of the live 364k session as a Cooler load: 15,457 MB exact with the margin, its chunk's transient from the
+    // layers' own rows (`qwen4_bill.PrefillRows`), where its MLX load keeps the calibrated net (20,845 MB).
+    try t.expectEqual(@as(u64, 15_457), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
+}
+
+test "a request refused by its bill names the bill, what is available and the largest max_tokens that fits" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    // The live session's request on an STQ pack.
+    var cfg = fixtures.qwen4ExpLive364kConfig();
+    cfg.expert_layout = .exl3_k4;
+    const kv = trunk.KVQuantConfig.affine(8);
+    const seq: usize = 364_509;
+    const asked: u32 = 421_923;
+    const mb: u64 = 1024 * 1024;
+    // Room for the prompt and 100,000 tokens of reply, not for the 421,923 asked.
+    const room = prefillNeededAtChunk(&cfg, seq, 100_000, 8, 2048, .{});
+    const bill = bills.AdmissionBill{ .needed = prefillNeededAtChunk(&cfg, seq, asked, 8, 2048, .{}), .available = room, .chunk = 2048 };
+    try t.expect(!bill.fits());
+    const refusal = bills.requestContextRefusal(&cfg, seq, asked, kv, bill, .{}) orelse return error.TestUnexpectedResult;
+    // The largest that fits: it fits, and one token more does not.
+    const fit = refusal.fitting_max_tokens;
+    try t.expect(fit >= 100_000 and fit < asked);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, fit, 8, 2048, .{}) <= room);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, fit + 1, 8, 2048, .{}) > room);
+    var buf: [512]u8 = undefined;
+    const msg = bills.memoryContextRefusalMessage(&buf, refusal);
+    var want: [3][64]u8 = undefined;
+    for ([_][]const u8{
+        try std.fmt.bufPrint(&want[0], "{d} MB", .{bill.needed / mb}),
+        try std.fmt.bufPrint(&want[1], "{d} MB", .{room / mb}),
+        try std.fmt.bufPrint(&want[2], "max_tokens {d}", .{fit}),
+    }) |part| if (std.mem.indexOf(u8, msg, part) == null) {
+        std.debug.print("refusal \"{s}\" does not name \"{s}\"\n", .{ msg, part });
+        return error.TestExpectedEqual;
+    };
+}
+
+test "a rate-grouped Flash-Next prefill chunk bills every plane its widest layer's down projection combines" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    var cfg = try model_mod.parseConfigFromJson(t.allocator, @embedFile("../fixtures/model-configs/qwen4_exp.json"));
+    defer cfg.deinit(t.allocator);
+    cfg.expert_layout = .exl3_k4;
+    var dense = cfg;
+    dense.num_experts = 0;
+    // The served STQ 2.75 pack: its widest layer spans 11 rate groups, and its warm's widest chunk is 8162 rows.
+    cfg.expert_rate_groups = 11;
+    const rows: u64 = 8162;
+    const sorted = rows * cfg.num_experts_per_tok;
+    // At the combine the chain holds, f16 over every sorted row: the gate and up inputs, the gate, up and SwiGLU
+    // planes, one down plane per group and the combined one.
+    const held = sorted * 2 * (@as(u64, cfg.hidden_size) * (2 + 11 + 1) + 3 * @as(u64, cfg.moe_intermediate_size));
+    try t.expectEqual(@as(u64, 6_163_942_400), held);
+    try t.expectEqual(held, (prefillStreamBytesPerToken(&cfg) - prefillStreamBytesPerToken(&dense)) * rows);
+    // The STQ 4bpw pack's two groups stay inside the fitted gather-sort expansion.
+    cfg.expert_rate_groups = 2;
+    const fitted = 4 * @as(u64, cfg.num_experts_per_tok) * 2 * (@as(u64, cfg.hidden_size) + cfg.moe_intermediate_size) * 2;
+    try t.expectEqual(fitted, prefillStreamBytesPerToken(&cfg) - prefillStreamBytesPerToken(&dense));
+}
+
+test "a Cooler prefill row bills the down GEMM's two planes in flight once, beside its peak kind" {
+    const t = std.testing;
+    var c = model_mod.ModelConfig{};
+    c.model_type = "qwen4";
+    c.hidden_size = 2560;
+    c.moe_intermediate_size = 640;
+    c.num_experts_per_tok = 10;
+    const r = @import("qwen4_bill.zig").coolerPrefillRows(&c);
+    try t.expectEqual(@as(u64, 10 * (2560 + 640) * 2), r.inflight);
+    try t.expectEqual(@max(@max(@max(r.gdn, r.attn), @max(r.moe, r.ple)), r.mtp) + r.trunk + r.inflight, r.peak());
 }

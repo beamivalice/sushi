@@ -183,6 +183,45 @@ fn pcQsaFeed(xfm: *trunk_mod.Trunk, entry: *SSMCacheEntry, keys: mlx.mlx_array, 
     try qwen4_qsa_state.qsaTestAppendPool(xfm, entry, chunk, 0, s);
 }
 
+test "Qwen SSD-only: a prefill chunk written before any SSM restore point leaves no SSD entry, and the chunk after one writes them both" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var tokens: [1024]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, 1024);
+    var live = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&live);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-qwen-wt-nocp", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.ssm_max_per_entry = kv_disk_cache.SSM_DISK_MAX_PER_ENTRY;
+    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+    hc.disk.?.enableBackgroundWriter();
+
+    // A first chunk below the restore-point grid: no checkpoint yet, so a cancel here must not leave a record.
+    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..512], false, .{}, null, &.{}, &live, std.math.maxInt(u64), s);
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entries.items.len);
+
+    var cp = try trunk_mod.captureSsmCheckpoint(testing.allocator, &live, 1024, s);
+    defer cp.deinit(testing.allocator);
+    var cps = [_]SSMCheckpoint{cp};
+    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..1024], false, .{}, null, &cps, &live, std.math.maxInt(u64), s);
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entries.items.len);
+    try testing.expectEqual(@as(usize, 1024), hc.disk.?.entries.items[0].tokens.len);
+}
+
 test "Qwen SSD-only: a prefill holds at most two checkpoint states, lists every position, and any of them restores from SSD exactly" {
     const io = std.testing.io;
     const s = mlx.gpuStream();

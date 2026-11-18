@@ -192,8 +192,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 ## Settings precedence
 
 - **An explicit launch flag outranks `model-settings.json`**, which outranks the default (`settings_resolve.resolve`,
-  the one resolver: `Setting(T) = { value, source: flag | model_settings | default }`; `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
-  `--mtp-greedy-tail`, `--ssd-budget-gb`, `--ssd-prefetch`, `--preserve-thinking`, `--think-penalty`, `--vision/--no-vision`, `--max-tokens`; a request's own field still applies on top. Design reviews reject "file beats
+  the one resolver: `Setting(T) = { value, source: flag | model_settings | default }`; `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`,
+  `--ssd-budget-gb`, `--ssd-prefetch`, `--preserve-thinking`, `--think-penalty`, `--vision/--no-vision`, `--max-tokens`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
 - **`--mtp-min-depth` / `--mtp-max-depth` are launch-only**: the range is a property of the machine, so it has no
   `model-settings.json` key ([engine-mtp](engine-mtp.md#depth-range)).
@@ -201,8 +201,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   rounds (Qwen, MiMo) and GLM DFlash2's lookup chains.
 - **A flag the operator did not pass is null, never a value beside a "given" bit.** A flag that shapes a LOAD is retained
   as `?T` on `LoadParams`, the Scheduler and the cold-load `LoadRequest` (a SECOND site): `mtp: ?bool`,
-  `kv_quant: ?KVQuantConfig`; read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. The process-wide ones are
-  `settings_resolve.launch` (`mtp_acceptance`, `mtp_greedy_tail`) and `settings_resolve.prefill_chunk` (a `Setting`
+  `kv_quant: ?KVQuantConfig`; read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. The process-wide one is
+  `settings_resolve.prefill_chunk` (a `Setting`
   whose source is `.flag` once `--prefill-chunk` is given); the prefix-cache asks carry a `Source`
   (`server_state.prefix_cache_mem_source`, `prefix_cache_disk_source`: `.flag`, `.model_settings` for
   `server.prefix_cache_disk_gb`, or `.default`). Each load logs its resolved value and source (`[kv-cache] kv8
@@ -220,7 +220,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - A load refused by `--max-resident-models` (every resident model serving a request) is a 503 `resident_models_cap`
   naming that flag, with `Retry-After`; `--max-resident-mem` is a 503 `out_of_memory` naming its own flag.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
-  `mtp`, `mtp_acceptance`, `mtp_greedy_tail`, `ssd_budget_gb`, `ssd_prefetch` (0..100; ignored with a log line on an arch with no expert prefetcher, whereas the flag is refused there), `preserve_thinking`, `think_penalty`, `logit_bias_file`, `vision`, `qwen_cooler` (bool, the same for Qwen3.8 and `--qwen-mlx-engine`; each arch reads only its own key, `arch_flags.coolerSettingOf`, and another arch's key is ignored with a log line), `ds41_cooler` (bool, default true: DeepSeek-V4.1 decodes on Sushi Cooler; false decodes on MLX, as `--ds41-mlx-engine` pins; ignored with a log line on other archs, disabled with its reason on the page for a pack or Mac Cooler cannot serve), `max_tokens`: the per-model twin of `--max-tokens`, a positive integer at most the model's context, the omitted-`max_tokens` budget of `ModelConfig.defaultMaxTokens`), stamped at BOTH load construction sites and resolved
+  `mtp`, `ssd_budget_gb`, `ssd_prefetch` (0..100; ignored with a log line on an arch with no expert prefetcher, whereas the flag is refused there), `preserve_thinking`, `think_penalty`, `logit_bias_file`, `vision`, `qwen_cooler` (bool, the same for Qwen3.8 and `--qwen-mlx-engine`; each arch reads only its own key, `arch_flags.coolerSettingOf`, and another arch's key is ignored with a log line), `ds41_cooler` (bool, default true: DeepSeek-V4.1 decodes on Sushi Cooler; false decodes on MLX, as `--ds41-mlx-engine` pins; ignored with a log line on other archs, disabled with its reason on the page for a pack or Mac Cooler cannot serve), `max_tokens`: the per-model twin of `--max-tokens`, a positive integer at most the model's context, the omitted-`max_tokens` budget of `ModelConfig.defaultMaxTokens`), `expert_cache_bias` (0..8, the twin of `--expert-cache-bias`, which wins; `ModelConfig.expertCacheBias` hands the load's own value to its expert engine and its prefix namespace; offered only to a DeepSeek-V4.1 STQ pack that streams), stamped at BOTH load construction sites and resolved
   ONCE in `doLoadOnInferenceThread` (`preserve_thinking` per render, where a request can override it, and logged as
   `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
   `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
@@ -262,8 +262,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `model_settings.model_keys` is the one list of editable per-model keys, and the loader applies exactly the values its `validate` accepts
   (one parse and one range: a hand-edited `ssd_budget_gb` over 512 is unset to both). The SSD ask (`server.diskAsk`) is atomic: the settings POST
   writes it from a connection thread, and every load, cold loads and their checkpoint stride included, reads it at load time rather than a boot snapshot.
-  A key that does not apply to an arch (`model_settings.applies`) is logged as ignored at load and listed as not applying by `GET /v1/settings` and `/props`
-  (`settings.mtp.acceptance_applies`); `ssd_prefetch` also logs that it is ignored on a DeepSeek pack without STQ experts. `model_settings.Fit` (built by `arch_flags.settingsFit` from a loaded config, by the settings API from a stub's files) is the one set of facts behind `applies`, `limit` and `refuseEdits`; add a gate there, never in the page (`Fit.prefetch` is the arch's `ExpertStreamTraits.prefetch`; the arch that has a prefetcher also keeps no KV cache and accepts drafts by the exact rule only). A `kv_quant` file value GLM's latent cannot store (4) is dropped at stamping with a warning, never a refused load. `SUSHI_MODELS_DIR` is a test variable the engine does not read.
+  A key that does not apply to an arch (`model_settings.applies`) is logged as ignored at load and listed as not applying by `GET /v1/settings`;
+  `ssd_prefetch` also logs that it is ignored on a DeepSeek pack without STQ experts. `model_settings.Fit` (built by `arch_flags.settingsFit` from a loaded config, by the settings API from a stub's files) is the one set of facts behind `applies`, `limit` and `refuseEdits`; add a gate there, never in the page (`Fit.prefetch` is the arch's `ExpertStreamTraits.prefetch`; the arch that has a prefetcher also keeps no KV cache). A `kv_quant` file value GLM's latent cannot store (4) is dropped at stamping with a warning, never a refused load. `SUSHI_MODELS_DIR` is a test variable the engine does not read.
 - **The prefix cache's other tiers are launch flags only**: RAM retention is off unless
   `--prefix-cache-mem` is given with a size (`off` or `0` keeps it off), and the SSD tier is on unless `--prefix-cache-disk 0`
   or `--prefix-cache-entries 0`, sized per model at load ([engine-prefix-cache](engine-prefix-cache.md#defaults)); its size alone has the
@@ -306,7 +306,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
     it, so a per-row forward and a padded one share the tick);
   - how a speculating slot ticks (`tickClass`: `mtp_group` joins the grouped verify or drops to a plain row when
     crowded, `rows_company` rides a plain grouped row when its model has company);
-  - what a request owns beside its KV (`initRequest`, `commitsAtCull`, `modelStateBytes`, `checkKvQuant`; the
+  - what a request owns beside its KV (`initRequest`, `commitsAtCull`, `modelStateBytes`, `parkedStateBytes`, `checkKvQuant`; the
     request's bytes, release and cull read the slot's own state, never a config) and how it commits, restores and writes through (`prepareCommit`,
     `commitOwn`, `publishLive`, `restoreTarget`, `writeThrough`, `mtpHeadCommit`, `handoffHistory`);
   - when a thought point is armed (`facts.thought_point`, `thoughtGrid`, `armThoughtPoint`, `afterSpecBlock`) and the
@@ -339,6 +339,10 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   GPU warm tick take the turn of the model they serve ([engine-own-forward](engine-own-forward.md#the-seam)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
+- **A media encode yields the same way after each image and each video frame group** (`EncodeSteps`): the boundary's
+  ticks run outside the encode's bill, and the slot's cancel flag stops it before the next step, freeing what it made.
+  A 60-frame 1080p video is 30 steps of about 4 s, where it held the thread 130 s. A request that arrives during the
+  encode still waits for the whole prefill: a yield ticks only streams already decoding.
 - `--prefill-decode-share S` (default 0.25) targets the fraction of wall time given
   to existing decoders during another request's prefill. Values above 0.9 clamp; negative values and NaN refuse.
   Zero preserves one decode tick per boundary; a nonzero share adds ticks until `chunk_ns*S/(1-S)` is spent or
@@ -468,7 +472,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   its tower call; an image its restored prefix holds is decoded once, for its key. Qwen, MiMo and GLM take the same
   path; Gemma's fixed square and `x-mlx-pixels` decode on the connection thread. The `Multimodal: encoded N of M` line gives decode and
   encode ms (a failed encode logs `Multimodal: the encode of ... failed after N ms` instead), and the encode counts in
-  the request's prefill time.
+  the request's prefill time, less the decode ticks its yields hosted.
 - **Media refusals are named**: an undecodable image is a 400 naming `messages[i]`/`input[i]` and the reason
   (`imageRejectReason`), an `input_audio` part a 400 unless the model encodes audio (`RequestMedia.accepts_audio`),
   more than `chat.MAX_REQUEST_IMAGES` (1024) a 400 with both counts, a prompt the media pushes past the context a 400

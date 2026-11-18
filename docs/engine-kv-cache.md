@@ -57,8 +57,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
 
 - Affine scales and biases retain the quantizer's activation dtype at allocation and growth; dense reconstruction returns that same dtype, so f16 attention does not widen through bf16 K/V.
 
-- KV growth is PROPORTIONAL (`nextCapacity` +25%, capped 8192). Past 32k a request reserves its capacity up front
-  (`KVCache.reservedTokens`); a ringed arch reserves always (`ModelConfig.reservesKvCapacity`). A shorter prompt of
+- KV growth is PROPORTIONAL (`nextCapacity` +25%, capped 8192). Past 32k a request reserves its whole cache up front
+  (`KVCache.reservedTokens`: prompt, `min(max_tokens, ctx - prompt)` and a chunk), so its decode never grows it; a
+  ringed arch reserves always (`ModelConfig.reservesKvCapacity`). A shorter prompt of
   several chunks reserves its own length (`prefill_plan.reservedPrefillTokens`, as the bill floors it), so its prefill
   grows each layer's buffers once, not once a chunk.
 - **A shared restore whose buffer is longer than the request reserves copies its rows into a request-sized buffer**

@@ -1246,6 +1246,16 @@ pub fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int {
     kernel_keys.kernelFree(cls);
     return raw_kernel.mlx_fast_metal_kernel_free(cls);
 }
+/// A kernel's one output written over `into` on the engine's stream (`engine.kernelApplyInto`); null where the stream
+/// is MLX's, which writes only fresh outputs.
+pub fn kernelApplyInto(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream, into: mlx_array) ?c_int {
+    if (!engine.enabled) return null;
+    return switch (engine.side(.{ inputs, config, s })) {
+        .engine => if (faultAtEntry()) 1 else engine.kernelApplyInto(outputs, cls, inputs, config, into),
+        else => null,
+    };
+}
+
 pub fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int {
     if (engine.enabled) switch (engine.side(.{ inputs, config, s })) {
         // The MLX path's entry is counted (`raw_kernel`); the engine's is this one.

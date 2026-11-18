@@ -68,6 +68,11 @@ assert.equal(pick('low'), '2048');
 assert.equal(pick('xhigh'), '');
 assert.equal(pick('off'), '');
 assert.equal(budget.disabled, true);
+// An emptied box says what the request then runs under: the word's own cap where it has one, never "no cap" over it.
+assert.equal((pick('low'), budget.placeholder), '2,048 (level cap)');
+assert.equal((pick('medium'), budget.placeholder), '8,192 (level cap)');
+assert.equal((pick('xhigh'), budget.placeholder), 'no cap');
+assert.equal((pick('off'), budget.placeholder), 'off');
 // A typed budget survives the model poll's re-render, and moves again only when the word or model does.
 pick('medium');
 budget.value = '3000';

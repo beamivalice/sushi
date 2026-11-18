@@ -402,6 +402,26 @@ pub const Fs = struct {
         const v = self.vfs orelse return free;
         return (free +| v.physicalBytes()) -| v.logicalBytes();
     }
+
+    /// Gives the volume back the layer's dead bytes, as a plain file's unlink already did.
+    pub fn reclaim(self: *const Fs) void {
+        const v = self.vfs orelse return;
+        _ = v.reclaim();
+    }
+
+    /// The bytes the tier's files hold on the volume: the layer's packs, journal and snapshot, less the snapshot's state
+    /// record an empty layer keeps (`prefix_vfs.state_record_bytes`); null on plain files, whose bytes are the tier's
+    /// own count.
+    pub fn heldBytes(self: *const Fs) ?u64 {
+        const v = self.vfs orelse return null;
+        return v.bytesBeyondEmpty();
+    }
+
+    /// Folds the layer's journal into its snapshot, so the records of what was deleted stop holding the volume.
+    pub fn compact(self: *const Fs) void {
+        const v = self.vfs orelse return;
+        v.compact() catch |err| log.warn("  [prefix-vfs] compacting the journal failed: {s}\n", .{@errorName(err)});
+    }
 };
 
 fn ownedBytes(a: Allocator, bytes: []const u8, kind: write_stats.Kind) !prefix_vfs.OwnedPayload {

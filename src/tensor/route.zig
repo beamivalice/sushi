@@ -587,6 +587,7 @@ pub fn poolRefusals() u64 {
 pub const poolPeak = core.poolPeak;
 pub const resetPoolPeak = core.resetPoolPeak;
 pub const poolHeldPeak = core.poolHeldPeak;
+pub const logPoolPeakTrace = core.logPoolPeakTrace;
 
 /// The engine's pool keeps no more free bytes than `bytes`, the limit MLX's cache was given beside it.
 pub fn setFreeCap(bytes: u64) void {
@@ -2072,6 +2073,33 @@ pub fn mlx_fast_metal_kernel_apply(outputs: *V, k: mlx.mlx_fast_metal_kernel, in
     return 0;
 }
 
+/// `mlx_fast_metal_kernel_apply` with its one output written over `into`, a tensor of ours (`kernel.launchInto`); an
+/// empty `into` makes the output fresh, bound as the launches written into it are (`kernel.launchDisjoint`).
+pub fn kernelApplyInto(outputs: *V, k: mlx.mlx_fast_metal_kernel, inputs: V, c: mlx.mlx_fast_metal_kernel_config, into: A) c_int {
+    if (into.ctx != null and !core.isOurs(into)) return fail("kernel_apply_into", core.refusing("the output to write over is not the engine's", error.TensorUnsupported));
+    const def = if (isKernel(k)) kernelOf(k) else defs.get(@intFromPtr(k.ctx)) orelse return fail("kernel_apply_into", core.refusing("the kernel was made before the engine was on", error.TensorUnsupported));
+    const cfg = if (isConfig(c)) configOf(c) else mirrors.get(@intFromPtr(c.ctx)) orelse return fail("kernel_apply_into", core.refusing("the config was made before the engine was on", error.TensorUnsupported));
+    if (cfg.partial) return fail("kernel_apply_into", core.refusing("the config holds more outputs or template arguments than the engine mirrors", error.TensorUnsupported));
+    const ins = takeAll(inputs) catch |e| return fail("kernel_apply_into", e);
+    defer releaseAll(ins);
+    var out_buf: [kernel.max_outputs]*Tensor = undefined;
+    const outs = out_buf[0..cfg.n_out];
+    (if (into.ctx == null) kernel.launchDisjoint(def, ins, cfg, outs) else kernel.launchInto(def, ins, cfg, outs, core.of(into))) catch |e| {
+        var what: [96]u8 = undefined;
+        return fail(std.fmt.bufPrint(&what, "kernel_apply_into {s}", .{def.name}) catch "kernel_apply_into", e);
+    };
+    const v = newVec() orelse {
+        for (outs) |t| core.release(t);
+        return fail("kernel_apply_into", error.OutOfMemory);
+    };
+    for (outs) |t| v.items.append(gpa, core.handle(t)) catch {
+        core.release(t);
+    };
+    if (outputs.ctx != null) _ = if (isVec(outputs.*)) mlx_vector_array_free(outputs.*) else mlx.raw.mlx_vector_array_free(outputs.*);
+    outputs.* = vecHandle(v);
+    return 0;
+}
+
 // ── Tests: each op against the MLX op it replaces ──
 
 const t_std = std.testing;
@@ -3378,10 +3406,12 @@ test "a mapped region the engine wraps is bound by a pass without a copy or a ca
     defer enabled = was;
     const Region = struct {
         var given_back: usize = 0;
+        // The engine may call `release` once the test has returned: the span it is handed outlives the test.
+        var span: [2]usize = undefined;
         fn release(payload: ?*anyopaque) callconv(.c) void {
             given_back += 1;
-            const span: *const [2]usize = @ptrCast(@alignCast(payload.?));
-            _ = std.c.munmap(@ptrFromInt(span[0]), span[1]);
+            const at: *const [2]usize = @ptrCast(@alignCast(payload.?));
+            _ = std.c.munmap(@ptrFromInt(at[0]), at[1]);
         }
     };
     Region.given_back = 0;
@@ -3392,12 +3422,12 @@ test "a mapped region the engine wraps is bound by a pass without a copy or a ca
     const ptr: [*]u8 = @ptrCast(mapped);
     const values: []f32 = @alignCast(std.mem.bytesAsSlice(f32, ptr[0 .. n * 4]));
     for (values, 0..) |*v, i| v.* = @floatFromInt(i);
-    var span = [2]usize{ @intFromPtr(ptr), len };
+    Region.span = .{ @intFromPtr(ptr), len };
     try core.sync();
     const calls = mlx.calls.load(.monotonic);
     const before = core.stats().mapped_bytes;
 
-    const t = try core.wrapMapped(ptr, .float32, &.{n}, &span, Region.release);
+    const t = try core.wrapMapped(ptr, .float32, &.{n}, &Region.span, Region.release);
     try t_std.expectEqual(@intFromPtr(ptr), @intFromPtr(t.store.ptr));
     try t_std.expectEqual(before + n * 4, core.stats().mapped_bytes);
     const x = core.handle(t);
@@ -3425,9 +3455,11 @@ test "a pass that binds the landed half of a wrapped slab runs while the other h
     enabled = true;
     defer enabled = was;
     const Region = struct {
+        // The engine may call `release` once the test has returned: the span it is handed outlives the test.
+        var span: [2]usize = undefined;
         fn release(payload: ?*anyopaque) callconv(.c) void {
-            const span: *const [2]usize = @ptrCast(@alignCast(payload.?));
-            _ = std.c.munmap(@ptrFromInt(span[0]), span[1]);
+            const at: *const [2]usize = @ptrCast(@alignCast(payload.?));
+            _ = std.c.munmap(@ptrFromInt(at[0]), at[1]);
         }
     };
     const len = 2 * std.heap.pageSize();
@@ -3437,8 +3469,8 @@ test "a pass that binds the landed half of a wrapped slab runs while the other h
     const ptr: [*]u8 = @ptrCast(mapped);
     const values: []f32 = @alignCast(std.mem.bytesAsSlice(f32, ptr[0..len]));
     for (values, 0..) |*v, i| v.* = @floatFromInt(i);
-    var span = [2]usize{ @intFromPtr(ptr), len };
-    const slab = core.handle(try core.wrapMapped(ptr, .float32, &.{n}, &span, Region.release));
+    Region.span = .{ @intFromPtr(ptr), len };
+    const slab = core.handle(try core.wrapMapped(ptr, .float32, &.{n}, &Region.span, Region.release));
     defer _ = mlx.mlx_array_free(slab);
     const s = core.stream();
     const half = @divExact(n, 2);
@@ -5680,7 +5712,9 @@ test "engine quantized matmul in affine bits 3, 5 and 6 gives MLX's bytes: the M
     // {rows, inner, outputs}: the coarse head (one row and a verify's eight against the vocab at hidden 2560), the
     // quad plan's inner widths, the wide plan, split-K and the tiles, aligned and not.
     const cases = [_][3]usize{ .{ 1, 2560, 248320 }, .{ 8, 2560, 8192 }, .{ 1, 128, 64 }, .{ 4, 64, 256 }, .{ 6, 1024, 3072 }, .{ 13, 5120, 1280 }, .{ 100, 1024, 1000 }, .{ 300, 2048, 1024 } };
-    inline for (.{ 3, 5, 6 }) |bits| for (cases) |c| {
+    inline for (.{ 3, 5, 6 }) |bits| for (cases, 0..) |c, ci| {
+        // The 248320-wide coarse head is built once, at 3 bits; its width is what it adds, and every other plan runs all three.
+        if (ci == 0 and bits != 3) continue;
         const m, const k, const n = c;
         errdefer std.debug.print("affine bits {d}: {d} x {d} against {d}\n", .{ bits, m, k, n });
         const x = try bf16Array(m * k, &.{ @intCast(m), @intCast(k) }, 4, -2);

@@ -6,6 +6,8 @@
 //! filesystem it would have had. Every namespace mutation is one checksummed journal record, written
 //! before it is applied; `open` replays the snapshot, then the journal, and drops a torn tail.
 //! Nothing is fsynced: a crash of the process loses nothing that was journaled, a power loss may.
+//! A pack goes with its last live block; before that, `reclaim` punches the whole pages of its dead runs out of it,
+//! so the volume holds a pack's live bytes, not its length.
 
 const std = @import("std");
 const xxh3 = @import("xxh3.zig");
@@ -28,6 +30,11 @@ pub const BYTE_BLOCK: usize = 16 * 1024;
 const MAX_DEPTH = 32;
 const MAX_NAME = 255;
 const FRAME_HEAD = 12;
+/// A snapshot ends with one state record (tag, sequence, next inode, last mtime, last sequence), so a reopened layer
+/// reuses no inode and no mtime. It is all an empty layer keeps after `compact`.
+pub const state_record_bytes: u64 = FRAME_HEAD + 1 + 8 + 3 * 8;
+/// `F_PUNCHHOLE` frees whole filesystem blocks only: APFS's are 4 KiB.
+const HOLE_ALIGN: u64 = 4096;
 
 /// One block of a file. `tensor` and `group` are the caller's tags and come back from `readPayload`.
 pub const Segment = struct {
@@ -91,7 +98,21 @@ const Ext = struct {
 const Block = struct { pack: u32, off: u32, kind: Kind, refs: u32, verified: bool };
 const Ref = struct { ext: Ext, pack: u32, off: u32, kind: Kind };
 /// `unfilled` counts blocks placed in the pack that their `fillBlocks` has not written yet: the pack stays open.
-const Pack = struct { file: ?File = null, size: u64 = 0, live_blocks: u32 = 0, live_bytes: u64 = 0, unfilled: u32 = 0 };
+/// `holes` are the bytes `reclaim` punched out of its dead runs.
+const Pack = struct { file: ?File = null, size: u64 = 0, live_blocks: u32 = 0, live_bytes: u64 = 0, unfilled: u32 = 0, holes: u64 = 0, dead: DeadRuns = .{} };
+/// A pack's dead byte runs, merged, by both ends: a run that dies beside another joins it, so the pages they share
+/// are freed too.
+const DeadRuns = struct {
+    by_start: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    by_end: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+
+    fn deinit(self: *DeadRuns, a: Allocator) void {
+        self.by_start.deinit(a);
+        self.by_end.deinit(a);
+    }
+};
+/// Whole pages of a dead run not yet punched out of their pack.
+const Hole = struct { pack: u32, off: u64, len: u64 };
 
 const Vnode = struct {
     ino: u64,
@@ -382,6 +403,23 @@ fn decodeRec(a: Allocator, payload: []const u8) !Decoded {
     return .{ .seq = seq, .rec = rec };
 }
 
+fn pageDown(x: u64) u64 {
+    return x & ~(HOLE_ALIGN - 1);
+}
+
+fn pageUp(x: u64) u64 {
+    return pageDown(x + HOLE_ALIGN - 1);
+}
+
+/// macOS `struct fpunchhole`.
+const FPunchhole = extern struct { fp_flags: c_uint = 0, reserved: c_uint = 0, fp_offset: i64, fp_length: i64 };
+
+/// Frees `[off, off + len)` of `f` (whole filesystem blocks); later reads of it return zeros.
+fn punchHole(f: File, off: u64, len: u64) std.posix.E {
+    var ph: FPunchhole = .{ .fp_offset = @intCast(off), .fp_length = @intCast(len) };
+    return std.posix.errno(std.c.fcntl(f.handle, std.c.F.PUNCHHOLE, &ph));
+}
+
 // ---------------------------------------------------------------- the VFS
 
 pub const Vfs = struct {
@@ -417,8 +455,14 @@ pub const Vfs = struct {
     recovered: Recovery = .{},
     /// Blocks hashed on a first read; a block written by this process is never counted.
     verify_count: u64 = 0,
+    /// Dead pages `reclaim` has yet to punch.
+    holes: std.ArrayList(Hole) = .empty,
+    /// The volume refused a punch: from then on a dead byte goes only with its pack.
+    holes_refused: bool = false,
     /// Test seam: the next step the gate names waits there until the test opens it.
     gate: if (builtin.is_test) ?*Gate else void = if (builtin.is_test) null else {},
+    /// Test seam: `reclaim` stops after this many punches, as a crash between two of them would.
+    punch_limit: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
 
     pub fn open(allocator: Allocator, io: std.Io, root: []const u8, opts: Options) !*Vfs {
         const packs_path = try std.fmt.allocPrint(allocator, "{s}/v/packs", .{root});
@@ -446,6 +490,7 @@ pub const Vfs = struct {
             allocator.destroy(self);
             return e;
         };
+        if (!opts.read_only) self.markGaps();
         return self;
     }
 
@@ -462,8 +507,12 @@ pub const Vfs = struct {
         self.removeNode(.{ .dir = self.root }, false);
         self.blocks.deinit(a);
         var pit = self.packs.valueIterator();
-        while (pit.next()) |p| if (p.file) |f| f.close(self.io);
+        while (pit.next()) |p| {
+            if (p.file) |f| f.close(self.io);
+            p.dead.deinit(a);
+        }
         self.packs.deinit(a);
+        self.holes.deinit(a);
         var tit = self.tickets.valueIterator();
         while (tit.next()) |t| {
             a.free(t.path);
@@ -732,6 +781,7 @@ pub const Vfs = struct {
                     if (self.blocks.contains(at.ext.key())) {
                         ks.dedup_blocks += 1;
                         ks.dedup_bytes += at.ext.len;
+                        self.markDead(at.pack, at.off, at.ext.len);
                     } else {
                         self.blocks.putAssumeCapacity(at.ext.key(), .{ .pack = at.pack, .off = at.off, .kind = fill.payload.kind, .refs = 0, .verified = true });
                         ks.blocks += 1;
@@ -767,7 +817,10 @@ pub const Vfs = struct {
     fn unplace(self: *Vfs, slots: []const Fill.Slot) void {
         for (slots) |slot| switch (slot) {
             .shared => |e| self.release(e),
-            .at => |at| self.packs.getPtr(at.pack).?.unfilled -= 1,
+            .at => |at| {
+                self.packs.getPtr(at.pack).?.unfilled -= 1;
+                self.markDead(at.pack, at.off, at.ext.len);
+            },
             else => {},
         };
         self.dropDrainedPacks(slots);
@@ -1143,12 +1196,24 @@ pub const Vfs = struct {
 
     // ------------------------------------------------------------ public: accounting
 
+    /// The bytes the layer holds on the volume: its packs less their punched pages, its journal and its snapshot.
     pub fn physicalBytes(self: *Vfs) u64 {
         self.lock();
         defer self.unlock();
+        return self.physicalLocked();
+    }
+
+    /// `physicalBytes` less the one record an empty layer keeps, its snapshot's state record (`state_record_bytes`).
+    pub fn bytesBeyondEmpty(self: *Vfs) u64 {
+        self.lock();
+        defer self.unlock();
+        return self.physicalLocked() - if (self.snapshot_len > 0) state_record_bytes else 0;
+    }
+
+    fn physicalLocked(self: *const Vfs) u64 {
         var n = self.journal_len + self.snapshot_len;
         var it = self.packs.valueIterator();
-        while (it.next()) |p| n += p.size;
+        while (it.next()) |p| n += p.size - p.holes;
         return n;
     }
 
@@ -1159,14 +1224,104 @@ pub const Vfs = struct {
         return self.logical_total;
     }
 
-    /// Pack bytes no live file references: freed blocks, abandoned staging, failed writes.
+    /// Pack bytes no live file references and the volume still holds: freed blocks, abandoned staging, failed
+    /// writes, less the pages `reclaim` punched.
     pub fn deadBytes(self: *Vfs) u64 {
         self.lock();
         defer self.unlock();
         var n: u64 = 0;
         var it = self.packs.valueIterator();
-        while (it.next()) |p| n += p.size - p.live_bytes;
+        while (it.next()) |p| n += p.size - p.live_bytes - p.holes;
         return n;
+    }
+
+    /// Punches the dead pages queued since the last call out of their packs, so the volume gets them back as a plain
+    /// file's unlink gives back its blocks. Returns the bytes freed. Runs under the lock: a pack cannot close under a
+    /// punch, and only the writer's next step waits for it.
+    pub fn reclaim(self: *Vfs) u64 {
+        self.lock();
+        defer self.unlock();
+        var freed: u64 = 0;
+        var done: usize = 0;
+        for (self.holes.items) |h| {
+            if (builtin.is_test) if (self.punch_limit) |n| if (done == n) break;
+            done += 1;
+            if (self.holes_refused) continue;
+            const p = self.packs.getPtr(h.pack) orelse continue;
+            const f = p.file orelse continue;
+            const err = punchHole(f, h.off, h.len);
+            if (err != .SUCCESS) {
+                self.holes_refused = true;
+                log.warn("  [prefix-vfs] the volume refuses to free a pack's dead pages ({s}): they now go only with their pack\n", .{@tagName(err)});
+                continue;
+            }
+            p.holes += h.len;
+            freed += h.len;
+        }
+        const left = self.holes.items.len - done;
+        std.mem.copyForwards(Hole, self.holes.items[0..left], self.holes.items[done..]);
+        self.holes.shrinkRetainingCapacity(left);
+        return freed;
+    }
+
+    /// Test builds: the bytes of the pack pages that hold a live byte. After `reclaim` the volume holds no other pack
+    /// page but each pack's last.
+    pub fn testLivePageBytes(self: *Vfs) !u64 {
+        self.lock();
+        defer self.unlock();
+        const Span = struct {
+            pack: u32,
+            lo: u64,
+            hi: u64,
+            fn less(_: void, x: @This(), y: @This()) bool {
+                return x.pack < y.pack or (x.pack == y.pack and x.lo < y.lo);
+            }
+        };
+        const spans = try self.allocator.alloc(Span, self.blocks.count());
+        defer self.allocator.free(spans);
+        var it = self.blocks.iterator();
+        var n: usize = 0;
+        while (it.next()) |kv| : (n += 1) spans[n] = .{ .pack = kv.value_ptr.pack, .lo = pageDown(kv.value_ptr.off), .hi = pageUp(@as(u64, kv.value_ptr.off) + kv.key_ptr.len) };
+        std.mem.sort(Span, spans, {}, Span.less);
+        var total: u64 = 0;
+        var i: usize = 0;
+        while (i < spans.len) {
+            var cur = spans[i];
+            i += 1;
+            while (i < spans.len and spans[i].pack == cur.pack and spans[i].lo <= cur.hi) : (i += 1) cur.hi = @max(cur.hi, spans[i].hi);
+            total += cur.hi - cur.lo;
+        }
+        return total;
+    }
+
+    /// Test builds: fails unless each pack's dead runs hold its dead bytes once: both maps name the same runs, and no
+    /// two runs overlap or touch.
+    pub fn testCheckDeadRuns(self: *Vfs) !void {
+        self.lock();
+        defer self.unlock();
+        var pit = self.packs.valueIterator();
+        while (pit.next()) |p| {
+            if (p.dead.by_start.count() != p.dead.by_end.count()) return error.DeadRunsUnmirrored;
+            const runs = try self.allocator.alloc([2]u32, p.dead.by_start.count());
+            defer self.allocator.free(runs);
+            var it = p.dead.by_start.iterator();
+            var n: usize = 0;
+            while (it.next()) |kv| : (n += 1) {
+                if (p.dead.by_end.get(kv.value_ptr.*) != kv.key_ptr.*) return error.DeadRunsUnmirrored;
+                runs[n] = .{ kv.key_ptr.*, kv.value_ptr.* };
+            }
+            std.mem.sort([2]u32, runs, {}, struct {
+                fn less(_: void, x: [2]u32, y: [2]u32) bool {
+                    return x[0] < y[0];
+                }
+            }.less);
+            var dead: u64 = 0;
+            for (runs, 0..) |r, i| {
+                if (i > 0 and runs[i - 1][1] >= r[0]) return error.DeadRunsOverlap;
+                dead += r[1] - r[0];
+            }
+            if (p.unfilled == 0 and dead != p.size - p.live_bytes) return error.DeadRunsMiscounted;
+        }
     }
 
     pub fn stats(self: *Vfs, kind: Kind) KindStats {
@@ -1327,11 +1482,12 @@ pub const Vfs = struct {
         b.refs -= 1;
         if (b.refs != 0) return;
         const id = b.pack;
+        const off = b.off;
         _ = self.blocks.remove(e.key());
         const p = self.packs.getPtr(id).?;
         p.live_blocks -= 1;
         p.live_bytes -= e.len;
-        if (p.live_blocks == 0 and p.unfilled == 0 and !self.replaying) self.dropPack(id);
+        if (p.live_blocks == 0 and p.unfilled == 0 and !self.replaying) self.dropPack(id) else self.markDead(id, off, e.len);
     }
 
     fn releaseAll(self: *Vfs, exts: []const Ext) void {
@@ -1339,11 +1495,74 @@ pub const Vfs = struct {
     }
 
     fn dropPack(self: *Vfs, id: u32) void {
-        const kv = self.packs.fetchRemove(id) orelse return;
+        var kv = self.packs.fetchRemove(id) orelse return;
+        kv.value.dead.deinit(self.allocator);
         if (kv.value.file) |f| f.close(self.io);
         var name_buf: [32]u8 = undefined;
         self.vdir.deleteFile(self.io, packName(&name_buf, id)) catch {};
         if (self.active == id) self.active = null;
+    }
+
+    /// Records `len` bytes at `off` of pack `id` as dead, joined to the dead runs beside them, and queues the pages the
+    /// joined run frees that its parts did not. Bytes it cannot record stay until their pack goes or the next open.
+    /// The caller marks only bytes nothing will write or read again: a punched page reads as zeros.
+    fn markDead(self: *Vfs, id: u32, off: u32, len: u32) void {
+        if (self.replaying or self.opts.read_only or len == 0) return;
+        const a = self.allocator;
+        const p = self.packs.getPtr(id) orelse return;
+        p.dead.by_start.ensureUnusedCapacity(a, 1) catch return;
+        p.dead.by_end.ensureUnusedCapacity(a, 1) catch return;
+        self.holes.ensureUnusedCapacity(a, 1) catch return;
+        const end = off + len;
+        var lo = off;
+        var hi = end;
+        if (p.dead.by_end.fetchRemove(off)) |kv| {
+            lo = kv.value;
+            _ = p.dead.by_start.remove(lo);
+        }
+        if (p.dead.by_start.fetchRemove(end)) |kv| {
+            hi = kv.value;
+            _ = p.dead.by_end.remove(hi);
+        }
+        p.dead.by_start.putAssumeCapacityNoClobber(lo, hi);
+        p.dead.by_end.putAssumeCapacityNoClobber(hi, lo);
+        if (self.holes_refused) return;
+        // The run's whole pages are [up(lo), down(hi)); those of its left part ended by down(off), its right part's
+        // began at up(end).
+        const from = @max(pageDown(off), pageUp(lo));
+        const to = @min(pageUp(end), pageDown(hi));
+        if (to > from) self.holes.appendAssumeCapacity(.{ .pack = id, .off = from, .len = to - from });
+    }
+
+    /// After a replay every pack byte outside a live block is dead, whatever left it there: a crash before its pages
+    /// were punched, a staged file that never landed, the copy a racing writer placed.
+    fn markGaps(self: *Vfs) void {
+        const a = self.allocator;
+        const Span = struct {
+            pack: u32,
+            off: u32,
+            end: u32,
+            fn less(_: void, x: @This(), y: @This()) bool {
+                return x.pack < y.pack or (x.pack == y.pack and x.off < y.off);
+            }
+        };
+        const spans = a.alloc(Span, self.blocks.count()) catch return;
+        defer a.free(spans);
+        var it = self.blocks.iterator();
+        var n: usize = 0;
+        while (it.next()) |kv| : (n += 1) spans[n] = .{ .pack = kv.value_ptr.pack, .off = kv.value_ptr.off, .end = kv.value_ptr.off + kv.key_ptr.len };
+        std.mem.sort(Span, spans, {}, Span.less);
+        var i: usize = 0;
+        while (i < spans.len) {
+            const id = spans[i].pack;
+            var at: u32 = 0;
+            while (i < spans.len and spans[i].pack == id) : (i += 1) {
+                if (spans[i].off > at) self.markDead(id, at, spans[i].off - at);
+                at = @max(at, spans[i].end);
+            }
+            const p = self.packs.get(id) orelse continue;
+            if (p.file != null and p.size > at) self.markDead(id, at, @intCast(p.size - at));
+        }
     }
 
     /// Reads a whole block, verifying its checksum the first time this process reads it.
@@ -1856,6 +2075,8 @@ pub const Vfs = struct {
         self.removeNode(.{ .dir = self.root }, false);
         self.root = fresh;
         self.blocks.clearAndFree(a);
+        var pit = self.packs.valueIterator();
+        while (pit.next()) |p| p.dead.deinit(a);
         self.packs.clearAndFree(a);
         self.seen_end.clearAndFree(a);
         self.next_ino = 2;
@@ -3256,4 +3477,234 @@ test "prefix_vfs: tickets landed in order replay to the same namespace" {
     const got = try dump(r);
     defer ta.free(got);
     try testing.expectEqualStrings(want, got);
+}
+
+/// Bytes the pack files hold on the volume (`du`), not their lengths.
+fn packAllocated(env: *const Env) !u64 {
+    const p = try env.path("vfs/v/packs", .{});
+    defer ta.free(p);
+    var pdir = try Dir.openDirAbsolute(tio, p, .{ .iterate = true });
+    defer pdir.close(tio);
+    var total: u64 = 0;
+    var it = pdir.iterate();
+    while (try it.next(tio)) |e| {
+        var zb: [Dir.max_path_bytes + 1]u8 = undefined;
+        const z = try std.fmt.bufPrintSentinel(&zb, "{s}/{s}", .{ p, e.name }, 0);
+        var st: std.c.Stat = undefined;
+        if (std.c.stat(z.ptr, &st) != 0) return error.TestUnexpectedResult;
+        total += @as(u64, @intCast(st.blocks)) * 512;
+    }
+    return total;
+}
+
+const six_names = [_][]const u8{ "f0", "f1", "f2", "f3", "f4", "f5" };
+
+/// Six files of 20,000 to 25,000 bytes back to back in one pack; f1, f2 and f4 then die, leaving it partly live.
+fn sixThenThreeDie(v: *Vfs, bufs: *[6][]u8) !void {
+    for (bufs, 0..) |*b, i| b.* = try blob(20_000 + 1000 * i, i + 1);
+    for (six_names, bufs) |n, b| _ = try v.create(n, onePayload(.kv, b));
+    for ([_][]const u8{ "f1", "f2", "f4" }) |n| try v.unlink(n);
+}
+
+test "prefix_vfs: reclaim gives the volume a partly live pack's dead pages, and the files beside them read back whole" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const v = try openAt(&env, .{});
+    defer v.close();
+    var bufs: [6][]u8 = undefined;
+    try sixThenThreeDie(v, &bufs);
+    defer for (bufs) |b| ta.free(b);
+    // The dead bytes stay on the volume until the reclaim: the pack still holds live blocks.
+    const full = try packAllocated(&env);
+    try testing.expectEqual(@as(u64, 21_000 + 22_000 + 24_000), v.deadBytes());
+    const phys = v.physicalBytes();
+    const freed = v.reclaim();
+    // f1 and f2 died apart and joined: their run frees every whole page inside it.
+    try testing.expectEqual(@as(u64, (61440 - 20480) + (106496 - 86016)), freed);
+    try testing.expectEqual(full - freed, try packAllocated(&env));
+    try testing.expectEqual(try v.testLivePageBytes(), try packAllocated(&env));
+    try testing.expectEqual(phys - freed, v.physicalBytes());
+    try testing.expectEqual(try onDiskBytes(&env) - freed, v.physicalBytes());
+    try testing.expectEqual(@as(u64, 21_000 + 22_000 + 24_000) - freed, v.deadBytes());
+    try testing.expectEqual(@as(u64, 0), v.reclaim());
+    for ([_]usize{ 0, 3, 5 }) |i| {
+        const got = try v.readBytes(ta, six_names[i]);
+        defer ta.free(got);
+        try testing.expectEqualSlices(u8, bufs[i], got);
+    }
+    // The pack still goes with its last block.
+    for ([_][]const u8{ "f0", "f3", "f5" }) |n| try v.unlink(n);
+    try testing.expectEqual(@as(usize, 0), try packCount(&env));
+    try testing.expectEqual(try onDiskBytes(&env), v.physicalBytes());
+}
+
+test "prefix_vfs: dead runs that meet join, so a page two dead blocks share goes too" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const v = try openAt(&env, .{});
+    defer v.close();
+    // Four 3,000-byte blocks at 0, 3000, 6000 and 9000: no one of them covers a whole page.
+    var bufs: [4][]u8 = undefined;
+    for (&bufs, 0..) |*b, i| b.* = try blob(3000, i + 1);
+    defer for (bufs) |b| ta.free(b);
+    for (six_names[0..4], bufs) |n, b| _ = try v.create(n, onePayload(.kv, b));
+    try testing.expectEqual(@as(u64, 12288), try packAllocated(&env));
+    const steps = [_]struct { name: []const u8, freed: u64, held: u64 }{
+        .{ .name = "f1", .freed = 0, .held = 12288 },
+        .{ .name = "f2", .freed = 4096, .held = 8192 },
+        .{ .name = "f0", .freed = 4096, .held = 4096 },
+    };
+    for (steps) |st| {
+        try v.unlink(st.name);
+        try testing.expectEqual(st.freed, v.reclaim());
+        try testing.expectEqual(st.held, try packAllocated(&env));
+        try testing.expectEqual(try v.testLivePageBytes(), try packAllocated(&env));
+    }
+    const got = try v.readBytes(ta, "f3");
+    defer ta.free(got);
+    try testing.expectEqualSlices(u8, bufs[3], got);
+}
+
+test "prefix_vfs: a block that dies just before a dead run joins it once, live and after a compaction and a reopen" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    // Twelve 1,000-byte blocks back to back; b11 keeps the pack.
+    const names = [_][]const u8{ "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "b10", "b11" };
+    var bufs: [names.len][]u8 = undefined;
+    for (&bufs, 0..) |*b, i| b.* = try blob(1000, i + 1);
+    defer for (bufs) |b| ta.free(b);
+    {
+        const v = try openAt(&env, .{ .compact_min_bytes = 1 << 30 });
+        defer v.close();
+        for (names, bufs) |n, b| _ = try v.create(n, onePayload(.kv, b));
+        // b1 and b0 each die just before a run, b3 and b4 just after one.
+        for ([_][]const u8{ "b2", "b1", "b0", "b3", "b4" }) |n| {
+            try v.unlink(n);
+            try v.testCheckDeadRuns();
+            _ = v.reclaim();
+            try testing.expectEqual(try v.testLivePageBytes(), try packAllocated(&env));
+        }
+        try v.compact();
+        try v.testCheckDeadRuns();
+    }
+    const v = try openAt(&env, .{ .compact_min_bytes = 1 << 30 });
+    defer v.close();
+    try v.testCheckDeadRuns();
+    _ = v.reclaim();
+    // b7 joins runs on both sides, then b5 does.
+    for ([_][]const u8{ "b9", "b8", "b6", "b7", "b5" }) |n| {
+        try v.unlink(n);
+        try v.testCheckDeadRuns();
+        _ = v.reclaim();
+        try testing.expectEqual(try v.testLivePageBytes(), try packAllocated(&env));
+    }
+    for ([_]usize{ 10, 11 }) |i| {
+        const got = try v.readBytes(ta, names[i]);
+        defer ta.free(got);
+        try testing.expectEqualSlices(u8, bufs[i], got);
+    }
+}
+
+test "prefix_vfs: a crash before, between or after a reclaim's punches reopens to the same files, and the open frees the rest" {
+    for (0..4) |done| {
+        var env: Env = undefined;
+        try env.init();
+        defer env.deinit();
+        const v = try openAt(&env, .{});
+        defer v.close();
+        var bufs: [6][]u8 = undefined;
+        try sixThenThreeDie(v, &bufs);
+        defer for (bufs) |b| ta.free(b);
+        // Three runs' pages are queued; the crash comes after `done` of them were punched (0: right after the
+        // records that killed the blocks were journaled).
+        v.punch_limit = done;
+        _ = v.reclaim();
+        const want = try dump(v);
+        defer ta.free(want);
+        const clean = try v.testLivePageBytes();
+
+        const r = try openAt(&env, .{});
+        defer r.close();
+        const got = try dump(r);
+        defer ta.free(got);
+        // The dump reads every file: a replayed block is checked against its hash on that first read.
+        try testing.expectEqualStrings(want, got);
+        _ = r.reclaim();
+        try testing.expectEqual(clean, try packAllocated(&env));
+        try testing.expectEqual(clean, try r.testLivePageBytes());
+        try testing.expectEqual(try onDiskBytes(&env) - (21_000 + 22_000 + 24_000 - r.deadBytes()), r.physicalBytes());
+    }
+}
+
+test "prefix_vfs: a punched block that a lost journal tail brings back fails its read, never reads as zeros" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    var bufs: [6][]u8 = undefined;
+    defer for (bufs) |b| ta.free(b);
+    var before: []u8 = undefined;
+    {
+        const v = try openAt(&env, .{});
+        defer v.close();
+        for (&bufs, 0..) |*b, i| b.* = try blob(20_000 + 1000 * i, i + 1);
+        for (six_names, bufs) |n, b| _ = try v.create(n, onePayload(.kv, b));
+        const st = try DiskState.read(&env);
+        defer st.deinit();
+        before = try ta.dupe(u8, st.journal);
+        for ([_][]const u8{ "f1", "f2", "f4" }) |n| try v.unlink(n);
+        try testing.expect(v.reclaim() > 0);
+    }
+    defer ta.free(before);
+    // A power loss kept the punches and lost the records that killed the blocks.
+    const jpath = try env.path("vfs/v/journal", .{});
+    defer ta.free(jpath);
+    try Dir.cwd().writeFile(tio, .{ .sub_path = jpath, .data = before });
+    const r = try openAt(&env, .{});
+    defer r.close();
+    for (bufs, six_names, 0..) |b, n, i| {
+        if (i == 1 or i == 2 or i == 4) {
+            try testing.expectError(error.VfsCorrupt, r.readBytes(ta, n));
+            continue;
+        }
+        const got = try r.readBytes(ta, n);
+        defer ta.free(got);
+        try testing.expectEqualSlices(u8, b, got);
+    }
+}
+
+test "prefix_vfs: a volume that refuses a punch keeps its dead bytes counted and is not asked again" {
+    var env: Env = undefined;
+    try env.init();
+    defer env.deinit();
+    const v = try openAt(&env, .{});
+    defer v.close();
+    var bufs: [6][]u8 = undefined;
+    try sixThenThreeDie(v, &bufs);
+    defer for (bufs) |b| ta.free(b);
+    const dead = v.deadBytes();
+    const phys = v.physicalBytes();
+    const full = try packAllocated(&env);
+    // A read-only handle stands for a volume without holes: the punch fails as it would there.
+    const id = v.active.?;
+    const pack_path = try env.path("vfs/v/packs/{d}.pack", .{id});
+    defer ta.free(pack_path);
+    const ro = try Dir.openFileAbsolute(tio, pack_path, .{});
+    defer ro.close(tio);
+    const rw = v.packs.getPtr(id).?.file.?;
+    v.packs.getPtr(id).?.file = ro;
+    try testing.expectEqual(@as(u64, 0), v.reclaim());
+    v.packs.getPtr(id).?.file = rw;
+    try testing.expect(v.holes_refused);
+    try testing.expectEqual(dead, v.deadBytes());
+    try testing.expectEqual(phys, v.physicalBytes());
+    try testing.expectEqual(full, try packAllocated(&env));
+    try v.unlink("f3");
+    try testing.expectEqual(@as(usize, 0), v.holes.items.len);
+    try testing.expectEqual(@as(u64, 0), v.reclaim());
+    const got = try v.readBytes(ta, "f5");
+    defer ta.free(got);
+    try testing.expectEqualSlices(u8, bufs[5], got);
 }

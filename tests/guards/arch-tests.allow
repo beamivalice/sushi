@@ -54,7 +54,6 @@ Qwen3.8-Flash-Next thinks at medium effort by default, under the launch flag and
 Responses: a stored chain and an input replay render the same Qwen prompt
 a GLM raw FP8 config with another block size is refused by name
 a MiMo slot bills the decode rebuilds the other rows of its batched decode hold
-a Qwen load on Sushi Cooler accepts drafts by the exact rule whatever its settings say; on MLX its settings reach it
 a Qwen or MiMo request owes no growth after admission, its reserved capacity is taken at its first grow
 a freed MiMo slot returns its KV to the OS, not to MLX's pool
 a qwen4_exp config refusal keeps its own name in the 503 text
@@ -72,7 +71,6 @@ chat: Qwen's late-system edit reaches only a Qwen-typed config, never another ar
 chat: the embedded V4.1 template renders through the template engine byte-exact with DeepSeek's encoder
 chat: the shared Qwen test config places a late system turn as a Qwen load does
 chat: tool results a client sends out of call order render byte-exact with DeepSeek's encoder once the messages are ordered
-deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one line naming the keys set
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line
 deepseek_v41 thinks by default, at its native high effort
 deepseek_v41: the image token spelled in a text-only prompt is text, with no placeholder check

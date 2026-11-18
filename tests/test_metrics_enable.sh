@@ -176,16 +176,14 @@ HOSTILE='org/q"b\c'
 mkdir -p "$STUB_DIR/$HOSTILE"
 echo '{"model_type":"qwen4_exp"}' > "$STUB_DIR/$HOSTILE/config.json"
 echo "stub" > "$STUB_DIR/$HOSTILE/transformer.safetensors"
-if MODEL_DIR="$STUB_DIR" boot --mtp-tokenv3 0.5 --mtp-greedy-tail; then
+if MODEL_DIR="$STUB_DIR" boot --ctx-size 4096; then
     check "/v1/models parses and names the folder exactly" \
         "$(curl -s "$BASE/v1/models" | python3 -c 'import json,sys; assert json.load(sys.stdin)["data"][0]["id"]==sys.argv[1]' "$HOSTILE" 2>/dev/null && echo 1 || echo 0)"
     SETTINGS="$(curl -s "$BASE/v1/settings")"
     check "/v1/settings parses and names the folder exactly" \
         "$(echo "$SETTINGS" | python3 -c 'import json,sys; assert json.load(sys.stdin)["models"][0]["id"]==sys.argv[1]' "$HOSTILE" 2>/dev/null && echo 1 || echo 0)"
-    check "the acceptance lock reports --mtp-tokenv3 0.5 as typed" \
-        "$(echo "$SETTINGS" | python3 -c 'import json,sys; assert json.load(sys.stdin)["models"][0]["settings"]["mtp_acceptance"]["flag"]=="--mtp-tokenv3 0.5"' 2>/dev/null && echo 1 || echo 0)"
-    check "the greedy-tail lock reports --mtp-greedy-tail" \
-        "$(echo "$SETTINGS" | python3 -c 'import json,sys; assert json.load(sys.stdin)["models"][0]["settings"]["mtp_greedy_tail"]["flag"]=="--mtp-greedy-tail"' 2>/dev/null && echo 1 || echo 0)"
+    check "the ctx_size lock reports --ctx-size 4096 as typed" \
+        "$(echo "$SETTINGS" | python3 -c 'import json,sys; assert json.load(sys.stdin)["models"][0]["settings"]["ctx_size"]["flag"]=="4096"' 2>/dev/null && echo 1 || echo 0)"
     check "/v1/prefix-cache parses" \
         "$(curl -s "$BASE/v1/prefix-cache" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null && echo 1 || echo 0)"
 else

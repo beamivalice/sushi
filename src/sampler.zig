@@ -51,6 +51,8 @@ pub const SamplingParams = struct {
     temperature: f32 = 1.0,
     top_p: f32 = 1.0,
     top_k: u32 = 0, // 0 = disabled
+    /// Keeps an id whose probability after temperature, top-k and top-p is at least this share of the top one's; 0 = off.
+    min_p: f32 = 0,
     repeat_penalty: f32 = 1.0,
     presence_penalty: f32 = 0.0, // 0.0 = disabled
     /// OpenAI's: subtracted once per earlier occurrence of a token (0.0 = disabled).
@@ -220,9 +222,9 @@ pub fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: 
         _ = mlx.mlx_array_free(current);
         current = scaled;
     }
-    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
+    if (filters(sampling)) {
         var masked = mlx.mlx_array_new();
-        filterTopKTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
+        filterRows(&masked, current, sampling, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -290,7 +292,7 @@ pub fn probsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx
     return filteredProbsRows(owned, sampling, s);
 }
 
-/// Temperature → top-k → top-p → softmax over the LAST axis of an owned
+/// Temperature → top-k → top-p → min-p → softmax over the LAST axis of an owned
 /// `[.., V]` array (consumed). The ONE place a proposal or target density is
 /// built: a draft sampled from a distribution that is not byte-for-byte the
 /// `q` handed to `specAcceptProb` breaks exactness silently, so both sides
@@ -299,7 +301,7 @@ pub fn probsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx
 fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     var current = owned_rows;
     errdefer _ = mlx.mlx_array_free(current);
-    // Apply temperature → top-k → top-p (same order as `sampleTokenLazy`).
+    // Apply temperature → top-k → top-p → min-p (same order as `sampleTokenLazy`).
     if (sampling.temperature != 1.0) {
         const t = try mlx.newFloat(sampling.temperature);
         defer _ = mlx.mlx_array_free(t);
@@ -309,9 +311,9 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
         _ = mlx.mlx_array_free(current);
         current = scaled;
     }
-    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
+    if (filters(sampling)) {
         var masked = mlx.mlx_array_new();
-        filterTopKTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
+        filterRows(&masked, current, sampling, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -475,20 +477,8 @@ pub fn argmaxStepProposal(amax: mlx.mlx_array, vocab: c_int, s: mlx.mlx_stream) 
     return .{ .id = id, .q = try lazyOneHotRow(id, vocab, s) };
 }
 
-/// A depth of a chain that carries densities, off the rerank shortlist: a
-/// sampling depth draws from it (`shortlistProposal`), an argmax depth (the
-/// greedy tail) takes the token a greedy chain drafts.
-pub fn shortlistStepProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx_stream) !StepProposal {
-    if (!isGreedyTemperature(sampling.temperature)) return shortlistProposal(sl, sampling, s);
-    return argmaxStepProposal(try mtp_mod.shortlistArgmax(s, sl), sl.rows, s);
-}
-
-/// `shortlistStepProposal` off the draft head's full `[1, 1, V]` logits.
+/// `shortlistProposal` off the draft head's full `[1, 1, V]` logits.
 pub fn logitsStepProposal(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !StepProposal {
-    if (isGreedyTemperature(sampling.temperature)) {
-        const shape = mlx.getShape(logits);
-        return argmaxStepProposal(try sampleTokenLazy(logits, sampling, s), shape[shape.len - 1], s);
-    }
     const q = try probsAtLastPos(logits, sampling, s);
     errdefer _ = mlx.mlx_array_free(q);
     return .{ .id = try sampleFromProbsLazy(q, sampling, s), .q = q };
@@ -576,6 +566,50 @@ pub fn shortlistProposalRows(
     return .{ .ids = ids, .qs = qs };
 }
 
+/// A draft off the rerank shortlist on the engine (`engineDraws`): the shortlist's logits at their own vocab ids, -inf
+/// elsewhere, so each id takes the noise the target's draw at the same position gives it; an argmax depth takes the
+/// shortlist's argmax.
+pub fn shortlistDraw(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (isGreedyTemperature(sampling.temperature)) return mtp_mod.shortlistArgmax(s, sl);
+    const n = mlx.getShape(sl.exact)[mlx.getShape(sl.exact).len - 1];
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, sl.exact, &[_]c_int{ 1, n }, 2, s));
+        try mlx.check(mlx.mlx_astype(&row, flat, .float32, s));
+    }
+    var cand_row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_row);
+    try mlx.check(mlx.mlx_reshape(&cand_row, sl.cands, &[_]c_int{ 1, n }, 2, s));
+    const neg_inf = try mlx.newFloat(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    var floor = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(floor);
+    try mlx.check(mlx.mlx_full(&floor, &[_]c_int{ 1, sl.rows }, 2, neg_inf, .float32, s));
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_put_along_axis(&dense, floor, cand_row, row, 1, s));
+    const drawn = try engineDraws(dense, sampling, s);
+    defer _ = mlx.mlx_array_free(drawn);
+    var id = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(id);
+    try mlx.check(mlx.mlx_astype(&id, drawn, .int32, s));
+    return id;
+}
+
+/// The serial step's draws of a verify block's first `1 + m` rows (`[1, >= 1+m, V]` logits, shifted as the serial step
+/// shifts them): row j under the key of the position `sampling.draw + j`, as a lazy `[1+m]`.
+pub fn verifyDraws(logits: mlx.mlx_array, m: u32, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    var masked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked);
+    if (sampling.suppress_mask) |mask| try applySuppressMask(&masked, logits, mask, s);
+    const rows2d = try generate.verifyRows2d(if (sampling.suppress_mask != null) masked else logits, m, s);
+    defer _ = mlx.mlx_array_free(rows2d);
+    return engineDraws(rows2d, sampling, s);
+}
+
 /// One row's `[1, 32]` shortlist density as the dense `[1, V]` q the verify
 /// takes, zero off the shortlist.
 fn scatterShortlistQ(sl: mtp_mod.Shortlist, q32: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -661,7 +695,7 @@ pub fn drawRowsLogProbs(logp2d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
         var keys: [sampler_draw.max_rows][2]u32 = undefined;
         if (n > keys.len) return error.SamplerDrawUnsupported;
         for (keys[0..n], 0..) |*k, j| k.* = random.drawKey(root ^ (@as(u64, j) *% row_salt), sampling.draw);
-        return sampler_draw.rows(logp2d, 1.0, 1.0, 0, keys[0..n], s);
+        return sampler_draw.rows(logp2d, 1.0, 1.0, 0, 0, keys[0..n], s);
     }
     var sampled = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(sampled);
@@ -789,10 +823,10 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
         current = next;
     }
 
-    // Apply top-k and top-p in one pass (lazy)
-    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
+    // Top-k and top-p in one pass, then min-p (lazy)
+    if (filters(sampling)) {
         var next = mlx.mlx_array_new();
-        filterTopKTopP(&next, current, sampling.top_p, sampling.top_k, s) catch {};
+        filterRows(&next, current, sampling, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = next;
     }
@@ -835,7 +869,7 @@ pub fn sampleRows(out: []i32, row_logits: []const mlx.mlx_array, params: []Sampl
 pub fn sampleRowsHomogeneous(params: []const SamplingParams) bool {
     const p0 = params[0];
     for (params[1..]) |p| {
-        if (p.temperature != p0.temperature or p.top_k != p0.top_k or p.top_p != p0.top_p) return false;
+        if (p.temperature != p0.temperature or p.top_k != p0.top_k or p.top_p != p0.top_p or p.min_p != p0.min_p) return false;
         const m0 = p0.suppress_mask;
         const m1 = p.suppress_mask;
         if (m0 == null and m1 == null) continue;
@@ -970,9 +1004,9 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
         _ = mlx.mlx_array_free(current);
         current = next;
     }
-    if (p0.top_k > 0 or p0.top_p < 1.0) {
+    if (filters(p0)) {
         var next = mlx.mlx_array_new();
-        filterTopKTopP(&next, current, p0.top_p, p0.top_k, s) catch {
+        filterRows(&next, current, p0, s) catch {
             _ = mlx.mlx_array_free(next);
             next = current;
             current = mlx.mlx_array_new();
@@ -1010,7 +1044,7 @@ pub fn engineDraws(rows2d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_s
     var keys: [sampler_draw.max_rows][2]u32 = undefined;
     if (n > keys.len) return error.SamplerDrawUnsupported;
     for (keys[0..n], 0..) |*k, j| k.* = random.drawKey(root, sampling.draw +% j);
-    return sampler_draw.rows(rows2d, sampling.temperature, sampling.top_p, sampling.top_k, keys[0..n], s);
+    return sampler_draw.rows(rows2d, sampling.temperature, sampling.top_p, sampling.top_k, sampling.min_p, keys[0..n], s);
 }
 
 /// PRNG key for one draw: `seed` mixed with the draw index, so a seeded
@@ -1133,15 +1167,15 @@ pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling
     // sampling knob.
     const logprobs_logits = last_logits;
 
-    // Apply top-k and top-p in one pass
+    // Top-k and top-p in one pass, then min-p
     var filtered = mlx.mlx_array_new();
     var filtered_owned = false;
     defer if (filtered_owned) {
         _ = mlx.mlx_array_free(filtered);
     };
 
-    if (!host.own and (sampling.top_k > 0 or sampling.top_p < 1.0)) {
-        try filterTopKTopP(&filtered, current, sampling.top_p, sampling.top_k, s);
+    if (!host.own and filters(sampling)) {
+        try filterRows(&filtered, current, sampling, s);
         current = filtered;
         filtered_owned = true;
     }
@@ -1620,6 +1654,44 @@ fn keepByIndex(res: *mlx.mlx_array, logits: mlx.mlx_array, keep_idx: mlx.mlx_arr
 fn filterTopKTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, top_k: u32, s: mlx.mlx_stream) !void {
     if (top_p >= 1.0) return applyTopK(res, logits, top_k, s);
     return applyTopP(res, logits, top_p, top_k, s);
+}
+
+/// Whether a filter runs over the scaled logits: top-k, the nucleus or min-p.
+fn filters(p: SamplingParams) bool {
+    return p.top_k > 0 or p.top_p < 1.0 or p.min_p > 0;
+}
+
+/// The filters in llama.cpp's order over logits after temperature: top-k and the nucleus (`filterTopKTopP`), then
+/// min-p (`applyMinP`).
+fn filterRows(res: *mlx.mlx_array, logits: mlx.mlx_array, p: SamplingParams, s: mlx.mlx_stream) !void {
+    if (p.min_p <= 0) return filterTopKTopP(res, logits, p.top_p, p.top_k, s);
+    if (p.top_k == 0 and p.top_p >= 1.0) return applyMinP(res, logits, p.min_p, s);
+    var cut = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cut);
+    try filterTopKTopP(&cut, logits, p.top_p, p.top_k, s);
+    return applyMinP(res, cut, p.min_p, s);
+}
+
+/// Min-p: an id whose value less the row's top value is under `ln(min_p)` goes to -inf, compared in f32 as
+/// `sampler_draw` compares it.
+fn applyMinP(res: *mlx.mlx_array, logits: mlx.mlx_array, min_p: f32, s: mlx.mlx_stream) !void {
+    var vals = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vals);
+    try mlx.check(mlx.mlx_astype(&vals, logits, .float32, s));
+    var top = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(top);
+    try mlx.check(mlx.mlx_max_axis(&top, vals, -1, true, s));
+    var below = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(below);
+    try mlx.check(mlx.mlx_subtract(&below, vals, top, s));
+    const floor = try mlx.newFloat(@log(min_p));
+    defer _ = mlx.mlx_array_free(floor);
+    var keep = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(keep);
+    try mlx.check(mlx.mlx_greater_equal(&keep, below, floor, s));
+    const neg_inf = try mlx.newFloat(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    try mlx.check(mlx.mlx_where(res, keep, logits, neg_inf, s));
 }
 
 /// Apply top-p (nucleus) sampling: mask logits outside the top-p probability
@@ -2179,6 +2251,40 @@ test "top-k and top-p break exact ties by rank, not by value" {
     for (out3, 0..) |v, i| try testing.expect((v != -std.math.inf(f32)) == (i >= 1 and i <= 3));
 }
 
+test "min_p: MLX's densities, the host sampler and the lazy sampler keep the rule's set on a toy row" {
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const inf = std.math.inf(f32);
+    const data = [_]f32{ 3.0, 2.5, 1.0, 0.0, -1.0, 2.9, -inf, 2.0 };
+    const logits = mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 1, data.len }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var order: [data.len]u32 = undefined;
+    for ([_]SamplingParams{
+        .{ .temperature = 1.0, .min_p = 0.5 },
+        .{ .temperature = 2.0, .min_p = 0.5 },
+        .{ .temperature = 1.0, .min_p = 1.0 },
+        .{ .temperature = 1.0, .top_k = 6, .min_p = 0.05 },
+        .{ .temperature = 1.0, .top_p = 0.9, .min_p = 0.2 },
+    }) |base| {
+        const rule = sampler_draw.hostDraw(&data, &order, base.temperature, base.top_p, base.top_k, base.min_p, .{ 0, 0 });
+        var kept: [data.len]bool = @splat(false);
+        for (order[0..rule.kept]) |id| kept[id] = data[id] > -inf;
+        const probs = try probsAtLastPos(logits, base, s);
+        defer _ = mlx.mlx_array_free(probs);
+        const p = try proposalTestRead(a, probs, data.len, s);
+        defer a.free(p);
+        for (p, kept) |v, k| try testing.expectEqual(k, v > 0);
+        var params = base;
+        params.seed = 9;
+        for (0..48) |_| {
+            const sync = try sampleToken(a, logits, params, null, 0, null, s);
+            try testing.expect(kept[sync.token_id]);
+            try testing.expect(kept[try evalLazyToken(try sampleTokenLazy(logits, params, s))]);
+            params.draw +%= 1;
+        }
+    }
+}
+
 test "batched stacked seedless rows honour a suppress mask" {
     const s = mlx.gpuStream();
     const mask = try buildSuppressMask(&[_]u32{1}, 0, 4, s);
@@ -2514,33 +2620,6 @@ test "mtpDraftGreedyFor: the proposal mode is a property of the REQUEST" {
     try testing.expect(Generator.mtpDraftGreedyFor(one_way));
 }
 
-const qwen_draft_temp: f32 = 1.0;
-
-test "mtpDraftGreedyAt: the greedy tail samples depth 0 only; a greedy request drafts the same bytes either way" {
-    const sampled = SamplingParams{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 };
-    for (0..4) |d| {
-        const step: u32 = @intCast(d);
-        try testing.expect(!Generator.mtpDraftGreedyAt(sampled, false, step));
-        try testing.expectEqual(step > 0, Generator.mtpDraftGreedyAt(sampled, true, step));
-    }
-    // A request whose chain is greedy already stays greedy at every depth.
-    try testing.expect(Generator.mtpDraftGreedyAt(.{ .temperature = 0.3 }, true, 0));
-
-    // The byte-identity contract: a greedy target's draft sampler is the same
-    // value at every depth with the tail on as off, so its chain allocates no q
-    // and drafts the argmax exactly as before.
-    for ([_]f32{ 0.0, 0.005 }) |t| {
-        const target = SamplingParams{ .temperature = t, .top_p = 0.95, .top_k = 20, .seed = 7 };
-        for (0..mtp_mod.MAX_DEPTH) |d| {
-            const step: u32 = @intCast(d);
-            const on = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, true, step), qwen_draft_temp);
-            const off = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, false, step), qwen_draft_temp);
-            try testing.expect(std.meta.eql(on, off));
-            try testing.expect(isGreedyTemperature(on.temperature));
-        }
-    }
-}
-
 /// Toy-vocab helpers for the host-level exactness simulations.
 const ToyDist = struct {
     fn draw(dist: []const f64, rnd: std.Random) usize {
@@ -2572,16 +2651,13 @@ const ToyDist = struct {
     }
 };
 
-test "spec sampling exactness: a greedy tail (depth 0 sampled, argmax after it, one-hot q) reproduces the target chain (toy vocab)" {
+test "spec sampling exactness: a sampled depth then a one-hot depth reproduce the target chain (toy vocab)" {
     // Two draft depths over V = 4, run through the engine's exact acceptance
     // (`exactPrefix`): depth 0 is drawn from q0 and handed to the verify as q0,
-    // depth 1 is the draft head's argmax after the depth-0 token with a one-hot q.
+    // depth 1 is a point mass after the depth-0 token (a one-hot q, as a copied draft carries).
     // Rejecting at a depth resamples normalize(max(p - q, 0)); a reject at depth 0
     // leaves depth 1 to the next round, i.e. to the target itself. Every emitted
     // pair must follow the target's joint p0(x0) p1(x1 | x0).
-    const target = SamplingParams{ .temperature = 1.0 };
-    try testing.expect(!Generator.mtpDraftGreedyAt(target, true, 0));
-    try testing.expect(Generator.mtpDraftGreedyAt(target, true, 1));
     const V = 4;
     const p0 = [V]f64{ 0.1, 0.2, 0.3, 0.4 };
     const p1 = [V][V]f64{
@@ -2603,7 +2679,7 @@ test "spec sampling exactness: a greedy tail (depth 0 sampled, argmax after it, 
         const d1 = head_argmax[d0];
         const p_at = [_]f32{ @floatCast(p0[d0]), @floatCast(p1[d0][d1]) };
         const q_at = [_]f32{ @floatCast(q0[d0]), 1.0 };
-        const accepted = mtp_acceptance.exactPrefix(&p_at, &q_at, null, &prng);
+        const accepted = mtp_acceptance.exactPrefix(&p_at, &q_at, &prng);
         var x0 = d0;
         var x1 = d1;
         switch (accepted) {
@@ -2767,168 +2843,6 @@ test "seeded MTP draft and correction draws replay despite unrelated MLX random 
     try testing.expect(!all_same);
 }
 
-test "typical + greedy tail: an argmax tail is accepted when it clears the entropy floor" {
-    // Depth 0 is the sampled token 1 (p 0.3, floor 0.2 * exp(-H) = 0.071); depth 1
-    // is the head's argmax, judged against row 1's floor of 0.130. The q rows the
-    // chain carries (a density, then a one-hot) do not move a typical decision.
-    const s = mlx.gpuStream();
-    const p_data = [_]f32{ 0.5, 0.3, 0.2, 0.0, 0.02, 0.9, 0.04, 0.04, 0.0, 0.0, 0.0, 1.0 };
-    const probs = mlx.mlx_array_new_data(&p_data, &[_]c_int{ 1, 3, 4 }, 3, .float32);
-    defer _ = mlx.mlx_array_free(probs);
-    const q0_data = [_]f32{ 0.3, 0.5, 0.2, 0.0 };
-    const q0 = mlx.mlx_array_new_data(&q0_data, &[_]c_int{ 1, 4 }, 2, .float32);
-    defer _ = mlx.mlx_array_free(q0);
-
-    const Case = struct { tail: i32, accepted: u32 };
-    // The target's own mode clears the floor; a head argmax the target puts 0.04 on does not.
-    for ([_]Case{ .{ .tail = 1, .accepted = 2 }, .{ .tail = 2, .accepted = 1 } }) |case| {
-        const d0_id: i32 = 1;
-        const d0 = mlx.mlx_array_new_data(&d0_id, &[_]c_int{1}, 1, .int32);
-        defer _ = mlx.mlx_array_free(d0);
-        const d1 = mlx.mlx_array_new_data(&case.tail, &[_]c_int{1}, 1, .int32);
-        defer _ = mlx.mlx_array_free(d1);
-        const q1 = try lazyOneHotRow(d1, 4, s);
-        defer _ = mlx.mlx_array_free(q1);
-        var g = try Generator.mtpBatchedTypicalGraph(probs, &.{ d0, d1 }, &.{ q0, q1 }, 2, 0.2, .{}, s);
-        defer g.deinit();
-        try mlx.check(mlx.mlx_array_eval(g.accept_p));
-        try mlx.check(mlx.mlx_array_eval(g.accept_q));
-        const p = mlx.mlx_array_data_float32(g.accept_p) orelse return error.InvalidDtype;
-        const floor = mlx.mlx_array_data_float32(g.accept_q) orelse return error.InvalidDtype;
-        try testing.expectApproxEqAbs(@as(f32, 0.0714), floor[0], 1e-3);
-        try testing.expectApproxEqAbs(@as(f32, 0.1300), floor[1], 1e-3);
-        var rng = std.Random.DefaultPrng.init(1);
-        try testing.expectEqual(case.accepted, mtp_acceptance.typicalPrefix(p[0..2], floor[0..2], null, &rng));
-    }
-}
-
-test "greedy tail: each depth's verify q is the density its draft came from" {
-    // Depth 0 of a sampled request draws from the shortlist; depth 1 takes its
-    // argmax. The rows the chain hands the verify must be exactly those
-    // proposals: a shortlist density with the draft in its support, then a
-    // one-hot at the argmax, so accept_q = [q0(d0), 1] and a reject at depth 1
-    // can never re-draw d1.
-    try mlx.requireGpu();
-    const s = mlx.gpuStream();
-    const allocator = testing.allocator;
-    const V: c_int = 4096;
-    const N: usize = 32;
-    var ids: [N]u32 = undefined;
-    var logits: [N]f32 = undefined;
-    for (0..N) |i| {
-        ids[i] = @intCast(37 + i * 101);
-        logits[i] = @as(f32, @floatFromInt(i)) * 0.25;
-    }
-    var sl = mtp_mod.Shortlist{
-        .cands = mlx.mlx_array_new_data(&ids, &[_]c_int{@intCast(N)}, 1, .uint32),
-        .exact = mlx.mlx_array_new_data(&logits, &[_]c_int{ 1, 1, @intCast(N) }, 3, .float32),
-        .rows = V,
-    };
-    defer sl.deinit();
-
-    const target = SamplingParams{ .temperature = 1.0 };
-    var props: [2]StepProposal = undefined;
-    var built: usize = 0;
-    defer for (props[0..built]) |p| {
-        _ = mlx.mlx_array_free(p.id);
-        _ = mlx.mlx_array_free(p.q);
-    };
-    for (&props, 0..) |*p, d| {
-        const greedy = Generator.mtpDraftGreedyAt(target, true, @intCast(d));
-        p.* = try shortlistStepProposal(sl, Generator.mtpDraftSamplingFor(target, greedy, mtp_round.MTP_DRAFT_TEMP), s);
-        built += 1;
-        // Every depth drafts the same `[1]` id shape: the verify concatenates them.
-        try testing.expectEqualSlices(c_int, &.{1}, mlx.getShape(p.id));
-    }
-
-    const q0 = try proposalTestRead(allocator, props[0].q, @intCast(V), s);
-    defer allocator.free(q0);
-    const q1 = try proposalTestRead(allocator, props[1].q, @intCast(V), s);
-    defer allocator.free(q1);
-    const id_reads = [_][]f32{
-        try proposalTestRead(allocator, props[0].id, 1, s),
-        try proposalTestRead(allocator, props[1].id, 1, s),
-    };
-    defer for (id_reads) |r| allocator.free(r);
-    const id0: usize = @intFromFloat(id_reads[0][0]);
-    const id1: usize = @intFromFloat(id_reads[1][0]);
-    var sum0: f64 = 0;
-    var support0: usize = 0;
-    for (q0) |v| {
-        sum0 += v;
-        if (v > 0) support0 += 1;
-    }
-    try testing.expect(@abs(sum0 - 1.0) < 1e-4 and support0 > 1 and q0[id0] > 0);
-    try testing.expectEqual(@as(usize, ids[N - 1]), id1);
-    for (q1, 0..) |v, i| try testing.expectEqual(@as(f32, if (i == id1) 1 else 0), v);
-
-    // Target rows: row 1 splits its mass between the argmax draft and one other id.
-    const Vu: usize = @intCast(V);
-    const other: usize = ids[0];
-    const p_data = try allocator.alloc(f32, 3 * Vu);
-    defer allocator.free(p_data);
-    @memset(p_data, 0);
-    @memcpy(p_data[0..Vu], q0);
-    p_data[Vu + id1] = 0.5;
-    p_data[Vu + other] = 0.5;
-    p_data[2 * Vu + other] = 1.0;
-    const probs = mlx.mlx_array_new_data(p_data.ptr, &[_]c_int{ 1, 3, V }, 3, .float32);
-    defer _ = mlx.mlx_array_free(probs);
-    var g = try Generator.mtpBatchedAcceptGraph(probs, &.{ props[0].id, props[1].id }, &.{ props[0].q, props[1].q }, 2, .{}, s);
-    defer g.deinit();
-    try mlx.check(mlx.mlx_array_eval(g.accept_q));
-    try mlx.check(mlx.mlx_array_eval(g.accept_p));
-    try mlx.check(mlx.mlx_array_eval(g.corr_samples));
-    const aq = mlx.mlx_array_data_float32(g.accept_q) orelse return error.InvalidDtype;
-    const ap = mlx.mlx_array_data_float32(g.accept_p) orelse return error.InvalidDtype;
-    const corr = mlx.mlx_array_data_int32(g.corr_samples) orelse return error.InvalidDtype;
-    try testing.expectApproxEqAbs(q0[id0], aq[0], 1e-6);
-    try testing.expectEqual(@as(f32, 1.0), aq[1]);
-    try testing.expectEqual(@as(f32, 0.5), ap[1]);
-    try testing.expectEqual(@as(i32, @intCast(other)), corr[1]);
-}
-
-test "MTP TokenV3 batched graph uses full pi for sampled and one-hot drafts" {
-    const s = mlx.gpuStream();
-    const p_data = [_]f32{ 0.8, 0.19, 0.01, 0, 0, 0, 0, 1 };
-    const p_shape = [_]c_int{ 1, 2, 4 };
-    const probs = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
-    defer _ = mlx.mlx_array_free(probs);
-    const id: i32 = 2;
-    const id_shape = [_]c_int{1};
-    const draft = mlx.mlx_array_new_data(&id, &id_shape, 1, .int32);
-    defer _ = mlx.mlx_array_free(draft);
-    const drafts = [_]mlx.mlx_array{draft};
-    const q_data = [_]f32{ 0.1, 0.2, 0.7, 0 };
-    const q_shape = [_]c_int{ 1, 4 };
-    const q = mlx.mlx_array_new_data(&q_data, &q_shape, 2, .float32);
-    defer _ = mlx.mlx_array_free(q);
-    const qs = [_]mlx.mlx_array{q};
-
-    var sampled = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 1, 0.95, .{}, s);
-    defer sampled.deinit();
-    try mlx.check(mlx.mlx_array_eval(sampled.accept_p));
-    try mlx.check(mlx.mlx_array_eval(sampled.accept_q));
-    try mlx.check(mlx.mlx_array_eval(sampled.accept_defer));
-    const pi_draft = mlx.mlx_array_data_float32(sampled.accept_p) orelse return error.InvalidDtype;
-    const q_draft = mlx.mlx_array_data_float32(sampled.accept_q) orelse return error.InvalidDtype;
-    const deferred = mlx.mlx_array_data_bool(sampled.accept_defer) orelse return error.InvalidDtype;
-    try testing.expectApproxEqAbs(@as(f32, 0.007), pi_draft[0], 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 0.7), q_draft[0], 1e-6);
-    try testing.expect(deferred[0]);
-    try mlx.check(mlx.mlx_array_eval(sampled.corr_samples));
-    const corr = mlx.mlx_array_data_int32(sampled.corr_samples) orelse return error.InvalidDtype;
-    try testing.expect(corr[0] == 0 or corr[0] == 1);
-    try testing.expectEqual(@as(i32, 3), corr[1]);
-
-    var onehot = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, null, 1, 0.95, .{}, s);
-    defer onehot.deinit();
-    try mlx.check(mlx.mlx_array_eval(onehot.accept_p));
-    const onehot_pi = mlx.mlx_array_data_float32(onehot.accept_p) orelse return error.InvalidDtype;
-    try testing.expectApproxEqAbs(@as(f32, 0.01), onehot_pi[0], 1e-6);
-    try testing.expect(onehot.accept_q.ctx == null);
-}
-
 fn evalLazyToken(lazy: mlx.mlx_array) !u32 {
     defer _ = mlx.mlx_array_free(lazy);
     try mlx.check(mlx.mlx_array_eval(lazy));
@@ -3004,6 +2918,62 @@ test "suppress_mask: a mask the engine could not apply fails the draw by its err
     try std.testing.expectEqual(@as(u32, 5), mlx.mlx_array_data_uint32(drawn).?[0]);
 }
 
+test "sampler: on the engine a draft off a shortlist holding the target's kept ids draws the target's token at its position" {
+    try mlx.requireGpu();
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was_enabled);
+    const s = mlx.engine.stream();
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    const a = testing.allocator;
+    const V = 1500;
+    const rows = 4;
+    const first_draw = 40;
+    const flat = try a.alloc(f32, rows * V);
+    defer a.free(flat);
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    for (flat) |*x| x.* = prng.random().floatNorm(f32) * 2;
+    const logits = mlx.mlx_array_new_data(flat.ptr, &[_]c_int{ 1, rows, V }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var sampling: SamplingParams = .{ .temperature = 0.8, .top_k = 20, .draw_root = 5, .draw = first_draw };
+    const target = try verifyDraws(logits, rows - 1, sampling, s);
+    defer _ = mlx.mlx_array_free(target);
+    try mlx.check(mlx.mlx_array_eval(target));
+    const want = mlx.mlx_array_data_uint32(target).?[0..rows];
+
+    const order = try a.alloc(u32, V);
+    defer a.free(order);
+    var drafts: [rows]u32 = undefined;
+    for (&drafts, 0..) |*d, r| {
+        // The row's 32 largest ids, the top-k's 20 among them, listed out of order as a coarse readout lists them.
+        const row: []const f32 = flat[r * V ..][0..V];
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        std.mem.sort(u32, order, row, struct {
+            fn above(x: []const f32, i: u32, j: u32) bool {
+                return x[i] > x[j];
+            }
+        }.above);
+        var ids: [32]u32 = order[0..32].*;
+        std.mem.reverse(u32, &ids);
+        var vals: [32]f32 = undefined;
+        for (&vals, ids) |*v, id| v.* = row[id];
+        const cands = mlx.mlx_array_new_data(&ids, &[_]c_int{32}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(cands);
+        const exact = mlx.mlx_array_new_data(&vals, &[_]c_int{ 1, 32 }, 2, .float32);
+        defer _ = mlx.mlx_array_free(exact);
+        sampling.draw = first_draw + r;
+        const id = try shortlistDraw(.{ .cands = cands, .exact = exact, .rows = V }, sampling, s);
+        defer _ = mlx.mlx_array_free(id);
+        try mlx.check(mlx.mlx_array_eval(id));
+        d.* = @intCast(mlx.mlx_array_data_int32(id).?[0]);
+    }
+    try testing.expectEqualSlices(u32, want, &drafts);
+    try testing.expect(!std.mem.allEqual(u32, want, want[0]));
+}
+
 test "sampler: on the engine a sampled step, the sync sampler and a block's rows each draw the rule's token for their position" {
     try mlx.requireGpu();
     const had_error = mlx.errorPending();
@@ -3037,7 +3007,7 @@ test "sampler: on the engine a sampled step, the sync sampler and a block's rows
         @memcpy(ruled, flat[r * V ..][0..V]);
         ruled[7] = -std.math.inf(f32);
         @memset(ruled[V - 4 ..], -std.math.inf(f32));
-        const rule = sampler_draw.hostDraw(ruled, order, sampling.temperature, sampling.top_p, sampling.top_k, random.drawKey(99, first_draw + r));
+        const rule = sampler_draw.hostDraw(ruled, order, sampling.temperature, sampling.top_p, sampling.top_k, sampling.min_p, random.drawKey(99, first_draw + r));
         // The data makes every call a clear one, so the rule's id is the only right answer.
         try testing.expect(rule.gap > 1e-3 and rule.nucleus_margin > 1e-4);
         w.* = rule.id;
@@ -3497,8 +3467,9 @@ test "shortlist top-p equals the whole row's ranking, ties and 248320-wide rows"
             try applyTopP(&full, masked, cfg.p, 0, s);
             try samplerTestExpectSameBits(short, full, rows * v, s);
 
-            // Same filtered logits and the same key must draw the same token.
-            for (0..8) |d| {
+            // Same filtered logits and the same key must draw the same token: the bits above already match, so two
+            // keys stand for the rest.
+            for (0..2) |d| {
                 const key = seedKey(.{ .seed = 12345, .draw = @intCast(d) });
                 defer _ = mlx.mlx_array_free(key);
                 var a = mlx.mlx_array_new();

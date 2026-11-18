@@ -101,6 +101,9 @@ check_flag --expert-cache-gb 60
 check_flag --embedding-max-length 512
 check_flag --reasoning-budget 4
 check_flag --logit-bias-file bias.json
+check_flag --mtp-typical 0.2
+check_flag --mtp-tokenv3 0.95
+check_flag --mtp-greedy-tail
 
 echo "== unsupported checkpoint format refused by name =="
 TMP=$(mktemp -d)

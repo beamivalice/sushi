@@ -137,52 +137,6 @@ test "mtpEvPlanFor: realistic warmup EMAs stop the generic surface early and nev
     try testing.expectEqual(@as(u32, 1), cold_plan.m_hi);
 }
 
-test "MTP TokenV3 full Qwen3.8 vocabulary graph stays finite at depth three" {
-    const s = mlx.gpuStream();
-    const vocab: usize = 248_320;
-    const p_data = try testing.allocator.alloc(f32, 4 * vocab);
-    defer testing.allocator.free(p_data);
-    @memset(p_data, 0);
-    for (0..3) |row| {
-        p_data[row * vocab] = 0.8;
-        p_data[row * vocab + 1] = 0.19;
-        p_data[row * vocab + 2] = 0.01;
-    }
-    p_data[3 * vocab + 3] = 1.0;
-    const p_shape = [_]c_int{ 1, 4, @intCast(vocab) };
-    const probs = mlx.mlx_array_new_data(p_data.ptr, &p_shape, 3, .float32);
-    defer _ = mlx.mlx_array_free(probs);
-    const q_data = try testing.allocator.alloc(f32, vocab);
-    defer testing.allocator.free(q_data);
-    @memset(q_data, 0);
-    q_data[0] = 0.1;
-    q_data[1] = 0.2;
-    q_data[2] = 0.7;
-    const q_shape = [_]c_int{ 1, @intCast(vocab) };
-    const q = mlx.mlx_array_new_data(q_data.ptr, &q_shape, 2, .float32);
-    defer _ = mlx.mlx_array_free(q);
-    const draft_id: i32 = 2;
-    const id_shape = [_]c_int{1};
-    const draft = mlx.mlx_array_new_data(&draft_id, &id_shape, 1, .int32);
-    defer _ = mlx.mlx_array_free(draft);
-    const drafts = [_]mlx.mlx_array{ draft, draft, draft };
-    const qs = [_]mlx.mlx_array{ q, q, q };
-    var g = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 3, 0.95, .{}, s);
-    defer g.deinit();
-    try mlx.check(mlx.mlx_array_eval(g.accept_p));
-    try mlx.check(mlx.mlx_array_eval(g.accept_defer));
-    try mlx.check(mlx.mlx_array_eval(g.corr_samples));
-    const pi_draft = mlx.mlx_array_data_float32(g.accept_p) orelse return error.InvalidDtype;
-    const deferred = mlx.mlx_array_data_bool(g.accept_defer) orelse return error.InvalidDtype;
-    const corr = mlx.mlx_array_data_int32(g.corr_samples) orelse return error.InvalidDtype;
-    for (0..3) |k| {
-        try testing.expectApproxEqAbs(@as(f32, 0.007), pi_draft[k], 1e-5);
-        try testing.expect(deferred[k]);
-        try testing.expect(corr[k] == 0 or corr[k] == 1);
-    }
-    try testing.expectEqual(@as(i32, 3), corr[3]);
-}
-
 test "qwen4: the coarse rerank head is READY before any draft has run" {
     // The head is a full `requantizeRows` of the trunk lm_head plus a
     // synchronous eval of its ~240 MB. Built lazily it landed inside the
@@ -558,7 +512,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     }
 }
 
-test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, every later depth a one-hot at its draft (QWEN4_TEST_MODEL)" {
+test "sampled qwen4 chains hand the verify the density each depth drew from (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     try mlx.requireGpu();
     const predraft = mtp_round.mtp_predraft_enabled;
@@ -602,13 +556,8 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
                 defer testing.allocator.free(id_read);
                 const id: usize = @intFromFloat(id_read[0]);
                 var sum: f64 = 0;
-                var support: usize = 0;
-                for (q) |v| {
-                    sum += v;
-                    if (v > 0) support += 1;
-                }
+                for (q) |v| sum += v;
                 try testing.expect(@abs(sum - 1.0) < 1e-3 and q[id] > 0);
-                if (i > 0) try testing.expect(support == 1 and q[id] == 1.0);
             }
         }
     };
@@ -623,7 +572,6 @@ test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, ev
         slot.* = try MtpChainTestSlot.init(a, io, &xfm, &tok, prompt[0..if (i == 1) @as(usize, 61) else 96], depth);
         const g = &slot.*.?.gen.?;
         g.sampling = .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20, .seed = 11 + i, .suppress_mask = g.sampling.suppress_mask };
-        g.mtp_greedy_tail = true;
     }
     for (0..3) |_| {
         const g = &slots[0].?.gen.?;

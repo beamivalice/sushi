@@ -44,7 +44,6 @@ const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;
 const tokenizer_mod = @import("tokenizer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
-const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const model_settings_mod = @import("model_settings.zig");
 const effort_mod = @import("effort.zig");
 const arch_config = @import("arch/config.zig");
@@ -153,8 +152,12 @@ pub const ModelConfig = struct {
     /// The bank rates the pack's codebook table has a row for (bit n/2); null admits every rate.
     expert_quant_rates: ?u128 = null,
     expert_tile_order: expert_exl3.TileOrder = .pack,
+    /// The most rate groups one layer's routed experts span (`<proj>.g<i>` in the pack index); 1 for an ungrouped pack.
+    expert_rate_groups: u8 = 1,
     /// How the trunk projections a pack stores as trellis banks decode (`trunk_quant`); null for an all-affine trunk.
     trunk_quant: ?expert_exl3.Decode = null,
+    /// The trunk banks' rate (`trunk_quant.k`), for the pack's label; null for an all-affine trunk.
+    trunk_quant_rate: ?expert_exl3.Rate = null,
     expert_source_dir: ?[]u8 = null,
     /// `SUSHI_NGRAM_BF16_DIR`: serve the PLE n-gram table from the ORIGINAL bf16
     /// shards in this HF checkpoint dir instead of the pack's quantized `ngram_table.bin`
@@ -356,12 +359,12 @@ pub const ModelConfig = struct {
     ctx_override: u32 = 0,
     kv_quant_override: ?kv_quant_mod.KVQuantConfig = null,
     mtp_override: ?bool = null,
-    mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
-    mtp_greedy_tail_override: ?bool = null,
     /// Per-model `ssd_budget_gb` (GiB, the `--ssd-budget-gb` unit) from model-settings.json; 0 = none.
     ssd_budget_gb_override: u32 = 0,
     preserve_thinking_override: ?bool = null,
     think_penalty_override: ?f32 = null,
+    /// model-settings.json `expert_cache_bias`; `expertCacheBias` resolves it under the flag.
+    expert_cache_bias_override: ?f32 = null,
     logit_bias_file_override: ?@import("logit_bias.zig").FilePath = null,
     vision_override: ?bool = null,
     max_tokens_override: ?u32 = null,
@@ -842,6 +845,11 @@ pub const ModelConfig = struct {
         return self.ssd_prefetch orelse self.ssd_prefetch_override orelse default_ssd_prefetch;
     }
 
+    /// The cache-favoring pick's bias (`--expert-cache-bias`): the launch flag, else the model setting, else 0 (exact).
+    pub fn expertCacheBias(self: *const ModelConfig) f32 {
+        return model_settings_mod.expert_cache_bias_flag orelse self.expert_cache_bias_override orelse 0;
+    }
+
     /// Whether DeepSeek-V4.1 decodes on Sushi Cooler: the launch flag, else the model setting, else on.
     pub fn coolerChoice(self: *const ModelConfig) model_settings_mod.CoolerChoice {
         return model_settings_mod.CoolerChoice.resolve(self.cooler_flag != null, self.cooler_override);
@@ -861,7 +869,7 @@ pub const ModelConfig = struct {
     }
 
     /// The budget of a request that omits `max_tokens`, when `--max-tokens` is not given: the model's `max_tokens` setting,
-    /// else the architecture's own; 0 = the rest of the window.
+    /// else the architecture's own; 0 = neither, and `request_policy.filledMaxTokens` takes the engine default.
     pub fn defaultMaxTokens(self: *const ModelConfig) u32 {
         return self.max_tokens_override orelse self.serve_defaults.max_tokens;
     }
@@ -1145,7 +1153,6 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         const first_moe: u16 = @intCast(config.first_k_dense_replace);
         if (expert_quant.layoutOfDirWithFirstMoe(allocator, io, config.model_type, model_dir, layers, first_moe)) |layout| {
             config.expert_layout = layout;
-            arch_config.adoptLayout(&config);
             if (layout == .mxfp4_individual) {
                 config.quant_mode = .mxfp4;
                 config.quant_bits = 4;
@@ -1166,9 +1173,11 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                 // Only the DeepSeek loader reads pair-major tiles; the index must name the order the config does.
                 if (spec.tile_order == .pair_major and !(arch_config.facts(&config) orelse arch_config.Facts{}).reads_pair_major) return error.Exl3TileOrderUnsupported;
                 if (try expert_quant.tileOrderOfDir(allocator, io, model_dir) != spec.tile_order) return error.Exl3TileOrderMismatch;
+                config.expert_rate_groups = try sushi_exl3.pack.widestRateGroupsOfDir(allocator, io, model_dir);
                 var k_buf: [8]u8 = undefined;
                 log.info("[expert-exl3] engaged K={s} codebook={s} window={d}\n", .{ spec.rate.kText(&k_buf), @tagName(spec.codebook), spec.window.bits() });
             }
+            arch_config.adoptLayout(&config);
         } else if (expert_quant.hasGroupedExl3Index(allocator, io, model_dir)) {
             return error.ExpertLayoutUnsupported;
         }
@@ -1919,7 +1928,7 @@ pub fn usesSushiQuantMemoryBill(config: *const ModelConfig) bool {
 }
 
 /// The quantization group a built arch's vision tower requantizes this matrix to at load; null keeps its stored bytes.
-fn towerQuantGroupAtLoad(key: []const u8, bf16: bool, dims: []const u64) ?u32 {
+pub fn towerQuantGroupAtLoad(key: []const u8, bf16: bool, dims: []const u64) ?u32 {
     inline for (comptime std.enums.values(registry.Tag)) |t| {
         const M = registry.Mod(t).media;
         if (@hasDecl(M, "quantGroupAtLoad")) if (M.quantGroupAtLoad(key, bf16, dims)) |group| return group;
@@ -2120,7 +2129,7 @@ pub fn loadWeightsForConfig(
     try archGate(config);
     if (config.pack_revision) |rev| try pack_revision_mod.verify(io, allocator, model_dir, rev);
     if (config.expert_layout == .exl3_k4 and !(arch_config.facts(config) orelse arch_config.Facts{}).reads_own_source) try @import("pack_index.zig").validateExl3Pack(io, allocator, model_dir, config);
-    const scope = @import("arch/cooler.zig").LoadScope.weights(config);
+    const scope = try @import("arch/cooler.zig").LoadScope.weights(config);
     defer scope.end();
     if (try arch_load.weights(io, allocator, model_dir, config, load_vision)) |weights| return weights;
     return loadWeightsGeneric(io, allocator, model_dir, config, load_vision);
@@ -4711,4 +4720,19 @@ test "configOverridesSetRope: only an override that names the RoPE or the window
     try testing.expect(configOverridesSetRope());
     setConfigOverrides("not json");
     try testing.expect(!configOverridesSetRope());
+}
+
+test "ModelConfig.expertCacheBias: the launch flag, else the model setting, else 0" {
+    const t = std.testing;
+    const saved = model_settings_mod.expert_cache_bias_flag;
+    defer model_settings_mod.expert_cache_bias_flag = saved;
+    var c: ModelConfig = .{};
+    model_settings_mod.expert_cache_bias_flag = null;
+    try t.expectEqual(@as(f32, 0), c.expertCacheBias());
+    c.expert_cache_bias_override = 0.2;
+    try t.expectEqual(@as(f32, 0.2), c.expertCacheBias());
+    model_settings_mod.expert_cache_bias_flag = 0;
+    try t.expectEqual(@as(f32, 0), c.expertCacheBias());
+    model_settings_mod.expert_cache_bias_flag = 0.5;
+    try t.expectEqual(@as(f32, 0.5), c.expertCacheBias());
 }

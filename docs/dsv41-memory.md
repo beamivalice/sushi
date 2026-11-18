@@ -77,7 +77,8 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
 - The per-request state (890 B a token, 0.93 GB at 1M) and the prefill transient are not in the SSD budget. They come
   from the serving budget (the GPU ceiling less everything resident), billed per request. `/props`
   `memory.kv_cache_bytes` and a live `/metrics` row's `state_bytes` count it (`dsv41_model.stateBytes` plus the live
-  points) while the request runs.
+  points) while the request runs; between requests the model parks it and `kv_cache_bytes` still counts it
+  (`sched.parkedStateBytes`).
 
 <a id="transient-caps"></a>
 ## Transient caps
@@ -92,15 +93,62 @@ pool on demand and the phase's bytes plus the pool never pass the limit. A reque
 
 The phase's bytes are the bill: `Config.forwardCap(rows, seq)` for a forward, `request_media.visionEncodeBill` for an image.
 
-    prefill-width forward (> 17 rows):  (rows x dim x 480 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
-    decode or verify forward (<= 17):   (seq x 16 x 4 x 3 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
-    joined decode forward (a row each): the sum of each request's decode term at its own seq, + 256 MiB once
+    prefill-width forward (> 17 rows):  shape sum(rows, seq) + seq x (state/16 + worst layer) + 256 MiB
+    decode or verify forward (<= 17):   seq x 16 x 4 x 3 + seq x (state/16 + worst layer) + 123 MiB + 256 MiB
+    joined decode forward (a row each): the sum of each request's decode term at its own seq, + 379 MiB once
+    prefill-width forward on MLX:       rows x dim x 480 + seq x (state/16 + worst layer) + 123 MiB + 256 MiB
 
-The per-row 480 B a channel is the 2.3 MiB a row measured from 256 to 2048 rows, rounded up (one 363-row chunk read 2.8
-MiB with its state rows); the per-context term is a decode block's scores (16 rows, 3 copies, f32) and the row stores'
-growth (a sixteenth of the state, plus one layer's old rows beside the new buffer: 55 + 356 B a token); the 256 MiB is
-twice the 0.12 GiB of small tensors a decode forward holds. A last chunk absorbs a tail, so a chunk bills
-`chunk + 511` rows (`chunkCap`).
+The per-context term is a decode block's scores (16 rows, 3 copies, f32) and the row stores' growth (a sixteenth of the
+state, plus one layer's old rows beside the new buffer: 55 + 356 B a token); the 123 MiB is the 0.12 GiB of small
+tensors a decode forward holds (`forward_held_bytes`) and the 256 MiB the bill's one margin (`BILL_MARGIN_BYTES`); no
+term is multiplied. A last chunk absorbs a tail, so a chunk bills `chunk + 511` rows (`chunkCap`).
+
+<a id="wide-shape-sum"></a>
+**The shape sum** (`dsv41_wide_bytes.bytes`, Sushi Cooler) is what the engine's pool holds in use at the fullest point
+of a wide forward, each tensor at its pool size class, from the shapes the forward makes. A layer's intermediates live
+in its scope to its end, its attention's and its routed chain's in child scopes, so the fullest point is the end of one
+layer's attention or of its routed chain, at the layer holding the most: an encoder layer that is an Engram layer, a KV
+source and an index owner (the tiny's 2, the release's 14). L is the chunk's rows, hc 4, n = L x top_k:
+
+| owner | live tensors (bf16 = act unless named) |
+|---|---|
+| pass | `pipe_depth` (2) streams `[L,hc,D]`; the collapse weights `[L,hc]` f32; each Engram layer's rows read so far `[L x cols, ehd]` f32; each ratio-2 source's open group, copied out, `[1,hd]` f32 twice; positions `[L]`, `[L/r]` and two `[span]` a span to eight arrays; each span's index top-k `[span, topk]` i32; the state rows appended so far (FP4 codes and scales, at the worst compression phase); STQ trunk: `linear.gemmInputs` row tables for `[L]` and `[o_groups x L]` |
+| Engram write | the rows `[L, cols x ehd]`, `wkv` `[L,(hc+1)D]`, eight f32 `[L,hc,D]`, value `[L,D]` f32, sixteen `[L,hc]` f32, the sign mask, the new stream `[L,hc,D]` |
+| hc, twice | mixes `[L,(2+hc)hc]` f32, pre and post `[L,hc]` f32, comb `[L,hc,hc]` f32, the normed input `[L,D]`; the FFN stage's stream expanded `[L,hc,D]`, and where the fused expand does not serve (`dsv41_wide_bytes.expand_fused`, which a load records, else the GPU class: a non-NAX GPU, whose f32 matmul `hcExpandFused` does not reproduce, or the fused kernels off) `hcExpandOps`'s chain beside it: four f32 `[L,hc,D]` (the stream's copy, the product, the matmul, their sum) and the output's f32 `[L,D]` |
+| attention (child) | `wq_a`, `q_norm` `[L,q_lora]`, `wkv` and the window rows `[L,hd]`, `wq_b` and the roped queries `[L,H,hd]`; the compressor (f32 input `[L,D]`, its projections and their join to the pending rows `[L+r-1,hd]` f32, the new pending rows copied out, softmax and pool, latents, index keys, FP4 codes); every span's heads; the last span's band, indexer (queries f32, scores `[span, min(keys, 32768)]` f32, the keys it unpacks) and the head kernel's or `attnCore`'s scores `[span,H,window+span+topk]` f32 |
+| after attention | its output `[L,D]`; the window rows `[L,hd]`, which the ring write's source keeps in use until the layer's pass runs |
+| last expand (after the routed chain's scope) | the routed sum `[L,D]`, the new stream `[L,hc,D]`, and on the chain arm `hcExpandOps`'s four f32 `[L,hc,D]` and f32 `[L,D]`; a wide forward never folds it into the routed chain (`foldsExpand` is decode-wide only), so a layer peaks at its attention, its routed chain or this |
+| router | the input `[L,D]` f32, the weight `[E,D]` f32, a `[2048,E]` f32 tile at a time and their concat, the picks and weights `[L,top_k]` |
+| routed chain (child), STQ fused (`moePrefillSharedFusedFrom`, up to 6 pools) | slots, sort and order `[n]`, the shared and routed prep `[L,D]`, `[n,D]` twice each, shared gate and up `[L,I]`, the window table, a gate and an up plane `[n,I]` per pool, the SwiGLU `[n,I]`, shared `[L,I]` and `[L,D]`, a down plane `[n,D]` per pool, the f32 sum `[L,D]` |
+| routed chain, STQ combined (`moePrefillFrom`, more than 6 pools) | the shared expert as ops (gate, up, eight f32 `[L,I]`, down), sort, prep `[n,D]` twice, gate and up combined and the SwiGLU `[n,I]`, a down plane per pool and their combine `[n,D]` |
+| routed chain, FP4 (`moeWide`) | the shared expert as ops, six `[n]` index arrays, the gathered rows `[n,D]`, gate, up, SwiGLU `[n,I]`, down `[n,D]`, the sum `[L,D]` |
+
+The data-dependent maxima are the bill's: a streamed route reads each rate group from its cache pool and its spill
+pool, so it bills `2 x rate_groups` pools (`ModelConfig.expert_rate_groups`, the pack's widest layer; above 6 pools the
+combined chain), and a ratio-r compressor bills `r - 1` pending rows. A resident load's route reads one pool a group:
+its bill carries the spill pools it never makes. Decode forwards keep their scores term and `forward_held_bytes`.
+
+Measured (`dsv41 engine: a wide forward's in-use peak is its cap's shape sum less the spill pools its route did not
+take`, DSV41_STQ_TINY and DSV41_TINY at 512 to 8192 rows, one row in, all experts cached; the pair-major tiny is left out: tile order is fixed at the slab fill, never in the forward pool): the shape sum at the pools taken sits over the
+in-use peak by 10 pages on the STQ tinies (9 at 512 rows) and 1 page on DSV41_TINY (3 at 512): page-sized tables and
+constants a route reuses. On a non-NAX GPU (M1 Max) the expand's chain, at the attention's expand and at the layer's last
+expand, keeps every tiny inside its bill at every width: the STQ tiny was 46.2 MB in use against 40.5 MB billed at 512
+rows, DSV41_TINY about 600 B a row over (its routed chain is smaller than the last expand's chain); DSV41_TINY now sits
+108 KB under at 512 rows and 536 KB under at 8,192. The STQ tiny's sum at 8192 rows is 637.5 MB at six pools, 75.5 MB of them the three spill
+pools its cached route never makes.
+
+| release (STQ-1.75bpw, 10 pools) rows | shape sum, GB | new cap at seq = rows, GB | old cap, GB |
+|---|---|---|---|
+| 363 | 0.751 | 1.020 | 1.290 |
+| 2,048 | 4.081 | 4.350 (4.443 at 225k) | 5.431 (5.523 at 225k) |
+| 4,096 | 8.161 | 8.431 | 10.465 |
+| 8,192 | 16.314 | 16.586 | 20.533 |
+
+The release checkpoint itself (FP4 experts, FP8 trunk) on Sushi Cooler: 2.718 GB at 2,048 rows, cap 2.987 GB.
+
+**MLX keeps the measured row term** (`Config.mlxForwardCap`, the 480 B a channel below): MLX's graph holds what its
+evaluation order keeps, and the recorded MLX peaks sit above the engine's shape sum (2,048 rows: 4.57 GiB against 4.11
+GB).
 
 Measured peaks of MLX's own bytes, imported weights left out and the state's rows in (the reading then counted what
 was resident at the phase's start; it now counts only what the phase adds past it) (`SUSHI_TRANSIENT_PEAK=1`,
@@ -109,26 +157,29 @@ binary 26a28040, STQ-1.75bpw, `--ssd-budget-gb 108`, DSpark, one 225k-token cold
 
 | phase | rows | context | measured peak, GiB | cap, GB |
 |---|---|---|---|---|
-| decode | 1 | 9k / 225k | 0.116 / 0.336 | 0.28 / 0.44 |
-| DSpark draft, verify | 5, <= 17 | 225k | 0.304, 0.327 | 0.44 |
-| prefill chunk | 2048 | 2k / 225k | 4.57 / 4.77 | 6.6 / 6.7 |
-| prefill chunk | 256 / 1000 / 1183 | short | 0.57 / 2.25 / 2.48 | 1.0 / 3.4 / 3.9 |
+| decode | 1 | 9k / 225k | 0.116 / 0.336 | 0.40 / 0.53 |
+| DSpark draft, verify | 5, <= 17 | 225k | 0.304, 0.327 | 0.53 |
+| prefill chunk | 2048 | 2k / 225k | 4.57 / 4.77 | 5.4 / 5.5 |
+| prefill chunk | 256 / 1000 / 1183 | short | 0.57 / 2.25 / 2.48 | 1.0 / 2.9 / 3.3 |
 | vision encode | 8463 patches (1031 tokens) | | 1.11 | 1.47 (`visionEncodeBill`) |
 
-A cap is over the level its phase starts from, which holds the state: each cap covers a quarter over the measured peak
-less the state of the context (`dsv41 forward cap` test). Extrapolated to 1M tokens: a decode or verify forward 1.06 GB,
-a 2048-row chunk 7.1 GB and a tail-merged one (2559 rows) 8.7 GB. The decode slope the measurements give beyond the
-state's 890 B a token is 204 B; the cap carries 603 B (x 5/4).
+A cap is over the level its phase starts from, which holds the state: each MLX cap covers the measured peak less the
+state of the context (`dsv41 forward cap: on MLX` test); the 363-row chunk is the one whose rows and fixed bytes alone
+fall short (by 74 MB, inside the margin). Extrapolated to 1M tokens: a decode or verify forward 1.03 GB, a 2048-row chunk 5.9 GB and a
+tail-merged one (2559 rows) 7.1 GB. The decode slope the measurements give beyond the state's 890 B a token is 204 B; the
+cap carries 603 B.
 
 **What the bill is now** (`prefillNeededAtChunk`, the borrow's `prefillNeed`; the old bill was
 `transientBytes x 5/4 + (8 GiB - 1 GiB)` pool growth for a prefill and `decodeTransientBytes(17) x 5/4` for a decode):
 
 | term | context | old, GB | new, GB |
 |---|---|---|---|
-| borrow need, 2048 rows | 14.8k / 225k / 1M | 15.1 / 15.3 / 15.8 | 6.6 / 6.7 / 7.1 |
-| chunk bill, 2048 + 511 rows | 14.8k / 225k / 1M | 16.4 / 16.6 / 17.1 | 8.1 / 8.2 / 8.7 |
-| decode or verify block | 9k / 225k / 1M | 0.55 / 0.71 / 1.33 | 0.28 / 0.44 / 1.06 |
+| borrow need, 2048 rows | 14.8k / 225k / 1M | 15.1 / 15.3 / 15.8 | 5.4 / 5.5 / 5.9 |
+| chunk bill, 2048 + 511 rows | 14.8k / 225k / 1M | 16.4 / 16.6 / 17.1 | 6.7 / 6.8 / 7.1 |
+| decode or verify block | 9k / 225k / 1M | 0.55 / 0.71 / 1.33 | 0.40 / 0.53 / 1.03 |
 | image encode | any | unchanged: the bill already covered the measured peak by a quarter | |
+
+Those are MLX's; on a Cooler load (the shape sum) a 2048-row chunk needs 4.35 / 4.44 / 4.78 GB at 2k / 225k / 1M.
 
 On a Cooler load (an STQ pack, [engine-own-forward](engine-own-forward.md#memory)) the request
 bill is the state and one forward's cap: the engine's pool is that cap (its free buffers are inside it), a prefill chunk
@@ -141,10 +192,17 @@ between requests, about 0.26 GB (`arch_config.expertPoolBytes`, the arch's own a
 - **A restore reserves the rows' slack** (`Rows.reserve`): the first step after a restore from a point someone keeps
   copied every layer's rows (1,441,792 bytes on the tiny fixture against 163,840 cold); it now takes 196,608 and does
   not grow with the context.
-- **What does not scale with the rows sits in the cap's slack** (`cap_slack_bytes`, 256 MB): the pool's whole pages
-  and, on MLX's stream only, the router's zero pad of a short tile (42 MB at the release's width,
-  [dsv41-arch](dsv41-arch.md#prefill-width)). A wide
-  chunk fits its row term alone (`each forward's pool peak stays inside its cap, a wide chunk's inside the cap less its slack`).
+- **The engine's cap is the forward's own** (`dsv41_borrow.enterForward`, `enterRows`), whether or not `serve`
+  installed MLX's: off serve (`sushi kld`, tests) a request's end left its rest cap (0.26 GB) in force, which refused a
+  4096-row chunk of the tiny from the load's second request on, and the first ran under no cap at all.
+- **A decode forward's fixed bytes** (`cap_fixed_bytes`, 379 MB) hold its small tensors; a wide forward's are in its
+  shape sum, page by page, and on MLX's stream the router's zero pad of a short tile (42 MB at the release's width,
+  [dsv41-arch](dsv41-arch.md#prefill-width)) sits in the MLX cap's fixed bytes.
+- **A wide forward copies a compressor's open group out** (`compress`): the pending rows are the tail of the kv and gate
+  joined to the rows before them, and a slice of it would keep the whole `[rows + r - 1, head_dim]` f32 pair in use
+  until the next chunk (1 KB a row on the STQ tiny; 25 MB after a 2,048-row chunk of the release, three ratio-2 sources),
+  past the state term (`stateFixedBytes`, `r - 1` rows). A decode or verify forward keeps the slice of its few rows: a
+  copy there is an op a token (`between two 2,048-row chunks the pool holds no more than the request's billed state`).
 
 The live headroom the borrow reads (`dsv41Headroom`) is the ceiling less `gpu_mem.activeBytes`, which holds the
 engine's pool buffers bound to live tensors (the state rows, window rings and rollback record) beside MLX's active
@@ -157,7 +215,7 @@ counts what it holds now. A tensor lent to MLX is in both counters, so the headr
 
 The pool growth (7.5 GB) was most of the old bill and the cap replaces it: a 2048-row chunk's need falls 8.3-8.7 GB,
 the rest being the measured per-row rate against the old formula. At wired 124000 with DSpark and the SSD tier on (the
-`with its decoder pools lendable` test), budget 117 and no decoder pool to lend, the advertised context is 390,144
+`with its decoder pools lendable` test), budget 117 and no decoder pool to lend, the advertised context is 581,632
 tokens where it was under 262,144.
 
 **Gates** (09977e23 vs main b66f36a8, budget 108, DSpark): greedy code, prose and image answers and their SSD-restore
@@ -282,7 +340,7 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
 (`ModelConfig.expert_borrow_bytes`, published live by the engine) do not cover it. At 1M: 3.4 GB in all.
 
 **The borrow** (`src/dsv41/dsv41_borrow.zig`, `Engine.borrowLayer`/`restoreLayer`):
-- Before every forward wider than 17 rows, its need, `Config.forwardCap(rows, seq)` (6.6 GB at 2048 rows),
+- Before every forward wider than 17 rows, its need, `Config.forwardCap(rows, seq)` (4.35 GB at 2048 rows on the STQ pack),
   against the live headroom (ceiling less MLX's active bytes). Short of it, whole decoder pools go, latest layer first
   (39 down to the CED split, 20): the plan is made from the pools' bytes before anything is released, a forward the
   pools cannot cover is refused (`PrefillDoesNotFit`) with nothing released, and the live headroom is re-read after each

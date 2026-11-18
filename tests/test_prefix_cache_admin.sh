@@ -158,6 +158,7 @@ check "kv_quant 16 is accepted and stored as off" "$(jq -e --arg p "$MODELS/alph
 post /v1/settings '{"model":"alpha","set":{"kv_quant":null}}' >/dev/null
 check "nothing is set: every key is default" "$(echo "$S" | jq '[.models[0].settings[] | .source] | all(. == "default")')"
 check "an unknown key is refused" "$(is "$(post /v1/settings '{"model":"alpha","set":{"temperature":1}}' | jq -r '.error.type')" unknown_setting)"
+check "a removed key is refused as removed" "$(post /v1/settings '{"model":"alpha","set":{"mtp_greedy_tail":true}}' | jq -r '.error.message' | grep -c '"mtp_greedy_tail" is removed' || true)"
 check "a bad value is refused" "$(is "$(post /v1/settings '{"model":"alpha","set":{"ssd_prefetch":101}}' | jq -r '.error.type')" invalid_setting)"
 check "an unknown model is a 404" "$(is "$(code -X POST "$BASE/v1/settings" -d '{"model":"nope","set":{"mtp":true}}')" 404)"
 check "saving a model key is ok" "$(post /v1/settings '{"model":"alpha","set":{"kv_quant":"4","think_penalty":2}}' | jq '.ok')"
@@ -210,8 +211,8 @@ boot --model-dir "$LIM" || { echo "[fail] boot"; exit 1; }
 S="$(get /v1/settings)"
 lim() { echo "$S" | jq -r --arg id "$1" ".models[] | select(.id == \$id) | .limits$2"; }
 check "GLM offers kv_quant off, 6 and 8 only" "$(is "$(lim glm '.kv_quant.choices | join(",")')" "off,6,8")"
-check "GLM has no MTP: mtp and its tail keys are disabled with a reason" \
-    "$(echo "$S" | jq '.models[] | select(.id == "glm") | [.limits.mtp, .limits.mtp_acceptance, .limits.mtp_greedy_tail] | all(.disabled and (.why | length > 0))')"
+check "GLM has no MTP: mtp is disabled with a reason" \
+    "$(echo "$S" | jq '.models[] | select(.id == "glm") | .limits.mtp | .disabled and (.why | length > 0)')"
 check "DeepSeek keeps no KV cache: kv_quant is disabled and absent from keys" \
     "$(echo "$S" | jq '.models[] | select(.id == "ds") | .limits.kv_quant.disabled and (.keys | index("kv_quant") == null)')"
 check "a pack without STQ experts has no expert prefetcher" "$(is "$(lim ds '.ssd_prefetch.disabled')" true)"
@@ -287,8 +288,6 @@ PY
     check "the loaded model reports the keys that apply and what it loaded with" \
         "$(get /v1/settings | jq '.models[] | select(.id == "tiny") | (.loaded_with != null) and (.keys | index("kv_quant") == null) and (.keys | index("ssd_prefetch") == null) and (.limits.ssd_prefetch.disabled) and (.limits.kv_quant.disabled)')"
     S="$(get /v1/props 2>/dev/null)"
-    P="$(get /props)"
-    check "/props does not report the file's acceptance as applying on DeepSeek" "$(echo "$P" | jq '.settings.mtp.acceptance_applies == false')"
     # The entry lands after the response; wait for the listing to show it.
     wait_entries() { for _ in $(seq 1 20); do [ "$(get /v1/prefix-cache | jq '[.namespaces[].entries] | add // 0')" -ge 1 ] && return 0; sleep 0.5; done; return 1; }
     first="$(ask)"

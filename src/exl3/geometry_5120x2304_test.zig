@@ -85,6 +85,9 @@ fn sharedChainCase(hidden: usize, inter: usize) !void {
     defer _ = mlx.mlx_array_free(act.x);
     const zeros: [16]u32 = @splat(0);
     const unit: [16]f32 = @splat(1);
+    // Each row count takes the first rows of one 16-row draw: the truth is computed once per row, for every width and dtype.
+    const truth16 = try alloc.alloc(f64, 16 * hidden);
+    for (0..16) |r| try dense.run(alloc, act.vals[r * hidden ..][0..hidden], hidden, inter, LIMIT, truth16[r * hidden ..][0..hidden]);
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
         var first: ?[]f32 = null;
         for ([_]usize{ 1, 2, 5, 16 }) |rows| {
@@ -106,12 +109,7 @@ fn sharedChainCase(hidden: usize, inter: usize) !void {
             defer _ = mlx.mlx_array_free(cy);
             const got = try toF32(s, y, &cy);
             for (got) |v| try t.expect(std.math.isFinite(v));
-            const want = try alloc.alloc(f64, got.len);
-            const tmp = try alloc.alloc(f64, hidden);
-            for (0..rows) |r| {
-                try dense.run(alloc, act.vals[r * hidden ..][0..hidden], hidden, inter, LIMIT, tmp);
-                @memcpy(want[r * hidden ..][0..hidden], tmp);
-            }
+            const want = truth16[0..got.len];
             const err = relRms(got, want);
             if (err >= 0.005) std.debug.print("dsv41 shared chain rows {d}: relRms {d}\n", .{ rows, err });
             try t.expect(err < 0.005);

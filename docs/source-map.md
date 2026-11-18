@@ -39,7 +39,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 | `qwen4/qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections, PLE / QSA | qwen4-arch, engine-mtp |
 | `mimo2/mimo_forward.zig` / `mimo2_shortlist.zig` | MiMo forward, attention arms, MoE dispatch, batched decode; the greedy lm-head shortlist | mimo2-arch, engine-mtp |
 | `glm5/glm5_*.zig` | GLM forward, MLA/KDA attention, router, DFlash2 verify, kernels, prefix state, vision | glm5-* |
-| `dsv41/dsv41_*.zig` / `row_grammar.zig` / `tokenizer_deepseek.zig` | DeepSeek-V4.1 loader, forward, QAT, Engram, stream hooks, prefill borrow, prefix state, vision, DSpark rounds, per-row grammar masks, pre-tokenizer; `dsv41/fixtures/` its Engram token map | dsv41-arch, dsv41-memory |
+| `dsv41/dsv41_*.zig` / `row_grammar.zig` / `tokenizer_deepseek.zig` | DeepSeek-V4.1 loader, forward, QAT, Engram, stream hooks, prefill borrow, the wide forward cap's shape sum (`dsv41_wide_bytes`), prefix state, vision, DSpark rounds, per-row grammar masks, pre-tokenizer; `dsv41/fixtures/` its Engram token map | dsv41-arch, dsv41-memory |
 | `dspark_rows.zig` / `expert_usage.zig` / `weights_where.zig` | DSpark verify width and the generator's DSpark types (a drafting method like DFlash); the pack's `expert_usage.json` and the `--drop-expert` set it ranks; the keep-predicate shard loader | dsv41-arch, pack-format |
 | `qwen4/qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side, fused HC prefill | qwen4-arch |
 | `qwen4/gdn_decode.zig` | fused GDN decode/verify step (one dispatch) | engine-kernels |

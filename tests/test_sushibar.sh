@@ -89,16 +89,19 @@ wait_health() {
     echo "$code"
 }
 
-# run_bar <binary> <polls> <actions> [args...]: one detached sushibar run through the seams, waited for.
+# run_bar <binary> <polls> <actions> [args...]: one detached sushibar run through the seams, waited for. TICK=<ms>
+# shortens its tick and poll waits alike (SUSHIBAR_TEST_TICK_MS); a run whose polls race a server starting, an update
+# check or a fake's delay keeps the real second. FAST is the tick of the runs that only read what is already up.
+FAST=100
 run_bar() {
     local bin="$1" polls="$2" actions="$3"
     shift 3
     : > "$LOG"
-    SUSHIBAR_TEST_POLLS="$polls" SUSHIBAR_TEST_ACTIONS="$actions" "$bin" "$@" 2> "$LOG"
+    SUSHIBAR_TEST_TICK_MS="${TICK:-}" SUSHIBAR_TEST_POLLS="$polls" SUSHIBAR_TEST_ACTIONS="$actions" "$bin" "$@" 2> "$LOG"
     BARRC=$?
     local pid
     pid=$(cut -d' ' -f1 "$HOME/.sushi/sushibar.pid" 2>/dev/null)
-    for _ in $(seq 1 80); do [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    for _ in $(seq 1 400); do [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
 }
 
 echo "== run on port $PORT =="
@@ -138,10 +141,10 @@ start_foreign() {
 }
 start_foreign
 check "a headless sushi started outside sushibar answers on $FPORT" "$(yes_if 'kill -0 "$FPID" 2>/dev/null')"
-run_bar "$BAR" 2 "" --port "$PORT"
+TICK=$FAST run_bar "$BAR" 2 "" --port "$PORT"
 check "a sushi nobody added is found by the scan but not listed in the Port data" "$(yes_if '! grep -q "ports=\".*'"$FPORT"' —" "$LOG"')"
 echo '{"port":'"$PORT"',"ports":['"$FPORT"']}' > "$HOME/.sushi/sushibar.json"
-run_bar "$BAR" 11 "confirm@1,models$FPORT@2,port$FPORT@4,stop@8" --port "$PORT"
+TICK=$FAST run_bar "$BAR" 11 "confirm@1,models$FPORT@2,port$FPORT@4,stop@8" --port "$PORT"
 check "an added port is listed with the state the scan finds, its model asked when the submenu opens" "$(yes_if 'grep -q "ports=\".*'"$FPORT"' — no model;" "$LOG"')"
 check "choosing it switches the watched port and names it in the status" "$(yes_if 'grep -q "poll [0-9]* .*Port '"$FPORT"': running, no model loaded\" start=0 stop=1" "$LOG"')"
 check "a sushi sushibar did not start offers Stop with the confirm ellipsis" "$(yes_if 'grep -q "toggle=\"Stop Server…\"" "$LOG"')"
@@ -151,7 +154,7 @@ check "Stop with the confirm answered ended that sushi" "$(yes_if '! kill -0 "$F
 wait "$FPID" 2>/dev/null
 
 start_foreign
-run_bar "$BAR" 6 "stop@2" --port "$FPORT"
+TICK=$FAST run_bar "$BAR" 6 "stop@2" --port "$FPORT"
 check "Stop without a confirm leaves a sushi sushibar did not start running" "$(yes_if 'kill -0 "$FPID" 2>/dev/null')"
 check "that status offered Stop" "$(yes_if 'grep -q "poll 1 .*Port '"$FPORT"': running.*stop=1" "$LOG"')"
 kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
@@ -162,25 +165,25 @@ FPID=$!
 for _ in $(seq 1 40); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$FPORT/metrics.json")" = 401 ] && break; sleep 0.5; done
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$FPORT/metrics.json")
 check "the strict server refuses a request without its key" "$(yes_if '[ "$code" = 401 ]')"
-run_bar "$BAR" 3 "" --port "$FPORT"
+TICK=$FAST run_bar "$BAR" 3 "" --port "$FPORT"
 check "sushibar sends the key the server's argv gives it and reads the server as running" "$(yes_if 'grep -q "poll [23] .*Port '"$FPORT"': running, no model loaded\" .*badge=0" "$LOG" && ! grep -q "Key needed" "$LOG"')"
 kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
 SB_TEST_KEY=sb-env-key "$SUSHI_BIN" --serve --port "$FPORT" --api-key-env SB_TEST_KEY --api-key-strict > /dev/null 2>&1 &
 FPID=$!
 for _ in $(seq 1 40); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$FPORT/metrics.json")" = 401 ] && break; sleep 0.5; done
-run_bar "$BAR" 3 "" --port "$FPORT"
+TICK=$FAST run_bar "$BAR" 3 "" --port "$FPORT"
 check "a key from --api-key-env is read from the server's own environment" "$(yes_if 'grep -q "poll [23] .*Port '"$FPORT"': running, no model loaded\"" "$LOG" && ! grep -q "Key needed" "$LOG"')"
 kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
 
 echo "== the Port field: an invalid number is refused in place, a valid one switches =="
-run_bar "$BAR" 8 "type99999@2,type$FPORT@5" --port "$PORT"
+TICK=$FAST run_bar "$BAR" 8 "type99999@2,type$FPORT@5" --port "$PORT"
 check "an invalid port turns the field red and keeps the watched port" "$(yes_if 'grep -q "poll [2-4] .*Port '"$PORT"':.*field_invalid=1" "$LOG"')"
 check "a valid port typed in the field switches the watched port" "$(yes_if 'grep -q "poll [6-8] .*Port '"$FPORT"':.*field_invalid=0" "$LOG"')"
 
 echo "== the chosen port persists, --port beats it =="
-run_bar "$BAR" 2 ""
+TICK=$FAST run_bar "$BAR" 2 ""
 check "a saved port is used on relaunch" "$(yes_if 'grep -q "poll 1 .*Port '"$FPORT"':" "$LOG"')"
-run_bar "$BAR" 2 "" --port "$PORT"
+TICK=$FAST run_bar "$BAR" 2 "" --port "$PORT"
 check "an explicit --port beats the saved one" "$(yes_if 'grep -q "poll 1 .*Port '"$PORT"':" "$LOG"')"
 
 echo "== added ports are kept, removable, and the default port is neither =="
@@ -189,23 +192,23 @@ DPORT=$((PORT + 9))
 APORT2=$((PORT + 10))
 rm -f "$HOME/.sushi/sushibar.json"
 echo '{"server":{"port":'"$DPORT"'}}' > "$HOME/.sushi/model-settings.json"
-run_bar "$BAR" 9 "port$APORT2@2,remove$DPORT@4,remove$APORT2@6" --port "$PORT"
+TICK=$FAST run_bar "$BAR" 9 "port$APORT2@2,remove$DPORT@4,remove$APORT2@6" --port "$PORT"
 check "the default port is listed first and has no remove button" "$(yes_if 'grep -q "poll 1 .*ports=\"'"$DPORT"' — not running;" "$LOG" && ! grep -q "removable=\"[^\"]*'"$DPORT"'" "$LOG"')"
 check "a port switched to is added, checked and removable" "$(yes_if 'grep -q "poll [3-4] .*ports=\"[^\"]*'"$APORT2"' — not running\*;.*removable=\"[^\"]*'"$APORT2"'" "$LOG"')"
 check "removing the default port does nothing" "$(yes_if 'grep -q "poll [5-6] .*ports=\"'"$DPORT"' — not running;'"$APORT2"' — not running\*;" "$LOG"')"
 check "removing the watched port forgets it and watches the default" "$(yes_if 'grep -q "poll [7-9] .*Port '"$DPORT"':.*ports=\"'"$DPORT"' — not running\*;" "$LOG" && ! grep -q "poll [7-9] .*'"$APORT2"' — not running" "$LOG"')"
 check "the saved file keeps the watched port and no added one" "$(yes_if 'grep -q "\"port\":'"$DPORT"',\"ports\":\[\]" "$HOME/.sushi/sushibar.json"')"
 start_foreign
-run_bar "$BAR" 8 "remove$FPORT@4" --port "$FPORT"
+TICK=$FAST run_bar "$BAR" 8 "remove$FPORT@4" --port "$FPORT"
 check "a watched port that was never added, with a sushi on it, has a remove button" "$(yes_if 'grep -q "poll [1-3] .*Port '"$FPORT"':.*removable=\"[^\"]*'"$FPORT"'" "$LOG"')"
 check "removing it moves the watch to the default and the sushi still listening there is no longer listed" "$(yes_if 'grep -q "poll [6-8] .*Port '"$DPORT"':.*ports=\"'"$DPORT"' — not running\*;\"" "$LOG" && ! grep -q "poll [6-8] .*ports=\"[^\"]*'"$FPORT"' —" "$LOG"')"
 kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
 echo '{"port":'"$FPORT"'}' > "$HOME/.sushi/sushibar.json"
-run_bar "$BAR" 2 ""
+TICK=$FAST run_bar "$BAR" 2 ""
 check "a file from before added ports still sets the watched port" "$(yes_if 'grep -q "poll 1 .*Port '"$FPORT"':" "$LOG"')"
 rm -f "$HOME/.sushi/sushibar.json"
 echo '{"server":{"port":'"$APORT2"'}}' > "$HOME/.sushi/model-settings.json"
-run_bar "$BAR" 2 ""
+TICK=$FAST run_bar "$BAR" 2 ""
 check "server.port in the settings file is the default port: watched at first, listed first, not removable" "$(yes_if 'grep -q "poll 1 .*Port '"$APORT2"':.*ports=\"'"$APORT2"' — not running\*;" "$LOG" && ! grep -q "removable=\"[^\"]*'"$APORT2"'" "$LOG"')"
 seed_default
 rm -f "$HOME/.sushi/sushibar.json"
@@ -215,7 +218,7 @@ mkdir -p "$WORK/empty"
 (cd "$WORK/empty" && exec python3 -m http.server "$TPORT" --bind 127.0.0.1 > /dev/null 2>&1) &
 TPID=$!
 for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$TPORT/" && break; sleep 0.25; done
-run_bar "$BAR" 3 "" --port "$TPORT"
+TICK=$FAST run_bar "$BAR" 3 "" --port "$TPORT"
 check "the status says the port is in use and Start is disabled" "$(yes_if 'grep -q "poll 2 .*Port '"$TPORT"': in use by another program\" start=0 stop=0" "$LOG"')"
 check "the header says why in an orange pill, and the icon carries a badge" "$(yes_if 'grep -q "poll 2 .*badge=1.*" "$LOG" && grep -q "poll 2 .*pill=\"Port in use\" line1=\"Another program holds this port\"" "$LOG"')"
 kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
@@ -233,12 +236,12 @@ for _ in $(seq 1 40); do
     sleep 0.5
 done
 check "a LAN-bound sushi still answers on loopback" "$(yes_if '[ "$LAN_OK" = 1 ]')"
-run_bar "$BAR" 3 "" --port "$LPORT"
+TICK=$FAST run_bar "$BAR" 3 "" --port "$LPORT"
 check "the header names the LAN bind" "$(yes_if 'grep -q "line2=\"Port '"$LPORT"' · LAN" "$LOG"')"
 check "the LAN switch persists over relaunch" "$(yes_if 'grep -q "poll [123] .*lan=1" "$LOG"')"
 kill "$SRVPID" 2>/dev/null; wait "$SRVPID" 2>/dev/null
 rm -f "$HOME/.sushi/sushibar-server-$LPORT.pid"
-run_bar "$BAR" 2 "lan@1" --port "$LPORT"
+TICK=$FAST run_bar "$BAR" 2 "lan@1" --port "$LPORT"
 check "toggling LAN off leaves it out of the saved file" "$(yes_if '! grep -q "\"lan\"" "$HOME/.sushi/sushibar.json"')"
 rm -f "$HOME/.sushi/sushibar.json"
 
@@ -270,7 +273,7 @@ EOF
 python3 "$WORK/stub_models.py" "$SPORT" > /dev/null 2>&1 &
 TPID=$!
 for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$SPORT/v1/models" && break; sleep 0.25; done
-run_bar "$BAR" 3 "" --port "$SPORT"
+TICK=$FAST run_bar "$BAR" 3 "" --port "$SPORT"
 check "the header card names the pack update under the model" "$(yes_if 'grep -q "poll [23] .*pack=\"Pack 2.0 available (you have 1.0)\"" "$LOG"')"
 check "the menu offers to copy the pull command" "$(yes_if 'grep -q "packcopy=\"Copy “sushi pull deepseek-v4.1-flash”\"" "$LOG"')"
 kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
@@ -354,7 +357,7 @@ check "each port keeps its own pid record" "$(yes_if '[ -f "$HOME/.sushi/sushiba
 P1=$(cut -d' ' -f1 "$HOME/.sushi/sushibar-server-$PORT.pid" 2>/dev/null)
 P2=$(cut -d' ' -f1 "$HOME/.sushi/sushibar-server-$FPORT.pid" 2>/dev/null)
 check "both servers are alive" "$(yes_if '[ -n "$P1" ] && [ -n "$P2" ] && kill -0 "$P1" 2>/dev/null && kill -0 "$P2" 2>/dev/null')"
-run_bar "$BAR" 3 "" --port "$PORT"
+TICK=$FAST run_bar "$BAR" 3 "" --port "$PORT"
 check "back on the first port, its server is sushibar's own (Stop without the confirm ellipsis)" "$(yes_if 'grep -q "poll 2 .*Port '"$PORT"': .*toggle=\"Stop Server\"" "$LOG"')"
 kill "$P1" "$P2" 2>/dev/null
 rm -f "$HOME"/.sushi/sushibar-server-*.pid
@@ -648,7 +651,7 @@ EOF
 python3 "$WORK/stub_key.py" "$TPORT" > /dev/null 2>&1 &
 TPID=$!
 for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$TPORT/" && break; sleep 0.25; done
-run_bar "$BAR" 3 "" --port "$TPORT"
+TICK=$FAST run_bar "$BAR" 3 "" --port "$TPORT"
 check "a 401 reads Key needed with its cause in the header, a badge and no words in the title" "$(yes_if 'grep -q "poll 2 title=\"\" .*pill=\"Key needed\" line1=\"The server requires an API key\".*badge=1" "$LOG"')"
 kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
 

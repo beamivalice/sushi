@@ -588,7 +588,9 @@ test "prefix cache admin: scan lists a namespace's entries, bytes and newest man
     const layer = scanNamespace(testing.allocator, io, base, 0xb2);
     try testing.expectEqual(@as(u32, 2), plain.entries);
     try testing.expectEqual(plain.entries, layer.entries);
-    try testing.expectEqual(plain.bytes, layer.bytes);
+    // The layer reports what its folder holds: every byte the plain files hold, plus its journal and the pages its packs
+    // allocate.
+    try testing.expect(layer.bytes >= plain.bytes);
     try testing.expect(layer.newest_ns > 0);
 
     // The scan read the live layer without changing it: the tier keeps writing and reopens whole.
@@ -763,7 +765,7 @@ test "prefix cache admin: clearDisk: the index, the files and the budget agree, 
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     var hc = prefix_cache_mod.HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "00000000000000a1", 0, 128);
+    hc.disk = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "00000000000000a1", 0, 128, .cas);
     defer hc.deinit();
 
     var cache = try KVCache.init(testing.allocator, 1);
@@ -779,6 +781,10 @@ test "prefix cache admin: clearDisk: the index, the files and the budget agree, 
     try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
     try testing.expectEqual(@as(u64, 0), hc.disk.?.total_bytes);
     try testing.expectEqual(@as(u64, 0), scanNamespace(testing.allocator, io, base, 0xa1).bytes);
+    // What the tier reports holding on the volume (`used_bytes`): no journal of the records the clear dropped. The
+    // layer's folder keeps one named record, its snapshot's state record, which that count leaves out.
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.diskBytes());
+    try testing.expectEqual(prefix_vfs.state_record_bytes, hc.disk.?.fs.vfs.?.physicalBytes());
 
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 900);
     _ = try hc.commit(&cache, &tokens, false);

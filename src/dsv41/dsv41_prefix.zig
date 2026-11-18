@@ -428,7 +428,7 @@ pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const @import("../mo
     var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else try expert_usage.load(allocator, model_dir, config.expertDropRequest());
     defer if (drop) |*d| d.deinit();
     const m = xfm.arch_state.dsv41.model.?;
-    return try layoutKey(allocator, config.dsparkOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, @import("../expert_stream.zig").pick_tolerance, m.hc_mix_nax);
+    return try layoutKey(allocator, config.dsparkOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, @import("../expert_stream.zig").pick_tolerance, m.hc_mix_nax, config.expertCacheBias());
 }
 
 /// The SSD namespace of one boot: `namespaceTag` plus what changes the numbers a stored state was computed
@@ -437,7 +437,7 @@ pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const @import("../mo
 /// order, so its states are no NAX boot's, and so does the ALU hyper-connection mix (`hc_mix_nax` off). A composed boot (`fused` off) runs the op chains, and DSpark rounds that
 /// sum by width (`dspark_exact` off) change the verify rows; neither writes into the served namespace. A boot with
 /// none of these keeps `namespaceTag`.
-pub fn layoutKey(allocator: std.mem.Allocator, dspark: bool, attn_nax: bool, fused: bool, dspark_exact: bool, drop: ?*const expert_usage.Drop, pick_tolerance: f32, hc_mix_nax: bool) ![]u8 {
+pub fn layoutKey(allocator: std.mem.Allocator, dspark: bool, attn_nax: bool, fused: bool, dspark_exact: bool, drop: ?*const expert_usage.Drop, pick_tolerance: f32, hc_mix_nax: bool, cache_bias: f32) ![]u8 {
     var key = std.ArrayList(u8).empty;
     errdefer key.deinit(allocator);
     try key.appendSlice(allocator, namespaceTag(dspark));
@@ -447,7 +447,6 @@ pub fn layoutKey(allocator: std.mem.Allocator, dspark: bool, attn_nax: bool, fus
     if (dspark and !dspark_exact) try key.appendSlice(allocator, "-dsparkinexact");
     if (drop) |d| try key.print(allocator, "-drop{d}-{x:0>16}", .{ d.n, d.digest() });
     if (pick_tolerance > 0) try key.print(allocator, "-pick{x:0>8}", .{@as(u32, @bitCast(pick_tolerance))});
-    const cache_bias = @import("../expert_stream.zig").cache_bias;
     if (cache_bias > 0) try key.print(allocator, "-cbias{x:0>8}", .{@as(u32, @bitCast(cache_bias))});
     return key.toOwnedSlice(allocator);
 }
@@ -785,7 +784,7 @@ test "snapshotBackoff: the last forward starts at the prompt's last assistant op
 
 test "layoutKey: a boot that drops other experts or picks leniently has its own namespace" {
     const a = testing.allocator;
-    const full = try layoutKey(a, false, true, true, true, null, 0, true);
+    const full = try layoutKey(a, false, true, true, true, null, 0, true, 0);
     defer a.free(full);
     try testing.expectEqualStrings(namespaceTag(false), full);
 
@@ -799,36 +798,36 @@ test "layoutKey: a boot that drops other experts or picks leniently has its own 
     var d16 = try expert_usage.fixedDrop(a, 1, &.{ &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, &.{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } });
     defer d16.deinit();
 
-    const k8 = try layoutKey(a, false, true, true, true, &d8, 0, true);
+    const k8 = try layoutKey(a, false, true, true, true, &d8, 0, true, 0);
     defer a.free(k8);
-    const k8_same = try layoutKey(a, false, true, true, true, &d8_same, 0, true);
+    const k8_same = try layoutKey(a, false, true, true, true, &d8_same, 0, true, 0);
     defer a.free(k8_same);
-    const k8_other = try layoutKey(a, false, true, true, true, &d8_other, 0, true);
+    const k8_other = try layoutKey(a, false, true, true, true, &d8_other, 0, true, 0);
     defer a.free(k8_other);
-    const k16 = try layoutKey(a, false, true, true, true, &d16, 0, true);
+    const k16 = try layoutKey(a, false, true, true, true, &d16, 0, true, 0);
     defer a.free(k16);
-    const k8_dspark = try layoutKey(a, true, true, true, true, &d8, 0, true);
+    const k8_dspark = try layoutKey(a, true, true, true, true, &d8, 0, true, 0);
     defer a.free(k8_dspark);
-    const k_lossy = try layoutKey(a, false, true, true, true, null, 0.3, true);
+    const k_lossy = try layoutKey(a, false, true, true, true, null, 0.3, true, 0);
     defer a.free(k_lossy);
-    const k_lossier = try layoutKey(a, false, true, true, true, null, 0.4, true);
+    const k_lossier = try layoutKey(a, false, true, true, true, null, 0.4, true, 0);
     defer a.free(k_lossier);
-    const k8_lossy = try layoutKey(a, false, true, true, true, &d8, 0.3, true);
+    const k8_lossy = try layoutKey(a, false, true, true, true, &d8, 0.3, true, 0);
     defer a.free(k8_lossy);
-    const k_simd = try layoutKey(a, false, false, true, true, null, 0, true);
+    const k_simd = try layoutKey(a, false, false, true, true, null, 0, true, 0);
     defer a.free(k_simd);
-    const k8_simd = try layoutKey(a, false, false, true, true, &d8, 0, true);
+    const k8_simd = try layoutKey(a, false, false, true, true, &d8, 0, true, 0);
     defer a.free(k8_simd);
 
-    const k_composed = try layoutKey(a, false, true, false, true, null, 0, true);
+    const k_composed = try layoutKey(a, false, true, false, true, null, 0, true, 0);
     defer a.free(k_composed);
-    const k_composed_simd = try layoutKey(a, false, false, false, true, null, 0, true);
+    const k_composed_simd = try layoutKey(a, false, false, false, true, null, 0, true, 0);
     defer a.free(k_composed_simd);
-    const k_dspark = try layoutKey(a, true, true, true, true, null, 0, true);
+    const k_dspark = try layoutKey(a, true, true, true, true, null, 0, true, 0);
     defer a.free(k_dspark);
-    const k_dspark_inexact = try layoutKey(a, true, true, true, false, null, 0, true);
+    const k_dspark_inexact = try layoutKey(a, true, true, true, false, null, 0, true, 0);
     defer a.free(k_dspark_inexact);
-    const k_dspark_composed = try layoutKey(a, true, true, false, false, null, 0, true);
+    const k_dspark_composed = try layoutKey(a, true, true, false, false, null, 0, true, 0);
     defer a.free(k_dspark_composed);
 
     // The served keys are unchanged, and a model without DSpark has no verify rows to sum differently.
@@ -836,13 +835,13 @@ test "layoutKey: a boot that drops other experts or picks leniently has its own 
     try testing.expectEqualStrings("dsv41-state-v6-simd", k_simd);
     try testing.expectEqualStrings("dsv41-state-v6-dspark", k_dspark);
     // The ALU mix sums in another order than the matrix-unit one: its states are their own, beside either attention arm.
-    const k_hcalu = try layoutKey(a, false, true, true, true, null, 0, false);
+    const k_hcalu = try layoutKey(a, false, true, true, true, null, 0, false, 0);
     defer a.free(k_hcalu);
-    const k_simd_hcalu = try layoutKey(a, false, false, true, true, null, 0, false);
+    const k_simd_hcalu = try layoutKey(a, false, false, true, true, null, 0, false, 0);
     defer a.free(k_simd_hcalu);
     try testing.expectEqualStrings("dsv41-state-v6-hcalu", k_hcalu);
     try testing.expectEqualStrings("dsv41-state-v6-simd-hcalu", k_simd_hcalu);
-    const no_dspark = try layoutKey(a, false, true, true, false, null, 0, true);
+    const no_dspark = try layoutKey(a, false, true, true, false, null, 0, true, 0);
     defer a.free(no_dspark);
     try testing.expectEqualStrings(full, no_dspark);
 
@@ -851,10 +850,7 @@ test "layoutKey: a boot that drops other experts or picks leniently has its own 
     for (distinct, 0..) |x, i| for (distinct[i + 1 ..]) |y| try testing.expect(!std.mem.eql(u8, x, y));
 
     // A cache-biased boot stores states no exact boot may read.
-    const expert_stream = @import("../expert_stream.zig");
-    expert_stream.cache_bias = 0.2;
-    defer expert_stream.cache_bias = 0;
-    const k_bias = try layoutKey(a, false, true, true, true, null, 0, true);
+    const k_bias = try layoutKey(a, false, true, true, true, null, 0, true, 0.2);
     defer a.free(k_bias);
     try testing.expect(std.mem.startsWith(u8, k_bias, full) and k_bias.len > full.len);
 }

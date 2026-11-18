@@ -195,8 +195,16 @@ pub fn forward(self: *Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
 }
 
 pub fn forwardWith(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    // A decode or verify forward past its cache's capacity grows it here, a layer per eval, not inside its graph.
+    // A prefill chunk takes its reservation (`KVCache.reserve`) at the first grow and is left to it.
+    const shape = mlx.getShape(token_ids);
+    const rows: usize = if (shape.len == 0) 1 else @intCast(shape[shape.len - 1]);
+    if (rows <= grow_ahead_rows) try ctx.cache.growAhead(rows, self.s);
     return arch_forward.forward(arch_registry.handleOf(self), ctx, token_ids);
 }
+
+/// The widest forward `forwardWith` grows the cache ahead of: past a verify block's rows it is a prefill chunk.
+const grow_ahead_rows = 64;
 
 /// Project a hidden state through the trunk's lm_head, dense (no argmax
 /// prune). DFlash draft logits come from the assistant's hidden through

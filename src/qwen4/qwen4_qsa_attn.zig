@@ -1249,6 +1249,17 @@ pub fn qsaPrefillTransientBytes(n_idx: u64, fwd: u64, kv: u64, ratio: u64, idx_h
     return rows * nb * 4 * (n_idx * 2 + 4) + fwd * @min(nb, 512) * 4;
 }
 
+/// The same select on the engine of our own, which chains the head weighting into the score: composed, the matmul's
+/// `[n_idx, rows, nb]` f32 sheet, its weighted relu and the head sum; fused, the sheet once; then the selection.
+pub fn qsaPrefillTransientBytesEngine(n_idx: u64, fwd: u64, kv: u64, ratio: u64, idx_hd: u64) u64 {
+    if (ratio == 0) return 0;
+    const nb = kv / ratio;
+    const fused = qsaScoreFusedActiveFor(1, @intCast(n_idx), @intCast(idx_hd));
+    const rows = qsaScoreRowsPerChunkFused(n_idx, nb, fwd, fused);
+    const sheet: u64 = if (fused) rows * nb * 4 else rows * nb * 4 * (2 * n_idx + 1);
+    return sheet + fwd * @min(nb, 512) * 4;
+}
+
 /// Two bf16 ulps at the reference's own scale.
 pub fn attn256UlpBar(ref: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
     const m = try attn256MaxAbs(ref, s);

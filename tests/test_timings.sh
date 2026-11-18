@@ -1,5 +1,5 @@
 #!/bin/bash
-# sushi-test: tier=live boot=api
+# sushi-test: tier=live boot=api pack=qwen4
 # Integration test: chat completions emit a llama.cpp-style `timings` block
 # alongside `usage`, on both the non-stream JSON body and the final SSE chunk
 # of a streaming response (when stream_options.include_usage is set).

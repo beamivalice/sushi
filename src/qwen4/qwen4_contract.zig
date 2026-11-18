@@ -15,6 +15,40 @@ pub fn specIsGreedy(config: *const model_mod.ModelConfig) bool {
     return @import("qwen4_cooler.zig").formatOf(config) == .stq;
 }
 
+/// The kinds of layer an exact Cooler prefill bill names (`qwen4_bill.PrefillRows`). The PLE layer has no stand-in, so
+/// every set holds it.
+pub const PrefillKinds = struct { gdn: bool = true, attn: bool = true, moe: bool = true };
+
+/// The sets whose chunks the contract measures against their rows: all, and each kind left as the peak by standing in
+/// the others.
+pub const prefill_kind_sets = [_]PrefillKinds{ .{}, .{ .attn = false, .moe = false }, .{ .gdn = false, .moe = false }, .{ .gdn = false, .attn = false, .moe = false } };
+
+/// The forward runs only `kinds` (the rest stood in); null runs every layer.
+pub fn standInAllBut(kinds: ?PrefillKinds) void {
+    const fwd = @import("qwen4_forward.zig");
+    fwd.qwen4_standin_override = if (kinds) |k| .{ .gdn = !k.gdn, .attn = !k.attn, .mlp = !k.moe } else null;
+}
+
+/// Whether a forward that runs only `kinds` selects QSA blocks (its attention layers do).
+pub fn selectsBlocks(kinds: PrefillKinds) bool {
+    return kinds.attn;
+}
+
+/// The bytes a prefill row of a forward that runs only `kinds` holds at its peak.
+pub fn prefillRowsOf(config: *const model_mod.ModelConfig, kinds: PrefillKinds) u64 {
+    const r = @import("qwen4_bill.zig").coolerPrefillRows(config);
+    var top = r.ple;
+    if (kinds.gdn) top = @max(top, r.gdn);
+    if (kinds.attn) top = @max(top, r.attn);
+    if (kinds.moe) top = @max(top, r.moe);
+    return top + r.trunk + r.inflight;
+}
+
+/// The bytes a row of the bill names beyond what a chunk asks: room for a plane the GPU still binds.
+pub fn prefillAllowanceRows(config: *const model_mod.ModelConfig) u64 {
+    return @import("qwen4_bill.zig").coolerPrefillRows(config).inflight;
+}
+
 /// Prompt lengths a request of the contract takes: one row, the verify widths' edge, a chunk past it.
 pub const prompt_lengths = [_]usize{ 1, 2, 7, 8, 9, 40 };
 
@@ -80,15 +114,7 @@ pub fn specTokensAt(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, n: u32,
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     try xfm.resetCache();
-    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, xfm, &tok, ids, n, sampling, &.{}, .{
-        .mtp = generate.MtpHeadRef.of("qwen4", xfm),
-        .mtp_enabled = true,
-        .model_has_mtp = true,
-        .mtp_depth = depth,
-        // The load's acceptance rule and tail, as the scheduler hands a served request.
-        .mtp_acceptance = @import("../arch/flags.zig").mtpAcceptanceOf(&xfm.config).value,
-        .mtp_greedy_tail = @import("../arch/flags.zig").greedyTailOf(&xfm.config).value,
-    });
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, xfm, &tok, ids, n, sampling, &.{}, specOptions(xfm, depth));
     defer gen.deinit(a);
     var got: std.ArrayList(u32) = .empty;
     errdefer got.deinit(a);
@@ -97,6 +123,17 @@ pub fn specTokensAt(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, n: u32,
         try got.appendSlice(a, r.tokens);
     }
     return got;
+}
+
+/// A speculative request's generator options with its draft depth cap at `depth` (0: the load's).
+pub fn specOptions(xfm: *Trunk, depth: u32) Generator.InitOptions {
+    return .{
+        .mtp = generate.MtpHeadRef.of("qwen4", xfm),
+        .mtp_enabled = true,
+        .model_has_mtp = true,
+        .mtp_depth = depth,
+        // The load's acceptance rule and tail, as the scheduler hands a served request.
+    };
 }
 
 /// `n` greedy tokens for each of `prompts`, every prompt prefilled in a slot of its own and every tick one forward of
@@ -120,8 +157,15 @@ pub fn greedyRows(a: std.mem.Allocator, xfm: *Trunk, prompts: []const []const u3
         const ids = try a.alloc(i32, p.len);
         defer a.free(ids);
         for (ids, p) |*d, t| d.* = @intCast(t);
-        // As a request prefills: all but the last token, then the last alone, whose logits are a decode row's.
-        if (ids.len > 1) _ = mlx.mlx_array_free(try slots[i].forward(xfm, ids[0 .. ids.len - 1]));
+        // As a request prefills: all but the last token without a readout (no row of it is sampled), then the last
+        // alone, whose logits are a decode row's.
+        if (ids.len > 1) {
+            slots[i].ctx.skip_lm_head = true;
+            defer slots[i].ctx.skip_lm_head = false;
+            const hidden = try slots[i].forward(xfm, ids[0 .. ids.len - 1]);
+            defer _ = mlx.mlx_array_free(hidden);
+            try mlx.check(mlx.mlx_array_eval(hidden));
+        }
         const logits = try slots[i].forward(xfm, ids[ids.len - 1 ..]);
         defer _ = mlx.mlx_array_free(logits);
         try got[i].append(a, try lastArgmax(logits, xfm.s));

@@ -43,6 +43,36 @@ test "DeepSeek: the streamed request bill brackets the prefill peaks measured on
     }
 }
 
+test "DeepSeek's live headroom under a raised wired limit is what the machine can still give, not the declared limit" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.cooler_for_test = true;
+    config.expert_borrow_bytes = 0;
+    const MiB: u64 = 1 << 20;
+    const GB: u64 = 1_000_000_000;
+    // r-65, the M5 at --ssd-budget-gb 108: iogpu.wired_limit_mb=125000 less the 1 GiB margin, every expert cached
+    // (112.83 GB active), and the owner's apps holding the rest of the 128 GB, so 3 GB reclaimable, 1 GiB of it kept.
+    const declared: u64 = 123_976 * MiB;
+    const active: u64 = 112_828_234_064;
+    const footprint: u64 = active + 400 * MiB;
+    const reclaimable: u64 = 3 * GB;
+    const margin: u64 = 1 << 30;
+    const live = bills.liveCeilingFrom(declared, footprint, reclaimable, margin);
+    try t.expectEqual(footprint + reclaimable - margin, live);
+    // The served warm's widest chunk is what that headroom holds: never the 8192 rows the declared limit admitted,
+    // whose ~13 GB took the box down.
+    const at_declared = bills.widestChunkAdmitted(&config, 16, 8192, bills.prefillHeadroomFrom(declared, active, 0));
+    const at_live = bills.widestChunkAdmitted(&config, 16, 8192, bills.prefillHeadroomFrom(live, active, 0));
+    try t.expectEqual(@as(u32, 8192), at_declared);
+    try t.expect(at_live < 8192);
+    try t.expect(at_live == 0 or bills.prefillChunkCost(&config, 16, at_live, 0) <= live - active);
+    // With the memory free, the declared limit stands.
+    try t.expectEqual(declared, bills.liveCeilingFrom(declared, footprint, 40 * GB, margin));
+}
+
 test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024, then 512, never wider" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
@@ -70,6 +100,27 @@ test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024
     try t.expectEqualStrings("Prefill chunk: per request, up to 2048 at a short prompt (the widest rung each request's bill admits); load-time fallback 512\n", bills.prefillChunkLoadLine(&buf, &config, 512, 8192).?);
     // The ladder never narrows the advertised context: it is priced at the 512 floor.
     try t.expectEqual(@as(u32, 1_000_000), bills.advertisedContextAt(&config, 16, 110_100 * MB, 97_080 * MB, 512));
+}
+
+test "a DeepSeek load's served warm forwards at the widest width a served request takes, 2048, not the global 8192" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.num_attention_heads = 64;
+    try t.expectEqual(@as(u32, 2048), bills.widestServedRung(&config));
+    const generic = prefill_plan.requestPrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, 1, config.has_sliding_window, config.isMoe(), config.longCtxGated(), 0);
+    try t.expect(generic > bills.widestServedRung(&config));
+    // An operator's --prefill-chunk is what served requests take, so the warm follows it.
+    const sr = @import("../settings_resolve.zig");
+    const saved_width = sr.prefill_chunk.value;
+    defer sr.prefill_chunk.value = saved_width;
+    const saved_source = sr.prefill_chunk.source;
+    defer sr.prefill_chunk.source = saved_source;
+    sr.prefill_chunk.value = 4096;
+    sr.prefill_chunk.source = .flag;
+    try t.expectEqual(@as(u32, 4096), bills.widestServedRung(&config));
 }
 
 test "DeepSeek advertises the longest context its own request bill admits" {
@@ -174,7 +225,8 @@ test "DeepSeek's request bill takes its prefill working set out of the decoder p
     const c = config.dsv41.?;
     const seq: u64 = 524_288;
     const state = ((seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(true) + bills.checkpointReserve(&config, seq, 2048)) * 5 / 4;
-    const work = c.chunkCap(2048, seq) + config.expertPoolBytes();
+    // A load on MLX: its chunk bills MLX's per-row rate.
+    const work = c.chunkCapOn(false, 2048, seq) + config.expertPoolBytes();
     const decode = c.forwardCap(dsv41_config.verify_rows, seq);
     // No pool to lend: the whole working set is billed, as before.
     try t.expectEqual(state + work, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
@@ -245,7 +297,7 @@ test "with its decoder pools lendable, DeepSeek at --ssd-budget-gb 117 with DSpa
     try t.expectEqual(@as(u32, 1_000_000), bills.advertisedContextAt(&config, 16, ceiling, active, 2048));
     // Billing the working set to the request, with nothing to lend, advertises well under the whole context.
     config.expert_borrow_bytes = 0;
-    try t.expectEqual(@as(u32, 390_144), bills.advertisedContextAt(&config, 16, ceiling, active, 512));
+    try t.expectEqual(@as(u32, 581_632), bills.advertisedContextAt(&config, 16, ceiling, active, 512));
 }
 
 test "a default context never exceeds the checkpoint's window, and --ctx-size or model-settings still win" {
@@ -265,17 +317,46 @@ test "a default context never exceeds the checkpoint's window, and --ctx-size or
     try t.expectEqual(@as(u32, 250_000), bills.getEffectiveContextLength(&config));
 }
 
-test "DeepSeek's request bill on a Cooler load is the state and one forward's cap: the engine's pool is that cap, and MLX's parked pool is not billed" {
+test "DeepSeek's unlent bill is what a Cooler request's forwards take from the pool themselves, whatever the pools may lend" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
+    config.cooler_for_test = true;
+    const c = &config.dsv41.?;
+    // The served warm's widest request on the M5 at --ssd-budget-gb 95 (r-62): 8,193 tokens at 8192-row chunks.
+    const seq: u64 = 8193;
+    const chunk: u64 = 8192;
+    const unlent = bills.prefillNeededAtChunk(&config, seq, 96, 16, chunk, .{});
+    // Decoder pools that cover the chunk's cap: admission bills the state and a decode forward, since a forward the
+    // headroom cannot hold releases pools first (`dsv41_borrow.beforeForward`)...
+    config.expert_borrow_bytes = 60_000_000_000;
+    const lent = bills.prefillNeededAtChunk(&config, seq, 96, 16, chunk, .{});
+    try t.expectEqual(unlent - (c.chunkCap(chunk, seq) - c.forwardCap(dsv41_config.verify_rows, seq)), lent);
+    // ...but a forward the headroom holds releases none and takes its whole cap from the pool: what it asks is measured
+    // against the bill with nothing lent, the same with or without pools to lend.
+    try t.expectEqual(unlent, bills.prefillNeededAtChunkUnlent(&config, seq, 96, 16, chunk, .{}));
+    config.expert_borrow_bytes = 0;
+    try t.expectEqual(unlent, bills.prefillNeededAtChunkUnlent(&config, seq, 96, 16, chunk, .{}));
+}
+
+test "DeepSeek's request bill on a Cooler load is its exact state, one forward's cap and the margin: MLX's parked pool, the MLX net and MLX's row rate are not billed" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    const c = &config.dsv41.?;
     for ([_]u64{ 9_000, 225_000, 1_000_000 }) |seq| {
+        // What the request stores: its state rows and fixed state, and the checkpoints its prefill keeps.
+        const stored = (seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(config.dsparkOn()) + dsv41_bill.checkpointReserve(&config, seq, 2048);
         config.cooler_for_test = false;
         const off = bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{});
         config.cooler_for_test = true;
-        try t.expectEqual(off - dsv41_config.dsv41_pool_bytes, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
+        const net = stored * 5 / 4 - stored;
+        const engine_chunk = c.chunkCap(2048, seq);
+        try t.expectEqual(off - dsv41_config.dsv41_pool_bytes - net - c.chunkCapOn(false, 2048, seq) + engine_chunk + bills.BILL_MARGIN_BYTES, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
     }
 }
 

@@ -117,6 +117,21 @@ pub const Linear = union(enum) {
             },
         }
     }
+
+    /// The engine pool's bytes `apply` holds beside its output over `rows` 16-bit rows of `in` -> `out`: a trellis
+    /// GEMM's prepared rows and f16 plane, an affine prefill's dequantized weight. Dense and FP8 kinds count none.
+    pub fn scratchBytes(self: *const Linear, ctx: Ctx, rows: u64, in: u64, out: u64) u64 {
+        const pool = @import("tensor/pool_class.zig").poolBytes;
+        return switch (self.*) {
+            .trellis => if (exl3_trunk.gemmRows(rows, ctx.wide)) pool(rows * in * 2) + pool(rows * out * 2) else 0,
+            .affine => |*a| blk: {
+                const qp = a.solve(ctx.config, @intCast(in));
+                const dq = qp.mode == .affine and a.b.ctx != null and verify_moe.prefillDqGemmTakes(rows, qp.bits);
+                break :blk if (dq) pool(in * out * 2) else 0;
+            },
+            .absent, .dense, .fp8_block => 0,
+        };
+    }
 };
 
 const testing = std.testing;

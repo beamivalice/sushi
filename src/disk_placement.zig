@@ -277,7 +277,10 @@ pub fn sweepBase(
     }
     var layers = std.ArrayList(*prefix_vfs.Vfs).empty;
     defer {
-        for (layers.items) |v| v.close();
+        for (layers.items) |v| {
+            _ = v.reclaim();
+            v.close();
+        }
         layers.deinit(allocator);
     }
 
@@ -534,7 +537,7 @@ pub fn tierBytes(io: std.Io, base_dir: []const u8, fingerprint: []const u8) u64 
         if (std.mem.eql(u8, dent.name, "v")) {
             for ([_][]const u8{ "v", "v/packs" }) |sub| {
                 const v_abs = std.fmt.bufPrint(&e_buf, "{s}/{s}", .{ root, sub }) catch continue;
-                total +|= dirBytes(io, v_abs, &seen);
+                total +|= heldBytes(io, v_abs);
             }
             continue;
         }
@@ -559,6 +562,23 @@ pub fn dirBytes(io: std.Io, dir_abs: []const u8, seen: *InodeSet) u64 {
         const st = d.statFile(io, dent.name, .{}) catch continue;
         if (st.nlink > 1 and (seen.fetchPut(st.inode, {}) catch null) != null) continue;
         total += st.size;
+    }
+    return total;
+}
+
+/// Bytes the files directly inside `dir_abs` hold on the volume: a pack's punched pages are not (`Vfs.reclaim`).
+fn heldBytes(io: std.Io, dir_abs: []const u8) u64 {
+    var d = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var total: u64 = 0;
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .file) continue;
+        var pb: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const p = std.fmt.bufPrintSentinel(&pb, "{s}/{s}", .{ dir_abs, dent.name }, 0) catch continue;
+        var st: std.c.Stat = undefined;
+        if (std.c.stat(p.ptr, &st) != 0) continue;
+        total += @min(@as(u64, @intCast(st.size)), @as(u64, @intCast(st.blocks)) * 512);
     }
     return total;
 }
@@ -1436,4 +1456,79 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     try testing.expect(kv_disk_fs.testStatAt(io, base, "fp-sibling/e1/meta.json") == null);
     try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
     try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
+}
+
+/// The lengths of the files directly inside `<root>/v` and `<root>/v/packs`.
+fn layerLengths(io: std.Io, root: []const u8) !u64 {
+    var total: u64 = 0;
+    for ([_][]const u8{ "v", "v/packs" }) |sub| {
+        var pb: [std.fs.max_path_bytes]u8 = undefined;
+        var d = try std.Io.Dir.openDirAbsolute(io, try std.fmt.bufPrint(&pb, "{s}/{s}", .{ root, sub }), .{ .iterate = true });
+        defer d.close(io);
+        var it = d.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind == .file) total += (try d.statFile(io, e.name, .{})).size;
+        }
+    }
+    return total;
+}
+
+/// A content-addressed sibling with three records of distinct rows, oldest first, closed again. Returns the root.
+fn threeLayerRecords(io: std.Io, base: []const u8, fp: []const u8, first_bytes: *u64) ![]u8 {
+    const s = mlx.gpuStream();
+    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, fp, 0, 128, .cas);
+    defer tier.deinit();
+    for (0..3) |k| {
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try kv_disk_cache.fillCache(&cache, s, 1, 600, 32, @floatFromInt(1_000_000 * k), .float32);
+        var tokens: [600]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(100_000 * k + i);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    }
+    first_bytes.* = tier.entries.items[0].bytes;
+    return testing.allocator.dupe(u8, tier.root);
+}
+
+test "DiskTier: tierBytes counts a content-addressed root by what its packs hold on the volume, not their lengths" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    var first: u64 = 0;
+    const root = try threeLayerRecords(io, base, "fp-holes", &first);
+    defer testing.allocator.free(root);
+    var held: u64 = 0;
+    {
+        var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-holes", 0, 128, .cas);
+        defer tier.deinit();
+        // The two newer records' pages go as holes; the pack stays for the oldest.
+        tier.invalidateNewest();
+        tier.invalidateNewest();
+        held = tier.diskBytes();
+    }
+    const counted = tierBytes(io, base, "fp-holes");
+    try testing.expect(counted + first / 2 < try layerLengths(io, root));
+    const slack: u64 = 4 * 4096;
+    try testing.expect(counted <= held + slack and held <= counted + slack);
+}
+
+test "DiskTier: the root-wide sweep gives the volume the pages of a content-addressed sibling's records it deletes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    var first: u64 = 0;
+    const root = try threeLayerRecords(io, base, "fp-swept", &first);
+    defer testing.allocator.free(root);
+    const before = tierBytes(io, base, "fp-swept");
+    // Room for the two newer records: the oldest, first in the pack, goes.
+    sweepBase(testing.allocator, io, base, "/nonexistent-live-root", first * 2 + first / 2);
+    const v = try prefix_vfs.Vfs.open(testing.allocator, io, root, .{ .read_only = true });
+    defer v.close();
+    try testing.expect(v.stat("e1/meta.json") == null);
+    try testing.expect(v.stat("e2/meta.json") != null);
+    try testing.expect(tierBytes(io, base, "fp-swept") + first / 2 < before);
 }

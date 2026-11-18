@@ -34,7 +34,6 @@
 const std = @import("std");
 const testTrunk = @import("test_support.zig").testTrunk;
 const arch_handle = @import("arch/handle.zig");
-const arch_flags = @import("arch/flags.zig");
 const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
 const arch_state = @import("arch/arch_state.zig");
@@ -1112,7 +1111,8 @@ pub const Scheduler = struct {
     /// inference-thread state, freed on every model switch, so the guard reads this number
     /// and never the pointer.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// KV + recurrent state the live slots own beyond what the hot caches bill, once per tick (`/props`).
+    /// KV + recurrent state the live slots own beyond what the hot caches bill, and the state the current model keeps
+    /// between requests, once per tick (`/props`).
     resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// The part of the above an eviction can prove it will return (residency minus the largest entry).
@@ -2960,16 +2960,23 @@ fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot) void {
     const observe = sch.metrics != null;
     sch.live_session_count = 0;
     var bytes: u64 = 0;
+    var current_billed = false;
     if (prefilling) |p| {
         const b = slotStateBytes(p);
         bytes += b -| slotDonatedBytes(sch, p);
+        current_billed = p.model == sch.current_model;
         if (observe) recordLiveSession(sch, p, .prefill, b);
     }
     for (sch.decoding.items) |s| {
         const b = slotStateBytes(s);
         bytes += b -| slotDonatedBytes(sch, s);
+        current_billed = current_billed or s.model == sch.current_model;
         if (observe) recordLiveSession(sch, s, .decode, b);
     }
+    // What the current model keeps between requests: a live slot of it bills that (`modelStateBytes`), else it is here.
+    if (!current_billed) if (sch.current_model) |m| {
+        bytes += sched.parkedStateBytes(m);
+    };
     sch.resident_live_kv_bytes.store(bytes, .monotonic);
 }
 
@@ -3283,7 +3290,7 @@ pub fn publishDiskStats(sch: *Scheduler) void {
                 if (c.prefix_cache_disk_declined) declined += 1;
             };
             if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
-                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount(), .written = d.stats.snapshot().totalWritten(), .namespace = prefix_cache_admin.namespaceOfRoot(d.root, d.private_root) };
+                snap = .{ .budget = d.max_bytes, .used = d.diskBytes(), .entries = d.entryCount(), .written = d.stats.snapshot().totalWritten(), .namespace = prefix_cache_admin.namespaceOfRoot(d.root, d.private_root) };
             };
         }
         entry.disk_stats.publish(snap);
@@ -3498,6 +3505,14 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
         publishLiveKvResidency(ic.sch, ic.slot);
     }
     ic.chunk_sw.reset();
+}
+
+/// After a media encode step: the chunk boundary's ticks; returns the decode time they hosted.
+fn encodeYieldCb(opaque_ctx: *anyopaque) u64 {
+    const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
+    const before = ic.decode_ns;
+    interleaveDecodeTickCb(opaque_ctx);
+    return ic.decode_ns - before;
 }
 
 /// One decode tick for the streams currently decoding, run from INSIDE a
@@ -3732,7 +3747,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 if (target) |t| t.log_tag else "[prefix]",
                 lookup.matched,
                 slot.full_prompt.len,
-                if (lookup.matched == 0) "nothing" else if (hc.last_restored_live) "the live state" else if (hc.last_restored_disk_id != null) "SSD" else "RAM",
+                if (lookup.matched == 0) "nothing" else if (hc.last_restored_live) "the live state" else if (hc.last_restored_held) "a held restore point (RAM)" else if (hc.last_restored_disk_id != null) "SSD" else "RAM",
                 lookup_sw.read() / std.time.ns_per_ms,
             )) |line| log.info("{s}\n", .{line}) else |_| {}
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
@@ -3797,12 +3812,19 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     else
         0;
     var vision_skipped: usize = 0;
+    // Chunk-boundary decode yields: the hook advances already-decoding streams after each media encode step and
+    // between this prefill's chunks. Ticks hosted here are billed out of prefill_ns below (the decoding slots got
+    // the time).
+    var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .cancelled = &slot.cancelled, .chunk_sw = io_util.Stopwatch.init(sch.io) };
     if (slot.deferred_media) |d| {
         if (slot.vision_embeddings) |old| {
             vision_queue.freeVisionArray(old);
             slot.vision_embeddings = null;
         }
-        const encoded = vision_queue.encodeMediaAfterRestore(sch, slot.model, d, vision_consumed, &slot.media_refusal) catch |err| {
+        const encoded = vision_queue.encodeMediaAfterRestore(sch, slot.model, d, vision_consumed, .{
+            .yield = if (prefillInterleaveEnabled()) .{ .ctx = &interleave_ctx, .call = encodeYieldCb } else null,
+            .cancel = &slot.cancelled,
+        }, &slot.media_refusal) catch |err| {
             if (err == error.MediaRefused) log.warn("[scheduler] media refused: {s}\n", .{if (slot.media_refusal) |*r| r.text() else "no text"});
             return err;
         };
@@ -3945,10 +3967,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         break :blk decision.width;
     } else 0;
 
-    // Chunk-boundary decode yields: the hook advances already-decoding
-    // streams between this prefill's chunks. Ticks hosted here are billed
-    // out of prefill_ns below (the decoding slots got the time).
-    var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .cancelled = &slot.cancelled, .chunk_sw = io_util.Stopwatch.init(sch.io) };
+    interleave_ctx.chunk_sw = io_util.Stopwatch.init(sch.io);
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
     const write_through_on = writeThroughArmed(slot, prefill_tokens.len);
     cp_max = ssmCheckpointCap(slot, cp_max, write_through_on);
@@ -4004,8 +4023,6 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // Use the resolved thinking mode and normalize the M5/block-16
             // calibration to this machine's effective assistant width.
             .mtp_enabled = use_head_mtp,
-            .mtp_acceptance = arch_flags.mtpAcceptanceOf(slot.model.config.?).value,
-            .mtp_greedy_tail = arch_flags.greedyTailOf(slot.model.config.?).value,
             .mtp = if (use_head_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,
@@ -5633,6 +5650,7 @@ pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Schedul
     sch.unload_queue = .empty;
     sch.abandoned = null;
     sch.orphan_vision_n = 0;
+    sch.current_model = null;
     return sch;
 }
 
@@ -5971,6 +5989,7 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var mm = metrics_mod.Metrics.init();
     var sch: Scheduler = undefined;
+    sch.current_model = null;
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     sch.queue_mu = .init;
@@ -6022,6 +6041,7 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
 test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" {
     var mm = metrics_mod.Metrics.init();
     var sch: Scheduler = undefined;
+    sch.current_model = null;
     sch.io = testing.io;
     sch.metrics = &mm;
     sch.live_sessions = undefined;
@@ -6111,6 +6131,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     var sch: Scheduler = undefined;
+    sch.current_model = null;
     sch.io = testing.io;
     sch.metrics = null;
     sch.live_session_count = 0;

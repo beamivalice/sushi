@@ -76,6 +76,16 @@ bill function's output on the committed fixture configs of all served packs: a b
   however much RAM is free. It was the larger of that and the free-RAM term, whose working set is the limit itself: a
   streamed load on a quiet 32 GB box saw 27,936 MiB of ceiling where its requests saw 26,976, and proved an 86k context
   each request then refused.
+- **A load's served warm forwards at the widest width a served request takes** (`widestServedRung`, shared with the
+  load line): the arch's start width (DeepSeek's 2048) or `--prefill-chunk`, never the global default. The warm took the
+  generic 8192 on DeepSeek, a width no DeepSeek request forwards at, and at `--ssd-budget-gb 108` it reset the Mac.
+- **A live check never grows past what the machine can still give** (`liveGpuMemoryCeiling`: the ceiling above, capped at
+  the process's GPU footprint plus `getAvailableMemBytes`' reclaimable pages less `--wired-margin-gib`). Request
+  admission, the prefill chunk's width (the served warm's included), an image encode and DeepSeek's borrow read it; the
+  load and the advertised context keep the declared floor. A raised limit lifts the plan over other processes' pages but
+  frees none: on a 128 GB M5 at `iogpu.wired_limit_mb=125000` with the owner's apps open, DeepSeek at `--ssd-budget-gb
+  108` (105 GiB active) took an 8,192-row warm chunk the 121 GiB floor admitted and the kernel panicked (r-65). A quiet
+  box reclaims its file cache, so there the declared limit stands.
 - **A declared `iogpu.wired_limit_mb` is the resident Sushi preflight's available figure, as it is request admission's ceiling** (`effectiveSushiAvailableBytes`: wired limit less `--wired-margin-gib` or the GPU floor, less resident buffers, still under the working set), however much RAM is free. Free RAM alone read file cache and other apps' pages as gone and refused a 32 GB box whose declared limit admitted the load; free RAM above the ceiling passed a load whose every request was then refused, a 1-token context.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
@@ -131,7 +141,11 @@ bill function's output on the committed fixture configs of all served packs: a b
 - **The kernel unwires a freed Metal buffer asynchronously** (~0.5 s for 50 GB): an unload and an eviction-before-load
   wait until most of the freed bytes left the wired set (`waitForUnwire`, bounded at 3 s), or the next preflight reads
   them as taken (45 GB free where 95 GB was a moment later).
-- **An MTP head rides the checkpoint's shards**: the bill adds nothing for it beyond the coarse rerank copy.
+- **An MTP head rides the checkpoint's shards**: the bill adds nothing for it beyond the coarse rerank copy. That copy
+  (`rerankCoarseBill`) is built at the load's serve step from an affine head, and on Sushi Cooler from the engine's
+  pool, so there its three buffers are billed at their size classes (`tensor/pool_class.zig`): the Qwen STQ 2.75 cut's
+  coarse head holds 283.1 MB in the pool at rest against the 278.1 MB of its packed bytes. It is the whole of that
+  cut's pool at rest; the STQ 4bpw cut's trellis head builds none and rests at 1 MB.
 - **A Flash-Next trellis trunk is billed as stored**: `residentWeightBytes` sums the shard headers, so a trellis
   projection's `trellis`, `suh` and `svh` replace the affine triple's bytes; stacked banks are held once (the stored
   ones leave the weight map). A trellis lm_head (`ResidentSplit.stq_head`) builds no coarse rerank copy, so that term
@@ -200,6 +214,10 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   two formulas: a 32 GB M1 Max advertised 71,680 tokens and refused past 20,549. The other archs keep `contextForBudget`.
 - The prefill CHUNK is a machine decision (`resolvePrefillChunk`, ladder 8192→512 at ≤ a quarter of the serving
   budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
+- **A rate-grouped EXL3 MoE bills its combine** (`rateGroupedPrefillBytesPerRow`, the pack index's widest layer in
+  `ModelConfig.expert_rate_groups`): at its down projection a layer holds one f16 plane per rate group, each as tall as
+  every sorted row (rows x top_k), and the combined one, beside its gate and up inputs and planes; the MoE term is the
+  larger of that and the fitted expansion. The STQ 2.75 pack's 11 groups hold 6.16 GB at 8162 rows, 1.98 GB past it.
 - GLM's load-time pin, the width its advertised context is billed at, is the widest rung up to 2048 that advertises
   as much context as 512: the `max_safe_context` bill picks it, not a quarter of free memory
   ([glm5-arch](glm5-arch.md#memory)).
@@ -215,6 +233,12 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 - **Admission does not bill the SSD writers' host bytes** (`admissionAvailable` = ceiling less MLX's bytes): they are
   pageable host memory, outside the wired limit a Metal OOM is measured against, and the ceiling's 1 GiB margin under
   that limit is the one reserve. Billing them too took 1 GiB of context off every request for no crash it prevented.
+- **A Qwen tier's held restore points are the same pageable host bytes** (`DiskTier.held`,
+  [engine-prefix-cache](engine-prefix-cache.md#held-points)): at most `HELD_POINTS_MAX_BYTES` (250 MB, the owner's bound: the
+  STQ 4bpw pack's newest two points, 2 x 115.7 MB) or the permit over `HELD_POINTS_PERMIT_DIVISOR` (2), whichever is
+  smaller: 64 MiB on a 16 GB Mac, 128 MiB on 32 GB, 250 MB from 64 GB. They give way to
+  any staged write, so writer and held bytes stay within the permit. Under memory pressure macOS may swap them, which
+  writes them to the SSD once anyway; at this size that is accepted.
 - **The writer's permit is a 128th of host RAM, 128 MiB to 1 GiB** (`kv_disk_writer.permitForRam`, set once at startup
   into `server.disk_writer_permit_bytes`, which arms every writer). A prefill stages one blob per chunk and the SSD
   drains it before the next, so a larger permit buys no speed and on a small Mac crowds macOS's share of RAM.
@@ -237,6 +261,56 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 
 <a id="bill-net"></a>
 ### The request bill's net
+
+- **On Sushi Cooler a request bill is its exact bytes plus `BILL_MARGIN_BYTES` (256 MB), once** (`requestHeldBytes`,
+  `billMargin`): no net, and DeepSeek's request bill drops its quarter there too. The live 364k Turn A on an STQ pack
+  bills 15,457 MB. Measured whole requests (33k-token prompt, 1,024 new tokens, on Cooler): tiny held 2,368 MB of a
+  3,072 MB bill; the 2.75 cut 6,882 of 7,161; the stq4 cut 6,541 of 7,289. MLX and GLM keep the net below.
+- **A Flash-Next STQ chunk's transient on Cooler is its layers' own rows** (`qwen4_bill.PrefillRows`), in place of the
+  MLP envelope, the stream slope, the 512 MB floor and the net: the max over the layer kinds a chunk peaks in, plus the
+  trunk's rows held across all, per row, f16 unless named. From the buffers alive at each peak
+  (`SUSHI_ENGINE_POOL_PEAK_TRACE`), each kind left the peak by standing the others in:
+
+  | kind | bytes a row |
+  |---|---|
+  | GatedDeltaNet | `2·qkv·2` (projection, prework copy) + `2·Hv·4` (decay, beta) + `4·Hv·Dv·2` |
+  | full attention | `2·Hq·hd·2` (gated query) + `4·Hq·hd·2` + `2·hd·2` (rope angles) |
+  | rate-grouped MoE | `rateGroupedPrefillBytesPerRow`: on the engine a resident bank's groups write one plane each for gate, up and down (`rate_groups.groupedGemm`), so `top_k·2·(3·hidden + 3·inter)` |
+  | n-gram PLE | `9·hc·hidden·2` + `hidden·2` + `ple_embed_dim·2` |
+  | MTP head, where it runs | its MoE + `4·hc·hidden·2` (the drafter history's forward over the chunk) |
+  | in flight, beside any | `top_k·(hidden + inter)·2`: the down GEMM's input and output planes a MoE layer freed while the GPU binds them, so the next layer does not wait for the pass |
+  | trunk, beside any | `hc·hidden·2` + `5·hidden·2` |
+
+  Beside them, every linear layer's state replaced beside the old until its pass runs (`ssmCheckpointBytes`). The QSA
+  block select runs at an attention layer's entry beside the trunk's rows alone, so it adds only what that moment holds
+  past the rows' peak; on the engine it is `rows·nb·4·(2·n_idx + 1) + fwd·min(nb, 512)·4` (measured to 16 KB at 8,192
+  rows). A trellis trunk's decoded weight is billed only where the GPU runs the NAX GEMM that takes it. The contract
+  cell `an exact Cooler prefill bill is what each kind of layer asks...` holds each kind's cost within one
+  `BILL_MARGIN_BYTES` of what it asks, either way past the in-flight plane and the decoded trunk weight it names (held at
+  its own matmul, never at a chunk's peak: the stq4 cut's 8,192-row attention chunk asks 1,933,856 KB with and without
+  NAX, r-46), on tiny and both cuts at 512, 2,048
+  and 8,192 rows: the small tensors
+  no term names come to under 1 MB, and the over-bill to 55 MB on tiny and 130 MB on the cuts, most of it the dq-GEMM
+  weight below. A chunk's cap and the sizer's ask are its cost plus the margin, and a rung the long-context gate
+  widened clears that bill alone (`PREFILL_WIDE_RUNG_MARGIN_PCT` stays for the fitted bills).
+- **Open fitted terms on Cooler:** the dq-GEMM weight (`prefillDequantWeightBytes`, billed beside the rows though it
+  lives at its own matmul) and a BF16 Cooler load's envelope. DeepSeek's wide forward is a shape sum
+  ([dsv41-memory](dsv41-memory.md#wide-shape-sum)); its decode forward keeps `forward_held_bytes`, measured.
+  `PREFILL_RUNTIME_FLOOR_BYTES`, the 0.64 and 93% sizer margins, GLM's quarter and
+  `GPU_FLOOR_SLACK_BYTES` are MLX-path and stay.
+- **Under a cap the pool hands the open pass over rather than refuse** (`core.trimTo`): a buffer freed inside the open
+  pass stays bound to it, so before the hand-over the pool could hold more than its tensors ask and refuse a buffer the
+  bill covered. It still refuses between a dispatch's binds.
+- **A Cooler load checks its bill at the served warm** (`cooler_warm.warmServed`): the widest chunk's request runs once,
+  and a pool refusal, or more bytes in use at its peak than its request bill, fails the load with `WarmOverBill`,
+  naming both. Free buffers the pool keeps up to its cap are not billed; the debug line logs them beside the peak.
+  The bill there lends no decoder pool (`bills.prefillNeededAtChunkUnlent`): admission nets out the pools a DeepSeek
+  prefill may release, which a forward the headroom cannot hold releases first (`dsv41_borrow.beforeForward`, else
+  `PrefillDoesNotFit`), but the warm's chunk fits the headroom, so it releases none and takes its whole cap from the
+  pool. Against the lent bill a streamed load whose pools cover the chunk failed every warm (r-62: 13,248 MB against
+  719 MB at `--ssd-budget-gb 95`).
+- **A term is proven from the buffers alive at the peak**: `SUSHI_ENGINE_POOL_PEAK_TRACE=1` with `--log-level debug` logs
+  the engine pool's asks in use at its fullest, by call site, after each request.
 
 - `prefillMemoryNeeded` sums its terms and adds a net: a quarter (`uplift_16ths` 20) for every arch, none (16) for
   Flash-Next up to `MEASURED_NET_MAX_TOKENS` (86,016), where its summed terms alone measured at least 1.1x the live
@@ -367,6 +441,8 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 
 ## Admission
 
+- The generation bill uses the request's concrete `max_tokens` (the client's, else the filled default, never the
+  rest of the window), cut to what the window leaves ([server-http-apis](server-http-apis.md)).
 - One `[admission] needed=… available=… reclaimable=… width=… verdict=…` line per decision.
 - An explicit `--prefill-chunk N` caps the per-request ladder, never pins it: N if it fits, else the widest rung
   below N that fits, down to 512; refused only when that floor does not fit. `requestPrefillPick` is the one rule for
@@ -402,6 +478,11 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   (`oldBuffersInEvalWindow`) for a donated restore and nothing for a share. At a 128k entry, kv8: +170 MiB on
   qwen4_exp and +212.5 MiB on mimo_v2 over the bill without the grow; growing at the first decode step instead
   held every layer's old rows at once.
+- A decode or verify forward past its cache's capacity grows it before it builds (`KVCache.growAhead`, from
+  `model_handle.forwardWith` for forwards of up to 64 rows): one buffer at a time, each the kept rows joined to a zero
+  tail, evaluated, and its old copy released. The release is `mlx.engine.trim()` on the engine's stream:
+  `mlx_clear_cache` clears MLX's cache only, and the engine's pool kept every old buffer as a free one. Grown inside
+  the forward, the zeros buffer of the whole capacity, the copy and the old buffer of every layer were alive at once.
 - The eviction pass drains the GPU stream before it reads live memory: a command buffer in flight holds its inputs'
   buffers, so an eviction read early frees nothing and trips the shared-entry stop.
 - **Concurrent arrivals are each billed against the SAME free memory** on their connection threads. The gated arch
@@ -412,8 +493,12 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   `commit`, released as the slot's resident cache reaches it): a later admission subtracts every live slot's
   outstanding share from its headroom. Native GLM MLA grows row by row, so two short-prompt requests with large output
   limits otherwise both admit and together outgrow the box; a DFlash2 request reserves its capacity after prefill and
-  owes nothing. Qwen and MiMo take their reserved KV at the first grow, resident before the next admission, so their
-  `commit` is zero.
+  owes nothing. A Qwen request commits its whole cache and state at their allocated capacity (`bills.cacheCommitBytes`,
+  the 256-row step and, on Sushi Cooler, the pool's size class), drained as it becomes resident; MiMo's is zero.
+- **A request's whole reply is billed** (`bills.cacheCapacityTokens`): a long prompt's reservation, else the cache its
+  decode grows to by the +25% steps. An explicit `max_tokens` that does not fit is refused by name: the refusal gives
+  the bill, what is available and the largest `max_tokens` that fits (`requestContextRefusal`, EXL3 packs). The live
+  364k session's Turn A, admitted at 13,269 MB under the old 8192-token headroom, bills 20,845 MB on MLX.
 - The hot-cache budget is clamped at load and follows residency ([engine-prefix-cache](engine-prefix-cache.md#budget)).
 - Context-overflow 400s name BOTH counts.
 - **A freed reserved-KV slot goes back to the OS, not MLX's pool** (`deinitSlotsReturningPool`, and the prefill-end
@@ -422,10 +507,11 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - MiMo MTP adds a constant per-request and load-time reserve (`mimo_mtp.State.billedBytes`) for all three sliding head KVs, retained hiddens, and catch-up/concatenation buffers; it is zero with MTP off and never scales with context.
 - **A vision encode is billed before it runs** (`towerFitFault`, `request_media.visionEncodeBill`), for the blocks the prefix
   restore leaves to encode, never the whole history: the largest block's tower
-  scratch (`qwen_vision.encodeScratchBytes`, fitted >= 25% over the measured peak) plus every block's float32 pixels
+  scratch (`qwen_vision.encodeScratchBytes`: on Sushi Cooler the pool's exact buffers and the margin, on MLX fitted
+  >= 25% over the measured peak) plus every block's float32 pixels
   and three bf16 copies of its soft-token rows (group outputs, video concatenation, request concatenation); past what
-  the GPU has left it is a named 400. The tower evaluates per block, so the peak is one block's f32 score sheet
-  (heads x N^2) and rows; table in [qwen4-arch](qwen4-arch.md#vision-tower).
+  the GPU has left it is a named 400. The tower evaluates per block and scores 512 query rows at a time, so the peak is
+  one block's [heads, 512, N] sheets and rows; table in [qwen4-arch](qwen4-arch.md#vision-tower).
 - **A vision encode is checked on the inference thread** (`runVisionEncode`, `vision_encode_available`), right before
   the tower runs and after the restore: a prefill's cache growth or an earlier encode's resident output may have taken
   the headroom, and the refusal is a named 400 (`MediaRefused`).
@@ -549,9 +635,8 @@ tensor lent to MLX is in both counters, so the sum errs high.
 - **Through `gpu_mem`** (count the engine): every bill and admission read in `bills.zig`, `dsv41Headroom` (it adds
   nothing of its own), `visionEncodeAvailable`, the load preflight, the gauge sampler (`mlx_active_bytes`,
   `mlx_cache_bytes`, the history ring), `/props` (`active_bytes`, `cache_bytes`), `sushi kld`'s memory report, the
-  `[prefill-trace]` line, and the GPU floor (`measureGpuFloor`, `refreshIdleGpuFloor`).
-- **MLX direct, on purpose**: every peak (`/props` `peak_bytes`, `[prefill-trace]` `peak_bytes`, the load's fwd-ubench,
-  `sushi chat`'s peak line, the encoder and the vision/ubench fits) because the engine keeps no peak; the DeepSeek
-  transient cap (`mlxSetTransient`), which limits MLX's own allocator; `[transient-peak]` pool_gb, MLX's pool; tests
+  `[prefill-trace]` line, the GPU floor (`measureGpuFloor`, `refreshIdleGpuFloor`), and every peak through `peakBytes`
+  (`/props` `peak_bytes`, the process's high-water since the load, never one request's; `[prefill-trace]` `peak_bytes`).
+- **MLX direct, on purpose**: the DeepSeek transient cap (`mlxSetTransient`), which limits MLX's own allocator; `[transient-peak]` pool_gb, MLX's pool; tests
   that measure what an MLX op allocates.
 - A new reader of the GPU's bytes goes through `gpu_mem`; a raw `mlx_get_*_memory` is for MLX's own allocator only.

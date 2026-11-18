@@ -169,11 +169,9 @@ pub const Pending = struct {
     stop: [max_dims]c_int,
 };
 
-/// Pool buffers are whole pages: every page count up to `steps`, then `steps` sizes to an octave, so a buffer is
-/// under 1/16 larger than what was asked.
-const page_bytes = 16 * 1024;
-const steps = 16;
-const classes = steps * 22;
+const pool_class = @import("pool_class.zig");
+const page_bytes = pool_class.page_bytes;
+const classes = pool_class.classes;
 
 const Stores = std.AutoHashMapUnmanaged(*Store, void);
 
@@ -361,6 +359,10 @@ pub fn poolHeldPeak(which: Peak) u64 {
 /// Both high-waters start again from now: in use, and held.
 pub fn resetPoolPeak(which: Peak) void {
     pool_peaks[@intFromEnum(which)].store(poolTotal() - poolFree(), .monotonic);
+    if (which == .process) {
+        peak_set.clearRetainingCapacity();
+        peak_set_in_use = poolTotal() - poolFree();
+    }
     held_peaks[@intFromEnum(which)].store(poolTotal(), .monotonic);
 }
 
@@ -531,28 +533,10 @@ pub fn of(a: mlx.mlx_array) *Tensor {
 
 // ── Stores and tensors ──
 
-fn classOf(len: usize) usize {
-    const pages = (len + page_bytes - 1) / page_bytes;
-    if (pages <= steps) return pages - 1;
-    var shift: usize = std.math.log2_int(usize, pages) - std.math.log2_int(usize, steps);
-    var top = (pages + (@as(usize, 1) << @intCast(shift)) - 1) >> @intCast(shift);
-    if (top == 2 * steps) {
-        shift += 1;
-        top = steps;
-    }
-    return steps - 1 + shift * steps + (top - steps);
-}
-
+const classOf = pool_class.classOf;
 /// What a tensor of `len` bytes takes from the pool: its size class.
-pub fn poolBytes(len: usize) usize {
-    return if (len == 0) 0 else classBytes(classOf(len));
-}
-
-fn classBytes(class: usize) usize {
-    if (class < steps) return (class + 1) * page_bytes;
-    const k = class - (steps - 1);
-    return ((steps + k % steps) << @intCast(k / steps)) * page_bytes;
-}
+pub const poolBytes = pool_class.poolBytes;
+const classBytes = pool_class.classBytes;
 
 /// TEST-ONLY, `mlx.fault` for the engine's allocations: `arm(k)` makes the pool refuse its k-th buffer from here with
 /// `PoolOverBudget`, so a test walks every error path of a forward without patching it. Compiled only under test.
@@ -626,6 +610,73 @@ pub const poison = struct {
 /// A store of at least `len` bytes from the pool, never one the open pass binds. `for_host` asks for one no
 /// submitted pass still binds either, since the host is about to write it. A new buffer stays inside the budget:
 /// free buffers go to make room, and with none left the op is refused.
+// ── Pool peak trace ──
+
+/// Tests set this; otherwise `SUSHI_ENGINE_POOL_PEAK_TRACE` decides, read once.
+pub var peak_trace_hook: ?bool = null;
+var peak_trace_env: ?bool = null;
+fn peakTraceOn() bool {
+    return peak_trace_hook orelse io_util.diagEnvOnCached(&peak_trace_env, "SUSHI_ENGINE_POOL_PEAK_TRACE");
+}
+
+/// A pool ask in use: its bytes and its caller's return addresses, innermost first, past the pool's own frames.
+pub const PeakAsk = struct { len: usize, at: [8]usize };
+var peak_live: std.AutoHashMapUnmanaged(usize, PeakAsk) = .empty;
+var peak_set: std.ArrayList(PeakAsk) = .empty;
+var peak_set_in_use: u64 = 0;
+
+/// The asks in use when the pool was fullest since the process peak's last reset.
+pub fn peakTrace() []const PeakAsk {
+    return peak_set.items;
+}
+
+noinline fn tracePoolAsk(store: *const Store, in_use: u64) void {
+    var ask: PeakAsk = .{ .len = store.len, .at = @splat(0) };
+    var addrs: [ask.at.len + 2]usize = undefined;
+    const all = std.debug.captureCurrentStackTrace(.{}, &addrs).return_addresses;
+    // This frame and `poolStore`'s.
+    if (all.len > 2) for (all[2..], 0..) |r, i| {
+        ask.at[i] = r;
+    };
+    peak_live.put(gpa, @intFromPtr(store), ask) catch return;
+    if (in_use <= peak_set_in_use) return;
+    peak_set_in_use = in_use;
+    peak_set.clearRetainingCapacity();
+    var it = peak_live.valueIterator();
+    while (it.next()) |v| peak_set.append(gpa, v.*) catch return;
+}
+
+/// Debug lines for the trace: the asks in use at the pool's fullest, by call site, largest first; nothing while the
+/// switch is off.
+pub fn logPoolPeakTrace() void {
+    if (!peakTraceOn()) return;
+    const log = @import("../log.zig");
+    var sites: std.AutoArrayHashMapUnmanaged([8]usize, struct { bytes: u64, n: u64 }) = .empty;
+    defer sites.deinit(gpa);
+    var total: u64 = 0;
+    for (peak_set.items) |ask| {
+        const g = sites.getOrPut(gpa, ask.at) catch return;
+        if (!g.found_existing) g.value_ptr.* = .{ .bytes = 0, .n = 0 };
+        g.value_ptr.bytes += ask.len;
+        g.value_ptr.n += 1;
+        total += ask.len;
+    }
+    const Order = struct {
+        v: []const @TypeOf(sites.values()[0]),
+        pub fn lessThan(o: @This(), a: usize, b: usize) bool {
+            return o.v[a].bytes > o.v[b].bytes;
+        }
+    };
+    sites.sort(Order{ .v = sites.values() });
+    log.debug("[engine-peak] {d} MB asked by {d} tensors at the pool's fullest ({d} MB in use), {d} call sites\n", .{ total >> 20, peak_set.items.len, peak_set_in_use >> 20, sites.count() });
+    for (sites.keys(), sites.values()) |at, v| {
+        log.debug("[engine-peak] {d} KB in {d} tensors from:\n", .{ v.bytes >> 10, v.n });
+        var addrs = at;
+        const n = std.mem.indexOfScalar(usize, &addrs, 0) orelse addrs.len;
+        std.debug.dumpStackTrace(&.{ .return_addresses = addrs[0..n], .skipped = .unknown });
+    }
+}
+
 fn poolStore(len: usize, for_host: bool) Error!*Store {
     const s = try st();
     takeBack();
@@ -650,6 +701,7 @@ fn poolStore(len: usize, for_host: bool) Error!*Store {
         store.len = len;
         s.stats.pool_free -= bytes;
         s.stats.pool_asked += len;
+        if (peakTraceOn()) tracePoolAsk(store, s.stats.pool_bytes - s.stats.pool_free);
         publishPool(s);
         return store;
     }
@@ -668,16 +720,21 @@ fn poolStore(len: usize, for_host: bool) Error!*Store {
     if (comptime builtin.is_test) if (poison.byte) |b| @memset(store.ptr[0..bytes], b);
     s.stats.pool_bytes += bytes;
     s.stats.pool_asked += len;
+    if (peakTraceOn()) tracePoolAsk(store, s.stats.pool_bytes - s.stats.pool_free);
     publishPool(s);
     return store;
 }
 
 /// Releases free buffers until the pool holds at most `bytes`, waiting for the passes that still bind some when
-/// the idle ones are not enough. False when the buffers in use and those the open pass binds hold more.
+/// the idle ones are not enough, the open one too where no dispatch is between its binds. False when the buffers in
+/// use hold more, or those a dispatch being bound still pins.
 fn trimTo(s: *State, bytes: u64) Error!bool {
     if (s.stats.pool_bytes <= bytes) return true;
     if (evict(s, bytes)) return true;
     try waitFor(s, s.seq - 1);
+    if (evict(s, bytes)) return true;
+    if (s.pass == null or s.next_in.count() != 0 or s.next_out.count() != 0) return false;
+    try waitFor(s, s.seq);
     return evict(s, bytes);
 }
 
@@ -769,6 +826,7 @@ fn dropStore(store: *Store) void {
     const s = &state.?;
     switch (store.origin) {
         .pool => |class| {
+            if (peakTraceOn()) _ = peak_live.remove(@intFromPtr(store));
             s.stats.pool_asked -= store.len;
             if (s.free[class].append(gpa, store)) |_| {
                 s.stats.pool_free += classBytes(class);
@@ -1076,6 +1134,8 @@ pub fn take(a: mlx.mlx_array) Error!*Tensor {
 /// The tensor behind `a` with its bytes final: a slice update still pending is written first.
 pub fn ready(a: mlx.mlx_array) Error!*Tensor {
     const t = of(a);
+    // Its box waits for the next tensor, and its store may already be another's.
+    if (!t.live) return refusing("a tensor used after its release", error.TensorUnsupported);
     if (t.pending != null) try @import("ops.zig").settle(t);
     return t;
 }
@@ -1175,11 +1235,15 @@ fn gpuIdle(s: *State) bool {
 /// Binds the bytes of `t`, which the dispatch being encoded reads, at `index` of the open pass.
 pub fn bind(p: metal.Pass, t: *const Tensor, index: usize) void {
     const s = &state.?;
-    t.store.seq = s.seq;
     s.next_in.put(gpa, t.store, {}) catch {
         s.needs_barrier = true;
     };
     if (s.prev_out.contains(t.store)) s.needs_barrier = true;
+    bindBuffer(s, p, t, index);
+}
+
+fn bindBuffer(s: *State, p: metal.Pass, t: *const Tensor, index: usize) void {
+    t.store.seq = s.seq;
     s.pass_binds.put(gpa, t.store, {}) catch @panic("engine: out of memory tracking a pass");
     if (t.store.origin == .mapped) {
         const range: Range = .{ .ptr = @intFromPtr(t.store.ptr) + t.offset, .len = t.reach() };
@@ -1194,6 +1258,19 @@ pub fn bind(p: metal.Pass, t: *const Tensor, index: usize) void {
 pub fn bindOut(p: metal.Pass, t: *const Tensor, index: usize) void {
     const s = &state.?;
     bind(p, t, index);
+    bindOutTail(s, t);
+}
+
+/// `bindOut` for a write that misses every element the dispatches before it write to `t`: it waits for their reads,
+/// not their writes, and is not a read itself, so writes to disjoint rows of one plane run together. A reader of `t`
+/// after waits for them all.
+pub fn bindOutDisjoint(p: metal.Pass, t: *const Tensor, index: usize) void {
+    const s = &state.?;
+    bindBuffer(s, p, t, index);
+    bindOutTail(s, t);
+}
+
+fn bindOutTail(s: *State, t: *const Tensor) void {
     s.next_out.put(gpa, t.store, {}) catch {
         s.needs_barrier = true;
     };
@@ -1639,6 +1716,17 @@ test "a fresh tensor comes from the pool and goes back to it" {
     try t.expectEqual(pooled, stats().pool_bytes);
 }
 
+test "a tensor used after its release is refused by name, before its box or store is reused" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    const a = try fresh(.uint8, &.{100});
+    const h = handle(a);
+    release(a);
+    try t.expectError(error.TensorUnsupported, take(h));
+    try t.expectError(error.TensorUnsupported, ready(h));
+    refused_why = null;
+}
+
 test "a second release of a tensor is refused by name: its box and its store are given back once" {
     const t = std.testing;
     _ = metal.device() catch return error.SkipZigTest;
@@ -1697,6 +1785,32 @@ test "the pool's high-waters keep what was in use at its fullest, each from its 
     release(b);
     try t.expectEqual(part, poolPeak(.phase));
     try t.expectEqual(full, poolPeak(.process));
+}
+
+test "the pool peak trace keeps the tensors in use at the pool's fullest, each with its caller, from the last reset" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    const mb = 1 << 20;
+    peak_trace_hook = true;
+    defer peak_trace_hook = null;
+    try sync();
+    resetPoolPeak(.process);
+    const a = try fresh(.uint8, &.{5 * mb});
+    const b = try fresh(.uint8, &.{7 * mb});
+    release(b);
+    const c = try fresh(.uint8, &.{mb});
+    release(c);
+    release(a);
+    // The fullest was a and b together; c came after b went.
+    var sum: u64 = 0;
+    for (peakTrace()) |ask| {
+        try t.expect(ask.at[0] != 0);
+        sum += ask.len;
+    }
+    try t.expectEqual(@as(usize, 2), peakTrace().len);
+    try t.expectEqual(@as(u64, 12 * mb), sum);
+    resetPoolPeak(.process);
+    try t.expectEqual(@as(usize, 0), peakTrace().len);
 }
 
 test "the pool's byte mirrors follow every allocation, return and release, and an emptied pool reads zero" {
@@ -1773,6 +1887,30 @@ test "under a budget the pool gives its free buffers up for a new one, and refus
     try t.expectError(error.PoolOverBudget, fresh(.uint8, &.{9 * mb}));
     try t.expectEqual(before, stats().pool_bytes);
     release(c);
+}
+
+test "under a budget the pool hands the open pass over for the free buffers it binds, rather than refuse" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    const ops = @import("ops.zig");
+    const s = try st();
+    const was = s.pool_limit;
+    defer s.pool_limit = was;
+    try sync();
+    trim();
+    const mb = 1 << 20;
+    const x = try fresh(.float32, &.{ 2048, 1024 });
+    @memset(try hostBytes(x), 0);
+    // The open pass binds x, so its buffer, freed, cannot go until that pass is handed over.
+    const y = try ops.unary(.negative, x);
+    defer release(y);
+    release(x);
+    try t.expect(s.pass != null);
+    const want = classBytes(classOf(7 * mb));
+    s.pool_limit = s.stats.pool_bytes - classBytes(classOf(8 * mb)) + want;
+    const z = try fresh(.uint8, &.{7 * mb});
+    release(z);
+    try t.expect(s.stats.pool_bytes <= s.pool_limit.?);
 }
 
 test "what is built with the cap lifted stays, and the cap comes back raised by it" {

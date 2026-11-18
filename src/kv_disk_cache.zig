@@ -116,6 +116,19 @@ pub const GrownSpec = struct {
 };
 
 pub const IndexEntry = disk_format.IndexEntry;
+
+/// The most a tier keeps of its off-grid restore points in RAM, as their files' bytes, instead of writing them
+/// (`DiskTier.hold_stride`; docs/engine-prefix-cache.md#held-points).
+/// 250 MB (owner): the newest two points of the STQ 4bpw pack (2 x 115.7 MB), a prompt end and the newer point over it.
+pub const HELD_POINTS_MAX_BYTES: u64 = 250_000_000;
+/// The held points take at most the writer's permit over this: they are pageable host bytes beside the writer's
+/// staged ones, and give way to a staged write first (docs/engine-memory-admission.md).
+pub const HELD_POINTS_PERMIT_DIVISOR: u64 = 2;
+
+/// One restore point kept in RAM as its file's bytes (`serializeSafetensors`), listed in entry `id`'s positions.
+/// `spare`: a point a newer one of its conversation extends, kept so a regenerate of its turn restores from it; the
+/// first to go, unwritten, when the held points pass the cap, and written by a flush like any other.
+pub const HeldPoint = struct { id: u64, pos: u32, bytes: []u8, spare: bool = false };
 pub const RingFile = disk_format.RingFile;
 
 /// What a commit of a ringed cache adds: its sliding layers hold only a window, so the entry
@@ -347,6 +360,16 @@ pub const DiskTier = struct {
     ssm_budget_drops: usize = 0,
     /// Bytes of restore-point and row-segment files staged so far, for the write-through log line.
     point_bytes_written: u64 = 0,
+    /// The restore-point grid: a point off it (a prompt end, a reply end) is held in RAM, not written, until a flush
+    /// or a newer point that extends it (Qwen under SSD-first). 0 writes every point.
+    hold_stride: u32 = 0,
+    /// Whether the last restore point `loadSsmFile` loaded was a held one (RAM), not a file (SSD).
+    last_point_held: bool = false,
+    /// The off-grid points held in RAM, oldest first, and their bytes.
+    held: std.ArrayList(HeldPoint) = .empty,
+    held_bytes: u64 = 0,
+    /// Tests size the cap in points of a fixture (`heldCap`).
+    held_cap_for_test: ?u64 = null,
     /// Rows per whole segment of a growing sidecar (`SIDE_SEG_SPAN`).
     seg_span: u32 = SIDE_SEG_SPAN,
     /// What the last `persisted` line reports: every file the commit wrote but the manifest and the token record.
@@ -705,6 +728,8 @@ pub const DiskTier = struct {
     }
 
     pub fn deinit(self: *DiskTier) void {
+        for (self.held.items) |h| self.allocator.free(h.bytes);
+        self.held.deinit(self.allocator);
         if (self.grown) |g| self.allocator.free(g.divs);
         if (self.base_dir) |b| self.allocator.free(b);
         self.base_dir = null;
@@ -1408,12 +1433,22 @@ pub const DiskTier = struct {
         const cpu = rd.s;
         const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors\x00", .{ self.root, id, pos });
         defer self.allocator.free(path);
-        if (self.fs.size(path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
         var tensor_map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
         var meta_map = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-        try self.fs.loadSafetensors(path, &tensor_map, &meta_map, cpu);
+        self.last_point_held = self.heldIndex(id, pos) != null;
+        if (self.heldIndex(id, pos)) |hi| {
+            // A held point loads from its bytes as its file would.
+            const loaded = try vt.loadBytes(self.allocator, self.held.items[hi].bytes, cpu);
+            _ = mlx.mlx_map_string_to_array_free(tensor_map);
+            _ = mlx.mlx_map_string_to_string_free(meta_map);
+            tensor_map = loaded.tensors;
+            meta_map = loaded.meta;
+        } else {
+            if (self.fs.size(path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
+            try self.fs.loadSafetensors(path, &tensor_map, &meta_map, cpu);
+        }
 
         var layers_c: [*:0]const u8 = undefined;
         if (mlx.mlx_map_string_to_string_get(&layers_c, meta_map, "layers") != 0) return error.DiskCacheCorruptSsm;
@@ -2055,7 +2090,7 @@ pub const DiskTier = struct {
         const inherited_grown: u32 = if (extend_idx) |i| self.entries.items[i].inherited_grown else @intCast(linked_grown.items.len);
         const old_grown: []const u64 = if (extend_idx) |i| self.entries.items[i].grown else linked_grown.items;
         const old_span: u32 = if (extend_idx) |i| self.entries.items[i].grown_span else if (seg_donor) |d| self.entries.items[d.idx].grown_span else 0;
-        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, old_grown, old_span, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
+        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, old_grown, old_span, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2, tokens) catch |err| {
             // errdefer already owns chunk_sizes + ssm_res; a manual deinit here
             // would double-free (the fault-injection test segfaulted on exactly this).
             return err;
@@ -2317,7 +2352,7 @@ pub const DiskTier = struct {
         // Write-ahead bound: the token record, not the flushed kv_len — a
         // checkpoint beyond the current chunks is position-keyed and becomes
         // restorable when a later extend raises kv_len past it.
-        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, e.grown, e.grown_span, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes);
+        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, e.grown, e.grown_span, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes, e.tokens);
         errdefer ssm_res.deinit(self.allocator);
         const rings = try self.persistRings(e.id, dir_rel, e.quant, e.rings, ring_srcs, &written_bytes, s);
         errdefer self.allocator.free(rings);
@@ -3053,6 +3088,10 @@ pub const DiskTier = struct {
     /// Returns the file's byte size.
     pub fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
         if (self.writer) |w| {
+            // Held points give way to a staged write: they go to the writer first, so they never hold its permit.
+            while (self.held.items.len > 0 and w.pendingBytes() + self.held_bytes + dataLen(list) > w.permit_bytes) self.flushHeldAt(0, s) catch |err| {
+                log.warn("  [disk-cache] a held restore point could not be written: {s}; dropped\n", .{@errorName(err)});
+            };
             if (self.fs.vfs == null) return self.stageSafetensors(w, path, list, meta, kind, s);
             const views = self.tensorViews(list) catch |err| {
                 self.allocator.free(path);
@@ -3503,6 +3542,7 @@ pub const DiskTier = struct {
         written_bytes: *u64,
         s: mlx.mlx_stream,
         max_spend: u64,
+        tokens: []const u32,
     ) !SsmPersistResult {
         const cps: []const trunk.SSMCheckpoint = cps_opt orelse &[_]trunk.SSMCheckpoint{};
         var grown = std.ArrayList(u64).empty;
@@ -3554,6 +3594,12 @@ pub const DiskTier = struct {
                 complete = false;
                 continue; // share exhausted — persist on a later flush
             }
+            if (self.grown == null and self.holdsPosition(p)) {
+                if (self.holdPoint(id, dir_rel, cp, s)) |sz| {
+                    try pairs.append(self.allocator, .{ .pos = p, .bytes = sz });
+                    continue;
+                } else |err| log.warn("  [disk-cache] restore point at {d} written, not held: {s}\n", .{ p, @errorName(err) });
+            }
             const k = if (self.grown != null) try self.growSegments(dir_rel, cp, divs, span, &grown, s) else 0;
             const sz = try self.writePoint(dir_rel, cp, s, k, span);
             self.point_bytes_written += sz;
@@ -3562,6 +3608,38 @@ pub const DiskTier = struct {
         }
         // Bytes the segments took count against the flush like the points'.
         for (grown.items[old_grown.len..]) |b| written_bytes.* += b;
+        // A held point this commit's points extend is restored again only by a regenerate of its turn: the newest such
+        // point stays as a spare, and every older one goes unwritten.
+        if (self.held.items.len > 0) {
+            var top: u32 = 0;
+            for (pairs.items) |pr| top = @max(top, pr.pos);
+            var spare: ?usize = null;
+            for (self.held.items, 0..) |h, j| {
+                if (h.pos < top and self.heldExtendedBy(h, id, tokens) and (spare == null or h.pos > self.held.items[spare.?].pos)) spare = j;
+            }
+            const spare_key: ?struct { id: u64, pos: u32 } = if (spare) |j| .{ .id = self.held.items[j].id, .pos = self.held.items[j].pos } else null;
+            var i: usize = 0;
+            while (i < self.held.items.len) {
+                const h = self.held.items[i];
+                if (spare_key) |k| if (h.id == k.id and h.pos == k.pos) {
+                    self.held.items[i].spare = true;
+                    i += 1;
+                    continue;
+                };
+                if (h.pos < top and self.heldExtendedBy(h, id, tokens)) {
+                    if (h.id == id) {
+                        for (pairs.items, 0..) |pr, j| if (pr.pos == h.pos) {
+                            _ = pairs.orderedRemove(j);
+                            break;
+                        };
+                    } else self.unlistPoint(h.id, h.pos);
+                    self.dropHeldAt(i);
+                    continue;
+                }
+                i += 1;
+            }
+            self.fitHeld(s);
+        }
 
         std.mem.sort(Pair, pairs.items, {}, struct {
             fn lt(_: void, a: Pair, b: Pair) bool {
@@ -3602,6 +3680,19 @@ pub const DiskTier = struct {
         s: mlx.mlx_stream,
         grown_k: u32,
         span: u32,
+    ) !u64 {
+        return self.encodePoint(dir_rel, cp, s, grown_k, span, null);
+    }
+
+    /// `writePoint`, or with `held` its file's bytes into `held.*` instead of a write; returns the file's size.
+    fn encodePoint(
+        self: *DiskTier,
+        dir_rel: []const u8,
+        cp: *const trunk.SSMCheckpoint,
+        s: mlx.mlx_stream,
+        grown_k: u32,
+        span: u32,
+        held: ?*[]u8,
     ) !u64 {
         const divs: []const u32 = if (self.grown) |g| g.divs else &.{};
         var list = std.ArrayList(NamedTensor).empty;
@@ -3686,6 +3777,10 @@ pub const DiskTier = struct {
             }
         }
 
+        if (held) |out| {
+            out.* = try self.serializeSafetensors(list.items, meta.items, s);
+            return out.len;
+        }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
         return self.saveNamed(path, list.items, meta.items, .ssm, s);
     }
@@ -3694,6 +3789,7 @@ pub const DiskTier = struct {
     pub const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false, written: u64 = 0, segs: []SideSeg = &.{}, segs_inherited: u32 = 0 };
 
     fn deleteSsmFile(self: *DiskTier, id: u64, pos: u32) void {
+        if (self.heldIndex(id, pos)) |i| return self.dropHeldAt(i);
         const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch return;
         defer self.allocator.free(path);
         // A staged checkpoint may still be in the writer's queue; fence it before deleting, or
@@ -3861,12 +3957,15 @@ pub const DiskTier = struct {
     // ── Invalidation (mirrors the RAM cache API) ──
 
     pub fn invalidateAll(self: *DiskTier) void {
+        while (self.held.items.len > 0) self.dropHeldAt(0);
         for (self.entries.items) |*e| {
             self.deleteEntryDir(e.id);
             self.freeIndexEntryOwned(e);
         }
         self.entries.clearRetainingCapacity();
         self.total_bytes = 0;
+        // An empty layer keeps only its snapshot's state record, not the journal of every delete.
+        self.fs.compact();
     }
 
     pub fn invalidateNewest(self: *DiskTier) void {
@@ -3882,6 +3981,131 @@ pub const DiskTier = struct {
         self.removeAt(newest_idx);
     }
 
+    // ── Held restore points (docs/engine-prefix-cache.md#held-points) ──
+
+    /// What the held points may take: the cap, or the permit's share when that is smaller; 0 without a writer.
+    pub fn heldCap(self: *const DiskTier) u64 {
+        const w = self.writer orelse return 0;
+        if (@import("builtin").is_test) if (self.held_cap_for_test) |c| return c;
+        return @min(HELD_POINTS_MAX_BYTES, w.permit_bytes / HELD_POINTS_PERMIT_DIVISOR);
+    }
+
+    fn holdsPosition(self: *const DiskTier, pos: u32) bool {
+        return self.hold_stride != 0 and pos % self.hold_stride != 0 and self.heldCap() > 0;
+    }
+
+    pub fn heldIndex(self: *const DiskTier, id: u64, pos: u32) ?usize {
+        for (self.held.items, 0..) |h, i| if (h.id == id and h.pos == pos) return i;
+        return null;
+    }
+
+    /// Keeps `cp`'s file bytes in RAM as entry `id`'s point; returns the file's size. A point past the cap is refused.
+    fn holdPoint(self: *DiskTier, id: u64, dir_rel: []const u8, cp: *const trunk.SSMCheckpoint, s: mlx.mlx_stream) !u64 {
+        var bytes: []u8 = &.{};
+        const sz = try self.encodePoint(dir_rel, cp, s, 0, 0, &bytes);
+        errdefer self.allocator.free(bytes);
+        if (sz > self.heldCap()) return error.HeldPointOverCap;
+        const pos: u32 = @intCast(cp.pos);
+        if (self.heldIndex(id, pos)) |i| self.dropHeldAt(i);
+        try self.held.append(self.allocator, .{ .id = id, .pos = pos, .bytes = bytes });
+        self.held_bytes += sz;
+        return sz;
+    }
+
+    /// Entry `id`'s tokens extend held point `h`'s entry through `h.pos` (or `h` is `id`'s own).
+    fn heldExtendedBy(self: *const DiskTier, h: HeldPoint, id: u64, tokens: []const u32) bool {
+        if (h.id == id) return true;
+        const e = for (self.entries.items) |*e| {
+            if (e.id == h.id) break e;
+        } else return true; // its entry is gone: nothing restores it
+        return h.pos <= e.tokens.len and h.pos <= tokens.len and std.mem.eql(u32, e.tokens[0..h.pos], tokens[0..h.pos]);
+    }
+
+    fn dropHeldAt(self: *DiskTier, i: usize) void {
+        const h = self.held.orderedRemove(i);
+        self.held_bytes -|= h.bytes.len;
+        self.allocator.free(h.bytes);
+    }
+
+    fn dropHeldOf(self: *DiskTier, id: u64) void {
+        var i: usize = 0;
+        while (i < self.held.items.len) {
+            if (self.held.items[i].id == id) self.dropHeldAt(i) else i += 1;
+        }
+    }
+
+    /// Takes `pos` out of entry `id`'s listed points (a held point that goes unwritten); its manifest on disk still
+    /// names it, and the next scan drops it there, as it drops any point whose file is missing.
+    fn unlistPoint(self: *DiskTier, id: u64, pos: u32) void {
+        const e = for (self.entries.items) |*e| {
+            if (e.id == id) break e;
+        } else return;
+        const at = std.mem.indexOfScalar(u32, e.ssm_positions, pos) orelse return;
+        const sz = e.ssm_bytes[at];
+        std.mem.copyForwards(u32, e.ssm_positions[at..], e.ssm_positions[at + 1 ..]);
+        std.mem.copyForwards(u64, e.ssm_bytes[at..], e.ssm_bytes[at + 1 ..]);
+        e.ssm_positions = self.allocator.realloc(e.ssm_positions, e.ssm_positions.len - 1) catch e.ssm_positions[0 .. e.ssm_positions.len - 1];
+        e.ssm_bytes = self.allocator.realloc(e.ssm_bytes, e.ssm_bytes.len - 1) catch e.ssm_bytes[0 .. e.ssm_bytes.len - 1];
+        e.bytes -|= sz;
+        self.total_bytes -|= sz;
+    }
+
+    /// Writes held point `i` as the file its bytes are; it leaves RAM.
+    fn flushHeldAt(self: *DiskTier, i: usize, s: mlx.mlx_stream) anyerror!void {
+        const h = self.held.orderedRemove(i);
+        self.held_bytes -|= h.bytes.len;
+        defer self.allocator.free(h.bytes);
+        // A point that is neither held nor written is not listed.
+        errdefer self.unlistPoint(h.id, h.pos);
+        const loaded = try vt.loadBytes(self.allocator, h.bytes, s);
+        defer loaded.deinit();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const head = try vt.headerOfBytes(arena.allocator(), h.bytes);
+        var list = std.ArrayList(NamedTensor).empty;
+        defer self.freeNamed(&list);
+        for (head.keys) |k| {
+            const kz = try arena.allocator().dupeSentinel(u8, k, 0);
+            var arr = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(arr);
+            try mlx.check(mlx.mlx_map_string_to_array_get(&arr, loaded.tensors, kz.ptr));
+            const key = try self.allocator.dupe(u8, k);
+            errdefer self.allocator.free(key);
+            try list.append(self.allocator, .{ .key = key, .arr = arr });
+        }
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, h.id, h.pos });
+        const sz = try self.saveNamed(path, list.items, head.meta, .ssm, s);
+        self.point_bytes_written += sz;
+        if (sz != h.bytes.len) log.warn("  [disk-cache] held point e{d}@{d} wrote {d} bytes, listed {d}\n", .{ h.id, h.pos, sz, h.bytes.len });
+    }
+
+    /// Fits the held points under the cap and the writer's share of the permit: a spare goes first, unwritten (a newer
+    /// point of its conversation restores the next turn), then the oldest is written.
+    fn fitHeld(self: *DiskTier, s: mlx.mlx_stream) void {
+        while (self.held_bytes > self.heldCap()) {
+            const j = for (self.held.items, 0..) |h, j| {
+                if (h.spare) break j;
+            } else break;
+            const h = self.held.items[j];
+            self.unlistPoint(h.id, h.pos);
+            self.dropHeldAt(j);
+        }
+        while (self.held.items.len > 0 and self.held_bytes > self.heldCap()) self.flushHeldAt(0, s) catch |err| {
+            log.warn("  [disk-cache] a held restore point could not be written: {s}; dropped\n", .{@errorName(err)});
+        };
+    }
+
+    /// Writes every held point: run where the process's RAM copy is about to go (handover, unload, idle, shutdown).
+    pub fn flushHeld(self: *DiskTier, why: []const u8, s: mlx.mlx_stream) void {
+        if (self.held.items.len == 0) return;
+        const n = self.held.items.len;
+        const bytes = self.held_bytes;
+        while (self.held.items.len > 0) self.flushHeldAt(0, s) catch |err| {
+            log.warn("  [disk-cache] a held restore point could not be written ({s}): {s}; dropped\n", .{ why, @errorName(err) });
+        };
+        log.info("  [disk-cache] wrote {d} held restore points ({d:.1} MB) on {s}\n", .{ n, mib(bytes), why });
+    }
+
     // ── Internals ──
 
     fn bump(self: *DiskTier) u64 {
@@ -3891,6 +4115,7 @@ pub const DiskTier = struct {
 
     fn removeAt(self: *DiskTier, idx: usize) void {
         var e = self.entries.swapRemove(idx);
+        self.dropHeldOf(e.id);
         self.total_bytes -|= self.bytesFreedByRemoving(&e);
         self.deleteEntryDir(e.id);
         self.freeIndexEntryOwned(&e);
@@ -4108,6 +4333,7 @@ pub const DiskTier = struct {
         const dir = std.fmt.allocPrint(self.allocator, "{s}/e{d}", .{ self.root, id }) catch return;
         defer self.allocator.free(dir);
         self.fs.deleteTree(dir);
+        self.fs.reclaim();
     }
 
     /// Before `idx` is evicted: hard-link its highest point inside the prefix a resident entry provably holds
@@ -4193,7 +4419,15 @@ pub const DiskTier = struct {
         self.total_bytes += bytes;
     }
 
+    /// What the tier holds on the volume: its files' bytes, which on the content-addressed layer are the packs,
+    /// journal and snapshot.
+    pub fn diskBytes(self: *const DiskTier) u64 {
+        return self.fs.heldBytes() orelse self.total_bytes;
+    }
+
     fn gcToBudget(self: *DiskTier) void {
+        // Files the writer replaced since the last GC left dead bytes; an eviction reclaims its own.
+        self.fs.reclaim();
         if (self.max_bytes == 0) return;
         while (self.total_bytes > self.max_bytes and self.entries.items.len > 1) {
             var lru_idx: usize = 0;
@@ -8655,10 +8889,14 @@ fn sumBytes(items: []const u64) u64 {
     return n;
 }
 
-/// The layer's pack, journal and snapshot bytes, or 0 on plain files.
-fn physicalOf(tier: *DiskTier) u64 {
+/// The bytes the layer appended to its packs, journal and snapshot, the pages it punched since included; 0 on plain
+/// files.
+fn appendedOf(tier: *DiskTier) u64 {
     const v = tier.fs.vfs orelse return 0;
-    return v.physicalBytes();
+    var punched: u64 = 0;
+    var it = v.packs.valueIterator();
+    while (it.next()) |p| punched += p.holes;
+    return v.physicalBytes() + punched;
 }
 
 test "DiskTier write counters: a cold persist counts its kinds, an exact reuse adds nothing, an extension counts the tail and the new chunks" {
@@ -8682,7 +8920,7 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-wcount", 0, 128);
     defer tier.deinit();
     tier.enableBackgroundWriter();
-    const phys0 = physicalOf(&tier);
+    const phys0 = appendedOf(&tier);
     const start = tier.stats.snapshot().totalStored();
     try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, dflash, null, s));
     tier.drainWriter();
@@ -8696,8 +8934,8 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     try testing.expectEqual(sumBytes(e.chunk_bytes), cold.written[@intFromEnum(write_stats.Kind.kv)]);
     try testing.expectEqual(e.spec_bytes, cold.written[@intFromEnum(write_stats.Kind.spec)]);
     try testing.expectEqual(@as(u64, 600 * 4) + meta_json, cold.written[@intFromEnum(write_stats.Kind.meta)]);
-    // What the layer stored is its growth, every byte attributed: the guard on the store counters.
-    try testing.expectEqual(physicalOf(&tier) - phys0, cold.totalStored() - start);
+    // What the layer stored is what it appended, every byte attributed: the guard on the store counters.
+    try testing.expectEqual(appendedOf(&tier) - phys0, cold.totalStored() - start);
     for ([_]write_stats.Kind{ .ssm, .qsa, .ring }) |k| try testing.expectEqual(@as(u64, 0), wroteKind(&tier, k));
     try testing.expectEqual(@as(u64, 0), cold.failed);
 
@@ -8714,7 +8952,7 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     const grown = &tier.entries.items[0];
     try testing.expectEqual(@as(usize, 7), grown.chunk_bytes.len);
     try testing.expectEqual(sumBytes(grown.chunk_bytes[4..]), ext.written[@intFromEnum(write_stats.Kind.kv)] - cold.written[@intFromEnum(write_stats.Kind.kv)]);
-    try testing.expectEqual(physicalOf(&tier) - phys0, ext.totalStored() - start);
+    try testing.expectEqual(appendedOf(&tier) - phys0, ext.totalStored() - start);
     try testing.expectEqual(cold.written[@intFromEnum(write_stats.Kind.spec)], ext.written[@intFromEnum(write_stats.Kind.spec)]);
     try testing.expectEqual(@as(u64, 0), ext.failed);
 }
@@ -9507,5 +9745,78 @@ test "DiskTier: random commits, restores, evictions and restarts answer alike on
             }
             try pair.expectSame(io);
         }
+    }
+}
+
+/// Bytes the files directly inside `dir_abs` hold on the volume (`du`): their allocated blocks, not their lengths.
+fn allocatedBytes(dir_abs: []const u8) !u64 {
+    var d = try std.Io.Dir.openDirAbsolute(std.testing.io, dir_abs, .{ .iterate = true });
+    defer d.close(std.testing.io);
+    var total: u64 = 0;
+    var it = d.iterate();
+    while (try it.next(std.testing.io)) |ent| {
+        if (ent.kind != .file) continue;
+        var pb: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const p = try std.fmt.bufPrintSentinel(&pb, "{s}/{s}", .{ dir_abs, ent.name }, 0);
+        var st: std.c.Stat = undefined;
+        if (std.c.stat(p.ptr, &st) != 0) return error.TestUnexpectedResult;
+        total += @as(u64, @intCast(st.blocks)) * 512;
+    }
+    return total;
+}
+
+test "DiskTier budget: evictions that leave the layer's packs partly live give the volume back every dead page" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.initBackend(testing.allocator, io, base, "fp-packs", 0, 128, .cas);
+    defer tier.deinit();
+    const v = tier.fs.vfs.?;
+    // A pack takes about one round's writes, so each holds a chunk of the conversation that stays.
+    v.opts.pack_limit = 128 * 1024;
+    const rounds = 8;
+    const dim = 32;
+
+    var conv: [640 + 128 * rounds]u32 = undefined;
+    for (&conv, 0..) |*t, i| t.* = @intCast(i + 7);
+    var long = try KVCache.init(testing.allocator, 1);
+    defer long.deinit();
+    try fillCache(&long, s, 1, 640, dim, 0.0, .float32);
+    _ = try tier.appendCommit(long.entries, long.step, long.config, conv[0..640], false, null, s);
+    // The conversation at its last length beside two and a half other records.
+    tier.max_bytes = 800 * 1024;
+    var vb: [std.fs.max_path_bytes]u8 = undefined;
+    const v_dir = try std.fmt.bufPrint(&vb, "{s}/v", .{tier.root});
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const packs_dir = try std.fmt.bufPrint(&pb, "{s}/v/packs", .{tier.root});
+
+    for (0..rounds) |r| {
+        try fillCache(&long, s, 1, 128, dim, @floatFromInt(10_000_000 * (r + 1)), .float32);
+        _ = try tier.appendCommit(long.entries, long.step, long.config, conv[0..long.step], false, null, s);
+
+        var other = try KVCache.init(testing.allocator, 1);
+        defer other.deinit();
+        try fillCache(&other, s, 1, 520, dim, @floatFromInt(-10_000_000 * @as(i64, @intCast(r + 1))), .float32);
+        var toks: [520]u32 = undefined;
+        for (&toks, 0..) |*t, i| t.* = @intCast(1_000_000 * (r + 1) + i);
+        _ = try tier.appendCommit(other.entries, other.step, other.config, &toks, false, null, s);
+
+        // The conversation in use is never what goes.
+        var kept = false;
+        for (tier.entries.items) |*e| kept = kept or std.mem.eql(u32, e.tokens, conv[0..long.step]);
+        try testing.expect(kept);
+        try testing.expect(tier.entryCount() >= 2);
+        try testing.expect(tier.total_bytes <= tier.max_bytes);
+        // The packs hold no page without a live byte but each pack's last: past that, the bytes over.
+        const pages = try v.testLivePageBytes() + 4096 * v.packs.count();
+        try testing.expectEqual(@as(u64, 0), try allocatedBytes(packs_dir) -| pages);
+        // What the tier reports is what the volume holds, to a partial last page per file.
+        const held = try allocatedBytes(v_dir) + try allocatedBytes(packs_dir);
+        const slack = 4096 * (2 + v.packs.count());
+        try testing.expect(held <= tier.diskBytes() + slack and tier.diskBytes() <= held + slack);
     }
 }

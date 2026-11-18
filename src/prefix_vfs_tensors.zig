@@ -567,6 +567,61 @@ pub fn loadTensors(vfs: *Vfs, path: []const u8, s: mlx.mlx_stream) !Loaded {
     return loadFrom(src, reader) catch |e| loadError(path, e);
 }
 
+/// A tensor file held in memory as its bytes (`serializeSafetensors`' encoding), loaded as `loadTensors` loads one from
+/// the layer: the same names, dtypes, shapes, bytes and metadata; on the engine's stream into the engine's buffers,
+/// else as MLX arrays on the CPU, evaluated. A buffer that does not parse raises `error.MlxError`, as a corrupt file does.
+pub fn loadBytes(allocator: Allocator, bytes: []const u8, s: mlx.mlx_stream) !Loaded {
+    return loadBytesOr(allocator, bytes, s) catch |e| switch (e) {
+        error.OutOfMemory => e,
+        else => error.MlxError,
+    };
+}
+
+fn loadBytesOr(allocator: Allocator, bytes: []const u8, s: mlx.mlx_stream) !Loaded {
+    if (bytes.len < 8) return error.VfsCorrupt;
+    const head_len = std.mem.readInt(u64, bytes[0..8], .little);
+    if (head_len > bytes.len - 8) return error.VfsCorrupt;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const head = bytes[0 .. 8 + @as(usize, @intCast(head_len))];
+    const lay = try parseLayout(aa, head, &.{}, 0);
+    const own = mlx.engine.isStream(s);
+    const scope = if (own) mlx.engine.enter(s) else null;
+    defer if (scope) |sc| sc.end();
+    var loaded: Loaded = .{ .tensors = mlx.mlx_map_string_to_array_new(), .meta = mlx.mlx_map_string_to_string_new() };
+    errdefer loaded.deinit();
+    if (loaded.tensors.ctx == null or loaded.meta.ctx == null) return error.OutOfMemory;
+    var at: usize = head.len;
+    for (lay.entries) |*e| {
+        if (e.nbytes > bytes.len - at) return error.VfsCorrupt;
+        const src = bytes[at..][0..e.nbytes];
+        at += e.nbytes;
+        const arr = if (own) blk: {
+            var buf: []u8 = undefined;
+            const a = mlx.engine.hostFilled(e.dtype, e.shape, &buf) orelse return error.MlxError;
+            @memcpy(buf, src);
+            break :blk a;
+        } else mlx.newData(src.ptr, e.shape, e.dtype) catch return error.MlxError;
+        defer _ = mlx.mlx_array_free(arr);
+        try mlx.check(mlx.mlx_map_string_to_array_insert(loaded.tensors, try aa.dupeSentinel(u8, e.key, 0), arr));
+    }
+    if (at != bytes.len) return error.VfsCorrupt;
+    for (lay.meta) |m| try mlx.check(mlx.mlx_map_string_to_string_insert(loaded.meta, try aa.dupeSentinel(u8, m.key, 0), try aa.dupeSentinel(u8, m.value, 0)));
+    return loaded;
+}
+
+/// The tensor names of a file held as its bytes, in the order its header lists them, and its metadata. In `aa`.
+pub fn headerOfBytes(aa: Allocator, bytes: []const u8) !struct { keys: []const []const u8, meta: []const MetaPair } {
+    if (bytes.len < 8) return error.VfsCorrupt;
+    const head_len = std.mem.readInt(u64, bytes[0..8], .little);
+    if (head_len > bytes.len - 8) return error.VfsCorrupt;
+    const lay = try parseLayout(aa, bytes[0 .. 8 + @as(usize, @intCast(head_len))], &.{}, 0);
+    const keys = try aa.alloc([]const u8, lay.entries.len);
+    for (lay.entries, keys) |e, *k| k.* = e.key;
+    return .{ .keys = keys, .meta = lay.meta };
+}
+
 fn loadOwn(src: *Source, s: mlx.mlx_stream) !Loaded {
     const scope = mlx.engine.enter(s);
     defer scope.end();

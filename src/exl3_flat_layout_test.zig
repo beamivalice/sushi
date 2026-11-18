@@ -349,7 +349,8 @@ test "Sushi quant memory bills a tower on the engine as the engine holds it: req
     defer dir.close(io);
     try writeSafetensors(io, a, dir, "model-vision.safetensors", &.{ VISION_SPEC, TOWER_MATRIX_SPEC });
     const vision_common = @import("vision_common.zig");
-    const group = @import("qwen4/qwen_vision.zig").quantGroupAtLoad(TOWER_MATRIX_SPEC.key, true, TOWER_MATRIX_SHAPE[0..]).?;
+    // Through the registry, as the bill reads it: a build without an arch that requantizes a tower has no such bill.
+    const group = model.towerQuantGroupAtLoad(TOWER_MATRIX_SPEC.key, true, TOWER_MATRIX_SHAPE[0..]) orelse return error.SkipZigTest;
     const text = try model.residentWeightBytes(io, a, path, false, false, false);
     const on_mlx = try model.residentWeightBytes(io, a, path, true, false, false);
     try std.testing.expectEqual(text.trunk + 4 + vision_common.quantizedBytes(256, 256, group), on_mlx.trunk);

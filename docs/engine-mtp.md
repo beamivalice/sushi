@@ -14,7 +14,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 | File | Role |
 |---|---|
 | `src/mtp.zig` | shared MTP machinery: depth bounds, cost profiles, draft rerank (the heads live in `qwen4_forward.zig`, `mimo_mtp.zig`) |
-| `src/mtp_acceptance.zig` | acceptance modes `exact|typical|tokenv3` |
+| `src/mtp_acceptance.zig` | the exact acceptance prefix on the host (`exactPrefix`, the p/q ratio) |
 | `src/mtp_group_planner.zig` / `src/mtp_group_cost.zig` | grouped verify planner |
 | `src/mtp_qmv.zig` | M=1-exact qmv rows |
 | `src/mimo2/mimo_mtp.zig` | MiMo's three trained heads (`model.mtp.layers.{0,1,2}`), per-request row state |
@@ -85,6 +85,9 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   take the same per-slot cap (`plannerRowCap`, `capMtpRoundToThinkBound`; room 1 is a plain planner row), and a
   planner-owned slot rejoins the planner after the close instead of the serial ramp. DSpark takes the same cut
   (`dsparkRowsForRoom`) and resumes by draining the commit (`dsparkResumeAfterForced`); DFlash2 still decodes the answer plain.
+- `commitForcedTokens` forwards a spec exit's pending token alone before the forced ids, as the pipelined state did, so
+  the forced ids take one width whichever state the bound fired in; folded in, the width followed the round plan
+  (measured round times) and a greedy answer behind the close changed bytes from run to run.
 - A think penalty shifts every verify block right after its forward (`thinkShiftRows`, solo, grouped and batched-head
   alike): row j is gated on the verify ids through j, so it reads the logits its serial tick would; drafts stay raw.
 - Scoped file/request logit biases share these prefix-dependent shifts for MTP and prompt lookup; active
@@ -180,11 +183,9 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - **Declined** for a batched head and in planner-owned rounds; a serial block (adaptive serial past 32k) runs none
   either. An explicit depth range holds it: at most `--mtp-max-depth` drafts, and a lookup shorter than
   `--mtp-min-depth` is declined, so a pinned depth takes only the lookups that fill it.
-- **Output**: greedy is serial byte for byte (every row is a decode tick's); sampled under `exact` keeps the target
-  distribution, but seeded text differs from lookup-off because the draws land differently. A lookup round always
-  verifies with `exact` (`acceptGraphFor`/`acceptPrefixFor`, keep the copy with probability p; MTP rounds keep the
-  installed mode): a draft is a point mass, so `typical`'s floor makes any plausible copy certain, the output echoes
-  its context and the loop guard cuts it (mlx-serve #614).
+- **Output**: greedy is serial byte for byte (every row is a decode tick's); sampled keeps the target distribution; on
+  MLX's stream seeded text differs from lookup-off as the draws land elsewhere. A lookup draft is a point mass, kept
+  with probability p (no q rides it).
 - **Measured on Sushi-3bpw**: copies and edits of a file +16-21%, a write_file tool call +9-11%, long-context edits
   +18-24%; diff, new code and prose inside noise ([perf-baselines](qwen4-perf.md#mtp-lookup)).
 - **Measured on MiMo 2.3bpw** at seven drafts (8-row verify): a verbatim copy +23%, a rename +19%, prose unchanged;
@@ -252,8 +253,12 @@ serve up to `SINGLE_VERIFY_ROWS_MAX` (9) rows. `dflash_policy.ladder()` is that 
   a round takes cannot flip a greedy token.
 - `test_mtp_equivalence.sh` compares full output bytes with `--no-mtp` and acquits nothing
   (`test_mtp_equivalence_strict.py`); its servers boot `--prefix-cache-entries 0`.
-- **Sampled auto-mode output follows the round times**: the plan reads measured round costs, and the draft counts
-  decide which draws land where. A seeded byte comparison pins the plan (`SUSHI_MTP_ADAPTIVE=0
+- **On the engine a sampled draft stands while it is the target's draw at its position** (`mtpDrawsAtPositions`: a draw
+  root): draft and verify row j take the key of the position they predict (`sampler.shortlistDraw`,
+  `sampler.verifyDraws`, the serial step's `engineDraws`), so every emitted token is the serial step's draw from its
+  row, and where rows are the serial step's bytes (STQ) a seeded request says the serial text whatever the plan; no
+  host PRNG, p/q ratio or residual. MLX's stream keeps a draw counter, so its sampled text
+  follows the round times: a seeded byte comparison there pins the plan (`SUSHI_MTP_ADAPTIVE=0
   SUSHI_MTP_COST_TABLE=0`, or a pinned depth).
 - **Trellis (STQ) trunk projections are row-invariant per arm**: a verify row equals its serial tick bit for bit on the machine's own arm (NAX where present, else SIMD, exact rows); NAX and SIMD boxes may differ from each other, the accepted cross-hardware rule ([engine-exl3-experts](engine-exl3-experts.md#dense-linears)). Without matrix units that arm holds 8 rows (`rowsMax`) and a ninth sends the block to the sorted GEMM, so qwen4's `Ctx.verifyRowsMax` caps an STQ verify there.
 - Pinned-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on two K3 packs).
@@ -268,23 +273,12 @@ serve up to `SINGLE_VERIFY_ROWS_MAX` (9) rows. `dflash_policy.ladder()` is that 
   either way, `mtpHeadKvBytesPerToken`; MiMo's heads keep their dense window and the boot log says the flag does
   nothing there, `server.mtpHeadKvLine`); a spec sidecar under another scheme is declined at restore and rewritten
   on the next commit. Head persistence with its QSA half: `tests/qwen4/test_qwen4_mtp_head_persist.sh`.
-- Acceptance modes `exact|typical|tokenv3` (`mtp_acceptance.zig`, per-model `mtp_acceptance`).
-  Only sampled decoding reads the mode: temperature < 0.01 (`sampler.isGreedyTemperature`, shared with serial sampling) always takes the argmax check (`mtpAcceptRowGreedy`), so
-  greedy output is identical under every mode. Sushi-4bpw at T=1.0 / top_k 20 / top_p 0.95, 16 fixture prompts x 512,
-  2 seeds, binary b64c5a0e: typical 0.2 decoded 80.0 / 76.6 tok/s vs exact 69.2 / 63.3 (2.4-2.6 vs 2.1-2.2 tokens per
-  round); target NLL of the emitted text 0.7819 vs 0.7805 nats, a paired difference inside the seed noise (~0.1 nats).
-- **Greedy tail** (`--mtp-greedy-tail`, per-model `mtp_greedy_tail`, off by default): a sampled request draws only
-  depth 0 from the draft sampler and drafts every later depth by argmax (`mtpDraftSampling(step)`, the one place a
-  depth's proposal is resolved). Those verify rows carry a one-hot q, so `exact` stays distribution-exact and
-  `typical` judges the argmax against the target's floor; a greedy request is untouched. A chain that carries q
-  drafts every depth as a `[1]` id: the accept graph concatenates them.
-- Sampled output under `typical` acceptance has been seen looping (2026-09-28): the README and
-  pack cards do not recommend it until the cause is known.
-- **The greedy tail pays only beside `typical`, and pulls sampled text toward the argmax.** Sushi-2.6bpw at T=1.0 /
-  top_k 20 / top_p 0.95, 16 fixture prompts x 512, 2 seeds, binary 506efc5b: typical 0.2 + tail decoded 95.9 / 92.6
-  tok/s vs typical 84.0 / 89.0 and exact 74.3 / 74.6 (2.7-2.9 vs 2.5 vs 2.1 tokens per round). Its emitted-text NLL
-  fell below exact (0.603 vs 0.680 nats, paired interval [-0.23, +0.01]; non-argmax tokens 19.2% vs 21.6%): less
-  diverse text, not a likelihood loss. Exact + tail stayed inside the NLL noise but decoded 72.8 / 72.2 tok/s.
+- **One acceptance rule, the exact one.** Temperature < 0.01 (`sampler.isGreedyTemperature`, shared with serial
+  sampling) takes the argmax check (`mtpAcceptRowGreedy`); a sampled request keeps a draft while it is the target's
+  draw at its position on the engine, and by the p/q ratio with a residual correction on MLX. The lossy `typical` and
+  TokenV3 rules and the greedy tail (`--mtp-typical`, `--mtp-tokenv3`, `--mtp-greedy-tail`, settings `mtp_acceptance`
+  and `mtp_greedy_tail`) are removed ([flags](flags.md#removed)): they bought sampled speed with text that differs
+  from serial, where the position-keyed rule makes a seeded sampled request on the engine repeat the serial text.
 - **Norms**: publish packs carry FOLDED head norms (the converter folds them).
 
 <a id="ple-defer"></a>

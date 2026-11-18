@@ -840,6 +840,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
           <label class="field" data-tip="How varied the wording is. 0 always picks the most likely next word; 0.6 to 1 is typical. Empty uses the model's default.">Temperature <input id="optTemperature" type="number" min="0" max="2" step="0.05" placeholder="Default" /></label>
           <label class="field" data-tip="Picks only among the most likely next words that together make up this share (0 to 1). Lower is more focused; 0.95 is typical. Empty uses the model's default.">Top-p <input id="optTopP" type="number" min="0" max="1" step="0.01" placeholder="Default" /></label>
           <label class="field" data-tip="Picks only among this many most likely next words; 0 turns the limit off. 20 to 40 is typical. Empty uses the model's default.">Top-k <input id="optTopK" type="number" min="0" step="1" placeholder="Default" /></label>
+          <label class="field" data-tip="Drops every next word less likely than this share of the most likely one (0 to 1); 0 turns it off. 0.05 is typical. Empty leaves it off.">Min-p <input id="optMinP" type="number" min="0" max="1" step="0.01" placeholder="Default (off)" /></label>
         </div>
         <button class="btn sm ghost" id="chatOptionsReset">Reset to the model's defaults</button>
       </div>
@@ -2015,7 +2016,7 @@ $("updateButton").onclick = async () => {
    Chat options
    ------------------------------------------------------------ */
 const OPTIONS_KEY = "sushi-chat-options";
-const optionFields = ["optSystem", "optMaxTokens", "optTemperature", "optTopP", "optTopK"];
+const optionFields = ["optSystem", "optMaxTokens", "optTemperature", "optTopP", "optTopK", "optMinP"];
 function loadChatOptions() {
   try {
     const stored = JSON.parse(readStore(OPTIONS_KEY) ?? "{}");
@@ -2028,7 +2029,7 @@ function persistChatOptions() {
   writeStore(OPTIONS_KEY, JSON.stringify(stored));
 }
 for (const id of optionFields) $(id).addEventListener("change", persistChatOptions);
-const chatNumberFields = ["optMaxTokens", "optTemperature", "optTopP", "optTopK", "optThinkBudget"];
+const chatNumberFields = ["optMaxTokens", "optTemperature", "optTopP", "optTopK", "optMinP", "optThinkBudget"];
 // Flags every setting field that cannot be sent; returns the first one.
 function checkChatNumbers() {
   let first = null;
@@ -2192,11 +2193,12 @@ function applyEffortBudget() {
   const model = selectedModel();
   const effort = $("effortSelect").value;
   box.disabled = !effort || effort === "off";
-  box.placeholder = box.disabled ? "off" : "no cap";
+  const budget = box.disabled ? null : model?.reasoning_effort_budgets?.[effort];
+  // An empty box sends no budget, so the request runs under the word's own cap: say so, never "no cap" over one.
+  box.placeholder = box.disabled ? "off" : budget == null ? "no cap" : `${Number(budget).toLocaleString("en-US")} (level cap)`;
   const key = `${model?.id ?? ""}|${effort}`;
   if (box.dataset.budgetFor === key) return;
   box.dataset.budgetFor = key;
-  const budget = box.disabled ? null : model?.reasoning_effort_budgets?.[effort];
   box.value = budget == null ? "" : String(budget);
 }
 // "Default (value)" when the server reports what the model uses unset, else a bare "Default".
@@ -2207,7 +2209,7 @@ function renderChatDefaults(model) {
   const known = (v) => (Number.isFinite(v) ? v : null);
   const tokens = known(meta.default_max_tokens);
   const shown = {
-    optMaxTokens: tokens == null ? null : tokens > 0 ? tokens.toLocaleString("en-US") : "rest of the context window",
+    optMaxTokens: tokens == null ? null : tokens.toLocaleString("en-US"),
     optTemperature: known(meta.default_temperature) == null ? null : decimalText(meta.default_temperature),
     optTopP: known(meta.default_top_p) == null ? null : decimalText(meta.default_top_p),
     optTopK: known(meta.default_top_k) == null ? null : meta.default_top_k === 0 ? "off" : String(meta.default_top_k),
@@ -3034,7 +3036,7 @@ function buildRequest(model, history, tools = null) {
   if (effort) body.reasoning_effort = effort;
   const budget = chatNumber("optThinkBudget").value;
   if (effort !== "off" && budget > 0) body.reasoning_budget_tokens = budget;
-  for (const [fieldId, key] of [["optMaxTokens", "max_tokens"], ["optTemperature", "temperature"], ["optTopP", "top_p"], ["optTopK", "top_k"]]) {
+  for (const [fieldId, key] of [["optMaxTokens", "max_tokens"], ["optTemperature", "temperature"], ["optTopP", "top_p"], ["optTopK", "top_k"], ["optMinP", "min_p"]]) {
     const { value } = chatNumber(fieldId);
     if (value !== null && value !== undefined) body[key] = value;
   }
@@ -3634,10 +3636,6 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       "Fewer bits fit a longer conversation in the same memory, at a small quality cost. 8-bit suits almost everyone.", ""],
     mtp: ["Speculative decoding", "The model drafts a few tokens ahead and verifies them in one step, for faster generation. Default: on where the model can.", "--mtp",
       "Usually makes generation faster at no cost to quality. Turn it off only to save a little memory or to compare speeds. It uses the model's own draft head (MTP).", ""],
-    mtp_acceptance: ["Draft acceptance", "How strictly the drafted tokens are verified. Exact keeps the output the same as without drafting.", "",
-      "Typical and TokenV3 accept more drafted tokens, so generation is faster, but the wording can differ from Exact. Exact is the safe choice.", ""],
-    mtp_greedy_tail: ["Longer drafts when sampling", "With a temperature above 0, also draft the later tokens, picking the most likely ones.", "--mtp-greedy-tail",
-      "Mainly speeds up generation together with Typical acceptance. Off by default.", "MTP greedy tail"],
     ssd_budget_gb: ["Memory for SSD streaming (GiB)", "Memory for the parts of the model read from the SSD as it runs. More memory, fewer slow SSD reads.", "--ssd-budget-gb",
       "Setting it makes the model run partly from the SSD, so it fits in less memory but generates more slowly. Leave it empty if the model fits in memory.", "expert streaming budget"],
     ssd_prefetch: ["SSD read-ahead (%)", "Share of the SSD's speed sushi may use to read model parts before they are needed. 0 turns it off.", "--ssd-prefetch",
@@ -3654,11 +3652,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       "Ticked is the default and the better choice. Untick it only if Qwen3.8 answers wrongly or crashes, then report the issue so it can be fixed. It takes effect the next time the model loads.", "Sushi Cooler engine"],
     max_tokens: ["Max generated tokens", "The most tokens a request may generate, thinking included, when an app sets no limit of its own. An app's own limit wins.", "--max-tokens",
       "A token is about three quarters of a word. Empty uses the model's default.", ""],
+    expert_cache_bias: ["Faster SSD streaming (not exact)", "Lower quality for speed: when DeepSeek runs partly from the SSD, its router may pick a slightly worse expert that is already in memory instead of reading the best one from the SSD. Answers are no longer exact and can be a little worse. 0 is off (exact, the default); the most is 8.", "--expert-cache-bias",
+      "Only worth it when generation is slow because the model streams from the SSD. Higher values are faster and less exact; around 0.2 is mild. Leave it at 0 for exact answers or when the model fits in memory. It takes effect the next time the model loads.", "expert cache bias"],
     yarn_factor: ["Context extension", "Stretches the model's context window with YaRN. It can lower quality on short prompts, and a longer context needs more memory.", "",
       "Use it only when you need a conversation longer than the model's own window. Leave it on Model default otherwise.", "YaRN rope scaling"],
   };
   const COMMON = ["ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "max_tokens", "yarn_factor"];
-  const CHOICE_LABEL = { yarn_factor: { 2: "YaRN ×2", 4: "YaRN ×4" }, kv_quant: { off: "16-bit (exact)", 4: "4-bit", 6: "6-bit", 8: "8-bit" }, mtp_acceptance: { exact: "Exact (same output)", typical: "Typical (faster)", tokenv3: "TokenV3 (faster)" } };
+  const CHOICE_LABEL = { yarn_factor: { 2: "YaRN ×2", 4: "YaRN ×4" }, kv_quant: { off: "16-bit (exact)", 4: "4-bit", 6: "6-bit", 8: "8-bit" } };
   const choiceLabel = (key, v) => CHOICE_LABEL[key]?.[v] ?? v;
   // What the server would use with the key unset, as the label of the Default choice; a bare "Default" when it cannot say.
   const defaultLabel = (m, spec) => {
@@ -3667,7 +3667,6 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (v == null) return "Default";
     if (spec.type === "bool") return `Default (${v ? "On" : "Off"})`;
     if (spec.type === "choice") return `Default (${choiceLabel(spec.name, String(v)).replace(/ \(.*\)$/, "")})`;
-    if (spec.name === "max_tokens" && v === 0) return "Default (rest of the context window)";
     return `Default (${Number(v).toLocaleString("en-US")})`;
   };
   // The RoPE and window a Context extension choice leaves the model with, from the config.json's own `rope` (native window first).
@@ -3678,11 +3677,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     return r.method === "yarn" ? `Model default: yarn, factor ${r.factor}, original ${n(r.native)} · up to ${n(r.window)} tokens` : `Model default: no extension · up to ${n(r.window)} tokens`;
   };
   const isOff = (flag) => flag === "off" || flag === "false" || flag === "--ds41-mlx-engine" || flag === "--qwen-mlx-engine" || /^--no-/.test(flag);
-  // The server may send a flag's whole spelling ("--mtp-tokenv3 0.5") or just its value ("8").
+  // The server may send a flag's whole spelling ("--qwen-mlx-engine") or just its value ("8").
   const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check", skip_mem_preflight: "--skip-mem-preflight" }[key] ?? "";
   // The model-settings.json key beside its launch flag, after any engineering name the plain label replaced.
   const keyTerm = (key, eng = KEY[key]?.[4]) => `${[eng, key].filter(Boolean).join(", ")}${flagName(key) ? ` (${flagName(key)})` : ""}`;
-  const flagText = (key, flag) => /^--/.test(flag) ? flag : key === "mtp" || key === "vision" ? flagName(key).replace("--", isOff(flag) ? "--no-" : "--") : key === "mtp_greedy_tail" ? flagName(key) : flagName(key) ? `${flagName(key)} ${flag}` : "";
+  const flagText = (key, flag) => /^--/.test(flag) ? flag : key === "mtp" || key === "vision" ? flagName(key).replace("--", isOff(flag) ? "--no-" : "--") : flagName(key) ? `${flagName(key)} ${flag}` : "";
   const flagHelp = (key, flag) => { const text = flagText(key, flag); return `Set by ${text ? `${text} at launch` : "a launch flag"}. Start sushi without the flag to change it here.`; };
   const flagShown = (spec, flag) => {
     if (spec.type !== "choice") return String(flag);
@@ -3755,28 +3754,18 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (message) node.replaceChildren(h("span", { text: message }), ...(retry ? [h("button", { class: "btn sm", type: "button", text: "Retry", onclick: refresh })] : []));
   }
 
-  // limits[key]: { choices, max, requires: {key: bool}, unset: [keys], disabled, why }, present only for a constrained key.
+  // limits[key]: { choices, max, unset: [keys], disabled, why }, present only for a constrained key.
   const specsOf = (m) => (A.settings?.model_keys ?? []).filter((spec) => {
     const s = m.settings[spec.name];
     return s?.file != null || s?.flag != null || (m.keys ?? []).includes(spec.name) || (modeNow() === "advanced" && !!m.limits?.[spec.name]?.disabled);
   }).map((spec) => { const max = m.limits?.[spec.name]?.max, min = Math.max(spec.min, CONTEXT_FLOOR[spec.name] ?? 0); return max < spec.max || min > spec.min ? { ...spec, min, max: Math.min(max ?? Infinity, spec.max) } : spec; });
   // A window smaller than this cannot hold a chat template and a question.
   const CONTEXT_FLOOR = { ctx_size: 256 };
-  // What a controlling bool key stands at: "true", "false", or "" for its default.
-  const standing = (m, key) => {
-    const s = m.settings[key];
-    if (s?.locked) return isOff(s.flag) ? "false" : "true";
-    return key in per(m.id).texts ? per(m.id).texts[key] : adminFileText(s?.file);
-  };
   const isSet = (m, k) => { const s = m.settings[k], t = per(m.id).texts; return s?.locked ? s.flag != null : k in t ? t[k] !== "" : s?.file != null; };
   const whyDisabled = (m, key) => {
     const lim = m.limits?.[key];
     if (lim?.disabled) return lim.why || "Not available for this model.";
     if (lim?.unset?.some((k) => isSet(m, k))) return lim.why || "Not used with the settings above.";
-    for (const [k, want] of Object.entries(lim?.requires ?? {})) {
-      const have = standing(m, k);
-      if (have !== "" && have !== String(want)) return lim.why || `Needs ${(KEY[k]?.[0] ?? k).toLowerCase()} ${want === true ? "on" : want === false ? "off" : `set to ${want}`}.`;
-    }
     return "";
   };
   // The unsaved values worth sending: valid, for a key that is not locked or switched off.

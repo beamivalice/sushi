@@ -35,7 +35,7 @@ const prefetch_cand_max = @import("../expert_stream.zig").Prefetcher.cand_max;
 
 /// Rows one attention span handles: the compressed rows each query gathers are its largest
 /// transient (`[span, index_topk, head_dim]` in f32).
-pub const SPAN: usize = 256;
+pub const SPAN: usize = cfg_mod.attn_span;
 /// Index keys scored per matmul: `[rows, index_heads, tile]` in f32.
 const INDEX_TILE: usize = 4096;
 /// Keys one pass of a wide span's streamed top-k scores (`indexStream`).
@@ -819,7 +819,7 @@ pub const Model = struct {
     sync_layers: bool = false,
     /// Prefill layers allowed in flight: a layer is submitted, not waited on, and the host waits only for the oldest of
     /// more than `pipe_depth`. 0 waits on every layer (the tests' reference).
-    pipe_depth: usize = 2,
+    pipe_depth: usize = cfg_mod.prefill_pipe_depth,
     pipe: Inflight = .{},
     /// TEMPORARY A/B: a decode-width STQ layer queues its routed chain from the stream's cache map before the host
     /// reads its picks (`Experts.Spec`); off, it waits for them.
@@ -1646,7 +1646,8 @@ fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize,
     const r: usize = ly.ratio;
     var latent: A = undefined;
     var g0: usize = p0;
-    var groups: usize = dim(x, 0);
+    const rows = dim(x, 0);
+    var groups: usize = rows;
     if (r == 1) {
         latent = try sc.rms(if (kv_in.ctx != null) kv_in else try cw.wkv.apply(sc, x), cw.norm, c.eps);
     } else {
@@ -1670,8 +1671,14 @@ fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize,
         const full = groups * r;
         // Both slices before either leaves the scope: a failed second one leaves the first to the scope.
         const tail: [2]mlx.mlx_array = if (full < total) .{ try sc.slice(kv, 0, full, total), try sc.slice(gate, 0, full, total) } else .{ none, none };
-        const new_kv = if (full < total) sc.out(tail[0]) else none;
-        const new_gate = if (full < total) sc.out(tail[1]) else none;
+        // A wide forward copies its pending rows out: a slice would keep its whole projections in use until the next
+        // forward. A narrow one's projections are a few rows, and a decode step makes no copy.
+        const wide = rows > cfg_mod.verify_rows;
+        const new_kv = if (full == total) none else if (wide) try ownedRows(tail[0], total - full, sc.s) else sc.out(tail[0]);
+        const new_gate = if (full == total) none else if (wide) ownedRows(tail[1], total - full, sc.s) catch |e| {
+            _ = mlx.mlx_array_free(new_kv);
+            return e;
+        } else sc.out(tail[1]);
         if (st.verify) |*v| {
             v.pend_kv[li] = sc.out(kv);
             v.pend_gate[li] = sc.out(gate);
@@ -3973,6 +3980,7 @@ pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) 
 /// Sets the kernels off (the diagnostic `SUSHI_DSV41_COMPOSED`, the KLD A/B's teacher arm) or on, and says which.
 pub fn setFused(m: *Model, composed: bool) void {
     m.fused = !composed;
+    kernels.noteExpandArm(m.fused);
     log.info("[dsv41] fused kernels {s}{s}, hc expand kernel {s}\n", .{ if (m.fused) "on" else "off", if (composed) " (diag)" else "", if (m.fused and kernels.hcExpandProbed()) "on" else "off" });
 }
 

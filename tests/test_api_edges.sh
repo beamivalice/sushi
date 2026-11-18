@@ -77,13 +77,17 @@ req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"top_k\":1,\"
 # a value the sampler cannot honour as given is refused naming the field, never clamped
 for f in 'temperature|"temperature":-1' 'temperature|"temperature":100' 'top_p|"top_p":2' 'top_k|"top_k":-3' 'top_k|"top_k":5000' \
          'seed|"seed":9223372036854775808' 'max_tokens|"max_tokens":-5' 'presence_penalty|"presence_penalty":3' \
-         'repeat_penalty|"repeat_penalty":-1' 'top_logprobs|"logprobs":true,"top_logprobs":50' 'think_penalty|"think_penalty":99'; do
+         'repeat_penalty|"repeat_penalty":-1' 'top_logprobs|"logprobs":true,"top_logprobs":50' 'think_penalty|"think_penalty":99' \
+         'min_p|"min_p":1.5' 'typical_p|"typical_p":0.9' 'tfs_z|"tfs_z":0.95' 'top_a|"top_a":0.1' 'mirostat|"mirostat":2' \
+         'dry_multiplier|"dry_multiplier":0.8' 'xtc_probability|"xtc_probability":0.5'; do
     key=${f%%|*}; field=${f#*|}
     [[ "$key" == max_tokens ]] && cap="" || cap=',"max_tokens":5'
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$field$cap,$NT_CHAT}"
     [[ "$R" == 400 && "$(echo "$BODY" | J 'd["error"]["message"]')" == *"'$key'"* ]] && ok "out-of-range $field is refused naming $key" || bad "out-of-range $field" "$R ${BODY:0:120}"
 done
-for f in '"max_tokens":0' '"temperature":2,"top_p":0,"top_k":1000' '"logit_bias":{"1":-100}' '"presence_penalty":2,"frequency_penalty":-2' '"seed":-1'; do
+for f in '"max_tokens":0' '"temperature":2,"top_p":0,"top_k":1000' '"logit_bias":{"1":-100}' '"presence_penalty":2,"frequency_penalty":-2' '"seed":-1' \
+         '"min_p":0.05,"temperature":0.8' '"min_p":1' '"service_tier":"auto"' \
+         '"typical_p":1,"tfs_z":1,"top_a":0,"mirostat":0,"dry_multiplier":0,"xtc_probability":0'; do
     [[ "$f" == '"max_tokens"'* ]] && cap="" || cap=',"max_tokens":5'
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$f$cap,$NT_CHAT}"
     [[ "$R" == 200 && -n "$(echo "$BODY" | J "$GENERATED")" ]] && ok "edge value $f answers" || bad "edge value $f" "$R ${BODY:0:120}"
@@ -94,6 +98,20 @@ req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"$N hi\",\"max_tokens\":5
 expect_status 400 "completions: logprobs 99 is refused"
 req POST /v1/responses '{"model":"m","max_output_tokens":-3,"input":"hi"}'
 expect_status 400 "responses: negative max_output_tokens is refused"
+# a field the server cannot honour is a 400 that names it, never ignored
+named400() { [[ "$R" == 400 && "$(echo "$BODY" | J 'd["error"]["message"]')" == *"'$1'"* ]] && ok "$2" || bad "$2" "$R ${BODY:0:120}"; }
+req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":5,\"min_p\":0.1,\"messages\":[$U]}"
+named400 min_p "messages: min_p (not an Anthropic field) is refused by name"
+req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"$N hi\",\"max_tokens\":5,\"suffix\":\"}\"}"
+named400 suffix "completions: suffix is refused by name"
+req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"$N hi\",\"max_tokens\":5,\"best_of\":3}"
+named400 best_of "completions: best_of 3 is refused by name"
+req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"$N hi\",\"max_tokens\":5,\"min_p\":2}"
+named400 min_p "completions: min_p 2 is refused by name"
+req POST /v1/responses '{"model":"m","max_output_tokens":5,"min_p":-1,"input":"hi"}'
+named400 min_p "responses: min_p -1 is refused by name"
+req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"$N hi\",\"max_tokens\":5,\"best_of\":1,\"suffix\":null,\"min_p\":0.05}"
+[[ "$R" == 200 ]] && ok "completions: best_of 1, a null suffix and min_p answer" || bad "completions: best_of 1, a null suffix and min_p" "$R ${BODY:0:120}"
 
 for f in '"temperature":"hot"' '"top_p":true' '"seed":"abc"' '"stop":5' '"max_tokens":"7"' '"kv_quant":5' '"n":0'; do
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$f,$NT_CHAT}"

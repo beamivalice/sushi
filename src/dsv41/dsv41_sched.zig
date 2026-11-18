@@ -159,6 +159,10 @@ pub fn modelStateBytes(slot: *const Slot) u64 {
     return thought_point.dsv41StateBytes(slot);
 }
 
+pub fn parkedStateBytes(entry: *model_registry.LoadedModel) u64 {
+    return thought_point.dsv41ModelStateBytes(entry);
+}
+
 /// The next exclusive request is admitted as soon as the slot leaves `decoding` and takes the record over, so a
 /// commit at the cleanup drain would publish onto its state.
 pub fn commitsAtCull(slot: *const Slot) bool {

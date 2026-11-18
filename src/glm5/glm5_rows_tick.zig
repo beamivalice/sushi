@@ -506,6 +506,7 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
     if (comptime !@hasField(arch_state.Ctx, "glm5")) return error.SkipZigTest;
     var mm = metrics_mod.Metrics.init();
     var sch: Scheduler = undefined;
+    sch.current_model = null;
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     sch.queue_mu = .init;
@@ -568,6 +569,7 @@ test "a GLM cancel landing between the cull passes is committed once before its 
         }
     };
     var sch: Scheduler = undefined;
+    sch.current_model = null;
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     sch.queue_mu = .init;

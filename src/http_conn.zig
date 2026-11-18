@@ -289,6 +289,8 @@ pub const Conn = struct {
     /// How long a length-framed response waits for the client to close first: a client that sent bytes we never
     /// read (a refused body, a reused socket) would otherwise get a reset that can destroy the response.
     const LINGER_MS: i64 = 250;
+    /// `LINGER_MS`, which a test shortens so it does not wait out the real linger.
+    var linger_ms: i64 = LINGER_MS;
 
     /// Keep close-delimited responses owned until the reader closes: orphaned FIN_WAIT_2
     /// sockets can expire with a reset while a slow client is still consuming the body.
@@ -296,7 +298,7 @@ pub const Conn = struct {
         c.flush() catch {};
         const fd = c.stream.socket.handle;
         _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
-        const deadline = nowMsMonotonic(c.io) + if (c.length_framed) LINGER_MS else CLOSE_WAIT_MS;
+        const deadline = nowMsMonotonic(c.io) + if (c.length_framed) linger_ms else CLOSE_WAIT_MS;
         var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
         var sink: [256]u8 = undefined;
         while (nowMsMonotonic(c.io) < deadline and !server_state.shutdown_requested.load(.acquire)) {
@@ -1676,6 +1678,8 @@ test "Conn.peerClosed: alive socket returns false, closed peer returns true" {
 /// Runs `Conn.close` after one response, with a peer that stays connected, and checks whether it
 /// held the socket (`close_delimited`) or returned at once.
 fn expectCloseWaitsForPeer(close_delimited: bool, stop_server: bool) !void {
+    Conn.linger_ms = 20;
+    defer Conn.linger_ms = Conn.LINGER_MS;
     const was_shutdown = server_state.shutdown_requested.swap(false, .acq_rel);
     defer server_state.shutdown_requested.store(was_shutdown, .release);
     var sv: [2]std.posix.fd_t = undefined;
@@ -1717,9 +1721,11 @@ fn expectCloseWaitsForPeer(close_delimited: bool, stop_server: bool) !void {
     try testing.expect(std.mem.endsWith(u8, buf[0..got], tail));
 
     // ... a Content-Length body lingers only briefly, and only a close-delimited body keeps the server's end
-    // open, so the kernel cannot reset a lagging reader.
+    // open, so the kernel cannot reset a lagging reader. The held socket is watched for twice the linger; the
+    // lingering one is given up to a second (the 5-minute close wait is what it must not take).
     var waited: u32 = 0;
-    while (!closed.load(.acquire) and waited < 2 * Conn.LINGER_MS) : (waited += 1) {
+    const watch_ms: u32 = if (close_delimited) @intCast(2 * Conn.linger_ms) else 1000;
+    while (!closed.load(.acquire) and waited < watch_ms) : (waited += 1) {
         std.Io.sleep(testing.io, .fromMilliseconds(1), .real) catch {};
     }
     try testing.expectEqual(!close_delimited, closed.load(.acquire));
@@ -1834,13 +1840,13 @@ fn rawResponseFor(conn: *Conn, peer: std.posix.fd_t, buf: []u8) ![]u8 {
     return buf[0..got];
 }
 
-test "a max_tokens the window cuts rides the response head of a JSON and an SSE answer; an uncut or omitted one adds no header" {
+test "a client max_tokens the window cuts rides the response head of a JSON and an SSE answer; an uncut or filled one adds no header" {
     var sv: [2]std.posix.fd_t = undefined;
     try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
     defer _ = std.c.close(sv[1]);
     var conn: Conn = undefined;
     Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, std.testing.io);
-    try std.testing.expectEqual(@as(u32, 96), request_policy.clampMaxTokensFor(&conn, 64000, 4000, 4096));
+    try std.testing.expectEqual(@as(u32, 96), request_policy.clampMaxTokensFor(&conn, 64000, true, 4000, 4096));
     try sendResponseFramed(&conn, "200 OK", "application/json", "{}");
     var buf: [2048]u8 = undefined;
     const json_raw = try rawResponseFor(&conn, sv[1], &buf);
@@ -1852,18 +1858,18 @@ test "a max_tokens the window cuts rides the response head of a JSON and an SSE 
     defer _ = std.c.close(sv2[1]);
     var sse: Conn = undefined;
     Conn.init(&sse, .{ .socket = .{ .handle = sv2[0], .address = undefined } }, std.testing.io);
-    _ = request_policy.clampMaxTokensFor(&sse, 64000, 4000, 4096);
+    _ = request_policy.clampMaxTokensFor(&sse, 64000, true, 4000, 4096);
     try sendSseHeaders(&sse, "chat", "Content-Type");
     const sse_raw = try rawResponseFor(&sse, sv2[1], &buf);
     try std.testing.expect(std.mem.indexOf(u8, sse_raw, "\r\nX-Sushi-Max-Tokens-Cut: 64000 -> 96\r\n") != null);
 
-    for ([_]u32{ 50, request_policy.omittedMaxTokensDefaultWith(4096, 0, 0) }) |asked| {
+    for ([_]struct { u32, bool }{ .{ 50, true }, .{ request_policy.ENGINE_DEFAULT_MAX_TOKENS, false }, .{ 64000, false } }) |case| {
         var sv3: [2]std.posix.fd_t = undefined;
         try std.testing.expect(std.c.socketpair(1, 1, 0, &sv3) == 0);
         defer _ = std.c.close(sv3[1]);
         var plain: Conn = undefined;
         Conn.init(&plain, .{ .socket = .{ .handle = sv3[0], .address = undefined } }, std.testing.io);
-        _ = request_policy.clampMaxTokensFor(&plain, asked, 4000, 4096);
+        _ = request_policy.clampMaxTokensFor(&plain, case[0], case[1], 4000, 4096);
         try sendResponseFramed(&plain, "200 OK", "application/json", "{}");
         const raw = try rawResponseFor(&plain, sv3[1], &buf);
         try std.testing.expect(std.mem.indexOf(u8, raw, "X-Sushi-Max-Tokens-Cut") == null);

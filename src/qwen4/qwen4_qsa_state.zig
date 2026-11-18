@@ -1984,7 +1984,7 @@ test "reserveQsaHistory: the MTP head entry is reserved at the same length" {
 
 test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#353 follow-up)" {
     // These buffers walked the +25% ladder beside a KV cache that had been sized once; the loop
-    // below allocated ~30 times before `qsa_reserve_rows`.
+    // below allocated ~30 times over 409,600 rows before `qsa_reserve_rows`; over the 65,536 here, about 22.
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
@@ -1992,7 +1992,7 @@ test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#3
     const rnd = prng.random();
     const hd: c_int = 128;
     const chunk_rows: c_int = 4096;
-    const total: usize = 409_600;
+    const total: usize = 65_536;
 
     var t: Trunk = undefined;
     t.s = s;

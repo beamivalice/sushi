@@ -61,9 +61,6 @@ refusals = [
     (("serve", "--model-dir", "--port", "18901"), "expects a value"),
     (("serve", "--log-file", "--port", "18901"), "expects a value"),
     (("serve", "--port", "18901", "--api-key-env", "SUSHI_API_KEY_TEST_UNSET"), "SUSHI_API_KEY_TEST_UNSET"),
-    (("serve", "--mtp-typical", "x"), "--mtp-typical: expected a number above 0; got 'x'"),
-    (("serve", "--mtp-tokenv3", "2"), "--mtp-tokenv3: expected a number from 0 to 1; got '2'"),
-    (("serve", "--mtp-typical", "0.2", "--mtp-tokenv3", "0.5"), "conflict; pass one"),
     (("serve", "--mtp", "--no-mtp"), "--mtp and --no-mtp conflict; pass one"),
     (("serve", "--no-mtp", "--mtp"), "--mtp and --no-mtp conflict; pass one"),
     (("serve", "--api-key", ""), "--api-key: the key is empty"),
@@ -77,7 +74,7 @@ refusals = [
 for args, message in refusals:
     code, out, err = run(*args)
     check(code != 0 and message in err, f"refusal {args}", f"rc={code} {err[-300:]}")
-    check(not any(name in err for name in ("InvalidAcceptanceValue", "ConflictingAcceptanceModes", "UnknownSubcommand")), f"no raw error name {args}", err[-300:])
+    check(not any(name in err for name in ("UnknownSubcommand",)), f"no raw error name {args}", err[-300:])
 
 # A set variable passes the key check; the bad --temp after it is what stops the run.
 code, _, err = run("serve", "--api-key-env", "SUSHI_API_KEY_TEST_SET", "--temp", "-1")

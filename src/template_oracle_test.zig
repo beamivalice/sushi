@@ -958,8 +958,11 @@ test "template oracle: a prompt encoded through the segment cache is the prompt 
         for ([_]usize{ segment_cache.default_budget, 64 << 10 }) |budget| {
             try tok.enableSegmentCache(budget);
             const Worker = struct {
-                fn run(t: *const tokenizer_mod.Tokenizer, config: *const chat.ChatConfig, list: []const Call, ok: *bool) void {
-                    for (list) |c| {
+                /// Every `stride`th call from `offset`.
+                fn run(t: *const tokenizer_mod.Tokenizer, config: *const chat.ChatConfig, list: []const Call, offset: usize, stride: usize, ok: *bool) void {
+                    var i = offset;
+                    while (i < list.len) : (i += stride) {
+                        const c = list[i];
                         var c2 = config.*;
                         c2.preserve_thinking = c.arm.preserve;
                         const ids = chat.formatChat(std.heap.page_allocator, t, c.r.messages, &c2, c.r.tools, c.r.instr, c.arm.thinking, c.arm.effort, c.r.continue_final) catch return;
@@ -969,15 +972,16 @@ test "template oracle: a prompt encoded through the segment cache is the prompt 
                     ok.* = true;
                 }
             };
-            // Cold and warm on one thread, then eight at once.
+            // Cold and warm on one thread, every prompt; then eight at once, each a quarter of the corpus, so every prompt
+            // runs on two threads together and the threads share the segments of the prompts beside it.
             for (0..2) |_| {
                 var ok = false;
-                Worker.run(tok, &cfg, prompts.items, &ok);
+                Worker.run(tok, &cfg, prompts.items, 0, 1, &ok);
                 try testing.expect(ok);
             }
             var oks: [8]bool = @splat(false);
             var threads: [8]std.Thread = undefined;
-            for (&threads, &oks) |*t, *ok| t.* = try std.Thread.spawn(.{}, Worker.run, .{ tok, &cfg, prompts.items, ok });
+            for (&threads, &oks, 0..) |*t, *ok, k| t.* = try std.Thread.spawn(.{}, Worker.run, .{ tok, &cfg, prompts.items, k % 4, 4, ok });
             for (threads) |t| t.join();
             for (oks) |ok| try testing.expect(ok);
             try testing.expect(tok.segment_cache.?.bytes() <= budget);

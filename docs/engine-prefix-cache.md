@@ -122,7 +122,11 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   post-preprocessing, so a preprocessing change rolls the key by itself. The tower's storage is in the key's seed
   (`--vision-bf16` or the requantized affine-8 tower give other rows for the same pixels); text records stay shared.
 - **A restore is not bit-identical on a HYBRID** (≤ 0.047 nats; the chunking class ~0.3 nats top-5 for QSA state) ⇒
-  byte-stable greedy needs `--prefix-cache-entries 0`. A hybrid cache hit moves the top logprob ~0.2 nats, so any
+  byte-stable greedy needs `--prefix-cache-entries 0`. On Sushi Cooler a restore at the request's own point says the
+  cold bytes; one from another prompt's record (every multi-turn append) reaches the tail in two spans where cold
+  forwards one, so it is deterministic but not cold's bytes (tiny flips at token 0, the stq4 cut at 6). The contract
+  holds both. Open (R2): chunked against one forward can select a different QSA block set exactly at the indexer
+  budget (kv 2049). A hybrid cache hit moves the top logprob ~0.2 nats, so any
   scorer boots with the cache off.
 - Every request logs one `[prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms` line (`[dsv41-prefix]` on DeepSeek); `prompt_ms` includes that time and `sushi bench` takes it out.
 - The always-on SSM snapshot sits 30 tokens BEFORE prompt end; a restored tail inside that window forwards as ONE
@@ -461,12 +465,50 @@ restores at the previous prompt less 31).
   `handOverSsmCheckpoint` (ssm_cache.zig), `endPointStands`/`replyEdgesSurvive` (mtp_plan.zig),
   `tests/qwen4/test_qwen4_decode_end_point.sh` (RAM-only and SSD-only).
 
+<a id="held-points"></a>
+### A Qwen conversation keeps its newest restore points in RAM
+
+Each Qwen turn's prompt-end point is a whole GDN state (about 56 MiB on the real pack), new at every position, so it
+never dedups; and the next turn restores exactly it. Written through, every turn wrote it and read it straight back:
+on a served six-turn conversation (2.75 cut, SSD-first) it was 82% of the bytes each turn stored. Under SSD-first an arch
+that sets `holds_off_grid_points` (Qwen) keeps its off-grid points (a prompt end, a reply end) in RAM instead:
+
+- **The tier lists the point and holds its file's bytes** (`DiskTier.held`, the `serializeSafetensors` encoding a staged
+  write would land). A restore decodes those bytes (`prefix_vfs_tensors.loadBytes`), so it loads what the file would
+  hold; a flush stages them as the file. Grid points (`hold_stride`, the checkpoint grid) are written through as before.
+- **The cap is `HELD_POINTS_MAX_BYTES` (250 MB), or the writer's permit over `HELD_POINTS_PERMIT_DIVISOR` (2) when
+  that is smaller** ([engine-memory-admission](engine-memory-admission.md)): the newest two points of the STQ 4bpw pack
+  (2 x 115.7 MB) fit from a 64 GB Mac. Past it a spare goes first, unwritten, then the oldest held point is written; a
+  staged write that needs the permit's room writes held points first, so they never hold the writer up.
+- **A point a newer one extends is kept as a spare, the newest such point only**: a commit whose points extend held
+  ones (one whose entry's tokens contain them) keeps the newest of them, so a regenerate of the turn restores from its
+  own prompt end, live and after a flush, which writes the spare like any other; the older ones go unwritten. A spare
+  is the first point dropped over the cap: where the newest two do not fit, a regenerate restores from the last
+  written point instead. Any other point leaving RAM (another conversation's, the cap) is written, never dropped. A
+  rewind past the points held restores from the last written point (a grid point, at most 8,191 tokens back) and
+  re-prefills the gap. Guard: `a regenerated Qwen turn restores from its own prompt end, live and after a flush`.
+- **They are written where the process's copy is about to go**, on DeepSeek's triggers (`sched.flushResident`):
+  another model's load or an unload (`retire`), 300 s idle (`live_unflushed`), shutdown. A crash or `kill -9` loses
+  them: the manifest names the point with no file, and the next scan drops it, as it drops any point whose file is
+  missing; the conversation then restores from its last written point.
+- Measured (the same served six-turn conversation, 2.75 cut, SSD-first, M1 Max): a turn off the grid stored 11.7 MB
+  (KV 2.0, the point 9.6, QSA 0.1) and now 2.3 MB (KV 2.0, QSA 0.29); the turn crossing 8192 writes only its grid point;
+  each turn restores from the same point as before. The QSA history stores about 180 KB more a turn (285 against
+  105 KB of the same 461 KB written): its leftover rows used to dedup against the same bytes in that turn's point file,
+  which is no longer stored, so they are stored once under the QSA kind instead of inside the point. Guards:
+  `cooler contract: a served Qwen conversation keeps its newest off-grid restore points in RAM ...`, `... another
+  conversation pushes out of RAM is written, not dropped`, `... restores the same tokens as its file after a flush`,
+  `... give way to a staged write`, `a rewind past a Qwen conversation's held restore points ...`.
+
 <a id="checkpoints-on-ssd"></a>
 ### Qwen's GDN checkpoints live on the SSD
 
 Qwen takes GLM's mechanism ([glm5-prefix-cache](glm5-prefix-cache.md#glm)): `SSMCheckpoint.release` keeps a position and
 frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but the newest once its file left the writer.
 
+- **A hybrid write-through waits for the prefill's first SSM restore point** (`writeThroughHybrid`): a chunk before
+  one (the 4096-token chunk under the 8192 grid) is written with the next record, so a cancel there leaves no entry
+  nothing can restore.
 - **A checkpoint leaves RAM as the next one is taken.** The write-through (`HotPrefixCache.writeThroughHybrid`) persists
   the chunk with its checkpoints, then settles them; a prefill holds two states (the previous newest until its file is
   written, and the one just taken) where it held every one it captured (up to 16: 897 MiB at `--qwen-gdn 16`, 1.76 GiB
@@ -615,6 +657,20 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   layer's entries (manifest mtime, a shared inode once) and deletes through it. The admin listing reads a layer
   read-only (`Options.read_only`: it replays the journal and changes no file, so a live tier's layer is safe) and
   lists its entries, file bytes and newest manifest as the plain files would.
+- **A dead block's whole pages go back to the volume, as a plain file's go at its unlink** (`Vfs.reclaim`: `F_PUNCHHOLE`
+  over a pack's merged dead runs; a pack still goes with its last live block). The tier reclaims at every GC and entry
+  delete, the sibling sweep before it closes a layer, and an open queues every pack byte outside a live block, so a
+  crash between a record and its punch only defers them. A pack's dead runs (`DeadRuns`, keyed by start and by end)
+  hold each dead byte once: a block that dies beside a run joins it, and the joined run's old keys go from both maps.
+  The GC still evicts on the bill, as on plain files; past it
+  the layer holds its journal, snapshot and the partial pages beside live blocks, all of which `disk_used_bytes`, the
+  usage line (`DiskTier.diskBytes`) and `tierBytes` (allocated blocks) count. Guards: `DiskTier budget:`
+  (`kv_disk_cache.zig`), `reclaim gives the volume`, `a crash before, between or after a reclaim`, `a block that dies
+  just before a dead run` (`prefix_vfs.zig`).
+- **An emptied tier reports zero on every count** (`DiskTier.invalidateAll`, the model-scope clear): it compacts the
+  layer, so the journal of the deletes goes and only the snapshot's state record stays (`prefix_vfs.state_record_bytes`,
+  45 bytes: next inode, last mtime, last sequence, so a reopened layer reuses neither). `DiskTier.diskBytes` leaves that
+  one named record out. Guard: `prefix cache admin: clearDisk` (`prefix_cache_admin.zig`).
 - **A `cas` attach deletes the plain-file `e<id>` records under its root** (`DiskTier.dropPlainRecords`), once, under
   the root lock and before its scan, with one `removed N plain-file entries` line: the layer would neither restore
   nor free them, so they would sit beside it, up to a second budget on disk. Nothing is converted. A `real` attach
@@ -749,7 +805,7 @@ added to its packs and journal to hold them (0 on plain files), so on that layer
   it while the process counters keep it.
 - Guards: `disk_write_stats.zig` (accounting and both renderings), `kv_disk_writer.zig` (`landed bytes count under their
   kind`, `a failed, dropped or fenced blob`, `a file staged in parts`), `DiskTier write counters:` in `kv_disk_cache.zig`
-  (on the layer, `stored` equals its physical growth) and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache
+  (on the layer, `stored` equals what it appended) and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache
   write counters` in `metrics.zig`.
 
 ## Restore tape and write replay

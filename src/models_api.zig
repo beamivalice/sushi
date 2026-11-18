@@ -6,7 +6,6 @@ const http = @import("http.zig");
 const gpu_mem = @import("gpu_mem.zig");
 const trunk = @import("trunk.zig");
 const generate_mod = @import("generate.zig");
-const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const mtp_depth_bounds = @import("mtp_depth_bounds.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
@@ -22,7 +21,6 @@ const model_settings = @import("model_settings.zig");
 const metrics = @import("status.zig");
 const arch_chat = @import("arch/chat.zig");
 const arch_serve = @import("arch/serve.zig");
-const arch_flags = @import("arch/flags.zig");
 const update_mod = @import("update.zig");
 const pack_update = @import("pack_update.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -578,7 +576,8 @@ pub fn renderModelEntry(
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
 
-    const engine_part = "\"engine\":\"mlx\",";
+    // An unloaded model has no side yet: the load decides Sushi Cooler or MLX from its flags and settings.
+    const engine_part = "";
 
     // Top-level twins of meta.context_length (issue #188): openai-models-list
     // discovery clients read row-level max_model_len/context_length. Unloaded
@@ -597,6 +596,8 @@ pub fn renderModelEntry(
             .quant_bits = sm.quant_bits,
             .expert_layout = if (sm.expert_quant_rate != null) .exl3_k4 else .bf16_fused,
             .expert_quant_rate = sm.expert_quant_rate orelse .{ .n = 64 },
+            .expert_quant_codebook = sm.expert_quant_codebook,
+            .trunk_quant_rate = sm.trunk_quant_rate,
         });
         defer allocator.free(quantization);
         break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":{f},\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},\"mtp_available\":{s},", .{
@@ -795,11 +796,6 @@ const PropsSettings = struct {
     mtp_loaded: bool,
     mtp_default_on: bool,
     mtp_choice: model_settings.MtpChoice = .{ .on = true, .source = .default },
-    mtp_acceptance: mtp_acceptance_mod.Mode,
-    mtp_acceptance_source: []const u8 = "default",
-    mtp_greedy_tail: settings_resolve.Setting(bool) = .{ .value = false, .source = .default },
-    /// False on an arch whose drafts the file's acceptance and greedy-tail keys do not reach (DSpark).
-    mtp_acceptance_applies: bool = true,
     /// 0 = auto.
     mtp_depth: u32,
     /// The launch flags when they bound the depth.
@@ -823,36 +819,18 @@ const PropsSettings = struct {
     vision: struct { loaded: bool = false, source: []const u8 = "default", tower_bytes: u64 = 0, encode_bytes: u64 = 0 } = .{},
 };
 
-fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
+pub fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
     return mlxPropsSettings(lm);
-}
-
-const MtpAcceptanceReport = struct {
-    acceptance: settings_resolve.Setting(mtp_acceptance_mod.Mode),
-    greedy_tail: settings_resolve.Setting(bool),
-    applies: bool,
-};
-
-/// What /props says about acceptance and the greedy tail: on an arch the file's keys do not reach, the file's values are not reported.
-fn mtpAcceptanceReport(config: *const model_mod.ModelConfig) MtpAcceptanceReport {
-    const applies = model_settings.applies("mtp_acceptance", arch_flags.settingsFit(config));
-    return .{
-        .acceptance = arch_flags.mtpAcceptanceOf(config),
-        .greedy_tail = arch_flags.greedyTailOf(config),
-        .applies = applies,
-    };
 }
 
 fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv_cache = kvCacheFor(config);
     const kv = kv_cache.config;
-    const report = mtpAcceptanceReport(config);
-    const acceptance = report.acceptance;
     // This model's own tier, the four numbers from one publish.
     const disk = lm.disk_stats.snapshot();
     return .{
-        .engine = "mlx",
+        .engine = if (@import("arch/handle.zig").onEngine(lm.handle, config)) "sushi-cooler" else "mlx",
         .kv_quant = kv.wireName(),
         .kv_cache = kv_cache,
         .prefill_chunk = settings_resolve.prefill_chunk.value,
@@ -860,10 +838,6 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_loaded = mtpCapable(lm),
         .mtp_default_on = defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head),
         .mtp_choice = mtpChoiceFor(config),
-        .mtp_acceptance = acceptance.value,
-        .mtp_acceptance_source = settings_resolve.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
-        .mtp_greedy_tail = report.greedy_tail,
-        .mtp_acceptance_applies = report.applies,
         .mtp_depth = lm.mtp_depth,
         .mtp_depth_source = if (mtp_depth_bounds.active.explicit()) "--mtp-min-depth/--mtp-max-depth" else "default",
         .mtp_adaptive = mtp_depth_bounds.active.adaptive(generate_mod.Generator.mtpAdaptiveEnabled()),
@@ -891,24 +865,15 @@ fn js(s: []const u8) json_text.Str {
 
 /// The /props "settings" object: leading-comma fragment spliced before the props root close.
 pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
-    var param_buf: [32]u8 = undefined;
-    const param: []const u8 = switch (st.mtp_acceptance) {
-        .exact => "null",
-        .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
-        .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
-    };
     const vision = try std.fmt.allocPrint(allocator, "{{\"loaded\":{},\"source\":{f},\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, json_text.Str{ .s = st.vision.source }, st.vision.tower_bytes, st.vision.encode_bytes });
     defer allocator.free(vision);
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":{f},\"engine\":{f},\"kv_quant\":{f},\"kv_cache\":{{\"scheme\":{f},\"source\":{f}}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":{f},\"acceptance_source\":{f},\"acceptance\":{f},\"acceptance_param\":{s},\"acceptance_applies\":{},\"greedy_tail\":{},\"greedy_tail_source\":{f},\"depth\":{d},\"depth_source\":{f},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":{f},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}{s}}},\"vision\":{s}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":{f},\"engine\":{f},\"kv_quant\":{f},\"kv_cache\":{{\"scheme\":{f},\"source\":{f}}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":{f},\"depth\":{d},\"depth_source\":{f},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":{f},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}{s}}},\"vision\":{s}}}", .{
         js(build_options.version),                          js(st.engine),
         js(st.kv_quant),                                    js(st.kv_cache.label()),
         js(st.kv_cache.sourceName()),
         st.prefill_chunk,
         st.mtp_loaded,                                      st.mtp_default_on,
-        js(st.mtp_choice.sourceName()),                     js(st.mtp_acceptance_source),
-        js(mtp_acceptance_mod.name(st.mtp_acceptance)),     param,
-        st.mtp_acceptance_applies,
-        st.mtp_greedy_tail.value,                           js(settings_resolve.sourceLabel(st.mtp_greedy_tail.source, "--mtp-greedy-tail")),
+        js(st.mtp_choice.sourceName()),
         st.mtp_depth,                                       js(st.mtp_depth_source),
         st.mtp_adaptive,
         st.max_mtp_ctx,                                     js(st.drafter),
@@ -1112,7 +1077,7 @@ test "queryModel: GET /props?model=<id> routes to that model, percent-decoded" {
 }
 
 test "settingsPropsJson: /props names the vision choice and a streamed tower's bill" {
-    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 2048, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .vision = .{ .loaded = true, .source = "--vision", .tower_bytes = 493_389_824, .encode_bytes = 5_000_000_000 } });
+    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 2048, .mtp_loaded = false, .mtp_default_on = false, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .vision = .{ .loaded = true, .source = "--vision", .tower_bytes = 493_389_824, .encode_bytes = 5_000_000_000 } });
     defer testing.allocator.free(frag);
     var config = model_mod.ModelConfig{};
     const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, frag);
@@ -1124,32 +1089,6 @@ test "settingsPropsJson: /props names the vision choice and a streamed tower's b
     try testing.expectEqualStrings("--vision", vision.get("source").?.string);
     try testing.expectEqual(@as(i64, 493_389_824), vision.get("streamed_tower_bytes").?.integer);
     try testing.expectEqual(@as(i64, 5_000_000_000), vision.get("streamed_encode_bytes").?.integer);
-}
-
-test "/props reports acceptance and greedy tail as not applying on an arch that ignores them" {
-    if (@import("arch/registry.zig").ofModelType("deepseek_v41") == null) return error.SkipZigTest;
-    var dsv = model_mod.ModelConfig{};
-    dsv.model_type = "deepseek_v41";
-    dsv.mtp_acceptance_override = .{ .typical = .{ .delta = 0.2 } };
-    dsv.mtp_greedy_tail_override = true;
-    const ds = mtpAcceptanceReport(&dsv);
-    try testing.expect(!ds.applies);
-    try testing.expectEqualStrings("exact", mtp_acceptance_mod.name(ds.acceptance.value));
-    try testing.expect(!ds.greedy_tail.value);
-    try testing.expect(ds.greedy_tail.source == .default);
-
-    var qwen = dsv;
-    qwen.model_type = "qwen4_exp";
-    const q = mtpAcceptanceReport(&qwen);
-    try testing.expect(q.applies);
-    try testing.expectEqualStrings("typical", mtp_acceptance_mod.name(q.acceptance.value));
-    try testing.expect(q.greedy_tail.value);
-
-    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 1, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_acceptance_applies = false, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
-    defer testing.allocator.free(frag);
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
-    defer parsed.deinit();
-    try testing.expect(!parsed.value.object.get("mtp").?.object.get("acceptance_applies").?.bool);
 }
 
 test "settingsPropsJson: prefix_cache.volume names the cache volume, or nulls when it is unavailable" {
@@ -1164,7 +1103,7 @@ test "settingsPropsJson: prefix_cache.volume names the cache volume, or nulls wh
     }) |c| {
         const vol = try volumePropsJson(a, c.volume);
         defer a.free(vol);
-        const frag = try settingsPropsJson(a, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 1, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 1, .prefix_cache_volume_json = vol });
+        const frag = try settingsPropsJson(a, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 1, .mtp_loaded = false, .mtp_default_on = false, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 1, .prefix_cache_volume_json = vol });
         defer a.free(frag);
         var parsed = try std.json.parseFromSlice(std.json.Value, a, frag[",\"settings\":".len..], .{});
         defer parsed.deinit();
@@ -1189,8 +1128,6 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
         .mtp_loaded = true,
         .mtp_default_on = true,
         .mtp_choice = model_settings.MtpChoice.resolve(true, false, true),
-        .mtp_acceptance = .{ .tokenv3 = 0.95 },
-        .mtp_acceptance_source = "--mtp-tokenv3",
         .mtp_depth = 3,
         .mtp_depth_source = "--mtp-min-depth/--mtp-max-depth",
         .mtp_adaptive = false,
@@ -1218,9 +1155,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     const mtp = st.get("mtp").?.object;
     try testing.expect(mtp.get("default_on").?.bool);
     try testing.expectEqualStrings("--mtp", mtp.get("source").?.string);
-    try testing.expectEqualStrings("--mtp-tokenv3", mtp.get("acceptance_source").?.string);
-    try testing.expectEqualStrings("tokenv3", mtp.get("acceptance").?.string);
-    try testing.expectApproxEqAbs(@as(f64, 0.95), mtp.get("acceptance_param").?.float, 1e-6);
+    try testing.expect(mtp.get("acceptance") == null);
     try testing.expectEqual(@as(i64, 32768), mtp.get("max_ctx").?.integer);
     try testing.expectEqual(@as(i64, 3), mtp.get("depth").?.integer);
     try testing.expectEqualStrings("--mtp-min-depth/--mtp-max-depth", mtp.get("depth_source").?.string);
@@ -1229,7 +1164,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqual(@as(i64, 4), st.get("max_concurrent").?.integer);
     try testing.expect(st.get("prefix_cache").?.object.get("ram_enabled").?.bool);
 
-    const used = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 20 << 30, .prefix_cache_disk_used_bytes = 3 << 30, .prefix_cache_disk_written_bytes = 7 << 30, .prefix_cache_disk_entries = 5, .prefix_cache_ram_enabled = false });
+    const used = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 20 << 30, .prefix_cache_disk_used_bytes = 3 << 30, .prefix_cache_disk_written_bytes = 7 << 30, .prefix_cache_disk_entries = 5, .prefix_cache_ram_enabled = false });
     defer testing.allocator.free(used);
     var up = try std.json.parseFromSlice(std.json.Value, testing.allocator, used[",\"settings\":".len..], .{});
     defer up.deinit();
@@ -1239,11 +1174,10 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqual(@as(i64, 7 << 30), pc.get("disk_written_bytes").?.integer);
     try testing.expectEqual(@as(i64, 5), pc.get("disk_entries").?.integer);
 
-    const exact = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "q4", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 4096, .prefix_cache_ram_enabled = false });
+    const exact = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "q4", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 4096, .prefix_cache_ram_enabled = false });
     defer testing.allocator.free(exact);
     var ep = try std.json.parseFromSlice(std.json.Value, testing.allocator, exact[",\"settings\":".len..], .{});
     defer ep.deinit();
-    try testing.expect(ep.value.object.get("mtp").?.object.get("acceptance_param").? == .null);
     try testing.expect(!ep.value.object.get("prefix_cache").?.object.get("ram_enabled").?.bool);
     try testing.expectEqual(@as(i64, 0), ep.value.object.get("prefix_cache").?.object.get("mem_bytes").?.integer);
 }
@@ -1435,9 +1369,8 @@ test "/props stays valid JSON when a settings label carries a quote, a backslash
         .prefill_chunk = 1,
         .mtp_loaded = false,
         .mtp_default_on = false,
-        .mtp_acceptance = .exact,
-        .mtp_acceptance_source = hostile,
         .mtp_depth = 0,
+        .mtp_depth_source = hostile,
         .mtp_adaptive = false,
         .max_mtp_ctx = 0,
         .drafter = "none",
@@ -1452,7 +1385,7 @@ test "/props stays valid JSON when a settings label carries a quote, a backslash
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, doc, .{});
     defer parsed.deinit();
     const settings = parsed.value.object.get("settings").?.object;
-    try t.expectEqualStrings(hostile, settings.get("mtp").?.object.get("acceptance_source").?.string);
+    try t.expectEqualStrings(hostile, settings.get("mtp").?.object.get("depth_source").?.string);
     try t.expectEqualStrings(hostile, settings.get("vision").?.object.get("source").?.string);
 }
 
@@ -1512,6 +1445,63 @@ test "model quantization label K3 loaded and unloaded" {
 test "model quantization label K4 loaded and unloaded" {
     try testQuantizationModelRow("qwen4_exp", 4, "EXL3 4bpw experts, 8-bit dense", true);
     try testQuantizationModelRow("qwen4_exp", 4, "EXL3 4bpw experts, 8-bit dense", false);
+}
+
+fn testStqLabel(trunk_k: ?u8, expected: []const u8) !void {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const block = "{{\"format\":\"stq\",\"k\":{d},\"codebook\":\"spec1\",\"window\":15,\"codebook_table\":\"spec1-w15\",\"codebook_digest\":\"37f72431\"}}";
+    const trunk_part = if (trunk_k) |k| try std.fmt.allocPrint(t.allocator, ",\"trunk_quant\":" ++ block, .{k}) else try t.allocator.dupe(u8, "");
+    defer t.allocator.free(trunk_part);
+    const raw = try std.fmt.allocPrint(t.allocator, "{{\"model_type\":\"qwen4_exp\",\"quantization\":{{\"bits\":8,\"group_size\":64}},\"expert_quant\":" ++ block ++ "{s}}}", .{ @as(u8, 5), trunk_part });
+    defer t.allocator.free(raw);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = raw });
+    const cfg = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .quant_bits = 8,
+        .expert_layout = .exl3_k4,
+        .expert_quant_rate = .{ .n = 80 },
+        .expert_quant_codebook = .spec1,
+        .trunk_quant_rate = if (trunk_k) |k| .{ .n = @as(u32, k) * 16 } else null,
+    };
+    const label = try modelQuantizationLabel(t.allocator, &cfg);
+    defer t.allocator.free(label);
+    try t.expectEqualStrings(expected, label);
+    var entry = model_registry_mod.LoadedModel{
+        .allocator = t.allocator,
+        .id = "test-pack",
+        .path = path,
+        .bytes_on_disk = 0,
+        .arch_hint = "qwen4_exp",
+        .config = null,
+        .weights = null,
+        .handle = null,
+        .tokenizer = null,
+        .chat_config = null,
+        .vision_encoder = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .unloaded,
+        .error_name = null,
+    };
+    const row = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(row);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, row, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings(expected, parsed.value.object.get("meta").?.object.get("quantization").?.string);
+}
+
+test "model quantization label: an STQ pack names its format, its highest expert rate and its trellis trunk, loaded and unloaded" {
+    try testStqLabel(6, "STQ experts up to 5bpw, 6-bit STQ trunk");
+    try testStqLabel(null, "STQ experts up to 5bpw, 8-bit dense");
 }
 
 test "model quantization label affine unchanged" {

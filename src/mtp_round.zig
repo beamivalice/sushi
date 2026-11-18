@@ -156,16 +156,33 @@ pub fn mtpSamplingDraw(self: *Generator, params: sampler.SamplingParams) sampler
     return draw;
 }
 
+/// Whether this request's rounds draw by position: on the engine (a draw root), a draft and a verify row take the key
+/// of the position they predict, `self.sampling.draw` being the round's first (the one after the pending token), and a
+/// draft stands while it is the target's draw there. Every emitted token is then the serial
+/// step's draw at its position, whatever the round plan. No proposal density is kept.
+pub fn mtpDrawsAtPositions(self: *const Generator) bool {
+    return self.sampling.draw_root != null;
+}
+
+/// The draft sampler's draw at chain depth `step`: by position (`mtpDrawsAtPositions`), else the next request-local
+/// index (`mtpSamplingDraw`).
+pub fn mtpDraftDraw(self: *Generator, params: sampler.SamplingParams, step: u32) sampler.SamplingParams {
+    if (!self.mtpDrawsAtPositions()) return self.mtpSamplingDraw(params);
+    var at = params;
+    at.draw = self.sampling.draw +% step;
+    return at;
+}
+
 /// Allocate an empty draft chain for `plan` (nothing built yet).
 pub fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !MtpPreDraft {
     if (plan.m_hi > mtp_mod.MAX_DEPTH) return error.MtpDepthRange;
     const consider_ext = plan.m_hi > plan.m_lo;
-    const sharp_drafts = !sampler.isGreedyTemperature(self.mtpDraftSampling(0).temperature);
+    const sharp_drafts = !sampler.isGreedyTemperature(self.mtpDraftSampling().temperature);
     const drafts = try allocator.alloc(u32, plan.m_hi);
     errdefer allocator.free(drafts);
     const conf_arrs: ?[]mlx.mlx_array = if (consider_ext) try allocator.alloc(mlx.mlx_array, plan.m_lo) else null;
     errdefer if (conf_arrs) |slots| allocator.free(slots);
-    const q_probs: ?[]mlx.mlx_array = if (sharp_drafts) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null;
+    const q_probs: ?[]mlx.mlx_array = if (sharp_drafts and !self.mtpDrawsAtPositions()) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null;
     const t1_i32: i32 = @intCast(t1);
     const t1_shape = [_]c_int{1};
     return .{
@@ -181,20 +198,10 @@ pub fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRou
         .n_conf = 0,
         .q_probs = q_probs,
         .n_qp = 0,
+        .sampled = sharp_drafts,
         .h_chain = null,
         .m = plan.m_lo,
     };
-}
-
-/// A lookup draft is a point mass copied from the context, so it takes exact acceptance
-/// (keep it with probability p) whatever the MTP mode: a lossy rule that accepts any
-/// plausible token outright makes copying the context certain, and the output loops.
-pub fn acceptGraphFor(self: *const Generator, lookup: bool) MtpGraphFn {
-    return if (lookup) mtpBatchedExactGraph else self.mtp_accept_graph;
-}
-
-pub fn acceptPrefixFor(self: *const Generator, lookup: bool) mtp_acceptance.PrefixFn {
-    return if (lookup) mtp_acceptance.exactPrefix else self.mtp_accept_prefix;
 }
 
 /// May a lookup stand in for this request's next MTP chain? Not for a batched head or a
@@ -349,7 +356,7 @@ pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) 
     std.debug.assert(chain.n_drafted == from);
     var i: u32 = from;
     while (i < to) : (i += 1) {
-        const draft_sampling = self.mtpDraftSampling(i);
+        const draft_sampling = self.mtpDraftSampling();
         const h_prev_arg: mlx.mlx_array = if (chain.h_chain) |h| h else self.last_hidden;
         const prev_tok_arr: mlx.mlx_array = if (i == 0) chain.t1_arr else chain.draft_arrs[i - 1];
         // Rerank drafts skip the head's own logits projection entirely:
@@ -412,24 +419,28 @@ pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) 
         defer if (step_out.rerank_x.ctx != null) {
             _ = mlx.mlx_array_free(step_out.rerank_x);
         };
-        if (use_rerank and chain.q_probs != null) {
+        if (use_rerank and chain.sampled) {
             const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
-            const slots = chain.q_probs.?;
             if (try head.draftShortlist(xfm, rerank_x, draft_sampling.suppress_mask)) |shortlist| {
                 var sl = shortlist;
                 defer sl.deinit();
-                const prop = try sampler.shortlistStepProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
-                chain.draft_arrs[i] = prop.id;
-                slots[i] = prop.q;
+                const at = self.mtpDraftDraw(draft_sampling, i);
+                if (chain.q_probs) |slots| {
+                    const prop = try sampler.shortlistProposal(sl, at, s);
+                    chain.draft_arrs[i] = prop.id;
+                    slots[i] = prop.q;
+                } else chain.draft_arrs[i] = try sampler.shortlistDraw(sl, at, s);
             } else {
                 // The coarse head just retired: propose greedily and hand
                 // the verify the one-hot q that proposal really has.
                 const id = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
-                const prop = try sampler.argmaxStepProposal(id, xfm.lmHeadRows(), s);
-                chain.draft_arrs[i] = prop.id;
-                slots[i] = prop.q;
+                if (chain.q_probs) |slots| {
+                    const prop = try sampler.argmaxStepProposal(id, xfm.lmHeadRows(), s);
+                    chain.draft_arrs[i] = prop.id;
+                    slots[i] = prop.q;
+                } else chain.draft_arrs[i] = id;
             }
-            chain.n_qp = i + 1;
+            if (chain.q_probs != null) chain.n_qp = i + 1;
         } else if (use_rerank) {
             const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
             chain.draft_arrs[i] = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
@@ -439,7 +450,7 @@ pub fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) 
             chain.n_qp = i + 1;
             chain.draft_arrs[i] = prop.id;
         } else {
-            chain.draft_arrs[i] = try sampler.sampleTokenLazy(step_out.logits, draft_sampling, s);
+            chain.draft_arrs[i] = try sampler.sampleTokenLazy(step_out.logits, self.mtpDraftDraw(draft_sampling, i), s);
         }
         chain.n_drafted = i + 1;
         if (chain.conf_arrs != null and i < chain.plan.m_lo) {
@@ -528,7 +539,7 @@ pub fn mtpDraftStepPath(can_rerank: bool, sampled: bool, conf_needed: bool) Draf
 /// two head forwards.
 pub fn mtpRowRerankMode(g: *Generator, c: *const MtpPreDraft, step: u32) bool {
     const conf_needed = c.conf_arrs != null and step < c.plan.m_lo;
-    return mtpDraftStepPath(g.mtp.?.canRerankDrafts(), c.q_probs != null, conf_needed) != .full_logits;
+    return mtpDraftStepPath(g.mtp.?.canRerankDrafts(), c.sampled, conf_needed) != .full_logits;
 }
 
 pub fn mtpChainBuildBatched(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32) !void {
@@ -603,15 +614,20 @@ pub fn mtpGroupSampledDrafts(
     }
     defer for (shortlists[0..n]) |*sl| sl.deinit();
 
-    // Which rows sample, and whether one batched draw can serve them all.
+    // Which rows sample, and whether one batched draw can serve them all. A row that draws by position draws alone.
     var sampled: [32]usize = undefined;
     var params: [32]sampler.SamplingParams = undefined;
     var samples: [32]bool = @splat(false);
     var k_sampled: usize = 0;
     for (gens, chains, 0..) |g, *c, row| {
-        const row_params = g.mtpDraftSampling(step);
-        if (c.q_probs == null or sampler.isGreedyTemperature(row_params.temperature)) continue;
+        const row_params = g.mtpDraftSampling();
+        if (!c.sampled or sampler.isGreedyTemperature(row_params.temperature)) continue;
         samples[row] = true;
+        if (c.q_probs == null) {
+            c.draft_arrs[step] = try sampler.shortlistDraw(shortlists[row], g.mtpDraftDraw(row_params, step), s);
+            c.n_drafted = step + 1;
+            continue;
+        }
         sampled[k_sampled] = row;
         params[k_sampled] = row_params;
         k_sampled += 1;
@@ -620,14 +636,9 @@ pub fn mtpGroupSampledDrafts(
         sampler.sampleRowsHomogeneous(params[0..k_sampled]) and
         !sampler.sampleRowsAnySeed(params[0..k_sampled]);
 
-    for (gens, chains, 0..) |g, *c, row| {
+    for (chains, 0..) |*c, row| {
         if (samples[row]) continue;
-        if (c.q_probs) |slots| {
-            const prop = try sampler.shortlistStepProposal(shortlists[row], g.mtpDraftSampling(step), s);
-            c.draft_arrs[step] = prop.id;
-            slots[step] = prop.q;
-            c.n_qp = step + 1;
-        } else c.draft_arrs[step] = try mtp_mod.shortlistArgmax(s, shortlists[row]);
+        c.draft_arrs[step] = try mtp_mod.shortlistArgmax(s, shortlists[row]);
         c.n_drafted = step + 1;
     }
     if (!batched) {
@@ -667,18 +678,6 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
         return;
     }
     try gens[0].mtp.?.buildBatchedChains(gens, chains, from, to);
-}
-
-pub fn mtpBatchedExactGraph(
-    probs_all: mlx.mlx_array,
-    draft_arrs: []const mlx.mlx_array,
-    q_probs: ?[]const mlx.mlx_array,
-    m: u32,
-    _: f32,
-    sampling: sampler.SamplingParams,
-    s: mlx.mlx_stream,
-) !MtpBatchedGraph {
-    return mtpBatchedAcceptGraph(probs_all, draft_arrs, q_probs, m, sampling, s);
 }
 
 pub fn mtpBatchedAcceptGraph(
@@ -808,247 +807,6 @@ pub fn mtpBatchedAcceptGraph(
     }
 
     return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q };
-}
-
-pub fn mtpBatchedTypicalGraph(
-    probs_all: mlx.mlx_array,
-    draft_arrs: []const mlx.mlx_array,
-    q_probs: ?[]const mlx.mlx_array,
-    m: u32,
-    delta: f32,
-    sampling: sampler.SamplingParams,
-    s: mlx.mlx_stream,
-) !MtpBatchedGraph {
-    return mtpBatchedLossyGraph(.typical, probs_all, draft_arrs, q_probs, m, delta, sampling, s);
-}
-
-pub fn mtpBatchedTokenV3Graph(
-    probs_all: mlx.mlx_array,
-    draft_arrs: []const mlx.mlx_array,
-    q_probs: ?[]const mlx.mlx_array,
-    m: u32,
-    alpha: f32,
-    sampling: sampler.SamplingParams,
-    s: mlx.mlx_stream,
-) !MtpBatchedGraph {
-    return mtpBatchedLossyGraph(.tokenv3, probs_all, draft_arrs, q_probs, m, alpha, sampling, s);
-}
-
-/// Specialized at compile time; the installed route adds no mode switch
-/// to a measured MTP round. Both lanes keep corrections in one lazy graph.
-pub fn mtpBatchedLossyGraph(
-    comptime mode: enum { typical, tokenv3 },
-    probs_all: mlx.mlx_array,
-    draft_arrs: []const mlx.mlx_array,
-    q_probs: ?[]const mlx.mlx_array,
-    m: u32,
-    param: f32,
-    sampling: sampler.SamplingParams,
-    s: mlx.mlx_stream,
-) !MtpBatchedGraph {
-    const shape = mlx.getShape(probs_all); // [1, 1+m, V]
-    const vocab = shape[2];
-    const mi: c_int = @intCast(m);
-    const strides2 = [_]c_int{ 1, 1 };
-
-    const p2d = try verifyRows2d(probs_all, m, s);
-    defer _ = mlx.mlx_array_free(p2d);
-
-    var ids_2d = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ids_2d);
-    {
-        const vec = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(vec);
-        for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
-        var flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(flat);
-        try mlx.check(mlx.mlx_concatenate_axis(&flat, vec, 0, s));
-        const id2_shape = [_]c_int{ mi, 1 };
-        try mlx.check(mlx.mlx_reshape(&ids_2d, flat, &id2_shape, 2, s));
-    }
-
-    var p_rows = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(p_rows);
-    var bonus = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(bonus);
-    {
-        const r_start = [_]c_int{ 0, 0 };
-        const r_stop = [_]c_int{ mi, vocab };
-        try mlx.check(mlx.mlx_slice(&p_rows, p2d, &r_start, 2, &r_stop, 2, &strides2, 2, s));
-        const b_start = [_]c_int{ mi, 0 };
-        const b_stop = [_]c_int{ mi + 1, vocab };
-        try mlx.check(mlx.mlx_slice(&bonus, p2d, &b_start, 2, &b_stop, 2, &strides2, 2, s));
-    }
-
-    // TokenV3 needs the FULL q row. Typical acceptance uses only p and
-    // does not add a proposal concat or one-hot operation to the graph.
-    var proposal: mlx.mlx_array = .{ .ctx = null };
-    defer if (proposal.ctx != null) {
-        _ = mlx.mlx_array_free(proposal);
-    };
-    if (comptime mode == .tokenv3) {
-        proposal = mlx.mlx_array_new();
-        if (q_probs) |qs| {
-            const vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(vec);
-            for (qs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
-            try mlx.check(mlx.mlx_concatenate_axis(&proposal, vec, 0, s));
-        } else {
-            var indices = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(indices);
-            try mlx.check(mlx.mlx_arange(&indices, 0, @as(f64, @floatFromInt(vocab)), 1, .int32, s));
-            var onehot_b = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(onehot_b);
-            try mlx.check(mlx.mlx_equal(&onehot_b, indices, ids_2d, s));
-            try mlx.check(mlx.mlx_astype(&proposal, onehot_b, mlx.mlx_array_dtype(p2d), s));
-        }
-    }
-
-    // TokenV3 Eq. 11: pi = q*1[Top] + p*sum(q outside Top).
-    // The p*eta term applies to EVERY token, including those inside Top.
-    var pi: mlx.mlx_array = .{ .ctx = null };
-    defer if (pi.ctx != null) {
-        _ = mlx.mlx_array_free(pi);
-    };
-    var defer_mask: mlx.mlx_array = .{ .ctx = null };
-    defer if (defer_mask.ctx != null) {
-        _ = mlx.mlx_array_free(defer_mask);
-    };
-    if (comptime mode == .tokenv3) {
-        var peak = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(peak);
-        try mlx.check(mlx.mlx_max_axis(&peak, p_rows, 1, true, s));
-        const complement = try mlx.newFloat(1.0 - param);
-        defer _ = mlx.mlx_array_free(complement);
-        var cutoff = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cutoff);
-        try mlx.check(mlx.mlx_multiply(&cutoff, peak, complement, s));
-        defer_mask = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_less(&defer_mask, p_rows, cutoff, s));
-        const zero = try mlx.newFloat(0.0);
-        defer _ = mlx.mlx_array_free(zero);
-        var deferred_q = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(deferred_q);
-        try mlx.check(mlx.mlx_where(&deferred_q, defer_mask, proposal, zero, s));
-        var eta = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(eta);
-        try mlx.check(mlx.mlx_sum_axis(&eta, deferred_q, 1, true, s));
-        var kept_q = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kept_q);
-        try mlx.check(mlx.mlx_where(&kept_q, defer_mask, zero, proposal, s));
-        var recycled = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(recycled);
-        try mlx.check(mlx.mlx_multiply(&recycled, p_rows, eta, s));
-        pi = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&pi, kept_q, recycled, s));
-    }
-    const decision_rows = if (comptime mode == .tokenv3) pi else p_rows;
-
-    var corr_samples = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(corr_samples);
-    {
-        var corr_rows: mlx.mlx_array = .{ .ctx = null };
-        defer if (corr_rows.ctx != null) {
-            _ = mlx.mlx_array_free(corr_rows);
-        };
-        if (comptime mode == .typical) {
-            corr_rows = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&corr_rows, p_rows));
-        } else {
-            var diff = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(diff);
-            try mlx.check(mlx.mlx_subtract(&diff, pi, proposal, s));
-            const zero = try mlx.newFloat(0.0);
-            defer _ = mlx.mlx_array_free(zero);
-            corr_rows = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_maximum(&corr_rows, diff, zero, s));
-        }
-        var stack = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(stack);
-        const vec = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(vec);
-        _ = mlx.mlx_vector_array_append_value(vec, corr_rows);
-        _ = mlx.mlx_vector_array_append_value(vec, bonus);
-        try mlx.check(mlx.mlx_concatenate_axis(&stack, vec, 0, s));
-        var log_stack = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(log_stack);
-        try mlx.check(mlx.mlx_log(&log_stack, stack, s));
-        const sampled = try sampler.drawRowsLogProbs(log_stack, sampling, s);
-        defer _ = mlx.mlx_array_free(sampled);
-        try mlx.check(mlx.mlx_astype(&corr_samples, sampled, .int32, s));
-    }
-
-    var accept_p = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(accept_p);
-    {
-        var taken = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(taken);
-        try mlx.check(mlx.mlx_take_along_axis(&taken, decision_rows, ids_2d, -1, s));
-        var flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(flat);
-        const m_shape = [_]c_int{mi};
-        try mlx.check(mlx.mlx_reshape(&flat, taken, &m_shape, 1, s));
-        try mlx.check(mlx.mlx_astype(&accept_p, flat, .float32, s));
-    }
-
-    var accept_q: mlx.mlx_array = .{ .ctx = null };
-    errdefer if (accept_q.ctx != null) {
-        _ = mlx.mlx_array_free(accept_q);
-    };
-    if (comptime mode == .typical) {
-        // H(p) = -sum p*log(p), with log(0) safely masked by clamping
-        // only the log operand. The p factor remains exactly zero.
-        const tiny = try mlx.newFloat(1e-30);
-        defer _ = mlx.mlx_array_free(tiny);
-        var safe_p = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(safe_p);
-        try mlx.check(mlx.mlx_maximum(&safe_p, p_rows, tiny, s));
-        var log_p = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(log_p);
-        try mlx.check(mlx.mlx_log(&log_p, safe_p, s));
-        var p_log_p = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(p_log_p);
-        try mlx.check(mlx.mlx_multiply(&p_log_p, p_rows, log_p, s));
-        var sum = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sum);
-        try mlx.check(mlx.mlx_sum_axis(&sum, p_log_p, 1, false, s));
-        var scaled = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(scaled);
-        try mlx.check(mlx.mlx_exp(&scaled, sum, s)); // exp(-H)
-        const delta = try mlx.newFloat(param);
-        defer _ = mlx.mlx_array_free(delta);
-        var raw_floor = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(raw_floor);
-        try mlx.check(mlx.mlx_multiply(&raw_floor, scaled, delta, s));
-        const eps = try mlx.newFloat(1.0);
-        defer _ = mlx.mlx_array_free(eps);
-        accept_q = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_minimum(&accept_q, raw_floor, eps, s));
-    } else if (q_probs != null) {
-        var taken = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(taken);
-        try mlx.check(mlx.mlx_take_along_axis(&taken, proposal, ids_2d, -1, s));
-        var flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(flat);
-        const m_shape = [_]c_int{mi};
-        try mlx.check(mlx.mlx_reshape(&flat, taken, &m_shape, 1, s));
-        accept_q = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&accept_q, flat, .float32, s));
-    }
-
-    var accept_defer: mlx.mlx_array = .{ .ctx = null };
-    errdefer if (accept_defer.ctx != null) {
-        _ = mlx.mlx_array_free(accept_defer);
-    };
-    if (comptime mode == .tokenv3) {
-        var taken = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(taken);
-        try mlx.check(mlx.mlx_take_along_axis(&taken, defer_mask, ids_2d, -1, s));
-        const m_shape = [_]c_int{mi};
-        accept_defer = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&accept_defer, taken, &m_shape, 1, s));
-    }
-    return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q, .accept_defer = accept_defer };
 }
 
 /// A pre-draft chain is only worth its cost when a later round reads it: a request whose
@@ -1760,7 +1518,7 @@ pub fn mtpGroupAcceptBatchable(params: []const sampler.SamplingParams) bool {
 /// group's single async eval, instead of a build-wait-build staircase per
 /// row. Declines (every row then builds its own in `mtpRoundFinish`) when
 /// the rows do not share one sampler, any row is seeded, or a row was
-/// padded past `1 + m`.
+/// padded past `1 + m`. A row that draws by position takes its own draws.
 pub fn mtpGroupSampledAccept(
     gens: []const *Generator,
     states: []const *MtpRoundState,
@@ -1772,6 +1530,11 @@ pub fn mtpGroupSampledAccept(
     var k: usize = 0;
     for (gens, states, 0..) |gen, st, i| {
         if (sampler.isGreedyTemperature(gen.sampling.temperature)) continue;
+        if (gen.mtpDrawsAtPositions()) {
+            st.corr = try sampler.verifyDraws(st.verify_logits, st.chain.m, gen.sampling, s);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, st.corr);
+            continue;
+        }
         if (st.chain.m == 0 or st.verify_len != 1 + st.chain.m) return;
         rows[k] = i;
         params[k] = gen.sampling;
@@ -1812,25 +1575,21 @@ pub fn mtpGroupSampledAccept(
         const st = states[i];
         const row_probs = try sampler.groupProbsRow(probs, offs[j], st.verify_len, s);
         defer _ = mlx.mlx_array_free(row_probs);
-        // The row's OWN acceptance mode, threshold and draw index: only the
-        // filter is shared, so a seeded row keeps its own key.
+        // The row's OWN draw index: only the filter is shared, so a seeded row keeps its own key.
         const gen = gens[i];
-        const bg = try gen.acceptGraphFor(st.chain.lookup)(
+        const bg = try mtpBatchedAcceptGraph(
             row_probs,
             st.chain.draft_arrs[0..st.chain.m],
             if (st.chain.q_probs) |qs| qs[0..st.chain.m] else null,
             st.chain.m,
-            gen.mtp_accept_param,
             gen.mtpSamplingDraw(gen.sampling),
             s,
         );
         st.accept_p = bg.accept_p;
         st.accept_q = bg.accept_q;
-        st.accept_defer = bg.accept_defer;
         st.corr = bg.corr_samples;
         _ = mlx.mlx_vector_array_append_value(eval_vec, st.accept_p);
         if (st.accept_q.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, st.accept_q);
-        if (st.accept_defer.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, st.accept_defer);
         _ = mlx.mlx_vector_array_append_value(eval_vec, st.corr);
     }
 }
@@ -1906,6 +1665,9 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     // calls cost one GPU round-trip sync EACH — 3-5 syncs per round that
     // stalled the pipeline for milliseconds while the GPU sat idle.
     const stochastic = !sampler.isGreedyTemperature(self.sampling.temperature);
+    // By position, a sampled row's verdict reads the target's draws as a greedy row's reads its argmax.
+    const by_draws = stochastic and self.mtpDrawsAtPositions();
+    const leviathan = stochastic and !by_draws;
     const vl_shape = mlx.getShape(verify_logits);
 
     var accept_p_vec = mlx.mlx_array_new();
@@ -1913,10 +1675,6 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     var accept_q_vec: mlx.mlx_array = .{ .ctx = null };
     defer if (accept_q_vec.ctx != null) {
         _ = mlx.mlx_array_free(accept_q_vec);
-    };
-    var accept_defer_vec: mlx.mlx_array = .{ .ctx = null };
-    defer if (accept_defer_vec.ctx != null) {
-        _ = mlx.mlx_array_free(accept_defer_vec);
     };
     // ONE [1+m] pre-sampled correction array, indexed at the realized accept.
     var corr_batch: mlx.mlx_array = .{ .ctx = null };
@@ -1926,17 +1684,19 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
 
     // The group already built and dispatched this row's Phase 4 with the rest
     // of the round (`mtpGroupSampledAccept`); nothing here but the handover.
-    const prepared = stochastic and st.accept_p.ctx != null;
+    const prepared = stochastic and st.corr.ctx != null;
     if (prepared) {
-        _ = mlx.mlx_array_free(accept_p_vec);
-        accept_p_vec = st.accept_p;
+        if (st.accept_p.ctx != null) {
+            _ = mlx.mlx_array_free(accept_p_vec);
+            accept_p_vec = st.accept_p;
+        }
         accept_q_vec = st.accept_q;
-        accept_defer_vec = st.accept_defer;
         corr_batch = st.corr;
         st.accept_p = .{ .ctx = null };
         st.accept_q = .{ .ctx = null };
-        st.accept_defer = .{ .ctx = null };
         st.corr = .{ .ctx = null };
+    } else if (by_draws) {
+        corr_batch = try sampler.verifyDraws(verify_logits, m, self.sampling, s);
     } else if (stochastic) {
         // A group-padded row filters only the 1+m positions it reads.
         var live_logits = mlx.mlx_array_new();
@@ -1944,12 +1704,11 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         try mlx.check(mlx.mlx_slice(&live_logits, verify_logits, &.{ 0, 0, 0 }, 3, &.{ vl_shape[0], @intCast(1 + m), vl_shape[2] }, 3, &.{ 1, 1, 1 }, 3, s));
         const probs_all = try sampler.probsAllPositions(live_logits, self.sampling, s);
         defer _ = mlx.mlx_array_free(probs_all);
-        const bg = try self.acceptGraphFor(chain.lookup)(
+        const bg = try mtpBatchedAcceptGraph(
             probs_all,
             draft_arrs[0..m],
             if (q_probs) |qs| qs[0..m] else null,
             m,
-            self.mtp_accept_param,
             self.mtpSamplingDraw(self.sampling),
             s,
         );
@@ -1957,7 +1716,6 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         _ = mlx.mlx_array_free(accept_p_vec);
         accept_p_vec = bg.accept_p;
         accept_q_vec = bg.accept_q;
-        accept_defer_vec = bg.accept_defer;
     }
 
     const group_argmax = st.verify_argmax.present();
@@ -1982,9 +1740,8 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         defer _ = mlx.mlx_vector_array_free(eval_vec);
         for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
         if (stochastic) {
-            _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
+            if (leviathan) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
             if (accept_q_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_q_vec);
-            if (accept_defer_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_defer_vec);
             _ = mlx.mlx_vector_array_append_value(eval_vec, corr_batch);
         } else {
             _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
@@ -2010,7 +1767,11 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
 
     var accepted: u32 = 0;
     var greedy_next_pending: u32 = 0;
-    if (stochastic) {
+    if (by_draws) {
+        try mlx.check(mlx.mlx_array_eval(corr_batch));
+        const d = mlx.mlx_array_data_int32(corr_batch) orelse return error.MlxArrayDataNull;
+        accepted = mtpGreedyVerdict(d[0 .. 1 + m], drafts[0..m], self.completion_tokens, self.max_tokens).accepted;
+    } else if (stochastic) {
         // Sharp drafts: full Leviathan ratio min(1, p/q) against the
         // proposal's own density. Greedy-forced drafts keep the exact
         // one-hot rule min(1, target_p).
@@ -2026,13 +1787,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
             };
             q_data = q_ptr[0..m];
         }
-        var defer_data: ?[]const bool = null;
-        if (accept_defer_vec.ctx != null) {
-            try mlx.check(mlx.mlx_array_eval(accept_defer_vec));
-            const defer_ptr = mlx.mlx_array_data_bool(accept_defer_vec) orelse return error.MlxArrayDataNull;
-            defer_data = defer_ptr[0..m];
-        }
-        accepted = self.acceptPrefixFor(chain.lookup)(p_data[0..m], q_data, defer_data, &self.prng);
+        accepted = mtp_acceptance.exactPrefix(p_data[0..m], q_data, &self.prng);
         accepted = mtp_plan.capAcceptedForTokenBudget(
             accepted,
             self.completion_tokens,
@@ -2076,6 +1831,8 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         ph.reset();
     }
     log.debug("  [mtp-round] off0={d} t1={d} m={d}/{d} drafts={any} accepted={d}\n", .{ mtp_off0, t1, m, m_max, drafts[0..m], accepted });
+    // The pending token stands at the position after the kept drafts.
+    if (self.mtpDrawsAtPositions()) self.sampling.draw +%= accepted + 1;
 
     // ── Phase 5a: stash the committed history for a DEFERRED append ──
     // The old shape paid a second head forward (appendHistory) here every
@@ -2326,22 +2083,10 @@ pub fn mtpDraftSamplingFor(target: sampler.SamplingParams, force_greedy: bool, d
     return d;
 }
 
-/// Greedy drafts at chain depth `step` (0 = the round's first draft). The
-/// greedy tail samples depth 0 of a sampled request and takes the argmax after it.
-pub fn mtpDraftGreedyAt(target: sampler.SamplingParams, greedy_tail: bool, step: u32) bool {
-    return mtpDraftGreedyFor(target) or (greedy_tail and step > 0);
-}
-
-/// This request's draft sampler at chain depth `step`: the per-request
-/// proposal mode, the greedy tail and the loaded family's draft temperature,
-/// resolved in ONE place so no call site can read a different proposal than
-/// the one the verify's q came from.
-pub fn mtpDraftSampling(self: *const Generator, step: u32) sampler.SamplingParams {
-    return mtpDraftSamplingFor(
-        self.sampling,
-        mtpDraftGreedyAt(self.sampling, self.mtp_greedy_tail, step),
-        mtpDraftTempFor(&self.xfm.config),
-    );
+/// This request's draft sampler: the per-request proposal mode and the loaded family's draft temperature, resolved
+/// in ONE place so no call site can read a different proposal than the one the verify's q came from.
+pub fn mtpDraftSampling(self: *const Generator) sampler.SamplingParams {
+    return mtpDraftSamplingFor(self.sampling, mtpDraftGreedyFor(self.sampling), mtpDraftTempFor(&self.xfm.config));
 }
 
 /// Full Leviathan acceptance ratio; q clamped so a sampled draft (q > 0
@@ -2354,8 +2099,6 @@ pub fn specAcceptProb(p: f32, q_draft: f32) f32 {
 pub fn mtpKvLen(self: *const Generator) u32 {
     return @intCast(self.prompt_ids_owned.len + self.generated_ids.items.len);
 }
-
-pub const MtpGraphFn = *const fn (mlx.mlx_array, []const mlx.mlx_array, ?[]const mlx.mlx_array, u32, f32, sampler.SamplingParams, mlx.mlx_stream) anyerror!MtpBatchedGraph;
 
 /// Qwen native-MTP speculative round. Structure mirrors `nextDrafter`
 /// (same verify invariant: cache.step = prompt_len + emitted, t1 NOT in
@@ -2408,10 +2151,12 @@ pub const MtpPreDraft = struct {
     /// Chunk-A log-confidence graphs (two-chunk plans only). len m_lo.
     conf_arrs: ?[]mlx.mlx_array,
     n_conf: u32,
-    /// Proposal densities q, present when depth 0 samples; an argmax
+    /// Proposal densities q, present when depth 0 samples and the round does not draw by position; an argmax
     /// depth's row is its one-hot. len m_hi; [0..n_qp) valid.
     q_probs: ?[]mlx.mlx_array,
     n_qp: u32,
+    /// Depth 0 draws from the draft sampler.
+    sampled: bool = false,
     /// Chain hidden after the last built step (owned) — a chunk-B
     /// extension resumes from it; freed once the chain is complete.
     h_chain: ?mlx.mlx_array,
@@ -2470,17 +2215,13 @@ pub const MtpBatchedGraph = struct {
     /// [m] f32 filtered target probability of each draft.
     accept_p: mlx.mlx_array,
     /// [m] f32 proposal density at each draft (sharp drafts only;
-    /// null-ctx under greedy proposals). Typical mode stores its entropy
-    /// floor here instead.
+    /// null-ctx under greedy proposals).
     accept_q: mlx.mlx_array,
-    /// [m] bool TokenV3 deferral decisions; null for other modes.
-    accept_defer: mlx.mlx_array = .{ .ctx = null },
 
     pub fn deinit(self: *MtpBatchedGraph) void {
         _ = mlx.mlx_array_free(self.corr_samples);
         _ = mlx.mlx_array_free(self.accept_p);
         if (self.accept_q.ctx != null) _ = mlx.mlx_array_free(self.accept_q);
-        if (self.accept_defer.ctx != null) _ = mlx.mlx_array_free(self.accept_defer);
     }
 };
 
@@ -2511,11 +2252,10 @@ pub const MtpRoundState = struct {
     /// row's state; the accept side filters it once for every sampled row.
     group_logits: mlx.mlx_array = .{ .ctx = null },
     /// Phase-4 terms the group prepared for this row (sampled rows only):
-    /// the accept graph's own outputs, whichever acceptance mode built them.
-    /// `accept_p` null-ctx = this row builds its own in the finish.
+    /// the accept graph's own outputs, or only `corr` when the row draws by position.
+    /// `corr` null-ctx = this row builds its own in the finish.
     accept_p: mlx.mlx_array = .{ .ctx = null },
     accept_q: mlx.mlx_array = .{ .ctx = null },
-    accept_defer: mlx.mlx_array = .{ .ctx = null },
     corr: mlx.mlx_array = .{ .ctx = null },
 
     pub fn deinit(self: *MtpRoundState, allocator: std.mem.Allocator) void {
@@ -2539,7 +2279,7 @@ pub const MtpRoundState = struct {
 
     /// Drop the group-prepared Phase-4 terms, so the row's finish builds its own.
     pub fn releasePreparedAccept(self: *MtpRoundState) void {
-        inline for (.{ &self.accept_p, &self.accept_q, &self.accept_defer, &self.corr }) |slot| {
+        inline for (.{ &self.accept_p, &self.accept_q, &self.corr }) |slot| {
             if (slot.ctx != null) {
                 _ = mlx.mlx_array_free(slot.*);
                 slot.* = .{ .ctx = null };
@@ -2734,72 +2474,6 @@ test "batched corrections read only 1+m rows of a group-padded verify block" {
     try testing.expectEqual(@as(i32, 1), corr[0]);
     try testing.expectEqual(@as(i32, 1), corr[1]);
     try testing.expectEqual(@as(i32, 3), corr[2]);
-}
-
-test "MTP typical batched graph uses entropy floor and target-row correction" {
-    const s = mlx.gpuStream();
-    const p_data = [_]f32{ 0.5, 0.5, 0, 0, 0, 0, 0, 1 };
-    const p_shape = [_]c_int{ 1, 2, 4 };
-    const probs = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
-    defer _ = mlx.mlx_array_free(probs);
-    const id: i32 = 0;
-    const id_shape = [_]c_int{1};
-    const draft = mlx.mlx_array_new_data(&id, &id_shape, 1, .int32);
-    defer _ = mlx.mlx_array_free(draft);
-    const drafts = [_]mlx.mlx_array{draft};
-    var g = try Generator.mtpBatchedTypicalGraph(probs, &drafts, null, 1, 0.2, .{}, s);
-    defer g.deinit();
-    try mlx.check(mlx.mlx_array_eval(g.accept_p));
-    try mlx.check(mlx.mlx_array_eval(g.accept_q));
-    const p = mlx.mlx_array_data_float32(g.accept_p) orelse return error.InvalidDtype;
-    const floor = mlx.mlx_array_data_float32(g.accept_q) orelse return error.InvalidDtype;
-    try testing.expectApproxEqAbs(@as(f32, 0.5), p[0], 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.1), floor[0], 1e-6);
-    try testing.expect(g.accept_defer.ctx == null);
-    try mlx.check(mlx.mlx_array_eval(g.corr_samples));
-    const corr = mlx.mlx_array_data_int32(g.corr_samples) orelse return error.InvalidDtype;
-    try testing.expect(corr[0] == 0 or corr[0] == 1);
-    try testing.expectEqual(@as(i32, 3), corr[1]);
-}
-
-test "a prompt-lookup draft is kept only as often as sampling would keep it under typical acceptance" {
-    // A copied token at p = 0.05 in a high-entropy row clears typical's floor (0.2 * e^-H), so
-    // the typical route keeps it every time; a lookup round must keep it about 5% of the time.
-    const s = mlx.gpuStream();
-    const V = 32;
-    var p_data: [2 * V]f32 = undefined;
-    p_data[0] = 0.05;
-    for (p_data[1..V]) |*v| v.* = 0.95 / @as(f32, V - 1);
-    for (p_data[V..]) |*v| v.* = 1.0 / @as(f32, V);
-    const p_shape = [_]c_int{ 1, 2, V };
-    const probs = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
-    defer _ = mlx.mlx_array_free(probs);
-    const id: i32 = 0;
-    const id_shape = [_]c_int{1};
-    const draft = mlx.mlx_array_new_data(&id, &id_shape, 1, .int32);
-    defer _ = mlx.mlx_array_free(draft);
-    const drafts = [_]mlx.mlx_array{draft};
-
-    var g: Generator = undefined;
-    g.mtp_accept_graph = Generator.mtpBatchedTypicalGraph;
-    g.mtp_accept_prefix = mtp_acceptance.typicalPrefix;
-    g.mtp_accept_param = 0.2;
-    var prng = std.Random.DefaultPrng.init(0x100C);
-    var kept: [2]u32 = .{ 0, 0 };
-    for ([_]bool{ false, true }, 0..) |lookup, arm| {
-        var bg = try g.acceptGraphFor(lookup)(probs, &drafts, null, 1, g.mtp_accept_param, .{}, s);
-        defer bg.deinit();
-        try mlx.check(mlx.mlx_array_eval(bg.accept_p));
-        const p = mlx.mlx_array_data_float32(bg.accept_p) orelse return error.InvalidDtype;
-        var q: ?[]const f32 = null;
-        if (bg.accept_q.ctx != null) {
-            try mlx.check(mlx.mlx_array_eval(bg.accept_q));
-            q = (mlx.mlx_array_data_float32(bg.accept_q) orelse return error.InvalidDtype)[0..1];
-        }
-        for (0..400) |_| kept[arm] += g.acceptPrefixFor(lookup)(p[0..1], q, null, &prng);
-    }
-    try testing.expectEqual(@as(u32, 400), kept[0]);
-    try testing.expect(kept[1] > 0 and kept[1] < 60);
 }
 
 test "mtpCommittedLen: speculative tails (pre-draft, stash) bound the committable history" {

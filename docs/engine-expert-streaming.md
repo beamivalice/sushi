@@ -300,6 +300,9 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   (`canQueue` stays true): a tolerance above 0 turns the queue off, so a boot with both ignores the bias (and says so).
 - Prefill chunks, image rows and layers without a pooled map route exactly. `layoutKey` names a non-zero bias (`-cbias`),
   so its states never mix with an exact boot's. `kld compare` takes it, `capture` refuses it.
+- Per model: model-settings.json `expert_cache_bias` (the web UI's "Faster SSD streaming (not exact)", offered only to a DeepSeek
+  STQ pack that streams); the flag outranks it. `ModelConfig.expertCacheBias` resolves it per load and the load hands it
+  to its own engine (`Options.cache_bias`) and namespace, so a second resident model never reads another's bias.
 - Output depends on cache state, so it is not reproducible across runs or prompt histories. `kld capture` refuses a
   non-zero tolerance: the teacher is exact routing. Numbers: [quality-kld](quality-kld.md#lossy-expert-pick).
 

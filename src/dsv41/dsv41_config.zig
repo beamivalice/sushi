@@ -140,6 +140,9 @@ pub const Config = struct {
     /// FP4 experts and FP8 trunk.
     expert_dec: ?sushi_exl3.format.Decode = null,
     trunk_dec: ?sushi_exl3.format.Decode = null,
+    /// The most rate groups one layer's routed experts span in an STQ pack (`ModelConfig.expert_rate_groups`, set
+    /// once the pack's layout is read); 1 for an ungrouped pack.
+    rate_groups: u8 = 1,
 
     pub fn isDsparkTarget(self: *const Config, l: usize) bool {
         for (self.dspark.targets[0..self.dspark.n_targets]) |t| if (t == l) return true;
@@ -225,15 +228,29 @@ pub const Config = struct {
         return base + (@as(u64, self.n_mtp) * self.window + @as(u64, self.layers) * ring_slack) * self.head_dim * act_bytes;
     }
 
-    /// The most one forward of `rows` ending at position `seq` may allocate through MLX beyond what is live when it
-    /// starts: its transients and the state rows it appends. The transient cap installs it (`dsv41_borrow`) and
-    /// admission bills it. A prefill-width forward costs `cap_row_bytes_per_dim` a row and a channel; a decode or
-    /// verify block scores every key (`narrow_rows` rows, `score_copies` copies) and its rows fit in the slack. Both
-    /// carry the rows' growth: its slack plus one layer's old rows beside the new buffer during the copy.
+    /// The most one forward of `rows` ending at position `seq` may allocate beyond what is live when it starts: its
+    /// transients and the state rows it appends. The transient cap installs it (`dsv41_borrow`) and admission bills it.
+    /// A prefill-width forward holds the tensors `dsv41_wide_bytes` counts from its shapes, the state rows among them; a
+    /// decode or verify block scores every key (`narrow_rows` rows, `score_copies` copies) beside `forward_held_bytes`.
+    /// Both carry the rows' growth (its slack plus one layer's old rows beside the new buffer during the copy) and the
+    /// bill's one margin.
     pub fn forwardCap(self: *const Config, rows: u64, seq: u64) u64 {
         const ctx = @max(seq, 1);
-        const by_rows = if (rows > verify_rows) rows *| self.dim *| cap_row_bytes_per_dim else narrow_rows * ctx * 4 * score_copies;
-        return (by_rows +| self.growthBytes(ctx)) *| 5 / 4 +| cap_slack_bytes;
+        if (rows > verify_rows) return wide_bytes.bytes(self, rows, ctx) +| self.growthBytes(ctx) +| BILL_MARGIN_BYTES;
+        return narrow_rows * ctx * 4 * score_copies +| self.growthBytes(ctx) +| cap_fixed_bytes;
+    }
+
+    /// `forwardCap` of a load on MLX's stream: MLX's graph holds what its evaluation order keeps, which no shape sum
+    /// of ours counts, so a prefill-width forward there keeps the per-row rate measured on it.
+    pub fn mlxForwardCap(self: *const Config, rows: u64, seq: u64) u64 {
+        if (rows <= verify_rows) return self.forwardCap(rows, seq);
+        const ctx = @max(seq, 1);
+        return rows *| self.dim *| mlx_row_bytes_per_dim +| self.growthBytes(ctx) +| cap_fixed_bytes;
+    }
+
+    /// `forwardCap` on the side a load runs on: the engine of our own (`engine`) or MLX.
+    pub fn forwardCapOn(self: *const Config, engine: bool, rows: u64, seq: u64) u64 {
+        return if (engine) self.forwardCap(rows, seq) else self.mlxForwardCap(rows, seq);
     }
 
     fn growthBytes(self: *const Config, ctx: u64) u64 {
@@ -241,17 +258,22 @@ pub const Config = struct {
     }
 
     /// `forwardCap` of a joined decode forward, a row per request at `seqs`: each request's scores and state growth are
-    /// its own, the slack is the forward's.
+    /// its own, `cap_fixed_bytes` the forward's.
     pub fn joinedCap(self: *const Config, seqs: []const u64) u64 {
         var sum: u64 = 0;
-        for (seqs) |seq| sum +|= self.forwardCap(1, seq) - cap_slack_bytes;
-        return sum +| cap_slack_bytes;
+        for (seqs) |seq| sum +|= self.forwardCap(1, seq) - cap_fixed_bytes;
+        return sum +| cap_fixed_bytes;
     }
 
     /// `forwardCap` of a prefill chunk of `chunk` rows ending at `seq`: the last chunk of a prompt absorbs a tail of
     /// up to `tail_merge_rows`, so the widest forward is `chunk + tail_merge_rows` rows.
     pub fn chunkCap(self: *const Config, chunk: u64, seq: u64) u64 {
-        return self.forwardCap(@min(chunk +| tail_merge_rows, @max(seq, 1)), seq);
+        return self.chunkCapOn(true, chunk, seq);
+    }
+
+    /// `chunkCap` on the side a load runs on (`forwardCapOn`).
+    pub fn chunkCapOn(self: *const Config, engine: bool, chunk: u64, seq: u64) u64 {
+        return self.forwardCapOn(engine, @min(chunk +| tail_merge_rows, @max(seq, 1)), seq);
     }
 };
 
@@ -277,14 +299,23 @@ pub const gate_tile_rows: u64 = prefill_width;
 
 /// The MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
 pub const dsv41_pool_bytes: u64 = 1 << 30;
-/// Added to every cap: twice the 0.12 GiB of small tensors and tables a decode forward was measured to hold.
-pub const cap_slack_bytes: u64 = 256 << 20;
+/// The small tensors and tables a forward holds whatever its rows: the 0.12 GiB a decode forward was measured to hold.
+pub const forward_held_bytes: u64 = 123 << 20;
+/// The bill's one safety margin, by the name and value `bills.zig` gives the shared one, which replaces it.
+pub const BILL_MARGIN_BYTES: u64 = 256 << 20;
+/// What a decode or verify forward's cap carries beyond its scores and its context.
+pub const cap_fixed_bytes: u64 = forward_held_bytes + BILL_MARGIN_BYTES;
 const score_copies: u64 = 3;
 /// `prefill_plan.TAIL_MERGE_MAX - 1`: the longest tail the last chunk of a prompt absorbs.
 pub const tail_merge_rows: u64 = 511;
-/// Peak bytes a prefill forward row holds per hidden channel: measured on the 5120-wide release as 2.3 MiB a row from
-/// 256 to 2048 rows (2.8 MiB for one 363-row chunk, its state rows included), rounded up.
-const cap_row_bytes_per_dim: u64 = 480;
+/// Rows of a wide chunk one attention span takes: a span's scores and gathered rows are freed before the next.
+pub const attn_span: u64 = 256;
+/// Layers a prefill pass keeps in flight (`Model.pipe_depth`): their output streams stay in use until it waits on them.
+pub const prefill_pipe_depth: usize = 2;
+/// Peak bytes a prefill forward row on MLX's stream holds per hidden channel: measured on the 5120-wide release as 2.3
+/// MiB a row from 256 to 2048 rows (2.8 MiB for one 363-row chunk, its state rows included), rounded up.
+const mlx_row_bytes_per_dim: u64 = 480;
+const wide_bytes = @import("dsv41_wide_bytes.zig");
 /// Keys one pass of a wide span's streamed index top-k scores, as `dsv41_model` runs them.
 pub const index_stream_tile: u64 = 32768;
 /// Rows up to which the indexer scores a block with the scalar kernel, whole rows at a time.
@@ -404,6 +435,7 @@ pub fn parseFamily(config: anytype, root: std.json.ObjectMap, cfg_obj: std.json.
         config.qv_merge = v.downsample;
         config.qv_temporal_patch = 1;
     }
+    if (root.get("trunk_quant")) |b| config.trunk_quant_rate = (try sushi_exl3.parseQuantBlock(b)).rate;
     config.dsv41 = c;
     config.serve_defaults = Config.serveDefaults(@TypeOf(config.serve_defaults));
 }
@@ -586,7 +618,7 @@ fn gibs(x: f64) u64 {
     return @intFromFloat(x * @as(f64, @floatFromInt(gib)));
 }
 
-test "dsv41 forward cap: covers a quarter over what every measured peak added to the state it started from" {
+test "dsv41 forward cap: on MLX, covers what every measured peak added to the state it started from, with no multiplier" {
     const c = try parseText(release_config);
     // Peaks of MLX's own bytes (imported weights left out, state rows in), STQ pack, budget 108, binary 26a28040. The
     // cap is over the level a forward starts at, which holds the state of `ctx` tokens at least.
@@ -605,19 +637,44 @@ test "dsv41 forward cap: covers a quarter over what every measured peak added to
     };
     for (peaks) |m| {
         const added = gibs(m.peak) -| m.ctx * c.stateBytesPerToken();
-        try testing.expect(c.forwardCap(m.rows, m.ctx) >= added * 5 / 4);
+        try testing.expect(c.mlxForwardCap(m.rows, m.ctx) >= added);
     }
 }
 
-test "dsv41 forward cap: a joined decode forward bills each request's one-row cap, the slack once" {
+test "dsv41 forward cap: a wide forward's row term is the shape sum of its widest layer's tensors, for the tiny fixture's geometry and the release's" {
+    var tiny = try parseText(stq_tiny_config);
+    tiny.rate_groups = 3;
+    const rel_stq = try releaseStqForTest();
+    const rel = try parseText(release_config);
+    const Case = struct { c: *const Config, rows: u64, shapes: u64 };
+    // The tiny: layer 2 (Engram, KV source and index owner) at its routed chain over six pools; its trace at three
+    // pools reads these less the three spill pools. The release: layer 14 (the same roles) over ten pools (the STQ
+    // pack's combined chain) or the FP4 experts' sorted gather.
+    for ([_]Case{
+        .{ .c = &tiny, .rows = 512, .shapes = 40_501_248 },
+        .{ .c = &tiny, .rows = 2048, .shapes = 159_694_848 },
+        .{ .c = &tiny, .rows = 8192, .shapes = 637_452_288 },
+        .{ .c = &rel_stq, .rows = 363, .shapes = 751_157_248 },
+        .{ .c = &rel_stq, .rows = 2048, .shapes = 4_081_090_560 },
+        .{ .c = &rel_stq, .rows = 4096, .shapes = 8_160_788_480 },
+        .{ .c = &rel_stq, .rows = 8192, .shapes = 16_314_007_552 },
+        .{ .c = &rel, .rows = 2048, .shapes = 2_717_777_920 },
+    }) |k| {
+        const got = k.c.forwardCap(k.rows, k.rows) - k.c.growthBytes(k.rows) - BILL_MARGIN_BYTES;
+        errdefer std.debug.print("{d} rows: shape sum {d}\n", .{ k.rows, got });
+        try testing.expectEqual(k.shapes, got);
+    }
+}
+
+test "dsv41 forward cap: a joined decode forward bills each request's one-row cap, the fixed bytes once" {
     const c = try parseText(release_config);
     for ([_]u64{ 1, 4096, 1 << 20 }) |seq| try testing.expectEqual(c.forwardCap(1, seq), c.joinedCap(&.{seq}));
-    try testing.expectEqual(c.forwardCap(1, 4096) + c.forwardCap(1, 90_000) - cap_slack_bytes, c.joinedCap(&.{ 4096, 90_000 }));
-    try testing.expectEqual(3 * c.forwardCap(1, 9_000) - 2 * cap_slack_bytes, c.joinedCap(&.{ 9_000, 9_000, 9_000 }));
+    try testing.expectEqual(c.forwardCap(1, 4096) + c.forwardCap(1, 90_000) - cap_fixed_bytes, c.joinedCap(&.{ 4096, 90_000 }));
+    try testing.expectEqual(3 * c.forwardCap(1, 9_000) - 2 * cap_fixed_bytes, c.joinedCap(&.{ 9_000, 9_000, 9_000 }));
 }
 
 test "dsv41 forward cap: grows with the rows and the context, a chunk's tail merge is priced, and 1M fits" {
-    const c = try parseText(release_config);
+    const c = try releaseStqForTest();
     const m: u64 = 1 << 20;
     try testing.expect(c.forwardCap(2048, 9_000) > c.forwardCap(1024, 9_000));
     try testing.expect(c.forwardCap(2048, m) > c.forwardCap(2048, 9_000));
@@ -629,10 +686,10 @@ test "dsv41 forward cap: grows with the rows and the context, a chunk's tail mer
     // The measured growth beyond the state rows (1094 B a token less 890) is a fraction of the cap's per-token slope.
     const measured: u64 = (gibs(0.336) - gibs(0.116)) / (225_000 - 9_000) - c.stateBytesPerToken();
     const slope = (c.forwardCap(1, m) - c.forwardCap(1, 9_000)) / (m - 9_000);
-    try testing.expect(slope >= measured * 5 / 4);
-    // The extrapolation to 1M context: a decode forward under 1.1 GB, a tail-merged 2048-row chunk under 8.8 GB.
-    try testing.expect(c.forwardCap(verify_rows, m) < 1_100_000_000);
-    try testing.expect(c.chunkCap(2048, m) < 8_800_000_000);
+    try testing.expect(slope >= measured);
+    // The extrapolation to 1M context: a decode forward under 1.05 GB, a tail-merged 2048-row chunk under 7.2 GB.
+    try testing.expect(c.forwardCap(verify_rows, m) < 1_050_000_000);
+    try testing.expect(c.chunkCap(2048, m) < 7_200_000_000);
 }
 
 /// The V4.1-Flash release's `config.json`.
@@ -663,6 +720,46 @@ pub const release_config =
     \\ "vision_config": {"model_type": "deepseek_v41_vision", "num_hidden_layers": 32, "hidden_size": 1024,
     \\  "num_attention_heads": 16, "intermediate_size": 2816, "patch_size": 14, "rope_theta": 10000, "downsample_ratio": 3,
     \\  "max_image_tokens": 1024, "min_pixels": 295936, "max_wh_ratio": null}}
+;
+
+/// The release as its STQ pack serves it (`DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw`): trellis experts and trunk, and
+/// five rate groups at its widest layer.
+pub fn releaseStqForTest() !Config {
+    var c = try parseText(release_config);
+    const quant =
+        \\{"expert_quant": {"format": "stq", "k": 2.5, "codebook": "pair1", "window": 16, "codebook_table": "pair1-w16-v1", "codebook_digest": "c089b4eb"},
+        \\ "trunk_quant": {"format": "stq", "k": 6, "codebook": "spec1", "window": 15, "codebook_table": "spec1-w15", "codebook_digest": "37f72431"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, quant, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestUnexpectedResult;
+    const blocks = parsed.value.object;
+    c.expert_dec = try stqDecode(blocks.get("expert_quant").?);
+    c.trunk_dec = try stqDecode(blocks.get("trunk_quant").?);
+    c.rate_groups = 5;
+    return c;
+}
+
+/// `DSV41_STQ_TINY`'s config: the release's layout of layers at a tiny width, three rate groups a layer.
+const stq_tiny_config =
+    \\{"model_type": "deepseek_v41", "image_token_id": 129264,
+    \\ "text_config": {"vocab_size": 256, "hidden_size": 256, "moe_intermediate_size": 128, "num_hidden_layers": 8,
+    \\  "num_attention_heads": 2, "num_key_value_heads": 1, "hidden_act": "silu", "head_dim": 128, "qk_rope_head_dim": 16,
+    \\  "q_lora_rank": 128, "o_lora_rank": 128, "o_groups": 2, "swiglu_limit": 1.0, "rms_norm_eps": 1e-20,
+    \\  "max_position_embeddings": 128, "rope_theta": 10000.0,
+    \\  "rope_scaling": {"rope_type": "yarn", "factor": 4, "beta_fast": 32, "beta_slow": 1, "original_max_position_embeddings": 64},
+    \\  "n_routed_experts": 8, "n_shared_experts": 1, "num_experts_per_tok": 3, "scoring_func": "sqrtsoftplus",
+    \\  "topk_method": "noaux_tc", "norm_topk_prob": true, "routed_scaling_factor": 1.5, "sliding_window": 8,
+    \\  "compress_ratios": [0, 0, 2, 2, 2, 1, 1, 1, 0, 0, 0], "compress_rope_theta": 40000.0, "kv_source_layer_ids": [2, 5],
+    \\  "index_source_layer_ids": [2, 5, 7], "index_n_heads": 8, "index_head_dim": 128, "index_topk": 4,
+    \\  "candidate_source_layer_id": 5, "candidate_topk_blocks": 3, "candidate_block_size": 2, "hc_mult": 4,
+    \\  "hc_sinkhorn_iters": 20, "hc_eps": 1e-06, "engram_layer_ids": [1, 2], "engram_max_ngram_size": 4,
+    \\  "engram_vocab_size": 50, "engram_n_heads": 2, "engram_head_dim": 64, "engram_pad_token_id": 2,
+    \\  "engram_compressed_vocab_size": 256, "engram_num_embeddings": [384, 552], "num_nextn_predict_layers": 3,
+    \\  "dspark_block_size": 4, "dspark_noise_token_id": 255, "dspark_target_layer_ids": [5, 6, 7], "dspark_markov_rank": 32,
+    \\  "dspark_n_routed_experts": 4, "dspark_num_experts_per_tok": 2},
+    \\ "expert_quant": {"format": "stq", "k": 4.0, "codebook": "pair1", "window": 16, "codebook_table": "pair1-w16-v1", "codebook_digest": "c089b4eb"},
+    \\ "trunk_quant": {"format": "stq", "k": 6.0, "codebook": "spec1", "window": 15, "codebook_table": "spec1-w15", "codebook_digest": "37f72431"}}
 ;
 
 /// Test fixtures elsewhere (the server's bills) parse the release config through it.

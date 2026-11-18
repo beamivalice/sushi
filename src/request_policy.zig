@@ -28,7 +28,6 @@ const Conn = http_conn.Conn;
 const MAX_TOKENS_DESC_LEN = request_parse.MAX_TOKENS_DESC_LEN;
 const StreamMode = generation_stream.StreamMode;
 const atomicTokenId = server.atomicTokenId;
-const autoBudgetWindowTight = server.autoBudgetWindowTight;
 const chatTemplateKwargBool = request_parse.chatTemplateKwargBool;
 const jsonEscape = http.jsonEscape;
 const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
@@ -93,39 +92,21 @@ pub fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *con
     return tp;
 }
 
-/// Default when an OpenAI-style client omits `max_tokens` /
-/// `max_completion_tokens` / `max_output_tokens`. OpenAI semantics: omitted
-/// means "generate until EOS, bounded by the context window" — NOT a small
-/// fixed cap. (The old 256 default silently broke agent clients like pi:
-/// every thinking-enabled turn hit `length` mid-reasoning, so no tool call or
-/// answer ever came back.) The sentinel is huge so the downstream
-/// `clampMaxTokens` resolves it to the remaining context; only when the context
-/// is genuinely unknown (0) do we fall back to a finite 4096.
-///
-/// Takes the EFFECTIVE context, not `server_config.max_context_size`: that
-/// global is set only by `--ctx-size`, so under auto-context this used to
-/// return 4096 — an omitted-max_tokens client silently capped at 4096 tokens,
-/// truncating any large tool call. Same class as the 256 default it replaced.
-pub fn omittedMaxTokensDefault(config: *const model_mod.ModelConfig) u32 {
-    return omittedMaxTokensDefaultWith(server.getEffectiveContextLength(config), launchMaxTokensDefault(), config.defaultMaxTokens());
+/// The budget of a request that omits `max_tokens`, never 0 and never pegged to the window:
+/// `--max-tokens`, else the model's default, else `ENGINE_DEFAULT_MAX_TOKENS`.
+pub fn filledMaxTokens(config: *const model_mod.ModelConfig) u32 {
+    return filledMaxTokensWith(launchMaxTokensDefault(), config.defaultMaxTokens());
 }
 
-/// Pure core of the above with the launch default (`--max-tokens N`, 0 = unset) passed in.
-/// The flag outranks both fallbacks.
-pub fn omittedMaxTokensDefaultWith(effective_ctx: u32, launch_default: u32, model_default: u32) u32 {
+/// Pure core of `filledMaxTokens`; 0 = unset for both inputs.
+pub fn filledMaxTokensWith(launch_default: u32, model_default: u32) u32 {
     if (launch_default > 0) return launch_default;
     if (model_default > 0) return model_default;
-    return if (effective_ctx > 0) AUTO_MAX_TOKENS_SENTINEL else 4096;
+    return ENGINE_DEFAULT_MAX_TOKENS;
 }
 
-/// The "no budget named, peg it to the window" sentinel, in one place; `clampMaxTokens` reduces it to `context - prompt`.
-const AUTO_MAX_TOKENS_SENTINEL: u32 = std.math.maxInt(u32) / 4;
-
-/// The budget a surface that needs one fills in when the request names none: `--max-tokens`, else the model's own; 0 = neither.
-pub fn filledMaxTokens(config: *const model_mod.ModelConfig) u32 {
-    const launch = launchMaxTokensDefault();
-    return if (launch > 0) launch else config.defaultMaxTokens();
-}
+/// What an omitted `max_tokens` gets when neither the operator nor the model names a budget.
+pub const ENGINE_DEFAULT_MAX_TOKENS: u32 = 32768;
 
 /// The `model` an answer echoes when the request names none: the id it is served under.
 pub fn servedModelId(lm: *const LoadedModel, config: *const model_mod.ModelConfig) []const u8 {
@@ -137,71 +118,53 @@ pub fn launchMaxTokensDefault() u32 {
     return server_state.server_config.default_max_tokens;
 }
 
-/// Resolve a request's `max_tokens` (or its aliases) to an effective cap.
-/// Absent OR `<= 0` means **auto**: peg generation to the remaining context
-/// window via `auto_default` (the `omittedMaxTokensDefault` sentinel, which
-/// `clampMaxTokens` then reduces to `context - prompt`). The app's "Auto"
-/// setting sends 0 (or omits the field); both land on the context-pegged budget
-/// instead of a fixed ceiling. A positive integer is an explicit cap.
-pub fn resolveRequestMaxTokens(v: ?std.json.Value, auto_default: u32) u32 {
-    const i = request_parse.wholeNumber(v orelse return auto_default) orelse return auto_default;
-    return if (i > 0) std.math.cast(u32, i) orelse auto_default else auto_default;
+/// Resolve a request's `max_tokens` (or its aliases) to an effective cap. Absent, `<= 0` or not
+/// a whole number takes `filled` (`filledMaxTokens`): the app's "Auto" sends 0. A positive
+/// integer is the client's own cap.
+pub fn resolveRequestMaxTokens(v: ?std.json.Value, filled: u32) u32 {
+    const i = request_parse.wholeNumber(v orelse return filled) orelse return filled;
+    return if (i > 0) std.math.cast(u32, i) orelse filled else filled;
 }
 
-/// Who decided the effective `max_tokens`: the client, the `--max-tokens` launch default, or nobody (auto).
-const MaxTokensOrigin = enum { client, launch_default, model_default, auto };
+/// Who decided the effective `max_tokens`: the client, `--max-tokens`, the model, or the engine.
+const MaxTokensOrigin = enum { client, launch_default, model_default, engine_default };
 
-/// The origin of the number `resolveRequestMaxTokens` returns, from the same two inputs.
+/// The origin of the number `resolveRequestMaxTokens` returns, from the same inputs.
 pub fn maxTokensOrigin(requested: ?std.json.Value, launch_default: u32, model_default: u32) MaxTokensOrigin {
     if (requested) |val| if (request_parse.wholeNumber(val)) |i| {
         if (i > 0) return .client;
     };
     if (launch_default > 0) return .launch_default;
-    return if (model_default > 0) .model_default else .auto;
+    return if (model_default > 0) .model_default else .engine_default;
 }
 
-/// Render the request log's `max_tokens=` field: auto prints as `auto` (or `auto (N)` for the
-/// finite unknown-context fallback), a launch-filled budget names its source, a client's number
-/// prints bare. The sentinel used to print as a client asking for a billion tokens.
+/// Render the request log's `max_tokens=` field: a filled budget names its source, a client's number prints bare.
 pub fn describeMaxTokens(buf: []u8, value: u32, origin: MaxTokensOrigin) []const u8 {
     return switch (origin) {
         .client => std.fmt.bufPrint(buf, "{d}", .{value}) catch "?",
         .launch_default => std.fmt.bufPrint(buf, "{d} (launch default)", .{value}) catch "?",
         .model_default => std.fmt.bufPrint(buf, "{d} (model default)", .{value}) catch "?",
-        .auto => if (value == AUTO_MAX_TOKENS_SENTINEL)
-            "auto"
-        else
-            std.fmt.bufPrint(buf, "auto ({d})", .{value}) catch "auto",
+        .engine_default => std.fmt.bufPrint(buf, "{d} (engine default)", .{value}) catch "?",
     };
 }
 
-/// Does the generation budget warrant the "budget squeezed" warning? The auto sentinel is
-/// excluded: it is always more than 4x anything that remains.
+/// Does the generation budget warrant the "budget squeezed" note?
 fn maxTokensBudgetSqueezed(max_tokens: u32, remaining: u32) bool {
-    if (max_tokens == AUTO_MAX_TOKENS_SENTINEL) return false;
     return remaining < max_tokens / 4;
 }
 
-/// Clamp max_tokens so prompt + completion doesn't exceed context length.
-/// Clamp a request's `max_tokens` so `prompt + generation` stays inside
-/// `effective_ctx`. `effective_ctx == 0` means "unknown" and imposes no limit.
-///
-/// Takes the context explicitly rather than reading `server_config.max_context_size`:
-/// that global is only set by `--ctx-size`, so under AUTO context this function
-/// used to return `max_tokens` untouched — the server never trimmed a client's
-/// budget, never emitted the "budget squeezed" warning, and generation could run
-/// past the memory-safe window. Callers pass `getEffectiveContextLength(config)`,
-/// which is the same number the prompt-length guard and `/v1/models` report.
-pub fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
-    if (effective_ctx == 0) return max_tokens;
+/// Clamp a request's `max_tokens` so `prompt + generation` stays inside `effective_ctx`, which
+/// is always concrete (`getEffectiveContextLength` never returns 0). A squeeze on the client's
+/// own number warns; on a budget the server filled it is context, not a deviation: debug.
+pub fn clampMaxTokens(max_tokens: u32, client_asked: bool, prompt_len: usize, effective_ctx: u32) u32 {
     const prompt: u32 = @intCast(@min(prompt_len, effective_ctx));
     if (prompt >= effective_ctx) return 1; // at least 1 token
     const remaining = effective_ctx - prompt;
     if (maxTokensBudgetSqueezed(max_tokens, remaining)) {
-        log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}) — tool call arguments may be truncated\n", .{ remaining, max_tokens, prompt, effective_ctx });
-    } else if (max_tokens == AUTO_MAX_TOKENS_SENTINEL and autoBudgetWindowTight(remaining, effective_ctx)) {
-        // The client named no budget, so this is context, not a deviation: debug.
-        log.debug("  generation budget squeezed: {d} of the window remain (auto budget; prompt={d}, ctx={d})\n", .{ remaining, prompt, effective_ctx });
+        if (client_asked)
+            log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}) — tool call arguments may be truncated\n", .{ remaining, max_tokens, prompt, effective_ctx })
+        else
+            log.debug("  generation budget squeezed: {d}/{d} tokens remaining (filled budget; prompt={d}, ctx={d})\n", .{ remaining, max_tokens, prompt, effective_ctx });
     }
     if (max_tokens > remaining) {
         log.debug("  max_tokens clamped: {d} -> {d} (ctx={d}, prompt={d})\n", .{ max_tokens, remaining, effective_ctx, prompt });
@@ -334,11 +297,12 @@ pub fn writeEffortNoticeHeader(stream: *Conn) !void {
     try stream.writeAllNoFlush("\r\nAccess-Control-Expose-Headers: X-Sushi-Effort-Notice\r\n");
 }
 
-/// `clampMaxTokens` for a request: a cut the window made also rides the response head, so a client sees it was not granted its ask.
-pub fn clampMaxTokensFor(stream: *Conn, max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
-    const granted = clampMaxTokens(max_tokens, prompt_len, effective_ctx);
+/// `clampMaxTokens` for a request: a cut the window made to the client's own number also rides the
+/// response head, so the client sees it was not granted its ask. A filled budget asked for nothing.
+pub fn clampMaxTokensFor(stream: *Conn, max_tokens: u32, client_asked: bool, prompt_len: usize, effective_ctx: u32) u32 {
+    const granted = clampMaxTokens(max_tokens, client_asked, prompt_len, effective_ctx);
     stream.max_tokens_cut_len = 0;
-    if (max_tokens != AUTO_MAX_TOKENS_SENTINEL and granted < max_tokens) {
+    if (client_asked and granted < max_tokens) {
         const text = std.fmt.bufPrint(&stream.max_tokens_cut, "{d} -> {d}", .{ max_tokens, granted }) catch return granted;
         stream.max_tokens_cut_len = @intCast(text.len);
     }
@@ -717,71 +681,61 @@ test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-s
     server_state.server_config.max_context_size = 0; // auto: the old code never clamped here
 
     // 4096-token window, 4000-token prompt -> only 96 tokens of generation left.
-    try testing.expectEqual(@as(u32, 96), clampMaxTokens(8192, 4000, 4096));
+    try testing.expectEqual(@as(u32, 96), clampMaxTokens(8192, true, 4000, 4096));
     // Comfortable budget is passed through untouched.
-    try testing.expectEqual(@as(u32, 8192), clampMaxTokens(8192, 100, 65536));
+    try testing.expectEqual(@as(u32, 8192), clampMaxTokens(8192, true, 100, 65536));
     // Prompt at/over the window still yields at least one token.
-    try testing.expectEqual(@as(u32, 1), clampMaxTokens(8192, 4096, 4096));
-    try testing.expectEqual(@as(u32, 1), clampMaxTokens(8192, 9000, 4096));
-    // ctx 0 (unknown) = no limit.
-    try testing.expectEqual(@as(u32, 8192), clampMaxTokens(8192, 4000, 0));
+    try testing.expectEqual(@as(u32, 1), clampMaxTokens(8192, true, 4096, 4096));
+    try testing.expectEqual(@as(u32, 1), clampMaxTokens(8192, true, 9000, 4096));
 }
 
-test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback otherwise" {
-    const original = server_state.server_config.max_context_size;
-    defer server_state.server_config.max_context_size = original;
-
-    // OpenAI semantics: omitted max_tokens = generate until EOS bounded by the
-    // context window. The old fixed 256 default broke agent clients (pi) whose
-    // thinking-enabled turns hit `length` mid-reasoning on EVERY request.
-    server_state.server_config.max_context_size = 32768;
-    const sentinel = omittedMaxTokensDefault(&model_mod.ModelConfig{});
-    // Big enough that clampMaxTokens (the downstream bound) always wins…
-    try testing.expect(sentinel > 32768);
-    // …and the composition resolves to exactly the remaining context.
-    try testing.expectEqual(@as(u32, 32768 - 1500), clampMaxTokens(sentinel, 1500, 32768));
-
-    // ctx unknown (max_context_size=0): clampMaxTokens won't bound anything,
-    // so the default itself must stay finite.
-    server_state.server_config.max_context_size = 0;
-    try testing.expectEqual(@as(u32, 4096), omittedMaxTokensDefaultWith(0, 0, 0));
+test "an omitted max_tokens is a concrete budget an agent's thinking turn fits in, still bounded by the window" {
+    // The old fixed 256 default broke agent clients (pi) whose thinking-enabled turns hit
+    // `length` mid-reasoning on EVERY request.
+    const slot = &@field(server_state.server_config, "default_max_tokens");
+    const orig = slot.*;
+    defer slot.* = orig;
+    slot.* = 0;
+    const filled = filledMaxTokens(&model_mod.ModelConfig{});
+    try testing.expectEqual(ENGINE_DEFAULT_MAX_TOKENS, filled);
+    try testing.expect(filled > 256);
+    // The window still bounds it.
+    try testing.expectEqual(@as(u32, 16384 - 1500), clampMaxTokens(filled, false, 1500, 16384));
 }
 
-test "resolveRequestMaxTokens: absent / 0 / negative / non-int → auto; positive → value" {
-    const auto: u32 = 12345;
-    // Absent → auto (the omitted-default path the app's "Auto" setting rides).
-    try testing.expectEqual(auto, resolveRequestMaxTokens(null, auto));
-    // 0 and negatives are "auto" too — a client must not be able to request a
+test "resolveRequestMaxTokens: absent / 0 / negative / non-int → the filled budget; positive → value" {
+    const filled: u32 = 12345;
+    // Absent → the filled budget (the omitted-default path the app's "Auto" setting rides).
+    try testing.expectEqual(filled, resolveRequestMaxTokens(null, filled));
+    // 0 and negatives take it too — a client must not be able to request a
     // 0-token (generate-nothing) response by selecting Auto.
-    try testing.expectEqual(auto, resolveRequestMaxTokens(.{ .integer = 0 }, auto));
-    try testing.expectEqual(auto, resolveRequestMaxTokens(.{ .integer = -5 }, auto));
-    // Wrong type (e.g. a string) → auto rather than crashing.
-    try testing.expectEqual(auto, resolveRequestMaxTokens(.{ .string = "999" }, auto));
+    try testing.expectEqual(filled, resolveRequestMaxTokens(.{ .integer = 0 }, filled));
+    try testing.expectEqual(filled, resolveRequestMaxTokens(.{ .integer = -5 }, filled));
+    // Wrong type (e.g. a string) → the filled budget rather than crashing.
+    try testing.expectEqual(filled, resolveRequestMaxTokens(.{ .string = "999" }, filled));
     // A real positive cap is honored verbatim.
-    try testing.expectEqual(@as(u32, 4096), resolveRequestMaxTokens(.{ .integer = 4096 }, auto));
+    try testing.expectEqual(@as(u32, 4096), resolveRequestMaxTokens(.{ .integer = 4096 }, filled));
     // A whole float is the integer `json.dumps(7.0)` sends.
-    try testing.expectEqual(@as(u32, 7), resolveRequestMaxTokens(.{ .float = 7.0 }, auto));
+    try testing.expectEqual(@as(u32, 7), resolveRequestMaxTokens(.{ .float = 7.0 }, filled));
     try testing.expectEqual(MaxTokensOrigin.client, maxTokensOrigin(.{ .float = 7.0 }, 0, 0));
 }
 
-test "--max-tokens is the omitted-field default: unset is byte-identical, set wins" {
+test "--max-tokens is the omitted-field default: unset is the engine default, set wins" {
     const t = std.testing;
-    // With no flag the omitted-field default is byte-for-byte what it was.
-    try t.expectEqual(@as(u32, std.math.maxInt(u32) / 4), omittedMaxTokensDefaultWith(32768, 0, 0));
-    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefaultWith(0, 0, 0));
+    try t.expectEqual(ENGINE_DEFAULT_MAX_TOKENS, filledMaxTokensWith(0, 0));
 
     // Flag set: the launch value outranks both fallbacks.
-    try t.expectEqual(@as(u32, 65536), omittedMaxTokensDefaultWith(786_432, 65536, 0));
-    try t.expectEqual(@as(u32, 65536), omittedMaxTokensDefaultWith(0, 65536, 0));
+    try t.expectEqual(@as(u32, 65536), filledMaxTokensWith(65536, 0));
+    try t.expectEqual(@as(u32, 65536), filledMaxTokensWith(65536, 256_000));
 
     // The context clamp still sits on top.
-    try t.expectEqual(@as(u32, 32768 - 1500), clampMaxTokens(omittedMaxTokensDefaultWith(32768, 65536, 0), 1500, 32768));
+    try t.expectEqual(@as(u32, 32768 - 1500), clampMaxTokens(filledMaxTokensWith(65536, 0), false, 1500, 32768));
 
     // A request that sends max_tokens is untouched by the flag.
-    const auto = omittedMaxTokensDefaultWith(786_432, 65536, 0);
-    try t.expectEqual(@as(u32, 128), resolveRequestMaxTokens(.{ .integer = 128 }, auto));
-    try t.expectEqual(@as(u32, 200_000), resolveRequestMaxTokens(.{ .integer = 200_000 }, auto));
-    try t.expectEqual(@as(u32, 65536), resolveRequestMaxTokens(.{ .integer = 0 }, auto));
+    const filled = filledMaxTokensWith(65536, 0);
+    try t.expectEqual(@as(u32, 128), resolveRequestMaxTokens(.{ .integer = 128 }, filled));
+    try t.expectEqual(@as(u32, 200_000), resolveRequestMaxTokens(.{ .integer = 200_000 }, filled));
+    try t.expectEqual(@as(u32, 65536), resolveRequestMaxTokens(.{ .integer = 0 }, filled));
 
     // The live wrapper reads the ServerConfig field through the one accessor.
     const slot = &@field(server_state.server_config, "default_max_tokens");
@@ -790,26 +744,24 @@ test "--max-tokens is the omitted-field default: unset is byte-identical, set wi
     slot.* = 0;
     try t.expectEqual(@as(u32, 0), launchMaxTokensDefault());
     var cfg = model_mod.ModelConfig{ .pinned_context = 32768 };
-    try t.expectEqual(@as(u32, std.math.maxInt(u32) / 4), omittedMaxTokensDefault(&cfg));
+    try t.expectEqual(ENGINE_DEFAULT_MAX_TOKENS, filledMaxTokens(&cfg));
     slot.* = 4096;
     try t.expectEqual(@as(u32, 4096), launchMaxTokensDefault());
-    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(&cfg));
+    try t.expectEqual(@as(u32, 4096), filledMaxTokens(&cfg));
 }
 
-test "an omitted max_tokens: --max-tokens, else the architecture's own default, else the window" {
+test "an omitted max_tokens: --max-tokens, else the architecture's own default, else the engine's" {
     if (arch_config.ofConfigType("deepseek_v41") == null) return error.SkipZigTest;
     const t = std.testing;
-    const sentinel = std.math.maxInt(u32) / 4;
-    // DeepSeek with no flag: its own 256,000, in every arm that is not the flag's.
-    try t.expectEqual(@as(u32, 256_000), omittedMaxTokensDefaultWith(1_000_000, 0, 256_000));
-    try t.expectEqual(@as(u32, 256_000), omittedMaxTokensDefaultWith(0, 0, 256_000));
+    // DeepSeek with no flag: its own 256,000.
+    try t.expectEqual(@as(u32, 256_000), filledMaxTokensWith(0, 256_000));
     // The flag outranks the architecture.
-    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefaultWith(1_000_000, 4096, 256_000));
-    // An architecture with no default keeps the window.
-    try t.expectEqual(@as(u32, sentinel), omittedMaxTokensDefaultWith(1_000_000, 0, 0));
+    try t.expectEqual(@as(u32, 4096), filledMaxTokensWith(4096, 256_000));
+    // An architecture with no default takes the engine's.
+    try t.expectEqual(ENGINE_DEFAULT_MAX_TOKENS, filledMaxTokensWith(0, 0));
     // The context clamp still sits on top, and a client's own number is untouched.
-    try t.expectEqual(@as(u32, 100_000 - 1500), clampMaxTokens(256_000, 1500, 100_000));
-    const dflt = omittedMaxTokensDefaultWith(1_000_000, 0, 256_000);
+    try t.expectEqual(@as(u32, 100_000 - 1500), clampMaxTokens(256_000, false, 1500, 100_000));
+    const dflt = filledMaxTokensWith(0, 256_000);
     try t.expectEqual(@as(u32, 128), resolveRequestMaxTokens(.{ .integer = 128 }, dflt));
     try t.expectEqual(@as(u32, 256_000), resolveRequestMaxTokens(.{ .integer = 0 }, dflt));
 
@@ -818,7 +770,7 @@ test "an omitted max_tokens: --max-tokens, else the architecture's own default, 
     try t.expectEqual(MaxTokensOrigin.model_default, maxTokensOrigin(null, 0, 256_000));
     try t.expectEqual(MaxTokensOrigin.launch_default, maxTokensOrigin(null, 4096, 256_000));
     try t.expectEqual(MaxTokensOrigin.client, maxTokensOrigin(.{ .integer = 128 }, 0, 256_000));
-    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(null, 0, 0));
+    try t.expectEqual(MaxTokensOrigin.engine_default, maxTokensOrigin(null, 0, 0));
     try t.expectEqualStrings("256000 (model default)", describeMaxTokens(&buf, 256_000, .model_default));
 
     // The live wrapper reads the flag and the model's own default.
@@ -828,16 +780,14 @@ test "an omitted max_tokens: --max-tokens, else the architecture's own default, 
     slot.* = 0;
     var dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .pinned_context = 1_000_000, .serve_defaults = arch_config.releaseServeDefaults("dsv41") };
     var qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp", .pinned_context = 1_000_000 };
-    try t.expectEqual(@as(u32, 256_000), omittedMaxTokensDefault(&dsv41));
-    try t.expectEqual(@as(u32, sentinel), omittedMaxTokensDefault(&qwen));
     try t.expectEqual(@as(u32, 256_000), filledMaxTokens(&dsv41));
-    try t.expectEqual(@as(u32, 0), filledMaxTokens(&qwen));
+    try t.expectEqual(ENGINE_DEFAULT_MAX_TOKENS, filledMaxTokens(&qwen));
     slot.* = 4096;
-    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(&dsv41));
     try t.expectEqual(@as(u32, 4096), filledMaxTokens(&dsv41));
+    try t.expectEqual(@as(u32, 4096), filledMaxTokens(&qwen));
 }
 
-test "an omitted max_tokens: --max-tokens, else the model's max_tokens setting, else the architecture's default, else the window" {
+test "an omitted max_tokens: --max-tokens, else the model's max_tokens setting, else the architecture's default, else the engine's" {
     if (arch_config.ofConfigType("deepseek_v41") == null) return error.SkipZigTest;
     const t = std.testing;
     const slot = &@field(server_state.server_config, "default_max_tokens");
@@ -848,22 +798,34 @@ test "an omitted max_tokens: --max-tokens, else the model's max_tokens setting, 
     var qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp", .pinned_context = 1_000_000 };
     dsv41.max_tokens_override = 50_000;
     qwen.max_tokens_override = 12_000;
-    try t.expectEqual(@as(u32, 50_000), omittedMaxTokensDefault(&dsv41));
-    try t.expectEqual(@as(u32, 12_000), omittedMaxTokensDefault(&qwen));
+    try t.expectEqual(@as(u32, 50_000), filledMaxTokens(&dsv41));
     try t.expectEqual(@as(u32, 12_000), filledMaxTokens(&qwen));
     slot.* = 4096;
-    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(&dsv41));
-    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(&qwen));
+    try t.expectEqual(@as(u32, 4096), filledMaxTokens(&dsv41));
+    try t.expectEqual(@as(u32, 4096), filledMaxTokens(&qwen));
 }
 
-test "describeMaxTokens: an omitted max_tokens logs as auto, never as the sentinel" {
+test "an omitted max_tokens with no flag and no model default is the engine's 32768, never the rest of the window" {
+    const t = std.testing;
+    const slot = &@field(server_state.server_config, "default_max_tokens");
+    const orig = slot.*;
+    defer slot.* = orig;
+    slot.* = 0;
+    const qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp", .pinned_context = 1_000_000 };
+    try t.expectEqual(@as(u32, 0), qwen.defaultMaxTokens());
+    try t.expectEqual(@as(u32, 32768), filledMaxTokens(&qwen));
+    try t.expectEqual(@as(u32, 32768), resolveRequestMaxTokens(null, filledMaxTokens(&qwen)));
+    try t.expectEqual(@as(u32, 32768), clampMaxTokens(filledMaxTokens(&qwen), false, 1500, 1_000_000));
+    try t.expectEqual(MaxTokensOrigin.engine_default, maxTokensOrigin(null, launchMaxTokensDefault(), qwen.defaultMaxTokens()));
+    var buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
+    try t.expectEqualStrings("32768 (engine default)", describeMaxTokens(&buf, filledMaxTokens(&qwen), .engine_default));
+}
+
+test "describeMaxTokens: a filled budget names its source, a client's number prints bare" {
     const t = std.testing;
     var buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
 
-    try t.expectEqualStrings("auto", describeMaxTokens(&buf, AUTO_MAX_TOKENS_SENTINEL, .auto));
-
-    // With an unknown context the auto budget is a finite 4096 that really caps generation.
-    try t.expectEqualStrings("auto (4096)", describeMaxTokens(&buf, 4096, .auto));
+    try t.expectEqualStrings("32768 (engine default)", describeMaxTokens(&buf, ENGINE_DEFAULT_MAX_TOKENS, .engine_default));
 
     // `--max-tokens N` filled an omitted field: the number is real, but it is
     // the operator's, not the client's, and the line says whose it is.
@@ -874,37 +836,26 @@ test "describeMaxTokens: an omitted max_tokens logs as auto, never as the sentin
 
     // Origin comes from the SAME inputs `resolveRequestMaxTokens` reads, so
     // the label can't disagree with the number beside it.
-    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(null, 0, 0));
-    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(.{ .integer = 0 }, 0, 0));
-    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(.{ .integer = -5 }, 0, 0));
-    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(.{ .string = "999" }, 0, 0));
+    try t.expectEqual(MaxTokensOrigin.engine_default, maxTokensOrigin(null, 0, 0));
+    try t.expectEqual(MaxTokensOrigin.engine_default, maxTokensOrigin(.{ .integer = 0 }, 0, 0));
+    try t.expectEqual(MaxTokensOrigin.engine_default, maxTokensOrigin(.{ .integer = -5 }, 0, 0));
+    try t.expectEqual(MaxTokensOrigin.engine_default, maxTokensOrigin(.{ .string = "999" }, 0, 0));
     try t.expectEqual(MaxTokensOrigin.launch_default, maxTokensOrigin(null, 65536, 0));
     try t.expectEqual(MaxTokensOrigin.launch_default, maxTokensOrigin(.{ .integer = 0 }, 65536, 0));
     // A sent field outranks the flag, so it is the CLIENT's number either way.
     try t.expectEqual(MaxTokensOrigin.client, maxTokensOrigin(.{ .integer = 128 }, 65536, 0));
     try t.expectEqual(MaxTokensOrigin.client, maxTokensOrigin(.{ .integer = 128 }, 0, 0));
 
-    try t.expectEqualStrings(
-        "1073741823 (launch default)",
-        describeMaxTokens(&buf, AUTO_MAX_TOKENS_SENTINEL, .launch_default),
-    );
+    // The widest value fits the buffer.
+    try t.expectEqualStrings("4294967295 (engine default)", describeMaxTokens(&buf, std.math.maxInt(u32), .engine_default));
 }
 
-test "the max_tokens squeeze warning is silent for the auto budget, loud for a real over-ask" {
+test "the max_tokens squeeze note fires when under a quarter of the budget remains" {
     const t = std.testing;
-
-    // A real over-ask: the client named a number and the window can't pay it.
-    // That is the warning's whole point (the tool-call truncation nudge).
+    // A real over-ask: the window can't pay the budget. That is the warning's whole point
+    // (the tool-call truncation nudge); a filled budget logs the same note at debug.
     try t.expect(maxTokensBudgetSqueezed(32768, 4000));
     try t.expect(!maxTokensBudgetSqueezed(32768, 30000));
-
-    // The sentinel is always > 4x whatever remains; there is nothing to be short of.
-    try t.expect(!maxTokensBudgetSqueezed(AUTO_MAX_TOKENS_SENTINEL, 4000));
-    try t.expect(!maxTokensBudgetSqueezed(AUTO_MAX_TOKENS_SENTINEL, 1));
-
-    try t.expect(autoBudgetWindowTight(4000, 32768));
-    try t.expect(!autoBudgetWindowTight(30000, 32768));
-    // A launch default is a real number and takes the real predicate.
     try t.expect(maxTokensBudgetSqueezed(65536, 4000));
 }
 
@@ -916,29 +867,21 @@ test "an omitted max_tokens reserves the LAUNCH default, not the whole window" {
     const seq: u64 = 400_000; // past RESERVE_MIN_TOKENS
     const chunk: u64 = 4096;
 
-    // No flag: the sentinel becomes the whole remaining window; only the headroom cap keeps that off the bill.
-    const no_flag = clampMaxTokens(omittedMaxTokensDefaultWith(@intCast(ctx), 0, 0), seq, @intCast(ctx));
-    try t.expectEqual(@as(u32, @intCast(ctx - seq)), no_flag);
-    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + chunk, KVCache.reservedTokens(seq, no_flag, chunk, ctx));
+    // No flag: the engine default, reserved whole.
+    const no_flag = clampMaxTokens(filledMaxTokensWith(0, 0), false, seq, @intCast(ctx));
+    try t.expectEqual(ENGINE_DEFAULT_MAX_TOKENS, no_flag);
+    try t.expectEqual(seq + ENGINE_DEFAULT_MAX_TOKENS + chunk, KVCache.reservedTokens(seq, no_flag, chunk, ctx));
 
-    // Flag set below the headroom: the reservation is prompt + the flag.
-    const flagged = clampMaxTokens(omittedMaxTokensDefaultWith(@intCast(ctx), 2048, 0), seq, @intCast(ctx));
+    // A flag: the reservation is prompt + the flag.
+    const flagged = clampMaxTokens(filledMaxTokensWith(2048, 0), false, seq, @intCast(ctx));
     try t.expectEqual(@as(u32, 2048), flagged);
     try t.expectEqual(seq + 2048 + chunk, KVCache.reservedTokens(seq, flagged, chunk, ctx));
     try t.expect(KVCache.reservedTokens(seq, flagged, chunk, ctx) < KVCache.reservedTokens(seq, no_flag, chunk, ctx));
 
-    // A flag above the headroom bills only the headroom.
-    const big = clampMaxTokens(omittedMaxTokensDefaultWith(@intCast(ctx), 65536, 0), seq, @intCast(ctx));
+    // A large one is reserved whole too.
+    const big = clampMaxTokens(filledMaxTokensWith(65536, 0), false, seq, @intCast(ctx));
     try t.expectEqual(@as(u32, 65536), big);
-    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + chunk, KVCache.reservedTokens(seq, big, chunk, ctx));
-}
-
-test "clampMaxTokens no limit when ctx_size=0" {
-    const original = server_state.server_config.max_context_size;
-    defer server_state.server_config.max_context_size = original;
-    server_state.server_config.max_context_size = 0;
-
-    try testing.expectEqual(@as(u32, 1000), clampMaxTokens(1000, 500, 0));
+    try t.expectEqual(seq + 65536 + chunk, KVCache.reservedTokens(seq, big, chunk, ctx));
 }
 
 test "clampMaxTokens clamps when would exceed" {
@@ -947,7 +890,7 @@ test "clampMaxTokens clamps when would exceed" {
     server_state.server_config.max_context_size = 4096;
 
     // prompt=3000, max_tokens=2000 → clamp to 1096
-    try testing.expectEqual(@as(u32, 1096), clampMaxTokens(2000, 3000, 4096));
+    try testing.expectEqual(@as(u32, 1096), clampMaxTokens(2000, true, 3000, 4096));
 }
 
 test "clampMaxTokens no clamp when fits" {
@@ -956,7 +899,7 @@ test "clampMaxTokens no clamp when fits" {
     server_state.server_config.max_context_size = 4096;
 
     // prompt=100, max_tokens=200 → fits, no clamp
-    try testing.expectEqual(@as(u32, 200), clampMaxTokens(200, 100, 4096));
+    try testing.expectEqual(@as(u32, 200), clampMaxTokens(200, true, 100, 4096));
 }
 
 test "clampMaxTokens at boundary" {
@@ -965,9 +908,9 @@ test "clampMaxTokens at boundary" {
     server_state.server_config.max_context_size = 4096;
 
     // prompt=4096 → only 1 token allowed
-    try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, 4096, 4096));
+    try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, true, 4096, 4096));
     // prompt=4095 → only 1 token remaining
-    try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, 4095, 4096));
+    try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, true, 4095, 4096));
 }
 
 test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinking + budget" {

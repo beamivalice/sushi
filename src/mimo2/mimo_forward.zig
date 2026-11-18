@@ -636,12 +636,8 @@ pub fn forwardMoeWith(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) 
     var pclk: ProfClock = if (prof_on) ProfClock.init() else undefined;
 
     var h = try self.embedding(token_ids);
-    {
-        errdefer _ = mlx.mlx_array_free(h);
-
-        // Splice vision embeddings at image_token_id positions (prefill only)
-        h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
-    }
+    // Splice vision embeddings at image_token_id positions (prefill only)
+    h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
     if (ctx.capture_layers) |cl| if (cl.input) |slot| {
         _ = mlx.mlx_array_set(slot, h);
     };

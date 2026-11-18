@@ -102,8 +102,9 @@ check "context_length 4096 from the file (got $(row "$A" ctx))" "$(is "$(row "$A
 check "meta.kv_quant 4 from the file (got $(row "$A" kv))" "$(is "$(row "$A" kv)" 4)"
 check "kv_cache source model-settings.json (got $(row "$A" src))" "$(is "$(row "$A" src)" model-settings.json)"
 check "load log names the KV and ctx choices" "$(logline "\[kv-cache\] kv4 (model-settings.json); ctx 4096 (model-settings.json)")"
-check "load log: --no-mtp outranks mtp:true, acceptance from the file" "$(logline "\[mtp\] off (--no-mtp); acceptance typical (model-settings.json)")"
-check "load log: greedy tail from the file" "$(logline "acceptance typical (model-settings.json); greedy tail on (model-settings.json)")"
+check "load log: --no-mtp outranks mtp:true" "$(logline "\[mtp\] off (--no-mtp)")"
+check "load log names the removed mtp_acceptance key" "$(logline "mtp_acceptance is removed and ignored")"
+check "load log names the removed mtp_greedy_tail key" "$(logline "mtp_greedy_tail is removed and ignored")"
 check "/props settings.mtp.source --no-mtp (got $(props_mtp "$A" source))" "$(is "$(props_mtp "$A" source)" --no-mtp)"
 check "the loaded row carries its architecture" "$(models | python3 -c "
 import sys, json
@@ -125,7 +126,7 @@ check "--no-drafter survives a cold load: no DFlash probe line" "$(grep -q DFlas
 check "B keeps the kv8 default (got $(row "$B" kv))" "$(is "$(row "$B" kv)" 8)"
 check "B kv_cache source default (got $(row "$B" src))" "$(is "$(row "$B" src)" default)"
 check "cold-load log: kv8 default, ctx auto" "$(logline "\[kv-cache\] kv8 (default); ctx auto (default)")"
-check "cold-load log: --no-mtp, exact acceptance, greedy tail off" "$(logline "\[mtp\] off (--no-mtp); acceptance exact (default); greedy tail off (default)")"
+check "cold-load log: --no-mtp" "$(logline "\[mtp\] off (--no-mtp)")"
 check "/props settings.mtp.source --no-mtp for B (got $(props_mtp "$B" source))" "$(is "$(props_mtp "$B" source)" --no-mtp)"
 check "a chat on the cold-loaded id answers (200)" "$(is "$(chat "$B_ID")" 200)"
 
@@ -168,16 +169,15 @@ sushi_stop 0
 
 # ---------------------------------------------------------------- boot 2
 cat > "$WORK/settings.json" <<JSON
-{ "$A/": { "ctx_size": 4096, "kv_quant": "8", "mtp": false, "mtp_acceptance": "typical", "mtp_greedy_tail": false } }
+{ "$A/": { "ctx_size": 4096, "kv_quant": "8", "mtp": false } }
 JSON
 echo "== boot 2: explicit launch flags beside a file that disagrees"
 SUSHI_BOOT_SETTINGS="$WORK/settings.json" sushi_boot cold-2 "$A" --model-dir "$ROOT" --no-drafter --ctx-size 16384 --kv-quant 4 \
-    --mtp --mtp-tokenv3 0.9 --mtp-greedy-tail || exit $?
+    --mtp || exit $?
 check "--ctx-size 16384 outranks ctx_size 4096 (got $(row "$A" ctx))" "$(is "$(row "$A" ctx)" 16384)"
 check "--kv-quant 4 outranks kv_quant 8 (got $(row "$A" kv), source $(row "$A" src))" "$([ "$(row "$A" kv)" = 4 ] && [ "$(row "$A" src)" = --kv-quant ] && echo 1 || echo 0)"
 check "load log names the flags" "$(logline "\[kv-cache\] kv4 (--kv-quant); ctx 16384 (--ctx-size)")"
-check "--mtp outranks mtp:false, --mtp-tokenv3 outranks typical" "$(logline "\[mtp\] on (--mtp); acceptance tokenv3 (--mtp-tokenv3)")"
-check "--mtp-greedy-tail outranks mtp_greedy_tail:false" "$(logline "acceptance tokenv3 (--mtp-tokenv3); greedy tail on (--mtp-greedy-tail)")"
+check "--mtp outranks mtp:false" "$(logline "\[mtp\] on (--mtp)")"
 check "/props settings.mtp.source --mtp (got $(props_mtp "$A" source))" "$(is "$(props_mtp "$A" source)" --mtp)"
 A_ID=$(model_id "$A")
 B_ID=$(model_id "$B")

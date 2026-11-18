@@ -18,6 +18,7 @@ const model_mod = @import("../model.zig");
 const model_handle = @import("../model_handle.zig");
 const cooler_side = @import("../cooler_side.zig");
 const ModelConfig = model_mod.ModelConfig;
+const Trunk = @import("../trunk.zig").Trunk;
 
 /// A verify block's rows: every forward of a request is billed at no fewer.
 const verify_rows: u64 = @import("../sampler_draw.zig").max_rows;
@@ -41,11 +42,19 @@ fn ownCaps(config: *const ModelConfig) bool {
 }
 
 /// PURE: the bytes a forward of `rows` ending at `seq` is billed to add to the pool: its transient at no fewer rows than
-/// a verify block.
+/// a verify block, and where that transient is exact (`bills.coolerPrefillRowBytes`), the one margin a bill carries.
 pub fn forwardCap(config: *const ModelConfig, rows: u64, seq: u64) u64 {
     const kv = bills.configuredKvQuantFor(config);
     const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
-    return bills.prefillTransientReserveAtKv(config, kv_bits, @max(rows, verify_rows), seq);
+    const margin: u64 = if (bills.coolerPrefillRowBytes(config) > 0) bills.BILL_MARGIN_BYTES else 0;
+    return bills.prefillTransientReserveAtKv(config, kv_bits, @max(rows, verify_rows), seq) +| margin;
+}
+
+/// PURE: `forwardCap` of a forward that reads out every row through the head, which asks `readout` bytes
+/// (`Trunk.lmHeadReadoutBytes`) past the last layer. A served prefill chunk reads out none; a tool's (`sushi kld`, the
+/// decode meter) reads out its whole width.
+pub fn readoutCap(config: *const ModelConfig, rows: u64, seq: u64, readout: u64) u64 {
+    return forwardCap(config, rows, seq) +| bills.atTrunkRows(config, rows, readout);
 }
 
 /// PURE: the free buffers a request's end leaves the pool at most.
@@ -60,19 +69,34 @@ pub fn restCap(config: *const ModelConfig) u64 {
 /// A forward wider than a verify block ran since the last trim: the next narrow one trims its scratch.
 var after_wide = false;
 
-pub const Rows = struct { rows: u64, seq: u64 };
+/// `readout`: the head's bytes over a wide forward's rows when it reads them out (`readoutCap`), else 0.
+pub const Rows = struct {
+    rows: u64,
+    seq: u64,
+    readout: u64 = 0,
+
+    pub fn cap(r: Rows, config: *const ModelConfig) u64 {
+        return readoutCap(config, r.rows, r.seq, r.readout);
+    }
+};
 
 /// A forward of the model of `config` begins: its rows, and the position its last row ends at, read only when the
 /// shared seam acts on them or `want` asks (each read of a shape is a query of MLX's on an MLX load).
-pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.ForwardCtx, ids: mlx.mlx_array, want: bool) ?Rows {
+pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.ForwardCtx, ids: mlx.mlx_array, head: *const Trunk, want: bool) ?Rows {
     const seam = onEngine(config) and !ownCaps(config);
     if (!seam and !want) return null;
     const shape = mlx.getShape(ids);
     const rows: u64 = if (shape.len == 0) 1 else @intCast(shape[shape.len - 1]);
-    const at: Rows = .{ .rows = rows, .seq = @as(u64, ctx.cache.kvLenForBatching()) + rows };
+    var at: Rows = .{ .rows = rows, .seq = @as(u64, ctx.cache.kvLenForBatching()) + rows };
     if (!seam) return at;
     if (rows > verify_rows) {
+        if (!ctx.skip_lm_head) at.readout = head.lmHeadReadoutBytes(rows);
+        // A prefill chunk holds no more than its bill: under the cap the pool gives up its free buffers before it asks
+        // Metal for more. Uncapped, a 4096-row chunk of the Qwen cut kept ~2 GB of them on 2.9 GB in use, 1.4 GB past
+        // its bill. The next narrow forward, or the request's end, lifts it.
         after_wide = true;
+        mlx.engine.close();
+        install(at.cap(config));
         return at;
     }
     if (!after_wide) return at;
@@ -126,17 +150,21 @@ pub fn warmEnded() void {
 
 /// What a load on the engine of our own owes the engine while it reads its weights and builds its model, in one place
 /// for every arch: the engine on before the first weight is wrapped, every region the load makes wrapped as the
-/// engine's, and while the model builds the engine's scope held (to the unload, `arch_handle.destroy`), no cap of an
-/// earlier model's forward in force, and the seal of an earlier load lifted, standing again if this one fails.
+/// engine's, no cap of an earlier model's forward in force from its first weight, and while the model builds the
+/// engine's scope held (to the unload, `arch_handle.destroy`) and the seal of an earlier load lifted, standing again if
+/// this one fails.
 pub const LoadScope = struct {
     on: bool,
     held: bool = false,
     seal: ?mlx.engine.Seal = null,
 
-    /// The weights of `config` are read from here to `end`.
-    pub fn weights(config: *const ModelConfig) LoadScope {
+    /// The weights of `config` are read from here to `end`, under no cap of an earlier model's forward.
+    pub fn weights(config: *const ModelConfig) error{EngineBudget}!LoadScope {
         const on = cooler_side.onEngine(config);
-        if (on) mlx.engine.enable();
+        if (on) {
+            mlx.engine.enable();
+            mlx.engine.budget(std.math.maxInt(u64)) catch return error.EngineBudget;
+        }
         mlx.engine.own_weights = on;
         return .{ .on = on };
     }

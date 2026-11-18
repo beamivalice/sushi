@@ -8,14 +8,11 @@
 //! - `command`: a subcommand (`name`, `runs_gpu`, `help`, `run`);
 //! - `refusal(use)`: a launch flag this arch cannot act on;
 //! - `mtp_off_line`, `kvQuantRequestRefusal(kv)`, `kv_quant_choices` (the spellings its cache stores),
-//!   `settings_kv_quant_ignored`, `settingsMtpIgnoredLine(config)`: the arch's lines and refusals where it differs
-//!   from the shared rule;
+//!   `settings_kv_quant_ignored`: the arch's lines and refusals where it differs from the shared rule;
 //! - `serve` (`install`, `uninstall`) and `warm` (`bytes`, `total`): the MLX-side hooks `arch/serve.zig` reaches.
 const std = @import("std");
 const model = @import("../model.zig");
 const model_settings = @import("../model_settings.zig");
-const settings_resolve = @import("../settings_resolve.zig");
-const mtp_acceptance = @import("../mtp_acceptance.zig");
 const kv_quant = @import("../kv_quant.zig");
 const registry = @import("registry.zig");
 const arch_config = @import("config.zig");
@@ -29,9 +26,6 @@ pub const LaunchFlagUse = struct {
     mtp_head_kv_quant: bool = false,
     drop_expert: bool = false,
     ssd_prefetch: bool = false,
-    mtp_typical: bool = false,
-    mtp_tokenv3: bool = false,
-    mtp_greedy_tail: bool = false,
     /// `--drafter`: a DFlash2 assistant beside the model.
     drafter: bool = false,
     /// `--mtp-min-depth` / `--mtp-max-depth` as given; 0 = not given.
@@ -147,12 +141,9 @@ pub fn archFlagRefusal(config: *const model.ModelConfig, use: LaunchFlagUse) ?[]
     }
 }
 
-/// What a Cooler load serves, whatever its arch: drafts accepted by the exact rule only, and no DFlash2, which runs on
-/// MLX only. A flag that asks otherwise is refused by name, with the arch's own way back to MLX.
+/// What a Cooler load serves, whatever its arch: no DFlash2, which runs on MLX only. A flag that asks otherwise is
+/// refused by name, with the arch's own way back to MLX.
 const cooler_refused = [_]struct { field: []const u8, flag: []const u8, why: []const u8 }{
-    .{ .field = "mtp_typical", .flag = "--mtp-typical", .why = "drafts are accepted by the exact rule only" },
-    .{ .field = "mtp_tokenv3", .flag = "--mtp-tokenv3", .why = "drafts are accepted by the exact rule only" },
-    .{ .field = "mtp_greedy_tail", .flag = "--mtp-greedy-tail", .why = "drafts are accepted by the exact rule only" },
     .{ .field = "drafter", .flag = "--drafter", .why = "DFlash2 runs on MLX only" },
 };
 
@@ -185,23 +176,6 @@ pub fn coolerOffIgnoredLines(config: *const model.ModelConfig) [cooler_archs]?[]
         }
     }
     return out;
-}
-
-/// Whether the model accepts drafts by the exact rule only, with no MTP tail, whatever its settings say: a Cooler load.
-pub fn exactDraftsOnly(config: *const model.ModelConfig) bool {
-    return @import("../cooler_side.zig").onEngine(config);
-}
-
-/// The model's acceptance rule: its `mtp_acceptance` only where the key reaches it (`model_settings.applies`).
-pub fn mtpAcceptanceOf(config: *const model.ModelConfig) settings_resolve.Setting(mtp_acceptance.Mode) {
-    const reaches = model_settings.applies("mtp_acceptance", settingsFit(config));
-    return settings_resolve.acceptanceFor(if (reaches) config.mtp_acceptance_override else null);
-}
-
-/// The model's greedy tail: its `mtp_greedy_tail` only where the key reaches it.
-pub fn greedyTailOf(config: *const model.ModelConfig) settings_resolve.Setting(bool) {
-    const reaches = model_settings.applies("mtp_greedy_tail", settingsFit(config));
-    return settings_resolve.greedyTailFor(if (reaches) config.mtp_greedy_tail_override else null);
 }
 
 /// The model setting that turns the model's arch off Sushi Cooler; null for an arch without the engine.
@@ -256,7 +230,6 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .context_cap = config.contextCap(),
         .reads_yarn = arch_config.fact(config, "reads_yarn"),
         .cooler_setting = coolerSettingName(config),
-        .exact_drafts_only = exactDraftsOnly(config),
     };
 }
 
@@ -292,16 +265,6 @@ pub fn settingsKvQuantIgnoredLine(config: *const model.ModelConfig) ?[]const u8 
     switch (tag) {
         inline else => |t| return if (comptime hasDecl(t, "settings_kv_quant_ignored")) flagsOf(t).settings_kv_quant_ignored else null,
     }
-}
-
-/// A model-settings.json `mtp_acceptance` or `mtp_greedy_tail` where no MTP head runs is ignored with this one line, as `kv_quant` is.
-pub fn settingsMtpIgnoredLine(config: *const model.ModelConfig) ?[]const u8 {
-    if (model_settings.applies("mtp_acceptance", settingsFit(config))) return null;
-    if (arch_config.tagOf(config)) |tag| switch (tag) {
-        inline else => |t| if (comptime hasDecl(t, "settingsMtpIgnoredLine")) return flagsOf(t).settingsMtpIgnoredLine(config),
-    };
-    if (config.mtp_acceptance_override != null or config.mtp_greedy_tail_override != null) return "model-settings.json mtp_acceptance and mtp_greedy_tail are ignored: this load runs no MTP head";
-    return null;
 }
 
 /// The boot line saying the arch serves no MTP head at all; null where it may.
@@ -434,15 +397,12 @@ test "deepseek_v41 refuses the launch flags it cannot act on, and ignores a mode
     var dsv41 = model.ModelConfig{ .model_type = "deepseek_v41" };
     const qwen4 = model.ModelConfig{ .model_type = "qwen4_exp" };
     try testing.expect(archFlagRefusal(&dsv41, .{}) == null);
-    const all = LaunchFlagUse{ .kv_quant = true, .qwen_gdn_16 = true, .mtp_head_kv_quant = true, .mtp_typical = true, .mtp_tokenv3 = true, .mtp_greedy_tail = true };
+    const all = LaunchFlagUse{ .kv_quant = true, .qwen_gdn_16 = true, .mtp_head_kv_quant = true };
     try testing.expect(archFlagRefusal(&qwen4, all) == null);
     for ([_]struct { use: LaunchFlagUse, why: []const u8 }{
         .{ .use = .{ .kv_quant = true }, .why = "--kv-quant has no effect on deepseek_v41: its compressed state is stored as the QAT round trips left it, so there is no KV cache to quantize; drop the flag" },
         .{ .use = .{ .qwen_gdn_16 = true }, .why = "--qwen-gdn has no effect on deepseek_v41: it has no GatedDeltaNet layers; drop the flag" },
         .{ .use = .{ .mtp_head_kv_quant = true }, .why = "--mtp-head-kv-quant has no effect on deepseek_v41: its DSpark stages keep their own windows; drop the flag" },
-        .{ .use = .{ .mtp_typical = true }, .why = "--mtp-typical has no effect on deepseek_v41: DSpark accepts drafts by the exact rule only; drop the flag" },
-        .{ .use = .{ .mtp_tokenv3 = true }, .why = "--mtp-tokenv3 has no effect on deepseek_v41: DSpark accepts drafts by the exact rule only; drop the flag" },
-        .{ .use = .{ .mtp_greedy_tail = true }, .why = "--mtp-greedy-tail has no effect on deepseek_v41: DSpark drafts one block from the trunk's own state, with no MTP tail; drop the flag" },
     }) |c| {
         try testing.expectEqualStrings(c.why, archFlagRefusal(&dsv41, c.use) orelse return error.TestExpectedRefusal);
     }
@@ -450,29 +410,6 @@ test "deepseek_v41 refuses the launch flags it cannot act on, and ignores a mode
     dsv41.kv_quant_override = kv_quant.KVQuantConfig.affine(8);
     try testing.expectEqualStrings("model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)", settingsKvQuantIgnoredLine(&dsv41).?);
     try testing.expect(settingsKvQuantIgnoredLine(&qwen4) == null);
-}
-
-test "deepseek_v41 ignores a model-settings mtp_acceptance or mtp_greedy_tail with one line naming the keys set" {
-    if (!built("deepseek_v41")) return error.SkipZigTest;
-    var dsv41 = model.ModelConfig{ .model_type = "deepseek_v41" };
-    var qwen4 = model.ModelConfig{ .model_type = "qwen4_exp" };
-    try testing.expect(settingsMtpIgnoredLine(&dsv41) == null);
-    dsv41.mtp_acceptance_override = .{ .typical = .{ .delta = 0.3 } };
-    try testing.expectEqualStrings("model-settings.json mtp_acceptance is ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only)", settingsMtpIgnoredLine(&dsv41).?);
-    dsv41.mtp_acceptance_override = null;
-    dsv41.mtp_greedy_tail_override = true;
-    try testing.expectEqualStrings("model-settings.json mtp_greedy_tail is ignored on deepseek_v41 (DSpark has no MTP tail)", settingsMtpIgnoredLine(&dsv41).?);
-    dsv41.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
-    try testing.expectEqualStrings("model-settings.json mtp_acceptance and mtp_greedy_tail are ignored on deepseek_v41 (DSpark accepts drafts by the exact rule only, with no MTP tail)", settingsMtpIgnoredLine(&dsv41).?);
-    qwen4.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
-    qwen4.mtp_greedy_tail_override = true;
-    try testing.expect(settingsMtpIgnoredLine(&qwen4) == null);
-
-    if (!built("glm5_next")) return;
-    var glm = model.ModelConfig{ .model_type = "glm5_next" };
-    try testing.expect(settingsMtpIgnoredLine(&glm) == null);
-    glm.mtp_greedy_tail_override = true;
-    try testing.expectEqualStrings("model-settings.json mtp_acceptance and mtp_greedy_tail are ignored: this load runs no MTP head", settingsMtpIgnoredLine(&glm).?);
 }
 
 test "settingsFit: a latent-cache arch stores only the latent widths and serves no MTP head; the cap is the model's window" {
@@ -585,8 +522,11 @@ test "--qwen-mlx-engine takes no value and keeps Flash-Next loads on MLX; a mode
     try testing.expect(model_settings.applies("qwen_cooler", settingsFit(&qwen)));
     try testing.expect(!model_settings.applies("ds41_cooler", settingsFit(&qwen)));
     try testing.expectEqual(@as(?bool, false), coolerSettingOf(&qwen, .{ .qwen_cooler = false, .ds41_cooler = true }));
-    qwen.cooler_setting_stray = strayCoolerSetting(&qwen, .{ .qwen_cooler = false, .ds41_cooler = true });
-    try testing.expectEqualStrings("model-settings.json ds41_cooler is ignored: it turns Sushi Cooler off for deepseek_v41 only", settingsCoolerIgnoredLine(&qwen).?);
+    // DeepSeek's setting, stray on a Qwen load, is named only where DeepSeek is built.
+    if (built("deepseek_v41")) {
+        qwen.cooler_setting_stray = strayCoolerSetting(&qwen, .{ .qwen_cooler = false, .ds41_cooler = true });
+        try testing.expectEqualStrings("model-settings.json ds41_cooler is ignored: it turns Sushi Cooler off for deepseek_v41 only", settingsCoolerIgnoredLine(&qwen).?);
+    }
     for ([_][]const u8{ "deepseek_v41", "mimo_v2", "glm5_next" }) |arch| {
         if (!built(arch)) continue;
         var cfg = model.ModelConfig{ .model_type = arch };
@@ -601,18 +541,4 @@ test "--qwen-mlx-engine takes no value and keeps Flash-Next loads on MLX; a mode
         cfg.cooler_setting_stray = strayCoolerSetting(&cfg, .{ .qwen_cooler = false });
         try testing.expectEqualStrings("model-settings.json qwen_cooler is ignored: it turns Sushi Cooler off for qwen4_exp only", settingsCoolerIgnoredLine(&cfg).?);
     }
-}
-
-test "a Qwen load on Sushi Cooler accepts drafts by the exact rule whatever its settings say; on MLX its settings reach it" {
-    if (!built("qwen4_exp")) return error.SkipZigTest;
-    var c = model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .expert_quant_codebook = .spec1, .cooler_for_test = true };
-    c.mtp_acceptance_override = .{ .typical = .{ .delta = 0.1 } };
-    c.mtp_greedy_tail_override = true;
-    try testing.expect(!model_settings.applies("mtp_acceptance", settingsFit(&c)));
-    try testing.expectEqualStrings("On Sushi Cooler, drafts are accepted by the exact rule only, with no MTP tail.", model_settings.unavailable("mtp_greedy_tail", settingsFit(&c)).?);
-    try testing.expect(mtpAcceptanceOf(&c).value == .exact);
-    try testing.expect(!greedyTailOf(&c).value);
-    c.cooler_ask = .setting;
-    try testing.expect(mtpAcceptanceOf(&c).value == .typical);
-    try testing.expect(greedyTailOf(&c).value);
 }

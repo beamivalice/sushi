@@ -613,20 +613,14 @@ pub const KVCache = struct {
     /// Tokens of capacity a request reserves: prompt + allowed generation + one chunk of slack.
     /// The one definition; `server.reservedCacheTokens` delegates here.
     pub fn reservedTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {
-        // Short prompts keep the proportional policy: reserving costs them `max_tokens` of KV they may never use.
+        // Short prompts keep the proportional policy: their whole cache is still billed (`bills.cacheCapacityTokens`),
+        // but allocating `max_tokens` of KV up front costs every short request it.
         if (seq < RESERVE_MIN_TOKENS) return 0;
-        // An omitted `max_tokens` is maxInt(u32)/4 (~26 TB of KV), so bound by the context AND
-        // by the generation headroom: reserving `ctx - prompt` billed 13 GB at 383k on a
-        // 1M-context qwen4_exp. `ctx == 0` = unknown, no clamp.
-        const want: u64 = @min(max_tokens, RESERVE_GEN_HEADROOM);
-        const head_room: u64 = if (ctx > seq) @min(want, ctx - seq) else if (ctx > 0) 0 else want;
-        return seq +| head_room +| @max(chunk, 1);
+        // Every served request carries a concrete `max_tokens` and context (an omitted one is the engine default,
+        // 32768): the reservation is the request's whole cache, so its decode never grows it.
+        const generation: u64 = if (ctx > seq) @min(max_tokens, ctx - seq) else 0;
+        return seq +| generation +| @max(chunk, 1);
     }
-
-    /// Tokens of generation the reservation pre-buys. Past it a decode grow takes the ordinary
-    /// +25% policy, which happens between decode steps, never inside a chunk's lazy graph.
-    /// 8192 covers essentially every real request at ~100 MB of KV on qwen4_exp at 8-bit.
-    pub const RESERVE_GEN_HEADROOM: u64 = 8192;
 
     /// Prompt length at or above which a request reserves its capacity; below it the flat
     /// runtime floor already covers the transient.
@@ -677,6 +671,36 @@ pub const KVCache = struct {
             kv_cap_buf_grows += 1;
             try mlx.check(mlx.mlx_eval(vec));
             _ = mlx.mlx_clear_cache();
+        }
+    }
+
+    /// Grow every initialized, unshared, non-ringed layer whose next `rows` would pass its capacity, one layer per
+    /// eval, before a forward builds. Left to the forward, a decode step past the capacity grew every layer inside its
+    /// lazy graph, each old buffer alive beside its new one until the step ran: the whole cache twice, unbilled.
+    pub fn growAhead(self: *KVCache, rows: usize, s: mlx.mlx_stream) !void {
+        const n: usize = if (self.config.scheme == .off) 2 else 6;
+        for (self.entries) |*entry| {
+            if (!entry.initialized or entry.ringed or entry.shared_view) continue;
+            const cur_cap = bufferCapacity(entry.keys);
+            const needed = entry.offset + rows;
+            if (needed <= cur_cap) continue;
+            const new_cap: c_int = @intCast(self.growCapacityFor(entry, cur_cap, needed));
+            const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
+            for (views) |view| {
+                _ = mlx.mlx_array_free(view.*);
+                view.* = mlx.mlx_array_new();
+            }
+            const bufs = [_]*mlx.mlx_array{ &entry.keys, &entry.values, &entry.keys_scales, &entry.keys_biases, &entry.values_scales, &entry.values_biases };
+            // A buffer at a time, each evaluated and its old copy released before the next: kept as free buffers the
+            // old copies held the cache twice until a trim.
+            for (bufs[0..n]) |buf| {
+                const sh = mlx.getShape(buf.*);
+                try growQuantBuf(s, buf, true, entry.offset, new_cap, sh[0], sh[1], sh[3], mlx.mlx_array_dtype(buf.*));
+                try mlx.check(mlx.mlx_array_eval(buf.*));
+                // The engine's pool keeps a freed buffer as a free one, which MLX's cache clear never reaches.
+                if (mlx.engine.isStream(s)) mlx.engine.trim() else _ = mlx.mlx_clear_cache();
+            }
+            kv_cap_buf_grows += 1;
         }
     }
 
@@ -1227,26 +1251,27 @@ pub const KVCache = struct {
     fn growQuantBuf(s: mlx.mlx_stream, buf: *mlx.mlx_array, initialized: bool, offset: usize, new_cap: c_int, B: c_int, heads: c_int, last_dim: c_int, dtype: mlx.mlx_dtype) !void {
         const buf_shape = [_]c_int{ B, heads, new_cap, last_dim };
         if (initialized and offset > 0) {
-            var new_buf = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(new_buf);
-            try mlx.check(mlx.mlx_zeros(&new_buf, &buf_shape, 4, dtype, s));
+            // The kept rows, then a zero tail to the new capacity, joined into the one new buffer: a zeros buffer of
+            // the whole capacity written by slice_update held a second new-size buffer while the copy ran.
             const off_c: c_int = @intCast(offset);
             const su_start = [_]c_int{ 0, 0, 0, 0 };
             const su_stop = [_]c_int{ B, heads, off_c, last_dim };
             const su_strides = [_]c_int{ 1, 1, 1, 1 };
             var old_data = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(old_data);
+            defer _ = mlx.mlx_array_free(old_data);
             try mlx.check(mlx.mlx_slice(&old_data, buf.*, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
-            var updated = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(updated);
-            try mlx.check(mlx.mlx_slice_update(&updated, new_buf, old_data, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
-            _ = mlx.mlx_array_free(old_data);
-            old_data = .{ .ctx = null };
-            _ = mlx.mlx_array_free(new_buf);
-            new_buf = .{ .ctx = null };
+            const tail_shape = [_]c_int{ B, heads, new_cap - off_c, last_dim };
+            var tail = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(tail);
+            try mlx.check(mlx.mlx_zeros(&tail, &tail_shape, 4, dtype, s));
+            const parts = [_]mlx.mlx_array{ old_data, tail };
+            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var joined = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(joined);
+            try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 2, s));
             _ = mlx.mlx_array_free(buf.*);
-            buf.* = updated;
-            updated = .{ .ctx = null };
+            buf.* = joined;
         } else {
             var new_buf = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(new_buf);
@@ -3266,15 +3291,15 @@ test "KVCache dense update: a faulted op leaves no freed view handle in the entr
     try testing.expect(ops[0] >= 4 and ops[1] > ops[0]);
 }
 
-test "generation past the reserved headroom takes the +25% growth policy, never a mid-prefill grow" {
+test "a reservation holds the request's whole generation: neither its prefill nor its decode grows the cache" {
     const t = std.testing;
-    // The reservation is bounded at `RESERVE_GEN_HEADROOM` tokens of generation; past it the
-    // ordinary proportional policy grows between decode steps.
-    const reserve_headroom = KVCache.RESERVE_GEN_HEADROOM;
     const chunk: usize = 4096;
     const seq: usize = 40_000;
-    const reserved: usize = @intCast(KVCache.reservedTokens(seq, 1_000_000, chunk, 0));
-    try t.expectEqual(seq + reserve_headroom + chunk, reserved);
+    const max_tokens: usize = 32_768;
+    const reserved: usize = @intCast(KVCache.reservedTokens(seq, max_tokens, chunk, 1_048_576));
+    try t.expectEqual(seq + max_tokens + chunk, reserved);
+    // Bounded by the context's room past the prompt.
+    try t.expectEqual(seq + 1000 + chunk, KVCache.reservedTokens(seq, max_tokens, chunk, seq + 1000));
 
     const s_gpu = mlx.gpuStream();
     var cache = try KVCache.init(t.allocator, 1);
@@ -3283,8 +3308,7 @@ test "generation past the reserved headroom takes the +25% growth policy, never 
     var written: usize = 0;
     var allocs: usize = 0;
     var last_cap: usize = 0;
-    var cap_at_prefill_end: usize = 0;
-    const total: usize = reserved + reserve_headroom;
+    const total: usize = seq + max_tokens;
     while (written < total) {
         const n: c_int = @intCast(@min(chunk, total - written));
         var flat = mlx.mlx_array_new();
@@ -3303,14 +3327,11 @@ test "generation past the reserved headroom takes the +25% growth policy, never 
             last_cap = cap_now;
         }
         written += @intCast(n);
-        if (written <= seq) cap_at_prefill_end = last_cap;
     }
-    // The prefill never grew.
-    try t.expect(cap_at_prefill_end >= reserved);
+    // One allocation, at the reservation, and no grow after it.
+    try t.expectEqual(@as(usize, 1), allocs);
     try t.expectEqual(total, cache.entries[0].offset);
-    try t.expect(allocs >= 2);
-    try t.expectEqual(KVCache.nextCapacityPolicy(cap_at_prefill_end, cap_at_prefill_end + 1), cache.nextCapacityReserved(cap_at_prefill_end, cap_at_prefill_end + 1));
-    try t.expect(last_cap >= total);
+    try t.expect(last_cap >= reserved);
 }
 
 test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long prefill" {
@@ -3332,8 +3353,8 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     }
     try t.expect(grows > 20);
 
-    // Reserved: one allocation, driven through the real write path. ctx 0 = no context named.
-    const reserved: usize = @intCast(KVCache.reservedTokens(seq, 2048, chunk, 0));
+    // Reserved: one allocation, driven through the real write path, in a context with room for the reply.
+    const reserved: usize = @intCast(KVCache.reservedTokens(seq, 2048, chunk, 1 << 20));
     try t.expectEqual(seq + 2048 + chunk, reserved);
     var rcache = try KVCache.init(t.allocator, 1);
     defer rcache.deinit();

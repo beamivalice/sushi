@@ -1499,7 +1499,7 @@ test "DeepSeek live rollback: a cancelled request's record, published at the cul
     try testing.expectEqual(@as(?usize, null), try live.pick(net.m, &c_buf, false, std.math.maxInt(u32)));
 }
 
-test "DeepSeek SSD tier: the namespace names the layout, and another layout's entries are never read (DSV41_TINY)" {
+test "DeepSeek SSD tier: the namespace names the layout and another layout's entries are never read; with both tiers the RAM entry serves the active session and, once it is gone, the SSD entry does; under the engine's default KV scheme, which every slot cache carries, a commit restores after a restart (DSV41_TINY)" {
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const io = std.testing.io;
@@ -1586,99 +1586,76 @@ test "DeepSeek SSD tier: the namespace names the layout, and another layout's en
         const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, &target, &moe, net.m, s, &next_buf, false, 0, null, &.{}, 9, false);
         try testing.expectEqual(arm.want, res.matched);
     }
-}
 
-test "DeepSeek with both tiers: the RAM entry serves the active session and, once it is gone, the SSD entry does (DSV41_TINY)" {
-    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
-    try mlx.requireGpu();
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var first_buf: [600]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    var next_buf: [620]u32 = undefined;
-    @memcpy(next_buf[0..600], first);
-    for (next_buf[600..]) |*t| t.* = 91;
-
-    var hc = pc.HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.hybrid = true;
-    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "dsv41-both", 0, 128);
-    hc.disk.?.enableBackgroundWriter();
-    dsv41_model.resetState(net.m);
-    var cps: std.ArrayList(SSMCheckpoint) = .empty;
-    try net.prefill(first, &.{ 256, 256, 88 }, 0, &.{ 0, 1 }, &cps);
-    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    defer cache.deinit();
-    cache.step = first.len;
-    try dsv41_prefix.markRows(&cache, mlx.gpuStream());
-    try testing.expectEqual(pc.CommitStatus{ .ok = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
-    hc.flushPendingDisk(s);
-    hc.disk.?.drainWriter();
-    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-
-    const ram = try dsv41Lookup(&hc, &net, &next_buf);
-    try testing.expectEqual(@as(usize, 512), ram.matched);
-    try testing.expect(hc.last_restored_disk_id == null);
-    // Dropping the RAM entry leaves the disk copy, which restores the same point.
-    hc.evictAt(0, "test");
-    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
-    const disk = try dsv41Lookup(&hc, &net, &next_buf);
-    try testing.expectEqual(@as(usize, 512), disk.matched);
-    try testing.expect(hc.last_restored_disk_id != null);
-}
-
-test "DeepSeek SSD tier under the engine's default KV scheme, which every slot cache carries: commit, restart, restore (DSV41_TINY)" {
-    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
-    try mlx.requireGpu();
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var first_buf: [600]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    var next_buf: [620]u32 = undefined;
-    @memcpy(next_buf[0..600], first);
-    for (next_buf[600..]) |*t| t.* = 91;
-    const kv = kv_quant.KVQuantConfig.engine_default;
-    try testing.expect(kv.scheme != .off);
+    // Both tiers: the RAM entry serves first, the SSD entry once it is gone.
     {
-        var hc = try dsv41SsdOnlyCache(io, base, "dsv41-kv8");
+        var tmp_both = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp_both.cleanup();
+        var buf_both: [512]u8 = undefined;
+        const base_both = buf_both[0..try tmp_both.dir.realPath(io, &buf_both)];
+        var hc = pc.HotPrefixCache.initWithMem(testing.allocator, 4, 0);
         defer hc.deinit();
+        hc.hybrid = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base_both, "dsv41-both", 0, 128);
+        hc.disk.?.enableBackgroundWriter();
         dsv41_model.resetState(net.m);
         var cps: std.ArrayList(SSMCheckpoint) = .empty;
         try net.prefill(first, &.{ 256, 256, 88 }, 0, &.{ 0, 1 }, &cps);
-        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv);
+        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
         defer cache.deinit();
         cache.step = first.len;
         try dsv41_prefix.markRows(&cache, mlx.gpuStream());
-        try testing.expectEqual(pc.CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
+        try testing.expectEqual(pc.CommitStatus{ .ok = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
         try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
         try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+
+        const ram = try dsv41Lookup(&hc, &net, &next_buf);
+        try testing.expectEqual(@as(usize, 512), ram.matched);
+        try testing.expect(hc.last_restored_disk_id == null);
+        // Dropping the RAM entry leaves the disk copy, which restores the same point.
+        hc.evictAt(0, "test");
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+        const disk = try dsv41Lookup(&hc, &net, &next_buf);
+        try testing.expectEqual(@as(usize, 512), disk.matched);
+        try testing.expect(hc.last_restored_disk_id != null);
     }
-    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-kv8");
-    defer hc.deinit();
-    dsv41_model.resetState(net.m);
-    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv);
-    defer target.deinit();
-    var moe: usize = 0;
-    const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, &target, &moe, net.m, s, &next_buf, false, 0, null, &.{}, 9, false);
-    try testing.expectEqual(@as(usize, 512), res.matched);
-    try testing.expectEqual(@as(usize, 512), (try dsv41_model.ensureState(net.m)).n);
+
+    // The engine's default KV scheme, which every slot cache carries: commit, restart, restore.
+    {
+        var tmp_kv = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp_kv.cleanup();
+        var buf_kv: [512]u8 = undefined;
+        const base_kv = buf_kv[0..try tmp_kv.dir.realPath(io, &buf_kv)];
+        const kv = kv_quant.KVQuantConfig.engine_default;
+        try testing.expect(kv.scheme != .off);
+        {
+            var hc = try dsv41SsdOnlyCache(io, base_kv, "dsv41-kv8");
+            defer hc.deinit();
+            dsv41_model.resetState(net.m);
+            var cps: std.ArrayList(SSMCheckpoint) = .empty;
+            try net.prefill(first, &.{ 256, 256, 88 }, 0, &.{ 0, 1 }, &cps);
+            var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv);
+            defer cache.deinit();
+            cache.step = first.len;
+            try dsv41_prefix.markRows(&cache, mlx.gpuStream());
+            try testing.expectEqual(pc.CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
+            hc.flushPendingDisk(s);
+            hc.disk.?.drainWriter();
+            try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+            try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        }
+        var hc = try dsv41SsdOnlyCache(io, base_kv, "dsv41-kv8");
+        defer hc.deinit();
+        dsv41_model.resetState(net.m);
+        var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv);
+        defer target.deinit();
+        var moe: usize = 0;
+        const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, &target, &moe, net.m, s, &next_buf, false, 0, null, &.{}, 9, false);
+        try testing.expectEqual(@as(usize, 512), res.matched);
+        try testing.expectEqual(@as(usize, 512), (try dsv41_model.ensureState(net.m)).n);
+    }
 }
 
 test "DeepSeek SSD tier: an image's restore points never land in, or come from, another same-size image's record (DSV41_TINY)" {

@@ -117,6 +117,11 @@ pub fn dsparkOn(config: *const Config) bool {
 }
 
 pub const load = @import("dsv41_load.zig");
+
+/// The pack's widest rate-grouped layer, which the forward cap's routing worst case reads.
+pub fn adoptLayout(config: *Config) void {
+    if (config.dsv41) |*c| c.rate_groups = config.expert_rate_groups;
+}
 pub const parseConfig = config_file.parseFamily;
 
 pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {

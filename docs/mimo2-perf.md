@@ -32,7 +32,8 @@ tok/s; tok/step = 1 + accepted drafts per round; stalls = rounds over twice the 
 - The stalls came with other agents' builds and fan changes on the box: a quiet box read 0 on every rung, both
   before the pool fix (typical-sampling boots below) and after it (64d9c341: 63.8 / 60.8 / 55.8 / 48.9 / 39.9 at
   4k / 8k / 32k / 64k / 128k, 0 stalls, 07:38).
-- Typical 0.2 at T=1.0, top_p 0.95, seed 7, two boots back to back after 3 min idle: `--mtp-greedy-tail` (90f8bf7f)
+- Typical 0.2 at T=1.0, top_p 0.95, seed 7, two boots back to back after 3 min idle (both flags since removed,
+  [flags](flags.md#removed)): `--mtp-greedy-tail` (90f8bf7f)
   vs without (3d11b0f7) decodes +15.1 / +12.6 / +13.2% at 16k / 32k / 64k (tok/step 3.51 / 3.51 / 3.12 vs
   2.78 / 2.72 / 2.69), with GPU clocks within 1-5% and prefill within 1-8%; at 4k / 8k the clocks differed 14-19%.
 

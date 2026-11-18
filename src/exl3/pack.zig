@@ -170,17 +170,47 @@ pub fn tileOrderOfMap(map: std.json.ObjectMap) !format.TileOrder {
     return if (seen_major) .pair_major else .pack;
 }
 
-pub fn tileOrderOfDir(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !format.TileOrder {
+const WeightMap = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    map: std.json.ObjectMap,
+};
+
+fn readWeightMap(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !WeightMap {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
     defer dir.close(io);
     const raw = try dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(64 * 1024 * 1024));
     defer allocator.free(raw);
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return error.InvalidSafetensorsIndex;
-    defer parsed.deinit();
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .allocate = .alloc_always }) catch return error.InvalidSafetensorsIndex;
+    errdefer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSafetensorsIndex;
     const map = parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
     if (map != .object) return error.InvalidSafetensorsIndex;
-    return tileOrderOfMap(map.object);
+    return .{ .parsed = parsed, .map = map.object };
+}
+
+pub fn tileOrderOfDir(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !format.TileOrder {
+    const index = try readWeightMap(allocator, io, model_dir);
+    defer index.parsed.deinit();
+    return tileOrderOfMap(index.map);
+}
+
+/// The most rate groups one layer's routed experts span: a layer's groups are `g0` to `g<count - 1>`. 1 when no layer
+/// is grouped.
+pub fn widestRateGroupsOfMap(map: std.json.ObjectMap) u8 {
+    const marker = ".mlp.switch_mlp.";
+    var widest: u32 = 1;
+    for (map.keys()) |key| {
+        const at = std.mem.indexOf(u8, key, marker) orelse continue;
+        const name = gl.Name.parse(key[at + marker.len ..]) catch continue;
+        if (name.grouped) widest = @max(widest, name.group + 1);
+    }
+    return @intCast(widest);
+}
+
+pub fn widestRateGroupsOfDir(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !u8 {
+    const index = try readWeightMap(allocator, io, model_dir);
+    defer index.parsed.deinit();
+    return widestRateGroupsOfMap(index.map);
 }
 
 pub const rate_group_limit = gl.max_groups;
@@ -365,4 +395,20 @@ test "sushi coder index recognizes grouped qwen4 and mimo layouts" {
         try t.expect(exl3BankComplete(map, prefix, 0, 2));
         try t.expect(hasAnyExl3Key(map, 2));
     }
+}
+
+test "a pack's widest rate-grouped layer is the most groups any one layer spans, and an ungrouped pack spans one" {
+    const t = std.testing;
+    var map: std.json.ObjectMap = .empty;
+    defer {
+        for (map.keys()) |key| t.allocator.free(key);
+        map.deinit(t.allocator);
+    }
+    try map.put(t.allocator, try t.allocator.dupe(u8, "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight"), .{ .string = "a" });
+    try t.expectEqual(@as(u8, 1), widestRateGroupsOfMap(map));
+    for ([_]u32{ 3, 11 }, 0..) |count, layer| for (0..count) |g| {
+        const key = try std.fmt.allocPrint(t.allocator, "language_model.model.layers.{d}.mlp.switch_mlp.down_proj.g{d}.trellis", .{ layer + 1, g });
+        try map.put(t.allocator, key, .{ .string = "a" });
+    };
+    try t.expectEqual(@as(u8, 11), widestRateGroupsOfMap(map));
 }

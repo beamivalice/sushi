@@ -119,9 +119,14 @@ test "a streamed DeepSeek load bills its union workspace and MLX pool and no fil
 /// DeepSeek's decode state outside the slot request: the state the model parks between requests (a running request's
 /// is billed as its slot request's, `sched.requestBytes`), and the live restore points the record keeps.
 pub fn dsv41StateBytes(s: *const Slot) u64 {
-    const dsv = arch_handle.trunk(s.model.handle orelse return 0).arch_state.dsv41.model orelse return 0;
+    return dsv41ModelStateBytes(s.model);
+}
+
+/// `dsv41StateBytes` of the model alone, with no request on it: what it keeps for the next one.
+pub fn dsv41ModelStateBytes(entry: *model_registry_mod.LoadedModel) u64 {
+    const dsv = arch_handle.trunk(entry.handle orelse return 0).arch_state.dsv41.model orelse return 0;
     var bytes: u64 = if (dsv.dec_state) |*st| @import("dsv41_model.zig").stateBytes(st) else 0;
-    if (s.model.prefix_cache) |*hc| bytes += dsv41_prefix.liveBytes(hc);
+    if (entry.prefix_cache) |*hc| bytes += dsv41_prefix.liveBytes(hc);
     return bytes;
 }
 
@@ -281,6 +286,7 @@ test "a cancelled DeepSeek slot commits when it is culled and not again at the c
     };
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     var sch: Scheduler = undefined;
+    sch.current_model = null;
     var model: model_registry_mod.LoadedModel = undefined;
     var xfm = testTrunk("deepseek_v41");
     xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
@@ -309,6 +315,7 @@ test "a finished DeepSeek slot is not committed again by the cull" {
     };
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     var sch: Scheduler = undefined;
+    sch.current_model = null;
     var model: model_registry_mod.LoadedModel = undefined;
     var xfm = testTrunk("deepseek_v41");
     xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
@@ -383,4 +390,50 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     try testing.expect(rows_and_windows > 0);
     try testing.expect(dsv41_prefix.liveOf(hc).bytes() > 0);
     try testing.expectEqual(rows_and_windows + dsv41_prefix.liveOf(hc).bytes(), slotStateBytes(&slot));
+}
+
+test "with no request on it, a DeepSeek model's parked rows, windows and live points stay in the live KV bill (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = try dsv41_model.fixtureDir();
+    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try dsv41_model.tokens(&sc, &fx);
+    defer a.free(ids);
+    const m = try dsv41_model.tinyModel(dir, .{ .act = .bfloat16, .dspark = true }, mlx.gpuStream());
+    defer m.deinit();
+    _ = mlx.mlx_array_free(try dsv41_model.extend(m, ids[0..40], .last));
+
+    var xfm = testTrunk("deepseek_v41");
+    xfm.arch_state.dsv41.model = m;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.config = &xfm.config;
+    model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(a, 2);
+    defer model.prefix_cache.?.deinit();
+    model.handle = arch_handle.fixtureHandle(&xfm);
+    const hc = &model.prefix_cache.?;
+    var cp = try dsv41_prefix.capture(a, m, 40);
+    defer cp.deinit(a);
+    try dsv41_prefix.liveOf(hc).keep(a, m, &cp, null);
+
+    // The request ended: its slot is culled, and the model keeps its state for the next one.
+    var sch: Scheduler = undefined;
+    sch.allocator = a;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.metrics = null;
+    sch.live_session_count = 0;
+    sch.decoding = .empty;
+    sch.resident_live_kv_bytes = .init(0);
+    sch.current_model = &model;
+    cullDecodingWith(&sch, struct {
+        fn commit(_: *Scheduler, _: *Slot) void {}
+    }.commit);
+
+    const kept = dsv41_model.stateBytes(&m.dec_state.?) + dsv41_prefix.liveOf(hc).bytes();
+    try testing.expect(kept > 0);
+    try testing.expectEqual(kept, sch.resident_live_kv_bytes.load(.monotonic));
 }

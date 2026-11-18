@@ -20,6 +20,16 @@ pub fn dropAll(side: u1) void {
     while (at) |node| : (at = node.next) node.drop(node, side);
 }
 
+fn unenroll(node: *Node) void {
+    if (!node.enrolled) return;
+    var at = &enrolled;
+    while (at.*) |n| : (at = &n.next) if (n == node) {
+        at.* = node.next;
+        node.* = .{ .drop = node.drop };
+        return;
+    };
+}
+
 /// Up to `n` arrays a side, by `K`; when a side is full the least recently used goes. A handle from the cache is the
 /// cache's: valid until its side drops or `n` other keys are put after it, never freed by the caller.
 pub fn SideCache(comptime K: type, comptime n: usize) type {
@@ -76,6 +86,14 @@ pub fn SideCache(comptime K: type, comptime n: usize) type {
             self.len[side] = 0;
         }
 
+        /// A cache that does not live for the process (a test's) frees both sides and leaves the enrolled list, which
+        /// would otherwise point into its dead frame.
+        pub fn deinit(self: *Self) void {
+            self.drop(0);
+            self.drop(1);
+            unenroll(&self.node);
+        }
+
         fn dropNode(node: *Node, side: u1) void {
             const self: *Self = @fieldParentPtr("node", node);
             self.drop(side);
@@ -95,7 +113,7 @@ const testing = std.testing;
 
 test "a side cache refuses an empty handle and keeps nothing, and keeps a made one for its side alone" {
     var c: SideCache(u8, 2) = .{};
-    defer c.drop(0);
+    defer c.deinit();
     try testing.expectError(error.HostArrayRefused, c.put(0, 1, .{}));
     try testing.expect(c.get(0, 1) == null);
     const a = try c.put(0, 1, mlx.mlx_array_new_int(7));
@@ -105,7 +123,7 @@ test "a side cache refuses an empty handle and keeps nothing, and keeps a made o
 
 test "a full side gives up its least recently used array, and a key put again replaces its array" {
     var c: SideCache(u8, 2) = .{};
-    defer c.drop(0);
+    defer c.deinit();
     _ = try c.put(0, 1, mlx.mlx_array_new_int(1));
     _ = try c.put(0, 2, mlx.mlx_array_new_int(2));
     _ = c.get(0, 1);
@@ -122,7 +140,8 @@ test "dropAll frees a side in every cache that kept an array, and leaves the oth
         var a: SideCache(u8, 1) = .{};
         var b: SideCache(u8, 1) = .{};
     };
-    defer S.a.drop(1);
+    defer S.a.deinit();
+    defer S.b.deinit();
     _ = try S.a.put(0, 1, mlx.mlx_array_new_int(1));
     _ = try S.a.put(1, 1, mlx.mlx_array_new_int(2));
     _ = try S.b.put(0, 1, mlx.mlx_array_new_int(3));
@@ -134,7 +153,7 @@ test "dropAll frees a side in every cache that kept an array, and leaves the oth
 
 test "a full side never gives up the two arrays a call just took: a kernel holds its K and N scalars together" {
     var c: SideCache(c_int, 4) = .{};
-    defer c.drop(0);
+    defer c.deinit();
     for (0..4) |i| _ = try c.put(0, @intCast(i), mlx.mlx_array_new_int(@intCast(i)));
     var v: c_int = 100;
     for (0..40) |_| {
@@ -144,4 +163,24 @@ test "a full side never gives up the two arrays a call just took: a kernel holds
         try testing.expectEqual(n.ctx, c.get(0, v + 1).?.ctx);
         v += 2;
     }
+}
+
+fn enrolledCount() usize {
+    var n: usize = 0;
+    var at = enrolled;
+    while (at) |node| : (at = node.next) n += 1;
+    return n;
+}
+
+test "a cache that goes leaves the enrolled list, so dropAll never reaches a cache past its scope" {
+    const before = enrolledCount();
+    {
+        var c: SideCache(u8, 1) = .{};
+        defer c.deinit();
+        _ = try c.put(0, 1, mlx.mlx_array_new_int(1));
+        _ = try c.put(1, 1, mlx.mlx_array_new_int(2));
+        try testing.expectEqual(before + 1, enrolledCount());
+    }
+    try testing.expectEqual(before, enrolledCount());
+    dropAll(0);
 }

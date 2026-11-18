@@ -472,31 +472,19 @@ fn denseVerifyReplay(xfm: *Trunk, slot: *Qwen4TestSlot, tokens: []const i32, io:
     return .{ .logits = logits, .last = last, .all = all, .ns = watch.read() };
 }
 
-fn qwen4LayerIdentityCase(capture_layers: bool, capture_hidden: bool, width: c_int, prefix: usize, row_index: c_int) !void {
-    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    try mlx.requireGpu();
+/// One verify against serial ticks on a fresh pair of slots of `xfm`: the slots' state is the case's own.
+fn qwen4LayerIdentityCase(xfm: *Trunk, layers: u32, capture_layers: bool, capture_hidden: bool, width: c_int, prefix: usize, row_index: c_int) !void {
     const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
     const s = mlx.gpuStream();
-    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
-    defer if (config.ngram_table_path) |path| a.free(path);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    qwen4_forward.compileQwen4Hc(&xfm);
-    qwen4_forward.compileGdnGate(&xfm);
-    xfm.compileMoeRouting();
-    const serial = try Qwen4TestSlot.init(a, config.num_hidden_layers);
+    const serial = try Qwen4TestSlot.init(a, layers);
     defer serial.deinit(a);
-    const verify = try Qwen4TestSlot.init(a, config.num_hidden_layers);
+    const verify = try Qwen4TestSlot.init(a, layers);
     defer verify.deinit(a);
     const prompt = [_]i32{ 248045, 846, 198, 7734, 264, 2716, 3255, 883, 264, 11952, 6618, 310, 5984, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271 };
     const history = [_]i32{ 4413, 220, 22, 18, 19, 11, 852, 14459, 310, 381, 2512, 328, 57517, 1288, 1467, 524, 3418, 3069, 279, 12313, 36811, 948, 781, 6749, 506, 279, 41564, 13, 1946, 28970, 11, 264 };
     for ([_]*Qwen4TestSlot{ serial, verify }) |slot| {
-        try slot.cache.reinit(config.num_hidden_layers, KVQuantConfig.affine(8));
-        try qwen4ReplayPrompt(&xfm, slot, &prompt);
+        try slot.cache.reinit(layers, KVQuantConfig.affine(8));
+        try qwen4ReplayPrompt(xfm, slot, &prompt);
         var begin: usize = 0;
         while (begin < prefix) {
             const stop = @min(prefix, begin + if (slot == serial) @as(usize, 1) else @as(usize, @intCast(width)));
@@ -508,15 +496,15 @@ fn qwen4LayerIdentityCase(capture_layers: bool, capture_hidden: bool, width: c_i
             defer _ = mlx.mlx_array_free(all);
             slot.ctx.lazy_ids = slot == verify;
             slot.ctx.capture_ssm_seq = slot == verify;
-            const out = if (slot == serial) try slot.forward(&xfm, history[begin..stop]) else try xfm.forwardWithCaptureAll(&slot.ctx, ids, &hidden, &all);
+            const out = if (slot == serial) try slot.forward(xfm, history[begin..stop]) else try xfm.forwardWithCaptureAll(&slot.ctx, ids, &hidden, &all);
             defer _ = mlx.mlx_array_free(out);
-            try qwen4_hc.flushDeferredPle(&xfm, &slot.ctx);
+            try qwen4_hc.flushDeferredPle(xfm, &slot.ctx);
             try mlx.check(mlx.mlx_array_eval(out));
             for (slot.entries) |*entry| ssmFreeSpecCapture(entry);
             begin = stop;
         }
     }
-    const layer_ids = try a.alloc(u32, config.num_hidden_layers);
+    const layer_ids = try a.alloc(u32, layers);
     defer a.free(layer_ids);
     const sa = try a.alloc(mlx.mlx_array, layer_ids.len);
     defer a.free(sa);
@@ -542,13 +530,13 @@ fn qwen4LayerIdentityCase(capture_layers: bool, capture_hidden: bool, width: c_i
     var vt = qwen4_forward.Qwen4Trace{};
     defer vt.deinit();
     for (history[prefix..][0..@intCast(row_index)]) |token| {
-        const out = try serial.forward(&xfm, &.{token});
+        const out = try serial.forward(xfm, &.{token});
         defer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_eval(out));
     }
     qwen4_forward.qwen4_trace = &st;
     defer qwen4_forward.qwen4_trace = null;
-    const sr = try serial.forward(&xfm, &.{history[prefix + @as(usize, @intCast(row_index))]});
+    const sr = try serial.forward(xfm, &.{history[prefix + @as(usize, @intCast(row_index))]});
     defer _ = mlx.mlx_array_free(sr);
     try mlx.check(mlx.mlx_array_eval(sr));
     qwen4_forward.qwen4_trace = &vt;
@@ -561,9 +549,9 @@ fn qwen4LayerIdentityCase(capture_layers: bool, capture_hidden: bool, width: c_i
     const tokens = history[prefix..][0..@intCast(width)];
     const ids = mlx.mlx_array_new_data(tokens.ptr, &[_]c_int{ 1, width }, 2, .int32);
     defer _ = mlx.mlx_array_free(ids);
-    const vr = if (capture_hidden) try xfm.forwardWithCaptureAll(&verify.ctx, ids, &hidden, &all) else try verify.forward(&xfm, tokens);
+    const vr = if (capture_hidden) try xfm.forwardWithCaptureAll(&verify.ctx, ids, &hidden, &all) else try verify.forward(xfm, tokens);
     defer _ = mlx.mlx_array_free(vr);
-    try qwen4_hc.flushDeferredPle(&xfm, &verify.ctx);
+    try qwen4_hc.flushDeferredPle(xfm, &verify.ctx);
     try mlx.check(mlx.mlx_array_eval(vr));
     var mismatch = false;
     inline for (.{ "mixed_attn", "inj_attn", "attn_out", "mixed_mlp", "inj_mlp", "mlp_out", "ple_emb", "ple_out", "attn3_input", "q3_raw", "k3_raw", "v3_raw", "gate3", "attn3_out" }) |name| {
@@ -1883,12 +1871,13 @@ test "qwen4 grow to the reservation before the prefill keeps greedy logits bit-i
         if (e.initialized and !e.ringed) try testing.expect(KVCache.bufferCapacity(e.keys) >= 1024);
     }
 
-    var chunk: [40]i32 = undefined;
+    // A chunk to 248 rows, inside the lazy slot's 256, then decode steps past them: the lazy slot grows at step 9.
+    var chunk: [240]i32 = undefined;
     for (&chunk, 0..) |*r, i| r.* = @intCast(3 + (i * 37) % 900);
     var ids: []const i32 = &chunk;
     var next: [1]i32 = undefined;
     var step: usize = 0;
-    while (step < 220) : (step += 1) {
+    while (step < 17) : (step += 1) {
         const g = try grown.forward(&xfm, ids);
         defer _ = mlx.mlx_array_free(g);
         const l = try lazy.forward(&xfm, ids);
@@ -1951,7 +1940,8 @@ test "qwen4 MTP verify token values equal serial ticks without near-tie acquitta
             expected[row] = top.id;
             gaps[row] = top.gap;
         }
-        for (2..9) |width| {
+        // The narrowest group, an odd middle one and the widest.
+        for ([_]usize{ 2, 5, 8 }) |width| {
             const verify = try Qwen4TestSlot.init(a, config.num_hidden_layers);
             defer verify.deinit(a);
             try verify.cache.reinit(config.num_hidden_layers, kv);
@@ -3484,16 +3474,30 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     }
 }
 
-test "qwen4 verify first-row layer identity (QWEN4_TEST_MODEL)" {
-    try qwen4LayerIdentityCase(true, false, 2, 0, 0);
-}
-
-test "qwen4 verify unflushed stream and recurrent state identity (QWEN4_TEST_MODEL)" {
-    try qwen4LayerIdentityCase(false, true, 2, 0, 0);
-}
-
-test "qwen4 verify history row and cache identity (QWEN4_TEST_MODEL)" {
-    try qwen4LayerIdentityCase(false, true, 8, 24, 1);
+test "qwen4 verify history row and cache identity, first-row layer identity, and unflushed stream and recurrent state identity (QWEN4_TEST_MODEL)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |path| a.free(path);
+    var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Trunk.init(io, a, config, &weights);
+    defer xfm.deinit();
+    qwen4_forward.compileQwen4Hc(&xfm);
+    qwen4_forward.compileGdnGate(&xfm);
+    xfm.compileMoeRouting();
+    const Case = struct { what: []const u8, capture_layers: bool, capture_hidden: bool, width: c_int, prefix: usize, row_index: c_int };
+    for ([_]Case{
+        .{ .what = "first-row layer identity", .capture_layers = true, .capture_hidden = false, .width = 2, .prefix = 0, .row_index = 0 },
+        .{ .what = "unflushed stream and recurrent state identity", .capture_layers = false, .capture_hidden = true, .width = 2, .prefix = 0, .row_index = 0 },
+        .{ .what = "history row and cache identity", .capture_layers = false, .capture_hidden = true, .width = 8, .prefix = 24, .row_index = 1 },
+    }) |c| {
+        errdefer std.debug.print("qwen4 verify {s}\n", .{c.what});
+        try qwen4LayerIdentityCase(&xfm, config.num_hidden_layers, c.capture_layers, c.capture_hidden, c.width, c.prefix, c.row_index);
+    }
 }
 
 test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {

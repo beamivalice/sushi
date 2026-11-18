@@ -1933,10 +1933,7 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
     // Vision rows splice into the `hidden`-wide embeddings BEFORE the
     // hyper-connection tile (the reference masked_scatters, then repeats).
     var emb = if (ctx.arch_ctx.qwen4.stream_in == null) try self.embedding(token_ids) else mlx.mlx_array_new();
-    if (ctx.arch_ctx.qwen4.stream_in == null) {
-        errdefer _ = mlx.mlx_array_free(emb);
-        emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
-    }
+    if (ctx.arch_ctx.qwen4.stream_in == null) emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
     defer _ = mlx.mlx_array_free(emb);
     const x_shape = if (ctx.arch_ctx.qwen4.stream_in == null) mlx.getShape(emb) else mlx.getShape(token_ids);
     const batch: c_int = x_shape[0];

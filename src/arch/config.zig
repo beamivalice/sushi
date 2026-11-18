@@ -261,7 +261,7 @@ pub fn parseDir(config: *model.ModelConfig, allocator: std.mem.Allocator, model_
     }
 }
 
-/// What the arch changes once the pack's expert layout is known.
+/// What the arch changes once the pack's expert layout and its rate groups are known.
 pub fn adoptLayout(config: *model.ModelConfig) void {
     const tag = tagOf(config) orelse return;
     switch (tag) {

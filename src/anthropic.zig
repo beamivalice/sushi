@@ -501,7 +501,7 @@ pub fn handleAnthropicMessages(
     defer spelled.deinit();
 
     var fault_buf: [384]u8 = undefined;
-    const field_fault = request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &.{"max_tokens"}, .stop = "stop_sequences" }) orelse
+    const field_fault = request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &.{"max_tokens"}, .stop = "stop_sequences", .min_p = false }) orelse
         if (root.get("tools")) |tv| request_parse.toolsFault(&fault_buf, tv, false) else null;
     if (field_fault) |reason| {
         log.warn("POST /v1/messages -> 400 ({s})\n", .{reason});
@@ -509,17 +509,9 @@ pub fn handleAnthropicMessages(
         return;
     }
 
-    // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
-    // value is an omission and the `--max-tokens` launch default reaches this surface too.
-    const req_max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), 0);
-    const max_tokens: u32 = if (req_max_tokens > 0) req_max_tokens else request_policy.filledMaxTokens(config);
-    // For the request log line only. This surface 400s on a missing budget, so
-    // the origin here is never `.auto`.
+    // The Anthropic API requires max_tokens; an omitted one takes the filled budget like every surface.
+    const max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), request_policy.filledMaxTokens(config));
     const max_tokens_origin = maxTokensOrigin(root.get("max_tokens"), launchMaxTokensDefault(), config.defaultMaxTokens());
-    if (max_tokens == 0) {
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "'max_tokens' is required and must be > 0", 400);
-        return;
-    }
 
     // Sampling parameters. Omitted fields resolve through CLI flags and the
     // model's generation_config.json — Claude Code omits ALL of them, and the
@@ -626,9 +618,8 @@ pub fn handleAnthropicMessages(
         return;
     }
 
-    // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
-    // omitted max_tokens is the maxInt(u32)/4 sentinel.
-    const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, prompt_ids.len, effective_ctx);
+    // Clamp max_tokens first: the memory guard bills the reserved generation headroom.
+    const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, max_tokens_origin == .client, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{}, 0);

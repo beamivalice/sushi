@@ -1742,12 +1742,18 @@ test "sushi_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape" 
     const bitss = [_]u32{ 3, 4, 8 };
     const ns = [_]c_int{ 2, 4, 8, 16 };
     const gs: u32 = 64;
-    for (bitss) |bits| {
-        for (shapes) |kn| {
-            const K = kn[0];
-            const Nout = kn[1];
-            const w_bf = try testRandWeightBf16(rnd, &[_]c_int{ Nout, K }, s);
-            defer _ = mlx.mlx_array_free(w_bf);
+    // Each weight is drawn once and quantized at every bits. The 248320-wide head (a 2.5 GB f32 draw) runs at 4 bits
+    // and the row ends only: its width is what it adds, the grid over output rows every bits shares, and the five
+    // narrower shapes hold every bits at every row count.
+    for (shapes) |kn| {
+        const K = kn[0];
+        const Nout = kn[1];
+        const head = Nout == 248320;
+        const w_bf = try testRandWeightBf16(rnd, &[_]c_int{ Nout, K }, s);
+        defer _ = mlx.mlx_array_free(w_bf);
+        try mlx.check(mlx.mlx_array_eval(w_bf));
+        for (bitss) |bits| {
+            if (head and bits != 4) continue;
             var qvec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(qvec);
             try mlx.check(mlx.mlx_quantize(&qvec, w_bf, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, s));
@@ -1761,6 +1767,7 @@ test "sushi_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape" 
             try mlx.check(mlx.mlx_vector_array_get(&sc, qvec, 1));
             try mlx.check(mlx.mlx_vector_array_get(&bi, qvec, 2));
             for (ns) |nrows| {
+                if (head and nrows != ns[0] and nrows != ns[ns.len - 1]) continue;
                 const x = try attn256RandBf16(rnd, &[_]c_int{ nrows, K }, s);
                 defer _ = mlx.mlx_array_free(x);
                 const got = (try msvQmvRows(s, x, w, sc, bi, bits, gs)) orelse {

@@ -250,6 +250,24 @@ pub fn batchedForward(
     };
 }
 
+/// Whether the arch runs joined decode rows outside a scheduler (`rowsForward`); one whose rows need a request's
+/// own state from the scheduler does not.
+pub fn hasRowsForward(xfm: *const Trunk) bool {
+    const tag = tagOfModel(xfm) orelse return false;
+    return switch (tag) {
+        inline else => |t| comptime has(t, "rowsForward"),
+    };
+}
+
+/// One forward of joined decode rows outside a scheduler (a Cooler load's served warm), as `batchedForward` runs
+/// them for `arm`, for an arch with `hasRowsForward`.
+pub fn rowsForward(xfm: *Trunk, next_tokens: []const u32, ctxs: []const *ForwardCtx, rope_offsets: []const u32, arm: BatchArm, hidden_rows: ?*?[]mlx.mlx_array) ![]mlx.mlx_array {
+    const tag = tagOfModel(xfm) orelse return error.NoBatchedKernel;
+    return switch (tag) {
+        inline else => |t| if (comptime has(t, "rowsForward")) S(t).rowsForward(xfm, next_tokens, ctxs, rope_offsets, arm, hidden_rows) else error.NoBatchedKernel,
+    };
+}
+
 /// Plain decode rows are priced by the grouped-MTP planner as they run (its cost table learns from them).
 pub fn plannerObservesPlainRows(xfm: *const Trunk) bool {
     const tag = tagOfModel(xfm) orelse return false;
@@ -318,6 +336,15 @@ pub fn modelStateBytes(slot: *const Slot) u64 {
     const tag = tagOfSlot(slot) orelse return 0;
     return switch (tag) {
         inline else => |t| if (comptime has(t, "modelStateBytes")) S(t).modelStateBytes(slot) else 0,
+    };
+}
+
+/// Bytes of the state a model keeps between requests for the next one to take over; a live slot of the model bills
+/// them as `modelStateBytes`.
+pub fn parkedStateBytes(entry: *model_registry.LoadedModel) u64 {
+    const tag = tagOfConfig(entry.config) orelse return 0;
+    return switch (tag) {
+        inline else => |t| if (comptime has(t, "parkedStateBytes")) S(t).parkedStateBytes(entry) else 0,
     };
 }
 
@@ -508,8 +535,8 @@ pub fn flushResident(entry: *model_registry.LoadedModel, why: []const u8) void {
 const known_hooks = [_][]const u8{
     "facts",           "batches",       "rowCap",         "modelBatches",             "padsBatch",       "batchArm",
     "readyToBatch",    "coolerRows",
-    "batchedForward",  "plannerObservesPlainRows",        "tickClass",                "mtpGroupable",    "initRequest",
-    "checkKvQuant",    "coldLoadBill",  "modelStateBytes",                          "commitsAtCull",
+    "batchedForward",  "rowsForward",   "plannerObservesPlainRows",        "tickClass",                "mtpGroupable",    "initRequest",
+    "checkKvQuant",    "coldLoadBill",  "modelStateBytes", "parkedStateBytes",      "commitsAtCull",
     "prepareCommit",   "publishLive",   "commitOwn",      "cancelledNeedsCheckpoints", "handoffHistory",  "mtpHeadCommit",
     "restoreTarget",   "restoreEnd",    "writeThrough",  "nativeDflashArmed",                          "thoughtGrid",     "armThoughtPoint",
     "afterSpecBlock",  "endRequest",    "resetForRetry",  "flushResident",

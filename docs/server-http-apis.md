@@ -105,9 +105,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - A prompt that tokenizes to zero tokens is a 400 `invalid_request_error` and never reaches generate: completions
   refuse it after tokenizing, `Scheduler.submit` refuses it for every surface (`error.EmptyPrompt`), and
   `Generator.initWithOptions` returns that error rather than index the prompt's last token.
-- `/v1/models` `meta.default_max_tokens`, `default_temperature`, `default_top_p` and `default_top_k` on a loaded model's row are what a request that omits the field gets (`--max-tokens` / the `max_tokens` setting / the architecture's own, 0 = the rest of the window; then a launch flag > `generation_config.json` > the hardcoded value, `request_policy.sampling*`); the chat page's placeholders read them.
+- `/v1/models` `meta.default_max_tokens`, `default_temperature`, `default_top_p` and `default_top_k` on a loaded model's row are what a request that omits the field gets (`max_tokens` as the next bullet resolves it, never 0; the sampling fields a launch flag > `generation_config.json` > the hardcoded value, `request_policy.sampling*`); the chat page's placeholders read them.
+- **An omitted `max_tokens` is always a concrete number** (`request_policy.filledMaxTokens`, read by chat, completions,
+  Messages, Responses, `/v1/models` and the load line): the client's positive `max_tokens` (or alias), else
+  `--max-tokens`, else the model's default (its `max_tokens` setting, else the architecture's: DeepSeek-V4.1 256,000),
+  else the engine default 32,768 (`ENGINE_DEFAULT_MAX_TOKENS`). Absent, null and 0 are an omission, on Messages too,
+  where the field is required; Responses with a JSON format and no budget takes `DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS`.
+  The request log names the source (`max_tokens=32768 (engine default)`); the window cut below still applies.
 - `/v1/models` `meta.pack_update` (`{"current":"1.0","latest":"2.0","command":"sushi pull deepseek-v4.1-flash","repo":"beamster/..."}`) is present on a loaded model's row only while Hugging Face publishes a higher `pack_revision` of its pack ([usage](usage.md#sushi-pull-and-sushi-list)); absent otherwise, offline, or under `--no-update-check`. The check (`pack_update.zig`) runs on its own thread after the load and then daily, never on the inference thread; `sushibar` and the Models tab show it. The tab never offers `sushi pull` for an update (it writes a second copy): its callout opens the Models tab's Available list at the row of `repo`, which updates in place.
-- `/v1/models` `meta.quantization` reports EXL3’s configured expert rate and dense width (e.g. `EXL3 3bpw experts, 8-bit dense`) for loaded and unloaded packs; affine labels remain `{bits}-bit`, and `/props` numeric quantization fields retain their dense-trunk meaning.
+- `/props` `settings.engine` is the side a loaded model's forwards run on (`sushi-cooler` or `mlx`); an unloaded model's
+  row names none, as its load decides.
+- `/v1/models` `meta.quantization` names the expert format, its configured rate and the trunk, from the pack's config, for loaded and unloaded packs: `EXL3 3bpw experts, 8-bit dense`, `STQ experts up to 5bpw, 6-bit STQ trunk` (an STQ `k` is the highest rate its rate-grouped layers hold); affine labels remain `{bits}-bit`, and `/props` numeric quantization fields retain their dense-trunk meaning.
 - Endpoint EXISTENCE never depends on model state and the 404 is answered BEFORE the model resolves (`ROUTE_PATHS`);
   a status route never reaches `ensureLoaded` (`handlePropsNoModel`). Removed upstream routes answer named 404s.
 - **Only an unknown NAME falls back to the default model** (SDK names like `gpt-4`); a PATH (`/…`, `~/…`, never
@@ -205,11 +213,12 @@ before reading a completed stream and requires clean EOF.
 ## Seeds, logprobs, sampling
 
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`sampler.seedKey`).
-- <a id="sampled-draw"></a>**On DeepSeek on Sushi Cooler a sampled token is one kernel's draw** (`sampler_draw.zig`,
-  `sampler.engineDraws`), a serial step's and a DSpark row's alike. Its rule, which `hostDraw` states on the host:
+- <a id="sampled-draw"></a>**On Sushi Cooler a sampled token is one kernel's draw** (`sampler_draw.zig`,
+  `sampler.engineDraws`), a serial step's, a DSpark row's and an MTP verify row's alike. Its rule, which `hostDraw`
+  states on the host:
   a value is `logit / temperature`; values order high to low, equal values by the lower id; top-k keeps the first k;
   the nucleus keeps, of those, each id whose mass strictly above it is under `top_p` of their mass (the top one
-  always); the draw is the kept id with the largest `value + Gumbel(key, id)`, the key a host mix of the request's
+  always); min-p keeps, of those, each id whose value less the top value is at least `ln(min_p)`; the draw is the kept id with the largest `value + Gumbel(key, id)`, the key a host mix of the request's
   root and the position. A suppressed id sits at -inf and is never drawn. A row draws the same alone and beside other
   rows, so a seed gives one text; it is another text than the MLX route's, and than a Cooler load's before this
   kernel. A call two float orders can make differently (a nucleus threshold within 1e-5 of the kept mass) is not part
@@ -221,6 +230,25 @@ before reading a completed stream and requires clean EOF.
   apart between -16 and -32. On DeepSeek on Sushi Cooler the engine has no logsumexp or argpartition, so the row is read
   back once and ranked on the host (f64 sum): ids and order are MLX's (ties by the lower id), values may differ in the last bits.
 - Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded.
+- <a id="sampling-fields"></a>**The sampling fields, in the order they apply** (llama.cpp's default chain, with
+  temperature first as vLLM does, so min-p reads probabilities after temperature). A field another server reads that
+  this one does not run is accepted only at the value that turns it off; any other value is a 400 that names it.
+
+  | field | surfaces | status | order |
+  |---|---|---|---|
+  | `temperature` | all | served, 0..2 | 1: scales the logits |
+  | `top_k` | all | served, 0..1000, 0 off | 2 |
+  | `top_p` | all | served, 0..1 | 3 |
+  | `min_p` | chat, completions, Responses (a Messages request carrying it is a 400: Anthropic has no such field) | served, 0..1, 0 or omitted off; no launch flag or model default | 4: keeps p ≥ `min_p` × the top p |
+  | `typical_p`, `tfs_z` | all | accepted only at 1 | not run |
+  | `top_a`, `mirostat`, `dry_multiplier`, `xtc_probability` | all | accepted only at 0 | not run |
+  | `suffix` | completions | null or `""` only; fill-in-the-middle is a 400 | |
+  | `best_of` | completions | 1 only | |
+  | `service_tier` | all | accepted and ignored: a billing hint with no meaning on a local server (Responses echoes it) | |
+
+  Min-p after top-k and the nucleus is the same set as before them: an id's ratio to the top id survives
+  renormalization, and the top id survives every filter. Every sampler applies the chain alike (`sampler.filterRows`
+  on MLX, `sampler_draw` on Sushi Cooler, whose MTP verify rows draw through it as the serial step does).
 - A conversation the template says has no user turn (Qwen: system-only or assistant-only) is a 400, never rendered
   through the generic ChatML fallback (`ChatNeedsUserTurn`). A reply echoes `model` as the request named it, else the id
   it is served under (`servedModelId`). `/detokenize` takes only token ids of the vocabulary (a 400 names the entry).
@@ -235,14 +263,14 @@ before reading a completed stream and requires clean EOF.
   strings; `kv_quant` `off|0|4|6|8|16`; null is absent. A wrong type is a 400 naming the field, and so is a number out of
   its range, with the range in the message (`tests/test_api_edges.sh`): `temperature` 0..2, `top_p` 0..1, `top_k` 0..1000
   (0 = off), the penalties -2..2, `repeat_penalty`/`repetition_penalty` 0..10 (0 = off), `think_penalty` 0..20, `top_logprobs`
-  and the legacy `logprobs` 0..20, `max_tokens` 0..4294967295 where 0 is the "rest of the window" (the app's Auto sends 0)
+  and the legacy `logprobs` 0..20, `max_tokens` 0..4294967295 where 0 is an omission (the app's Auto sends 0)
   and a negative is refused, `seed` any 64-bit integer (a negative one means unseeded, a wider one is refused),
   `reasoning_budget_tokens` and `thinking.budget_tokens` 32-bit integers. A `max_tokens` past what
   the window leaves after the prompt is the one value that is cut, not refused (clients such as Claude Code send 64000 on
   small windows): it is served at what the window leaves, ends with `finish_reason: length` when the model uses it all,
   logs `max_tokens clamped` at debug, and rides back as `X-Sushi-Max-Tokens-Cut: <requested> -> <granted>` on every
-  generation surface, stream and not (`request_policy.clampMaxTokensFor`); an omitted `max_tokens` takes the window
-  and adds no header. A tool name the call markup cannot carry (whitespace, quote, angle bracket) or a
+  generation surface, stream and not (`request_policy.clampMaxTokensFor`); a filled `max_tokens` is cut the same way,
+  logs at debug only and adds no header. A tool name the call markup cannot carry (whitespace, quote, angle bracket) or a
   repeated one is a 400, since the model's call to it would parse to nothing. `response_format` `strict: true` with a
   schema the grammar cannot enforce is a 400 naming the construct, on chat, Responses `text.format` and Anthropic
   `output_config.format` alike (`request_parse.strictSchemaFault`; Anthropic's format has no `strict` and counts as
@@ -252,6 +280,8 @@ before reading a completed stream and requires clean EOF.
 - Top-k and top-p are ONE pass (`sampler.filterTopKTopP`); a filter cuts by RANK, never by value (bf16 ties at the top
   constantly; `sampler.ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
   `top_p` 0 is GREEDY (`sampler.applyTopP` floors at `floatMin(f32)`).
+- Min-p is the one filter that cuts by VALUE (`sampler.applyMinP`, compared in f32): its definition keeps every id
+  tied with the threshold, so `min_p` 1 keeps every id tied at the top.
 - A sampler never draws a RESERVED special or PADDING row (`Tokenizer.bindTemplate` derives the set, `sampler.installSuppressMask` applies it; logprobs stay RAW).
 - **A non-streaming `/v1/completions` reply carries the chat reply's `timings`** (`prompt_n`, `cached_n`, `prompt_ms`, `predicted_ms`; `prompt_ms` includes the prefix restore); `sushi bench` reads it.
 - **A text `/v1/completions` prompt is encoded raw, plus the model's own opening id** (`ModelConfig.textPromptBosId`: DeepSeek's BOS, which its chat template writes literally; its base model answers EOS at once without it). Other families add none, and Qwen's config "BOS" is `<|endoftext|>`.
@@ -485,8 +515,10 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
   answered (other models refuse with 500 `chat template unusable`, uncounted) ([server-tool-calling](server-tool-calling.md#templates)); the count is process-wide, and it is zero when
   every prompt is the checkpoint's own.
 - `/props` `memory.total_bytes` = the machine's physical RAM (`hw.memsize`), the ceiling the Compact view's Memory tile and chart measure against.
-- `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state, published
-  each tick with or without `--metrics`; a donated checkout's buffers, which the entry bills until release, count once.
+- `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state + the state the
+  current model keeps between requests for the next one (DeepSeek's parked rows and live restore points; a live slot
+  of the model bills them instead), published each tick with or without `--metrics`; a donated checkout's buffers,
+  which the entry bills until release, count once.
 
 ## SSD prefix cache and settings (`/v1/prefix-cache`, `/v1/settings`)
 
@@ -501,6 +533,8 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   tier lives there (and `tier` its live numbers, published by the inference thread); `stale` means no loaded model uses it
   and no other server holds its lock, or the lock of a private `p<pid>-<n>` root inside it (`held_by_other_process`). A symlink or a folder that is not a namespace name is never listed.
   `tier.written_bytes` is cumulative since the tier opened; a client takes the write rate between two polls.
+  `tier.used_bytes` (and `/props` `disk_used_bytes`) is what the tier's files hold on the volume less the one record an
+  empty content-addressed layer keeps (its snapshot's state record), so a cleared tier reads 0.
 - `POST /v1/prefix-cache/clear` `{"scope":"model","model":id}` | `{"scope":"namespace","id":"<16 hex>"}` | `{"scope":"stale"}` | `{"scope":"all"}` answers `{scope,
   freed_bytes, model_freed_bytes, model_entries_removed, stale_freed_bytes, stale_namespaces_removed,
   skipped_live_namespaces, refused_symlinks, busy_models}`. `model` empties that model's tier on the inference thread (its
@@ -529,10 +563,10 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   the macOS default; `in_use_mb`, the GPU limit this process read at start; `standard_mb`, the RAM less 4 GiB; `command`,
   the one `sudo sysctl` line that sets all three to it; `applies`), the
   `model_keys` metadata (type, range, choices) and, per registered model, each key's `file` value, `flag`, `source` and
-  `locked`. A pinned `mtp_acceptance` reports the flag as typed with its value (`--mtp-tokenv3 0.5`, `--mtp-typical 0.3`) and `mtp_greedy_tail` reports `--mtp-greedy-tail`; the other model keys report their value alone; and `effort`, the thinking-effort tables ([Effort tables](#effort-tables)). `POST /v1/settings` takes `{"server":{key:value|null}}`, `{"model":id,"set":{key:value|null}}` and/or `{"effort":{...}}`; null removes
+  `locked`. A pinned model key reports its value alone; and `effort`, the thinking-effort tables ([Effort tables](#effort-tables)). `POST /v1/settings` takes `{"server":{key:value|null}}`, `{"model":id,"set":{key:value|null}}` and/or `{"effort":{...}}`; null removes
   a key. Each model row also carries `keys`, the keys that apply to that model (`model_settings.applies`, the same gates
   the loader's ignored-key log lines use: `ssd_budget_gb` needs expert streaming, `ssd_prefetch` and `ds41_cooler` (Sushi Cooler on or off; reports `--ds41-mlx-engine` when pinned) are DeepSeek-V4.1's,
-  `kv_quant`, `mtp_acceptance` and `mtp_greedy_tail` are not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,
+  `kv_quant` is not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,
   null while the model is not loaded and otherwise `{key: value|null}` for every key: the file value the load stamped
   (null: the file had none then), in the shape of `settings.<key>.file`, so a page tells "saved differs from loaded".
   Each model row also carries `rope`, what its own `config.json` declares before any setting or flag (`method`
@@ -542,16 +576,15 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   A ready model's row also carries `defaults`, `{key: value}` for the keys whose unset value the server can state (null while the model
   is not loaded): `settings_api.resolvedDefaults` reads it from the loader's own resolvers on the config with the file's values and the
   launch flags cleared, so it is never a flag's value. `ctx_size` and `ssd_budget_gb` are absent (measured at load); `max_tokens` is
-  0 when the model has no output budget of its own and an omitted `max_tokens` takes the rest of the window. A page writes "Default (value)"
+  the model's own default, else the engine's 32,768. A page writes "Default (value)"
   from it and a bare "Default" when a key is absent.
   Each row also carries `limits`, an object holding an entry only for a key the model constrains (`model_settings.limit`, read
   from the same `Fit` the loader's gates use): `disabled: true` (the loader ignores the key; every key missing from `keys` has
   one), `choices` (the subset a choice key takes: GLM's `kv_quant` is `off|6|8`, the widths its MLA latent stores), `max`
-  (`ctx_size`: the model's context window, YaRN-aware), `requires: {"mtp": true}` (`mtp_acceptance`, `mtp_greedy_tail`: read
-  only while `mtp` is not false, unset counting as on) and `unset: ["ssd_budget_gb"]` (a key the pack ignores while an SSD
+  (`ctx_size`: the model's context window, YaRN-aware) and `unset: ["ssd_budget_gb"]` (a key the pack ignores while an SSD
   budget makes it stream, because its MTP head cannot run then), each with a one-sentence `why`. A POST for a model refuses
   with a 400 `invalid_setting` naming the key and the reason a non-null value of a disabled key, a choice or integer outside
-  its limit, and a set key whose `requires`/`unset` fails against the file plus the request; removing a key and any value
+  its limit, and a set key whose `unset` fails against the file plus the request; removing a key and any value
   already in the file pass, and the loader still never refuses a load over the file. Not in `limits`: bounds that need the
   machine's memory or the pack's weight bill (the smallest `ssd_budget_gb`, a tower beside a small budget, the memory-safe
   `ctx_size`); the load refuses those by name.
@@ -570,11 +603,11 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   model's cache) and **Settings** (`/settings`: SSD cache size and use, per-namespace rows with their own Clear, the clear
   buttons, models directory, version) views. The page is served by the same build as the API, so it reads these fields
   without fallbacks: per model `keys` (which settings the model has), `loaded_with` (what the loaded model started with,
-  for the reload prompt) and `limits` (per key: `disabled`, `choices`, `max`, `requires`, `unset`, each with a `why`
+  for the reload prompt) and `limits` (per key: `disabled`, `choices`, `max`, `unset`, each with a `why`
   the page shows on the row; a key outside `keys` with a `disabled` limit shows greyed in Advanced), `kv_quant` as
   `off|4|6|8`, `server.*.flag` as the flag's own text, `server.prefix_cache_disk_gb.ask_bytes`, and `POST
   /v1/prefix-cache/clear {"scope":"namespace","id":...}`. A `flag` is printed as the server sends it: a text starting with `--`
-  (`--mtp-tokenv3 0.5`) is the flag's whole spelling, anything else is the value the page puts after the flag's name; a locked
+  is the flag's whole spelling, anything else is the value the page puts after the flag's name; a locked
   choice shows the choice the spelling names, else "Set at launch". The Settings page's "Automatic update checks" card is a Default (On) / On / Off group per check.
   Each server setting's badge is `Now`, `Next load` or `Next start`, read from its `applies` sentence; a setting row has no
   Default badge. A Settings box shows Save only while it differs from the file, and an emptied box says "Use default" and sends
@@ -821,9 +854,8 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   word (GLM: low/high/max; on/off make none).
 - OpenCode `--think WORD` validates the selected model's advertised efforts and sets only its `options.reasoningEffort`; omission preserves existing defaults.
 - OpenCode `--persist` backs up and merges the global JSON/JSONC config under `XDG_CONFIG_HOME` or `~/.config`, preserves unrelated settings, and normalizes comments into the backup; successful replacements print the backup's full path to stderr; invalid or ambiguous files are refused.
-- opencode sends no `max_tokens`, and GLM reserves a request's whole window without one (1M rows): serve GLM with
-  `--max-tokens N` for opencode (live: a 12k-token agent prompt hit `GlmReserveMemoryLimit` with 16 GB free). grok
-  sends its configured `max_completion_tokens`.
+- opencode sends no `max_tokens` and gets the omitted default (32,768 unless `--max-tokens` or the model names one);
+  grok sends its configured `max_completion_tokens`.
 - `sushi launch grok` writes `~/.sushi/grok/config.toml` and sets `GROK_HOME` there (the owner's `~/.grok` stays
   untouched): one `[model."<id>"]` per chat row on `api_backend = "chat_completions"`, dummy `api_key`, advertised
   `context_window`, `max_completion_tokens` from `budgetForContext`, the row's efforts as `reasoning_efforts`, and

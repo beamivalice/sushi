@@ -1,5 +1,5 @@
 #!/bin/bash
-# sushi-test: tier=live boot=api
+# sushi-test: tier=live boot=api pack=qwen4
 # Integration tests for the observability layer (on by default; --no-metrics opts out):
 #   * GET /metrics       — Prometheus text exposition (headless scraping)
 #   * GET /metrics.json  — open JSON feed of the same counters

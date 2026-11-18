@@ -1033,7 +1033,7 @@ test "qsa select on the engine before the seal makes the split's pipelines, so a
     try testing.expectEqual(late, mlx.engine.latePipelines());
 }
 
-test "qsa below the block budget before the seal makes the select every row class past it picks, so a long select compiles none" {
+test "qsa select before the seal, at the one row class a warm's wide chunk takes, makes every row class's, so a chunk's remainder of any width compiles none" {
     try mlx.requireGpu();
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -1041,13 +1041,30 @@ test "qsa below the block budget before the seal makes the select every row clas
     const s = mlx.engine.stream();
     // A block budget no other test takes: its pipelines are this test's to make.
     const kb: c_int = 41;
-    // A forward whose blocks fit the budget selects none; it makes them ahead.
-    try qwen4_qsa.makeSelectAhead(s, kb);
+    const nb: c_int = kb * 3;
+    {
+        const rows: c_int = 300;
+        const host = try testing.allocator.alloc(f32, @intCast(rows * nb));
+        defer testing.allocator.free(host);
+        for (host, 0..) |*v, i| v.* = @floatFromInt(i % 977);
+        const bound = try testing.allocator.alloc(i32, @intCast(rows));
+        defer testing.allocator.free(bound);
+        @memset(bound, nb);
+        const mk = mlx.engine.makers(true);
+        defer mk.end();
+        const scores = mlx.mlx_array_new_data(host.ptr, &[_]c_int{ 1, rows, nb }, 3, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+        const bounds = mlx.mlx_array_new_data(bound.ptr, &[_]c_int{rows}, 1, .int32);
+        defer _ = mlx.mlx_array_free(bounds);
+        const picks = (try qwen4_qsa.qsaSelectTopBlocks(s, scores, bounds, kb)) orelse return error.SelectKernelDeclined;
+        _ = mlx.mlx_array_free(picks);
+    }
     mlx.engine.seal(true);
     defer mlx.engine.seal(false);
     const late = mlx.engine.latePipelines();
-    const nb: c_int = kb * 3;
-    for ([_]c_int{ 1, 16, 64, 256 }) |rows| {
+    mlx.engine.late_names.clear();
+    errdefer std.debug.print("qsa select: after the seal, compiled:\n{s}", .{mlx.engine.late_names.text()});
+    for ([_]c_int{ 1, 15, 16, 63, 64, 241, 255, 256 }) |rows| {
         const host = try testing.allocator.alloc(f32, @intCast(rows * nb));
         defer testing.allocator.free(host);
         for (host, 0..) |*v, i| v.* = @floatFromInt(i % 977);

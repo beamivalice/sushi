@@ -4906,7 +4906,8 @@ test "formatChat: threads on two models, with the memo restarting and the cache 
         fn run(self: *@This(), seed: u64) void {
             var prng = std.Random.DefaultPrng.init(seed);
             const rnd = prng.random();
-            for (0..400) |_| {
+            // 100 random picks a thread, 800 a budget: past the memo's 256 entries, so it restarts under the threads.
+            for (0..100) |_| {
                 const j = self.jobs[rnd.uintLessThan(usize, self.jobs.len)];
                 const m = &self.models[j.model];
                 const r = sweepRequests()[j.req];

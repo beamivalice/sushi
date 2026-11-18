@@ -132,6 +132,9 @@ pub const MemoryContextRefusal = struct {
     available: u64,
     kv_bits: u64,
     chunk: u64,
+    /// The max_tokens the request asked, and the largest that its bill fits (0: the prompt alone does not fit).
+    asked_max_tokens: u32 = 0,
+    fitting_max_tokens: u32 = 0,
 };
 
 /// One model's SSD prefix tier as the inference thread last saw it: the budget, bytes in use, entry

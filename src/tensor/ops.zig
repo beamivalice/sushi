@@ -446,11 +446,12 @@ fn generalSource(comptime tag: []const u8, comptime expr: []const u8, comptime w
 }
 
 /// `out[i] = expr` over the broadcast of up to three inputs, each read as `x`, `y`, `z` in its own type.
-/// Before the seal: the contiguous copy at each dtype a model's state holds. A restore that rolls a live state back
-/// copies whole tensors, a path no warm request takes.
+/// Before the seal: the contiguous copy and every concatenate part count at each dtype a model's state holds. A restore
+/// that rolls a live state back copies whole tensors, and a sampled draft joins rows of a dtype no warm width reaches.
 pub fn makeCopiesAhead() Error!void {
     inline for (.{ Dtype.bfloat16, Dtype.float16, Dtype.float32, Dtype.int32, Dtype.uint32, Dtype.uint8 }) |d| {
         _ = try pipelineFor("copy_v0", comptime flatSource("copy", "x", 1, 0), &.{d}, d);
+        inline for (2..5) |k| _ = try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ d, d }, d);
     }
 }
 

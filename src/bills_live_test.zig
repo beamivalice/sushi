@@ -179,6 +179,13 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     try testing.expectEqual(bills.safeAutoContext(memory_ctx), bills.autoContextFrom(memory_ctx, unbounded.contextCap(), 0));
 }
 
+test "an unpinned model with no --ctx-size still has a concrete effective context" {
+    const original = launch_state.server_config.max_context_size;
+    defer launch_state.server_config.max_context_size = original;
+    launch_state.server_config.max_context_size = 0;
+    try testing.expect(bills.getEffectiveContextLength(&model_mod.ModelConfig{}) > 0);
+}
+
 test "pinAutoContext is idempotent and a no-op under --ctx-size" {
     const original = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = original;
@@ -293,22 +300,24 @@ test "GPU memory readings count a mapping the engine wraps as active, and a pass
     const mlx = @import("mlx.zig");
     _ = metal.device() catch return error.SkipZigTest;
     const Region = struct {
+        // The engine may call `release` once the test has returned: the span it is handed outlives the test.
+        var span: [2]usize = undefined;
         fn release(payload: ?*anyopaque) callconv(.c) void {
-            const span: *const [2]usize = @ptrCast(@alignCast(payload.?));
-            _ = std.c.munmap(@ptrFromInt(span[0]), span[1]);
+            const at: *const [2]usize = @ptrCast(@alignCast(payload.?));
+            _ = std.c.munmap(@ptrFromInt(at[0]), at[1]);
         }
     };
     const len = 4 * std.heap.pageSize();
     const mapped = std.c.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     try testing.expect(mapped != std.c.MAP_FAILED);
-    var span = [2]usize{ @intFromPtr(mapped), len };
+    Region.span = .{ @intFromPtr(mapped), len };
     try core.sync();
     if (core.stats().mapped_bytes != 0) return error.SkipZigTest;
     const idle = metal.touches;
     core.touch();
     try testing.expectEqual(idle, metal.touches);
     const before = gpu_mem.activeBytes();
-    const t = try core.wrapMapped(@ptrCast(mapped), .uint8, &.{@intCast(len)}, &span, Region.release);
+    const t = try core.wrapMapped(@ptrCast(mapped), .uint8, &.{@intCast(len)}, &Region.span, Region.release);
     try testing.expectEqual(before + len, gpu_mem.activeBytes());
     core.touch();
     try testing.expectEqual(idle + 1, metal.touches);
@@ -331,16 +340,20 @@ test "a wrapped mapping MLX takes for an op is MLX's only for that op: MLX's act
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was;
     const Region = struct {
+        // The engine may call `release` once the test has returned: the span it is handed outlives the test.
+        var span: [2]usize = undefined;
         fn release(payload: ?*anyopaque) callconv(.c) void {
-            const span: *const [2]usize = @ptrCast(@alignCast(payload.?));
-            _ = std.c.munmap(@ptrFromInt(span[0]), span[1]);
+            const at: *const [2]usize = @ptrCast(@alignCast(payload.?));
+            _ = std.c.munmap(@ptrFromInt(at[0]), at[1]);
         }
     };
     const len = 64 * std.heap.pageSize();
     const mapped = std.c.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     try testing.expect(mapped != std.c.MAP_FAILED);
-    var span = [2]usize{ @intFromPtr(mapped), len };
-    const t = try core.wrapMapped(@ptrCast(mapped), .float32, &.{@intCast(len / 4)}, &span, Region.release);
+    Region.span = .{ @intFromPtr(mapped), len };
+    const t = try core.wrapMapped(@ptrCast(mapped), .float32, &.{@intCast(len / 4)}, &Region.span, Region.release);
+    // Runs once `x` is freed: takes back the lends MLX returned, so the mapping goes before the test returns.
+    defer core.trim();
     const x = core.handle(t);
     defer _ = mlx.mlx_array_free(x);
     const gpu = mlx.gpuStream();

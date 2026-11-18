@@ -670,11 +670,6 @@ pub fn resolveReasoningProtocol(
 
 
 
-/// The auto budget's own tightness question: under a quarter of the window left.
-pub fn autoBudgetWindowTight(remaining: u32, effective_ctx: u32) bool {
-    return remaining < effective_ctx / 4;
-}
-
 /// The `finish_details` object emitted BESIDE `finish_reason` on a choice,
 /// or "" when there is nothing to say. Comes with its leading comma so call
 /// sites splice it straight into the choice literal.
@@ -933,9 +928,8 @@ pub fn serve(
     if (model_ctx > 0) {
         log.info("Model context length: {d} tokens\n", .{model_ctx});
     }
-    if (request_policy.filledMaxTokens(config) > 0) {
-        log.info("default max_tokens for omitted requests: {d} ({s})\n", .{ request_policy.filledMaxTokens(config), if (request_policy.launchMaxTokensDefault() > 0) "--max-tokens" else "model default" });
-    }
+    var default_max_tokens_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
+    log.info("default max_tokens for omitted requests: {s}\n", .{request_policy.describeMaxTokens(&default_max_tokens_buf, request_policy.filledMaxTokens(config), request_policy.maxTokensOrigin(null, request_policy.launchMaxTokensDefault(), config.defaultMaxTokens()))});
     if (scheduler.dflash != null) {
         log.info("DFlash speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
@@ -1769,8 +1763,17 @@ fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
 pub fn modelQuantizationLabel(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig) ![]u8 {
     if (config.expert_layout == .exl3_k4) {
         var rate_buf: [8]u8 = undefined;
-        if (config.fp8_block128_trunk) return std.fmt.allocPrint(allocator, "EXL3 {s}bpw experts, raw FP8 E4M3FN block128 trunk", .{config.expert_quant_rate.kText(&rate_buf)});
-        return std.fmt.allocPrint(allocator, "EXL3 {s}bpw experts, {d}-bit dense", .{ config.expert_quant_rate.kText(&rate_buf), config.quant_bits });
+        var trunk_buf: [40]u8 = undefined;
+        const k = config.expert_quant_rate.kText(&rate_buf);
+        const dense = if (config.fp8_block128_trunk)
+            "raw FP8 E4M3FN block128 trunk"
+        else if (config.trunk_quant_rate) |r| blk: {
+            var k_buf: [8]u8 = undefined;
+            break :blk try std.fmt.bufPrint(&trunk_buf, "{s}-bit STQ trunk", .{r.kText(&k_buf)});
+        } else try std.fmt.bufPrint(&trunk_buf, "{d}-bit dense", .{config.quant_bits});
+        // An STQ pack's config `k` is the highest rate its rate-grouped layers hold, not their mean.
+        if (config.expert_quant_codebook.hasTable()) return std.fmt.allocPrint(allocator, "STQ experts up to {s}bpw, {s}", .{ k, dense });
+        return std.fmt.allocPrint(allocator, "EXL3 {s}bpw experts, {s}", .{ k, dense });
     }
     return std.fmt.allocPrint(allocator, "{d}-bit", .{config.quant_bits});
 }
@@ -2327,13 +2330,13 @@ pub fn handleChatCompletions(
     }
 
     // Support both max_tokens and max_completion_tokens (OpenAI alias). Absent
-    // or <= 0 → auto (peg to remaining context).
+    // or <= 0 → the filled budget.
     const requested_max_tokens = request_parse.requestedMaxTokens(root);
     const max_tokens: u32 = request_policy.resolveRequestMaxTokens(
         requested_max_tokens,
-        request_policy.omittedMaxTokensDefault(config),
+        request_policy.filledMaxTokens(config),
     );
-    // For the request log line only: which of the three sources this came from.
+    // Who decided it: the log line names it, and only the client's own number is a cut to report.
     const max_tokens_origin = request_policy.maxTokensOrigin(requested_max_tokens, request_policy.launchMaxTokensDefault(), config.defaultMaxTokens());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
@@ -2671,9 +2674,8 @@ pub fn handleChatCompletions(
         return;
     }
 
-    // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
-    // omitted max_tokens is the maxInt(u32)/4 sentinel.
-    const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, prompt_ids.len, effective_ctx);
+    // Clamp max_tokens first: the memory guard bills the reserved generation headroom.
+    const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, max_tokens_origin == .client, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, logprobs_n);
@@ -2690,6 +2692,7 @@ pub fn handleChatCompletions(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = request_parse.parseMinP(root),
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .frequency_penalty = frequency_penalty,
@@ -3502,18 +3505,6 @@ test "Responses: a stored reasoning turn renders as the model's own think block"
 
 
 
-test "settingsPropsJson: /props names the greedy tail and where it came from" {
-    for ([_]settings_resolve.Setting(bool){ .{ .value = false, .source = .default }, .{ .value = true, .source = .model_settings }, .{ .value = true, .source = .flag } }, [_][]const u8{ "default", "model-settings.json", "--mtp-greedy-tail" }) |tail, source| {
-        const frag = try models_api.settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
-        defer testing.allocator.free(frag);
-        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
-        defer parsed.deinit();
-        const mtp = parsed.value.object.get("mtp").?.object;
-        try testing.expectEqual(tail.value, mtp.get("greedy_tail").?.bool);
-        try testing.expectEqualStrings(source, mtp.get("greedy_tail_source").?.string);
-    }
-}
-
 test "prefix cache default capacity covers interleaved agent flows" {
     // Claude Code-style clients interleave several conversation roots (main
     // thread, subagents, title generation). With capacity 1, every
@@ -3896,7 +3887,7 @@ test "chat_template_kwargs is read in one place, and only a bool counts" {
 }
 
 test "settingsPropsJson: /props reports the prefill decode share" {
-    const frag = try models_api.settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 8, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
+    const frag = try models_api.settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 8, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
     defer testing.allocator.free(frag);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
     defer parsed.deinit();

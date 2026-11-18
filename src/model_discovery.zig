@@ -799,6 +799,8 @@ pub const StubMeta = struct {
     context_cap: u32 = 0,
     quant_bits: u32 = 0,
     expert_quant_rate: ?expert_quant.expert_exl3.Rate = null,
+    expert_quant_codebook: expert_quant.expert_exl3.Codebook = .mul1,
+    trunk_quant_rate: ?expert_quant.expert_exl3.Rate = null,
     /// The pack carries an `expert_quant` block: its routed experts are already
     /// packed, at widths this config does not state one number for.
     quantized_experts: bool = false,
@@ -874,7 +876,11 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
         if (q == .object) meta.quant_bits = jsonU32(q.object, "bits");
     }
     if (root.get("expert_quant")) |q| meta.quantized_experts = q == .object;
-    if (meta.quantized_experts) meta.expert_quant_rate = if (sushi_exl3.parseExpertQuant(root)) |spec| spec.rate else |_| null;
+    if (meta.quantized_experts) if (sushi_exl3.parseExpertQuant(root)) |spec| {
+        meta.expert_quant_rate = spec.rate;
+        meta.expert_quant_codebook = spec.codebook;
+    } else |_| {};
+    if (root.get("trunk_quant")) |b| meta.trunk_quant_rate = if (sushi_exl3.parseQuantBlock(b)) |spec| spec.rate else |_| null;
     meta.is_moe = cfgU32(root, text_cfg, "num_experts") > 0 or
         cfgU32(root, text_cfg, "num_local_experts") > 0 or
         cfgU32(root, text_cfg, "n_routed_experts") > 0;

@@ -78,16 +78,11 @@ fn qwenGdnLine(config: *const model.ModelConfig, use: flags.LaunchFlagUse) ?[]co
 
 
 
-test "qwen4 flags: a Cooler load refuses lossy acceptance, the greedy tail and DFlash2 by name; a load on MLX takes them" {
+test "qwen4 flags: a Cooler load refuses DFlash2 by name; a load on MLX takes it" {
     const std = @import("std");
     var c: model.ModelConfig = .{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .expert_quant_codebook = .spec1, .cooler_for_test = true };
-    try std.testing.expect(flags.exactDraftsOnly(&c));
     try std.testing.expect(flags.archFlagRefusal(&c, .{}) == null);
-    try std.testing.expectEqualStrings("--mtp-typical is not served on Sushi Cooler: drafts are accepted by the exact rule only; drop the flag, or pass --qwen-mlx-engine", flags.archFlagRefusal(&c, .{ .mtp_typical = true }).?);
-    try std.testing.expect(std.mem.startsWith(u8, flags.archFlagRefusal(&c, .{ .mtp_tokenv3 = true }).?, "--mtp-tokenv3 is not served on Sushi Cooler"));
-    try std.testing.expect(std.mem.startsWith(u8, flags.archFlagRefusal(&c, .{ .mtp_greedy_tail = true }).?, "--mtp-greedy-tail is not served on Sushi Cooler"));
     try std.testing.expectEqualStrings("--drafter is not served on Sushi Cooler: DFlash2 runs on MLX only; drop the flag, or pass --qwen-mlx-engine", flags.archFlagRefusal(&c, .{ .drafter = true }).?);
     c.cooler_ask = .flag;
-    try std.testing.expect(!flags.exactDraftsOnly(&c));
-    try std.testing.expect(flags.archFlagRefusal(&c, .{ .mtp_typical = true, .mtp_greedy_tail = true, .drafter = true }) == null);
+    try std.testing.expect(flags.archFlagRefusal(&c, .{ .drafter = true }) == null);
 }

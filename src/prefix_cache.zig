@@ -632,6 +632,8 @@ pub const HotPrefixCache = struct {
     /// The raw prefix that restore matched, before a hybrid clamp (`checkoutRestored`).
     last_restored_shared: usize = 0,
     last_restored_disk_id: ?u64 = null,
+    /// The last SSD-tier restore came from a restore point the tier held in RAM (`DiskTier.held`), not a file.
+    last_restored_held: bool = false,
     /// The last lookup rolled the model's live state back instead of restoring a stored point.
     last_restored_live: bool = false,
     /// What each arch keeps beside the entries (the points of a live state it can be rolled back to).
@@ -1394,6 +1396,7 @@ pub const HotPrefixCache = struct {
         const s = self.arrays_on orelse caller_stream;
         self.last_restored_used = null;
         self.last_restored_disk_id = null;
+        self.last_restored_held = false;
         self.last_restored_live = false;
         if (rec == .arch) try prefix_arch.checkLent(rec.arch);
         if (skip) {
@@ -1525,8 +1528,9 @@ pub const HotPrefixCache = struct {
                 self.last_restored_disk_id = d.entries.items[hm.idx].id;
                 const ms = sw.read() / std.time.ns_per_ms;
                 const lost = @as(usize, hm.usable) -| restored;
-                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (ssm@{d}), matched {d}, lost {d}{s}\n", .{
-                    restored, prompt_ids.len, ms, disk_cp, hm.usable, lost, if (lost > 0) ": no-point" else "",
+                self.last_restored_held = d.last_point_held;
+                log.info("  [disk-cache] restored {d}/{d} tokens from {s} in {d}ms (ssm@{d}), matched {d}, lost {d}{s}\n", .{
+                    restored, prompt_ids.len, if (d.last_point_held) "a held restore point (RAM)" else "SSD", ms, disk_cp, hm.usable, lost, if (lost > 0) ": no-point" else "",
                 });
                 const disk_mtp = diskRestoreSpec(d, hm.idx, mtp_target, restored, s, .mtp);
                 return .{
@@ -2923,6 +2927,9 @@ pub const HotPrefixCache = struct {
         s: mlx.mlx_stream,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
+        // A hybrid record restores only at a stored SSM point: before the prefill holds one (or extends a record that
+        // does), a chunk waits for the next record, which writes it too, instead of leaving an entry nothing restores.
+        if (live_ssm.len > 0 and cps.len == 0 and restored == null) return;
         // A prefill point carries no QSA bank: the newest one borrows the live history for this write, so the SSD
         // history reaches every point the chunk lands.
         const lent = cps.len > 0 and live_ssm.len > 0 and !checkpointHasQsaPooled(&cps[cps.len - 1]);
@@ -3775,7 +3782,7 @@ pub const HotPrefixCache = struct {
 
     /// The tier the last lookup's restored rows came from: memory (the RAM tier or the live state) unless the disk supplied them.
     pub fn lastRestoredTier(self: *const HotPrefixCache) cache_stats.Tier {
-        return if (!self.last_restored_live and self.last_restored_disk_id != null) .ssd else .hot;
+        return if (!self.last_restored_live and self.last_restored_disk_id != null and !self.last_restored_held) .ssd else .hot;
     }
 
     /// False when nothing was evictable (every survivor is checked out) — the termination
@@ -3790,6 +3797,7 @@ pub const HotPrefixCache = struct {
         var dropped = false;
         if (self.last_restored_disk_id) |id| {
             self.last_restored_disk_id = null;
+            self.last_restored_held = false;
             if (self.disk) |*d| {
                 if (d.poisonId(id, "QSA history check")) dropped = true;
             }
@@ -4033,6 +4041,7 @@ pub const HotPrefixCache = struct {
         if (self.pending_disk) |*p| p.deinit(self.allocator);
         self.pending_disk = null;
         self.last_restored_disk_id = null;
+        self.last_restored_held = false;
     }
 
     /// Drop the most recently committed entry — used after a pad-only

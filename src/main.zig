@@ -20,7 +20,6 @@ pub const model_handle = @import("model_handle.zig");
 const trunk = @import("trunk.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
-const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_discovery = @import("model_discovery.zig");
 const model_registry_mod = @import("model_registry.zig");
 const mtp_mod = @import("mtp.zig");
@@ -312,8 +311,6 @@ fn runCli(init: std.process.Init) !void {
     var mtp_flag: ?bool = null;
     var mtp_on = false;
     var no_mtp = false;
-    var mtp_typical_raw: ?[]const u8 = null;
-    var mtp_tokenv3_raw: ?[]const u8 = null;
     var kv_quant_flag: ?trunk.KVQuantConfig = null;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running small models". Override via the
@@ -511,14 +508,6 @@ fn runCli(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             if (is_min) depth_bounds.active.min = n else depth_bounds.active.max = n;
-        } else if (std.mem.eql(u8, args[i], "--mtp-typical") and flag_value.follows(args, i)) {
-            i += 1;
-            mtp_typical_raw = args[i];
-        } else if (std.mem.eql(u8, args[i], "--mtp-tokenv3") and flag_value.follows(args, i)) {
-            i += 1;
-            mtp_tokenv3_raw = args[i];
-        } else if (std.mem.eql(u8, args[i], "--mtp-greedy-tail")) {
-            settings_resolve.launch.mtp_greedy_tail = true;
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and flag_value.follows(args, i)) {
             i += 1;
             generate_mod.max_mtp_ctx = flagInt(u32, "--max-mtp-ctx", args[i], 0);
@@ -603,7 +592,7 @@ fn runCli(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, args[i], "--expert-cache-bias") and flag_value.follows(args, i)) {
             i += 1;
-            expert_stream_mod.cache_bias = expert_stream_mod.parseCacheBias(args[i]) catch {
+            model_settings_mod.expert_cache_bias_flag = expert_stream_mod.parseCacheBias(args[i]) catch {
                 log.err("--expert-cache-bias: expected a number from 0 to 8, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -742,17 +731,8 @@ fn runCli(init: std.process.Init) !void {
         });
     }
 
-    const acceptance_flag = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
-        if (err == error.ConflictingAcceptanceModes) log.err("--mtp-typical and --mtp-tokenv3 conflict; pass one\n", .{});
-        if (mtp_typical_raw) |raw| if (std.meta.isError(mtp_acceptance.parse(raw, null))) log.err("--mtp-typical: expected a number above 0; got '{s}'\n", .{raw});
-        if (mtp_tokenv3_raw) |raw| if (std.meta.isError(mtp_acceptance.parse(null, raw))) log.err("--mtp-tokenv3: expected a number from 0 to 1; got '{s}'\n", .{raw});
-        std.process.exit(1);
-    };
-    if (mtp_typical_raw != null or mtp_tokenv3_raw != null) settings_resolve.launch.mtp_acceptance = acceptance_flag;
     const temperature: f32 = temp_flag orelse 0.0;
-    var acceptance_flag_buf: [128]u8 = undefined;
     pinLaunchFlags(.{
-        .mtp_acceptance_flag = model_settings_mod.acceptanceFlagText(&acceptance_flag_buf, mtp_typical_raw, mtp_tokenv3_raw),
         .ctx_size = ctx_size,
         .kv_quant = if (kv_quant_flag) |q| q.wireName() else null,
         .mtp = mtp_flag,
@@ -1546,13 +1526,11 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
 /// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
-fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool, skip_mem_preflight: bool = false, port: ?u16 = null }) void {
+fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool, skip_mem_preflight: bool = false, port: ?u16 = null }) void {
     const locks = &model_settings_mod.launch_locks;
     if (given.ctx_size > 0) locks.modelMut("ctx_size").pin("{d}", .{given.ctx_size});
     if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
     if (given.mtp) |m| locks.modelMut("mtp").pin("{s}", .{if (m) "on" else "off"});
-    if (given.mtp_acceptance_flag) |f| locks.modelMut("mtp_acceptance").pin("{s}", .{f});
-    if (settings_resolve.launch.mtp_greedy_tail != null) locks.modelMut("mtp_greedy_tail").pin("--mtp-greedy-tail", .{});
     if (ssd_budget_bytes != 0) locks.modelMut("ssd_budget_gb").pin("{d}", .{ssd_budget_bytes >> 30});
     if (model_mod.ssd_prefetch) |p| locks.modelMut("ssd_prefetch").pin("{d}", .{p});
     inline for (comptime std.meta.tags(arch_config.Tag)) |t| {
@@ -1560,6 +1538,7 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
     }
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
+    if (model_settings_mod.expert_cache_bias_flag) |b| locks.modelMut("expert_cache_bias").pin("{d}", .{b});
     if (serve_default_max_tokens > 0) locks.modelMut("max_tokens").pin("{d}", .{serve_default_max_tokens});
     if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
     if (model_mod.configOverridesSetRope()) locks.modelMut("yarn_factor").pin("--config-overrides", .{});
@@ -1640,9 +1619,9 @@ test "launch flags: --port pins server.port as typed, and no flag leaves it free
     const saved = model_settings_mod.launch_locks;
     defer model_settings_mod.launch_locks = saved;
     model_settings_mod.launch_locks = .{};
-    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
     try std.testing.expect(!model_settings_mod.launch_locks.port.set);
-    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .port = 8080 });
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .port = 8080 });
     try std.testing.expectEqualStrings("8080", model_settings_mod.launch_locks.port.text());
 }
 
@@ -1650,10 +1629,10 @@ test "launch flags: --no-update-check pins both automatic update checks, and no 
     const saved = model_settings_mod.launch_locks;
     defer model_settings_mod.launch_locks = saved;
     model_settings_mod.launch_locks = .{};
-    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
     try std.testing.expect(!model_settings_mod.launch_locks.update_check.set);
     try std.testing.expect(!model_settings_mod.launch_locks.pack_update_check.set);
-    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = true });
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = true });
     try std.testing.expectEqualStrings("--no-update-check", model_settings_mod.launch_locks.update_check.text());
     try std.testing.expectEqualStrings("--no-update-check", model_settings_mod.launch_locks.pack_update_check.text());
 }
@@ -1662,9 +1641,9 @@ test "launch flags: --skip-mem-preflight pins server.skip_mem_preflight, and no 
     const saved = model_settings_mod.launch_locks;
     defer model_settings_mod.launch_locks = saved;
     model_settings_mod.launch_locks = .{};
-    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
     try std.testing.expect(!model_settings_mod.launch_locks.skip_mem_preflight.set);
-    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .skip_mem_preflight = true });
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .skip_mem_preflight = true });
     try std.testing.expectEqualStrings("--skip-mem-preflight", model_settings_mod.launch_locks.skip_mem_preflight.text());
 }
 
@@ -1674,10 +1653,10 @@ test "launch flags: --config-overrides pins yarn_factor only when it names the R
     defer model_mod.setConfigOverrides(null);
     model_settings_mod.launch_locks = .{};
     model_mod.setConfigOverrides("{\"text_config\":{\"num_experts_per_tok\":4}}");
-    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
     try std.testing.expect(!model_settings_mod.launch_locks.model("yarn_factor").?.set);
     model_mod.setConfigOverrides("{\"text_config\":{\"rope_parameters\":{\"factor\":4}}}");
-    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
     try std.testing.expectEqualStrings("--config-overrides", model_settings_mod.launch_locks.model("yarn_factor").?.text());
 }
 
@@ -1690,10 +1669,10 @@ test "launch flags: each arch's Sushi Cooler opt-out flag pins that arch's model
         if (comptime arch_config.coolerOptOut(t)) |o| {
             model_settings_mod.launch_locks = .{};
             model_mod.cooler_off = .empty;
-            pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+            pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
             try std.testing.expect(!model_settings_mod.launch_locks.model(o.setting).?.set);
             model_mod.cooler_off.insert(t);
-            pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+            pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
             try std.testing.expectEqualStrings(o.flag, model_settings_mod.launch_locks.model(o.setting).?.text());
         }
     }

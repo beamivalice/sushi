@@ -125,6 +125,8 @@ pub const Writer = struct {
     broken_path: ?[]u8 = null,
     /// Throughput of the plain file write, which an op may not beat (0 = no floor). Set before `start`.
     pace_bytes_per_s: u64 = 0,
+    /// Bytes `calibratePace` writes to measure the rate; a test writes less.
+    pace_probe_bytes: usize = 64 * 1024 * 1024,
     /// Serializes the pack and journal appends of the writer thread with `landNow`.
     land_mutex: std.Io.Mutex = .init,
     /// Landed bytes per op since `takeLanding` read them; the oldest go past `MAX_LANDINGS`.
@@ -602,7 +604,7 @@ pub const Writer = struct {
     /// Measure the file-write rate of the volume under `dir_abs` with the plain path's own write, and make
     /// it the pace floor. A probe file is written and removed.
     pub fn calibratePace(self: *Writer, dir_abs: []const u8) !void {
-        const probe_bytes: usize = 64 * 1024 * 1024;
+        const probe_bytes = self.pace_probe_bytes;
         const buf = try self.allocator.alloc(u8, probe_bytes);
         defer self.allocator.free(buf);
         @memset(buf, 0xA5);
@@ -1482,20 +1484,20 @@ test "kv_disk_writer op: an op stays pending and unpublished for as long as the 
     var fake = FakeSink.init(testing.io);
     defer fake.deinit();
     var w = Writer.init(testing.allocator, testing.io);
-    // 4 MiB at 16 MiB/s: a 250 ms floor, far above the instant fake landing.
+    // 1.5 MiB at 16 MiB/s: a 94 ms floor, far above the instant fake landing.
     w.pace_bytes_per_s = 16 << 20;
     try w.start();
     defer w.deinit();
 
     const t0 = fake.clock.read();
-    w.submitOp(try opPath("c000000"), fake.sink(), .{ .ticket = 1, .host_bytes = 4096, .logical_bytes = 4 << 20 }, .kv);
-    std.Io.sleep(testing.io, .fromMilliseconds(60), .real) catch {};
+    w.submitOp(try opPath("c000000"), fake.sink(), .{ .ticket = 1, .host_bytes = 4096, .logical_bytes = 3 << 19 }, .kv);
+    std.Io.sleep(testing.io, .fromMilliseconds(20), .real) catch {};
     try testing.expect(w.isPending("v/e1/c000000"));
     try testing.expect(w.pendingPrefix("v/e1/"));
     try testing.expect(!fake.isVisible(1));
     w.drain();
     try testing.expect(fake.isVisible(1));
-    try testing.expect(fake.published_ns.items[0] - t0 >= 250 * std.time.ns_per_ms);
+    try testing.expect(fake.published_ns.items[0] - t0 >= 93 * std.time.ns_per_ms);
     try testing.expect(!w.isPending("v/e1/c000000"));
 }
 
@@ -1503,13 +1505,13 @@ test "kv_disk_writer op: a fence waits out only the op in flight on its own path
     var fake = FakeSink.init(testing.io);
     defer fake.deinit();
     var w = Writer.init(testing.allocator, testing.io);
-    // 8 MiB at 16 MiB/s: the op stays in flight for 500 ms.
+    // 1.5 MiB at 16 MiB/s: the op stays in flight for 94 ms.
     w.pace_bytes_per_s = 16 << 20;
     try w.start();
     defer w.deinit();
 
-    w.submitOp(try opPath("c000000"), fake.sink(), .{ .ticket = 1, .host_bytes = 4096, .logical_bytes = 8 << 20 }, .kv);
-    std.Io.sleep(testing.io, .fromMilliseconds(60), .real) catch {};
+    w.submitOp(try opPath("c000000"), fake.sink(), .{ .ticket = 1, .host_bytes = 4096, .logical_bytes = 3 << 19 }, .kv);
+    std.Io.sleep(testing.io, .fromMilliseconds(20), .real) catch {};
     w.fence("v/e2/");
     try testing.expect(w.isPending("v/e1/c000000"));
     try testing.expect(!fake.isVisible(1));
@@ -1528,13 +1530,13 @@ test "kv_disk_writer op: a paced queue delays each op by the ops before it, as a
 
     w.setPaused(true);
     const t0 = fake.clock.read();
-    for (1..4) |t| w.submitOp(try opPath("c"), fake.sink(), .{ .ticket = t, .host_bytes = 64, .logical_bytes = 1 << 20 }, .kv);
+    for (1..4) |t| w.submitOp(try opPath("c"), fake.sink(), .{ .ticket = t, .host_bytes = 64, .logical_bytes = 1 << 19 }, .kv);
     w.setPaused(false);
     w.drain();
-    // 1 MiB at 16 MiB/s is 62.5 ms: the third op lands no sooner than three floors after the first began.
+    // 512 KiB at 16 MiB/s is 31.25 ms: the third op lands no sooner than three floors after the first began.
     try testing.expectEqual(@as(usize, 3), fake.published_ns.items.len);
-    try testing.expect(fake.published_ns.items[0] - t0 >= 62 * std.time.ns_per_ms);
-    try testing.expect(fake.published_ns.items[2] - t0 >= 187 * std.time.ns_per_ms);
+    try testing.expect(fake.published_ns.items[0] - t0 >= 31 * std.time.ns_per_ms);
+    try testing.expect(fake.published_ns.items[2] - t0 >= 93 * std.time.ns_per_ms);
 }
 
 test "kv_disk_writer op: no pace rate means no floor" {
@@ -1556,6 +1558,7 @@ test "kv_disk_writer op: calibratePace measures the file-write rate of a directo
     const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
     var w = Writer.init(testing.allocator, testing.io);
     defer w.deinit();
+    w.pace_probe_bytes = 1 << 20;
     try w.calibratePace(root);
     try testing.expect(w.pace_bytes_per_s > 0);
     var it = tmp.dir.iterate();
@@ -1616,6 +1619,7 @@ test "kv_disk_writer: the crash seam counts the files and ops a tier lands, neve
     defer fake.deinit();
     var w = Writer.init(testing.allocator, testing.io);
     defer w.deinit();
+    w.pace_probe_bytes = 1 << 20;
     const before = landings.load(.monotonic);
     try w.calibratePace(root);
     try testing.expectEqual(before, landings.load(.monotonic));

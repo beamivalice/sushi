@@ -11,6 +11,10 @@ const qwen4_exp = @import("qwen4_exp.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const qsa_state = @import("qwen4_qsa_state.zig");
 
+/// Each turn's prompt-end GDN state is the restore point the next turn takes and nothing else does: held in RAM, not
+/// written, while the conversation goes on (docs/engine-prefix-cache.md#held-points).
+pub const holds_off_grid_points = true;
+
 /// The `qsa.safetensors` section of a hybrid record.
 pub const disk = @import("qwen4_disk_qsa.zig");
 

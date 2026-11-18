@@ -3216,8 +3216,8 @@ fn parityVs(got: mlx.mlx_array, want: []const f32, allocator: std.mem.Allocator,
 }
 
 test "dflash fixture parity: encoder + two draft rounds vs transformers reference" {
-    const fixtures_path = std.c.getenv("DFLASH_FIXTURES") orelse return;
-    const assistant_dir = std.c.getenv("DFLASH_ASSISTANT_DIR") orelse return;
+    const fixtures_path = std.c.getenv("DFLASH_FIXTURES") orelse return error.SkipZigTest;
+    const assistant_dir = std.c.getenv("DFLASH_ASSISTANT_DIR") orelse return error.SkipZigTest;
     try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -3317,8 +3317,8 @@ test "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab
     // scale rule), and the selector path ids EXACTLY — both sides read the
     // identical sparse logits and the identical bf16 hidden, so the trace is
     // a pure-math question.
-    const fixtures_path = std.c.getenv("DFLASH2_FIXTURES") orelse return;
-    const assistant_dir = std.c.getenv("DFLASH2_ASSISTANT_DIR") orelse return;
+    const fixtures_path = std.c.getenv("DFLASH2_FIXTURES") orelse return error.SkipZigTest;
+    const assistant_dir = std.c.getenv("DFLASH2_ASSISTANT_DIR") orelse return error.SkipZigTest;
     try mlx.requireGpu();
     const allocator = testing.allocator;
     const s = mlx.gpuStream();

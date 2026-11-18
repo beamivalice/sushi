@@ -487,6 +487,9 @@ pub const Options = struct {
     drop_owned: ?*expert_usage.Drop = null,
     /// Rate-grouped trellis tiles land in the pools in `layout.tileMajor` order, which the rate-group kernels read.
     tile_major: bool = false,
+    /// Decode-width picks score an expert the layer's cache lacks this much lower (`ModelConfig.expertCacheBias`, 0 =
+    /// exact), in the router's own sqrt-softplus units. DeepSeek-V4.1 only; the weights stay the unbiased scores.
+    cache_bias: f32 = 0,
 };
 
 pub const Binding = struct {
@@ -522,11 +525,7 @@ pub fn parsePickTolerance(raw: []const u8) error{InvalidPickTolerance}!f32 {
     return value;
 }
 
-pub const MAX_CACHE_BIAS: f32 = 8;
-
-/// Decode-width picks score an expert the layer's cache lacks this much lower (`--expert-cache-bias`, 0 = exact), in the
-/// router's own sqrt-softplus units. DeepSeek-V4.1 only; the weights stay the unbiased scores.
-pub var cache_bias: f32 = 0;
+pub const MAX_CACHE_BIAS: f32 = @import("model_settings.zig").expert_cache_bias_max;
 
 pub fn parseCacheBias(raw: []const u8) error{InvalidCacheBias}!f32 {
     const value = std.fmt.parseFloat(f32, raw) catch return error.InvalidCacheBias;
@@ -1675,13 +1674,14 @@ const LayerState = struct {
     spec_host: []i32 = &.{},
     spec_slots: mlx.mlx_array = .{ .ctx = null },
     spec_raw: mlx.mlx_array = .{ .ctx = null },
-    /// f32 `[experts]` pick-score penalty of `spec_host` (`biasPenalty`); null context while `cache_bias` is off.
+    /// f32 `[experts]` pick-score penalty of `spec_host` (`biasPenalty`); null context while the engine's bias is off.
     spec_pen: mlx.mlx_array = .{ .ctx = null },
 
     /// Brings the host map and its GPU copy up to the cache. The pair only ever
     /// changes together: a failure leaves no GPU map and a host map that forces
     /// the next call to rebuild.
-    fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator, s: mlx.mlx_stream) !void {
+    /// `cache_bias` > 0 also builds the map's pick-score penalty (`spec_pen`).
+    fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator, s: mlx.mlx_stream, cache_bias: f32) !void {
         const experts = if (self.grouped) |gl| gl.expertCount() else self.cache.expert_to_slot.len;
         if (self.spec_host.len != experts) {
             if (self.spec_host.len != 0) allocator.free(self.spec_host);
@@ -2078,6 +2078,8 @@ pub const Engine = struct {
     swap_seen_ids: u64 = 0,
     swap_reported_at: u64 = 0,
     bias_logged: bool = false,
+    /// `Options.cache_bias`: this load's, never another's.
+    cache_bias: f32 = 0,
 
     pub fn pendingReaders(self: *const Engine) usize {
         var n: usize = 0;
@@ -2121,6 +2123,7 @@ pub const Engine = struct {
             .layers = &.{},
             .s = s,
             .forward_clock = Clock.init(),
+            .cache_bias = opts.cache_bias,
         };
         errdefer engine.releaseSlabs();
         const fds = try allocator.alloc(std.c.fd_t, engine.store.fileCount());
@@ -2552,7 +2555,7 @@ pub const Engine = struct {
         if (self.store.quantized == null or self.store.layout() == .bf16_individual or layer_index >= self.layers.len) return null;
         const layer = &self.layers[layer_index];
         if (!layer.active or layer.grouped != null or layer.slabs.len != self.store.componentCount()) return null;
-        try layer.refreshSpec(self.allocator, self.s);
+        try layer.refreshSpec(self.allocator, self.s, self.cache_bias);
         var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
         return .{ .slots = layer.spec_slots, .raw = layer.spec_raw, .starved = layer.cache.swap_starved, .host = layer.spec_host, .operands = operands };
@@ -2575,7 +2578,7 @@ pub const Engine = struct {
         const layer = &self.layers[layer_index];
         const gl = layer.grouped orelse return null;
         if (!layer.active or layer.borrowed or layer.resident_map.ctx != null or layer.slabs.len != quant.component_count) return null;
-        try layer.refreshSpec(self.allocator, self.s);
+        try layer.refreshSpec(self.allocator, self.s, self.cache_bias);
         return .{ .slots = layer.spec_slots, .host = layer.spec_host, .bank = &gl.cache_ragged };
     }
 
@@ -2583,7 +2586,7 @@ pub const Engine = struct {
     /// Null where the bias is off, `--expert-pick-tolerance` is set (it swaps on the host and keeps nothing queued), or
     /// the layer has no map (the cases `specGrouped` answers null for).
     pub fn penaltyGrouped(self: *Engine, layer_index: u16) !?mlx.mlx_array {
-        if (!(cache_bias > 0)) return null;
+        if (!(self.cache_bias > 0)) return null;
         if (pick_tolerance > 0) {
             if (!self.bias_logged) log.warn("[expert-bias] --expert-cache-bias is ignored: --expert-pick-tolerance is set\n", .{});
             self.bias_logged = true;
@@ -2591,7 +2594,7 @@ pub const Engine = struct {
         }
         if (try self.specGrouped(layer_index) == null) return null;
         const pen = self.layers[layer_index].spec_pen;
-        if (pen.ctx != null and !self.bias_logged) log.info("[expert-bias] engaged on rate-grouped layers: bias={d:.2} (lossy: an expert the cache lacks scores that much lower at decode widths; the chain stays queued)\n", .{cache_bias});
+        if (pen.ctx != null and !self.bias_logged) log.info("[expert-bias] engaged on rate-grouped layers: bias={d:.2} (lossy: an expert the cache lacks scores that much lower at decode widths; the chain stays queued)\n", .{self.cache_bias});
         self.bias_logged = true;
         return if (pen.ctx != null) pen else null;
     }
@@ -5940,14 +5943,14 @@ test "a failed spec map refresh leaves no GPU map until a rebuild matches the ca
     markResolvedReady(&layer.cache, &first);
     const s = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(s);
-    try layer.refreshSpec(t.allocator, s);
+    try layer.refreshSpec(t.allocator, s, 0);
     var second = try layer.cache.resolve(t.allocator, &.{ 0, 2 });
     defer second.deinit(t.allocator);
     markResolvedReady(&layer.cache, &second);
     spec_alloc_fail_for_test = true;
-    try t.expectError(error.ExpertSpecMapAlloc, layer.refreshSpec(t.allocator, s));
+    try t.expectError(error.ExpertSpecMapAlloc, layer.refreshSpec(t.allocator, s, 0));
     try t.expect(layer.spec_slots.ctx == null);
-    try layer.refreshSpec(t.allocator, s);
+    try layer.refreshSpec(t.allocator, s, 0);
     const gpu = mlx.mlx_array_data_int32(layer.spec_slots).?;
     for (layer.spec_host, 0..) |host, e| try t.expectEqual(@max(host, 0), gpu[e]);
     try t.expectEqual(layer.cache.expert_to_slot[2], layer.spec_host[2]);
@@ -5955,8 +5958,6 @@ test "a failed spec map refresh leaves no GPU map until a rebuild matches the ca
 
 test "the spec map refresh builds the cache-bias penalty only while the bias is on" {
     const t = std.testing;
-    const saved = cache_bias;
-    defer cache_bias = saved;
     var layer = LayerState{ .cache = try GroupCache.init(t.allocator, 2, 4) };
     defer {
         if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
@@ -5970,12 +5971,10 @@ test "the spec map refresh builds the cache-bias penalty only while the bias is 
     markResolvedReady(&layer.cache, &resolved);
     const s = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(s);
-    cache_bias = 0;
-    try layer.refreshSpec(t.allocator, s);
+    try layer.refreshSpec(t.allocator, s, 0);
     try t.expect(layer.spec_pen.ctx == null);
-    cache_bias = 0.25;
     layer.spec_host[0] = -2;
-    try layer.refreshSpec(t.allocator, s);
+    try layer.refreshSpec(t.allocator, s, 0.25);
     const pen = mlx.mlx_array_data_float32(layer.spec_pen).?;
     for (layer.spec_host, 0..) |host, e| try t.expectEqual(if (host >= 0) @as(f32, 0) else -0.25, pen[e]);
 }

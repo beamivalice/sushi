@@ -175,6 +175,9 @@ route and the MLX arm still build the bank at prepare time.
 - **A best-effort path never declines on the engine.** MLX-side fallbacks that drop a feature on a failed launch (the
   MTP coarse rerank's build and shortlist) return the error on the engine's stream, so a refusal fails that request or
   load and never leaves later ones on a different path.
+- **A call that takes a handle takes it on every path, an error's too** (`Trunk.spliceVisionRows`): taken only on
+  success, each caller owed an `errdefer`, and the warm's image splice had none, so a Cooler load refused there kept a
+  pool buffer. A handle such a call takes is made last, just before it.
 - A kernel, its config and its lists of names made while the engine is on are objects of the engine's (tagged
   handles), so making and filling them calls nothing in mlx-c. A module keeps the kernels and configs it builds and
   may launch one on MLX's side later: MLX's kernel and config (the twins) are made at that first launch, the config
@@ -211,8 +214,8 @@ route and the MLX arm still build the bank at prepare time.
   other loads).
 - **A Cooler load holds the engine's scope from its first tensor to its unload** (`engine.hold`, `engine.unhold`,
   counted, so a second load's unload leaves the first one's). One shared scope does a load's engine steps for every
-  arch (`arch_cooler.LoadScope`: the engine on and regions wrapped while `loadWeightsForConfig` reads, the hold, no
-  earlier cap and the seal lifted while `arch_life.init` builds; lint `engine-lifecycle`): one arch's step the other
+  arch (`arch_cooler.LoadScope`: the engine on, regions wrapped and no earlier cap while `loadWeightsForConfig`
+  reads, the hold, no earlier cap and the seal lifted while `arch_life.init` builds; lint `engine-lifecycle`): one arch's step the other
   lacked made a second Cooler load's warm count as late. Its trunk's stream is the engine's (`cooler_side.stream`), so `xfm.s`, `m.s` and
   `Trunk.outStream` are one stream, every host array, scalar and vector made for the load is the engine's wherever it
   is made, and an op that reaches an MLX stream is refused by name instead of lending a tensor. What a held scope
@@ -346,6 +349,17 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **The pool keeps no more free bytes than MLX's cache may** (`core.free_cap`, set beside `mlx_set_cache_limit` by
   `gpu_mem`): past it a freed buffer's class is released at once. Without it a Qwen prefill chunk on the 32 GB M1 held
   2.3 GB of free buffers of sizes nothing asked for again.
+- **A prefill chunk holds no more than its bill** (`arch/cooler.zig` `enterForward`): a forward wider than a verify
+  block runs under `budget(forwardCap(rows, seq))`, so the pool gives up its free buffers before it asks Metal for
+  more; the next narrow forward, or the request's end, lifts it. Uncapped, the Qwen STQ 2.75 cut's 4096-row chunk held
+  4.95 GB on 2.93 GB in use against a 3.51 GB bill, and the real pack's 8162-row chunk 8.52 GB against 7.03; capped,
+  3.48 and 6.84. The trim may wait on the GPU for buffers a pass still binds: ~0.5% on the real pack's 8.5k prefill,
+  ~5% on the cut's isolated 4096-row chunk. The STQ 4bpw cut stays inside its bill uncapped.
+- **A wide forward that reads out every row is billed for its readout** (`cooler.readoutCap`): a served chunk sets
+  `skip_lm_head`, but `sushi kld` and the decode meter read out the whole chunk, whose logits (`rows x vocab x 2`) and
+  head scratch (a trellis GEMM's f16 plane, an affine head's dequantized weight; `Trunk.lmHeadReadoutBytes`) the chunk
+  bill never named. Under the bare chunk cap a 418-row KLD prompt on the STQ 2.75 pack met `PoolOverBudget` at the
+  head's `sushi_exl3_finish_h128`.
 - **Hand the GPU nothing a layer early.** On the engine an async eval commits the open pass, and the next one waits on
   its fence; the kicks already start the GPU. A resident expert route that handed each layer over cut a decode
   forward into 52 command buffers and left the GPU idle 2.2 ms a forward on an M1 Max (`Stats.handovers` counts them).
@@ -356,7 +370,9 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   fence of the pass before it and of any unfinished pass that wrote a store it binds; without that a pass reads
   stale bytes, or never completes.
 - **Inside a pass, a barrier where MLX puts one**: before a dispatch that reads what an earlier dispatch of the pass
-  wrote, or writes what one read.
+  wrote, or writes what one read. Launches that write disjoint rows of one tensor (`kernel.launchInto`,
+  `launchDisjoint`: a rate-grouped bank's groups into one plane) bind it as writes only (`core.bindOutDisjoint`), so
+  they run side by side and the first reader after waits for them all.
 - **A host read waits for the pass that wrote the bytes, not for the queue.** Waiting for everything in flight loses
   the layer the forward queued ahead (25.5 against 20.4 ms per forward).
 - The pool never hands out a store the open pass binds.
@@ -586,8 +602,27 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   runs it, at every chunk width to 33 rows (kernels take a narrow width as a template value), 100 and 128 rows (off
   and on the GEMM tiles), and one prompt of a short request's whole chunk, past a sparse indexer's budget when it has
   one (a module's path chosen from a row count, as EXL3's decoded trunk GEMM from 1024 rows, runs only there), then
-  every narrow width appended after it (a prompt restored from the prefix cache prefills its tail there), greedy
-  and each sampler filter mix, with the load's drafter and without. The contract holds it: after the warm no prompt of 1 to 40 tokens compiles a pipeline.
+  every narrow width appended after it (a prompt restored from the prefix cache prefills its tail there), and the
+  the arch's gather of the cached keys in their stored form (`warmPackedGather`; Flash-Next: the packed gather a
+  restored tail past the budget takes, `packedGatherTail` its width, called over the keys `narrowAfter` left), which
+  no cold chunk reads and whose kernel a GPU without NAX makes nowhere else, greedy and each sampler filter mix, with
+  the load's drafter and without. The contract holds it: after the warm no prompt of 1 to 40 tokens compiles a pipeline.
+- **A path no text request takes is made ahead by the warm** (`cooler_warm`): each penalty kind, greedy and sampled,
+  with the drafter and without; every concatenate part count and the contiguous copy at each state dtype
+  (`makeCopiesAhead`); one small image splice (`spliceAhead`), whose kernels follow the dtypes, not the rows; and on an
+  M-RoPE model one image request with the drafter (`imageRequest`): its prefill and every verify row after it splice
+  the tower's rows (a verify's ids take other dtypes than a prefill's) and rotate by M-RoPE, whose negated half is a
+  strided 4-D read no text request makes.
+- **Joined rows are warmed as the scheduler runs them**: drafter rounds as the planner tick does
+  (`cooler_warm.joinedRounds`, two and three rows, greedy and sampled: one batched draft chain over every row's head,
+  one grouped verify), and plain decode rows at every row count the load joins, with and without the hidden rows a
+  planner's plain tick keeps (`joinedRows`, through `arch/sched.rowsForward`). The head's rows kernels and the trunk's
+  one-row shared-expert launches run only there; the cut fixtures do not reach the latter (the real packs' codebooks).
+- **The warm crosses the indexer's budget with the drafter and prompt lookup off** (a prompt 8 short of it, 48
+  tokens): below the budget attention is dense, and from 1024 keys on a Max or an Ultra it takes two passes
+  (`attention.planOf`), a pipeline no shorter prompt and no request past the budget reaches. The warm's prompts repeat
+  a span, which the real model continues, so with lookup on its rounds draft by lookup alone and the head's chains past
+  the budget never ran: a 60k request then compiled the head's split-K attention in its first head chain.
 - **The warm's widest chunk is what fits the live headroom** (`bills.widestChunkAdmitted`, nothing borrowed): it runs
   before the server installs a request's adaptive width and borrow, so a fixed widest chunk (8192 rows, 23.6 GB billed)
   wired past a `--ssd-budget-gb 108` DeepSeek load and the watchdog panicked the box (2026-11-17). DeepSeek's forwards
@@ -722,6 +757,10 @@ rebuilds one.
   forwards are the request sweeps'), and a fixture whose phase makes another's very calls is not swept twice. A pool
   ask is armed as a site's n-th (`fault.armAt`), since a speculative request's asks do not come in one order. The
   sampled sweeps before reached about 0.04% of a load's 300k to 740k calls and stepped over a request's last token. A tensor released twice is latched and counted (`core.double_releases`), never returned to the pool twice.
+- **A handle used after its release is refused by name** (`core.ready`: `TensorUnsupported`): its box waits for the
+  next tensor and its store may already be another's. DeepSeek's `Scope.concat` of one part returned the part itself,
+  which a joined decode freed and then forwarded; a scope op that makes nothing new returns a handle of its own
+  (`Scope.share`), as every other op does.
 - **A read of bytes nothing wrote is caught by poison** (`mlx.engine.poison`): every buffer the pool hands out and
   every free one written over, the forwards and requests must give the clean bytes.
 - **The census counts the engine's work too**: every phase of a Cooler load's life dispatches the same at a later

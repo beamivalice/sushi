@@ -97,6 +97,7 @@ pub fn parseFamily(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.
         const spec = sushi_exl3.parseQuantBlock(block) catch return error.InvalidQwen4ConfigField;
         if (!spec.codebook.hasTable()) return error.InvalidQwen4ConfigField;
         config.trunk_quant = .{ .codebook = spec.codebook, .window = spec.window, .table = spec.table };
+        config.trunk_quant_rate = spec.rate;
     }
     try validateQwen4Config(config);
 }

@@ -1635,6 +1635,14 @@ pub const Trunk = struct {
         return self.lmHeadProject(x, false);
     }
 
+    /// The engine pool's bytes `lmHeadProject` (the full head) asks over `rows` rows: its 16-bit logits and the head's
+    /// scratch beside them.
+    pub fn lmHeadReadoutBytes(self: *const Trunk, rows: u64) u64 {
+        const vocab: u64 = @intCast(self.lmHeadRows());
+        const logits = @import("tensor/pool_class.zig").poolBytes(rows * vocab * 2);
+        return logits + self.lm_head.scratchBytes(self.linearCtx(), rows, self.config.hidden_size, vocab);
+    }
+
     /// The readout's width, whichever way the pack stores the head.
     pub fn lmHeadRows(self: *const Trunk) c_int {
         return if (trunk_stq.isStq(self.lm_head_w)) @intCast(trunk_stq.outDim(self.lm_head_w)) else mlx.getShape(self.lm_head_w)[0];
@@ -1781,8 +1789,9 @@ pub const Trunk = struct {
     /// chunks of this prefill already consumed (chunked vision prefill): the
     /// row lookup is a cumsum over THIS forward's mask, so the offset is what
     /// keeps a chunk boundary inside an image from restarting the scatter at
-    /// row 0. Frees `h` and returns the spliced replacement.
+    /// row 0. Takes `h` on every path, an error's too, and returns the spliced replacement.
     pub fn spliceVisionRows(h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32, video_token_id: u32, row_offset: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+        errdefer _ = mlx.mlx_array_free(h);
         const h_shape = mlx.getShape(h);
 
         // mask = (token_ids == image_token_id) [| (token_ids == video_token_id)].
@@ -1895,7 +1904,7 @@ pub const Trunk = struct {
 
     /// Apply vision embeddings to text embeddings during prefill.
     /// Handles scaling and splicing at image_token_id positions.
-    /// Returns the (potentially modified) h; caller should replace their h with the result.
+    /// Takes `h` on every path and returns the (potentially modified) h; caller should replace their h with the result.
     pub fn applyVisionEmbeddingsWith(self: *Trunk, ctx: *ForwardCtx, h: mlx.mlx_array, token_ids: mlx.mlx_array) !mlx.mlx_array {
         const cfg = &self.config;
         const h_shape = mlx.getShape(h);
@@ -2948,7 +2957,7 @@ pub const Trunk = struct {
         };
         var geometry = config.expertGeometry();
         geometry.drop = drop;
-        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop, .tile_major = traits.tile_major });
+        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop, .tile_major = traits.tile_major, .cache_bias = config.expertCacheBias() });
         return engine;
     }
 
@@ -5956,9 +5965,6 @@ test "spliceVisionRows: on the engine's stream the splice gives MLX's bytes, ima
         for ([_]mlx.mlx_stream{ gpu, mlx.engine.stream() }) |s| {
             const hf = try mlx.newData(hv.ptr, &[_]c_int{ 1, @intCast(t), @intCast(hidden) }, .float32);
             defer _ = mlx.mlx_array_free(hf);
-            // The splice takes `h`.
-            var h = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&h, hf, .bfloat16, s));
             const ef = try mlx.newData(ev.ptr, &[_]c_int{ 1, @intCast(c.rows), @intCast(hidden) }, .float32);
             defer _ = mlx.mlx_array_free(ef);
             var e = mlx.mlx_array_new();
@@ -5966,6 +5972,9 @@ test "spliceVisionRows: on the engine's stream the splice gives MLX's bytes, ima
             try mlx.check(mlx.mlx_astype(&e, ef, .bfloat16, s));
             const ids = try mlx.newData(c.ids.ptr, &[_]c_int{ 1, @intCast(t) }, .int32);
             defer _ = mlx.mlx_array_free(ids);
+            // The splice takes `h`.
+            var h = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&h, hf, .bfloat16, s));
             const out = try Trunk.spliceVisionRows(h, ids, e, 9, c.video, c.offset, s);
             defer _ = mlx.mlx_array_free(out);
             var cont = mlx.mlx_array_new();

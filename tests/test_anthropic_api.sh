@@ -345,7 +345,7 @@ else
 fi
 echo ""
 
-# ── Test 8: Missing max_tokens is refused (the boot sets no --max-tokens launch default) ──
+# ── Test 8: Missing max_tokens takes the filled default, as on every surface ──
 echo "--- Test 8: Missing max_tokens ---"
 RESULT=$(curl -s "$BASE/v1/messages" \
   -H "Content-Type: application/json" \
@@ -353,9 +353,8 @@ RESULT=$(curl -s "$BASE/v1/messages" \
     "model": "sushi",
     "messages": [{"role": "user", "content": "'"$N"' hi"}]
   }')
-ERR_TYPE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['error']['type'])" 2>/dev/null)
-assert_eq "error type is invalid_request_error" "invalid_request_error" "$ERR_TYPE"
-assert_contains "error mentions max_tokens" "max_tokens" "$RESULT"
+MSG_TYPE=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['type'])" 2>/dev/null)
+assert_eq "an omitted max_tokens answers a message" "message" "$MSG_TYPE"
 echo ""
 
 # ── Test 9: Error — missing messages ──

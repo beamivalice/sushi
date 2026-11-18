@@ -12,6 +12,20 @@ const scheduler = @import("../scheduler.zig");
 const sched = @import("../arch/sched.zig");
 const qsa_state = @import("qwen4_qsa_state.zig");
 
+/// The tier's held restore points are written where the process's copy is about to go (handover, unload, idle,
+/// shutdown).
+pub fn flushResident(entry: *@import("../model_registry.zig").LoadedModel, why: []const u8) void {
+    const hc = if (entry.prefix_cache) |*p| p else return;
+    const d = if (hc.disk) |*dd| dd else return;
+    if (d.held.items.len == 0) return;
+    d.flushHeld(why, arch_handle.stream(entry.handle orelse return));
+}
+
+/// A finished request may leave restore points held in RAM: the idle flush is armed.
+pub fn publishLive(sch: *Scheduler, _: *Slot, hc: *@import("../prefix_cache.zig").HotPrefixCache, _: []const u32) void {
+    if (hc.disk) |*d| if (d.hold_stride != 0) sch.live_unflushed.store(true, .release);
+}
+
 const Slot = scheduler.Slot;
 const Scheduler = scheduler.Scheduler;
 const Trunk = trunk_mod.Trunk;
@@ -79,6 +93,10 @@ pub fn batchedForward(
     hidden_rows: ?*?[]mlx.mlx_array,
 ) ![]mlx.mlx_array {
     _ = .{ sch, allocator, batch };
+    return rowsForward(xfm, next_tokens, ctxs, rope_offsets, arm, hidden_rows);
+}
+
+pub fn rowsForward(xfm: *Trunk, next_tokens: []const u32, ctxs: []const *ForwardCtx, rope_offsets: []const u32, arm: sched.BatchArm, hidden_rows: ?*?[]mlx.mlx_array) ![]mlx.mlx_array {
     if (arm.arm == arm_rows) return qwen4_forward.forwardQwen4DecodeRows(xfm, next_tokens, ctxs, hidden_rows);
     return qwen4_forward.forwardMoeBatchedDecode(xfm, next_tokens, ctxs, rope_offsets, hidden_rows);
 }

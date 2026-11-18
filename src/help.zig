@@ -162,17 +162,6 @@ const shared =
     \\                        reverts to the fixed windowed controller,
     \\                        cap 3). A --mtp-min-depth above that default
     \\                        lifts it. Each machine finds its own range.
-    \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
-    \\                        Use 0.2 for the Qwen3.8 matched comparison.
-    \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
-    \\                        Use 0.95 for the Qwen3.8 matched
-    \\                        comparison. Exclusive with
-    \\                        --mtp-typical; exact is the default.
-    \\  --mtp-greedy-tail   Sampled requests draft only the first MTP token
-    \\                        from the draft sampler, every later one by
-    \\                        argmax. Pays beside --mtp-typical (faster,
-    \\                        slightly more predictable text); greedy
-    \\                        requests are unchanged. Default off.
     \\  --max-mtp-ctx <n>   Keep MTP speculative decoding OFF past <n>
     \\                        context tokens (default: 0 = no ceiling).
     \\                        A verify row is BYTES, so on a long-context

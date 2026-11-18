@@ -68,7 +68,7 @@ fn Str(comptime N: usize) type {
     };
 }
 
-// ── Test seams: SUSHIBAR_TEST_POLLS, SUSHIBAR_TEST_ACTIONS (docs/envvar.md) ──
+// ── Test seams: SUSHIBAR_TEST_POLLS, SUSHIBAR_TEST_ACTIONS, SUSHIBAR_TEST_TICK_MS (docs/envvar.md) ──
 
 const ActionKind = enum { start, stop, load, unload, confirm, check, update, port, typed, models, remove, lan };
 const Action = struct { kind: ActionKind, at: u32, value: u32 = 0 };
@@ -76,9 +76,20 @@ var test_polls: u32 = 0;
 var test_actions: [12]Action = undefined;
 var test_action_n: usize = 0;
 var test_confirm = false;
+/// The menu's tick under test: every poll interval shrinks by `test_tick_ms / tick_ms`.
+var test_tick_ms: u32 = tick_ms;
+
+/// `ms` of the poll schedule at the test tick.
+fn ticked(ms: i64) i64 {
+    return @divTrunc(ms * test_tick_ms, tick_ms);
+}
 
 fn readTestSeams() void {
     test_polls = std.fmt.parseInt(u32, env("SUSHIBAR_TEST_POLLS") orelse "", 10) catch 0;
+    if (test_polls > 0) {
+        const t = std.fmt.parseInt(u32, env("SUSHIBAR_TEST_TICK_MS") orelse "", 10) catch tick_ms;
+        test_tick_ms = std.math.clamp(t, 10, tick_ms);
+    }
     var it = std.mem.tokenizeScalar(u8, env("SUSHIBAR_TEST_ACTIONS") orelse "", ',');
     while (it.next()) |item| {
         if (test_action_n == test_actions.len) break;
@@ -921,7 +932,7 @@ fn pollLoop() void {
             .changing = now < g_fast_until_ms.load(.acquire) or models_loading or busy or g_load_port.load(.acquire) != 0 or g_unload_port.load(.acquire) != 0,
         };
         const spent = io_util.nowMs(g_io) - now;
-        const wait = logic.pollWaitMs(activity) - spent;
+        const wait = ticked(logic.pollWaitMs(activity)) - spent;
         if (wait > 0) g_wake.waitTimeout(g_io, .{ .duration = .{ .raw = .fromMilliseconds(wait), .clock = .awake } }) catch {};
     }
 }
@@ -2167,7 +2178,7 @@ fn runMenuBar() noreturn {
     const quit_mi = addItem(menu, "Quit sushibar", "quit:", 0, "q", null);
     objc.msg(void, quit_mi, "setHidden:", .{true});
     objc.msg(void, status_item, "setMenu:", .{menu});
-    _ = objc.addTimer(@as(f64, tick_ms) / 1000.0, menu_target, "tick:");
+    _ = objc.addTimer(@as(f64, @floatFromInt(test_tick_ms)) / 1000.0, menu_target, "tick:");
     _ = objc.addTimer(0.5, menu_target, "logTick:");
 
     _ = std.Thread.spawn(.{}, pollLoop, .{}) catch fail("cannot start the poll thread", .{});

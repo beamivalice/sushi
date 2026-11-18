@@ -2476,7 +2476,7 @@ fn borrowCase(cache_bytes: u64) !void {
 
     // The first chunk finds the need less one and a half of the last two pools: those two go, the rest stay.
     const first = 25;
-    const need = borrow.prefillNeed(&dsv41_state.modelOf(&xfm).?.cfg, first, first);
+    const need = borrow.prefillNeed(&dsv41_state.modelOf(&xfm).?.cfg, @import("../cooler_side.zig").onEngine(&config), first, first);
     BorrowProbe.engine = engine;
     try testing.expectEqual(cache_bytes == 64 << 20, engine.plan.resident);
     BorrowProbe.base = need + engine.unionPending() - engine.poolBytes(last) - engine.poolBytes(last - 1) / 2;
@@ -3029,6 +3029,58 @@ const PmDir = struct {
     }
 };
 
+/// The feed `expectPmParity` gives both loads: a prefill, then decode and verify widths.
+const pm_feed = [_]usize{ 20, 2, 5, 3, 4, 6, 1, 1, 9 };
+
+/// The pack-order load's bytes over `pm_feed` and its draft at one expert budget.
+const PmReference = struct {
+    dir: []const u8,
+    slots: u64,
+    rows: [pm_feed.len][]const u8 = undefined,
+    chunks: usize = 0,
+    draft_ids: []const u32 = &.{},
+    draft_logits: []const u8 = &.{},
+    draft_conf: []const u8 = &.{},
+};
+
+/// The pack-order references made in this process, one a pack and budget: every pair-major pack is held to the same
+/// load's bytes, so that load runs once, not once a pair-major variant. Host bytes, kept past the test that made them.
+var pm_references: [4]?PmReference = @splat(null);
+var pm_reference_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+
+fn pmReference(dir: []const u8, ids: []const u32, sc: *Scope, slots: u64, s: mlx.mlx_stream) !*const PmReference {
+    for (&pm_references) |*r| if (r.*) |*x| if (x.slots == slots and std.mem.eql(u8, x.dir, dir)) return x;
+    const keep = pm_reference_arena.allocator();
+    var legacy: StqServed = undefined;
+    try legacy.init(dir, .bfloat16, true, true, slots, s);
+    defer legacy.deinit();
+    var ref: PmReference = .{ .dir = try keep.dupe(u8, dir), .slots = slots };
+    var at: usize = 0;
+    for (pm_feed) |n| {
+        const take = @min(n, ids.len - at);
+        if (take == 0) break;
+        const x = try model.extend(legacy.m, ids[at..][0..take], .all);
+        defer _ = mlx.mlx_array_free(x);
+        at += take;
+        const rows = try model.hostRows(sc, x);
+        defer testing.allocator.free(rows);
+        ref.rows[ref.chunks] = try keep.dupe(u8, std.mem.sliceAsBytes(rows));
+        ref.chunks += 1;
+    }
+    var d = try model.draft(legacy.m, ids[0], true);
+    defer d.deinit();
+    ref.draft_ids = try keep.dupe(u32, d.ids);
+    ref.draft_logits = try keep.dupe(u8, std.mem.sliceAsBytes(d.logits));
+    ref.draft_conf = try keep.dupe(u8, std.mem.sliceAsBytes(d.conf));
+    // The pack-order load's fills reshuffle its tiles into the tile-major pools.
+    try testing.expect(legacy.engine.fillStats().bytes_reshuffled > 0);
+    for (&pm_references) |*r| if (r.* == null) {
+        r.* = ref;
+        return &r.*.?;
+    };
+    return error.TestUnexpectedResult;
+}
+
 /// `direct_bytes`: at least this many fill bytes of the resident load (every expert read once) skip the bounce buffer.
 fn expectPmParity(dir: []const u8, pm_path: []const u8, direct_bytes: u64, budgets: []const u64) !void {
     try mlx.requireGpu();
@@ -3040,37 +3092,30 @@ fn expectPmParity(dir: []const u8, pm_path: []const u8, direct_bytes: u64, budge
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
     for (budgets) |slots| {
-        var legacy: StqServed = undefined;
-        try legacy.init(dir, .bfloat16, true, true, slots, s);
-        defer legacy.deinit();
+        const want = try pmReference(dir, ids, &sc, slots, s);
         var major: StqServed = undefined;
         try major.init(pm_path, .bfloat16, true, true, slots, s);
         defer major.deinit();
         var at: usize = 0;
-        for ([_]usize{ 20, 2, 5, 3, 4, 6, 1, 1, 9 }) |n| {
+        var chunks: usize = 0;
+        for (pm_feed) |n| {
             const take = @min(n, ids.len - at);
             if (take == 0) break;
-            const a = try model.extend(legacy.m, ids[at..][0..take], .all);
-            defer _ = mlx.mlx_array_free(a);
             const b = try model.extend(major.m, ids[at..][0..take], .all);
             defer _ = mlx.mlx_array_free(b);
             at += take;
-            const ga = try model.hostRows(&sc, a);
-            defer testing.allocator.free(ga);
             const gb = try model.hostRows(&sc, b);
             defer testing.allocator.free(gb);
-            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ga), std.mem.sliceAsBytes(gb));
+            try testing.expectEqualSlices(u8, want.rows[chunks], std.mem.sliceAsBytes(gb));
+            chunks += 1;
         }
-        var da = try model.draft(legacy.m, ids[0], true);
-        defer da.deinit();
+        try testing.expectEqual(want.chunks, chunks);
         var db = try model.draft(major.m, ids[0], true);
         defer db.deinit();
-        try testing.expectEqualSlices(u32, da.ids, db.ids);
-        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(da.logits), std.mem.sliceAsBytes(db.logits));
-        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(da.conf), std.mem.sliceAsBytes(db.conf));
-        const old = legacy.engine.fillStats();
+        try testing.expectEqualSlices(u32, want.draft_ids, db.ids);
+        try testing.expectEqualSlices(u8, want.draft_logits, std.mem.sliceAsBytes(db.logits));
+        try testing.expectEqualSlices(u8, want.draft_conf, std.mem.sliceAsBytes(db.conf));
         const new = major.engine.fillStats();
-        try testing.expect(old.bytes_reshuffled > 0);
         try testing.expectEqual(@as(u64, 0), new.bytes_reshuffled);
         try testing.expect(new.bytes_read > 0);
         if (slots == 8) try testing.expect(new.bytes_read - new.bytes_bounced >= direct_bytes);
@@ -3106,7 +3151,8 @@ test "dsv41 pair-major: a pair-major pack with one trellis off its page still pa
     const dir = try stqDir();
     var pm = try PmDir.makeAlignedExcept(dir, ".up_proj.g0.");
     defer pm.deinit();
-    try expectPmParity(dir, pm.path, 8 * 2 * 16384, &.{ 8, 6 });
+    // At the budget alone: an evicting budget is the plain and the page-aligned pack's.
+    try expectPmParity(dir, pm.path, 8 * 2 * 16384, &.{8});
 }
 
 test "dsv41 pair-major: the resident bill and load of a padded pair-major pack equal the pack-order pack's (DSV41_STQ_TINY)" {
@@ -3123,7 +3169,8 @@ test "dsv41 pair-major: the resident bill and load of a padded pair-major pack e
 test "dsv41 pair-major: the repacker's pair-major copy of the tiny pack gives the same bytes (DSV41_STQ_TINY, its -pm sibling)" {
     const dir = try stqDir();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    try expectPmParity(dir, siblingPm(&buf, dir) orelse return error.SkipZigTest, 0, &.{ 8, 6 });
+    // At the budget alone: an evicting budget is the plain and the page-aligned pack's.
+    try expectPmParity(dir, siblingPm(&buf, dir) orelse return error.SkipZigTest, 0, &.{8});
 }
 
 test "dsv41 pair-major: `sushi repack` of a copy of the tiny pack gives a pack that serves the pack-order pack's bytes (DSV41_STQ_TINY)" {
@@ -3144,7 +3191,8 @@ test "dsv41 pair-major: `sushi repack` of a copy of the tiny pack gives a pack t
         try tmp.dir.writeFile(io, .{ .sub_path = entry.name, .data = bytes });
     }
     try testing.expectEqual(@import("repack.zig").Outcome.repacked, try @import("repack.zig").repackPack(testing.allocator, io, copy, .{ .workers = 2 }));
-    try expectPmParity(dir, copy, 0, &.{ 8, 6 });
+    // At the budget alone: an evicting budget is the plain and the page-aligned pack's.
+    try expectPmParity(dir, copy, 0, &.{8});
 }
 
 test "dsv41 pair-major: a pack-order pool cannot take pair-major tiles, and a uniform layer cannot be pair-major (DSV41_STQ_TINY)" {

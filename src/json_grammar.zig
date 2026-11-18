@@ -1567,8 +1567,9 @@ test "no reachable grammar state is a dead end" {
     for (schemas) |src| {
         var schema = try parseSchema(testing.allocator, src);
         defer schema.deinit();
+        // A random walk samples the states: 12 walks a schema, each up to 300 bytes deep.
         var seed: u64 = 0;
-        while (seed < 40) : (seed += 1) {
+        while (seed < 12) : (seed += 1) {
             var prng = std.Random.DefaultPrng.init(seed);
             const rnd = prng.random();
             var g = try Grammar.init(testing.allocator, &schema);

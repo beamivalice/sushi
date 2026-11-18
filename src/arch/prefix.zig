@@ -308,6 +308,15 @@ pub fn diskCheckpointCap(config: *const model.ModelConfig) ?u32 {
 /// The stream a prefix cache's arrays live on: a Cooler load's side (`cooler_side`), null for MLX's.
 pub const arraysOn = @import("../cooler_side.zig").stream;
 
+/// The arch keeps its off-grid restore points (a prompt end, a reply end) in RAM under SSD-first, writing them only
+/// when they would be lost or no newer point extends them (docs/engine-prefix-cache.md#held-points).
+pub fn holdsOffGridPoints(config: *const model.ModelConfig) bool {
+    const tag = registry.ofModelType(config.model_type) orelse return false;
+    return switch (tag) {
+        inline else => |t| comptime @hasDecl(P(t), "holds_off_grid_points") and P(t).holds_off_grid_points,
+    };
+}
+
 /// Tells the SSD tier how the arch's restore points split into rows that grow with the prompt and fixed arrays.
 pub fn setDiskGrownSpec(allocator: std.mem.Allocator, config: *const model.ModelConfig, tier: *kv_disk_cache.DiskTier) !void {
     const tag = registry.ofModelType(config.model_type) orelse return;

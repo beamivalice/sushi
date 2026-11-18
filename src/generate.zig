@@ -14,7 +14,6 @@ const rp_mod = @import("reasoning_protocol.zig");
 const io_util = @import("io_util.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
 const mtp_mod = @import("mtp.zig");
-const mtp_acceptance = @import("mtp_acceptance.zig");
 const round_cost = @import("round_cost.zig");
 const spec_cost_gate = @import("spec_cost_gate.zig");
 const spec_stats = @import("spec_stats.zig");
@@ -608,13 +607,7 @@ pub const Generator = struct {
     // KV cache — OWNED by the Generator (built during prefill, freed in
     // `deinit`).
     mtp: ?MtpHeadRef = null,
-    /// Installed verifier route; selected once at init, not checked per token.
     opts: spec_types.RoundOpts,
-    mtp_accept_graph: mtp_round.MtpGraphFn = mtpBatchedExactGraph,
-    mtp_accept_prefix: mtp_acceptance.PrefixFn = mtp_acceptance.exactPrefix,
-    mtp_accept_param: f32 = 0,
-    /// A sampled request drafts only depth 0 from the draft sampler, every later depth by argmax.
-    mtp_greedy_tail: bool = false,
     /// Does the model have a usable MTP head? `--no-mtp` clears it; a per-request `enable_mtp:false` does not.
     model_has_mtp: bool = false,
     mtp_cache: ?MtpCacheRef = null,
@@ -1089,9 +1082,6 @@ pub const Generator = struct {
         /// final-token forward captures `last_hidden`, exactly like the
         /// drafter path. Same lazy-pre-forward skip semantics as drafter.
         mtp_enabled: bool = false,
-        /// Explicit verifier selected by the caller at construction.
-        mtp_acceptance: mtp_acceptance.Mode = .exact,
-        mtp_greedy_tail: bool = false,
         /// Non-owning pointer to the loaded MTP head.
         mtp: ?MtpHeadRef = null,
         /// The model's head before this request's opt-out (the qwen4 weights load with the trunk regardless).
@@ -1411,23 +1401,6 @@ pub const Generator = struct {
         // forwarded tail — RoPE offsets are cache-relative, so a late-starting
         // history is self-consistent (sliding-window history semantics).
         const mtp_active = options.mtp_enabled and options.mtp != null;
-        const AcceptRoute = struct {
-            graph: mtp_round.MtpGraphFn,
-            prefix: mtp_acceptance.PrefixFn,
-            param: f32,
-        };
-        const accept_route: AcceptRoute = switch (options.mtp_acceptance) {
-            .exact => .{ .graph = mtpBatchedExactGraph, .prefix = mtp_acceptance.exactPrefix, .param = 0 },
-            .typical => |cfg| .{ .graph = mtpBatchedTypicalGraph, .prefix = mtp_acceptance.typicalPrefix, .param = cfg.delta },
-            .tokenv3 => |alpha| .{ .graph = mtpBatchedTokenV3Graph, .prefix = mtp_acceptance.tokenV3Prefix, .param = alpha },
-        };
-        if (mtp_active and std.meta.activeTag(options.mtp_acceptance) != .exact) {
-            switch (options.mtp_acceptance) {
-                .typical => |cfg| log.info("  [mtp-accept] typical delta={d:.3} eps={d:.3} NOT distribution-exact\n", .{ cfg.delta, cfg.eps }),
-                .tokenv3 => |alpha| log.info("  [mtp-accept] TokenV3 alpha={d:.3} NOT distribution-exact\n", .{alpha}),
-                .exact => unreachable,
-            }
-        }
         var mtp_cache: ?MtpCacheRef = null;
         var mtp_position_base: usize = ssm_cp_offset;
         var mtp_history_started = false;
@@ -2150,10 +2123,6 @@ pub const Generator = struct {
                 .native_prefill_window = native_window,
                 .dflash_block_size = dflash_bs,
                 .mtp = if (mtp_active) options.mtp else null,
-                .mtp_accept_graph = accept_route.graph,
-                .mtp_accept_prefix = accept_route.prefix,
-                .mtp_accept_param = accept_route.param,
-                .mtp_greedy_tail = options.mtp_greedy_tail,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
                 .mtp_depth = mtp_cap,
@@ -2810,8 +2779,13 @@ pub const Generator = struct {
             self.advanceStep(1);
             self.dropPending();
         } else {
-            // Spec exit: `next_token_id` is decided but not in the cache.
-            try input.append(allocator, self.next_token_id);
+            // Spec exit: `next_token_id` is decided but not in the cache. It goes in alone, as the pipelined state
+            // forwarded it, so the forced ids take one width whichever state the bound fired in.
+            const tok_i32: i32 = @intCast(self.next_token_id);
+            const tok_shape = [_]c_int{ 1, 1 };
+            const tok_input = try idsArray(self.xfm, @ptrCast(&tok_i32), &tok_shape);
+            defer _ = mlx.mlx_array_free(tok_input);
+            _ = mlx.mlx_array_free(try self.xfm.forwardWith(&self.ctx, tok_input));
             try self.generated_ids.append(allocator, self.next_token_id);
             try emitted.append(allocator, self.next_token_id);
             self.advanceStep(1);
@@ -3017,16 +2991,10 @@ pub const Generator = struct {
         }
     }
 
-    pub const acceptGraphFor = mtp_round.acceptGraphFor;
-    pub const acceptPrefixFor = mtp_round.acceptPrefixFor;
     pub const mtpAcceptRowGreedy = mtp_round.mtpAcceptRowGreedy;
     pub const mtpApplyStash = mtp_round.mtpApplyStash;
     pub const mtpBatchHeadPosition = mtp_round.mtpBatchHeadPosition;
     pub const mtpBatchedAcceptGraph = mtp_round.mtpBatchedAcceptGraph;
-    pub const mtpBatchedExactGraph = mtp_round.mtpBatchedExactGraph;
-    pub const mtpBatchedLossyGraph = mtp_round.mtpBatchedLossyGraph;
-    pub const mtpBatchedTokenV3Graph = mtp_round.mtpBatchedTokenV3Graph;
-    pub const mtpBatchedTypicalGraph = mtp_round.mtpBatchedTypicalGraph;
     pub const mtpChainBuild = mtp_round.mtpChainBuild;
     pub const mtpChainBuildBatched = mtp_round.mtpChainBuildBatched;
     pub const mtpChainBuildBatchedActive = mtp_round.mtpChainBuildBatchedActive;
@@ -3037,12 +3005,13 @@ pub const Generator = struct {
     pub const mtpCommittedLen = mtp_round.mtpCommittedLen;
     pub const mtpDetachHead = mtp_round.mtpDetachHead;
     pub const mtpDraftActiveRows = mtp_round.mtpDraftActiveRows;
-    pub const mtpDraftGreedyAt = mtp_round.mtpDraftGreedyAt;
+    pub const mtpDraftDraw = mtp_round.mtpDraftDraw;
     pub const mtpDraftGreedyFor = mtp_round.mtpDraftGreedyFor;
     pub const mtpDraftSampling = mtp_round.mtpDraftSampling;
     pub const mtpDraftSamplingFor = mtp_round.mtpDraftSamplingFor;
     pub const mtpDraftStepPath = mtp_round.mtpDraftStepPath;
     pub const mtpDraftTempFor = mtp_round.mtpDraftTempFor;
+    pub const mtpDrawsAtPositions = mtp_round.mtpDrawsAtPositions;
     pub const mtpFullAccept = mtp_round.mtpFullAccept;
     pub const mtpGreedyVerdict = mtp_round.mtpGreedyVerdict;
     pub const mtpGroupAccept = mtp_round.mtpGroupAccept;
@@ -3950,6 +3919,7 @@ fn logEngineStats() void {
         if (gpuShareLine(&gpu_buf, mlx.engine.gpuTimeTaken())) |line| log.info("  [engine] {s}\n", .{line});
         log.debug("  [engine] since load: {d} dispatches, {d} command buffers, {d} waits, {d} imports, {d} kernel keys built, {d} lends ({d} of a weight the engine wraps), {d} ops on MLX, {d} calls refused; slice updates {d} in place, {d} copied; pool {d} MB, {d} free, {d} asked by tensors in use, {d} buffers released for the budget; {d} kernels compiled after the load; GPU busy {d} ms, idle between passes {d} ms; pauses under 20 us / 100 us / 1 ms / longer: {d} ({d} ms) / {d} ({d} ms) / {d} ({d} ms) / {d} ({d} ms); before other / forward / draft / verify / round end: {d} / {d} / {d} / {d} / {d} ms; {d} MLX calls\n", .{ e.dispatches, e.submits, e.waits, e.imports, mlx.engine.kernelKeyBuilds(), e.lends, e.mapped_lends, mlx.engine.mlx_ops, mlx.engine.refusals, e.updates_in_place, e.updates_copied, e.pool_bytes >> 20, e.pool_free >> 20, e.pool_asked >> 20, e.pool_evictions, mlx.engine.latePipelines(), e.gpu_busy_ns / std.time.ns_per_ms, e.gpu_gap_ns / std.time.ns_per_ms, e.gpu_gap_count[0], e.gpu_gap_sum[0] / std.time.ns_per_ms, e.gpu_gap_count[1], e.gpu_gap_sum[1] / std.time.ns_per_ms, e.gpu_gap_count[2], e.gpu_gap_sum[2] / std.time.ns_per_ms, e.gpu_gap_count[3], e.gpu_gap_sum[3] / std.time.ns_per_ms, e.gpu_gap_phase[0] / std.time.ns_per_ms, e.gpu_gap_phase[1] / std.time.ns_per_ms, e.gpu_gap_phase[2] / std.time.ns_per_ms, e.gpu_gap_phase[3] / std.time.ns_per_ms, e.gpu_gap_phase[4] / std.time.ns_per_ms, mlx.engine.mlxCalls() });
         mlx.engine.logKernelProfile(1);
+        mlx.engine.logPoolPeakTrace();
     }
     logMlxCalls();
 }

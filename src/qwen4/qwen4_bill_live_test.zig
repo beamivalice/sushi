@@ -11,7 +11,6 @@ const std = @import("std");
 const trunk = @import("../trunk.zig");
 const request_policy = @import("../request_policy.zig");
 const clampMaxTokens = request_policy.clampMaxTokens;
-const omittedMaxTokensDefaultWith = request_policy.omittedMaxTokensDefaultWith;
 const server = @import("../server.zig");
 const prefillRequestTerms = server.prefillRequestTerms;
 const qsaScoreFusedOffGuard = @import("qwen4_bill_test.zig").qsaScoreFusedOffGuard;
@@ -116,6 +115,26 @@ test "chooseRequestPrefillChunk: the rung the gate widened clears its bill by th
     try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, 8192, .{}));
     // The rungs the gate did not widen are still taken at their plain bill.
     try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, narrow_bill, pin, 8192, .{}));
+}
+
+test "chooseRequestPrefillChunk: on Sushi Cooler the widened rung clears its exact bill alone, no estimator margin" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    var cfg = fixtures.qwen4RequestTestConfig();
+    cfg.cooler_for_test = true;
+    cfg.expert_layout = .exl3_k4;
+    cfg.expert_quant_codebook = .spec1;
+    cfg.trunk_quant = null;
+    cfg.quant_bits = 0;
+    try t.expect(bills.coolerPrefillRowBytes(&cfg) > 0);
+    const kv_bits: u64 = 8;
+    const seq: u64 = 300_000;
+    const pin = cfg.pinned_prefill_chunk;
+    try t.expectEqual(@as(u64, 4096), bills.rungWidth(&cfg, seq, 8192, false));
+    const wide_bill = bills.prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 8192, .{});
+    try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, 8192, .{}));
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill - 1, pin, 8192, .{}));
 }
 
 test "prefillNeededAtChunk: the deployed pack's 8192 step is at least the measured peak step" {
@@ -357,7 +376,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     const max_tokens: u32 = @intCast(bills.getEffectiveContextLength(&cfg) - seq);
     const shared = bills.WarmPrefix{ .matched_tokens = 448_531, .capacity_tokens = 448_531, .will_donate = false };
     const needed = bills.prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, shared);
-    try t.expectEqual(@as(u64, 11_456), needed / mb);
+    try t.expectEqual(@as(u64, 17_492), needed / mb);
     try t.expect(needed > bills.gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, 0) -| footprint);
     const lifted = bills.gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, bills.wiredCeilingFloorForRam(&cfg, total_ram));
     try t.expectEqual(@as(u64, 31_254), (lifted -| footprint) / mb);
@@ -390,28 +409,27 @@ test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bi
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
     const t = std.testing;
-    // An omitted `max_tokens` is maxInt(u32)/4; the memory guard used to run before
-    // `clampMaxTokens`, so the reservation billed ~26 TB of KV and refused every long prompt.
+    // An omitted `max_tokens` was maxInt(u32)/4 and the memory guard ran before `clampMaxTokens`,
+    // so the reservation billed ~26 TB of KV and refused every long prompt. A budget past the
+    // window is still a client's to send.
     const KVCache = trunk.KVCache;
     const ctx: u64 = 262_144;
     const seq: u64 = 50_000;
-    const sentinel: u64 = omittedMaxTokensDefaultWith(@intCast(ctx), 0, 0);
-    try t.expectEqual(@as(u64, std.math.maxInt(u32) / 4), sentinel);
+    const huge: u64 = std.math.maxInt(u32) / 4;
 
     // (1) The cache clamps: the reservation cannot exceed the context plus a chunk.
-    const reserved = KVCache.reservedTokens(seq, sentinel, 4096, ctx);
-    // Bounded twice: by the generation headroom first, by the context second.
-    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + 4096, reserved);
-    try t.expect(reserved < ctx);
+    const reserved = KVCache.reservedTokens(seq, huge, 4096, ctx);
+    // Bounded by the context: the prompt, the room past it, and a chunk.
+    try t.expectEqual(ctx + 4096, reserved);
     // (2) The four surfaces clamp first and hand the guard the clamped value.
-    const clamped: u64 = clampMaxTokens(@intCast(sentinel), @intCast(seq), @intCast(ctx));
+    const clamped: u64 = clampMaxTokens(@intCast(huge), true, @intCast(seq), @intCast(ctx));
     try t.expectEqual(ctx - seq, clamped);
     try t.expectEqual(reserved, KVCache.reservedTokens(seq, clamped, 4096, ctx));
 
     try t.expectEqual(seq + 2048 + 4096, KVCache.reservedTokens(seq, 2048, 4096, ctx));
-    // A caller that names no context is not context-clamped, but the headroom bound still applies.
-    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + 4096, KVCache.reservedTokens(seq, sentinel, 4096, 0));
-    try t.expectEqual(ctx + 4096, KVCache.reservedTokens(ctx, sentinel, 4096, ctx));
+    // A context of 0 (none known; a served request always has one) leaves no room to generate into.
+    try t.expectEqual(seq + 4096, KVCache.reservedTokens(seq, huge, 4096, 0));
+    try t.expectEqual(ctx + 4096, KVCache.reservedTokens(ctx, huge, 4096, ctx));
 
     const cfg = qwen4ExpOomConfig();
     const terms = prefillRequestTerms(&cfg, seq, clamped, 8, 4096, .{});

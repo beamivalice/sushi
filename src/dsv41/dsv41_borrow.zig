@@ -21,9 +21,10 @@ pub var headroom_fn: ?*const fn (*const ModelConfig) u64 = null;
 /// The widest verify block: up to it a forward is a decode forward, whose cap admission always reserves.
 pub const verify_rows = cfg_mod.verify_rows;
 
-/// What a prefill-width forward must find free before it runs: the most it may allocate (`Config.forwardCap`).
-pub fn prefillNeed(c: *const Config, rows: u64, seq: u64) u64 {
-    return c.forwardCap(rows, seq);
+/// What a prefill-width forward must find free before it runs: the most it may allocate on its side
+/// (`Config.forwardCapOn`).
+pub fn prefillNeed(c: *const Config, engine: bool, rows: u64, seq: u64) u64 {
+    return c.forwardCapOn(engine, rows, seq);
 }
 
 /// PURE: the MLX buffer-pool cap of a forward of `rows`: the decode cap up to a verify block, the RAM-wide cap above
@@ -114,15 +115,14 @@ fn setTransient(bytes: u64, ops: PoolOps) void {
 pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const Config, ops: PoolOps) bool {
     if (!arch_config.isOf(config, "dsv41")) return false;
     const own = cooler_side.onEngine(config);
-    if (pool_ram_cap == 0) {
-        enterWarm(rows, seq, c, own, ops);
-        return false;
-    }
     const split = splitOf(rows, seq, c, own);
+    // The engine's cap is the forward's own whether or not `serve` installed MLX's: the rest a request's end leaves in
+    // force would refuse a wide chunk mid-forward, and none would let it hold past its bill.
     if (own) {
-        ops.set_own(split.own);
+        ops.set_own(ownBudget(split.own));
         return false;
     }
+    if (pool_ram_cap == 0) return false;
     setTransient(phaseLimit(split.mlx, config), ops);
     return moveCap(rowsCap(rows, config), config, ops);
 }
@@ -131,17 +131,11 @@ pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const C
 pub fn enterRows(seqs: []const u64, config: *const ModelConfig, c: *const Config, ops: PoolOps) bool {
     if (!arch_config.isOf(config, "dsv41")) return false;
     const cap = c.joinedCap(seqs);
-    if (pool_ram_cap == 0) {
-        if (warm_budget and cooler_side.onEngine(config)) {
-            warm_budget_set = true;
-            ops.set_own(warm_budget_override orelse cap);
-        }
-        return false;
-    }
     if (cooler_side.onEngine(config)) {
-        ops.set_own(cap);
+        ops.set_own(ownBudget(cap));
         return false;
     }
+    if (pool_ram_cap == 0) return false;
     setTransient(phaseLimit(cap, config), ops);
     return moveCap(rowsCap(seqs.len, config), config, ops);
 }
@@ -154,12 +148,18 @@ pub fn beforeRowsForward(engine: *stream.Engine, config: *const ModelConfig, c: 
     return restore(engine, config, headroom, c.joinedCap(seqs));
 }
 
+/// The engine's budget of a forward that bills `bytes`; the warm's, which `endWarm` lifts, while it runs.
+fn ownBudget(bytes: u64) u64 {
+    if (!warm_budget) return bytes;
+    warm_budget_set = true;
+    return warm_budget_override orelse bytes;
+}
+
 /// A forward of the load's warm: the engine's share of the cap a request's forward of `rows` ending at `seq` has. Nothing
 /// outside the warm.
 pub fn enterWarm(rows: u64, seq: u64, c: *const Config, own: bool, ops: PoolOps) void {
     if (!warm_budget or !own) return;
-    warm_budget_set = true;
-    ops.set_own(warm_budget_override orelse splitOf(rows, seq, c, own).own);
+    ops.set_own(ownBudget(splitOf(rows, seq, c, own).own));
 }
 
 pub fn enterWarmMlx(rows: u64, seq: u64, c: *const Config, own: bool) void {
@@ -181,7 +181,7 @@ pub fn endWarmMlx() void {
 /// What a forward's cap leaves to MLX and to the engine of our own. A wide chunk on the engine takes the whole cap its
 /// bill reserves: the state rows it appends grow in the engine's pool with the rest, and MLX allocates nothing.
 fn splitOf(rows: u64, seq: u64, c: *const Config, own: bool) struct { mlx: u64, own: u64 } {
-    const cap = c.forwardCap(rows, seq);
+    const cap = c.forwardCapOn(own, rows, seq);
     if (!own) return .{ .mlx = cap, .own = 0 };
     return .{ .mlx = 0, .own = if (rows > verify_rows) cap else ownCap(c, own, seq) };
 }
@@ -328,7 +328,7 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
     const headroom = headroom_fn orelse return;
     if (engine.borrow_from >= engine.layers.len) return;
     if (rows <= verify_rows) return restore(engine, config, headroom, c.forwardCap(rows, seq));
-    const need = prefillNeed(c, rows, seq);
+    const need = prefillNeed(c, cooler_side.onEngine(config), rows, seq);
     if (headroom(config) >= need) return;
     _ = mlx.mlx_clear_cache();
     const before = headroom(config);
@@ -428,12 +428,12 @@ test "dsv41 borrow: a forward releases pools in order until the headroom covers 
 }
 
 test "dsv41 borrow: a forward's need is its cap, a decode forward's far smaller" {
-    const c = try cfg_mod.parseText(cfg_mod.release_config);
+    const c = try cfg_mod.releaseStqForTest();
     const ctx: u64 = 1 << 20;
-    try testing.expectEqual(c.forwardCap(2048, ctx), prefillNeed(&c, 2048, ctx));
+    try testing.expectEqual(c.forwardCap(2048, ctx), prefillNeed(&c, true, 2048, ctx));
     // A last chunk that absorbed its tail is priced at its own rows.
-    try testing.expect(prefillNeed(&c, 2048 + 511, ctx) > prefillNeed(&c, 2048, ctx));
-    try testing.expect(c.forwardCap(verify_rows, ctx) * 3 < prefillNeed(&c, 512, ctx) * 2);
+    try testing.expect(prefillNeed(&c, true, 2048 + 511, ctx) > prefillNeed(&c, true, 2048, ctx));
+    try testing.expect(c.forwardCap(verify_rows, ctx) * 3 < prefillNeed(&c, true, 512, ctx) * 2);
 }
 
 test "dsv41 borrow: the load-time estimate is the decoder layers' even share of the cache, STQ packs only" {
@@ -455,16 +455,17 @@ test "dsv41 borrow: the pool cap is the decode cap up to a verify block and the 
     try testing.expectEqual(@as(u64, 1 << 20), poolCap(4096, decode, 1 << 20));
 }
 
-test "dsv41 borrow: at the budget-115 geometry no chunk releases a pool, and at 117 a 2048-row chunk releases one" {
-    const c = try cfg_mod.parseText(cfg_mod.release_config);
+test "dsv41 borrow: at the budget-115 and 117 geometries no chunk releases a pool, and under a 2048-row chunk's cap one goes" {
+    const c = try cfg_mod.releaseStqForTest();
     // Live at `--ssd-budget-gb 115` (280 slots a layer): the decoder pools a prefill may release, and the headroom there.
     const pools = [_]u64{ 2_700_000_000, 2_700_000_000, 2_760_000_000 };
     const headroom: u64 = 8_950_000_000;
-    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, 31, 14766), headroom));
-    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, 2048, 2048), headroom));
-    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, 2048 + 511, 1 << 20), headroom));
-    // At 117 the headroom is ~4.6 GB.
-    try testing.expectEqual(@as(?usize, 1), releaseCount(&pools, prefillNeed(&c, 2048, 2048), 4_600_000_000));
+    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 31, 14766), headroom));
+    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), headroom));
+    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048 + 511, 1 << 20), headroom));
+    // At 117 the headroom is ~4.6 GB, over the 4.38 GB a 2048-row chunk holds on the engine; under it, one pool goes.
+    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 4_600_000_000));
+    try testing.expectEqual(@as(?usize, 1), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 4_000_000_000));
 }
 
 const PoolProbe = struct {
@@ -587,12 +588,33 @@ test "dsv41 borrow: a joined decode forward of one request installs that request
                 try testing.expectEqual(solo, .{ PoolProbe.own, PoolProbe.transient });
                 PoolProbe.reset();
                 _ = enterRows(&.{ 4097, 70_000 }, &config, c, PoolProbe.ops);
-                const two = c.forwardCap(1, 4097) + c.forwardCap(1, 70_000) - cfg_mod.cap_slack_bytes;
+                const two = c.forwardCap(1, 4097) + c.forwardCap(1, 70_000) - cfg_mod.cap_fixed_bytes;
                 if (cooler) try testing.expectEqual(two, PoolProbe.own) else try testing.expectEqual(two, PoolProbe.transient - config.expertPoolBytes());
             }
         }
     };
     try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: a forward on the engine runs under its own cap whether or not serve installed MLX's, never under the rest a request's end left" {
+    const Body = struct {
+        fn run() anyerror!void {
+            var config = try dsv41Config();
+            const c = &config.dsv41.?;
+            config.cooler_for_test = true;
+            PoolProbe.own = @import("../arch/cooler.zig").restCap(&config);
+            _ = enterForward(4097, 4097, &config, c, PoolProbe.ops);
+            try testing.expectEqual(c.forwardCap(4097, 4097), PoolProbe.own);
+            _ = enterForward(1, 4098, &config, c, PoolProbe.ops);
+            try testing.expectEqual(c.forwardCap(verify_rows, 4098), PoolProbe.own);
+            _ = enterRows(&.{ 4099, 9_000 }, &config, c, PoolProbe.ops);
+            try testing.expectEqual(c.joinedCap(&.{ 4099, 9_000 }), PoolProbe.own);
+            // MLX's caps stay serve's to move.
+            try testing.expectEqual(@as(usize, 0), PoolProbe.n);
+            try testing.expectEqual(@as(usize, 0), PoolProbe.transient_sets);
+        }
+    };
+    try withPoolState(0, &Body.run);
 }
 
 test "dsv41 borrow: a wide chunk of a pack that decodes on MLX keeps the whole cap on MLX" {
@@ -602,7 +624,7 @@ test "dsv41 borrow: a wide chunk of a pack that decodes on MLX keeps the whole c
             const c = &config.dsv41.?;
             config.cooler_for_test = false;
             _ = enterForward(2048, 2048, &config, c, PoolProbe.ops);
-            try testing.expectEqual(c.forwardCap(2048, 2048), PoolProbe.transient - config.expertPoolBytes());
+            try testing.expectEqual(c.mlxForwardCap(2048, 2048), PoolProbe.transient - config.expertPoolBytes());
             try testing.expectEqual(@as(u64, 0), PoolProbe.own);
         }
     };
@@ -619,8 +641,6 @@ test "dsv41 borrow: the load's warm gives each engine forward, of any width, the
                 warm_budget = false;
                 warm_budget_set = false;
             }
-            // Outside the warm a forward is not capped before `serve` installs the caps, as `sushi kld` and the tests are not.
-            _ = enterForward(2048, 2048, &config, c, PoolProbe.ops);
             enterWarm(1, 4096, c, true, PoolProbe.ops);
             try testing.expectEqual(@as(u64, 0), PoolProbe.own);
             warm_budget = true;
@@ -661,7 +681,7 @@ test "dsv41 borrow: every phase installs the cap it bills and the decode pool be
             _ = enterForward(17, 225_000, &config, c, PoolProbe.ops);
             try testing.expectEqual(c.forwardCap(17, 225_000) + pool, PoolProbe.transient);
             _ = enterForward(2048, 225_000, &config, c, PoolProbe.ops);
-            try testing.expectEqual(c.forwardCap(2048, 225_000) + pool, PoolProbe.transient);
+            try testing.expectEqual(c.mlxForwardCap(2048, 225_000) + pool, PoolProbe.transient);
             // The same rows further into the context cost more: the cap follows the position.
             const before = PoolProbe.transient;
             _ = enterForward(2048, 1 << 20, &config, c, PoolProbe.ops);

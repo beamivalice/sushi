@@ -76,8 +76,16 @@ pub const DECODED_SCRATCH_BYTES: u64 = 2 * DECODED_MAX_WEIGHTS * 2;
 
 /// Whether a one-bank linear of `rows` x `in` -> `out` takes the decoded path; `billed` says its caller's transient
 /// bill holds `DECODED_SCRATCH_BYTES`.
+/// Whether a decoded weight can serve on this machine at all: the route is on and the GPU runs MLX's NAX GEMM.
+pub fn decodedCanServe() bool {
+    if (@import("builtin").is_test) if (can_serve_for_test) |v| return v;
+    return enabled and kernels.gemmNaxOn();
+}
+/// Test seam: whether this machine's GPU serves the decoded weight, in place of asking it.
+pub var can_serve_for_test: ?bool = null;
+
 pub fn decodedServes(billed: bool, rows: c_int, in: c_int, out: c_int) bool {
-    return enabled and billed and rows >= DECODED_MIN_ROWS and @as(usize, @intCast(in)) * @as(usize, @intCast(out)) <= DECODED_MAX_WEIGHTS and
+    return decodedCanServe() and billed and rows >= DECODED_MIN_ROWS and @as(usize, @intCast(in)) * @as(usize, @intCast(out)) <= DECODED_MAX_WEIGHTS and
         denseOrderMatches(rows, in, out);
 }
 

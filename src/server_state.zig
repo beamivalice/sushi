@@ -81,8 +81,7 @@ pub const ServerConfig = struct {
     default_top_p: ?f32 = null,
     default_top_k: ?u32 = null,
     /// Default `max_tokens` for a request that omits the field (`--max-tokens N` in serve mode;
-    /// 0 = flag not given). Agent clients send nothing, and an omitted budget is the rest of
-    /// the window, which the admission bill reserves for. Read through `launchMaxTokensDefault`.
+    /// 0 = flag not given, the model's default then the engine's apply). Read through `launchMaxTokensDefault`.
     default_max_tokens: u32 = 0,
     /// `--mtp`: force the native MTP head ON for MoE targets too. The
     /// per-request default is otherwise `sidecar loaded and !isMoe()` (the

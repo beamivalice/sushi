@@ -28,6 +28,9 @@ pub const vision_headroom_error = "VisionHeadroomExceeded";
 /// The `VisionEncodeRequest.error_name` of an image whose file would not decode.
 pub const image_undecodable_error = "ImageUndecodable";
 
+/// The `VisionEncodeRequest.error_name` of an encode its `EncodeSteps.cancel` stopped.
+pub const encode_cancelled_error = "Cancelled";
+
 /// One media block of the prompt, in prompt order: the soft-token rows it takes from the encoded array.
 pub const MediaBlock = struct { kind: chat_mod.MediaPart.Kind, rows: usize };
 
@@ -91,9 +94,23 @@ pub fn skippedMedia(blocks: []const MediaBlock, consumed_rows: usize) MediaSkip 
 
 const EncodedMedia = struct { embeddings: ?mlx.mlx_array, skipped_rows: usize };
 
+/// What an encode runs after each step (one image, or one temporal-patch group of a video): the prefill's
+/// chunk-boundary decode ticks. `call` returns the ns those ticks took, which the encode's time leaves out.
+pub const EncodeYield = struct {
+    ctx: *anyopaque,
+    call: *const fn (*anyopaque) u64,
+};
+
+/// How an encode shares the inference thread: `yield` after every step (null runs it in one piece), and
+/// `cancel`, read before every step, stops it and frees what it made.
+pub const EncodeSteps = struct {
+    yield: ?EncodeYield = null,
+    cancel: ?*const std.atomic.Value(bool) = null,
+};
+
 /// Encodes what `consumed_rows` of restored prefix leaves uncovered. `embeddings` is null when the
 /// restore covers every block; its row 0 is placeholder row `skipped_rows` of the prompt.
-pub fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const DeferredMedia, consumed_rows: usize, refusal: *?MediaRefusal) !EncodedMedia {
+pub fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const DeferredMedia, consumed_rows: usize, steps: EncodeSteps, refusal: *?MediaRefusal) !EncodedMedia {
     const skip = skippedMedia(d.blocks, consumed_rows);
     const blocks = d.blocks[skip.blocks..];
     const images = d.images[skip.images..];
@@ -102,13 +119,14 @@ pub fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const D
     for (blocks) |b| rows += b.rows;
     const sw = io_util.Stopwatch.init(sch.io);
     var decode_ns = d.decode_ns;
+    var yielded_ns: u64 = 0;
     var encoded = false;
     defer if (encoded) log.info("  Multimodal: encoded {d} of {d} image(s) and {d} of {d} video(s), {d} of {d} soft tokens (the restored prefix holds {d}): decode {d} ms, encode {d} ms\n", .{
         images.len, d.images.len,
         videos.len, d.videos.len,
         rows,       rows + skip.rows,
         skip.rows,  decode_ns / std.time.ns_per_ms,
-        sw.read() / std.time.ns_per_ms,
+        (sw.read() -| yielded_ns) / std.time.ns_per_ms,
     }) else log.info("  Multimodal: the encode of {d} image(s) and {d} video(s), {d} soft tokens, failed after {d} ms\n", .{
         images.len, videos.len, rows, sw.read() / std.time.ns_per_ms,
     });
@@ -136,11 +154,14 @@ pub fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const D
         .order = order,
         .bill_bytes = if (cfg.qv_heads == 0) 0 else if (scheduler_mod.vision_encode_bill) |bill| bill(cfg, images, videos, rows) else 0,
         .allocator = allocator,
+        .steps = steps,
     };
     runVisionEncode(sch, &req);
     decode_ns += req.decode_ns;
+    yielded_ns = req.yielded_ns;
     if (req.error_name) |name| {
         defer allocator.free(name);
+        if (std.mem.eql(u8, name, encode_cancelled_error)) return error.Cancelled;
         if (std.mem.eql(u8, name, image_undecodable_error)) {
             refusal.* = MediaRefusal.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG, GIF, BMP or WebP image", .{skip.images + req.failed_image + 1});
             return error.MediaRefused;
@@ -165,6 +186,8 @@ pub fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const D
 
 /// Tests only: stands in for the tower on one image block.
 var vision_block_test_hook: ?*const fn (VisionImagePixels) anyerror!mlx.mlx_array = null;
+/// Tests only: stands in for the tower on one temporal-patch group of a video (`grid_t` 1).
+var video_group_test_hook: ?*const fn (VisionVideoPixels) anyerror!mlx.mlx_array = null;
 
 pub const orphan_vision_cap = 16;
 
@@ -248,6 +271,9 @@ pub const VisionEncodeRequest = struct {
     failed_image: usize = 0,
     /// Output: time spent decoding `undecoded` images.
     decode_ns: u64 = 0,
+    steps: EncodeSteps = .{},
+    /// Output: time the steps' yields gave to other requests.
+    yielded_ns: u64 = 0,
     /// Done flag (under done_mu). Caller's wait-loop drains the cond when
     /// this flips true.
     done: bool = false,
@@ -365,13 +391,30 @@ fn encodeImageBlock(vision_enc: *VisionEncoder, img: VisionImagePixels) !mlx.mlx
     return error.NoPatchGridEncoder;
 }
 
-pub fn encodeVideoBlock(vision_enc: *VisionEncoder, vid: VisionVideoPixels) !mlx.mlx_array {
-    const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
-    const feat: usize = (vid.pixels.len / 4) / n;
-    const shape = [_]c_int{ @intCast(n), @intCast(feat) };
-    const pixel_arr = try mlx.newData(vid.pixels.ptr, &shape, .float32);
+/// Temporal-patch group `t` of a video through the tower. A group never attends to another (`cu_seqlens` cut at
+/// group edges), so the groups' rows joined in order are the whole video's, and only one group's patches are uploaded.
+fn encodeVideoGroup(vision_enc: *VisionEncoder, vid: VisionVideoPixels, t: u32) !mlx.mlx_array {
+    const bytes = vid.pixels.len / vid.grid_t;
+    const group = VisionVideoPixels{ .pixels = vid.pixels[t * bytes ..][0..bytes], .grid_t = 1, .grid_h = vid.grid_h, .grid_w = vid.grid_w };
+    if (@import("builtin").is_test) if (video_group_test_hook) |hook| return hook(group);
+    const n: usize = @as(usize, group.grid_h) * group.grid_w;
+    const shape = [_]c_int{ @intCast(n), @intCast((bytes / 4) / n) };
+    const pixel_arr = blk: {
+        const host = mlx.engine.enter(vision_enc.s);
+        defer host.end();
+        break :blk try mlx.newData(group.pixels.ptr, &shape, .float32);
+    };
     defer _ = mlx.mlx_array_free(pixel_arr);
-    return vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w);
+    return vision_enc.forwardVideoPatches(pixel_arr, 1, group.grid_h, group.grid_w);
+}
+
+/// Gives the thread to other requests after an encode step, outside the encode's bill phase: their ticks run under
+/// their own caps, as between two prefill chunks.
+fn yieldStep(req: *VisionEncodeRequest) void {
+    const y = req.steps.yield orelse return;
+    if (req.model.config) |cfg| arch_serve.leaveVision(cfg);
+    defer if (req.model.config) |cfg| arch_serve.enterVision(req.bill_bytes, cfg);
+    req.yielded_ns +|= y.call(y.ctx);
 }
 
 /// Phase A4: encode one or more images on the inference thread. Writes the
@@ -413,7 +456,7 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     defer emb_parts.deinit(req.allocator);
     const failParts = struct {
         fn f(s: *Scheduler, r: *VisionEncodeRequest, parts: []mlx.mlx_array, name: []const u8) void {
-            for (parts) |e| _ = mlx.mlx_array_free(e);
+            for (parts) |e| freeVisionArray(e);
             finishVisionRequest(s, r, name);
         }
     }.f;
@@ -434,32 +477,36 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
             failParts(sch, req, emb_parts.items, "MediaOrderMismatch");
             return;
         }
-        const emb = (if (is_image) blk: {
-            defer req.decode_ns = window.decode_ns;
-            const px = window.view(next_image) orelse {
-                req.failed_image = next_image;
-                failParts(sch, req, emb_parts.items, image_undecodable_error);
+        // A step is an image, or one temporal-patch group of a video.
+        const n_steps: u32 = if (is_image) 1 else req.videos[next_video].grid_t;
+        for (0..n_steps) |step| {
+            if (req.steps.cancel) |c| if (c.load(.acquire)) {
+                failParts(sch, req, emb_parts.items, encode_cancelled_error);
                 return;
             };
-            defer window.release(next_image);
-            break :blk encodeImageBlock(vision_enc, px);
-        } else encodeVideoBlock(vision_enc, req.videos[next_video])) catch |err| {
-            failParts(sch, req, emb_parts.items, mlx.settledErrorName(err));
-            return;
-        };
-        const rows: usize = @intCast(mlx.getShape(emb)[1]);
-        if (is_image) {
-            next_image += 1;
-            n_vision += rows;
-        } else {
-            next_video += 1;
-            n_video += rows;
+            const emb = (if (is_image) blk: {
+                defer req.decode_ns = window.decode_ns;
+                const px = window.view(next_image) orelse {
+                    req.failed_image = next_image;
+                    failParts(sch, req, emb_parts.items, image_undecodable_error);
+                    return;
+                };
+                defer window.release(next_image);
+                break :blk encodeImageBlock(vision_enc, px);
+            } else encodeVideoGroup(vision_enc, req.videos[next_video], @intCast(step))) catch |err| {
+                failParts(sch, req, emb_parts.items, mlx.settledErrorName(err));
+                return;
+            };
+            const rows: usize = @intCast(mlx.getShape(emb)[1]);
+            if (is_image) n_vision += rows else n_video += rows;
+            emb_parts.append(req.allocator, emb) catch |err| {
+                _ = mlx.mlx_array_free(emb);
+                failParts(sch, req, emb_parts.items, @errorName(err));
+                return;
+            };
+            yieldStep(req);
         }
-        emb_parts.append(req.allocator, emb) catch |err| {
-            _ = mlx.mlx_array_free(emb);
-            failParts(sch, req, emb_parts.items, @errorName(err));
-            return;
-        };
+        if (is_image) next_image += 1 else next_video += 1;
     }
 
     if (emb_parts.items.len == 0) {
@@ -911,7 +958,7 @@ test "a restored prefix lets the encode skip its images, and the rest match a fu
     const media = DeferredMedia{ .allocator = testing.allocator, .images = &images, .videos = &.{}, .blocks = &blocks };
     var refusal: ?MediaRefusal = null;
 
-    const full = try encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal);
+    const full = try encodeMediaAfterRestore(&sch, &model, &media, 0, .{}, &refusal);
     defer _ = mlx.mlx_array_free(full.embeddings.?);
     try testing.expectEqual(@as(usize, 3), Probe.tower_runs);
     try testing.expectEqual(@as(usize, 3), Probe.billed_images);
@@ -920,7 +967,7 @@ test "a restored prefix lets the encode skip its images, and the rest match a fu
 
     // The first image is inside the 4-row prefix: the tower runs twice and the bill sees two images.
     Probe.tower_runs = 0;
-    const tail = try encodeMediaAfterRestore(&sch, &model, &media, 4, &refusal);
+    const tail = try encodeMediaAfterRestore(&sch, &model, &media, 4, .{}, &refusal);
     defer _ = mlx.mlx_array_free(tail.embeddings.?);
     try testing.expectEqual(@as(usize, 2), Probe.tower_runs);
     try testing.expectEqual(@as(usize, 2), Probe.billed_images);
@@ -930,7 +977,7 @@ test "a restored prefix lets the encode skip its images, and the rest match a fu
 
     // The prefix ends inside the second image: it is encoded whole, and the splice resumes at its row 1.
     Probe.tower_runs = 0;
-    const straddled = try encodeMediaAfterRestore(&sch, &model, &media, 5, &refusal);
+    const straddled = try encodeMediaAfterRestore(&sch, &model, &media, 5, .{}, &refusal);
     defer _ = mlx.mlx_array_free(straddled.embeddings.?);
     try testing.expectEqual(@as(usize, 2), Probe.tower_runs);
     try testing.expectEqual(@as(usize, 4), straddled.skipped_rows);
@@ -938,7 +985,7 @@ test "a restored prefix lets the encode skip its images, and the rest match a fu
 
     // A prefix holding every image encodes nothing.
     Probe.tower_runs = 0;
-    const covered = try encodeMediaAfterRestore(&sch, &model, &media, 9, &refusal);
+    const covered = try encodeMediaAfterRestore(&sch, &model, &media, 9, .{}, &refusal);
     try testing.expect(covered.embeddings == null);
     try testing.expectEqual(@as(usize, 9), covered.skipped_rows);
     try testing.expectEqual(@as(usize, 0), Probe.tower_runs);
@@ -973,7 +1020,7 @@ test "an encoder on the engine's stream joins its tower's spans there, with no M
     var refusal: ?MediaRefusal = null;
     const calls_before = mlx.engine.mlxCalls();
     const lends_before = mlx.engine.stats().lends;
-    const joined = try encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal);
+    const joined = try encodeMediaAfterRestore(&sch, &model, &media, 0, .{}, &refusal);
     defer _ = mlx.mlx_array_free(joined.embeddings.?);
     try testing.expectEqual(calls_before, mlx.engine.mlxCalls());
     try testing.expectEqual(lends_before, mlx.engine.stats().lends);
@@ -1053,13 +1100,13 @@ test "undecoded images are decoded a window at a time, freed after their tower c
     var refusal: ?MediaRefusal = null;
 
     const whole = DeferredMedia{ .allocator = testing.allocator, .images = &eager, .videos = &.{}, .blocks = &blocks };
-    const want = try encodeMediaAfterRestore(&sch, &model, &whole, 0, &refusal);
+    const want = try encodeMediaAfterRestore(&sch, &model, &whole, 0, .{}, &refusal);
     defer _ = mlx.mlx_array_free(want.embeddings.?);
     try testing.expectEqual(@as(usize, 0), Probe.decodes.load(.monotonic));
 
     Probe.live.store(0, .monotonic);
     const lazy = DeferredMedia{ .allocator = testing.allocator, .images = &files, .videos = &.{}, .blocks = &blocks };
-    const got = try encodeMediaAfterRestore(&sch, &model, &lazy, 0, &refusal);
+    const got = try encodeMediaAfterRestore(&sch, &model, &lazy, 0, .{}, &refusal);
     defer _ = mlx.mlx_array_free(got.embeddings.?);
     try testing.expectEqualSlices(f32, Probe.rowsOf(want.embeddings.?), Probe.rowsOf(got.embeddings.?));
     try testing.expectEqual(@as(usize, n), Probe.decodes.load(.monotonic));
@@ -1070,14 +1117,14 @@ test "undecoded images are decoded a window at a time, freed after their tower c
     var prefix_rows: usize = 0;
     for (blocks[0..4]) |b| prefix_rows += b.rows;
     Probe.decodes.store(0, .monotonic);
-    const tail = try encodeMediaAfterRestore(&sch, &model, &lazy, prefix_rows, &refusal);
+    const tail = try encodeMediaAfterRestore(&sch, &model, &lazy, prefix_rows, .{}, &refusal);
     defer _ = mlx.mlx_array_free(tail.embeddings.?);
     try testing.expectEqual(@as(usize, n - 4), Probe.decodes.load(.monotonic));
     try testing.expectEqualSlices(f32, Probe.rowsOf(want.embeddings.?)[prefix_rows * 4 ..], Probe.rowsOf(tail.embeddings.?));
 
     // A file that will not decode refuses the request by its place in it.
     Probe.fail_id = 7;
-    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &lazy, 0, &refusal));
+    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &lazy, 0, .{}, &refusal));
     try testing.expect(std.mem.startsWith(u8, refusal.?.text(), "image 7 could not be decoded"));
     try testing.expect(!refusal.?.server_error);
 }
@@ -1118,11 +1165,11 @@ test "an encode refused for headroom after the restore names the bill of what it
     const blocks = [_]MediaBlock{ .{ .kind = .image, .rows = 4 }, .{ .kind = .image, .rows = 2 } };
     const media = DeferredMedia{ .allocator = testing.allocator, .images = &images, .videos = &.{}, .blocks = &blocks };
     var refusal: ?MediaRefusal = null;
-    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 0, .{}, &refusal));
     try testing.expectEqualStrings("2 images, 10 free", refusal.?.text());
     try testing.expect(!refusal.?.server_error);
     refusal = null;
-    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 4, &refusal));
+    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 4, .{}, &refusal));
     try testing.expectEqualStrings("1 images, 10 free", refusal.?.text());
 }
 
@@ -1165,27 +1212,27 @@ test "an encode the engine or MLX refused settles its error: the request gets th
 
     // The two spans take the pool's first two buffers; the join of them takes the third.
     mlx.engine.fault.arm(3);
-    try testing.expectError(error.TransientCapExceeded, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expectError(error.TransientCapExceeded, encodeMediaAfterRestore(&sch, &model, &media, 0, .{}, &refusal));
     try testing.expect(!mlx.errorPending());
 
     mlx.engine.fault.disarm();
     Probe.latch = "[engine] kernel_apply: PoolOverBudget: a buffer of 16 KB with 10 MB held for the pool, 4 MB of it asked by tensors in use, under a limit of 4 MB";
-    try testing.expectError(error.TransientCapExceeded, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expectError(error.TransientCapExceeded, encodeMediaAfterRestore(&sch, &model, &media, 0, .{}, &refusal));
     try testing.expect(!mlx.errorPending());
 
     Probe.latch = "[METAL] Command buffer execution failed: Insufficient Memory";
-    try testing.expectError(error.OutOfMemory, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expectError(error.OutOfMemory, encodeMediaAfterRestore(&sch, &model, &media, 0, .{}, &refusal));
     try testing.expect(!mlx.errorPending());
 
     Probe.latch = "[metal] a kernel failed for a reason of its own";
     refusal = null;
-    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 0, .{}, &refusal));
     try testing.expectEqualStrings("vision encoding failed: MlxError", refusal.?.text());
     try testing.expect(refusal.?.server_error);
     try testing.expect(!mlx.errorPending());
 
     Probe.latch = null;
-    const served = try encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal);
+    const served = try encodeMediaAfterRestore(&sch, &model, &media, 0, .{}, &refusal);
     defer _ = mlx.mlx_array_free(served.embeddings.?);
     try testing.expectEqual(@as(i32, 2), mlx.getShape(served.embeddings.?)[1]);
 }
@@ -1216,7 +1263,7 @@ test "a refused encode logs its failure, never an encoded count" {
     const blocks = [_]MediaBlock{.{ .kind = .image, .rows = 3 }};
     const media = DeferredMedia{ .allocator = testing.allocator, .images = &images, .videos = &.{}, .blocks = &blocks };
     var refusal: ?MediaRefusal = null;
-    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 0, &refusal));
+    try testing.expectError(error.MediaRefused, encodeMediaAfterRestore(&sch, &model, &media, 0, .{}, &refusal));
 
     var buf: [2048]u8 = undefined;
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
@@ -1226,4 +1273,108 @@ test "a refused encode logs its failure, never an encoded count" {
     const text = buf[0..if (n > 0) @intCast(n) else 0];
     try testing.expect(std.mem.indexOf(u8, text, "encoded") == null);
     try testing.expect(std.mem.indexOf(u8, text, "Multimodal: the encode of 1 image(s) and 0 video(s), 3 soft tokens, failed after") != null);
+}
+
+test "a media encode yields to other requests after each image and frame group, and a cancel between steps frees what it made" {
+    // Fake towers whose every call is logged: `i` an image, `v` a video's frame group, `y` a yield to other requests.
+    const StepProbe = struct {
+        var events: [32]u8 = undefined;
+        var n_events: usize = 0;
+        var made: usize = 0;
+        var freed: usize = 0;
+        var cancel_at_yield: ?usize = null;
+        var cancel = std.atomic.Value(bool).init(false);
+
+        fn reset() void {
+            n_events = 0;
+            made = 0;
+            freed = 0;
+            cancel_at_yield = null;
+            cancel.store(false, .release);
+        }
+        fn note(c: u8) void {
+            events[n_events] = c;
+            n_events += 1;
+        }
+        fn trail() []const u8 {
+            return events[0..n_events];
+        }
+        /// One row per call: the block's first pixel and its place in the trail.
+        fn row(first: f32) anyerror!mlx.mlx_array {
+            made += 1;
+            const data = [_]f32{ first, @floatFromInt(n_events), 0, 0 };
+            return mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+        }
+        fn tower(img: VisionImagePixels) anyerror!mlx.mlx_array {
+            note('i');
+            return row(@floatFromInt(img.pixels[0]));
+        }
+        fn group(vid: VisionVideoPixels) anyerror!mlx.mlx_array {
+            note('v');
+            try testing.expectEqual(@as(u32, 1), vid.grid_t);
+            return row(std.mem.bytesAsSlice(f32, vid.pixels)[0]);
+        }
+        fn yield(_: *anyopaque) u64 {
+            note('y');
+            if (cancel_at_yield) |at| if (std.mem.count(u8, trail(), "y") == at) cancel.store(true, .release);
+            return 0;
+        }
+        fn free(arr: mlx.mlx_array) void {
+            freed += 1;
+            _ = mlx.mlx_array_free(arr);
+        }
+    };
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.handle = null;
+    var encoder = VisionEncoder{ .allocator = testing.allocator, .s = mlx.mlx_default_cpu_stream_new() };
+    defer _ = mlx.mlx_stream_free(encoder.s);
+    model.vision_encoder = &encoder;
+    vision_block_test_hook = StepProbe.tower;
+    video_group_test_hook = StepProbe.group;
+    slot_vision_free_test_hook = StepProbe.free;
+    defer {
+        vision_block_test_hook = null;
+        video_group_test_hook = null;
+        slot_vision_free_test_hook = null;
+    }
+    // Three frame groups of a 1x2 grid, one f32 a patch: each group's first pixel is 10, 20, 30.
+    const frames = [_]f32{ 10, 11, 20, 21, 30, 31 };
+    const images = [_]chat_mod.ImageData{.{ .pixels = "\x07", .width = 1, .height = 1 }};
+    const videos = [_]chat_mod.VideoData{.{ .pixels = std.mem.sliceAsBytes(&frames), .grid_t = 3, .grid_h = 1, .grid_w = 2 }};
+    const blocks = [_]MediaBlock{ .{ .kind = .image, .rows = 1 }, .{ .kind = .video, .rows = 3 } };
+    const media = DeferredMedia{ .allocator = testing.allocator, .images = &images, .videos = &videos, .blocks = &blocks };
+    var refusal: ?MediaRefusal = null;
+    var token: u8 = 0;
+    const yield = EncodeYield{ .ctx = &token, .call = StepProbe.yield };
+
+    StepProbe.reset();
+    const whole = try encodeMediaAfterRestore(&sch, &model, &media, 0, .{}, &refusal);
+    defer _ = mlx.mlx_array_free(whole.embeddings.?);
+    try testing.expectEqualStrings("ivvv", StepProbe.trail());
+
+    // Another request's tick lands after every step, so it never waits out the whole video.
+    StepProbe.reset();
+    const stepped = try encodeMediaAfterRestore(&sch, &model, &media, 0, .{ .yield = yield }, &refusal);
+    defer _ = mlx.mlx_array_free(stepped.embeddings.?);
+    try testing.expectEqualStrings("iyvyvyvy", StepProbe.trail());
+    try mlx.check(mlx.mlx_array_eval(whole.embeddings.?));
+    try mlx.check(mlx.mlx_array_eval(stepped.embeddings.?));
+    const a = mlx.mlx_array_data_float32(whole.embeddings.?).?[0..16];
+    const b = mlx.mlx_array_data_float32(stepped.embeddings.?).?[0..16];
+    for (0..4) |r| try testing.expectEqual(a[r * 4], b[r * 4]);
+    try testing.expectEqualSlices(f32, &.{ 7, 10, 20, 30 }, &.{ b[0], b[4], b[8], b[12] });
+
+    // The client leaves during the second yield: the frame groups after it are never encoded.
+    StepProbe.reset();
+    StepProbe.cancel_at_yield = 2;
+    try testing.expectError(error.Cancelled, encodeMediaAfterRestore(&sch, &model, &media, 0, .{ .yield = yield, .cancel = &StepProbe.cancel }, &refusal));
+    try testing.expectEqualStrings("iyvy", StepProbe.trail());
+    try testing.expectEqual(@as(usize, 2), StepProbe.made);
+    try testing.expectEqual(StepProbe.made, StepProbe.freed);
+    try testing.expect(refusal == null);
 }

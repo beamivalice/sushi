@@ -7,7 +7,7 @@ MiMo's three MTP heads, split out of [engine-mtp](engine-mtp.md); everything sha
 ## MiMo's three heads
 
 - **What is generic and what is qwen4's.** The controller is head-agnostic (`MtpHeadRef` switches five
-  operations): the round phases, verify invariant, draft rerank, acceptance modes, EV planner, round-cost table,
+  operations): the round phases, verify invariant, draft rerank, acceptance, EV planner, round-cost table,
   depth caps and EV seed serve any head. qwen4-only: the pre-mixer hyper-connection stream as the head input, the
   mixer output as the lm_head input, QSA `pos_base`, the deferred PLE leaf, `forwardQwen4VerifyRows`, head
   persistence, the G17 cost profile and merged multi-slot verify.

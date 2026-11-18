@@ -19,6 +19,7 @@ const model_mod = @import("model.zig");
 const arch_config = @import("arch/config.zig");
 const model_load = @import("model_load.zig");
 const models_api = @import("models_api.zig");
+const request_policy = @import("request_policy.zig");
 const chat = @import("chat.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const update_mod = @import("update.zig");
@@ -69,8 +70,6 @@ fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
     if (eql(u8, name, "ctx_size")) return if (o.ctx_size) |v| .{ .integer = v } else null;
     if (eql(u8, name, "kv_quant")) return if (o.kv_quant) |v| .{ .string = v.wireName() } else null;
     if (eql(u8, name, "mtp")) return if (o.mtp) |v| .{ .bool = v } else null;
-    if (eql(u8, name, "mtp_acceptance")) return if (o.mtp_acceptance) |v| .{ .string = @import("mtp_acceptance.zig").name(v) } else null;
-    if (eql(u8, name, "mtp_greedy_tail")) return if (o.mtp_greedy_tail) |v| .{ .bool = v } else null;
     if (eql(u8, name, "ssd_budget_gb")) return if (o.ssd_budget_gb) |v| .{ .integer = v } else null;
     if (eql(u8, name, "ssd_prefetch")) return if (o.ssd_prefetch) |v| .{ .integer = v } else null;
     if (eql(u8, name, "preserve_thinking")) return if (o.preserve_thinking) |v| .{ .bool = v } else null;
@@ -80,6 +79,7 @@ fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
     if (eql(u8, name, "qwen_cooler")) return if (o.qwen_cooler) |v| .{ .bool = v } else null;
     if (eql(u8, name, "max_tokens")) return if (o.max_tokens) |v| .{ .integer = v } else null;
     if (eql(u8, name, "yarn_factor")) return if (o.yarn_factor) |v| .{ .string = if (v == 2) "2" else "4" } else null;
+    if (eql(u8, name, "expert_cache_bias")) return if (o.expert_cache_bias) |v| .{ .float = v } else null;
     return null;
 }
 
@@ -89,8 +89,6 @@ fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
         .ctx_size = if (config.ctx_override > 0) config.ctx_override else null,
         .kv_quant = config.kv_quant_override,
         .mtp = config.mtp_override,
-        .mtp_acceptance = config.mtp_acceptance_override,
-        .mtp_greedy_tail = config.mtp_greedy_tail_override,
         .ssd_budget_gb = if (config.ssd_budget_gb_override > 0) config.ssd_budget_gb_override else null,
         .ssd_prefetch = config.ssd_prefetch_override,
         .preserve_thinking = config.preserve_thinking_override,
@@ -98,6 +96,7 @@ fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
         .vision = config.vision_override,
         .max_tokens = config.max_tokens_override,
         .yarn_factor = config.yarn_factor_override,
+        .expert_cache_bias = config.expert_cache_bias_override,
     };
     arch_flags.putCoolerSetting(config, &o, config.cooler_override);
     return o;
@@ -113,13 +112,12 @@ pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Ove
     var o: model_settings.Override = .{
         .kv_quant = server.kvCacheForLaunch(&bare, null).config,
         .mtp = model_load.mtpChoiceFor(null, &bare).on,
-        .mtp_acceptance = model_settings.default_mtp_acceptance,
-        .mtp_greedy_tail = model_settings.default_mtp_greedy_tail,
         .ssd_prefetch = bare.ssdPrefetchPct(),
         .preserve_thinking = model_settings.default_preserve_thinking,
         .think_penalty = model_settings.default_think_penalty,
         .vision = model_settings.VisionChoice.resolve(null, null, model_load.visionDefaultOn(&bare, bare.expert_streaming)).on,
-        .max_tokens = bare.defaultMaxTokens(),
+        .max_tokens = request_policy.filledMaxTokensWith(0, bare.defaultMaxTokens()),
+        .expert_cache_bias = 0,
     };
     arch_flags.putCoolerSetting(&bare, &o, bare.coolerChoice().on);
     return o;
@@ -154,7 +152,7 @@ fn writeKey(w: *std.Io.Writer, spec: model_settings.KeySpec, file_value: ?std.js
 }
 
 /// What a model's keys may be set to, for every key with a constraint: `disabled` (the key does nothing), `choices` (the
-/// subset it stores), `max`, `requires` (another key's value it needs) and `unset` (keys that must stay unset), each with a `why`.
+/// subset it stores), `max` and `unset` (keys that must stay unset), each with a `why`.
 fn writeLimits(w: *std.Io.Writer, fit: model_settings.Fit) !void {
     try w.writeAll("{");
     var first = true;
@@ -178,7 +176,6 @@ fn writeLimits(w: *std.Io.Writer, fit: model_settings.Fit) !void {
             try w.writeAll(",");
         }
         if (l.max > 0) try w.print("\"max\":{d},", .{l.max});
-        if (l.requires_mtp) try w.writeAll("\"requires\":{\"mtp\":true},");
         if (l.unset.len > 0) {
             try w.writeAll("\"unset\":");
             try writeJson(w, l.unset);
@@ -451,8 +448,10 @@ fn reject(arena: std.mem.Allocator, status: u16, err_type: []const u8, comptime 
 fn collect(arena: std.mem.Allocator, specs: []const model_settings.KeySpec, obj: std.json.ObjectMap, edits: *std.ArrayList(Edit)) ?Parsed {
     var it = obj.iterator();
     while (it.next()) |kv| {
-        const spec = model_settings.findKey(specs, kv.key_ptr.*) orelse
+        const spec = model_settings.findKey(specs, kv.key_ptr.*) orelse {
+            if (model_settings.removedWhy(kv.key_ptr.*)) |why| return reject(arena, 400, "unknown_setting", "\"{s}\" is removed: {s}", .{ kv.key_ptr.*, why });
             return reject(arena, 400, "unknown_setting", "\"{s}\" is not a setting this server has", .{kv.key_ptr.*});
+        };
         if (kv.value_ptr.* == .null) {
             edits.append(arena, .{ .key = spec.name, .value = null }) catch return reject(arena, 500, "internal_error", "out of memory", .{});
             continue;
@@ -832,16 +831,16 @@ fn savesSsdTier(plan: Plan) bool {
 
 /// Whether saving `key` changes what a load or its preflight reads, so a model that failed to load deserves another try.
 pub fn reachesLoad(key: []const u8) bool {
-    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" };
+    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" };
     for (reads) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
 
 test "settings api: every saved key is classified, and the ones a load reads clear a stored load failure" {
-    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" }) |key| {
+    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" }) |key| {
         try std.testing.expect(reachesLoad(key));
     }
-    for ([_][]const u8{ "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" }) |key| {
+    for ([_][]const u8{ "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" }) |key| {
         try std.testing.expect(!reachesLoad(key));
     }
     // A new key must be classified above before it ships.
@@ -858,7 +857,7 @@ test "settings api: only the two SSD size keys re-arm a declined SSD tier, and b
 }
 
 fn classified(key: []const u8) bool {
-    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "mtp_acceptance", "mtp_greedy_tail", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" };
+    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port" };
     for (known) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
@@ -943,6 +942,18 @@ fn expectRejected(body: []const u8, status: u16, err_type: []const u8) !void {
         .rejected => |r| {
             try testing.expectEqual(status, r.status);
             try testing.expectEqualStrings(err_type, r.err_type);
+        },
+    }
+}
+
+test "settings api: a removed model key is refused by name as removed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    switch (parseRequest(arena_state.allocator(), "{\"model\":\"m\",\"set\":{\"mtp_greedy_tail\":true}}")) {
+        .ok => return error.TestExpectedRejection,
+        .rejected => |r| {
+            try testing.expectEqualStrings("unknown_setting", r.err_type);
+            try testing.expectEqualStrings("\"mtp_greedy_tail\" is removed: MTP accepts drafts by the exact rule only", r.message);
         },
     }
 }
@@ -1186,7 +1197,7 @@ test "settings api: render names the keys a model honours, what a loaded model l
     defer file.deinit();
     const locks: model_settings.LaunchLocks = .{};
     const rows = [_]ModelRow{
-        .{ .id = "a", .path = "/m/a", .state = "ready", .bytes = 5, .fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true }, .loaded = .{ .ctx_size = 4096, .kv_quant = null, .ssd_budget_gb = 60, .mtp_acceptance = .exact }, .tier = .{ .cap_bytes = 2 << 30, .used_bytes = 7 } },
+        .{ .id = "a", .path = "/m/a", .state = "ready", .bytes = 5, .fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true }, .loaded = .{ .ctx_size = 4096, .kv_quant = null, .ssd_budget_gb = 60 }, .tier = .{ .cap_bytes = 2 << 30, .used_bytes = 7 } },
         .{ .id = "b", .path = "/m/b", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false } },
     };
     const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
@@ -1212,7 +1223,6 @@ test "settings api: render names the keys a model honours, what a loaded model l
     const lw = a.get("loaded_with").?.object;
     try testing.expectEqual(@as(i64, 4096), lw.get("ctx_size").?.integer);
     try testing.expect(lw.get("kv_quant").? == .null);
-    try testing.expectEqualStrings("exact", lw.get("mtp_acceptance").?.string);
     try testing.expectEqualStrings("off", a.get("settings").?.object.get("kv_quant").?.object.get("file").?.string);
 
     const b = root.get("models").?.array.items[1].object;
@@ -1241,19 +1251,16 @@ test "settings api: each model lists the limits its arch and pack put on its key
     try testing.expectEqual(@as(usize, 3), kv.get("choices").?.array.items.len);
     try testing.expectEqualStrings("6", kv.get("choices").?.array.items[1].string);
     try testing.expect(latent.get("mtp").?.object.get("disabled").?.bool);
-    try testing.expect(latent.get("mtp_acceptance").?.object.get("disabled").?.bool);
     try testing.expect(latent.get("mtp").?.object.get("why").?.string.len > 0);
     try testing.expectEqual(@as(i64, 131072), latent.get("ctx_size").?.object.get("max").?.integer);
 
     const dropped = models[1].object.get("limits").?.object;
     try testing.expectEqualStrings("ssd_budget_gb", dropped.get("mtp").?.object.get("unset").?.array.items[0].string);
-    try testing.expect(dropped.get("mtp_greedy_tail").?.object.get("requires").?.object.get("mtp").?.bool);
     try testing.expect(dropped.get("kv_quant") == null);
 
     const plain = models[2].object.get("limits").?.object;
     for ([_][]const u8{ "kv_quant", "mtp", "ctx_size", "ssd_budget_gb", "vision", "preserve_thinking", "think_penalty" }) |k| try testing.expect(plain.get(k) == null);
     try testing.expect(plain.get("ssd_prefetch").?.object.get("disabled").?.bool);
-    try testing.expect(plain.get("mtp_acceptance").?.object.get("unset") == null);
 
     const bare = models[3].object.get("limits").?.object;
     try testing.expect(bare.get("kv_quant").?.object.get("disabled").?.bool);
@@ -1323,7 +1330,6 @@ test "settings api: a ready model reports the default each key resolves to; an u
     const models = parsed.value.object.get("models").?.array.items;
     const d = models[0].object.get("defaults").?.object;
     try testing.expectEqual(@as(i64, 256_000), d.get("max_tokens").?.integer);
-    try testing.expectEqualStrings("exact", d.get("mtp_acceptance").?.string);
     try testing.expect(d.get("mtp").?.bool);
     try testing.expect(d.get("preserve_thinking").?.bool);
     try testing.expectEqual(@as(i64, 0), d.get("think_penalty").?.integer);
@@ -1338,7 +1344,7 @@ test "settings api: the resolved defaults ignore the file's values the config wa
     var stamped = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 262_144 };
     model_load.applyModelSettings(&stamped, .{ .max_tokens = 999, .mtp = false, .kv_quant = kv_quant_mod.KVQuantConfig.affine(4), .vision = false, .ssd_prefetch = 40 });
     const d = resolvedDefaults(&stamped);
-    try testing.expectEqual(@as(?u32, 0), d.max_tokens);
+    try testing.expectEqual(@as(?u32, request_policy.ENGINE_DEFAULT_MAX_TOKENS), d.max_tokens);
     try testing.expectEqual(@as(?bool, true), d.mtp);
     try testing.expectEqual(@as(u8, 8), d.kv_quant.?.bits);
     try testing.expectEqual(@as(?bool, true), d.vision);

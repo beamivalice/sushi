@@ -3,6 +3,7 @@
 const std = @import("std");
 const arch_config = @import("arch/config.zig");
 const settings_resolve = @import("settings_resolve.zig");
+const cooler_side = @import("cooler_side.zig");
 const trunk = @import("trunk.zig");
 const verify_moe = @import("verify_moe.zig");
 const attn_kernels = @import("attn_kernels.zig");
@@ -62,7 +63,7 @@ pub fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
 
 /// Will a request that omits `enable_mtp` run the head on this model? The load-time bills
 /// (`sessionBytesPerToken`) price its KV whenever it does, the request-time bill per request.
-fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
+pub fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
     if (arch_config.fact(config, "no_mtp_head")) return false;
     // A loaded DFlash2 drafter outranks the head: the default round never builds its cache.
     if (config.dflash_loaded) return false;
@@ -605,6 +606,19 @@ pub fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem
     );
 }
 
+/// The ceiling a live check reads (a request's admission, a prefill chunk's width, an image encode, a borrow): the
+/// load's ceiling, but never past the process's GPU footprint plus what the system can still reclaim, less the
+/// unplanned margin (`--wired-margin-gib`) the kernel and other processes keep. A raised `iogpu.wired_limit_mb` lifts
+/// the planning ceiling over other processes' pages; it does not free them, and growth past them takes the machine down.
+pub fn liveGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
+    return liveCeilingFrom(currentGpuMemoryCeiling(config, active_mem), active_mem +| @as(u64, gpu_mem.cacheBytes()), metrics.getAvailableMemBytes(), launch_state.wired_limit_margin_bytes);
+}
+
+/// PURE half of `liveGpuMemoryCeiling`.
+pub fn liveCeilingFrom(ceiling: u64, footprint: u64, reclaimable: u64, margin: u64) u64 {
+    return @min(ceiling, footprint +| (reclaimable -| margin));
+}
+
 pub fn expertStreamingLoadFits(ceiling: u64, active_mem: u64, resident_bytes: u64, cache_bytes: u64, bounce_bytes: u64, fill_peak_bytes: u64, serving_bytes: u64) bool {
     const needed = active_mem +| resident_bytes +| cache_bytes +| bounce_bytes +| fill_peak_bytes +| serving_bytes;
     return needed <= ceiling;
@@ -787,9 +801,11 @@ pub fn prefillTransientReserveAtKv(
             .state_bytes = if (mtpHeadDefaultOn(config)) mtpHeadRingBytes(config) else 0,
             .qsa_ring_bytes = slotRingBytes(config, kv_bits),
             .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(chunk, seq)),
-            .uplift_16ths = billUplift16ths(config, seq),
+            .uplift_16ths = if (coolerPrefillRowBytes(config) > 0) 16 else fittedNet16ths(config, seq),
+            .cooler_row_bytes = coolerPrefillRowBytes(config),
+            .cooler_turnover_bytes = config.ssmCheckpointBytes(),
         },
-    ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
+    ) + qsaMaskBilled(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
         trunkDecodeScratchBytes(config, @min(chunk, @max(seq, 1))) +
@@ -819,6 +835,7 @@ pub fn fp8DequantScratchBytes(config: *const model_mod.ModelConfig, fwd: u64) u6
 /// (`trunk_gemm.decodedServes`).
 pub fn trunkDecodeScratchBytes(config: *const model_mod.ModelConfig, fwd: u64) u64 {
     if (config.trunk_quant == null or fwd < @as(u64, @intCast(sushi_exl3.trunk_gemm.DECODED_MIN_ROWS))) return 0;
+    if (!sushi_exl3.trunk_gemm.decodedCanServe()) return 0;
     return sushi_exl3.trunk_gemm.DECODED_SCRATCH_BYTES;
 }
 
@@ -871,7 +888,24 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
     // Prefill widths gather by block index (row-chunked score sheet, no
     // [S, kv] mask); decode/verify widths still build the dense mask.
     if (archHook("gatheredMaskBytes", u64, config, .{ fwd, kv })) |bytes| return bytes;
-    return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
+    const mask = QSA_MASK_BYTES_PER_KEY * fwd * kv;
+    return if (cooler_side.onEngine(config)) mask else mask * 5 / 4;
+}
+
+/// What the QSA select adds to a chunk's bill. On an exact Cooler bill it runs at a full-attention layer's entry,
+/// beside the trunk's rows alone, so it adds only what that moment holds past the rows' peak.
+fn qsaMaskBilled(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64 {
+    if (@import("builtin").is_test and qsa_off_for_test) return 0;
+    return atTrunkRows(config, fwd, qsaMaskBytes(config, fwd, kv));
+}
+
+/// What `bytes` held where a chunk holds only the trunk's rows (a full-attention layer's entry, the head's readout
+/// past the last layer) adds to its bill: on an exact Cooler bill, only what they hold past the rows' peak.
+pub fn atTrunkRows(config: *const model_mod.ModelConfig, fwd: u64, bytes: u64) u64 {
+    const rows = coolerPrefillRowBytes(config);
+    if (rows == 0) return bytes;
+    const entry = archHook("coolerPrefillEntryRowBytes", u64, config, .{}) orelse rows;
+    return (fwd *| entry +| bytes) -| fwd *| rows;
 }
 
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
@@ -1056,12 +1090,30 @@ pub fn requestContextRefusal(config: *const model_mod.ModelConfig, prompt_len: u
         .available = budget,
         .kv_bits = bits,
         .chunk = bill.chunk,
+        .asked_max_tokens = max_tokens,
+        .fitting_max_tokens = fittingMaxTokens(config, prompt_len, max_tokens, bits, bill.chunk, warm, budget),
     };
 }
 
+/// The largest max_tokens up to `asked` whose bill fits `budget`; 0 when the prompt alone does not.
+fn fittingMaxTokens(config: *const model_mod.ModelConfig, prompt_len: usize, asked: u32, kv_bits: u64, chunk: u64, warm: WarmPrefix, budget: u64) u32 {
+    var low: u32 = 0;
+    var high: u32 = asked;
+    if (prefillNeededAtChunk(config, prompt_len, 0, kv_bits, chunk, warm) > budget) return 0;
+    while (low < high) {
+        const mid = low + (high - low + 1) / 2;
+        if (prefillNeededAtChunk(config, prompt_len, mid, kv_bits, chunk, warm) <= budget) low = mid else high = mid - 1;
+    }
+    return low;
+}
+
 pub fn memoryContextRefusalMessage(buf: []u8, refusal: model_registry_mod.MemoryContextRefusal) []const u8 {
-    return std.fmt.bufPrint(buf, "Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}. Maximum context: {d} tokens. Reduce context or free memory.", .{
-        refusal.requested, refusal.kv_bits, refusal.chunk, refusal.maximum,
+    const mb: u64 = 1 << 20;
+    if (refusal.fitting_max_tokens > 0) return std.fmt.bufPrint(buf, "Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}: the request needs {d} MB and {d} MB is available. max_tokens {d} fits (asked {d}); maximum context: {d} tokens. Lower max_tokens, reduce context or free memory.", .{
+        refusal.requested, refusal.kv_bits, refusal.chunk, refusal.needed / mb, refusal.available / mb, refusal.fitting_max_tokens, refusal.asked_max_tokens, refusal.maximum,
+    }) catch "The requested context does not fit in available GPU memory.";
+    return std.fmt.bufPrint(buf, "Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}: the request needs {d} MB and {d} MB is available, and the prompt alone does not fit. Maximum context: {d} tokens. Reduce context or free memory.", .{
+        refusal.requested, refusal.kv_bits, refusal.chunk, refusal.needed / mb, refusal.available / mb, refusal.maximum,
     }) catch "The requested context does not fit in available GPU memory.";
 }
 
@@ -1137,7 +1189,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
 /// request prices its own rung against live memory, so the pin is only the fallback.
 pub fn prefillChunkLoadLine(buf: []u8, config: *const model_mod.ModelConfig, pinned: u32, launch: usize) ?[]const u8 {
     if (perRequestPrefillChunkEnabled(config)) {
-        const widest = rungWidth(config, 1, cappedRung(PREFILL_CHUNK_LADDER[0], ladderTop(config, explicitPrefillChunk())), config.longCtxGated());
+        const widest = widestServedRung(config);
         return std.fmt.bufPrint(buf, "Prefill chunk: per request, up to {d} at a short prompt (the widest rung each request's bill admits); load-time fallback {d}\n", .{ widest, pinned }) catch null;
     }
     if (archHook("prefillChunkLoadLine", []const u8, config, .{ buf, pinned, launch })) |line| return line;
@@ -1704,9 +1756,25 @@ pub const PREFILL_RUNTIME_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
 /// the live peak (engine-memory-admission.md#bill-net). Past it the bill keeps the quarter its terms were fitted under.
 const MEASURED_NET_MAX_TOKENS: u64 = 86_016;
 
-/// The net the bill adds over its summed terms, in sixteenths (16 = none, 20 = the quarter).
+/// The net the bill adds over its summed terms, in sixteenths (16 = none, 20 = the quarter). Sushi Cooler owns its
+/// memory, so its bill is the exact bytes plus `BILL_MARGIN_BYTES`, never a net.
 fn billUplift16ths(config: *const model_mod.ModelConfig, seq: u64) u64 {
+    if (cooler_side.onEngine(config)) return 16;
+    return fittedNet16ths(config, seq);
+}
+
+/// The net the fitted transient terms were measured under; a chunk's cost keeps it until those terms are exact.
+fn fittedNet16ths(config: *const model_mod.ModelConfig, seq: u64) u64 {
     return if (config.longCtxGated() and seq <= MEASURED_NET_MAX_TOKENS) 16 else 20;
+}
+
+/// The one safety margin a Sushi Cooler bill carries, added once to its exact bytes: allocator granularity and the
+/// small tensors no term names. Fixed, since none of that scales with the context.
+pub const BILL_MARGIN_BYTES: u64 = 256 << 20;
+
+/// The margin a request's or a chunk's bill adds: Cooler's one named margin; an MLX bill's net is inside its terms.
+pub fn billMargin(config: *const model_mod.ModelConfig) u64 {
+    return if (cooler_side.onEngine(config)) BILL_MARGIN_BYTES else 0;
 }
 
 /// How many MoE layers' gather-sort expansions coexist between eval points.
@@ -1838,13 +1906,18 @@ pub const PrefillRequestTerms = struct {
     mtp_head_kv_bytes: u64 = 0,
     /// The DFlash2 assistant's window and capture rows (`dflashRequestBytes`).
     dflash_bytes: u64 = 0,
-    /// The bill's net over the summed terms, in sixteenths (20 = the historical quarter).
+    /// The bill's net over the summed terms, in sixteenths (20 = the historical quarter; 16, none, on Sushi Cooler).
     uplift_16ths: u64 = 20,
     /// The dense rebuild ONE quantized-KV layer really makes at this prompt
     /// length (`kvDequantScratchBytes`). Zero = the generic
     /// `2 · seq · kv_heads · hdim · 2` below, which is exact for every arch
     /// whose caching layers share one head count and one width.
     dequant_scratch_bytes: u64 = 0,
+    /// Sushi Cooler: the bytes each forward row holds at the chunk's peak, from the arch's own buffers
+    /// (`coolerPrefillRowBytes`). Nonzero replaces the fitted envelope and MLX's runtime floor.
+    cooler_row_bytes: u64 = 0,
+    /// Beside them, the recurrent states a chunk replaces (`ModelConfig.ssmCheckpointBytes`).
+    cooler_turnover_bytes: u64 = 0,
 };
 
 pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms) u64 {
@@ -1867,15 +1940,17 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // historical 3-envelope bill so no arch's admission ever LOOSENS: that
     // figure is conservative on plain attention archs and would be a 33%
     // UNDER-bill on a GatedDeltaNet hybrid.
-    const envelope: u64 = @max(3 * mlp, mlp + fwd * stream_per_tok);
+    // An exact Cooler forward's rows, and each linear layer's state replaced beside the old until its pass has run.
+    const envelope: u64 = if (req.cooler_row_bytes > 0) fwd * req.cooler_row_bytes + req.cooler_turnover_bytes else @max(3 * mlp, mlp + fwd * stream_per_tok);
+    const runtime_floor: u64 = if (req.cooler_row_bytes > 0) 0 else PREFILL_RUNTIME_FLOOR_BYTES;
     // The dequant+GEMM prefill route (verify_moe.prefillDqGemm) materializes
     // a bf16 copy of the weight it is about to multiply plus its transpose,
     // and only at forwards wide enough to take that route. Measured against
     // the route off: ~0 at chunk 8192 where the envelope already dominates.
     const dq_weights: u64 = if (fwd >= trunk.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
-        req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
-    // The one place a warm turn's resident rows leave the bill, inside the 5/4.
+        req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + scores + dequant + envelope + dq_weights + runtime_floor;
+    // The one place a warm turn's resident rows leave the bill, inside the net.
     return (gross -| req.shared_resident_bytes) * req.uplift_16ths / 16;
 }
 
@@ -1905,8 +1980,10 @@ pub fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
     }
     if (config.isMoe()) {
         const top_k: u64 = @max(@as(u64, config.num_experts_per_tok), 1);
-        per_tok += MOE_PREFILL_COEXIST * top_k * 2 *
+        const expansion = MOE_PREFILL_COEXIST * top_k * 2 *
             (@as(u64, config.hidden_size) + config.moe_intermediate_size) * 2;
+        // A rate-grouped layer's planes, each as tall as every sorted row, can outgrow the fitted expansion.
+        per_tok += @max(expansion, rateGroupedPrefillBytesPerRow(config));
     }
     // A ringed sliding layer stages the WHOLE chunk before it compacts back to
     // its window, so the rows exist for the width of the forward and the
@@ -1917,6 +1994,46 @@ pub fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
         @as(u64, trunk.Trunk.PREFILL_EVAL_CADENCE_DEFAULT) + 1,
     );
     return per_tok;
+}
+
+/// Sushi Cooler: the bytes each prefill row holds at a chunk's peak, from the arch's own buffers; 0 where the arch has
+/// no such account (its fitted envelope stands).
+pub fn coolerPrefillRowBytes(config: *const model_mod.ModelConfig) u64 {
+    if (!cooler_side.onEngine(config)) return 0;
+    const rows = archHook("coolerPrefillRowBytes", u64, config, .{}) orelse return 0;
+    return if (@import("builtin").is_test) cooler_rows_for_test orelse rows else rows;
+}
+/// Test seam: a forward whose attention is stood in selects no QSA blocks, so its bill has none.
+pub var qsa_off_for_test = false;
+/// Test seam: the row bytes an exact Cooler bill takes in place of the arch's (one layer kind's, to cost it alone).
+pub var cooler_rows_for_test: ?u64 = null;
+
+/// What the adaptive sizer asks the headroom for a chunk of `cost`: an exact Cooler cost and the margin, else the quarter
+/// the fitted terms were measured under.
+fn chunkAsk(config: *const model_mod.ModelConfig, cost: u64) u64 {
+    return if (coolerPrefillRowBytes(config) > 0) cost +| BILL_MARGIN_BYTES else cost *| 5 / 4;
+}
+
+/// The most a prefill chunk may grow the engine's pool: its cost, and where that cost is exact the one margin, which
+/// the forward's cap (`cooler.forwardCap`) lets the pool keep in free buffers.
+pub fn prefillChunkHeldMax(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64) u64 {
+    const cost = prefillChunkCost(config, kv_bits, width, kv_len);
+    return if (coolerPrefillRowBytes(config) > 0) cost +| BILL_MARGIN_BYTES else cost;
+}
+
+/// Bytes per prefill row an EXL3 MoE layer holds at its down projection (`rate_groups.moePrefill`), f16 over every
+/// sorted row: the gate and up inputs, the gate, up and SwiGLU planes, and the down plane, each as tall as every
+/// sorted row. MLX, or a streamed bank, holds a down plane per pool and their combine where there is more than one;
+/// a streamed bank serves a group as two pools.
+pub fn rateGroupedPrefillBytesPerRow(config: *const model_mod.ModelConfig) u64 {
+    if (config.expert_layout != .exl3_k4) return 0;
+    const groups: u64 = config.expert_rate_groups;
+    const pools: u64 = if (config.expert_streaming) @min(2 * groups, sushi_exl3.group_layout.max_groups) else groups;
+    // On the engine a resident bank's groups write one plane (`rate_groups.groupedGemm`); a streamed bank's are planes.
+    const one_plane = cooler_side.onEngine(config) and !config.expert_streaming;
+    const down: u64 = if (one_plane or pools == 1) 1 else pools + 1;
+    const top_k: u64 = @max(@as(u64, config.num_experts_per_tok), 1);
+    return top_k * 2 * (@as(u64, config.hidden_size) * (2 + down) + 3 * @as(u64, config.moe_intermediate_size));
 }
 
 /// The dequantized-weight working set `verify_moe.prefillDqGemm` materializes
@@ -1956,6 +2073,47 @@ pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
     const one = config.qsaHistoryBytesPerToken();
     if (one == 0) return 0;
     return one + config.qsaScoreBankBytesPerToken();
+}
+
+/// Tokens of capacity a request's cache holds by its last token, as `KVCache` allocates them at its 256-row step: a long
+/// prompt's reservation (prompt, reply and a chunk); a shorter one of several chunks reserves its own length
+/// (`prefill_plan.reservedPrefillTokens`), else the prefill's chunks grow it; then each decode grow takes the +25%
+/// policy up to the prompt and its reply. What the bill and the commit count.
+pub fn cacheCapacityTokens(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {
+    const KV = trunk.KVCache;
+    const end = seq +| (if (ctx > seq) @min(max_tokens, ctx - seq) else 0);
+    const reserves = config.reservesKvCapacity();
+    const long = if (reserves) reservedCacheTokens(seq, max_tokens, chunk, ctx) else 0;
+    if (long > 0) return roundToCacheStep(long);
+    var cap: u64 = 0;
+    if (reserves and seq > chunk) {
+        cap = roundToCacheStep(seq);
+    } else {
+        var at: u64 = 0;
+        while (at < seq) {
+            at = @min(seq, at + @max(chunk, 1));
+            cap = KV.nextCapacityPolicy(@intCast(cap), @intCast(at));
+        }
+    }
+    while (cap < end) cap = KV.nextCapacityPolicy(@intCast(cap), @intCast(cap + 1));
+    return cap;
+}
+
+fn roundToCacheStep(tokens: u64) u64 {
+    const step: u64 = 256;
+    return (tokens + step - 1) / step * step;
+}
+
+/// On a Cooler load each cache buffer is held at its pool size class, at most a sixteenth over its bytes.
+fn pooledCacheBytes(config: *const model_mod.ModelConfig, bytes: u64) u64 {
+    return if (@import("cooler_side.zig").onEngine(config)) bytes +| bytes / 16 else bytes;
+}
+
+/// What a request commits at admission where its arch's bill opts in (`commitsCache`): its whole cache and per-token
+/// state at `cacheCapacityTokens`, drained as the cache becomes resident.
+pub fn cacheCommitBytes(config: *const model_mod.ModelConfig, prompt_len: u64, max_tokens: u64, kv_bits: u64, chunk: u64) u64 {
+    const cap = cacheCapacityTokens(config, prompt_len, max_tokens, chunk, getEffectiveContextLength(config));
+    return pooledCacheBytes(config, cap *| (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)));
 }
 
 /// Tokens of cache capacity a request reserves at admission (prompt + generation + one chunk
@@ -2039,8 +2197,8 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // joins through the narrower `reservesKvCapacity`; every term it does not have stays zero on
     // its own (no QSA history, no SSM checkpoints); its MTP heads bill `mimo_mtp.State.billedBytes`.
     if (!config.reservesKvCapacity()) return .{};
-    // `reservedTokens` returns 0 below its length threshold; floor the reserved length at `seq`.
-    const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
+    // The whole cache the request holds by its last token, reserved up front or grown to (`cacheCapacityTokens`).
+    const reserved = @max(cacheCapacityTokens(config, seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
     // Only the headroom is new here: the prompt's own rows are already billed.
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     const mtp_on = warm.mtp_on or (forceMtpFor(config) and !config.dflash_loaded);
@@ -2051,8 +2209,8 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // privatised on restore (`seedCapBuf`), so crediting it cancelled the one-copy bill outright.
     const credited = warm.creditedRows(reserved);
     return .{
-        .reserved_kv_bytes = (reserved -| seq) * kv_per_tok,
-        .state_bytes = reserved * (statePerTokenBilled(config) +| head_state_per_tok) +|
+        .reserved_kv_bytes = pooledCacheBytes(config, (reserved -| seq) * kv_per_tok),
+        .state_bytes = pooledCacheBytes(config, reserved * (statePerTokenBilled(config) +| head_state_per_tok)) +|
             (if (mtp_on) mtpHeadRingBytes(config) else 0),
         // The warm span, not the prompt; read regardless of `will_donate` (a shared restore skips the same rows).
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk) +| thoughtPointBytes(config, warm),
@@ -2063,6 +2221,8 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .dflash_bytes = dflashRequestBytes(config, @min(chunk, @max(seq, 1))),
         .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(chunk, seq)),
         .uplift_16ths = billUplift16ths(config, seq),
+        .cooler_row_bytes = coolerPrefillRowBytes(config),
+        .cooler_turnover_bytes = config.ssmCheckpointBytes(),
     };
 }
 
@@ -2133,6 +2293,35 @@ pub fn prefillNeededAtChunk(
     chunk: u64,
     warm: WarmPrefix,
 ) u64 {
+    return requestHeldBytes(config, seq, max_tokens, kv_bits, chunk, warm) +| billMargin(config);
+}
+
+/// The bill with no decoder pool lent (`borrowableBytes` 0): what a request's forwards take from the pool themselves.
+/// Admission nets out the pools a prefill may release, since a forward the live headroom cannot hold releases them
+/// first; a forward the headroom holds releases none, so a check of what a forward asks (the served warm) reads this.
+pub fn prefillNeededAtChunkUnlent(
+    config: *const model_mod.ModelConfig,
+    seq: u64,
+    max_tokens: u32,
+    kv_bits: u64,
+    chunk: u64,
+    warm: WarmPrefix,
+) u64 {
+    var own = config.*;
+    own.expert_borrow_bytes = 0;
+    return prefillNeededAtChunk(&own, seq, max_tokens, kv_bits, chunk, warm);
+}
+
+/// What a request holds at its peak, its storage and its widest forward's transients: exact on Sushi Cooler (the bill
+/// adds `billMargin`), with the calibrated net on MLX.
+pub fn requestHeldBytes(
+    config: *const model_mod.ModelConfig,
+    seq: u64,
+    max_tokens: u32,
+    kv_bits: u64,
+    chunk: u64,
+    warm: WarmPrefix,
+) u64 {
     if (archHook("requestBill", u64, config, .{ seq, max_tokens, kv_bits, chunk, warm })) |bill| return bill;
     const heads: u64 = config.num_attention_heads;
     const kv_heads: u64 = config.num_key_value_heads;
@@ -2140,7 +2329,7 @@ pub fn prefillNeededAtChunk(
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
     return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
-        qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
+        qsaMaskBilled(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
         trunkDecodeScratchBytes(config, @min(chunk, @max(seq, 1))) +
@@ -2186,7 +2375,8 @@ pub fn chooseRequestPrefillChunk(
         const rung = cappedRung(r, top);
         const width: u64 = rungWidth(config, seq, rung, config.longCtxGated());
         const bill = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, rung_warm);
-        const needed = if (width > rungWidth(config, seq, rung, false))
+        // An exact Cooler bill under-bills nothing, so it carries its one margin and no estimator's.
+        const needed = if (width > rungWidth(config, seq, rung, false) and coolerPrefillRowBytes(config) == 0)
             bill *| (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100
         else
             bill;
@@ -2197,6 +2387,12 @@ pub fn chooseRequestPrefillChunk(
 
 fn cappedRung(rung: u32, cap: u32) u32 {
     return if (cap == 0) rung else @min(rung, cap);
+}
+
+/// The widest width a served request's ladder forwards at a short prompt: the arch's start width (DeepSeek's 2048) or
+/// `--prefill-chunk`, bounded as a request's rung is. A load's served warm takes this width, not the global default.
+pub fn widestServedRung(config: *const model_mod.ModelConfig) u32 {
+    return @intCast(rungWidth(config, 1, cappedRung(PREFILL_CHUNK_LADDER[0], ladderTop(config, explicitPrefillChunk())), config.longCtxGated()));
 }
 
 /// The widest rung a request may take: an explicit `--prefill-chunk`, else the arch's start width.
@@ -2249,7 +2445,7 @@ pub fn requestPrefillChunkNow(
     const seq: u64 = @intCast(prompt_len);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     const active_mem: usize = gpu_mem.activeBytes();
-    const available: u64 = currentGpuMemoryCeiling(config, active_mem) -| active_mem;
+    const available: u64 = liveGpuMemoryCeiling(config, active_mem) -| active_mem;
     const warm = WarmPrefix{ .matched_tokens = warm_matched, .capacity_tokens = warm_capacity, .will_donate = warm_will_donate, .mtp_on = enable_mtp };
     const chosen = requestPrefillPick(config, seq, max_tokens, kv_bits, available, unchunked_prefill, warm);
     if (chosen != pin and !unchunked_prefill and perRequestPrefillChunkEnabled(config)) {
@@ -2350,7 +2546,7 @@ pub fn adaptivePrefillWidth(
         st.supporting = 0;
         return current;
     }
-    const asked: u64 = prefillChunkCost(config, kv_bits, next, kv_len) *| 5 / 4;
+    const asked: u64 = chunkAsk(config, prefillChunkCost(config, kv_bits, next, kv_len));
     if (asked > headroom) {
         st.supporting = 0;
         return current;
@@ -2369,7 +2565,7 @@ pub fn prefillHeadroomNow(config: *const model_mod.ModelConfig, staged_host: u64
     // The SSD write-through stages chunk blobs as host bytes behind a ~1 GiB permit that
     // `mlx_get_active_memory` does not count; on unified memory they are the same pool. Read at
     // the hook site (inference thread) and passed in.
-    return prefillHeadroomFrom(currentGpuMemoryCeiling(config, active_mem), active_mem, staged_host);
+    return prefillHeadroomFrom(liveGpuMemoryCeiling(config, active_mem), active_mem, staged_host);
 }
 
 /// Pure half of `prefillHeadroomNow`.
@@ -2388,7 +2584,7 @@ pub fn adaptivePrefillWidenStillFits(
 ) bool {
     if (!adaptivePrefillChunkEnabled(config)) return false;
     const headroom = prefillHeadroomNow(config, staged_host);
-    const asked: u64 = prefillChunkCost(config, kv_bits, want, pos) *| 5 / 4;
+    const asked: u64 = chunkAsk(config, prefillChunkCost(config, kv_bits, want, pos));
     if (asked <= headroom) return true;
     log.info("[prefill] widen to {d} withdrawn at pos {d} (headroom {d} MB after the decode tick, cost {d} MB)\n", .{
         want,
@@ -2444,7 +2640,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     // Available = the lesser of Metal's static working-set max and what is physically reachable
     // now (#64). Read before the width is chosen: on a per-request arch the width is a function of it.
     const active_mem: usize = gpu_mem.activeBytes();
-    const total_limit: u64 = currentGpuMemoryCeiling(config, active_mem);
+    const total_limit: u64 = liveGpuMemoryCeiling(config, active_mem);
     const available = admissionAvailable(total_limit, active_mem);
 
     // A vision prefill chunks like text since issue #197 (the splice resumes
@@ -3427,6 +3623,21 @@ test "a refusal names the credit it COMPARED, never the residency it cannot take
     try t.expectEqual(7_802 * mb, reclaimable.evictionCredit());
     try t.expectEqual(@as(u64, 0), pinnedResidentBytes(reclaimable));
     try t.expect(reclaimable.fitsAfterEviction());
+}
+
+test "the effective context is never 0: a request always runs against a concrete window" {
+    // `getEffectiveContextLength` returns the manual context when set, else the pinned one when set,
+    // else `autoContextFor`, whose two arms bottom out in `safeAutoContext` (at least 1) and a
+    // positive checkpoint cap or default.
+    try testing.expect(safeAutoContext(0) > 0);
+    try testing.expect(autoContextFrom(0, 0, 0) > 0);
+    try testing.expect(autoContextFrom(0, 131_072, 0) > 0);
+    try testing.expect(autoContextFrom(0, 0, 262_144) > 0);
+    try testing.expect(autoContextFrom(0, 131_072, 262_144) > 0);
+    const original = launch_state.server_config.max_context_size;
+    defer launch_state.server_config.max_context_size = original;
+    launch_state.server_config.max_context_size = 0;
+    try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&model_mod.ModelConfig{ .pinned_context = 4096 }));
 }
 
 test "safeAutoContext leaves headroom below the memory ceiling and rounds to 1024" {
@@ -4506,13 +4717,13 @@ test "the 64 GB Sushi-STQ-2.75bpw recipe's bills at both GDN widths: 250000 cont
     const warm = WarmPrefix{ .mtp_on = true };
     // The load bill's context term is the narrowest rung; at this pack's weights the 59,000 MB ceiling admits
     // the 2048 rung. With the SSD tier up (the default) the prefill holds 3 checkpoints, not the 16 it captures.
-    try t.expectEqual(@as(u64, 7_844), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 9_337), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
-    try t.expectEqual(@as(u64, 11_157), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 7_846), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_340), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
+    try t.expectEqual(@as(u64, 11_159), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
     cfg.gdn_state_f32 = false;
-    try t.expectEqual(@as(u64, 7_641), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 9_135), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
-    try t.expectEqual(@as(u64, 10_954), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 7_643), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_137), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
+    try t.expectEqual(@as(u64, 10_957), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
 }
 
 test "an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN widths" {
@@ -4782,7 +4993,7 @@ test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
     try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&plain, seq, 2048, chunk));
 }
 
-test "a prompt of several chunks under the long-prompt threshold reserves its own length (one grow, as a reserved cache takes), billed as before" {
+test "a prompt of several chunks under the long-prompt threshold reserves its own length (one grow, as a reserved cache takes), and is billed the cache its reply grows it to" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
     const cfg = fixtures.qwen4ExpOomConfig();
@@ -4790,8 +5001,10 @@ test "a prompt of several chunks under the long-prompt threshold reserves its ow
     const chunk: u64 = 1024;
     for ([_]u64{ 1025, 5000, 32767 }) |seq| {
         try t.expectEqual(seq, prefill_plan.reservedPrefillTokens(&cfg, seq, 2048, chunk));
-        // The bill floors its reservation at the prompt: no headroom past it to bill.
-        try t.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{}).reserved_kv_bytes);
+        // The reply grows the cache past the prompt by the +25% policy, each grow billed.
+        const cap = cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg));
+        try t.expect(cap >= seq + 2048);
+        try t.expectEqual((cap - seq) * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8), prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{}).reserved_kv_bytes);
     }
     // One chunk grows once either way: nothing reserved.
     try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&cfg, chunk, 2048, chunk));
@@ -4831,13 +5044,18 @@ test "mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sh
     try t.expectEqual(@as(u64, 0), slidingBandScoreBytes(&plain, chunk));
 }
 
-test "a trellis trunk's prefill bill carries one decoded bank pair from the decoded path's width" {
+test "a trellis trunk's prefill bill carries one decoded bank pair from the decoded path's width, where the GPU serves it" {
     if (!archBuilt("mimo2")) return error.SkipZigTest;
     const t = std.testing;
     var plain = fixtures.mimoV2BillConfig();
     var stq = plain;
     stq.trunk_quant = sushi_exl3.format.Decode.tabled(.spec1, .w15);
     const min: u64 = @intCast(sushi_exl3.trunk_gemm.DECODED_MIN_ROWS);
+    defer sushi_exl3.trunk_gemm.can_serve_for_test = null;
+    // A GPU without the NAX GEMM never decodes the weight, so its bill holds none.
+    sushi_exl3.trunk_gemm.can_serve_for_test = false;
+    try t.expectEqual(@as(u64, 0), trunkDecodeScratchBytes(&stq, 4096));
+    sushi_exl3.trunk_gemm.can_serve_for_test = true;
     try t.expectEqual(sushi_exl3.trunk_gemm.DECODED_SCRATCH_BYTES, prefillTransientReserve(&stq, 8, 4096) - prefillTransientReserve(&plain, 8, 4096));
     try t.expectEqual(sushi_exl3.trunk_gemm.DECODED_SCRATCH_BYTES, trunkDecodeScratchBytes(&stq, min));
     try t.expectEqual(@as(u64, 0), trunkDecodeScratchBytes(&stq, min - 1));
@@ -5130,12 +5348,20 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk(&other));
 }
 
-test "a Qwen or MiMo request owes no growth after admission, its reserved capacity is taken at its first grow" {
+test "a Qwen request commits its whole cache at admission, as admission counts what it is still to grow; MiMo commits none" {
     if (!archBuilt("qwen4") or !archBuilt("mimo2")) return error.SkipZigTest;
-    for ([_][]const u8{ "qwen4_exp", "mimo_v2" }) |model_type| {
-        const cfg = model_mod.ModelConfig{ .model_type = model_type };
-        try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&cfg, 40_000, 4096, 8));
+    const cfg = fixtures.qwen4ExpOomConfig();
+    const ctx = getEffectiveContextLength(&cfg);
+    const chunk = settings_resolve.prefill_chunk.value;
+    // A long prompt reserves the prompt, the reply and a chunk; a short one grows to its reply by the cache's steps.
+    for ([_]u64{ 40_000, 1_000 }) |seq| {
+        const per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + statePerTokenBilled(&cfg);
+        const cap = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx);
+        try std.testing.expect(cap >= seq + 4096);
+        try std.testing.expectEqual(cap * per_tok, admissionCommitBytes(&cfg, seq, 4096, 8));
     }
+    const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
+    try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&mimo, 40_000, 4096, 8));
 }
 
 test "GLM release defaults advertise the full context at the widest prefill chunk that keeps it" {
@@ -5295,7 +5521,7 @@ test "bill pin: prefillTransientReserve and prefillTransientReserveAtKv" {
         913670144, 2007965696, 3841163264, 5598412928, 912621568, 1751965696, 3832774656, 5342412928,
         1630685920, 1837124320, 6452824800, 6649432800, 1813205120, 1813205120, 6625513600, 6625513600,
         1637207552, 1701999104, 5399432704, 5462045184, 1635074560, 1747620352, 5397070336, 5505716736,
-        1841562496, 3462466456, 12853451776, 14472514456, 1841562496, 3462466456, 12853451776, 14472514456,
+        1655911936, 2952635104, 10465423360, 11760673504, 1655911936, 2952635104, 10465423360, 11760673504,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             for (pin_bits) |b| for ([_]u64{ 512, 4096 }) |chunk| {
@@ -5390,8 +5616,8 @@ test "bill pin: sushiContextBytesAt and the max-context search" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigs("maxSushiContext", &.{
-        4652207616, 512, 1048576, 1048576, 200000, 3544957920, 512, 1048576,
-        1048576, 200000, 2966441600, 512, 1048576, 1048576, 200000, 4845384760,
+        4654319616, 512, 1048576, 1048576, 200000, 3546426720, 512, 1048576,
+        1048576, 200000, 2966441600, 512, 1048576, 1048576, 200000, 4335553408,
         512, 1048576, 1048576, 200000,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -5410,8 +5636,8 @@ test "bill pin: loadServingBill" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("loadServingBill", &.{
-        0, 1, 100000, 4652207616, 1048576, 8, 512, 0,
-        1, 100000, 3813393376, 1048576, 8, 512, 0, 0,
+        0, 1, 100000, 4654319616, 1048576, 8, 512, 0,
+        1, 100000, 3814862176, 1048576, 8, 512, 0, 0,
         0, 0,
     }, .{ 7, 7, 2, 2 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -5434,7 +5660,7 @@ test "bill pin: loadServingBill" {
 
 test "bill pin: memoryContextAt and memoryContextAtChunk" {
     try pinConfigs("memoryContextAt", &.{
-        1048576, 1048576, 446723, 446723, 2052459, 2160469, 480445, 588455,
+        1048576, 1048576, 446720, 446720, 2052459, 2160469, 480445, 588455,
         3799051, 3953345, 922039, 1076334, 1076224, 1076224, 1076224, 1076224,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -5507,9 +5733,9 @@ test "bill pin: planHotCache" {
         1630685920, 1423904640, 2147483648, 1024, 512, 1630685920, 1423904640, 2147483648,
         2048, 512, 1637207552, 816436736, 40496028672, 1024, 512, 1637207552,
         816436736, 40496028672, 2048, 512, 1637207552, 816436736, 2147483648, 1024,
-        512, 1637207552, 816436736, 2147483648, 2048, 512, 1841562496, 95303744,
-        41012806720, 1024, 512, 1841562496, 95303744, 41012806720, 2048, 512,
-        1841562496, 95303744, 2147483648, 1024, 512, 1841562496, 95303744, 2147483648,
+        512, 1637207552, 816436736, 2147483648, 2048, 512, 1655911936, 95303744,
+        41198457280, 1024, 512, 1655911936, 95303744, 41198457280, 2048, 512,
+        1655911936, 95303744, 2147483648, 1024, 512, 1655911936, 95303744, 2147483648,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             for ([_]u64{ 0, 2 * pin_gib }) |req| for ([_]u32{ 0, 1024 }) |over| {
@@ -5568,9 +5794,9 @@ test "bill pin: the unnamed hot-cache ask" {
 
 test "bill pin: oneSessionEntryBytes and oneSessionFor" {
     try pinConfigs("oneSession", &.{
-        2250651648, 2250651648, 36555305344, 5320625792, 1073741824, 2250651648, 1526246400, 1526246400,
-        37635666976, 4240264160, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
-        1073741824, 2052183552, 96290880, 96290880, 35457682376, 6418248760, 1073741824, 96290880,
+        2250651648, 2250651648, 36553193344, 5322737792, 1073741824, 2250651648, 1526246400, 1526246400,
+        37634198176, 4241732960, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
+        1073741824, 2052183552, 96290880, 96290880, 36282086528, 5593844608, 1073741824, 96290880,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             g.add(oneSessionEntryBytes(c, 8, 100_000, 1024));
@@ -5600,45 +5826,45 @@ test "bill pin: reservedCacheTokens" {
 
 test "bill pin: prefillRequestTerms" {
     try pinConfigs("prefillRequestTerms", &.{
-        0, 2304000, 115458048, 0, 0, 98304, 0, 0,
-        16, 2048000, 0, 2496000, 115458048, 0, 0, 106496,
-        2048000, 0, 16, 2048000, 0, 2304000, 0, 13056000,
-        0, 98304, 0, 0, 16, 2048000, 0, 2496000,
-        230916096, 0, 0, 106496, 2048000, 0, 16, 2048000,
-        0, 2304000, 115458048, 0, 0, 98304, 0, 0,
-        16, 2048000, 0, 2496000, 115458048, 0, 0, 106496,
-        2048000, 0, 16, 2048000, 0, 2304000, 0, 24576000,
-        0, 98304, 0, 0, 16, 2048000, 0, 2496000,
-        230916096, 0, 0, 106496, 2048000, 0, 16, 2048000,
-        80216064, 244555776, 346374144, 0, 0, 98304, 0, 0,
-        20, 204800000, 80216064, 264935424, 346374144, 0, 0, 106496,
-        217382912, 0, 20, 204800000, 80216064, 244555776, 346374144, 652800000,
-        65280000, 98304, 0, 0, 20, 204800000, 80216064, 264935424,
-        461832192, 0, 0, 106496, 217382912, 0, 20, 204800000,
-        150994944, 244555776, 346374144, 0, 0, 98304, 0, 0,
-        20, 204800000, 150994944, 264935424, 346374144, 0, 0, 106496,
-        217382912, 0, 20, 204800000, 150994944, 244555776, 346374144, 1228800000,
-        122880000, 98304, 0, 0, 20, 204800000, 150994944, 264935424,
-        461832192, 0, 0, 106496, 217382912, 0, 20, 204800000,
-        0, 0, 0, 0, 1360000, 199904640, 0, 0,
-        20, 3276800, 0, 15173632, 0, 0, 1360000, 199904640,
-        0, 0, 20, 3276800, 0, 0, 0, 12240000,
-        1360000, 199904640, 0, 0, 20, 3276800, 0, 15173632,
+        67160064, 14155776, 115458048, 0, 0, 98304, 0, 0,
+        16, 2048000, 67160064, 15335424, 115458048, 0, 0, 106496,
+        12582912, 0, 16, 2048000, 67160064, 14155776, 0, 80216064,
+        0, 98304, 0, 0, 16, 2048000, 67160064, 15335424,
+        230916096, 0, 0, 106496, 12582912, 0, 16, 2048000,
+        126418944, 14155776, 115458048, 0, 0, 98304, 0, 0,
+        16, 2048000, 126418944, 15335424, 115458048, 0, 0, 106496,
+        12582912, 0, 16, 2048000, 126418944, 14155776, 0, 150994944,
+        0, 98304, 0, 0, 16, 2048000, 126418944, 15335424,
+        230916096, 0, 0, 106496, 12582912, 0, 16, 2048000,
+        81469440, 244776960, 346374144, 0, 0, 98304, 0, 0,
+        20, 204800000, 81469440, 265175040, 346374144, 0, 0, 106496,
+        217579520, 0, 20, 204800000, 81469440, 244776960, 346374144, 652800000,
+        65280000, 98304, 0, 0, 20, 204800000, 81469440, 265175040,
+        461832192, 0, 0, 106496, 217579520, 0, 20, 204800000,
+        153354240, 244776960, 346374144, 0, 0, 98304, 0, 0,
+        20, 204800000, 153354240, 265175040, 346374144, 0, 0, 106496,
+        217579520, 0, 20, 204800000, 153354240, 244776960, 346374144, 1228800000,
+        122880000, 98304, 0, 0, 20, 204800000, 153354240, 265175040,
+        461832192, 0, 0, 106496, 217579520, 0, 20, 204800000,
+        62962560, 0, 0, 0, 1360000, 199904640, 0, 0,
+        20, 3276800, 62962560, 15173632, 0, 0, 1360000, 199904640,
+        0, 0, 20, 3276800, 62962560, 0, 0, 75202560,
+        1360000, 199904640, 0, 0, 20, 3276800, 62962560, 15173632,
         0, 0, 1360000, 199904640, 0, 0, 20, 3276800,
-        0, 0, 0, 0, 2560000, 348541440, 0, 0,
-        20, 3276800, 0, 15173632, 0, 0, 2560000, 348541440,
-        0, 0, 20, 3276800, 0, 0, 0, 23040000,
-        2560000, 348541440, 0, 0, 20, 3276800, 0, 15173632,
+        118517760, 0, 0, 0, 2560000, 348541440, 0, 0,
+        20, 3276800, 118517760, 15173632, 0, 0, 2560000, 348541440,
+        0, 0, 20, 3276800, 118517760, 0, 0, 141557760,
+        2560000, 348541440, 0, 0, 20, 3276800, 118517760, 15173632,
         0, 0, 2560000, 348541440, 0, 0, 20, 3276800,
-        75202560, 0, 0, 0, 136000000, 199904640, 0, 0,
-        20, 167772160, 75202560, 15173632, 0, 0, 136000000, 199904640,
-        0, 0, 20, 167772160, 75202560, 0, 0, 612000000,
-        81600000, 199904640, 0, 0, 20, 167772160, 75202560, 15173632,
+        76377600, 0, 0, 0, 136000000, 199904640, 0, 0,
+        20, 167772160, 76377600, 15173632, 0, 0, 136000000, 199904640,
+        0, 0, 20, 167772160, 76377600, 0, 0, 612000000,
+        81600000, 199904640, 0, 0, 20, 167772160, 76377600, 15173632,
         0, 0, 136000000, 199904640, 0, 0, 20, 167772160,
-        141557760, 0, 0, 0, 256000000, 348541440, 0, 0,
-        20, 167772160, 141557760, 15173632, 0, 0, 256000000, 348541440,
-        0, 0, 20, 167772160, 141557760, 0, 0, 1152000000,
-        153600000, 348541440, 0, 0, 20, 167772160, 141557760, 15173632,
+        143769600, 0, 0, 0, 256000000, 348541440, 0, 0,
+        20, 167772160, 143769600, 15173632, 0, 0, 256000000, 348541440,
+        0, 0, 20, 167772160, 143769600, 0, 0, 1152000000,
+        153600000, 348541440, 0, 0, 20, 167772160, 143769600, 15173632,
         0, 0, 256000000, 348541440, 0, 0, 20, 167772160,
         0, 0, 0, 0, 0, 0, 0, 0,
         20, 0, 0, 0, 0, 0, 0, 0,
@@ -5720,22 +5946,22 @@ test "bill pin: growCoexistBytes and the eval-window terms" {
 
 test "bill pin: prefillNeededAtChunk" {
     try pinConfigs("prefillNeededAtChunk", &.{
-        1048735744, 1050983936, 920221696, 1166441984, 1409875264, 1412123456, 1281361216, 1527581504,
-        1058207744, 1060455936, 918173696, 1175913984, 1419347264, 1421595456, 1279313216, 1537053504,
-        4449406976, 4742319616, 3715006976, 4886642176, 6203928704, 6501142144, 5469528704, 6645464704,
-        5699762176, 5992674816, 4317362176, 6136997376, 7476402304, 7773615744, 6094002304, 7917938304,
-        1629538080, 1648505120, 1614238080, 1648505120, 2284785440, 2303752480, 2269485440, 2303752480,
-        1826238080, 1845205120, 1797438080, 1845205120, 2481485440, 2500452480, 2452685440, 2500452480,
-        3588659680, 3607626720, 2755659680, 3607626720, 5674578400, 5693545440, 4841578400, 5693545440,
-        5126948480, 5145915520, 3558948480, 5145915520, 7233603200, 7252570240, 5665603200, 7252570240,
+        1127747584, 1141518336, 932073472, 1256976384, 1488887104, 1502657856, 1293212992, 1618115904,
+        1196478464, 1210249216, 930025472, 1325707264, 1557617984, 1571388736, 1291164992, 1686846784,
+        4451250176, 4744431616, 3716850176, 4888754176, 6205771904, 6503254144, 5471371904, 6647576704,
+        5702987776, 5996169216, 4320587776, 6140491776, 7479627904, 7777110144, 6097227904, 7921432704,
+        1708241280, 1727208320, 1614238080, 1727208320, 2363488640, 2382455680, 2269485440, 2382455680,
+        1974385280, 1993352320, 1797438080, 1993352320, 2629632640, 2648599680, 2452685440, 2648599680,
+        3590128480, 3609095520, 2757128480, 3609095520, 5676047200, 5695014240, 4843047200, 5695014240,
+        5129713280, 5148680320, 3561713280, 5148680320, 7236368000, 7255335040, 5668368000, 7255335040,
         2089683520, 2089683520, 2089683520, 2274208320, 2729646720, 2729646720, 2729646720, 2914171520,
         2121102080, 2121102080, 2121102080, 2305626880, 2760733440, 2760733440, 2760733440, 2945258240,
         3000684160, 3000684160, 3000684160, 3369733760, 5014994560, 5014994560, 5014994560, 5384044160,
         3747067520, 3747067520, 3747067520, 4116117120, 5760333440, 5760333440, 5760333440, 6129383040,
-        4508149310, 4508149310, 4508149310, 4508149310, 4508149310, 4508149310, 4508149310, 4508149310,
-        4508149310, 4508149310, 4508149310, 4508149310, 4508149310, 4508149310, 4508149310, 4508149310,
-        4849941560, 4849941560, 4849941560, 4849941560, 9568533560, 9568533560, 9568533560, 9568533560,
-        4849941560, 4849941560, 4849941560, 4849941560, 9568533560, 9568533560, 9568533560, 9568533560,
+        4022621408, 4022621408, 4022621408, 4022621408, 4022621408, 4022621408, 4022621408, 4022621408,
+        4022621408, 4022621408, 4022621408, 4022621408, 4022621408, 4022621408, 4022621408, 4022621408,
+        4340110208, 4340110208, 4340110208, 4340110208, 8114983808, 8114983808, 8114983808, 8114983808,
+        4340110208, 4340110208, 4340110208, 4340110208, 8114983808, 8114983808, 8114983808, 8114983808,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             for ([_]u64{ 1000, 100_000 }) |seq| for (pin_bits) |b| for ([_]u64{ 512, 2048 }) |chunk| for (pinWarms()) |w|
@@ -5745,7 +5971,7 @@ test "bill pin: prefillNeededAtChunk" {
 }
 
 test "bill pin: defaultRequestBill" {
-    try pinConfigs("defaultRequestBill", &.{ 537696256, 1108173696, 1037824640, 4407603760 }, struct {
+    try pinConfigs("defaultRequestBill", &.{ 537696256, 1108173696, 1037824640, 4385828608 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             g.add(defaultRequestBill(c));
         }
@@ -5814,7 +6040,7 @@ test "bill pin: prefillChunkCost and the adaptive width" {
         1705423360, 5489439232, 512, 512, 0, 1, 512, 512,
         0, 1, 512, 1024, 0, 0, 2048, 2048,
         0, 0, 512, 1024, 0, 0, 2048, 4096,
-        0, 0, 1, 1, 3462708120, 14474447768, 512, 512,
+        0, 0, 1, 1, 2952876768, 11762606816, 512, 512,
         0, 1, 512, 512, 0, 1, 512, 1024,
         0, 0, 1024, 1024, 0, 1, 512, 1024,
         0, 0, 2048, 4096, 0, 0, 1, 1,
@@ -5848,7 +6074,7 @@ test "bill pin: creditedAdmissionBill and its verdict" {
         10737418240, 12884901888, 5368709120, 3221225472, 1024, 1, 1, 0,
         2147483648, 12884901888, 10737418240, 5368709120, 3221225472, 1024, 0, 1,
         1, 2147483648, 12884901888, 11811160064, 5368709120, 3221225472, 1024, 0,
-        1, 1, 2147483648, 0, 10737418240, 12884901888, 5368709120, 3221225472,
+        1, 1, 2147483648, 157286400, 10737418240, 12884901888, 5368709120, 3221225472,
         1024, 1, 1, 0, 2147483648, 12884901888, 10737418240, 5368709120,
         3221225472, 1024, 0, 1, 1, 2147483648, 12884901888, 11811160064,
         5368709120, 3221225472, 1024, 0, 1, 1, 2147483648, 0,
@@ -5895,8 +6121,12 @@ test "bill pin: the refusal sentences" {
     try std.testing.expectEqualStrings("Prompt (5000 tokens) requires ~13664MB GPU memory but only ~13374MB is available and the hot prefix cache holds ~7802MB more, all of which can be reclaimed (~2000MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", cached);
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024. Maximum context: 64000 tokens. Reduce context or free memory.",
-        memoryContextRefusalMessage(&buf, .{ .requested = 160_000, .maximum = 64_000, .needed = 1, .available = 1, .kv_bits = 4, .chunk = 1024 }),
+        "Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024: the request needs 9000 MB and 7000 MB is available. max_tokens 2000 fits (asked 96000); maximum context: 64000 tokens. Lower max_tokens, reduce context or free memory.",
+        memoryContextRefusalMessage(&buf, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024, .asked_max_tokens = 96_000, .fitting_max_tokens = 2000 }),
+    );
+    try std.testing.expectEqualStrings(
+        "Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024: the request needs 9000 MB and 7000 MB is available, and the prompt alone does not fit. Maximum context: 64000 tokens. Reduce context or free memory.",
+        memoryContextRefusalMessage(&buf, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024 }),
     );
 }
 
@@ -5905,7 +6135,7 @@ test "bill pin: requestContextRefusal" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("requestContextRefusal", &.{
-        1, 94096, 955581, 32212254720, 22548578304, 8, 1024, 1,
+        1, 94096, 955392, 32212254720, 22548578304, 8, 1024, 1,
         94096, 1048576, 32212254720, 22548578304, 8, 1024, 0, 0,
     }, .{ 7, 7, 1, 1 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -5979,7 +6209,7 @@ test "bill pin: the streamed-load fit" {
     try pinConfigs("expertStreaming", &.{
         65536, 1006731264, 4493721600, 3154214912, 1, 0, 65536, 970615680,
         5018044000, 3118099328, 1, 0, 65536, 585941504, 4677861760, 2733425152,
-        1, 0, 65536, 64630784, 8398125056, 2212114432, 1, 0,
+        1, 0, 65536, 64630784, 6948116480, 2212114432, 1, 0,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             var s = c.*;
@@ -6074,7 +6304,7 @@ test "a warm restore whose buffers hold the prompt but not the reservation bills
     const chunk: u64 = 2048;
     for ([_]*const model_mod.ModelConfig{ &q4, &mimo }) |cfg| {
         const kv = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
-        const reserved = @max(reservedCacheTokens(seq, 32_000, chunk, getEffectiveContextLength(cfg)), seq);
+        const reserved = cacheCapacityTokens(cfg, seq, 32_000, chunk, getEffectiveContextLength(cfg));
         try t.expect(seq <= capacity and capacity < reserved);
         const window = capacity * kv / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS);
         try t.expect(window > 0 and window < capacity * kv);
@@ -6092,6 +6322,7 @@ test "a warm restore whose buffers hold the prompt but not the reservation bills
         try t.expectEqual(@as(u64, 0), roomy.grow_coexist_bytes);
     }
 }
+
 
 test "bill pin: the manual context and the KV scheme" {
     const saved = launch_state.server_config.max_context_size;
@@ -6163,9 +6394,16 @@ pub fn expertStreamingGateBytes(resident_bytes: u64, cache_bytes: u64, fill_peak
 }
 
 /// The draft head's coarse lm_head copy: built only with MTP on, from an affine head (a trellis head has no packed rows to shrink).
+/// On a Cooler load each of its three buffers (packed rows, scales, biases) is billed at the size class the engine's pool
+/// takes for it: the Qwen STQ 2.75 cut's 227 MiB of rows take 232.
 pub fn rerankCoarseBill(split: model_mod.ResidentSplit, config: *const model_mod.ModelConfig, mtp_on: bool, coarse_bits: u32) u64 {
     if (!mtp_on or split.mtp == 0 or coarse_bits == 0 or split.stq_head) return 0;
-    return mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits);
+    if (!@import("cooler_side.zig").onEngine(config))
+        return mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits);
+    const rows: u64 = config.vocab_size;
+    const hidden: u64 = config.hidden_size;
+    const pool_class = @import("tensor/pool_class.zig");
+    return pool_class.poolBytes(rows * hidden * coarse_bits / 8) + 2 * pool_class.poolBytes(rows * (hidden / 64) * 2);
 }
 
 /// Which "available memory" figure the preflight should trust. On iOS the
@@ -6257,6 +6495,26 @@ test "the Sushi resident bill leaves out the coarse rerank copy of a trellis hea
     try testing.expectEqual(coarse, rerankCoarseBill(affine, &config, true, 3));
     try testing.expectEqual(@as(u64, 0), rerankCoarseBill(trellis, &config, true, 3));
     try testing.expectEqual(@as(u64, 0), rerankCoarseBill(affine, &config, false, 3));
+}
+
+test "on a Cooler load the coarse rerank head is billed as the pool holds it, each buffer at its size class" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    // The Qwen STQ 2.75 cut's head: its 227 MiB of packed rows take a 232 MiB class.
+    var config = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    config.vocab_size = 248320;
+    config.hidden_size = 2560;
+    const affine: model_mod.ResidentSplit = .{ .trunk = 1000, .mtp = 100 };
+    const rows: u64 = 248320;
+    const packed_bytes = rows * 2560 * 3 / 8;
+    const side = rows * (2560 / 64) * 2;
+    @import("cooler_side.zig").forTest(&config, true);
+    const pool_class = @import("tensor/pool_class.zig");
+    const held = pool_class.poolBytes(packed_bytes) + 2 * pool_class.poolBytes(side);
+    try testing.expect(held > mtp_mod.rerankCoarseBytes(248320, 2560, 3));
+    try testing.expectEqual(held, rerankCoarseBill(affine, &config, true, 3));
+    // On MLX it is the bytes MLX allocates.
+    @import("cooler_side.zig").forTest(&config, false);
+    try testing.expectEqual(mtp_mod.rerankCoarseBytes(248320, 2560, 3), rerankCoarseBill(affine, &config, true, 3));
 }
 
 test "bf16 streaming registry gate uses resident plan not checkpoint disk size" {

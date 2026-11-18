@@ -98,15 +98,15 @@ const test = (name, fn) => tests.push([name, fn]);
 
 test('the generation fields say what the model uses unset, and a model that cannot say keeps the bare word', async ({ browser }) => {
   const known = model({ id: 'Known', meta: { default_max_tokens: 256000, default_temperature: 1, default_top_p: 0.95, default_top_k: 20 } });
-  const windowed = model({ id: 'Windowed', meta: { default_max_tokens: 0, default_temperature: 0.6, default_top_p: 1, default_top_k: 0 } });
+  const engine = model({ id: 'Engine', meta: { default_max_tokens: 32768, default_temperature: 0.6, default_top_p: 1, default_top_k: 0 } });
   const cold = model({ id: 'Cold', state: 'unloaded', loaded: false });
-  const stub = await startStub({ models: [known, windowed, cold] });
+  const stub = await startStub({ models: [known, engine, cold] });
   const { page, errors } = await open(browser, stub);
   const placeholders = () => page.evaluate(() => ['optMaxTokens', 'optTemperature', 'optTopP', 'optTopK'].map((id) => document.getElementById(id).placeholder));
   await page.selectOption('#modelSelect', 'Known');
   assert.deepEqual(await placeholders(), ['Default (256,000)', 'Default (1.0)', 'Default (0.95)', 'Default (20)']);
-  await page.selectOption('#modelSelect', 'Windowed');
-  assert.deepEqual(await placeholders(), ['Default (rest of the context window)', 'Default (0.6)', 'Default (1.0)', 'Default (off)']);
+  await page.selectOption('#modelSelect', 'Engine');
+  assert.deepEqual(await placeholders(), ['Default (32,768)', 'Default (0.6)', 'Default (1.0)', 'Default (off)']);
   await page.selectOption('#modelSelect', 'Cold');
   assert.deepEqual(await placeholders(), ['Default', 'Default', 'Default', 'Default']);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
@@ -554,15 +554,20 @@ test('a typed generation setting reaches the request as typed, and one out of ra
   const stub = await startStub({ models: [model({ reasoning_efforts: ['low', 'high'], default_reasoning_effort: 'high' })] });
   const { page, context } = await open(browser, stub);
   const set = (id, value) => page.fill(`#${id}`, value);
-  await set('optMaxTokens', '1e9'); await set('optTemperature', '0.5');
+  await set('optMaxTokens', '1e9'); await set('optTemperature', '0.5'); await set('optMinP', '0.05');
   await send(page, 'q'); await page.waitForSelector('.msg.assistant .content'); await idle(page);
   const body = JSON.parse(stub.posts()[0].body);
   assert.equal(body.max_tokens, 1e9, '1e9 is a billion, not 1');
   assert.equal(body.temperature, 0.5);
-  const bad = [['optMaxTokens', '-5', /1 or more/], ['optMaxTokens', '1.7', /whole number/], ['optTemperature', '5', /0 to 2/], ['optTopP', '2', /0 to 1/], ['optTopK', '-3', /0 or more/], ['optThinkBudget', '0', /1 or more/]];
+  assert.equal(body.min_p, 0.05, 'Min-p rides the request as min_p');
+  const grid = await page.$$eval('#optTopK, #optMinP', (ns) => ns.map((n) => n.closest('.opt-grid') !== null));
+  assert.deepEqual(grid, [true, true], 'Min-p sits in the generation grid beside Top-k');
+  await page.reload(); await page.waitForSelector('#modelSelect option', { state: 'attached' });
+  assert.equal(await page.inputValue('#optMinP'), '0.05', 'Min-p is saved like the other generation fields');
+  const bad = [['optMaxTokens', '-5', /1 or more/], ['optMaxTokens', '1.7', /whole number/], ['optTemperature', '5', /0 to 2/], ['optTopP', '2', /0 to 1/], ['optTopK', '-3', /0 or more/], ['optMinP', '1.5', /0 to 1/], ['optThinkBudget', '0', /1 or more/]];
   for (const [id, value, message] of bad) {
     await page.reload(); await page.waitForSelector('#modelSelect option', { state: 'attached' });
-    await page.evaluate(() => { for (const id of ['optMaxTokens', 'optTemperature', 'optTopP', 'optTopK', 'optThinkBudget']) document.getElementById(id).value = ''; });
+    await page.evaluate(() => { for (const id of ['optMaxTokens', 'optTemperature', 'optTopP', 'optTopK', 'optMinP', 'optThinkBudget']) document.getElementById(id).value = ''; });
     const before = stub.posts().length;
     await set(id, value); await page.fill('#promptInput', 'q2'); await page.keyboard.press('Enter');
     await page.waitForTimeout(150);

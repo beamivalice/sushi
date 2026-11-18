@@ -457,6 +457,12 @@ const Host = struct {
         for ([_]mlx.mlx_array{ self.p.trellis, self.p.suh, self.p.svh }) |a| _ = mlx.mlx_array_free(a);
     }
 
+    /// Bank g's dense twin (`decodeDense`): `x` times it is `project`'s answer, with the tiles decoded once.
+    fn decodeGroup(self: *const Host, alloc: std.mem.Allocator, g: usize, in: usize, out: usize, n: u32, dec: exl3.Decode, dst: []f32) !void {
+        const per = (in / 16) * (out / 16) * n;
+        try decodeDense(alloc, self.words[g * per ..][0..per], self.suh[g * in ..][0..in], self.svh[g * out ..][0..out], in, out, n, dec, dst);
+    }
+
     /// Bank g's projection of `x` in f32 from the host tile decode.
     fn project(self: *const Host, alloc: std.mem.Allocator, g: usize, x: []const f32, in: usize, out: usize, n: u32, dec: exl3.Decode, dst: []f32) !void {
         const sc = try alloc.alloc(f32, in);
@@ -563,48 +569,61 @@ test "exl3 linear: one-bank and grouped trellis linears hold the f32-truth bar o
     const in: usize = 384;
     const out: usize = 256;
     var failed: usize = 0;
-    for (cases) |cs| for ([_]usize{ 1, 2, 8 }) |groups| for ([_]usize{ 1, 3, 8, 70 }) |rows| for ([_]Arm{ .rows, .gemm, .gemv }) |arm| for ([_]mlx.mlx_dtype{ .float16, .bfloat16, .float32 }) |dt| {
-        if ((arm == .gemv and rows > 3) or (arm == .rows and rows > project_rows.PROJECT_ROWS_MAX)) continue;
-        if (groups == 8 and rows > 8) continue;
-        force_arm = arm;
-        defer force_arm = null;
+    for (cases) |cs| for ([_]usize{ 1, 2, 8 }) |groups| {
+        // One bank per codebook and group count, decoded once to its dense twin: every row count, dtype and arm is
+        // held to the same host truth, computed once per input.
         var h = try Host.init(alloc, rnd, groups, in, out, cs.n);
         defer h.deinit();
-        const xs = try alloc.alloc(f32, groups * rows * in);
-        for (xs) |*v| v.* = (rnd.float(f32) * 2 - 1) * 30;
-        const xb = try alloc.alloc(u16, xs.len);
-        if (dt != .float32) for (xb, xs) |*b, *v| {
-            b.* = if (dt == .float16) exl3.f32ToF16Bits(v.*) else bf16Bits(v.*);
-            v.* = if (dt == .float16) exl3.f16BitsToF32(b.*) else bf16ToF32(b.*);
+        const dense = try alloc.alloc(f32, groups * in * out);
+        for (0..groups) |g| try h.decodeGroup(alloc, g, in, out, cs.n, cs.dec, dense[g * in * out ..][0 .. in * out]);
+        for ([_]usize{ 1, 3, 8, 70 }) |rows| for ([_]mlx.mlx_dtype{ .float16, .bfloat16, .float32 }) |dt| {
+            if (groups == 8 and rows > 8) continue;
+            const xs = try alloc.alloc(f32, groups * rows * in);
+            for (xs) |*v| v.* = (rnd.float(f32) * 2 - 1) * 30;
+            const xb = try alloc.alloc(u16, xs.len);
+            if (dt != .float32) for (xb, xs) |*b, *v| {
+                b.* = if (dt == .float16) exl3.f32ToF16Bits(v.*) else bf16Bits(v.*);
+                v.* = if (dt == .float16) exl3.f16BitsToF32(b.*) else bf16ToF32(b.*);
+            };
+            const want = try alloc.alloc(f32, groups * rows * out);
+            @memset(want, 0);
+            for (0..groups) |g| for (0..rows) |r| {
+                const at = g * rows + r;
+                const w = dense[g * in * out ..][0 .. in * out];
+                const dst = want[at * out ..][0..out];
+                for (xs[at * in ..][0..in], 0..) |xv, i| for (dst, w[i * out ..][0..out]) |*o, wv| {
+                    o.* += xv * wv;
+                };
+            };
+            // The output is stored in x's dtype: its own rounding of the truth adds to the kernel's bar.
+            const stored = try alloc.alloc(f32, want.len);
+            for (stored, want) |*o, v| o.* = roundTo(dt, v);
+            const floor = relRms(stored, want);
+            const x = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(xs.ptr) else @ptrCast(xb.ptr), &[_]c_int{ @intCast(groups), @intCast(rows), @intCast(in) }, 3, dt);
+            defer _ = mlx.mlx_array_free(x);
+            for ([_]Arm{ .rows, .gemm, .gemv }) |arm| {
+                if ((arm == .gemv and rows > 3) or (arm == .rows and rows > project_rows.PROJECT_ROWS_MAX)) continue;
+                force_arm = arm;
+                defer force_arm = null;
+                const y = if (groups == 1) blk: {
+                    var x2 = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(x2);
+                    try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ @intCast(rows), @intCast(in) }, 2, s));
+                    break :blk try linear(s, x2, h.p, cs.dec);
+                } else try linearGrouped(s, x, h.p, cs.dec);
+                defer _ = mlx.mlx_array_free(y);
+                try t.expectEqual(groups * rows * out, mlx.mlx_array_size(y));
+                var cy = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(cy);
+                const got = try hostF32(s, y, &cy);
+                for (got) |v| try t.expect(std.math.isFinite(v));
+                const err = relRms(got, want);
+                if (err >= @sqrt(LINEAR_BAR * LINEAR_BAR + floor * floor)) {
+                    std.debug.print("linear {s} n{d} groups {d} rows {d} arm {s} {s}: relRms {d}\n", .{ @tagName(cs.dec.codebook), cs.n, groups, rows, @tagName(arm), @tagName(dt), err });
+                    failed += 1;
+                }
+            }
         };
-        const x = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(xs.ptr) else @ptrCast(xb.ptr), &[_]c_int{ @intCast(groups), @intCast(rows), @intCast(in) }, 3, dt);
-        defer _ = mlx.mlx_array_free(x);
-        const y = if (groups == 1) blk: {
-            var x2 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(x2);
-            try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ @intCast(rows), @intCast(in) }, 2, s));
-            break :blk try linear(s, x2, h.p, cs.dec);
-        } else try linearGrouped(s, x, h.p, cs.dec);
-        defer _ = mlx.mlx_array_free(y);
-        try t.expectEqual(groups * rows * out, mlx.mlx_array_size(y));
-        var cy = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cy);
-        const got = try hostF32(s, y, &cy);
-        const want = try alloc.alloc(f32, got.len);
-        for (0..groups) |g| for (0..rows) |r| {
-            const at = g * rows + r;
-            try h.project(alloc, g, xs[at * in ..][0..in], in, out, cs.n, cs.dec, want[at * out ..][0..out]);
-        };
-        for (got) |v| try t.expect(std.math.isFinite(v));
-        const err = relRms(got, want);
-        // The output is stored in x's dtype: its own rounding of the truth adds to the kernel's bar.
-        const stored = try alloc.alloc(f32, want.len);
-        for (stored, want) |*o, v| o.* = roundTo(dt, v);
-        const floor = relRms(stored, want);
-        if (err >= @sqrt(LINEAR_BAR * LINEAR_BAR + floor * floor)) {
-            std.debug.print("linear {s} n{d} groups {d} rows {d} arm {s} {s}: relRms {d}\n", .{ @tagName(cs.dec.codebook), cs.n, groups, rows, @tagName(arm), @tagName(dt), err });
-            failed += 1;
-        }
     };
     try t.expectEqual(@as(usize, 0), failed);
 }
@@ -627,6 +646,9 @@ test "exl3 linear: bf16 or f32 rows past the f16 range stay finite and hold the 
         const out = shape[1];
         var h = try Host.init(alloc, rnd, 1, in, out, 64);
         defer h.deinit();
+        // The 256x40960 bank's tiles are decoded once, not once per row.
+        const dense = try alloc.alloc(f32, in * out);
+        try h.decodeGroup(alloc, 0, in, out, 64, dec, dense);
         for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 5 }) |rows| {
             // Inputs near 3e5 against suh near 0.01 put outputs past 65504, the f16 ceiling, and keep the prepared
             // input (f16 in threadgroup memory) inside it.
@@ -646,7 +668,10 @@ test "exl3 linear: bf16 or f32 rows past the f16 range stay finite and hold the 
             defer _ = mlx.mlx_array_free(cy);
             const got = try hostF32(s, y, &cy);
             const want = try alloc.alloc(f32, got.len);
-            for (0..rows) |r| try h.project(alloc, 0, xs[r * in ..][0..in], in, out, 64, dec, want[r * out ..][0..out]);
+            @memset(want, 0);
+            for (0..rows) |r| for (xs[r * in ..][0..in], 0..) |xv, i| for (want[r * out ..][0..out], dense[i * out ..][0..out]) |*o, wv| {
+                o.* += xv * wv;
+            };
             var peak: f32 = 0;
             for (want) |v| peak = @max(peak, @abs(v));
             try t.expect(peak > 65504);

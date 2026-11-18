@@ -29,6 +29,7 @@ pub const tests = .{
     @import("repack_stamp_test.zig"),
     @import("arch.zig"),
     @import("dsv41_sched.zig"),
+    @import("dsv41_scope.zig"),
 };
 
 /// The MLX-free test files `src/tests_host.zig` runs for this arch.

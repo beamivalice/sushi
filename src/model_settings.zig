@@ -7,7 +7,6 @@ const std = @import("std");
 const kv_quant = @import("kv_quant.zig");
 const log = @import("log.zig");
 const default_port = @import("default_port.zig");
-const mtp_acceptance = @import("mtp_acceptance.zig");
 const effort = @import("effort.zig");
 const settings_resolve = @import("settings_resolve.zig");
 
@@ -24,10 +23,13 @@ pub const think_penalty_max: f32 = 20;
 
 /// What a load picks for a key with no flag and no file value; the load sites and the settings API read these.
 pub const default_mtp = true;
-pub const default_mtp_acceptance: mtp_acceptance.Mode = .exact;
-pub const default_mtp_greedy_tail = false;
 pub const default_preserve_thinking = true;
 pub const default_think_penalty: f32 = 0;
+
+/// `--expert-cache-bias <n>`; null = not given. It outranks a model's `expert_cache_bias`.
+pub var expert_cache_bias_flag: ?f32 = null;
+/// The most `--expert-cache-bias` / `expert_cache_bias` takes, in the router's own score units.
+pub const expert_cache_bias_max: f32 = 8;
 
 /// The manual context: `--ctx-size` > `ctx_size` > auto. 0 = auto, i.e. not given, on both sides.
 pub fn contextPick(flag: u32, setting: u32) settings_resolve.Setting(u32) {
@@ -159,27 +161,10 @@ pub fn contextLabel(buf: []u8, ctx: u32) []const u8 {
     return std.fmt.bufPrint(buf, "{d}", .{ctx}) catch "auto";
 }
 
-/// The flag an acceptance mode would have been launched with.
-pub fn acceptanceFlagName(mode: mtp_acceptance.Mode) []const u8 {
-    return switch (mode) {
-        .exact => "default",
-        .typical => "--mtp-typical",
-        .tokenv3 => "--mtp-tokenv3",
-    };
-}
-
-/// The acceptance flag as typed, value included; null when neither was given.
-pub fn acceptanceFlagText(buf: []u8, typical: ?[]const u8, tokenv3: ?[]const u8) ?[]const u8 {
-    const flag = if (typical != null) "--mtp-typical" else if (tokenv3 != null) "--mtp-tokenv3" else return null;
-    return std.fmt.bufPrint(buf, "{s} {s}", .{ flag, typical orelse tokenv3.? }) catch null;
-}
-
 pub const Override = struct {
     ctx_size: ?u32 = null,
     kv_quant: ?kv_quant.KVQuantConfig = null,
     mtp: ?bool = null,
-    mtp_acceptance: ?mtp_acceptance.Mode = null,
-    mtp_greedy_tail: ?bool = null,
     ssd_budget_gb: ?u32 = null,
     ssd_prefetch: ?u8 = null,
     preserve_thinking: ?bool = null,
@@ -190,15 +175,17 @@ pub const Override = struct {
     /// only by its own arch (`arch_flags.coolerSettingOf`).
     ds41_cooler: ?bool = null,
     qwen_cooler: ?bool = null,
-    /// The omitted-`max_tokens` budget. In a defaults row, 0 = the rest of the window.
+    /// The omitted-`max_tokens` budget.
     max_tokens: ?u32 = null,
     /// The YaRN factor the config is parsed with; null = the config.json's own RoPE.
     yarn_factor: ?u8 = null,
+    /// DeepSeek-V4.1's cache-favoring pick (`--expert-cache-bias`), lossy; 0 = exact routing.
+    expert_cache_bias: ?f32 = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
-            o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.ssd_prefetch == null and o.preserve_thinking == null and
-            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.ds41_cooler == null and o.qwen_cooler == null and o.max_tokens == null and o.yarn_factor == null;
+            o.ssd_budget_gb == null and o.ssd_prefetch == null and o.preserve_thinking == null and
+            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.ds41_cooler == null and o.qwen_cooler == null and o.max_tokens == null and o.yarn_factor == null and o.expert_cache_bias == null;
     }
 };
 
@@ -254,13 +241,6 @@ fn fromValue(v: std.json.Value) Override {
         .bool => |b| o.mtp = b,
         else => {},
     };
-    if (obj.get("mtp_acceptance")) |a| if (accepts("mtp_acceptance", a)) {
-        o.mtp_acceptance = mtp_acceptance.fromName(a.string);
-    };
-    if (obj.get("mtp_greedy_tail")) |g| switch (g) {
-        .bool => |b| o.mtp_greedy_tail = b,
-        else => {},
-    };
     if (obj.get("ssd_budget_gb")) |g| if (accepts("ssd_budget_gb", g)) {
         o.ssd_budget_gb = @intCast(g.integer);
     };
@@ -291,6 +271,13 @@ fn fromValue(v: std.json.Value) Override {
     };
     if (obj.get("think_penalty")) |t| if (accepts("think_penalty", t)) {
         o.think_penalty = @floatCast(switch (t) {
+            .float => |f| f,
+            .integer => |i| @as(f64, @floatFromInt(i)),
+            else => unreachable,
+        });
+    };
+    if (obj.get("expert_cache_bias")) |b| if (accepts("expert_cache_bias", b)) {
+        o.expert_cache_bias = @floatCast(switch (b) {
             .float => |f| f,
             .integer => |i| @as(f64, @floatFromInt(i)),
             else => unreachable,
@@ -343,6 +330,35 @@ pub fn warnRejected(section: []const u8, obj: std.json.ObjectMap, specs: []const
     return n;
 }
 
+/// Per-model keys a release removed. A file written before keeps loading; each one it still holds is named once.
+pub const removed_model_keys = [_]struct { name: []const u8, why: []const u8 }{
+    .{ .name = "mtp_acceptance", .why = "MTP accepts drafts by the exact rule only" },
+    .{ .name = "mtp_greedy_tail", .why = "MTP accepts drafts by the exact rule only" },
+};
+
+/// Why `key` is no longer a setting; null when it never was one or still is.
+pub fn removedWhy(key: []const u8) ?[]const u8 {
+    for (removed_model_keys) |r| if (std.mem.eql(u8, r.name, key)) return r.why;
+    return null;
+}
+
+/// The warning for a removed key a model section still holds; null for any other key.
+pub fn removedLine(buf: []u8, section: []const u8, key: []const u8) ?[]const u8 {
+    const why = removedWhy(key) orelse return null;
+    return std.fmt.bufPrint(buf, "[model-settings] {s}: {s} is removed and ignored: {s}; delete the key", .{ section, key, why }) catch null;
+}
+
+/// One warning per removed key of a model section; returns how many.
+pub fn warnRemoved(section: []const u8, obj: std.json.ObjectMap) usize {
+    var n: usize = 0;
+    var buf: [512]u8 = undefined;
+    for (removed_model_keys) |r| if (obj.get(r.name) != null) {
+        log.warn("{s}\n", .{removedLine(&buf, section, r.name).?});
+        n += 1;
+    };
+    return n;
+}
+
 pub fn parse(alloc: std.mem.Allocator, body: []const u8) !Settings {
     return .{ .parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{}) };
 }
@@ -379,14 +395,15 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
-    if (modelObject(&s, model_path)) |obj| _ = warnRejected(model_path, obj, &model_keys);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} ds41_cooler={s} qwen_cooler={s} max_tokens={d} yarn_factor={d}\n", .{
+    if (modelObject(&s, model_path)) |obj| {
+        _ = warnRejected(model_path, obj, &model_keys);
+        _ = warnRemoved(model_path, obj);
+    }
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} ds41_cooler={s} qwen_cooler={s} max_tokens={d} yarn_factor={d} expert_cache_bias={d}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
         if (o.mtp) |m| (if (m) "on" else "off") else "default",
-        if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
-        if (o.mtp_greedy_tail) |g| (if (g) "on" else "off") else "default",
         o.ssd_budget_gb orelse 0,
         o.ssd_prefetch,
         if (o.preserve_thinking) |p| (if (p) "on" else "off") else "default",
@@ -396,6 +413,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.qwen_cooler) |v| (if (v) "on" else "off") else "default",
         o.max_tokens orelse 0,
         o.yarn_factor orelse 0,
+        o.expert_cache_bias orelse 0,
     });
     return o;
 }
@@ -442,8 +460,6 @@ pub const model_keys = [_]KeySpec{
     .{ .name = "ctx_size", .kind = .int, .min = 1, .max = std.math.maxInt(u32) },
     .{ .name = "kv_quant", .kind = .choice, .choices = &.{ "off", "4", "6", "8" }, .normalize = kvQuantChoice },
     .{ .name = "mtp", .kind = .bool },
-    .{ .name = "mtp_acceptance", .kind = .choice, .choices = &.{ "exact", "typical", "tokenv3" } },
-    .{ .name = "mtp_greedy_tail", .kind = .bool },
     .{ .name = "ssd_budget_gb", .kind = .int, .min = 1, .max = 512 },
     .{ .name = "ssd_prefetch", .kind = .int, .min = 0, .max = 100 },
     .{ .name = "preserve_thinking", .kind = .bool },
@@ -453,6 +469,7 @@ pub const model_keys = [_]KeySpec{
     .{ .name = "qwen_cooler", .kind = .bool },
     .{ .name = "max_tokens", .kind = .int, .min = 1, .max = std.math.maxInt(u32) },
     .{ .name = "yarn_factor", .kind = .choice, .choices = &.{ "2", "4" }, .normalize = yarnChoice },
+    .{ .name = "expert_cache_bias", .kind = .number, .min = 0, .max = expert_cache_bias_max },
 };
 
 /// Server-wide keys, under the file's `"server"` object (a model's key is its absolute path, so the two never meet).
@@ -490,8 +507,7 @@ pub const Fit = struct {
     head_streams: bool = true,
     /// The pack's experts are STQ, the only stream with an expert prefetcher.
     stq_experts: bool = true,
-    /// The arch has an expert prefetcher (`arch/admission.zig` `ExpertStreamTraits.prefetch`). It keeps no KV cache
-    /// and runs no MTP tail either: its drafts accept by the exact rule only.
+    /// The arch has an expert prefetcher (`arch/admission.zig` `ExpertStreamTraits.prefetch`). It keeps no KV cache either.
     prefetch: bool = false,
     /// The `kv_quant` spellings the cache stores, when it stores fewer than all of them; empty = every width.
     kv_choices: []const []const u8 = &.{},
@@ -505,8 +521,6 @@ pub const Fit = struct {
     /// 0 = unknown, which judges nothing.
     window_native: u32 = 0,
     window_default: u32 = 0,
-    /// Drafts are accepted by the exact rule only, with no MTP tail, on this load (a Qwen load on Sushi Cooler).
-    exact_drafts_only: bool = false,
     /// The model setting that turns this arch's Sushi Cooler off; null for an arch without the engine.
     cooler_setting: ?[]const u8 = null,
 };
@@ -572,14 +586,15 @@ pub fn unavailable(key: []const u8, fit: Fit) ?[]const u8 {
         if (fit.streaming_required and !fit.head_streams) return "This pack streams its experts, and its MTP head cannot run while they stream.";
         return null;
     }
-    if (eql(u8, key, "mtp_acceptance") or eql(u8, key, "mtp_greedy_tail")) {
-        if (special) return "Drafts are accepted by the exact rule only, with no MTP tail.";
-        if (fit.exact_drafts_only) return "On Sushi Cooler, drafts are accepted by the exact rule only, with no MTP tail.";
-        return unavailable("mtp", fit);
-    }
     if (eql(u8, key, "preserve_thinking")) return if (fit.template_preserves_thinking) null else "This model's chat template has no preserve-thinking switch.";
     if (eql(u8, key, "yarn_factor")) return if (fit.reads_yarn) null else "This model's RoPE has no YaRN context extension.";
     if (eql(u8, key, "think_penalty")) return if (fit.template_thinks) null else "This model's chat template has no thinking span to penalise.";
+    if (eql(u8, key, "expert_cache_bias")) {
+        // The pick runs in DeepSeek's router, on the rate-grouped (STQ) layers whose cache map the GPU holds.
+        if (!fit.prefetch) return "Only DeepSeek-V4.1's router can favour the experts already in memory.";
+        if (!fit.streams_experts) return "This model does not stream its experts from SSD.";
+        if (!fit.stq_experts) return "This pack has no STQ experts, so its router has no cached experts to favour.";
+    }
     return null;
 }
 
@@ -604,14 +619,12 @@ pub const Limit = struct {
     disabled: bool = false,
     /// The largest value the model takes; 0 = no bound.
     max: u32 = 0,
-    /// Takes effect only while `mtp` is not false (unset counts as on).
-    requires_mtp: bool = false,
     /// Takes effect only while none of these keys is set.
     unset: []const []const u8 = &.{},
     why: []const u8 = "",
 
     pub fn isEmpty(self: Limit) bool {
-        return !self.disabled and self.max == 0 and !self.requires_mtp and self.unset.len == 0;
+        return !self.disabled and self.max == 0 and self.unset.len == 0;
     }
 };
 
@@ -622,14 +635,9 @@ pub fn limit(key: []const u8, fit: Fit) Limit {
     const eql = std.mem.eql;
     if (unavailable(key, fit)) |why| return .{ .disabled = true, .why = why };
     var l: Limit = .{};
-    const tail = eql(u8, key, "mtp_acceptance") or eql(u8, key, "mtp_greedy_tail");
-    if ((tail or eql(u8, key, "mtp")) and budgetDropsHead(fit)) {
+    if (eql(u8, key, "mtp") and budgetDropsHead(fit)) {
         l.unset = &unset_budget;
         l.why = "An SSD budget makes this model stream its experts, and its MTP head cannot run while they stream.";
-    }
-    if (tail) {
-        l.requires_mtp = true;
-        if (l.why.len == 0) l.why = "Used only while MTP is on.";
     }
     if (eql(u8, key, "ctx_size") or eql(u8, key, "max_tokens")) l.max = fit.context_cap;
     return l;
@@ -650,7 +658,6 @@ pub fn refuseEdits(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit,
         if (lim.disabled) return .{ .key = e.key, .why = lim.why };
         if (v == .string and !choiceAllowed(e.key, v.string, fit)) return .{ .key = e.key, .why = "This model's cache cannot store that width." };
         if (lim.max > 0 and v == .integer and v.integer > lim.max and !std.mem.eql(u8, e.key, "ctx_size")) return .{ .key = e.key, .why = maxWhy(buf, lim.max) };
-        if (lim.requires_mtp) if (stateOf(existing, edits, "mtp")) |m| if (m == .bool and !m.bool) return .{ .key = e.key, .why = "Used only while MTP is on." };
         for (lim.unset) |other| if (stateOf(existing, edits, other) != null) return .{ .key = e.key, .why = lim.why };
     }
     return ctxAboveWindow(fit, existing, edits, buf);
@@ -944,8 +951,6 @@ test "model_settings: the editor accepts exactly the values the loader applies" 
         .{ .key = "kv_quant", .body = "16" },
         .{ .key = "kv_quant", .body = "0" },
         .{ .key = "kv_quant", .body = "\"5\"" },
-        .{ .key = "mtp_acceptance", .body = "\"fast\"" },
-        .{ .key = "mtp_acceptance", .body = "\"typical\"" },
         .{ .key = "mtp", .body = "1" },
     };
     for (cases) |c| {
@@ -962,12 +967,12 @@ test "model_settings: the editor accepts exactly the values the loader applies" 
 test "model_settings: applies: a key shows only for a model the loader would honour it on" {
     const t = std.testing;
     const dsv: Fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true };
-    for ([_][]const u8{ "kv_quant", "mtp_acceptance", "mtp_greedy_tail" }) |k| try t.expect(!applies(k, dsv));
+    try t.expect(!applies("kv_quant", dsv));
     for ([_][]const u8{ "ssd_budget_gb", "ssd_prefetch", "vision", "mtp", "ctx_size", "preserve_thinking", "think_penalty" }) |k| try t.expect(applies(k, dsv));
 
     const resident: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false };
     for ([_][]const u8{ "ssd_budget_gb", "ssd_prefetch", "vision" }) |k| try t.expect(!applies(k, resident));
-    for ([_][]const u8{ "kv_quant", "mtp", "mtp_acceptance", "mtp_greedy_tail", "ctx_size" }) |k| try t.expect(applies(k, resident));
+    for ([_][]const u8{ "kv_quant", "mtp", "ctx_size" }) |k| try t.expect(applies(k, resident));
 
     const qwen_streamed: Fit = .{ .arch = "qwen4_exp", .streams_experts = true, .has_vision = true };
     try t.expect(applies("ssd_budget_gb", qwen_streamed));
@@ -995,16 +1000,6 @@ test "model_settings: a launch lock keeps a long path whole" {
     try std.testing.expectEqualStrings(&long, l.text());
 }
 
-test "model_settings: the acceptance lock text is the flag as typed, never a placeholder" {
-    var b: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("--mtp-typical 0.3", acceptanceFlagText(&b, "0.3", null).?);
-    try std.testing.expectEqualStrings("--mtp-tokenv3 0.5", acceptanceFlagText(&b, null, "0.5").?);
-    try std.testing.expect(acceptanceFlagText(&b, null, null) == null);
-    var l: Lock = .{};
-    l.pin("{s}", .{acceptanceFlagText(&b, null, "0.5").?});
-    try std.testing.expectEqualStrings("--mtp-tokenv3 0.5", l.text());
-}
-
 test "model_settings: sizeText reads back in the flag's own syntax, sub-GB sizes included" {
     var b: [32]u8 = undefined;
     try std.testing.expectEqualStrings("40GB", sizeText(&b, 40 << 30));
@@ -1030,28 +1025,6 @@ test "model_settings: parse + lookup with and without trailing slash" {
     try std.testing.expectEqual(@as(?bool, null), b.mtp);
     try std.testing.expectEqual(@as(u8, 6), s.lookup("/m/c").kv_quant.?.bits);
     try std.testing.expect(s.lookup("/m/d").isEmpty());
-}
-
-test "model_settings: mtp_acceptance names a mode at its default threshold" {
-    var s = try parse(std.testing.allocator,
-        \\{"/m/a": {"mtp_acceptance": "typical"}, "/m/b": {"mtp_acceptance": "tokenv3"}, "/m/c": {"mtp_acceptance": "exact"}, "/m/d": {"mtp_acceptance": "fast"}}
-    );
-    defer s.deinit();
-    try std.testing.expectEqual(@as(f32, 0.2), s.lookup("/m/a").mtp_acceptance.?.typical.delta);
-    try std.testing.expectEqual(@as(f32, 0.95), s.lookup("/m/b").mtp_acceptance.?.tokenv3);
-    try std.testing.expect(s.lookup("/m/c").mtp_acceptance.? == .exact);
-    try std.testing.expect(s.lookup("/m/d").isEmpty());
-}
-
-test "model_settings: the greedy tail (mtp_greedy_tail) is a bool, anything else is unset" {
-    var s = try parse(std.testing.allocator,
-        \\{"/m/a": {"mtp_greedy_tail": true}, "/m/b": {"mtp_greedy_tail": false}, "/m/c": {"mtp_greedy_tail": "on"}}
-    );
-    defer s.deinit();
-    try std.testing.expectEqual(@as(?bool, true), s.lookup("/m/a").mtp_greedy_tail);
-    try std.testing.expectEqual(@as(?bool, false), s.lookup("/m/b").mtp_greedy_tail);
-    try std.testing.expect(!s.lookup("/m/b").isEmpty());
-    try std.testing.expect(s.lookup("/m/c").isEmpty());
 }
 
 test "model_settings: bad values ignored, bad JSON = empty" {
@@ -1120,21 +1093,6 @@ test "an explicit --ctx-size outranks the per-model ctx_size; 0 is auto on both 
     try t.expectEqual(Source.default, auto.source);
 }
 
-test "an explicit --mtp-typical / --mtp-tokenv3 outranks the per-model mtp_acceptance" {
-    const t = std.testing;
-    const Mode = mtp_acceptance.Mode;
-    const typical: Mode = .{ .typical = .{ .delta = 0.3 } };
-    const flag = settings_resolve.resolve(Mode, typical, .{ .tokenv3 = 0.95 }, .exact);
-    try t.expectEqual(@as(f32, 0.3), flag.value.typical.delta);
-    try t.expectEqualStrings("--mtp-typical", settings_resolve.sourceLabel(flag.source, acceptanceFlagName(flag.value)));
-    const file = settings_resolve.resolve(Mode, null, .{ .tokenv3 = 0.95 }, .exact);
-    try t.expectEqual(@as(f32, 0.95), file.value.tokenv3);
-    try t.expectEqual(Source.model_settings, file.source);
-    const engine = settings_resolve.resolve(Mode, null, null, .exact);
-    try t.expect(engine.value == .exact);
-    try t.expectEqual(Source.default, engine.source);
-}
-
 test "model_settings: think_penalty is a non-negative number, anything else is unset" {
     var s = try parse(std.testing.allocator,
         \\{"/m/a": {"think_penalty": 1.5}, "/m/b": {"think_penalty": 2}, "/m/c": {"think_penalty": -1}, "/m/d": {"think_penalty": "1"}, "/m/e": {"think_penalty": 0}}
@@ -1146,6 +1104,32 @@ test "model_settings: think_penalty is a non-negative number, anything else is u
     try std.testing.expect(s.lookup("/m/d").isEmpty());
     try std.testing.expectEqual(@as(?f32, 0), s.lookup("/m/e").think_penalty);
     try std.testing.expect(!s.lookup("/m/e").isEmpty());
+}
+
+test "model_settings: expert_cache_bias is a number from 0 to 8, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"expert_cache_bias": 0.2}, "/m/b": {"expert_cache_bias": 8}, "/m/c": {"expert_cache_bias": 8.5}, "/m/d": {"expert_cache_bias": -0.1}, "/m/e": {"expert_cache_bias": "0.2"}, "/m/f": {"expert_cache_bias": 0}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqual(@as(?f32, 0.2), s.lookup("/m/a").expert_cache_bias);
+    try std.testing.expectEqual(@as(?f32, 8), s.lookup("/m/b").expert_cache_bias);
+    for ([_][]const u8{ "/m/c", "/m/d", "/m/e" }) |m| try std.testing.expect(s.lookup(m).isEmpty());
+    try std.testing.expectEqual(@as(?f32, 0), s.lookup("/m/f").expert_cache_bias);
+    try std.testing.expect(!s.lookup("/m/f").isEmpty());
+}
+
+test "model_settings: expert_cache_bias shows only for a DeepSeek pack whose STQ experts stream" {
+    const t = std.testing;
+    const dsv: Fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true };
+    try t.expect(applies("expert_cache_bias", dsv));
+    var not_stq = dsv;
+    not_stq.stq_experts = false;
+    try t.expectEqualStrings("This pack has no STQ experts, so its router has no cached experts to favour.", unavailable("expert_cache_bias", not_stq).?);
+    var resident = dsv;
+    resident.streams_experts = false;
+    try t.expectEqualStrings("This model does not stream its experts from SSD.", unavailable("expert_cache_bias", resident).?);
+    const qwen: Fit = .{ .arch = "qwen4_exp", .streams_experts = true, .has_vision = true };
+    try t.expectEqualStrings("Only DeepSeek-V4.1's router can favour the experts already in memory.", unavailable("expert_cache_bias", qwen).?);
 }
 
 test "model_settings: preserve_thinking is a bool, anything else is unset" {
@@ -1207,7 +1191,6 @@ test "model_settings: validate takes the values the loader reads and names the r
         .{ .k = "kv_quant", .v = .{ .string = "8" } },
         .{ .k = "kv_quant", .v = .{ .integer = 0 } },
         .{ .k = "mtp", .v = .{ .bool = false } },
-        .{ .k = "mtp_acceptance", .v = .{ .string = "typical" } },
         .{ .k = "ssd_prefetch", .v = .{ .integer = 0 } },
         .{ .k = "think_penalty", .v = .{ .integer = 2 } },
         .{ .k = "think_penalty", .v = .{ .float = 0.5 } },
@@ -1217,7 +1200,6 @@ test "model_settings: validate takes the values the loader reads and names the r
         .{ .k = "ctx_size", .v = .{ .integer = 0 } },
         .{ .k = "kv_quant", .v = .{ .string = "5" } },
         .{ .k = "mtp", .v = .{ .string = "on" } },
-        .{ .k = "mtp_acceptance", .v = .{ .string = "fast" } },
         .{ .k = "ssd_budget_gb", .v = .{ .integer = 513 } },
         .{ .k = "ssd_prefetch", .v = .{ .integer = 101 } },
         .{ .k = "think_penalty", .v = .{ .float = 20.5 } },
@@ -1329,15 +1311,13 @@ test "model_settings: limits: each arch and pack variant is offered only what th
     try t.expect(choiceAllowed("kv_quant", "8", latent));
     try t.expect(!choiceAllowed("kv_quant", "4", latent));
     try t.expect(choiceAllowed("kv_quant", "4", .{ .arch = "a", .streams_experts = false, .has_vision = false }));
-    for ([_][]const u8{ "mtp", "mtp_acceptance", "mtp_greedy_tail" }) |k| {
-        try t.expect(!applies(k, latent));
-        try t.expect(limit(k, latent).disabled);
-        try t.expect(limit(k, latent).why.len > 0);
-    }
+    try t.expect(!applies("mtp", latent));
+    try t.expect(limit("mtp", latent).disabled);
+    try t.expect(limit("mtp", latent).why.len > 0);
     try t.expectEqual(@as(u32, 4096), limit("ctx_size", latent).max);
 
     const headless: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .mtp_head = false };
-    for ([_][]const u8{ "mtp", "mtp_acceptance", "mtp_greedy_tail" }) |k| try t.expect(!applies(k, headless));
+    try t.expect(!applies("mtp", headless));
 
     const dsv: Fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true, .streaming_required = true, .stq_experts = false };
     try t.expect(!applies("ssd_prefetch", dsv));
@@ -1346,14 +1326,11 @@ test "model_settings: limits: each arch and pack variant is offered only what th
 
     const dropped: Fit = .{ .arch = "a", .streams_experts = true, .has_vision = false, .head_streams = false };
     try t.expectEqualStrings("ssd_budget_gb", limit("mtp", dropped).unset[0]);
-    try t.expectEqual(@as(usize, 1), limit("mtp_acceptance", dropped).unset.len);
-    try t.expect(limit("mtp_acceptance", dropped).requires_mtp);
-    try t.expect(!limit("mtp", dropped).requires_mtp);
     try t.expect(limit("mtp", .{ .arch = "a", .streams_experts = true, .has_vision = false }).isEmpty());
 
     var forced = dropped;
     forced.streaming_required = true;
-    for ([_][]const u8{ "mtp", "mtp_acceptance", "mtp_greedy_tail" }) |k| try t.expect(!applies(k, forced));
+    try t.expect(!applies("mtp", forced));
 
     const plain: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .template_preserves_thinking = false, .template_thinks = false };
     try t.expect(!applies("preserve_thinking", plain));
@@ -1367,7 +1344,7 @@ test "model_settings: refuseEdits: a value or pair the model cannot honour is re
     try t.expectEqualStrings("kv_quant", refuseEdits(latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "4" } }}, &buf).?.key);
     try t.expect(refuseEdits(latent, null, &.{.{ .key = "kv_quant", .value = .{ .string = "6" } }}, &buf) == null);
     try t.expectEqualStrings("mtp", refuseEdits(latent, null, &.{.{ .key = "mtp", .value = .{ .bool = true } }}, &buf).?.key);
-    try t.expect(refuseEdits(latent, null, &.{ .{ .key = "mtp", .value = null }, .{ .key = "mtp_acceptance", .value = null } }, &buf) == null);
+    try t.expect(refuseEdits(latent, null, &.{.{ .key = "mtp", .value = null }}, &buf) == null);
     const over = refuseEdits(latent, null, &.{.{ .key = "ctx_size", .value = .{ .integer = 4097 } }}, &buf).?;
     try t.expect(std.mem.indexOf(u8, over.why, "4096") != null);
     try t.expect(refuseEdits(latent, null, &.{.{ .key = "ctx_size", .value = .{ .integer = 4096 } }}, &buf) == null);
@@ -1376,15 +1353,9 @@ test "model_settings: refuseEdits: a value or pair the model cannot honour is re
     var file = try parse(t.allocator, "{\"/m\":{\"mtp\":false,\"ssd_budget_gb\":40}}");
     defer file.deinit();
     const held = modelObject(&file, "/m");
-    const accept = Edit{ .key = "mtp_acceptance", .value = .{ .string = "typical" } };
-    try t.expectEqualStrings("mtp_acceptance", refuseEdits(dropped, held, &.{accept}, &buf).?.key);
-    try t.expectEqualStrings("mtp_acceptance", refuseEdits(dropped, null, &.{ accept, .{ .key = "mtp", .value = .{ .bool = false } } }, &buf).?.key);
     try t.expect(refuseEdits(dropped, held, &.{.{ .key = "ssd_budget_gb", .value = .{ .integer = 50 } }}, &buf) == null);
     try t.expectEqualStrings("mtp", refuseEdits(dropped, held, &.{.{ .key = "mtp", .value = .{ .bool = true } }}, &buf).?.key);
     try t.expect(refuseEdits(dropped, held, &.{ .{ .key = "mtp", .value = .{ .bool = true } }, .{ .key = "ssd_budget_gb", .value = null } }, &buf) == null);
-    const resident: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false };
-    try t.expect(refuseEdits(resident, held, &.{accept}, &buf) != null);
-    try t.expect(refuseEdits(resident, null, &.{accept}, &buf) == null);
 }
 
 test "model_settings: max_tokens is a positive integer the model's window bounds" {
@@ -1526,6 +1497,21 @@ test "warnRejected counts exactly the keys the loader ignores, in a model sectio
     try t.expectEqual(@as(usize, 1), warnRejected(server_section, s.parsed.?.value.object.get(server_section).?.object, &server_keys));
     try t.expect(s.lookup("/m/a").mtp == null);
     try t.expectEqual(@as(?bool, false), s.lookup("/m/a").vision);
+}
+
+test "a removed key in a model section gets one warning naming it, and the rest of the section still loads" {
+    const t = std.testing;
+    var buf: [512]u8 = undefined;
+    try t.expectEqualStrings(
+        "[model-settings] /m/a: mtp_greedy_tail is removed and ignored: MTP accepts drafts by the exact rule only; delete the key",
+        removedLine(&buf, "/m/a", "mtp_greedy_tail").?,
+    );
+    try t.expect(std.mem.indexOf(u8, removedLine(&buf, "/m/a", "mtp_acceptance").?, "mtp_acceptance is removed and ignored") != null);
+    try t.expect(removedLine(&buf, "/m/a", "ctx_size") == null);
+    var s = try parse(t.allocator, "{\"/m/a\":{\"mtp_acceptance\":\"exact\",\"mtp_greedy_tail\":true,\"ctx_size\":4096}}");
+    defer s.deinit();
+    try t.expectEqual(@as(usize, 2), warnRemoved("/m/a", modelObject(&s, "/m/a").?));
+    try t.expectEqual(@as(?u32, 4096), s.lookup("/m/a").ctx_size);
 }
 
 test "model_settings: ds41_cooler is a bool, anything else is unset, and the page offers it only where the arch has the engine" {

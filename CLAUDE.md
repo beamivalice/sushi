@@ -170,7 +170,10 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
 - An explicit launch flag outranks `model-settings.json`, which outranks the default
   ([server-lifecycle](docs/server-lifecycle.md#settings)).
 - A bill follows the storage in the SAME commit; under-billing is a Metal OOM
-  ([engine-memory-admission](docs/engine-memory-admission.md)).
+  ([engine-memory-admission](docs/engine-memory-admission.md)). On Sushi Cooler, which owns its memory, a bill is the
+  exact bytes held plus one small, named safety margin: never a hidden multiplier or calibrated uplift.
+- Every request runs with a concrete max context and max_tokens (omitted: `--max-tokens`, else the model's default,
+  else 32,768); the engine never guesses and the bill uses them ([server-http-apis](docs/server-http-apis.md)).
 - A stream and a non-stream answer are the SAME BYTES; emitted tool `arguments` are ALWAYS valid JSON
   ([server-http-apis](docs/server-http-apis.md), [server-tool-calling](docs/server-tool-calling.md)).
 - A pack is judged by KLD against a lossless teacher, never by bytes against another pack

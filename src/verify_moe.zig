@@ -38,6 +38,16 @@ const evalToF32 = test_support.evalToF32;
 
 pub const PREFILL_DQ_GEMM_MIN_M: usize = 2048;
 
+/// Whether a 16-bit affine projection of `rows` rows at `bits` takes the dequant+GEMM route, whose dequantized weight
+/// it holds beside its output.
+pub fn prefillDqGemmTakes(rows: usize, bits: u32) bool {
+    if (!prefillDqGemmEnabled() or rows < PREFILL_DQ_GEMM_MIN_M) return false;
+    return switch (bits) {
+        2, 3, 4, 5, 6, 8 => true,
+        else => false,
+    };
+}
+
 /// Test seam: forces the route on/off without the environment.
 pub var prefill_dq_gemm_override: ?bool = null;
 
@@ -605,15 +615,10 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
 /// The dequant+GEMM prefill route (see the block comment above
 /// prefillDqGemmEnabled). Returns null when the call must stay on stock qmm.
 fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!prefillDqGemmEnabled()) return null;
-    switch (bits) {
-        2, 3, 4, 5, 6, 8 => {},
-        else => return null,
-    }
     const last = lastDim(x) orelse return null;
     if (last == 0) return null;
     const rows = mlx.mlx_array_size(x) / @as(usize, @intCast(last));
-    if (rows < PREFILL_DQ_GEMM_MIN_M) return null;
+    if (!prefillDqGemmTakes(rows, bits)) return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
 
@@ -650,6 +655,25 @@ fn expertReduceReference(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.ml
     return expected;
 }
 
+/// `qmatmulBits` over `x` one row at a time, joined along the sequence: the serial answer a batched call matches bit
+/// for bit, read back in one sync rather than one per row.
+fn serialRows(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, gs: u32, rows: usize) !mlx.mlx_array {
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (0..rows) |row| {
+        const begin: c_int = @intCast(row);
+        const xr = try sliceAttentionSeq(s, x, begin, begin + 1);
+        defer _ = mlx.mlx_array_free(xr);
+        const single = try qmatmulBits(xr, w, sc, bi, bits, gs, .affine, s);
+        defer _ = mlx.mlx_array_free(single);
+        try mlx.check(mlx.mlx_vector_array_append_value(vec, single));
+    }
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
+    return out;
+}
+
 fn testAffine8ProjectionRows(gs: u32) !void {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
@@ -670,19 +694,13 @@ fn testAffine8ProjectionRows(gs: u32) !void {
                 defer _ = mlx.mlx_array_free(x);
                 const together = try qmatmulBits(x, weights.q, weights.scales, weights.biases, 8, gs, .affine, s);
                 defer _ = mlx.mlx_array_free(together);
-                for (0..rows) |row| {
-                    const begin: c_int = @intCast(row);
-                    const xr = try sliceAttentionSeq(s, x, begin, begin + 1);
-                    defer _ = mlx.mlx_array_free(xr);
-                    const single = try qmatmulBits(xr, weights.q, weights.scales, weights.biases, 8, gs, .affine, s);
-                    defer _ = mlx.mlx_array_free(single);
-                    const candidate = try sliceAttentionSeq(s, together, begin, begin + 1);
-                    defer _ = mlx.mlx_array_free(candidate);
-                    qkvExpectBitsEqual(s, single, candidate) catch |err| {
-                        std.debug.print("affine8 gs={d} N={d} K={d} rows={d} row={d} dtype={s}\n", .{ gs, n, k, rows, row, @tagName(dtype) });
-                        return err;
-                    };
-                }
+                const serial = try serialRows(s, x, weights.q, weights.scales, weights.biases, 8, gs, rows);
+                defer _ = mlx.mlx_array_free(serial);
+                // The differing index over N names the row.
+                qkvExpectBitsEqual(s, serial, together) catch |err| {
+                    std.debug.print("affine8 gs={d} N={d} K={d} rows={d} dtype={s}\n", .{ gs, n, k, rows, @tagName(dtype) });
+                    return err;
+                };
             }
         }
     }
@@ -1402,19 +1420,13 @@ test "dense projections are row-identical to serial matmul" {
                 defer _ = mlx.mlx_array_free(x);
                 const together = try qmatmulBits(x, w, .{}, .{}, 0, 64, .affine, s);
                 defer _ = mlx.mlx_array_free(together);
-                for (0..rows) |row| {
-                    const begin: c_int = @intCast(row);
-                    const xr = try sliceAttentionSeq(s, x, begin, begin + 1);
-                    defer _ = mlx.mlx_array_free(xr);
-                    const single = try qmatmulBits(xr, w, .{}, .{}, 0, 64, .affine, s);
-                    defer _ = mlx.mlx_array_free(single);
-                    const candidate = try sliceAttentionSeq(s, together, begin, begin + 1);
-                    defer _ = mlx.mlx_array_free(candidate);
-                    qkvExpectBitsEqual(s, single, candidate) catch |err| {
-                        std.debug.print("dense N={d} K={d} rows={d} row={d} dtype={s}\n", .{ shape[0], k, rows, row, @tagName(dtype) });
-                        return err;
-                    };
-                }
+                const serial = try serialRows(s, x, w, .{}, .{}, 0, 64, rows);
+                defer _ = mlx.mlx_array_free(serial);
+                // The differing index over N names the row.
+                qkvExpectBitsEqual(s, serial, together) catch |err| {
+                    std.debug.print("dense N={d} K={d} rows={d} dtype={s}\n", .{ shape[0], k, rows, @tagName(dtype) });
+                    return err;
+                };
             }
         }
     }

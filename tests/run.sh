@@ -108,8 +108,11 @@ parse_header() {
         return
     fi
     if [ -n "$H_PACK" ] && [ "$H_BOOT" != own ] && [ "$H_TIER" != pack ]; then
-        H_ERR="pack= is for boot=own and tier=pack only"
-        return
+        # An attach script whose property is not the model's names the one pass it runs in.
+        case "$H_BOOT:$H_PACK" in
+            api:qwen4 | exact:qwen4 | ram:qwen4 | api:glm5 | exact:glm5 | ram:glm5 | api:dsv41 | exact:dsv41 | ram:dsv41 | api:mimo2 | exact:mimo2 | ram:mimo2) ;;
+            *) H_ERR="pack= is for boot=own and tier=pack, or one model's pass (qwen4|glm5|dsv41|mimo2) on an attach boot"; return ;;
+        esac
     fi
     if [ -n "$H_BOOTS" ]; then
         case "$H_BOOTS" in
@@ -197,7 +200,7 @@ entries_of() {
         root = (folder == "-"); sel = 0
         if (pass != "shared") {
             if (folder == pass) sel = 1
-            else if (root && tier == "live" && (boot == "api" || boot == "exact" || boot == "ram")) sel = 1
+            else if (root && tier == "live" && (boot == "api" || boot == "exact" || boot == "ram") && (pack == "-" || pack == "" || pack == pass)) sel = 1
             else if (root && tier == "live" && boot == "own" && pack == "each") sel = 1
         } else {
             if (root && (tier == "hermetic" || tier == "host" || tier == "pack")) sel = 1

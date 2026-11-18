@@ -87,8 +87,8 @@ else
     check "boot with --max-tokens" 0
 fi
 if boot; then
-    grep -q "default max_tokens for omitted requests" "$LOG"
-    check "no flag announces no default (offline's 100 never leaks into serve)" "$([ $? -ne 0 ] && echo 1 || echo 0)"
+    grep -q "default max_tokens for omitted requests: 32768 (engine default)" "$LOG"
+    check "no flag announces the engine default (offline's 100 never leaks into serve)" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 else
     check "bare boot for the --max-tokens default" 0
 fi

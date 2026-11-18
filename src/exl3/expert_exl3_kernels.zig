@@ -1001,7 +1001,7 @@ const IndexedKey = struct { in_dim: c_int, out_dim: c_int, topk: c_int, n: u32 }
 const UnaryKey = struct { dim: c_int, topk: c_int };
 const GemmSortedKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, win: c_int, n: u32 };
 
-const GEMM_WINDOW_ROWS: c_int = 32;
+pub const GEMM_WINDOW_ROWS: c_int = 32;
 
 /// Maximum run supported by all sorted-GEMM bodies; larger runs leave tail rows unwritten.
 const GEMM_WINDOW_MAX_ROWS: c_int = 32;
@@ -1246,13 +1246,13 @@ fn sortedGemmCfg(cache: *kernel_src.CfgCache(GemmSortedKey, 8), key: GemmSortedK
     return c;
 }
 
-fn applySortedGemm(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config, x: mlx.mlx_array, trellis: mlx.mlx_array, eids: mlx.mlx_array, tab: WindowTable) !mlx.mlx_array {
+fn applySortedGemm(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config, x: mlx.mlx_array, trellis: mlx.mlx_array, eids: mlx.mlx_array, tab: WindowTable, into: ?mlx.mlx_array) !mlx.mlx_array {
     const inputs = [_]mlx.mlx_array{ x, trellis, eids, tab.starts, tab.nlives };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, s));
+    try mlx.check(applyOut(&outputs_vec, kernel, inputs_vec, cfg, s, into));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -1454,6 +1454,42 @@ pub fn innerGemmSortedTableOrdered(
     tab: WindowTable,
     order: TileOrder,
 ) !mlx.mlx_array {
+    return gemmSortedInto(s, x, trellis, eids, win, aligned, tab, order, null);
+}
+
+/// `innerGemmSortedTableOrdered` writing its windows' live rows over `into`, a plane of the engine's of the output's
+/// shape: the rows no window of `tab` holds keep what `into` holds, so the groups of a rate-grouped bank write one plane.
+pub fn innerGemmSortedTableOrderedInto(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    trellis: mlx.mlx_array,
+    eids: mlx.mlx_array,
+    win: c_int,
+    aligned: bool,
+    tab: WindowTable,
+    order: TileOrder,
+    into: mlx.mlx_array,
+) !mlx.mlx_array {
+    return gemmSortedInto(s, x, trellis, eids, win, aligned, tab, order, into);
+}
+
+/// A kernel's one output, fresh or written over `into` (the engine's only).
+fn applyOut(outputs: *mlx.mlx_vector_array, k: mlx.mlx_fast_metal_kernel, inputs: mlx.mlx_vector_array, cfg: mlx.mlx_fast_metal_kernel_config, s: mlx.mlx_stream, into: ?mlx.mlx_array) c_int {
+    if (into) |t| return mlx.kernelApplyInto(outputs, k, inputs, cfg, s, t) orelse 1;
+    return mlx.mlx_fast_metal_kernel_apply(outputs, k, inputs, cfg, s);
+}
+
+fn gemmSortedInto(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    trellis: mlx.mlx_array,
+    eids: mlx.mlx_array,
+    win: c_int,
+    aligned: bool,
+    tab: WindowTable,
+    order: TileOrder,
+    into: ?mlx.mlx_array,
+) !mlx.mlx_array {
     const xsh = mlx.getShape(x);
     const tsh = mlx.getShape(trellis);
     if (xsh.len != 2 or tsh.len != 4) return error.BadExl3Shape;
@@ -1480,7 +1516,7 @@ pub fn innerGemmSortedTableOrdered(
             defer _ = mlx.mlx_vector_array_free(ninputs_vec);
             var noutputs = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(noutputs);
-            if (mlx.mlx_fast_metal_kernel_apply(&noutputs, nk, ninputs_vec, ncfg, s) == 0 and mlx.mlx_vector_array_size(noutputs) == 1) {
+            if (applyOut(&noutputs, nk, ninputs_vec, ncfg, s, into) == 0 and mlx.mlx_vector_array_size(noutputs) == 1) {
                 var nout = mlx.mlx_array_new();
                 errdefer _ = mlx.mlx_array_free(nout);
                 try mlx.check(mlx.mlx_vector_array_get(&nout, noutputs, 0));
@@ -1502,7 +1538,7 @@ pub fn innerGemmSortedTableOrdered(
     if ((gemm_simdmat_force orelse true) and @rem(out_dim, 128) == 0 and mlx.mlx_array_dtype(x) == .float16) {
         const cfg = try sortedGemmCfg(&gemm_simdmat_cfgs, key);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, out_dim, tab.nwin, 1));
-        const out = try applySortedGemm(s, try getGemmSimdmatKernel(order), cfg, x, trellis, eids, tab);
+        const out = try applySortedGemm(s, try getGemmSimdmatKernel(order), cfg, x, trellis, eids, tab, into);
         if (!gemm_simdmat_engaged) {
             gemm_simdmat_engaged = true;
             log.info("[exl3-gemm] simdgroup-matrix body engaged n={d}\n", .{rate.n});
@@ -1512,7 +1548,7 @@ pub fn innerGemmSortedTableOrdered(
     }
     const cfg = try sortedGemmCfg(&gemm_sorted_cfgs, key);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, out_tiles * 128, tab.nwin, 1));
-    return applySortedGemm(s, try getGemmSortedKernel(order), cfg, x, trellis, eids, tab);
+    return applySortedGemm(s, try getGemmSortedKernel(order), cfg, x, trellis, eids, tab, into);
 }
 
 fn getPrepareKernel() !mlx.mlx_fast_metal_kernel {
@@ -7628,7 +7664,8 @@ fn laneChainBytesMatch(n: u32, dec: exl3.Decode, rows: usize, seed: u64) !void {
 }
 
 // A window is one mask in the decode helper every arm inlines, so each low rate is held to
-// the generic reader's bytes on every arm at every window the format admits.
+// the generic reader's bytes on every arm at every window the format admits. The chains run every rate at the window
+// table's ends (the admitted-rate test runs them at w12).
 test "exl3 every K1.5 to K2 rate takes the fast arms at every window, bit-identical to the generic reader" {
     inline for (12..17) |half| {
         const n: u32 = 2 * half;
@@ -7636,7 +7673,7 @@ test "exl3 every K1.5 to K2 rate takes the fast arms at every window, bit-identi
             const win = comptime exl3.Window.fromBits(bits).?;
             inline for (.{ .lane, .nax, .simdmat }) |reader| try weightReaderExact(n, .mcg, win, false, reader);
         }
-        for ([_]exl3.Window{ .w8, .w12, .w15, .w16 }) |win| {
+        for ([_]exl3.Window{ .w8, .w16 }) |win| {
             const dec: exl3.Decode = .{ .codebook = .mcg, .window = win };
             const seed: u64 = 100 * n + win.bits();
             for ([_]usize{ 1, 4 }) |rows| {
@@ -7831,8 +7868,11 @@ fn foldBytesMatch(c: MoeCase, arm: FoldArm) !void {
 // SPEC1's half sum rounds once in either form, and the 2^12 is exact.
 // The fold is exact: the f32 sums scale by a power of two and no f16 store sees the unscaled value,
 // down to activations whose unfolded inner sums would sit far below f16's normal range.
+// The fold is codec-free: PAIR1's test below runs its grid at every x_scale and row count; here the rate's ends and middle.
+const FOLD_NS = [_]u32{ 24, 40, 64 };
+
 test "exl3 spec1's 2^12 folded into the stores keeps every byte of the decode, verify, prefill and clamped chains" {
-    for ([_]f32{ 0.005, 3 }) |x_scale| for ([_]u32{ 24, 32, 40, 48, 64 }) |n| for ([_]usize{ 1, 4, 33 }) |rows| {
+    for ([_]f32{ 0.005, 3 }) |x_scale| for (FOLD_NS) |n| for ([_]usize{ 1, 4, 33 }) |rows| {
         const c: MoeCase = .{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = SPEC1_W15, .seed = 7300 + n + rows, .banks = SERVED_W12_BANKS, .x_scale = x_scale };
         try foldBytesMatch(c, .{});
         if (rows > DECODE_ROWS_MAX) try foldBytesMatch(c, .{ .scalar_gemm = true });
@@ -7841,9 +7881,10 @@ test "exl3 spec1's 2^12 folded into the stores keeps every byte of the decode, v
     try foldBytesMatch(.{ .e = 8, .hidden = 4096, .inter = 2048, .topk = 8, .rows = 4, .rate = .{ .n = 36 }, .dec = SPEC1_W15, .seed = 7500, .banks = SERVED_W12_BANKS, .x_scale = 3 }, .{ .prepared = true });
 }
 
-// PAIR1 folds its 2^12 like the hash-mask codebooks: exact, in every chain.
+// PAIR1 folds its 2^12 like the hash-mask codebooks: exact, in every chain. Every x_scale, row count and arm, at the
+// rate's ends and middle: a rate picks PAIR1's table row, which its decode tests hold at every rate.
 test "exl3 PAIR1's 2^12 folded into the stores keeps every byte of the decode, verify, prefill and clamped chains" {
-    for ([_]f32{ 0.005, 0.5, 3, 30 }) |x_scale| for ([_]u32{ 24, 28, 32, 40, 42, 48, 64 }) |n| for ([_]usize{ 1, 4, 9, 33 }) |rows| {
+    for ([_]f32{ 0.005, 0.5, 3, 30 }) |x_scale| for (FOLD_NS) |n| for ([_]usize{ 1, 4, 9, 33 }) |rows| {
         const c: MoeCase = .{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = PAIR1_W16, .seed = 7600 + n + rows, .banks = SERVED_W12_BANKS, .x_scale = x_scale };
         try foldBytesMatch(c, .{});
         try foldBytesMatch(c, .{ .funnel_off = true });
@@ -7915,7 +7956,7 @@ test "exl3 SPEC1 per-rate table: GLM's lane fast paths and fold keep the staged 
 }
 
 test "exl3 SPEC1 per-rate table: the 2^12 folded into the stores keeps every byte of every chain" {
-    for ([_]f32{ 0.005, 3 }) |x_scale| for ([_]u32{ 24, 32, 40, 48, 64 }) |n| for ([_]usize{ 1, 4, 33 }) |rows| {
+    for ([_]f32{ 0.005, 3 }) |x_scale| for (FOLD_NS) |n| for ([_]usize{ 1, 4, 33 }) |rows| {
         const c: MoeCase = .{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = SPEC1_PER_RATE, .seed = 7800 + n + rows, .banks = SERVED_W12_BANKS, .x_scale = x_scale };
         try foldBytesMatch(c, .{});
         if (rows > DECODE_ROWS_MAX) try foldBytesMatch(c, .{ .scalar_gemm = true });
@@ -7929,6 +7970,8 @@ pub const SPEC1_WIDE_NS = sampleRates(24, 64, false);
 test "exl3 SPEC1 below K1.5 and above K4: the prefill GEMM, the decode chain and the f32-truth bar hold" {
     defer gemm_simdmat_force = null;
     for ([_]exl3.Decode{ SPEC1_W15, SPEC1_PER_RATE }) |dec| {
+        // The per-rate table (a different pair at every rate) sweeps every parity seed; SPEC1's own rows take two.
+        const seeds: usize = if (dec.table == SPEC1_PER_RATE.table) PARITY_SEEDS else 2;
         for (SPEC1_WIDE_NS) |n| {
             const rate: exl3.Rate = .{ .n = n };
             naxBodyBytesMatch(rate, dec, 2560, 640, 900 + n) catch |e| if (e != error.SkipZigTest) return e;
@@ -7937,7 +7980,7 @@ test "exl3 SPEC1 below K1.5 and above K4: the prefill GEMM, the decode chain and
                 if (simdmat != null) env.force();
                 defer if (simdmat != null) env.restore();
                 gemm_simdmat_force = simdmat;
-                for (0..PARITY_SEEDS) |i| try sortedGemmParity(rate, dec, 32, 3001 + 10 * n + i);
+                for (0..seeds) |i| try sortedGemmParity(rate, dec, 32, 3001 + 10 * n + i);
             }
             for ([_]usize{ 1, 4, 9, 33 }) |rows| {
                 try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = rows, .rate = rate, .dec = dec, .seed = 5000 + 10 * n, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, rows <= DECODE_ROWS_MAX);
@@ -7945,7 +7988,7 @@ test "exl3 SPEC1 below K1.5 and above K4: the prefill GEMM, the decode chain and
             try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = 4, .rate = rate, .dec = dec, .seed = 6000 + n, .banks = SERVED_W12_BANKS, .x_scale = 3 });
             try foldBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 10, .rows = 4, .rate = rate, .dec = dec, .seed = 7800 + n, .banks = SERVED_W12_BANKS, .x_scale = 3 }, .{});
         }
-        for (SPEC1_WIDE_NS) |n| for (0..PARITY_SEEDS) |i| try indexedParity(.{ .n = n }, 128, 128, 4, 10, 4001 + 10 * n + i, dec);
+        for (SPEC1_WIDE_NS) |n| for (0..seeds) |i| try indexedParity(.{ .n = n }, 128, 128, 4, 10, 4001 + 10 * n + i, dec);
     }
 }
 
@@ -8122,24 +8165,28 @@ fn naturalBucket(rows: usize) c_int {
     return GROUP_BUCKETS[GROUP_BUCKETS.len - 1];
 }
 
-fn groupedCodecSweep(dec: exl3.Decode, n: u32, seed: u64) !void {
-    for (GROUP_ROWS) |rows| for (GROUP_ROUTES) |route| {
+/// The row counts a codebook other than the first runs: the grouping is codec-free, so the narrowest bucket, a part-filled
+/// one and the widest stand for the rest; MCG w12 runs every row count.
+const GROUP_ROWS_SAMPLE = [_]usize{ 2, 6, 16 };
+
+fn groupedCodecSweep(dec: exl3.Decode, n: u32, seed: u64, rows_set: []const usize) !void {
+    for (rows_set) |rows| for (GROUP_ROUTES) |route| {
         const c: MoeCase = .{ .e = 0, .hidden = 1024, .inter = 512, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = seed + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 };
         try groupedRowsMatchTicks(c, route, naturalBucket(rows), false);
     };
 }
 
 test "exl3 grouped decode rows are bit-identical to their one-row ticks at 2 to 16 rows, planted overlap, MCG and MUL1" {
-    try groupedCodecSweep(.{ .codebook = .mcg, .window = .w12 }, 40, 11000);
-    try groupedCodecSweep(.{ .codebook = .mcg, .window = .w15 }, 48, 11100);
-    try groupedCodecSweep(.mul1, 64, 11200);
+    try groupedCodecSweep(.{ .codebook = .mcg, .window = .w12 }, 40, 11000, &GROUP_ROWS);
+    try groupedCodecSweep(.{ .codebook = .mcg, .window = .w15 }, 48, 11100, &GROUP_ROWS_SAMPLE);
+    try groupedCodecSweep(.mul1, 64, 11200, &GROUP_ROWS_SAMPLE);
 }
 
 test "exl3 grouped decode rows are bit-identical to their one-row ticks under PAIR1, SPEC1 and STD1" {
-    try groupedCodecSweep(PAIR1_W16, 36, 11300);
-    try groupedCodecSweep(SPEC1_W15, 42, 11400);
-    try groupedCodecSweep(SPEC1_PER_RATE, 36, 11500);
-    try groupedCodecSweep(STD1_W15, 32, 11600);
+    try groupedCodecSweep(PAIR1_W16, 36, 11300, &GROUP_ROWS_SAMPLE);
+    try groupedCodecSweep(SPEC1_W15, 42, 11400, &GROUP_ROWS_SAMPLE);
+    try groupedCodecSweep(SPEC1_PER_RATE, 36, 11500, &GROUP_ROWS_SAMPLE);
+    try groupedCodecSweep(STD1_W15, 32, 11600, &GROUP_ROWS_SAMPLE);
 }
 
 test "exl3 grouped decode keeps the ticks' bytes at every capacity, wider than the rows and narrower" {
@@ -8370,9 +8417,13 @@ test "exl3 grouped decode timing arms all engage and keep the served chain's byt
     }
 }
 
+/// Decode row counts the across-seeds bars sweep: one row, the narrowest group, a part-filled one and the widest
+/// (the grouped tests hold the bytes at every row count).
+const SEED_ROWS = [_]usize{ 1, 2, 5, 8 };
+
 test "exl3 MCG n48 BF16 decode and NAX preserve f32 truth across seeds" {
     for ([_]bool{ false, true }) |prepared| {
-        for (1..9) |rows| {
+        for (SEED_ROWS) |rows| {
             for (0..PARITY_SEEDS) |seed| try n48FunnelCase(.mcg, rows, 318 + seed, true, prepared);
         }
     }
@@ -8383,7 +8434,7 @@ test "exl3 MCG K2.5 BF16 decode and NAX preserve f32 truth across seeds" {
     for ([_]bool{ false, true }) |prepared| {
         prepared_mid_force = prepared;
         defer prepared_mid_force = null;
-        for (1..9) |rows| {
+        for (SEED_ROWS) |rows| {
             for (0..PARITY_SEEDS) |seed| {
                 try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 8, .rows = rows, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 318 + seed, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, true);
             }

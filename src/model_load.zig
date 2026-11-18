@@ -26,7 +26,6 @@ const tokenize_cache_mod = @import("tokenize_cache.zig");
 const segment_cache_mod = @import("segment_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
-const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
 const load_clock = @import("load_clock.zig");
@@ -230,8 +229,6 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
         log.warn("[model-settings] kv_quant {s} ignored: the MLA latent is stored at off, 6 or 8 bits\n", .{k.wireName()});
     };
     config.mtp_override = o.mtp;
-    config.mtp_acceptance_override = o.mtp_acceptance;
-    config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.ssd_budget_gb_override = o.ssd_budget_gb orelse 0;
     config.ssd_prefetch_override = o.ssd_prefetch;
     config.cooler_override = arch_flags.coolerSettingOf(config, o);
@@ -242,6 +239,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.logit_bias_file_override = o.logit_bias_file;
     config.vision_override = o.vision;
     config.max_tokens_override = o.max_tokens;
+    config.expert_cache_bias_override = o.expert_cache_bias;
     if (yarnFactorIgnoredLine(config, o.yarn_factor)) |line| log.warn("{s}\n", .{line});
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.supportsExpertStreaming()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
@@ -338,9 +336,6 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
         .mtp_head_kv_quant = trunk.Trunk.mtp_head_kv_quant_flag,
         .drop_expert = config.drop_expert != 0,
         .ssd_prefetch = config.ssd_prefetch != null,
-        .mtp_typical = if (settings_resolve.launch.mtp_acceptance) |m| m == .typical else false,
-        .mtp_tokenv3 = if (settings_resolve.launch.mtp_acceptance) |m| m == .tokenv3 else false,
-        .mtp_greedy_tail = settings_resolve.launch.mtp_greedy_tail != null,
         .drafter = settings_resolve.launch.drafter,
         .mtp_min_depth = if (depth_bounds.active.min > 1) depth_bounds.active.min else 0,
         .mtp_max_depth = depth_bounds.active.max,
@@ -355,7 +350,6 @@ pub fn logIgnoredSettings(config: *const ModelConfig) void {
     if (arch_flags.settingsCoolerIgnoredLine(config)) |line| log.info("{s}\n", .{line});
     for (arch_flags.coolerOffIgnoredLines(config)) |line| if (line) |l| log.info("{s}\n", .{l});
     if (arch_flags.settingsKvQuantIgnoredLine(config)) |line| log.info("{s}\n", .{line});
-    if (arch_flags.settingsMtpIgnoredLine(config)) |line| log.info("{s}\n", .{line});
 }
 
 /// A load's MTP decision: `--mtp`/`--no-mtp` > the per-model `mtp` > on.
@@ -420,47 +414,32 @@ test "a streamed load drops only the engine-default MTP, never an asked-for one"
     try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = false, .source = .default }, true, false));
 }
 
-/// What a load line and `/props` read for the MTP, acceptance, greedy-tail and KV keys, under the launch globals.
+/// What a load line and `/props` read for the MTP and KV keys.
 const LaunchPicks = struct {
     mtp: model_settings.MtpChoice,
-    acceptance: settings_resolve.Setting(mtp_acceptance_mod.Mode),
-    greedy_tail: settings_resolve.Setting(bool),
     kv: trunk.KvCacheChoice,
 
     fn of(mtp_flag: ?bool, kv_flag: ?trunk.KVQuantConfig, config: *const ModelConfig) LaunchPicks {
         return .{
             .mtp = mtpChoiceFor(mtp_flag, config),
-            .acceptance = arch_flags.mtpAcceptanceOf(config),
-            .greedy_tail = arch_flags.greedyTailOf(config),
             .kv = trunk.KvCacheChoice.resolve(kv_flag, config.kv_quant_override),
         };
     }
 };
 
-test "an explicit launch flag outranks model-settings.json for MTP, acceptance, greedy tail and KV" {
-    const saved = settings_resolve.launch;
-    defer settings_resolve.launch = saved;
-    settings_resolve.launch = .{};
+test "an explicit launch flag outranks model-settings.json for MTP and KV" {
     var file = ModelConfig{};
     file.mtp_override = false;
-    file.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
-    file.mtp_greedy_tail_override = true;
     file.kv_quant_override = .dense;
 
     const unflagged = LaunchPicks.of(null, null, &file);
     try testing.expect(!unflagged.mtp.on);
     try testing.expectEqual(settings_resolve.Source.model_settings, unflagged.mtp.source);
-    try testing.expectEqual(settings_resolve.Source.model_settings, unflagged.acceptance.source);
-    try testing.expectEqual(settings_resolve.Setting(bool){ .value = true, .source = .model_settings }, unflagged.greedy_tail);
     try testing.expectEqualStrings("model-settings.json", unflagged.kv.sourceName());
 
-    settings_resolve.launch = .{ .mtp_acceptance = .{ .typical = .{ .delta = 0.1 } }, .mtp_greedy_tail = true };
     const flagged = LaunchPicks.of(true, trunk.KVQuantConfig.affine(4), &file);
     try testing.expect(flagged.mtp.on);
     try testing.expectEqualStrings("--mtp", flagged.mtp.sourceName());
-    try testing.expectEqual(@as(f32, 0.1), flagged.acceptance.value.typical.delta);
-    try testing.expectEqual(settings_resolve.Source.flag, flagged.acceptance.source);
-    try testing.expectEqual(settings_resolve.Source.flag, flagged.greedy_tail.source);
     try testing.expectEqualStrings("kv4", flagged.kv.label());
     try testing.expectEqualStrings("--kv-quant", flagged.kv.sourceName());
 }
@@ -1675,6 +1654,8 @@ pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *Loade
         }
         if (entry.prefix_cache.?.ssd_first) {
             entry.prefix_cache.?.disk.?.ssd_first = true;
+            if (prefix_arch.holdsOffGridPoints(config))
+                entry.prefix_cache.?.disk.?.hold_stride = @intCast(@import("prefill_plan.zig").effectiveSsmCheckpointStride(p.ssm_checkpoint_stride, settings_resolve.prefill_chunk.value));
             // Startup sweep of strays + root-wide LRU across sibling fingerprints.
             entry.prefix_cache.?.disk.?.sweepSiblings();
         }
@@ -1992,13 +1973,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const kv_quant_config = kv_cache.config;
     const mtp = mtpChoiceFor(params.mtp, params.config);
     const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming, params.config.stream_mtp_head);
-    const acceptance = arch_flags.mtpAcceptanceOf(params.config);
-    const greedy_tail = arch_flags.greedyTailOf(params.config);
     // GLM has no MTP head; the server's `MTP: off` line already says so.
-    if (!arch_config.fact(params.config, "no_mtp_head")) log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
+    if (!arch_config.fact(params.config, "no_mtp_head")) log.info("[mtp] {s} ({s}{s})\n", .{
         if (mtp_streaming_off) "off" else mtp.label(), if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
-        mtp_acceptance_mod.name(acceptance.value),     settings_resolve.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
-        if (greedy_tail.value) "on" else "off",        settings_resolve.sourceLabel(greedy_tail.source, "--mtp-greedy-tail"),
     });
     const mtp_enabled = mtp.on and !mtp_streaming_off and !arch_config.fact(params.config, "no_mtp_head");
     arch_serve.loadLines(params.config, .{ .io = sch.io, .allocator = sch.allocator, .model_dir = params.model_dir, .mtp_source = mtp.sourceName() });
@@ -2824,6 +2801,8 @@ test "preloadCpuState refuses an unsupported checkpoint format by name" {
 
 test "every real streamed pack and source on this box plans a streamed load" {
     const t = std.testing;
+    // A box with none of the packs proves nothing: the test skips, never passes.
+    var planned: usize = 0;
     const Case = struct { name: []const u8, layout: expert_stream_mod.quant.Layout, tower: u64 };
     for ([_]Case{
         .{ .name = "Qwen3.8-Flash-Next-Sushi-2.6bpw", .layout = .exl3_k4, .tower = 597_327_776 },
@@ -2839,6 +2818,7 @@ test "every real streamed pack and source on this box plans a streamed load" {
         const path = try @import("test_models.zig").packPath(&path_buf, case.name);
         var config = model_mod.parseConfig(t.io, t.allocator, path) catch continue;
         defer config.deinit(t.allocator);
+        planned += 1;
         const plan = try planExpertStreaming(t.io, t.allocator, &config, path, 60 << 30, false);
         try t.expectEqual(case.layout, plan.layout);
         try t.expect(plan.cache.slots_per_layer > 1);
@@ -2852,6 +2832,7 @@ test "every real streamed pack and source on this box plans a streamed load" {
         // Slots are whole per layer: a tower smaller than one slot across the layers, or a pack that fits in full, costs none.
         try t.expect(seen.cache.slots_per_layer <= plan.cache.slots_per_layer);
     }
+    if (planned == 0) return error.SkipZigTest;
 }
 
 test "planExpertStreamingWith takes a resident drafter out of the expert cache" {

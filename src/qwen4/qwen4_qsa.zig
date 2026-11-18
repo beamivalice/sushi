@@ -423,6 +423,7 @@ pub fn qsaSelectTopBlocks(
     // MLX binds a custom kernel's input of fewer than 8 elements as `constant` (`max_constant_array_size`), and the
     // select reads `scores` as a device pointer: the composed chain serves such a row with the same blocks.
     if (@as(i64, rows) * nb < 8) return null;
+    try makeSelectAhead(s, kb);
 
     qsa_select_used_split = false;
     if (qsaSelectSplitEnabled() and qsaSelectSplitServes(rows, nb, kb)) {
@@ -510,9 +511,9 @@ var split_made: [8]c_int = @splat(0);
 
 /// A load's warm never reaches the split's width (tens of thousands of blocks): before the seal, on the engine, the
 /// first select of a block budget runs the split once over a sheet of that width, so a long request compiles nothing.
-/// Before the seal, the select a forward past `kb` blocks takes at each row class (`qsaSelectTgFor`, the radix width
-/// of `qsaSelectDigitBits`): a forward whose blocks fit the budget selects none, and a warm's context never passes it.
-pub fn makeSelectAhead(s: mlx.mlx_stream, kb: c_int) !void {
+/// Before the seal, on the engine, a block budget's first select makes the select at every row class the selectors
+/// pick (`qsaSelectTgFor`, `qsaSelectDigitBits`): a forward's rows, a chunk's remainder among them, take any count.
+pub fn makeSelectAhead(s: mlx.mlx_stream, kb: c_int) anyerror!void {
     if (!qsaSelectKernelEnabled() or mlx.engine.sealed() or !mlx.engine.isStream(s)) return;
     const slot = for (&select_made) |*k| {
         if (k.* == kb) return;
@@ -520,7 +521,13 @@ pub fn makeSelectAhead(s: mlx.mlx_stream, kb: c_int) !void {
     } else return;
     slot.* = kb;
     const nb = kb + 1;
-    for ([_]c_int{ 1, QSA_SELECT_SPLIT_MAX_ROWS + 1, 64, 256 }) |rows| {
+    var class: [2]c_int = .{ 0, 0 };
+    // Past every breakpoint of both selectors.
+    var rows: c_int = 1;
+    while (rows <= 4096) : (rows += 1) {
+        const here = [2]c_int{ qsaSelectTgFor(rows), qsaSelectDigitBits(rows) };
+        if (std.mem.eql(c_int, &here, &class)) continue;
+        class = here;
         const n: usize = @intCast(rows * nb);
         const sheet = try std.heap.page_allocator.alloc(f32, n);
         defer std.heap.page_allocator.free(sheet);
@@ -789,6 +796,47 @@ pub fn qsaSelectComposedOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.
     defer _ = mlx.mlx_array_free(top_idx);
     try mlx.check(mlx.mlx_astype(&top_idx, tail, .int32, s));
     return qsaSortWithInvisible(s, top_idx, vis3, all_vis);
+}
+
+/// The narrowest prefill tail past the indexer's budget that gathers the cache's packed keys in place, and the keys it
+/// must find cached: past `QSA_ATTN_PACKED_MAX_S` rows the aligned kernel declines, and the packed gather serves only
+/// where `qsaPackedGatherServes` does. A cold chunk never reads packed keys; a prompt restored from the prefix cache does.
+pub fn packedGatherTail(budget: u64, ratio: u64) ?[2]usize {
+    if (budget == 0 or ratio == 0) return null;
+    const rows: u64 = @max(@as(u64, @intCast(qwen4_qsa_attn.QSA_ATTN_PACKED_MAX_S)) + 1, FUSED256_MIN_Q_LEN);
+    const topk: u64 = budget / ratio;
+    var kv: u64 = budget + rows;
+    while (!qsaPackedGatherServes(@intCast(rows), @intCast(kv), @intCast(@min(kv / ratio, topk)), @intCast(ratio))) kv += ratio;
+    return .{ kv - rows, rows };
+}
+
+/// The served warm's make of the packed gather a restored tail past the budget takes (`packedGatherTail`): the call a
+/// request makes, over a full-attention layer's packed keys as the cache holds them, at the tail's width. Its pipeline
+/// follows the model's geometry and the cache's quantization, not how many keys there are, so it needs no long prefill.
+pub fn warmPackedGather(xfm: *Trunk) !void {
+    const cfg = &xfm.config;
+    const tail = packedGatherTail(cfg.indexer_budget, cfg.indexer_compress_ratio) orelse return;
+    var layer: u32 = 0;
+    while (layer < cfg.num_hidden_layers and cfg.isLinearLayer(layer)) layer += 1;
+    if (layer == cfg.num_hidden_layers) return;
+    var view = try xfm.cache.denseViewPacked(layer, xfm.s);
+    defer view.deinit();
+    if (!view.has_quant_triple) return;
+    const rows: c_int = @intCast(tail[1]);
+    const ratio: c_int = @intCast(cfg.indexer_compress_ratio);
+    const kv = mlx.getShape(view.k_triple_q)[2];
+    if (kv < rows) return error.WarmCacheTooShort;
+    const kb: c_int = @min(@divTrunc(kv, ratio), @as(c_int, @intCast(cfg.indexer_budget / cfg.indexer_compress_ratio)));
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    try mlx.check(mlx.mlx_zeros(&q, &[_]c_int{ 1, @intCast(cfg.num_attention_heads), rows, @intCast(cfg.head_dim) }, 4, .bfloat16, xfm.s));
+    // Block 0 for every row: an index the cache holds, as a selection's are.
+    var blocks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blocks);
+    try mlx.check(mlx.mlx_zeros(&blocks, &[_]c_int{ 1, rows, kb }, 3, .int32, xfm.s));
+    const out = (try qwen4_qsa_gather.gatherQsa256Packed(xfm.s, q, &view, 1.0, blocks, ratio)) orelse return error.WarmPackedGatherDeclined;
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
 }
 
 /// Past the split-K widths: gather the packed cache in place, or from its rebuild when the
@@ -1535,7 +1583,6 @@ pub fn qsaSelectBlocks(self: *Trunk, q_rope: mlx.mlx_array, k32t: mlx.mlx_array,
         _ = mlx.mlx_array_free(canonical);
     };
     if (nb <= block_topk) {
-        try makeSelectAhead(self.s, block_topk);
         var ar = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ar);
         try mlx.check(mlx.mlx_arange(&ar, 0, @floatFromInt(nb), 1.0, .int32, self.s));
@@ -1893,4 +1940,23 @@ test "qsa pooled rope: a mark from another thread is observed by the next lookup
     try testing.expect(t.arch_state.qwen4.qsa_pooled_rope.stale.load(.acquire));
     _ = try qsaPooledCosSin(&t, &ctx, rope_dims, base, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 2), t.arch_state.qwen4.qsa_pooled_rope.builds);
+}
+
+test "the warm's packed tail is the narrowest past the aligned kernel, over the fewest keys the packed gather serves" {
+    const t = std.testing;
+    for ([_][2]u64{ .{ 2048, 4 }, .{ 8, 4 } }) |geo| {
+        const tail = packedGatherTail(geo[0], geo[1]).?;
+        const rows: c_int = @intCast(tail[1]);
+        const kv: u64 = tail[0] + tail[1];
+        const kb = struct {
+            fn at(k: u64, g: [2]u64) c_int {
+                return @intCast(@min(k / g[1], g[0] / g[1]));
+            }
+        }.at;
+        try t.expect(!qwen4_qsa_attn.qsaSparseAttnServes(true, rows));
+        try t.expect(qsaPackedGatherServes(rows, @intCast(kv), kb(kv, geo), @intCast(geo[1])));
+        try t.expect(!qsaPackedGatherServes(rows, @intCast(kv - geo[1]), kb(kv - geo[1], geo), @intCast(geo[1])));
+        try t.expect(tail[0] > geo[0]);
+    }
+    try t.expectEqual(@as(?[2]usize, null), packedGatherTail(0, 4));
 }

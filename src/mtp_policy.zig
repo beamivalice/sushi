@@ -933,7 +933,7 @@ pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
 /// One debug line per planned round with every input the planner read.
 pub fn mtpPlannerMode(self: *const Generator) u8 {
     const head = self.mtp orelse return 0;
-    const sharp = !sampler.isGreedyTemperature(self.mtpDraftSampling(0).temperature);
+    const sharp = !sampler.isGreedyTemperature(self.mtpDraftSampling().temperature);
     return group_cost.GroupShape.samplingMode(head.canRerankDrafts(), false, sharp, !sampler.isGreedyTemperature(self.sampling.temperature));
 }
 

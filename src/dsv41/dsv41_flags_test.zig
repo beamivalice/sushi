@@ -40,7 +40,6 @@ test "the Sushi Cooler choice reaches the DeepSeek config: the flag, else the se
 
 test "dsv41 flags: a Cooler load refuses DFlash2 by the rule every Cooler load takes, naming its own opt-out; its own reasons come first" {
     var c: model.ModelConfig = .{ .model_type = "deepseek_v41", .cooler_for_test = true };
-    try std.testing.expect(flags.exactDraftsOnly(&c));
     try std.testing.expectEqualStrings("--drafter is not served on Sushi Cooler: DFlash2 runs on MLX only; drop the flag, or pass --ds41-mlx-engine", flags.archFlagRefusal(&c, .{ .drafter = true }).?);
-    try std.testing.expect(std.mem.startsWith(u8, flags.archFlagRefusal(&c, .{ .mtp_typical = true }).?, "--mtp-typical has no effect on deepseek_v41"));
+    try std.testing.expect(std.mem.startsWith(u8, flags.archFlagRefusal(&c, .{ .kv_quant = true, .drafter = true }).?, "--kv-quant has no effect on deepseek_v41"));
 }

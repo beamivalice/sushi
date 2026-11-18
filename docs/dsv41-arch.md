@@ -13,7 +13,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
   text out; a streamed load one request at a time (`ownsModuleDecodeState`), a fully resident one up to
   `maxJoinedRows` requests as rows of one decode forward ([below](#prefix-cache)).
 - Off, by name: `--kv-quant` (the state is the activation dtype;
-  `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` or `--mtp-greedy-tail` refuses the load (DSpark accepts by the exact rule only), a settings `kv_quant`, `mtp_acceptance` or `mtp_greedy_tail` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
+  `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16` or `--mtp-head-kv-quant` refuses the load, a settings `kv_quant` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
   ([below](#dspark)), the checkpoint's own drafter, on by default like every served MTP head; `--no-mtp` turns it off.
 - Every pack's forwards, STQ or the release's own FP8 trunk and MXFP4 experts, run on the engine of our own (shipped
   as Sushi Cooler) on any GPU, the SIMD arms where there are no matrix units, and on MLX only when the user opts out
@@ -528,7 +528,7 @@ After CED and the fused gather-attention (budget 96, chunk 1024, synced stage pr
 layers, hidden 128, ratios 0,0,2,2,2,1,1,1, 8 experts top-3, window 8, Engram at layers 1 and 2) written in the
 ORIGINAL checkpoint layout, and dumps logits, per-layer streams and sub-module captures (`fixture.safetensors`, QAT on;
 `fixture_noqat.safetensors`, off). The reference's GPU kernels are stubbed on the CPU. `DSV41_TINY=<dir>` points the Zig
-tests at the output; `zig build test` caches a passing env-gated run, so re-run the test binary to re-execute.
+tests at the output.
 
 `DSV41_TINY` takes the DEFAULT-geometry dump (no `--geometry`); a `--geometry stq` dump there fails `dsv41 fused: prefill ...` at `attn_2` (diff 0.39, bar 0.010). `DSV41_STQ_TINY` takes the STQ PACK built from the `--geometry stq` dump, not the dump itself.
 

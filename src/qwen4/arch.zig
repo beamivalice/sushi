@@ -121,6 +121,9 @@ pub const coolerGap = qwen4_cooler.coolerGap;
 
 /// The pipeline manifest a Qwen load reads and writes (`arch/cooler_pipelines.zig`): kernels follow the pack's shapes
 /// and formats, never its weights, so two packs alike in these share one.
+/// The served warm's packed gather past the indexer's budget (`qwen4_qsa.warmPackedGather`), over the warm's cache.
+pub const warmPackedGather = @import("qwen4_qsa.zig").warmPackedGather;
+
 pub fn coolerPipelineScope(config: *const Config) [16]u8 {
     const manifest = @import("../pipeline_manifest.zig");
     var d: manifest.Digest = .{};

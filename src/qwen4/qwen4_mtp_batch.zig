@@ -89,7 +89,7 @@ pub fn build(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32
             try mlx.check(mlx.mlx_concatenate_axis(&stacked_x, mvec, 0, xfm.s));
             var any_sampled = false;
             for (chains) |*c| {
-                if (c.q_probs != null) any_sampled = true;
+                if (c.sampled) any_sampled = true;
             }
             if (any_sampled) {
                 try mtp_round.mtpGroupSampledDrafts(gens, chains, stacked_x, i);
@@ -111,14 +111,14 @@ pub fn build(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32
             }
         } else {
             for (gens, chains, 0..) |g, *c, k| {
-                const draft_sampling = g.mtpDraftSampling(i);
+                const draft_sampling = g.mtpDraftSampling();
                 if (c.q_probs) |slots| {
                     const prop = try sampler.logitsStepProposal(outs[k].logits, g.mtpSamplingDraw(draft_sampling), xfm.s);
                     slots[i] = prop.q;
                     c.n_qp = i + 1;
                     c.draft_arrs[i] = prop.id;
                 } else {
-                    c.draft_arrs[i] = try sampler.sampleTokenLazy(outs[k].logits, draft_sampling, xfm.s);
+                    c.draft_arrs[i] = try sampler.sampleTokenLazy(outs[k].logits, g.mtpDraftDraw(draft_sampling, i), xfm.s);
                 }
                 c.n_drafted = i + 1;
                 if (c.conf_arrs != null and i < c.plan.m_lo) {

@@ -85,10 +85,21 @@ hidden 2560, expert intermediate 640.
 - **Every array of an encode or a tower load has one owner on every path**: a refused encode or load (an MLX call, a pool
   buffer, a missing tensor) fails by its error, frees each array once and leaves the engine's pool as it was; a video's
   groups are freed by one `defer` over those built. Pinned by the two `qwen vision: ... on the engine ... refused` sweeps.
-- **On Sushi Cooler an encode is billed and capped as the engine holds it**: the engine runs each op as it is built,
-  so a block's score sheets are held together; attention frees each sheet once the next is made and evaluates between
-  them, and `encodeScratchBytes` bills four sheets on the engine (1.3 on MLX). The encode runs under `engine.budget` of
-  its bill, so an over-run is `PoolOverBudget`, never a Metal OOM (the served-widths bill test).
+- **Attention scores 512 query rows at a time** (`ATTN_QUERY_ROWS`): a block holds [heads, 512, N] f32 sheets, never
+  [heads, N, N]. A row's scores, softmax and context reduce along keys only, so the output is the whole sheet's bytes
+  (the tiny tower against the old path, MLX and engine; the real 4bpw tower at 96x96 patches, byte for byte).
+- **On Sushi Cooler an encode is billed and capped as the engine's pool keeps it** (`EngineHeld`): every buffer at its
+  size class, no factor. Each sheet step hands its pass over, so two sheets are live, and the in-use peak is an attention
+  step's (rows, f32 q/k/v, chunk outputs, two sheets) or, on small images, the tanh GELU's (fc1 and eight [N, 4304]
+  temporaries); the served-widths test pins it to the byte. The bill is the attention step plus the MLP's own buffers
+  plus `BILL_MARGIN_BYTES`: a cap at either peak alone evicts the other's buffers every block and makes them again,
+  and the test pins that a second encode evicts nothing. A 1536² image (9,216 patches) bills 1.90 GB, down from
+  22.8 GB of whole sheets, and holds 0.91 GB in use, down from 11.6 GB. The encode runs under `engine.budget` of its
+  bill, so an over-run is `PoolOverBudget`, never a Metal OOM.
+- A 1536² encode on the 4bpw-v2.0 tower on Cooler: 2,498 ms whole sheets, 2,280 ms by chunks, same bytes (base
+  `80f21021` plus this change, M5 Max, one encode after one warm each, GPU lock held, `taskpolicy -a`, idle box).
+- **On MLX the bill stays fitted to the whole sheet**: the lazy graph keeps many chunks' sheets until the block's
+  eval (5.6 GB at 9,216 patches against 6.1 GB whole), so `encodeScratchBytes` keeps its N² term there.
 - **The resident weights are billed as their side holds them** (`model.indexedResidentSplit`, `engine`): on Sushi
   Cooler a requantized tower matrix is its codes, scales and biases at their pool size classes (`quantizedHeldBytes`)
   and every other tensor, trunk, head and tower, a page-rounded mapping (`readTensorArray`'s own region per tensor). A channels-last patch embedding is held once: its flattened copy replaces it.
@@ -96,11 +107,13 @@ hidden 2560, expert intermediate 640.
   4, 16, 60, 64, 256, 1,020 and 1,024 patches and a two-group video, reaching every product plan of its blocks and its
   merger, so an image or video of any grid compiles nothing inside a request (a video's three- and four-group joins are
   made with the two-group one, by the concatenate rule). A `vision tower` marker keyed by the
-  tower's widths rides the manifest as DeepSeek's does; softmax's looped kernel past 4,096 keys is left to the manifest.
+  tower's widths rides the manifest as DeepSeek's does. Softmax's looped kernel past 4,096 keys and the context
+  product's 64-deep K tile from 8,192 come from shapes alone (`warmContext`): one softmax and one context product of
+  four query rows over 8,192 keys, which makes every row count's tiles at every alignment, with no image encoded.
 - **The tower evaluates after every block and at its output** (`QwenVision.eval_per_block`): a lazy 27-block graph
-  also held every block's transposed weights (~1 GB at any size) and more than one block's score sheets. The encode
-  bill (`encodeScratchBytes`: 32 MB + 1.3 x one f32 score sheet + 107 KB per patch) covers the per-block peak by
-  1.26x or more at every measured size; `qwen vision ubench` asserts bill >= peak.
+  also held every block's transposed weights (~1 GB at any size) and more than one block's score sheets. The MLX
+  encode bill (`encodeScratchBytes`: 32 MB + 1.3 x one f32 score sheet + 107 KB per patch) covers the per-block peak
+  by 1.26x or more at every measured size; `qwen vision ubench` asserts bill >= peak.
 - Measured on main `68001a57` plus this change, with `qwen vision ubench`: Sushi-3bpw tower only, random pixels, 5 reps with the lazy and
   per-block arms interleaved, `taskpolicy -a`, GPU lock held. Times are best-of-5 and CONTENDED: a live Qwen server
   was decoding on the same GPU. Peaks were identical across two runs.
@@ -234,9 +247,8 @@ A quantized pack whose experts stream takes `--drop-expert n` as DeepSeek does
 - **Which loads**: an STQ pack (STQ experts, an affine or STQ trunk) and the BF16 checkpoint run on Sushi Cooler by
   default; any other pack runs on MLX with the reason in its `[qwen4] forwards:` load line (`qwen4_cooler.coolerGap`,
   asked by `cooler_side.sideOf`). `--qwen-mlx-engine` and the model's `qwen_cooler` setting keep it on MLX.
-- **What it refuses by name**: `--mtp-typical`, `--mtp-tokenv3`, `--mtp-greedy-tail` and `--drafter` (DFlash2), as every
-  Cooler load does (`arch_flags.archFlagRefusal`, after the arch's own refusals): drafts are accepted by the exact rule
-  only, and its `mtp_acceptance` / `mtp_greedy_tail` settings do not reach it (`arch_flags.exactDraftsOnly`).
+- **What it refuses by name**: `--drafter` (DFlash2 runs on MLX only), as every Cooler load does
+  (`arch_flags.archFlagRefusal`, after the arch's own refusals).
 - **Vision**: the tower runs on the load's side (`QwenVision.own`): on Sushi Cooler every op takes the engine's stream
   and gives MLX's bytes (requantized and bf16, asking nothing of MLX), its requantize kernels made under the load's
   lifted seal; the patch arrays and spans take its stream (`ownStream`).

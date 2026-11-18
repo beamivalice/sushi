@@ -34,7 +34,7 @@ const request_policy = @import("request_policy.zig");
 const servedModelId = request_policy.servedModelId;
 const resolveThinkPenalty = request_policy.resolveThinkPenalty;
 const armThinkPenalty = request_policy.armThinkPenalty;
-const omittedMaxTokensDefault = request_policy.omittedMaxTokensDefault;
+const filledMaxTokens = request_policy.filledMaxTokens;
 const launchMaxTokensDefault = request_policy.launchMaxTokensDefault;
 const resolveRequestMaxTokens = request_policy.resolveRequestMaxTokens;
 const maxTokensOrigin = request_policy.maxTokensOrigin;
@@ -188,7 +188,7 @@ pub fn handleCompletions(
         return;
     }
     var fault_buf: [384]u8 = undefined;
-    if (request_parse.generationFieldFault(&fault_buf, root, .{})) |reason| {
+    if (request_parse.generationFieldFault(&fault_buf, root, .{}) orelse request_parse.completionsFieldFault(root)) |reason| {
         log.warn("POST /v1/completions -> 400 ({s})\n", .{reason});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
@@ -229,9 +229,9 @@ pub fn handleCompletions(
     const requested_max_tokens = request_parse.requestedMaxTokens(root);
     const max_tokens: u32 = resolveRequestMaxTokens(
         requested_max_tokens,
-        omittedMaxTokensDefault(config),
+        filledMaxTokens(config),
     );
-    // For the request log line only: which of the three sources this came from.
+    // Who decided it: the log line names it, and only the client's own number is a cut to report.
     const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault(), config.defaultMaxTokens());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
@@ -315,9 +315,8 @@ pub fn handleCompletions(
         return;
     }
 
-    // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
-    // omitted max_tokens is the maxInt(u32)/4 sentinel.
-    const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, prompt_ids.len, effective_ctx);
+    // Clamp max_tokens first: the memory guard bills the reserved generation headroom.
+    const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, max_tokens_origin == .client, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = sampling.repeat_penalty, .presence_penalty = sampling.presence_penalty, .frequency_penalty = sampling.frequency_penalty }, logprobs_n);
@@ -352,6 +351,7 @@ fn requestSampling(config: *const model_mod.ModelConfig, root: std.json.ObjectMa
         .temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature")),
         .top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p")),
         .top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k")),
+        .min_p = request_parse.parseMinP(root),
         .repeat_penalty = parseRepeatPenalty(root),
         .presence_penalty = parseAdditivePenalty(root, "presence_penalty"),
         .frequency_penalty = parseAdditivePenalty(root, "frequency_penalty"),
@@ -400,7 +400,7 @@ pub fn completeIds(allocator: std.mem.Allocator, lm: *LoadedModel, ids: []const 
     const enable_mtp = admitMtpForCtx(spec_request.mtp, ids.len);
     const spec = requestSpecModes(spec_request.drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
 
-    return nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, ids, ids, clampMaxTokens(max_tokens, ids.len, effective_ctx), sampling, requestEosSlice(config, root), 0, false, false, spec.use_drafter, spec.use_mtp, spec_request.allow_batch_mtp, getTimeoutNs(), null, &.{}, requestCacheKey(root), .{}, 0, parseKvQuantOverride(root), null, .{ .stops = &.{}, .completion_skip_special = true });
+    return nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, ids, ids, clampMaxTokens(max_tokens, true, ids.len, effective_ctx), sampling, requestEosSlice(config, root), 0, false, false, spec.use_drafter, spec.use_mtp, spec_request.allow_batch_mtp, getTimeoutNs(), null, &.{}, requestCacheKey(root), .{}, 0, parseKvQuantOverride(root), null, .{ .stops = &.{}, .completion_skip_special = true });
 }
 
 fn handleNonStreamingCompletion(

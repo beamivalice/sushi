@@ -12,6 +12,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 
 - **QSA GATHERS selected blocks, never a dense `[S, kv]` mask** on a packed cache.
 - Selection = the exact radix-select `sushi_qsa_select` on both arms, SPLIT across 16 threadgroups at decode widths.
+- **On Sushi Cooler a block budget's first select, before the seal, makes the select at every row class**
+  (`makeSelectAhead`: each threadgroup and radix width the selectors pick, and the split): a chunk's remainder takes
+  any row count, and no warm request reaches every class.
 - Rows 1..15 (decode and verify) = the fused split-K `qsaSparseAttn` on dense and packed caches alike
   (`qsaAlignedSparseAttn`). When it declines, decode falls to
   `qsaDecodeGatherAttn` and rows 2..15 to the union gather `qsaVerifyGatherAttn`.

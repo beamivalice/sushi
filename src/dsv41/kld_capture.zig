@@ -1769,8 +1769,11 @@ test "deepseek_v41 layer-major capture: flags it takes and refuses, and the batc
     const floor = try floorBudget(&dc, 12 << 30, per_expert);
     try testing.expectEqual(@as(u32, batch_cap), try batchWindows(&dc, 100 << 30, floor, chunk_rows));
     try testing.expectError(error.Dsv41CaptureBudgetTooSmall, batchWindows(&dc, floor, floor, chunk_rows));
-    const small = try batchWindows(&dc, floor + (14 << 30), floor, chunk_rows);
-    try testing.expect(small >= 1 and small < batch_cap);
+    // A budget that carries exactly half a batch beside the floor and the reserve buys half a batch.
+    const reserve = dc.chunkCap(chunk_rows, chunk_rows) + sumsBytes(&dc) + (2 << 30);
+    const half = floor + reserve + carriedPerWindow(&dc, chunk_rows) * (batch_cap / 2);
+    try testing.expectEqual(@as(u32, batch_cap / 2), try batchWindows(&dc, half, floor, chunk_rows));
+    try testing.expectEqual(@as(u32, batch_cap / 2 - 1), try batchWindows(&dc, half - 1, floor, chunk_rows));
 }
 
 /// The head applied to row `row` of the stored head inputs must give the logits the capture wrote for that window.

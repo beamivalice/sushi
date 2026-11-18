@@ -57,7 +57,7 @@ for p in "Say hello." "Say goodbye."; do
 done
 
 echo "[4] a long prompt with NO max_tokens field is admitted"
-# The omitted sentinel (maxInt/4) must be clamped before the guard bills it. The prompt must pass
+# The filled default must be clamped before the guard bills it. The prompt must pass
 # KVCache.RESERVE_MIN_TOKENS (32k) and still fit the context.
 CTX=$(curl -s -m 10 "$SUSHI_URL/v1/models" | python3 -c "import json,sys; d=json.load(sys.stdin); print(max([m.get('context_length',0) for m in d.get('data',[])] or [0]))" 2> /dev/null || echo 0)
 if [ "${CTX:-0}" -lt 65536 ]; then

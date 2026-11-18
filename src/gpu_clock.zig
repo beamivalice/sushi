@@ -162,12 +162,19 @@ pub const Sampler = struct {
     mu: std.Io.Mutex = .init,
     readings: std.ArrayList(Reading) = .empty,
     stopping: std.atomic.Value(bool) = .init(false),
+    /// The sampling interval: `interval_ms` but in a test, which does not wait out the real one.
+    every_ms: u32 = interval_ms,
 
     /// Fails when the clock cannot be read on this box.
     pub fn start(gpa: std.mem.Allocator, io: std.Io) !*Sampler {
+        return startEvery(gpa, io, interval_ms);
+    }
+
+    /// `start`, sampling every `every_ms`.
+    pub fn startEvery(gpa: std.mem.Allocator, io: std.Io, every_ms: u32) !*Sampler {
         const self = try gpa.create(Sampler);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .io = io, .reader = live.Reader.open() orelse return error.GpuClockUnavailable };
+        self.* = .{ .gpa = gpa, .io = io, .reader = live.Reader.open() orelse return error.GpuClockUnavailable, .every_ms = every_ms };
         self.thread = try std.Thread.spawn(.{}, readMain, .{self});
         return self;
     }
@@ -217,7 +224,7 @@ pub const Sampler = struct {
         var token: ?c_int = null;
         var last = io_util.nowMsMonotonic(self.io);
         while (!self.stopping.load(.acquire)) {
-            std.Io.sleep(self.io, .fromMilliseconds(interval_ms), .real) catch {};
+            std.Io.sleep(self.io, .fromMilliseconds(self.every_ms), .real) catch {};
             const mhz = self.reader.sample() orelse continue;
             const pressure = readPressure(&token) orelse continue;
             const at = io_util.nowMsMonotonic(self.io);
@@ -308,7 +315,8 @@ test "gpu_clock: the report header names the clock and the pressure levels seen,
 
 test "gpu_clock: a sampler delivers readings and stops" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
-    const s = Sampler.start(testing.allocator, testing.io) catch return;
+    // At 10 ms the first reading and the stop's join take tens of ms, not the real interval's second.
+    const s = Sampler.startEvery(testing.allocator, testing.io, 10) catch return;
     defer s.stop();
     try testing.expect(s.waitFirst(5000));
     const run = try s.summarizeAll(testing.allocator);

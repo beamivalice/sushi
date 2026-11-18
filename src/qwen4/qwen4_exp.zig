@@ -1513,6 +1513,13 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ref), std.mem.sliceAsBytes(got));
 }
 
+/// Waits for a warm `startWarm` began to read the whole table: its thread ends there, so this joins it, no poll.
+fn joinWarm(t: *NgramTable) !void {
+    const th = t.warm_thread orelse return error.WarmNeverStarted;
+    th.join();
+    t.warm_thread = null;
+}
+
 test "ngram prefill gather: a pool chosen on a cold table yields to the serial walk once the warm has read the table" {
     // 4-bit, group 32, dim 32: 256 rows, 4 pool batches.
     const ROWS: usize = 256;
@@ -1559,12 +1566,8 @@ test "ngram prefill gather: a pool chosen on a cold table yields to the serial w
     try testing.expectEqual(cold + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
 
     t.startWarm();
-    var spins: u32 = 0;
-    while (t.warm_bytes.load(.acquire) < t.map.len) : (spins += 1) {
-        if (spins > 10_000) return error.WarmNeverFinished;
-        var ts: std.c.timespec = .{ .sec = 0, .nsec = 1_000_000 };
-        _ = std.c.nanosleep(&ts, null);
-    }
+    try joinWarm(&t);
+    try testing.expect(t.warm_bytes.load(.acquire) >= t.map.len);
     const warm = pool.runs.load(.monotonic);
     try t.gatherChecked(ids, out, 8192);
     try testing.expectEqual(warm, pool.runs.load(.monotonic));
@@ -1870,12 +1873,7 @@ test "ngram table warm: touches the whole file in the background; close() joins 
     var t = try NgramTable.open(path);
     t.startWarm();
     try testing.expect(t.warm_thread != null);
-    var spins: u32 = 0;
-    while (t.warm_bytes.load(.acquire) < buf.len) : (spins += 1) {
-        if (spins > 10_000) return error.WarmNeverFinished;
-        var ts: std.c.timespec = .{ .sec = 0, .nsec = 1_000_000 };
-        _ = std.c.nanosleep(&ts, null);
-    }
+    try joinWarm(&t);
     try testing.expectEqual(@as(u64, buf.len), t.warm_bytes.load(.acquire));
     t.close();
 

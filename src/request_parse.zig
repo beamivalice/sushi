@@ -19,6 +19,11 @@ pub fn parseJsonFloatOpt(root: std.json.ObjectMap, key: []const u8) ?f32 {
     };
 }
 
+/// The request's `min_p` after `generationFieldFault`: omitted or null is 0, which is off.
+pub fn parseMinP(root: std.json.ObjectMap) f32 {
+    return parseJsonFloatOpt(root, "min_p") orelse 0;
+}
+
 /// Optional top_k body field after `generationFieldFault`; null = omitted, 0 disables top-k.
 pub fn parseJsonTopKOpt(root: std.json.ObjectMap, key: []const u8) ?u32 {
     return switch (root.get(key) orelse return null) {
@@ -239,6 +244,19 @@ pub fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     return "'n' > 1 is not supported: this server returns a single choice per request; omit 'n' or set it to 1";
 }
 
+/// Legacy completions fields this server cannot honour: a fill-in-the-middle `suffix`, and `best_of` above 1.
+pub fn completionsFieldFault(root: std.json.ObjectMap) ?[]const u8 {
+    if (root.get("suffix")) |v| switch (v) {
+        .null => {},
+        .string => |text| if (text.len > 0) return "'suffix' is not supported: this server does not fill in the middle; omit it",
+        else => return "'suffix' is not supported: this server does not fill in the middle; omit it",
+    };
+    if (root.get("best_of")) |v| if (v != .null and wholeNumber(v) != 1) {
+        return "'best_of' must be 1: this server returns one completion per request and ranks no candidates";
+    };
+    return null;
+}
+
 fn numberOf(v: std.json.Value) ?f64 {
     return switch (v) {
         .integer => |i| @floatFromInt(i),
@@ -267,6 +285,8 @@ pub const GenerationKeys = struct {
     max_tokens: []const []const u8 = &.{ "max_completion_tokens", "max_tokens" },
     /// Null where the surface has no stop field.
     stop: ?[]const u8 = "stop",
+    /// False where the surface's API has no `min_p`: a value there is refused rather than read.
+    min_p: bool = true,
 };
 
 fn fieldFault(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
@@ -288,11 +308,22 @@ const sampling_ranges = [_]NumberRange{
     .{ .key = "temperature", .min = 0, .max = 2 },
     .{ .key = "top_p", .min = 0, .max = 1 },
     .{ .key = "top_k", .min = 0, .max = 1000 },
+    .{ .key = "min_p", .min = 0, .max = 1 },
     .{ .key = "presence_penalty", .min = -2, .max = 2 },
     .{ .key = "frequency_penalty", .min = -2, .max = 2 },
     .{ .key = "repeat_penalty", .min = 0, .max = 10 },
     .{ .key = "repetition_penalty", .min = 0, .max = 10 },
     .{ .key = "think_penalty", .min = 0, .max = model_settings.think_penalty_max },
+};
+
+/// Samplers other servers run and this one does not: each is accepted only at the value that turns it off.
+const unsupported_samplers = [_]struct { key: []const u8, off: f64 }{
+    .{ .key = "typical_p", .off = 1 },
+    .{ .key = "tfs_z", .off = 1 },
+    .{ .key = "top_a", .off = 0 },
+    .{ .key = "mirostat", .off = 0 },
+    .{ .key = "dry_multiplier", .off = 0 },
+    .{ .key = "xtc_probability", .off = 0 },
 };
 
 /// `reasoning_budget_tokens` and Anthropic's `thinking.budget_tokens` are 32-bit integers; -1 is no cap.
@@ -316,17 +347,23 @@ pub const MAX_TOP_LOGPROBS: i64 = 20;
 
 /// The first bad value among the fields every generation surface reads the same way, as a message naming the
 /// field. A field that is absent or null is the default; a value of the wrong type or outside its range is
-/// refused, never clamped or read as absent. A `max_tokens` of 0 is the documented "rest of the window".
+/// refused, never clamped or read as absent. A `max_tokens` of 0 is an omission: the server fills the default.
 pub fn generationFieldFault(buf: []u8, root: std.json.ObjectMap, keys: GenerationKeys) ?[]const u8 {
     for (keys.max_tokens) |k| {
         const v = root.get(k) orelse continue;
         if (v == .null) continue;
         const n = wholeNumber(v) orelse return fieldFault(buf, "'{s}' must be an integer", .{k});
-        if (n < 0 or n > std.math.maxInt(u32)) return fieldFault(buf, "'{s}' must be an integer from 0 (the rest of the window) to {d}", .{ k, std.math.maxInt(u32) });
+        if (n < 0 or n > std.math.maxInt(u32)) return fieldFault(buf, "'{s}' must be an integer from 0 (the default) to {d}", .{ k, std.math.maxInt(u32) });
     }
+    if (!keys.min_p) if (root.get("min_p")) |v| if (v != .null) {
+        return "'min_p' is not a field of this API: send it to /v1/chat/completions, /v1/completions or /v1/responses";
+    };
     for (sampling_ranges) |r| {
         if (numberFault(buf, root, r.key, r.min, r.max)) |m| return m;
     }
+    for (unsupported_samplers) |u| if (root.get(u.key)) |v| if (v != .null and numberOf(v) != u.off) {
+        return fieldFault(buf, "'{s}' is not supported: this server samples with temperature, top_k, top_p and min_p only; omit it or send {d}", .{ u.key, u.off });
+    };
     if (root.get("top_logprobs")) |v| if (v != .null) {
         const n = wholeNumber(v) orelse return "'top_logprobs' must be an integer from 0 to 20";
         if (n < 0 or n > MAX_TOP_LOGPROBS) return "'top_logprobs' must be an integer from 0 to 20";
@@ -524,6 +561,21 @@ test "generationFieldFault names the field a bad value sits in" {
         .{ .body = "{\"kv_quant\":5}", .field = "kv_quant" },
         .{ .body = "{\"kv_quant\":\"5\"}", .field = "kv_quant" },
         .{ .body = "{\"kv_quant\":true}", .field = "kv_quant" },
+        .{ .body = "{\"min_p\":0,\"service_tier\":\"auto\"}", .field = null },
+        .{ .body = "{\"min_p\":1}", .field = null },
+        .{ .body = "{\"min_p\":0.05}", .field = null },
+        .{ .body = "{\"min_p\":-0.1}", .field = "min_p" },
+        .{ .body = "{\"min_p\":1.5}", .field = "min_p" },
+        .{ .body = "{\"min_p\":\"0.1\"}", .field = "min_p" },
+        .{ .body = "{\"typical_p\":1,\"tfs_z\":1.0,\"top_a\":0,\"mirostat\":0,\"dry_multiplier\":0,\"xtc_probability\":0.0}", .field = null },
+        .{ .body = "{\"typical_p\":null,\"mirostat\":null}", .field = null },
+        .{ .body = "{\"typical_p\":0.9}", .field = "typical_p" },
+        .{ .body = "{\"tfs_z\":0.95}", .field = "tfs_z" },
+        .{ .body = "{\"top_a\":0.1}", .field = "top_a" },
+        .{ .body = "{\"mirostat\":2}", .field = "mirostat" },
+        .{ .body = "{\"dry_multiplier\":0.8}", .field = "dry_multiplier" },
+        .{ .body = "{\"xtc_probability\":0.5}", .field = "xtc_probability" },
+        .{ .body = "{\"mirostat\":\"off\"}", .field = "mirostat" },
     };
     for (cases) |c| {
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
@@ -583,6 +635,57 @@ test "generationFieldFault reads each surface's own spelling" {
     try testing.expectEqual(@as(?[]const u8, null), generationFieldFault(&buf, parsed.value.object, .{ .max_tokens = &.{"max_tokens"}, .stop = null }));
     try testing.expect(std.mem.indexOf(u8, generationFieldFault(&buf, parsed.value.object, .{ .max_tokens = &.{"max_output_tokens"}, .stop = null }).?, "'max_output_tokens'") != null);
     try testing.expect(std.mem.indexOf(u8, generationFieldFault(&buf, parsed.value.object, .{ .max_tokens = &.{}, .stop = "stop_sequences" }).?, "'stop_sequences'") != null);
+}
+
+test "generationFieldFault: a sampler this server does not run is refused as unsupported, and min_p only where the surface has it" {
+    var buf: [256]u8 = undefined;
+    var off = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"xtc_probability\":0.5}", .{});
+    defer off.deinit();
+    try testing.expect(std.mem.indexOf(u8, generationFieldFault(&buf, off.value.object, .{}).?, "not supported") != null);
+    var min_p = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"min_p\":0.1}", .{});
+    defer min_p.deinit();
+    const messages: GenerationKeys = .{ .max_tokens = &.{"max_tokens"}, .stop = "stop_sequences", .min_p = false };
+    try testing.expect(std.mem.indexOf(u8, generationFieldFault(&buf, min_p.value.object, messages).?, "'min_p'") != null);
+    var none = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"min_p\":null}", .{});
+    defer none.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), generationFieldFault(&buf, none.value.object, messages));
+}
+
+test "completionsFieldFault refuses suffix and a best_of above 1 by name" {
+    const Case = struct { body: []const u8, field: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .body = "{}", .field = null },
+        .{ .body = "{\"suffix\":null,\"best_of\":1}", .field = null },
+        .{ .body = "{\"suffix\":\"\",\"best_of\":1.0}", .field = null },
+        .{ .body = "{\"suffix\":\"}\"}", .field = "suffix" },
+        .{ .body = "{\"suffix\":5}", .field = "suffix" },
+        .{ .body = "{\"best_of\":3}", .field = "best_of" },
+        .{ .body = "{\"best_of\":0}", .field = "best_of" },
+        .{ .body = "{\"best_of\":\"2\"}", .field = "best_of" },
+    };
+    for (cases) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        const got = completionsFieldFault(parsed.value.object);
+        if (c.field) |f| {
+            const quoted = try std.fmt.allocPrint(testing.allocator, "'{s}'", .{f});
+            defer testing.allocator.free(quoted);
+            try testing.expect(std.mem.indexOf(u8, got.?, quoted) != null);
+        } else try testing.expectEqual(@as(?[]const u8, null), got);
+    }
+}
+
+test "parseMinP: an omitted or null min_p is off" {
+    for ([_]struct { body: []const u8, want: f32 }{
+        .{ .body = "{}", .want = 0 },
+        .{ .body = "{\"min_p\":null}", .want = 0 },
+        .{ .body = "{\"min_p\":0.05}", .want = 0.05 },
+        .{ .body = "{\"min_p\":1}", .want = 1 },
+    }) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        try testing.expectEqual(c.want, parseMinP(parsed.value.object));
+    }
 }
 
 test "a request's max_completion_tokens supersedes its max_tokens" {

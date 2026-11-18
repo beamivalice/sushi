@@ -1,7 +1,6 @@
 //! Where a launch flag, a `model-settings.json` value and a default meet: an explicit flag outranks the file, which
 //! outranks the default. A flag the operator did not pass is null, never a value beside a "given" bit.
 const std = @import("std");
-const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_settings = @import("model_settings.zig");
 
 /// Where a load's value for one key came from. A request's own field outranks all of them.
@@ -28,8 +27,6 @@ pub fn sourceLabel(source: Source, flag_name: []const u8) []const u8 {
 
 /// The launch flags no load params carry: set once by `main` before the first load, null = not given.
 pub const Launch = struct {
-    mtp_acceptance: ?mtp_acceptance.Mode = null,
-    mtp_greedy_tail: ?bool = null,
     /// `--drafter` was given.
     drafter: bool = false,
 };
@@ -40,16 +37,6 @@ pub var launch: Launch = .{};
 /// (`ModelConfig.pinned_prefill_chunk`); without the flag 8192 is only the default.
 pub var prefill_chunk: Setting(usize) = .{ .value = 8192, .source = .default };
 
-/// THIS model's acceptance mode: the launch flag > its `mtp_acceptance` > exact.
-pub fn acceptanceFor(file: ?mtp_acceptance.Mode) Setting(mtp_acceptance.Mode) {
-    return resolve(mtp_acceptance.Mode, launch.mtp_acceptance, file, model_settings.default_mtp_acceptance);
-}
-
-/// THIS model's greedy tail: the launch flag > its `mtp_greedy_tail` > off.
-pub fn greedyTailFor(file: ?bool) Setting(bool) {
-    return resolve(bool, launch.mtp_greedy_tail, file, model_settings.default_mtp_greedy_tail);
-}
-
 const testing = std.testing;
 const model_mod = @import("model.zig");
 const model_load = @import("model_load.zig");
@@ -59,7 +46,6 @@ const http = @import("http.zig");
 const server_state = @import("server_state.zig");
 
 const KV = kv_quant.KVQuantConfig;
-const Mode = mtp_acceptance.Mode;
 
 fn expectSetting(comptime T: type, want_value: T, want_source: Source, got: Setting(T)) !void {
     try testing.expectEqualDeep(want_value, got.value);
@@ -118,40 +104,6 @@ test "settings precedence: ctx_size is flag > file > auto, and 0 is auto on both
         .{ .flag = 4096, .file = 8192, .want = 4096, .source = .flag },
     };
     for (rows) |r| try expectSetting(u32, r.want, r.source, model_settings.contextPick(r.flag, r.file));
-}
-
-test "settings precedence: mtp_acceptance is flag > file > exact" {
-    const saved = launch;
-    defer launch = saved;
-    const typical: Mode = .{ .typical = .{ .delta = 0.1 } };
-    const tokenv3: Mode = .{ .tokenv3 = 0.9 };
-    const rows = [_]struct { flag: ?Mode, file: ?Mode, want: Mode, source: Source }{
-        .{ .flag = null, .file = null, .want = .exact, .source = .default },
-        .{ .flag = null, .file = tokenv3, .want = tokenv3, .source = .model_settings },
-        .{ .flag = typical, .file = null, .want = typical, .source = .flag },
-        .{ .flag = typical, .file = tokenv3, .want = typical, .source = .flag },
-        .{ .flag = tokenv3, .file = typical, .want = tokenv3, .source = .flag },
-    };
-    for (rows) |r| {
-        launch = .{ .mtp_acceptance = r.flag };
-        try expectSetting(Mode, r.want, r.source, acceptanceFor(r.file));
-    }
-}
-
-test "settings precedence: mtp_greedy_tail is flag > file > off, and the flag only turns it on" {
-    const saved = launch;
-    defer launch = saved;
-    const rows = [_]struct { flag: ?bool, file: ?bool, want: bool, source: Source }{
-        .{ .flag = null, .file = null, .want = false, .source = .default },
-        .{ .flag = null, .file = true, .want = true, .source = .model_settings },
-        .{ .flag = null, .file = false, .want = false, .source = .model_settings },
-        .{ .flag = true, .file = null, .want = true, .source = .flag },
-        .{ .flag = true, .file = false, .want = true, .source = .flag },
-    };
-    for (rows) |r| {
-        launch = .{ .mtp_greedy_tail = r.flag };
-        try expectSetting(bool, r.want, r.source, greedyTailFor(r.file));
-    }
 }
 
 test "settings precedence: preserve_thinking and think_penalty are flag > file > default" {

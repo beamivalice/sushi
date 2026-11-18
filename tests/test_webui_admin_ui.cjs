@@ -20,13 +20,14 @@ const ORIGIN = 'http://sushi.test';
 const GiB = 2 ** 30;
 const KEYS = [
   { name: 'ctx_size', type: 'int', min: 1, max: 4294967295 }, { name: 'kv_quant', type: 'choice', choices: ['off', '4', '6', '8'] },
-  { name: 'mtp', type: 'bool' }, { name: 'mtp_acceptance', type: 'choice', choices: ['exact', 'typical', 'tokenv3'] }, { name: 'mtp_greedy_tail', type: 'bool' },
+  { name: 'mtp', type: 'bool' },
   { name: 'ssd_budget_gb', type: 'int', min: 1, max: 512 }, { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 },
   { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' }, { name: 'ds41_cooler', type: 'bool' }, { name: 'qwen_cooler', type: 'bool' },
   { name: 'max_tokens', type: 'int', min: 1, max: 4294967295 }, { name: 'yarn_factor', type: 'choice', choices: ['2', '4'] },
+  { name: 'expert_cache_bias', type: 'number', min: 0, max: 8 },
 ];
 const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
-const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'mtp_acceptance', 'mtp_greedy_tail', 'preserve_thinking', 'think_penalty', 'max_tokens'];
+const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'preserve_thinking', 'think_penalty', 'max_tokens'];
 const allKeys = (over = {}) => Object.fromEntries(KEYS.map((k) => [k.name, over[k.name] ?? keyState()]));
 
 // A stub server: its state lives here in node, every call is recorded, and a test can hold a response back.
@@ -64,8 +65,7 @@ function makeServer(opts = {}) {
   const settingsBody = () => ({ file: '/h/.sushi/model-settings.json', applies: 'next load of the model', model_keys: KEYS, server: state.server, gpu_limit: state.gpuLimit,
     models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, rope: m.rope ?? null, defaults: m.defaults ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
   if (opts.limits) {
-    state.models[0].limits = { ctx_size: { max: 131072, why: "This model's context window is 131072 tokens." }, kv_quant: { choices: ['off', '8'], why: '4-bit and 6-bit need a different cache layout.' },
-      mtp_acceptance: { requires: { mtp: true }, why: 'Used only while MTP is on.' }, mtp_greedy_tail: { requires: { mtp: true }, why: 'Used only while MTP is on.' } };
+    state.models[0].limits = { ctx_size: { max: 131072, why: "This model's context window is 131072 tokens." }, kv_quant: { choices: ['off', '8'], why: '4-bit and 6-bit need a different cache layout.' } };
     state.models[2].keys = ['ctx_size', 'mtp', 'ssd_budget_gb', 'ssd_prefetch', 'think_penalty', 'vision'];
     state.models[2].limits = { kv_quant: { disabled: true, why: 'This model keeps no KV cache to quantize.' }, preserve_thinking: { disabled: true, why: 'No preserve-thinking switch in this chat template.' },
       mtp: { unset: ['ssd_budget_gb'], why: 'An SSD budget makes this model stream its experts, and its MTP head cannot run while they stream.' } };
@@ -176,7 +176,7 @@ async function main() {
     for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
       // Every Default says what the server would use; a model with no known default keeps the bare word.
       const server = makeServer();
-      server.state.models[0].defaults = { kv_quant: '8', mtp: true, mtp_acceptance: 'exact', mtp_greedy_tail: false, preserve_thinking: true, think_penalty: 0, vision: false, max_tokens: 256000 };
+      server.state.models[0].defaults = { kv_quant: '8', mtp: true, preserve_thinking: true, think_penalty: 0, vision: false, max_tokens: 256000 };
       const { page, context, errors } = await open(browser, server, '/models#Qwen-A', { viewport, mode: 'advanced' });
       await page.waitForSelector(`${row('max_tokens')} input`);
       const first = (key) => page.evaluate((k) => { const r = document.querySelector(`.set[data-key="${k}"]`); const o = r.querySelector('select option'); return o ? o.textContent : r.querySelector('.tri button').textContent; }, key);
@@ -184,19 +184,17 @@ async function main() {
       assert.match(await page.textContent(`${row('max_tokens')} .lab`), /Max generated tokens/);
       assert.equal(await page.getAttribute(`${row('ctx_size')} input`, 'placeholder'), 'Default', 'a default measured at load is not guessed');
       assert.equal(await first('kv_quant'), 'Default (8-bit)', 'a choice shows its label');
-      assert.equal(await first('mtp_acceptance'), 'Default (Exact)');
       assert.equal(await first('mtp'), 'Default (On)', 'a switch shows On or Off');
-      assert.equal(await first('mtp_greedy_tail'), 'Default (Off)');
       assert.equal(await page.getAttribute(`${row('think_penalty')} input`, 'placeholder'), 'Default (0)');
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'no horizontal overflow');
       await page.evaluate(() => { window.__mutations = 0; window.__where = []; new MutationObserver((list) => { window.__mutations += list.length; for (const m of list) window.__where.push(`${m.type}:${m.attributeName ?? ''}:${m.target.nodeName}.${m.target.className}`); }).observe(document.querySelector('#modelsDetail .rows'), { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['placeholder'] }); });
       await settle(page, 16_000);
       assert.equal(await page.evaluate(() => window.__mutations), 0, `an unchanged poll writes nothing (${await page.evaluate(() => window.__where.slice(0, 5))})`);
-      server.state.models[0].defaults = { ...server.state.models[0].defaults, kv_quant: 'off', max_tokens: 0, mtp: false };
+      server.state.models[0].defaults = { ...server.state.models[0].defaults, kv_quant: 'off', max_tokens: 32768, mtp: false };
       await settle(page, 16_000);
       assert.equal(await first('kv_quant'), 'Default (16-bit)');
       assert.equal(await first('mtp'), 'Default (Off)');
-      assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default (rest of the context window)', 'no cap of its own means the window');
+      assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default (32,768)', 'no cap of its own means the engine default');
       await page.goto(`${ORIGIN}/models#GLM-B`);
       await page.waitForSelector(`${row('max_tokens')} input`);
       assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default', 'a model that is not loaded keeps the bare word');
@@ -586,13 +584,6 @@ async function main() {
       assert.equal(await page.isDisabled(four), true);
       assert.match(await page.textContent(four), /not for this model/);
       assert.match(await page.textContent(row('kv_quant')), /need a different cache layout/, 'the reason is on the row, not only in a tooltip');
-      assert.equal(await page.isDisabled(`${row('mtp_acceptance')} select`), false, 'MTP at its default leaves acceptance usable');
-      await page.click(`${row('mtp')} button:text-is("Off")`);
-      assert.equal(await page.isDisabled(`${row('mtp_acceptance')} select`), true, 'turning MTP off disables acceptance at once');
-      assert.match(await page.textContent(row('mtp_acceptance')), /Used only while MTP is on/);
-      assert.equal(await page.isDisabled(`${row('mtp_greedy_tail')} button:text-is("On")`), true);
-      await page.click(`${row('mtp')} button:text-is("On")`);
-      assert.equal(await page.isDisabled(`${row('mtp_acceptance')} select`), false);
       await page.click(`${row('mtp')} button:text-is("Off")`);
       await page.click('.savebar button:text-is("Save")');
       await settle(page, 1000);
@@ -606,7 +597,7 @@ async function main() {
       await page.waitForFunction(() => document.querySelector('.detail h2')?.textContent === 'Deep-C');
       assert.equal(await page.isDisabled(`${row('kv_quant')} select`), true, 'Advanced lists a key the model lacks, greyed');
       assert.match(await page.textContent(row('kv_quant')), /no KV cache to quantize/);
-      assert.equal(await page.locator(row('mtp_acceptance')).count(), 0, 'a key without a limits entry is not listed');
+      assert.equal(await page.locator(row('max_tokens')).count(), 0, 'a key without a limits entry is not listed');
       assert.equal(await page.isDisabled(`${row('mtp')} button:text-is("On")`), false);
       await page.fill(`${row('ssd_budget_gb')} input`, '8');
       assert.equal(await page.isDisabled(`${row('mtp')} button:text-is("On")`), true, 'an SSD budget switches MTP off at once');
@@ -752,30 +743,18 @@ async function main() {
       assert.match(await page.textContent('#cacheCard'), /Set at launch/);
       assert.doesNotMatch(await page.textContent('.set[data-key="prefix_cache_disk_gb"] .badges'), /Now|Next/, 'a pinned size has no timing badge');
     });
-    await scenario('a flag that pins MTP acceptance prints its own spelling', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
-      s.state.models[0].settings.mtp_acceptance = keyState({ flag: '--mtp-tokenv3 0.5', source: 'flag', locked: true });
+    await scenario('a value-only lock on a choice shows the choice it names', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.models[0].settings.kv_quant = keyState({ flag: '4', source: 'flag', locked: true });
     } }, async ({ page }) => {
-      await page.waitForSelector(row('mtp_acceptance'));
-      const text = await page.textContent(row('mtp_acceptance'));
-      assert.match(text, /--mtp-tokenv3 0\.5/);
-      assert.doesNotMatch(text, /--mtp-typical|\bset\b/);
-      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'TokenV3 (faster)');
-    });
-    await scenario('a value-only lock on MTP acceptance shows the choice it names', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
-      s.state.models[0].settings.mtp_acceptance = keyState({ flag: 'typical', source: 'flag', locked: true });
-    } }, async ({ page }) => {
-      await page.waitForSelector(row('mtp_acceptance'));
-      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'Typical (faster)');
-      assert.match(await page.textContent(row('mtp_acceptance')), /Set by a launch flag\./);
+      await page.waitForSelector(row('kv_quant'));
+      assert.equal(await page.$eval(`${row('kv_quant')} select`, (n) => n.selectedOptions[0].textContent), '4-bit');
+      assert.match(await page.textContent(row('kv_quant')), /Set by --kv-quant 4 at launch/);
     });
     await scenario('a flag the page cannot read shows Set at launch, never "set"', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
-      s.state.models[0].settings.mtp_acceptance = keyState({ flag: 'set', source: 'flag', locked: true });
-      s.state.models[0].settings.mtp_greedy_tail = keyState({ flag: '--mtp-greedy-tail', source: 'flag', locked: true });
+      s.state.models[0].settings.kv_quant = keyState({ flag: 'set', source: 'flag', locked: true });
     } }, async ({ page }) => {
-      await page.waitForSelector(row('mtp_acceptance'));
-      assert.equal(await page.$eval(`${row('mtp_acceptance')} select`, (n) => n.selectedOptions[0].textContent), 'Set at launch');
-      assert.doesNotMatch(await page.textContent(row('mtp_acceptance')), /--mtp-typical/);
-      assert.match(await page.textContent(row('mtp_greedy_tail')), /Set by --mtp-greedy-tail at launch/);
+      await page.waitForSelector(row('kv_quant'));
+      assert.equal(await page.$eval(`${row('kv_quant')} select`, (n) => n.selectedOptions[0].textContent), 'Set at launch');
     });
     await scenario('saving one server setting keeps the other one\'s draft', { path: '/settings' }, async ({ page }) => {
       await page.waitForSelector('#portNum');
@@ -1192,12 +1171,12 @@ async function main() {
         assert.equal(await page.evaluate(() => document.getElementById('tip').firstChild.textContent), rows[0].label.tip, 'keyboard focus opens the tooltip');
       });
     // A plain-worded setting or badge keeps its engineering name in the tooltip: the model-settings.json key and the launch flag.
-    const FLAGS = { ctx_size: '--ctx-size', kv_quant: '--kv-quant', mtp: '--mtp', mtp_acceptance: null, mtp_greedy_tail: '--mtp-greedy-tail', ssd_budget_gb: '--ssd-budget-gb', ssd_prefetch: '--ssd-prefetch',
-      preserve_thinking: '--preserve-thinking', think_penalty: '--think-penalty', vision: '--vision', ds41_cooler: '--ds41-mlx-engine', max_tokens: '--max-tokens', prefix_cache_disk_gb: '--prefix-cache-disk', models_dir: null, port: '--port',
+    const FLAGS = { ctx_size: '--ctx-size', kv_quant: '--kv-quant', mtp: '--mtp', ssd_budget_gb: '--ssd-budget-gb', ssd_prefetch: '--ssd-prefetch',
+      preserve_thinking: '--preserve-thinking', think_penalty: '--think-penalty', vision: '--vision', ds41_cooler: '--ds41-mlx-engine', expert_cache_bias: '--expert-cache-bias', max_tokens: '--max-tokens', prefix_cache_disk_gb: '--prefix-cache-disk', models_dir: null, port: '--port',
       update_check: '--no-update-check', pack_update_check: '--no-update-check', skip_mem_preflight: '--skip-mem-preflight' };
-    const WORDS = { ssd_budget_gb: /expert/, ssd_prefetch: /prefetch/ };
+    const WORDS = { ssd_budget_gb: /expert/, ssd_prefetch: /prefetch/, expert_cache_bias: /expert cache bias/ };
     // A label that is already the common term keeps only the key and flag in its technical name.
-    const KEY_ONLY = { kv_quant: 'kv_quant (--kv-quant)', mtp: 'mtp (--mtp)', mtp_acceptance: 'mtp_acceptance', vision: 'vision (--vision)' };
+    const KEY_ONLY = { kv_quant: 'kv_quant (--kv-quant)', mtp: 'mtp (--mtp)', vision: 'vision (--vision)' };
     const BADGE_TERMS = { Saved: /model-settings\.json/, 'Set at launch': /launch flag/, Now: /live/, 'Next load': /model load/, 'Next start': /server start/ };
     const termsOf = (page) => page.$$eval('.set', (rows) => rows.filter((r) => r.offsetParent || r.closest('details')).map((r) => ({ key: r.dataset.key, term: r.querySelector('.lab [data-tip]')?.dataset.term ?? '',
       badges: [...r.querySelectorAll('.badges .badge')].map((b) => [b.textContent, b.dataset.term ?? '']) })));
@@ -1234,9 +1213,7 @@ async function main() {
         if (path === '/settings') assert.equal(await page.textContent('#cacheCard .card-h'), 'Prompt cache (SSD)');
         else {
           const labels = await page.$$eval('.set', (rows) => Object.fromEntries(rows.map((r) => [r.dataset.key, r.querySelector('.lab [data-tip]')?.textContent])));
-          assert.deepEqual([labels.kv_quant, labels.mtp, labels.mtp_acceptance, labels.vision], ['KV cache precision', 'Speculative decoding', 'Draft acceptance', 'Vision (image input)']);
-          const options = await page.$eval(`${row('mtp_acceptance')} select`, (n) => [...n.options].map((o) => o.textContent).join('|'));
-          assert.equal(options, 'Default|Exact (same output)|Typical (faster)|TokenV3 (faster)', options);
+          assert.deepEqual([labels.kv_quant, labels.mtp, labels.vision], ['KV cache precision', 'Speculative decoding', 'Vision (image input)']);
           assert.ok((await page.$$eval('.sect h3', (ns) => ns.map((n) => n.textContent))).includes('Prompt cache'), 'the model page names its cache section');
         }
         const words = await page.evaluate(() => [...document.querySelectorAll('body *:not(script):not(style)')].flatMap((n) => [...n.childNodes].filter((c) => c.nodeType === 3).map((c) => c.textContent)
@@ -1402,6 +1379,28 @@ async function main() {
       assert.equal(await page.locator('#toastHost .toast').count(), 0, 'the row already says it');
       await page.fill('#portNum', '81');
       assert.equal(await page.textContent('.set[data-key="port"] .bad'), '', 'typing clears the refusal');
+    });
+    await scenario('DeepSeek\'s Faster SSD streaming (not exact) saves a number from 0 to 8, refuses one past 8, and its launch flag locks it', { path: '/models#Deep-C', open: { mode: 'advanced' },
+      setup: (s) => { s.state.models[2].keys = [...BASE_KEYS, 'ssd_budget_gb', 'expert_cache_bias']; s.state.models[2].defaults = { ...s.state.models[2].defaults, expert_cache_bias: 0 }; } }, async ({ page, server }) => {
+      const box = `${row('expert_cache_bias')} input`;
+      await page.waitForSelector(box);
+      assert.match(await page.textContent(`${row('expert_cache_bias')} .lab`), /Faster SSD streaming \(not exact\)/);
+      assert.match(await page.textContent(`${row('expert_cache_bias')}`), /Lower quality for speed/);
+      assert.equal(await page.getAttribute(box, 'placeholder'), 'Default (0)');
+      await page.fill(box, '9');
+      assert.match(await page.textContent(`${row('expert_cache_bias')} .bad`), /from 0 to 8/);
+      await page.fill(box, '0.2');
+      assert.equal(await page.textContent(`${row('expert_cache_bias')} .bad`), '');
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForSelector('.toast');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'Deep-C', set: { expert_cache_bias: 0.2 } });
+    });
+    await scenario('--expert-cache-bias at launch locks Faster SSD streaming (not exact) and names the flag', { path: '/models#Deep-C', open: { mode: 'advanced' },
+      setup: (s) => { s.state.models[2].keys = [...BASE_KEYS, 'expert_cache_bias']; s.state.models[2].settings = allKeys({ expert_cache_bias: keyState({ flag: '0.3', source: 'flag', locked: true }) }); } }, async ({ page }) => {
+      const box = `${row('expert_cache_bias')} input`;
+      await page.waitForSelector(box);
+      assert.equal(await page.isDisabled(box), true);
+      assert.match(await page.textContent(row('expert_cache_bias')), /--expert-cache-bias 0\.3/);
     });
     await scenario('a refused model setting names a label, not a key, and raises no toast', { serverOpts: { limits: true }, path: '/models#Qwen-A', open: { mode: 'advanced' } }, async ({ page }) => {
       await page.waitForSelector(`${row('think_penalty')} input`);

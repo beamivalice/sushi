@@ -63,11 +63,7 @@ pub fn forwardGlm5WithImpl(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m
         _ = mlx.mlx_array_free(h);
     };
     if (ctx.vision_embeddings) |media| {
-        const h = try mdl.rawEmbedding(ids);
-        embedded = self.spliceVisionEmbeddings(h, ids, media, self.config.image_token_id, self.config.video_token_id, ctx.vision_splice_offset) catch |err| {
-            _ = mlx.mlx_array_free(h);
-            return err;
-        };
+        embedded = try self.spliceVisionEmbeddings(try mdl.rawEmbedding(ids), ids, media, self.config.image_token_id, self.config.video_token_id, ctx.vision_splice_offset);
     }
     if (self.expert_stream) |engine| engine.beginForward();
     const logits = try mdl.forwardLastWithEmbedding(request, ids, true, embedded);

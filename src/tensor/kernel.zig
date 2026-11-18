@@ -430,6 +430,22 @@ pub var refused_threads: usize = 0;
 
 /// Runs `def` on `inputs` into fresh tensors written to `outputs` (one per output of `cfg`), which the caller owns.
 pub fn launch(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor) LaunchError!void {
+    return launchWith(def, inputs, cfg, outputs, null, false);
+}
+
+/// `launch`, its one output written over `into` (row-contiguous, of the output's shape and dtype): the elements the
+/// kernel does not write keep what `into` holds. `outputs[0]` shares its bytes. The caller promises the kernel writes
+/// none of the elements a pending write to `into` does, so it runs beside them (`core.bindOutDisjoint`).
+pub fn launchInto(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor, into: ?*Tensor) LaunchError!void {
+    return launchWith(def, inputs, cfg, outputs, into, into != null);
+}
+
+/// `launchInto` of a fresh output the later launches write into: bound as theirs are, it runs beside them.
+pub fn launchDisjoint(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor) LaunchError!void {
+    return launchWith(def, inputs, cfg, outputs, null, true);
+}
+
+fn launchWith(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor, into: ?*Tensor, disjoint: bool) LaunchError!void {
     if (inputs.len != def.inputs.len or cfg.n_out != def.outputs.len or outputs.len != cfg.n_out) return error.TensorShape;
 
     // A kernel that asks for row-contiguous inputs gets a copy of each input that is not.
@@ -463,7 +479,12 @@ pub fn launch(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tens
     var made: usize = 0;
     errdefer for (outputs[0..made]) |t| core.release(t);
     for (0..cfg.n_out) |i| {
-        outputs[i] = try core.fresh(cfg.out_dtypes[i], cfg.out_shapes[i][0..cfg.out_ndims[i]]);
+        outputs[i] = if (into) |t| blk: {
+            const shape = cfg.out_shapes[i][0..cfg.out_ndims[i]];
+            if (cfg.n_out != 1 or t.dtype != cfg.out_dtypes[i] or t.ndim != shape.len or !t.rowContiguous()) return error.TensorShape;
+            for (t.shape[0..t.ndim], shape) |a, b| if (a != b) return error.TensorShape;
+            break :blk try core.share(t);
+        } else try core.fresh(cfg.out_dtypes[i], cfg.out_shapes[i][0..cfg.out_ndims[i]]);
         made += 1;
     }
 
@@ -490,7 +511,7 @@ pub fn launch(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tens
         }
     }
     for (outputs) |out| {
-        core.bindOut(p, out, index);
+        if (disjoint) core.bindOutDisjoint(p, out, index) else core.bindOut(p, out, index);
         index += 1;
     }
     const grid: metal.Size = .{ .x = @intCast(cfg.grid[0]), .y = @intCast(cfg.grid[1]), .z = @intCast(cfg.grid[2]) };
@@ -645,4 +666,38 @@ test "kernel: a launch with more template arguments than a kernel remembers buil
         try testing.expectEqual([4]f32{ 1 + want, 2 + want, 3 + want, 4 + want }, try run(def, x, &cfg));
     }
     try testing.expectEqual(before + 2, key_builds);
+}
+
+test "kernel: launches into one tensor over disjoint ranges run with no barrier between, and a reader after sees them all" {
+    try mlx.requireGpu();
+    const n: c_int = 1024;
+    const part = try Def.create("kn_into_part", &.{ "x", "r" }, &.{"out"}, "uint i = thread_position_in_grid.x; if (i >= uint(r[0]) && i < uint(r[1])) out[i] = x[i];", "", true, false);
+    const twice = try Def.create("kn_into_twice", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 2.0f;", "", true, false);
+    var vals: [1024]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
+    const x = try floats(&vals);
+    defer core.release(x);
+    var cfg: Config = .{};
+    try cfg.addOutput(&.{n}, .float32);
+    cfg.grid = .{ n, 1, 1 };
+    cfg.group = .{ 256, 1, 1 };
+    var ranges: [4]*Tensor = undefined;
+    for (&ranges, 0..) |*r, k| r.* = try ints(&.{ @intCast(k * 256), @intCast(k * 256 + 256) });
+    defer for (ranges) |r| core.release(r);
+    var plane: [1]*Tensor = undefined;
+    const barriers = core.stats().barriers;
+    try launchDisjoint(part, &.{ x, ranges[0] }, &cfg, &plane);
+    for (ranges[1..]) |r| {
+        var next: [1]*Tensor = undefined;
+        try launchInto(part, &.{ x, r }, &cfg, &next, plane[0]);
+        core.release(plane[0]);
+        plane[0] = next[0];
+    }
+    defer core.release(plane[0]);
+    try testing.expectEqual(barriers, core.stats().barriers);
+    var out: [1]*Tensor = undefined;
+    try launch(twice, &.{plane[0]}, &cfg, &out);
+    defer core.release(out[0]);
+    const got = std.mem.bytesAsSlice(f32, try core.hostBytes(out[0]));
+    for (got[0..1024], 0..) |v, i| try testing.expectEqual(@as(f32, @floatFromInt(2 * i)), v);
 }

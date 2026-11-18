@@ -37,6 +37,11 @@ fn launchOpts(wide: bool) linear.Opts {
     return .{ .rows = .{ .exact = true, .wide = wide }, .decoded_billed = true };
 }
 
+/// Whether `matmul` of `rows` rows runs the sorted GEMM, which holds its prepared rows and an f16 plane beside its output.
+pub fn gemmRows(rows: u64, wide: bool) bool {
+    return rows > @as(u64, @intCast(project_rows.rowsMax(launchOpts(wide).rows)));
+}
+
 /// `x` `[..., in]` through the bank, in x's dtype, each row rounding as it does alone; `wide` marks a spec verify.
 pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode, wide: bool) !mlx.mlx_array {
     const sh = mlx.getShape(x);

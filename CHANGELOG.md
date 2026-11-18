@@ -4,218 +4,38 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.7.0 — Sushi Cooler by default, faster DeepSeek, a lighter prompt cache
 
-- **`--expert-cache-bias <n>` (lossy, DeepSeek-V4.1, off by default)** scores an expert the layer's cache lacks n lower
-  at decode widths, so a streamed load reads fewer experts from SSD; unlike `--expert-pick-tolerance` it keeps the
-  routed chain queued ahead of the host.
-- **Qwen3.8 runs on Sushi Cooler, the engine of our own, by default**: its STQ packs and its BF16 checkpoint. Pass
-  `--qwen-mlx-engine`, or clear the web UI's `qwen_cooler` checkbox, to keep it on MLX; the load line names the side.
-- **A Qwen3.8 load on Sushi Cooler runs its vision tower there too**, so images no longer need `--no-vision` or MLX; an
-  image or video encode there runs inside its memory bill and is refused by name, never a Metal out-of-memory.
-- **Sushi Cooler runs Qwen3.8's elementwise chains as one kernel each and waits on the GPU only where MLX does**, with
-  the same tokens and less CPU time per token.
-- **A Sushi Cooler prefill chunk holds about what it was admitted under**: buffers a chunk frees return to the pool
-  within it, and the engine keeps no more free buffers than MLX's cache may, so a wide chunk no longer runs a 32 GB
-  Mac out of memory.
-- **A prompt longer than one prefill chunk reserves its KV cache once**, instead of regrowing it at every chunk.
-- **DeepSeek-V4.1 on Sushi Cooler counts its parked decode pool once**, so it no longer admits a narrower prefill
-  chunk, or refuses a request, that fits.
-- **A Qwen3.8 load on Sushi Cooler decodes concurrent requests as joined rows**, as on MLX, instead of one at a time.
-- **Qwen3.8's BF16 checkpoint runs on Sushi Cooler**, its streamed experts through the engine's dense expert gather.
-- **A Sushi Cooler load compiles nothing inside a request after its first on a machine**: what a request had to compile
-  is kept with the warm's in the pack's pipeline manifest, and the next load makes it ahead and skips the warm.
-- **A Sushi Cooler load whose warm-up fails no longer serves**: the load fails by name instead of the first request
-  paying the failure.
-- **DeepSeek-V4.1-Flash's own release checkpoint (FP8 trunk, MXFP4 experts) now runs on Sushi Cooler too**, with
-  the tokens MLX gives and at MLX's speed, so every DeepSeek pack decodes on the engine of our own at its load;
-  `--ds41-mlx-engine` keeps MLX until 1.8.0.
-- **`--ds41-mlx-engine` no longer stops a model of another architecture from loading**: it keeps DeepSeek-V4.1 loads on
-  MLX, and any other model loads as it would, its load log saying the flag has no effect on it.
-- **A one-prompt run without `--serve` now refuses what a served load refuses**: a launch flag or context size the model
-  cannot take, by name, before any weight is read; and a model of no served architecture is refused as that, whatever
-  flags it was given.
-- **DeepSeek-V4.1 STQ decodes and prefills on Sushi Cooler on an M1 to M4 as well**: the engine takes the SIMD arms where
-  there are no matrix units, MLX stays one flag away (`--ds41-mlx-engine`), and the vision tower's quantized and attention
-  tiles follow the GPU's. Proven as an M1 Max on an M5; no real M1 to M4 run is recorded yet.
-- **A sampled DeepSeek-V4.1 draw on Sushi Cooler steps down to a smaller threadgroup where the GPU grants fewer threads
-  than the kernel asks**, with the same draw as the rule's at every size.
-- **A strict JSON schema is enforced as written, or refused with a 400 naming why**: an `enum` or object of any size,
-  a `required` key outside `properties`, `items: false`, a `false` property and an `additionalProperties` schema are now
-  enforced; `minLength`/`maxLength` count characters, and a key or enum string written with `\u` escapes matches its
-  value. A schema no value can meet, a count past 4294967295 or an unresolved `$ref` is a 400 under `strict` instead of
-  a silently different grammar.
-- **A failed image encode no longer fails the request after it**: an encode that MLX or Sushi Cooler refused takes the
-  error it raised, so the next request starts clean, and a refusal for memory answers the 503 a forward gets instead
-  of a 500 `vision encoding failed`. A failed encode logs that it failed instead of `encoded N of N`.
-- **DeepSeek-V4.1 on Sushi Cooler serves many large images followed by a small one, as the MLX route does**: the
-  encode runs under its bill on the engine from the first image to the join of the spans, which failed 500 before.
-- **The DeepSeek-V4.1 tower's warm on Sushi Cooler makes the attention pipeline of an image of more than 8,192
-  patches**: such an image no longer compiles a pipeline inside its request; the load warms two more patch counts.
-- **A reply says the same thing on every API surface**: `/v1/responses` keeps the text a model wrote before its tool
-  calls and reports its prefix reuse and timings when streamed, `/v1/messages` now ships a call the model wrote inside
-  a thought it never closed, as the other surfaces do, a stop sequence that cuts a call open no longer ships it as a
-  finished call, and a stream with no tools cuts stray tool markup and a content part's leading space as the
-  non-stream reply does.
-- **A tool call's parameter text can no longer change the call**: Qwen, MiMo, GLM and DeepSeek read the call in their own
-  template's dialect first, and a value that holds another family's call or a close tag of its own comes back byte for byte.
-- **Tool arguments keep the model's spelling**: a Qwen string argument such as `3.10`, `1.0` or `null` arrives as
-  that string, a number keeps its digits (`0.50`, a 20-digit id), and a request's numbers and object `arguments` in
-  chat history reach the template unchanged.
-- **A pack's `chat_template.jinja` outranks the template copied into its tokenizer_config.json**, as transformers loads
-  it, so an edited template file is the one that is served.
-- **GLM `tool_choice` `required` or a named function is now enforced as it is on Qwen**: the call opener and a declared
-  function name are committed while decoding instead of only asked for in the prompt, and a reasoning budget or a loop
-  that closes a thought writes the separator the model's own template writes before an answer.
-- **A reasoning budget never cuts a thought inside a character**: a thought trimmed to its token budget after the fact
-  no longer ends in a replacement character.
-- **A character cut off at the end of a text no longer crashes tokenization**: a lead byte whose continuation bytes
-  are missing reads as one byte instead of reaching undefined behaviour.
-- **A reply never writes a token its template prints only between turns**: Qwen and MiMo `<|im_start|>`, GLM
-  `<|system|>`, `[gMASK]` and `<sop>`, and DeepSeek `<｜User｜>` and `<｜Assistant｜>` can no longer be sampled, and their
-  text in an earlier assistant turn is text.
-- **GLM no longer reads a client's `/nothink` as its token, and a load names what it ignores**: that text, and any
-  other added token's text, in a user, system or tool message is plain text on every model, and a pack load logs the
-  tokenizer.json parts the engine does not apply.
-- **A tool with no `description` or `parameters` reaches the prompt as sent**: the empty defaults are added only for
-  a template that reads those keys, so Qwen3.8 and GLM-5.3 prompts match transformers byte for byte.
-- **Qwen3.8 reads decomposed text as transformers does**: text a client sends in NFD (an `e` plus a combining accent,
-  Hangul jamo) is composed by the pack's NFC normalizer before it is encoded; a reply keeps its own bytes.
-- **One conversation is the same prompt on every API surface**: chat, `/v1/messages` and `/v1/responses` join text
-  and reasoning parts alike, drop an empty message alike and keep a number's spelling in tool arguments and schemas;
-  chat reads its `tools` from the body's own field (a message that said "tools" could hide them), an Anthropic tools
-  list with a stray non-object entry no longer breaks the prompt, and a Responses chain with `text.format` no longer
-  repeats its JSON instruction each turn.
-- **The dashboard shows expert streaming**: for a model that streams its experts from the SSD, a new card shows how many
-  routed experts were already in memory, the SSD read rate and the time spent waiting on it, and `/metrics` carries the
-  same counters.
-- **Chat requests and pack loads are sturdier**: an OpenAI `function`-role message is read as a tool result on every
-  model, a pack whose tokenizer files are malformed fails to load with a line that names the key instead of taking
-  the server down, and text a client sends is never read as a special token or cut out of a continued reply.
-- **DeepSeek-V4.1-Flash decodes about 3% faster on Sushi Cooler, serial and speculative**: seven small steps of each
-  layer now ride the kernels beside them, so a token issues about 80 fewer GPU dispatches for the same output.
-- **A sampled DeepSeek token is drawn by one GPU kernel on Sushi Cooler**: temperature, top-k, top-p and the draw
-  took up to 101 GPU dispatches a round and now take two. A seed still gives one text on every repeat, streamed or
-  not, but not the text an earlier version gave for that seed.
-- **DeepSeek on Sushi Cooler no longer slips a random token into sampled text**: with neither top-p nor top-k set,
-  about one token in 130 was drawn from the whole vocabulary whatever its probability (1.6.1-dev2 and 1.7.0-dev1),
-  which broke tool calls in agent sessions. A seed's text changes once more with the fix.
-- **A DeepSeek agent turn no longer prefills the previous reply again**: the next request starts from the state
-  behind the reply it just generated, tool call included, and prefills only the tool results and what else is new.
-- **A DeepSeek model that another model's load evicts keeps its conversation state**: the restore points not yet on
-  SSD are written there first, as an unload already did, and a point the SSD cache dropped is written again.
-- **A turn that stops because its tool call could not be read says so in the server log**: the reply still goes out
-  with the broken markup removed, and a `[tool-parse]` line now records what was cut.
-- **DeepSeek reads parallel tool results in the order it made the calls**: results a client returns in another order,
-  and a tool call with no arguments, now reach the model exactly as DeepSeek's own encoder writes them.
-- **Parallel tool calls replayed through `/v1/responses` are one assistant turn on every model**: without a reasoning
-  item before them each call used to open a turn of its own, a prompt no model was trained on and no cache could reuse.
-- **The server log says how busy each DeepSeek request kept the GPU on Sushi Cooler**: one `[engine]` line a request
-  with the GPU's busy and idle time as Metal timed them, and model-discovery `skip` lines no longer run together.
-- **Settings opens with a copyable GPU wired-limit command**: the `sudo sysctl iogpu.wired_limit_mb=…` line sets all
-  three wire limits from one adjustable, savable box that defaults to the Mac's memory less 4 GB.
-- **The test builds no longer link a C++ chat-template library**: the jinja.cpp copy under `lib/jinja_cpp/` is gone; the
-  tests hold the Zig template engine to Python's Jinja2, and the three names only jinja.cpp served to its pinned renders.
-- **An agent turn tokenizes only the text it has not seen before**: each loaded model keeps the token ids of the
-  prompt pieces it encoded, bounded in memory and reported on `/metrics`, so a long conversation's next turn no longer
-  re-encodes its whole history.
-- **Qwen with MTP on a Mac without matrix units gives the same text as without MTP on an STQ pack**: a round there
-  verifies at most eight rows, where every row keeps its serial step's bits.
-- **Special-token text in an assistant turn is a token only where the model could have written it**: a stop such as
-  `<|im_end|>`, or a special the sampler never draws, spelled out in an earlier reply now reaches the model as text, as
-  in every other role; a function name a client forces is text too; a U+FDD0 a client sends now stays in the prompt,
-  and a Qwen user turn written as a tool response is read as one, as transformers reads it.
-- **A tool declared without a description keeps its schema's numbers as sent**: a whole float such as `1.0`, `1e5`
-  or `-0.0` in its parameters no longer reaches the prompt as an integer, and a tool list with a repeated key gets its
-  missing description and parameters filled like any other.
-- **A chat template that does not parse now fails the model's load**: the log names its line and column
-  (`[load] chat template:`) instead of every request failing its render.
-- **DeepSeek-V4.1-Flash answers a cached chat turn sooner**: the turn's last step is two tokens instead of
-  thirty-one, about 120 ms less before the first token. A prompt that changes only the last words of its final
-  message no longer restores from the previous prompt's end.
-- **DeepSeek-V4.1-Flash prefills faster on Sushi Cooler**: the hyper-connection mixes of a prompt run on the GPU's
-  matrix units. Output moves at rounding level, so the SSD prefix cache starts a new namespace.
-- **DeepSeek-V4.1-Flash's prefill attention does less work for the same output**: the kernel reads each block of
-  keys once for both of its products.
-- **DeepSeek-V4.1-Flash prefills long prompts faster on Sushi Cooler**: an expert streamed back from the SSD no
-  longer re-reads its small scale vectors while the GPU waits, so long prompts on a budget below the whole pack
-  process sooner with the same output; the SSD budget sets 0.7 GB aside for them.
-- **DeepSeek-V4.1-Flash reads a fresh prompt's Engram rows sooner**: the SSD is asked at a deeper queue, so the first
-  chunk of a new prompt waits about a quarter less on them.
-- **DeepSeek-V4.1-Flash drafts cost less**: each drafted token reads its bigram table once, in the form the pack
-  stores it, so speculative rounds on code and prose finish sooner with the same text, and the load holds 66 MB less.
-- **Chat templates render in sushi's own engine**: numbers in a tool schema or a tool call replayed from history now
-  reach the prompt as Python's chat templates write them, every digit and a float's `.0` kept (`1.0` no longer `1`).
-- **Long conversations start answering sooner**: building the prompt of a 400-turn tool-calling conversation takes
-  2 to 4 ms where it took 0.1 to 0.6 s, on every served model.
-- **A chat template that leans on a jinja.cpp leniency Python's Jinja2 refuses now fails by name**: a list or dict
-  mutator other than `append`, or `|length` of a `map` result, fails the render with today's handling of a failed render.
-- **DeepSeek-V4.1-Flash STQ prefill runs on Sushi Cooler on M5 Macs**: long prompts are processed on sushi's own Metal
-  engine beside generation, with the same answers; `--ds41-mlx-engine` and the "Use Sushi's Cooler Engine instead of
-  MLX" setting move prefill back to MLX with the rest.
-- **DeepSeek-V4.1-Flash on Sushi Cooler reports the engine's memory**: the memory figures in `/props` and the dashboard,
-  and the admission checks, now count the bytes sushi's own engine holds beside MLX's.
-- **DeepSeek-V4.1-Flash reads images on Sushi Cooler**: on an M5 Mac the image encoder and the model's pass over the
-  image's rows run on sushi's own engine with the same result they had on MLX, so an image request no longer sends that
-  work to MLX, and a repeat start keeps the encoder's kernel recipes beside the model's.
-- **DeepSeek-V4.1-Flash on Sushi Cooler does less host work per token**: the engine holds the model's weights and
-  streamed experts as its own buffers, finds a kernel it has already used without rebuilding its key and sets up a
-  kernel launch without calling MLX, so the CPU has less to do between GPU passes. Long prompts are read faster, a
-  start of the model is faster, and the prefix cache's restore points are taken, saved to SSD and read back by the
-  engine. A load there, its requests and its unload now run without a call into MLX, and an idle server keeps only
-  the engine's GPU queue awake.
-- **DeepSeek-V4.1-Flash sampled answers draw on Sushi Cooler without MLX**: a seed now gives a different text on Sushi
-  Cooler than on MLX, and the same text on every repeat, streamed or not, the first token included; the sampler,
-  penalties, logit bias, grammar masks and logprobs of a token no longer run on MLX there.
-- **DeepSeek-V4.1-Flash greedy answers no longer depend on how tokens were drafted**: at long context a rare rounding
-  difference between a single-token step and a drafted round could change a greedy answer; a token now gets the same
-  result either way, so a request that asks for logprobs gives the text one without them gives.
-- **DeepSeek-V4.1-Flash echoes and edits of text already in the conversation decode faster on M5 Macs**: when the
-  answer repeats a long stretch of the prompt or of earlier output, a round now checks up to 16 copied tokens at once
-  where it checked 8, with the same text.
-- **`sushi bench` rejects a row the engine compiled a kernel in**: such a request's time holds a compile, so it is
-  listed under Warnings like a missed restore; a Sushi Cooler load whose kernel warm fails now stops with the error
-  instead of serving.
-- **DeepSeek-V4.1-Flash answers no longer depend on `--prefill-chunk`**: a rounding difference in expert routing
-  between chunk sizes could change an answer at a near-tie; a prompt now routes the same at every chunk size.
-- **DeepSeek-V4.1-Flash no longer fails a request on its image token**: a text prompt that holds the image
-  placeholder, or a reply in which the model writes it, is read as ordinary text when no image stands behind it.
-- **DeepSeek-V4.1-Flash STQ loads skip the engine's warm-up on a repeat start**: the first load of a pack on a build
-  keeps the engine's kernel recipes in `~/.sushi/cache/pipelines`, and the next load makes its kernels from them instead
-  of running the engine's warm forwards.
-- **DeepSeek-V4.1-Flash can go back to MLX**: DeepSeek generates on Sushi Cooler, sushi's own engine, by default on M5
-  Macs; start with `--ds41-mlx-engine`, or untick "Use Sushi's Cooler Engine instead of MLX" under DeepSeek 4.1
-  Inference on the model's settings, to generate on MLX again, and please report a problem at
-  <https://github.com/beamivalice/sushi/issues/new>.
-- **`sushi bench` reports energy per token**: beside tok/s, every prefill and decode cell now carries the CPU
-  millijoules, CPU milliseconds and instructions the process spent per token, and the GPU's millijoules per token as a
-  record beside its mean clock; a Mac without the system library behind the GPU reading still benches and says so.
-- **DeepSeek-V4.1-Flash STQ loads faster on M5 Macs**: the load no longer warms kernels that generation does not use,
-  and a short follow-up turn generates on the same engine as the rest of decode.
-- **DeepSeek-V4.1-Flash STQ generates on sushi's own Metal engine on M5 Macs**: token generation for the STQ packs no
-  longer runs through MLX there. It gives the same tokens with about a third less CPU while generating; every other
-  model is unchanged. It is the first step of moving the engine off MLX.
-- **Prefill with the SSD prompt cache is back to full speed**: saving a long prompt to the SSD cache no longer stalls
-  the next prefill chunk, which had cost 1.6.0 up to about 5% of prefill speed on Qwen3.8-Flash-Next.
-- **Follow-up turns restore from the SSD prompt cache faster**: a restore reads the cache in parallel again, as 1.5.1
-  did, instead of taking about twice as long as in 1.6.0.
-- **Less CPU while saving to the SSD prompt cache**: the checksums of saved blocks are computed about 25 times
-  faster, which takes about 6% off the server's CPU over a full benchmark run. Existing caches stay valid.
-- **Less CPU for the same work**: the server spends about 20% less CPU over a full benchmark run on
-  Qwen3.8-Flash-Next, decodes about 5% faster and prefills about 2% faster, with the same output.
-- **Less CPU while DeepSeek-V4.1-Flash prefills prose**: a long prose prompt takes less than half the system CPU it did,
-  with the same output and no slower prefill.
-- **The peak memory figure is never below the memory in use**: right after a reset, `/props`, `sushi kld` and the
-  load log read MLX's peak as at least what MLX holds, where it read nothing until MLX next allocated.
-- **A prompt-cache entry on the SSD survives a restore refused for memory**: on Qwen3.8-Flash-Next, GLM-5.3-Flash and
-  MiMo, a restore that ran out of room no longer deletes a valid entry; the next request restores it.
-- **A replayed tool call that repeats an argument key keeps its arguments**: the chat template reads the key's last
-  value, as Python's `json.loads` does, where the call reached the prompt with no arguments at all.
-- **DeepSeek-V4.1-Flash reuses a short prompt sent again**: a prompt under 512 tokens repeated on the same slot rolls
-  back to the state the last request left, where it prefilled from the start.
-- **A seeded DeepSeek-V4.1-Flash request keeps the adaptive draft rounds**: on Sushi Cooler a request with a `seed`
-  and a temperature takes the same draft rounds as an unseeded one, where it verified at one fixed width, and the
-  seed still gives the same text every time, streamed or not.
+- **Qwen3.8 and DeepSeek-V4.1 run on Sushi Cooler, sushi's own Metal engine, by default**: every Qwen3.8 STQ pack and
+  its BF16 checkpoint, and every DeepSeek-V4.1-Flash pack including its own release checkpoint, prefill, decode, batch
+  concurrent requests and read images on it, on M1 through M5 Macs, with the tokens MLX gives. A repeat start skips the
+  engine's warm-up, and nothing compiles mid-request. `--qwen-mlx-engine`, `--ds41-mlx-engine` or the model's Cooler
+  checkbox keeps a model on MLX.
+- **DeepSeek-V4.1-Flash is faster and steadier**: about 3% faster decode, faster long-prompt prefill, about a third less
+  CPU while generating, cached turns that answer about 120 ms sooner, and agent turns that no longer re-read their
+  previous reply. Sampled replies no longer slip in a random token (1.6.1-dev2 and 1.7.0-dev1), and greedy answers no
+  longer depend on drafting or chunk size. On a Mac that streams its experts from the SSD, a new opt-in setting, "Faster
+  SSD streaming (not exact)" in the web UI or `--expert-cache-bias`, trades a little answer quality for speed: the
+  router favours an expert already in memory over a slightly better one it would read from the SSD (about 2x faster
+  decode at 0.2 on a 64 GB Mac, about 30% at 0.5 on a 32 GB Mac whose cache holds far fewer experts; off by default, so
+  answers stay exact). Thanks @odokododok for it.
+- **A lighter prompt cache**: a Qwen3.8 conversation writes about three quarters less to the SSD (six turns on the STQ
+  4bpw pack: 370 MB instead of 1,409 MB, same replies), holding its newest restore points in up to 250 MB of RAM so a
+  regenerated answer restores at once, even after a restart. The SSD cache is back to full speed when saving and
+  restoring, and stays within its budget on disk.
+- **Less CPU, sooner answers**: about 20% less CPU over a full benchmark on Qwen3.8-Flash-Next with decode about 5%
+  faster, and a 400-turn tool-calling conversation builds its prompt in 2 to 4 ms instead of up to 0.6 s.
+- **Every request runs inside its memory budget**: a wide prefill no longer runs a 32 GB Mac out of memory, a 1536²
+  image on Qwen3.8 takes 1.9 GB instead of 22.8 GB, and what does not fit is refused by name instead of crashing.
+- **Exact prompts and tool calls on every API**: chat, Anthropic Messages and Responses render one prompt and say one
+  reply; tool arguments arrive spelled as the model wrote them; GLM's forced tool calls are enforced as Qwen's are; a
+  strict JSON schema is enforced as written or refused with a reason; `min_p` sampling joins every API and the chat
+  page.
+- **Removed: `--mtp-typical`, `--mtp-tokenv3` and `--mtp-greedy-tail`**, with their settings: speculative decoding
+  accepts drafts by the exact rule only, so a seeded request repeats its text. A settings file that still names them
+  loads with a warning.
+
+---
 
 ## v1.6.0 — Stability, UI and Architecture Refactor
 

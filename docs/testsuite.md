@@ -73,7 +73,10 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   teardown asking MLX nothing, the opt-out's tokens, fault sweeps over the load and a request, nothing compiled after
   it, and a load of more than one row (`coolerRows`) giving each row its solo request's tokens (the arch's
   `greedyRows`; skipped at one row). Requests run in the model's turn and end as serve ends them; unloads run serve's teardown. An arch on Sushi
-  Cooler is admitted by declaring it; a test runs every fixture present and is reported skipped when any is missing.
+  Cooler is admitted by declaring it. With every fixture set a cell runs them all (`eachFixture`), or one per arch
+  (`eachArch`, the first set: for a property of the arch and the engine, not of a pack's format); with any unset it
+  skips before loading anything. `SUSHI_CONTRACT_FIXTURE=QWEN4_STQ_TINY` (comma-separated envs) runs only the named
+  fixtures, and a cell that ran on them passes: the way to check one cell on one fixture.
   Its no-late-kernel test proves its property only on a fresh pipeline cache (run it alone): the cache is the process's.
 - **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device
   profile and the engine dispatch as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`). A test about one arm's bytes names it
@@ -221,6 +224,9 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 ## How a test is built
 
 - Smallest input that reaches the arm under test. A sweep samples: shipped rates plus the table's ends, not every value.
+- A test that counts a speculative request's calls or pool asks pins the MTP depth (`mtp_depth_bounds.active`, as
+  `--mtp-min-depth N --mtp-max-depth N`): unpinned, each round's plan follows the trunk's measured cost table and live
+  sync times, so the round count, and every call per round, changes from request to request with the same tokens.
 - One function, many inputs: one table-driven test, one row per case.
 - One fixture or pack load per process, shared by the tests that read it.
 - No sleeps to wait for a thread. Use a hook or a counter. Any wait is bounded and under 100 ms.
@@ -282,7 +288,7 @@ may add only `needs=<commands>`. Scope is the folder (`tests/qwen4|mimo2|glm5|ds
 |---|---|
 | `tier` | `hermetic` (no binary), `host` (the binary, no weights, no lock), `pack` (real weights, run.sh takes the lock), `live` (loads a pack over HTTP); `bench`, `tool` and `lib` are never run |
 | `boot` | live only: `api`, `exact`, `ram`, `knobs` attach to a shared boot; `own` boots itself |
-| `pack` | `own` and `pack` only: `default` (the folder's model), `each` (once per model pass), a model key or an alias |
+| `pack` | `own` and `pack`: `default` (the folder's model), `each` (once per model pass), a model key or an alias. An attach script (`api`, `exact`, `ram`) runs in every model pass unless it names one, `pack=qwen4` (`qwen4`, `glm5`, `dsv41`, `mimo2`): for a property of the server, not of the model (`test_metrics.sh`, `test_timings.sh`) |
 | `boots` | `own` only: the scripted number of boots, for the ledger |
 
 Exit codes: 0 pass, 1 fail, 3 SKIP (one line naming what is missing).

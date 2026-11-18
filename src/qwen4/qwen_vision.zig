@@ -20,21 +20,68 @@ const io_util = @import("../io_util.zig");
 
 // ─────────────────────────────────────────────────────────────────────────────
 /// Transient GPU bytes one image's encode needs on top of the resident tower, at
-/// `n_patches` patches. The stream is evaluated per block, so the peak is one
-/// block: its f32 score sheets (heads x N^2) and its row activations. On MLX the
-/// lazy graph reuses a sheet's buffer (`qwen vision ubench`); the engine runs each
-/// op as it is built and holds four sheets' worth in its pool (the served-widths test).
-/// Either covers its measured peak by >= 25%.
+/// `n_patches` patches. The stream is evaluated per block, so the peak is one block's. On Sushi Cooler it is the
+/// bytes the engine's pool keeps for it (`EngineHeld.kept`) and `bills.BILL_MARGIN_BYTES`. On MLX the lazy graph
+/// keeps many chunks' score sheets until a block is evaluated, so its bill stays fitted to the whole f32 sheet
+/// (heads x N^2) and its row activations, >= 25% over the measured peak (`qwen vision ubench`).
 pub fn encodeScratchBytes(config: *const ModelConfig, n_patches: u64) u64 {
-    return scratchOf(config.qv_heads, config.qv_hidden, config.qv_intermediate, @import("../cooler_side.zig").onEngine(config), n_patches);
+    return scratchOf(Widths.of(config), @import("../cooler_side.zig").onEngine(config), ATTN_QUERY_ROWS, n_patches);
 }
 
-fn scratchOf(heads: u32, hidden: u32, intermediate: u32, on_engine: bool, n_patches: u64) u64 {
-    const scores = 4 * @as(u64, @max(heads, 1)) * n_patches * n_patches;
-    const per_patch: u64 = 4 * (12 * @as(u64, hidden) + 3 * @as(u64, intermediate));
-    const sheets = if (on_engine) scores * 4 else scores * 13 / 10;
-    return (32 << 20) + sheets + n_patches * per_patch;
+/// Query rows one attention step scores at a time: a block holds [heads, rows, N] score sheets, never [heads, N, N].
+pub const ATTN_QUERY_ROWS: u32 = 512;
+
+const Widths = struct {
+    heads: u64,
+    head_dim: u64,
+    hidden: u64,
+    intermediate: u64,
+
+    fn of(config: *const ModelConfig) Widths {
+        return .{ .heads = config.qv_heads, .head_dim = config.qv_head_dim, .hidden = config.qv_hidden, .intermediate = config.qv_intermediate };
+    }
+};
+
+fn scratchOf(w: Widths, on_engine: bool, attn_rows: u64, n_patches: u64) u64 {
+    if (on_engine) return if (n_patches == 0) 0 else EngineHeld.of(w, attn_rows, n_patches).kept() + @import("../bills.zig").BILL_MARGIN_BYTES;
+    const scores = 4 * @max(w.heads, 1) * n_patches * n_patches;
+    const per_patch: u64 = 4 * (12 * w.hidden + 3 * w.intermediate);
+    return (32 << 20) + scores * 13 / 10 + n_patches * per_patch;
 }
+
+/// The engine's pool at an encode's two peaks, each buffer at its size class.
+const EngineHeld = struct {
+    /// An attention step: the residual, its norm, qkv, roped q and k, f32 q, k and v, the rope tables, the chunks'
+    /// outputs so far and two [heads, rows, N] sheets.
+    attention: u64,
+    /// The MLP's tanh GELU: the residual, its norm, the rope tables, and fc1 with its eight temporaries.
+    mlp: u64,
+    /// fc1 and the GELU's temporaries and scalars: the MLP's buffers of a size the attention has none of.
+    mlp_own: u64,
+
+    fn of(w: Widths, attn_rows: u64, n: u64) EngineHeld {
+        const P = @import("../tensor/pool_class.zig").poolBytes;
+        const rows = @min(attn_rows, n);
+        const chunks = (n + rows - 1) / rows;
+        const rope = 2 * P(2 * n * w.head_dim);
+        const block_rows = 4 * P(2 * n * w.hidden) + P(6 * n * w.hidden) + 3 * P(4 * n * w.hidden) + rope + P(4);
+        const out = P(2 * w.heads * rows * w.head_dim);
+        const last = n - (chunks - 1) * rows;
+        const mlp_own = 9 * P(2 * n * w.intermediate) + 5 * P(2);
+        return .{
+            // The last chunk holds the most outputs; the one before it holds whole sheets when the last is short.
+            .attention = block_rows + @max((chunks - 1) * out + 2 * P(4 * w.heads * last * n), (chunks -| 2) * out + 2 * P(4 * w.heads * rows * n)),
+            .mlp = 2 * P(2 * n * w.hidden) + rope + mlp_own,
+            .mlp_own = mlp_own,
+        };
+    }
+
+    /// What the pool keeps across blocks: the attention's buffers and the MLP's own beside them, so a block allocates
+    /// nothing anew. A cap at either peak alone evicts the other's buffers every block and makes them again.
+    fn kept(self: EngineHeld) u64 {
+        return self.attention + self.mlp_own;
+    }
+};
 
 // Qwen3-VL ViT encoder. Mirrors mlx-vlm qwen3_vl/vision.py for a SINGLE still
 // image (grid_thw = [[1, grid_h, grid_w]]): full bidirectional attention over all
@@ -136,6 +183,8 @@ pub const QwenVision = struct {
     /// Evaluate the stream after every block and the output at the end, so one
     /// block's buffers are the encode's peak (`encodeScratchBytes`).
     eval_per_block: bool = true,
+    /// `ATTN_QUERY_ROWS`; a test lowers it to take several chunks on a small image.
+    attn_rows: u32 = ATTN_QUERY_ROWS,
 
     depth: u32,
     hidden: u32,
@@ -641,9 +690,10 @@ pub const QwenVision = struct {
         return acc;
     }
 
-    fn dropSheet(_: *QwenVision, sheet: *mlx.mlx_array) void {
+    fn dropSheet(self: *QwenVision, sheet: *mlx.mlx_array) !void {
         _ = mlx.mlx_array_free(sheet.*);
         sheet.* = .{ .ctx = null };
+        if (self.own) try mlx.engine.submit();
     }
 
     /// Self-attention over all patches (single image → full bidirectional).
@@ -699,50 +749,68 @@ pub const QwenVision = struct {
         try mlx.check(mlx.mlx_transpose_axes(&vh, parts[2], &perm, 3, self.s));
         try mlx.check(mlx.mlx_astype(&vh, vh, .float32, self.s));
 
-        // scores = q @ k^T * scale
         const kperm = [_]c_int{ 0, 2, 1 };
         var kt = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(kt);
         try mlx.check(mlx.mlx_transpose_axes(&kt, kh, &kperm, 3, self.s));
-        // Each [heads, N, N] f32 sheet goes as soon as the next is made. The engine runs every op as it is built and
-        // reuses a buffer only once its pass has run, so there each step is evaluated: two sheets at a time, not four.
-        var sheets: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
-        defer for (sheets) |sh| {
-            if (sh.ctx != null) _ = mlx.mlx_array_free(sh);
-        };
-        try mlx.check(mlx.mlx_matmul(&sheets[0], qh, kt, self.s)); // scores
-        if (self.own) try mlx.check(mlx.mlx_array_eval(sheets[0]));
         const scale = try mlx.newFloat(1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim))));
         defer _ = mlx.mlx_array_free(scale);
-        try mlx.check(mlx.mlx_multiply(&sheets[1], sheets[0], scale, self.s)); // scaled
-        self.dropSheet(&sheets[0]);
-        if (self.own) try mlx.check(mlx.mlx_array_eval(sheets[1]));
-        try mlx.check(mlx.mlx_softmax_axis(&sheets[2], sheets[1], -1, true, self.s)); // probs
-        self.dropSheet(&sheets[1]);
-        if (self.own) try mlx.check(mlx.mlx_array_eval(sheets[2]));
-        var ctx32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ctx32);
-        try mlx.check(mlx.mlx_matmul(&ctx32, sheets[2], vh, self.s)); // [heads, N, hd] f32
-        self.dropSheet(&sheets[2]);
-        var ctx = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ctx);
-        try mlx.check(mlx.mlx_astype(&ctx, ctx32, .bfloat16, self.s));
 
-        // [heads, N, hd] → [N, heads*hd]
-        const operm = [_]c_int{ 1, 0, 2 };
-        var ctt = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ctt);
-        try mlx.check(mlx.mlx_transpose_axes(&ctt, ctx, &operm, 3, self.s));
+        // A row's scores, softmax and context are the whole sheet's: the reductions run along keys, never queries.
+        const rows: c_int = @intCast(@min(self.attn_rows, @as(u32, @intCast(n))));
+        const chunks: usize = @intCast(@divFloor(n + rows - 1, rows));
+        const outs = try self.allocator.alloc(mlx.mlx_array, chunks);
+        defer self.allocator.free(outs);
+        var done: usize = 0;
+        defer for (outs[0..done]) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        const ones = [_]c_int{ 1, 1, 1 };
+        for (outs, 0..) |*out, c| {
+            const r0: c_int = @as(c_int, @intCast(c)) * rows;
+            var qc = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(qc);
+            try mlx.check(mlx.mlx_slice(&qc, qh, &[_]c_int{ 0, r0, 0 }, 3, &[_]c_int{ heads, @min(n, r0 + rows), hd }, 3, &ones, 3, self.s));
+            // Each [heads, rows, N] f32 sheet goes as soon as the next is made. The engine reuses a buffer only once
+            // the pass that freed it is handed over, so each drop hands it over: two sheets at a time, not three.
+            var sheets: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+            defer for (sheets) |sh| {
+                if (sh.ctx != null) _ = mlx.mlx_array_free(sh);
+            };
+            try mlx.check(mlx.mlx_matmul(&sheets[0], qc, kt, self.s)); // scores
+            try mlx.check(mlx.mlx_multiply(&sheets[1], sheets[0], scale, self.s)); // scaled
+            try self.dropSheet(&sheets[0]);
+            try mlx.check(mlx.mlx_softmax_axis(&sheets[2], sheets[1], -1, true, self.s)); // probs
+            try self.dropSheet(&sheets[1]);
+            var ctx32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ctx32);
+            try mlx.check(mlx.mlx_matmul(&ctx32, sheets[2], vh, self.s)); // [heads, rows, hd] f32
+            try self.dropSheet(&sheets[2]);
+            var ctx = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ctx);
+            try mlx.check(mlx.mlx_astype(&ctx, ctx32, .bfloat16, self.s));
+            out.* = mlx.mlx_array_new(); // [rows, heads, hd]
+            done += 1;
+            try mlx.check(mlx.mlx_transpose_axes(out, ctx, &perm, 3, self.s));
+        }
+        const vec = mlx.mlx_vector_array_new_data(outs.ptr, outs.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var joined = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(joined);
+        try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 0, self.s));
         var flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat);
         const fshape = [_]c_int{ n, @intCast(self.hidden) };
-        try mlx.check(mlx.mlx_reshape(&flat, ctt, &fshape, 2, self.s));
+        try mlx.check(mlx.mlx_reshape(&flat, joined, &fshape, 2, self.s));
         return self.denseLinear(flat, blk.proj_w, blk.proj_b, blk.proj_q);
     }
 
     /// Patch counts whose blocks (N rows) and merger (N/4) reach every plan the engine picks for the tower's products:
     /// the vector kernels, split-K and whole tiles, N aligned and not; and a two-group video for the join.
     const warm_patches = [_]u32{ 4, 16, 60, 64, 256, 1020, 1024 };
+    /// Patches from which a block's attention takes kernels no grid of `warm_patches` reaches: the looped softmax (past
+    /// 4,096 keys) and the context product's other K step (`matmul.fusedNaxTile`). The warm makes them by shape alone.
+    const context_patches: u32 = 8192;
     /// Warms that ran in this process: a test reads it to see that a load from a manifest ran none.
     pub var warms: u32 = 0;
 
@@ -751,7 +819,7 @@ pub const QwenVision = struct {
     pub fn warmEngine(self: *QwenVision) !void {
         if (!self.own or self.blocks.len == 0) return;
         var key_buf: [96]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}/{d}.{d}.{d}.{d}.{d}/w1", .{ if (self.blocks[0].qkv_q != null) "q8" else "bf16", self.hidden, self.heads, self.intermediate, self.merge, self.out_hidden }) catch return error.TensorShape;
+        const key = std.fmt.bufPrint(&key_buf, "{s}/{d}.{d}.{d}.{d}.{d}/w2", .{ if (self.blocks[0].qkv_q != null) "q8" else "bf16", self.hidden, self.heads, self.intermediate, self.merge, self.out_hidden }) catch return error.TensorShape;
         if (mlx.engine.pipeline_registry.takeMarker(key)) {
             log.info("[vision] engine tower: pipelines made from the manifest, no warm\n", .{});
             return;
@@ -782,10 +850,38 @@ pub const QwenVision = struct {
             const out = if (video) try self.forwardVideo(patches, 2, self.merge, self.merge) else try self.forward(patches, n / self.merge, self.merge);
             _ = mlx.mlx_array_free(out);
         }
+        try self.warmContext(context_patches);
         mlx.engine.trim();
         log.info("[vision] engine tower warmed: {d} pipelines, {d} ms\n", .{ mlx.engine.pipelinesMade().count - made_before, clock.read() / std.time.ns_per_ms });
         mlx.engine.pipeline_registry.recordMarker("vision tower", key);
         @import("../arch/cooler_pipelines.zig").rewriteLate();
+    }
+
+    /// A few query rows' softmax and context product over `keys` patches, on operands laid out as `attention` makes
+    /// them on the engine (fresh f32 sheets and values, a batch per head): the kernels a block over that many keys
+    /// takes, made without its image. Each product makes every row count's kernels before the seal.
+    fn warmContext(self: *QwenVision, keys: u32) !void {
+        const heads: usize = self.heads;
+        const rows: usize = 4;
+        const sheet = heads * rows * keys;
+        const values = heads * keys * self.head_dim;
+        const zeros = try self.allocator.alloc(f32, @max(sheet, values));
+        defer self.allocator.free(zeros);
+        @memset(zeros, 0);
+        mlx.engine.room(&.{ 4 * sheet, 4 * values, 4 * sheet, 4 * heads * rows * self.head_dim });
+        const scope = mlx.engine.enter(self.s);
+        defer scope.end();
+        const scores = try mlx.newData(zeros.ptr, &[_]c_int{ @intCast(heads), @intCast(rows), @intCast(keys) }, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+        const vh = try mlx.newData(zeros.ptr, &[_]c_int{ @intCast(heads), @intCast(keys), @intCast(self.head_dim) }, .float32);
+        defer _ = mlx.mlx_array_free(vh);
+        var probs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(probs);
+        try mlx.check(mlx.mlx_softmax_axis(&probs, scores, -1, true, self.s));
+        var ctx = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ctx);
+        try mlx.check(mlx.mlx_matmul(&ctx, probs, vh, self.s));
+        try mlx.check(mlx.mlx_array_eval(ctx));
     }
 
     /// Encode one image. `patches` = pixel_values [N, C*tps*ps*ps] (merge order).
@@ -801,7 +897,7 @@ pub const QwenVision = struct {
         defer if (run) |made| made.end();
         const n: c_int = @intCast(grid_h * grid_w);
         // On the engine the encode runs inside its bill: an over-run is a named refusal, never a Metal OOM.
-        if (self.own) try mlx.engine.budget(scratchOf(self.heads, self.hidden, self.intermediate, true, @intCast(n)));
+        if (self.own) try mlx.engine.budget(scratchOf(.{ .heads = self.heads, .head_dim = self.head_dim, .hidden = self.hidden, .intermediate = self.intermediate }, true, self.attn_rows, @intCast(n)));
         defer if (self.own) mlx.engine.budget(std.math.maxInt(u64)) catch {};
         // The residual: replaced in place, and freed on any failure.
         var x = mlx.mlx_array_new();
@@ -1417,12 +1513,12 @@ test "qwen encodeScratchBytes covers each measured peak by >= 25% without the N^
     config.qv_heads = 16;
     config.qv_hidden = 1152;
     config.qv_intermediate = 4304;
-    // Per-block-eval scratch peaks, bytes (`qwen vision ubench`, Sushi-3bpw tower).
+    // Per-block-eval scratch peaks on MLX, bytes: the served widths' synthetic tower, attention by query chunks.
     const measured = [_][2]u64{
-        .{ 196, 20_800_000 },
-        .{ 3772, 1_225_400_000 },
-        .{ 8160, 4_923_400_000 },
-        .{ 9216, 6_112_100_000 },
+        .{ 196, 20_291_266 },
+        .{ 3772, 1_089_716_258 },
+        .{ 8160, 4_414_259_224 },
+        .{ 9216, 5_608_341_528 },
     };
     for (measured) |m| {
         const bill = encodeScratchBytes(&config, m[0]);
@@ -1430,6 +1526,19 @@ test "qwen encodeScratchBytes covers each measured peak by >= 25% without the N^
         // Where the bill decides admission, it stays within 1.5x of the peak.
         if (m[0] >= 1000) try std.testing.expect(bill * 2 <= m[1] * 3);
     }
+}
+
+test "qwen vision: on Sushi Cooler a 1536^2 image's encode bills a chunk of query rows' score sheets, never N^2" {
+    var cfg = servedTowerConfig(27, 1152, 16, 4304, 2560, 2304);
+    @import("../cooler_side.zig").forTest(&cfg, true);
+    const n: u64 = 96 * 96;
+    // Two sheets of one query chunk, [heads, rows, N] f32; the block's rows, 28 bytes a hidden channel a patch (bf16
+    // residual, norm, qkv, roped q and k and chunk outputs; f32 q, k and v), within 32 at the pool's classes; and the
+    // MLP's fc1 with its GELU's eight bf16 temporaries, 18 bytes an intermediate channel a patch.
+    const sheet = 4 * @as(u64, cfg.qv_heads) * ATTN_QUERY_ROWS * n;
+    const bound = 2 * sheet + 32 * @as(u64, cfg.qv_hidden) * n + 18 * @as(u64, cfg.qv_intermediate) * n + @import("../bills.zig").BILL_MARGIN_BYTES;
+    try std.testing.expect(encodeScratchBytes(&cfg, n) <= bound);
+    try std.testing.expect(bound < 2 << 30);
 }
 
 // Encode time and scratch peak on the real tower, per image, at a small image, a
@@ -1529,7 +1638,7 @@ test "qwen vision ubench: encode time and scratch peak per image and video" {
             _ = mlx.mlx_get_active_memory(&before);
             _ = mlx.mlx_reset_peak_memory();
             const t0 = std.Io.Timestamp.now(io, .boot);
-            // As `vision_queue.encodeVideoBlock`: the upload is a copy the encode owns.
+            // As `vision_queue.encodeVideoGroup`: the upload is a copy the encode owns.
             const pixels = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
             const out = tower.forwardVideo(pixels, v[0], v[1], v[2]);
             _ = mlx.mlx_array_free(pixels);
@@ -2105,8 +2214,7 @@ test "qwen vision: a tower load on the engine refused at a checked call or a poo
     try std.testing.expectEqual(base, inUse());
 }
 
-test "qwen vision: on the engine an encode's bill covers what the pool holds for it at the served widths" {
-    // The engine runs each op as it is built, so a block's buffers are held together; MLX's lazy graph reuses them.
+test "qwen vision: on the engine an encode's bill is what the pool keeps for it at the served widths, and the margin" {
     try mlx.requireGpu();
     const a = std.testing.allocator;
     const was = mlx.engine.enabled;
@@ -2118,20 +2226,27 @@ test "qwen vision: on the engine an encode's bill covers what the pool holds for
     defer w.deinit();
     var tower = try QwenVision.init(a, cfg, &w);
     defer tower.deinit();
-    for ([_][2]u32{ .{ 16, 16 }, .{ 32, 32 }, .{ 40, 48 } }) |grid| {
+    // The MLP's peak (14x14, 16x16), one chunk's sheets (32x32), whole chunks and a short last one (40x48).
+    for ([_][2]u32{ .{ 14, 14 }, .{ 16, 16 }, .{ 32, 32 }, .{ 40, 48 } }) |grid| {
         const n: usize = @as(usize, grid[0]) * grid[1];
         const patches = try servedPatches(n, grid[0]);
         defer _ = mlx.mlx_array_free(patches);
         try mlx.check(mlx.mlx_array_eval(patches));
         mlx.engine.trim();
         const in_use = mlx.engine.poolTotal() - mlx.engine.poolFree();
-        const pool_before = mlx.engine.poolTotal();
         mlx.engine.resetPoolPeak(.process);
         const out = try tower.forward(patches, grid[0], grid[1]);
         defer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_eval(out));
-        const held = @max(mlx.engine.poolTotal() -| pool_before, mlx.engine.poolPeak(.process) -| in_use);
-        try std.testing.expect(encodeScratchBytes(&cfg, n) >= held + held / 4);
+        const held = EngineHeld.of(Widths.of(&cfg), ATTN_QUERY_ROWS, n);
+        try std.testing.expectEqual(@max(held.attention, held.mlp), mlx.engine.poolPeak(.process) - in_use);
+        try std.testing.expectEqual(held.kept() + @import("../bills.zig").BILL_MARGIN_BYTES, encodeScratchBytes(&cfg, n));
+        // The next encode under the bill finds every buffer it takes in the pool.
+        const evictions = mlx.engine.stats().pool_evictions;
+        const again = try tower.forward(patches, grid[0], grid[1]);
+        defer _ = mlx.mlx_array_free(again);
+        try mlx.check(mlx.mlx_array_eval(again));
+        try std.testing.expectEqual(evictions, mlx.engine.stats().pool_evictions);
     }
 }
 
@@ -2152,7 +2267,8 @@ test "qwen vision: a Cooler load's tower warms before the seal, so images and vi
     const late = mlx.engine.latePipelines();
     mlx.engine.late_names.clear();
     // Videos of two to five frame groups: their encodes are joined two, three or four at a time, or part by part past.
-    for ([_][3]u32{ .{ 1, 2, 2 }, .{ 1, 4, 4 }, .{ 1, 8, 6 }, .{ 1, 6, 10 }, .{ 1, 16, 16 }, .{ 1, 30, 34 }, .{ 1, 46, 40 }, .{ 2, 4, 4 }, .{ 3, 8, 6 }, .{ 4, 2, 2 }, .{ 5, 2, 2 } }) |g| {
+    // From 8,192 patches a block's context product takes another K step, at whole tiles (64x128) or not (92x90).
+    for ([_][3]u32{ .{ 1, 2, 2 }, .{ 1, 4, 4 }, .{ 1, 8, 6 }, .{ 1, 6, 10 }, .{ 1, 16, 16 }, .{ 1, 30, 34 }, .{ 1, 46, 40 }, .{ 1, 64, 128 }, .{ 1, 92, 90 }, .{ 2, 4, 4 }, .{ 3, 8, 6 }, .{ 4, 2, 2 }, .{ 5, 2, 2 } }) |g| {
         const n: usize = @as(usize, g[0]) * g[1] * g[2];
         const patches = blk: {
             const scope = mlx.engine.enter(mlx.engine.stream());
@@ -2206,4 +2322,216 @@ test "qwen vision: a channels-last patch embedding is held once, flattened, and 
     try mlx.check(mlx.mlx_array_eval(ol));
     const n = mlx.mlx_array_size(of) * mlx.mlx_array_itemsize(of);
     try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(of).?[0..n], mlx.mlx_array_data_uint8(ol).?[0..n]);
+}
+
+test "qwen vision: a video the scheduler encodes a frame group a step, yielding between, gives forwardVideo's bytes" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const vision_queue = @import("../vision_queue.zig");
+    var cfg = tinyConfig();
+    cfg.qwen_vision = true;
+    var w = try tinyTower();
+    defer w.deinit();
+    var enc = try @import("../vision.zig").VisionEncoder.init(a, cfg, &w);
+    defer enc.deinit();
+    const grid_t: u32 = 3;
+    const feat: usize = 3 * 2 * 4 * 4;
+    const px = try a.alloc(f32, grid_t * 16 * feat);
+    defer a.free(px);
+    var prng = std.Random.DefaultPrng.init(11);
+    for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
+
+    const whole = blk: {
+        const p = try mlx.newData(px.ptr, &[_]c_int{ @intCast(grid_t * 16), @intCast(feat) }, .float32);
+        defer _ = mlx.mlx_array_free(p);
+        break :blk try enc.forwardVideoPatches(p, grid_t, 4, 4);
+    };
+    defer _ = mlx.mlx_array_free(whole);
+    try mlx.check(mlx.mlx_array_eval(whole));
+
+    const Count = struct {
+        fn call(ctx: *anyopaque) u64 {
+            const n: *usize = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+            return 0;
+        }
+    };
+    var sch: @import("../scheduler.zig").Scheduler = undefined;
+    sch.io = std.testing.io;
+    sch.allocator = a;
+    var model: @import("../model_registry.zig").LoadedModel = undefined;
+    model.config = &cfg;
+    model.handle = null;
+    model.vision_encoder = &enc;
+    var yields: usize = 0;
+    const videos = [_]vision_queue.VisionVideoPixels{.{ .pixels = std.mem.sliceAsBytes(px), .grid_t = grid_t, .grid_h = 4, .grid_w = 4 }};
+    var req = vision_queue.VisionEncodeRequest{ .model = &model, .images = &.{}, .videos = &videos, .allocator = a, .steps = .{ .yield = .{ .ctx = &yields, .call = Count.call } } };
+    vision_queue.runVisionEncode(&sch, &req);
+    if (req.error_name) |name| {
+        defer a.free(name);
+        std.debug.print("qwen vision: the stepped encode failed: {s}\n", .{name});
+        return error.TestUnexpectedResult;
+    }
+    const stepped = req.result.?;
+    defer _ = mlx.mlx_array_free(stepped);
+    try mlx.check(mlx.mlx_array_eval(stepped));
+    try std.testing.expectEqual(@as(usize, grid_t), yields);
+    try std.testing.expectEqual(@as(usize, grid_t * 4), req.n_video_tokens);
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(whole), mlx.getShape(stepped));
+    const n = mlx.mlx_array_size(whole) * mlx.mlx_array_itemsize(whole);
+    try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(whole).?[0..n], mlx.mlx_array_data_uint8(stepped).?[0..n]);
+}
+
+/// The tower's attention before its queries went by chunks, whole [heads, N, N] sheets: the parity test's reference.
+fn wholeSheetAttention(self: *QwenVision, normed: mlx.mlx_array, blk: QBlock, cos: mlx.mlx_array, sin: mlx.mlx_array, n: c_int) !mlx.mlx_array {
+    const hd: c_int = @intCast(self.head_dim);
+    const heads: c_int = self.headsC();
+    const qkv = try self.denseLinear(normed, blk.qkv_w, blk.qkv_b, blk.qkv_q); // [N, 3*hidden]
+    defer _ = mlx.mlx_array_free(qkv);
+    // [N, 3, heads, hd]
+    var r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r);
+    const rshape = [_]c_int{ n, 3, heads, hd };
+    try mlx.check(mlx.mlx_reshape(&r, qkv, &rshape, 4, self.s));
+
+    const sl_strides = [_]c_int{ 1, 1, 1, 1 };
+    var parts: [3]mlx.mlx_array = undefined;
+    var made: usize = 0;
+    defer for (parts[0..made]) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    inline for (0..3) |j| {
+        const start = [_]c_int{ 0, @intCast(j), 0, 0 };
+        const stop = [_]c_int{ n, @intCast(j + 1), heads, hd };
+        var sliced = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sliced);
+        try mlx.check(mlx.mlx_slice(&sliced, r, &start, 4, &stop, 4, &sl_strides, 4, self.s));
+        const flat = [_]c_int{ n, heads, hd };
+        parts[j] = mlx.mlx_array_new(); // [N, heads, hd]
+        made += 1;
+        try mlx.check(mlx.mlx_reshape(&parts[j], sliced, &flat, 3, self.s));
+    }
+
+    const q_rope = try self.applyVisionRope(parts[0], cos, sin, n, hd);
+    defer _ = mlx.mlx_array_free(q_rope);
+    const k_rope = try self.applyVisionRope(parts[1], cos, sin, n, hd);
+    defer _ = mlx.mlx_array_free(k_rope);
+
+    // [N, heads, hd] → [heads, N, hd], in fp32 to mirror the reference's
+    // fused SDPA (bf16 in/out, fp32 internal accumulation). Computing the
+    // score/softmax/context core in bf16 leaves sparse ~0.9 outliers on
+    // high-variance channels; fp32 internals match the reference far closer.
+    const perm = [_]c_int{ 1, 0, 2 };
+    var qh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qh);
+    try mlx.check(mlx.mlx_transpose_axes(&qh, q_rope, &perm, 3, self.s));
+    try mlx.check(mlx.mlx_astype(&qh, qh, .float32, self.s));
+    var kh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kh);
+    try mlx.check(mlx.mlx_transpose_axes(&kh, k_rope, &perm, 3, self.s));
+    try mlx.check(mlx.mlx_astype(&kh, kh, .float32, self.s));
+    var vh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vh);
+    try mlx.check(mlx.mlx_transpose_axes(&vh, parts[2], &perm, 3, self.s));
+    try mlx.check(mlx.mlx_astype(&vh, vh, .float32, self.s));
+
+    // scores = q @ k^T * scale
+    const kperm = [_]c_int{ 0, 2, 1 };
+    var kt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kt);
+    try mlx.check(mlx.mlx_transpose_axes(&kt, kh, &kperm, 3, self.s));
+    // Each [heads, N, N] f32 sheet goes as soon as the next is made. The engine runs every op as it is built and
+    // reuses a buffer only once its pass has run, so there each step is evaluated: two sheets at a time, not four.
+    var sheets: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (sheets) |sh| {
+        if (sh.ctx != null) _ = mlx.mlx_array_free(sh);
+    };
+    try mlx.check(mlx.mlx_matmul(&sheets[0], qh, kt, self.s)); // scores
+    if (self.own) try mlx.check(mlx.mlx_array_eval(sheets[0]));
+    const scale = try mlx.newFloat(1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim))));
+    defer _ = mlx.mlx_array_free(scale);
+    try mlx.check(mlx.mlx_multiply(&sheets[1], sheets[0], scale, self.s)); // scaled
+    dropWhole(&sheets[0]);
+    if (self.own) try mlx.check(mlx.mlx_array_eval(sheets[1]));
+    try mlx.check(mlx.mlx_softmax_axis(&sheets[2], sheets[1], -1, true, self.s)); // probs
+    dropWhole(&sheets[1]);
+    if (self.own) try mlx.check(mlx.mlx_array_eval(sheets[2]));
+    var ctx32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ctx32);
+    try mlx.check(mlx.mlx_matmul(&ctx32, sheets[2], vh, self.s)); // [heads, N, hd] f32
+    dropWhole(&sheets[2]);
+    var ctx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ctx);
+    try mlx.check(mlx.mlx_astype(&ctx, ctx32, .bfloat16, self.s));
+
+    // [heads, N, hd] → [N, heads*hd]
+    const operm = [_]c_int{ 1, 0, 2 };
+    var ctt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ctt);
+    try mlx.check(mlx.mlx_transpose_axes(&ctt, ctx, &operm, 3, self.s));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const fshape = [_]c_int{ n, @intCast(self.hidden) };
+    try mlx.check(mlx.mlx_reshape(&flat, ctt, &fshape, 2, self.s));
+    return self.denseLinear(flat, blk.proj_w, blk.proj_b, blk.proj_q);
+}
+
+fn dropWhole(sheet: *mlx.mlx_array) void {
+    _ = mlx.mlx_array_free(sheet.*);
+    sheet.* = .{ .ctx = null };
+}
+
+test "qwen vision: attention by chunks of query rows gives the whole-sheet attention's bytes, and so the tower's, on MLX and the engine" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    for ([_]bool{ false, true }) |on_engine| {
+        var w = try tinyTower();
+        defer w.deinit();
+        var cfg = tinyConfig();
+        cfg.model_type = "qwen4_exp";
+        cfg.expert_layout = .exl3_k4;
+        cfg.expert_quant_codebook = .spec1;
+        cfg.cooler_for_test = on_engine;
+        var tower = try QwenVision.init(a, cfg, &w);
+        defer tower.deinit();
+        // Three whole chunks; two and a ragged one.
+        for ([_][2]u32{ .{ 8, 6 }, .{ 4, 10 } }) |grid| {
+            const n: c_int = @intCast(grid[0] * grid[1]);
+            const run: ?mlx.engine.Makers = if (on_engine) mlx.engine.makers(true) else null;
+            defer if (run) |made| made.end();
+            const patches = try servedPatches(@intCast(n), grid[1]);
+            defer _ = mlx.mlx_array_free(patches);
+            const rope = try tower.buildVisionRope(grid[0], grid[1]);
+            defer _ = mlx.mlx_array_free(rope.cos);
+            defer _ = mlx.mlx_array_free(rope.sin);
+            var half = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(half);
+            try mlx.check(mlx.mlx_astype(&half, patches, .bfloat16, tower.s));
+            const normed = try tower.denseLinear(half, tower.patch_w, tower.patch_b, null);
+            defer _ = mlx.mlx_array_free(normed);
+            const want = try wholeSheetAttention(&tower, normed, tower.blocks[0], rope.cos, rope.sin, n);
+            defer _ = mlx.mlx_array_free(want);
+            tower.attn_rows = 16;
+            const got = try tower.attention(normed, tower.blocks[0], rope.cos, rope.sin, n);
+            defer _ = mlx.mlx_array_free(got);
+            try expectSameBytes(want, got);
+            const by_chunks = try tower.forward(patches, grid[0], grid[1]);
+            defer _ = mlx.mlx_array_free(by_chunks);
+            tower.attn_rows = ATTN_QUERY_ROWS;
+            const whole = try tower.forward(patches, grid[0], grid[1]);
+            defer _ = mlx.mlx_array_free(whole);
+            try expectSameBytes(whole, by_chunks);
+        }
+    }
+}
+
+fn expectSameBytes(want: mlx.mlx_array, got: mlx.mlx_array) !void {
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    const bytes = mlx.mlx_array_size(want) * mlx.mlx_array_itemsize(want);
+    try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..bytes], mlx.mlx_array_data_uint8(got).?[0..bytes]);
 }

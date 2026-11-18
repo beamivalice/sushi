@@ -57,6 +57,13 @@ pub const Scope = struct {
         return self.keep(o.*);
     }
 
+    /// The scope's own handle on `x`, for an op that makes nothing new: like every op's result it stays valid
+    /// after the caller frees `x`.
+    pub fn share(sc: *Scope, x: A) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_array_set(&o, x), &o);
+    }
+
     /// A handle on `x` that outlives the scope (the caller frees it).
     pub fn out(_: *Scope, x: A) A {
         var o = mlx.mlx_array_new();
@@ -131,7 +138,7 @@ pub const Scope = struct {
     }
 
     pub fn astype(sc: *Scope, x: A, dt: mlx.mlx_dtype) !A {
-        if (mlx.mlx_array_dtype(x) == dt) return x;
+        if (mlx.mlx_array_dtype(x) == dt) return sc.share(x);
         var o = mlx.mlx_array_new();
         return sc.res(mlx.mlx_astype(&o, x, dt, sc.s), &o);
     }
@@ -177,7 +184,7 @@ pub const Scope = struct {
         return sc.res(mlx.mlx_slice(&o, x, &start, sh.len, &stop, sh.len, &st, sh.len, sc.s), &o);
     }
     pub fn concat(sc: *Scope, xs: []const A, axis: c_int) !A {
-        if (xs.len == 1) return xs[0];
+        if (xs.len == 1) return sc.share(xs[0]);
         const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
         defer _ = mlx.mlx_vector_array_free(vec);
         var o = mlx.mlx_array_new();
@@ -268,4 +275,22 @@ pub fn hostI32(a: A) ![]const i32 {
     try mlx.check(mlx.mlx_array_eval(a));
     const p = mlx.mlx_array_data_int32(a) orelse return error.HostRead;
     return p[0..mlx.mlx_array_size(a)];
+}
+
+test "a scope's concat of one part and astype to the same dtype give a handle of the scope's own: the input freed and its box reused, the result keeps its bytes" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    const want = [_]f32{ 1, 2, 3, 4 };
+    for (0..2) |case| {
+        var sc = Scope.plain(std.testing.allocator, mlx.engine.stream());
+        defer sc.deinit();
+        const part = sc.out(try sc.floats(&want, &.{4}));
+        const got = if (case == 0) try sc.concat(&.{part}, 0) else try sc.astype(part, .float32);
+        _ = mlx.mlx_array_free(part);
+        _ = try sc.floats(&.{ 9, 9, 9, 9 }, &.{4});
+        try mlx.check(mlx.mlx_array_eval(got));
+        try std.testing.expectEqualSlices(f32, &want, mlx.mlx_array_data_float32(got).?[0..4]);
+    }
 }

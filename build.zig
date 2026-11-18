@@ -188,6 +188,7 @@ pub fn build(b: *std.Build) void {
         const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = host_filters, .test_runner = testRunner(b) });
         test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_host_tests = b.addRunArtifact(host_tests);
+        runEveryTime(run_host_tests);
         test_host_step.dependOn(&run_host_tests.step);
         test_step.dependOn(&run_host_tests.step);
         if (test_filter == null) {
@@ -203,6 +204,7 @@ pub fn build(b: *std.Build) void {
     for (unit_tests) |unit_test| {
         test_build.dependOn(&b.addInstallArtifact(unit_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_unit_tests = b.addRunArtifact(unit_test);
+        runEveryTime(run_unit_tests);
         if (qwen_preprocess_fixture) |fixture| {
             run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
             run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
@@ -210,8 +212,11 @@ pub fn build(b: *std.Build) void {
             run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
         }
         test_step.dependOn(&run_unit_tests.step);
-        if (std.mem.eql(u8, unit_test.name, "test-" ++ tier_bucket[0])) {
+        // The prefix tier's second backend runs on the full gate only: a `-Dtest-filter` run checks the tests it names
+        // once, on the default backend (`SUSHI_PREFIX_FS=real` in the environment still runs it on the plain files).
+        if (test_filter == null and std.mem.eql(u8, unit_test.name, "test-" ++ tier_bucket[0])) {
             const on_files = b.addRunArtifact(unit_test);
+            runEveryTime(on_files);
             on_files.setName("run test-" ++ tier_bucket[0] ++ " (SUSHI_PREFIX_FS=real)");
             on_files.setEnvironmentVariable("SUSHI_PREFIX_FS", "real");
             test_step.dependOn(&on_files.step);
@@ -226,7 +231,9 @@ pub fn build(b: *std.Build) void {
         addExl3TestBins(b, exl3_test_mod, test_filter);
     for (exl3_tests) |exl3_test| {
         test_build.dependOn(&b.addInstallArtifact(exl3_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        test_step.dependOn(&b.addRunArtifact(exl3_test).step);
+        const run_exl3 = b.addRunArtifact(exl3_test);
+        runEveryTime(run_exl3);
+        test_step.dependOn(&run_exl3.step);
         test_step.dependOn(countGuard(b, count_guard, exl3_test));
     }
 
@@ -238,7 +245,9 @@ pub fn build(b: *std.Build) void {
     });
     if (test_model == null or test_model == .enc) {
         test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        test_step.dependOn(&b.addRunArtifact(encoder_tests).step);
+        const run_encoder = b.addRunArtifact(encoder_tests);
+        runEveryTime(run_encoder);
+        test_step.dependOn(&run_encoder.step);
     }
 
     guardBenchFiles(b, build_roots);
@@ -744,7 +753,7 @@ const exl3_test_weights = [_]struct { []const u8, u16 }{
     .{ "SPEC1 below K1.5 and above K4: the prefill GEMM", 40 },
     .{ "SPEC1 below K1.5 and above K4: every reader decodes", 2 },
     .{ "serves spec1 and std1 on the prefill grid", 36 },
-    .{ "one-bank and grouped trellis linears", 35 },
+    .{ "one-bank and grouped trellis linears", 32 },
     .{ "SIMD multi-row: the split row loops", 15 },
     .{ "every slot writes the served kernels' bytes", 35 },
     .{ "spec1's 2^12 folded into the stores", 28 },
@@ -925,6 +934,12 @@ fn addCountGuard(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Ste
         .target = target,
         .optimize = .Debug,
     }) });
+}
+
+/// A test reads its fixtures and engine switches from the environment, which neither the configure cache nor a run's
+/// cache key sees: the run always executes, so a pass made without a fixture never stands for a run with it.
+fn runEveryTime(run: *std.Build.Step.Run) void {
+    run.has_side_effects = true;
 }
 
 fn countGuard(b: *std.Build, guard: *std.Build.Step.Compile, unit_test: *std.Build.Step.Compile) *std.Build.Step {

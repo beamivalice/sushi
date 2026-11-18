@@ -1171,12 +1171,14 @@ test "exl3 SIMD multi-row: every row equals the one-row launch bit for bit" {
         for ([_][3]usize{ .{ 1024, 512, 1 }, .{ 384, 256, 2 }, .{ 2304, 640, 1 } }) |sh| {
             const rig = try RowsRig.init(alloc, 0x51d0 + sh[0], sh[0], sh[1], sh[2], d.n);
             const g1 = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), false);
+            // Each row's one-row launch once, for every width that holds it.
+            var alone: [@as(usize, @intCast(PROJECT_ROWS_MAX))][]const u16 = undefined;
+            for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
             for (1..@as(usize, @intCast(PROJECT_ROWS_MAX)) + 1) |rows| {
                 const g = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), false);
                 const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
                 for (0..rows) |r| {
-                    const one = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
-                    for (0..sh[2]) |grp| try std.testing.expectEqualSlices(u16, one[grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
+                    for (0..sh[2]) |grp| try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
                 }
             }
         }

@@ -1,4 +1,4 @@
-//! A sampled draw as one kernel: temperature, top-k by rank, the nucleus and the draw, a threadgroup a row.
+//! A sampled draw as one kernel: temperature, top-k by rank, the nucleus, min-p and the draw, a threadgroup a row.
 //!
 //! The rule (`hostDraw` is its reference):
 //! - a value is `logit * (1 / temperature)`, NaN read as -inf and +inf as the largest float, so the row's top value and
@@ -6,6 +6,8 @@
 //! - top-k keeps the first `top_k` in that order (0 or >= vocab: all);
 //! - the nucleus keeps, of those, each one whose mass strictly above it in that order is under `top_p` of their mass
 //!   (the top one always);
+//! - min-p keeps, of those, each one whose value less the row's top value is at least `ln(min_p)` (0: all), which is
+//!   llama.cpp's order (top-k, top-p, min-p) on probabilities after temperature;
 //! - the draw is the kept id with the largest `value + gumbel(key, id)`, the lower id on a tie.
 //! A row's draw is a function of that row, the parameters and its key alone: the same alone and beside other rows.
 //! A row whose every value is -inf or NaN draws id 0.
@@ -81,6 +83,8 @@ const SOURCE =
     \\const float inv_t = fparams[0];
     \\const float top_p = fparams[1];
     \\const uint top_k = uparams[0];
+    \\const float lmp = fparams[2];
+    \\const bool do_m = uparams[1] != 0u;
     \\const uint key0 = keys[row * 2u], key1 = keys[row * 2u + 1u];
     \\threadgroup uint pu[32][32];
     \\threadgroup float pf[32][32];
@@ -95,7 +99,7 @@ const SOURCE =
     \\
     \\// The row's top value, which only a filter reads.
     \\float m = -INFINITY;
-    \\if (do_k || do_p) {
+    \\if (do_k || do_p || do_m) {
     \\  float s = -INFINITY;
     \\  for (uint j = 0u; j < n; ++j) s = metal::max(s, SD_VAL(j));
     \\  s = metal::simd_max(s);
@@ -176,7 +180,7 @@ const SOURCE =
     \\      for (uint g = 0u; g < NSG; ++g) zs += pf[2][g];
     \\      if (!do_k) for (uint g = 0u; g < NSG; ++g) zs += pf[1][g];
     \\    }
-    \\    if (ink && (!do_p || above < metal::max(top_p, 1.17549435e-38f) * zs)) {
+    \\    if (ink && (!do_p || above < metal::max(top_p, 1.17549435e-38f) * zs) && (!do_m || sushi_draw_unkey(kt) - m >= lmp)) {
     \\      best = sushi_draw_unkey(kt) + sushi_draw_gumbel(ci[t], key0, key1);
     \\      bi = ci[t];
     \\    }
@@ -259,7 +263,7 @@ const SOURCE =
     \\    const float v = SD_VAL(j);
     \\    const uint k = sushi_draw_key(v);
     \\    const bool ink = SD_INK;
-    \\    const bool keep = ink && (!nuc || k > tau || (k == tau && s_gt + float(base_p + po++) * e_tau < pz));
+    \\    const bool keep = ink && (!nuc || k > tau || (k == tau && s_gt + float(base_p + po++) * e_tau < pz)) && (!do_m || v - m >= lmp);
     \\    if (keep && v > -INFINITY) {
     \\      const float s = v + sushi_draw_gumbel(i0 + j, key0, key1);
     \\      if (s > best) { best = s; bi = i0 + j; }
@@ -298,8 +302,8 @@ pub fn fits(n_rows: usize, dtype: mlx.mlx_dtype) bool {
 
 /// The draws of `logits` (`[rows, vocab]`, already masked and penalized: an id at -inf is never drawn), one per row
 /// under `keys[row]`, as a uint32 `[rows]` not yet evaluated.
-pub fn rows(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []const [2]u32, s: mlx.mlx_stream) !Arr {
-    const both = try routed(logits, temperature, top_p, top_k, keys, s);
+pub fn rows(logits: Arr, temperature: f32, top_p: f32, top_k: u32, min_p: f32, keys: []const [2]u32, s: mlx.mlx_stream) !Arr {
+    const both = try routed(logits, temperature, top_p, top_k, min_p, keys, s);
     _ = mlx.mlx_array_free(both.route);
     return both.tok;
 }
@@ -308,13 +312,13 @@ pub fn rows(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []const
 pub const Routed = struct { tok: Arr, route: Arr };
 
 /// `rows` with the route of each row beside its draw.
-pub fn routed(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []const [2]u32, s: mlx.mlx_stream) !Routed {
+pub fn routed(logits: Arr, temperature: f32, top_p: f32, top_k: u32, min_p: f32, keys: []const [2]u32, s: mlx.mlx_stream) !Routed {
     defer mlx.expected_refusal = null;
     while (true) {
         // Only a rung left to take expects the refusal: the last one's is the caller's error.
         mlx.expected_refusal = if (ladder.hasNext()) "Thread group size" else null;
         const tg = ladder.threads();
-        return launch(logits, temperature, top_p, top_k, keys, s, tg) catch |e| {
+        return launch(logits, temperature, top_p, top_k, min_p, keys, s, tg) catch |e| {
             // The last rung's refusal keeps its text for the caller: only a rung left to take reads (and clears) it.
             const refused = ladder.hasNext() and (e == error.SamplerDrawGroupRefused or (e == error.MlxError and mlx.takeErrorIf("Thread group size")));
             if (refused and ladder.stepDown()) {
@@ -326,7 +330,7 @@ pub fn routed(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []con
     }
 }
 
-fn launch(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []const [2]u32, s: mlx.mlx_stream, tg: u32) !Routed {
+fn launch(logits: Arr, temperature: f32, top_p: f32, top_k: u32, min_p: f32, keys: []const [2]u32, s: mlx.mlx_stream, tg: u32) !Routed {
     const shape = mlx.getShape(logits);
     const dtype = mlx.mlx_array_dtype(logits);
     if (shape.len != 2 or shape[0] != @as(c_int, @intCast(keys.len)) or !fits(keys.len, dtype) or !(temperature > 0)) return error.SamplerDrawUnsupported;
@@ -366,11 +370,11 @@ fn launch(logits: Arr, temperature: f32, top_p: f32, top_k: u32, keys: []const [
             break;
         };
     }
-    const fp = [2]f32{ 1.0 / temperature, top_p };
-    const up = [1]u32{top_k};
-    const fparams = try mlx.newData(&fp, &[_]c_int{2}, .float32);
+    const fp = [3]f32{ 1.0 / temperature, top_p, if (min_p > 0) @log(min_p) else 0 };
+    const up = [2]u32{ top_k, @intFromBool(min_p > 0) };
+    const fparams = try mlx.newData(&fp, &[_]c_int{3}, .float32);
     defer _ = mlx.mlx_array_free(fparams);
-    const uparams = try mlx.newData(&up, &[_]c_int{1}, .uint32);
+    const uparams = try mlx.newData(&up, &[_]c_int{2}, .uint32);
     defer _ = mlx.mlx_array_free(uparams);
     const key_arr = try mlx.newData(keys.ptr, &[_]c_int{ key.rows, 2 }, .uint32);
     defer _ = mlx.mlx_array_free(key_arr);
@@ -422,7 +426,7 @@ pub const HostDraw = struct {
 };
 
 /// The rule on the host: `row` is the logits as f32, `order` is scratch of the row's length.
-pub fn hostDraw(row: []const f32, order: []u32, temperature: f32, top_p: f32, top_k: u32, key: [2]u32) HostDraw {
+pub fn hostDraw(row: []const f32, order: []u32, temperature: f32, top_p: f32, top_k: u32, min_p: f32, key: [2]u32) HostDraw {
     const inv_t: f32 = 1.0 / temperature;
     const Ctx = struct {
         row: []const f32,
@@ -455,6 +459,12 @@ pub fn hostDraw(row: []const f32, order: []u32, temperature: f32, top_p: f32, to
             if (above < pz) n += 1;
             above += @exp(@as(f64, ctx.val(i)) - m);
         }
+        kept = n;
+    }
+    if (min_p > 0 and m > -std.math.inf(f32)) {
+        const lmp: f32 = @log(min_p);
+        var n: usize = 0;
+        while (n < kept and ctx.val(order[n]) - m >= lmp) n += 1;
         kept = n;
     }
     var best: f32 = -std.math.inf(f32);
@@ -497,7 +507,7 @@ fn testRow(out: []f32, seed: u64, ties: bool) void {
 /// Rows a test's draws sent down each route, by filter: none, top-k, the nucleus, both.
 var test_routes: [4][3]usize = @splat(@splat(0));
 
-fn drawHost(a: std.mem.Allocator, s: mlx.mlx_stream, flat: []const f32, n_rows: usize, vocab: usize, dtype: mlx.mlx_dtype, temperature: f32, top_p: f32, top_k: u32, keys: []const [2]u32) ![]u32 {
+fn drawHost(a: std.mem.Allocator, s: mlx.mlx_stream, flat: []const f32, n_rows: usize, vocab: usize, dtype: mlx.mlx_dtype, temperature: f32, top_p: f32, top_k: u32, min_p: f32, keys: []const [2]u32) ![]u32 {
     const scope = mlx.engine.enter(s);
     defer scope.end();
     const f32_arr = try mlx.newData(flat.ptr, &[_]c_int{ @intCast(n_rows), @intCast(vocab) }, .float32);
@@ -505,7 +515,7 @@ fn drawHost(a: std.mem.Allocator, s: mlx.mlx_stream, flat: []const f32, n_rows: 
     var typed = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(typed);
     try mlx.check(mlx.mlx_astype(&typed, f32_arr, dtype, s));
-    const both = try routed(typed, temperature, top_p, top_k, keys, s);
+    const both = try routed(typed, temperature, top_p, top_k, min_p, keys, s);
     const drawn = both.tok;
     defer _ = mlx.mlx_array_free(drawn);
     defer _ = mlx.mlx_array_free(both.route);
@@ -542,10 +552,10 @@ test "sampler draw: the kernel draws what the rule draws, at every filter, with 
         for ([_]f32{ 0.7, 1.0, 1.4 }) |temperature| for ([_]u32{ 0, 1, 5, 40, 4098, 4099, 9000 }) |top_k| for ([_]f32{ 1.0, 0.95, 0.5, 0.0 }) |top_p| {
             var keys: [n_rows][2]u32 = undefined;
             for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x9000 + r * 7 + top_k), @intCast(0x1234 + r) };
-            const got = try drawHost(a, s, flat, n_rows, vocab, if (ties) .bfloat16 else .float32, temperature, top_p, top_k, &keys);
+            const got = try drawHost(a, s, flat, n_rows, vocab, if (ties) .bfloat16 else .float32, temperature, top_p, top_k, 0, &keys);
             defer a.free(got);
             for (got, 0..) |g, r| {
-                const want = hostDraw(flat[r * vocab ..][0..vocab], order, temperature, top_p, top_k, keys[r]);
+                const want = hostDraw(flat[r * vocab ..][0..vocab], order, temperature, top_p, top_k, 0, keys[r]);
                 // A call the two float orders can make differently is not a verdict: the nucleus within 1e-5 of the
                 // kept mass of its threshold, or two scores within 1e-4.
                 if (want.nucleus_margin < 1e-5) {
@@ -583,10 +593,10 @@ test "sampler draw: a row's draw is the same alone, beside other rows and at any
     for (0..max_rows) |r| testRow(flat[r * vocab ..][0..vocab], 0x77 + r, r % 2 == 0);
     var keys: [max_rows][2]u32 = undefined;
     for (&keys, 0..) |*k, r| k.* = .{ @intCast(31 * r + 5), @intCast(r ^ 0xabc) };
-    const all = try drawHost(a, s, flat, max_rows, vocab, .float32, 0.8, 0.9, 40, &keys);
+    const all = try drawHost(a, s, flat, max_rows, vocab, .float32, 0.8, 0.9, 40, 0, &keys);
     defer a.free(all);
     for (0..max_rows) |r| {
-        const alone = try drawHost(a, s, flat[r * vocab ..][0..vocab], 1, vocab, .float32, 0.8, 0.9, 40, keys[r .. r + 1]);
+        const alone = try drawHost(a, s, flat[r * vocab ..][0..vocab], 1, vocab, .float32, 0.8, 0.9, 40, 0, keys[r .. r + 1]);
         defer a.free(alone);
         try testing.expectEqual(all[r], alone[0]);
     }
@@ -598,7 +608,7 @@ test "sampler draw: a row's draw is the same alone, beside other rows and at any
         @memcpy(rev[r * vocab ..][0..vocab], flat[(max_rows - 1 - r) * vocab ..][0..vocab]);
         rkeys[r] = keys[max_rows - 1 - r];
     }
-    const back = try drawHost(a, s, rev, max_rows, vocab, .float32, 0.8, 0.9, 40, &rkeys);
+    const back = try drawHost(a, s, rev, max_rows, vocab, .float32, 0.8, 0.9, 40, 0, &rkeys);
     defer a.free(back);
     for (0..max_rows) |r| try testing.expectEqual(all[max_rows - 1 - r], back[r]);
 }
@@ -619,7 +629,7 @@ test "sampler draw: an id at -inf is never drawn, one at +inf always is, top-k 1
     // Every id ties: the lowest wins under top-k 1 and under a zero nucleus, whatever the key.
     for ([_][2]u32{ .{ 1, 2 }, .{ 77, 0 }, .{ 0xffff_ffff, 9 } }) |key| {
         for ([_]struct { k: u32, p: f32 }{ .{ .k = 1, .p = 1.0 }, .{ .k = 0, .p = 0.0 }, .{ .k = 7, .p = 0.0 } }) |f| {
-            const got = try drawHost(a, s, row, 1, vocab, .bfloat16, 1.0, f.p, f.k, &.{key});
+            const got = try drawHost(a, s, row, 1, vocab, .bfloat16, 1.0, f.p, f.k, 0, &.{key});
             defer a.free(got);
             try testing.expectEqual(@as(u32, 0), got[0]);
         }
@@ -630,14 +640,14 @@ test "sampler draw: an id at -inf is never drawn, one at +inf always is, top-k 1
     row[2400] = 0.5;
     var seen = [2]usize{ 0, 0 };
     for (0..64) |i| {
-        const got = try drawHost(a, s, row, 1, vocab, .float32, 1.0, 1.0, 0, &.{.{ @intCast(i), 3 }});
+        const got = try drawHost(a, s, row, 1, vocab, .float32, 1.0, 1.0, 0, 0, &.{.{ @intCast(i), 3 }});
         defer a.free(got);
         try testing.expect(got[0] == 1700 or got[0] == 2400);
         seen[@intFromBool(got[0] == 2400)] += 1;
     }
     try testing.expect(seen[0] > 8 and seen[1] > 8);
     @memset(row, -std.math.inf(f32));
-    const none = try drawHost(a, s, row, 1, vocab, .float32, 1.0, 0.9, 5, &.{.{ 4, 4 }});
+    const none = try drawHost(a, s, row, 1, vocab, .float32, 1.0, 0.9, 5, 0, &.{.{ 4, 4 }});
     defer a.free(none);
     try testing.expectEqual(@as(u32, 0), none[0]);
     // One id at +inf, over a floor or alone among -inf: the kernel and the rule draw it under every filter.
@@ -649,10 +659,10 @@ test "sampler draw: an id at -inf is never drawn, one at +inf always is, top-k 1
         row[1234] = std.math.inf(f32);
         for ([_]u32{ 0, 1, 7, vocab }) |top_k| for ([_]f32{ 1.0, 0.9, 1e-6, 0.0, 1e-45 }) |top_p| for ([_]f32{ 0.01, 1.0 }) |temperature| {
             const key: [2]u32 = .{ top_k + 5, @bitCast(top_p) };
-            const got = try drawHost(a, s, row, 1, vocab, .float32, temperature, top_p, top_k, &.{key});
+            const got = try drawHost(a, s, row, 1, vocab, .float32, temperature, top_p, top_k, 0, &.{key});
             defer a.free(got);
             try testing.expectEqual(@as(u32, 1234), got[0]);
-            try testing.expectEqual(@as(u32, 1234), hostDraw(row, order, temperature, top_p, top_k, key).id);
+            try testing.expectEqual(@as(u32, 1234), hostDraw(row, order, temperature, top_p, top_k, 0, key).id);
         };
     }
 }
@@ -685,7 +695,7 @@ test "sampler draw: a repeat penalty that pushes a seen id to +inf draws that id
     try mlx.check(mlx.mlx_array_eval(penalized));
     try testing.expect(std.math.isPositiveInf((mlx.mlx_array_data_float32(penalized) orelse return error.TestUnexpectedResult)[777]));
     for ([_]u32{ 0, 1, 40 }) |top_k| for ([_]f32{ 1.0, 0.9, 0.0, 1e-45 }) |top_p| {
-        const drawn = try rows(penalized, 0.8, top_p, top_k, &.{.{ top_k, 3 }}, s);
+        const drawn = try rows(penalized, 0.8, top_p, top_k, 0, &.{.{ top_k, 3 }}, s);
         defer _ = mlx.mlx_array_free(drawn);
         try mlx.check(mlx.mlx_array_eval(drawn));
         try testing.expectEqual(@as(u32, 777), (mlx.mlx_array_data_uint32(drawn) orelse return error.TestUnexpectedResult)[0]);
@@ -735,10 +745,10 @@ test "sampler draw: at the edges of width, row count, special values and filters
                 for ([_]f32{ 0.7, 100.0 }) |temperature| for ([_]u32{ 0, 1, @intCast(vocab) }) |top_k| for ([_]f32{ 1.0, 0.9, 0.0, 1e-45 }) |top_p| {
                     var keys: [16][2]u32 = undefined;
                     for (keys[0..n_rows], 0..) |*k, r| k.* = .{ @intCast(0x77 + r * 3 + top_k), @intCast(0x99 + r + vocab) };
-                    const got = try drawHost(a, s, flat, n_rows, vocab, .float32, temperature, top_p, top_k, keys[0..n_rows]);
+                    const got = try drawHost(a, s, flat, n_rows, vocab, .float32, temperature, top_p, top_k, 0, keys[0..n_rows]);
                     defer a.free(got);
                     for (got, 0..) |g, r| {
-                        const want = hostDraw(flat[r * vocab ..][0..vocab], order, temperature, top_p, top_k, keys[r]);
+                        const want = hostDraw(flat[r * vocab ..][0..vocab], order, temperature, top_p, top_k, 0, keys[r]);
                         if (pat == 6) {
                             try testing.expectEqual(@as(u32, @intCast((r * 11) % vocab)), g);
                             try testing.expectEqual(g, want.id);
@@ -801,7 +811,7 @@ test "sampler draw: at served vocabularies, over a plateau and a slope, the kern
             for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| for ([_]u32{ 0, 1, 1025, 60000 }) |top_k| for ([_]f32{ 1.0, 0.99, 0.3 }) |top_p| {
                 var keys: [n_rows][2]u32 = undefined;
                 for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x11 + r * 5 + top_k), @intCast(0x23 + r + vocab) };
-                const got = try drawHost(a, s, flat, n_rows, vocab, dtype, 1.0, top_p, top_k, &keys);
+                const got = try drawHost(a, s, flat, n_rows, vocab, dtype, 1.0, top_p, top_k, 0, &keys);
                 defer a.free(got);
                 for (got, 0..) |g, r| {
                     // The rule reads what the kernel reads: the row rounded to the dtype, to nearest even.
@@ -809,7 +819,7 @@ test "sampler draw: at served vocabularies, over a plateau and a slope, the kern
                         const u: u32 = @bitCast(x);
                         o.* = if (dtype == .bfloat16) @bitCast((u +% 0x7FFF +% ((u >> 16) & 1)) & 0xFFFF_0000) else x;
                     }
-                    const want = hostDraw(view, order, 1.0, top_p, top_k, keys[r]);
+                    const want = hostDraw(view, order, 1.0, top_p, top_k, 0, keys[r]);
                     if (want.nucleus_margin < 1e-4 or want.gap < 1e-3) {
                         close += 1;
                         continue;
@@ -854,7 +864,7 @@ test "sampler draw: over many keys the kept ids come out at their share of the k
     var call: u32 = 0;
     while (call < draws / max_rows) : (call += 1) {
         for (&keys, 0..) |*k, r| k.* = .{ call * 16 + @as(u32, @intCast(r)), 0xfeed };
-        const got = try drawHost(a, s, flat, max_rows, vocab, .float32, 1.0, 1.0, 3, &keys);
+        const got = try drawHost(a, s, flat, max_rows, vocab, .float32, 1.0, 1.0, 3, 0, &keys);
         defer a.free(got);
         for (got) |g| {
             const which = std.mem.indexOfScalar(u32, &ids, g) orelse return error.TestUnexpectedResult;
@@ -866,6 +876,102 @@ test "sampler draw: over many keys the kept ids come out at their share of the k
         const sigma = @sqrt(p * (1 - p) / @as(f64, draws));
         try testing.expect(@abs(c / @as(f64, draws) - p) < 4 * sigma);
     }
+}
+
+test "sampler draw: min_p keeps each id whose probability after temperature is at least min_p of the top one's, after top-k and the nucleus" {
+    const a = testing.allocator;
+    const inf = std.math.inf(f32);
+    const row = [_]f32{ 3.0, 2.5, 1.0, 0.0, -1.0, 2.9, -inf, 2.0 };
+    var order: [row.len]u32 = undefined;
+    const Case = struct { temperature: f32, top_p: f32 = 1.0, top_k: u32 = 0, min_p: f32, kept: []const u32 };
+    const cases = [_]Case{
+        .{ .temperature = 1.0, .min_p = 0.5, .kept = &.{ 0, 5, 1 } },
+        // Temperature first: at 2 the ratios flatten and id 7 clears the same min_p.
+        .{ .temperature = 2.0, .min_p = 0.5, .kept = &.{ 0, 5, 1, 7 } },
+        .{ .temperature = 1.0, .min_p = 0.0, .kept = &.{ 0, 5, 1, 7, 2, 3, 4, 6 } },
+        .{ .temperature = 1.0, .min_p = 1.0, .kept = &.{0} },
+        .{ .temperature = 1.0, .top_k = 2, .min_p = 0.5, .kept = &.{ 0, 5 } },
+        .{ .temperature = 1.0, .top_p = 0.3, .min_p = 0.05, .kept = &.{0} },
+        .{ .temperature = 1.0, .top_k = 6, .min_p = 0.05, .kept = &.{ 0, 5, 1, 7, 2 } },
+    };
+    for (cases) |c| {
+        // The definition, in f64: p_i >= min_p * p_max over softmax(logit / temperature).
+        var defined: usize = 0;
+        for (row) |x| {
+            const ratio = @exp((@as(f64, x) - 3.0) / c.temperature);
+            if (ratio >= c.min_p and x > -inf) defined += 1;
+        }
+        const want = hostDraw(&row, &order, c.temperature, c.top_p, c.top_k, c.min_p, .{ 1, 2 });
+        try testing.expectEqualSlices(u32, c.kept, order[0..want.kept]);
+        if (c.top_k == 0 and c.top_p == 1.0 and c.min_p > 0) try testing.expectEqual(defined, want.kept);
+    }
+
+    try mlx.requireGpu();
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    for (cases) |c| {
+        var seen: [row.len]bool = @splat(false);
+        var key: u32 = 0;
+        while (key < 256) : (key += 1) {
+            const k: [2]u32 = .{ key, 0x51 };
+            const got = try drawHost(a, s, &row, 1, row.len, .float32, c.temperature, c.top_p, c.top_k, c.min_p, &.{k});
+            defer a.free(got);
+            try testing.expect(std.mem.indexOfScalar(u32, c.kept, got[0]) != null);
+            try testing.expectEqual(hostDraw(&row, &order, c.temperature, c.top_p, c.top_k, c.min_p, k).id, got[0]);
+            seen[got[0]] = true;
+        }
+        // Under min_p every kept id holds at least 4% of the kept mass, so each comes out over the keys.
+        if (c.min_p > 0) for (c.kept) |id| try testing.expect(seen[id]);
+    }
+}
+
+test "sampler draw: under min_p the kernel draws what the rule draws on both routes, with and without ties" {
+    try mlx.requireGpu();
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    const vocab = 4099;
+    const n_rows = 5;
+    const flat = try a.alloc(f32, n_rows * vocab);
+    defer a.free(flat);
+    const order = try a.alloc(u32, vocab);
+    defer a.free(order);
+    var checked: usize = 0;
+    var close: usize = 0;
+    test_routes = @splat(@splat(0));
+    for ([_]bool{ false, true }) |ties| {
+        for (0..n_rows) |r| testRow(flat[r * vocab ..][0..vocab], 0x6b1d + r + @as(u64, @intFromBool(ties)) * 100, ties);
+        for ([_]f32{ 0.7, 1.4 }) |temperature| for ([_]u32{ 0, 5, 40 }) |top_k| for ([_]f32{ 1.0, 0.9 }) |top_p| for ([_]f32{ 0.02, 0.3, 1.0 }) |min_p| {
+            var keys: [n_rows][2]u32 = undefined;
+            for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x3000 + r * 7 + top_k), @intCast(0x77 + r) };
+            const got = try drawHost(a, s, flat, n_rows, vocab, if (ties) .bfloat16 else .float32, temperature, top_p, top_k, min_p, &keys);
+            defer a.free(got);
+            for (got, 0..) |g, r| {
+                const want = hostDraw(flat[r * vocab ..][0..vocab], order, temperature, top_p, top_k, min_p, keys[r]);
+                if (want.nucleus_margin < 1e-5 or want.gap < 1e-4) {
+                    close += 1;
+                    if (want.nucleus_margin >= 1e-5) try testing.expect(g == want.id or g == want.second.?);
+                    continue;
+                }
+                try testing.expectEqual(want.id, g);
+                checked += 1;
+            }
+        };
+    }
+    try testing.expect(checked > 20 * close);
+    var by_route = [3]usize{ 0, 0, 0 };
+    for (test_routes[1..]) |row_routes| for (row_routes, 0..) |seen, r| {
+        by_route[r] += seen;
+    };
+    try testing.expect(by_route[1] > 0 and by_route[2] > 0);
 }
 
 /// The inverse of `mix`: each of its steps is a bijection of u32.
@@ -913,7 +1019,7 @@ test "sampler draw: a key that maxes a negligible id's hash still draws the like
     @memset(row, -20.0);
     row[7] = 10.0;
     const key = keyHashing(2000, 0xFFFF_FFFF);
-    try testing.expectEqual(@as(u32, 7), hostDraw(row, order, 1.0, 1.0, 0, key).id);
+    try testing.expectEqual(@as(u32, 7), hostDraw(row, order, 1.0, 1.0, 0, 0, key).id);
 
     try mlx.requireGpu();
     const had_error = mlx.errorPending();
@@ -922,7 +1028,7 @@ test "sampler draw: a key that maxes a negligible id's hash still draws the like
     mlx.engine.enabled = true;
     defer @import("test_support.zig").restoreEngine(was);
     for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {
-        const got = try drawHost(a, mlx.engine.stream(), row, 1, vocab, dtype, 1.0, 1.0, 0, &.{key});
+        const got = try drawHost(a, mlx.engine.stream(), row, 1, vocab, dtype, 1.0, 1.0, 0, 0, &.{key});
         defer a.free(got);
         try testing.expectEqual(@as(u32, 7), got[0]);
     }
@@ -947,7 +1053,7 @@ test "sampler draw: at a served vocabulary an unfiltered row never draws an id o
     var call: u32 = 0;
     while (call < 96) : (call += 1) {
         for (&keys, 0..) |*k, r| k.* = .{ call * 16 + @as(u32, @intCast(r)), 0xc0de };
-        const got = try drawHost(a, s, flat, max_rows, vocab, .float32, 1.0, 1.0, 0, &keys);
+        const got = try drawHost(a, s, flat, max_rows, vocab, .float32, 1.0, 1.0, 0, 0, &keys);
         defer a.free(got);
         for (got, 0..) |g, r| try testing.expectEqual(@as(u32, @intCast(1000 * r + 3)), g);
     }
@@ -977,7 +1083,7 @@ test "sampler draw: at every thread rung the kernel draws what the rule draws, a
     {
         var probe_keys: [n_rows][2]u32 = undefined;
         for (&probe_keys, 0..) |*k, r| k.* = .{ @intCast(r), 1 };
-        a.free(try drawHost(a, s, flat, n_rows, vocab, .float32, 0.9, 1.0, 0, &probe_keys));
+        a.free(try drawHost(a, s, flat, n_rows, vocab, .float32, 0.9, 1.0, 0, 0, &probe_keys));
     }
     const chip = ladder.threads();
     var checked: usize = 0;
@@ -992,11 +1098,11 @@ test "sampler draw: at every thread rung the kernel draws what the rule draws, a
                 const top_k: u32 = @intFromFloat(f[1]);
                 var keys: [n_rows][2]u32 = undefined;
                 for (&keys, 0..) |*k, r| k.* = .{ @intCast(0x4000 + r * 3 + top_k), @intCast(0x77 + r) };
-                const got = try drawHost(a, s, flat, n_rows, vocab, .float32, 0.9, top_p, top_k, &keys);
+                const got = try drawHost(a, s, flat, n_rows, vocab, .float32, 0.9, top_p, top_k, 0, &keys);
                 defer a.free(got);
                 try testing.expectEqual(want_rung, ladder.threads());
                 for (got, 0..) |g, r| {
-                    const want = hostDraw(flat[r * vocab ..][0..vocab], order, 0.9, top_p, top_k, keys[r]);
+                    const want = hostDraw(flat[r * vocab ..][0..vocab], order, 0.9, top_p, top_k, 0, keys[r]);
                     if (want.nucleus_margin < 1e-5) continue;
                     if (want.gap < 1e-4) {
                         try testing.expect(g == want.id or g == want.second.?);
@@ -1022,6 +1128,6 @@ test "sampler draw: a GPU that refuses every rung gets the refusal by name, and 
     const logits = mlx.mlx_array_new_data(&flat, &[_]c_int{ 1, 4 }, 2, .float32);
     defer _ = mlx.mlx_array_free(logits);
     const keys = [_][2]u32{.{ 1, 2 }};
-    try testing.expectError(error.SamplerDrawGroupRefused, routed(logits, 1.0, 1.0, 0, &keys, mlx.gpuStream()));
+    try testing.expectError(error.SamplerDrawGroupRefused, routed(logits, 1.0, 1.0, 0, 0, &keys, mlx.gpuStream()));
     try testing.expectEqual(@as(u32, 256), ladder.threads());
 }
