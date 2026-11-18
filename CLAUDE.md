@@ -47,6 +47,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/dsv41-arch.md](docs/dsv41-arch.md) | DeepSeek-V4.1-Flash: geometry, FP8 trunk + streamed experts, Engram, CED prefill, oracle, kernels, DSpark, STQ, `--drop-expert`, prefix cache, images |
 | [docs/dsv41-memory.md](docs/dsv41-memory.md) | DeepSeek-V4.1 ledger, per-layer cache split, 1M-token state, prefill borrow, resident load |
 | [docs/dsv41-parity.md](docs/dsv41-parity.md) | DeepSeek-V4.1 against Qwen: feature matrix, larger gaps, live checks |
+| [docs/hy4-flash-arch.md](docs/hy4-flash-arch.md) | Hy4-Flash (not served yet): forward on Sushi Cooler, seams, bills, pack, parity, 1.8.0 parts |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
 | [docs/encoder.md](docs/encoder.md) | `sushi convert exl3`: flags, what a pack holds, trunk rules, calibration, Hessians, resume, stamps |
 | [docs/engine-exl3-encoder.md](docs/engine-exl3-encoder.md) | EXL3 encoder core: trellis search, LDLQ, signs, shard writer, Qwen BF16 reader |
