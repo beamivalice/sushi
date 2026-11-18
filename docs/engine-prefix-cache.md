@@ -478,15 +478,24 @@ that sets `holds_off_grid_points` (Qwen) keeps its off-grid points (a prompt end
   hold; a flush stages them as the file. Grid points (`hold_stride`, the checkpoint grid) are written through as before.
 - **The cap is `HELD_POINTS_MAX_BYTES` (250 MB), or the writer's permit over `HELD_POINTS_PERMIT_DIVISOR` (2) when
   that is smaller** ([engine-memory-admission](engine-memory-admission.md)): the newest two points of the STQ 4bpw pack
-  (2 x 115.7 MB) fit from a 64 GB Mac. Past it a spare goes first, unwritten, then the oldest held point is written; a
-  staged write that needs the permit's room writes held points first, so they never hold the writer up.
+  (2 x 115.7 MB) fit from a 64 GB Mac. Past it held points are written, never dropped: a spare first, then the oldest;
+  a staged write that needs the permit's room writes held points first, so they never hold the writer up.
 - **A point a newer one extends is kept as a spare, the newest such point only**: a commit whose points extend held
   ones (one whose entry's tokens contain them) keeps the newest of them, so a regenerate of the turn restores from its
   own prompt end, live and after a flush, which writes the spare like any other; the older ones go unwritten. A spare
-  is the first point dropped over the cap: where the newest two do not fit, a regenerate restores from the last
-  written point instead. Any other point leaving RAM (another conversation's, the cap) is written, never dropped. A
-  rewind past the points held restores from the last written point (a grid point, at most 8,191 tokens back) and
-  re-prefills the gap. Guard: `a regenerated Qwen turn restores from its own prompt end, live and after a flush`.
+  is the first point written over the cap (owner): where the newest two do not fit (an agent turn past ~40k tokens on
+  4bpw), the turn writes its spare, so a prompt that re-renders the reply's tail (a thought point under a coerced tool
+  call) restores from it, not from the grid point up to 8,191 tokens back. Ordinary turns still write no point. Any
+  other point leaving RAM (another conversation's, the cap) is written, never dropped. A rewind past the points held
+  restores from the last written point (a grid point, at most 8,191 tokens back) and re-prefills the gap. Guard: `a
+  regenerated Qwen turn restores from its own prompt end, live and after a flush`.
+- **Every point the index names restores from where it lives, its held bytes or its file**: the cap is fitted
+  (`fitHeld`) only once the index holds the commit, so a point whose write fails leaves the record that names it.
+  Fitted inside the commit, it left the record the commit replaced, and the commit listed a point with no bytes: a
+  prompt that re-rendered the reply after it restored nothing (`DiskCacheNoCheckpoint`, a cold 40k-token prefill). A
+  held point whose write fails while it gives way to a staged write mid-commit is unlisted again once the commit is in
+  the index (`lost_points`, `settleHeld`). Guards: `a Qwen prompt that re-renders an earlier reply restores from that
+  turn's own point`, `a held Qwen restore point whose write fails as it gives way to a staged write`.
 - **They are written where the process's copy is about to go**, on DeepSeek's triggers (`sched.flushResident`):
   another model's load or an unload (`retire`), 300 s idle (`live_unflushed`), shutdown. A crash or `kill -9` loses
   them: the manifest names the point with no file, and the next scan drops it, as it drops any point whose file is

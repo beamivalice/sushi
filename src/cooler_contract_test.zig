@@ -2917,6 +2917,93 @@ test "cooler contract: a regenerated Qwen turn restores from its own prompt end,
     }.run);
 }
 
+/// Every restore point the SSD tier's index names restores from where it lives: its held bytes or its file.
+fn expectListedPointsLive(disk: *@import("kv_disk_cache.zig").DiskTier) !void {
+    disk.drainWriter();
+    for (disk.entries.items) |e| for (e.ssm_positions) |p| {
+        if (disk.heldIndex(e.id, p) != null) continue;
+        var buf: [1024]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "{s}/e{d}/s{d:0>7}.safetensors", .{ disk.root, e.id, p });
+        errdefer std.debug.print("cooler contract: e{d} lists a restore point at {d} that is neither held nor on disk\n", .{ e.id, p });
+        try testing.expect(disk.fs.size(path) != null);
+    };
+}
+
+test "cooler contract: a Qwen prompt that re-renders an earlier reply restores from that turn's own point, written when the held points pass the cap" {
+    try eachQwenServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            const disk = &sv.entry.prefix_cache.?.disk.?;
+            // Over the 8192 grid, so a written grid point lies under the turns' held points.
+            var conv = try heldPrompt(a, ids, 9000, 41);
+            defer conv.deinit(a);
+            var f: u32 = 0;
+            // The second turn's prompt and the first 8 tokens of its reply: an agent's later prompt that re-renders
+            // the rest of that reply (a coerced tool call) shares this much.
+            var shared: usize = 0;
+            for (0..3) |turn| {
+                var reply = try sv.request(conv.items, 16, &f);
+                defer reply.deinit(a);
+                try expectListedPointsLive(disk);
+                // Room for one point and a half: a commit keeps its newest point held and writes the spare it supersedes.
+                if (turn == 0) disk.held_cap_for_test = disk.held_bytes / disk.held.items.len * 3 / 2;
+                if (turn == 1) shared = conv.items.len + 8;
+                try conv.appendSlice(a, reply.items);
+                for (0..600) |i| try conv.append(a, ids[(i * 13 + turn * 101) % ids.len]);
+            }
+            var next = try conv.clone(a);
+            defer next.deinit(a);
+            next.shrinkRetainingCapacity(shared);
+            for (0..200) |i| try next.append(a, ids[(i * 17 + 3) % ids.len]);
+            var last = try sv.request(next.items, 16, &f);
+            last.deinit(a);
+            // The second turn's prompt-end point, not the 8192 grid point under it.
+            try testing.expectEqual(@as(u32, @intCast(shared - 8 - 31)), sv.reused);
+        }
+    }.run);
+}
+
+test "cooler contract: a held Qwen restore point whose write fails as it gives way to a staged write mid-commit leaves no listed point without bytes" {
+    try eachQwenServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            const disk = &sv.entry.prefix_cache.?.disk.?;
+            var conv = try heldPrompt(a, ids, 3000, 51);
+            defer conv.deinit(a);
+            var f: u32 = 0;
+            var first = try sv.request(conv.items, 16, &f);
+            try conv.appendSlice(a, first.items);
+            first.deinit(a);
+            try expectListedPointsLive(disk);
+            const one = disk.held_bytes;
+            try testing.expect(one > 0);
+            // The next turn's commit stages its chunks with too little permit beside the held points, and their writes fail.
+            const permit = disk.writer.?.permit_bytes;
+            defer disk.writer.?.permit_bytes = permit;
+            disk.writer.?.permit_bytes = one + (1 << 20);
+            disk.fail_held_flush_for_test = true;
+            defer disk.fail_held_flush_for_test = false;
+            for (0..1500) |i| try conv.append(a, ids[(i * 13 + 7) % ids.len]);
+            var next = try sv.request(conv.items, 16, &f);
+            next.deinit(a);
+            try testing.expectEqual(@as(usize, 0), disk.held.items.len);
+            try expectListedPointsLive(disk);
+        }
+    }.run);
+}
+
 test "cooler contract: held Qwen restore points give way to a staged write that needs the writer's permit" {
     try eachQwenServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {

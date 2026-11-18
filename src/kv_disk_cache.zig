@@ -126,9 +126,10 @@ pub const HELD_POINTS_MAX_BYTES: u64 = 250_000_000;
 pub const HELD_POINTS_PERMIT_DIVISOR: u64 = 2;
 
 /// One restore point kept in RAM as its file's bytes (`serializeSafetensors`), listed in entry `id`'s positions.
-/// `spare`: a point a newer one of its conversation extends, kept so a regenerate of its turn restores from it; the
-/// first to go, unwritten, when the held points pass the cap, and written by a flush like any other.
+/// `spare`: a point a newer one of its conversation extends, kept so a regenerate of its turn, or a prompt that
+/// re-renders the reply after it, restores from it; the first written when the held points pass the cap.
 pub const HeldPoint = struct { id: u64, pos: u32, bytes: []u8, spare: bool = false };
+pub const PointKey = struct { id: u64, pos: u32 };
 pub const RingFile = disk_format.RingFile;
 
 /// What a commit of a ringed cache adds: its sliding layers hold only a window, so the entry
@@ -368,8 +369,13 @@ pub const DiskTier = struct {
     /// The off-grid points held in RAM, oldest first, and their bytes.
     held: std.ArrayList(HeldPoint) = .empty,
     held_bytes: u64 = 0,
+    /// Held points a failed write took out of RAM during the current commit: its record may still name them, so they
+    /// are unlisted again once the index holds it (`settleHeld`).
+    lost_points: std.ArrayList(PointKey) = .empty,
     /// Tests size the cap in points of a fixture (`heldCap`).
     held_cap_for_test: ?u64 = null,
+    /// Tests fail every write of a held point (`flushHeldAt`) before it stages.
+    fail_held_flush_for_test: bool = false,
     /// Rows per whole segment of a growing sidecar (`SIDE_SEG_SPAN`).
     seg_span: u32 = SIDE_SEG_SPAN,
     /// What the last `persisted` line reports: every file the commit wrote but the manifest and the token record.
@@ -730,6 +736,7 @@ pub const DiskTier = struct {
     pub fn deinit(self: *DiskTier) void {
         for (self.held.items) |h| self.allocator.free(h.bytes);
         self.held.deinit(self.allocator);
+        self.lost_points.deinit(self.allocator);
         if (self.grown) |g| self.allocator.free(g.divs);
         if (self.base_dir) |b| self.allocator.free(b);
         self.base_dir = null;
@@ -1888,6 +1895,7 @@ pub const DiskTier = struct {
     }
 
     fn appendCommitWithSpecBounded(self: *DiskTier, p: CommitParams, s: mlx.mlx_stream, flush_bound: u64) !PersistOutcome {
+        self.lost_points.clearRetainingCapacity();
         const kv_entries = p.kv_entries;
         const step = p.step;
         const config = p.config;
@@ -2260,14 +2268,18 @@ pub const DiskTier = struct {
             self.total_bytes += new_entry.bytes;
         }
         self.last_store_id = id;
+        self.settleHeld(s);
         self.gcToBudget();
+        const listed: usize = for (self.entries.items) |e| {
+            if (e.id == id) break e.ssm_positions.len;
+        } else 0;
 
         self.last_persist_bytes = written_bytes;
         const wrote_mb = @as(f64, @floatFromInt(written_bytes)) / (1024.0 * 1024.0);
         const ms: u64 = sw.read() / std.time.ns_per_ms;
         const waited_ms: u64 = if (self.writer) |w| (w.waitedNs() -| waited_before) / std.time.ns_per_ms else 0;
         log.info("  [disk-cache] persisted {d}/{d} tokens (+{d} chunks, {d} ssm-cp, {d:.1} MB, {d}ms, {d}ms waiting on the writer); resident={d:.1} MB ({d} entries)\n", .{
-            kv_len,                                                        kv_target,              chunks_done - keep, new_entry.ssm_positions.len, wrote_mb, ms, waited_ms,
+            kv_len,                                                        kv_target,              chunks_done - keep, listed, wrote_mb, ms, waited_ms,
             @as(f64, @floatFromInt(self.total_bytes)) / (1024.0 * 1024.0), self.entries.items.len,
         });
         // The one completion marker: every chunk and every wanted checkpoint is staged. A
@@ -2279,7 +2291,7 @@ pub const DiskTier = struct {
             if (self.entryPoisoned(id)) whole = false;
         }
         if (whole) {
-            log.info("  [disk-cache] e{d} complete on disk: {d} tokens, {d} chunks, {d} ssm-cp\n", .{ id, kv_len, new_entry.chunk_bytes.len, new_entry.ssm_positions.len });
+            log.info("  [disk-cache] e{d} complete on disk: {d} tokens, {d} chunks, {d} ssm-cp\n", .{ id, kv_len, new_entry.chunk_bytes.len, listed });
         }
         return if (whole) .persisted else .partial;
     }
@@ -2401,6 +2413,7 @@ pub const DiskTier = struct {
         live.* = updated;
         self.total_bytes = clampAdd(self.total_bytes, delta);
         self.last_store_id = updated.id;
+        self.settleHeld(s);
         self.gcToBudget();
         return if (ssm_res.complete) .persisted else .partial;
     }
@@ -3638,7 +3651,6 @@ pub const DiskTier = struct {
                 }
                 i += 1;
             }
-            self.fitHeld(s);
         }
 
         std.mem.sort(Pair, pairs.items, {}, struct {
@@ -4055,8 +4067,12 @@ pub const DiskTier = struct {
         const h = self.held.orderedRemove(i);
         self.held_bytes -|= h.bytes.len;
         defer self.allocator.free(h.bytes);
-        // A point that is neither held nor written is not listed.
-        errdefer self.unlistPoint(h.id, h.pos);
+        // A point that is neither held nor written is not listed, nor by the record a commit in flight installs.
+        errdefer {
+            self.unlistPoint(h.id, h.pos);
+            self.lost_points.append(self.allocator, .{ .id = h.id, .pos = h.pos }) catch {};
+        }
+        if (@import("builtin").is_test and self.fail_held_flush_for_test) return error.InjectedHeldFlushFailure;
         const loaded = try vt.loadBytes(self.allocator, h.bytes, s);
         defer loaded.deinit();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -4079,16 +4095,24 @@ pub const DiskTier = struct {
         if (sz != h.bytes.len) log.warn("  [disk-cache] held point e{d}@{d} wrote {d} bytes, listed {d}\n", .{ h.id, h.pos, sz, h.bytes.len });
     }
 
-    /// Fits the held points under the cap and the writer's share of the permit: a spare goes first, unwritten (a newer
-    /// point of its conversation restores the next turn), then the oldest is written.
+    /// Runs once the index holds a commit: the points that left RAM unwritten during it, and those `fitHeld` drops,
+    /// are taken out of the record that names them, not the one it replaced.
+    fn settleHeld(self: *DiskTier, s: mlx.mlx_stream) void {
+        for (self.lost_points.items) |k| if (self.heldIndex(k.id, k.pos) == null) self.unlistPoint(k.id, k.pos);
+        self.lost_points.clearRetainingCapacity();
+        self.fitHeld(s);
+    }
+
+    /// Fits the held points under the cap and the writer's share of the permit by writing them: a spare first (the
+    /// commit that made it holds the newer point after it), then the oldest.
     fn fitHeld(self: *DiskTier, s: mlx.mlx_stream) void {
         while (self.held_bytes > self.heldCap()) {
             const j = for (self.held.items, 0..) |h, j| {
                 if (h.spare) break j;
             } else break;
-            const h = self.held.items[j];
-            self.unlistPoint(h.id, h.pos);
-            self.dropHeldAt(j);
+            self.flushHeldAt(j, s) catch |err| {
+                log.warn("  [disk-cache] a held restore point could not be written: {s}; dropped\n", .{@errorName(err)});
+            };
         }
         while (self.held.items.len > 0 and self.held_bytes > self.heldCap()) self.flushHeldAt(0, s) catch |err| {
             log.warn("  [disk-cache] a held restore point could not be written: {s}; dropped\n", .{@errorName(err)});
