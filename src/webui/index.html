@@ -4306,11 +4306,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   portRow.ctl.append(h("div", { class: "row-in" }, portIn, portSave), portRow.bad, portWarn);
   q("portSet").replaceWith(portRow.row);
 
-  const REQUEST_SPEC = { type: "int", min: 1, max: 4096 };
-  const requestRow = setRow("max_request_mb", "Request size limit", "requestMb", "Maximum HTTP request size in MiB, including conversation history and base64 images. Larger limits allow more attachments but use more memory. Applies to new requests without a restart.", keyTerm("max_request_mb", "HTTP request size limit"));
+  // The range is the server's, so the page never refuses a value the server takes or the reverse.
+  const requestSpec = (p) => ({ type: "int", min: p.min, max: p.max });
+  const requestRow = setRow("max_request_mb", "Request size limit", "requestMb", "The largest request sushi accepts, in MiB. Every message resends the whole conversation, images included, so a long chat with many images can be refused as too large. 128 fits most; raise it only after such a refusal.", keyTerm("max_request_mb", "HTTP request size limit"));
   const requestIn = h("input", { id: "requestMb", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default (128)", "aria-label": "HTTP request size limit in MiB", oninput: () => { A.requestText = requestIn.value; typed("max_request_mb"); renderRequestLimit(A.settings.server.max_request_mb); }, onkeydown: (e) => enterTo(requestSave)(e) });
   const requestSave = h("button", { class: "btn sm primary", id: "requestSave", type: "button", text: "Save", onclick: () => {
-    const v = adminControlValue(REQUEST_SPEC, requestIn.value);
+    const v = adminControlValue(requestSpec(A.settings.server.max_request_mb), requestIn.value);
     if (v.ok) saveServer("max_request_mb", v.value, "Saved.", requestSave, "Saving…");
   } });
   requestRow.ctl.append(h("div", { class: "row-in" }, requestIn, h("span", { class: "muted", text: "MiB" }), requestSave), requestRow.bad);
@@ -4607,11 +4608,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (A.requestText === file) A.requestText = null;
     if (A.requestText === null && requestIn.value !== file) requestIn.value = file;
     requestIn.placeholder = `Default (${p.default})`;
-    const text = requestIn.value.trim(), parsed = adminControlValue(REQUEST_SPEC, text), dirty = text !== file, busy = requestSave.getAttribute("aria-busy") === "true";
+    setText(requestRow.help, "How large one request may be, its conversation and images included. A larger limit lets one request use more memory.");
+    const text = requestIn.value.trim(), parsed = adminControlValue(requestSpec(p), text), dirty = text !== file, busy = requestSave.getAttribute("aria-busy") === "true";
     setHidden(requestSave, !dirty);
     requestSave.disabled = !dirty || !parsed.ok || busy;
     if (!busy) setText(requestSave, text === "" ? "Use default" : "Save");
-    setText(requestRow.bad, (dirty && text && !parsed.ok ? "Enter a whole number from 1 to 4096 MiB." : "") || A.serr.max_request_mb || "");
+    setText(requestRow.bad, (dirty && text && !parsed.ok ? `Enter a whole number from ${p.min} to ${p.max} MiB.` : "") || A.serr.max_request_mb || "");
     requestIn.setAttribute("aria-invalid", String(!!requestRow.bad.textContent));
   }
   function renderPort(p) {

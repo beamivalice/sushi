@@ -51,7 +51,7 @@ function makeServer(opts = {}) {
       pack_update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
       skip_mem_preflight: { file: null, flag: null, default: false, source: 'default', locked: false, applies: 'applies at once' },
       port: { file: null, flag: null, default: 12345, source: 'default', locked: false, applies: 'the next start; a running server keeps its port' },
-      max_request_mb: { file: null, default: 128, min: 1, max: 4096, source: 'default', locked: false, applies: 'applies at once to new requests; uploads already in progress keep their limit' },
+      max_request_mb: { file: null, default: 128, min: 1, max: 1024, source: 'default', locked: false, applies: 'applies at once to new requests; uploads already in progress keep their limit' },
     },
     cache: {
       root: '/h/.sushi/kv-cache', volume: { free_bytes: 1399 * GiB, total_bytes: 3722 * GiB }, total_bytes: 71.5 * GiB,
@@ -1132,10 +1132,12 @@ async function main() {
     await scenario('request size limit validates, saves and resets without a restart', { path: '/settings' }, async ({ page, server }) => {
       await page.waitForSelector('#requestMb', { timeout: 3000 });
       assert.equal(await page.getAttribute('#requestMb', 'placeholder'), 'Default (128)');
-      for (const value of ['0', '4097', '1.5', 'abc']) {
+      assert.match(await page.textContent('.set[data-key="max_request_mb"] .help'), /images.*memory/, 'the row says what the limit covers and what raising it costs');
+      for (const value of ['0', '1025', '1.5', 'abc']) {
         await page.fill('#requestMb', value);
         assert.equal(await page.isDisabled('#requestSave'), true);
         assert.equal(await page.getAttribute('#requestMb', 'aria-invalid'), 'true');
+        assert.equal(await page.textContent('.set[data-key="max_request_mb"] .bad'), 'Enter a whole number from 1 to 1024 MiB.');
       }
       await page.fill('#requestMb', '5');
       await page.click('#requestSave');
@@ -1146,6 +1148,20 @@ async function main() {
       await page.click('#requestSave');
       await page.waitForFunction(() => document.querySelector('#requestMb').value === '');
       assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings')[1].body, { server: { max_request_mb: null } });
+    });
+    await scenario('the request size limit takes its range from the server', { path: '/settings', setup: (s) => {
+      Object.assign(s.state.server.max_request_mb, { min: 2, max: 300 });
+    } }, async ({ page }) => {
+      await page.waitForSelector('#requestMb', { timeout: 3000 });
+      for (const value of ['1', '301']) {
+        await page.fill('#requestMb', value);
+        assert.equal(await page.isDisabled('#requestSave'), true, `${value} is outside 2-300`);
+        assert.equal(await page.textContent('.set[data-key="max_request_mb"] .bad'), 'Enter a whole number from 2 to 300 MiB.');
+      }
+      for (const value of ['2', '300']) {
+        await page.fill('#requestMb', value);
+        assert.equal(await page.isDisabled('#requestSave'), false, `${value} is inside 2-300`);
+      }
     });
     await scenario('--port locks the default port and names the flag', { path: '/settings', setup: (s) => {
       Object.assign(s.state.server.port, { flag: '9000', source: 'flag', locked: true });

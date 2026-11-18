@@ -1169,7 +1169,8 @@ test "settings api: request size limit accepts MiB or null and rejects invalid v
     const reset = parseRequest(arena_state.allocator(), "{\"server\":{\"max_request_mb\":null}}");
     try testing.expect(reset == .ok);
     try testing.expect(reset.ok.server_edits[0].value == null);
-    for ([_][]const u8{ "0", "-1", "4097", "1.5", "\"5\"", "true" }) |value| {
+    try testing.expect(parseRequest(arena_state.allocator(), "{\"server\":{\"max_request_mb\":1024}}") == .ok);
+    for ([_][]const u8{ "0", "-1", "1025", "1.5", "\"5\"", "true" }) |value| {
         const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"server\":{{\"max_request_mb\":{s}}}}}", .{value});
         try expectRejected(body, 400, "invalid_setting");
     }

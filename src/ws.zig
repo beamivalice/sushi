@@ -1,15 +1,12 @@
 //! Minimal RFC 6455 WebSocket framing + handshake.
 //!
 //! Server-side only — no masking on outbound frames; rejects fragmented
-//! control frames per spec; tear down on payloads >16 MiB.
+//! control frames per spec; tear down on a message over the caller's live limit.
 //!
 //! Designed to layer on top of `server.Conn`: the caller drives the read/write
 //! loop and decides what to do with text frames.
 
 const std = @import("std");
-
-/// Server-imposed cap on a single message's reassembled payload.
-pub const max_message_bytes: usize = 16 * 1024 * 1024;
 
 /// Magic GUID per RFC 6455 §1.3.
 const ws_magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -37,14 +34,18 @@ pub fn WsConn(comptime ConnT: type) type {
     return struct {
         const Self = @This();
         conn: *ConnT,
+        /// The cap on a reassembled message, read once when the message starts.
+        limit: *const std.atomic.Value(usize),
+        /// The cap of the message being read, or of the last one.
+        message_limit: usize = 0,
         /// Set when a control or fragmented data message has been partially
         /// reassembled. When non-null, any incoming frame with opcode != 0
         /// (continuation) and != control is a protocol violation.
         in_message: ?std.ArrayList(u8) = null,
         in_opcode: Opcode = .continuation,
 
-        pub fn init(conn: *ConnT) Self {
-            return .{ .conn = conn };
+        pub fn init(conn: *ConnT, limit: *const std.atomic.Value(usize)) Self {
+            return .{ .conn = conn, .limit = limit };
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
@@ -57,7 +58,8 @@ pub fn WsConn(comptime ConnT: type) type {
         /// is returned with its payload — the caller decides how to respond.
         pub fn readMessage(self: *Self, allocator: std.mem.Allocator) !Message {
             while (true) {
-                const frame = try readFrame(self.conn, allocator);
+                if (self.in_message == null) self.message_limit = self.limit.load(.monotonic);
+                const frame = try readFrame(self.conn, allocator, self.message_limit);
                 // The payload is freed on every exit except the ones that hand it to the caller.
                 var returned = false;
                 defer if (!returned) allocator.free(frame.payload);
@@ -88,7 +90,7 @@ pub fn WsConn(comptime ConnT: type) type {
                 } else {
                     if (frame.opcode != .continuation) return error.WsProtocol;
                     var buf = &self.in_message.?;
-                    if (buf.items.len + frame.payload.len > max_message_bytes) return error.WsTooLarge;
+                    if (buf.items.len + frame.payload.len > self.message_limit) return error.WsTooLarge;
                     try buf.appendSlice(allocator, frame.payload);
                     if (frame.fin) {
                         const owned = try buf.toOwnedSlice(allocator);
@@ -151,7 +153,7 @@ fn readExact(conn: anytype, buf: []u8) !void {
     }
 }
 
-fn readFrame(conn: anytype, allocator: std.mem.Allocator) !RawFrame {
+fn readFrame(conn: anytype, allocator: std.mem.Allocator, limit: usize) !RawFrame {
     var hdr: [2]u8 = undefined;
     try readExact(conn, &hdr);
 
@@ -175,7 +177,7 @@ fn readFrame(conn: anytype, allocator: std.mem.Allocator) !RawFrame {
         try readExact(conn, &ext);
         payload_len = std.mem.readInt(u64, &ext, .big);
     }
-    if (payload_len > max_message_bytes) return error.WsTooLarge;
+    if (payload_len > limit) return error.WsTooLarge;
 
     var mask_key: [4]u8 = undefined;
     try readExact(conn, &mask_key);
@@ -292,6 +294,8 @@ test "isUpgrade detects upgrade headers" {
     try testing.expect(!isUpgrade("Connection: keep-alive\r\n"));
 }
 
+var test_limit = std.atomic.Value(usize).init(1 << 20);
+
 // MockConn — exercises the framing path without a real socket.
 const MockConn = struct {
     read_data: []const u8,
@@ -360,7 +364,7 @@ test "round-trip a small text frame" {
 
     var mock = MockConn.init(a, frame_bytes);
     defer mock.deinit();
-    var ws = WsConn(MockConn).init(&mock);
+    var ws = WsConn(MockConn).init(&mock, &test_limit);
     defer ws.deinit(a);
 
     const msg = try ws.readMessage(a);
@@ -380,7 +384,7 @@ test "fragmented text reassembles" {
 
     var mock = MockConn.init(a, all);
     defer mock.deinit();
-    var ws = WsConn(MockConn).init(&mock);
+    var ws = WsConn(MockConn).init(&mock, &test_limit);
     defer ws.deinit(a);
 
     const msg = try ws.readMessage(a);
@@ -402,7 +406,7 @@ test "ping interleaved during fragmented data is reported separately" {
 
     var mock = MockConn.init(a, all);
     defer mock.deinit();
-    var ws = WsConn(MockConn).init(&mock);
+    var ws = WsConn(MockConn).init(&mock, &test_limit);
     defer ws.deinit(a);
 
     const m1 = try ws.readMessage(a);
@@ -420,7 +424,7 @@ test "writeText emits unmasked frame with correct length encoding" {
     const a = testing.allocator;
     var mock = MockConn.init(a, "");
     defer mock.deinit();
-    var ws = WsConn(MockConn).init(&mock);
+    var ws = WsConn(MockConn).init(&mock, &test_limit);
     defer ws.deinit(a);
 
     try ws.writeText("hi");
@@ -434,7 +438,7 @@ test "writeText with 16-bit length boundary" {
     const a = testing.allocator;
     var mock = MockConn.init(a, "");
     defer mock.deinit();
-    var ws = WsConn(MockConn).init(&mock);
+    var ws = WsConn(MockConn).init(&mock, &test_limit);
     defer ws.deinit(a);
 
     const payload = try a.alloc(u8, 200);
@@ -453,7 +457,7 @@ test "unmasked client frame is rejected" {
     const bytes = [_]u8{ 0x81, 0x02, 'h', 'i' };
     var mock = MockConn.init(a, &bytes);
     defer mock.deinit();
-    var ws = WsConn(MockConn).init(&mock);
+    var ws = WsConn(MockConn).init(&mock, &test_limit);
     defer ws.deinit(a);
 
     try testing.expectError(error.WsProtocol, ws.readMessage(a));
@@ -466,7 +470,7 @@ test "fragmented control frame is rejected" {
     defer a.free(bytes);
     var mock = MockConn.init(a, bytes);
     defer mock.deinit();
-    var ws = WsConn(MockConn).init(&mock);
+    var ws = WsConn(MockConn).init(&mock, &test_limit);
     defer ws.deinit(a);
 
     try testing.expectError(error.WsProtocol, ws.readMessage(a));
@@ -474,20 +478,65 @@ test "fragmented control frame is rejected" {
 
 test "a fragmented message over the cap frees each payload once" {
     const a = testing.allocator;
-    const first_len = max_message_bytes;
-    const bytes = try a.alloc(u8, 14 + first_len + 7);
-    defer a.free(bytes);
-    @memset(bytes, 0);
-    // Masked 127-length text frame (FIN=0, zero mask key), then a masked 1-byte continuation (FIN=1).
-    bytes[0] = 0x01;
-    bytes[1] = 0x80 | 127;
-    std.mem.writeInt(u64, bytes[2..10], first_len, .big);
-    bytes[14 + first_len] = 0x80;
-    bytes[14 + first_len + 1] = 0x80 | 1;
+    var limit = std.atomic.Value(usize).init(8);
+    const f1 = try buildClientFrame(a, .text, false, "12345678");
+    defer a.free(f1);
+    const f2 = try buildClientFrame(a, .continuation, true, "9");
+    defer a.free(f2);
+    const all = try std.mem.concat(a, u8, &.{ f1, f2 });
+    defer a.free(all);
 
-    var mock = MockConn.init(a, bytes);
+    var mock = MockConn.init(a, all);
     defer mock.deinit();
-    var ws = WsConn(MockConn).init(&mock);
+    var ws = WsConn(MockConn).init(&mock, &limit);
     defer ws.deinit(a);
     try testing.expectError(error.WsTooLarge, ws.readMessage(a));
+    try testing.expectEqual(@as(usize, 8), ws.message_limit);
+}
+
+test "a message reads the live limit when it starts: one under it is read, one over it is refused" {
+    const a = testing.allocator;
+    var limit = std.atomic.Value(usize).init(5);
+    const under = try buildClientFrame(a, .text, true, "12345");
+    defer a.free(under);
+    const over = try buildClientFrame(a, .text, true, "1234");
+    defer a.free(over);
+    const all = try std.mem.concat(a, u8, &.{ under, over });
+    defer a.free(all);
+
+    var mock = MockConn.init(a, all);
+    defer mock.deinit();
+    var ws = WsConn(MockConn).init(&mock, &limit);
+    defer ws.deinit(a);
+    const msg = try ws.readMessage(a);
+    defer a.free(msg.payload);
+    try testing.expectEqualStrings("12345", msg.payload);
+    limit.store(3, .monotonic);
+    try testing.expectError(error.WsTooLarge, ws.readMessage(a));
+    try testing.expectEqual(@as(usize, 3), ws.message_limit);
+}
+
+test "a fragmented message keeps the limit it started with across an interleaved ping" {
+    const a = testing.allocator;
+    var limit = std.atomic.Value(usize).init(5);
+    const f1 = try buildClientFrame(a, .text, false, "abc");
+    defer a.free(f1);
+    const ping = try buildClientFrame(a, .ping, true, "p");
+    defer a.free(ping);
+    const f2 = try buildClientFrame(a, .continuation, true, "de");
+    defer a.free(f2);
+    const all = try std.mem.concat(a, u8, &.{ f1, ping, f2 });
+    defer a.free(all);
+
+    var mock = MockConn.init(a, all);
+    defer mock.deinit();
+    var ws = WsConn(MockConn).init(&mock, &limit);
+    defer ws.deinit(a);
+    const m1 = try ws.readMessage(a);
+    defer a.free(m1.payload);
+    try testing.expectEqual(Opcode.ping, m1.opcode);
+    limit.store(2, .monotonic);
+    const m2 = try ws.readMessage(a);
+    defer a.free(m2.payload);
+    try testing.expectEqualStrings("abcde", m2.payload);
 }

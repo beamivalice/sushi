@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
+  default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many
+  images is no longer refused at 64 MB, and a refusal names the limit and the setting. Thanks @Cianidos for the request
+  and the change (#96).
 - **A large SSD prompt cache no longer stops the server from accepting connections**: the cache keeps a fixed
   handful of files open whatever its size, the server raises its open-file limit at startup and states it in a
   `[limits]` line, and a server that runs out of descriptors says once how many are open and what holds most of them.

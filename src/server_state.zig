@@ -17,6 +17,7 @@ pub var shutdown_requested = std.atomic.Value(bool).init(false);
 
 pub var completion_id_counter = std.atomic.Value(i64).init(0);
 
+/// The cap in bytes on an HTTP request and a WebSocket message. The settings API changes it while serving; each reads it once.
 pub var max_request_bytes = std.atomic.Value(usize).init(@as(usize, model_settings.default_max_request_mb) << 20);
 
 pub fn setMaxRequestMb(value: ?u32) void {

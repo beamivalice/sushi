@@ -26,7 +26,7 @@ pub const default_mtp = true;
 pub const default_preserve_thinking = true;
 pub const default_think_penalty: f32 = 0;
 pub const default_max_request_mb: u32 = 128;
-pub const max_request_mb_limit: u32 = 4096;
+pub const max_request_mb_limit: u32 = 1024;
 
 /// `--expert-cache-bias <n>`; null = not given. It outranks a model's `expert_cache_bias`.
 pub var expert_cache_bias_flag: ?f32 = null;
@@ -1245,9 +1245,9 @@ test "model_settings: server request limit reads a bounded MiB value" {
     const t = std.testing;
     for ([_]struct { value: []const u8, want: ?u32 }{
         .{ .value = "1", .want = 1 },
-        .{ .value = "4096", .want = 4096 },
+        .{ .value = "1024", .want = 1024 },
         .{ .value = "0", .want = null },
-        .{ .value = "4097", .want = null },
+        .{ .value = "1025", .want = null },
         .{ .value = "\"5\"", .want = null },
     }) |c| {
         const text = try std.fmt.allocPrint(t.allocator, "{{\"server\":{{\"max_request_mb\":{s}}}}}", .{c.value});

@@ -539,11 +539,15 @@ pub fn routeExists(path: []const u8) bool {
 
 /// The 413 names BOTH numbers it compared (context-overflow-400 class): a
 /// refusal that only names the cap reads as "this should have worked".
-fn payloadTooLargeMessage(buf: []u8, got: usize, cap: usize) []const u8 {
+/// A chunked body stops at the cap, so its size is unknown (`got` null).
+fn payloadTooLargeMessage(buf: []u8, got: ?usize, cap: usize) []const u8 {
     const mb = 1024 * 1024;
-    return std.fmt.bufPrint(buf, "Request body too large: {d} MB exceeds the {d} MB limit", .{
-        got / mb + @intFromBool(got % mb != 0), cap / mb,
-    }) catch "Request body too large";
+    const setting = "limit (server.max_request_mb)";
+    const msg = if (got) |n|
+        std.fmt.bufPrint(buf, "Request body too large: {d} MB exceeds the {d} MB " ++ setting, .{ n / mb + @intFromBool(n % mb != 0), cap / mb })
+    else
+        std.fmt.bufPrint(buf, "Request body too large: over the {d} MB " ++ setting, .{cap / mb});
+    return msg catch "Request body too large";
 }
 
 /// Per-connection thread arguments. Heap-allocated so the spawned thread
@@ -664,7 +668,10 @@ fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64
         _ = decoder.feed(allocator, &out, pending, max_request_bytes) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.TooLarge => {
-                try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", "Request body too large", 413);
+                var msg_buf: [128]u8 = undefined;
+                const msg = payloadTooLargeMessage(&msg_buf, null, max_request_bytes);
+                log.warn("[http] 413: {s}\n", .{msg});
+                try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
                 out.deinit(allocator);
                 return null;
             },
@@ -1048,6 +1055,7 @@ test "request size limit: content-length and chunked bodies use the current limi
         const rejected = try serveOneForTest(request);
         defer t.allocator.free(rejected);
         try t.expect(std.mem.startsWith(u8, rejected, "HTTP/1.1 413 "));
+        try t.expect(std.mem.indexOf(u8, rejected, "limit (server.max_request_mb)") != null);
         server_state.max_request_bytes.store(size, .monotonic);
         const accepted = try serveOneForTest(request);
         defer t.allocator.free(accepted);
@@ -1424,7 +1432,7 @@ pub fn handleResponsesWebSocket(
     };
     log.info("WS /v1/responses connected\n", .{});
 
-    var ws_conn = WsConnT.init(stream);
+    var ws_conn = WsConnT.init(stream, &server_state.max_request_bytes);
     defer ws_conn.deinit(allocator);
 
     var local_cache: WsLocalCache = .{ .gpa = allocator };
@@ -1442,7 +1450,10 @@ pub fn handleResponsesWebSocket(
                 return;
             },
             error.WsTooLarge => {
-                ws_conn.writeClose(1009, "message too large") catch {};
+                var msg_buf: [123]u8 = undefined;
+                const msg = payloadTooLargeMessage(&msg_buf, null, ws_conn.message_limit);
+                log.warn("[http] WS 1009: {s}\n", .{msg});
+                ws_conn.writeClose(1009, msg) catch {};
                 return;
             },
             else => return,
@@ -1953,11 +1964,10 @@ test "POST /v1/completions with a prompt that tokenizes to nothing answers 400 b
     try t.expect(std.mem.indexOf(u8, buf[0..got], EMPTY_PROMPT_MSG) != null);
 }
 
-test "the 413 names both counts it compared" {
+test "the 413 names both counts it compared, and the setting that moves the limit" {
     var buf: [128]u8 = undefined;
-    const msg = payloadTooLargeMessage(&buf, 97 * 1024 * 1024 + 1, 64 * 1024 * 1024);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "98 MB") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "64 MB") != null);
+    try std.testing.expectEqualStrings("Request body too large: 98 MB exceeds the 64 MB limit (server.max_request_mb)", payloadTooLargeMessage(&buf, 97 * 1024 * 1024 + 1, 64 * 1024 * 1024));
+    try std.testing.expectEqualStrings("Request body too large: over the 64 MB limit (server.max_request_mb)", payloadTooLargeMessage(&buf, null, 64 * 1024 * 1024));
 }
 
 test "startListener: a second bind on the same port is refused" {
