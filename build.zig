@@ -528,8 +528,10 @@ const test_domains = [_]TestDomain{
 /// Tests that run alone, each in a process of its own (a step named `step`), left out of their file's step: what they
 /// prove holds only on state the process starts with. `name` is the test's name in `src/<file>.zig`.
 const alone_tests = [_]AloneTest{
-    .{ .step = "cooler-late-widest", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, a prompt at the widest chunk and a repetitive one past a sparse indexer's budget, greedy, speculative and sampled, compile no kernel" },
-    .{ .step = "cooler-late-lengths", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, greedy requests of every prompt length to 40, and speculative and sampled ones, compile no kernel" },
+    .{ .step = "cooler-late-widest-tinies", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, a prompt at the widest chunk and a repetitive one past a sparse indexer's budget, greedy, speculative and sampled, compile no kernel, on the tiny fixtures" },
+    .{ .step = "cooler-late-widest-cut", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, a prompt at the widest chunk and a repetitive one past a sparse indexer's budget, greedy, speculative and sampled, compile no kernel, on the cut" },
+    .{ .step = "cooler-late-lengths-tinies", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, greedy requests of every prompt length to 40, and speculative and sampled ones, compile no kernel, on the tiny fixtures" },
+    .{ .step = "cooler-late-lengths-cut", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, greedy requests of every prompt length to 40, and speculative and sampled ones, compile no kernel, on the cut" },
     .{ .step = "cooler-late-restore", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, a served request that restores the live state behind its reply compiles no kernel" },
     .{ .step = "cooler-late-bench", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, the release bench's first request through the scheduler compiles no kernel" },
     .{ .step = "deepseek-late-new-row-count", .file = "dsv41/dsv41_kernels", .name = "dsv41 kernels: a new row count, pick count, split count or context width compiles no new Metal library" },

@@ -220,12 +220,13 @@ fn skipsUpFront(sel: ?[]const u8, set: []const bool) bool {
     return false;
 }
 
-/// Every contract fixture env, and whether it is set.
-fn fixturesSet(buf: *[16]bool) []const bool {
+/// Every contract fixture env that `which` takes, and whether it is set.
+fn fixturesSet(comptime which: Which, buf: *[16]bool) []const bool {
     var n: usize = 0;
     inline for (comptime std.meta.tags(registry.Tag)) |t| {
         if (comptime @hasDecl(registry.Mod(t), "cooler_contract")) {
             for (registry.Mod(t).cooler_contract.fixtures) |env| {
+                if (!takes(which, env)) continue;
                 buf[n] = std.c.getenv(env) != null;
                 n += 1;
             }
@@ -260,6 +261,29 @@ pub fn eachLayout(comptime body: fn (comptime C: type, dir: []const u8, ids: []c
     return eachOf(.per_layout, body);
 }
 
+/// `body` on each chosen fixture but the Qwen cut, and `onTheCut` on the cut alone: the two halves of a late cell, each a
+/// run step of its own, so the cut's load runs beside the tinies' instead of after them.
+pub fn eachTinyFixture(comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+    return eachOf(.tinies, body);
+}
+
+pub fn onTheCut(comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+    return eachOf(.cut, body);
+}
+
+const Which = enum { every, first, per_residency, per_layout, tinies, cut };
+
+/// The fixture env of the Qwen cut (`QWEN4_TEST_MODEL`).
+const cut_env = "QWEN4_TEST_MODEL";
+
+fn takes(comptime which: Which, env: []const u8) bool {
+    return switch (which) {
+        .tinies => !std.mem.eql(u8, env, cut_env),
+        .cut => std.mem.eql(u8, env, cut_env),
+        .every, .first, .per_residency, .per_layout => true,
+    };
+}
+
 /// A contract load's expert layout, from its config as the arch prepares it; nothing loads. Bit 0: the experts stream;
 /// bit 1: they are stored pair-major.
 fn layoutOf(comptime C: type, dir: []const u8) !u2 {
@@ -271,11 +295,11 @@ fn layoutOf(comptime C: type, dir: []const u8) !u2 {
     return @as(u2, @intFromBool(streamed)) | @as(u2, @intFromBool(config.expert_tile_order == .pair_major)) << 1;
 }
 
-fn eachOf(comptime which: enum { every, first, per_residency, per_layout }, comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+fn eachOf(comptime which: Which, comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
     try mlx.requireGpu();
     const sel = selection();
     var set_buf: [16]bool = undefined;
-    if (skipsUpFront(sel, fixturesSet(&set_buf))) return error.SkipZigTest;
+    if (skipsUpFront(sel, fixturesSet(which, &set_buf))) return error.SkipZigTest;
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was_enabled);
@@ -287,7 +311,7 @@ fn eachOf(comptime which: enum { every, first, per_residency, per_layout }, comp
             // The layouts taken (`layoutOf`); per residency only its streamed bit counts.
             var took: [4]bool = @splat(false);
             for (C.fixtures) |env| {
-                if (!fixtureChosen(sel, env)) continue;
+                if (!takes(which, env) or !fixtureChosen(sel, env)) continue;
                 if (which == .first and took_one) break;
                 const dir = std.mem.span(std.c.getenv(env) orelse {
                     tally.absent();
@@ -324,6 +348,16 @@ test "cooler contract runner: a fixture whose body skips does not stop the next;
     try testing.expectError(error.SkipZigTest, one_missing.verdict());
     var fails: Tally = .{};
     try testing.expectError(error.TestUnexpectedResult, fails.took(error.TestUnexpectedResult));
+}
+
+test "cooler contract runner: a late cell's tinies half takes every fixture but the cut, and its cut half the cut alone" {
+    for ([_][]const u8{ "QWEN4_STQ_TINY", "QWEN4_BF16_TINY", "DSV41_STQ_TINY", "DSV41_STQ_TINY_PM", "DSV41_TINY" }) |env| {
+        try testing.expect(takes(.tinies, env));
+        try testing.expect(!takes(.cut, env));
+    }
+    try testing.expect(!takes(.tinies, "QWEN4_TEST_MODEL"));
+    try testing.expect(takes(.cut, "QWEN4_TEST_MODEL"));
+    try testing.expect(takes(.every, "QWEN4_TEST_MODEL"));
 }
 
 test "cooler contract runner: SUSHI_CONTRACT_FIXTURE names the fixtures a run takes, and without it a missing fixture skips the test before any load" {

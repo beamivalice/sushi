@@ -124,8 +124,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   (`eachFixture`: a kernel, a bill or a late compile, which a geometry changes), one per arch and expert layout
   (`eachLayout`, residency and tile order: the loader, its cleanup, the calls a request makes), one per arch and
   residency (`eachResidency`: pool and memory), or one per arch (`eachArch`, the first set: generator and engine
-  logic); with
-  any unset it skips before loading anything. `SUSHI_CONTRACT_FIXTURE=QWEN4_STQ_TINY` (comma-separated envs) runs only
+  logic); a late cell long enough to split is two tests, `eachTinyFixture` (every fixture but the cut) and
+  `onTheCut`, each a step of its own; with any of its fixtures unset a cell skips before loading anything. `SUSHI_CONTRACT_FIXTURE=QWEN4_STQ_TINY` (comma-separated envs) runs only
   the named fixtures, and a cell that ran on them passes: the way to check one cell on one fixture.
   A fault sweep refuses each pool-buffer or checked-call site once, at its first ask, and not again on another arm or
   fixture of the same arch (`firstAsks`); a sweep of one step (an image splice, an SSD restore, a rows tick) refuses only
