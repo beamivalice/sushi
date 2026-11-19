@@ -1153,6 +1153,8 @@ const FakeSink = struct {
     land_ns: u64 = 0,
     fill_ns: u64 = 0,
     filling: std.atomic.Value(bool) = .init(false),
+    /// While set, fillBlocks holds its op in flight until a test clears it.
+    hold: std.atomic.Value(bool) = .init(false),
     in_land: std.atomic.Value(bool) = .init(false),
     overlapped: std.atomic.Value(bool) = .init(false),
 
@@ -1178,9 +1180,10 @@ const FakeSink = struct {
     fn hashBlocks(_: *anyopaque, _: u64) anyerror!void {}
     fn fillBlocks(ctx: *anyopaque, _: u64) anyerror!void {
         const self: *FakeSink = @ptrCast(@alignCast(ctx));
-        if (self.fill_ns == 0) return;
+        if (self.fill_ns == 0 and !self.hold.load(.acquire)) return;
         self.filling.store(true, .release);
-        std.Io.sleep(self.io, .fromNanoseconds(@intCast(self.fill_ns)), .real) catch {};
+        while (self.hold.load(.acquire)) std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
+        if (self.fill_ns > 0) std.Io.sleep(self.io, .fromNanoseconds(@intCast(self.fill_ns)), .real) catch {};
         self.filling.store(false, .release);
     }
 
@@ -1505,16 +1508,28 @@ test "kv_disk_writer op: a fence waits out only the op in flight on its own path
     var fake = FakeSink.init(testing.io);
     defer fake.deinit();
     var w = Writer.init(testing.allocator, testing.io);
-    // 1.5 MiB at 16 MiB/s: the op stays in flight for 94 ms.
-    w.pace_bytes_per_s = 16 << 20;
     try w.start();
     defer w.deinit();
 
-    w.submitOp(try opPath("c000000"), fake.sink(), .{ .ticket = 1, .host_bytes = 4096, .logical_bytes = 3 << 19 }, .kv);
-    std.Io.sleep(testing.io, .fromMilliseconds(20), .real) catch {};
+    // The op is held in flight until the test lets it go; a fence that wrongly waits on it is freed by the watchdog
+    // after 2 s, and the op then lands, so the checks below fail instead of hanging.
+    fake.hold.store(true, .release);
+    w.submitOp(try opPath("c000000"), fake.sink(), .{ .ticket = 1, .host_bytes = 4096, .logical_bytes = 4096 }, .kv);
+    while (!fake.filling.load(.acquire)) std.Io.sleep(testing.io, .fromMilliseconds(1), .real) catch {};
+    const watchdog = try std.Thread.spawn(.{}, struct {
+        fn run(f: *FakeSink) void {
+            var waited: u32 = 0;
+            while (f.hold.load(.acquire) and waited < 2000) : (waited += 1) std.Io.sleep(f.io, .fromMilliseconds(1), .real) catch {};
+            f.hold.store(false, .release);
+        }
+    }.run, .{&fake});
     w.fence("v/e2/");
-    try testing.expect(w.isPending("v/e1/c000000"));
-    try testing.expect(!fake.isVisible(1));
+    const pending = w.isPending("v/e1/c000000");
+    const visible = fake.isVisible(1);
+    fake.hold.store(false, .release);
+    watchdog.join();
+    try testing.expect(pending);
+    try testing.expect(!visible);
     w.fence("v/e1/c000000");
     try testing.expect(fake.isVisible(1));
     try testing.expect(!w.isPending("v/e1/c000000"));
