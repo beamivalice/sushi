@@ -755,6 +755,7 @@ pub fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
     const config = try allocator.create(ModelConfig);
     errdefer allocator.destroy(config);
     config.* = try model_mod.parseConfig(io, allocator, model_dir);
+    errdefer config.deinit(allocator);
 
     const tok = try allocator.create(Tokenizer);
     errdefer allocator.destroy(tok);
@@ -3091,6 +3092,23 @@ test "preloadCpuState refuses an unsupported checkpoint format by name" {
     const path = try std.fmt.allocPrint(testing.allocator, "{s}/g", .{buf[0..root_len]});
     defer testing.allocator.free(path);
     try testing.expectError(error.ModelFormatUnsupported, preloadCpuState(testing.allocator, io, path));
+}
+
+test "preloadCpuState frees the parsed config when the tokenizer then fails to read" {
+    const io = std.testing.io;
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // qwen4's config owns a path of its own (`ngram_table_path`).
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "not json" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    if (preloadCpuState(testing.allocator, io, dir)) |state| {
+        var s = state;
+        freeCpuState(testing.allocator, &s);
+        return error.TestExpectedError;
+    } else |_| {}
 }
 
 test "every real streamed pack and source on this box plans a streamed load" {
