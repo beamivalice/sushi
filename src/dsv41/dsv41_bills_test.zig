@@ -488,14 +488,13 @@ fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, exp
     while (pos < loop_end) {
         const grown = c.stateFixedBytes(config.dsparkOn()) + pos * c.stateBytesPerToken();
         if (adaptive) {
-            const next = bills.adaptivePrefillWidth(config, bits, pos, bills.liveHeadroomFrom(config, avail, grown, 0, free), cur, cap, &st);
+            const next = bills.adaptivePrefillWidth(config, bits, pos, bills.headroomFrom(config, avail, grown, 0, free).bound(), cur, cap, &st);
             if (next != 0 and next < cur) cur = next;
         }
         var end = @min(pos + cur, loop_end);
         if (end < loop_end and loop_end - end < prefill_plan.tailMergeMaxFor(cur, adaptive)) end = loop_end;
         const need = c.forwardCapOn(cooler, end - pos, end);
-        const kept = @min(free, need);
-        const cover = dsv41_bill.borrowHeadroomFrom(avail, grown, kept, config) +| config.expert_borrow_bytes;
+        const cover = bills.headroomFrom(config, avail, grown, 0, free).forNeed(need) +| config.expert_borrow_bytes;
         if (cover < need) return .{ .rows = end - pos, .end = end, .short = need - cover };
         if (cooler) free = @max(pool, need * free_pct / 100);
         pos = end;
@@ -600,4 +599,26 @@ test "DeepSeek: a refusal caused by max_tokens names the max_tokens and the cont
         try t.expect(r.maximum > seq);
         try t.expect(bills.prefillNeededAtChunk(&config, seq, @intCast(r.maximum - seq), 16, 512, .{}) <= available);
     }
+}
+
+// Contract (a1fcae5c): admission, the chunk width, the warm, image encodes and DeepSeek's borrow read one headroom. An
+// encode on the engine runs under a cap of its bill (`arch_serve.enterVision`), so it reuses the free buffers a forward
+// under its cap reuses, which the live headroom counts out as parked.
+test "DeepSeek: an image encode on a Cooler load reads the headroom a forward of its size reads: the free buffers it reuses count" {
+    const gb: u64 = 1 << 30;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.cooler_for_test = true;
+    const ceiling: u64 = 40 * gb;
+    const active: u64 = 30 * gb;
+    // The engine keeps a prefill's scratch as free buffers past the decode pool.
+    const free = config.expertPoolBytes() + 2 * gb;
+    const h = bills.headroomFrom(&config, ceiling, active, 0, free);
+    const bill = h.live + gb;
+    // What the borrow lets a forward of `bill` bytes take without releasing a pool, and what an encode of it may take.
+    try std.testing.expect(h.forNeed(bill) >= bill);
+    try std.testing.expect(h.bound() >= bill);
+    // The live part alone, which an encode read before, is short of it.
+    try std.testing.expect(h.live < bill);
 }

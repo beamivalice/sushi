@@ -116,9 +116,9 @@ pub fn prefillChunkLoadLine(config: *const model_mod.ModelConfig, buf: []u8, pin
     return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from DeepSeek's {d}; --prefill-chunk overrides)\n", .{ pinned, dsv41_config.prefill_width }) catch null;
 }
 
-/// `dsv41_borrow.headroom_fn`: what admission reads as available, live.
-pub fn dsv41Headroom(config: *const model_mod.ModelConfig) u64 {
-    return bills.prefillHeadroomNow(config, 0);
+/// `dsv41_borrow.headroom_fn`: the one live headroom (`bills.headroomNow`).
+pub fn dsv41Headroom(config: *const model_mod.ModelConfig) bills.Headroom {
+    return bills.headroomNow(config, 0);
 }
 
 /// PURE: `dsv41Headroom` over the readings. `active` is `gpu_mem.activeBytes`, MLX's and the engine's bytes in use.
@@ -126,11 +126,10 @@ pub fn dsv41HeadroomFrom(ceiling: u64, active: u64, engine_free: u64, config: *c
     return bills.liveHeadroomFrom(config, ceiling, active, 0, engine_free);
 }
 
-/// PURE: what the borrow compares a forward's need against (`dsv41_borrow.beforeForward`): the live headroom, and on a
-/// Cooler load the engine's free buffers `kept` under the forward's cap, which the forward reuses.
-pub fn borrowHeadroomFrom(ceiling: u64, active: u64, kept: u64, config: *const model_mod.ModelConfig) u64 {
-    const reuse = if (@import("../cooler_side.zig").onEngine(config)) kept else 0;
-    return dsv41HeadroomFrom(ceiling, active, kept, config) +| reuse;
+/// On a Cooler load the engine's free buffers are parked (`parkedBytes`) and a forward or an encode under its own cap
+/// reuses them (`bills.Headroom.reusable`).
+pub fn reusableUnderCap(config: *const model_mod.ModelConfig, engine_free: u64) ?u64 {
+    return if (@import("../cooler_side.zig").onEngine(config)) engine_free else 0;
 }
 
 /// The decode pool a request's bill holds itself (`requestBill`): MLX's parked pool; on a Cooler load none, the pool being

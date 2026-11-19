@@ -1972,12 +1972,12 @@ const BorrowProbe = struct {
     var base: u64 = 0;
 
     /// A box whose free memory is `base` plus what the decoder pools have given back, less a resident pack's union.
-    fn headroom(_: *const @import("../model.zig").ModelConfig) u64 {
+    fn headroom(_: *const @import("../model.zig").ModelConfig) @import("../bills.zig").Headroom {
         const e = engine.?;
         var lent: u64 = 0;
         for (e.borrow_from..e.layers.len) |li| lent += e.lentBytes(@intCast(li));
         const made = if (e.plan.resident and e.grouped_union.len != 0) e.unionBytes() else 0;
-        return (base + lent) -| made;
+        return .{ .live = (base + lent) -| made };
     }
 };
 

@@ -14,9 +14,9 @@ const ModelConfig = @import("../model.zig").ModelConfig;
 const Config = cfg_mod.Config;
 const cooler_side = @import("../cooler_side.zig");
 
-/// The live headroom (the GPU ceiling less MLX's active bytes), installed by the server. Unset (tests, `sushi kld`),
-/// nothing is ever released.
-pub var headroom_fn: ?*const fn (*const ModelConfig) u64 = null;
+/// The live headroom (`bills.headroomNow`), installed by the server. Unset (tests, `sushi kld`), nothing is ever released.
+pub var headroom_fn: ?*const fn (*const ModelConfig) Headroom = null;
+const Headroom = @import("../bills.zig").Headroom;
 /// The need of the wide forward `beforeForward` is sizing, which a test's `headroom_fn` reads.
 pub var forward_need: u64 = 0;
 
@@ -344,11 +344,9 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
     if (rows <= verify_rows) return restore(engine, config, headroom, c.forwardCap(rows, seq));
     const need = prefillNeed(c, cooler_side.onEngine(config), rows, seq);
     forward_need = need;
-    // On Sushi Cooler the forward reuses the engine's free buffers under its cap, which the live headroom leaves out.
-    const reuse: u64 = if (cooler_side.onEngine(config)) @min(mlx.engine.poolFree(), need) else 0;
-    if (headroom(config) +| reuse >= need) return;
+    if (headroom(config).forNeed(need) >= need) return;
     _ = mlx.mlx_clear_cache();
-    const before = headroom(config) +| reuse;
+    const before = headroom(config).forNeed(need);
     const gpa = engine.allocator;
     const order = try gpa.alloc(u16, engine.layers.len - engine.borrow_from);
     defer gpa.free(order);
@@ -369,7 +367,7 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
         log.warn("[dsv41-borrow] a {d}-row forward at {d} needs {d:.2} GB; the headroom and every decoder pool hold {d:.2} GB\n", .{ rows, seq, gb(need), gb(have) });
         return refuse(c, cooler_side.onEngine(config), rows, seq, rest, need, have);
     };
-    var m: LiveBorrow = .{ .engine = engine, .order = order[0..n], .config = config, .read = headroom, .reuse = reuse, .wired = status.getWiredMemBytes() };
+    var m: LiveBorrow = .{ .engine = engine, .order = order[0..n], .config = config, .read = headroom, .need = need, .wired = status.getWiredMemBytes() };
     const r = releaseUntil(&m, n, count, need) catch |e| {
         log.warn("[dsv41-borrow] a release for a {d}-row forward at {d} failed after {d:.2} GB: {s}\n", .{ rows, seq, gb(m.released), @errorName(e) });
         return e;
@@ -432,9 +430,9 @@ const LiveBorrow = struct {
     engine: *stream.Engine,
     order: []const u16,
     config: *const ModelConfig,
-    read: *const fn (*const ModelConfig) u64,
-    /// The engine's free buffers the forward reuses (`beforeForward`).
-    reuse: u64,
+    read: *const fn (*const ModelConfig) Headroom,
+    /// The forward's need: the engine's free buffers it reuses under its cap count up to it.
+    need: u64,
     wired: u64,
     released: u64 = 0,
     waited: u64 = 0,
@@ -448,7 +446,7 @@ const LiveBorrow = struct {
         self.waited += waitForUnwire(self.wired, self.released);
     }
     fn headroom(self: *LiveBorrow) u64 {
-        return self.read(self.config) +| self.reuse;
+        return self.read(self.config).forNeed(self.need);
     }
 };
 
@@ -469,7 +467,7 @@ fn releaseUntil(m: anytype, n: usize, count: usize, need: u64) !struct { layers:
     return .{ .layers = i, .have = have };
 }
 
-fn restore(engine: *stream.Engine, config: *const ModelConfig, headroom: *const fn (*const ModelConfig) u64, work: u64) !void {
+fn restore(engine: *stream.Engine, config: *const ModelConfig, headroom: *const fn (*const ModelConfig) Headroom, work: u64) !void {
     var any = false;
     for (engine.borrow_from..engine.layers.len) |li| any = any or engine.isBorrowed(@intCast(li));
     if (!any) return;
@@ -481,7 +479,8 @@ fn restore(engine: *stream.Engine, config: *const ModelConfig, headroom: *const 
     var left: usize = 0;
     for (engine.borrow_from..engine.layers.len) |li| {
         if (!engine.isBorrowed(@intCast(li))) continue;
-        if (left > 0 or headroom(config) < work +| engine.lentBytes(@intCast(li))) {
+        // The forward reuses free buffers for its own work; a pool read back takes memory of its own.
+        if (left > 0 or headroom(config).forNeed(work) < work +| engine.lentBytes(@intCast(li))) {
             left += 1;
             continue;
         }

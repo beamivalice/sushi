@@ -3929,15 +3929,14 @@ const LateUnwireHeadroom = struct {
     var req: usize = 0;
     var reads: u32 = 0;
     var borrowed = false;
-    fn headroom(_: *const model_mod.ModelConfig) u64 {
+    fn headroom(_: *const model_mod.ModelConfig) @import("bills.zig").Headroom {
         const need = @import("dsv41/dsv41_borrow.zig").forward_need;
         if (req == 0 and !borrowed and need > 0) {
             reads += 1;
-            // The borrow adds the engine's free buffers the forward reuses; the read is a byte short of the need with them.
-            if (reads <= 3) return (need - 1) -| @min(mlx.engine.poolFree(), need);
+            if (reads <= 3) return .{ .live = need - 1 };
             borrowed = true;
         }
-        return std.math.maxInt(u64) / 4;
+        return .{ .live = std.math.maxInt(u64) / 4 };
     }
 };
 

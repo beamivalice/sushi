@@ -2699,11 +2699,10 @@ pub fn adaptivePrefillWidth(
 /// borrow all fit their working set in, and what admission compares against (`admissionAvailableFor`). Read once per
 /// chunk boundary after its `mlx_clear_cache`.
 pub fn prefillHeadroomNow(config: *const model_mod.ModelConfig, staged_host: u64) u64 {
-    const active_mem: usize = gpu_mem.activeBytes();
     // The SSD write-through stages chunk blobs as host bytes behind a ~1 GiB permit that
     // `mlx_get_active_memory` does not count; on unified memory they are the same pool. Read at
-    // the hook site (inference thread) and passed in.
-    return liveHeadroomFrom(config, liveGpuMemoryCeiling(config, active_mem), active_mem, staged_host, gpu_mem.engineFree());
+    // the hook site (inference thread) and passed in. A chunk's forward runs under its cap: compared at the bound.
+    return headroomNow(config, staged_host).bound();
 }
 
 /// What an arch keeps parked beside its active bytes that no forward of it may take (DeepSeek's decode pool and the
@@ -2717,6 +2716,38 @@ fn parkedBytes(config: *const model_mod.ModelConfig, engine_free: u64) u64 {
 pub fn admissionAvailableNow(config: *const model_mod.ModelConfig) u64 {
     const active_mem: usize = gpu_mem.activeBytes();
     return admissionAvailableFor(config, liveGpuMemoryCeiling(config, active_mem), active_mem, gpu_mem.engineFree());
+}
+
+/// One reading of the memory a forward, an encode or a pool's read-back may take now. `live` is the ceiling less the
+/// bytes in use, staged and parked; `reusable` the engine's free buffers `live` counted out as parked, which a forward
+/// or an encode under its own cap on the engine reuses before it asks for more (`reusableUnderCap`).
+pub const Headroom = struct {
+    live: u64,
+    reusable: u64 = 0,
+
+    /// What a forward or an encode of `need` bytes may take.
+    pub fn forNeed(self: Headroom, need: u64) u64 {
+        return self.live +| @min(self.reusable, need);
+    }
+
+    /// The bound a need is compared against: a need fits exactly when it is at most this (`forNeed`'s fixed point).
+    pub fn bound(self: Headroom) u64 {
+        return self.live +| self.reusable;
+    }
+};
+
+/// PURE: the one `Headroom` every live check reads, over the readings.
+pub fn headroomFrom(config: *const model_mod.ModelConfig, ceiling: u64, active: u64, staged_host: u64, engine_free: u64) Headroom {
+    return .{
+        .live = liveHeadroomFrom(config, ceiling, active, staged_host, engine_free),
+        .reusable = archHook("reusableUnderCap", u64, config, .{engine_free}) orelse 0,
+    };
+}
+
+/// `headroomFrom` over the live readings.
+pub fn headroomNow(config: *const model_mod.ModelConfig, staged_host: u64) Headroom {
+    const active_mem: usize = gpu_mem.activeBytes();
+    return headroomFrom(config, liveGpuMemoryCeiling(config, active_mem), active_mem, staged_host, gpu_mem.engineFree());
 }
 
 /// PURE half of `prefillHeadroomNow`.
