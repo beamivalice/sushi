@@ -1202,10 +1202,11 @@ pub var slab_release_timeouts: std.atomic.Value(u64) = .init(0);
 /// them in use (`gpu_mem.lentBytes`). Written only by `Engine.publishLent`.
 pub var lent_total: std.atomic.Value(u64) = .init(0);
 
-/// What a release frees for a reading that credits the engine's free buffers (`bills.admissionAvailableFor`): a buffer
-/// that leaves those in use for the free ones counts twice, since the read-back reuses it.
+/// Admission's own reading of what a release frees (`bills.admissionAvailableFor`), on either engine: the active bytes,
+/// MLX's and the engine's, and the engine's free buffers it credits. A buffer that leaves those in use for the free ones
+/// counts twice, since the read-back reuses it.
 fn lentReading() i64 {
-    return -@as(i64, @intCast(gpu_mem.engineInUse())) + @as(i64, @intCast(mlx.engine.poolFree()));
+    return -@as(i64, @intCast(gpu_mem.activeBytes())) + @as(i64, @intCast(gpu_mem.engineFree()));
 }
 
 const SlabOperand = struct {
@@ -1676,7 +1677,7 @@ const LayerState = struct {
     /// release gave back.
     saved: []u16 = &.{},
     lent: u64 = 0,
-    /// What the release, union workspace included, moved in `lentReading` (`Engine.lentOutstanding`).
+    /// What the pool's release moved in `lentReading` (`Engine.lentOutstanding`), its union workspace not netted out.
     lent_read: i64 = 0,
     /// A resident pack's int32 `[experts]` map from expert id to its global slot in the cache bank; null while released.
     resident_map: mlx.mlx_array = .{ .ctx = null },
@@ -3179,8 +3180,9 @@ pub const Engine = struct {
         self.lent_published = lent;
     }
 
-    /// What the released pools' read-back takes back from admission's reading: what each release, its union workspace
-    /// included (a resident pack's, which the last read-back drops), moved in `lentReading`.
+    /// What the released pools' read-back takes back from admission's reading: what each pool's release moved in
+    /// `lentReading`. A resident pack's union workspace is in the active bytes until the last read-back drops it, so a
+    /// promise holds it beside every pool the read-back takes back.
     pub fn lentOutstanding(self: *const Engine) u64 {
         var lent: i64 = 0;
         for (self.layers) |*layer| if (layer.borrowed) {
@@ -3209,15 +3211,16 @@ pub const Engine = struct {
         layer.saved = try saved.toOwnedSlice(self.allocator);
         const before = lentReading();
         const freed = self.dropPool(layer, gl);
+        // Measured as the pool leaves, so every exit that leaves the layer released publishes it, stranded included.
+        layer.lent_read = lentReading() - before;
         layer.borrowed = true;
         layer.lent = freed;
+        defer self.publishBorrowable();
         // Released first, so the workspace comes out of the pool it replaces; without one the layer takes its pool back.
         self.ensureUnion() catch |e| {
             self.restoreLayer(li) catch |re| log.err("[expert-stream] layer {d} stays released with no union workspace until the next forward: {s}\n", .{ li, @errorName(re) });
             return e;
         };
-        layer.lent_read = lentReading() - before;
-        self.publishBorrowable();
         return freed;
     }
 

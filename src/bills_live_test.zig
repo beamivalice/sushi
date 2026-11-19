@@ -428,3 +428,31 @@ test "the width the scheduler runs a request at is the one its admission bill wa
         try testing.expectEqual(bills.requestPrefillPick(&cfg, prompt, 4096, 8, bill.available, false, .{}), width);
     }
 }
+
+test "a model loaded while decoder pools are lent pins its auto-context and prefill chunk with them in use, as admission reads them" {
+    const status = @import("status.zig");
+    const avail_was = status.available_mem_override;
+    status.available_mem_override = 1 << 40;
+    defer status.available_mem_override = avail_was;
+    var qwen = fixtures.qwen4ExpOomConfig();
+    qwen.max_position_embeddings = 0;
+    const Pin = struct { context: u32, chunk: u32, admission: u64 };
+    const pin = struct {
+        fn at(c: *const model_mod.ModelConfig) Pin {
+            var fresh = c.*;
+            fresh.pinned_prefill_chunk = 0;
+            return .{ .chunk = bills.pinPrefillChunk(&fresh), .context = bills.computeMemoryContext(c), .admission = bills.admissionAvailableNow(c) };
+        }
+    }.at;
+    const rest = pin(&qwen);
+    // A lease that publishes all but 512 MiB of what admission holds free (`Engine.publishLent`).
+    const lent = rest.admission -| (512 << 20);
+    const lent_total = &@import("expert_stream.zig").lent_total;
+    _ = lent_total.fetchAdd(lent, .monotonic);
+    defer _ = lent_total.fetchSub(lent, .monotonic);
+    const now = pin(&qwen);
+    errdefer std.debug.print("{d} B lent: at rest {any}, during the lease {any}\n", .{ lent, rest, now });
+    try testing.expect(rest.admission - now.admission >= lent);
+    try testing.expect(now.context < rest.context);
+    try testing.expect(now.chunk < rest.chunk);
+}

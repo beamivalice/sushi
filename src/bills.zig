@@ -694,7 +694,7 @@ pub const FitReadings = struct {
     pub fn now(config: *const model_mod.ModelConfig) FitReadings {
         // The lent decoder pools are in use for a load (`promisedActive`), and not the free RAM their pages show as.
         const lent = gpu_mem.lentBytes();
-        const active: u64 = gpu_mem.activeBytes() +| lent;
+        const active: u64 = promisedActive(gpu_mem.activeBytes());
         return .{
             .wired_limit = wiredLimitBytes(),
             .budget_working_set = staticGpuMemoryCeiling(),
@@ -1304,7 +1304,10 @@ pub fn loadServingBill(config: *const model_mod.ModelConfig, budget: u64) ?model
 /// bill and the forward cannot drift.
 pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     if (config.pinned_prefill_chunk == 0) {
-        const active_mem: usize = gpu_mem.activeBytes();
+        const active_now: usize = gpu_mem.activeBytes();
+        const ceiling = currentGpuMemoryCeiling(config, active_now);
+        // A pin outlives any lease: the lent decoder pools are in use (`promisedActive`).
+        const active_mem: usize = promisedActive(active_now);
         const kv_bits: u64 = defaultKvBits(config);
         // Which ask: the gated arch reads the resolved budget; every other arch reads the raw
         // ask as before (the accessor would pin a second model against the first's budget).
@@ -1315,7 +1318,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         config.pinned_prefill_chunk = billedPrefillChunk(
             config,
             kv_bits,
-            currentGpuMemoryCeiling(config, active_mem),
+            ceiling,
             active_mem,
             sizerCtxKvBytes(config, kv_bits),
             hot_cache_ask,
@@ -1325,7 +1328,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
             const cache_mem: usize = gpu_mem.cacheBytes();
             log.debug("[prefill] pinned {d}: ceiling {d} MB, active {d} MB, mlx cache {d} MB, system available {d} MB, working set {d} MB\n", .{
                 config.pinned_prefill_chunk,
-                currentGpuMemoryCeiling(config, active_mem) >> 20,
+                ceiling >> 20,
                 active_mem >> 20,
                 cache_mem >> 20,
                 metrics.getAvailableMemBytes() >> 20,
@@ -1334,7 +1337,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         }
         // Say when the ctx bar is the binding one.
         if (config.longCtxGated() and explicitPrefillChunk() == 0) {
-            const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, 0, hot_cache_ask);
+            const share_only = resolvePrefillChunk(config, kv_bits, ceiling, active_mem, 0, hot_cache_ask);
             if (share_only > config.pinned_prefill_chunk) {
                 log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d})\n", .{ config.pinned_prefill_chunk, share_only });
             }
@@ -1783,9 +1786,10 @@ pub fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 
 }
 
 /// The largest context this model's per-token footprint fits into RAM right now, ignoring the checkpoint's own maximum.
+/// A context pinned at load outlives any lease: the lent decoder pools are in use (`promisedActive`).
 pub fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const active_mem: usize = gpu_mem.activeBytes();
-    return memoryContextLive(config, currentGpuMemoryCeiling(config, active_mem), active_mem +| @as(u64, gpu_mem.cacheBytes()), metrics.getAvailableMemBytes(), active_mem);
+    return memoryContextLive(config, currentGpuMemoryCeiling(config, active_mem), active_mem +| @as(u64, gpu_mem.cacheBytes()), metrics.getAvailableMemBytes(), promisedActive(active_mem));
 }
 
 /// PURE: the memory context at the reading admission compares a request's bill against (`admissionAvailableNow`): the

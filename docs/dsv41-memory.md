@@ -391,6 +391,12 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   forward, a refused read-back), every reading whose promise outlives the lease holds them off (`gpu_mem.lentBytes`,
   [engine-memory-admission](engine-memory-admission.md#gpu-memory-readers)); only the lessee's borrow and read-back count
   them free.
+- **Every exit that leaves a layer lent publishes the change in admission's own reading, on every engine**: a pool is
+  measured as it leaves (`gpu_mem.activeBytes`, MLX's and the engine's, less the free buffers admission credits) and
+  published on every exit, a release whose workspace and take-back both failed included. The union workspace a resident
+  pack's first release makes is not netted out: it stays in the active bytes until the last read-back drops it, so a
+  promise holds it beside every pool the read-back takes back (tested by a fault sweep over every release, read-back,
+  heal and unload exit, on Sushi Cooler and MLX).
 - Log lines: `[dsv41-borrow] released layers a..39 (X GB) for a N-row forward at P: need, headroom before -> after,
   unwired in T ms` and `[dsv41-borrow] restored n layers (X GB) in T ms before decode`.
 

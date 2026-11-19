@@ -5702,7 +5702,7 @@ test "cooler contract: a DeepSeek prefill that releases decoder pools keeps them
     }
 }
 
-test "cooler contract: a DeepSeek decoder pool left released with no lessee, beside the engine's parked free buffers, is held off admission, a co-loaded model's, the other forwards' headroom and a load's preflight, and only the lessee's own reading counts it" {
+test "cooler contract: a DeepSeek decoder pool left released with no lessee, on Sushi Cooler beside the engine's parked free buffers and on MLX, is held off admission, a co-loaded model's, the other forwards' headroom and a load's preflight, and only the lessee's own reading counts it" {
     try mlx.requireGpu();
     const D = ContractOf("dsv41");
     if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
@@ -5710,32 +5710,19 @@ test "cooler contract: a DeepSeek decoder pool left released with no lessee, bes
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was_enabled);
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    const a = testing.allocator;
+    for ([_]bool{ true, false }) |cooler| try lentHeldOff(dir, cooler);
+}
+
+fn lentHeldOff(dir: []const u8, cooler: bool) !void {
     const bills = @import("bills.zig");
     const gpu_mem = @import("gpu_mem.zig");
-    const status = @import("status.zig");
-    const ids = try D.prompt(a, dir);
-    defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(D, dir, true);
-    defer _ = ld.close();
-    const engine = arch_handle.trunk(ld.h).expert_stream.?;
-    if (engine.borrow_from >= engine.layers.len) return error.SkipZigTest;
-    // Free RAM never binds: the ceiling is the GPU's, so only what the engine holds moves the readings.
-    const avail_was = status.available_mem_override;
-    status.available_mem_override = 1 << 40;
-    defer status.available_mem_override = avail_was;
-    // A request first: it parks the engine's free buffers, which admission credits as its forwards reuse them.
-    var sv: Served = undefined;
-    try sv.init(&ld, dir);
-    defer sv.deinit();
-    var prompt: [40]u32 = undefined;
-    for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 2) % ids.len];
-    var f: u32 = 0;
-    var said = try sv.request(&prompt, 8, &f);
-    said.deinit(a);
-    try testing.expect(gpu_mem.engineFree() > 0);
-    const config = &ld.config;
+    var lease: LentLease = undefined;
+    try lease.open(dir, cooler);
+    defer lease.close();
+    const engine = lease.engine;
+    // On Cooler the request parked the engine's free buffers, which admission credits as its forwards reuse them.
+    if (cooler) try testing.expect(gpu_mem.engineFree() > 0);
+    const config = &lease.ld.config;
     var qwen = @import("bills_fixtures_test.zig").qwen4ExpOomConfig();
     const Reading = struct { admission: u64, beside: u64, forward: u64, load: u64, own: u64 };
     const read = struct {
@@ -5749,12 +5736,15 @@ test "cooler contract: a DeepSeek decoder pool left released with no lessee, bes
             };
         }
     }.at;
+    // On a resident pack the first release makes the union workspace, which the read-back holds beside the pools (the
+    // read-back cell): made before the reading at rest, so only the pools move these readings.
+    if (engine.layers.len - engine.borrow_from < 3) return error.SkipZigTest;
+    const last: u16 = @intCast(engine.layers.len - 1);
+    _ = try engine.borrowLayer(last - 2);
+    defer engine.restoreLayer(last - 2) catch {};
     const rest = read(config, &qwen);
     // A borrower that ended before any decode-width forward (cancelled, failed, its reply done at its prefill) leaves
-    // its pools released with no lessee: the next decode-width forward reads them back whole. Two: on a resident pack
-    // the first release pays for the union workspace, which the last read-back drops.
-    if (engine.layers.len - engine.borrow_from < 2) return error.SkipZigTest;
-    const last: u16 = @intCast(engine.layers.len - 1);
+    // its pools released with no lessee: the next decode-width forward reads them back whole.
     var lent = try engine.borrowLayer(last);
     lent += engine.borrowLayer(last - 1) catch |e| {
         try engine.restoreLayer(last);
@@ -5763,7 +5753,7 @@ test "cooler contract: a DeepSeek decoder pool left released with no lessee, bes
     const now = read(config, &qwen);
     try engine.restoreLayer(last - 1);
     try engine.restoreLayer(last);
-    errdefer std.debug.print("cooler contract: {d} B lent, union {d} B; at rest {any}, lent {any}\n", .{ lent, engine.unionBytes(), rest, now });
+    errdefer std.debug.print("cooler contract on {s}: {d} B lent, union {d} B; at rest {any}, lent {any}\n", .{ if (cooler) "Sushi Cooler" else "MLX", lent, engine.unionBytes(), rest, now });
     try testing.expect(lent > 0);
     // Held off once: a reading that credits no free buffer falls by those the release parked, none by the pools again.
     for ([_][2]u64{ .{ rest.admission, now.admission }, .{ rest.beside, now.beside }, .{ rest.forward, now.forward }, .{ rest.load, now.load } }) |r| {
@@ -5772,6 +5762,251 @@ test "cooler contract: a DeepSeek decoder pool left released with no lessee, bes
     }
     // The read-back's room: the lessee's own reading counts what it takes back.
     try testing.expect(now.own > rest.own);
+}
+
+/// The DeepSeek STQ tiny on Sushi Cooler or MLX after one served request (a Cooler load's free buffers parked), at a
+/// free RAM that never binds: only what the load holds moves the readings.
+const LentLease = struct {
+    ld: Load,
+    sv: Served,
+    avail_was: ?u64,
+    engine: *@import("expert_stream.zig").Engine,
+
+    fn open(self: *LentLease, dir: []const u8, cooler: bool) !void {
+        const D = ContractOf("dsv41");
+        const a = testing.allocator;
+        const ids = try D.prompt(a, dir);
+        defer a.free(ids);
+        try self.ld.open(D, dir, cooler);
+        errdefer _ = self.ld.close();
+        const status = @import("status.zig");
+        self.avail_was = status.available_mem_override;
+        status.available_mem_override = 1 << 40;
+        errdefer status.available_mem_override = self.avail_was;
+        try self.sv.init(&self.ld, dir);
+        errdefer self.sv.deinit();
+        var prompt: [40]u32 = undefined;
+        for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 2) % ids.len];
+        var f: u32 = 0;
+        var said = try self.sv.request(&prompt, 8, &f);
+        said.deinit(a);
+        self.engine = arch_handle.trunk(self.ld.h).expert_stream.?;
+    }
+
+    fn close(self: *LentLease) void {
+        self.sv.deinit();
+        @import("status.zig").available_mem_override = self.avail_was;
+        _ = self.ld.close();
+    }
+};
+
+/// Admission's reading of what a pool's release frees, on either engine: the engine's free buffers, which a Cooler
+/// admission credits, less the active bytes, MLX's and the engine's.
+fn admissionReading() i64 {
+    const gpu_mem = @import("gpu_mem.zig");
+    return @as(i64, @intCast(gpu_mem.engineFree())) - @as(i64, @intCast(gpu_mem.activeBytes()));
+}
+
+/// One step of a pool's lease on the two last decoder layers, run from the state it starts in, and what every exit of
+/// it must leave: the lent total the pools left unmapped, admission no higher than at rest.
+const LentSweep = struct {
+    engine: *@import("expert_stream.zig").Engine,
+    config: *const model_mod.ModelConfig,
+    /// The last layer, whose steps are swept, and the one before, released beside it.
+    layer: [2]u16,
+    /// Each pool as its release moves the reading, measured with the union workspace already made.
+    pool: [2]i64 = .{ 0, 0 },
+    rest: u64 = 0,
+    step: Step = .release,
+    /// A host allocation index that strands the last layer: its workspace fails and its take-back too.
+    strands_at: ?usize = null,
+
+    const Step = enum { release, release_beside, read_back, heal };
+
+    fn run(self: *LentSweep) anyerror!void {
+        const e = self.engine;
+        switch (self.step) {
+            .release => _ = try e.borrowLayer(self.layer[0]),
+            .release_beside => _ = try e.borrowLayer(self.layer[1]),
+            .read_back => try e.restoreLayer(self.layer[0]),
+            .heal => try e.healReleased(),
+        }
+    }
+
+    /// The state the step starts from: at rest, the last layer released, or released with no union workspace.
+    fn start(self: *LentSweep) !void {
+        try self.toRest();
+        switch (self.step) {
+            .release => {},
+            .release_beside, .read_back => _ = try self.engine.borrowLayer(self.layer[0]),
+            .heal => try self.strand(),
+        }
+    }
+
+    fn strand(self: *LentSweep) !void {
+        const e = self.engine;
+        const gpa = e.allocator;
+        defer e.allocator = gpa;
+        var k: usize = self.strands_at orelse 0;
+        while (true) : (k += 1) {
+            if (k > 10_000) return error.NeverStranded;
+            try self.toRest();
+            var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = k });
+            e.allocator = failing.allocator();
+            _ = e.borrowLayer(self.layer[0]) catch 0;
+            e.allocator = gpa;
+            if (e.isBorrowed(self.layer[0]) and e.grouped_union.len == 0) break;
+        }
+        self.strands_at = k;
+    }
+
+    fn toRest(self: *LentSweep) !void {
+        const e = self.engine;
+        try e.healReleased();
+        for (self.layer) |li| try e.restoreLayer(li);
+        try testing.expectEqual(@as(u64, 0), @import("gpu_mem.zig").lentBytes());
+    }
+
+    /// The lent total is the bytes the released pools left unmapped, measured, and admission reads no more than at rest.
+    fn check(self: *LentSweep, refused: []const u8, k: u64) !void {
+        const e = self.engine;
+        var unmapped: i64 = 0;
+        for (self.layer, self.pool) |li, bytes| {
+            if (e.isBorrowed(li)) unmapped += bytes;
+        }
+        const lent = @import("gpu_mem.zig").lentBytes();
+        const now = @import("bills.zig").admissionAvailableNow(self.config);
+        errdefer std.debug.print("{t} with {s} {d} refused: released {any}, union {}; lent {d} B, pools unmapped {d} B; admission at rest {d}, now {d}\n", .{
+            self.step, refused, k, .{ e.isBorrowed(self.layer[0]), e.isBorrowed(self.layer[1]) }, e.grouped_union.len != 0, lent, unmapped, self.rest, now,
+        });
+        try testing.expectEqual(unmapped, @as(i64, @intCast(lent)));
+        try testing.expect(now <= self.rest);
+    }
+
+    /// Each site of `F` (`mlx.fault`, `mlx.engine.fault`) the step reaches refused once, at its first ask.
+    fn sweepSites(self: *LentSweep, comptime F: type, name: []const u8) !void {
+        const a = testing.allocator;
+        try self.start();
+        F.sites = .{ .lasts = false };
+        defer F.sites = .{};
+        const ks = try mlx.sweepPoints(a, &F.sites, self, run);
+        defer a.free(ks);
+        try self.check("nothing", 0);
+        for (ks) |k| {
+            try self.start();
+            F.arm(k);
+            self.run() catch {};
+            const fired = if (comptime F == mlx.fault) F.didFire() else !F.armed();
+            F.disarm();
+            var msg: [300]u8 = undefined;
+            _ = mlx.takeError(&msg);
+            try testing.expect(fired);
+            try self.check(name, k);
+        }
+    }
+
+    /// Every host allocation from the k-th on refused, k from 0 until the step needs none: a refused step's take-back,
+    /// or a heal's restore after its workspace, is refused too.
+    fn sweepHost(self: *LentSweep) !void {
+        const e = self.engine;
+        const gpa = e.allocator;
+        defer e.allocator = gpa;
+        var k: usize = 0;
+        while (true) : (k += 1) {
+            try self.start();
+            var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = k });
+            e.allocator = failing.allocator();
+            const r = self.run();
+            e.allocator = gpa;
+            try self.check("every host allocation from", k);
+            if (!failing.has_induced_failure) return r;
+        }
+    }
+};
+
+test "cooler contract: every exit of a DeepSeek pool's release, read-back and heal, one refused step or two included, and of an unload mid-lease, on Sushi Cooler and on MLX, publishes as lent what the pools left free in admission's reading, and admission never reads more than at rest" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.engine.fault.disarm();
+    defer mlx.fault.disarm();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    for ([_]bool{ true, false }) |cooler| try lentSweep(dir, cooler);
+}
+
+fn lentSweep(dir: []const u8, cooler: bool) !void {
+    const gpu_mem = @import("gpu_mem.zig");
+    var lease: LentLease = undefined;
+    try lease.open(dir, cooler);
+    var open = true;
+    defer if (open) lease.close();
+    const e = lease.engine;
+    errdefer std.debug.print("on {s}\n", .{if (cooler) "Sushi Cooler" else "MLX"});
+    if (e.layers.len - e.borrow_from < 2) return error.SkipZigTest;
+    const last: u16 = @intCast(e.layers.len - 1);
+    var sw: LentSweep = .{ .engine = e, .config = &lease.ld.config, .layer = .{ last, last - 1 } };
+    // Each pool alone: released beside the other, which made the union workspace.
+    for (0..2) |i| {
+        _ = try e.borrowLayer(sw.layer[1 - i]);
+        const before = admissionReading();
+        _ = try e.borrowLayer(sw.layer[i]);
+        sw.pool[i] = admissionReading() - before;
+        try sw.toRest();
+        try testing.expect(sw.pool[i] > 0);
+    }
+    sw.rest = @import("bills.zig").admissionAvailableNow(sw.config);
+    for (std.meta.tags(LentSweep.Step)) |step| {
+        sw.step = step;
+        try sw.sweepSites(mlx.engine.fault, "pool buffer");
+        try sw.sweepSites(mlx.fault, "checked call");
+        try sw.sweepHost();
+    }
+    try sw.toRest();
+    // An unload mid-lease takes its engine's share out of the process's total.
+    _ = try e.borrowLayer(sw.layer[0]);
+    _ = try e.borrowLayer(sw.layer[1]);
+    try sw.check("nothing", 0);
+    open = false;
+    lease.close();
+    try testing.expectEqual(@as(u64, 0), gpu_mem.lentBytes());
+}
+
+test "cooler contract: a DeepSeek read-back holds the union workspace beside the pools it takes back, on Sushi Cooler and on MLX, and admission read during the lease never exceeds what is free through it" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    for ([_]bool{ true, false }) |cooler| try readBackHoldsUnion(dir, cooler);
+}
+
+fn readBackHoldsUnion(dir: []const u8, cooler: bool) !void {
+    const bills = @import("bills.zig");
+    var lease: LentLease = undefined;
+    try lease.open(dir, cooler);
+    defer lease.close();
+    const e = lease.engine;
+    if (e.layers.len - e.borrow_from < 3) return error.SkipZigTest;
+    const config = &lease.ld.config;
+    const last: u16 = @intCast(e.layers.len - 1);
+    // The first release makes the union workspace; the middle layer stays lent through the read-back of the other two,
+    // so the read-back's whole window, the union held beside every pool back, can be read before the union drops.
+    const order = [_]u16{ last, last - 1, last - 2 };
+    defer for (order) |li| e.restoreLayer(li) catch {};
+    for (order) |li| _ = try e.borrowLayer(li);
+    const admitted = bills.admissionAvailableNow(config);
+    for ([_]u16{ last, last - 2 }) |li| {
+        try e.restoreLayer(li);
+        const free = bills.admissionAvailableNow(config);
+        errdefer std.debug.print("on {s}, read back layer {d}: admission during the lease {d}, through the read-back {d} (union {d} B)\n", .{ if (cooler) "Sushi Cooler" else "MLX", li, admitted, free, e.unionBytes() });
+        try testing.expect(e.grouped_union.len != 0);
+        try testing.expect(admitted <= free);
+    }
 }
 
 /// One request prefilled under `LeaseProbe`, so its wide chunk released decoder pools, and decoding.

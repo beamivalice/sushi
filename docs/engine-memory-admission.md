@@ -737,8 +737,10 @@ tensor lent to MLX is in both counters, so the sum errs high.
   that measure what an MLX op allocates.
 - A new reader of the GPU's bytes goes through `gpu_mem`; a raw `mlx_get_*_memory` is for MLX's own allocator only.
 - **A promise counts the lent decoder pools in use** (`gpu_mem.lentBytes`, `bills.promisedActive`): DeepSeek's pools a
-  prefill released leave the active bytes until their lessee's read-back takes them back, so admission (every model's),
-  the live headroom, the load's fit and the hot-cache budget add them; only the lessee's own reading
-  (`bills.leaseHolderHeadroomNow`, `dsv41Headroom`) counts them free. The pinned auto-context is read once at load and
-  frozen, so it takes no lent term. Each engine publishes what its releases moved in admission's reading
-  (`Engine.lentOutstanding`), a buffer parked in its free list twice, since the credit reads it and the read-back reuses it.
+  prefill released leave the active bytes until their lessee's read-back takes them back, so admission (every
+  model's), the live headroom, the load's fit, the hot-cache budget and the auto-context and prefill chunk a load pins
+  (a pin outlives any lease) add them; only the lessee's own reading (`bills.leaseHolderHeadroomNow`, `dsv41Headroom`)
+  counts them free. A promise reads the active bytes only through `promisedActive` (lint `promise-active`). Each
+  engine publishes what its releases moved in admission's reading (`Engine.lentOutstanding`: the active bytes, MLX's
+  and the engine's, as each pool leaves, on every exit that leaves it lent), a buffer parked in its free list twice,
+  since the credit reads it and the read-back reuses it.

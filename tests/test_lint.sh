@@ -351,6 +351,17 @@ printf '%s\n' 'fn side(c: *const C) bool {' '    return c.cooler_ask == .none;' 
 printf '%s\n' 'test "t" {' '    c.cooler_for_test = true;' '}' > "$TMP/t/src/p.zig"
 expect_green "cooler_side itself, and a test"
 
+# rule promise-active
+tree
+printf '%s\n' 'fn contextNow(c: *const C) u32 {' '    const active = gpu_mem.activeBytes();' '    return contextAt(c, active);' '}' > "$TMP/t/src/p.zig"
+expect_red "a pinned context read off the raw active bytes" "src/p.zig:2:28 \[promise-active\] contextNow: the active bytes read raw"
+
+tree
+printf '%s\n' 'fn contextNow(c: *const C) u32 {' '    const active = gpu_mem.activeBytes();' '    return contextAt(ceilingOf(active), promisedActive(active));' '}' \
+  'test "t" {' '    _ = gpu_mem.activeBytes();' '}' > "$TMP/t/src/p.zig"
+printf '%s\n' 'pub fn activeBytes() usize {' '    return 0;' '}' 'fn floor() usize {' '    return activeBytes();' '}' > "$TMP/t/src/gpu_mem.zig"
+expect_green "a reading through promisedActive, a test, and gpu_mem's own"
+
 # rule response-store-field
 tree
 printf '%s\n' 'fn take(store: *S, id: []const u8) void {' '    _ = store.by_id.fetchRemove(id);' '}' > "$TMP/t/src/p.zig"

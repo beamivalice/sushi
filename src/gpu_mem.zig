@@ -60,8 +60,7 @@ pub fn resetPeak() void {
     mlx.engine.resetPoolPeak(.process);
 }
 
-/// The engine's pool buffers bound to tensors and the mappings it wraps: its part of `activeBytes`.
-pub fn engineInUse() usize {
+fn engineInUse() usize {
     return (mlx.engine.poolTotal() -| mlx.engine.poolFree()) + mlx.engine.mappedTotal();
 }
 
