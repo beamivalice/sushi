@@ -420,6 +420,13 @@ pub fn clearsPoolAtPrefillEnd(config: *const model_mod.ModelConfig) bool {
     return config.reservesKvCapacity();
 }
 
+/// Whether the chunk loop returns the buffer pool after each chunk: MLX's, yes (handing it on lost on GLM and Qwen,
+/// glm5-perf); the engine's, no: each forward's cap (`engine.budget`) already trims it, and a pool kept for the next
+/// chunk lets its host work start without fresh Metal buffers.
+pub fn clearsPoolBetweenChunks(on_engine: bool) bool {
+    return !on_engine;
+}
+
 /// Walk a chunked prefill as `runPrefill` does, taking the width from `widths` at each boundary (the last entry repeats).
 pub fn walkChunkEnds(
     out: []usize,
@@ -865,4 +872,9 @@ test "countSpliceRows counts image and video placeholders, video only when decla
     try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0));
     try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 77));
     try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 77));
+}
+
+test "prefill plan: the chunk loop returns MLX's pool after each chunk and keeps the engine's" {
+    try std.testing.expect(clearsPoolBetweenChunks(false));
+    try std.testing.expect(!clearsPoolBetweenChunks(true));
 }

@@ -489,6 +489,27 @@ large share alone.
   1.2 at span 128, against 1.64 / 1.26 and 0.70 / 0.72 staged (`7424e2c0`). The scattered reads cost more than the
   occupancy the tile gave back.
 
+<a id="m5u-chunk-handoff"></a>
+**The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
+`[engine] GPU busy` line; then `tests`-free prefill A B A B, one boot an arm, 2 samples a rung, code text with a fresh
+nonce each request, `--ctx-size 200000`, AC, `taskpolicy -a`, GPU lock, old `381a49b2`, new the two changes on it;
+tok/s):
+- The idle came at every 2048-row boundary: per request ~59 ms a chunk before the next chunk's first kernels
+  (`sushi_take`, the routed prep, casts), found by a temporary per-pass gap log. Layers in flight alone: idle 894 to
+  715 ms, prefill 2,783 to 2,830; with the pool kept as well: 258 ms, 2,968.
+- DeepSeek STQ 1.75bpw, old / new: 8k 2,616, 2,823, 2,586, 2,805 / 2,703, 2,921, 2,739, 2,930 (+3.8%); 32k 2,716,
+  2,794, 2,699, 2,783 / 2,894, 2,974, 2,907, 2,965 (+6.8%); 64k 2,696, 2,707, 2,664, 2,709 / 2,872, 2,863, 2,839,
+  2,859 (+6.1%); GPU idle a request 1,120 to 383 ms; peak equal (132.96 GB at 29k).
+- Qwen STQ 2.75bpw (the pool change only), old / new: 8k 3,539, 3,758, 3,523, 3,756 / 3,510, 3,751, 3,518, 3,751
+  (level); 32k 3,720, 3,809, 3,710, 3,798 / 3,779, 3,877, 3,773, 3,879 (+1.7%).
+- Against mlx-serve's sushi_ds41 plugin on the same box and prompts (this driver, 2 samples, before the change):
+  32k code 2,987 plugin / 2,711 Cooler, 64k 2,958 / 2,654; the new arm reads 2,935 and 2,858 at those rungs.
+
+**Ruled out, long context (KLD gate):** the plugin's matrix-unit prefill index scorer (16 query rows a staged key
+tile, `matmul2d`) cuts the indexer 113 to 61 ms a 2048-row chunk at 64k, but its sums run in another order and move
+picks: on 8 prompts of 18k to 68k tokens (code and prose, 64 teacher-forced positions each) against the release
+checkpoint, KLD 0.051939 to 0.054276 (+4.5%), past the 0.01% bar.
+
 ## DeepSeek-V4.1 STQ on an M1 Max 32 GB: Sushi Cooler against MLX (2026-11-15)
 
 The first run on a GPU without matrix units. M1 Max (`applegpu_g13s`, 32 GPU cores) 32 GB, macOS 26.5.2, STQ 1.75bpw on

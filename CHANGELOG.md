@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Prefill on Sushi Cooler no longer waits between chunks**: the GPU sat idle at every 2048-row boundary while the
+  host trimmed the engine's buffer pool and a resident DeepSeek chunk drained its last layers; the pool now carries to
+  the next chunk and those layers finish behind it, for faster long-prompt prefill at the same output.
 - **A Responses WebSocket message sent as a binary frame is answered**: it got no reply and no close, so a client that
   sent a Buffer or bytes waited forever; it now gets an error frame and a 1003 close, every end of the socket sends its
   close frame, and an upgrade without its key is answered 400.

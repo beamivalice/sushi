@@ -1704,8 +1704,7 @@ pub const Generator = struct {
                     // A chunk that left nothing to materialize asks for no eval.
                     if (mlx.mlx_vector_array_size(eval_vec) > 0) _ = mlx.mlx_eval(eval_vec);
                 }
-                // Every chunk: handing the pool to the next chunk was slower and larger (glm5-perf).
-                clearPool(xfm);
+                if (prefill_plan.clearsPoolBetweenChunks(mlx.engine.isStream(xfm.outStream()))) clearPool(xfm);
                 if (trace_enabled) {
                     const eval_dt = prefill_sw.read() - eval_start_ns;
                     eval_ns += eval_dt;

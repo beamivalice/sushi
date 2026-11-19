@@ -185,8 +185,10 @@ Found while holding the engine of our own to MLX's bytes ([engine-own-forward](e
 
 - `mlx_clear_cache()` once per CHUNK and per emitted block, INTERVAL-based (`step -| last_clear >= 256`),
   un-skippable; `Generator.advanceStep` is the one step mover.
-- The prefill loop's per-chunk clear stays: handing the pool to the next chunk measured 5-7% slower prefill and a
-  3 GB larger footprint ([glm5-perf](glm5-perf.md#glm-prefill-pool-clear)).
+- The prefill loop's per-chunk clear stays on MLX: handing MLX's pool to the next chunk measured 5-7% slower prefill
+  and a 3 GB larger footprint ([glm5-perf](glm5-perf.md#glm-prefill-pool-clear)). Sushi Cooler keeps its own pool
+  between chunks (`prefill_plan.clearsPoolBetweenChunks`): each forward's cap trims it, and a trimmed pool made the
+  next chunk's first passes wait on fresh Metal buffers ([perf-baselines](perf-baselines.md#m5u-chunk-handoff)).
 - `active` flat while phys climbs = the POOL (`memory.cache_bytes`). RSS is blind to Metal.
 - **MLX hands a small array a larger buffer its pool already holds** (a 96-byte table got 128), and returns a freed
   buffer to the pool from a Metal completion thread. A test that reads MLX's active or cached bytes synchronizes and
