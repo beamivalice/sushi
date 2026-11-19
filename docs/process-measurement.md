@@ -93,8 +93,8 @@ start (fans at max, 4 min idle). Even with fans at max the die reached 97 °C in
 server and between arms: fans to max, then idle until the hottest die sensor (`fanctl status`) reads under 50 °C, at most
 3 min. Never slot a GPU job into that idle: the next server starts throttled.
 
-**The M5 Ultra does not throttle**, so it takes no cooldown and no temperature limit; its die sensor reads as `unread`
-in a `sushi-ubench` header, and the idle step passes at once.
+**The M5 Ultra (a Mac Studio) does not throttle**, so it takes no cooldown and no temperature limit: `tests/bench.sh` skips
+the fans and the idle on a Mac Studio and says so in the report's stamp, and `sushi-ubench` reads its die sensor as `unread`.
 
 Under this protocol one A arm then one B arm is enough. Run A B B A only when the expected difference is within a few
 percent, where a thermal or drift step between two single arms would read as the effect.

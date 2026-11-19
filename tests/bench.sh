@@ -12,7 +12,7 @@
 # the order rule and the report format are in docs/process-measurement.md (release bench).
 #
 # What it takes on for the box rules: a clean tree and a fresh ReleaseFast build, the QUIET marker, AC power, the GPU
-# lock for the whole model, fans at max with an idle under 50 C (at most 3 min) `taskpolicy -a`,
+# lock for the whole model, fans at max with an idle under 50 C (at most 3 min; none on a Mac Studio) `taskpolicy -a`,
 # and a private SSD prefix cache. It refuses to start while another sushi, sushi-repack or sushi-grid runs.
 #
 # Another engine: this script does not drive one. Start it yourself and run llmprobe by hand,
@@ -93,11 +93,19 @@ SHA="$(shasum -a 256 "$BINARY" | cut -c1-16)"
 MTIME="$(stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$BINARY")"
 CHIP="$(sysctl -n machdep.cpu.brand_string) $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
 STAMP="Commit \`$COMMIT\`, binary SHA-256 \`$SHA\` (built $MTIME). Hardware: $CHIP, AC power, ReleaseFast, \`taskpolicy -a\`, GPU lock \`$owner\`, $(date '+%Y-%m-%d')."
-STAMP="$STAMP\\nServer flags: ${SERVER_FLAGS[*]:-defaults}. Private SSD prefix cache, one model per server, fans at max with an idle under 50 C before the boot."
+studio=0
+system_profiler SPHardwareDataType 2>/dev/null | grep -c 'Model Name: Mac Studio' >/dev/null && studio=1
+cooling="fans at max with an idle under 50 C before the boot"
+[[ $studio -eq 1 ]] && cooling="no cooldown (a Mac Studio does not throttle)"
+STAMP="$STAMP\\nServer flags: ${SERVER_FLAGS[*]:-defaults}. Private SSD prefix cache, one model per server, $cooling."
 
 # ── Lock, then cool ──
 "$LOCK" acquire "$owner" || die "could not take the GPU lock"
 have_lock=1
+# A Mac Studio does not throttle: no fans to raise and no idle before the boot.
+if [[ $studio -eq 1 ]]; then
+    echo "bench.sh: Mac Studio, no cooldown" | tee -a "$OUT/bench.log"
+else
 fanctl max --ttl 900 >/dev/null 2>&1 || echo "bench.sh: fanctl max failed; the run is not thermally controlled" >&2
 # The fan daemon grants at most 15 min of max whatever the ttl asked, then goes back to auto: renew it for the whole run.
 ( while sleep 300; do fanctl max --ttl 900 >/dev/null 2>&1; done ) &
@@ -111,6 +119,7 @@ for _ in $(seq 1 36); do
     sleep 5
 done
 echo "bench.sh: die at ${t%.*} C at the boot" | tee -a "$OUT/bench.log"
+fi
 # The GPU clock is read by `sushi bench` itself, which aborts a throttled request; the pressure level is only logged.
 pressure="$(notifyutil -g com.apple.system.thermalpressurelevel 2>/dev/null | sed -n 's/.* //p')"
 if [[ -z "$pressure" ]]; then
