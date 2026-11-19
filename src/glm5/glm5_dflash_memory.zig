@@ -10,16 +10,18 @@ fn add(a: usize, b: usize) !usize {
 fn mul(a: usize, b: usize) !usize {
     return std.math.mul(usize, a, b) catch error.GlmTreeScratchLimit;
 }
-fn capacity(needed: usize) !usize {
-    return mul((try add(needed, 255)) / 256, 256);
+/// The rows a growth gives a buffer of `row_bytes` (`glm5_bill.pagedRows`, as `appendRows`).
+fn capacity(needed: usize, row_bytes: usize) !usize {
+    if (needed > std.math.maxInt(c_int)) return error.GlmTreeScratchLimit;
+    return @intCast(@import("glm5_bill.zig").pagedRows(needed, &.{row_bytes}));
 }
 
 pub fn plan(processed: usize, latent_capacity: usize, pool_capacity: usize, width: usize, index_width: usize, heads: usize, rows: usize, bytes: usize) !Plan {
     if (rows == 0 or rows > 16 or width == 0 or index_width == 0 or heads == 0 or (bytes != 2 and bytes != 4) or latent_capacity < processed or pool_capacity < processed / 4) return error.InvalidGlmDraftShape;
     const needed = try add(processed, rows);
     const pool_needed = needed / 4;
-    const latent_rows = @max(latent_capacity, try capacity(needed));
-    const pool_rows = @max(pool_capacity, try capacity(pool_needed));
+    const latent_rows = @max(latent_capacity, try capacity(needed, try mul(width, bytes)));
+    const pool_rows = @max(pool_capacity, try capacity(pool_needed, try mul(index_width, bytes)));
     // Growth can retain both concatenation storage and the slice-update copy. Overlay branches
     // write neither shared buffer; their completed pools ride in `compression`.
     const overlay = rows <= overlay_rows;

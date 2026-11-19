@@ -14,8 +14,10 @@ fn add(a: usize, b: usize) !usize {
 fn mul(a: usize, b: usize) !usize {
     return std.math.mul(usize, a, b) catch error.GlmReserveOverflow;
 }
-pub fn capacity(rows: usize) !usize {
-    const value = try mul((try add(rows, 255)) / 256, 256);
+/// The rows `appendRows` gives a buffer of `parts` (`glm5_bill.pagedRows`).
+pub fn capacity(rows: usize, parts: []const u64) !usize {
+    if (rows > std.math.maxInt(c_int)) return error.GlmReserveOverflow;
+    const value: usize = @intCast(@import("glm5_bill.zig").pagedRows(rows, parts));
     if (value > std.math.maxInt(c_int)) return error.GlmReserveOverflow;
     return value;
 }
@@ -23,14 +25,17 @@ fn inFlight(old: usize, target: usize, row_bytes: usize) !usize {
     if (target == old) return 0;
     return mul(try add(target, target - old), row_bytes);
 }
-/// `latent_row_bytes` is one stored row: BF16 1024, kv8 544 or kv6 416 at width 512 (`glm5_latent.rowBytes`).
-pub fn plan(processed: usize, lc: usize, pc: usize, latent_row_bytes: usize, iw: usize, ib: usize, total: usize) !Plan {
+/// `latent_parts` is one stored row's bytes in each part (`glm5_bill.latentPartBytes`): BF16 1024, kv8 544 or kv6 416
+/// in all at width 512 (`glm5_latent.rowBytes`).
+pub fn plan(processed: usize, lc: usize, pc: usize, latent_parts: []const u64, iw: usize, ib: usize, total: usize) !Plan {
+    var latent_row_bytes: usize = 0;
+    for (latent_parts) |b| latent_row_bytes = try add(latent_row_bytes, @intCast(b));
     if (latent_row_bytes == 0 or iw == 0 or lc < processed or pc < processed / 4 or total < processed or
         (ib != 2 and ib != 4)) return error.InvalidGlmReserveShape;
-    if (lc > std.math.maxInt(c_int) or pc > std.math.maxInt(c_int) or iw > std.math.maxInt(c_int)) return error.GlmReserveOverflow;
-    const latent = @max(lc, try capacity(total));
-    const pool = @max(pc, try capacity(total / 4));
+    if (lc > std.math.maxInt(c_int) or pc > std.math.maxInt(c_int) or iw > std.math.maxInt(c_int) or latent_row_bytes > std.math.maxInt(c_int)) return error.GlmReserveOverflow;
     const pool_row_bytes = try mul(iw, ib);
+    const latent = @max(lc, try capacity(total, latent_parts));
+    const pool = @max(pc, try capacity(total / 4, &.{pool_row_bytes}));
     const latent_growth = try mul(latent - lc, latent_row_bytes);
     return .{
         .latent_capacity = latent,
@@ -63,8 +68,8 @@ fn statePlan(st: *const attention.State, total: usize) !Plan {
             mlx.mlx_array_dtype(st.pooled) != mlx.mlx_array_dtype(st.tail_keys)) return error.InvalidGlmReserveShape;
         pc = @intCast(ps[0]);
     }
-    const row_bytes = if (view.quantized()) @import("glm5_latent.zig").rowBytes(@intCast(view.width()), st.latent_bits) else @as(usize, @intCast(view.width())) * mlx.mlx_array_itemsize(st.latent);
-    return plan(st.processed, @intCast(view.rows()), pc, row_bytes, @intCast(ts[1]), mlx.mlx_array_itemsize(st.tail_keys), total);
+    const parts = @import("glm5_bill.zig").latentPartBytes(@intCast(view.width()), st.latent_bits, mlx.mlx_array_itemsize(st.latent));
+    return plan(st.processed, @intCast(view.rows()), pc, &parts, @intCast(ts[1]), mlx.mlx_array_itemsize(st.tail_keys), total);
 }
 fn grow(buffer: *Arr, rows: usize, width: c_int, dtype: mlx.mlx_dtype, stream: mlx.mlx_stream) !void {
     const old: usize = if (buffer.ctx == null) 0 else @intCast(mlx.getShape(buffer.*)[0]);
@@ -136,7 +141,7 @@ pub fn reserve(request: anytype, total_tokens: usize, available_peak_bytes: usiz
 test "GLM reserve ledger admits the 128K verifier" {
     const scratch = @import("glm5_dflash_memory.zig");
     try std.testing.expectError(error.GlmTreeScratchLimit, scratch.plan(131072, 131072, 32768, 512, 128, 64, scratch.overlay_rows + 1, 2));
-    const p = try plan(131072, 131072, 32768, 1024, 128, 2, 131072 + 256 + 3);
+    const p = try plan(131072, 131072, 32768, &.{1024}, 128, 2, 131072 + 256 + 3);
     try std.testing.expectEqual(@as(usize, 131584), p.latent_capacity);
     try std.testing.expectEqual(@as(usize, 33024), p.pool_capacity);
     try std.testing.expectEqual(@as(usize, 512 * 1024 + 256 * 256), p.growth_bytes);
@@ -145,11 +150,11 @@ test "GLM reserve ledger admits the 128K verifier" {
     const admitted = try scratch.plan(131328, p.latent_capacity, p.pool_capacity, 512, 128, 64, 3, 2);
     try std.testing.expectEqual(@as(usize, 3), admitted.branches);
     try std.testing.expect(admitted.live_bytes <= scratch.limit_bytes);
-    try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 3, 1, 1024, 128, 2, 16));
-    try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 4, 1, 1024, 128, 1, 16));
-    try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 4, 1, 1024, 128, 2, 3));
-    try std.testing.expectError(error.GlmReserveOverflow, plan(4, 4, 1, std.math.maxInt(usize), 128, 2, 16));
-    try std.testing.expectError(error.GlmReserveOverflow, capacity(std.math.maxInt(usize)));
+    try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 3, 1, &.{1024}, 128, 2, 16));
+    try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 4, 1, &.{1024}, 128, 1, 16));
+    try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 4, 1, &.{1024}, 128, 2, 3));
+    try std.testing.expectError(error.GlmReserveOverflow, plan(4, 4, 1, &.{std.math.maxInt(u64)}, 128, 2, 16));
+    try std.testing.expectError(error.GlmReserveOverflow, capacity(std.math.maxInt(usize), &.{1024}));
 }
 
 fn equal(a: Arr, b: Arr, _: mlx.mlx_stream) !void {
@@ -269,13 +274,14 @@ fn reserveQuantizedCase(bits: u8) !void {
     }
     const total = n + 33;
     const p = try statePlan(&layers[0].attention, total);
-    try std.testing.expectEqual(@as(usize, 1280), p.latent_capacity);
-    try std.testing.expectEqual(256 * row + 256 * 4 * 2, p.growth_bytes);
-    try std.testing.expectEqual((1280 + 256) * row, p.peak_bytes);
+    // Past 1,024 rows the scales and biases (16 B a row) take whole pages: 2,048 rows, not 1,280.
+    try std.testing.expectEqual(@as(usize, 2048), p.latent_capacity);
+    try std.testing.expectEqual(1024 * row + 256 * 4 * 2, p.growth_bytes);
+    try std.testing.expectEqual((2048 + 1024) * row, p.peak_bytes);
     try std.testing.expectError(error.GlmReserveMemoryLimit, reserve(&request, total, p.peak_bytes - 1, stream));
     try std.testing.expectEqual(p.peak_bytes, try reserve(&request, total, p.peak_bytes, stream));
     const view = layers[0].attention.latentView();
-    try std.testing.expect(view.rowMajor() and view.rows() == 1280);
+    try std.testing.expect(view.rowMajor() and view.rows() == 2048);
     for ([_]Arr{ view.data, view.scales, view.biases }, [_]Arr{ baseline.latent, baseline.latent_scales, baseline.latent_biases }) |grown_part, kept| try attention.expectSameBits(try ops.slice(grown_part, 0, 0, n), try ops.slice(kept, 0, 0, n));
     for ([_]*attention.State{ &layers[0].attention, &baseline }) |st| {
         _ = try st.append(try ops.slice(source, 0, n, n + 6), try ops.slice(keys, 0, n, n + 6), try ops.slice(keys, 0, n, n + 6), ape, stream);

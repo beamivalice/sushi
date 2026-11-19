@@ -720,7 +720,18 @@ fn readInFlight(request: *const forward.Request, s: mlx.mlx_stream) !void {
     try mlx.check(mlx.mlx_async_eval(evals));
 }
 
+test "GLM consuming commit appends kv6 MLA rows in place when MLX's pool holds buffers two pages past their rows" {
+    try mlx.requireGpu();
+    // 256 kv6 code rows of the tiny fixture are 1.5 pages: a free 3-page buffer is a page past what MLX donates.
+    try consumingCommitCaseSeeded(6, false, 3 * 16384);
+}
+
 fn consumingCommitCase(latent_bits: u8, in_flight: bool) !void {
+    return consumingCommitCaseSeeded(latent_bits, in_flight, 0);
+}
+
+/// `seed_bytes`: MLX's pool is emptied, then holds 64 free buffers of that size when the request's rows are made.
+fn consumingCommitCaseSeeded(latent_bits: u8, in_flight: bool, seed_bytes: usize) !void {
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("../model.zig").Weights.init(a);
@@ -742,6 +753,17 @@ fn consumingCommitCase(latent_bits: u8, in_flight: bool) !void {
     var request = try forward.Request.init(a, target.layers.len);
     defer request.deinit();
     try request.setLatentBits(latent_bits);
+    if (seed_bytes > 0) {
+        _ = mlx.mlx_clear_cache();
+        var held: [64]Arr = undefined;
+        for (&held) |*h| {
+            h.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(h, &[_]c_int{@intCast(seed_bytes)}, 1, .uint8, s));
+            try mlx.check(mlx.mlx_array_eval(h.*));
+        }
+        try mlx.check(mlx.mlx_synchronize(s));
+        for (held) |h| _ = mlx.mlx_array_free(h);
+    }
     const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &.{ 1, 3 }, 2, .uint32);
     defer _ = mlx.mlx_array_free(ids);
     const logits = try target.forwardLast(&request, ids, true);

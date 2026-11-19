@@ -3,6 +3,7 @@
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const latent_store = @import("glm5_latent.zig");
+const glm5_bill = @import("glm5_bill.zig");
 pub const Latent = latent_store.Latent;
 const partials = @import("glm5_attention_prefill.zig");
 pub const packed_nax = @import("glm5_attention_nax_packed.zig");
@@ -100,14 +101,16 @@ pub const Scope = struct {
         try mlx.check(mlx.mlx_add(out, a, zero, self.s));
         return out.*;
     }
-    fn appendRows(self: *Scope, buffer: Arr, used: usize, chunk: Arr) !Arr {
+    /// `parts`: a row's bytes in each buffer that grows with `buffer` (`glm5_bill.pagedRows`).
+    fn appendRows(self: *Scope, buffer: Arr, used: usize, chunk: Arr, parts: []const u64) !Arr {
         const sh = mlx.getShape(chunk);
         const needed = try std.math.add(usize, used, @intCast(sh[0]));
-        if (needed > std.math.maxInt(c_int) - 255) return error.InvalidGlmAttentionShape;
+        if (needed > std.math.maxInt(c_int)) return error.InvalidGlmAttentionShape;
         const current: usize = if (buffer.ctx == null) 0 else @intCast(mlx.getShape(buffer)[0]);
         var target = buffer;
         if (needed > current) {
-            const capacity = (needed + 255) / 256 * 256;
+            const capacity: usize = @intCast(glm5_bill.pagedRows(needed, parts));
+            if (capacity > std.math.maxInt(c_int)) return error.InvalidGlmAttentionShape;
             const padding = try self.zeros(&.{ @intCast(capacity - current), sh[1] }, mlx.mlx_array_dtype(chunk));
             target = try self.join(buffer, padding);
         }
@@ -221,19 +224,20 @@ pub const State = struct {
         var l = self.latent;
         var l_scales = self.latent_scales;
         var l_biases = self.latent_biases;
-        if (store_latent and self.latent_bits == 0) l = try scope.appendRows(self.latent, self.processed, latent);
+        const parts = glm5_bill.latentPartBytes(@intCast(ls[1]), self.latent_bits, mlx.mlx_array_itemsize(latent));
+        if (store_latent and self.latent_bits == 0) l = try scope.appendRows(self.latent, self.processed, latent, &parts);
         if (store_latent and self.latent_bits != 0) {
             var q = try latent_store.quantize(latent, self.latent_bits, s);
             defer q.deinit();
-            l = try scope.appendRows(self.latent, self.processed, q.q);
-            l_scales = try scope.appendRows(self.latent_scales, self.processed, q.scales);
-            l_biases = try scope.appendRows(self.latent_biases, self.processed, q.biases);
+            l = try scope.appendRows(self.latent, self.processed, q.q, &parts);
+            l_scales = try scope.appendRows(self.latent_scales, self.processed, q.scales, &parts);
+            l_biases = try scope.appendRows(self.latent_biases, self.processed, q.biases, &parts);
         }
         const k = try scope.join(self.tail_keys, keys);
         const g = try scope.join(self.tail_gates, gates);
         const ready = @divTrunc(mlx.getShape(k)[0], 4) * 4;
         const fresh = if (ready > 0) try compress(&scope, k, g, ape, ready) else nil;
-        const p = if (ready > 0 and store_latent) try scope.appendRows(self.pooled, self.processed / 4, fresh) else self.pooled;
+        const p = if (ready > 0 and store_latent) try scope.appendRows(self.pooled, self.processed / 4, fresh, &.{@as(u64, @intCast(ks[1])) * mlx.mlx_array_itemsize(keys)}) else self.pooled;
         const pt = if (ready > 0 and !store_latent) try scope.join(self.pool_tail, fresh) else self.pool_tail;
         const tail_k = try scope.copy(try scope.cut(k, ready, mlx.getShape(k)[0]));
         const tail_g = try scope.copy(try scope.cut(g, ready, mlx.getShape(g)[0]));

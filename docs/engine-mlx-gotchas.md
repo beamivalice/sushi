@@ -191,6 +191,10 @@ Found while holding the engine of our own to MLX's bytes ([engine-own-forward](e
 - **MLX hands a small array a larger buffer its pool already holds** (a 96-byte table got 128), and returns a freed
   buffer to the pool from a Metal completion thread. A test that reads MLX's active or cached bytes synchronizes and
   clears first, and asserts "the ledger's bytes, under a page more", never an exact size.
+- **MLX's pool hands an allocation a free buffer up to two pages over it, and MLX donates one only within a page
+  (16 KB) of the array's bytes**: a buffer appended in place whose bytes are past a page and off the page grid can
+  sit in one MLX never donates, and the append copies it. Such a buffer's capacity keeps it on whole pages
+  (GLM's latent: `glm5_bill.pagedRows`).
 
 ## Zig
 

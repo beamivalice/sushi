@@ -220,13 +220,14 @@ test "GLM DFlash2 reserve at prefill end fits the admission bill at every reques
         cfg.pinned_context = ctx;
         for ([_]u64{ 16, 8, 6 }) |kv_bits| {
             const latent_row: usize = if (kv_bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, @intCast(kv_bits));
+            const parts = glm_bill.latentPartBytes(cfg.mla_kv_lora_rank, if (kv_bits == 16) 0 else @intCast(kv_bits), 2);
             for (shapes) |shape| {
                 const seq: usize = @intCast(shape[0]);
                 if (seq >= ctx) continue;
                 const max_tokens: u32 = @intCast(@min(shape[1], ctx - seq));
-                const lc = try reserve.capacity(seq);
-                const pc = try reserve.capacity(seq / 4);
-                const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
+                const lc = try reserve.capacity(seq, &parts);
+                const pc = try reserve.capacity(seq / 4, &.{pool_row});
+                const p = try reserve.plan(seq, lc, pc, &parts, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
                 const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
                 try std.testing.expect(try reserve.statesPeak(mla_layers, p) <= glm_bill.dflashReserveBudget(&cfg, seq, max_tokens, kv_bits, held));
             }
@@ -244,11 +245,12 @@ test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the adve
     for ([_]struct { bits: u64, ctx: u32 }{ .{ .bits = 8, .ctx = 1048576 }, .{ .bits = 6, .ctx = 1048576 }, .{ .bits = 16, .ctx = 524288 } }) |arm| {
         cfg.pinned_context = arm.ctx;
         const latent_row: usize = if (arm.bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, @intCast(arm.bits));
+        const parts = glm_bill.latentPartBytes(cfg.mla_kv_lora_rank, if (arm.bits == 16) 0 else @intCast(arm.bits), 2);
         for ([_]usize{ 16, 2008, 100000 }) |seq| {
             const max_tokens: u32 = @intCast(arm.ctx - seq);
-            const lc = try reserve.capacity(seq);
-            const pc = try reserve.capacity(seq / 4);
-            const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
+            const lc = try reserve.capacity(seq, &parts);
+            const pc = try reserve.capacity(seq / 4, &.{pool_row});
+            const p = try reserve.plan(seq, lc, pc, &parts, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
             const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
             const peak = try reserve.statesPeak(mla_layers, p);
             // The generator's config copy is never pinned: it resolves its own, smaller context.
