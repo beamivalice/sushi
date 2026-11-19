@@ -1954,6 +1954,34 @@ const Served = struct {
         return got;
     }
 
+    /// One request as the inference loop runs it, a failure settled by `failPrefill` or `failTick`, then completed and
+    /// taken by the loop's cleanup drain (`cleanupSlot`, then the slot's memory goes): the dispatches still open between
+    /// the drain and the slot's end.
+    fn requestToCleanup(self: *Served, prompt: []const u32, n: u32, mtp: bool) !u32 {
+        const sch = &self.sch;
+        const head = if (mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(self.entry.handle.?), true, null) else null;
+        const slot = try sch.submit(.{ .model = self.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
+        _ = sch.pending.orderedRemove(0);
+        scheduler.runPrefill(sch, slot) catch |e| scheduler.failPrefill(slot, e);
+        if (!scheduler.postPrefillTerminal(sch, slot)) {
+            try sch.decoding.append(testing.allocator, slot);
+            var one = [_]*scheduler.Slot{slot};
+            while (slot.joinsTick()) scheduler.runDecodeTick(sch, &one) catch |e| scheduler.failTick(&one, e, "[scheduler]");
+            scheduler.cullDecoding(sch);
+        }
+        sch.complete(slot);
+        var open: u32 = 0;
+        for (sch.cleanup_queue.items) |s| {
+            scheduler.cleanupSlot(sch, s);
+            open = @max(open, mlx.engine.openDispatches());
+            const turn = arch_handle.turnFor(s.model.handle, s.model.config);
+            defer turn.end();
+            s.deinit();
+        }
+        sch.cleanup_queue.clearRetainingCapacity();
+        return open;
+    }
+
     /// Requests through the scheduler, each prefilled in turn and then decoded together, their rows joined in its ticks
     /// as concurrent requests are, with the model's MTP head when `mtp`. `reused`: what the last took from a tier.
     fn concurrent(self: *Served, prompts: []const []const u32, n: u32, sampling: SamplingParams, mtp: bool) !void {
@@ -2989,6 +3017,56 @@ test "cooler contract: a served speculative request refused at any pool buffer s
                 const now = Sheet.now();
                 try testing.expectEqual(base.in_use, now.in_use);
                 try testing.expectEqual(@as(u32, 0), now.open);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a speculative request failed at any pool buffer site its plain request lacks leaves no dispatch open once the cleanup drain takes its slot, before the slot's memory goes" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            const depth_bounds = @import("mtp_depth_bounds.zig");
+            const saved = depth_bounds.active;
+            defer depth_bounds.active = saved;
+            depth_bounds.active = .{ .min = 3, .max = 3 };
+            var p: [40]u32 = undefined;
+            for (&p, 0..) |*t, i| t.* = ids[(i * 5 + 1) % ids.len];
+            const Req = struct {
+                sv: *Served,
+                p: []const u32,
+                mtp: bool,
+                fn go(q: @This()) anyerror!void {
+                    _ = try q.sv.requestToCleanup(q.p, 12, q.mtp);
+                }
+            };
+            const sites = &mlx.engine.fault.sites;
+            defer sites.* = .{};
+            sites.* = .{ .frames = 8 };
+            const plain = try mlx.sweepSites(a, sites, Req{ .sv = &sv, .p = &p, .mtp = false }, Req.go);
+            defer a.free(plain);
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            for (plain) |pt| try seen.put(a, pt.site, {});
+            sites.* = .{ .lasts = true, .frames = 8 };
+            const all = try mlx.sweepSites(a, sites, Req{ .sv = &sv, .p = &p, .mtp = true }, Req.go);
+            defer a.free(all);
+            const base = Sheet.now();
+            for (all, 0..) |pt, at| {
+                if (seen.contains(pt.site)) continue;
+                errdefer std.debug.print("cooler contract: a speculative request failed at pool point {d} of {d} (ask {d} of its site)\n", .{ at, all.len, pt.n });
+                mlx.engine.fault.armAt(pt);
+                const open = try sv.requestToCleanup(&p, 12, true);
+                mlx.engine.fault.disarm();
+                try testing.expect(!mlx.errorPending());
+                try testing.expectEqual(@as(u32, 0), open);
+                try testing.expect(Sheet.now().in_use <= base.in_use);
             }
         }
     }.run);
