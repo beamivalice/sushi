@@ -537,13 +537,19 @@ fn restore(engine: *stream.Engine, config: *const ModelConfig, headroom: *const 
             left += 1;
             continue;
         }
-        bytes += engine.lentBytes(@intCast(li));
-        try engine.restoreLayer(@intCast(li));
+        const lent = engine.lentBytes(@intCast(li));
+        // A refused read-back leaves the layer released, its union workspace serving it, and a later forward retries.
+        engine.restoreLayer(@intCast(li)) catch |e| {
+            log.warn("[dsv41-borrow] layer {d} stays released: its read-back failed ({s})\n", .{ li, mlx.settledErrorName(e) });
+            left += 1;
+            continue;
+        };
+        bytes += lent;
         count += 1;
     }
     const ms: u64 = @intCast(@divTrunc(t0.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
     if (count > 0) log.info("[dsv41-borrow] restored {d} layers ({d:.2} GB) in {d} ms before decode\n", .{ count, gb(bytes), ms });
-    if (left > 0) log.info("[dsv41-borrow] {d} layers stay released: no room beside the decode forward\n", .{left});
+    if (left > 0) log.info("[dsv41-borrow] {d} layers stay released until a later forward\n", .{left});
 }
 
 /// The kernel unwires a freed Metal buffer asynchronously; the forward waits until most of what was released has left

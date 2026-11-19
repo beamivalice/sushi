@@ -374,6 +374,8 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
 - A release or a restore that fails leaves the layer as it was, and the borrow stops at the first failure: a released
   layer always has the union workspace, so a release that cannot make it takes its pool back. One whose take-back
   failed too is healed before the next forward (workspace, else pool), or that forward is `ReleasedLayerHasNoUnion`.
+  A refused read-back never fails the decode: its layer and the ones after it stay released, served by the union
+  workspace, and a later forward retries them.
 - Log lines: `[dsv41-borrow] released layers a..39 (X GB) for a N-row forward at P: need, headroom before -> after,
   unwired in T ms` and `[dsv41-borrow] restored n layers (X GB) in T ms before decode`.
 

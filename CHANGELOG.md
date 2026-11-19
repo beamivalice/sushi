@@ -35,6 +35,8 @@ earlier history is mlx-serve's, in that project's changelog.
   scale and bias rows a buffer slightly larger than they need, which it then never reuses in place, so the append
   copied them, memory the bill did not hold. Past 1,024 tokens the cache now grows 1,024 rows at a time (up to 4.6 MB
   more held on the release pack), which the memory bill already counted.
+- **A DeepSeek request on Sushi Cooler no longer fails when memory is short as its decode starts**: after a prefill
+  that lent expert-cache layers, a refused read-back of one failed the request, though the layer can decode as it is.
 - **A long DeepSeek prompt on a fully resident Sushi Cooler load no longer re-reads expert layers from SSD while other
   requests decode**: each decode step between its prefill chunks read back the expert-cache layers the prefill had
   lent, and the next chunk lent them again, about 3 GB of SSD reads a layer each time.

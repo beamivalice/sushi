@@ -4699,6 +4699,12 @@ const LeaseProbe = struct {
     var seen: usize = 0;
     var released: usize = 0;
     var restored: usize = 0;
+    /// Armed at the next read: a decode forward's first read is its first read-back's, so the fault's count starts there.
+    var arm_at: u64 = 0;
+    /// With `mark`, the fault's count at the first two reads: a decode forward reads before each read-back.
+    var mark: bool = false;
+    var marks: [2]u64 = .{ 0, 0 };
+    var marked: usize = 0;
 
     fn reset() void {
         seen = 0;
@@ -4707,6 +4713,12 @@ const LeaseProbe = struct {
     }
 
     fn headroom(_: *const model_mod.ModelConfig) @import("bills.zig").Headroom {
+        if (arm_at != 0) mlx.engine.fault.arm(arm_at);
+        arm_at = 0;
+        if (mark and marked < marks.len) {
+            marks[marked] = mlx.engine.fault.count();
+            marked += 1;
+        }
         const e = engine.?;
         var lent: u64 = 0;
         var n: usize = 0;
@@ -4844,5 +4856,119 @@ test "cooler contract: a DeepSeek prefill that releases decoder pools keeps them
         try testing.expectEqual(solo.released, pair.released);
         try testing.expectEqual(solo.restored, pair.restored);
         try testing.expectEqualSlices(u32, solo.a_tokens.items, pair.a_tokens.items);
+    }
+}
+
+/// One request prefilled under `LeaseProbe`, so its wide chunk released decoder pools, and decoding.
+const LeasedDecode = struct {
+    sv: Served,
+    slot: *Served.scheduler.Slot,
+
+    fn begin(self: *LeasedDecode, ld: *Load, dir: []const u8, prompt: []const u32) !void {
+        const scheduler = Served.scheduler;
+        try self.sv.init(ld, dir);
+        errdefer self.sv.deinit();
+        const sch = &self.sv.sch;
+        self.slot = try sch.submit(.{ .model = self.sv.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 8 });
+        _ = sch.pending.orderedRemove(0);
+        errdefer {
+            sch.complete(self.slot);
+            for (sch.cleanup_queue.items) |x| x.deinit();
+            sch.cleanup_queue.clearRetainingCapacity();
+        }
+        try scheduler.runPrefill(sch, self.slot);
+        if (!scheduler.postPrefillTerminal(sch, self.slot)) try sch.decoding.append(testing.allocator, self.slot);
+    }
+
+    fn tick(self: *LeasedDecode) void {
+        const scheduler = Served.scheduler;
+        var one = [_]*scheduler.Slot{self.slot};
+        if (self.slot.joinsTick()) scheduler.runDecodeTick(&self.sv.sch, &one) catch |e| self.slot.markError(@errorName(e));
+    }
+
+    fn end(self: *LeasedDecode) void {
+        const sch = &self.sv.sch;
+        sch.complete(self.slot);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+        sch.cleanup_queue.clearRetainingCapacity();
+        self.sv.deinit();
+    }
+};
+
+test "cooler contract: a DeepSeek decode whose read-back of a released pool is refused decodes through the union workspace and says the same tokens" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.engine.fault.disarm();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const ids = try D.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(D, dir, true);
+    defer _ = ld.close();
+    const borrow = @import("dsv41/dsv41_borrow.zig");
+    const xfm = arch_handle.trunk(ld.h);
+    const engine = xfm.expert_stream.?;
+    const m = @import("dsv41/dsv41_state.zig").modelOf(xfm).?;
+    // One 2048-row chunk and the held-back span: the chunk's need less half a pool is the free memory, so it releases a
+    // pool, and the first decode step finds room to read it back.
+    ld.config.pinned_prefill_chunk = 2048;
+    var long: [2048]u32 = undefined;
+    for (&long, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
+    const wide = long.len - (prefill_plan.SSM_SNAPSHOT_BACKOFF + 1);
+    const need = borrow.prefillNeed(&m.cfg, @import("cooler_side.zig").onEngine(&ld.config), wide, wide);
+    LeaseProbe.engine = engine;
+    defer LeaseProbe.engine = null;
+    LeaseProbe.base = need - engine.poolBytes(@intCast(engine.layers.len - 1)) / 2;
+    borrow.headroom_fn = &LeaseProbe.headroom;
+    defer borrow.headroom_fn = null;
+    const Released = struct {
+        fn count(e: *const @import("expert_stream.zig").Engine) usize {
+            var n: usize = 0;
+            for (e.borrow_from..e.layers.len) |li| n += @intFromBool(e.isBorrowed(@intCast(li)));
+            return n;
+        }
+    };
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(a);
+    {
+        var r: LeasedDecode = undefined;
+        try r.begin(&ld, dir, &long);
+        defer r.end();
+        try testing.expect(Released.count(engine) >= 2);
+        LeaseProbe.mark = true;
+        LeaseProbe.marked = 0;
+        r.tick();
+        LeaseProbe.mark = false;
+        try testing.expectEqual(@as(usize, 0), Released.count(engine));
+        while (r.slot.joinsTick()) r.tick();
+        try testing.expect(r.slot.error_code == null);
+        try want.appendSlice(a, r.slot.legacy_gen.?.generated_ids.items);
+    }
+    // The buffers the first read-back asks, between the reads before it and before the second.
+    try testing.expectEqual(@as(usize, 2), LeaseProbe.marked);
+    const asks = LeaseProbe.marks[1] - LeaseProbe.marks[0];
+    try testing.expect(asks > 0);
+    // Each is refused in turn: the layer stays released with the union workspace, and the request decodes through it to
+    // the same tokens.
+    var k: u64 = 1;
+    while (k <= asks) : (k += 1) {
+        var r: LeasedDecode = undefined;
+        try r.begin(&ld, dir, &long);
+        defer r.end();
+        LeaseProbe.arm_at = k;
+        defer LeaseProbe.arm_at = 0;
+        r.tick();
+        try testing.expectEqual(@as(u64, 0), LeaseProbe.arm_at);
+        try testing.expect(!mlx.engine.fault.armed());
+        mlx.engine.fault.disarm();
+        while (r.slot.joinsTick()) r.tick();
+        errdefer std.debug.print("ask {d} of the read-back's {d} refused: {?s}\n", .{ k, asks, r.slot.error_code });
+        try testing.expect(r.slot.error_code == null);
+        try testing.expectEqualSlices(u32, want.items, r.slot.legacy_gen.?.generated_ids.items);
     }
 }
