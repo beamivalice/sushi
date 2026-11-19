@@ -95,7 +95,8 @@ hidden 2560, expert intermediate 640.
   plus `BILL_MARGIN_BYTES`: a cap at either peak alone evicts the other's buffers every block and makes them again,
   and the test pins that a second encode evicts nothing. A 1536² image (9,216 patches) bills 1.90 GB, down from
   22.8 GB of whole sheets, and holds 0.91 GB in use, down from 11.6 GB. The encode runs under `engine.budget` of its
-  bill, so an over-run is `PoolOverBudget`, never a Metal OOM.
+  bill, so an over-run is `PoolOverBudget`, never a Metal OOM; the vision queue installs it before the first patch
+  array (`qwen4_flags.serve.enterVision`), so the patches never land on free buffers past it.
 - A 1536² encode on the 4bpw-v2.0 tower on Cooler: 2,498 ms whole sheets, 2,280 ms by chunks, same bytes (base
   `80f21021` plus this change, M5 Max, one encode after one warm each, GPU lock held, `taskpolicy -a`, idle box).
 - **On MLX the bill stays fitted to the whole sheet**: the lazy graph keeps many chunks' sheets until the block's

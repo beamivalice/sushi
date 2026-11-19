@@ -175,6 +175,10 @@ const Load = struct {
     }
 };
 
+/// An image encode on the engine the vision queue runs under its whole bill (`qwen4_flags.serve.enterVision`), from
+/// before its first patch array to its last span: no forward installs or lifts a cap of its own inside it.
+pub var encode_billed = false;
+
 pub const QwenVision = struct {
     s: mlx.mlx_stream,
     /// The tower runs on Sushi Cooler, the engine of our own: the load's side (`cooler_side`), decided at its init.
@@ -896,9 +900,11 @@ pub const QwenVision = struct {
         const run: ?mlx.engine.Makers = if (self.own) mlx.engine.makers(true) else null;
         defer if (run) |made| made.end();
         const n: c_int = @intCast(grid_h * grid_w);
-        // On the engine the encode runs inside its bill: an over-run is a named refusal, never a Metal OOM.
-        if (self.own) try mlx.engine.budget(scratchOf(.{ .heads = self.heads, .head_dim = self.head_dim, .hidden = self.hidden, .intermediate = self.intermediate }, true, self.attn_rows, @intCast(n)));
-        defer if (self.own) mlx.engine.budget(std.math.maxInt(u64)) catch {};
+        // On the engine the encode runs inside its bill: an over-run is a named refusal, never a Metal OOM. An encode
+        // the vision queue billed (`encode_billed`) is under that bill already, its patches with it.
+        const capped = self.own and !encode_billed;
+        if (capped) try mlx.engine.budget(scratchOf(.{ .heads = self.heads, .head_dim = self.head_dim, .hidden = self.hidden, .intermediate = self.intermediate }, true, self.attn_rows, @intCast(n)));
+        defer if (capped) mlx.engine.budget(std.math.maxInt(u64)) catch {};
         // The residual: replaced in place, and freed on any failure.
         var x = mlx.mlx_array_new();
         errdefer if (x.ctx != null) {
@@ -2506,4 +2512,65 @@ fn expectSameBytes(want: mlx.mlx_array, got: mlx.mlx_array) !void {
     try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
     const bytes = mlx.mlx_array_size(want) * mlx.mlx_array_itemsize(want);
     try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..bytes], mlx.mlx_array_data_uint8(got).?[0..bytes]);
+}
+
+test "a Qwen encode on the engine admitted at its bill, with a request's rest of free buffers in the pool, holds no more than in use and the bill" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const arch_serve = @import("../arch/serve.zig");
+    var cfg = servedTowerConfig(2, 1152, 16, 4304, 2560, 2304);
+    @import("../cooler_side.zig").forTest(&cfg, true);
+    var w = try servedTower(cfg);
+    defer w.deinit();
+    var tower = try QwenVision.init(a, cfg, &w);
+    defer tower.deinit();
+    const s = tower.ownStream().?;
+    for ([_][2]u32{ .{ 32, 32 }, .{ 64, 64 } }) |grid| {
+        for ([_]u64{ 0, 12 }) |rest_n| {
+            mlx.engine.close();
+            mlx.engine.trim();
+            // A request's end leaves free buffers in the pool, up to its rest cap; the encode's check reads them as free.
+            {
+                const zeros = try a.alloc(u8, 48 << 20);
+                defer a.free(zeros);
+                @memset(zeros, 0);
+                var held: [12]mlx.mlx_array = undefined;
+                for (0..rest_n) |i| {
+                    mlx.engine.room(&.{zeros.len});
+                    const scope = mlx.engine.enter(s);
+                    defer scope.end();
+                    held[i] = try mlx.newData(zeros.ptr, &[_]c_int{@intCast(zeros.len)}, .uint8);
+                }
+                for (held[0..rest_n]) |x| _ = mlx.mlx_array_free(x);
+                mlx.engine.close();
+            }
+            const st0 = mlx.engine.stats();
+            const in_use = st0.pool_bytes - st0.pool_free;
+            const n: usize = @as(usize, grid[0]) * grid[1];
+            // visionEncodeBill on a served config: the tower's scratch, the patches and three copies of the rows out.
+            const bill = encodeScratchBytes(&cfg, n) + n * 384 + 3 * (n / 4) * cfg.qv_out_hidden * 2;
+            mlx.engine.resetPoolPeak(.process);
+            // As the vision queue runs an encode: under its bill from before its first array.
+            arch_serve.enterVision(bill, &cfg);
+            defer arch_serve.leaveVision(&cfg);
+            const patches = blk: {
+                const scope = mlx.engine.enter(s);
+                defer scope.end();
+                break :blk try servedPatches(n, grid[0]);
+            };
+            defer _ = mlx.mlx_array_free(patches);
+            try mlx.check(mlx.mlx_array_eval(patches));
+            const out = try tower.forward(patches, grid[0], grid[1]);
+            defer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_array_eval(out));
+            mlx.engine.close();
+            const peak = mlx.engine.poolHeldPeak(.process);
+            // The pool held its rest before the encode began; the encode may not grow it past that or past its bill.
+            errdefer std.debug.print("{d}x{d}, {d} MB of rest free: {d} MB in use, a {d} MB bill, {d} MB held at the peak\n", .{ grid[0], grid[1], st0.pool_free >> 20, in_use >> 20, bill >> 20, peak >> 20 });
+            try std.testing.expect(peak <= @max(in_use + bill, st0.pool_bytes));
+        }
+    }
 }

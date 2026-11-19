@@ -16,13 +16,13 @@ fn flagsOf(comptime tag: registry.Tag) type {
 /// Installs the hooks an arch's serving path reads for the life of `serve`; `pool_ram_cap` is the MLX pool's ceiling.
 pub fn install(pool_ram_cap: u64) void {
     inline for (comptime std.meta.tags(registry.Tag)) |t| {
-        if (comptime @hasDecl(flagsOf(t), "serve")) flagsOf(t).serve.install(pool_ram_cap);
+        if (comptime serveHas(t, "install")) flagsOf(t).serve.install(pool_ram_cap);
     }
 }
 
 pub fn uninstall() void {
     inline for (comptime std.meta.tags(registry.Tag)) |t| {
-        if (comptime @hasDecl(flagsOf(t), "serve")) flagsOf(t).serve.uninstall();
+        if (comptime serveHas(t, "uninstall")) flagsOf(t).serve.uninstall();
     }
 }
 

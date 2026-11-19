@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A Qwen image encode on Sushi Cooler stays inside its memory bill**: its patch arrays were made before the encode's
+  cap went in, so they could land on free buffers past the bill.
 - **A Sushi Cooler load that evicts a model on MLX gets that model's memory back**: the evicted model's freed buffers
   stayed in MLX's pool (up to 8 GB on a 128 GB Mac) for the whole life of the new load, so its memory check read
   less free RAM than there was, and later checks counted that pool as room the engine cannot use.

@@ -4,6 +4,9 @@ const arch_config = @import("../arch/config.zig");
 const flags = @import("../arch/flags.zig");
 const trunk = @import("../trunk.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
+const qwen_vision = @import("qwen_vision.zig");
+const mlx = @import("../mlx.zig");
+const log = @import("../log.zig");
 
 pub const options = [_]flags.Option{
     .{ .name = "--mtp-head-kv-quant", .takes_value = false, .apply = setMtpHeadKvQuant, .boot_line = mtpHeadKvLine },
@@ -40,6 +43,24 @@ pub const help = [_]flags.HelpChunk{
 pub const think_rank = 1;
 pub const think_help = "Qwen off|low|medium|xhigh; ";
 pub const think_refusal = "Qwen off|low|medium|xhigh";
+
+/// An image encode on the engine runs under its bill (`request_media.visionEncodeBill`) from before its first array:
+/// the patches the queue makes land inside it with the tower's scratch and the rows out.
+pub const serve = struct {
+    pub fn enterVision(bill: u64, config: *const model.ModelConfig) void {
+        if (bill == 0 or !@import("../cooler_side.zig").onEngine(config)) return;
+        mlx.engine.budget(bill) catch |e| {
+            log.warn("[vision] the encode's cap of {d} MB was not installed ({s}): each pass caps its own scratch\n", .{ bill >> 20, @errorName(e) });
+            return;
+        };
+        qwen_vision.encode_billed = true;
+    }
+    pub fn leaveVision(_: *const model.ModelConfig) void {
+        if (!qwen_vision.encode_billed) return;
+        qwen_vision.encode_billed = false;
+        mlx.engine.budget(@import("std").math.maxInt(u64)) catch {};
+    }
+};
 
 pub const warm = struct {
     pub fn bytes(comptime order: @import("std").builtin.AtomicOrder) u64 {
