@@ -6971,6 +6971,16 @@ fn writeGpuAction(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!v
     try w.print("- Raise the GPU memory limit in Terminal: {s} (it resets at reboot), then restart sushi: the limit is read when sushi starts.\n", .{wireLimitsCommand(&cmd, mb)});
 }
 
+/// The resident-model budget's refusal (`--max-resident-mem`, no loaded model can be evicted): `needed` for this load,
+/// `cap` the budget and `held` what the loaded models in use hold.
+pub fn residentBudgetRefusalText(buf: []u8, needed: u64, cap: u64, held: u64, models: usize) []const u8 {
+    const u = Mem.unitOf(needed, cap);
+    return std.fmt.bufPrint(buf, "Not enough memory to load this model: it needs {f}, and the resident-model budget (--max-resident-mem, {f}) has {f} left beside the {d} loaded model(s), each in use.\n" ++
+        "To load it:\n- Unload a model on the Models page (or with Unload in Sushibar), then retry.\n" ++
+        "- Restart sushi with a larger --max-resident-mem <size>, or 0 for none (a launch flag; Settings has none).", .{ Mem.need(needed, u), Mem.have(cap, u), Mem.have(cap -| held, u), models }) catch
+        "Not enough memory to load this model: it would pass the resident-model budget (--max-resident-mem).";
+}
+
 /// The smallest ssd budget that plans: its GiB and what its plan holds beside the expert cache.
 pub const BudgetFloor = struct { gb: u64, held: u64 };
 
@@ -7674,4 +7684,13 @@ test "a resident load of a pack that can stream names the ssd budget that fits" 
     const text = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .total_ram = 32 * gib, .stream_fits_gb = 17 });
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "- Stream its experts from the SSD: set Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to 17 or less") != null);
+}
+
+test "the resident-model budget refusal gives its figures in one unit and its actions" {
+    const gib: u64 = 1 << 30;
+    var buf: [768]u8 = undefined;
+    const text = residentBudgetRefusalText(&buf, 20 * gib + 1, 48 * gib, 40 * gib, 2);
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "it needs 20.1 GB, and the resident-model budget (--max-resident-mem, 48.0 GB) has 8.0 GB left beside the 2 loaded model(s), each in use.\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\n- Unload a model on the Models page") != null);
 }

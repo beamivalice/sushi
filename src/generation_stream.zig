@@ -2225,7 +2225,7 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
 /// bound and what to free or change), else the refusal's own. The caller frees it.
 pub fn loadRefusalMessage(allocator: std.mem.Allocator, err: anyerror, refusal: LoadRefusal, context: ?model_registry_mod.MemoryContextRefusal) ![]u8 {
     const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported or
-        err == error.SsdBudgetExceedsWiredLimit or err == error.ExpertCacheDoesNotFit or err == error.SsdBudgetBelowResident;
+        err == error.SsdBudgetExceedsWiredLimit or err == error.ExpertCacheDoesNotFit or err == error.SsdBudgetBelowResident or err == error.NotEnoughMemory;
     if (written) if (scheduler_mod.takeLoadRefusal()) |text| return allocator.dupe(u8, text);
     if (context) |c| return memoryContextRefusalMessage(allocator, c);
     return allocator.dupe(u8, refusal.message);
@@ -2262,9 +2262,9 @@ test "a prefill chunk refused mid-request for memory answers 503 with the arch's
     try std.testing.expect(std.mem.indexOf(u8, bare.message, "before any work started") == null);
 }
 
-test "a streamed load refused by its fit checks answers with the text the load wrote, as the memory preflight does" {
+test "a load refused by a check that wrote its text answers with that text, as the memory preflight does" {
     const a = std.testing.allocator;
-    for ([_]anyerror{ error.SsdBudgetExceedsWiredLimit, error.ExpertCacheDoesNotFit, error.SsdBudgetBelowResident }) |e| {
+    for ([_]anyerror{ error.SsdBudgetExceedsWiredLimit, error.ExpertCacheDoesNotFit, error.SsdBudgetBelowResident, error.NotEnoughMemory }) |e| {
         scheduler_mod.recordLoadRefusal("Not enough memory to load this model.\nIt needs 150.0 GB ...");
         const message = try loadRefusalMessage(a, e, loadRefusalFor(e).?, null);
         defer a.free(message);

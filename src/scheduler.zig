@@ -82,6 +82,7 @@ const prefix_cache_admin = @import("prefix_cache_admin.zig");
 const slot_admission = @import("slot_admission.zig");
 const vision_queue = @import("vision_queue.zig");
 const model_load = @import("model_load.zig");
+const bills = @import("bills.zig");
 const sched = @import("arch/sched.zig");
 const arch_prefix = @import("arch/prefix.zig");
 
@@ -1896,20 +1897,16 @@ pub const Scheduler = struct {
                 // hunting for a concurrent request that does not exist: on an
                 // idle server the cause is always the static cap (#126), and
                 // the flag that moves it is not otherwise discoverable.
-                const gb = 1024.0 * 1024.0 * 1024.0;
                 const count_cap = self.registry.countLoadedLocked() + 1 > self.registry.max_resident_models;
                 if (count_cap) {
                     log.err("Refusing to load {s}: --max-resident-models is {d} and {d} model(s) are resident, none evictable (each is serving a request). Retry when one ends, or raise the cap.\n", .{
                         entry.id, self.registry.max_resident_models, self.registry.countLoadedLocked(),
                     });
                 } else {
-                    log.err("Refusing to load {s}: needs ~{d:.2} GB but --max-resident-mem is {d:.2} GB ({d:.2} GB already resident across {d} model(s), none evictable). Raise or disable the cap with --max-resident-mem <size>|0.\n", .{
-                        entry.id,
-                        @as(f64, @floatFromInt(estimated)) / gb,
-                        @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
-                        @as(f64, @floatFromInt(self.registry.current_resident_bytes)) / gb,
-                        self.registry.countLoadedLocked(),
-                    });
+                    var text_buf: [768]u8 = undefined;
+                    const text = bills.residentBudgetRefusalText(&text_buf, estimated, self.registry.max_resident_mem, self.registry.current_resident_bytes +| (self.registry.reserved_bytes -| estimated), self.registry.countLoadedLocked());
+                    log.err("Refusing to load {s}: {s}\n", .{ entry.id, text });
+                    recordLoadRefusal(text);
                 }
                 self.registry.markUnloadedLocked(entry); // releases the reservation
                 return if (count_cap) error.ResidentModelsCapReached else error.NotEnoughMemory;
