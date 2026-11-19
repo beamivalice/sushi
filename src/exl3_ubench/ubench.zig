@@ -1741,6 +1741,30 @@ fn bankView(s: mlx.mlx_stream, bank: mlx.mlx_array, c: usize, g: usize) !mlx.mlx
     return v;
 }
 
+/// `copies` random trellis banks of shape `sh`, each a view of one bank so a chain reads cold; `owned` frees them.
+fn stqBanks(a: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, sh: TrunkShape, copies: usize, owned: *std.ArrayList(mlx.mlx_array)) ![]root.Proj {
+    const g = sh.groups;
+    const words = try a.alloc(u16, copies * g * (sh.in / 16) * (sh.out / 16) * sh.n);
+    bench.randomWords(rnd, words);
+    const bank = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ @intCast(copies * g), @intCast(sh.in / 16), @intCast(sh.out / 16), @intCast(sh.n) }, 4, .uint16);
+    try owned.append(a, bank);
+    a.free(words);
+    // A chain keeps its magnitude: suh = 1/sqrt(in) cancels the inner sum's growth.
+    const scaled = try a.alloc(u16, g * sh.in);
+    @memset(scaled, exl3.f32ToF16Bits(1.0 / @sqrt(@as(f32, @floatFromInt(sh.in)))));
+    const ones = try a.alloc(u16, g * sh.out);
+    @memset(ones, exl3.f32ToF16Bits(1.0));
+    const suh = mlx.mlx_array_new_data(scaled.ptr, &[_]c_int{ @intCast(g), @intCast(sh.in) }, 2, .float16);
+    const svh = mlx.mlx_array_new_data(ones.ptr, &[_]c_int{ @intCast(g), @intCast(sh.out) }, 2, .float16);
+    try owned.appendSlice(a, &.{ suh, svh });
+    const stq = try a.alloc(root.Proj, copies);
+    for (stq, 0..) |*p, c| {
+        p.* = .{ .trellis = try bankView(s, bank, c, g), .suh = suh, .svh = svh };
+        try owned.append(a, p.trellis);
+    }
+    return stq;
+}
+
 fn runTrunkRows(run: *report.Run) anyerror!void {
     const s = mlx.gpuStream();
     defer {
@@ -1761,24 +1785,7 @@ fn runTrunkRows(run: *report.Run) anyerror!void {
         defer for (owned.items) |x| {
             _ = mlx.mlx_array_free(x);
         };
-        const words = try a.alloc(u16, copies * g * (sh.in / 16) * (sh.out / 16) * sh.n);
-        bench.randomWords(rnd, words);
-        const bank = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ @intCast(copies * g), @intCast(sh.in / 16), @intCast(sh.out / 16), @intCast(sh.n) }, 4, .uint16);
-        try owned.append(a, bank);
-        a.free(words);
-        // A chain keeps its magnitude: suh = 1/sqrt(in) cancels the inner sum's growth.
-        const scaled = try a.alloc(u16, g * sh.in);
-        @memset(scaled, exl3.f32ToF16Bits(1.0 / @sqrt(@as(f32, @floatFromInt(sh.in)))));
-        const ones = try a.alloc(u16, g * sh.out);
-        @memset(ones, exl3.f32ToF16Bits(1.0));
-        const suh = mlx.mlx_array_new_data(scaled.ptr, &[_]c_int{ @intCast(g), @intCast(sh.in) }, 2, .float16);
-        const svh = mlx.mlx_array_new_data(ones.ptr, &[_]c_int{ @intCast(g), @intCast(sh.out) }, 2, .float16);
-        try owned.appendSlice(a, &.{ suh, svh });
-        const stq = try a.alloc(root.Proj, copies);
-        for (stq, 0..) |*p, c| {
-            p.* = .{ .trellis = try bankView(s, bank, c, g), .suh = suh, .svh = svh };
-            try owned.append(a, p.trellis);
-        }
+        const stq = try stqBanks(a, s, rnd, sh, copies, &owned);
         const mx_codes = try a.alloc(u32, copies * g * sh.out * sh.in / 4);
         for (mx_codes) |*v| v.* = rnd.int(u32) & 0x3f3f3f3f;
         const mx_exp = try a.alloc(u8, copies * g * sh.out * sh.in / 32);
@@ -1820,6 +1827,74 @@ fn runTrunkRows(run: *report.Run) anyerror!void {
             const us = run.lastMedianNs("served") / 1e3;
             try run.metric("served", "GB/s", "GB/s", bench.gbps(bytes, us));
         }
+    }
+}
+
+pub const wo_pair: report.Bench = .{
+    .name = "dsv41.wo_pair",
+    .scope = .dsv41,
+    .what = "DeepSeek-V4.1's attention output (wo_a G8 4096->1024, then wo_b 8192->5120) as the pair launch, wo_b summing wo_a's partials, against the two launches",
+    .unit = .us,
+    .steps = 64,
+    .axes = &.{.{ .name = "rows", .values = &.{ "1", "2", "3" } }},
+    .arms = &.{ "pair", "separate" },
+    .ref = "separate",
+    .run = runWoPair,
+};
+
+const WoPair = struct { a: []const root.Proj, b: []const root.Proj, rows: usize, pair: bool };
+
+fn woPairStep(t: WoPair, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const c = i % t.a.len;
+    const dec = kernels.SPEC1_W15;
+    if (t.pair) return (try root.linear.linearPair(s, x, t.a[c], t.b[c], dec, dec, .{}, null)) orelse error.PairNotServed;
+    const oa = try root.linear.linearGroupedWith(s, x, t.a[c], dec, .{});
+    defer _ = mlx.mlx_array_free(oa);
+    var tr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tr);
+    try mlx.check(mlx.mlx_transpose_axes(&tr, oa, &[_]c_int{ 1, 0, 2 }, 3, s));
+    var mid = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mid);
+    try mlx.check(mlx.mlx_reshape(&mid, tr, &[_]c_int{ @intCast(t.rows), -1 }, 2, s));
+    return root.linear.linearWith(s, mid, t.b[c], dec, .{});
+}
+
+const WoPairSample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, t: WoPair, steps: usize };
+
+fn sampleWoPair(smp: WoPairSample, arm: usize) anyerror!f64 {
+    var t = smp.t;
+    t.pair = arm == 0;
+    kernels.setDecodeParams(kernels.SPEC1_W15);
+    const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, t, woPairStep);
+    const floor = try bench.chainNs(smp.s, smp.x0, smp.steps, {}, bench.linkOnly);
+    return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(smp.steps));
+}
+
+fn runWoPair(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    var prng = std.Random.DefaultPrng.init(0x70a);
+    const rnd = prng.random();
+    try kernels.SPEC1_W15.requireTable();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer for (owned.items) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    const copies = 24;
+    const wa = try stqBanks(a, s, rnd, TRUNK_SHAPES[3], copies, &owned);
+    const wb = try stqBanks(a, s, rnd, TRUNK_SHAPES[4], copies, &owned);
+    for (run.axis("rows")) |rows_text| {
+        const rows = try std.fmt.parseInt(usize, rows_text, 10);
+        const xs = try a.alloc(u16, 8 * rows * 4096);
+        for (xs) |*v| v.* = @truncate(@as(u32, @bitCast(rnd.float(f32) - 0.5)) >> 16);
+        const x0 = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ 8, @intCast(rows), 4096 }, 3, .bfloat16);
+        defer _ = mlx.mlx_array_free(x0);
+        const t: WoPair = .{ .a = wa, .b = wb, .rows = rows, .pair = true };
+        const label = try std.fmt.allocPrint(run.a, "rows {d}", .{rows});
+        try run.interleave(label, WoPairSample{ .s = s, .x0 = x0, .t = t, .steps = run.steps(64) }, sampleWoPair);
     }
 }
 

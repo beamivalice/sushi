@@ -456,7 +456,11 @@ its Engram rows cold, on an older main.
 
 **Ruled out here** (`sushi-ubench run dsv41.wo_pair`, 15 rounds, quiet, `7424e2c0`): `wo_b` reading `wo_a`'s partials
 ties the two launches at one row (49.4 against 50.1 us) and loses from two rows (74.9 against 69.0), where it is not
-served: the choice stands on this GPU.
+served: the choice stands on this GPU. The prefill attention's 16 heads a threadgroup is the widest that runs: 32 asks
+35,136 B of threadgroup memory against the 32,768 B limit. Decode attention is not bound by re-reading the one KV
+head's rows per query head: a threadgroup holding 2, 4 or 8 heads, each row read once for them (same bytes), ran 31.3,
+67.4 and 221.6 us against 31.5 at 512 picks over 4k (`dsv41.attn_decode`, 15 rounds, quiet; 64 picks 24.2 against 27.1
+at two heads).
 
 ## DeepSeek-V4.1 STQ on an M1 Max 32 GB: Sushi Cooler against MLX (2026-11-15)
 
