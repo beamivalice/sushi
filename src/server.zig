@@ -3123,6 +3123,22 @@ fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
 
 
 
+test "metrics off: /metrics answers its 503 in plain text for a scraper, /metrics.json in the error envelope" {
+    const t = std.testing;
+    instr.process = .{};
+    defer instr.process = .{};
+    const text = try http_conn.serveOneForTest("GET /metrics HTTP/1.1\r\n\r\n");
+    defer t.allocator.free(text);
+    try t.expect(std.mem.startsWith(u8, text, "HTTP/1.1 503 Service Unavailable\r\n"));
+    const head = text[0 .. std.mem.indexOf(u8, text, "\r\n\r\n") orelse return error.NoHead];
+    try t.expectEqualStrings("text/plain", http_conn.findHeaderValueCI(head, "content-type") orelse "");
+    try t.expect(std.mem.startsWith(u8, responseBody(text), "metrics not enabled"));
+    const json = try http_conn.serveOneForTest("GET /metrics.json HTTP/1.1\r\n\r\n");
+    defer t.allocator.free(json);
+    try t.expect(std.mem.startsWith(u8, json, "HTTP/1.1 503 Service Unavailable\r\n"));
+    try t.expect(std.mem.startsWith(u8, responseBody(json), "{\"error\":{"));
+}
+
 test "metrics enable: POST /metrics/enable turns the feeds on, idempotently" {
     const t = std.testing;
     instr.process = .{};
