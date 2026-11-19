@@ -14,7 +14,7 @@ done
 ZIG=${ZIG:-.zig-toolchain/zig}
 "$ZIG" build test-build -Doptimize=ReleaseFast -Dmodel=dsv41 || { echo "FAIL: the test build"; exit 1; }
 status=0
-for bin in test-rest test-generate test-trunk; do
+for bin in test-cooler test-deepseek test-kernels test-generate test-load; do
     log=$(mktemp)
     if MLX_METAL_GPU_ARCH=$ARCH "zig-out/tests/$bin" > "$log" 2>&1; then
         echo "PASS $bin as $ARCH: $(tail -1 "$log")"

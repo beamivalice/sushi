@@ -97,6 +97,16 @@ fn isSelected(name: []const u8) bool {
     return kept;
 }
 
+/// A step that can load the Qwen cut gets `SUSHI_TEST_FIXTURE_CUT`: `1` when the build declared the cut's memory
+/// (`-Dfixture-cut=true`), `0` when not, so a `0` step that sees QWEN4_TEST_MODEL fails before its first test.
+fn refuseUndeclaredCut(environ: std.process.Environ, step: ?[]const u8) void {
+    const declared = environ.getPosix("SUSHI_TEST_FIXTURE_CUT") orelse return;
+    const model = environ.getPosix("QWEN4_TEST_MODEL") orelse return;
+    if (model.len == 0 or !std.mem.eql(u8, declared, "0")) return;
+    std.debug.print("step '{s}': QWEN4_TEST_MODEL is set, but the build did not declare it: zig build test -Dfixture-cut=true\n", .{step orelse "(no SUSHI_TEST_STEP)"});
+    std.process.exit(1);
+}
+
 /// Fills `selected_tests`; a selection that keeps no test fails the process, naming its step.
 fn selectTests(gpa: std.mem.Allocator, step: ?[]const u8) void {
     var kept: std.ArrayList(u32) = .empty;
@@ -275,6 +285,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 });
                 log_err_count = 0;
                 const index = try server.receiveBody_u32();
+                refuseUndeclaredCut(init.environ, init.environ.getPosix("SUSHI_TEST_STEP"));
                 const test_fn = builtin.test_functions[selected_tests[index]];
                 is_fuzz_test = false;
 

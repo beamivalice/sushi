@@ -1,12 +1,12 @@
 //! Rule `arch-test-unlisted`: a file that declares a test, sits beside an `arch_tests.zig` and is not imported
-//! there. The test buckets select tests by the files that list names, so the file's tests never run and nothing
+//! there. The test domains select tests by the files that list names, so the file's tests never run and nothing
 //! fails. Reads the list from disk and scans its string literal tokens; no Sema.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const rule = @import("rule.zig");
 
 pub const name = "arch-test-unlisted";
-pub const reason = "the test buckets select tests by the files arch_tests.zig lists: an unlisted file's tests never run";
+pub const reason = "the test domains select tests by the files arch_tests.zig lists: an unlisted file's tests never run";
 
 const list_name = "arch_tests.zig";
 

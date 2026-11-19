@@ -4,11 +4,11 @@
 #   tests/gate.sh [--test-budget-gib N] [<ref>]
 #                             the ref as this repo has it (default origin/main: fetch first); N is the test step's
 #                             memory budget (zig build --maxrss), by default the box's row: 72 GiB on 96 GiB or more
-#                             (the M5 Max), 20 GiB on 32 GiB or more (the M1 Max); a smaller box names N itself
+#                             (the M5 Max), 20 GiB and -j8 on 32 GiB or more (the M1 Max); a smaller box names N itself
 # It refuses while the GPU lock is held: a full model load owns the box, and the suite's fixture loads would join it.
 # Steps, each under `taskpolicy -a`, stopping at the first failure: zig build lint, zig build ubench, then
-# zig build test -Doptimize=ReleaseFast --summary all with the tiny-fixture envs of tests/lib/fixture_envs.sh and
-# -Dtest-log, with tests/hermetic_guards.sh running beside it. Each test's log line shows as it lands; at the end the
+# zig build test -Doptimize=ReleaseFast --summary all with the tiny-fixture envs of tests/lib/fixture_envs.sh,
+# -Dtest-log and, when they name the Qwen cut, -Dfixture-cut=true, with tests/hermetic_guards.sh running beside it. Each test's log line shows as it lands; at the end the
 # per-step table, the 10 slowest tests and, last, every failed test with its error block (tests/lib/test_log.py).
 # On success it writes ${SUSHI_GATE_DIR:-$HOME/.sushi/runs/gate}/<sha>.json, the record ./release.sh requires; each
 # step's log and the per-test log (tests.tsv) stay in <sha>.logs/ beside it. The worktree is removed either way.
@@ -55,16 +55,18 @@ LOCK="$("$ROOT/scripts/gpu-lock.sh" status 2> /dev/null | sed -n 1p)" || LOCK=""
 
 MEM_GIB=$(($(sysctl -n hw.memsize) >> 30))
 BUDGET_FROM="hw.memsize $MEM_GIB GiB"
+JOBS=()
 if [ -n "$BUDGET_GIB" ]; then
   BUDGET_FROM="--test-budget-gib; $BUDGET_FROM"
 elif [ "$MEM_GIB" -ge 96 ]; then
   BUDGET_GIB=72
 elif [ "$MEM_GIB" -ge 32 ]; then
   BUDGET_GIB=20
+  JOBS=(-j8)
 else
   die "refused: no test budget row for a $MEM_GIB GiB box; name one with --test-budget-gib N"
 fi
-echo "gate: test budget $BUDGET_GIB GiB ($BUDGET_FROM)"
+echo "gate: test budget $BUDGET_GIB GiB ($BUDGET_FROM)${JOBS[*]+, ${JOBS[*]}}"
 
 WT="$(mktemp -d "${TMPDIR:-/tmp}/sushi-gate.XXXXXX")"
 GUARDS_PID=""
@@ -85,11 +87,14 @@ cd "$WT"
 
 [ -f tests/lib/fixture_envs.sh ] || die "refused: $SHA has no tests/lib/fixture_envs.sh"
 grep -q '"test-log"' build.zig || die "refused: $SHA's build.zig has no -Dtest-log, which the gate's per-test log needs"
+grep -q '"fixture-cut"' build.zig || die "refused: $SHA's build.zig has no -Dfixture-cut, which declares the Qwen cut's memory"
 # shellcheck source=lib/fixture_envs.sh
 source tests/lib/fixture_envs.sh
 for v in $SUSHI_FIXTURE_ENVS; do
   [ -d "${!v}" ] || die "refused: fixture $v=${!v} is not a folder"
 done
+CUT=()
+[ -z "${QWEN4_TEST_MODEL:-}" ] || CUT=(-Dfixture-cut=true)
 
 ZIG_CACHE="$GATE_DIR/zig-cache"
 # A test binary in <cache>/o/<hash>/ finds libmlxc through its rpath @loader_path/../../../lib/mlx/lib.
@@ -151,7 +156,8 @@ run_tests() {
   FOLLOW_PID=$!
   t0=$(date +%s)
   taskpolicy -a zig build test -Doptimize=ReleaseFast --summary all --cache-dir "$ZIG_CACHE" \
-    --maxrss $((BUDGET_GIB << 30)) "-Dtest-log=$TEST_LOG" > "$LOGS/test.log" 2>&1 || rc=$?
+    --maxrss $((BUDGET_GIB << 30)) ${JOBS[@]+"${JOBS[@]}"} ${CUT[@]+"${CUT[@]}"} "-Dtest-log=$TEST_LOG" \
+    > "$LOGS/test.log" 2>&1 || rc=$?
   touch "$LOGS/tests.done"
   wait "$FOLLOW_PID" || true
   FOLLOW_PID=""

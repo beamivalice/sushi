@@ -1380,7 +1380,13 @@ test "chat page: --api-key leaves the page open and keeps the API behind the key
 test "self-update: /v1/update refuses by name over the wire and never shuts the server down" {
     const t = std.testing;
     const prev_key = server_state.g_api_key;
-    defer server_state.g_api_key = prev_key;
+    const old_port = server_state.listen_port;
+    defer {
+        server_state.g_api_key = prev_key;
+        server_state.listen_port = old_port;
+    }
+    // The Origin cases name this port; a server test earlier in the binary leaves its own bound port behind.
+    server_state.listen_port = 12345;
     // A test binary is no release install, in a checkout's cache or a gate's outside one: refused by the reason its
     // place gives, before asking whether a release is newer.
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;

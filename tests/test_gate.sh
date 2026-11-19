@@ -63,7 +63,7 @@ mkdir -p "$REPO/tests/lib" "$REPO/scripts" "$REPO/.zig-toolchain" "$REPO/lib/mlx
 cp "$ROOT/tests/gate.sh" "$REPO/tests/" 2> /dev/null
 cp "$ROOT/tests/lib/fixture_envs.sh" "$ROOT/tests/lib/test_log.py" "$REPO/tests/lib/" 2> /dev/null
 cp "$ROOT/scripts/gpu-lock.sh" "$REPO/scripts/" 2> /dev/null
-echo 'const test_log = b.option([]const u8, "test-log", "");' > "$REPO/build.zig"
+printf '%s\n' 'const test_log = b.option([]const u8, "test-log", "");' 'const cut = b.option(bool, "fixture-cut", "");' > "$REPO/build.zig"
 echo 'tracked, as the real lib/ is' > "$REPO/lib/stb_image.h"
 # The guards wait for the test step to start: run before it instead of beside it, they find it never did.
 cat > "$REPO/tests/hermetic_guards.sh" << 'EOF'
@@ -159,6 +159,8 @@ has "  and the slowest tests" "$OUT" '      0.3 s  test-rest                    
 has "the test step logs to the gate's logs dir" "$(grep '^zig test ' "$CALLS")" "-Dtest-log=$GATE_DIR/$SHA1.logs/tests.tsv"
 has "the test step runs under the M5 row's 72 GiB" "$(grep '^zig test ' "$CALLS")" "--maxrss 77309411328"
 has "the gate names its budget" "$OUT" "test budget 72 GiB (hw.memsize 128 GiB)"
+has "the test step declares the Qwen cut that the fixture envs name" "$(grep '^zig test ' "$CALLS")" "-Dfixture-cut=true"
+ok "  and keeps zig's default job count on the M5 row" "$(grep '^zig test ' "$CALLS" | grep -c -- ' -j')" "0"
 has "the record holds a summary line" "$(field "$REC" summary)" "939/1001"
 ZIGS="$(grep '^zig ' "$CALLS" | cut -d' ' -f2 | tr '\n' ' ')"
 ok "lint, then ubench, then the test step" "$(grep -E '^zig ' "$CALLS" | cut -d' ' -f1-2 | tr '\n' ',')" "zig lint,zig ubench,zig test,"
@@ -204,6 +206,7 @@ ok "  writing no record" "$(ls "$GATE_DIR"/*.json 2> /dev/null | wc -l | tr -d '
 echo "── the test budget ──"
 gate STUB_MEMSIZE=34359738368 -- HEAD
 has "a 32 GiB box takes the M1 row's 20 GiB" "$(grep '^zig test ' "$CALLS")" "--maxrss 21474836480"
+has "  and its 8 jobs" "$(grep '^zig test ' "$CALLS")" " -j8 "
 gate STUB_MEMSIZE=137438953472 -- --test-budget-gib 30 HEAD
 has "--test-budget-gib sets the budget" "$(grep '^zig test ' "$CALLS")" "--maxrss 32212254720"
 gate STUB_MEMSIZE=17179869184 -- HEAD
@@ -249,8 +252,15 @@ gate -- no-such-ref
 ok "a ref that names no commit refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
 has "  naming it" "$OUT" "no-such-ref"
 
-echo 'no test log here' > "$REPO/build.zig"
+echo 'const test_log = b.option([]const u8, "test-log", "");' > "$REPO/build.zig"
 g -C "$REPO" commit -qam "three"
+gate -- HEAD
+ok "a commit whose build.zig has no -Dfixture-cut refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
+has "  naming it" "$OUT" "-Dfixture-cut"
+ok "  before any step" "$(grep -c -E '^(zig|guards) ' "$CALLS")" "0"
+
+echo 'no test log here' > "$REPO/build.zig"
+g -C "$REPO" commit -qam "four"
 gate -- HEAD
 ok "a commit whose build.zig has no -Dtest-log refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
 has "  naming it" "$OUT" "-Dtest-log"

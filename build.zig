@@ -159,6 +159,7 @@ pub fn build(b: *std.Build) void {
         "CPU reference fixture for the gated Qwen preprocessing parity test",
     );
     const test_log = b.option([]const u8, "test-log", "Append a line per test (UTC, step, PASS/SKIP/FAIL, ms, name) and each step's DONE totals to this absolute path");
+    const fixture_cut = b.option(bool, "fixture-cut", "QWEN4_TEST_MODEL names a Qwen cut or pack: the test steps that load it declare 16 GiB; a test step that sees it without this fails") orelse false;
     if (test_log) |path| if (!std.fs.path.isAbsolute(path)) std.debug.panic("-Dtest-log={s} is not an absolute path", .{path});
     const test_build = b.step("test-build", "Compile unit tests without running them");
     const test_step = b.step("test", "Run unit tests");
@@ -192,6 +193,7 @@ pub fn build(b: *std.Build) void {
         const run_host_tests = b.addRunArtifact(host_tests);
         runEveryTime(run_host_tests);
         logTo(run_host_tests, test_log, host_tests.name);
+        declareRun(run_host_tests, fixture_cut, false, 1);
         test_host_step.dependOn(&run_host_tests.step);
         test_step.dependOn(&run_host_tests.step);
         if (test_filter == null) {
@@ -200,33 +202,30 @@ pub fn build(b: *std.Build) void {
             test_step.dependOn(host_count);
         }
     }
-    const unit_tests: []const *std.Build.Step.Compile = if (test_model == .exl3 or test_model == .enc)
+    const domains: []const DomainBuild = if (test_model == .exl3 or test_model == .enc)
         &.{}
     else
-        addTestBuckets(b, test_mod, test_model, test_filter);
-    for (unit_tests) |unit_test| {
-        test_build.dependOn(&b.addInstallArtifact(unit_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        const run_unit_tests = b.addRunArtifact(unit_test);
-        runEveryTime(run_unit_tests);
-        logTo(run_unit_tests, test_log, unit_test.name);
-        if (qwen_preprocess_fixture) |fixture| {
-            run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
-            run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
-            run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
-            run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
+        addTestDomains(b, test_mod, test_model, test_filter);
+    for (domains) |domain| {
+        test_build.dependOn(&b.addInstallArtifact(domain.compile, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        for (domain.steps) |step| {
+            const run = b.addRunArtifact(domain.compile);
+            runEveryTime(run);
+            run.setName(b.fmt("run {s}", .{step.name}));
+            run.setEnvironmentVariable("SUSHI_TEST_SELECT", step.select);
+            run.setEnvironmentVariable("SUSHI_TEST_STEP", step.name);
+            if (step.env) |kv| run.setEnvironmentVariable(kv[0], kv[1]);
+            logTo(run, test_log, step.name);
+            declareRun(run, fixture_cut, domain.domain.cut, domain.domain.run_gib);
+            if (qwen_preprocess_fixture) |fixture| {
+                run.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
+                run.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
+                run.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
+                run.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
+            }
+            test_step.dependOn(&run.step);
         }
-        test_step.dependOn(&run_unit_tests.step);
-        // The prefix tier's second backend runs on the full gate only: a `-Dtest-filter` run checks the tests it names
-        // once, on the default backend (`SUSHI_PREFIX_FS=real` in the environment still runs it on the plain files).
-        if (test_filter == null and std.mem.eql(u8, unit_test.name, "test-" ++ tier_bucket[0])) {
-            const on_files = b.addRunArtifact(unit_test);
-            runEveryTime(on_files);
-            logTo(on_files, test_log, "test-" ++ tier_bucket[0] ++ " (SUSHI_PREFIX_FS=real)");
-            on_files.setName("run test-" ++ tier_bucket[0] ++ " (SUSHI_PREFIX_FS=real)");
-            on_files.setEnvironmentVariable("SUSHI_PREFIX_FS", "real");
-            test_step.dependOn(&on_files.step);
-        }
-        test_step.dependOn(countGuard(b, count_guard, unit_test));
+        test_step.dependOn(countGuard(b, count_guard, domain.compile));
     }
 
     // Zig collects tests from an artifact's root module only, so src/exl3 is its own.
@@ -239,6 +238,10 @@ pub fn build(b: *std.Build) void {
         const run_exl3 = b.addRunArtifact(exl3_test);
         runEveryTime(run_exl3);
         logTo(run_exl3, test_log, exl3_test.name);
+        const area = for (exl3_test_bins) |area| {
+            if (std.mem.eql(u8, exl3_test.name, b.fmt("test-exl3-{s}", .{area.area}))) break area;
+        } else unreachable;
+        declareRun(run_exl3, fixture_cut, area.cut, area.run_gib);
         test_step.dependOn(&run_exl3.step);
         test_step.dependOn(countGuard(b, count_guard, exl3_test));
     }
@@ -255,6 +258,7 @@ pub fn build(b: *std.Build) void {
         const run_encoder = b.addRunArtifact(encoder_tests);
         runEveryTime(run_encoder);
         logTo(run_encoder, test_log, encoder_tests.name);
+        declareRun(run_encoder, fixture_cut, false, 6);
         test_step.dependOn(&run_encoder.step);
         test_step.dependOn(countGuard(b, count_guard, encoder_tests));
     }
@@ -271,6 +275,7 @@ pub fn build(b: *std.Build) void {
         const run_bar = b.addRunArtifact(bar_tests);
         runEveryTime(run_bar);
         logTo(run_bar, test_log, bar_tests.name);
+        declareRun(run_bar, fixture_cut, false, 1);
         test_step.dependOn(&run_bar.step);
         test_step.dependOn(countGuard(b, count_guard, bar_tests));
     };
@@ -458,25 +463,74 @@ fn linkApple(module: *std.Build.Module, macos_sdk_frameworks: ?[]const u8) void 
     module.linkFramework("IOSurface", .{});
 }
 
-/// The unit tests compile as several binaries in parallel: one LLVM module is single-threaded.
-/// A test's name is `<file stem>.test.<name>`, or `<file stem>.<Struct>.test.<name>` inside a struct, so a bucket is
-/// a list of `<stem>.test.` filters plus one filter per nested test; the last bucket takes every MLX stem the others
-/// do not name.
-const test_buckets = [_][]const []const u8{
-    &.{ "trunk", "gdn_decode", "cli", "launch" },
-    &.{ "generate", "mtp_policy", "mtp_round", "scheduler", "restore_dump", "mtp", "dflash" },
-    &.{ "server", "server_test", "responses" },
-    tier_bucket,
+/// The MLX tests compile as one binary per domain, `test-<name>`, named by what its tests prove. A domain holds every
+/// test file of its `folders` (`src/<folder>/`) and the files it lists (`src/`-relative, without `.zig`); a listed file
+/// leaves its folder's domain. A test file that no domain holds, or that two list, fails the configure by name.
+/// `compile_gib` bounds the compile's RSS, `run_gib` each run step's (`--maxrss` schedules both); a `cut` domain's
+/// steps can hold the Qwen cut, which `-Dfixture-cut=true` declares at `cut_run_gib`.
+const test_domains = [_]TestDomain{
+    .{ .name = "cooler", .files = &.{"cooler_contract_test"}, .cut = true },
+    .{ .name = "deepseek", .folders = &.{"dsv41"}, .compile_gib = 8, .run_gib = 9 },
+    .{ .name = "qwen", .folders = &.{"qwen4"}, .cut = true },
+    .{ .name = "glm", .folders = &.{"glm5"} },
+    .{ .name = "mimo", .folders = &.{"mimo2"} },
+    .{ .name = "kernels", .folders = &.{"tensor"}, .run_gib = 6, .files = &.{
+        "attn_kernels",       "dflash_conv",    "dflash_qmv",      "expert_bf16_kernels", "fp8_block",    "linear",     "metal",
+        "metal_mlx",          "mlx",            "mlx_kernel_keys", "mlx_pages",           "mlx_util",     "moe_gqmv",   "moe_router",
+        "moe_stream_compute", "mtp_dense_rows", "mtp_qmv",         "nax_gate",            "sampler_draw", "verify_moe", "verify_qmm",
+    } },
+    .{ .name = "generate", .files = &.{
+        "arm_trial",     "degenerate",   "dflash",             "forward_diag", "generate",       "hc_prefill",   "kv_cache",
+        "kv_quant",      "logprobs",     "mtp",                "mtp_plan",     "mtp_policy",     "mtp_round",    "mtp_tick",
+        "prefill_plan",  "restore_dump", "sampler",            "scheduler",    "slot_admission", "slot_outcome", "ssm_cache",
+        "think_penalty", "trunk",        "trunk_helpers_test", "trunk_stq",
+    } },
+    // `tests` is the MLX root: its own test only names the files the binaries reach.
+    .{ .name = "load", .folders = &.{"arch"}, .files = &.{
+        "arch_host_stub", "bills_live_test", "exl3_flat_layout_test", "expert_io",     "expert_store", "expert_stream",
+        "hidden_capture", "imatrix",         "kld",                   "layer_weights", "model",        "model_discovery",
+        "model_load",     "model_registry",  "owned_weights",         "pack_index",    "tests",        "transient_peak",
+        "vision_common",
+    } },
+    .{ .name = "server", .compile_gib = 10, .files = &.{
+        "anthropic",     "bench",          "byte_budget", "cli",           "completions", "downloads",      "generation_stream",
+        "http_conn",     "http_head",      "launch",      "main",          "metrics",     "model_settings", "models_api",
+        "request_media", "request_policy", "responses",   "responses_api", "server",      "server_test",    "settings_api",
+        "sleep_inhibit", "status",         "version",     "vision_queue",
+    } },
+    // The SSD tier's tests run once on each file backend (`SUSHI_PREFIX_FS`); a `-Dtest-filter` run, on the default.
+    .{ .name = "prefix-cache", .files = &.{
+        "disk_placement",       "dsv41/dsv41_prefix_cache_test", "glm5/glm5_prefix_cache_test", "kv_disk_cache",
+        "kv_disk_fs",           "prefix_cache",                  "prefix_cache_admin",          "prefix_vfs_tensors_test",
+        "qwen4/qwen4_disk_qsa", "qwen4/qwen4_prefix_cache_test",
+    }, .steps = &.{
+        .{ .name = "test-prefix-cache" },
+        .{ .name = "test-prefix-cache (SUSHI_PREFIX_FS=real)", .env = .{ "SUSHI_PREFIX_FS", "real" }, .again = true },
+    } },
 };
 
-/// Each bucket's compile RSS bound, in `test_buckets` order and then test-rest: a cold ReleaseFast compile's MaxRSS,
-/// which `--summary all` floors to 10^9 bytes, so `N`G is held as (N + 1) * 10^9 rounded up to whole GiB. `--maxrss`
-/// (tests/gate.sh --test-budget-gib) then runs only the compiles that fit at once; run steps declare none (Metal).
-const bucket_compile_gib = [test_buckets.len + 1]u64{ 3, 6, 8, 4, 13 };
-const gib: u64 = 1 << 30;
+const TestDomain = struct {
+    name: []const u8,
+    folders: []const []const u8 = &.{},
+    files: []const []const u8 = &.{},
+    compile_gib: u64 = 6,
+    run_gib: u64 = 4,
+    cut: bool = false,
+    /// The run steps that share the binary, each a process of its own; none means one, `test-<name>`, over every file.
+    steps: []const RunStep = &.{},
+};
 
-/// The SSD tier's tests, which run once on each file backend (`SUSHI_PREFIX_FS`).
-const tier_bucket: []const []const u8 = &.{ "kv_disk_cache", "kv_disk_fs", "prefix_cache", "disk_placement", "prefix_cache_admin", "prefix_vfs_tensors_test", "qwen4_disk_qsa", "qwen4_prefix_cache_test", "glm5_prefix_cache_test", "dsv41_prefix_cache_test" };
+/// One process of a domain's binary: the tests of `files` (none: every file of the domain), under `env`. An `again`
+/// step runs tests another step runs, on another backend: only an unfiltered run takes it.
+const RunStep = struct {
+    name: []const u8,
+    files: []const []const u8 = &.{},
+    env: ?[2][]const u8 = null,
+    again: bool = false,
+};
+
+const cut_run_gib: u64 = 16;
+const gib: u64 = 1 << 30;
 
 /// The model folders hold their own test files beside the root's; src/exl3 and src/encoder are modules of their own.
 const test_dirs = [_][]const u8{ "src", "src/arch", "src/tensor", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41" };
@@ -485,16 +539,15 @@ const test_dirs = [_][]const u8{ "src", "src/arch", "src/tensor", "src/qwen4", "
 const TestModel = enum { qwen4, mimo2, glm5, dsv41, exl3, enc };
 
 /// Zig keeps a test when its fully qualified name holds any filter, and filters OR, so a user's filter cannot narrow
-/// a bucket's: the scan names each test in full and keeps those the user's filters select.
+/// a domain's: the scan names each test in full and keeps those the user's filters select.
 fn selectedByUser(user: ?[]const []const u8, full: []const u8) bool {
     const filters = user orelse return true;
     for (filters) |f| if (std.mem.indexOf(u8, full, f) != null) return true;
     return false;
 }
 
-/// The filter that selects a user-matched test. Filters reach `zig test` in a response file whose parser reads a quote
-/// or backslash as syntax, so a name holding one is cut there and its longest piece that no skipped test also holds
-/// stands for it; null when every piece would select a test the user's filters skip.
+/// The longest piece of `full` between quotes and backslashes that no name of `others` holds. Filters reach `zig test`
+/// in a response file whose parser reads a quote or backslash as syntax; null when every piece selects another test.
 fn quoteFreeFilter(full: []const u8, all: []const []const u8, user: []const []const u8) ?[]const u8 {
     if (std.mem.indexOfAny(u8, full, "'\"\\") == null) return full;
     var best: ?[]const u8 = null;
@@ -513,19 +566,76 @@ fn nameFilter(full: []const u8, all: []const []const u8, user: []const []const u
         std.debug.panic("rename the test \"{s}\": no quote-free part of it avoids the tests your filter skips", .{full});
 }
 
-fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, user: ?[]const []const u8) []const *std.Build.Step.Compile {
+/// One test as the runner names it: `<path>.test.<name>`, `<path>.<Struct>.test.<name>` in a struct opened at column 0,
+/// or `<path>.test_<n>` for an anonymous block, `<path>` being the file's `src/`-relative path with `.` for `/`.
+const TestName = struct {
+    full: []const u8,
+    /// An anonymous block survives every filter, so it is never one.
+    anonymous: bool = false,
+    /// A test nested where the scan cannot name it; its file's prefix still selects it.
+    unnamed: bool = false,
+};
+
+const TestFile = struct {
+    /// `src/`-relative, without `.zig`.
+    path: []const u8,
+    /// The prefix every test of the file carries: `<path with . for />.`.
+    prefix: []const u8,
+    names: []const TestName,
+    in_scope: bool,
+    host: bool,
+    domain: usize = 0,
+};
+
+fn testFolder(path: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[0..i] else "";
+}
+
+/// The tests of one file, as `TestName`s; in an MLX file (`strict`), a test line the build cannot cut out fails, naming it.
+fn scanTestNames(b: *std.Build, path: []const u8, prefix: []const u8, source: []const u8, strict: bool) []const TestName {
+    var out: std.ArrayList(TestName) = .empty;
+    var owner: []const u8 = "";
+    var anonymous: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        if ((std.mem.startsWith(u8, line, "pub const ") or std.mem.startsWith(u8, line, "const ")) and std.mem.endsWith(u8, line, " = struct {"))
+            owner = line[std.mem.indexOf(u8, line, "const ").? + "const ".len .. line.len - " = struct {".len];
+        const trimmed = std.mem.trimStart(u8, line, " ");
+        const indent = line.len - trimmed.len;
+        if (std.mem.startsWith(u8, trimmed, "test {")) {
+            out.append(b.allocator, .{ .full = b.fmt("{s}test_{d}", .{ prefix, anonymous }), .anonymous = true, .unnamed = indent != 0 }) catch @panic("OOM");
+            if (indent == 0) anonymous += 1;
+            continue;
+        }
+        if (!std.mem.startsWith(u8, trimmed, "test \"")) continue;
+        // A nested name this scan cannot cut out would drop its test from every binary.
+        const clean = std.mem.endsWith(u8, line, "\" {");
+        if (strict and indent != 0 and (!clean or std.mem.indexOfScalar(u8, line, '\\') != null))
+            std.debug.panic("src/{s}.zig: write `test \"name\" {{` on one line without escapes: {s}", .{ path, line });
+        if (!clean) {
+            out.append(b.allocator, .{ .full = b.fmt("{s}test.?", .{prefix}), .unnamed = true }) catch @panic("OOM");
+            continue;
+        }
+        const name = trimmed["test \"".len .. trimmed.len - "\" {".len];
+        if (indent == 0) {
+            out.append(b.allocator, .{ .full = b.fmt("{s}test.{s}", .{ prefix, name }) }) catch @panic("OOM");
+        } else {
+            const named = indent == 4 and owner.len != 0;
+            out.append(b.allocator, .{ .full = b.fmt("{s}{s}.test.{s}", .{ prefix, if (named) owner else "?", name }), .unnamed = !named }) catch @panic("OOM");
+        }
+    }
+    return out.items;
+}
+
+/// Every file whose tests the MLX root reaches, the host tier's included (their names keep a domain's filters off
+/// them), with its domain; a file no domain holds fails here.
+fn scanTestFiles(b: *std.Build, model: ?TestModel) []TestFile {
     const io = b.graph.io;
-    const host_stems = hostStems(b);
     const host_paths = hostPaths(b);
-    var stems: std.ArrayList([]const u8) = .empty;
-    var nested: std.ArrayList(struct { stem: []const u8, filter: []const u8, full: []const u8 }) = .empty;
-    // A scoped run names each test of a root file that another model's file name ends with ("model" in
-    // "dsv41_model"), since a filter matches anywhere in a test name.
-    var skipped: std.ArrayList([]const u8) = .empty;
-    var all_names: std.ArrayList([]const u8) = .empty;
-    var top: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
+    var files: std.ArrayList(TestFile) = .empty;
     for (test_dirs) |dir_path| {
-        const out_of_scope = if (model) |m| !std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path, "src/arch") and !std.mem.eql(u8, dir_path, "src/tensor") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m)) else false;
+        const folder = if (std.mem.eql(u8, dir_path, "src")) "" else dir_path["src/".len..];
+        const in_scope = if (model) |m| folder.len == 0 or std.mem.eql(u8, folder, "arch") or std.mem.eql(u8, folder, "tensor") or std.mem.eql(u8, folder, @tagName(m)) else true;
         // A dropped architecture has no folder.
         var src = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
             error.FileNotFound => continue,
@@ -538,101 +648,188 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
         while (it.next(io) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e })) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
             const stem = entry.name[0 .. entry.name.len - ".zig".len];
-            if (isHostFile(host_paths, dir_path, stem)) continue;
             if (std.mem.startsWith(u8, stem, "ubench_")) continue;
-            // sushibar's own binary, `test-sushibar`, runs its tests.
-            if (std.mem.eql(u8, dir_path, "src") and std.mem.eql(u8, stem, "sushibar_main")) continue;
-            if (out_of_scope) {
-                skipped.append(b.allocator, b.allocator.dupe(u8, stem) catch @panic("OOM")) catch @panic("OOM");
-                continue;
-            }
-            stems.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
+            // sushibar's own binary, `test-sushibar`, runs its tests; tests_host roots the host tier.
+            if (folder.len == 0 and (std.mem.eql(u8, stem, "sushibar_main") or std.mem.eql(u8, stem, "tests_host"))) continue;
+            const path = if (folder.len == 0) b.dupe(stem) else b.fmt("{s}/{s}", .{ folder, stem });
             b.dependOnFileContents(b.path(b.fmt("{s}/{s}", .{ dir_path, entry.name })));
             const source = src.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
-            var lines = std.mem.splitScalar(u8, source, '\n');
-            var owner: []const u8 = "";
-            while (lines.next()) |line| {
-                if ((std.mem.startsWith(u8, line, "pub const ") or std.mem.startsWith(u8, line, "const ")) and std.mem.endsWith(u8, line, " = struct {"))
-                    owner = line[std.mem.indexOf(u8, line, "const ").? + "const ".len .. line.len - " = struct {".len];
-                const indent = std.mem.indexOf(u8, line, "test \"") orelse continue;
-                if (indent == 0 and (model != null or user != null) and std.mem.endsWith(u8, line, "\" {")) {
-                    const full = b.fmt("{s}.test.{s}", .{ stem, line["test \"".len .. line.len - "\" {".len] });
-                    all_names.append(b.allocator, full) catch @panic("OOM");
-                    top.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = full }) catch @panic("OOM");
-                }
-                if (indent == 0 or std.mem.trim(u8, line[0..indent], " ").len != 0) continue;
-                if (!std.mem.endsWith(u8, line, "\" {") or std.mem.indexOfScalar(u8, line, '\\') != null)
-                    std.debug.panic("{s}: write `test \"name\" {{` on one line without escapes: {s}", .{ entry.name, line });
-                const name = line[indent + "test \"".len .. line.len - "\" {".len];
-                // A nested test is `<stem>.<Struct>.test.<name>`; only a struct opened at column 0 is understood.
-                if (user != null and (indent != 4 or owner.len == 0)) std.debug.panic("{s}: cannot name the nested test: {s}", .{ entry.name, line });
-                const full = b.fmt("{s}.{s}.test.{s}", .{ stem, owner, name });
-                nested.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = b.fmt(".test.{s}", .{name}), .full = full }) catch @panic("OOM");
-                all_names.append(b.allocator, full) catch @panic("OOM");
-            }
+            const prefix = b.fmt("{s}.", .{std.mem.replaceOwned(u8, b.allocator, path, "/", ".") catch @panic("OOM")});
+            const host = isHostFile(host_paths, dir_path, stem);
+            const names = scanTestNames(b, path, prefix, source, !host);
+            if (names.len == 0) continue;
+            files.append(b.allocator, .{ .path = path, .prefix = prefix, .names = names, .in_scope = in_scope, .host = host }) catch @panic("OOM");
         }
+    }
+    // Host files outside the scanned folders (src/template/) are reached by the MLX root too.
+    for (host_paths) |path| {
+        const folder = testFolder(path);
+        const scanned = for (test_dirs) |d| {
+            if (std.mem.eql(u8, d, if (folder.len == 0) "src" else b.fmt("src/{s}", .{folder}))) break true;
+        } else false;
+        if (scanned) continue;
+        const source = buildRootHandle(b).readFileAlloc(io, b.fmt("src/{s}.zig", .{path}), b.allocator, .limited(16 << 20)) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => std.debug.panic("src/{s}.zig: {t}", .{ path, e }),
+        };
+        const prefix = b.fmt("{s}.", .{std.mem.replaceOwned(u8, b.allocator, path, "/", ".") catch @panic("OOM")});
+        files.append(b.allocator, .{ .path = path, .prefix = prefix, .names = scanTestNames(b, path, prefix, source, false), .in_scope = false, .host = true }) catch @panic("OOM");
     }
     // Directory order varies; the filters key the compile step's cache.
-    std.mem.sortUnstable([]const u8, stems.items, {}, struct {
-        fn lt(_: void, x: []const u8, y: []const u8) bool {
-            return std.mem.lessThan(u8, x, y);
+    std.mem.sortUnstable(TestFile, files.items, {}, struct {
+        fn lt(_: void, x: TestFile, y: TestFile) bool {
+            return std.mem.lessThan(u8, x.path, y.path);
         }
     }.lt);
-    const bucket = b.allocator.alloc(usize, stems.items.len) catch @panic("OOM");
-    for (stems.items, bucket) |stem, *k| k.* = namedBucket(stem[0 .. stem.len - ".test.".len]);
-    // A filter matches anywhere in a name, so "ws.test." also selects dspark_rows's tests: stems
-    // that end with one another must share a bucket, or their tests would run twice.
-    var moved = true;
-    while (moved) {
-        moved = false;
-        for (stems.items, bucket) |a, *ka| {
-            for (stems.items, bucket) |s, *ks| {
-                if (ka.* == ks.* or std.mem.indexOf(u8, a, s) == null) continue;
-                if (ka.* != test_buckets.len and ks.* != test_buckets.len)
-                    std.debug.panic("test buckets {d} and {d} split overlapping stems {s} and {s}", .{ ka.*, ks.*, a, s });
-                ka.* = @min(ka.*, ks.*);
-                ks.* = ka.*;
-                moved = true;
+    for (files.items) |*f| {
+        if (f.host) continue;
+        f.domain = domainOf(f.path) orelse
+            std.debug.panic("src/{s}.zig holds tests that no test_domains entry holds: list it in build.zig", .{f.path});
+    }
+    for (test_domains) |d| for (d.files) |listed| {
+        const found = for (files.items) |f| {
+            if (!f.host and std.mem.eql(u8, f.path, listed)) break true;
+        } else false;
+        if (found) continue;
+        // A dropped architecture's folder is gone with its files.
+        const folder = testFolder(listed);
+        if (folder.len != 0) {
+            var dir = buildRootHandle(b).openDir(io, b.fmt("src/{s}", .{folder}), .{}) catch continue;
+            dir.close(io);
+        }
+        std.debug.panic("test_domains lists {s} under test-{s}, which is no MLX test file", .{ listed, d.name });
+    };
+    return files.items;
+}
+
+/// The domain that lists `path`, else the one whose folder holds it; two that list it fail.
+fn domainOf(path: []const u8) ?usize {
+    var listed: ?usize = null;
+    for (test_domains, 0..) |d, i| for (d.files) |f| if (std.mem.eql(u8, f, path)) {
+        if (listed) |first| std.debug.panic("test_domains lists {s} under test-{s} and test-{s}", .{ path, test_domains[first].name, d.name });
+        listed = i;
+    };
+    if (listed) |i| return i;
+    const folder = testFolder(path);
+    if (folder.len == 0) return null;
+    for (test_domains, 0..) |d, i| for (d.folders) |f| if (std.mem.eql(u8, f, folder)) return i;
+    return null;
+}
+
+/// A domain's binary and the run steps that share it.
+const DomainBuild = struct {
+    compile: *std.Build.Step.Compile,
+    domain: TestDomain,
+    steps: []const PlannedStep,
+};
+
+const PlannedStep = struct {
+    name: []const u8,
+    /// `SUSHI_TEST_SELECT`: the prefix of each file the step runs.
+    select: []const u8,
+    env: ?[2][]const u8,
+};
+
+fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, user: ?[]const []const u8) []const DomainBuild {
+    const files = scanTestFiles(b, model);
+    var all_names: std.ArrayList([]const u8) = .empty;
+    for (files) |f| for (f.names) |n| all_names.append(b.allocator, n.full) catch @panic("OOM");
+
+    var planned: std.ArrayList(struct { domain: usize, step: PlannedStep, again: bool }) = .empty;
+    for (test_domains, 0..) |d, di| {
+        const steps: []const RunStep = if (d.steps.len > 0) d.steps else &.{.{ .name = b.fmt("test-{s}", .{d.name}) }};
+        for (steps) |s| {
+            if (s.again and user != null) continue;
+            var select: std.ArrayList(u8) = .empty;
+            var chosen = false;
+            for (files) |f| {
+                if (f.host or f.domain != di or !f.in_scope) continue;
+                if (s.files.len > 0) {
+                    for (s.files) |sf| {
+                        if (std.mem.eql(u8, sf, f.path)) break;
+                    } else continue;
+                }
+                const wanted = for (f.names) |n| {
+                    if (!n.anonymous and selectedByUser(user, n.full)) break true;
+                } else user == null;
+                if (!wanted) continue;
+                chosen = true;
+                select.print(b.allocator, "{s}\n", .{f.prefix}) catch @panic("OOM");
             }
+            if (chosen) planned.append(b.allocator, .{ .domain = di, .step = .{ .name = s.name, .select = select.items, .env = s.env }, .again = s.again }) catch @panic("OOM");
+        }
+        for (d.steps) |s| for (s.files) |sf| if (domainOf(sf) != di)
+            std.debug.panic("test-{s}'s step {s} names {s}, a file of another domain", .{ d.name, s.name, sf });
+    }
+    // Every test the steps can see runs in exactly one of them (a second backend's run aside).
+    for (files) |f| {
+        if (f.host or !f.in_scope) continue;
+        for (f.names) |n| {
+            if (user != null and (n.anonymous or !selectedByUser(user, n.full))) continue;
+            var runs: usize = 0;
+            for (planned.items) |p| {
+                if (!p.again and selects(p.step.select, n.full)) runs += 1;
+            }
+            if (runs != 1) std.debug.panic("the test '{s}' runs in {d} test steps, not one: check test_domains", .{ n.full, runs });
         }
     }
-    // A host file's tests run only in test-host, so no MLX filter may select them. A host file is found by its path, so
-    // an MLX file that shares its stem (a later src/render.zig, an arch's value.zig) lands here, loudly.
-    for (host_stems) |h| for (stems.items) |a| {
-        if (std.mem.endsWith(u8, h, a[0 .. a.len - ".test.".len])) std.debug.panic("host test file {s} would also run in the MLX bucket of {s}", .{ h, a });
-    };
-    var out: std.ArrayList(*std.Build.Step.Compile) = .empty;
-    for (0..test_buckets.len + 1) |i| {
+
+    var out: std.ArrayList(DomainBuild) = .empty;
+    for (test_domains, 0..) |d, di| {
+        var steps: std.ArrayList(PlannedStep) = .empty;
+        for (planned.items) |p| if (p.domain == di) steps.append(b.allocator, p.step) catch @panic("OOM");
+        if (steps.items.len == 0) continue;
+        // A file's prefix filter is kept when it selects only the domain's tests; else its tests are named one by one.
+        var others: std.ArrayList([]const u8) = .empty;
+        for (files) |f| if (f.host or f.domain != di or !f.in_scope) for (f.names) |n| others.append(b.allocator, n.full) catch @panic("OOM");
         var filters: std.ArrayList([]const u8) = .empty;
-        for (stems.items, bucket) |stem, k| if (k == i) {
-            if (user) |u| {
-                for (top.items) |t| if (std.mem.eql(u8, t.stem, stem) and selectedByUser(u, t.filter)) filters.append(b.allocator, nameFilter(t.filter, all_names.items, u)) catch @panic("OOM");
-                continue;
+        for (files) |f| {
+            if (f.host or f.domain != di or !f.in_scope) continue;
+            if (user == null) {
+                const exclusive = for (others.items) |o| {
+                    if (std.mem.indexOf(u8, o, f.prefix) != null) break false;
+                } else true;
+                if (exclusive) {
+                    filters.append(b.allocator, f.prefix) catch @panic("OOM");
+                    continue;
+                }
             }
-            const bare = stem[0 .. stem.len - ".test.".len];
-            const shadowed = for (skipped.items) |sk| {
-                if (std.mem.endsWith(u8, sk, bare)) break true;
-            } else false;
-            if (!shadowed) {
-                filters.append(b.allocator, stem) catch @panic("OOM");
-                continue;
+            for (f.names) |n| {
+                if (n.anonymous or !selectedByUser(user, n.full)) continue;
+                if (n.unnamed) std.debug.panic("src/{s}.zig: cannot name the nested test {s}; nest it in a struct opened at column 0", .{ f.path, n.full });
+                filters.append(b.allocator, if (user) |u| nameFilter(n.full, all_names.items, u) else domainFilter(n.full, others.items)) catch @panic("OOM");
             }
-            for (top.items) |t| if (std.mem.eql(u8, t.stem, stem)) filters.append(b.allocator, t.filter) catch @panic("OOM");
-        };
-        for (nested.items) |n| {
-            const owner = for (stems.items, bucket) |stem, k| {
-                if (std.mem.eql(u8, stem, n.stem)) break k;
-            } else unreachable;
-            if (owner != i) continue;
-            if (user) |u| {
-                if (selectedByUser(u, n.full)) filters.append(b.allocator, nameFilter(n.full, all_names.items, u)) catch @panic("OOM");
-            } else filters.append(b.allocator, n.filter) catch @panic("OOM");
         }
-        if (filters.items.len == 0) continue;
-        const name = if (i < test_buckets.len) b.fmt("test-{s}", .{test_buckets[i][0]}) else "test-rest";
-        out.append(b.allocator, b.addTest(.{ .name = name, .root_module = root, .filters = filters.items, .test_runner = testRunner(b), .max_rss = bucket_compile_gib[i] * gib })) catch @panic("OOM");
+        const compile = b.addTest(.{ .name = b.fmt("test-{s}", .{d.name}), .root_module = root, .filters = filters.items, .test_runner = testRunner(b), .max_rss = d.compile_gib * gib });
+        out.append(b.allocator, .{ .compile = compile, .domain = d, .steps = steps.items }) catch @panic("OOM");
     }
     return out.items;
+}
+
+/// The runner's reading of `SUSHI_TEST_SELECT` (scripts/test_runner.zig `isSelected`).
+fn selects(select: []const u8, name: []const u8) bool {
+    var kept = false;
+    var it = std.mem.splitScalar(u8, select, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (line[0] == '!') {
+            if (std.mem.startsWith(u8, name, line[1..])) return false;
+        } else if (std.mem.startsWith(u8, name, line)) kept = true;
+    }
+    return kept;
+}
+
+/// A filter for one test that selects no name of `others`: its full name, or its longest quote-free piece.
+fn domainFilter(full: []const u8, others: []const []const u8) []const u8 {
+    var best: ?[]const u8 = null;
+    var pieces = std.mem.tokenizeAny(u8, full, "'\"\\");
+    while (pieces.next()) |piece| {
+        if (best) |b| if (b.len >= piece.len) continue;
+        for (others) |other| {
+            if (std.mem.indexOf(u8, other, piece) != null) break;
+        } else best = piece;
+    }
+    return best orelse std.debug.panic("rename the test \"{s}\": every quote-free part of it is in a test of another domain", .{full});
 }
 
 /// The host tier's files, as `src/`-relative paths without `.zig`: the imports of src/tests_host.zig, and each arch
@@ -783,26 +980,21 @@ fn isHostFile(host_paths: []const []const u8, dir_path: []const u8, stem: []cons
     return false;
 }
 
-fn namedBucket(stem: []const u8) usize {
-    for (test_buckets, 0..) |names, i| {
-        for (names) |name| if (std.mem.eql(u8, stem, name)) return i;
-    }
-    return test_buckets.len;
-}
-
 /// The exl3 tests run as one binary per area, `test-exl3-<area>`: the tests of the src/exl3 files listed for it, with
-/// its compile's RSS bound in GiB (as `bucket_compile_gib`). Every file that holds a test is listed once, and every
-/// listed file holds one.
-const exl3_test_bins = [_]struct { []const u8, u64, []const []const u8 }{
-    .{ "experts", 3, &.{ "expert_exl3_kernels", "expert_exl3", "rate_groups", "project_rows", "coop_rows2", "prefill_grid", "sorted_windows", "geometry_5120x2304_test" } },
-    .{ "trunk", 2, &.{ "linear", "trunk", "trunk_gemm" } },
-    .{ "format", 2, &.{ "root", "device", "kernel_source", "codebook_tables", "side_cache", "layout", "pack" } },
+/// its compile's and its run's RSS bounds in GiB (as `test_domains`). Every file that holds a test is listed once, and
+/// every listed file holds one.
+const exl3_test_bins = [_]Exl3Bin{
+    .{ .area = "experts", .compile_gib = 3, .run_gib = 8, .files = &.{ "expert_exl3_kernels", "expert_exl3", "rate_groups", "project_rows", "coop_rows2", "prefill_grid", "sorted_windows", "geometry_5120x2304_test" } },
+    .{ .area = "trunk", .compile_gib = 2, .run_gib = 8, .cut = true, .files = &.{ "linear", "trunk", "trunk_gemm" } },
+    .{ .area = "format", .compile_gib = 2, .run_gib = 4, .files = &.{ "root", "device", "kernel_source", "codebook_tables", "side_cache", "layout", "pack" } },
 };
+
+const Exl3Bin = struct { area: []const u8, compile_gib: u64, run_gib: u64, cut: bool = false, files: []const []const u8 };
 
 /// The binary `exl3_test_bins` lists the file `stem` under.
 fn exl3Bin(stem: []const u8) usize {
     var bin: ?usize = null;
-    for (exl3_test_bins, 0..) |area, i| for (area[2]) |listed| if (std.mem.eql(u8, listed, stem)) {
+    for (exl3_test_bins, 0..) |area, i| for (area.files) |listed| if (std.mem.eql(u8, listed, stem)) {
         if (bin != null) std.debug.panic("exl3_test_bins lists src/exl3/{s}.zig under two binaries", .{stem});
         bin = i;
     };
@@ -848,7 +1040,7 @@ fn addExl3TestBins(b: *std.Build, root: *std.Build.Module, user: ?[]const []cons
             if (selectedByUser(user, full)) tests.append(b.allocator, .{ .filter = full, .bin = bin.? }) catch @panic("OOM");
         }
     }
-    for (exl3_test_bins) |area| for (area[2]) |listed| {
+    for (exl3_test_bins) |area| for (area.files) |listed| {
         for (with_tests.items) |stem| {
             if (std.mem.eql(u8, stem, listed)) break;
         } else std.debug.panic("exl3_test_bins lists {s}, which is no src/exl3 file with tests", .{listed});
@@ -866,7 +1058,7 @@ fn addExl3TestBins(b: *std.Build, root: *std.Build.Module, user: ?[]const []cons
         var filters: std.ArrayList([]const u8) = .empty;
         for (tests.items) |t| if (t.bin == i) filters.append(b.allocator, t.filter) catch @panic("OOM");
         if (filters.items.len == 0) continue;
-        out.append(b.allocator, b.addTest(.{ .name = b.fmt("test-exl3-{s}", .{area[0]}), .root_module = root, .filters = filters.items, .test_runner = testRunner(b), .max_rss = area[1] * gib })) catch @panic("OOM");
+        out.append(b.allocator, b.addTest(.{ .name = b.fmt("test-exl3-{s}", .{area.area}), .root_module = root, .filters = filters.items, .test_runner = testRunner(b), .max_rss = area.compile_gib * gib })) catch @panic("OOM");
     }
     return out.items;
 }
@@ -989,6 +1181,13 @@ fn addCountGuard(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Ste
 /// cache key sees: the run always executes, so a pass made without a fixture never stands for a run with it.
 fn runEveryTime(run: *std.Build.Step.Run) void {
     run.has_side_effects = true;
+}
+
+/// A run step's RSS bound for `--maxrss` (Metal is not in RSS, so it is generous). A step that can load the Qwen cut
+/// holds `cut_run_gib` under `-Dfixture-cut=true`; without it, its runner refuses QWEN4_TEST_MODEL (`SUSHI_TEST_FIXTURE_CUT`).
+fn declareRun(run: *std.Build.Step.Run, fixture_cut: bool, holds_cut: bool, run_gib: u64) void {
+    run.step.max_rss = (if (fixture_cut and holds_cut) cut_run_gib else run_gib) * gib;
+    if (holds_cut) run.setEnvironmentVariable("SUSHI_TEST_FIXTURE_CUT", if (fixture_cut) "1" else "0");
 }
 
 /// `-Dtest-log`: the run's runner appends its per-test lines to `path` under `step` (scripts/test_runner.zig).

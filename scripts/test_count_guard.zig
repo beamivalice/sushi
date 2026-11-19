@@ -1,4 +1,4 @@
-//! `test_count_guard <bucket> <test binary>`: exit 1, naming the bucket, when the binary holds no named test. It asks
+//! `test_count_guard <name> <test binary>`: exit 1, naming the binary, when it holds no named test. It asks
 //! the test runner for its test list over the build protocol and runs nothing, so `zig build test` can follow each
 //! scanned binary with it. A filter set that selects nothing otherwise passes: Zig reports "0 tests passed" as success.
 const std = @import("std");
@@ -16,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     _ = args.next();
-    const bucket = args.next() orelse return error.MissingBucketName;
+    const name = args.next() orelse return error.MissingBinaryName;
     const binary = args.next() orelse return error.MissingTestBinary;
 
     var child = try std.process.spawn(io, .{
@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     }
     try client.serveBodylessMessage(.exit);
     if (named == 0) {
-        std.debug.print("test bucket {s} ran 0 tests: its filters select nothing\n", .{bucket});
+        std.debug.print("test binary {s} ran 0 tests: its filters select nothing\n", .{name});
         std.process.exit(1);
     }
 }

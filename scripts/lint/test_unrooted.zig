@@ -10,7 +10,7 @@ const rule = @import("rule.zig");
 pub const name = "test-unrooted";
 pub const reason = "Zig runs a file's tests only when a test root imports the file: an unrooted file's tests never run";
 
-/// The test roots build.zig compiles, relative to the source dir: the MLX and host tiers, the bucket list the MLX
+/// The test roots build.zig compiles, relative to the source dir: the MLX and host tiers, the after-each hook the MLX
 /// root pulls in, and the exl3, encoder and sushibar binaries.
 const roots = [_][]const u8{ "tests.zig", "tests_host.zig", "test_rest.zig", "exl3/root.zig", "exl3/host_min.zig", "encoder/root.zig", "sushibar_main.zig" };
 

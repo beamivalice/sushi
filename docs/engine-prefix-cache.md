@@ -699,7 +699,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   keeps them as its entries; the root's `v/` and every other name are left alone.
 - `SUSHI_TEST_CRASH_AFTER_LANDINGS` counts an op's publish as a landing and never the pace probe's file (only a `cas`
   tier writes one), so the crash flow cuts at the same file on both backends.
-- **Tests run on both backends**: `zig build test` runs the tier bucket (`test-kv_disk_cache`) a second time with
+- **Tests run on both backends**: `zig build test` runs `test-prefix-cache` a second time with
   `SUSHI_PREFIX_FS=real`. A test reads or damages a record's files through `kv_disk_fs.test*` (a live tier's layer, or
   one opened for the call); the SHA-256 pins hash each file's plain-file image (`regenerate`); `random commits,
   restores, evictions and restarts answer alike` drives both backends with one sequence and compares every answer.

@@ -222,7 +222,7 @@ Found while holding the engine of our own to MLX's bytes ([engine-own-forward](e
   names the slow decls.
 - `std.testing.expectError` and `expectEqual` on a pointer print the value with `{any}`: one printer per payload
   type, tens of KiB of code for an engine struct. Use `test_expect.expectError` or `expect(a == b)` there.
-- The unit tests compile as one binary per `test_buckets` entry in `build.zig`; a new file joins the last bucket.
+- The unit tests compile as one binary per `test_domains` entry in `build.zig`; a new shared test file is listed in one, or the configure fails.
 
 ## Tokenizer
 

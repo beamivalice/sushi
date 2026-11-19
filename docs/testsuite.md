@@ -51,14 +51,31 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 
 - `zig build test-host` builds `src/tests_host.zig`, a root that links no MLX: a file in it that reaches MLX fails the
   link. The build reads that root's imports, and each arch folder's `pub const host_tests` in its `arch_tests.zig`, as the
-  host list, and no MLX bucket may also select a host file's tests. An arch's other test files are its `pub const
+  host list, and no MLX domain may also select a host file's tests. An arch's other test files are its `pub const
   tests` ([placement](engine-arch-seam.md#adding-an-architecture)): `src/tests.zig` walks the enabled archs' lists, so
   a test file is added to its arch's `arch_tests.zig`, never to a root.
   The host binary is filtered to the tests of those files (`hostFilters` in build.zig); its module is built with
   `build_options.host_tier`, under which a live GPU read (`gpu_mem.zig`) panics and the NAX probe answers false.
   Every `<arch>/<arch>_bill.zig` is a host file too, by its `_bill` stem; `bills.zig` reaches the enabled archs' through the registry.
   A bill test that needs the live GPU lives in `bills_live_test.zig` (or `<arch>_bill_test.zig`) in the MLX tier.
-- `zig build test` runs the host tier, the MLX buckets, the exl3 binaries and the encoder binary, `test-encoder`.
+- `zig build test` runs the host tier, the MLX domains, the exl3 binaries and the encoder binary, `test-encoder`.
+  **The MLX domains** (`test_domains` in build.zig) are one binary each, named by what its tests prove:
+
+  | binary | holds |
+  |---|---|
+  | `test-cooler` | the Sushi Cooler contract |
+  | `test-deepseek`, `test-qwen`, `test-glm`, `test-mimo` | `src/dsv41/`, `src/qwen4/`, `src/glm5/`, `src/mimo2/`, less their prefix-cache files |
+  | `test-kernels` | `src/tensor/` and the shared kernels (attention, verify, MoE, FP8, MTP, DFlash, MLX and Metal glue) |
+  | `test-generate` | generation, the scheduler, MTP and DFlash rounds, sampling, the KV and SSM caches, the trunk |
+  | `test-load` | `src/arch/`, the model and its loader, registry, discovery, owned weights, expert I/O, imatrix, KLD, live bills |
+  | `test-server` | the HTTP server and its APIs, the CLI, launch and main |
+  | `test-prefix-cache` | the prefix cache and its SSD tier, run twice: `test-prefix-cache` and, on a run with no `-Dtest-filter`, `test-prefix-cache (SUSHI_PREFIX_FS=real)` |
+
+  A domain holds the test files of its folders and the `src/` files it lists (a listed file leaves its folder's
+  domain); a test file that no domain holds, or that two list, fails the configure by name, so a new shared file is
+  placed in a domain in the landing that adds it. A domain's binary runs as one or more run steps, each a process with
+  its own `SUSHI_TEST_SELECT` (the prefix `<path>.` of each of its files), and the configure fails a test that the steps
+  would run other than once.
   The exl3 tests run as one binary per area of `exl3_test_bins` (build.zig): `test-exl3-experts` (the expert
   kernels, rate groups, windows, prefill grid), `test-exl3-trunk` (the trellis linears) and `test-exl3-format`
   (root, device, kernel source, codebook tables, side cache, layout, pack). A file with tests that the table does not
@@ -66,15 +83,15 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   `test-encoder` builds only when the run's `-Dtest-filter` selects one of its tests (or there is none).
   `test-sushibar` runs `src/sushibar_main.zig`'s tests (AppKit views read back, no MLX) under the same rule.
 - **A binary that runs no test fails.** Zig reports a test binary whose filters select nothing as a pass, so each MLX
-  bucket, each exl3 binary, the encoder binary and the unfiltered host binary is followed by
+  domain, each exl3 binary, the encoder binary and the unfiltered host binary is followed by
   `scripts/test_count_guard.zig`, which asks the runner for the binary's test list (nothing runs) and fails, naming the
-  bucket (`test-rest`, `test-exl3-trunk`), when no
+  binary (`test-cooler`, `test-exl3-trunk`), when no
   named test is in it. The root file's anonymous `test { ... }` does not count: it survives every filter. A run with a
   `-Dtest-filter` skips the host check, since a filter may select nothing there. `tests/test_test_count_guard.sh` pins it.
-- build.zig names a bucket's files at configure time, so every folder or file it scans is declared with
+- build.zig names a domain's files at configure time, so every folder or file it scans is declared with
   `b.dependOnDirectoryContents`/`dependOnFileContents`; without that a new test file never runs until the cache goes.
-- A filtered run keeps the parallel binaries: the scan keeps the tests whose full name holds a `-Dtest-filter` substring
-  and balances them over the same binaries, and the host tier runs once, in `test-host`.
+- A filtered run keeps the parallel binaries: the scan keeps the tests whose full name holds a `-Dtest-filter` substring,
+  in their domains' binaries and steps (a step with none is not made), and the host tier runs once, in `test-host`.
   A filter may hold any character; a test name with a quote is selected by its longest quote-free piece that no
   skipped test holds (the response file the compiler reads cannot carry a quote), and a name with none is renamed.
 - `SUSHI_TEST_NO_GPU=1` makes a test build see no Metal backend, so `requireGpu` skips (diagnostic, test builds only).
@@ -82,17 +99,20 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   `sushi_after_each` (`src/test_rest.zig`), which fails that test by name when it left a hold, a turn, a model's budget
   slot, a forward scope, a seal, an armed fault, an opt-out or a latched MLX error, then puts the engine back at rest.
   `zig build test -Dtest-log=<abs path>` gives every test run step `SUSHI_TEST_LOG` and its name as `SUSHI_TEST_STEP`
-  (the second tier run: `test-kv_disk_cache (SUSHI_PREFIX_FS=real)`); each runner appends, under the file's lock,
+  (the second tier run: `test-prefix-cache (SUSHI_PREFIX_FS=real)`); each runner appends, under the file's lock,
   `<UTC>\t<step>\t<PASS|SKIP|FAIL>\t<ms>\t<test name>` per test and `<UTC>\t<step>\tDONE\t<ms>\t<p> pass, <s> skip,
   <f> fail` when its process ends, and prints nothing. A leak or a logged error is a FAIL, as the build runner counts
   it; a crashed test has no line (the build runner's error names it) and the restarted process ends on a DONE of its own.
   The slow tests: `sort -t$'\t' -k4,4rn <file> | head`.
   `SUSHI_TEST_SELECT` (one name prefix a line, `!<prefix>` drops) makes the runner run only the tests it selects, so
   several run steps can share one binary; one that selects nothing fails, naming its step.
-- Every test compile declares its measured peak RSS (`max_rss`, `bucket_compile_gib` in build.zig), so `zig build test
-  --maxrss <bytes>` runs only the compiles that fit at once; run steps declare none, since RSS does not see Metal.
-  Without `--maxrss` the budget is the machine's RAM (`hw.memsize`); a box under the largest bound, test-rest's
-  13 GiB, refuses the build by name.
+- Every test compile and run step declares its peak RSS (`max_rss`: a domain's `compile_gib` and `run_gib` in
+  build.zig, `exl3_test_bins` alike), so `zig build test --maxrss <bytes>` runs only the steps that fit at once. A
+  compile's is its measured cold MaxRSS; a run's is generous, since RSS does not see Metal. A step that can load the
+  Qwen cut (`test-cooler`, `test-qwen`, `test-exl3-trunk`) declares 16 GiB under `-Dfixture-cut=true`, which a run that
+  sets `QWEN4_TEST_MODEL` passes (`tests/gate.sh` does): without it such a step fails before its first test, naming
+  the flag (`SUSHI_TEST_FIXTURE_CUT`). Without `--maxrss` the budget is the machine's RAM (`hw.memsize`); a box under
+  the largest bound refuses the build by name.
 - **The Sushi Cooler contract** (`src/cooler_contract_test.zig`, tests `cooler contract:`) runs on the tiny fixtures of
   every arch that declares `cooler_contract`: the side, every weight in an owned region, a request and the model's
   teardown asking MLX nothing, an exact speculative request saying its greedy tokens, fault sweeps over the load and a
@@ -125,11 +145,11 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   suite proves nothing there.
 - Three real-weight runs have no script. The encoder's real-checkpoint capture:
   `SUSHI_ENCODER_REAL_MODEL=1 SUSHI_MODELS_DIR=<root holding Qwen/Qwen3.8-Flash-Next> zig build test -Doptimize=ReleaseFast -Dmodel=enc`.
-  MTP verify exactness on a real pack: `QWEN4_TEST_MODEL=<pack> zig build test -Doptimize=ReleaseFast -Dmodel=qwen4` with
+  MTP verify exactness on a real pack: `QWEN4_TEST_MODEL=<pack> zig build test -Doptimize=ReleaseFast -Dfixture-cut=true -Dmodel=qwen4` with
   `-Dtest-filter=` `qwen4 checkpoint affine8 and dense projections`, `qwen4 verify history row and cache identity`,
   `qwen4 MTP verify token values` and `qwen4 deferred PLE: the captured hidden`.
   The decoded trunk GEMM on the pack's own K6 banks (GPU lock): `QWEN4_TEST_MODEL=<pack> zig build test
-  -Doptimize=ReleaseFast -Dtest-filter="trunk gemm: real pack trunk banks"`.
+  -Doptimize=ReleaseFast -Dfixture-cut=true -Dtest-filter="trunk gemm: real pack trunk banks"`.
 - Model scope is `qwen4`, `mimo2`, `glm5`, `dsv41`, `enc` (the encoder) or `shared` (every model). A test's folder says
   its model; a test of one model's code lives in that model's folder ([map and guards](#folder-map-and-scope-guards)).
 
@@ -211,7 +231,7 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `log-line-end` flags a `log.info|warn|debug|err` call whose format is one string literal that does not end in
   `\n` (`"{s}"` alone passes: a line built whole): the logger adds no line end, so the next line starts on that one.
   `arch-test-unlisted` flags a file that declares a test and sits beside an `arch_tests.zig` that does not import
-  it: the buckets select tests by listed file, so its tests would never run.
+  it: the domains select tests by listed file, so its tests would never run.
   `test-unrooted` flags any other `src/` file that declares a test and that no test root (`tests.zig`,
   `tests_host.zig`, `test_rest.zig`, the exl3 and encoder roots) imports: Zig runs only the tests a root reaches.
   `template-text-search` flags, outside `src/template/` and tests, a `mem.` search (`indexOf`, `count`, `startsWith`,
@@ -274,9 +294,9 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - A test's model is its file's folder (`src/qwen4/`, `src/mimo2/`, `src/glm5/`, `src/dsv41/`); the `src/` root is shared.
   `-Dmodel=<arch>` runs one folder's tests plus the shared ones. A new test file of an arch is listed in that
   arch's `arch_tests.zig` (`pub const tests`, or `host_tests` for an MLX-free file), never in `src/tests.zig`.
-  A source file with tests at its bottom is listed too: the buckets select tests by listed file, so an unlisted
+  A source file with tests at its bottom is listed too: the domains select tests by listed file, so an unlisted
   file's tests never run (lint `arch-test-unlisted`). A shared file with tests is imported from `src/tests.zig`, or
-  `src/tests_host.zig` when MLX-free (lint `test-unrooted`).
+  `src/tests_host.zig` when MLX-free (lint `test-unrooted`), and an MLX one is listed in its domain (`test_domains`).
 - A shared file (`trunk.zig`, `server.zig`, `generate.zig`, `scheduler.zig`, `prefix_cache.zig`, the EXL3 kernels)
   holds only `shared` tests. Code for one arch lives in that arch's files, and so do its tests.
 - A scenario across several modules, or a table of real captures, is its own `<topic>_test.zig`.
@@ -353,9 +373,10 @@ unexplained drop means tests were not built, and blocks the push.
 `tests/gate.sh [--test-budget-gib N] [<ref>]` (default `origin/main`; fetch first) refuses while the GPU lock is held,
 makes a clean worktree of the commit (no untracked file can mask a missing one) and runs, under `taskpolicy -a`,
 `zig build lint`, `zig build ubench` and `zig build test -Doptimize=ReleaseFast --summary all` with the tiny-fixture
-envs of `tests/lib/fixture_envs.sh`, `-Dtest-log` and `--maxrss` of the test budget, with `tests/hermetic_guards.sh`
-running beside the test step. The budget is 72 GiB on a box of 96 GiB or more (M5 Max), 20 GiB on 32 GiB or more
-(M1 Max); a smaller box refuses until `--test-budget-gib` names one. Each test's log line shows as it lands; at the end
+envs of `tests/lib/fixture_envs.sh`, `-Dtest-log`, `--maxrss` of the test budget and, when the envs name the Qwen cut,
+`-Dfixture-cut=true`, with `tests/hermetic_guards.sh` running beside the test step. The budget is 72 GiB on a box of
+96 GiB or more (M5 Max: at most four 16 GiB cut steps at once), 20 GiB and `-j8` on 32 GiB or more (M1 Max); a
+smaller box refuses until `--test-budget-gib` names one. Each test's log line shows as it lands; at the end
 `tests/lib/test_log.py` prints the per-step table (tests, pass, skip, fail, wall), the 10 slowest tests and, last,
 every failed test with the error block the build runner printed for it.
 Its zig builds share a persistent local cache, `~/.sushi/runs/gate/zig-cache` (`--cache-dir`), so a fresh worktree is
@@ -373,7 +394,7 @@ architecture the series did not touch is not dropped, and a series that touched 
 (a drop and a single-arch build for each architecture taken) run at once: all eight took 11.5 minutes on the M5 Max at
 a954450b (the slowest drop's 687 s), against 42 minutes one after another.
 A landing runs what its diff can break and nothing for ceremony: its new tests, the filters of the code it changed, one
-arch bucket when it reaches that arch widely. A rebase that touched none of its files repeats no run.
+arch domain when it reaches that arch widely. A rebase that touched none of its files repeats no run.
 
 ## Integration scripts
 

@@ -1,8 +1,9 @@
 #!/bin/bash
 # sushi-test: tier=host
-# test_test_bins.sh — the exl3 tests run in one binary per area, `test-exl3-experts`, `-trunk` and `-format`, each
-# holding the tests of the files build.zig lists for it, and `test-encoder` builds only when the filter selects one
-# of its tests. One CPU test per binary, read back from -Dtest-log.
+# test_test_bins.sh — the MLX tests run in one binary per domain of build.zig's `test_domains` (`test-cooler`,
+# `test-qwen`, ...), and a test file no domain holds fails the configure; the exl3 tests run in one binary per area,
+# `test-exl3-experts`, `-trunk` and `-format`, each holding the tests of the files build.zig lists for it, and
+# `test-encoder` builds only when the filter selects one of its tests. One test per binary, read back from -Dtest-log.
 #
 # Usage: ./tests/test_test_bins.sh
 
@@ -37,6 +38,44 @@ taskpolicy -a "$ZIG" build test -Doptimize=ReleaseFast "-Dtest-filter=$ENCODER" 
   >"$TMP/out" 2>&1 || fail "the encoder filter runs green"
 [ "$(steps "$TMP/enc.tsv")" = "test-encoder PASS cli.test.$ENCODER" ] \
   || fail "an encoder filter runs its test in test-encoder alone; got: $(steps "$TMP/enc.tsv")"
+
+# The MLX tests run in one binary per domain of `test_domains`, each test in the step its file's domain names.
+COOLER="cooler contract runner: SUSHI_CONTRACT_FIXTURE names the fixtures a run takes, and without it a missing fixture skips the test before any load"
+DEEPSEEK="dsv41 forward cap: on MLX, covers what every measured peak added to the state it started from, with no multiplier"
+QWEN="qwen4 convolution transform rejects a non-unit channel axis"
+GLM="GLM config maps compressed MLA and FP32 recurrent state without Qwen assumptions"
+MIMO="a model stamped as mimo2 is dispatched to mimo2"
+KERNELS="lastDim reads the innermost size and refuses a null handle"
+LOAD="EXL3 shard stamp rejects invalid and nonfinite rates"
+SERVER="routeRequestModel: a path names its own entry, an unknown name the default"
+PREFIX="HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints"
+while [ -e "$QUIET" ]; do sleep 5; done
+taskpolicy -a "$ZIG" build test -Doptimize=ReleaseFast "-Dtest-filter=$COOLER" "-Dtest-filter=$DEEPSEEK" \
+  "-Dtest-filter=$QWEN" "-Dtest-filter=$GLM" "-Dtest-filter=$MIMO" "-Dtest-filter=$KERNELS" "-Dtest-filter=$LOAD" \
+  "-Dtest-filter=$SERVER" "-Dtest-filter=$PREFIX" "-Dtest-log=$TMP/domains.tsv" >"$TMP/out" 2>&1 \
+  || fail "one test of each domain runs green"
+want="test-cooler PASS cooler_contract_test.test.$COOLER
+test-deepseek PASS dsv41.dsv41_config.test.$DEEPSEEK
+test-glm PASS glm5.glm5_config.test.$GLM
+test-kernels PASS mlx_util.test.$KERNELS
+test-load PASS pack_index.test.$LOAD
+test-mimo PASS mimo2.arch.test.$MIMO
+test-prefix-cache PASS prefix_cache.test.$PREFIX
+test-qwen PASS qwen4.qwen4_config.test.$QWEN
+test-server PASS http_conn.test.$SERVER"
+[ "$(steps "$TMP/domains.tsv")" = "$want" ] || fail "each test runs in its domain's step; got: $(steps "$TMP/domains.tsv")"
+
+# A test file that no domain holds fails the configure by name: a copy of the tree whose src/ gains one.
+mkdir -p "$TMP/tree/src"
+for f in * .zig-toolchain; do [ "$f" = src ] || ln -s "$PWD/$f" "$TMP/tree/$f"; done
+for f in src/*; do ln -s "$PWD/$f" "$TMP/tree/$f"; done
+printf '%s\n' 'test "a file of no domain" {}' > "$TMP/tree/src/zz_unlisted.zig"
+while [ -e "$QUIET" ]; do sleep 5; done
+if (cd "$TMP/tree" && "$ZIG" build -h >"$TMP/out" 2>&1); then
+  fail "a test file no domain holds should fail the configure"
+elif ! grep -q "src/zz_unlisted.zig holds tests that no test_domains entry holds" "$TMP/out"; then
+  fail "the configure failure should name the unlisted file"
+fi
 
 [ "$FAIL" -eq 0 ] || { echo "FAIL"; exit 1; }
 echo "PASS"

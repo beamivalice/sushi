@@ -29,8 +29,8 @@ Rules: [CLAUDE.md](../CLAUDE.md#team-process). Tests and tiers: [testsuite](test
 
 ## What a hunter may do
 
-- Write and run **scratch tests**: at the bottom of a test file the bucket already runs, on the tiny fixtures, with
-  the bucket's filter. A scratch test may print to stderr (never stdout); it is not held to the quiet-test rule.
+- Write and run **scratch tests**: at the bottom of a test file a domain already runs, on the tiny fixtures, with
+  the test's `-Dtest-filter`. A scratch test may print to stderr (never stdout); it is not held to the quiet-test rule.
 - Leave a one-line local change that proves a diagnosis, marked `// SCRATCH PROOF`.
 - Use the fault injectors to reach error paths: `mlx.fault.arm(k)` fails the k-th checked MLX call, and
   `mlx.engine.fault.arm(k)` makes the engine's pool refuse its k-th buffer. Sweep by site, never by sampling call

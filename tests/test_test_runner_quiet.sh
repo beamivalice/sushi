@@ -144,6 +144,10 @@ pub fn build(b: *std.Build) void {
         run_select.setEnvironmentVariable("SUSHI_TEST_SELECT", select);
         run_select.setEnvironmentVariable("SUSHI_TEST_LOG", log);
         run_select.setEnvironmentVariable("SUSHI_TEST_STEP", "select step");
+        if (b.option([]const u8, "cut", "")) |cut| {
+            run_select.setEnvironmentVariable("SUSHI_TEST_FIXTURE_CUT", cut);
+            run_select.setEnvironmentVariable("QWEN4_TEST_MODEL", "/nonexistent/qwen4-cut");
+        }
         b.step("select", "").dependOn(&run_select.step);
     }
 }
@@ -224,6 +228,20 @@ got=$(cut -f3,5 "$TMP/by-hand-select.tsv" 2>/dev/null | tr '\t' '|' | tr '\n' ';
 want="PASS|by_hand.test.passes;SKIP|by_hand.test.skips;DONE|1 pass, 1 skip, 0 fail;"
 if [ $BY_HAND_RC -ne 0 ] || [ "$got" != "$want" ]; then
   echo "  FAIL: a binary run by hand under SUSHI_TEST_SELECT should run and log only [$want], got [$got] (exit $BY_HAND_RC)"
+  FAIL=1
+fi
+
+# A run step that can load the Qwen cut carries SUSHI_TEST_FIXTURE_CUT, 1 under -Dfixture-cut=true and 0 without: a 0
+# step that sees QWEN4_TEST_MODEL fails before its first test, naming the flag, since its memory was declared without it.
+if (cd "$TMP/scratch" && "$ZIG" build select "-Dselect=select.test.alpha one" -Dcut=0 "-Dlog=$TMP/cut.tsv" >"$TMP/out" 2>&1) ||
+  ! grep -q "step 'select step': QWEN4_TEST_MODEL is set, but the build did not declare it: zig build test -Dfixture-cut=true" "$TMP/out"; then
+  echo "  FAIL: a cut step built without -Dfixture-cut should refuse QWEN4_TEST_MODEL by name"
+  sed 's/^/    | /' "$TMP/out" | head -20
+  FAIL=1
+fi
+if ! (cd "$TMP/scratch" && "$ZIG" build select "-Dselect=select.test.alpha one" -Dcut=1 "-Dlog=$TMP/cut.tsv" >"$TMP/out" 2>&1); then
+  echo "  FAIL: a cut step built with -Dfixture-cut=true should run beside QWEN4_TEST_MODEL"
+  sed 's/^/    | /' "$TMP/out" | head -20
   FAIL=1
 fi
 

@@ -18,7 +18,7 @@ Two phases, run from the torch venv (transformers main carries the arch):
   venv/bin/python tests/qwen4/dump_qwen4_exp_fixtures.py dump --hf ~/.sushi/runs/qwen4-tiny/hf \
       --pack ~/.sushi/runs/qwen4-tiny/pack --out ~/.sushi/runs/qwen4-tiny/fixture.safetensors
   QWEN4_TEST_MODEL=~/.sushi/runs/qwen4-tiny/pack QWEN4_FIXTURE=~/.sushi/runs/qwen4-tiny/fixture.safetensors \
-      zig build test -Dtest-filter="qwen4 fixture"
+      zig build test -Dfixture-cut=true -Dtest-filter="qwen4 fixture"
 
 `--vision` on both phases builds Qwen4ExpForConditionalGeneration with a tiny
 tower (the converter packs it via `--add-vision --src`) and dumps ONE image
