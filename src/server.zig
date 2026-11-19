@@ -776,6 +776,8 @@ pub fn serve(
     //    Trunk/vision/drafter load, JIT compile, and warmup; mlx ops
     //    are bound to that thread's GPU stream. `init` returns once the load
     //    has passed its refusals, so a refusal still ends the boot unserved.
+    // False once a shutdown left connection threads running: what they hold is then never freed (`stopServing`).
+    var drained = true;
     var scheduler = scheduler_mod.Scheduler.init(
         allocator,
         io,
@@ -785,7 +787,7 @@ pub fn serve(
         if (listener) |*l| l.deinit(io);
         return err;
     };
-    defer scheduler.deinit();
+    defer if (drained) scheduler.deinit();
     server_state.global_scheduler = scheduler;
     defer server_state.global_scheduler = null;
     server_state.global_registry = scheduler.registry;
@@ -793,7 +795,7 @@ pub fn serve(
     scheduler.registry.load_gate = downloads.loadGate;
     scheduler.test_on_cooler = cfg.test_on_cooler;
     responses_api.initGlobalResponseStore(io, allocator);
-    defer responses_api.deinitGlobalResponseStore();
+    defer if (drained) responses_api.deinitGlobalResponseStore();
 
     if (instr.current() != null) {
         startGaugeSampler() catch |err| log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
@@ -805,7 +807,10 @@ pub fn serve(
     var client_thread: ?std.Thread = null;
     defer if (listener) |*l| http_conn.closeEmbeddedListener(io, l, client_thread) else if (client_thread) |t| t.join();
     var accept_thread: ?std.Thread = null;
-    defer stopServing(&accept_thread);
+    var stopped = false;
+    defer if (!stopped) {
+        drained = stopServing(&accept_thread);
+    };
     if (listener != null) {
         log.info("\nServer listening on http://{s}:{d}\n", .{ host, server_state.listen_port });
         if (boots_model) log.info("  {s} is loading: the page, /health, /v1/models, /props, /v1/settings and the metrics answer now; generation waits for the model\n", .{load_params.entry.id});
@@ -997,7 +1002,9 @@ pub fn serve(
         t.join();
         accept_thread = null;
     } else acceptLoop(allocator, io, null);
-    stopServing(&accept_thread);
+    stopped = true;
+    drained = stopServing(&accept_thread);
+    if (!drained) return error.ConnectionsOutliveShutdown;
 
     log.info("\nShutting down gracefully...\n", .{});
 }
@@ -1089,31 +1096,42 @@ fn logFdQuota(allocator: std.mem.Allocator, err: anyerror) void {
     log.err("{s}\n", .{fd_limits.quotaLine(&line_buf, err, c)});
 }
 
+/// How long a shutdown waits for its connection threads. Past `beginShutdown` each one's wait is bounded by the read
+/// limit: no new work is taken, and what it waited on is cancelled or failed.
+const CONN_DRAIN_MS: u64 = 35_000;
+
 /// Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): stop the accept
-/// loop, cancel every in-flight slot so its connection thread unblocks from
-/// waitNext and runs its `defer complete(...)`, then WAIT for all connection
-/// threads to finish — `serve` runs `scheduler.deinit` on return, which frees
-/// the slot queues that an in-flight `complete()` is still touching. The
-/// inference thread is still alive here (deinit joins it later), so cancelled
-/// slots settle promptly. Bounded so a wedged thread can't hang shutdown forever.
+/// loop, begin the scheduler's shutdown (`beginShutdown`: new work refused, every
+/// in-flight slot cancelled, queued loads and encodes failed), then WAIT for all
+/// connection threads to finish — `serve` runs `scheduler.deinit` on return, which
+/// frees the slots, the models and the stores those threads hold. The inference
+/// thread is still alive here (deinit joins it later), so cancelled slots settle
+/// promptly. False when a thread is still alive past the bound: it would read what
+/// the teardown frees, so `serve` skips that teardown and returns
+/// `error.ConnectionsOutliveShutdown`, and its caller must free nothing it passed in.
 /// Idempotent; also the cleanup of a boot whose load failed with the listener up.
-fn stopServing(accept_thread: *?std.Thread) void {
+fn stopServing(accept_thread: *?std.Thread) bool {
     server_state.shutdown_requested.store(true, .release);
     downloads.stop();
     if (accept_thread.*) |t| {
         t.join();
         accept_thread.* = null;
     }
-    if (server_state.global_scheduler) |sch| sch.cancelAllInFlight();
+    if (server_state.global_scheduler) |sch| sch.beginShutdown();
     var waited_ms: u64 = 0;
     var idle_fds = [_]std.posix.pollfd{};
-    while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
+    while (active_conn_threads.load(.acquire) > 0 and waited_ms < CONN_DRAIN_MS) {
         _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
         waited_ms += 20;
     }
     const remaining = active_conn_threads.load(.acquire);
-    if (remaining > 0)
-        log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
+    if (remaining > 0) {
+        var held_buf: [512]u8 = undefined;
+        const held = if (server_state.global_scheduler) |sch| sch.stillHeld(&held_buf) else "nothing the scheduler knows";
+        log.warn("shutdown: {d} connection thread(s) still active after {d}ms, holding {s}: ending without the teardown that would free it\n", .{ remaining, waited_ms, held });
+        return false;
+    }
+    return true;
 }
 
 fn handleConnectionThread(args: *http_conn.ConnThreadArgs) void {

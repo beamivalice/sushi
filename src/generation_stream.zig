@@ -202,8 +202,8 @@ pub fn mapGenerationError(allocator: std.mem.Allocator, err: anyerror) !GenError
             .anthropic_type = "invalid_request_error",
             .message = EMPTY_PROMPT_MSG,
         },
-        // The shutdown drain ended a request that was queued or running.
-        error.ServerShutdown => .{
+        // The shutdown drain ended a request that was queued or running, or refused one at submit.
+        error.ServerShutdown, error.Shutdown => .{
             .status_line = "503 Service Unavailable",
             .code = 503,
             .openai_type = "server_error",
@@ -2585,8 +2585,8 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         try t.expectEqualStrings("invalid_request_error", w.openai_type);
         try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
     }
-    {
-        const w = try mapGenerationError(a, error.ServerShutdown);
+    for ([_]anyerror{ error.ServerShutdown, error.Shutdown }) |e| {
+        const w = try mapGenerationError(a, e);
         defer w.deinit(a);
         try t.expectEqual(@as(u32, 503), w.code);
         try t.expectEqualStrings("server_error", w.openai_type);

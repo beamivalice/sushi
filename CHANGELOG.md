@@ -35,6 +35,12 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A failed speculative Qwen request no longer leaves memory held until restart**: a request whose MTP verify failed,
   for example refused for memory, kept the verify's recurrent-state capture (about 6 MB per layer it had reached), and
   every such failure added to it. The round frees it as it fails, and the request's teardown frees it too.
+- **A shutdown no longer serves a request that was waiting for room, or one that arrives as it starts**: it cancelled
+  what was running once, and a request waiting in the full queue then took a freed place and ran to its end, as did one
+  still being read; every request, load and image encode after the shutdown's first step now ends with a 503 "Server is
+  shutting down" (a request refused at that step answered a 500 "Internal server error: Shutdown"). A server whose
+  connections are still busy 35 s into a shutdown now exits with status 1 and a log line naming the requests and models
+  they hold, instead of freeing what they still read (it went on to free them and exited 0).
 - **A Responses continuation no longer reads freed memory when its previous response is deleted or evicted mid-reply**:
   the stored history it continued, a `GET /v1/responses/{id}` body and a WebSocket chain were read after the store had
   let go of them, so the reply could store garbage history or crash; the store now keeps a response whole until every

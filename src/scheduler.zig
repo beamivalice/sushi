@@ -1247,6 +1247,9 @@ pub const Scheduler = struct {
     /// `ServerConfig.test_on_cooler`, for the cold loads (read in test builds only).
     test_on_cooler: ?bool = null,
     shutdown: std.atomic.Value(bool),
+    /// Set by `beginShutdown`, the first step of a shutdown (queue_mu): from here no new request, load, image encode,
+    /// unload or cache job is taken, while the inference thread still settles what was already in flight.
+    draining: bool,
     started: std.atomic.Value(bool),
     started_mu: std.Io.Mutex,
     started_cond: std.Io.Condition,
@@ -1345,6 +1348,7 @@ pub const Scheduler = struct {
             .submit_cond = .init,
             .inference_thread = null,
             .shutdown = std.atomic.Value(bool).init(false),
+            .draining = false,
             .started = std.atomic.Value(bool).init(false),
             .started_mu = .init,
             .started_cond = .init,
@@ -1427,26 +1431,8 @@ pub const Scheduler = struct {
         destroyAbandoned(self.abandoned);
         for (self.orphan_vision[0..self.orphan_vision_n]) |ve| vision_queue.freeVisionArray(ve);
         self.prefilling.deinit(self.allocator);
-        // The vision queue should be empty (encodeVision blocks until done) but
-        // guard against shutdown-mid-encode by signaling done with an error.
-        for (self.vision_queue.items) |req| {
-            req.done_mu.lockUncancelable(self.io);
-            req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
-            req.done = true;
-            req.done_cond.broadcast(self.io);
-            req.done_mu.unlock(self.io);
-        }
+        self.failQueuedWaiters();
         self.vision_queue.deinit(self.allocator);
-        // Phase D: signal any pending cold-load requesters that the
-        // server is shutting down. They roll back their entry state and
-        // free pre-loaded CPU resources.
-        for (self.load_queue.items) |req| {
-            req.done_mu.lockUncancelable(self.io);
-            req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
-            req.done = true;
-            req.done_cond.broadcast(self.io);
-            req.done_mu.unlock(self.io);
-        }
         self.load_queue.deinit(self.allocator);
         // Wake any conn threads blocked in unloadModel so they don't hang.
         for (self.unload_queue.items) |req| {
@@ -1500,6 +1486,37 @@ pub const Scheduler = struct {
         self.allocator.destroy(self);
     }
 
+    /// Whether new work is refused: a shutdown has begun (queue_mu).
+    fn refusingLocked(self: *const Scheduler) bool {
+        return self.draining or self.shutdown.load(.acquire);
+    }
+
+    /// Ends every queued cold load and image encode the inference thread has not taken with the shutdown error: their
+    /// requesters roll back their entry and free what they hold.
+    fn failQueuedWaiters(self: *Scheduler) void {
+        for (self.vision_queue.items) |req| finishShutdown(self, req);
+        self.vision_queue.clearRetainingCapacity();
+        for (self.load_queue.items) |req| finishShutdown(self, req);
+        self.load_queue.clearRetainingCapacity();
+    }
+
+    fn finishShutdown(self: *Scheduler, req: anytype) void {
+        req.done_mu.lockUncancelable(self.io);
+        req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
+        req.done = true;
+        req.done_cond.broadcast(self.io);
+        req.done_mu.unlock(self.io);
+    }
+
+    /// A cold load a shutdown refused before the inference thread took it: its entry and its victims return to where
+    /// they stood, so a request waiting on either does not wait on a load that never runs.
+    fn rollBackUntakenLoad(self: *Scheduler, entry: *LoadedModel, victims: []const *LoadedModel) void {
+        self.registry.mutex.lockUncancelable(self.io);
+        defer self.registry.mutex.unlock(self.io);
+        for (victims) |v| if (v.state == .evicting) self.registry.unmarkEvictingLocked(v);
+        if (entry.state == .loading) self.registry.markUnloadedLocked(entry);
+    }
+
     /// Submit a new request. Builds a Slot, queues it, returns the handle.
     /// Blocks if the queue is full (i.e. `in_flight >= queue_cap`). When
     /// the scheduler is shutting down this returns `error.Shutdown`.
@@ -1524,10 +1541,10 @@ pub const Scheduler = struct {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
 
-        while (self.in_flight >= self.queue_cap and !self.shutdown.load(.acquire)) {
+        while (self.in_flight >= self.queue_cap and !self.refusingLocked()) {
             self.submit_cond.waitUncancelable(self.io, &self.queue_mu);
         }
-        if (self.shutdown.load(.acquire)) return error.Shutdown;
+        if (self.refusingLocked()) return error.Shutdown;
 
         try self.cleanup_queue.ensureUnusedCapacity(self.allocator, self.in_flight + 1);
         try self.prefilling.ensureUnusedCapacity(self.allocator, self.in_flight + 1);
@@ -1637,20 +1654,43 @@ pub const Scheduler = struct {
         self.queue_mu.unlock(self.io);
     }
 
-    /// Shutdown helper: signal every in-flight slot (pending + decoding) to
-    /// cancel so their owning connection threads unblock from `waitNext` and
-    /// run their `defer complete(...)` promptly. `server.serve` calls this when
-    /// the accept loop exits, THEN waits for the connection threads to drain
-    /// before returning (which triggers `deinit`) — otherwise a thread still in
-    /// `complete()` races `deinit`'s teardown of `pending`/`decoding`/
-    /// `cleanup_queue` into a use-after-free. Does NOT remove or free slots;
-    /// the conn threads own that via `complete()`.
-    pub fn cancelAllInFlight(self: *Scheduler) void {
+    /// The first step of a shutdown, one sweep under one lock: from here every new request, load, image encode, unload
+    /// and cache job is refused with `error.Shutdown` (a submitter waiting for room included), every in-flight slot is
+    /// cancelled so its connection thread unblocks and runs its `complete`, and every queued load and encode fails.
+    /// `server.serve` then waits for the connection threads before `deinit`. Frees nothing: the threads own their slots.
+    pub fn beginShutdown(self: *Scheduler) void {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
+        self.draining = true;
         for (self.pending.items) |slot| slot.cancelForShutdown();
         for (self.prefilling.items) |slot| slot.cancelForShutdown();
         for (self.decoding.items) |slot| slot.cancelForShutdown();
+        self.failQueuedWaiters();
+        self.submit_cond.broadcast(self.io);
+        self.queue_cond.broadcast(self.io);
+    }
+
+    /// What a shutdown still waits on, for its log line: the requests not yet completed, by id, and the models still
+    /// held, with their holds.
+    pub fn stillHeld(self: *Scheduler, buf: []u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeAll("requests") catch {};
+        {
+            self.queue_mu.lockUncancelable(self.io);
+            defer self.queue_mu.unlock(self.io);
+            for ([_][]const *Slot{ self.pending.items, self.prefilling.items, self.decoding.items }) |list| for (list) |slot| {
+                w.print(" {d}", .{slot.request_id}) catch {};
+            };
+        }
+        w.writeAll(", models") catch {};
+        self.registry.mutex.lockUncancelable(self.io);
+        defer self.registry.mutex.unlock(self.io);
+        var it = self.registry.entries.valueIterator();
+        while (it.next()) |e| {
+            const n = e.*.refcount.load(.acquire);
+            if (n > 0) w.print(" {s} ({d} holds)", .{ e.*.id, n }) catch {};
+        }
+        return w.buffered();
     }
 
     /// Cancel a single in-flight slot by its request_id (user/dashboard cancellation).
@@ -1920,12 +1960,17 @@ pub const Scheduler = struct {
             .allocator = self.allocator,
         };
 
-        {
+        const refused = blk: {
             self.queue_mu.lockUncancelable(self.io);
             defer self.queue_mu.unlock(self.io);
-            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            if (self.refusingLocked()) break :blk true;
             try self.load_queue.append(self.allocator, &req);
             self.queue_cond.broadcast(self.io);
+            break :blk false;
+        };
+        if (refused) {
+            self.rollBackUntakenLoad(entry, victims_buf[0..n_victims]);
+            return error.Shutdown;
         }
 
         // Block until the inference thread signals done.
@@ -1940,6 +1985,10 @@ pub const Scheduler = struct {
             // to a typed error so a memory-preflight refusal surfaces as a
             // named 503, not the generic "Model load failed" 500 (#144).
             defer self.allocator.free(name);
+            if (std.mem.eql(u8, name, "Shutdown")) {
+                self.rollBackUntakenLoad(entry, victims_buf[0..n_victims]);
+                return error.Shutdown;
+            }
             // On success the inference thread took ownership of cpu_state;
             // on failure it didn't, so we still hold it.
             return ModelRegistry.loadErrorFromName(name);
@@ -2037,7 +2086,7 @@ pub const Scheduler = struct {
             defer self.queue_mu.unlock(self.io);
             // On shutdown the entry stays `.evicting`; `Scheduler.deinit`
             // unloads every `.ready`/`.evicting` entry, so it's still freed.
-            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            if (self.refusingLocked()) return error.Shutdown;
             try self.unload_queue.append(self.allocator, &req);
             self.queue_cond.broadcast(self.io);
         }
@@ -2060,7 +2109,7 @@ pub const Scheduler = struct {
         {
             self.queue_mu.lockUncancelable(self.io);
             defer self.queue_mu.unlock(self.io);
-            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            if (self.refusingLocked()) return error.Shutdown;
             try self.prefix_clear_queue.append(self.allocator, &req);
             self.queue_cond.broadcast(self.io);
         }
@@ -2106,6 +2155,10 @@ pub const Scheduler = struct {
     pub fn encodeVision(self: *Scheduler, req: *vision_queue.VisionEncodeRequest) !mlx.mlx_array {
         // Post + wake.
         self.queue_mu.lockUncancelable(self.io);
+        if (self.refusingLocked()) {
+            self.queue_mu.unlock(self.io);
+            return error.Shutdown;
+        }
         self.vision_queue.append(self.allocator, req) catch |err| {
             self.queue_mu.unlock(self.io);
             return err;
@@ -5287,6 +5340,7 @@ test "complete keeps a slot in decoding until its pass is out, so admission neve
     sch.queue_cond = .init;
     sch.submit_cond = .init;
     sch.shutdown = .init(false);
+    sch.draining = false;
     sch.queue_cap = 2;
     sch.in_flight = 0;
     sch.pending = .empty;
@@ -5709,6 +5763,7 @@ pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Schedul
     sch.queue_cond = .init;
     sch.submit_cond = .init;
     sch.shutdown = .init(false);
+    sch.draining = false;
     sch.queue_cap = queue_cap;
     sch.in_flight = 0;
     sch.req_seq = first_request_id;
@@ -5717,6 +5772,7 @@ pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Schedul
     sch.cleanup_queue = .empty;
     sch.prefilling = .empty;
     sch.load_queue = .empty;
+    sch.vision_queue = .empty;
     sch.unload_queue = .empty;
     sch.abandoned = null;
     sch.orphan_vision_n = 0;
@@ -5787,6 +5843,7 @@ test "a per-request kv_quant override (16, \"16\", 8, 6, 4) reaches the submitte
     sch.queue_cond = .init;
     sch.submit_cond = .init;
     sch.shutdown = .init(false);
+    sch.draining = false;
     sch.queue_cap = 2;
     sch.in_flight = 0;
     sch.pending = .empty;
@@ -5830,6 +5887,7 @@ test "an empty prompt is refused at submit, before any slot reaches the inferenc
     sch.queue_cond = .init;
     sch.submit_cond = .init;
     sch.shutdown = .init(false);
+    sch.draining = false;
     sch.queue_cap = 2;
     sch.in_flight = 0;
     sch.pending = .empty;
@@ -5861,6 +5919,7 @@ test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
     sch.queue_cond = .init;
     sch.submit_cond = .init;
     sch.shutdown = .init(false);
+    sch.draining = false;
     sch.queue_cap = 2;
     sch.in_flight = 0;
     sch.pending = .empty;
@@ -5919,12 +5978,15 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
     sch.queue_cond = .init;
     sch.submit_cond = .init;
     sch.shutdown = .init(false);
+    sch.draining = false;
     sch.queue_cap = 2;
     sch.in_flight = 0;
     sch.pending = .empty;
     sch.decoding = .empty;
     sch.cleanup_queue = .empty;
     sch.prefilling = .empty;
+    sch.load_queue = .empty;
+    sch.vision_queue = .empty;
     defer sch.pending.deinit(allocator);
     defer sch.decoding.deinit(allocator);
     defer sch.cleanup_queue.deinit(allocator);
@@ -5936,7 +5998,7 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
     _ = sch.pending.orderedRemove(0);
     sch.queue_mu.unlock(sch.io);
     try testing.expectEqual(slot, taken);
-    sch.cancelAllInFlight();
+    sch.beginShutdown();
     const cancelled = slot.cancelled.load(.acquire);
     endPrefillPass(&sch, slot);
     sch.complete(slot);
@@ -5977,6 +6039,35 @@ test "cancelSlotById cancels the slot with that id in any queue and no other" {
     }
 }
 
+test "a shutdown refuses a submit that comes after its first step, and the one waiting for room" {
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.handle = null;
+    model.prefix_cache = null;
+    var sch = submitTestScheduler(testing.allocator, 1);
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.cleanup_queue.deinit(testing.allocator);
+    defer sch.prefilling.deinit(testing.allocator);
+    const params: SubmitParams = .{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 };
+    const held = try sch.submit(params);
+    var waited: anyerror!*Slot = error.NotRun;
+    const waiter = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Scheduler, p: SubmitParams, out: *anyerror!*Slot) void {
+            out.* = s.submit(p);
+        }
+    }.run, .{ &sch, params, &waited });
+    sch.beginShutdown();
+    sch.complete(held);
+    waiter.join();
+    try testing.expectError(error.Shutdown, waited);
+    try testing.expectError(error.Shutdown, sch.submit(params));
+    var batch: [16]*Slot = undefined;
+    const take = takeTeardownLocked(&sch, &batch);
+    for (batch[0..take.cleanup_n]) |s| s.deinit();
+    destroyAbandoned(take.abandoned);
+}
+
 test "a shutdown drain ends a queued request with an error, a client disconnect still ends it as done" {
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
@@ -5992,7 +6083,7 @@ test "a shutdown drain ends a queued request with an error, a client disconnect 
     gone.cancel();
     try testing.expect(gone.waitNext() == .done);
     const drained = try sch.submit(params);
-    sch.cancelAllInFlight();
+    sch.beginShutdown();
     // A drained slot never ran: `done` would surface as the default finish reason, `length`.
     try testing.expect(drained.waitNextTimeout(0).? == .err);
     try testing.expect(drained.waitNext() == .err);

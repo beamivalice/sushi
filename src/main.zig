@@ -1242,7 +1242,11 @@ fn runCli(init: std.process.Init) !void {
         serve_cfg.on_ready = if (prompt != null) PromptClient.ready else null;
         serve_cfg.embedded_client = if (bench_run != null) bench_mod.embeddedClient else null;
         serve_cfg.default_force_mtp = mtp_flag == true;
-        try server_mod.serve(io, allocator, params, config, host, port, serve_cfg);
+        server_mod.serve(io, allocator, params, config, host, port, serve_cfg) catch |err| {
+            // A connection thread outlived the shutdown and still holds what main's defers would free.
+            if (err == error.ConnectionsOutliveShutdown) std.process.exit(1);
+            return err;
+        };
         if (prompt_state.err) |err| return err;
         if (bench_run) |r| if (r.err) |err| return err;
     } else {
@@ -1509,7 +1513,11 @@ fn runHeadlessServe(
     // On-demand MLX loads auto-attach an MTP sidecar (MTP is on unless a flag or the
     // file says off), so the MoE force flag has to reach this path too.
     serve_cfg.default_force_mtp = mtp_flag == true;
-    try server_mod.serve(io, allocator, params, stub.config, host, port, serve_cfg);
+    server_mod.serve(io, allocator, params, stub.config, host, port, serve_cfg) catch |err| {
+        // A connection thread outlived the shutdown and still holds what main's defers would free.
+        if (err == error.ConnectionsOutliveShutdown) std.process.exit(1);
+        return err;
+    };
 }
 
 /// Parse a size-style CLI argument: bare integer = bytes, suffix `KB`/`MB`/

@@ -447,8 +447,13 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `[stop]`). The EOS is never pushed or counted, so `Slot.stop_token` / `Generator.stop_token` (set where the stop is
   decided) are the only record of it; a length finish or a disconnect logs nothing.
 - **A slot whose prefill runs is in `Scheduler.prefilling`**, neither `pending` nor `decoding`, so a SIGTERM's
-  `cancelAllInFlight` stops it at the next chunk; it ran a MiMo 512k prefill on past 120 s until SIGKILL.
-- **A shutdown drain is an ERROR, never a finish reason**: `cancelAllInFlight` marks `Slot.shutdown_cancelled`, so the
+  `beginShutdown` stops it at the next chunk; it ran a MiMo 512k prefill on past 120 s until SIGKILL.
+- **A shutdown is a gate, not a sweep**: `beginShutdown` sets `draining` under `queue_mu` in the same hold that cancels
+  the slots, so a submit (one waiting for room too), a cold load, an image encode, an unload and a cache job after it
+  are refused with `error.Shutdown`, and queued loads and encodes fail then, not at `deinit`; with a connection thread
+  still alive past the drain bound `serve` skips the teardown that would free what it holds and returns
+  `error.ConnectionsOutliveShutdown` (the CLI exits 1 on it before its own defers free anything).
+- **A shutdown drain is an ERROR, never a finish reason**: `beginShutdown` marks `Slot.shutdown_cancelled`, so the
   reader gets `.err` (`error.ServerShutdown`, 503 "Server is shutting down") instead of `.done`, whose default
   `finish_reason` is `length` (a queued request logged `0+0 tokens [length]`).
 
