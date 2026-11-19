@@ -1029,7 +1029,9 @@ fn gdnRunYState(route: GdnRoute, tb_requested: u32, q: mlx.mlx_array, k: mlx.mlx
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kern, inputs_vec, config, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
     var yo = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(yo);
     var so = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(so);
     try mlx.check(mlx.mlx_vector_array_get(&yo, outputs_vec, 0));
     try mlx.check(mlx.mlx_vector_array_get(&so, outputs_vec, 1));
     return .{ .y = yo, .state = so };

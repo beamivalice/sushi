@@ -773,6 +773,7 @@ pub fn putRandomBf16(allocator: std.mem.Allocator, map: *std.StringHashMap(mlx.m
     const f = try mlx.newData(data.ptr, shape, .float32);
     defer _ = mlx.mlx_array_free(f);
     var b = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(b);
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
     try mlx.check(mlx.mlx_astype(&b, f, .bfloat16, cpu));

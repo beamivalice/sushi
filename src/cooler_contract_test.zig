@@ -2516,7 +2516,7 @@ test "cooler contract: a served SSD restore refused at any pool buffer site its 
 }
 
 /// Two served requests decoded as rows of one tick through the scheduler, as serve runs them.
-fn servedRows(sv: *Served, prompts: [2][]const u32, n: u32, out: *[2]std.ArrayList(u32)) !void {
+fn servedRows(sv: *Served, prompts: [2][]const u32, n: u32, mtp: bool, out: *[2]std.ArrayList(u32)) !void {
     const scheduler = @import("scheduler.zig");
     const a = testing.allocator;
     const sch = &sv.sch;
@@ -2528,7 +2528,8 @@ fn servedRows(sv: *Served, prompts: [2][]const u32, n: u32, out: *[2]std.ArrayLi
         sch.cleanup_queue.clearRetainingCapacity();
     }
     for (0..2) |i| {
-        slots[i] = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompts[i], .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = n });
+        const head = if (mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
+        slots[i] = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompts[i], .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
         made += 1;
     }
     sch.pending.clearRetainingCapacity();
@@ -2556,10 +2557,13 @@ fn servedRows(sv: *Served, prompts: [2][]const u32, n: u32, out: *[2]std.ArrayLi
     }
     scheduler.cullDecoding(sch);
     if (failed) |e| return e;
+    for (slots) |s| if (s.error_code) |_| return error.RequestFailed;
+    var filled: usize = 0;
+    errdefer for (out[0..filled]) |*o| o.deinit(a);
     for (slots, 0..) |s, i| {
-        if (s.error_code) |_| return error.RequestFailed;
         out[i] = .empty;
         try out[i].appendSlice(a, s.legacy_gen.?.generated_ids.items);
+        filled += 1;
     }
     const hc = &sv.entry.prefix_cache.?;
     hc.flushPendingDisk(arch_handle.trunk(sv.entry.handle.?).s);
@@ -2590,12 +2594,12 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
                 p: [2][]const u32,
                 fn go(q: @This()) anyerror!void {
                     var o: [2]std.ArrayList(u32) = undefined;
-                    try servedRows(q.sv, q.p, 16, &o);
+                    try servedRows(q.sv, q.p, 16, false, &o);
                     for (&o) |*x| x.deinit(testing.allocator);
                 }
             };
             var rows: [2]std.ArrayList(u32) = undefined;
-            try servedRows(&sv, prompts, 16, &rows);
+            try servedRows(&sv, prompts, 16, false, &rows);
             for (&rows, 0..) |*x, i| {
                 defer x.deinit(a);
                 try testing.expectEqualSlices(u32, solo[i].items, x.items);
@@ -2624,7 +2628,7 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
                 errdefer std.debug.print("cooler contract: rows point {d} of {d}\n", .{ at, points.len });
                 mlx.engine.fault.armAt(pt);
                 var o: [2]std.ArrayList(u32) = undefined;
-                const r = servedRows(&sv, prompts, 16, &o);
+                const r = servedRows(&sv, prompts, 16, false, &o);
                 mlx.engine.fault.disarm();
                 if (r) |_| {
                     for (&o, 0..) |*x, i| {
@@ -2634,7 +2638,7 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
                 } else |_| _ = mlx.takeError(&msg);
                 try testing.expect(!mlx.errorPending());
                 var o2: [2]std.ArrayList(u32) = undefined;
-                try servedRows(&sv, prompts, 16, &o2);
+                try servedRows(&sv, prompts, 16, false, &o2);
                 for (&o2, 0..) |*x, i| {
                     defer x.deinit(a);
                     try testing.expectEqualSlices(u32, solo[i].items, x.items);
@@ -2770,6 +2774,82 @@ test "cooler contract: a DeepSeek request committed after another took the state
             const was = .{ live.ready, live.tokens.len, live.points.items.len };
             scheduler.commitSlotIfApplicable(sch, first);
             try testing.expectEqual(was, .{ live.ready, live.tokens.len, live.points.items.len });
+        }
+    }.run);
+}
+
+test "cooler contract: speculative rows failed at any checked MLX call site their solo plain requests lack, at its first call or its last, leave the next rows their solo tokens and the pool as it was" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            const depth_bounds = @import("mtp_depth_bounds.zig");
+            const saved = depth_bounds.active;
+            defer depth_bounds.active = saved;
+            depth_bounds.active = .{ .min = 3, .max = 3 };
+            var p1: [37]u32 = undefined;
+            for (&p1, 0..) |*t, i| t.* = ids[(i * 3) % ids.len];
+            const prompts = [2][]const u32{ ids[0..@min(ids.len, 23)], &p1 };
+            var solo: [2]std.ArrayList(u32) = undefined;
+            for (0..2) |i| {
+                var f: u32 = 0;
+                solo[i] = try sv.request(prompts[i], 12, &f);
+            }
+            defer for (&solo) |*s| s.deinit(a);
+            const Rows = struct {
+                sv: *Served,
+                p: [2][]const u32,
+                mtp: bool,
+                fn go(q: @This()) anyerror!void {
+                    var o: [2]std.ArrayList(u32) = undefined;
+                    try servedRows(q.sv, q.p, 12, q.mtp, &o);
+                    for (&o) |*x| x.deinit(testing.allocator);
+                }
+            };
+            // A site the plain rows reach is the plain request's sweep's; the speculative ones are swept here, at
+            // their last call too, where an array made by an earlier call of the step is still held.
+            const sites = &mlx.fault.sites;
+            defer sites.* = .{};
+            const plain = try mlx.sweepSites(a, sites, Rows{ .sv = &sv, .p = prompts, .mtp = false }, Rows.go);
+            defer a.free(plain);
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            for (plain) |pt| try seen.put(a, pt.site, {});
+            sites.* = .{ .lasts = true };
+            const all = try mlx.sweepSites(a, sites, Rows{ .sv = &sv, .p = prompts, .mtp = true }, Rows.go);
+            defer a.free(all);
+            sv.quiet_failures = true;
+            const base = Sheet.now();
+            var msg: [300]u8 = undefined;
+            for (all, 0..) |pt, at| {
+                if (seen.contains(pt.site)) continue;
+                errdefer std.debug.print("cooler contract: speculative rows failed at MLX point {d} of {d} (call {d} of its site)\n", .{ at, all.len, pt.n });
+                sites.armAt(pt);
+                var o: [2]std.ArrayList(u32) = undefined;
+                const r = servedRows(&sv, prompts, 12, true, &o);
+                mlx.fault.disarm();
+                if (r) |_| {
+                    for (&o, 0..) |*x, i| {
+                        defer x.deinit(a);
+                        try testing.expectEqualSlices(u32, solo[i].items, x.items);
+                    }
+                } else |_| _ = mlx.takeError(&msg);
+                try testing.expect(!mlx.errorPending());
+                var o2: [2]std.ArrayList(u32) = undefined;
+                try servedRows(&sv, prompts, 12, true, &o2);
+                for (&o2, 0..) |*x, i| {
+                    defer x.deinit(a);
+                    try testing.expectEqualSlices(u32, solo[i].items, x.items);
+                }
+                const now = Sheet.now();
+                try testing.expectEqual(base.in_use, now.in_use);
+                try testing.expectEqual(@as(u64, 0), now.open);
+            }
         }
     }.run);
 }

@@ -309,12 +309,18 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
     errdefer allocator.free(drafts);
     @memcpy(drafts, got.?.draft[0..k]);
     var draft_arrs: [mtp_mod.MAX_DEPTH]mlx.mlx_array = undefined;
+    var made: usize = 0;
+    errdefer for (draft_arrs[0..made]) |arr| {
+        _ = mlx.mlx_array_free(arr);
+    };
     const one = [_]c_int{1};
     for (drafts, draft_arrs[0..k]) |d, *arr| {
         const v: i32 = @intCast(d);
         arr.* = try mlx.newData(&v, &one, .int32);
+        made += 1;
     }
     const t1_i32: i32 = @intCast(t1);
+    const t1_arr = try mlx.newData(&t1_i32, &one, .int32);
     var lplan = plan;
     lplan.m_lo = k;
     lplan.m_hi = k;
@@ -324,7 +330,7 @@ pub fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpR
         .off0 = mtpRoundOff0(self.mtp_hist_stash, self.mtp_cache.?.step()),
         .head_input_rows = 0,
         .t1 = t1,
-        .t1_arr = try mlx.newData(&t1_i32, &one, .int32),
+        .t1_arr = t1_arr,
         .drafts = drafts,
         .draft_arrs = draft_arrs,
         .n_drafted = k,

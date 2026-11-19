@@ -490,15 +490,15 @@ fn rowsOf(arr: mlx.mlx_array, from: c_int, to: c_int, s: mlx.mlx_stream) !mlx.ml
 /// The state serial decode holds after the first `rows` verify rows. `conv_input` is the verify's
 /// convolution input [1, 3 + R, C].
 pub fn replayState(rep: Replay, conv_input: mlx.mlx_array, rows: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const parts = [_]mlx.mlx_array{
-        try rowsOf(conv_input, 0, 3, s),
-        try rowsOf(conv_input, 3, 3 + rows, s),
-        try rowsOf(rep.a, 0, rows, s),
-        try rowsOf(rep.b, 0, rows, s),
-    };
-    defer for (parts) |p| {
+    // Slot by slot behind the defer: a literal of `try`s owns nothing until its last one returns.
+    var parts: [4]mlx.mlx_array = @splat(.{ .ctx = null });
+    defer for (parts) |p| if (p.ctx != null) {
         _ = mlx.mlx_array_free(p);
     };
+    parts[0] = try rowsOf(conv_input, 0, 3, s);
+    parts[1] = try rowsOf(conv_input, 3, 3 + rows, s);
+    parts[2] = try rowsOf(rep.a, 0, rows, s);
+    parts[3] = try rowsOf(rep.b, 0, rows, s);
     const in = Inputs{
         .qkv = parts[1],
         .a = parts[2],

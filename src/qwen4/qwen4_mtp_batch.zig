@@ -41,24 +41,21 @@ pub fn build(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32
                 g.mtp_hist_stash = null;
                 defer stash.deinit();
                 try qwen4_forward.qwen4MtpTruncateOn(qref.t, st, stash.off0);
-                var mids = mlx.mlx_array_new();
-                var mh = mlx.mlx_array_new();
-                {
-                    const idv = mlx.mlx_vector_array_new();
-                    defer _ = mlx.mlx_vector_array_free(idv);
-                    _ = mlx.mlx_vector_array_append_value(idv, stash.ids);
-                    _ = mlx.mlx_vector_array_append_value(idv, prev_tok_arr);
-                    try mlx.check(mlx.mlx_concatenate_axis(&mids, idv, 0, xfm.s));
-                    const hv = mlx.mlx_vector_array_new();
-                    defer _ = mlx.mlx_vector_array_free(hv);
-                    _ = mlx.mlx_vector_array_append_value(hv, stash.hidden);
-                    _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
-                    try mlx.check(mlx.mlx_concatenate_axis(&mh, hv, 1, xfm.s));
-                }
-                merged_ids[k] = mids;
-                merged_hidden[k] = mh;
+                // Owned before the first call that can fail: the step's defer frees them on any error.
+                merged_ids[k] = mlx.mlx_array_new();
                 own_ids[k] = true;
+                merged_hidden[k] = mlx.mlx_array_new();
                 own_h[k] = true;
+                const idv = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(idv);
+                _ = mlx.mlx_vector_array_append_value(idv, stash.ids);
+                _ = mlx.mlx_vector_array_append_value(idv, prev_tok_arr);
+                try mlx.check(mlx.mlx_concatenate_axis(&merged_ids[k], idv, 0, xfm.s));
+                const hv = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(hv);
+                _ = mlx.mlx_vector_array_append_value(hv, stash.hidden);
+                _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
+                try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden[k], hv, 1, xfm.s));
             } else {
                 merged_ids[k] = prev_tok_arr;
                 merged_hidden[k] = h_prev_arg;
@@ -98,9 +95,10 @@ pub fn build(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32
                 defer _ = mlx.mlx_array_free(ids);
                 for (chains, 0..) |*c, k| {
                     const k_c: c_int = @intCast(k);
-                    var one = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_slice(&one, ids, &[_]c_int{ k_c, 0 }, 2, &[_]c_int{ k_c + 1, 1 }, 2, &[_]c_int{ 1, 1 }, 2, xfm.s));
-                    c.draft_arrs[i] = one;
+                    // The chain's deinit frees [0, n_drafted): counted before the call that can fail.
+                    c.draft_arrs[i] = mlx.mlx_array_new();
+                    c.n_drafted = i + 1;
+                    try mlx.check(mlx.mlx_slice(&c.draft_arrs[i], ids, &[_]c_int{ k_c, 0 }, 2, &[_]c_int{ k_c + 1, 1 }, 2, &[_]c_int{ 1, 1 }, 2, xfm.s));
                 }
             }
             for (chains, 0..) |*c, k| {

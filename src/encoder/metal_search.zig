@@ -692,8 +692,11 @@ pub const Search = struct {
             try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, s));
             if (mlx.mlx_vector_array_size(outputs_vec) != 4) return error.MetalKernelBadOutputCount;
 
+            // This launch's pair until `made` counts it, when the loop's errdefer takes over.
             var q_arr = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(q_arr);
             var idx_arr = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(idx_arr);
             try mlx.check(mlx.mlx_vector_array_get(&q_arr, outputs_vec, 0));
             try mlx.check(mlx.mlx_vector_array_get(&idx_arr, outputs_vec, 1));
             launches[made] = .{ .start = start, .count = count, .q = q_arr, .idx = idx_arr };

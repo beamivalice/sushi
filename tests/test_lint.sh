@@ -383,6 +383,23 @@ printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn f(x: mlx.mlx_array) !mlx.mlx
   && printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn k(x: mlx.mlx_array) !mlx.mlx_array {' '    var out = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_sigmoid(&out, x, null));' '    return out;' '}' > "$TMP/t/src/p_test.zig"
 expect_green "a guarded returned handle, a deferred local, a return with no try, and a _test file"
 
+# rule array-unowned-across-try
+tree
+printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn f(x: mlx.mlx_array, out: *mlx.mlx_array) !void {' '    var m = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_sigmoid(&m, x, null));' '    try mlx.check(mlx.mlx_array_eval(m));' '    out.* = m;' '}' \
+  'fn g(x: mlx.mlx_array) !mlx.mlx_array {' '    const parts = [_]mlx.mlx_array{' '        try h(x),' '        try h(x),' '    };' '    return parts[0];' '}' 'fn h(x: mlx.mlx_array) !mlx.mlx_array {' '    return x;' '}' > "$TMP/t/src/p.zig"
+expect_red "a filled local across a later try" "src/p.zig:5:5 \[array-unowned-across-try\] f: 'm' holds a filled array across this try"
+expect_red "an array literal of several trys" "src/p.zig:11:9 \[array-unowned-across-try\] g: an array literal of mlx arrays made by several trys"
+
+tree
+printf '%s\n' 'const mlx = @import("mlx.zig");' 'const Sc = struct {' '    fn keep(_: Sc, x: mlx.mlx_array) !mlx.mlx_array {' '        return x;' '    }' '    fn res(_: Sc, rc: c_int, o: *const mlx.mlx_array) !mlx.mlx_array {' '        try mlx.check(rc);' '        return o.*;' '    }' '};' \
+  'fn f(x: mlx.mlx_array, out: *mlx.mlx_array) !void {' '    var m = mlx.mlx_array_new();' '    errdefer _ = mlx.mlx_array_free(m);' '    try mlx.check(mlx.mlx_sigmoid(&m, x, null));' '    try mlx.check(mlx.mlx_array_eval(m));' '    out.* = m;' '}' \
+  'fn g(x: mlx.mlx_array, out: *mlx.mlx_array, sc: Sc) !void {' '    var a = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_sigmoid(&a, x, null));' '    out.* = a;' '    try mlx.check(mlx.mlx_array_eval(x));' \
+  '    var b = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_sigmoid(&b, x, null));' '    _ = try sc.keep(b);' \
+  '    var c = mlx.mlx_array_new();' '    const r = try sc.res(mlx.mlx_sigmoid(&c, x, null), &c);' '    try mlx.check(mlx.mlx_array_eval(r));' '}' \
+  'fn h(x: mlx.mlx_array, out: *mlx.mlx_array, wide: bool) !void {' '    var d = mlx.mlx_array_new();' '    if (wide) try mlx.check(mlx.mlx_sigmoid(&d, x, null)) else try mlx.check(mlx.mlx_exp(&d, x, null));' '    out.* = d;' '}' > "$TMP/t/src/p.zig" \
+  && printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn k(x: mlx.mlx_array) !void {' '    var m = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_sigmoid(&m, x, null));' '    try mlx.check(mlx.mlx_array_eval(m));' '}' > "$TMP/t/src/p_test.zig"
+expect_green "a guarded local, a hand-off before the try, a scope's keep and res, fills on two branches, and a _test file"
+
 # rule json-unchecked-shape
 tree
 printf '%s\n' 'const std = @import("std");' 'pub fn f(parsed: std.json.Parsed(std.json.Value)) ?std.json.Value {' '    const root = parsed.value.object;' \

@@ -465,6 +465,7 @@ pub fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: boo
         try scaleTriple(&out.inject_w, &out.inject_s, &out.inject_b, inv_hc, owned_bf16, allocator, s);
         if (out.inject_s.ctx == null) {
             var flat = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(flat);
             try mlx.check(mlx.mlx_contiguous(&flat, out.inject_w, false, s));
             try mlx.check(mlx.mlx_array_eval(flat));
             try owned_bf16.append(allocator, flat);
@@ -1081,6 +1082,7 @@ pub fn splitFusedQkvAsymRows(
         } else {
             try mlx.check(mlx.mlx_contiguous(&part, view, false, s));
         }
+        errdefer _ = mlx.mlx_array_free(part);
         try owned.append(allocator, part);
         out[i] = part;
     }

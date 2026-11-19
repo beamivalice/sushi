@@ -178,6 +178,9 @@ route and the MLX arm still build the bank at prepare time.
 - **A call that takes a handle takes it on every path, an error's too** (`Trunk.spliceVisionRows`): taken only on
   success, each caller owed an `errdefer`, and the warm's image splice had none, so a Cooler load refused there kept a
   pool buffer. A handle such a call takes is made last, just before it.
+- **An array a checked call filled has an owner before the next `try`** (an `errdefer`, a hand-off, an owner's slot):
+  a later failure leaves it in the pool for the process. Lint rule `array-unowned-across-try`; pinned by the
+  contract's `speculative rows failed at any checked MLX call site ... at its first call or its last`.
 - A kernel, its config and its lists of names made while the engine is on are objects of the engine's (tagged
   handles), so making and filling them calls nothing in mlx-c. A module keeps the kernels and configs it builds and
   may launch one on MLX's side later: MLX's kernel and config (the twins) are made at that first launch, the config

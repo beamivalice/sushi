@@ -83,8 +83,11 @@ pub fn standinOnes(shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
         _ = mlx.mlx_array_free(a);
     }
     var a = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_ones(&a, shape.ptr, @intCast(shape.len), .bfloat16, s));
-    try mlx.check(mlx.mlx_array_eval(a));
+    {
+        errdefer _ = mlx.mlx_array_free(a);
+        try mlx.check(mlx.mlx_ones(&a, shape.ptr, @intCast(shape.len), .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(a));
+    }
     standin_ones = a;
     var r = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(r);

@@ -4146,19 +4146,25 @@ pub const Trunk = struct {
             defer _ = mlx.mlx_array_free(ar);
             try mlx.check(mlx.mlx_arange(&ar, 0, @floatFromInt(k), 1, mlx.mlx_array_dtype(inds), self.s));
             var fixed = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(fixed);
             try mlx.check(mlx.mlx_broadcast_to(&fixed, ar, ish.ptr, @intCast(ish.len), self.s));
             var fixed_c = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_contiguous(&fixed_c, fixed, false, self.s));
-            _ = mlx.mlx_array_free(fixed);
-            try mlx.check(mlx.mlx_array_eval(fixed_c));
+            {
+                errdefer _ = mlx.mlx_array_free(fixed_c);
+                try mlx.check(mlx.mlx_contiguous(&fixed_c, fixed, false, self.s));
+                try mlx.check(mlx.mlx_array_eval(fixed_c));
+            }
             _ = mlx.mlx_array_free(inds);
             inds = fixed_c;
             const ssh = mlx.getShape(norm_scores);
-            var uni = mlx.mlx_array_new();
             const one_k = try scalarOf(1.0 / @as(f32, @floatFromInt(k)), mlx.mlx_array_dtype(norm_scores), self.s);
             defer _ = mlx.mlx_array_free(one_k);
-            try mlx.check(mlx.mlx_full(&uni, ssh.ptr, @intCast(ssh.len), one_k, mlx.mlx_array_dtype(norm_scores), self.s));
-            try mlx.check(mlx.mlx_array_eval(uni));
+            var uni = mlx.mlx_array_new();
+            {
+                errdefer _ = mlx.mlx_array_free(uni);
+                try mlx.check(mlx.mlx_full(&uni, ssh.ptr, @intCast(ssh.len), one_k, mlx.mlx_array_dtype(norm_scores), self.s));
+                try mlx.check(mlx.mlx_array_eval(uni));
+            }
             _ = mlx.mlx_array_free(norm_scores);
             norm_scores = uni;
         }
@@ -4558,12 +4564,12 @@ pub const Trunk = struct {
         const mask_scalars = try self.maskScalars();
         defer mask_scalars.deinit();
         var mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mask);
         try mlx.check(mlx.mlx_where(&mask, bool_upper, mask_scalars.neg_inf, mask_scalars.zero, self.s));
         const mask_shape = [_]c_int{ 1, 1, q_len, kv_len };
         var mask_4d = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(mask_4d);
         try mlx.check(mlx.mlx_reshape(&mask_4d, mask, &mask_shape, 4, self.s));
-        _ = mlx.mlx_array_free(mask);
         return mask_4d;
     }
 
@@ -4890,6 +4896,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                 // Routing is f32 (`arch_moe.routerLogits`): widen once here rather than per forward.
                 if (arch_moe.widensRouter(&config) and mw.router_s.ctx == null and mlx.mlx_array_dtype(mw.router_w) != .float32) {
                     var w32 = mlx.mlx_array_new();
+                    errdefer _ = mlx.mlx_array_free(w32);
                     try mlx.check(mlx.mlx_astype(&w32, mw.router_w, .float32, s));
                     try owned_bf16.append(allocator, w32);
                     mw.router_w = w32;
@@ -4975,6 +4982,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                         defer _ = mlx.mlx_array_free(flat);
                         try mlx.check(mlx.mlx_reshape(&flat, seg_w_ptr.*, &[_]c_int{@intCast(config.hidden_size)}, 1, s));
                         var vec = mlx.mlx_array_new();
+                        errdefer _ = mlx.mlx_array_free(vec);
                         try mlx.check(mlx.mlx_contiguous(&vec, flat, false, s));
                         try owned_bf16.append(allocator, vec);
                         mw.shared_gate_vec = vec;

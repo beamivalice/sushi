@@ -1254,6 +1254,7 @@ pub const RerankFixture = struct {
         const f32_arr = try mlx.newData(buf.ptr, &shape, .float32);
         defer _ = mlx.mlx_array_free(f32_arr);
         var dense = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(dense);
         try mlx.check(mlx.mlx_astype(&dense, f32_arr, .bfloat16, s));
 
         var qv = mlx.mlx_vector_array_new();
