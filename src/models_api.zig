@@ -627,7 +627,7 @@ pub fn handleModels(allocator: std.mem.Allocator, stream: *Conn) !void {
     // does NOT route through `scheduler.ensureLoaded` — listing metadata
     // shouldn't trigger a cold load of the default model.
     const registry = server_state.global_registry orelse {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
 
@@ -673,7 +673,7 @@ pub fn handleModels(allocator: std.mem.Allocator, stream: *Conn) !void {
 /// `GET /v1/models/{id}` (OpenAI's retrieve): the one registry row `handleModels` lists, or a 404.
 pub fn handleModelGet(allocator: std.mem.Allocator, stream: *Conn, raw_id: []const u8) !void {
     const registry = server_state.global_registry orelse {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
     var id_buf: [512]u8 = undefined;
@@ -699,7 +699,7 @@ pub fn handleModelGet(allocator: std.mem.Allocator, stream: *Conn, raw_id: []con
 /// new dirs and clear failed loads (`ModelRegistry.rescan`). Answers `{"added":N}`.
 pub fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
     const registry = server_state.global_registry orelse {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
     const added = registry.rescan() catch |err| {

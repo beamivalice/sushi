@@ -345,7 +345,7 @@ test "only a streamed load whose tower is off by default names --vision in its m
 /// surface's error sender ships.
 pub const MediaFault = struct {
     server_error: bool = false,
-    buf: [320]u8 = undefined,
+    buf: [640]u8 = undefined,
     len: usize = 0,
 
     pub fn init(server_error: bool, comptime fmt: []const u8, args: anytype) MediaFault {
@@ -1492,7 +1492,10 @@ test "towerFitFault refuses an encode whose scratch does not fit, naming both si
     const need = arch_media.scratchBytes(&config, 8100);
     try std.testing.expect(need > 4 * (1 << 30));
     const fault = towerFitFault(&config, &shot, &.{}, 2041, need / 2) orelse return error.TestExpectedRefusal;
-    try std.testing.expect(std.mem.indexOf(u8, fault.text(), "8100 patches") != null);
+    errdefer std.debug.print("{s}\n", .{fault.text()});
+    try std.testing.expect(std.mem.startsWith(u8, fault.text(), "This image or video needs "));
+    try std.testing.expect(std.mem.indexOf(u8, fault.text(), "\n- Send a smaller image or a shorter video") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fault.text(), "\n- Quit other apps or unload another model") != null);
     try std.testing.expect(!fault.server_error);
     try std.testing.expect(towerFitFault(&config, &shot, &.{}, 2041, need * 2) == null);
     // A tower this check does not model is not refused by it.

@@ -671,7 +671,7 @@ fn collectRows(allocator: std.mem.Allocator, registry: *model_registry_mod.Model
 
 pub fn handleGet(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
     const registry = server_state.global_registry orelse {
-        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -712,7 +712,7 @@ fn refusalMessage(arena: std.mem.Allocator, fit: model_settings.Fit, existing: ?
 
 pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
     const sch = server_state.global_scheduler orelse {
-        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
     var arena_state = std.heap.ArenaAllocator.init(allocator);

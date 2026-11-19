@@ -316,7 +316,7 @@ fn cacheRoot(allocator: std.mem.Allocator) ![]u8 {
 
 pub fn handleList(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
     const registry = server_state.global_registry orelse {
-        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
     const root = cacheRoot(allocator) catch {
@@ -366,7 +366,7 @@ pub fn parseScope(name: []const u8) ?Scope {
 
 pub fn handleClear(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
     const sch = server_state.global_scheduler orelse {
-        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+        try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, request_body, .{}) catch {
@@ -421,11 +421,11 @@ pub fn handleClear(allocator: std.mem.Allocator, stream: *http_conn.Conn, reques
         };
         const entry = sch.registry.resolveEntry(id) catch |err| {
             const no_default = err == error.NoDefaultModel;
-            try http.sendErrorResponse(allocator, stream, if (no_default) "503 Service Unavailable" else "404 Not Found", if (no_default) "no_model" else "model_not_found", if (no_default) "No default model configured" else "Unknown model id", if (no_default) 503 else 404);
+            try http.sendErrorResponse(allocator, stream, if (no_default) "503 Service Unavailable" else "404 Not Found", if (no_default) "no_model" else "model_not_found", if (no_default) http.no_model_message else "Unknown model id", if (no_default) 503 else 404);
             return;
         };
         const r = sch.prefixAdmin(.{ .entry = entry }) catch {
-            try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+            try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", http.shutting_down_message, 503);
             return;
         };
         switch (r.outcome) {

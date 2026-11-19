@@ -106,14 +106,14 @@ fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
 }
 
 /// The message `error.TransientCapExceeded` sends: MLX refused an allocation past the transient memory cap.
-const TRANSIENT_CAP_MSG = "The request needed more transient GPU memory than the engine's cap allows and was abandoned. The server is still running. Reduce the prompt length or the image size.";
+const TRANSIENT_CAP_MSG = "This request ran out of GPU memory while it ran and was stopped; the server is still running.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Lower max_tokens or shorten the prompt: a smaller request needs less memory.";
 
 /// The message `error.PrefillDoesNotFit` sends: refused before its first forward by the same
 /// estimator the guard uses, re-asked after the hot cache gave back everything it could.
-pub const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
+pub const PREFILL_NOFIT_MSG = "This request does not fit in GPU memory, even with the prefix cache emptied; nothing ran.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Lower max_tokens or shorten the prompt.\n- Use a smaller pack of this model.";
 
 /// The message `error.PrefillChunkDoesNotFit` sends when the arch left no text of its own.
-pub const PREFILL_CHUNK_NOFIT_MSG = "This prompt ran out of GPU memory partway through its prefill. Lower --prefill-chunk, retry when other requests finish, or shorten the prompt; the server log quotes the figures.";
+pub const PREFILL_CHUNK_NOFIT_MSG = "This prompt ran out of GPU memory partway through reading it.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Shorten the prompt.\n- Restart sushi with a smaller --prefill-chunk (a launch flag; Settings has none): a narrower chunk needs less memory.";
 
 /// The message `error.EmptyPrompt` sends: generation continues from the prompt's last token.
 pub const EMPTY_PROMPT_MSG = "The prompt tokenizes to zero tokens; send non-empty text to continue.";
@@ -208,7 +208,7 @@ pub fn mapGenerationError(allocator: std.mem.Allocator, err: anyerror) !GenError
             .code = 503,
             .openai_type = "server_error",
             .anthropic_type = "api_error",
-            .message = "Server is shutting down",
+            .message = http.shutting_down_message,
         },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
@@ -2231,6 +2231,21 @@ pub fn loadRefusalMessage(allocator: std.mem.Allocator, err: anyerror, refusal: 
     return allocator.dupe(u8, refusal.message);
 }
 
+test "a request refused for memory with no text of its own gets the actions that can help it, one per line" {
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.TransientCapExceeded, error.GenerationOutOfMemory, error.PrefillDoesNotFit, error.PrefillChunkDoesNotFit }) |e| {
+        const w = try mapGenerationError(a, e);
+        defer w.deinit(a);
+        errdefer std.debug.print("{s}: {s}\n", .{ @errorName(e), w.message });
+        try std.testing.expect(std.mem.indexOf(u8, w.message, "\n- Quit other apps or unload another model") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w.message, "max_tokens") != null or std.mem.indexOf(u8, w.message, "prompt") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w.message, "cap allows") == null and std.mem.indexOf(u8, w.message, "image size") == null);
+    }
+    const shut = try mapGenerationError(a, error.ServerShutdown);
+    defer shut.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, shut.message, "retry") != null);
+}
+
 test "a prefill chunk refused mid-request for memory answers 503 with the arch's whole text, not the admission refusal" {
     const text = "This prompt ran out of GPU memory partway through its prefill.\nIts 2048-token chunk, tokens 4096 to 6144, needs 5.00 GB, and the free memory with every expert-cache pool the prefill can borrow holds 4.50 GB: about 0.5 GB short. The chunks before it ran.\nTo serve it:\n- Lower --prefill-chunk to 1024: a narrower chunk needs less memory at this length.\n- Retry when other requests finish or other apps quit: the memory they hold comes back.\n- Shorten the prompt to 4096 tokens or fewer: the chunks up to there fit.";
     forward_refusal_mod.record(text);
@@ -2601,7 +2616,7 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         defer w.deinit(a);
         try t.expectEqual(@as(u32, 503), w.code);
         try t.expectEqualStrings("server_error", w.openai_type);
-        try t.expectEqualStrings("Server is shutting down", w.message);
+        try t.expectEqualStrings(http.shutting_down_message, w.message);
     }
     {
         const w = try mapGenerationError(a, error.GenerationFailed);
@@ -2621,24 +2636,27 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
     {
         const w = try mapGenerationError(a, error.GenerationOutOfMemory);
         defer w.deinit(a);
+        const quoted = try http.jsonEscape(a, GEN_OOM_MSG);
+        defer a.free(quoted);
+        const escaped = quoted[1 .. quoted.len - 1];
         const body = try buildOpenAiStreamError(a, w);
         defer a.free(body);
         try t.expect(std.mem.indexOf(u8, body, "\"type\":\"server_error\"") != null);
         try t.expect(std.mem.indexOf(u8, body, "\"code\":503") != null);
-        try t.expect(std.mem.indexOf(u8, body, GEN_OOM_MSG) != null);
+        try t.expect(std.mem.indexOf(u8, body, escaped) != null);
         try t.expect(std.mem.indexOf(u8, body, "\"finish_reason\":\"error\"") != null);
 
         const anth = try buildAnthropicStreamError(a, w);
         defer a.free(anth);
         try t.expect(std.mem.indexOf(u8, anth, "\"type\":\"error\"") != null);
         try t.expect(std.mem.indexOf(u8, anth, "\"type\":\"api_error\"") != null);
-        try t.expect(std.mem.indexOf(u8, anth, GEN_OOM_MSG) != null);
+        try t.expect(std.mem.indexOf(u8, anth, escaped) != null);
 
         const resp = try buildResponsesStreamError(a, w);
         defer a.free(resp);
         try t.expect(std.mem.indexOf(u8, resp, "\"type\":\"error\"") != null);
         try t.expect(std.mem.indexOf(u8, resp, "\"code\":\"server_error\"") != null);
-        try t.expect(std.mem.indexOf(u8, resp, GEN_OOM_MSG) != null);
+        try t.expect(std.mem.indexOf(u8, resp, escaped) != null);
     }
 }
 

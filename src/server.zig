@@ -1182,7 +1182,7 @@ pub fn handleConnection(
     // default model for everything (only one is loaded), but the plumbing
     // is in place for Phase D's hot-load path.
     const registry = server_state.global_registry orelse {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Server not ready", 503);
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
     const raw = (try http_conn.readRequestWithin(allocator, stream, REQUEST_READ_LIMIT_MS)) orelse return;
@@ -1410,7 +1410,7 @@ pub fn handleConnection(
     //    intentional; clients targeting an unloaded model should set a
     //    longer request timeout (or hit /v1/load-model first).
     const scheduler = server_state.global_scheduler orelse {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
     // Strip whatever the client passed in `"model":"..."` — except when the
@@ -1506,7 +1506,7 @@ pub fn handleConnection(
             return;
         },
         error.NotLoaded => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", "Requested model is not currently loaded", 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", http.model_not_loaded_message, 503);
             return;
         },
         error.NoDefaultModel => {
@@ -1517,7 +1517,7 @@ pub fn handleConnection(
                 try models_api.handlePropsNoModel(allocator, stream);
                 return;
             }
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", http.no_model_message, 503);
             return;
         },
         error.LoadFailed => {
@@ -1525,7 +1525,7 @@ pub fn handleConnection(
             return;
         },
         error.Shutdown => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", http.shutting_down_message, 503);
             return;
         },
         // Other errors (CPU-side preload failures like FileNotFound on a
@@ -1697,7 +1697,7 @@ test "Sushi quant memory request refusal carries the actual KV width MTP and max
 
 
 /// The message `error.GenerationOutOfMemory` sends on every surface and both paths.
-pub const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
+pub const GEN_OOM_MSG = "This request ran out of GPU memory and was stopped; the server is still running.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Lower max_tokens or shorten the prompt: a smaller request needs less memory.";
 
 /// `fitAfterUnloadingIdle`'s context for one request: each unload re-bills the same prompt.
 const IdleUnloadFit = struct {
@@ -1857,7 +1857,7 @@ pub fn modelQuantizationLabel(allocator: std.mem.Allocator, config: *const model
 /// scheduler.ensureLoaded so eviction/back-pressure kicks in.
 fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
     const scheduler = server_state.global_scheduler orelse {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
     // Parse the model field with std.json (NOT the quick scanner): clients
@@ -1892,7 +1892,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
     // proceeds under the directory-basename id.
     if (std.mem.startsWith(u8, requested_id, "/")) {
         const registry = server_state.global_registry orelse {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
             return;
         };
         requested_id = registry.registerByPath(stream.io, requested_id) catch |err| switch (err) {
@@ -1917,11 +1917,11 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
             return;
         },
         error.NotLoaded => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", "Requested model is not currently loaded", 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", http.model_not_loaded_message, 503);
             return;
         },
         error.NoDefaultModel => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", http.no_model_message, 503);
             return;
         },
         error.LoadFailed => {
@@ -2023,7 +2023,7 @@ test "an unload body naming an unrecognised key is a 400, not the default model"
 /// small status payload confirming the model is unloaded.
 fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
     const scheduler = server_state.global_scheduler orelse {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
     // Parse the model id with std.json (handles '\/'-escaped absolute paths
@@ -2060,11 +2060,11 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn
             return;
         },
         error.NoDefaultModel => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", http.no_model_message, 503);
             return;
         },
         error.Shutdown => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", http.shutting_down_message, 503);
             return;
         },
         error.ModelBusy => {
@@ -3409,9 +3409,8 @@ pub fn towerFitFault(config: *const model_mod.ModelConfig, images: []const chat_
     const worst = bill.largest_group_patches;
     const needed = bill.bytes;
     if (needed <= available) return null;
-    const mb: u64 = 1024 * 1024;
-    // The need rounds up and what is free down: a refusal never reads as fitting.
-    return request_media.MediaFault.init(false, "encoding the media needs ~{d} MB of GPU memory (its largest block has {d} patches), ~{d} MB is available", .{ (needed + mb - 1) / mb, worst, available / mb });
+    const u = bills.Mem.unitOf(needed, available);
+    return request_media.MediaFault.init(false, "This image or video needs {f} of GPU memory to encode, and {f} is available (its largest block is {d} patches).\nTo send it:\n- Send a smaller image or a shorter video, or fewer at once.\n- Quit other apps or unload another model on the Models page, then retry.", .{ bills.Mem.need(needed, u), bills.Mem.have(available, u), worst });
 }
 
 /// Qwen3-VL interleaved M-RoPE position-id table for a request. `pos` (owned) is

@@ -137,7 +137,7 @@ test('every plain-worded chat label keeps its engineering name in the tooltip', 
 });
 
 test('a refused request shows the server reason and what to do next, not a bare status code', async ({ browser }) => {
-  const cases = [[503, 'Requested model is not currently loaded', /on Models/], [400, 'Prompt does not fit', /new chat|settings/i], [500, 'boom', /server log/]];
+  const cases = [[503, 'The requested model is not loaded: load it on the Models page, then retry.', /on the Models page/], [400, 'Not enough GPU memory for this request: with a 9-token prompt and max_tokens 100 it needs 636 MB, and 635 MB is available.\nmax_tokens 40 fits: lower max_tokens to 40 or less, shorten the prompt, or free memory (quit other apps or unload another model).', /lower max_tokens/], [500, 'boom', /server log/]];
   for (const [status, message, next] of cases) {
     const stub = await startStub({ chat: (req, res) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message } })); } });
     const { page, context } = await open(browser, stub);

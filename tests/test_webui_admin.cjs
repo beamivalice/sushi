@@ -150,7 +150,13 @@ const body = JSON.stringify({ error: { message: refused, type: 'out_of_memory', 
 assert.equal(page.loadFailureText(page.adminErrorText(new Error(`503 ${body}`))), refused);
 vm.runInContext(main.slice(main.indexOf('function refusalText('), main.indexOf('// A reply that breaks off')), page);
 assert.equal(page.refusalText(503, refused), refused, 'a message with its own actions gets no generic one, and no cut');
-assert.match(page.refusalText(503, 'Model is loading'), /^Model is loading\. Wait for the model to load/);
+// A refusal carries the actions for its own bound: a one-line 400 or 503 reaches the chat as the server wrote it.
+for (const [status, msg] of [[503, 'The server is shutting down: start it again, then retry.'], [503, 'This request ran out of GPU memory while it ran and was stopped.'], [400, 'This image needs 5.0 GB of GPU memory to encode, and 2.9 GB is available.']]) {
+  assert.equal(page.refusalText(status, msg), msg, `${status}: no generic action is added to a refusal`);
+}
+assert.equal(page.refusalText(503, 'no period'), 'no period.');
+assert.match(page.refusalText(500, 'boom'), /^boom\. Retry; if it happens again, check the server log\.$/);
+assert.match(page.refusalText(429, 'busy'), /^busy\. Wait a moment, then Retry\.$/);
 for (const rule of ['.alert span', '.toast', '.chat-error span']) {
   assert.match(source, new RegExp(`\\${rule.replace(' ', ' ')}[^{]*\\{[^}]*white-space: pre-line`), `${rule} shows a message's lines`);
 }

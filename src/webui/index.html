@@ -3101,12 +3101,14 @@ function replyMeta(usage, timings, finishReason, aborted, clientRate, effortNoti
 }
 // The server's reason for a refused request, then what the user can do about it.
 // A server message of several lines carries its own actions; one line gets the status's.
+// A 400 or 503 is a refusal whose text carries the actions for its own bound, so it is shown as the server wrote it.
 function refusalText(status, detail) {
   const why = String(detail ?? "").trim();
   if (why.includes("\n")) return why;
-  const next = { 400: "Check the chat settings, or start a new chat if this one is long.", 404: "Pick another model in Chat settings.", 409: "Wait a moment, then Retry.", 429: "Wait a moment, then Retry.",
-    503: "Wait for the model to load, or unload another model on Models, then Retry." }[status] ?? (status >= 500 ? "Retry; if it happens again, check the server log." : `The server answered with error ${status}.`);
-  return [why && (/[.!?]$/.test(why) ? why : `${why}.`), next].filter(Boolean).join(" ");
+  const sentence = why && (/[.!?]$/.test(why) ? why : `${why}.`);
+  if ((status === 400 || status === 503) && sentence) return sentence;
+  const next = { 404: "Pick another model in Chat settings.", 409: "Wait a moment, then Retry.", 429: "Wait a moment, then Retry." }[status] ?? (status >= 500 ? "Retry; if it happens again, check the server log." : `The server answered with error ${status}.`);
+  return [sentence, next].filter(Boolean).join(" ");
 }
 // A reply that breaks off keeps what already reached the screen, so the turn can save it.
 function interrupted(error, view) {

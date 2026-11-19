@@ -303,15 +303,22 @@ test "ipIsLoopback exempts local addresses only" {
 /// below (#144) — blaming free memory here sends a user quitting apps when
 /// the fix is unloading a model or moving the cap.
 pub const not_enough_memory_message =
-    "Not enough memory to load model: it would exceed the resident-model budget and no loaded model can be evicted. " ++
-    "Unload the model you are chatting with (tray > Models > eject), " ++
-    "or raise or disable the cap with --max-resident-mem <size>|0. " ++
-    "The server log names the exact figures and the current cap.";
+    "Not enough memory to load this model: it would pass the resident-model budget, and every loaded model is in use.\n" ++
+    "To load it:\n" ++
+    "- Unload a model on the Models page (or with Unload in Sushibar), then retry.\n" ++
+    "- Restart sushi with a larger --max-resident-mem <size>, or 0 for none (a launch flag; Settings has none). The server log names the figures and the budget.";
 
 /// The count cap: `--max-resident-models` models are resident and each is serving a request.
 pub const resident_models_cap_message =
-    "Cannot load another model: the --max-resident-models cap is reached and every loaded model is serving a request. " ++
-    "Retry when one finishes, or raise the cap with --max-resident-models <n>. The server log names the cap.";
+    "Cannot load another model: the most models this server keeps loaded (--max-resident-models) are loaded, and each is serving a request.\n" ++
+    "- Retry when one finishes.\n" ++
+    "- Or restart sushi with a larger --max-resident-models <n> (a launch flag; Settings has none).";
+
+/// The one-line 503s: each says what clears it, since the web UI and Sushibar show the server's text as is.
+pub const shutting_down_message = "The server is shutting down: start it again, then retry.";
+pub const model_not_loaded_message = "The requested model is not loaded: load it on the Models page, then retry.";
+pub const no_model_message = "No model is loaded: load one on the Models page, then retry.";
+pub const not_ready_message = "The server is still starting: retry in a moment.";
 
 /// Seconds a client waits before retrying a refusal that clears when a running request ends.
 pub const BUSY_RETRY_AFTER_SECS: u32 = 5;

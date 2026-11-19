@@ -11,6 +11,7 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
   through `light-dark()`; `data-theme` (`system`, `day`, `night`, stored as `sushi-theme`) only sets `color-scheme`.
 - Token names are a contract with the dashboard's charts and any branch that draws in the page: rename none; add new ones.
 - Text keeps WCAG AA (4.5:1) on every surface it sits on in both themes; a focus ring or a chart line keeps 3:1.
+- A 400 or 503 is shown as the server wrote it (`refusalText`): every refusal carries the actions for its own bound, one per line, so the page adds a generic action only to a 404, 409, 429 or other 5xx. Guard: `tests/test_webui_admin.cjs`.
 - A number field never sends or saves a value its own label rules out: the chat's Max tokens, Temperature, Top-p, Top-k, Min-p and Thinking budget flag the field (`aria-invalid` and a message in its label) on input and hold Send; Settings and Models whole-number boxes take digits only (no `1e3`), and a context length under 256 tokens is refused. Guards: `typed generation setting` in `tests/test_webui_chat.cjs`, `tests/test_webui_admin.cjs`.
 - The chat's Thinking budget box takes the picked effort word's cap; emptied, it sends no budget, so the request runs
   under that cap, and its placeholder names it ("2,048 (level cap)" on Qwen's low). It reads "no cap" only for a word
