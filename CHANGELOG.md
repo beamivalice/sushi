@@ -39,7 +39,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A load refusal points only to options it lists**: one that said this Mac cannot give the GPU enough memory told
   the user to "use one of the options below" when it listed none.
 - **A refusal suggests a smaller pack only when one exists**: a request refused for memory always said to use a
-  smaller pack (or a smaller model), and an SSD streaming memory refusal a smaller pack, even on a model's smallest.
+  smaller pack (or a smaller model), and an SSD streaming memory refusal a smaller pack, even on a model's smallest;
+  a message that cannot know the pack no longer suggests one.
 - **A load short of free RAM is refused even if a memory reading fails while it waits**: the preflight waited for
   memory to come back after a short reading, and a failed reading then let the load through.
 - **No command fails silently**: every error that ends a `sushi` command prints a line saying what to do; `sushi kld` on

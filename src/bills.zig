@@ -487,9 +487,10 @@ pub fn userWireWarning(buf: []u8, owned_bytes: u64, limits: [2]u64, wired_limit:
     const u = Mem.unitOf(need, limit);
     const head = "[mem] warning: this load wires {f} but {s} is {f}: prefill will run slower. ";
     const args = .{ Mem.need(need, u), names[bind], Mem.have(limit, u) };
-    // A declared GPU limit that holds the load is the user's choice: the user-wire limits come up to match it.
+    // A declared GPU limit that holds the load is the user's choice: the user-wire limits come up to match it. The wired
+    // bytes span every loaded model, so no one model's smaller pack is offered.
     const mb = if (wired_limit >= need) wired_limit >> 20 else wiredLimitMbThatFits(need, 0, total_ram) orelse
-        return std.fmt.bufPrint(buf, head ++ "This Mac cannot wire that much: use a smaller pack or a lower --ssd-budget-gb", args) catch null;
+        return std.fmt.bufPrint(buf, head ++ "This Mac cannot wire that much: use a lower --ssd-budget-gb", args) catch null;
     var cmd: [192]u8 = undefined;
     return std.fmt.bufPrint(buf, head ++ "Raise it: {s} (resets at reboot)", args ++ .{wireLimitsCommand(&cmd, mb)}) catch null;
 }
@@ -6587,7 +6588,7 @@ test "bill pin: the wire-limit sentences" {
     var cmd: [192]u8 = undefined;
     try std.testing.expectEqualStrings("sudo sysctl iogpu.wired_limit_mb=120000 vm.global_user_wire_limit=125829120000 vm.user_wire_limit=125829120000", wireLimitsCommand(&cmd, 120_000));
     const cannot = userWireWarning(&buf, 117 * pin_gib, .{ 116 * pin_gib, 116 * pin_gib }, 0, 128 * pin_gib).?;
-    try std.testing.expectEqualStrings("[mem] warning: this load wires 118.0 GB but vm.global_user_wire_limit is 116.0 GB: prefill will run slower. This Mac cannot wire that much: use a smaller pack or a lower --ssd-budget-gb", cannot);
+    try std.testing.expectEqualStrings("[mem] warning: this load wires 118.0 GB but vm.global_user_wire_limit is 116.0 GB: prefill will run slower. This Mac cannot wire that much: use a lower --ssd-budget-gb", cannot);
     const raise = userWireWarning(&buf, 100 * pin_gib, .{ 96 * pin_gib, 96 * pin_gib }, 0, 128 * pin_gib).?;
     try std.testing.expectEqualStrings("[mem] warning: this load wires 101.0 GB but vm.global_user_wire_limit is 96.0 GB: prefill will run slower. Raise it: sudo sysctl iogpu.wired_limit_mb=103500 vm.global_user_wire_limit=108527616000 vm.user_wire_limit=108527616000 (resets at reboot)", raise);
     try std.testing.expect(userWireWarning(&buf, 10 * pin_gib, .{ 116 * pin_gib, 116 * pin_gib }, 0, 128 * pin_gib) == null);

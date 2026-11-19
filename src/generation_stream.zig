@@ -108,8 +108,9 @@ fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
 const TRANSIENT_CAP_MSG = "This request ran out of GPU memory while it ran and was stopped; the server is still running.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Lower max_tokens or shorten the prompt: a smaller request needs less memory.";
 
 /// The message `error.PrefillDoesNotFit` sends: refused before its first forward by the same
-/// estimator the guard uses, re-asked after the hot cache gave back everything it could.
-pub const PREFILL_NOFIT_MSG = "This request does not fit in GPU memory, even with the prefix cache emptied; nothing ran.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Lower max_tokens or shorten the prompt.\n- Use a smaller pack of this model.";
+/// estimator the guard uses, re-asked after the hot cache gave back everything it could. It knows no pack, so it
+/// offers none (the context refusal's text does, from the load's stamp).
+pub const PREFILL_NOFIT_MSG = "This request does not fit in GPU memory, even with the prefix cache emptied; nothing ran.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Lower max_tokens or shorten the prompt.";
 
 /// The message `error.PrefillChunkDoesNotFit` sends when the arch left no text of its own.
 pub const PREFILL_CHUNK_NOFIT_MSG = "This prompt ran out of GPU memory partway through reading it.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Shorten the prompt.\n- Restart sushi with a smaller --prefill-chunk (a launch flag; Settings has none): a narrower chunk needs less memory.";
@@ -2135,6 +2136,22 @@ test "streaming layout refusal explains MiMo repacking without assuming Qwen" {
     try std.testing.expect(std.mem.indexOf(u8, budget.message, "--ssd-budget-gb") != null);
 }
 
+test "a fixed refusal text, which knows no pack, offers no smaller pack" {
+    var buf: [384]u8 = undefined;
+    const gib: u64 = 1 << 30;
+    const texts = [_][]const u8{
+        PREFILL_NOFIT_MSG,
+        loadRefusalFor(error.ExpertCacheDoesNotFit).?.message,
+        loadRefusalFor(error.SsdBudgetExceedsWiredLimit).?.message,
+        // Past what this Mac may wire: the process's wired bytes span every loaded model.
+        bills_mod.userWireWarning(&buf, 117 * gib, .{ 116 * gib, 116 * gib }, 0, 128 * gib).?,
+    };
+    for (texts) |text| {
+        errdefer std.debug.print("{s}\n", .{text});
+        try std.testing.expect(std.mem.indexOf(u8, text, "smaller") == null);
+    }
+}
+
 test "the load refusals list the archs this build serves" {
     if (arch_packs.gate_order.len != 4) return error.SkipZigTest;
     try std.testing.expectEqualStrings(
@@ -2157,7 +2174,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.GlmKvQuantUnsupported => .{ .type = "kv_quant_unsupported", .message = "The KV-cache quantization in force (--kv-quant or the model's saved kv_quant) is not one this model stores. The server log names the accepted widths." },
         error.ArchitectureUnsupported => .{ .type = "architecture_unsupported", .message = "This checkpoint's model_type is not served by this build, which loads " ++ arch_packs.served_list ++ "." },
         error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (" ++ arch_packs.served_types_or ++ ")." },
-        error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "Not enough memory to load this model: its SSD streaming memory and what serving needs beside it do not fit under the GPU memory limit. Lower Memory for SSD streaming (GiB) in its settings (--ssd-budget-gb), quit other apps or unload another model, or use a smaller pack." },
+        error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "Not enough memory to load this model: its SSD streaming memory and what serving needs beside it do not fit under the GPU memory limit. Lower Memory for SSD streaming (GiB) in its settings (--ssd-budget-gb), or quit other apps or unload another model." },
         error.ExpertStreamingMtpUnsupported => .{ .type = "expert_streaming_mtp_unsupported", .message = expert_stream_mod.MTP_UNSUPPORTED },
         error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = model_load_mod.budget_required_message },
         error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = arch_load.refusalText("ExpertStreamingUnsupportedLayout") orelse "This checkpoint has no complete expert-bank layout this build can stream. Check the pack and all indexed shards." },
@@ -2193,7 +2210,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3CodebookTableUndecodable => .{ .type = "exl3_codebook_table_undecodable", .message = "This STQ pack's codebook table holds PAIR1 constants this build's kernels have not compiled." },
         error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "This model's SSD streaming memory is too small to load it: raise Memory for SSD streaming (GiB) in its settings (--ssd-budget-gb)." },
         error.SsdBudgetBelowVision => .{ .type = "ssd_budget_below_vision", .message = arch_load.refusalText("SsdBudgetBelowVision") orelse "--ssd-budget-gb cannot hold the vision tower (--vision) beside the minimum expert cache. Raise the budget or pass --no-vision." },
-        error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "Not enough memory to load this model: its SSD streaming memory and the context it plans are more than this Mac's GPU memory limit. Lower Memory for SSD streaming (GiB) in its settings (--ssd-budget-gb), or use a smaller pack." },
+        error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "Not enough memory to load this model: its SSD streaming memory and the context it plans are more than this Mac's GPU memory limit. Lower Memory for SSD streaming (GiB) in its settings (--ssd-budget-gb)." },
         else => null,
     };
 }
