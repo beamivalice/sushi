@@ -1038,6 +1038,8 @@ the bound counts on the l-qwen4b tree over `3d4b4277`):
   dtype read their operands' shapes per call (`linearWith`, `projectRows`). Bytes are unchanged.
 - A layer holds its trellis shared bank's lane shapes (`Layer.shared_lane`, `rate_groups.SharedLane.of` at load), which
   `sharedBank` hands the chain; `sharedRate` checks them against `rb.hidden` and `rb.inter`. Bytes are unchanged.
+- A gate added to a per-layer step reads the shapes the step already reads: the router reads its row count once for
+  the cache-bias gate and the logits kernel, where a second read cost 16 queries a token on the 8-layer fixtures.
 - At 43 layers what is left is a few thousand queries a token, an estimate of tens of microseconds against a GPU-bound
   token ([engine-kernels](engine-kernels.md)).
 
