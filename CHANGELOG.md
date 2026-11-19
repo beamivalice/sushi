@@ -4,238 +4,42 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.7.1 — Sushi Cooler, made right: memory, refusals, long conversations
 
-- **A streamed load the GPU memory limit leaves no room for is refused by name**: it answered a 500 "Failed to
-  load model: ExpertCacheTooSmall" with no reason; it now answers the 503 that names the Memory for SSD streaming (GiB)
-  setting (`--ssd-budget-gb`) that loads it, as a budget set too small does.
-- **A Responses WebSocket turn sent with `store: false` now says `"store":false` in its response**: it was kept on its
-  connection as asked, but its `response.created` and `response.completed` events said `"store":true`.
-- **A model load refused by the GPU memory limit answers at once**: the memory check waited about 2 s for memory to come
-  back before every refusal, even when the bound was the GPU limit, which waiting cannot raise; it now waits only while
-  free RAM is the bound.
-- **A refused model load stays on screen in the web page until you dismiss it**: its message, which can hold a
-  command to copy, left after 8 s whatever its length; a toast carrying the server's refusal (a load, an update, a
-  Models or Settings action) now stays until dismissed.
-- **Every error on `/v1/messages` now comes in Anthropic's shape**: a refused model load, an unknown model, a wrong
-  method and a too-deeply nested body answered there in OpenAI's `{"error":...}` shape, and Anthropic errors said
-  "400 Error" in their status line; they now carry Anthropic's `{"type":"error",...}` and the standard status text. A
-  `/v1/completions` stream that fails mid-reply now ends with a completions chunk (`"text"`) instead of a chat one.
-- **A Responses WebSocket turn refused before it runs now ends**: a turn refused for memory, context length, a bad
-  field, an image or an effort word sent one `{"error":...}` frame and then nothing, so a client waiting for the turn's
-  end hung; it now ends in the `{"type":"error"}` frame every other failed turn ends in, and the socket serves the next.
-- **A long Qwen conversation's next turn is no longer refused for memory when it shares most of the last turn's cache**
-  (#109): a turn that re-rendered the end of the previous reply restored most of the cached conversation as a shared
-  copy, which past ~70k tokens on a 64 GB Mac did not fit, and every retry was refused the same way. When evicting other
-  cached conversations does not make room, the turn now takes the cached copy over instead of copying it, as a turn that
-  extends the whole conversation already did.
-- **A long Qwen conversation on Sushi Cooler keeps its restore points across turns that share only part of the last
-  one**: such a turn's cache entry lost the restore points it inherits (`checkpoint inheritance failed`), so later turns
-  restored from further back and prefilled more.
-- **On MLX (`--qwen-mlx-engine`, a Qwen pack Sushi Cooler does not run, or MiMo) a kv8 cache grows on MLX's page grid,
-  so its scale and bias rows are never copied past the memory bill**: the cache and its bill move by up to 768 rows a
-  layer either way (about 10 MB at most on Qwen3.8-Flash-Next), and on a tight budget the advertised context can drop
-  by a few hundred tokens (79,872 where it was 80,000 or more on a lean 32 GB Mac); Sushi Cooler is unchanged.
-- **A MiMo request with a kv8 or kv4 cache on MLX bills the copy its sliding window makes on every token**: the
-  window's scale and bias rows sit in buffers MLX does not reuse in place, so each token copies them; a live slot now
-  bills about 7 MB more for it (7.3 MiB on MiMo-V2.6-Flash), and the advertised context can drop by that much.
-- **On MLX a Qwen request's QSA index banks are appended in place**: a reservation could size them a fraction of a
-  page off MLX's page grid, so MLX's pool could hand them a buffer it never reuses in place and each block's append
-  copied the bank, memory the bill did not hold; they now take whole pages, inside the rows the bill already counted.
-- **A GLM request with a kv8 or kv6 cache no longer copies part of its cache on a step**: MLX could hand the cache's
-  scale and bias rows a buffer slightly larger than they need, which it then never reuses in place, so the append
-  copied them, memory the bill did not hold. Past 1,024 tokens the cache now grows 1,024 rows at a time (up to 4.6 MB
-  more held on the release pack), which the memory bill already counted.
-- **A DeepSeek request on Sushi Cooler no longer fails when memory is short as its decode starts**: after a prefill
-  that lent expert-cache layers, a refused read-back of one failed the request, though the layer can decode as it is.
-- **A long DeepSeek prompt on a fully resident Sushi Cooler load no longer re-reads expert layers from SSD while other
-  requests decode**: each decode step between its prefill chunks read back the expert-cache layers the prefill had
-  lent, and the next chunk lent them again, about 3 GB of SSD reads a layer each time.
-- **The web UI's Thinking panel no longer jumps to the bottom while you read it**: it follows new reasoning only while
-  you are at the bottom (#108).
-- **A failure in one group of a decode step fails that group's requests alone**: a failure the engine did not report
-  for memory (a host allocation, say) failed every request decoding at that moment, other models' included.
-- **A Qwen image encode on Sushi Cooler stays inside its memory bill**: its patch arrays were made before the encode's
-  cap went in, so they could land on free buffers past the bill.
-- **Joined speculative requests with a logit bias or a think penalty no longer leak GPU memory when one request's
-  verify fails**: the later requests' verify outputs were left behind.
-- **A DeepSeek prompt refused for memory partway through its prefill is offered a narrower `--prefill-chunk` wherever
-  one fits**: each width was priced with a full merged tail even where the prompt has fewer rows left, so a short
-  prompt was offered none.
-- **An image request on a DeepSeek Sushi Cooler load is no longer refused for memory a prefill of the same size gets**:
-  the image encode left out the free memory the engine keeps for its forwards, which the encode reuses too.
-- **The context a model advertises can be used at its length when free RAM, not the GPU limit, is what binds**: the
-  auto context and `/props` `max_safe_context` were sized against the GPU memory limit while requests are admitted
-  against the memory macOS can still give, so a 32 GB Mac advertised 444,416 tokens and refused a request that long.
-  Both now read what admission reads: on such a Mac the advertised context comes out smaller.
-- **A DeepSeek or GLM request whose `max_tokens` does not fit in memory is told the `max_tokens` and context that do**:
-  it read "Reduce prompt size or use a smaller model", which named neither; the values it now names are admitted when
-  applied.
-- **A DeepSeek request on Sushi Cooler is billed its one 256 MB memory margin once**: the bill took a forward's cap,
-  which already carries the margin, and added it again, so a request within 256 MB of the edge was refused and the
-  advertised context came out that much smaller. Its last decode forward is now priced where it runs, at the reply's
-  end, so a short prompt with a long reply is billed the scores and state growth of its whole context.
-- **The SSD streaming budget is checked against the same GPU limit the memory check reads**: with a raised
-  `iogpu.wired_limit_mb` it was checked against the raw limit, so a 32 GB Mac read a 29.4 GB limit in one refusal and
-  27.0 GB in the next; a refusal now offers a smaller pack only when one exists.
-- **A load refused by the resident-model budget gives its figures**: it said "The server log names the exact figures";
-  it now names what the load needs, the budget and what is left of it, and how to unload a model or raise the budget.
-- **A model that only fits streamed is told so when its resident load is refused**: the refusal now names the Memory for
-  SSD streaming (GiB) setting that loads it, and drops "quit other apps to free N GB" when even a raised GPU limit
-  could not hold the model.
-- **A memory refusal names the setting to change where the web UI shows it**: "Lower --ctx-size" and "Lower
-  --ssd-budget-gb" now name Context length and Memory for SSD streaming (GiB) in the model's settings, with the flag,
-  or a restart with the flag when the flag set the value; `--prefill-chunk` is said to be a launch flag.
-- **A request refused because its prompt alone does not fit no longer reads "Maximum context: 0 tokens"**: it now
-  says what can help (free memory, a smaller pack), drops the internal KV width and prefill chunk, and the log line
-  beside it prints the same figures.
-- **Every refusal says what can help it, and the web UI shows it as written**: a request stopped for memory while it
-  ran was told to shrink "the image size" for a text prompt, an image too large to encode got no action at all, and the
-  chat appended "Wait for the model to load" to every one-line 503 (a shutdown included) and "Check the chat settings" to
-  every 400. Each refusal now names its own actions, and the chat adds none to a 400 or 503.
-- **A streamed load whose SSD streaming memory is too small names the smallest setting that loads it**: it read
-  "--ssd-budget-gb leaves no room for an expert cache after the resident trunk ... Raise the budget", with no figure.
-- **A request refused for memory on a model without a Sushi bill, or a streamed one, names the `max_tokens` that fits**: it read "Prompt (98
-  tokens) requires ~635MB GPU memory but only ~635MB available. Reduce prompt size", though `max_tokens` was the cause
-  and the need was over what was available; it now gives both figures, need above what is available, and the largest
-  `max_tokens` that fits, or says the prompt alone does not fit.
-- **A streamed load refused because its SSD streaming memory does not fit says why, with figures and what helps**: it
-  read a fixed sentence about "full-union workspace, bounce buffers" or sent the user to the server log for a
-  `sysctl` command, which on a Mac with less RAM than the budget asked for a GPU limit past its RAM. It now reads as the
-  memory check's refusal does: what it needs, the GPU limit, a raise only when this Mac can hold it, and the budget that fits.
-- **A memory refusal never shows its need equal to what is available**: a load refusal and DeepSeek's mid-prefill
-  refusal rounded both figures to the nearest tenth ("needs 0.29 GB ... holds 0.29 GB"); the need now rounds up, what
-  is available down, the shortfall is their difference, and a text whose figures are all under 1 GB counts MB.
-- **Sushibar shows a refused load's whole reason in the note's tooltip**: the tooltip cut every text at 255 bytes, so a
-  memory refusal lost its figures and every action, and a cut inside a character such as an em dash left it blank.
-- **A Sushi Cooler load that evicts a model on MLX gets that model's memory back**: the evicted model's freed buffers
-  stayed in MLX's pool (up to 8 GB on a 128 GB Mac) for the whole life of the new load, so its memory check read
-  less free RAM than there was, and later checks counted that pool as room the engine cannot use.
-- **A request whose `max_tokens` does not fit in memory is told the `max_tokens` that does**: refused before its prefill,
-  it read "Prompt (64 tokens) requires ... Reduce prompt size", which named neither `max_tokens` nor what fits; it now
-  reads as a refusal from the scheduler does, with the bill, what is available and the largest `max_tokens` and
-  context that fit.
-- **A speculative Qwen request on Sushi Cooler is billed for the memory its draft rounds hold**: a round keeps up to two
-  recurrent-state copies from its verify to its rollback (four a row when requests decode joined), its drafts grow the
-  cache and the MTP head's cache a step past the reply, and a short prompt keeps its end-of-prompt snapshot; none of it
-  was billed, so a short speculative request could hold ~350 MB past its bill (90 MB past the margin). Such a request
-  now needs up to ~560 MB more free on the release pack; the advertised context does not move (1,048,576 at 128 GB,
-  where the long prompt's prefill still sets the bill). Admission also counts the MTP head's cache as a running
-  request's growth, so a later request no longer starts in memory that head will take, and a load's memory check
-  leaves its served warm the whole bill of the warm's longest request, not only its widest forward.
-- **The maximum context a Sushi Cooler memory refusal names is admitted when applied**: it was priced as a prompt alone,
-  while the request it names bills the reply's cache rows at the pool's size class, so the request was refused again.
-  The bill now counts the prompt's cache rows at that size too, as the pool holds them: a Qwen request on Sushi Cooler
-  needs up to a sixteenth more of its cache free than before, and an auto-sized context comes out that much smaller.
-- **Regenerating a DeepSeek reply reuses the conversation instead of reading the whole prompt again**: after a reply
-  longer than about a quarter of its prompt, the same prompt sent again (regenerate, or a retry) skipped the state the
-  server still held and prefilled from scratch. The held state now gives back the reply's memory and serves the prompt.
-- **A DeepSeek load whose SSD prefix tier runs out of memory as it comes up serves without the tier instead of
-  crashing**: the failure came after the load had handed its model to the server, and the load's cleanup then freed
-  that model a second time. The tier is now declined, as any other tier that fails to come up is.
-- **A Sushi Cooler model keeps reporting late kernel compiles after another model's load fails beside it**: a second
-  load whose warm failed left the engine unsealed, so a kernel compiled inside a later request of the first model was
-  no longer logged or written to its pipeline manifest.
-- **DeepSeek's release checkpoint answers one greedy request with one text when DSpark is on**: its FP8 trunk and MXFP4
-  experts give a row other bytes at another verify width, and the width followed measured timings, so the same request
-  could answer two texts. A greedy or seeded DSpark request on that layout now verifies at one fixed width, which decodes
-  slower than the timing-led width did; the boot line says so. STQ packs keep the timing-led width.
-- **A server on an EXL3 or STQ pack no longer grows its memory with every reload and new decode width**: each decode
-  kernel setting it built kept a few small buffers for the life of the process, and the settings it evicted were built
-  again at their next use, so every reload added more. They are now freed once the setting is made.
-- **A model load beside models that already fill a raised GPU memory limit is refused, naming that limit**: with
-  `iogpu.wired_limit_mb` set and what was loaded past its floor, the memory check read the 0 GB left as "unknown" and
-  let the load through, toward a failed load or a stalled Mac. A load whose free-RAM reading fails is now checked
-  against the GPU working set instead of let through unchecked.
-- **A memory refusal reaches a Responses WebSocket client whole, with its numbers**: a request refused for memory (its
-  bill, what was available and the `max_tokens` that fits) or a DeepSeek prefill chunk refused partway read a generic
-  sentence there instead of the refusal's text.
-- **A request refused for memory on Sushi Cooler fails alone, with its memory error, and the next request serves**: a
-  refusal met while making a host array (DeepSeek's prompt arrays, a request's first buffer on a full pool) failed as a
-  bare 500 "generation failed" and left its error pending, so the next request, or one already answering beside it,
-  failed with it.
-- **A failed speculative Qwen request no longer leaves memory held until restart**: a request whose MTP verify failed,
-  for example refused for memory, kept the verify's recurrent-state capture (about 6 MB per layer it had reached), and
-  every such failure added to it. The round frees it as it fails, and the request's teardown frees it too.
-- **A client that stops reading its stream no longer blocks an unload and every request behind it**: a stream to a
-  client that kept its socket open but read nothing (a closed laptop lid, a stopped process) held its model until the
-  client went away, so an unload waited forever and every new request to that model waited behind the unload. A write
-  now gives up after 30 s without progress and ends that request as a disconnect; an unload whose model is still in use
-  after 30 s is refused with a 409 `model_busy` and the model keeps serving (it used to wait with no limit).
-- **A shutdown no longer serves a request that was waiting for room, or one that arrives as it starts**: it cancelled
-  what was running once, and a request waiting in the full queue then took a freed place and ran to its end, as did one
-  still being read; every request, load and image encode after the shutdown's first step now ends with a 503 "Server is
-  shutting down" (a request refused at that step answered a 500 "Internal server error: Shutdown"). A server whose
-  connections are still busy 35 s into a shutdown now exits with status 1 and a log line naming the requests and models
-  they hold, instead of freeing what they still read (it went on to free them and exited 0).
-- **A Responses continuation no longer reads freed memory when its previous response is deleted or evicted mid-reply**:
-  the stored history it continued, a `GET /v1/responses/{id}` body and a WebSocket chain were read after the store had
-  let go of them, so the reply could store garbage history or crash; the store now keeps a response whole until every
-  request reading it is done.
-- **A raised `--wired-margin-gib` no longer stops a model from loading**: 1.7.0 took the margin off the memory still
-  free as well as off the wired limit, so a margin that left room for other apps' models on 1.6.0 left no room for a
-  prefill and the load failed (`WarmChunkDoesNotFit`). The margin now applies once, under the wired limit, as before,
-  and a load that still finds no room says which numbers it compared (#105).
-- **DeepSeek no longer releases every decoder layer to fit one prefill chunk**: it read the free memory before macOS had
-  given back what it released, so it kept releasing, failed the request (`PrefillDoesNotFit`) and spent seconds
-  reloading the layers. It now waits for each release to land before deciding it needs more (#105).
-- **A failed memory borrow no longer breaks every later long prompt on DeepSeek until a reload**: a decoder layer whose
-  release or read-back failed was left without the memory its prompts read through, so every later prompt past 17
-  tokens failed (`MissingExpertSlab`); a failed release or read-back now leaves the layer as it was.
-- **A long Qwen request with MTP on Sushi Cooler stays inside the memory it was admitted with**: the MTP head's cache
-  grew in steps past what admission billed, more the longer the prompt, and now takes its whole reservation up front,
-  as the model's own cache does.
-- **A DeepSeek request cancelled as its prompt finished no longer hands its next turn another conversation's cache**:
-  it saved its prompt cache after the next request had taken the model's state, so the conversation's next turn
-  continued from the other conversation's state and the SSD cache could store it under the wrong prompt.
-- **A DeepSeek follow-up cancelled or failed before it answered no longer costs its retry the last turn's cache**: the
-  retry, or the next conversation's save to SSD, found the last turn's latest restore points gone and prefilled from
-  the last grid point again, up to 8,192 tokens back.
-- **A seeded DeepSeek request on the release's own layout (FP8 trunk, MXFP4 experts) repeats its text on Sushi Cooler**:
-  its DSpark rounds took their width from measured timings, which changes that layout's rows, so the same seed could
-  give another text. It now verifies at a fixed width, as on MLX; STQ packs keep the adaptive width.
-- **Two or more sampled requests decode at once on Sushi Cooler again**: concurrent Qwen requests under the same
-  sampling settings and no seed failed together (`a draw needs a key`); each row now draws under its own request's
-  key. Thanks @younesehb for the report and the diagnosis (#106).
-- **Concurrent requests on Sushi Cooler no longer fail with `PoolOverBudget` beside another request's prefill**:
-  requests decoding together ran under the memory cap of the last prefill chunk, sized for that chunk alone; a
-  decode of several requests now lifts it as a single request's step does (#106).
-- **A load on Sushi Cooler no longer reads every weight and then fails its warm-up**: an `--ssd-budget-gb`, or for a
-  resident model the last gigabyte or so of free memory, that left no room for the warm-up's prefill passed the memory
-  check, loaded, then failed (`WarmChunkDoesNotFit`). The check now counts the warm-up's widest chunk as it runs and
-  refuses such a load before reading weights, naming the budget or the memory that fits.
-- **A long prompt no longer runs past the memory it was admitted with**: a cold prompt's first chunk started wider than
-  admission billed, and DeepSeek's borrow priced memory its own way, so a 4k DeepSeek prompt on a 32 GB Mac was refused
-  mid-prefill (`PrefillDoesNotFit`) and a long Qwen or MiMo prompt could hold up to 2 GB more than admitted. A Qwen or
-  MiMo prompt's first chunk now runs at the admitted width (DeepSeek and GLM keep the wide start, checked against the
-  memory free at the first position), and admission, the chunk width, the warm-up, image encodes and the borrow read
-  one headroom. On Sushi Cooler a DeepSeek prompt at an explicit `--prefill-chunk` is no longer admitted only to be
-  refused at its last chunk.
-- **A DeepSeek load that fails with Sushi Cooler turned off no longer shrinks memory reuse for every later model**: it
-  left MLX's buffer pool and the engine's free buffers capped at its own small figure until the server restarted, and
-  an unload gave back MLX's cap only. A failed load and an unload now give both back.
-- **With a raised `iogpu.wired_limit_mb`, a model is refused before loading when other apps hold the memory it needs**:
-  the memory check read the wired limit alone, so a load passed it, read every weight and failed its warm-up. It now
-  uses the free memory when that is lower.
-- **A model refused for memory now tells you what to free or change**, in the server log, the web UI, the HTTP answer
-  and Sushibar alike. The message names what ran short (free RAM, or the GPU memory limit) and by how much. It then
-  lists the fixes for that limit, in plain words: quit apps or unload a model, the exact `sudo sysctl` wired-limit
-  command that fits (the same one Settings builds), the `--ctx-size` or `--ssd-budget-gb` that fits, or a smaller pack.
-  Skipping the check comes last, with its risk. A DeepSeek prompt that runs out of memory partway through its prefill
-  is answered the same way, naming the `--prefill-chunk` that fits, rather than "refused before any work started".
-- **A resident DeepSeek load without DSpark no longer compiles kernels inside a request** when nine or more requests
-  decode together: the load's warm now runs every joined width.
-- **A DeepSeek pack whose Engram token map changed no longer restores conversations stored under the old map**: the SSD
-  cache key now names the map the load runs. DeepSeek conversations stored by an earlier version are not reused, once.
+- **Every request stays inside the memory it was admitted with**: Qwen3.8's speculative requests are now billed for what
+  their draft rounds hold (a short one needs up to about 560 MB more free; the advertised context does not move),
+  DeepSeek counts its memory margin once, and a raised `--wired-margin-gib` applies once again, under the wired limit,
+  as on 1.6.0. Leaks after a failed speculative request, after joined requests with a logit bias, and after every reload
+  of an EXL3 or STQ pack are closed; concurrent and sampled requests decode together on Sushi Cooler again, and a
+  failure fails only the requests it touched. Where free RAM rather than the GPU limit binds, the advertised context is
+  now the one a request at that length is admitted at, so it can come out smaller.
+- **Long Qwen3.8 conversations keep going**: when a turn's prompt shares most of the last turn's cached entry and
+  nothing else frees enough room, the turn takes that entry over instead of being refused (on a 32 GB Mac, a
+  131k-token turn that was refused is now served); turns that share part of an entry keep their restore points and
+  prefill less.
+- **DeepSeek-V4.1 is steadier**: a long prompt no longer re-reads decoder layers from the SSD while other requests
+  decode or after a failed memory borrow, regenerating a reply reuses the conversation, a cancelled turn no longer
+  costs its retry the cache (or hands it another conversation's), and an image request is no longer refused for memory
+  a prompt of the same size gets. A greedy or seeded DSpark request on the release checkpoint repeats its text: on an
+  M5 Ultra 256 GB with its experts streamed at `--ssd-budget-gb 200`, 26.6 tok/s decode cold and 38.6 tok/s repeated.
+- **Refusals say what to do**: a request or load refused for memory names the `max_tokens`, context and SSD streaming
+  memory that fit (each admitted when applied), offers streaming when a pack only fits streamed, names the Settings
+  label beside each flag, prints one unit with the need rounded up and what is available rounded down, and never
+  suggests a wired limit past the Mac's RAM. Sushibar shows the whole reason, the web page keeps it on screen until
+  dismissed, every request to a refused model gets it, and a load the GPU limit refuses answers at once.
+- **APIs and server**: errors on `/v1/messages` come in Anthropic's shape; a Responses WebSocket turn refused before it
+  runs ends with an error frame, and `store: false` is echoed as sent; a client that stops reading no longer blocks an
+  unload (a busy unload answers 409 within 30 s); a shutdown no longer serves waiting requests; a large SSD prompt cache
+  no longer stops new connections; the web page's Thinking panel stays where you scroll it. The HTTP request-size limit
+  is a setting, `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by default): thanks @Cianidos.
+- **On the MLX route** (`--qwen-mlx-engine`, GLM-5.3-Flash, MiMo): a kv8, kv6 or kv4 cache grows on MLX's page grid, so
+  its appends are never copied past the bill; a bill moves by a few MB, and on a tight Mac the advertised context can
+  drop by a few hundred tokens. Sushi Cooler is unchanged by this.
+- **Known issue**: DeepSeek-V4.1-Flash's FP8 release checkpoint does not load at its default SSD streaming memory on a
+  256 GB Mac; set `--ssd-budget-gb 215` (the refusal names it). Thanks @nikolay-bratanov, @younesehb, @NikolaKrstic94
+  and @cyrilmhansen for the reports behind this release.
 
-- **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
-  default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many
-  images is no longer refused at 64 MB, and a refusal names the limit and the setting. Thanks @Cianidos for the request
-  and the change (#96).
-- **A large SSD prompt cache no longer stops the server from accepting connections**: the cache keeps a fixed
-  handful of files open whatever its size, the server raises its open-file limit at startup and states it in a
-  `[limits]` line, and a server that runs out of descriptors says once how many are open and what holds most of them.
-  Thanks @nikolay-bratanov for the report (#104).
+---
 
 ## v1.7.0 — Sushi Cooler by default, faster DeepSeek, a lighter prompt cache
 
