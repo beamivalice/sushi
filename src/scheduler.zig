@@ -2037,6 +2037,12 @@ pub const Scheduler = struct {
     /// returns immediately. Marks the entry `.evicting`, drains in-flight
     /// requests (refcount → 0), then hands the mlx free to the inference
     /// thread (stream-bound). Blocks until the free completes.
+    /// How long an unload waits for the requests that hold its model, new requests to it waiting behind it meanwhile,
+    /// before it refuses with `error.ModelBusy` and the model serves on.
+    const UNLOAD_DRAIN_MS: i64 = 30_000;
+    /// `UNLOAD_DRAIN_MS`, which a test shortens.
+    pub var unload_drain_ms: i64 = UNLOAD_DRAIN_MS;
+
     pub fn unloadModel(self: *Scheduler, id_or_empty: []const u8) !void {
         return self.unloadModelIfIdle(id_or_empty, null);
     }
@@ -2076,7 +2082,13 @@ pub const Scheduler = struct {
                 }
             }
             self.registry.markEvictingLocked(entry);
-            self.registry.waitForRefcountZeroLocked(entry);
+            if (!self.registry.waitForRefcountZeroWithinLocked(entry, unload_drain_ms)) {
+                const held = entry.refcount.load(.acquire);
+                self.registry.unmarkEvictingLocked(entry);
+                self.registry.mutex.unlock(self.io);
+                log.warn("[registry] unload of {s} refused: {d} request(s) still hold it after {d} ms\n", .{ entry.id, held, unload_drain_ms });
+                return error.ModelBusy;
+            }
             self.registry.mutex.unlock(self.io);
         }
 

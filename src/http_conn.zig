@@ -159,6 +159,70 @@ pub const StreamHeartbeat = struct {
     }
 };
 
+/// How long a connection's write waits for the client to take a byte, as its reads are bounded: a client that stops
+/// reading with its socket open fails the write, so its request is cancelled and the model it holds is released.
+const SEND_LIMIT_MS: i64 = 30_000;
+/// `SEND_LIMIT_MS`, which a test shortens.
+pub var send_limit_ms: i64 = SEND_LIMIT_MS;
+
+/// `std.Io.net.Stream.Writer`'s socket writer, each send bounded by `send_limit_ms` of no progress (`err` is then
+/// `error.SendTimedOut`), which the kernel's `SO_SNDTIMEO` enforces.
+pub const SocketWriter = struct {
+    interface: std.Io.Writer,
+    fd: std.posix.fd_t,
+    err: ?anyerror = null,
+
+    fn init(fd: std.posix.fd_t, buffer: []u8) SocketWriter {
+        const limit: std.posix.timeval = .{ .sec = @intCast(@divTrunc(send_limit_ms, 1000)), .usec = @intCast(@rem(send_limit_ms, 1000) * 1000) };
+        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&limit)) catch |e|
+            log.warn("[http] a connection's writes stay unbounded: SO_SNDTIMEO refused ({s})\n", .{@errorName(e)});
+        return .{ .fd = fd, .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const w: *SocketWriter = @alignCast(@fieldParentPtr("interface", io_w));
+        var iov: [16]std.posix.iovec_const = undefined;
+        var n: usize = 0;
+        const parts = .{ io_w.buffered(), data[0 .. data.len - 1] };
+        if (parts[0].len > 0) {
+            iov[n] = .{ .base = parts[0].ptr, .len = parts[0].len };
+            n += 1;
+        }
+        for (parts[1]) |d| if (d.len > 0 and n < iov.len) {
+            iov[n] = .{ .base = d.ptr, .len = d.len };
+            n += 1;
+        };
+        const pattern = data[data.len - 1];
+        if (pattern.len > 0) for (0..splat) |_| {
+            if (n == iov.len) break;
+            iov[n] = .{ .base = pattern.ptr, .len = pattern.len };
+            n += 1;
+        };
+        if (n == 0) return io_w.consume(0);
+        const sent = w.sendWithin(iov[0..n]) catch |e| {
+            w.err = e;
+            return error.WriteFailed;
+        };
+        return io_w.consume(sent);
+    }
+
+    /// A send that moved some bytes returns their count; one that moved none in `send_limit_ms` fails.
+    fn sendWithin(w: *SocketWriter, iov: []const std.posix.iovec_const) !usize {
+        const msg: std.posix.msghdr_const = .{ .name = null, .namelen = 0, .iov = iov.ptr, .iovlen = @intCast(iov.len), .control = null, .controllen = 0, .flags = 0 };
+        while (true) {
+            const rc = std.posix.system.sendmsg(w.fd, &msg, std.posix.MSG.NOSIGNAL);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.SendTimedOut,
+                .PIPE => return error.BrokenPipe,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                else => |e| return std.posix.unexpectedErrno(e),
+            }
+        }
+    }
+};
+
 /// Connection wrapper bundling a TCP stream with its `Io` and per-connection
 /// reader/writer buffers. Replaces `std.net.Stream` in 0.16 — methods that took
 /// a bare stream now take `*Conn` so the IO interface and buffers travel together.
@@ -167,7 +231,7 @@ pub const Conn = struct {
     io: std.Io,
     write_buf: [16 * 1024]u8,
     read_buf: [16 * 1024]u8,
-    write_state: std.Io.net.Stream.Writer,
+    write_state: SocketWriter,
     read_state: std.Io.net.Stream.Reader,
     /// Silence tracker for the streaming keepalive. Stamped by every write
     /// path below, so it measures client-visible silence rather than "time
@@ -198,7 +262,7 @@ pub const Conn = struct {
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
-        c.write_state = stream.writer(io, &c.write_buf);
+        c.write_state = SocketWriter.init(stream.socket.handle, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
         c.sse_headers_sent = false;

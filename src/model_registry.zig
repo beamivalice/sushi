@@ -1074,6 +1074,17 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// `waitForRefcountZeroLocked` for at most `ms`; false when a reader still holds `entry` then.
+    pub fn waitForRefcountZeroWithinLocked(self: *ModelRegistry, entry: *LoadedModel, ms: i64) bool {
+        const deadline = io_util.nowMsMonotonic(self.io) + ms;
+        while (entry.refcount.load(.acquire) != 0) {
+            const left = deadline - io_util.nowMsMonotonic(self.io);
+            if (left <= 0) return false;
+            self.state_cond.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(left), .clock = .awake } }) catch {};
+        }
+        return true;
+    }
+
     /// Phase D: finalize an eviction after `unloadResident()` has been
     /// called on the inference thread. Caller holds `mutex`. Updates the
     /// summed-bytes accounting and flips state to `.unloaded`.

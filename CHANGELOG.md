@@ -35,6 +35,11 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A failed speculative Qwen request no longer leaves memory held until restart**: a request whose MTP verify failed,
   for example refused for memory, kept the verify's recurrent-state capture (about 6 MB per layer it had reached), and
   every such failure added to it. The round frees it as it fails, and the request's teardown frees it too.
+- **A client that stops reading its stream no longer blocks an unload and every request behind it**: a stream to a
+  client that kept its socket open but read nothing (a closed laptop lid, a stopped process) held its model until the
+  client went away, so an unload waited forever and every new request to that model waited behind the unload. A write
+  now gives up after 30 s without progress and ends that request as a disconnect; an unload whose model is still in use
+  after 30 s is refused with a 409 `model_busy` and the model keeps serving (it used to wait with no limit).
 - **A shutdown no longer serves a request that was waiting for room, or one that arrives as it starts**: it cancelled
   what was running once, and a request waiting in the full queue then took a freed place and ran to its end, as did one
   still being read; every request, load and image encode after the shutdown's first step now ends with a 503 "Server is

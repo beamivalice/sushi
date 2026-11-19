@@ -1097,7 +1097,7 @@ fn logFdQuota(allocator: std.mem.Allocator, err: anyerror) void {
 }
 
 /// How long a shutdown waits for its connection threads. Past `beginShutdown` each one's wait is bounded by the read
-/// limit: no new work is taken, and what it waited on is cancelled or failed.
+/// and send limits: no new work is taken, and what it waited on is cancelled or failed.
 const CONN_DRAIN_MS: u64 = 35_000;
 
 /// Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): stop the accept
@@ -2050,6 +2050,10 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn
         },
         error.Shutdown => {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+            return;
+        },
+        error.ModelBusy => {
+            try sendErrorResponse(allocator, stream, "409 Conflict", "model_busy", "The model is still serving requests: unload refused", 409);
             return;
         },
         else => {

@@ -10,6 +10,8 @@ const server_state = @import("server_state.zig");
 const model_load = @import("model_load.zig");
 const registry = @import("arch/registry.zig");
 const responses_api = @import("responses_api.zig");
+const http_conn = @import("http_conn.zig");
+const scheduler_mod = @import("scheduler.zig");
 const test_support = @import("test_support.zig");
 const ModelRegistry = @import("model_registry.zig").ModelRegistry;
 
@@ -365,6 +367,88 @@ test "server: a shutdown with the submit queue full ends the request waiting for
                     return error.ServedPastTheShutdown;
                 if (std.mem.indexOf(u8, all, "shutting down") == null) return error.EndedWithoutTheShutdownError;
             }
+        }
+    }.run);
+}
+
+/// A stream the client stops reading after its first token, with its socket left open, an unload asked behind it and
+/// then another request: each of the two answers within `ms`. Returns their answers; the caller frees.
+fn behindAStalledReader(ms: u32) ![2][]u8 {
+    var b: [2][512]u8 = undefined;
+    gpa.free(try request("POST", "/v1/completions", try completionBody(&b[0], "hi", 2, false)));
+    const stalled = try connect();
+    defer _ = std.c.close(stalled);
+    try send(stalled, "POST", "/v1/completions", try completionBody(&b[1], "a long tale of the sea", 64, true));
+    gpa.free(try readUntil(stalled, "\"choices\""));
+    const Asked = struct {
+        path: []const u8,
+        body: []const u8,
+        out: []u8 = &.{},
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(q: *@This()) void {
+            q.out = request("POST", q.path, q.body) catch &.{};
+            q.done.store(true, .release);
+        }
+    };
+    var asked = [_]Asked{ .{ .path = "/v1/unload-model", .body = "{\"model\":\"tiny\"}" }, .{ .path = "/v1/completions", .body = try completionBody(&b[0], "hello", 4, false) } };
+    var threads: [2]std.Thread = undefined;
+    var waited: u32 = 0;
+    for (&asked, 0..) |*q, i| {
+        threads[i] = try std.Thread.spawn(.{}, Asked.run, .{q});
+        // The unload has marked the model before the other request asks for it.
+        if (i == 0) while (!unloadPending()) : (waited += 10) {
+            if (waited >= ms) break;
+            var none = [_]std.posix.pollfd{};
+            _ = std.posix.poll(&none, 10) catch {};
+        };
+    }
+    while (!(asked[0].done.load(.acquire) and asked[1].done.load(.acquire)) and waited < ms) : (waited += 10) {
+        var none = [_]std.posix.pollfd{};
+        _ = std.posix.poll(&none, 10) catch {};
+    }
+    const wedged = !asked[1].done.load(.acquire);
+    // The stall ends here either way, so the threads end.
+    _ = std.c.shutdown(stalled, std.posix.SHUT.RDWR);
+    for (threads) |t| t.join();
+    if (wedged) {
+        std.debug.print("{d} ms behind a stalled reader: the unload done={any} ({s}), the request behind it done={any}\n", .{ waited, asked[0].done.load(.acquire), asked[0].out[0..@min(asked[0].out.len, 200)], asked[1].done.load(.acquire) });
+        for (asked) |q| gpa.free(q.out);
+        return error.WedgedByAStalledReader;
+    }
+    return .{ asked[0].out, asked[1].out };
+}
+
+fn unloadPending() bool {
+    const reg = server_state.global_registry.?;
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    return reg.entries.get("tiny").?.state == .evicting;
+}
+
+test "server: a client that stops reading its stream gives up its model, so an unload behind it and every request behind that go on" {
+    const was = http_conn.send_limit_ms;
+    http_conn.send_limit_ms = 200;
+    defer http_conn.send_limit_ms = was;
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const got = try behindAStalledReader(10_000);
+            defer for (got) |g| gpa.free(g);
+            if (!std.mem.startsWith(u8, got[0], "HTTP/1.1 200")) return error.UnloadFailed;
+            if (!std.mem.startsWith(u8, got[1], "HTTP/1.1 200")) return error.RequestBehindFailed;
+        }
+    }.run);
+}
+
+test "server: an unload whose model stays held past its drain bound is refused by name, and the request behind it is served" {
+    const was = scheduler_mod.Scheduler.unload_drain_ms;
+    scheduler_mod.Scheduler.unload_drain_ms = 200;
+    defer scheduler_mod.Scheduler.unload_drain_ms = was;
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const got = try behindAStalledReader(10_000);
+            defer for (got) |g| gpa.free(g);
+            if (!std.mem.startsWith(u8, got[0], "HTTP/1.1 409") or std.mem.indexOf(u8, got[0], "model_busy") == null) return error.UnloadNotRefusedByName;
+            if (!std.mem.startsWith(u8, got[1], "HTTP/1.1 200")) return error.RequestBehindFailed;
         }
     }.run);
 }
