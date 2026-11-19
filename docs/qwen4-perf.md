@@ -277,9 +277,12 @@ twice, one boot per arm.
 M1 Max 64 GB (`applegpu_g13s`, 32 GPU cores, no matrix units), sushi 1.7.0, STQ 2.75bpw, `--kv-quant 8`, 5.7k-token
 prompt, one boot per arm. At S=1 the default 16 splits launch exactly 32 threadgroups — one wave on 32 cores.
 
-- Kernel meter (`SUSHI_QSA_ATTN_UBENCH=1`, 12 dependent layers, median of 7): 16 splits 188.5 µs/call at kv 4096 and
-  188.8 at kv 32768; 64 splits with the meter's 2-simdgroup arm 140.8 and 146.9. The served fallback at 64 splits is
-  the computing 3 simdgroups.
+- Kernel meter (`SUSHI_QSA_ATTN_UBENCH=1`, 12 dependent layers, median of 7; it now sweeps nsplit
+  {16, 64} × simdgroups {2, 16}): 16 splits 187.6 µs/call at kv 4096 and 191.8 at kv 32768 (both at
+  16 simdgroups — the served fallback at 32 threadgroups); 64 splits at 2 simdgroups 141.8 and 148.6
+  (an earlier read of the same code measured 188.5/188.8 against 140.8/146.9).
+  The served fallback at 64 splits is that 2-simdgroup arm: nsg = (gqa+7)/8 = 2 at gqa 12, and
+  1·2·64 > 32, so `qsaAttnSimdgroups` returns it.
 - Served decode, MTP depth 2 pinned, 512 tokens: 64 splits 34.6 tok/s against 33.7 and 32.0 for the default (A B A).
   With MTP off, which removes acceptance noise: 25.08 against 24.73 and 24.56 (A B A).
 - Greedy text diverges with the split count (the merge order changes, as at every nsplit); these cells are rates, not
