@@ -1881,7 +1881,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             wired_floor: u64,
             /// The Sushi reading's two bounds, as last read.
             last: ?bills.SushiAvailable = null,
-            pub fn read(r: *@This()) u64 {
+            pub fn read(r: *@This()) ?u64 {
                 // An MLX load reads free RAM under the working set alone: no active buffers come off it, no declared floor.
                 r.last = if (r.sushi)
                     bills.sushiAvailable(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, gpu_mem.activeBytes(), r.wired_floor)
@@ -1896,30 +1896,31 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config), .wired_floor = bills.wiredCeilingFloorFor(params.config) };
         var avail_bytes = reader.read();
         const mtp_on = mtpChoiceFor(params.mtp, params.config).on;
-        var serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
+        // Its maximum context is read only by a refusal, which an unread figure never makes.
+        var serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, if (avail_bytes) |b| b -| weights_bytes else 0) else null;
         var needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         if (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed)) {
             log.info("[preflight] {d:.2} GB available of {d:.2} GB needed; waiting while memory is still being released\n", .{
-                @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
+                @as(f64, @floatFromInt(avail_bytes.?)) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             });
             avail_bytes = bills.settleAvailableBytes(avail_bytes, needed, &reader);
-            serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
+            serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, if (avail_bytes) |b| b -| weights_bytes else 0) else null;
             needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         }
         const active: usize = if (reader.sushi) gpu_mem.activeBytes() else 0;
         var avail_buf: [192]u8 = undefined;
         const wired_mb = bills.wiredLimitBytes() >> 20;
         const avail_line = bills.sushiAvailableLine(&avail_buf, reader.last.?, if (reader.sushi and reader.wired_floor > 0) wired_mb else 0);
-        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB (warmup + net or context ~{d:.2} GB; {s})\n", .{
+        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB (warmup + net or context ~{d:.2} GB; {s})\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
-            @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed -| weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             avail_line,
         });
-        const gpu_exhausted = model_mod.usesSushiQuantMemoryBill(params.config) and gpu_limit > 0 and active >= gpu_limit;
-        if (weights_bytes > 0 and (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed) or gpu_exhausted)) {
+        // Every bound that was read refuses here, an exhausted one (read as 0) included.
+        if (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed)) {
+            const avail = avail_bytes.?;
             var refusal = bills.LoadMemoryRefusal{
                 .needed = needed,
                 .avail = reader.last.?,
@@ -1928,9 +1929,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 .total_ram = status.getTotalMemBytes(),
             };
             if (serving) |b| {
-                const maximum: u32 = if (avail_bytes < loadRequirementBytes(params.config, weights_bytes, mtp_on, 0)) 0 else b.max_context;
+                const maximum: u32 = if (avail < loadRequirementBytes(params.config, weights_bytes, mtp_on, 0)) 0 else b.max_context;
                 sch.registry.mutex.lockUncancelable(sch.io);
-                const context = model_registry_mod.MemoryContextRefusal{ .requested = b.requested_context, .maximum = maximum, .needed = needed, .available = avail_bytes, .kv_bits = b.kv_bits, .chunk = b.chunk };
+                const context = model_registry_mod.MemoryContextRefusal{ .requested = b.requested_context, .maximum = maximum, .needed = needed, .available = avail, .kv_bits = b.kv_bits, .chunk = b.chunk };
                 params.entry.memory_context_refusal = context;
                 if (@TypeOf(params) == *LoadRequest) params.memory_context_refusal = context;
                 sch.registry.mutex.unlock(sch.io);
@@ -1938,7 +1939,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             } else if (params.config.expert_streaming and params.config.expert_ssd_budget_bytes > 0) {
                 const budget = params.config.expert_ssd_budget_bytes;
                 const planner = BudgetPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = planned_assistant, .beside = weights_bytes -| planned_resident, .mtp_on = mtp_on };
-                refusal.knob = .{ .ssd_budget = .{ .gb = budget >> 30, .fits_gb = bills.streamedBudgetThatFits(budget, avail_bytes, planner) } };
+                refusal.knob = .{ .ssd_budget = .{ .gb = budget >> 30, .fits_gb = bills.streamedBudgetThatFits(budget, avail, planner) } };
             }
             var text_buf: [2048]u8 = undefined;
             const text = bills.loadMemoryRefusalText(&text_buf, refusal);

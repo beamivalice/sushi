@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A model load beside models that already fill a raised GPU memory limit is refused, naming that limit**: with
+  `iogpu.wired_limit_mb` set and what was loaded past its floor, the memory check read the 0 GB left as "unknown" and
+  let the load through, toward a failed load or a stalled Mac. A load whose free-RAM reading fails is now checked
+  against the GPU working set instead of let through unchecked.
 - **A memory refusal reaches a Responses WebSocket client whole, with its numbers**: a request refused for memory (its
   bill, what was available and the `max_tokens` that fits) or a DeepSeek prefill chunk refused partway read a generic
   sentence there instead of the refusal's text.

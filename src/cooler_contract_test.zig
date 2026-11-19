@@ -3988,3 +3988,69 @@ test "cooler contract: the first served DeepSeek request after a Cooler load's w
         }
     }.run);
 }
+
+test "cooler contract: a resident load beside buffers already past a declared wired limit's floor is refused by the preflight, which names that limit" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const bills = @import("bills.zig");
+    const status = @import("status.zig");
+    const registry_mod = @import("model_registry.zig");
+    const scheduler_mod = @import("scheduler.zig");
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.fault.disarm();
+
+    // A declared iogpu.wired_limit_mb (above 75% of RAM) whose floor, less the unplanned margin, is 1 GiB.
+    const total = status.getTotalMemBytes();
+    const mb_was = bills.wired_limit_mb_override;
+    defer bills.wired_limit_mb_override = mb_was;
+    bills.wired_limit_mb_override = (total - (1 << 30)) >> 20;
+    const margin_was = bills.launch_state.wired_limit_margin_bytes;
+    defer bills.launch_state.wired_limit_margin_bytes = margin_was;
+    bills.launch_state.wired_limit_margin_bytes = total - (2 << 30);
+    const floor_was = bills.gpu_floor_bytes.load(.monotonic);
+    defer bills.gpu_floor_bytes.store(floor_was, .monotonic);
+
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    @import("cooler_side.zig").forTest(&config, true);
+    const floor = bills.wiredCeilingFloorFor(&config);
+    try testing.expect(floor > 0 and floor <= 1 << 30);
+
+    // 1.5 GiB already in use: past the declared floor, well under Metal's working set.
+    const shape = [_]c_int{3 << 27};
+    var held: mlx.mlx_array = .{ .ctx = null };
+    try mlx.check(mlx.mlx_zeros(&held, &shape, 1, .float32, mlx.gpuStream()));
+    defer _ = mlx.mlx_array_free(held);
+    try mlx.check(mlx.mlx_array_eval(held));
+
+    const reg = try registry_mod.ModelRegistry.init(a, io, null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("past-floor", dir, 0);
+    reg.mutex.lockUncancelable(io);
+    try testing.expect(reg.tryBeginLoadLocked(entry));
+    reg.mutex.unlock(io);
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = io;
+    sch.allocator = a;
+    sch.ctx_size_flag = 0;
+    var req: scheduler_mod.LoadRequest = .{ .entry = entry, .config = &config, .tok = undefined, .chat_config = undefined, .model_dir = dir, .evict_entries = &.{}, .allocator = a };
+    // Past the preflight the first checked MLX call is the weights': failing it ends an admitted load before it needs a
+    // tokenizer.
+    mlx.fault.arm(1);
+    model_load.runLoadRequest(&sch, &req);
+    const admitted = mlx.fault.didFire();
+    mlx.fault.disarm();
+    defer if (req.error_name) |n| a.free(n);
+    if (admitted) {
+        var msg: [300]u8 = undefined;
+        _ = mlx.takeError(&msg);
+    }
+    errdefer std.debug.print("a load beside {d} MB in use under a {d} MB floor ended {s}; the preflight admitted it: {}\n", .{ @import("gpu_mem.zig").activeBytes() >> 20, floor >> 20, req.error_name orelse "loaded", admitted });
+    try testing.expect(!admitted);
+    try testing.expectEqualStrings("InsufficientMemory", req.error_name.?);
+    try testing.expect(std.mem.indexOf(u8, req.refusal_text[0..req.refusal_text_len], "iogpu.wired_limit_mb = ") != null);
+}

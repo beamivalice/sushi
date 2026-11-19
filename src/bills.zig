@@ -6500,16 +6500,16 @@ pub fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64)
 }
 
 /// A just-exited process returns its Metal memory over seconds: while a short reading keeps
-/// rising, poll every 500 ms; stop at enough, after 2 s without growth, or after 15 s.
-pub fn settleAvailableBytes(first: u64, needed: u64, reader: anytype) u64 {
+/// rising, poll every 500 ms; stop at enough, after 2 s without growth, or after 15 s. An unread figure ends the wait.
+pub fn settleAvailableBytes(first: ?u64, needed: u64, reader: anytype) ?u64 {
     var avail = first;
     var stalled: u32 = 0;
     var polls: u32 = 0;
-    while (avail > 0 and avail < needed and stalled < 4 and polls < 30) : (polls += 1) {
+    while (avail) |now| : (polls += 1) {
+        if (now >= needed or stalled >= 4 or polls >= 30) break;
         reader.sleep();
-        const next = reader.read();
-        stalled = if (next > avail) 0 else stalled + 1;
-        avail = next;
+        avail = reader.read();
+        if (avail) |next| stalled = if (next > now) 0 else stalled + 1;
     }
     return avail;
 }
@@ -6518,8 +6518,10 @@ pub fn settleAvailableBytes(first: u64, needed: u64, reader: anytype) u64 {
 /// streamed preflight takes), the GPU working set less the already active model buffers, and under a declared wired
 /// limit (`wired_floor`, 0 = none) that limit's floor less them. Owner rule: free RAM under the limit is the figure.
 pub const SushiAvailable = struct {
-    bytes: u64,
-    free: u64,
+    /// The least of the bounds read; null when none was: a bound read as exhausted is 0, never unknown.
+    bytes: ?u64,
+    /// The RAM free now; null when neither reading gave one.
+    free: ?u64,
     /// The working set less the active buffers; null when Metal gave no working set.
     gpu: ?u64 = null,
     /// The declared limit's floor less the active buffers; null without one.
@@ -6527,9 +6529,11 @@ pub const SushiAvailable = struct {
 
     pub const Bound = enum { free_ram, gpu_limit, wired_limit };
 
+    /// Of a figure that was read (`bytes` not null).
     pub fn bound(self: SushiAvailable) Bound {
-        if (self.free <= self.bytes) return .free_ram;
-        if (self.declared) |d| if (d <= self.bytes) return .wired_limit;
+        const bytes = self.bytes.?;
+        if (self.free) |f| if (f <= bytes) return .free_ram;
+        if (self.declared) |d| if (d <= bytes) return .wired_limit;
         return .gpu_limit;
     }
 
@@ -6541,10 +6545,14 @@ pub const SushiAvailable = struct {
 };
 
 pub fn sushiAvailable(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) SushiAvailable {
-    const free = if (proc_avail > 0) proc_avail else host_avail;
+    // A reading of 0 is a query that failed; a bound less the active buffers is read, down to 0.
+    const free: ?u64 = if (proc_avail > 0) proc_avail else if (host_avail > 0) host_avail else null;
     const gpu: ?u64 = if (gpu_limit > 0) gpu_limit -| active else null;
     const declared: ?u64 = if (wired_floor > 0) wired_floor -| active else null;
-    const bytes = @min(free, @min(gpu orelse free, declared orelse free));
+    var bytes: ?u64 = null;
+    for ([_]?u64{ free, gpu, declared }) |b| if (b) |v| {
+        bytes = @min(v, bytes orelse v);
+    };
     return .{ .bytes = bytes, .free = free, .gpu = gpu, .declared = declared };
 }
 
@@ -6560,15 +6568,25 @@ fn gbUp(bytes: u64) f64 {
 
 /// The `[preflight]` line's words for the bound a load's available figure came from.
 pub fn sushiAvailableLine(buf: []u8, a: SushiAvailable, wired_limit_mb: u64) []const u8 {
+    const bytes = a.bytes orelse return "no memory figure could be read: the check admits the load";
     return (switch (a.bound()) {
         .free_ram => if (a.gpuAllows()) |gpu|
-            std.fmt.bufPrint(buf, "bound by free RAM, {d:.1} GB; the GPU memory limit allows {d:.1} GB", .{ gbOf(a.free), gbOf(gpu) })
+            std.fmt.bufPrint(buf, "bound by free RAM, {d:.1} GB; the GPU memory limit allows {d:.1} GB", .{ gbOf(bytes), gbOf(gpu) })
         else
-            std.fmt.bufPrint(buf, "bound by free RAM, {d:.1} GB", .{gbOf(a.free)}),
-        .wired_limit => std.fmt.bufPrint(buf, "bound by the GPU memory limit (iogpu.wired_limit_mb = {d} MB): {d:.1} GB beside what is already loaded; {d:.1} GB of RAM free", .{ wired_limit_mb, gbOf(a.bytes), gbOf(a.free) }),
-        .gpu_limit => std.fmt.bufPrint(buf, "bound by the GPU memory limit (macOS's default): {d:.1} GB beside what is already loaded; {d:.1} GB of RAM free", .{ gbOf(a.bytes), gbOf(a.free) }),
+            std.fmt.bufPrint(buf, "bound by free RAM, {d:.1} GB", .{gbOf(bytes)}),
+        .wired_limit => std.fmt.bufPrint(buf, "bound by the GPU memory limit (iogpu.wired_limit_mb = {d} MB): {d:.1} GB beside what is already loaded; {f}", .{ wired_limit_mb, gbOf(bytes), FreeRam{ .free = a.free } }),
+        .gpu_limit => std.fmt.bufPrint(buf, "bound by the GPU memory limit (macOS's default): {d:.1} GB beside what is already loaded; {f}", .{ gbOf(bytes), FreeRam{ .free = a.free } }),
     }) catch "bound by free RAM or the GPU memory limit";
 }
+
+/// The free-RAM clause of a load's memory figures, which a failed RAM query leaves unread.
+const FreeRam = struct {
+    free: ?u64,
+    pub fn format(self: FreeRam, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.free) |f| return w.print("{d:.1} GB of RAM free", .{gbOf(f)});
+        return w.writeAll("free RAM unread");
+    }
+};
 
 /// A load the memory check refused: what it needs, what the check read, and the one knob that shrinks the need.
 pub const LoadMemoryRefusal = struct {
@@ -6608,13 +6626,13 @@ pub fn loadMemoryRefusalText(buf: []u8, r: LoadMemoryRefusal) []const u8 {
 fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!void {
     const a = r.avail;
     // Each bound short of the need gets its action: freeing RAM past a GPU limit that is short too is refused again.
-    const ram_short = r.needed -| a.free;
+    const ram_short = if (a.free) |f| r.needed -| f else 0;
     const gpu_room = a.gpuAllows();
     const gpu_short = if (gpu_room) |g| r.needed -| g else 0;
     try w.print("Not enough memory to load this model.\n", .{});
     switch (a.bound()) {
         .free_ram => {
-            try w.print("It needs {d:.1} GB, and only {d:.1} GB of RAM is free right now (other apps and the system hold the rest)", .{ gbOf(r.needed), gbOf(a.free) });
+            try w.print("It needs {d:.1} GB, and only {d:.1} GB of RAM is free right now (other apps and the system hold the rest)", .{ gbOf(r.needed), gbOf(a.bytes.?) });
             if (gpu_room) |gpu| {
                 if (gpu_short > 0)
                     try w.print("; your GPU memory limit allows only {d:.1} GB, about {d:.1} GB short as well", .{ gbOf(gpu), gbUp(gpu_short) })
@@ -6626,7 +6644,8 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
         .wired_limit, .gpu_limit => {
             try w.print("It needs {d:.1} GB, and the GPU memory limit (", .{gbOf(r.needed)});
             if (r.wired_limit_mb > 0) try w.print("iogpu.wired_limit_mb = {d} MB", .{r.wired_limit_mb}) else try w.print("macOS's default", .{});
-            try w.print(") leaves {d:.1} GB beside what is already loaded: about {d:.1} GB short. {d:.1} GB of RAM is free", .{ gbOf(a.bytes), gbUp(gpu_short), gbOf(a.free) });
+            try w.print(") leaves {d:.1} GB beside what is already loaded: about {d:.1} GB short. ", .{ gbOf(a.bytes.?), gbUp(gpu_short) });
+            if (a.free) |f| try w.print("{d:.1} GB of RAM is free", .{gbOf(f)}) else try w.print("The free RAM could not be read", .{});
             if (ram_short > 0) try w.print(", about {d:.1} GB short as well", .{gbUp(ram_short)});
             try w.print(".\n", .{});
         },
@@ -6675,7 +6694,7 @@ pub fn streamedBudgetThatFits(budget: u64, avail: u64, planner: anytype) u64 {
     return lo;
 }
 
-pub fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) u64 {
+pub fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) ?u64 {
     return sushiAvailable(host_avail, proc_avail, gpu_limit, active, wired_floor).bytes;
 }
 
@@ -6716,9 +6735,10 @@ pub fn loadRequirementBytes(config: *const model_mod.ModelConfig, weights_bytes:
 
 
 /// Unknown figures (a failed memory query, an unmeasurable size) never block a load.
-pub fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64, required_bytes: u64) bool {
-    if (weights_bytes == 0 or avail_bytes == 0) return false;
-    return avail_bytes < required_bytes;
+/// A figure that was not read (null) never blocks a load; one read as exhausted (0) does.
+pub fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: ?u64, required_bytes: u64) bool {
+    const avail = avail_bytes orelse return false;
+    return weights_bytes > 0 and avail < required_bytes;
 }
 
 test "residentWeightBytes: a boot entry without a disk hint reports its measured shards" {
@@ -6781,35 +6801,59 @@ test "load preflight waits for a prior process's memory to come back, and only w
         fn sleep(_: *@This()) void {}
     };
     var rising = Fake{ .seq = &.{ 80 * gib, 95 * gib, 110 * gib } };
-    try testing.expectEqual(@as(u64, 110 * gib), settleAvailableBytes(69 * gib, 100 * gib, &rising));
+    try testing.expectEqual(@as(?u64, 110 * gib), settleAvailableBytes(69 * gib, 100 * gib, &rising));
     var short = Fake{ .seq = &.{ 70 * gib, 70 * gib, 70 * gib, 70 * gib, 70 * gib, 200 * gib } };
-    try testing.expectEqual(@as(u64, 70 * gib), settleAvailableBytes(69 * gib, 100 * gib, &short));
+    try testing.expectEqual(@as(?u64, 70 * gib), settleAvailableBytes(69 * gib, 100 * gib, &short));
     try testing.expectEqual(@as(usize, 5), short.i);
+    // A bound read as exhausted waits as any short figure does; an unread one ends the wait.
+    var exhausted = Fake{ .seq = &.{ 0, 0, 0, 0, 0 } };
+    try testing.expectEqual(@as(?u64, 0), settleAvailableBytes(0, 100 * gib, &exhausted));
+    try testing.expectEqual(@as(usize, 4), exhausted.i);
+    try testing.expectEqual(@as(?u64, null), settleAvailableBytes(null, 100 * gib, &exhausted));
     var never = Fake{ .seq = &.{200 * gib} };
-    try testing.expectEqual(@as(u64, 120 * gib), settleAvailableBytes(120 * gib, 100 * gib, &never));
+    try testing.expectEqual(@as(?u64, 120 * gib), settleAvailableBytes(120 * gib, 100 * gib, &never));
     try testing.expectEqual(@as(usize, 0), never.i);
+}
+
+test "a load beside buffers past a bound reads that bound as 0 and is refused; only a figure never read admits it" {
+    const gib: u64 = 1 << 30;
+    // 12 GiB active past a declared floor of 8 GiB, under a 94 GiB working set, with 88 GiB of RAM free.
+    const past_floor = sushiAvailable(88 * gib, 0, 94 * gib, 12 * gib, 8 * gib);
+    try testing.expectEqual(@as(?u64, 0), past_floor.bytes);
+    try testing.expectEqual(SushiAvailable.Bound.wired_limit, past_floor.bound());
+    try testing.expect(memInsufficientForLoad(gib, past_floor.bytes, 2 * gib));
+    // Past Metal's working set with no declared limit: the GPU bound.
+    const past_gpu = sushiAvailable(88 * gib, 0, 40 * gib, 40 * gib, 0);
+    try testing.expectEqual(SushiAvailable.Bound.gpu_limit, past_gpu.bound());
+    try testing.expect(memInsufficientForLoad(gib, past_gpu.bytes, 2 * gib));
+    // No RAM reading, no working set, no declared limit: nothing to refuse by.
+    const unread = sushiAvailable(0, 0, 0, 12 * gib, 0);
+    try testing.expectEqual(@as(?u64, null), unread.bytes);
+    try testing.expect(!memInsufficientForLoad(gib, unread.bytes, 2 * gib));
+    // A failed RAM query leaves the working set to bound the load.
+    try testing.expectEqual(@as(?u64, 28 * gib), sushiAvailable(0, 0, 40 * gib, 12 * gib, 0).bytes);
 }
 
 test "Sushi quant memory subtracts existing resident buffers from the GPU limit" {
     const gib: u64 = 1 << 30;
-    try testing.expectEqual(@as(u64, 54 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 94 * gib, 40 * gib, 0));
-    try testing.expectEqual(@as(u64, 30 * gib), effectiveSushiAvailableBytes(30 * gib, 0, 94 * gib, 40 * gib, 0));
-    try testing.expectEqual(@as(u64, 0), effectiveSushiAvailableBytes(88 * gib, 0, 40 * gib, 40 * gib, 0));
-    try testing.expectEqual(@as(u64, 88 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 0, 40 * gib, 0));
+    try testing.expectEqual(@as(?u64, 54 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 94 * gib, 40 * gib, 0));
+    try testing.expectEqual(@as(?u64, 30 * gib), effectiveSushiAvailableBytes(30 * gib, 0, 94 * gib, 40 * gib, 0));
+    try testing.expectEqual(@as(?u64, 0), effectiveSushiAvailableBytes(88 * gib, 0, 40 * gib, 40 * gib, 0));
+    try testing.expectEqual(@as(?u64, 88 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 0, 40 * gib, 0));
 }
 
 test "under a declared wired limit the load preflight reads the free RAM when it is below the limit's floor, never past the working set" {
     const gib: u64 = 1 << 30;
     // 32 GB box, iogpu.wired_limit_mb raised, other apps holding RAM: the free RAM is what a load can have now.
-    try testing.expectEqual(@as(u64, 25 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 28 * gib));
-    try testing.expectEqual(@as(u64, 15 * gib), effectiveSushiAvailableBytes(15 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
+    try testing.expectEqual(@as(?u64, 25 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 28 * gib));
+    try testing.expectEqual(@as(?u64, 15 * gib), effectiveSushiAvailableBytes(15 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
     // A resident load of 20 GB that today's floor reading admitted with 12 GB free, to fail its warm, is refused.
     try testing.expect(memInsufficientForLoad(18 * gib, effectiveSushiAvailableBytes(12 * gib, 0, 29 * gib, 0, 28 * gib), 20 * gib));
     // More free RAM than the floor does not raise it: the declared limit is the ceiling, resident buffers off it.
-    try testing.expectEqual(@as(u64, 28 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 28 * gib));
-    try testing.expectEqual(@as(u64, 18 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
+    try testing.expectEqual(@as(?u64, 28 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 28 * gib));
+    try testing.expectEqual(@as(?u64, 18 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
     // A floor above the working set never raises the cap.
-    try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 31 * gib));
+    try testing.expectEqual(@as(?u64, 29 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 31 * gib));
 }
 
 test "the load preflight never reads more than the wired-limit ceiling its requests are admitted under" {
@@ -6859,9 +6903,10 @@ test "the exact load bill admits a MiMo load the flat 7 GiB headroom refused" {
     try testing.expect(!memInsufficientForLoad(weights, available, exact));
     try testing.expect(!memInsufficientForLoad(weights, exact, exact));
     try testing.expect(memInsufficientForLoad(weights, exact - 1, exact));
-    // Unknown figures (a failed memory query, an unmeasurable size) never block a load.
+    // Unknown figures (a failed memory query, an unmeasurable size) never block a load; a bound read as exhausted does.
     try testing.expect(!memInsufficientForLoad(0, available, exact));
-    try testing.expect(!memInsufficientForLoad(weights, 0, exact));
+    try testing.expect(!memInsufficientForLoad(weights, null, exact));
+    try testing.expect(memInsufficientForLoad(weights, 0, exact));
 }
 
 test "the eviction gate bills weights plus 10% headroom" {
