@@ -2408,7 +2408,8 @@ pub fn memoryRefusalMessage(
     const have = if (carries_cache) bill.available +| bill.evictionCredit() else bill.available;
     const u = Mem.unitOf(bill.needed, have);
     try w.print("Not enough GPU memory for this request: with a {d}-token prompt and max_tokens {d} it needs {f}, and {f} is available", .{ prompt_len, max_tokens, Mem.need(bill.needed, u), Mem.have(have, u) });
-    if (carries_cache) try w.print(", counting the {f} the prefix cache can give back", .{Mem.have(bill.evictionCredit(), u)});
+    const credit = Mem.have(bill.evictionCredit(), u);
+    if (carries_cache and credit.units > 0) try w.print(", counting the {f} the prefix cache can give back", .{credit});
     if (fitting_max_tokens > 0)
         try w.print(".\nmax_tokens {d} fits: lower max_tokens to {d} or less, shorten the prompt, or free memory (quit other apps or unload another model).", .{ fitting_max_tokens, fitting_max_tokens })
     else

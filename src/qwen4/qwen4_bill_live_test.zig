@@ -3,6 +3,8 @@ const bills = @import("../bills.zig");
 const fixtures = @import("../bills_fixtures_test.zig");
 const launch_state = @import("../server_state.zig");
 const model_mod = @import("../model.zig");
+const model_load = @import("../model_load.zig");
+const http_conn = @import("../http_conn.zig");
 const prefix_cache_mod = @import("../prefix_cache.zig");
 const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const settings_resolve = @import("../settings_resolve.zig");
@@ -434,4 +436,72 @@ test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bi
     const cfg = qwen4ExpOomConfig();
     const terms = prefillRequestTerms(&cfg, seq, clamped, 8, 4096, .{});
     try t.expect(terms.reserved_kv_bytes < 4 * 1024 * 1024 * 1024);
+}
+
+test "Flash-Next streamed: a request refused at admission for its max_tokens names the max_tokens that fits, and no empty prefix-cache clause (QWEN4_STQ_TINY)" {
+    const t = std.testing;
+    const a = t.allocator;
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const saved_ctx = launch_state.server_config.max_context_size;
+    defer launch_state.server_config.max_context_size = saved_ctx;
+    const saved_mtp = launch_state.configured_mtp;
+    defer launch_state.configured_mtp = saved_mtp;
+    launch_state.configured_mtp = null;
+    var config = try model_mod.parseConfig(t.io, a, dir);
+    defer config.deinit(a);
+    model_load.applyModelSettings(&config, .{});
+    launch_state.server_config.max_context_size = config.contextCap();
+    // The smallest budget the tiny pack plans: a streamed load, its experts read from the SSD.
+    var budget: u64 = 1 << 30;
+    const plan = while (budget <= 64 << 30) : (budget += 1 << 30) {
+        break model_load.planExpertStreamingWith(t.io, a, &config, dir, budget, false, 0) catch continue;
+    } else return error.TestUnexpectedResult;
+    model_load.applyStreamingPlan(&config, plan, budget);
+    try t.expect(config.expert_streaming and !config.expert_resident);
+    // A declared GPU limit whose floor is `room` past what the process holds: the streamed load's ceiling.
+    const ram = @import("../status.zig").getTotalMemBytes();
+    const saved_margin = launch_state.wired_limit_margin_bytes;
+    defer launch_state.wired_limit_margin_bytes = saved_margin;
+    bills.wired_limit_mb_override = ram >> 20;
+    defer bills.wired_limit_mb_override = null;
+    var prompt: [15]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast(i + 10);
+    const asked: u32 = @intCast(config.contextCap() - prompt.len);
+    const Ask = struct {
+        fn at(max_tokens: u32, cfg: *const model_mod.ModelConfig, ids: []const u32, out: []u8) !struct { admitted: bool, body: []const u8 } {
+            var sv: [2]std.posix.fd_t = undefined;
+            try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+            defer _ = std.c.close(sv[1]);
+            var conn: http_conn.Conn = undefined;
+            http_conn.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+            const admitted = try server.checkAttentionMemory(t.allocator, &conn, ids, max_tokens, cfg, "", false, null, false, false);
+            _ = std.c.close(sv[0]);
+            const raw = server.readAllFromPair(sv[1], out);
+            return .{ .admitted = admitted, .body = raw[(std.mem.indexOf(u8, raw, "\r\n\r\n") orelse 0)..] };
+        }
+    };
+    const active = @import("../gpu_mem.zig").activeBytes();
+    var buf: [8192]u8 = undefined;
+    // The least room that admits a one-token reply: there the prompt fits and the whole context does not.
+    var lo: u64 = 1 << 20;
+    var hi: u64 = 4 << 30;
+    while (hi - lo > 1 << 20) {
+        const mid = lo + (hi - lo) / 2;
+        launch_state.wired_limit_margin_bytes = (ram -| mid) -| active;
+        if ((try Ask.at(1, &config, &prompt, &buf)).admitted) hi = mid else lo = mid;
+    }
+    launch_state.wired_limit_margin_bytes = (ram -| hi) -| active;
+    const got = try Ask.at(asked, &config, &prompt, &buf);
+    errdefer std.debug.print("the streamed load's refusal at {d} MB of room: {s}\n", .{ hi >> 20, got.body });
+    try t.expect(!got.admitted);
+    try t.expect(std.mem.indexOf(u8, got.body, "Reduce prompt size") == null);
+    try t.expect(std.mem.indexOf(u8, got.body, "prefix cache can give back") == null);
+    try t.expect(std.mem.indexOf(u8, got.body, "--ctx-size") == null);
+    const key = " fits: lower max_tokens to ";
+    const at = std.mem.indexOf(u8, got.body, key) orelse return error.TestUnexpectedResult;
+    const rest = got.body[at + key.len ..];
+    const fits = try std.fmt.parseInt(u32, rest[0..std.mem.indexOfScalar(u8, rest, ' ').?], 10);
+    // The max_tokens it names is admitted on the same memory.
+    var again: [8192]u8 = undefined;
+    try t.expect((try Ask.at(fits, &config, &prompt, &again)).admitted);
 }

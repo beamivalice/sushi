@@ -40,7 +40,7 @@ earlier history is mlx-serve's, in that project's changelog.
   every 400. Each refusal now names its own actions, and the chat adds none to a 400 or 503.
 - **A streamed load whose SSD streaming memory is too small names the smallest setting that loads it**: it read
   "--ssd-budget-gb leaves no room for an expert cache after the resident trunk ... Raise the budget", with no figure.
-- **A request refused for memory on a model without a Sushi bill names the `max_tokens` that fits**: it read "Prompt (98
+- **A request refused for memory on a model without a Sushi bill, or a streamed one, names the `max_tokens` that fits**: it read "Prompt (98
   tokens) requires ~635MB GPU memory but only ~635MB available. Reduce prompt size", though `max_tokens` was the cause
   and the need was over what was available; it now gives both figures, need above what is available, and the largest
   `max_tokens` that fits, or says the prompt alone does not fit.
