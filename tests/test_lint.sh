@@ -575,6 +575,17 @@ printf '%s\n' 'const std = @import("std");' 'const log = @import("log.zig");' 'p
   '    std.log.info("no end", .{});' '}' > "$TMP/t/src/p.zig"
 expect_green "a line end, a whole line passed through, a joined format and another logger"
 
+# rule scheduler-hand-built
+tree
+printf '%s\n' 'const scheduler_mod = @import("scheduler.zig");' 'test "t" {' '    var sch: scheduler_mod.Scheduler = undefined;' \
+  '    sch.queue_cap = 2;' '    _ = try sch.submit(.{});' '}' > "$TMP/t/src/p.zig"
+expect_red "a field-by-field Scheduler given a submit" "src/p.zig:3:9 \[scheduler-hand-built\] t: Scheduler 'sch' built field by field reaches submit"
+
+tree
+printf '%s\n' 'const scheduler_mod = @import("scheduler.zig");' 'test "t" {' '    var sch = scheduler_mod.submitTestScheduler(a, 2);' \
+  '    _ = try sch.submit(.{});' '    var bare: scheduler_mod.Scheduler = undefined;' '    _ = bare.cancelSlotById(1);' '}' > "$TMP/t/src/p.zig"
+expect_green "a Scheduler from submitTestScheduler, and a bare one that never submits"
+
 # the allowlist
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn handleOf(s: *S) *S { return s; }' 'fn f(self: *const S) *S {' \

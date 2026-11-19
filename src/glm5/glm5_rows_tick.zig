@@ -437,20 +437,7 @@ test "a resident GLM batches plain rows four at a time, a streamed one stays ser
 test "every GLM slot owns its native request and hands it to its forward context" {
     if (comptime !@hasField(arch_state.Ctx, "glm5")) return error.SkipZigTest;
     const allocator = testing.allocator;
-    var sch: Scheduler = undefined;
-    sch.allocator = allocator;
-    sch.io = testing.io;
-    sch.kv_quant = .dense;
-    sch.queue_mu = .init;
-    sch.queue_cond = .init;
-    sch.submit_cond = .init;
-    sch.shutdown = .init(false);
-    sch.queue_cap = 2;
-    sch.in_flight = 0;
-    sch.pending = .empty;
-    sch.decoding = .empty;
-    sch.cleanup_queue = .empty;
-    sch.prefilling = .empty;
+    var sch = scheduler_mod.submitTestScheduler(allocator, 2);
     defer sch.pending.deinit(allocator);
     defer sch.decoding.deinit(allocator);
     defer sch.cleanup_queue.deinit(allocator);
@@ -475,20 +462,7 @@ test "every GLM slot owns its native request and hands it to its forward context
 
 test "a GLM slot submitted with a kv4 override is refused by the same name admission uses elsewhere" {
     const allocator = testing.allocator;
-    var sch: Scheduler = undefined;
-    sch.allocator = allocator;
-    sch.io = testing.io;
-    sch.kv_quant = .dense;
-    sch.queue_mu = .init;
-    sch.queue_cond = .init;
-    sch.submit_cond = .init;
-    sch.shutdown = .init(false);
-    sch.queue_cap = 2;
-    sch.in_flight = 0;
-    sch.pending = .empty;
-    sch.decoding = .empty;
-    sch.cleanup_queue = .empty;
-    sch.prefilling = .empty;
+    var sch = scheduler_mod.submitTestScheduler(allocator, 2);
     defer sch.pending.deinit(allocator);
     defer sch.decoding.deinit(allocator);
     defer sch.cleanup_queue.deinit(allocator);

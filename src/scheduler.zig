@@ -5358,21 +5358,7 @@ test "a saved SSD-cache setting makes the re-arm check due at once, a declined t
 
 test "complete keeps a slot in decoding until its pass is out, so admission never misses it" {
     const allocator = testing.allocator;
-    var sch: Scheduler = undefined;
-    sch.allocator = allocator;
-    sch.io = testing.io;
-    sch.kv_quant = .dense;
-    sch.queue_mu = .init;
-    sch.queue_cond = .init;
-    sch.submit_cond = .init;
-    sch.shutdown = .init(false);
-    sch.draining = false;
-    sch.queue_cap = 2;
-    sch.in_flight = 0;
-    sch.pending = .empty;
-    sch.decoding = .empty;
-    sch.cleanup_queue = .empty;
-    sch.prefilling = .empty;
+    var sch = submitTestScheduler(allocator, 2);
     defer sch.pending.deinit(allocator);
     defer sch.decoding.deinit(allocator);
     defer sch.cleanup_queue.deinit(allocator);
@@ -5861,21 +5847,7 @@ test "a model load or unload waits for every queued slot to be destroyed" {
 
 test "a per-request kv_quant override (16, \"16\", 8, 6, 4) reaches the submitted slot's cache as that scheme" {
     const allocator = testing.allocator;
-    var sch: Scheduler = undefined;
-    sch.allocator = allocator;
-    sch.io = testing.io;
-    sch.kv_quant = .dense;
-    sch.queue_mu = .init;
-    sch.queue_cond = .init;
-    sch.submit_cond = .init;
-    sch.shutdown = .init(false);
-    sch.draining = false;
-    sch.queue_cap = 2;
-    sch.in_flight = 0;
-    sch.pending = .empty;
-    sch.decoding = .empty;
-    sch.cleanup_queue = .empty;
-    sch.prefilling = .empty;
+    var sch = submitTestScheduler(allocator, 2);
     defer sch.pending.deinit(allocator);
     defer sch.decoding.deinit(allocator);
     defer sch.cleanup_queue.deinit(allocator);
@@ -5905,21 +5877,7 @@ test "a per-request kv_quant override (16, \"16\", 8, 6, 4) reaches the submitte
 
 test "an empty prompt is refused at submit, before any slot reaches the inference thread" {
     const allocator = testing.allocator;
-    var sch: Scheduler = undefined;
-    sch.allocator = allocator;
-    sch.io = testing.io;
-    sch.kv_quant = .dense;
-    sch.queue_mu = .init;
-    sch.queue_cond = .init;
-    sch.submit_cond = .init;
-    sch.shutdown = .init(false);
-    sch.draining = false;
-    sch.queue_cap = 2;
-    sch.in_flight = 0;
-    sch.pending = .empty;
-    sch.decoding = .empty;
-    sch.cleanup_queue = .empty;
-    sch.prefilling = .empty;
+    var sch = submitTestScheduler(allocator, 2);
     defer sch.pending.deinit(allocator);
     defer sch.decoding.deinit(allocator);
     defer sch.cleanup_queue.deinit(allocator);
@@ -5937,21 +5895,7 @@ test "an empty prompt is refused at submit, before any slot reaches the inferenc
 test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
     try mlx.requireGpu();
     const allocator = testing.allocator;
-    var sch: Scheduler = undefined;
-    sch.allocator = allocator;
-    sch.io = testing.io;
-    sch.kv_quant = .dense;
-    sch.queue_mu = .init;
-    sch.queue_cond = .init;
-    sch.submit_cond = .init;
-    sch.shutdown = .init(false);
-    sch.draining = false;
-    sch.queue_cap = 2;
-    sch.in_flight = 0;
-    sch.pending = .empty;
-    sch.decoding = .empty;
-    sch.cleanup_queue = .empty;
-    sch.prefilling = .empty;
+    var sch = submitTestScheduler(allocator, 2);
     defer sch.pending.deinit(allocator);
     defer sch.decoding.deinit(allocator);
     defer sch.cleanup_queue.deinit(allocator);
@@ -5996,23 +5940,7 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
     model.config = &cfg;
     model.handle = null;
     model.prefix_cache = null;
-    var sch: Scheduler = undefined;
-    sch.allocator = allocator;
-    sch.io = testing.io;
-    sch.kv_quant = .dense;
-    sch.queue_mu = .init;
-    sch.queue_cond = .init;
-    sch.submit_cond = .init;
-    sch.shutdown = .init(false);
-    sch.draining = false;
-    sch.queue_cap = 2;
-    sch.in_flight = 0;
-    sch.pending = .empty;
-    sch.decoding = .empty;
-    sch.cleanup_queue = .empty;
-    sch.prefilling = .empty;
-    sch.load_queue = .empty;
-    sch.vision_queue = .empty;
+    var sch = submitTestScheduler(allocator, 2);
     defer sch.pending.deinit(allocator);
     defer sch.decoding.deinit(allocator);
     defer sch.cleanup_queue.deinit(allocator);

@@ -43,6 +43,7 @@ const rules = .{
     @import("host_maker_unchecked.zig"),
     @import("array_unowned_across_try.zig"),
     @import("caught_error_unsettled.zig"),
+    @import("scheduler_hand_built.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };
