@@ -685,8 +685,8 @@ pub const FitReadings = struct {
     cache: u64 = 0,
     free: u64 = 0,
     total_ram: u64 = 0,
-    /// What a raised GPU limit must hold beside the load: the active buffers and the unplanned margin.
-    gpu_beside: u64 = 0,
+    /// What stays unplanned under a declared limit (`wiredUnplannedBytes`): a raised limit holds it beside the load.
+    unplanned: u64 = 0,
 
     pub fn now(config: *const model_mod.ModelConfig) FitReadings {
         const active: u64 = gpu_mem.activeBytes();
@@ -699,7 +699,7 @@ pub const FitReadings = struct {
             .cache = gpu_mem.cacheBytes(),
             .free = metrics.getAvailableMemBytes(),
             .total_ram = metrics.getTotalMemBytes(),
-            .gpu_beside = active +| wiredUnplannedBytes(launch_state.wired_limit_margin_bytes, gpu_floor_bytes.load(.monotonic)),
+            .unplanned = wiredUnplannedBytes(launch_state.wired_limit_margin_bytes, gpu_floor_bytes.load(.monotonic)),
         };
     }
 };
@@ -724,6 +724,8 @@ pub fn expertCacheRefusal(config: *const model_mod.ModelConfig, resident_bytes: 
             .needed = budget +| beside,
             .avail = .{ .bytes = limit, .free = null, .gpu = if (r.wired_floor > 0) null else limit, .declared = if (r.wired_floor > 0) limit else null },
             .wired_limit_mb = if (r.wired_floor > 0) r.wired_limit >> 20 else 0,
+            // The budget is admitted against the limit as a whole, less what stays unplanned under it.
+            .wired_beside = r.unplanned,
             .total_ram = r.total_ram,
             .check = .budget,
         }, .readings = r };
@@ -739,7 +741,7 @@ pub fn expertCacheRefusal(config: *const model_mod.ModelConfig, resident_bytes: 
         .needed = expertStreamingFitNeed(config, 0, resident_bytes),
         .avail = avail,
         .wired_limit_mb = if (r.wired_floor > 0) r.wired_limit >> 20 else 0,
-        .wired_beside = r.gpu_beside,
+        .wired_beside = r.active +| r.unplanned,
         .total_ram = r.total_ram,
         .check = .fit,
     }, .readings = r };
@@ -6931,8 +6933,9 @@ pub const LoadMemoryRefusal = struct {
     avail: SushiAvailable,
     /// `iogpu.wired_limit_mb` as set (0: macOS's default).
     wired_limit_mb: u64 = 0,
-    /// What a raised `iogpu.wired_limit_mb` holds beside the load: the buffers already active and the unplanned margin.
-    wired_beside: u64 = 0,
+    /// What a raised `iogpu.wired_limit_mb` holds beside the load: the buffers already active (none for the budget
+    /// check) and the unplanned margin. No default: a limit named without it is refused by the check it names.
+    wired_beside: u64,
     total_ram: u64 = 0,
     knob: Knob = .none,
     check: Check = .preflight,
@@ -6996,7 +6999,13 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
             if (r.check == .budget) try w.print(" for SSD streaming and the context it plans", .{});
             try w.print(", and the GPU memory limit (", .{});
             if (r.wired_limit_mb > 0) try w.print("iogpu.wired_limit_mb = {d} MB", .{r.wired_limit_mb}) else try w.print("macOS's default", .{});
-            try w.print(") {s} {f}{s}: about {f} short.", .{ if (r.check == .budget) "is" else "leaves", Mem.have(a.bytes.?, u), if (r.check == .budget) "" else " beside what is already loaded", Mem.short(r.needed, a.bytes.?, u) });
+            if (r.check != .budget)
+                try w.print(") leaves {f} beside what is already loaded", .{Mem.have(a.bytes.?, u)})
+            else if (r.wired_limit_mb > 0)
+                try w.print(") leaves {f} once {f} stays unplanned under it", .{ Mem.have(a.bytes.?, u), Mem.need(r.wired_beside, u) })
+            else
+                try w.print(") is {f}", .{Mem.have(a.bytes.?, u)});
+            try w.print(": about {f} short.", .{Mem.short(r.needed, a.bytes.?, u)});
             if (a.free) |f| {
                 try w.print(" {f} of RAM is free", .{Mem.have(f, u)});
                 if (ram_short > 0) try w.print(", about {f} short as well", .{Mem.short(r.needed, f, u)});
@@ -7570,7 +7579,7 @@ test "a refused load's message names the bound in words, the shortfall and the b
     try has(no_raise, "This Mac cannot give the GPU enough memory for it");
     try testing.expect(std.mem.indexOf(u8, no_raise, "sudo sysctl") == null);
     // The shortfall rounds up to a tenth of a GB.
-    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib + 1, .avail = by_free }), "Free about 8.1 GB more.");
+    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib + 1, .avail = by_free, .wired_beside = 0 }), "Free about 8.1 GB more.");
     // The preflight line names the bound in words.
     try testing.expectEqualStrings("bound by free RAM, 12.0 GB; the GPU memory limit allows 28.0 GB", sushiAvailableLine(&buf, by_free, 29696));
     try testing.expectEqualStrings("bound by the GPU memory limit (iogpu.wired_limit_mb = 29696 MB): 18.0 GB beside what is already loaded; 40.0 GB of RAM free", sushiAvailableLine(&buf, by_floor, 29696));
@@ -7664,7 +7673,7 @@ test "a load refused a byte short never shows its need equal to what is free, an
     const gib: u64 = 1 << 30;
     var buf: [2048]u8 = undefined;
     const by_free = sushiAvailable(20 * gib, 0, 60 * gib, 0, 0);
-    const text = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib + 1, .avail = by_free });
+    const text = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib + 1, .avail = by_free, .wired_beside = 0 });
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "It needs 20.1 GB, and only 20.0 GB of RAM is free right now") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Free about 0.1 GB more.") != null);
@@ -7686,10 +7695,11 @@ test "a streamed load whose ssd budget passes the GPU limit is refused in the lo
     // The preflight's skip does not skip this check, so it is not offered.
     try testing.expect(std.mem.indexOf(u8, text, "--skip-mem-preflight") == null);
     // A 256 GB Mac can raise its limit to hold it.
-    const big = expertCacheRefusal(&cfg, 0, .{ .budget_working_set = 192 * gib, .wired_limit = 140 * gib, .wired_floor = 140 * gib, .total_ram = 256 * gib }).?;
+    // Its declared limit's floor is the limit less what stays unplanned under it, which the raise holds too.
+    const big = expertCacheRefusal(&cfg, 0, .{ .budget_working_set = 192 * gib, .wired_limit = 141 * gib, .wired_floor = 140 * gib, .total_ram = 256 * gib, .unplanned = gib }).?;
     const raised = loadMemoryRefusalText(&buf, big.refusal);
-    try testing.expect(std.mem.indexOf(u8, raised, "the GPU memory limit (iogpu.wired_limit_mb = 143360 MB) is 140.0 GB: about 10.0 GB short.") != null);
-    try testing.expect(std.mem.indexOf(u8, raised, "sudo sysctl iogpu.wired_limit_mb=153600 ") != null);
+    try testing.expect(std.mem.indexOf(u8, raised, "the GPU memory limit (iogpu.wired_limit_mb = 144384 MB) leaves 140.0 GB once 1.0 GB stays unplanned under it: about 10.0 GB short.") != null);
+    try testing.expect(std.mem.indexOf(u8, raised, "sudo sysctl iogpu.wired_limit_mb=154700 ") != null);
 }
 
 test "a streamed load whose expert cache does not fit its ceiling is refused with the figures, the bound and its actions" {
@@ -7698,7 +7708,7 @@ test "a streamed load whose expert cache does not fit its ceiling is refused wit
     cfg.expert_cache_bytes = gib;
     var buf: [2048]u8 = undefined;
     // 2 GiB loaded under a 3 GiB working set leaves 1 GiB; the load needs its 1 GiB cache and 0.5 GiB resident beside the rest.
-    const readings = FitReadings{ .working_set = 3 * gib, .active = 2 * gib, .free = 10 * gib, .total_ram = 64 * gib, .gpu_beside = 3 * gib };
+    const readings = FitReadings{ .working_set = 3 * gib, .active = 2 * gib, .free = 10 * gib, .total_ram = 64 * gib, .unplanned = gib };
     const r = expertCacheRefusal(&cfg, gib / 2, readings).?;
     try testing.expectEqual(error.ExpertCacheDoesNotFit, r.err);
     try testing.expectEqual(expertStreamingFitNeed(&cfg, 0, gib / 2), r.refusal.needed);
@@ -7774,10 +7784,10 @@ test "a load refusal names the setting it asks to lower by its Settings label an
             try testing.expect(std.mem.indexOf(u8, text, part) != null);
         }
     }.f;
-    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ctx_size = .{ .requested = 262144, .fits = 65536 } } }), "- Lower Context length in this model's settings (--ctx-size) to 65536 or less (it is 262144).");
-    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ctx_size = .{ .requested = 262144, .fits = 65536, .from_flag = true } } }), "- Restart sushi with --ctx-size 65536 or less (it is 262144; the flag outranks Context length in Settings).");
-    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15 } } }), "- Lower Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to 15 (it is 18)");
-    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15, .from_flag = true } } }), "- Restart sushi with --ssd-budget-gb 15 (it is 18; the flag outranks Memory for SSD streaming (GiB) in Settings)");
+    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .wired_beside = 0, .knob = .{ .ctx_size = .{ .requested = 262144, .fits = 65536 } } }), "- Lower Context length in this model's settings (--ctx-size) to 65536 or less (it is 262144).");
+    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .wired_beside = 0, .knob = .{ .ctx_size = .{ .requested = 262144, .fits = 65536, .from_flag = true } } }), "- Restart sushi with --ctx-size 65536 or less (it is 262144; the flag outranks Context length in Settings).");
+    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .wired_beside = 0, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15 } } }), "- Lower Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to 15 (it is 18)");
+    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .wired_beside = 0, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15, .from_flag = true } } }), "- Restart sushi with --ssd-budget-gb 15 (it is 18; the flag outranks Memory for SSD streaming (GiB) in Settings)");
 }
 
 test "a load this Mac can never give the GPU enough memory for offers no free-RAM action, which cannot help" {
@@ -7785,7 +7795,7 @@ test "a load this Mac can never give the GPU enough memory for offers no free-RA
     var buf: [2048]u8 = undefined;
     // M1's 32 GB gate: 47.2 GB needed, 20.1 GB of RAM free, the GPU limit allows 26.3 GB.
     const avail = sushiAvailable(20 * gib + gib / 10, 0, 26 * gib + gib * 3 / 10, 0, 0);
-    const text = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib + gib / 5, .avail = avail, .total_ram = 32 * gib });
+    const text = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib + gib / 5, .avail = avail, .wired_beside = 0, .total_ram = 32 * gib });
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "This Mac cannot give the GPU enough memory for it") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Quit other apps or unload another model to free about") == null);
@@ -7796,7 +7806,7 @@ test "a resident load of a pack that can stream names the ssd budget that fits" 
     const gib: u64 = 1 << 30;
     var buf: [2048]u8 = undefined;
     const avail = sushiAvailable(20 * gib, 0, 26 * gib, 0, 0);
-    const text = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .total_ram = 32 * gib, .stream_fits_gb = 17 });
+    const text = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0, .total_ram = 32 * gib, .stream_fits_gb = 17 });
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "- Stream its experts from the SSD: set Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to 17 or less") != null);
 }
@@ -7846,10 +7856,10 @@ test "a load refusal offers a smaller pack only when one exists, and says so whe
     const gib: u64 = 1 << 30;
     var buf: [2048]u8 = undefined;
     const avail = sushiAvailable(20 * gib, 0, 26 * gib, 0, 0);
-    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .smaller_pack = .none }), "smaller pack") == null);
-    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .smaller_pack = .exists }), "- Use a smaller pack of this model.\n") != null);
-    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail }), "- Use a smaller pack of this model, if one exists.\n") != null);
+    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0, .smaller_pack = .none }), "smaller pack") == null);
+    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0, .smaller_pack = .exists }), "- Use a smaller pack of this model.\n") != null);
+    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0 }), "- Use a smaller pack of this model, if one exists.\n") != null);
     // Streaming, when it fits, is the first action.
-    const streamed = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .total_ram = 32 * gib, .stream_fits_gb = 17 });
+    const streamed = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0, .total_ram = 32 * gib, .stream_fits_gb = 17 });
     try testing.expect(std.mem.indexOf(u8, streamed, "To load it:\n- Stream its experts from the SSD") != null);
 }

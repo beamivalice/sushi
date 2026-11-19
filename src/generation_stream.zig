@@ -2272,7 +2272,7 @@ test "a memory-refused load's 503 carries the check's whole text, its lines inta
     const a = std.testing.allocator;
     var text_buf: [2048]u8 = undefined;
     const gib: u64 = 1 << 30;
-    const text = bills_mod.loadMemoryRefusalText(&text_buf, .{ .needed = 20 * gib, .avail = bills_mod.sushiAvailable(12 * gib, 0, 29 * gib, 0, 28 * gib) });
+    const text = bills_mod.loadMemoryRefusalText(&text_buf, .{ .needed = 20 * gib, .avail = bills_mod.sushiAvailable(12 * gib, 0, 29 * gib, 0, 28 * gib), .wired_beside = 0 });
     scheduler_mod.recordLoadRefusal(text);
     const context = model_registry_mod.MemoryContextRefusal{ .requested = 9, .maximum = 4, .needed = 1, .available = 0, .kv_bits = 8, .chunk = 512 };
     const message = try loadRefusalMessage(a, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context);

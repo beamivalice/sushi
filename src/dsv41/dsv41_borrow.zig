@@ -1268,7 +1268,7 @@ const RefusingFit = struct {
     var free_cap_seen: ?u64 = null;
     fn fit(_: *const ModelConfig, _: u64) ?@import("../bills.zig").ExpertCacheRefusal {
         free_cap_seen = @import("../tensor/core.zig").free_cap;
-        return .{ .err = error.ExpertCacheDoesNotFit, .refusal = .{ .needed = 1, .avail = .{ .bytes = 0, .free = 0 } }, .readings = .{} };
+        return .{ .err = error.ExpertCacheDoesNotFit, .refusal = .{ .needed = 1, .avail = .{ .bytes = 0, .free = 0 }, .wired_beside = 0 }, .readings = .{} };
     }
 };
 

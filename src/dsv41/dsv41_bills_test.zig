@@ -465,6 +465,36 @@ test "DeepSeek: a streamed load the preflight and the fit admit on a 32 GB Mac l
     try t.expect(bills.defaultRequestBill(&config) >= bills.warmFloorChunkBytes(&config));
 }
 
+test "DeepSeek: the iogpu.wired_limit_mb a refused ssd budget names admits that budget, the unplanned margin under it included" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const ram: u64 = 128 * GiB;
+    // macOS's default limit and two declared ones, at the default margin and a raised one; a budget just past each.
+    for ([_]u64{ 1, 4 }) |margin_gib| for ([_]u64{ 0, 100_000, 110_000 }) |wired_mb| {
+        const unplanned = margin_gib * GiB;
+        const floor = bills.wiredLimitFloor(wired_mb * MiB, ram, unplanned);
+        const r = bills.FitReadings{ .wired_limit = wired_mb * MiB, .wired_floor = floor, .budget_working_set = 96 * GiB, .working_set = 96 * GiB, .free = ram, .total_ram = ram, .unplanned = unplanned };
+        const limit = if (floor > 0) floor else r.budget_working_set;
+        config.expert_ssd_budget_bytes = (limit -| bills.expertStreamingBesideBudgetBytes(&config)) / GiB * GiB + GiB;
+        const refused = bills.expertCacheRefusal(&config, 0, r) orelse return error.TestExpectedRefusal;
+        try t.expectEqual(error.SsdBudgetExceedsWiredLimit, refused.err);
+        const mb = refused.refusal.wiredLimitThatFits() orelse return error.TestExpectedWiredLimit;
+        var raised = r;
+        raised.wired_limit = mb * MiB;
+        raised.wired_floor = bills.wiredLimitFloor(mb * MiB, ram, unplanned);
+        if (bills.expertCacheRefusal(&config, 0, raised)) |again| {
+            var buf: [2048]u8 = undefined;
+            std.debug.print("margin {d} GiB, iogpu.wired_limit_mb {d}, --ssd-budget-gb {d}: the refusal names {d}, under which the same check refuses again:\n{s}\n", .{ margin_gib, wired_mb, config.expert_ssd_budget_bytes / GiB, mb, bills.loadMemoryRefusalText(&buf, again.refusal) });
+            return error.TestUnexpectedResult;
+        }
+    };
+}
+
 /// A DeepSeek prompt of `seq` tokens on a machine with `avail` bytes free beside the load, as serve runs it: admission
 /// picks and bills its width, the per-chunk hook narrows the adaptive start, and before each forward the borrow covers
 /// its need from the headroom and the decoder pools. On a Cooler load the engine keeps `free_pct`% of the last forward's
