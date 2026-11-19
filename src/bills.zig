@@ -6493,10 +6493,9 @@ pub fn rerankCoarseBill(split: model_mod.ResidentSplit, config: *const model_mod
 /// 8 GB iPhone reported ~4 GB host-free and the preflight refused a 3.6 GB
 /// model that fit comfortably inside the ~6.4 GB process limit.
 /// `gpu_limit` = Metal's working-set limit (0 = unknown): a lowered `iogpu.wired_limit_mb` binds
-/// below free RAM, and weights past it OOM in warmup instead of refusing by name.
-pub fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64 {
-    const avail = if (proc_avail > 0) proc_avail else host_avail;
-    return if (gpu_limit > 0) @min(avail, gpu_limit) else avail;
+/// below free RAM, and weights past it OOM in warmup instead of refusing by name. Null when neither was read.
+pub fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) ?u64 {
+    return sushiAvailable(host_avail, proc_avail, gpu_limit, 0, 0).bytes;
 }
 
 /// A just-exited process returns its Metal memory over seconds: while a short reading keeps
@@ -6867,15 +6866,23 @@ test "the load preflight never reads more than the wired-limit ceiling its reque
 
 test "effectiveAvailableBytes is capped by the GPU working-set limit" {
     const GB: u64 = 1024 * 1024 * 1024;
-    try std.testing.expectEqual(36 * GB, effectiveAvailableBytes(98 * GB, 0, 36 * GB));
+    try std.testing.expectEqual(@as(?u64, 36 * GB), effectiveAvailableBytes(98 * GB, 0, 36 * GB));
     try std.testing.expect(memInsufficientForLoad(70 * GB, effectiveAvailableBytes(98 * GB, 0, 36 * GB), 71 * GB));
+}
+
+test "an MLX load whose free-RAM query failed is bounded by the working set; only no figure at all admits it" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // The two calls GLM's BF16 DFlash2 fallback makes: the figure, then the rule.
+    try std.testing.expectEqual(@as(?u64, 36 * GB), effectiveAvailableBytes(0, 0, 36 * GB));
+    try std.testing.expect(memInsufficientForLoad(30 * GB, effectiveAvailableBytes(0, 0, 36 * GB), 40 * GB));
+    try std.testing.expectEqual(@as(?u64, null), effectiveAvailableBytes(0, 0, 0));
+    try std.testing.expect(!memInsufficientForLoad(30 * GB, effectiveAvailableBytes(0, 0, 0), 40 * GB));
 }
 
 test "effectiveAvailableBytes prefers the per-process jetsam headroom when present" {
     const GB: u64 = 1024 * 1024 * 1024;
-    try std.testing.expectEqual(6 * GB, effectiveAvailableBytes(4 * GB, 6 * GB, 0)); // iOS: proc wins
-    try std.testing.expectEqual(4 * GB, effectiveAvailableBytes(4 * GB, 0, 0)); // macOS: proc query = 0 → host
-    try std.testing.expectEqual(@as(u64, 0), effectiveAvailableBytes(0, 0, 0)); // both unknown → 0 (never blocks)
+    try std.testing.expectEqual(@as(?u64, 6 * GB), effectiveAvailableBytes(4 * GB, 6 * GB, 0)); // iOS: proc wins
+    try std.testing.expectEqual(@as(?u64, 4 * GB), effectiveAvailableBytes(4 * GB, 0, 0)); // macOS: proc query = 0 → host
 }
 
 test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net, and its warm's narrowest chunk past the live reserve" {

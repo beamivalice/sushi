@@ -83,8 +83,8 @@ pub fn prepareDrafter(io: std.Io, allocator: std.mem.Allocator, config: *const M
         if (!scheduler_mod.skipMemPreflight()) {
             const available = bills.effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
             const needed = model_load.loadRequirementBytes(config, bytes.?, false, 0);
-            log.info("[preflight] BF16 DFlash2 fallback: weights ~{d:.2} GiB, needs ~{d:.2} GiB, available {d:.2} GiB\n", .{ @as(f64, @floatFromInt(bytes.?)) / (1 << 30), @as(f64, @floatFromInt(needed)) / (1 << 30), @as(f64, @floatFromInt(available)) / (1 << 30) });
-            if (available > 0 and needed > available) return error.InsufficientMemory;
+            log.info("[preflight] BF16 DFlash2 fallback: weights ~{d:.2} GiB, needs ~{d:.2} GiB, available {?d} MiB\n", .{ @as(f64, @floatFromInt(bytes.?)) / (1 << 30), @as(f64, @floatFromInt(needed)) / (1 << 30), if (available) |b| b >> 20 else null });
+            if (bills.memInsufficientForLoad(bytes.?, available, needed)) return error.InsufficientMemory;
         }
     }
     _ = mlx.mlx_clear_cache();
