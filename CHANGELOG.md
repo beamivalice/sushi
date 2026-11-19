@@ -57,6 +57,8 @@ earlier history is mlx-serve's, in that project's changelog.
   command that fits (the same one Settings builds), the `--ctx-size` or `--ssd-budget-gb` that fits, or a smaller pack.
   Skipping the check comes last, with its risk. A DeepSeek prompt that runs out of memory partway through its prefill
   is answered the same way, naming the `--prefill-chunk` that fits, rather than "refused before any work started".
+- **A resident DeepSeek load without DSpark no longer compiles kernels inside a request** when nine or more requests
+  decode together: the load's warm now runs every joined width.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many

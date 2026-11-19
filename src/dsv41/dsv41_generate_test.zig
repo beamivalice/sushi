@@ -6244,6 +6244,52 @@ test "dsv41 engine: the release's layout (FP8 trunk, MXFP4 experts) serves one r
     try testing.expect(!m.serves_rows);
 }
 
+test "dsv41 engine: a load that joins rows, with DSpark or without, compiles nothing after its warm at joined rows of every width (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    // Pipelines are the process's: the load without DSpark goes first, before a round's warm makes any.
+    for ([_]bool{ false, true }) |dspark| {
+        var fx: EngineFixture = undefined;
+        try fx.prepare(dir, null, 64 << 20);
+        fx.config.stream_mtp_head = dspark;
+        fx.config.mtp_override = dspark;
+        fx.config.expert_resident = true;
+        try fx.load(dir);
+        defer fx.deinit();
+        const m = fx.model();
+        try testing.expectEqual(dspark, m.dspark != null);
+        // The load a fully resident plan makes: its rows are set before its warm (`dsv41_serving.applyRows`).
+        m.serves_rows = true;
+        defer m.serves_rows = false;
+        var buf: [8]u32 = undefined;
+        const base = fx.prompt(&buf);
+        const most = m.maxJoinedRows();
+        // Prompts of 7 tokens or fewer: only a joined forward runs more than 8 rows.
+        var prompts: [16][]const u32 = undefined;
+        for (prompts[0..most], 0..) |*p, i| p.* = base[0 .. 3 + i % 5];
+        mlx.engine.seal(false);
+        try dsv41_serving.warmAll(&fx.xfm, m, null, .all);
+        // Each prompt's own prefill, which a served load's request warm runs (`cooler_warm`): only joined rows are new.
+        for (0..5) |i| {
+            const solo = try @import("dsv41_contract.zig").greedyRows(a, &fx.xfm, prompts[i .. i + 1], 1);
+            for (solo) |*o| o.deinit(a);
+            a.free(solo);
+        }
+        mlx.engine.seal(true);
+        defer mlx.engine.seal(false);
+        const late = mlx.engine.latePipelines();
+        mlx.engine.late_names.clear();
+        for (2..most + 1) |k| {
+            const out = try @import("dsv41_contract.zig").greedyRows(a, &fx.xfm, prompts[0..k], 3);
+            for (out) |*o| o.deinit(a);
+            a.free(out);
+        }
+        if (mlx.engine.latePipelines() != late) std.debug.print("dsv41 engine: DSpark {}: {d} pipelines compiled after the warm at joined rows of 2..{d}:\n{s}\n", .{ dspark, mlx.engine.latePipelines() - late, most, mlx.engine.late_names.text() });
+        try testing.expectEqual(late, mlx.engine.latePipelines());
+    }
+}
+
 test "dsv41 engine: the scheduler's batched tick joins the slots' requests, each row its solo step's bytes, and moves each slot's position (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);

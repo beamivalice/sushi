@@ -171,6 +171,12 @@ pub fn enterWarmMlx(rows: u64, seq: u64, c: *const Config, own: bool) void {
     enterWarm(rows, seq, c, own, mlx_ops);
 }
 
+/// A joined decode forward of the load's warm, under the cap the served one installs (`enterRows`).
+pub fn enterWarmRowsMlx(seqs: []const u64, c: *const Config) void {
+    if (!warm_budget) return;
+    mlx_ops.set_own(ownBudget(c.joinedCap(seqs)));
+}
+
 /// The warm is over: the engine runs under no budget until a request's forward installs its own.
 pub fn endWarm(ops: PoolOps) void {
     warm_budget = false;

@@ -3495,6 +3495,38 @@ pub fn warmKernelsFor(m: *Model, scope: WarmScope) !void {
         try warmOwnCapture(m);
         try warmOwnImages(m);
         try warmOwnStream(m);
+        try warmOwnRows(m, ids[0]);
+    }
+}
+
+/// A load that joins rows (`serves_rows`): one `.rows` forward at every width it joins. Past the verify widths those
+/// take pipelines of their own row count, which only a DSpark round's warm reaches otherwise.
+fn warmOwnRows(m: *Model, t1: u32) !void {
+    if (!m.serves_rows) return;
+    var reqs: [16]Request = @splat(.{});
+    defer for (&reqs) |*r| r.deinit();
+    const most = m.maxJoinedRows();
+    if (most > reqs.len) return error.Dsv41RowsWidth;
+    const was = ownBegin(m);
+    defer ownEnd(m, was);
+    const ids = [1]u32{t1};
+    for (reqs[0..most]) |*r| {
+        const scope = try enterForward(m, r);
+        defer scope.endForward();
+        try warmBudget(m, 1);
+        try warmRun(try extend(m, &ids, .last));
+    }
+    var segs: [16]Seg = undefined;
+    var seqs: [16]u64 = undefined;
+    for (2..most + 1) |n| {
+        for (segs[0..n], seqs[0..n], reqs[0..n]) |*sg, *seq, *r| {
+            sg.* = .{ .request = r, .ids = &ids };
+            seq.* = r.position() + 1;
+        }
+        const armed = m.arm(.rows);
+        defer armed.end();
+        dsv41_borrow.enterWarmRowsMlx(seqs[0..n], &m.cfg);
+        try warmRun(try extendRows(m, segs[0..n]));
     }
 }
 
