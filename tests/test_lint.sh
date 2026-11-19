@@ -107,6 +107,32 @@ tree
 printf '%s\n' 'fn g(s: *S) !void {' '    try send(s,' '        \\{{"type":"error","error":{{"type":"x"}}}}' '    );' '}' > "$TMP/t/src/p.zig"
 expect_red "a hand-built Anthropic error body in a multiline literal" "src/p.zig:3:9 \[error-body-literal\] g: a hand-built error body"
 
+# Each spelling of the envelope's key: spaced, a format argument, split, "type": "error", a JSON writer's field,
+# a multiline literal, a newline after the brace.
+spellings=(
+  'fn a1(m: []const u8) !void {|    _ = try std.fmt.allocPrint(alloc, "{{ \"error\": {{\"message\":\"{s}\"}}}}", .{m});|}|2:39'
+  'fn a2(m: []const u8) !void {|    _ = try std.fmt.allocPrint(alloc, "{{\"{s}\":{{\"message\":\"{s}\"}}}}", .{ "error", m });|}|2:81'
+  'fn a3(s: *S) !void {|    try send(s, "{" ++ "\"error\":{\"message\":\"x\"}}");|}|2:24'
+  'fn a4(s: *S) !void {|    try send(s, "{\"type\": \"error\",\"error\":{\"type\":\"x\"}}");|}|2:17'
+  'fn a5(w: *W, m: []const u8) !void {|    try w.write(.{ .@"error" = .{ .message = m } });|}|2:21'
+  'fn a6(s: *S) !void {|    try send(s,|        \\{ "error": { "message": "x" } }|    );|}|3:9'
+  'fn a7(s: *S) !void {|    try send(s, "{\n\"error\":{\"message\":\"x\"}}");|}|2:17'
+)
+for case in "${spellings[@]}"; do
+  tree
+  IFS='|' read -r -a lines <<< "$case"
+  at="${lines[${#lines[@]}-1]}"
+  unset 'lines[${#lines[@]}-1]'
+  printf '%s\n' "${lines[@]}" > "$TMP/t/src/p.zig"
+  expect_red "an error envelope spelled as in ${lines[0]%%(*}" "src/p.zig:$at \[error-body-literal\]"
+done
+
+tree
+printf '%s\n' 'fn g(m: []const u8, n: u32) !void {' '    _ = try std.fmt.allocPrint(alloc, ",\"{s}\":{d}", .{ "error", n });' \
+  '    _ = .{ .ok = true, .@"error" = m };' '    _ = parsed.value.@"error".message;' '    _ = "{\"errors\": [], \"type\": \"error_rate\"}";' \
+  '    _ = "a" ++ ",\"error\":null";' '    _ = std.mem.eql(u8, kind, "error");' '}' > "$TMP/t/src/p.zig"
+expect_green "an error field after another, a parsed error read, other keys and values, and a plain \"error\" string"
+
 tree
 printf '%s\n' 'fn f(s: *S) !void {' '    try send(s, "{\"error\":\"x\"}");' '}' > "$TMP/t/src/http.zig"
 printf '%s\n' 'fn g() []const u8 {' '    return ",\"error\":null";' '}' 'test "t" { try expect(body, "{\"error\":{\"message\":\"x\"}}"); }' > "$TMP/t/src/p.zig"
