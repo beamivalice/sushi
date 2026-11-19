@@ -57,6 +57,7 @@ const model_settings = @import("model_settings.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
+const server_state = @import("server_state.zig");
 
 const Trunk = trunk.Trunk;
 const KVCache = trunk.KVCache;
@@ -1487,9 +1488,10 @@ pub const Scheduler = struct {
         self.allocator.destroy(self);
     }
 
-    /// Whether new work is refused: a shutdown has begun (queue_mu).
+    /// Whether new work is refused: a shutdown was asked (queue_mu). The flag counts before `beginShutdown`, which
+    /// runs when the accept loop next sees it, up to a second later: no waiting request is admitted in that gap.
     fn refusingLocked(self: *const Scheduler) bool {
-        return self.draining or self.shutdown.load(.acquire);
+        return self.draining or self.shutdown.load(.acquire) or server_state.shutdown_requested.load(.acquire);
     }
 
     /// Ends every queued cold load and image encode the inference thread has not taken with the shutdown error: their
@@ -2510,7 +2512,8 @@ pub fn takeOrphanedVisionLocked(sch: *Scheduler, out: *[vision_queue.orphan_visi
 
 /// Caller holds `queue_mu`. Shared with the wait condition below.
 fn hasWorkPendingLocked(sch: *const Scheduler) bool {
-    return sch.pending.items.len > 0 or
+    // A refused pending slot waits for its connection to complete it, which wakes the loop.
+    return (sch.pending.items.len > 0 and !sch.refusingLocked()) or
         sch.decoding.items.len > 0 or
         sch.vision_queue.items.len > 0 or
         sch.cleanup_queue.items.len > 0 or
@@ -2605,7 +2608,7 @@ const TO_PREFILL_MAX = 16;
 /// Takes this tick's admits out of `pending` into `to_prefill` and returns how many (queue_mu held).
 fn admitPendingLocked(sch: *Scheduler, to_prefill: *[TO_PREFILL_MAX]*Slot) usize {
     // Nothing waits: no candidate list to build and no decoding slot to scan.
-    if (sch.pending.items.len == 0) return 0;
+    if (sch.pending.items.len == 0 or sch.refusingLocked()) return 0;
     var n_prefill: usize = 0;
     // Single-flight admission: a model with
     // MODULE-OWNED decode state admits at most one live slot.
@@ -5788,6 +5791,8 @@ pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Schedul
     sch.unload_queue = .empty;
     sch.abandoned = null;
     sch.orphan_vision_n = 0;
+    sch.prefix_clear_queue = .empty;
+    sch.rearm_forced = .init(false);
     sch.current_model = null;
     return sch;
 }
@@ -6016,6 +6021,38 @@ test "a shutdown refuses a submit that comes after its first step, and the one w
     waiter.join();
     try testing.expectError(error.Shutdown, waited);
     try testing.expectError(error.Shutdown, sch.submit(params));
+    var batch: [16]*Slot = undefined;
+    const take = takeTeardownLocked(&sch, &batch);
+    for (batch[0..take.cleanup_n]) |s| s.deinit();
+    destroyAbandoned(take.abandoned);
+}
+
+test "a shutdown asked and not yet begun admits no waiting request, takes no new one and parks the loop" {
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.handle = null;
+    model.prefix_cache = null;
+    var sch = submitTestScheduler(testing.allocator, 2);
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.cleanup_queue.deinit(testing.allocator);
+    defer sch.prefilling.deinit(testing.allocator);
+    const params: SubmitParams = .{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 };
+    const waiting = try sch.submit(params);
+    // The accept loop sees the flag up to a second later; `beginShutdown` runs only then.
+    server_state.shutdown_requested.store(true, .release);
+    defer server_state.shutdown_requested.store(false, .release);
+    {
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        var to_prefill: [TO_PREFILL_MAX]*Slot = undefined;
+        try testing.expectEqual(@as(usize, 0), admitPendingLocked(&sch, &to_prefill));
+        try testing.expect(!hasWorkPendingLocked(&sch));
+    }
+    try testing.expectError(error.Shutdown, sch.submit(params));
+    sch.beginShutdown();
+    try testing.expect(waiting.waitNext() == .err);
+    sch.complete(waiting);
     var batch: [16]*Slot = undefined;
     const take = takeTeardownLocked(&sch, &batch);
     for (batch[0..take.cleanup_n]) |s| s.deinit();

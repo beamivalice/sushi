@@ -454,6 +454,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   are refused with `error.Shutdown`, and queued loads and encodes fail then, not at `deinit`; with a connection thread
   still alive past the drain bound `serve` skips the teardown that would free what it holds and returns
   `error.ConnectionsOutliveShutdown` (the CLI exits 1 on it before its own defers free anything).
+- **The gate shuts when the shutdown is asked, not when it begins**: `refusingLocked` reads
+  `server_state.shutdown_requested` too, since `beginShutdown` runs only when the accept loop next sees the flag (up to
+  1 s later); a pending slot is neither admitted nor counted as work then, so the loop parks instead of spinning.
 - **A shutdown drain is an ERROR, never a finish reason**: `beginShutdown` marks `Slot.shutdown_cancelled`, so the
   reader gets `.err` (`error.ServerShutdown`, 503 "Server is shutting down") instead of `.done`, whose default
   `finish_reason` is `length` (a queued request logged `0+0 tokens [length]`).

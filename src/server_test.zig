@@ -313,6 +313,83 @@ fn completionBody(buf: []u8, text: []const u8, n: u32, stream: bool) ![]const u8
     return std.fmt.bufPrint(buf, "{{\"model\":\"tiny\",\"prompt\":\"{s}\",\"max_tokens\":{d},\"temperature\":0,\"ignore_eos\":true,\"stream\":{s}}}", .{ text, n, if (stream) "true" else "false" });
 }
 
+/// Polls `done` every 10 ms for at most `ms`; whether it came.
+fn within(ms: u32, done: *const fn () bool) bool {
+    var waited: u32 = 0;
+    while (!done()) : (waited += 10) {
+        if (waited >= ms) return false;
+        var none = [_]std.posix.pollfd{};
+        _ = std.posix.poll(&none, 10) catch {};
+    }
+    return true;
+}
+
+test "server: a shutdown with the submit queue full ends the request waiting for room with the shutdown error too" {
+    try eachArch(1, .{}, struct {
+        var next_id: u64 = 0;
+        fn queueFull() bool {
+            const sch = server_state.global_scheduler.?;
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            return sch.in_flight == sch.queue_cap;
+        }
+        fn submitted() bool {
+            const sch = server_state.global_scheduler.?;
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            return sch.req_seq == next_id;
+        }
+        fn run() !void {
+            var b: [512]u8 = undefined;
+            // The model loads first, so every request below reaches submit.
+            gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "hi", 2, false)));
+            const sch = server_state.global_scheduler.?;
+            next_id = sch.req_seq;
+            const first_id = next_id;
+            // One more than the queue holds: the last waits in submit for room. Each submits before the next is
+            // sent, so stream i carries request id first_id + i.
+            var fds: [34]std.posix.fd_t = undefined;
+            var n_open: usize = 0;
+            defer for (fds[0..n_open]) |fd| {
+                _ = std.c.close(fd);
+            };
+            for (&fds, 0..) |*fd, i| {
+                fd.* = try connect();
+                n_open += 1;
+                try send(fd.*, "POST", "/v1/completions", try completionBody(&b, "write forever about rivers", 100, true));
+                if (i + 1 == fds.len) break;
+                next_id += 1;
+                if (!within(5000, submitted)) return error.NeverSubmitted;
+            }
+            if (!within(5000, queueFull)) return error.QueueNeverFull;
+            // Waiting at the shutdown: still pending, or not yet submitted. Read in the hold the shutdown is asked
+            // in, as admission reads it, so no stream changes side between the two.
+            var waiting: [fds.len]bool = @splat(true);
+            {
+                sch.queue_mu.lockUncancelable(sch.io);
+                defer sch.queue_mu.unlock(sch.io);
+                for (&waiting, 0..) |*w, i| {
+                    const id = first_id + i;
+                    if (id >= sch.req_seq) continue;
+                    w.* = for (sch.pending.items) |slot| {
+                        if (slot.request_id == id) break true;
+                    } else false;
+                }
+                server.requestShutdown();
+            }
+            for (fds, waiting, 0..) |fd, w, i| {
+                const all = try readUntil(fd, null);
+                defer gpa.free(all);
+                if (!w) continue;
+                errdefer std.debug.print("stream {d} of {d} waiting at the shutdown: {s}\n", .{ i, fds.len, all[all.len -| 600..] });
+                if (std.mem.indexOf(u8, all, "\"finish_reason\":\"length\"") != null or std.mem.indexOf(u8, all, "\"finish_reason\":\"stop\"") != null)
+                    return error.ServedPastTheShutdown;
+                if (std.mem.indexOf(u8, all, "shutting down") == null) return error.EndedWithoutTheShutdownError;
+            }
+        }
+    }.run);
+}
+
 /// A stream the client stops reading after its first token, with its socket left open, an unload asked behind it and
 /// then another request: each of the two answers within `ms`. Returns their answers; the caller frees.
 fn behindAStalledReader(ms: u32) ![2][]u8 {
