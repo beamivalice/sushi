@@ -1122,22 +1122,20 @@ test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
     try t.expect(gated.shared_resident_bytes > 0);
 }
 
-test "memoryRefusalMessage: the 400 names the hot cache only where the bill carries it" {
+test "memoryRefusalMessage: the 400 counts the hot cache only where the bill carries it" {
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
-    // A non-qwen4 refusal read "the hot prefix cache holds ~0MB ..." on a box with a multi-GB resident cache.
     const t = std.testing;
     const MB: u64 = 1024 * 1024;
 
-    // Ungated: the previous sentence, byte for byte.
     const bare = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB }, false);
     defer t.allocator.free(bare);
     try t.expectEqualStrings(
-        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB available. Reduce prompt size or use a smaller model.",
+        "Not enough GPU memory for this request: with a 12000-token prompt and max_tokens 4096 it needs 30 MB, and 20 MB is available.\nmax_tokens 2048 fits: lower max_tokens to 2048 or less, shorten the prompt, or free memory (quit other apps or unload another model).",
         bare,
     );
 
-    // Gated: the message quotes what the guard compared.
+    // Gated: what the cache can give back is counted and named.
     const rich = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{
         .needed = 30 * MB,
         .available = 20 * MB,
@@ -1145,16 +1143,14 @@ test "memoryRefusalMessage: the 400 names the hot cache only where the bill carr
         .reclaimable = 900 * MB,
     }, true);
     defer t.allocator.free(rich);
-    try t.expect(std.mem.indexOf(u8, rich, "holds ~1500MB more") != null);
-    try t.expect(std.mem.indexOf(u8, rich, "(~900MB") != null);
+    try t.expect(std.mem.indexOf(u8, rich, "920 MB is available, counting the 900 MB the prefix cache can give back") != null);
 
-    // The gated arch reaches this arm with an empty cache too and keeps its bytes, zeroes and all.
+    // A gated arch with an empty cache says nothing about the cache.
     const q4_cold = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB }, true);
     defer t.allocator.free(q4_cold);
-    try t.expectEqualStrings(
-        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB is available and the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.",
-        q4_cold,
-    );
+    try t.expectEqualStrings(bare, q4_cold);
+
+    // Ungated: the cache is neither counted nor named.
     const ungated_rich = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{
         .needed = 30 * MB,
         .available = 20 * MB,
@@ -2026,7 +2022,6 @@ test "a request refused by its bill names the bill, what is available and the la
     const kv = trunk.KVQuantConfig.affine(8);
     const seq: usize = 364_509;
     const asked: u32 = 421_923;
-    const mb: u64 = 1024 * 1024;
     // Room for the prompt and 100,000 tokens of reply, not for the 421,923 asked.
     const room = prefillNeededAtChunk(&cfg, seq, 100_000, 8, 2048, .{});
     const bill = bills.AdmissionBill{ .needed = prefillNeededAtChunk(&cfg, seq, asked, 8, 2048, .{}), .available = room, .chunk = 2048 };
@@ -2039,10 +2034,11 @@ test "a request refused by its bill names the bill, what is available and the la
     try t.expect(prefillNeededAtChunk(&cfg, seq, fit + 1, 8, 2048, .{}) > room);
     const msg = try bills.memoryContextRefusalMessage(std.testing.allocator, refusal);
     defer std.testing.allocator.free(msg);
+    const u = bills.Mem.unitOf(bill.needed, room);
     var want: [3][64]u8 = undefined;
     for ([_][]const u8{
-        try std.fmt.bufPrint(&want[0], "{d} MB", .{(bill.needed + mb - 1) / mb}),
-        try std.fmt.bufPrint(&want[1], "{d} MB", .{room / mb}),
+        try std.fmt.bufPrint(&want[0], "needs {f}", .{bills.Mem.need(bill.needed, u)}),
+        try std.fmt.bufPrint(&want[1], "{f} is available", .{bills.Mem.have(room, u)}),
         try std.fmt.bufPrint(&want[2], "max_tokens {d}", .{fit}),
     }) |part| if (std.mem.indexOf(u8, msg, part) == null) {
         std.debug.print("refusal \"{s}\" does not name \"{s}\"\n", .{ msg, part });
