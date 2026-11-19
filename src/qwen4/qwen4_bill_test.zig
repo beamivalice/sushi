@@ -2005,14 +2005,14 @@ test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a re
         }
     }.of;
     const kv = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
-    const exact = pooled((long - seq) * kv) - pooled((short - seq) * kv) + pooled(long * statePerTokenBilled(&cfg)) - pooled(short * statePerTokenBilled(&cfg));
+    const exact = pooled(long * kv) - pooled(short * kv) + pooled(long * statePerTokenBilled(&cfg)) - pooled(short * statePerTokenBilled(&cfg));
     const held = bills.requestHeldBytes(&cfg, seq, 421_923, 8, 2048, .{});
     try t.expectEqual(exact, held - bills.requestHeldBytes(&cfg, seq, 8192, 8, 2048, .{}));
     // The bill is what it holds and the margin, once.
     try t.expectEqual(held + bills.BILL_MARGIN_BYTES, prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}));
-    // Turn A of the live 364k session as a Cooler load: 15,457 MB exact with the margin, its chunk's transient from the
+    // Turn A of the live 364k session as a Cooler load: 15,741 MB exact with the margin, its chunk's transient from the
     // layers' own rows (`qwen4_bill.PrefillRows`), where its MLX load keeps the calibrated net (20,845 MB).
-    try t.expectEqual(@as(u64, 15_457), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
+    try t.expectEqual(@as(u64, 15_741), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
 }
 
 test "a request refused by its bill names the bill, what is available and the largest max_tokens that fits" {
@@ -2182,5 +2182,83 @@ test "Flash-Next: a resident load the free-RAM preflight admits at its edge leav
             try t.expect(chunk > 0);
             try warmFits(&config, bits, chunk, headroom);
         }
+    };
+}
+
+/// The bill the connection thread takes (`bills.prefillAdmissionBill` without its live read): the width
+/// `requestPrefillPick` chooses at `available`, then the bill at that width.
+fn connBillAt(cfg: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, available: u64) bills.AdmissionBill {
+    const chosen = bills.requestPrefillPick(cfg, seq, max_tokens, kv_bits, available, false, .{});
+    const chunk: u64 = prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, @intCast(seq), cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), chosen);
+    return bills.creditedAdmissionBill(cfg, prefillNeededAtChunk(cfg, seq, max_tokens, kv_bits, chunk, .{}), available, 0, 0, chunk);
+}
+
+fn coolerFlashNext() model_mod.ModelConfig {
+    var cfg = fixtures.qwen4ExpLive364kConfig();
+    cfg.cooler_for_test = true;
+    cfg.expert_layout = .exl3_k4;
+    cfg.expert_quant_codebook = .spec1;
+    cfg.trunk_quant = null;
+    cfg.quant_bits = 0;
+    return cfg;
+}
+
+test "Flash-Next on Cooler: the max_tokens and the maximum context a refusal names are admitted when applied with the request's own prompt" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    const cfg = coolerFlashNext();
+    try t.expect(@import("../cooler_side.zig").onEngine(&cfg));
+    const kv = trunk.KVQuantConfig.affine(8);
+    const ctx = getEffectiveContextLength(&cfg);
+    var failures: usize = 0;
+    var cases: usize = 0;
+    for ([_]u64{ 100, 3_000, 20_000, 32_767, 32_768, 60_000, 200_000 }) |seq| for ([_]u32{ 4_096, 32_768, 200_000 }) |asked| {
+        if (seq + asked > ctx) continue;
+        // A headroom a little under the asked bill, then much under it.
+        const asked_bill = connBillAt(&cfg, seq, asked, 8, std.math.maxInt(u64) / 4).needed;
+        const prompt_only = connBillAt(&cfg, seq, 1, 8, std.math.maxInt(u64) / 4).needed;
+        for ([_]u64{ asked_bill - 1, prompt_only + (asked_bill - prompt_only) / 2, prompt_only + 1 }) |available| {
+            const bill = connBillAt(&cfg, seq, asked, 8, available);
+            if (bill.fits()) continue;
+            cases += 1;
+            const r = bills.requestContextRefusal(&cfg, @intCast(seq), asked, kv, bill, .{}) orelse return error.TestUnexpectedResult;
+            if (r.fitting_max_tokens > 0) {
+                const b = connBillAt(&cfg, seq, r.fitting_max_tokens, 8, available);
+                if (!b.fits()) {
+                    failures += 1;
+                    std.debug.print("seq {d} asked {d} avail {d} MB: max_tokens {d} named as fitting is refused (needs {d} MB at width {d})\n", .{ seq, asked, available >> 20, r.fitting_max_tokens, b.needed >> 20, b.chunk });
+                }
+            }
+            // The maximum context with this prompt: the reply up to it.
+            if (r.maximum > seq) {
+                const m: u32 = @intCast(@min(r.maximum - seq, asked));
+                const b = connBillAt(&cfg, seq, m, 8, available);
+                if (!b.fits()) {
+                    failures += 1;
+                    std.debug.print("seq {d} asked {d} avail {d} MB: the named maximum context {d} (max_tokens {d}) is refused (needs {d} MB at width {d})\n", .{ seq, asked, available >> 20, r.maximum, m, b.needed >> 20, b.chunk });
+                }
+            }
+        }
+    };
+    try t.expect(cases > 0);
+    try t.expectEqual(@as(usize, 0), failures);
+}
+
+test "Flash-Next on Cooler: a request's bill holds every KV and state row of its cache at the pool's size class, prompt rows as reply rows" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    const cfg = coolerFlashNext();
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
+    for ([_]u64{ 3_000, 60_000, 200_000 }) |seq| for ([_]u64{ 0, 4_096 }) |reply| {
+        const terms = bills.prefillRequestTerms(&cfg, seq, reply, 8, 2048, .{});
+        // The prompt's raw rows `prefillMemoryNeeded` bills, and the request's terms on top of them.
+        const billed = seq * kv_per_tok + terms.reserved_kv_bytes + terms.state_bytes;
+        const held = bills.cacheCommitBytes(&cfg, seq, reply, 8, 2048);
+        errdefer std.debug.print("seq {d} reply {d}: the bill holds {d} KB of cache, the pool {d} KB\n", .{ seq, reply, billed >> 10, held >> 10 });
+        try t.expect(billed >= held);
     };
 }

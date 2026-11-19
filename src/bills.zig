@@ -1094,15 +1094,21 @@ pub fn requestContextRefusal(config: *const model_mod.ModelConfig, prompt_len: u
     if (!model_mod.usesSushiQuantMemoryBill(config)) return null;
     const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
     const budget = bill.available +| bill.evictionCredit();
+    const ctx = getEffectiveContextLength(config);
+    const room: u32 = @intCast(@min(ctx -| @as(u64, @intCast(prompt_len)), std.math.maxInt(u32)));
+    // With this prompt the maximum context is the prompt and the longest reply that fits, priced as the request it
+    // names; a prompt that does not fit alone is told the longest prompt that does.
+    const prompt_fits = prefillNeededAtChunk(config, prompt_len, 0, bits, bill.chunk, warm) <= budget;
+    const reply = fittingMaxTokens(config, prompt_len, room, bits, bill.chunk, warm, budget);
     return .{
-        .requested = @as(u64, @intCast(prompt_len)) +| @min(max_tokens, getEffectiveContextLength(config) -| @as(u64, @intCast(prompt_len))),
-        .maximum = maxSushiContextAtWidth(config, bits, budget, bill.chunk, warm),
+        .requested = @as(u64, @intCast(prompt_len)) +| @min(max_tokens, room),
+        .maximum = if (prompt_fits) @intCast(prompt_len + reply) else maxSushiContextAtWidth(config, bits, budget, bill.chunk, warm),
         .needed = bill.needed,
         .available = budget,
         .kv_bits = bits,
         .chunk = bill.chunk,
         .asked_max_tokens = max_tokens,
-        .fitting_max_tokens = fittingMaxTokens(config, prompt_len, max_tokens, bits, bill.chunk, warm, budget),
+        .fitting_max_tokens = @min(reply, max_tokens),
     };
 }
 
@@ -2218,7 +2224,6 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     if (!config.reservesKvCapacity()) return .{};
     // The whole cache the request holds by its last token, reserved up front or grown to (`cacheCapacityTokens`).
     const reserved = @max(cacheCapacityTokens(config, seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
-    // Only the headroom is new here: the prompt's own rows are already billed.
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     const mtp_on = warm.mtp_on or (forceMtpFor(config) and !config.dflash_loaded);
     const head_per_tok: u64 = if (mtp_on) mtpHeadKvBytesPerToken(config) else 0;
@@ -2228,7 +2233,9 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // privatised on restore (`seedCapBuf`), so crediting it cancelled the one-copy bill outright.
     const credited = warm.creditedRows(reserved);
     return .{
-        .reserved_kv_bytes = pooledCacheBytes(config, (reserved -| seq) * kv_per_tok),
+        // The pool holds each layer's whole cache at its size class, the prompt's rows with the reply's: this prices
+        // it whole, less the prompt's raw rows `prefillMemoryNeeded` bills.
+        .reserved_kv_bytes = pooledCacheBytes(config, reserved * kv_per_tok) -| seq * kv_per_tok,
         .state_bytes = pooledCacheBytes(config, reserved * (statePerTokenBilled(config) +| head_state_per_tok)) +|
             (if (mtp_on) mtpHeadRingBytes(config) else 0),
         // The warm span, not the prompt; read regardless of `will_donate` (a shared restore skips the same rows).
@@ -6214,8 +6221,8 @@ test "bill pin: requestContextRefusal" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("requestContextRefusal", &.{
-        1, 94096, 955392, 32212254720, 22548578304, 8, 1024, 1,
-        94096, 1048576, 32212254720, 22548578304, 8, 1024, 0, 0,
+        1, 94096, 100000, 32212254720, 22548578304, 8, 1024, 1,
+        94096, 100000, 32212254720, 22548578304, 8, 1024, 0, 0,
     }, .{ 7, 7, 1, 1 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             var exl3 = c.*;

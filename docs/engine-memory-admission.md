@@ -292,7 +292,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 
 - **On Sushi Cooler a request bill is its exact bytes plus `BILL_MARGIN_BYTES` (256 MB), once** (`requestHeldBytes`,
   `billMargin`): no net, and DeepSeek's request bill drops its quarter there too. The live 364k Turn A on an STQ pack
-  bills 15,457 MB. Measured whole requests (33k-token prompt, 1,024 new tokens, on Cooler): tiny held 2,368 MB of a
+  bills 15,741 MB. Measured whole requests (33k-token prompt, 1,024 new tokens, on Cooler): tiny held 2,368 MB of a
   3,072 MB bill; the 2.75 cut 6,882 of 7,161; the stq4 cut 6,541 of 7,289. MLX and GLM keep the net below.
 - **A Flash-Next STQ chunk's transient on Cooler is its layers' own rows** (`qwen4_bill.PrefillRows`), in place of the
   MLP envelope, the stream slope, the 512 MB floor and the net: the max over the layer kinds a chunk peaks in, plus the
@@ -545,6 +545,9 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   decode grows to by the +25% steps. An explicit `max_tokens` that does not fit is refused by name: the refusal gives
   the bill, what is available and the largest `max_tokens` that fits (`requestContextRefusal`, EXL3 packs). The live
   364k session's Turn A, admitted at 13,269 MB under the old 8192-token headroom, bills 20,845 MB on MLX.
+- **A refusal names only values its own bill admits**: the maximum context is the request's prompt and the longest reply
+  that fits (the longest prompt alone when the prompt does not fit), and the bill prices every cache row the same way,
+  the prompt's at the pool's size class as the reply's (`prefillRequestTerms`), so it holds what `cacheCommitBytes` does.
 - The hot-cache budget is clamped at load and follows residency ([engine-prefix-cache](engine-prefix-cache.md#budget)).
 - Context-overflow 400s name BOTH counts.
 - **A freed reserved-KV slot goes back to the OS, not MLX's pool** (`deinitSlotsReturningPool`, and the prefill-end

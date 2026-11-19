@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The maximum context a Sushi Cooler memory refusal names is admitted when applied**: it was priced as a prompt alone,
+  while the request it names bills the reply's cache rows at the pool's size class, so the request was refused again.
+  The bill now counts the prompt's cache rows at that size too, as the pool holds them: a Qwen request on Sushi Cooler
+  needs up to a sixteenth more of its cache free than before, and an auto-sized context comes out that much smaller.
 - **A model load beside models that already fill a raised GPU memory limit is refused, naming that limit**: with
   `iogpu.wired_limit_mb` set and what was loaded past its floor, the memory check read the 0 GB left as "unknown" and
   let the load through, toward a failed load or a stalled Mac. A load whose free-RAM reading fails is now checked
