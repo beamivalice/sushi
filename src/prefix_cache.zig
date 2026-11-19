@@ -1792,8 +1792,9 @@ pub const HotPrefixCache = struct {
         return res;
     }
 
-    /// Restore by move, the decision: only on a full-prefix hit (the commit's replace path lands
-    /// on this same entry) with something to append. A partial hit keeps the refcount share.
+    /// Restore by move, the decision. A whole take needs a full-prefix hit (the commit's replace path lands on this same
+    /// entry) and a prompt that appends past it. A `partial` take keeps only the shared prefix at donation and its slot
+    /// appends from a restore point at or below the share, so it needs only a share, whatever the prompt's length.
     pub fn checkoutEligible(
         ssd_first: bool,
         move_enabled: bool,
@@ -1802,10 +1803,12 @@ pub const HotPrefixCache = struct {
         shared: usize,
         prompt_len: usize,
         has_slot: bool,
+        partial: bool,
     ) bool {
         if (!ssd_first or !move_enabled or !has_slot) return false;
         // The pending disk record shares the same buffers, so a checkout could not donate anyway.
         if (pending_disk) return false;
+        if (partial) return shared > 0;
         if (entry_tokens == 0 or shared != entry_tokens) return false;
         return prompt_len > shared;
     }
@@ -1823,6 +1826,7 @@ pub const HotPrefixCache = struct {
             shared,
             prompt_len,
             slot_id != null,
+            false,
         )) return false;
         e.checked_out_by = slot_id;
         log.info("  [hot-cache] checked out {d}-token entry to the slot (restore by move; the append donates in place)\n", .{e.tokens.len});
@@ -1842,7 +1846,7 @@ pub const HotPrefixCache = struct {
             const shared = @min(self.last_restored_shared, e.tokens.len);
             // A ringed entry's restore points are snapshots past any prefix cut; it is taken over whole only.
             const partial = partial_ok and shared < e.tokens.len and shared > 0 and e.ring_cps == null;
-            if (!checkoutEligible(true, restoreMoveEnabled(), self.pending_disk != null, e.tokens.len, if (partial) e.tokens.len else shared, prompt_len, true)) return false;
+            if (!checkoutEligible(true, restoreMoveEnabled(), self.pending_disk != null, e.tokens.len, shared, prompt_len, true, partial)) return false;
             e.checked_out_by = slot_id;
             e.checkout_keep = if (partial) shared else 0;
             log.info("  [hot-cache] checked out {d}-token entry to the slot (the share of {d} does not fit; the append donates in place)\n", .{ e.tokens.len, shared });
@@ -10266,14 +10270,21 @@ test "restore by move: a checked-out entry is invisible to a second slot, to evi
 
 test "restore by move: the policy is off outside the SSD-first arm and with the move forced off" {
     // Eligible: SSD-first, enabled, no pending flush, whole entry matched, something to append.
-    try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 608, true));
-    try testing.expect(!HotPrefixCache.checkoutEligible(false, true, false, 600, 600, 608, true));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, false, false, 600, 600, 608, true));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 608, false));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, true, 600, 600, 608, true));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 500, 608, true));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 600, true));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 0, 0, 608, true));
+    try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 608, true, false));
+    try testing.expect(!HotPrefixCache.checkoutEligible(false, true, false, 600, 600, 608, true, false));
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, false, false, 600, 600, 608, true, false));
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 608, false, false));
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, true, 600, 600, 608, true, false));
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 500, 608, true, false));
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 600, true, false));
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 0, 0, 608, true, false));
+    // A partial take needs only a share to keep: a prompt shorter than the entry, or the share itself (a regenerate).
+    try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 500, 550, true, true));
+    try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 500, 608, true, true));
+    try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 500, 500, true, true));
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 0, 550, true, true));
+    try testing.expect(!HotPrefixCache.checkoutEligible(false, true, false, 600, 500, 550, true, true));
+    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, true, 600, 500, 550, true, true));
 }
 
 /// The resident entry whose token record is exactly `toks`.

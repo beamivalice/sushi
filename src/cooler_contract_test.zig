@@ -3643,6 +3643,86 @@ test "cooler contract: a served Qwen turn that shares part of the last turn's RA
     }.run);
 }
 
+test "cooler contract: a served Qwen turn no longer than the RAM entry it partly shares, a regenerate or a turn that drops more of the last one than it adds, fits by taking it over and says the shared restore's tokens (#109)" {
+    try eachQwenServed(struct {
+        /// Admission that refuses a warm share the request did not take over: a copy of the prefix does not fit.
+        fn onlyTaken(_: *const @import("model.zig").ModelConfig, _: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, _: u64, will_donate: bool, _: bool, _: @import("scheduler.zig").CheckpointPlan) bool {
+            return matched == 0 or will_donate;
+        }
+
+        const Shape = enum { shorter_turn, regenerate };
+
+        /// Turn 1, a turn 2 that extends it, then turn 3: turn 2 less its last 100 tokens and 50 new ones, or turn 2's
+        /// prompt again. Returns turn 3's tokens; its prompt (`prompt_len`) is shorter than turn 2's entry either way.
+        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, shape: Shape, taken: bool, reused: *u32, prompt_len: *usize, refused: *u64) !std.ArrayList(u32) {
+            const a = testing.allocator;
+            const route = @import("tensor/route.zig");
+            const refused0 = route.refusals;
+            defer refused.* = route.refusals - refused0;
+            var sv: Served = undefined;
+            try sv.initTiers(ld, dir, 1 << 30);
+            defer sv.deinit();
+            var f: u32 = 0;
+            var first = try heldPrompt(a, ids, 1500, 0);
+            defer first.deinit(a);
+            var reply = try sv.request(first.items, 16, &f);
+            defer reply.deinit(a);
+            var second: std.ArrayList(u32) = .empty;
+            defer second.deinit(a);
+            try second.appendSlice(a, first.items);
+            try second.appendSlice(a, reply.items);
+            var said = try heldPrompt(a, ids, 1500, 2);
+            defer said.deinit(a);
+            try second.appendSlice(a, said.items);
+            var reply2 = try sv.request(second.items, 16, &f);
+            defer reply2.deinit(a);
+            var next: std.ArrayList(u32) = .empty;
+            defer next.deinit(a);
+            switch (shape) {
+                .shorter_turn => {
+                    try next.appendSlice(a, second.items[0 .. second.items.len - 100]);
+                    var more = try heldPrompt(a, ids, 50, 1);
+                    defer more.deinit(a);
+                    try next.appendSlice(a, more.items);
+                },
+                .regenerate => try next.appendSlice(a, second.items),
+            }
+            if (next.items.len >= second.items.len + reply2.items.len) return error.TestTurnThreeNotShorter;
+            prompt_len.* = next.items.len;
+            const scheduler = @import("scheduler.zig");
+            const fits_was = scheduler.prefill_admission_fits;
+            defer scheduler.prefill_admission_fits = fits_was;
+            if (taken) scheduler.prefill_admission_fits = onlyTaken;
+            const got = try sv.request(next.items, 16, &f);
+            reused.* = sv.reused;
+            return got;
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            for ([_]Shape{ .shorter_turn, .regenerate }) |shape| {
+                var shared_reused: u32 = 0;
+                var taken_reused: u32 = 0;
+                var prompt_len: usize = 0;
+                var refused: u64 = 0;
+                var shared = try conversation(&ld, dir, ids, shape, false, &shared_reused, &prompt_len, &refused);
+                defer shared.deinit(a);
+                try testing.expectEqual(@as(u64, 0), refused);
+                var taken = try conversation(&ld, dir, ids, shape, true, &taken_reused, &prompt_len, &refused);
+                defer taken.deinit(a);
+                try testing.expectEqual(@as(u64, 0), refused);
+                // The slot restores at a point below its prompt's end, the regenerate's whole-prompt share included.
+                try testing.expect(taken_reused > 0 and taken_reused < prompt_len);
+                try testing.expectEqual(shared_reused, taken_reused);
+                try testing.expectEqualSlices(u32, shared.items, taken.items);
+            }
+        }
+    }.run);
+}
+
 
 test "cooler contract: a served Qwen turn whose partial share fits once an idle entry is evicted is served as a share, and the entry it restores from stays whole (#109)" {
     try eachQwenServed(struct {

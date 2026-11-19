@@ -3217,6 +3217,7 @@ pub const CheckoutCase = struct {
                 self.shared,
                 self.prompt_len,
                 self.has_slot,
+                false,
             ),
         };
     }

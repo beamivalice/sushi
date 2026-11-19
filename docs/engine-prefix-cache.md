@@ -903,7 +903,8 @@ process start whatever turns `--metrics` on.
   fails after donating loses the entry. A partial hit is taken over too (a long conversation's next turn re-renders
   the last reply's tail, #109), but only once evicting every other entry left no room: its donation keeps only the
   shared prefix and the checkpoints inside it, so the turn's commit replaces the entry as a full hit's does; a ringed
-  entry is taken whole only. Disk checkpoints come off the TOP of
+  entry is taken whole only. Its slot appends from a restore point at or below the share, so a partial take needs
+  only a share: a prompt no longer than the entry (a regenerate, a turn that drops more than it adds) qualifies. Disk checkpoints come off the TOP of
   the flush budget; the disk tier serves the pre-media text prefix only.
 - **A media commit persists its text to the SSD tier, never a media row** (`diskTextLen`): the record stops at the
   first item (none when the boundary is unknown), a hybrid at its last checkpoint at or below it (`hybrid`, set at

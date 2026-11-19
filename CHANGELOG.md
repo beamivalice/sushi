@@ -13,10 +13,10 @@ earlier history is mlx-serve's, in that project's changelog.
   of an EXL3 or STQ pack are closed; concurrent and sampled requests decode together on Sushi Cooler again, and a
   failure fails only the requests it touched. Where free RAM rather than the GPU limit binds, the advertised context is
   now the one a request at that length is admitted at, so it can come out smaller.
-- **Long Qwen3.8 conversations keep going**: when a turn's prompt shares most of the last turn's cached entry and
-  nothing else frees enough room, the turn takes that entry over instead of being refused (on a 32 GB Mac, a
-  131k-token turn that was refused is now served); turns that share part of an entry keep their restore points and
-  prefill less.
+- **Long Qwen3.8 conversations keep going**: when a turn shares the last turn's cached entry and nothing else frees
+  enough room, the turn takes that entry over instead of being refused, whether it adds to the conversation, is shorter
+  or regenerates the last reply (on a 32 GB Mac, a 131k-token turn that was refused is now served); turns that share
+  part of an entry keep their restore points and prefill less.
 - **DeepSeek-V4.1 is steadier**: a long prompt no longer re-reads decoder layers from the SSD while other requests
   decode or after a failed memory borrow, regenerating a reply reuses the conversation, a cancelled turn no longer
   costs its retry the cache (or hands it another conversation's), and an image request is no longer refused for memory
