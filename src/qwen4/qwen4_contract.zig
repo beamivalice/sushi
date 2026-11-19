@@ -158,6 +158,18 @@ pub fn headCacheTokens(xfm: *Trunk) usize {
     return xfm.arch_state.qwen4.mtp.?.cache.residentCapacityTokens();
 }
 
+/// The bytes a request holds past its trunk's KV: the trunk's recurrent and QSA history entries, and the KV and QSA
+/// entry of the MTP head whose half is installed.
+pub fn stateHeldBytes(xfm: *Trunk) u64 {
+    const ssmEntryBytes = @import("../trunk.zig").ssmEntryBytes;
+    var bytes: u64 = 0;
+    if (xfm.ssm_entries) |entries| for (entries) |*e| {
+        bytes += ssmEntryBytes(e);
+    };
+    if (xfm.arch_state.qwen4.mtp) |*m| bytes += m.cache.residentBytes() + ssmEntryBytes(&m.entry);
+    return bytes;
+}
+
 /// `n` greedy tokens for each of `prompts`, every prompt prefilled in a slot of its own and every tick one forward of
 /// all the rows: the joined decode a served Cooler load runs (`qwen4_forward.forwardQwen4DecodeRows`).
 pub fn greedyRows(a: std.mem.Allocator, xfm: *Trunk, prompts: []const []const u32, n: u32) ![]std.ArrayList(u32) {

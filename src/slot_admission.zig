@@ -279,7 +279,7 @@ pub fn admitsWithinMemory(bills: []const ?MemoryBill, live_company: bool, outsta
 
 /// What a live slot was admitted to allocate and has not: its commitment less its resident
 /// cache. A DFlash2 slot reserves its capacity after prefill, so its share drains at once.
-fn outstandingGrowth(commit: u64, resident: u64) u64 {
+pub fn outstandingGrowth(commit: u64, resident: u64) u64 {
     return commit -| resident;
 }
 

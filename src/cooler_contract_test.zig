@@ -4358,6 +4358,69 @@ test "cooler contract: a speculative request whose reply ends at a cache step gr
     try testing.expectEqual(@as(usize, 0), over);
 }
 
+test "cooler contract: a speculative request's growth commit, less its resident KV as admission reads it, never drops below what its KV, histories and draft head still grow" {
+    const Q = ContractOf("qwen4");
+    if (comptime !@hasDecl(Q, "stateHeldBytes")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    if (!fixtureChosen(selection(), "QWEN4_STQ_TINY")) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const a = testing.allocator;
+    const ids = try Q.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(Q, dir, true);
+    defer _ = ld.close();
+    const bills = @import("bills.zig");
+    const outstandingGrowth = @import("slot_admission.zig").outstandingGrowth;
+    const depth_bounds = @import("mtp_depth_bounds.zig");
+    const saved = depth_bounds.active;
+    defer depth_bounds.active = saved;
+    depth_bounds.active = .{ .min = 6, .max = 6 };
+    const prompt = ids[0..@min(ids.len, 9)];
+    const kv = ld.xfm.cache.config;
+    const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+    var under: usize = 0;
+    for ([_]u32{ 256, 1280 }) |end| for ([_]u32{ 0, 6 }) |less| {
+        const n: u32 = end - @as(u32, @intCast(prompt.len)) - less;
+        const commit = bills.admissionCommitBytes(&ld.config, prompt.len, n, kv_bits, true);
+        const turn = arch_handle.turnFor(ld.h, &ld.config);
+        defer turn.end();
+        defer arch_sched.endRequest(&ld.config);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, prompt, n, .{ .temperature = 0.0 }, &.{}, Q.specOptions(ld.xfm, 6));
+        defer gen.deinit(a);
+        // At each round's end: what admission holds outstanding (the slot side reads the trunk's KV as resident), and
+        // everything the request's storage holds.
+        var points: std.ArrayList([2]u64) = .empty;
+        defer points.deinit(a);
+        while (true) {
+            if (gen.mtp_cache) |*mc| mc.activate();
+            const trunk_kv = ld.xfm.cache.residentBytes();
+            try points.append(a, .{ outstandingGrowth(commit, trunk_kv), trunk_kv + Q.stateHeldBytes(ld.xfm) });
+            const r = try gen.nextMtp(a) orelse break;
+            a.free(r.tokens);
+        }
+        var peak: u64 = 0;
+        var i = points.items.len;
+        while (i > 0) {
+            i -= 1;
+            const p = points.items[i];
+            peak = @max(peak, p[1]);
+            if (p[0] < peak - p[1]) {
+                under += 1;
+                std.debug.print("cooler contract: prompt {d} + max_tokens {d}, round {d}: {d} B outstanding, {d} B still to grow\n", .{ prompt.len, n, i, p[0], peak - p[1] });
+                break;
+            }
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), under);
+}
+
 /// The engine pool's bytes in use at its peak over `body`, past those in use before it.
 fn inUsePeak(ctx: anytype, comptime body: fn (@TypeOf(ctx)) anyerror!void) !u64 {
     mlx.engine.close();

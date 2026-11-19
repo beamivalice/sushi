@@ -554,7 +554,9 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   outstanding share from its headroom. Native GLM MLA grows row by row, so two short-prompt requests with large output
   limits otherwise both admit and together outgrow the box; a DFlash2 request reserves its capacity after prefill and
   owes nothing. A Qwen request commits its whole cache and state at their allocated capacity (`bills.cacheCommitBytes`,
-  the 256-row step and, on Sushi Cooler, the pool's size class), drained as it becomes resident; MiMo's is zero.
+  the 256-row step and, on Sushi Cooler, the pool's size class), drained as it becomes resident; MiMo's is zero. The
+  drain reads only the slot's KV as resident (`slotOutstandingGrowth`): the histories and the MTP head stay promised to
+  the request's end, an over-hold of at most those terms and never an under-bill.
 - **A request's whole reply is billed** (`bills.cacheCapacityTokens`): a long prompt's reservation, else the cache its
   decode grows to by the +25% steps. An explicit `max_tokens` that does not fit is refused by name: the refusal gives
   the bill, what is available and the largest `max_tokens` that fits (`requestContextRefusal`, on EXL3 packs and every
