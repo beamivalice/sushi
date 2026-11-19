@@ -208,7 +208,8 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   SSD-only: `/props` active bytes after every turn equal the boot figure (91,806 MiB) with the SSD tier on or off, so
   nothing is retained; peak during the cold turn +1.9 GiB either way (live KV and prefill).
 - **A disk restore fills its buffers chunk by chunk** (`restoreKvInto`): each chunk is evaluated into buffers
-  allocated at the restored length before the next file opens. A lazy `mlx_load_safetensors` holds its file open until
+  allocated at the restored length, on MLX's page grid (`restoredRows`, or every chunk's write could copy the whole
+  buffer), before the next file opens. A lazy `mlx_load_safetensors` holds its file open until
   eval (one eval at the end failed past the soft limit of 256 files), and a concatenation at the end held every chunk
   beside the result, twice the restored KV before any bill saw it. Each chunk's eval is drained before the next chunk
   writes: undrained, a write that beat the command buffer's release copied the whole buffers instead of donating, up

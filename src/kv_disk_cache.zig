@@ -54,6 +54,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
 const trunk = @import("trunk.zig");
+const mlx_pages = @import("mlx_pages.zig");
 const prefix_arch = @import("arch/prefix.zig");
 const model = @import("model.zig");
 const io_util = @import("io_util.zig");
@@ -1254,9 +1255,9 @@ pub const DiskTier = struct {
         else
             &.{ "k", "v", "ks", "kb", "vs", "vb" };
 
-        // Per-layer per-kind buffers at `limit` rows, filled chunk by chunk: the restore runs before
-        // any admission bill sees it, and a concatenation at the end held every chunk beside the
-        // result (twice the restored KV). Layers absent from chunk 0 stay uninitialized: the
+        // Per-layer per-kind buffers holding `limit` rows, filled chunk by chunk in place (on MLX's page grid,
+        // `restoredRows`): the restore runs before any admission bill sees it, and a concatenation at the end held
+        // every chunk beside the result (twice the restored KV). Layers absent from chunk 0 stay uninitialized: the
         // GatedDeltaNet layers of a hybrid arch have no KV (their state rides the SSM checkpoints).
         const n_layers = cache.entries.len;
         const dsts = try self.allocator.alloc(mlx.mlx_array, n_layers * kinds.len);
@@ -1289,6 +1290,7 @@ pub const DiskTier = struct {
             defer _ = mlx.mlx_vector_array_free(chunk_arrays);
 
             for (0..n_layers) |li| {
+                const rows_held: c_int = if (chunk_i == 0) @intCast(try self.restoredRows(tensor_map, li, kinds, limit, s)) else 0;
                 for (kinds, 0..) |kind, ki| {
                     const key = try std.fmt.allocPrint(self.allocator, "l{d}.{s}\x00", .{ li, kind });
                     defer self.allocator.free(key);
@@ -1333,8 +1335,9 @@ pub const DiskTier = struct {
                     const dst = &dsts[li * kinds.len + ki];
                     const rows = mlx.getShape(arr);
                     if (chunk_i == 0) {
-                        const full = [_]c_int{ rows[0], rows[1], @intCast(limit), rows[3] };
-                        try mlx.check(mlx.mlx_zeros(dst, &full, 4, mlx.mlx_array_dtype(arr), s));
+                        const made = try mlx_pages.inPlaceBuffer(&.{ rows[0], rows[1], rows_held, rows[3] }, mlx.mlx_array_dtype(arr), s);
+                        _ = mlx.mlx_array_free(dst.*);
+                        dst.* = made;
                     }
                     const dshape = mlx.getShape(dst.*);
                     if (dshape.len != 4 or dshape[0] != rows[0] or dshape[1] != rows[1] or dshape[3] != rows[3])
@@ -1376,6 +1379,25 @@ pub const DiskTier = struct {
             dst.initialized = true;
         }
         cache.step = limit;
+    }
+
+    /// The rows a restored layer's buffers hold for `limit` restored rows: on MLX the page grid of every kind's row
+    /// bytes, read off chunk 0 (`KVCache.heldRows`, which the cache's later grows take), so the fill and the request's
+    /// appends write in place. The engine of our own holds `limit`.
+    fn restoredRows(self: *DiskTier, chunk0: mlx.mlx_map_string_to_array, li: usize, kinds: []const []const u8, limit: u32, s: mlx.mlx_stream) !u64 {
+        if (mlx.engine.isStream(s)) return limit;
+        var parts: [6]u64 = @splat(0);
+        for (kinds, 0..) |kind, ki| {
+            const key = try std.fmt.allocPrint(self.allocator, "l{d}.{s}\x00", .{ li, kind });
+            defer self.allocator.free(key);
+            var arr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(arr);
+            if (mlx.mlx_map_string_to_array_get(&arr, chunk0, @ptrCast(key.ptr)) != 0) return limit;
+            const sh = mlx.getShape(arr);
+            if (sh.len != 4) return error.DiskCacheCorruptChunk;
+            parts[ki] = @as(u64, @intCast(sh[0] * sh[1] * sh[3])) * mlx.mlx_array_itemsize(arr);
+        }
+        return trunk.KVCache.heldRows(0, limit, .{ .end = limit }, parts[0..kinds.len]);
     }
 
     /// Rebuilds a point's growing arrays: the entry's first `k` row segments in order, then the rows the point's own
@@ -9852,4 +9874,64 @@ test "DiskTier budget: evictions that leave the layer's packs partly live give t
         const slack = 4096 * (2 + v.packs.count());
         try testing.expect(held <= tier.diskBytes() + slack and tier.diskBytes() <= held + slack);
     }
+}
+
+/// MLX's peak above where it started while an SSD restore fills one kv8 layer of 8,001 rows (codes 125.02 pages,
+/// scales 3.9 pages), the pool emptied and, when `seed`, left free buffers a page past both the restored rows and
+/// their page grid (8,192 rows: 128 and 8 pages).
+fn restorePeak(seed: bool) !u64 {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-peak", 0, 1024);
+    defer tier.deinit();
+    const qcfg = kv_quant.KVQuantConfig.affine(8);
+    const rows: u32 = 8001;
+    {
+        var cache = try KVCache.initWithConfig(testing.allocator, 1, qcfg);
+        defer cache.deinit();
+        try fillCache(&cache, s, 1, rows, 256, 0.0, .bfloat16);
+        const tokens = try testing.allocator.alloc(u32, rows);
+        defer testing.allocator.free(tokens);
+        for (tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, tokens, false, null, s);
+    }
+    tier.drainWriter();
+    var cache2 = try KVCache.initWithConfig(testing.allocator, 1, qcfg);
+    defer cache2.deinit();
+    const idx: usize = 0;
+    try testing.expectEqual(rows, tier.entries.items[idx].kv_len);
+    try mlx.check(mlx.mlx_synchronize(s));
+    _ = mlx.mlx_clear_cache();
+    if (seed) {
+        var held: [24]mlx.mlx_array = undefined;
+        for (&held, 0..) |*h, i| {
+            h.* = mlx.mlx_array_new();
+            const bytes: c_int = @as(c_int, ([_]c_int{ 127, 129, 5, 9 })[i / 6]) * 16384;
+            try mlx.check(mlx.mlx_zeros(h, &[_]c_int{bytes}, 1, .uint8, s));
+            try mlx.check(mlx.mlx_array_eval(h.*));
+        }
+        try mlx.check(mlx.mlx_synchronize(s));
+        for (held) |h| _ = mlx.mlx_array_free(h);
+    }
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    _ = mlx.mlx_reset_peak_memory();
+    try tier.restorePrefixInto(&cache2, idx, rows, s);
+    try mlx.check(mlx.mlx_synchronize(s));
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    return peak -| before;
+}
+
+test "an SSD restore fills its KV in place when MLX's pool holds buffers a page past the restored rows" {
+    try mlx.requireGpu();
+    const clean = try restorePeak(false);
+    const seeded = try restorePeak(true);
+    // The fill writes each chunk into the buffer it made (comment above `restoreKvInto`'s loop): each of the six
+    // buffers may take a free one a page larger, never a second copy of the restored rows.
+    try testing.expect(seeded <= clean + 6 * 16384);
 }

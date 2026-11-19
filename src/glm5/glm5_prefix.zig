@@ -359,12 +359,12 @@ pub fn rowsFromDisk(allocator: std.mem.Allocator, cache: *trunk_mod.KVCache, bit
         const main = &cache.entries[2 * i];
         if (!main.initialized) continue;
         const width: c_int = mlx.getShape(main.values)[3] * @as(c_int, pool_size);
-        layer.latent = try reshaped(main.keys, &.{ @intCast(len), mlx.getShape(main.keys)[3] }, s);
-        layer.pooled = try reshaped(main.values, &.{ @intCast(len / pool_size), width }, s);
+        layer.latent = try restoredRows(main.keys, len, &.{ @intCast(len), mlx.getShape(main.keys)[3] }, s);
+        layer.pooled = try restoredRows(main.values, len, &.{ @intCast(len / pool_size), width }, s);
         const quant = &cache.entries[2 * i + 1];
         if (quant.initialized) {
-            layer.scales = try reshaped(quant.keys, &.{ @intCast(len), mlx.getShape(quant.keys)[3] }, s);
-            layer.biases = try reshaped(quant.values, &.{ @intCast(len), mlx.getShape(quant.values)[3] }, s);
+            layer.scales = try restoredRows(quant.keys, len, &.{ @intCast(len), mlx.getShape(quant.keys)[3] }, s);
+            layer.biases = try restoredRows(quant.values, len, &.{ @intCast(len), mlx.getShape(quant.values)[3] }, s);
         }
         for ([_]*Arr{ &layer.tail_keys, &layer.tail_gates }) |tail| {
             tail.* = mlx.mlx_array_new();
@@ -378,6 +378,20 @@ fn asTokenRows(dst: *Arr, src: Arr, len: usize) !void {
     const n: usize = @intCast(mlx.mlx_array_size(src));
     _ = mlx.mlx_array_free(dst.*);
     dst.* = try reshaped(src, &.{ 1, 1, @intCast(len), @intCast(n / len) }, mlx.gpuStream());
+}
+
+/// The first `len` rows of a restored `[1, 1, rows, w]` buffer as `shape`: an SSD restore holds its rows on MLX's page
+/// grid (`DiskTier.restoredRows`), past `len`.
+fn restoredRows(src: Arr, len: usize, shape: []const c_int, s: mlx.mlx_stream) !Arr {
+    const sh = mlx.getShape(src);
+    if (sh[2] == len) return reshaped(src, shape, s);
+    var head = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(head);
+    try mlx.check(mlx.mlx_slice(&head, src, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ sh[0], sh[1], @intCast(len), sh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+    const out = try reshaped(head, shape, s);
+    defer _ = mlx.mlx_array_free(out);
+    // An owned copy: a view would keep the restore's whole buffer alive.
+    return @import("../mlx_util.zig").materializedOwnedCopy(s, out);
 }
 
 fn reshaped(src: Arr, shape: []const c_int, s: mlx.mlx_stream) !Arr {

@@ -118,6 +118,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **MLX-route memory: a request whose prompt does not fill the advertised context is admitted again**: its cache no
   longer grows past the request's last token, so it holds and is billed no more than a prompt that fills the context;
   a warm cache restored at its own length no longer grows past its bill either.
+- **MLX-route memory: a conversation restored from the SSD cache is held once**: the restore copied its whole cache at
+  each chunk it read, so it briefly held about twice the conversation's cache before the request was admitted.
 - **APIs and server**: a shutdown refuses the requests still waiting from the moment it is asked, instead of serving
   those it reaches within the next second.
 - **Stopping the server during an unload answers the requests waiting on that model**: a request sent while an unload
