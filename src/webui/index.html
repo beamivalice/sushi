@@ -1979,7 +1979,7 @@ function reportUpdateResult(update) {
   if (!from || !update) return;
   dropStore(UPDATE_KEY);
   if (update.current !== from) toast(`Updated to sushi ${update.current}`, "ok");
-  else toast(`Update failed: ${update.error || "sushi restarted on the version it had"}`, "err");
+  else toast(`Update failed: ${update.error || "sushi restarted on the version it had"}`, "err", { stay: true });
 }
 /* The server goes down while the updater runs; back up (or on another version) means the restart is over. */
 async function waitForRestart(from) {

@@ -19,6 +19,7 @@ earlier history is mlx-serve's, in that project's changelog.
   unsupported transfer coding or expectation, a bad chunk, a server still starting and an unknown path under
   `/v1/messages` answered in OpenAI's shape; a refused API key now takes the same shape as every other error (a HEAD
   gets no body), and the metrics feed's refusals carry the `error.message` the dashboard reads.
+- **A failed self-update's message stays in the web page until you dismiss it**, as a refused load's does.
 - **APIs and server**: a shutdown refuses the requests still waiting from the moment it is asked, instead of serving
   those it reaches within the next second.
 - **A long Qwen3.8 conversation's next turn is refused less often near the memory limit**: a turn that takes the cached

@@ -139,7 +139,7 @@ and the page tooltip share them.
   chat's folder picker (`/v1/tools` browse, so this Mac's page on a loopback bind; elsewhere a typed absolute path is
   taken as is). A pick saves `server.models_dir` and rescans at once; **Use the default folder** clears it; a
   `--model-dir` launch leaves no Change button.
-- A toast that carries the server's refusal (a load, an update, a Models or Settings action) stays until dismissed
+- A toast that carries the server's refusal (a load, an update and its result, a Models or Settings action) stays until dismissed
   (`toast(..., "err", { stay: true })`); any other error toast leaves after 8 s, a confirmation after 2.4 s.
 - Each model's page shows the three wire limits as they read now (refetched when the window regains focus, as after
   Terminal) and the standard `sudo sysctl` line with a copy button; it says to restart while `iogpu` differs from the

@@ -417,6 +417,24 @@ async function main() {
       assert.deepEqual(errors, []);
       await context.close();
     }
+    {
+      // A failed update's toast carries the server's reason and stays until dismissed, as a refused load's does.
+      const server = makeServer();
+      const { page, context, errors } = await open(browser, server, '/chat', { viewport: PHONE, clock: true });
+      await page.evaluate(() => {
+        writeStore('sushi-update-pending', '1.0.0', true);
+        reportUpdateResult({ current: '1.0.0', error: 'the download of sushi 1.0.1 failed: HTTP 404' });
+      });
+      await page.clock.runFor(120_000);
+      const shown = await page.evaluate(() => [...document.getElementById('toastHost').children].map((n) => n.textContent));
+      assert.equal(shown.length, 1, 'the failed update is still shown after two minutes');
+      assert.ok(shown[0].includes('HTTP 404'), `it names the server's reason (${shown[0]})`);
+      await page.click('#toastHost .toast [aria-label="Dismiss"]');
+      await page.clock.runFor(1000);
+      assert.equal(await page.evaluate(() => document.getElementById('toastHost').children.length), 0, 'Dismiss removes it');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
     console.log('Web UI shell: passed');
   } finally {
     await browser.close();
