@@ -5701,7 +5701,10 @@ test "cooler contract: a DeepSeek decode whose read-back of a released pool is r
     const need = borrow.prefillNeed(&m.cfg, @import("cooler_side.zig").onEngine(&ld.config), wide, wide);
     LeaseProbe.engine = engine;
     defer LeaseProbe.engine = null;
-    LeaseProbe.base = need - engine.poolBytes(@intCast(engine.layers.len - 1)) / 2;
+    const at_prefill = need - engine.poolBytes(@intCast(engine.layers.len - 1)) / 2;
+    // Once the prefill's working set is free again, the decode has its own cap and the union workspace beside the pools.
+    const at_decode = @max(at_prefill, m.cfg.forwardCap(1, long.len + 1) + engine.unionBytes());
+    LeaseProbe.base = at_prefill;
     borrow.headroom_fn = &LeaseProbe.headroom;
     defer borrow.headroom_fn = null;
     const Released = struct {
@@ -5718,6 +5721,7 @@ test "cooler contract: a DeepSeek decode whose read-back of a released pool is r
         try r.begin(&ld, dir, &long);
         defer r.end();
         try testing.expect(Released.count(engine) >= 2);
+        LeaseProbe.base = at_decode;
         LeaseProbe.mark = true;
         LeaseProbe.marked = 0;
         r.tick();
@@ -5736,8 +5740,10 @@ test "cooler contract: a DeepSeek decode whose read-back of a released pool is r
     var k: u64 = 1;
     while (k <= asks) : (k += 1) {
         var r: LeasedDecode = undefined;
+        LeaseProbe.base = at_prefill;
         try r.begin(&ld, dir, &long);
         defer r.end();
+        LeaseProbe.base = at_decode;
         LeaseProbe.arm_at = k;
         defer LeaseProbe.arm_at = 0;
         r.tick();
@@ -5876,6 +5882,8 @@ test "cooler contract: a DeepSeek decode forward reads back every pool its prefi
     var r: LeasedDecode = undefined;
     try r.begin(&ld, dir, &long);
     defer r.end();
+    // Once the prefill's working set is free again, the decode has its own cap and the union workspace beside the pools.
+    LeaseProbe.base = @max(LeaseProbe.base, m.cfg.forwardCap(1, long.len + 1) + engine.unionBytes());
     var released: std.ArrayList(u16) = .empty;
     defer released.deinit(a);
     for (engine.borrow_from..engine.layers.len) |li| if (engine.isBorrowed(@intCast(li))) try released.append(a, @intCast(li));

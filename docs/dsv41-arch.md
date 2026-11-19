@@ -394,6 +394,8 @@ Prefill width:
   - At 8k and longer a 2048 bill is the 1024 bill plus 2500 MiB (1024 more rows at 400 B a channel, x 5/4). At
     budget 96 (13020 MiB to serve) prompts up to ~413k take 2048, up to ~642k take 1024, and the rest take 512.
   - Measured transient at 2048 rows: 4.35 GB, and 5.15 GB on a 2524-row last chunk (8.7k prompt), inside the bill.
+    Measured before the Engram gate kernel served wide rows, whose op chain the bill no longer carries (2.70 GB at 2048
+    rows, 10.78 GB at 8192 on the STQ pack's shape sum, from 4.08 and 16.31).
 - The tail's routed experts stay on the prefill sorted GEMM. `sushi-ubench run dsv41.tail_routed` (c5fec957 + the bench, ReleaseFast,
   AC, `taskpolicy -a`, quiet box, 5 rounds, synthetic uniform top-6 routes over the plan's layers 2, 5 and 23) times it
   against the multi-row decode chain per layer: the chain wins to 32 rows (0.50-0.72 of the GEMM) and 64 (0.82-0.90),
@@ -587,7 +589,7 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_hc_mix`, `dsv41_hc_norm` | the same for a wide block (a tile of rows and mixes a threadgroup; split + collapse + norm) | more than 16 rows; the mix where `dsv41_hc_mix_nax` does not serve | bit for bit the stage's z, split and normed collapse |
 | `dsv41_hc_mix_nax` (`Model.hc_mix_nax`) | the wide mix on the matrix units: 16 rows a threadgroup, 16 simdgroups each summing a sixteenth of the stream, the f32 mix weights as two half parts | more than 16 rows, a bf16 stream whose width times copies 256 divides, at most 32 mixes, where the load's trial against `dsv41_hc_mix` passes | within 2e-6 of the peak of the f64 truth (the ALU kernel is within 1e-6); a row's bytes are the same wherever it sits in a block |
 | `dsv41_hc_expand` | `hcExpand`'s op chain (post x y + comb^T x) on a wide block: the stream in one pass, one thread an output element (grid z = copy) | any rows, GPU stream, 4 copies, where `probeHc` finds the GPU's f32 matmul TF32-class and the kernel equal to the chain | bit for bit the chain (bf16 and f32; 1 to 4096 rows; D 40 to 5120) |
-| `dsv41_engram` | the Engram gate chain after `wkv` | up to 16 rows | bit for bit (MLX's row-reduction order) |
+| `dsv41_engram` | the Engram gate chain after `wkv`, one threadgroup a (row, copy) | any rows on the GPU stream (the op chain's f32 copies of the stream were ~670 MB each at 8192 rows) | bit for bit (MLX's row-reduction order), up to 2048 rows on MLX's stream and the engine's |
 
 `dsv41_unpack_picks` (decode picks glue, 7 dispatches to 1): `sushi-ubench run dsv41.picks_glue` (62f2245d code, quiet, 9 rounds of 40 dependent layers, `taskpolicy -a`, AC, GPU lock; 512 picks of 512-wide FP4 rows with holes, median us a layer including a 4 us link): op chain 26.7 / 23.0 / 18.6 / 23.0 to kernel 16.1 / 14.9 / 12.2 / 15.1 at 1024 and 16384 rows x 1 and 4 query rows; 27.1 to 23.3 at 262144 rows. One kernel a layer; bytes equal to the chain.
 Decode attention core, `sushi-ubench run dsv41.attn_decode` (`dsv41_attn_decode`/`_split`/`_merge`, 40 dependent calls, 15 rounds, quiet, `taskpolicy -a`, GPU lock, AC, 85ec48c1): 36.8 us a call at 512 picks over 4k compressed rows, 35.9 over 250k, 22.7 at 64 picks over 4k. Scoring RB of a simdgroup's rows (their dots) ahead of the serial recurrence, same expressions and bytes, was slower: RB 1/2/4/8 at 512 picks over 4k 39.2/42.0/42.0/46.0 us (a variant keeping the rows in registers 57 to 92 us). The serial walk is not what bounds the kernel.

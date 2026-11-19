@@ -3090,7 +3090,8 @@ fn engramApply(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A
     const wkv_in = try sc.astype(try sc.reshape(rows, &.{ ci(dim(x, 0)), -1 }), m.act);
     try tapInput(m, e.layer, .engram_in, wkv_in);
     const kv = try e.wkv.apply(sc, wkv_in);
-    if (fusedOn(sc, m) and dim(x, 0) <= NARROW_ROWS) return kernels.engramGate(sc, x, kv, e.qk, m.cfg.eps);
+    // One threadgroup a (row, copy) at any width: the op chain's f32 intermediates are ~670 MB each at 8192 rows.
+    if (fusedOn(sc, m)) return kernels.engramGate(sc, x, kv, e.qk, m.cfg.eps);
     return engramGateOps(sc, &m.cfg, e.qk, x, kv);
 }
 

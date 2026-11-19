@@ -2959,9 +2959,11 @@ pub fn hcExpandProbed() bool {
 }
 
 /// Records for the wide forward's shape sum whether the loaded model expands its hyper-connection stream with
-/// `hcExpandFused` (its fused kernels on, this GPU probed) or `hcExpandOps`'s chain, whose planes it then bills.
+/// `hcExpandFused` (its fused kernels on, this GPU probed) or `hcExpandOps`'s chain, whose planes it then bills, and
+/// whether its Engram gate is the kernel or `engramGateOps`'s chain.
 pub fn noteExpandArm(fused: bool) void {
     @import("dsv41_wide_bytes.zig").expand_fused = fused and hc_expand_tf32;
+    @import("dsv41_wide_bytes.zig").engram_fused = fused;
 }
 
 pub fn hcExpandServes(x: A) bool {
@@ -4599,6 +4601,37 @@ test "dsv41 engram: the gate kernel writes the op chain's stream, bit for bit" {
             try expectBitEqual("engram gate", try hostOf(&sc, got), try hostOf(&sc, want));
         }
     }
+}
+
+test "dsv41 engram: the gate kernel writes the op chain's stream at prefill widths, on MLX and on the engine" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    var cfg = Config{};
+    cfg.hc_mult = 4;
+    cfg.eps = 1e-6;
+    cfg.dim = 5120;
+    var prng = std.Random.DefaultPrng.init(0x3e6a);
+    const r = prng.random();
+    const big = try testing.allocator.alloc(f32, 2048 * 5 * 5120);
+    defer testing.allocator.free(big);
+    for (big) |*v| v.* = r.floatNorm(f32) * 1.2;
+    for ([_]bool{ false, true }) |own| for ([_]usize{ 17, 2048 }) |n| {
+        const s = if (own) mlx.engine.stream() else mlx.gpuStream();
+        const scope = mlx.engine.enter(s);
+        defer scope.end();
+        var sc = Scope.plain(testing.allocator, s);
+        defer sc.deinit();
+        const l: c_int = @intCast(n);
+        const x = try sc.astype(try sc.floats(big[0 .. n * 4 * 5120], &.{ l, 4, 5120 }), .bfloat16);
+        const kv = try sc.astype(try sc.floats(big[big.len - n * 5 * 5120 ..], &.{ l, 5 * 5120 }), .bfloat16);
+        const qk = try sc.floats(big[n * 4 * 5120 ..][0 .. 4 * 5120], &.{ 4, 5120 });
+        const want = try model.engramGateOps(&sc, &cfg, qk, x, kv);
+        const got = try engramGate(&sc, x, kv, qk, 1e-6);
+        try testing.expectEqual(own, mlx.engine.isOurs(got));
+        try expectBitEqual("engram gate", try hostOf(&sc, got), try hostOf(&sc, want));
+    };
 }
 
 test "dsv41 draft: a Markov step's kernel gives the op chain's pick, and its scores and confidence to f32 rounding" {

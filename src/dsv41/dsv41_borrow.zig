@@ -667,7 +667,7 @@ test "dsv41 borrow: a forward's need is its cap, a decode forward's far smaller"
     try testing.expectEqual(c.forwardCap(2048, ctx), prefillNeed(&c, true, 2048, ctx));
     // A last chunk that absorbed its tail is priced at its own rows.
     try testing.expect(prefillNeed(&c, true, 2048 + 511, ctx) > prefillNeed(&c, true, 2048, ctx));
-    try testing.expect(c.forwardCap(verify_rows, ctx) * 3 < prefillNeed(&c, true, 512, ctx) * 2);
+    try testing.expect(c.forwardCap(verify_rows, ctx) * 3 < prefillNeed(&c, true, 2048, ctx));
 }
 
 test "dsv41 borrow: the load-time estimate is the decoder layers' even share of the cache, STQ packs only" {
@@ -697,9 +697,9 @@ test "dsv41 borrow: at the budget-115 and 117 geometries no chunk releases a poo
     try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 31, 14766), headroom));
     try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), headroom));
     try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048 + 511, 1 << 20), headroom));
-    // At 117 the headroom is ~4.6 GB, over the 4.38 GB a 2048-row chunk holds on the engine; under it, one pool goes.
+    // At 117 the headroom is ~4.6 GB, over the 2.97 GB a 2048-row chunk holds on the engine; under it, one pool goes.
     try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 4_600_000_000));
-    try testing.expectEqual(@as(?usize, 1), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 4_000_000_000));
+    try testing.expectEqual(@as(?usize, 1), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 2_900_000_000));
 }
 
 const PoolProbe = struct {

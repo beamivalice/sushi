@@ -12,6 +12,10 @@ const Config = cfg_mod.Config;
 /// the matrix-unit (NAX) GPUs it was probed on.
 pub var expand_fused: ?bool = null;
 
+/// The loaded model's Engram gate arm (`dsv41_kernels.noteExpandArm`): true for the gate kernel, false for
+/// `engramGateOps`'s chain (the composed diagnostic). Null before a load: the kernel, the served default.
+pub var engram_fused: ?bool = null;
+
 fn expandFused() bool {
     if (expand_fused) |on| return on;
     return sushi_exl3.kernels.gemmNaxOn();
@@ -157,13 +161,18 @@ fn packedRows(t: *Tally, n: u64, w: u64, group: u64) void {
     t.t(1, n * w / group);
 }
 
-/// The gated write of the n-gram rows (`engramApply`, the op chain at a wide width): the rows as one bf16 row each,
-/// `wkv`'s keys and value, eight f32 copies of the stream, the f32 value, sixteen per-copy f32 scalars, the sign mask,
-/// the new stream and four constants.
+/// The gated write of the n-gram rows (`engramApply`): the rows as one bf16 row each, `wkv`'s keys and value and the new
+/// stream; the gate kernel's three constants, or the op chain's eight f32 copies of the stream, the f32 value, sixteen
+/// per-copy f32 scalars, the sign mask and four constants.
 fn engramWrite(t: *Tally, c: *const Config, L: u64) void {
     const hc: u64 = c.hc_mult;
     t.t(1, L * c.engram.cols() * c.engram.head_dim * act);
     t.t(1, L * (hc + 1) * c.dim * act);
+    if (engram_fused orelse true) {
+        t.t(1, L * hc * c.dim * act);
+        t.t(1, 3 * f32b);
+        return;
+    }
     t.t(8, L * hc * c.dim * f32b);
     t.t(1, L * c.dim * f32b);
     t.t(1, L * hc * c.dim * act);

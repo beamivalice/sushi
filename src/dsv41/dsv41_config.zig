@@ -657,14 +657,14 @@ test "dsv41 forward cap: a wide forward's row term is the shape sum of its wides
     // pools reads these less the three spill pools. The release: layer 14 (the same roles) over ten pools (the STQ
     // pack's combined chain) or the FP4 experts' sorted gather.
     for ([_]Case{
-        .{ .c = &tiny, .rows = 512, .shapes = 40_501_248 },
-        .{ .c = &tiny, .rows = 2048, .shapes = 159_694_848 },
-        .{ .c = &tiny, .rows = 8192, .shapes = 637_452_288 },
-        .{ .c = &rel_stq, .rows = 363, .shapes = 751_157_248 },
-        .{ .c = &rel_stq, .rows = 2048, .shapes = 4_081_090_560 },
-        .{ .c = &rel_stq, .rows = 4096, .shapes = 8_160_788_480 },
-        .{ .c = &rel_stq, .rows = 8192, .shapes = 16_314_007_552 },
-        .{ .c = &rel, .rows = 2048, .shapes = 2_717_777_920 },
+        .{ .c = &tiny, .rows = 512, .shapes = 22_872_064 },
+        .{ .c = &tiny, .rows = 2048, .shapes = 89_899_008 },
+        .{ .c = &tiny, .rows = 8192, .shapes = 358_449_152 },
+        .{ .c = &rel_stq, .rows = 363, .shapes = 499_957_760 },
+        .{ .c = &rel_stq, .rows = 2048, .shapes = 2_696_380_416 },
+        .{ .c = &rel_stq, .rows = 4096, .shapes = 5_391_433_728 },
+        .{ .c = &rel_stq, .rows = 8192, .shapes = 10_775_347_200 },
+        .{ .c = &rel, .rows = 2048, .shapes = 1_333_067_776 },
     }) |k| {
         const got = k.c.forwardCap(k.rows, k.rows) - k.c.growthBytes(k.rows) - BILL_MARGIN_BYTES;
         errdefer std.debug.print("{d} rows: shape sum {d}\n", .{ k.rows, got });
@@ -685,7 +685,7 @@ test "dsv41 forward cap: grows with the rows and the context, a chunk's tail mer
     try testing.expect(c.forwardCap(2048, 9_000) > c.forwardCap(1024, 9_000));
     try testing.expect(c.forwardCap(2048, m) > c.forwardCap(2048, 9_000));
     try testing.expect(c.forwardCap(verify_rows, m) > c.forwardCap(1, 9_000));
-    try testing.expect(c.forwardCap(verify_rows, m) * 4 < c.forwardCap(2048, m));
+    try testing.expect(c.forwardCap(verify_rows, m) * 3 < c.forwardCap(2048, m));
     try testing.expectEqual(c.forwardCap(2048 + tail_merge_rows, m), c.chunkCap(2048, m));
     // A prompt shorter than the chunk cannot run more rows than it has.
     try testing.expectEqual(c.forwardCap(100, 100), c.chunkCap(2048, 100));

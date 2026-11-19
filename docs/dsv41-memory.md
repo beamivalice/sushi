@@ -353,7 +353,7 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
 (`ModelConfig.expert_borrow_bytes`, published live by the engine) do not cover it. At 1M: 3.4 GB in all.
 
 **The borrow** (`src/dsv41/dsv41_borrow.zig`, `Engine.borrowLayer`/`restoreLayer`):
-- Before every forward wider than 17 rows, its need, `Config.forwardCap(rows, seq)` (4.35 GB at 2048 rows on the STQ pack),
+- Before every forward wider than 17 rows, its need, `Config.forwardCap(rows, seq)` (2.7 GB of shapes at 2048 rows on the STQ pack),
   against the live headroom (ceiling less MLX's active bytes). Short of it, whole decoder pools go, latest layer first
   (39 down to the CED split, 20): the plan is made from the pools' bytes before anything is released, a forward the
   pools cannot cover is refused (`PrefillDoesNotFit`) with nothing released. The planned pools go, the forward waits for
