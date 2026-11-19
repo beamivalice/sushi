@@ -1206,13 +1206,16 @@ pub fn memoryContextRefusalMessage(allocator: std.mem.Allocator, refusal: model_
 }
 
 pub fn writeMemoryContextRefusal(w: *std.Io.Writer, refusal: model_registry_mod.MemoryContextRefusal) std.Io.Writer.Error!void {
-    const mb: u64 = 1 << 20;
-    if (refusal.fitting_max_tokens > 0) return w.print("Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}: the request needs {d} MB and {d} MB is available. max_tokens {d} fits (asked {d}); maximum context: {d} tokens. Lower max_tokens, reduce context or free memory.", .{
-        refusal.requested, refusal.kv_bits, refusal.chunk, (refusal.needed + mb - 1) / mb, refusal.available / mb, refusal.fitting_max_tokens, refusal.asked_max_tokens, refusal.maximum,
-    });
-    return w.print("Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}: the request needs {d} MB and {d} MB is available, and the prompt alone does not fit. Maximum context: {d} tokens. Reduce context or free memory.", .{
-        refusal.requested, refusal.kv_bits, refusal.chunk, (refusal.needed + mb - 1) / mb, refusal.available / mb, refusal.maximum,
-    });
+    const u = Mem.unitOf(refusal.needed, refusal.available);
+    try w.print("Context {d} does not fit in GPU memory: the request needs {f} and {f} is available", .{ refusal.requested, Mem.need(refusal.needed, u), Mem.have(refusal.available, u) });
+    if (refusal.fitting_max_tokens > 0) {
+        try w.print(". max_tokens {d} fits (asked {d}); maximum context: {d} tokens.\nTo serve it:\n- Lower max_tokens to {d} or less.\n- Shorten the prompt.\n", .{ refusal.fitting_max_tokens, refusal.asked_max_tokens, refusal.maximum, refusal.fitting_max_tokens });
+    } else {
+        try w.print(", and the prompt alone does not fit.", .{});
+        // A zero maximum is no advice: nothing this request can shed fits.
+        if (refusal.maximum > 0) try w.print(" Maximum context: {d} tokens.\nTo serve it:\n- Shorten the prompt so that it and its reply fit in {d} tokens.\n", .{ refusal.maximum, refusal.maximum }) else try w.print("\nTo serve it:\n", .{});
+    }
+    try w.print("- Quit other apps or unload another model on the Models page, then retry.\n- Use a smaller pack of this model.", .{});
 }
 
 pub fn loadServingBill(config: *const model_mod.ModelConfig, budget: u64) ?model_load.LoadServingBill {
@@ -3076,20 +3079,20 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
         .thought = checkpoints.thought,
     };
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, warm);
-    const mb = 1024 * 1024;
     // "Narrowest width tried" is only true where the ladder was walked.
     const width_note: []const u8 = if (perRequestPrefillChunkEnabled(config)) "the narrowest width tried" else "the pinned width";
     // The comparison first (`fitsAfterEviction` spelled out), then the residency as context, with
     // the part eviction cannot take named.
-    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} ({s}), ~{d}MB available + ~{d}MB the hot cache can give back (~{d}MB resident, ~{d}MB of it pinned by this request's own prefix) — refused before prefill\n", .{
+    const u = Mem.unitOf(bill.needed, bill.available +| bill.evictable);
+    log.warn("  prompt {d} tokens needs {f} at prefill chunk {d} ({s}), {f} available + {f} the hot cache can give back ({f} resident, {f} of it pinned by this request's own prefix) — refused before prefill\n", .{
         prompt_len,
-        bill.needed / mb,
+        Mem.need(bill.needed, u),
         bill.chunk,
         width_note,
-        bill.available / mb,
-        bill.evictionCredit() / mb,
-        bill.evictable / mb,
-        pinnedResidentBytes(bill) / mb,
+        Mem.have(bill.available, u),
+        Mem.have(bill.evictionCredit(), u),
+        Mem.have(bill.evictable, u),
+        Mem.have(pinnedResidentBytes(bill), u),
     });
     const context = requestContextRefusal(config, prompt_len, max_tokens, kv_cfg, bill, warm);
     if (context) |r| log.warn("  maximum context at KV{d}, prefill chunk {d}: {d} tokens\n", .{ r.kv_bits, r.chunk, r.maximum });
@@ -6399,10 +6402,10 @@ test "bill pin: the refusal sentences" {
     try std.testing.expectEqualStrings("Not enough GPU memory for this request: with a 5000-token prompt and max_tokens 4096 it needs 13.4 GB, and 13.2 GB is available, counting the 0.1 GB the prefix cache can give back.\nThe prompt alone does not fit: shorten it, free memory (quit other apps or unload another model), or use a smaller model.", cached);
     const fits = try memoryContextRefusalMessage(a, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024, .asked_max_tokens = 96_000, .fitting_max_tokens = 2000 });
     defer a.free(fits);
-    try std.testing.expectEqualStrings("Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024: the request needs 9000 MB and 7000 MB is available. max_tokens 2000 fits (asked 96000); maximum context: 64000 tokens. Lower max_tokens, reduce context or free memory.", fits);
+    try std.testing.expectEqualStrings("Context 160000 does not fit in GPU memory: the request needs 8.8 GB and 6.8 GB is available. max_tokens 2000 fits (asked 96000); maximum context: 64000 tokens.\nTo serve it:\n- Lower max_tokens to 2000 or less.\n- Shorten the prompt.\n- Quit other apps or unload another model on the Models page, then retry.\n- Use a smaller pack of this model.", fits);
     const alone = try memoryContextRefusalMessage(a, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024 });
     defer a.free(alone);
-    try std.testing.expectEqualStrings("Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024: the request needs 9000 MB and 7000 MB is available, and the prompt alone does not fit. Maximum context: 64000 tokens. Reduce context or free memory.", alone);
+    try std.testing.expectEqualStrings("Context 160000 does not fit in GPU memory: the request needs 8.8 GB and 6.8 GB is available, and the prompt alone does not fit. Maximum context: 64000 tokens.\nTo serve it:\n- Shorten the prompt so that it and its reply fit in 64000 tokens.\n- Quit other apps or unload another model on the Models page, then retry.\n- Use a smaller pack of this model.", alone);
 }
 
 test "a memory refusal names a max_tokens and a maximum context its own request admits, on every served pack's bill" {
@@ -7486,7 +7489,7 @@ test "a refused request's message never shows its need equal to what is availabl
         const msg = try memoryContextRefusalMessage(testing.allocator, .{ .requested = 70000, .maximum = 65536, .needed = 5000 * mb + 1, .available = 5000 * mb + mb - 1, .kv_bits = 8, .chunk = 2048, .asked_max_tokens = 4096, .fitting_max_tokens = fitting });
         defer testing.allocator.free(msg);
         errdefer std.debug.print("{s}\n", .{msg});
-        try testing.expect(std.mem.indexOf(u8, msg, "needs 5001 MB and 5000 MB is available") != null);
+        try testing.expect(std.mem.indexOf(u8, msg, "needs 4.9 GB and 4.8 GB is available") != null);
     }
 }
 
@@ -7595,4 +7598,15 @@ test "an ssd budget below what a streamed pack holds is refused naming the small
             return null;
         }
     }{}));
+}
+
+test "a context refusal whose prompt alone does not fit names no zero maximum, and says what can help" {
+    const a = testing.allocator;
+    const mib: u64 = 1 << 20;
+    const text = try memoryContextRefusalMessage(a, .{ .requested = 14, .maximum = 0, .needed = 276 * mib + 1, .available = 274 * mib + mib / 2, .kv_bits = 8, .chunk = 512 });
+    defer a.free(text);
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "Maximum context: 0") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "the request needs 277 MB and 274 MB is available, and the prompt alone does not fit.") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\n- Quit other apps or unload another model on the Models page, then retry.") != null);
 }

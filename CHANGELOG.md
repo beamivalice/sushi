@@ -28,6 +28,9 @@ earlier history is mlx-serve's, in that project's changelog.
   which already carries the margin, and added it again, so a request within 256 MB of the edge was refused and the
   advertised context came out that much smaller. Its last decode forward is now priced where it runs, at the reply's
   end, so a short prompt with a long reply is billed the scores and state growth of its whole context.
+- **A request refused because its prompt alone does not fit no longer reads "Maximum context: 0 tokens"**: it now
+  says what can help (free memory, a smaller pack), drops the internal KV width and prefill chunk, and the log line
+  beside it prints the same figures.
 - **Every refusal says what can help it, and the web UI shows it as written**: a request stopped for memory while it
   ran was told to shrink "the image size" for a text prompt, an image too large to encode got no action at all, and the
   chat appended "Wait for the model to load" to every one-line 503 (a shutdown included) and "Check the chat settings" to

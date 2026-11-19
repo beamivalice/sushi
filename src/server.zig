@@ -1662,7 +1662,7 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
 }
 
 
-test "Sushi quant memory request refusal carries the actual KV width MTP and maximum to the wire" {
+test "Sushi quant memory request refusal prices the actual KV width and MTP, and its maximum reaches the wire" {
     const saved_ctx = server_state.server_config.max_context_size;
     defer server_state.server_config.max_context_size = saved_ctx;
     const saved_mtp = server_state.configured_mtp;
@@ -1683,7 +1683,6 @@ test "Sushi quant memory request refusal carries the actual KV width MTP and max
     const message = try memoryContextRefusalMessage(std.testing.allocator, refusal);
     defer std.testing.allocator.free(message);
     try std.testing.expect(std.mem.indexOf(u8, message, "Maximum context: 64000 tokens") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "KV4") != null);
     server_state.slot_memory_context_refusal = refusal;
     const wire = try generation_stream.mapGenerationError(std.testing.allocator, error.PrefillDoesNotFit);
     defer wire.deinit(std.testing.allocator);
@@ -1742,8 +1741,9 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
     // Evict to admit (#353): when the bill only fails because the cache is holding memory, admit;
     // the inference thread evicts LRU entries until it fits and refuses by name only if it still does not.
     if (needed > available and bill.fitsAfterEviction()) {
-        log.info("  prompt {d} tokens needs ~{d}MB, ~{d}MB available + ~{d}MB reclaimable hot cache (of ~{d}MB resident) — admitting, the prefill will evict\n", .{
-            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024),
+        const u = bills.Mem.unitOf(needed, available +| bill.evictable);
+        log.info("  prompt {d} tokens needs {f}, {f} available + {f} reclaimable hot cache (of {f} resident) — admitting, the prefill will evict\n", .{
+            prompt_len, bills.Mem.need(needed, u), bills.Mem.have(available, u), bills.Mem.have(bill.evictionCredit(), u), bills.Mem.have(bill.evictable, u),
         });
         return true;
     }
@@ -1751,8 +1751,9 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
     // this prompt would restore from is holding bytes that will neither be allocated nor
     // reclaimed. How many is knowable only on the inference thread, which bills with `WarmPrefix`.
     if (needed > available and pinnedResidentBytes(bill) > 0) {
-        log.info("  prompt {d} tokens needs ~{d}MB cold, ~{d}MB available, and ~{d}MB of hot cache is a prefix this prompt would SHARE — deferring to the prefill, which bills the warm request\n", .{
-            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), pinnedResidentBytes(bill) / (1024 * 1024),
+        const u = bills.Mem.unitOf(needed, available +| pinnedResidentBytes(bill));
+        log.info("  prompt {d} tokens needs {f} cold, {f} available, and {f} of hot cache is a prefix this prompt would SHARE — deferring to the prefill, which bills the warm request\n", .{
+            prompt_len, bills.Mem.need(needed, u), bills.Mem.have(available, u), bills.Mem.have(pinnedResidentBytes(bill), u),
         });
         return true;
     }
@@ -4195,6 +4196,6 @@ test "a request whose max_tokens alone does not fit is refused on the connection
     errdefer std.debug.print("the connection thread's refusal (admitted {}): {s}\n", .{ admitted, body });
     try t.expect(!admitted);
     // `memoryContextRefusalMessage`'s text, as the inference thread's refusal reads.
-    try t.expect(std.mem.indexOf(u8, body, " does not fit available GPU memory at KV") != null);
+    try t.expect(std.mem.indexOf(u8, body, " does not fit in GPU memory: the request needs ") != null);
     try t.expect(std.mem.indexOf(u8, body, " fits (asked 1000000); maximum context: ") != null);
 }
