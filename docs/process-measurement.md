@@ -93,6 +93,9 @@ start (fans at max, 4 min idle). Even with fans at max the die reached 97 °C in
 server and between arms: fans to max, then idle until the hottest die sensor (`fanctl status`) reads under 50 °C, at most
 3 min. Never slot a GPU job into that idle: the next server starts throttled.
 
+**The M5 Ultra does not throttle**, so it takes no cooldown and no temperature limit; its die sensor reads as `unread`
+in a `sushi-ubench` header, and the idle step passes at once.
+
 Under this protocol one A arm then one B arm is enough. Run A B B A only when the expected difference is within a few
 percent, where a thermal or drift step between two single arms would read as the effect.
 
@@ -273,6 +276,8 @@ local path.
   that builds and passes the full suite.
 - A git worktree has neither `.zig-toolchain/` nor the built `lib/mlx/`: symlink both from the main checkout.
 - `lib/mlx-src` and `lib/mlxc-src` are the only submodules; they are needed only to rebuild MLX.
+- `scripts/build-mlx.sh` leaves its patches applied in both submodules, which reads as a dirty tree to `sushi-ubench` and
+  `tests/bench.sh`. On a new box set `git config submodule.lib/mlx-src.ignore dirty` (and the same for `lib/mlxc-src`).
 - Pins: `lib/mlx-src` v0.32.3 and `lib/mlxc-src` 56b2d39 (mlx-serve's). Bumping: check out the tag, `git add` the
   submodule, rerun `scripts/build-mlx.sh`, re-diff `src/mlx.zig` externs against `lib/mlxc-src/mlx/c/*.h`.
 - Image input links `stb_image` and libwebp; the only non-system dylibs are `libmlxc` and `libwebp`

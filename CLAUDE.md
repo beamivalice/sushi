@@ -97,8 +97,9 @@ Skills: `/release` (release order, gates, CHANGELOG, contributor credit), `/benc
 
 Zig 0.17.1 (`scripts/fetch-zig.sh` stages it at `.zig-toolchain/`); mlx + mlx-c are pinned submodules built NAX-enabled
 by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); chat templates render in Zig (`src/template/`). Min
-macOS 26.2. Box: M5 Max 128 GB, macOS 27. Bumping mlx:
-[process-measurement](docs/process-measurement.md#build-environment-notes).
+macOS 26.2. Boxes, macOS 27: M5 Max 128 GB (40-core GPU) and M5 Ultra 256 GB (64-core GPU, about twice the bandwidth,
+holds a DeepSeek STQ pack resident, never throttles). A number names its box and compares only with that box's. Bumping
+mlx: [process-measurement](docs/process-measurement.md#build-environment-notes).
 
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug is 2–4× slower ⇒ fake regressions).
   `zig build test` does NOT refresh `zig-out/bin/sushi`: rebuild before any live A/B.
@@ -243,8 +244,8 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
   long), writes the same notice into the marker file, and says so again when it clears; workers check the file before
   every build or test, not once per session.
 - Measure only what the diff touches: no arm whose code path is unchanged, no metric the change cannot move.
-- Bench thermal: [cool the box](docs/process-measurement.md#4b-cool-the-box-before-a-bench) before each server and
-  between arms; never slot a GPU job into a bench's cooldown idle.
+- Bench thermal (M5 Max): [cool the box](docs/process-measurement.md#4b-cool-the-box-before-a-bench) before each server
+  and between arms; never slot a GPU job into a bench's cooldown idle. The M5 Ultra needs no cooldown.
 - Wait on END markers, PIDs or `pgrep -x`, never `pgrep -f <string>` (the waiting shell matches itself).
 - Detach a long job with `nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' zsh <script> > <log> 2>&1 < /dev/null &`
   (macOS has no `setsid`; plain `nohup … &` dies with the tool's session); END marker from an EXIT trap.
