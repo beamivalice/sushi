@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A streamed load the GPU memory limit leaves no room for is refused by name**: it answered a 500 "Failed to
+  load model: ExpertCacheTooSmall" with no reason; it now answers the 503 that names the Memory for SSD streaming (GiB)
+  setting (`--ssd-budget-gb`) that loads it, as a budget set too small does.
 - **A Responses WebSocket turn sent with `store: false` now says `"store":false` in its response**: it was kept on its
   connection as asked, but its `response.created` and `response.completed` events said `"store":true`.
 - **A model load refused by the GPU memory limit answers at once**: the memory check waited about 2 s for memory to come

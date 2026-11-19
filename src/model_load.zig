@@ -770,6 +770,8 @@ pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config:
         return err;
     };
     if (!picked.cost.on) split.vision = 0;
+    // A budget of 0 (a RAM default the GPU memory limit left no room for) holds no expert cache.
+    if (budget_bytes == 0) return error.SsdBudgetBelowResident;
     const cache = try expert_stream_mod.cachePlanBytesForGeometry(picked.resolved.cache_bytes, streamed.expertGeometry(), per_expert);
     return .{ .layout = streamed.expert_layout, .split = split, .resolved = picked.resolved, .cache = cache, .vision = picked.cost };
 }
@@ -846,6 +848,17 @@ pub const FitPlanner = struct {
 };
 
 /// What a budget's plan holds beside its expert cache, null when the plan refuses it (`bills.smallestBudgetGb`).
+/// The refusal of a streamed load whose ssd budget holds less than its pack beside two cache slots per layer, naming
+/// the smallest budget its planner makes; in `buf`. The load and its registry gate refuse in this one text.
+pub fn ssdBudgetBelowRefusal(buf: []u8, io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, budget: SsdBudgetChoice, vision: bool, assistant: u64) []const u8 {
+    const floor = bills.smallestBudgetGb(budget.bytes >> 30, PlanFloor{ .io = io, .allocator = allocator, .config = config, .model_dir = model_dir, .vision = vision, .assistant = assistant });
+    return bills.ssdBudgetBelowText(buf, budget.bytes >> 30, floor, switch (budget.origin) {
+        .flag => .flag,
+        .ram_default => .ram_default,
+        .model_settings, .none => .setting,
+    });
+}
+
 const PlanFloor = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1857,9 +1870,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (budget.bytes == 0) budget = try ramDefaultChoice(sch, params, tier.?, load_vision, assistant_bytes);
         const plan = planExpertStreamingWith(sch.io, sch.allocator, params.config, params.model_dir, budget.bytes, load_vision, assistant_bytes) catch |e| {
             if (e == error.SsdBudgetBelowResident) {
-                const floor = bills.smallestBudgetGb(budget.bytes >> 30, PlanFloor{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant_bytes });
                 var text_buf: [512]u8 = undefined;
-                const text = bills.ssdBudgetBelowText(&text_buf, budget.bytes >> 30, floor, budget.origin == .flag);
+                const text = ssdBudgetBelowRefusal(&text_buf, sch.io, sch.allocator, params.config, params.model_dir, budget, load_vision, assistant_bytes);
                 log.err("{s}\n", .{text});
                 if (@TypeOf(params) == *LoadRequest) params.recordRefusalText(text);
             }

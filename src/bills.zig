@@ -7024,23 +7024,31 @@ pub fn smallestBudgetGb(asked_gb: u64, planner: anytype) ?BudgetFloor {
     return .{ .gb = hi, .held = planner.heldAt(hi << 30).? };
 }
 
+/// Who set a streamed load's ssd budget: `--ssd-budget-gb` (which outranks the model's setting), the setting, or
+/// the RAM default the GPU memory limit leaves room for.
+pub const BudgetSource = enum { flag, setting, ram_default };
+
 /// The refusal of an ssd budget below what a streamed pack holds beside two cache slots per layer.
-/// `from_flag`: `--ssd-budget-gb` set it, which outranks the model's setting.
-pub fn ssdBudgetBelowText(buf: []u8, asked_gb: u64, floor: ?BudgetFloor, from_flag: bool) []const u8 {
+pub fn ssdBudgetBelowText(buf: []u8, asked_gb: u64, floor: ?BudgetFloor, source: BudgetSource) []const u8 {
     var w = std.Io.Writer.fixed(buf);
-    writeSsdBudgetBelow(&w, asked_gb, floor, from_flag) catch return "This model's SSD streaming memory is too small to load it.";
+    writeSsdBudgetBelow(&w, asked_gb, floor, source) catch return "This model's SSD streaming memory is too small to load it.";
     return w.buffered();
 }
 
-fn writeSsdBudgetBelow(w: *std.Io.Writer, asked_gb: u64, floor: ?BudgetFloor, from_flag: bool) std.Io.Writer.Error!void {
+fn writeSsdBudgetBelow(w: *std.Io.Writer, asked_gb: u64, floor: ?BudgetFloor, source: BudgetSource) std.Io.Writer.Error!void {
     try w.print("This model's SSD streaming memory is too small to load it.\n", .{});
-    if (from_flag)
-        try w.print("--ssd-budget-gb (which outranks Memory for SSD streaming (GiB) in Settings) is {d}", .{asked_gb})
-    else
-        try w.print("Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is {d}", .{asked_gb});
+    switch (source) {
+        .flag => try w.print("--ssd-budget-gb (which outranks Memory for SSD streaming (GiB) in Settings) is {d}", .{asked_gb}),
+        .setting => try w.print("Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is {d}", .{asked_gb}),
+        .ram_default => try w.print("Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is unset; the GPU memory limit leaves room for a default of {d}", .{asked_gb}),
+    }
     const f = floor orelse return w.print(", and no setting up to 512 holds this pack beside its expert cache: use a smaller pack.", .{});
     try w.print(", and this pack holds {f} beside its expert cache, which needs room for two experts per layer. ", .{Mem.need(f.held, MemUnit.of(f.held))});
-    if (from_flag) try w.print("Restart sushi with --ssd-budget-gb {d} or more.", .{f.gb}) else try w.print("Set it to {d} or more.", .{f.gb});
+    switch (source) {
+        .flag => try w.print("Restart sushi with --ssd-budget-gb {d} or more.", .{f.gb}),
+        .setting => try w.print("Set it to {d} or more.", .{f.gb}),
+        .ram_default => try w.print("Free GPU memory (quit other apps or unload another model) and set it to {d} or more, or use a smaller pack.", .{f.gb}),
+    }
 }
 
 /// PURE: the largest whole-GiB ssd budget below `budget` whose streamed load fits `avail`, priced by the load's own
@@ -7661,10 +7669,14 @@ test "an ssd budget below what a streamed pack holds is refused naming the small
         }
     };
     var buf: [1024]u8 = undefined;
-    const text = ssdBudgetBelowText(&buf, 12, smallestBudgetGb(12, Planner{}), false);
+    const text = ssdBudgetBelowText(&buf, 12, smallestBudgetGb(12, Planner{}), .setting);
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is 12, and this pack holds 19.5 GB beside its expert cache") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Set it to 21 or more.") != null);
+    // A RAM default the GPU memory limit left no room for names the setting unset, never a value the user chose.
+    const unset = ssdBudgetBelowText(&buf, 0, smallestBudgetGb(0, Planner{}), .ram_default);
+    try testing.expect(std.mem.indexOf(u8, unset, "(--ssd-budget-gb) is unset; the GPU memory limit leaves room for a default of 0, and this pack holds 19.5 GB") != null);
+    try testing.expect(std.mem.indexOf(u8, unset, "set it to 21 or more, or use a smaller pack.") != null);
     try testing.expectEqual(@as(?BudgetFloor, null), smallestBudgetGb(12, struct {
         pub fn heldAt(_: @This(), _: u64) ?u64 {
             return null;

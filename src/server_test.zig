@@ -633,3 +633,38 @@ test "server: a WebSocket turn's response says the store the client asked for" {
         }
     }.run);
 }
+
+/// The `error.message` of a JSON error answer; the caller frees.
+fn errorMessage(resp: []const u8) ![]u8 {
+    const E = struct { @"error": struct { message: []const u8 } };
+    const parsed = try std.json.parseFromSlice(E, gpa, bodyOf(resp), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return gpa.dupe(u8, parsed.value.@"error".message);
+}
+
+test "server: every request to a model whose load is refused for memory gets the whole refusal, re-read, as a named 503" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            setWiredFloor(64 << 20);
+            defer setWiredFloor(null);
+            const chat = "{\"model\":\"tiny\",\"max_tokens\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+            var first: ?[]u8 = null;
+            defer if (first) |f| gpa.free(f);
+            for ([_][2][]const u8{ .{ "/v1/load-model", "{\"model\":\"tiny\"}" }, .{ "/v1/chat/completions", chat }, .{ "/v1/chat/completions", chat } }) |c| {
+                const resp = try request("POST", c[0], c[1]);
+                defer gpa.free(resp);
+                const message = try errorMessage(resp);
+                errdefer gpa.free(message);
+                errdefer std.debug.print("{s}: {s}\n", .{ c[0], resp[0..@min(resp.len, 600)] });
+                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 503")) return error.NotANamedRefusal;
+                // The text the load's check wrote, its lines whole: a fixed fallback is one line.
+                if (std.mem.indexOfScalar(u8, message, '\n') == null) return error.FallbackText;
+                if (first) |f| {
+                    const head = f[0 .. std.mem.indexOfScalar(u8, f, '\n') orelse f.len];
+                    if (!std.mem.startsWith(u8, message, head)) return error.AnotherRefusal;
+                    gpa.free(message);
+                } else first = message;
+            }
+        }
+    }.run);
+}

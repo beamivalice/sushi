@@ -1801,7 +1801,8 @@ pub const Scheduler = struct {
         var pinned = false;
         errdefer if (pinned) self.registry.releaseStatus(entry);
 
-        const settings_budget = model_load.resolveSsdBudget(self.ssd_budget_bytes, owned.config.ssd_budget_gb_override, owned.config.supportsExpertStreaming()).bytes;
+        const settings_choice = model_load.resolveSsdBudget(self.ssd_budget_bytes, owned.config.ssd_budget_gb_override, owned.config.supportsExpertStreaming());
+        const settings_budget = settings_choice.bytes;
         const streaming_gate_bytes: ?u64 = if (expert_stream_mod.expertStreamingEngaged(
             owned.config.supportsExpertStreaming(),
             owned.config.expertStreamingRequired(),
@@ -1817,8 +1818,16 @@ pub const Scheduler = struct {
                 .drop_default, .off => {},
             }
             const assistant_bytes = try model_load.streamedAssistantBytes(self.io, self.allocator, owned.config, self.no_drafter, model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path), entry.path);
-            const gate_budget = if (settings_budget > 0) settings_budget else model_load.ramDefaultFor(self.io, self.allocator, owned.config, entry.path, model_load.ramDefaultTierFor(owned.config).?, model_load.coldLoadVision(owned.config, true), assistant_bytes).bytes;
-            const plan = try model_load.planExpertStreamingWith(self.io, self.allocator, owned.config, entry.path, gate_budget, model_load.coldLoadVision(owned.config, true), assistant_bytes);
+            const gate_budget: model_load.SsdBudgetChoice = if (settings_budget > 0) settings_choice else .{ .bytes = model_load.ramDefaultFor(self.io, self.allocator, owned.config, entry.path, model_load.ramDefaultTierFor(owned.config).?, model_load.coldLoadVision(owned.config, true), assistant_bytes).bytes, .origin = .ram_default, .setting_ignored = false };
+            const plan = model_load.planExpertStreamingWith(self.io, self.allocator, owned.config, entry.path, gate_budget.bytes, model_load.coldLoadVision(owned.config, true), assistant_bytes) catch |e| {
+                if (e == error.SsdBudgetBelowResident) {
+                    var text_buf: [512]u8 = undefined;
+                    const text = model_load.ssdBudgetBelowRefusal(&text_buf, self.io, self.allocator, owned.config, entry.path, gate_budget, model_load.coldLoadVision(owned.config, true), assistant_bytes);
+                    log.err("{s}\n", .{text});
+                    recordLoadRefusal(text);
+                }
+                return e;
+            };
             break :blk model_load.streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, model_load.loadStagingBytes(owned.config, model_load.billedFillPeakBytes(owned.config, plan.cache.prefill_peak_bytes), plan.cache.workspace_bytes), plan.cache.bounce_bytes, model_load.warmNeedBytes(owned.config));
         } else if (try sched.coldLoadBill(.{
             .io = self.io,
