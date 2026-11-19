@@ -33,6 +33,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A load refused because its SSD streaming memory passes the GPU limit names a limit that loads it**: the
   `iogpu.wired_limit_mb` it suggested left out the margin kept under the limit, so the same check refused again, and
   the text called the limit less that margin the limit.
+- **The SSD streaming memory a refused load names loads it**: the `--ssd-budget-gb` a load refusal named could be
+  refused by the load's other memory check on the same Mac (on a 32 GB Mac with 6 GB free, a load over its GPU limit
+  named 26, which free RAM then refused); a named budget now passes every check the load runs.
 - **No command fails silently**: every error that ends a `sushi` command prints a line saying what to do; `sushi kld` on
   a DeepSeek-V4.1 pack without `--ssd-budget-gb` used to exit with no message and now asks for it.
 
@@ -55,10 +58,10 @@ earlier history is mlx-serve's, in that project's changelog.
   a prompt of the same size gets. A greedy or seeded DSpark request on the release checkpoint repeats its text: on an
   M5 Ultra 256 GB with its experts streamed at `--ssd-budget-gb 200`, 26.6 tok/s decode cold and 38.6 tok/s repeated.
 - **Refusals say what to do**: a request or load refused for memory names the `max_tokens`, context and SSD streaming
-  memory that fit (each admitted when applied), offers streaming when a pack only fits streamed, names the Settings
-  label beside each flag, prints one unit with the need rounded up and what is available rounded down, and never
-  suggests a wired limit past the Mac's RAM. Sushibar shows the whole reason, the web page keeps it on screen until
-  dismissed, every request to a refused model gets it, and a load the GPU limit refuses answers at once.
+  memory that fit, offers streaming when a pack only fits streamed, names the Settings label beside each flag, prints
+  one unit with the need rounded up and what is available rounded down, and never suggests a wired limit past the Mac's
+  RAM. Sushibar shows the whole reason, the web page keeps it on screen until dismissed, every request to a refused
+  model gets it, and a load the GPU limit refuses answers at once.
 - **APIs and server**: errors on `/v1/messages` come in Anthropic's shape; a Responses WebSocket turn refused before it
   runs ends with an error frame, and `store: false` is echoed as sent; a client that stops reading no longer blocks an
   unload (a busy unload answers 409 within 30 s); a large SSD prompt cache

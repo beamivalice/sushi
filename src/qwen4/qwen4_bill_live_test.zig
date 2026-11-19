@@ -539,9 +539,70 @@ test "Flash-Next streamed: the ssd budget a refused budget names is admitted und
     model_load.applyStreamingPlan(&planned, try model_load.planExpertStreamingWith(t.io, a, &config, dir, asked, false, 0), asked);
     const refused = bills.expertCacheRefusal(&planned, 0, readings) orelse return error.TestExpectedRefusal;
     try t.expectEqual(error.SsdBudgetExceedsWiredLimit, refused.err);
-    const planner = model_load.FitPlanner{ .io = t.io, .allocator = a, .config = &config, .model_dir = dir, .vision = false, .assistant = 0, .readings = readings };
+    const plan_at = model_load.BudgetPlanner{ .io = t.io, .allocator = a, .config = &config, .model_dir = dir, .vision = false, .assistant = 0, .beside = 0, .mtp_on = false };
+    const planner = model_load.LoadPlanner{ .plan = plan_at, .readings = readings };
     const fits = bills.streamedBudgetThatFits(asked, 0, planner);
     try t.expect(fits > 0 and fits < 30);
     try t.expectEqual(@as(?u64, 0), planner.needAt(fits << 30));
     try t.expect(planner.needAt((fits + 1) << 30).? > 0);
+}
+
+test "Flash-Next streamed: the ssd budget a fit refusal names passes the preflight on the readings that refused it (QWEN4_TEST_MODEL)" {
+    const t = std.testing;
+    const a = t.allocator;
+    const dir = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
+    var config = try model_mod.parseConfig(t.io, a, dir);
+    defer config.deinit(a);
+    model_load.applyModelSettings(&config, .{});
+    const gib: u64 = 1 << 30;
+    const asked: u64 = 30 * gib;
+    const plan = try model_load.planExpertStreamingWith(t.io, a, &config, dir, asked, false, 0);
+    var planned = config;
+    model_load.applyStreamingPlan(&planned, plan, asked);
+    const resident = plan.split.trunk +| plan.split.mtp +| plan.split.vision;
+    // A 32 GB Mac at iogpu.wired_limit_mb 28000 (floor 26976 MB under the 1 GiB margin), its free RAM below the floor.
+    for ([_]u64{ 6, 8 }) |free_gib| {
+        const readings = bills.FitReadings{ .wired_limit = 28000 << 20, .wired_floor = 26976 << 20, .budget_working_set = 28000 << 20, .working_set = 28000 << 20, .free = free_gib * gib, .total_ram = 32 * gib, .unplanned = gib };
+        _ = bills.expertCacheRefusal(&planned, resident, readings) orelse return error.TestExpectedRefusal;
+        const plan_at = model_load.BudgetPlanner{ .io = t.io, .allocator = a, .config = &config, .model_dir = dir, .vision = false, .assistant = 0, .beside = 0, .mtp_on = false };
+        const fits = bills.streamedBudgetThatFits(asked, 0, model_load.LoadPlanner{ .plan = plan_at, .readings = readings });
+        try t.expect(fits > 0);
+        const need = plan_at.needAt(fits << 30).?;
+        const avail = readings.preflightAvailable(true).bytes.?;
+        errdefer std.debug.print("free {d} GiB: the fit refusal names --ssd-budget-gb {d}, whose preflight needs {d} MB of {d} MB\n", .{ free_gib, fits, need >> 20, avail >> 20 });
+        try t.expect(need <= avail);
+    }
+}
+
+test "Flash-Next: the ssd budget a resident or streamed preflight refusal names passes the fit checks on the same readings (QWEN4_TEST_MODEL)" {
+    const t = std.testing;
+    const a = t.allocator;
+    const dir = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
+    var config = try model_mod.parseConfig(t.io, a, dir);
+    defer config.deinit(a);
+    model_load.applyModelSettings(&config, .{});
+    try t.expect(config.supportsExpertStreaming());
+    const gib: u64 = 1 << 30;
+    const mib: u64 = 1 << 20;
+    const saved_ctx = launch_state.server_config.max_context_size;
+    defer launch_state.server_config.max_context_size = saved_ctx;
+    const plan_at = model_load.BudgetPlanner{ .io = t.io, .allocator = a, .config = &config, .model_dir = dir, .vision = false, .assistant = 0, .beside = 0, .mtp_on = false };
+    var named: u32 = 0;
+    // A 32 GB Mac at macOS's default and at iogpu.wired_limit_mb 28000, the planned context automatic and the window's.
+    for ([_]u32{ 0, 262_144 }) |ctx| for ([_]u64{ 0, 28000 }) |wired_mb| for ([_]u64{ 4, 8, 12, 16 }) |free_gib| {
+        launch_state.server_config.max_context_size = @min(ctx, config.contextCap());
+        const ws: u64 = if (wired_mb > 0) wired_mb * mib else 21 * gib;
+        const readings = bills.FitReadings{ .wired_limit = wired_mb * mib, .wired_floor = bills.wiredLimitFloor(wired_mb * mib, 32 * gib, gib), .budget_working_set = ws, .working_set = ws, .free = free_gib * gib, .total_ram = 32 * gib, .unplanned = gib };
+        const fits = bills.streamedBudgetThatFits(512 << 30, 0, model_load.LoadPlanner{ .plan = plan_at, .readings = readings });
+        if (fits == 0) continue;
+        named += 1;
+        const at = plan_at.planAt(fits << 30).?;
+        if (bills.expertCacheRefusal(&at.config, at.resident, readings)) |refused| {
+            var buf: [2048]u8 = undefined;
+            std.debug.print("--ctx-size {d}, wired {d} MB, free {d} GiB: the named --ssd-budget-gb {d} is refused by the fit check:\n{s}\n", .{ ctx, wired_mb, free_gib, fits, bills.loadMemoryRefusalText(&buf, refused.refusal) });
+            return error.TestUnexpectedResult;
+        }
+        try t.expect(plan_at.needAt(fits << 30).? <= readings.preflightAvailable(true).bytes.?);
+    };
+    try t.expect(named > 0);
 }

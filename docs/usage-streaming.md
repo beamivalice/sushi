@@ -84,6 +84,9 @@ SSD. The answers are byte-for-byte the same as with the whole pack in memory; on
   keep it: on Qwen Sushi-4bpw it costs 0.6 GB of the budget. DeepSeek keeps it on.
 - Streaming only reads from the SSD; it does not write to it.
 
+When a budget does not fit, sushi refuses the load and names the largest `--ssd-budget-gb` that loads with the GPU
+limit and the free RAM it read; quitting other apps can raise it.
+
 Set the budget with `--ssd-budget-gb N` on the command line, or per model on the web page: Models tab, pick the model, and
 set "Memory for SSD streaming (GiB)" in its Settings. It applies at the next load.
 

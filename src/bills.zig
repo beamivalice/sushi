@@ -684,6 +684,8 @@ pub const FitReadings = struct {
     active: u64 = 0,
     cache: u64 = 0,
     free: u64 = 0,
+    /// The per-process headroom (iOS's jetsam limit; 0 elsewhere), which the preflight trusts over `free`.
+    proc_free: u64 = 0,
     total_ram: u64 = 0,
     /// What stays unplanned under a declared limit (`wiredUnplannedBytes`): a raised limit holds it beside the load.
     unplanned: u64 = 0,
@@ -698,9 +700,25 @@ pub const FitReadings = struct {
             .active = active,
             .cache = gpu_mem.cacheBytes(),
             .free = metrics.getAvailableMemBytes(),
+            .proc_free = metrics.getProcAvailableMemBytes(),
             .total_ram = metrics.getTotalMemBytes(),
             .unplanned = wiredUnplannedBytes(launch_state.wired_limit_margin_bytes, gpu_floor_bytes.load(.monotonic)),
         };
+    }
+
+    /// What the load preflight compares its need with: a Sushi load's least bound less the active buffers, under the
+    /// declared floor; an MLX load's free RAM under the working set alone.
+    pub fn preflightAvailable(r: FitReadings, sushi: bool) SushiAvailable {
+        if (!sushi) return sushiAvailable(r.free, r.proc_free, r.working_set, 0, 0);
+        return sushiAvailable(r.free, r.proc_free, r.working_set, r.active, r.wired_floor);
+    }
+
+    /// The readings as a streamed load of the same model takes them: its ceiling always has the declared limit's floor
+    /// (`wiredCeilingFloorForRam`), which a resident load's may not.
+    pub fn streamed(r: FitReadings) FitReadings {
+        var s = r;
+        s.wired_floor = wiredLimitFloor(r.wired_limit, r.total_ram, r.unplanned);
+        return s;
     }
 };
 

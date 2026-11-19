@@ -865,23 +865,22 @@ fn smallerPackOf(model_dir: []const u8) bills.LoadMemoryRefusal.SmallerPack {
 /// A streamed load's fit check once its plan is applied (`bills.expertCacheFitForLoad`): its refusal, or null.
 pub const FitResolver = *const fn (*const model_mod.ModelConfig, u64) ?bills.ExpertCacheRefusal;
 
-/// The ssd budget a refused fit names: `needAt` is 0 for a budget whose plan the fit checks admit on the refusal's
-/// readings, and past any figure otherwise, so `streamedBudgetThatFits(budget, 0, ...)` finds the largest admitted.
-pub const FitPlanner = struct {
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    config: *const ModelConfig,
-    model_dir: []const u8,
-    vision: bool,
-    assistant: u64,
+/// The one planner every ssd budget a load refusal names comes from: `needAt` is 0 where every check a streamed load
+/// runs, in its order (the budget against the GPU limit and the fit under the ceiling, then the preflight), admits the
+/// budget's plan on `readings`, and past any figure where one refuses, so `streamedBudgetThatFits(budget, 0, ...)`
+/// finds the largest the load admits.
+pub const LoadPlanner = struct {
+    plan: BudgetPlanner,
     readings: bills.FitReadings,
 
-    pub fn needAt(p: FitPlanner, budget_bytes: u64) ?u64 {
-        const plan = planExpertStreamingWith(p.io, p.allocator, p.config, p.model_dir, budget_bytes, p.vision, p.assistant) catch return null;
-        var planned = p.config.*;
-        applyStreamingPlan(&planned, plan, budget_bytes);
-        const refused = bills.expertCacheRefusal(&planned, plan.split.trunk +| plan.split.mtp +| plan.split.vision, p.readings) != null;
-        return if (refused) std.math.maxInt(u64) else 0;
+    pub fn needAt(p: LoadPlanner, budget_bytes: u64) ?u64 {
+        const at = p.plan.planAt(budget_bytes) orelse return null;
+        const r = p.readings.streamed();
+        if (bills.expertCacheRefusal(&at.config, at.resident, r) != null) return std.math.maxInt(u64);
+        const weights = at.resident +| p.plan.beside;
+        const avail = r.preflightAvailable(model_mod.usesSushiQuantMemoryBill(&at.config)).bytes;
+        if (bills.memInsufficientForLoad(weights, avail, loadRequirementBytes(&at.config, weights, p.plan.mtp_on, 0))) return std.math.maxInt(u64);
+        return 0;
     }
 };
 
@@ -923,11 +922,19 @@ pub const BudgetPlanner = struct {
     beside: u64,
     mtp_on: bool,
 
-    pub fn needAt(p: BudgetPlanner, budget_bytes: u64) ?u64 {
+    /// The config a load at `budget_bytes` applies and the resident bytes its fit check holds; null where the planner
+    /// refuses the budget.
+    pub fn planAt(p: BudgetPlanner, budget_bytes: u64) ?struct { config: ModelConfig, resident: u64 } {
         const plan = planExpertStreamingWith(p.io, p.allocator, p.config, p.model_dir, budget_bytes, p.vision, p.assistant) catch return null;
         var planned = p.config.*;
         applyStreamingPlan(&planned, plan, budget_bytes);
-        return loadRequirementBytes(&planned, plan.split.trunk +| plan.split.mtp +| plan.split.vision +| p.beside, p.mtp_on, 0);
+        return .{ .config = planned, .resident = plan.split.trunk +| plan.split.mtp +| plan.split.vision };
+    }
+
+    /// The preflight's need at `budget_bytes` (the RAM default steps down by it); null where the planner refuses it.
+    pub fn needAt(p: BudgetPlanner, budget_bytes: u64) ?u64 {
+        const at = p.planAt(budget_bytes) orelse return null;
+        return loadRequirementBytes(&at.config, at.resident +| p.beside, p.mtp_on, 0);
     }
 };
 
@@ -2008,8 +2015,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             refusal.smaller_pack = smallerPackOf(params.model_dir);
             const asked = params.config.expert_ssd_budget_bytes;
             if (asked > 0) {
-                const planner = FitPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant_bytes, .readings = refused.readings };
-                refusal.knob = .{ .ssd_budget = .{ .gb = asked >> 30, .fits_gb = bills.streamedBudgetThatFits(asked, 0, planner), .from_flag = budget.origin == .flag } };
+                const plan_at = BudgetPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant_bytes, .beside = 0, .mtp_on = mtpChoiceFor(params.mtp, params.config).on };
+                refusal.knob = .{ .ssd_budget = .{ .gb = asked >> 30, .fits_gb = bills.streamedBudgetThatFits(asked, 0, LoadPlanner{ .plan = plan_at, .readings = refused.readings }), .from_flag = budget.origin == .flag } };
             }
             var text_buf: [2048]u8 = undefined;
             const text = bills.loadMemoryRefusalText(&text_buf, refusal);
@@ -2049,20 +2056,16 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // its memory" case. Bypass with --skip-mem-preflight.
     if (!scheduler_mod.skipMemPreflight()) {
         const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
-        const gpu_limit = mlx.maxRecommendedWorkingSet();
         const Reader = struct {
             io: std.Io,
-            gpu_limit: usize,
+            config: *const ModelConfig,
             sushi: bool,
-            wired_floor: u64,
-            /// The Sushi reading's two bounds, as last read.
+            /// The readings last taken, which a refusal and the budgets it names are priced on, and their bounds.
+            readings: bills.FitReadings = .{},
             last: ?bills.SushiAvailable = null,
             pub fn read(r: *@This()) ?u64 {
-                // An MLX load reads free RAM under the working set alone: no active buffers come off it, no declared floor.
-                r.last = if (r.sushi)
-                    bills.sushiAvailable(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, gpu_mem.activeBytes(), r.wired_floor)
-                else
-                    bills.sushiAvailable(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, 0, 0);
+                r.readings = bills.FitReadings.now(r.config);
+                r.last = r.readings.preflightAvailable(r.sushi);
                 return r.last.?.bytes;
             }
             pub fn sleep(r: *@This()) void {
@@ -2072,7 +2075,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 return r.last.?.bound() == .free_ram;
             }
         };
-        var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config), .wired_floor = bills.wiredCeilingFloorFor(params.config) };
+        var reader = Reader{ .io = sch.io, .config = params.config, .sushi = model_mod.usesSushiQuantMemoryBill(params.config) };
         var avail_bytes = reader.read();
         const mtp_on = mtpChoiceFor(params.mtp, params.config).on;
         // Its maximum context is read only by a refusal, which an unread figure never makes.
@@ -2087,10 +2090,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, if (avail_bytes) |b| b -| weights_bytes else 0) else null;
             needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         }
-        const active: usize = if (reader.sushi) gpu_mem.activeBytes() else 0;
         var avail_buf: [192]u8 = undefined;
-        const wired_mb = bills.wiredLimitBytes() >> 20;
-        const avail_line = bills.sushiAvailableLine(&avail_buf, reader.last.?, if (reader.sushi and reader.wired_floor > 0) wired_mb else 0);
+        const wired_mb = reader.readings.wired_limit >> 20;
+        const avail_line = bills.sushiAvailableLine(&avail_buf, reader.last.?, if (reader.sushi and reader.readings.wired_floor > 0) wired_mb else 0);
         var line_buf: [384]u8 = undefined;
         log.info("[preflight] {s}\n", .{bills.preflightLine(&line_buf, params.config, weights_bytes, needed, avail_line)});
         // Every bound that was read refuses here, an exhausted one (read as 0) included.
@@ -2099,9 +2101,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var refusal = bills.LoadMemoryRefusal{
                 .needed = needed,
                 .avail = reader.last.?,
-                .wired_limit_mb = if (reader.sushi and reader.wired_floor > 0) wired_mb else 0,
-                .wired_beside = active +| bills.wiredUnplannedBytes(bills.launch_state.wired_limit_margin_bytes, bills.gpu_floor_bytes.load(.monotonic)),
-                .total_ram = status.getTotalMemBytes(),
+                .wired_limit_mb = if (reader.sushi and reader.readings.wired_floor > 0) wired_mb else 0,
+                .wired_beside = (if (reader.sushi) reader.readings.active else 0) +| reader.readings.unplanned,
+                .total_ram = reader.readings.total_ram,
                 .smaller_pack = smallerPackOf(params.model_dir),
             };
             if (serving) |b| {
@@ -2114,14 +2116,14 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 refusal.knob = .{ .ctx_size = .{ .requested = b.requested_context, .fits = maximum, .from_flag = sch.ctx_size_flag > 0 } };
             } else if (params.config.expert_streaming and params.config.expert_ssd_budget_bytes > 0) {
                 const budget = params.config.expert_ssd_budget_bytes;
-                const planner = BudgetPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = planned_assistant, .beside = weights_bytes -| planned_resident, .mtp_on = mtp_on };
-                refusal.knob = .{ .ssd_budget = .{ .gb = budget >> 30, .fits_gb = bills.streamedBudgetThatFits(budget, avail, planner), .from_flag = streaming_budget.origin == .flag } };
+                const plan_at = BudgetPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = planned_assistant, .beside = weights_bytes -| planned_resident, .mtp_on = mtp_on };
+                refusal.knob = .{ .ssd_budget = .{ .gb = budget >> 30, .fits_gb = bills.streamedBudgetThatFits(budget, 0, LoadPlanner{ .plan = plan_at, .readings = reader.readings }), .from_flag = streaming_budget.origin == .flag } };
             }
             // A resident load of a pack that can stream: the budget that loads it streamed, by the same planner.
             if (!params.config.expert_streaming and params.config.supportsExpertStreaming()) {
                 const assistant = try streamedAssistantBytes(sch.io, sch.allocator, params.config, params.no_drafter, params.drafter_dir, params.model_dir);
-                const planner = BudgetPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant, .beside = 0, .mtp_on = mtp_on };
-                refusal.stream_fits_gb = bills.streamedBudgetThatFits(512 << 30, avail, planner);
+                const plan_at = BudgetPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant, .beside = 0, .mtp_on = mtp_on };
+                refusal.stream_fits_gb = bills.streamedBudgetThatFits(512 << 30, 0, LoadPlanner{ .plan = plan_at, .readings = reader.readings });
             }
             var text_buf: [2048]u8 = undefined;
             const text = bills.loadMemoryRefusalText(&text_buf, refusal);
