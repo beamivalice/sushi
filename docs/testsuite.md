@@ -243,6 +243,10 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `request-bool-read` flags `x == .bool` and `x != .bool` in the files that read a request body (`server`, `anthropic`,
   `completions`, `responses_api`, `http_conn`, `request_policy`, `generation_stream`): a request's bool is read by
   `request_parse.boolField`, so another type is refused by name and never read as the default.
+  `in-place-buffer` flags a fn outside `mlx_pages.zig` that makes a buffer with `mlx_zeros` and writes with
+  `mlx_slice_update`: a buffer written in place is made by `mlx_pages.inPlaceBuffer`, which refuses one off MLX's page grid.
+  `cache-room` flags `roomFor` outside `mlx_pages.zig` and `src/tensor/`: the constructor that makes a cache buffer takes
+  the engine's room for it once, as admission bills it.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its

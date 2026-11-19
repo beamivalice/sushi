@@ -50,6 +50,8 @@ const rules = .{
     @import("error_body_literal.zig"),
     @import("conn_read_unbounded.zig"),
     @import("request_bool_read.zig"),
+    @import("in_place_buffer.zig"),
+    @import("cache_room.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

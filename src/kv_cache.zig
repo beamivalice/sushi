@@ -665,7 +665,7 @@ pub const KVCache = struct {
             defer _ = mlx.mlx_vector_array_free(vec);
             for (bufs[0..n]) |buf| {
                 const sh = mlx.getShape(buf.*);
-                try growQuantBuf(s, buf, true, entry.offset, new_cap, sh[0], sh[1], sh[3], mlx.mlx_array_dtype(buf.*));
+                try growQuantBuf(s, buf, true, false, entry.offset, new_cap, sh[0], sh[1], sh[3], mlx.mlx_array_dtype(buf.*));
                 _ = mlx.mlx_vector_array_append_value(vec, buf.*);
             }
             // The grown buffers are this cache's own; a shared restore's rows stay with the entry.
@@ -697,7 +697,7 @@ pub const KVCache = struct {
             // old copies held the cache twice until a trim.
             for (bufs[0..n]) |buf| {
                 const sh = mlx.getShape(buf.*);
-                try growQuantBuf(s, buf, true, entry.offset, new_cap, sh[0], sh[1], sh[3], mlx.mlx_array_dtype(buf.*));
+                try growQuantBuf(s, buf, true, false, entry.offset, new_cap, sh[0], sh[1], sh[3], mlx.mlx_array_dtype(buf.*));
                 try mlx.check(mlx.mlx_array_eval(buf.*));
                 // The engine's pool keeps a freed buffer as a free one, which MLX's cache clear never reaches.
                 if (mlx.engine.isStream(s)) mlx.engine.trim() else _ = mlx.mlx_clear_cache();
@@ -992,13 +992,13 @@ pub const KVCache = struct {
             };
             const new_cap: c_int = @intCast(pagedCapacity(entry, self.growCapacityFor(entry, cur_cap, needed), &parts, s));
             kv_cap_buf_grows += 1;
-            try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
-            try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, vq_last, .uint32);
+            try growQuantBuf(s, &entry.keys, entry.initialized, entry.ringed, entry.offset, new_cap, B, heads, q_last, .uint32);
+            try growQuantBuf(s, &entry.values, entry.initialized, entry.ringed, entry.offset, new_cap, B, heads, vq_last, .uint32);
             // Quantizer scales retain the activation dtype through allocation and growth.
-            try growQuantBuf(s, &entry.keys_scales, entry.initialized, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
-            try growQuantBuf(s, &entry.keys_biases, entry.initialized, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
-            try growQuantBuf(s, &entry.values_scales, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
-            try growQuantBuf(s, &entry.values_biases, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
+            try growQuantBuf(s, &entry.keys_scales, entry.initialized, entry.ringed, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
+            try growQuantBuf(s, &entry.keys_biases, entry.initialized, entry.ringed, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
+            try growQuantBuf(s, &entry.values_scales, entry.initialized, entry.ringed, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
+            try growQuantBuf(s, &entry.values_biases, entry.initialized, entry.ringed, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
             entry.initialized = true;
         }
 
@@ -1113,8 +1113,8 @@ pub const KVCache = struct {
             const new_cap: c_int = @intCast(pagedCapacity(entry, self.growCapacityFor(entry, cur_cap, needed), &parts, s));
             kv_cap_buf_grows += 1;
             const initialized = entry.initialized;
-            try growQuantBuf(s, &entry.keys, initialized, entry.offset, new_cap, B, heads, head_dim, dtype);
-            try growQuantBuf(s, &entry.values, initialized, entry.offset, new_cap, B, heads, v_head_dim, dtype);
+            try growQuantBuf(s, &entry.keys, initialized, entry.ringed, entry.offset, new_cap, B, heads, head_dim, dtype);
+            try growQuantBuf(s, &entry.values, initialized, entry.ringed, entry.offset, new_cap, B, heads, v_head_dim, dtype);
             entry.initialized = true;
         }
 
@@ -1255,40 +1255,21 @@ pub const KVCache = struct {
     /// buffer's last dim and dtype: six calls per `updateAffine` (3 buffers ×
     /// K and V) and two per `updateDense`. Every caller passes the width of
     /// the operand it is writing, which is what lets K and V differ.
-    fn growQuantBuf(s: mlx.mlx_stream, buf: *mlx.mlx_array, initialized: bool, offset: usize, new_cap: c_int, B: c_int, heads: c_int, last_dim: c_int, dtype: mlx.mlx_dtype) !void {
+    /// `ring`: a ring's fixed rows, which take no page grid (`pagedCapacity`).
+    fn growQuantBuf(s: mlx.mlx_stream, buf: *mlx.mlx_array, initialized: bool, ring: bool, offset: usize, new_cap: c_int, B: c_int, heads: c_int, last_dim: c_int, dtype: mlx.mlx_dtype) !void {
         const buf_shape = [_]c_int{ B, heads, new_cap, last_dim };
         // A cold prefill's first chunk grows each layer to the whole reservation inside its forward.
-        mlx.engine.roomFor(&buf_shape, dtype);
-        if (initialized and offset > 0) {
-            // The kept rows, then a zero tail to the new capacity, joined into the one new buffer: a zeros buffer of
-            // the whole capacity written by slice_update held a second new-size buffer while the copy ran.
-            const off_c: c_int = @intCast(offset);
+        const new_buf = if (initialized and offset > 0) blk: {
             const su_start = [_]c_int{ 0, 0, 0, 0 };
-            const su_stop = [_]c_int{ B, heads, off_c, last_dim };
+            const su_stop = [_]c_int{ B, heads, @intCast(offset), last_dim };
             const su_strides = [_]c_int{ 1, 1, 1, 1 };
             var old_data = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(old_data);
             try mlx.check(mlx.mlx_slice(&old_data, buf.*, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
-            const tail_shape = [_]c_int{ B, heads, new_cap - off_c, last_dim };
-            var tail = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(tail);
-            try mlx.check(mlx.mlx_zeros(&tail, &tail_shape, 4, dtype, s));
-            const parts = [_]mlx.mlx_array{ old_data, tail };
-            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
-            defer _ = mlx.mlx_vector_array_free(vec);
-            var joined = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(joined);
-            try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 2, s));
-            _ = mlx.mlx_array_free(buf.*);
-            buf.* = joined;
-        } else {
-            var new_buf = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(new_buf);
-            try mlx.check(mlx.mlx_zeros(&new_buf, &buf_shape, 4, dtype, s));
-            _ = mlx.mlx_array_free(buf.*);
-            buf.* = new_buf;
-            new_buf = .{ .ctx = null };
-        }
+            break :blk try mlx_pages.grownBuffer(old_data, &buf_shape, 2, dtype, ring, s);
+        } else if (ring) try mlx_pages.ringBuffer(&buf_shape, dtype, s) else try mlx_pages.inPlaceBuffer(&buf_shape, dtype, s);
+        _ = mlx.mlx_array_free(buf.*);
+        buf.* = new_buf;
     }
 
     /// Replace `buf` with a fresh `cap`-row buffer holding rows `[drop, offset)`
@@ -1368,7 +1349,7 @@ pub const KVCache = struct {
 
     /// One cache row's bytes in a `[B, heads, rows, last]` buffer of `dtype`.
     fn rowBytes(B: c_int, heads: c_int, last: c_int, dtype: mlx.mlx_dtype) u64 {
-        return @as(u64, @intCast(B * heads * last)) * (mlx.dtypeBytes(dtype) orelse 0);
+        return @as(u64, @intCast(B * heads * last)) * @import("tensor/core.zig").itemSize(dtype);
     }
 
     /// One cache row's bytes in each of an entry's buffers.
@@ -3249,7 +3230,7 @@ test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no dou
     try mlx.check(mlx.mlx_zeros(&warm, &old_shape, 4, .float32, s));
     try mlx.check(mlx.mlx_array_eval(warm));
     const c0 = mlx.op_count.load(.monotonic);
-    try KVCache.growQuantBuf(s, &warm, false, 0, new_cap, B, heads, last_dim, .float32);
+    try KVCache.growQuantBuf(s, &warm, false, false, 0, new_cap, B, heads, last_dim, .float32);
     const n_ops = mlx.op_count.load(.monotonic) - c0;
     try mlx.check(mlx.mlx_array_eval(warm));
     try testing.expectEqual(@as(c_int, new_cap), mlx.getShape(warm)[2]);
@@ -3263,7 +3244,7 @@ test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no dou
         try mlx.check(mlx.mlx_zeros(&buf, &old_shape, 4, .float32, s));
         try mlx.check(mlx.mlx_array_eval(buf));
         mlx.fault.arm(k);
-        const r = KVCache.growQuantBuf(s, &buf, false, 0, new_cap, B, heads, last_dim, .float32);
+        const r = KVCache.growQuantBuf(s, &buf, false, false, 0, new_cap, B, heads, last_dim, .float32);
         const did = mlx.fault.didFire();
         mlx.fault.disarm();
         if (r) |_| {

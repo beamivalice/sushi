@@ -84,6 +84,7 @@ test {
     _ = @import("layer_weights.zig");
     _ = @import("forward_diag.zig");
     _ = @import("kv_cache.zig");
+    _ = @import("mlx_pages.zig");
     _ = @import("hc_prefill.zig");
     _ = @import("mrope.zig");
     _ = @import("regex.zig");

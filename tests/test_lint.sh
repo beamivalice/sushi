@@ -360,6 +360,29 @@ printf '%s\n' 'fn arraysStream(self: *const C) mlx.mlx_stream {' '    return sel
 printf '%s\n' 'fn other() void {' '    _ = mlx.gpuStream();' '}' > "$TMP/t/src/model.zig"
 expect_green "arraysStream's fallback, a test and a fn only tests reach, and a file outside the caches"
 
+# rule in-place-buffer
+tree
+printf '%s\n' 'fn grow(buf: *A, s: S) !void {' '    var z = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, buf.*, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/p.zig"
+expect_red "a buffer made by mlx_zeros and written by slice_update" "src/p.zig:3:23 \[in-place-buffer\] grow: a buffer made by mlx_zeros and written by slice_update"
+
+tree
+printf '%s\n' 'fn inPlaceBuffer(s: S) !A {' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '}' 'fn fill(z: A, s: S) !void {' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' \
+  'fn seed(s: S) !void {' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' 'test "t" {' '    try seed(s);' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/p.zig"
+printf '%s\n' 'fn grow(s: S) !void {' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/mlx_pages.zig"
+expect_green "zeros and a write in different fns, a test and a fn only tests reach, and mlx_pages itself"
+
+# rule cache-room
+tree
+printf '%s\n' 'fn grow(s: S) !void {' '    mlx.engine.roomFor(&shape, dt);' '    buf = try mlx_pages.inPlaceBuffer(&shape, dt, s);' '}' > "$TMP/t/src/kv_cache.zig"
+expect_red "the engine's room taken beside a constructor" "src/kv_cache.zig:2:16 \[cache-room\] grow: the engine's room taken outside mlx_pages"
+
+tree
+printf '%s\n' 'fn zeros(s: S) !A {' '    mlx.engine.roomFor(&shape, dt);' '}' > "$TMP/t/src/mlx_pages.zig"
+mkdir -p "$TMP/t/src/tensor"
+printf '%s\n' 'pub fn roomFor(dims: []const c_int) void {' '    room(dims);' '}' 'fn other() void {' '    roomFor(&shape);' '}' > "$TMP/t/src/tensor/route.zig"
+printf '%s\n' 'test "t" {' '    mlx.engine.roomFor(&shape, dt);' '}' > "$TMP/t/src/p.zig"
+expect_green "mlx_pages, the engine itself and a test"
+
 # rule entry-checkout
 tree
 printf '%s\n' 'fn refuse(e: *Entry) void {' '    e.checkout = null;' '}' > "$TMP/t/src/scheduler.zig"
