@@ -3629,15 +3629,19 @@ test "cooler contract: the first served DeepSeek request after a Cooler load's w
                 var got = try sv.requestWith(prompt, 8, .{ .temperature = 0 }, &from);
                 defer got.deinit(a);
                 try testing.expectEqual(@as(usize, 8), got.items.len);
-                grew[r] = mlx.engine.poolHeldPeak(.process) -| starts[r].pool;
+                // From what was in use at the start: a headroom read counts the pool's free buffers as free.
+                grew[r] = mlx.engine.poolHeldPeak(.process) -| (starts[r].pool -| starts[r].pool_free);
             }
-            // The rest a request start finds free in the pool, at either start.
+            // A start's free buffers are reused in other sizes than a cold start makes: its peak moves by up to them.
             const rest = @max(starts[0].pool_free, starts[1].pool_free);
-            errdefer std.debug.print("first request: MLX cache {d} KB, grew {d} KB, pool rest {d} KB; second: MLX cache {d} KB, grew {d} KB, pool rest {d} KB; borrowed {}\n", .{ starts[0].mlx_cache >> 10, grew[0] >> 10, starts[0].pool_free >> 10, starts[1].mlx_cache >> 10, grew[1] >> 10, starts[1].pool_free >> 10, LateUnwireHeadroom.borrowed });
+            const in_use = [2]u64{ starts[0].pool -| starts[0].pool_free, starts[1].pool -| starts[1].pool_free };
+            errdefer std.debug.print("first request: MLX cache {d} KB, pool in use {d} KB, grew {d} KB, pool rest {d} KB; second: MLX cache {d} KB, pool in use {d} KB, grew {d} KB, pool rest {d} KB; borrowed {}\n", .{ starts[0].mlx_cache >> 10, in_use[0] >> 10, grew[0] >> 10, starts[0].pool_free >> 10, starts[1].mlx_cache >> 10, in_use[1] >> 10, grew[1] >> 10, starts[1].pool_free >> 10, LateUnwireHeadroom.borrowed });
             // The late-unwiring borrow ran in the first request, and the request was served.
             try testing.expect(LateUnwireHeadroom.borrowed);
             // A headroom read counts MLX's cache and the pool's free buffers as free: the first request starts as the second.
             try testing.expectEqual(starts[1].mlx_cache, starts[0].mlx_cache);
+            // The warm leaves no more of the pool in use than a finished request does.
+            try testing.expect(in_use[0] <= in_use[1]);
             try testing.expect(@max(grew[0], grew[1]) - @min(grew[0], grew[1]) <= rest);
         }
     }.run);
