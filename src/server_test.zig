@@ -18,6 +18,7 @@ const model_mod = @import("model.zig");
 const trunk = @import("trunk.zig");
 const http = @import("http.zig");
 const ModelRegistry = @import("model_registry.zig").ModelRegistry;
+const nowMsMonotonic = @import("io_util.zig").nowMsMonotonic;
 
 const io = std.testing.io;
 
@@ -1333,6 +1334,138 @@ test "server: a shutdown mid-reply ends the stream of every surface in one termi
                 const answer = try f.finish();
                 defer gpa.free(answer);
                 try expectShutDown(f.row, answer);
+            }
+        }
+    }.run);
+}
+
+/// `connect` with a 256 KB server receive buffer, so a request sent whole lands in one read, past the reader's buffer.
+fn connectReceiveWide() !std.posix.fd_t {
+    var sv: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv) != 0) return error.SocketPairFailed;
+    const wide: c_int = 256 * 1024;
+    _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
+    _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
+    readLimit(sv[1], 10);
+    server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
+    return sv[1];
+}
+
+fn pause(ms: i64) void {
+    std.Io.sleep(io, .fromMilliseconds(ms), .real) catch {};
+}
+
+/// Milliseconds until the server ends `fd` (or its read limit fires).
+fn msUntilClosed(fd: std.posix.fd_t) !i64 {
+    const t0 = nowMsMonotonic(io);
+    const got = readUntil(fd, null) catch |e| switch (e) {
+        error.ReadTimedOut => return nowMsMonotonic(io) - t0,
+        else => return e,
+    };
+    gpa.free(got);
+    return nowMsMonotonic(io) - t0;
+}
+
+test "server: a chunked upload sent whole, larger than the reader's buffer, is answered rather than left waiting in a read" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            // Loads the model first, so the 10 s each answer may take is the request's own.
+            var wb: [512]u8 = undefined;
+            gpa.free(try request("POST", "/v1/completions", try completionBody(&wb, "hi", 2, false)));
+            for ([_]usize{ 20_000, 30_000, 40_000 }) |pad| {
+                var body: std.ArrayList(u8) = .empty;
+                defer body.deinit(gpa);
+                try body.appendSlice(gpa, "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2,\"temperature\":0,\"user\":\"");
+                try body.appendNTimes(gpa, 'a', pad);
+                try body.appendSlice(gpa, "\"}");
+                var req: std.ArrayList(u8) = .empty;
+                defer req.deinit(gpa);
+                try req.appendSlice(gpa, "POST /v1/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n");
+                var off: usize = 0;
+                while (off < body.items.len) {
+                    const n = @min(5000, body.items.len - off);
+                    var hb: [32]u8 = undefined;
+                    try req.appendSlice(gpa, try std.fmt.bufPrint(&hb, "{x}\r\n", .{n}));
+                    try req.appendSlice(gpa, body.items[off..][0..n]);
+                    try req.appendSlice(gpa, "\r\n");
+                    off += n;
+                }
+                try req.appendSlice(gpa, "0\r\n\r\n");
+                const fd = try connectReceiveWide();
+                defer _ = std.c.close(fd);
+                try sendAll(fd, req.items);
+                const resp = readUntil(fd, null) catch |e| {
+                    std.debug.print("chunked upload of {d} bytes sent whole: no answer in 10 s ({s})\n", .{ req.items.len, @errorName(e) });
+                    return error.ChunkedUploadHangs;
+                };
+                defer gpa.free(resp);
+                if (resp.len == 0) return error.ChunkedUploadUnanswered;
+                // The same body by Content-Length.
+                const fd2 = try connectReceiveWide();
+                defer _ = std.c.close(fd2);
+                var hb2: [128]u8 = undefined;
+                try sendAll(fd2, try std.fmt.bufPrint(&hb2, "POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\n\r\n", .{body.items.len}));
+                try sendAll(fd2, body.items);
+                const resp2 = readUntil(fd2, null) catch return error.ContentLengthUploadHangs;
+                defer gpa.free(resp2);
+                if (resp2.len == 0) return error.ContentLengthUploadUnanswered;
+            }
+        }
+    }.run);
+}
+
+test "server: a shutdown while a body trickles, a chunked upload waits and a frame is half sent ends each connection at once" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const a1 = try connect();
+            defer _ = std.c.close(a1);
+            try sendAll(a1, "POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\n\r\n{\"mo");
+            const a2 = try connect();
+            defer _ = std.c.close(a2);
+            try sendAll(a2, "POST /v1/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"mod\r\n");
+            // A frame of 20 payload bytes with 2 sent: the reader holds them, the rest never comes.
+            const a3 = try wsConnect();
+            defer _ = std.c.close(a3);
+            try sendAll(a3, &.{ 0x81, 0x80 | 20, 0, 0, 0, 0, '{', '"' });
+            for ([_]std.posix.fd_t{ a1, a2, a3 }) |fd| readLimit(fd, 5);
+            pause(200);
+            server.requestShutdown();
+            for ([_]std.posix.fd_t{ a1, a2 }, [_][]const u8{ "trickled body", "waiting chunked upload" }) |fd, what| {
+                const ms = try msUntilClosed(fd);
+                if (ms >= 4500) {
+                    std.debug.print("{s} at shutdown: open after {d} ms\n", .{ what, ms });
+                    return error.ConnectionOutlivesShutdown;
+                }
+            }
+            const code = wsReadCloseCode(a3) catch |e| {
+                std.debug.print("half frame at shutdown: {s}\n", .{@errorName(e)});
+                return e;
+            };
+            if (code != 1001) {
+                std.debug.print("half frame at shutdown closed with {d}\n", .{code});
+                return error.NotGoingAway;
+            }
+        }
+    }.run);
+}
+
+test "server: a Content-Length body read past the reader's buffer, then stalled, ends at a shutdown" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const fd = try connectReceiveWide();
+            defer _ = std.c.close(fd);
+            readLimit(fd, 5);
+            var req: std.ArrayList(u8) = .empty;
+            defer req.deinit(gpa);
+            try req.appendSlice(gpa, "POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 40000\r\n\r\n{\"model\":\"tiny\",\"user\":\"");
+            try req.appendNTimes(gpa, 'a', 30_000);
+            try sendAll(fd, req.items);
+            pause(300);
+            server.requestShutdown();
+            const ms = try msUntilClosed(fd);
+            if (ms >= 4500) {
+                std.debug.print("stalled body at shutdown: open after {d} ms\n", .{ms});
+                return error.StalledBodyOutlivesShutdown;
             }
         }
     }.run);

@@ -649,6 +649,25 @@ printf '%s\n' 'const scheduler_mod = @import("scheduler.zig");' 'test "t" {' '  
   '    _ = try sch.submit(.{});' '    var bare: scheduler_mod.Scheduler = undefined;' '    _ = bare.cancelSlotById(1);' '}' > "$TMP/t/src/p.zig"
 expect_green "a Scheduler from submitTestScheduler, and a bare one that never submits"
 
+# rule conn-read-unbounded
+tree
+printf '%s\n' 'const Conn = struct {' '    fn reader(c: *Conn) *R { return &c.read_state.interface; }' \
+  '    fn read(c: *Conn, buf: []u8) !usize { return c.reader().readVec(buf); }' '};' \
+  'fn body(c: *Conn, buf: []u8) !void {' '    try c.reader().readSliceAll(buf);' '}' > "$TMP/t/src/http_conn.zig"
+expect_red "a read of the connection's reader outside Conn.read" "src/http_conn.zig:6:11 \[conn-read-unbounded\] body: the connection's reader outside Conn.read"
+
+tree
+printf '%s\n' 'fn peek(conn: *Conn) usize {' '    return conn.read_state.interface.bufferedLen();' '}' > "$TMP/t/src/server.zig"
+expect_red "read_state.interface outside the connection file" "src/server.zig:2:17 \[conn-read-unbounded\] peek:"
+
+tree
+printf '%s\n' 'const Conn = struct {' '    fn reader(c: *Conn) *R { return &c.read_state.interface; }' \
+  '    fn awaitReadable(c: *Conn) bool { return c.reader().bufferedLen() > 0; }' '};' \
+  'fn open(f: F, io: Io, buf: []u8) R { return f.reader(io, buf); }' 'fn err(c: *Conn) ?E { return c.read_state.err; }' \
+  'test "t" {' '    _ = conn.reader().bufferedLen();' '}' > "$TMP/t/src/http_conn.zig"
+printf '%s\n' 'fn lines(r: *R) void {' '    _ = r.reader().takeDelimiter(10);' '}' > "$TMP/t/src/cli.zig"
+expect_green "Conn's own reads, a reader with arguments, read_state.err, a test, and another file's reader()"
+
 # the allowlist
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn handleOf(s: *S) *S { return s; }' 'fn f(self: *const S) *S {' \

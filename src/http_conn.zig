@@ -301,7 +301,8 @@ pub const Conn = struct {
         return &c.write_state.interface;
     }
 
-    pub fn reader(c: *Conn) *std.Io.Reader {
+    /// Only `read` and `awaitReadable` reach it (lint `conn-read-unbounded`).
+    fn reader(c: *Conn) *std.Io.Reader {
         return &c.read_state.interface;
     }
 
@@ -321,14 +322,20 @@ pub const Conn = struct {
         try c.writer().flush();
     }
 
-    /// Read up to buf.len bytes; may return fewer (HTTP-style short read). Returns 0 on EOF.
-    /// Uses `readVec` because `readSliceShort` blocks until the buffer is full or EOF —
-    /// wrong semantics for HTTP request parsing where we read until headers terminate.
-    /// Waits without a limit for bytes, as `awaitReadable(null)`: a shutdown ends it with `error.Shutdown`.
+    /// The one read of a connection: up to buf.len bytes, maybe fewer, 0 at EOF. Bytes the reader holds come back
+    /// alone; the socket is read only once `awaitReadable` saw it readable, so no read outwaits a caller's limit or a
+    /// shutdown (`error.Shutdown`). A `readVec` that wants more than the reader holds blocks in the socket for the rest.
     pub fn read(c: *Conn, buf: []u8) !usize {
+        const r = c.reader();
+        if (r.bufferedLen() > 0) {
+            const n = @min(r.bufferedLen(), buf.len);
+            @memcpy(buf[0..n], r.buffered()[0..n]);
+            r.toss(n);
+            return n;
+        }
         _ = try c.awaitReadable(null);
         var bufs: [1][]u8 = .{buf};
-        return c.reader().readVec(&bufs) catch |err| switch (err) {
+        return r.readVec(&bufs) catch |err| switch (err) {
             error.EndOfStream => 0,
             else => |e| e,
         };
@@ -2227,6 +2234,10 @@ fn readerGivesUp(sent: []const u8, limit_ms: i64, drip_ms: u64) !bool {
     const t = std.testing;
     var sv: [2]std.posix.fd_t = undefined;
     try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0); // AF_UNIX, SOCK_STREAM
+    // Wide enough that `sent` lands whole, so the first read can take more than the head.
+    const wide: c_int = 256 * 1024;
+    _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
+    _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
     var conn: Conn = undefined;
     Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
     defer conn.close();
@@ -2255,6 +2266,12 @@ test "readRequest: a client that stalls its head or body, or drips its head, is 
     try std.testing.expect(try readerGivesUp(head, 40, 0));
     try std.testing.expect(try readerGivesUp(head, 60, 10));
     try std.testing.expect(try readerGivesUp(head ++ "Content-Length: 100\r\n\r\n{}", 40, 0));
+}
+
+test "readRequest: a body read past the reader's buffer and then stalled is dropped at the limit, by length or chunked" {
+    const pad: [24_000]u8 = @splat('a');
+    try std.testing.expect(try readerGivesUp("POST /v1/completions HTTP/1.1\r\nContent-Length: 40000\r\n\r\n" ++ pad, 40, 0));
+    try std.testing.expect(try readerGivesUp("POST /v1/completions HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9c40\r\n" ++ pad, 40, 0));
 }
 
 test "readRequest: a Content-Length that wraps the size sum is a 413" {

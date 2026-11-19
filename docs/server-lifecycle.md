@@ -461,6 +461,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **A shutdown ends every wait for a client's bytes**: `Conn.awaitReadable` is the one read wait and looks at the flag
   every 100 ms, so an idle connection closes and a WebSocket between turns gets its 1001 close at once; only a request
   in flight holds the drain.
+- **`Conn.read` is the one read of a connection**: it returns the bytes the reader holds alone and reads the socket only
+  after `awaitReadable` saw it readable, since a `readVec` past the held bytes blocks in the socket with no limit and no
+  shutdown poll (a chunked upload sent whole got no answer); lint `conn-read-unbounded` keeps the reader inside it.
 - **The gate shuts when the shutdown is asked, not when it begins**: `refusingLocked` reads
   `server_state.shutdown_requested` too, since `beginShutdown` runs only when the accept loop next sees the flag (up to
   1 s later); a pending slot is neither admitted nor counted as work then, so the loop parks instead of spinning.

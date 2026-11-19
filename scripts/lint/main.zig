@@ -48,6 +48,7 @@ const rules = .{
     @import("scheduler_hand_built.zig"),
     @import("entry_checkout.zig"),
     @import("error_body_literal.zig"),
+    @import("conn_read_unbounded.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };
