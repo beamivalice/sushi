@@ -228,8 +228,8 @@ test "dsv41 queries: a decode token (DSV41_TINY, DSV41_STQ_TINY)" {
             const got = (try decodeTokens(env)) orelse continue;
             ran = true;
             try testing.expectEqual(folds, kernels.hcExpandProbed());
-            // The two counts alternate with the compressed-attention cycle.
-            const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1164, 1213, 1164, 1213, 1164, 1213 } else if (folds) .{ 2254, 2310, 2254, 2310, 2254, 2310 } else .{ 2142, 2198, 2142, 2198, 2142, 2198 };
+            // The two counts alternate with the compressed-attention cycle. The Engram gate reads no width.
+            const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1160, 1209, 1160, 1209, 1160, 1209 } else if (folds) .{ 2250, 2306, 2250, 2306, 2250, 2306 } else .{ 2138, 2194, 2138, 2194, 2138, 2194 };
             try testing.expectEqual(want, got);
         }
     }
