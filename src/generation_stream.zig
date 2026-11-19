@@ -2195,7 +2195,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3CodebookTableRateMissing => .{ .type = "exl3_codebook_table_rate_missing", .message = "This STQ pack has a routed bank at a rate its codebook table has no row for (each table covers the even n it lists: spec1-w15 n16 to n128, the others n24 to n64)." },
         error.Exl3CodebookTableLegacyConfig => .{ .type = "exl3_codebook_table_legacy_config", .message = "This pack's expert_quant names a codebook table by a digest from before the table grew (spec1-w15 2ac2594d, now 37f72431). Re-convert the pack." },
         error.Exl3CodebookTableUndecodable => .{ .type = "exl3_codebook_table_undecodable", .message = "This STQ pack's codebook table holds PAIR1 constants this build's kernels have not compiled." },
-        error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "--ssd-budget-gb leaves no room for an expert cache after the resident trunk, the prefill union and the fill buffers. Raise the budget." },
+        error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "This model's SSD streaming memory is too small to load it: raise Memory for SSD streaming (GiB) in its settings (--ssd-budget-gb)." },
         error.SsdBudgetBelowVision => .{ .type = "ssd_budget_below_vision", .message = arch_load.refusalText("SsdBudgetBelowVision") orelse "--ssd-budget-gb cannot hold the vision tower (--vision) beside the minimum expert cache. Raise the budget or pass --no-vision." },
         error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "Not enough memory to load this model: its SSD streaming memory and the context it plans are more than this Mac's GPU memory limit. Lower Memory for SSD streaming (GiB) in its settings (--ssd-budget-gb), or use a smaller pack." },
         else => null,
@@ -2225,7 +2225,7 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
 /// bound and what to free or change), else the refusal's own. The caller frees it.
 pub fn loadRefusalMessage(allocator: std.mem.Allocator, err: anyerror, refusal: LoadRefusal, context: ?model_registry_mod.MemoryContextRefusal) ![]u8 {
     const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported or
-        err == error.SsdBudgetExceedsWiredLimit or err == error.ExpertCacheDoesNotFit;
+        err == error.SsdBudgetExceedsWiredLimit or err == error.ExpertCacheDoesNotFit or err == error.SsdBudgetBelowResident;
     if (written) if (scheduler_mod.takeLoadRefusal()) |text| return allocator.dupe(u8, text);
     if (context) |c| return memoryContextRefusalMessage(allocator, c);
     return allocator.dupe(u8, refusal.message);
@@ -2249,7 +2249,7 @@ test "a prefill chunk refused mid-request for memory answers 503 with the arch's
 
 test "a streamed load refused by its fit checks answers with the text the load wrote, as the memory preflight does" {
     const a = std.testing.allocator;
-    for ([_]anyerror{ error.SsdBudgetExceedsWiredLimit, error.ExpertCacheDoesNotFit }) |e| {
+    for ([_]anyerror{ error.SsdBudgetExceedsWiredLimit, error.ExpertCacheDoesNotFit, error.SsdBudgetBelowResident }) |e| {
         scheduler_mod.recordLoadRefusal("Not enough memory to load this model.\nIt needs 150.0 GB ...");
         const message = try loadRefusalMessage(a, e, loadRefusalFor(e).?, null);
         defer a.free(message);

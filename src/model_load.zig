@@ -840,6 +840,22 @@ const FitPlanner = struct {
     }
 };
 
+/// What a budget's plan holds beside its expert cache, null when the plan refuses it (`bills.smallestBudgetGb`).
+const PlanFloor = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    config: *const ModelConfig,
+    model_dir: []const u8,
+    vision: bool,
+    assistant: u64,
+
+    pub fn heldAt(p: PlanFloor, budget_bytes: u64) ?u64 {
+        const plan = planExpertStreamingWith(p.io, p.allocator, p.config, p.model_dir, budget_bytes, p.vision, p.assistant) catch return null;
+        const led = plan.resolved.ledger orelse return null;
+        return led.trunk_bytes +| led.mtp_bytes +| led.vision_bytes +| led.workspace_bytes +| led.selected_bytes +| led.bounce_bytes +| led.pool_bytes +| led.kept_bytes;
+    }
+};
+
 pub const BudgetPlanner = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1834,7 +1850,16 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         const assistant_bytes = try streamedAssistantBytes(sch.io, sch.allocator, params.config, params.no_drafter, params.drafter_dir, params.model_dir);
         if (budget.bytes == 0) budget = try ramDefaultChoice(sch, params, tier.?, load_vision, assistant_bytes);
-        const plan = try planExpertStreamingWith(sch.io, sch.allocator, params.config, params.model_dir, budget.bytes, load_vision, assistant_bytes);
+        const plan = planExpertStreamingWith(sch.io, sch.allocator, params.config, params.model_dir, budget.bytes, load_vision, assistant_bytes) catch |e| {
+            if (e == error.SsdBudgetBelowResident) {
+                const floor = bills.smallestBudgetGb(budget.bytes >> 30, PlanFloor{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant_bytes });
+                var text_buf: [512]u8 = undefined;
+                const text = bills.ssdBudgetBelowText(&text_buf, budget.bytes >> 30, floor);
+                log.err("{s}\n", .{text});
+                if (@TypeOf(params) == *LoadRequest) params.recordRefusalText(text);
+            }
+            return e;
+        };
         vision_cost = plan.vision;
         load_vision = plan.vision.on;
         var origin_buf: [160]u8 = undefined;

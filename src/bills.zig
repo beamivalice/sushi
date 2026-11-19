@@ -6951,6 +6951,31 @@ fn writeGpuAction(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!v
     try w.print("- Raise the GPU memory limit in Terminal: {s} (it resets at reboot), then restart sushi: the limit is read when sushi starts.\n", .{wireLimitsCommand(&cmd, mb)});
 }
 
+/// The smallest ssd budget that plans: its GiB and what its plan holds beside the expert cache.
+pub const BudgetFloor = struct { gb: u64, held: u64 };
+
+/// The smallest `--ssd-budget-gb` above `asked_gb`, up to the 512 `parseSsdBudgetGb` takes, whose plan the planner makes
+/// (`heldAt(bytes)` is what it holds beside its cache, null when it refuses that budget); null when none up to 512 does.
+pub fn smallestBudgetGb(asked_gb: u64, planner: anytype) ?BudgetFloor {
+    const top: u64 = 512;
+    if (asked_gb >= top or planner.heldAt(top << 30) == null) return null;
+    var lo = asked_gb;
+    var hi = top;
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        if (planner.heldAt(mid << 30) == null) lo = mid else hi = mid;
+    }
+    return .{ .gb = hi, .held = planner.heldAt(hi << 30).? };
+}
+
+/// The refusal of an ssd budget below what a streamed pack holds beside two cache slots per layer.
+pub fn ssdBudgetBelowText(buf: []u8, asked_gb: u64, floor: ?BudgetFloor) []const u8 {
+    const head = "This model's SSD streaming memory is too small to load it.\nMemory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is {d}";
+    const f = floor orelse return std.fmt.bufPrint(buf, head ++ ", and no setting up to 512 holds this pack beside its expert cache: use a smaller pack.", .{asked_gb}) catch "This model's SSD streaming memory is too small to load it.";
+    const u = MemUnit.of(f.held);
+    return std.fmt.bufPrint(buf, head ++ ", and this pack holds {f} beside its expert cache, which needs room for two experts per layer. Set it to {d} or more.", .{ asked_gb, Mem.need(f.held, u), f.gb }) catch "This model's SSD streaming memory is too small to load it.";
+}
+
 /// PURE: the largest whole-GiB ssd budget below `budget` whose streamed load fits `avail`, priced by the load's own
 /// planner (`planner.needAt(budget_bytes)`, null where it refuses the budget); 0 when none does. Past the planner's
 /// smallest budget the need only grows with the budget, so the search halves.
@@ -7550,4 +7575,24 @@ test "a request a non-Sushi bill refuses shows its need above what is available 
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "needs 636 MB, and 635 MB is available") != null);
     try testing.expect(std.mem.indexOf(u8, text, "max_tokens 40 fits") != null);
+}
+
+test "an ssd budget below what a streamed pack holds is refused naming the smallest budget that plans, and what it holds" {
+    const gib: u64 = 1 << 30;
+    // The planner plans from 21 GiB; what it holds beside its cache is 19.5 GiB.
+    const Planner = struct {
+        pub fn heldAt(_: @This(), budget: u64) ?u64 {
+            return if (budget >= 21 * gib) 19 * gib + gib / 2 else null;
+        }
+    };
+    var buf: [1024]u8 = undefined;
+    const text = ssdBudgetBelowText(&buf, 12, smallestBudgetGb(12, Planner{}));
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is 12, and this pack holds 19.5 GB beside its expert cache") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Set it to 21 or more.") != null);
+    try testing.expectEqual(@as(?BudgetFloor, null), smallestBudgetGb(12, struct {
+        pub fn heldAt(_: @This(), _: u64) ?u64 {
+            return null;
+        }
+    }{}));
 }
