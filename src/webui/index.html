@@ -1153,7 +1153,7 @@ async function copyText(text, message = "Copied to clipboard") {
     area.remove();
   }
 }
-function toast(message, tone = "ok") {
+function toast(message, tone = "ok", { stay = false } = {}) {
   if ([...$("toastHost").children].some((shown) => shown.textContent === message)) return;
   const node = el("div", `toast ${tone}`);
   node.appendChild(icon(tone === "err" ? "x" : "check", 15));
@@ -1165,7 +1165,8 @@ function toast(message, tone = "ok") {
     setTimeout(() => node.remove(), 260);
   };
   if (tone !== "err") return setTimeout(drop, 2400);
-  setTimeout(drop, 8000);
+  // The server's refusal stays until dismissed: it can carry a command to copy and take longer than any timer to read.
+  if (!stay) setTimeout(drop, 8000);
   node.setAttribute("role", "alert");
   const close = el("button", "icon-btn");
   close.setAttribute("aria-label", "Dismiss");
@@ -1362,7 +1363,7 @@ const modelStore = {
     } catch (error) {
       const message = loadFailureText(adminErrorText(error));
       this.failed.set(id, message);
-      if (!window.sushiAdmin?.shows(id)) toast(`${verbs[1]} failed: ${message}`, "err");
+      if (!window.sushiAdmin?.shows(id)) toast(`${verbs[1]} failed: ${message}`, "err", { stay: true });
     }
     this.pending.delete(id);
     await this.refresh();
@@ -2004,7 +2005,7 @@ $("updateButton").onclick = async () => {
   const response = await api("/v1/update", { method: "POST" }).catch(() => null);
   if (response?.status !== 202) {
     const detail = await response?.json().catch(() => null);
-    toast(detail?.error?.message || "The server did not accept the update", "err");
+    toast(detail?.error?.message || "The server did not accept the update", "err", { stay: true });
     button.disabled = false;
     return;
   }
@@ -3621,7 +3622,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     btn.disabled = true; btn.setAttribute("aria-busy", "true"); btn.textContent = label;
     try { return await fn(); } finally { btn.disabled = false; btn.removeAttribute("aria-busy"); btn.textContent = was; }
   }
-  const failToast = (what, e) => toast(`${what} failed: ${adminErrorText(e)}`, "err");
+  const failToast = (what, e) => toast(`${what} failed: ${adminErrorText(e)}`, "err", { stay: true });
   // A server message names settings by their key; the page names them by their label.
   const labelled = (text) => text.replace(/\b[a-z]+(?:_[a-z]+)+\b/g, (key) => KEY[key]?.[0] ?? key);
 

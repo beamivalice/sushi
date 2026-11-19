@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A refused model load stays on screen in the web page until you dismiss it**: its message, which can hold a
+  command to copy, left after 8 s whatever its length; a toast carrying the server's refusal (a load, an update, a
+  Models or Settings action) now stays until dismissed.
 - **Every error on `/v1/messages` now comes in Anthropic's shape**: a refused model load, an unknown model, a wrong
   method and a too-deeply nested body answered there in OpenAI's `{"error":...}` shape, and Anthropic errors said
   "400 Error" in their status line; they now carry Anthropic's `{"type":"error",...}` and the standard status text. A

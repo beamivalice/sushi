@@ -32,7 +32,7 @@ function makeServer({ metrics = 200, loaded = true, down = false, apiKey = null 
     if (down) return route.abort();
     switch (p) {
       case '/v1/models': if (state.modelsReply) return route.fulfill(state.modelsReply); return route.fulfill(json({ data: [{ id: 'Chat-A', state: state.loaded ? 'ready' : 'unloaded', loaded: state.loaded, capabilities: ['chat'], context_length: 8192, bytes_on_disk: 2 ** 30, input_modalities: ['text'] }] }));
-      case '/v1/load-model': state.loaded = true; return route.fulfill(json({ ok: true }));
+      case '/v1/load-model': if (state.loadReply) return route.fulfill(state.loadReply); state.loaded = true; return route.fulfill(json({ ok: true }));
       case '/props': return route.fulfill(json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9, total_bytes: 128 * 2 ** 30 }, batching: {} }));
       case '/v1/tools': return route.fulfill(json({ edit_default: false }));
       case '/v1/settings': return route.fulfill(json({ file: '/h/f.json', model_keys: [], applies: 'x', server: { models_dir: { default: '/d', boot_roots: ['/m'], file: null, flag: '', locked: false }, prefix_cache_disk_gb: { file: null, locked: false, effective_bytes: 2 ** 30 } }, models: [] }));
@@ -395,6 +395,27 @@ async function main() {
         assert.deepEqual(errors, []);
         await context.close();
       }
+    }
+    {
+      // A refused load's toast stays on screen until it is dismissed, however long it takes to read; any other toast leaves.
+      const refusal = 'Not enough memory to load this model.\n' + 'It needs 61.0 GB, and the GPU memory limit leaves 40.0 GB. '.repeat(12) + '\nTo load it:\n- sudo sysctl iogpu.wired_limit_mb=120000';
+      const server = makeServer({ loaded: false });
+      server.state.loadReply = { status: 503, contentType: 'application/json', body: JSON.stringify({ error: { message: refusal, type: 'out_of_memory', param: null, code: 503 } }) };
+      const { page, context, errors } = await open(browser, server, '/chat', { viewport: PHONE, clock: true });
+      await page.evaluate(() => { toast('Copy failed', 'err'); toast('Saved', 'ok'); return modelStore.act('Chat-A', 'load'); });
+      await page.clock.runFor(120_000);
+      const shown = await page.evaluate(() => [...document.getElementById('toastHost').children].map((n) => {
+        const r = n.getBoundingClientRect();
+        return { text: n.textContent, onScreen: r.top >= 0 && r.bottom <= innerHeight && r.left >= 0 && r.right <= innerWidth };
+      }));
+      assert.equal(shown.length, 1, `only the refusal is still shown after two minutes (${shown.map((t) => t.text.slice(0, 40))})`);
+      assert.ok(shown[0].text.includes('sudo sysctl iogpu.wired_limit_mb=120000'), 'the refusal is whole');
+      assert.ok(shown[0].onScreen, 'the refusal fits the phone screen');
+      await page.click('#toastHost .toast [aria-label="Dismiss"]');
+      await page.clock.runFor(1000);
+      assert.equal(await page.evaluate(() => document.getElementById('toastHost').children.length), 0, 'Dismiss removes it');
+      assert.deepEqual(errors, []);
+      await context.close();
     }
     console.log('Web UI shell: passed');
   } finally {
