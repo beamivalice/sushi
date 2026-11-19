@@ -29,7 +29,7 @@ earlier history is mlx-serve's, in that project's changelog.
   dismissed, every request to a refused model gets it, and a load the GPU limit refuses answers at once.
 - **APIs and server**: errors on `/v1/messages` come in Anthropic's shape; a Responses WebSocket turn refused before it
   runs ends with an error frame, and `store: false` is echoed as sent; a client that stops reading no longer blocks an
-  unload (a busy unload answers 409 within 30 s); a shutdown no longer serves waiting requests; a large SSD prompt cache
+  unload (a busy unload answers 409 within 30 s); a large SSD prompt cache
   no longer stops new connections; the web page's Thinking panel stays where you scroll it. The HTTP request-size limit
   is a setting, `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by default): thanks @Cianidos.
 - **On the MLX route** (`--qwen-mlx-engine`, GLM-5.3-Flash, MiMo): a kv8, kv6 or kv4 cache grows on MLX's page grid, so

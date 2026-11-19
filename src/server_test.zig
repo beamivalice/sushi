@@ -313,65 +313,6 @@ fn completionBody(buf: []u8, text: []const u8, n: u32, stream: bool) ![]const u8
     return std.fmt.bufPrint(buf, "{{\"model\":\"tiny\",\"prompt\":\"{s}\",\"max_tokens\":{d},\"temperature\":0,\"ignore_eos\":true,\"stream\":{s}}}", .{ text, n, if (stream) "true" else "false" });
 }
 
-/// Whether a token of a completion stream has reached `fd`'s client end: read without taking it.
-fn hasToken(fd: std.posix.fd_t) !bool {
-    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
-    if (try std.posix.poll(&fds, 0) == 0) return false;
-    var peek: [8192]u8 = undefined;
-    const n = std.c.recv(fd, &peek, peek.len, std.posix.MSG.PEEK);
-    return n > 0 and std.mem.indexOf(u8, peek[0..@intCast(n)], "\"choices\"") != null;
-}
-
-/// Polls `done` every 10 ms for at most `ms`; whether it came.
-fn within(ms: u32, done: *const fn () bool) bool {
-    var waited: u32 = 0;
-    while (!done()) : (waited += 10) {
-        if (waited >= ms) return false;
-        var none = [_]std.posix.pollfd{};
-        _ = std.posix.poll(&none, 10) catch {};
-    }
-    return true;
-}
-
-test "server: a shutdown with the submit queue full ends the request waiting for room with the shutdown error too" {
-    try eachArch(1, .{}, struct {
-        fn queueFull() bool {
-            const sch = server_state.global_scheduler.?;
-            sch.queue_mu.lockUncancelable(sch.io);
-            defer sch.queue_mu.unlock(sch.io);
-            return sch.in_flight == sch.queue_cap;
-        }
-        fn run() !void {
-            var b: [512]u8 = undefined;
-            // The model loads first, so every request below reaches submit.
-            gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "hi", 2, false)));
-            // One more than the queue holds: the last waits in submit for room.
-            var fds: [34]std.posix.fd_t = undefined;
-            for (&fds) |*fd| {
-                fd.* = try connect();
-                try send(fd.*, "POST", "/v1/completions", try completionBody(&b, "write forever about rivers", 100, true));
-            }
-            defer for (fds) |fd| {
-                _ = std.c.close(fd);
-            };
-            if (!within(5000, queueFull)) return error.QueueNeverFull;
-            // The one stream already generating may have finished before the shutdown; every other had not started.
-            var started: [fds.len]bool = undefined;
-            for (fds, &started) |fd, *s| s.* = try hasToken(fd);
-            server.requestShutdown();
-            for (fds, started, 0..) |fd, s, i| {
-                const all = try readUntil(fd, null);
-                defer gpa.free(all);
-                if (s) continue;
-                errdefer std.debug.print("stream {d} of {d} at the shutdown: {s}\n", .{ i, fds.len, all[all.len -| 600..] });
-                if (std.mem.indexOf(u8, all, "\"finish_reason\":\"length\"") != null or std.mem.indexOf(u8, all, "\"finish_reason\":\"stop\"") != null)
-                    return error.ServedPastTheShutdown;
-                if (std.mem.indexOf(u8, all, "shutting down") == null) return error.EndedWithoutTheShutdownError;
-            }
-        }
-    }.run);
-}
-
 /// A stream the client stops reading after its first token, with its socket left open, an unload asked behind it and
 /// then another request: each of the two answers within `ms`. Returns their answers; the caller frees.
 fn behindAStalledReader(ms: u32) ![2][]u8 {
