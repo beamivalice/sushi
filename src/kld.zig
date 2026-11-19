@@ -928,12 +928,12 @@ fn inputRefusal(allocator: std.mem.Allocator, io: std.Io, opts: Options, buf: []
     switch (opts.command) {
         .compare => {
             var base = fixture_mod.readBaseline(allocator, io, opts.fixture) catch |err|
-                return std.fmt.bufPrint(buf, "--fixture {s}: {s}", .{ opts.fixture, cli_error.describe(err) orelse @errorName(err) }) catch "--fixture: unreadable";
+                return std.fmt.bufPrint(buf, "--fixture {s}: {s}", .{ opts.fixture, cli_error.describe(err) }) catch "--fixture: unreadable";
             base.deinit();
         },
         .capture => {
             var prompts = fixture_mod.loadPrompts(allocator, io, opts.prompts, opts.limit) catch |err|
-                return std.fmt.bufPrint(buf, "--prompts {s}: {s}", .{ opts.prompts, cli_error.describe(err) orelse @errorName(err) }) catch "--prompts: unreadable";
+                return std.fmt.bufPrint(buf, "--prompts {s}: {s}", .{ opts.prompts, cli_error.describe(err) }) catch "--prompts: unreadable";
             prompts.deinit();
         },
     }
@@ -943,7 +943,7 @@ fn inputRefusal(allocator: std.mem.Allocator, io: std.Io, opts: Options, buf: []
 pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var out: Out = .{};
     var opts = parseArgs(args) catch |err| {
-        out.print("sushi kld: {s}\n\n{s}", .{ cli_error.describe(err) orelse @errorName(err), USAGE });
+        out.print("sushi kld: {s}\n\n{s}", .{ cli_error.describe(err), USAGE });
         std.process.exit(1);
     };
     if (opts.help) {

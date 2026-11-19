@@ -11,6 +11,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek-V4.1 loads at its default SSD budget when other apps hold memory**: the release checkpoint on a 256 GB Mac
   was refused at its default (237 GB against 217 GB free) and asked for `--ssd-budget-gb 215`; the default now fits
   the free RAM at the load, so it can be lower than before while other apps hold memory, and the load log names it.
+- **No command fails silently**: every error that ends a `sushi` command prints a line saying what to do; `sushi kld` on
+  a DeepSeek-V4.1 pack without `--ssd-budget-gb` used to exit with no message and now asks for it.
 
 ## v1.7.1 — Sushi Cooler, made right: memory, refusals, long conversations
 

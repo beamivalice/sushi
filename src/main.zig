@@ -127,7 +127,7 @@ fn settleDeviceReads() void {
 
 pub fn main(init: std.process.Init) void {
     runCli(init) catch |err| {
-        if (cli_error.describe(err)) |text| log.err("{s}\n", .{text});
+        log.err("{s}\n", .{cli_error.describe(err)});
         std.process.exit(1);
     };
 }
@@ -1040,7 +1040,7 @@ fn runCli(init: std.process.Init) !void {
         allocator.destroy(config_storage);
     };
     config_storage.* = model_mod.parseConfig(io, allocator, model_dir) catch |err| {
-        log.err("cannot read the model at {s}: {s}{s}\n", .{ model_dir, cli_error.describe(err) orelse @errorName(err), if (err == error.FileNotFound) " (a model is a folder holding config.json)" else "" });
+        log.err("cannot read the model at {s}: {s}{s}\n", .{ model_dir, cli_error.describe(err), if (err == error.FileNotFound) " (a model is a folder holding config.json)" else "" });
         std.process.exit(1);
     };
     const config = config_storage;
@@ -1082,7 +1082,7 @@ fn runCli(init: std.process.Init) !void {
         // was a live SIGSEGV on a partially-downloaded model dir (the
         // preloadCpuState errdefer-after-init pattern applies here too).
         allocator.destroy(tok);
-        log.err("failed to load tokenizer from {s}: {s} (incomplete download? `sushi pull` the model again to resume, or delete the dir)\n", .{ model_dir, cli_error.describe(err) orelse @errorName(err) });
+        log.err("failed to load tokenizer from {s}: {s} (incomplete download? `sushi pull` the model again to resume, or delete the dir)\n", .{ model_dir, cli_error.describe(err) });
         std.process.exit(1);
     };
     // defer-only (see config note above): errdefer + defer with the same body
