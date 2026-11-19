@@ -3,14 +3,14 @@
 . "$(dirname "$0")/private_cache.sh"
 # `sushi bench --model`: the bench in this process on a tiny DeepSeek fixture with a byte-level tokenizer made here.
 # A rung subset and a short decode run through the serve path with no listener; a repeat of the 4k prompt restores
-# from the prefix cache and the table reports it. The tiny fixture is ${SUSHI_MODELS_DIR}/test-fixtures/dsv41-dspark-tiny
+# from the prefix cache and the table reports it. The tiny fixture is ${SUSHI_MODELS_DIR}/tiny-models/dsv41-dspark-tiny
 # (BENCH_TINY_MODEL overrides); SKIPs without it.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BINARY:-$ROOT/zig-out/bin/sushi}"
 LOCK="$ROOT/scripts/gpu-lock.sh"
-FIXTURE="${BENCH_TINY_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/test-fixtures/dsv41-dspark-tiny}"
+FIXTURE="${BENCH_TINY_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/tiny-models/dsv41-dspark-tiny}"
 PASS=0
 FAIL=0
 

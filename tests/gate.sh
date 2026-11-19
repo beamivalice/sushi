@@ -89,7 +89,7 @@ cd "$WT"
 grep -q '"test-log"' build.zig || die "refused: $SHA's build.zig has no -Dtest-log, which the gate's per-test log needs"
 grep -q '"fixture-cut"' build.zig || die "refused: $SHA's build.zig has no -Dfixture-cut, which declares the Qwen cut's memory"
 # shellcheck source=lib/fixture_envs.sh
-source tests/lib/fixture_envs.sh
+source tests/lib/fixture_envs.sh || die "refused: tests/lib/fixture_envs.sh failed (above)"
 for v in $SUSHI_FIXTURE_ENVS; do
   [ -d "${!v}" ] || die "refused: fixture $v=${!v} is not a folder"
 done

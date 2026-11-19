@@ -172,8 +172,8 @@ has "the guards run in a tree without the checkout's untracked files" "$(grep '^
 has "the guards run with the PyYAML python3 first on PATH" "$(grep '^guards ' "$CALLS")" "python3=$TMP/py-yes/python3"
 has "the guards' own zig build keeps its cache in the gate dir" "$(grep '^guards ' "$CALLS")" "zcache=$GATE_DIR/zig-cache"
 has "the test step sees the fixture envs" "$(grep '^zig test ' "$CALLS")" "QWEN4_STQ_TINY=$QWEN_TINY"
-has "  DSV41_EPI_TINY among them" "$(grep '^zig test ' "$CALLS")" "DSV41_EPI_TINY=$TMP/models/test-fixtures/dsv41-epi-tiny"
-ok "the record names DSV41_EPI_TINY's fixture" "$(field "$REC" fixtures.DSV41_EPI_TINY)" "$TMP/models/test-fixtures/dsv41-epi-tiny"
+has "  DSV41_EPI_TINY among them" "$(grep '^zig test ' "$CALLS")" "DSV41_EPI_TINY=$TMP/models/tiny-models/dsv41-epi-tiny"
+ok "the record names DSV41_EPI_TINY's fixture" "$(field "$REC" fixtures.DSV41_EPI_TINY)" "$TMP/models/tiny-models/dsv41-epi-tiny"
 for s in lint ubench test; do
   has "zig build $s keeps its cache in the gate dir" "$(grep "^zig $s " "$CALLS")" "--cache-dir $GATE_DIR/zig-cache"
 done
@@ -247,6 +247,13 @@ ok "  before any step" "$(grep -c -E '^(zig|guards) ' "$CALLS")" "0"
 ok "  writing no record" "$(ls "$GATE_DIR"/*.json 2> /dev/null | wc -l | tr -d ' ')" "0"
 ok "  and removing its worktree" "$(worktrees)" "1"
 mkdir -p "$PM"
+
+mv "$TMP/models/tiny-models" "$TMP/models/test-fixtures"
+gate -- HEAD
+ok "tiny models still in the old test-fixtures folder refuse" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
+has "  naming the mv" "$OUT" "mv \"$TMP/models/test-fixtures\" \"$TMP/models/tiny-models\""
+ok "  before any step" "$(grep -c -E '^(zig|guards) ' "$CALLS")" "0"
+mv "$TMP/models/test-fixtures" "$TMP/models/tiny-models"
 
 gate -- no-such-ref
 ok "a ref that names no commit refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"

@@ -142,11 +142,13 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device
   profile and the engine dispatch as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`). A test about one arm's bytes names it
   (`device.current().has(.matrix_g17)`), never a chip.
-- The pack tier's envs: `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/test-fixtures/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_STQ_TINY_PM` (its pair-major copy), `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
+- The pack tier's envs: `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/tiny-models/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_STQ_TINY_PM` (its pair-major copy), `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
   folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
   `{p0, ratio, keys, group}`, `wscale` and the kernel's `scores`; the test skips without it), `QWEN4_TEST_MODEL`,
   `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`, `SUSHI_DSV41_REAL_PACK` (the DeepSeek width probe: every row of a verify is its one-row round's bits on the real pack;
-  its `SUSHI_DSV41_PROBE_*` knobs are in [envvar](envvar.md); a ~40 GB-budget run, GPU lock). A landing on main sets the tiny-fixture envs (`source tests/lib/fixture_envs.sh`); the real-pack envs run with the release gate. Without them a green
+  its `SUSHI_DSV41_PROBE_*` knobs are in [envvar](envvar.md); a ~40 GB-budget run, GPU lock). The tiny models live in `${SUSHI_MODELS_DIR}/tiny-models/` (the owner's Hugging Face dataset keeps them under
+  `test-fixtures/`, so a fetch lands that folder's contents there; `fixture_envs.sh` refuses a box that still has the
+  old `test-fixtures/` folder, naming the `mv`). A landing on main sets the tiny-fixture envs (`source tests/lib/fixture_envs.sh`); the real-pack envs run with the release gate. Without them a green
   suite proves nothing there.
 - Three real-weight runs have no script. The encoder's real-checkpoint capture:
   `SUSHI_ENCODER_REAL_MODEL=1 SUSHI_MODELS_DIR=<root holding Qwen/Qwen3.8-Flash-Next> zig build test -Doptimize=ReleaseFast -Dmodel=enc`.
@@ -369,7 +371,7 @@ A full-suite run (series end, version bump) also sets `QWEN4_TEST_MODEL` to a Qw
 (`QWEN4_STQ_CUT`, then `QWEN4_STQ4_CUT`): the real-pack Qwen tests run nowhere else, and left unset they rot unseen.
 Only a box of 64 GB or more sets it: the contract holds an MLX reference load and a Cooler load of the cut at once,
 beside the served warm's widest chunk (about 6 GB of transient).
-It sets `QWEN4_BF16_TINY` to `test-fixtures/qwen4-bf16-tiny-hd256` (the HF BF16 source of the STQ hd256 tiny), so the
+It sets `QWEN4_BF16_TINY` to `tiny-models/qwen4-bf16-tiny-hd256` (the HF BF16 source of the STQ hd256 tiny), so the
 Cooler contract holds the BF16 checkpoint's format at served head geometry.
 A full-suite run compares its test total (`Build Summary` plus `test-host`) with the previous full run's: an
 unexplained drop means tests were not built, and blocks the push.

@@ -238,7 +238,7 @@ check "GET /v1/settings with the key is 200" "$(is "$(code "$BASE/v1/settings" -
 stop_server
 
 echo "[5/5] a loaded model's tier: clear through the inference thread, then a new write (tiny DeepSeek fixture, GPU lock)"
-FIXTURE="${PREFIX_ADMIN_TINY_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/test-fixtures/dsv41-dspark-tiny}"
+FIXTURE="${PREFIX_ADMIN_TINY_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/tiny-models/dsv41-dspark-tiny}"
 if [ ! -f "$FIXTURE/config.json" ]; then
     echo "  SKIP no tiny fixture at $FIXTURE"
 else

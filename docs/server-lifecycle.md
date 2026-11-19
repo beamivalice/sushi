@@ -184,9 +184,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   only by it (lint `folder-bytes-compare`), a folder registers once (`error.FolderRegistered`), and a path no entry is at
   names no model: never another folder's by its name (`registry.peekByPath`; a new folder whose name is taken takes
   `<parent>/<name>`, else `IdTaken` → 409).
-- **Discovery never lists a dot folder or a folder named `test-fixtures` BELOW a root**, at either depth (`skipsBelowRoot`;
-  one debug line per skipped fixtures folder). The repo's tiny test models live in `${SUSHI_MODELS_DIR}/test-fixtures/<name>`
-  and are not packs to serve. A root the user NAMES is always scanned (`--model-dir .../test-fixtures` lists them), and
+- **Discovery never lists a dot folder or a folder named `tiny-models` BELOW a root**, at either depth (`skipsBelowRoot`;
+  one debug line per skipped fixtures folder). The repo's tiny test models live in `${SUSHI_MODELS_DIR}/tiny-models/<name>`
+  and are not packs to serve. A root the user NAMES is always scanned (`--model-dir .../tiny-models` lists them), and
   `--model <path>` never goes through discovery; rescan shares the rule.
 - **The auto `--max-resident-mem` (80% of the GPU working-set limit) bounds CO-RESIDENCE only**: a cold load evicts
   every other model first, and one that then loads alone is the load preflight's call (`mem_cap_binds_alone`); an

@@ -2,7 +2,7 @@
 # sushi-test: tier=host
 # A `--model` boot listens before its model is loaded: the page and the status routes answer during the load, a
 # generation request sent then completes after it, and a load that fails ends the process non-zero by name. The model
-# is the tiny DeepSeek fixture with a byte-level tokenizer made here (${SUSHI_MODELS_DIR}/test-fixtures/dsv41-dspark-tiny,
+# is the tiny DeepSeek fixture with a byte-level tokenizer made here (${SUSHI_MODELS_DIR}/tiny-models/dsv41-dspark-tiny,
 # EARLY_LISTEN_TINY_MODEL overrides; SKIPs without it); SUSHI_TEST_LOAD_DELAY_MS holds the load open after its
 # refusals so the window is long enough to observe. Takes the GPU lock per boot; private HOME and prefix cache root.
 # Usage: ./tests/test_early_listener.sh [port]
@@ -11,7 +11,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BINARY:-$ROOT/zig-out/bin/sushi}"
 LOCK="$ROOT/scripts/gpu-lock.sh"
-FIXTURE="${EARLY_LISTEN_TINY_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/test-fixtures/dsv41-dspark-tiny}"
+FIXTURE="${EARLY_LISTEN_TINY_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/tiny-models/dsv41-dspark-tiny}"
 PORT="${1:-18771}"
 BASE="http://127.0.0.1:$PORT"
 HOLD_MS=8000

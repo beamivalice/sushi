@@ -6,7 +6,7 @@
 set -u
 cd "$(dirname "$0")/../.."
 ARCH=${1:-applegpu_g13s}
-FIX=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/test-fixtures
+FIX=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/tiny-models
 export DSV41_TINY=${DSV41_TINY:-$FIX/dsv41-dspark-tiny} DSV41_STQ_TINY=${DSV41_STQ_TINY:-$FIX/dsv41-stq-tiny} DSV41_EPI_TINY=${DSV41_EPI_TINY:-$FIX/dsv41-epi-tiny}
 for d in "$DSV41_TINY" "$DSV41_STQ_TINY" "$DSV41_EPI_TINY"; do
     [ -d "$d" ] || { echo "SKIP: no fixture at $d"; exit 3; }

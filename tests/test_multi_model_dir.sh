@@ -105,22 +105,22 @@ grep -q "scan failed" "$TMP/missing.log" \
 stop
 
 # ── [3b] The repo's test fixtures and dot folders are not models to list below a root, but a root NAMED at
-# test-fixtures lists what is inside it.
+# tiny-models lists what is inside it.
 mk d/org/real     qwen4_exp
-mk d/test-fixtures/tiny qwen4_exp
-mk d/org/test-fixtures  qwen4_exp
+mk d/tiny-models/tiny qwen4_exp
+mk d/org/tiny-models  qwen4_exp
 mk d/.hidden/h    qwen4_exp
 boot "$TMP/fixtures.log" "$TMP/d" || exit 1
 GOT="$(ids)"
 [ "$GOT" = "org/real" ] \
-  && echo "PASS: test-fixtures and dot folders below a root are not listed ($GOT)" \
+  && echo "PASS: tiny-models and dot folders below a root are not listed ($GOT)" \
   || { echo "FAIL: below a root got [$GOT], wanted [org/real]"; rc=1; }
 stop
-boot "$TMP/fixtures-root.log" "$TMP/d/test-fixtures" || exit 1
+boot "$TMP/fixtures-root.log" "$TMP/d/tiny-models" || exit 1
 GOT="$(ids)"
 [ "$GOT" = "tiny" ] \
-  && echo "PASS: a --model-dir named at test-fixtures lists what is inside ($GOT)" \
-  || { echo "FAIL: named test-fixtures root got [$GOT], wanted [tiny]"; rc=1; }
+  && echo "PASS: a --model-dir named at tiny-models lists what is inside ($GOT)" \
+  || { echo "FAIL: named tiny-models root got [$GOT], wanted [tiny]"; rc=1; }
 stop
 
 # ── [4] Past the cap the server REFUSES rather than silently dropping folders —

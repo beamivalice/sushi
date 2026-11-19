@@ -2812,7 +2812,7 @@ test "ModelRegistry: rescan reads the settings file the registry names instead o
     try testing.expectEqual(@as(u32, 0), try reg.rescan());
 }
 
-test "ModelRegistry: rescan under a models root never absorbs test-fixtures or dot folders" {
+test "ModelRegistry: rescan under a models root never absorbs tiny-models or dot folders" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2826,7 +2826,7 @@ test "ModelRegistry: rescan under a models root never absorbs test-fixtures or d
     var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
     defer reg.deinit();
 
-    try model_discovery.writePackStub(io, tmp.dir, "test-fixtures/x");
+    try model_discovery.writePackStub(io, tmp.dir, "tiny-models/x");
     try model_discovery.writePackStub(io, tmp.dir, ".hidden/y");
     try model_discovery.writePackStub(io, tmp.dir, "org/second");
 

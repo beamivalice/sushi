@@ -483,15 +483,15 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
     return .{ .models = try merged.toOwnedSlice(allocator), .allocator = allocator, .roots = roots_owned };
 }
 
-/// Folder name that holds the repo's tiny test models (`${SUSHI_MODELS_DIR}/test-fixtures/<name>`).
-const fixtures_dir_name = "test-fixtures";
+/// Folder name that holds the repo's tiny test models (`${SUSHI_MODELS_DIR}/tiny-models/<name>`).
+const fixtures_dir_name = "tiny-models";
 
 /// A folder met BELOW a root that discovery never lists: dot folders and the test fixtures.
-/// A root the user names is not asked, so `--model-dir .../test-fixtures` still lists them.
+/// A root the user names is not asked, so `--model-dir .../tiny-models` still lists them.
 fn skipsBelowRoot(name: []const u8, root: []const u8) bool {
     if (name.len == 0 or name[0] == '.') return true;
     if (!std.mem.eql(u8, name, fixtures_dir_name)) return false;
-    log.debug("[discovery] skip {s} under {s}: test fixtures are not models to serve\n", .{ name, root });
+    log.debug("[discovery] skip {s} under {s}: tiny test models are not models to serve\n", .{ name, root });
     return true;
 }
 
@@ -1707,14 +1707,14 @@ pub fn writePackStub(io: std.Io, dir: std.Io.Dir, sub: []const u8) !void {
     try dir.writeFile(io, .{ .sub_path = path, .data = body });
 }
 
-test "discovery below a root skips test-fixtures and dot folders at every depth, but a named root is scanned" {
+test "discovery below a root skips tiny-models and dot folders at every depth, but a named root is scanned" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try writePackStub(io, tmp.dir, "org/pack");
-    try writePackStub(io, tmp.dir, "test-fixtures/x");
-    try writePackStub(io, tmp.dir, "org/test-fixtures");
+    try writePackStub(io, tmp.dir, "tiny-models/x");
+    try writePackStub(io, tmp.dir, "org/tiny-models");
     try writePackStub(io, tmp.dir, ".hidden/y");
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
@@ -1724,7 +1724,7 @@ test "discovery below a root skips test-fixtures and dot folders at every depth,
     try std.testing.expectEqual(@as(usize, 1), parent.models.len);
     try std.testing.expectEqualStrings("org/pack", parent.models[0].id);
 
-    const fixtures_root = try std.fmt.allocPrint(allocator, "{s}/test-fixtures", .{root});
+    const fixtures_root = try std.fmt.allocPrint(allocator, "{s}/tiny-models", .{root});
     defer allocator.free(fixtures_root);
     var named = try discoverModelsMany(io, allocator, &.{fixtures_root});
     defer named.deinit();

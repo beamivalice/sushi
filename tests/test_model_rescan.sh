@@ -92,12 +92,12 @@ RESCAN=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/models/rescan")
 check "second rescan adds nothing (got $RESCAN)" \
     "$(echo "$RESCAN" | grep -q '"added":0' && echo 1 || echo 0)"
 
-# A folder whose model_type is not served, or one under test-fixtures, is not absorbed.
-mkdir -p "$ROOT_DIR/org/other" "$ROOT_DIR/test-fixtures/tiny"
+# A folder whose model_type is not served, or one under tiny-models, is not absorbed.
+mkdir -p "$ROOT_DIR/org/other" "$ROOT_DIR/tiny-models/tiny"
 echo '{"model_type":"llama"}' > "$ROOT_DIR/org/other/config.json"
 echo "stub" > "$ROOT_DIR/org/other/model.safetensors"
-echo '{"model_type":"glm5_next"}' > "$ROOT_DIR/test-fixtures/tiny/config.json"
-echo "stub" > "$ROOT_DIR/test-fixtures/tiny/model.safetensors"
+echo '{"model_type":"glm5_next"}' > "$ROOT_DIR/tiny-models/tiny/config.json"
+echo "stub" > "$ROOT_DIR/tiny-models/tiny/model.safetensors"
 RESCAN=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/models/rescan")
 check "an unserved model_type and a test fixture are not absorbed (got $RESCAN)" \
     "$(echo "$RESCAN" | grep -q '"added":0' && echo 1 || echo 0)"
