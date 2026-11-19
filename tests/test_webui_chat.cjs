@@ -550,6 +550,36 @@ test('a tool round follows the bottom only for a reader who is at the bottom', a
   await context.close(); await stub.close();
 });
 
+test('the Thinking panel follows streamed reasoning only while the reader is at its bottom', async ({ browser }) => {
+  let stream;
+  const opened = new Promise((resolve) => { stream = resolve; });
+  const stub = await startStub({ chat: (req, res) => { head(res); stream(res); } });
+  const { page, context, errors } = await open(browser, stub);
+  await send(page, 'think');
+  const res = await opened;
+  const think = async (from, to) => {
+    const marker = `step ${to - 1}`;
+    for (let i = from; i < to; i++) sse(res, { choices: [{ delta: { reasoning_content: `step ${i}\n` } }] });
+    await page.waitForFunction((m) => document.querySelector('.thinking .t-body')?.textContent.includes(m), marker);
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  };
+  const panel = () => page.evaluate(() => { const b = document.querySelector('.thinking .t-body'); return { top: b.scrollTop, gap: b.scrollHeight - b.scrollTop - b.clientHeight, room: b.scrollHeight - b.clientHeight }; });
+  await think(0, 60);
+  await page.click('.thinking summary');
+  assert.ok((await panel()).room > 200, 'the reasoning is taller than its panel');
+  await page.evaluate(() => { document.querySelector('.thinking .t-body').scrollTop = 80; });
+  await think(60, 90);
+  assert.equal((await panel()).top, 80, 'a reader who scrolled up in the Thinking panel stays put');
+
+  await page.evaluate(() => { const b = document.querySelector('.thinking .t-body'); b.scrollTop = b.scrollHeight; });
+  await think(90, 120);
+  assert.ok((await panel()).gap < 24, 'at the bottom the Thinking panel follows new reasoning');
+  delta(res, 'answer'); finish(res);
+  await idle(page);
+  assert.deepEqual(errors, []);
+  await context.close(); await stub.close();
+});
+
 test('a typed generation setting reaches the request as typed, and one out of range holds the send with a message on its field', async ({ browser }) => {
   const stub = await startStub({ models: [model({ reasoning_efforts: ['low', 'high'], default_reasoning_effort: 'high' })] });
   const { page, context } = await open(browser, stub);

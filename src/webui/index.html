@@ -3066,8 +3066,11 @@ function createStreamingView() {
       node.prepend(state.thinkingEl);
     }
     if (state.thinkingBody) {
-      state.thinkingBody.textContent = state.reasoning;
-      state.thinkingBody.scrollTop = state.thinkingBody.scrollHeight;
+      // Measured before the text grows: a reader who scrolled up to read earlier reasoning stays put.
+      const body = state.thinkingBody;
+      const follow = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+      body.textContent = state.reasoning;
+      if (follow) body.scrollTop = body.scrollHeight;
     }
     if (state.text) {
       if (!state.contentEl) {
