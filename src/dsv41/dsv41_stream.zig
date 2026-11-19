@@ -1262,8 +1262,9 @@ test "dsv41 stq: a queued decode layer is one command buffer, two where a prefet
             const rebuilt = model.spec_rebuilt - rebuilt0;
             const predicted = model.prefetch_predicted - predicted0;
             if (slots == 8) {
-                // The picks with the hc split, the shared expert, then the layer's graph with the routed chain.
-                try testing.expectEqual(3 * layers + flush, submits);
+                // The picks with the hc split, then the layer's graph with the routed chain, which the shared expert
+                // rides when every pick is resident.
+                try testing.expectEqual(2 * layers + flush, submits);
                 continue;
             }
             // A queued build is one buffer, with the picks, the hc split and the routed chain in it; its prefetch
