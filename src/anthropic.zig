@@ -136,10 +136,6 @@ pub fn buildAnthropicStreamError(allocator: std.mem.Allocator, w: GenErrorWire) 
     , .{ w.anthropic_type, esc });
 }
 
-/// The routes whose errors take Anthropic's shape.
-pub fn isAnthropicRoute(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/v1/messages") or std.mem.eql(u8, path, "/v1/messages/count_tokens");
-}
 
 /// Anthropic `output_config` — the 2026 spelling Claude Code sends: `effort`
 /// in place of the older `thinking` budget object, and `format` where this

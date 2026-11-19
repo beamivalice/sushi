@@ -15,6 +15,10 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A Responses WebSocket holds its model only during a turn**: an open socket kept its model from being unloaded or
   evicted, and every turn ran on the model of the upgrade, whatever it named; each turn now routes its own `model` as
   `POST /v1/responses` does.
+- **Every error on `/v1/messages` comes in Anthropic's shape, from the first byte**: a body over the size limit, an
+  unsupported transfer coding or expectation, a bad chunk, a server still starting and an unknown path under
+  `/v1/messages` answered in OpenAI's shape; a refused API key now takes the same shape as every other error (a HEAD
+  gets no body), and the metrics feed's refusals carry the `error.message` the dashboard reads.
 - **APIs and server**: a shutdown refuses the requests still waiting from the moment it is asked, instead of serving
   those it reaches within the next second.
 - **A long Qwen3.8 conversation's next turn is refused less often near the memory limit**: a turn that takes the cached

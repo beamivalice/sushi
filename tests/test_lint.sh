@@ -98,6 +98,21 @@ printf '%s\n' 'const tc = @import("tool_calls.zig");' 'pub fn f(a: u8) void {' '
 printf '%s\n' 'test "t" { _ = .{ .prefill_tps = 0.0 }; }' > "$TMP/t/src/generation_stream.zig"
 expect_green "the raw parser outside a surface, and a result literal in a test or in generation_stream.zig"
 
+# rule error-body-literal
+tree
+printf '%s\n' 'fn f(s: *S) !void {' '    try send(s, "{\"error\":\"metrics off\"}");' '}' > "$TMP/t/src/p.zig"
+expect_red "a hand-built OpenAI error body" "src/p.zig:2:17 \[error-body-literal\] f: a hand-built error body"
+
+tree
+printf '%s\n' 'fn g(s: *S) !void {' '    try send(s,' '        \\{{"type":"error","error":{{"type":"x"}}}}' '    );' '}' > "$TMP/t/src/p.zig"
+expect_red "a hand-built Anthropic error body in a multiline literal" "src/p.zig:3:9 \[error-body-literal\] g: a hand-built error body"
+
+tree
+printf '%s\n' 'fn f(s: *S) !void {' '    try send(s, "{\"error\":\"x\"}");' '}' > "$TMP/t/src/http.zig"
+printf '%s\n' 'fn g() []const u8 {' '    return ",\"error\":null";' '}' 'test "t" { try expect(body, "{\"error\":{\"message\":\"x\"}}"); }' > "$TMP/t/src/p.zig"
+printf '%s\n' 'fn h() []const u8 {' '    return "{\"error\":{\"message\":\"x\"}}";' '}' > "$TMP/t/src/p_test.zig"
+expect_green "the sender's own file, an error field, a test's expected body and a test file"
+
 # rule std-xxhash3
 tree
 printf '%s\n' 'const std = @import("std");' 'pub fn f(b: []const u8) u64 {' '    return std.hash.XxHash3.hash(0, b);' '}' > "$TMP/t/src/p.zig"

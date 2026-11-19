@@ -32,9 +32,7 @@ const chatPageUrl = server_mod.chatPageUrl;
 const handleCompletions = completions.handleCompletions;
 const handleConnection = server_mod.handleConnection;
 const handleResponses = responses_api.handleResponses;
-const isAnthropicRoute = anthropic.isAnthropicRoute;
 const jsonEscape = http.jsonEscape;
-const logHttpResponse = http.logHttpResponse;
 const mapGenerationError = generation_stream.mapGenerationError;
 const readAllFromPair = server_mod.readAllFromPair;
 const redactQueryKeys = http.redactQueryKeys;
@@ -88,6 +86,19 @@ pub fn startListener(host: []const u8, port: u16) (error{InvalidHost} || std.Io.
 
 /// The error envelope a request's API takes: OpenAI's `{"error":{...}}` or Anthropic's `{"type":"error",...}`.
 pub const Api = enum { openai, anthropic };
+
+/// The one predicate of a request's API: every path under `/v1/messages` is Anthropic's, its 401 and 404 included.
+pub fn apiOfPath(path: []const u8) Api {
+    return if (std.mem.eql(u8, path, "/v1/messages") or std.mem.startsWith(u8, path, "/v1/messages/")) .anthropic else .openai;
+}
+
+/// The API of a request head's target, its query left out.
+fn apiOfHead(head: []const u8) Api {
+    var words = std.mem.splitScalar(u8, head[0 .. std.mem.indexOf(u8, head, "\r\n") orelse head.len], ' ');
+    _ = words.next();
+    const target = words.next() orelse return .openai;
+    return apiOfPath(target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len]);
+}
 
 /// Bridge that lets a Conn route OpenAI-Responses output through a WebSocket
 /// transport instead of HTTP/SSE. When `Conn.ws_mode` is set, `sendResponse`
@@ -765,7 +776,8 @@ fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64
 }
 
 /// Reads one request: the head (up to 16 KB), then its `Content-Length` or chunked body. Null when no
-/// complete head arrived, the client stalled, or the body is over the cap (the 413 is already sent).
+/// complete head arrived, the client stalled, or the body is over the cap (the 413 is already sent). Sets `Conn.api`
+/// from the head before it can send anything, so every error of the request takes its API's envelope.
 pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64) !?RawRequest {
     const head_deadline = nowMsMonotonic(stream.io) + limit_ms;
     // Read HTTP headers first (up to 16KB), then allocate for the full body based on Content-Length.
@@ -784,6 +796,7 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
         if (std.mem.indexOf(u8, hdr_buf[0..total_read], "\r\n\r\n")) |he| {
             header_end_pos = he + 4;
             content_length = findContentLength(hdr_buf[0..he]);
+            stream.api = apiOfHead(hdr_buf[0..he]);
             break;
         }
     }
@@ -996,23 +1009,10 @@ pub fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
     return false;
 }
 
-/// Send a 401 with a Basic-auth challenge so browsers prompt for the key on the
-/// index + metrics pages; API clients read the JSON error body, in Anthropic's envelope on `/v1/messages`.
-pub fn sendUnauthorized(stream: *Conn, anthropic_shape: bool) !void {
-    const body = if (anthropic_shape)
-        "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"missing or invalid API key\"}}"
-    else
-        "{\"error\":{\"message\":\"missing or invalid API key\",\"type\":\"authentication_error\"}}";
-    logHttpResponse("401 Unauthorized", "application/json", body);
-    if (stream.ws_mode) |bridge| {
-        if (body.len > 0) try bridge.sendText(body);
-        return;
-    }
-    var hdr_buf: [512]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nWWW-Authenticate: Basic realm=\"sushi\"\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, x-api-key\r\n\r\n", .{body.len}) catch return error.Overflow;
-    try stream.writeAll(hdr);
-    stream.length_framed = true;
-    try stream.writeAll(body);
+/// A 401 with a Basic-auth challenge, so browsers prompt for the key on the index and metrics pages; API clients
+/// read the error envelope of the request's API.
+pub fn sendUnauthorized(allocator: std.mem.Allocator, stream: *Conn) !void {
+    try http.sendErrorResponseWithHeaders(allocator, stream, "401 Unauthorized", "authentication_error", "missing or invalid API key", 401, "WWW-Authenticate: Basic realm=\"sushi\"\r\n");
 }
 
 test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
@@ -1052,10 +1052,15 @@ pub fn serveOneForTest(request: []const u8) ![]u8 {
 /// `serveOneForTest` with the request sent in two parts: `rest` goes out once `head` has been answered with
 /// `100 Continue` (when it asks for one), as a client holding its body back does.
 pub fn serveSplitForTest(head: []const u8, rest: []const u8) ![]u8 {
-    const a = std.testing.allocator;
-    const reg = try ModelRegistry.init(a, std.testing.io, null, 1, 0, null);
+    const reg = try ModelRegistry.init(std.testing.allocator, std.testing.io, null, 1, 0, null);
     defer reg.deinit();
     reg.settings_path = "/nonexistent/sushi-test/model-settings.json";
+    return serveWithRegistryForTest(reg, head, rest);
+}
+
+/// `serveSplitForTest` with `reg` as the server's registry; null serves a server that has none yet.
+fn serveWithRegistryForTest(reg: ?*ModelRegistry, head: []const u8, rest: []const u8) ![]u8 {
+    const a = std.testing.allocator;
     const prev_registry = server_state.global_registry;
     defer server_state.global_registry = prev_registry;
     server_state.global_registry = reg;
@@ -2310,7 +2315,7 @@ test "count_tokens: routed like /v1/messages, with Anthropic-shaped refusals, be
     const t = std.testing;
     try t.expect(routeExists("/v1/messages/count_tokens"));
     try t.expect(isTextGenRoute("POST", "/v1/messages/count_tokens"));
-    try t.expect(isAnthropicRoute("/v1/messages/count_tokens"));
+    try t.expectEqual(Api.anthropic, apiOfPath("/v1/messages/count_tokens"));
 
     const prev_key = server_state.g_api_key;
     const prev_strict = server_state.g_api_key_strict;
@@ -2468,4 +2473,100 @@ test "a generation refusal reaches the client whole: the longest of each kind, i
         };
     }
     try t.expectEqual(@as(usize, 0), failures);
+}
+
+/// Whether `response` carries Anthropic's error envelope.
+fn anthropicEnvelope(response: []const u8) bool {
+    return std.mem.startsWith(u8, responseBody(response), "{\"type\":\"error\",\"error\":{\"type\":\"");
+}
+
+test "an error on an Anthropic route takes Anthropic's envelope, sent by the request reader or before any registry" {
+    const t = std.testing;
+    const previous = server_state.max_request_bytes.swap(4096, .monotonic);
+    defer server_state.max_request_bytes.store(previous, .monotonic);
+    var bad: usize = 0;
+    for ([_][2][]const u8{
+        .{ "413 oversize", "POST /v1/messages HTTP/1.1\r\nContent-Length: 999999\r\n\r\n{" },
+        .{ "501 coding", "POST /v1/messages HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n" },
+        .{ "417 expect", "POST /v1/messages HTTP/1.1\r\nContent-Length: 10\r\nExpect: 200-ok\r\n\r\n" },
+        .{ "400 chunk", "POST /v1/messages HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n" },
+        .{ "413 count_tokens", "POST /v1/messages/count_tokens?beta=true HTTP/1.1\r\nContent-Length: 999999\r\n\r\n{" },
+    }) |c| {
+        const response = try serveOneForTest(c[1]);
+        defer t.allocator.free(response);
+        if (!anthropicEnvelope(response)) {
+            bad += 1;
+            std.debug.print("{s}: {s}\n", .{ c[0], response[0..@min(response.len, 400)] });
+        }
+    }
+    const no_registry = try serveWithRegistryForTest(null, "POST /v1/messages HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", "");
+    defer t.allocator.free(no_registry);
+    if (!std.mem.startsWith(u8, no_registry, "HTTP/1.1 503 ") or !anthropicEnvelope(no_registry)) {
+        bad += 1;
+        std.debug.print("no registry: {s}\n", .{no_registry[0..@min(no_registry.len, 400)]});
+    }
+    try t.expectEqual(@as(usize, 0), bad);
+}
+
+test "every path under /v1/messages takes Anthropic's envelope, its 401 and its other errors alike" {
+    const t = std.testing;
+    const prev_key = server_state.g_api_key;
+    const prev_strict = server_state.g_api_key_strict;
+    defer {
+        server_state.g_api_key = prev_key;
+        server_state.g_api_key_strict = prev_strict;
+    }
+    var bad: usize = 0;
+    for ([_]?[]const u8{ null, "s3cret" }) |key| {
+        server_state.g_api_key = key;
+        server_state.g_api_key_strict = key != null;
+        for ([_][]const u8{
+            "POST /v1/messages/batches HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+            "GET /v1/messages/count_tokens HTTP/1.1\r\n\r\n",
+            "POST /v1/messages/count_tokens HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+            "POST /v1/messages HTTP/1.1\r\nContent-Length: 8\r\n\r\nnot json",
+        }) |request| {
+            const response = try serveOneForTest(request);
+            defer t.allocator.free(response);
+            if (!anthropicEnvelope(response)) {
+                bad += 1;
+                std.debug.print("key={any}: {s}\n", .{ key != null, response[0..@min(response.len, 400)] });
+            }
+        }
+    }
+    try t.expectEqual(@as(usize, 0), bad);
+}
+
+test "the 401 takes the error envelope every other error takes, and a HEAD's 401 carries no body" {
+    const t = std.testing;
+    const prev_key = server_state.g_api_key;
+    const prev_strict = server_state.g_api_key_strict;
+    defer {
+        server_state.g_api_key = prev_key;
+        server_state.g_api_key_strict = prev_strict;
+    }
+    server_state.g_api_key = "s3cret";
+    server_state.g_api_key_strict = true;
+    const chat = try serveOneForTest("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}");
+    defer t.allocator.free(chat);
+    try t.expectEqualStrings("{\"error\":{\"message\":\"missing or invalid API key\",\"type\":\"authentication_error\",\"param\":null,\"code\":401}}", responseBody(chat));
+    try t.expect(std.mem.indexOf(u8, chat, "WWW-Authenticate: Basic realm=\"sushi\"\r\n") != null);
+    const head = try serveOneForTest("HEAD /v1/models HTTP/1.1\r\n\r\n");
+    defer t.allocator.free(head);
+    try t.expect(std.mem.startsWith(u8, head, "HTTP/1.1 401 "));
+    try t.expectEqualStrings("", responseBody(head));
+}
+
+test "the metrics feed's refusal carries the error envelope the page reads error.message from" {
+    const t = std.testing;
+    const was = instr.process;
+    defer instr.process = was;
+    instr.process = .{};
+    const response = try serveOneForTest("GET /metrics.json HTTP/1.1\r\n\r\n");
+    defer t.allocator.free(response);
+    try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 503 "));
+    const E = struct { @"error": struct { message: []const u8 } };
+    const parsed = try std.json.parseFromSlice(E, t.allocator, responseBody(response), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try t.expect(std.mem.indexOf(u8, parsed.value.@"error".message, "--metrics") != null);
 }

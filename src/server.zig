@@ -1181,12 +1181,12 @@ pub fn handleConnection(
     // and parse out the optional `"model"` field. For Phase C we use the
     // default model for everything (only one is loaded), but the plumbing
     // is in place for Phase D's hot-load path.
+    const raw = (try http_conn.readRequestWithin(allocator, stream, REQUEST_READ_LIMIT_MS)) orelse return;
+    defer allocator.free(raw.buf);
     const registry = server_state.global_registry orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
-    const raw = (try http_conn.readRequestWithin(allocator, stream, REQUEST_READ_LIMIT_MS)) orelse return;
-    defer allocator.free(raw.buf);
     const total_read = raw.len;
     const header_end_pos = raw.header_end;
     const request = raw.buf[0..total_read];
@@ -1204,7 +1204,6 @@ pub fn handleConnection(
     const path = if (std.mem.indexOf(u8, raw_path, "?")) |qpos| raw_path[0..qpos] else raw_path;
     const request_body = if (total_read > header_end_pos) request[header_end_pos..total_read] else "";
     logHttpRequest(method, raw_path, request_body);
-    stream.api = if (anthropic.isAnthropicRoute(path)) .anthropic else .openai;
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic APIs AND the metrics feed) —
@@ -1222,7 +1221,7 @@ pub fn handleConnection(
         !http_conn.apiKeyAuthorized(request[0..header_end_pos], raw_path))
     {
         log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
-        try http_conn.sendUnauthorized(stream, std.mem.eql(u8, path, "/v1/messages") or std.mem.startsWith(u8, path, "/v1/messages/"));
+        try http_conn.sendUnauthorized(allocator, stream);
         return;
     }
 
@@ -1288,7 +1287,7 @@ pub fn handleConnection(
             // Quiet: dashboards poll this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled — start with --metrics, or POST /metrics/enable\"}");
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "metrics_disabled", "Metrics are off: start sushi with --metrics, or POST /metrics/enable", 503);
         }
         return;
     }
@@ -1303,7 +1302,7 @@ pub fn handleConnection(
         return;
     }
     if (std.mem.eql(u8, path, "/metrics/enable")) {
-        try handleMetricsEnable(stream);
+        try handleMetricsEnable(allocator, stream);
         return;
     }
     if (std.mem.eql(u8, path, "/v1/update")) {
@@ -2141,11 +2140,11 @@ fn busyForUpdate(io: std.Io) bool {
 /// SIGTERM path; main then replaces the process with the updater (`update.relaunchIfRequested`).
 /// Turns metrics on for the running server; 200 whether this call did it or it was already on. Counters start
 /// from zero at the moment of the first enable.
-fn handleMetricsEnable(stream: *http_conn.Conn) !void {
+fn handleMetricsEnable(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
     const changed = instr.process.enable();
     startGaugeSampler() catch |err| {
         log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
-        return sendResponse(stream, "500 Internal Server Error", "application/json", "{\"error\":\"metrics enabled but the gauge sampler did not start; retry\"}");
+        return sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "Metrics are on, but the gauge sampler did not start: retry", 500);
     };
     if (changed) log.info("Prometheus metrics: ENABLED at runtime (POST /metrics/enable)\n", .{});
     try sendResponse(stream, "200 OK", "application/json", if (changed) "{\"metrics\":true,\"already_enabled\":false}" else "{\"metrics\":true,\"already_enabled\":true}");
@@ -2188,7 +2187,7 @@ fn handleUpdate(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: 
     };
     if (update_mod.guard(ask)) |r| {
         log.info("[update] POST /v1/update -> {d}: {s}\n", .{ r.code, r.message });
-        if (r.code == 401) return http_conn.sendUnauthorized(stream, false);
+        if (r.code == 401) return http_conn.sendUnauthorized(allocator, stream);
         return sendErrorResponse(allocator, stream, r.status, r.kind, r.message, r.code);
     }
     const body = try std.fmt.allocPrint(allocator, "{{\"status\":\"updating\",\"from\":\"{s}\",\"to\":\"{s}\"}}", .{ update_mod.version, latest.? });

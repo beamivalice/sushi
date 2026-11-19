@@ -235,6 +235,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   fixture leaves unset (`draining`), so it reads an earlier test's stack and can refuse; start from `submitTestScheduler`.
   `entry-checkout` flags a write of a hot-cache entry's `checkout` (assigned, set in a literal, captured by pointer,
   written through `.?`) outside `prefix_cache.zig`'s `beginCheckout`, `donateCheckout` and `endCheckout`, tests exempt.
+  `error-body-literal` flags a string literal that spells an error envelope (`{"error":`, `"type":"error"`) outside
+  `src/http.zig`, whose `sendError` picks the envelope by the request's API; tests and `*_test.zig` files exempt.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its
