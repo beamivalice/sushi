@@ -499,6 +499,11 @@ large share alone.
 - Keeping the pool across requests (no trim at the first decode after a prefill, at the request's end or under a
   forward's cap) leaves a request's first chunk with the same layer-0 gaps (24 to 36 ms each): host work at a
   request's start, not fresh Metal buffers.
+- A Metal queue with room for 512 uncompleted command buffers (the default holds 64): GPU idle 370 against 371 ms a
+  29k request, gaps over 1 ms 358 against 358 ms.
+- The draft's Markov bias over the stage logits' top 512 instead of the vocabulary (it reads the 66 MB bias table
+  once a position): the first pick agreed with the full chain in 661 of 831 drafts, all five in 264. The bias lifts a
+  token from outside the top 512 too often to keep the drafts.
 
 <a id="m5u-chunk-handoff"></a>
 **The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
