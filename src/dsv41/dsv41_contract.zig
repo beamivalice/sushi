@@ -32,6 +32,10 @@ pub fn prepare(a: std.mem.Allocator, config: *model_mod.ModelConfig, dir: []cons
 /// with `ignore_eos`.
 pub const server_long_replies = false;
 
+/// The SSD budget a server test's load names (`ssd_budget_gb` in its model-settings.json): a Mac under 96 GB has no
+/// RAM-tier default and refuses the load by name (`expert_streaming_required`), and the tiny's experts fit 1 GB whole.
+pub const server_ssd_budget_gb: u32 = 1;
+
 /// What a server test serves (`src/server_test.zig`), in `dir`: the DSpark tiny's weights, and a byte-level tokenizer
 /// of the release's specials and the tiny's 96 ids, which the fixture lacks.
 pub fn serverDir(dir: std.Io.Dir) !void {

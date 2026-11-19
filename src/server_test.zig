@@ -62,7 +62,8 @@ fn startClient() anyerror!std.Thread {
     return std.Thread.spawn(.{}, clientMain, .{});
 }
 
-const Arch = struct { name: []const u8, tmp: testing.TmpDir };
+/// `ssd_budget_gb`: what the fixture's load names in its model-settings.json (`cooler_contract.server_ssd_budget_gb`).
+const Arch = struct { name: []const u8, tmp: testing.TmpDir, ssd_budget_gb: ?u32 = null };
 
 /// What a test asks of a fixture beyond being served.
 const Needs = struct {
@@ -80,20 +81,20 @@ fn eachArch(max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void)
         const M = registry.Mod(t);
         if (comptime @hasDecl(M, "cooler_contract") and @hasDecl(M.cooler_contract, "serverDir")) if (!needs.long_replies or M.cooler_contract.server_long_replies) {
             var tmp = testing.tmpDir(.{});
-            archs[i] = .{ .name = @tagName(t), .tmp = tmp };
+            archs[i] = .{ .name = @tagName(t), .tmp = tmp, .ssd_budget_gb = if (@hasDecl(M.cooler_contract, "server_ssd_budget_gb")) M.cooler_contract.server_ssd_budget_gb else null };
             try tmp.dir.createDirPath(io, "m");
             var m = try tmp.dir.openDir(io, "m", .{});
             defer m.close(io);
             try M.cooler_contract.serverDir(m);
         };
     }
-    for (&archs) |*a| if (a.*) |*x| withServer(&x.tmp, max_concurrent, body) catch |e| {
+    for (&archs) |*a| if (a.*) |*x| withServer(&x.tmp, x.ssd_budget_gb, max_concurrent, body) catch |e| {
         if (e != error.SkipZigTest) std.debug.print("server test on {s}: {s}\n", .{ x.name, @errorName(e) });
         return e;
     };
 }
 
-fn withServer(tmp: *testing.TmpDir, max_concurrent: u32, body: *const fn () anyerror!void) !void {
+fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, body: *const fn () anyerror!void) !void {
     const a = Poison.allocator();
     try tmp.dir.createDirPath(io, "home/.sushi");
     try tmp.dir.createDirPath(io, "cache");
@@ -121,6 +122,11 @@ fn withServer(tmp: *testing.TmpDir, max_concurrent: u32, body: *const fn () anye
     defer reg.deinit();
     var settings_buf: [1024]u8 = undefined;
     reg.settings_path = try std.fmt.bufPrint(&settings_buf, "{s}/.sushi/model-settings.json", .{home});
+    if (ssd_budget_gb) |gb| {
+        var sb: [1200]u8 = undefined;
+        const settings = try std.fmt.bufPrint(&sb, "{{\"{s}\":{{\"ssd_budget_gb\":{d}}}}}", .{ model_dir, gb });
+        try tmp.dir.writeFile(io, .{ .sub_path = "home/.sushi/model-settings.json", .data = settings });
+    }
     const entry = try reg.registerStub("tiny", model_dir, 90 << 20);
     try reg.setDefault("tiny");
 
@@ -756,18 +762,9 @@ fn wsCompletedTurn(fd: std.posix.fd_t) !void {
     }
 }
 
-/// The model answers on this box: a fixture it cannot load (the DeepSeek tiny on a 32 GB Mac) answers before any upgrade.
-fn modelServes() !bool {
-    var b: [512]u8 = undefined;
-    const warm = try request("POST", "/v1/completions", try completionBody(&b, "hi", 2, false));
-    defer gpa.free(warm);
-    return std.mem.startsWith(u8, warm, "HTTP/1.1 200");
-}
-
 test "server: a Responses WebSocket message sent as a binary frame is answered by an error frame and a 1003 close, never silence" {
     try eachArch(4, .{}, struct {
         fn run() !void {
-            if (!try modelServes()) return;
             const fd = try wsConnect();
             defer _ = std.c.close(fd);
             const text = "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}";
@@ -788,7 +785,6 @@ test "server: a Responses WebSocket message sent as a binary frame is answered b
 test "server: a WebSocket upgrade the server cannot complete is answered 400, never closed bare" {
     try eachArch(4, .{}, struct {
         fn run() !void {
-            if (!try modelServes()) return;
             const fd = try connect();
             defer _ = std.c.close(fd);
             // No Sec-WebSocket-Key.
@@ -812,7 +808,6 @@ fn readLimit(fd: std.posix.fd_t, sec: i64) void {
 test "server: a shutdown closes a WebSocket idle between turns with 1001 and an idle connection at once, and serve runs its teardown" {
     try eachArch(4, .{}, struct {
         fn run() !void {
-            if (!try modelServes()) return;
             // Between turns, as Codex keeps one.
             const ws = try wsConnect();
             defer _ = std.c.close(ws);
@@ -838,7 +833,6 @@ test "server: a WebSocket idle between turns does not hold its model against an 
     defer scheduler_mod.Scheduler.unload_drain_ms = was;
     try eachArch(4, .{}, struct {
         fn run() !void {
-            if (!try modelServes()) return;
             const ws = try wsConnect();
             defer _ = std.c.close(ws);
             try wsCompletedTurn(ws);
@@ -857,7 +851,6 @@ test "server: a WebSocket idle between turns does not hold its model against an 
 test "server: a WebSocket turn routes its own model: an unregistered model path is refused in its error frame, as its HTTP route refuses it" {
     try eachArch(4, .{}, struct {
         fn run() !void {
-            if (!try modelServes()) return;
             const http_answer = try request("POST", "/v1/responses", "{\"model\":\"/nonexistent/sushi-test/model\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}");
             defer gpa.free(http_answer);
             if (!std.mem.startsWith(u8, http_answer, "HTTP/1.1 404")) return error.HttpRouteServedIt;

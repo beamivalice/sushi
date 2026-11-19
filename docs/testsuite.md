@@ -272,6 +272,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
   A cell under a declared wired limit sets it with `setWiredFloor`, whose limit is the box's RAM (a floor is at most
   the RAM less the margin) and which refuses a floor the bill would not read: a 120,000 MB limit declared none below
   about 118 GB of RAM, so its cells tested nothing there.
+  A tiny that streams its experts names the SSD budget its load takes (`cooler_contract.server_ssd_budget_gb`, written
+  to the test's model-settings.json): a box under 96 GB has no RAM-tier default, and its cells would test a refusal.
 - Integration scripts in `tests/` cover only what HTTP shows and a unit test cannot reach.
 
 ## How a test is built
