@@ -75,6 +75,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   on the first append (`KVCache.copiesSharedRestore`), because the admission bills the copy at the reservation: a 4k
   chat restored from an 80k entry held the 80k buffer (mlx-serve #492), and a donor that decoded past its own
   reservation was copied past the bill. A donated checkout owns its buffers (`adoptRestored`) and appends in place.
+  An entry whose MLX buffers sit off the page grid (a trimmed copy) takes in place only the rows it holds
+  (`inPlaceCapacity`): its next write grows it onto the grid once, and the warm bill credits those rows alone.
 - **A fallible re-init BEHIND a `deinit` leaves a freed object on the error path** — build first, then swap
   (`KVCache.reinit`). A handle freed before a fallible op is reset AT the free (`updateDense`).
 - A lazily copied side-channel state is not in the residual's graph: name the owned copy in the cadence eval vector

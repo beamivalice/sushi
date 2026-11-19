@@ -120,6 +120,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   a warm cache restored at its own length no longer grows past its bill either.
 - **MLX-route memory: a conversation restored from the SSD cache is held once**: the restore copied its whole cache at
   each chunk it read, so it briefly held about twice the conversation's cache before the request was admitted.
+- **MLX-route speed: a turn that reuses a trimmed cached conversation no longer copies its cache every token**: when
+  the turn diverged before the cached end, each new token copied the whole cache until it caught up.
 - **APIs and server**: a shutdown refuses the requests still waiting from the moment it is asked, instead of serving
   those it reaches within the next second.
 - **Stopping the server during an unload answers the requests waiting on that model**: a request sent while an unload

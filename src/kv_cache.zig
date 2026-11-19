@@ -694,7 +694,7 @@ pub const KVCache = struct {
         for (self.entries) |*entry| {
             if (!entry.initialized or entry.ringed) continue;
             const cur_cap = bufferCapacity(entry.keys);
-            if (cur_cap >= self.reserve_tokens) continue;
+            if (inPlaceCapacity(entry) >= self.reserve_tokens) continue;
             const new_cap: c_int = @intCast(self.grownCapacity(entry, cur_cap, self.reserve_tokens, &entryRowBytes(entry, n), s));
             const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
             for (views) |view| {
@@ -726,7 +726,7 @@ pub const KVCache = struct {
             if (!entry.initialized or entry.ringed or entry.shared_view) continue;
             const cur_cap = bufferCapacity(entry.keys);
             const needed = entry.offset + rows;
-            if (needed <= cur_cap) continue;
+            if (needed <= inPlaceCapacity(entry)) continue;
             const new_cap: c_int = @intCast(self.grownCapacity(entry, cur_cap, needed, &entryRowBytes(entry, n), s));
             const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
             for (views) |view| {
@@ -1017,7 +1017,7 @@ pub const KVCache = struct {
         const vsc_last = vsc_shape[3];
 
         const shared = self.copiesSharedRestore(entry, entry.offset + new_len);
-        const will_grow = !entry.initialized or shared or entry.offset + new_len > bufferCapacity(entry.keys);
+        const will_grow = !entry.initialized or shared or entry.offset + new_len > inPlaceCapacity(entry);
         if (entry.initialized and entry.shared_view and !will_grow) try cowAffineBuffers(s, entry);
         entry.shared_view = false;
 
@@ -1131,7 +1131,7 @@ pub const KVCache = struct {
         const v_head_dim = mlx.getShape(new_v)[3];
 
         const shared = self.copiesSharedRestore(entry, entry.offset + new_len);
-        const will_grow = !entry.initialized or shared or entry.offset + new_len > bufferCapacity(entry.keys);
+        const will_grow = !entry.initialized or shared or entry.offset + new_len > inPlaceCapacity(entry);
         if (entry.initialized and entry.shared_view and !will_grow) {
             const k_owned = try materializedOwnedCopy(s, entry.keys);
             _ = mlx.mlx_array_free(entry.keys);
@@ -1263,6 +1263,19 @@ pub const KVCache = struct {
         return @intCast(shape[2]);
     }
 
+    /// Rows an entry takes in place: its capacity, or only the rows it holds when one of its MLX buffers sits off the
+    /// page grid (a restore's exact copy, `trimmedCopy`), where every write could copy the whole buffer: the next write
+    /// grows it onto the grid (`heldRows`) once. A ring keeps its fixed rows.
+    fn inPlaceCapacity(entry: *const KVCacheEntry) usize {
+        const cap = bufferCapacity(entry.keys);
+        if (entry.ringed) return cap;
+        for ([_]mlx.mlx_array{ entry.keys, entry.values, entry.keys_scales, entry.keys_biases, entry.values_scales, entry.values_biases }) |buf| {
+            if (buf.ctx == null or mlx.mlx_array_ndim(buf) < 3 or mlx.engine.isOurs(buf)) continue;
+            if (!mlx_pages.onGrid(@as(u64, mlx.mlx_array_size(buf)) * mlx.mlx_array_itemsize(buf))) return entry.offset;
+        }
+        return cap;
+    }
+
     /// Pure half of `residentCapacityTokens`: the minimum capacity across the entries that
     /// hold one, 0 when none does. An uninitialized entry is skipped, never a veto: on a
     /// hybrid trunk only the attention layers ever call `update` (12 of 48 on qwen4_exp).
@@ -1288,7 +1301,7 @@ pub const KVCache = struct {
     /// layers, since the credit must be provable for every buffer the prefill writes.
     pub fn residentCapacityTokens(self: *const KVCache) usize {
         var fold = CapacityFold{};
-        for (self.entries) |*e| fold.add(if (e.initialized and !e.ringed) bufferCapacity(e.keys) else null);
+        for (self.entries) |*e| fold.add(if (e.initialized and !e.ringed) inPlaceCapacity(e) else null);
         return fold.result();
     }
 
@@ -3638,4 +3651,78 @@ test "a Flash-Next cache restored at its rows or cold holds no more rows than it
         if (held > billed or billed > bills.cacheCapacityTokens(&cfg, ctx, 0, chunk, ctx, 0, 8)) over += 1;
     }
     try testing.expectEqual(@as(usize, 0), over);
+}
+
+/// Empties MLX's pool and leaves 16 free buffers of each page count in `pages`.
+fn seedPoolPages(s: mlx.mlx_stream, pages: []const c_int) !void {
+    try mlx.check(mlx.mlx_synchronize(s));
+    _ = mlx.mlx_clear_cache();
+    var held: [64]mlx.mlx_array = undefined;
+    var n: usize = 0;
+    for (pages) |p| for (0..16) |_| {
+        held[n] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&held[n], &[_]c_int{p * 16384}, 1, .uint8, s));
+        try mlx.check(mlx.mlx_array_eval(held[n]));
+        n += 1;
+    };
+    try mlx.check(mlx.mlx_synchronize(s));
+    for (held[0..n]) |h| _ = mlx.mlx_array_free(h);
+}
+
+/// A 1,100-row kv8 layer (2 heads of 256) trimmed to its rows (`trimmedCopy`, as a byte-budget trim or an
+/// SSD restore leaves it), restored, clamped 30 rows back, then appended a row at a time inside its capacity. How many
+/// of those appends moved any of the six buffers (a copy of the whole buffer).
+fn clampedRestoreMoves(donated: bool) !usize {
+    const s = mlx.gpuStream();
+    var donor = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
+    defer donor.deinit();
+    var rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_ones(&rows, &[_]c_int{ 1, 2, 1100, 256 }, 4, .bfloat16, s));
+    var one = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(one);
+    try mlx.check(mlx.mlx_ones(&one, &[_]c_int{ 1, 2, 1, 256 }, 4, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(one));
+    var dv = try donor.update(0, rows, rows, s, 0);
+    dv.deinit();
+    donor.evalState();
+    var snap = try donor.snapshot();
+    defer snap.deinit();
+    // Codes 563,200 B (35 pages), scales 17,600 B (2 pages): free buffers one page past each.
+    try seedPoolPages(s, &.{ 36, 3 });
+    var trimmed = try snap.trimmedCopy(1100, null, s);
+    defer trimmed.deinit();
+    var warm = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
+    defer warm.deinit();
+    try warm.restore(&trimmed);
+    if (donated) {
+        warm.adoptRestored();
+        trimmed.releaseHandles();
+    }
+    try warm.truncate(1070, s);
+    var moved: usize = 0;
+    var last: [6]?[*]const u8 = @splat(null);
+    for (0..6) |step| {
+        var ov = try warm.update(0, one, one, s, 0);
+        ov.deinit();
+        warm.evalState();
+        try mlx.check(mlx.mlx_synchronize(s));
+        const e = &warm.entries[0];
+        const bufs = [_]mlx.mlx_array{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases };
+        var any = false;
+        for (bufs, &last) |b, *p| {
+            const now = mlx.mlx_array_data_uint8(b);
+            if (step > 0 and now != p.*) any = true;
+            p.* = now;
+        }
+        if (any) moved += 1;
+    }
+    return moved;
+}
+
+test "a trimmed restore clamped below its rows appends in place when MLX's pool holds buffers a page past it" {
+    try mlx.requireGpu();
+    const donated = try clampedRestoreMoves(true);
+    const shared = try clampedRestoreMoves(false);
+    try testing.expectEqual(@as(usize, 0), donated + shared);
 }
