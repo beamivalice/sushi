@@ -4973,6 +4973,80 @@ test "cooler contract: a DeepSeek decode whose read-back of a released pool is r
     }
 }
 
+/// A box with room for every forward. At a request's first read, after its first forward installed its cap, it records
+/// the room that cap leaves, the need it was installed for, and whether a stranded layer was healed by then.
+const HealProbe = struct {
+    var engine: ?*@import("expert_stream.zig").Engine = null;
+    var read: bool = false;
+    var room: u64 = 0;
+    var need: u64 = 0;
+    var healed: bool = false;
+
+    fn headroom(_: *const model_mod.ModelConfig) @import("bills.zig").Headroom {
+        if (!read) {
+            read = true;
+            room = (mlx.engine.poolLimit() orelse std.math.maxInt(u64)) -| (mlx.engine.poolTotal() - mlx.engine.poolFree());
+            need = @import("dsv41/dsv41_borrow.zig").forward_need;
+            healed = engine.?.grouped_union.len != 0;
+        }
+        return .{ .live = 1 << 40 };
+    }
+};
+
+test "cooler contract: a DeepSeek layer left released with no union workspace is healed under the resting cap a request's end leaves, before the next forward installs its cap, which keeps the forward's whole bill" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const ids = try D.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(D, dir, true);
+    defer _ = ld.close();
+    const borrow = @import("dsv41/dsv41_borrow.zig");
+    const engine = arch_handle.trunk(ld.h).expert_stream.?;
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    var prompt: [80]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 2) % ids.len];
+    var restored: u32 = 0;
+    // A request's end leaves its resting cap in force: the cap the next request's heal runs under.
+    var first = try sv.request(&prompt, 4, &restored);
+    first.deinit(a);
+
+    // Every host allocation from the swept one on fails, so a release whose workspace fails cannot take its pool back.
+    const last: u16 = @intCast(engine.layers.len - 1);
+    const gpa = engine.allocator;
+    defer engine.allocator = gpa;
+    var fail_index: usize = 0;
+    while (!engine.isBorrowed(last) or engine.grouped_union.len != 0) : (fail_index += 1) {
+        if (engine.isBorrowed(last)) try engine.restoreLayer(last);
+        var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        engine.allocator = failing.allocator();
+        _ = engine.borrowLayer(last) catch 0;
+        engine.allocator = gpa;
+        try testing.expect(fail_index < 10_000);
+    }
+
+    HealProbe.engine = engine;
+    HealProbe.read = false;
+    defer HealProbe.engine = null;
+    borrow.headroom_fn = &HealProbe.headroom;
+    defer borrow.headroom_fn = null;
+    prompt[0] = ids[1];
+    var second = try sv.request(&prompt, 4, &restored);
+    second.deinit(a);
+    try testing.expect(HealProbe.read and HealProbe.healed);
+    try testing.expect(!engine.isBorrowed(last));
+    // The heal's lasting buffers are in use before the forward's cap goes in, so the cap's room is its need, whole.
+    try testing.expectEqual(HealProbe.need, HealProbe.room);
+}
+
 /// `LeaseProbe` that also records, at a decode forward's reads (one before each read-back), the pool's bytes in use and
 /// the room its cap leaves.
 const ReadBackProbe = struct {
