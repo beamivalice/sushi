@@ -6869,12 +6869,13 @@ pub const LoadMemoryRefusal = struct {
     /// ceiling, or the ssd budget with its planned KV against the GPU limit as a whole (no RAM term, nothing beside).
     pub const Check = enum { preflight, fit, budget };
 
+    /// `from_flag`: the launch flag set the value, so it outranks the model's setting and only a restart changes it.
     pub const Knob = union(enum) {
         none,
         /// The requested context and the largest that fits (0: none does).
-        ctx_size: struct { requested: u64, fits: u32 },
+        ctx_size: struct { requested: u64, fits: u32, from_flag: bool = false },
         /// The ssd budget in GiB and the largest the planner fits (0: none does).
-        ssd_budget: struct { gb: u64, fits_gb: u64 },
+        ssd_budget: struct { gb: u64, fits_gb: u64, from_flag: bool = false },
     };
 
     /// The `iogpu.wired_limit_mb` that holds the load, or null when this Mac cannot wire that much.
@@ -6935,8 +6936,18 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
     }
     switch (r.knob) {
         .none => {},
-        .ctx_size => |c| if (c.fits > 0) try w.print("- Lower --ctx-size to {d} or less (it is {d}).\n", .{ c.fits, c.requested }),
-        .ssd_budget => |b| if (b.fits_gb > 0) try w.print("- Lower --ssd-budget-gb to {d} (it is {d}): a smaller expert cache, slower decode.\n", .{ b.fits_gb, b.gb }),
+        .ctx_size => |c| if (c.fits > 0) {
+            if (c.from_flag)
+                try w.print("- Restart sushi with --ctx-size {d} or less (it is {d}; the flag outranks Context length in Settings).\n", .{ c.fits, c.requested })
+            else
+                try w.print("- Lower Context length in this model's settings (--ctx-size) to {d} or less (it is {d}).\n", .{ c.fits, c.requested });
+        },
+        .ssd_budget => |b| if (b.fits_gb > 0) {
+            if (b.from_flag)
+                try w.print("- Restart sushi with --ssd-budget-gb {d} (it is {d}; the flag outranks Memory for SSD streaming (GiB) in Settings): a smaller expert cache, slower decode.\n", .{ b.fits_gb, b.gb })
+            else
+                try w.print("- Lower Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to {d} (it is {d}): a smaller expert cache, slower decode.\n", .{ b.fits_gb, b.gb });
+        },
     }
     try w.print("- Use a smaller pack of this model.", .{});
     if (r.check != .preflight) return;
@@ -6972,11 +6983,22 @@ pub fn smallestBudgetGb(asked_gb: u64, planner: anytype) ?BudgetFloor {
 }
 
 /// The refusal of an ssd budget below what a streamed pack holds beside two cache slots per layer.
-pub fn ssdBudgetBelowText(buf: []u8, asked_gb: u64, floor: ?BudgetFloor) []const u8 {
-    const head = "This model's SSD streaming memory is too small to load it.\nMemory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is {d}";
-    const f = floor orelse return std.fmt.bufPrint(buf, head ++ ", and no setting up to 512 holds this pack beside its expert cache: use a smaller pack.", .{asked_gb}) catch "This model's SSD streaming memory is too small to load it.";
-    const u = MemUnit.of(f.held);
-    return std.fmt.bufPrint(buf, head ++ ", and this pack holds {f} beside its expert cache, which needs room for two experts per layer. Set it to {d} or more.", .{ asked_gb, Mem.need(f.held, u), f.gb }) catch "This model's SSD streaming memory is too small to load it.";
+/// `from_flag`: `--ssd-budget-gb` set it, which outranks the model's setting.
+pub fn ssdBudgetBelowText(buf: []u8, asked_gb: u64, floor: ?BudgetFloor, from_flag: bool) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    writeSsdBudgetBelow(&w, asked_gb, floor, from_flag) catch return "This model's SSD streaming memory is too small to load it.";
+    return w.buffered();
+}
+
+fn writeSsdBudgetBelow(w: *std.Io.Writer, asked_gb: u64, floor: ?BudgetFloor, from_flag: bool) std.Io.Writer.Error!void {
+    try w.print("This model's SSD streaming memory is too small to load it.\n", .{});
+    if (from_flag)
+        try w.print("--ssd-budget-gb (which outranks Memory for SSD streaming (GiB) in Settings) is {d}", .{asked_gb})
+    else
+        try w.print("Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is {d}", .{asked_gb});
+    const f = floor orelse return w.print(", and no setting up to 512 holds this pack beside its expert cache: use a smaller pack.", .{});
+    try w.print(", and this pack holds {f} beside its expert cache, which needs room for two experts per layer. ", .{Mem.need(f.held, MemUnit.of(f.held))});
+    if (from_flag) try w.print("Restart sushi with --ssd-budget-gb {d} or more.", .{f.gb}) else try w.print("Set it to {d} or more.", .{f.gb});
 }
 
 /// PURE: the largest whole-GiB ssd budget below `budget` whose streamed load fits `avail`, priced by the load's own
@@ -7406,7 +7428,7 @@ test "a refused load's message names the bound in words, the shortfall and the b
     try has(free_text, "only 12.0 GB of RAM is free right now (other apps and the system hold the rest); your GPU memory limit would allow 28.0 GB");
     try has(free_text, "Free about 8.0 GB more.");
     try has(free_text, "To load it:\n- Quit other apps or unload another model to free about 8.0 GB, then retry");
-    try has(free_text, "- Lower --ctx-size to 65536 or less (it is 262144).");
+    try has(free_text, "- Lower Context length in this model's settings (--ctx-size) to 65536 or less (it is 262144).");
     try testing.expect(std.mem.endsWith(u8, free_text, "the load can then fail later or stall the Mac."));
     // The declared limit binds: its floor less 10 GB loaded leaves 18 GB; the raise holds the load, the loaded and the margin.
     const by_floor = sushiAvailable(40 * gib, 0, 29 * gib, 10 * gib, 28 * gib);
@@ -7415,7 +7437,7 @@ test "a refused load's message names the bound in words, the shortfall and the b
     try has(floor_text, "the GPU memory limit (iogpu.wired_limit_mb = 29696 MB) leaves 18.0 GB beside what is already loaded: about 2.0 GB short.");
     // The command the Settings page builds (`#wiredCmd`): the GPU limit and both user wire limits, from one rule.
     try has(floor_text, "To load it:\n- Raise the GPU memory limit in Terminal: sudo sysctl iogpu.wired_limit_mb=31800 vm.global_user_wire_limit=33344716800 vm.user_wire_limit=33344716800 (it resets at reboot), then restart sushi: the limit is read when sushi starts.");
-    try has(floor_text, "- Lower --ssd-budget-gb to 15 (it is 18)");
+    try has(floor_text, "- Lower Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to 15 (it is 18)");
     // A limit this Mac cannot wire is not offered.
     const no_raise = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = by_floor, .wired_limit_mb = 29696, .wired_beside = 11 * gib, .total_ram = 32 * gib });
     try has(no_raise, "This Mac cannot give the GPU enough memory for it");
@@ -7589,7 +7611,7 @@ test "an ssd budget below what a streamed pack holds is refused naming the small
         }
     };
     var buf: [1024]u8 = undefined;
-    const text = ssdBudgetBelowText(&buf, 12, smallestBudgetGb(12, Planner{}));
+    const text = ssdBudgetBelowText(&buf, 12, smallestBudgetGb(12, Planner{}), false);
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is 12, and this pack holds 19.5 GB beside its expert cache") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Set it to 21 or more.") != null);
@@ -7609,4 +7631,20 @@ test "a context refusal whose prompt alone does not fit names no zero maximum, a
     try testing.expect(std.mem.indexOf(u8, text, "Maximum context: 0") == null);
     try testing.expect(std.mem.indexOf(u8, text, "the request needs 277 MB and 274 MB is available, and the prompt alone does not fit.") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\n- Quit other apps or unload another model on the Models page, then retry.") != null);
+}
+
+test "a load refusal names the setting it asks to lower by its Settings label and flag, and the flag alone when the flag set it" {
+    const gib: u64 = 1 << 30;
+    var buf: [2048]u8 = undefined;
+    const avail = sushiAvailable(12 * gib, 0, 29 * gib, 0, 28 * gib);
+    const has = struct {
+        fn f(text: []const u8, part: []const u8) !void {
+            errdefer std.debug.print("missing \"{s}\" in:\n{s}\n", .{ part, text });
+            try testing.expect(std.mem.indexOf(u8, text, part) != null);
+        }
+    }.f;
+    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ctx_size = .{ .requested = 262144, .fits = 65536 } } }), "- Lower Context length in this model's settings (--ctx-size) to 65536 or less (it is 262144).");
+    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ctx_size = .{ .requested = 262144, .fits = 65536, .from_flag = true } } }), "- Restart sushi with --ctx-size 65536 or less (it is 262144; the flag outranks Context length in Settings).");
+    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15 } } }), "- Lower Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to 15 (it is 18)");
+    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15, .from_flag = true } } }), "- Restart sushi with --ssd-budget-gb 15 (it is 18; the flag outranks Memory for SSD streaming (GiB) in Settings)");
 }

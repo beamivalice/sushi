@@ -421,12 +421,12 @@ pub fn refusalText(buf: []u8, rows: u64, seq: u64, need: u64, have: u64, chunk_f
 fn writeRefusal(w: *std.Io.Writer, rows: u64, seq: u64, need: u64, have: u64, chunk_fits: u64) std.Io.Writer.Error!void {
     const u = Mem.unitOf(need, have);
     try w.print("This prompt ran out of GPU memory partway through its prefill.\n", .{});
-    try w.print("Its {d}-token chunk, tokens {d} to {d}, needs {f}, and the free memory with every expert-cache pool the prefill can borrow holds {f}: {f} short. The chunks before it ran.\n", .{
+    try w.print("Its {d}-token chunk, tokens {d} to {d}, needs {f}, and the free memory, with the expert cache lent to the prefill, holds {f}: {f} short. The chunks before it ran.\n", .{
         rows, seq -| rows, seq, Mem.need(need, u), Mem.have(have, u), Mem.short(need, have, u),
     });
     try w.print("To serve it:\n", .{});
-    if (chunk_fits > 0) try w.print("- Lower --prefill-chunk to {d}: a narrower chunk needs less memory at this length.\n", .{chunk_fits});
-    try w.print("- Retry when other requests finish or other apps quit: the memory they hold comes back.", .{});
+    if (chunk_fits > 0) try w.print("- Restart sushi with --prefill-chunk {d} (a launch flag; Settings has none): a narrower chunk needs less memory at this length.\n", .{chunk_fits});
+    try w.print("- Quit other apps or unload another model on the Models page, then retry: the memory they hold comes back.", .{});
     // A first chunk has no shorter prompt the chunks before it prove.
     if (seq > rows) try w.print("\n- Shorten the prompt to {d} tokens or fewer: the chunks up to there fit.", .{seq - rows});
 }
@@ -1303,8 +1303,8 @@ test "dsv41 borrow: a forward refused mid-prefill names its chunk, the shortfall
         "This prompt ran out of GPU memory partway through its prefill.\n",
         "Its 2048-token chunk, tokens 4096 to 6144, needs 5.0 GB",
         "holds 4.5 GB: 0.5 GB short. The chunks before it ran.\n",
-        "To serve it:\n- Lower --prefill-chunk to 1024",
-        "- Retry when other requests finish",
+        "To serve it:\n- Restart sushi with --prefill-chunk 1024 (a launch flag; Settings has none)",
+        "- Quit other apps or unload another model on the Models page, then retry",
         "- Shorten the prompt to 4096 tokens or fewer",
     }) |part| {
         errdefer std.debug.print("missing \"{s}\" in:\n{s}\n", .{ part, text });

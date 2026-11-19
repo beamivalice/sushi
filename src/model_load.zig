@@ -1854,7 +1854,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (e == error.SsdBudgetBelowResident) {
                 const floor = bills.smallestBudgetGb(budget.bytes >> 30, PlanFloor{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant_bytes });
                 var text_buf: [512]u8 = undefined;
-                const text = bills.ssdBudgetBelowText(&text_buf, budget.bytes >> 30, floor);
+                const text = bills.ssdBudgetBelowText(&text_buf, budget.bytes >> 30, floor, budget.origin == .flag);
                 log.err("{s}\n", .{text});
                 if (@TypeOf(params) == *LoadRequest) params.recordRefusalText(text);
             }
@@ -1896,7 +1896,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const asked = params.config.expert_ssd_budget_bytes;
             if (asked > 0) {
                 const planner = FitPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant_bytes, .readings = refused.readings };
-                refusal.knob = .{ .ssd_budget = .{ .gb = asked >> 30, .fits_gb = bills.streamedBudgetThatFits(asked, 0, planner) } };
+                refusal.knob = .{ .ssd_budget = .{ .gb = asked >> 30, .fits_gb = bills.streamedBudgetThatFits(asked, 0, planner), .from_flag = budget.origin == .flag } };
             }
             var text_buf: [2048]u8 = undefined;
             const text = bills.loadMemoryRefusalText(&text_buf, refusal);
@@ -1998,11 +1998,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 params.entry.memory_context_refusal = context;
                 if (@TypeOf(params) == *LoadRequest) params.memory_context_refusal = context;
                 sch.registry.mutex.unlock(sch.io);
-                refusal.knob = .{ .ctx_size = .{ .requested = b.requested_context, .fits = maximum } };
+                refusal.knob = .{ .ctx_size = .{ .requested = b.requested_context, .fits = maximum, .from_flag = sch.ctx_size_flag > 0 } };
             } else if (params.config.expert_streaming and params.config.expert_ssd_budget_bytes > 0) {
                 const budget = params.config.expert_ssd_budget_bytes;
                 const planner = BudgetPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = planned_assistant, .beside = weights_bytes -| planned_resident, .mtp_on = mtp_on };
-                refusal.knob = .{ .ssd_budget = .{ .gb = budget >> 30, .fits_gb = bills.streamedBudgetThatFits(budget, avail, planner) } };
+                refusal.knob = .{ .ssd_budget = .{ .gb = budget >> 30, .fits_gb = bills.streamedBudgetThatFits(budget, avail, planner), .from_flag = streaming_budget.origin == .flag } };
             }
             var text_buf: [2048]u8 = undefined;
             const text = bills.loadMemoryRefusalText(&text_buf, refusal);
