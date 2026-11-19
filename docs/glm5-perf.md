@@ -624,7 +624,7 @@ Model (`SUSHI_GLM_ROWS_UBENCH=24`, B=1 serial, one boot, lane and one-row altern
 | 1K | 27.04 ms | 25.55 ms | -1.49 ms (-5.5%) |
 | 8K | 29.58 ms | 28.02 ms | -1.56 ms (-5.3%) |
 
-Bytes equal the lane chain's at n32..64 and 72/80/96/112/128 (small shape) and at 4096/2048 n36/n40 w14, clamp live.
+Bytes equal the lane chain's at one rate per reader class (small shape) and at 4096/2048 n36/n40 w12, clamp live.
 
 ## Prefill: KDA prework reads q/k/v in place (T2048 layer, 8K prompt)
 

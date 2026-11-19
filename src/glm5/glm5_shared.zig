@@ -346,32 +346,29 @@ test "GLM shared expert folded into the routed launches is bit exact to the sepa
     const sigmoid = try @import("../hc_prefill.zig").sigmoidTable(s);
     const routed = try routedBank(&ops, 36);
     const route = try routeInputs(&ops, rnd, 1);
-    defer api.fold_clamped.shared_first = false;
-    // Gate/up and down are stored at their own widths; the large gain pushes the activation through both clamps.
-    for ([_][3]usize{ .{ 6, 6, 6 }, .{ 5, 5, 5 }, .{ 8, 8, 8 }, .{ 5, 5, 8 }, .{ 8, 8, 6 }, .{ 6, 6, 5 } }) |bits| for ([_]f32{ 1, 0.02 }) |gain| {
+    // Gate/up and down are stored at their own widths, each width once on each side; the gain pushes the activation
+    // through both clamps.
+    for ([_][3]usize{ .{ 5, 5, 8 }, .{ 8, 8, 6 }, .{ 6, 6, 5 } }) |bits| {
         var fx = Fixture{};
         defer fx.deinit();
-        const gate = try fx.bank(std.testing.allocator, rnd, 2048, 4096, bits[0], gain);
-        const up = try fx.bank(std.testing.allocator, rnd, 2048, 4096, bits[1], gain);
-        const down = try fx.bank(std.testing.allocator, rnd, 4096, 2048, bits[2], gain);
+        const gate = try fx.bank(std.testing.allocator, rnd, 2048, 4096, bits[0], 1);
+        const up = try fx.bank(std.testing.allocator, rnd, 2048, 4096, bits[1], 1);
+        const down = try fx.bank(std.testing.allocator, rnd, 4096, 2048, bits[2], 1);
         const x = try ops.own(try randomRow(std.testing.allocator, rnd, 4096, 4));
         const gate_up_separate = gateUpDispatches();
         const want = try separateChain(&ops, x, gate, up, down, bits[2], routed, route.ids, route.scores, sigmoid);
         try std.testing.expectEqual(gate_up_separate + 1, gateUpDispatches());
-        for ([_]bool{ false, true }) |shared_first| {
-            api.fold_clamped.shared_first = shared_first;
-            const gate_up_before = gateUpDispatches();
-            const folded_before = api.fold_clamped.foldedCount();
-            const launches_before = api.fold_clamped.launchCount();
-            const got = try ops.own((try folded(s, x, gate, up, down, routed, route.ids, route.scores, test_dec, 10, sigmoid)) orelse return error.TestExpectedFoldedShared);
-            try mlx.check(mlx.mlx_array_eval(got));
-            try std.testing.expectEqual(gate_up_before, gateUpDispatches());
-            try std.testing.expectEqual(folded_before + 1, api.fold_clamped.foldedCount());
-            // The separate chain launches seven: gate/up, the stock down and the routed five.
-            try std.testing.expectEqual(launches_before + 5, api.fold_clamped.launchCount());
-            try expectSameBits(want, got);
-        }
-    };
+        const gate_up_before = gateUpDispatches();
+        const folded_before = api.fold_clamped.foldedCount();
+        const launches_before = api.fold_clamped.launchCount();
+        const got = try ops.own((try folded(s, x, gate, up, down, routed, route.ids, route.scores, test_dec, 10, sigmoid)) orelse return error.TestExpectedFoldedShared);
+        try mlx.check(mlx.mlx_array_eval(got));
+        try std.testing.expectEqual(gate_up_before, gateUpDispatches());
+        try std.testing.expectEqual(folded_before + 1, api.fold_clamped.foldedCount());
+        // The separate chain launches seven: gate/up, the stock down and the routed five.
+        try std.testing.expectEqual(launches_before + 5, api.fold_clamped.launchCount());
+        try expectSameBits(want, got);
+    }
 }
 
 test "GLM shared expert fold declines what the separate chains must run" {

@@ -353,46 +353,7 @@ test "a DSpark round that finished the slot leaves the thought point to the comm
     try testing.expectEqual(@as(?u32, null), gen.dspark_round_ends_at);
 }
 
-test "a DeepSeek slot's state bytes hold the model's rows and windows and the live points (DSV41_TINY)" {
-    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = try dsv41_model.fixtureDir();
-    var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
-    defer fx.deinit();
-    var sc = @import("dsv41_scope.zig").Scope.plain(a, mlx.gpuStream());
-    defer sc.deinit();
-    const ids = try dsv41_model.tokens(&sc, &fx);
-    defer a.free(ids);
-    const m = try dsv41_model.tinyModel(dir, .{ .act = .bfloat16, .dspark = true }, mlx.gpuStream());
-    defer m.deinit();
-    _ = mlx.mlx_array_free(try dsv41_model.extend(m, ids[0..40], .last));
-
-    var xfm = testTrunk("deepseek_v41");
-    xfm.arch_state.dsv41.model = m;
-    var model: model_registry_mod.LoadedModel = undefined;
-    model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(a, 2);
-    defer model.prefix_cache.?.deinit();
-    model.handle = arch_handle.fixtureHandle(&xfm);
-    const hc = &model.prefix_cache.?;
-    var cp = try dsv41_prefix.capture(a, m, 40);
-    defer cp.deinit(a);
-    try dsv41_prefix.liveOf(hc).keep(a, m, &cp, null);
-    var slot: Slot = undefined;
-    slot.model = &model;
-    slot.cache = .{ .entries = &.{}, .step = 0, .allocator = a, .config = .dense };
-    slot.ssm_entries = null;
-    slot.ring_cps = .{};
-    slot.request = null;
-    slot.legacy_gen = null;
-
-    const rows_and_windows = dsv41_model.stateBytes(&m.dec_state.?);
-    try testing.expect(rows_and_windows > 0);
-    try testing.expect(dsv41_prefix.liveOf(hc).bytes() > 0);
-    try testing.expectEqual(rows_and_windows + dsv41_prefix.liveOf(hc).bytes(), slotStateBytes(&slot));
-}
-
-test "with no request on it, a DeepSeek model's parked rows, windows and live points stay in the live KV bill (DSV41_TINY)" {
+test "a DeepSeek slot's state bytes hold the model's rows and windows and the live points, and with no request on it they stay in the live KV bill (DSV41_TINY)" {
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();
     const a = testing.allocator;
@@ -418,6 +379,18 @@ test "with no request on it, a DeepSeek model's parked rows, windows and live po
     var cp = try dsv41_prefix.capture(a, m, 40);
     defer cp.deinit(a);
     try dsv41_prefix.liveOf(hc).keep(a, m, &cp, null);
+    var slot: Slot = undefined;
+    slot.model = &model;
+    slot.cache = .{ .entries = &.{}, .step = 0, .allocator = a, .config = .dense };
+    slot.ssm_entries = null;
+    slot.ring_cps = .{};
+    slot.request = null;
+    slot.legacy_gen = null;
+
+    const rows_and_windows = dsv41_model.stateBytes(&m.dec_state.?);
+    try testing.expect(rows_and_windows > 0);
+    try testing.expect(dsv41_prefix.liveOf(hc).bytes() > 0);
+    try testing.expectEqual(rows_and_windows + dsv41_prefix.liveOf(hc).bytes(), slotStateBytes(&slot));
 
     // The request ended: its slot is culled, and the model keeps its state for the next one.
     var sch: Scheduler = undefined;
@@ -432,8 +405,5 @@ test "with no request on it, a DeepSeek model's parked rows, windows and live po
     cullDecodingWith(&sch, struct {
         fn commit(_: *Scheduler, _: *Slot) void {}
     }.commit);
-
-    const kept = dsv41_model.stateBytes(&m.dec_state.?) + dsv41_prefix.liveOf(hc).bytes();
-    try testing.expect(kept > 0);
-    try testing.expectEqual(kept, sch.resident_live_kv_bytes.load(.monotonic));
+    try testing.expectEqual(rows_and_windows + dsv41_prefix.liveOf(hc).bytes(), sch.resident_live_kv_bytes.load(.monotonic));
 }

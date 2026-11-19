@@ -116,6 +116,9 @@ test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" 
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, a, std.mem.span(path));
     defer if (config.ngram_table_path) |name| a.free(name);
+    // Any other geometry answers `.generic`, field by field in the fingerprint test: only the profile's pack loads.
+    const served_geometry: Qwen4MixedGeometry = .{};
+    if (config.hidden_size != served_geometry.hidden or config.num_hidden_layers != served_geometry.layers) return error.SkipZigTest;
     var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);

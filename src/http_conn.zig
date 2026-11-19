@@ -1260,13 +1260,17 @@ test "self-update: /v1/update refuses by name over the wire and never shuts the 
     const t = std.testing;
     const prev_key = server_state.g_api_key;
     defer server_state.g_api_key = prev_key;
+    // A test binary is no release install, in a checkout's cache or a gate's outside one: refused by the reason its
+    // place gives, before asking whether a release is newer.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var why_buf: [512]u8 = undefined;
+    const install = update_mod.selfInstallRefusal(t.io, &path_buf, &why_buf) orelse return error.TestBinaryIsAnInstall;
     const Case = struct { request: []const u8, status: []const u8, says: []const u8 };
     for ([_]Case{
         .{ .request = "GET /v1/update HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "POST only" },
         .{ .request = "POST /v1/update HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 403 ", .says = "no Origin" },
         .{ .request = "POST /v1/update HTTP/1.1\r\nOrigin: http://evil.test\r\n\r\n", .status = "HTTP/1.1 403 ", .says = "Origin" },
-        // This test binary sits in a checkout: refused as a source build, before asking whether a release is newer.
-        .{ .request = "POST /v1/update HTTP/1.1\r\nOrigin: http://localhost:12345\r\n\r\n", .status = "HTTP/1.1 409 ", .says = "built from source" },
+        .{ .request = "POST /v1/update HTTP/1.1\r\nOrigin: http://localhost:12345\r\n\r\n", .status = "HTTP/1.1 409 ", .says = install },
     }) |c| {
         const response = try serveOneForTest(c.request);
         defer t.allocator.free(response);

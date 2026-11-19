@@ -258,8 +258,8 @@ A quantized pack whose experts stream takes `--drop-expert n` as DeepSeek does
 - **Rows**: a Cooler load joins as many decode rows as on MLX (`qwen4_sched.coolerRows` = `rowCap`, 8 on a
   non-streamed pack), each row its solo request's tokens (the contract's rows test, `qwen4_contract.greedyRows`).
 - **The contract** (`src/cooler_contract_test.zig`, fixture `QWEN4_STQ_TINY` on the served geometry, head dim 256):
-  owned weights, no MLX call in a request or the unload, MLX's tokens greedy and through MTP rounds, every checked
-  failure of a load or a request freed, and an unload that gives back everything.
+  owned weights, no MLX call in a request or the unload, MTP rounds saying greedy's tokens, every checked failure of a
+  load or a request freed, and an unload that gives back everything.
 - **Closures**: a Cooler load compiles none; each chain runs op by op, MLX's unfused bytes (the f32 GDN gate's compiled
   kernel sits a few ulps from that chain).
 

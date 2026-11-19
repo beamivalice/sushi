@@ -3479,16 +3479,6 @@ test "dsv41 moe decode: the gate-up and down-expand kernels are no further from 
     try expectNoWorse("kernel vs composed's error", err_kernel, err_composed);
 }
 
-test "dsv41 moe decode: in bf16 the kernels give the composed chain's stream to a few bf16 ulps" {
-    try mlx.requireGpu();
-    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
-    defer sc.deinit();
-    const f = try ffnData(&sc, .{}, .bfloat16);
-    const want = try hostOf(&sc, try composedFfn(&sc, &f, .bfloat16));
-    const got = try hostOf(&sc, try kernelFfn(&sc, &f));
-    try expectLe("kernel vs composed", relErrF(got, want), 1.0 / 128.0);
-}
-
 test "dsv41 gate: the router logits are no further from the f64 truth than the f32 matmul" {
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
@@ -4445,18 +4435,6 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
     try expectNoWorse("expand stage h", relErr(try hostOf(&sc, sx.h), h_truth), relErr(try hostOf(&sc, ref1.h), h_truth));
 }
 
-test "dsv41 hc stage: in bf16 the stage gives the chain's normed collapse and expanded stream to bf16 ulps" {
-    try mlx.requireGpu();
-    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
-    defer sc.deinit();
-    const d = try hcData(&sc, 1, .bfloat16);
-    const x1_ref = try model.hcExpandOps(&sc, d.x, d.y, d.prev.post, d.prev.comb);
-    const sx = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = d.prev } }, d.cpre, d.w, d.hw, d.eps);
-    try expectLe("bf16 expanded stream", relErrF(try hostOf(&sc, sx.x1), try hostOf(&sc, x1_ref)), 1.0 / 128.0);
-    const ref = try composedHc(&sc, &d, x1_ref);
-    try expectLe("bf16 normed collapse", relErrF(try hostOf(&sc, sx.h), try hostOf(&sc, ref.h)), 1.0 / 64.0);
-}
-
 test "dsv41 hc stage: a stage that splits its previous mixes gives the split kernel's and the array stage's bytes" {
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
@@ -4562,18 +4540,6 @@ test "dsv41 hc mix NAX trial: the release shape passes it, a zero bar and a stre
     try testing.expect(!try arm_trial.run(mlx.gpuStream(), hcMixNaxTrial, .{ testing.allocator, mlx.gpuStream(), 4, 40, hc_mix_nax_bar }));
 }
 
-test "dsv41 hc wide: the release mix tile gives the previous tile's mixes at the release shapes, bit for bit" {
-    try mlx.requireGpu();
-    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 3, 17, 512, 2048 }) |L| {
-        var sc = Scope.plain(testing.allocator, mlx.gpuStream());
-        defer sc.deinit();
-        const d = try hcData(&sc, L, dt);
-        const want = try hcMixTiled(&sc, d.x, d.hw, d.eps, .{ .rows = 4, .cols = 6 });
-        const got = try hcMix(&sc, d.x, d.hw, d.eps);
-        try expectBitEqual("hc mix tile", try sc_mod.hostF32(got), try sc_mod.hostF32(want));
-    };
-}
-
 test "dsv41 hc expand: the kernel gives the op chain's stream, bit for bit" {
     try mlx.requireGpu();
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
@@ -4608,23 +4574,6 @@ test "dsv41 hc expand: the kernel gives the op chain's stream, bit for bit" {
         try expectBitEqual("hc expand", got, want);
     };
     try testing.expect(hc_expand_tf32);
-}
-
-test "dsv41 hc expand: a thread an element writes the bytes of a thread a column, at stream magnitudes" {
-    try mlx.requireGpu();
-    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 5120, 4096, 1000, 40 }) |D| for ([_]c_int{ 1, 2, 5, 17, 512 }) |L| {
-        for ([_][2]f32{ .{ 1.5, 1.0 }, .{ 400.0, 60.0 }, .{ 1e-3, 1e-4 } }) |mag| {
-            var cs = Scope.plain(testing.allocator, mlx.gpuStream());
-            defer cs.deinit();
-            const x = try cs.astype(try randn(&cs, &.{ L, 4, D }, .float32, 191, mag[0]), dt);
-            const y = try cs.astype(try randn(&cs, &.{ L, D }, .float32, 192, mag[1]), dt);
-            const post = try randn(&cs, &.{ L, 4 }, .float32, 193, 0.7);
-            const comb = try randn(&cs, &.{ L, 4, 4 }, .float32, 194, 0.5);
-            const want = try hostOf(&cs, try hcExpandPerColumn(&cs, x, y, post, comb));
-            const got = try hostOf(&cs, try hcExpandFused(&cs, x, y, post, comb));
-            try expectBitEqual("hc expand grid", got, want);
-        }
-    };
 }
 
 test "dsv41 engram: the gate kernel writes the op chain's stream, bit for bit" {

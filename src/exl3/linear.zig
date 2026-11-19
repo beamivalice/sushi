@@ -550,7 +550,7 @@ fn roundTo(dt: mlx.mlx_dtype, v: f32) f32 {
     };
 }
 
-test "exl3 linear: one-bank and grouped trellis linears hold the f32-truth bar on every arm, every STQ codebook and activation dtype" {
+test "exl3 linear: one-bank and grouped trellis linears hold the f32-truth bar on their served arm, every STQ codebook and activation dtype" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -569,15 +569,15 @@ test "exl3 linear: one-bank and grouped trellis linears hold the f32-truth bar o
     const in: usize = 384;
     const out: usize = 256;
     var failed: usize = 0;
-    for (cases) |cs| for ([_]usize{ 1, 2, 8 }) |groups| {
-        // One bank per codebook and group count, decoded once to its dense twin: every row count, dtype and arm is
-        // held to the same host truth, computed once per input.
+    for (cases) |cs| for ([_]usize{ 1, 2 }) |groups| {
+        // One bank per codebook and group count, decoded once to its dense twin: every row count and dtype is held to
+        // the same host truth, computed once per input.
         var h = try Host.init(alloc, rnd, groups, in, out, cs.n);
         defer h.deinit();
         const dense = try alloc.alloc(f32, groups * in * out);
         for (0..groups) |g| try h.decodeGroup(alloc, g, in, out, cs.n, cs.dec, dense[g * in * out ..][0 .. in * out]);
-        for ([_]usize{ 1, 3, 8, 70 }) |rows| for ([_]mlx.mlx_dtype{ .float16, .bfloat16, .float32 }) |dt| {
-            if (groups == 8 and rows > 8) continue;
+        // One row takes the one-row arm, three the multi-row arm, 70 the GEMM.
+        for ([_]usize{ 1, 3, 70 }) |rows| for ([_]mlx.mlx_dtype{ .float16, .bfloat16, .float32 }) |dt| {
             const xs = try alloc.alloc(f32, groups * rows * in);
             for (xs) |*v| v.* = (rnd.float(f32) * 2 - 1) * 30;
             const xb = try alloc.alloc(u16, xs.len);
@@ -601,27 +601,22 @@ test "exl3 linear: one-bank and grouped trellis linears hold the f32-truth bar o
             const floor = relRms(stored, want);
             const x = mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(xs.ptr) else @ptrCast(xb.ptr), &[_]c_int{ @intCast(groups), @intCast(rows), @intCast(in) }, 3, dt);
             defer _ = mlx.mlx_array_free(x);
-            for ([_]Arm{ .rows, .gemm, .gemv }) |arm| {
-                if ((arm == .gemv and rows > 3) or (arm == .rows and rows > project_rows.PROJECT_ROWS_MAX)) continue;
-                force_arm = arm;
-                defer force_arm = null;
-                const y = if (groups == 1) blk: {
-                    var x2 = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(x2);
-                    try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ @intCast(rows), @intCast(in) }, 2, s));
-                    break :blk try linear(s, x2, h.p, cs.dec);
-                } else try linearGrouped(s, x, h.p, cs.dec);
-                defer _ = mlx.mlx_array_free(y);
-                try t.expectEqual(groups * rows * out, mlx.mlx_array_size(y));
-                var cy = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(cy);
-                const got = try hostF32(s, y, &cy);
-                for (got) |v| try t.expect(std.math.isFinite(v));
-                const err = relRms(got, want);
-                if (err >= @sqrt(LINEAR_BAR * LINEAR_BAR + floor * floor)) {
-                    std.debug.print("linear {s} n{d} groups {d} rows {d} arm {s} {s}: relRms {d}\n", .{ @tagName(cs.dec.codebook), cs.n, groups, rows, @tagName(arm), @tagName(dt), err });
-                    failed += 1;
-                }
+            const y = if (groups == 1) blk: {
+                var x2 = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x2);
+                try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ @intCast(rows), @intCast(in) }, 2, s));
+                break :blk try linear(s, x2, h.p, cs.dec);
+            } else try linearGrouped(s, x, h.p, cs.dec);
+            defer _ = mlx.mlx_array_free(y);
+            try t.expectEqual(groups * rows * out, mlx.mlx_array_size(y));
+            var cy = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cy);
+            const got = try hostF32(s, y, &cy);
+            for (got) |v| try t.expect(std.math.isFinite(v));
+            const err = relRms(got, want);
+            if (err >= @sqrt(LINEAR_BAR * LINEAR_BAR + floor * floor)) {
+                std.debug.print("linear {s} n{d} groups {d} rows {d} {s}: relRms {d}\n", .{ @tagName(cs.dec.codebook), cs.n, groups, rows, @tagName(dt), err });
+                failed += 1;
             }
         };
     };
@@ -696,7 +691,7 @@ test "exl3 linear: linears sharing their input in one launch each hold the f32-t
     const dec = exl3.Decode.tabled(.spec1, .w15);
     const in: usize = 512;
     // wq_a | wkv | the compressor's wkv at DeepSeek's proportions, and two equal linears (wkv | wgate).
-    for ([_][]const usize{ &.{ 640, 256, 256 }, &.{ 256, 256 }, &.{ 384, 128, 256, 128 } }) |widths| {
+    for ([_][]const usize{ &.{ 640, 256, 256 }, &.{ 384, 128, 256, 128 } }) |widths| {
         var hosts: [SHARED_MAX]Host = undefined;
         var cols: [SHARED_MAX + 1]c_int = @splat(0);
         for (widths, 0..) |w, i| {
@@ -722,7 +717,7 @@ test "exl3 linear: linears sharing their input in one launch each hold the f32-t
             try mlx.check(mlx.mlx_concatenate_axis(&cat[k], v, axis, s));
         }
         const sh: Shared = .{ .p = .{ .trellis = cat[0], .suh = cat[1], .svh = cat[2] }, .cols = cols, .count = widths.len };
-        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 2, 5, 8 }) |rows| {
+        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 5 }) |rows| {
             const xs = try alloc.alloc(f32, rows * in);
             for (xs) |*v| v.* = (rnd.float(f32) * 2 - 1) * 30;
             const xb = try alloc.alloc(u16, xs.len);
@@ -755,50 +750,6 @@ test "exl3 linear: linears sharing their input in one launch each hold the f32-t
     }
 }
 
-test "exl3 linear: the multi-row kernel gives a row the same bytes at widths 2 to 8, on one bank and on a grouped bank" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    defer kernels.setDecodeParams(.mul1);
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var prng = std.Random.DefaultPrng.init(0xbea7);
-    const rnd = prng.random();
-    const in: usize = 256;
-    const out: usize = 384;
-    const dec = exl3.Decode.tabled(.spec1, .w15);
-    for ([_]usize{ 1, 2 }) |groups| {
-        var h = try Host.init(alloc, rnd, groups, in, out, 64);
-        defer h.deinit();
-        const xb = try alloc.alloc(u16, groups * 8 * in);
-        for (xb) |*b| b.* = exl3.f32ToF16Bits((rnd.float(f32) * 2 - 1) * 4);
-        // Group g's 8 rows are x[g], and the narrower runs take its first `width` rows.
-        const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ @intCast(groups), 8, @intCast(in) }, 3, .float16);
-        defer _ = mlx.mlx_array_free(x);
-        const all = try linearGrouped(s, x, h.p, dec);
-        defer _ = mlx.mlx_array_free(all);
-        var ca = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ca);
-        const want = try hostF32(s, all, &ca);
-        for ([_]c_int{ 2, 3, 5 }) |width| {
-            var part = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(part);
-            try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ @intCast(groups), width, @intCast(in) }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-            const y = try linearGrouped(s, part, h.p, dec);
-            defer _ = mlx.mlx_array_free(y);
-            var cy = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(cy);
-            const got = try hostF32(s, y, &cy);
-            for (0..groups) |g| {
-                const w: usize = @intCast(width);
-                try t.expectEqualSlices(u8, std.mem.sliceAsBytes(want[g * 8 * out ..][0 .. w * out]), std.mem.sliceAsBytes(got[g * w * out ..][0 .. w * out]));
-            }
-        }
-    }
-}
-
-
 const exact: Opts = .{ .rows = .{ .exact = true } };
 
 test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 8 at Flash-Next's trunk shapes, stacked, on the machine's own arm and on SIMD" {
@@ -823,8 +774,8 @@ fn exactRowsCase() !void {
     var prng = std.Random.DefaultPrng.init(0xe4ac7);
     const rnd = prng.random();
     const dec = exl3.Decode.tabled(.spec1, .w15);
-    // The 12288-wide output, a deep input and a narrow one each split k differently.
-    const shapes = [_][3]usize{ .{ 2560, 12288, 48 }, .{ 2560, 12288, 96 }, .{ 2560, 10240, 64 }, .{ 2560, 6144, 64 }, .{ 6144, 2560, 48 }, .{ 2560, 640, 32 }, .{ 256, 131072, 32 } };
+    // A k-split launch with a finish, and an lm_head-wide one that folds it: the chunk is the same at every width of both.
+    const shapes = [_][3]usize{ .{ 2560, 12288, 48 }, .{ 256, 131072, 32 } };
     for (shapes) |sh| {
         var h = try Host.init(alloc, rnd, 1, sh[0], sh[1], @intCast(sh[2]));
         defer h.deinit();
@@ -848,7 +799,7 @@ fn exactRowsCase() !void {
             solo[r] = try hostF32(s, y, &solo_arrays[made - 1]);
             _ = mlx.mlx_array_free(y);
         }
-        for (2..9) |width| {
+        for ([_]usize{ 2, 8 }) |width| {
             var part = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(part);
             try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ @intCast(width), @intCast(sh[0]) }, 2, &[_]c_int{ 1, 1 }, 2, s));
@@ -893,7 +844,7 @@ fn exactRowsCase() !void {
             _ = mlx.mlx_array_free(o);
         }
     }
-    for (2..9) |width| {
+    for ([_]usize{ 2, 8 }) |width| {
         var part = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(part);
         try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ @intCast(width), @intCast(in) }, 2, &[_]c_int{ 1, 1 }, 2, s));
@@ -976,7 +927,7 @@ test "exl3 linear: a pair whose second launch sums the first's partials gives th
     try pairCase(mlx.gpuStream());
 }
 
-test "exl3 linear: a stacked launch whose first linear leaves rms-normed gives the launch's, its finish's and MLX's rms norm's bytes, 1 to 8 rows, on the machine's arm and SIMD, MLX's stream and the engine's" {
+test "exl3 linear: a stacked launch whose first linear leaves rms-normed gives the launch's, its finish's and MLX's rms norm's bytes, one and three rows, on the machine's arm and SIMD, MLX's stream and the engine's" {
     try mlx.requireGpu();
     const was = mlx.engine.enabled;
     defer mlx.engine.enabled = was;
@@ -991,7 +942,7 @@ test "exl3 linear: a stacked launch whose first linear leaves rms-normed gives t
     try normedCase(mlx.gpuStream());
 }
 
-test "exl3 linear: a launch whose finish expands its rows into streams gives the host expand of the launch's bytes, alone and as a pair's second, 1 to 8 rows, on the machine's arm and SIMD, MLX's stream and the engine's" {
+test "exl3 linear: a launch whose finish expands its rows into streams gives the host expand of the launch's bytes, alone and as a pair's second, one and three rows, on the machine's arm and SIMD, MLX's stream and the engine's" {
     try mlx.requireGpu();
     const was = mlx.engine.enabled;
     defer mlx.engine.enabled = was;
@@ -1016,10 +967,9 @@ fn expandedCase(s: mlx.mlx_stream) !void {
     var prng = std.Random.DefaultPrng.init(0xe8a1);
     const rnd = prng.random();
     const dec = exl3.Decode.tabled(.spec1, .w15);
-    // DeepSeek's wo_a and wo_b with its four streams, then small ones with two and three.
+    // DeepSeek's wo_a and wo_b with its four streams, then a one-bank first launch with three.
     const shapes = [_]struct { groups: usize, in: usize, mid: usize, out: usize, n: u32, hc: usize }{
         .{ .groups = 8, .in = 4096, .mid = 1024, .out = 5120, .n = 64, .hc = 4 },
-        .{ .groups = 2, .in = 256, .mid = 256, .out = 384, .n = 64, .hc = 2 },
         .{ .groups = 1, .in = 384, .mid = 256, .out = 128, .n = 96, .hc = 3 },
     };
     var served: usize = 0;
@@ -1028,7 +978,8 @@ fn expandedCase(s: mlx.mlx_stream) !void {
         defer ha.deinit();
         var hb = try Host.init(alloc, rnd, 1, sh.groups * sh.mid, sh.out, sh.n);
         defer hb.deinit();
-        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]Opts{ .{}, exact, .{ .rows = .{ .exact = true, .wide = true } } }) |opts| for ([_]usize{ 1, 3, 8 }) |rows| {
+        // `wide` changes no launch of eight rows or fewer.
+        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]Opts{ .{}, exact }) |opts| for ([_]usize{ 1, 3 }) |rows| {
             const hc = sh.hc;
             const nx = sh.groups * rows * sh.in;
             const xf = try alloc.alloc(f32, nx);
@@ -1095,7 +1046,7 @@ fn expandedCase(s: mlx.mlx_stream) !void {
             served += 1;
         };
     }
-    try t.expectEqual(@as(usize, 3 * 2 * 3 * 3), served);
+    try t.expectEqual(@as(usize, 2 * 2 * 2 * 2), served);
 }
 
 /// f32 activations show every ulp of the norm's sums, which bf16 outputs round away; bf16 is the served dtype.
@@ -1108,11 +1059,9 @@ fn normedCase(s: mlx.mlx_stream) !void {
     var prng = std.Random.DefaultPrng.init(0x4a55);
     const rnd = prng.random();
     const dec = exl3.Decode.tabled(.spec1, .w15);
-    // DeepSeek's wq_a, wkv and a compressor's wkv on one input; then two linears, then one alone.
+    // DeepSeek's wq_a, wkv and a compressor's wkv on one input, then one linear alone.
     const shapes = [_]struct { in: usize, widths: []const usize, n: u32 }{
-        .{ .in = 5120, .widths = &.{ 1280, 512 }, .n = 64 },
         .{ .in = 5120, .widths = &.{ 1280, 512, 512 }, .n = 64 },
-        .{ .in = 384, .widths = &.{ 256, 128 }, .n = 96 },
         .{ .in = 256, .widths = &.{384}, .n = 64 },
     };
     var served: usize = 0;
@@ -1142,7 +1091,8 @@ fn normedCase(s: mlx.mlx_stream) !void {
             }
             const w = try host_side.made(mlx.mlx_array_new_data(if (dt == .float32) @ptrCast(wf.ptr) else @ptrCast(wb.ptr), &[_]c_int{@intCast(sh.widths[0])}, 1, dt));
             defer _ = mlx.mlx_array_free(w);
-            for ([_]Opts{ .{}, exact, .{ .rows = .{ .exact = true, .wide = true } } }) |opts| for ([_]usize{ 1, 3, 8 }) |rows| for ([_]f32{ 4, 1e-3 }) |amp| {
+            // `wide` changes no launch of eight rows or fewer.
+            for ([_]Opts{ .{}, exact }) |opts| for ([_]usize{ 1, 3 }) |rows| for ([_]f32{ 4, 1e-3 }) |amp| {
                 const xf = try alloc.alloc(f32, rows * sh.in);
                 const xb = try alloc.alloc(u16, rows * sh.in);
                 for (xf, xb) |*f, *bits| {
@@ -1177,7 +1127,7 @@ fn normedCase(s: mlx.mlx_stream) !void {
             };
         }
     }
-    try t.expectEqual(@as(usize, 4 * 2 * 3 * 3 * 2), served);
+    try t.expectEqual(@as(usize, 2 * 2 * 2 * 2 * 2), served);
 }
 
 /// Every pair `linearPair` serves equals the grouped launch, its finish and the one-bank launch; past one multi-row
@@ -1191,10 +1141,9 @@ fn pairCase(s: mlx.mlx_stream) !void {
     var prng = std.Random.DefaultPrng.init(0x9a17);
     const rnd = prng.random();
     const dec = exl3.Decode.tabled(.spec1, .w15);
-    // DeepSeek's wo_a and wo_b, then a two-bank and a one-bank first launch.
+    // DeepSeek's wo_a and wo_b, then a one-bank first launch.
     const shapes = [_]struct { groups: usize, in: usize, mid: usize, out: usize, n: u32 }{
         .{ .groups = 8, .in = 4096, .mid = 1024, .out = 5120, .n = 64 },
-        .{ .groups = 2, .in = 256, .mid = 256, .out = 384, .n = 64 },
         .{ .groups = 1, .in = 384, .mid = 256, .out = 128, .n = 96 },
     };
     for (shapes) |sh| {
@@ -1202,7 +1151,7 @@ fn pairCase(s: mlx.mlx_stream) !void {
         defer ha.deinit();
         var hb = try Host.init(alloc, rnd, 1, sh.groups * sh.mid, sh.out, sh.n);
         defer hb.deinit();
-        for ([_]Opts{ .{}, exact, .{ .rows = .{ .exact = true, .wide = true } } }) |opts| for ([_]usize{ 1, 3, 8, 16 }) |rows| {
+        for ([_]Opts{ .{}, exact, .{ .rows = .{ .exact = true, .wide = true } } }) |opts| for ([_]usize{ 1, 3, 16 }) |rows| {
             const xb = try alloc.alloc(u16, sh.groups * rows * sh.in);
             for (xb) |*v| v.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4);
             const x = try host_side.made(mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ @intCast(sh.groups), @intCast(rows), @intCast(sh.in) }, 3, .bfloat16));

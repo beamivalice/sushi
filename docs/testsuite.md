@@ -74,15 +74,25 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - **Tests run under sushi's runner** (`scripts/test_runner.zig`, std's with one check): after each test it asks
   `sushi_after_each` (`src/test_rest.zig`), which fails that test by name when it left a hold, a turn, a model's budget
   slot, a forward scope, a seal, an armed fault, an opt-out or a latched MLX error, then puts the engine back at rest.
-- **The Sushi Cooler contract** (`src/cooler_contract_test.zig`, tests `cooler contract:`) runs on every tiny fixture of
+  `SUSHI_TEST_TIMES=<abs path>` makes it append `<ms>\t<test name>` per test to that file, from every binary of the run
+  (each line under the file's lock), and print nothing: the way to find the slow tests (`sort -rn <file> | head`).
+- **The Sushi Cooler contract** (`src/cooler_contract_test.zig`, tests `cooler contract:`) runs on the tiny fixtures of
   every arch that declares `cooler_contract`: the side, every weight in an owned region, a request and the model's
-  teardown asking MLX nothing, the opt-out's tokens, fault sweeps over the load and a request, nothing compiled after
-  it, and a load of more than one row (`coolerRows`) giving each row its solo request's tokens (the arch's
-  `greedyRows`; skipped at one row). Requests run in the model's turn and end as serve ends them; unloads run serve's teardown. An arch on Sushi
-  Cooler is admitted by declaring it. With every fixture set a cell runs them all (`eachFixture`), or one per arch
-  (`eachArch`, the first set: for a property of the arch and the engine, not of a pack's format); with any unset it
-  skips before loading anything. `SUSHI_CONTRACT_FIXTURE=QWEN4_STQ_TINY` (comma-separated envs) runs only the named
-  fixtures, and a cell that ran on them passes: the way to check one cell on one fixture.
+  teardown asking MLX nothing, an exact speculative request saying its greedy tokens, fault sweeps over the load and a
+  request, nothing compiled after it, and a load of more than one row (`coolerRows`) giving each row its solo request's
+  tokens (the arch's `greedyRows`; skipped at one row). It holds no cell against the MLX load: Sushi Cooler is proven.
+  Requests run in the model's turn and end as serve ends them; unloads run serve's teardown. An arch on Sushi
+  Cooler is admitted by declaring it. A cell runs on the fixtures whose paths differ for its property: every fixture
+  (`eachFixture`: a kernel, a bill or a late compile, which a geometry changes), one per arch and expert layout
+  (`eachLayout`, residency and tile order: the loader, its cleanup, the calls a request makes), one per arch and
+  residency (`eachResidency`: pool and memory), or one per arch (`eachArch`, the first set: generator and engine
+  logic); with
+  any unset it skips before loading anything. `SUSHI_CONTRACT_FIXTURE=QWEN4_STQ_TINY` (comma-separated envs) runs only
+  the named fixtures, and a cell that ran on them passes: the way to check one cell on one fixture.
+  A fault sweep refuses each pool-buffer or checked-call site once, at its first ask, and not again on another arm or
+  fixture of the same arch (`firstAsks`); a sweep of one step (an image splice, an SSD restore, a rows tick) refuses only
+  the sites that step adds to a plain request's. A load sweep refuses each step of the load at its first and last
+  call, and each step of its warm at its first.
   Its no-late-kernel test proves its property only on a fresh pipeline cache (run it alone): the cache is the process's.
 - **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device
   profile and the engine dispatch as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`). A test about one arm's bytes names it
@@ -90,7 +100,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - The pack tier's envs: `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/test-fixtures/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_STQ_TINY_PM` (its pair-major copy), `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
   folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
   `{p0, ratio, keys, group}`, `wscale` and the kernel's `scores`; the test skips without it), `QWEN4_TEST_MODEL`,
-  `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`, `SUSHI_DSV41_REAL_PACK` (the DeepSeek width probe: every row of a verify is its one-row round's bits on the real pack, and the engine's proof: one-row steps and DSpark rounds on the engine of our own give MLX's bytes;
+  `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`, `SUSHI_DSV41_REAL_PACK` (the DeepSeek width probe: every row of a verify is its one-row round's bits on the real pack;
   its `SUSHI_DSV41_PROBE_*` knobs are in [envvar](envvar.md); a ~40 GB-budget run, GPU lock). A landing on main sets the tiny-fixture envs (`source tests/lib/fixture_envs.sh`); the real-pack envs run with the release gate. Without them a green
   suite proves nothing there.
 - Three real-weight runs have no script. The encoder's real-checkpoint capture:
@@ -237,8 +247,11 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - One fixture or pack load per process, shared by the tests that read it.
 - No sleeps to wait for a thread. Use a hook or a counter. Any wait is bounded and under 100 ms.
 - Deterministic: no dependence on scheduler timing, machine memory or test order. Global overrides restore in `defer`.
+- No dependence on where the test binary sits: `tests/gate.sh` builds it in a cache outside any checkout.
 - "No worse than the reference" states its margin in ulps, or compares bytes within one arm: a bare `<=` between two
   rounded errors flips on other hardware.
+- A GPU f32 result held to a reference takes its bar from MLX's TF32 reading (`matmul.gpu().tf32`): MLX keeps the
+  first one for the process, so a bar that holds only on f32 tiles passes or fails by test order.
 - A passing test prints nothing, on either stream. Diagnostics go behind an env switch or into `errdefer`.
 - A regression pin is written red first. Its name says what failed, never an issue number or date.
 - A test name is one line without escapes (`test "name" {`): the build scans names to place tests in binaries.

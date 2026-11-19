@@ -16,25 +16,21 @@ GLM admission credits the hot cache, so an eviction lets a long prefill in
 GLM assistant bounded block tail preserves visible keys and masks
 GLM assistant cached sliding mask equals the mask built at any absolute position
 GLM clamped EXL3 rejects malformed banks before kernel dispatch
-GLM group2 cooperative projections preserve F16 bits at all rates and ballot boundaries
-GLM group2 half4 composition preserves all-rate cooperative projection bits
+GLM group2 half4 composition preserves the cooperative projection's bits
 GLM group2 keeps the cooperative reader's bytes under PAIR1
 GLM group2 routed-chain guards precede any preparation
-GLM group2 serves every admitted rate, exact to the cooperative reader
 GLM group2 shared expert joined in the reduce equals the separate BF16 add
-GLM group2 singleton and all-shared routes preserve strided input bits
 GLM near the top of its context keeps fewer checkpoints at the start width instead of being refused
 GLM prefill chunk never widens past the width its numerics are built for
 GLM prefill grid declines guards before dispatch
-GLM prefill grid serves W14 packs with the sorted chain's bytes
-GLM prefill grid serves every admitted rate, mixed projections included, with the sorted chain's bytes
+GLM prefill grid serves mixed projections and K4 with the sorted chain's bytes
 GLM raw FP8 honors the declared wired limit with the same reserve as MiMo
 GLM release defaults advertise the full context at the widest prefill chunk that keeps it
 GLM requests prefill at 2048 and step down a rung only where a chunk stops fitting
-GLM serves PAIR1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included
+GLM serves PAIR1 on group2's routed chain with the unfolded oracle's bytes
 GLM serves PAIR1 on the prefill grid with the unfolded sorted chain's bytes
-GLM serves spec1 and std1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included
-GLM serves spec1 and std1 on the prefill grid with the unfolded sorted chain's bytes
+GLM serves spec1 on group2's routed chain with the unfolded oracle's bytes
+GLM serves spec1 on the prefill grid with the unfolded sorted chain's bytes
 GLM serves std1 on the prefill grid and probes a failing kernel once per codebook and window
 GLM serving accepts native effort levels and thinks by default
 GLM serving memory bills one latent at the request's KV width and pooled index per token
@@ -82,7 +78,7 @@ deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-sett
 deepseek_v41 thinks by default, at its native high effort
 deepseek_v41: the image token spelled in a text-only prompt is text, with no placeholder check
 driver: a tiny Qwen source becomes a complete pack, and a second run into it is refused
-dsv41 geometry: the grouped chain at 5120x2304 over n24, n26, n32, n40 and a mixed class holds the f32-truth bar
+dsv41 geometry: the grouped chain at 5120x2304 over n24, n26 and a mixed class holds the f32-truth bar
 dsv41 geometry: the shared expert as a one-expert fused chain gives a row the same bytes at every decode width and holds the f32-truth bar
 effort off default: DeepSeek and GLM resolve and render as before
 effort off default: Qwen stays off on chat, Anthropic and Responses for a request naming no effort word or budget
@@ -90,30 +86,20 @@ effort off default: a Qwen request naming an effort word or a budget still think
 effort table: with off unoffered, chat, Anthropic and Responses refuse a request that turns thinking off, as GLM does
 every model, GLM included, defaults to kv8 and 16 selects BF16
 exl3 GLM GPU windows match host metadata with zero padded windows
-exl3 GLM GPU windows preserve 288 expert bytes at every admitted rate
-exl3 GLM GPU windows preserve 288 expert production width bytes
-exl3 GLM down lane exact staged and fused bytes
+exl3 GLM GPU windows preserve 288 expert bytes at each reader class's rate
+exl3 GLM down lane and one-row kernels keep the staged chain's bytes
 exl3 GLM lane half4 pair exact bytes
-exl3 GLM lane, one-row and fused middle-down kernels keep the cooperative bytes under PAIR1
 exl3 GLM one-row decode chain equals the lane chain to the byte and engages on one row only
-exl3 GLM serves PAIR1 on its lane chain at the served geometry with the unfolded oracle's bytes
 exl3 GLM serves PAIR1 on its lane fast paths with the staged chain's bytes
-exl3 GLM serves spec1 and std1 on its lane chain at the served geometry with the unfolded oracle's bytes
 exl3 GLM serves spec1 and std1 on its lane fast paths with the staged chain's bytes
 exl3 GLM sorted finish retains stride fallback bytes
 exl3 MiMo verify rows sharing experts are bit-identical to their one-row decode ticks
-exl3 NAX GEMM body writes the reference body's bytes at MiMo and Flash-Next geometry
-exl3 PAIR1 decode arms keep the generic reader's bytes, MiMo's prepared and grouped arms included
-exl3 SPEC1 per-rate table: GLM's lane fast paths and fold keep the staged chain's bytes
-exl3 SPEC1 per-rate table: decode arms keep the generic reader's bytes, MiMo's prepared and grouped arms included
+exl3 SPEC1 per-rate table: GLM's lane fast paths keep the staged chain's bytes
 exl3 STQ shared expert at DeepSeek's shape: a one-row chain gives row 0 of a wider chain the same bytes
 exl3 clamped routing preserves GLM production width bytes
-exl3 down GEMV on a prepared middle keeps the self-preparing kernel's bytes (MiMo rates, grouped rows, K4)
 exl3 expert bytes at the MiMo K2.5 geometry size the resident admission
-exl3 grouped decode keeps the ticks' bytes at Flash-Next and DeepSeek geometry
 exl3 linear: a pair whose second launch sums the first's partials gives the two launches' bytes at DeepSeek's wo shapes and small ones, 1 to 16 rows, on the machine's arm and SIMD, MLX's stream and the engine's
 exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at DeepSeek's trunk shapes, and the lm_head keeps its serial launch's
-exl3 pair GEMV on a prepared input keeps the self-preparing kernel's bytes (MiMo rates, grouped rows, K4)
 exl3 paired cooperative projections preserve GLM width and mixed rate fallback
 exl3 prepared mid keys on MiMo geometry, never on the rate, and excludes qwen and unmeasured widths
 exl3 rate groups: the shared expert riding the decode launches at DeepSeek's geometry, 1 to 6 rows
@@ -136,9 +122,6 @@ mimo v2 fused qkv split keeps asymmetric value rows
 mimo_v2 EXL3 arms stay finite where the SwiGLU product passes the f16 ceiling
 mimo_v2 EXL3 beside an MXFP4 bank is a mixed pack and resolves to nothing
 mimo_v2 EXL3 prefill layers built lazily keep their own window count and rate
-mimo_v2 EXL3 prefill rows match the fused decode arm at E=256 top-8
-mimo_v2 EXL3 prefill rows match the fused decode arm at the served hidden and inter
-mimo_v2 EXL3 prefill rows match the fused decode arm on every GEMM arm
 mimo_v2 EXL3 prefill rows match the host SwiGLU oracle past one GEMM window
 mimo_v2 EXL3 stacked experts resolve as a layout and keep the dense prefix
 mimo_v2 admission credits the hot cache: a gap the cache covers is an evict, not a refusal

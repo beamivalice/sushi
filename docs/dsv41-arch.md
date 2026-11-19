@@ -365,7 +365,7 @@ State-only chunks (a chunk another chunk follows runs no decoder tail):
   a chunk before one of `window` rows or fewer (a stride-boundary cut or a merged tail: a full pass reads the ring).
 - With DSpark on, a decoder layer's ring holds `ring_slack` rows beyond the window that no query reads. A state-only
   chunk leaves them as an earlier pass wrote them, so a restore point's raw ring bytes can differ from the full
-  pass's there; every row a pass reads is the same bits.
+  pass's there; every row a pass reads is the same bits, so a test holds a ring to its last `window` positions only.
 - The release's tail (128 rows) is wider than a decode-width pass (`narrow_rows`, 16); the tiny fixture's window (8) is
   not, so its replay takes the decode kernel, which reads the ring below the tail's first row. The tests raise the
   window to 20 so the replay takes the span path the release takes.
@@ -418,7 +418,7 @@ Prefill pipeline (`Model.pipe_depth`, 2; load line `[dsv41] prefill pipeline: 2 
 - A wide layer is submitted, not waited on: no evaluation at the routed sum or the layer's end, the host waits only on
   the oldest of more than 2 layers in flight, and each chunk drains at its end (`finishPass`, `extendState`), so two
   chunks never overlap. Streamed experts keep the router readback, which orders every slab refill after the layer
-  before it. Same graphs, so the same bytes: `dsv41 prefill pipeline` compares depths 0 to 3.
+  before it. Same graphs, so the same bytes (proven at 2291e1b0 against depth 0; the test went once proven).
 - Measured on 59e7a562 + caee00fe against 59e7a562 (pack revision 2.0, `--ssd-budget-gb 108`, debug log,
   `taskpolicy -a`, GPU lock, AC, fans max and under 50 C before each boot, one boot an arm, six pipelined boots and six
   unpipelined boots of the same prefill code interleaved in three rounds; a cold 16,020-token code prompt, then
@@ -608,7 +608,8 @@ output bytes are the unfused kernels' and the GPU time is no worse (`sushi-ubenc
   (operands truncated to 10 mantissa bits, `(p0 + p1) + (p2 + p3)`, uncontracted) in the simdgroup that stores it, its stream operands loaded before the
   barrier. It engages only where `hcExpand` is the kernel (`foldsExpand`: `hcExpandServes`, no trace, tap or profile, a backbone layer at decode
   width); a settle that finds a missed pick runs the sum and `hcExpand` as before, so the rebuilt stream is the same bytes
-  (`dsv41 stq: queueing the routed chains ...` counts `expands_folded` and compares the queued packs with the drained one).
+  (`dsv41 stq: queueing the routed chains ...` counts `expands_folded` and compares the queued packs with the waiting
+  schedule's).
 
 Microbenches (commit 551d6122, ReleaseFast, GPU lock, QUIET, `taskpolicy -a`, AC, median of rounds of 40 dependent layers, us a layer, link included):
 `dsv41.launch_fusions` router + split 24.0 -> 20.1 (4 rows), window row + rotation 18.3 -> 16.4 (1 row) and 14.7 -> 13.6 (4 rows), with the
@@ -939,8 +940,8 @@ Decode schedule (<= 16 rows, any pack): a layer's output, state rows and DSpark 
 so the host builds the next layer while the GPU runs this one. On an STQ pack the router's picks are submitted first and
 the shared expert is queued behind them (the GPU runs it while the host reads the picks and fills the misses). The next
 layer's picks depend on this layer, so their read is the one host wait per layer and no union slab is refilled under a
-reader. `Model.sync_layers` (tests) waits at every layer instead; the two schedules give the same bytes through hits,
-misses and the union.
+reader. `Model.sync_layers` waits at every layer instead; the two schedules gave the same bytes through hits, misses
+and the union (the test went once proven).
 
 STQ decode also queues the routed chain before the picks are read (`Model.route_spec`, `Experts.Spec`, the Qwen schedule
 of [engine-expert-streaming](engine-expert-streaming.md#decode-schedule)): `StqStream.queue` takes the slot of each pick
@@ -991,8 +992,7 @@ id the model emitted included). The FFN's hc split
 `Spec.queue`'s `ride`), so the one-simdgroup Sinkhorn runs beside the picks and not in a buffer of its own behind the routed chain; same bytes
 (`dsv41 submit`, `dsv41 route split`). Together with the picks kernel and the hc expand grid, serial `--no-mtp` decode at 4.7k went
 52.65 / 51.85 -> 54.42 / 53.53 tok/s (r2 / r3, A B B A, one boot an arm, b95886f8 vs this stack, AC, GPU lock, fans max,
-die < 50 C at boot, `taskpolicy -a`), same text. The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
-round's kept rows ...`). Kernel shapes, arms and timings:
+die < 50 C at boot, `taskpolicy -a`), same text. The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`). Kernel shapes, arms and timings:
 [engine-exl3-experts](engine-exl3-experts.md#dsv41-stq).
 
 A submit costs host CPU (a Metal command buffer), so two with no host wait between them are one: the prefetch
@@ -1292,7 +1292,7 @@ rows arm and 2 or more rows the NAX arm, whose k sums differ. A DSpark round now
 (`project_rows.Mode.exact`, carried by the scopes `verify` opens), except the lm_head, whose SIMD rows arm equals its one-row launch bit for bit and
 is the faster one up to 5 rows, so it takes the SIMD arm at every width. The rest is already width-invariant, by test: the shared
 expert's one-row coop chain against the lane chain (`STQ shared expert at DeepSeek's shape`), the expert-grouped routed chain
-(`verify rows that decode each distinct expert once`), the per-row commit, router and indexer rows (the indexer's
+(proven against the per-row chain, then cut), the per-row commit, router and indexer rows (the indexer's
 top-k split changes no pick). The indexer's head weights were not: a dense `[32, 5120]` weight on MLX's matmul, which runs
 one row on its vector kernel and two or more on its matrix kernel, so a weight sometimes rounded to the other bf16 value and
 moved an index pick (seen at 25.8k context, layer 8). At decode width `indexWeights` sums them in `dsv41_dense_f32x`. The decode attention is not width-invariant by itself: it splits a row's window and picked columns

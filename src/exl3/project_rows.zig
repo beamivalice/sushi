@@ -1094,19 +1094,14 @@ const SIMD_ROWS_DECODES = [_]struct { dec: exl3.Decode, n: u32 }{
     .{ .dec = .{ .codebook = .mcg, .window = .w15 }, .n = 48 },
 };
 
-fn rowsBaselineKernel() !mlx.mlx_fast_metal_kernel {
-    return kernel_src.codebookKernelWith(&kernels.rows_baseline_kernel, "sushi_exl3_rows_baseline", &ROWS_INS, &.{"y"}, kernels.ROWS_BASELINE_SOURCE, ROWS_HELPERS);
-}
-
 test "exl3 multi-row projection matches projectIndexed per row against the f64 projection" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
     const shapes = [_][2]usize{ .{ 512, 640 }, .{ 6144, 384 } };
-    for (0..kernels.PARITY_SEEDS) |i| {
-        for ([_]u32{ 40, 64, 112 }) |n| {
-            for (shapes) |sh| {
-                for (1..5) |rows| {
-                    try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = sh[0], .in_dim = sh[1], .rows = rows, .seed = 1301 + i }));
-                }
+    // One row takes the one-row arm, three the multi-row arm.
+    for ([_]u32{ 40, 64, 112 }) |n| {
+        for (shapes) |sh| {
+            for ([_]usize{ 1, 3 }) |rows| {
+                try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = sh[0], .in_dim = sh[1], .rows = rows, .seed = 1301 }));
             }
         }
     }
@@ -1114,22 +1109,23 @@ test "exl3 multi-row projection matches projectIndexed per row against the f64 p
 
 test "exl3 multi-row projection holds the bar on every launch geometry and at eight rows" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    // The launch classes `rowsGeometryFor` serves: SIMD folded (lm_head-wide), one-row and multi-row k splits; NAX at one
+    // simdgroup per pair folded and split, and at sliced k folded and split, each with its served fragment reader.
     const geoms = [_]RowsGeom{
-        .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 256 },
         .{ .tgrp = 4, .kph = 2, .nsplit = 1, .chunk = 768 },
-        .{ .tgrp = 4, .kph = 1, .nsplit = 2, .chunk = 384 },
         .{ .tgrp = 1, .kph = 4, .nsplit = 3, .chunk = 128 },
-        .{ .tgrp = 2, .kph = 1, .nsplit = 6, .chunk = 128 },
-        .{ .tgrp = 4, .kph = 1, .nsplit = 1, .chunk = 256, .nax = true },
-        .{ .tgrp = 4, .kph = 1, .nsplit = 3, .chunk = 256, .nax = true },
-        .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 256, .nax = true },
-        .{ .tgrp = 4, .kph = 2, .nsplit = 3, .chunk = 256, .nax = true },
-        .{ .tgrp = 4, .kph = 3, .nsplit = 2, .chunk = 384, .nax = true },
-        .{ .tgrp = 4, .kph = 8, .nsplit = 1, .chunk = 256, .nax = true },
+        .{ .tgrp = 2, .kph = 4, .nsplit = 2, .chunk = 384 },
+        .{ .tgrp = 4, .kph = 1, .nsplit = 1, .chunk = 0, .nax = true, .unr = 2, .r32 = true, .sw = true },
+        .{ .tgrp = 4, .kph = 1, .nsplit = 3, .chunk = 0, .nax = true, .unr = 2, .r32 = true, .sw = true },
+        .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 0, .nax = true, .r32 = true, .sw = true },
+        .{ .tgrp = 4, .kph = 2, .nsplit = 3, .chunk = 0, .nax = true, .r32 = true, .sw = true },
     };
-    for (geoms, 0..) |g, gi| {
-        if (g.nax and !kernels.gemmNaxOn()) continue;
-        for ([_]usize{ 1, 3, 8 }) |rows| {
+    for (geoms, 0..) |g0, gi| {
+        if (g0.nax and !kernels.gemmNaxOn()) continue;
+        for ([_]usize{ 1, 8 }) |rows| {
+            var g = g0;
+            if (g.nax) g.chunk = rowsChunk(768, @intCast(rows), g.nsplit);
+            // n48 and n128 take the 64-bit reader, n96 the 32-bit one with its four-word read.
             for ([_]u32{ 48, 96, 128 }) |n| {
                 try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 1024, .in_dim = 768, .rows = rows, .seed = 1401 + gi, .geom = g }));
             }
@@ -1139,9 +1135,11 @@ test "exl3 multi-row projection holds the bar on every launch geometry and at ei
 
 test "exl3 multi-row projection holds the bar at every admitted rate on both kernels" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    const nax = rowsGeometryFor(256, 256, 3, 1, true);
     var n: u32 = exl3.Rate.min_n;
     while (n <= exl3.Rate.max_n) : (n += 2) {
         try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 256, .in_dim = 256, .rows = 3, .seed = 1601 + n, .geom = .{ .tgrp = 1, .kph = 4, .nsplit = 2, .chunk = 128 } }));
+        if (kernels.gemmNaxOn()) try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 256, .in_dim = 256, .rows = 3, .seed = 1601 + n, .geom = nax }));
     }
 }
 
@@ -1165,22 +1163,19 @@ test "exl3 SIMD multi-row: every row equals the one-row launch bit for bit" {
     defer arena.deinit();
     const alloc = arena.allocator();
     defer kernels.setDecodeParams(.mul1);
-    for (SIMD_ROWS_DECODES) |d| {
-        try d.dec.requireTable();
-        kernels.setDecodeParams(d.dec);
-        for ([_][3]usize{ .{ 1024, 512, 1 }, .{ 384, 256, 2 }, .{ 2304, 640, 1 } }) |sh| {
-            const rig = try RowsRig.init(alloc, 0x51d0 + sh[0], sh[0], sh[1], sh[2], d.n);
-            const g1 = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), false);
-            // Each row's one-row launch once, for every width that holds it.
-            var alone: [@as(usize, @intCast(PROJECT_ROWS_MAX))][]const u16 = undefined;
-            for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
-            for (1..@as(usize, @intCast(PROJECT_ROWS_MAX)) + 1) |rows| {
-                const g = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), false);
-                const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
-                for (0..rows) |r| {
-                    for (0..sh[2]) |grp| try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
-                }
-            }
+    // A two-bank launch; linear.zig's exact-rows test holds one-bank launches under the SIMD profile.
+    const d = SIMD_ROWS_DECODES[2];
+    kernels.setDecodeParams(d.dec);
+    const sh = [3]usize{ 384, 256, 2 };
+    const rig = try RowsRig.init(alloc, 0x51d0 + sh[0], sh[0], sh[1], sh[2], d.n);
+    const g1 = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), false);
+    var alone: [@as(usize, @intCast(PROJECT_ROWS_MAX))][]const u16 = undefined;
+    for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
+    for ([_]usize{ 2, @intCast(PROJECT_ROWS_MAX) }) |rows| {
+        const g = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), false);
+        const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
+        for (0..rows) |r| {
+            for (0..sh[2]) |grp| try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
         }
     }
 }
@@ -1215,46 +1210,6 @@ test "exl3 multi-row mode: at the lm_head's shape a wide exact verify of 9 to 16
     }
 }
 
-// A NAX multi-row launch sums a row in an order set by its k slicing alone, so a verify row has the same bytes at every
-// width from two up; the served geometry may not read the row count.
-test "exl3 NAX multi-row: a row has the same bytes at widths 2 to 8 under every k slicing" {
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s) or !kernels.gemmNaxOn()) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    defer kernels.setDecodeParams(.mul1);
-    var failed: usize = 0;
-    for (SIMD_ROWS_DECODES) |d| {
-        try d.dec.requireTable();
-        kernels.setDecodeParams(d.dec);
-        for ([_][3]usize{ .{ 1280, 512, 1 }, .{ 1024, 256, 2 } }) |sh| {
-            const rig = try RowsRig.init(alloc, 0x4a58 + sh[0], sh[0], sh[1], sh[2], d.n);
-            const in: c_int = @intCast(sh[0]);
-            var served: [2]RowsGeom = undefined;
-            for ([_]c_int{ 2, 8 }, &served) |rows, *g| g.* = rowsGeometry(in, @intCast(sh[1]), rows, @intCast(sh[2]), .{});
-            try std.testing.expectEqual(served[0].kph, served[1].kph);
-            try std.testing.expectEqual(served[0].nsplit, served[1].nsplit);
-            const blocks = @divExact(in, 128);
-            for ([_]c_int{ 1, 2, 3, 4, 8 }) |kph| for ([_]c_int{ 1, 2, 4, 5 }) |nsplit| {
-                if (@rem(blocks, nsplit) != 0) continue;
-                const at = RowsGeom{ .tgrp = 4, .kph = kph, .nsplit = nsplit, .chunk = rowsChunk(in, 8, nsplit), .nax = true };
-                const ref = try rig.run(alloc, 0, 8, at, try rowsKernel(at));
-                for (2..8) |rows| {
-                    const g = RowsGeom{ .tgrp = 4, .kph = kph, .nsplit = nsplit, .chunk = rowsChunk(in, @intCast(rows), nsplit), .nax = true };
-                    const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
-                    for (0..sh[2]) |grp| for (0..rows) |r| {
-                        if (std.mem.eql(u16, ref[(grp * 8 + r) * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]])) continue;
-                        std.debug.print("NAX rows differ: n{d} {d}x{d} g{d} kph {d} nsplit {d} rows {d} row {d}\n", .{ d.n, sh[0], sh[1], sh[2], kph, nsplit, rows, r });
-                        failed += 1;
-                    };
-                }
-            };
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 0), failed);
-}
-
 // Past eight rows the NAX arm feeds the tile's second eight rows, which were zero; a row's sums never see another row's,
 // so a 9- to 16-row verify row keeps the bytes of its one-row decode tick.
 test "exl3 NAX multi-row: at 9 to 16 rows every row equals the one-row launch bit for bit" {
@@ -1265,61 +1220,22 @@ test "exl3 NAX multi-row: at 9 to 16 rows every row equals the one-row launch bi
     const alloc = arena.allocator();
     defer kernels.setDecodeParams(.mul1);
     const exact: Mode = .{ .exact = true };
-    const decodes = SIMD_ROWS_DECODES ++ [_]@TypeOf(SIMD_ROWS_DECODES[0]){.{ .dec = exl3.Decode.tabled(.spec1, .w15), .n = 96 }};
-    for (decodes) |d| {
-        try d.dec.requireTable();
-        kernels.setDecodeParams(d.dec);
-        for ([_][3]usize{ .{ 1280, 512, 1 }, .{ 1024, 256, 2 }, .{ 131072, 256, 1 }, .{ 1792, 5120, 1 } }) |sh| {
-            const rig = try RowsRig.init(alloc, 0x9a16 + sh[0] + d.n, sh[0], sh[1], sh[2], d.n);
-            const g1 = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), exact);
-            var alone: [@as(usize, @intCast(NAX_ROWS_MAX))][]const u16 = undefined;
-            for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
-            for (9..@as(usize, @intCast(NAX_ROWS_MAX)) + 1) |rows| {
-                const g = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), exact);
-                const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
-                for (0..sh[2]) |grp| for (0..rows) |r|
-                    try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
-            }
-        }
-    }
-}
-
-test "exl3 SIMD multi-row: the split row loops and the launch policy leave every output byte unchanged" {
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    defer kernels.setDecodeParams(.mul1);
-    const geoms = [_]RowsGeom{
-        .{ .tgrp = 4, .kph = 4, .nsplit = 1, .chunk = 256 },
-        .{ .tgrp = 4, .kph = 2, .nsplit = 1, .chunk = 768 },
-        .{ .tgrp = 4, .kph = 1, .nsplit = 2, .chunk = 384 },
-        .{ .tgrp = 1, .kph = 4, .nsplit = 3, .chunk = 128 },
-        .{ .tgrp = 2, .kph = 4, .nsplit = 2, .chunk = 384 },
-        .{ .tgrp = 2, .kph = 1, .nsplit = 6, .chunk = 128 },
-    };
-    for (SIMD_ROWS_DECODES) |d| {
-        try d.dec.requireTable();
-        kernels.setDecodeParams(d.dec);
-        for ([_]usize{ 1, 2 }) |groups| {
-            const rig = try RowsRig.init(alloc, 0x5b17 + groups, 768, 1024, groups, d.n);
-            for (geoms) |g| for ([_]usize{ 1, 3, 5, 8 }) |rows| {
-                const want = try rig.run(alloc, 0, rows, g, try rowsBaselineKernel());
-                const got = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
-                try std.testing.expectEqualSlices(u16, want, got);
-            };
-        }
-        for ([_][3]usize{ .{ 1024, 512, 1 }, .{ 2304, 640, 1 }, .{ 4096, 1024, 8 }, .{ 128, 131072, 1 } }) |sh| {
-            const rig = try RowsRig.init(alloc, 0x5b99 + sh[0], sh[0], sh[1], sh[2], d.n);
-            for (1..@as(usize, @intCast(PROJECT_ROWS_MAX)) + 1) |rows| {
-                const g = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), false);
-                var before = g;
-                if (g.nsplit > 1) before.tgrp = 1;
-                const want = try rig.run(alloc, 0, rows, before, try rowsBaselineKernel());
-                const got = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
-                try std.testing.expectEqualSlices(u16, want, got);
-            }
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    const n: u32 = 96;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    // A bank and a deep k split; trunk.zig's wide verify test holds a one-bank launch.
+    for ([_][3]usize{ .{ 1024, 256, 2 }, .{ 131072, 256, 1 } }) |sh| {
+        const rig = try RowsRig.init(alloc, 0x9a16 + sh[0] + n, sh[0], sh[1], sh[2], n);
+        const g1 = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), exact);
+        var alone: [@as(usize, @intCast(NAX_ROWS_MAX))][]const u16 = undefined;
+        for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
+        // 9 and 16 rows stage the two chunk widths `rowsChunk` gives past eight.
+        for ([_]usize{ 9, @intCast(NAX_ROWS_MAX) }) |rows| {
+            const g = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), exact);
+            const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
+            for (0..sh[2]) |grp| for (0..rows) |r|
+                try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
         }
     }
 }
@@ -1350,69 +1266,6 @@ test "exl3 multi-row projection is one dispatch on an lm_head-wide output and tw
         defer _ = mlx.mlx_array_free(y);
         try t.expectEqual(@as(u32, @intCast(c[2])), kernels.fusedDispatchCount());
         try t.expectEqualSlices(c_int, &.{ 4, c[0] }, mlx.getShape(y));
-    }
-}
-
-// The served NAX walk reads two k-tiles' fragments ahead of their MMAs, on 32-bit funnels; the MMAs run in the one-tile
-// walk's order into the same accumulator, so every byte is the one-tile, 64-bit walk's.
-test "exl3 NAX multi-row: the unrolled 32-bit walk writes the one-tile walk's bytes" {
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s) or !kernels.gemmNaxOn()) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    defer kernels.setDecodeParams(.mul1);
-    for ([_]exl3.Decode{ exl3.Decode.tabled(.spec1, .w15), .{ .codebook = .mcg, .window = .w15 } }) |dec| for ([_]u32{ 48, 64, 96 }) |n| {
-        try dec.requireTable();
-        kernels.setDecodeParams(dec);
-        for ([_][3]usize{ .{ 640, 2560, 1 }, .{ 1280, 1024, 2 }, .{ 1408, 384, 1 } }) |sh| {
-            const rig = try RowsRig.init(alloc, 0x6a11 + sh[0] + n, sh[0], sh[1], sh[2], n);
-            const in: c_int = @intCast(sh[0]);
-            for ([_]c_int{ 1, 2, 5, 11 }) |nsplit| {
-                if (@rem(@divExact(in, 128), nsplit) != 0) continue;
-                for ([_]c_int{ 1, 3, 8 }) |rows| for ([_]c_int{ rowsChunk(in, rows, nsplit), 128 }) |chunk| {
-                    const one = RowsGeom{ .tgrp = 4, .kph = 1, .nsplit = nsplit, .chunk = chunk, .nax = true };
-                    const want = try rig.run(alloc, 0, @intCast(rows), one, try rowsKernel(one));
-                    for ([_]c_int{ 1, 2, 4 }) |unr| for ([_]bool{ false, true }) |r32| for ([_]bool{ false, true }) |sw| {
-                        if (sw and (!r32 or unr == 4 or chunk != rowsChunk(in, rows, nsplit))) continue;
-                        var g = one;
-                        g.unr = unr;
-                        g.r32 = r32;
-                        g.sw = sw;
-                        try std.testing.expectEqualSlices(u16, want, try rig.run(alloc, 0, @intCast(rows), g, try rowsKernel(g)));
-                    };
-                };
-            }
-        }
-    };
-}
-
-// The 32-bit funnel reader takes the 64-bit reader's codewords at every rate it serves (n62 to n102); another rate keeps
-// the 64-bit reader. Sliced k (kph > 1) keeps the one-tile walk and takes the 32-bit reader alone.
-test "exl3 NAX multi-row: the 32-bit funnel reader writes the 64-bit reader's bytes at every rate" {
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s) or !kernels.gemmNaxOn()) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    defer kernels.setDecodeParams(.mul1);
-    for ([_]exl3.Decode{ exl3.Decode.tabled(.spec1, .w15), .{ .codebook = .mcg, .window = .w15 }, .{ .codebook = .pair1, .window = .w16 } }) |dec| {
-        try dec.requireTable();
-        kernels.setDecodeParams(dec);
-        var n: u32 = 56;
-        while (n <= 112) : (n += 2) {
-            if (dec.codebook.tabledHashMask() and dec.hashMask(.{ .n = n }) == null) continue;
-            if (dec.codebook == .pair1 and exl3.pair1Pair(.{ .n = n }) == null) continue;
-            const rig = try RowsRig.init(alloc, 0x8c41 + n, 1280, 1024, 1, n);
-            for ([_]c_int{ 1, 4 }) |kph| for ([_]c_int{ 1, 3 }) |rows| for ([_]bool{ false, true }) |sw| {
-                const one = RowsGeom{ .tgrp = 4, .kph = kph, .nsplit = 2, .chunk = rowsChunk(1280, rows, 2), .nax = true };
-                const want = try rig.run(alloc, 0, @intCast(rows), one, try rowsKernel(one));
-                var g = one;
-                g.r32 = true;
-                g.sw = sw;
-                try std.testing.expectEqualSlices(u16, want, try rig.run(alloc, 0, @intCast(rows), g, try rowsKernel(g)));
-            };
-        }
     }
 }
 

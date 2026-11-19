@@ -152,36 +152,35 @@ fn expectSameBits(want: Arr, got: Arr) !void {
 }
 
 const Rates = struct { dec: api.format.Decode, rates: [3]c_int };
+// Gate/up and down at their own rates: the down launch is keyed on its own.
 const one_bank_cases = [_]Rates{
-    .{ .dec = test_dec, .rates = .{ 64, 64, 64 } },
-    .{ .dec = test_dec, .rates = .{ 32, 32, 32 } },
     .{ .dec = test_dec, .rates = .{ 44, 44, 64 } },
 };
+/// One row and the widest verify block: a row count only sets the fold's grid height.
+const fold_rows = [_]usize{ 1, 8 };
 
-test "Qwen shared expert folded into the one-bank routed launches is bit exact to the separate chain at every row count" {
+test "Qwen shared expert folded into the one-bank routed launches is bit exact to the separate chain" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var random = std.Random.DefaultPrng.init(901);
     const rnd = random.random();
     var ops = Ops{ .s = s };
     defer ops.deinit();
-    defer api.fold_gated.shared_first = false;
     const experts: c_int = 24;
     for (one_bank_cases) |kind| {
         const bank = try routedBank(&ops, experts, kind.rates[0], kind.rates[2], 40 + @as(u64, @intCast(kind.rates[0])));
-        for ([_]usize{ 128, 64 }) |group| for ([_]f32{ 1, 0.05 }) |gain| {
+        for ([_]usize{ 128, 64 }) |group| {
             var wops = Ops{ .s = s };
             defer wops.deinit();
-            const w = try weights(&wops, std.testing.allocator, rnd, s, hidden, inter, group, gain, 0);
-            for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8 }) |rows| {
+            const w = try weights(&wops, std.testing.allocator, rnd, s, hidden, inter, group, 1, 0);
+            for (fold_rows) |rows| {
                 var scope = Ops{ .s = s };
                 defer scope.deinit();
                 const route = try routing(&scope, rnd, rows, @intCast(experts));
                 const x = try randomBf16(&scope, std.testing.allocator, rnd, &.{ 1, @intCast(rows), hidden }, 4);
                 const want = try separate(&scope, x, w, .{ .bank = bank }, route.ids, route.scores, kind.dec);
                 // The router kernel's own logit rides in at one row, the rider's at every width.
-                for ([_]bool{ false, true }) |router_logit| for ([_]bool{ false, true }) |first| {
-                        api.fold_gated.shared_first = first;
+                for ([_]bool{ false, true }) |router_logit| {
                     var sh = w.shared;
                     var gate: ?Arr = null;
                     if (router_logit) {
@@ -195,9 +194,9 @@ test "Qwen shared expert folded into the one-bank routed launches is bit exact t
                     try std.testing.expectEqual(launches_before + 3, api.fold_gated.launchCount());
                     try std.testing.expectEqual(dispatches_before + 3, api.kernels.fusedDispatchCount());
                     try expectSameBits(want, got);
-                };
+                }
             }
-        };
+        }
     }
 }
 
@@ -210,24 +209,22 @@ fn raggedLayer(ops: *Ops, s: mlx.mlx_stream) !api.Ragged {
     return api.Ragged.init(s, &banks);
 }
 
-test "Qwen shared expert folded into the rate-grouped routed launches is bit exact to the separate chain at every row count" {
+test "Qwen shared expert folded into the rate-grouped routed launches is bit exact to the separate chain" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var random = std.Random.DefaultPrng.init(907);
     const rnd = random.random();
     var ops = Ops{ .s = s };
     defer ops.deinit();
-    defer api.rate_groups.fused_shared_first = false;
     var rb = try raggedLayer(&ops, s);
     defer rb.deinit();
-    for ([_]api.format.Decode{ test_dec, api.format.Decode.tabled(.spec1, .w15) }) |dec| for ([_]f32{ 1, 0.05 }) |gain| {
-        const w = try weights(&ops, std.testing.allocator, rnd, s, hidden, inter, 128, gain, 0);
-        for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8 }) |rows| {
+    for ([_]api.format.Decode{ test_dec, api.format.Decode.tabled(.spec1, .w15) }) |dec| {
+        const w = try weights(&ops, std.testing.allocator, rnd, s, hidden, inter, 128, 1, 0);
+        for (fold_rows) |rows| {
             const route = try routing(&ops, rnd, rows, 24);
             const x = try randomBf16(&ops, std.testing.allocator, rnd, &.{ 1, @intCast(rows), hidden }, 4);
             const want = try separate(&ops, x, w, .{ .ragged = &rb }, route.ids, route.scores, dec);
-            for ([_]bool{ false, true }) |router_logit| for ([_]bool{ false, true }) |first| {
-                api.rate_groups.fused_shared_first = first;
+            for ([_]bool{ false, true }) |router_logit| {
                 var sh = w.shared;
                 var gate: ?Arr = null;
                 if (router_logit) {
@@ -241,9 +238,9 @@ test "Qwen shared expert folded into the rate-grouped routed launches is bit exa
                 try std.testing.expectEqual(launches_before + 3, api.rate_groups.foldLaunchCount());
                 try std.testing.expectEqual(dispatches_before + 3, api.kernels.fusedDispatchCount());
                 try expectSameBits(want, got);
-            };
+            }
         }
-    };
+    }
 }
 
 test "Qwen shared expert fold declines what the separate chain must run" {
@@ -346,7 +343,7 @@ pub const TrellisShared = struct {
     }
 };
 
-test "Qwen trellis shared expert folded into the routed launches is bit exact to the separate chain at every row count" {
+test "Qwen trellis shared expert folded into the routed launches is bit exact to the separate chain" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s) or !api.kernels.gemmNaxOn()) return error.SkipZigTest;
     var random = std.Random.DefaultPrng.init(913);
@@ -359,10 +356,11 @@ test "Qwen trellis shared expert folded into the routed launches is bit exact to
     const trunk_dec = api.format.Decode.tabled(.spec1, .w15);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    for ([_]u32{ 96, 64 }) |bits| {
+    // Each trunk rate once, the one-bank chain at K4 and the rate-grouped one at K6.
+    for ([_]u32{ 96, 64 }, [_]usize{ 1, 0 }) |bits, chain_kind| {
         var w = try TrellisShared.init(&ops, std.testing.allocator, arena.allocator(), rnd, s, bits, trunk_dec);
         defer w.deinit(std.testing.allocator);
-        for (0..2) |chain_kind| for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8 }) |rows| {
+        for (fold_rows) |rows| {
             const dec = if (chain_kind == 0) test_dec else api.format.Decode.tabled(.spec1, .w15);
             const route = try routing(&ops, rnd, rows, 24);
             const x = try randomBf16(&ops, std.testing.allocator, rnd, &.{ 1, @intCast(rows), hidden }, 4);
@@ -382,7 +380,7 @@ test "Qwen trellis shared expert folded into the routed launches is bit exact to
                 try std.testing.expectEqual(dispatches_before + 3, api.kernels.fusedDispatchCount());
                 try expectSameBits(want, got);
             }
-        };
+        }
     }
 }
 

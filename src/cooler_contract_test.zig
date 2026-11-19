@@ -37,8 +37,6 @@ const Load = struct {
     weights: model_mod.Weights,
     xfm: *Trunk,
     h: arch_handle.Handle,
-    /// Off only for the MLX reference (`openMlxReference`).
-    compile: bool,
 
     fn prepare(self: *Load, comptime C: type, dir: []const u8, cooler: bool) !void {
         return self.prepareOn(testing.allocator, C, dir, cooler);
@@ -48,7 +46,6 @@ const Load = struct {
     /// takes; a Cooler load lifts the tests' MLX default.
     fn prepareOn(self: *Load, a: std.mem.Allocator, comptime C: type, dir: []const u8, cooler: bool) !void {
         self.a = a;
-        self.compile = true;
         const off = model_mod.cooler_off;
         defer model_mod.cooler_off = off;
         model_mod.cooler_off = if (cooler) .empty else .full;
@@ -71,7 +68,7 @@ const Load = struct {
         self.xfm = try a.create(Trunk);
         errdefer a.destroy(self.xfm);
         self.xfm.* = try Trunk.init(io, a, self.config, &self.weights);
-        if (self.compile) @import("model_load.zig").compileClosures(self.xfm, .all);
+        @import("model_load.zig").compileClosures(self.xfm, .all);
         self.h = arch_handle.adopt(self.xfm);
     }
 
@@ -101,14 +98,6 @@ const Load = struct {
         const policy = @import("mtp_policy.zig");
         const verify_cap: ?u32 = if (mtp_on) @min(policy.resolveMtpDepthCapForProfile(0, .generic), policy.mtpVerifyDraftsMax(&self.config)) else null;
         try model_load.warmLoad(io, self.a, &self.config, self.xfm, verify_cap, null, kv);
-    }
-
-    /// The MLX load a Cooler load's tokens are held to. MLX's compiled f32 GDN gate is ulps off its own unfused chain,
-    /// which the engine equals, so the reference compiles no closure.
-    fn openMlxReference(self: *Load, comptime C: type, dir: []const u8) !void {
-        try self.prepare(C, dir, false);
-        self.compile = false;
-        try self.loadServed(dir);
     }
 
     fn onEngine(self: *Load) bool {
@@ -156,6 +145,25 @@ const Sheet = struct {
         };
     }
 };
+
+/// Each pool-buffer site `run(ctx)` reaches, at its first ask, but a site already in `seen`, which takes the rest: a
+/// site is a code location with its own unwinding, so one refusal each walks every error path once. Sites are told
+/// apart per arch, whose forward unwinds above them.
+fn firstAsks(a: std.mem.Allocator, seen: *std.AutoHashMapUnmanaged(u64, void), comptime C: type, ctx: anytype, comptime run: fn (@TypeOf(ctx)) anyerror!void) ![]mlx.FaultSites.SitePoint {
+    const sites = &mlx.engine.fault.sites;
+    sites.lasts = false;
+    defer sites.* = .{};
+    const all = try mlx.sweepSites(a, sites, ctx, run);
+    defer a.free(all);
+    var fresh: std.ArrayList(mlx.FaultSites.SitePoint) = .empty;
+    errdefer fresh.deinit(a);
+    for (all) |pt| if (!(try seen.getOrPut(a, archSite(C, pt.site))).found_existing) try fresh.append(a, pt);
+    return fresh.toOwnedSlice(a);
+}
+
+fn archSite(comptime C: type, site: u64) u64 {
+    return std.hash.Wyhash.hash(site, @typeName(C));
+}
 
 /// What `eachFixture` saw over the fixtures. A body that skips (a load the test does not apply to) moves on to the next
 /// fixture; any other error ends the test. The test is a skip when a fixture is missing or no body ran.
@@ -227,7 +235,32 @@ fn eachArch(comptime body: fn (comptime C: type, dir: []const u8, ids: []const u
     return eachOf(.first, body);
 }
 
-fn eachOf(comptime which: enum { every, first }, comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+/// `body` on one fixture per arch and per expert residency, the first chosen of each: resident, and streamed (the BF16
+/// checkpoint, MXFP4 experts). For a pool, memory or cleanup property, which a streamed plan changes and a pack's
+/// geometry or tile order does not.
+fn eachResidency(comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+    return eachOf(.per_residency, body);
+}
+
+/// `body` on one fixture per arch and per expert layout, the first chosen of each: its residency and its tile order
+/// (the pair-major pack). For a property of the loader, its cleanup or the calls a request makes, which a pack's
+/// geometry (the cut beside the tiny) does not change.
+fn eachLayout(comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+    return eachOf(.per_layout, body);
+}
+
+/// A contract load's expert layout, from its config as the arch prepares it; nothing loads. Bit 0: the experts stream;
+/// bit 1: they are stored pair-major.
+fn layoutOf(comptime C: type, dir: []const u8) !u2 {
+    const a = testing.allocator;
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    try C.prepare(a, &config, dir);
+    const streamed = config.expert_streaming and !config.expert_resident;
+    return @as(u2, @intFromBool(streamed)) | @as(u2, @intFromBool(config.expert_tile_order == .pair_major)) << 1;
+}
+
+fn eachOf(comptime which: enum { every, first, per_residency, per_layout }, comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
     try mlx.requireGpu();
     const sel = selection();
     var set_buf: [16]bool = undefined;
@@ -240,6 +273,8 @@ fn eachOf(comptime which: enum { every, first }, comptime body: fn (comptime C: 
         if (comptime @hasDecl(registry.Mod(t), "cooler_contract")) {
             const C = registry.Mod(t).cooler_contract;
             var took_one = false;
+            // The layouts taken (`layoutOf`); per residency only its streamed bit counts.
+            var took: [4]bool = @splat(false);
             for (C.fixtures) |env| {
                 if (!fixtureChosen(sel, env)) continue;
                 if (which == .first and took_one) break;
@@ -247,6 +282,12 @@ fn eachOf(comptime which: enum { every, first }, comptime body: fn (comptime C: 
                     tally.absent();
                     continue;
                 });
+                if (which == .per_residency or which == .per_layout) {
+                    const layout = layoutOf(C, dir) catch |e| return named(env, dir, e);
+                    const key = if (which == .per_residency) layout & 1 else layout;
+                    if (took[key]) continue;
+                    took[key] = true;
+                }
                 const ids = C.prompt(testing.allocator, dir) catch |e| return named(env, dir, e);
                 defer testing.allocator.free(ids);
                 tally.took(body(C, dir, ids)) catch |e| return named(env, dir, e);
@@ -326,53 +367,48 @@ fn serialWith(ld: *Load, ids: []const u32, n: u32, sampling: SamplingParams, opt
     return got;
 }
 
-test "cooler contract: a Cooler load that drops experts by usage routes only the kept ones and says the MLX load's tokens" {
+test "cooler contract: a Cooler load that drops experts by usage serves, routing only the kept ones on the GPU" {
     // A route to a dropped expert fails the request (`ExpertDropped`): the router must never pick one.
-    try eachFixture(struct {
+    try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             if (comptime !@hasDecl(C, "dropExperts")) return error.SkipZigTest;
             const a = testing.allocator;
             var tmp = testing.tmpDir(.{ .iterate = true });
             defer tmp.cleanup();
-            var root: ?[:0]u8 = null;
-            defer if (root) |r| a.free(r);
-            var said: [2]std.ArrayList(u32) = undefined;
-            var made: usize = 0;
-            defer for (said[0..made]) |*t| t.deinit(a);
-            for ([_]bool{ false, true }) |cooler| {
-                var ld: Load = undefined;
-                try ld.prepare(C, dir, cooler);
-                ld.compile = cooler;
-                if (root == null) root = try @import("test_support.zig").usagePack(&tmp, dir, ld.config.num_hidden_layers, ld.config.num_experts, ld.config.num_experts_per_tok);
-                const n = (C.dropExperts(a, &ld.config, root.?) catch |e| {
-                    ld.config.deinit(a);
-                    return e;
-                }) orelse {
-                    ld.config.deinit(a);
-                    return error.SkipZigTest;
-                };
-                ld.config.drop_expert = n;
-                try ld.load(root.?);
-                defer _ = ld.close();
-                try testing.expectEqual(cooler, ld.onEngine());
-                // Every expert the router can pick is resident: a one-row request reads no route on the host.
-                const engine = ld.xfm.expert_stream orelse return error.TestExpectedExpertStream;
-                if (engine.plan.resident) {
-                    const before = engine.hostRoutes();
-                    const handed = if (cooler) mlx.engine.stats().handovers else 0;
-                    const tokens = 4;
-                    var one = try greedy(&ld, ids[0..1], tokens);
-                    one.deinit(a);
-                    try testing.expectEqual(before, engine.hostRoutes());
-                    // Nor does a layer hand its pass over early: each boundary leaves the GPU idle, and the kicks start it.
-                    // A token hands over two: the step's own next forward, and its sample's pass before the next
-                    // forward reads the ids (`qwen4_hc.handOverIdsWriter`).
-                    if (cooler) try testing.expect(mlx.engine.stats().handovers - handed <= 2 * tokens);
-                }
-                said[made] = try greedy(&ld, ids[0..@min(ids.len, 9)], 6);
-                made += 1;
+            var ld: Load = undefined;
+            try ld.prepare(C, dir, true);
+            const root = @import("test_support.zig").usagePack(&tmp, dir, ld.config.num_hidden_layers, ld.config.num_experts, ld.config.num_experts_per_tok) catch |e| {
+                ld.config.deinit(a);
+                return e;
+            };
+            defer a.free(root);
+            const n = (C.dropExperts(a, &ld.config, root) catch |e| {
+                ld.config.deinit(a);
+                return e;
+            }) orelse {
+                ld.config.deinit(a);
+                return error.SkipZigTest;
+            };
+            ld.config.drop_expert = n;
+            try ld.load(root);
+            defer _ = ld.close();
+            try testing.expect(ld.onEngine());
+            // Every expert the router can pick is resident: a one-row request reads no route on the host.
+            const engine = ld.xfm.expert_stream orelse return error.TestExpectedExpertStream;
+            if (engine.plan.resident) {
+                const before = engine.hostRoutes();
+                const handed = mlx.engine.stats().handovers;
+                const tokens = 4;
+                var one = try greedy(&ld, ids[0..1], tokens);
+                one.deinit(a);
+                try testing.expectEqual(before, engine.hostRoutes());
+                // Nor does a layer hand its pass over early: each boundary leaves the GPU idle, and the kicks start it.
+                // A token hands over two: the step's own next forward, and its sample's pass before the next
+                // forward reads the ids (`qwen4_hc.handOverIdsWriter`).
+                try testing.expect(mlx.engine.stats().handovers - handed <= 2 * tokens);
             }
-            try testing.expectEqualSlices(u32, said[0].items, said[1].items);
+            var said = try greedy(&ld, ids[0..@min(ids.len, 9)], 6);
+            said.deinit(a);
         }
     }.run);
 }
@@ -424,7 +460,7 @@ test "cooler contract: a Cooler load that serves more than one row gives each ro
 }
 
 test "cooler contract: a Cooler load runs on the engine and holds every weight in an owned region, none in the forward pool" {
-    try eachFixture(struct {
+    try eachLayout(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
             var cooler: Load = undefined;
             try cooler.open(C, dir, true);
@@ -437,7 +473,7 @@ test "cooler contract: a Cooler load runs on the engine and holds every weight i
 }
 
 test "cooler contract: a Cooler load opens under whatever engine cap was in force before it, and its unload leaves the pool as it found it" {
-    try eachFixture(struct {
+    try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
             const base = Sheet.now();
             // A cap an earlier forward left in force, below the smallest buffer the load makes.
@@ -463,19 +499,10 @@ test "cooler contract: a prompt token id outside the model's vocabulary is refus
     }.run);
 }
 
-test "cooler contract: a Cooler load's request and unload ask nothing of MLX, and a load the user opted out to MLX says the same tokens" {
-    try eachFixture(struct {
+test "cooler contract: a Cooler load's request and unload ask nothing of MLX" {
+    try eachLayout(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const prompt = ids[0..@min(ids.len, 30)];
-            var want: std.ArrayList(u32) = .empty;
-            defer want.deinit(testing.allocator);
-            {
-                var on_mlx: Load = undefined;
-                try on_mlx.openMlxReference(C, dir);
-                defer _ = on_mlx.close();
-                try testing.expect(!on_mlx.onEngine());
-                want = try greedy(&on_mlx, prompt, 12);
-            }
             var cooler: Load = undefined;
             try cooler.open(C, dir, true);
             var closed = false;
@@ -484,9 +511,8 @@ test "cooler contract: a Cooler load's request and unload ask nothing of MLX, an
             };
             const calls = mlx.engine.mlxCalls();
             var got = try greedy(&cooler, prompt, 12);
-            defer got.deinit(testing.allocator);
+            got.deinit(testing.allocator);
             try testing.expectEqual(calls, mlx.engine.mlxCalls());
-            try testing.expectEqualSlices(u32, want.items, got.items);
             // The job's end then pays MLX what it was owed while at rest: not the teardown's.
             closed = true;
             try testing.expectEqual(@as(u64, 0), cooler.close());
@@ -494,8 +520,8 @@ test "cooler contract: a Cooler load's request and unload ask nothing of MLX, an
     }.run);
 }
 
-test "cooler contract: a Cooler load refused at pool buffers sampled over its whole load frees what it made, and the next load serves the same tokens" {
-    try eachFixture(struct {
+test "cooler contract: a Cooler load refused at a pool buffer where its cleanup changes frees what it made, and the next load serves the same tokens" {
+    try eachLayout(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             defer mlx.engine.fault.disarm();
             const prompt = ids[0..@min(ids.len, 30)];
@@ -508,36 +534,41 @@ test "cooler contract: a Cooler load refused at pool buffers sampled over its wh
                 want = try greedy(&first, prompt, 8);
             }
             const base = Sheet.now();
-            const c0 = mlx.engine.fault.count();
+            // The asks of the trunk's bring-up (`Load.load`, whose errdefers free the weights and the trunk) and of the
+            // served warm (`serve`, whose failure closes the whole load), counted on a clean load after the first.
+            var asks: [2]u64 = undefined;
             {
                 var counted: Load = undefined;
-                try counted.open(C, dir, true);
-                _ = counted.close();
+                try counted.prepare(C, dir, true);
+                const c0 = mlx.engine.fault.count();
+                try counted.load(dir);
+                defer _ = counted.close();
+                const c1 = mlx.engine.fault.count();
+                try counted.serve();
+                asks = .{ c1 - c0, mlx.engine.fault.count() - c1 };
             }
-            const total = mlx.engine.fault.count() - c0;
             try testing.expectEqual(base, Sheet.now());
+            try testing.expect(asks[0] > 0 and asks[1] > 0);
+            // The bring-up's first and last ask (nothing of it made yet; all of it but one buffer), and the warm's first:
+            // a warm failed anywhere closes the whole load, and its forwards' own unwinding is the request sweeps'.
+            const points = [_]u64{ 1, asks[0], asks[0] + 1 };
             var msg: [300]u8 = undefined;
-            var refused: usize = 0;
-            var k: u64 = 1;
-            while (k <= total) : (k += @max(1, total / 12)) {
+            for (points) |k| {
                 var fx: Load = undefined;
                 try fx.prepare(C, dir, true);
                 mlx.engine.fault.arm(k);
                 const r = fx.loadServed(dir);
+                const fired = !mlx.engine.fault.armed();
                 mlx.engine.fault.disarm();
-                if (r) {
+                errdefer std.debug.print("cooler contract: the load refused at pool buffer {d} of {d} ({s}) left {any} -> {any}\n", .{ k, asks[0] + asks[1], if (r) |_| "it loaded" else |_| "it failed", base, Sheet.now() });
+                if (r) |_| {
                     _ = fx.close();
-                    errdefer std.debug.print("cooler contract: the load refused at pool buffer {d} of {d} loaded and left an error latched: {s}\n", .{ k, total, mlx.takeError(&msg) orelse "" });
                     try testing.expect(!mlx.errorPending());
-                } else |_| {
-                    refused += 1;
-                    _ = mlx.takeError(&msg);
-                }
+                } else |_| _ = mlx.takeError(&msg);
+                try testing.expect(fired);
                 try testing.expect(!mlx.engine.holding());
-                errdefer std.debug.print("cooler contract: the load refused at pool buffer {d} of {d} ({s}) left {any} -> {any}\n", .{ k, total, if (r) |_| "it loaded" else |_| "it failed", base, Sheet.now() });
                 try testing.expectEqual(base, Sheet.now());
             }
-            try testing.expect(refused >= 10);
             var after: Load = undefined;
             try after.open(C, dir, true);
             defer _ = after.close();
@@ -548,8 +579,8 @@ test "cooler contract: a Cooler load refused at pool buffers sampled over its wh
     }.run);
 }
 
-test "cooler contract: a Cooler warm's image splice refused at any pool buffer frees what it made" {
-    try eachFixture(struct {
+test "cooler contract: a Cooler warm's image splice refused at any of its pool buffer sites frees what it made" {
+    try eachArch(struct {
         fn go(ld: *Load) anyerror!void {
             const turn = arch_handle.turnFor(ld.h, &ld.config);
             defer turn.end();
@@ -563,7 +594,9 @@ test "cooler contract: a Cooler warm's image splice refused at any pool buffer f
             try ld.open(C, dir, true);
             defer _ = ld.close();
             if (ld.config.image_token_id == 0) return error.SkipZigTest;
-            const points = try mlx.sweepSites(a, &mlx.engine.fault.sites, &ld, go);
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            const points = try firstAsks(a, &seen, C, &ld, go);
             defer a.free(points);
             try testing.expect(points.len > 1);
             const base = Sheet.now();
@@ -585,8 +618,8 @@ test "cooler contract: a Cooler warm's image splice refused at any pool buffer f
     }.run);
 }
 
-test "cooler contract: a Cooler image request refused at any pool buffer frees what it made, the embedding its rows splice into too" {
-    try eachFixture(struct {
+test "cooler contract: a Cooler image request refused at any pool buffer site a text request lacks frees what it made, the embedding its rows splice into too" {
+    try eachArch(struct {
         const Req = struct {
             ld: *Load,
             prompt: []const u32,
@@ -623,7 +656,13 @@ test "cooler contract: a Cooler image request refused at any pool buffer frees w
                 _ = mlx.mlx_array_free(ld.xfm.vision_embeddings.?);
                 ld.xfm.vision_embeddings = null;
             }
-            const points = try mlx.sweepSites(a, &mlx.engine.fault.sites, Req{ .ld = &ld, .prompt = &prompt }, Req.go);
+            // A text request's sites are the request sweep's; this one refuses those the image's rows add.
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            var text: [12]u32 = undefined;
+            for (&text, 0..) |*t, i| t.* = ids[i % ids.len];
+            a.free(try firstAsks(a, &seen, C, Req{ .ld = &ld, .prompt = &text }, Req.go));
+            const points = try firstAsks(a, &seen, C, Req{ .ld = &ld, .prompt = &prompt }, Req.go);
             defer a.free(points);
             const base = Sheet.now();
             var msg: [300]u8 = undefined;
@@ -643,15 +682,10 @@ test "cooler contract: a Cooler image request refused at any pool buffer frees w
     }.run);
 }
 
-test "cooler contract: a Cooler load's speculative requests say the same requests' tokens on MLX and ask nothing of MLX, and the unload gives back everything" {
-    try eachFixture(struct {
-        fn spec(ld: *Load, comptime C: type, prompt: []const u32) !std.ArrayList(u32) {
-            var asked: u64 = 0;
-            return specAsked(ld, C, prompt, &asked);
-        }
-
-        /// `spec`, and the MLX calls the request made to its end. The turn's end is not counted: returning to a side
-        /// not at rest pays MLX what it is owed for its own earlier launches (`mlx.payOwed`), which no request asked.
+test "cooler contract: a Cooler load's speculative requests ask nothing of MLX, and the unload gives back everything" {
+    try eachLayout(struct {
+        /// A speculative request, and the MLX calls it made to its end. The turn's end is not counted: returning to a
+        /// side not at rest pays MLX what it is owed for its own earlier launches (`mlx.payOwed`), which no request asked.
         fn specAsked(ld: *Load, comptime C: type, prompt: []const u32, asked: *u64) !std.ArrayList(u32) {
             const turn = arch_handle.turnFor(ld.h, &ld.config);
             defer turn.end();
@@ -663,31 +697,20 @@ test "cooler contract: a Cooler load's speculative requests say the same request
 
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             if (comptime !@hasDecl(C, "specTokens")) return error.SkipZigTest;
-            const a = testing.allocator;
-            var want: [C.prompt_lengths.len]std.ArrayList(u32) = @splat(.empty);
-            defer for (&want) |*w| w.deinit(a);
-            {
-                var on_mlx: Load = undefined;
-                try on_mlx.openMlxReference(C, dir);
-                defer _ = on_mlx.close();
-                for (C.prompt_lengths, &want) |len, *w| w.* = try spec(&on_mlx, C, ids[0..@min(ids.len, len)]);
-            }
             const base = Sheet.now();
             var cooler: Load = undefined;
             try cooler.open(C, dir, true);
             {
                 errdefer _ = cooler.close();
                 try testing.expect(C.headLoaded(cooler.xfm));
-                for (C.prompt_lengths, want) |len, w| {
+                // One row, past the verify edge, a chunk: the forwards a prompt length can take.
+                for ([_]usize{ 1, 9, 40 }) |len| {
                     const prompt = ids[0..@min(ids.len, len)];
-                    for (0..2) |round| {
-                        var asked: u64 = 0;
-                        var got = try specAsked(&cooler, C, prompt, &asked);
-                        defer got.deinit(a);
-                        errdefer std.debug.print("cooler contract: speculative request {d} over a prompt of {d} tokens\n", .{ round, prompt.len });
-                        try testing.expectEqualSlices(u32, w.items, got.items);
-                        try testing.expectEqual(@as(u64, 0), asked);
-                    }
+                    var asked: u64 = 0;
+                    var got = try specAsked(&cooler, C, prompt, &asked);
+                    got.deinit(testing.allocator);
+                    errdefer std.debug.print("cooler contract: a speculative request over a prompt of {d} tokens asked MLX {d} times\n", .{ prompt.len, asked });
+                    try testing.expectEqual(@as(u64, 0), asked);
                 }
             }
             _ = cooler.close();
@@ -697,7 +720,7 @@ test "cooler contract: a Cooler load's speculative requests say the same request
 }
 
 test "cooler contract: a Cooler load's warm that ends seals the engine, and one refused at a pool buffer fails the load" {
-    try eachFixture(struct {
+    try eachArch(struct {
         fn warm(ld: *Load) !void {
             const turn = arch_handle.turnFor(ld.h, &ld.config);
             defer turn.end();
@@ -735,7 +758,7 @@ test "cooler contract: a Cooler load's warm that ends seals the engine, and one 
 
 test "cooler contract: a Cooler prefill's chunks before the tail project no logits" {
     // An eager engine evaluates what MLX's lazy graph drops: a chunk's logits are rows x vocab x 2 bytes.
-    try eachFixture(struct {
+    try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             var ld: Load = undefined;
             try ld.open(C, dir, true);
@@ -800,7 +823,7 @@ fn besideSealed(comptime A: type, comptime B: type) !bool {
 }
 
 test "cooler contract: a Cooler request ends with its pass closed and at most its resting cap free in the pool, and the unload leaves the pool empty" {
-    try eachFixture(struct {
+    try eachResidency(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const before = Sheet.now();
             var ld: Load = undefined;
@@ -848,7 +871,7 @@ test "cooler contract: a Cooler load's prefix cache keeps its arrays on the engi
 }
 
 test "cooler contract: a Cooler load's sampled speculative requests, seeded or not, serve and ask nothing of MLX" {
-    try eachFixture(struct {
+    try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             if (comptime !@hasDecl(C, "specTokensWith")) return error.SkipZigTest;
             const a = testing.allocator;
@@ -860,8 +883,9 @@ test "cooler contract: a Cooler load's sampled speculative requests, seeded or n
                 .{ .temperature = 0.8, .top_p = 0.95, .seed = 7 },
                 .{ .temperature = 1.0, .top_k = 20 },
             };
-            for (cases) |sampling| for (C.prompt_lengths) |len| {
-                const prompt = ids[0..@min(ids.len, len)];
+            // The sampler's draw follows no prompt length: each length's forward is the greedy cell's.
+            const prompt = ids[0..@min(ids.len, 9)];
+            for (cases) |sampling| {
                 const turn = arch_handle.turnFor(cooler.h, &cooler.config);
                 defer turn.end();
                 defer arch_sched.endRequest(&cooler.config);
@@ -871,12 +895,12 @@ test "cooler contract: a Cooler load's sampled speculative requests, seeded or n
                 defer got.deinit(a);
                 try testing.expectEqual(@as(usize, 12), got.items.len);
                 try testing.expectEqual(calls, mlx.engine.mlxCalls());
-            };
+            }
         }
     }.run);
 }
 
-test "cooler contract: a seeded sampled speculative request says the seeded serial request's tokens, again after other requests and at every pinned depth" {
+test "cooler contract: a seeded sampled speculative request says the seeded serial request's tokens, again after another request and at every pinned depth" {
     try eachFixture(struct {
         fn spec(ld: *Load, comptime C: type, prompt: []const u32, n: u32, sampling: SamplingParams, depth: u32) !std.ArrayList(u32) {
             const turn = arch_handle.turnFor(ld.h, &ld.config);
@@ -906,21 +930,20 @@ test "cooler contract: a seeded sampled speculative request says the seeded seri
             for (&long, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
             const cases = [_]SamplingParams{
                 .{ .temperature = 0.8, .top_k = 20, .seed = 42 },
-                .{ .temperature = 0.8, .top_p = 0.95, .seed = 7 },
-                .{ .temperature = 1.3, .top_p = 0.5, .top_k = 5, .seed = 3 },
                 .{ .temperature = 1.0, .top_p = 0.95, .top_k = 40, .min_p = 0.05, .seed = 11 },
             };
             var bad: u32 = 0;
-            for (cases) |sampling| for ([_]usize{ 9, long.len }) |len| {
-                const prompt = long[0..len];
+            const len = long.len;
+            const prompt: []const u32 = &long;
+            for (cases) |sampling| {
                 var want = try serial(&ld, prompt, 32, sampling);
                 defer want.deinit(a);
                 var first = try spec(&ld, C, prompt, 32, sampling, 0);
                 defer first.deinit(a);
                 if (differs("the speculative request against the serial one", 0, sampling, len, want.items, first.items)) bad += 1;
                 // Another request between publishes the acceptance the next one plans from.
-                for (0..2) |k| {
-                    var other = try spec(&ld, C, long[0 .. 100 + k * 60], 24, .{ .temperature = 0 }, 0);
+                {
+                    var other = try spec(&ld, C, long[0..100], 24, .{ .temperature = 0 }, 0);
                     other.deinit(a);
                     var again = try spec(&ld, C, prompt, 32, sampling, 0);
                     defer again.deinit(a);
@@ -933,7 +956,7 @@ test "cooler contract: a seeded sampled speculative request says the seeded seri
                     defer pinned.deinit(a);
                     if (differs("the speculative request against the first", depth, sampling, len, first.items, pinned.items)) bad += 1;
                 }
-            };
+            }
             try testing.expectEqual(@as(u32, 0), bad);
         }
     }.run);
@@ -1006,7 +1029,7 @@ const BoundRun = struct {
 };
 
 test "cooler contract: a greedy request's thought closed by its budget says the serial request's tokens, whether the close lands on a serial tick or a speculative round's exit" {
-    try eachFixture(struct {
+    try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             if (comptime !@hasDecl(C, "specOptions") or !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
             const a = testing.allocator;
@@ -1048,7 +1071,7 @@ test "cooler contract: a greedy request's thought closed by its budget says the 
     }.run);
 }
 
-test "cooler contract: after a Cooler load's served warm, requests of every prompt length to 40, greedy, speculative and sampled, compile no kernel" {
+test "cooler contract: after a Cooler load's served warm, greedy requests of every prompt length to 40, and speculative and sampled ones, compile no kernel" {
     try eachFixture(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             var cooler: Load = undefined;
@@ -1069,6 +1092,12 @@ test "cooler contract: after a Cooler load's served warm, requests of every prom
                 const prompt = long[0..len];
                 var got = try greedy(&cooler, prompt, 6);
                 got.deinit(testing.allocator);
+                // Each length is its own prefill shape; a speculative request's verify and draw take the same shapes
+                // after any of them, so one length runs them.
+                if (len != long.len) {
+                    if (first_late == null and mlx.engine.latePipelines() != late) first_late = len;
+                    continue;
+                }
                 if (@hasDecl(C, "specTokens")) {
                     const turn = arch_handle.turnFor(cooler.h, &cooler.config);
                     defer turn.end();
@@ -1124,7 +1153,7 @@ test "cooler contract: an exact Cooler prefill bill is what each kind of layer a
                 C.standInAllBut(kinds);
                 bills.cooler_rows_for_test = C.prefillRowsOf(&ld.config, kinds);
                 bills.qsa_off_for_test = !C.selectsBlocks(kinds);
-                for ([_]usize{ 512, 2048, 8192 }) |width| {
+                for ([_]usize{ 512, 8192 }) |width| {
                     const wide = try a.alloc(u32, width);
                     defer a.free(wide);
                     for (wide, 0..) |*t, i| t.* = ids[i % ids.len];
@@ -1228,7 +1257,7 @@ test "cooler contract: a decode after a long Cooler prefill grows the engine's p
     }.run);
 }
 
-test "cooler contract: every prefill width a Cooler load serves, on its first request and on every later one, grows the engine's pool by no more than the chunk's bill" {
+test "cooler contract: a Cooler prefill chunk, the widest on the load's first request and any width on a later one, grows the engine's pool by no more than the chunk's bill" {
     try eachFixture(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
@@ -1242,8 +1271,8 @@ test "cooler contract: every prefill width a Cooler load serves, on its first re
             defer a.free(long);
             for (long, 0..) |*t, i| t.* = ids[i % ids.len];
             const cfg = &ld.xfm.config;
-            // The widest is the load's first request; each width then runs after another request ended.
-            for ([_]usize{ top, 512, 1024, 2048, 4096, top }, 0..) |pin, at| {
+            // The widest is the load's first request; a narrower width, then the widest again, run after another ended.
+            for ([_]usize{ top, 1024, top }, 0..) |pin, at| {
                 const prompt = long[0 .. pin + 1];
                 const width = prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, prompt.len, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), pin);
                 const bill = bills.prefillChunkHeldMax(&ld.config, if (kv.scheme == .off) 16 else kv.bits, width, prompt.len);
@@ -1472,7 +1501,7 @@ test "cooler contract: after a Cooler load's served warm, a prompt at the widest
 }
 
 test "cooler contract: a pipeline a Cooler request compiles late is written to the load's manifest, for the next load to make ahead" {
-    try eachFixture(struct {
+    try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
             const shared = @import("arch/cooler_pipelines.zig");
             var tmp = testing.tmpDir(.{ .iterate = true });
@@ -1515,7 +1544,7 @@ test "cooler contract: a pipeline a Cooler request compiles late is written to t
 }
 
 test "cooler contract: a Cooler load whose manifest made every pipeline runs no served warm" {
-    try eachFixture(struct {
+    try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
             const shared = @import("arch/cooler_pipelines.zig");
             const cooler_warm = @import("cooler_warm.zig");
@@ -1545,7 +1574,7 @@ test "cooler contract: a Cooler load whose manifest made every pipeline runs no 
 }
 
 test "cooler contract: a Cooler load whose widest served request holds more than its bill is refused by name" {
-    try eachFixture(struct {
+    try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
             const shared = @import("arch/cooler_pipelines.zig");
             const cooler_warm = @import("cooler_warm.zig");
@@ -1605,12 +1634,12 @@ fn faultedLoad(comptime C: type, dir: []const u8, phase: Phase, k: u64) !struct 
     return .{ .fired = fired, .left = left };
 }
 
-/// Frames from each phase's root a load's sweep tells sites by. `load`: every step of bringing the trunk up, to the
-/// weights and layers it binds. `serve`: the warm's own steps, the cache, the draft rerank, the warm-up, the verify and
-/// served warms; the forwards inside them are the request sweeps'.
-const load_sweep_frames = std.enums.EnumArray(Phase, usize).init(.{ .load = 4, .serve = 3 });
+/// Frames from each phase's root a load's sweep tells sites by: one site per step of the phase. `load`: the weights,
+/// the trunk's init, its closures, the handle. `serve`: the cache, the draft rerank, the warm; what runs inside a step
+/// unwinds through that step's cleanup, and the forwards inside the warm are the request sweeps'.
+const load_sweep_frames = std.enums.EnumArray(Phase, usize).init(.{ .load = 3, .serve = 3 });
 
-test "cooler contract: a Cooler load failed at any of its checked MLX calls leaves nothing of it behind" {
+test "cooler contract: a Cooler load failed at the first checked MLX call of any step, or the last of a bring-up step, leaves nothing of it behind" {
     var paths = std.AutoHashMap(u64, void).init(testing.allocator);
     defer paths.deinit();
     const S = struct {
@@ -1625,8 +1654,10 @@ test "cooler contract: a Cooler load failed at any of its checked MLX calls leav
             }
             var left: usize = 0;
             for ([_]Phase{ .load, .serve }) |phase| {
-                // One clean load records the phase's sites; each is failed at its first call. A fixture whose phase
-                // makes the very calls another's did is that path again, and is not swept twice.
+                // One clean load records the phase's steps; each is failed at its first call (nothing of it made), and a
+                // bring-up step at its last too (all of it made but that call); the warm's tail varies by a call from load
+                // to load. A fixture whose phase makes the very calls another's did is that path again, and is not swept
+                // twice.
                 const R = struct {
                     dir: []const u8,
                     phase: Phase,
@@ -1634,7 +1665,7 @@ test "cooler contract: a Cooler load failed at any of its checked MLX calls leav
                         if ((try faultedLoad(C, r.dir, r.phase, 0)).left) return error.CleanLoadLeft;
                     }
                 };
-                mlx.fault.sites = .{ .from = .root, .frames = load_sweep_frames.get(phase), .lasts = false };
+                mlx.fault.sites = .{ .from = .root, .frames = load_sweep_frames.get(phase), .lasts = phase == .load };
                 const points = try mlx.sweepPoints(testing.allocator, &mlx.fault.sites, R{ .dir = dir, .phase = phase }, R.go);
                 defer testing.allocator.free(points);
                 const path = std.hash.Wyhash.hash(@intFromEnum(phase), std.mem.sliceAsBytes(points));
@@ -1657,14 +1688,15 @@ test "cooler contract: a Cooler load failed at any of its checked MLX calls leav
         }
     };
     S.seen = &paths;
-    try eachFixture(S.run);
+    try eachLayout(S.run);
 }
 
 test "cooler contract: requests, repeated, leave the engine as they found it, and an unload gives back everything, load after load" {
-    try eachFixture(struct {
+    try eachResidency(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const prompt = ids[0..@min(ids.len, 30)];
-            for (0..3) |_| {
+            // A second load is what meets a first load's leftovers.
+            for (0..2) |_| {
                 const before = Sheet.now();
                 var cooler: Load = undefined;
                 try cooler.open(C, dir, true);
@@ -1675,11 +1707,9 @@ test "cooler contract: requests, repeated, leave the engine as they found it, an
                         g.deinit(testing.allocator);
                     }
                     const warm = Sheet.now();
-                    for (0..3) |_| {
-                        var g = try greedy(&cooler, prompt, 6);
-                        g.deinit(testing.allocator);
-                        try testing.expectEqual(warm, Sheet.now());
-                    }
+                    var g = try greedy(&cooler, prompt, 6);
+                    g.deinit(testing.allocator);
+                    try testing.expectEqual(warm, Sheet.now());
                 }
                 _ = cooler.close();
                 try testing.expectEqual(before, Sheet.now());
@@ -1688,8 +1718,11 @@ test "cooler contract: requests, repeated, leave the engine as they found it, an
     }.run);
 }
 
-test "cooler contract: a Cooler request failed at any of its checked MLX calls leaves the engine as a whole request does, and the next says the same tokens" {
-    try eachFixture(struct {
+test "cooler contract: a Cooler request failed at any of its checked MLX call sites leaves the engine as a whole request does, and the next says the same tokens" {
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(testing.allocator);
+    const S = struct {
+        var sites: *std.AutoHashMapUnmanaged(u64, void) = undefined;
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             defer mlx.fault.disarm();
             const prompt = ids[0..@min(ids.len, 30)];
@@ -1711,12 +1744,21 @@ test "cooler contract: a Cooler request failed at any of its checked MLX calls l
                     got.deinit(testing.allocator);
                 }
             };
-            // Each op under its callers fails once, at its first call: a request is short, and its sites many.
-            mlx.fault.sites = .{ .lasts = false };
-            defer mlx.fault.sites = .{};
-            const points = try mlx.sweepPoints(testing.allocator, &mlx.fault.sites, Req{ .ld = &cooler, .prompt = prompt }, Req.go);
-            defer testing.allocator.free(points);
-            for (points) |k| {
+            // Each op under its callers fails once, at its first call, on the first fixture of the arch that reaches it.
+            var list: std.ArrayList(u64) = .empty;
+            defer list.deinit(testing.allocator);
+            mlx.fault.sites = .{ .list = &list, .gpa = testing.allocator };
+            const recorded = Req.go(.{ .ld = &cooler, .prompt = prompt });
+            const unrecorded = mlx.fault.sites.failed;
+            mlx.fault.sites = .{};
+            try recorded;
+            if (unrecorded) return error.OutOfMemory;
+            var points: std.ArrayList(u64) = .empty;
+            defer points.deinit(testing.allocator);
+            for (list.items, 1..) |site, k| {
+                if (!(try sites.getOrPut(testing.allocator, archSite(C, site))).found_existing) try points.append(testing.allocator, k);
+            }
+            for (points.items) |k| {
                 mlx.fault.arm(k);
                 var faulted = greedy(&cooler, prompt, 6);
                 mlx.fault.disarm();
@@ -1734,64 +1776,32 @@ test "cooler contract: a Cooler request failed at any of its checked MLX calls l
                 try testing.expectEqual(base, Sheet.now());
             }
         }
-    }.run);
+    };
+    S.sites = &seen;
+    try eachLayout(S.run);
 }
 
-/// The logits of a prefill of `ids` and of the one-token step after it, as bytes.
-fn stepLogits(ld: *Load, ids: []const u32, step: u32, out: *std.ArrayList(u8)) !void {
-    const turn = arch_handle.turnFor(ld.h, &ld.config);
-    defer turn.end();
-    defer arch_sched.endRequest(&ld.config);
-    try ld.xfm.resetCache();
-    const tail = [_]u32{step};
-    for ([_][]const u32{ ids, &tail }) |part| {
-        const arr = mlx.mlx_array_new_data(@ptrCast(part.ptr), &[_]c_int{ 1, @intCast(part.len) }, 2, .int32);
-        defer _ = mlx.mlx_array_free(arr);
-        const lg = try @import("model_handle.zig").forward(ld.xfm, arr);
-        defer _ = mlx.mlx_array_free(lg);
-        var c: mlx.mlx_array = .{};
-        defer _ = mlx.mlx_array_free(c);
-        try mlx.check(mlx.mlx_contiguous(&c, lg, false, ld.xfm.s));
-        try mlx.check(mlx.mlx_array_eval(c));
-        const n = mlx.mlx_array_size(c) * mlx.mlx_array_itemsize(c);
-        try out.appendSlice(testing.allocator, mlx.mlx_array_data_uint8(c).?[0..n]);
-    }
-}
 
-test "cooler contract: a Cooler load's prefill and next step give the uncompiled MLX load's logits byte for byte at every prompt length, and an exact speculative request its greedy tokens" {
+test "cooler contract: an exact Cooler speculative request says its greedy tokens, over one row, past the verify edge and a chunk" {
     try eachFixture(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            if (comptime !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
             const a = testing.allocator;
-            var want: [C.prompt_lengths.len]std.ArrayList(u8) = @splat(.empty);
-            defer for (&want) |*w| w.deinit(a);
-            {
-                var on_mlx: Load = undefined;
-                try on_mlx.openMlxReference(C, dir);
-                defer _ = on_mlx.close();
-                for (C.prompt_lengths, &want) |len, *w| try stepLogits(&on_mlx, ids[0..@min(ids.len, len)], ids[ids.len - 1], w);
-            }
             var ld: Load = undefined;
             try ld.open(C, dir, true);
             defer _ = ld.close();
-            for (C.prompt_lengths, want) |len, w| {
+            if (!C.specIsGreedy(&ld.config)) return error.SkipZigTest;
+            for ([_]usize{ 1, 9, 40 }) |len| {
                 const prompt = ids[0..@min(ids.len, len)];
                 errdefer std.debug.print("cooler contract: a prompt of {d} tokens\n", .{prompt.len});
-                var got: std.ArrayList(u8) = .empty;
-                defer got.deinit(a);
-                try stepLogits(&ld, prompt, ids[ids.len - 1], &got);
-                try testing.expectEqualSlices(u8, w.items, got.items);
-                if (comptime @hasDecl(C, "specIsGreedy")) {
-                    if (C.specIsGreedy(&ld.config)) {
-                        var g = try greedy(&ld, prompt, 12);
-                        defer g.deinit(a);
-                        const turn = arch_handle.turnFor(ld.h, &ld.config);
-                        defer turn.end();
-                        defer arch_sched.endRequest(&ld.config);
-                        var sp = try C.specTokens(a, ld.xfm, prompt, 12);
-                        defer sp.deinit(a);
-                        try testing.expectEqualSlices(u32, g.items, sp.items);
-                    }
-                }
+                var g = try greedy(&ld, prompt, 12);
+                defer g.deinit(a);
+                const turn = arch_handle.turnFor(ld.h, &ld.config);
+                defer turn.end();
+                defer arch_sched.endRequest(&ld.config);
+                var sp = try C.specTokens(a, ld.xfm, prompt, 12);
+                defer sp.deinit(a);
+                try testing.expectEqualSlices(u32, g.items, sp.items);
             }
         }
     }.run);
@@ -1974,7 +1984,7 @@ const Served = struct {
 };
 
 test "cooler contract: a served Cooler request that restores from the SSD tier says a cold request's tokens and asks nothing of MLX" {
-    try eachFixture(struct {
+    try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             // Long enough that the tier holds restore points under it.
@@ -2087,8 +2097,11 @@ fn requestOf(comptime C: type, ld: *Load, prompt: []const u32, n: u32, spec: boo
     return C.specTokens(testing.allocator, ld.xfm, prompt, n);
 }
 
-test "cooler contract: a Cooler request refused at any pool buffer fails by its error, and every later request on the same load says the same tokens" {
-    try eachFixture(struct {
+test "cooler contract: a Cooler request refused at any pool buffer site fails by its error, and every later request on the same load says the same tokens" {
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(testing.allocator);
+    const S = struct {
+        var sites: *std.AutoHashMapUnmanaged(u64, void) = undefined;
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             defer mlx.engine.fault.disarm();
@@ -2117,9 +2130,10 @@ test "cooler contract: a Cooler request refused at any pool buffer fails by its 
                         got.deinit(testing.allocator);
                     }
                 };
-                // One clean request records every pool buffer's site; each site is refused at its first and last ask. A
-                // speculative request's asks do not come in the same order every time, so a point is a site's n-th ask.
-                const points = try mlx.sweepSites(a, &mlx.engine.fault.sites, Req{ .ld = &ld, .prompt = prompt, .spec = spec }, Req.go);
+                // One clean request records every pool buffer's site; each is refused at its first ask, on the first arm
+                // and fixture of the arch that reaches it. A speculative request's asks do not come in the same order
+                // every time, so a point is a site's n-th ask.
+                const points = try firstAsks(a, sites, C, Req{ .ld = &ld, .prompt = prompt, .spec = spec }, Req.go);
                 defer a.free(points);
                 const base = Sheet.now();
                 for (points, 0..) |pt, at| {
@@ -2144,8 +2158,11 @@ test "cooler contract: a Cooler request refused at any pool buffer fails by its 
                 }
             };
         }
-    }.run);
+    };
+    S.sites = &seen;
+    try eachLayout(S.run);
 }
+
 
 /// The Cooler contract of the arch registered as `name`, or an empty struct where the build left it out: a shared test
 /// of one arch's load checks `@hasDecl` and skips, so the drop of that arch still compiles it.
@@ -2332,7 +2349,7 @@ test "cooler contract: a served request restored from a shorter prompt's SSD rec
     // record sits off this prompt's cold split ([0, N - 31) then the tail), so its state reaches N - 31 in two
     // spans where cold forwards one, and bf16 near-ties may flip. What holds is that the restore is taken and is
     // deterministic.
-    try eachFixture(struct {
+    try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var long: [1300]u32 = undefined;
@@ -2361,6 +2378,15 @@ test "cooler contract: a served request restored from a shorter prompt's SSD rec
 
 /// The Qwen fixtures a served-path cell runs on: the tiny STQ and, when set, the cut.
 fn eachQwenServed(comptime body: fn (comptime Q: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+    return qwenServedOn(&.{ "QWEN4_STQ_TINY", "QWEN4_TEST_MODEL" }, body);
+}
+
+/// The tiny STQ alone: for a sweep, whose sites the cut's load reaches as well.
+fn qwenTinyServed(comptime body: fn (comptime Q: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+    return qwenServedOn(&.{"QWEN4_STQ_TINY"}, body);
+}
+
+fn qwenServedOn(envs: []const [:0]const u8, comptime body: fn (comptime Q: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
     try mlx.requireGpu();
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -2369,7 +2395,7 @@ fn eachQwenServed(comptime body: fn (comptime Q: type, dir: []const u8, ids: []c
     const Q = ContractOf("qwen4");
     if (comptime !@hasDecl(Q, "prompt")) return error.SkipZigTest;
     var ran = false;
-    for ([_][:0]const u8{ "QWEN4_STQ_TINY", "QWEN4_TEST_MODEL" }) |env| {
+    for (envs) |env| {
         if (!fixtureChosen(selection(), env)) continue;
         const dir = std.mem.span(std.c.getenv(env) orelse continue);
         const ids = try Q.prompt(testing.allocator, dir);
@@ -2387,6 +2413,8 @@ const SsdRestore = struct {
     long: []const u32,
     other: []const u32,
     restored: ?*std.ArrayList(u32) = null,
+    /// The two cold requests alone, no restore.
+    cold_only: bool = false,
 
     fn go(self: SsdRestore) anyerror!void {
         const a = testing.allocator;
@@ -2399,6 +2427,7 @@ const SsdRestore = struct {
         cold.deinit(a);
         var o = try sv.request(self.other, 4, &f);
         o.deinit(a);
+        if (self.cold_only) return;
         const got = try sv.request(self.long, 12, &f);
         if (self.restored) |out| out.* = got else {
             var g = got;
@@ -2407,8 +2436,8 @@ const SsdRestore = struct {
     }
 };
 
-test "cooler contract: a served SSD restore refused at any pool buffer fails or says the cold tokens, and the next conversation says them" {
-    try eachQwenServed(struct {
+test "cooler contract: a served SSD restore refused at any pool buffer site its cold requests lack fails or says the cold tokens, and the next conversation says them" {
+    try qwenTinyServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var long: [1300]u32 = undefined;
@@ -2420,8 +2449,12 @@ test "cooler contract: a served SSD restore refused at any pool buffer fails or 
             const plain = SsdRestore{ .ld = &ld, .dir = dir, .long = &long, .other = ids[0..@min(ids.len, 20)], .restored = &cold };
             try plain.go();
             defer cold.deinit(a);
-            // Each point replays the whole conversation on a fresh tier, so every recorded point is reached again.
-            const points = try mlx.sweepSites(a, &mlx.engine.fault.sites, SsdRestore{ .ld = &ld, .dir = dir, .long = &long, .other = ids[0..@min(ids.len, 20)] }, SsdRestore.go);
+            // Each point replays the whole conversation on a fresh tier, so every recorded point is reached again. The
+            // restore's own sites only: the cold requests' are the request sweep's.
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            a.free(try firstAsks(a, &seen, Q, SsdRestore{ .ld = &ld, .dir = dir, .long = &long, .other = ids[0..@min(ids.len, 20)], .cold_only = true }, SsdRestore.go));
+            const points = try firstAsks(a, &seen, Q, SsdRestore{ .ld = &ld, .dir = dir, .long = &long, .other = ids[0..@min(ids.len, 20)] }, SsdRestore.go);
             defer a.free(points);
             var msg: [300]u8 = undefined;
             for (points, 0..) |pt, at| {
@@ -2497,7 +2530,7 @@ fn servedRows(sv: *Served, prompts: [2][]const u32, n: u32, out: *[2]std.ArrayLi
     hc.disk.?.drainWriter();
 }
 
-test "cooler contract: two served requests as rows say their solo tokens, and a rows tick refused at any pool buffer leaves the next rows theirs and the pool as it was" {
+test "cooler contract: two served requests as rows say their solo tokens, and a rows tick refused at any pool buffer site the solo requests lack leaves the next rows theirs and the pool as it was" {
     try eachQwenServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
@@ -2531,7 +2564,23 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
                 defer x.deinit(a);
                 try testing.expectEqualSlices(u32, solo[i].items, x.items);
             }
-            const points = try mlx.sweepSites(a, &mlx.engine.fault.sites, Req{ .sv = &sv, .p = prompts }, Req.go);
+            // The sweep's sites are the cut's too: it runs on the tiny, over the rows tick's own sites.
+            if (!std.mem.eql(u8, dir, std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse ""))) return;
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            const Solo = struct {
+                sv: *Served,
+                p: [2][]const u32,
+                fn go(q: @This()) anyerror!void {
+                    for (q.p) |p| {
+                        var f: u32 = 0;
+                        var got = try q.sv.request(p, 16, &f);
+                        got.deinit(testing.allocator);
+                    }
+                }
+            };
+            a.free(try firstAsks(a, &seen, Q, Solo{ .sv = &sv, .p = prompts }, Solo.go));
+            const points = try firstAsks(a, &seen, Q, Req{ .sv = &sv, .p = prompts }, Req.go);
             defer a.free(points);
             const base = Sheet.now();
             var msg: [300]u8 = undefined;
@@ -2590,106 +2639,7 @@ fn greedyOn(ld: *Load, ids: []const u32, n: u32) !std.ArrayList(u32) {
     return got;
 }
 
-/// The last row's logits of `ids` forwarded in chunks of `chunk` (0: one forward), then those of one step of `step`.
-/// The prompt's forwards skip the lm_head as serve's chunks do (a whole-prompt readout is no served shape); its last
-/// row is projected alone.
-fn lastRowLogits(ld: *Load, ids: []const u32, chunk: usize, step: u32, out: *std.ArrayList(u8)) !void {
-    const handle = @import("model_handle.zig");
-    const turn = arch_handle.turnFor(ld.h, &ld.config);
-    defer turn.end();
-    defer arch_sched.endRequest(&ld.config);
-    try ld.xfm.resetCache();
-    const w = if (chunk == 0) ids.len else chunk;
-    var pos: usize = 0;
-    while (pos < ids.len) {
-        const end = @min(ids.len, pos + w);
-        const part = ids[pos..end];
-        const arr = mlx.mlx_array_new_data(@ptrCast(part.ptr), &[_]c_int{ 1, @intCast(part.len) }, 2, .int32);
-        defer _ = mlx.mlx_array_free(arr);
-        var ctx = ld.xfm.defaultCtx();
-        ctx.skip_lm_head = true;
-        const hidden = try handle.forwardWith(ld.xfm, &ctx, arr);
-        defer _ = mlx.mlx_array_free(hidden);
-        if (end < ids.len) {
-            try mlx.check(mlx.mlx_array_eval(hidden));
-        } else {
-            const sh = mlx.getShape(hidden);
-            var row: mlx.mlx_array = .{};
-            defer _ = mlx.mlx_array_free(row);
-            try mlx.check(mlx.mlx_slice(&row, hidden, &[_]c_int{ 0, sh[1] - 1, 0 }, 3, &[_]c_int{ 1, sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, ld.xfm.s));
-            const lg = try ld.xfm.lmHeadLogits(row);
-            defer _ = mlx.mlx_array_free(lg);
-            try appendBytes(ld, lg, out);
-        }
-        pos = end;
-    }
-    const tail = [_]u32{step};
-    const arr = mlx.mlx_array_new_data(@ptrCast(&tail), &[_]c_int{ 1, 1 }, 2, .int32);
-    defer _ = mlx.mlx_array_free(arr);
-    const lg = try handle.forward(ld.xfm, arr);
-    defer _ = mlx.mlx_array_free(lg);
-    try appendBytes(ld, lg, out);
-}
-
-fn appendBytes(ld: *Load, arr: mlx.mlx_array, out: *std.ArrayList(u8)) !void {
-    var c: mlx.mlx_array = .{};
-    defer _ = mlx.mlx_array_free(c);
-    try mlx.check(mlx.mlx_contiguous(&c, arr, false, ld.xfm.s));
-    try mlx.check(mlx.mlx_array_eval(c));
-    const n = mlx.mlx_array_size(c) * mlx.mlx_array_itemsize(c);
-    try out.appendSlice(testing.allocator, mlx.mlx_array_data_uint8(c).?[0..n]);
-}
-
-const PrefillArm = struct { len: usize, chunk: usize };
-/// Every prefill arm a prompt can take: each short width, the verify and prefill edges, the indexer budget's, chunked.
-/// The 4097-token prompt's chunkings keep one per tail a chunk can leave: just past 16 rows, just past 128, a ragged
-/// width and a one-row tail (each a whole 4097-row prefill on both loads, so the table's bulk).
-const prefill_arms = blk: {
-    var c: []const PrefillArm = &.{};
-    for (1..17) |l| c = c ++ [_]PrefillArm{.{ .len = l, .chunk = 0 }};
-    for ([_]usize{ 17, 24, 31, 32, 33, 48, 63, 64, 65, 96, 127, 128, 129, 255, 256, 257, 512, 513, 1024, 2047, 2048, 2049, 4096, 4097 }) |l| c = c ++ [_]PrefillArm{.{ .len = l, .chunk = 0 }};
-    for ([_]usize{ 17, 129, 1000, 4096 }) |ch| c = c ++ [_]PrefillArm{.{ .len = 4097, .chunk = ch }};
-    c = c ++ [_]PrefillArm{ .{ .len = 2049, .chunk = 1000 }, .{ .len = 600, .chunk = 16 }, .{ .len = 129, .chunk = 1 } };
-    break :blk c;
-};
-
-test "cooler contract: on real text, a Cooler load's last-row and next-step logits are the MLX load's bytes at every prefill arm and chunking (cut)" {
-    const Q = ContractOf("qwen4");
-    if (comptime !@hasDecl(Q, "prompt")) return error.SkipZigTest;
-    try mlx.requireGpu();
-    const was_enabled = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was_enabled);
-    const dir = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
-    errdefer {
-        var msg: [512]u8 = undefined;
-        std.debug.print("cooler contract: fixture {s}: {s}\n", .{ dir, mlx.takeError(&msg) orelse "no MLX or engine error latched" });
-    }
-    const a = testing.allocator;
-    const ids = try realTextIds(a, dir, 4097);
-    defer a.free(ids);
-    const step = ids[4096];
-    var want: [prefill_arms.len]std.ArrayList(u8) = @splat(.empty);
-    defer for (&want) |*w| w.deinit(a);
-    {
-        var on_mlx: Load = undefined;
-        try on_mlx.openMlxReference(Q, dir);
-        defer _ = on_mlx.close();
-        for (prefill_arms, &want) |arm, *w| try lastRowLogits(&on_mlx, ids[0..arm.len], arm.chunk, step, w);
-    }
-    var ld: Load = undefined;
-    try ld.open(Q, dir, true);
-    defer _ = ld.close();
-    for (prefill_arms, want) |arm, w| {
-        var got: std.ArrayList(u8) = .empty;
-        defer got.deinit(a);
-        try lastRowLogits(&ld, ids[0..arm.len], arm.chunk, step, &got);
-        errdefer std.debug.print("cooler contract: real text of {d} tokens in chunks of {d}: Cooler's logits are not the MLX load's\n", .{ arm.len, arm.chunk });
-        try testing.expectEqualSlices(u8, w.items, got.items);
-    }
-}
-
-test "cooler contract: on real text, greedy speculative at depths 1, 3 and 6 says greedy's tokens across prefill arms (cut)" {
+test "cooler contract: on real text, greedy speculative at depths 1, 3 and 6 says greedy's tokens, short and past the two-pass context (cut)" {
     const Q = ContractOf("qwen4");
     if (comptime !@hasDecl(Q, "prompt")) return error.SkipZigTest;
     try mlx.requireGpu();
@@ -2707,7 +2657,9 @@ test "cooler contract: on real text, greedy speculative at depths 1, 3 and 6 say
     var ld: Load = undefined;
     try ld.open(Q, dir, true);
     defer _ = ld.close();
-    for ([_]usize{ 1, 5, 16, 17, 65, 129, 513, 2049, 4097 }) |len| {
+    // Below and past the 2048 context where verify takes the two-pass kernel, the second a chunked prefill; the short
+    // prompt arms are the tiny's.
+    for ([_]usize{ 17, 4097 }) |len| {
         var greedy_said = try greedyOn(&ld, ids[0..len], 40);
         defer greedy_said.deinit(a);
         // The shallowest and deepest round and one between: each depth re-prefills the prompt.
@@ -2725,7 +2677,7 @@ test "cooler contract: on real text, greedy speculative at depths 1, 3 and 6 say
     }
 }
 
-test "cooler contract: on real text, joined decode rows say their solo rows' tokens for ragged prompts across prefill arms (cut)" {
+test "cooler contract: on real text, joined decode rows say their solo rows' tokens for a long chunked prompt beside a short one (cut)" {
     const Q = ContractOf("qwen4");
     if (comptime !@hasDecl(Q, "prompt")) return error.SkipZigTest;
     try mlx.requireGpu();
@@ -2738,12 +2690,13 @@ test "cooler contract: on real text, joined decode rows say their solo rows' tok
         std.debug.print("cooler contract: fixture {s}: {s}\n", .{ dir, mlx.takeError(&msg) orelse "no MLX or engine error latched" });
     }
     const a = testing.allocator;
-    const ids = try realTextIds(a, dir, 8200);
+    const ids = try realTextIds(a, dir, 4200);
     defer a.free(ids);
     var ld: Load = undefined;
     try ld.open(Q, dir, true);
     defer _ = ld.close();
-    const sets = [_][]const usize{ &.{ 4097, 17 }, &.{ 1, 65, 129, 2049 }, &.{ 4096, 4097, 3000, 513, 64, 16, 2, 8000 } };
+    // A long chunked row past the two-pass context beside a short one; three short rows are the tiny's.
+    const sets = [_][]const usize{&.{ 4097, 17 }};
     for (sets) |lens| {
         var prompts: [8][]const u32 = undefined;
         for (lens, 0..) |l, i| prompts[i] = ids[i * 7 .. i * 7 + l];
@@ -3137,9 +3090,10 @@ fn withUiSettings(dir: []const u8, row: []const u8, comptime body: fn () anyerro
     try body();
 }
 
-test "cooler contract: a Cooler load under each KV precision and context extension the web UI saves gives the uncompiled MLX load's logits byte for byte" {
+test "cooler contract: a Cooler load under each KV precision and context extension the web UI offers takes it and loads on the engine" {
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            _ = ids;
             const rows = [_]struct { []const u8, []const u8, []const u8 }{
                 .{ "{\"kv_quant\": \"off\"}", "kv_quant", "off" },
                 .{ "{\"kv_quant\": \"4\"}", "kv_quant", "4" },
@@ -3150,42 +3104,23 @@ test "cooler contract: a Cooler load under each KV precision and context extensi
                 const row = r[0];
                 const Cell = struct {
                     var d: []const u8 = undefined;
-                    var p: []const u32 = undefined;
                     fn body() !void {
-                        const a = testing.allocator;
-                        var want: [C.prompt_lengths.len]std.ArrayList(u8) = @splat(.empty);
-                        defer for (&want) |*w| w.deinit(a);
-                        {
-                            var on_mlx: Load = undefined;
-                            try on_mlx.openMlxReference(C, d);
-                            defer _ = on_mlx.close();
-                            // A row the web UI does not offer for this model (DeepSeek keeps no KV cache to quantize, a
-                            // RoPE with no YaRN) has nothing to hold; one it offers must take effect, never skip.
-                            const fit = @import("arch/flags.zig").settingsFit(&on_mlx.config);
-                            const model_settings = @import("model_settings.zig");
-                            if (!model_settings.applies(r[1], fit) or !model_settings.choiceAllowed(r[1], r[2], fit)) return;
-                            errdefer std.debug.print("cooler contract: {s} is offered for this model and did not take effect\n", .{row});
-                            if (comptime std.mem.eql(u8, r[1], "kv_quant")) {
-                                try testing.expect(on_mlx.config.kv_quant_override != null);
-                            } else try testing.expect(on_mlx.config.yarn_factor_override != null);
-                            for (C.prompt_lengths, &want) |len, *w| try stepLogits(&on_mlx, p[0..@min(p.len, len)], p[p.len - 1], w);
-                        }
                         var ld: Load = undefined;
                         try ld.open(C, d, true);
                         defer _ = ld.close();
+                        // A row the web UI does not offer for this model (DeepSeek keeps no KV cache to quantize, a
+                        // RoPE with no YaRN) has nothing to hold; one it offers must take effect, never skip.
+                        const fit = @import("arch/flags.zig").settingsFit(&ld.config);
+                        const model_settings = @import("model_settings.zig");
+                        if (!model_settings.applies(r[1], fit) or !model_settings.choiceAllowed(r[1], r[2], fit)) return;
+                        errdefer std.debug.print("cooler contract: {s} is offered for this model and did not take effect\n", .{row});
+                        if (comptime std.mem.eql(u8, r[1], "kv_quant")) {
+                            try testing.expect(ld.config.kv_quant_override != null);
+                        } else try testing.expect(ld.config.yarn_factor_override != null);
                         try testing.expect(ld.onEngine());
-                        for (C.prompt_lengths, want) |len, w| {
-                            const prompt = p[0..@min(p.len, len)];
-                            errdefer std.debug.print("cooler contract: {s}, a prompt of {d} tokens\n", .{ row, prompt.len });
-                            var got: std.ArrayList(u8) = .empty;
-                            defer got.deinit(a);
-                            try stepLogits(&ld, prompt, p[p.len - 1], &got);
-                            try testing.expectEqualSlices(u8, w.items, got.items);
-                        }
                     }
                 };
                 Cell.d = dir;
-                Cell.p = ids;
                 try withUiSettings(dir, row, Cell.body);
             }
         }

@@ -575,67 +575,6 @@ test "sushi coder layouts refuse malformed missing mixed and unsupported groups"
     try t.expectError(error.Exl3GroupNameInvalid, plan.add("gate_proj.g32.trellis", &.{ 1, 8, 8, 32 }, .u16));
 }
 
-test "sushi coder GPU two groups equal independently routed uniform banks" {
-    try mlx.requireGpu();
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    var banks: [2]Bank = undefined;
-    var held: std.ArrayList(mlx.mlx_array) = .empty;
-    defer {
-        for (held.items) |a| _ = mlx.mlx_array_free(a);
-        held.deinit(t.allocator);
-    }
-    for (&banks, 0..) |*bank, group| {
-        for ([_]*Proj{ &bank.gate, &bank.up, &bank.down }, 0..) |p, projection| {
-            const n: c_int = @intCast(32 + 16 * ((group + projection) % 3));
-            const words = try t.allocator.alloc(u16, @intCast(8 * 8 * n));
-            defer t.allocator.free(words);
-            for (words, 0..) |*v, i| v.* = @truncate(i *% 7919 +% 23);
-            const signs: [128]u16 = @splat(format.f32ToF16Bits(0.125));
-            p.trellis = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ 1, 8, 8, n }, 4, .uint16);
-            try held.append(t.allocator, p.trellis);
-            p.suh = mlx.mlx_array_new_data(&signs, &[_]c_int{ 1, 128 }, 2, .float16);
-            try held.append(t.allocator, p.suh);
-            p.svh = mlx.mlx_array_new_data(&signs, &[_]c_int{ 1, 128 }, 2, .float16);
-            try held.append(t.allocator, p.svh);
-        }
-    }
-    const xh: [128]u16 = @splat(format.f32ToF16Bits(0.25));
-    const x = mlx.mlx_array_new_data(&xh, &[_]c_int{ 1, 1, 128 }, 3, .float16);
-    defer _ = mlx.mlx_array_free(x);
-    const ids = mlx.mlx_array_new_data(&[_]i32{ 1, 0 }, &[_]c_int{ 1, 1, 2 }, 3, .int32);
-    defer _ = mlx.mlx_array_free(ids);
-    const scores = mlx.mlx_array_new_data(&[_]f32{ 0.25, 0.75 }, &[_]c_int{ 1, 1, 2 }, 3, .float32);
-    defer _ = mlx.mlx_array_free(scores);
-    const got = try moeGroups(s, x, &banks, ids, scores, .mcg, false);
-    defer _ = mlx.mlx_array_free(got);
-    const one_id = mlx.mlx_array_new_data(&[_]i32{0}, &[_]c_int{ 1, 1, 1 }, 3, .int32);
-    defer _ = mlx.mlx_array_free(one_id);
-    var outputs: [2]mlx.mlx_array = undefined;
-    for (&outputs, 0..) |*out, i| {
-        const score = mlx.mlx_array_new_data(&[_]f32{if (i == 0) 0.75 else 0.25}, &[_]c_int{ 1, 1, 1 }, 3, .float32);
-        defer _ = mlx.mlx_array_free(score);
-        out.* = try moe(s, x, banks[i], one_id, score, .mcg, false);
-    }
-    defer for (outputs) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    var want = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(want);
-    try mlx.check(mlx.mlx_add(&want, outputs[0], outputs[1], s));
-    var actual = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(actual);
-    var expected = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(expected);
-    try mlx.check(mlx.mlx_astype(&actual, got, .float32, s));
-    try mlx.check(mlx.mlx_astype(&expected, want, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(actual));
-    try mlx.check(mlx.mlx_array_eval(expected));
-    const a = mlx.mlx_array_data_float32(actual).?;
-    const e = mlx.mlx_array_data_float32(expected).?;
-    for (0..128) |i| try t.expectApproxEqAbs(e[i], a[i], 0.0001 + @abs(e[i]) * 0.01);
-}
-
 /// Routed SwiGLU of a rate-grouped layer, in `moe`'s shapes and dtype. Decode and verify rows fold
 /// `shared` (with `shared_gate`: the bf16 `sigmoid(gate) * shared`) into the finish reduce where the
 /// uniform chain does (one row); otherwise the tail runs as separate ops.

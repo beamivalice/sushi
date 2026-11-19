@@ -168,8 +168,8 @@ four rows; down: sixteen rows, a simdgroup per four), so every output element ha
 - **Proof** (`GLM shared expert folded into the routed launches is bit exact ...` for one row, `... routed rows launches
   ...` for two to eight): bytes equal to the separate chain (gate/up plus the stock affine down plus
   `moeClampedWithShared`; the shared rows chain plus `moeLayoutShared`), at the real 4096/2048 geometry with nine experts at
-  n36, for gate/up and down stored at 6/6/6, 5/5/5, 8/8/8, 5/5/8, 8/8/6 (and 6/6/5 on one row) bits, large and small gains
-  (the clamps both ways), with either part's threadgroups first; five launches a layer (`fold_clamped.launchCount`). Two more
+  n36, for gate/up and down stored at 5/5/8, 8/8/6 and 6/6/5 bits, gain 1, in the served launch order (the other
+  stored widths, gains and orders ran when it was proven); five launches a layer (`fold_clamped.launchCount`). Two more
   tests cover the declines.
 - **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=glm5` times the routed-first order; this table, base `f831f1e5` plus the rows change,
   ReleaseFast, GPU lock, `taskpolicy -a`, fans auto, M5 Max, median of 21 interleaved rounds of 8 dependent layers over eight

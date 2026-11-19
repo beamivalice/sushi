@@ -173,7 +173,7 @@ A call is not a pure function of its arguments in these ways. A host serving sev
 |---|---|
 | `linear.force_arm` | forces `linear` onto one `Arm` (`rows`, `gemm`, `gemv`) |
 | `trunk_gemm.enabled`, `trunk_gemm.decoded_calls` | `enabled` false keeps every linear on the sorted GEMM; `decoded_calls` counts decoded-path planes |
-| `kernels.nax_reference_override`, `gemm_simdmat_force`, `unfolded_for_test`, `grouped_widest`, `one_row_coop_off`, `rows_baseline_kernel`, `prefill_chains` | A/B arms of the GEMM, grouped and one-row kernels, and test counters |
+| `kernels.nax_reference_override`, `gemm_simdmat_force`, `unfolded_for_test`, `grouped_widest`, `one_row_coop_off`, `prefill_chains` | A/B arms of the GEMM, grouped and one-row kernels, and test counters |
 | `rate_groups.prepared_force`, `group_force`, `fused_shared_first`, `fold_clamped.shared_first`, `fold_gated.shared_first` | forced arms of the grouped and fused chains |
 | `f32_truth` | f32 reference helpers the geometry and real-pack parity tests share |
 | `synth` | random banks (`makeBank`, `freeBank`, `randomWords`) for tests and the benches |

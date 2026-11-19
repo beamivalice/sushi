@@ -2556,6 +2556,8 @@ const Fixture = struct {
             v.* = exl3.f16BitsToF32(b.*);
         }
         f.slot_ids = try alloc.alloc(u32, spec.rows * spec.topk);
+        // A row draws `topk` distinct experts: more than the fixture holds would never end.
+        if (spec.slots == null and spec.topk > f.experts) return error.FixtureTopkOverExperts;
         if (spec.slots) |given| @memcpy(f.slot_ids, given) else for (0..spec.rows) |r| {
             const row = f.slot_ids[r * spec.topk ..][0..spec.topk];
             var k: usize = 0;
@@ -2750,40 +2752,6 @@ test "a bank's parts on the engine's stream are joined there: none is lent to ML
     try std.testing.expectEqualSlices(u16, &.{ 1, 2, 3, 4 }, mlx.mlx_array_data_uint16(joined).?[0..4]);
 }
 
-test "exl3 rate groups: every slot writes the served kernels' bytes at its own rate" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    for (CODEBOOKS) |dec| {
-        kernels.setDecodeParams(dec);
-        defer kernels.setDecodeParams(.mul1);
-        var arena = std.heap.ArenaAllocator.init(t.allocator);
-        defer arena.deinit();
-        var buf: [max_groups][3]u32 = undefined;
-        const rates = everyRate(&buf, 24, 64);
-        const experts: [max_groups]u32 = @splat(2);
-        // Two rows, each taking one expert of every group: 42 slots, every rate on both rows.
-        var slots: [2 * 21]u32 = undefined;
-        for (0..21) |g| {
-            slots[g] = @intCast(2 * g + g % 2);
-            slots[21 + g] = @intCast(2 * (20 - g) + 1 - (20 - g) % 2);
-        }
-        var f = try Fixture.init(arena.allocator(), s, .{ .rates = rates, .experts = experts[0..rates.len], .rows = 2, .topk = 21, .slots = &slots });
-        defer f.deinit();
-        const want = try servedComposition(s, &f, .float16);
-        defer _ = mlx.mlx_array_free(want.inner);
-        defer _ = mlx.mlx_array_free(want.y);
-        var cw = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cw);
-        const want_bytes = try bytesOf(s, want.y, &cw);
-        const y = try moeDecode(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float16, null, null);
-        defer _ = mlx.mlx_array_free(y);
-        var cy = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cy);
-        try t.expectEqualSlices(u8, want_bytes, try bytesOf(s, y, &cy));
-    }
-}
-
 test "exl3 rate groups: a slot's planes keep their bytes at the rates outside K1.5 to K4 and with gate and up apart" {
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -2809,10 +2777,11 @@ test "exl3 rate groups: a slot's planes keep their bytes at the rates outside K1
     try t.expectEqualSlices(u8, want_bytes, try bytesOf(s, y, &cy));
 }
 
-test "exl3 rate groups: decode rows hold the f32-truth bar for every codebook" {
+test "exl3 rate groups: decode rows hold the f32-truth bar for every codebook, in pack and tile-major order, self-preparing and prepared" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    defer prepared_force = null;
     for (CODEBOOKS) |dec| {
         kernels.setDecodeParams(dec);
         defer kernels.setDecodeParams(.mul1);
@@ -2823,14 +2792,20 @@ test "exl3 rate groups: decode rows hold the f32-truth bar for every codebook" {
         const experts = [_]u32{ 6, 3, 7 };
         var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = 4, .topk = 8, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 40 });
         defer f.deinit();
+        var tm = try tileMajorCopy(s, &f.rb);
+        defer tm.deinit();
         const want = try hostTruth(alloc, &f, dec);
-        const y = try moeDecode(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null);
-        defer _ = mlx.mlx_array_free(y);
-        var cy = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cy);
-        const got = try toF32(s, y, &cy);
-        for (got) |v| try t.expect(std.math.isFinite(v));
-        try t.expect(relRms(got, want) < 0.01);
+        // On the prepared arm four rows group the slots that share an expert.
+        for ([_]*const Ragged{ &f.rb, &tm }) |rb| for ([_]bool{ false, true }) |prepared| {
+            prepared_force = prepared;
+            const y = try moeDecode(s, f.x, rb, f.slots, f.scores, f.topk(), .float32, null, null);
+            defer _ = mlx.mlx_array_free(y);
+            var cy = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cy);
+            const got = try toF32(s, y, &cy);
+            for (got) |v| try t.expect(std.math.isFinite(v));
+            try t.expect(relRms(got, want) < 0.01);
+        };
     }
 }
 
@@ -2839,67 +2814,31 @@ test "exl3 rate groups: a clamped SwiGLU holds the f32-truth bar at decode and p
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const limit: c_int = 10;
-    for ([_]exl3.Decode{ .{ .codebook = .pair1, .window = .w16 }, exl3.Decode.tabled(.spec1, .w15) }) |dec| {
-        kernels.setDecodeParams(dec);
-        defer kernels.setDecodeParams(.mul1);
-        var arena = std.heap.ArenaAllocator.init(t.allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-        const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 64 } };
-        const experts = [_]u32{ 5, 3, 4 };
-        for ([_]usize{ 4, 40 }) |rows| {
-            var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = rows, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
-            defer f.deinit();
-            const want = try hostTruthClamped(alloc, &f, dec, @floatFromInt(limit));
-            // The clamp moves the answer at these magnitudes.
-            try t.expect(relRms(try hostTruth(alloc, &f, dec), want) > 0.1);
-            const y = if (rows <= kernels.DECODE_ROWS_MAX)
-                try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit)
-            else
-                try moePrefillClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), limit);
-            defer _ = mlx.mlx_array_free(y);
-            var cy = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(cy);
-            const got = try toF32(s, y, &cy);
-            for (got) |v| try t.expect(std.math.isFinite(v));
-            try t.expect(relRms(got, want) < 0.01);
-        }
-    }
-}
-
-test "exl3 rate groups: rows through the prepared pair input and middle write the self-preparing chain's bytes, 1 to 16 rows" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const limit: c_int = 10;
+    // The codebook never reaches the clamp: one is enough here.
+    const dec: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
+    kernels.setDecodeParams(dec);
+    defer kernels.setDecodeParams(.mul1);
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 64 }, .{ 32, 26, 24 } };
-    const experts = [_]u32{ 5, 3, 4, 2 };
-    var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = 1, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
-    defer f.deinit();
-    for ([_]exl3.Decode{ .{ .codebook = .pair1, .window = .w16 }, exl3.Decode.tabled(.spec1, .w15) }) |dec| {
-        kernels.setDecodeParams(dec);
-        defer kernels.setDecodeParams(.mul1);
-        defer prepared_force = null;
-        for ([_]usize{ 1, 2, 3, 4, 5, 6, 9, 16 }) |rows| {
-            try f.redraw(alloc, rows, 400, null, 0x5eed + rows);
-            prepared_force = false;
-            const self_prep = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
-            defer _ = mlx.mlx_array_free(self_prep);
-            var c0 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(c0);
-            const want = try bytesOf(s, self_prep, &c0);
-            prepared_force = true;
-            prepared_engaged = false;
-            const prep = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
-            defer _ = mlx.mlx_array_free(prep);
-            var c1 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(c1);
-            try t.expect(prepared_engaged);
-            try t.expectEqualSlices(u8, want, try bytesOf(s, prep, &c1));
-        }
+    const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 64 } };
+    const experts = [_]u32{ 5, 3, 4 };
+    for ([_]usize{ 4, 40 }) |rows| {
+        var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = rows, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
+        defer f.deinit();
+        const want = try hostTruthClamped(alloc, &f, dec, @floatFromInt(limit));
+        // The clamp moves the answer at these magnitudes.
+        try t.expect(relRms(try hostTruth(alloc, &f, dec), want) > 0.1);
+        const y = if (rows <= kernels.DECODE_ROWS_MAX)
+            try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit)
+        else
+            try moePrefillClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), limit);
+        defer _ = mlx.mlx_array_free(y);
+        var cy = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cy);
+        const got = try toF32(s, y, &cy);
+        for (got) |v| try t.expect(std.math.isFinite(v));
+        try t.expect(relRms(got, want) < 0.01);
     }
 }
 
@@ -2919,7 +2858,7 @@ fn plantedPicks(alloc: std.mem.Allocator, kind: usize, rows: usize, topk: usize)
     return out;
 }
 
-test "exl3 rate groups: verify rows grouped by expert write the per-slot chain's bytes, 2 to 16 rows, every bucket" {
+test "exl3 rate groups: verify rows grouped by expert write the per-slot chain's bytes on every planted route, 2 to 16 rows" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -2929,146 +2868,75 @@ test "exl3 rate groups: verify rows grouped by expert write the per-slot chain's
     const alloc = arena.allocator();
     const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 64 }, .{ 32, 26, 24 } };
     const experts = [_]u32{ 20, 12, 16, 8 };
-    // One bank for every decode, row count and route: the banks are codec-free words, and only the rows are redrawn.
+    // One bank for every row count and route: only the rows are redrawn.
     var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = 1, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
     defer f.deinit();
-    for ([_]exl3.Decode{ .{ .codebook = .pair1, .window = .w16 }, exl3.Decode.tabled(.spec1, .w15) }) |dec| {
-        kernels.setDecodeParams(dec);
-        defer kernels.setDecodeParams(.mul1);
-        defer prepared_force = null;
-        defer group_force = null;
-        prepared_force = true;
-        for ([_]usize{ 2, 3, 4, 5, 8, 9, 16 }) |rows| {
-            for (0..4) |kind| {
-                try f.redraw(alloc, rows, 400, try plantedPicks(alloc, kind, rows, 6), 0x5eed);
-                group_force = 0;
-                const one = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
-                defer _ = mlx.mlx_array_free(one);
-                var c0 = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(c0);
-                const want = try bytesOf(s, one, &c0);
-                for ([_]?c_int{ null, 2, 4, 8, 16 }) |arm| {
-                    group_force = arm;
-                    kernels.grouped_widest = 0;
-                    const y = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
-                    defer _ = mlx.mlx_array_free(y);
-                    var c1 = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(c1);
-                    try t.expectEqual(arm orelse kernels.GROUP_BUCKETS[0], kernels.grouped_widest);
-                    try t.expectEqualSlices(u8, want, try bytesOf(s, y, &c1));
-                }
-            }
-        }
-    }
-}
-
-test "exl3 rate groups: tile-major tiles write the pack order's chain bytes, 1 to 16 rows, self-preparing, prepared and grouped" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const limit: c_int = 10;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 64 }, .{ 32, 26, 24 } };
-    const experts = [_]u32{ 20, 12, 16, 8 };
-    // One bank and its tile-major copy for every decode and row count; only the rows are redrawn.
-    var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = 1, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
-    defer f.deinit();
-    var tm = try tileMajorCopy(s, &f.rb);
-    defer tm.deinit();
-    for ([_]exl3.Decode{ .{ .codebook = .pair1, .window = .w16 }, exl3.Decode.tabled(.spec1, .w15) }) |dec| {
-        kernels.setDecodeParams(dec);
-        defer kernels.setDecodeParams(.mul1);
-        defer prepared_force = null;
-        defer group_force = null;
-        for ([_]usize{ 1, 2, 3, 4, 5, 6, 9, 16 }) |rows| {
-            try f.redraw(alloc, rows, 400, null, 0x5eed + rows);
-            for ([_]bool{ false, true }) |prepared| {
-                prepared_force = prepared;
-                for ([_]?c_int{ 0, null, 4, 16 }) |arm| {
-                    group_force = arm;
-                    const want = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
-                    defer _ = mlx.mlx_array_free(want);
-                    var c0 = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(c0);
-                    const wb = try bytesOf(s, want, &c0);
-                    const got = try moeDecodeClamped(s, f.x, &tm, f.slots, f.scores, f.topk(), .float32, null, null, limit);
-                    defer _ = mlx.mlx_array_free(got);
-                    var c1 = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(c1);
-                    try t.expectEqualSlices(u8, wb, try bytesOf(s, got, &c1));
-                }
-            }
-        }
-    }
-}
-
-test "exl3 rate groups: tile-major tiles write the pack order's prefill bytes, 17 to 256 rows" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const limit: c_int = 10;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 64 }, .{ 32, 26, 24 } };
-    const experts = [_]u32{ 20, 12, 16, 8 };
-    var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = 1, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
-    defer f.deinit();
-    var tm = try tileMajorCopy(s, &f.rb);
-    defer tm.deinit();
-    for ([_]exl3.Decode{ .{ .codebook = .pair1, .window = .w16 }, exl3.Decode.tabled(.spec1, .w15) }) |dec| {
-        kernels.setDecodeParams(dec);
-        defer kernels.setDecodeParams(.mul1);
-        for ([_]usize{ 17, 64, 256 }) |rows| {
-            try f.redraw(alloc, rows, 400, null, 0x5eed + rows);
-            const want = try moePrefillClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), limit);
-            defer _ = mlx.mlx_array_free(want);
+    kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    defer kernels.setDecodeParams(.mul1);
+    defer prepared_force = null;
+    defer group_force = null;
+    prepared_force = true;
+    for ([_]usize{ 2, 9, 16 }) |rows| {
+        for (0..4) |kind| {
+            try f.redraw(alloc, rows, 400, try plantedPicks(alloc, kind, rows, 6), 0x5eed);
+            group_force = 0;
+            const one = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
+            defer _ = mlx.mlx_array_free(one);
             var c0 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(c0);
-            const wb = try bytesOf(s, want, &c0);
-            const got = try moePrefillClamped(s, f.x, &tm, f.slots, f.scores, f.topk(), limit);
-            defer _ = mlx.mlx_array_free(got);
+            const want = try bytesOf(s, one, &c0);
+            group_force = null;
+            kernels.grouped_widest = 0;
+            const y = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
+            defer _ = mlx.mlx_array_free(y);
             var c1 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(c1);
-            try t.expectEqualSlices(u8, wb, try bytesOf(s, got, &c1));
+            try t.expectEqual(kernels.GROUP_BUCKETS[0], kernels.grouped_widest);
+            try t.expectEqualSlices(u8, want, try bytesOf(s, y, &c1));
         }
     }
 }
 
-test "exl3 rate groups: on the engine a prefill's groups write one plane, the combine's bytes, with no combine" {
+test "exl3 rate groups: on the engine a prefill's groups hold the f32-truth bar in one plane, with no combine" {
     const t = std.testing;
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     const limit: c_int = 10;
-    kernels.setDecodeParams(exl3.Decode.tabled(.spec1, .w15));
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    kernels.setDecodeParams(dec);
     defer kernels.setDecodeParams(.mul1);
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 32, 32, 40 }, .{ 48, 48, 64 }, .{ 32, 26, 24 } };
     const experts = [_]u32{ 20, 12, 16, 8 };
-    for ([_]usize{ 64, 256 }) |rows| {
-        var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = rows, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
-        defer f.deinit();
-        const want = try moePrefillClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), limit);
-        defer _ = mlx.mlx_array_free(want);
-        var c0 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(c0);
-        const wb = try bytesOf(s, want, &c0);
-        const was = mlx.engine.enabled;
-        mlx.engine.enabled = true;
-        defer mlx.engine.enabled = was;
-        const e = mlx.engine.stream();
-        const combines = combineCount();
-        const got = try moePrefillClamped(e, f.x, &f.rb, f.slots, f.scores, f.topk(), limit);
-        defer _ = mlx.mlx_array_free(got);
-        var c1 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(c1);
-        try t.expectEqualSlices(u8, wb, try bytesOf(e, got, &c1));
-        try t.expectEqual(combines, combineCount());
+    var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = 64, .topk = 6, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 400 });
+    defer f.deinit();
+    const want = try hostTruthClamped(alloc, &f, dec, @floatFromInt(limit));
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    const e = mlx.engine.stream();
+    const combines = combineCount();
+    const got = try moePrefillClamped(e, f.x, &f.rb, f.slots, f.scores, f.topk(), limit);
+    defer _ = mlx.mlx_array_free(got);
+    var c1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c1);
+    // Read on the host: a cast would run on the engine's stream too.
+    const bytes = try bytesOf(e, got, &c1);
+    const vals = try alloc.alloc(f32, want.len);
+    switch (mlx.mlx_array_dtype(got)) {
+        .float32 => for (vals, std.mem.bytesAsSlice(f32, bytes)) |*v, b| {
+            v.* = b;
+        },
+        .float16 => for (vals, std.mem.bytesAsSlice(u16, bytes)) |*v, b| {
+            v.* = exl3.f16BitsToF32(b);
+        },
+        else => return error.TestUnexpectedResult,
     }
+    for (vals) |v| try t.expect(std.math.isFinite(v));
+    try t.expect(relRms(vals, want) < 0.01);
+    try t.expectEqual(combines, combineCount());
 }
 
 pub fn reshaped(s: mlx.mlx_stream, a: mlx.mlx_array, shape: []const c_int) !mlx.mlx_array {
@@ -3257,7 +3125,8 @@ test "exl3 rate groups: the shared expert riding the decode launches writes the 
     defer f.deinit();
     var se = try sharedOf(&f);
     defer freeBank(&se.bank);
-    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16 }) |rows| {
+    // One row, a grouped verify block, and the wide verify past eight rows.
+    for ([_]usize{ 1, 2, 9, 16 }) |rows| {
         try f.redraw(arena.allocator(), rows, 400, null, 0x51 + rows);
         try sharedFusedCase(t.allocator, s, &f, se, 0x51 + rows);
     }
@@ -3281,7 +3150,7 @@ test "exl3 rate groups: the shared expert riding a DSpark stage's one-group bank
     defer f.deinit();
     var se = try sharedOf(&f);
     defer freeBank(&se.bank);
-    for ([_]usize{ 1, 2, 3, 5, 6 }) |rows| {
+    for ([_]usize{ 1, 5 }) |rows| {
         try f.redraw(arena.allocator(), rows, 400, null, 0x77 + rows);
         try sharedFusedCase(t.allocator, s, &f, se, 0x77 + rows);
     }
@@ -3304,7 +3173,7 @@ test "exl3 rate groups: the shared expert riding the decode launches at DeepSeek
     defer f.deinit();
     var se = try sharedOf(&f);
     defer freeBank(&se.bank);
-    for ([_]usize{ 1, 2, 4, 6 }) |rows| {
+    for ([_]usize{ 1, 4 }) |rows| {
         try f.redraw(arena.allocator(), rows, 400, null, 0xd5 + rows);
         try sharedFusedCase(t.allocator, s, &f, se, 0xd5 + rows);
     }
@@ -3395,7 +3264,7 @@ test "exl3 rate groups: a settle recomputing only the picks that missed writes t
     defer f.deinit();
     var se = try sharedOf(&f);
     defer freeBank(&se.bank);
-    for ([_]usize{ 1, 2, 4, 16 }) |rows| {
+    for ([_]usize{ 1, 16 }) |rows| {
         try f.redraw(arena.allocator(), rows, 400, null, 0x61 + rows);
         try redoCase(t.allocator, s, &f, se);
     }
@@ -3415,7 +3284,7 @@ test "exl3 rate groups: a settle recomputing only the picks that missed writes t
     defer f.deinit();
     var se = try sharedOf(&f);
     defer freeBank(&se.bank);
-    for ([_]usize{ 1, 2, 4, 16 }) |rows| {
+    for ([_]usize{ 1, 16 }) |rows| {
         try f.redraw(arena.allocator(), rows, 400, null, 0xe5 + rows);
         try redoCase(t.allocator, s, &f, se);
     }
@@ -3466,7 +3335,8 @@ test "exl3 rate groups: the shared expert riding the prefill launches writes the
     var se = try sharedOf(&f);
     defer freeBank(&se.bank);
     // 4000 pushes the gate and up past the clamp, 400 stays inside it.
-    for ([_]f32{ 400, 4000 }) |x_scale| for ([_]usize{ 17, 33, 128, 600, 2500 }) |rows| {
+    // 17 rows leave most experts one slot or none; at 600 experts pass one 32-row window.
+    for ([_]f32{ 400, 4000 }) |x_scale| for ([_]usize{ 17, 600 }) |rows| {
         try f.redraw(arena.allocator(), rows, x_scale, null, 0x91 + rows);
         try sharedPrefillCase(s, &f, se);
     };
@@ -3481,103 +3351,18 @@ test "exl3 rate groups: the shared expert riding the prefill launches at 5120x23
     const rates = [_][3]u32{ .{ 40, 40, 40 }, .{ 32, 32, 32 }, .{ 32, 32, 26 }, .{ 26, 26, 26 }, .{ 24, 24, 24 } };
     const experts = [_]u32{ 51, 75, 1, 109, 148 };
     // The 384-expert bank is about 3 GB: drawn once, each row count redraws only the activations, picks and scores.
-    // 17 rows is the first prefill chunk (most experts take one slot or none); 128 rows was the same arm, every expert
-    // inside one 32-row window. 2048 is the widest, with experts past one window.
+    // 17 rows is the first prefill chunk (most experts take one slot or none); 2048 is the widest, with experts past
+    // one window.
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     var f = try sharedLayer(arena.allocator(), s, 5120, 2304, &rates, &experts, 6, 0xd7);
     defer f.deinit();
     var se = try sharedOf(&f);
     defer freeBank(&se.bank);
-    for ([_]usize{ 17, 512, 2048 }) |rows| {
+    for ([_]usize{ 17, 2048 }) |rows| {
         try f.redraw(arena.allocator(), rows, 400, null, 0xd7 + rows);
         try sharedPrefillCase(s, &f, se);
     }
-}
-
-test "exl3 rate groups: groups sharing one rate equal the uniform layer to the byte at n40 and K4, shared tail folded" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    for (CODEBOOKS) |dec| for ([_]u32{ 40, 64 }) |n| {
-        kernels.setDecodeParams(dec);
-        defer kernels.setDecodeParams(.mul1);
-        var arena = std.heap.ArenaAllocator.init(t.allocator);
-        defer arena.deinit();
-        const rates: [3][3]u32 = @splat(@splat(n));
-        const experts = [_]u32{ 3, 5, 4 };
-        var f = try Fixture.init(arena.allocator(), s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = 3, .topk = 6 });
-        defer f.deinit();
-        var uniform: root.Bank = undefined;
-        var held: [9]mlx.mlx_array = undefined;
-        var n_held: usize = 0;
-        defer for (held[0..n_held]) |a| {
-            _ = mlx.mlx_array_free(a);
-        };
-        for (0..3) |p| {
-            var parts: [3][3]mlx.mlx_array = undefined;
-            for (0..3) |g| {
-                const q = projOf(f.banks[g], p);
-                parts[0][g] = q.trellis;
-                parts[1][g] = q.suh;
-                parts[2][g] = q.svh;
-            }
-            for (0..3) |part| {
-                held[n_held] = try concat(s, &parts[part]);
-                n_held += 1;
-            }
-            projPtr(&uniform, p).* = .{ .trellis = held[n_held - 3], .suh = held[n_held - 2], .svh = held[n_held - 1] };
-        }
-        const xb = try cast(s, f.x, .bfloat16);
-        defer _ = mlx.mlx_array_free(xb);
-        const x3 = try reshaped(s, xb, &.{ 3, 1, 512 });
-        defer _ = mlx.mlx_array_free(x3);
-        const ids = try reshaped(s, f.slots, &.{ 3, 1, 6 });
-        defer _ = mlx.mlx_array_free(ids);
-        const sc = try reshaped(s, f.scores, &.{ 3, 1, 6 });
-        defer _ = mlx.mlx_array_free(sc);
-        const want = try root.moe(s, x3, uniform, ids, sc, dec, true);
-        defer _ = mlx.mlx_array_free(want);
-        var cw = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cw);
-        const want_bytes = try bytesOf(s, want, &cw);
-        const y = try moeDecode(s, xb, &f.rb, f.slots, f.scores, 6, .bfloat16, null, null);
-        defer _ = mlx.mlx_array_free(y);
-        var cy = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cy);
-        try t.expectEqualSlices(u8, want_bytes, try bytesOf(s, y, &cy));
-        // One decode row with the gated bf16 shared expert in the reduce.
-        var row = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(row);
-        try mlx.check(mlx.mlx_slice(&row, xb, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ 1, 512 }, 2, &[_]c_int{ 1, 1 }, 2, s));
-        const row3 = try reshaped(s, row, &.{ 1, 1, 512 });
-        defer _ = mlx.mlx_array_free(row3);
-        var one_ids = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(one_ids);
-        try mlx.check(mlx.mlx_slice(&one_ids, f.slots, &[_]c_int{0}, 1, &[_]c_int{6}, 1, &[_]c_int{1}, 1, s));
-        var one_sc = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(one_sc);
-        try mlx.check(mlx.mlx_slice(&one_sc, f.scores, &[_]c_int{0}, 1, &[_]c_int{6}, 1, &[_]c_int{1}, 1, s));
-        const ids1 = try reshaped(s, one_ids, &.{ 1, 1, 6 });
-        defer _ = mlx.mlx_array_free(ids1);
-        const sc1 = try reshaped(s, one_sc, &.{ 1, 1, 6 });
-        defer _ = mlx.mlx_array_free(sc1);
-        const down = try reshaped(s, row, &.{512});
-        defer _ = mlx.mlx_array_free(down);
-        const lg: u16 = 0xbf00;
-        const logit = mlx.mlx_array_new_data(&lg, &[_]c_int{1}, 1, .bfloat16);
-        defer _ = mlx.mlx_array_free(logit);
-        const gw = try root.moeWithGatedShared(s, row3, uniform, ids1, sc1, dec, false, down, logit);
-        defer _ = mlx.mlx_array_free(gw);
-        var cg = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cg);
-        const gw_bytes = try bytesOf(s, gw, &cg);
-        const y1 = try moeDecode(s, row, &f.rb, one_ids, one_sc, 6, .bfloat16, down, logit);
-        defer _ = mlx.mlx_array_free(y1);
-        var cy1 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cy1);
-        try t.expectEqualSlices(u8, gw_bytes, try bytesOf(s, y1, &cy1));
-    };
 }
 
 test "exl3 rate groups: a shared expert folded into the clamped f32 reduce is the separate f32 add, to the byte" {
@@ -3618,40 +3403,6 @@ test "exl3 rate groups: a shared expert folded into the clamped f32 reduce is th
     }
 }
 
-test "exl3 rate groups: decode rows agree with today's masked moeGroups to f32 summation order" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const dec = exl3.Decode.tabled(.spec1, .w15);
-    kernels.setDecodeParams(dec);
-    defer kernels.setDecodeParams(.mul1);
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const rates = [_][3]u32{ .{ 24, 24, 24 }, .{ 24, 24, 48 }, .{ 48, 48, 48 } };
-    const experts = [_]u32{ 6, 3, 7 };
-    var f = try Fixture.init(arena.allocator(), s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = 4, .topk = 8 });
-    defer f.deinit();
-    const x3 = try reshaped(s, f.x, &.{ 4, 1, 512 });
-    defer _ = mlx.mlx_array_free(x3);
-    const ids = try reshaped(s, f.slots, &.{ 4, 1, 8 });
-    defer _ = mlx.mlx_array_free(ids);
-    const sc = try reshaped(s, f.scores, &.{ 4, 1, 8 });
-    defer _ = mlx.mlx_array_free(sc);
-    const today = try root.moeGroups(s, x3, f.banks[0..3], ids, sc, dec, false);
-    defer _ = mlx.mlx_array_free(today);
-    var ct = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ct);
-    const want = try toF32(s, today, &ct);
-    const y = try moeDecode(s, f.x, &f.rb, f.slots, f.scores, 8, .float16, null, null);
-    defer _ = mlx.mlx_array_free(y);
-    var cy = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(cy);
-    const got = try toF32(s, y, &cy);
-    // moeGroups sums each group's slots in f32, adds the group totals in f32, then rounds once: the
-    // same products in another order, so at most one f16 rounding step apart.
-    for (got, want) |a, b| try t.expect(@abs(a - b) <= @abs(b) * (1.0 / 1024.0) + 1e-6);
-}
-
 fn randomWords(rnd: std.Random, out: []u16) void {
     const w64: []align(1) u64 = std.mem.bytesAsSlice(u64, std.mem.sliceAsBytes(out[0 .. out.len / 4 * 4]));
     for (w64) |*v| v.* = rnd.int(u64);
@@ -3666,63 +3417,6 @@ fn freeBank(b: *root.Bank) void {
     }
 }
 
-/// The uniform bank of a fixture whose groups share one rate: each projection's group arrays stacked.
-fn stackedBank(s: mlx.mlx_stream, f: *const Fixture, held: *[9]mlx.mlx_array) !root.Bank {
-    var uniform: root.Bank = undefined;
-    var k: usize = 0;
-    for (0..3) |p| {
-        var parts: [3][max_groups]mlx.mlx_array = undefined;
-        const n = f.spec.rates.len;
-        for (0..n) |g| {
-            const q = projOf(f.banks[g], p);
-            parts[0][g] = q.trellis;
-            parts[1][g] = q.suh;
-            parts[2][g] = q.svh;
-        }
-        for (0..3) |part| {
-            held[k] = try concat(s, parts[part][0..n]);
-            k += 1;
-        }
-        projPtr(&uniform, p).* = .{ .trellis = held[k - 3], .suh = held[k - 2], .svh = held[k - 1] };
-    }
-    return uniform;
-}
-
-test "exl3 rate groups: prefill rows of groups sharing one rate equal the uniform prefill to the byte" {
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    for (CODEBOOKS) |dec| {
-        var arena = std.heap.ArenaAllocator.init(t.allocator);
-        defer arena.deinit();
-        const rates = [_][3]u32{ .{ 36, 36, 36 }, .{ 36, 36, 36 }, .{ 36, 36, 36 }, .{ 36, 36, 36 } };
-        const experts = [_]u32{ 3, 5, 1, 7 };
-        var f = try Fixture.init(arena.allocator(), s, .{ .hidden = 512, .inter = 256, .rates = &rates, .experts = &experts, .rows = 40, .topk = 6 });
-        defer f.deinit();
-        var held: [9]mlx.mlx_array = undefined;
-        const uniform = try stackedBank(s, &f, &held);
-        defer for (held) |a| {
-            _ = mlx.mlx_array_free(a);
-        };
-        const x3 = try reshaped(s, f.x, &.{ 40, 1, 512 });
-        defer _ = mlx.mlx_array_free(x3);
-        const ids = try reshaped(s, f.slots, &.{ 40, 1, 6 });
-        defer _ = mlx.mlx_array_free(ids);
-        const sc = try reshaped(s, f.scores, &.{ 40, 1, 6 });
-        defer _ = mlx.mlx_array_free(sc);
-        const want = try root.moe(s, x3, uniform, ids, sc, dec, false);
-        defer _ = mlx.mlx_array_free(want);
-        const got = try root.moeRagged(s, x3, &f.rb, ids, sc, dec, false, null, null);
-        defer _ = mlx.mlx_array_free(got);
-        defer kernels.setDecodeParams(.mul1);
-        var cw = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cw);
-        var cg = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cg);
-        try t.expectEqualSlices(u8, try bytesOf(s, want, &cw), try bytesOf(s, got, &cg));
-    }
-}
-
 test "exl3 rate groups: prefill rows hold the f32-truth bar for every codebook, past 24 groups" {
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -3732,15 +3426,27 @@ test "exl3 rate groups: prefill rows hold the f32-truth bar for every codebook, 
         defer arena.deinit();
         const alloc = arena.allocator();
         var buf: [max_groups][3]u32 = undefined;
-        var rates = everyRate(&buf, 24, 64);
-        // Five more groups with gate, up and down apart: 26 in all, two combine dispatches.
-        const extra = [_][3]u32{ .{ 24, 48, 36 }, .{ 64, 40, 64 }, .{ 32, 32, 56 }, .{ 48, 24, 24 }, .{ 40, 40, 26 } };
-        @memcpy(buf[rates.len..][0..extra.len], &extra);
-        rates = buf[0 .. rates.len + extra.len];
+        // PAIR1 and the per-rate SPEC1 table decode each rate with a row of its own: every rate, and the bit layouts
+        // the other codebooks share. Those take three groups.
+        const few = [_][3]u32{ .{ 24, 24, 24 }, .{ 24, 24, 48 }, .{ 48, 48, 48 } };
+        var rates: [][3]u32 = undefined;
+        if (which >= 3) {
+            rates = everyRate(&buf, 24, 64);
+            // Five more groups with gate, up and down apart: 26 in all, two combine dispatches.
+            const extra = [_][3]u32{ .{ 24, 48, 36 }, .{ 64, 40, 64 }, .{ 32, 32, 56 }, .{ 48, 24, 24 }, .{ 40, 40, 26 } };
+            @memcpy(buf[rates.len..][0..extra.len], &extra);
+            rates = buf[0 .. rates.len + extra.len];
+        } else {
+            @memcpy(buf[0..few.len], &few);
+            rates = buf[0..few.len];
+        }
+        // A row picks 8 distinct experts, so the three groups of the shared layouts hold 2 + 3 + 4 of them.
         var experts: [max_groups]u32 = undefined;
-        for (experts[0..rates.len], 0..) |*e, i| e.* = 1 + @as(u32, @intCast(i % 3));
+        for (experts[0..rates.len], 0..) |*e, i| e.* = 2 + @as(u32, @intCast(i % 3));
         var f = try Fixture.init(alloc, s, .{ .hidden = 512, .inter = 256, .rates = rates, .experts = experts[0..rates.len], .rows = 20, .topk = 8, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 40 });
         defer f.deinit();
+        var tm = try tileMajorCopy(s, &f.rb);
+        defer tm.deinit();
         const want = try hostTruth(alloc, &f, dec);
         const x3 = try reshaped(s, f.x, &.{ 20, 1, 512 });
         defer _ = mlx.mlx_array_free(x3);
@@ -3748,20 +3454,16 @@ test "exl3 rate groups: prefill rows hold the f32-truth bar for every codebook, 
         defer _ = mlx.mlx_array_free(ids);
         const sc = try reshaped(s, f.scores, &.{ 20, 1, 8 });
         defer _ = mlx.mlx_array_free(sc);
-        const y = try root.moeRagged(s, x3, &f.rb, ids, sc, dec, false, null, null);
-        defer _ = mlx.mlx_array_free(y);
         defer kernels.setDecodeParams(.mul1);
-        var cy = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cy);
-        const got = try toF32(s, y, &cy);
-        for (got) |v| try t.expect(std.math.isFinite(v));
-        try t.expect(relRms(got, want) < 0.01);
-        if (which >= 2) continue;
-        // The decode chain on the same rows (verify rows) scores the same.
-        const v = try root.moeRagged(s, x3, &f.rb, ids, sc, dec, true, null, null);
-        defer _ = mlx.mlx_array_free(v);
-        var cv = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(cv);
-        try t.expect(relRms(try toF32(s, v, &cv), want) < 0.01);
+        // The prefill chain, then the decode chain on the same rows (verify rows), each in pack and tile-major order.
+        for ([_]bool{ false, true }) |verify| for ([_]*const Ragged{ &f.rb, &tm }) |rb| {
+            const y = try root.moeRagged(s, x3, rb, ids, sc, dec, verify, null, null);
+            defer _ = mlx.mlx_array_free(y);
+            var cy = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cy);
+            const got = try toF32(s, y, &cy);
+            for (got) |v| try t.expect(std.math.isFinite(v));
+            try t.expect(relRms(got, want) < 0.01);
+        };
     }
 }

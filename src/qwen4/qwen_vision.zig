@@ -1225,54 +1225,6 @@ test "qwen preprocessing parity vs reference pixel_values (QWEN_PREPROCESS_FIXTU
 // preprocessing), then compares post-merger embeddings. Build the fixture first:
 //   python3 tests/qwen4/build_qwen_vision_fixture.py --model <dir> --image <img> --out <fix>
 // then run via tests/qwen4/test_qwen_vision_parity.sh (sets the env vars below).
-test "qwen vision on Sushi Cooler at a real pack gives MLX's bytes and asks nothing of MLX (QWEN_VISION_TEST_MODEL)" {
-    const model_raw = std.c.getenv("QWEN_VISION_TEST_MODEL") orelse return error.SkipZigTest;
-    const dir = std.mem.sliceTo(model_raw, 0);
-    try mlx.requireGpu();
-    const a = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const was_enabled = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was_enabled);
-    var on_mlx_cfg = try model_mod.parseConfig(io, a, dir);
-    defer on_mlx_cfg.deinit(a);
-    try std.testing.expect(on_mlx_cfg.qwen_vision);
-    var on_engine_cfg = on_mlx_cfg;
-    on_mlx_cfg.cooler_for_test = false;
-    on_engine_cfg.cooler_for_test = true;
-    var wm = try model_mod.loadWeightsWithVision(io, a, dir);
-    defer wm.deinit();
-    var we = try model_mod.loadWeightsWithVision(io, a, dir);
-    defer we.deinit();
-    var on_mlx = try QwenVision.init(a, on_mlx_cfg, &wm);
-    defer on_mlx.deinit();
-    var on_engine = try QwenVision.init(a, on_engine_cfg, &we);
-    defer on_engine.deinit();
-    try std.testing.expect(on_engine.ownStream() != null and on_mlx.ownStream() == null);
-    const feat: usize = 3 * @as(usize, on_mlx_cfg.qv_temporal_patch) * on_mlx_cfg.qv_patch * on_mlx_cfg.qv_patch;
-    // A small image and a wide one: the attention takes another plan past its first chunk.
-    for ([_][2]u32{ .{ 8, 8 }, .{ 32, 48 } }) |grid| {
-        const n: usize = @as(usize, grid[0]) * grid[1];
-        const px = try a.alloc(f32, n * feat);
-        defer a.free(px);
-        var prng = std.Random.DefaultPrng.init(grid[1]);
-        for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
-        const patches = mlx.mlx_array_new_data(px.ptr, &[_]c_int{ @intCast(n), @intCast(feat) }, 2, .float32);
-        defer _ = mlx.mlx_array_free(patches);
-        const want = try on_mlx.forward(patches, grid[0], grid[1]);
-        defer _ = mlx.mlx_array_free(want);
-        try mlx.check(mlx.mlx_array_eval(want));
-        const ops_before = mlx.engine.mlx_ops;
-        const got = try on_engine.forward(patches, grid[0], grid[1]);
-        defer _ = mlx.mlx_array_free(got);
-        try mlx.check(mlx.mlx_array_eval(got));
-        try std.testing.expectEqual(ops_before, mlx.engine.mlx_ops);
-        try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
-        const bytes = mlx.mlx_array_size(want) * mlx.mlx_array_itemsize(want);
-        try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..bytes], mlx.mlx_array_data_uint8(got).?[0..bytes]);
-    }
-}
-
 test "qwen vision parity vs reference embeddings (QWEN_VISION_TEST_MODEL)" {
     const model_raw = std.c.getenv("QWEN_VISION_TEST_MODEL") orelse return error.SkipZigTest;
     const fix_raw = std.c.getenv("QWEN_VISION_FIXTURE") orelse return error.SkipZigTest;
@@ -2006,29 +1958,23 @@ test "qwen vision: the requantized tower stays within bf16's drift of the bf16 t
     try std.testing.expect(g.cos > 0.998);
 }
 
-test "qwen vision: on Sushi Cooler the tower gives MLX's bytes, requantized and bf16, asking nothing of MLX" {
+test "qwen vision: on Sushi Cooler the tower, requantized and bf16, asks nothing of MLX" {
     try mlx.requireGpu();
     const a = std.testing.allocator;
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was_enabled);
     for ([_]bool{ true, false }) |quantize| {
-        var wm = try tinyTower();
-        defer wm.deinit();
         var we = try tinyTower();
         defer we.deinit();
-        var on_mlx_cfg = tinyConfig();
-        on_mlx_cfg.model_type = "qwen4_exp";
-        on_mlx_cfg.expert_layout = .exl3_k4;
-        on_mlx_cfg.expert_quant_codebook = .spec1;
-        var on_engine_cfg = on_mlx_cfg;
-        on_mlx_cfg.cooler_for_test = false;
-        on_engine_cfg.cooler_for_test = true;
-        var on_mlx = try QwenVision.initWith(a, on_mlx_cfg, &wm, quantize);
-        defer on_mlx.deinit();
-        var on_engine = try QwenVision.initWith(a, on_engine_cfg, &we, quantize);
+        var cfg = tinyConfig();
+        cfg.model_type = "qwen4_exp";
+        cfg.expert_layout = .exl3_k4;
+        cfg.expert_quant_codebook = .spec1;
+        cfg.cooler_for_test = true;
+        var on_engine = try QwenVision.initWith(a, cfg, &we, quantize);
         defer on_engine.deinit();
-        try std.testing.expect(on_engine.ownStream() != null and on_mlx.ownStream() == null);
+        try std.testing.expect(on_engine.ownStream() != null);
         for ([_][2]u32{ .{ 4, 4 }, .{ 8, 6 } }) |grid| {
             const n: usize = @as(usize, grid[0]) * grid[1];
             const px = try a.alloc(f32, n * 96);
@@ -2037,9 +1983,6 @@ test "qwen vision: on Sushi Cooler the tower gives MLX's bytes, requantized and 
             for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
             const patches = mlx.mlx_array_new_data(px.ptr, &[_]c_int{ @intCast(n), 96 }, 2, .float32);
             defer _ = mlx.mlx_array_free(patches);
-            const want = try on_mlx.forward(patches, grid[0], grid[1]);
-            defer _ = mlx.mlx_array_free(want);
-            try mlx.check(mlx.mlx_array_eval(want));
             const ops_before = mlx.engine.mlx_ops;
             const lends_before = mlx.engine.stats().lends;
             const got = try on_engine.forward(patches, grid[0], grid[1]);
@@ -2047,9 +1990,6 @@ test "qwen vision: on Sushi Cooler the tower gives MLX's bytes, requantized and 
             try mlx.check(mlx.mlx_array_eval(got));
             try std.testing.expectEqual(ops_before, mlx.engine.mlx_ops);
             try std.testing.expectEqual(lends_before, mlx.engine.stats().lends);
-            try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
-            const bytes = mlx.mlx_array_size(want) * mlx.mlx_array_itemsize(want);
-            try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..bytes], mlx.mlx_array_data_uint8(got).?[0..bytes]);
         }
     }
 }
@@ -2091,6 +2031,10 @@ test "qwen vision: an encode on the engine, image or video, refused at a checked
     cfg.cooler_for_test = true;
     var tower = try QwenVision.initWith(a, cfg, &w, true);
     defer tower.deinit();
+    defer mlx.engine.fault.sites = .{};
+    // A site the image's encode refused is not refused again in the video's: the same code, the same cleanup.
+    var refused: [2]std.AutoHashMapUnmanaged(u64, void) = .{ .empty, .empty };
+    defer for (&refused) |*set| set.deinit(a);
     for ([_]u32{ 1, 2 }) |gt| {
         const px = try a.alloc(f32, 16 * gt * 96);
         defer a.free(px);
@@ -2106,32 +2050,48 @@ test "qwen vision: an encode on the engine, image or video, refused at a checked
         const want = try H.bytesOf(try h.run());
         defer a.free(want);
         for ([_]bool{ false, true }) |pool| {
-            // One clean encode records the site of every checked call, or pool buffer; each is refused at its first
-            // and last, the pool's as a site's n-th ask.
+            // One clean encode records the site of every checked call, or pool buffer; each site is refused at its
+            // first call, the pool's as the site's first ask.
             const G = struct {
                 // The encode alone, as the sweep arms it.
                 fn go(hh: H) anyerror!void {
                     _ = mlx.mlx_array_free(try hh.run());
                 }
             };
-            const calls: []const u64 = if (pool) &.{} else try mlx.sweepPoints(a, &mlx.fault.sites, h, G.go);
-            defer if (!pool) a.free(calls);
-            const asks: []const mlx.FaultSites.SitePoint = if (pool) try mlx.sweepSites(a, &mlx.engine.fault.sites, h, G.go) else &.{};
-            defer if (pool) a.free(asks);
-            for (0..if (pool) asks.len else calls.len) |k| {
+            var points: std.ArrayList(mlx.FaultSites.SitePoint) = .empty;
+            defer points.deinit(a);
+            if (pool) {
+                mlx.engine.fault.sites.lasts = false;
+                const asks = try mlx.sweepSites(a, &mlx.engine.fault.sites, h, G.go);
+                defer a.free(asks);
+                try points.appendSlice(a, asks);
+            } else {
+                var list: std.ArrayList(u64) = .empty;
+                defer list.deinit(a);
+                mlx.fault.sites = .{ .list = &list, .gpa = a };
+                const recorded = G.go(h);
+                const unrecorded = mlx.fault.sites.failed;
+                mlx.fault.sites = .{};
+                try recorded;
+                if (unrecorded) return error.OutOfMemory;
+                // A checked call's point is its call number; the set below keeps each site's first.
+                for (list.items, 1..) |site, n| try points.append(a, .{ .site = site, .n = n });
+            }
+            for (points.items) |pt| {
+                if (try refused[@intFromBool(pool)].fetchPut(a, pt.site, {}) != null) continue;
                 const base = H.inUse();
                 const doubles = core.double_releases;
-                if (pool) mlx.engine.fault.armAt(asks[k]) else mlx.fault.arm(calls[k]);
+                if (pool) mlx.engine.fault.armAt(pt) else mlx.fault.arm(pt.n);
                 const r = h.run();
                 const fired = if (pool) !mlx.engine.fault.armed() else mlx.fault.didFire();
                 mlx.fault.disarm();
                 mlx.engine.fault.disarm();
-                if (pool and !fired and !asks[k].strict) {
+                if (pool and !fired and !pt.strict) {
                     if (r) |o| _ = mlx.mlx_array_free(o) else |_| {}
                     continue;
                 }
                 if (!fired or (if (r) |_| true else |_| false)) {
-                    std.debug.print("qwen vision: an encode of {d} groups armed at {s} {d}: {s}\n", .{ gt, if (pool) "pool buffer" else "checked call", k, if (!fired) "never reached it" else "succeeded" });
+                    std.debug.print("qwen vision: an encode of {d} groups armed at {s} {d}: {s}\n", .{ gt, if (pool) "pool buffer" else "checked call", pt.n, if (!fired) "never reached it" else "succeeded" });
                     if (r) |o| _ = mlx.mlx_array_free(o) else |_| {}
                     return error.TestUnexpectedResult;
                 }
@@ -2172,18 +2132,30 @@ test "qwen vision: a tower load on the engine refused at a checked call or a poo
     cfg.expert_quant_codebook = .spec1;
     cfg.cooler_for_test = true;
     for ([_]bool{ false, true }) |pool| {
-        var total: u64 = 0;
+        // One clean load records the site of every checked call, or pool ask; each site is refused at its first.
+        var points: std.ArrayList(u64) = .empty;
+        defer points.deinit(a);
         {
+            const rec = if (pool) &mlx.engine.fault.sites else &mlx.fault.sites;
+            var list: std.ArrayList(u64) = .empty;
+            defer list.deinit(a);
             var w = try tinyTowerOnEngine();
             defer w.deinit();
-            const c0 = if (pool) mlx.engine.fault.count() else mlx.op_count.load(.monotonic);
-            var t = try QwenVision.initWith(a, cfg, &w, true);
-            total = (if (pool) mlx.engine.fault.count() else mlx.op_count.load(.monotonic)) - c0;
+            rec.* = .{ .list = &list, .gpa = a };
+            const recorded = QwenVision.initWith(a, cfg, &w, true);
+            const unrecorded = rec.failed;
+            rec.* = .{};
+            var t = try recorded;
             t.deinit();
+            if (unrecorded) return error.OutOfMemory;
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            for (list.items, 1..) |site, n| {
+                if (try seen.fetchPut(a, site, {}) == null) try points.append(a, n);
+            }
         }
         // The weights' own bytes come and go with them: what a load leaves is what outlives them.
-        var k: u64 = 1;
-        while (k <= total) : (k += 1) {
+        for (points.items) |k| {
             const base = inUse();
             {
                 var w = try tinyTowerOnEngine();

@@ -885,9 +885,9 @@ multiply and add tail is the reduce's (`gate[row]`); at one row the router kerne
   (`mtpMoeRows`), 9 to 16 rows and prefill, `--qwen-standin`, shared banks that are not affine8 g64/g128 with K a
   multiple of 128, a gate/up pair at two rates, a prepared-chain bank (hidden 5120). Each declines before any launch.
 - **Proof** (`qwen4_shared.zig`): bytes equal to the production separate chain (`qmatmulBits` rows path, `fusedSwiGLU`,
-  `moeWithGatedShared` / `moeRagged`), real 2560/640/top-10 geometry, 1 to 8 rows, MCG at n64, n32 and n44/n44/n64, spec1
-  grouped at n32/44/64 (down n48), shared g128 and g64, large and small gains, router logit and rider logit, either
-  part's threadgroups first, three launches a layer; one decline test.
+  `moeWithGatedShared` / `moeRagged`), real 2560/640/top-10 geometry, 1 and 8 rows, MCG at n44/n44/n64, spec1 grouped at
+  n32/44/64 (down n48), shared g128 and g64, gain 1, router logit and rider logit, the served launch order, three
+  launches a layer; one decline test.
 - **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=qwen4`; this table, ReleaseFast, GPU lock `qwen-fold`, `taskpolicy -a`,
   fans auto, M5 Max, median of 21 interleaved rounds of 8 dependent layers over distinct banks, 64 experts, random
   routes; separate = production shared chain incl. its N=1 logit; uncommitted tree on `a9853b3e`, us):
@@ -951,7 +951,7 @@ linear's own launch; what its two finish dispatches did moves into the neighbour
   to 8 rows, where only the router kernel supplies the logit at one row. The layer now computes the logit as the separate
   chain does and passes it in, so verify widths fold too.
 - **Proof** (`qwen4_shared.zig`): bytes equal to the production separate chain (`sharedProject`, `fusedSwiGLU`,
-  `trunk_stq.matmul`, then `moeWithGatedShared` / `moeRagged`) at 1 to 8 rows, 6-bit and 4-bit shared banks, SPEC1 trunk,
+  `trunk_stq.matmul`, then `moeWithGatedShared` / `moeRagged`) at 1 and 8 rows, one shared trunk rate per chain, SPEC1 trunk,
   one-bank (MCG) and rate-grouped routed layers, logit riding the launch or passed in, three launches a layer; a decline
   test.
 - **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=qwen4 --rungs shared=trellis`, K6 shared
@@ -1023,8 +1023,7 @@ is (lm_head 248320: 6.00 vs 7.28-7.39 ms; 6144: 317-326 vs 382-394 us; 12288 gs6
 - Stage split at f96a99e9, 8K, one boot per stand-in (`QWEN4_STANDIN`; removal is not additive): the part each block costs at 1 / 4 / 8 rows,
   MLP 4.9 / 10.3 / 17.4 ms (1.8 per row: the routed experts are bound per slot), GDN 4.9 / 5.0 / 7.2, hyper-connections 2.8 / 2.5 / 4.8,
   attention 3.1 / 4.3 / 4.7. The routed experts are the remaining slope.
-- Tests: `single-stream verify feature selection` (widths 1..9), the real-pack `single-stream verify optimizations` (prepared graph at
-  2..8), `dense rows ... preserve MLX's bits` (rows 1..8, 9, 16, 32), `qmv8 gs32/64/128 shared rows` (the trunk shapes, arm engaged at 5..7),
+- Tests: `single-stream verify feature selection` (widths 1..9), `dense rows ... preserve MLX's bits` (rows 1..8, 9, 16, 32), `qmv8 gs32/64/128 shared rows` (the trunk shapes, arm engaged at 5..7),
   `gdn_decode.step in gatedDeltaNetProjected` (rollback at every accepted row, f32 and bf16, fused replay against the chain).
 
 Bench on the final tree (`d2a866b4`, binary built 2026-10-22 06:49:59, SHA-256 `648924f9...48e8`), Sushi-2.6bpw, llmprobe 0.6.15

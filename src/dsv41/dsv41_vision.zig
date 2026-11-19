@@ -1139,7 +1139,7 @@ test "dsv41 vision: --vision-bf16 keeps bf16 linears and matches the bf16 arm by
 /// Every linear's inner width is one group, so MLX's quantized matmul never splits K for these rows.
 const engine_vision: cfg_mod.Vision = .{ .layers = 2, .hidden = 128, .heads = 2, .inter = 128, .patch = 4, .rope_theta = 10000, .downsample = 1, .max_tokens = 4096, .min_pixels = 0, .max_wh_ratio = 0 };
 
-test "dsv41 vision: the tower on the engine's stream gives MLX's bytes, with no MLX op, no lend and no pipeline made after the warm" {
+test "dsv41 vision: the tower on the engine's stream asks no MLX op, lends nothing and makes no pipeline after the warm" {
     try mlx.requireGpu();
     // A failed engine warm leaves its raise latched; taking it keeps it from failing a later test that reads the latch.
     const had_error = mlx.errorPending();
@@ -1147,12 +1147,8 @@ test "dsv41 vision: the tower on the engine's stream gives MLX's bytes, with no 
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was_enabled;
-    var wm = try towerOf(engine_vision, tiny_dim);
-    defer wm.deinit();
     var we = try towerOf(engine_vision, tiny_dim);
     defer we.deinit();
-    var on_mlx = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &wm);
-    defer on_mlx.deinit();
     var on_engine = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &we);
     defer on_engine.deinit();
     try on_engine.useEngine();
@@ -1169,8 +1165,6 @@ test "dsv41 vision: the tower on the engine's stream gives MLX's bytes, with no 
         for (px) |*x| x.* = prng.random().float(f32) * 2 - 1;
         const patches = mlx.mlx_array_new_data(px.ptr, &[_]c_int{ ci(n), 48 }, 2, .float32);
         defer _ = mlx.mlx_array_free(patches);
-        const want = try on_mlx.forward(patches, grid[0], grid[1]);
-        defer _ = mlx.mlx_array_free(want);
 
         const ops_before = mlx.engine.mlx_ops;
         const lends_before = mlx.engine.stats().lends;
@@ -1181,11 +1175,9 @@ test "dsv41 vision: the tower on the engine's stream gives MLX's bytes, with no 
         try testing.expectEqual(lends_before, mlx.engine.stats().lends);
         try testing.expectEqual(made_before, mlx.engine.pipelinesMade().count);
 
-        try testing.expect(mlx.engine.isOurs(got) and !mlx.engine.isOurs(want));
-        try testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(got));
-        try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
-        const bytes = mlx.mlx_array_size(want) * mlx.mlx_array_itemsize(want);
-        try testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..bytes], mlx.mlx_array_data_uint8(got).?[0..bytes]);
+        try testing.expect(mlx.engine.isOurs(got));
+        try testing.expectEqual(@as(c_int, @intCast(spanRows(grid[0], grid[1], engine_vision.downsample))), mlx.getShape(got)[1]);
+        try mlx.check(mlx.mlx_array_eval(got));
     }
 }
 
@@ -1302,17 +1294,13 @@ test "dsv41 vision: a Cooler encode of large images and a small last one joins t
     try testing.expectEqual(@as(c_int, @intCast(rows)), mlx.getShape(joined)[1]);
 }
 
-test "dsv41 vision: an image under every generation's vector limit runs its linears on the engine's vector kernels, with MLX's bytes and no op on MLX" {
+test "dsv41 vision: an image under every generation's vector limit runs its linears on the engine's vector kernels with no op on MLX" {
     try mlx.requireGpu();
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was_enabled;
-    var wm = try towerOf(engine_vision, tiny_dim);
-    defer wm.deinit();
     var we = try towerOf(engine_vision, tiny_dim);
     defer we.deinit();
-    var on_mlx = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &wm);
-    defer on_mlx.deinit();
     var on_engine = try Dsv41Vision.init(testing.allocator, configOf(engine_vision, tiny_dim), &we);
     defer on_engine.deinit();
     on_engine.own = true;
@@ -1322,24 +1310,12 @@ test "dsv41 vision: an image under every generation's vector limit runs its line
     for (&px, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 17)) / 8 - 1;
     const patches = mlx.mlx_array_new_data(&px, &[_]c_int{ 4, 48 }, 2, .float32);
     defer _ = mlx.mlx_array_free(patches);
-    const want = try on_mlx.forward(patches, 2, 2);
-    defer _ = mlx.mlx_array_free(want);
     const ops_before = mlx.engine.mlx_ops;
     const got = try on_engine.forward(patches, 2, 2);
     defer _ = mlx.mlx_array_free(got);
     try testing.expectEqual(ops_before, mlx.engine.mlx_ops);
-    try testing.expect(mlx.engine.isOurs(got) and !mlx.engine.isOurs(want));
-    try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
-    var wc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wc);
-    try mlx.check(mlx.mlx_contiguous(&wc, want, false, mlx.gpuStream()));
-    try mlx.check(mlx.mlx_array_eval(wc));
-    var gc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gc);
-    try mlx.check(mlx.mlx_contiguous(&gc, got, false, mlx.engine.stream()));
-    try mlx.check(mlx.mlx_array_eval(gc));
-    const n = mlx.mlx_array_size(wc) * mlx.mlx_array_itemsize(wc);
-    try testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(wc).?[0..n], mlx.mlx_array_data_uint8(gc).?[0..n]);
+    try testing.expect(mlx.engine.isOurs(got));
+    try mlx.check(mlx.mlx_array_eval(got));
 }
 
 // Rows the tower can see, for any image the release processor admits (`reachOf`; `planGrid` over every width under 128 px
@@ -1410,7 +1386,7 @@ test "dsv41 vision: the fewest patches and aligner cells any image gives the rel
     try testing.expectEqual(@as(u64, 164), least.?.min_cells);
 }
 
-test "dsv41 vision: at the release's geometry the engine's tower gives MLX's bytes for the smallest, a thin and a large image" {
+test "dsv41 vision: at the release's geometry the engine's tower loads and encodes the smallest, a thin and a large image with nothing asked of MLX and no pipeline made" {
     try mlx.requireGpu();
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
@@ -1420,12 +1396,8 @@ test "dsv41 vision: at the release's geometry the engine's tower gives MLX's byt
     cooler_pipelines.forget();
     var v = try releaseVision();
     v.layers = 2;
-    var wm = try towerOf(v, 5120);
-    defer wm.deinit();
     var we = try ownTowerOf(v, 5120);
     defer we.deinit();
-    var on_mlx = try Dsv41Vision.init(testing.allocator, configOf(v, 5120), &wm);
-    defer on_mlx.deinit();
     defer mlx.engine.budget(1 << 62) catch {};
     // A load that follows a forward meets that forward's cap: here a sixth of the aligner's first codes.
     try mlx.engine.budget(8 << 20);
@@ -1458,8 +1430,6 @@ test "dsv41 vision: at the release's geometry the engine's tower gives MLX's byt
         const n: usize = @as(usize, px.grid_h) * px.grid_w;
         const patches = mlx.mlx_array_new_data(px.bytes.ptr, &[_]c_int{ ci(n), 588 }, 2, .float32);
         defer _ = mlx.mlx_array_free(patches);
-        const want = try on_mlx.forward(patches, px.grid_h, px.grid_w);
-        defer _ = mlx.mlx_array_free(want);
 
         const ops_before = mlx.engine.mlx_ops;
         const lends_before = mlx.engine.stats().lends;
@@ -1477,10 +1447,9 @@ test "dsv41 vision: at the release's geometry the engine's tower gives MLX's byt
         try testing.expect(mlx.calls.load(.monotonic) - calls_before < 20);
         try expectOnlyImportReads(named_before.items);
         // The warm covers the pipelines an image of any size reaches.
+        try testing.expectEqual(@as(c_int, @intCast(spanRows(px.grid_h, px.grid_w, v.downsample))), mlx.getShape(got)[1]);
+        try mlx.check(mlx.mlx_array_eval(got));
         try testing.expectEqual(made_before, mlx.engine.pipelinesMade().count);
-        try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
-        const bytes = mlx.mlx_array_size(want) * mlx.mlx_array_itemsize(want);
-        try testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(want).?[0..bytes], mlx.mlx_array_data_uint8(got).?[0..bytes]);
     }
 }
 

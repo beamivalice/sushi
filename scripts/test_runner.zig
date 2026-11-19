@@ -1,6 +1,7 @@
 //! Sushi's test runner: Zig 0.17.1's default runner (`lib/compiler/test_runner.zig`, MIT), unchanged but for `runTest`,
 //! which asks after every test whether the engine is at rest (`sushi_after_each`, exported where the engine is built)
-//! and fails the test that left it otherwise, by name, before the next one starts.
+//! and fails the test that left it otherwise, by name, before the next one starts, and records the test's time when
+//! `main` read `SUSHI_TEST_TIMES`.
 const builtin = @import("builtin");
 
 const std = @import("std");
@@ -19,15 +20,35 @@ comptime {
 }
 extern fn sushi_after_each() callconv(.c) ?[*:0]const u8;
 
+/// `SUSHI_TEST_TIMES=<abs path>`: each test appends `<ms>\t<name>` there, its at-rest check included.
+var times_path: ?[]const u8 = null;
+
 /// The test, then the engine put back at rest; a test that passed but left it otherwise fails, naming what it left.
-fn runTest(func: *const fn () anyerror!void) anyerror!void {
+fn runTest(name: []const u8, func: *const fn () anyerror!void) anyerror!void {
+    const start: Io.Timestamp = .now(runner_threaded_io, .awake);
     const result = func();
     const left = sushi_after_each();
+    if (times_path) |path| {
+        const ms = start.untilNow(runner_threaded_io, .awake).toMilliseconds();
+        appendTime(path, ms, name) catch |err| {
+            std.debug.print("SUSHI_TEST_TIMES={s}: {t}\n", .{ path, err });
+            return err;
+        };
+    }
     try result;
     if (left) |why| {
         std.debug.print("{s}\n", .{why});
         return error.EngineNotAtRest;
     }
+}
+
+/// The buckets run as parallel processes, so a line is written under the file's exclusive lock at its current end.
+fn appendTime(path: []const u8, ms: i64, name: []const u8) !void {
+    const file = try Io.Dir.createFileAbsolute(runner_threaded_io, path, .{ .truncate = false, .lock = .exclusive });
+    defer file.close(runner_threaded_io);
+    var line_buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{d}\t{s}\n", .{ ms, name }) catch return error.TestNameTooLong;
+    try file.writePositionalAll(runner_threaded_io, line, try file.length(runner_threaded_io));
 }
 
 pub const std_options: std.Options = .{
@@ -82,6 +103,11 @@ pub fn main(init: std.process.Init.Minimal) void {
         } else {
             panic("unrecognized command line argument: {s}", .{arg});
         }
+    }
+
+    if (init.environ.getPosix("SUSHI_TEST_TIMES")) |path| {
+        if (!std.fs.path.isAbsolute(path)) panic("SUSHI_TEST_TIMES must be an absolute path, not {s}", .{path});
+        times_path = path;
     }
 
     if (builtin.fuzz) {
@@ -161,7 +187,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 try server.serveStringMessage(.test_started, &.{});
 
                 const TestResults = std.zig.Server.Message.TestResults;
-                const status: TestResults.Status = if (runTest(test_fn.func)) |v| s: {
+                const status: TestResults.Status = if (runTest(test_fn.name, test_fn.func)) |v| s: {
                     v;
                     break :s .pass;
                 } else |err| switch (err) {
@@ -313,7 +339,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             std.debug.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name });
         }
         is_fuzz_test = false;
-        if (runTest(test_fn.func)) |_| {
+        if (runTest(test_fn.name, test_fn.func)) |_| {
             ok_count += 1;
             test_node.end();
             if (!have_tty) std.debug.print("OK\n", .{});
@@ -412,7 +438,7 @@ pub fn mainSimple() anyerror!void {
             stdout.writeStreamingAll(runner_threaded_io, test_fn.name) catch {};
             stdout.writeStreamingAll(runner_threaded_io, "... ") catch {};
         }
-        if (runTest(test_fn.func)) |_| {
+        if (runTest(test_fn.name, test_fn.func)) |_| {
             if (enable_write) stdout.writeStreamingAll(runner_threaded_io, "PASS\n") catch {};
         } else |err| {
             if (err != error.SkipZigTest) {

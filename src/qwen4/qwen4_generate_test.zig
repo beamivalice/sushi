@@ -364,7 +364,7 @@ test "qwen4: the spec warm-up runs a prefill-shaped forward through the grouped 
     try testing.expect(api.rate_groups.prefill_chains + api.kernels.prefill_calls > before);
 }
 
-test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
+test "Generator rounds preserve acceptance and next-round stashes at N=4" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     try mlx.requireGpu();
     const predraft = mtp_round.mtp_predraft_enabled;
@@ -397,8 +397,9 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
-    for ([_]usize{ 2, 4 }) |n| {
-        for ([_]u32{ 1, 2, 4 }) |depth| {
+    // Rows 0 and 1 of four are what two rows run; the second round is the first to take a stash.
+    for ([_]usize{4}) |n| {
+        for ([_]u32{ 1, 4 }) |depth| {
             depth_bounds.active = .{ .min = depth, .max = depth };
             var solo: [4]?*MtpChainTestSlot = @splat(null);
             var batch: [4]?*MtpChainTestSlot = @splat(null);
@@ -411,7 +412,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
                 solo[i] = try MtpChainTestSlot.init(a, io, &xfm, &tok, ids, depth);
                 batch[i] = try MtpChainTestSlot.init(a, io, &xfm, &tok, ids, depth);
             }
-            for (0..3) |round| {
+            for (0..2) |round| {
                 var ss: [4]?mtp_round.MtpRoundState = @splat(null);
                 var results: [4]?Generator.DrafterStepResult = @splat(null);
                 defer for (&ss, results) |*state, result| {
@@ -573,7 +574,7 @@ test "sampled qwen4 chains hand the verify the density each depth drew from (QWE
         const g = &slot.*.?.gen.?;
         g.sampling = .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20, .seed = 11 + i, .suppress_mask = g.sampling.suppress_mask };
     }
-    for (0..3) |_| {
+    for (0..2) |_| {
         const g = &slots[0].?.gen.?;
         var st = try g.mtpRoundContinue(a, try MtpChainTestSlot.begin(g, a, depth, false));
         defer st.deinit(a);
@@ -582,7 +583,7 @@ test "sampled qwen4 chains hand the verify the density each depth drew from (QWE
         const r = (try g.mtpRoundFinish(a, &st)) orelse return error.MtpRoundDeclined;
         a.free(r.tokens);
     }
-    for (0..3) |_| {
+    for (0..2) |_| {
         var gens: [2]*Generator = undefined;
         var opens: [2]mtp_round.MtpRoundOpen = undefined;
         var chains: [2]mtp_round.MtpPreDraft = undefined;

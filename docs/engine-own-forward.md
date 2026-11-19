@@ -28,9 +28,9 @@ The release's own layout reaches two ops an STQ pack does not, both MLX's plans 
 of weights) with the vector, quad, wide, split-K and tile plans MLX picks by rows, and `gather_qmm` in `mxfp4` (the
 routed experts: `gather_qmv` for a decode row, the tiles for many rows a pick, and the sorted `gather_qmm_rhs` with
 `gather_mm_offsets` for a wide chunk). On the tiny release-layout fixture (`DSV41_TINY`) a Cooler load asks nothing of
-MLX from load to unload and gives the MLX route's logits and DSpark tokens at each round-width mix. A verify wider than
-one row takes other product plans than a one-row step on either route, so greedy tokens on that random model depend
-on the round mix; each mix is held to MLX's at the same mix.
+MLX from load to unload; it gave the MLX route's logits and DSpark tokens at each round-width mix when it was proven,
+and a small expert cache now gives the cached load's bytes. A verify wider than one row takes other product plans
+than a one-row step on either route, so greedy tokens on that random model depend on the round mix.
 
 Qwen's BF16 checkpoint reaches the dense gathered product (`tensor/gather_mm.zig`, MLX's `gather_mm`): `gather_mv` for
 a decode row (both kernel orientations), the wide gather for up to fifteen rows a pick against a transposed bank, and
@@ -43,7 +43,7 @@ the table's `quantized_matmul`, `fast::scaled_dot_product_attention` and `erf` r
 so MLX's codes, scales and biases), and the weights it makes are the engine's tensors, not imports.
 
 A forward that splices image rows runs on the engine like any other, and so does one issued while a DSpark verify is
-open (only after a round failed): the MLX route's logits, byte for byte. An image row takes the non-queued route (a
+open (only after a round failed), with no op on MLX. An image row takes the non-queued route (a
 routing bias read row by row, the Engram write masked by row), whose pipelines a load with the image bias warms at
 every decode width and at a prefill width (`dsv41_model.warmOwnImages`).
 
@@ -199,8 +199,8 @@ route and the MLX arm still build the bank at prepare time.
   handle (`mlx_array_new`, `mlx_stream_new`, `mlx_device_new`, `mlx_string_new`, `mlx_device_info_new`) is a zero
   `ctx` made in Zig, no call. It cannot see MLX's own threads, work before the load, or the Metal objects MLX already
   made. Another file declaring an `mlx_*` extern fails the `mlx-extern` lint; an address of the library for `dladdr`
-  is `mlx.libraryAnchor()`, never a wrapper's address. A one-row STQ decode step on the tiny fixture makes no call
-  into mlx-c (pinned in `dsv41_generate_test.zig`).
+  is `mlx.libraryAnchor()`, never a wrapper's address. A request on each tiny fixture makes no call into mlx-c
+  (the contract's `a Cooler load's request and unload ask nothing of MLX`).
 - **A Cooler load, its requests and its unload ask nothing of MLX, pinned phase by phase** (the census test in
   `dsv41_generate_test.zig`: the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore
   point captured and restored, a step after it, an image prompt, the unload; the SSD tier has its own test, with the
@@ -249,7 +249,8 @@ route and the MLX arm still build the bank at prepare time.
   the module) and keeps its GEMM input ring and zero-slot rows one per side.
 - **A kernel is noted in a served process whatever the engine's state**, so a kernel or config a module made before
   the first Cooler load launches on the engine like one made after it.
-- **A Cooler pack loads again after its unload.** `dsv41_borrow.unloadModel` leaves the pool empty and uncapped, and
+- **A Cooler pack loads again after its unload** (the contract's `requests, repeated, ...`, load after load).
+  `dsv41_borrow.unloadModel` leaves the pool empty and uncapped, and
   `initDsv41` sets its own budget and unseals the pipelines before it proves a kernel. The NAX GEMM arm proven on the
   engine's side stays proven: a later build that fails there is an error, never a switch to another arm.
 - **The device is asked once a process** (`mlx.deviceArchitecture`, `maxRecommendedWorkingSet`; `main` asks what a
@@ -286,7 +287,7 @@ route and the MLX arm still build the bank at prepare time.
   `engine.enabled` (lint rule `scope-state`).
 - **The last Cooler unload leaves nothing of the engine's in use**: the pool is empty and the EXL3 module's arrays of
   the engine's side (its GEMM input ring, a unit scalar) go with it (`sushi_exl3.dropHostArrays`). Pinned from zero:
-  `requests, repeated, leave the engine's pool as they found it, and an unload gives back everything`.
+  the contract's `requests, repeated, leave the engine as they found it, and an unload gives back everything`.
   So does a Cooler load that fails after its warm made them: every hold ends in `arch_handle.engineHoldEnd`, which
   drops them when no hold is left (lint rule `engine-hold-end`); a failed load's own unhold kept up to 393 KB in the
   pool, unbilled, until the next Cooler load and unload. Pinned by `a Cooler load refused at any of its pool buffers`.
@@ -428,8 +429,7 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   naming it under its old key; the next call launched freed memory. A cache builds, then puts (`QsaCfgCache`; lint
   `config-free-stale`).
 - **A route is a load's for its life**: no load mixes an MLX forward with the engine's weights or slabs. A test that
-  wants MLX's bytes loads the pack on the MLX route (`EngineFixture.openMlx`), takes them and closes it before the
-  Cooler load opens. One forward of the load's warm had stayed on MLX (the context chunk of `warmOwnBlocks`, 536 rows
+  runs a model on MLX beside a Cooler load opens it on the MLX route (`EngineFixture.openMlx`). One forward of the load's warm had stayed on MLX (the context chunk of `warmOwnBlocks`, 536 rows
   on the 1.75bpw pack; the tiny fixture's geometry skips that step): with the slabs the engine's it built its bank on
   the engine while its fill was in flight, the guard refused it and the whole warm was dropped, so every kernel
   compiled inside the first requests. It runs on the engine now, and the order a wide route reads its fill in follows
@@ -732,8 +732,8 @@ rebuilds one.
 ## Proving a change
 
 - A new op: a case in `route.zig` beside its family, red before the op exists.
-- DeepSeek: `dsv41 engine:` tests on the tiny STQ fixture hold one-row decode logits, DSpark drafts, confidences and
-  verify logits to MLX's bytes at every verify width, and the tokens at every round-width mix.
+- DeepSeek: `dsv41 engine:` tests on the tiny STQ fixture hold every verify row to the serial step's bits and one text
+  serial and in rounds of any width; Sushi Cooler is proven against MLX, so no test holds it to MLX's bytes.
 - **An op takes every count MLX takes.** `stack`, `concatenate` and a kernel's inputs held their parts in a fixed
   64-slot buffer; the release's DSpark bank stacks 256 experts, which no tiny fixture has. A cap is the kernel's own
   (`kernel.max_inputs`), named where it refuses; the real-pack test (`SUSHI_DSV41_REAL_PACK`) runs before a phase closes.

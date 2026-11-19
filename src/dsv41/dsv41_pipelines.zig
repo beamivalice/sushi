@@ -159,21 +159,33 @@ fn engineDispatches() u64 {
     return mlx.engine.stats().dispatches;
 }
 
-test "dsv41 pipelines: a load with no manifest writes one, and a load from it skips the engine's forwards and serves the same tokens (DSV41_STQ_TINY)" {
+test "dsv41 pipelines: a load with no manifest writes one with the wide chunks' recipes, and a load from it skips the engine's forwards, the wide ones included, serves the same tokens and compiles none inside a prompt (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     var served: Served = undefined;
     try served.init(testing.allocator);
     defer served.deinit();
+    const m = served.model();
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const key = testKey("b1b1b1b1b1b1b1b1");
+
+    // A load given no manifest root keeps none, says so, and warms in full.
+    var rootless = dsv41_serving.beginPipelines(testing.allocator, &served.config, served.xfm.expert_stream.?, true);
+    defer rootless.deinit();
+    try testing.expectEqual(Case.off, rootless.case);
+    try testing.expect(rootless.root == null);
+    try testing.expectEqualStrings("no manifest root was given", rootless.why);
+    try testing.expectEqual(dsv41_model.WarmScope.all, dsv41_serving.warmScopeOf(rootless.settle()));
 
     var first = plainBegin(tmp.dir, key);
     defer first.deinit();
     try testing.expectEqual(Case.none, first.case);
     const before_full = engineDispatches();
+    const state_only = m.state_only_used;
     try testing.expectEqual(dsv41_model.WarmScope.all, try served.load(&first));
     const full = engineDispatches() - before_full;
+    // The wide warm ran before the manifest was stored, so it holds the wide recipes.
+    try testing.expect(m.state_only_used > state_only);
     mlx.engine.seal(true);
     defer mlx.engine.seal(false);
     const warmed = try served.tokens();
@@ -189,13 +201,20 @@ test "dsv41 pipelines: a load with no manifest writes one, and a load from it sk
     defer second.deinit();
     try testing.expectEqual(Case.same, second.case);
     const before_skip = engineDispatches();
+    const state_only_second = m.state_only_used;
     try testing.expectEqual(dsv41_model.WarmScope.mlx, try served.load(&second));
     try testing.expect(engineDispatches() - before_skip < full);
+    try testing.expectEqual(state_only_second, m.state_only_used);
     mlx.engine.seal(true);
     const late = mlx.engine.latePipelines();
     const from_manifest = try served.tokens();
     defer testing.allocator.free(from_manifest);
     try testing.expectEqualSlices(u32, warmed, from_manifest);
+    try served.xfm.resetCache();
+    var prompt: [97]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = served.ids[(i * 5 + 3) % served.ids.len];
+    try served.prefillChunk(prompt[0..64]);
+    try served.prefillChunk(prompt[64..97]);
     try testing.expectEqual(late, mlx.engine.latePipelines());
 }
 
@@ -218,45 +237,6 @@ test "dsv41 pipelines: a load whose warm did not finish leaves no manifest, and 
     var stored = try manifest.lookup(testing.allocator, io, tmp.dir, key);
     defer stored.deinit();
     try testing.expect(stored == .same);
-}
-
-test "dsv41 pipelines: the wide chunks' recipes are in the manifest, and a load from it runs none of the wide forwards and compiles none inside a prompt (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    var served: Served = undefined;
-    try served.init(testing.allocator);
-    defer served.deinit();
-    const m = served.model();
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const key = testKey("d1d1d1d1d1d1d1d1");
-
-    var first = plainBegin(tmp.dir, key);
-    defer first.deinit();
-    const state_only = m.state_only_used;
-    try testing.expectEqual(dsv41_model.WarmScope.all, try served.load(&first));
-    // The wide warm ran before the manifest was stored, so it holds the wide recipes.
-    try testing.expect(m.state_only_used > state_only);
-    var written = try manifest.lookup(testing.allocator, std.Io.Threaded.global_single_threaded.io(), tmp.dir, key);
-    defer written.deinit();
-    try testing.expect(written == .same);
-    const with_wide = written.same.recipes.len;
-
-    mlx.engine.seal(false);
-    var second = plainBegin(tmp.dir, key);
-    defer second.deinit();
-    try testing.expectEqual(Case.same, second.case);
-    const state_only_second = m.state_only_used;
-    try testing.expectEqual(dsv41_model.WarmScope.mlx, try served.load(&second));
-    try testing.expectEqual(state_only_second, m.state_only_used);
-    mlx.engine.seal(true);
-    defer mlx.engine.seal(false);
-    const late = mlx.engine.latePipelines();
-    var prompt: [97]u32 = undefined;
-    for (&prompt, 0..) |*t, i| t.* = served.ids[(i * 5 + 3) % served.ids.len];
-    try served.prefillChunk(prompt[0..64]);
-    try served.prefillChunk(prompt[64..97]);
-    try testing.expectEqual(late, mlx.engine.latePipelines());
-    try testing.expect(with_wide > 0);
 }
 
 test "dsv41 pipelines: a chunk whose index top-k streams over key tiles compiles nothing inside a prompt, after a full warm and after a load from the manifest (DSV41_STQ_TINY)" {
@@ -293,24 +273,24 @@ test "dsv41 pipelines: a chunk whose index top-k streams over key tiles compiles
     }
 }
 
-test "dsv41 pipelines: a manifest of another build is recompiled, the warm runs in full, and the older build's directory goes (DSV41_STQ_TINY)" {
+test "dsv41 pipelines: a manifest of another build is recompiled, the warm runs in full, and the older build's directory goes" {
     try mlx.requireGpu();
-    var served: Served = undefined;
-    try served.init(testing.allocator);
-    defer served.deinit();
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
+    defer forget();
     const old = testKey("0a0a0a0a0a0a0a0a");
     const new = testKey("0b0b0b0b0b0b0b0b");
 
     var first = plainBegin(tmp.dir, old);
     defer first.deinit();
-    _ = try served.load(&first);
+    try testing.expect(!first.settle());
+    first.store();
 
     var second = plainBegin(tmp.dir, new);
     defer second.deinit();
     try testing.expectEqual(Case.other_build, second.case);
-    try testing.expectEqual(dsv41_model.WarmScope.all, try served.load(&second));
+    try testing.expectEqual(dsv41_model.WarmScope.all, dsv41_serving.warmScopeOf(second.settle()));
+    second.store();
 
     const io = std.Io.Threaded.global_single_threaded.io();
     var now = try manifest.lookup(testing.allocator, io, tmp.dir, new);
@@ -321,19 +301,18 @@ test "dsv41 pipelines: a manifest of another build is recompiled, the warm runs 
     try testing.expect(gone == .other);
 }
 
-test "dsv41 pipelines: a truncated manifest is reported by name and rebuilt, never trusted (DSV41_STQ_TINY)" {
+test "dsv41 pipelines: a truncated manifest is reported by name and rebuilt, never trusted" {
     try mlx.requireGpu();
-    var served: Served = undefined;
-    try served.init(testing.allocator);
-    defer served.deinit();
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
+    defer forget();
     const io = std.Io.Threaded.global_single_threaded.io();
     const key = testKey("c1c1c1c1c1c1c1c1");
 
     var first = plainBegin(tmp.dir, key);
     defer first.deinit();
-    _ = try served.load(&first);
+    try testing.expect(!first.settle());
+    first.store();
 
     var name_buf: [manifest.Key.dir_len]u8 = undefined;
     var path_buf: [64]u8 = undefined;
@@ -346,23 +325,11 @@ test "dsv41 pipelines: a truncated manifest is reported by name and rebuilt, nev
     defer second.deinit();
     try testing.expectEqual(Case.unreadable, second.case);
     try testing.expectEqualStrings("ManifestChecksum", second.why);
-    try testing.expectEqual(dsv41_model.WarmScope.all, try served.load(&second));
+    try testing.expectEqual(dsv41_model.WarmScope.all, dsv41_serving.warmScopeOf(second.settle()));
+    second.store();
 
     var rebuilt = try manifest.lookup(testing.allocator, io, tmp.dir, key);
     defer rebuilt.deinit();
     try testing.expect(rebuilt == .same);
     try testing.expectEqual(whole.len, (try tmp.dir.statFile(io, file, .{})).size);
-}
-
-test "dsv41 pipelines: a load given no manifest root keeps no manifest and says so (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    var served: Served = undefined;
-    try served.init(testing.allocator);
-    defer served.deinit();
-    var plan = dsv41_serving.beginPipelines(testing.allocator, &served.config, served.xfm.expert_stream.?, true);
-    defer plan.deinit();
-    try testing.expectEqual(Case.off, plan.case);
-    try testing.expect(plan.root == null);
-    try testing.expectEqualStrings("no manifest root was given", plan.why);
-    try testing.expectEqual(dsv41_model.WarmScope.all, try served.load(&plan));
 }

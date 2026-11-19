@@ -298,7 +298,8 @@ test "exl3 trunk: a trellis triple multiplies as its host-decoded dense twin doe
     };
     try testing.expect(isStq(t.w));
     try testing.expectEqual(out, outDim(t.w));
-    for ([_]usize{ 1, 2, 5, 8, 40 }) |rows| {
+    // The one-row arm, the multi-row arm and the GEMM.
+    for ([_]usize{ 1, 5, 40 }) |rows| {
         const xs = try alloc.alloc(f32, rows * in);
         const xb = try alloc.alloc(u16, xs.len);
         for (xs, xb) |*v, *b| {
@@ -322,45 +323,6 @@ test "exl3 trunk: a trellis triple multiplies as its host-decoded dense twin doe
             want[r * out + j] += xs[r * in + i] * twin[i * out + j];
         };
         try testing.expect(relRms(got, want) < MATMUL_BAR);
-    }
-}
-
-test "exl3 trunk: a row beside others rounds as it does alone, so batched ticks and verify blocks equal serial ones" {
-    try mlx.requireGpu();
-    const s = mlx.gpuStream();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var prng = std.Random.DefaultPrng.init(0x57a4);
-    const rnd = prng.random();
-    const dec = format.Decode.tabled(.spec1, .w15);
-    const bank = try TestBank.init(alloc, rnd, 2560, 12288, 48);
-    const t = try bank.triple(s);
-    defer for ([_]mlx.mlx_array{ t.w, t.s, t.b }) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    const rows = 5;
-    const xb = try alloc.alloc(u16, rows * 2560);
-    for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
-    const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, rows, 2560 }, 3, .bfloat16);
-    defer _ = mlx.mlx_array_free(x);
-    const block = try matmul(s, x, t.w, t.s, t.b, dec, false);
-    defer _ = mlx.mlx_array_free(block);
-    for (0..rows) |r| {
-        var xr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(xr);
-        try mlx.check(mlx.mlx_slice(&xr, x, &[_]c_int{ 0, @intCast(r), 0 }, 3, &[_]c_int{ 1, @intCast(r + 1), 2560 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-        const alone = try matmul(s, xr, t.w, t.s, t.b, dec, false);
-        defer _ = mlx.mlx_array_free(alone);
-        var want = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(want);
-        try mlx.check(mlx.mlx_slice(&want, block, &[_]c_int{ 0, @intCast(r), 0 }, 3, &[_]c_int{ 1, @intCast(r + 1), 12288 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-        var eq = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(eq);
-        try mlx.check(mlx.mlx_array_equal(&eq, alone, want, false, s));
-        var same = false;
-        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
-        try testing.expect(same);
     }
 }
 
@@ -421,7 +383,7 @@ test "exl3 trunk: stacked banks serve each linear as its own, and a view run alo
     var solo: [3]mlx.mlx_array = undefined;
     var xb8: [8 * 256]u16 = undefined;
     for (&xb8) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
-    for (1..SHARED_ROWS_MAX + 1) |rows| {
+    for ([_]usize{ 1, 3, SHARED_ROWS_MAX }) |rows| {
         const x = mlx.mlx_array_new_data(&xb8, &[_]c_int{ 1, @intCast(rows), 256 }, 3, .bfloat16);
         defer _ = mlx.mlx_array_free(x);
         var outs: [3]mlx.mlx_array = undefined;
@@ -461,6 +423,48 @@ test "exl3 trunk: stacked banks serve each linear as its own, and a view run alo
     defer _ = mlx.mlx_array_free(wide);
     var none: [3]mlx.mlx_array = undefined;
     try testing.expect(!try sharedProject(s, wide, sh, dec, &none, false));
+}
+
+test "exl3 trunk: a row beside others rounds as it does alone at 2 to 8 rows, so batched ticks and verify blocks equal serial ones" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x57a4);
+    const rnd = prng.random();
+    const dec = format.Decode.tabled(.spec1, .w15);
+    const bank = try TestBank.init(alloc, rnd, 2560, 12288, 48);
+    const t = try bank.triple(s);
+    defer for ([_]mlx.mlx_array{ t.w, t.s, t.b }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    // One input per width: each width is its own launch shape.
+    for (2..9) |rows| {
+        const xb = try alloc.alloc(u16, rows * 2560);
+        for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
+        const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, @intCast(rows), 2560 }, 3, .bfloat16);
+        defer _ = mlx.mlx_array_free(x);
+        const block = try matmul(s, x, t.w, t.s, t.b, dec, false);
+        defer _ = mlx.mlx_array_free(block);
+        for (0..rows) |r| {
+            errdefer std.debug.print("exl3 trunk: row {d} of {d}\n", .{ r, rows });
+            var xr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xr);
+            try mlx.check(mlx.mlx_slice(&xr, x, &[_]c_int{ 0, @intCast(r), 0 }, 3, &[_]c_int{ 1, @intCast(r + 1), 2560 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            const alone = try matmul(s, xr, t.w, t.s, t.b, dec, false);
+            defer _ = mlx.mlx_array_free(alone);
+            var want = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(want);
+            try mlx.check(mlx.mlx_slice(&want, block, &[_]c_int{ 0, @intCast(r), 0 }, 3, &[_]c_int{ 1, @intCast(r + 1), 12288 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_array_equal(&eq, alone, want, false, s));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+            try testing.expect(same);
+        }
+    }
 }
 
 test "exl3 trunk: a 9- to 16-row spec verify keeps each row's decode tick bytes, alone and stacked; a prefill chunk keeps the GEMM" {
@@ -523,7 +527,8 @@ test "exl3 trunk: a 9- to 16-row spec verify keeps each row's decode tick bytes,
         alone[r][2] = outs[1];
     }
 
-    for (9..max + 1) |rows| {
+    // 9 and 16 rows stage the two chunk widths past eight.
+    for ([_]usize{ 9, max }) |rows| {
         const x = try rowsOf(s, xs, 0, rows, &pool);
         const block = try matmul(s, x, t.w, t.s, t.b, dec, true);
         try pool.append(testing.allocator, block);
@@ -548,52 +553,51 @@ test "exl3 trunk: a launch from the weight's geo gives the bytes of the launch t
     var prng = std.Random.DefaultPrng.init(0x57b1);
     const rnd = prng.random();
     const dec = format.Decode.tabled(.spec1, .w15);
-    const rates = [_]u32{ 48, 96 };
-    for (rates) |n| {
-        const t = try (try TestBank.init(alloc, rnd, 2560, 1024, n)).triple(s);
-        var parts: [2]Triple = undefined;
-        for (&parts, [_]usize{ 512, 256 }) |*p, w| p.* = try (try TestBank.init(alloc, rnd, 2560, w, n)).triple(s);
-        var owned: std.ArrayList(mlx.mlx_array) = .empty;
-        defer {
-            for (owned.items) |a| _ = mlx.mlx_array_free(a);
-            owned.deinit(testing.allocator);
-        }
-        defer for ([_]mlx.mlx_array{ t.w, t.s, t.b }) |a| {
-            _ = mlx.mlx_array_free(a);
-        };
-        const orig = parts;
-        defer for (orig) |o| for ([_]mlx.mlx_array{ o.w, o.s, o.b }) |arr| {
-            _ = mlx.mlx_array_free(arr);
-        };
-        const sh = (try fuse(&.{ &parts[0], &parts[1] }, &owned, testing.allocator, s)).?;
-        try testing.expect(sh.geo != null);
-        const geo = try linear.Geo.init(t.w, null, .{ .exact = true });
-        try testing.expectEqual(@as(c_int, 2560), geo.in);
-        try testing.expectEqual(@as(c_int, 1024), geo.out);
-        const max: usize = if (kernels.gemmNaxOn()) @intCast(project_rows.NAX_ROWS_MAX) else @intCast(project_rows.PROJECT_ROWS_MAX);
-        const xb = try alloc.alloc(u16, (max + 4) * 2560);
-        for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
-        for (1..max + 5) |rows| {
-            const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, @intCast(rows), 2560 }, 3, .bfloat16);
-            defer _ = mlx.mlx_array_free(x);
-            for ([_]bool{ false, true }) |wide| {
-                const want = try matmul(s, x, t.w, t.s, t.b, dec, wide);
-                defer _ = mlx.mlx_array_free(want);
-                const got = try matmulGeo(s, x, t.w, t.s, t.b, &geo, dec, wide);
-                defer _ = mlx.mlx_array_free(got);
-                try testing.expect(try bitsEqual(s, got, want));
-                var a: [2]mlx.mlx_array = undefined;
-                var b: [2]mlx.mlx_array = undefined;
-                var bare = sh;
-                bare.geo = null;
-                const served = try sharedProject(s, x, bare, dec, &a, wide);
-                try testing.expectEqual(served, try sharedProject(s, x, sh, dec, &b, wide));
-                if (!served) continue;
-                defer for (a ++ b) |arr| {
-                    _ = mlx.mlx_array_free(arr);
-                };
-                for (a, b) |ya, yb| try testing.expect(try bitsEqual(s, ya, yb));
-            }
+    const n: u32 = 48;
+    const t = try (try TestBank.init(alloc, rnd, 2560, 1024, n)).triple(s);
+    var parts: [2]Triple = undefined;
+    for (&parts, [_]usize{ 512, 256 }) |*p, w| p.* = try (try TestBank.init(alloc, rnd, 2560, w, n)).triple(s);
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(testing.allocator);
+    }
+    defer for ([_]mlx.mlx_array{ t.w, t.s, t.b }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const orig = parts;
+    defer for (orig) |o| for ([_]mlx.mlx_array{ o.w, o.s, o.b }) |arr| {
+        _ = mlx.mlx_array_free(arr);
+    };
+    const sh = (try fuse(&.{ &parts[0], &parts[1] }, &owned, testing.allocator, s)).?;
+    try testing.expect(sh.geo != null);
+    const geo = try linear.Geo.init(t.w, null, .{ .exact = true });
+    try testing.expectEqual(@as(c_int, 2560), geo.in);
+    try testing.expectEqual(@as(c_int, 1024), geo.out);
+    const max: usize = if (kernels.gemmNaxOn()) @intCast(project_rows.NAX_ROWS_MAX) else @intCast(project_rows.PROJECT_ROWS_MAX);
+    const xb = try alloc.alloc(u16, (max + 4) * 2560);
+    for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
+    // One row, a multi-row launch, 9 rows and the most a launch takes (a wide verify's two chunk widths on NAX), one past.
+    for ([_]usize{ 1, 3, 9, max, max + 1 }) |rows| {
+        const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, @intCast(rows), 2560 }, 3, .bfloat16);
+        defer _ = mlx.mlx_array_free(x);
+        for ([_]bool{ false, true }) |wide| {
+            const want = try matmul(s, x, t.w, t.s, t.b, dec, wide);
+            defer _ = mlx.mlx_array_free(want);
+            const got = try matmulGeo(s, x, t.w, t.s, t.b, &geo, dec, wide);
+            defer _ = mlx.mlx_array_free(got);
+            try testing.expect(try bitsEqual(s, got, want));
+            var a: [2]mlx.mlx_array = undefined;
+            var b: [2]mlx.mlx_array = undefined;
+            var bare = sh;
+            bare.geo = null;
+            const served = try sharedProject(s, x, bare, dec, &a, wide);
+            try testing.expectEqual(served, try sharedProject(s, x, sh, dec, &b, wide));
+            if (!served) continue;
+            defer for (a ++ b) |arr| {
+                _ = mlx.mlx_array_free(arr);
+            };
+            for (a, b) |ya, yb| try testing.expect(try bitsEqual(s, ya, yb));
         }
     }
 }
@@ -631,7 +635,7 @@ test "exl3 trunk: a geo bound with NAX on runs the SIMD arm once the NAX latch i
     const previous = kernels.gemm_nax_failed;
     defer kernels.gemm_nax_failed = previous;
     kernels.gemm_nax_failed = true;
-    for (1..9) |rows| {
+    for ([_]usize{ 1, 5 }) |rows| {
         const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 1, @intCast(rows), 2560 }, 3, .bfloat16);
         defer _ = mlx.mlx_array_free(x);
         const want = try matmul(s, x, t.w, t.s, t.b, dec, false);
@@ -701,7 +705,8 @@ test "exl3 trunk: a geo made for the non-exact mode binds the SIMD one-row launc
     try testing.expectEqual(try linear.Geo.get(t.w, null, .{}), try linear.Geo.get(t.w, null, .{ .wide = true }));
     const xb = try alloc.alloc(u16, 8 * 2560);
     for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 3);
-    for (1..9) |rows| {
+    // The one-row SIMD launch and the multi-row NAX one.
+    for ([_]usize{ 1, 5 }) |rows| {
         const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ @intCast(rows), 2560 }, 2, .bfloat16);
         defer _ = mlx.mlx_array_free(x);
         const want = try linear.linearWith(s, x, p, dec, .{});

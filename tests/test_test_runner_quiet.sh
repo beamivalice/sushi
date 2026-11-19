@@ -57,8 +57,25 @@ if [ -n "$OUT" ]; then
   FAIL=1
 fi
 
+# SUSHI_TEST_TIMES: the runner appends `<ms>\t<test name>` per test and still prints nothing. Every binary shares
+# the runner, so the host step's format corpus stands for all of them.
+TIMES=$(mktemp -t sushi-test-times)
+trap 'rm -f "$TIMES"' EXIT
+LC_ALL=C grep -l -a -E 'o/[0-9a-f]+/(exl3-)?test' .zig-cache/h/* 2>/dev/null | xargs rm -f 2>/dev/null
+TIMES_OUT=$(SUSHI_TEST_TIMES="$TIMES" "$ZIG" build test-host -Doptimize=ReleaseFast -Dtest-filter="format corpus" 2>&1)
+TIMES_RC=$?
+if [ $TIMES_RC -ne 0 ] || [ -n "$TIMES_OUT" ]; then
+  echo "  FAIL: SUSHI_TEST_TIMES run exited $TIMES_RC with $(printf '%s' "$TIMES_OUT" | wc -l | tr -d ' ') lines of output"
+  printf '%s\n' "$TIMES_OUT" | head -20 | sed 's/^/    | /'
+  FAIL=1
+elif ! LC_ALL=C grep -E $'^[0-9]+\t.*format corpus' "$TIMES" >/dev/null || LC_ALL=C grep -v -E $'^[0-9]+\t.+$' "$TIMES" >/dev/null; then
+  echo "  FAIL: SUSHI_TEST_TIMES wrote a line that is not '<ms>\\t<name>', or none for the format corpus"
+  head -5 "$TIMES" | sed 's/^/    | /'
+  FAIL=1
+fi
+
 if [ $FAIL -eq 0 ]; then
-  echo "  PASS: $WHAT is silent and green"
+  echo "  PASS: $WHAT is silent and green, and SUSHI_TEST_TIMES records each test silently"
   echo "PASS"
   exit 0
 fi

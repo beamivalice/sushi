@@ -56,8 +56,8 @@ kernel on supported hardware.
   stored. Even n in [16, 128] admits (K1 to K8); `expert_quant.k` may be fractional JSON.
 - **Every reader keys on n, never on an integer K** (`exl3.Rate`, kernel template `NHW`, cache keys,
   `exl3ExpertBytes`); a K printed anywhere reads 2.25, not 36.
-- **Every fast path serves every admitted n; a guard test enumerates them** (`every admitted rate takes the fast
-  arms`). The funnel readers take their word indices and shifts from n at compile time: eight weights span n/2 whole
+- **Every fast path serves every admitted n; a guard test enumerates them** (`every admitted rate reads exactly on
+  every reader, and the sorted GEMM takes the fast arms`). The funnel readers take their word indices and shifts from n at compile time: eight weights span n/2 whole
   bits, and 16 weights span n. The decode GEMVs read every n through them; the prefill readers every n below 64,
   where a packed K4 branch does the same reads at a word-aligned rate:
   - decode GEMV lane: 64 bits ending at the lane's last bit (at n64, two whole words). A third word is read only
@@ -85,7 +85,7 @@ kernel on supported hardware.
   in: a decode without a table row panics on the host and a pack naming no table is refused at load.
   - The 2^12 scale is folded out of the GEMV decode: `exl3_decode2` is the weight over `foldScale`, and every kernel
     that reads it passes each stored f32 sum through `exl3_out`. A power of two, so the bytes are the unfolded ones
-    (`unfolded_for_test` is the reference). Never fold after an f16 store (into `svh` or `suh`): the unscaled inner
+    (proven against `unfolded_for_test`; the f32-truth bars hold the folded kernels now). Never fold after an f16 store (into `svh` or `suh`): the unscaled inner
     sum underflows f16. `exl3_pairh`, the MMA operand, keeps the 2^12, so the matrix units never see a subnormal weight.
   - The halves are often subnormal and the half sum rounds on some codewords, the same way on the host and in Metal
     (held over every codeword).
@@ -125,8 +125,8 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   builds the table on the host (a sync) and un-sorts with a copy ([perf-baselines](qwen4-perf.md#exl3-gpu-routing-meta)).
 - **The NAX body's x loads carry no bounds branch**: a lane's row pointers are clamped into the input once per run
   (a padded row reads a live neighbour whose product is never stored), the k loop is unswitched on the window's
-  second 16-row block and unrolled by two. Every row's products are the branch-guarded body's, so its bytes are
-  `GEMM_NAX_REFERENCE_SOURCE`'s at every admitted rate (the test's reference); -25% per GEMM at MiMo geometry
+  second 16-row block and unrolled by two. Every row's products are the branch-guarded body's, so its bytes were
+  `GEMM_NAX_REFERENCE_SOURCE`'s at every admitted rate when proven; -25% per GEMM at MiMo geometry
   ([perf-baselines](mimo2-perf.md#mimo-prefill-nax-body)).
 - **Prefill off NAX** (M1–M4, or NAX declined): the 8x8 `simdgroup_matrix` body computes D = W^T X^T so each lane's
   eight-weight slot group lands straight in its A fragments (the tile layout is the MMA fragment layout). f16 x and
@@ -145,7 +145,7 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   (`Exl3MtpRowsExceedDecode`).
 - **The prepared pair input is stored in GEMV lane order** (`LANE_ORDER_SLOT`: each 16-row tile keeps rows 2q,
   2q+1, 2q+8, 2q+9 at 4q..4q+3), so a lane reads its four as one half4 (`laneQuadReads`). Same values in the same
-  order: the pair planes keep the self-preparing kernel's bytes. The same layout for the prepared middle measured no
+  order: the pair planes kept the self-preparing kernel's bytes when proven. The same layout for the prepared middle measured no
   gain on the down (mid + down 52.1 vs 51.7 us at 1 row, 145.1 vs 145.9 at 4) and is not taken.
 - **Streamed serial decode** can add its already gated shared expert in the finish reduce, removing a dependent
   elementwise dispatch. The routed sum is rounded to its output dtype before the shared addition, matching the
@@ -158,8 +158,7 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
 - **The decode GEMVs are bound by fixed per-tile work, not DRAM** (64-bit index math, two word loads and a 64-bit
   shift, four input reads, loop control). The lane-funnel arms (`gemvLayout`: every n) carry two output
   tiles per threadgroup, load both k-tiles of an iteration before decoding, and bump pointers; the per-tile
-  accumulation order is unchanged, so the bytes equal the one-tile generic reader's (`FUNNEL=0`, the test's
-  reference). A layout that changes which simdgroup sums which k-tile (8 simdgroups) is NOT bit-identical.
+  accumulation order is unchanged, so the bytes equalled the one-tile generic reader's (`FUNNEL=0`) when proven. A layout that changes which simdgroup sums which k-tile (8 simdgroups) is NOT bit-identical.
 - A rate on the generic reader decodes ~40% slower per GEMV than on the funnel, with no other symptom. The engagement
   line `[exl3] n<n> funnel engaged arm=<arm>` names the rate and arm in a live log.
 - A decode rate kept off the lane layout keeps every byte and loses its speed: n64's own packed branch (one tile and
@@ -187,8 +186,8 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   2+ rows): among an expert's slots, each slot whose rank is a multiple of the bucket leads itself and the next
   bucket - 1, decodes each weight once and feeds every member in the single-slot order, so every row's bytes are its
   one-row decode tick's. Served: buckets of 2, on MiMo and on DeepSeek's rate-grouped chain (`rate_groups.groupFor`;
-  the load logs `[exl3-decode] expert-grouped rows engaged group=2`). Built and byte-tested at 2, 4, 8 and 16 members for any
-  slot count up to 512 (one ballot per 32 slots), on every codec: a bucket above 2 runs one output tile per
+  the load logs `[exl3-decode] expert-grouped rows engaged group=2`). Built for 2, 4, 8 and 16 members for any slot count up to
+  512 (one ballot per 32 slots), on every codec, and byte-tested at the served 2 (MCG, MUL1, PAIR1, SPEC1): a bucket above 2 runs one output tile per
   threadgroup, a block of `m` members takes the smallest rung (1, 2, 3, 4, 6, 8, 12, 16) that holds it, and rungs
   above 8 decode a weight once and sweep the members over it. `sushi-ubench run shared.exl3_grouped_decode` times
   ungrouped, prepared, pairs and the member capacity sized to the rows in one process at 1-8 rows on Flash-Next and
@@ -257,8 +256,8 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
 - **Decode and verify rows are ONE pair GEMV and ONE fused-mid down** over the layer's rate classes. Each is the
   served body with N constant per `case`, the rate read per threadgroup from the table. The served finish reduce
   follows, folding the shared tail where a uniform layer does.
-  - Every slot's planes are the served kernels' bytes at its own rate.
-  - So a layer whose groups share one rate is the uniform layer to the byte.
+  - Every slot's planes were the served kernels' bytes at its own rate, and a layer whose groups share one rate the
+    uniform layer to the byte, when proven; the f32-truth bar holds them now, per codebook.
   - The served body is taken verbatim apart from N and the trellis offset, and the layout comes from `gemvLayout`,
     so a change to the uniform decode GEMVs (e.g. K4 onto the lane funnel) reaches every class with no edit here.
 - **The pair kernel switches ONCE, on the expert's (gate n, up n) class, with both projections unrolled in a case.**
@@ -269,11 +268,11 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
 - **Prefill runs each GEMM once per group** over the group's bank view at local expert ids and its own segment of a
   GPU-built window table (`C + E_g` windows from `g * C + base_g`, C = ceil(rows * topk / WIN)). A combine dispatch
   (24 planes at most) joins the planes. N stays compile-time in the NAX body. Prepare, mid and the inverse-indexed
-  finish run once over the concatenated scales. Bytes equal the uniform prefill when the groups share one rate. Up to
+  finish run once over the concatenated scales. Bytes equalled the uniform prefill when the groups share one rate (proven, then cut). Up to
   512 experts (one window threadgroup). The folded DeepSeek chain (`moePrefillSharedFusedEarly`, up to 6 groups) skips the
   combine: its mid and finish kernels take every group's plane and read a row from the plane of its expert's group
   (`meta[eid * 8 + 3]`), the bytes the combine copied.
-- **`moeGroups` is the test reference, not a served path**: it decodes every out-of-group slot at local expert 0
+- **`moeGroups` is not a served path (ubench only)**: it decodes every out-of-group slot at local expert 0
   with weight 0, sums each group's slots in f32 and adds the group totals in f32. Its output differs from the
   served path by at most one rounding of the output dtype; a KLD gate judges that.
 - **SSD streaming of a grouped layer** (Flash-Next) keeps one slot pool per rate group and builds this `Ragged` bank
@@ -284,8 +283,8 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   of an expert as `[OT/2][IT][2][n]` (`layout.tileMajor`) instead of the pack's `[IT][OT][n]`, so an output tile pair's
   whole K range is one run. Only the first tile and the k stride of a reader change (`retile` over the decode funnel
   arms, `GEMM_NAX_TM_SOURCE`, `GEMM_SIMDMAT_TM_SOURCE`, `GEMM_SORTED_TM_SOURCE`, `TileOrder`); the words, the decode and
-  the FMA order are the pack order's, so every plane is the same bytes (held at 1-16 and 256 rows, every body, PAIR1
-  and SPEC1). The pack on disk is unchanged; the DSpark stage's resident bank and every other pack keep the pack order.
+  the FMA order are the pack order's, so every plane is the same bytes (proven at 1-16 and 256 rows, every body, PAIR1
+  and SPEC1; the decode and prefill f32-truth bars now run a tile-major copy too). The pack on disk is unchanged; the DSpark stage's resident bank and every other pack keep the pack order.
   A kernel keyed on a tile-major bank carries a `_tm` name. The non-funnel decode arms and a bank made by `Ragged.init`
   stay in pack order; `moeDecodeClamped` refuses a tile-major bank when the funnel is off (`Exl3TileMajorNeedsFunnel`).
 - Timing: `sushi-ubench run shared.exl3_rate_groups` (decode rows 1 and 4, prefill chunks, against uniform n32 and the
@@ -416,24 +415,24 @@ or from 1024 rows the decoded path below.
   Meter: [qwen4-perf](qwen4-perf.md#verify-rows9).
 - A row's bytes are the same at widths 2 to 8 (NAX); the one-row SIMD kernel and the GEMM differ from them in sum order
   only. All three hold the f32-truth bar 1.5e-3 past the output dtype's own rounding of the truth, added in quadrature
-  (worst kernel error measured 4.1e-4: spec1 n64/n96, pair1 n32, mcg, G 1/2/8, rows 1 to 70, f16/bf16/f32).
+  (worst kernel error measured 4.1e-4: spec1 n64/n96, pair1 n32, mcg, G 1/2/8, rows 1 to 70, f16/bf16/f32; the test
+  now holds each codebook and dtype on its served arm).
 - Both arms store bf16 and f32 rows as such: an f16 store capped an output at 65504 and cost a cast dispatch per
   linear. Two f16 stores remain: the prepared input (`H128(suh * x) / sqrt(128)`; real trunk suh is 0.005 to 0.4) and,
   on the GEMM arm only (prefill), the inner products before the output H128 + svh (shared with the expert prefill
   kernels; real trunk svh is 0.1 to 5, so an output saturates there only past about 6500 to 3e5). The multi-row
   kernel sums in f32 to the end. No real-magnitude capture of the trunk activations exists yet.
 - The SIMD arm (no NAX) decodes each k-tile into registers once and loops the rows over it in groups of at most four
-  (a longer row loop compiles 2-3x slower); from two rows a threadgroup spans two output tile pairs. Its bytes are the
-  pre-split kernel's at every width, and a row equals the one-row launch bit for bit; the tests keep the old loop as
-  their oracle. Timings: [perf-baselines](perf-baselines.md#simd-rows).
+  (a longer row loop compiles 2-3x slower); from two rows a threadgroup spans two output tile pairs. Its bytes were the
+  pre-split kernel's at every width when proven, and a row equals the one-row launch bit for bit. Timings: [perf-baselines](perf-baselines.md#simd-rows).
 - DeepSeek shapes at 2 to 8 rows (a launch-geometry sweep, chained, on a loaded box so +-50% noise): the NAX policy is within noise of the best geometry at every shape and width; the SIMD kernel wins only some
   two-row cells, by less than the noise. The policy stands.
 
 <a id="nax-rows-walk"></a>
 - **The NAX rows walk reads two k-tiles' fragments ahead of their MMAs, on 32-bit funnels** (`RowsGeom.unr` 2 at kph 1,
   `r32` on every NAX launch; `rows_wfrag` takes `nax_win2`'s two 32-bit funnels where a quad's codewords fit them, n62 to
-  n102 but n64, else `nax_wfrag_k`). The MMAs run in the one-tile walk's order into the same accumulator, so every byte is the
-  old walk's (`the unrolled 32-bit walk writes the one-tile walk's bytes`, `the 32-bit funnel reader ... at every rate`).
+  n102 but n64, else `nax_wfrag_k`). The MMAs run in the one-tile walk's order into the same accumulator, so every byte was the
+  old walk's when proven; the multi-row truth tests now run the served geometries and readers at every rate.
   At n96 (`RowsGeom.sw`) a lane loads the four words its 112 bits span once (`wm`, `w0`..`w2`; only the first group wraps)
   and cuts its four windows from them with 64-bit funnels, where two `nax_win2` calls loaded six words: the windows ending
   at `end` and `end + 32` share one shift, those ending at `end - 16` and `end + 48` the next.
@@ -569,12 +568,13 @@ threadgroup that leads them reads and decodes each weight once and feeds every m
 (bucket 2, two output tiles per threadgroup): an expert picked by three rows is led twice. Buckets 4 and 8 halve the
 tiles per threadgroup and measured live (real pack, DSpark sweep, median verify ms, grouped / per-slot) 5 / 7 / 14%
 slower at 5 / 6 / 8 rows, level at 2 to 4, so they are built and byte-tested but not served.
-Tested bit-exact against the one-slot chain (`group_force = 0`) at 2 to 16 rows, random, all-rows-equal, disjoint and
-core-plus-private routes, PAIR1 and SPEC1, four rate groups with a mixed gate/up/down class, every bucket forced.
+Tested bit-exact against the one-slot chain (`group_force = 0`) at 2, 9 and 16 rows, random, all-rows-equal, disjoint
+and core-plus-private routes, PAIR1, four rate groups with a mixed gate/up/down class, on the served bucket.
 The saving is the weight
 decode and trellis read of the repeats, bounded by the unit measurement above (decode is about 1.6 us of a ~26 us pick).
 
-Every row has a kernel; nothing falls to a generic reader (`every admitted rate takes the fast arms` covers n26). The
+Every row has a kernel; nothing falls to a generic reader (`every K1.5 to K2 rate decodes exactly on every reader at the window ends, and the sorted GEMM
+takes the fast arms` covers n26). The
 indexer's `weights_proj` (32 x 5120) stays FP8 off the 128 grid.
 
 Parity at the pack's geometry: `dsv41 geometry` (5120/2304 PAIR1 n24/26/32/40 and the mixed class, rows 1, 5, 16, 33;
@@ -613,7 +613,7 @@ into `moeDecodeClamped`'s reduce.
   against the one-slot chain already pins), and `sushi_exl3_down_reduce_fused_shared_redo` (the plain reduce's source with
   the plane's row source switched by `redo[slot]`) sums the kept and new planes in the plain reduce's order. A queue that
   folds the stream (`...FusedExpand`) keeps the same planes; the settle returns the sum as before. Proof: `exl3 rate
-  groups: a settle recomputing only the picks that missed ...` (1, 2, 4 and 16 rows; one, two, three and every pick
+  groups: a settle recomputing only the picks that missed ...` (1 and 16 rows; one, two, three and every pick
   stale; mixed rate groups at 512/256 and the real 5120/2304; with and without the folded queue), `dsv41 stq: a settle that
   recomputes only the picks off the map ...` (through the stream hook, forced off the cache map). Ubench
   `dsv41.settle_redo` (layer 2 and 23 plans, `c8543034`, ReleaseFast, GPU lock, QUIET, `taskpolicy -a`, AC, fans max, die 49 C,
@@ -658,13 +658,13 @@ rides an input array (`fuse.sourceRuntime`), so a chunk of another width reuses 
 three GEMMs stay launches of their own, on the trunk's window table; riding the routed GEMM launches is not built: what
 the fold leaves of the shared stage is those GEMMs (2.2 to 2.6 ms of a 2048-row layer against the routed chain alone).
 - **Proof** (`exl3 rate groups: the shared expert riding the prefill launches ...`): bytes equal to `moePrefillClampedSharedSeparate`
-  (the forward's two-step sum: `moePrefillClamped`, `sharedPrefillSeparate`, f32 add) at 17, 33, 128 and 600 rows (512/256,
-  four groups with a mixed class, x scaled to engage and to stay under the clamp) and at 17, 128, 512 and 2048 rows on the
+  (the forward's two-step sum: `moePrefillClamped`, `sharedPrefillSeparate`, f32 add) at 17 and 600 rows (512/256,
+  four groups with a mixed class, x scaled to engage and to stay under the clamp) and at 17 and 2048 rows on the
   release geometry (5120/2304, 384 experts in five groups, SPEC1 n64 shared). A deliberately wrong arm (the SwiGLU rounding
   left out of one lane) fails both tests.
-- **Served path** (`dsv41 stq: a wide chunk's shared expert riding the routed prefill launches ...`, `DSV41_STQ_TINY`): the tiny STQ pack's two
-  wide chunks (20 rows, then the rest) run with `Model.shared_fold` off and on; the fold is taken on the second arm only
-  (`rate_groups.prefillFoldedCount`), and the logits and the captured state are byte-equal. The wrong-arm SwiGLU fails it.
+- **Served path** (proven at 0e709341, then the test went): the tiny STQ pack's two wide chunks (20 rows, then the rest)
+  ran with `Model.shared_fold` off and on; the fold was taken on the second arm only (`rate_groups.prefillFoldedCount`),
+  and the logits and the captured state were byte-equal; the wrong-arm SwiGLU failed it.
 - **Per layer** (`sushi-ubench run dsv41.shared_prefill`, 73aac2a9, ReleaseFast, GPU lock, QUIET, `taskpolicy -a`, AC, fans
   auto, die 49 C at start, median of 7 interleaved rounds of 16 steps, synthetic uniform top-6 routes, us; the L5 and L23
   2048-row rungs ran at 80+ C):

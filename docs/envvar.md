@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (63)
+## Diagnostics (64)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -36,6 +36,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `QWEN4_DUMP_QSA_BLOCKS` | `qwen4_qsa.zig:627` | `<path>` dumps the selected QSA block indices | once | no |
 | `QWEN4_FIXTURE_ROWS` | `qwen4_fixture_test.zig` | prints per-row cos/margin in the Qwen4 fixture test | test | no |
 | `SUSHI_TEST_NO_GPU` | `mlx.zig` (`testNoGpuEnv`) | a test build sees no Metal backend, so `requireGpu` tests skip | test | yes: testsuite |
+| `SUSHI_TEST_TIMES` | `scripts/test_runner.zig` (`main`) | `<abs path>`: every test appends `<ms>\t<test name>` there, its at-rest check included; prints nothing; a relative path panics | test | yes: testsuite |
 | `QWEN4_GDN_CHECK` | `qwen4_gdn.zig:2703, 2849` | runs the composed GDN prework beside the fused kernel and compares | once | no |
 | `QWEN4_NO_POOLED` | `qwen4_qsa.zig:1242` | forces `QsaPooledRequired` to exercise the pooled-key fallback | once | no |
 | `QWEN4_OPCOUNT` | `qwen4_forward.zig:2940` | FFI op counts per block of the Qwen4 forward | once | no |
@@ -115,11 +116,11 @@ Inputs and hooks that real-pack tests and scripts use.
 | `DFLASH_FIXTURES`, `DFLASH_ASSISTANT_DIR`, `DFLASH2_FIXTURES`, `DFLASH2_ASSISTANT_DIR` | `dflash.zig` | DFlash oracle fixtures and sidecar dirs (set by the `tests/dump_dflash*_fixtures.py` dumpers) | test | no |
 | `MIMO_V2_MODEL`, `MIMO_V2_SOURCE`, `MIMO_V2_FIXTURE`, `MIMO_V2_MTP_FIXTURE`, `MIMO_VISION_ORACLE`, `MIMO_STREAM_FIXTURE`, `MIMO_SLICED_REAL_FIXTURE`, `MIMO_SLICED_OUTPUT`, `MIMO_DIFFERENTIAL_FIXTURE`, `MIMO_DIFFERENTIAL_LAYER`, `MIMO_DIFFERENTIAL_PACK`, `MIMO_PACK_REFERENCE` | `mimo_fixture_test.zig`, `mimo_config.zig`, `mimo_generate_test.zig`, `mimo_mtp.zig`, `mimo_vision.zig` | MiMo pack, source checkpoint and oracle-fixture inputs for real-pack tests | test | yes: tests/CLAUDE, mimo2-arch |
 | `SUSHI_CONTRACT_FIXTURE` | `cooler_contract_test.zig` (`selection`) | unset: every contract fixture, and a cell skips before any load when one is unset; a comma-separated list of fixture envs (`QWEN4_STQ_TINY,DSV41_STQ_TINY`): only those, and a cell that ran on them passes | test | yes: testsuite |
-| `MTP_TEST_MODEL`, `MTP_LMHEAD_TEST_FILE`, `SINGLE_MTP_TEST_CONTEXT` | `verify_moe.zig`, `qwen4_fixture_test.zig`, `qwen4_forward.zig`, `qwen4_generate_test.zig` | MTP real-pack tests (pack, lm_head blob, context length) | test | yes: tests/CLAUDE |
+| `MTP_TEST_MODEL`, `MTP_LMHEAD_TEST_FILE` | `verify_moe.zig`, `qwen4_fixture_test.zig`, `qwen4_forward.zig`, `qwen4_generate_test.zig` | MTP real-pack tests (pack, lm_head blob, context length) | test | yes: tests/CLAUDE |
 | `QWEN4_FIXTURE`, `QWEN4_FIXTURE_BF16`, `QWEN4_FIXTURE_VISION`, `QWEN4_ROWS_OLD`, `QWEN4_TEST_HF_MODEL`, `QWEN4_TEST_PREFIX_TOKENS`, `QWEN4_VERIFY_BENCH`, `QWEN4_YARN_FIXTURES`, `QWEN4_BF16_STREAM_MODEL` | `qwen4_fixture_test.zig`, `mrope.zig`, `expert_io.zig` | oracle fixtures, HF source dir and probe switches for the Qwen4 oracle tests | test | yes: tests/CLAUDE |
 | `QWEN4_TEST_MODEL` | `qwen4_fixture_test.zig:474, 618, 641, +24`, `qwen4_generate_test.zig:387, 531, 640` | `<pack dir>` for the real-pack Qwen4 tests; they skip without it | test | yes: mlx-serve-sync, server-lifecycle, tests/CLAUDE |
 | `QWEN_VISION_TEST_MODEL`, `QWEN_VISION_FIXTURE`, `QWEN_PREPROCESS_FIXTURE`, `QV_GH`, `QV_GW`, `QWEN_MID_SYSTEM_MODEL_DIR` | `qwen_vision.zig`, `chat.zig` | Qwen vision/preprocess oracle inputs and a chat-template pack | test | yes: server-tool-calling, tests/CLAUDE |
-| `SUSHI_DSV41_REAL_PACK`, `SUSHI_DSV41_PROBE_AT`, `SUSHI_DSV41_PROBE_WIDTH`, `SUSHI_DSV41_PROBE_TEXT`, `SUSHI_DSV41_PROBE_VERBOSE` | `dsv41_generate_test.zig` | the real-pack width probe (skips without `SUSHI_DSV41_REAL_PACK=<pack dir>`): at each context in `PROBE_AT` (comma list, default 17) of `PROBE_TEXT` (a text file with more tokens than the largest context + width + 1) a `PROBE_WIDTH`-row verify (default 4) must give every row the bits of its own one-row round, layer by layer; `PROBE_VERBOSE` prints each differing tensor. `SUSHI_DSV41_REAL_PACK` also runs the engine's real-pack proof (one-row steps and DSpark rounds on the engine give MLX's bytes) | test | yes: dsv41-arch, testsuite |
+| `SUSHI_DSV41_REAL_PACK`, `SUSHI_DSV41_PROBE_AT`, `SUSHI_DSV41_PROBE_WIDTH`, `SUSHI_DSV41_PROBE_TEXT`, `SUSHI_DSV41_PROBE_VERBOSE` | `dsv41_generate_test.zig` | the real-pack width probe (skips without `SUSHI_DSV41_REAL_PACK=<pack dir>`): at each context in `PROBE_AT` (comma list, default 17) of `PROBE_TEXT` (a text file with more tokens than the largest context + width + 1) a `PROBE_WIDTH`-row verify (default 4) must give every row the bits of its own one-row round, layer by layer; `PROBE_VERBOSE` prints each differing tensor | test | yes: dsv41-arch, testsuite |
 | `SUSHI_TEMPLATE_DIFF`, `SUSHI_TEMPLATE_DIFF_START` | `template.zig` | `<abs path>` of JSONL cases: the `template differential` test writes one result line per case to `<path>.out`, from case `START` on, for `tests/template_differential.py`; unset, it does nothing | test | yes: server-tool-calling, tests/CLAUDE |
 | `SUSHI_TEMPLATE_ORACLE_DUMP` | `template_oracle_test.zig` | `<abs path>`: the corpus test writes every engine call it captured there for `tests/dump_template_oracle.py render`, and compares nothing | test | yes: server-tool-calling |
 | `SUSHI_FORCE_BATCHED` | `scheduler.zig:1209` | `1` routes single-slot ticks through the batched kernel (`tests/test_batched_equivalence.sh`) | boot | yes: tests/CLAUDE |
@@ -158,6 +159,11 @@ Kept because the launch flag cannot express what the env does.
 ## Reads to fix
 
 - *Stale scripts*: benches that export `SUSHI_ROUND_COST_PERSIST=0` set the default (persistence is opt-in); `SUSHI_QSA_NAX_PRECISION` is script-side only.
+
+## Removed 2026-11-18
+
+- `SINGLE_MTP_TEST_CONTEXT`: the context length of the real-pack `single-stream verify optimizations` test, cut with it
+  (a verify path held to the forward it replaced).
 
 ## Removed 2026-11-16
 

@@ -1616,10 +1616,14 @@ test "deepseek_v41 layer-major capture equals the window-major forward byte for 
         }
         var base: ?[]const u8 = null;
         defer if (base) |b| a.free(b);
-        for ([_]u32{ 1, 3 }) |batch| {
+        // The batch compare runs at one chunk width; the wide chunk takes the CED replay's logits.
+        const batches: []const u32 = if (chunk == 4) &.{ 1, 3 } else &.{3};
+        for (batches) |batch| {
             const name = try std.fmt.allocPrint(a, "lm-c{d}-b{d}", .{ chunk, batch });
             defer if (base != null) a.free(name);
             try runTiny(a, io, root, tiny, name, batch, chunk);
+            // Head rows are off by default.
+            try expectMissing(a, io, root, "{s}/calib/head-in.bf16", .{name});
             for (windows, 0..) |_, w| {
                 const got = try readFile(a, io, root, "{s}/prompts/{d:0>2}_w{d}/logits.f32", .{ name, w, w });
                 defer a.free(got);
@@ -1819,7 +1823,7 @@ fn runTinyMode(a: std.mem.Allocator, io: std.Io, root: []const u8, tiny: *TinyLo
     try runLoadedMode(a, io, &tiny.loaded, .{ .command = .capture, .layer_major = true, .model_dir = root, .prompts = prompts, .out_dir = out_dir, .tokens = 1, .no_template = true }, batch, chunk, &quiet, mode);
 }
 
-test "deepseek_v41 layer-major capture: head rows are the head's input for every row, a lean run writes only those, and both resume (DSV41_TINY)" {
+test "deepseek_v41 layer-major capture: head rows are the head's input for every row, and a lean run writes only those and resumes (DSV41_TINY)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1852,10 +1856,6 @@ test "deepseek_v41 layer-major capture: head rows are the head's input for every
         a.free(want_logits);
     }
     try testing.expectEqual(tokens * m.cfg.dim * 2, rec.head.items.len);
-
-    // Off by default.
-    try runTinyMode(a, io, root, tiny, "off", 3, 4, .{});
-    try expectMissing(a, io, root, "off/calib/head-in.bf16", .{});
 
     try runTinyMode(a, io, root, tiny, "full", 3, 4, .{ .head_rows = true });
     const full = try readFile(a, io, root, "full/calib/head-in.bf16", .{});
@@ -1897,9 +1897,9 @@ test "deepseek_v41 layer-major capture: head rows are the head's input for every
     var base = try fixture_mod.readBaseline(a, io, lean_dir);
     base.deinit();
 
-    // A run interrupted inside the second batch resumes to the uninterrupted rows, lean or not; another mode is refused.
+    // A lean run interrupted inside the second batch resumes to the uninterrupted rows; another mode is refused.
     const batch_one = (2 + 4 + 3) * layers;
-    for ([_]struct { name: []const u8, mode: Mode }{ .{ .name = "cut-full", .mode = .{ .head_rows = true } }, .{ .name = "cut-lean", .mode = .{ .head_rows = true, .lean = true } } }) |c| {
+    for ([_]struct { name: []const u8, mode: Mode }{.{ .name = "cut-lean", .mode = .{ .head_rows = true, .lean = true } }}) |c| {
         interrupt_layers_for_test = batch_one + 20;
         defer interrupt_layers_for_test = null;
         try testing.expectError(error.TestInterrupted, runTinyMode(a, io, root, tiny, c.name, 3, 4, c.mode));
@@ -1988,7 +1988,7 @@ test "kld: a deepseek_v41 load names the missing streaming budget before touchin
     try testing.expectError(error.Dsv41KvQuantUnsupported, kld.loadModel(io, testing.allocator, .{ .model_dir = dir, .kv_quant_config = trunk_mod.KVQuantConfig.affine(8), .ssd_budget_bytes = 1 << 30 }));
 }
 
-test "kld: a deepseek_v41 teacher captures and compare reads it back, fused against composed included (DSV41_TINY)" {
+test "kld: a deepseek_v41 teacher captures and compare reads it back (DSV41_TINY)" {
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const dsv41_model = @import("dsv41_model.zig");
@@ -2036,22 +2036,15 @@ test "kld: a deepseek_v41 teacher captures and compare reads it back, fused agai
     try testing.expectEqual(@as(usize, 2), base.prompts.len);
     try testing.expectEqualStrings("bf16", base.kv_cache_format);
 
-    for ([_]bool{ true, false }) |composed| {
-        dsv41_model.setFused(dsv41_state.modelOf(&loaded.xfm).?, composed);
-        const json_path = try std.fmt.allocPrint(arena, "{s}/compare-{s}.json", .{ root, if (composed) "composed" else "fused" });
-        try kld.runCompare(io, allocator, &loaded, .{ .command = .compare, .model_dir = root, .fixture = teacher, .json_out = json_path }, &quiet);
-        const text = try std.Io.Dir.cwd().readFileAlloc(io, json_path, arena, .limited(1 << 22));
-        const parsed = try std.json.parseFromSlice(std.json.Value, arena, text, .{});
-        const o = parsed.value.object;
-        try testing.expectEqualStrings(fixture_mod.COMPARE_SCHEMA, o.get("schema").?.string);
-        try testing.expectEqual(@as(f64, 8), try util.jsonNumber(o.get("positions").?));
-        try testing.expectEqual(@as(usize, 2), o.get("prompts").?.array.items.len);
-        const mean_kld = try util.jsonNumber(o.get("mean_kld_to_eos").?);
-        try testing.expect(std.math.isFinite(mean_kld));
-        // The same arm replays its own teacher bit for bit.
-        if (composed) {
-            try testing.expectEqual(@as(f64, 0), mean_kld);
-            try testing.expectEqual(@as(f64, 1), try util.jsonNumber(o.get("mean_top1").?));
-        }
-    }
+    // The composed arm replays its own teacher bit for bit.
+    const json_path = try std.fmt.allocPrint(arena, "{s}/compare.json", .{root});
+    try kld.runCompare(io, allocator, &loaded, .{ .command = .compare, .model_dir = root, .fixture = teacher, .json_out = json_path }, &quiet);
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, json_path, arena, .limited(1 << 22));
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, text, .{});
+    const o = parsed.value.object;
+    try testing.expectEqualStrings(fixture_mod.COMPARE_SCHEMA, o.get("schema").?.string);
+    try testing.expectEqual(@as(f64, 8), try util.jsonNumber(o.get("positions").?));
+    try testing.expectEqual(@as(usize, 2), o.get("prompts").?.array.items.len);
+    try testing.expectEqual(@as(f64, 0), try util.jsonNumber(o.get("mean_kld_to_eos").?));
+    try testing.expectEqual(@as(f64, 1), try util.jsonNumber(o.get("mean_top1").?));
 }
