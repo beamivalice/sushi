@@ -419,16 +419,10 @@ test "readAnthropicMessages: a tool_result image is the tool message's placed me
 
 // ── Anthropic Messages API ──
 
+/// An error with Anthropic's type named; the connection (`http.sendError`) picks its envelope.
 pub fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32) !void {
-    const escaped_msg = try jsonEscape(allocator, message);
-    defer allocator.free(escaped_msg);
-    const body = try std.fmt.allocPrint(allocator,
-        \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
-    , .{ err_type, escaped_msg });
-    defer allocator.free(body);
-    var status_buf: [32]u8 = undefined;
-    const status = std.fmt.bufPrint(&status_buf, "{d} Error", .{status_code}) catch "500 Error";
-    try sendResponse(stream, status, "application/json", body);
+    var status_buf: [48]u8 = undefined;
+    try http.sendError(allocator, stream, http.statusLine(&status_buf, status_code), .{ .openai = err_type, .anthropic = err_type }, message, status_code, "");
 }
 
 /// The Anthropic surface's idle event: its ping, preceded by the queue comment while the request waits.
@@ -2185,6 +2179,8 @@ const CountTokensFixture = struct {
         defer _ = std.c.close(sv[1]);
         var conn: Conn = undefined;
         Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+        // As `handleConnection` sets it from the route.
+        if (handler == handleAnthropicCountTokens or handler == handleAnthropicMessages) conn.api = .anthropic;
         try handler(t.allocator, &conn, body, &f.lm);
         _ = std.c.close(sv[0]);
         var out = std.ArrayList(u8).empty;

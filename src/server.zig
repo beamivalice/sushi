@@ -1204,6 +1204,7 @@ pub fn handleConnection(
     const path = if (std.mem.indexOf(u8, raw_path, "?")) |qpos| raw_path[0..qpos] else raw_path;
     const request_body = if (total_read > header_end_pos) request[header_end_pos..total_read] else "";
     logHttpRequest(method, raw_path, request_body);
+    stream.api = if (anthropic.isAnthropicRoute(path)) .anthropic else .openai;
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic APIs AND the metrics feed) —
@@ -1438,12 +1439,7 @@ pub fn handleConnection(
         .entry => |id| requested_model_id = id,
         .default => requested_model_id = "",
         .not_found => {
-            const msg = "No model is registered at that path; POST /v1/load-model with the absolute path registers it";
-            if (anthropic.isAnthropicRoute(path)) {
-                try anthropic.sendAnthropicError(allocator, stream, "not_found_error", msg, 404);
-            } else {
-                try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", msg, 404);
-            }
+            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No model is registered at that path; POST /v1/load-model with the absolute path registers it", 404);
             return;
         },
     }
@@ -1464,11 +1460,7 @@ pub fn handleConnection(
         };
         if (target) |t| {
             if (textGenRejectReason(t)) |reason| {
-                if (anthropic.isAnthropicRoute(path)) {
-                    try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
-                } else {
-                    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
-                }
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
                 return;
             }
         }
@@ -1599,7 +1591,7 @@ pub fn handleConnection(
         try completions.handleCompletions(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages")) {
         if (text_gen_reject) |reason| {
-            try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
@@ -1607,7 +1599,7 @@ pub fn handleConnection(
         try anthropic.handleAnthropicMessages(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages/count_tokens")) {
         if (text_gen_reject) |reason| {
-            try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;

@@ -334,12 +334,12 @@ pub fn handleCompletions(
     if (is_stream) {
         handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, include_usage, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, kv_quant_override) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
-            sendGenerationError(allocator, stream, err, .openai) catch {};
+            sendGenerationError(allocator, stream, err, .completions) catch {};
         };
     } else {
         handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, kv_quant_override) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
-            sendGenerationError(allocator, stream, err, .openai) catch {};
+            sendGenerationError(allocator, stream, err, .completions) catch {};
         };
     }
 }

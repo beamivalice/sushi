@@ -265,6 +265,10 @@ before reading a completed stream and requires clean EOF.
 - **Routing**: a known path asked with a method it does not answer is a 405 with `Allow` (`http_conn.allowedMethods`,
   one gate ahead of every route); HEAD is the GET without its body (`Conn.head_only`); `GET /v1/models/{id}` retrieves a
   row; the auth scheme word is any case, and `/v1/messages` refuses a key in Anthropic's `{"type":"error",...}` envelope.
+- **An error's envelope is the connection's, never the call site's**: `handleConnection` sets `Conn.api` once from the
+  route (`isAnthropicRoute`) and `http.sendError` shapes every error by it (a load refusal, a 404, 405 or 400 on
+  `/v1/messages` is Anthropic's, typed by status, with the status' standard reason phrase). A stream's error event
+  keeps its surface's chunk shape (`ErrorSurface`: chat's `delta`, completions' `text`).
 - **A field the server reads is used or refused by name, never read as absent** (`request_parse.generationFieldFault`,
   one check for chat, completions, Messages and Responses; `chatFieldFault` adds roles, `response_format.type`, `tools`
   and `tool_choice`): `max_tokens`/`max_completion_tokens` (the latter supersedes) and `seed` take an integer or a whole

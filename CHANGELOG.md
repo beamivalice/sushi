@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Every error on `/v1/messages` now comes in Anthropic's shape**: a refused model load, an unknown model, a wrong
+  method and a too-deeply nested body answered there in OpenAI's `{"error":...}` shape, and Anthropic errors said
+  "400 Error" in their status line; they now carry Anthropic's `{"type":"error",...}` and the standard status text. A
+  `/v1/completions` stream that fails mid-reply now ends with a completions chunk (`"text"`) instead of a chat one.
 - **A Responses WebSocket turn refused before it runs now ends**: a turn refused for memory, context length, a bad
   field, an image or an effort word sent one `{"error":...}` frame and then nothing, so a client waiting for the turn's
   end hung; it now ends in the `{"type":"error"}` frame every other failed turn ends in, and the socket serves the next.

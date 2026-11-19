@@ -82,13 +82,9 @@ pub fn sendResponseWithHeaders(stream: *http_conn.Conn, status: []const u8, cont
 pub fn sendMethodNotAllowed(allocator: std.mem.Allocator, stream: *http_conn.Conn, path: []const u8, allow: []const u8) !void {
     const message = try std.fmt.allocPrint(allocator, "{s} answers {s} only", .{ path, allow });
     defer allocator.free(message);
-    const escaped = try jsonEscape(allocator, message);
-    defer allocator.free(escaped);
-    const body = try std.fmt.allocPrint(allocator, "{{\"error\":{{\"message\":{s},\"type\":\"invalid_request_error\",\"param\":null,\"code\":405}}}}", .{escaped});
-    defer allocator.free(body);
     var allow_line: [96]u8 = undefined;
     const header = std.fmt.bufPrint(&allow_line, "Allow: {s}\r\n", .{allow}) catch "";
-    try sendResponseWithHeaders(stream, "405 Method Not Allowed", "application/json", body, header);
+    try sendErrorResponseWithHeaders(allocator, stream, "405 Method Not Allowed", "invalid_request_error", message, 405, header);
 }
 
 /// The body-less answer to a HEAD request: the head a GET would send, its Content-Length included.
@@ -341,9 +337,17 @@ pub fn sendErrorResponse(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
 
 /// `sendErrorResponse` whose head also carries `extra_headers` (complete `Name: value\r\n` lines).
 pub fn sendErrorResponseWithHeaders(allocator: std.mem.Allocator, stream: *http_conn.Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32, extra_headers: []const u8) !void {
-    // On a Responses WebSocket every refusal ends its turn, whichever check sent it.
+    return sendError(allocator, stream, status, .{ .openai = err_type, .anthropic = anthropicErrorType(statusCode(status)) }, message, code, extra_headers);
+}
+
+/// An error's type in each API: OpenAI's names the case, Anthropic's the status class.
+pub const ErrorTypes = struct { openai: []const u8, anthropic: []const u8 };
+
+/// THE error sender: the connection picks the envelope, never the caller. On a Responses WebSocket an error is the
+/// turn's terminal frame; otherwise the request's API (`Conn.api`) shapes the body.
+pub fn sendError(allocator: std.mem.Allocator, stream: *http_conn.Conn, status: []const u8, types: ErrorTypes, message: []const u8, code: ?u32, extra_headers: []const u8) !void {
     if (stream.ws_mode) |bridge| {
-        const frame = try wsErrorFrame(allocator, statusCode(status), err_type, message);
+        const frame = try wsErrorFrame(allocator, statusCode(status), types.openai, message);
         defer allocator.free(frame);
         logHttpResponse(status, "application/json", frame);
         return bridge.sendText(frame);
@@ -357,9 +361,14 @@ pub fn sendErrorResponseWithHeaders(allocator: std.mem.Allocator, stream: *http_
     else
         "null";
 
-    const body = try std.fmt.allocPrint(allocator,
-        \\{{"error":{{"message":{s},"type":"{s}","param":null,"code":{s}}}}}
-    , .{ escaped_msg, err_type, code_str });
+    const body = switch (stream.api) {
+        .openai => try std.fmt.allocPrint(allocator,
+            \\{{"error":{{"message":{s},"type":"{s}","param":null,"code":{s}}}}}
+        , .{ escaped_msg, types.openai, code_str }),
+        .anthropic => try std.fmt.allocPrint(allocator,
+            \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
+        , .{ types.anthropic, escaped_msg }),
+    };
     defer allocator.free(body);
     if (extra_headers.len == 0) return sendResponse(stream, status, "application/json", body);
     try sendResponseWithHeaders(stream, status, "application/json", body, extra_headers);
@@ -374,6 +383,24 @@ pub fn wsErrorFrame(allocator: std.mem.Allocator, status: u32, code: []const u8,
     return std.fmt.allocPrint(allocator,
         \\{{"type":"error","status":{d},"error":{{"code":{s},"message":{s}}}}}
     , .{ status, esc_code, esc_msg });
+}
+
+/// Anthropic's error type for a status: its API types the status class.
+fn anthropicErrorType(status: u32) []const u8 {
+    return switch (status) {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        else => if (status >= 500) "api_error" else "invalid_request_error",
+    };
+}
+
+/// `NNN Reason` for a status number, in `buf`.
+pub fn statusLine(buf: []u8, status: u32) []const u8 {
+    const reason = if (status <= std.math.maxInt(u10)) (@as(std.http.Status, @enumFromInt(status)).phrase() orelse "Error") else "Error";
+    return std.fmt.bufPrint(buf, "{d} {s}", .{ status, reason }) catch "500 Internal Server Error";
 }
 
 /// The number of a status line (`NNN Reason`); one without a number is the server's own error.

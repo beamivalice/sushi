@@ -534,3 +534,77 @@ test "server: a Responses WebSocket turn refused before it runs ends in the erro
         }
     }.run);
 }
+
+/// The body of an HTTP answer.
+fn bodyOf(resp: []const u8) []const u8 {
+    const at = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return "";
+    return resp[at + 4 ..];
+}
+
+test "server: an error on an Anthropic route takes Anthropic's envelope and status line, whichever check sent it" {
+    try eachArch(4, .{}, struct {
+        /// `status` is the head's status line, or its start.
+        const Case = struct { name: []const u8, method: []const u8 = "POST", path: []const u8, body: []const u8, status: []const u8, anthropic: bool = true };
+        const messages = "{\"model\":\"tiny\",\"max_tokens\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+        const nested = blk: {
+            var s: []const u8 = "";
+            for (0..300) |_| s = s ++ "[";
+            break :blk s;
+        };
+        fn check(c: Case) !void {
+            const resp = try request(c.method, c.path, c.body);
+            defer gpa.free(resp);
+            var want: [64]u8 = undefined;
+            const head = try std.fmt.bufPrint(&want, "HTTP/1.1 {s}", .{c.status});
+            const shape = if (c.anthropic) "{\"type\":\"error\",\"error\":{\"type\":\"" else "{\"error\":{\"message\":";
+            if (!std.mem.startsWith(u8, resp, head) or !std.mem.startsWith(u8, bodyOf(resp), shape)) {
+                std.debug.print("{s}: {s}\n", .{ c.name, resp[0..@min(resp.len, 500)] });
+                return error.WrongEnvelope;
+            }
+        }
+        fn run() !void {
+            // Refused loads, by whichever check refuses first: the model cannot fit under a declared wired limit's floor.
+            setWiredFloor(64 << 20);
+            const refused = [_]Case{
+                .{ .name = "load refused, messages", .path = "/v1/messages", .body = messages, .status = "5" },
+                .{ .name = "load refused, count_tokens", .path = "/v1/messages/count_tokens", .body = messages, .status = "5" },
+                .{ .name = "load refused, chat", .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", .status = "5", .anthropic = false },
+            };
+            for (refused) |c| try check(c);
+            setWiredFloor(null);
+            const served = [_]Case{
+                .{ .name = "method", .method = "GET", .path = "/v1/messages", .body = "", .status = "405 Method Not Allowed" },
+                .{ .name = "nesting", .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"x\":" ++ nested ++ "}", .status = "400 Bad Request" },
+                .{ .name = "no messages", .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"max_tokens\":4}", .status = "400 Bad Request" },
+            };
+            for (served) |c| try check(c);
+        }
+    }.run);
+}
+
+test "server: a completions stream that fails mid-reply ends in a completions chunk, not a chat delta" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            defer mlx.engine.fault.disarm();
+            var b: [512]u8 = undefined;
+            gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "hi", 2, false)));
+            const fd = try connect();
+            defer _ = std.c.close(fd);
+            try send(fd, "POST", "/v1/completions", try completionBody(&b, "a long tale of the sea", 64, true));
+            const head = try readUntil(fd, "\"choices\"");
+            defer gpa.free(head);
+            mlx.engine.fault.arm(1);
+            const rest = try readUntil(fd, null);
+            defer gpa.free(rest);
+            const at = std.mem.lastIndexOf(u8, rest, "\"finish_reason\":\"error\"") orelse {
+                std.debug.print("no error chunk: {s}\n", .{rest[rest.len -| 400..]});
+                return error.NoErrorChunk;
+            };
+            const line = rest[(std.mem.lastIndexOf(u8, rest[0..at], "data: ") orelse 0)..at];
+            if (std.mem.indexOf(u8, line, "\"delta\"") != null or std.mem.indexOf(u8, line, "\"text\":\"\"") == null) {
+                std.debug.print("error chunk: {s}\n", .{line});
+                return error.NotACompletionsChunk;
+            }
+        }
+    }.run);
+}

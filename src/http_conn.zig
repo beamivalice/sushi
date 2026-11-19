@@ -86,6 +86,9 @@ pub fn startListener(host: []const u8, port: u16) (error{InvalidHost} || std.Io.
     return .{ .socket = .{ .handle = fd, .address = addr }, .options = {} };
 }
 
+/// The error envelope a request's API takes: OpenAI's `{"error":{...}}` or Anthropic's `{"type":"error",...}`.
+pub const Api = enum { openai, anthropic };
+
 /// Bridge that lets a Conn route OpenAI-Responses output through a WebSocket
 /// transport instead of HTTP/SSE. When `Conn.ws_mode` is set, `sendResponse`
 /// and `sendAnthropicEvent` send the JSON payload as a single WS text frame
@@ -244,6 +247,8 @@ pub const Conn = struct {
     /// would otherwise be HTTP/SSE is reshaped into WS text frames at the
     /// `sendResponse` / `sendAnthropicEvent` chokepoints.
     ws_mode: ?*WsBridge = null,
+    /// The API this request speaks, from its route: `http.sendErrorResponse` shapes every error by it.
+    api: Api = .openai,
     /// True once this connection has written a `text/event-stream` head: past it a generation
     /// failure can only be an SSE `error` event. Set only in `sendSseHeaders`.
     sse_headers_sent: bool = false,
@@ -265,6 +270,7 @@ pub const Conn = struct {
         c.write_state = SocketWriter.init(stream.socket.handle, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
+        c.api = .openai;
         c.sse_headers_sent = false;
         c.head_only = false;
         c.length_framed = false;

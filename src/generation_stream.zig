@@ -66,7 +66,6 @@ const not_enough_memory_message = http.not_enough_memory_message;
 const parseToolCallsForRequest = reply_mod.parseToolCallsForRequest;
 const promptOpensThink = server_mod.promptOpensThink;
 const reasoningWithinBudget = server_mod.reasoningWithinBudget;
-const sendAnthropicError = anthropic.sendAnthropicError;
 const sendAnthropicEvent = anthropic.sendAnthropicEvent;
 const sendErrorResponse = http.sendErrorResponse;
 const sendErrorResponseWithHeaders = http.sendErrorResponseWithHeaders;
@@ -249,19 +248,21 @@ pub fn mapGenerationError(allocator: std.mem.Allocator, err: anyerror) !GenError
     return wire;
 }
 
-/// The terminal SSE frame for the OpenAI dialects, with a `finish_reason: "error"` choice so a
-/// chunk-only client terminates.
-fn buildOpenAiStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
+/// The terminal SSE frame for the OpenAI dialects, with a `finish_reason: "error"` choice in the surface's own chunk
+/// shape (chat's `delta`, completions' `text`) so a chunk-only client terminates.
+fn buildOpenAiStreamError(allocator: std.mem.Allocator, w: GenErrorWire, text_chunk: bool) ![]u8 {
     const esc = try jsonEscape(allocator, w.message);
     defer allocator.free(esc);
+    const choice = if (text_chunk) "\"text\":\"\",\"logprobs\":null" else "\"delta\":{}";
     return std.fmt.allocPrint(allocator,
-        \\data: {{"error":{{"message":{s},"type":"{s}","param":null,"code":{d}}},"choices":[{{"index":0,"delta":{{}},"finish_reason":"error"}}]}}
-    ++ "\n\n", .{ esc, w.openai_type, w.code });
+        \\data: {{"error":{{"message":{s},"type":"{s}","param":null,"code":{d}}},"choices":[{{"index":0,{s},"finish_reason":"error"}}]}}
+    ++ "\n\n", .{ esc, w.openai_type, w.code, choice });
 }
 
-/// Which wire dialect a generative surface speaks its errors in.
+/// Which stream a generative surface ends with its error event.
 pub const ErrorSurface = union(enum) {
     openai,
+    completions,
     anthropic,
     responses: *u64,
 };
@@ -273,16 +274,11 @@ pub fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: any
     const w = try mapGenerationError(allocator, err);
     defer w.deinit(allocator);
 
-    if (!stream.sse_headers_sent) {
-        return switch (surface) {
-            .anthropic => sendAnthropicError(allocator, stream, w.anthropic_type, w.message, w.code),
-            else => sendErrorResponse(allocator, stream, w.status_line, w.openai_type, w.message, w.code),
-        };
-    }
+    if (!stream.sse_headers_sent) return http.sendError(allocator, stream, w.status_line, .{ .openai = w.openai_type, .anthropic = w.anthropic_type }, w.message, w.code, "");
 
     switch (surface) {
-        .openai => {
-            const body = try buildOpenAiStreamError(allocator, w);
+        .openai, .completions => {
+            const body = try buildOpenAiStreamError(allocator, w, surface == .completions);
             defer allocator.free(body);
             try stream.writeAllNoFlush(body);
             try stream.writeAll("data: [DONE]\n\n");
@@ -2639,7 +2635,7 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         const quoted = try http.jsonEscape(a, GEN_OOM_MSG);
         defer a.free(quoted);
         const escaped = quoted[1 .. quoted.len - 1];
-        const body = try buildOpenAiStreamError(a, w);
+        const body = try buildOpenAiStreamError(a, w, false);
         defer a.free(body);
         try t.expect(std.mem.indexOf(u8, body, "\"type\":\"server_error\"") != null);
         try t.expect(std.mem.indexOf(u8, body, "\"code\":503") != null);
