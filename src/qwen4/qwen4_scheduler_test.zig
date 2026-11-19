@@ -402,6 +402,7 @@ test "admission combines Qwen and MiMo reservations in either order" {
     var sch: Scheduler = undefined;
     sch.pending = .empty;
     sch.decoding = .empty;
+    sch.live_hold = .{};
     defer sch.pending.deinit(testing.allocator);
     try sch.pending.appendSlice(testing.allocator, &.{ &a, &b });
     try testing.expectEqual(@as(usize, 1), memoryAdmitCount(&sch, &.{ 0, 1 }));

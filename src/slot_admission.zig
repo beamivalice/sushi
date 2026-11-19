@@ -265,8 +265,9 @@ pub fn queueStartLine(buf: []u8, slot: *const Slot, waited_ns: u64) ?[]const u8 
 }
 
 /// `commit` is the part of `needed` the request allocates after admission (cache growth the bill
-/// prices up front); until it is resident, later admissions must leave it free.
-pub const MemoryBill = struct { needed: u64, available: u64, commit: u64 = 0 };
+/// prices up front); until it is resident, later admissions must leave it free. `held` is `needed`
+/// less the bill's safety margin: what the request holds at its peak.
+pub const MemoryBill = struct { needed: u64, available: u64, commit: u64 = 0, held: u64 = 0 };
 
 /// How many of one tick's admits (queue order) go on to prefill. Each connection-thread bill
 /// ran before any sibling allocated, so an ungated arch is re-billed here: an admit that does
@@ -297,10 +298,45 @@ fn slotOutstandingGrowth(s: *const Slot) u64 {
     return outstandingGrowth(s.growth_commit, resident);
 }
 
+/// The requests admitted and not yet freed, and the bytes their bills priced them to hold
+/// (`Slot.admitted_held`): what comes back once every one of them has finished.
+pub const LiveHold = struct { requests: u32 = 0, bytes: u64 = 0 };
+
+/// Connection thread: `Scheduler.live_hold`, under `queue_mu`.
+pub fn liveHold(sch: *Scheduler) LiveHold {
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    return sch.live_hold;
+}
+
+/// `queue_mu` held: `slot` is admitted, and holds what its bill priced until `releaseHoldLocked` after its free.
+pub fn countHoldLocked(sch: *Scheduler, slot: *Slot) void {
+    slot.hold_counted = true;
+    sch.live_hold.requests += 1;
+    sch.live_hold.bytes +|= slot.admitted_held;
+}
+
+/// What `slots` were counted holding; read before they are freed.
+pub fn heldBy(slots: []const *Slot) LiveHold {
+    var hold: LiveHold = .{};
+    for (slots) |s| if (s.hold_counted) {
+        hold.requests += 1;
+        hold.bytes +|= s.admitted_held;
+    };
+    return hold;
+}
+
+/// `queue_mu` held: `freed` (`heldBy`) has been freed.
+pub fn releaseHoldLocked(sch: *Scheduler, freed: LiveHold) void {
+    sch.live_hold.requests -|= freed.requests;
+    sch.live_hold.bytes -|= freed.bytes;
+}
+
 /// `admitsWithinMemory` over this tick's admits; called under `queue_mu`.
 pub fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
     const numbers_fn = scheduler_mod.prefill_admission_numbers orelse return admit_idx.len;
-    var live = false;
+    // A finished request whose slot is not freed yet still holds its memory: it is company too.
+    var live = sch.live_hold.requests > 0;
     var outstanding: u64 = 0;
     for (sch.decoding.items) |s| {
         if (!s.joinsTick()) continue;
@@ -317,7 +353,11 @@ pub fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
         bills[i] = numbers_fn(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, prefill_plan.visionPrefillUnchunked(s.vision_embeddings != null or s.deferred_media != null), s.enable_mtp);
     }
     const admitted = admitsWithinMemory(bills[0..n], live, outstanding);
-    for (admit_idx[0..admitted], bills[0..admitted]) |idx, bill| sch.pending.items[idx].growth_commit = if (bill) |b| b.commit else 0;
+    for (admit_idx[0..admitted], bills[0..admitted]) |idx, bill| {
+        const s = sch.pending.items[idx];
+        s.growth_commit = if (bill) |b| b.commit else 0;
+        s.admitted_held = if (bill) |b| b.held else 0;
+    }
     if (admitted < n) {
         const held = sch.pending.items[admit_idx[admitted]];
         if (!held.memory_hold_logged) {
@@ -517,11 +557,12 @@ test "admitsWithinMemory: a live request's outstanding growth is not free headro
     try testing.expectEqual(@as(usize, 1), admitsWithinMemory(&.{b}, false, 0));
 }
 
-test "a staggered admission waits for the growth an earlier request was admitted to allocate" {
+test "a staggered admission waits for the growth an earlier request was admitted to allocate, and for a finished one's slot to be freed" {
     const gb: u64 = 1 << 30;
     const Probe = struct {
+        var available: u64 = 10 * gb;
         fn numbers(_: *const ModelConfig, _: usize, _: u32, _: trunk.KVQuantConfig, _: bool, _: bool) MemoryBill {
-            return .{ .needed = 9 * gb, .available = 10 * gb, .commit = 6 * gb };
+            return .{ .needed = 9 * gb, .available = available, .commit = 6 * gb };
         }
     };
     const saved = scheduler_mod.prefill_admission_numbers;
@@ -549,6 +590,7 @@ test "a staggered admission waits for the growth an earlier request was admitted
     var sch: Scheduler = undefined;
     sch.pending = .empty;
     sch.decoding = .empty;
+    sch.live_hold = .{};
     defer sch.pending.deinit(testing.allocator);
     defer sch.decoding.deinit(testing.allocator);
 
@@ -563,8 +605,15 @@ test "a staggered admission waits for the growth an earlier request was admitted
     try testing.expectEqual(@as(usize, 0), memoryAdmitCount(&sch, &.{0}));
     try testing.expectEqual(@as(u64, 0), b.growth_commit);
 
-    // Once A finishes its commitment is gone and B proceeds.
+    // A finished A holds its memory until its slot is freed: B, short of it, waits instead of going on alone.
     a.finished = true;
+    Probe.available = 8 * gb;
+    defer Probe.available = 10 * gb;
+    sch.live_hold = .{ .requests = 1, .bytes = 9 * gb };
+    try testing.expectEqual(@as(usize, 0), memoryAdmitCount(&sch, &.{0}));
+    // Freed, its commitment is gone and B proceeds.
+    Probe.available = 10 * gb;
+    sch.live_hold = .{};
     try testing.expectEqual(@as(usize, 1), memoryAdmitCount(&sch, &.{0}));
 }
 

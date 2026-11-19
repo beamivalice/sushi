@@ -356,6 +356,11 @@ pub const Slot = struct {
     /// Bytes of cache growth admission priced for this request that it had not allocated yet;
     /// `slotOutstandingGrowth` is the part still unallocated.
     growth_commit: u64 = 0,
+    /// What the request's admission bill priced it to hold at its peak, margin excluded: memory that comes back
+    /// once it finishes (`slot_admission.liveHold`).
+    admitted_held: u64 = 0,
+    /// Counted in `Scheduler.live_hold` from its admission until its free.
+    hold_counted: bool = false,
     /// This tick decodes plain (batched) although the slot's MTP head is armed: the
     /// batched forward captures its hidden so the next solo tick can resume speculating.
     mtp_plain_tick: bool = false,
@@ -1196,6 +1201,8 @@ pub const Scheduler = struct {
     /// Slots out of `pending` whose prefill pass is running: neither pending nor decoding, so
     /// a shutdown reaches them only here (queue_mu).
     prefilling: std.ArrayList(*Slot),
+    /// Every admitted slot until its memory is freed, whichever list it is in or between (queue_mu).
+    live_hold: slot_admission.LiveHold = .{},
     /// Metrics sink. Null while metrics are off. Populated from LoadParams, and adopted by the inference thread
     /// (its only writer) once `POST /metrics/enable` publishes one. Read once per REQUEST in `finishSlot`.
     metrics: ?*metrics_mod.Metrics,
@@ -1608,9 +1615,11 @@ pub const Scheduler = struct {
             // OOM on the cleanup list — fall back to inline deinit. This
             // races on mlx but is strictly better than the leak; the slot
             // is no longer referenced from pending/decoding above.
+            const freed = slot_admission.heldBy(&.{slot});
             self.queue_mu.unlock(self.io);
             slot.deinit();
             self.queue_mu.lockUncancelable(self.io);
+            slot_admission.releaseHoldLocked(self, freed);
         };
         if (self.in_flight > 0) self.in_flight -= 1;
         self.queue_cond.broadcast(self.io); // wake inference thread to drain
@@ -2630,7 +2639,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             defer sch.queue_mu.unlock(sch.io);
             recordDrained(sch.metrics, cleanup_batch[0..cleanup_n], sch.decoding.items);
         }
+        const freed = slot_admission.heldBy(cleanup_batch[0..cleanup_n]);
         deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
+        if (cleanup_n > 0) {
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            slot_admission.releaseHoldLocked(sch, freed);
+        }
         destroyAbandoned(abandoned);
         if (orphan_vision_n > 0) {
             // An orphaned encode has no model left to turn to: an array of MLX's is freed in a turn of MLX's, and one
@@ -3587,6 +3602,7 @@ fn admitForPrefillLocked(sch: *Scheduler, idx: usize) *Slot {
     const waited_ns: u64 = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
     if (slot_admission.queueStartLine(&start_line, slot, waited_ns)) |line| log.info("{s}\n", .{line});
     _ = slot.in_pass.fetchAdd(1, .acq_rel);
+    slot_admission.countHoldLocked(sch, slot);
     // `submit` reserved room for every in-flight slot.
     sch.prefilling.appendAssumeCapacity(slot);
     return slot;
@@ -5689,6 +5705,7 @@ pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Schedul
     sch.decoding = .empty;
     sch.cleanup_queue = .empty;
     sch.prefilling = .empty;
+    sch.live_hold = .{};
     sch.load_queue = .empty;
     sch.unload_queue = .empty;
     sch.abandoned = null;

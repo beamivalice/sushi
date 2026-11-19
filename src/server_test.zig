@@ -2561,3 +2561,103 @@ test "server: a logprobs of the wrong type is refused by name on chat and comple
         }
     }.run);
 }
+
+/// The tiny's config, as its ready registry entry holds it.
+fn tinyConfig() *const model_mod.ModelConfig {
+    const reg = server_state.global_registry.?;
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    return reg.entries.get("tiny").?.config.?;
+}
+
+/// One request decoding, with a token published and not ended.
+fn decodingOne() bool {
+    const seen = onlySlot("decoding") orelse return false;
+    return seen.tokens > 0 and !seen.ended;
+}
+
+/// No admitted request is left unfreed.
+fn noLiveHold() bool {
+    return @import("slot_admission.zig").liveHold(server_state.global_scheduler.?).requests == 0;
+}
+
+const running_body = "{\"model\":\"tiny\",\"prompt\":[11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26],\"max_tokens\":2000,\"temperature\":0,\"ignore_eos\":true,\"enable_mtp\":false}";
+const waiting_ids = [_]u32{ 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116 };
+const waiting_body = "{\"model\":\"tiny\",\"prompt\":[101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116],\"max_tokens\":8,\"temperature\":0,\"ignore_eos\":true,\"enable_mtp\":false}";
+
+test "server: a request that fits once the running one finishes waits for it and is answered, and one that never fits is refused at once" {
+    try eachArch(4, .{ .long_replies = true }, struct {
+        fn run() !void {
+            defer clearWiredFloor();
+            var running = Background{ .path = "/v1/completions", .body = running_body };
+            defer gpa.free(running.out);
+            const runner = try std.Thread.spawn(.{}, Background.run, .{&running});
+            var joined = false;
+            defer if (!joined) runner.join();
+            if (!within(60_000, decodingWithTokens)) return error.NeverDecoded;
+            const sch = server_state.global_scheduler.?;
+            const cfg = tinyConfig();
+            // What the running request holds and gives back when it ends.
+            const held = sch.resident_live_kv_bytes.load(.monotonic);
+            // The running request stands still between two tokens while the inference thread waits in the blocker's
+            // prefill, so what admission reads in use holds still too.
+            try PrefillHold.install();
+            defer PrefillHold.uninstall();
+            var blocked = Background{ .path = "/v1/chat/completions", .body = blocker_body };
+            defer gpa.free(blocked.out);
+            PrefillHold.arm();
+            const blocker = try std.Thread.spawn(.{}, Background.run, .{&blocked});
+            defer blocker.join();
+            defer PrefillHold.release();
+            try PrefillHold.waitHeld();
+            const probe: u64 = 16 << 30;
+            try setWiredFloor(probe);
+            var free_lo: u64 = std.math.maxInt(u64);
+            var free_hi: u64 = 0;
+            for (0..20) |_| {
+                const free = bills.admissionAvailableNow(cfg);
+                free_lo = @min(free_lo, free);
+                free_hi = @max(free_hi, free);
+                var none = [_]std.posix.pollfd{};
+                _ = std.posix.poll(&none, 5) catch {};
+            }
+            const in_use = probe - free_hi;
+            const drift = free_hi - free_lo;
+            const live = @import("slot_admission.zig").liveHold(sch);
+            const needed = bills.prefillAdmissionBill(cfg, waiting_ids.len, 8, null, false, &waiting_ids, .{}).needed;
+            // The waiting request's floor leaves it short by `margin` at the highest reading now, and over by
+            // `margin` at the lowest once the running requests are gone.
+            const margin = (held -| drift) / 2;
+            errdefer std.debug.print("in use {d} MB (drift {d} KB); the running request holds {d} MB; {d} running billed {d} MB; the waiting one needs {d} MB\n", .{ in_use >> 20, drift >> 10, held >> 20, live.requests, live.bytes >> 20, needed >> 20 });
+            if (live.requests != 2 or needed <= live.bytes + (64 << 20)) return error.NoRoomForTheRefusal;
+            if (margin < 8 << 20 or drift > 1 << 20) return error.WindowTooNarrow;
+
+            // Short by more than the running requests were billed to hold: refused at once, in today's words.
+            try setWiredFloor(in_use + needed - live.bytes - (64 << 20));
+            const refused = try request("POST", "/v1/completions", waiting_body);
+            defer gpa.free(refused);
+            if (!std.mem.startsWith(u8, refused, "HTTP/1.1 400") or std.mem.indexOf(u8, refused, " does not fit in GPU memory") == null) {
+                std.debug.print("never-fitting request answered: {s}\n", .{refused[0..@min(refused.len, 600)]});
+                return error.NotRefused;
+            }
+
+            // Short only of what the running request holds: it waits for it, then is served.
+            try setWiredFloor(in_use + needed - margin);
+            var waiting = Background{ .path = "/v1/completions", .body = waiting_body };
+            defer gpa.free(waiting.out);
+            const waiter = try std.Thread.spawn(.{}, Background.run, .{&waiting});
+            const queued = within(20_000, pendingOne) and decodingOne();
+            PrefillHold.release();
+            runner.join();
+            joined = true;
+            waiter.join();
+            if (!queued) return error.NeverQueuedBehindTheRunningRequest;
+            if (!std.mem.startsWith(u8, waiting.out, "HTTP/1.1 200") or std.mem.indexOf(u8, waiting.out, "\"completion_tokens\":8") == null) {
+                std.debug.print("waiting request answered: {s}\n", .{waiting.out[0..@min(waiting.out.len, 600)]});
+                return error.NotServedAfterTheRunningRequest;
+            }
+            // Every request freed: nothing stays credited as a running request's.
+            if (!within(10_000, noLiveHold)) return error.HoldOutlivesItsRequests;
+        }
+    }.run);
+}

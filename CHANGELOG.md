@@ -122,6 +122,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **A Settings save writes the file in one piece, applies it, and only then clears failed loads, for a key that changed and no launch flag pins**; a new safety margin logs its `[mem] ceiling` line again.
 - **The GPU memory card in Settings sets the safety margin sushi keeps under the GPU limit** for macOS and other apps
   (`--wired-margin-gib` still outranks it).
+- **Concurrent requests that fit one after another now wait instead of being refused**: a request that did not fit
+  beside the ones running was refused for memory even when it fits once they finish; it now waits in the queue, and
+  only a request that does not fit even alone is refused.
 - **A reply cancelled mid-stream no longer says it ran out of tokens**: a request stopped by `POST /v1/slots/cancel`
   (or the dashboard's Cancel) ended with `finish_reason: length` (Responses: incomplete, `max_output_tokens`) and zero
   usage on every surface; it now ends as cancelled, and its usage counts the tokens it returned.

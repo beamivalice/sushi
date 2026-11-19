@@ -1701,6 +1701,18 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
         var unloading = IdleUnloadFit{ .sch = sch, .model = model, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .unchunked_prefill = unchunked_prefill, .enable_mtp = enable_mtp };
         if (fitAfterUnloadingIdle(&unloading, IdleUnloadFit.fits, IdleUnloadFit.unloadOne)) return true;
     };
+    // Running requests give back what they hold when they finish. A prompt that fits then waits in the queue, which
+    // holds it beside them (`memoryAdmitCount`); alone, the prefill evicts or refuses it by name.
+    if (bill.needed > bill.available) if (server_state.global_scheduler) |sch| {
+        const live = slot_admission.liveHold(sch);
+        if (live.requests > 0 and bill.fitsOnceAlone(live.bytes)) {
+            const u = bills.Mem.unitOf(bill.needed, bill.available +| bill.evictionCredit() +| live.bytes);
+            log.info("[admission] prompt {d} tokens needs {f}, {f} available + {f} reclaimable hot cache + {f} the running requests hold — deferring until {d} running requests finish\n", .{
+                prompt_len, bills.Mem.need(bill.needed, u), bills.Mem.have(bill.available, u), bills.Mem.have(bill.evictionCredit(), u), bills.Mem.have(live.bytes, u), live.requests,
+            });
+            return true;
+        }
+    };
     if (bill.needed > bill.available) {
         const u = bills.Mem.unitOf(bill.needed, bill.available +| bill.evictable);
         log.warn("  prompt {d} tokens needs {f} (KV+working+margin) at prefill chunk {d}, {f} available + {f} reclaimable of {f} resident hot cache — rejecting\n", .{
@@ -4224,6 +4236,65 @@ test "a request whose max_tokens alone does not fit is refused on the connection
     // `memoryContextRefusalMessage`'s text, as the inference thread's refusal reads.
     try t.expect(std.mem.indexOf(u8, body, " does not fit in GPU memory: the request needs ") != null);
     try t.expect(std.mem.indexOf(u8, body, " fits (asked 1000000); maximum context: ") != null);
+}
+
+test "admission: a prompt that fits once the running requests finish waits in the queue, and one that would not fit even then is refused in today's words" {
+    const t = std.testing;
+    const a = t.allocator;
+    const saved_ctx = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = saved_ctx;
+    server_state.server_config.max_context_size = 1_048_576;
+    var cfg = fixtures.qwen4RequestTestConfig();
+    cfg.expert_layout = .exl3_k4;
+    cfg.cooler_for_test = true;
+    cfg.num_key_value_heads = 64;
+    var prompt: [64]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast(i + 10);
+
+    const reg = try ModelRegistry.init(a, t.io, null, 1, 0, null);
+    defer reg.deinit();
+    var sch = scheduler_mod.submitTestScheduler(a, 8);
+    sch.registry = reg;
+    sch.mtp = null;
+    sch.digest_mu = .init;
+    const prev_sch = server_state.global_scheduler;
+    defer server_state.global_scheduler = prev_sch;
+    server_state.global_scheduler = &sch;
+
+    // A reply about 8 GiB past what is free now; the running request holds 4 GiB more than that gap, then 4 GiB less.
+    const gib: u64 = 1 << 30;
+    const Need = struct {
+        cfg: *const model_mod.ModelConfig,
+        prompt: []const u32,
+        pub fn at(n: @This(), m: u32) u64 {
+            return prefillAdmissionBill(n.cfg, null, n.prompt.len, m, null, false, n.prompt, .{}).needed;
+        }
+    };
+    const free = prefillAdmissionBill(&cfg, null, prompt.len, 0, null, false, &prompt, .{}).available;
+    const asked = bills.fittingMaxTokensBy(1_000_000, free + 8 * gib, Need{ .cfg = &cfg, .prompt = &prompt }) + 1;
+    const bill = prefillAdmissionBill(&cfg, null, prompt.len, asked, null, false, &prompt, .{});
+    if (bill.needed < bill.available + 6 * gib) return error.ReplyNotPastFreeMemory;
+    const gap = bill.needed - bill.available;
+    const Case = struct { held: u64, admitted: bool };
+    for ([_]Case{ .{ .held = gap + 4 * gib, .admitted = true }, .{ .held = gap - 4 * gib, .admitted = false } }) |c| {
+        sch.live_hold = .{ .requests = 1, .bytes = c.held };
+        var sv: [2]std.posix.fd_t = undefined;
+        try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+        defer _ = std.c.close(sv[1]);
+        var conn: http_conn.Conn = undefined;
+        http_conn.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+        const admitted = try checkAttentionMemory(a, &conn, &prompt, asked, &cfg, null, false, null, false, false);
+        _ = std.c.close(sv[0]);
+        var buf: [8192]u8 = undefined;
+        const raw = readAllFromPair(sv[1], &buf);
+        errdefer std.debug.print("held {d} MB past a {d} MB gap: admitted {}, answered {s}\n", .{ c.held >> 20, gap >> 20, admitted, raw });
+        try t.expectEqual(c.admitted, admitted);
+        if (c.admitted) {
+            try t.expectEqual(@as(usize, 0), raw.len);
+        } else {
+            try t.expect(std.mem.indexOf(u8, raw, " does not fit in GPU memory: the request needs ") != null);
+        }
+    }
 }
 
 test "a kv_quant the arch refuses ends a Responses WebSocket turn in its error frame" {

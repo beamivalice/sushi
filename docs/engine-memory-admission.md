@@ -594,7 +594,13 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - **Concurrent arrivals are each billed against the SAME free memory** on their connection threads. The gated arch
   (qwen4_exp) re-bills live memory before each prefill in `runPrefill`; an ungated one (mimo_v2) is re-billed at the
   pending drain (`admitsWithinMemory`: live requests plus this tick's earlier admits). One that does not fit beside
-  company waits in `pending` (`[admission] held`); alone it proceeds.
+  company waits in `pending` (`[admission] held`); alone it proceeds. Company is every admitted request whose slot is
+  not freed yet (`Scheduler.live_hold`): a finished one awaiting its cleanup still holds its memory.
+- **The connection thread refuses only what does not fit once every running request is gone** (`fitsOnceAlone`: what
+  is free, what the hot cache gives back and what the running requests' bills priced them to hold, counted from
+  admission until the slot's free, whichever list it is in: `Scheduler.live_hold`). A
+  prompt short only of what they hold is logged `deferring until N running requests finish` and waits in `pending`;
+  alone, its prefill evicts or refuses it by name. Every surface and arch bills here (`checkAttentionMemory`).
 - **An admitted request keeps its unallocated cache growth promised across ticks** (`Slot.growth_commit`, the bill's
   `commit`, released as the slot's resident cache reaches it): a later admission subtracts every live slot's
   outstanding share from its headroom. Native GLM MLA grows row by row, so two short-prompt requests with large output

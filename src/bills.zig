@@ -2553,6 +2553,11 @@ pub const AdmissionBill = struct {
     pub fn fitsAfterEviction(self: AdmissionBill) bool {
         return self.needed <= self.available +| self.evictionCredit();
     }
+
+    /// Fits once the running requests are gone too: `live_held` is what their bills priced them to hold.
+    pub fn fitsOnceAlone(self: AdmissionBill, live_held: u64) bool {
+        return self.needed <= self.available +| self.evictionCredit() +| live_held;
+    }
 };
 
 /// Unloads idle resident models, least recently used first, until `fits` holds; false when
@@ -3193,7 +3198,7 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) slot_admission.MemoryBill {
     const bill = prefillAdmissionBill(config, null, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
-    return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits, bill.chunk, enable_mtp) };
+    return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits, bill.chunk, enable_mtp), .held = bill.needed -| billMargin(config) };
 }
 
 /// Bytes the bill prices for a request's cache that it allocates AFTER admission. A native GLM
