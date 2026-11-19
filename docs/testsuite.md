@@ -282,6 +282,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - No sleeps to wait for a thread. Use a hook or a counter. Any wait is bounded and under 100 ms.
 - A served test that waits on another request bounds what it claims (the request is not held: its model is claimed
   soon after the step it waited on), never a wall clock that holds a reload: every load runs its served warm.
+- A test client's read limit only guards against a hang: it budgets a cold first load (its kernel compiles too), and
+  a read past it fails by name, never as a short answer.
 - Deterministic: no dependence on scheduler timing, machine memory or test order. Global overrides restore in `defer`.
 - No dependence on where the test binary sits: `tests/gate.sh` builds it in a cache outside any checkout.
 - "No worse than the reference" states its margin in ulps, or compares bytes within one arm: a bare `<=` between two

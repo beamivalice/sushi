@@ -164,8 +164,9 @@ fn connect() !std.posix.fd_t {
     const small: c_int = 2048;
     _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&small), @sizeOf(c_int));
-    // A read that waits past this fails the test instead of hanging it.
-    const limit: std.posix.timeval = .{ .sec = 30, .usec = 0 };
+    // A read that waits past this fails the test instead of hanging it; it budgets a cold first load, whose kernel
+    // compiles alone can pass half a minute on a loaded box.
+    const limit: std.posix.timeval = .{ .sec = 120, .usec = 0 };
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit), @sizeOf(std.posix.timeval));
     server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return sv[1];
@@ -193,10 +194,28 @@ fn readUntil(fd: std.posix.fd_t, needle: ?[]const u8) ![]u8 {
     var buf: [16 * 1024]u8 = undefined;
     while (needle == null or std.mem.indexOf(u8, out.items, needle.?) == null) {
         const n = std.c.read(fd, &buf, buf.len);
-        if (n <= 0) break;
+        if (n == 0) break;
+        if (n < 0) return if (std.posix.errno(n) == .AGAIN) error.ReadTimedOut else error.ReadFailed;
         try out.appendSlice(gpa, buf[0..@intCast(n)]);
     }
     return out.toOwnedSlice(gpa);
+}
+
+test "server test client: a read past its limit fails by name, never as a short answer" {
+    gpa = testing.allocator;
+    var sv: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(sv[1]);
+    const limit: std.posix.timeval = .{ .sec = 0, .usec = 50_000 };
+    _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit), @sizeOf(std.posix.timeval));
+    try sendAll(sv[0], "HTTP/1.1 200 OK\r\n");
+    try testing.expectError(error.ReadTimedOut, readUntil(sv[1], "\r\n\r\n"));
+    // A peer that closes ends the read with what it sent.
+    try sendAll(sv[0], "{}");
+    _ = std.c.close(sv[0]);
+    const rest = try readUntil(sv[1], null);
+    defer gpa.free(rest);
+    try testing.expectEqualStrings("{}", rest);
 }
 
 fn request(method: []const u8, path: []const u8, body: []const u8) ![]u8 {
