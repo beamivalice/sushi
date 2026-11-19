@@ -480,3 +480,17 @@ pub fn usagePack(tmp: *testing.TmpDir, fixture: []const u8, layers: usize, exper
     try tmp.dir.writeFile(io, .{ .sub_path = @import("expert_usage.zig").file_name, .data = json.items });
     return tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
 }
+
+/// Empties MLX's pool, then leaves `count` (at most 64) free buffers of `bytes` in it: the pool a long-running process
+/// can hand an allocation (`mlx_pages`).
+pub fn seedMlxPool(s: mlx.mlx_stream, bytes: c_int, count: usize) !void {
+    _ = mlx.mlx_clear_cache();
+    var held: [64]mlx.mlx_array = undefined;
+    for (held[0..count]) |*h| {
+        h.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(h, &[_]c_int{bytes}, 1, .uint8, s));
+        try mlx.check(mlx.mlx_array_eval(h.*));
+    }
+    try mlx.check(mlx.mlx_synchronize(s));
+    for (held[0..count]) |h| _ = mlx.mlx_array_free(h);
+}

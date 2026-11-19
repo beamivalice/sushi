@@ -31,6 +31,9 @@ earlier history is mlx-serve's, in that project's changelog.
   so its scale and bias rows are never copied past the memory bill**: the cache and its bill move by up to 768 rows a
   layer either way (about 10 MB at most on Qwen3.8-Flash-Next), and on a tight budget the advertised context can drop
   by a few hundred tokens (79,872 where it was 80,000 or more on a lean 32 GB Mac); Sushi Cooler is unchanged.
+- **On MLX a Qwen request's QSA index banks are appended in place**: a reservation could size them a fraction of a
+  page off MLX's page grid, so MLX's pool could hand them a buffer it never reuses in place and each block's append
+  copied the bank, memory the bill did not hold; they now take whole pages, inside the rows the bill already counted.
 - **A GLM request with a kv8 or kv6 cache no longer copies part of its cache on a step**: MLX could hand the cache's
   scale and bias rows a buffer slightly larger than they need, which it then never reuses in place, so the append
   copied them, memory the bill did not hold. Past 1,024 tokens the cache now grows 1,024 rows at a time (up to 4.6 MB

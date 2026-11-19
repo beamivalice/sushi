@@ -17,3 +17,13 @@ fn onPages(rows: u64, part_bytes: []const u64) bool {
     for (part_bytes) |b| if (rows *| b > page and rows *| b % page != 0) return false;
     return true;
 }
+
+/// PURE: the fewest rows, at least `rows`, of a buffer of `row_bytes` a row that are within a page or whole pages: the
+/// finest grid a buffer appended in place can take (`pagedRows` keeps the KV cache's 256-row steps).
+pub fn pagedCount(rows: u64, row_bytes: u64) u64 {
+    if (row_bytes == 0 or rows *| row_bytes <= page) return rows;
+    const step = page / std.math.gcd(page, row_bytes);
+    return (rows +| step - 1) / step * step;
+}
+
+const std = @import("std");
