@@ -43,6 +43,9 @@ for v in $SUSHI_FIXTURE_ENVS; do
 done
 
 ZIG_CACHE="$GATE_DIR/zig-cache"
+# A test binary in <cache>/o/<hash>/ finds libmlxc through its rpath @loader_path/../../../lib/mlx/lib.
+mkdir -p "$GATE_DIR/lib"
+ln -sfn "$(cd "$ROOT/lib/mlx" && pwd -P)" "$GATE_DIR/lib/mlx"
 LOGS="$GATE_DIR/$SHA.logs"
 rm -rf "$LOGS"
 mkdir -p "$LOGS"

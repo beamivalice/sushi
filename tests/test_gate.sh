@@ -110,6 +110,7 @@ gate SUSHI_TEST_TIMES= -- HEAD~1
 ok "a green gate exits 0" "$RC" "0"
 REC="$GATE_DIR/$SHA1.json"
 ok "the record is named for the resolved sha" "$([ -f "$REC" ] && echo yes || echo no)" "yes"
+ok "lib/mlx sits beside the gate's zig cache, where a cached test binary's rpath finds libmlxc" "$(readlink "$GATE_DIR/lib/mlx")" "$(cd "$REPO/lib/mlx" && pwd -P)"
 ok "  and none for another commit" "$([ -e "$GATE_DIR/$SHA2.json" ] && echo yes || echo no)" "no"
 ok "the record holds the sha" "$(field "$REC" sha)" "$SHA1"
 ok "the record holds the toolchain" "$(field "$REC" zig)" "0.17.1"
