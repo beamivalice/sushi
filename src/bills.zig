@@ -7035,11 +7035,18 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
     try w.print("To load it:\n", .{});
     if (r.stream_fits_gb > 0) try w.print("- Stream its experts from the SSD: set Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to {d} or less: much less memory, slower decode.\n", .{r.stream_fits_gb});
     const free_short = if (a.free) |f| Mem.short(r.needed, f, u) else Mem.short(0, 0, u);
+    // What this text lists after the GPU action, which may point to it.
+    const knob_fits = switch (r.knob) {
+        .none => false,
+        .ctx_size => |c| c.fits > 0,
+        .ssd_budget => |b| b.fits_gb > 0,
+    };
+    const later = knob_fits or r.smaller_pack != .none or r.check == .preflight;
     if (a.bound() == .free_ram) {
         if (ram_helps) try writeRamAction(w, free_short);
-        if (gpu_short > 0) try writeGpuAction(w, r);
+        if (gpu_short > 0) try writeGpuAction(w, r, later);
     } else {
-        try writeGpuAction(w, r);
+        try writeGpuAction(w, r, later or (ram_short > 0 and ram_helps));
         if (ram_short > 0 and ram_helps) try writeRamAction(w, free_short);
     }
     switch (r.knob) {
@@ -7070,9 +7077,10 @@ fn writeRamAction(w: *std.Io.Writer, short: Mem) std.Io.Writer.Error!void {
     try w.print("- Quit other apps or unload another model to free about {f}, then retry: the check reads free memory when the load starts, so a retry sees what you freed.\n", .{short});
 }
 
-fn writeGpuAction(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!void {
+/// `later`: the text lists another option after this one.
+fn writeGpuAction(w: *std.Io.Writer, r: LoadMemoryRefusal, later: bool) std.Io.Writer.Error!void {
     const mb = r.wiredLimitThatFits() orelse
-        return w.print("- This Mac cannot give the GPU enough memory for it, even with a raised limit: use one of the options below.\n", .{});
+        return w.print("- This Mac cannot give the GPU enough memory for it, even with a raised limit{s}.\n", .{if (later) ": use one of the options below" else ""});
     var cmd: [192]u8 = undefined;
     try w.print("- Raise the GPU memory limit in Terminal: {s} (it resets at reboot), then restart sushi: the limit is read when sushi starts.\n", .{wireLimitsCommand(&cmd, mb)});
 }
@@ -7868,6 +7876,20 @@ test "the ssd budget is admitted against the ceiling the preflight and admission
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "sudo sysctl") == null);
     try testing.expect(std.mem.indexOf(u8, text, "This Mac cannot give the GPU enough memory for it") != null);
+}
+
+test "a load refusal that points to the options below lists one" {
+    const gib: u64 = 1 << 30;
+    var buf: [2048]u8 = undefined;
+    // Past what this Mac can ever wire: each check, with and without a smaller pack and a budget that fits.
+    for ([_]LoadMemoryRefusal.Check{ .preflight, .fit, .budget }) |check| for ([_]LoadMemoryRefusal.SmallerPack{ .none, .exists }) |smaller| for ([_]u64{ 0, 7 }) |fits| {
+        const avail: SushiAvailable = .{ .bytes = 20 * gib, .free = if (check == .budget) null else 24 * gib, .gpu = 20 * gib };
+        const text = loadMemoryRefusalText(&buf, .{ .needed = 40 * gib, .avail = avail, .wired_beside = 0, .total_ram = 32 * gib, .check = check, .smaller_pack = smaller, .knob = .{ .ssd_budget = .{ .gb = 30, .fits_gb = fits } } });
+        errdefer std.debug.print("{s}\n", .{text});
+        try testing.expect(std.mem.indexOf(u8, text, "This Mac cannot give the GPU enough memory for it") != null);
+        const at = std.mem.indexOf(u8, text, "the options below") orelse continue;
+        try testing.expect(std.mem.indexOf(u8, text[at..], "\n- ") != null);
+    };
 }
 
 test "a load refusal offers a smaller pack only when one exists, and says so when that is unknown" {

@@ -36,6 +36,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **The SSD streaming memory a refused load names loads it**: the `--ssd-budget-gb` a load refusal named could be
   refused by the load's other memory check on the same Mac (on a 32 GB Mac with 6 GB free, a load over its GPU limit
   named 26, which free RAM then refused); a named budget now passes every check the load runs.
+- **A load refusal points only to options it lists**: one that said this Mac cannot give the GPU enough memory told
+  the user to "use one of the options below" when it listed none.
 - **No command fails silently**: every error that ends a `sushi` command prints a line saying what to do; `sushi kld` on
   a DeepSeek-V4.1 pack without `--ssd-budget-gb` used to exit with no message and now asks for it.
 
