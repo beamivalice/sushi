@@ -1682,7 +1682,7 @@ test "the drafter is billed at its quantized resident bytes and its load transie
     try testing.expectEqual(bare + gib / 2, loadRequirementBytes(&f.qwen, 44 * gib, false, 0));
     // An MTP-on load pays both peaks, and a context bill still replaces them.
     try testing.expectEqual(44 * gib + gib * 5 / 4 + gib / 2 + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 0));
-    try testing.expectEqual(44 * gib + 6 * gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
+    try testing.expectEqual(44 * gib + 6 * gib + bills.LIVE_RESERVE_BYTES, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
 }
 
 test "a cold load reads the serving bill on the config the load stamps with the drafter's request terms" {

@@ -36,6 +36,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **The SSD streaming memory a refused load names loads it**: the `--ssd-budget-gb` a load refusal named could be
   refused by the load's other memory check on the same Mac (on a 32 GB Mac with 6 GB free, a load over its GPU limit
   named 26, which free RAM then refused); a named budget now passes every check the load runs.
+- **A Qwen3.8 load at the `--ctx-size` its memory refusal named serves requests that long**: the context was priced on
+  the free RAM before the load, and a request at it was then refused up to 1 GB short of what the server keeps free
+  once loaded; the refusal and the load's check now leave that room.
 - **The maximum context a memory refusal names is admitted however the prompt and reply split it**: a Qwen3.8 refusal
   for a prompt that did not fit named a context that a shorter prompt with a longer reply was then refused at; every
   context the server names (advertised, `--ctx-size` at load, a refusal's maximum) is now priced at its dearest split.

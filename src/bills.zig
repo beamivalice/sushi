@@ -1269,7 +1269,8 @@ pub fn loadServingBill(config: *const model_mod.ModelConfig, budget: u64) ?model
     return .{
         .requested_context = context,
         .needed = full.bytes,
-        .max_context = maxSushiContextForBudget(config, bits, budget),
+        // The largest context whose bill the preflight admits beside the weights (`loadRequirementBytes`).
+        .max_context = maxSushiContextForBudget(config, bits, budget -| LIVE_RESERVE_BYTES),
         .kv_bits = bits,
         .chunk = full.chunk,
     };
@@ -3387,8 +3388,9 @@ test "Sushi quant memory production context CPU audit" {
     const budget: u64 = 16 << 30;
     const bill = loadServingBill(&cfg, budget).?;
     try std.testing.expectEqual(@as(u64, 8), bill.kv_bits);
-    try std.testing.expect(sushiContextBytesAt(&cfg, bill.max_context, 8).bytes <= budget);
-    if (bill.max_context < cfg.contextCap()) try std.testing.expect(sushiContextBytesAt(&cfg, bill.max_context + 1, 8).bytes > budget);
+    // The live checks after the load keep their reserve of the budget.
+    try std.testing.expect(freeNeededAfterLoad(sushiContextBytesAt(&cfg, bill.max_context, 8).bytes) <= budget);
+    if (bill.max_context < cfg.contextCap()) try std.testing.expect(freeNeededAfterLoad(sushiContextBytesAt(&cfg, bill.max_context + 1, 8).bytes) > budget);
 }
 
 test "Sushi quant memory rejects an oversized context with an exact maximum at KV8" {
@@ -3411,14 +3413,14 @@ test "Sushi quant memory rejects an oversized context with an exact maximum at K
     settings_resolve.prefill_chunk.source = .flag;
     var cfg = fixtures.qwen4RequestTestConfig();
     cfg.expert_layout = .exl3_k4;
-    const budget = sushiContextBytesAt(&cfg, 128000, 8).bytes;
+    // What the preflight must find free beside the weights for 128000 tokens: their bill and the live checks' reserve.
+    const budget = freeNeededAfterLoad(sushiContextBytesAt(&cfg, 128000, 8).bytes);
     const bill = loadServingBill(&cfg, budget).?;
     try std.testing.expectEqual(@as(u64, 8), bill.kv_bits);
     try std.testing.expectEqual(@as(u32, 500000), bill.requested_context);
     try std.testing.expect(bill.needed > budget);
     try std.testing.expectEqual(@as(u32, 128000), bill.max_context);
-    try std.testing.expect(sushiContextBytesAt(&cfg, bill.max_context, 8).bytes <= budget);
-    try std.testing.expect(sushiContextBytesAt(&cfg, bill.max_context + 1, 8).bytes > budget);
+    try std.testing.expect(freeNeededAfterLoad(sushiContextBytesAt(&cfg, bill.max_context + 1, 8).bytes) > budget);
     try std.testing.expectEqual(@as(u64, 2048), sushiContextBytesAt(&cfg, 128000, 8).chunk);
     try std.testing.expect(maxSushiContextForBudget(&cfg, 4, budget) > bill.max_context);
     try std.testing.expectEqual(@as(u32, 0), maxSushiContextForBudget(&cfg, 8, 0));
@@ -3427,7 +3429,7 @@ test "Sushi quant memory rejects an oversized context with an exact maximum at K
     var mimo = try model_mod.parseConfigFromJson(std.testing.allocator, arch_config.fixtureConfig("mimo2") orelse return error.SkipZigTest);
     defer mimo.deinit(std.testing.allocator);
     mimo.expert_layout = .exl3_k4;
-    const mimo_budget = sushiContextBytesAt(&mimo, 64000, 8).bytes;
+    const mimo_budget = freeNeededAfterLoad(sushiContextBytesAt(&mimo, 64000, 8).bytes);
     const mimo_bill = loadServingBill(&mimo, mimo_budget).?;
     try std.testing.expectEqual(@as(u32, 64000), mimo_bill.max_context);
     launch_state.server_config.max_context_size = 0;
@@ -7220,7 +7222,14 @@ pub fn loadWarmupBytes(config: *const model_mod.ModelConfig, mtp_on: bool) u64 {
 pub fn warmNeedBytes(config: *const model_mod.ModelConfig) u64 {
     const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
     const request = if (coolerPrefillRowBytes(config) > 0) warmRequestBill(config, defaultKvBits(config), floor, mtpHeadDefaultOn(config)) else 0;
-    return @max(warmFloorChunkBytes(config), request) +| LIVE_RESERVE_BYTES;
+    return freeNeededAfterLoad(@max(warmFloorChunkBytes(config), request));
+}
+
+/// What a load must find free beside what it holds for a bill a live check reads once it is loaded (its served warm, a
+/// request at its context): those checks leave `LIVE_RESERVE_BYTES` of what macOS can still give to the kernel
+/// (`liveCeilingFrom`), which the preflight's free RAM still counts.
+pub fn freeNeededAfterLoad(bill: u64) u64 {
+    return bill +| LIVE_RESERVE_BYTES;
 }
 
 /// The reply of the served warm's longest request (`cooler_warm.warmServed`).
@@ -7248,7 +7257,8 @@ pub fn loadRequirementBytes(config: *const model_mod.ModelConfig, weights_bytes:
     if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes, warmNeedBytes(config));
     // A load on Sushi Cooler runs its served warm once the load's own transient is gone.
     const warm = if (@import("cooler_side.zig").onEngine(config)) warmNeedBytes(config) else 0;
-    return weights_bytes +| @max(@max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill), warm);
+    const context = if (context_bill > 0) freeNeededAfterLoad(context_bill) else 0;
+    return weights_bytes +| @max(@max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context), warm);
 }
 
 
@@ -7502,9 +7512,9 @@ test "bill pin: loadWarmupBytes" {
 
 test "bill pin: loadRequirementBytes" {
     try pinLoadConfigs("loadRequirementBytes", &.{
-        65632468992, 85899345920, 66840428544, 85899345920, 79541548544, 79541548544, 79541548544, 79541548544,
-        65766686720, 85899345920, 65766686720, 85899345920, 79971411552, 79971411552, 79971411552, 79971411552,
-        66060796416, 85899345920, 66060796416, 85899345920, 80340094144, 80340094144, 80340094144, 80340094144,
+        65632468992, 86973087744, 66840428544, 86973087744, 79541548544, 79541548544, 79541548544, 79541548544,
+        65766686720, 86973087744, 65766686720, 86973087744, 79971411552, 79971411552, 79971411552, 79971411552,
+        66060796416, 86973087744, 66060796416, 86973087744, 80340094144, 80340094144, 80340094144, 80340094144,
         69456957221, 69456957221, 69456957221, 69456957221, 82341859109, 82341859109, 82341859109, 82341859109,
     }, struct {
         fn run(c: *const model_mod.ModelConfig, g: *PinGot) void {
