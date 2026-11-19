@@ -5050,6 +5050,8 @@ test "dsv41 engine: a finished request's state is the next turn's deepest point,
         var at: usize = 0;
         for ([_]usize{ 12, 8, 1, 3, 1, 5 }, 0..) |n, i| {
             var ctx = fx.xfm.defaultCtx();
+            // A served slot forwards over its own cache: the one its commit names as the state's owner.
+            ctx.cache = &slot.cache;
             ctx.cache.step = at;
             _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, turns[at .. at + n]));
             at += n;
@@ -5131,6 +5133,8 @@ test "dsv41 engine: a slot request holds the one decode state while it runs and 
         var at: usize = 0;
         for ([_]usize{ 12, 8, 1, 3, 1, 5 }, 0..) |n, i| {
             var ctx = fx.xfm.defaultCtx();
+            // A served slot forwards over its own cache: the one its commit names as the state's owner.
+            ctx.cache = &slot.cache;
             if (slots) ctx.arch_ctx.dsv41.request = first;
             ctx.cache.step = at;
             _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, turns[at .. at + n]));
