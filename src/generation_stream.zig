@@ -2214,7 +2214,7 @@ pub fn loadRefusalMessage(buf: []u8, err: anyerror, refusal: LoadRefusal, contex
 }
 
 test "a prefill chunk refused mid-request for memory answers 503 with the arch's whole text, not the admission refusal" {
-    const text = "This prompt ran out of GPU memory partway through its prefill.\nIts 2048-token chunk at token 6144 needs 5.0 GB, and the free memory with every expert-cache pool the prefill can borrow holds 4.5 GB: about 0.5 GB short. The chunks before it ran.\nTo serve it:\n- Lower --prefill-chunk to 1024: a narrower chunk needs less memory at this length.\n- Retry when other requests finish or other apps quit: the memory they hold comes back.\n- Shorten the prompt to under 6144 tokens.";
+    const text = "This prompt ran out of GPU memory partway through its prefill.\nIts 2048-token chunk, tokens 4096 to 6144, needs 5.00 GB, and the free memory with every expert-cache pool the prefill can borrow holds 4.50 GB: about 0.5 GB short. The chunks before it ran.\nTo serve it:\n- Lower --prefill-chunk to 1024: a narrower chunk needs less memory at this length.\n- Retry when other requests finish or other apps quit: the memory they hold comes back.\n- Shorten the prompt to 4096 tokens or fewer: the chunks up to there fit.";
     forward_refusal_mod.record(text);
     server_state.slot_forward_refusal = forward_refusal_mod.take();
     var buf: [@sizeOf(@FieldType(forward_refusal_mod.Text, "buf"))]u8 = undefined;

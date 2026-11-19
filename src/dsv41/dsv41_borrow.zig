@@ -373,14 +373,18 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
     if (r.have < need) return refuse(c, cooler_side.onEngine(config), rows, seq, need, r.have);
 }
 
-/// The narrowest step down from `rows` whose forward at `seq` fits `have`, halving to 64 rows; 0 when none does.
+/// The widest `--prefill-chunk` below the refused forward's whose forward ending at `seq` fits `have`, halving to 64; 0
+/// when none does. An explicit width's forward takes up to a whole merged tail beside it (`prefill_plan.TAIL_MERGE_MAX`).
 pub fn chunkThatFits(c: *const Config, engine: bool, rows: u64, seq: u64, have: u64) u64 {
-    var w = rows / 2;
-    while (w >= 64) : (w /= 2) if (prefillNeed(c, engine, w, seq) <= have) return w;
+    const tail = @import("../prefill_plan.zig").TAIL_MERGE_MAX - 1;
+    if (rows < 2) return 0;
+    var w = std.math.floorPowerOfTwo(u64, rows / 2);
+    while (w >= 64) : (w /= 2) if (prefillNeed(c, engine, w + tail, seq) <= have) return w;
     return 0;
 }
 
-/// What the client reads when a forward is refused mid-request: what did not fit, by how much, and what to change.
+/// What the client reads when a forward is refused mid-request: what did not fit, by how much, and what to change. `seq`
+/// is the position the forward ends at.
 pub fn refusalText(buf: []u8, rows: u64, seq: u64, need: u64, have: u64, chunk_fits: u64) []const u8 {
     var w = std.Io.Writer.fixed(buf);
     writeRefusal(&w, rows, seq, need, have, chunk_fits) catch return "A prefill chunk of this prompt did not fit in GPU memory; the server log has the figures.";
@@ -391,13 +395,13 @@ fn writeRefusal(w: *std.Io.Writer, rows: u64, seq: u64, need: u64, have: u64, ch
     const gib = 1024.0 * 1024.0 * 1024.0;
     const short_tenths = ((need -| have) *| 10 +| ((1 << 30) - 1)) >> 30;
     try w.print("This prompt ran out of GPU memory partway through its prefill.\n", .{});
-    try w.print("Its {d}-token chunk at token {d} needs {d:.1} GB, and the free memory with every expert-cache pool the prefill can borrow holds {d:.1} GB: about {d:.1} GB short. The chunks before it ran.\n", .{
-        rows, seq, @as(f64, @floatFromInt(need)) / gib, @as(f64, @floatFromInt(have)) / gib, @as(f64, @floatFromInt(short_tenths)) / 10.0,
+    try w.print("Its {d}-token chunk, tokens {d} to {d}, needs {d:.2} GB, and the free memory with every expert-cache pool the prefill can borrow holds {d:.2} GB: about {d:.1} GB short. The chunks before it ran.\n", .{
+        rows, seq -| rows, seq, @as(f64, @floatFromInt(need)) / gib, @as(f64, @floatFromInt(have)) / gib, @as(f64, @floatFromInt(short_tenths)) / 10.0,
     });
     try w.print("To serve it:\n", .{});
     if (chunk_fits > 0) try w.print("- Lower --prefill-chunk to {d}: a narrower chunk needs less memory at this length.\n", .{chunk_fits});
     try w.print("- Retry when other requests finish or other apps quit: the memory they hold comes back.\n", .{});
-    try w.print("- Shorten the prompt to under {d} tokens.", .{seq});
+    try w.print("- Shorten the prompt to {d} tokens or fewer: the chunks up to there fit.", .{seq -| rows});
 }
 
 fn refuse(c: *const Config, engine: bool, rows: u64, seq: u64, need: u64, have: u64) error{PrefillChunkDoesNotFit} {
@@ -1253,19 +1257,21 @@ test "dsv41 borrow: a forward refused mid-prefill names its chunk, the shortfall
     const rows: u64 = 2048;
     const seq: u64 = 6144;
     const need = prefillNeed(&c, true, rows, seq);
-    const have = prefillNeed(&c, true, rows / 2, seq) + (1 << 20);
+    // A 1024 chunk's forward may merge a 511-row tail: the width that fits is priced with it.
+    const have = prefillNeed(&c, true, 1024 + 511, seq) + (1 << 20);
     try testing.expect(have < need);
-    try testing.expectEqual(rows / 2, chunkThatFits(&c, true, rows, seq, have));
+    try testing.expectEqual(@as(u64, 1024), chunkThatFits(&c, true, rows, seq, have));
+    try testing.expectEqual(@as(u64, 512), chunkThatFits(&c, true, rows, seq, prefillNeed(&c, true, 1024 + 511, seq) - 1));
     try testing.expectEqual(@as(u64, 0), chunkThatFits(&c, true, rows, seq, 0));
     var buf: [1024]u8 = undefined;
     const text = refusalText(&buf, rows, seq, 5 * gib, 4 * gib + gib / 2, 1024);
     for ([_][]const u8{
         "This prompt ran out of GPU memory partway through its prefill.\n",
-        "Its 2048-token chunk at token 6144 needs 5.0 GB",
-        "holds 4.5 GB: about 0.5 GB short. The chunks before it ran.\n",
+        "Its 2048-token chunk, tokens 4096 to 6144, needs 5.00 GB",
+        "holds 4.50 GB: about 0.5 GB short. The chunks before it ran.\n",
         "To serve it:\n- Lower --prefill-chunk to 1024",
         "- Retry when other requests finish",
-        "- Shorten the prompt to under 6144 tokens.",
+        "- Shorten the prompt to 4096 tokens or fewer",
     }) |part| {
         errdefer std.debug.print("missing \"{s}\" in:\n{s}\n", .{ part, text });
         try testing.expect(std.mem.indexOf(u8, text, part) != null);

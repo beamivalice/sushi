@@ -6582,7 +6582,8 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
     if (a.bound() == .free_ram) {
         try w.print("- Quit other apps or unload another model, then retry: the check reads free memory when the load starts, so a retry sees what you freed.\n", .{});
     } else if (r.wiredLimitThatFits()) |mb| {
-        try w.print("- Raise the GPU memory limit: sudo sysctl iogpu.wired_limit_mb={d} (it resets at reboot), then retry.", .{mb});
+        var cmd: [192]u8 = undefined;
+        try w.print("- Raise the GPU memory limit: {s} (it resets at reboot), then retry.", .{wireLimitsCommand(&cmd, mb)});
         if (a.free < r.needed) try w.print(" Free about {d:.1} GB of RAM as well: quit other apps or unload another model.", .{gbUp(r.needed - a.free)});
         try w.print("\n", .{});
     } else {
@@ -6966,7 +6967,8 @@ test "a refused load's message names the bound in words, the shortfall and the b
     try testing.expectEqual(SushiAvailable.Bound.wired_limit, by_floor.bound());
     const floor_text = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = by_floor, .wired_limit_mb = 29696, .wired_beside = 11 * gib, .total_ram = 64 * gib, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15 } } });
     try has(floor_text, "the GPU memory limit (iogpu.wired_limit_mb = 29696 MB) leaves 18.0 GB beside what is already loaded: about 2.0 GB short.");
-    try has(floor_text, "To load it:\n- Raise the GPU memory limit: sudo sysctl iogpu.wired_limit_mb=31800 (it resets at reboot), then retry.");
+    // The command the Settings page builds (`#wiredCmd`): the GPU limit and both user wire limits, from one rule.
+    try has(floor_text, "To load it:\n- Raise the GPU memory limit: sudo sysctl iogpu.wired_limit_mb=31800 vm.global_user_wire_limit=33344716800 vm.user_wire_limit=33344716800 (it resets at reboot), then retry.");
     try has(floor_text, "- Lower --ssd-budget-gb to 15 (it is 18)");
     // A limit this Mac cannot wire is not offered.
     const no_raise = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = by_floor, .wired_limit_mb = 29696, .wired_beside = 11 * gib, .total_ram = 32 * gib });
