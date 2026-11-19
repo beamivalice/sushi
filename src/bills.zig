@@ -6865,6 +6865,8 @@ pub const LoadMemoryRefusal = struct {
     total_ram: u64 = 0,
     knob: Knob = .none,
     check: Check = .preflight,
+    /// A resident load of a pack that can stream its experts: the largest `--ssd-budget-gb` that fits (0: none does).
+    stream_fits_gb: u64 = 0,
 
     /// The check that refused: the preflight (which `--skip-mem-preflight` skips), the streamed load's fit under its
     /// ceiling, or the ssd budget with its planned KV against the GPU limit as a whole (no RAM term, nothing beside).
@@ -6899,6 +6901,8 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
     const gpu_room = a.gpuAllows();
     const gpu_short = if (gpu_room) |g| r.needed -| g else 0;
     const u = Mem.unitOf(r.needed, @max(a.bytes orelse 0, @max(a.free orelse 0, gpu_room orelse 0)));
+    // Past what this Mac can ever give the GPU, freeing RAM cannot load it.
+    const ram_helps = gpu_short == 0 or r.wiredLimitThatFits() != null;
     const need = Mem.need(r.needed, u);
     try w.print("Not enough memory to load this model.\n", .{});
     switch (a.bound()) {
@@ -6910,7 +6914,7 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
                 else
                     try w.print("; your GPU memory limit would allow {f}", .{Mem.have(gpu, u)});
             }
-            try w.print(". Free about {f} more.\n", .{Mem.short(r.needed, a.bytes.?, u)});
+            if (ram_helps) try w.print(". Free about {f} more.\n", .{Mem.short(r.needed, a.bytes.?, u)}) else try w.print(".\n", .{});
         },
         .wired_limit, .gpu_limit => {
             try w.print("It needs {f}", .{need});
@@ -6929,12 +6933,13 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
     try w.print("To load it:\n", .{});
     const free_short = if (a.free) |f| Mem.short(r.needed, f, u) else Mem.short(0, 0, u);
     if (a.bound() == .free_ram) {
-        try writeRamAction(w, free_short);
+        if (ram_helps) try writeRamAction(w, free_short);
         if (gpu_short > 0) try writeGpuAction(w, r);
     } else {
         try writeGpuAction(w, r);
-        if (ram_short > 0) try writeRamAction(w, free_short);
+        if (ram_short > 0 and ram_helps) try writeRamAction(w, free_short);
     }
+    if (r.stream_fits_gb > 0) try w.print("- Stream its experts from the SSD: set Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to {d} or less: much less memory, slower decode.\n", .{r.stream_fits_gb});
     switch (r.knob) {
         .none => {},
         .ctx_size => |c| if (c.fits > 0) {
@@ -7648,4 +7653,25 @@ test "a load refusal names the setting it asks to lower by its Settings label an
     try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ctx_size = .{ .requested = 262144, .fits = 65536, .from_flag = true } } }), "- Restart sushi with --ctx-size 65536 or less (it is 262144; the flag outranks Context length in Settings).");
     try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15 } } }), "- Lower Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to 15 (it is 18)");
     try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = avail, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15, .from_flag = true } } }), "- Restart sushi with --ssd-budget-gb 15 (it is 18; the flag outranks Memory for SSD streaming (GiB) in Settings)");
+}
+
+test "a load this Mac can never give the GPU enough memory for offers no free-RAM action, which cannot help" {
+    const gib: u64 = 1 << 30;
+    var buf: [2048]u8 = undefined;
+    // M1's 32 GB gate: 47.2 GB needed, 20.1 GB of RAM free, the GPU limit allows 26.3 GB.
+    const avail = sushiAvailable(20 * gib + gib / 10, 0, 26 * gib + gib * 3 / 10, 0, 0);
+    const text = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib + gib / 5, .avail = avail, .total_ram = 32 * gib });
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "This Mac cannot give the GPU enough memory for it") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Quit other apps or unload another model to free about") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "Free about") == null);
+}
+
+test "a resident load of a pack that can stream names the ssd budget that fits" {
+    const gib: u64 = 1 << 30;
+    var buf: [2048]u8 = undefined;
+    const avail = sushiAvailable(20 * gib, 0, 26 * gib, 0, 0);
+    const text = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .total_ram = 32 * gib, .stream_fits_gb = 17 });
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "- Stream its experts from the SSD: set Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to 17 or less") != null);
 }

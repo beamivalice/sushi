@@ -2004,6 +2004,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 const planner = BudgetPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = planned_assistant, .beside = weights_bytes -| planned_resident, .mtp_on = mtp_on };
                 refusal.knob = .{ .ssd_budget = .{ .gb = budget >> 30, .fits_gb = bills.streamedBudgetThatFits(budget, avail, planner), .from_flag = streaming_budget.origin == .flag } };
             }
+            // A resident load of a pack that can stream: the budget that loads it streamed, by the same planner.
+            if (!params.config.expert_streaming and params.config.supportsExpertStreaming()) {
+                const assistant = try streamedAssistantBytes(sch.io, sch.allocator, params.config, params.no_drafter, params.drafter_dir, params.model_dir);
+                const planner = BudgetPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant, .beside = 0, .mtp_on = mtp_on };
+                refusal.stream_fits_gb = bills.streamedBudgetThatFits(512 << 30, avail, planner);
+            }
             var text_buf: [2048]u8 = undefined;
             const text = bills.loadMemoryRefusalText(&text_buf, refusal);
             log.err("{s}\n", .{text});

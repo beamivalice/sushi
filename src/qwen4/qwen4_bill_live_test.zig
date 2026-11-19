@@ -505,3 +505,21 @@ test "Flash-Next streamed: a request refused at admission for its max_tokens nam
     var again: [8192]u8 = undefined;
     try t.expect((try Ask.at(fits, &config, &prompt, &again)).admitted);
 }
+
+test "Flash-Next resident: the ssd budget a refused resident load offers loads it streamed on the memory that refused it (QWEN4_STQ_TINY)" {
+    const t = std.testing;
+    const a = t.allocator;
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    var config = try model_mod.parseConfig(t.io, a, dir);
+    defer config.deinit(a);
+    model_load.applyModelSettings(&config, .{});
+    try t.expect(!config.expert_streaming and config.supportsExpertStreaming());
+    const planner = model_load.BudgetPlanner{ .io = t.io, .allocator = a, .config = &config, .model_dir = dir, .vision = false, .assistant = 0, .beside = 0, .mtp_on = false };
+    // Room for the smallest streamed plan and one GiB more, under what the whole pack streamed at 512 GiB needs.
+    var floor: u64 = 1;
+    while (planner.needAt(floor << 30) == null) floor += 1;
+    const avail = planner.needAt(floor << 30).? + (1 << 30);
+    const fits = bills.streamedBudgetThatFits(512 << 30, avail, planner);
+    try t.expect(fits >= floor);
+    try t.expect(planner.needAt(fits << 30).? <= avail);
+}
