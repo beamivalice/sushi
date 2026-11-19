@@ -18,6 +18,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **A large chunked upload is answered**: a `Transfer-Encoding: chunked` request over about 16 KB sent in one go got no
   answer and held its connection forever, and a body or WebSocket frame left half sent outlasted the 30 s read limit
   and a shutdown.
+- **A request ended by a shutdown says so in its error type**: its 503 carried `server_error` where every other
+  shutdown refusal carries `shutting_down`; all now carry `shutting_down`.
 - **A reply cancelled mid-stream no longer says it ran out of tokens**: a request stopped by `POST /v1/slots/cancel`
   (or the dashboard's Cancel) ended with `finish_reason: length` (Responses: incomplete, `max_output_tokens`) and zero
   usage on every surface; it now ends as cancelled, and its usage counts the tokens it returned.

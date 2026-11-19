@@ -558,7 +558,11 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
             defer for (asked) |q| gpa.free(q.out);
             if (!marked) return error.UnloadNeverMarked;
             if (!answered) return error.ShutdownLeftAWaiterUnanswered;
-            for (asked) |q| if (!std.mem.startsWith(u8, q.out, "HTTP/1.1 503") or std.mem.indexOf(u8, q.out, @import("http.zig").shutting_down_message) == null) {
+            // One shutdown error: the unload and the request behind it carry the same type too.
+            const shutdown_type = "\"type\":\"" ++ http.shutting_down_type ++ "\"";
+            for (asked) |q| if (!std.mem.startsWith(u8, q.out, "HTTP/1.1 503") or std.mem.indexOf(u8, q.out, http.shutting_down_message) == null or
+                std.mem.indexOf(u8, q.out, shutdown_type) == null)
+            {
                 std.debug.print("{s} answered at the shutdown: {s}\n", .{ q.path, q.out[0..@min(q.out.len, 300)] });
                 return error.NotTheShutdownError;
             };

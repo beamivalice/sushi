@@ -425,7 +425,7 @@ pub fn handleClear(allocator: std.mem.Allocator, stream: *http_conn.Conn, reques
             return;
         };
         const r = sch.prefixAdmin(.{ .entry = entry }) catch {
-            try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", http.shutting_down_message, 503);
+            try http.sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503);
             return;
         };
         switch (r.outcome) {

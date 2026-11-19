@@ -1765,7 +1765,7 @@ fn holdModel(allocator: std.mem.Allocator, stream: *http_conn.Conn, scheduler: *
             return null;
         },
         error.Shutdown => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", http.shutting_down_message, 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503);
             return null;
         },
         // Other errors (CPU-side preload failures like FileNotFound on a
@@ -2078,7 +2078,7 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn
             return;
         },
         error.Shutdown => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", http.shutting_down_message, 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503);
             return;
         },
         error.ModelBusy => {

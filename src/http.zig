@@ -312,6 +312,8 @@ pub const resident_models_cap_message =
 
 /// The one-line 503s: each says what clears it, since the web UI and Sushibar show the server's text as is.
 pub const shutting_down_message = "The server is shutting down: start it again, then retry.";
+/// The OpenAI error type of every shutdown refusal, whichever path refused it.
+pub const shutting_down_type = "shutting_down";
 pub const model_not_loaded_message = "The requested model is not loaded: load it on the Models page, then retry.";
 pub const no_model_message = "No model is loaded: load one on the Models page, then retry.";
 pub const not_ready_message = "The server is still starting: retry in a moment.";

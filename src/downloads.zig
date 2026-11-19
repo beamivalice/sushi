@@ -648,7 +648,7 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
         return http.sendErrorResponse(allocator, stream, "409 Conflict", "model_loaded", msg, 409);
     }
     const queued_now = queued catch |err| switch (err) {
-        error.ShuttingDown => return http.sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", http.shutting_down_message, 503),
+        error.ShuttingDown => return http.sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503),
         else => return err,
     };
     var out: std.Io.Writer.Allocating = .init(allocator);

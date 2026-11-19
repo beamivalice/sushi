@@ -206,7 +206,7 @@ pub fn mapGenerationError(allocator: std.mem.Allocator, err: anyerror) !GenError
         error.ServerShutdown, error.Shutdown => .{
             .status_line = "503 Service Unavailable",
             .code = 503,
-            .openai_type = "server_error",
+            .openai_type = http.shutting_down_type,
             .anthropic_type = "api_error",
             .message = http.shutting_down_message,
         },
@@ -2646,7 +2646,8 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         const w = try mapGenerationError(a, e);
         defer w.deinit(a);
         try t.expectEqual(@as(u32, 503), w.code);
-        try t.expectEqualStrings("server_error", w.openai_type);
+        // The type every other shutdown refusal sends (an unload, a load, a download, a cache job).
+        try t.expectEqualStrings("shutting_down", w.openai_type);
         try t.expectEqualStrings(http.shutting_down_message, w.message);
     }
     {

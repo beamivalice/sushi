@@ -475,6 +475,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **A shutdown drain is an ERROR, never a finish reason**: `beginShutdown` marks `Slot.shutdown_cancelled`, so the
   reader gets `.err` (`error.ServerShutdown`, 503 "Server is shutting down") instead of `.done`, whose default
   `finish_reason` is `length` (a queued request logged `0+0 tokens [length]`).
+- **One shutdown refusal, one type**: every path that refuses for a shutdown (a request the drain ended, an unload, a
+  load, a download, a cache job) sends `http.shutting_down_type` with `http.shutting_down_message`.
 
 ## Request ownership and media
 
