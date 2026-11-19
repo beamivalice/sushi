@@ -306,6 +306,9 @@ pub const LoadedModel = struct {
     error_name: ?[]const u8,
     /// Kept through a transient memory refusal's unloaded reset; cleared on retry or success.
     memory_context_refusal: ?MemoryContextRefusal = null,
+    /// A setting that reaches loading was saved while this entry loaded: the load ran on the old settings, so its
+    /// failure is not stored. Cleared at each claim.
+    settings_saved_mid_load: bool = false,
 
     /// Token → bytes table backing the JSON grammar mask, built lazily on this
     /// entry's first schema-constrained request. Its lifetime matches
@@ -1032,6 +1035,7 @@ pub const ModelRegistry = struct {
         entry.state = .loading;
         _ = entry.refcount.fetchAdd(1, .acq_rel);
         entry.memory_context_refusal = null;
+        entry.settings_saved_mid_load = false;
         self.state_cond.broadcast(self.io);
         return true;
     }
@@ -1472,11 +1476,11 @@ pub const ModelRegistry = struct {
     }
 
     /// A settings change that reaches loading invalidates the stored failure: the entry goes back to unloaded, so the next
-    /// request loads again with the new settings. A model that is loading, loaded or unloaded is left alone.
+    /// request loads again with the new settings. A loading model's coming failure is not stored either.
     pub fn forgetLoadFailure(self: *ModelRegistry, entry: *LoadedModel) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (entry.state == .error_state) self.markUnloadedLocked(entry);
+        self.forgetLoadFailureLocked(entry);
     }
 
     /// `forgetLoadFailure` for every model, after a server-wide setting changed.
@@ -1484,12 +1488,22 @@ pub const ModelRegistry = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var it = self.entries.valueIterator();
-        while (it.next()) |entry| if (entry.*.state == .error_state) self.markUnloadedLocked(entry.*);
+        while (it.next()) |entry| self.forgetLoadFailureLocked(entry.*);
+    }
+
+    fn forgetLoadFailureLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+        switch (entry.state) {
+            .error_state => self.markUnloadedLocked(entry),
+            .loading => entry.settings_saved_mid_load = true,
+            .unloaded, .ready, .evicting => {},
+        }
     }
 
     /// A failed load's end state. A refusal that a setting or the memory limit decides goes back to `.unloaded`, so
-    /// the next load re-reads model-settings.json; any other failure is the pack's and fails fast as `.error_state`.
+    /// the next load re-reads model-settings.json, as does any failure of a load a setting that reaches loading was saved
+    /// during; any other failure is the pack's and fails fast as `.error_state`.
     pub fn markLoadFailedLocked(self: *ModelRegistry, entry: *LoadedModel, error_name: []const u8) void {
+        if (entry.settings_saved_mid_load) return self.markUnloadedLocked(entry);
         for (refusals) |n| if (std.mem.eql(u8, n, error_name)) return self.markUnloadedLocked(entry);
         self.markErrorLocked(entry, error_name);
     }
@@ -2088,6 +2102,31 @@ test "ModelRegistry: a settings change that reaches loading forgets the stored f
     try testing.expectEqual(LoadState.ready, c.state);
     reg.forgetLoadFailure(c);
     try testing.expectEqual(LoadState.ready, c.state);
+}
+
+test "ModelRegistry: a setting that reaches loading saved while the model loads ends the failure that load then stores" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const one = try reg.registerStub("one", "/path/to/one", 1024);
+    const all = try reg.registerStub("all", "/path/to/all", 1024);
+    for ([_]*LoadedModel{ one, all }) |e| {
+        reg.mutex.lockUncancelable(reg.io);
+        try testing.expect(reg.tryBeginLoadLocked(e));
+        reg.mutex.unlock(reg.io);
+        if (e == one) reg.forgetLoadFailure(e) else reg.forgetLoadFailures();
+        reg.mutex.lockUncancelable(reg.io);
+        reg.markLoadFailedLocked(e, "FileNotFound");
+        reg.mutex.unlock(reg.io);
+        reg.releaseStatus(e);
+        try expectError(error.NotLoaded, reg.ensureLoaded(e.id));
+        // The next attempt that fails with no save meanwhile stores its failure again.
+        reg.mutex.lockUncancelable(reg.io);
+        try testing.expect(reg.tryBeginLoadLocked(e));
+        reg.markLoadFailedLocked(e, "FileNotFound");
+        reg.mutex.unlock(reg.io);
+        reg.releaseStatus(e);
+        try expectError(error.LoadFailed, reg.ensureLoaded(e.id));
+    }
 }
 
 test "ModelRegistry: memory-refused loads keep their identity, other failures expose their name" {
