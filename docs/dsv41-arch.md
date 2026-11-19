@@ -1158,7 +1158,8 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   request keeps its own pass (embedding, Engram rows, DSpark targets, head, its state's advance), and a layer joins
   the rows for everything but the attention, which runs per request over its own state, the hc split's ride on its
   slice. A row is its request's one-row step bit for bit: the `.rows` arm is exact and wide, a load that joins rows
-  steps one row on the exact arm too (`serves_rows`), and a forward joins at most `maxJoinedRows`. Resident loads only.
+  steps one row on the exact arm too (`serves_rows`), and a forward joins at most `maxJoinedRows`. Resident loads only,
+  and width-exact ones (`Config.widthExactLayout`, `Model.widthExact`): the release's FP8/FP4 layout serves one row.
 - **A load that joins rows keeps a state per request and parks none** (`serves_rows`): a slot's first forward makes
   its request's state, and a forward runs it only for its own span (`bind`, `unbindRows`). Off a forward a hook reads a
   state only where it lends one (`lend`, `lendFor`: the restore through `restoreTarget`/`restoreEnd`, a write-through,

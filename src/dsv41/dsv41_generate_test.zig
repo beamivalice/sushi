@@ -6222,6 +6222,24 @@ test "dsv41 engine: a fully resident load joins as many rows as a joined forward
     try testing.expect(!fx.xfm.ownsModuleDecodeState());
 }
 
+test "dsv41 engine: the release's layout (FP8 trunk, MXFP4 experts) serves one row though its config claims every expert resident, and its model refuses rows by name (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const dsv41_sched = @import("dsv41_sched.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    try testing.expect(m.onEngine());
+    var config = fx.xfm.config;
+    config.expert_resident = true;
+    const rows = dsv41_sched.coolerRows(&config);
+    try testing.expectEqual(@as(usize, 1), rows.rows);
+    try testing.expect(std.mem.indexOf(u8, rows.why.?, "beside other rows") != null);
+    try testing.expectError(error.Dsv41RowsNotWidthExact, dsv41_serving.applyRows(m, 2, true));
+    try testing.expect(!m.serves_rows);
+}
+
 test "dsv41 engine: the scheduler's batched tick joins the slots' requests, each row its solo step's bytes, and moves each slot's position (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);

@@ -542,6 +542,10 @@ pub fn applyRows(mdl: *dsv41_model.Model, rows: usize, plan_resident: bool) !voi
         log.err("[cooler] {d} DeepSeek rows: a joined forward carries at most {d} on this GPU\n", .{ rows, mdl.maxJoinedRows() });
         return error.Dsv41RowsPastJoinCap;
     }
+    if (!mdl.widthExact()) {
+        log.err("[cooler] DeepSeek rows: a linear of this pack takes a product plan by row count, so a joined row is not its request's step\n", .{});
+        return error.Dsv41RowsNotWidthExact;
+    }
     mdl.serves_rows = true;
 }
 

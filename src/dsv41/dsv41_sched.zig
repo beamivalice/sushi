@@ -42,6 +42,7 @@ pub fn coolerRows(config: *const ModelConfig) sched.CoolerRows {
     if (!config.expert_resident) return .{ .rows = 1, .why = "its routed experts stream from SSD (the expert cache is one request's working set)" };
     // Rows are Sushi Cooler's: the user's opt-out to MLX keeps the one-request decode it had.
     if (!@import("../cooler_side.zig").onEngine(config)) return .{ .rows = 1, .why = "its decode runs on MLX" };
+    if (config.dsv41) |c| if (!c.widthExactLayout()) return .{ .rows = 1, .why = "its FP8 trunk or FP4 experts give a row other bytes beside other rows" };
     return .{ .rows = joinedRowsMax(), .note = "steps run the exact arm (+~0.6 ms a step on NAX); a next turn restores from the SSD tier" };
 }
 

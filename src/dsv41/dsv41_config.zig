@@ -149,6 +149,12 @@ pub const Config = struct {
         return false;
     }
 
+    /// The pack's layout gives a row one arm at every width: trellis experts and trunk (`Model.widthExact` checks the
+    /// loaded linears). The release's FP8 trunk and FP4 experts take a product plan by row count.
+    pub fn widthExactLayout(self: *const Config) bool {
+        return self.expert_dec != null and self.trunk_dec != null;
+    }
+
     pub fn isKvSource(self: *const Config, l: usize) bool {
         return l < self.layers and (self.kv_sources >> @intCast(l)) & 1 != 0;
     }
