@@ -9,6 +9,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Prefill on Sushi Cooler no longer waits between chunks**: the GPU sat idle at every 2048-row boundary while the
   host trimmed the engine's buffer pool and a resident DeepSeek chunk drained its last layers; the pool now carries to
   the next chunk and those layers finish behind it, for faster long-prompt prefill at the same output.
+- **Sushi Cooler keeps the GPU busy while its buffer pool trims**: a trim under a forward's memory cap waited for every
+  queued pass instead of only those that free enough, so the GPU went idle until the host caught up.
 - **DeepSeek prefill bills 1.4 GB less a 2048-row chunk**: its Engram layers gate the n-gram rows in one kernel at every
   width, where an op chain held eight full-precision copies of the stream; the output is the same.
 - **A Responses WebSocket message sent as a binary frame is answered**: it got no reply and no close, so a client that

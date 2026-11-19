@@ -733,11 +733,38 @@ fn poolStore(len: usize, for_host: bool) Error!*Store {
 fn trimTo(s: *State, bytes: u64) Error!bool {
     if (s.stats.pool_bytes <= bytes) return true;
     if (evict(s, bytes)) return true;
-    try waitFor(s, s.seq - 1);
+    // Only the passes that free enough: the ones after them keep the GPU busy while the host goes on.
+    try waitFor(s, try pendingFrees(s, bytes) orelse s.seq - 1);
     if (evict(s, bytes)) return true;
     if (s.pass == null or s.next_in.count() != 0 or s.next_out.count() != 0) return false;
     try waitFor(s, s.seq);
     return evict(s, bytes);
+}
+
+/// The committed pass whose end lets `evict` bring the pool to `bytes`, from the free buffers passes still bind.
+fn pendingFrees(s: *State, bytes: u64) Error!?u64 {
+    var pending: std.ArrayList([2]u64) = .empty;
+    defer pending.deinit(gpa);
+    for (s.free, 0..) |list, class| for (list.items) |store| {
+        if (store.seq > s.done and store.seq < s.seq) pending.append(gpa, .{ store.seq, classBytes(class) }) catch return error.OutOfMemory;
+    };
+    return passFreeing(pending.items, s.stats.pool_bytes, bytes);
+}
+
+/// Of free buffers `pending` (the last pass that binds each, its bytes), the oldest pass after whose end releasing
+/// them brings `held` to `bytes`; null when all of them do not.
+fn passFreeing(pending: [][2]u64, held: u64, bytes: u64) ?u64 {
+    std.mem.sort([2]u64, pending, {}, struct {
+        fn lt(_: void, a: [2]u64, b: [2]u64) bool {
+            return a[0] < b[0];
+        }
+    }.lt);
+    var left = held;
+    for (pending) |p| {
+        left -|= p[1];
+        if (left <= bytes) return p[0];
+    }
+    return null;
 }
 
 /// The largest first; a buffer a pass has yet to run over stays.
@@ -1713,6 +1740,17 @@ test "a long open pass holds no more than it uses plus the bytes it may free bef
     defer release(x);
     const in_use = stats().pool_bytes - stats().pool_free;
     try t.expect(stats().pool_bytes - held0 <= in_use + pass_freed_cap + 2 * 8 * 1024 * 1024);
+}
+
+test "a trim waits for the oldest pass whose end frees enough, not for every pass in flight" {
+    const t = std.testing;
+    // Free buffers as (the last pass that binds each, its bytes), in no order.
+    var pending = [_][2]u64{ .{ 7, 200 }, .{ 3, 50 }, .{ 5, 100 }, .{ 3, 25 } };
+    try t.expectEqual(@as(?u64, 3), passFreeing(&pending, 1000, 925));
+    try t.expectEqual(@as(?u64, 5), passFreeing(&pending, 1000, 850));
+    try t.expectEqual(@as(?u64, 7), passFreeing(&pending, 1000, 625));
+    try t.expectEqual(@as(?u64, null), passFreeing(&pending, 1000, 600));
+    try t.expectEqual(@as(?u64, null), passFreeing(pending[0..0], 1000, 900));
 }
 
 test "the pool keeps no more free bytes than its free cap, as MLX's cache keeps no more than its limit" {

@@ -363,6 +363,10 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   4.95 GB on 2.93 GB in use against a 3.51 GB bill, and the real pack's 8162-row chunk 8.52 GB against 7.03; capped,
   3.48 and 6.84. The trim may wait on the GPU for buffers a pass still binds: ~0.5% on the real pack's 8.5k prefill,
   ~5% on the cut's isolated 4096-row chunk. The STQ 4bpw cut stays inside its bill uncapped.
+- **A trim waits only for the passes that free enough** (`core.pendingFrees`): the oldest pass after whose end the free
+  buffers still bound bring the pool under the cap, not every pass in flight, so the later ones keep the GPU busy while
+  the host builds on. Waiting for all of them drained the queue at each trim: on DeepSeek STQ 1.75bpw (M5 Ultra, 29k
+  tokens) GPU idle 254 to 140 ms a request at 2048-row chunks and 1,063 to 364 ms at 8192 rows.
 - **A wide forward that reads out every row is billed for its readout** (`cooler.readoutCap`): a served chunk sets
   `skip_lm_head`, but `sushi kld` and the decode meter read out the whole chunk, whose logits (`rows x vocab x 2`) and
   head scratch (a trellis GEMM's f16 plane, an affine head's dequantized weight; `Trunk.lmHeadReadoutBytes`) the chunk
