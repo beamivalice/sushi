@@ -7808,3 +7808,17 @@ test "engine affine products give MLX's bytes in bits 2, 4 and 8, groups 32 and 
     };
     try t_std.expectEqual(@as(usize, 0), named_failures);
 }
+
+test "matmul: the TF32 reading takes no armed fault, which the call under test is owed" {
+    try mlx.requireGpu();
+    const matmul = @import("matmul.zig");
+    const was = matmul.tf32_known;
+    defer matmul.tf32_known = was;
+    const first = try matmul.gpu();
+    matmul.tf32_known = null;
+    mlx.fault.arm(1);
+    defer mlx.fault.disarm();
+    const again = try matmul.gpu();
+    try std.testing.expect(!mlx.fault.didFire());
+    try std.testing.expectEqual(first.tf32, again.tf32);
+}

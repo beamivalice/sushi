@@ -72,6 +72,13 @@ fn routed(comptime name: [:0]const u8, comptime F: type) Spread(F, Routed(name, 
     return Spread(F, Routed(name, F).go).pick();
 }
 
+/// Calls the armed `fault` never takes: a test-only reading of MLX on the way to the call under test, which the fault
+/// is owed to.
+pub const past_fault = struct {
+    const Matmul = fn (res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) callconv(.c) c_int;
+    pub const mlx_matmul = Spread(Matmul, Counted("mlx_matmul", Matmul).go).pick();
+};
+
 /// `name` of mlx-c, counted in `calls`.
 fn counted(comptime name: [:0]const u8, comptime F: type) Spread(F, CountedEntry(name, F).go).Fn {
     return Spread(F, CountedEntry(name, F).go).pick();
@@ -81,14 +88,16 @@ fn counted(comptime name: [:0]const u8, comptime F: type) Spread(F, CountedEntry
 fn CountedEntry(comptime name: [:0]const u8, comptime F: type) type {
     return struct {
         inline fn go(args: std.meta.ArgsTuple(F)) @typeInfo(F).@"fn".return_type.? {
-            if (comptime faultable(F)) if (faultAtEntry()) return 1;
+            if (comptime faultable(name, F)) if (faultAtEntry()) return 1;
             return Counted(name, F).go(args);
         }
     };
 }
 
-/// A call `fault` may take: one that reports failure by its `c_int` and carries a stream, so it makes a result.
-fn faultable(comptime F: type) bool {
+/// A call `fault` may take: one that reports failure by its `c_int` and carries a stream, so it makes a result. A call
+/// on the stream handle itself makes none: a fault there would skip a free and take the fault the next op is owed.
+fn faultable(comptime name: []const u8, comptime F: type) bool {
+    if (std.mem.startsWith(u8, name, "mlx_stream_")) return false;
     const info = @typeInfo(F).@"fn";
     if (info.return_type.? != c_int) return false;
     for (info.param_types) |T| if (T == mlx_stream) return true;
@@ -318,7 +327,7 @@ fn Routed(comptime name: [:0]const u8, comptime F: type) type {
         const viaMlx = Counted(name, F).go;
 
         inline fn go(args: Args) R {
-            if (comptime faultable(F)) if (faultAtEntry()) return 1;
+            if (comptime faultable(name, F)) if (faultAtEntry()) return 1;
             if (!engine.enabled) {
                 // A handle of the engine's can outlive the switch in a cache; MLX's free would read memory MLX never made.
                 if (comptime std.mem.eql(u8, name, "mlx_array_free")) if (engine.isOurs(args[0])) return engine.mlx_array_free(args[0]);

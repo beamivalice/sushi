@@ -107,7 +107,9 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   fixture of the same arch (`firstAsks`); a sweep of one step (an image splice, an SSD restore, a rows tick) refuses only
   the sites that step adds to a plain request's. A speculative round's sweep tells sites apart over eight frames: at
   the default four, a verify forward asks at a prefill chunk's sites, so the plain request's set takes them all. A load sweep refuses each step of the load at its first and last
-  call, and each step of its warm at its first.
+  call, and each step of its warm at its first. A checked call is one that makes a result on a stream: a call on the
+  stream handle itself is not (a fault there skipped its free), and a test-only reading made on the way to the call
+  under test (the TF32 probe) goes past the fault (`mlx.past_fault`), so a test passes alone as in the suite.
   Its no-late-kernel test proves its property only on a fresh pipeline cache (run it alone): the cache is the process's.
 - **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device
   profile and the engine dispatch as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`). A test about one arm's bytes names it

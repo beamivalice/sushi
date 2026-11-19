@@ -22,7 +22,7 @@ pub const Gpu = struct { class: device.Class, gen: u32, nax: bool, tf32: bool };
 
 /// Whether MLX takes f32 products on TF32 tiles, read once: MLX keeps its first reading of the variable for the process,
 /// and its tiles follow the chip, so the chip's units decide how it is read, not what the profile withholds.
-var tf32_known: ?bool = null;
+pub var tf32_known: ?bool = null;
 
 fn atoi(text: []const u8) i64 {
     var end: usize = 0;
@@ -62,7 +62,8 @@ fn mlxTf32() !bool {
     defer _ = mlx.mlx_stream_free(gpu_stream);
     var squared = mlx.raw.mlx_array_new();
     defer _ = mlx.raw.mlx_array_free(squared);
-    try mlx.check(mlx.raw.mlx_matmul(&squared, x, x, gpu_stream));
+    // The call under test may be the first to read this: the fault it is armed for is its own.
+    try mlx.check(mlx.past_fault.mlx_matmul(&squared, x, x, gpu_stream));
     try mlx.check(mlx.raw.mlx_array_eval(squared));
     const got = mlx.mlx_array_data_float32(squared) orelse return error.NotEvaluated;
     return got[0] == n;
