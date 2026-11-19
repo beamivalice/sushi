@@ -287,6 +287,13 @@ prompt, one boot per arm. At S=1 the default 16 splits launch exactly 32 threadg
   With MTP off, which removes acceptance noise: 25.08 against 24.73 and 24.56 (A B A).
 - MTP depth is a measured row, not the generic cap 6: forced depth 1..6 read 32.2 / 33.9 / 35.0 / 31.9 / 29.3 / 27.5
   tok/s on the same prompt. `--mtp` with no bounds now caps at 3 on this chip (`src/mtp.zig`); the launcher keeps pinning 2.
+- The cold 16.5k prefill wall is ~328-333 tok/s and no launch lever moved it: `--qwen-mlx-engine` 321.9 (decode
+  38.5, also slower), `--prefill-chunk 8192` 329.6, `QWEN4_PLE_PREFETCH_PREFILL=1` 332.6, against 328.9 for the
+  control (no prefix cache, distinct prompts, one boot per arm). The routed window replay bound is in
+  [engine-exl3-experts](engine-exl3-experts.md).
+- Batching does not buy throughput: 2 and 4 concurrent 256-token streams moved the aggregate 23.4 → 25.3 → 25.2
+  tok/s (+8%, prefill included), and 8 streams collapsed to 9.2 with two zero-token replies. The launcher's
+  `--max-concurrent 4` is the right cap on this GPU.
 - Greedy text diverges with the split count (the merge order changes, as at every nsplit); these cells are rates, not
   a byte gate. BK stays 16: the BK=8 seam fails the kernel's launch check on 1.7.0 (MlxError), so it is not an arm.
 

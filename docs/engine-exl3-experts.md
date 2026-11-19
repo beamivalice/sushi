@@ -232,6 +232,11 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   so the ceiling of sharing decodes is below the register cost of four 16x32 accumulators.
 - Dead for prefill routing: a counting sort (histogram, scan, stable scatter) in place of the argsort, exact with
   ties: -0.03 to -0.16 ms per MoE layer as a component, yet Qwen 2.6bpw prefill 5-10% slower in an A B B A (de867e94 era).
+- **The routed window replay is bounded on a non-NAX M1 Max** (2026-11-19, Flash-Next STQ 2.75bpw, 16.5k cold
+  prefill, `--prefix-cache-disk 0`, one boot per arm): 32-row windows 327 tok/s, 16 rows 298 (-9%), 8 rows 254
+  (-22%). Narrowing the window multiplies the per-expert replays (~1.7x and ~3.3x at chunk 4096), so the replay is
+  about 10-14% of prefill; a one-window pre-decode is therefore a <=10% lever before its own slab traffic and GEMM
+  bill, and 64-row windows already lose to register pressure (+9-13% above). Not built.
 - **The SwiGLU chain is f32**: gate, up, sigmoid, SiLU and their product stay in f32 registers through the multiply
   by the down suh. In f16, MiMo's activations put gate and up near 400 each and the product past 65504, so a whole
   routed row became inf. The next ceiling is the f16 down inner plane (about 2x above the measured peak).
