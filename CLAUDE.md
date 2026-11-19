@@ -264,8 +264,9 @@ landing's subset, the full suite at a series' end, `tests/gate.sh` on the commit
 knowledge in the matching doc in the branch.
 
 **Bug hunt** ([process-bug-hunt](docs/process-bug-hunt.md)). New code is closed by a hunt before its phase is called done.
-- Hunters, one surface each, each in its own worktree at the head, write and run scratch tests on the tiny
-  fixtures; they report, never fix, and name the bug class and its sibling sites for every finding.
+- Three hunters unless the owner sets otherwise, one surface each, each in its own worktree at the head, write and
+  run scratch tests on the tiny fixtures; they report, never fix, and name the bug class and its sibling sites for
+  every finding.
 - The coordinator synthesizes: per component, refactor when the class repeats, has siblings or is made possible by
   the structure; a normal fix only for a one-off. The long-term codebase decides, not today's diff.
 - A finding closes by a fix with its regression test, or a test proving the contract: never by argument, never by
