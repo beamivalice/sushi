@@ -80,7 +80,9 @@ bill function's output on the committed fixture configs of all served packs: a b
   load line): the arch's start width (DeepSeek's 2048) or `--prefill-chunk`, never the global default. The warm took the
   generic 8192 on DeepSeek, a width no DeepSeek request forwards at, and at `--ssd-budget-gb 108` it reset the Mac.
 - **A live check never grows past what the machine can still give** (`liveGpuMemoryCeiling`: the ceiling above, capped at
-  the process's GPU footprint plus `getAvailableMemBytes`' reclaimable pages less `--wired-margin-gib`). Request
+  the process's GPU footprint plus `getAvailableMemBytes`' reclaimable pages less `LIVE_RESERVE_BYTES`, 1 GiB).
+  `--wired-margin-gib` is not taken there again: the reclaimable pages already leave out what other processes hold, and
+  the margin keeps their room under the declared limit; taken twice, a 16 GiB margin left no prefill width (issue 105). Request
   admission, the prefill chunk's width (the served warm's included), an image encode and DeepSeek's borrow read it; the
   load and the advertised context keep the declared floor. A raised limit lifts the plan over other processes' pages but
   frees none: on a 128 GB M5 at `iogpu.wired_limit_mb=125000` with the owner's apps open, DeepSeek at `--ssd-budget-gb

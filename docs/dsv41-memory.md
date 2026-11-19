@@ -343,8 +343,10 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
 - Before every forward wider than 17 rows, its need, `Config.forwardCap(rows, seq)` (4.35 GB at 2048 rows on the STQ pack),
   against the live headroom (ceiling less MLX's active bytes). Short of it, whole decoder pools go, latest layer first
   (39 down to the CED split, 20): the plan is made from the pools' bytes before anything is released, a forward the
-  pools cannot cover is refused (`PrefillDoesNotFit`) with nothing released, and the live headroom is re-read after each
-  release (a short count takes the next pool too).
+  pools cannot cover is refused (`PrefillDoesNotFit`) with nothing released. The planned pools go, the forward waits for
+  the kernel to unwire them, and only then is the live headroom re-read: freed pages count in it once unwired, so a
+  reading inside the release loop stays flat and released every pool (issue 105). Still short, one more pool goes and
+  is waited for (`releaseUntil`).
 - A release drops the layer's bank, waits for the slabs' holder to let go of each (MLX, or on a Cooler load the
   engine, whose own wait is enough) and unmaps it: the active count falls by exactly the pool's bytes (tested), and the forward waits up to 1 s for 90% of them to leave the wired set.
 - Under CED a decoder layer runs only the chunk's last 128 rows, so a released layer reads that chunk's picks (~130

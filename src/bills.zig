@@ -611,12 +611,17 @@ pub fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem
 /// unplanned margin (`--wired-margin-gib`) the kernel and other processes keep. A raised `iogpu.wired_limit_mb` lifts
 /// the planning ceiling over other processes' pages; it does not free them, and growth past them takes the machine down.
 pub fn liveGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
-    return liveCeilingFrom(currentGpuMemoryCeiling(config, active_mem), active_mem +| @as(u64, gpu_mem.cacheBytes()), metrics.getAvailableMemBytes(), launch_state.wired_limit_margin_bytes);
+    return liveCeilingFrom(currentGpuMemoryCeiling(config, active_mem), active_mem +| @as(u64, gpu_mem.cacheBytes()), metrics.getAvailableMemBytes());
 }
 
+/// What a live check leaves of the reclaimable pages for the kernel: the 1 GiB the r-65 guard was proven at.
+/// `--wired-margin-gib` is not taken here: the reclaimable pages already exclude what other processes hold, and
+/// the margin keeps their room under the declared limit (`wiredLimitFloor`).
+pub const LIVE_RESERVE_BYTES: u64 = 1 << 30;
+
 /// PURE half of `liveGpuMemoryCeiling`.
-pub fn liveCeilingFrom(ceiling: u64, footprint: u64, reclaimable: u64, margin: u64) u64 {
-    return @min(ceiling, footprint +| (reclaimable -| margin));
+pub fn liveCeilingFrom(ceiling: u64, footprint: u64, reclaimable: u64) u64 {
+    return @min(ceiling, footprint +| (reclaimable -| LIVE_RESERVE_BYTES));
 }
 
 pub fn expertStreamingLoadFits(ceiling: u64, active_mem: u64, resident_bytes: u64, cache_bytes: u64, bounce_bytes: u64, fill_peak_bytes: u64, serving_bytes: u64) bool {

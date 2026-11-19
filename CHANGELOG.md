@@ -6,6 +6,14 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A raised `--wired-margin-gib` no longer stops a model from loading**: 1.7.0 took the margin off the memory still
+  free as well as off the wired limit, so a margin that left room for other apps' models on 1.6.0 left no room for a
+  prefill and the load failed (`WarmChunkDoesNotFit`). The margin now applies once, under the wired limit, as before,
+  and a load that still finds no room says which numbers it compared (#105).
+- **DeepSeek no longer releases every decoder layer to fit one prefill chunk**: it read the free memory before macOS had
+  given back what it released, so it kept releasing, failed the request (`PrefillDoesNotFit`) and spent seconds
+  reloading the layers. It now waits for each release to land before deciding it needs more (#105).
+
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many
   images is no longer refused at 64 MB, and a refusal names the limit and the setting. Thanks @Cianidos for the request

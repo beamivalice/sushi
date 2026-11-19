@@ -54,14 +54,13 @@ test "DeepSeek's live headroom under a raised wired limit is what the machine ca
     const MiB: u64 = 1 << 20;
     const GB: u64 = 1_000_000_000;
     // r-65, the M5 at --ssd-budget-gb 108: iogpu.wired_limit_mb=125000 less the 1 GiB margin, every expert cached
-    // (112.83 GB active), and the owner's apps holding the rest of the 128 GB, so 3 GB reclaimable, 1 GiB of it kept.
+    // (112.83 GB active), and the owner's apps holding the rest of the 128 GB, so 3 GB reclaimable, the live reserve of it kept.
     const declared: u64 = 123_976 * MiB;
     const active: u64 = 112_828_234_064;
     const footprint: u64 = active + 400 * MiB;
     const reclaimable: u64 = 3 * GB;
-    const margin: u64 = 1 << 30;
-    const live = bills.liveCeilingFrom(declared, footprint, reclaimable, margin);
-    try t.expectEqual(footprint + reclaimable - margin, live);
+    const live = bills.liveCeilingFrom(declared, footprint, reclaimable);
+    try t.expectEqual(footprint + reclaimable - bills.LIVE_RESERVE_BYTES, live);
     // The served warm's widest chunk is what that headroom holds: never the 8192 rows the declared limit admitted,
     // whose ~13 GB took the box down.
     const at_declared = bills.widestChunkAdmitted(&config, 16, 8192, bills.prefillHeadroomFrom(declared, active, 0));
@@ -70,7 +69,30 @@ test "DeepSeek's live headroom under a raised wired limit is what the machine ca
     try t.expect(at_live < 8192);
     try t.expect(at_live == 0 or bills.prefillChunkCost(&config, 16, at_live, 0) <= live - active);
     // With the memory free, the declared limit stands.
-    try t.expectEqual(declared, bills.liveCeilingFrom(declared, footprint, 40 * GB, margin));
+    try t.expectEqual(declared, bills.liveCeilingFrom(declared, footprint, 40 * GB));
+}
+
+test "issue 105: a raised --wired-margin-gib lowers the declared ceiling only; the live headroom keeps its own reserve, so the served warm still finds DeepSeek's 2048-row chunk" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.cooler_for_test = true;
+    config.expert_borrow_bytes = 0;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    // The report: an M5 at iogpu.wired_limit_mb=124518 with --wired-margin-gib 16 for other apps' models, DeepSeek STQ
+    // 1.75 at --ssd-budget-gb 100 loaded (~99.4 GB active), and ~10.4 GiB still reclaimable.
+    const margin: u64 = 16 * GiB;
+    const declared: u64 = bills.wiredLimitFloor(124_518 * MiB, 128 * GiB, margin);
+    try t.expectEqual(@as(u64, 108_134 * MiB), declared);
+    const active: u64 = 99_400 * MiB;
+    const footprint: u64 = active + 400 * MiB;
+    const reclaimable: u64 = 10_600 * MiB;
+    const live = bills.liveCeilingFrom(declared, footprint, reclaimable);
+    const width = bills.widestChunkAdmitted(&config, 16, 8192, bills.prefillHeadroomFrom(live, active, 0));
+    try t.expect(width >= 2048);
 }
 
 test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024, then 512, never wider" {

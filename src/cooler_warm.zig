@@ -56,7 +56,14 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
     const kv = bills.configuredKvQuantFor(c);
     const headroom = bills.prefillHeadroomNow(c, 0);
     const chunk = bills.widestChunkAdmitted(c, if (kv.scheme == .off) 16 else kv.bits, top, headroom);
-    if (chunk == 0) return error.WarmChunkDoesNotFit;
+    if (chunk == 0) {
+        const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+        const floor = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
+        log.warn("[warm] no prefill chunk fits beside the load: the narrowest ({d} rows) needs {d} MB, the live headroom is {d} MB (reclaimable {d} MB less the {d} MB live reserve, under the ceiling --wired-margin-gib {d} GiB sets); a lower --ssd-budget-gb leaves room\n", .{
+            floor, bills.prefillChunkCost(c, bits, floor, 0) >> 20, headroom >> 20, @import("status.zig").getAvailableMemBytes() >> 20, bills.LIVE_RESERVE_BYTES >> 20, bills.launch_state.wired_limit_margin_bytes >> 30,
+        });
+        return error.WarmChunkDoesNotFit;
+    }
     log.info("[warm] the widest chunk is {d} rows of {d}: headroom {d} MB\n", .{ chunk, top, headroom >> 20 });
     const past_budget: usize = if (c.indexer_budget > 0) c.indexer_budget + 300 else 0;
     const longest = @max(past_budget, chunk + 1);
