@@ -134,20 +134,20 @@ pub fn seedCapBuf(s: mlx.mlx_stream, src: mlx.mlx_array, axis: usize, reserve: u
     const nd: usize = sh.len;
     std.debug.assert(nd <= 4 and axis < nd);
     const held: usize = @intCast(sh[axis]);
-    // No reservation (or one the history exceeds): the tight copy is the right buffer.
-    if (reserve <= held) return materializedOwnedCopy(s, src);
+    // No reservation (or one the history exceeds): the history's own rows, still on the page grid, since a clamp
+    // republishes fewer rows over the same buffer and the appends then write into it.
     var shape = [_]c_int{ 0, 0, 0, 0 };
     var stop = [_]c_int{ 0, 0, 0, 0 };
     for (sh, 0..) |d, i| {
         shape[i] = d;
         stop[i] = d;
     }
-    shape[axis] = @intCast(pagedAxis(s, src, axis, reserve));
+    shape[axis] = @intCast(pagedAxis(s, src, axis, @max(reserve, held)));
+    if (shape[axis] == sh[axis]) return materializedOwnedCopy(s, src);
     const start = [_]c_int{ 0, 0, 0, 0 };
     const strides = [_]c_int{ 1, 1, 1, 1 };
-    var grown = mlx.mlx_array_new();
+    const grown = try @import("mlx_pages.zig").inPlaceBuffer(shape[0..nd], mlx.mlx_array_dtype(src), s);
     defer _ = mlx.mlx_array_free(grown);
-    try mlx.check(mlx.mlx_zeros(&grown, &shape, nd, mlx.mlx_array_dtype(src), s));
     var seeded = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(seeded);
     try mlx.check(mlx.mlx_slice_update(&seeded, grown, src, &start, nd, &stop, nd, &strides, nd, s));
@@ -1630,4 +1630,37 @@ test "a short Flash-Next request's QSA pooled bank holds no more tokens' blocks 
     const blocks: u64 = @intCast(mlx.getShape(buf)[1]);
     const state_rows = @max(bills.cacheCapacityTokens(&cfg, @intCast(seq), 1, 2048, ctx, 0, null), @as(u64, @intCast(seq)));
     try testing.expect(blocks * 4 <= state_rows);
+}
+
+test "a seedCapBuf copy with no reservation, resliced below its rows, appends in place when MLX's pool holds buffers a page past it" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    // 1,100 pooled rows of 256 B: 17.2 pages, malloc'd as 18; a free 19-page buffer is theirs.
+    var held = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(held);
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    try mlx.check(mlx.mlx_ones(&held, &[_]c_int{ 1, 1100, 128 }, 3, .bfloat16, s));
+    try mlx.check(mlx.mlx_ones(&row, &[_]c_int{ 1, 1, 128 }, 3, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(held));
+    try mlx.check(mlx.mlx_array_eval(row));
+    try test_support.seedMlxPool(s, 19 * 16384, 32);
+    // No reservation (reserve <= held): the history's own rows.
+    var buf = try seedCapBuf(s, held, 1, 0);
+    defer _ = mlx.mlx_array_free(buf);
+    try mlx.check(mlx.mlx_array_eval(buf));
+    var view: mlx.mlx_array = .{ .ctx = null };
+    defer _ = mlx.mlx_array_free(view);
+    // A clamp (`qsaResliceToKeep`) republishes fewer rows over the same buffer.
+    var count: c_int = 1070;
+    var first: ?[*]const u8 = null;
+    var moved: usize = 0;
+    for (0..6) |step| {
+        try capBufAppend(s, &buf, &view, &count, row, 1, .{}, 1);
+        try mlx.check(mlx.mlx_array_eval(buf));
+        try mlx.check(mlx.mlx_synchronize(s));
+        const p = mlx.mlx_array_data_uint8(buf);
+        if (step == 0) first = p else if (p != first) moved += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), moved);
 }
