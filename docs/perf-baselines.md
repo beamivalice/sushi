@@ -425,6 +425,39 @@ is the same on the three sides. About 160 of a request's 210 rounds are plain on
   against 296 to 302): a wide chunk's Engram rows are read without `F_RDADVISE` since `0d43d77d`.
 - The decode right after the prefill (position 1): 39.3, 39.7 and 47.2 tok/s at 1399, 1404 and 1298 GPU mJ/token.
 
+## DeepSeek-V4.1 STQ on the M5 Ultra 256 GB: resident, Sushi Cooler (2026-11-19)
+
+The pack loads resident at the 256 GB default budget (every expert in its pool, no SSD reads). A number here compares
+only with this box's.
+
+**Fast bench, the box's first** (`tests/bench.sh --tag ultra-base --rungs 4k,8k` over the pack, `--ctx-size 1000000
+--max-tokens 128000`, commit `3f9bfd61` = main `07ff5fe7` plus the box's bench change, binary SHA-256 `51b18bb2a6c9b8a3`,
+AC, `taskpolicy -a`, GPU lock, no cooldown, GPU 1620 MHz, Nominal throughout):
+
+| rung | code decode | prose decode | code prefill | prose prefill |
+|---|---:|---:|---:|---:|
+| 4k | 132.6 | 61.4 | 2,437 | 1,950 |
+| 8k | 140.2 | 76.4 | 2,392 | 2,011 |
+
+**Where a decode token goes** (`SUSHI_DECODE_FWD_UBENCH` 200, S=1,3, 4096 keys, same commit): 16.15 ms a one-row
+forward over 1,193 dispatches, GPU busy 97%; three rows 23.84 ms. The bytes a token reads (~5.6 GB) take ~5 ms at this
+box's ~1 TB/s, so decode runs at a third of the roofline: kernels that stream (the routed chain, `wq_b`, `wo_a`, `wo_b`,
+the head) run 2-2.5x the M5 Max's, while latency-bound ones (one token's attention 42.7 against 36.8 us, a dependent
+dispatch 8.4 against 7.8 us) are slower. Fewer launches pay here first.
+
+**The shared expert on the routed launches at a resident layer** (decode meter as above, arms interleaved A B A B one
+boot each, base `79d8584c`, the change on it; the same output bytes): one row 16.12 / 16.12 to 14.82 / 14.81 ms
+(-8.1%), three rows 23.78 / 23.73 to 22.57 / 22.55 ms (-5.0%); 1,193 to 913 dispatches a forward. Micro indicator
+(`shared.shared_expert_fold`, model dsv41, contended look): 138.1 to 117.6 us a layer at one row. Fast bench (tag
+`ultra-ride`, the same flags, branch head `6becd306` on main `79d8584c`), beside the table above, recorded, not rerun:
+code decode 138.4 / 146.4 at 4k / 8k (+4.4%), prose 66.3 / 80.2 (+8.0%, +5.0%), no kernel compiled inside a request.
+Its prefill (code 2,555 / 2,529, prose 2,287 / 2,331) is not this change's: the table's run was the box's first load,
+its Engram rows cold, on an older main.
+
+**Ruled out here** (`sushi-ubench run dsv41.wo_pair`, 15 rounds, quiet, `7424e2c0`): `wo_b` reading `wo_a`'s partials
+ties the two launches at one row (49.4 against 50.1 us) and loses from two rows (74.9 against 69.0), where it is not
+served: the choice stands on this GPU.
+
 ## DeepSeek-V4.1 STQ on an M1 Max 32 GB: Sushi Cooler against MLX (2026-11-15)
 
 The first run on a GPU without matrix units. M1 Max (`applegpu_g13s`, 32 GPU cores) 32 GB, macOS 26.5.2, STQ 1.75bpw on

@@ -2769,6 +2769,7 @@ fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.
     const se = sharedBank(ly) orelse return null;
     const epi: ?exl3.rate_groups.StreamExpand = if (expand) |e| .{ .x = e.x, .post = e.post, .comb = e.comb } else null;
     const y = try exl3.rate_groups.moeDecodeClampedSharedFusedKeep(sc.s, x, rb, flat, scores, k, .float32, se, limit, epi, keep) orelse return null;
+    shared_rides += 1;
     return try sc.keep(y);
 }
 
@@ -2982,19 +2983,31 @@ fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) 
     return ly.shared[2].apply(sc, act);
 }
 
-/// Whether the layer's routed chain, queued from the cache map, writes the new hyper-connection stream itself: a trellis
-/// layer of the backbone at decode width, where `hcExpand` is the kernel and nothing reads the sum.
+/// Whether layer `li`'s experts are all resident, so its picks map to slots on the GPU and the host never reads them.
+fn residentLayer(m: *const Model, li: usize) bool {
+    if (li >= m.cfg.layers) return false;
+    const hk = switch (m.experts) {
+        .hook => |hk| hk,
+        .resident => return false,
+    };
+    const f = hk.slot_map orelse return false;
+    return f(hk.ctx, li, false).ctx != null;
+}
+
+/// Whether the layer's routed chain, queued from the cache map or mapped on a resident layer, writes the new
+/// hyper-connection stream itself: a trellis layer of the backbone at decode width, where `hcExpand` is the kernel and
+/// nothing reads the sum.
 fn foldsExpand(m: *const Model, sh: *const Shared, li: usize, x1: A) bool {
     const rows = dim(x1, 0);
-    return m.fused and mlx.streamIsGpu(m.s) and sh.spec_on and sh.img.ctx == null and m.experts == .hook and m.cfg.expert_dec != null and
+    return m.fused and mlx.streamIsGpu(m.s) and (sh.spec_on or (residentLayer(m, li) and m.layers[li].shared[0].stq != null)) and sh.img.ctx == null and m.experts == .hook and m.cfg.expert_dec != null and
         li < m.cfg.layers and rows <= exl3.kernels.DECODE_ROWS_MAX and m.trace == null and m.tap == null and prof(m, rows) == null and
         kernels.hcExpandServes(x1) and mlx.mlx_array_dtype(x1) == m.act;
 }
 
 /// `r`: the router's picks, made in the caller's scope so the hc split they may carry outlives this one.
 /// `ride`: arrays independent of the router (the FFN's hc split) that go out with its picks.
-/// `expand`: the stream the sum is expanded into, which only the route-spec queue takes (`foldsExpand`); the result is then
-/// the new stream.
+/// `expand`: the stream the sum is expanded into, which the route-spec queue and a resident layer take (`foldsExpand`);
+/// the result is then the new stream.
 fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Routes, ride: []const A, expand: ?Expand) !A {
     const c = &m.cfg;
     const ly = &m.layers[li];
@@ -3032,10 +3045,12 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
         // layer is only submitted: the next layer's picks depend on it, so their read is the one wait per layer.
         const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
         if (early) try submitWith(r.idx, ride);
-        // A wide chunk's shared expert rides the routed launches when the trellis chain takes it there.
+        // A wide chunk's shared expert rides the routed launches when the trellis chain takes it there, and so does a
+        // resident layer's at decode widths: no host read of its picks waits for a chain of its own to hide behind.
         const wide = m.tap == null and m.shared_fold and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX and ly.shared[0].stq != null;
-        const sy: SharedOp = if (wide) .{ .layer = .{ .m = m, .li = li } } else .{ .array = try sharedExpert(sc, m, li, ly, h) };
-        if (!wide) {
+        const rides = !wide and m.tap == null and pf == null and ly.shared[0].stq != null and residentLayer(m, li);
+        const sy: SharedOp = if (wide) .{ .layer = .{ .m = m, .li = li } } else if (rides) .{ .layer = .{ .m = m, .li = li, .expand = expand } } else .{ .array = try sharedExpert(sc, m, li, ly, h) };
+        if (sy == .array) {
             if (early) try submit(sy.array);
             if (pf) |p| try p.mark(.shared, &.{sy.array});
         }
@@ -4327,8 +4342,10 @@ const Unresolved = struct {
     }
 };
 
-/// Layers whose queued routed chain wrote the new stream itself (`foldsExpand`); a test counts a pass's.
+/// Layers whose queued or resident routed chain wrote the new stream itself (`foldsExpand`); a test counts a pass's.
 pub var expands_folded: u64 = 0;
+/// Decode-width layers whose shared expert ran on the routed chain's launches.
+pub var shared_rides: u64 = 0;
 pub var spec_kept: u64 = 0;
 pub var spec_rebuilt: u64 = 0;
 /// Rebuilt layers that recomputed only the picks that missed, and the picks of the rebuilt layers that were recomputed.

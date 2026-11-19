@@ -929,8 +929,9 @@ trellis bank); the FFN is the routed sum plus the shared expert, which at decode
 trellis chain (`sharedFused`: pair GEMV, fused mid and down, reduce; the clamped SwiGLU stays in f32) and over more rows the
 three linears and the SwiGLU ops; the routed decode reduce adds it in f32 (`stqRouted`), the byte-equal of a separate add.
 On the route-spec queue and in the DSpark stage layers the shared expert rides the routed chain's own launches (5 fewer
-launches a layer, byte-identical; [engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)); the waiting schedule keeps
-it a chain of its own. A wide chunk (resident or streamed) hands `stqRouted` the layer, not the finished expert: its token
+launches a layer, byte-identical; [engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)), and so does a resident
+layer's at decode widths, whose reduce also writes the new stream (`residentLayer`: its picks map to slots on the GPU, so no
+host read waits for a chain to hide behind); the waiting schedule of a streamed layer keeps it a chain of its own. A wide chunk (resident or streamed) hands `stqRouted` the layer, not the finished expert: its token
 prepare, SwiGLU middle and finish ride the routed prefill launches ([engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-prefill)).
 Trunk linears take the multi-row kernel up to 8 rows. Up to 8 rows, `wq_a` and `wkv` (and a ratio-1 KV source's compressor
 `wkv`) run as one stacked launch, as do a pooling compressor's `wkv` and `wgate` (`Layer.in_shared`, `CompW.shared`,

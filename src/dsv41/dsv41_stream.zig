@@ -1138,9 +1138,9 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the waiting
         const rebuilt = model.spec_rebuilt - rebuilt0;
         const redone = model.spec_redone - redone0;
         if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 stq route-spec prepared {?} slots {d}: {d} layers kept, {d} rebuilt, {d} of them recomputing only the missed picks ({d} of {d} picks)\n", .{ prepared, slots, kept, rebuilt, redone, model.spec_redo_picks - redo_picks0, model.spec_rebuilt_picks - rebuilt_picks0 });
-        // The eager pack's decode layers write their stream in the reduce.
+        // The decode layers write their stream in the reduce, queued from the cache map or resident (8 slots).
         // A GPU whose f32 matmul is true f32 fails the expand kernel's probe and keeps the chain, so no layer folds.
-        try testing.expectEqual(slots != 8 and @import("dsv41_kernels.zig").hcExpandProbed(), model.expands_folded > folded0);
+        try testing.expectEqual(@import("dsv41_kernels.zig").hcExpandProbed(), model.expands_folded > folded0);
         if (slots == 8) {
             try testing.expectEqual(@as(u64, 0), kept + rebuilt);
         } else {
@@ -2118,6 +2118,45 @@ test "dsv41 resident: a budget that holds every expert reads them all at load, m
         // Only the released layer's picks and its restore read the SSD.
         if (step == 0) try testing.expectEqual(loaded, engine.fill_bytes_total);
     }
+}
+
+test "dsv41 resident: a decode-width layer runs the shared expert on the routed launches and writes its stream in the reduce, the separate chain's bytes (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.plain(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    // The serving geometry's prepared chain is the one the shared expert rides.
+    exl3.rate_groups.prepared_force = true;
+    defer exl3.rate_groups.prepared_force = null;
+    // The waiting schedule runs the shared expert as a chain of its own.
+    var separate: StqServed = undefined;
+    try separate.init(dir, .bfloat16, true, false, 3, s);
+    defer separate.deinit();
+    separate.m.route_spec = false;
+    var resident: StqServed = undefined;
+    try resident.initBytes(dir, .bfloat16, true, false, 1 << 40, s);
+    defer resident.deinit();
+    const rides0 = model.shared_rides;
+    const folded0 = model.expands_folded;
+    var at: usize = 0;
+    for ([_]usize{ 20, 1, 1, 3, 1, 16, 1 }) |n| {
+        const take = @min(n, ids.len - at);
+        if (take == 0) break;
+        const a = try model.extend(separate.m, ids[at..][0..take], .all);
+        defer _ = mlx.mlx_array_free(a);
+        const b = try model.extend(resident.m, ids[at..][0..take], .all);
+        defer _ = mlx.mlx_array_free(b);
+        at += take;
+        try expectSameBits(&sc, a, b);
+    }
+    try testing.expect(model.shared_rides > rides0);
+    // A GPU whose f32 matmul is true f32 fails the expand kernel's probe and keeps the chain, so no layer folds.
+    try testing.expectEqual(@import("dsv41_kernels.zig").hcExpandProbed(), model.expands_folded > folded0);
 }
 
 /// A resident pair, streamed and resident, of the tiny STQ pack, the resident one releasable from its CED split.

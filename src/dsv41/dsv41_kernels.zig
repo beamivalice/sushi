@@ -2951,6 +2951,9 @@ pub fn hcNorm(sc: *Scope, z: A, x: A, cpre: A, norm_w: A, iters: usize, eps: A) 
 /// Whether `hcExpandFused` reproduces this GPU's `hcExpandOps` byte for byte; set by `probeHc`.
 var hc_expand_tf32 = false;
 
+/// Tests only: the probe's verdict, so a test that counts work pins both expand arms on any GPU.
+pub var hc_expand_probe_override: ?bool = null;
+
 pub fn hcExpandProbed() bool {
     return hc_expand_tf32;
 }
@@ -3056,7 +3059,7 @@ pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
     // GPU that granted fewer than the widest group is held to it (the widest is the bytes every pack was made on).
     while (hc_tg < hc_tg_widest and hc_tg > 32 and !try hcStageAgrees(gpa, s, hc, D, iters)) hc_tg /= 2;
     if (hc_tg < hc_tg_widest) log.info("[dsv41] hyper-connection kernels run {d} threads a group on this GPU (widest {d})\n", .{ hc_tg, hc_tg_widest });
-    hc_expand_tf32 = hc == 4 and probeHcExpand(gpa, s, D);
+    hc_expand_tf32 = hc_expand_probe_override orelse (hc == 4 and probeHcExpand(gpa, s, D));
 }
 
 /// An f32 array of the shape, uniform in [-scale, scale] (or [0, scale]) from a fixed generator.
