@@ -6,6 +6,15 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (refreshed at the cut):
+
+| Severity | Memory & admission | Refusals & UI | Server & API | Engine & tests | Total |
+|---|---|---|---|---|---|
+| High | 7 / 13 | 3 / 3 | 4 / 6 | 0 / 0 | 14 / 22 |
+| Medium | 6 / 10 | 1 / 1 | 4 / 9 | 0 / 1 | 11 / 21 |
+| Low | 2 / 5 | 4 / 4 | 3 / 9 | 3 / 4 | 12 / 22 |
+| Total | 15 / 28 | 8 / 8 | 11 / 24 | 3 / 5 | 37 / 65 |
+
 - **A reply cancelled mid-stream no longer says it ran out of tokens**: a request stopped by `POST /v1/slots/cancel`
   (or the dashboard's Cancel) ended with `finish_reason: length` (Responses: incomplete, `max_output_tokens`) and zero
   usage on every surface; it now ends as cancelled, and its usage counts the tokens it returned.
@@ -97,6 +106,15 @@ earlier history is mlx-serve's, in that project's changelog.
   a DeepSeek-V4.1 pack without `--ssd-budget-gb` used to exit with no message and now asks for it.
 
 ## v1.7.1 — Sushi Cooler, made right: memory, refusals, long conversations
+
+Bugs fixed in this release, by severity and area:
+
+| Severity | Memory & admission | Refusals & UI | Server & API | Engine & tests | Total |
+|---|---|---|---|---|---|
+| High | 14 | 13 | 5 | 4 | 36 |
+| Medium | 10 | 8 | 1 | 8 | 27 |
+| Low | 7 | 2 | 2 | 8 | 19 |
+| Total | 31 | 23 | 8 | 20 | 82 |
 
 - **Every request stays inside the memory it was admitted with**: Qwen3.8's speculative requests are now billed for what
   their draft rounds hold (a short one needs up to about 560 MB more free; the advertised context does not move),
