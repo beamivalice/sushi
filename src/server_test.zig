@@ -533,11 +533,23 @@ fn readExact(fd: std.posix.fd_t, out: []u8) !void {
     }
 }
 
-/// Sets a declared `iogpu.wired_limit_mb` whose floor (the limit less the margin) is `floor` bytes; null restores both.
-fn setWiredFloor(floor: ?u64) void {
-    const limit_mb: u64 = 120_000;
-    bills.wired_limit_mb_override = if (floor != null) limit_mb else null;
-    server_state.wired_limit_margin_bytes = if (floor) |f| (limit_mb << 20) - f else server_state.WIRED_LIMIT_MARGIN_BYTES;
+/// Declares an `iogpu.wired_limit_mb` whose floor (the limit less the margin) is `floor` bytes, refused when the bill
+/// would read another: a cell under a floor it does not have tests nothing. The limit is the box's RAM, since a floor
+/// is also at most the RAM less the margin (`bills.wiredLimitFloor`). `clearWiredFloor` restores both.
+fn setWiredFloor(floor: u64) !void {
+    const total = @import("status.zig").getTotalMemBytes();
+    const limit_mb: u64 = total >> 20;
+    bills.wired_limit_mb_override = limit_mb;
+    server_state.wired_limit_margin_bytes = (limit_mb << 20) - floor;
+    const unplanned = bills.wiredUnplannedBytes(server_state.wired_limit_margin_bytes, bills.gpu_floor_bytes.load(.monotonic));
+    if (bills.wiredLimitFloor(bills.wiredLimitBytes(), total, unplanned) == floor) return;
+    clearWiredFloor();
+    return error.WiredFloorNotDeclared;
+}
+
+fn clearWiredFloor() void {
+    bills.wired_limit_mb_override = null;
+    server_state.wired_limit_margin_bytes = server_state.WIRED_LIMIT_MARGIN_BYTES;
 }
 
 test "server: a Responses WebSocket turn refused before it runs ends in the error frame, whichever check refused it" {
@@ -560,11 +572,11 @@ test "server: a Responses WebSocket turn refused before it runs ends in the erro
         fn run() !void {
             const fd = try wsConnect();
             defer _ = std.c.close(fd);
-            defer setWiredFloor(null);
+            defer clearWiredFloor();
             const ctx_was = server_state.server_config.max_context_size;
             defer server_state.server_config.max_context_size = ctx_was;
             for (cases) |c| {
-                if (std.mem.eql(u8, c.name, "memory admission")) setWiredFloor(1 << 20);
+                if (std.mem.eql(u8, c.name, "memory admission")) try setWiredFloor(1 << 20);
                 server_state.server_config.max_context_size = if (std.mem.eql(u8, c.name, "context overflow")) 64 else ctx_was;
                 try wsSend(fd, c.frame);
                 const frame = try wsReadFrame(fd);
@@ -574,7 +586,7 @@ test "server: a Responses WebSocket turn refused before it runs ends in the erro
                     return error.RefusalNotTheTurnsErrorFrame;
                 }
             }
-            setWiredFloor(null);
+            clearWiredFloor();
             // The connection serves the next turn.
             try wsSend(fd, "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}");
             while (true) {
@@ -616,14 +628,15 @@ test "server: an error on an Anthropic route takes Anthropic's envelope and stat
         }
         fn run() !void {
             // Refused loads, by whichever check refuses first: the model cannot fit under a declared wired limit's floor.
-            setWiredFloor(64 << 20);
+            try setWiredFloor(64 << 20);
+            errdefer clearWiredFloor();
             const refused = [_]Case{
                 .{ .name = "load refused, messages", .path = "/v1/messages", .body = messages, .status = "5" },
                 .{ .name = "load refused, count_tokens", .path = "/v1/messages/count_tokens", .body = messages, .status = "5" },
                 .{ .name = "load refused, chat", .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", .status = "5", .anthropic = false },
             };
             for (refused) |c| try check(c);
-            setWiredFloor(null);
+            clearWiredFloor();
             const served = [_]Case{
                 .{ .name = "method", .method = "GET", .path = "/v1/messages", .body = "", .status = "405 Method Not Allowed" },
                 .{ .name = "nesting", .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"x\":" ++ nested ++ "}", .status = "400 Bad Request" },
@@ -697,8 +710,8 @@ fn errorMessage(resp: []const u8) ![]u8 {
 test "server: every request to a model whose load is refused for memory gets the whole refusal, re-read, as a named 503" {
     try eachArch(4, .{}, struct {
         fn run() !void {
-            setWiredFloor(64 << 20);
-            defer setWiredFloor(null);
+            try setWiredFloor(64 << 20);
+            defer clearWiredFloor();
             const chat = "{\"model\":\"tiny\",\"max_tokens\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
             var first: ?[]u8 = null;
             defer if (first) |f| gpa.free(f);

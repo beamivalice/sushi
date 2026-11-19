@@ -269,6 +269,9 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - A server scenario under concurrency (requests racing a delete, a shutdown or an unload) runs in process through
   `src/server_test.zig`: `serve` with an embedded client, each arch's servable tiny (`cooler_contract.serverDir`) on
   Sushi Cooler, socketpair connections, an allocator that poisons what it frees.
+  A cell under a declared wired limit sets it with `setWiredFloor`, whose limit is the box's RAM (a floor is at most
+  the RAM less the margin) and which refuses a floor the bill would not read: a 120,000 MB limit declared none below
+  about 118 GB of RAM, so its cells tested nothing there.
 - Integration scripts in `tests/` cover only what HTTP shows and a unit test cannot reach.
 
 ## How a test is built
