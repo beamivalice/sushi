@@ -1447,7 +1447,8 @@ fn billedAutoContext(config: *const model_mod.ModelConfig) bool {
 
 /// The context the RAM-first clamp bills, through the one shared pure resolver.
 fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
-    const ceiling = currentGpuMemoryCeiling(config, active_mem);
+    // The reading the advertised context is priced on (`computeMemoryContext`).
+    const ceiling = liveGpuMemoryCeiling(config, active_mem);
     if (billedAutoContext(config)) return billedAdvertisedContext(config, memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk));
     return resolvedContextForLoad(
         manualContext(config),
@@ -1654,7 +1655,13 @@ pub fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 
 /// The largest context this model's per-token footprint fits into RAM right now, ignoring the checkpoint's own maximum.
 pub fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const active_mem: usize = gpu_mem.activeBytes();
-    return memoryContextAt(config, currentGpuMemoryCeiling(config, active_mem), active_mem);
+    return memoryContextLive(config, currentGpuMemoryCeiling(config, active_mem), active_mem +| @as(u64, gpu_mem.cacheBytes()), metrics.getAvailableMemBytes(), active_mem);
+}
+
+/// PURE: the memory context at the reading admission compares a request's bill against (`admissionAvailableNow`): the
+/// load's `ceiling`, never past the process's `footprint` plus what the system can still `reclaim`.
+pub fn memoryContextLive(config: *const model_mod.ModelConfig, ceiling: u64, footprint: u64, reclaimable: u64, active_mem: u64) u32 {
+    return memoryContextAt(config, liveCeilingFrom(ceiling, footprint, reclaimable), active_mem);
 }
 
 /// `computeMemoryContext` at one reading of the ceiling and MLX's active memory.

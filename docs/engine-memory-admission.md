@@ -83,8 +83,10 @@ bill function's output on the committed fixture configs of all served packs: a b
   the process's GPU footprint plus `getAvailableMemBytes`' reclaimable pages less `LIVE_RESERVE_BYTES`, 1 GiB).
   `--wired-margin-gib` is not taken there again: the reclaimable pages already leave out what other processes hold, and
   the margin keeps their room under the declared limit; taken twice, a 16 GiB margin left no prefill width (issue 105). Request
-  admission, the prefill chunk's width (the served warm's included), an image encode and DeepSeek's borrow read it; the
-  load and the advertised context keep the declared floor. A raised limit lifts the plan over other processes' pages but
+  admission, the prefill chunk's width (the served warm's included), an image encode, DeepSeek's borrow and the advertised
+  context (`computeMemoryContext`, `max_safe_context`) read it, so the context a load advertises is admitted when asked;
+  the load keeps the declared floor. A 32 GB M1 whose free RAM bound below its limit advertised 444,416 tokens and
+  refused a request at that length (8,313 MB needed, 7,178 MB available). A raised limit lifts the plan over other processes' pages but
   frees none: on a 128 GB M5 at `iogpu.wired_limit_mb=125000` with the owner's apps open, DeepSeek at `--ssd-budget-gb
   108` (105 GiB active) took an 8,192-row warm chunk the 121 GiB floor admitted and the kernel panicked (r-65). A quiet
   box reclaims its file cache, so there the declared limit stands.

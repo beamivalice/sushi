@@ -10,6 +10,10 @@ earlier history is mlx-serve's, in that project's changelog.
   for memory (a host allocation, say) failed every request decoding at that moment, other models' included.
 - **A Qwen image encode on Sushi Cooler stays inside its memory bill**: its patch arrays were made before the encode's
   cap went in, so they could land on free buffers past the bill.
+- **The context a model advertises can be used at its length when free RAM, not the GPU limit, is what binds**: the
+  auto context and `/props` `max_safe_context` were sized against the GPU memory limit while requests are admitted
+  against the memory macOS can still give, so a 32 GB Mac advertised 444,416 tokens and refused a request that long.
+  Both now read what admission reads: on such a Mac the advertised context comes out smaller.
 - **A DeepSeek or GLM request whose `max_tokens` does not fit in memory is told the `max_tokens` and context that do**:
   it read "Reduce prompt size or use a smaller model", which named neither; the values it now names are admitted when
   applied.

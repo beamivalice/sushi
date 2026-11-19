@@ -2289,3 +2289,28 @@ test "Flash-Next on Cooler: a load's preflight leaves its served warm the whole 
     try t.expect(bills.warmNeedBytes(&cfg) >= bill + bills.LIVE_RESERVE_BYTES);
     try t.expect(bill > bills.warmFloorChunkBytes(&cfg));
 }
+
+test "Flash-Next on Cooler: the advertised context is admitted when asked on a Mac whose free RAM binds below its declared GPU limit" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    var cfg = coolerFlashNext();
+    cfg.expert_streaming = true;
+    const GiB: u64 = 1 << 30;
+    // A 32 GB M1 under a declared limit: the streamed load's bytes in use, and what macOS can still give beside them.
+    const ceiling: u64 = 28 * GiB;
+    const active: u64 = 12 * GiB;
+    const reclaimable: u64 = 8 * GiB;
+    const ctx = bills.memoryContextLive(&cfg, ceiling, active, reclaimable, active);
+    var probe = cfg;
+    probe.pinned_context = bills.autoContextFrom(ctx, cfg.contextCap(), 0);
+    const available = bills.admissionAvailableFor(&probe, bills.liveCeilingFrom(ceiling, active, reclaimable), active, 0);
+    const chunk: u64 = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
+    // A prompt that fills the advertised context, and a short one whose reply does.
+    for ([_]u64{ probe.pinned_context, 1_000 }) |seq| {
+        const needed = prefillNeededAtChunk(&probe, seq, @intCast(probe.pinned_context - seq), 8, chunk, .{ .mtp_on = bills.mtpHeadDefaultOn(&probe) });
+        errdefer std.debug.print("advertised {d}: a {d}-token prompt needs {d} MB, admission reads {d} MB\n", .{ probe.pinned_context, seq, needed >> 20, available >> 20 });
+        try t.expect(needed <= available);
+    }
+}
