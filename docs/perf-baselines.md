@@ -489,6 +489,17 @@ large share alone.
   1.2 at span 128, against 1.64 / 1.26 and 0.70 / 0.72 staged (`7424e2c0`). The scattered reads cost more than the
   occupancy the tile gave back.
 
+**Ruled out on the M5 Ultra, decode and first chunk** (`9ae2eb31`, `taskpolicy -a`, GPU lock):
+- The one-row trunk linears' NAX geometry (`project_rows.NAX_TUNED`, tuned on the M5 Max): `wo_b` [5120x8192] at
+  `kph` 1, 2, 4 by `nsplit` 2, 4, 8, 16 all read 27.7 to 28.6 us (`shared.exl3_trunk_rows`, rows 1, 7 rounds,
+  contended). They decode about 1.5 T weights/s, the head's rate too (446 us for 662 M weights); the head only reads
+  more GB/s because it stores 6 bits a weight. The trunk is bound by the SPEC1 decode, not occupancy.
+- The draft's Markov pick on a threadgroup instead of one thread (the same first maximum): `dsv41.markov_chain` 669.2
+  against 669.8 us a block of 5. The per-op profile's 30 us a pick was its own command-buffer wait.
+- Keeping the pool across requests (no trim at the first decode after a prefill, at the request's end or under a
+  forward's cap) leaves a request's first chunk with the same layer-0 gaps (24 to 36 ms each): host work at a
+  request's start, not fresh Metal buffers.
+
 <a id="m5u-chunk-handoff"></a>
 **The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
 `[engine] GPU busy` line; then `tests`-free prefill A B A B, one boot an arm, 2 samples a rung, code text with a fresh
