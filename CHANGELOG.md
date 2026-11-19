@@ -10,6 +10,10 @@ earlier history is mlx-serve's, in that project's changelog.
   for memory (a host allocation, say) failed every request decoding at that moment, other models' included.
 - **A Qwen image encode on Sushi Cooler stays inside its memory bill**: its patch arrays were made before the encode's
   cap went in, so they could land on free buffers past the bill.
+- **A DeepSeek request on Sushi Cooler is billed its one 256 MB memory margin once**: the bill took a forward's cap,
+  which already carries the margin, and added it again, so a request within 256 MB of the edge was refused and the
+  advertised context came out that much smaller. Its last decode forward is now priced where it runs, at the reply's
+  end, so a short prompt with a long reply is billed the scores and state growth of its whole context.
 - **A Sushi Cooler load that evicts a model on MLX gets that model's memory back**: the evicted model's freed buffers
   stayed in MLX's pool (up to 8 GB on a 128 GB Mac) for the whole life of the new load, so its memory check read
   less free RAM than there was, and later checks counted that pool as room the engine cannot use.

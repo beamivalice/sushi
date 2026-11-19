@@ -36,10 +36,15 @@ pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u
     const c = config.dsv41 orelse return null;
     const held = (@as(u64, seq) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
     // The cap a forward runs under (`Config.forwardCap`) is its bill. The prefill's comes out of the decoder pools it
-    // may release (`dsv41_borrow`); a decode forward's never does. On MLX the decode pool is parked beside either. On
-    // a Cooler load the engine's pool is the cap itself (its free buffers are inside it) and MLX holds nothing.
-    const forward = @max(c.forwardCap(dsv41_borrow.verify_rows, seq), c.chunkCapOn(@import("../cooler_side.zig").onEngine(config), chunk, seq) -| bills.borrowableBytes(config));
-    const work = forward +| (if (@import("../cooler_side.zig").onEngine(config)) 0 else config.expertPoolBytes());
+    // may release (`dsv41_borrow`); a decode forward's never does, and the last runs at the reply's end, its verify
+    // block past it. On MLX the decode pool is parked beside either. On a Cooler load the engine's pool is the cap
+    // itself (its free buffers are inside it) and MLX holds nothing.
+    const engine = @import("../cooler_side.zig").onEngine(config);
+    const decode_end = seq +| max_tokens +| dsv41_borrow.verify_rows;
+    const capped = @max(c.forwardCap(dsv41_borrow.verify_rows, decode_end), c.chunkCapOn(engine, chunk, seq) -| bills.borrowableBytes(config));
+    // A Cooler cap carries the bill's one margin, which `bills.billMargin` adds to the bill: the bill takes the cost.
+    const forward = if (engine) capped -| dsv41_config.BILL_MARGIN_BYTES else capped;
+    const work = forward +| (if (engine) 0 else config.expertPoolBytes());
     const stored = held +| checkpointReserve(config, seq, chunk);
     // On Sushi Cooler the bill is exact (`bills.billMargin` adds the one margin); MLX keeps its calibrated quarter.
     return (if (@import("../cooler_side.zig").onEngine(config)) stored else stored *| 5 / 4) +| work +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);

@@ -249,7 +249,7 @@ test "DeepSeek's request bill takes its prefill working set out of the decoder p
     const state = ((seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(true) + bills.checkpointReserve(&config, seq, 2048)) * 5 / 4;
     // A load on MLX: its chunk bills MLX's per-row rate.
     const work = c.chunkCapOn(false, 2048, seq) + config.expertPoolBytes();
-    const decode = c.forwardCap(dsv41_config.verify_rows, seq);
+    const decode = c.forwardCap(dsv41_config.verify_rows, seq + 2048 + dsv41_config.verify_rows);
     // No pool to lend: the whole working set is billed, as before.
     try t.expectEqual(state + work, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
     // Pools that cover part of it: admission pays only the rest.
@@ -355,7 +355,7 @@ test "DeepSeek's unlent bill is what a Cooler request's forwards take from the p
     // headroom cannot hold releases pools first (`dsv41_borrow.beforeForward`)...
     config.expert_borrow_bytes = 60_000_000_000;
     const lent = bills.prefillNeededAtChunk(&config, seq, 96, 16, chunk, .{});
-    try t.expectEqual(unlent - (c.chunkCap(chunk, seq) - c.forwardCap(dsv41_config.verify_rows, seq)), lent);
+    try t.expectEqual(unlent - (c.chunkCap(chunk, seq) - c.forwardCap(dsv41_config.verify_rows, seq + 96 + dsv41_config.verify_rows)), lent);
     // ...but a forward the headroom holds releases none and takes its whole cap from the pool: what it asks is measured
     // against the bill with nothing lent, the same with or without pools to lend.
     try t.expectEqual(unlent, bills.prefillNeededAtChunkUnlent(&config, seq, 96, 16, chunk, .{}));
@@ -363,7 +363,7 @@ test "DeepSeek's unlent bill is what a Cooler request's forwards take from the p
     try t.expectEqual(unlent, bills.prefillNeededAtChunkUnlent(&config, seq, 96, 16, chunk, .{}));
 }
 
-test "DeepSeek's request bill on a Cooler load is its exact state, one forward's cap and the margin: MLX's parked pool, the MLX net and MLX's row rate are not billed" {
+test "DeepSeek's request bill on a Cooler load is its exact state and one forward's cap, whose margin is the bill's one: MLX's parked pool, the MLX net and MLX's row rate are not billed" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
@@ -378,7 +378,7 @@ test "DeepSeek's request bill on a Cooler load is its exact state, one forward's
         config.cooler_for_test = true;
         const net = stored * 5 / 4 - stored;
         const engine_chunk = c.chunkCap(2048, seq);
-        try t.expectEqual(off - dsv41_config.dsv41_pool_bytes - net - c.chunkCapOn(false, 2048, seq) + engine_chunk + bills.BILL_MARGIN_BYTES, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
+        try t.expectEqual(off - dsv41_config.dsv41_pool_bytes - net - c.chunkCapOn(false, 2048, seq) + engine_chunk, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
     }
 }
 
@@ -534,4 +534,41 @@ test "DeepSeek: an admitted prompt is never refused by a forward's borrow, at th
             }
         }
     }
+}
+
+// Contract (engine-memory-admission#bill-net): a Cooler request bill is its exact bytes plus BILL_MARGIN_BYTES, once.
+// `Config.forwardCap` carries that margin (dsv41-memory#transient-caps), so the bill takes the forward's cost under it.
+test "DeepSeek's Cooler request bill carries its one margin once, not once in the forward's cap and again on the bill" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.cooler_for_test = true;
+    const c = &config.dsv41.?;
+    for ([_]u64{ 100, 9_000, 225_000, 1_000_000 }) |seq| for ([_]u64{ 512, 2048 }) |chunk| {
+        const stored = (seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(config.dsparkOn()) + dsv41_bill.checkpointReserve(&config, seq, chunk);
+        const cap = @max(c.forwardCap(dsv41_config.verify_rows, seq + 2048 + dsv41_config.verify_rows), c.chunkCap(chunk, seq));
+        const exact = stored + cap - bills.BILL_MARGIN_BYTES;
+        const bill = bills.prefillNeededAtChunk(&config, seq, 2048, 16, chunk, .{});
+        errdefer std.debug.print("DeepSeek seq {d} chunk {d}: bill {d} MB = exact {d} MB + {d} MB of margin\n", .{ seq, chunk, bill >> 20, exact >> 20, (bill -% exact) >> 20 });
+        try t.expectEqual(exact + bills.BILL_MARGIN_BYTES, bill);
+    };
+}
+
+// The decode and verify forwards a request runs last are at its reply's end, where their scores and the rows' growth
+// span the whole context: a bill priced at the prompt's position under-billed a short prompt's long reply.
+test "DeepSeek's request bill prices its decode forward at the reply's end, not at the prompt's" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.cooler_for_test = true;
+    const c = &config.dsv41.?;
+    const seq: u64 = 64;
+    const reply: u32 = 1_000_000;
+    const stored = (seq + reply) * c.stateBytesPerToken() + c.stateFixedBytes(config.dsparkOn());
+    const decode = c.forwardCap(dsv41_config.verify_rows, seq + reply + dsv41_config.verify_rows);
+    try t.expect(bills.prefillNeededAtChunk(&config, seq, reply, 16, 2048, .{}) >= stored + decode);
 }

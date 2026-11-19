@@ -6116,7 +6116,7 @@ test "bill pin: prefillNeededAtChunk" {
 }
 
 test "bill pin: defaultRequestBill" {
-    try pinConfigs("defaultRequestBill", &.{ 537696256, 1108173696, 1037824640, 4385828608 }, struct {
+    try pinConfigs("defaultRequestBill", &.{ 537696256, 1108173696, 1037824640, 4385838859 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             g.add(defaultRequestBill(c));
         }
