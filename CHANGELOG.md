@@ -50,8 +50,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A DeepSeek-V4.1 prompt refused for memory at its first prefill chunk says so**: the refusal said it ran out
   partway through the prefill and that the chunks before it ran, when none had.
 - **A DeepSeek-V4.1 request admitted under memory pressure is no longer promised memory a stranded or reading-back
-  decoder pool holds**: a pool whose release failed half way, every pool released on an MLX load, and the workspace a
-  read-back holds beside the pools it takes back counted as free.
+  decoder pool holds**: a pool whose release failed half way and the workspace its heal makes, every pool released on
+  an MLX load, and the workspace a read-back holds beside the pools it takes back counted as free.
 - **A DeepSeek-V4.1 request admitted while another request's borrowed decoder pools are out is no longer promised the
   memory they take back**: pools a long prefill released and had not yet read back counted as free, so a request
   admitted then could run short, or keep the pools from coming back, when they did.

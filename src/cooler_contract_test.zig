@@ -5816,7 +5816,11 @@ const LentSweep = struct {
     layer: [2]u16,
     /// Each pool as its release moves the reading, measured with the union workspace already made.
     pool: [2]i64 = .{ 0, 0 },
+    /// What making the union workspace takes from the reading, measured on the release that makes it.
+    union_read: i64 = 0,
     rest: u64 = 0,
+    /// Admission read at a stranded layer, before the heal makes its workspace.
+    stranded: u64 = 0,
     step: Step = .release,
     /// A host allocation index that strands the last layer: its workspace fails and its take-back too.
     strands_at: ?usize = null,
@@ -5839,7 +5843,10 @@ const LentSweep = struct {
         switch (self.step) {
             .release => {},
             .release_beside, .read_back => _ = try self.engine.borrowLayer(self.layer[0]),
-            .heal => try self.strand(),
+            .heal => {
+                try self.strand();
+                self.stranded = @import("bills.zig").admissionAvailableNow(self.config);
+            },
         }
     }
 
@@ -5867,20 +5874,24 @@ const LentSweep = struct {
         try testing.expectEqual(@as(u64, 0), @import("gpu_mem.zig").lentBytes());
     }
 
-    /// The lent total is the bytes the released pools left unmapped, measured, and admission reads no more than at rest.
+    /// The lent total is the bytes the released pools left unmapped, measured, and at a stranded layer at least those
+    /// and the workspace its heal makes; admission reads no more than at rest, and what it read at a stranded layer
+    /// still fits once the heal has made the workspace.
     fn check(self: *LentSweep, refused: []const u8, k: u64) !void {
         const e = self.engine;
         var unmapped: i64 = 0;
         for (self.layer, self.pool) |li, bytes| {
             if (e.isBorrowed(li)) unmapped += bytes;
         }
-        const lent = @import("gpu_mem.zig").lentBytes();
+        const stranded = unmapped > 0 and e.grouped_union.len == 0;
+        const lent: i64 = @intCast(@import("gpu_mem.zig").lentBytes());
         const now = @import("bills.zig").admissionAvailableNow(self.config);
-        errdefer std.debug.print("{t} with {s} {d} refused: released {any}, union {}; lent {d} B, pools unmapped {d} B; admission at rest {d}, now {d}\n", .{
-            self.step, refused, k, .{ e.isBorrowed(self.layer[0]), e.isBorrowed(self.layer[1]) }, e.grouped_union.len != 0, lent, unmapped, self.rest, now,
+        errdefer std.debug.print("{t} with {s} {d} refused: released {any}, union {}; lent {d} B, pools unmapped {d} B, union {d} B; admission at rest {d}, stranded {d}, now {d}\n", .{
+            self.step, refused, k, .{ e.isBorrowed(self.layer[0]), e.isBorrowed(self.layer[1]) }, e.grouped_union.len != 0, lent, unmapped, self.union_read, self.rest, self.stranded, now,
         });
-        try testing.expectEqual(unmapped, @as(i64, @intCast(lent)));
+        if (stranded) try testing.expect(lent >= unmapped + self.union_read) else try testing.expectEqual(unmapped, lent);
         try testing.expect(now <= self.rest);
+        if (self.step == .heal) try testing.expect(now >= self.stranded);
     }
 
     /// Each site of `F` (`mlx.fault`, `mlx.engine.fault`) the step reaches refused once, at its first ask.
@@ -5924,7 +5935,7 @@ const LentSweep = struct {
     }
 };
 
-test "cooler contract: every exit of a DeepSeek pool's release, read-back and heal, one refused step or two included, and of an unload mid-lease, on Sushi Cooler and on MLX, publishes as lent what the pools left free in admission's reading, and admission never reads more than at rest" {
+test "cooler contract: every exit of a DeepSeek pool's release, read-back and heal, one refused step or two included, and of an unload mid-lease, on Sushi Cooler and on MLX, publishes as lent what the pools left free in admission's reading and, at a stranded layer, the workspace its heal makes, and admission never reads more than at rest nor than a heal leaves" {
     try mlx.requireGpu();
     const D = ContractOf("dsv41");
     if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
@@ -5957,6 +5968,12 @@ fn lentSweep(dir: []const u8, cooler: bool) !void {
         try sw.toRest();
         try testing.expect(sw.pool[i] > 0);
     }
+    // The first release makes the union workspace out of its pool.
+    const before = admissionReading();
+    _ = try e.borrowLayer(sw.layer[0]);
+    sw.union_read = sw.pool[0] - (admissionReading() - before);
+    try sw.toRest();
+    try testing.expect(sw.union_read > 0);
     sw.rest = @import("bills.zig").admissionAvailableNow(sw.config);
     for (std.meta.tags(LentSweep.Step)) |step| {
         sw.step = step;

@@ -398,6 +398,9 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   pack's first release makes is not netted out: it stays in the active bytes until the last read-back drops it, so a
   promise holds it beside every pool the read-back takes back (tested by a fault sweep over every release, read-back,
   heal and unload exit, on Sushi Cooler and MLX).
+- **A stranded layer holds back the workspace its heal makes**: a layer left released with no union workspace adds
+  `Engine.unionReadBound` to the lent total until the heal makes it (its slabs, and each meta table at its pool class
+  twice: one the heal takes from the free buffers leaves their credit too), so a request admitted then still fits.
 - Log lines: `[dsv41-borrow] released layers a..39 (X GB) for a N-row forward at P: need, headroom before -> after,
   unwired in T ms` and `[dsv41-borrow] restored n layers (X GB) in T ms before decode`.
 

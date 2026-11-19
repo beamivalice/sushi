@@ -93,7 +93,7 @@ cooler contract: a served Qwen turn that shares part of the last turn's RAM entr
 cooler contract: a served Qwen turn whose partial share fits once an idle entry is evicted is served as a share, and the entry it restores from stays whole (#109)
 cooler contract: a served speculative Qwen conversation of takeovers, partial and whole, says its share arm's tokens with the pool poisoned
 cooler contract: a streamed Qwen Cooler load decodes one row per forward, so a restore while two requests decode patches no live group and the engine refuses nothing
-cooler contract: every exit of a DeepSeek pool's release, read-back and heal, one refused step or two included, and of an unload mid-lease, on Sushi Cooler and on MLX, publishes as lent what the pools left free in admission's reading, and admission never reads more than at rest
+cooler contract: every exit of a DeepSeek pool's release, read-back and heal, one refused step or two included, and of an unload mid-lease, on Sushi Cooler and on MLX, publishes as lent what the pools left free in admission's reading and, at a stranded layer, the workspace its heal makes, and admission never reads more than at rest nor than a heal leaves
 cooler contract: held Qwen restore points give way to a staged write that needs the writer's permit
 cooler contract: the first served DeepSeek request after a Cooler load's warm starts from the state the second does, and a streamed load's first wide prefill is served through a late-unwiring borrow (issue 107)
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line

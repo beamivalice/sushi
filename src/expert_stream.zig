@@ -3033,19 +3033,31 @@ pub const Engine = struct {
 
     /// The bytes the union workspace takes: its nine slabs and the meta table of each layer that may be released.
     pub fn unionBytes(self: *const Engine) u64 {
-        var bytes: u64 = 0;
-        var meta: u64 = 0;
+        const parts = self.unionParts();
+        return parts.slabs + parts.metas * parts.meta;
+    }
+
+    /// What making the union workspace may take from `lentReading`: its slabs, and each meta table at its pool class
+    /// twice, since one the engine takes from its free buffers leaves their credit too.
+    fn unionReadBound(self: *const Engine) u64 {
+        const parts = self.unionParts();
+        return parts.slabs + parts.metas * 2 * @import("tensor/pool_class.zig").poolBytes(parts.meta);
+    }
+
+    fn unionParts(self: *const Engine) struct { slabs: u64, meta: u64, metas: u64 } {
+        var slabs: u64 = 0;
+        var metas: u64 = 0;
         for (self.layers, 0..) |*layer, li| {
             const gl = layer.grouped orelse continue;
-            if (bytes == 0) {
-                for (self.union_elems) |elems| bytes += elems * 2;
+            if (slabs == 0) {
+                for (self.union_elems) |elems| slabs += elems * 2;
                 for (0..quant.component_count) |ci| {
-                    if (ci % 3 != 0) bytes += @as(u64, self.geometry.kept()) * gl.pieceBytes(0, ci);
+                    if (ci % 3 != 0) slabs += @as(u64, self.geometry.kept()) * gl.pieceBytes(0, ci);
                 }
             }
-            if (li >= self.borrow_from) meta += @as(u64, self.geometry.kept()) * sushi_exl3.rate_groups.META_WORDS * 4;
+            if (li >= self.borrow_from) metas += 1;
         }
-        return bytes + meta;
+        return .{ .slabs = slabs, .meta = @as(u64, self.geometry.kept()) * sushi_exl3.rate_groups.META_WORDS * 4, .metas = metas };
     }
 
     /// What a resident pack's first release must first pay for the union workspace; 0 once it exists.
@@ -3185,9 +3197,14 @@ pub const Engine = struct {
     /// promise holds it beside every pool the read-back takes back.
     pub fn lentOutstanding(self: *const Engine) u64 {
         var lent: i64 = 0;
+        var any = false;
         for (self.layers) |*layer| if (layer.borrowed) {
             lent += layer.lent_read;
+            any = true;
         };
+        // A layer released with no union workspace (its workspace and take-back both failed) is healed before the next
+        // forward, which makes the workspace: held back before it is made.
+        if (any and self.grouped_union.len == 0) lent += @intCast(self.unionReadBound());
         return @intCast(@max(lent, 0));
     }
 
