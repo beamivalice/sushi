@@ -239,11 +239,15 @@ fn dirBytesIn(io: std.Io, dir: std.Io.Dir, depth: u8) u64 {
     return total;
 }
 
-/// The id of the loaded (or loading) model served from `path`, or null. Caller holds the registry's mutex.
+/// The id of the model in memory served from `path`, or null. Caller holds the registry's mutex. An unloading model
+/// counts: requests still read it until its drain ends, and the unload may be refused and the model serve on.
 fn loadedModelAtLocked(allocator: Allocator, path: []const u8) ?[]u8 {
     const reg = server_state.global_registry orelse return null;
     const e = reg.peekByPathLocked(path) orelse return null;
-    if (e.state != .ready and e.state != .loading) return null;
+    switch (e.state) {
+        .unloaded, .error_state => return null,
+        .loading, .ready, .evicting => {},
+    }
     return allocator.dupe(u8, e.id) catch null;
 }
 
@@ -691,6 +695,24 @@ test "downloads: a pack row carries the tier verdict, the recommended pack and i
     const new = try row(arena, .{ .repo = "beamster/New-Sushi-3bpw", .size = 1, .installed = "/m/n" }, 128);
     try testing.expect(new.fits == null and new.tier_gb == null and !new.recommended and new.launch == null);
     try testing.expectEqualStrings("New-Sushi-3bpw", new.name);
+}
+
+test "downloads: an update is refused for a model in memory, also while it loads or unloads" {
+    const ModelRegistry = @import("model_registry.zig").ModelRegistry;
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 2, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStub("m", "/packs/m", 10);
+    const prev = server_state.global_registry;
+    server_state.global_registry = reg;
+    defer server_state.global_registry = prev;
+    for (std.enums.values(@import("model_registry.zig").LoadState)) |state| {
+        e.state = state;
+        const id = loadedModelAtLocked(testing.allocator, "/packs/m/");
+        defer if (id) |i| testing.allocator.free(i);
+        const in_memory = state == .loading or state == .ready or state == .evicting;
+        try testing.expectEqual(in_memory, id != null);
+    }
+    e.state = .unloaded;
 }
 
 test "downloads: a finished pull drops the update claim from the pack row" {
