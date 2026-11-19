@@ -14,10 +14,10 @@ fn add(a: usize, b: usize) !usize {
 fn mul(a: usize, b: usize) !usize {
     return std.math.mul(usize, a, b) catch error.GlmReserveOverflow;
 }
-/// The rows `appendRows` gives a buffer of `parts` (`glm5_bill.pagedRows`).
+/// The rows `appendRows` gives a buffer of `parts` (`mlx_pages.pagedRows`).
 pub fn capacity(rows: usize, parts: []const u64) !usize {
     if (rows > std.math.maxInt(c_int)) return error.GlmReserveOverflow;
-    const value: usize = @intCast(@import("glm5_bill.zig").pagedRows(rows, parts));
+    const value: usize = @intCast(@import("../mlx_pages.zig").pagedRows(rows, parts));
     if (value > std.math.maxInt(c_int)) return error.GlmReserveOverflow;
     return value;
 }

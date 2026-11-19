@@ -4459,7 +4459,7 @@ test "cooler contract: a speculative request whose reply ends at a cache step gr
     // A reply that ends at, or a draft block short of, a 256-row step and a +25% step.
     for ([_]u32{ 256, 512, 1280 }) |end| for ([_]u32{ 0, 1, 3, 6 }) |less| {
         const n: u32 = end - @as(u32, @intCast(prompt.len)) - less;
-        const billed = bills.cacheCapacityTokens(&ld.config, prompt.len, n, ld.config.prefillStartWidth(), ctx, bills.speculativeRowsPastEnd(&ld.config, .{ .mtp_on = true }));
+        const billed = bills.cacheCapacityTokens(&ld.config, prompt.len, n, ld.config.prefillStartWidth(), ctx, bills.speculativeRowsPastEnd(&ld.config, .{ .mtp_on = true }), bills.defaultKvBits(&ld.config));
         const turn = arch_handle.turnFor(ld.h, &ld.config);
         defer turn.end();
         defer arch_sched.endRequest(&ld.config);

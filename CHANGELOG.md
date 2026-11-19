@@ -27,6 +27,10 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A long Qwen conversation on Sushi Cooler keeps its restore points across turns that share only part of the last
   one**: such a turn's cache entry lost the restore points it inherits (`checkpoint inheritance failed`), so later turns
   restored from further back and prefilled more.
+- **On MLX (`--qwen-mlx-engine`, a Qwen pack Sushi Cooler does not run, or MiMo) a kv8 cache grows on MLX's page grid,
+  so its scale and bias rows are never copied past the memory bill**: the cache and its bill move by up to 768 rows a
+  layer either way (about 10 MB at most on Qwen3.8-Flash-Next), and on a tight budget the advertised context can drop
+  by a few hundred tokens (79,872 where it was 80,000 or more on a lean 32 GB Mac); Sushi Cooler is unchanged.
 - **A GLM request with a kv8 or kv6 cache no longer copies part of its cache on a step**: MLX could hand the cache's
   scale and bias rows a buffer slightly larger than they need, which it then never reuses in place, so the append
   copied them, memory the bill did not hold. Past 1,024 tokens the cache now grows 1,024 rows at a time (up to 4.6 MB

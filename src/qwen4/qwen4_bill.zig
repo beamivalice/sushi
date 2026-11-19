@@ -116,9 +116,13 @@ pub fn gatheredMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64
 pub fn headKvPerToken(config: *const model_mod.ModelConfig) ?u64 {
     const n = config.attnCacheLayerCount();
     if (n == 0) return 0;
+    return bills.kvBytesPerTokenAtBits(config.kvBytesPerToken() / n, headKvBits(config).?);
+}
+
+/// The bits the MTP head's cache stores at (16: dense), which its rows grow on (`bills.cacheStorage`).
+pub fn headKvBits(config: *const model_mod.ModelConfig) ?u64 {
     const head_cfg = qwen4_forward.qwen4MtpHeadKvConfig(bills.configuredKvQuantFor(config));
-    const bits: u64 = if (head_cfg.scheme == .off) 16 else head_cfg.bits;
-    return bills.kvBytesPerTokenAtBits(config.kvBytesPerToken() / n, bits);
+    return if (head_cfg.scheme == .off) 16 else head_cfg.bits;
 }
 
 pub fn headQsaRing(config: *const model_mod.ModelConfig) ?u64 {

@@ -183,7 +183,7 @@ inside 1.46% drift) because verification per round grew 20.6%. The verify now ru
 - Load bill: text weights, the enabled tower, the selected assistant and warmup. Request bill: BF16 latent 11,264
   plus pooled-index 704 bytes per token (11,968); under kv8 the latent is 5,984 (11 × 512 codes + 8 BF16 scale/bias
   pairs, 6,688 per token). Then capacity growth (256-row steps on which every latent part past a 16 KB page is whole
-  pages, `glm5_bill.pagedRows`: a kv8 or kv6 latent past 1,024 rows steps by 1,024, its 16-byte scale and bias rows
+  pages, `mlx_pages.pagedRows`: a kv8 or kv6 latent past 1,024 rows steps by 1,024, its 16-byte scale and bias rows
   being 1,024 to a page; the bill takes those rows, at least 1,024-row steps, at the stored row width), the raw key/gate ring
   and FP32 KDA state (147,619,840 bytes), plus native kernel transients at two pending layers: A6 expansion 512 MiB,
   B1/B3 decode attention 128 MiB, KDA cluster 1.25 MiB per pending layer. The MLA-only terms are held by the one MLA

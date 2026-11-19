@@ -194,7 +194,7 @@ Found while holding the engine of our own to MLX's bytes ([engine-own-forward](e
 - **MLX's pool hands an allocation a free buffer up to two pages over it, and MLX donates one only within a page
   (16 KB) of the array's bytes**: a buffer appended in place whose bytes are past a page and off the page grid can
   sit in one MLX never donates, and the append copies it. Such a buffer's capacity keeps it on whole pages
-  (GLM's latent: `glm5_bill.pagedRows`).
+  (`mlx_pages.pagedRows`: GLM's latent, the KV cache on MLX).
 
 ## Zig
 

@@ -5,6 +5,7 @@ const trunk_helpers_test = @import("trunk_helpers_test.zig");
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
+const mlx_pages = @import("mlx_pages.zig");
 const KVQuantConfig = kv_quant.KVQuantConfig;
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
@@ -648,11 +649,12 @@ pub const KVCache = struct {
     /// capacity grows every layer inside one forward, all the old buffers alive beside the new.
     pub fn growToReservation(self: *KVCache, s: mlx.mlx_stream) !void {
         if (self.reserve_tokens == 0) return;
-        const new_cap: c_int = @intCast((self.reserve_tokens + chunk_step - 1) / chunk_step * chunk_step);
+        const reserved = (self.reserve_tokens + chunk_step - 1) / chunk_step * chunk_step;
         const n: usize = if (self.config.scheme == .off) 2 else 6;
         for (self.entries) |*entry| {
             if (!entry.initialized or entry.ringed) continue;
             if (bufferCapacity(entry.keys) >= self.reserve_tokens) continue;
+            const new_cap: c_int = @intCast(pagedCapacity(entry, reserved, &entryRowBytes(entry, n), s));
             const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
             for (views) |view| {
                 _ = mlx.mlx_array_free(view.*);
@@ -684,7 +686,7 @@ pub const KVCache = struct {
             const cur_cap = bufferCapacity(entry.keys);
             const needed = entry.offset + rows;
             if (needed <= cur_cap) continue;
-            const new_cap: c_int = @intCast(self.growCapacityFor(entry, cur_cap, needed));
+            const new_cap: c_int = @intCast(pagedCapacity(entry, self.growCapacityFor(entry, cur_cap, needed), &entryRowBytes(entry, n), s));
             const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
             for (views) |view| {
                 _ = mlx.mlx_array_free(view.*);
@@ -982,13 +984,17 @@ pub const KVCache = struct {
         if (will_grow) {
             const needed = entry.offset + new_len;
             const cur_cap = if (entry.initialized and !shared) bufferCapacity(entry.keys) else 0;
-            const new_cap: c_int = @intCast(self.growCapacityFor(entry, cur_cap, needed));
+            const ksc_dt = mlx.mlx_array_dtype(new_kq.scales);
+            const vsc_dt = mlx.mlx_array_dtype(new_vq.scales);
+            const parts = [_]u64{
+                rowBytes(B, heads, q_last, .uint32),   rowBytes(B, heads, vq_last, .uint32),
+                rowBytes(B, heads, sc_last, ksc_dt),   rowBytes(B, heads, vsc_last, vsc_dt),
+            };
+            const new_cap: c_int = @intCast(pagedCapacity(entry, self.growCapacityFor(entry, cur_cap, needed), &parts, s));
             kv_cap_buf_grows += 1;
             try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
             try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, vq_last, .uint32);
             // Quantizer scales retain the activation dtype through allocation and growth.
-            const ksc_dt = mlx.mlx_array_dtype(new_kq.scales);
-            const vsc_dt = mlx.mlx_array_dtype(new_vq.scales);
             try growQuantBuf(s, &entry.keys_scales, entry.initialized, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
             try growQuantBuf(s, &entry.keys_biases, entry.initialized, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
             try growQuantBuf(s, &entry.values_scales, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
@@ -1103,7 +1109,8 @@ pub const KVCache = struct {
             const dtype = mlx.mlx_array_dtype(new_k);
             const needed = entry.offset + new_len;
             const cur_cap = if (entry.initialized and !shared) bufferCapacity(entry.keys) else 0;
-            const new_cap: c_int = @intCast(self.growCapacityFor(entry, cur_cap, needed));
+            const parts = [_]u64{ rowBytes(B, heads, head_dim, dtype), rowBytes(B, heads, v_head_dim, dtype) };
+            const new_cap: c_int = @intCast(pagedCapacity(entry, self.growCapacityFor(entry, cur_cap, needed), &parts, s));
             kv_cap_buf_grows += 1;
             const initialized = entry.initialized;
             try growQuantBuf(s, &entry.keys, initialized, entry.offset, new_cap, B, heads, head_dim, dtype);
@@ -1350,6 +1357,29 @@ pub const KVCache = struct {
     fn growCapacityFor(self: *const KVCache, entry: *const KVCacheEntry, cur_cap: usize, needed: usize) usize {
         if (!entry.ringed) return self.nextCapacityReserved(cur_cap, needed);
         return @max(nextCapacity(cur_cap, needed), ringCap(self.swa_ring_window));
+    }
+
+    /// A grown layer's capacity on MLX: on its page grid for buffers of `parts` bytes a row (`mlx_pages`), so every
+    /// write lands in place. A ring keeps its fixed rows; the engine of our own appends in place at any size.
+    fn pagedCapacity(entry: *const KVCacheEntry, cap: usize, parts: []const u64, s: mlx.mlx_stream) usize {
+        if (entry.ringed or mlx.engine.isStream(s)) return cap;
+        return @intCast(mlx_pages.pagedRows(cap, parts));
+    }
+
+    /// One cache row's bytes in a `[B, heads, rows, last]` buffer of `dtype`.
+    fn rowBytes(B: c_int, heads: c_int, last: c_int, dtype: mlx.mlx_dtype) u64 {
+        return @as(u64, @intCast(B * heads * last)) * (mlx.dtypeBytes(dtype) orelse 0);
+    }
+
+    /// One cache row's bytes in each of an entry's buffers.
+    fn entryRowBytes(entry: *const KVCacheEntry, n: usize) [6]u64 {
+        const bufs = [_]mlx.mlx_array{ entry.keys, entry.values, entry.keys_scales, entry.keys_biases, entry.values_scales, entry.values_biases };
+        var parts: [6]u64 = @splat(0);
+        for (bufs[0..n], parts[0..n]) |buf, *part| {
+            const sh = mlx.getShape(buf);
+            part.* = rowBytes(sh[0], sh[1], sh[3], mlx.mlx_array_dtype(buf));
+        }
+        return parts;
     }
 
     fn writeAtOffset(s: mlx.mlx_stream, buf: *mlx.mlx_array, offset: usize, new_chunk: mlx.mlx_array) !void {
@@ -3490,6 +3520,45 @@ test "upstream bugfix: KVCache affine quant keeps its dtype through growth" {
             for ([_]mlx.mlx_array{ cache.entries[0].keys_scales, cache.entries[0].keys_biases, cache.entries[0].values_scales, cache.entries[0].values_biases }) |arr| {
                 try testing.expectEqual(dt, mlx.mlx_array_dtype(arr));
             }
+        }
+    }
+}
+
+test "KVCache on MLX appends kv8 rows in place when MLX's pool holds buffers two pages past their scale rows" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var cache = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
+    defer cache.deinit();
+    // Two heads of 256: 16 B of scales a row, so 1,280 rows are 1.25 pages, which a free 3-page buffer could hold.
+    var prompt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(prompt);
+    try mlx.check(mlx.mlx_ones(&prompt, &[_]c_int{ 1, 2, 1100, 256 }, 4, .bfloat16, s));
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    try mlx.check(mlx.mlx_ones(&row, &[_]c_int{ 1, 2, 1, 256 }, 4, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(prompt));
+    try mlx.check(mlx.mlx_array_eval(row));
+    _ = mlx.mlx_clear_cache();
+    var held: [64]mlx.mlx_array = undefined;
+    for (&held) |*h| {
+        h.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(h, &[_]c_int{3 * 16384}, 1, .uint8, s));
+        try mlx.check(mlx.mlx_array_eval(h.*));
+    }
+    try mlx.check(mlx.mlx_synchronize(s));
+    for (held) |h| _ = mlx.mlx_array_free(h);
+    var pointers: [6]?[*]const u8 = undefined;
+    for ([_]mlx.mlx_array{ prompt, row }, 0..) |rows, step| {
+        var view = try cache.update(0, rows, rows, s, 0);
+        view.deinit();
+        const e = &cache.entries[0];
+        const bufs = [_]mlx.mlx_array{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases };
+        const vec = mlx.mlx_vector_array_new_data(&bufs, bufs.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        try mlx.check(mlx.mlx_synchronize(s));
+        for (bufs, &pointers) |buf, *p| {
+            if (step == 0) p.* = mlx.mlx_array_data_uint8(buf) else try testing.expectEqual(p.*, mlx.mlx_array_data_uint8(buf));
         }
     }
 }

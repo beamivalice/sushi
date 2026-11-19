@@ -10,10 +10,10 @@ fn add(a: usize, b: usize) !usize {
 fn mul(a: usize, b: usize) !usize {
     return std.math.mul(usize, a, b) catch error.GlmTreeScratchLimit;
 }
-/// The rows a growth gives a buffer of `row_bytes` (`glm5_bill.pagedRows`, as `appendRows`).
+/// The rows a growth gives a buffer of `row_bytes` (`mlx_pages.pagedRows`, as `appendRows`).
 fn capacity(needed: usize, row_bytes: usize) !usize {
     if (needed > std.math.maxInt(c_int)) return error.GlmTreeScratchLimit;
-    return @intCast(@import("glm5_bill.zig").pagedRows(needed, &.{row_bytes}));
+    return @intCast(@import("../mlx_pages.zig").pagedRows(needed, &.{row_bytes}));
 }
 
 pub fn plan(processed: usize, latent_capacity: usize, pool_capacity: usize, width: usize, index_width: usize, heads: usize, rows: usize, bytes: usize) !Plan {

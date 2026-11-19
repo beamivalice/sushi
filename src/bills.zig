@@ -2192,25 +2192,44 @@ pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
 /// (`prefill_plan.reservedPrefillTokens`), else the prefill's chunks grow it; then each decode grow takes the +25%
 /// policy up to the prompt, its reply and the `past_end` rows a speculative round writes past the reply's last
 /// (`speculativeRowsPastEnd`). What the bill and the commit count.
-pub fn cacheCapacityTokens(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, chunk: u64, ctx: u64, past_end: u64) u64 {
+pub fn cacheCapacityTokens(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, chunk: u64, ctx: u64, past_end: u64, paged_bits: ?u64) u64 {
     const KV = trunk.KVCache;
     const end = seq +| (if (ctx > seq) @min(max_tokens, ctx - seq) else 0) +| past_end;
     const reserves = config.reservesKvCapacity();
     const long = if (reserves) reservedCacheTokens(seq, max_tokens, chunk, ctx) else 0;
     var cap: u64 = 0;
     if (long > 0) {
-        cap = roundToCacheStep(long);
+        cap = pagedCacheRows(config, roundToCacheStep(long), paged_bits);
     } else if (reserves and seq > chunk) {
-        cap = roundToCacheStep(seq);
+        cap = pagedCacheRows(config, roundToCacheStep(seq), paged_bits);
     } else {
         var at: u64 = 0;
         while (at < seq) {
             at = @min(seq, at + @max(chunk, 1));
-            cap = KV.nextCapacityPolicy(@intCast(cap), @intCast(at));
+            cap = pagedCacheRows(config, KV.nextCapacityPolicy(@intCast(cap), @intCast(at)), paged_bits);
         }
     }
-    while (cap < end) cap = KV.nextCapacityPolicy(@intCast(cap), @intCast(cap + 1));
+    while (cap < end) cap = pagedCacheRows(config, KV.nextCapacityPolicy(@intCast(cap), @intCast(cap + 1)), paged_bits);
     return cap;
+}
+
+/// The rows a cache layer of `kv_bits` grown to `rows` holds (`KVCache.pagedCapacity`): on a load on MLX, its buffers on
+/// MLX's page grid, the most any full-context layer's geometry takes. Null: a buffer that grows on the policy alone (the
+/// QSA history).
+fn pagedCacheRows(config: *const model_mod.ModelConfig, rows: u64, paged_bits: ?u64) u64 {
+    const kv_bits = paged_bits orelse return rows;
+    if (cooler_side.onEngine(config)) return rows;
+    var most = rows;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers) : (li += 1) {
+        if (!config.isGlobalLayer(li)) continue;
+        const k: u64 = @as(u64, config.layerKVHeads(li)) * config.layerHeadDim(li) * 2;
+        const v: u64 = @as(u64, config.layerKVHeads(li)) * config.layerVHeadDim(li) * 2;
+        // Codes, then the BF16 scales and biases of each group of 64 (`kvBytesPerTokenAtBits`).
+        const parts: [4]u64 = if (kv_bits >= 16) .{ k, v, 0, 0 } else .{ k * kv_bits / 16, v * kv_bits / 16, k / 64, v / 64 };
+        most = @max(most, @import("mlx_pages.zig").pagedRows(rows, &parts));
+    }
+    return most;
 }
 
 fn roundToCacheStep(tokens: u64) u64 {
@@ -2247,14 +2266,20 @@ pub const CacheStorage = struct {
 };
 
 pub fn cacheStorage(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) CacheStorage {
-    const rows = @max(cacheCapacityTokens(config, seq, max_tokens, chunk, getEffectiveContextLength(config), speculativeRowsPastEnd(config, warm)), seq);
+    const ctx = getEffectiveContextLength(config);
+    const past = speculativeRowsPastEnd(config, warm);
+    // Each buffer grows on its own steps: the KV and the head's on MLX's page grid at their bits, the history on the policy.
+    const rows = @max(cacheCapacityTokens(config, seq, max_tokens, chunk, ctx, past, kv_bits), seq);
+    const state_rows = @max(cacheCapacityTokens(config, seq, max_tokens, chunk, ctx, past, null), seq);
     const head = headBilled(config, warm);
     const head_state: u64 = if (head) mtpHeadStateBytesPerToken(config) else 0;
+    const head_bits = archHook("headKvBits", u64, config, .{}) orelse defaultKvBits(config);
+    const head_rows = if (head) @max(cacheCapacityTokens(config, seq, max_tokens, chunk, ctx, past, head_bits), seq) else 0;
     return .{
         .rows = rows,
         .kv = pooledCacheBytes(config, rows *| kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits)),
-        .state = pooledCacheBytes(config, rows *| (statePerTokenBilled(config) +| head_state)),
-        .head_kv = if (head) pooledCacheBytes(config, rows *| mtpHeadKvBytesPerToken(config)) else 0,
+        .state = pooledCacheBytes(config, state_rows *| (statePerTokenBilled(config) +| head_state)),
+        .head_kv = if (head) pooledCacheBytes(config, head_rows *| mtpHeadKvBytesPerToken(config)) else 0,
     };
 }
 
@@ -4998,13 +5023,13 @@ test "the 64 GB Sushi-STQ-2.75bpw recipe's bills at both GDN widths: 250000 cont
     const warm = WarmPrefix{ .mtp_on = true };
     // The load bill's context term is the narrowest rung; at this pack's weights the 59,000 MB ceiling admits
     // the 2048 rung. With the SSD tier up (the default) the prefill holds 3 checkpoints, not the 16 it captures.
-    try t.expectEqual(@as(u64, 7_846), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 9_340), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
-    try t.expectEqual(@as(u64, 11_159), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 7_850), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_352), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
+    try t.expectEqual(@as(u64, 11_172), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
     cfg.gdn_state_f32 = false;
-    try t.expectEqual(@as(u64, 7_643), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 9_137), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
-    try t.expectEqual(@as(u64, 10_957), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 7_648), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_150), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
+    try t.expectEqual(@as(u64, 10_970), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
 }
 
 test "an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN widths" {
@@ -5283,7 +5308,7 @@ test "a prompt of several chunks under the long-prompt threshold reserves its ow
     for ([_]u64{ 1025, 5000, 32767 }) |seq| {
         try t.expectEqual(seq, prefill_plan.reservedPrefillTokens(&cfg, seq, 2048, chunk));
         // The reply grows the cache past the prompt by the +25% policy, each grow billed.
-        const cap = cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg), 0);
+        const cap = cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg), 0, 8);
         try t.expect(cap >= seq + 2048);
         try t.expectEqual((cap - seq) * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8), prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{}).reserved_kv_bytes);
     }
@@ -5636,10 +5661,11 @@ test "a Qwen request commits its whole cache at admission, as admission counts w
     const chunk = settings_resolve.prefill_chunk.value;
     // A long prompt reserves the prompt, the reply and a chunk; a short one grows to its reply by the cache's steps.
     for ([_]u64{ 40_000, 1_000 }) |seq| {
-        const per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + statePerTokenBilled(&cfg);
-        const cap = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx, 0);
+        // The KV grows on MLX's page grid, the history on the policy alone.
+        const cap = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx, 0, 8);
+        const history = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx, 0, null);
         try std.testing.expect(cap >= seq + 4096);
-        try std.testing.expectEqual(cap * per_tok, admissionCommitBytes(&cfg, seq, 4096, 8, false));
+        try std.testing.expectEqual(cap * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + history * statePerTokenBilled(&cfg), admissionCommitBytes(&cfg, seq, 4096, 8, false));
     }
     const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
     try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&mimo, 40_000, 4096, 8, false));
@@ -5897,7 +5923,7 @@ test "bill pin: sushiContextBytesAt and the max-context search" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigs("maxSushiContext", &.{
-        4654319616, 512, 1048576, 1048576, 200000, 3546426720, 512, 1048576,
+        4666853376, 512, 1048576, 1048576, 200000, 3573844320, 512, 1048576,
         1048576, 200000, 2966441600, 512, 1048576, 1048576, 200000, 4335553408,
         512, 1048576, 1048576, 200000,
     }, struct {
@@ -5917,8 +5943,8 @@ test "bill pin: loadServingBill" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("loadServingBill", &.{
-        0, 1, 100000, 4654319616, 1048576, 8, 512, 0,
-        1, 100000, 3814862176, 1048576, 8, 512, 0, 0,
+        0, 1, 100000, 4666853376, 1048576, 8, 512, 0,
+        1, 100000, 3842279776, 1048576, 8, 512, 0, 0,
         0, 0,
     }, .{ 7, 7, 2, 2 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -5941,7 +5967,7 @@ test "bill pin: loadServingBill" {
 
 test "bill pin: memoryContextAt and memoryContextAtChunk" {
     try pinConfigs("memoryContextAt", &.{
-        1048576, 1048576, 446720, 446720, 2052459, 2160469, 480445, 588455,
+        1048576, 1048576, 446055, 446055, 2052459, 2160469, 480445, 588455,
         3799051, 3953345, 922039, 1076334, 1076224, 1076224, 1076224, 1076224,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6075,8 +6101,8 @@ test "bill pin: the unnamed hot-cache ask" {
 
 test "bill pin: oneSessionEntryBytes and oneSessionFor" {
     try pinConfigs("oneSession", &.{
-        2250651648, 2250651648, 36553193344, 5322737792, 1073741824, 2250651648, 1526246400, 1526246400,
-        37634198176, 4241732960, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
+        2250651648, 2250651648, 36549015424, 5326915712, 1073741824, 2250651648, 1526246400, 1526246400,
+        37614614176, 4261316960, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
         1073741824, 2052183552, 96290880, 96290880, 36282086528, 5593844608, 1073741824, 96290880,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6107,20 +6133,20 @@ test "bill pin: reservedCacheTokens" {
 
 test "bill pin: prefillRequestTerms" {
     try pinConfigs("prefillRequestTerms", &.{
-        67160064, 14155776, 115458048, 0, 0, 98304, 0, 0,
-        16, 2048000, 67160064, 15335424, 115458048, 0, 0, 106496,
-        12582912, 0, 16, 2048000, 67160064, 14155776, 0, 80216064,
-        0, 98304, 0, 0, 16, 2048000, 67160064, 15335424,
+        53790720, 14155776, 115458048, 0, 0, 98304, 0, 0,
+        16, 2048000, 53790720, 15335424, 115458048, 0, 0, 106496,
+        12582912, 0, 16, 2048000, 53790720, 14155776, 0, 66846720,
+        0, 98304, 0, 0, 16, 2048000, 53790720, 15335424,
         230916096, 0, 0, 106496, 12582912, 0, 16, 2048000,
         126418944, 14155776, 115458048, 0, 0, 98304, 0, 0,
         16, 2048000, 126418944, 15335424, 115458048, 0, 0, 106496,
         12582912, 0, 16, 2048000, 126418944, 14155776, 0, 150994944,
         0, 98304, 0, 0, 16, 2048000, 126418944, 15335424,
         230916096, 0, 0, 106496, 12582912, 0, 16, 2048000,
-        81469440, 244776960, 346374144, 0, 0, 98304, 0, 0,
-        20, 204800000, 81469440, 265175040, 346374144, 0, 0, 106496,
-        217579520, 0, 20, 204800000, 81469440, 244776960, 346374144, 652800000,
-        65280000, 98304, 0, 0, 20, 204800000, 81469440, 265175040,
+        84811776, 244776960, 346374144, 0, 0, 98304, 0, 0,
+        20, 204800000, 84811776, 265175040, 346374144, 0, 0, 106496,
+        217579520, 0, 20, 204800000, 84811776, 244776960, 346374144, 652800000,
+        65280000, 98304, 0, 0, 20, 204800000, 84811776, 265175040,
         461832192, 0, 0, 106496, 217579520, 0, 20, 204800000,
         153354240, 244776960, 346374144, 0, 0, 98304, 0, 0,
         20, 204800000, 153354240, 265175040, 346374144, 0, 0, 106496,
@@ -6137,10 +6163,10 @@ test "bill pin: prefillRequestTerms" {
         0, 0, 20, 3276800, 118517760, 0, 0, 141557760,
         2560000, 348541440, 0, 0, 20, 3276800, 118517760, 15173632,
         0, 0, 2560000, 348541440, 0, 0, 20, 3276800,
-        76377600, 0, 0, 0, 136000000, 199904640, 0, 0,
-        20, 167772160, 76377600, 15173632, 0, 0, 136000000, 199904640,
-        0, 0, 20, 167772160, 76377600, 0, 0, 612000000,
-        81600000, 199904640, 0, 0, 20, 167772160, 76377600, 15173632,
+        79511040, 0, 0, 0, 136000000, 199904640, 0, 0,
+        20, 167772160, 79511040, 15173632, 0, 0, 136000000, 199904640,
+        0, 0, 20, 167772160, 79511040, 0, 0, 612000000,
+        81600000, 199904640, 0, 0, 20, 167772160, 79511040, 15173632,
         0, 0, 136000000, 199904640, 0, 0, 20, 167772160,
         143769600, 0, 0, 0, 256000000, 348541440, 0, 0,
         20, 167772160, 143769600, 15173632, 0, 0, 256000000, 348541440,
@@ -6227,13 +6253,13 @@ test "bill pin: growCoexistBytes and the eval-window terms" {
 
 test "bill pin: prefillNeededAtChunk" {
     try pinConfigs("prefillNeededAtChunk", &.{
-        1127747584, 1141518336, 932073472, 1256976384, 1488887104, 1502657856, 1293212992, 1618115904,
+        1114378240, 1128148992, 932073472, 1243607040, 1475517760, 1489288512, 1293212992, 1604746560,
         1196478464, 1210249216, 930025472, 1325707264, 1557617984, 1571388736, 1291164992, 1686846784,
-        4451250176, 4744431616, 3716850176, 4888754176, 6205771904, 6503254144, 5471371904, 6647576704,
+        4463783936, 4756965376, 3729383936, 4901287936, 6209949824, 6507432064, 5475549824, 6651754624,
         5702987776, 5996169216, 4320587776, 6140491776, 7479627904, 7777110144, 6097227904, 7921432704,
         1708241280, 1727208320, 1614238080, 1727208320, 2363488640, 2382455680, 2269485440, 2382455680,
         1974385280, 1993352320, 1797438080, 1993352320, 2629632640, 2648599680, 2452685440, 2648599680,
-        3590128480, 3609095520, 2757128480, 3609095520, 5676047200, 5695014240, 4843047200, 5695014240,
+        3617546080, 3636513120, 2784546080, 3636513120, 5679964000, 5698931040, 4846964000, 5698931040,
         5129713280, 5148680320, 3561713280, 5148680320, 7236368000, 7255335040, 5668368000, 7255335040,
         2089683520, 2089683520, 2089683520, 2274208320, 2729646720, 2729646720, 2729646720, 2914171520,
         2121102080, 2121102080, 2121102080, 2305626880, 2760733440, 2760733440, 2760733440, 2945258240,
@@ -6355,7 +6381,7 @@ test "bill pin: creditedAdmissionBill and its verdict" {
         10737418240, 12884901888, 5368709120, 3221225472, 1024, 1, 1, 0,
         2147483648, 12884901888, 10737418240, 5368709120, 3221225472, 1024, 0, 1,
         1, 2147483648, 12884901888, 11811160064, 5368709120, 3221225472, 1024, 0,
-        1, 1, 2147483648, 157286400, 10737418240, 12884901888, 5368709120, 3221225472,
+        1, 1, 2147483648, 143917056, 10737418240, 12884901888, 5368709120, 3221225472,
         1024, 1, 1, 0, 2147483648, 12884901888, 10737418240, 5368709120,
         3221225472, 1024, 0, 1, 1, 2147483648, 12884901888, 11811160064,
         5368709120, 3221225472, 1024, 0, 1, 1, 2147483648, 0,
@@ -6611,7 +6637,7 @@ test "a warm restore whose buffers hold the prompt but not the reservation bills
     const chunk: u64 = 2048;
     for ([_]*const model_mod.ModelConfig{ &q4, &mimo }) |cfg| {
         const kv = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
-        const reserved = cacheCapacityTokens(cfg, seq, 32_000, chunk, getEffectiveContextLength(cfg), 0);
+        const reserved = cacheCapacityTokens(cfg, seq, 32_000, chunk, getEffectiveContextLength(cfg), 0, kv_bits);
         try t.expect(seq <= capacity and capacity < reserved);
         const window = capacity * kv / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS);
         try t.expect(window > 0 and window < capacity * kv);

@@ -101,7 +101,7 @@ pub const Scope = struct {
         try mlx.check(mlx.mlx_add(out, a, zero, self.s));
         return out.*;
     }
-    /// `parts`: a row's bytes in each buffer that grows with `buffer` (`glm5_bill.pagedRows`).
+    /// `parts`: a row's bytes in each buffer that grows with `buffer` (`mlx_pages.pagedRows`).
     fn appendRows(self: *Scope, buffer: Arr, used: usize, chunk: Arr, parts: []const u64) !Arr {
         const sh = mlx.getShape(chunk);
         const needed = try std.math.add(usize, used, @intCast(sh[0]));
@@ -109,7 +109,7 @@ pub const Scope = struct {
         const current: usize = if (buffer.ctx == null) 0 else @intCast(mlx.getShape(buffer)[0]);
         var target = buffer;
         if (needed > current) {
-            const capacity: usize = @intCast(glm5_bill.pagedRows(needed, parts));
+            const capacity: usize = @intCast(@import("../mlx_pages.zig").pagedRows(needed, parts));
             if (capacity > std.math.maxInt(c_int)) return error.InvalidGlmAttentionShape;
             const padding = try self.zeros(&.{ @intCast(capacity - current), sh[1] }, mlx.mlx_array_dtype(chunk));
             target = try self.join(buffer, padding);

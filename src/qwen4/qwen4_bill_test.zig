@@ -710,13 +710,14 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     // the prompt's own rows, not a second copy of the cache.
     const terms = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
-    const cap = bills.cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg), 0);
+    const cap = bills.cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg), 0, 8);
     try t.expect(cap >= seq + 2048 + chunk);
     try t.expectEqual((cap - seq) * kv_per_tok, terms.reserved_kv_bytes);
     try t.expect(terms.reserved_kv_bytes * 4 < seq * kv_per_tok); // headroom, not a copy
     // The indexer history is billed at one copy plus the score bank (`statePerTokenBilled`).
     try t.expectEqual(cfg.qsaHistoryBytesPerToken() + cfg.qsaScoreBankBytesPerToken(), statePerTokenBilled(&cfg));
-    try t.expectEqual(cap * statePerTokenBilled(&cfg), terms.state_bytes);
+    // The history grows on the policy alone; the KV on MLX's page grid (`cacheCapacityTokens`).
+    try t.expectEqual(bills.cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg), 0, null) * statePerTokenBilled(&cfg), terms.state_bytes);
     try t.expectEqual(held, terms.checkpoint_bytes);
 
     // 3. The bill moved by more than 3 GB, toward a 503 instead of a corpse.
@@ -733,10 +734,10 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
 
     // A short prompt reserves nothing past itself, and is billed the cache its reply grows it to.
     const short = prefillRequestTerms(&cfg, 4096, 2048, 8, chunk, .{});
-    const short_cap = bills.cacheCapacityTokens(&cfg, 4096, 2048, chunk, getEffectiveContextLength(&cfg), 0);
+    const short_cap = bills.cacheCapacityTokens(&cfg, 4096, 2048, chunk, getEffectiveContextLength(&cfg), 0, 8);
     try t.expect(short_cap >= 4096 + 2048);
     try t.expectEqual((short_cap - 4096) * kv_per_tok, short.reserved_kv_bytes);
-    try t.expectEqual(short_cap * statePerTokenBilled(&cfg), short.state_bytes);
+    try t.expectEqual(bills.cacheCapacityTokens(&cfg, 4096, 2048, chunk, getEffectiveContextLength(&cfg), 0, null) * statePerTokenBilled(&cfg), short.state_bytes);
 }
 
 test "the QSA history is billed at the one copy a slot HOLDS, plus the score bank" {
@@ -753,7 +754,7 @@ test "the QSA history is billed at the one copy a slot HOLDS, plus the score ban
 
     const seq: u64 = 458_832;
     const terms = prefillRequestTerms(&cfg, seq, 2048, 8, 4096, .{});
-    try t.expectEqual(bills.cacheCapacityTokens(&cfg, seq, 2048, 4096, getEffectiveContextLength(&cfg), 0) * (one + bank), terms.state_bytes);
+    try t.expectEqual(bills.cacheCapacityTokens(&cfg, seq, 2048, 4096, getEffectiveContextLength(&cfg), 0, null) * (one + bank), terms.state_bytes);
 
     var dense = model_mod.ModelConfig{};
     dense.num_hidden_layers = 32;
@@ -1182,9 +1183,9 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
         @as(u64, 20_845),
         prefillNeededAtChunk(&cfg, 364_509, 421_923, kv_bits, 2048, .{}) / mb,
     );
-    // Turn B: 11,854 MB with the 8192-token headroom, 19,362 MB with its reply billed whole.
+    // Turn B: 11,854 MB with the 8192-token headroom, 19,370 MB with its reply billed whole.
     try t.expectEqual(
-        @as(u64, 19_362),
+        @as(u64, 19_370),
         prefillNeededAtChunk(&cfg, 368_208, 418_224, kv_bits, 512, .{}) / mb,
     );
 }
@@ -1229,7 +1230,7 @@ test "a streamed Qwen plans its QSA history beside its KV for every planned toke
     try std.testing.expectEqual(per_token * expertStreamingPlannedSeq(&cfg) + slotRingBytes(&cfg, 8), expertStreamingPlannedKvBytes(&cfg));
 }
 
-test "a 32 GB Mac's lean Flash-Next budget advertises and admits an 80k prompt" {
+test "a 32 GB Mac's lean Flash-Next budget on MLX admits the context it advertises, 79,872 tokens" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
@@ -1246,12 +1247,13 @@ test "a 32 GB Mac's lean Flash-Next budget advertises and admits an 80k prompt" 
     cfg.pinned_prefill_chunk = 512;
     const ceiling: u64 = 28976 << 20; // 30000 MiB wired limit less the 1 GiB margin
     const active: u64 = 27_378_205_274; // the measured lean pack's resident bytes
-    const prompt: u64 = 80_000;
     const new_tokens: u32 = 16;
-    // What the boot advertises: within the measured range the bill is the one reserve, no margin on top.
+    // What the boot advertises: within the measured range the bill is the one reserve, no margin on top. The KV on
+    // MLX's page grid takes up to 768 rows more than the 256-row step, which costs this tight budget its 80k.
     var sized = cfg;
     sized.pinned_context = ssdFirstSessionTokensNow(&cfg, 8, ceiling, active, 512);
-    try std.testing.expect(sized.pinned_context >= prompt + new_tokens);
+    try std.testing.expect(sized.pinned_context >= 79_872);
+    const prompt: u64 = sized.pinned_context - new_tokens;
     const budget = admissionAvailable(ceiling, active);
     try std.testing.expect(prefillNeededAtChunk(&sized, prompt, new_tokens, 8, 512, .{}) <= budget);
 }
@@ -1494,7 +1496,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     const chunk: u64 = 512;
     const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
-    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg), 0);
+    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg), 0, kv_bits);
 
     // Pessimal reading of the entry: capacity exactly the rows it matched, so the append DOES
     // grow every attention layer.
@@ -1507,7 +1509,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u64, 465), g.grow_coexist_bytes / mb);
     // The bill at the narrowest and a wider width.
     // The reply is billed whole: 5,057 MB under the 8192-token headroom.
-    try t.expectEqual(@as(u64, 11_092), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
+    try t.expectEqual(@as(u64, 11_100), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
     try t.expectEqual(@as(u64, 12_584), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
 
     // A buffer the previous turn sized above this prompt but below the reservation is grown to
@@ -1516,7 +1518,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     const f = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, fits);
     try t.expect(reserved > 450_048);
     try t.expectEqual(450_048 *| kv_per_tok / 12, f.grow_coexist_bytes);
-    try t.expectEqual(@as(u64, 11_094), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
+    try t.expectEqual(@as(u64, 11_102), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
 
     // Byte-identical arms: a SHARED restore is copied whole by the first append, so it credits
     // nothing and bills no window either; a COLD prompt has nothing to credit.
@@ -1556,12 +1558,14 @@ test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the 
     try t.expectEqual(ctx + chunk, KVCache.reservedTokens(ctx - 16, clamped, chunk, ctx));
 
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
-    // Billed at the capacity the cache allocates for it, the reservation at the cache's 256-row step.
-    const cap = bills.cacheCapacityTokens(&cfg, seq, clamped, chunk, ctx, 0);
-    try t.expectEqual(@as(u64, 420_096), cap);
+    // Billed at the capacity the cache allocates for it: the reservation at the cache's 256-row step, on MLX's page grid
+    // (1,024 rows at kv8) for the KV, the history's at the step alone.
+    const cap = bills.cacheCapacityTokens(&cfg, seq, clamped, chunk, ctx, 0, 8);
+    try t.expectEqual(@as(u64, 420_864), cap);
+    try t.expectEqual(@as(u64, 420_096), bills.cacheCapacityTokens(&cfg, seq, clamped, chunk, ctx, 0, null));
     const terms = prefillRequestTerms(&cfg, seq, clamped, 8, chunk, .{});
     try t.expectEqual((cap - seq) * kv_per_tok, terms.reserved_kv_bytes);
-    try t.expectEqual(cap * statePerTokenBilled(&cfg), terms.state_bytes);
+    try t.expectEqual(@as(u64, 420_096) * statePerTokenBilled(&cfg), terms.state_bytes);
 
     // ...and the whole bill drops by more than 10 GB, from above the live headroom to under it.
     const ctx_bounded: PrefillRequestTerms = .{
@@ -1828,7 +1832,8 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const off = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{});
     try t.expectEqual(@as(u64, 0), off.mtp_head_kv_bytes);
     const on = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{ .mtp_on = true });
-    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg), 0);
+    // Each buffer's own steps: the dense head's cache and the history on the policy alone (`cacheStorage`).
+    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg), 0, null);
     try t.expectEqual(reserved * 2048, on.mtp_head_kv_bytes);
     const n: u64 = cfg.attnCacheLayerCount();
     try t.expectEqual(cfg.qsaRingBytes() + cfg.qsaRingBytes() / n, on.qsa_ring_bytes);
@@ -1863,7 +1868,8 @@ test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_q
     try t.expectEqual(@as(u64, 576), request_head);
     try t.expectEqual(@as(u64, 1088), mtpHeadKvBytesPerToken(&cfg));
     const on = prefillRequestTerms(&cfg, seq, max_tokens, request_bits, chunk, .{ .mtp_on = true });
-    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg), 0);
+    // The head's cache grows on MLX's page grid at the boot scheme's bits too.
+    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg), 0, 8);
     try t.expectEqual(reserved * 1088, on.mtp_head_kv_bytes);
 }
 
@@ -1941,13 +1947,13 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
     try t.expectEqual(gross * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq), needed);
 
-    // AND THE VERDICT MOVES. 11,857 MB refused against 10,000 MB available;
-    // the honest checkpoint term brings it to 9,793 MB, so the turn is served.
+    // AND THE VERDICT MOVES. 11,869 MB refused against 10,000 MB available;
+    // the honest checkpoint term brings it to 9,805 MB, so the turn is served.
     const available: u64 = 10_000 * mb;
     try t.expect(needed < available);
-    try t.expectEqual(@as(u64, 9_793), needed / mb);
+    try t.expectEqual(@as(u64, 9_805), needed / mb);
     const before = gross - terms.checkpoint_bytes + @as(u64, launch_state.ssm_checkpoint_max) * per_cp;
-    try t.expectEqual(@as(u64, 11_857), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
+    try t.expectEqual(@as(u64, 11_869), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
     try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) > available);
 }
 
@@ -1992,8 +1998,8 @@ test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a re
     try t.expect(@import("../cooler_side.zig").onEngine(&cfg));
     const ctx = getEffectiveContextLength(&cfg);
     const seq: u64 = 364_509;
-    const short = bills.cacheCapacityTokens(&cfg, seq, 8192, 2048, ctx, 0);
-    const long = bills.cacheCapacityTokens(&cfg, seq, 421_923, 2048, ctx, 0);
+    const short = bills.cacheCapacityTokens(&cfg, seq, 8192, 2048, ctx, 0, 8);
+    const long = bills.cacheCapacityTokens(&cfg, seq, 421_923, 2048, ctx, 0, 8);
     // Each reserved token costs its KV and state, held at the pool's size class (at most a sixteenth over).
     const pooled = struct {
         fn of(b: u64) u64 {

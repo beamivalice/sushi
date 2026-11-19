@@ -114,24 +114,6 @@ pub fn glmCommitStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm:
     return copied +| kept +| window;
 }
 
-/// MLX rounds an allocation past a page up to whole pages, its pool hands one a free buffer up to two pages larger,
-/// and it donates a buffer only when it is at most one page past the array's bytes (`is_donatable`).
-const mlx_page: u64 = 16384;
-
-/// PURE: the rows a stored buffer holds for `rows`, where `part_bytes` is a row's bytes in each buffer that grows with
-/// it (a quantized latent's codes, scales and biases): 256-row steps on which every part past a page is a whole number
-/// of pages, so whatever buffer MLX's pool hands a part is one MLX donates, and an append writes in place.
-pub fn pagedRows(rows: u64, part_bytes: []const u64) u64 {
-    var capacity = (rows +| 255) / 256 * 256;
-    while (!onPages(capacity, part_bytes)) capacity += 256;
-    return capacity;
-}
-
-fn onPages(rows: u64, part_bytes: []const u64) bool {
-    for (part_bytes) |b| if (rows *| b > mlx_page and rows *| b % mlx_page != 0) return false;
-    return true;
-}
-
 /// PURE: a stored latent row's bytes in each part: kv8 or kv6 codes and their BF16 scales and biases (group 64), or the
 /// one dense part of `itemsize`-byte values (`bits` 0).
 pub fn latentPartBytes(width: u64, bits: u8, itemsize: u64) [3]u64 {
@@ -144,9 +126,9 @@ pub fn glmCacheBytes(config: *const model_mod.ModelConfig, prompt_len: u64, max_
     const ctx = bills.getEffectiveContextLength(config);
     const reserved = @max(prompt_len, @min(prompt_len +| max_tokens, ctx));
     // Native appendRows steps the latent and the pooled index (a row per four) separately in 256 rows, the latent's
-    // on MLX's pages (`pagedRows`).
+    // on MLX's pages.
     const parts = latentPartBytes(config.mla_kv_lora_rank, if (kv_bits >= 16) 0 else @intCast(kv_bits), 2);
-    const rows = @max((reserved +| 1023) / 1024 * 1024, pagedRows(reserved, &parts));
+    const rows = @max((reserved +| 1023) / 1024 * 1024, @import("../mlx_pages.zig").pagedRows(reserved, &parts));
     return bills.sessionBytesPerToken(config, kv_bits) *| rows;
 }
 
