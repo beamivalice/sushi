@@ -646,7 +646,9 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   MTP head's depth cap (8 drafts against 6 on an M5 Max), so the warm's verify cap is the wider of the two, and the
   contract pins every such width past a sparse indexer's budget on the served-geometry cut.
 - **A Cooler load whose warm fails does not serve** (`model_load.warmLoad`): a forward that fails in the warm fails in a
-  request. A warm that ends seals the engine and trims its transients (`arch_cooler.warmEnded`), for every Cooler arch.
+  request. A warm that ends seals the engine and trims its transients (`arch_cooler.warmEnded`), for every Cooler arch;
+  a model torn down before its warm ended puts back the seal its build lifted (`Trunk.warm_seal`), so a failed load
+  beside a sealed model leaves the engine sealed.
 - **A pipeline made after the warm is logged** (`engine.seal`): `[engine] compiled inside a request (N ms): <name>`
   at warning level, and the request-end debug line counts them. The count is 0 on the release pack.
 

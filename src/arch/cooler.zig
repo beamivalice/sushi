@@ -157,9 +157,15 @@ pub fn unloadModel(config: *const ModelConfig) void {
     trimTo(0);
 }
 
-/// A Cooler load's warm ended: a pipeline made from here is late (`engine.seal`), and the warm's transients leave the
-/// pool, so the load's memory reading is the model's.
-pub fn warmEnded() void {
+/// A model went before its warm ended (`Trunk.warm_seal` still held): the seal its build lifted stands again.
+pub fn warmAbandoned(seal: ?mlx.engine.Seal) void {
+    if (seal) |s| s.end();
+}
+
+/// The Cooler load of `xfm` ended its warm: a pipeline made from here is late (`engine.seal`), and the warm's transients
+/// leave the pool, so the load's memory reading is the model's.
+pub fn warmEnded(xfm: *Trunk) void {
+    xfm.warm_seal = null;
     mlx.engine.seal(true);
     mlx.engine.close();
     mlx.engine.trim();
@@ -197,8 +203,8 @@ pub const LoadScope = struct {
         return .{ .on = true, .held = true, .seal = mlx.engine.unsealed() };
     }
 
-    /// The weights are read or the model is built: the model keeps its hold, and the seal stays lifted until its warm
-    /// ends (`warmEnded`).
+    /// The weights are read or the model is built: the model keeps its hold, and its seal (`Trunk.warm_seal`) stays
+    /// lifted until its warm ends (`warmEnded`) or the model goes.
     pub fn end(_: LoadScope) void {
         mlx.engine.own_weights = false;
     }

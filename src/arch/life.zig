@@ -24,6 +24,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: trunk.ModelConfig,
         inline else => |t| blk: {
             var m = try registry.Mod(t).init(io, allocator, config, weights, s);
             m.arch = t;
+            m.warm_seal = scope.seal;
             break :blk m;
         },
     };
@@ -38,7 +39,9 @@ pub fn deinit(a: Arch) void {
     switch (a) {
         inline else => |m, t| {
             const held = mlx.engine.isStream(m.s);
+            const seal = m.warm_seal;
             registry.Mod(t).deinit(m);
+            @import("cooler.zig").warmAbandoned(seal);
             // The hold `init`'s load scope took is the model's to here (`arch_cooler.LoadScope.build`).
             if (held) @import("handle.zig").engineHoldEnd();
         },

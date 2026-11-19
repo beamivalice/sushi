@@ -813,6 +813,9 @@ pub const Trunk = struct {
     arch: arch_registry.Tag = undefined,
     /// The arch's own model-lifetime state (`arch/arch_state.zig`): a field per enabled arch.
     arch_state: arch_state_mod.State = .{},
+    /// The seal its Cooler build lifted (`arch_cooler.LoadScope.build`): its warm's end takes it (`warmEnded`), and a
+    /// model torn down before then ends it, so a failed load leaves the engine as it found it.
+    warm_seal: ?mlx.engine.Seal = null,
     config: ModelConfig,
     cache: KVCache,
     s: mlx.mlx_stream,

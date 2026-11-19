@@ -2192,7 +2192,7 @@ test "dsv41 engine: a Cooler load that fails beside a resident Cooler model leav
     try fx.open(dir);
     defer fx.deinit();
     // A served load's warm ends sealed (`arch_cooler.warmEnded`); the fixture runs only DeepSeek's own warm.
-    @import("../arch/cooler.zig").warmEnded();
+    @import("../arch/cooler.zig").warmEnded(&fx.xfm);
     dsv41_borrow.warm_budget_override = 0;
     var failed: EngineFixture = undefined;
     const got = failed.open(dir);

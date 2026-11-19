@@ -4260,3 +4260,47 @@ test "cooler contract: a tick unit failed by an error no latch explains fails it
         }
     }.run);
 }
+
+test "cooler contract: a second Cooler load beside a sealed one whose warm fails leaves the engine sealed, as the second load's success would" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            defer mlx.engine.fault.disarm();
+            var first: Load = undefined;
+            try first.open(C, dir, true);
+            defer _ = first.close();
+            try testing.expect(mlx.engine.sealed());
+            // The warm's pool asks, counted on a second load that serves: it ends sealed.
+            var total: u64 = 0;
+            {
+                var fx: Load = undefined;
+                try fx.prepare(C, dir, true);
+                try fx.load(dir);
+                try testing.expect(!mlx.engine.sealed());
+                const c0 = mlx.engine.fault.count();
+                fx.serve() catch |e| {
+                    fx.discard();
+                    return e;
+                };
+                total = mlx.engine.fault.count() - c0;
+                _ = fx.close();
+            }
+            try testing.expect(mlx.engine.sealed());
+            if (total < 2) return error.SkipZigTest;
+            var fx: Load = undefined;
+            try fx.prepare(C, dir, true);
+            try fx.load(dir);
+            mlx.engine.fault.arm(total / 2);
+            const r = fx.serve();
+            mlx.engine.fault.disarm();
+            if (r) |_| {
+                _ = fx.close();
+                return error.SkipZigTest;
+            } else |_| {}
+            var msg: [300]u8 = undefined;
+            _ = mlx.takeError(&msg);
+            fx.discard();
+            errdefer std.debug.print("{s}: the first load serves on with the engine unsealed after a second load's warm failed at pool buffer {d} of {d}\n", .{ std.fs.path.basename(dir), total / 2, total });
+            try testing.expect(mlx.engine.sealed());
+        }
+    }.run);
+}

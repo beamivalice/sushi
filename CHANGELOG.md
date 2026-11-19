@@ -21,6 +21,9 @@ earlier history is mlx-serve's, in that project's changelog.
   while the request it names bills the reply's cache rows at the pool's size class, so the request was refused again.
   The bill now counts the prompt's cache rows at that size too, as the pool holds them: a Qwen request on Sushi Cooler
   needs up to a sixteenth more of its cache free than before, and an auto-sized context comes out that much smaller.
+- **A Sushi Cooler model keeps reporting late kernel compiles after another model's load fails beside it**: a second
+  load whose warm failed left the engine unsealed, so a kernel compiled inside a later request of the first model was
+  no longer logged or written to its pipeline manifest.
 - **DeepSeek's release checkpoint answers one greedy request with one text when DSpark is on**: its FP8 trunk and MXFP4
   experts give a row other bytes at another verify width, and the width followed measured timings, so the same request
   could answer two texts. A greedy or seeded DSpark request on that layout now verifies at one fixed width, which decodes

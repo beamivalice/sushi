@@ -303,7 +303,7 @@ pub fn warmLoad(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xf
         log.err("[warm] a served request failed ({s}: {s}); a load on Sushi Cooler does not serve without it\n", .{ @errorName(err), latchedCause(&cause) });
         return err;
     };
-    @import("arch/cooler.zig").warmEnded();
+    @import("arch/cooler.zig").warmEnded(xfm);
     if (plan) |*p| p.store() else cooler_pipelines.rewriteLate();
 }
 
