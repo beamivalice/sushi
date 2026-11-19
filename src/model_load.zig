@@ -1961,6 +1961,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             pub fn sleep(r: *@This()) void {
                 std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
             }
+            pub fn freeRamBinds(r: *@This()) bool {
+                return r.last.?.bound() == .free_ram;
+            }
         };
         var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config), .wired_floor = bills.wiredCeilingFloorFor(params.config) };
         var avail_bytes = reader.read();
@@ -1968,7 +1971,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // Its maximum context is read only by a refusal, which an unread figure never makes.
         var serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, if (avail_bytes) |b| b -| weights_bytes else 0) else null;
         var needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
-        if (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed)) {
+        if (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed) and reader.freeRamBinds()) {
             log.info("[preflight] {d:.2} GB available of {d:.2} GB needed; waiting while memory is still being released\n", .{
                 @as(f64, @floatFromInt(avail_bytes.?)) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),

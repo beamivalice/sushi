@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A model load refused by the GPU memory limit answers at once**: the memory check waited about 2 s for memory to come
+  back before every refusal, even when the bound was the GPU limit, which waiting cannot raise; it now waits only while
+  free RAM is the bound.
 - **A refused model load stays on screen in the web page until you dismiss it**: its message, which can hold a
   command to copy, left after 8 s whatever its length; a toast carrying the server's refusal (a load, an update, a
   Models or Settings action) now stays until dismissed.

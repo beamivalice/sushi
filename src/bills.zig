@@ -6728,12 +6728,13 @@ pub fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64)
 
 /// A just-exited process returns its Metal memory over seconds: while a short reading keeps
 /// rising, poll every 500 ms; stop at enough, after 2 s without growth, or after 15 s. An unread figure ends the wait.
+/// Only free RAM comes back: a reading a GPU limit binds (`reader.freeRamBinds()` false) is final.
 pub fn settleAvailableBytes(first: ?u64, needed: u64, reader: anytype) ?u64 {
     var avail = first;
     var stalled: u32 = 0;
     var polls: u32 = 0;
     while (avail) |now| : (polls += 1) {
-        if (now >= needed or stalled >= 4 or polls >= 30) break;
+        if (now >= needed or stalled >= 4 or polls >= 30 or !reader.freeRamBinds()) break;
         reader.sleep();
         avail = reader.read();
         if (avail) |next| stalled = if (next > now) 0 else stalled + 1;
@@ -7171,12 +7172,16 @@ test "load preflight waits for a prior process's memory to come back, and only w
     const Fake = struct {
         seq: []const u64,
         i: usize = 0,
+        free_binds: bool = true,
         fn read(f: *@This()) u64 {
             const v = f.seq[@min(f.i, f.seq.len - 1)];
             f.i += 1;
             return v;
         }
         fn sleep(_: *@This()) void {}
+        fn freeRamBinds(f: *@This()) bool {
+            return f.free_binds;
+        }
     };
     var rising = Fake{ .seq = &.{ 80 * gib, 95 * gib, 110 * gib } };
     try testing.expectEqual(@as(?u64, 110 * gib), settleAvailableBytes(69 * gib, 100 * gib, &rising));
@@ -7191,6 +7196,10 @@ test "load preflight waits for a prior process's memory to come back, and only w
     var never = Fake{ .seq = &.{200 * gib} };
     try testing.expectEqual(@as(?u64, 120 * gib), settleAvailableBytes(120 * gib, 100 * gib, &never));
     try testing.expectEqual(@as(usize, 0), never.i);
+    // A reading a GPU limit binds (the working set, a declared wired limit) cannot rise by waiting.
+    var limit = Fake{ .seq = &.{200 * gib}, .free_binds = false };
+    try testing.expectEqual(@as(?u64, 70 * gib), settleAvailableBytes(70 * gib, 100 * gib, &limit));
+    try testing.expectEqual(@as(usize, 0), limit.i);
 }
 
 test "a load beside buffers past a bound reads that bound as 0 and is refused; only a figure never read admits it" {
