@@ -2818,7 +2818,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     };
                     break :prefill;
                 }
-                if (postPrefillTerminal(slot)) continue;
+                if (postPrefillTerminal(sch, slot)) continue;
                 // Interleaved decode time is billed to the decoding slots, so prefill_ns excludes it.
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
                 if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
@@ -2894,9 +2894,19 @@ fn discardRestore(slot: anytype) void {
     slot.cached_tokens = 0;
 }
 
-pub fn postPrefillTerminal(slot: *Slot) bool {
+pub fn postPrefillTerminal(sch: *Scheduler, slot: *Slot) bool {
+    return postPrefillTerminalWith(sch, slot, commitSlotIfApplicable);
+}
+
+/// A slot cancelled as its prefill ends joins neither `decoding` nor the cleanup queue until its connection completes
+/// it, so the next exclusive request may take the state first: it commits here, before the release, as a cull does.
+pub fn postPrefillTerminalWith(sch: *Scheduler, slot: *Slot, commit: *const fn (*Scheduler, *Slot) void) bool {
     if (slot.state == .errored) return true;
     if (!slot.cancelled.load(.acquire)) return false;
+    if (commitsAtCull(slot)) {
+        commit(sch, slot);
+        slot.committed_at_cull = true;
+    }
     releaseNativeState(slot);
     return true;
 }

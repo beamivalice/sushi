@@ -515,6 +515,9 @@ pub const State = struct {
     /// Which state this is, for a record of it (`dsv41_prefix.Live`): a made state takes a new one, and the state keeps
     /// it as it rolls back or moves between its model and a request.
     id: u64 = 0,
+    /// The KV cache of the request whose forward last moved this state; 0 once a rollback hands it to the next one.
+    /// Only that request publishes a record of it (`ownedBy`).
+    owner: usize = 0,
     n: usize = 0,
     layers: []LState,
     /// The request's compressed token ids (Engram look-back).
@@ -3391,6 +3394,12 @@ pub fn currentState(m: *const Model) !?*const State {
     return if (at.*) |*st| st else null;
 }
 
+/// Whether the state stands where the forwards of the request over `cache` left it.
+pub fn ownedBy(m: *const Model, cache: *const anyopaque) !bool {
+    const st = (try currentState(m)) orelse return false;
+    return st.owner == @intFromPtr(cache);
+}
+
 pub fn ensureState(m: *Model) !*State {
     const at = try liveSlot(m);
     if (at.* == null) at.* = try newState(m);
@@ -3936,6 +3945,7 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
         if (!present(a) or dim(a, 0) != ring.cap) return error.Dsv41CheckpointMismatch;
     }
     errdefer resetState(m);
+    st.owner = 0;
     for (st.layers, 0..) |*ls, li| {
         const a = slots[2 * li];
         try shareInto(&ls.win.buf, a[0]);

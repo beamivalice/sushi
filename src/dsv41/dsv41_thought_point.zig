@@ -136,6 +136,9 @@ pub fn publishLive(sch: *Scheduler, slot: *Slot, hc: *prefix_cache_mod.HotPrefix
     const dsv = arch_handle.trunk(slot.model.handle orelse return).arch_state.dsv41.model orelse return;
     const media = prefix_cache_mod.MediaStamp.of(slot.vision_key, slot.media_start);
     if (dsv.serves_rows) return writeEndPoint(hc, dsv, slot, tokens, media);
+    // A commit deferred past another request's forward would label this request's tokens with that request's points.
+    const owned = dsv41_model.ownedBy(dsv, &slot.cache) catch |e| return log.err("[dsv41-prefix] the request's record not published: {s}\n", .{@errorName(e)});
+    if (!owned) return log.err("[dsv41-prefix] the request's record not published: Dsv41StateNotOwned (another request has moved the state since)\n", .{});
     const kept = dsv41_prefix.keepEndPointDsv41(hc, dsv, tokens.len) catch |e| return log.err("[dsv41-prefix] the request's record not published: {s}\n", .{@errorName(e)});
     if (kept) log.info("[dsv41-prefix] restore point behind the reply at {d}\n", .{tokens.len});
     const unflushed = dsv41_prefix.publishLiveDsv41(hc, dsv, tokens, slot.has_tools, media, slot.cache.config) catch |e| return log.err("[dsv41-prefix] the request's record not published: {s}\n", .{@errorName(e)});

@@ -1206,9 +1206,11 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   telling the record. A crash flushes nothing: the cache restores from the last grid point (at most 8192 tokens of re-prefill). Log:
   `[dsv41-prefix] live points to SSD (why): N points to P, X GB staged, held T ms`. The flush needs no bill of its own: the
   points are the record's, the rows views, and the writer's bounded buffers take the bytes.
-  A cancelled request (stop sequence, disconnect) publishes at the scheduler's cull (`commitsAtCull`), not at the cleanup
-  drain: the cull drops it from `decoding`, so the next request is admitted over the model's state before `complete()`,
-  and a later publish would pair this request's tokens with that request's points and epoch.
+  A cancelled request (stop sequence, disconnect) publishes where the scheduler lets go of it, at the cull or, cancelled
+  as its prefill ends, at `postPrefillTerminal` (`commitsAtCull`), not at the cleanup drain: the next request is admitted
+  over the model's state before `complete()`, and a later publish would pair this request's tokens with that request's
+  points and epoch. The publish itself checks: the state names the request whose forward last moved it (`State.owner`,
+  cleared by a rollback), and a publish by any other request writes nothing (`Dsv41StateNotOwned` in the log).
 - **A finished request leaves a point right behind its reply** (`dsv41_prefix.keepEndPointDsv41`, at the commit): the
   next prompt repeats the reply token for token (the thought with tools, the answer, the call block), so the state as it
   stands is the deepest point the turn shares and the turn prefills only what is new, where it prefilled the whole reply

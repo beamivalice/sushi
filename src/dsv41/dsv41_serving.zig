@@ -473,6 +473,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     if (ctx.cache.step == 0) dsv41_model.resetState(m);
     const st = try dsv41_model.ensureState(m);
     if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
+    st.owner = @intFromPtr(ctx.cache);
     m.s = self.s;
     const rows = mlx.getShape(ids);
     if (rows.len != 2 or rows[0] != 1) return error.InvalidDsv41Input;

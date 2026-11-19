@@ -19,6 +19,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A long Qwen request with MTP on Sushi Cooler stays inside the memory it was admitted with**: the MTP head's cache
   grew in steps past what admission billed, more the longer the prompt, and now takes its whole reservation up front,
   as the model's own cache does.
+- **A DeepSeek request cancelled as its prompt finished no longer hands its next turn another conversation's cache**:
+  it saved its prompt cache after the next request had taken the model's state, so the conversation's next turn
+  continued from the other conversation's state and the SSD cache could store it under the wrong prompt.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many

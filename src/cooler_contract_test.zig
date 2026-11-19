@@ -1920,7 +1920,7 @@ const Served = struct {
         const hc = &self.entry.prefix_cache.?;
         restored.* = if (slot.cached_tokens > 0 and hc.lastRestoredTier() == .ssd) slot.cached_tokens else 0;
         self.reused = slot.cached_tokens;
-        if (!scheduler.postPrefillTerminal(slot)) {
+        if (!scheduler.postPrefillTerminal(sch, slot)) {
             try sch.decoding.append(a, slot);
             var one = [_]*scheduler.Slot{slot};
             while (slot.joinsTick()) try scheduler.runDecodeTick(sch, &one);
@@ -1960,7 +1960,7 @@ const Served = struct {
             _ = sch.pending.orderedRemove(0);
             try scheduler.runPrefill(sch, slot);
             self.reused = slot.cached_tokens;
-            if (!scheduler.postPrefillTerminal(slot)) try sch.decoding.append(a, slot);
+            if (!scheduler.postPrefillTerminal(sch, slot)) try sch.decoding.append(a, slot);
         }
         while (true) {
             var live: [4]*scheduler.Slot = undefined;
@@ -2395,12 +2395,21 @@ fn qwenTinyServed(comptime body: fn (comptime Q: type, dir: []const u8, ids: []c
 }
 
 fn qwenServedOn(envs: []const [:0]const u8, comptime body: fn (comptime Q: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+    return servedOn("qwen4", envs, body);
+}
+
+/// DeepSeek's one-row tiny load: the exclusive load, whose model state the next request takes.
+fn dsv41OneRowServed(comptime body: fn (comptime D: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
+    return servedOn("dsv41", &.{"DSV41_TINY"}, body);
+}
+
+fn servedOn(comptime arch: []const u8, envs: []const [:0]const u8, comptime body: fn (comptime Q: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
     try mlx.requireGpu();
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was_enabled);
     defer mlx.engine.fault.disarm();
-    const Q = ContractOf("qwen4");
+    const Q = ContractOf(arch);
     if (comptime !@hasDecl(Q, "prompt")) return error.SkipZigTest;
     var ran = false;
     for (envs) |env| {
@@ -2510,7 +2519,7 @@ fn servedRows(sv: *Served, prompts: [2][]const u32, n: u32, out: *[2]std.ArrayLi
             failed = e;
             s.markError(@errorName(e));
         };
-        if (!scheduler.postPrefillTerminal(s)) try sch.decoding.append(a, s);
+        if (!scheduler.postPrefillTerminal(sch, s)) try sch.decoding.append(a, s);
     }
     while (true) {
         var act: [2]*scheduler.Slot = undefined;
@@ -2619,6 +2628,132 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
     }.run);
 }
 
+
+/// A DeepSeek request `a` prefilled over `long` whose client left as its prefill ended, and a next request over `other`
+/// that fails before it publishes. `race`: the next one takes the model's state before `a`'s connection completes it,
+/// as exclusive admission allows; else `a` is completed and drained first.
+const CancelledAtPrefillEnd = struct {
+    const scheduler = Served.scheduler;
+
+    fn run(sv: *Served, long: []const u32, other: []const u32, race: bool) !void {
+        const sch = &sv.sch;
+        const a = try sch.submit(.{ .model = sv.entry, .prompt_ids = long, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 12 });
+        _ = sch.pending.orderedRemove(0);
+        try scheduler.runPrefill(sch, a);
+        a.cancelled.store(true, .release);
+        try testing.expect(scheduler.postPrefillTerminal(sch, a));
+        if (!race) {
+            sch.complete(a);
+            drain(sv);
+        }
+        const b = try sch.submit(.{ .model = sv.entry, .prompt_ids = other, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 12 });
+        _ = sch.pending.orderedRemove(0);
+        try scheduler.runPrefill(sch, b);
+        b.markError("Injected");
+        scheduler.releaseNativeState(b);
+        if (race) sch.complete(a);
+        sch.complete(b);
+        drain(sv);
+    }
+
+    /// As the inference thread's cleanup drain does.
+    fn drain(sv: *Served) void {
+        const sch = &sv.sch;
+        for (sch.cleanup_queue.items) |s| {
+            if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
+                scheduler.commitCancelledAtCleanup(sch, s, scheduler.commitSlotIfApplicable);
+                sv.entry.prefix_cache.?.flushPendingDisk(arch_handle.trunk(sv.entry.handle.?).s);
+            }
+            s.deinit();
+        }
+        sch.cleanup_queue.clearRetainingCapacity();
+    }
+};
+
+fn cancelledPrompts(ids: []const u32, long: *[1300]u32, other: *[600]u32, cont: *[1340]u32) void {
+    for (long, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
+    for (other, 0..) |*t, i| t.* = ids[(i * 5 + 2 + i / ids.len) % ids.len];
+    @memcpy(cont[0..long.len], long);
+    for (cont[long.len..], 0..) |*t, i| t.* = ids[(i * 3 + 5) % ids.len];
+}
+
+test "cooler contract: a DeepSeek request cancelled as its prefill ends, its cleanup run after the next request took the state, gives its continuation what a cleanup run first does, from RAM or the SSD tier" {
+    try dsv41OneRowServed(struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            try testing.expectEqual(@as(usize, 1), arch_sched.rowCap(&ld.config) orelse 1);
+            var long: [1300]u32 = undefined;
+            var other: [600]u32 = undefined;
+            var cont: [1340]u32 = undefined;
+            cancelledPrompts(ids, &long, &other, &cont);
+            // The continuation restores from the live record, or, after another conversation's handover flushed that
+            // record, from the SSD tier; a restore path may change tokens, so each is held to its own ordered twin.
+            for ([_]bool{ false, true }) |handover| {
+                errdefer std.debug.print("cooler contract: the continuation {s}\n", .{if (handover) "after a handover" else "from RAM"});
+                var got: [2]std.ArrayList(u32) = undefined;
+                var reused: [2]u32 = undefined;
+                for ([_]bool{ false, true }, 0..) |race, k| {
+                    var sv: Served = undefined;
+                    try sv.init(&ld, dir);
+                    defer sv.deinit();
+                    try CancelledAtPrefillEnd.run(&sv, &long, &other, race);
+                    var f: u32 = 0;
+                    if (handover) {
+                        var o = try sv.request(ids[0..@min(ids.len, 40)], 4, &f);
+                        o.deinit(a);
+                    }
+                    got[k] = try sv.request(&cont, 12, &f);
+                    reused[k] = sv.reused;
+                }
+                defer for (&got) |*g| g.deinit(a);
+                try testing.expect(reused[0] > 0);
+                try testing.expectEqual(reused[0], reused[1]);
+                try testing.expectEqualSlices(u32, got[0].items, got[1].items);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a DeepSeek request committed after another took the state publishes no record over that state" {
+    try dsv41OneRowServed(struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const scheduler = Served.scheduler;
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            var long: [1300]u32 = undefined;
+            var other: [600]u32 = undefined;
+            var cont: [1340]u32 = undefined;
+            cancelledPrompts(ids, &long, &other, &cont);
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            const sch = &sv.sch;
+            const first = try sch.submit(.{ .model = sv.entry, .prompt_ids = &long, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 12 });
+            _ = sch.pending.orderedRemove(0);
+            try scheduler.runPrefill(sch, first);
+            const next = try sch.submit(.{ .model = sv.entry, .prompt_ids = &other, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 12 });
+            _ = sch.pending.orderedRemove(0);
+            try scheduler.runPrefill(sch, next);
+            defer {
+                for ([_]*scheduler.Slot{ first, next }) |s| {
+                    s.markError("Injected");
+                    scheduler.releaseNativeState(s);
+                    sch.complete(s);
+                }
+                CancelledAtPrefillEnd.drain(&sv);
+            }
+            // A commit of `first` run now, whatever deferred it, finds the state `next`'s.
+            const live = @import("dsv41/dsv41_prefix.zig").liveOf(&sv.entry.prefix_cache.?);
+            const was = .{ live.ready, live.tokens.len, live.points.items.len };
+            scheduler.commitSlotIfApplicable(sch, first);
+            try testing.expectEqual(was, .{ live.ready, live.tokens.len, live.points.items.len });
+        }
+    }.run);
+}
 
 /// `n` ids of real text: Pride and Prejudice (public domain, the bench's corpus) through the fixture's own tokenizer.
 fn realTextIds(a: std.mem.Allocator, dir: []const u8, n: usize) ![]u32 {

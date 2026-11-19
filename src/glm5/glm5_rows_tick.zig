@@ -39,7 +39,7 @@ const cullDecodingWith = scheduler_mod.cullDecodingWith;
 const expectError = scheduler_mod.expectError;
 const expectOutcomes = scheduler_mod.expectOutcomes;
 const glmStreamedDrafterOff = @import("../arch/load.zig").drafterOff;
-const postPrefillTerminal = scheduler_mod.postPrefillTerminal;
+const postPrefillTerminalWith = scheduler_mod.postPrefillTerminalWith;
 const publishSpeculativeBlock = scheduler_mod.publishSpeculativeBlock;
 const recordSlotCleanup = slot_outcome.recordSlotCleanup;
 
@@ -621,39 +621,52 @@ test "a GLM cancel landing between the cull passes is committed once before its 
     try testing.expectEqual(@as(usize, 0), slots[1].request.?.as(.glm5).?.offset);
 }
 
-test "postPrefillTerminal releases native GLM state for a cancelled slot but not a live one" {
+test "postPrefillTerminal commits a cancelled GLM slot before it releases its native state, and leaves a live one" {
     if (comptime !@hasField(arch_state.Ctx, "glm5")) return error.SkipZigTest;
     var cfg = ModelConfig{ .model_type = "glm5_next" };
     var model: LoadedModel = undefined;
     model.handle = null;
     model.config = &cfg;
-    var cancelled_slot: Slot = undefined;
-    cancelled_slot.model = &model;
-    cancelled_slot.state = .decoding;
+    const Hook = struct {
+        var commits: usize = 0;
+        var offset_at_commit: usize = 0;
+        fn commit(_: *Scheduler, s: *Slot) void {
+            commits += 1;
+            offset_at_commit = s.request.?.as(.glm5).?.offset;
+        }
+    };
+    Hook.commits = 0;
+    var sch: Scheduler = undefined;
+    var slots: [3]Slot = undefined;
+    for (&slots) |*slot| {
+        slot.model = &model;
+        slot.state = .decoding;
+        slot.finished = false;
+        slot.error_code = null;
+        slot.committed_at_cull = false;
+        slot.cancelled = .init(false);
+        slot.request = null;
+    }
+    const cancelled_slot = &slots[0];
+    const live_slot = &slots[1];
+    const errored_slot = &slots[2];
+    for ([_]*Slot{ cancelled_slot, live_slot }) |slot| {
+        slot.request = arch_state.SlotRequest.of(.glm5, try glm5_forward_mod.Request.init(testing.allocator, 2));
+        slot.request.?.as(.glm5).?.offset = 4;
+    }
+    defer for ([_]*Slot{ cancelled_slot, live_slot }) |slot| slot.request.?.deinit();
     cancelled_slot.cancelled = .init(true);
-    cancelled_slot.request = arch_state.SlotRequest.of(.glm5, try glm5_forward_mod.Request.init(testing.allocator, 2));
-    cancelled_slot.request.?.as(.glm5).?.offset = 4;
-    defer cancelled_slot.request.?.deinit();
-
-    var live_slot: Slot = undefined;
-    live_slot.model = &model;
-    live_slot.state = .decoding;
-    live_slot.cancelled = .init(false);
-    live_slot.request = arch_state.SlotRequest.of(.glm5, try glm5_forward_mod.Request.init(testing.allocator, 2));
-    live_slot.request.?.as(.glm5).?.offset = 4;
-    defer live_slot.request.?.deinit();
-
-    var errored_slot: Slot = undefined;
-    errored_slot.model = &model;
     errored_slot.state = .errored;
-    errored_slot.cancelled = .init(false);
-    errored_slot.request = null;
 
-    try testing.expect(postPrefillTerminal(&cancelled_slot));
+    try testing.expect(postPrefillTerminalWith(&sch, cancelled_slot, Hook.commit));
+    try testing.expectEqual(@as(usize, 1), Hook.commits);
+    try testing.expectEqual(@as(usize, 4), Hook.offset_at_commit);
+    try testing.expect(cancelled_slot.committed_at_cull);
     try testing.expectEqual(@as(usize, 0), cancelled_slot.request.?.as(.glm5).?.offset);
 
-    try testing.expect(!postPrefillTerminal(&live_slot));
+    try testing.expect(!postPrefillTerminalWith(&sch, live_slot, Hook.commit));
     try testing.expectEqual(@as(usize, 4), live_slot.request.?.as(.glm5).?.offset);
 
-    try testing.expect(postPrefillTerminal(&errored_slot));
+    try testing.expect(postPrefillTerminalWith(&sch, errored_slot, Hook.commit));
+    try testing.expectEqual(@as(usize, 1), Hook.commits);
 }
