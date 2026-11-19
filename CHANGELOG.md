@@ -36,6 +36,8 @@ earlier history is mlx-serve's, in that project's changelog.
   after 35 s without its cleanup; it now gets the shutdown error at once.
 - **A setting saved while a model loads ends that load's failure too**: a load that failed after the save stored its
   failure, so every request kept failing fast on the old settings; the next request now loads again with the new ones.
+- **A model another request loaded is no longer marked failed by a request whose read of its files failed meanwhile**:
+  it listed `error` while it stayed in memory.
 - **A long Qwen3.8 conversation's next turn is refused less often near the memory limit**: a turn that takes the cached
   conversation over is no longer billed again for the room its taken-over cache already holds for the reply.
 - **A DeepSeek-V4.1 request admitted while another request's borrowed decoder pools are out is no longer promised the

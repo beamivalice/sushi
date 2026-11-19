@@ -1785,7 +1785,8 @@ pub const Scheduler = struct {
         const settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
         const cpu_state = model_load.preloadCpuState(self.allocator, self.io, entry.path) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
-            self.registry.markErrorLocked(entry, @errorName(err));
+            // Another request may have claimed or loaded the model meanwhile: its state is that request's.
+            if (entry.state == .unloaded or entry.state == .error_state) self.registry.markErrorLocked(entry, @errorName(err));
             self.registry.mutex.unlock(self.io);
             return error.LoadFailed;
         };
@@ -6604,6 +6605,47 @@ test "a cold load ended before the inference thread takes it returns its model a
     try testing.expect(answered);
     try testing.expectError(error.Shutdown, call.got);
     target.state = .unloaded;
+}
+
+test "ensureLoaded: a load whose files fail to read stores the failure only on a model nobody else loaded meanwhile" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    const target = try reg.registerStub("b", dir, 10);
+    var sch = submitTestScheduler(testing.allocator, 1);
+    sch.registry = reg;
+    sch.test_on_cooler = null;
+
+    // Another request loads the model while this one reads its files, which no longer read.
+    const Meanwhile = struct {
+        var r: *ModelRegistry = undefined;
+        var to: ?model_registry_mod.LoadState = null;
+        fn gate(_: []u8, _: []const u8) ?[]const u8 {
+            const e = r.entries.get("b").?;
+            const state = to orelse return null;
+            r.mutex.lockUncancelable(r.io);
+            defer r.mutex.unlock(r.io);
+            if (state == .ready) r.markReadyLocked(e, 10) else e.state = state;
+            return null;
+        }
+    };
+    Meanwhile.r = reg;
+    reg.load_gate = Meanwhile.gate;
+    for ([_]model_registry_mod.LoadState{ .ready, .loading }) |state| {
+        Meanwhile.to = state;
+        try testing.expectError(error.LoadFailed, sch.ensureLoaded("b"));
+        try testing.expectEqual(state, target.state);
+        target.state = .unloaded;
+    }
+    // With nothing meanwhile the failure is stored.
+    Meanwhile.to = null;
+    try testing.expectError(error.LoadFailed, sch.ensureLoaded("b"));
+    try testing.expectEqual(model_registry_mod.LoadState.error_state, target.state);
 }
 
 test "ensureLoaded: a streamed pack with no ssd budget is gated at its RAM-tier default, not at 0" {
