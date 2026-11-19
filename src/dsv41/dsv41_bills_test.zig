@@ -710,3 +710,57 @@ test "DeepSeek: the RAM default a load takes passes every check the load runs on
     idle.active = 0;
     try t.expectEqual(108 * GiB, model_load.ramDefaultAtLoad(.gb128, 0, 5_000_000_000, limits, plan, idle).bytes);
 }
+
+// Contract (engine-memory-admission "A live check..."): the advertised context is admitted when asked, at the readings
+// the load saw and after an earlier request left the engine's free buffers (up to its free cap, RAM/16: 2 GiB on 32 GB),
+// which admission takes off as parked (`dsv41_bill.parkedBytes`) and a forward reuses under its cap.
+test "DeepSeek: a request at the advertised context is admitted at the readings the load saw, and after a request leaves the engine's free buffers" {
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.num_attention_heads = 64;
+    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
+    const saved = .{ bills.launch_state.prefix_cache_ram_enabled, bills.launch_state.prefix_cache_disk_bytes };
+    defer {
+        bills.launch_state.prefix_cache_ram_enabled = saved[0];
+        bills.launch_state.prefix_cache_disk_bytes = saved[1];
+    }
+    bills.launch_state.prefix_cache_ram_enabled = false;
+    bills.launch_state.prefix_cache_disk_bytes = 20 << 30;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    var bad: u32 = 0;
+    var tried: u32 = 0;
+    for ([_]bool{ true, false }) |cooler| for ([_]u64{ 0, 2_100_000_000 }) |borrow| {
+        config.cooler_for_test = cooler;
+        config.expert_borrow_bytes = borrow;
+        const bits = bills.defaultKvBits(&config);
+        const active: u64 = 20 * GiB;
+        var room: u64 = 1 * GiB;
+        while (room <= 24 * GiB) : (room += 256 * MiB) for ([_]u64{ 512, 2048 }) |pin| {
+            const ceiling = active + room;
+            const adv = bills.advertisedContextAt(&config, bits, ceiling, active, pin);
+            if (adv < 64) continue;
+            var probe = config;
+            probe.pinned_context = adv;
+            probe.pinned_prefill_chunk = @intCast(pin);
+            // The engine keeps free buffers only on Cooler.
+            for ([_]u64{ 0, 512 * MiB, 1 * GiB, 2 * GiB }) |engine_free| {
+                if (!cooler and engine_free > 0) continue;
+                const available = bills.admissionAvailableFor(&probe, ceiling, active, engine_free);
+                for ([_][2]u64{ .{ adv - 1, 1 }, .{ 15, adv - 15 } }) |req| {
+                    tried += 1;
+                    const mt: u32 = @intCast(req[1]);
+                    const pick = bills.chooseRequestPrefillChunk(&probe, req[0], mt, bits, available, @intCast(pin), 0, .{});
+                    const need = bills.prefillNeededAtChunk(&probe, req[0], mt, bits, pick, .{});
+                    if (need <= available) continue;
+                    if (bad < 6) std.debug.print("{s}, borrowable {d} MB, room {d} MB, pin {d}, engine free {d} MB: advertised {d}; prompt {d} + max_tokens {d} needs {d} MB at width {d}, admission has {d} MB\n", .{ if (cooler) "Cooler" else "MLX", borrow / MiB, room / MiB, pin, engine_free / MiB, adv, req[0], mt, need / MiB, pick, available / MiB });
+                    bad += 1;
+                }
+            }
+        };
+    };
+    try std.testing.expect(tried > 0);
+    try std.testing.expectEqual(@as(u32, 0), bad);
+}

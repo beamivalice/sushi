@@ -97,7 +97,8 @@ bill function's output on the committed fixture configs of all served packs: a b
   buffers); the chunk-width hook, the widen re-check, the served warm, an image encode and DeepSeek's borrow read it,
   and admission reads it plus only the parked bytes its bill holds itself (`admissionAvailableFor`, the arch's
   `billedParkedBytes`: DeepSeek's decode pool on MLX; none on Sushi Cooler, whose bill holds no pool term, so adding it
-  back admitted an explicit `--prefill-chunk 512` prompt its last merged 1,003-row forward was then refused). It is one
+  back admitted an explicit `--prefill-chunk 512` prompt its last merged 1,003-row forward was then refused) and the
+  engine's free buffers its forwards reuse (`reusable`, at `bound`, as each forward reads them). It is one
   value, `bills.Headroom` (`headroomFrom`, `headroomNow`): the live part, and the engine's free buffers DeepSeek parks,
   which a forward or an encode under its own cap reuses (`reusable`, up to its need: `forNeed`, compared at `bound`);
   the borrow, its read-back, an image encode, the warm and the chunk width read it. An encode read the live part alone

@@ -220,6 +220,12 @@ side can reclaim a buffer the engine holds. The cap bills the pool's growth over
 counts what it holds now. A tensor lent to MLX is in both counters, so the headroom errs low
 ([engine-memory-admission](engine-memory-admission.md#gpu-memory-readers)).
 
+The advertised context is priced on admission's own available with no engine buffer free (`bills.contextBudget`, the
+least admission reads at that ceiling): the parked pool comes off it as it comes off admission, and admission credits
+the free buffers an earlier request left as its forwards reuse them. Priced on the ceiling less active alone, a Cooler
+load with 1 GiB of room advertised 404 tokens, whose request needed 968 MB where admission read 644, and 0 once an
+earlier request left 1 GiB of free buffers.
+
 The pool growth (7.5 GB) was most of the old bill and the cap replaces it: a 2048-row chunk's need falls 8.3-8.7 GB,
 the rest being the measured per-row rate against the old formula. At wired 124000 with DSpark and the SSD tier on (the
 `with its decoder pools lendable` test), budget 117 and no decoder pool to lend, the advertised context is 581,632

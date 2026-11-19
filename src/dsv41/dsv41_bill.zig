@@ -103,7 +103,7 @@ pub fn diskTokenBytes(config: *const model_mod.ModelConfig, kv_bits: u64) ?u64 {
 pub fn memoryContext(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) ?u32 {
     // Searched past the checkpoint's window, up to the memory a margined default needs, so the margin is judged against memory.
     const upper = @max(config.contextCap(), bills.memoryContextForMargined(config.defaultContext()));
-    return bills.maxSushiContextUpTo(config, upper, kv_bits, bills.admissionAvailable(ceiling, active_mem) -| bills.ctxCacheShare(ceiling, active_mem, bills.ctxSizingCacheReserve(config)), chunk, .{});
+    return bills.maxSushiContextUpTo(config, upper, kv_bits, bills.contextBudget(config, ceiling, active_mem), chunk, .{});
 }
 
 

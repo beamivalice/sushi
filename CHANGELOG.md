@@ -36,6 +36,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **The SSD streaming memory a refused load names loads it**: the `--ssd-budget-gb` a load refusal named could be
   refused by the load's other memory check on the same Mac (on a 32 GB Mac with 6 GB free, a load over its GPU limit
   named 26, which free RAM then refused); a named budget now passes every check the load runs.
+- **A DeepSeek-V4.1 request at the advertised context is admitted when memory is tight**: on Sushi Cooler with 1 to
+  1.5 GB to spare the advertised context left out the buffers the engine keeps parked, and once an earlier request had
+  left the engine's free buffers, admission counted them as taken; both now match what the request's forwards use.
 - **A Qwen3.8 load at the `--ctx-size` its memory refusal named serves requests that long**: the context was priced on
   the free RAM before the load, and a request at it was then refused up to 1 GB short of what the server keeps free
   once loaded; where free RAM is what binds, the refusal and the load's check now leave that room.

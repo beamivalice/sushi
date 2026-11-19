@@ -1813,8 +1813,7 @@ pub fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, 
     // Flash-Next advertises the context its own request bill admits at the floor rung, from the
     // headroom admission reads (the writers' host bytes included), so the two cannot disagree.
     if (config.longCtxGated()) {
-        const budget = admissionAvailable(ceiling, active_mem) -| ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config));
-        return maxSushiContextAtWidth(config, kv_bits, budget, null, .{ .mtp_on = mtpHeadDefaultOn(config) });
+        return maxSushiContextAtWidth(config, kv_bits, contextBudget(config, ceiling, active_mem), null, .{ .mtp_on = mtpHeadDefaultOn(config) });
     }
     if (archHook("memoryContext", u32, config, .{ kv_bits, ceiling, active_mem, chunk })) |ctx| return ctx;
     //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
@@ -2959,11 +2958,18 @@ pub fn liveHeadroomFrom(config: *const model_mod.ModelConfig, ceiling: u64, acti
 }
 
 /// What admission compares a request's bill against: the live headroom, plus the parked bytes the bill holds itself
-/// (an arch's `billedParkedBytes`: DeepSeek's decode pool on MLX, none on Cooler), so admission and every live check
-/// read one number.
+/// (an arch's `billedParkedBytes`: DeepSeek's decode pool on MLX, none on Cooler) and the engine's free buffers its
+/// forwards reuse under their caps (`Headroom.bound`), so admission and every live check read one number.
 pub fn admissionAvailableFor(config: *const model_mod.ModelConfig, ceiling: u64, active: u64, engine_free: u64) u64 {
     const billed = archHook("billedParkedBytes", u64, config, .{}) orelse 0;
-    return admissionAvailable(ceiling, active) -| (parkedBytes(config, engine_free) -| billed);
+    const reusable = archHook("reusableUnderCap", u64, config, .{engine_free}) orelse 0;
+    return admissionAvailable(ceiling, active) -| (parkedBytes(config, engine_free) -| billed -| reusable);
+}
+
+/// What a context is priced against at a reading (`memoryContextAtChunk`, an arch's `memoryContext`): admission's own
+/// available with no engine buffer free, the least it reads at that ceiling, less the cache's share.
+pub fn contextBudget(config: *const model_mod.ModelConfig, ceiling: u64, active: u64) u64 {
+    return admissionAvailableFor(config, ceiling, active, 0) -| ctxCacheShare(ceiling, active, ctxSizingCacheReserve(config));
 }
 
 /// The ceiling less what is in use and staged, before an arch's parked bytes (`liveHeadroomFrom`).
