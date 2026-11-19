@@ -6718,6 +6718,11 @@ pub const Mem = struct {
     units: u64,
     unit: MemUnit,
 
+    /// The unit of a text whose largest figures are `a` and `b`.
+    pub fn unitOf(a: u64, b: u64) MemUnit {
+        return MemUnit.of(@max(a, b));
+    }
+
     pub fn need(bytes: u64, unit: MemUnit) Mem {
         return .{ .units = unit.count(bytes, true), .unit = unit };
     }
@@ -6738,39 +6743,29 @@ pub const Mem = struct {
     }
 };
 
-fn gbOf(bytes: u64) f64 {
-    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0);
-}
-
-/// GB with one decimal, rounded up: a shortfall never reads smaller than it is.
-fn gbUp(bytes: u64) f64 {
-    const tenths = (bytes *| 10 +| ((1 << 30) - 1)) >> 30;
-    return @as(f64, @floatFromInt(tenths)) / 10.0;
-}
-
-/// The `[preflight]` line's words for the bound a load's available figure came from.
 pub fn sushiAvailableLine(buf: []u8, a: SushiAvailable, wired_limit_mb: u64) []const u8 {
     const bytes = a.bytes orelse return "no memory figure could be read: the check admits the load";
+    const u = Mem.unitOf(bytes, @max(a.free orelse 0, a.gpuAllows() orelse 0));
+    const free: FreeRam = .{ .free = a.free, .unit = u };
     return (switch (a.bound()) {
         .free_ram => if (a.gpuAllows()) |gpu|
-            std.fmt.bufPrint(buf, "bound by free RAM, {d:.1} GB; the GPU memory limit allows {d:.1} GB", .{ gbOf(bytes), gbOf(gpu) })
+            std.fmt.bufPrint(buf, "bound by free RAM, {f}; the GPU memory limit allows {f}", .{ Mem.have(bytes, u), Mem.have(gpu, u) })
         else
-            std.fmt.bufPrint(buf, "bound by free RAM, {d:.1} GB", .{gbOf(bytes)}),
-        .wired_limit => std.fmt.bufPrint(buf, "bound by the GPU memory limit (iogpu.wired_limit_mb = {d} MB): {d:.1} GB beside what is already loaded; {f}", .{ wired_limit_mb, gbOf(bytes), FreeRam{ .free = a.free } }),
-        .gpu_limit => std.fmt.bufPrint(buf, "bound by the GPU memory limit (macOS's default): {d:.1} GB beside what is already loaded; {f}", .{ gbOf(bytes), FreeRam{ .free = a.free } }),
+            std.fmt.bufPrint(buf, "bound by free RAM, {f}", .{Mem.have(bytes, u)}),
+        .wired_limit => std.fmt.bufPrint(buf, "bound by the GPU memory limit (iogpu.wired_limit_mb = {d} MB): {f} beside what is already loaded; {f}", .{ wired_limit_mb, Mem.have(bytes, u), free }),
+        .gpu_limit => std.fmt.bufPrint(buf, "bound by the GPU memory limit (macOS's default): {f} beside what is already loaded; {f}", .{ Mem.have(bytes, u), free }),
     }) catch "bound by free RAM or the GPU memory limit";
 }
 
-/// The free-RAM clause of a load's memory figures, which a failed RAM query leaves unread.
 const FreeRam = struct {
     free: ?u64,
+    unit: MemUnit,
     pub fn format(self: FreeRam, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        if (self.free) |f| return w.print("{d:.1} GB of RAM free", .{gbOf(f)});
+        if (self.free) |f| return w.print("{f} of RAM free", .{Mem.have(f, self.unit)});
         return w.writeAll("free RAM unread");
     }
 };
 
-/// A load the memory check refused: what it needs, what the check read, and the one knob that shrinks the need.
 pub const LoadMemoryRefusal = struct {
     needed: u64,
     avail: SushiAvailable,
@@ -6807,38 +6802,40 @@ pub fn loadMemoryRefusalText(buf: []u8, r: LoadMemoryRefusal) []const u8 {
 
 fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!void {
     const a = r.avail;
-    // Each bound short of the need gets its action: freeing RAM past a GPU limit that is short too is refused again.
     const ram_short = if (a.free) |f| r.needed -| f else 0;
     const gpu_room = a.gpuAllows();
     const gpu_short = if (gpu_room) |g| r.needed -| g else 0;
+    const u = Mem.unitOf(r.needed, @max(a.bytes orelse 0, @max(a.free orelse 0, gpu_room orelse 0)));
+    const need = Mem.need(r.needed, u);
     try w.print("Not enough memory to load this model.\n", .{});
     switch (a.bound()) {
         .free_ram => {
-            try w.print("It needs {d:.1} GB, and only {d:.1} GB of RAM is free right now (other apps and the system hold the rest)", .{ gbOf(r.needed), gbOf(a.bytes.?) });
+            try w.print("It needs {f}, and only {f} of RAM is free right now (other apps and the system hold the rest)", .{ need, Mem.have(a.bytes.?, u) });
             if (gpu_room) |gpu| {
                 if (gpu_short > 0)
-                    try w.print("; your GPU memory limit allows only {d:.1} GB, about {d:.1} GB short as well", .{ gbOf(gpu), gbUp(gpu_short) })
+                    try w.print("; your GPU memory limit allows only {f}, about {f} short as well", .{ Mem.have(gpu, u), Mem.short(r.needed, gpu, u) })
                 else
-                    try w.print("; your GPU memory limit would allow {d:.1} GB", .{gbOf(gpu)});
+                    try w.print("; your GPU memory limit would allow {f}", .{Mem.have(gpu, u)});
             }
-            try w.print(". Free about {d:.1} GB more.\n", .{gbUp(ram_short)});
+            try w.print(". Free about {f} more.\n", .{Mem.short(r.needed, a.bytes.?, u)});
         },
         .wired_limit, .gpu_limit => {
-            try w.print("It needs {d:.1} GB, and the GPU memory limit (", .{gbOf(r.needed)});
+            try w.print("It needs {f}, and the GPU memory limit (", .{need});
             if (r.wired_limit_mb > 0) try w.print("iogpu.wired_limit_mb = {d} MB", .{r.wired_limit_mb}) else try w.print("macOS's default", .{});
-            try w.print(") leaves {d:.1} GB beside what is already loaded: about {d:.1} GB short. ", .{ gbOf(a.bytes.?), gbUp(gpu_short) });
-            if (a.free) |f| try w.print("{d:.1} GB of RAM is free", .{gbOf(f)}) else try w.print("The free RAM could not be read", .{});
-            if (ram_short > 0) try w.print(", about {d:.1} GB short as well", .{gbUp(ram_short)});
+            try w.print(") leaves {f} beside what is already loaded: about {f} short. ", .{ Mem.have(a.bytes.?, u), Mem.short(r.needed, a.bytes.?, u) });
+            if (a.free) |f| try w.print("{f} of RAM is free", .{Mem.have(f, u)}) else try w.print("The free RAM could not be read", .{});
+            if (ram_short > 0) try w.print(", about {f} short as well", .{Mem.short(r.needed, a.free.?, u)});
             try w.print(".\n", .{});
         },
     }
     try w.print("To load it:\n", .{});
+    const free_short = if (a.free) |f| Mem.short(r.needed, f, u) else Mem.short(0, 0, u);
     if (a.bound() == .free_ram) {
-        try writeRamAction(w, ram_short);
+        try writeRamAction(w, free_short);
         if (gpu_short > 0) try writeGpuAction(w, r);
     } else {
         try writeGpuAction(w, r);
-        if (ram_short > 0) try writeRamAction(w, ram_short);
+        if (ram_short > 0) try writeRamAction(w, free_short);
     }
     switch (r.knob) {
         .none => {},
@@ -6849,11 +6846,10 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
     try w.print("- Last resort: --skip-mem-preflight (or \"Skip the memory check before loading\" in Settings) skips this check; the load can then fail later or stall the Mac.", .{});
 }
 
-fn writeRamAction(w: *std.Io.Writer, short: u64) std.Io.Writer.Error!void {
-    try w.print("- Quit other apps or unload another model to free about {d:.1} GB, then retry: the check reads free memory when the load starts, so a retry sees what you freed.\n", .{gbUp(short)});
+fn writeRamAction(w: *std.Io.Writer, short: Mem) std.Io.Writer.Error!void {
+    try w.print("- Quit other apps or unload another model to free about {f}, then retry: the check reads free memory when the load starts, so a retry sees what you freed.\n", .{short});
 }
 
-/// The raise holds the load beside what is loaded; the limit and the working set are read once, when sushi starts.
 fn writeGpuAction(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!void {
     const mb = r.wiredLimitThatFits() orelse
         return w.print("- This Mac cannot give the GPU enough memory for it, even with a raised limit: use one of the options below.\n", .{});
@@ -7391,4 +7387,14 @@ test "a refusal's memory figures: need up, available down, the shortfall their p
     try testing.expectEqual(MemUnit.mb, small);
     try testing.expectEqualStrings("298 MB, 276 MB, 22 MB", try std.fmt.bufPrint(&buf, "{f}, {f}, {f}", .{ Mem.need(297 * mib + 1, small), Mem.have(277 * mib - 1, small), Mem.short(297 * mib + 1, 277 * mib - 1, small) }));
     try testing.expectEqualStrings("0 MB", try std.fmt.bufPrint(&buf, "{f}", .{Mem.short(10 * mib, 20 * mib, small)}));
+}
+
+test "a load refused a byte short never shows its need equal to what is free, and its shortfall adds up" {
+    const gib: u64 = 1 << 30;
+    var buf: [2048]u8 = undefined;
+    const by_free = sushiAvailable(20 * gib, 0, 60 * gib, 0, 0);
+    const text = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib + 1, .avail = by_free });
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "It needs 20.1 GB, and only 20.0 GB of RAM is free right now") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Free about 0.1 GB more.") != null);
 }

@@ -13,6 +13,7 @@ const cfg_mod = @import("dsv41_config.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const Config = cfg_mod.Config;
 const cooler_side = @import("../cooler_side.zig");
+const Mem = @import("../bills.zig").Mem;
 
 /// The live headroom (`bills.headroomNow`), installed by the server. Unset (tests, `sushi kld`), nothing is ever released.
 pub var headroom_fn: ?*const fn (*const ModelConfig) Headroom = null;
@@ -364,7 +365,8 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
     // A resident pack pays for the union workspace out of its first release.
     const count = releaseCount(pools[0..n], need +| engine.unionPending(), before) orelse {
         const have = (before +| sum(pools[0..n])) -| engine.unionPending();
-        log.warn("[dsv41-borrow] a {d}-row forward at {d} needs {d:.2} GB; the headroom and every decoder pool hold {d:.2} GB\n", .{ rows, seq, gb(need), gb(have) });
+        const u = Mem.unitOf(need, have);
+        log.warn("[dsv41-borrow] a {d}-row forward at {d} needs {f}; the headroom and every decoder pool hold {f}\n", .{ rows, seq, Mem.need(need, u), Mem.have(have, u) });
         return refuse(c, cooler_side.onEngine(config), rows, seq, rest, need, have);
     };
     var m: LiveBorrow = .{ .engine = engine, .order = order[0..n], .config = config, .read = headroom, .need = need, .wired = status.getWiredMemBytes() };
@@ -417,11 +419,10 @@ pub fn refusalText(buf: []u8, rows: u64, seq: u64, need: u64, have: u64, chunk_f
 }
 
 fn writeRefusal(w: *std.Io.Writer, rows: u64, seq: u64, need: u64, have: u64, chunk_fits: u64) std.Io.Writer.Error!void {
-    const gib = 1024.0 * 1024.0 * 1024.0;
-    const short_tenths = ((need -| have) *| 10 +| ((1 << 30) - 1)) >> 30;
+    const u = Mem.unitOf(need, have);
     try w.print("This prompt ran out of GPU memory partway through its prefill.\n", .{});
-    try w.print("Its {d}-token chunk, tokens {d} to {d}, needs {d:.2} GB, and the free memory with every expert-cache pool the prefill can borrow holds {d:.2} GB: about {d:.1} GB short. The chunks before it ran.\n", .{
-        rows, seq -| rows, seq, @as(f64, @floatFromInt(need)) / gib, @as(f64, @floatFromInt(have)) / gib, @as(f64, @floatFromInt(short_tenths)) / 10.0,
+    try w.print("Its {d}-token chunk, tokens {d} to {d}, needs {f}, and the free memory with every expert-cache pool the prefill can borrow holds {f}: {f} short. The chunks before it ran.\n", .{
+        rows, seq -| rows, seq, Mem.need(need, u), Mem.have(have, u), Mem.short(need, have, u),
     });
     try w.print("To serve it:\n", .{});
     if (chunk_fits > 0) try w.print("- Lower --prefill-chunk to {d}: a narrower chunk needs less memory at this length.\n", .{chunk_fits});
@@ -1300,8 +1301,8 @@ test "dsv41 borrow: a forward refused mid-prefill names its chunk, the shortfall
     const text = refusalText(&buf, rows, seq, 5 * gib, 4 * gib + gib / 2, 1024);
     for ([_][]const u8{
         "This prompt ran out of GPU memory partway through its prefill.\n",
-        "Its 2048-token chunk, tokens 4096 to 6144, needs 5.00 GB",
-        "holds 4.50 GB: about 0.5 GB short. The chunks before it ran.\n",
+        "Its 2048-token chunk, tokens 4096 to 6144, needs 5.0 GB",
+        "holds 4.5 GB: 0.5 GB short. The chunks before it ran.\n",
         "To serve it:\n- Lower --prefill-chunk to 1024",
         "- Retry when other requests finish",
         "- Shorten the prompt to 4096 tokens or fewer",
@@ -1310,6 +1311,15 @@ test "dsv41 borrow: a forward refused mid-prefill names its chunk, the shortfall
         try testing.expect(std.mem.indexOf(u8, text, part) != null);
     }
     try testing.expect(std.mem.indexOf(u8, refusalText(&buf, rows, seq, 5 * gib, 0, 0), "--prefill-chunk") == null);
+}
+
+test "dsv41 borrow: a mid-prefill refusal a byte short shows its need above what the borrow holds, in one unit" {
+    var buf: [1024]u8 = undefined;
+    const need: u64 = 290_000_000;
+    const text = refusalText(&buf, 569, 569, need, need - 1, 0);
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "needs 277 MB, and ") != null);
+    try testing.expect(std.mem.indexOf(u8, text, " holds 276 MB: 1 MB short.") != null);
 }
 
 test "dsv41 borrow: a first chunk refused mid-request names no shorter prompt (it would be 0 tokens)" {
