@@ -1146,15 +1146,20 @@ fn sushiContextWidth(config: *const model_mod.ModelConfig, context: u32) u64 {
 /// The dearest request a context of `ctx` tokens can be asked for, over every split of it between prompt and reply: what
 /// every context the server names (advertised, admitted at load, or in a refusal) is priced at.
 pub fn contextNeed(config: *const model_mod.ModelConfig, ctx: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
-    var most = prefillNeededAtChunk(config, ctx, 0, kv_bits, chunk, warm);
+    var most = splitNeed(config, ctx, ctx, kv_bits, chunk, warm);
     // A prompt under the reservation grows its cache from its own 256-row step by the +25% policy
     // (`cacheCapacityTokens`), which can pass the prompt alone's; within one step the longest prompt is dearest.
     if (!config.reservesKvCapacity()) return most;
     const below = @min(ctx, trunk.KVCache.RESERVE_MIN_TOKENS);
     var seq: u64 = 256;
-    while (seq < below) : (seq += 256) most = @max(most, prefillNeededAtChunk(config, seq, @intCast(ctx - seq), kv_bits, chunk, warm));
-    if (below < ctx) most = @max(most, prefillNeededAtChunk(config, below - 1, @intCast(ctx - below + 1), kv_bits, chunk, warm));
+    while (seq < below) : (seq += 256) most = @max(most, splitNeed(config, ctx, seq, kv_bits, chunk, warm));
+    if (below < ctx) most = @max(most, splitNeed(config, ctx, below - 1, kv_bits, chunk, warm));
     return most;
+}
+
+fn splitNeed(config: *const model_mod.ModelConfig, ctx: u64, prompt: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
+    _ = context_bills_priced.fetchAdd(1, .monotonic);
+    return prefillNeededAtChunk(config, prompt, @intCast(ctx - prompt), kv_bits, chunk, warm);
 }
 
 /// PURE with respect to memory: solve the same admission bill used to check the requested context.
@@ -1172,22 +1177,36 @@ pub fn memoryContextForMargined(target: u32) u32 {
 }
 
 pub fn maxSushiContextUpTo(config: *const model_mod.ModelConfig, upper: u32, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix) u32 {
+    // Every split is dearer than the prompt alone or as dear, and pricing them walks each one's growth: the prompt
+    // alone bounds the answer, which is searched again under it only where a split is dearer.
+    const alone = contextSearch(config, upper, kv_bits, budget, fixed_chunk, warm, false);
+    if (alone == 0 or contextFits(config, alone, kv_bits, budget, fixed_chunk, warm, true)) return alone;
+    return contextSearch(config, alone - 1, kv_bits, budget, fixed_chunk, warm, true);
+}
+
+fn contextSearch(config: *const model_mod.ModelConfig, upper: u32, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix, every_split: bool) u32 {
     var low: u32 = 0;
     var high: u32 = upper;
-    // Before the auto context is pinned the bill's reservation reads `getEffectiveContextLength`,
-    // which is this very search: bill each probe as the context it is asking about.
-    const unpinned = manualContext(config) == 0 and config.pinned_context == 0;
     while (low < high) {
         const mid = low + @as(u32, @intCast((@as(u64, high) - low + 1) / 2));
-        var probe = config.*;
-        if (unpinned) probe.pinned_context = mid;
-        const chunk = fixed_chunk orelse sushiContextWidth(&probe, mid);
-        if (contextNeed(&probe, mid, kv_bits, chunk, warm) <= budget)
-            low = mid
-        else
-            high = mid - 1;
+        if (contextFits(config, mid, kv_bits, budget, fixed_chunk, warm, every_split)) low = mid else high = mid - 1;
     }
     return low;
+}
+
+/// Bills the max-context search and `contextNeed` have priced: each walks a request's cache growth, so the test that
+/// holds the search's cost counts them.
+pub var context_bills_priced = std.atomic.Value(u64).init(0);
+
+fn contextFits(config: *const model_mod.ModelConfig, ctx: u32, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix, every_split: bool) bool {
+    // Before the auto context is pinned the bill's reservation reads `getEffectiveContextLength`,
+    // which is this very search: bill each probe as the context it is asking about.
+    var probe = config.*;
+    if (manualContext(config) == 0 and config.pinned_context == 0) probe.pinned_context = ctx;
+    const chunk = fixed_chunk orelse sushiContextWidth(&probe, ctx);
+    if (every_split) return contextNeed(&probe, ctx, kv_bits, chunk, warm) <= budget;
+    _ = context_bills_priced.fetchAdd(1, .monotonic);
+    return prefillNeededAtChunk(&probe, ctx, 0, kv_bits, chunk, warm) <= budget;
 }
 
 /// Whether a refusal can name the max_tokens and the context that fit: the resident Sushi EXL3 bill, or an arch's own

@@ -2386,3 +2386,27 @@ test "Flash-Next on Cooler: the --ctx-size a resident load refusal names loads, 
     try std.testing.expect(tried > 0);
     try std.testing.expectEqual(@as(u32, 0), bad);
 }
+
+// Pricing every split walks each one's cache growth (on MLX a page grid a layer a step): the search prices them only to
+// confirm the prompt alone's answer, or below it where a split is dearer. Counted, not timed.
+test "Flash-Next on MLX: a max-context search with no cap or a large one prices every split once, to confirm the prompt alone's answer" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    var cfg = fixtures.qwen4MeasuredTestConfig();
+    cfg.pinned_context = 0;
+    try t.expect(!@import("../cooler_side.zig").onEngine(&cfg) and cfg.reservesKvCapacity());
+    const GiB: u64 = 1 << 30;
+    const splits: u64 = trunk.KVCache.RESERVE_MIN_TOKENS / 256 + 1;
+    for ([_]u32{ 1_048_576, std.math.maxInt(u32) }) |upper| for ([_]u64{ 8 * GiB, 40 * GiB }) |budget| {
+        bills.context_bills_priced.store(0, .monotonic);
+        const ctx = bills.maxSushiContextUpTo(&cfg, upper, 8, budget, null, .{});
+        const priced = bills.context_bills_priced.load(.monotonic);
+        // The prompt alone's search prices a bill a halving of the range, as it did before splits were priced.
+        const halvings: u64 = std.math.log2_int_ceil(u64, @as(u64, upper) + 1);
+        errdefer std.debug.print("upper {d}, budget {d} GiB: context {d} priced {d} bills, the prompt alone's search {d}\n", .{ upper, budget >> 30, ctx, priced, halvings });
+        try t.expect(ctx > 32_768);
+        try t.expect(priced <= halvings + splits);
+    };
+}
