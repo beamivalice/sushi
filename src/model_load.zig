@@ -1975,12 +1975,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         var avail_buf: [192]u8 = undefined;
         const wired_mb = bills.wiredLimitBytes() >> 20;
         const avail_line = bills.sushiAvailableLine(&avail_buf, reader.last.?, if (reader.sushi and reader.wired_floor > 0) wired_mb else 0);
-        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB (warmup + net or context ~{d:.2} GB; {s})\n", .{
-            @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
-            @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
-            @as(f64, @floatFromInt(needed -| weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
-            avail_line,
-        });
+        var line_buf: [384]u8 = undefined;
+        log.info("[preflight] {s}\n", .{bills.preflightLine(&line_buf, params.config, weights_bytes, needed, avail_line)});
         // Every bound that was read refuses here, an exhausted one (read as 0) included.
         if (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed)) {
             const avail = avail_bytes.?;

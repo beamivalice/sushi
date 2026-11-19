@@ -6971,6 +6971,22 @@ fn writeGpuAction(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!v
     try w.print("- Raise the GPU memory limit in Terminal: {s} (it resets at reboot), then restart sushi: the limit is read when sushi starts.\n", .{wireLimitsCommand(&cmd, mb)});
 }
 
+/// The `[preflight]` line's figures: the weights, a streamed load's expert cache, and the warmup and context beside them,
+/// adding up to `needed`.
+pub fn preflightLine(buf: []u8, config: *const model_mod.ModelConfig, weights: u64, needed: u64, avail_line: []const u8) []const u8 {
+    const u = MemUnit.of(needed);
+    const cache: u64 = if (config.expert_streaming) config.expert_cache_bytes else 0;
+    const total = Mem.need(needed, u);
+    const w = Mem.need(weights, u);
+    const c = Mem.need(cache, u);
+    // The last term is the printed difference, so the line adds up.
+    const rest: Mem = .{ .units = total.units -| w.units -| c.units, .unit = u };
+    return (if (cache > 0)
+        std.fmt.bufPrint(buf, "weights {f}, expert cache {f}, warmup and context {f}: needs {f} ({s})", .{ w, c, rest, total, avail_line })
+    else
+        std.fmt.bufPrint(buf, "weights {f}, warmup and context {f}: needs {f} ({s})", .{ w, rest, total, avail_line })) catch avail_line;
+}
+
 /// The resident-model budget's refusal (`--max-resident-mem`, no loaded model can be evicted): `needed` for this load,
 /// `cap` the budget and `held` what the loaded models in use hold.
 pub fn residentBudgetRefusalText(buf: []u8, needed: u64, cap: u64, held: u64, models: usize) []const u8 {
@@ -7693,4 +7709,17 @@ test "the resident-model budget refusal gives its figures in one unit and its ac
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "it needs 20.1 GB, and the resident-model budget (--max-resident-mem, 48.0 GB) has 8.0 GB left beside the 2 loaded model(s), each in use.\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\n- Unload a model on the Models page") != null);
+}
+
+test "a streamed load's preflight line names its expert cache as its own term" {
+    const gib: u64 = 1 << 30;
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true };
+    cfg.expert_cache_bytes = 12 * gib + gib / 5;
+    var buf: [256]u8 = undefined;
+    const line = preflightLine(&buf, &cfg, 5 * gib, 20 * gib, "bound by free RAM, 30.0 GB");
+    errdefer std.debug.print("{s}\n", .{line});
+    try testing.expectEqualStrings("weights 5.0 GB, expert cache 12.2 GB, warmup and context 2.8 GB: needs 20.0 GB (bound by free RAM, 30.0 GB)", line);
+    var resident = cfg;
+    resident.expert_streaming = false;
+    try testing.expectEqualStrings("weights 5.0 GB, warmup and context 15.0 GB: needs 20.0 GB (bound by free RAM, 30.0 GB)", preflightLine(&buf, &resident, 5 * gib, 20 * gib, "bound by free RAM, 30.0 GB"));
 }

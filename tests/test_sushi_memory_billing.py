@@ -5,7 +5,7 @@
 Per pack, two resident boots at a 1248-token context (MTP + vision on, and `--no-mtp --no-vision`):
   - the enabled boot holds more resident bytes than the disabled one, advertises images, and reports the MTP head
     in /v1/models and /props; KV8 is the default and a per-request KV4 override is honoured and logged;
-  - the load bills `[preflight] weights ~W GB, needs ~N GB`: N is at least W plus the 1 GiB net plus the measured
+  - the load bills `[preflight] weights W GB, ... needs N GB`: N is at least W plus the 1 GiB net plus the measured
     warmup, `/props` peak memory fits N and sits within 3 GB of it, and a short chat completes.
 Then, without loading weights: a startup refusal at an absurd context names the maximum context before any shard
 loads, and a headless `--model-dir` server answers `/v1/load-model` with a 503 `out_of_memory` naming it, twice.
@@ -63,12 +63,13 @@ def main():
         expect(props["settings"]["kv_cache"]["scheme"] == "kv8" and props["settings"]["kv_quant"] == "8", f"{server.label}: kv {props['settings']}")
         expect(props["settings"]["mtp"]["loaded"] == enabled and props["settings"]["mtp"]["default_on"] == enabled,
                f"{server.label}: mtp {props['settings']['mtp']}")
-        found = re.findall(r"\[preflight\] weights ~([0-9.]+) GB, needs ~([0-9.]+) GB", server.log_text())
+        found = re.findall(r"\[preflight\] weights ([0-9.]+) GB, .*?needs ([0-9.]+) GB", server.log_text())
         assert len(found) == 1, found
         weights, needed = map(float, found[0])
         # The billed weights plus the larger of the measured warmup plus the 1 GiB net and the context bill.
         warmup = 0.25 if name.startswith("MiMo") else (1.25 if enabled else 0.125)
-        expect(needed - weights >= 1.0 + warmup - 0.01, f"{server.label}: needs {needed} < weights {weights} + 1 + warmup {warmup}")
+        # Both figures print rounded up to a tenth of a GB.
+        expect(needed - weights >= 1.0 + warmup - 0.1, f"{server.label}: needs {needed} < weights {weights} + 1 + warmup {warmup}")
         expect(0 < props["memory"]["active_bytes"] <= props["memory"]["peak_bytes"], f"{server.label}: memory {props['memory']}")
         peak = props["memory"]["peak_bytes"] / 2**30
         expect(peak <= needed + 0.005, f"{server.label}: peak {peak:.2f} GiB above the billed need {needed} GB (weights {weights}): {props['memory']}")
