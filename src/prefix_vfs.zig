@@ -3893,6 +3893,22 @@ fn highestFd(limit: u64) usize {
     return top;
 }
 
+/// Takes every free descriptor number below `top` (a soft limit counts numbers, not open descriptors), so the next
+/// open past `top` meets the quota; `closeFilled` gives them back.
+fn fillFdGaps(top: usize, filled: *std.ArrayList(c_int)) !void {
+    for (0..top) |fd| {
+        if (std.c.fcntl(@intCast(fd), std.c.F.GETFD) != -1) continue;
+        const d = std.c.dup2(2, @intCast(fd));
+        if (d < 0) return error.FdGapNotFilled;
+        try filled.append(ta, d);
+    }
+}
+
+fn closeFilled(filled: *std.ArrayList(c_int)) void {
+    for (filled.items) |d| _ = std.c.close(d);
+    filled.deinit(ta);
+}
+
 fn packFileName(buf: []u8, i: usize) []const u8 {
     return std.fmt.bufPrint(buf, "f{d}", .{i}) catch unreachable;
 }
@@ -4004,8 +4020,18 @@ test "prefix_vfs: a pack open past the descriptor quota closes the least recentl
     defer std.posix.setrlimit(.NOFILE, saved) catch {};
     for (0..2) |i| ta.free(try v.readBytes(ta, packFileName(&name_buf, i)));
 
+    // A gap below the highest descriptor, as tests that ran before leave one.
+    const gap = std.c.dup(2);
+    const above = std.c.dup(2);
+    defer _ = std.c.close(above);
+    _ = std.c.close(gap);
+
     // No descriptor left: pack 2 opens in place of pack 0, the least recently used.
-    try std.posix.setrlimit(.NOFILE, .{ .cur = highestFd(saved.cur) + 1, .max = saved.max });
+    const top = highestFd(saved.cur) + 1;
+    var filled: std.ArrayList(c_int) = .empty;
+    defer closeFilled(&filled);
+    try fillFdGaps(top, &filled);
+    try std.posix.setrlimit(.NOFILE, .{ .cur = top, .max = saved.max });
     const got = try v.readBytes(ta, packFileName(&name_buf, 2));
     defer ta.free(got);
     try testing.expectEqualSlices(u8, bufs[2], got);
