@@ -221,6 +221,9 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   runs, so a value made ahead of a refusal hands its reason to the next, unrelated refusal.
   `refusal-unnamed` flags, under `src/tensor/`, an `error.TensorUnsupported` returned or handed to `fail` without
   `core.refusing`: the bare error names no reason and is not counted in the engine's refusals.
+  `caught-error-unsettled` flags, in the files that run a request's work on the inference thread (`scheduler.zig`,
+  `mtp_tick.zig`, `slot_outcome.zig`, `vision_queue.zig`), `@errorName(e)` of a `catch |e|` capture: the failure may
+  have left the MLX latch, which `mlx.settledErrorName(e)` takes; a `checkError*` call's own error passes.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its

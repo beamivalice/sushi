@@ -93,9 +93,12 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   latched error never 200s; streaming shares `mapGenerationError`.
 - A swallowed failure must DROP the latch it raised (`dropLatchedErrorUnless(had_error)`, passing the
   `errorPending()` read BEFORE the op). Guard: `tests/test_mlx_error_recovery.sh`.
-- **A failure caught as `error.MlxError` leaves the latch SET**: the next request's first `checkError` consumed it and
-  failed at once as `OutOfMemory`. Name it with `mlx.settledErrorName(err)` where it is caught: that consumes the latch
-  and reports a Metal out-of-memory behind it as one.
+- **No latch outlives the request that raised it.** A failure caught on the inference thread may leave the latch SET
+  (`check`'s `MlxError`; an engine maker's `HostArrayRefused`, its pool's refusal latched), and the next request's
+  first checkpoint failed on it. Name it with `mlx.settledErrorName(err)`, whatever its error: that takes the latch and
+  names the refusal or out-of-memory behind it. `runPrefill` and `runDecodeTick` settle on every exit (`checkLatch`
+  fails one on a latch a handled step left); a step that handles its own failure (a commit, an SSD flush) takes what it
+  left (`settleHandled`). Lint `caught-error-unsettled`.
 - **A load ends with the latch empty** (`settleLoadLatch`): an MLX error raised during the load that nothing handled is logged (`[load] MLX raised an error nothing handled`) and cleared, because the first request's `checkError` would fail on it as `MlxFailure` ("generation failed"). A step whose result matters must return `error.MlxError` through `mlx.check`; the latch is no channel for a load failure. `Warmup failed` and `[spec-warmup] failed` name the MLX message behind them.
 - A client-supplied PATH is proven on OUR side of the mlx boundary (stat → 400; an MLX error there latches).
 - In the unit-test binary a failing test's MLX error stays latched for the next test: a decode tick consumes it and

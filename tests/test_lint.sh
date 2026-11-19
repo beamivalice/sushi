@@ -362,6 +362,20 @@ printf '%s\n' 'fn fused() !?u8 { return null; }' 'fn f() !u8 {' '    blk: {' '  
   'fn g() ?u8 {' '    return (fused() catch null) orelse return null;' '}' > "$TMP/t/src/p.zig"
 expect_green "a tried fused arm, and a catch null that is not a fallback break"
 
+# rule caught-error-unsettled
+tree
+printf '%s\n' 'fn f(slot: anytype) void {' '    g() catch |e| {' '        slot.markError(@errorName(e));' '    };' '}' 'fn g() !void {}' > "$TMP/t/src/scheduler.zig"
+expect_red "an inference-thread failure named by @errorName" "src/scheduler.zig:3:24 \[caught-error-unsettled\] f: @errorName(e) of a caught failure"
+
+tree
+printf '%s\n' 'const log = @import("log.zig");' 'fn f() ?u8 {' '    return g() catch |err| blk: {' '        log.warn("{s}\\n", .{@errorName(err)});' '        break :blk null;' '    };' '}' 'fn g() !u8 { return 0; }' > "$TMP/t/src/mtp_tick.zig"
+expect_red "a labelled handler" "src/mtp_tick.zig:4:30 \[caught-error-unsettled\] f: @errorName(err)"
+
+tree
+printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn f(slot: anytype) void {' '    g() catch |e| slot.markError(mlx.settledErrorName(e));' '    mlx.checkErrorDecode() catch |e| slot.markError(@errorName(e));' '    g() catch |e| slot.markError(@errorName(error.Other));' '    _ = e2;' '}' 'const e2 = 0;' 'fn g() !void {}' > "$TMP/t/src/scheduler.zig"
+printf '%s\n' 'fn f(slot: anytype) void {' '    g() catch |e| slot.markError(@errorName(e));' '}' 'fn g() !void {}' > "$TMP/t/src/p.zig"
+expect_green "a settled name, a checkpoint's own error, another error's name, and a file off the inference thread"
+
 # rule config-free-stale
 tree
 printf '%s\n' 'const mlx = @import("mlx.zig");' 'var cfg: ?u8 = null;' 'fn f() !void {' '    if (cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);' '    try build();' '}' 'fn build() !void {}' > "$TMP/t/src/p.zig"

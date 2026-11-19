@@ -4,6 +4,7 @@ const arch_handle = @import("arch/handle.zig");
 const sched_policy = @import("sched_policy.zig");
 const trunk = @import("trunk.zig");
 const moe_gqmv = @import("moe_gqmv.zig");
+const mlx = @import("mlx.zig");
 const generate_mod = @import("generate.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -489,7 +490,7 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
         gen.mtp_batch_head = true;
         const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
             gen.mtp_batch_head = false;
-            slot.markError(@errorName(e));
+            slot.markError(mlx.settledErrorName(e));
             continue;
         };
         switch (begun) {
@@ -498,7 +499,7 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
                 var state = st_in;
                 defer state.deinit(slot.allocator);
                 gen.mtpRoundVerify(&state) catch |e| {
-                    slot.markError(@errorName(e));
+                    slot.markError(mlx.settledErrorName(e));
                     continue;
                 };
                 mtpFinishPublish(sch, slot, gen, &state);
@@ -536,15 +537,9 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     }
 
     const chain_lap = mtp_policy.SubLap.start(generate_mod.Generator.mtpTraceOn(), live[0].io);
-    generate_mod.Generator.mtpChainBuildBatched(gens[0..n], chains[0..n], 0, depth) catch |e| {
-        for (live[0..n]) |slot| slot.markError(@errorName(e));
-        return;
-    };
+    generate_mod.Generator.mtpChainBuildBatched(gens[0..n], chains[0..n], 0, depth) catch |e| return failRows(live[0..n], e);
     // Dispatched before the verify build so the chain's GPU time covers the build.
-    generate_mod.Generator.mtpChainDispatchBatched(chains[0..n]) catch |e| {
-        for (live[0..n]) |slot| slot.markError(@errorName(e));
-        return;
-    };
+    generate_mod.Generator.mtpChainDispatchBatched(chains[0..n]) catch |e| return failRows(live[0..n], e);
     if (chain_lap.read()) |chain_ns| {
         for (gens[0..n]) |gen| gen.mtpTraceSub(.chain, chain_ns);
     }
@@ -562,7 +557,7 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     for (0..taken) |i| {
         opens[i].chain = chains[i];
         states[vn] = gens[i].mtpRoundContinue(live[i].allocator, opens[i]) catch |e| {
-            live[i].markError(@errorName(e));
+            live[i].markError(mlx.settledErrorName(e));
             continue;
         };
         vgens[vn] = gens[i];
@@ -574,19 +569,19 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     var sts: [MAX_BATCH_GROUP]*mtp_round.MtpRoundState = undefined;
     for (states[0..vn], 0..) |*st, i| sts[i] = st;
     if (generate_mod.Generator.mtpGroupVerify(vgens[0..vn], sts[0..vn])) |_| {
-        generate_mod.Generator.mtpGroupAccept(vgens[0..vn], sts[0..vn]) catch |e| {
-            for (vlive[0..vn]) |slot| slot.markError(@errorName(e));
-            return;
-        };
-    } else |e| {
-        for (vlive[0..vn]) |slot| slot.markError(@errorName(e));
-        return;
-    }
+        generate_mod.Generator.mtpGroupAccept(vgens[0..vn], sts[0..vn]) catch |e| return failRows(vlive[0..vn], e);
+    } else |e| return failRows(vlive[0..vn], e);
     for (states[0..vn], vgens[0..vn], vlive[0..vn]) |*st, gen, slot| {
         if (slot.state == .errored) continue;
         mtpFinishPublish(sch, slot, gen, st);
     }
     observeGroupRound(vlive[0..vn], states[0..vn], group.len, &tick_sw, head_calls_before);
+}
+
+/// A group step that failed fails every row in it, by its settled error's name.
+fn failRows(rows: []const *Slot, err: anyerror) void {
+    const name = mlx.settledErrorName(err);
+    for (rows) |slot| slot.markError(name);
 }
 
 /// Every MTP slot that reaches here is Flash-Next (`slotMtpGroupable` needs its GDN trunk) or MiMo
@@ -650,7 +645,7 @@ fn observeGroupRound(live: []*Slot, states: []const mtp_round.MtpRoundState, exp
 /// Finish one row's round and publish it; a failed finish errors the slot instead.
 fn mtpFinishPublish(sch: *Scheduler, slot: *Slot, gen: *Generator, st: *mtp_round.MtpRoundState) void {
     const r = gen.mtpRoundFinish(slot.allocator, st) catch |e| {
-        slot.markError(@errorName(e));
+        slot.markError(mlx.settledErrorName(e));
         return;
     };
     publishMtpResult(sch, slot, gen, r);

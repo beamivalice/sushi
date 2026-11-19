@@ -2648,38 +2648,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // After the teardown settles, like a load: a finished slot's flush has run by then.
             if (sch.cleanup_queue.items.len == 0 and sch.prefix_clear_queue.items.len > 0) clear_req = sch.prefix_clear_queue.orderedRemove(0);
         }
-        for (cleanup_batch[0..cleanup_n]) |s| {
-            const turn = arch_handle.turnFor(s.model.handle, s.model.config);
-            defer turn.end();
-            // Decode-phase cancel: `complete()` pulled this slot straight
-            // into the cleanup queue, so it never went through finishSlot
-            // and its committed KV (prompt + every emitted token) would die
-            // right here with the slot. Commit it first — the same guards
-            // as a normal finish apply inside (pad-only / error / vision /
-            // empty all decline) — then flush what was committed to the
-            // SSD tier, since no finishSlot will. Normally-finished slots
-            // arrive here with `finished` already set (finishSlot committed
-            // them) and skip; errored slots decline via the error guard.
-            // Runs on the inference thread — the sole mlx caller — which is
-            // what makes the refcount-sharing snapshot legal here.
-            if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
-                // Streams end this way on a stop sequence or a client that leaves: finishSlot's line is theirs too.
-                if (s.legacy_gen) |*g| {
-                    slot_outcome.finishSpec(s, g);
-                    g.logArchMeters();
-                }
-                commitCancelledAtCleanup(sch, s, commitSlotIfApplicable);
-                if (s.model.prefix_cache) |*hc| {
-                    if (s.model.handle) |h| hc.flushPendingDisk(arch_handle.stream(h));
-                }
-            }
-            slot_outcome.finishSpecAtCleanup(s);
-            // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
-            // record must not outlive the bytes `s.deinit()` frees.
-            if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
-            if (s.model.handle) |h| arch_state.resetTables(arch_handle.trunk(h));
-            if (s.model.config) |c| sched.endRequest(c);
-        }
+        for (cleanup_batch[0..cleanup_n]) |s| cleanupSlot(sch, s);
         if (cleanup_n > 0) {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
@@ -2810,7 +2779,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                             if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
                             if (slot.model.handle) |h| {
                                 const xf = arch_handle.trunk(h);
-                                slot.cache.truncate(0, xf.s) catch {};
+                                slot.cache.truncate(0, xf.s) catch |e| log.warn("[hot-cache] dropping the restored rows failed: {s}\n", .{mlx.settledErrorName(e)});
                                 arch_state.resetTables(xf);
                                 sched.resetForRetry(slot, xf);
                             }
@@ -2826,10 +2795,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                             qsa_gap_retried = true;
                             continue :prefill;
                         }
-                        const name = mlx.settledErrorName(err);
-                        log.err("[scheduler] prefill failed for slot: {s}\n", .{name});
-                        slot.markError(name);
-                        releaseNativeState(slot);
+                        failPrefill(slot, err);
                         break :prefill;
                     };
                     break :prefill;
@@ -2848,7 +2814,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 sch.queue_mu.lockUncancelable(sch.io);
                 sch.decoding.append(sch.allocator, slot) catch |err| {
                     sch.queue_mu.unlock(sch.io);
-                    slot.markError(@errorName(err));
+                    slot.markError(mlx.settledErrorName(err));
                     releaseNativeState(slot);
                     continue;
                 };
@@ -2877,11 +2843,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         //    the tick cadence regardless of how many peers share it).
         if (active.items.len > 0) {
             var decode_sw = io_util.Stopwatch.init(sch.io);
-            runDecodeTick(sch, active.items) catch |err| {
-                const name = mlx.settledErrorName(err);
-                log.err("[scheduler] decode tick failed: {s}\n", .{name});
-                for (active.items) |s| s.markError(name);
-            };
+            runDecodeTick(sch, active.items) catch |err| failTick(active.items, err, "[scheduler]");
             const tick_ns = decode_sw.read();
             for (active.items) |s| s.decode_ns +|= tick_ns;
         }
@@ -2894,6 +2856,21 @@ fn inferenceLoop(ctx: ThreadCtx) void {
     }
     flushLiveStates(sch, "shutdown");
     flushImatrixCaptures(sch);
+}
+
+/// A request whose prefill failed fails alone, by its settled error's name.
+pub fn failPrefill(slot: *Slot, err: anyerror) void {
+    const name = mlx.settledErrorName(err);
+    log.err("[scheduler] prefill failed for slot: {s}\n", .{name});
+    slot.markError(name);
+    releaseNativeState(slot);
+}
+
+/// A decode tick that failed fails the slots it ran, by its settled error's name.
+pub fn failTick(active: []const *Slot, err: anyerror, tag: []const u8) void {
+    const name = mlx.settledErrorName(err);
+    log.err("{s} decode tick failed: {s}\n", .{ tag, name });
+    for (active) |s| s.markError(name);
 }
 
 /// Counts the tier hit of the restore a request keeps, once its prefill completes: a restore a retry or an abort throws
@@ -2966,6 +2943,41 @@ pub fn cullDecodingWith(sch: *Scheduler, commit: *const fn (*Scheduler, *Slot) v
 fn commitsAtCull(s: *const Slot) bool {
     if (!sched_policy.cancelOpen(s.cancelled.load(.acquire), s.finished, s.error_code != null)) return false;
     return sched.commitsAtCull(s);
+}
+
+/// The cleanup drain's step for one slot the connection thread completed, before its deinit (inference thread).
+pub fn cleanupSlot(sch: *Scheduler, s: *Slot) void {
+    const turn = arch_handle.turnFor(s.model.handle, s.model.config);
+    defer turn.end();
+    // Decode-phase cancel: `complete()` pulled this slot straight
+    // into the cleanup queue, so it never went through finishSlot
+    // and its committed KV (prompt + every emitted token) would die
+    // right here with the slot. Commit it first — the same guards
+    // as a normal finish apply inside (pad-only / error / vision /
+    // empty all decline) — then flush what was committed to the
+    // SSD tier, since no finishSlot will. Normally-finished slots
+    // arrive here with `finished` already set (finishSlot committed
+    // them) and skip; errored slots decline via the error guard.
+    // Runs on the inference thread — the sole mlx caller — which is
+    // what makes the refcount-sharing snapshot legal here.
+    if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
+        // Streams end this way on a stop sequence or a client that leaves: finishSlot's line is theirs too.
+        if (s.legacy_gen) |*g| {
+            slot_outcome.finishSpec(s, g);
+            g.logArchMeters();
+        }
+        commitCancelledAtCleanup(sch, s, commitSlotIfApplicable);
+        if (s.model.prefix_cache) |*hc| {
+            if (s.model.handle) |h| hc.flushPendingDisk(arch_handle.stream(h));
+        }
+        mlx.settleHandled("[disk-cache] a cancelled request's flush");
+    }
+    slot_outcome.finishSpecAtCleanup(s);
+    // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
+    // record must not outlive the bytes `s.deinit()` frees.
+    if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+    if (s.model.handle) |h| arch_state.resetTables(arch_handle.trunk(h));
+    if (s.model.config) |c| sched.endRequest(c);
 }
 
 pub fn commitCancelledAtCleanup(sch: *Scheduler, s: *Slot, commit: *const fn (*Scheduler, *Slot) void) void {
@@ -3108,6 +3120,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // `finishSlot` can be reached on an EOS the failing forward itself produced, before the
     // tick wrapper reads the latch: an unread latch means the KV under this commit may be garbage.
     if (mlx.errorPending()) return;
+    defer mlx.settleHandled("[hot-cache] the commit");
     const gen_ptr = if (slot.legacy_gen) |*g| g else {
         // A Generator-less slot whose cache is non-empty is a prefill the
         // client disconnected from mid-chunk-loop: initWithOptions threw
@@ -3129,7 +3142,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // forwarded each emitted token into slot.cache as it was sampled.
     const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
     sched.prepareCommit(slot) catch |err| {
-        log.warn("[hot-cache] {s} failed: {s} — not committed\n", .{ sched.prepareCommitLabel(slot), @errorName(err) });
+        log.warn("[hot-cache] {s} failed: {s} — not committed\n", .{ sched.prepareCommitLabel(slot), mlx.settledErrorName(err) });
         return;
     };
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
@@ -3189,7 +3202,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         const committed = gen_ptr.mtpCommittedHistoryLen();
         if (committed == 0) break :blk null;
         mc.truncate(committed, arch_handle.trunk(slot.model.handle.?).s) catch |err| {
-            log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
+            log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{mlx.settledErrorName(err)});
             break :blk null;
         };
         // An in-checkpoint head commits its own half beside the KV.
@@ -3212,7 +3225,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // Ownership of the checkpoints transferred to the cache regardless of
         // the outcome — its error paths free them (#330 adjacent: freeing
         // here too was a double free, with a different allocator).
-        log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
+        log.warn("[hot-cache] commit failed: {s}\n", .{mlx.settledErrorName(err)});
         return;
     };
     publishHotCacheResidency(sch);
@@ -3284,7 +3297,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     if (sched.commitOwn(hc, slot, null, slot.full_prompt[0..len], cps, len)) return;
     hc.commit_restored = slot.restored_disk;
     const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, media.key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
-        log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
+        log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{mlx.settledErrorName(err)});
         return;
     };
     // Truthful outcome only: a budget decline must never print as a commit
@@ -3577,11 +3590,7 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
         }
     }
     var sw = io_util.Stopwatch.init(sch.io);
-    runDecodeTick(sch, buf[0..n]) catch |err| {
-        const name = mlx.settledErrorName(err);
-        log.err("[interleave] decode tick failed: {s}\n", .{name});
-        for (buf[0..n]) |s| s.markError(name);
-    };
+    runDecodeTick(sch, buf[0..n]) catch |err| failTick(buf[0..n], err, "[interleave]");
     const tick_ns = sw.read();
     for (buf[0..n]) |s| s.decode_ns +|= tick_ns;
     return tick_ns;
@@ -3626,7 +3635,14 @@ fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
     slot.handover_token = t1;
 }
 
+/// A request's prefill. No latch outlives it, whatever its exit: a failure is its settled error, and a latch a step it
+/// handled left fails it here, not the next request's first checkpoint.
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+    prefillSteps(sch, slot) catch |e| return mlx.settledError(e);
+    try mlx.checkLatch();
+}
+
+fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
     const turn = arch_handle.turnFor(slot.model.handle, slot.model.config);
     defer turn.end();
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
@@ -3762,7 +3778,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 @intFromPtr(slot),
                 slot.skip_prefix_cache,
             )) catch |err| blk: {
-                log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
+                log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{mlx.settledErrorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
             slot.restore_ns = lookup_sw.read();
@@ -3788,7 +3804,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // keeps its own restore point; a full reuse is covered by the prompt end.
             if (hot_matched >= prefix_cache_mod.RING_RESTORE_MIN_TOKENS and !lookup.full_match and slot.ring_cps.fork == null) {
                 slot.ring_cps.fork = slot.cache.ringCheckpoint(hot_matched, xfm_ptr.s) catch |err| blk: {
-                    log.warn("[hot-cache] ring checkpoint at the restore failed: {s}\n", .{@errorName(err)});
+                    log.warn("[hot-cache] ring checkpoint at the restore failed: {s}\n", .{mlx.settledErrorName(err)});
                     break :blk null;
                 };
             }
@@ -4117,7 +4133,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // A long reply compacts the ring past the prompt end, where the next turn diverges.
     if (slot.model.prefix_cache != null and slot.ring_cps.prompt_end == null) {
         slot.ring_cps.prompt_end = slot.cache.ringCheckpoint(slot.full_prompt.len, xfm_ptr.s) catch |err| blk: {
-            log.warn("[hot-cache] ring checkpoint failed: {s}; the entry restores at its end only\n", .{@errorName(err)});
+            log.warn("[hot-cache] ring checkpoint failed: {s}; the entry restores at its end only\n", .{mlx.settledErrorName(err)});
             break :blk null;
         };
     }
@@ -4196,8 +4212,9 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     }
 
     // A planner's round, a head detached and a group's forward are their model's work: each side's slots are a tick
-    // of their own, in that side's turn.
-    return arch_handle.perSide(*Slot, active, slotOnEngine, sch, runSideTick);
+    // of their own, in that side's turn. No latch outlives the tick, whatever its exit.
+    arch_handle.perSide(*Slot, active, slotOnEngine, sch, runSideTick) catch |e| return mlx.settledError(e);
+    try mlx.checkLatch();
 }
 
 /// One tick of the slots of one side: models on MLX (`own` false), or on the engine's own stream.
@@ -4284,7 +4301,7 @@ fn runSideTick(sch: *Scheduler, active: []*Slot, own: bool) anyerror!void {
                 for (mtp_buf[i..j]) |slot| {
                     const gen = &slot.legacy_gen.?;
                     gen.mtpDetachHead(slot.allocator, true) catch |e| {
-                        slot.markError(@errorName(e));
+                        slot.markError(mlx.settledErrorName(e));
                         continue;
                     };
                     gen.mtp_group_cap = 0;
@@ -4961,7 +4978,7 @@ pub fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
         if (try loopGuardTick(sch, slot, gen)) continue;
         if (gen.pending != null) {
             const emitted = gen.drainPipelineForBatch(slot.allocator) catch |err| {
-                slot.markError(@errorName(err));
+                slot.markError(mlx.settledErrorName(err));
                 continue;
             };
             if (emitted) |tok| {

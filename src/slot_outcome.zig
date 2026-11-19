@@ -358,6 +358,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
             logDiskUsage(slot.model);
         }
     }
+    if (latched == null) mlx.settleHandled("[disk-cache] a finished request's flush");
     // Return this turn's transients to the OS. The per-`CACHE_CLEAR_INTERVAL`
     // clear inside `Generator.advanceStep` can't cover the tail of a turn, and
     // MLX parks freed buffers in a size-keyed pool rather than releasing them —

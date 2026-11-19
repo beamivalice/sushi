@@ -6,6 +6,11 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A request refused for memory on Sushi Cooler fails alone, with its memory error, and the next request serves**: a
+  refusal met while making a host array (DeepSeek's prompt arrays, a request's first buffer on a full pool) failed as a
+  bare 500 "generation failed" and left its error pending, so the next request, or one already answering beside it,
+  failed with it. A failed prefix-cache lookup now falls back to a cold prefill as it says, instead of failing the
+  request at its first chunk.
 - **A failed speculative Qwen request no longer leaves memory held until restart**: a request whose MTP verify failed,
   for example refused for memory, kept the verify's recurrent-state capture (about 6 MB per layer it had reached), and
   every such failure added to it. The round frees it as it fails, and the request's teardown frees it too.

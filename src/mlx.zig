@@ -2376,15 +2376,35 @@ fn consumeLatch() !void {
     return error.MlxFailure;
 }
 
-/// The name a caught failure is reported under. `check` returns `MlxError` and leaves the mlx-c
-/// latch set; settling it here keeps the next request's first checkpoint from failing on it, and
-/// a Metal out-of-memory behind it is reported as the memory failure it is.
-pub fn settledErrorName(err: anyerror) []const u8 {
-    if (err != error.MlxError) return @errorName(err);
+/// The error a caught failure is reported as, its latch settled whatever the error: on the inference thread a latch
+/// pending at a failure is that failure's cause (`check`'s `MlxError`, an engine maker's `HostArrayRefused`), and left
+/// set it fails the next request's first checkpoint. A refusal or a Metal out-of-memory behind it is that failure.
+pub fn settledError(err: anyerror) anyerror {
     var buf: [512]u8 = undefined;
-    const msg = takeError(&buf) orelse return @errorName(err);
-    if (mlxErrorIsTransientCap(msg)) return "TransientCapExceeded";
-    return if (mlxErrorIsMemory(msg)) "OutOfMemory" else @errorName(err);
+    const msg = takeError(&buf);
+    // The engine's pool refused the buffer: the same refusal its latched message names.
+    if (err == error.PoolOverBudget) return error.TransientCapExceeded;
+    const m = msg orelse return err;
+    if (mlxErrorIsTransientCap(m)) return error.TransientCapExceeded;
+    return if (mlxErrorIsMemory(m)) error.OutOfMemory else err;
+}
+
+pub fn settledErrorName(err: anyerror) []const u8 {
+    return @errorName(settledError(err));
+}
+
+/// The end of a unit of a request's work that returned no error (a prefill, a decode tick): a latch a step of it left
+/// fails the unit here, not the next request.
+pub fn checkLatch() !void {
+    return consumeLatch();
+}
+
+/// The end of a step that handles its own failure (a commit or an SSD flush skipped): takes a latch it left, logged
+/// under `what`. Called only where no latch was pending as the step began, so the latch is the step's own.
+pub fn settleHandled(what: []const u8) void {
+    var buf: [512]u8 = undefined;
+    const msg = takeError(&buf) orelse return;
+    log.warn("{s} left an MLX error, settled: {s}\n", .{ what, msg });
 }
 
 /// Prefill checkpoint: once per chunk plus once after the last.
@@ -2576,17 +2596,21 @@ test "a Metal out-of-memory behind an MlxError is a memory failure and leaves no
     try checkErrorDecode();
 }
 
-test "settledErrorName leaves other errors and an unlatched MlxError alone" {
+test "settledErrorName takes the latch whatever the error, and names a refusal behind an engine maker's error by it" {
     const t = std.testing;
     resetFaultChunkForTest();
     defer resetFaultChunkForTest();
 
     try t.expectEqualStrings("MlxError", settledErrorName(error.MlxError));
     try t.expectEqualStrings("Cancelled", settledErrorName(error.Cancelled));
-    // A latch that is not this failure's stays for its owner.
     latchErrorForTest("[matmul] Last dimension of first input must match.");
     try t.expectEqualStrings("Cancelled", settledErrorName(error.Cancelled));
-    try t.expect(errorPending());
+    try t.expect(!errorPending());
+    latchErrorForTest("[engine] array_new_data: PoolOverBudget: a buffer of 16 KB under a limit of 4 MB");
+    try t.expectEqualStrings("TransientCapExceeded", settledErrorName(error.HostArrayRefused));
+    try t.expect(!errorPending());
+    try t.expectEqualStrings("TransientCapExceeded", settledErrorName(error.PoolOverBudget));
+    try checkError();
 }
 
 test "a transient-cap refusal is its own failure, at every checkpoint, and is consumed once" {

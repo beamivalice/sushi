@@ -2111,7 +2111,7 @@ fn requestOf(comptime C: type, ld: *Load, prompt: []const u32, n: u32, spec: boo
     return C.specTokens(testing.allocator, ld.xfm, prompt, n);
 }
 
-test "cooler contract: a Cooler request refused at any pool buffer site fails by its error, and every later request on the same load says the same tokens" {
+test "cooler contract: a Cooler request refused at any pool buffer site fails as TransientCapExceeded once the scheduler settles it, leaving no latch, and every later request on the same load says the same tokens" {
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer seen.deinit(testing.allocator);
     const S = struct {
@@ -2122,7 +2122,6 @@ test "cooler contract: a Cooler request refused at any pool buffer site fails by
             var ld: Load = undefined;
             try ld.open(C, dir, true);
             defer _ = ld.close();
-            var msg: [300]u8 = undefined;
             // A speculative round's plan follows measured costs and live sync times, so its draft count, and the asks
             // with it, change from request to request; pinned (as --mtp-min-depth 3 --mtp-max-depth 3) every request
             // makes the same asks and the sweep proves each one.
@@ -2159,8 +2158,8 @@ test "cooler contract: a Cooler request refused at any pool buffer site fails by
                     if (r) |got| {
                         var g = got;
                         g.deinit(a);
-                        try testing.expect(!mlx.errorPending());
-                    } else |_| _ = mlx.takeError(&msg);
+                    } else |e| try testing.expectEqualStrings("TransientCapExceeded", mlx.settledErrorName(e));
+                    try testing.expect(!mlx.errorPending());
                     if (!fired and pt.strict) {
                         std.debug.print("cooler contract: a {s} request never made ask {d} of a site its recording made\n", .{ if (spec) "speculative" else "plain", pt.n });
                         return error.TestUnexpectedResult;
@@ -2548,7 +2547,7 @@ const SsdRestore = struct {
     }
 };
 
-test "cooler contract: a served SSD restore refused at any pool buffer site its cold requests lack fails or says the cold tokens, and the next conversation says them" {
+test "cooler contract: a served SSD restore refused at any pool buffer site its cold requests lack falls back to a cold prefill and says the cold tokens, and the next conversation says them" {
     try qwenTinyServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
@@ -2568,19 +2567,17 @@ test "cooler contract: a served SSD restore refused at any pool buffer site its 
             a.free(try firstAsks(a, &seen, Q, SsdRestore{ .ld = &ld, .dir = dir, .long = &long, .other = ids[0..@min(ids.len, 20)], .cold_only = true }, SsdRestore.go));
             const points = try firstAsks(a, &seen, Q, SsdRestore{ .ld = &ld, .dir = dir, .long = &long, .other = ids[0..@min(ids.len, 20)] }, SsdRestore.go);
             defer a.free(points);
-            var msg: [300]u8 = undefined;
             for (points, 0..) |pt, at| {
                 var got: std.ArrayList(u32) = .empty;
                 mlx.engine.fault.armAt(pt);
                 const r = (SsdRestore{ .ld = &ld, .dir = dir, .long = &long, .other = ids[0..@min(ids.len, 20)], .restored = &got }).go();
                 const fired = !mlx.engine.fault.armed();
                 mlx.engine.fault.disarm();
-                if (r) |_| {
-                    defer got.deinit(a);
-                    errdefer std.debug.print("cooler contract: SSD restore point {d} of {d}: the refused conversation said other tokens\n", .{ at, points.len });
-                    try testing.expectEqualSlices(u32, cold.items, got.items);
-                } else |_| _ = mlx.takeError(&msg);
                 errdefer std.debug.print("cooler contract: SSD restore point {d} of {d} (fired {})\n", .{ at, points.len, fired });
+                try r;
+                defer got.deinit(a);
+                try testing.expectEqualSlices(u32, cold.items, got.items);
+                try testing.expect(!mlx.errorPending());
                 if (pt.strict) try testing.expect(fired);
                 var after: std.ArrayList(u32) = undefined;
                 try (SsdRestore{ .ld = &ld, .dir = dir, .long = &long, .other = ids[0..@min(ids.len, 20)], .restored = &after }).go();
@@ -2699,7 +2696,6 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
             const points = try firstAsks(a, &seen, Q, Req{ .sv = &sv, .p = prompts }, Req.go);
             defer a.free(points);
             const base = Sheet.now();
-            var msg: [300]u8 = undefined;
             for (points, 0..) |pt, at| {
                 errdefer std.debug.print("cooler contract: rows point {d} of {d}\n", .{ at, points.len });
                 mlx.engine.fault.armAt(pt);
@@ -2711,7 +2707,7 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
                         defer x.deinit(a);
                         try testing.expectEqualSlices(u32, solo[i].items, x.items);
                     }
-                } else |_| _ = mlx.takeError(&msg);
+                } else |_| {}
                 try testing.expect(!mlx.errorPending());
                 var o2: [2]std.ArrayList(u32) = undefined;
                 try servedRows(&sv, prompts, 16, false, &o2);
@@ -2901,7 +2897,6 @@ test "cooler contract: speculative rows failed at any checked MLX call site thei
             defer a.free(all);
             sv.quiet_failures = true;
             const base = Sheet.now();
-            var msg: [300]u8 = undefined;
             for (all, 0..) |pt, at| {
                 if (seen.contains(pt.site)) continue;
                 errdefer std.debug.print("cooler contract: speculative rows failed at MLX point {d} of {d} (call {d} of its site)\n", .{ at, all.len, pt.n });
@@ -2914,7 +2909,7 @@ test "cooler contract: speculative rows failed at any checked MLX call site thei
                         defer x.deinit(a);
                         try testing.expectEqualSlices(u32, solo[i].items, x.items);
                     }
-                } else |_| _ = mlx.takeError(&msg);
+                } else |_| {}
                 try testing.expect(!mlx.errorPending());
                 var o2: [2]std.ArrayList(u32) = undefined;
                 try servedRows(&sv, prompts, 12, true, &o2);
@@ -2974,7 +2969,6 @@ test "cooler contract: a served speculative request refused at any pool buffer s
             defer a.free(all);
             sv.quiet_failures = true;
             const base = Sheet.now();
-            var msg: [300]u8 = undefined;
             for (all, 0..) |pt, at| {
                 if (seen.contains(pt.site)) continue;
                 errdefer std.debug.print("cooler contract: a speculative request refused at pool point {d} of {d} (ask {d} of its site)\n", .{ at, all.len, pt.n });
@@ -2982,9 +2976,8 @@ test "cooler contract: a served speculative request refused at any pool buffer s
                 const r = Req.go(.{ .sv = &sv, .p = &p, .mtp = true });
                 const fired = !mlx.engine.fault.armed();
                 mlx.engine.fault.disarm();
-                r catch {
-                    if (mlx.errorPending()) _ = mlx.takeError(&msg);
-                };
+                r catch {};
+                try testing.expect(!mlx.errorPending());
                 try testing.expect(fired or !pt.strict);
                 var got = try sv.requestWith(&p, 12, .{ .temperature = 0 }, true, &from);
                 defer got.deinit(a);
@@ -2993,6 +2986,286 @@ test "cooler contract: a served speculative request refused at any pool buffer s
                 try testing.expectEqual(base.in_use, now.in_use);
                 try testing.expectEqual(@as(u32, 0), now.open);
             }
+        }
+    }.run);
+}
+
+/// A greedy request's slot, submitted and prefilled as the inference loop runs it (`failPrefill` on a failure).
+/// `refuse_first`: its prefill's first pool buffer is refused, as when it meets a full pool.
+fn servedAdmit(sv: *Served, prompt: []const u32, n: u32, refuse_first: bool) !*Served.scheduler.Slot {
+    const scheduler = Served.scheduler;
+    const sch = &sv.sch;
+    const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = n });
+    for (sch.pending.items, 0..) |p, k| if (p == slot) {
+        _ = sch.pending.orderedRemove(k);
+        break;
+    };
+    if (refuse_first) mlx.engine.fault.arm(1);
+    const prefilled = scheduler.runPrefill(sch, slot);
+    mlx.engine.fault.disarm();
+    prefilled catch |e| scheduler.failPrefill(slot, e);
+    if (!scheduler.postPrefillTerminal(sch, slot)) try sch.decoding.append(testing.allocator, slot);
+    return slot;
+}
+
+/// One decode tick of the scheduler's decoding slots, as the inference loop runs it (`failTick` on a failure).
+fn servedTick(sv: *Served) void {
+    const scheduler = Served.scheduler;
+    var act: [4]*scheduler.Slot = undefined;
+    var k: usize = 0;
+    for (sv.sch.decoding.items) |s| if (s.joinsTick() and k < act.len) {
+        act[k] = s;
+        k += 1;
+    };
+    if (k > 0) scheduler.runDecodeTick(&sv.sch, act[0..k]) catch |e| scheduler.failTick(act[0..k], e, "[scheduler]");
+    scheduler.cullDecoding(&sv.sch);
+}
+
+test "cooler contract: a served request refused at its prefill's first pool buffer fails alone as TransientCapExceeded; the request after it and one decoding beside it say their solo tokens" {
+    const Body = struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            var other: [27]u32 = undefined;
+            for (&other, 0..) |*t, i| t.* = ids[(i * 7 + 3) % ids.len];
+            var refused: [19]u32 = undefined;
+            for (&refused, 0..) |*t, i| t.* = ids[(i * 5 + 1) % ids.len];
+            var f: u32 = 0;
+            var solo = try sv.request(&other, 12, &f);
+            defer solo.deinit(a);
+            // The refused request arrives before the other one is admitted, then after it has decoded three tokens.
+            for ([_]u32{ 0, 3 }) |ticks_before| {
+                errdefer std.debug.print("cooler contract: the refused request arrived after {d} ticks of the other\n", .{ticks_before});
+                var slots: [2]*Served.scheduler.Slot = undefined;
+                var made: usize = 0;
+                defer {
+                    for (slots[0..made]) |s| sv.sch.complete(s);
+                    for (sv.sch.cleanup_queue.items) |s| s.deinit();
+                    sv.sch.cleanup_queue.clearRetainingCapacity();
+                }
+                const other_first = ticks_before > 0;
+                if (other_first) {
+                    slots[made] = try servedAdmit(&sv, &other, 12, false);
+                    made += 1;
+                    for (0..ticks_before) |_| servedTick(&sv);
+                }
+                slots[made] = try servedAdmit(&sv, &refused, 12, true);
+                const r = slots[made];
+                made += 1;
+                if (!other_first) {
+                    slots[made] = try servedAdmit(&sv, &other, 12, false);
+                    made += 1;
+                }
+                const o = if (other_first) slots[0] else slots[1];
+                while (o.joinsTick()) servedTick(&sv);
+                try testing.expectEqualStrings("TransientCapExceeded", r.error_code orelse "served");
+                try testing.expect(o.error_code == null);
+                try testing.expectEqualSlices(u32, solo.items, o.legacy_gen.?.generated_ids.items);
+                try testing.expect(!mlx.errorPending());
+            }
+        }
+    };
+    var ran = false;
+    inline for (.{ .{ "qwen4", "QWEN4_STQ_TINY" }, .{ "dsv41", "DSV41_STQ_TINY" } }) |arm| {
+        if (servedOn(arm[0], &.{arm[1]}, Body.run)) |_| {
+            ran = true;
+        } else |e| if (e != error.SkipZigTest) return e;
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+/// Requests through one scheduler as the inference loop runs them, with the loop's own failure and cleanup steps: all
+/// submitted at once and prefilled in turn (a second one after a tick of the first, as `interleaveDecodeTick` runs),
+/// then joined in each decode tick; a client that leaves is completed and drained at its tick.
+const MixedTick = struct {
+    const scheduler = Served.scheduler;
+    const max = 4;
+
+    const Spec = struct {
+        prompt: []const u32,
+        n: u32,
+        sampling: SamplingParams = .{ .temperature = 0.0 },
+        mtp: bool = false,
+        logprobs: u32 = 0,
+        /// Decode ticks after its admission at which its client leaves; null: it runs to its end.
+        cancel_at: ?u32 = null,
+
+        fn deterministic(s: Spec) bool {
+            return s.sampling.temperature == 0.0 or s.sampling.seed != null;
+        }
+    };
+
+    /// A request's tokens, or the name it failed by.
+    const Out = struct {
+        tokens: std.ArrayList(u32) = .empty,
+        err: [48]u8 = undefined,
+        err_len: usize = 0,
+
+        fn failed(o: *const Out) bool {
+            return o.err_len > 0;
+        }
+    };
+
+    fn tick(sch: *scheduler.Scheduler) void {
+        var act: [max]*scheduler.Slot = undefined;
+        var k: usize = 0;
+        for (sch.decoding.items) |s| if (s.joinsTick()) {
+            act[k] = s;
+            k += 1;
+        };
+        if (k > 0) scheduler.runDecodeTick(sch, act[0..k]) catch |e| scheduler.failTick(act[0..k], e, "[scheduler]");
+        scheduler.cullDecoding(sch);
+    }
+
+    fn drain(sch: *scheduler.Scheduler) void {
+        for (sch.cleanup_queue.items) |s| scheduler.cleanupSlot(sch, s);
+        for (sch.cleanup_queue.items) |s| {
+            const turn = arch_handle.turnFor(s.model.handle, s.model.config);
+            defer turn.end();
+            s.deinit();
+        }
+        sch.cleanup_queue.clearRetainingCapacity();
+    }
+
+    fn run(sv: *Served, specs: []const Spec, out: []Out) !void {
+        const a = testing.allocator;
+        const sch = &sv.sch;
+        // `submit` waits for room in the queue; every request here is in flight at once.
+        sch.queue_cap = max;
+        var slots: [max]*scheduler.Slot = undefined;
+        var gone: [max]bool = @splat(false);
+        var made: usize = 0;
+        for (out[0..specs.len]) |*o| o.* = .{};
+        errdefer for (out[0..specs.len]) |*o| o.tokens.deinit(a);
+        defer {
+            for (slots[0..made], gone[0..made]) |s, g| if (!g) sch.complete(s);
+            drain(sch);
+        }
+        for (specs, 0..) |sp, i| {
+            if (i > 0) tick(sch);
+            const head = if (sp.mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
+            slots[i] = try sch.submit(.{ .model = sv.entry, .prompt_ids = sp.prompt, .sampling = sp.sampling, .eos_token_ids = &.{}, .max_tokens = sp.n, .enable_mtp = sp.mtp, .mtp = head, .logprobs_n = sp.logprobs });
+            made += 1;
+            for (sch.pending.items, 0..) |p, k| if (p == slots[i]) {
+                _ = sch.pending.orderedRemove(k);
+                break;
+            };
+            scheduler.runPrefill(sch, slots[i]) catch |e| scheduler.failPrefill(slots[i], e);
+            if (!scheduler.postPrefillTerminal(sch, slots[i])) try sch.decoding.append(a, slots[i]);
+        }
+        var t: u32 = 0;
+        while (true) : (t += 1) {
+            for (specs, 0..) |sp, i| {
+                if (sp.cancel_at != t or gone[i]) continue;
+                if (slots[i].legacy_gen) |*g| try out[i].tokens.appendSlice(a, g.generated_ids.items);
+                sch.complete(slots[i]);
+                gone[i] = true;
+                drain(sch);
+            }
+            var live = false;
+            for (sch.decoding.items) |s| live = live or s.joinsTick();
+            if (!live) break;
+            tick(sch);
+        }
+        scheduler.cullDecoding(sch);
+        for (slots[0..made], gone[0..made], out[0..made]) |s, g, *o| {
+            if (g) continue;
+            if (s.error_code) |e| {
+                o.err_len = @min(e.len, o.err.len);
+                @memcpy(o.err[0..o.err_len], e[0..o.err_len]);
+            } else try o.tokens.appendSlice(a, s.legacy_gen.?.generated_ids.items);
+        }
+        const hc = &sv.entry.prefix_cache.?;
+        hc.flushPendingDisk(arch_handle.trunk(sv.entry.handle.?).s);
+        hc.disk.?.drainWriter();
+    }
+
+    /// `specs` refused at each pool-buffer site of their joined run that `seen` lacks, at its first ask: at most one
+    /// request fails, and by its settled name; every other one says its solo tokens, the next joined run says them all
+    /// and the pool is as it was.
+    fn faultSweep(comptime C: type, sv: *Served, specs: []const Spec, seen: *std.AutoHashMapUnmanaged(u64, void)) !void {
+        const a = testing.allocator;
+        var solo: [max]Out = undefined;
+        var made: usize = 0;
+        defer for (solo[0..made]) |*s| s.tokens.deinit(a);
+        for (specs) |sp| {
+            var one = [_]Spec{sp};
+            one[0].cancel_at = null;
+            try run(sv, &one, solo[made..][0..1]);
+            made += 1;
+            try testing.expect(!solo[made - 1].failed());
+        }
+        const Joined = struct {
+            sv: *Served,
+            specs: []const Spec,
+            fn go(q: @This()) anyerror!void {
+                var o: [max]Out = undefined;
+                try run(q.sv, q.specs, &o);
+                for (o[0..q.specs.len]) |*x| x.tokens.deinit(testing.allocator);
+            }
+        };
+        const points = try firstAsks(a, seen, C, Joined{ .sv = sv, .specs = specs }, Joined.go);
+        defer a.free(points);
+        try (Joined{ .sv = sv, .specs = specs }).go();
+        const base = Sheet.now();
+        for (points, 0..) |pt, at| {
+            errdefer std.debug.print("cooler contract: mixed tick refused at pool point {d} of {d}\n", .{ at, points.len });
+            var o: [max]Out = undefined;
+            mlx.engine.fault.armAt(pt);
+            const r = run(sv, specs, &o);
+            mlx.engine.fault.disarm();
+            try r;
+            defer for (o[0..specs.len]) |*x| x.tokens.deinit(a);
+            try testing.expect(!mlx.errorPending());
+            var failed: usize = 0;
+            for (specs, o[0..specs.len], solo[0..specs.len]) |sp, *x, *want| {
+                if (x.failed()) {
+                    failed += 1;
+                    try testing.expectEqualStrings("TransientCapExceeded", x.err[0..x.err_len]);
+                } else if (sp.deterministic() and sp.cancel_at == null) try testing.expectEqualSlices(u32, want.tokens.items, x.tokens.items);
+            }
+            try testing.expect(failed <= 1);
+            var again: [max]Out = undefined;
+            try run(sv, specs, &again);
+            defer for (again[0..specs.len]) |*x| x.tokens.deinit(a);
+            for (specs, again[0..specs.len], solo[0..specs.len]) |sp, *x, *want| {
+                try testing.expect(!x.failed());
+                if (sp.deterministic() and sp.cancel_at == null) try testing.expectEqualSlices(u32, want.tokens.items, x.tokens.items);
+            }
+            const now = Sheet.now();
+            try testing.expectEqual(base.in_use, now.in_use);
+            try testing.expectEqual(@as(u32, 0), now.open);
+        }
+    }
+};
+
+test "cooler contract: a pool refusal in one request of a mixed tick fails that request alone by its name and leaves the others their solo tokens" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            var b: [3][64]u32 = undefined;
+            var p: [3][]u32 = undefined;
+            for (&b, 0..) |*x, i| {
+                p[i] = x[0 .. 21 + 9 * i];
+                for (p[i], 0..) |*t, k| t.* = ids[(k * (7 + 2 * i) + i + 2) % ids.len];
+            }
+            const seeded: SamplingParams = .{ .temperature = 0.8, .top_k = 20, .seed = 5 };
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(testing.allocator);
+            // A logprobs request decodes serially and two speculative ones run their own rounds: three forwards a tick.
+            try MixedTick.faultSweep(Q, &sv, &.{ .{ .prompt = p[0], .n = 10, .logprobs = 2 }, .{ .prompt = p[1], .n = 10, .mtp = true }, .{ .prompt = p[2], .n = 10, .mtp = true, .sampling = seeded } }, &seen);
+            // One of them leaves after two ticks: the sites its commit and drain between the others' ticks add.
+            try MixedTick.faultSweep(Q, &sv, &.{ .{ .prompt = p[0], .n = 12, .logprobs = 2 }, .{ .prompt = p[1], .n = 12, .mtp = true, .cancel_at = 2 }, .{ .prompt = p[2], .n = 12, .mtp = true, .sampling = seeded } }, &seen);
         }
     }.run);
 }
@@ -3695,7 +3968,7 @@ test "cooler contract: the first served DeepSeek request after a Cooler load's w
                 starts[r] = MemSnap.now();
                 mlx.engine.resetPoolPeak(.process);
                 var from: u32 = 0;
-                var got = try sv.requestWith(prompt, 8, .{ .temperature = 0 }, &from);
+                var got = try sv.requestWith(prompt, 8, .{ .temperature = 0 }, false, &from);
                 defer got.deinit(a);
                 try testing.expectEqual(@as(usize, 8), got.items.len);
                 // From what was in use at the start: a headroom read counts the pool's free buffers as free.

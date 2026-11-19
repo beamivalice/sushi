@@ -501,7 +501,7 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
             if (is_image) n_vision += rows else n_video += rows;
             emb_parts.append(req.allocator, emb) catch |err| {
                 _ = mlx.mlx_array_free(emb);
-                failParts(sch, req, emb_parts.items, @errorName(err));
+                failParts(sch, req, emb_parts.items, mlx.settledErrorName(err));
                 return;
             };
             yieldStep(req);
