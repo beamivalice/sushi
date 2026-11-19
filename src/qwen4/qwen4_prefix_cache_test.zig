@@ -1372,7 +1372,7 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
 
     var from_full = pcEmptySsm();
     defer pcFreeQsaHybrid(&from_full);
-    try trunk_mod.restoreSsmCheckpoint(&from_full, &cps[0]);
+    try trunk_mod.restoreSsmCheckpoint(&from_full, &cps[0], s);
     qwen4_qsa_state.applyQsaHistoryAt(&from_full, &cps[1], B, s, false) catch |err| {
         std.debug.print("sliced-apply residue fail K=full field=apply {s}\n", .{@errorName(err)});
         return err;
@@ -1395,7 +1395,7 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
 
         var from_sliced = pcEmptySsm();
         defer pcFreeQsaHybrid(&from_sliced);
-        try trunk_mod.restoreSsmCheckpoint(&from_sliced, &cps[0]);
+        try trunk_mod.restoreSsmCheckpoint(&from_sliced, &cps[0], s);
         qwen4_qsa_state.applyQsaHistoryAt(&from_sliced, &sliced, B, s, false) catch |err| {
             std.debug.print("sliced-apply residue fail K={d} field=apply {s}\n", .{ K, @errorName(err) });
             return err;
@@ -1910,7 +1910,7 @@ test "spec snap bytes: the qwen4 head's QSA half is billed into the entry" {
     entry.aux_state = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_zeros(&entry.aux_state, &shape, 3, .bfloat16, s));
     entry.qsa_ratio = 4;
-    snap.head_aux = trunk_mod.ssmSnapshot(&entry);
+    snap.head_aux = trunk_mod.ssmSnapshot(&entry, s);
     const with_head = HotPrefixCache.specSnapBytes(&snap);
     try testing.expectEqual(kv_only + 16 * 128 * 2, with_head);
 }

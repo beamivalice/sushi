@@ -2438,7 +2438,7 @@ pub const Trunk = struct {
             for (ctx.cache.entries, marks) |entry, *mark| mark.* = .{ .offset = entry.offset, .initialized = entry.initialized };
             const entries = ctx.ssm_entries orelse &.{};
             const states = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
-            for (entries, states) |*entry, *state| state.* = ssmSnapshot(entry);
+            for (entries, states) |*entry, *state| state.* = ssmSnapshot(entry, xfm.s);
             return .{ .allocator = xfm.allocator, .xfm = xfm, .ctx = ctx, .kv_marks = marks, .cache_step = ctx.cache.step, .ssm = states, .offset = ctx.moe_seq_offset.* };
         }
 

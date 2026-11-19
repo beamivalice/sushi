@@ -188,7 +188,9 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `engine-hold-end` flags a call of `engine.unhold` outside `arch_handle.engineHoldEnd` and `src/tensor/`: the last
   hold's end also gives back the EXL3 module's engine-side arrays. `engine-lifecycle` flags a load's engine step
   (`enable`, `hold`, setting `own_weights`, `unsealed`, `seal`) outside `arch/cooler.zig` and `arch/handle.zig`;
-  `cooler-side-query` flags `cooler_ask` or `cooler_for_test` outside `cooler_side.zig`. `response-store-field` flags
+  `cooler-side-query` flags `cooler_ask` or `cooler_for_test` outside `cooler_side.zig`. `cache-gpu-stream` flags a
+  `gpuStream()` call in `prefix_cache.zig` or `ssm_cache.zig` outside `arraysStream` and tests: cache array work takes
+  its caller's stream ([engine-prefix-cache](engine-prefix-cache.md)). `response-store-field` flags
   the Responses store's map or LRU (`by_id`, `recency`) touched outside `responses.zig`: a record is held through
   `acquire`/`release`.
   `template-runtime-safety` flags a fn under `src/template/` whose body does not open with `@setRuntimeSafety(true)`,

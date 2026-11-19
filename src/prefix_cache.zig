@@ -541,11 +541,11 @@ pub const DflashSnap = struct {
     head_marks: trunk_mod.QsaHeadMarkSet = .{},
 
     /// The MTP snapshot of a commit, over a snapshot of its cache.
-    fn ofCommit(c: DflashCommit, snapshot: KVCacheSnapshot) DflashSnap {
+    fn ofCommit(c: DflashCommit, snapshot: KVCacheSnapshot, s: mlx.mlx_stream) DflashSnap {
         return .{
             .snapshot = snapshot,
             .base_pos = c.base_pos,
-            .head_aux = if (c.head) |h| trunk_mod.ssmSnapshot(h) else null,
+            .head_aux = if (c.head) |h| trunk_mod.ssmSnapshot(h, s) else null,
             .head_pos_base = c.head_pos_base,
             .head_marks = trunk_mod.QsaHeadMarkSet.share(c.head_marks),
         };
@@ -1669,7 +1669,7 @@ pub const HotPrefixCache = struct {
         } else if (rec.ssmEntries()) |entries| {
             if (e.ssm_checkpoints) |cps| {
                 if (highestCoveringCheckpoint(cps, restore_cap)) |cp| {
-                    try restoreSsmCheckpoint(entries, cp);
+                    try restoreSsmCheckpoint(entries, cp, s);
                     effective_matched = cp.pos;
                     const bank = qsaHistorySource(cps, cp);
                     if (bank) |src| {
@@ -1968,12 +1968,13 @@ pub const HotPrefixCache = struct {
         return self.commitWithState(source_cache, tokens, has_tools, 0, ssm_cps, dflash, mtp);
     }
 
-    /// Commit with SSM checkpoints; ownership of the payload transfers to
-    /// the entry.
-    fn arraysStream(self: *const HotPrefixCache) mlx.mlx_stream {
+    /// The stream the cache's arrays live on: the engine's on Sushi Cooler, MLX's otherwise.
+    pub fn arraysStream(self: *const HotPrefixCache) mlx.mlx_stream {
         return self.arrays_on orelse mlx.gpuStream();
     }
 
+    /// Commit with SSM checkpoints; ownership of the payload transfers to
+    /// the entry.
     pub fn commitWithState(
         self: *HotPrefixCache,
         source_cache: *const KVCache,
@@ -2155,7 +2156,7 @@ pub const HotPrefixCache = struct {
         var new_mtp_bytes: u64 = 0;
         if (mtp) |m2| {
             if (m2.cache.snapshot()) |snap| {
-                new_mtp = DflashSnap.ofCommit(m2, snap);
+                new_mtp = DflashSnap.ofCommit(m2, snap, self.arraysStream());
                 new_mtp_bytes = specSnapBytes(&new_mtp.?);
             } else |err| {
                 log.warn("  [hot-cache] mtp history snapshot failed: {s}\n", .{@errorName(err)});
@@ -2796,7 +2797,7 @@ pub const HotPrefixCache = struct {
         }
         if (mtp) |m2| {
             if (m2.cache.snapshot()) |ms| {
-                rec.mtp = DflashSnap.ofCommit(m2, ms);
+                rec.mtp = DflashSnap.ofCommit(m2, ms, self.arraysStream());
             } else |_| {}
         }
         self.pending_disk = rec;
@@ -8360,7 +8361,7 @@ test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is bu
 
     var dst = pcEmptySsm();
     defer pcFreeHybrid(&dst);
-    try trunk_mod.restoreSsmCheckpoint(&dst, &kept[1]);
+    try trunk_mod.restoreSsmCheckpoint(&dst, &kept[1], s);
     try testing.expectEqual(@as(f32, 200.0), pcSsmVal(dst[0].conv_state, 0, s));
     try testing.expectEqual(@as(f32, 1000.0), pcSsmVal(dst[0].ssm_state, 0, s));
 }

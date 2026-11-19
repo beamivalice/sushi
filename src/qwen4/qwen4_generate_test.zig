@@ -699,7 +699,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
         }
         try testing.expect(old_keys[i].ctx != null);
         saved_ssm[i] = try a.alloc(trunk.SSMCacheEntrySnapshot, slot.entries.len);
-        for (slot.entries, saved_ssm[i]) |*entry, *snapshot| snapshot.* = trunk.ssmSnapshot(entry);
+        for (slot.entries, saved_ssm[i]) |*entry, *snapshot| snapshot.* = trunk.ssmSnapshot(entry, xfm.s);
         saved_rows += 1;
     }
     const syncs = kv_cache.deferred_ple_group_syncs;
@@ -1237,7 +1237,7 @@ test "qwen4 decode-end point: an MTP finish hands over the state behind the repl
     // Restored from the point against a cold prefill of the same tokens, over the same continuation.
     // As a commit and a restore do: the slot's QSA history rides the newest point, cut to it.
     try qwen4_qsa_state.handoffQsaHistoryToLatest(gen.ssm_checkpoints.items, spec.entries, xfm.s);
-    try trunk.restoreSsmCheckpoint(spec.entries, cp);
+    try trunk.restoreSsmCheckpoint(spec.entries, cp, mlx.gpuStream());
     try qwen4_qsa_state.applyQsaHistoryAt(spec.entries, cp, cp.pos, xfm.s, false);
     var cold_prompt: [96 + want]u32 = undefined;
     @memcpy(cold_prompt[0..prompt.len], &prompt);

@@ -40,6 +40,7 @@ const rules = .{
     @import("response_store_field.zig"),
     @import("engine_lifecycle.zig"),
     @import("disk_read_stream.zig"),
+    @import("cache_gpu_stream.zig"),
     @import("host_maker_unchecked.zig"),
     @import("array_unowned_across_try.zig"),
     @import("caught_error_unsettled.zig"),

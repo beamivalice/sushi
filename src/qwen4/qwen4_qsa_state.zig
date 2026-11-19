@@ -928,7 +928,7 @@ test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identicall
 
     var dest_arr = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
     defer ssmFreeQsaState(&dest_arr[0]);
-    try restoreSsmCheckpoint(&dest_arr, &cps[0]);
+    try restoreSsmCheckpoint(&dest_arr, &cps[0], s);
     try applyQsaHistoryAt(&dest_arr, &cps[1], @intCast(pos), s, false);
 
     // The restore carries the raw rows of the block `pos` reopened, and nothing else.
@@ -1135,7 +1135,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
     try qsaTestAppendPool(&xfm, &live, keys, 0, s);
 
     // What `commitWithState` stores for the head, and what `qwen4MtpAdopt` seeds it back from.
-    var head_aux = ssmSnapshot(&live);
+    var head_aux = ssmSnapshot(&live, s);
     defer ssmSnapshotDeinit(&head_aux);
 
     const head_cache = try KVCache.init(t.allocator, 1);
@@ -1153,7 +1153,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
         m.cache.deinit();
     }
 
-    try ssmRestore(&m.entry, &head_aux);
+    try ssmRestore(&m.entry, &head_aux, s);
     m.seq_offset = @intCast(L);
     m.cache.step = @intCast(L);
     try t.expectError(error.MtpHeadQsaRingGap, qwen4_forward.qwen4MtpTruncate(&xfm, @intCast(want)));
@@ -1162,7 +1162,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
     // it re-pools from that leftover exactly as a full bank would.
     const near: c_int = L - 5;
     try t.expect(@mod(near, ratio) != 0);
-    try ssmRestore(&m.entry, &head_aux);
+    try ssmRestore(&m.entry, &head_aux, s);
     m.seq_offset = @intCast(L);
     m.cache.step = @intCast(L);
     try qwen4_forward.qwen4MtpTruncate(&xfm, @intCast(near));
@@ -1234,7 +1234,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     }
 
     // What `commitWithState` stores for the head, and what `qwen4MtpAdopt` seeds it back from.
-    var head_aux = ssmSnapshot(&m.entry);
+    var head_aux = ssmSnapshot(&m.entry, s);
     defer ssmSnapshotDeinit(&head_aux);
     var committed_marks = QsaHeadMarkSet.share(qwen4_forward.qwen4MtpMarks(&xfm));
     defer committed_marks.deinit();
@@ -1251,7 +1251,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
             try qsaTestAppendPool(&xfm, &refe, upto, 0, s);
         }
 
-        try ssmRestore(&m.entry, &head_aux);
+        try ssmRestore(&m.entry, &head_aux, s);
         m.qsa_marks.deinit();
         m.qsa_marks = QsaHeadMarkSet.share(committed_marks.slice());
         m.seq_offset = @intCast(L);
@@ -1522,7 +1522,7 @@ test "QSA checkpoint aux+pooled bytes are O(rows + checkpoints)" {
         .initialized = true,
     }};
     defer ssmFreeQsaState(&dest[0]);
-    try restoreSsmCheckpoint(&dest, &cps[2]);
+    try restoreSsmCheckpoint(&dest, &cps[2], s);
     try applyQsaHistoryAt(&dest, &cps[positions.len - 1], 46, s, false);
     // The leftover is the checkpoint's own raw rows 44 and 45, not the newest ring's overlap.
     try testing.expectEqual(@as(c_int, 2), mlx.getShape(dest[0].aux_state)[1]);
@@ -1722,7 +1722,7 @@ test "attachQsaHistoryToLatest is one copy; applyQsaHistoryAt slices to pos" {
         .initialized = true,
     }};
     defer ssmFreeQsaState(&dest_arr[0]);
-    try restoreSsmCheckpoint(&dest_arr, &cps[0]);
+    try restoreSsmCheckpoint(&dest_arr, &cps[0], s);
     try applyQsaHistoryAt(&dest_arr, &cps[1], 16, s, false);
     try testing.expect(dest_arr[0].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 4), dest_arr[0].qsa_pooled_blocks);
@@ -1851,7 +1851,7 @@ test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the 
 
     var dest = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
     defer ssmFreeQsaState(&dest[0]);
-    try restoreSsmCheckpoint(&dest, &cps[0]);
+    try restoreSsmCheckpoint(&dest, &cps[0], s);
     try applyQsaHistoryAt(&dest, &cps[0], 16, s, false);
     try testing.expectEqual(@as(c_int, 4), dest[0].qsa_pooled_blocks);
     try mlx.check(mlx.mlx_array_eval(dest[0].qsa_pooled));
@@ -1934,7 +1934,7 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
         _ = mlx.mlx_array_free(e.ssm_state);
         ssmFreeQsaState(e);
     };
-    try restoreSsmCheckpoint(&dst, cp);
+    try restoreSsmCheckpoint(&dst, cp, s);
     try applyQsaHistoryAt(&dst, cp, 37, s, false);
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].aux_state, cp.layers[0].aux_state, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].qsa_pooled, src_e[0].qsa_pooled, s));

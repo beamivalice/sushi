@@ -708,7 +708,7 @@ test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefi
 
     var warm_xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer warm_xfm.deinit();
-    try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, &gen.ssm_checkpoints.items[3]);
+    try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, &gen.ssm_checkpoints.items[3], mlx.gpuStream());
     warm_xfm.cache.step = 256;
     var warm_opts = opts;
     warm_opts.ssm_checkpoint_pos_offset = 256;
@@ -894,7 +894,7 @@ test "GLM checkpoints stay on the grid when a request steps its chunk down, and 
 
     var warm_xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer warm_xfm.deinit();
-    try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, &gen.ssm_checkpoints.items[2]);
+    try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, &gen.ssm_checkpoints.items[2], mlx.gpuStream());
     warm_xfm.cache.step = 192;
     var warm_opts = opts;
     warm_opts.ssm_checkpoint_pos_offset = 192;
@@ -972,7 +972,7 @@ test "GLM thought point: the round that carries the closer is cut to a pool boun
     defer rows.deinit();
     var warm_xfm = try Trunk.init(testing.io, a, cfg, &weights);
     defer warm_xfm.deinit();
-    try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, point);
+    try glm5_prefix.restore(glm5_state.ownRequestOf(&warm_xfm).?, &rows, point, mlx.gpuStream());
     warm_xfm.cache.step = point.pos;
     try glm5_prefix.expectSameLogicalState(glm5_state.ownRequestOf(&turn).?, glm5_state.ownRequestOf(&warm_xfm).?);
     const next = [_]u32{closing[want]};

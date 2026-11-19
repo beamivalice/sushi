@@ -828,17 +828,17 @@ test "persistent group: join leave cancel capture snapshot rollback restore matc
         try ssmTickCompareRow(s, &p_slots[1].entries[l], &o_slots[1].entries[l], kind);
     }
 
-    var snap = ssmSnapshot(&p_slots[1].entries[0]);
+    var snap = ssmSnapshot(&p_slots[1].entries[0], s);
     defer ssmSnapshotDeinit(&snap);
-    var snap_old = ssmSnapshot(&o_slots[1].entries[0]);
+    var snap_old = ssmSnapshot(&o_slots[1].entries[0], s);
     defer ssmSnapshotDeinit(&snap_old);
     if (kinds[0].linear) {
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(snap.conv_state, snap_old.conv_state, s));
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(snap.ssm_state, snap_old.ssm_state, s));
     }
 
-    try restoreSsmCheckpoint(p_slots[2].entries, &cp);
-    try restoreSsmCheckpoint(o_slots[2].entries, &cp_old);
+    try restoreSsmCheckpoint(p_slots[2].entries, &cp, s);
+    try restoreSsmCheckpoint(o_slots[2].entries, &cp_old, s);
     try ssmTickBind(alloc, s, &p_group, &p_leave, kinds, true);
     try ssmTickBind(alloc, s, &o_group, &o_leave, kinds, false);
     for (kinds, 0..) |kind, l| {
@@ -1094,9 +1094,9 @@ test "persistent group: snapshot is an owned row and survives departure" {
     try ssmTickBumpMerged(s, p_xfm.arch_state.qwen4.ssm_group.layers, kinds);
     try ssmTickBindXfm(&o_xfm, &o_ctxs, kinds);
     try ssmTickBumpSlots(s, &o_ctxs, kinds);
-    var snap = ssmSnapshot(&p_slots[0].entries[0]);
+    var snap = ssmSnapshot(&p_slots[0].entries[0], s);
     defer ssmSnapshotDeinit(&snap);
-    var snap_old = ssmSnapshot(&o_slots[0].entries[0]);
+    var snap_old = ssmSnapshot(&o_slots[0].entries[0], s);
     defer ssmSnapshotDeinit(&snap_old);
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(snap.conv_state, snap_old.conv_state, s));
     const row_n = mlx.mlx_array_size(snap.conv_state);

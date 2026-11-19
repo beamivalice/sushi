@@ -1115,7 +1115,7 @@ pub const DiskTier = struct {
         }
         try self.restoreKvInto(cache, e, cp_pos, s);
         errdefer cache.truncate(0, s) catch {};
-        try trunk.restoreSsmCheckpoint(ssm_entries, &cp);
+        try trunk.restoreSsmCheckpoint(ssm_entries, &cp, s);
         errdefer {
             for (ssm_entries) |*ent| {
                 _ = mlx.mlx_array_free(ent.conv_state);
@@ -1155,7 +1155,7 @@ pub const DiskTier = struct {
         defer cp.deinit(self.allocator);
         try self.restoreKvInto(cache, e, cp_pos, s);
         errdefer cache.truncate(0, s) catch {};
-        try trunk.restoreSsmCheckpoint(ssm_entries, &cp);
+        try trunk.restoreSsmCheckpoint(ssm_entries, &cp, s);
         e.last_used = self.bump();
         self.writeMeta(e.*) catch {};
         return cp_pos;
@@ -9581,7 +9581,7 @@ test "DiskTier: the bytes of a dense, a hybrid-with-QSA and a head-sidecar recor
         aux_src.aux_state = makeArange(s, &[_]c_int{ 1, 600, 8 }, 1.0);
         aux_src.qsa_pooled = makeArange(s, &[_]c_int{ 1, 150, 8 }, -9.0);
         aux_src.qsa_ratio = 4;
-        var head_snap = trunk.ssmSnapshot(&aux_src);
+        var head_snap = trunk.ssmSnapshot(&aux_src, s);
         defer trunk.ssmSnapshotDeinit(&head_snap);
         _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, null, null, .{
             .entries = mtp.entries,

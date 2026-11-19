@@ -883,7 +883,7 @@ pub fn qwen4MtpAdopt(
     errdefer qwen4MtpReset(self) catch {};
     try m.cache.restore(kv_snap);
     // `ssmRestore` replaces the aux state, so a stale history cannot survive.
-    try ssmRestore(&m.entry, aux);
+    try ssmRestore(&m.entry, aux, self.s);
     // Same discipline for the marks: the clamp below reads the committed set, never a
     // previous request's.
     m.qsa_marks.deinit();

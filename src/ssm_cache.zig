@@ -343,7 +343,8 @@ pub const SSMCacheEntrySnapshot = struct {
     ple_prev_valid: bool = false,
 };
 
-pub fn ssmSnapshot(src: *const SSMCacheEntry) SSMCacheEntrySnapshot {
+/// `s`: the caller's stream (the engine's on Sushi Cooler), on which a live group row is copied out.
+pub fn ssmSnapshot(src: *const SSMCacheEntry, s: mlx.mlx_stream) SSMCacheEntrySnapshot {
     var out: SSMCacheEntrySnapshot = .{
         .conv_state = mlx.mlx_array_new(),
         .ssm_state = mlx.mlx_array_new(),
@@ -369,22 +370,21 @@ pub fn ssmSnapshot(src: *const SSMCacheEntry) SSMCacheEntrySnapshot {
     var grouped = false;
     if (src.group) |g| {
         if (g.live and src.group_layer < g.layers.len) {
-            const stream = mlx.gpuStream();
             const m = g.layers[src.group_layer];
             const conv_ok = if (m.conv_state.ctx != null) blk: {
-                const c = ssmMaterializeLive(stream, src, m.conv_state) catch break :blk false;
+                const c = ssmMaterializeLive(s, src, m.conv_state) catch break :blk false;
                 _ = mlx.mlx_array_free(out.conv_state);
                 out.conv_state = c;
                 break :blk true;
             } else true;
             const ssm_ok = if (m.ssm_state.ctx != null) blk: {
-                const c = ssmMaterializeLive(stream, src, m.ssm_state) catch break :blk false;
+                const c = ssmMaterializeLive(s, src, m.ssm_state) catch break :blk false;
                 _ = mlx.mlx_array_free(out.ssm_state);
                 out.ssm_state = c;
                 break :blk true;
             } else true;
             const aux_ok = if (m.aux_state.ctx != null) blk: {
-                const c = ssmMaterializeLive(stream, src, m.aux_state) catch break :blk false;
+                const c = ssmMaterializeLive(s, src, m.aux_state) catch break :blk false;
                 out.aux_state = c;
                 break :blk true;
             } else blk: {
@@ -439,7 +439,8 @@ pub fn ssmSnapshotDeinit(snap: *SSMCacheEntrySnapshot) void {
     snap.qsa_pooled = .{ .ctx = null };
 }
 
-pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void {
+/// `s`: the caller's stream (the engine's on Sushi Cooler), on which a live group row is patched.
+pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot, s: mlx.mlx_stream) !void {
     _ = mlx.mlx_array_free(dst.conv_state);
     _ = mlx.mlx_array_free(dst.ssm_state);
     dst.conv_state = mlx.mlx_array_new();
@@ -478,7 +479,7 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
     }
     if (dst.group) |g| {
         try ssmPatchGroupRow(
-            mlx.gpuStream(),
+            s,
             g,
             dst.group_row,
             dst.group_layer,
@@ -1198,10 +1199,11 @@ pub fn shareSsmCheckpoint(allocator: std.mem.Allocator, cp: *const SSMCheckpoint
 pub fn restoreSsmCheckpoint(
     ssm_entries: []SSMCacheEntry,
     cp: *const SSMCheckpoint,
+    s: mlx.mlx_stream,
 ) !void {
     if (ssm_entries.len != cp.layers.len) return error.SsmCheckpointLayerMismatch;
     for (ssm_entries, cp.layers) |*dst, *src| {
-        try ssmRestore(dst, src);
+        try ssmRestore(dst, src, s);
     }
 }
 
@@ -1313,7 +1315,7 @@ test "SSMCacheEntry snapshot/restore round-trip preserves arrays" {
     try mlx.check(mlx.mlx_zeros(&entry.ssm_state, &ssm_shape, 4, .float32, s));
     entry.initialized = true;
 
-    var snap = ssmSnapshot(&entry);
+    var snap = ssmSnapshot(&entry, s);
     defer ssmSnapshotDeinit(&snap);
 
     // Mutate: replace ssm_state with a different shape.
@@ -1322,7 +1324,7 @@ test "SSMCacheEntry snapshot/restore round-trip preserves arrays" {
     const new_shape = [_]c_int{ 1, 1, 1, 1 };
     try mlx.check(mlx.mlx_zeros(&entry.ssm_state, &new_shape, 4, .float32, s));
 
-    try ssmRestore(&entry, &snap);
+    try ssmRestore(&entry, &snap, s);
     try testing.expect(entry.initialized);
     const restored_shape = mlx.getShape(entry.ssm_state);
     try testing.expectEqual(@as(c_int, 1), restored_shape[0]);

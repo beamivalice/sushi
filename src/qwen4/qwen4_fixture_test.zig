@@ -3118,7 +3118,7 @@ test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
         defer kv.deinit();
         const snaps = try a.alloc(SSMCacheEntrySnapshot, seed.entries.len);
         defer a.free(snaps);
-        for (snaps, seed.entries) |*snap, *entry| snap.* = ssmSnapshot(entry);
+        for (snaps, seed.entries) |*snap, *entry| snap.* = ssmSnapshot(entry, s);
         defer for (snaps) |*snap| ssmSnapshotDeinit(snap);
         for ([_]usize{ 2, 3, 4, 5, 8 }) |width| {
             if (selected_width != 0 and selected_width != width) continue;
@@ -3150,7 +3150,7 @@ test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
                         }
                         entry.shared_view = false;
                     }
-                    for (slot.entries, snaps) |*entry, *snap| try ssmRestore(entry, snap);
+                    for (slot.entries, snaps) |*entry, *snap| try ssmRestore(entry, snap, s);
                     slot.off = prefix;
                     try mlx.check(mlx.mlx_synchronize(s));
                     dense.override = arm == 1;

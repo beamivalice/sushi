@@ -1266,7 +1266,7 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
     aux_src.aux_state = try filledArray(&[_]c_int{ 1, 600, 8 }, 4.25, s);
     aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 150, 8 }, -1.75, s);
     aux_src.qsa_ratio = 4;
-    var head_snap = trunk_mod.ssmSnapshot(&aux_src);
+    var head_snap = trunk_mod.ssmSnapshot(&aux_src, s);
     defer trunk_mod.ssmSnapshotDeinit(&head_snap);
 
     var tokens: [600]u32 = undefined;
@@ -1357,7 +1357,7 @@ test "DiskTier: a head snap with no raw-history tensor drops the head half and a
     aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 150, 8 }, -1.75, s);
     aux_src.qsa_ratio = 4;
     aux_src.qsa_hist_rows = 600;
-    var head_snap = trunk_mod.ssmSnapshot(&aux_src);
+    var head_snap = trunk_mod.ssmSnapshot(&aux_src, s);
     defer trunk_mod.ssmSnapshotDeinit(&head_snap);
     try testing.expect(head_snap.aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 600), head_snap.qsa_rows);
@@ -1471,7 +1471,7 @@ test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {
     aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 16, 8 }, -1.75, s);
     aux_src.qsa_ratio = 4;
     aux_src.qsa_hist_rows = 64;
-    var head_snap = trunk_mod.ssmSnapshot(&aux_src);
+    var head_snap = trunk_mod.ssmSnapshot(&aux_src, s);
     defer trunk_mod.ssmSnapshotDeinit(&head_snap);
     try testing.expectEqual(@as(c_int, 64), head_snap.qsa_rows);
 
@@ -1537,7 +1537,7 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
     aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 16, 8 }, -1.75, s);
     aux_src.qsa_ratio = 4;
     aux_src.qsa_hist_rows = 64;
-    var head_snap = trunk_mod.ssmSnapshot(&aux_src);
+    var head_snap = trunk_mod.ssmSnapshot(&aux_src, s);
     defer trunk_mod.ssmSnapshotDeinit(&head_snap);
 
     // Two trunk checkpoint positions, both mid-block.
@@ -2053,7 +2053,7 @@ test "DiskTier row groups: the MTP head's pooled bank and history rewritten with
         head.qsa_pooled = makeArange(s, &[_]c_int{ 1, @divTrunc(rows, 4), 8 }, -5000.0);
         head.qsa_ratio = 4;
         head.qsa_hist_rows = rows;
-        var snap = trunk_mod.ssmSnapshot(&head);
+        var snap = trunk_mod.ssmSnapshot(&head, s);
         defer trunk_mod.ssmSnapshotDeinit(&snap);
         before = storedData(&tier, .spec);
         _ = try tier.appendCommitWithSpec(cache.entries, @intCast(rows), cache.config, tokens[0..@intCast(rows)], false, null, null, .{

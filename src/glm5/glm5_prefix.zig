@@ -146,16 +146,16 @@ pub fn captureKda(allocator: std.mem.Allocator, request: *const forward.Request,
 }
 
 /// Installs a checkpoint's KDA state; its arrays are shared, never written.
-pub fn restoreKda(request: *forward.Request, cp: *const trunk_mod.SSMCheckpoint) !void {
+pub fn restoreKda(request: *forward.Request, cp: *const trunk_mod.SSMCheckpoint, s: mlx.mlx_stream) !void {
     if (cp.layers.len != request.layers.len) return error.SsmCheckpointLayerMismatch;
-    for (request.layers, cp.layers) |*dst, *src| try trunk_mod.ssmRestore(&dst.recurrent, src);
+    for (request.layers, cp.layers) |*dst, *src| try trunk_mod.ssmRestore(&dst.recurrent, src, s);
 }
 
 /// The request as it stood at `cp.pos`; a failure leaves it reset.
-pub fn restore(request: *forward.Request, rows: *const MlaRows, cp: *const trunk_mod.SSMCheckpoint) !void {
+pub fn restore(request: *forward.Request, rows: *const MlaRows, cp: *const trunk_mod.SSMCheckpoint, s: mlx.mlx_stream) !void {
     try rows.restore(request, cp.pos);
     errdefer request.reset();
-    try restoreKda(request, cp);
+    try restoreKda(request, cp, s);
 }
 
 /// MLA rows [0, len) of every layer: latent (BF16, or kv8/kv6 codes with scales and biases) and
@@ -593,13 +593,12 @@ pub fn restoreDisk(
 
 /// Installs the entry's MLA rows and KDA state at the highest checkpoint under `restore_cap`; 0 when none serves.
 pub fn restoreEntry(self: *pc.HotPrefixCache, request: State, e: *pc.Entry, restore_cap: usize, prompt_ids: []const u32) !usize {
-    _ = self;
     _ = prompt_ids;
     if (comptime !prefix_arch.has("glm5")) unreachable;
     const rows = if (e.rows) |*r| r.asName("glm5") else return 0;
     const cps = e.ssm_checkpoints orelse return 0;
     const cp = pc.HotPrefixCache.highestCheckpointAtOrBelow(cps, @min(restore_cap, rows.len)) orelse return 0;
-    try restore(request, rows, cp);
+    try restore(request, rows, cp, self.arraysStream());
     return cp.pos;
 }
 
@@ -791,7 +790,7 @@ test "GLM prefix restore at a chunk-aligned checkpoint continues exactly like a 
 
         var warm = try servedRequest(bits);
         defer warm.deinit();
-        try restore(&warm, &rows, &cp8);
+        try restore(&warm, &rows, &cp8, mlx.gpuStream());
         try testing.expectEqual(@as(usize, 8), warm.offset);
         const got = try prefill(&net, &warm, next[8..], &.{ 8, 8 });
         defer _ = mlx.mlx_array_free(got);
@@ -835,8 +834,8 @@ test "GLM prefix rows bill exactly their rows and trim to a pool boundary" {
         var target = try servedRequest(bits);
         defer target.deinit();
         try testing.expectError(error.GlmCheckpointOffPool, rows.restore(&target, 18));
-        try testing.expectError(error.GlmCheckpointOffPool, restore(&target, &short, &kda));
-        try restore(&target, &rows, &kda);
+        try testing.expectError(error.GlmCheckpointOffPool, restore(&target, &short, &kda, mlx.gpuStream()));
+        try restore(&target, &rows, &kda, mlx.gpuStream());
         try testing.expectEqual(@as(usize, 12), target.offset);
     }
 }

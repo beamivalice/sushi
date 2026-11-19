@@ -298,6 +298,17 @@ printf '%s\n' 'fn reading() void {' '    _ = mlx.mlx_default_cpu_stream_new();' 
 printf '%s\n' 'fn other() void {' '    _ = mlx.mlx_default_cpu_stream_new();' '}' > "$TMP/t/src/model.zig"
 expect_green "reading itself, a test, and a file outside the disk tier"
 
+# rule cache-gpu-stream
+tree
+printf '%s\n' 'fn restore(e: *E) !void {' '    try patch(mlx.gpuStream(), e);' '}' > "$TMP/t/src/ssm_cache.zig"
+expect_red "MLX's stream in the SSM cache" "src/ssm_cache.zig:2:19 \[cache-gpu-stream\] restore: MLX's stream in the cache"
+
+tree
+printf '%s\n' 'fn arraysStream(self: *const C) mlx.mlx_stream {' '    return self.arrays_on orelse mlx.gpuStream();' '}' \
+  'fn seed() void {' '    _ = mlx.gpuStream();' '}' 'test "t" {' '    seed();' '    _ = mlx.gpuStream();' '}' > "$TMP/t/src/prefix_cache.zig"
+printf '%s\n' 'fn other() void {' '    _ = mlx.gpuStream();' '}' > "$TMP/t/src/model.zig"
+expect_green "arraysStream's fallback, a test and a fn only tests reach, and a file outside the caches"
+
 # rule cooler-side-query
 tree
 printf '%s\n' 'fn side(c: *const C) bool {' '    return c.cooler_ask == .none;' '}' > "$TMP/t/src/p.zig"
