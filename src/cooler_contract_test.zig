@@ -3987,6 +3987,71 @@ test "cooler contract: a served Qwen conversation of takeovers, partial, regener
     }.run);
 }
 
+test "cooler contract: a served Qwen turn of every prompt shape against a RAM entry, shorter, as long and longer, on the share and diverging, is taken over when its share does not fit, SSD-first or not, and says its share arm's tokens" {
+    try qwenTinyServed(struct {
+        /// Turn 3's prompt: the entry E (turns 1 and 2 and their replies) less its last `cut` tokens, then `say` new
+        /// ones. A share needs a restore point at or below it: E holds one at each prompt's end.
+        const Shape = struct { cut: usize, say: usize };
+        const shapes = [_]Shape{
+            .{ .cut = 16, .say = 0 }, // shorter, on the share: turn 2 regenerated
+            .{ .cut = 0, .say = 0 }, // as long: turn 2's cut reply continued
+            .{ .cut = 0, .say = 200 }, // longer: the next turn
+            .{ .cut = 300, .say = 200 }, // shorter, diverging
+            .{ .cut = 100, .say = 100 }, // as long, diverging
+            .{ .cut = 100, .say = 300 }, // longer, diverging
+        };
+
+        fn turn(ld: *Load, dir: []const u8, ids: []const u32, taken: bool, sh: Shape, out: *std.ArrayList(u32)) !void {
+            const a = testing.allocator;
+            var sv: Served = undefined;
+            try sv.initTiers(ld, dir, 1 << 30);
+            defer sv.deinit();
+            var conv = try PartialShare.serve(&sv, ids, 0);
+            defer conv.deinit();
+            const e = conv.entry.items;
+            var prompt: std.ArrayList(u32) = .empty;
+            defer prompt.deinit(a);
+            try prompt.appendSlice(a, e[0 .. e.len - sh.cut]);
+            var said = try heldPrompt(a, ids, sh.say, 7);
+            defer said.deinit(a);
+            try prompt.appendSlice(a, said.items);
+            // A diverging shape really leaves the entry where its new text starts.
+            if (sh.cut > 0 and sh.say > 0) try testing.expect(said.items[0] != e[e.len - sh.cut]);
+            const fits_was = Served.scheduler.prefill_admission_fits;
+            defer Served.scheduler.prefill_admission_fits = fits_was;
+            if (taken) Served.scheduler.prefill_admission_fits = fitsOnlyTaken;
+            var f: u32 = 0;
+            var got = try sv.request(prompt.items, 16, &f);
+            defer got.deinit(a);
+            try testing.expect(sv.reused > 0);
+            try out.appendSlice(a, got.items);
+            try testing.expect(takeoverAtRest(&sv.entry.prefix_cache.?));
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const prefix_cache = @import("prefix_cache.zig");
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            defer prefix_cache.ssd_first_override = null;
+            for ([_]bool{ true, false }) |ssd_first| {
+                prefix_cache.ssd_first_override = ssd_first;
+                for (shapes) |sh| {
+                    errdefer std.debug.print("cooler contract: the turn of E less {d} tokens then {d} new, SSD-first {any}\n", .{ sh.cut, sh.say, ssd_first });
+                    var shared: std.ArrayList(u32) = .empty;
+                    defer shared.deinit(a);
+                    try turn(&ld, dir, ids, false, sh, &shared);
+                    var taken: std.ArrayList(u32) = .empty;
+                    defer taken.deinit(a);
+                    try turn(&ld, dir, ids, true, sh, &taken);
+                    try testing.expectEqualSlices(u32, shared.items, taken.items);
+                }
+            }
+        }
+    }.run);
+}
+
 test "cooler contract: a served Qwen takeover turn cancelled as its prefill ends leaves the hot cache at rest, and the next turn restores and says what the share arm's does" {
     try qwenTinyServed(struct {
         /// The #109 conversation, its turn 3 cancelled once its prefill ends, then a turn 4 that extends turn 3's prompt.

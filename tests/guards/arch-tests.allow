@@ -85,6 +85,7 @@ cooler contract: a served Qwen takeover turn cancelled as its prefill ends leave
 cooler contract: a served Qwen takeover turn refused at each pool site it reaches, under a roomy and a tight RAM budget, leaves the hot cache at rest and the pool as it was, and the next turn is served
 cooler contract: a served Qwen takeover turn, whole or partial, is credited the capacity it writes in place, and holds no more in use than the exact part of its bill
 cooler contract: a served Qwen turn no longer than the RAM entry it partly shares, a regenerate or a turn that drops more of the last one than it adds, fits by taking it over and says the shared restore's tokens (#109)
+cooler contract: a served Qwen turn of every prompt shape against a RAM entry, shorter, as long and longer, on the share and diverging, is taken over when its share does not fit, SSD-first or not, and says its share arm's tokens
 cooler contract: a served Qwen turn that leaves the last turn's text between two restore points inherits the one below the cut, the engine refusing nothing
 cooler contract: a served Qwen turn that shares part of the last turn's RAM entry, and fits only by taking it over, takes it and says the shared restore's tokens, the engine refusing nothing (#109)
 cooler contract: a served Qwen turn whose partial share fits once an idle entry is evicted is served as a share, and the entry it restores from stays whole (#109)

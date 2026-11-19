@@ -3270,7 +3270,6 @@ pub const CheckoutCase = struct {
     pending_disk: bool = false,
     entry_tokens: usize = 786_695,
     shared: usize = 786_695,
-    prompt_len: usize = 786_707,
     has_slot: bool = true,
 
     /// The WarmPrefix the scheduler builds, with `will_donate` from restore-move's own predicate.
@@ -3285,7 +3284,6 @@ pub const CheckoutCase = struct {
                 self.pending_disk,
                 self.entry_tokens,
                 self.shared,
-                self.prompt_len,
             ),
         };
     }

@@ -4030,7 +4030,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
             var fits = Probe.call(&probe);
             // A shared restore is billed a whole second copy; taking the entry over moves it instead.
             if (!fits and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |*hc| {
-                if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len, false)) {
+                if (hc.checkoutRestored(@intFromPtr(slot), false)) {
                     hot_checked_out = true;
                     probe.warm_will_donate = true;
                     fits = Probe.call(&probe);
@@ -4050,7 +4050,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
                     prefix_cache_mod.EvictionReport{ .admitted = false };
                 // A partial share is taken over only when no eviction made room: the entry keeps just the shared prefix.
                 if (!report.admitted and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |*hc| {
-                    if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len, true)) {
+                    if (hc.checkoutRestored(@intFromPtr(slot), true)) {
                         hot_checked_out = true;
                         probe.warm_will_donate = true;
                         report.admitted = Probe.call(&probe);

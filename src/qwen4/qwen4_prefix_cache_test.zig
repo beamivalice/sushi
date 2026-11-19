@@ -1647,7 +1647,7 @@ test "HotPrefixCache: a partial takeover whose QSA slice fails, at any of its ca
             var moe_off: usize = 0;
             const r = try hc.lookupAndRestoreForSlot(&slot, &moe_off, &target, s, &prompt, false, 0, null, null, null, 7);
             try testing.expectEqual(@as(usize, 512), r.matched);
-            try testing.expect(hc.checkoutRestored(7, prompt.len, true));
+            try testing.expect(hc.checkoutRestored(7, true));
             const e = &hc.entries.items[0];
             const rest = e.kv_bytes - e.ssm_bytes;
             if (self.fail_copy) failing.fail_index = failing.alloc_index + 1;

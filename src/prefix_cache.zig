@@ -1790,9 +1790,7 @@ pub const HotPrefixCache = struct {
             .mtp_base = restoreMtp(e, mtp_target, matched, s),
             .entry_id = e.id,
         };
-        if (!full_reuse) {
-            res.checked_out = self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
-        }
+        res.checked_out = self.checkoutIfEligible(m.idx, m.shared, slot_id);
         dump.pos = res.matched;
         dump.mtp_base = res.mtp_base;
         dump.entry_idx = m.idx + 1;
@@ -1801,10 +1799,10 @@ pub const HotPrefixCache = struct {
         return res;
     }
 
-    /// Restore by move, a whole take: a full-prefix hit (the commit's replace path lands on this same entry) and a
-    /// prompt that appends past it.
-    pub fn wholeTakeEligible(entry_tokens: usize, shared: usize, prompt_len: usize) bool {
-        return entry_tokens > 0 and shared == entry_tokens and prompt_len > shared;
+    /// Restore by move, a whole take: a full-prefix hit, whose commit (prompt and reply) replaces this same entry. A
+    /// prompt that is exactly the entry qualifies: its slot re-forwards the last token from below the share.
+    pub fn wholeTakeEligible(entry_tokens: usize, shared: usize) bool {
+        return entry_tokens > 0 and shared == entry_tokens;
     }
 
     /// A partial take keeps only the shared prefix at donation and its slot appends from a restore point at or below
@@ -1820,8 +1818,8 @@ pub const HotPrefixCache = struct {
     }
 
     /// The SSD-first lookup's take, made up front: a whole take, for a slot.
-    pub fn upFrontTakeEligible(ssd_first: bool, has_slot: bool, move_enabled: bool, pending_disk: bool, entry_tokens: usize, shared: usize, prompt_len: usize) bool {
-        return ssd_first and has_slot and movable(move_enabled, pending_disk) and wholeTakeEligible(entry_tokens, shared, prompt_len);
+    pub fn upFrontTakeEligible(ssd_first: bool, has_slot: bool, move_enabled: bool, pending_disk: bool, entry_tokens: usize, shared: usize) bool {
+        return ssd_first and has_slot and movable(move_enabled, pending_disk) and wholeTakeEligible(entry_tokens, shared);
     }
 
     fn beginCheckout(e: *Entry, slot_id: usize, kind: Checkout.Kind) void {
@@ -1836,9 +1834,9 @@ pub const HotPrefixCache = struct {
     /// Take the checkout: mark the entry as this slot's; `donateCheckout` releases the handles
     /// at the last moment before the slot's first write. Returns whether it was taken (the
     /// admission bill's input).
-    fn checkoutIfEligible(self: *HotPrefixCache, idx: usize, shared: usize, prompt_len: usize, slot_id: ?usize) bool {
+    fn checkoutIfEligible(self: *HotPrefixCache, idx: usize, shared: usize, slot_id: ?usize) bool {
         const e = &self.entries.items[idx];
-        if (!upFrontTakeEligible(self.ssd_first, slot_id != null, restoreMoveEnabled(), self.pending_disk != null, e.tokens.len, shared, prompt_len)) return false;
+        if (!upFrontTakeEligible(self.ssd_first, slot_id != null, restoreMoveEnabled(), self.pending_disk != null, e.tokens.len, shared)) return false;
         beginCheckout(e, slot_id.?, .whole);
         log.info("  [hot-cache] checked out {d}-token entry to the slot (restore by move; the append donates in place)\n", .{e.tokens.len});
         return true;
@@ -1849,14 +1847,14 @@ pub const HotPrefixCache = struct {
     /// `checkoutIfEligible` takes up front in SSD-first mode.
     /// With `partial_ok` a partial share qualifies too, keeping only the shared prefix at donation (#109): the caller
     /// asks for it only once evicting the other entries left no room, since it drops what the entry held past the share.
-    pub fn checkoutRestored(self: *HotPrefixCache, slot_id: usize, prompt_len: usize, partial_ok: bool) bool {
+    pub fn checkoutRestored(self: *HotPrefixCache, slot_id: usize, partial_ok: bool) bool {
         const used = self.last_restored_used orelse return false;
         if (!movable(restoreMoveEnabled(), self.pending_disk != null)) return false;
         for (self.entries.items) |*e| {
             if (e.last_used != used) continue;
             if (e.checkout != null) return false;
             const shared = @min(self.last_restored_shared, e.tokens.len);
-            const kind: Checkout.Kind = if (wholeTakeEligible(e.tokens.len, shared, prompt_len))
+            const kind: Checkout.Kind = if (wholeTakeEligible(e.tokens.len, shared))
                 .whole
             else if (partial_ok and partialTakeEligible(e.tokens.len, shared, e.ring_cps != null))
                 .{ .partial = shared }
@@ -9984,8 +9982,8 @@ test "restore by move ON DEMAND: a share that does not fit is taken over, off SS
     var moe_off: usize = 0;
     const partial = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &diverged, false, 0, null, null, null, 7);
     try testing.expectEqual(@as(usize, 500), partial.matched);
-    try testing.expect(!hc.checkoutRestored(7, diverged.len, false));
-    try testing.expect(hc.checkoutRestored(7, diverged.len, true));
+    try testing.expect(!hc.checkoutRestored(7, false));
+    try testing.expect(hc.checkoutRestored(7, true));
     // Refused before it wrote: the entry comes back whole.
     hc.releaseCheckout(7, "prefill refused");
     try testing.expectEqual(@as(usize, 600), hc.entries.items[0].tokens.len);
@@ -9994,14 +9992,40 @@ test "restore by move ON DEMAND: a share that does not fit is taken over, off SS
     const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 7);
     try testing.expectEqual(@as(usize, 600), res.matched);
     try testing.expect(!res.checked_out);
-    try testing.expect(hc.checkoutRestored(7, prompt.len, false));
+    try testing.expect(hc.checkoutRestored(7, false));
     try testing.expectEqual(@as(usize, 7), hc.entries.items[0].checkout.?.slot);
-    try testing.expect(!hc.checkoutRestored(7, prompt.len, true));
+    try testing.expect(!hc.checkoutRestored(7, true));
 
     hc.releaseCheckout(7, "prefill refused");
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     try testing.expect(hc.entries.items[0].checkout == null);
     try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
+}
+
+test "restore by move: a prompt that is exactly the entry, a full reuse, is taken whole, up front in SSD-first and on demand off it" {
+    // Continuing a cut reply resends the entry's tokens: the slot re-forwards the last one from below the share.
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    for ([_]bool{ true, false }) |ssd_first| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        hc.ssd_first = ssd_first;
+        try testCheckoutCache(&hc, s, &tokens, 4096);
+        var slot = try KVCache.init(testing.allocator, 1);
+        defer slot.deinit();
+        var moe_off: usize = 0;
+        const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &tokens, false, 0, null, null, null, 7);
+        try testing.expectEqual(@as(usize, 599), res.matched);
+        try testing.expectEqual(ssd_first, res.checked_out);
+        if (!ssd_first) try testing.expect(hc.checkoutRestored(7, false));
+        try testing.expect(hc.entries.items[0].checkout.?.kind == .whole);
+        hc.releaseCheckout(7, "prefill refused");
+        try testing.expect(hc.entries.items[0].checkout == null);
+    }
 }
 
 test "restore by move: a partial take refused before it donates leaves no cut, so the next whole take keeps the whole entry" {
@@ -10024,7 +10048,7 @@ test "restore by move: a partial take refused before it donates leaves no cut, s
     defer slot.deinit();
     var moe_off: usize = 0;
     _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &diverged, false, 0, null, null, null, 7);
-    try testing.expect(hc.checkoutRestored(7, diverged.len, true));
+    try testing.expect(hc.checkoutRestored(7, true));
     hc.releaseCheckout(7, "prefill refused");
 
     hc.ssd_first = true;
@@ -10167,7 +10191,7 @@ test "restore by move ON DEMAND: a partial share taken over keeps the shared pre
     const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
     try testing.expectEqual(@as(usize, 500), res.matched);
     try testing.expect(!res.checked_out);
-    try testing.expect(hc.checkoutRestored(42, prompt.len, true));
+    try testing.expect(hc.checkoutRestored(42, true));
     hc.donateCheckout(42);
     // What the entry held past the shared prefix is another text: only the shared prefix is kept.
     try testing.expectEqual(@as(usize, 500), hc.entries.items[0].tokens.len);
@@ -10212,7 +10236,7 @@ test "restore by move: a donation frees the record's MTP history, which nothing 
     defer slot.deinit();
     var moe_off: usize = 0;
     _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
-    try testing.expect(hc.checkoutRestored(42, prompt.len, true));
+    try testing.expect(hc.checkoutRestored(42, true));
     hc.donateCheckout(42);
     const e = &hc.entries.items[0];
     try testing.expect(e.mtp == null);
@@ -10317,15 +10341,14 @@ test "restore by move: a checked-out entry is invisible to a second slot, to evi
 }
 
 test "restore by move: the policy is off outside the SSD-first arm and with the move forced off" {
-    // The up-front take: SSD-first, a slot, the move on, no pending flush, the whole entry matched, something to append.
-    try testing.expect(HotPrefixCache.upFrontTakeEligible(true, true, true, false, 600, 600, 608));
-    try testing.expect(!HotPrefixCache.upFrontTakeEligible(false, true, true, false, 600, 600, 608));
-    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, false, false, 600, 600, 608));
-    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, false, true, false, 600, 600, 608));
-    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, true, 600, 600, 608));
-    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, false, 600, 500, 608));
-    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, false, 600, 600, 600));
-    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, false, 0, 0, 608));
+    // The up-front take: SSD-first, a slot, the move on, no pending flush, the whole entry matched.
+    try testing.expect(HotPrefixCache.upFrontTakeEligible(true, true, true, false, 600, 600));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(false, true, true, false, 600, 600));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, false, false, 600, 600));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, false, true, false, 600, 600));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, true, 600, 600));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, false, 600, 500));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, false, 0, 0));
     // Any take, on demand too, needs the move on and no pending flush.
     try testing.expect(HotPrefixCache.movable(true, false));
     try testing.expect(!HotPrefixCache.movable(false, false));

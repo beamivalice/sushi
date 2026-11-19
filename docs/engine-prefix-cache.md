@@ -905,6 +905,8 @@ process start whatever turns `--metrics` on.
   bytes donated): a take begins it (`beginCheckout`), only `donateCheckout` advances it, and only the release, the
   replacing commit or eviction ends it, so no piece of one take outlives it; lint `entry-checkout` refuses any other
   writer. A whole take and a partial one keep separate rules (`wholeTakeEligible`, `partialTakeEligible`).
+- **A full-entry hit is taken whole whatever the prompt's length**, up front or on demand: a prompt that is exactly the
+  entry (a cut reply continued) re-forwards its last token from below the share, and its commit extends the entry.
 - **Off SSD-first, a warm share that does not fit is taken over, not refused** (`checkoutRestored`, qwen4_exp's
   admission pass): a full-entry hit is checked out on demand and billed as donated. The tradeoff: a request that
   fails after donating loses the entry. A partial hit is taken over too (a long conversation's next turn re-renders
