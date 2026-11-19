@@ -955,7 +955,7 @@ pub const LoadRequest = struct {
     prefix_cache_disk_bytes: u64 = 0,
     prefix_cache_disk_resolver: ?model_load.DiskResolver = null,
     ssd_budget_bytes: u64 = 0,
-    expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
+    expert_cache_fit_resolver: ?model_load.FitResolver = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
     /// Zero disables (hybrid models bypass the hot prefix cache, as before).
     /// Non-zero enables multi-turn warm reuse on hybrid SSM archs. Plumbed
@@ -1096,7 +1096,7 @@ pub const Scheduler = struct {
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_resolver: ?model_load.DiskResolver,
     ssd_budget_bytes: u64,
-    expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
+    expert_cache_fit_resolver: ?model_load.FitResolver,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
     /// Launch-flag MTP settings, retained (same rationale as the prefix-cache

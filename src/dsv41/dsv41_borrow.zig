@@ -1223,9 +1223,9 @@ test "dsv41 borrow: a load's served warm runs its forwards under the warm budget
 /// A load's fit check that refuses it, noting the engine's free cap it found: the load's plan has capped the pool by then.
 const RefusingFit = struct {
     var free_cap_seen: ?u64 = null;
-    fn fit(_: *const ModelConfig, _: u64) anyerror!void {
+    fn fit(_: *const ModelConfig, _: u64) ?@import("../bills.zig").ExpertCacheRefusal {
         free_cap_seen = @import("../tensor/core.zig").free_cap;
-        return error.ExpertCacheDoesNotFit;
+        return .{ .err = error.ExpertCacheDoesNotFit, .refusal = .{ .needed = 1, .avail = .{ .bytes = 0, .free = 0 } }, .readings = .{} };
     }
 };
 

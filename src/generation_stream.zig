@@ -2161,7 +2161,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.GlmKvQuantUnsupported => .{ .type = "kv_quant_unsupported", .message = "The KV-cache quantization in force (--kv-quant or the model's saved kv_quant) is not one this model stores. The server log names the accepted widths." },
         error.ArchitectureUnsupported => .{ .type = "architecture_unsupported", .message = "This checkpoint's model_type is not served by this build, which loads " ++ arch_packs.served_list ++ "." },
         error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (" ++ arch_packs.served_types_or ++ ")." },
-        error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "The requested expert cache, full-union workspace, bounce buffers, resident trunk, and serving state do not fit under the GPU memory ceiling. Lower --ssd-budget-gb or free memory." },
+        error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "Not enough memory to load this model: its SSD streaming memory and what serving needs beside it do not fit under the GPU memory limit. Lower Memory for SSD streaming (GiB) in its settings (--ssd-budget-gb), quit other apps or unload another model, or use a smaller pack." },
         error.ExpertStreamingMtpUnsupported => .{ .type = "expert_streaming_mtp_unsupported", .message = expert_stream_mod.MTP_UNSUPPORTED },
         error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = model_load_mod.budget_required_message },
         error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = arch_load.refusalText("ExpertStreamingUnsupportedLayout") orelse "This checkpoint has no complete expert-bank layout this build can stream. Check the pack and all indexed shards." },
@@ -2197,7 +2197,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3CodebookTableUndecodable => .{ .type = "exl3_codebook_table_undecodable", .message = "This STQ pack's codebook table holds PAIR1 constants this build's kernels have not compiled." },
         error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "--ssd-budget-gb leaves no room for an expert cache after the resident trunk, the prefill union and the fill buffers. Raise the budget." },
         error.SsdBudgetBelowVision => .{ .type = "ssd_budget_below_vision", .message = arch_load.refusalText("SsdBudgetBelowVision") orelse "--ssd-budget-gb cannot hold the vision tower (--vision) beside the minimum expert cache. Raise the budget or pass --no-vision." },
-        error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache (and, under --vision, the largest image encode) exceeds the machine's residency limit. Raise iogpu.wired_limit_mb together with vm.global_user_wire_limit and vm.user_wire_limit (the server log prints the command) or lower the budget." },
+        error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "Not enough memory to load this model: its SSD streaming memory and the context it plans are more than this Mac's GPU memory limit. Lower Memory for SSD streaming (GiB) in its settings (--ssd-budget-gb), or use a smaller pack." },
         else => null,
     };
 }
@@ -2224,7 +2224,8 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
 /// The message a load refusal's answer carries: the text the load wrote when it wrote one (the memory check's names the
 /// bound and what to free or change), else the refusal's own. The caller frees it.
 pub fn loadRefusalMessage(allocator: std.mem.Allocator, err: anyerror, refusal: LoadRefusal, context: ?model_registry_mod.MemoryContextRefusal) ![]u8 {
-    const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported;
+    const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported or
+        err == error.SsdBudgetExceedsWiredLimit or err == error.ExpertCacheDoesNotFit;
     if (written) if (scheduler_mod.takeLoadRefusal()) |text| return allocator.dupe(u8, text);
     if (context) |c| return memoryContextRefusalMessage(allocator, c);
     return allocator.dupe(u8, refusal.message);
@@ -2244,6 +2245,16 @@ test "a prefill chunk refused mid-request for memory answers 503 with the arch's
     defer bare.deinit(a);
     try std.testing.expectEqualStrings(PREFILL_CHUNK_NOFIT_MSG, bare.message);
     try std.testing.expect(std.mem.indexOf(u8, bare.message, "before any work started") == null);
+}
+
+test "a streamed load refused by its fit checks answers with the text the load wrote, as the memory preflight does" {
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.SsdBudgetExceedsWiredLimit, error.ExpertCacheDoesNotFit }) |e| {
+        scheduler_mod.recordLoadRefusal("Not enough memory to load this model.\nIt needs 150.0 GB ...");
+        const message = try loadRefusalMessage(a, e, loadRefusalFor(e).?, null);
+        defer a.free(message);
+        try std.testing.expectEqualStrings("Not enough memory to load this model.\nIt needs 150.0 GB ...", message);
+    }
 }
 
 test "a memory-refused load's 503 carries the check's whole text, its lines intact" {

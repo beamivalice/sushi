@@ -466,6 +466,14 @@ pub fn wireLimitMbFor(bytes: u64) u64 {
     return (bytes +| (step - 1)) / step * 100;
 }
 
+/// The `iogpu.wired_limit_mb` (MB) that holds `needed` beside `beside`, or null past what this Mac may wire (its RAM
+/// less `USER_WIRE_RAM_FLOOR_BYTES`; `total_ram` 0 is unread). Every sysctl a refusal or warning suggests comes from it.
+pub fn wiredLimitMbThatFits(needed: u64, beside: u64, total_ram: u64) ?u64 {
+    const mb = wireLimitMbFor(needed +| beside);
+    if (total_ram > 0 and mb << 20 > total_ram -| USER_WIRE_RAM_FLOOR_BYTES) return null;
+    return mb;
+}
+
 /// `limits` are `vm.global_user_wire_limit` and `vm.user_wire_limit` (0 = unreadable); the lower binds.
 /// Past it prefill slows down with no error. The suggestion matches a declared `iogpu.wired_limit_mb` that holds the
 /// load; otherwise it is the need rounded up to 100 MB, never above `total_ram` less a floor.
@@ -476,11 +484,11 @@ pub fn userWireWarning(buf: []u8, owned_bytes: u64, limits: [2]u64, wired_limit:
     if (limit == 0) return null;
     const need = owned_bytes +| USER_WIRE_MARGIN_BYTES;
     if (need <= limit) return null;
-    const head = "[mem] warning: this load wires ~{d:.1} GB but {s} is {d:.1} GB: prefill will run slower. ";
-    const args = .{ @as(f64, @floatFromInt(need)) / 1e9, names[bind], @as(f64, @floatFromInt(limit)) / 1e9 };
+    const u = Mem.unitOf(need, limit);
+    const head = "[mem] warning: this load wires {f} but {s} is {f}: prefill will run slower. ";
+    const args = .{ Mem.need(need, u), names[bind], Mem.have(limit, u) };
     // A declared GPU limit that holds the load is the user's choice: the user-wire limits come up to match it.
-    const mb = if (wired_limit >= need) wired_limit >> 20 else wireLimitMbFor(need);
-    if (wired_limit < need and mb << 20 > total_ram -| USER_WIRE_RAM_FLOOR_BYTES)
+    const mb = if (wired_limit >= need) wired_limit >> 20 else wiredLimitMbThatFits(need, 0, total_ram) orelse
         return std.fmt.bufPrint(buf, head ++ "This Mac cannot wire that much: use a smaller pack or a lower --ssd-budget-gb", args) catch null;
     var cmd: [192]u8 = undefined;
     return std.fmt.bufPrint(buf, head ++ "Raise it: {s} (resets at reboot)", args ++ .{wireLimitsCommand(&cmd, mb)}) catch null;
@@ -663,37 +671,89 @@ pub fn expertStreamingBesideBudgetBytes(config: *const model_mod.ModelConfig) u6
     return expertStreamingPlannedKvBytes(config) +| config.expert_vision_encode_bytes;
 }
 
-pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_bytes: u64) !void {
-    if (!config.expert_streaming) return;
-    if (config.expert_ssd_budget_bytes > 0) {
+/// What the streamed load's fit checks read, once, so a refusal and the budget it names price the same figures.
+pub const FitReadings = struct {
+    /// `iogpu.wired_limit_mb` in bytes, 0 when undeclared.
+    wired_limit: u64 = 0,
+    /// Metal's recommended working set, which the ssd budget is admitted against without a declared limit.
+    budget_working_set: u64 = 0,
+    /// The working set and the declared limit's floor (0 = none) the load's ceiling is made of.
+    working_set: u64 = 0,
+    wired_floor: u64 = 0,
+    /// MLX's active buffers, and its pool beside them.
+    active: u64 = 0,
+    cache: u64 = 0,
+    free: u64 = 0,
+    total_ram: u64 = 0,
+    /// What a raised GPU limit must hold beside the load: the active buffers and the unplanned margin.
+    gpu_beside: u64 = 0,
+
+    pub fn now(config: *const model_mod.ModelConfig) FitReadings {
+        const active: u64 = gpu_mem.activeBytes();
+        return .{
+            .wired_limit = wiredLimitBytes(),
+            .budget_working_set = staticGpuMemoryCeiling(),
+            .working_set = gpu_mem.getGpuWorkingSetLimit(),
+            .wired_floor = wiredCeilingFloorFor(config),
+            .active = active,
+            .cache = gpu_mem.cacheBytes(),
+            .free = metrics.getAvailableMemBytes(),
+            .total_ram = metrics.getTotalMemBytes(),
+            .gpu_beside = active +| wiredUnplannedBytes(launch_state.wired_limit_margin_bytes, gpu_floor_bytes.load(.monotonic)),
+        };
+    }
+};
+
+pub const ExpertCacheRefusal = struct {
+    err: error{ SsdBudgetExceedsWiredLimit, ExpertCacheDoesNotFit },
+    refusal: LoadMemoryRefusal,
+    /// What it was read against, which the budget it names is priced on.
+    readings: FitReadings,
+};
+
+/// PURE: the refusal of a streamed load whose ssd budget and planned KV pass the GPU limit as a whole, or whose expert
+/// cache, workspace and serving state do not fit the ceiling beside what is loaded; null when it fits.
+pub fn expertCacheRefusal(config: *const model_mod.ModelConfig, resident_bytes: u64, r: FitReadings) ?ExpertCacheRefusal {
+    if (!config.expert_streaming) return null;
+    const budget = config.expert_ssd_budget_bytes;
+    if (budget > 0) {
         const beside = expertStreamingBesideBudgetBytes(config);
-        const limit = ssdBudgetCeiling(wiredLimitBytes(), staticGpuMemoryCeiling());
-        if (!ssdBudgetAdmits(config.expert_ssd_budget_bytes, beside, limit)) {
-            var cmd: [192]u8 = undefined;
-            log.err("--ssd-budget-gb {d} plus {d:.2} GB of planned KV and {d:.2} GB of image encode exceeds the {d:.2} GB residency limit; raise the limits ({s}) or lower the budget\n", .{
-                config.expert_ssd_budget_bytes >> 30,
-                @as(f64, @floatFromInt(expertStreamingPlannedKvBytes(config))) / 1e9,
-                @as(f64, @floatFromInt(config.expert_vision_encode_bytes)) / 1e9,
-                @as(f64, @floatFromInt(limit)) / 1e9,
-                wireLimitsCommand(&cmd, wireLimitMbFor(wiredLimitMbForBudget(config.expert_ssd_budget_bytes, beside) << 20)),
-            });
-            return error.SsdBudgetExceedsWiredLimit;
-        }
+        const limit = ssdBudgetCeiling(r.wired_limit, r.budget_working_set);
+        if (!ssdBudgetAdmits(budget, beside, limit)) return .{ .err = error.SsdBudgetExceedsWiredLimit, .refusal = .{
+            .needed = budget +| beside,
+            .avail = .{ .bytes = limit, .free = null, .gpu = if (r.wired_limit > 0) null else limit, .declared = if (r.wired_limit > 0) limit else null },
+            .wired_limit_mb = r.wired_limit >> 20,
+            .total_ram = r.total_ram,
+            .check = .budget,
+        }, .readings = r };
     }
-    const active_mem: usize = gpu_mem.activeBytes();
-    const ceiling = currentGpuMemoryCeiling(config, active_mem);
-    if (!expertStreamingConfigFits(config, ceiling, active_mem, resident_bytes)) {
-        log.err("the streamed load bills {d} MB (active {d}, resident {d}, cache {d}, workspace and bounce {d}, a request or the warm beside it {d}) against {d} MB; lower --ssd-budget-gb\n", .{
-            (active_mem + resident_bytes + config.expert_cache_bytes + config.expert_bounce_bytes + model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes) + expertStreamingBesideLoadBytes(config)) >> 20,
-            active_mem >> 20,
-            resident_bytes >> 20,
-            config.expert_cache_bytes >> 20,
-            (config.expert_bounce_bytes + model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes)) >> 20,
-            expertStreamingBesideLoadBytes(config) >> 20,
-            ceiling >> 20,
-        });
-        return error.ExpertCacheDoesNotFit;
-    }
+    const ceiling = gpuCeilingWithWiredFloor(r.working_set, r.active +| r.cache, r.free, r.wired_floor);
+    if (expertStreamingConfigFits(config, ceiling, r.active, resident_bytes)) return null;
+    const room = ceiling -| r.active;
+    const avail: SushiAvailable = if (r.wired_floor > 0)
+        .{ .bytes = room, .free = null, .declared = room }
+    else
+        .{ .bytes = room, .free = r.cache +| r.free, .gpu = r.working_set -| r.active };
+    return .{ .err = error.ExpertCacheDoesNotFit, .refusal = .{
+        .needed = expertStreamingFitNeed(config, 0, resident_bytes),
+        .avail = avail,
+        .wired_limit_mb = if (r.wired_floor > 0) r.wired_limit >> 20 else 0,
+        .wired_beside = r.gpu_beside,
+        .total_ram = r.total_ram,
+        .check = .fit,
+    }, .readings = r };
+}
+
+/// The live check a streamed load runs once its plan is applied (`model_load`'s fit resolver).
+pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_bytes: u64) ?ExpertCacheRefusal {
+    return expertCacheRefusal(config, resident_bytes, FitReadings.now(config));
+}
+
+/// What the streamed load's fit check holds under its ceiling: `active` and the load's resident, cache, workspace,
+/// bounce and the request or warm beside it.
+pub fn expertStreamingFitNeed(config: *const model_mod.ModelConfig, active_mem: u64, resident_bytes: u64) u64 {
+    return active_mem +| resident_bytes +| config.expert_cache_bytes +| config.expert_bounce_bytes +|
+        model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes) +| expertStreamingBesideLoadBytes(config);
 }
 
 pub fn expertStreamingConfigFits(config: *const model_mod.ModelConfig, ceiling: u64, active_mem: u64, resident_bytes: u64) bool {
@@ -3430,12 +3490,12 @@ test "the user-wire warning fires when the wired bytes pass the lower macOS limi
     try t.expect(userWireWarning(&buf, owned(108), .{ default_limit, default_limit }, 125_000 << 20, ram) == null);
     for ([_]u64{ 111, 114 }) |b| {
         const line = userWireWarning(&buf, owned(b), .{ default_limit, default_limit }, 125_000 << 20, ram) orelse return error.TestExpectedWarning;
-        try t.expect(std.mem.indexOf(u8, line, "vm.global_user_wire_limit is 116.8 GB") != null);
+        try t.expect(std.mem.indexOf(u8, line, "vm.global_user_wire_limit is 108.7 GB") != null);
         // The declared GPU limit covers the load: the user-wire limits match it.
         try t.expect(std.mem.indexOf(u8, line, "sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=131072000000 vm.user_wire_limit=131072000000") != null);
     }
     const line = userWireWarning(&buf, owned(111), .{ default_limit, default_limit }, 0, ram).?;
-    try t.expect(std.mem.indexOf(u8, line, "wires ~119.2 GB") != null);
+    try t.expect(std.mem.indexOf(u8, line, "wires 111.0 GB") != null);
     try t.expect(std.mem.indexOf(u8, line, "iogpu.wired_limit_mb=113700 vm.global_user_wire_limit=119223091200 ") != null);
     try t.expect(userWireWarning(&buf, owned(114), .{ 125_000_000_000, 125_000_000_000 }, 125_000 << 20, ram) == null);
     // The per-process limit binds when it is the lower one; unreadable limits never warn.
@@ -6775,6 +6835,11 @@ pub const LoadMemoryRefusal = struct {
     wired_beside: u64 = 0,
     total_ram: u64 = 0,
     knob: Knob = .none,
+    check: Check = .preflight,
+
+    /// The check that refused: the preflight (which `--skip-mem-preflight` skips), the streamed load's fit under its
+    /// ceiling, or the ssd budget with its planned KV against the GPU limit as a whole (no RAM term, nothing beside).
+    pub const Check = enum { preflight, fit, budget };
 
     pub const Knob = union(enum) {
         none,
@@ -6786,9 +6851,7 @@ pub const LoadMemoryRefusal = struct {
 
     /// The `iogpu.wired_limit_mb` that holds the load, or null when this Mac cannot wire that much.
     pub fn wiredLimitThatFits(self: LoadMemoryRefusal) ?u64 {
-        const mb = wireLimitMbFor(self.needed +| self.wired_beside);
-        if (self.total_ram > 0 and mb << 20 > self.total_ram -| USER_WIRE_RAM_FLOOR_BYTES) return null;
-        return mb;
+        return wiredLimitMbThatFits(self.needed, self.wired_beside, self.total_ram);
     }
 };
 
@@ -6820,12 +6883,17 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
             try w.print(". Free about {f} more.\n", .{Mem.short(r.needed, a.bytes.?, u)});
         },
         .wired_limit, .gpu_limit => {
-            try w.print("It needs {f}, and the GPU memory limit (", .{need});
+            try w.print("It needs {f}", .{need});
+            if (r.check == .budget) try w.print(" for SSD streaming and the context it plans", .{});
+            try w.print(", and the GPU memory limit (", .{});
             if (r.wired_limit_mb > 0) try w.print("iogpu.wired_limit_mb = {d} MB", .{r.wired_limit_mb}) else try w.print("macOS's default", .{});
-            try w.print(") leaves {f} beside what is already loaded: about {f} short. ", .{ Mem.have(a.bytes.?, u), Mem.short(r.needed, a.bytes.?, u) });
-            if (a.free) |f| try w.print("{f} of RAM is free", .{Mem.have(f, u)}) else try w.print("The free RAM could not be read", .{});
-            if (ram_short > 0) try w.print(", about {f} short as well", .{Mem.short(r.needed, a.free.?, u)});
-            try w.print(".\n", .{});
+            try w.print(") {s} {f}{s}: about {f} short.", .{ if (r.check == .budget) "is" else "leaves", Mem.have(a.bytes.?, u), if (r.check == .budget) "" else " beside what is already loaded", Mem.short(r.needed, a.bytes.?, u) });
+            if (a.free) |f| {
+                try w.print(" {f} of RAM is free", .{Mem.have(f, u)});
+                if (ram_short > 0) try w.print(", about {f} short as well", .{Mem.short(r.needed, f, u)});
+                try w.print(".", .{});
+            } else if (r.check == .preflight) try w.print(" The free RAM could not be read.", .{});
+            try w.print("\n", .{});
         },
     }
     try w.print("To load it:\n", .{});
@@ -6842,8 +6910,9 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
         .ctx_size => |c| if (c.fits > 0) try w.print("- Lower --ctx-size to {d} or less (it is {d}).\n", .{ c.fits, c.requested }),
         .ssd_budget => |b| if (b.fits_gb > 0) try w.print("- Lower --ssd-budget-gb to {d} (it is {d}): a smaller expert cache, slower decode.\n", .{ b.fits_gb, b.gb }),
     }
-    try w.print("- Use a smaller pack of this model.\n", .{});
-    try w.print("- Last resort: --skip-mem-preflight (or \"Skip the memory check before loading\" in Settings) skips this check; the load can then fail later or stall the Mac.", .{});
+    try w.print("- Use a smaller pack of this model.", .{});
+    if (r.check != .preflight) return;
+    try w.print("\n- Last resort: --skip-mem-preflight (or \"Skip the memory check before loading\" in Settings) skips this check; the load can then fail later or stall the Mac.", .{});
 }
 
 fn writeRamAction(w: *std.Io.Writer, short: Mem) std.Io.Writer.Error!void {
@@ -7397,4 +7466,52 @@ test "a load refused a byte short never shows its need equal to what is free, an
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "It needs 20.1 GB, and only 20.0 GB of RAM is free right now") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Free about 0.1 GB more.") != null);
+}
+
+test "a streamed load whose ssd budget passes the GPU limit is refused in the load refusal's one text, its GPU limit capped by RAM" {
+    const gib: u64 = 1 << 30;
+    var cfg = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true };
+    cfg.expert_ssd_budget_bytes = 150 * gib;
+    var buf: [2048]u8 = undefined;
+    // A 128 GB Mac at macOS's default limit: no raise can hold 150 GB.
+    const small = expertCacheRefusal(&cfg, 0, .{ .budget_working_set = 96 * gib, .total_ram = 128 * gib }).?;
+    try testing.expectEqual(error.SsdBudgetExceedsWiredLimit, small.err);
+    const text = loadMemoryRefusalText(&buf, small.refusal);
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "It needs 150.0 GB for SSD streaming and the context it plans, and the GPU memory limit (macOS's default) is 96.0 GB: about 54.0 GB short.\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "This Mac cannot give the GPU enough memory for it") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "sudo sysctl") == null);
+    // The preflight's skip does not skip this check, so it is not offered.
+    try testing.expect(std.mem.indexOf(u8, text, "--skip-mem-preflight") == null);
+    // A 256 GB Mac can raise its limit to hold it.
+    const big = expertCacheRefusal(&cfg, 0, .{ .budget_working_set = 192 * gib, .wired_limit = 140 * gib, .total_ram = 256 * gib }).?;
+    const raised = loadMemoryRefusalText(&buf, big.refusal);
+    try testing.expect(std.mem.indexOf(u8, raised, "the GPU memory limit (iogpu.wired_limit_mb = 143360 MB) is 140.0 GB: about 10.0 GB short.") != null);
+    try testing.expect(std.mem.indexOf(u8, raised, "sudo sysctl iogpu.wired_limit_mb=153600 ") != null);
+}
+
+test "a streamed load whose expert cache does not fit its ceiling is refused with the figures, the bound and its actions" {
+    const gib: u64 = 1 << 30;
+    var cfg = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true };
+    cfg.expert_cache_bytes = gib;
+    var buf: [2048]u8 = undefined;
+    // 2 GiB loaded under a 3 GiB working set leaves 1 GiB; the load needs its 1 GiB cache and 0.5 GiB resident beside the rest.
+    const readings = FitReadings{ .working_set = 3 * gib, .active = 2 * gib, .free = 10 * gib, .total_ram = 64 * gib, .gpu_beside = 3 * gib };
+    const r = expertCacheRefusal(&cfg, gib / 2, readings).?;
+    try testing.expectEqual(error.ExpertCacheDoesNotFit, r.err);
+    try testing.expectEqual(expertStreamingFitNeed(&cfg, 0, gib / 2), r.refusal.needed);
+    const text = loadMemoryRefusalText(&buf, r.refusal);
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "and the GPU memory limit (macOS's default) leaves 1.0 GB beside what is already loaded: about ") != null);
+    try testing.expect(std.mem.indexOf(u8, text, " 10.0 GB of RAM is free.\n") != null);
+    var cmd: [192]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, text, wireLimitsCommand(&cmd, wiredLimitMbThatFits(r.refusal.needed, 3 * gib, 64 * gib).?)) != null);
+    try testing.expect(std.mem.indexOf(u8, text, "--skip-mem-preflight") == null);
+    // Under a declared limit the ceiling is its floor, and the refusal names that limit.
+    var floored = readings;
+    floored.wired_floor = 64 << 20;
+    floored.wired_limit = 2048 << 20;
+    const f = expertCacheRefusal(&cfg, gib / 2, floored).?;
+    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, f.refusal), "the GPU memory limit (iogpu.wired_limit_mb = 2048 MB) leaves 0.0 GB beside what is already loaded") != null);
+    try testing.expect(expertCacheRefusal(&cfg, gib / 2, .{ .working_set = 64 * gib, .free = 64 * gib }) == null);
 }

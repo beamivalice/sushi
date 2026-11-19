@@ -151,7 +151,7 @@ pub const LoadParams = struct {
     /// takes the cache directory. Null = `prefix_cache_disk_bytes` as given (tests).
     prefix_cache_disk_resolver: ?DiskResolver = null,
     ssd_budget_bytes: u64 = 0,
-    expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
+    expert_cache_fit_resolver: ?FitResolver = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
     /// 0 = disabled (hybrid models bypass the hot prefix cache). Non-zero
     /// enables hybrid in `HotPrefixCache.shouldUse` and triggers per-stride
@@ -817,6 +817,29 @@ fn visionLoadLine(buf: []u8, choice: model_settings.VisionChoice, streamed: bool
 }
 
 /// The streamed preflight's need at another ssd budget, as this load's planner plans it (null: the planner refuses it).
+/// A streamed load's fit check once its plan is applied (`bills.expertCacheFitForLoad`): its refusal, or null.
+pub const FitResolver = *const fn (*const model_mod.ModelConfig, u64) ?bills.ExpertCacheRefusal;
+
+/// The ssd budget a refused fit names: `needAt` is 0 for a budget whose plan the fit checks admit on the refusal's
+/// readings, and past any figure otherwise, so `streamedBudgetThatFits(budget, 0, ...)` finds the largest admitted.
+const FitPlanner = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    config: *const ModelConfig,
+    model_dir: []const u8,
+    vision: bool,
+    assistant: u64,
+    readings: bills.FitReadings,
+
+    pub fn needAt(p: FitPlanner, budget_bytes: u64) ?u64 {
+        const plan = planExpertStreamingWith(p.io, p.allocator, p.config, p.model_dir, budget_bytes, p.vision, p.assistant) catch return null;
+        var planned = p.config.*;
+        applyStreamingPlan(&planned, plan, budget_bytes);
+        const refused = bills.expertCacheRefusal(&planned, plan.split.trunk +| plan.split.mtp +| plan.split.vision, p.readings) != null;
+        return if (refused) std.math.maxInt(u64) else 0;
+    }
+};
+
 pub const BudgetPlanner = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1843,7 +1866,19 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         streaming_resident_bytes = plan.split.trunk +| plan.split.mtp +| plan.split.vision;
         planned_resident = streaming_resident_bytes.?;
         planned_assistant = assistant_bytes;
-        if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
+        if (params.expert_cache_fit_resolver) |fit| if (fit(params.config, streaming_resident_bytes.?)) |refused| {
+            var refusal = refused.refusal;
+            const asked = params.config.expert_ssd_budget_bytes;
+            if (asked > 0) {
+                const planner = FitPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant_bytes, .readings = refused.readings };
+                refusal.knob = .{ .ssd_budget = .{ .gb = asked >> 30, .fits_gb = bills.streamedBudgetThatFits(asked, 0, planner) } };
+            }
+            var text_buf: [2048]u8 = undefined;
+            const text = bills.loadMemoryRefusalText(&text_buf, refusal);
+            log.err("{s}\n", .{text});
+            if (@TypeOf(params) == *LoadRequest) params.recordRefusalText(text);
+            return refused.err;
+        };
     } else if (try arch_load.residentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on)) |bytes| {
         streaming_resident_bytes = bytes;
     } else if (model_mod.usesSushiQuantMemoryBill(params.config)) {
