@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A Sushi Cooler load that evicts a model on MLX gets that model's memory back**: the evicted model's freed buffers
+  stayed in MLX's pool (up to 8 GB on a 128 GB Mac) for the whole life of the new load, so its memory check read
+  less free RAM than there was, and later checks counted that pool as room the engine cannot use.
 - **A request whose `max_tokens` does not fit in memory is told the `max_tokens` that does**: refused before its prefill,
   it read "Prompt (64 tokens) requires ... Reduce prompt size", which named neither `max_tokens` nor what fits; it now
   reads as a refusal from the scheduler does, with the bill, what is available and the largest `max_tokens` and

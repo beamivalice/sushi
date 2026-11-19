@@ -2579,9 +2579,13 @@ pub const JobTurn = struct {
 /// state they lean on is still there, then its arrays and its arch's process-wide state go. Every unload of a resident
 /// model on the inference thread (an unload request, an eviction by another model's load) runs this.
 fn retire(entry: *LoadedModel, why: []const u8) void {
+    const on_mlx = !arch_handle.onEngine(entry.handle, entry.config);
     scheduler_mod.flushLiveState(entry, why);
     entry.unloadResident();
     if (entry.config) |c| arch_serve.unloadModel(c);
+    // A model on MLX freed its arrays into MLX's pool, kept for that model's next turn, which never comes: the pool
+    // goes now, in the model's own turn, where the clear reaches MLX (at rest under a held scope it would not).
+    if (on_mlx) _ = mlx.mlx_clear_cache();
 }
 
 pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
@@ -2609,11 +2613,8 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
         sch.registry.finalizeEvictionLocked(victim);
         sch.registry.mutex.unlock(sch.io);
     }
-    // The preflight below reads free memory: the victims' must be back first.
-    if (evicted_bytes > 0) {
-        _ = mlx.mlx_clear_cache();
-        waitForUnwire(sch.io, wired_before, evicted_bytes);
-    }
+    // The preflight below reads free memory: the victims' must be back first (`retire` gave their pools back).
+    if (evicted_bytes > 0) waitForUnwire(sch.io, wired_before, evicted_bytes);
     sch.registry.mutex.lockUncancelable(sch.io);
     const idle = sch.registry.countLoadedLocked() == 0;
     sch.registry.mutex.unlock(sch.io);
@@ -2672,11 +2673,8 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     });
     const wired_before = status.getWiredMemBytes();
     const job = JobTurn.begin(entry.handle, entry.config);
+    // `retire` gives the model's freed buffers back to the OS: the unload returns its memory.
     retire(entry, "unload");
-    // unloadResident freed the arrays into MLX's allocator cache — clear it
-    // so the unload actually returns the memory to the OS (the whole point
-    // of the load→generate→unload flow).
-    _ = mlx.mlx_clear_cache();
     waitForUnwire(sch.io, wired_before, bytes);
     job.end();
     // Drop any borrowed views that pointed at this entry so post-unload reads

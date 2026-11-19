@@ -4057,3 +4057,102 @@ test "cooler contract: a resident load beside buffers already past a declared wi
     try testing.expectEqualStrings("InsufficientMemory", req.error_name.?);
     try testing.expect(std.mem.indexOf(u8, req.refusal_text[0..req.refusal_text_len], "iogpu.wired_limit_mb = ") != null);
 }
+
+/// What a load's preflight saw of MLX's pool when it read the memory (the serving-bill hook runs inside it).
+const PreflightSawMlx = struct {
+    var mlx_cache: ?usize = null;
+    fn bill(_: *const model_mod.ModelConfig, _: u64) ?model_load.LoadServingBill {
+        var c: usize = 0;
+        _ = mlx.mlx_get_cache_memory(&c);
+        mlx_cache = c;
+        // Past the eviction: the first checked MLX call from here is the new load's weights'.
+        mlx.fault.arm(1);
+        return null;
+    }
+};
+
+/// A load of the tiny Qwen (on the engine or on MLX) that evicts the same pack loaded on MLX, failed at its first
+/// weights call; returns what MLX's pool held when its preflight read the memory.
+fn evictMlxModel(new_on_engine: bool) !usize {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const registry_mod = @import("model_registry.zig");
+    const scheduler_mod = @import("scheduler.zig");
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.fault.disarm();
+    _ = mlx.mlx_clear_cache();
+
+    const reg = try registry_mod.ModelRegistry.init(a, io, null, 3, 0, null);
+    defer reg.deinit();
+    // The victim: the same pack loaded on MLX (the user's opt-out), as a served load leaves it on the heap.
+    const victim = try reg.registerStub("victim", dir, 0);
+    const config = try a.create(model_mod.ModelConfig);
+    victim.config = config;
+    {
+        const off = model_mod.cooler_off;
+        defer model_mod.cooler_off = off;
+        model_mod.cooler_off = .full;
+        config.* = try model_mod.parseConfig(io, a, dir);
+        model_load.applyModelSettings(config, .{});
+    }
+    @import("cooler_side.zig").forTest(config, true);
+    try testing.expect(!arch_handle.onEngine(null, config));
+    const weights = try a.create(model_mod.Weights);
+    weights.* = try model_mod.loadWeightsForConfig(io, a, dir, config, false);
+    victim.weights = weights;
+    const t = try a.create(Trunk);
+    t.* = try Trunk.init(io, a, config.*, weights);
+    victim.handle = arch_handle.adopt(t);
+    var active_victim: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_victim);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(victim, active_victim);
+    reg.markEvictingLocked(victim);
+    reg.mutex.unlock(io);
+
+    const other = try reg.registerStub("other", dir, 0);
+    reg.mutex.lockUncancelable(io);
+    try testing.expect(reg.tryBeginLoadLocked(other));
+    reg.mutex.unlock(io);
+    var other_config = blk: {
+        const off = model_mod.cooler_off;
+        defer model_mod.cooler_off = off;
+        if (!new_on_engine) model_mod.cooler_off = .full;
+        var c = try model_mod.parseConfig(io, a, dir);
+        model_load.applyModelSettings(&c, .{});
+        break :blk c;
+    };
+    defer other_config.deinit(a);
+    @import("cooler_side.zig").forTest(&other_config, true);
+    try testing.expectEqual(new_on_engine, arch_handle.onEngine(null, &other_config));
+    var victims = [_]*registry_mod.LoadedModel{victim};
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = io;
+    sch.allocator = a;
+    sch.ctx_size_flag = 0;
+    const hook_was = scheduler_mod.load_serving_bill;
+    defer scheduler_mod.load_serving_bill = hook_was;
+    scheduler_mod.load_serving_bill = &PreflightSawMlx.bill;
+    PreflightSawMlx.mlx_cache = null;
+    var req: scheduler_mod.LoadRequest = .{ .entry = other, .config = &other_config, .tok = undefined, .chat_config = undefined, .model_dir = dir, .evict_entries = &victims, .allocator = a };
+    model_load.runLoadRequest(&sch, &req);
+    mlx.fault.disarm();
+    defer if (req.error_name) |n| a.free(n);
+    var msg: [300]u8 = undefined;
+    _ = mlx.takeError(&msg);
+    try testing.expectEqual(registry_mod.LoadState.unloaded, victim.state);
+    _ = mlx.mlx_clear_cache();
+    return PreflightSawMlx.mlx_cache orelse error.TestUnexpectedResult;
+}
+
+test "cooler contract: a load that evicts a model on MLX reads its preflight with the victim's freed buffers given back, on the engine as on MLX" {
+    for ([_]bool{ true, false }) |new_on_engine| {
+        const parked = try evictMlxModel(new_on_engine);
+        errdefer std.debug.print("a load {s} that evicted a model on MLX read its preflight beside {d} KB in MLX's pool\n", .{ if (new_on_engine) "on the engine" else "on MLX", parked >> 10 });
+        try testing.expect(parked < 1 << 20);
+    }
+}

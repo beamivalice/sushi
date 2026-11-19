@@ -123,8 +123,9 @@ fn readsOnly(comptime name: []const u8) bool {
 /// turn, or of a model on the engine that still asks MLX. Zero in a process that keeps its turns.
 pub var rest_breaks: std.atomic.Value(u64) = .init(0);
 
-/// Settings of MLX's allocator asked while it was at rest, which reached nothing: a model on MLX sets its own inside
-/// its turn, and a model on the engine has none to set. Zero in a process that keeps its turns.
+/// Settings of MLX's allocator asked while it was at rest: a model on MLX sets its own inside its turn, and a model on
+/// the engine has none to set. A pool clear and cap are owed to MLX's next turn; the rest reach nothing. Zero in a
+/// process that keeps its turns.
 pub var rest_swallows: std.atomic.Value(u64) = .init(0);
 
 inline fn tally(comptime name: []const u8) void {
@@ -977,16 +978,27 @@ fn dropConfigTwin(c: *engine.kernel.Config) void {
 
 /// MLX work asked for while its allocator is at rest, done when the inference thread next turns to a model on MLX or
 /// the last hold ends (`payOwed`): the free of a config of MLX's (a twin, or one a cache shared by both sides
-/// evicts), and the wired limit a load or an unload moved.
+/// evicts), the wired limit a load or an unload moved, and the pool's cap and clear.
 const owed = struct {
     var configs: std.ArrayList(mlx_fast_metal_kernel_config) = .empty;
     var wired: bool = false;
+    var cache_limit: ?usize = null;
+    var clear: bool = false;
 };
 
 /// Inference thread, MLX's allocator not at rest.
 pub fn payOwed() void {
     for (owed.configs.items) |twin| _ = raw_kernel.mlx_fast_metal_kernel_config_free(twin);
     owed.configs.clearRetainingCapacity();
+    if (owed.cache_limit) |limit| {
+        owed.cache_limit = null;
+        var prev: usize = 0;
+        _ = raw.mlx_set_cache_limit(&prev, limit);
+    }
+    if (owed.clear) {
+        owed.clear = false;
+        _ = raw.mlx_clear_cache();
+    }
     if (!owed.wired) return;
     owed.wired = false;
     _ = applyWiredPolicy();
@@ -994,7 +1006,7 @@ pub fn payOwed() void {
 
 /// Whether MLX is owed work for its next turn.
 pub fn owes() bool {
-    return owed.wired or owed.configs.items.len != 0;
+    return owed.wired or owed.cache_limit != null or owed.clear or owed.configs.items.len != 0;
 }
 
 /// MLX's config for a launch on MLX's side: `cls` itself, or the twin of a config of the engine's own, filled in the
@@ -1333,9 +1345,9 @@ const eval_raw = struct {
 
 // ── Memory management ──
 // ── MLX's allocator ──
-// Under a held scope (`engine.hold`) none of these calls MLX: a reading is the one MLX was last left with, and a pool
-// clear, a peak reset and a limit do nothing, since MLX allocates nothing there (`rest_swallows` counts them). A limit
-// hands back the value given.
+// Under a held scope (`engine.hold`) none of these calls MLX: a reading is the one MLX was last left with, a pool
+// clear and the pool's cap are owed to MLX's next turn (`payOwed`), and a peak reset and the other limits do nothing,
+// since MLX allocates nothing there (`rest_swallows` counts them all). A limit hands back the value given.
 
 fn atRest() ?*engine.MlxAtRest {
     return if (engine.mlx_at_rest.on.load(.acquire)) &engine.mlx_at_rest else null;
@@ -1389,8 +1401,11 @@ pub fn noteAllocator() void {
     readAllocator(&engine.mlx_at_rest, true);
 }
 
+/// At rest the clear is owed to MLX's next turn (`payOwed`): a pool a caller empties is never kept by a held scope.
 pub fn mlx_clear_cache() c_int {
-    return if (swallowedAtRest("mlx_clear_cache")) 0 else raw.mlx_clear_cache();
+    if (!swallowedAtRest("mlx_clear_cache")) return raw.mlx_clear_cache();
+    owed.clear = true;
+    return 0;
 }
 pub fn mlx_get_active_memory(res: *usize) c_int {
     const r = atRest() orelse return raw.mlx_get_active_memory(res);
@@ -1442,8 +1457,11 @@ fn limitAtRest(comptime name: []const u8, res: *usize, limit: usize) bool {
 pub fn mlx_set_memory_limit(res: *usize, limit: usize) c_int {
     return if (limitAtRest("mlx_set_memory_limit", res, limit)) 0 else raw.mlx_set_memory_limit(res, limit);
 }
+/// At rest the pool's cap is owed to MLX's next turn, the last one asked.
 pub fn mlx_set_cache_limit(res: *usize, limit: usize) c_int {
-    return if (limitAtRest("mlx_set_cache_limit", res, limit)) 0 else raw.mlx_set_cache_limit(res, limit);
+    if (!limitAtRest("mlx_set_cache_limit", res, limit)) return raw.mlx_set_cache_limit(res, limit);
+    owed.cache_limit = limit;
+    return 0;
 }
 pub fn mlx_set_wired_limit(res: *usize, limit: usize) c_int {
     return if (limitAtRest("mlx_set_wired_limit", res, limit)) 0 else raw.mlx_set_wired_limit(res, limit);

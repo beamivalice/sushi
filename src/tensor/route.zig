@@ -3917,7 +3917,7 @@ test "a hold that finds MLX as its allocator was last read asks it nothing; afte
     try std.testing.expectEqual(calls + 5, mlxCalls());
 }
 
-test "under a hold MLX's allocator is not asked: its readings are the hold's first, and a clear, a reset and a limit are no call and change nothing" {
+test "under a hold MLX's allocator is not asked: its readings are the hold's first, a clear, a reset and a limit are no call, and a clear and the pool's cap are owed to MLX" {
     try mlx.requireGpu();
     const was_enabled = enabled;
     enabled = true;
@@ -3961,10 +3961,10 @@ test "under a hold MLX's allocator is not asked: its readings are the hold's fir
     try std.testing.expectEqual(calls, mlxCalls());
     unhold();
     is_held = false;
-    // The limit set under the hold never reached MLX.
+    // Owed, not dropped: the pool's cap reached MLX when the last hold ended.
     var after: usize = 0;
     try mlx.check(mlx.mlx_set_cache_limit(&after, orig));
-    try std.testing.expectEqual(@as(usize, 1 << 30), after);
+    try std.testing.expectEqual(@as(usize, 5), after);
 }
 
 test "a turn of the engine's inside another asks MLX nothing, though MLX changed since it was read" {
@@ -4114,7 +4114,7 @@ test "a kernel config of MLX's freed at rest is owed to MLX's next turn, with no
     is_held = false;
 }
 
-test "a setting asked of MLX at rest is counted and reaches nothing; inside MLX's turn it is MLX's and none is counted" {
+test "a setting asked of MLX at rest is counted and owed to MLX's next turn; inside MLX's turn it is MLX's and none is counted" {
     try mlx.requireGpu();
     const was_enabled = enabled;
     enabled = true;
@@ -4138,14 +4138,24 @@ test "a setting asked of MLX at rest is counted and reaches nothing; inside MLX'
         const t = turnTo(false);
         defer t.end();
         try mlx.check(mlx.mlx_set_cache_limit(&prev, 7 << 20));
-        // The limit asked at rest never reached MLX.
-        try std.testing.expectEqual(@as(usize, 3 << 20), prev);
+        // The limit asked at rest reached MLX as its turn began.
+        try std.testing.expectEqual(@as(usize, 5 << 20), prev);
         try mlx.check(mlx.mlx_clear_cache());
+        // What a model on MLX frees stays in MLX's pool past its turn.
+        var ones = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ones);
+        try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1 << 20, 4 }, 2, .float32, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(ones));
     }
     try std.testing.expectEqual(swallows + 2, mlx.rest_swallows.load(.monotonic));
     try std.testing.expectEqual(breaks, mlx.rest_breaks.load(.monotonic));
+    // A clear asked at rest is owed: MLX's pool empties when the last hold ends.
+    try mlx.check(mlx.mlx_clear_cache());
     unhold();
     is_held = false;
+    var cached: usize = 1;
+    try mlx.check(mlx.mlx_get_cache_memory(&cached));
+    try std.testing.expectEqual(@as(usize, 0), cached);
     try mlx.check(mlx.mlx_set_cache_limit(&prev, orig));
     try std.testing.expectEqual(@as(usize, 7 << 20), prev);
 }

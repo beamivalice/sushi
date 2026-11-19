@@ -233,8 +233,10 @@ route and the MLX arm still build the bank at prepare time.
   (`mlx.noteAllocator`), so its Cooler loads ask nothing; a load after an MLX-route model reads once more. Nothing of
   MLX's is made or freed under a hold, so the readings stay true to its end and the seam answers with them on any
   thread: the gauges, the bills, a request's headroom. A pool clear, a peak reset and a limit
-  (`mlx_set_cache_limit`, the transient cap, the command-buffer budget of `DecodeBuffers`) are no call and change
-  nothing, a limit handing back the value given; a hold spans whole jobs, so no set and restore straddle its ends.
+  (`mlx_set_cache_limit`, the transient cap, the command-buffer budget of `DecodeBuffers`) are no call, a limit
+  handing back the value given; a pool clear and the pool's cap are owed to MLX's next turn (`payOwed`, as the
+  wired limit is), never dropped. A model on MLX that goes (`model_load.retire`) clears MLX's pool in its own turn:
+  its freed buffers are back before the load that evicted it reads memory.
   These were the last calls of a request: 300 to 700 each on the real pack.
 - **The hold begins with the load job** (`model_load.doLoadOnInferenceThread`, for an arch that brings its own
   stream; the model keeps a hold of its own from `initDsv41` to its unload). What the job did on MLX before the
