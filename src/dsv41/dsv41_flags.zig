@@ -83,7 +83,7 @@ pub const serve = struct {
         const c = config.dsv41 orelse return;
         log.info("[dsv41] {d} bytes/token of compressed state\n", .{config.kvBytesPerToken()});
         if (config.dsparkOn()) {
-            log.info("[spec] DeepSeek-V4.1-Flash decodes with DSpark ({d} stages, block {d}, resident; {s})\n", .{ c.n_mtp, c.dspark.block, ctx.mtp_source });
+            log.info("[spec] DeepSeek-V4.1-Flash decodes with DSpark ({d} stages, block {d}, resident; {s}{s})\n", .{ c.n_mtp, c.dspark.block, ctx.mtp_source, if (c.widthExactLayout()) "" else "; fixed width: this layout is not width-exact" });
             if (depth_bounds.active.explicit()) {
                 const range = dspark_rows.Range.of(depth_bounds.active, c.dspark.block);
                 log.info("[spec] DSpark verifies {d}..{d} rows a round (--mtp-min-depth/--mtp-max-depth)\n", .{ range.min_rows, range.max_rows });

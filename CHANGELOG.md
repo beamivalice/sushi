@@ -21,6 +21,10 @@ earlier history is mlx-serve's, in that project's changelog.
   while the request it names bills the reply's cache rows at the pool's size class, so the request was refused again.
   The bill now counts the prompt's cache rows at that size too, as the pool holds them: a Qwen request on Sushi Cooler
   needs up to a sixteenth more of its cache free than before, and an auto-sized context comes out that much smaller.
+- **DeepSeek's release checkpoint answers one greedy request with one text when DSpark is on**: its FP8 trunk and MXFP4
+  experts give a row other bytes at another verify width, and the width followed measured timings, so the same request
+  could answer two texts. A greedy or seeded DSpark request on that layout now verifies at one fixed width, which decodes
+  slower than the timing-led width did; the boot line says so. STQ packs keep the timing-led width.
 - **A server on an EXL3 or STQ pack no longer grows its memory with every reload and new decode width**: each decode
   kernel setting it built kept a few small buffers for the life of the process, and the settings it evicted were built
   again at their next use, so every reload added more. They are now freed once the setting is made.

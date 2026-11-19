@@ -27,17 +27,20 @@ pub fn dsparkRowsForRoom(rows: usize, room: ?u32) usize {
     return @max(1, @min(rows, r));
 }
 
-/// Verify width of a seeded sampled DSpark request on MLX's route: the one most rounds chose on the shipped pack, the median of its
-/// adaptive widths (2 to 3 rows at ~70% per-draft acceptance), where the round-cost model also puts the best tokens per ms.
-const dspark_seeded_rows: u32 = 3;
+/// The width every DSpark round verifies at where a row's bytes move with the width: the one most rounds chose on the
+/// shipped pack, the median of its adaptive widths (2 to 3 rows at ~70% per-draft acceptance), where the round-cost model
+/// also puts the best tokens per ms.
+const dspark_fixed_rows: u32 = 3;
 
-/// The fixed width a request's DSpark rounds verify at, or null for the adaptive policy. On MLX's route, and on a layout
-/// that is not width-exact (`Model.widthExact`), a row's bytes move with the verify width, so a seeded sampled request
-/// must not take its width from measured ms. Where a row is the same bytes at every width (`exact_rows`), a seeded
-/// request keeps the policy and its text.
-pub fn dsparkSeededRows(sampling: sampler.SamplingParams, range: dspark_rows.Range, exact_rows: bool) ?usize {
-    if (exact_rows or sampling.seed == null or sampler.isGreedyTemperature(sampling.temperature)) return null;
-    return std.math.clamp(dspark_seeded_rows, range.min_rows, range.max_rows);
+/// The fixed width a request's DSpark rounds verify at, or null for the adaptive policy. Where a row's bytes move with
+/// the verify width, a request whose text repeats must not take its width from measured ms, or its text would follow the
+/// timings: a greedy one on a layout that is not width-exact (`layout_exact`, `Model.widthExact`: the route keeps greedy
+/// rows exact on an STQ layout), and a seeded sampled one where its draws are not (`exact_rows`: on the engine and that
+/// layout). An unseeded sampled request repeats nothing and keeps the policy.
+pub fn dsparkFixedRows(sampling: sampler.SamplingParams, range: dspark_rows.Range, exact_rows: bool, layout_exact: bool) ?usize {
+    const exact = if (sampler.isGreedyTemperature(sampling.temperature)) layout_exact else if (sampling.seed != null) exact_rows else true;
+    if (exact) return null;
+    return std.math.clamp(dspark_fixed_rows, range.min_rows, range.max_rows);
 }
 
 pub const dsv41_max_drafts = dspark_rows.max_drafts;
@@ -135,16 +138,16 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         tb.observe(self.generated_ids.items);
         break :room tb.room();
     } else null;
-    const exact_rows = mlx.engine.isStream(s) and (if (dsv41_state.modelOf(xfm)) |m| m.widthExact() else false);
-    const seeded_rows = dsparkSeededRows(self.sampling, policy.range, exact_rows);
-    const adaptive = (diag == .off or diag == .log) and seeded_rows == null;
+    const layout_exact = if (dsv41_state.modelOf(xfm)) |m| m.widthExact() else false;
+    const fixed_rows = dsparkFixedRows(self.sampling, policy.range, mlx.engine.isStream(s) and layout_exact, layout_exact);
+    const adaptive = (diag == .off or diag == .log) and fixed_rows == null;
     var ids_buf: [dsv41_max_drafts + 1]u32 = undefined;
     const copied: usize = if (self.dspark_copy and adaptive and !self.spec_disabled_runtime and (think_room orelse 2) > 1)
         try dsparkCopyDrafts(self, allocator, t1, ids_buf[1..])
     else
         0;
     const policy_rows: ?usize = if (copied > 0) copied + 1 else if (self.spec_disabled_runtime and self.spec_disable_reason == .max_ctx) 1 else switch (diag) {
-        .off, .log => seeded_rows orelse if (policy.next() == .plain) 1 else null,
+        .off, .log => fixed_rows orelse if (policy.next() == .plain) 1 else null,
         .rows => |n| n,
         .sweep => dspark_sweep_rows[self.dspark_stats.rounds % dspark_sweep_rows.len],
     };

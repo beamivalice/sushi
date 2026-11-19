@@ -6074,16 +6074,31 @@ test "dsv41 engine: on the release's layout (FP8 trunk, MXFP4 experts) on Sushi 
     try testing.expect(fx.model().onEngine());
     // Its FP8 linears and FP4 experts take MLX's product plan by row count: rows differ by width.
     try testing.expect(!fx.model().widthExact());
+    try expectOneTextAtEveryCost(&fx, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 });
+}
+
+test "dsv41 engine: on the release's layout (FP8 trunk, MXFP4 experts) on Sushi Cooler a greedy DSpark request says one text whatever its rounds cost (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    try testing.expect(fx.model().onEngine());
+    try testing.expect(!fx.model().widthExact());
+    try expectOneTextAtEveryCost(&fx, .{ .temperature = 0.0 });
+}
+
+/// Four prompts, each through DSpark under a dear and a cheap round-cost model: a dear plain step makes the policy draft
+/// wide, a cheap one keeps it plain, and the two texts must be one.
+fn expectOneTextAtEveryCost(fx: *EngineFixture, sampling: SamplingParams) !void {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
-    const sampling: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
     var parted: usize = 0;
     for (0..4) |shift| {
         var buf: [30]u32 = undefined;
         for (&buf, 0..) |*t, i| t.* = fx.ids[(i * 5 + 3 + shift * 11) % fx.ids.len];
-        // A dear plain step makes the policy draft wide; a cheap one keeps it plain.
         var said: [2]std.ArrayList(u32) = @splat(.empty);
         defer for (&said) |*s| s.deinit(a);
         for ([_]bool{ true, false }, &said) |dear, *got| {
