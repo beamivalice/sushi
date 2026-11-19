@@ -364,6 +364,8 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   is about +0.075 s a borrowed layer a chunk at ~10 GB/s.
 - The first decode or verify forward reads each released pool back with the experts it held, while each fits beside
   that forward's working set; one that does not stays released (union path) and is retried at the next forward.
+  It runs under that forward's own cap, which holds it: a pool's slabs are host pages the engine wraps, outside the
+  cap, and only its bank's meta table and resident map (about 14 KB a layer on the release) stay in the engine's pool.
   Eager, not on demand: the bytes are the same order (a cold layer refills its ~200-300 decode experts by misses
   either way) but as one ~9 GB/s read before the first decode step (~0.3 s a layer) instead of per-token stalls,
   which would also feed DSpark's measured round cost (a cold cache once drove it off wide verifies). Against a 2k-20k

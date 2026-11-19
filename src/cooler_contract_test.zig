@@ -4972,3 +4972,81 @@ test "cooler contract: a DeepSeek decode whose read-back of a released pool is r
         try testing.expectEqualSlices(u32, want.items, r.slot.legacy_gen.?.generated_ids.items);
     }
 }
+
+/// `LeaseProbe` that also records, at a decode forward's reads (one before each read-back), the pool's bytes in use and
+/// the room its cap leaves.
+const ReadBackProbe = struct {
+    var on: bool = false;
+    var reads: usize = 0;
+    var in_use: [64]u64 = @splat(0);
+    var room: u64 = 0;
+
+    fn headroom(c: *const model_mod.ModelConfig) @import("bills.zig").Headroom {
+        if (on and reads < in_use.len) {
+            const used = mlx.engine.poolTotal() - mlx.engine.poolFree();
+            if (reads == 0) room = (mlx.engine.poolLimit() orelse std.math.maxInt(u64)) -| used;
+            in_use[reads] = used;
+            reads += 1;
+        }
+        return LeaseProbe.headroom(c);
+    }
+};
+
+test "cooler contract: a DeepSeek decode forward reads back every pool its prefill released under its own cap, each read-back keeping only its bank's meta table and resident map in the engine's pool" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const ids = try D.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(D, dir, true);
+    defer _ = ld.close();
+    const borrow = @import("dsv41/dsv41_borrow.zig");
+    const pool_class = @import("tensor/pool_class.zig");
+    const xfm = arch_handle.trunk(ld.h);
+    const engine = xfm.expert_stream.?;
+    const m = @import("dsv41/dsv41_state.zig").modelOf(xfm).?;
+    ld.config.pinned_prefill_chunk = 2048;
+    var long: [2048]u32 = undefined;
+    for (&long, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
+    const wide = long.len - (prefill_plan.SSM_SNAPSHOT_BACKOFF + 1);
+    const need = borrow.prefillNeed(&m.cfg, @import("cooler_side.zig").onEngine(&ld.config), wide, wide);
+    LeaseProbe.engine = engine;
+    defer LeaseProbe.engine = null;
+    LeaseProbe.base = need - engine.poolBytes(@intCast(engine.layers.len - 1)) / 2;
+    borrow.headroom_fn = &ReadBackProbe.headroom;
+    defer borrow.headroom_fn = null;
+    var r: LeasedDecode = undefined;
+    try r.begin(&ld, dir, &long);
+    defer r.end();
+    var released: std.ArrayList(u16) = .empty;
+    defer released.deinit(a);
+    for (engine.borrow_from..engine.layers.len) |li| if (engine.isBorrowed(@intCast(li))) try released.append(a, @intCast(li));
+    try testing.expect(released.items.len >= 2);
+    ReadBackProbe.on = true;
+    ReadBackProbe.reads = 0;
+    r.tick();
+    ReadBackProbe.on = false;
+    try testing.expect(r.slot.error_code == null);
+    for (released.items) |li| try testing.expect(!engine.isBorrowed(li));
+    try testing.expectEqual(released.items.len, ReadBackProbe.reads);
+    // The read-backs ran under the decode forward's cap: a one-row forward ending a token past the prompt.
+    try testing.expectEqual(m.cfg.forwardCap(1, long.len + 1), ReadBackProbe.room);
+    // Read-back i lies between reads i and i + 1; the last one also drops the union workspace, so it is not counted.
+    // Its pool's slabs are host pages the engine wraps, outside the cap: only the meta table and the map stay in use.
+    for (released.items[0 .. released.items.len - 1], 0..) |li, i| {
+        const layer = &engine.layers[li];
+        const meta = layer.grouped.?.cache_ragged.meta;
+        const map = layer.resident_map;
+        var kept = pool_class.poolBytes(mlx.mlx_array_size(meta) * mlx.mlx_array_itemsize(meta));
+        if (map.ctx != null) kept += pool_class.poolBytes(mlx.mlx_array_size(map) * mlx.mlx_array_itemsize(map));
+        const grew = ReadBackProbe.in_use[i + 1] -| ReadBackProbe.in_use[i];
+        errdefer std.debug.print("layer {d}: the read-back kept {d} B in the engine's pool; its meta table and map take {d} B\n", .{ li, grew, kept });
+        try testing.expect(grew <= kept);
+    }
+}

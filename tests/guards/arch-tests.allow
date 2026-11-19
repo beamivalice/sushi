@@ -66,6 +66,7 @@ chat: Qwen's late-system edit reaches only a Qwen-typed config, never another ar
 chat: the embedded V4.1 template renders through the template engine byte-exact with DeepSeek's encoder
 chat: the shared Qwen test config places a late system turn as a Qwen load does
 chat: tool results a client sends out of call order render byte-exact with DeepSeek's encoder once the messages are ordered
+cooler contract: a DeepSeek decode forward reads back every pool its prefill released under its own cap, each read-back keeping only its bank's meta table and resident map in the engine's pool
 cooler contract: a DeepSeek decode whose read-back of a released pool is refused decodes through the union workspace and says the same tokens
 cooler contract: a DeepSeek prefill that releases decoder pools keeps them released through another request's joined and DSpark decode ticks between its chunks, and says its solo tokens
 cooler contract: a DeepSeek request cancelled as its prefill ends, its cleanup run after the next request took the state, gives its continuation what a cleanup run first does, from RAM or the SSD tier
