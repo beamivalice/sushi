@@ -2137,47 +2137,56 @@ test "dsv41 engine: a prompt's tokens and the logits after them do not depend on
     m.cfg.window = 20;
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
-    var prompt: [600]u32 = undefined;
-    for (&prompt, 0..) |*t, i| t.* = fx.ids[(i * 5 + 3) % fx.ids.len];
+    const long = try a.alloc(u32, 9000);
+    defer a.free(long);
+    for (long, 0..) |*t, i| t.* = fx.ids[(i * 5 + 3) % fx.ids.len];
     const saved_chunk = settings_resolve.prefill_chunk.value;
     defer settings_resolve.prefill_chunk.value = saved_chunk;
-    var want_tokens: std.ArrayList(u32) = .empty;
-    defer want_tokens.deinit(a);
-    var want_logits: std.ArrayList(f32) = .empty;
-    defer want_logits.deinit(a);
-    // One chunk, the widths either side of the dense product's kernel switch at this fixture's shapes (128 rows), and
-    // the narrowest. Not under 33: this fixture has two heads, which the one-pass attention kernel does not take, so its
-    // attention is the op chain, whose own dense products change kernel with the keys a narrow span holds. The release's
-    // kernel is proven cut by cut (`dsv41 fused attention: a row's heads are the same bits in one span and in any two`).
-    for ([_]usize{ 1024, 129, 128, 127, 33 }, 0..) |width, run| {
-        settings_resolve.prefill_chunk.value = width;
-        try fx.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, &prompt, 8, .{ .temperature = 0.0 }, &.{}, .{
-            .skip_lazy_preforward = true,
-            .pinned_prefill_chunk = width,
-            .adaptive_chunk_width = false,
-            .skip_unread_tails = true,
-        });
-        defer gen.deinit(a);
-        var tokens: std.ArrayList(u32) = .empty;
-        defer tokens.deinit(a);
-        try tokens.append(a, gen.next_token_id);
-        while (try gen.next(a)) |t| try tokens.append(a, t);
-        const lg = try forwardIds(&fx.xfm, &gen.ctx, &.{prompt[0]});
-        defer _ = mlx.mlx_array_free(lg);
-        try mlx.check(mlx.mlx_array_eval(lg));
-        const logits = (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..m.cfg.vocab];
-        if (run == 0) {
-            try want_tokens.appendSlice(a, tokens.items);
-            try want_logits.appendSlice(a, logits);
-            continue;
+    // Each case's first width is its one chunk. A prompt longer than the served start width cut at every rung of the
+    // served ladder; and a short one at the widths either side of the dense product's kernel switch at this fixture's
+    // shapes (128 rows) and the narrowest. Not under 33, nor narrow on the long prompt: this fixture has two heads, which
+    // the one-pass attention kernel does not take, so its attention is the op chain, whose own dense products change
+    // kernel with the keys a narrow span holds. The release's kernel is proven cut by cut (`dsv41 fused attention: a
+    // row's heads are the same bits in one span and in any two`).
+    const cases = [_]struct { prompt: []const u32, widths: []const usize }{
+        .{ .prompt = long, .widths = &.{ 16384, 8192, 4096, 2048, 1024, 512 } },
+        .{ .prompt = long[0..600], .widths = &.{ 1024, 129, 128, 127, 33 } },
+    };
+    for (cases) |case| {
+        var want_tokens: std.ArrayList(u32) = .empty;
+        defer want_tokens.deinit(a);
+        var want_logits: std.ArrayList(f32) = .empty;
+        defer want_logits.deinit(a);
+        for (case.widths, 0..) |width, run| {
+            settings_resolve.prefill_chunk.value = width;
+            try fx.xfm.resetCache();
+            var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, case.prompt, 8, .{ .temperature = 0.0 }, &.{}, .{
+                .skip_lazy_preforward = true,
+                .pinned_prefill_chunk = width,
+                .adaptive_chunk_width = false,
+                .skip_unread_tails = true,
+            });
+            defer gen.deinit(a);
+            var tokens: std.ArrayList(u32) = .empty;
+            defer tokens.deinit(a);
+            try tokens.append(a, gen.next_token_id);
+            while (try gen.next(a)) |t| try tokens.append(a, t);
+            const lg = try forwardIds(&fx.xfm, &gen.ctx, &.{case.prompt[0]});
+            defer _ = mlx.mlx_array_free(lg);
+            try mlx.check(mlx.mlx_array_eval(lg));
+            const logits = (mlx.mlx_array_data_float32(lg) orelse return error.NoLogits)[0..m.cfg.vocab];
+            if (run == 0) {
+                try want_tokens.appendSlice(a, tokens.items);
+                try want_logits.appendSlice(a, logits);
+                continue;
+            }
+            // The bytes were proven on the matrix-unit class (natively and rehearsing an M1 to M4); a real M1 sums this
+            // fixture's two-head op chain otherwise at some cuts, which is hardware divergence.
+            if (!@import("sushi_exl3").device.systemChip().contains(.matrix_g17)) continue;
+            errdefer std.debug.print("a {d}-token prefill cut at {d} rows gives other bytes than one chunk\n", .{ case.prompt.len, width });
+            try testing.expectEqualSlices(u32, want_tokens.items, tokens.items);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want_logits.items), std.mem.sliceAsBytes(logits));
         }
-        // The bytes were proven on the matrix-unit class (natively and rehearsing an M1 to M4); a real M1 sums this
-        // fixture's two-head op chain otherwise at some cuts, which is hardware divergence.
-        if (!@import("sushi_exl3").device.systemChip().contains(.matrix_g17)) continue;
-        errdefer std.debug.print("a prefill cut at {d} rows gives other bytes than one chunk\n", .{width});
-        try testing.expectEqualSlices(u32, want_tokens.items, tokens.items);
-        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want_logits.items), std.mem.sliceAsBytes(logits));
     }
 }
 
