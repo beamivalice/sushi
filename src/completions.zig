@@ -648,7 +648,7 @@ fn handleStreamingCompletion(
     }
 
     // Final chunk with finish_reason
-    if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize();
+    if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize(server_state.global_scheduler.?);
     const finish_reason = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;
     const total_prompt = ts.prompt_tokens;
 

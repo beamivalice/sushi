@@ -300,9 +300,13 @@ pub fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: any
     }
 }
 
-/// A client that vanished mid-generation did not hit a token cap.
-fn nonStreamFinishReason(client_gone: bool, slot_reason: []const u8) []const u8 {
-    return if (client_gone) "client_disconnect" else slot_reason;
+/// A client that vanished mid-generation, or a slot the cancel API ended, did not hit a token cap.
+fn nonStreamFinishReason(end: DrainEnd, slot_reason: []const u8) []const u8 {
+    return switch (end) {
+        .client_gone => "client_disconnect",
+        .cancelled => "cancelled",
+        else => slot_reason,
+    };
 }
 
 pub const visibleToolPreamble = think_tags.visibleToolPreamble;
@@ -345,7 +349,7 @@ const EarlyStop = struct {
     }
 };
 
-const DrainEnd = enum { done, client_gone, stopped, failed };
+const DrainEnd = enum { done, client_gone, stopped, cancelled, failed };
 
 /// Connection thread: collect the slot's tokens until it ends, the client leaves or `early` sees a stop complete.
 fn drainSlotTokens(slot: anytype, conn: ?*Conn, allocator: std.mem.Allocator, output_ids: *std.ArrayList(u32), early: ?*EarlyStop) !DrainEnd {
@@ -366,6 +370,7 @@ fn drainSlotTokens(slot: anytype, conn: ?*Conn, allocator: std.mem.Allocator, ou
         switch (nr) {
             .token => |t| try output_ids.append(allocator, t),
             .done => return .done,
+            .cancelled => return .cancelled,
             .err => return .failed,
         }
         if (conn) |c| {
@@ -382,11 +387,12 @@ fn drainSlotTokens(slot: anytype, conn: ?*Conn, allocator: std.mem.Allocator, ou
     }
 }
 
-/// `drainSlotTokens`, then, after an early stop, wait out the inference pass still publishing and accounting
-/// the cancelled slot: its statistics are plain fields that only a quiet slot lets the caller read.
+/// `drainSlotTokens`, then, once the slot is cancelled (an early stop, the cancel API, a client that left), wait out
+/// the inference pass still publishing and accounting it: its statistics are plain fields only a quiet slot lets the
+/// caller read.
 fn drainSettled(sch: *scheduler_mod.Scheduler, slot: *scheduler_mod.Slot, conn: ?*Conn, allocator: std.mem.Allocator, output_ids: *std.ArrayList(u32), early: ?*EarlyStop) !DrainEnd {
     const end = try drainSlotTokens(slot, conn, allocator, output_ids, early);
-    if (end == .stopped) sch.quiesce(slot);
+    if (slot.cancelled.load(.acquire)) sch.quiesce(slot);
     return end;
 }
 
@@ -468,7 +474,8 @@ pub fn nonStreamingViaScheduler(
     defer if (early) |*e| e.gate.deinit(allocator);
     const end = try drainSettled(sch, slot, conn, allocator, &output_ids, if (early) |*e| e else null);
     if (end == .failed) return slotFailure(slot);
-    const client_gone = end == .client_gone;
+    // An early stop or a cancel reports the tokens it returned, not the ones decoded past its end.
+    const returned = end == .stopped or end == .cancelled;
 
     // The scheduler measures prefill_ns / decode_ns per-slot directly. Pull
     // those instead of the old single-wall-clock approximation, which
@@ -509,15 +516,14 @@ pub fn nonStreamingViaScheduler(
     // Phase A5: take ownership of the slot's accumulated logprobs. After
     // `toOwnedSlice` the slot's list is empty, so `Slot.deinit` doesn't try
     // to free what we just transferred to the caller.
-    const logprobs_slice: ?[]sampler.LogprobResult = slot.takeLogprobs(if (end == .stopped) token_ids.len else std.math.maxInt(usize));
+    const logprobs_slice: ?[]sampler.LogprobResult = slot.takeLogprobs(if (returned) token_ids.len else std.math.maxInt(usize));
 
     return .{
         .text = text,
         .token_ids = token_ids,
         .prompt_tokens = slot.prompt_tokens,
-        // An early stop reports the tokens it returned, not the ones decoded past the stop.
-        .completion_tokens = if (end == .stopped) @intCast(token_ids.len) else slot.completion_tokens,
-        .finish_reason = nonStreamFinishReason(client_gone, slot.finish_reason),
+        .completion_tokens = if (returned) @intCast(token_ids.len) else slot.completion_tokens,
+        .finish_reason = nonStreamFinishReason(end, slot.finish_reason),
         .prefill_tps = prefill_tps,
         .decode_tps = decode_tps,
         .prefill_ns = slot.prefill_ns,
@@ -890,8 +896,10 @@ pub const StreamingTokenStream = struct {
     /// `timings` block from the usage chunk).
     prefill_ns: u64 = 0,
     decode_ns: u64 = 0,
-    /// Tokens `nextOrIdle` has handed out: what a client stop sequence leaves as the completion count.
+    /// Tokens `nextOrIdle` has handed out: what a client stop sequence or a cancel leaves as the completion count.
     delivered: u32 = 0,
+    /// The slot was cancelled under the reader before it finished (`NextResult.cancelled`).
+    cancelled: bool = false,
 
     /// Phase A2-streaming: build a token stream backed by a scheduler Slot.
     /// `mode` is recorded for telemetry but doesn't drive next()'s dispatch
@@ -912,23 +920,23 @@ pub const StreamingTokenStream = struct {
     /// `finalize` after the request's own stop sequence ended the stream: the slot is cancelled and waited
     /// out, and usage counts the tokens delivered, not the ones a speculative block decoded past the stop.
     pub fn finalizeStopped(self: *StreamingTokenStream, sch: *scheduler_mod.Scheduler) void {
-        if (self.slot) |s| {
-            s.cancelOnStop();
-            sch.quiesce(s);
-        }
-        self.finalize();
+        if (self.slot) |s| s.cancelOnStop();
+        self.finalize(sch);
         self.completion_tokens = self.delivered;
     }
 
     /// Snapshot prompt/completion tokens + finish reason from the underlying
     /// source so callers can read them after the loop exits without having
     /// to know which source was active. Safe to call multiple times; idempotent.
-    pub fn finalize(self: *StreamingTokenStream) void {
+    /// A cancelled slot is waited out first: a pass may still write the fields read here.
+    pub fn finalize(self: *StreamingTokenStream, sch: *scheduler_mod.Scheduler) void {
         if (self.slot) |s| {
+            if (s.cancelled.load(.acquire)) sch.quiesce(s);
             self.prompt_tokens = s.prompt_tokens;
             self.cached_tokens = s.cached_tokens;
-            self.completion_tokens = s.completion_tokens;
-            self.finish_reason = s.finish_reason;
+            // A cancel ends the stream on what it handed out; no finish set the slot's reason.
+            self.completion_tokens = if (self.cancelled) self.delivered else s.completion_tokens;
+            self.finish_reason = if (self.cancelled) "cancelled" else s.finish_reason;
             self.finish_details = s.finish_details;
             self.prefill_ns = s.prefill_ns;
             self.decode_ns = s.decode_ns;
@@ -978,6 +986,11 @@ pub const StreamingTokenStream = struct {
                     self.finished = true;
                     return .done;
                 },
+                .cancelled => {
+                    self.finished = true;
+                    self.cancelled = true;
+                    return .done;
+                },
                 .err => return slotFailure(s),
             }
         }
@@ -1000,6 +1013,11 @@ pub const StreamingTokenStream = struct {
                 .token => |t| return t,
                 .done => {
                     self.finished = true;
+                    return null;
+                },
+                .cancelled => {
+                    self.finished = true;
+                    self.cancelled = true;
                     return null;
                 },
                 .err => return slotFailure(s),
@@ -1751,7 +1769,7 @@ pub fn handleStreamingGeneration(
 
     // After generation: capture stats from whichever source was active
     // (Generator on legacy, Slot on scheduler).
-    if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize();
+    if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize(server_state.global_scheduler.?);
 
     // Check for tool calls in accumulated text
     var finish_reason: []const u8 = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;
@@ -2714,9 +2732,10 @@ test "contextOverflowMessage: a buffer too small falls back rather than sending 
 test "a vanished client is not a token cap: the non-stream finish reason says so" {
     // Bar: the non-streaming path reports what the three streaming paths do.
     const t = std.testing;
-    try t.expectEqualStrings("client_disconnect", nonStreamFinishReason(true, "length"));
-    try t.expectEqualStrings("stop", nonStreamFinishReason(false, "stop"));
-    try t.expectEqualStrings("length", nonStreamFinishReason(false, "length"));
+    try t.expectEqualStrings("client_disconnect", nonStreamFinishReason(.client_gone, "length"));
+    try t.expectEqualStrings("cancelled", nonStreamFinishReason(.cancelled, "length"));
+    try t.expectEqualStrings("stop", nonStreamFinishReason(.done, "stop"));
+    try t.expectEqualStrings("length", nonStreamFinishReason(.done, "length"));
 }
 
 test "a tool-call answer keeps the model's visible preamble" {
@@ -2823,6 +2842,80 @@ test "a streamed stop reports the tokens it delivered, not the speculative block
     t.join();
     try std.testing.expectEqual(@as(u32, 4), slot.completion_tokens);
     try std.testing.expectEqual(@as(u32, 1), ts.completion_tokens);
+}
+
+/// The inference pass still holding a slot the cancel API ended: it writes the prompt count, two tokens decoded past
+/// what the reader took and the decode time, then lets go.
+const LatePass = struct {
+    slot: *scheduler_mod.Slot,
+    fn run(self: *LatePass) void {
+        std.Io.sleep(self.slot.io, .fromMilliseconds(5), .real) catch {};
+        self.slot.prompt_tokens = 12;
+        self.slot.completion_tokens += 2;
+        self.slot.decode_ns = 777;
+        _ = self.slot.in_pass.fetchSub(1, .acq_rel);
+    }
+};
+
+test "a reply the cancel API ends mid-decode says cancelled and counts the tokens it returned, read once its pass settles" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |streamed| {
+        var sch: scheduler_mod.Scheduler = undefined;
+        sch.io = io;
+        sch.queue_mu = .init;
+        var slot: scheduler_mod.Slot = undefined;
+        slot.io = io;
+        slot.allocator = a;
+        slot.out_mu = .init;
+        slot.out_cond = .init;
+        slot.out_event = .unset;
+        slot.out_buf = .empty;
+        defer slot.out_buf.deinit(a);
+        slot.logprobs_buf = .empty;
+        slot.out_idx = 0;
+        slot.handover_token = null;
+        slot.cancelled = .init(false);
+        slot.stop_hit = .init(false);
+        slot.shutdown_cancelled = .init(false);
+        slot.finished = false;
+        slot.error_code = null;
+        // What `Slot.init` leaves until a finish publishes its own.
+        slot.finish_reason = "length";
+        slot.finish_details = null;
+        slot.prompt_tokens = 0;
+        slot.cached_tokens = 0;
+        slot.completion_tokens = 3;
+        slot.prefill_ns = 0;
+        slot.decode_ns = 0;
+        slot.in_pass = .init(1);
+        for (0..3) |i| slot.pushTokenWithLogprob(@intCast(i + 1), null);
+        // POST /v1/slots/cancel, from another connection, while a pass holds the slot.
+        slot.cancel();
+        var pass = LatePass{ .slot = &slot };
+        const t = try std.Thread.spawn(.{}, LatePass.run, .{&pass});
+        defer t.join();
+        if (streamed) {
+            var ts = StreamingTokenStream.initFromSlot(&slot, .regular, &.{});
+            var got: u32 = 0;
+            while (try ts.nextOrIdle(a, 1000) == .token) got += 1;
+            ts.finalize(&sch);
+            try std.testing.expectEqual(@as(u32, 3), got);
+            try std.testing.expectEqualStrings("cancelled", ts.finish_reason);
+            try std.testing.expectEqual(@as(u32, 3), ts.completion_tokens);
+            try std.testing.expectEqual(@as(u32, 12), ts.prompt_tokens);
+            try std.testing.expectEqual(@as(u64, 777), ts.decode_ns);
+        } else {
+            var out = std.ArrayList(u32).empty;
+            defer out.deinit(a);
+            const end = try drainSettled(&sch, &slot, null, a, &out, null);
+            // Read exactly as the result builder does.
+            const prompt = slot.prompt_tokens;
+            try std.testing.expectEqualStrings("cancelled", @tagName(end));
+            try std.testing.expectEqual(@as(usize, 3), out.items.len);
+            try std.testing.expectEqual(@as(u32, 12), prompt);
+        }
+    }
 }
 
 test "a non-stream early stop reads usage and timing only after the tick that published its token settles" {

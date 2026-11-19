@@ -1661,7 +1661,7 @@ fn handleAnthropicStreaming(
     }
 
     // Post-generation: snapshot stats from whichever source was active.
-    if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize();
+    if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize(server_state.global_scheduler.?);
 
     // Handle tool calls
     var finish_reason: []const u8 = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;

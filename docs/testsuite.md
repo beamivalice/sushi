@@ -274,6 +274,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
   about 118 GB of RAM, so its cells tested nothing there.
   A tiny that streams its experts names the SSD budget its load takes (`cooler_contract.server_ssd_budget_gb`, written
   to the test's model-settings.json): a box under 96 GB has no RAM-tier default, and its cells would test a refusal.
+  A cell that needs a request to stand still (queued, or between two tokens) holds the inference thread in a
+  blocker's prefill (`PrefillHold`), never a wall-clock race against the tiny's decode.
 - Integration scripts in `tests/` cover only what HTTP shows and a unit test cannot reach.
 
 ## How a test is built

@@ -237,6 +237,9 @@ pub const NextResult = union(enum) {
     /// Generation completed (EOS, max_tokens, timeout, etc.). `finish_reason`
     /// is set on the slot at this point.
     done: void,
+    /// Another caller cancelled the slot before it finished (`/v1/slots/cancel`): no finish set its reason or
+    /// statistics, and a pass may still hold it (`Scheduler.quiesce`).
+    cancelled: void,
     /// Generation errored. `error_code` is set on the slot; the caller
     /// should surface it to the client and call `complete(slot)`.
     err: void,
@@ -812,7 +815,7 @@ pub const Slot = struct {
 
     /// Connection thread: block until the next token, completion, or error.
     /// Returns `.token` for each generated id, then exactly one terminator
-    /// (`.done` or `.err`).
+    /// (`.done`, `.cancelled` or `.err`).
     pub fn waitNext(self: *Slot) NextResult {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
@@ -882,7 +885,7 @@ pub const Slot = struct {
     }
 
     fn cancelledResult(self: *Slot) NextResult {
-        return if (self.shutdown_cancelled.load(.acquire)) .{ .err = {} } else .{ .done = {} };
+        return if (self.shutdown_cancelled.load(.acquire)) .{ .err = {} } else .{ .cancelled = {} };
     }
 
     /// Connection thread: signal cancellation. The inference thread will
@@ -6064,7 +6067,7 @@ test "a shutdown asked and not yet begun admits no waiting request, takes no new
     destroyAbandoned(take.abandoned);
 }
 
-test "a shutdown drain ends a queued request with an error, a client disconnect still ends it as done" {
+test "a shutdown drain ends a queued request with an error, a client cancel ends it as cancelled" {
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
     model.config = &cfg;
@@ -6077,10 +6080,10 @@ test "a shutdown drain ends a queued request with an error, a client disconnect 
     const params: SubmitParams = .{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 };
     const gone = try sch.submit(params);
     gone.cancel();
-    try testing.expect(gone.waitNext() == .done);
+    try testing.expect(gone.waitNext() == .cancelled);
     const drained = try sch.submit(params);
     sch.beginShutdown();
-    // A drained slot never ran: `done` would surface as the default finish reason, `length`.
+    // The server ended it: readers see an error, never a finish reason.
     try testing.expect(drained.waitNextTimeout(0).? == .err);
     try testing.expect(drained.waitNext() == .err);
     sch.complete(drained);

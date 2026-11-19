@@ -192,6 +192,9 @@ answers while the weights load:
   the whole decoded text holds it too, so the answer bytes stay `earliest`'s and generation ends within one token.
   The cancelled slot is quiesced (`Scheduler.quiesce`, waits out `in_pass`) BEFORE its statistics are read, and usage
   counts the tokens returned, not the ones a speculative block decoded past the stop (a stream: `finalizeStopped`).
+- **A terminal envelope comes from the terminator the reader got, never from slot fields only some end paths set**:
+  a slot the cancel API ended answers `.cancelled` (`Slot.waitNext`), and every surface quiesces it, says cancelled
+  (chat and completions `cancelled`, Messages `end_turn`, Responses `completed`) and counts the tokens it returned.
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s

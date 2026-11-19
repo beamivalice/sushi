@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A reply cancelled mid-stream no longer says it ran out of tokens**: a request stopped by `POST /v1/slots/cancel`
+  (or the dashboard's Cancel) ended with `finish_reason: length` (Responses: incomplete, `max_output_tokens`) and zero
+  usage on every surface; it now ends as cancelled, and its usage counts the tokens it returned.
 - **Prefill on Sushi Cooler no longer waits between chunks**: the GPU sat idle at every 2048-row boundary while the
   host trimmed the engine's buffer pool and a resident DeepSeek chunk drained its last layers; the pool now carries to
   the next chunk and those layers finish behind it, for faster long-prompt prefill at the same output.

@@ -1258,7 +1258,7 @@ fn handleResponsesInner(
             try emitResponsesReasoning(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, reasoningItemIndex(live_output_index, streamed_message_started, streamed_message_index), &join, think_tail);
         }
 
-        if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize();
+        if (stopped) ts.finalizeStopped(server_state.global_scheduler.?) else ts.finalize(server_state.global_scheduler.?);
 
         if (client_gone) {
             // Peer disconnected mid-decode. We've already cancelled the slot;

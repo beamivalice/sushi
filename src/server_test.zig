@@ -14,6 +14,9 @@ const http_conn = @import("http_conn.zig");
 const scheduler_mod = @import("scheduler.zig");
 const test_support = @import("test_support.zig");
 const bills = @import("bills.zig");
+const model_mod = @import("model.zig");
+const trunk = @import("trunk.zig");
+const http = @import("http.zig");
 const ModelRegistry = @import("model_registry.zig").ModelRegistry;
 
 const io = std.testing.io;
@@ -965,6 +968,372 @@ test "server: a WebSocket turn routes its own model: an unregistered model path 
             }
             // The socket serves the next turn.
             try wsCompletedTurn(fd);
+        }
+    }.run);
+}
+
+/// Holds the inference thread in the next request's prefill, before its first forward (`prefill_request_chunk`),
+/// until the test lets go: a request already decoding stands still between two tokens, the held one before its first.
+const PrefillHold = struct {
+    const ChunkFn = @typeInfo(@TypeOf(scheduler_mod.prefill_request_chunk)).optional.child;
+    var served: ?ChunkFn = null;
+    var armed: std.atomic.Value(bool) = .init(false);
+    var held: std.atomic.Value(bool) = .init(false);
+    var released: std.atomic.Value(bool) = .init(false);
+
+    fn chunk(cfg: *const model_mod.ModelConfig, n: usize, max: u32, kv: trunk.KVQuantConfig, a: bool, b: u64, c: u64, d: bool, e: bool) u32 {
+        if (armed.swap(false, .acq_rel)) {
+            held.store(true, .release);
+            // Bounds a test that fails before it lets go; the test itself releases at once.
+            var waited: u32 = 0;
+            while (!released.load(.acquire) and waited < 120_000) : (waited += 1) {
+                var none = [_]std.posix.pollfd{};
+                _ = std.posix.poll(&none, 1) catch {};
+            }
+        }
+        return served.?(cfg, n, max, kv, a, b, c, d, e);
+    }
+    /// After a first request: serve installs the hook this one wraps.
+    fn install() !void {
+        served = scheduler_mod.prefill_request_chunk orelse return error.NoPrefillChunkHook;
+        scheduler_mod.prefill_request_chunk = &chunk;
+    }
+    fn uninstall() void {
+        released.store(true, .release);
+        scheduler_mod.prefill_request_chunk = served;
+    }
+    fn arm() void {
+        held.store(false, .release);
+        released.store(false, .release);
+        armed.store(true, .release);
+    }
+    fn isHeld() bool {
+        return held.load(.acquire);
+    }
+    fn waitHeld() !void {
+        if (!within(60_000, isHeld)) return error.PrefillNeverHeld;
+    }
+    fn release() void {
+        released.store(true, .release);
+    }
+};
+
+/// The one slot a scheduler list holds, read under its locks; null unless it holds exactly one.
+const SlotSeen = struct { id: u64, tokens: usize, ended: bool };
+
+fn onlySlot(comptime list: []const u8) ?SlotSeen {
+    const sch = server_state.global_scheduler.?;
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    const items = @field(sch, list).items;
+    if (items.len != 1) return null;
+    const s = items[0];
+    s.out_mu.lockUncancelable(s.io);
+    defer s.out_mu.unlock(s.io);
+    return .{ .id = s.request_id, .tokens = s.out_buf.items.len, .ended = s.finished or s.error_code != null };
+}
+
+fn dumpLists(tag: []const u8) void {
+    const sch = server_state.global_scheduler.?;
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    std.debug.print("{s}: pending {d} prefilling {d} decoding {d} in_flight {d} held {any}\n", .{ tag, sch.pending.items.len, sch.prefilling.items.len, sch.decoding.items.len, sch.in_flight, PrefillHold.isHeld() });
+}
+
+fn pendingOne() bool {
+    return onlySlot("pending") != null;
+}
+
+fn decodingWithTokens() bool {
+    const seen = onlySlot("decoding") orelse return false;
+    return seen.tokens > 0;
+}
+
+/// A request run on its own thread, for one whose answer waits on the test.
+const Background = struct {
+    path: []const u8,
+    body: []const u8,
+    out: []u8 = &.{},
+    fn run(q: *@This()) void {
+        q.out = request("POST", q.path, q.body) catch &.{};
+    }
+};
+
+const Surface = enum { chat, completions, messages, responses, ws };
+
+const CancelRow = struct {
+    surface: Surface,
+    stream: bool,
+    path: []const u8,
+    body: []const u8,
+};
+
+const cancel_rows = [_]CancelRow{
+    .{ .surface = .chat, .stream = true, .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2000,\"temperature\":0,\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[{\"role\":\"user\",\"content\":\"write a long story about rivers\"}]}" },
+    .{ .surface = .chat, .stream = false, .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2000,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"write a long story about rivers\"}]}" },
+    .{ .surface = .completions, .stream = true, .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"prompt\":\"a long tale of the sea\",\"max_tokens\":64,\"temperature\":0,\"ignore_eos\":true,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" },
+    .{ .surface = .completions, .stream = false, .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"prompt\":\"a long tale of the sea\",\"max_tokens\":64,\"temperature\":0,\"ignore_eos\":true}" },
+    .{ .surface = .messages, .stream = true, .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"max_tokens\":2000,\"temperature\":0,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"write a long story about rivers\"}]}" },
+    .{ .surface = .messages, .stream = false, .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"max_tokens\":2000,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"write a long story about rivers\"}]}" },
+    .{ .surface = .responses, .stream = true, .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2000,\"temperature\":0,\"stream\":true,\"input\":\"write a long story about rivers\"}" },
+    .{ .surface = .responses, .stream = false, .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2000,\"temperature\":0,\"input\":\"write a long story about rivers\"}" },
+    .{ .surface = .ws, .stream = true, .path = "", .body = "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"write a long story about rivers\",\"max_output_tokens\":2000,\"temperature\":0}" },
+};
+
+/// `connect` with the buffers large, as a TCP socket's are: a stream writes its opening events before the test reads.
+fn connectWide() !std.posix.fd_t {
+    var sv: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv) != 0) return error.SocketPairFailed;
+    const wide: c_int = 256 * 1024;
+    _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
+    _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
+    readLimit(sv[1], 120);
+    server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
+    return sv[1];
+}
+
+/// One in-flight request of a row: a socket for a stream, a thread for an answer the test waits on.
+const InFlight = struct {
+    row: CancelRow,
+    fd: std.posix.fd_t = -1,
+    asked: Background = .{ .path = "", .body = "" },
+    thread: ?std.Thread = null,
+
+    fn start(row: CancelRow) !InFlight {
+        var f = InFlight{ .row = row };
+        if (row.surface == .ws) {
+            f.fd = try connectWide();
+            errdefer _ = std.c.close(f.fd);
+            try sendAll(f.fd, "GET /v1/responses HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+            const head = try readUntil(f.fd, "\r\n\r\n");
+            defer gpa.free(head);
+            if (!std.mem.startsWith(u8, head, "HTTP/1.1 101")) return error.NoUpgrade;
+            try wsSend(f.fd, row.body);
+        } else if (row.stream) {
+            f.fd = try connectWide();
+            try send(f.fd, "POST", row.path, row.body);
+        }
+        return f;
+    }
+    /// A non-stream request's thread starts once `f` sits where it stays.
+    fn spawn(f: *InFlight) !void {
+        if (f.fd >= 0) return;
+        f.asked = .{ .path = f.row.path, .body = f.row.body };
+        f.thread = try std.Thread.spawn(.{}, Background.run, .{&f.asked});
+    }
+    /// Everything the request answered, to its terminal; the caller frees.
+    fn finish(f: *InFlight) ![]u8 {
+        if (f.thread) |t| {
+            t.join();
+            return f.asked.out;
+        }
+        defer _ = std.c.close(f.fd);
+        if (f.row.surface != .ws) return readUntil(f.fd, null);
+        var all: std.ArrayList(u8) = .empty;
+        errdefer all.deinit(gpa);
+        while (true) {
+            const frame = try wsReadFrameOf(f.fd);
+            defer gpa.free(frame.payload);
+            if (frame.opcode == 0x8) break;
+            try all.appendSlice(gpa, frame.payload);
+            try all.append(gpa, '\n');
+            if (wsTerminal(frame.payload)) break;
+        }
+        return all.toOwnedSlice(gpa);
+    }
+};
+
+fn wsTerminal(frame: []const u8) bool {
+    return std.mem.indexOf(u8, frame, "\"type\":\"response.completed\"") != null or
+        std.mem.indexOf(u8, frame, "\"type\":\"response.failed\"") != null or
+        std.mem.indexOf(u8, frame, "\"type\":\"response.incomplete\"") != null or
+        std.mem.startsWith(u8, frame, "{\"type\":\"error\"");
+}
+
+/// The number after the LAST `key` in `text` (the terminal's usage).
+fn lastNumber(text: []const u8, key: []const u8) ?u64 {
+    const at = std.mem.lastIndexOf(u8, text, key) orelse return null;
+    const rest = text[at + key.len ..];
+    var n: usize = 0;
+    while (n < rest.len and std.ascii.isDigit(rest[n])) n += 1;
+    return std.fmt.parseInt(u64, rest[0..n], 10) catch null;
+}
+
+/// What a row's answer must say once it was cancelled with `tokens` published: one terminal in the surface's own
+/// cancelled wording, never a token cap, and usage that counts those tokens (and the prompt, once one was computed).
+fn saysCancelled(row: CancelRow, answer: []const u8, tokens: usize, prompt_counted: bool) bool {
+    const count = std.mem.count;
+    const ok = switch (row.surface) {
+        .chat, .completions => count(u8, answer, "\"finish_reason\":\"") == 1 and
+            std.mem.indexOf(u8, answer, "\"finish_reason\":\"cancelled\"") != null and
+            lastNumber(answer, "\"completion_tokens\":") == tokens and
+            (!prompt_counted or lastNumber(answer, "\"prompt_tokens\":").? > 0) and
+            (!row.stream or count(u8, answer, "data: [DONE]") == 1),
+        .messages => count(u8, answer, "\"stop_reason\":\"") == 1 and
+            std.mem.indexOf(u8, answer, "\"stop_reason\":\"end_turn\"") != null and
+            lastNumber(answer, "\"output_tokens\":") == tokens and
+            (!prompt_counted or lastNumber(answer, "\"input_tokens\":").? + lastNumber(answer, "\"cache_read_input_tokens\":").? > 0) and
+            (!row.stream or count(u8, answer, "event: message_stop") == 1),
+        .responses, .ws => std.mem.indexOf(u8, answer, "max_output_tokens\"}") == null and
+            std.mem.indexOf(u8, answer, "\"incomplete_details\":null") != null and
+            lastNumber(answer, "\"output_tokens\":") == tokens and
+            (!prompt_counted or lastNumber(answer, "\"input_tokens\":").? + lastNumber(answer, "\"cached_tokens\":").? > 0) and
+            (!row.stream or count(u8, answer, "\"type\":\"response.completed\"") == 1) and
+            count(u8, answer, "\"type\":\"error\"") == 0,
+    };
+    if (!ok) {
+        std.debug.print("{s} {s} cancelled with {d} tokens published answered: {s}\n", .{ @tagName(row.surface), if (row.stream) "stream" else "non-stream", tokens, answer[answer.len -| 1200..] });
+    }
+    return ok;
+}
+
+fn cancelById(id: u64) !void {
+    var b: [64]u8 = undefined;
+    const c = try request("POST", "/v1/slots/cancel", try std.fmt.bufPrint(&b, "{{\"id\":{d}}}", .{id}));
+    defer gpa.free(c);
+    if (!std.mem.startsWith(u8, c, "HTTP/1.1 200")) return error.CancelMissed;
+}
+
+/// The blocker whose prefill the hold stands in, while the request under test decodes.
+const blocker_body = "{\"model\":\"tiny\",\"max_tokens\":1,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+
+test "server: a request cancelled before its first token or mid-reply ends on every surface in one terminal that says cancelled, with usage counting what it returned" {
+    try eachArch(4, .{ .long_replies = true }, struct {
+        fn run() !void {
+            gpa.free(try request("POST", "/v1/chat/completions", blocker_body));
+            try PrefillHold.install();
+            defer PrefillHold.uninstall();
+            var wrong: u32 = 0;
+            for ([_]bool{ true, false }) |queued| for (cancel_rows) |row| {
+                // The cancel lands while the inference thread stands in the blocker's prefill: before the request's
+                // first forward (queued behind it), or mid-reply between two tokens.
+                var blocked = Background{ .path = "/v1/chat/completions", .body = blocker_body };
+                var f = InFlight{ .row = row };
+                var blocker: ?std.Thread = null;
+                defer if (blocker) |t| {
+                    t.join();
+                    gpa.free(blocked.out);
+                };
+                defer PrefillHold.release();
+                errdefer if (f.fd >= 0) {
+                    _ = std.c.shutdown(f.fd, std.posix.SHUT.RDWR);
+                };
+                if (queued) {
+                    PrefillHold.arm();
+                    blocker = try std.Thread.spawn(.{}, Background.run, .{&blocked});
+                    try PrefillHold.waitHeld();
+                    f = try InFlight.start(row);
+                    try f.spawn();
+                    if (!within(20_000, pendingOne)) {
+                        dumpLists(@tagName(row.surface));
+                        return error.NeverQueued;
+                    }
+                } else {
+                    f = try InFlight.start(row);
+                    try f.spawn();
+                    if (!within(60_000, decodingWithTokens)) {
+                        dumpLists(@tagName(row.surface));
+                        return error.NeverDecoded;
+                    }
+                    PrefillHold.arm();
+                    blocker = try std.Thread.spawn(.{}, Background.run, .{&blocked});
+                    try PrefillHold.waitHeld();
+                }
+                const seen = (if (queued) onlySlot("pending") else onlySlot("decoding")) orelse return error.NoSlotHeld;
+                if (seen.ended) return error.EndedBeforeTheCancel;
+                try cancelById(seen.id);
+                PrefillHold.release();
+                const answer = try f.finish();
+                defer gpa.free(answer);
+                if (!saysCancelled(row, answer, seen.tokens, !queued)) wrong += 1;
+            };
+            if (wrong > 0) return error.CancelMisreported;
+        }
+    }.run);
+}
+
+var decoding_want: usize = 0;
+
+/// `decoding_want` slots decode, each with a token published.
+fn allDecoding() bool {
+    const sch = server_state.global_scheduler.?;
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    if (sch.decoding.items.len != decoding_want) return false;
+    for (sch.decoding.items) |s| {
+        s.out_mu.lockUncancelable(s.io);
+        defer s.out_mu.unlock(s.io);
+        if (s.out_buf.items.len == 0) return false;
+    }
+    return true;
+}
+
+fn draining() bool {
+    const sch = server_state.global_scheduler.?;
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    return sch.draining;
+}
+
+/// One terminal, the surface's error naming the shutdown; never a token cap.
+fn expectShutDown(row: CancelRow, answer: []const u8) !void {
+    const count = std.mem.count;
+    const says = std.mem.indexOf(u8, answer, http.shutting_down_message) != null;
+    const ok = says and switch (row.surface) {
+        .chat, .completions => count(u8, answer, "\"finish_reason\":\"") == 1 and
+            std.mem.indexOf(u8, answer, "\"finish_reason\":\"error\"") != null,
+        .messages => count(u8, answer, "event: error") == 1 and count(u8, answer, "\"stop_reason\":\"") == 0,
+        .responses, .ws => count(u8, answer, "\"type\":\"error\"") == 1 and count(u8, answer, "\"type\":\"response.completed\"") == 0 and
+            std.mem.indexOf(u8, answer, "max_output_tokens\"}") == null,
+    };
+    if (!ok) {
+        std.debug.print("{s} stream at a shutdown mid-reply answered: {s}\n", .{ @tagName(row.surface), answer[answer.len -| 1200..] });
+        return error.ShutdownMisreported;
+    }
+}
+
+test "server: a shutdown mid-reply ends the stream of every surface in one terminal error naming it, never a token cap" {
+    try eachArch(8, .{ .long_replies = true }, struct {
+        fn run() !void {
+            gpa.free(try request("POST", "/v1/chat/completions", blocker_body));
+            try PrefillHold.install();
+            defer PrefillHold.uninstall();
+            // The long replies first; the completion, which ends within its context, joins them last.
+            var flights: [5]InFlight = undefined;
+            var n: usize = 0;
+            // A test that fails before it reads lets the server's writes end, so serve's drain still ends.
+            errdefer for (flights[0..n]) |f| if (f.fd >= 0) {
+                _ = std.c.shutdown(f.fd, std.posix.SHUT.RDWR);
+            };
+            for ([_]bool{ false, true }) |short| {
+                for (cancel_rows) |row| if (row.stream and (row.surface == .completions) == short) {
+                    flights[n] = try InFlight.start(row);
+                    n += 1;
+                };
+                decoding_want = n;
+                if (!within(60_000, allDecoding)) {
+                    dumpLists("shutdown");
+                    return error.NeverDecoded;
+                }
+            }
+            var blocked = Background{ .path = "/v1/chat/completions", .body = blocker_body };
+            PrefillHold.arm();
+            const blocker = try std.Thread.spawn(.{}, Background.run, .{&blocked});
+            defer {
+                blocker.join();
+                gpa.free(blocked.out);
+            }
+            defer PrefillHold.release();
+            try PrefillHold.waitHeld();
+            if (!allDecoding()) return error.EndedBeforeTheShutdown;
+            server.requestShutdown();
+            if (!within(10_000, draining)) return error.NeverDrained;
+            PrefillHold.release();
+            for (flights[0..n]) |*f| {
+                const answer = try f.finish();
+                defer gpa.free(answer);
+                try expectShutDown(f.row, answer);
+            }
         }
     }.run);
 }
