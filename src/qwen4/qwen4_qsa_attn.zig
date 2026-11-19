@@ -6,6 +6,7 @@ const attn_kernels = @import("../attn_kernels.zig");
 const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const std = @import("std");
+const chip = @import("../chip.zig");
 const mlx = @import("../mlx.zig");
 const kv_quant = @import("../kv_quant.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
@@ -56,10 +57,19 @@ const splitKAttnDispatch = trunk_mod.splitKAttnDispatch;
 const splitMaskedSdpa256 = qwen4_forward.splitMaskedSdpa256;
 const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
 
-/// Measured split count (M5 Max, qwen4_exp, kv 62k, 8-bit KV, 12 counterbalanced boots):
-/// every count 8..64 beats the union gather by 5-13%, only S=6's 16-vs-32 clears the noise
-/// floor, so one flat constant. The un-split kernel (12 threadgroups at S=6) ran +15.6%.
+/// Measured split count for a GPU with matrix units (M5 Max, qwen4_exp, kv 62k, 8-bit KV,
+/// 12 counterbalanced boots): every count 8..64 beats the union gather by 5-13%, only S=6's
+/// 16-vs-32 clears the noise floor, so one flat constant. The un-split kernel (12 threadgroups
+/// at S=6) ran +15.6%.
 pub const QSA_ATTN_NSPLIT_DEFAULT: c_int = 16;
+
+/// The M1 Max row (2026-11-19, `applegpu_g13s`, 32 GPU cores, no matrix units). 16 splits at
+/// S=1 launch 32 threadgroups — one wave on 32 cores — and the split pass measures 188.5 us a
+/// call at kv 4096/32768; 64 splits launch 128 short groups (3 simdgroups each) and measure
+/// ~141-147 us, and the served 5.7k-token decode reads 34.6 tok/s against 33.7/32.0 for the
+/// default (MTP depth 2 pinned, same prompt, one boot per arm). BK stays 16: BK=8 exists in
+/// the seam but fails the kernel's launch check in 1.7.0.
+pub const QSA_ATTN_NSPLIT_M1_MAX: c_int = 64;
 
 /// Ceiling on the split count; past it the f32 partial buffer costs more traffic than it buys.
 pub const QSA_ATTN_MAX_NSPLIT: c_int = 64;
@@ -67,19 +77,28 @@ pub const QSA_ATTN_MAX_NSPLIT: c_int = 64;
 /// Test and microbench seam: forces the split count.
 pub var qsa_attn_nsplit_override: ?c_int = null;
 
-/// Resolve every lazily-cached QSA env read once, from the main thread, before any other
+/// Per-silicon row, resolved in `warmQsaEnvCaches` before any other thread exists.
+var qsa_attn_m1_max_row: ?bool = null;
+
+/// Rounds a requested split count up to a power of two no higher than the ceiling.
+pub fn qsaAttnSplitCount(requested: c_int) c_int {
+    var f: c_int = 1;
+    while (f < requested and f < QSA_ATTN_MAX_NSPLIT) f *= 2;
+    return f;
+}
+
+/// Resolve every lazily-cached QSA machine read once, from the main thread, before any other
 /// thread exists: first touch of a `?bool`/`?c_int` from two threads is a race.
 pub fn warmQsaEnvCaches() void {
+    qsa_attn_m1_max_row = std.mem.indexOf(u8, chip.chipBrand(), "M1 Max") != null;
     _ = qsaScoreSheetBudget();
 }
 
 pub fn qsaAttnNSplit() c_int {
-    const forced = qsa_attn_nsplit_override orelse 0;
-    if (forced > 0) {
-        var f: c_int = 1;
-        while (f < forced and f < QSA_ATTN_MAX_NSPLIT) f *= 2;
-        return f;
+    if (qsa_attn_nsplit_override) |forced| {
+        if (forced > 0) return qsaAttnSplitCount(forced);
     }
+    if (qsa_attn_m1_max_row orelse false) return QSA_ATTN_NSPLIT_M1_MAX;
     return QSA_ATTN_NSPLIT_DEFAULT;
 }
 
@@ -2410,7 +2429,9 @@ test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 
 
 test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor binds the DISPATCH" {
     defer qsa_attn_nsplit_override = null;
+    defer qsa_attn_m1_max_row = null;
     qsa_attn_nsplit_override = null;
+    qsa_attn_m1_max_row = null;
     try std.testing.expectEqual(QSA_ATTN_NSPLIT_DEFAULT, qsaAttnNSplit());
     try std.testing.expectEqual(@as(c_int, 16), QSA_ATTN_NSPLIT_DEFAULT);
     qsa_attn_nsplit_override = 8;
@@ -2419,6 +2440,18 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit());
     qsa_attn_nsplit_override = 1000;
     try std.testing.expectEqual(QSA_ATTN_MAX_NSPLIT, qsaAttnNSplit());
+    qsa_attn_nsplit_override = null;
+
+    try std.testing.expectEqual(@as(c_int, 8), qsaAttnSplitCount(5));
+    try std.testing.expectEqual(@as(c_int, 64), qsaAttnSplitCount(64));
+    try std.testing.expectEqual(QSA_ATTN_MAX_NSPLIT, qsaAttnSplitCount(1000));
+
+    qsa_attn_m1_max_row = true;
+    try std.testing.expectEqual(QSA_ATTN_NSPLIT_M1_MAX, qsaAttnNSplit());
+    qsa_attn_m1_max_row = false;
+    try std.testing.expectEqual(QSA_ATTN_NSPLIT_DEFAULT, qsaAttnNSplit());
+    qsa_attn_nsplit_override = 8;
+    try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit());
     qsa_attn_nsplit_override = null;
 
     defer qsa_attn_bk_override = null;
