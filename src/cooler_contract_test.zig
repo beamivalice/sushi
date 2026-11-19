@@ -3837,7 +3837,7 @@ const PartialShare = struct {
 fn takeoverAtRest(hc: *const @import("prefix_cache.zig").HotPrefixCache) bool {
     var sum: u64 = 0;
     for (hc.entries.items) |*e| {
-        if (e.checked_out_by != null) return false;
+        if (e.checkout != null) return false;
         sum += e.kv_bytes;
     }
     return sum == hc.current_kv_bytes;
@@ -4108,6 +4108,67 @@ test "cooler contract: a served speculative Qwen conversation of takeovers, part
             defer taken.deinit(a);
             try conversation(&ld, dir, ids, true, &taken);
             try testing.expectEqualSlices(u32, shared.items, taken.items);
+        }
+    }.run);
+}
+
+test "cooler contract: a served Qwen partial takeover refused before it donates leaves no cut on the entry, so the next turn takes the entry whole and keeps its restore points" {
+    try qwenTinyServed(struct {
+        /// Admission that refuses every warm request, taken over or shared.
+        fn fitsNoWarm(_: *const @import("model.zig").ModelConfig, _: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, _: u64, _: bool, _: bool, _: @import("scheduler.zig").CheckpointPlan) bool {
+            return matched == 0;
+        }
+
+        /// The #109 conversation, (its turn 3 taken over and then refused), and a turn 4 that extends turn 2's entry:
+        /// the restore points of the entry turn 4 leaves.
+        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, refused_turn: bool, out: *std.ArrayList(usize)) !void {
+            const a = testing.allocator;
+            var sv: Served = undefined;
+            try sv.initTiers(ld, dir, 1 << 30);
+            defer sv.deinit();
+            sv.quiet_failures = true;
+            var c = try PartialShare.serve(&sv, ids, 200);
+            defer c.deinit();
+            const hc = &sv.entry.prefix_cache.?;
+            if (refused_turn) {
+                const fits_was = Served.scheduler.prefill_admission_fits;
+                defer Served.scheduler.prefill_admission_fits = fits_was;
+                Served.scheduler.prefill_admission_fits = fitsNoWarm;
+                _ = try sv.requestToCleanup(c.third.items, 16, false);
+                // Refused before its append donated: turn 2's entry is back, whole.
+                try testing.expect(takeoverAtRest(hc));
+                var whole = false;
+                for (hc.entries.items) |*e| whole = whole or std.mem.eql(u32, e.tokens, c.entry.items);
+                try testing.expect(whole);
+            }
+            var fourth: std.ArrayList(u32) = .empty;
+            defer fourth.deinit(a);
+            try fourth.appendSlice(a, c.entry.items);
+            var said = try heldPrompt(a, ids, 1500, 5);
+            defer said.deinit(a);
+            try fourth.appendSlice(a, said.items);
+            var f: u32 = 0;
+            var got = try sv.request(fourth.items, 16, &f);
+            defer got.deinit(a);
+            for (hc.entries.items) |*e| {
+                if (e.tokens.len < fourth.items.len) continue;
+                if (e.ssm_checkpoints) |cps| for (cps) |*cp| try out.append(a, cp.pos);
+            }
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var clean: std.ArrayList(usize) = .empty;
+            defer clean.deinit(a);
+            var after_refusal: std.ArrayList(usize) = .empty;
+            defer after_refusal.deinit(a);
+            try conversation(&ld, dir, ids, false, &clean);
+            try conversation(&ld, dir, ids, true, &after_refusal);
+            try testing.expect(clean.items.len > 0);
+            try testing.expectEqualSlices(usize, clean.items, after_refusal.items);
         }
     }.run);
 }

@@ -1589,7 +1589,7 @@ test "HotPrefixCache: a hybrid full-prefix extend checks out under SSD-first" {
     const r = try hc.lookupAndRestoreForSlot(&slot, &moe_off, &target, s, &prompt, false, 0, null, null, null, 0xA11CE);
     try testing.expect(r.matched > 0);
     try testing.expect(r.checked_out);
-    try testing.expectEqual(@as(?usize, 0xA11CE), hc.entries.items[0].checked_out_by);
+    try testing.expectEqual(@as(usize, 0xA11CE), hc.entries.items[0].checkout.?.slot);
 }
 
 test "HotPrefixCache: walk-down restores the higher covering checkpoint, not a lower one" {

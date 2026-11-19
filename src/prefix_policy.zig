@@ -187,20 +187,20 @@ pub const BestMatch = struct {
 /// Workload-fair: only entries of the `cache_key` holding the most eligible entries
 /// (`incoming_key` counts as one more) are candidates, so a sweep evicts its own
 /// documents before another workload's conversation. One key = plain LRU.
-/// `E` carries `checked_out_by`, `cache_key` and `last_used`; a checked-out entry owns its buffers
+/// `E` carries `checkout`, `cache_key` and `last_used`; a checked-out entry owns its buffers
 /// (evicting it frees nothing) and is never a candidate.
 pub fn lruIndexExcluding(comptime E: type, entries: []const E, protect: ?u64, incoming_key: ?u64) ?usize {
     var best: ?usize = null;
     var best_used: u64 = std.math.maxInt(u64);
     var max_count: usize = 0;
     for (entries, 0..) |*e, i| {
-        if (e.checked_out_by != null) continue;
+        if (e.checkout != null) continue;
         if (protect) |p| {
             if (e.last_used == p) continue;
         }
         var count: usize = if (incoming_key != null and incoming_key.? == e.cache_key) 1 else 0;
         for (entries) |*o| {
-            if (o.checked_out_by != null or o.cache_key != e.cache_key) continue;
+            if (o.checkout != null or o.cache_key != e.cache_key) continue;
             if (protect) |p| {
                 if (o.last_used == p) continue;
             }
@@ -401,7 +401,7 @@ test "common prefix: capped at the shorter side" {
     try testing.expectEqual(@as(usize, 0), commonPrefixLen(&.{ 5 }, &.{ 6 }, 1));
 }
 
-const EntryStub = struct { checked_out_by: ?usize = null, cache_key: u64 = 0, last_used: u64 };
+const EntryStub = struct { checkout: ?usize = null, cache_key: u64 = 0, last_used: u64 };
 
 test "eviction order: the LRU of the key holding the most eligible entries goes" {
     const key_a: u64 = 0xa;
@@ -417,12 +417,12 @@ test "eviction order: the LRU of the key holding the most eligible entries goes"
     // The incoming key counts as one more: A (1 + 1) still loses to B (3 + 0).
     try testing.expectEqual(@as(?usize, 1), lruIndexExcluding(EntryStub, &entries, null, key_a));
     try testing.expectEqual(@as(?usize, 2), lruIndexExcluding(EntryStub, &entries, 2, key_b));
-    entries[1].checked_out_by = 7;
+    entries[1].checkout = 7;
     try testing.expectEqual(@as(?usize, 2), lruIndexExcluding(EntryStub, &entries, null, key_b));
-    entries[1].checked_out_by = null;
+    entries[1].checkout = null;
     for (&entries) |*e| e.cache_key = 0;
     try testing.expectEqual(@as(?usize, 0), lruIndexExcluding(EntryStub, &entries, null, 0));
-    for (&entries) |*e| e.checked_out_by = 1;
+    for (&entries) |*e| e.checkout = 1;
     try testing.expectEqual(@as(?usize, null), lruIndexExcluding(EntryStub, &entries, null, null));
 }
 

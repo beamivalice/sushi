@@ -899,6 +899,10 @@ process start whatever turns `--metrics` on.
 - **A checkout is a PROMISE until the append DONATES** (`donateCheckout` right before `Generator.initWithOptions`,
   below every refusal; `releaseCheckout` hands an undonated entry back intact). The donation also frees the record's
   MTP and DFlash history: the slot restored its own, and nothing reads a checked-out record.
+- **A checkout is one value with one owner** (`Entry.checkout`: the slot, `whole` or `partial` with its keep, the
+  bytes donated): a take begins it (`beginCheckout`), only `donateCheckout` advances it, and only the release, the
+  replacing commit or eviction ends it, so no piece of one take outlives it; lint `entry-checkout` refuses any other
+  writer. A whole take and a partial one keep separate rules (`wholeTakeEligible`, `partialTakeEligible`).
 - **Off SSD-first, a warm share that does not fit is taken over, not refused** (`checkoutRestored`, qwen4_exp's
   admission pass): a full-entry hit is checked out on demand and billed as donated. The tradeoff: a request that
   fails after donating loses the entry. A partial hit is taken over too (a long conversation's next turn re-renders

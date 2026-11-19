@@ -309,6 +309,23 @@ printf '%s\n' 'fn arraysStream(self: *const C) mlx.mlx_stream {' '    return sel
 printf '%s\n' 'fn other() void {' '    _ = mlx.gpuStream();' '}' > "$TMP/t/src/model.zig"
 expect_green "arraysStream's fallback, a test and a fn only tests reach, and a file outside the caches"
 
+# rule entry-checkout
+tree
+printf '%s\n' 'fn refuse(e: *Entry) void {' '    e.checkout = null;' '}' > "$TMP/t/src/scheduler.zig"
+expect_red "an entry's checkout cleared outside the hot cache" "src/scheduler.zig:2:7 \[entry-checkout\] refuse: an entry's checkout written by hand"
+
+tree
+printf '%s\n' 'fn retake(e: *Entry) void {' '    if (e.checkout) |*c| c.slot = 1;' '}' 'fn redonate(e: *Entry) void {' '    e.checkout.?.donated = 4;' '}' > "$TMP/t/src/prefix_cache.zig"
+expect_red "a checkout written through a capture" "src/prefix_cache.zig:2:11 \[entry-checkout\] retake"
+expect_red "a checkout written through .?" "src/prefix_cache.zig:5:7 \[entry-checkout\] redonate"
+
+tree
+printf '%s\n' 'fn beginCheckout(e: *Entry) void {' '    e.checkout = .{ .slot = 1, .kind = .whole };' '}' 'fn donateCheckout(e: *Entry) void {' '    if (e.checkout) |*c| c.donated = 4;' '}' \
+  'fn endCheckout(e: *Entry) void {' '    e.checkout = null;' '}' 'fn held(e: *const Entry) bool {' '    return e.checkout != null and e.checkout.?.slot == 1;' '}' \
+  'fn stub(e: *Entry) void {' '    e.checkout = null;' '}' 'test "t" {' '    stub(undefined);' '}' > "$TMP/t/src/prefix_cache.zig"
+printf '%s\n' 'test "t" {' '    e.checkout = null;' '}' > "$TMP/t/src/scheduler.zig"
+expect_green "the hot cache's checkout calls, a read, a test and a fn only tests reach"
+
 # rule cooler-side-query
 tree
 printf '%s\n' 'fn side(c: *const C) bool {' '    return c.cooler_ask == .none;' '}' > "$TMP/t/src/p.zig"

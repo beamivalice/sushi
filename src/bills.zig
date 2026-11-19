@@ -1929,7 +1929,7 @@ pub const WarmPrefix = struct {
     /// Tokens of capacity the restored buffers hold (`KVCache.residentCapacityTokens`). The
     /// connection thread passes 0 and defers the warm decision to the inference thread.
     capacity_tokens: u64 = 0,
-    /// Did the restore check out its entry (`prefix_cache.checkoutEligible`)? A shared restore
+    /// Did the restore check out its entry (`prefix_cache.upFrontTakeEligible`, or `checkoutRestored`)? A shared restore
     /// is copied whole by the first append, so crediting it is an under-bill.
     will_donate: bool = false,
     mtp_on: bool = false,
@@ -3194,7 +3194,7 @@ pub fn adaptCapFor(cfg: *const model_mod.ModelConfig, seq: u64) u32 {
     return widthForRung(cfg, seq, PREFILL_CHUNK_LADDER[0]);
 }
 
-/// The live 768k scenario's checkout inputs, as `prefix_cache.checkoutEligible` takes them.
+/// The live 768k scenario's checkout inputs, as the SSD-first lookup's up-front take reads them.
 pub const CheckoutCase = struct {
     ssd_first: bool = true,
     move_enabled: bool = true,
@@ -3209,15 +3209,14 @@ pub const CheckoutCase = struct {
         return .{
             .matched_tokens = matched,
             .capacity_tokens = capacity,
-            .will_donate = prefix_cache_mod.HotPrefixCache.checkoutEligible(
+            .will_donate = prefix_cache_mod.HotPrefixCache.upFrontTakeEligible(
                 self.ssd_first,
+                self.has_slot,
                 self.move_enabled,
                 self.pending_disk,
                 self.entry_tokens,
                 self.shared,
                 self.prompt_len,
-                self.has_slot,
-                false,
             ),
         };
     }

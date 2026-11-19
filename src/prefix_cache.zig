@@ -163,7 +163,7 @@ pub const LookupResult = struct {
     /// without this every reused prefix drafts against an empty history
     /// (measured on echo: ~70 → ~38 tok/s on warm repeats).
     mtp_base: ?usize = null,
-    /// Did this restore check out its entry (`checkoutEligible`)? Only then does the first
+    /// Did this restore check out its entry (`upFrontTakeEligible`)? Only then does the first
     /// append donate in place; every other restore is a refcount share copied by that append.
     checked_out: bool = false,
     /// Did an SSD restore fill buffers the slot owns outright (`restoreKvInto`)?
@@ -422,18 +422,27 @@ pub const Entry = struct {
     /// ascending by `step`, billed in `kv_bytes`: the prompt end, which a long reply carries the
     /// ring past, and those inherited from the entry this prompt forked off (`bestRingDonor`).
     ring_cps: ?[]KVCacheSnapshot = null,
-    /// Restore by move: the slot that took ownership of this entry's KV buffers (`KVCache.adopt`).
-    /// While set the snapshot holds empty handles and the entry is invisible to every other
-    /// reader. Cleared by the commit that replaces it; dropped at slot end otherwise.
-    checked_out_by: ?usize = null,
-    /// Has the slot's append donated these buffers in place (`donateCheckout`)? Until then the
-    /// entry's handles are live and a slot that ends hands the entry back; only a donated checkout is dropped.
-    checkout_donated: bool = false,
-    /// Snapshot bytes the donation handed the slot; `kv_bytes` keeps billing them until release.
-    donated_bytes: u64 = 0,
-    /// A partial share taken over: the tokens the restoring prompt shares with this entry. The donation keeps only
-    /// them, so the turn's commit replaces this entry as it replaces a whole one. Zero for a whole-entry checkout.
-    checkout_keep: usize = 0,
+    /// Restore by move: the slot that took this entry's buffers. While set the entry is invisible to every other reader.
+    checkout: ?Checkout = null,
+};
+
+/// Restore by move, one slot's take of an entry's KV buffers (`KVCache.adopt`). Begun only by a checkout call
+/// (`beginCheckout`), advanced only by `donateCheckout`, and ended only by `endCheckout` (the slot's release, the
+/// commit that replaces the entry) or the entry's eviction: lint `entry-checkout` refuses any other writer.
+pub const Checkout = struct {
+    slot: usize,
+    kind: Kind,
+    /// Snapshot bytes the slot's append took in place, which `kv_bytes` bills until the release; null until it
+    /// donates, and while null the entry's handles are live and a slot that ends hands the entry back intact.
+    donated: ?u64 = null,
+
+    pub const Kind = union(enum) {
+        /// A full-prefix hit: the turn's commit replaces the entry.
+        whole,
+        /// A partial share: the tokens the prompt shares with the entry, all the donation keeps, so the turn's commit
+        /// replaces the entry as it replaces a whole one.
+        partial: usize,
+    };
 };
 
 /// Where a hybrid restore puts its recurrent state: the slot's SSM entries, or the state an arch owns.
@@ -1209,7 +1218,7 @@ pub const HotPrefixCache = struct {
         var best: prefix_policy.BestMatch = .{};
         for (self.entries.items, 0..) |*e, i| {
             // A checked-out entry's buffers belong to another slot; its snapshot is empty.
-            if (e.checked_out_by != null) continue;
+            if (e.checkout != null) continue;
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
 
@@ -1792,25 +1801,36 @@ pub const HotPrefixCache = struct {
         return res;
     }
 
-    /// Restore by move, the decision. A whole take needs a full-prefix hit (the commit's replace path lands on this same
-    /// entry) and a prompt that appends past it. A `partial` take keeps only the shared prefix at donation and its slot
-    /// appends from a restore point at or below the share, so it needs only a share, whatever the prompt's length.
-    pub fn checkoutEligible(
-        ssd_first: bool,
-        move_enabled: bool,
-        pending_disk: bool,
-        entry_tokens: usize,
-        shared: usize,
-        prompt_len: usize,
-        has_slot: bool,
-        partial: bool,
-    ) bool {
-        if (!ssd_first or !move_enabled or !has_slot) return false;
-        // The pending disk record shares the same buffers, so a checkout could not donate anyway.
-        if (pending_disk) return false;
-        if (partial) return shared > 0;
-        if (entry_tokens == 0 or shared != entry_tokens) return false;
-        return prompt_len > shared;
+    /// Restore by move, a whole take: a full-prefix hit (the commit's replace path lands on this same entry) and a
+    /// prompt that appends past it.
+    pub fn wholeTakeEligible(entry_tokens: usize, shared: usize, prompt_len: usize) bool {
+        return entry_tokens > 0 and shared == entry_tokens and prompt_len > shared;
+    }
+
+    /// A partial take keeps only the shared prefix at donation and its slot appends from a restore point at or below
+    /// the share, so it needs only a share, whatever the prompt's length. A ringed entry's restore points are
+    /// snapshots past any prefix cut: it is taken whole only.
+    pub fn partialTakeEligible(entry_tokens: usize, shared: usize, ringed: bool) bool {
+        return shared > 0 and shared < entry_tokens and !ringed;
+    }
+
+    /// Can a slot take any entry over? A pending disk record shares the buffers, so its append could not donate.
+    pub fn movable(move_enabled: bool, pending_disk: bool) bool {
+        return move_enabled and !pending_disk;
+    }
+
+    /// The SSD-first lookup's take, made up front: a whole take, for a slot.
+    pub fn upFrontTakeEligible(ssd_first: bool, has_slot: bool, move_enabled: bool, pending_disk: bool, entry_tokens: usize, shared: usize, prompt_len: usize) bool {
+        return ssd_first and has_slot and movable(move_enabled, pending_disk) and wholeTakeEligible(entry_tokens, shared, prompt_len);
+    }
+
+    fn beginCheckout(e: *Entry, slot_id: usize, kind: Checkout.Kind) void {
+        std.debug.assert(e.checkout == null);
+        e.checkout = .{ .slot = slot_id, .kind = kind };
+    }
+
+    fn endCheckout(e: *Entry) void {
+        e.checkout = null;
     }
 
     /// Take the checkout: mark the entry as this slot's; `donateCheckout` releases the handles
@@ -1818,17 +1838,8 @@ pub const HotPrefixCache = struct {
     /// admission bill's input).
     fn checkoutIfEligible(self: *HotPrefixCache, idx: usize, shared: usize, prompt_len: usize, slot_id: ?usize) bool {
         const e = &self.entries.items[idx];
-        if (!checkoutEligible(
-            self.ssd_first,
-            restoreMoveEnabled(),
-            self.pending_disk != null,
-            e.tokens.len,
-            shared,
-            prompt_len,
-            slot_id != null,
-            false,
-        )) return false;
-        e.checked_out_by = slot_id;
+        if (!upFrontTakeEligible(self.ssd_first, slot_id != null, restoreMoveEnabled(), self.pending_disk != null, e.tokens.len, shared, prompt_len)) return false;
+        beginCheckout(e, slot_id.?, .whole);
         log.info("  [hot-cache] checked out {d}-token entry to the slot (restore by move; the append donates in place)\n", .{e.tokens.len});
         return true;
     }
@@ -1836,19 +1847,22 @@ pub const HotPrefixCache = struct {
     /// Restore by move on demand: the admission pass found this slot's share does not fit (its first
     /// append copies the prefix). Takes, on the entry the slot just restored, the checkout
     /// `checkoutIfEligible` takes up front in SSD-first mode.
-    /// With `partial` a partial share qualifies too, keeping only the shared prefix at donation (#109): the caller asks
-    /// for it only once evicting the other entries left no room, since it drops what the entry held past the share.
+    /// With `partial_ok` a partial share qualifies too, keeping only the shared prefix at donation (#109): the caller
+    /// asks for it only once evicting the other entries left no room, since it drops what the entry held past the share.
     pub fn checkoutRestored(self: *HotPrefixCache, slot_id: usize, prompt_len: usize, partial_ok: bool) bool {
         const used = self.last_restored_used orelse return false;
+        if (!movable(restoreMoveEnabled(), self.pending_disk != null)) return false;
         for (self.entries.items) |*e| {
             if (e.last_used != used) continue;
-            if (e.checked_out_by != null) return false;
+            if (e.checkout != null) return false;
             const shared = @min(self.last_restored_shared, e.tokens.len);
-            // A ringed entry's restore points are snapshots past any prefix cut; it is taken over whole only.
-            const partial = partial_ok and shared < e.tokens.len and shared > 0 and e.ring_cps == null;
-            if (!checkoutEligible(true, restoreMoveEnabled(), self.pending_disk != null, e.tokens.len, shared, prompt_len, true, partial)) return false;
-            e.checked_out_by = slot_id;
-            e.checkout_keep = if (partial) shared else 0;
+            const kind: Checkout.Kind = if (wholeTakeEligible(e.tokens.len, shared, prompt_len))
+                .whole
+            else if (partial_ok and partialTakeEligible(e.tokens.len, shared, e.ring_cps != null))
+                .{ .partial = shared }
+            else
+                return false;
+            beginCheckout(e, slot_id, kind);
             log.info("  [hot-cache] checked out {d}-token entry to the slot (the share of {d} does not fit; the append donates in place)\n", .{ e.tokens.len, shared });
             return true;
         }
@@ -1861,12 +1875,11 @@ pub const HotPrefixCache = struct {
     /// restore time threw away a 364k session for a request that never ran. Idempotent.
     pub fn donateCheckout(self: *HotPrefixCache, slot_id: usize) void {
         for (self.entries.items) |*e| {
-            if (e.checked_out_by != slot_id) continue;
-            if (e.checkout_donated) continue;
-            e.donated_bytes = snapshotBytes(&e.snapshot) + e.rows_bytes;
+            const c = if (e.checkout) |*taken| taken else continue;
+            if (c.slot != slot_id or c.donated != null) continue;
+            c.donated = snapshotBytes(&e.snapshot) + e.rows_bytes;
             e.snapshot.releaseHandles();
             if (e.rows) |*rows| rows.releaseHandles();
-            e.checkout_donated = true;
             // The slot restored its draft-side history already; nothing reads a checked-out record's copy.
             const draft = e.dflash_bytes + e.mtp_bytes;
             if (e.dflash) |*d| d.deinit();
@@ -1877,16 +1890,17 @@ pub const HotPrefixCache = struct {
             e.mtp_bytes = 0;
             e.kv_bytes -|= draft;
             self.current_kv_bytes -|= draft;
-            if (e.checkout_keep > 0) self.keepTakenPrefix(e);
+            switch (c.kind) {
+                .whole => {},
+                .partial => |keep| self.keepTakenPrefix(e, keep),
+            }
         }
     }
 
     /// A partial takeover's record keeps only the prefix its prompt shares, and the checkpoints inside it: the rest
     /// describes a text the slot is overwriting. Where that cut fails the record stays whole, and the turn's commit
     /// lands beside it as a new entry until the slot's release drops the record.
-    fn keepTakenPrefix(self: *HotPrefixCache, e: *Entry) void {
-        const keep = e.checkout_keep;
-        e.checkout_keep = 0;
+    fn keepTakenPrefix(self: *HotPrefixCache, e: *Entry, keep: usize) void {
         if (keep >= e.tokens.len) return;
         const tokens = self.allocator.dupe(u32, e.tokens[0..keep]) catch return;
         if (e.ssm_checkpoints) |cps| {
@@ -1910,7 +1924,8 @@ pub const HotPrefixCache = struct {
     pub fn donatedBytes(self: *const HotPrefixCache, slot_id: usize) u64 {
         var total: u64 = 0;
         for (self.entries.items) |*e| {
-            if (e.checked_out_by == slot_id and e.checkout_donated) total += e.donated_bytes;
+            const c = e.checkout orelse continue;
+            if (c.slot == slot_id) total += c.donated orelse 0;
         }
         return total;
     }
@@ -1923,17 +1938,16 @@ pub const HotPrefixCache = struct {
         while (i > 0) {
             i -= 1;
             const e = &self.entries.items[i];
-            if (e.checked_out_by != slot_id) continue;
+            const c = e.checkout orelse continue;
+            if (c.slot != slot_id) continue;
             const tokens_len = e.tokens.len;
-            if (!e.checkout_donated) {
+            endCheckout(e);
+            if (c.donated == null) {
                 // Nothing was handed over; only the mark is undone (no LRU bump for a request that never ran).
-                e.checked_out_by = null;
                 log.info("  [hot-cache] checked-out entry returned intact: {s} ({d} tokens; the append never ran)\n", .{ reason, tokens_len });
                 continue;
             }
-            // Clear the mark before `evictAt`; the snapshot is already empty.
-            e.checked_out_by = null;
-            e.checkout_donated = false;
+            // The snapshot is already empty.
             self.evictAt(i, "checked-out entry dropped");
             log.info("  [hot-cache] checked-out entry dropped: {s} ({d} tokens; its KV died with the slot)\n", .{ reason, tokens_len });
         }
@@ -2205,7 +2219,7 @@ pub const HotPrefixCache = struct {
                 // re-copy an identical multi-GB prefix every turn.
                 if (replace_idx) |idx| {
                     // ...unless the entry is checked out: its snapshot is empty, so fall through to the trim/replace.
-                    if (self.entries.items[idx].checked_out_by == null and
+                    if (self.entries.items[idx].checkout == null and
                         self.entries.items[idx].tokens.len >= tl)
                     {
                         // The resident entry already covers the trim target;
@@ -2534,8 +2548,7 @@ pub const HotPrefixCache = struct {
             e.mtp = new_mtp;
             e.mtp_bytes = new_mtp_bytes;
             // Restore by move: the replacement the checkout promised; the entry is whole again.
-            e.checked_out_by = null;
-            e.checkout_donated = false;
+            endCheckout(e);
             e.last_used = self.bumpCounter();
             self.current_kv_bytes += e.kv_bytes;
             // Inherited SSM checkpoints can make a replacement larger than
@@ -2859,7 +2872,7 @@ pub const HotPrefixCache = struct {
             e.spill_durable = false;
             if (e.last_used == newest_used) continue; // the active session
             // Checked out: the bytes are the slot's, the snapshot is empty. Skipped before the allowance count.
-            if (e.checked_out_by != null) continue;
+            if (e.checkout != null) continue;
             // Counted against the allowance before the vision skip: it occupies RAM either way.
             idle_bytes +|= e.kv_bytes;
             // Vision entries never spill: a token-only disk key is ambiguous.
@@ -2939,7 +2952,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items, 0..) |*e, i| {
             if (e.last_used == newest_used) continue;
             if (e.vision_key != 0) continue;
-            if (e.checked_out_by != null) continue;
+            if (e.checkout != null) continue;
             if (durable_only and !e.spill_durable) continue;
             if (e.last_used < best_used) {
                 best_used = e.last_used;
@@ -3052,7 +3065,7 @@ pub const HotPrefixCache = struct {
         if (!self.ram_enabled) return;
         const d = if (self.disk) |*dd| dd else return;
         for (self.entries.items) |*e| {
-            if (e.checked_out_by != null) continue;
+            if (e.checkout != null) continue;
             const cps = e.ring_cps orelse continue;
             if (cps.len <= RING_CHECKPOINT_RAM_KEEP) continue;
             const older = cps.len - RING_CHECKPOINT_RAM_KEEP;
@@ -3915,7 +3928,7 @@ pub const HotPrefixCache = struct {
         // A checked-out entry is neither restorable nor evictable; it comes off the base.
         var checked_out: u64 = 0;
         for (self.entries.items) |*e| {
-            if (e.checked_out_by != null) {
+            if (e.checkout != null) {
                 checked_out += e.kv_bytes;
                 continue;
             }
@@ -3951,7 +3964,7 @@ pub const HotPrefixCache = struct {
         var out = std.ArrayList(EntryDigest).empty;
         errdefer out.deinit(allocator);
         for (self.entries.items) |*e| {
-            if (e.checked_out_by != null) continue;
+            if (e.checkout != null) continue;
             const fp = prefixFingerprint(e.tokens) orelse continue;
             try out.append(allocator, .{
                 .fingerprint = fp,
@@ -3985,7 +3998,7 @@ pub const HotPrefixCache = struct {
         var pinned: u64 = 0;
         var checked_out: u64 = 0;
         for (self.entries.items) |*e| {
-            if (e.checked_out_by != null) {
+            if (e.checkout != null) {
                 checked_out += e.kv_bytes;
                 continue;
             }
@@ -7623,7 +7636,7 @@ test "HotPrefixCache: a checked-out entry is neither trimmed nor evicted for roo
 
     try testing.expectEqual(@as(usize, 3), hc.entryCount());
     try testing.expectEqual(@as(usize, 4), hc.entries.items[0].tokens.len);
-    try testing.expect(hc.entries.items[0].checked_out_by != null);
+    try testing.expect(hc.entries.items[0].checkout != null);
     try testing.expectEqual(@as(u64, 1000), hc.entries.items[0].kv_bytes);
     try testing.expectEqual(@as(usize, 512), hc.entries.items[1].tokens.len);
     try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
@@ -8604,7 +8617,7 @@ test "a 0-token outcome is not a restore: no LRU bump, no protection, and the en
     // checked out to another slot.
     try t.expect(hc.last_restored_used == null);
     try t.expectEqual(used_before, hc.entries.items[hybrid_idx].last_used);
-    try t.expectEqual(@as(?usize, null), hc.entries.items[hybrid_idx].checked_out_by);
+    try t.expect(hc.entries.items[hybrid_idx].checkout == null);
 
     // The admission pass takes the decoy first, then the entry that delivered nothing.
     const Fits = struct {
@@ -9875,7 +9888,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
 
         // The entry gave the buffers up: its handles are empty and it names the slot.
         const e = &hc.entries.items[0];
-        try testing.expectEqual(@as(?usize, 0xA11CE), e.checked_out_by);
+        try testing.expectEqual(@as(usize, 0xA11CE), e.checkout.?.slot);
         try testing.expect(e.snapshot.entries[0].keys.ctx == null);
         try testing.expect(e.snapshot.entries[0].values.ctx == null);
 
@@ -9903,7 +9916,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 0xA11CE);
         try testing.expectEqual(@as(usize, 600), res.matched);
         const e = &hc.entries.items[0];
-        try testing.expectEqual(@as(?usize, null), e.checked_out_by);
+        try testing.expect(e.checkout == null);
         try testing.expect(e.snapshot.entries[0].keys.ctx != null);
 
         slot.evalState();
@@ -9979,13 +9992,44 @@ test "restore by move ON DEMAND: a share that does not fit is taken over, off SS
     try testing.expectEqual(@as(usize, 600), res.matched);
     try testing.expect(!res.checked_out);
     try testing.expect(hc.checkoutRestored(7, prompt.len, false));
-    try testing.expectEqual(@as(?usize, 7), hc.entries.items[0].checked_out_by);
+    try testing.expectEqual(@as(usize, 7), hc.entries.items[0].checkout.?.slot);
     try testing.expect(!hc.checkoutRestored(7, prompt.len, true));
 
     hc.releaseCheckout(7, "prefill refused");
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
-    try testing.expectEqual(@as(?usize, null), hc.entries.items[0].checked_out_by);
+    try testing.expect(hc.entries.items[0].checkout == null);
     try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
+}
+
+test "restore by move: a partial take refused before it donates leaves no cut, so the next whole take keeps the whole entry" {
+    // The refused take's keep stayed on the entry and cut the next, whole, take's record to the old share.
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+    var diverged = prompt;
+    diverged[500] = 999_999;
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 4096);
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &diverged, false, 0, null, null, null, 7);
+    try testing.expect(hc.checkoutRestored(7, diverged.len, true));
+    hc.releaseCheckout(7, "prefill refused");
+
+    hc.ssd_first = true;
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 8);
+    try testing.expect(res.checked_out);
+    hc.donateCheckout(8);
+    try testing.expectEqual(@as(usize, 600), hc.entries.items[0].tokens.len);
+    hc.releaseCheckout(8, "finished");
 }
 
 test "restore by move: a partial-prefix hit keeps the refcount-share" {
@@ -10009,7 +10053,7 @@ test "restore by move: a partial-prefix hit keeps the refcount-share" {
     var moe_off: usize = 0;
     const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 7);
     try testing.expectEqual(@as(usize, 500), res.matched);
-    try testing.expectEqual(@as(?usize, null), hc.entries.items[0].checked_out_by);
+    try testing.expect(hc.entries.items[0].checkout == null);
     try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
 }
 
@@ -10041,14 +10085,14 @@ test "restore by move: a refusal BEFORE the append hands the entry back INTACT" 
 
     // The refusal: `runPrefill` returns before `Generator.initWithOptions`, so
     // `donateCheckout` never ran and the entry never gave its handles up.
-    try testing.expect(!hc.entries.items[0].checkout_donated);
+    try testing.expect(hc.entries.items[0].checkout.?.donated == null);
     hc.releaseCheckout(42, "prefill refused");
 
     // The entry is whole: same tokens, live handles, same bill, same LRU position, restorable.
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     const e = &hc.entries.items[0];
     try testing.expectEqual(@as(usize, 600), e.tokens.len);
-    try testing.expectEqual(@as(?usize, null), e.checked_out_by);
+    try testing.expect(e.checkout == null);
     try testing.expect(e.snapshot.entries[0].keys.ctx != null);
     try testing.expect(e.snapshot.entries[0].values.ctx != null);
     try testing.expectEqual(billed_before, hc.current_kv_bytes);
@@ -10087,7 +10131,7 @@ test "restore by move: a slot that ends without committing DROPS its checked-out
 
     // Admitted and about to write: the handles go over.
     hc.donateCheckout(42);
-    try testing.expect(hc.entries.items[0].checkout_donated);
+    try testing.expect(hc.entries.items[0].checkout.?.donated != null);
     try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx == null);
 
     hc.releaseCheckout(42, "cancelled");
@@ -10129,7 +10173,7 @@ test "restore by move ON DEMAND: a partial share taken over keeps the shared pre
     _ = try hc.commit(&slot, &prompt, false);
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     const e = &hc.entries.items[0];
-    try testing.expectEqual(@as(?usize, null), e.checked_out_by);
+    try testing.expect(e.checkout == null);
     try testing.expectEqualSlices(u32, &prompt, e.tokens);
     try testing.expect(e.snapshot.entries[0].keys.ctx != null);
     try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
@@ -10195,13 +10239,13 @@ test "restore by move: a commit RECLAIMS the checked-out entry with the grown bu
     defer slot.deinit();
     var moe_off: usize = 0;
     _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
-    try testing.expect(hc.entries.items[0].checked_out_by != null);
+    try testing.expect(hc.entries.items[0].checkout != null);
     try testWriteCacheLayer(&slot, s, 0, 600, 8);
 
     _ = try hc.commit(&slot, &prompt, false);
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     const e = &hc.entries.items[0];
-    try testing.expectEqual(@as(?usize, null), e.checked_out_by);
+    try testing.expect(e.checkout == null);
     try testing.expectEqual(@as(usize, 608), e.tokens.len);
     try testing.expect(e.snapshot.entries[0].keys.ctx != null);
     hc.releaseCheckout(42, "finished");
@@ -10244,7 +10288,7 @@ test "restore by move: a checked-out entry is invisible to a second slot, to evi
     try testing.expectEqual(@as(usize, 0), res2.matched);
     try testing.expect(!res2.full_match);
     try testing.expectEqual(@as(usize, 0), slot2.step);
-    try testing.expectEqual(@as(?usize, 42), hc.entries.items[0].checked_out_by);
+    try testing.expectEqual(@as(usize, 42), hc.entries.items[0].checkout.?.slot);
 
     // (d) nothing to reclaim, no digest to publish.
     const digests = try hc.digestsAlloc(testing.allocator);
@@ -10264,28 +10308,30 @@ test "restore by move: a checked-out entry is invisible to a second slot, to evi
     const report = hc.evictLruToAdmit(608, null, Never.fits, false);
     try testing.expectEqual(@as(usize, 0), report.entries);
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
-    try testing.expectEqual(@as(?usize, 42), hc.entries.items[0].checked_out_by);
+    try testing.expectEqual(@as(usize, 42), hc.entries.items[0].checkout.?.slot);
 
     hc.releaseCheckout(42, "test teardown");
 }
 
 test "restore by move: the policy is off outside the SSD-first arm and with the move forced off" {
-    // Eligible: SSD-first, enabled, no pending flush, whole entry matched, something to append.
-    try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 608, true, false));
-    try testing.expect(!HotPrefixCache.checkoutEligible(false, true, false, 600, 600, 608, true, false));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, false, false, 600, 600, 608, true, false));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 608, false, false));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, true, 600, 600, 608, true, false));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 500, 608, true, false));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 600, true, false));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 0, 0, 608, true, false));
-    // A partial take needs only a share to keep: a prompt shorter than the entry, or the share itself (a regenerate).
-    try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 500, 550, true, true));
-    try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 500, 608, true, true));
-    try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 500, 500, true, true));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 0, 550, true, true));
-    try testing.expect(!HotPrefixCache.checkoutEligible(false, true, false, 600, 500, 550, true, true));
-    try testing.expect(!HotPrefixCache.checkoutEligible(true, true, true, 600, 500, 550, true, true));
+    // The up-front take: SSD-first, a slot, the move on, no pending flush, the whole entry matched, something to append.
+    try testing.expect(HotPrefixCache.upFrontTakeEligible(true, true, true, false, 600, 600, 608));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(false, true, true, false, 600, 600, 608));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, false, false, 600, 600, 608));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, false, true, false, 600, 600, 608));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, true, 600, 600, 608));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, false, 600, 500, 608));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, false, 600, 600, 600));
+    try testing.expect(!HotPrefixCache.upFrontTakeEligible(true, true, true, false, 0, 0, 608));
+    // Any take, on demand too, needs the move on and no pending flush.
+    try testing.expect(HotPrefixCache.movable(true, false));
+    try testing.expect(!HotPrefixCache.movable(false, false));
+    try testing.expect(!HotPrefixCache.movable(true, true));
+    // A partial take needs only a share to keep, whatever the prompt's length, of an entry with no ring.
+    try testing.expect(HotPrefixCache.partialTakeEligible(600, 500, false));
+    try testing.expect(!HotPrefixCache.partialTakeEligible(600, 0, false));
+    try testing.expect(!HotPrefixCache.partialTakeEligible(600, 600, false));
+    try testing.expect(!HotPrefixCache.partialTakeEligible(600, 500, true));
 }
 
 /// The resident entry whose token record is exactly `toks`.
@@ -10481,7 +10527,7 @@ fn pcAppendCheckedOut(hc: *HotPrefixCache, tokens: []const u32, kv_bytes: u64, u
         .kv_bytes = kv_bytes,
         .ssm_checkpoints = null,
         .ssm_bytes = 0,
-        .checked_out_by = 1,
+        .checkout = .{ .slot = 1, .kind = .whole },
     });
     hc.current_kv_bytes += kv_bytes;
 }
@@ -10504,7 +10550,7 @@ test "HotPrefixCache: a commit whose only eviction candidates are checked out st
         try testFillCache(&cache, s, 3, fresh.len);
         try pcAppendCheckedOut(&hc, &held, 0, 1);
         _ = try hc.commit(&cache, &fresh, false);
-        try testing.expect(hc.entries.items[0].checked_out_by != null);
+        try testing.expect(hc.entries.items[0].checkout != null);
     }
 
     // Append byte budget: already over the cap, nothing reclaimable.
@@ -10516,7 +10562,7 @@ test "HotPrefixCache: a commit whose only eviction candidates are checked out st
         try testFillCache(&cache, s, 3, fresh.len);
         try pcAppendCheckedOut(&hc, &held, big, 1);
         _ = try hc.commit(&cache, &fresh, false);
-        try testing.expect(hc.entries.items[0].checked_out_by != null);
+        try testing.expect(hc.entries.items[0].checkout != null);
     }
 
     // Replace path: the target is evictable, the survivors are not.
@@ -10563,9 +10609,9 @@ test "HotPrefixCache: eviction picks the LRU of the key holding the most entries
     try testing.expectEqual(@as(?usize, 1), cache.lruIndexExcluding(null, null));
     // D1 protected / checked out: next LRU within B.
     try testing.expectEqual(@as(?usize, 2), cache.lruIndexExcluding(2, key_b));
-    cache.entries.items[1].checked_out_by = 7;
+    cache.entries.items[1].checkout = .{ .slot = 7, .kind = .whole };
     try testing.expectEqual(@as(?usize, 2), cache.lruIndexExcluding(null, key_b));
-    cache.entries.items[1].checked_out_by = null;
+    cache.entries.items[1].checkout = null;
     // One workload = plain LRU: C goes first.
     for (cache.entries.items) |*e| e.cache_key = 0;
     try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
@@ -10671,7 +10717,7 @@ fn testCheckedOutRetentionCap(max_entries: u32, max_bytes: u64) !void {
     try testing.expect(!retained);
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     try testing.expectEqual(max_bytes, hc.current_kv_bytes);
-    try testing.expect(hc.entries.items[0].checked_out_by != null);
+    try testing.expect(hc.entries.items[0].checkout != null);
 }
 
 test "a restore names its entry, and a commit that extends it in place keeps the id" {

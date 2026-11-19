@@ -80,6 +80,7 @@ cooler contract: a regenerated Qwen turn restores from its own prompt end, live 
 cooler contract: a rewind past a Qwen conversation's held restore points restores from the grid point, the same tokens every time
 cooler contract: a served Qwen conversation keeps its newest off-grid restore points in RAM, writes none while the next turn extends them, and a flush writes the held ones
 cooler contract: a served Qwen conversation of takeovers, partial, regenerated and diverging, says its share arm's tokens with the pool poisoned, under a roomy and a tight RAM budget
+cooler contract: a served Qwen partial takeover refused before it donates leaves no cut on the entry, so the next turn takes the entry whole and keeps its restore points
 cooler contract: a served Qwen takeover turn cancelled as its prefill ends leaves the hot cache at rest, and the next turn restores and says what the share arm's does
 cooler contract: a served Qwen takeover turn refused at each pool site it reaches leaves the hot cache at rest and the pool as it was, and the next turn is served
 cooler contract: a served Qwen turn no longer than the RAM entry it partly shares, a regenerate or a turn that drops more of the last one than it adds, fits by taking it over and says the shared restore's tokens (#109)

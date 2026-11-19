@@ -6336,9 +6336,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
         .last_used = 1,
         .quant_config = .dense,
         .kv_bytes = 48,
-        .checked_out_by = @intFromPtr(&slot),
-        .checkout_donated = true,
-        .donated_bytes = 48,
+        .checkout = .{ .slot = @intFromPtr(&slot), .kind = .whole, .donated = 48 },
     });
     var mm = metrics_mod.Metrics.init();
     sch.metrics = &mm;
