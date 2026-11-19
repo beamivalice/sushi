@@ -18,6 +18,7 @@ pub const tests = .{
     @import("mimo2_load.zig"),
     @import("mimo2_drafter.zig"),
     @import("mimo_bill.zig"),
+    @import("mimo_bill_test.zig"),
     @import("arch.zig"),
     @import("mimo2_kld.zig"),
 };

@@ -1845,7 +1845,34 @@ pub fn kvBytesPerTokenAtBits(dense: u64, kv_bits: u64) u64 {
 pub fn slotRingBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
     if (archHook("slotRing", u64, config, .{kv_bits})) |bytes| return bytes;
     const swa = config.swaRingBytes() +| prefix_cache_mod.SLOT_RING_CHECKPOINTS *| config.swaRingCheckpointBytes();
-    return config.qsaRingBytes() +| kvBytesPerTokenAtBits(swa, kv_bits) +| batchedDecodeRowsBytes(config);
+    return config.qsaRingBytes() +| kvBytesPerTokenAtBits(swa, kv_bits) +| batchedDecodeRowsBytes(config) +|
+        ringAppendCopyBytes(config, kv_bits);
+}
+
+/// What a decode copies of a kv-quantized ring on MLX: a sliding layer's ring keeps its rows, so its scale and bias
+/// buffers can sit off MLX's page grid in a buffer MLX never donates, and each append copies them; a forward's old
+/// buffers live until its command buffer completes, so every sliding layer's at once (`mlx_pages.offGridCopyBytes`).
+pub fn ringAppendCopyBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    const rows = config.swaRingTokens();
+    if (rows == 0 or kv_bits >= 16 or cooler_side.onEngine(config)) return 0;
+    var total: u64 = 0;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers) : (li += 1) {
+        if (config.isGlobalLayer(li)) continue;
+        const k: u64 = @as(u64, config.layerKVHeads(li)) * config.layerHeadDim(li) * 2;
+        const v: u64 = @as(u64, config.layerKVHeads(li)) * config.layerVHeadDim(li) * 2;
+        total +|= ringLayerCopyBytes(rows, k, v, kv_bits);
+    }
+    return total;
+}
+
+/// PURE: one sliding layer's `ringAppendCopyBytes`, its `rows` of keys `k` and values `v` dense bytes a row: the codes,
+/// then the BF16 scales and biases of each group of 64 (`kvBytesPerTokenAtBits`).
+pub fn ringLayerCopyBytes(rows: u64, k: u64, v: u64, kv_bits: u64) u64 {
+    const pages = @import("mlx_pages.zig");
+    var total: u64 = 0;
+    for ([_]u64{ k * kv_bits / 16, v * kv_bits / 16, k / 64, k / 64, v / 64, v / 64 }) |part| total +|= pages.offGridCopyBytes(rows *| part);
+    return total;
 }
 
 /// What the other rows of a batched decode hold beside this slot's tick; zero where decode does not batch.
@@ -5178,7 +5205,10 @@ test "the sliding ring is billed once per slot and staged per chunk token" {
     const ring_and_cp = cfg.swaRingBytes() + prefix_cache_mod.SLOT_RING_CHECKPOINTS * cfg.swaRingCheckpointBytes();
     const rows = batchedDecodeRowsBytes(&cfg);
     try t.expectEqual(ring_and_cp + rows, slotRingBytes(&cfg, 16));
-    try t.expectEqual(kvBytesPerTokenAtBits(ring_and_cp, 8) + rows, slotRingBytes(&cfg, 8));
+    // On MLX a kv-quantized ring's append also copies its parts off the page grid: here 640 kv8 key rows of 576 B.
+    try t.expectEqual(@as(u64, 0), ringAppendCopyBytes(&cfg, 16));
+    try t.expectEqual(@as(u64, 2 * 24 * 16384), ringAppendCopyBytes(&cfg, 8));
+    try t.expectEqual(kvBytesPerTokenAtBits(ring_and_cp, 8) + rows + ringAppendCopyBytes(&cfg, 8), slotRingBytes(&cfg, 8));
     try t.expect(slotRingBytes(&cfg, 8) < slotRingBytes(&cfg, 16));
     // Per token of context only the two global layers count.
     try t.expectEqual(@as(u64, 2 * 2 * (192 + 128) * 2), sessionBytesPerToken(&cfg, 16));
@@ -5744,7 +5774,7 @@ test "bill pin: kvBytesPerTokenAtBits" {
 }
 
 test "bill pin: slotRingBytes" {
-    try pinConfigs("slotRingBytes", &.{ 98304, 98304, 199904640, 348541440, 147636736, 147636736, 6303744, 6303744 }, struct {
+    try pinConfigs("slotRingBytes", &.{ 98304, 98304, 207572352, 348541440, 147636736, 147636736, 6303744, 6303744 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             for (pin_bits) |b| g.add(slotRingBytes(c, b));
         }
@@ -5826,7 +5856,7 @@ test "bill pin: prefillMemoryNeeded" {
 test "bill pin: prefillTransientReserve and prefillTransientReserveAtKv" {
     try pinConfigs("prefillTransientReserve", &.{
         913670144, 2007965696, 3841163264, 5598412928, 912621568, 1751965696, 3832774656, 5342412928,
-        1630685920, 1837124320, 6452824800, 6649432800, 1813205120, 1813205120, 6625513600, 6625513600,
+        1640270560, 1846708960, 6462409440, 6659017440, 1813205120, 1813205120, 6625513600, 6625513600,
         1637207552, 1701999104, 5399432704, 5462045184, 1635074560, 1747620352, 5397070336, 5505716736,
         1655911936, 2952635104, 10465423360, 11760673504, 1655911936, 2952635104, 10465423360, 11760673504,
     }, struct {
@@ -5911,7 +5941,7 @@ test "bill pin: sizerCtxKvBytes" {
     const saved = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
-    try pinConfigs("sizerCtxKvBytes", &.{ 1760098304, 2912098304, 1423904640, 2652541440, 816436736, 1344436736, 95303744, 95303744 }, struct {
+    try pinConfigs("sizerCtxKvBytes", &.{ 1760098304, 2912098304, 1431572352, 2652541440, 816436736, 1344436736, 95303744, 95303744 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             for (pin_bits) |b| g.add(sizerCtxKvBytes(c, b));
         }
@@ -5923,7 +5953,7 @@ test "bill pin: sushiContextBytesAt and the max-context search" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigs("maxSushiContext", &.{
-        4666853376, 512, 1048576, 1048576, 200000, 3573844320, 512, 1048576,
+        4666853376, 512, 1048576, 1048576, 200000, 3583428960, 512, 1048576,
         1048576, 200000, 2966441600, 512, 1048576, 1048576, 200000, 4335553408,
         512, 1048576, 1048576, 200000,
     }, struct {
@@ -5944,7 +5974,7 @@ test "bill pin: loadServingBill" {
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("loadServingBill", &.{
         0, 1, 100000, 4666853376, 1048576, 8, 512, 0,
-        1, 100000, 3842279776, 1048576, 8, 512, 0, 0,
+        1, 100000, 3851864416, 1048576, 8, 512, 0, 0,
         0, 0,
     }, .{ 7, 7, 2, 2 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -5967,7 +5997,7 @@ test "bill pin: loadServingBill" {
 
 test "bill pin: memoryContextAt and memoryContextAtChunk" {
     try pinConfigs("memoryContextAt", &.{
-        1048576, 1048576, 446055, 446055, 2052459, 2160469, 480445, 588455,
+        1048576, 1048576, 446055, 446055, 2051958, 2159968, 479944, 587954,
         3799051, 3953345, 922039, 1076334, 1076224, 1076224, 1076224, 1076224,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6035,9 +6065,9 @@ test "bill pin: planHotCache" {
     try pinConfigs("planHotCache", &.{
         8192, 512, 913670144, 1760098304, 40275904512, 1024, 512, 913670144,
         1760098304, 40275904512, 8192, 512, 913670144, 1760098304, 2147483648, 1024,
-        512, 913670144, 1760098304, 2147483648, 4096, 512, 1630685920, 1423904640,
-        39895082400, 1024, 512, 1630685920, 1423904640, 39895082400, 4096, 512,
-        1630685920, 1423904640, 2147483648, 1024, 512, 1630685920, 1423904640, 2147483648,
+        512, 913670144, 1760098304, 2147483648, 4096, 512, 1640270560, 1431572352,
+        39877830048, 1024, 512, 1640270560, 1431572352, 39877830048, 4096, 512,
+        1640270560, 1431572352, 2147483648, 1024, 512, 1640270560, 1431572352, 2147483648,
         2048, 512, 1637207552, 816436736, 40496028672, 1024, 512, 1637207552,
         816436736, 40496028672, 2048, 512, 1637207552, 816436736, 2147483648, 1024,
         512, 1637207552, 816436736, 2147483648, 2048, 512, 1655911936, 95303744,
@@ -6102,7 +6132,7 @@ test "bill pin: the unnamed hot-cache ask" {
 test "bill pin: oneSessionEntryBytes and oneSessionFor" {
     try pinConfigs("oneSession", &.{
         2250651648, 2250651648, 36549015424, 5326915712, 1073741824, 2250651648, 1526246400, 1526246400,
-        37614614176, 4261316960, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
+        37605029536, 4270901600, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
         1073741824, 2052183552, 96290880, 96290880, 36282086528, 5593844608, 1073741824, 96290880,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6153,21 +6183,21 @@ test "bill pin: prefillRequestTerms" {
         217579520, 0, 20, 204800000, 153354240, 244776960, 346374144, 1228800000,
         122880000, 98304, 0, 0, 20, 204800000, 153354240, 265175040,
         461832192, 0, 0, 106496, 217579520, 0, 20, 204800000,
-        62962560, 0, 0, 0, 1360000, 199904640, 0, 0,
-        20, 3276800, 62962560, 15173632, 0, 0, 1360000, 199904640,
+        62962560, 0, 0, 0, 1360000, 207572352, 0, 0,
+        20, 3276800, 62962560, 15173632, 0, 0, 1360000, 207572352,
         0, 0, 20, 3276800, 62962560, 0, 0, 75202560,
-        1360000, 199904640, 0, 0, 20, 3276800, 62962560, 15173632,
-        0, 0, 1360000, 199904640, 0, 0, 20, 3276800,
+        1360000, 207572352, 0, 0, 20, 3276800, 62962560, 15173632,
+        0, 0, 1360000, 207572352, 0, 0, 20, 3276800,
         118517760, 0, 0, 0, 2560000, 348541440, 0, 0,
         20, 3276800, 118517760, 15173632, 0, 0, 2560000, 348541440,
         0, 0, 20, 3276800, 118517760, 0, 0, 141557760,
         2560000, 348541440, 0, 0, 20, 3276800, 118517760, 15173632,
         0, 0, 2560000, 348541440, 0, 0, 20, 3276800,
-        79511040, 0, 0, 0, 136000000, 199904640, 0, 0,
-        20, 167772160, 79511040, 15173632, 0, 0, 136000000, 199904640,
+        79511040, 0, 0, 0, 136000000, 207572352, 0, 0,
+        20, 167772160, 79511040, 15173632, 0, 0, 136000000, 207572352,
         0, 0, 20, 167772160, 79511040, 0, 0, 612000000,
-        81600000, 199904640, 0, 0, 20, 167772160, 79511040, 15173632,
-        0, 0, 136000000, 199904640, 0, 0, 20, 167772160,
+        81600000, 207572352, 0, 0, 20, 167772160, 79511040, 15173632,
+        0, 0, 136000000, 207572352, 0, 0, 20, 167772160,
         143769600, 0, 0, 0, 256000000, 348541440, 0, 0,
         20, 167772160, 143769600, 15173632, 0, 0, 256000000, 348541440,
         0, 0, 20, 167772160, 143769600, 0, 0, 1152000000,
@@ -6257,9 +6287,9 @@ test "bill pin: prefillNeededAtChunk" {
         1196478464, 1210249216, 930025472, 1325707264, 1557617984, 1571388736, 1291164992, 1686846784,
         4463783936, 4756965376, 3729383936, 4901287936, 6209949824, 6507432064, 5475549824, 6651754624,
         5702987776, 5996169216, 4320587776, 6140491776, 7479627904, 7777110144, 6097227904, 7921432704,
-        1708241280, 1727208320, 1614238080, 1727208320, 2363488640, 2382455680, 2269485440, 2382455680,
+        1717825920, 1736792960, 1623822720, 1736792960, 2373073280, 2392040320, 2279070080, 2392040320,
         1974385280, 1993352320, 1797438080, 1993352320, 2629632640, 2648599680, 2452685440, 2648599680,
-        3617546080, 3636513120, 2784546080, 3636513120, 5679964000, 5698931040, 4846964000, 5698931040,
+        3627130720, 3646097760, 2794130720, 3646097760, 5689548640, 5708515680, 4856548640, 5708515680,
         5129713280, 5148680320, 3561713280, 5148680320, 7236368000, 7255335040, 5668368000, 7255335040,
         2089683520, 2089683520, 2089683520, 2274208320, 2729646720, 2729646720, 2729646720, 2914171520,
         2121102080, 2121102080, 2121102080, 2305626880, 2760733440, 2760733440, 2760733440, 2945258240,
@@ -6340,7 +6370,7 @@ test "bill pin: prefillChunkCost and the adaptive width" {
         2015830016, 5661327488, 512, 512, 0, 1, 512, 512,
         0, 1, 512, 1024, 0, 0, 2048, 2048,
         0, 0, 512, 1024, 0, 0, 2048, 4096,
-        0, 0, 1, 1, 1843391200, 6699567840, 512, 512,
+        0, 0, 1, 1, 1852975840, 6709152480, 512, 512,
         0, 1, 512, 512, 0, 1, 512, 1024,
         0, 0, 2048, 2048, 0, 0, 512, 1024,
         0, 0, 2048, 4096, 0, 0, 1, 1,
@@ -6540,8 +6570,8 @@ test "bill pin: the wire-limit sentences" {
 
 test "bill pin: the streamed-load fit" {
     try pinConfigs("expertStreaming", &.{
-        65536, 1006731264, 4493721600, 3154214912, 1, 0, 65536, 970615680,
-        5018044000, 3118099328, 1, 0, 65536, 585941504, 4677861760, 2733425152,
+        65536, 1006731264, 4493721600, 3154214912, 1, 0, 65536, 978283392,
+        5027628640, 3125767040, 1, 0, 65536, 585941504, 4677861760, 2733425152,
         1, 0, 65536, 64630784, 6948116480, 2212114432, 1, 0,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -7367,7 +7397,7 @@ test "bill pin: loadWarmupBytes" {
 test "bill pin: loadRequirementBytes" {
     try pinLoadConfigs("loadRequirementBytes", &.{
         65632468992, 85899345920, 66840428544, 85899345920, 79541548544, 79541548544, 79541548544, 79541548544,
-        65766686720, 85899345920, 65766686720, 85899345920, 79961826912, 79961826912, 79961826912, 79961826912,
+        65766686720, 85899345920, 65766686720, 85899345920, 79971411552, 79971411552, 79971411552, 79971411552,
         66060796416, 85899345920, 66060796416, 85899345920, 80340094144, 80340094144, 80340094144, 80340094144,
         69456957221, 69456957221, 69456957221, 69456957221, 82341859109, 82341859109, 82341859109, 82341859109,
     }, struct {

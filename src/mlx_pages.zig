@@ -26,4 +26,11 @@ pub fn pagedCount(rows: u64, row_bytes: u64) u64 {
     return (rows +| step - 1) / step * step;
 }
 
+/// PURE: what an append into a buffer of `bytes` copies when it sits off the page grid: the most MLX's pool hands it
+/// (its pages and one more), which MLX never donates. Zero on the grid or within a page, where the append is in place.
+pub fn offGridCopyBytes(bytes: u64) u64 {
+    if (bytes <= page or bytes % page == 0) return 0;
+    return (bytes / page + 2) * page;
+}
+
 const std = @import("std");

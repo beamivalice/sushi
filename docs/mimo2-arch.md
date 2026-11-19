@@ -131,6 +131,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   newest two and `kv_bytes` drops by the rest (`RING_CHECKPOINT_RAM_KEEP`). One is 16 MiB at kv8, so the entry holds
   at most 128 MiB for eight and 32 MiB for two. `slotRingBytes` also bills the global-layer
   decode rebuilds the other rows of a batched decode hold below the packed arms' floor (`batchedDecodeRowsBytes`).
+  On MLX at kv8 or kv4 it also bills each append's copy of the rings' scale and bias rows, off the page grid at 640
+  rows (`ringAppendCopyBytes`: every sliding layer's, each part at its pages and one more, 7.3 MiB a slot at Flash).
 - **A hot entry holds a ringed layer's RETAINED ROWS, never the ring's capacity** (`KVCache.snapshotRetained`): the
   buffer is allocated at `ringCap` from token one, so a plain share billed and pinned rows no restore can read.
 - Per token: bf16 288 KiB → 22.5 KiB, kv8 153 KiB → 12.0 KiB; ring per slot 122 MiB bf16, 65 MiB kv8.
