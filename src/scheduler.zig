@@ -217,8 +217,8 @@ pub var vision_image_decode: ?*const fn (std.mem.Allocator, []const u8, *const m
 /// `request_media.visionEncodeBill`: the GPU bytes an encode of these blocks peaks at.
 pub var vision_encode_bill: ?*const fn (*const model_mod.ModelConfig, []const chat_mod.ImageData, []const chat_mod.VideoData, usize) u64 = null;
 
-/// `server.towerFitFault`: the refusal text when `available` bytes do not hold the encode, written into `out`.
-pub var vision_fit_fault: ?*const fn ([]u8, *const model_mod.ModelConfig, []const chat_mod.ImageData, []const chat_mod.VideoData, usize, u64) ?[]const u8 = null;
+/// `server.towerFitFault`: the refusal when `available` bytes do not hold the encode.
+pub var vision_fit_fault: ?*const fn (*const model_mod.ModelConfig, []const chat_mod.ImageData, []const chat_mod.VideoData, usize, u64) ?vision_queue.MediaRefusal = null;
 
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
@@ -995,6 +995,7 @@ pub const LoadRequest = struct {
     done_cond: std.Io.Condition = .init,
 
     pub fn recordRefusalText(self: *LoadRequest, text: []const u8) void {
+        warnPastStore(text.len);
         self.refusal_text_len = @min(text.len, self.refusal_text.len);
         @memcpy(self.refusal_text[0..self.refusal_text_len], text[0..self.refusal_text_len]);
     }
@@ -1036,9 +1037,14 @@ pub fn takeLoadRefusal() ?[]const u8 {
 }
 
 pub fn recordLoadRefusal(text: []const u8) void {
+    warnPastStore(text.len);
     const n = @min(text.len, last_load_refusal.len);
     @memcpy(last_load_refusal[0..n], text[0..n]);
     last_load_refusal_len = n;
+}
+
+fn warnPastStore(len: usize) void {
+    if (len > load_refusal_cap) log.warn("[load] a refusal of {d} bytes is past its {d}-byte store: the client reads its start\n", .{ len, load_refusal_cap });
 }
 
 test "the refusal a cold load records is read once" {

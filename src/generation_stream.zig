@@ -124,28 +124,35 @@ pub const GenErrorWire = struct {
     code: u32,
     openai_type: []const u8,
     anthropic_type: []const u8,
+    /// Owned: a refusal's text reaches the client whole, whatever its length.
     message: []const u8,
+
+    pub fn deinit(self: GenErrorWire, allocator: std.mem.Allocator) void {
+        allocator.free(self.message);
+    }
 };
 
 /// The mapping from a failed generation to what the client is told. It existed only on the
 /// non-streaming arms; streaming arms wrote a bare `server_error` into an SSE frame, so agents
 /// never saw the actionable 400/503. The unknown arm keeps the error name at a mapped 500.
-pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
+pub fn mapGenerationError(allocator: std.mem.Allocator, err: anyerror) !GenErrorWire {
     const context_refusal = server_state.slot_memory_context_refusal;
     server_state.slot_memory_context_refusal = null;
     const media_refusal = server_state.slot_media_refusal;
     server_state.slot_media_refusal = null;
     const forward_refusal = server_state.slot_forward_refusal;
     server_state.slot_forward_refusal = null;
-    return switch (err) {
+    var said: std.Io.Writer.Allocating = .init(allocator);
+    defer said.deinit();
+    var wire: GenErrorWire = switch (err) {
         // The media encode the prefix restore left to do could not run: the same text and status the
         // connection thread gave before the encode moved behind the restore.
-        error.MediaRefused => if (media_refusal) |r| .{
+        error.MediaRefused => if (media_refusal) |*r| .{
             .status_line = if (r.server_error) "500 Internal Server Error" else "400 Bad Request",
             .code = if (r.server_error) 500 else 400,
             .openai_type = if (r.server_error) "server_error" else "invalid_request_error",
             .anthropic_type = if (r.server_error) "api_error" else "invalid_request_error",
-            .message = std.fmt.bufPrint(buf, "{s}", .{r.text()}) catch "media refused",
+            .message = r.text(),
         } else .{
             .status_line = "500 Internal Server Error",
             .code = 500,
@@ -167,7 +174,7 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .code = 503,
             .openai_type = "server_error",
             .anthropic_type = "api_error",
-            .message = if (forward_refusal) |r| std.fmt.bufPrint(buf, "{s}", .{r.text()}) catch PREFILL_CHUNK_NOFIT_MSG else PREFILL_CHUNK_NOFIT_MSG,
+            .message = if (forward_refusal) |*r| r.text() else PREFILL_CHUNK_NOFIT_MSG,
         },
         error.TransientCapExceeded => .{
             .status_line = "503 Service Unavailable",
@@ -182,7 +189,10 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .code = 400,
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
-            .message = if (context_refusal) |r| memoryContextRefusalMessage(buf, r) else PREFILL_NOFIT_MSG,
+            .message = if (context_refusal) |r| blk: {
+                try bills_mod.writeMemoryContextRefusal(&said.writer, r);
+                break :blk said.written();
+            } else PREFILL_NOFIT_MSG,
         },
         // Refused at submit, so every surface answers it the same way.
         error.EmptyPrompt => .{
@@ -219,17 +229,24 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .code = 500,
             .openai_type = "server_error",
             .anthropic_type = "api_error",
-            .message = std.fmt.bufPrint(buf, "chat template unusable: {s}", .{chat_mod.templateRefusal()}) catch "chat template unusable",
+            .message = blk: {
+                try said.writer.print("chat template unusable: {s}", .{chat_mod.templateRefusal()});
+                break :blk said.written();
+            },
         },
         else => .{
             .status_line = "500 Internal Server Error",
             .code = 500,
             .openai_type = "server_error",
             .anthropic_type = "api_error",
-            .message = std.fmt.bufPrint(buf, "Internal server error: {s}", .{@errorName(err)}) catch
-                "Internal server error",
+            .message = blk: {
+                try said.writer.print("Internal server error: {s}", .{@errorName(err)});
+                break :blk said.written();
+            },
         },
     };
+    wire.message = try allocator.dupe(u8, wire.message);
+    return wire;
 }
 
 /// The terminal SSE frame for the OpenAI dialects, with a `finish_reason: "error"` choice so a
@@ -243,7 +260,7 @@ fn buildOpenAiStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
 }
 
 /// Which wire dialect a generative surface speaks its errors in.
-const ErrorSurface = union(enum) {
+pub const ErrorSurface = union(enum) {
     openai,
     anthropic,
     responses: *u64,
@@ -253,8 +270,8 @@ const ErrorSurface = union(enum) {
 /// stream gets the same response its non-streaming twin would; past it the same `type` and
 /// `message` ride the surface's terminal `error` event.
 pub fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror, surface: ErrorSurface) !void {
-    var msg_buf: [@sizeOf(@FieldType(forward_refusal_mod.Text, "buf"))]u8 = undefined;
-    const w = mapGenerationError(err, &msg_buf);
+    const w = try mapGenerationError(allocator, err);
+    defer w.deinit(allocator);
 
     if (!stream.sse_headers_sent) {
         return switch (surface) {
@@ -2195,9 +2212,9 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
         return true;
     }
     const refusal = loadRefusalFor(err) orelse return false;
-    var buf: [256]u8 = undefined;
     const context = if (err == error.InsufficientMemory) scheduler.takeLoadContextRefusal(id) else null;
-    const message = loadRefusalMessage(&buf, err, refusal, context);
+    const message = try loadRefusalMessage(allocator, err, refusal, context);
+    defer allocator.free(message);
     var retry_buf: [40]u8 = undefined;
     const retry = if (refusal.retry_after) |secs| std.fmt.bufPrint(&retry_buf, "Retry-After: {d}\r\n", .{secs}) catch "" else "";
     try sendErrorResponseWithHeaders(allocator, stream, "503 Service Unavailable", refusal.type, message, 503, retry);
@@ -2205,24 +2222,26 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
 }
 
 /// The message a load refusal's answer carries: the text the load wrote when it wrote one (the memory check's names the
-/// bound and what to free or change), else the refusal's own.
-pub fn loadRefusalMessage(buf: []u8, err: anyerror, refusal: LoadRefusal, context: ?model_registry_mod.MemoryContextRefusal) []const u8 {
+/// bound and what to free or change), else the refusal's own. The caller frees it.
+pub fn loadRefusalMessage(allocator: std.mem.Allocator, err: anyerror, refusal: LoadRefusal, context: ?model_registry_mod.MemoryContextRefusal) ![]u8 {
     const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported;
-    if (written) if (scheduler_mod.takeLoadRefusal()) |text| return text;
-    if (context) |c| return memoryContextRefusalMessage(buf, c);
-    return refusal.message;
+    if (written) if (scheduler_mod.takeLoadRefusal()) |text| return allocator.dupe(u8, text);
+    if (context) |c| return memoryContextRefusalMessage(allocator, c);
+    return allocator.dupe(u8, refusal.message);
 }
 
 test "a prefill chunk refused mid-request for memory answers 503 with the arch's whole text, not the admission refusal" {
     const text = "This prompt ran out of GPU memory partway through its prefill.\nIts 2048-token chunk, tokens 4096 to 6144, needs 5.00 GB, and the free memory with every expert-cache pool the prefill can borrow holds 4.50 GB: about 0.5 GB short. The chunks before it ran.\nTo serve it:\n- Lower --prefill-chunk to 1024: a narrower chunk needs less memory at this length.\n- Retry when other requests finish or other apps quit: the memory they hold comes back.\n- Shorten the prompt to 4096 tokens or fewer: the chunks up to there fit.";
     forward_refusal_mod.record(text);
     server_state.slot_forward_refusal = forward_refusal_mod.take();
-    var buf: [@sizeOf(@FieldType(forward_refusal_mod.Text, "buf"))]u8 = undefined;
-    const w = mapGenerationError(error.PrefillChunkDoesNotFit, &buf);
+    const a = std.testing.allocator;
+    const w = try mapGenerationError(a, error.PrefillChunkDoesNotFit);
+    defer w.deinit(a);
     try std.testing.expectEqual(@as(u32, 503), w.code);
     try std.testing.expectEqualStrings(text, w.message);
     // With no text left, the answer still names a mid-prefill refusal, never the before-any-work one.
-    const bare = mapGenerationError(error.PrefillChunkDoesNotFit, &buf);
+    const bare = try mapGenerationError(a, error.PrefillChunkDoesNotFit);
+    defer bare.deinit(a);
     try std.testing.expectEqualStrings(PREFILL_CHUNK_NOFIT_MSG, bare.message);
     try std.testing.expect(std.mem.indexOf(u8, bare.message, "before any work started") == null);
 }
@@ -2233,9 +2252,9 @@ test "a memory-refused load's 503 carries the check's whole text, its lines inta
     const gib: u64 = 1 << 30;
     const text = bills_mod.loadMemoryRefusalText(&text_buf, .{ .needed = 20 * gib, .avail = bills_mod.sushiAvailable(12 * gib, 0, 29 * gib, 0, 28 * gib) });
     scheduler_mod.recordLoadRefusal(text);
-    var buf: [256]u8 = undefined;
     const context = model_registry_mod.MemoryContextRefusal{ .requested = 9, .maximum = 4, .needed = 1, .available = 0, .kv_bits = 8, .chunk = 512 };
-    const message = loadRefusalMessage(&buf, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context);
+    const message = try loadRefusalMessage(a, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context);
+    defer a.free(message);
     try std.testing.expectEqualStrings(text, message);
     // The body the web UI and Sushibar read `error.message` from.
     const escaped = try http.jsonEscape(a, message);
@@ -2248,7 +2267,9 @@ test "a memory-refused load's 503 carries the check's whole text, its lines inta
     try std.testing.expectEqualStrings(text, parsed.value.@"error".message);
     try std.testing.expect(std.mem.indexOf(u8, parsed.value.@"error".message, "Free about 8.0 GB more.\nTo load it:\n- Quit other apps") != null);
     // Read once: an answer with no text written falls back to the context figures.
-    try std.testing.expect(std.mem.startsWith(u8, loadRefusalMessage(&buf, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context), "Context 9 does not fit"));
+    const again = try loadRefusalMessage(a, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context);
+    defer a.free(again);
+    try std.testing.expect(std.mem.startsWith(u8, again, "Context 9 does not fit"));
 }
 
 /// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for
@@ -2532,8 +2553,8 @@ test "a slot the transient cap failed answers a named 503, not the memory 503" {
     slot.error_code = "TransientCapExceeded";
 
     try t.expect(slotFailure(&slot) == error.TransientCapExceeded);
-    var buf: [192]u8 = undefined;
-    const w = mapGenerationError(error.TransientCapExceeded, &buf);
+    const w = try mapGenerationError(t.allocator, error.TransientCapExceeded);
+    defer w.deinit(t.allocator);
     try t.expectEqual(@as(u32, 503), w.code);
     try t.expectEqualStrings(TRANSIENT_CAP_MSG, w.message);
     try t.expect(!std.mem.eql(u8, w.message, GEN_OOM_MSG));
@@ -2547,9 +2568,9 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
     const t = std.testing;
     const a = t.allocator;
 
-    var buf: [192]u8 = undefined;
     {
-        const w = mapGenerationError(error.GenerationOutOfMemory, &buf);
+        const w = try mapGenerationError(a, error.GenerationOutOfMemory);
+        defer w.deinit(a);
         try t.expectEqual(@as(u32, 503), w.code);
         try t.expectEqualStrings("503 Service Unavailable", w.status_line);
         try t.expectEqualStrings(GEN_OOM_MSG, w.message);
@@ -2557,33 +2578,38 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         try t.expectEqualStrings("api_error", w.anthropic_type);
     }
     {
-        const w = mapGenerationError(error.PrefillDoesNotFit, &buf);
+        const w = try mapGenerationError(a, error.PrefillDoesNotFit);
+        defer w.deinit(a);
         try t.expectEqual(@as(u32, 400), w.code);
         try t.expectEqualStrings(PREFILL_NOFIT_MSG, w.message);
         try t.expectEqualStrings("invalid_request_error", w.openai_type);
         try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
     }
     {
-        const w = mapGenerationError(error.ServerShutdown, &buf);
+        const w = try mapGenerationError(a, error.ServerShutdown);
+        defer w.deinit(a);
         try t.expectEqual(@as(u32, 503), w.code);
         try t.expectEqualStrings("server_error", w.openai_type);
         try t.expectEqualStrings("Server is shutting down", w.message);
     }
     {
-        const w = mapGenerationError(error.GenerationFailed, &buf);
+        const w = try mapGenerationError(a, error.GenerationFailed);
+        defer w.deinit(a);
         try t.expectEqual(@as(u32, 500), w.code);
         try t.expectEqualStrings("generation failed", w.message);
     }
     {
         // Anything else keeps its name in the message, at a mapped status.
-        const w = mapGenerationError(error.WriteFailed, &buf);
+        const w = try mapGenerationError(a, error.WriteFailed);
+        defer w.deinit(a);
         try t.expectEqual(@as(u32, 500), w.code);
         try t.expectEqualStrings("Internal server error: WriteFailed", w.message);
     }
 
     // The SSE bodies carry the same type and message, plus the surface's terminal marker.
     {
-        const w = mapGenerationError(error.GenerationOutOfMemory, &buf);
+        const w = try mapGenerationError(a, error.GenerationOutOfMemory);
+        defer w.deinit(a);
         const body = try buildOpenAiStreamError(a, w);
         defer a.free(body);
         try t.expect(std.mem.indexOf(u8, body, "\"type\":\"server_error\"") != null);
@@ -2607,8 +2633,8 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
 
 test "an empty prompt refused at submit is a 400 invalid_request_error in both dialects" {
     const t = std.testing;
-    var buf: [192]u8 = undefined;
-    const w = mapGenerationError(error.EmptyPrompt, &buf);
+    const w = try mapGenerationError(t.allocator, error.EmptyPrompt);
+    defer w.deinit(t.allocator);
     try t.expectEqual(@as(u32, 400), w.code);
     try t.expectEqualStrings("400 Bad Request", w.status_line);
     try t.expectEqualStrings("invalid_request_error", w.openai_type);

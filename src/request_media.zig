@@ -265,18 +265,19 @@ test "a request whose image will not decode is refused naming it when it is keye
 }
 
 test "a media encode refused after the restore reaches the client with the text and status it was given" {
-    var buf: [320]u8 = undefined;
-    const fit = vision_queue.MediaRefusal{ .server_error = false, .buf = undefined, .len = 0 };
-    var refused = fit;
-    refused.len = (std.fmt.bufPrint(&refused.buf, "needs ~9 MB, ~1 MB is available", .{}) catch unreachable).len;
+    const a = std.testing.allocator;
+    var refused = vision_queue.MediaRefusal.init(false, "needs ~9 MB, ~1 MB is available", .{});
     server_state.slot_media_refusal = refused;
-    const wire = mapGenerationError(error.MediaRefused, &buf);
+    const wire = try mapGenerationError(a, error.MediaRefused);
+    defer wire.deinit(a);
     try std.testing.expectEqual(@as(u32, 400), wire.code);
     try std.testing.expectEqualStrings("needs ~9 MB, ~1 MB is available", wire.message);
     try std.testing.expectEqual(@as(?vision_queue.MediaRefusal, null), server_state.slot_media_refusal);
     refused.server_error = true;
     server_state.slot_media_refusal = refused;
-    try std.testing.expectEqual(@as(u32, 500), mapGenerationError(error.MediaRefused, &buf).code);
+    const failed = try mapGenerationError(a, error.MediaRefused);
+    defer failed.deinit(a);
+    try std.testing.expectEqual(@as(u32, 500), failed.code);
 }
 
 /// A request carrying images/video/audio on a model serving WITHOUT its tower
@@ -349,7 +350,10 @@ pub const MediaFault = struct {
 
     pub fn init(server_error: bool, comptime fmt: []const u8, args: anytype) MediaFault {
         var f: MediaFault = .{ .server_error = server_error };
-        f.len = (std.fmt.bufPrint(&f.buf, fmt, args) catch @as([]u8, &f.buf)).len;
+        f.len = (std.fmt.bufPrint(&f.buf, fmt, args) catch blk: {
+            log.warn("[media] a refusal of {d} bytes is past its {d}-byte store: the client reads its start\n", .{ std.fmt.count(fmt, args), f.buf.len });
+            break :blk @as([]u8, &f.buf);
+        }).len;
         return f;
     }
 

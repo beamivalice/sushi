@@ -1118,14 +1118,22 @@ fn fittingMaxTokens(config: *const model_mod.ModelConfig, prompt_len: usize, ask
     return low;
 }
 
-pub fn memoryContextRefusalMessage(buf: []u8, refusal: model_registry_mod.MemoryContextRefusal) []const u8 {
+/// The refusal's text, whole: the caller frees it.
+pub fn memoryContextRefusalMessage(allocator: std.mem.Allocator, refusal: model_registry_mod.MemoryContextRefusal) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try writeMemoryContextRefusal(&out.writer, refusal);
+    return out.toOwnedSlice();
+}
+
+pub fn writeMemoryContextRefusal(w: *std.Io.Writer, refusal: model_registry_mod.MemoryContextRefusal) std.Io.Writer.Error!void {
     const mb: u64 = 1 << 20;
-    if (refusal.fitting_max_tokens > 0) return std.fmt.bufPrint(buf, "Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}: the request needs {d} MB and {d} MB is available. max_tokens {d} fits (asked {d}); maximum context: {d} tokens. Lower max_tokens, reduce context or free memory.", .{
+    if (refusal.fitting_max_tokens > 0) return w.print("Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}: the request needs {d} MB and {d} MB is available. max_tokens {d} fits (asked {d}); maximum context: {d} tokens. Lower max_tokens, reduce context or free memory.", .{
         refusal.requested, refusal.kv_bits, refusal.chunk, (refusal.needed + mb - 1) / mb, refusal.available / mb, refusal.fitting_max_tokens, refusal.asked_max_tokens, refusal.maximum,
-    }) catch "The requested context does not fit in available GPU memory.";
-    return std.fmt.bufPrint(buf, "Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}: the request needs {d} MB and {d} MB is available, and the prompt alone does not fit. Maximum context: {d} tokens. Reduce context or free memory.", .{
+    });
+    return w.print("Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}: the request needs {d} MB and {d} MB is available, and the prompt alone does not fit. Maximum context: {d} tokens. Reduce context or free memory.", .{
         refusal.requested, refusal.kv_bits, refusal.chunk, (refusal.needed + mb - 1) / mb, refusal.available / mb, refusal.maximum,
-    }) catch "The requested context does not fit in available GPU memory.";
+    });
 }
 
 pub fn loadServingBill(config: *const model_mod.ModelConfig, budget: u64) ?model_load.LoadServingBill {
@@ -6193,15 +6201,12 @@ test "bill pin: the refusal sentences" {
     const cached = try memoryRefusalMessage(a, 5000, 13_664, 13_374, bill, true);
     defer a.free(cached);
     try std.testing.expectEqualStrings("Prompt (5000 tokens) requires ~13664MB GPU memory but only ~13374MB is available and the hot prefix cache holds ~7802MB more, all of which can be reclaimed (~2000MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", cached);
-    var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024: the request needs 9000 MB and 7000 MB is available. max_tokens 2000 fits (asked 96000); maximum context: 64000 tokens. Lower max_tokens, reduce context or free memory.",
-        memoryContextRefusalMessage(&buf, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024, .asked_max_tokens = 96_000, .fitting_max_tokens = 2000 }),
-    );
-    try std.testing.expectEqualStrings(
-        "Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024: the request needs 9000 MB and 7000 MB is available, and the prompt alone does not fit. Maximum context: 64000 tokens. Reduce context or free memory.",
-        memoryContextRefusalMessage(&buf, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024 }),
-    );
+    const fits = try memoryContextRefusalMessage(a, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024, .asked_max_tokens = 96_000, .fitting_max_tokens = 2000 });
+    defer a.free(fits);
+    try std.testing.expectEqualStrings("Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024: the request needs 9000 MB and 7000 MB is available. max_tokens 2000 fits (asked 96000); maximum context: 64000 tokens. Lower max_tokens, reduce context or free memory.", fits);
+    const alone = try memoryContextRefusalMessage(a, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024 });
+    defer a.free(alone);
+    try std.testing.expectEqualStrings("Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024: the request needs 9000 MB and 7000 MB is available, and the prompt alone does not fit. Maximum context: 64000 tokens. Reduce context or free memory.", alone);
 }
 
 test "bill pin: requestContextRefusal" {
@@ -7112,9 +7117,9 @@ test "a GPU-limit refusal says to restart sushi after the sysctl, as Settings do
 
 test "a refused request's message never shows its need equal to what is available" {
     const mb: u64 = 1 << 20;
-    var buf: [512]u8 = undefined;
     for ([_]u32{ 0, 2048 }) |fitting| {
-        const msg = memoryContextRefusalMessage(&buf, .{ .requested = 70000, .maximum = 65536, .needed = 5000 * mb + 1, .available = 5000 * mb + mb - 1, .kv_bits = 8, .chunk = 2048, .asked_max_tokens = 4096, .fitting_max_tokens = fitting });
+        const msg = try memoryContextRefusalMessage(testing.allocator, .{ .requested = 70000, .maximum = 65536, .needed = 5000 * mb + 1, .available = 5000 * mb + mb - 1, .kv_bits = 8, .chunk = 2048, .asked_max_tokens = 4096, .fitting_max_tokens = fitting });
+        defer testing.allocator.free(msg);
         errdefer std.debug.print("{s}\n", .{msg});
         try testing.expect(std.mem.indexOf(u8, msg, "needs 5001 MB and 5000 MB is available") != null);
     }

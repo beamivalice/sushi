@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A memory refusal reaches a Responses WebSocket client whole, with its numbers**: a request refused for memory (its
+  bill, what was available and the `max_tokens` that fits) or a DeepSeek prefill chunk refused partway read a generic
+  sentence there instead of the refusal's text.
 - **A request refused for memory on Sushi Cooler fails alone, with its memory error, and the next request serves**: a
   refusal met while making a host array (DeepSeek's prompt arrays, a request's first buffer on a full pool) failed as a
   bare 500 "generation failed" and left its error pending, so the next request, or one already answering beside it,

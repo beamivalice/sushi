@@ -14,6 +14,7 @@ threadlocal var last: ?Text = null;
 
 pub fn record(text: []const u8) void {
     var t: Text = .{};
+    if (text.len > t.buf.len) @import("log.zig").warn("[engine] a refusal of {d} bytes is past its {d}-byte store: the client reads its start\n", .{ text.len, t.buf.len });
     t.len = @min(text.len, t.buf.len);
     @memcpy(t.buf[0..t.len], text[0..t.len]);
     last = t;

@@ -838,7 +838,7 @@ pub fn serve(
     scheduler_mod.vision_encode_available = &request_media.visionEncodeAvailable;
     scheduler_mod.vision_encode_bill = &request_media.visionEncodeBillBytes;
     scheduler_mod.vision_image_decode = &request_media.decodeEncodedImage;
-    scheduler_mod.vision_fit_fault = &towerFitFaultText;
+    scheduler_mod.vision_fit_fault = &towerFitFault;
     defer scheduler_mod.vision_encode_available = null;
 
     // Idle eviction (--idle-evict-secs). Same lifetime shape as the sampler,
@@ -1650,16 +1650,19 @@ test "Sushi quant memory request refusal carries the actual KV width MTP and max
     try std.testing.expectEqual(@as(u64, 160000), refusal.requested);
     const mtp = bills.requestContextRefusal(&cfg, 128000, 32000, trunk.KVQuantConfig.affine(4), bill, .{ .mtp_on = true }).?;
     try std.testing.expect(mtp.maximum < refusal.maximum);
-    var buf: [256]u8 = undefined;
-    const message = memoryContextRefusalMessage(&buf, refusal);
+    const message = try memoryContextRefusalMessage(std.testing.allocator, refusal);
+    defer std.testing.allocator.free(message);
     try std.testing.expect(std.mem.indexOf(u8, message, "Maximum context: 64000 tokens") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "KV4") != null);
     server_state.slot_memory_context_refusal = refusal;
-    const wire = generation_stream.mapGenerationError(error.PrefillDoesNotFit, &buf);
+    const wire = try generation_stream.mapGenerationError(std.testing.allocator, error.PrefillDoesNotFit);
+    defer wire.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 400), wire.code);
     try std.testing.expect(std.mem.indexOf(u8, wire.message, "Maximum context: 64000 tokens") != null);
     try std.testing.expectEqual(@as(?model_registry_mod.MemoryContextRefusal, null), server_state.slot_memory_context_refusal);
-    try std.testing.expectEqualStrings(generation_stream.PREFILL_NOFIT_MSG, generation_stream.mapGenerationError(error.PrefillDoesNotFit, &buf).message);
+    const bare = try generation_stream.mapGenerationError(std.testing.allocator, error.PrefillDoesNotFit);
+    defer bare.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(generation_stream.PREFILL_NOFIT_MSG, bare.message);
 }
 
 
@@ -3361,14 +3364,6 @@ pub fn towerFitFault(config: *const model_mod.ModelConfig, images: []const chat_
     const mb: u64 = 1024 * 1024;
     // The need rounds up and what is free down: a refusal never reads as fitting.
     return request_media.MediaFault.init(false, "encoding the media needs ~{d} MB of GPU memory (its largest block has {d} patches), ~{d} MB is available", .{ (needed + mb - 1) / mb, worst, available / mb });
-}
-
-fn towerFitFaultText(out: []u8, config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, rows: usize, available: u64) ?[]const u8 {
-    const fault = towerFitFault(config, images, videos, rows, available) orelse return null;
-    const text = fault.text();
-    const n = @min(text.len, out.len);
-    @memcpy(out[0..n], text[0..n]);
-    return out[0..n];
 }
 
 /// Qwen3-VL interleaved M-RoPE position-id table for a request. `pos` (owned) is

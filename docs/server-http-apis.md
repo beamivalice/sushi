@@ -197,6 +197,9 @@ answers while the weights load:
 - **NO string built from model bytes is guaranteed UTF-8**: sanitizing lives INSIDE the escaper (`chat.utf8Next`
   under every `jsonEscape`/`appendJsonString`); logprobs `bytes` keeps the exact bytes. Hand-written error text is
   escaped at the SINK.
+- **A refusal's text reaches the client whole, on every surface and the WebSocket**: `mapGenerationError`,
+  `loadRefusalMessage` and `memoryContextRefusalMessage` allocate their message, never a caller's fixed buffer with a
+  fallback; a fixed store (forward, media, load, template refusal) logs a text past it.
 - **A name the server did not write enters a JSON body through `json_text`** (`Str` in a `{f}` slot, `innerAlloc` for a slot inside quotes): a model id or error name in `/v1/models`, `/props` and the load/unload answers, the echoed request `model` of the chat, completion and Anthropic answers, and the flag text of a `/props` setting. A folder named with a quote or a backslash lists as valid JSON.
 
 ### Closing a streamed response

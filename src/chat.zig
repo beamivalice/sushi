@@ -2012,6 +2012,7 @@ pub fn templateRefusal() []const u8 {
 }
 
 fn refuseTemplate(reason: []const u8) error{ChatTemplateUnusable} {
+    if (reason.len > template_refusal_buf.len) log.warn("[template] a refusal of {d} bytes is past its {d}-byte store: the client reads its start\n", .{ reason.len, template_refusal_buf.len });
     template_refusal_len = @min(reason.len, template_refusal_buf.len);
     @memcpy(template_refusal_buf[0..template_refusal_len], reason[0..template_refusal_len]);
     return error.ChatTemplateUnusable;

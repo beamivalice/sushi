@@ -1401,6 +1401,13 @@ fn wsBridgeSend(impl: *anyopaque, data: []const u8) anyerror!void {
 /// frame handler treats a `{"type":"error"}` text frame as terminal —
 /// emitting a trailing `[DONE]` would land in the *next* turn's bucket
 /// (same bug as success-path: see `handleResponsesWebSocket`).
+/// A WS turn's generation failure: the error frame, with the mapping every HTTP surface takes.
+fn wsGenerationErrorTurn(allocator: std.mem.Allocator, ws_conn: *WsConnT, err: anyerror) !void {
+    const ws_wire = try mapGenerationError(allocator, err);
+    defer ws_wire.deinit(allocator);
+    return wsSendErrorTurn(allocator, ws_conn, ws_wire.code, ws_wire.openai_type, ws_wire.message);
+}
+
 fn wsSendErrorTurn(allocator: std.mem.Allocator, ws_conn: *WsConnT, status: u32, code: []const u8, message: []const u8) !void {
     const esc_code = try jsonEscape(allocator, code);
     defer allocator.free(esc_code);
@@ -1578,10 +1585,7 @@ pub fn handleResponsesWebSocket(
         bridge.reset();
         handleResponses(allocator, stream, body, lm) catch |err| {
             log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
-            // Best-effort error frame; same mapping as every HTTP surface.
-            var ws_err_buf: [192]u8 = undefined;
-            const ws_wire = mapGenerationError(err, &ws_err_buf);
-            wsSendErrorTurn(allocator, &ws_conn, ws_wire.code, ws_wire.openai_type, ws_wire.message) catch {};
+            wsGenerationErrorTurn(allocator, &ws_conn, err) catch {};
             // Restore borrowed prev entry back to local cache on failure.
             if (did_borrow_to_global and prev_id_owned != null) {
                 const store = getOrInitResponseStore(stream.io, allocator);
@@ -1972,6 +1976,11 @@ test "the 413 names both counts it compared, and the setting that moves the limi
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("Request body too large: 98 MB exceeds the 64 MB limit (server.max_request_mb)", payloadTooLargeMessage(&buf, 97 * 1024 * 1024 + 1, 64 * 1024 * 1024));
     try std.testing.expectEqualStrings("Request body too large: over the 64 MB limit (server.max_request_mb)", payloadTooLargeMessage(&buf, null, 64 * 1024 * 1024));
+    // At the widest counts both still fit the 123 bytes a WebSocket close reason carries, so no 413 or 1009 is cut.
+    var close: [123]u8 = undefined;
+    const most = std.math.maxInt(usize);
+    try std.testing.expect(std.mem.endsWith(u8, payloadTooLargeMessage(&close, most, most), "(server.max_request_mb)"));
+    try std.testing.expect(std.mem.endsWith(u8, payloadTooLargeMessage(&close, null, most), "(server.max_request_mb)"));
 }
 
 test "startListener: a second bind on the same port is refused" {
@@ -2385,4 +2394,61 @@ test "every response says Connection: close, because the server closes after one
         const head = response[0 .. std.mem.indexOf(u8, response, "\r\n\r\n") orelse response.len];
         try t.expect(std.mem.indexOf(u8, head, "\r\nConnection: close") != null);
     }
+}
+
+test "a generation refusal reaches the client whole: the longest of each kind, in each dialect, streamed or not, and over the WebSocket" {
+    const t = std.testing;
+    const a = t.allocator;
+    const forward_refusal = @import("forward_refusal.zig");
+    const wide: u64 = std.math.maxInt(u64) >> 1;
+    const most: u32 = std.math.maxInt(u32);
+    const fits = model_registry_mod.MemoryContextRefusal{ .requested = wide, .maximum = most, .needed = wide, .available = wide, .kv_bits = wide, .chunk = wide, .asked_max_tokens = most, .fitting_max_tokens = most };
+    var alone = fits;
+    alone.fitting_max_tokens = 0;
+    // A stored text at its store's whole capacity, with a quote and a line break the wire escapes.
+    var forward: [@typeInfo(@FieldType(forward_refusal.Text, "buf")).array.len]u8 = @splat('f');
+    forward[0] = '"';
+    forward[1] = '\n';
+    var media: @import("vision_queue.zig").MediaRefusal = .{ .server_error = false };
+    @memset(&media.buf, 'm');
+    media.len = media.buf.len;
+    const Kind = struct { err: anyerror, context: ?model_registry_mod.MemoryContextRefusal = null, forward: bool = false, media: bool = false };
+    var failures: usize = 0;
+    var seq: u64 = 0;
+    for ([_]Kind{ .{ .err = error.PrefillDoesNotFit, .context = fits }, .{ .err = error.PrefillDoesNotFit, .context = alone }, .{ .err = error.PrefillChunkDoesNotFit, .forward = true }, .{ .err = error.MediaRefused, .media = true } }) |kind| {
+        const want = if (kind.context) |c| try server_mod.memoryContextRefusalMessage(a, c) else try a.dupe(u8, if (kind.forward) &forward else media.text());
+        defer a.free(want);
+        const esc = try http.jsonEscape(a, want);
+        defer a.free(esc);
+        for ([_]?generation_stream.ErrorSurface{ .openai, .anthropic, .{ .responses = &seq }, null }) |surface| for ([_]bool{ false, true }) |streamed| {
+            if (surface == null and streamed) continue;
+            var sv: [2]std.posix.fd_t = undefined;
+            try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+            defer _ = std.c.close(sv[1]);
+            var conn: Conn = undefined;
+            Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+            conn.sse_headers_sent = streamed;
+            server_state.slot_memory_context_refusal = kind.context;
+            server_state.slot_forward_refusal = if (kind.forward) blk: {
+                forward_refusal.record(&forward);
+                break :blk forward_refusal.take();
+            } else null;
+            server_state.slot_media_refusal = if (kind.media) media else null;
+            if (surface) |s| {
+                try generation_stream.sendGenerationError(a, &conn, kind.err, s);
+            } else {
+                var limit = std.atomic.Value(usize).init(1 << 20);
+                var ws_conn = WsConnT.init(&conn, &limit);
+                try wsGenerationErrorTurn(a, &ws_conn, kind.err);
+            }
+            _ = std.c.close(sv[0]);
+            var buf: [16384]u8 = undefined;
+            const raw = server_mod.readAllFromPair(sv[1], &buf);
+            if (std.mem.indexOf(u8, raw, esc) == null) {
+                failures += 1;
+                std.debug.print("{s} on {s}{s}: the wire lacks the refusal's {d}-byte text\n", .{ @errorName(kind.err), if (surface) |s| @tagName(s) else "websocket", if (streamed) " (streamed)" else "", want.len });
+            }
+        };
+    }
+    try t.expectEqual(@as(usize, 0), failures);
 }

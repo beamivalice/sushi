@@ -2037,8 +2037,8 @@ test "a request refused by its bill names the bill, what is available and the la
     try t.expect(fit >= 100_000 and fit < asked);
     try t.expect(prefillNeededAtChunk(&cfg, seq, fit, 8, 2048, .{}) <= room);
     try t.expect(prefillNeededAtChunk(&cfg, seq, fit + 1, 8, 2048, .{}) > room);
-    var buf: [512]u8 = undefined;
-    const msg = bills.memoryContextRefusalMessage(&buf, refusal);
+    const msg = try bills.memoryContextRefusalMessage(std.testing.allocator, refusal);
+    defer std.testing.allocator.free(msg);
     var want: [3][64]u8 = undefined;
     for ([_][]const u8{
         try std.fmt.bufPrint(&want[0], "{d} MB", .{(bill.needed + mb - 1) / mb}),

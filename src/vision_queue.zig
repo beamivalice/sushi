@@ -55,22 +55,9 @@ pub const DeferredMedia = struct {
     }
 };
 
-/// A media encode the engine could not run: what the client is told, and with which status.
-pub const MediaRefusal = struct {
-    server_error: bool,
-    buf: [320]u8 = undefined,
-    len: usize = 0,
-
-    fn init(server_error: bool, comptime fmt: []const u8, args: anytype) MediaRefusal {
-        var r: MediaRefusal = .{ .server_error = server_error };
-        r.len = (std.fmt.bufPrint(&r.buf, fmt, args) catch @as([]u8, &r.buf)).len;
-        return r;
-    }
-
-    pub fn text(self: *const MediaRefusal) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
+/// A media encode the engine could not run: the connection thread's refusal of a request's media, the same text
+/// and status.
+pub const MediaRefusal = @import("request_media.zig").MediaFault;
 
 /// What a restored prefix lets the encode leave out.
 pub const MediaSkip = struct { blocks: usize = 0, images: usize = 0, videos: usize = 0, rows: usize = 0 };
@@ -169,9 +156,8 @@ pub fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const D
         // A refusal for memory is the request's own 503, as a prefill's is.
         if (std.mem.eql(u8, name, "TransientCapExceeded")) return error.TransientCapExceeded;
         if (std.mem.eql(u8, name, "OutOfMemory")) return error.OutOfMemory;
-        var text: [320]u8 = undefined;
-        const fit = if (std.mem.eql(u8, name, vision_headroom_error)) (if (scheduler_mod.vision_fit_fault) |f| f(&text, cfg, images, videos, rows, req.available_bytes) else null) else null;
-        refusal.* = if (fit) |msg| MediaRefusal.init(false, "{s}", .{msg}) else MediaRefusal.init(true, "vision encoding failed: {s}", .{name});
+        const fit = if (std.mem.eql(u8, name, vision_headroom_error)) (if (scheduler_mod.vision_fit_fault) |f| f(cfg, images, videos, rows, req.available_bytes) else null) else null;
+        refusal.* = fit orelse MediaRefusal.init(true, "vision encoding failed: {s}", .{name});
         return error.MediaRefused;
     }
     const arr = req.result orelse return error.MediaRefused;
@@ -1137,8 +1123,8 @@ test "an encode refused for headroom after the restore names the bill of what it
         fn bill(_: *const ModelConfig, images: []const chat_mod.ImageData, _: []const chat_mod.VideoData, _: usize) u64 {
             return 100 * images.len;
         }
-        fn fault(out: []u8, _: *const ModelConfig, images: []const chat_mod.ImageData, _: []const chat_mod.VideoData, _: usize, free: u64) ?[]const u8 {
-            return std.fmt.bufPrint(out, "{d} images, {d} free", .{ images.len, free }) catch null;
+        fn fault(_: *const ModelConfig, images: []const chat_mod.ImageData, _: []const chat_mod.VideoData, _: usize, free: u64) ?MediaRefusal {
+            return MediaRefusal.init(false, "{d} images, {d} free", .{ images.len, free });
         }
         fn tower(_: VisionImagePixels) anyerror!mlx.mlx_array {
             return error.TowerMustNotRun;
