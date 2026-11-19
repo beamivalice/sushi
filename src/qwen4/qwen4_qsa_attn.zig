@@ -64,11 +64,11 @@ const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
 pub const QSA_ATTN_NSPLIT_DEFAULT: c_int = 16;
 
 /// The M1 Max row (2026-11-19, `applegpu_g13s`, 32 GPU cores, no matrix units). 16 splits at
-/// S=1 launch 32 threadgroups — one wave on 32 cores — and the split pass measures 188.5 us a
-/// call at kv 4096/32768; 64 splits launch 128 short groups (3 simdgroups each) and measure
-/// ~141-147 us, and the served 5.7k-token decode reads 34.6 tok/s against 33.7/32.0 for the
-/// default (MTP depth 2 pinned, same prompt, one boot per arm). BK stays 16: BK=8 exists in
-/// the seam but fails the kernel's launch check in 1.7.0.
+/// S=1 launch 32 threadgroups — one wave on 32 cores — and the split pass measures 187.6 us a
+/// call at kv 4096 and 191.8 at 32768; 64 splits launch 128 short groups of 2 simdgroups (nsg = (gqa+7)/8 = 2
+/// at gqa 12, the served fallback) and measure ~142-149 us, and the served 5.7k-token decode
+/// reads 34.6 tok/s against 33.7/32.0 for the default (MTP depth 2 pinned, same prompt, one boot
+/// per arm). BK stays 16: BK=8 exists in the seam but fails the kernel's launch check in 1.7.0.
 pub const QSA_ATTN_NSPLIT_M1_MAX: c_int = 64;
 
 /// Ceiling on the split count; past it the f32 partial buffer costs more traffic than it buys.
@@ -2432,12 +2432,12 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     try std.testing.expectEqual(QSA_ATTN_MAX_NSPLIT, qsaAttnSplitCount(1000));
 
     qsa_attn_m1_max_row = true;
-    try std.testing.expectEqual(QSA_ATTN_NSPLIT_M1_MAX, qsaAttnNSplit());
-    qsa_attn_m1_max_row = false;
-    try std.testing.expectEqual(QSA_ATTN_NSPLIT_DEFAULT, qsaAttnNSplit());
     qsa_attn_nsplit_override = 8;
     try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit());
     qsa_attn_nsplit_override = null;
+    try std.testing.expectEqual(QSA_ATTN_NSPLIT_M1_MAX, qsaAttnNSplit());
+    qsa_attn_m1_max_row = false;
+    try std.testing.expectEqual(QSA_ATTN_NSPLIT_DEFAULT, qsaAttnNSplit());
 
     defer qsa_attn_bk_override = null;
     try std.testing.expectEqual(QSA_ATTN_BK, qsaAttnBk());
@@ -2578,7 +2578,9 @@ test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN
     var prng = std.Random.DefaultPrng.init(0x0B5E_7A11);
     const rnd = prng.random();
     defer qsa_attn_simdgroups_override = null;
-    const arms = [_]c_int{ 2, 16 };
+    defer qsa_attn_nsplit_override = null;
+    const splits = [_]c_int{ QSA_ATTN_NSPLIT_DEFAULT, QSA_ATTN_NSPLIT_M1_MAX };
+    const sgs = [_]c_int{ 2, 16 };
     for ([_]c_int{ 4096, 32768 }) |kv| {
         var caches: [layers]KVCache = undefined;
         var views: [layers]DenseKVView = undefined;
@@ -2602,9 +2604,10 @@ test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN
         defer _ = mlx.mlx_array_free(blocks);
         const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 1, 256 }, s);
         defer _ = mlx.mlx_array_free(q0);
-        var us: [arms.len][reps]f64 = undefined;
-        for (0..reps + 1) |rep| for (arms, 0..) |arm, ai| {
-            qsa_attn_simdgroups_override = arm;
+        var us: [splits.len][sgs.len][reps]f64 = undefined;
+        for (0..reps + 1) |rep| for (splits, 0..) |nsplit, ni| for (sgs, 0..) |sg, ai| {
+            qsa_attn_nsplit_override = nsplit;
+            qsa_attn_simdgroups_override = sg;
             var q = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_array_set(&q, q0));
             for (0..chain) |_| for (&views) |*view| {
@@ -2616,12 +2619,12 @@ test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN
             try mlx.check(mlx.mlx_array_eval(q));
             const ns = clk.lap();
             _ = mlx.mlx_array_free(q);
-            if (rep > 0) us[ai][rep - 1] = @as(f64, @floatFromInt(ns)) / 1e3 / @as(f64, @floatFromInt(layers * chain));
+            if (rep > 0) us[ni][ai][rep - 1] = @as(f64, @floatFromInt(ns)) / 1e3 / @as(f64, @floatFromInt(layers * chain));
         };
-        for (arms, 0..) |arm, ai| {
-            std.mem.sort(f64, &us[ai], {}, std.sort.asc(f64));
-            std.debug.print("[qsa-attn-ubench] kv={d} simdgroups={d}: {d:.1} us/call (median of {d})\n", .{ kv, arm, us[ai][reps / 2], reps });
-        }
+        for (splits, 0..) |nsplit, ni| for (sgs, 0..) |sg, ai| {
+            std.mem.sort(f64, &us[ni][ai], {}, std.sort.asc(f64));
+            std.debug.print("[qsa-attn-ubench] kv={d} nsplit={d} simdgroups={d}: {d:.1} us/call (median of {d})\n", .{ kv, nsplit, sg, us[ni][ai][reps / 2], reps });
+        };
     }
 }
 
