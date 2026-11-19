@@ -6471,38 +6471,145 @@ pub fn settleAvailableBytes(first: u64, needed: u64, reader: anytype) u64 {
     return avail;
 }
 
-/// What a resident Sushi load may have: the free RAM (`effectiveAvailableBytes`, the reading the streamed preflight
-/// takes) under the working-set cap, less the already active model buffers; under a declared wired limit
-/// (`wired_floor`, 0 = none) no more than that limit's floor less them, and the free RAM when it is below.
+/// What a resident Sushi load may have: the least of the RAM free now (`effectiveAvailableBytes`'s reading, the one the
+/// streamed preflight takes), the GPU working set less the already active model buffers, and under a declared wired
+/// limit (`wired_floor`, 0 = none) that limit's floor less them. Owner rule: free RAM under the limit is the figure.
 pub const SushiAvailable = struct {
     bytes: u64,
     free: u64,
+    /// The working set less the active buffers; null when Metal gave no working set.
+    gpu: ?u64 = null,
     /// The declared limit's floor less the active buffers; null without one.
-    declared: ?u64,
+    declared: ?u64 = null,
 
-    pub fn byFree(self: SushiAvailable) bool {
-        return self.declared == null or self.free <= self.declared.?;
+    pub const Bound = enum { free_ram, gpu_limit, wired_limit };
+
+    pub fn bound(self: SushiAvailable) Bound {
+        if (self.free <= self.bytes) return .free_ram;
+        if (self.declared) |d| if (d <= self.bytes) return .wired_limit;
+        return .gpu_limit;
+    }
+
+    /// What the GPU limit alone would allow.
+    pub fn gpuAllows(self: SushiAvailable) ?u64 {
+        const gpu = self.gpu orelse return self.declared;
+        return @min(gpu, self.declared orelse gpu);
     }
 };
 
 pub fn sushiAvailable(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) SushiAvailable {
-    const available = effectiveAvailableBytes(host_avail, proc_avail, gpu_limit);
-    const free = if (gpu_limit > 0) @min(available, gpu_limit -| active) else available;
-    if (wired_floor == 0) return .{ .bytes = free, .free = free, .declared = null };
-    const declared = if (gpu_limit > 0) @min(wired_floor -| active, gpu_limit -| active) else wired_floor -| active;
-    return .{ .bytes = @min(free, declared), .free = free, .declared = declared };
+    const free = if (proc_avail > 0) proc_avail else host_avail;
+    const gpu: ?u64 = if (gpu_limit > 0) gpu_limit -| active else null;
+    const declared: ?u64 = if (wired_floor > 0) wired_floor -| active else null;
+    const bytes = @min(free, @min(gpu orelse free, declared orelse free));
+    return .{ .bytes = bytes, .free = free, .gpu = gpu, .declared = declared };
 }
 
-/// Which bound a Sushi preflight compared, with both numbers, for its line and its refusal.
-pub fn sushiAvailableLine(buf: []u8, a: SushiAvailable) []const u8 {
-    const gb = 1024.0 * 1024.0 * 1024.0;
-    const free = @as(f64, @floatFromInt(a.free)) / gb;
-    const declared = a.declared orelse return std.fmt.bufPrint(buf, "free RAM {d:.1} GB under the GPU working-set limit", .{free}) catch "free RAM";
-    const floor = @as(f64, @floatFromInt(declared)) / gb;
-    return (if (a.byFree())
-        std.fmt.bufPrint(buf, "free RAM {d:.1} GB, below the iogpu.wired_limit_mb floor less resident buffers, {d:.1} GB", .{ free, floor })
-    else
-        std.fmt.bufPrint(buf, "the iogpu.wired_limit_mb floor less resident buffers, {d:.1} GB, below free RAM {d:.1} GB", .{ floor, free })) catch "free RAM or the wired-limit floor";
+fn gbOf(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0);
+}
+
+/// GB with one decimal, rounded up: a shortfall never reads smaller than it is.
+fn gbUp(bytes: u64) f64 {
+    const tenths = (bytes *| 10 +| ((1 << 30) - 1)) >> 30;
+    return @as(f64, @floatFromInt(tenths)) / 10.0;
+}
+
+/// The `[preflight]` line's words for the bound a load's available figure came from.
+pub fn sushiAvailableLine(buf: []u8, a: SushiAvailable, wired_limit_mb: u64) []const u8 {
+    return (switch (a.bound()) {
+        .free_ram => if (a.gpuAllows()) |gpu|
+            std.fmt.bufPrint(buf, "bound by free RAM, {d:.1} GB; the GPU memory limit allows {d:.1} GB", .{ gbOf(a.free), gbOf(gpu) })
+        else
+            std.fmt.bufPrint(buf, "bound by free RAM, {d:.1} GB", .{gbOf(a.free)}),
+        .wired_limit => std.fmt.bufPrint(buf, "bound by the GPU memory limit (iogpu.wired_limit_mb = {d} MB): {d:.1} GB beside what is already loaded; {d:.1} GB of RAM free", .{ wired_limit_mb, gbOf(a.bytes), gbOf(a.free) }),
+        .gpu_limit => std.fmt.bufPrint(buf, "bound by the GPU memory limit (macOS's default): {d:.1} GB beside what is already loaded; {d:.1} GB of RAM free", .{ gbOf(a.bytes), gbOf(a.free) }),
+    }) catch "bound by free RAM or the GPU memory limit";
+}
+
+/// A load the memory check refused: what it needs, what the check read, and the one knob that shrinks the need.
+pub const LoadMemoryRefusal = struct {
+    needed: u64,
+    avail: SushiAvailable,
+    /// `iogpu.wired_limit_mb` as set (0: macOS's default).
+    wired_limit_mb: u64 = 0,
+    /// What a raised `iogpu.wired_limit_mb` holds beside the load: the buffers already active and the unplanned margin.
+    wired_beside: u64 = 0,
+    total_ram: u64 = 0,
+    knob: Knob = .none,
+
+    pub const Knob = union(enum) {
+        none,
+        /// The requested context and the largest that fits (0: none does).
+        ctx_size: struct { requested: u64, fits: u32 },
+        /// The ssd budget in GiB and the largest the planner fits (0: none does).
+        ssd_budget: struct { gb: u64, fits_gb: u64 },
+    };
+
+    /// The `iogpu.wired_limit_mb` that holds the load, or null when this Mac cannot wire that much.
+    pub fn wiredLimitThatFits(self: LoadMemoryRefusal) ?u64 {
+        const mb = wireLimitMbFor(self.needed +| self.wired_beside);
+        if (self.total_ram > 0 and mb << 20 > self.total_ram -| USER_WIRE_RAM_FLOOR_BYTES) return null;
+        return mb;
+    }
+};
+
+/// The text a refused load shows in the log, the HTTP answer and the web UI: a headline, the numbers, then the actions
+/// that fit the bound, most effective first, and the override last.
+pub fn loadMemoryRefusalText(buf: []u8, r: LoadMemoryRefusal) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    writeLoadMemoryRefusal(&w, r) catch return "Not enough memory to load this model. The server log has the figures.";
+    return w.buffered();
+}
+
+fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!void {
+    const a = r.avail;
+    const short = r.needed -| a.bytes;
+    try w.print("Not enough memory to load this model.\n", .{});
+    switch (a.bound()) {
+        .free_ram => {
+            try w.print("It needs {d:.1} GB, and only {d:.1} GB of RAM is free right now (other apps and the system hold the rest)", .{ gbOf(r.needed), gbOf(a.free) });
+            if (a.gpuAllows()) |gpu| try w.print("; your GPU memory limit would allow {d:.1} GB", .{gbOf(gpu)});
+            try w.print(". Free about {d:.1} GB more.\n", .{gbUp(short)});
+        },
+        .wired_limit, .gpu_limit => {
+            try w.print("It needs {d:.1} GB, and the GPU memory limit (", .{gbOf(r.needed)});
+            if (r.wired_limit_mb > 0) try w.print("iogpu.wired_limit_mb = {d} MB", .{r.wired_limit_mb}) else try w.print("macOS's default", .{});
+            try w.print(") leaves {d:.1} GB beside what is already loaded: about {d:.1} GB short. {d:.1} GB of RAM is free.\n", .{ gbOf(a.bytes), gbUp(short), gbOf(a.free) });
+        },
+    }
+    try w.print("To load it:\n", .{});
+    if (a.bound() == .free_ram) {
+        try w.print("- Quit other apps or unload another model, then retry: the check reads free memory when the load starts, so a retry sees what you freed.\n", .{});
+    } else if (r.wiredLimitThatFits()) |mb| {
+        try w.print("- Raise the GPU memory limit: sudo sysctl iogpu.wired_limit_mb={d} (it resets at reboot), then retry.", .{mb});
+        if (a.free < r.needed) try w.print(" Free about {d:.1} GB of RAM as well: quit other apps or unload another model.", .{gbUp(r.needed - a.free)});
+        try w.print("\n", .{});
+    } else {
+        try w.print("- This Mac cannot give the GPU enough memory for it, even with a raised limit: use one of the options below.\n", .{});
+    }
+    switch (r.knob) {
+        .none => {},
+        .ctx_size => |c| if (c.fits > 0) try w.print("- Lower --ctx-size to {d} or less (it is {d}).\n", .{ c.fits, c.requested }),
+        .ssd_budget => |b| if (b.fits_gb > 0) try w.print("- Lower --ssd-budget-gb to {d} (it is {d}): a smaller expert cache, slower decode.\n", .{ b.fits_gb, b.gb }),
+    }
+    try w.print("- Use a smaller pack of this model.\n", .{});
+    try w.print("- Last resort: --skip-mem-preflight (or \"Skip the memory check before loading\" in Settings) skips this check; the load can then fail later or stall the Mac.", .{});
+}
+
+/// PURE: the largest whole-GiB ssd budget below `budget` whose streamed load fits `avail`, priced by the load's own
+/// planner (`planner.needAt(budget_bytes)`, null where it refuses the budget); 0 when none does. Past the planner's
+/// smallest budget the need only grows with the budget, so the search halves.
+pub fn streamedBudgetThatFits(budget: u64, avail: u64, planner: anytype) u64 {
+    var lo: u64 = 0;
+    var hi: u64 = budget >> 30;
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        const need = planner.needAt(mid << 30);
+        if (need == null or need.? <= avail) lo = mid else hi = mid;
+    }
+    if (lo == 0 or planner.needAt(lo << 30) == null) return 0;
+    return lo;
 }
 
 pub fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) u64 {
@@ -6535,12 +6642,6 @@ pub fn loadRequirementBytes(config: *const model_mod.ModelConfig, weights_bytes:
     return weights_bytes +| @max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill);
 }
 
-/// PURE: the largest whole-GiB ssd budget below `budget` whose streamed load fits `avail`, a GiB of budget being a GiB
-/// of expert cache; 0 when none does.
-pub fn streamedBudgetThatFits(budget: u64, needed: u64, avail: u64) u64 {
-    const short = needed -| avail;
-    return if (short >= budget) 0 else (budget - short) >> 30;
-}
 
 /// Unknown figures (a failed memory query, an unmeasurable size) never block a load.
 pub fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64, required_bytes: u64) bool {
@@ -6841,13 +6942,65 @@ test "a long cold prompt admitted at the edge runs its first chunk at a width wh
     };
 }
 
-test "the Sushi preflight's line names the bound it compared, with both numbers" {
+test "a refused load's message names the bound in words, the shortfall and the bound's first action" {
     const gib: u64 = 1 << 30;
-    var buf: [160]u8 = undefined;
+    var buf: [2048]u8 = undefined;
+    const has = struct {
+        fn f(text: []const u8, part: []const u8) !void {
+            errdefer std.debug.print("missing \"{s}\" in:\n{s}\n", .{ part, text });
+            try testing.expect(std.mem.indexOf(u8, text, part) != null);
+        }
+    }.f;
+    // Free RAM binds: 12 GB free under a 28 GB floor, a 20 GB load.
     const by_free = sushiAvailable(12 * gib, 0, 29 * gib, 0, 28 * gib);
-    try testing.expect(by_free.byFree());
-    try testing.expectEqualStrings("free RAM 12.0 GB, below the iogpu.wired_limit_mb floor less resident buffers, 28.0 GB", sushiAvailableLine(&buf, by_free));
+    try testing.expectEqual(SushiAvailable.Bound.free_ram, by_free.bound());
+    const free_text = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = by_free, .wired_limit_mb = 29696, .wired_beside = 1 * gib, .total_ram = 32 * gib, .knob = .{ .ctx_size = .{ .requested = 262144, .fits = 65536 } } });
+    try has(free_text, "Not enough memory to load this model.\n");
+    try has(free_text, "only 12.0 GB of RAM is free right now (other apps and the system hold the rest); your GPU memory limit would allow 28.0 GB");
+    try has(free_text, "Free about 8.0 GB more.");
+    try has(free_text, "To load it:\n- Quit other apps or unload another model, then retry");
+    try has(free_text, "- Lower --ctx-size to 65536 or less (it is 262144).");
+    try testing.expect(std.mem.endsWith(u8, free_text, "the load can then fail later or stall the Mac."));
+    // The declared limit binds: its floor less 10 GB loaded leaves 18 GB; the raise holds the load, the loaded and the margin.
     const by_floor = sushiAvailable(40 * gib, 0, 29 * gib, 10 * gib, 28 * gib);
-    try testing.expect(!by_floor.byFree());
-    try testing.expectEqualStrings("the iogpu.wired_limit_mb floor less resident buffers, 18.0 GB, below free RAM 19.0 GB", sushiAvailableLine(&buf, by_floor));
+    try testing.expectEqual(SushiAvailable.Bound.wired_limit, by_floor.bound());
+    const floor_text = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = by_floor, .wired_limit_mb = 29696, .wired_beside = 11 * gib, .total_ram = 64 * gib, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15 } } });
+    try has(floor_text, "the GPU memory limit (iogpu.wired_limit_mb = 29696 MB) leaves 18.0 GB beside what is already loaded: about 2.0 GB short.");
+    try has(floor_text, "To load it:\n- Raise the GPU memory limit: sudo sysctl iogpu.wired_limit_mb=31800 (it resets at reboot), then retry.");
+    try has(floor_text, "- Lower --ssd-budget-gb to 15 (it is 18)");
+    // A limit this Mac cannot wire is not offered.
+    const no_raise = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = by_floor, .wired_limit_mb = 29696, .wired_beside = 11 * gib, .total_ram = 32 * gib });
+    try has(no_raise, "This Mac cannot give the GPU enough memory for it");
+    try testing.expect(std.mem.indexOf(u8, no_raise, "sudo sysctl") == null);
+    // The shortfall rounds up to a tenth of a GB.
+    try has(loadMemoryRefusalText(&buf, .{ .needed = 20 * gib + 1, .avail = by_free }), "Free about 8.1 GB more.");
+    // The preflight line names the bound in words.
+    try testing.expectEqualStrings("bound by free RAM, 12.0 GB; the GPU memory limit allows 28.0 GB", sushiAvailableLine(&buf, by_free, 29696));
+    try testing.expectEqualStrings("bound by the GPU memory limit (iogpu.wired_limit_mb = 29696 MB): 18.0 GB beside what is already loaded; 40.0 GB of RAM free", sushiAvailableLine(&buf, by_floor, 29696));
+}
+
+test "the ssd budget a refused streamed load names is the largest the planner itself fits, never one it refuses" {
+    const gib: u64 = 1 << 30;
+    // The planner's cache is whole slots of 0.385 GB past fixed terms, and it refuses a budget below those and two slots.
+    const Planner = struct {
+        fixed: u64,
+        pub fn needAt(p: @This(), budget: u64) ?u64 {
+            const slot: u64 = 385_000_000;
+            if (budget < p.fixed + 2 * slot) return null;
+            return p.fixed + (budget - p.fixed) / slot * slot + (3 * gib);
+        }
+    };
+    const planner = Planner{ .fixed = 9 * gib };
+    var avail: u64 = 10 * gib;
+    while (avail < 40 * gib) : (avail += 100 << 20) {
+        const fits = streamedBudgetThatFits(18 * gib, avail, planner);
+        if (fits == 0) {
+            var b: u64 = 1;
+            while (b < 18) : (b += 1) if (planner.needAt(b * gib)) |need| try testing.expect(need > avail);
+            continue;
+        }
+        try testing.expect(fits < 18);
+        try testing.expect(planner.needAt(fits * gib).? <= avail);
+        if (fits + 1 < 18) try testing.expect(planner.needAt((fits + 1) * gib).? > avail);
+    }
 }

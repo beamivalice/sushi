@@ -17,6 +17,8 @@ const cooler_side = @import("../cooler_side.zig");
 /// The live headroom (the GPU ceiling less MLX's active bytes), installed by the server. Unset (tests, `sushi kld`),
 /// nothing is ever released.
 pub var headroom_fn: ?*const fn (*const ModelConfig) u64 = null;
+/// The need of the wide forward `beforeForward` is sizing, which a test's `headroom_fn` reads.
+pub var forward_need: u64 = 0;
 
 /// The widest verify block: up to it a forward is a decode forward, whose cap admission always reserves.
 pub const verify_rows = cfg_mod.verify_rows;
@@ -334,6 +336,7 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
     if (engine.borrow_from >= engine.layers.len) return;
     if (rows <= verify_rows) return restore(engine, config, headroom, c.forwardCap(rows, seq));
     const need = prefillNeed(c, cooler_side.onEngine(config), rows, seq);
+    forward_need = need;
     if (headroom(config) >= need) return;
     _ = mlx.mlx_clear_cache();
     const before = headroom(config);
@@ -353,8 +356,9 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
     }
     // A resident pack pays for the union workspace out of its first release.
     const count = releaseCount(pools[0..n], need +| engine.unionPending(), before) orelse {
-        log.warn("[dsv41-borrow] a {d}-row forward at {d} needs {d:.2} GB; the headroom and every decoder pool hold {d:.2} GB\n", .{ rows, seq, gb(need), gb((before +| sum(pools[0..n])) -| engine.unionPending()) });
-        return error.PrefillDoesNotFit;
+        const have = (before +| sum(pools[0..n])) -| engine.unionPending();
+        log.warn("[dsv41-borrow] a {d}-row forward at {d} needs {d:.2} GB; the headroom and every decoder pool hold {d:.2} GB\n", .{ rows, seq, gb(need), gb(have) });
+        return refuse(c, cooler_side.onEngine(config), rows, seq, need, have);
     };
     var m: LiveBorrow = .{ .engine = engine, .order = order[0..n], .config = config, .read = headroom, .wired = status.getWiredMemBytes() };
     const r = releaseUntil(&m, n, count, need) catch |e| {
@@ -366,7 +370,40 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
             order[r.layers - 1], order[0], gb(m.released), rows, seq, gb(need), gb(before), gb(r.have), m.waited,
         });
     }
-    if (r.have < need) return error.PrefillDoesNotFit;
+    if (r.have < need) return refuse(c, cooler_side.onEngine(config), rows, seq, need, r.have);
+}
+
+/// The narrowest step down from `rows` whose forward at `seq` fits `have`, halving to 64 rows; 0 when none does.
+pub fn chunkThatFits(c: *const Config, engine: bool, rows: u64, seq: u64, have: u64) u64 {
+    var w = rows / 2;
+    while (w >= 64) : (w /= 2) if (prefillNeed(c, engine, w, seq) <= have) return w;
+    return 0;
+}
+
+/// What the client reads when a forward is refused mid-request: what did not fit, by how much, and what to change.
+pub fn refusalText(buf: []u8, rows: u64, seq: u64, need: u64, have: u64, chunk_fits: u64) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    writeRefusal(&w, rows, seq, need, have, chunk_fits) catch return "A prefill chunk of this prompt did not fit in GPU memory; the server log has the figures.";
+    return w.buffered();
+}
+
+fn writeRefusal(w: *std.Io.Writer, rows: u64, seq: u64, need: u64, have: u64, chunk_fits: u64) std.Io.Writer.Error!void {
+    const gib = 1024.0 * 1024.0 * 1024.0;
+    const short_tenths = ((need -| have) *| 10 +| ((1 << 30) - 1)) >> 30;
+    try w.print("This prompt ran out of GPU memory partway through its prefill.\n", .{});
+    try w.print("Its {d}-token chunk at token {d} needs {d:.1} GB, and the free memory with every expert-cache pool the prefill can borrow holds {d:.1} GB: about {d:.1} GB short. The chunks before it ran.\n", .{
+        rows, seq, @as(f64, @floatFromInt(need)) / gib, @as(f64, @floatFromInt(have)) / gib, @as(f64, @floatFromInt(short_tenths)) / 10.0,
+    });
+    try w.print("To serve it:\n", .{});
+    if (chunk_fits > 0) try w.print("- Lower --prefill-chunk to {d}: a narrower chunk needs less memory at this length.\n", .{chunk_fits});
+    try w.print("- Retry when other requests finish or other apps quit: the memory they hold comes back.\n", .{});
+    try w.print("- Shorten the prompt to under {d} tokens.", .{seq});
+}
+
+fn refuse(c: *const Config, engine: bool, rows: u64, seq: u64, need: u64, have: u64) error{PrefillChunkDoesNotFit} {
+    var buf: [1024]u8 = undefined;
+    @import("../forward_refusal.zig").record(refusalText(&buf, rows, seq, need, have, chunkThatFits(c, engine, rows, seq, have)));
+    return error.PrefillChunkDoesNotFit;
 }
 
 /// The engine's side of `releaseUntil`: a release lends a layer's pool; the wait is the kernel's unwire of everything
@@ -1208,4 +1245,30 @@ test "dsv41 borrow: a DeepSeek load on MLX that fails after its plan capped the 
         }
     };
     try withPoolState(8 << 30, &Body.run);
+}
+
+test "dsv41 borrow: a forward refused mid-prefill names its chunk, the shortfall and the narrower chunk that fits, never the admission refusal" {
+    const c = try cfg_mod.parseText(cfg_mod.release_config);
+    const gib: u64 = 1 << 30;
+    const rows: u64 = 2048;
+    const seq: u64 = 6144;
+    const need = prefillNeed(&c, true, rows, seq);
+    const have = prefillNeed(&c, true, rows / 2, seq) + (1 << 20);
+    try testing.expect(have < need);
+    try testing.expectEqual(rows / 2, chunkThatFits(&c, true, rows, seq, have));
+    try testing.expectEqual(@as(u64, 0), chunkThatFits(&c, true, rows, seq, 0));
+    var buf: [1024]u8 = undefined;
+    const text = refusalText(&buf, rows, seq, 5 * gib, 4 * gib + gib / 2, 1024);
+    for ([_][]const u8{
+        "This prompt ran out of GPU memory partway through its prefill.\n",
+        "Its 2048-token chunk at token 6144 needs 5.0 GB",
+        "holds 4.5 GB: about 0.5 GB short. The chunks before it ran.\n",
+        "To serve it:\n- Lower --prefill-chunk to 1024",
+        "- Retry when other requests finish",
+        "- Shorten the prompt to under 6144 tokens.",
+    }) |part| {
+        errdefer std.debug.print("missing \"{s}\" in:\n{s}\n", .{ part, text });
+        try testing.expect(std.mem.indexOf(u8, text, part) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, refusalText(&buf, rows, seq, 5 * gib, 0, 0), "--prefill-chunk") == null);
 }

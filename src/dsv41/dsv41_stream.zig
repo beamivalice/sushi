@@ -2053,7 +2053,9 @@ fn borrowCase(cache_bytes: u64) !void {
     try xfm.resetCache();
     BorrowProbe.base = 0;
     const chunk = try sc.ints(@as([]const i32, @ptrCast(ids[0..first])), &.{ 1, first });
-    try testing.expectError(error.PrefillDoesNotFit, xfm.forward(chunk));
+    try testing.expectError(error.PrefillChunkDoesNotFit, xfm.forward(chunk));
+    const refusal = @import("../forward_refusal.zig").take().?;
+    try testing.expect(std.mem.startsWith(u8, refusal.text(), "This prompt ran out of GPU memory partway through its prefill.\n"));
     for (engine.borrow_from..engine.layers.len) |li| try testing.expect(!engine.isBorrowed(@intCast(li)));
 }
 
@@ -2953,5 +2955,33 @@ test "dsv41 pair-major: the expert store refuses a swapped grid and an unstamped
         var config = try @import("../model.zig").parseConfig(io, testing.allocator, pm.path);
         defer config.deinit(testing.allocator);
         try testing.expectError(c.want, stream.Engine.initWithOptions(testing.allocator, pm.path, config.expertGeometry(), 1 << 30, mlx.gpuStream(), .{ .layout = .exl3_k4, .tile_major = true }));
+    }
+}
+
+test "dsv41 stream: the ssd budget a refused streamed load names is priced by the load's own planner on the config it applied (DSV41_STQ_TINY)" {
+    const dir = try stqDir();
+    const model_mod = @import("../model.zig");
+    const model_load = @import("../model_load.zig");
+    const bills = @import("../bills.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, testing.allocator, dir);
+    defer config.deinit(testing.allocator);
+    const budget: u64 = 4 << 30;
+    const plan = try model_load.planExpertStreamingWith(io, testing.allocator, &config, dir, budget, false, 0);
+    var applied = config;
+    model_load.applyStreamingPlan(&applied, plan, budget);
+    const resident = plan.split.trunk +| plan.split.mtp +| plan.split.vision;
+    const planner = model_load.BudgetPlanner{ .io = io, .allocator = testing.allocator, .config = &applied, .model_dir = dir, .vision = false, .assistant = 0, .beside = 0, .mtp_on = false };
+    // Planned again from the config the load applied, its own budget costs what the preflight billed.
+    try testing.expectEqual(bills.loadRequirementBytes(&applied, resident, false, 0), planner.needAt(budget).?);
+    var b: u64 = 1;
+    while (b < budget >> 30) : (b += 1) {
+        const need = planner.needAt(b << 30) orelse continue;
+        for ([_]u64{ need -| 1, need, need + (1 << 20) }) |avail| {
+            const fits = bills.streamedBudgetThatFits(budget, avail, planner);
+            if (fits == 0) continue;
+            try testing.expect(planner.needAt(fits << 30).? <= avail);
+            if (fits + 1 < budget >> 30) try testing.expect(planner.needAt((fits + 1) << 30).? > avail);
+        }
     }
 }

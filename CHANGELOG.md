@@ -47,7 +47,12 @@ earlier history is mlx-serve's, in that project's changelog.
   an unload gave back MLX's cap only. A failed load and an unload now give both back.
 - **With a raised `iogpu.wired_limit_mb`, a model is refused before loading when other apps hold the memory it needs**:
   the memory check read the wired limit alone, so a load passed it, read every weight and failed its warm-up. It now
-  uses the free memory when that is lower, and its line says which of the two it compared.
+  uses the free memory when that is lower.
+- **A model refused for memory now tells you what to free or change**, in the server log, the web UI, the HTTP answer
+  and Sushibar alike. The message names what ran short (free RAM, or the GPU memory limit) and by how much. It then
+  lists the fixes for that limit, in plain words: quit apps or unload a model, the exact
+  `sudo sysctl iogpu.wired_limit_mb=` value that fits, the `--ctx-size` or `--ssd-budget-gb` that fits, or a smaller
+  pack. Skipping the check comes last, with its risk.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many

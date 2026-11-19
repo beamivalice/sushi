@@ -406,6 +406,21 @@ fn warmHeadroomAfterLoad(config: *const model_mod.ModelConfig, ceiling: u64, ava
     return bills.liveHeadroomFrom(config, bills.liveCeilingFrom(ceiling, held, avail -| held), held - pool, 0, pool);
 }
 
+/// The 32 GB ledger's planner at a smaller budget: the GiBs it gives up come out of the cache, which keeps whole slots of
+/// about 0.385 GB, and a cache under two slots is refused.
+const SlotPlanner = struct {
+    config: *const model_mod.ModelConfig,
+    weights: u64,
+    pub fn needAt(p: SlotPlanner, budget: u64) ?u64 {
+        const slot: u64 = 385_000_000;
+        const given_up = p.config.expert_ssd_budget_bytes -| budget;
+        if (p.config.expert_cache_bytes < given_up +| 2 * slot) return null;
+        var planned = p.config.*;
+        planned.expert_cache_bytes = (p.config.expert_cache_bytes - given_up) / slot * slot;
+        return bills.loadRequirementBytes(&planned, p.weights, true, 0);
+    }
+};
+
 test "DeepSeek: a streamed load the preflight and the fit admit on a 32 GB Mac leaves its served warm a prefill chunk, and a refused budget names one that fits" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
@@ -431,11 +446,9 @@ test "DeepSeek: a streamed load the preflight and the fit admit on a 32 GB Mac l
     var avail = need -| (2 << 30);
     while (avail < need + (2 << 30)) : (avail += 50 * MiB) {
         if (bills.memInsufficientForLoad(weights, avail, need)) {
-            // The refusal's budget fits what is free.
-            var smaller = config;
-            const fits = bills.streamedBudgetThatFits(config.expert_ssd_budget_bytes, need, avail);
-            smaller.expert_cache_bytes -= config.expert_ssd_budget_bytes - (fits << 30);
-            try t.expect(!bills.memInsufficientForLoad(weights, avail, bills.loadRequirementBytes(&smaller, weights, true, 0)));
+            // The refusal's budget is one the ledger's planner fits in what is free.
+            const fits = bills.streamedBudgetThatFits(config.expert_ssd_budget_bytes, avail, SlotPlanner{ .config = &config, .weights = weights });
+            if (fits > 0) try t.expect(SlotPlanner.needAt(.{ .config = &config, .weights = weights }, fits << 30).? <= avail);
             continue;
         }
         try t.expect(bills.widestChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, ceiling, avail, weights)) > 0);

@@ -3558,3 +3558,77 @@ test "cooler contract: a Cooler load whose warm fails, torn down as a served loa
         }
     }.run);
 }
+
+/// The process's memory as a headroom read sees it: MLX's bytes and the engine's pool.
+const MemSnap = struct {
+    mlx_cache: u64,
+    pool: u64,
+    pool_free: u64,
+
+    fn now() MemSnap {
+        mlx.engine.close();
+        var cache: usize = 0;
+        _ = mlx.mlx_get_cache_memory(&cache);
+        const st = mlx.engine.stats();
+        return .{ .mlx_cache = cache, .pool = st.pool_bytes, .pool_free = st.pool_free };
+    }
+};
+
+/// A borrow whose freed pools unwire late (issue 105): the first request's first wide forward reads its headroom a byte
+/// short until the read after its first release has passed, then has room.
+const LateUnwireHeadroom = struct {
+    var req: usize = 0;
+    var reads: u32 = 0;
+    var borrowed = false;
+    fn headroom(_: *const model_mod.ModelConfig) u64 {
+        const need = @import("dsv41/dsv41_borrow.zig").forward_need;
+        if (req == 0 and !borrowed and need > 0) {
+            reads += 1;
+            if (reads <= 3) return need - 1;
+            borrowed = true;
+        }
+        return std.math.maxInt(u64) / 4;
+    }
+};
+
+test "cooler contract: the first served DeepSeek request after a Cooler load's warm starts from the state the second does, and its first wide prefill is served through a late-unwiring borrow (issue 107)" {
+    try eachFixture(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            if (!@import("arch/config.zig").isOf(&ld.config, "dsv41")) return error.SkipZigTest;
+            const borrow = @import("dsv41/dsv41_borrow.zig");
+            const was_fn = borrow.headroom_fn;
+            borrow.headroom_fn = &LateUnwireHeadroom.headroom;
+            defer borrow.headroom_fn = was_fn;
+            LateUnwireHeadroom.reads = 0;
+            LateUnwireHeadroom.borrowed = false;
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            var starts: [2]MemSnap = undefined;
+            var grew: [2]u64 = undefined;
+            for (0..2) |r| {
+                const prompt = try a.alloc(u32, 3000);
+                defer a.free(prompt);
+                for (prompt, 0..) |*t, i| t.* = ids[(i * (r + 1) + r * 7) % ids.len];
+                LateUnwireHeadroom.req = r;
+                starts[r] = MemSnap.now();
+                mlx.engine.resetPoolPeak(.process);
+                var from: u32 = 0;
+                var got = try sv.requestWith(prompt, 8, .{ .temperature = 0 }, &from);
+                defer got.deinit(a);
+                try testing.expectEqual(@as(usize, 8), got.items.len);
+                grew[r] = mlx.engine.poolHeldPeak(.process) -| starts[r].pool;
+            }
+            errdefer std.debug.print("first request: MLX cache {d} KB, grew {d} KB; second: MLX cache {d} KB, grew {d} KB, pool rest {d} KB\n", .{ starts[0].mlx_cache >> 10, grew[0] >> 10, starts[1].mlx_cache >> 10, grew[1] >> 10, starts[1].pool_free >> 10 });
+            // The late-unwiring borrow ran in the first request, and the request was served.
+            try testing.expect(LateUnwireHeadroom.borrowed);
+            // A headroom read counts MLX's cache and the pool's free buffers as free: the first request starts as the second.
+            try testing.expectEqual(starts[1].mlx_cache, starts[0].mlx_cache);
+            try testing.expect(@max(grew[0], grew[1]) - @min(grew[0], grew[1]) <= starts[1].pool_free);
+        }
+    }.run);
+}

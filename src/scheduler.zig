@@ -31,6 +31,7 @@
 //! drains. Generation end is signaled by `state == .finished` (or `.errored`)
 //! plus a cv broadcast.
 
+const forward_refusal_mod = @import("forward_refusal.zig");
 const std = @import("std");
 const testTrunk = @import("test_support.zig").testTrunk;
 const arch_handle = @import("arch/handle.zig");
@@ -294,6 +295,8 @@ pub const Slot = struct {
     deferred_media: ?*vision_queue.DeferredMedia = null,
     /// Set with `error.MediaRefused`, which the connection thread answers as a 4xx/5xx.
     media_refusal: ?vision_queue.MediaRefusal = null,
+    /// What a forward refused mid-request for memory left for the client (`forward_refusal`).
+    forward_refusal: ?forward_refusal_mod.Text = null,
     vision_key: u64,
     cache_key: u64 = 0,
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
@@ -787,6 +790,7 @@ pub const Slot = struct {
     /// terminal, so an uncopyable name falls back to a static one instead of leaving it null.
     fn latchErrorLocked(self: *Slot, name: []const u8) void {
         if (self.error_code == null) {
+            if (std.mem.eql(u8, name, "PrefillChunkDoesNotFit")) self.forward_refusal = forward_refusal_mod.take();
             self.error_code = self.allocator.dupe(u8, name) catch static_error_name;
             // The client sees only "generation failed" for most names; this line is the one place the name is kept.
             log.err("[slot] request {d} failed ({s}): {s}\n", .{ self.request_id, @tagName(self.state), name });
@@ -979,12 +983,20 @@ pub const LoadRequest = struct {
     /// frees). Null on success.
     error_name: ?[]const u8 = null,
     memory_context_refusal: ?model_registry_mod.MemoryContextRefusal = null,
+    /// Output: the refusal text a load's memory check wrote, which the client gets whole.
+    refusal_text: [load_refusal_cap]u8 = undefined,
+    refusal_text_len: usize = 0,
 
     /// Conn-thread synchronization. Inference thread broadcasts when done.
     done: bool = false,
     allocator: std.mem.Allocator,
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
+
+    pub fn recordRefusalText(self: *LoadRequest, text: []const u8) void {
+        self.refusal_text_len = @min(text.len, self.refusal_text.len);
+        @memcpy(self.refusal_text[0..self.refusal_text_len], text[0..self.refusal_text_len]);
+    }
 };
 
 /// Model-unload work item. Posted by `unloadModel` after the conn thread
@@ -1010,27 +1022,29 @@ fn coldLoadDisk(raw_stride: u32, capacity: u32, ram_enabled: bool) ColdLoadDisk 
 
 // Connection-local transport preserves a load diagnostic across a concurrent retry.
 threadlocal var last_load_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
-threadlocal var last_load_window_refusal: [384]u8 = undefined;
-threadlocal var last_load_window_refusal_len: usize = 0;
+pub const load_refusal_cap = 2048;
+threadlocal var last_load_refusal: [load_refusal_cap]u8 = undefined;
+threadlocal var last_load_refusal_len: usize = 0;
 
-/// The line of the setting or launch-flag refusal the calling thread's last cold load raised, read once by the HTTP answer.
-pub fn takeLoadWindowRefusal() ?[]const u8 {
-    const len = last_load_window_refusal_len;
-    last_load_window_refusal_len = 0;
-    return if (len == 0) null else last_load_window_refusal[0..len];
+/// The text of the setting, launch-flag or memory refusal the calling thread's last cold load raised, read once by the
+/// HTTP answer.
+pub fn takeLoadRefusal() ?[]const u8 {
+    const len = last_load_refusal_len;
+    last_load_refusal_len = 0;
+    return if (len == 0) null else last_load_refusal[0..len];
 }
 
-fn recordLoadWindowRefusal(line: []const u8) void {
-    const n = @min(line.len, last_load_window_refusal.len);
-    @memcpy(last_load_window_refusal[0..n], line[0..n]);
-    last_load_window_refusal_len = n;
+pub fn recordLoadRefusal(text: []const u8) void {
+    const n = @min(text.len, last_load_refusal.len);
+    @memcpy(last_load_refusal[0..n], text[0..n]);
+    last_load_refusal_len = n;
 }
 
-test "the window refusal a cold load records is read once" {
-    try std.testing.expect(takeLoadWindowRefusal() == null);
-    recordLoadWindowRefusal("--ctx-size 9 is above the 4-token window");
-    try std.testing.expectEqualStrings("--ctx-size 9 is above the 4-token window", takeLoadWindowRefusal().?);
-    try std.testing.expect(takeLoadWindowRefusal() == null);
+test "the refusal a cold load records is read once" {
+    try std.testing.expect(takeLoadRefusal() == null);
+    recordLoadRefusal("--ctx-size 9 is above the 4-token window");
+    try std.testing.expectEqualStrings("--ctx-size 9 is above the 4-token window", takeLoadRefusal().?);
+    try std.testing.expect(takeLoadRefusal() == null);
 }
 
 /// Continuous-batching scheduler. One per server. Owns the inference
@@ -1685,7 +1699,7 @@ pub const Scheduler = struct {
 
     fn ensureLoadedWith(self: *Scheduler, id_or_empty: []const u8, retry_failed: bool) !*LoadedModel {
         last_load_context_refusal = null;
-        last_load_window_refusal_len = 0;
+        last_load_refusal_len = 0;
         // Fast path: ready entries. registry.ensureLoaded handles waiting
         // out .loading / .evicting transitions by other callers.
         const fast_result = if (retry_failed) self.registry.ensureLoadedRetrying(id_or_empty) else self.registry.ensureLoaded(id_or_empty);
@@ -1724,7 +1738,7 @@ pub const Scheduler = struct {
         var launch_buf: [384]u8 = undefined;
         if (model_load.launchRefusal(&launch_buf, owned.config, self.kv_quant, self.ctx_size_flag)) |r| {
             log.err("{s}\n", .{r.line});
-            recordLoadWindowRefusal(r.line);
+            recordLoadRefusal(r.line);
             return r.err;
         }
 
@@ -1911,6 +1925,7 @@ pub const Scheduler = struct {
 
         if (req.error_name) |name| {
             last_load_context_refusal = req.memory_context_refusal;
+            if (req.refusal_text_len > 0) recordLoadRefusal(req.refusal_text[0..req.refusal_text_len]);
             // The failure crosses the thread boundary by NAME — map it back
             // to a typed error so a memory-preflight refusal surfaces as a
             // named 503, not the generic "Model load failed" 500 (#144).

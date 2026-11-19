@@ -51,6 +51,10 @@ fn env(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
 }
 
+/// A note holds a server's refusal whole (a load's memory refusal runs to about 1 KB): the menu shows its start, the
+/// tooltip all of it.
+const note_cap = 2048;
+
 fn Str(comptime N: usize) type {
     return struct {
         buf: [N]u8 = undefined,
@@ -164,7 +168,7 @@ const Shared = struct {
     props_command: Str(80) = .{},
     latest: Str(32) = .{},
     available: bool = false,
-    note: Str(240) = .{},
+    note: Str(note_cap) = .{},
     /// The note says something went wrong: it is drawn orange and opens the Log window.
     note_problem: bool = false,
     note_kind: logic.NoteKind = .other,
@@ -1131,7 +1135,7 @@ fn modelOpWorker(job: ModelOp) void {
     const payload = if (job.unload) logic.unloadModelBody(&body, job.model.get()) else logic.loadModelBody(&body, job.model.get());
     const reply = requestWithin(a, job.port, .POST, target, origin_s, load_timeout_s, payload);
     const verb = if (job.unload) "unload" else "load";
-    var msg: [240]u8 = undefined;
+    var msg: [note_cap]u8 = undefined;
     if (reply) |r| if (r.status == 200) {
         lock();
         if (shared.port == job.port) {
@@ -1326,7 +1330,7 @@ var button_command: Str(80) = .{};
 var confirm_needed = false;
 var confirm_model: Str(96) = .{};
 var confirm_latest: Str(32) = .{};
-var shown_note_sig: [600]u8 = undefined;
+var shown_note_sig: [2 * note_cap + 8]u8 = undefined;
 var shown_note_sig_len: usize = std.math.maxInt(usize);
 var menu_target: objc.id = null;
 var top_menu: objc.id = null;
@@ -1493,7 +1497,7 @@ fn showWhy(why: []const u8) void {
 /// width by drawing `title`; the tooltip has the whole `full` text.
 fn showNote(title: []const u8, full: []const u8, problem: bool) void {
     objc.msg(void, note_mi, "setHidden:", .{title.len == 0});
-    var sig: [600]u8 = undefined;
+    var sig: [2 * note_cap + 8]u8 = undefined;
     const key = std.fmt.bufPrint(&sig, "{s}\x00{s}\x00{d}", .{ title, full, @intFromBool(problem) }) catch return;
     if (key.len == shown_note_sig_len and std.mem.eql(u8, key, shown_note_sig[0..key.len])) return;
     shown_note_sig_len = key.len;
@@ -1574,7 +1578,7 @@ fn refresh() void {
     var srv_b: [32]u8 = undefined;
     var latest_b: [32]u8 = undefined;
     var cmd_b: [80]u8 = undefined;
-    var note_b: [240]u8 = undefined;
+    var note_b: [note_cap]u8 = undefined;
     var listings: [max_listings]logic.Listing = undefined;
     var list_models: [max_listings][96]u8 = undefined;
     var hist: [200]logic.Hist = undefined;

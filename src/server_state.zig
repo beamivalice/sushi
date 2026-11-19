@@ -229,3 +229,4 @@ pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
 // Numeric slot diagnostics cross to error mapping only on this connection's thread.
 pub threadlocal var slot_memory_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
 pub threadlocal var slot_media_refusal: ?vision_queue.MediaRefusal = null;
+pub threadlocal var slot_forward_refusal: ?@import("forward_refusal.zig").Text = null;

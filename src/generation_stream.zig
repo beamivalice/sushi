@@ -16,6 +16,8 @@ const model_load_mod = @import("model_load.zig");
 const vision_queue = @import("vision_queue.zig");
 const slot_admission = @import("slot_admission.zig");
 const model_registry_mod = @import("model_registry.zig");
+const bills_mod = @import("bills.zig");
+const forward_refusal_mod = @import("forward_refusal.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -92,11 +94,13 @@ fn loopTrimmedIds(ids: []const u32, start: ?usize) []const u32 {
 fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
     server_state.slot_memory_context_refusal = slot.memory_context_refusal;
     server_state.slot_media_refusal = slot.media_refusal;
+    server_state.slot_forward_refusal = slot.forward_refusal;
     if (slot.shutdown_cancelled.load(.acquire)) return error.ServerShutdown;
     if (slot.errorNameIs("MediaRefused")) return error.MediaRefused;
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
     if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
     if (slot.errorNameIs("TransientCapExceeded")) return error.TransientCapExceeded;
+    if (slot.errorNameIs("PrefillChunkDoesNotFit")) return error.PrefillChunkDoesNotFit;
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
     return error.GenerationFailed;
 }
@@ -107,6 +111,9 @@ const TRANSIENT_CAP_MSG = "The request needed more transient GPU memory than the
 /// The message `error.PrefillDoesNotFit` sends: refused before its first forward by the same
 /// estimator the guard uses, re-asked after the hot cache gave back everything it could.
 pub const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
+
+/// The message `error.PrefillChunkDoesNotFit` sends when the arch left no text of its own.
+pub const PREFILL_CHUNK_NOFIT_MSG = "This prompt ran out of GPU memory partway through its prefill. Lower --prefill-chunk, retry when other requests finish, or shorten the prompt; the server log quotes the figures.";
 
 /// The message `error.EmptyPrompt` sends: generation continues from the prompt's last token.
 pub const EMPTY_PROMPT_MSG = "The prompt tokenizes to zero tokens; send non-empty text to continue.";
@@ -128,6 +135,8 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
     server_state.slot_memory_context_refusal = null;
     const media_refusal = server_state.slot_media_refusal;
     server_state.slot_media_refusal = null;
+    const forward_refusal = server_state.slot_forward_refusal;
+    server_state.slot_forward_refusal = null;
     return switch (err) {
         // The media encode the prefix restore left to do could not run: the same text and status the
         // connection thread gave before the encode moved behind the restore.
@@ -151,6 +160,14 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .openai_type = "server_error",
             .anthropic_type = "api_error",
             .message = GEN_OOM_MSG,
+        },
+        // Refused mid-prefill for memory: the arch's text names the chunk, the shortfall and what to change.
+        error.PrefillChunkDoesNotFit => .{
+            .status_line = "503 Service Unavailable",
+            .code = 503,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = if (forward_refusal) |r| std.fmt.bufPrint(buf, "{s}", .{r.text()}) catch PREFILL_CHUNK_NOFIT_MSG else PREFILL_CHUNK_NOFIT_MSG,
         },
         error.TransientCapExceeded => .{
             .status_line = "503 Service Unavailable",
@@ -236,7 +253,7 @@ const ErrorSurface = union(enum) {
 /// stream gets the same response its non-streaming twin would; past it the same `type` and
 /// `message` ride the surface's terminal `error` event.
 pub fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror, surface: ErrorSurface) !void {
-    var msg_buf: [192]u8 = undefined;
+    var msg_buf: [@sizeOf(@FieldType(forward_refusal_mod.Text, "buf"))]u8 = undefined;
     const w = mapGenerationError(err, &msg_buf);
 
     if (!stream.sse_headers_sent) {
@@ -2179,17 +2196,59 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
     }
     const refusal = loadRefusalFor(err) orelse return false;
     var buf: [256]u8 = undefined;
-    const message = if (err == error.InsufficientMemory) blk: {
-        const context = scheduler.takeLoadContextRefusal(id) orelse break :blk refusal.message;
-        break :blk memoryContextRefusalMessage(&buf, context);
-    } else if (err == error.ContextSizeAboveWindow or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported)
-        scheduler_mod.takeLoadWindowRefusal() orelse refusal.message
-    else
-        refusal.message;
+    const context = if (err == error.InsufficientMemory) scheduler.takeLoadContextRefusal(id) else null;
+    const message = loadRefusalMessage(&buf, err, refusal, context);
     var retry_buf: [40]u8 = undefined;
     const retry = if (refusal.retry_after) |secs| std.fmt.bufPrint(&retry_buf, "Retry-After: {d}\r\n", .{secs}) catch "" else "";
     try sendErrorResponseWithHeaders(allocator, stream, "503 Service Unavailable", refusal.type, message, 503, retry);
     return true;
+}
+
+/// The message a load refusal's answer carries: the text the load wrote when it wrote one (the memory check's names the
+/// bound and what to free or change), else the refusal's own.
+pub fn loadRefusalMessage(buf: []u8, err: anyerror, refusal: LoadRefusal, context: ?model_registry_mod.MemoryContextRefusal) []const u8 {
+    const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported;
+    if (written) if (scheduler_mod.takeLoadRefusal()) |text| return text;
+    if (context) |c| return memoryContextRefusalMessage(buf, c);
+    return refusal.message;
+}
+
+test "a prefill chunk refused mid-request for memory answers 503 with the arch's whole text, not the admission refusal" {
+    const text = "This prompt ran out of GPU memory partway through its prefill.\nIts 2048-token chunk at token 6144 needs 5.0 GB, and the free memory with every expert-cache pool the prefill can borrow holds 4.5 GB: about 0.5 GB short. The chunks before it ran.\nTo serve it:\n- Lower --prefill-chunk to 1024: a narrower chunk needs less memory at this length.\n- Retry when other requests finish or other apps quit: the memory they hold comes back.\n- Shorten the prompt to under 6144 tokens.";
+    forward_refusal_mod.record(text);
+    server_state.slot_forward_refusal = forward_refusal_mod.take();
+    var buf: [@sizeOf(@FieldType(forward_refusal_mod.Text, "buf"))]u8 = undefined;
+    const w = mapGenerationError(error.PrefillChunkDoesNotFit, &buf);
+    try std.testing.expectEqual(@as(u32, 503), w.code);
+    try std.testing.expectEqualStrings(text, w.message);
+    // With no text left, the answer still names a mid-prefill refusal, never the before-any-work one.
+    const bare = mapGenerationError(error.PrefillChunkDoesNotFit, &buf);
+    try std.testing.expectEqualStrings(PREFILL_CHUNK_NOFIT_MSG, bare.message);
+    try std.testing.expect(std.mem.indexOf(u8, bare.message, "before any work started") == null);
+}
+
+test "a memory-refused load's 503 carries the check's whole text, its lines intact" {
+    const a = std.testing.allocator;
+    var text_buf: [2048]u8 = undefined;
+    const gib: u64 = 1 << 30;
+    const text = bills_mod.loadMemoryRefusalText(&text_buf, .{ .needed = 20 * gib, .avail = bills_mod.sushiAvailable(12 * gib, 0, 29 * gib, 0, 28 * gib) });
+    scheduler_mod.recordLoadRefusal(text);
+    var buf: [256]u8 = undefined;
+    const context = model_registry_mod.MemoryContextRefusal{ .requested = 9, .maximum = 4, .needed = 1, .available = 0, .kv_bits = 8, .chunk = 512 };
+    const message = loadRefusalMessage(&buf, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context);
+    try std.testing.expectEqualStrings(text, message);
+    // The body the web UI and Sushibar read `error.message` from.
+    const escaped = try http.jsonEscape(a, message);
+    defer a.free(escaped);
+    const body = try std.fmt.allocPrint(a, "{{\"error\":{{\"message\":{s}}}}}", .{escaped});
+    defer a.free(body);
+    const E = struct { @"error": struct { message: []const u8 } };
+    const parsed = try std.json.parseFromSlice(E, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(text, parsed.value.@"error".message);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.@"error".message, "Free about 8.0 GB more.\nTo load it:\n- Quit other apps") != null);
+    // Read once: an answer with no text written falls back to the context figures.
+    try std.testing.expect(std.mem.startsWith(u8, loadRefusalMessage(&buf, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context), "Context 9 does not fit"));
 }
 
 /// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for

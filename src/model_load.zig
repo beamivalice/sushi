@@ -815,6 +815,26 @@ fn visionLoadLine(buf: []u8, choice: model_settings.VisionChoice, streamed: bool
         std.fmt.bufPrint(buf, "[vision] off under expert streaming; pass --vision to load the tower (+{d:.2} GB, -{d} slots/layer)", .{ tower, lost })) catch "[vision]";
 }
 
+/// The streamed preflight's need at another ssd budget, as this load's planner plans it (null: the planner refuses it).
+pub const BudgetPlanner = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    config: *const ModelConfig,
+    model_dir: []const u8,
+    vision: bool,
+    assistant: u64,
+    /// Resident bytes the preflight bills beside the plan's (a staged drafter).
+    beside: u64,
+    mtp_on: bool,
+
+    pub fn needAt(p: BudgetPlanner, budget_bytes: u64) ?u64 {
+        const plan = planExpertStreamingWith(p.io, p.allocator, p.config, p.model_dir, budget_bytes, p.vision, p.assistant) catch return null;
+        var planned = p.config.*;
+        applyStreamingPlan(&planned, plan, budget_bytes);
+        return loadRequirementBytes(&planned, plan.split.trunk +| plan.split.mtp +| plan.split.vision +| p.beside, p.mtp_on, 0);
+    }
+};
+
 /// Marks the config streamed: the fields every streamed forward and bill reads.
 pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_bytes: u64) void {
     config.expert_layout = plan.layout;
@@ -1758,6 +1778,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const vision_choice = visionChoiceFor(params.config, streamed);
     var load_vision = params.load_vision and vision_choice.on;
     var vision_cost: VisionCost = .{};
+    // What the planner resolved, for a refusal that names the ssd budget it fits.
+    var planned_resident: u64 = 0;
+    var planned_assistant: u64 = 0;
     if (streamed) {
         var budget = streaming_budget;
         const tier = ramDefaultTierFor(params.config);
@@ -1814,6 +1837,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             expert_source_assigned = true;
         }
         streaming_resident_bytes = plan.split.trunk +| plan.split.mtp +| plan.split.vision;
+        planned_resident = streaming_resident_bytes.?;
+        planned_assistant = assistant_bytes;
         if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
     } else if (try arch_load.residentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on)) |bytes| {
         streaming_resident_bytes = bytes;
@@ -1856,8 +1881,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             /// The Sushi reading's two bounds, as last read.
             last: ?bills.SushiAvailable = null,
             pub fn read(r: *@This()) u64 {
-                if (!r.sushi) return bills.effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit);
-                r.last = bills.sushiAvailable(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, gpu_mem.activeBytes(), r.wired_floor);
+                // An MLX load reads free RAM under the working set alone: no active buffers come off it, no declared floor.
+                r.last = if (r.sushi)
+                    bills.sushiAvailable(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, gpu_mem.activeBytes(), r.wired_floor)
+                else
+                    bills.sushiAvailable(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, 0, 0);
                 return r.last.?.bytes;
             }
             pub fn sleep(r: *@This()) void {
@@ -1879,8 +1907,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         }
         const active: usize = if (reader.sushi) gpu_mem.activeBytes() else 0;
-        var avail_buf: [160]u8 = undefined;
-        const avail_line = if (reader.last) |last| bills.sushiAvailableLine(&avail_buf, last) else "free RAM, capped at the GPU working-set limit that iogpu.wired_limit_mb sets";
+        var avail_buf: [192]u8 = undefined;
+        const wired_mb = bills.wiredLimitBytes() >> 20;
+        const avail_line = bills.sushiAvailableLine(&avail_buf, reader.last.?, if (reader.sushi and reader.wired_floor > 0) wired_mb else 0);
         log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB (warmup + net or context ~{d:.2} GB; {s})\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
@@ -1890,40 +1919,30 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         });
         const gpu_exhausted = model_mod.usesSushiQuantMemoryBill(params.config) and gpu_limit > 0 and active >= gpu_limit;
         if (weights_bytes > 0 and (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed) or gpu_exhausted)) {
-            const gb = 1024.0 * 1024.0 * 1024.0;
+            var refusal = bills.LoadMemoryRefusal{
+                .needed = needed,
+                .avail = reader.last.?,
+                .wired_limit_mb = if (reader.sushi and reader.wired_floor > 0) wired_mb else 0,
+                .wired_beside = active +| bills.wiredUnplannedBytes(bills.launch_state.wired_limit_margin_bytes, bills.gpu_floor_bytes.load(.monotonic)),
+                .total_ram = status.getTotalMemBytes(),
+            };
             if (serving) |b| {
                 const maximum: u32 = if (avail_bytes < loadRequirementBytes(params.config, weights_bytes, mtp_on, 0)) 0 else b.max_context;
                 sch.registry.mutex.lockUncancelable(sch.io);
-                const refusal = model_registry_mod.MemoryContextRefusal{ .requested = b.requested_context, .maximum = maximum, .needed = needed, .available = avail_bytes, .kv_bits = b.kv_bits, .chunk = b.chunk };
-                params.entry.memory_context_refusal = refusal;
-                if (@TypeOf(params) == *LoadRequest) params.memory_context_refusal = refusal;
+                const context = model_registry_mod.MemoryContextRefusal{ .requested = b.requested_context, .maximum = maximum, .needed = needed, .available = avail_bytes, .kv_bits = b.kv_bits, .chunk = b.chunk };
+                params.entry.memory_context_refusal = context;
+                if (@TypeOf(params) == *LoadRequest) params.memory_context_refusal = context;
                 sch.registry.mutex.unlock(sch.io);
-                log.err("Insufficient memory for requested context: {d} tokens at KV{d} and prefill chunk {d} need ~{d:.2} GiB including {d:.2} GiB of enabled model/vision/MTP weights, but only {d:.2} GiB is available ({s}). Maximum context with this memory budget: {d} tokens. Lower --ctx-size or free memory; --skip-mem-preflight, or \"Skip the memory check before loading\" in Settings, overrides this check.\n", .{
-                    b.requested_context,                         b.kv_bits,                                 b.chunk,                                                                              @as(f64, @floatFromInt(needed)) / gb,
-                    @as(f64, @floatFromInt(weights_bytes)) / gb, @as(f64, @floatFromInt(avail_bytes)) / gb, avail_line,
-                    maximum,
-                });
-                return error.InsufficientMemory;
-            }
-            if (params.config.expert_streaming and params.config.expert_ssd_budget_bytes > 0) {
+                refusal.knob = .{ .ctx_size = .{ .requested = b.requested_context, .fits = maximum } };
+            } else if (params.config.expert_streaming and params.config.expert_ssd_budget_bytes > 0) {
                 const budget = params.config.expert_ssd_budget_bytes;
-                log.err("Insufficient memory for an ssd budget of {d} GiB: the streamed load needs ~{d:.1} GB free (its {d:.1} GB, the served warm's narrowest prefill chunk {d:.2} GB and the {d} GiB live reserve) but only {d:.1} GB is available; --ssd-budget-gb {d} fits it (0 = none does), or free memory. --skip-mem-preflight (or \"Skip the memory check before loading\" in Settings) overrides this check.\n", .{
-                    budget >> 30,
-                    @as(f64, @floatFromInt(needed)) / gb,
-                    @as(f64, @floatFromInt(needed -| bills.warmFloorChunkBytes(params.config) -| bills.LIVE_RESERVE_BYTES)) / gb,
-                    @as(f64, @floatFromInt(bills.warmFloorChunkBytes(params.config))) / gb,
-                    bills.LIVE_RESERVE_BYTES >> 30,
-                    @as(f64, @floatFromInt(avail_bytes)) / gb,
-                    bills.streamedBudgetThatFits(budget, needed, avail_bytes),
-                });
-                return error.InsufficientMemory;
+                const planner = BudgetPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = planned_assistant, .beside = weights_bytes -| planned_resident, .mtp_on = mtp_on };
+                refusal.knob = .{ .ssd_budget = .{ .gb = budget >> 30, .fits_gb = bills.streamedBudgetThatFits(budget, avail_bytes, planner) } };
             }
-            log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available ({s}). Close other models/apps (or wait for a prior sushi to fully exit) and retry; pass --skip-mem-preflight (or turn on \"Skip the memory check before loading\" in Settings) to override.\n", .{
-                @as(f64, @floatFromInt(needed)) / gb,
-                @as(f64, @floatFromInt(weights_bytes)) / gb,
-                @as(f64, @floatFromInt(avail_bytes)) / gb,
-                avail_line,
-            });
+            var text_buf: [2048]u8 = undefined;
+            const text = bills.loadMemoryRefusalText(&text_buf, refusal);
+            log.err("{s}\n", .{text});
+            if (@TypeOf(params) == *LoadRequest) params.recordRefusalText(text);
             return error.InsufficientMemory;
         }
     }

@@ -144,4 +144,14 @@ assert.match(page.loadFailureText('Failed to load model: ExpertCacheTooSmall'), 
 assert.match(page.loadFailureText('Failed to load model: OutOfMemory'), /Not enough memory/);
 assert.equal(page.loadFailureText('out of memory: needs 61 GiB'), 'out of memory: needs 61 GiB', 'a message with words stays as the server wrote it');
 assert.match(page.loadFailureText('Failed to load model: SomethingNew'), /SomethingNew.*server log/, 'an unknown tag keeps its name and points to the log');
+// A refused load's message reaches the Models page, the toast and the chat whole, its lines shown as lines.
+const refused = 'Not enough memory to load this model.\nIt needs 20.0 GB, and only 12.0 GB of RAM is free right now. Free about 8.0 GB more.\nTo load it:\n- Quit other apps or unload another model, then retry.\n- Last resort: --skip-mem-preflight skips this check; the load can then fail later or stall the Mac.';
+const body = JSON.stringify({ error: { message: refused, type: 'out_of_memory', param: null, code: 503 } });
+assert.equal(page.loadFailureText(page.adminErrorText(new Error(`503 ${body}`))), refused);
+vm.runInContext(main.slice(main.indexOf('function refusalText('), main.indexOf('// A reply that breaks off')), page);
+assert.equal(page.refusalText(503, refused), refused, 'a message with its own actions gets no generic one, and no cut');
+assert.match(page.refusalText(503, 'Model is loading'), /^Model is loading\. Wait for the model to load/);
+for (const rule of ['.alert span', '.toast', '.chat-error span']) {
+  assert.match(source, new RegExp(`\\${rule.replace(' ', ' ')}[^{]*\\{[^}]*white-space: pre-line`), `${rule} shows a message's lines`);
+}
 console.log('Web UI admin views: passed');
