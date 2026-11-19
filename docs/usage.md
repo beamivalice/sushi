@@ -175,8 +175,8 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
   256 GB Macs load the pack fully resident by default, and a fully resident load serves up to 16 requests at once (8 on
   a Mac without matrix units) as rows of one decode forward, each its single-request output; a streamed load serves one
   at a time ([dsv41-arch](dsv41-arch.md)). Any other RAM size must pass it. The default steps down to the
-  largest budget the Mac's limits hold beside a 1M request and an image encode, and the load log says which limit bound
-  it; a flag outranks `ssd_budget_gb` in `model-settings.json`, which outranks the default. The budget is everything the load keeps resident (trunk, DSpark, vision tower, workspace)
+  largest budget the Mac's limits hold beside a 1M request and an image encode, then to the largest the free RAM at the
+  load holds (so it can be lower while other apps hold memory), and the load log says which limit bound it; a flag outranks `ssd_budget_gb` in `model-settings.json`, which outranks the default. The budget is everything the load keeps resident (trunk, DSpark, vision tower, workspace)
   plus the expert cache, which gets the rest; more budget means more expert slots and fewer SSD reads. Budget, the
   request's state (3.7 GB billed at 1M) and an image encode (1.6 GB) must fit under the GPU limit.
 

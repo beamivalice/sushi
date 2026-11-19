@@ -8,6 +8,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **APIs and server**: a shutdown refuses the requests still waiting from the moment it is asked, instead of serving
   those it reaches within the next second.
+- **DeepSeek-V4.1 loads at its default SSD budget when other apps hold memory**: the release checkpoint on a 256 GB Mac
+  was refused at its default (237 GB against 217 GB free) and asked for `--ssd-budget-gb 215`; the default now fits
+  the free RAM at the load, so it can be lower than before while other apps hold memory, and the load log names it.
 
 ## v1.7.1 — Sushi Cooler, made right: memory, refusals, long conversations
 
