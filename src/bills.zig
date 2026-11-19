@@ -718,11 +718,12 @@ pub fn expertCacheRefusal(config: *const model_mod.ModelConfig, resident_bytes: 
     const budget = config.expert_ssd_budget_bytes;
     if (budget > 0) {
         const beside = expertStreamingBesideBudgetBytes(config);
-        const limit = ssdBudgetCeiling(r.wired_limit, r.budget_working_set);
+        // The ceiling the preflight and admission read: a declared limit's floor, else Metal's working set.
+        const limit = if (r.wired_floor > 0) r.wired_floor else r.budget_working_set;
         if (!ssdBudgetAdmits(budget, beside, limit)) return .{ .err = error.SsdBudgetExceedsWiredLimit, .refusal = .{
             .needed = budget +| beside,
-            .avail = .{ .bytes = limit, .free = null, .gpu = if (r.wired_limit > 0) null else limit, .declared = if (r.wired_limit > 0) limit else null },
-            .wired_limit_mb = r.wired_limit >> 20,
+            .avail = .{ .bytes = limit, .free = null, .gpu = if (r.wired_floor > 0) null else limit, .declared = if (r.wired_floor > 0) limit else null },
+            .wired_limit_mb = if (r.wired_floor > 0) r.wired_limit >> 20 else 0,
             .total_ram = r.total_ram,
             .check = .budget,
         }, .readings = r };
@@ -6867,6 +6868,10 @@ pub const LoadMemoryRefusal = struct {
     check: Check = .preflight,
     /// A resident load of a pack that can stream its experts: the largest `--ssd-budget-gb` that fits (0: none does).
     stream_fits_gb: u64 = 0,
+    /// Whether a published pack of this model is smaller (`packs.smallerPack`); unknown for a pack it does not list.
+    smaller_pack: SmallerPack = .unknown,
+
+    pub const SmallerPack = enum { unknown, none, exists };
 
     /// The check that refused: the preflight (which `--skip-mem-preflight` skips), the streamed load's fit under its
     /// ceiling, or the ssd budget with its planned KV against the GPU limit as a whole (no RAM term, nothing beside).
@@ -6892,7 +6897,7 @@ pub const LoadMemoryRefusal = struct {
 pub fn loadMemoryRefusalText(buf: []u8, r: LoadMemoryRefusal) []const u8 {
     var w = std.Io.Writer.fixed(buf);
     writeLoadMemoryRefusal(&w, r) catch return "Not enough memory to load this model. The server log has the figures.";
-    return w.buffered();
+    return std.mem.trimEnd(u8, w.buffered(), "\n");
 }
 
 fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!void {
@@ -6931,6 +6936,7 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
         },
     }
     try w.print("To load it:\n", .{});
+    if (r.stream_fits_gb > 0) try w.print("- Stream its experts from the SSD: set Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to {d} or less: much less memory, slower decode.\n", .{r.stream_fits_gb});
     const free_short = if (a.free) |f| Mem.short(r.needed, f, u) else Mem.short(0, 0, u);
     if (a.bound() == .free_ram) {
         if (ram_helps) try writeRamAction(w, free_short);
@@ -6939,7 +6945,6 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
         try writeGpuAction(w, r);
         if (ram_short > 0 and ram_helps) try writeRamAction(w, free_short);
     }
-    if (r.stream_fits_gb > 0) try w.print("- Stream its experts from the SSD: set Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to {d} or less: much less memory, slower decode.\n", .{r.stream_fits_gb});
     switch (r.knob) {
         .none => {},
         .ctx_size => |c| if (c.fits > 0) {
@@ -6955,9 +6960,13 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
                 try w.print("- Lower Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to {d} (it is {d}): a smaller expert cache, slower decode.\n", .{ b.fits_gb, b.gb });
         },
     }
-    try w.print("- Use a smaller pack of this model.", .{});
+    switch (r.smaller_pack) {
+        .exists => try w.print("- Use a smaller pack of this model.\n", .{}),
+        .unknown => try w.print("- Use a smaller pack of this model, if one exists.\n", .{}),
+        .none => {},
+    }
     if (r.check != .preflight) return;
-    try w.print("\n- Last resort: --skip-mem-preflight (or \"Skip the memory check before loading\" in Settings) skips this check; the load can then fail later or stall the Mac.", .{});
+    try w.print("- Last resort: --skip-mem-preflight (or \"Skip the memory check before loading\" in Settings) skips this check; the load can then fail later or stall the Mac.", .{});
 }
 
 fn writeRamAction(w: *std.Io.Writer, short: Mem) std.Io.Writer.Error!void {
@@ -7591,7 +7600,7 @@ test "a streamed load whose ssd budget passes the GPU limit is refused in the lo
     // The preflight's skip does not skip this check, so it is not offered.
     try testing.expect(std.mem.indexOf(u8, text, "--skip-mem-preflight") == null);
     // A 256 GB Mac can raise its limit to hold it.
-    const big = expertCacheRefusal(&cfg, 0, .{ .budget_working_set = 192 * gib, .wired_limit = 140 * gib, .total_ram = 256 * gib }).?;
+    const big = expertCacheRefusal(&cfg, 0, .{ .budget_working_set = 192 * gib, .wired_limit = 140 * gib, .wired_floor = 140 * gib, .total_ram = 256 * gib }).?;
     const raised = loadMemoryRefusalText(&buf, big.refusal);
     try testing.expect(std.mem.indexOf(u8, raised, "the GPU memory limit (iogpu.wired_limit_mb = 143360 MB) is 140.0 GB: about 10.0 GB short.") != null);
     try testing.expect(std.mem.indexOf(u8, raised, "sudo sysctl iogpu.wired_limit_mb=153600 ") != null);
@@ -7722,4 +7731,35 @@ test "a streamed load's preflight line names its expert cache as its own term" {
     var resident = cfg;
     resident.expert_streaming = false;
     try testing.expectEqualStrings("weights 5.0 GB, warmup and context 15.0 GB: needs 20.0 GB (bound by free RAM, 30.0 GB)", preflightLine(&buf, &resident, 5 * gib, 20 * gib, "bound by free RAM, 30.0 GB"));
+}
+
+test "the ssd budget is admitted against the ceiling the preflight and admission read: a declared limit's floor" {
+    const gib: u64 = 1 << 30;
+    const mib: u64 = 1 << 20;
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true };
+    // M1's 32 GB Mac: iogpu.wired_limit_mb 28000, its floor 26976 MB under the 1 GiB margin, the ceiling it logs.
+    const m1 = FitReadings{ .wired_limit = 28000 * mib, .wired_floor = 26976 * mib, .budget_working_set = 21 * gib, .working_set = 21 * gib, .total_ram = 32 * gib };
+    cfg.expert_ssd_budget_bytes = 27 * gib;
+    const r = expertCacheRefusal(&cfg, 0, m1) orelse return error.TestExpectedRefusal;
+    try testing.expectEqual(error.SsdBudgetExceedsWiredLimit, r.err);
+    try testing.expectEqual(@as(?u64, 26976 * mib), r.refusal.avail.bytes);
+    // M1's --ssd-budget-gb 30: no GPU limit this Mac can wire holds it, so none is offered.
+    cfg.expert_ssd_budget_bytes = 30 * gib;
+    var buf: [2048]u8 = undefined;
+    const text = loadMemoryRefusalText(&buf, expertCacheRefusal(&cfg, 0, m1).?.refusal);
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "sudo sysctl") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "This Mac cannot give the GPU enough memory for it") != null);
+}
+
+test "a load refusal offers a smaller pack only when one exists, and says so when that is unknown" {
+    const gib: u64 = 1 << 30;
+    var buf: [2048]u8 = undefined;
+    const avail = sushiAvailable(20 * gib, 0, 26 * gib, 0, 0);
+    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .smaller_pack = .none }), "smaller pack") == null);
+    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .smaller_pack = .exists }), "- Use a smaller pack of this model.\n") != null);
+    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail }), "- Use a smaller pack of this model, if one exists.\n") != null);
+    // Streaming, when it fits, is the first action.
+    const streamed = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .total_ram = 32 * gib, .stream_fits_gb = 17 });
+    try testing.expect(std.mem.indexOf(u8, streamed, "To load it:\n- Stream its experts from the SSD") != null);
 }

@@ -46,6 +46,17 @@ pub const aliases = blk: {
     break :blk final;
 };
 
+/// Whether a published pack of the model in `dir` is smaller than it; null when `dir`, by its folder name, is no
+/// published pack (a pack of one's own may have smaller siblings this build does not list).
+pub fn smallerPack(dir: []const u8) ?bool {
+    const base = std.fs.path.basename(std.mem.trimEnd(u8, dir, "/"));
+    const own = for (aliases) |a| {
+        if (std.ascii.eqlIgnoreCase(std.fs.path.basename(a.repo), base)) break a;
+    } else return null;
+    for (aliases) |a| if (std.mem.eql(u8, a.name, own.name) and a.tier_gb < own.tier_gb) return true;
+    return false;
+}
+
 /// "qwen4_exp (Qwen3.8-Flash-Next), mimo_v2 (MiMo-V2.6-Flash), and ...": what a build loads, for the load refusal.
 pub const served_list = blk: {
     var text: []const u8 = "";
@@ -118,4 +129,20 @@ test "every arch declares a product name and at least one pack" {
         try std.testing.expect(registry.Mod(t).packs.product.len > 0);
         try std.testing.expect(registry.Mod(t).packs.aliases.len > 0);
     }
+}
+
+test "a published pack knows whether a smaller pack of its model exists, and a pack it does not list is unknown" {
+    var smallest: ?Alias = null;
+    var larger: ?Alias = null;
+    for (aliases) |a| {
+        if (!std.mem.eql(u8, a.name, aliases[0].name)) continue;
+        if (smallest == null or a.tier_gb < smallest.?.tier_gb) smallest = a;
+    }
+    for (aliases) |a| if (std.mem.eql(u8, a.name, smallest.?.name) and a.tier_gb > smallest.?.tier_gb) {
+        larger = a;
+    };
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(?bool, false), smallerPack(try std.fmt.bufPrint(&buf, "/models/{s}/", .{std.fs.path.basename(smallest.?.repo)})));
+    if (larger) |l| try std.testing.expectEqual(@as(?bool, true), smallerPack(std.fs.path.basename(l.repo)));
+    try std.testing.expectEqual(@as(?bool, null), smallerPack("/models/My-Own-Quant"));
 }

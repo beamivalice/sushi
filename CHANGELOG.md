@@ -28,6 +28,9 @@ earlier history is mlx-serve's, in that project's changelog.
   which already carries the margin, and added it again, so a request within 256 MB of the edge was refused and the
   advertised context came out that much smaller. Its last decode forward is now priced where it runs, at the reply's
   end, so a short prompt with a long reply is billed the scores and state growth of its whole context.
+- **The SSD streaming budget is checked against the same GPU limit the memory check reads**: with a raised
+  `iogpu.wired_limit_mb` it was checked against the raw limit, so a 32 GB Mac read a 29.4 GB limit in one refusal and
+  27.0 GB in the next; a refusal now offers a smaller pack only when one exists.
 - **A load refused by the resident-model budget gives its figures**: it said "The server log names the exact figures";
   it now names what the load needs, the budget and what is left of it, and how to unload a model or raise the budget.
 - **A model that only fits streamed is told so when its resident load is refused**: the refusal now names the Memory for

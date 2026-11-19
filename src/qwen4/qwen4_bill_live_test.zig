@@ -523,3 +523,25 @@ test "Flash-Next resident: the ssd budget a refused resident load offers loads i
     try t.expect(fits >= floor);
     try t.expect(planner.needAt(fits << 30).? <= avail);
 }
+
+test "Flash-Next streamed: the ssd budget a refused budget names is admitted under the same declared limit (QWEN4_STQ_TINY)" {
+    const t = std.testing;
+    const a = t.allocator;
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    var config = try model_mod.parseConfig(t.io, a, dir);
+    defer config.deinit(a);
+    model_load.applyModelSettings(&config, .{});
+    const gib: u64 = 1 << 30;
+    // A 32 GB Mac with iogpu.wired_limit_mb 28000: its floor under the 1 GiB margin is the ceiling every check reads.
+    const readings = bills.FitReadings{ .wired_limit = 28000 << 20, .wired_floor = 26976 << 20, .budget_working_set = 21 * gib, .working_set = 21 * gib, .free = 20 * gib, .total_ram = 32 * gib };
+    const asked: u64 = 30 * gib;
+    var planned = config;
+    model_load.applyStreamingPlan(&planned, try model_load.planExpertStreamingWith(t.io, a, &config, dir, asked, false, 0), asked);
+    const refused = bills.expertCacheRefusal(&planned, 0, readings) orelse return error.TestExpectedRefusal;
+    try t.expectEqual(error.SsdBudgetExceedsWiredLimit, refused.err);
+    const planner = model_load.FitPlanner{ .io = t.io, .allocator = a, .config = &config, .model_dir = dir, .vision = false, .assistant = 0, .readings = readings };
+    const fits = bills.streamedBudgetThatFits(asked, 0, planner);
+    try t.expect(fits > 0 and fits < 30);
+    try t.expectEqual(@as(?u64, 0), planner.needAt(fits << 30));
+    try t.expect(planner.needAt((fits + 1) << 30).? > 0);
+}

@@ -817,12 +817,17 @@ fn visionLoadLine(buf: []u8, choice: model_settings.VisionChoice, streamed: bool
 }
 
 /// The streamed preflight's need at another ssd budget, as this load's planner plans it (null: the planner refuses it).
+fn smallerPackOf(model_dir: []const u8) bills.LoadMemoryRefusal.SmallerPack {
+    const smaller = arch_packs.smallerPack(model_dir) orelse return .unknown;
+    return if (smaller) .exists else .none;
+}
+
 /// A streamed load's fit check once its plan is applied (`bills.expertCacheFitForLoad`): its refusal, or null.
 pub const FitResolver = *const fn (*const model_mod.ModelConfig, u64) ?bills.ExpertCacheRefusal;
 
 /// The ssd budget a refused fit names: `needAt` is 0 for a budget whose plan the fit checks admit on the refusal's
 /// readings, and past any figure otherwise, so `streamedBudgetThatFits(budget, 0, ...)` finds the largest admitted.
-const FitPlanner = struct {
+pub const FitPlanner = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     config: *const ModelConfig,
@@ -1893,6 +1898,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         planned_assistant = assistant_bytes;
         if (params.expert_cache_fit_resolver) |fit| if (fit(params.config, streaming_resident_bytes.?)) |refused| {
             var refusal = refused.refusal;
+            refusal.smaller_pack = smallerPackOf(params.model_dir);
             const asked = params.config.expert_ssd_budget_bytes;
             if (asked > 0) {
                 const planner = FitPlanner{ .io = sch.io, .allocator = sch.allocator, .config = params.config, .model_dir = params.model_dir, .vision = load_vision, .assistant = assistant_bytes, .readings = refused.readings };
@@ -1986,6 +1992,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 .wired_limit_mb = if (reader.sushi and reader.wired_floor > 0) wired_mb else 0,
                 .wired_beside = active +| bills.wiredUnplannedBytes(bills.launch_state.wired_limit_margin_bytes, bills.gpu_floor_bytes.load(.monotonic)),
                 .total_ram = status.getTotalMemBytes(),
+                .smaller_pack = smallerPackOf(params.model_dir),
             };
             if (serving) |b| {
                 const maximum: u32 = if (avail < loadRequirementBytes(params.config, weights_bytes, mtp_on, 0)) 0 else b.max_context;
