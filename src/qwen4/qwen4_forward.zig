@@ -650,7 +650,10 @@ pub fn qwen4MtpRelease(self: *Trunk, st: *Qwen4MtpState) void {
 /// Reset the MTP head's per-request state (KV, indexer keys, position).
 pub fn qwen4MtpReset(self: *Trunk) !void {
     const m = &(self.arch_state.qwen4.mtp orelse return);
+    // A head reset inside a request keeps the request's reservation: the history it regrows is still billed.
+    const reserved = m.cache.reserve_tokens;
     try m.cache.reinit(self.config.num_hidden_layers + 1, m.cache.config);
+    m.cache.reserve(reserved);
     ssmFreeQsaState(&m.entry);
     m.qsa_marks.deinit();
     m.seq_offset = 0;

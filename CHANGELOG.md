@@ -16,6 +16,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A failed memory borrow no longer breaks every later long prompt on DeepSeek until a reload**: a decoder layer whose
   release or read-back failed was left without the memory its prompts read through, so every later prompt past 17
   tokens failed (`MissingExpertSlab`); a failed release or read-back now leaves the layer as it was.
+- **A long Qwen request with MTP on Sushi Cooler stays inside the memory it was admitted with**: the MTP head's cache
+  grew in steps past what admission billed, more the longer the prompt, and now takes its whole reservation up front,
+  as the model's own cache does.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many

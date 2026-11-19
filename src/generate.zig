@@ -1501,8 +1501,8 @@ pub const Generator = struct {
                 if (xfm.config.longCtxGated() or arch_request != null) .min_span_recency else .oldest;
 
             const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, s);
-            // The arch's own per-request buffers reserve at the same length.
-            if (mtp_cache) |*mc| mc.activate();
+            // The arch's own per-request buffers reserve at the same length; the head's rows start at its base.
+            if (mtp_cache) |*mc| try mc.reserve(reserved_tokens -| mtp_position_base, s);
             prefix_arch.aux.reserveQsaHistoryWithHead(
                 ctx.ssm_entries,
                 arch_state.headEntry(&xfm.arch_state),

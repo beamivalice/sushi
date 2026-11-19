@@ -295,6 +295,14 @@ pub const DraftCache = struct {
         };
     }
 
+    /// Reserves the head's history at `rows`, beside the trunk's reservation, so its storage is the bill's
+    /// (`bills.prefillRequestTerms`). Every arch's cache declares it: one whose rows are a fixed ring reserves nothing.
+    pub fn reserve(self: *const DraftCache, rows: usize, s: mlx.mlx_stream) !void {
+        if (no_caches) unreachable else switch (self.u) {
+            inline else => |*c| try c.reserve(rows, s),
+        }
+    }
+
     /// After a forced commit left a hole in the history: starts a head that refuses a gap over. True when it did,
     /// and the pending history stash is stale.
     pub fn reseedAfterForcedCommit(self: *const DraftCache) !bool {

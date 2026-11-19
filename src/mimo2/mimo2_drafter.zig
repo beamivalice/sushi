@@ -44,6 +44,9 @@ pub const Cache = struct {
     /// The prompt's last window rebuilds the head rows, so the final prefill chunk's storage is not evaluated.
     pub const rebuilt_from_tail = true;
 
+    /// The heads' rows are window rings, billed whole (`mimo_mtp.State.billedBytes`): nothing grows with the request.
+    pub fn reserve(_: *const Cache, _: usize, _: mlx.mlx_stream) !void {}
+
     pub fn truncate(self: *Cache, len: usize, s: mlx.mlx_stream) !void {
         try self.st.truncate(s, len);
         self.next_step = 0;

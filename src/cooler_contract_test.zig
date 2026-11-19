@@ -2282,11 +2282,17 @@ fn decodeGrowsInPlace(comptime Q: type) !void {
 
 test "cooler contract: a long reserved request holds no more than its admission bill, prefill and decode" {
     const Q = ContractOf("qwen4");
-    if (comptime @hasDecl(Q, "prompt")) return requestWithinBill(Q);
+    if (comptime @hasDecl(Q, "prompt")) return requestWithinBill(Q, false);
     return error.SkipZigTest;
 }
 
-fn requestWithinBill(comptime Q: type) !void {
+test "cooler contract: a long reserved speculative request holds no more than its admission bill, prefill and decode" {
+    const Q = ContractOf("qwen4");
+    if (comptime @hasDecl(Q, "specOptions")) return requestWithinBill(Q, true);
+    return error.SkipZigTest;
+}
+
+fn requestWithinBill(comptime Q: type, spec: bool) !void {
     try mlx.requireGpu();
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -2295,13 +2301,13 @@ fn requestWithinBill(comptime Q: type) !void {
     for ([_][:0]const u8{ "QWEN4_STQ_TINY", "QWEN4_TEST_MODEL" }) |env| {
         if (!fixtureChosen(selection(), env)) continue;
         const dir = std.mem.span(std.c.getenv(env) orelse continue);
-        try requestWithinBillOn(Q, dir);
+        try requestWithinBillOn(Q, dir, spec);
         ran = true;
     }
     if (!ran) return error.SkipZigTest;
 }
 
-fn requestWithinBillOn(comptime Q: type, dir: []const u8) !void {
+fn requestWithinBillOn(comptime Q: type, dir: []const u8, spec: bool) !void {
     const a = testing.allocator;
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
@@ -2319,7 +2325,7 @@ fn requestWithinBillOn(comptime Q: type, dir: []const u8) !void {
     const kv = bills.configuredKvQuantFor(c);
     const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
     const chunk = @import("prefill_plan.zig").requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0);
-    const bill = bills.prefillNeededAtChunk(c, len, n, kv_bits, chunk, .{});
+    const bill = bills.prefillNeededAtChunk(c, len, n, kv_bits, chunk, .{ .mtp_on = spec });
     const turn = arch_handle.turnFor(ld.h, c);
     defer turn.end();
     defer arch_sched.endRequest(c);
@@ -2333,14 +2339,16 @@ fn requestWithinBillOn(comptime Q: type, dir: []const u8) !void {
     var mlx0: usize = 0;
     _ = mlx.mlx_get_active_memory(&mlx0);
     _ = mlx.mlx_reset_peak_memory();
-    var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, long, n, .{ .temperature = 0.0 }, &.{}, .{});
+    var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, long, n, .{ .temperature = 0.0 }, &.{}, if (spec) Q.specOptions(ld.xfm, 0) else .{});
     defer gen.deinit(a);
-    while (try gen.next(a)) |_| {}
+    if (spec) {
+        while (try gen.nextMtp(a)) |r| a.free(r.tokens);
+    } else while (try gen.next(a)) |_| {}
     mlx.engine.close();
     var mlx_peak: usize = 0;
     _ = mlx.mlx_get_peak_memory(&mlx_peak);
     const held = (mlx.engine.poolHeldPeak(.process) -| held0) + (@as(u64, mlx_peak) -| mlx0);
-    if (held > bill) std.debug.print("cooler contract: {s}: a {d}-token request with {d} new tokens held {d} MB over its {d} MB bill\n", .{ dir, len, n, held >> 20, bill >> 20 });
+    if (held > bill) std.debug.print("cooler contract: {s}: a {d}-token request with {d} new tokens (MTP {}) held {d} KB over its {d} KB bill\n", .{ dir, len, n, spec, (held - bill) >> 10, bill >> 10 });
     try testing.expect(held <= bill);
 }
 

@@ -64,6 +64,14 @@ pub const Cache = struct {
         return if (persistEnabled()) self.t else null;
     }
 
+    /// The head's KV at the request's reserved rows, billed as `bills.mtpHeadKvBytesPerToken` per reserved token.
+    pub fn reserve(self: *const Cache, rows: usize, s: mlx.mlx_stream) !void {
+        self.activate();
+        const kv_cache = &self.t.arch_state.qwen4.mtp.?.cache;
+        kv_cache.reserve(rows);
+        try kv_cache.growToReservation(s);
+    }
+
     pub fn truncate(self: *const Cache, len: usize, _: mlx.mlx_stream) !void {
         self.activate();
         try qwen4_forward.qwen4MtpTruncate(self.t, len);

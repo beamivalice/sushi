@@ -486,6 +486,9 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   `ssm_cache.capBufAppend`), not by its transient bill. Billed as scratch, a 40,388-token cold turn reserving 256,000
   more (Qwen STQ 4bpw, kv8: 12 layers x 312 MiB of KV) outgrew its 4,096-row chunk's ~3.1 GB cap with `PoolOverBudget`
   (r-68). The contract cell `a served cold prefill past the reservation floor...` holds it on both cuts.
+- **A per-request buffer the bill prices at the reservation is reserved at it** (`DraftCache.reserve` beside
+  `reserveRequestCapacity`): the MTP head's KV, billed at the reserved tokens but grown by the +25% policy, raised the
+  cap at every grow (`roomFor`) and held 6.3 MB over the bill at 33,792 tokens on the cut, 140 MB at 98,304 (H1-2).
 - **A chunk's cap counts from the buffers in use, not their asks** (`core.budget`): a turn restored at 58,180 tokens
   of a 58,334-token prompt (Qwen STQ 4bpw, kv8, reserving 256,000 more) holds 8.8 GB of state as its 154-row chunk's
   564 MB cap goes in; at the refusal the pool held 9,366 MB for tensors asking 9,109 (257 MB of size rounding, no
