@@ -42,6 +42,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **The maximum context a memory refusal names is admitted however the prompt and reply split it**: a Qwen3.8 refusal
   for a prompt that did not fit named a context that a shorter prompt with a longer reply was then refused at; every
   context the server names (advertised, `--ctx-size` at load, a refusal's maximum) is now priced at its dearest split.
+  Where little memory is left beside the model (a context under about 50,000 tokens), the advertised context can be a
+  little smaller, so a request at its length is admitted at any split.
 - **A load refusal points only to options it lists**: one that said this Mac cannot give the GPU enough memory told
   the user to "use one of the options below" when it listed none.
 - **A refusal suggests a smaller pack only when one exists**: a request refused for memory always said to use a
