@@ -2659,6 +2659,90 @@ test "dsv41 borrow: a release that fails at any checked call leaves the layer ho
     try expectSameStep(&sc, pair.streamed.m, pair.resident.m, ids[0..25]);
 }
 
+test "dsv41 borrow: a layer left released with no union workspace is healed before the next forward, which serves, and the forward is refused by name when neither the workspace nor the pool can be made (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try stqDir();
+    const model_mod = @import("../model.zig");
+    const Trunk = @import("../trunk.zig").Trunk;
+    const borrow = @import("dsv41_borrow.zig");
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.plain(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+
+    var config = try model_mod.parseConfig(io, testing.allocator, dir);
+    defer config.deinit(testing.allocator);
+    config.expert_streaming = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try testing.allocator.dupe(u8, dir);
+    var served: StqServed = undefined;
+    try served.init(dir, .bfloat16, true, config.dsparkOn(), 8, s);
+    defer served.deinit();
+    var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
+    defer weights.deinit();
+    var xfm = try Trunk.init(io, testing.allocator, config, &weights);
+    defer xfm.deinit();
+    const engine = xfm.expert_stream.?;
+    try testing.expect(engine.plan.resident);
+    const last: u16 = @intCast(config.dsv41.?.layers - 1);
+    const first = 25;
+    const chunk = try sc.ints(@as([]const i32, @ptrCast(ids[0..first])), &.{ 1, first });
+    const want = try model.extend(served.m, ids[0..first], .last);
+    defer _ = mlx.mlx_array_free(want);
+    const exp = try model.hostRows(&sc, want);
+    defer testing.allocator.free(exp);
+    // The next request finds room for its whole prefill: it borrows nothing.
+    BorrowProbe.engine = engine;
+    BorrowProbe.base = 1 << 40;
+    borrow.headroom_fn = &BorrowProbe.headroom;
+    defer {
+        borrow.headroom_fn = null;
+        BorrowProbe.engine = null;
+    }
+    const gpa = engine.allocator;
+    defer engine.allocator = gpa;
+
+    // Every allocation from the swept one on fails, so a release whose workspace fails cannot take its pool back either.
+    var stranded: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        engine.allocator = failing.allocator();
+        const r = engine.borrowLayer(last);
+        engine.allocator = gpa;
+        if (r) |_| {
+            try engine.restoreLayer(last);
+            break;
+        } else |_| {}
+        if (!engine.isBorrowed(last)) continue;
+        try testing.expectEqual(@as(usize, 0), engine.grouped_union.len);
+        stranded += 1;
+        const saved = engine.layers[last].saved.len;
+        try xfm.resetCache();
+        var none = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+        engine.allocator = none.allocator();
+        try testing.expectError(error.ReleasedLayerHasNoUnion, xfm.forward(chunk));
+        engine.allocator = gpa;
+        try testing.expect(engine.isBorrowed(last));
+        try testing.expectEqual(@as(usize, 0), engine.grouped_union.len);
+        try testing.expectEqual(saved, engine.layers[last].saved.len);
+
+        try xfm.resetCache();
+        const logits = try xfm.forward(chunk);
+        defer _ = mlx.mlx_array_free(logits);
+        const got = try model.hostRows(&sc, logits);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(exp), std.mem.sliceAsBytes(got));
+        try engine.restoreLayer(last);
+        try testing.expectEqual(@as(usize, 0), engine.grouped_union.len);
+    }
+    try testing.expect(stranded > 0);
+}
+
 test "dsv41 borrow: a restore whose allocation fails at any point leaves the layer released with its union workspace and its experts remembered, and the next restore completes (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = try stqDir();

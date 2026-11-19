@@ -142,6 +142,7 @@ pub fn enterRows(seqs: []const u64, config: *const ModelConfig, c: *const Config
 
 /// `beforeForward` of a joined decode forward (`enterRows`).
 pub fn beforeRowsForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, seqs: []const u64) !void {
+    try engine.healReleased();
     _ = enterRows(seqs, config, c, mlx_ops);
     const headroom = headroom_fn orelse return;
     if (engine.borrow_from >= engine.layers.len) return;
@@ -320,10 +321,12 @@ pub fn releaseCount(pools: []const u64, need: u64, headroom: u64) ?usize {
     return if (have >= need) pools.len else null;
 }
 
-/// Before a forward of `rows` that ends at `seq`. A prefill-width forward releases decoder pools, latest first, until
-/// its need fits the live headroom, and is refused when all of them do not cover it. A decode forward reads released
-/// pools back while each fits beside its own working set.
+/// Before a forward of `rows` that ends at `seq`. A released layer left with no union workspace is healed first. A
+/// prefill-width forward releases decoder pools, latest first, until its need fits the live headroom, and is refused
+/// when all of them do not cover it. A decode forward reads released pools back while each fits beside its own
+/// working set.
 pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, rows: u64, seq: u64) !void {
+    try engine.healReleased();
     _ = enterForward(rows, seq, config, c, mlx_ops);
     const headroom = headroom_fn orelse return;
     if (engine.borrow_from >= engine.layers.len) return;

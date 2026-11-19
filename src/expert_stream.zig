@@ -3178,11 +3178,30 @@ pub const Engine = struct {
         layer.lent = freed;
         // Released first, so the workspace comes out of the pool it replaces; without one the layer takes its pool back.
         self.ensureUnion() catch |e| {
-            self.restoreLayer(li) catch |re| log.err("[expert-stream] layer {d} stays released with no union workspace: {s}\n", .{ li, @errorName(re) });
+            self.restoreLayer(li) catch |re| log.err("[expert-stream] layer {d} stays released with no union workspace until the next forward: {s}\n", .{ li, @errorName(re) });
             return e;
         };
         self.publishBorrowable();
         return freed;
+    }
+
+    /// A released layer reads its picks through the union workspace. One left without it (a release whose take-back
+    /// failed too) gets the workspace, else its pool back; when neither can be made the forward is refused.
+    pub fn healReleased(self: *Engine) !void {
+        if (self.grouped_union.len != 0) return;
+        for (self.layers) |*layer| {
+            if (layer.borrowed) break;
+        } else return;
+        if (self.ensureUnion()) |_| {
+            self.publishBorrowable();
+            return;
+        } else |union_err| for (self.layers, 0..) |*layer, li| {
+            if (!layer.borrowed) continue;
+            self.restoreLayer(@intCast(li)) catch |e| {
+                log.err("[expert-stream] layer {d} is released with no union workspace: the workspace failed ({s}), and its pool ({s})\n", .{ li, @errorName(union_err), @errorName(e) });
+                return error.ReleasedLayerHasNoUnion;
+            };
+        }
     }
 
     /// Drops a layer's bank, caches, slabs and resident map once no reader holds them; returns the bytes MLX gave back.

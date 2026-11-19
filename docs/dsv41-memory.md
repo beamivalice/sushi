@@ -360,8 +360,8 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   which would also feed DSpark's measured round cost (a cold cache once drove it off wide verifies). Against a 2k-20k
   token decode at ~65 ms a token that is 0.02-0.2% a layer.
 - A release or a restore that fails leaves the layer as it was, and the borrow stops at the first failure: a released
-  layer always has the union workspace, so a release that cannot make it takes its pool back (an error line names a
-  layer whose take-back failed too).
+  layer always has the union workspace, so a release that cannot make it takes its pool back. One whose take-back
+  failed too is healed before the next forward (workspace, else pool), or that forward is `ReleasedLayerHasNoUnion`.
 - Log lines: `[dsv41-borrow] released layers a..39 (X GB) for a N-row forward at P: need, headroom before -> after,
   unwired in T ms` and `[dsv41-borrow] restored n layers (X GB) in T ms before decode`.
 
