@@ -169,9 +169,11 @@ bill function's output on the committed fixture configs of all served packs: a b
   `loadServingBill` uses `prefillNeededAtChunk`, including KV, rings, recurrent/history state, MTP and prefill scratch.
   It prices an explicit prefill width at that width after the architecture's cap; otherwise it proves the per-request
   floor. A refusal reports the largest context that fits the same bill and available memory, capped at
-  the model's context limit. Both price the context on what admission reads once loaded: its bill plus the live
-  checks' `LIVE_RESERVE_BYTES` beside the weights (`freeNeededAfterLoad`, as the served warm's need), so a named or
-  admitted `--ctx-size` is admitted at that length (free 12 GB, 10 GB of weights: 33,024 named, 1 GiB short once loaded). Existing active MLX buffers are subtracted from the GPU working-set limit before this
+  the model's context limit. Both price the context on the room admission reads once loaded (`preflightServing`):
+  the reading less the weights, and less the live checks' `LIVE_RESERVE_BYTES` only where free RAM binds
+  (`SushiAvailable.liveReserve`; `liveCeilingFrom` keeps it off the free RAM, never off the GPU limit or a declared
+  floor), so a named or admitted `--ctx-size` is admitted at that length (free 12 GB, 10 GB of weights: 32,248 named
+  and 1 GiB short once loaded), and a GPU-bound edge still loads. Existing active MLX buffers are subtracted from the GPU working-set limit before this
   check. Cold-load HTTP 503 responses retain the numeric maximum through the transient unloaded reset; retry and
   successful load clear it.
 - Request-time memory refusals for these packs also report a maximum context using the request's actual KV width,

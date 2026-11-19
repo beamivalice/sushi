@@ -1161,6 +1161,17 @@ pub const LoadServingBill = struct {
     chunk: u64,
 };
 
+pub const PreflightServing = struct { serving: ?LoadServingBill, needed: u64 };
+
+/// A load's requirement on a preflight reading, and its explicit context's serving bill: the context is priced on the room
+/// admission reads once the weights are resident, the reading less the live checks' reserve where free RAM binds
+/// (`bills.SushiAvailable.liveReserve`), so a context the preflight admits or a refusal names is admitted at its length.
+pub fn preflightServing(config: *const ModelConfig, weights: u64, mtp_on: bool, avail: bills.SushiAvailable) PreflightServing {
+    const reserve = avail.liveReserve();
+    const serving = if (scheduler_mod.load_serving_bill) |bill| bill(config, if (avail.bytes) |b| b -| weights -| reserve else 0) else null;
+    return .{ .serving = serving, .needed = loadRequirementBytes(config, weights, mtp_on, if (serving) |b| b.needed +| reserve else 0) };
+}
+
 /// The drafter is quantized at load, so it stays resident at its quantized bytes, not its file bytes.
 fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !u64 {
     if (directory.len == 0) return 0;
@@ -1682,7 +1693,7 @@ test "the drafter is billed at its quantized resident bytes and its load transie
     try testing.expectEqual(bare + gib / 2, loadRequirementBytes(&f.qwen, 44 * gib, false, 0));
     // An MTP-on load pays both peaks, and a context bill still replaces them.
     try testing.expectEqual(44 * gib + gib * 5 / 4 + gib / 2 + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 0));
-    try testing.expectEqual(44 * gib + 6 * gib + bills.LIVE_RESERVE_BYTES, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
+    try testing.expectEqual(44 * gib + 6 * gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
 }
 
 test "a cold load reads the serving bill on the config the load stamps with the drafter's request terms" {
@@ -2095,16 +2106,18 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         var avail_bytes = reader.read();
         const mtp_on = mtpChoiceFor(params.mtp, params.config).on;
         // Its maximum context is read only by a refusal, which an unread figure never makes.
-        var serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, if (avail_bytes) |b| b -| weights_bytes else 0) else null;
-        var needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
+        var priced = preflightServing(params.config, weights_bytes, mtp_on, reader.last.?);
+        var serving = priced.serving;
+        var needed = priced.needed;
         if (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed) and reader.freeRamBinds()) {
             log.info("[preflight] {d:.2} GB available of {d:.2} GB needed; waiting while memory is still being released\n", .{
                 @as(f64, @floatFromInt(avail_bytes.?)) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             });
             avail_bytes = bills.settleAvailableBytes(avail_bytes, needed, &reader);
-            serving = if (scheduler_mod.load_serving_bill) |bill| bill(params.config, if (avail_bytes) |b| b -| weights_bytes else 0) else null;
-            needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
+            priced = preflightServing(params.config, weights_bytes, mtp_on, reader.last.?);
+            serving = priced.serving;
+            needed = priced.needed;
         }
         var avail_buf: [192]u8 = undefined;
         const wired_mb = reader.readings.wired_limit >> 20;

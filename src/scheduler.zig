@@ -2310,11 +2310,11 @@ test "a load bills weights, then the larger of the measured warmup plus a 1 GiB 
     const glm_state = f.glm.ssmCheckpointBytes() + f.glm.qsaRingBytes() + (f.glm.kvBytesPerToken() + f.glm.qsaHistoryBytesPerToken()) * 1024;
     try testing.expect(glm_state > 0);
     try testing.expectEqual(90 * gib + glm_state + gib * 3 / 8 + gib, model_load.loadRequirementBytes(&f.glm, 90 * gib, false, 0));
-    // A requested context's admission bill, beside the reserve the live checks keep once loaded, replaces warmup
-    // and net once it is the larger: no request has allocated during the warmup, and admission bills that context again.
-    try testing.expectEqual(44 * gib + 6 * gib + bills.LIVE_RESERVE_BYTES, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
+    // A requested context's admission bill replaces warmup and net once it is the larger: no request has allocated
+    // during the warmup, and request admission bills that context again.
+    try testing.expectEqual(44 * gib + 6 * gib, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
     try testing.expectEqual(44 * gib + gib * 5 / 4 + gib, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, gib));
-    try testing.expectEqual(44 * gib + gib * 9 / 4 + bills.LIVE_RESERVE_BYTES, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, gib * 9 / 4));
+    try testing.expectEqual(44 * gib + gib * 9 / 4, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, gib * 9 / 4));
 }
 
 test "a streamed Flash-Next load bills no expert fill peak; MiMo and GLM keep theirs" {

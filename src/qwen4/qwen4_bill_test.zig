@@ -2335,8 +2335,46 @@ test "Flash-Next on Cooler: the advertised context is admitted when asked on a M
     }
 }
 
-// Modelled: a resident Cooler load of W bytes on a Mac whose free RAM F binds below the GPU working set; after the load
-// the live check reads the same machine, F less the W the load wired.
+/// The load preflight's context terms (`model_load.preflightServing`) with the serving bill the server installs.
+fn preflightAt(cfg: *const model_mod.ModelConfig, weights: u64, a: bills.SushiAvailable) model_load.PreflightServing {
+    const saved = scheduler_mod.load_serving_bill;
+    defer scheduler_mod.load_serving_bill = saved;
+    scheduler_mod.load_serving_bill = &bills.loadServingBill;
+    return model_load.preflightServing(cfg, weights, false, a);
+}
+
+/// Whether a request of `prompt` + `reply` tokens is admitted at `available`, at the width admission picks.
+fn admittedAt(cfg: *const model_mod.ModelConfig, prompt: u64, reply: u32, available: u64) bool {
+    const w: WarmPrefix = .{ .mtp_on = bills.mtpHeadDefaultOn(cfg) };
+    const pick = bills.chooseRequestPrefillChunk(cfg, prompt, reply, 8, available, cfg.pinned_prefill_chunk, 0, w);
+    return prefillNeededAtChunk(cfg, prompt, reply, 8, pick, w) <= available;
+}
+
+// A resident Cooler load of W bytes on a Mac of working set `ws` with F free (`floor` a declared floor, or 0); after the
+// load the live check reads the same machine, F less the W the load wired. The --ctx-size a refusal names (the edge, at
+// 1M asked) passes the preflight and is admitted at every split once loaded. Free RAM binding, the live checks keep their
+// reserve of it; the GPU limit or a declared floor binding, they keep none, and neither does the preflight.
+fn namedContextHolds(cfg: *const model_mod.ModelConfig, weights: u64, ws: u64, free: u64, floor: u64) !?u32 {
+    const a = bills.sushiAvailable(free, 0, ws, 0, floor);
+    const avail = a.bytes.?;
+    launch_state.server_config.max_context_size = 1_000_000;
+    const refused = preflightAt(cfg, weights, a);
+    if (refused.needed <= avail or avail < bills.loadRequirementBytes(cfg, weights, false, 0)) return null;
+    const named = refused.serving.?.max_context;
+    if (named < 1024) return null;
+    launch_state.server_config.max_context_size = named;
+    const at = preflightAt(cfg, weights, a);
+    errdefer std.debug.print("ws {d} MB, floor {d} MB, free {d} MB, weights {d} MB: --ctx-size {d} named; preflight needs {d} MB of {d} MB\n", .{ ws >> 20, floor >> 20, free >> 20, weights >> 20, named, at.needed >> 20, avail >> 20 });
+    try std.testing.expect(at.needed <= avail);
+    const ceiling = bills.gpuCeilingWithWiredFloor(ws, weights, free - weights, floor);
+    const available = bills.admissionAvailableFor(cfg, bills.liveCeilingFrom(ceiling, weights, free - weights), weights, 0);
+    for ([_]u64{ named, named - 1, named / 2, 15 }) |prompt| {
+        errdefer std.debug.print("loaded at --ctx-size {d}: prompt {d} + max_tokens {d} refused at {d} MB\n", .{ named, prompt, named - prompt, available >> 20 });
+        try std.testing.expect(admittedAt(cfg, prompt, @intCast(named - prompt), available));
+    }
+    return named;
+}
+
 test "Flash-Next on Cooler: the --ctx-size a resident load refusal names loads, and is admitted at that length at every prompt and reply split once loaded" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const no_tier = TierGuard.pin(false, 0);
@@ -2348,43 +2386,43 @@ test "Flash-Next on Cooler: the --ctx-size a resident load refusal names loads, 
     try std.testing.expect(model_mod.usesSushiQuantMemoryBill(&cfg));
     const GiB: u64 = 1 << 30;
     const MiB: u64 = 1 << 20;
-    const ws: u64 = 21 * GiB;
+    var named: u32 = 0;
+    // Free RAM binds below a 21 GiB working set.
+    var free: u64 = 12 * GiB;
+    while (free < 21 * GiB) : (free += 256 * MiB) {
+        if (try namedContextHolds(&cfg, 10 * GiB, 21 * GiB, free, 0)) |_| named += 1;
+    }
+    try std.testing.expect(named > 0);
+}
+
+// The mirror of the test above: where the GPU limit or a declared floor binds, admission once loaded reads the whole
+// ceiling (`liveCeilingFrom` takes its reserve off the free RAM only), so the edge the room beside the weights holds
+// loads and is the context a refusal names.
+test "Flash-Next on Cooler: where the GPU limit binds, the --ctx-size at the edge of the room beside the weights loads and is the one a refusal names" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    const saved_ctx = launch_state.server_config.max_context_size;
+    defer launch_state.server_config.max_context_size = saved_ctx;
+    var cfg = coolerFlashNext();
+    cfg.pinned_context = 0;
+    const GiB: u64 = 1 << 30;
+    const MiB: u64 = 1 << 20;
     const weights: u64 = 10 * GiB;
-    var bad: u32 = 0;
-    var tried: u32 = 0;
-    var free: u64 = weights + 2 * GiB;
-    while (free < ws) : (free += 256 * MiB) {
-        launch_state.server_config.max_context_size = 1_000_000;
-        const avail = bills.sushiAvailable(free, 0, ws, 0, 0).bytes.?;
-        const sb = bills.loadServingBill(&cfg, avail - weights) orelse return error.TestUnexpectedResult;
-        if (bills.loadRequirementBytes(&cfg, weights, false, sb.needed) <= avail) continue;
-        if (avail < bills.loadRequirementBytes(&cfg, weights, false, 0)) continue;
-        const named = sb.max_context;
-        if (named < 1024) continue;
-        // The named context passes the preflight.
-        launch_state.server_config.max_context_size = named;
-        const at = bills.loadServingBill(&cfg, avail - weights).?;
-        if (bills.loadRequirementBytes(&cfg, weights, false, at.needed) > avail) {
-            std.debug.print("free {d} MB: --ctx-size {d} named, and the preflight refuses it\n", .{ free >> 20, named });
-            bad += 1;
-            continue;
-        }
-        // Loaded: W more in use, W less free.
-        const ceiling = bills.gpuCeilingWithWiredFloor(ws, weights, free - weights, 0);
-        const available = bills.admissionAvailableFor(&cfg, bills.liveCeilingFrom(ceiling, weights, free - weights), weights, 0);
-        const w: WarmPrefix = .{ .mtp_on = bills.mtpHeadDefaultOn(&cfg) };
-        for ([_]u64{ named, named - 1, named / 2, 15 }) |prompt| {
-            tried += 1;
-            const reply: u32 = @intCast(named - prompt);
-            const pick = bills.chooseRequestPrefillChunk(&cfg, prompt, reply, 8, available, cfg.pinned_prefill_chunk, 0, w);
-            const n = prefillNeededAtChunk(&cfg, prompt, reply, 8, pick, w);
-            if (n <= available) continue;
-            if (bad < 6) std.debug.print("free {d} MB, weights {d} MB: the refusal names --ctx-size {d}; loaded at it, prompt {d} + max_tokens {d} needs {d} MB at width {d}, admission reads {d} MB\n", .{ free >> 20, weights >> 20, named, prompt, reply, n >> 20, pick, available >> 20 });
-            bad += 1;
+    var named: u32 = 0;
+    // Free RAM ample: the working set binds, then a declared floor under a working set above it.
+    for ([_]bool{ false, true }) |declared| {
+        var limit: u64 = 12 * GiB;
+        while (limit <= 21 * GiB) : (limit += 512 * MiB) {
+            const ws = if (declared) 28 * GiB else limit;
+            const floor = if (declared) limit else 0;
+            const at = try namedContextHolds(&cfg, weights, ws, 64 * GiB, floor) orelse continue;
+            named += 1;
+            errdefer std.debug.print("{s} {d} MB: a refusal names {d}\n", .{ if (declared) "declared floor" else "working set", limit >> 20, at });
+            try std.testing.expectEqual(bills.maxSushiContextForBudget(&cfg, 8, limit - weights), at);
         }
     }
-    try std.testing.expect(tried > 0);
-    try std.testing.expectEqual(@as(u32, 0), bad);
+    try std.testing.expect(named > 0);
 }
 
 // Pricing every split walks each one's cache growth (on MLX a page grid a layer a step): the search prices them only to
