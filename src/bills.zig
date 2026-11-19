@@ -1942,14 +1942,14 @@ pub const WarmPrefix = struct {
     /// The request takes a thought point mid-decode: one more checkpoint state, held to its commit.
     thought: bool = false,
 
-    /// Rows of KV this request will not allocate: the rows the restored buffer already holds.
-    /// Capacity is a ceiling on the credit, never a switch: a growing chain outruns its capacity
-    /// on nearly every turn. The grow's own cost is `reserved - credited` plus
-    /// `PrefillRequestTerms.grow_coexist_bytes`. `will_donate` gates the whole credit.
+    /// Rows of KV this request will not allocate: the capacity of the buffers it takes over, which it writes in place
+    /// past the rows it shares (a partial take's too: the record drops the rows past its keep, the slot keeps the
+    /// buffers), up to its reservation. The cache bills those buffers until the slot ends. The grow's own cost is
+    /// `reserved - credited` plus `PrefillRequestTerms.grow_coexist_bytes`. `will_donate` gates the whole credit.
     pub fn creditedRows(self: WarmPrefix, reserved: u64) u64 {
         if (!self.will_donate) return 0;
         if (self.matched_tokens == 0) return 0;
-        return @min(@min(self.matched_tokens, self.capacity_tokens), reserved);
+        return @min(self.capacity_tokens, reserved);
     }
 
     /// Does this append grow the buffers at all? The per-layer grow fires on `offset + new_len
@@ -6175,12 +6175,12 @@ test "bill pin: prefillRequestTerms" {
         230916096, 0, 0, 106496, 12582912, 0, 16, 2048000,
         84811776, 244776960, 346374144, 0, 0, 98304, 0, 0,
         20, 204800000, 84811776, 265175040, 346374144, 0, 0, 106496,
-        217579520, 0, 20, 204800000, 84811776, 244776960, 346374144, 652800000,
+        217579520, 0, 20, 204800000, 84811776, 244776960, 346374144, 783360000,
         65280000, 98304, 0, 0, 20, 204800000, 84811776, 265175040,
         461832192, 0, 0, 106496, 217579520, 0, 20, 204800000,
         153354240, 244776960, 346374144, 0, 0, 98304, 0, 0,
         20, 204800000, 153354240, 265175040, 346374144, 0, 0, 106496,
-        217579520, 0, 20, 204800000, 153354240, 244776960, 346374144, 1228800000,
+        217579520, 0, 20, 204800000, 153354240, 244776960, 346374144, 1474560000,
         122880000, 98304, 0, 0, 20, 204800000, 153354240, 265175040,
         461832192, 0, 0, 106496, 217579520, 0, 20, 204800000,
         62962560, 0, 0, 0, 1360000, 207572352, 0, 0,
@@ -6195,12 +6195,12 @@ test "bill pin: prefillRequestTerms" {
         0, 0, 2560000, 348541440, 0, 0, 20, 3276800,
         79511040, 0, 0, 0, 136000000, 207572352, 0, 0,
         20, 167772160, 79511040, 15173632, 0, 0, 136000000, 207572352,
-        0, 0, 20, 167772160, 79511040, 0, 0, 612000000,
+        0, 0, 20, 167772160, 79511040, 0, 0, 734400000,
         81600000, 207572352, 0, 0, 20, 167772160, 79511040, 15173632,
         0, 0, 136000000, 207572352, 0, 0, 20, 167772160,
         143769600, 0, 0, 0, 256000000, 348541440, 0, 0,
         20, 167772160, 143769600, 15173632, 0, 0, 256000000, 348541440,
-        0, 0, 20, 167772160, 143769600, 0, 0, 1152000000,
+        0, 0, 20, 167772160, 143769600, 0, 0, 1382400000,
         153600000, 348541440, 0, 0, 20, 167772160, 143769600, 15173632,
         0, 0, 256000000, 348541440, 0, 0, 20, 167772160,
         0, 0, 0, 0, 0, 0, 0, 0,
@@ -6285,12 +6285,12 @@ test "bill pin: prefillNeededAtChunk" {
     try pinConfigs("prefillNeededAtChunk", &.{
         1114378240, 1128148992, 932073472, 1243607040, 1475517760, 1489288512, 1293212992, 1604746560,
         1196478464, 1210249216, 930025472, 1325707264, 1557617984, 1571388736, 1291164992, 1686846784,
-        4463783936, 4756965376, 3729383936, 4901287936, 6209949824, 6507432064, 5475549824, 6651754624,
-        5702987776, 5996169216, 4320587776, 6140491776, 7479627904, 7777110144, 6097227904, 7921432704,
+        4463783936, 4756965376, 3566183936, 4901287936, 6209949824, 6507432064, 5312349824, 6651754624,
+        5702987776, 5996169216, 4013387776, 6140491776, 7479627904, 7777110144, 5790027904, 7921432704,
         1717825920, 1736792960, 1623822720, 1736792960, 2373073280, 2392040320, 2279070080, 2392040320,
         1974385280, 1993352320, 1797438080, 1993352320, 2629632640, 2648599680, 2452685440, 2648599680,
-        3627130720, 3646097760, 2794130720, 3646097760, 5689548640, 5708515680, 4856548640, 5708515680,
-        5129713280, 5148680320, 3561713280, 5148680320, 7236368000, 7255335040, 5668368000, 7255335040,
+        3627130720, 3646097760, 2641130720, 3646097760, 5689548640, 5708515680, 4703548640, 5708515680,
+        5129713280, 5148680320, 3273713280, 5148680320, 7236368000, 7255335040, 5380368000, 7255335040,
         2089683520, 2089683520, 2089683520, 2274208320, 2729646720, 2729646720, 2729646720, 2914171520,
         2121102080, 2121102080, 2121102080, 2305626880, 2760733440, 2760733440, 2760733440, 2945258240,
         3000684160, 3000684160, 3000684160, 3369733760, 5014994560, 5014994560, 5014994560, 5384044160,
@@ -6647,6 +6647,19 @@ test "getEffectiveContextLength uses ctx_size override" {
     var config = model_mod.ModelConfig{};
     config.max_position_embeddings = 32768;
     try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&config));
+}
+
+test "a takeover's warm credit is the capacity it writes in place, up to the reservation, and a share's is none" {
+    const t = std.testing;
+    // The taken buffers hold the last turn's reservation past the rows this prompt shares: none of it is asked again.
+    const taken = WarmPrefix{ .matched_tokens = 2_985, .capacity_tokens = 3_840, .will_donate = true };
+    try t.expectEqual(@as(u64, 3_840), taken.creditedRows(4_096));
+    // A reservation inside the buffers is the whole credit.
+    try t.expectEqual(@as(u64, 3_500), taken.creditedRows(3_500));
+    const shared = WarmPrefix{ .matched_tokens = 2_985, .capacity_tokens = 3_840, .will_donate = false };
+    try t.expectEqual(@as(u64, 0), shared.creditedRows(4_096));
+    const cold = WarmPrefix{ .matched_tokens = 0, .capacity_tokens = 3_840, .will_donate = true };
+    try t.expectEqual(@as(u64, 0), cold.creditedRows(4_096));
 }
 
 test "a warm restore whose buffers hold the prompt but not the reservation bills one window of old rows" {

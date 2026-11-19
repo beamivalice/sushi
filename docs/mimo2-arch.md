@@ -288,8 +288,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   prompt longer than 2048 tokens depends on the width memory allowed. The ungated load-time pin subtracts the
   hot-cache ask first and lands on 512, 1024 or 2048 with the memory active at load. It is only the fallback,
   and the load line says so.
-- **A MiMo prefill evicts the hot cache to be admitted** (`admissionEvictsHotCache`): the warm credit is the restored
-  global rows only (`kvBytesPerToken` and `residentCapacityTokens` skip the ring), the ring and the slot's checkpoint
+- **A MiMo prefill evicts the hot cache to be admitted** (`admissionEvictsHotCache`): the warm credit is the taken-over
+  global layers' capacity only (`kvBytesPerToken` and `residentCapacityTokens` skip the ring), the ring and the slot's checkpoint
   copies are billed whole every turn, and a shared or SSD restore credits nothing. Adaptive width and mid-prefill
   stepping stay qwen4_exp-only.
 - **A ringed arch RESERVES its cache capacity up front** (`ModelConfig.reservesKvCapacity`, narrower than

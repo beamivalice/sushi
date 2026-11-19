@@ -8,6 +8,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **APIs and server**: a shutdown refuses the requests still waiting from the moment it is asked, instead of serving
   those it reaches within the next second.
+- **A long Qwen3.8 conversation's next turn is refused less often near the memory limit**: a turn that takes the cached
+  conversation over is no longer billed again for the room its taken-over cache already holds for the reply.
 - **A Qwen3.8 turn after a refused one keeps the conversation's restore points**: a turn refused for memory after it
   had taken over part of the cached conversation left a cut behind, and the next turn that took the whole entry cut
   the conversation's cache back to the refused turn's share, so a later regenerate re-read text it had cached.

@@ -511,6 +511,9 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   and the scheduler's `admissionPassArmed` read that one predicate), crediting only
   provably reclaimable bytes; `PrefillDoesNotFit` → 400 by name. A warm share that does not fit is first taken
   over (`checkoutRestored`: its append donates, so the restored rows are not billed twice).
+- **A takeover is credited the capacity it takes over, up to its reservation** (`WarmPrefix.creditedRows`): its append
+  writes in place past the shared rows, and the hot cache bills those buffers until the slot ends. A partial take
+  too: its record keeps only the share, the slot keeps the buffers. A share is credited nothing.
 - **A prompt that does not fit unloads idle resident models before it is refused** (`fitAfterUnloadingIdle`,
   `Scheduler.unloadLruIdleModel`): least recently used first, re-billed after each, never the request's own model and
   never one a request holds; the connection thread asks, the inference thread frees.

@@ -1518,7 +1518,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     const f = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, fits);
     try t.expect(reserved > 450_048);
     try t.expectEqual(450_048 *| kv_per_tok / 12, f.grow_coexist_bytes);
-    try t.expectEqual(@as(u64, 11_102), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
+    try t.expectEqual(@as(u64, 11_079), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
 
     // Byte-identical arms: a SHARED restore is copied whole by the first append, so it credits
     // nothing and bills no window either; a COLD prompt has nothing to credit.
@@ -1664,13 +1664,16 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     try t.expectEqual(@as(u64, 787_419), reserved);
     try t.expect(reserved <= capacity);
 
-    // `will_donate`: this restore checked out its entry, so the buffers are the slot's own.
+    // `will_donate`: this restore checked out its entry, so the buffers, the reservation and all, are the slot's own.
     const warm_prefix = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = capacity, .will_donate = true };
-    try t.expectEqual(matched, warm_prefix.creditedRows(reserved));
+    try t.expectEqual(reserved, warm_prefix.creditedRows(reserved));
 
-    // The credit is the handed-over rows at this arch's KV width and nothing else, inside the 5/4.
-    const credit = matched * kv_per_tok;
-    try t.expectEqual(@as(u64, 786_676 * 13_056), credit);
+    // The credit is the handed-over capacity up to the reservation the bill prices (on the KV's page grid: all of it),
+    // at this arch's KV width and nothing else, inside the 5/4.
+    const rows = bills.cacheStorage(&cfg, seq, max_tokens, kv_bits, chunk, warm_prefix).rows;
+    try t.expectEqual(capacity, rows);
+    const credit = warm_prefix.creditedRows(rows) * kv_per_tok;
+    try t.expectEqual(@as(u64, 787_456 * 13_056), credit);
     try t.expect(credit < matched * (kv_per_tok + cfg.qsaHistoryBytesPerToken()));
     const warm = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, warm_prefix);
     // Isolated against a shared restore of the same span: `checkpoint_bytes` follows `matched` too.
@@ -1706,21 +1709,23 @@ test "a chain extension that OUTGROWS the resident entry is credited the rows it
     const extend = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = capacity, .will_donate = true };
     try t.expect(reserved > capacity);
     try t.expect(extend.grows(seq));
-    try t.expectEqual(@as(u64, 786_707), extend.creditedRows(reserved));
+    try t.expectEqual(capacity, extend.creditedRows(reserved));
     const per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
     const ext_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, extend);
     const window = attnLayersPerEvalWindow(&cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS);
     try t.expectEqual(capacity * per_tok / cfg.attnCacheLayerCount() * window, ext_terms.grow_coexist_bytes);
     try t.expectEqual(
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) -
-            (786_707 * per_tok - ext_terms.grow_coexist_bytes) * 5 / 4,
+            (capacity * per_tok - ext_terms.grow_coexist_bytes) * 5 / 4,
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, extend),
     );
 
-    // A buffer that already covers the reservation credits the full shared prefix: the gate is capacity, not prompt length.
+    // A buffer that already covers the reservation credits the whole of it, as the bill prices it on the KV's page
+    // grid: nothing is allocated past the shared prefix.
     const roomy = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = 1_048_576, .will_donate = true };
-    try t.expectEqual(@as(u64, 786_707), roomy.creditedRows(reserved));
-    const credit = 786_707 * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    try t.expectEqual(reserved, roomy.creditedRows(reserved));
+    const roomy_rows = bills.cacheStorage(&cfg, seq, max_tokens, kv_bits, chunk, roomy).rows;
+    const credit = roomy.creditedRows(roomy_rows) * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
     try t.expectEqual(
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) - credit * 5 / 4,
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, roomy),
@@ -1751,11 +1756,12 @@ test "the warm KV credit fires ONLY where the restore checked its entry out" {
     // (1) qwen4_exp, SSD-first, full-prefix hit, switch on: the credit is real.
     const donating = (CheckoutCase{}).warm(matched, capacity);
     try t.expect(donating.will_donate);
-    try t.expectEqual(matched, donating.creditedRows(reserved));
+    try t.expectEqual(reserved, donating.creditedRows(reserved));
     const warm = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, donating);
     // Baseline = a shared restore of the same span, so the two credits are not folded into one comparison.
     const shared_same_span = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{ .matched_tokens = matched, .capacity_tokens = capacity });
-    try t.expectEqual(shared_same_span - matched * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) * 5 / 4, warm);
+    const priced = bills.cacheStorage(&cfg, seq, max_tokens, kv_bits, chunk, donating).rows;
+    try t.expectEqual(shared_same_span - donating.creditedRows(priced) * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) * 5 / 4, warm);
     try t.expect(warm / mb > 6_500 and warm / mb < 8_500);
 
     // Every arm below is the same restore minus one conjunct of the checkout, and every one shares.
@@ -1914,8 +1920,8 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     // 8192 tokens of generation: the reservation the turn ran under (a max_tokens is billed whole now; the 418,224 the
     // client sent would be refused by name).
     const max_tokens: u32 = 8192;
-    // The restored buffer is smaller than the reservation, so it grows and the rows it holds
-    // are still credited. This block keeps the original turn-B decomposition by pricing the
+    // The restored buffer is smaller than the reservation, so it grows and its capacity is
+    // still credited. This block keeps the original turn-B decomposition by pricing the
     // SHARED restore of the same span, whose credit is zero for the other reason.
     const turn_b_donating = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = true };
     const turn_b = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = false };
@@ -1923,7 +1929,7 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     try t.expectEqual(seq + max_tokens + chunk, reserve_rows);
     try t.expect(reserve_rows > turn_b.capacity_tokens);
     try t.expectEqual(@as(u64, 0), turn_b.creditedRows(reserve_rows));
-    try t.expectEqual(@as(u64, 364_478), turn_b_donating.creditedRows(reserve_rows));
+    try t.expectEqual(@as(u64, 365_568), turn_b_donating.creditedRows(reserve_rows));
 
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
     const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);

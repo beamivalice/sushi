@@ -4113,6 +4113,82 @@ test "cooler contract: a served speculative Qwen conversation of takeovers, part
     }.run);
 }
 
+test "cooler contract: a served Qwen takeover turn, whole or partial, is credited the capacity it writes in place, and holds no more in use than the exact part of its bill" {
+    try eachQwenServed(struct {
+        /// The warm inputs of the last admission probe that took the entry over.
+        var taken: ?@import("bills.zig").WarmPrefix = null;
+        var seq: usize = 0;
+
+        fn fitsTaken(_: *const @import("model.zig").ModelConfig, prompt_len: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, capacity: u64, will_donate: bool, mtp: bool, cps: @import("scheduler.zig").CheckpointPlan) bool {
+            if (matched > 0 and will_donate) {
+                taken = .{ .matched_tokens = matched, .capacity_tokens = capacity, .will_donate = true, .mtp_on = mtp, .checkpoints = cps.keep, .released = cps.released, .thought = cps.thought };
+                seq = prompt_len;
+            }
+            return matched == 0 or will_donate;
+        }
+
+        const Turn = struct { sv: *Served, prompt: []const u32 };
+
+        fn go(q: Turn) !void {
+            var f: u32 = 0;
+            var got = try q.sv.request(q.prompt, 16, &f);
+            got.deinit(testing.allocator);
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const bills = @import("bills.zig");
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            const c = &ld.config;
+            const kv = bills.configuredKvQuantFor(c);
+            const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+            const chunk: u64 = c.prefillStartWidth();
+            // The unnamed small tensors of a request: well under one recurrent state set.
+            const small: u64 = 4 << 20;
+            var sv: Served = undefined;
+            try sv.initTiers(&ld, dir, 1 << 30);
+            defer sv.deinit();
+            var conv = try PartialShare.serve(&sv, ids, 200);
+            defer conv.deinit();
+            const fits_was = Served.scheduler.prefill_admission_fits;
+            defer Served.scheduler.prefill_admission_fits = fits_was;
+            Served.scheduler.prefill_admission_fits = fitsTaken;
+            defer taken = null;
+            // A whole take (turn 3 extends turn 2's entry), then a partial one (turn 4 re-renders turn 3's tail).
+            var third: std.ArrayList(u32) = .empty;
+            defer third.deinit(a);
+            try third.appendSlice(a, conv.entry.items);
+            var said = try heldPrompt(a, ids, 100, 4);
+            defer said.deinit(a);
+            try third.appendSlice(a, said.items);
+            var fourth: std.ArrayList(u32) = .empty;
+            defer fourth.deinit(a);
+            for ([_]bool{ false, true }) |partial| {
+                errdefer std.debug.print("cooler contract: {s}: the {s} takeover turn\n", .{ dir, if (partial) "partial" else "whole" });
+                const prompt = if (partial) blk: {
+                    try fourth.appendSlice(a, third.items[0 .. third.items.len - 50]);
+                    var more = try heldPrompt(a, ids, 100, 5);
+                    defer more.deinit(a);
+                    try fourth.appendSlice(a, more.items);
+                    break :blk fourth.items;
+                } else third.items;
+                taken = null;
+                const peak = try inUsePeak(Turn{ .sv = &sv, .prompt = prompt }, go);
+                const warm = taken orelse return error.TestTurnNotTakenOver;
+                // The buffers the turn took hold the last turn's reservation, past the rows it shares.
+                try testing.expect(warm.capacity_tokens > warm.matched_tokens);
+                const reserved = bills.cacheStorage(c, seq, 16, kv_bits, chunk, warm).rows;
+                try testing.expectEqual(@min(warm.capacity_tokens, reserved), warm.creditedRows(reserved));
+                const exact = bills.requestHeldBytes(c, seq, 16, kv_bits, chunk, warm);
+                if (peak > exact + small) std.debug.print("cooler contract: {d} KB in use at the peak, {d} KB past the exact bill ({d} KB)\n", .{ peak >> 10, (peak - exact) >> 10, exact >> 10 });
+                try testing.expect(peak <= exact + small);
+            }
+        }
+    }.run);
+}
+
 test "cooler contract: a served Qwen partial takeover refused before it donates leaves no cut on the entry, so the next turn takes the entry whole and keeps its restore points" {
     try qwenTinyServed(struct {
         /// Admission that refuses every warm request, taken over or shared.
