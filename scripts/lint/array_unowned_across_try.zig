@@ -1,7 +1,8 @@
-//! Rule `array-unowned-across-try`: an mlx array that a checked call has filled, held only by a local across a later
-//! `try`, or made by one `try` of an array literal that a later `try` of the same literal can fail. The error return
-//! drops the handle: on Sushi Cooler its buffer stays in the engine's pool for the life of the process. Owned means a
-//! `defer`/`errdefer` that names it, or a hand-off (`= x;`, `return`) before that later `try`. Token scan, no Sema.
+//! Rule `array-unowned-across-try`: an mlx array that a checked call has filled, or that a local took out of its
+//! owner's field (`const v = e.f; e.f = .{ .ctx = null };`), held only by that local across a later `try`; or made by
+//! one `try` of an array literal that a later `try` of the same literal can fail. The error return drops the handle:
+//! on Sushi Cooler its buffer stays in the engine's pool for the life of the process. Owned means a `defer`/`errdefer`
+//! that names it, or a hand-off (`= x;`, `return`) before that later `try`. Token scan, no Sema.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const rule = @import("rule.zig");
@@ -21,11 +22,17 @@ pub fn check(arena: std.mem.Allocator, tree: *const Ast, report: rule.Report) !v
             if (secondTry(tree, brace)) |at| try report.add(tree, at, owner, "an array literal of mlx arrays made by several trys: a later one that fails leaks the earlier slots; fill them one by one behind a defer", .{});
             continue;
         }
-        if (tree.tokenTag(t) != .keyword_var or tree.tokenTag(t + 1) != .identifier or tree.tokenTag(t + 2) != .equal) continue;
-        if (!isNew(tree, t + 3)) continue;
+        if (tree.tokenTag(t + 1) != .identifier or tree.tokenTag(t + 2) != .equal) continue;
         const v = tree.tokenSlice(t + 1);
-        if (unownedTry(tree, t + 9, v)) |at| {
-            try report.add(tree, at, owner, "'{s}' holds a filled array across this try, which leaks it on an error: errdefer its free, or hand it to its owner first", .{v});
+        if (tree.tokenTag(t) == .keyword_var and isNew(tree, t + 3)) {
+            if (unownedTry(tree, t + 9, v, false)) |at| {
+                try report.add(tree, at, owner, "'{s}' holds a filled array across this try, which leaks it on an error: errdefer its free, or hand it to its owner first", .{v});
+            }
+        } else if (tree.tokenTag(t) == .keyword_const or tree.tokenTag(t) == .keyword_var) {
+            const after = takes(tree, t + 3) orelse continue;
+            if (unownedTry(tree, after, v, true)) |at| {
+                try report.add(tree, at, owner, "'{s}' holds an array it took from its owner across this try, which leaks it on an error: errdefer its return", .{v});
+            }
         }
     }
 }
@@ -41,6 +48,26 @@ fn isNew(tree: *const Ast, at: u32) bool {
     const tags = [_]std.zig.Token.Tag{ .identifier, .period, .identifier, .l_paren, .r_paren, .semicolon };
     for (tags, 0..) |tag, i| if (tree.tokenTag(at + @as(u32, @intCast(i))) != tag) return false;
     return std.mem.eql(u8, tree.tokenSlice(at), "mlx") and std.mem.eql(u8, tree.tokenSlice(at + 2), "mlx_array_new");
+}
+
+/// `a.b.f; a.b.f = .{ .ctx = null };` at `at`, a field's array taken out and its field cleared: the token after it.
+fn takes(tree: *const Ast, at: u32) ?u32 {
+    var t = at;
+    if (tree.tokenTag(t) != .identifier) return null;
+    while (tree.tokenTag(t + 1) == .period and tree.tokenTag(t + 2) == .identifier) t += 2;
+    const len = t + 1 - at;
+    if (len < 3 or tree.tokenTag(t + 1) != .semicolon) return null;
+    const again = t + 2;
+    if (again + len + 9 >= tree.tokens.len) return null;
+    for (0..len) |i| {
+        const x: u32 = @intCast(i);
+        if (tree.tokenTag(at + x) != tree.tokenTag(again + x)) return null;
+        if (tree.tokenTag(at + x) == .identifier and !std.mem.eql(u8, tree.tokenSlice(at + x), tree.tokenSlice(again + x))) return null;
+    }
+    const tags = [_]std.zig.Token.Tag{ .equal, .period, .l_brace, .period, .identifier, .equal, .identifier, .r_brace, .semicolon };
+    for (tags, 0..) |tag, i| if (tree.tokenTag(again + len + @as(u32, @intCast(i))) != tag) return null;
+    if (!std.mem.eql(u8, tree.tokenSlice(again + len + 4), "ctx") or !std.mem.eql(u8, tree.tokenSlice(again + len + 6), "null")) return null;
+    return again + len + @as(u32, tags.len);
 }
 
 /// The `{` of a `[_]mlx.mlx_array{` or `[N]mlx.mlx_array{` literal starting at `at` (not a fn's return type and body).
@@ -78,11 +105,11 @@ fn secondTry(tree: *const Ast, brace: u32) ?u32 {
     return null;
 }
 
-/// The first `try` after a `try` statement that filled `v` (`&v`), with no guard of `v` and no hand-off between, in
-/// `v`'s block.
-fn unownedTry(tree: *const Ast, from: u32, v: []const u8) ?u32 {
+/// The first `try` after a `try` statement that filled `v` (`&v`), or after `from` when `v` holds an array already
+/// (`held`, a `try` that names it takes it), with no guard of `v` and no hand-off between, in `v`'s block.
+fn unownedTry(tree: *const Ast, from: u32, v: []const u8, held: bool) ?u32 {
     var depth: i32 = 0;
-    var filled = false;
+    var filled = held;
     var t = from;
     while (t + 2 < tree.tokens.len) : (t += 1) {
         switch (tree.tokenTag(t)) {
@@ -93,6 +120,8 @@ fn unownedTry(tree: *const Ast, from: u32, v: []const u8) ?u32 {
             },
             .keyword_try => {
                 if (keeps(tree, t, v)) return null;
+                // A call that takes a handle takes it on every path, an error's too.
+                if (held and namesBeforeSemicolon(tree, t, v)) return null;
                 const n = fills(tree, t, v);
                 // A later fill of `v` is read as another branch's (`if .. try f(&v) else try g(&v)`).
                 if (filled and n == 0) return t;

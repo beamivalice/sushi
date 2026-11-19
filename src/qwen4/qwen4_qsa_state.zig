@@ -592,6 +592,8 @@ pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint,
         if (src_hist < keep) return error.QsaHistoryGap;
         const own = dst.aux_state;
         dst.aux_state = .{ .ctx = null };
+        // A failure below hands the entry its own leftover back, for the caller's reset to free.
+        errdefer dst.aux_state = own;
         if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
         dst.qsa_pooled = .{ .ctx = null };
         const ratio = @max(src.qsa_ratio, 1);

@@ -1680,7 +1680,7 @@ test "cooler contract: a Cooler load failed at the first checked MLX call of any
                 mlx.fault.sites = .{ .from = .root, .frames = load_sweep_frames.get(phase), .lasts = phase == .load };
                 const points = try mlx.sweepPoints(testing.allocator, &mlx.fault.sites, R{ .dir = dir, .phase = phase }, R.go);
                 defer testing.allocator.free(points);
-                const path = std.hash.Wyhash.hash(@intFromEnum(phase), std.mem.sliceAsBytes(points));
+                const path = std.hash.Wyhash.hash(@backingInt(phase), std.mem.sliceAsBytes(points));
                 if ((try seen.getOrPut(path)).found_existing) continue;
                 for (points) |k| {
                     const r = try faultedLoad(C, dir, phase, k);
@@ -1792,7 +1792,6 @@ test "cooler contract: a Cooler request failed at any of its checked MLX call si
     S.sites = &seen;
     try eachLayout(S.run);
 }
-
 
 test "cooler contract: an exact Cooler speculative request says its greedy tokens, over one row, past the verify edge and a chunk" {
     try eachFixture(struct {
@@ -2208,7 +2207,6 @@ test "cooler contract: a Cooler request refused at any pool buffer site fails as
     S.sites = &seen;
     try eachLayout(S.run);
 }
-
 
 /// The Cooler contract of the arch registered as `name`, or an empty struct where the build left it out: a shared test
 /// of one arch's load checks `@hasDecl` and skips, so the drop of that arch still compiles it.
@@ -2759,7 +2757,6 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
         }
     }.run);
 }
-
 
 /// A DeepSeek request `a` prefilled over `long` whose client left as its prefill ended, and a next request over `other`
 /// that fails before it publishes. `race`: the next one takes the model's state before `a`'s connection completes it,
@@ -3477,7 +3474,7 @@ test "cooler contract: a served Qwen conversation keeps its newest off-grid rest
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             const dws = @import("disk_write_stats.zig");
-            const ssm = @intFromEnum(dws.Kind.ssm);
+            const ssm = @backingInt(dws.Kind.ssm);
             var ld: Load = undefined;
             try ld.open(Q, dir, true);
             defer _ = ld.close();
@@ -3723,7 +3720,6 @@ test "cooler contract: a served Qwen turn no longer than the RAM entry it partly
     }.run);
 }
 
-
 test "cooler contract: a served Qwen turn whose partial share fits once an idle entry is evicted is served as a share, and the entry it restores from stays whole (#109)" {
     try eachQwenServed(struct {
         var cache: ?*const @import("prefix_cache.zig").HotPrefixCache = null;
@@ -3843,11 +3839,12 @@ fn takeoverAtRest(hc: *const @import("prefix_cache.zig").HotPrefixCache) bool {
     return sum == hc.current_kv_bytes;
 }
 
-test "cooler contract: a served Qwen takeover turn refused at each pool site it reaches leaves the hot cache at rest and the pool as it was, and the next turn is served" {
+test "cooler contract: a served Qwen takeover turn refused at each pool site it reaches, under a roomy and a tight RAM budget, leaves the hot cache at rest and the pool as it was, and the next turn is served" {
     try qwenTinyServed(struct {
         ld: *Load,
         dir: []const u8,
         ids: []const u32,
+        ram: u64,
 
         /// Turns 1 and 2, then the partial takeover turn 3, refused at `at` (none: served). A sweep records turn 3 alone.
         fn turns(q: @This(), sv: *Served, at: ?mlx.FaultSites.SitePoint) !void {
@@ -3873,7 +3870,7 @@ test "cooler contract: a served Qwen takeover turn refused at each pool site it 
 
         fn go(q: @This()) anyerror!void {
             var sv: Served = undefined;
-            try sv.initTiers(q.ld, q.dir, 1 << 30);
+            try sv.initTiers(q.ld, q.dir, q.ram);
             defer sv.deinit();
             try q.turns(&sv, null);
         }
@@ -3883,38 +3880,42 @@ test "cooler contract: a served Qwen takeover turn refused at each pool site it 
             var ld: Load = undefined;
             try ld.open(Q, dir, true);
             defer _ = ld.close();
-            const q: @This() = .{ .ld = &ld, .dir = dir, .ids = ids };
-            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-            defer seen.deinit(a);
-            const points = try firstAsks(a, &seen, Q, q, go);
-            defer a.free(points);
-            try testing.expect(points.len > 0);
-            const base = Sheet.now();
-            for (points, 1..) |pt, k| {
-                errdefer std.debug.print("cooler contract: the takeover turn refused at pool site {d} of {d}\n", .{ k, points.len });
-                {
-                    var sv: Served = undefined;
-                    try sv.initTiers(&ld, dir, 1 << 30);
-                    defer sv.deinit();
-                    sv.quiet_failures = true;
-                    try q.turns(&sv, pt);
-                    if (pt.strict) try testing.expect(!mlx.engine.fault.armed());
-                    mlx.engine.fault.disarm();
-                    const hc = &sv.entry.prefix_cache.?;
-                    if (hc.disk) |*d| d.drainWriter();
-                    try testing.expect(takeoverAtRest(hc));
-                    try testing.expect(!mlx.errorPending());
-                    // The conversation goes on past its third turn.
-                    var f: u32 = 0;
-                    var next = try heldPrompt(a, ids, 3300, 0);
-                    defer next.deinit(a);
-                    var got = try sv.request(next.items, 8, &f);
-                    got.deinit(a);
-                    try testing.expect(takeoverAtRest(hc));
+            // The tight budget restores from the SSD tier, a QSA overlay included: the same sites as the roomy budget's
+            // unwind through another caller there, so each budget sweeps its own.
+            for ([_]u64{ 1 << 30, 24 << 20 }) |ram| {
+                var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+                defer seen.deinit(a);
+                const q: @This() = .{ .ld = &ld, .dir = dir, .ids = ids, .ram = ram };
+                const points = try firstAsks(a, &seen, Q, q, go);
+                defer a.free(points);
+                try testing.expect(points.len > 0);
+                const base = Sheet.now();
+                for (points, 1..) |pt, k| {
+                    errdefer std.debug.print("cooler contract: the takeover turn under a {d} MB RAM tier refused at pool site {d} of {d}\n", .{ ram >> 20, k, points.len });
+                    {
+                        var sv: Served = undefined;
+                        try sv.initTiers(&ld, dir, ram);
+                        defer sv.deinit();
+                        sv.quiet_failures = true;
+                        try q.turns(&sv, pt);
+                        if (pt.strict) try testing.expect(!mlx.engine.fault.armed());
+                        mlx.engine.fault.disarm();
+                        const hc = &sv.entry.prefix_cache.?;
+                        if (hc.disk) |*d| d.drainWriter();
+                        try testing.expect(takeoverAtRest(hc));
+                        try testing.expect(!mlx.errorPending());
+                        // The conversation goes on past its third turn.
+                        var f: u32 = 0;
+                        var next = try heldPrompt(a, ids, 3300, 0);
+                        defer next.deinit(a);
+                        var got = try sv.request(next.items, 8, &f);
+                        got.deinit(a);
+                        try testing.expect(takeoverAtRest(hc));
+                    }
+                    const now = Sheet.now();
+                    try testing.expectEqual(base.in_use, now.in_use);
+                    try testing.expectEqual(@as(u32, 0), now.open);
                 }
-                const now = Sheet.now();
-                try testing.expectEqual(base.in_use, now.in_use);
-                try testing.expectEqual(@as(u32, 0), now.open);
             }
         }
     }.run);
@@ -4267,7 +4268,7 @@ fn heldPrompt(a: std.mem.Allocator, ids: []const u32, n: usize, seed: usize) !st
 }
 
 fn ssmWritten() u64 {
-    return @import("disk_write_stats.zig").process.snapshot().written[@intFromEnum(@import("disk_write_stats.zig").Kind.ssm)];
+    return @import("disk_write_stats.zig").process.snapshot().written[@backingInt(@import("disk_write_stats.zig").Kind.ssm)];
 }
 
 test "cooler contract: a held Qwen restore point another conversation pushes out of RAM is written, not dropped, and restores" {

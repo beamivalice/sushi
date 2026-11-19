@@ -451,6 +451,15 @@ printf '%s\n' 'const mlx = @import("mlx.zig");' 'const Sc = struct {' '    fn ke
   && printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn k(x: mlx.mlx_array) !void {' '    var m = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_sigmoid(&m, x, null));' '    try mlx.check(mlx.mlx_array_eval(m));' '}' > "$TMP/t/src/p_test.zig"
 expect_green "a guarded local, a hand-off before the try, a scope's keep and res, fills on two branches, and a _test file"
 
+tree
+printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn take(e: *E, s: mlx.mlx_stream) !void {' '    const own = e.aux;' '    e.aux = .{ .ctx = null };' '    try work(s);' '    e.aux = own;' '}' > "$TMP/t/src/p.zig"
+expect_red "a field's array taken out across a try" "src/p.zig:5:5 \[array-unowned-across-try\] take: 'own' holds an array it took from its owner across this try"
+
+tree
+printf '%s\n' 'const mlx = @import("mlx.zig");' 'fn take(e: *E, s: mlx.mlx_stream) !void {' '    const own = e.aux;' '    e.aux = .{ .ctx = null };' '    errdefer e.aux = own;' '    try work(s);' '    e.aux = own;' '}' \
+  'fn give(e: *E, r: *R) !void {' '    const pre = e.state;' '    e.state = .{ .ctx = null };' '    try r.hold(pre);' '}' > "$TMP/t/src/p.zig"
+expect_green "a taken array returned by an errdefer, and one a call takes"
+
 # rule json-unchecked-shape
 tree
 printf '%s\n' 'const std = @import("std");' 'pub fn f(parsed: std.json.Parsed(std.json.Value)) ?std.json.Value {' '    const root = parsed.value.object;' \
