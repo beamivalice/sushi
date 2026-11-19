@@ -285,6 +285,8 @@ prompt, one boot per arm. At S=1 the default 16 splits launch exactly 32 threadg
   1·2·64 > 32, so `qsaAttnSimdgroups` returns it.
 - Served decode, MTP depth 2 pinned, 512 tokens: 64 splits 34.6 tok/s against 33.7 and 32.0 for the default (A B A).
   With MTP off, which removes acceptance noise: 25.08 against 24.73 and 24.56 (A B A).
+- MTP depth is a measured row, not the generic cap 6: forced depth 1..6 read 32.2 / 33.9 / 35.0 / 31.9 / 29.3 / 27.5
+  tok/s on the same prompt. `--mtp` with no bounds now caps at 3 on this chip (`src/mtp.zig`); the launcher keeps pinning 2.
 - Greedy text diverges with the split count (the merge order changes, as at every nsplit); these cells are rates, not
   a byte gate. BK stays 16: the BK=8 seam fails the kernel's launch check on 1.7.0 (MlxError), so it is not an arm.
 

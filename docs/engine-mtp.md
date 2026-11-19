@@ -151,6 +151,9 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - **Calibrate per machine**: boot `--mtp-min-depth N --mtp-max-depth N` for each N on one prompt set (same boot rules as
   [process-measurement](process-measurement.md)), read `[spec-stats]` tok/s per N, then set max where the curve turns
   down and min where a shallower round never wins.
+- **Measured rows** (human forced-depth sweeps, never interpolated; an unmeasured chip keeps the profile's 6): M1 Pro 4;
+  M1 Max 3 (2026-11-19, Flash-Next STQ 2.75bpw, 5.7k-token decode, depth 1..6 = 32.2 / 33.9 / 35.0 / 31.9 / 29.3 / 27.5
+  tok/s, while the generic cap 6 held the planner at 34.3 after exploring 2-5); base M4 4; base M5 4.
 
 <a id="lookup"></a>
 ## Prompt lookup inside the round
