@@ -1107,7 +1107,8 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   `dsv41-state-v6-dspark` when the stages are resident; the tag moves whenever the default boot's bytes or the layout do, last
   when the wide hyper-connection mix moved to the matrix units, and no reader of an old tag exists), then `-simd` when the SIMD attention kernel serves, `-hcalu` when the ALU mix kernel serves, `-composed` for a
   `SUSHI_DSV41_COMPOSED=1` boot, `-dsparkinexact` for `SUSHI_DSV41_DSPARK_EXACT=0` with DSpark, then the drop list and
-  lossy pick. The key reads `Model.attn_nax` and `Model.hc_mix_nax` after the load's trials, so a declined trial, `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
+  lossy pick, and last `-map` with a digest of the Engram token map the load runs (`diskLayoutKey`: the pack's
+  `engram_token_map.json` or the built-in table, as `loadTokenMap` picked it), which no shard stamp covers. The key reads `Model.attn_nax` and `Model.hc_mix_nax` after the load's trials, so a declined trial, `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
   or a GPU without NAX never writes into the namespace the matrix-unit boots read (their key is unchanged). It is hashed
   into the tier's fingerprint beside the pack's shard names, sizes and mtimes and `config.json`: another pack, another
   slot set, another arm or a bumped tag never reads these entries. Any change to what a stored state means bumps the

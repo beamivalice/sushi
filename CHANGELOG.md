@@ -59,6 +59,8 @@ earlier history is mlx-serve's, in that project's changelog.
   is answered the same way, naming the `--prefill-chunk` that fits, rather than "refused before any work started".
 - **A resident DeepSeek load without DSpark no longer compiles kernels inside a request** when nine or more requests
   decode together: the load's warm now runs every joined width.
+- **A DeepSeek pack whose Engram token map changed no longer restores conversations stored under the old map**: the SSD
+  cache key now names the map the load runs. DeepSeek conversations stored by an earlier version are not reused, once.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many

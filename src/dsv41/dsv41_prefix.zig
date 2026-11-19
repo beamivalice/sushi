@@ -432,12 +432,16 @@ pub fn rowDivisors(allocator: std.mem.Allocator, c: *const @import("dsv41_config
     return divs;
 }
 
-/// The SSD namespace of a loaded DeepSeek model: `layoutKey` over the boot's arms and the expert drop list it names.
+/// The SSD namespace of a loaded DeepSeek model: `layoutKey` over the boot's arms and the expert drop list it names,
+/// and the Engram token map it runs (the pack's `engram_token_map.json` or the built-in one): every Engram row reads it.
 pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const @import("../model.zig").ModelConfig, model_dir: []const u8, xfm: *transformer.Trunk) !?[]u8 {
     var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else try expert_usage.load(allocator, model_dir, config.expertDropRequest());
     defer if (drop) |*d| d.deinit();
     const m = xfm.arch_state.dsv41.model.?;
-    return try layoutKey(allocator, config.dsparkOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, @import("../expert_stream.zig").pick_tolerance, m.hc_mix_nax, config.expertCacheBias());
+    const key = try layoutKey(allocator, config.dsparkOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, @import("../expert_stream.zig").pick_tolerance, m.hc_mix_nax, config.expertCacheBias());
+    if (m.token_map.len == 0) return key;
+    defer allocator.free(key);
+    return try std.fmt.allocPrint(allocator, "{s}-map{x:0>16}", .{ key, std.hash.XxHash64.hash(0, std.mem.sliceAsBytes(m.token_map)) });
 }
 
 /// The SSD namespace of one boot: `namespaceTag` plus what changes the numbers a stored state was computed

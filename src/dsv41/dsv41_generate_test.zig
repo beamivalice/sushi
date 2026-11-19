@@ -5015,6 +5015,24 @@ test "dsv41 engine: a Cooler state rolled back in place to a point it kept conti
     }
 }
 
+test "dsv41 engine: the SSD namespace names the Engram token map the load runs, so a pack whose map changed reads no state stored under the old one (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    try testing.expect(m.token_map.len > 0);
+    const before = (try dsv41_prefix.diskLayoutKey(a, &fx.xfm.config, dir, &fx.xfm)).?;
+    defer a.free(before);
+    m.token_map[0] +%= 1;
+    defer m.token_map[0] -%= 1;
+    const after = (try dsv41_prefix.diskLayoutKey(a, &fx.xfm.config, dir, &fx.xfm)).?;
+    defer a.free(after);
+    try testing.expect(!std.mem.eql(u8, before, after));
+}
+
 test "dsv41 engine: a finished request's state is the next turn's deepest point, and the turn continues from it as the state itself would (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
