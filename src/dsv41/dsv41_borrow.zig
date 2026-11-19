@@ -691,11 +691,10 @@ test "dsv41 borrow: the pool cap is the decode cap up to a verify block and the 
 }
 
 test "dsv41 borrow: at the budget-115 and 117 geometries no chunk releases a pool, and under a 2048-row chunk's cap one goes" {
-    const c = try cfg_mod.releaseStqForTest();
+    var c = try cfg_mod.releaseStqForTest();
     // Both expand arms: the fused one serves on a matrix-unit GPU, the chain elsewhere.
     for ([_]bool{ true, false }) |fused_expand| {
-        const pin = @import("dsv41_wide_bytes.zig").pinArms(fused_expand, true);
-        defer pin.restore();
+        c.wide_arms = .of(true, fused_expand);
         errdefer std.debug.print("dsv41 borrow: fused expand {any}: a 2048-row chunk needs {d}\n", .{ fused_expand, prefillNeed(&c, true, 2048, 2048) });
         // Live at `--ssd-budget-gb 115` (280 slots a layer): the decoder pools a prefill may release, and the headroom there.
         const pools = [_]u64{ 2_700_000_000, 2_700_000_000, 2_760_000_000 };

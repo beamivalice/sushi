@@ -1956,6 +1956,13 @@ fn settleLoadLatch(had_error: bool) void {
     log.warn("[load] MLX raised an error nothing handled during the load; cleared so the first request does not fail on it: {s}\n", .{msg});
 }
 
+/// `Trunk.init` for a caller that bills from its own copy of the config: the copy takes what the load decided.
+pub fn initTrunk(io: std.Io, allocator: std.mem.Allocator, config: *model_mod.ModelConfig, weights: *Weights) !Trunk {
+    const t = try Trunk.init(io, allocator, config.*, weights);
+    arch_config.adoptLoaded(config, &t.config);
+    return t;
+}
+
 pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     load_clock.begin();
     defer load_clock.end();
@@ -2214,7 +2221,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const xfm_ptr = try sch.allocator.create(Trunk);
     errdefer sch.allocator.destroy(xfm_ptr);
     const build_t0 = load_clock.now();
-    xfm_ptr.* = try Trunk.init(sch.io, sch.allocator, params.config.*, weights_ptr);
+    xfm_ptr.* = try initTrunk(sch.io, sch.allocator, params.config, weights_ptr);
     load_clock.buildDone(build_t0);
     errdefer xfm_ptr.deinit();
     publishEngine(xfm_ptr, params.config);

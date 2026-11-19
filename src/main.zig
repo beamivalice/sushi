@@ -1267,7 +1267,7 @@ fn runCli(init: std.process.Init) !void {
         defer weights.deinit();
         model_mod.resolveWeightPrefix(config, &weights);
 
-        var xfm = try trunk.Trunk.init(io, allocator, config.*, &weights);
+        var xfm = try model_load.initTrunk(io, allocator, config, &weights);
         defer xfm.deinit();
 
         xfm.round_cost.layout = round_cost_mod.layoutFor(config);

@@ -76,6 +76,21 @@ pub const Vision = struct {
     }
 };
 
+/// A wide forward's hyper-connection expand (the fused kernel, or `hcExpandOps`'s chain) and Engram gate (the kernel, or
+/// `engramGateOps`'s chain): the chains hold planes the kernels do not.
+pub const WideArms = struct {
+    expand_fused: bool,
+    engram_fused: bool,
+
+    /// The served kernels' arms: a matrix-unit GPU with its fused kernels on.
+    pub const kernels: WideArms = .{ .expand_fused = true, .engram_fused = true };
+
+    /// A load's arms: `fused`, its kernels on; `expand_probed`, `hcExpandFused` reproduces this GPU's chain.
+    pub fn of(fused: bool, expand_probed: bool) WideArms {
+        return .{ .expand_fused = fused and expand_probed, .engram_fused = fused };
+    }
+};
+
 /// Who asked for decode on MLX instead of the engine of our own.
 
 pub const Config = struct {
@@ -143,6 +158,9 @@ pub const Config = struct {
     /// The most rate groups one layer's routed experts span in an STQ pack (`ModelConfig.expert_rate_groups`, set
     /// once the pack's layout is read); 1 for an ungrouped pack.
     rate_groups: u8 = 1,
+    /// The wide forward's arms the shape sum bills (`dsv41_wide_bytes`): what the parse predicts for this GPU until
+    /// the load records its own (`dsv41_model.setFused`). Null only for a config no parse made.
+    wide_arms: ?WideArms = null,
 
     pub fn isDsparkTarget(self: *const Config, l: usize) bool {
         for (self.dspark.targets[0..self.dspark.n_targets]) |t| if (t == l) return true;
@@ -426,7 +444,9 @@ fn parseVision(obj: std.json.ObjectMap) !Vision {
 
 /// The DeepSeek part of the parse, onto the shared `ModelConfig` (taken as `anytype`: this file stays free of `model.zig`).
 pub fn parseFamily(config: anytype, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
-    const c = try parse(cfg_obj, root);
+    var c = try parse(cfg_obj, root);
+    // What a planner bills before the load probes its arms: the fused expand serves on the matrix-unit (NAX) GPUs.
+    c.wide_arms = .of(true, sushi_exl3.kernels.gemmNaxOn());
     config.model_type = "deepseek_v41";
     config.weight_prefix = "";
     config.text_prompt_bos = config.bos_token_id;
@@ -661,10 +681,7 @@ test "dsv41 forward cap: a wide forward's row term is the shape sum of its wides
     const rel_stq = try releaseStqForTest();
     const rel = try parseText(release_config);
     const Case = struct { c: *const Config, rows: u64, shapes: u64 };
-    // The served kernels' arms: the fused hyper-connection expand and the Engram gate kernel.
-    const pin = @import("dsv41_wide_bytes.zig").pinArms(true, true);
-    defer pin.restore();
-    // The tiny: layer 2 (Engram, KV source and index owner) at its routed chain over six pools; its trace at three
+    // At `parseText`'s arms, the served kernels'. The tiny: layer 2 (Engram, KV source and index owner) at its routed chain over six pools; its trace at three
     // pools reads these less the three spill pools. The release: layer 14 (the same roles) over ten pools (the STQ
     // pack's combined chain) or the FP4 experts' sorted gather.
     for ([_]Case{
@@ -681,6 +698,22 @@ test "dsv41 forward cap: a wide forward's row term is the shape sum of its wides
         errdefer std.debug.print("{d} rows: shape sum {d}\n", .{ k.rows, got });
         try testing.expectEqual(k.shapes, got);
     }
+}
+
+test "dsv41 forward cap: each config bills its own wide arms, whichever was priced or loaded before it" {
+    const rows: u64 = 8192;
+    var chain = try parseText(stq_tiny_config);
+    chain.rate_groups = 3;
+    chain.wide_arms = .of(false, true);
+    var fused = chain;
+    fused.wide_arms = .of(true, true);
+    const chain_cap = chain.forwardCap(rows, rows);
+    const fused_cap = fused.forwardCap(rows, rows);
+    errdefer std.debug.print("chain arms {d}, kernel arms {d}\n", .{ chain_cap, fused_cap });
+    // The chains' planes: four f32 `[L,hc,D]` and an f32 `[L,D]` per expand, eight f32 `[L,hc,D]` in the Engram write.
+    try testing.expect(chain_cap > fused_cap);
+    try testing.expectEqual(chain_cap, chain.forwardCap(rows, rows));
+    try testing.expectEqual(fused_cap, fused.forwardCap(rows, rows));
 }
 
 test "dsv41 prefill width: a request starts at 8192 rows on every chip, the router's tile a whole number of times" {
@@ -791,7 +824,10 @@ pub fn parseText(json: []const u8) !Config {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
-    return parse(root.get("text_config").?.object, root);
+    var c = try parse(root.get("text_config").?.object, root);
+    // A fixture prices the served kernels' arms on every box; a test of another arm sets its own.
+    c.wide_arms = .kernels;
+    return c;
 }
 
 test "dsv41 config: the V4.1-Flash release parses to its geometry" {

@@ -168,7 +168,7 @@ without it. An arch added later joins the list in the landing that adds it.
   `declared_wired_ceiling`, `own_dflash_bill` and `fills_slabs_in_place`. A predicate only one arch's folder reads (batched decode,
   the source trunk) is a function of that arch's config file. An arch declares
   `config_types` (what its parse reads, text twins included), `discovery_types`, `config_facts` and `parseConfig`,
-  and may declare `parseDir`, `adoptLayout`, `samplingDefaults` and `streamedResidentSplit`. `model.served_model_types`
+  and may declare `parseDir`, `adoptLayout`, `adoptLoaded` (`model_load.initTrunk`), `samplingDefaults` and `streamedResidentSplit`. `model.served_model_types`
   lists every registered type, enabled or not (`registry.registered_model_types`, from each registry line's own
   `model_types` and `gate_rank`, its place in the gate's refusal text, so a left-out arch's files are never read); a test of one arch skips when `registry.ofModelType` says the build left it out. Shared parse code calls those, never a type name.
 - **The guest line.** A registry line's `guest` says whether a host may route the arch's model types to this release

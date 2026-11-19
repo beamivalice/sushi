@@ -83,6 +83,8 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         mdl.profile.?.* = .init(verify_profile);
     }
     var shell = try initModuleShell(allocator, config, model_stream);
+    // The trunk's bills price the arms this load serves; `arch_config.adoptLoaded` hands them to the caller's config.
+    shell.config.dsv41.?.wide_arms = mdl.cfg.wide_arms;
     // The shell frees what it has been given: the experts' stream from its making, the model and the engine below.
     errdefer {
         shell.arch_state.dsv41.deinit(allocator);

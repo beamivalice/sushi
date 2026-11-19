@@ -1464,6 +1464,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     if (c.engram.n > 0) try initEngram(m, weights, dir_path);
     if (mlx.streamIsGpu(s)) try kernels.probeHc(gpa, s, c.hc_mult, c.dim, c.hc_iters);
     if (mlx.streamIsGpu(s)) try kernels.probeTopk(gpa, s);
+    m.cfg.wide_arms = .of(m.fused, kernels.hcExpandProbed());
     m.ced_split = c.cedSplit();
     return m;
 }
@@ -4106,7 +4107,7 @@ pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) 
 /// Sets the kernels off (the diagnostic `SUSHI_DSV41_COMPOSED`, the KLD A/B's teacher arm) or on, and says which.
 pub fn setFused(m: *Model, composed: bool) void {
     m.fused = !composed;
-    kernels.noteExpandArm(m.fused);
+    m.cfg.wide_arms = .of(m.fused, kernels.hcExpandProbed());
     log.info("[dsv41] fused kernels {s}{s}, hc expand kernel {s}\n", .{ if (m.fused) "on" else "off", if (composed) " (diag)" else "", if (m.fused and kernels.hcExpandProbed()) "on" else "off" });
 }
 

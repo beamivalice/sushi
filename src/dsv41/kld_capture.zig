@@ -1766,7 +1766,7 @@ test "deepseek_v41 layer-major capture: flags it takes and refuses, and the batc
     try refuse(&cfg, loadOptions(bad, 1 << 30));
 
     // The release's geometry.
-    var dc = dsv_cfg.Config{ .vocab = 129280, .dim = 5120, .layers = 40, .heads = 64, .head_dim = 512, .q_lora = 1280, .o_lora = 1024, .o_groups = 8, .window = 128, .experts = 384, .top_k = 6, .moe_inter = 2304, .hc_mult = 4, .index_heads = 64, .index_head_dim = 128, .index_topk = 512 };
+    var dc = dsv_cfg.Config{ .vocab = 129280, .dim = 5120, .layers = 40, .heads = 64, .head_dim = 512, .q_lora = 1280, .o_lora = 1024, .o_groups = 8, .window = 128, .experts = 384, .top_k = 6, .moe_inter = 2304, .hc_mult = 4, .index_heads = 64, .index_head_dim = 128, .index_topk = 512, .wide_arms = .kernels };
     dc.engram = .{ .n = 2, .max_ngram = 4, .heads = 8, .head_dim = 256 };
     const per_expert = try dsv_stream.expertBytes(&dc);
     try testing.expectEqual(@as(u64, 18_800_640), per_expert);

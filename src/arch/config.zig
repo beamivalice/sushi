@@ -271,6 +271,14 @@ pub fn adoptLayout(config: *model.ModelConfig) void {
     }
 }
 
+/// What the arch's load decided that its bills read, from the loaded trunk's config onto `config`, the caller's copy.
+pub fn adoptLoaded(config: *model.ModelConfig, loaded: *const model.ModelConfig) void {
+    const tag = tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| if (@hasDecl(registry.Mod(t), "adoptLoaded")) registry.Mod(t).adoptLoaded(config, loaded),
+    }
+}
+
 /// The family's documented sampling truncation, for a checkpoint that ships no generation_config.json.
 pub fn samplingDefaults(config: *model.ModelConfig) void {
     const tag = tagOf(config) orelse return;

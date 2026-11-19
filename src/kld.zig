@@ -360,7 +360,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     errdefer self.weights.deinit();
     model_mod.resolveWeightPrefix(&self.config, &self.weights);
 
-    self.xfm = try trunk.Trunk.init(io, allocator, self.config, &self.weights);
+    self.xfm = try model_load.initTrunk(io, allocator, &self.config, &self.weights);
     errdefer self.xfm.deinit();
     if (opts.kv_quant_config.scheme != .off) {
         try self.xfm.cache.reinit(self.config.num_hidden_layers, opts.kv_quant_config);

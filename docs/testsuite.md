@@ -296,7 +296,7 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
   a read past it fails by name, never as a short answer.
 - Deterministic: no dependence on scheduler timing, machine memory or test order. Global overrides restore in `defer`.
 - A number a load or the GPU's class decides is pinned by the test that reads it: DeepSeek's wide-forward shape sum
-  reads the expand and Engram arms the last load recorded, else the GPU's (`dsv41_wide_bytes.pinArms`).
+  reads the arms of the config it prices (`Config.wide_arms`), the served kernels' from `parseText`, never a global.
 - No dependence on where the test binary sits: `tests/gate.sh` builds it in a cache outside any checkout.
 - "No worse than the reference" states its margin in ulps, or compares bytes within one arm: a bare `<=` between two
   rounded errors flips on other hardware.

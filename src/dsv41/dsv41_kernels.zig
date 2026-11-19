@@ -2958,14 +2958,6 @@ pub fn hcExpandProbed() bool {
     return hc_expand_tf32;
 }
 
-/// Records for the wide forward's shape sum whether the loaded model expands its hyper-connection stream with
-/// `hcExpandFused` (its fused kernels on, this GPU probed) or `hcExpandOps`'s chain, whose planes it then bills, and
-/// whether its Engram gate is the kernel or `engramGateOps`'s chain.
-pub fn noteExpandArm(fused: bool) void {
-    @import("dsv41_wide_bytes.zig").expand_fused = fused and hc_expand_tf32;
-    @import("dsv41_wide_bytes.zig").engram_fused = fused;
-}
-
 pub fn hcExpandServes(x: A) bool {
     return hc_expand_tf32 and dim(x, 1) == 4;
 }

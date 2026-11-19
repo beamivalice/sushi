@@ -1160,7 +1160,7 @@ const EngineFixture = struct {
         }
         self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &self.config, false);
         errdefer self.weights.deinit();
-        self.xfm = try Trunk.init(io, a, self.config, &self.weights);
+        self.xfm = try @import("../model_load.zig").initTrunk(io, a, &self.config, &self.weights);
     }
 
     fn restore(self: *EngineFixture) void {
@@ -6517,6 +6517,24 @@ test "dsv41 engine: a fully resident load the user put on MLX keeps one request 
     try testing.expect(fx.xfm.ownsModuleDecodeState());
 }
 
+test "dsv41 serving: a load hands the wide arms it serves to the config the caller bills from, where its probe differs from the parse's guess (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const kernels = @import("dsv41_kernels.zig");
+    // The parse guesses the expand arm from the GPU class; the load serves what its probe says, here the other arm.
+    const probed = !@import("sushi_exl3").kernels.gemmNaxOn();
+    kernels.hc_expand_probe_override = probed;
+    defer kernels.hc_expand_probe_override = null;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const served = fx.model().cfg.wide_arms.?;
+    errdefer std.debug.print("served {any}, trunk's config {any}, caller's config {any}\n", .{ served, fx.xfm.config.dsv41.?.wide_arms, fx.config.dsv41.?.wide_arms });
+    try testing.expectEqual(dsv41_config.WideArms.of(true, probed), served);
+    try testing.expectEqual(served, fx.xfm.config.dsv41.?.wide_arms.?);
+    try testing.expectEqual(served, fx.config.dsv41.?.wide_arms.?);
+}
+
 test "dsv41 engine: a wide forward's in-use peak is its cap's shape sum less the spill pools its route did not take, under, at and past one router tile; between two 2,048-row chunks the pool holds no more than the request's billed state, its rows' growth and a page an array (DSV41_STQ_TINY, DSV41_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
@@ -6533,7 +6551,7 @@ test "dsv41 engine: a wide forward's in-use peak is its cap's shape sum less the
         try fx.open(dir);
         defer fx.deinit();
         defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
-        const c = &fx.config.dsv41.?;
+        const c = &fx.model().cfg;
 
         // A wide forward's in-use peak, one row in, against its cap's shape sum.
         const top: usize = 8192;

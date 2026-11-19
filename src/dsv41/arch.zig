@@ -122,6 +122,11 @@ pub const load = @import("dsv41_load.zig");
 pub fn adoptLayout(config: *Config) void {
     if (config.dsv41) |*c| c.rate_groups = config.expert_rate_groups;
 }
+
+/// The wide forward's arms the load recorded (`dsv41_model.setFused`), which admission prices.
+pub fn adoptLoaded(config: *Config, loaded: *const Config) void {
+    if (config.dsv41) |*c| c.wide_arms = loaded.dsv41.?.wide_arms;
+}
 pub const parseConfig = config_file.parseFamily;
 
 pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {

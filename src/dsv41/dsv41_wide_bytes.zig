@@ -7,37 +7,9 @@ const pool_class = @import("../tensor/pool_class.zig");
 const cfg_mod = @import("dsv41_config.zig");
 const Config = cfg_mod.Config;
 
-/// The loaded model's hyper-connection expand arm, which its load records (`dsv41_kernels.noteExpandArm`): true for the
-/// fused kernel, false for `hcExpandOps`'s chain. Null before a load: this GPU's class then, the fused expand serving on
-/// the matrix-unit (NAX) GPUs it was probed on.
-pub var expand_fused: ?bool = null;
-
-/// The loaded model's Engram gate arm (`dsv41_kernels.noteExpandArm`): true for the gate kernel, false for
-/// `engramGateOps`'s chain (the composed diagnostic). Null before a load: the kernel, the served default.
-pub var engram_fused: ?bool = null;
-
-/// Tests: the arms a shape sum reads, pinned. A load records them; unpinned, they follow the last load in the process,
-/// else this GPU's class, so a number taken on one box reads another elsewhere. `restore` puts them back.
-pub const ArmsPin = struct {
-    expand: ?bool,
-    engram: ?bool,
-
-    pub fn restore(self: ArmsPin) void {
-        expand_fused = self.expand;
-        engram_fused = self.engram;
-    }
-};
-
-pub fn pinArms(expand: bool, engram: bool) ArmsPin {
-    const was: ArmsPin = .{ .expand = expand_fused, .engram = engram_fused };
-    expand_fused = expand;
-    engram_fused = engram;
-    return was;
-}
-
-fn expandFused() bool {
-    if (expand_fused) |on| return on;
-    return sushi_exl3.kernels.gemmNaxOn();
+/// The arms `c` bills: a config no parse or load gave them is a bug, never this GPU's guess.
+fn armsOf(c: *const Config) cfg_mod.WideArms {
+    return c.wide_arms orelse @panic("dsv41: a wide forward priced on a config with no arms (Config.wide_arms)");
 }
 
 /// The activation dtype's bytes: the streams, the projections and the routed chain's planes are bf16 or f16.
@@ -187,7 +159,7 @@ fn engramWrite(t: *Tally, c: *const Config, L: u64) void {
     const hc: u64 = c.hc_mult;
     t.t(1, L * c.engram.cols() * c.engram.head_dim * act);
     t.t(1, L * (hc + 1) * c.dim * act);
-    if (engram_fused orelse true) {
+    if (armsOf(c).engram_fused) {
         t.t(1, L * hc * c.dim * act);
         t.t(1, 3 * f32b);
         return;
@@ -200,10 +172,10 @@ fn engramWrite(t: *Tally, c: *const Config, L: u64) void {
     t.t(4, 4);
 }
 
-/// `hcExpandOps`'s planes beside the stream it makes, where the fused expand does not serve (`expandFused`):
+/// `hcExpandOps`'s planes beside the stream it makes, where the fused expand does not serve (`WideArms.expand_fused`):
 /// the stream's f32 copy, the product, the matmul and their sum `[L,hc,D]`, and the output's f32 row `[L,D]`.
 fn expandChain(t: *Tally, c: *const Config, L: u64) void {
-    if (expandFused()) return;
+    if (armsOf(c).expand_fused) return;
     t.t(4, L * c.hc_mult * c.dim * f32b);
     t.t(1, L * c.dim * f32b);
 }
