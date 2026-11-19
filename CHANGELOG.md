@@ -21,6 +21,9 @@ earlier history is mlx-serve's, in that project's changelog.
   while the request it names bills the reply's cache rows at the pool's size class, so the request was refused again.
   The bill now counts the prompt's cache rows at that size too, as the pool holds them: a Qwen request on Sushi Cooler
   needs up to a sixteenth more of its cache free than before, and an auto-sized context comes out that much smaller.
+- **A server on an EXL3 or STQ pack no longer grows its memory with every reload and new decode width**: each decode
+  kernel setting it built kept a few small buffers for the life of the process, and the settings it evicted were built
+  again at their next use, so every reload added more. They are now freed once the setting is made.
 - **A model load beside models that already fill a raised GPU memory limit is refused, naming that limit**: with
   `iogpu.wired_limit_mb` set and what was loaded past its floor, the memory check read the 0 GB left as "unknown" and
   let the load through, toward a failed load or a stalled Mac. A load whose free-RAM reading fails is now checked

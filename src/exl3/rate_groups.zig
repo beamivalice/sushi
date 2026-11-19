@@ -612,10 +612,10 @@ const KernelEntry = struct {
 
 var kernel_cache: std.ArrayList(KernelEntry) = .empty;
 
-fn header(dec: exl3.Decode) ![:0]const u8 {
+fn header(alloc: std.mem.Allocator, dec: exl3.Decode) ![:0]const u8 {
     return switch (dec.codebook) {
         inline else => |cb| switch (dec.window) {
-            inline else => |win| kernel_src.withTableRows(cb, comptime kernel_src.codebookHelpers(cb, win)),
+            inline else => |win| kernel_src.withTableRows(alloc, cb, comptime kernel_src.codebookHelpers(cb, win)),
         },
     };
 }
@@ -635,7 +635,9 @@ fn mixedKernel(kind: Kind, classes: []const RateClass, limit: c_int, group: c_in
         break :blk &kernel_cache.items[kernel_cache.items.len - 1].kernel;
     };
     if (slot.*) |k| return k;
-    const alloc = std.heap.page_allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     const src = try mixedText(alloc, kind, classes, limit, group, tile_major);
     defer alloc.free(src);
     var name: std.ArrayList(u8) = .empty;
@@ -654,7 +656,7 @@ fn mixedKernel(kind: Kind, classes: []const RateClass, limit: c_int, group: c_in
         .down_prepared => &.{ "middle", "trellis", "slots", "meta" },
     };
     const outs: []const [*:0]const u8 = if (down) &.{"y"} else &.{ "yg", "yu" };
-    return kernels.getNamedKernel(slot, @ptrCast(name.items.ptr), ins, outs, src, try header(dec));
+    return kernels.getNamedKernel(slot, @ptrCast(name.items.ptr), ins, outs, src, try header(alloc, dec));
 }
 
 const DecodeKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int, down: bool, layout: kernels.GemvLayout, group: c_int = 0 };
@@ -692,8 +694,16 @@ fn decodeLaunch(alloc: std.mem.Allocator, key: DecodeKey) !fuse.Launch {
 }
 
 fn decodeConfig(key: DecodeKey) !mlx.mlx_fast_metal_kernel_config {
+    return decodeConfigIn(std.heap.page_allocator, key);
+}
+
+/// The launch is built on an arena: MLX's config keeps its own copies, and the cache evicts, so a kept launch would leak
+/// one at every miss.
+fn decodeConfigIn(gpa: std.mem.Allocator, key: DecodeKey) !mlx.mlx_fast_metal_kernel_config {
     if (decode_cfgs.get(key)) |c| return c;
-    const c = try (try decodeLaunch(std.heap.page_allocator, key)).config();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const c = try (try decodeLaunch(arena.allocator(), key)).config();
     decode_cfgs.put(key, c);
     return c;
 }
@@ -973,18 +983,21 @@ fn sharedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fu
     }
 }
 
-pub fn headerOf(dec: exl3.Decode) ![:0]const u8 {
+pub fn headerOf(alloc: std.mem.Allocator, dec: exl3.Decode) ![:0]const u8 {
     const prev = kernels.activeDecode();
     kernels.setDecodeParams(dec);
     defer kernels.setDecodeParams(prev);
-    return header(dec);
+    return header(alloc, dec);
 }
 
-fn buildStage(k: FuseKey) !FusedStage {
-    const alloc = std.heap.page_allocator;
+/// Built on an arena: the kernel and its config are MLX's copies of what the build made.
+fn buildStage(gpa: std.mem.Allocator, k: FuseKey) !FusedStage {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     const coded = k.stage == .pair or k.stage == .down;
-    const a = try routedPart(alloc, k, if (coded) try headerOf(k.dec) else "");
-    const b = try sharedPart(alloc, k, if (coded) try headerOf(k.sdec) else "");
+    const a = try routedPart(alloc, k, if (coded) try headerOf(alloc, k.dec) else "");
+    const b = try sharedPart(alloc, k, if (coded) try headerOf(alloc, k.sdec) else "");
     const src = try fuse.source(alloc, a, b);
     const head = try fuse.header(alloc, a, b);
     var name: std.ArrayList(u8) = .empty;
@@ -1008,7 +1021,7 @@ fn buildStage(k: FuseKey) !FusedStage {
 /// The pointer stays valid until the next stage is built.
 fn stageFor(k: FuseKey) !*const FusedStage {
     if (fused_stages.getPtr(k)) |f| return f;
-    const built = try buildStage(k);
+    const built = try buildStage(std.heap.page_allocator, k);
     try fused_stages.put(std.heap.page_allocator, k, built);
     return fused_stages.getPtr(k).?;
 }
@@ -1440,7 +1453,7 @@ fn gatedStage(k: GatedFoldKey) !*const FusedStage {
     const nslots = k.rows * k.topk;
     const layout: kernels.GemvLayout = .{ .funnel = k.funnel, .tiles = k.tiles };
     const geo: riders.Geometry = .{ .hidden = k.hidden, .width = k.width, .group = k.group, .logit_group = k.logit_group, .tr = k.tr };
-    const head = try headerOf(k.dec);
+    const head = try headerOf(alloc, k.dec);
     const a: fuse.Part = if (k.down) .{
         .launch = try decodeLaunch(alloc, .{ .in_dim = k.inter, .out_dim = k.hidden, .nslots = nslots, .topk = 0, .down = true, .layout = layout }),
         .body = try mixedText(alloc, .down, classes, 0, 0, k.tile_major),
@@ -3466,4 +3479,42 @@ test "exl3 rate groups: prefill rows hold the f32-truth bar for every codebook, 
             try t.expect(relRms(got, want) < 0.01);
         };
     }
+}
+
+test "exl3 rate groups: decode launch configs built past the cache's 16, each evicting the oldest, keep none of what their build allocated" {
+    defer decode_cfgs = .{};
+    for (0..40) |i| {
+        const key: DecodeKey = .{ .in_dim = 512, .out_dim = 256, .nslots = @intCast(i + 1), .topk = 2, .down = i % 2 == 0, .layout = kernels.gemvLayout(16), .group = 0 };
+        _ = try decodeConfigIn(std.testing.allocator, key);
+    }
+    for (&decode_cfgs.cfgs) |*c| if (c.*) |cfg| {
+        _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        c.* = null;
+    };
+}
+
+test "exl3 rate groups: a fused stage's build keeps none of what it allocated: the kernel and its config are MLX's copies" {
+    const key: FuseKey = .{
+        .stage = .prep,
+        .nslots = 4,
+        .rows = 2,
+        .topk = 2,
+        .hidden = 256,
+        .inter = 128,
+        .group = 0,
+        .tiles = 0,
+        .funnel = false,
+        .tile_major = false,
+        .limit = 0,
+        .classes = std.mem.zeroes([max_groups]RateClass),
+        .class_count = 0,
+        .dec = kernels.activeDecode(),
+        .sdec = kernels.activeDecode(),
+        .sn = 2,
+        .one_row = false,
+        .b_first = false,
+    };
+    const built = try buildStage(std.testing.allocator, key);
+    _ = mlx.mlx_fast_metal_kernel_free(built.kernel);
+    _ = mlx.mlx_fast_metal_kernel_config_free(built.cfg);
 }

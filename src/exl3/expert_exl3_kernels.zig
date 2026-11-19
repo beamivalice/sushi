@@ -1078,13 +1078,16 @@ fn getGemmNaxKernelFor(order: TileOrder, s: mlx.mlx_stream) !mlx.mlx_fast_metal_
             inline else => |win| {
                 const slot = &slots[kernel_src.slotRow(cb, false)][win.index()];
                 if (slot.*) |k| return k;
-                const header = try kernel_src.withTableRows(cb, kernel_src.naxHeader(cb, win));
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                const alloc = arena.allocator();
+                const header = try kernel_src.withTableRows(alloc, cb, kernel_src.naxHeader(cb, win));
                 const kernel = (if (ref)
-                    buildNaxGemmKernel(GEMM_NAX_REFERENCE_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_ref" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
+                    buildNaxGemmKernel(GEMM_NAX_REFERENCE_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax_ref" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
                 else if (order == .tile_major)
-                    buildNaxGemmKernel(GEMM_NAX_TM_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax_tm" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
+                    buildNaxGemmKernel(GEMM_NAX_TM_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax_tm" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)
                 else
-                    buildNaxGemmKernel(GEMM_NAX_SOURCE, header, (try kernel_src.tableKernelName(cb, comptime "sushi_exl3_k4_gemm_nax" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)) orelse {
+                    buildNaxGemmKernel(GEMM_NAX_SOURCE, header, (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_exl3_k4_gemm_nax" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, s)) orelse {
                     if (host_side.of(s) == 1) return error.MetalKernelCompileFailed;
                     gemm_nax_failed = true;
                     log.info("[exl3-gemm] NAX arm declined (kernel probe failed); the sorted GEMM serves prefill\n", .{});
@@ -5656,7 +5659,9 @@ pub fn weightReaderExactAt(comptime n: u32, comptime cb: exl3.Codebook, comptime
     const header = comptime (if (reader == .simdmat) "" else GEMM_NAX_INCLUDES) ++ kernel_src.codebookHelpers(cb, win) ++ (if (raw) identity else "") ++ (if (reader == .simdmat) GEMM_SIMDMAT_FRAGS else GEMM_NAX_FRAGS);
     var kernel: ?mlx.mlx_fast_metal_kernel = null;
     const name = comptime std.fmt.comptimePrint("exl3_n{d}_reader_exact", .{n}) ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win) ++ (if (raw) "_raw" else "_weights") ++ "_" ++ @tagName(reader);
-    const k = try getNamedKernel(&kernel, (try kernel_src.tableKernelName(cb, name)).ptr, &.{"trellis"}, &.{"result"}, source, try kernel_src.withTableRows(cb, header));
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const k = try getNamedKernel(&kernel, (try kernel_src.tableKernelName(arena.allocator(), cb, name)).ptr, &.{"trellis"}, &.{"result"}, source, try kernel_src.withTableRows(arena.allocator(), cb, header));
     defer _ = mlx.mlx_fast_metal_kernel_free(k);
     var trellis_data: [128 * n]u16 = undefined;
     var prng = std.Random.DefaultPrng.init(430);
@@ -8009,7 +8014,12 @@ pub const PrefillGridSupport = struct {
         defer mlx.dropLatchedErrorUnless(had_error);
         switch (dec.codebook) {
             inline else => |cb| switch (dec.window) {
-                inline else => |win| return buildNaxGemmKernel(kernel_source, try kernel_src.withTableRows(cb, kernel_src.naxHeader(cb, win)), (try kernel_src.tableKernelName(cb, comptime "sushi_prefill_grid_transpose" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, mlx.gpuStream()) orelse error.MetalKernelCompileFailed,
+                inline else => |win| {
+                    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    defer arena.deinit();
+                    const alloc = arena.allocator();
+                    return buildNaxGemmKernel(kernel_source, try kernel_src.withTableRows(alloc, cb, kernel_src.naxHeader(cb, win)), (try kernel_src.tableKernelName(alloc, cb, comptime "sushi_prefill_grid_transpose" ++ kernel_src.cbSuffix(cb) ++ kernel_src.winSuffix(win))).ptr, mlx.gpuStream()) orelse error.MetalKernelCompileFailed;
+                },
             },
         }
     }

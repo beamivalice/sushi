@@ -89,7 +89,7 @@ fn stageFor(k: Key) !*const Built {
     defer arena.deinit();
     const alloc = arena.allocator();
     const geo: riders.Geometry = .{ .hidden = k.hidden, .width = k.width, .group = k.group, .logit_group = k.logit_group, .tr = k.tr };
-    const a = try routedParts(alloc, k.stage, k.hidden, k.inter, k.topk, k.rows, k.n, k.layout, try rate_groups.headerOf(k.dec));
+    const a = try routedParts(alloc, k.stage, k.hidden, k.inter, k.topk, k.rows, k.n, k.layout, try rate_groups.headerOf(alloc, k.dec));
     const b = switch (k.stage) {
         .pair => try riders.gateUpPart(alloc, geo, k.rows, k.logit),
         .down => try riders.downPart(alloc, geo, k.rows),

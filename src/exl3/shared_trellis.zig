@@ -51,13 +51,13 @@ pub fn geometry(b: Banks, hidden: c_int, rows: c_int) ?Geo {
     return .{ .hidden = hidden, .width = width, .gu = gu, .dn = dn, .n_gu = n_gu, .n_dn = n_dn, .dec = b.dec };
 }
 
-fn codecHeader(dec: exl3.Decode) ![:0]const u8 {
+fn codecHeader(alloc: std.mem.Allocator, dec: exl3.Decode) ![:0]const u8 {
     const prev = kernels.activeDecode();
     kernels.setDecodeParams(dec);
     defer kernels.setDecodeParams(prev);
     return switch (dec.codebook) {
         inline else => |cb| switch (dec.window) {
-            inline else => |win| kernel_src.withTableRows(cb, comptime kernel_src.codebookHelpers(cb, win)),
+            inline else => |win| kernel_src.withTableRows(alloc, cb, comptime kernel_src.codebookHelpers(cb, win)),
         },
     };
 }
@@ -145,7 +145,7 @@ pub fn gateUpPart(alloc: std.mem.Allocator, geo: Geo, rows: c_int, extra_x: c_in
     const both = 2 * geo.width;
     const g = geo.gu;
     const body = try std.mem.concat(alloc, u8, &.{ prefix, "{\n", OUT_TYPE, SOURCE, "\n}\n" });
-    const head = try std.mem.concat(alloc, u8, &.{ try codecHeader(geo.dec), project_rows.ROWS_NAX_FRAGS });
+    const head = try std.mem.concat(alloc, u8, &.{ try codecHeader(alloc, geo.dec), project_rows.ROWS_NAX_FRAGS });
     return .{
         .launch = .{ .tgs = .{ tiles(both) + extra_x, g.nsplit, 1 }, .threads = g.tgrp * g.kph * 32, .ints = try ints(alloc, g, geo.hidden, both, geo.width, rows, geo.n_gu, extra_ints), .outs = try partialOut(alloc, g, rows, both) },
         .body = body,
@@ -159,7 +159,7 @@ pub fn gateUpPart(alloc: std.mem.Allocator, geo: Geo, rows: c_int, extra_x: c_in
 pub fn downPart(alloc: std.mem.Allocator, geo: Geo, rows: c_int) !fuse.Part {
     const g = geo.dn;
     const body = try std.mem.concat(alloc, u8, &.{ OUT_TYPE, DOWN_SOURCE });
-    const head = try std.mem.concat(alloc, u8, &.{ try codecHeader(geo.dec), project_rows.ROWS_NAX_FRAGS, MID_HEADER });
+    const head = try std.mem.concat(alloc, u8, &.{ try codecHeader(alloc, geo.dec), project_rows.ROWS_NAX_FRAGS, MID_HEADER });
     const extra = [_]fuse.IntArg{ .{ .name = "GNSPLIT", .value = geo.gu.nsplit }, .{ .name = "GODIM", .value = 2 * geo.width }, .{ .name = "GWIDTH", .value = geo.width } };
     return .{
         .launch = .{ .tgs = .{ tiles(geo.hidden), g.nsplit, 1 }, .threads = g.tgrp * g.kph * 32, .ints = try ints(alloc, g, geo.width, geo.hidden, geo.hidden, rows, geo.n_dn, &extra), .outs = try partialOut(alloc, g, rows, geo.hidden) },

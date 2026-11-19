@@ -258,11 +258,10 @@ fn tableRowsText(alloc: std.mem.Allocator, which: u8) ![:0]u8 {
     return out.toOwnedSliceSentinel(alloc, 0);
 }
 
-/// `header` as a kernel of `cb` under `active_decode` needs it: SPEC1's gets its table's rows ahead of the helpers.
-/// Allocated for the life of the process, so call it only where a kernel is built.
-pub fn withTableRows(comptime cb: exl3.Codebook, header: [:0]const u8) ![:0]const u8 {
+/// `header` as a kernel of `cb` under `active_decode` needs it: SPEC1's gets its table's rows ahead of the helpers, on
+/// `alloc` (a build's arena: MLX copies a kernel's header).
+pub fn withTableRows(alloc: std.mem.Allocator, comptime cb: exl3.Codebook, header: [:0]const u8) ![:0]const u8 {
     if (!cb.tabledHashMask()) return header;
-    const alloc = std.heap.page_allocator;
     const rows = try tableRowsText(alloc, kernels.active_decode.table.?);
     defer alloc.free(rows);
     return std.mem.concatWithSentinel(alloc, u8, &.{ rows, header }, 0);
@@ -272,13 +271,16 @@ pub fn withTableRows(comptime cb: exl3.Codebook, header: [:0]const u8) ![:0]cons
 /// spells the table in its name, since MLX keys a library by name.
 fn tableKernel(slot: *?mlx.mlx_fast_metal_kernel, comptime cb: exl3.Codebook, comptime name: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8, comptime header: [:0]const u8) !mlx.mlx_fast_metal_kernel {
     if (slot.*) |k| return k;
-    return kernels.getNamedKernel(slot, (try tableKernelName(cb, name)).ptr, ins, outs, source, try withTableRows(cb, header));
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    return kernels.getNamedKernel(slot, (try tableKernelName(alloc, cb, name)).ptr, ins, outs, source, try withTableRows(alloc, cb, header));
 }
 
-/// MLX keys a kernel library by name, so a SPEC1 kernel's name spells its table.
-pub fn tableKernelName(comptime cb: exl3.Codebook, comptime name: [:0]const u8) ![:0]const u8 {
+/// MLX keys a kernel library by name, so a SPEC1 kernel's name spells its table (on `alloc`, a build's arena).
+pub fn tableKernelName(alloc: std.mem.Allocator, comptime cb: exl3.Codebook, comptime name: [:0]const u8) ![:0]const u8 {
     if (!cb.tabledHashMask()) return name;
-    return std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}_t{s}", .{ name, codebook_tables.tables[tableOf(kernels.active_decode)].digest }, 0);
+    return std.fmt.allocPrintSentinel(alloc, "{s}_t{s}", .{ name, codebook_tables.tables[tableOf(kernels.active_decode)].digest }, 0);
 }
 
 pub fn naxHeader(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:0]const u8 {
@@ -435,7 +437,9 @@ test "exl3 MCG, spec1 and std1 decode every codeword, masked and unmasked, throu
         kernels.setDecodeParams(dec);
         defer kernels.setDecodeParams(.mul1);
         var slot: ?mlx.mlx_fast_metal_kernel = null;
-        const kernel = try kernels.getNamedKernel(&slot, (try tableKernelName(cb, comptime "exl3_half_pairs" ++ cbSuffix(cb) ++ winSuffix(win))).ptr, &.{"codes"}, &.{ "pairs", "stored", "carried" }, source, try withTableRows(cb, comptime codebookHelpers(cb, win)));
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const kernel = try kernels.getNamedKernel(&slot, (try tableKernelName(arena.allocator(), cb, comptime "exl3_half_pairs" ++ cbSuffix(cb) ++ winSuffix(win))).ptr, &.{"codes"}, &.{ "pairs", "stored", "carried" }, source, try withTableRows(arena.allocator(), cb, comptime codebookHelpers(cb, win)));
         defer _ = mlx.mlx_fast_metal_kernel_free(kernel);
         var outputs = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(outputs);

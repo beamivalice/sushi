@@ -131,7 +131,7 @@ fn stageFor(k: Key, sh: Shared) !*const Built {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const p = try parts(alloc, k, sh, try rate_groups.headerOf(k.dec));
+    const p = try parts(alloc, k, sh, try rate_groups.headerOf(alloc, k.dec));
     const src = try fuse.source(alloc, p.a, p.b);
     const head = try fuse.header(alloc, p.a, p.b);
     var name: std.ArrayList(u8) = .empty;
