@@ -80,6 +80,8 @@ cooler contract: a regenerated Qwen turn restores from its own prompt end, live 
 cooler contract: a rewind past a Qwen conversation's held restore points restores from the grid point, the same tokens every time
 cooler contract: a served Qwen conversation keeps its newest off-grid restore points in RAM, writes none while the next turn extends them, and a flush writes the held ones
 cooler contract: a served Qwen turn that leaves the last turn's text between two restore points inherits the one below the cut, the engine refusing nothing
+cooler contract: a served Qwen turn that shares part of the last turn's RAM entry, and fits only by taking it over, takes it and says the shared restore's tokens, the engine refusing nothing (#109)
+cooler contract: a served Qwen turn whose partial share fits once an idle entry is evicted is served as a share, and the entry it restores from stays whole (#109)
 cooler contract: held Qwen restore points give way to a staged write that needs the writer's permit
 cooler contract: the first served DeepSeek request after a Cooler load's warm starts from the state the second does, and a streamed load's first wide prefill is served through a late-unwiring borrow (issue 107)
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line

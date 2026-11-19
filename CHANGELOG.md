@@ -24,6 +24,11 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A Responses WebSocket turn refused before it runs now ends**: a turn refused for memory, context length, a bad
   field, an image or an effort word sent one `{"error":...}` frame and then nothing, so a client waiting for the turn's
   end hung; it now ends in the `{"type":"error"}` frame every other failed turn ends in, and the socket serves the next.
+- **A long Qwen conversation's next turn is no longer refused for memory when it shares most of the last turn's cache**
+  (#109): a turn that re-rendered the end of the previous reply restored most of the cached conversation as a shared
+  copy, which past ~70k tokens on a 64 GB Mac did not fit, and every retry was refused the same way. When evicting other
+  cached conversations does not make room, the turn now takes the cached copy over instead of copying it, as a turn that
+  extends the whole conversation already did.
 - **A long Qwen conversation on Sushi Cooler keeps its restore points across turns that share only part of the last
   one**: such a turn's cache entry lost the restore points it inherits (`checkpoint inheritance failed`), so later turns
   restored from further back and prefilled more.

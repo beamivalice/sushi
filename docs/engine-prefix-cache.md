@@ -894,10 +894,14 @@ process start whatever turns `--metrics` on.
   trim, an inheritance or a shed that moves the QSA history on MLX's stream inside an engine forward is refused, and
   the request or the commit fails with it.
 - **A checkout is a PROMISE until the append DONATES** (`donateCheckout` right before `Generator.initWithOptions`,
-  below every refusal; `releaseCheckout` hands an undonated entry back intact).
+  below every refusal; `releaseCheckout` hands an undonated entry back intact). The donation also frees the record's
+  MTP and DFlash history: the slot restored its own, and nothing reads a checked-out record.
 - **Off SSD-first, a warm share that does not fit is taken over, not refused** (`checkoutRestored`, qwen4_exp's
   admission pass): a full-entry hit is checked out on demand and billed as donated. The tradeoff: a request that
-  fails after donating loses the entry. Disk checkpoints come off the TOP of
+  fails after donating loses the entry. A partial hit is taken over too (a long conversation's next turn re-renders
+  the last reply's tail, #109), but only once evicting every other entry left no room: its donation keeps only the
+  shared prefix and the checkpoints inside it, so the turn's commit replaces the entry as a full hit's does; a ringed
+  entry is taken whole only. Disk checkpoints come off the TOP of
   the flush budget; the disk tier serves the pre-media text prefix only.
 - **A media commit persists its text to the SSD tier, never a media row** (`diskTextLen`): the record stops at the
   first item (none when the boundary is unknown), a hybrid at its last checkpoint at or below it (`hybrid`, set at

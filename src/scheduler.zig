@@ -4027,7 +4027,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
             var fits = Probe.call(&probe);
             // A shared restore is billed a whole second copy; taking the entry over moves it instead.
             if (!fits and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |*hc| {
-                if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len)) {
+                if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len, false)) {
                     hot_checked_out = true;
                     probe.warm_will_donate = true;
                     fits = Probe.call(&probe);
@@ -4040,11 +4040,19 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
                 }
                 // Per-model, off the slot: `sch.hot_prefix_cache` is whichever model loaded last.
                 // Captured by pointer: a `|hc|` capture would evict from a stack copy.
-                const report = if (slot.model.prefix_cache) |*hc|
+                var report = if (slot.model.prefix_cache) |*hc|
                     // Never evict the entry this request restored from: its buffers are shared.
                     hc.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, true)
                 else
                     prefix_cache_mod.EvictionReport{ .admitted = false };
+                // A partial share is taken over only when no eviction made room: the entry keeps just the shared prefix.
+                if (!report.admitted and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |*hc| {
+                    if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len, true)) {
+                        hot_checked_out = true;
+                        probe.warm_will_donate = true;
+                        report.admitted = Probe.call(&probe);
+                    }
+                };
                 publishHotCacheResidency(sch);
                 // What the allocator returned, not what the cache was billed for.
                 evicted_live_bytes = report.bytes;
@@ -4058,7 +4066,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
                     if (n == 0) cp_stride = 0;
                 }
                 if (!report.admitted and kept == null) {
-                    log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
+                    log.warn("[scheduler] prefill refused: {d} tokens do not fit after evicting every hot-cache entry but the one it restores from\n", .{slot.full_prompt.len});
                     if (prefill_admission_refused_log) |report_fn| {
                         slot.memory_context_refusal = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp, probe.checkpoints);
                     }

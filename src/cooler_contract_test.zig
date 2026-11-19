@@ -3557,6 +3557,156 @@ test "cooler contract: a served Qwen turn that leaves the last turn's text betwe
     }.run);
 }
 
+test "cooler contract: a served Qwen turn that shares part of the last turn's RAM entry, and fits only by taking it over, takes it and says the shared restore's tokens, the engine refusing nothing (#109)" {
+    try eachQwenServed(struct {
+        /// Admission that refuses a warm share the request did not take over: a copy of the prefix does not fit.
+        fn onlyTaken(_: *const @import("model.zig").ModelConfig, _: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, _: u64, will_donate: bool, _: bool, _: @import("scheduler.zig").CheckpointPlan) bool {
+            return matched == 0 or will_donate;
+        }
+
+        /// Turn 1, a turn 2 that extends it (its entry holds both prompt ends' restore points), then a turn 3 that
+        /// leaves turn 2's text between those points and says more; turn 3's tokens. Every engine refusal on the way
+        /// is counted in `refused`.
+        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, taken: bool, reused: *u32, entries: *usize, refused: *u64) !std.ArrayList(u32) {
+            const a = testing.allocator;
+            const route = @import("tensor/route.zig");
+            const refused0 = route.refusals;
+            defer refused.* = route.refusals - refused0;
+            var sv: Served = undefined;
+            try sv.initTiers(ld, dir, 1 << 30);
+            defer sv.deinit();
+            var f: u32 = 0;
+            var first = try heldPrompt(a, ids, 1500, 0);
+            defer first.deinit(a);
+            var reply = try sv.request(first.items, 16, &f);
+            defer reply.deinit(a);
+            var second: std.ArrayList(u32) = .empty;
+            defer second.deinit(a);
+            try second.appendSlice(a, first.items);
+            try second.appendSlice(a, reply.items);
+            var said = try heldPrompt(a, ids, 1500, 2);
+            defer said.deinit(a);
+            try second.appendSlice(a, said.items);
+            var reply2 = try sv.request(second.items, 16, &f);
+            defer reply2.deinit(a);
+            // The entry's point at turn 2's prompt end is past the cut, another text's: the share keeps turn 1's.
+            var next: std.ArrayList(u32) = .empty;
+            defer next.deinit(a);
+            try next.appendSlice(a, second.items[0 .. second.items.len - 100]);
+            var more = try heldPrompt(a, ids, 200, 1);
+            defer more.deinit(a);
+            try next.appendSlice(a, more.items);
+            const scheduler = @import("scheduler.zig");
+            const fits_was = scheduler.prefill_admission_fits;
+            defer scheduler.prefill_admission_fits = fits_was;
+            if (taken) scheduler.prefill_admission_fits = onlyTaken;
+            var got = try sv.request(next.items, 16, &f);
+            errdefer got.deinit(a);
+            reused.* = sv.reused;
+            // A turn 4 that leaves turn 3's text between its restore points: a partial share of the entry turn 3
+            // committed, taken over again on the takeover arm.
+            var fourth: std.ArrayList(u32) = .empty;
+            defer fourth.deinit(a);
+            try fourth.appendSlice(a, next.items[0 .. next.items.len - 50]);
+            try fourth.appendSlice(a, said.items[0..150]);
+            var got4 = try sv.request(fourth.items, 16, &f);
+            defer got4.deinit(a);
+            if (sv.reused == 0 or sv.reused >= next.items.len - 50) return error.TestTurnFourNotPartial;
+            try got.appendSlice(a, got4.items);
+            entries.* = sv.entry.prefix_cache.?.entries.items.len;
+            return got;
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var shared_reused: u32 = 0;
+            var taken_reused: u32 = 0;
+            var entries: usize = 0;
+            var refused: u64 = 0;
+            var shared = try conversation(&ld, dir, ids, false, &shared_reused, &entries, &refused);
+            defer shared.deinit(a);
+            // The share's commit inherits the entry's points below the cut on the engine's stream.
+            try testing.expectEqual(@as(u64, 0), refused);
+            var taken = try conversation(&ld, dir, ids, true, &taken_reused, &entries, &refused);
+            defer taken.deinit(a);
+            try testing.expectEqual(@as(u64, 0), refused);
+            // A partial share: turn 1's restore point, below the cut.
+            try testing.expect(taken_reused > 0 and taken_reused < 1516);
+            try testing.expectEqual(shared_reused, taken_reused);
+            try testing.expectEqualSlices(u32, shared.items, taken.items);
+            // Turn 2's commit replaced the entry it took over.
+            try testing.expectEqual(@as(usize, 1), entries);
+        }
+    }.run);
+}
+
+
+test "cooler contract: a served Qwen turn whose partial share fits once an idle entry is evicted is served as a share, and the entry it restores from stays whole (#109)" {
+    try eachQwenServed(struct {
+        var cache: ?*const @import("prefix_cache.zig").HotPrefixCache = null;
+
+        /// Admission that refuses a warm share while the cache holds another entry than the one shared.
+        fn fitsAlone(_: *const @import("model.zig").ModelConfig, _: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, _: u64, will_donate: bool, _: bool, _: @import("scheduler.zig").CheckpointPlan) bool {
+            return matched == 0 or will_donate or cache.?.entries.items.len <= 1;
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.initTiers(&ld, dir, 1 << 30);
+            defer sv.deinit();
+            // RAM-first: an idle entry stays resident, so there is one to evict.
+            sv.entry.prefix_cache.?.ssd_first = false;
+            var f: u32 = 0;
+            var first = try heldPrompt(a, ids, 1500, 0);
+            defer first.deinit(a);
+            var reply = try sv.request(first.items, 16, &f);
+            defer reply.deinit(a);
+            var second: std.ArrayList(u32) = .empty;
+            defer second.deinit(a);
+            try second.appendSlice(a, first.items);
+            try second.appendSlice(a, reply.items);
+            var said = try heldPrompt(a, ids, 1500, 2);
+            defer said.deinit(a);
+            try second.appendSlice(a, said.items);
+            var reply2 = try sv.request(second.items, 16, &f);
+            defer reply2.deinit(a);
+            // Another conversation's entry, idle.
+            var other = try heldPrompt(a, ids, 600, 7);
+            defer other.deinit(a);
+            var other_reply = try sv.request(other.items, 8, &f);
+            other_reply.deinit(a);
+            const hc = &sv.entry.prefix_cache.?;
+            try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
+            var next: std.ArrayList(u32) = .empty;
+            defer next.deinit(a);
+            try next.appendSlice(a, second.items[0 .. second.items.len - 100]);
+            var more = try heldPrompt(a, ids, 200, 1);
+            defer more.deinit(a);
+            try next.appendSlice(a, more.items);
+            const scheduler = @import("scheduler.zig");
+            const fits_was = scheduler.prefill_admission_fits;
+            defer scheduler.prefill_admission_fits = fits_was;
+            cache = hc;
+            defer cache = null;
+            scheduler.prefill_admission_fits = fitsAlone;
+            var got = try sv.request(next.items, 16, &f);
+            defer got.deinit(a);
+            try testing.expect(sv.reused > 0);
+            // The idle entry made the room; the entry turn 3 shared still holds turn 2 whole.
+            var whole = false;
+            for (hc.entries.items) |*e| whole = whole or e.tokens.len == second.items.len + reply2.items.len;
+            try testing.expect(whole);
+        }
+    }.run);
+}
+
 /// A Qwen conversation of `n` tokens, its own: `seed` picks the ids.
 fn heldPrompt(a: std.mem.Allocator, ids: []const u32, n: usize, seed: usize) !std.ArrayList(u32) {
     var p: std.ArrayList(u32) = .empty;
