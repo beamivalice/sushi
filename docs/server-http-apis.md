@@ -79,7 +79,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   (`http.sendErrorResponse`), never an HTTP body. A message is JSON in a text frame: a binary one is answered by a 400
   error frame and a 1003 close. Every end of the socket sends its close frame from one sender (`wsEndOf`): 1000 to the
   client's close, 1001 at a shutdown, 1002 a protocol error, 1003 a binary message, 1009 a message over the cap, 1011
-  anything else; an upgrade without `Sec-WebSocket-Key` is a 400. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
+  anything else; an upgrade without `Sec-WebSocket-Key` is a 400. Each turn routes and holds its own `model` as
+  `POST /v1/responses` does (`holdTurnModel`) until the turn ends: a socket between turns holds no model, so an unload
+  or an eviction takes it. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
   `/v1/messages`.
 - **Anthropic `/v1/messages`** (Claude Code): typed blocks, `input_schema`→`parameters`, stop-reason map incl.
   `stop_sequence` echo, full SSE block lifecycle (a block opens only once the open one is stopped, so each owns its

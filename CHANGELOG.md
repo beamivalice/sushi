@@ -12,6 +12,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Stopping the server no longer waits on idle clients**: a Responses WebSocket kept open between turns (as Codex
   keeps one) held a shutdown for 35 s, after which the server exited with an error and skipped its cleanup (SIGTERM,
   sushibar Stop, an update); an idle connection held it up to 30 s. Both now close at once.
+- **A Responses WebSocket holds its model only during a turn**: an open socket kept its model from being unloaded or
+  evicted, and every turn ran on the model of the upgrade, whatever it named; each turn now routes its own `model` as
+  `POST /v1/responses` does.
 - **APIs and server**: a shutdown refuses the requests still waiting from the moment it is asked, instead of serving
   those it reaches within the next second.
 - **A long Qwen3.8 conversation's next turn is refused less often near the memory limit**: a turn that takes the cached

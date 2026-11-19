@@ -1478,7 +1478,7 @@ pub fn handleResponsesWebSocket(
     allocator: std.mem.Allocator,
     stream: *Conn,
     headers: []const u8,
-    lm: *LoadedModel,
+    models: TurnModels,
 ) !void {
     ws_mod.handshake(stream, headers) catch |err| switch (err) {
         error.WsHandshake => {
@@ -1492,9 +1492,16 @@ pub fn handleResponsesWebSocket(
     var ws_conn = WsConnT.init(stream, &server_state.max_request_bytes);
     defer ws_conn.deinit(allocator);
     var reason_buf: [123]u8 = undefined;
-    const end = wsServeTurns(allocator, stream, &ws_conn, lm) catch |err| wsEndOf(err, ws_conn.message_limit, &reason_buf);
+    const end = wsServeTurns(allocator, stream, &ws_conn, models) catch |err| wsEndOf(err, ws_conn.message_limit, &reason_buf);
     if (end.code) |code| ws_conn.writeClose(code, end.reason) catch {};
 }
+
+/// How a WebSocket turn gets its model, as its HTTP twin does: `hold` routes and holds the turn's `model`, or sends
+/// the turn's refusal and gives null; `release` ends the hold when the turn ends.
+pub const TurnModels = struct {
+    hold: *const fn (std.mem.Allocator, *Conn, []const u8) anyerror!?*LoadedModel,
+    release: *const fn (*LoadedModel) void,
+};
 
 /// How a Responses WebSocket ends: the close frame `handleResponsesWebSocket` sends, none when the peer is gone.
 const WsEnd = struct { code: ?u16, reason: []const u8 = "" };
@@ -1518,7 +1525,7 @@ fn wsEndOf(err: anyerror, message_limit: usize, reason_buf: *[123]u8) WsEnd {
 
 /// The frame loop, one iteration per inbound message, until the socket ends: every end returns or raises here, so
 /// one sender closes it.
-fn wsServeTurns(allocator: std.mem.Allocator, stream: *Conn, ws_conn: *WsConnT, lm: *LoadedModel) !WsEnd {
+fn wsServeTurns(allocator: std.mem.Allocator, stream: *Conn, ws_conn: *WsConnT, models: TurnModels) !WsEnd {
     var local_cache: WsLocalCache = .{ .gpa = allocator };
     defer local_cache.deinit();
 
@@ -1623,6 +1630,9 @@ fn wsServeTurns(allocator: std.mem.Allocator, stream: *Conn, ws_conn: *WsConnT, 
         defer stream.ws_mode = null;
 
         bridge.reset();
+        const model_id = if (root.get("model")) |v| (if (v == .string) v.string else "") else "";
+        const lm = (try models.hold(allocator, stream, model_id)) orelse continue;
+        defer models.release(lm);
         var kept: ?*responses_mod.StoredResponse = null;
         const turn_result = handleResponses(allocator, stream, body, lm, .{ .prev_history = prev_history, .kept = if (want_user_store) null else &kept });
         if (kept) |sr| local_cache.put(sr) catch sr.deinit();

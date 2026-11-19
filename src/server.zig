@@ -1403,6 +1403,13 @@ pub fn handleConnection(
         return;
     }
 
+    // ── WebSocket upgrade for /v1/responses, ahead of the model routing: each turn routes and holds its own model
+    //    (`holdTurnModel`), so the socket holds none between turns.
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses") and ws_mod.isUpgrade(request[0..header_end_pos])) {
+        try http_conn.handleResponsesWebSocket(allocator, stream, request[0..header_end_pos], .{ .hold = &holdTurnModel, .release = &releaseTurnModel });
+        return;
+    }
+
     // ── Plan 05 Phase D: resolve the request's target model via the
     //    scheduler (which delegates the fast path to registry.ensureLoaded
     //    and handles cold-load + eviction internally). Absent `model`
@@ -1430,41 +1437,13 @@ pub fn handleConnection(
     // so every consumer below (peek, ensureLoaded) sees the real id.
     var model_id_buf: [512]u8 = undefined;
     var query_model_buf: [512]u8 = undefined;
-    var requested_model_id = unescapeJsonSlashes(
+    const requested_model_id = (try routeModel(allocator, stream, registry, unescapeJsonSlashes(
         &model_id_buf,
         parseModelFromBody(request_body) orelse queryModel(&query_model_buf, raw_path) orelse "",
-    );
-    const home: ?[]const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else null;
-    switch (http_conn.routeRequestModel(registry, requested_model_id, home)) {
-        .entry => |id| requested_model_id = id,
-        .default => requested_model_id = "",
-        .not_found => {
-            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No model is registered at that path; POST /v1/load-model with the absolute path registers it", 404);
-            return;
-        },
-    }
-    // Text-gen route aimed at a KNOWN non-text model: reject before
-    // ensureLoaded, or the request cold-loads a multi-GB media model just
-    // to earn its 400. The post-load `text_gen_reject` below stays the
-    // authoritative crash barrier (this peek can't see `--model` primaries
-    // with no arch hint until they're resident).
-    if (requested_model_id.len > 0 and http_conn.isTextGenRoute(method, path)) {
-        // Entry and snapshot under ONE hold — plain `peek` unlocks before it
-        // returns. `arch_hint` outlives the unlock: entry-owned, freed in
-        // `deinit`.
-        const target: ?TextGenTarget = blk: {
-            registry.mutex.lockUncancelable(stream.io);
-            defer registry.mutex.unlock(stream.io);
-            const peeked = registry.peekLocked(requested_model_id) orelse break :blk null;
-            break :blk textGenTargetOf(peeked);
-        };
-        if (target) |t| {
-            if (textGenRejectReason(t)) |reason| {
-                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
-                return;
-            }
-        }
-    }
+    ))) orelse return;
+    // A text-gen route aimed at a KNOWN non-text model is refused before the load it would cost; the post-load
+    // `text_gen_reject` below stays the authoritative crash barrier.
+    if (http_conn.isTextGenRoute(method, path) and try refuseNonTextModel(allocator, stream, registry, requested_model_id)) return;
     // An endpoint that doesn't exist is a 404, and it must cost NOTHING to say
     // so. Resolution runs ahead of dispatch, so this has to be answered here
     // rather than inside one of `ensureLoaded`'s error arms: with a resolvable
@@ -1492,63 +1471,10 @@ pub fn handleConnection(
             return;
         }
     }
-    const lm = scheduler.ensureLoaded(requested_model_id) catch |err| switch (err) {
-        error.UnknownModelId => {
-            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
-            return;
-        },
-        error.NotLoaded => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", http.model_not_loaded_message, 503);
-            return;
-        },
-        error.NoDefaultModel => {
-            // Headless gen-only boot (media models resident, no default chat
-            // model): /props keeps answering with the live memory counters —
-            // the app's tray polls it, and a 503 here read as "0 MB".
-            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
-                try models_api.handlePropsNoModel(allocator, stream);
-                return;
-            }
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", http.no_model_message, 503);
-            return;
-        },
-        error.LoadFailed => {
-            try generation_stream.sendLoadFailedResponse(allocator, stream, scheduler, requested_model_id);
-            return;
-        },
-        error.Shutdown => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", http.shutting_down_message, 503);
-            return;
-        },
-        // Other errors (CPU-side preload failures like FileNotFound on a
-        // missing tokenizer.json, JSON parse errors on a malformed
-        // config.json, etc.) bubble out of `preloadCpuState`. A refusal the
-        // registry preserves by name answers 503 under that name; anything
-        // else is a 500 with the error name, never a hung connection.
-        else => {
-            if (try generation_stream.sendNamedLoadRefusal(allocator, stream, scheduler, requested_model_id, err)) return;
-            log.warn("  -> 500 ({s}) while resolving model\n", .{@errorName(err)});
-            const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
-                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
-                return;
-            };
-            defer allocator.free(msg);
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
-            return;
-        },
-    };
+    const lm = (try holdModel(allocator, stream, scheduler, requested_model_id, std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props"))) orelse return;
     // A status read must not look like use — see `isStatusRoute`.
     const status_read = http_conn.isStatusRoute(method, path);
     defer if (status_read) scheduler.releaseStatus(lm) else scheduler.release(lm);
-    // The launch model turns ready before its boot pins its context and installs the request hooks.
-    boot_gate.process.waitOpen(stream.io);
-
-    // A model loaded on demand freezes its own auto-context here, for the same
-    // reason the `--model` primary does at startup: the number we advertise is
-    // what clients budget against, and each model has its own dims. Idempotent,
-    // and a no-op under `--ctx-size`.
-    if (lm.config) |c| _ = bills.pinAutoContext(c);
-    warnUserWireLimit();
 
     // ── Phase C: handlers take `lm` directly and extract their own
     //    locals. handleConnection only needs one decision for every
@@ -1556,19 +1482,6 @@ pub fn handleConnection(
     //    no transformer to run (the SIGSEGV class documented on
     //    textGenRejectReason).
     const text_gen_reject: ?[]const u8 = textGenRejectReason(textGenTargetOf(lm));
-
-    // ── WebSocket upgrade for /v1/responses ──
-    // Detect Upgrade: websocket BEFORE the regular route dispatch so the
-    // GET method (used for the upgrade handshake) doesn't fall through to
-    // the 404 branch.
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses") and ws_mod.isUpgrade(request[0..header_end_pos])) {
-        if (text_gen_reject) |reason| {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
-            return;
-        }
-        try http_conn.handleResponsesWebSocket(allocator, stream, request[0..header_end_pos], lm);
-        return;
-    }
 
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
@@ -1794,6 +1707,114 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
         return false;
     }
     return true;
+}
+
+/// A request's `model` routed (`routeRequestModel`): a registered id, "" for the default; null once the 404 is sent.
+fn routeModel(allocator: std.mem.Allocator, stream: *http_conn.Conn, registry: *ModelRegistry, requested: []const u8) !?[]const u8 {
+    const home: ?[]const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else null;
+    switch (http_conn.routeRequestModel(registry, requested, home)) {
+        .entry => |id| return id,
+        .default => return "",
+        .not_found => {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No model is registered at that path; POST /v1/load-model with the absolute path registers it", 404);
+            return null;
+        },
+    }
+}
+
+/// True once a text-generation request aimed at a registered model that cannot serve text is refused, before any load.
+fn refuseNonTextModel(allocator: std.mem.Allocator, stream: *http_conn.Conn, registry: *ModelRegistry, id: []const u8) !bool {
+    if (id.len == 0) return false;
+    // Entry and snapshot under ONE hold — plain `peek` unlocks before it returns.
+    const target: ?TextGenTarget = blk: {
+        registry.mutex.lockUncancelable(stream.io);
+        defer registry.mutex.unlock(stream.io);
+        const peeked = registry.peekLocked(id) orelse break :blk null;
+        break :blk textGenTargetOf(peeked);
+    };
+    const reason = textGenRejectReason(target orelse return false) orelse return false;
+    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+    return true;
+}
+
+/// Holds `id`'s model (`ensureLoaded`, loading it when it is not resident); null once the refusal is sent. `props`:
+/// the request is `GET /props`, answered without a model when none is the default.
+fn holdModel(allocator: std.mem.Allocator, stream: *http_conn.Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, props: bool) !?*LoadedModel {
+    const lm = scheduler.ensureLoaded(id) catch |err| switch (err) {
+        error.UnknownModelId => {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
+            return null;
+        },
+        error.NotLoaded => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", http.model_not_loaded_message, 503);
+            return null;
+        },
+        error.NoDefaultModel => {
+            // Headless gen-only boot (media models resident, no default chat
+            // model): /props keeps answering with the live memory counters —
+            // the app's tray polls it, and a 503 here read as "0 MB".
+            if (props) {
+                try models_api.handlePropsNoModel(allocator, stream);
+                return null;
+            }
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", http.no_model_message, 503);
+            return null;
+        },
+        error.LoadFailed => {
+            try generation_stream.sendLoadFailedResponse(allocator, stream, scheduler, id);
+            return null;
+        },
+        error.Shutdown => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", http.shutting_down_message, 503);
+            return null;
+        },
+        // Other errors (CPU-side preload failures like FileNotFound on a
+        // missing tokenizer.json, JSON parse errors on a malformed
+        // config.json, etc.) bubble out of `preloadCpuState`. A refusal the
+        // registry preserves by name answers 503 under that name; anything
+        // else is a 500 with the error name, never a hung connection.
+        else => {
+            if (try generation_stream.sendNamedLoadRefusal(allocator, stream, scheduler, id, err)) return null;
+            log.warn("  -> 500 ({s}) while resolving model\n", .{@errorName(err)});
+            const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
+                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
+                return null;
+            };
+            defer allocator.free(msg);
+            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
+            return null;
+        },
+    };
+    // The launch model turns ready before its boot pins its context and installs the request hooks.
+    boot_gate.process.waitOpen(stream.io);
+
+    // A model loaded on demand freezes its own auto-context here, for the same
+    // reason the `--model` primary does at startup: the number we advertise is
+    // what clients budget against, and each model has its own dims. Idempotent,
+    // and a no-op under `--ctx-size`.
+    if (lm.config) |c| _ = bills.pinAutoContext(c);
+    warnUserWireLimit();
+    return lm;
+}
+
+/// A Responses WebSocket turn's model, routed and held as `POST /v1/responses` holds its own; null once the turn's
+/// refusal is sent. The socket holds no model between turns.
+fn holdTurnModel(allocator: std.mem.Allocator, stream: *http_conn.Conn, model_id: []const u8) anyerror!?*LoadedModel {
+    const registry = server_state.global_registry orelse return error.ServerNotReady;
+    const scheduler = server_state.global_scheduler orelse return error.ServerNotReady;
+    const id = (try routeModel(allocator, stream, registry, model_id)) orelse return null;
+    if (try refuseNonTextModel(allocator, stream, registry, id)) return null;
+    const lm = (try holdModel(allocator, stream, scheduler, id, false)) orelse return null;
+    if (textGenRejectReason(textGenTargetOf(lm))) |reason| {
+        scheduler.release(lm);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return null;
+    }
+    return lm;
+}
+
+fn releaseTurnModel(lm: *LoadedModel) void {
+    server_state.global_scheduler.?.release(lm);
 }
 
 /// Facts about a request's target model that decide whether a TEXT-

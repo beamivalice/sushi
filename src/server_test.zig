@@ -789,3 +789,47 @@ test "server: a shutdown closes a WebSocket idle between turns with 1001 and an 
         }
     }.run);
 }
+
+test "server: a WebSocket idle between turns does not hold its model against an unload" {
+    const was = scheduler_mod.Scheduler.unload_drain_ms;
+    scheduler_mod.Scheduler.unload_drain_ms = 2000;
+    defer scheduler_mod.Scheduler.unload_drain_ms = was;
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            if (!try modelServes()) return;
+            const ws = try wsConnect();
+            defer _ = std.c.close(ws);
+            try wsCompletedTurn(ws);
+            const un = try request("POST", "/v1/unload-model", "{\"model\":\"tiny\"}");
+            defer gpa.free(un);
+            if (!std.mem.startsWith(u8, un, "HTTP/1.1 200")) {
+                std.debug.print("unload beside an idle WebSocket: {s}\n", .{un[0..@min(un.len, 500)]});
+                return error.IdleWebSocketPinsModel;
+            }
+            // The next turn loads the model again.
+            try wsCompletedTurn(ws);
+        }
+    }.run);
+}
+
+test "server: a WebSocket turn routes its own model: an unregistered model path is refused in its error frame, as its HTTP route refuses it" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            if (!try modelServes()) return;
+            const http_answer = try request("POST", "/v1/responses", "{\"model\":\"/nonexistent/sushi-test/model\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}");
+            defer gpa.free(http_answer);
+            if (!std.mem.startsWith(u8, http_answer, "HTTP/1.1 404")) return error.HttpRouteServedIt;
+            const fd = try wsConnect();
+            defer _ = std.c.close(fd);
+            try wsSend(fd, "{\"type\":\"response.create\",\"model\":\"/nonexistent/sushi-test/model\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}");
+            const frame = try wsReadFrame(fd);
+            defer gpa.free(frame);
+            if (!std.mem.startsWith(u8, frame, "{\"type\":\"error\",\"status\":404")) {
+                std.debug.print("turn for an unregistered path answered: {s}\n", .{frame[0..@min(frame.len, 300)]});
+                return error.TurnModelNotRouted;
+            }
+            // The socket serves the next turn.
+            try wsCompletedTurn(fd);
+        }
+    }.run);
+}
