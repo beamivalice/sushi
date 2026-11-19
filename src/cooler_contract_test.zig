@@ -2296,6 +2296,9 @@ fn decodeGrowsInPlace(comptime Q: type) !void {
     var grown = false;
     while (try gen.next(a)) |_| {
         steps += 1;
+        // Stops short of the request's last row, where `heldRows` caps the last grow: a capped grow adds less than the
+        // quarter this bar's arithmetic counts on (its peak is lower, its growth smaller still).
+        if (steps > 2000) break;
         if (steps > 1 and !grown) {
             if (@import("kv_cache.zig").KVCache.kv_cap_buf_grows > grows0) {
                 grown = true;

@@ -421,7 +421,7 @@ pub const aux = firstWith("aux") orelse struct {
         return false;
     }
     pub fn ssmFreeQsaState(_: *ssm_cache.SSMCacheEntry) void {}
-    pub fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize, _: usize) struct { new_cap: usize, write_at: usize, new_rows: usize } {
+    pub fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize, _: trunk.Hold, _: usize) struct { new_cap: usize, write_at: usize, new_rows: usize } {
         return .{ .new_cap = @max(cap, rows + add), .write_at = rows, .new_rows = rows + add };
     }
     pub fn qsaLeftoverAt(_: mlx.mlx_array, _: c_int, _: c_int, _: c_int, _: mlx.mlx_stream) !mlx.mlx_array {
@@ -436,7 +436,7 @@ pub const aux = firstWith("aux") orelse struct {
     pub fn sliceQsaHistoryOntoCheckpoint(_: *ssm_cache.SSMCheckpoint, _: *const ssm_cache.SSMCheckpoint, _: usize, _: mlx.mlx_stream) !void {}
     pub fn keepOnlyLatestQsaHistory(_: []ssm_cache.SSMCheckpoint) void {}
     pub fn dropQsaHistory(_: *ssm_cache.SSMCheckpoint) void {}
-    pub fn reserveQsaHistoryWithHead(_: ?[]ssm_cache.SSMCacheEntry, _: ?*ssm_cache.SSMCacheEntry, _: usize) void {}
+    pub fn reserveQsaHistoryWithHead(_: ?[]ssm_cache.SSMCacheEntry, _: ?*ssm_cache.SSMCacheEntry, _: trunk.Hold) void {}
     pub fn checkpointHasQsaPooled(_: *const ssm_cache.SSMCheckpoint) bool {
         return false;
     }

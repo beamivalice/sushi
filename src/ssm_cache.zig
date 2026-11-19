@@ -8,6 +8,7 @@ const kv_cache = @import("kv_cache.zig");
 const disk_format = @import("disk_format.zig");
 const prefix_policy = @import("prefix_policy.zig");
 const KVCacheEntry = kv_cache.KVCacheEntry;
+const Hold = kv_cache.Hold;
 const arch_aux = @import("arch/prefix.zig").aux;
 const qsaHistoryRows = arch_aux.qsaHistoryRows;
 const qsaKeyAppendPlan = arch_aux.qsaKeyAppendPlan;
@@ -77,6 +78,8 @@ pub const SSMCacheEntry = struct {
     /// Rows this entry's QSA history is asked to hold up front (the counterpart of
     /// `KVCache.reserve_tokens`); the pooled bank derives its own by `ratio`. 0 = none.
     qsa_reserve_rows: usize = 0,
+    /// The request's last row (`KVCache.requestEnd`): no history grow passes it. 0 = no request bounds it.
+    qsa_end_rows: usize = 0,
     /// Logical QSA history length in tokens (`pooled_blocks * ratio + ring_tail`).
     qsa_hist_rows: c_int = 0,
     group: ?*PersistentSsmGroup = null,
@@ -165,7 +168,8 @@ fn pagedAxis(s: mlx.mlx_stream, like: mlx.mlx_array, axis: usize, len: usize) us
     return @intCast(@import("mlx_pages.zig").pagedCount(len, row_bytes));
 }
 
-pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, count: *c_int, chunk: mlx.mlx_array, axis: usize, reserve: usize) !void {
+/// `hold` is in tokens and a row holds `ratio` of them (a pooled block holds `indexer_compress_ratio`).
+pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, count: *c_int, chunk: mlx.mlx_array, axis: usize, hold: Hold, ratio: usize) !void {
     const csh = mlx.getShape(chunk);
     const nd: usize = csh.len;
     std.debug.assert(nd <= 4 and axis < nd);
@@ -174,7 +178,7 @@ pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array
     view.* = .{ .ctx = null };
 
     const cap: usize = if (buf.ctx != null) @intCast(mlx.getShape(buf.*)[axis]) else 0;
-    const plan = qsaKeyAppendPlan(@intCast(count.*), cap, @intCast(add), reserve);
+    const plan = qsaKeyAppendPlan(@intCast(count.*), cap, @intCast(add), hold, ratio);
     var start = [_]c_int{ 0, 0, 0, 0 };
     var stop = [_]c_int{ 0, 0, 0, 0 };
     const strides = [_]c_int{ 1, 1, 1, 1 };
@@ -1569,7 +1573,7 @@ test "a QSA pooled bank and score bank append in place at a reservation off MLX'
         var count: c_int = 0;
         var first: ?[*]const u8 = null;
         for (0..4) |step| {
-            try capBufAppend(s, &buf, &view, &count, chunks[@min(step, 1)], c.axis, reserve);
+            try capBufAppend(s, &buf, &view, &count, chunks[@min(step, 1)], c.axis, .{ .reserve = reserve * 4 }, 4);
             try mlx.check(mlx.mlx_array_eval(buf));
             try mlx.check(mlx.mlx_synchronize(s));
             if (step == 0) first = mlx.mlx_array_data_uint8(buf) else try testing.expectEqual(first, mlx.mlx_array_data_uint8(buf));
@@ -1598,9 +1602,32 @@ test "a QSA pooled bank re-seeded at a reservation off MLX's page grid appends i
     var count: c_int = 512;
     var first: ?[*]const u8 = null;
     for (0..4) |step| {
-        try capBufAppend(s, &buf, &view, &count, row, 1, 1274);
+        try capBufAppend(s, &buf, &view, &count, row, 1, .{ .reserve = 1274 * 4 }, 4);
         try mlx.check(mlx.mlx_array_eval(buf));
         try mlx.check(mlx.mlx_synchronize(s));
         if (step == 0) first = mlx.mlx_array_data_uint8(buf) else try testing.expectEqual(first, mlx.mlx_array_data_uint8(buf));
     }
+}
+
+test "a short Flash-Next request's QSA pooled bank holds no more tokens' blocks than its bill's history rows" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    const bills = @import("bills.zig");
+    const cfg = @import("bills_fixtures_test.zig").qwen4ExpOomConfig();
+    const ctx = bills.getEffectiveContextLength(&cfg);
+    // A cold 300-token prompt in one chunk (no reservation), one reply token: 75 blocks of 128-wide BF16 keys, grown as
+    // the engine bounds the request (`reserveQsaHistoryWithHead`).
+    const seq: c_int = 300;
+    var chunk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(chunk);
+    try mlx.check(mlx.mlx_ones(&chunk, &[_]c_int{ 1, @divTrunc(seq, 4), 128 }, 3, .bfloat16, s));
+    var buf: mlx.mlx_array = .{ .ctx = null };
+    var view: mlx.mlx_array = .{ .ctx = null };
+    defer _ = mlx.mlx_array_free(buf);
+    defer _ = mlx.mlx_array_free(view);
+    var count: c_int = 0;
+    try capBufAppend(s, &buf, &view, &count, chunk, 1, .{ .end = @intCast(seq + 1) }, 4);
+    const blocks: u64 = @intCast(mlx.getShape(buf)[1]);
+    const state_rows = @max(bills.cacheCapacityTokens(&cfg, @intCast(seq), 1, 2048, ctx, 0, null), @as(u64, @intCast(seq)));
+    try testing.expect(blocks * 4 <= state_rows);
 }

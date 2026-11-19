@@ -1514,7 +1514,7 @@ pub const Generator = struct {
             prefix_arch.aux.reserveQsaHistoryWithHead(
                 ctx.ssm_entries,
                 arch_state.headEntry(&xfm.arch_state),
-                @intCast(reserved_tokens),
+                .{ .reserve = reserved_tokens, .end = ctx.cache.end_tokens },
             );
             // Admission billed the request at `default_chunk`; where the hook may, the first chunk starts wider and
             // steps down only where it no longer fits.

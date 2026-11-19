@@ -69,6 +69,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
 - **A grow never passes the request's last row** (`KVCache.bound`, `requestEnd`: prompt, clamped reply, speculative
   rows): `heldRows` is the one capacity rule, and the bill prices it at that row, so a cache restored off the policy's
   steps, or a prompt that does not fill the context, holds no more than its bill and than a prompt that fills it.
+  Qwen's QSA banks grow on the same rule in pooled rows (`indexer_compress_ratio` tokens each, `Hold.per`), and the
+  bill prices the history in those rows (`qsaKeyAppendPlan`, `cacheCapacityTokens`).
 - **A shared restore whose buffer is longer than the request reserves copies its rows into a request-sized buffer**
   on the first append (`KVCache.copiesSharedRestore`), because the admission bills the copy at the reservation: a 4k
   chat restored from an 80k entry held the 80k buffer (mlx-serve #492), and a donor that decoded past its own

@@ -2289,14 +2289,16 @@ pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
 /// grow lands under from any start, restored or cold): its reservation (a long prompt's prompt, reply and a chunk; a
 /// shorter one of several chunks its own length, `prefill_plan.reservedPrefillTokens`), else the prompt, its reply and
 /// the `past_end` rows a speculative round writes past the reply's last (`speculativeRowsPastEnd`). Null `paged_bits`:
-/// a buffer that grows on the policy alone (the QSA history). What the bill and the commit count.
+/// the QSA history, which grows on the policy alone in pooled rows. What the bill and the commit count.
 pub fn cacheCapacityTokens(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, chunk: u64, ctx: u64, past_end: u64, paged_bits: ?u64) u64 {
     const KV = trunk.KVCache;
     const end = @max(KV.requestEnd(seq, max_tokens, ctx, past_end), seq);
     const reserves = config.reservesKvCapacity();
     const long = if (reserves) reservedCacheTokens(seq, max_tokens, chunk, ctx) else 0;
     const hold: trunk.Hold = .{ .reserve = if (long > 0) long else if (reserves and seq > chunk) seq else 0, .end = end };
-    const kv_bits = paged_bits orelse return KV.heldRows(0, end, hold, &.{});
+    // The QSA history grows in pooled rows of `indexer_compress_ratio` tokens (`qsaKeyAppendPlan`).
+    const ratio: u64 = @max(config.indexer_compress_ratio, 1);
+    const kv_bits = paged_bits orelse return KV.heldRows(0, (end +| ratio - 1) / ratio, hold.per(ratio), &.{}) *| ratio;
     if (cooler_side.onEngine(config)) return KV.heldRows(0, end, hold, &.{});
     var most: u64 = KV.heldRows(0, end, hold, &.{});
     var li: u32 = 0;
@@ -5158,13 +5160,13 @@ test "the 64 GB Sushi-STQ-2.75bpw recipe's bills at both GDN widths: 250000 cont
     const warm = WarmPrefix{ .mtp_on = true };
     // The load bill's context term is the narrowest rung; at this pack's weights the 59,000 MB ceiling admits
     // the 2048 rung. With the SSD tier up (the default) the prefill holds 3 checkpoints, not the 16 it captures.
-    try t.expectEqual(@as(u64, 7_850), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 9_352), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
-    try t.expectEqual(@as(u64, 11_172), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 7_851), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_355), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
+    try t.expectEqual(@as(u64, 11_174), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
     cfg.gdn_state_f32 = false;
     try t.expectEqual(@as(u64, 7_648), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 9_150), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
-    try t.expectEqual(@as(u64, 10_970), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 9_152), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
+    try t.expectEqual(@as(u64, 10_972), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
 }
 
 test "an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN widths" {
@@ -6061,7 +6063,7 @@ test "bill pin: sushiContextBytesAt and the max-context search" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigs("maxSushiContext", &.{
-        4666853376, 512, 1048576, 1048576, 200000, 3583428960, 512, 1048576,
+        4669249536, 512, 1048576, 1048576, 200000, 3583428960, 512, 1048576,
         1048576, 200000, 2966441600, 512, 1048576, 1048576, 200000, 4335553408,
         512, 1048576, 1048576, 200000,
     }, struct {
@@ -6081,7 +6083,7 @@ test "bill pin: loadServingBill" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("loadServingBill", &.{
-        0, 1, 100000, 4666853376, 1048576, 8, 512, 0,
+        0, 1, 100000, 4669249536, 1048576, 8, 512, 0,
         1, 100000, 3851864416, 1048576, 8, 512, 0, 0,
         0, 0,
     }, .{ 7, 7, 2, 2 }, struct {
@@ -6105,7 +6107,7 @@ test "bill pin: loadServingBill" {
 
 test "bill pin: memoryContextAt and memoryContextAtChunk" {
     try pinConfigs("memoryContextAt", &.{
-        1048576, 1048576, 446055, 446055, 2051958, 2159968, 479944, 587954,
+        1048576, 1048576, 445952, 445952, 2051958, 2159968, 479944, 587954,
         3799051, 3953345, 922039, 1076334, 1076224, 1076224, 1076224, 1076224,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6239,7 +6241,7 @@ test "bill pin: the unnamed hot-cache ask" {
 
 test "bill pin: oneSessionEntryBytes and oneSessionFor" {
     try pinConfigs("oneSession", &.{
-        2250651648, 2250651648, 36549015424, 5326915712, 1073741824, 2250651648, 1526246400, 1526246400,
+        2250651648, 2250651648, 36548216704, 5327714432, 1073741824, 2250651648, 1526246400, 1526246400,
         37605029536, 4270901600, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
         1073741824, 2052183552, 96290880, 96290880, 36282086528, 5593844608, 1073741824, 96290880,
     }, struct {
@@ -6281,15 +6283,15 @@ test "bill pin: prefillRequestTerms" {
         10485760, 0, 16, 2048000, 101253120, 11796480, 0, 125829120,
         0, 98304, 0, 0, 16, 2048000, 101253120, 12779520,
         230916096, 0, 0, 106496, 10485760, 0, 16, 2048000,
-        84811776, 244776960, 346374144, 0, 0, 98304, 0, 0,
-        20, 204800000, 84811776, 265175040, 346374144, 0, 0, 106496,
-        217579520, 0, 20, 204800000, 84811776, 244776960, 346374144, 783360000,
-        65280000, 98304, 0, 0, 20, 204800000, 84811776, 265175040,
+        84811776, 245366784, 346374144, 0, 0, 98304, 0, 0,
+        20, 204800000, 84811776, 265814016, 346374144, 0, 0, 106496,
+        217579520, 0, 20, 204800000, 84811776, 245366784, 346374144, 783360000,
+        65280000, 98304, 0, 0, 20, 204800000, 84811776, 265814016,
         461832192, 0, 0, 106496, 217579520, 0, 20, 204800000,
-        153354240, 244776960, 346374144, 0, 0, 98304, 0, 0,
-        20, 204800000, 153354240, 265175040, 346374144, 0, 0, 106496,
-        217579520, 0, 20, 204800000, 153354240, 244776960, 346374144, 1474560000,
-        122880000, 98304, 0, 0, 20, 204800000, 153354240, 265175040,
+        153354240, 245366784, 346374144, 0, 0, 98304, 0, 0,
+        20, 204800000, 153354240, 265814016, 346374144, 0, 0, 106496,
+        217579520, 0, 20, 204800000, 153354240, 245366784, 346374144, 1474560000,
+        122880000, 98304, 0, 0, 20, 204800000, 153354240, 265814016,
         461832192, 0, 0, 106496, 217579520, 0, 20, 204800000,
         62962560, 0, 0, 0, 1360000, 207572352, 0, 0,
         20, 3276800, 62962560, 15173632, 0, 0, 1360000, 207572352,
@@ -6393,8 +6395,8 @@ test "bill pin: prefillNeededAtChunk" {
     try pinConfigs("prefillNeededAtChunk", &.{
         1112018944, 1123495936, 929714176, 1238953984, 1473158464, 1484635456, 1290853696, 1600093504,
         1168953344, 1180430336, 927666176, 1295888384, 1530092864, 1541569856, 1288805696, 1657027904,
-        4463783936, 4756965376, 3566183936, 4901287936, 6209949824, 6507432064, 5312349824, 6651754624,
-        5702987776, 5996169216, 4013387776, 6140491776, 7479627904, 7777110144, 5790027904, 7921432704,
+        4465995776, 4759361536, 3568395776, 4903684096, 6210687104, 6508230784, 5313087104, 6652553344,
+        5705199616, 5998565376, 4015599616, 6142887936, 7480365184, 7777908864, 5790765184, 7922231424,
         1717825920, 1736792960, 1623822720, 1736792960, 2373073280, 2392040320, 2279070080, 2392040320,
         1944894080, 1963861120, 1797438080, 1963861120, 2600141440, 2619108480, 2452685440, 2619108480,
         3627130720, 3646097760, 2641130720, 3646097760, 5689548640, 5708515680, 4703548640, 5708515680,

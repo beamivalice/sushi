@@ -554,8 +554,8 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   held every layer's old rows at once.
 - **A cold prefill grows the request's cache to its reservation inside its first chunk** (the KV of every attention
   layer and the MTP head, and the QSA history): those buffers are the request's commit, billed at admission, so the
-  chunk's pool cap rises by their exact bytes as they are made (`engine.roomFor` in `KVCache.growQuantBuf` and
-  `ssm_cache.capBufAppend`), not by its transient bill. Billed as scratch, a 40,388-token cold turn reserving 256,000
+  chunk's pool cap rises by their exact bytes as they are made (`engine.roomFor`, taken once by the `mlx_pages`
+  constructor that makes each, lint `cache-room`), not by its transient bill. Billed as scratch, a 40,388-token cold turn reserving 256,000
   more (Qwen STQ 4bpw, kv8: 12 layers x 312 MiB of KV) outgrew its 4,096-row chunk's ~3.1 GB cap with `PoolOverBudget`
   (r-68). The contract cell `a served cold prefill past the reservation floor...` holds it on both cuts.
 - **A per-request buffer the bill prices at the reservation is reserved at it** (`DraftCache.reserve` beside

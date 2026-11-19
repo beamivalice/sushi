@@ -1183,9 +1183,9 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
         @as(u64, 20_845),
         prefillNeededAtChunk(&cfg, 364_509, 421_923, kv_bits, 2048, .{}) / mb,
     );
-    // Turn B: 11,854 MB with the 8192-token headroom, 19,370 MB with its reply billed whole.
+    // Turn B: 11,854 MB with the 8192-token headroom, 19,371 MB with its reply billed whole.
     try t.expectEqual(
-        @as(u64, 19_370),
+        @as(u64, 19_371),
         prefillNeededAtChunk(&cfg, 368_208, 418_224, kv_bits, 512, .{}) / mb,
     );
 }
@@ -1509,7 +1509,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u64, 465), g.grow_coexist_bytes / mb);
     // The bill at the narrowest and a wider width.
     // The reply is billed whole: 5,057 MB under the 8192-token headroom.
-    try t.expectEqual(@as(u64, 11_100), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
+    try t.expectEqual(@as(u64, 11_102), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
     try t.expectEqual(@as(u64, 12_584), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
 
     // A buffer the previous turn sized above this prompt but below the reservation is grown to
@@ -1518,7 +1518,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     const f = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, fits);
     try t.expect(reserved > 450_048);
     try t.expectEqual(450_048 *| kv_per_tok / 12, f.grow_coexist_bytes);
-    try t.expectEqual(@as(u64, 11_079), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
+    try t.expectEqual(@as(u64, 11_080), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
 
     // Byte-identical arms: a SHARED restore is copied whole by the first append, so it credits
     // nothing and bills no window either; a COLD prompt has nothing to credit.
@@ -1559,13 +1559,13 @@ test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the 
 
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
     // Billed at the capacity the cache allocates for it: the reservation at the cache's 256-row step, on MLX's page grid
-    // (1,024 rows at kv8) for the KV, the history's at the step alone.
+    // (1,024 rows at kv8) for the KV, the history's at the step in pooled rows (256 rows of 4 tokens).
     const cap = bills.cacheCapacityTokens(&cfg, seq, clamped, chunk, ctx, 0, 8);
     try t.expectEqual(@as(u64, 420_864), cap);
-    try t.expectEqual(@as(u64, 420_096), bills.cacheCapacityTokens(&cfg, seq, clamped, chunk, ctx, 0, null));
+    try t.expectEqual(@as(u64, 420_864), bills.cacheCapacityTokens(&cfg, seq, clamped, chunk, ctx, 0, null));
     const terms = prefillRequestTerms(&cfg, seq, clamped, 8, chunk, .{});
     try t.expectEqual((cap - seq) * kv_per_tok, terms.reserved_kv_bytes);
-    try t.expectEqual(@as(u64, 420_096) * statePerTokenBilled(&cfg), terms.state_bytes);
+    try t.expectEqual(@as(u64, 420_864) * statePerTokenBilled(&cfg), terms.state_bytes);
 
     // ...and the whole bill drops by more than 10 GB, from above the live headroom to under it.
     const ctx_bounded: PrefillRequestTerms = .{
@@ -1838,14 +1838,17 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const off = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{});
     try t.expectEqual(@as(u64, 0), off.mtp_head_kv_bytes);
     const on = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{ .mtp_on = true });
-    // Each buffer's own steps: the dense head's cache and the history on the policy alone (`cacheStorage`).
-    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg), 0, null);
-    try t.expectEqual(reserved * 2048, on.mtp_head_kv_bytes);
+    // Each buffer's own steps (`cacheStorage`): the dense head's cache on its page grid, the history in pooled rows, both
+    // to the MTP round's rows past the reply where the head runs.
+    const ctx = getEffectiveContextLength(&cfg);
+    const past = bills.speculativeRowsPastEnd(&cfg, .{ .mtp_on = true });
+    try t.expectEqual(bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, ctx, past, 16) * 2048, on.mtp_head_kv_bytes);
     const n: u64 = cfg.attnCacheLayerCount();
     try t.expectEqual(cfg.qsaRingBytes() + cfg.qsaRingBytes() / n, on.qsa_ring_bytes);
-    try t.expectEqual(reserved * (statePerTokenBilled(&cfg) + statePerTokenBilled(&cfg) / n), on.state_bytes);
+    const history_on = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, ctx, past, null);
+    try t.expectEqual(history_on * (statePerTokenBilled(&cfg) + statePerTokenBilled(&cfg) / n), on.state_bytes);
     try t.expectEqual(cfg.qsaRingBytes(), off.qsa_ring_bytes);
-    try t.expectEqual(reserved * statePerTokenBilled(&cfg), off.state_bytes);
+    try t.expectEqual(bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, ctx, 0, null) * statePerTokenBilled(&cfg), off.state_bytes);
     var other = cfg;
     other.model_type = "not_a_served_arch";
     const other_on = prefillRequestTerms(&other, seq, max_tokens, kv_bits, chunk, .{ .mtp_on = true });
@@ -1953,13 +1956,13 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
     try t.expectEqual(gross * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq), needed);
 
-    // AND THE VERDICT MOVES. 11,869 MB refused against 10,000 MB available;
-    // the honest checkpoint term brings it to 9,805 MB, so the turn is served.
+    // AND THE VERDICT MOVES. 11,871 MB refused against 10,000 MB available;
+    // the honest checkpoint term brings it to 9,807 MB, so the turn is served.
     const available: u64 = 10_000 * mb;
     try t.expect(needed < available);
-    try t.expectEqual(@as(u64, 9_805), needed / mb);
+    try t.expectEqual(@as(u64, 9_807), needed / mb);
     const before = gross - terms.checkpoint_bytes + @as(u64, launch_state.ssm_checkpoint_max) * per_cp;
-    try t.expectEqual(@as(u64, 11_869), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
+    try t.expectEqual(@as(u64, 11_871), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
     try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) > available);
 }
 

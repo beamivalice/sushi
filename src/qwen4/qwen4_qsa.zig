@@ -1047,7 +1047,7 @@ pub fn qsaScoreBank(self: *Trunk, entry: *SSMCacheEntry, batch: c_int, nb: c_int
     if (entry.qsa_score_bank.ctx != null and entry.qsa_score_blocks == nb) return entry.qsa_score_bank;
     const old_nb = entry.qsa_score_blocks;
     const ratio: usize = @max(@as(usize, @intCast(entry.qsa_ratio)), 1);
-    const reserve = entry.qsa_reserve_rows / ratio;
+    const hold = qwen4_qsa_state.qsaHold(entry);
     if (entry.qsa_score_buf.ctx != null and old_nb > 0 and nb > old_nb and entry.qsa_pooled.ctx != null) {
         const psh = mlx.getShape(entry.qsa_pooled);
         if (psh[1] >= nb) {
@@ -1067,7 +1067,7 @@ pub fn qsaScoreBank(self: *Trunk, entry: *SSMCacheEntry, batch: c_int, nb: c_int
             ));
             const cols = try qsaScoreCols(self, new_pooled, batch, n_new, idx_hd);
             defer _ = mlx.mlx_array_free(cols);
-            try capBufAppend(self.s, &entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, cols, 3, reserve);
+            try capBufAppend(self.s, &entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, cols, 3, hold, ratio);
             self.arch_state.qwen4.qsa_score_bank_builds += 1;
             qsa_score_incremental_appends += 1;
             return entry.qsa_score_bank;
@@ -1080,7 +1080,7 @@ pub fn qsaScoreBank(self: *Trunk, entry: *SSMCacheEntry, batch: c_int, nb: c_int
     entry.qsa_score_blocks = 0;
     const cols = try qsaScoreCols(self, entry.qsa_pooled, batch, nb, idx_hd);
     defer _ = mlx.mlx_array_free(cols);
-    try capBufAppend(self.s, &entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, cols, 3, reserve);
+    try capBufAppend(self.s, &entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, cols, 3, hold, ratio);
     self.arch_state.qwen4.qsa_score_bank_builds += 1;
     return entry.qsa_score_bank;
 }
@@ -1749,7 +1749,7 @@ pub fn qsaAppendKeys(self: *Trunk, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, 
     if (add >= QSA_RING_ROWS) {
         try qsaInstallRing(self, entry, k_raw, s, false);
     } else if (held + add <= QSA_RING_ROWS) {
-        try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1, ring_cap);
+        try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1, .{ .reserve = ring_cap }, 1);
     } else {
         const keep_old = QSA_RING_ROWS - add;
         const sh = mlx.getShape(entry.aux_state);
@@ -1791,9 +1791,9 @@ pub fn qsaAppendPooled(self: *Trunk, entry: *SSMCacheEntry, new3: mlx.mlx_array,
             entry.qsa_pooled_blocks = nb_cached;
         }
     }
-    // One row per completed block: the row reservation divided by the ratio.
+    // One row per completed block of `ratio` tokens.
     const ratio: usize = @max(@as(usize, @intCast(entry.qsa_ratio)), 1);
-    try capBufAppend(s, &entry.qsa_pooled_buf, &entry.qsa_pooled, &entry.qsa_pooled_blocks, new3, 1, entry.qsa_reserve_rows / ratio);
+    try capBufAppend(s, &entry.qsa_pooled_buf, &entry.qsa_pooled, &entry.qsa_pooled_blocks, new3, 1, qwen4_qsa_state.qsaHold(entry), ratio);
 }
 
 /// `rms_norm(bf16(mean_f32(kb4, axis 2)), w)` → `[B, nb, D]`.

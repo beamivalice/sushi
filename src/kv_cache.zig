@@ -297,6 +297,12 @@ pub const Hold = struct {
     reserve: u64 = 0,
     /// The request's last row (`KVCache.requestEnd`); 0 = no request bounds the buffer.
     end: u64 = 0,
+
+    /// The hold of a buffer whose rows each hold `ratio` tokens (a QSA bank's pooled blocks).
+    pub fn per(self: Hold, ratio: u64) Hold {
+        const r = @max(ratio, 1);
+        return .{ .reserve = (self.reserve +| r - 1) / r, .end = (self.end +| r - 1) / r };
+    }
 };
 
 pub const KVCache = struct {

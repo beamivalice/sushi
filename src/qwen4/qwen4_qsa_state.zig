@@ -15,6 +15,7 @@ const testTrunk = test_support.testTrunk;
 const attn256MaxDiff = test_support.attn256MaxDiff;
 const attn256RandBf16 = test_support.attn256RandBf16;
 const KVCache = trunk_mod.KVCache;
+const Hold = trunk_mod.Hold;
 const QSA_MAX_COMPRESS_RATIO = trunk_mod.QSA_MAX_COMPRESS_RATIO;
 const QSA_RING_ROWS = trunk_mod.QSA_RING_ROWS;
 const SSMCacheEntry = trunk_mod.SSMCacheEntry;
@@ -111,10 +112,10 @@ pub fn ssmFreeQsaState(e: *SSMCacheEntry) void {
 /// Where the next `add` rows of QSA raw-key history go, and how big the capacity buffer must
 /// be. `cap == 0` = no buffer yet. Growth is the KV cache's proportional policy.
 const QsaKeyAppendPlan = struct { new_cap: usize, write_at: usize, new_rows: usize };
-pub fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize, reserve: usize) QsaKeyAppendPlan {
+pub fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize, hold: Hold, ratio: usize) QsaKeyAppendPlan {
     const need = rows + add;
-    // A reservation raises the first grow to the whole request; past it the proportional policy takes over.
-    const grown = if (need <= cap) cap else @max(KVCache.nextCapacityPolicy(cap, need), reserve);
+    // The cache's rule (`KVCache.heldRows`) in rows of `ratio` tokens, as the bill prices the history.
+    const grown = if (need <= cap) cap else KVCache.heldRows(cap, need, hold.per(ratio), &.{});
     return .{
         .new_cap = grown,
         .write_at = rows,
@@ -130,16 +131,22 @@ pub var qsa_history_seeds: usize = 0;
 
 
 /// Ask every live entry's QSA history to hold `tokens` rows up front (same lever as `KVCache.reserve`).
-pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, tokens: usize) void {
+pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, hold: Hold) void {
     const es = entries orelse return;
     for (es) |*e| {
-        if (tokens > e.qsa_reserve_rows) e.qsa_reserve_rows = tokens;
+        if (hold.reserve > e.qsa_reserve_rows) e.qsa_reserve_rows = @intCast(hold.reserve);
+        e.qsa_end_rows = @intCast(hold.end);
     }
 }
 
-pub fn reserveQsaHistoryWithHead(entries: ?[]SSMCacheEntry, head: ?*SSMCacheEntry, tokens: usize) void {
-    reserveQsaHistory(entries, tokens);
-    if (head) |h| reserveQsaHistory(h[0..1], tokens);
+pub fn reserveQsaHistoryWithHead(entries: ?[]SSMCacheEntry, head: ?*SSMCacheEntry, hold: Hold) void {
+    reserveQsaHistory(entries, hold);
+    if (head) |h| reserveQsaHistory(h[0..1], hold);
+}
+
+/// What the entry's request asks of its QSA history's growth, in tokens.
+pub fn qsaHold(e: *const SSMCacheEntry) Hold {
+    return .{ .reserve = e.qsa_reserve_rows, .end = e.qsa_end_rows };
 }
 
 /// Re-publish an entry's QSA views over the first `keep` rows of the capacity buffers it
@@ -1951,26 +1958,26 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
 }
 
 test "qsa key append plan: rows advance by S, capacity grows only when it must" {
-    const p0 = qsaKeyAppendPlan(0, 0, 4, 0);
+    const p0 = qsaKeyAppendPlan(0, 0, 4, .{}, 1);
     try testing.expectEqual(@as(usize, 0), p0.write_at);
     try testing.expectEqual(@as(usize, 4), p0.new_rows);
     try testing.expect(p0.new_cap >= 4);
 
-    const p1 = qsaKeyAppendPlan(100, 512, 1, 0);
+    const p1 = qsaKeyAppendPlan(100, 512, 1, .{}, 1);
     try testing.expectEqual(@as(usize, 512), p1.new_cap);
     try testing.expectEqual(@as(usize, 100), p1.write_at);
     try testing.expectEqual(@as(usize, 101), p1.new_rows);
 
-    const p2 = qsaKeyAppendPlan(511, 512, 1, 0);
+    const p2 = qsaKeyAppendPlan(511, 512, 1, .{}, 1);
     try testing.expectEqual(@as(usize, 512), p2.new_cap);
     try testing.expectEqual(@as(usize, 512), p2.new_rows);
 
-    const p3 = qsaKeyAppendPlan(512, 512, 1, 0);
+    const p3 = qsaKeyAppendPlan(512, 512, 1, .{}, 1);
     try testing.expect(p3.new_cap >= 513);
     try testing.expectEqual(@as(usize, 512), p3.write_at);
     try testing.expectEqual(@as(usize, 513), p3.new_rows);
 
-    const p4 = qsaKeyAppendPlan(500, 512, 4096, 0);
+    const p4 = qsaKeyAppendPlan(500, 512, 4096, .{}, 1);
     try testing.expect(p4.new_cap >= 4596);
     try testing.expectEqual(@as(usize, 4596), p4.new_rows);
 }
@@ -1979,7 +1986,7 @@ test "reserveQsaHistory: the MTP head entry is reserved at the same length" {
     var slot = [_]SSMCacheEntry{.{ .ssm_state = .{ .ctx = null }, .conv_state = .{ .ctx = null }, .initialized = false }};
     var head: SSMCacheEntry = .{ .ssm_state = .{ .ctx = null }, .conv_state = .{ .ctx = null }, .initialized = false };
     const tokens: usize = 8192;
-    reserveQsaHistoryWithHead(slot[0..], &head, tokens);
+    reserveQsaHistoryWithHead(slot[0..], &head, .{ .reserve = tokens });
     try testing.expectEqual(tokens, slot[0].qsa_reserve_rows);
     try testing.expectEqual(tokens, head.qsa_reserve_rows);
 }
@@ -2007,7 +2014,7 @@ test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#3
         _ = mlx.mlx_array_free(entry.conv_state);
     }
 
-    reserveQsaHistory(entries[0..], total);
+    reserveQsaHistory(entries[0..], .{ .reserve = total });
     try testing.expectEqual(total, entry.qsa_reserve_rows);
 
     var rows: c_int = 0;
@@ -2023,10 +2030,12 @@ test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#3
 }
 
 test "qsa key append plan: a reservation raises the FIRST grow and nothing else" {
-    try testing.expectEqual(@as(usize, 512), qsaKeyAppendPlan(100, 512, 1, 400_000).new_cap);
-    try testing.expectEqual(@as(usize, 400_000), qsaKeyAppendPlan(0, 0, 4096, 400_000).new_cap);
-    try testing.expect(qsaKeyAppendPlan(0, 0, 500_000, 400_000).new_cap >= 500_000);
-    try testing.expect(qsaKeyAppendPlan(400_000, 400_000, 1, 400_000).new_cap > 400_000);
+    const r: Hold = .{ .reserve = 400_000 };
+    try testing.expectEqual(@as(usize, 512), qsaKeyAppendPlan(100, 512, 1, r, 1).new_cap);
+    // The reservation on the cache's 256-row steps (`KVCache.heldRows`).
+    try testing.expectEqual(@as(usize, 400_128), qsaKeyAppendPlan(0, 0, 4096, r, 1).new_cap);
+    try testing.expect(qsaKeyAppendPlan(0, 0, 500_000, r, 1).new_cap >= 500_000);
+    try testing.expect(qsaKeyAppendPlan(400_000, 400_000, 1, r, 1).new_cap > 400_000);
 }
 
 test "qsa key history: capacity-buffer append equals the concatenated reference, across a growth boundary" {
@@ -2281,7 +2290,7 @@ test "qsa history: a restore-shaped re-seed lands AT the reservation, so the app
         _ = mlx.mlx_array_free(entry.ssm_state);
         _ = mlx.mlx_array_free(entry.conv_state);
     }
-    reserveQsaHistory(entries[0..], reserve);
+    reserveQsaHistory(entries[0..], .{ .reserve = reserve });
 
     {
         const chunk = try attn256RandBf16(rnd, &[_]c_int{ 1, held, hd }, s);
