@@ -259,6 +259,22 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(countGuard(b, count_guard, encoder_tests));
     }
 
+    if (test_model == null) if (sushibarFilters(b, test_filter)) |filters| {
+        const bar_tests = b.addTest(.{
+            .test_runner = testRunner(b),
+            .max_rss = 1 * gib,
+            .name = "test-sushibar",
+            .root_module = sushibarModule(b, target, optimize, macos_sdk_frameworks),
+            .filters = filters,
+        });
+        test_build.dependOn(&b.addInstallArtifact(bar_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        const run_bar = b.addRunArtifact(bar_tests);
+        runEveryTime(run_bar);
+        logTo(run_bar, test_log, bar_tests.name);
+        test_step.dependOn(&run_bar.step);
+        test_step.dependOn(countGuard(b, count_guard, bar_tests));
+    };
+
     guardBenchFiles(b, build_roots);
     const ubench_step = b.step("ubench", "Build zig-out/bin/sushi-ubench (always ReleaseFast): the microbenches, which no test step builds");
     ubench_step.dependOn(&b.addInstallArtifact(addUbench(b, build_options, target, macos_sdk_frameworks), .{}).step);
@@ -281,6 +297,10 @@ fn archList(b: *std.Build) []const []const u8 {
 
 /// `sushibar`: the menu bar app. It links no MLX or server module, only the Objective-C runtime and AppKit.
 fn addSushibar(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, macos_sdk_frameworks: ?[]const u8) *std.Build.Step.Compile {
+    return b.addExecutable(.{ .name = "sushibar", .root_module = sushibarModule(b, target, optimize, macos_sdk_frameworks) });
+}
+
+fn sushibarModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, macos_sdk_frameworks: ?[]const u8) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path("src/sushibar_main.zig"),
         .target = target,
@@ -290,7 +310,21 @@ fn addSushibar(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     if (macos_sdk_frameworks) |fw_path| mod.addFrameworkPath(.{ .cwd_relative = fw_path });
     mod.linkFramework("AppKit", .{});
     mod.linkFramework("Foundation", .{});
-    return b.addExecutable(.{ .name = "sushibar", .root_module = mod });
+    return mod;
+}
+
+/// The filters of `test-sushibar`, sushibar's AppKit tests (those of `sushibar_main.zig`; its logic and proc files are
+/// host-tier); null when the user's filters select none of them.
+fn sushibarFilters(b: *std.Build, user: ?[]const []const u8) ?[]const []const u8 {
+    const path = "src/sushibar_main.zig";
+    const source = buildRootHandle(b).readFileAlloc(b.graph.io, path, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ path, e });
+    b.dependOnFileContents(b.path(path));
+    var names: std.ArrayList([]const u8) = .empty;
+    appendTestNames(b, &names, "sushibar_main", source);
+    const filters = user orelse return &.{"sushibar_main.test."};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (names.items) |name| if (selectedByUser(filters, name)) out.append(b.allocator, nameFilter(name, names.items, filters)) catch @panic("OOM");
+    return if (out.items.len == 0) null else out.items;
 }
 
 /// `sushi-ubench`: the microbench harness and the bench bodies, a binary of its own. It stamps the commit it was
@@ -506,6 +540,8 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
             const stem = entry.name[0 .. entry.name.len - ".zig".len];
             if (isHostFile(host_paths, dir_path, stem)) continue;
             if (std.mem.startsWith(u8, stem, "ubench_")) continue;
+            // sushibar's own binary, `test-sushibar`, runs its tests.
+            if (std.mem.eql(u8, dir_path, "src") and std.mem.eql(u8, stem, "sushibar_main")) continue;
             if (out_of_scope) {
                 skipped.append(b.allocator, b.allocator.dupe(u8, stem) catch @panic("OOM")) catch @panic("OOM");
                 continue;

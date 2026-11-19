@@ -28,6 +28,8 @@ earlier history is mlx-serve's, in that project's changelog.
   which already carries the margin, and added it again, so a request within 256 MB of the edge was refused and the
   advertised context came out that much smaller. Its last decode forward is now priced where it runs, at the reply's
   end, so a short prompt with a long reply is billed the scores and state growth of its whole context.
+- **Sushibar shows a refused load's whole reason in the note's tooltip**: the tooltip cut every text at 255 bytes, so a
+  memory refusal lost its figures and every action, and a cut inside a character such as an em dash left it blank.
 - **A Sushi Cooler load that evicts a model on MLX gets that model's memory back**: the evicted model's freed buffers
   stayed in MLX's pool (up to 8 GB on a 128 GB Mac) for the whole life of the new load, so its memory check read
   less free RAM than there was, and later checks counted that pool as room the engine cannot use.

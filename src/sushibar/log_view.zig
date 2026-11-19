@@ -171,8 +171,7 @@ fn copyDone(_: id, _: objc.SEL, _: id) callconv(.c) void {
 
 fn fileUrlPath() ?id {
     if (!has_file) return null;
-    var b: [1100]u8 = undefined;
-    return objc.nsString(z(&b, shown_path.get()));
+    return objc.nsText(shown_path.get());
 }
 
 fn consoleAction(_: id, _: objc.SEL, _: id) callconv(.c) void {
@@ -284,16 +283,14 @@ fn build() void {
 fn titleFor(port: u16, src: logic.LogSource) void {
     var tb: [64]u8 = undefined;
     const title = std.fmt.bufPrint(&tb, "sushi log — port {d}", .{port}) catch "sushi log";
-    var zb: [96]u8 = undefined;
-    msg(void, window, "setTitle:", .{objc.nsString(z(&zb, title))});
-    var pb: [1100]u8 = undefined;
+    msg(void, window, "setTitle:", .{objc.nsText(title)});
     const shown = switch (src.kind) {
         .standard, .given => src.path,
         .off => "no log file (--log-file off)",
         .relative => src.path,
     };
-    msg(void, path_label, "setStringValue:", .{objc.nsString(z(&pb, shown))});
-    msg(void, path_label, "setToolTip:", .{objc.nsString(z(&pb, shown))});
+    msg(void, path_label, "setStringValue:", .{objc.nsText(shown)});
+    msg(void, path_label, "setToolTip:", .{objc.nsText(shown)});
 }
 
 // ── Reading ──

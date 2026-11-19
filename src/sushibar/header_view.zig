@@ -80,11 +80,7 @@ fn linkSelector(l: Link) [*:0]const u8 {
 }
 
 fn str(s: []const u8) id {
-    var z: [320:0]u8 = undefined;
-    const n = @min(s.len, z.len - 1);
-    @memcpy(z[0..n], s[0..n]);
-    z[n] = 0;
-    return objc.nsString(&z);
+    return objc.nsText(s);
 }
 
 fn color(name: [*:0]const u8) id {

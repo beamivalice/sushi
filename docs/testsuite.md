@@ -64,6 +64,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   (root, device, kernel source, codebook tables, side cache, layout, pack). A file with tests that the table does not
   list, lists twice or whose filter selects a test of another binary is refused at configure, by name.
   `test-encoder` builds only when the run's `-Dtest-filter` selects one of its tests (or there is none).
+  `test-sushibar` runs `src/sushibar_main.zig`'s tests (AppKit views read back, no MLX) under the same rule.
 - **A binary that runs no test fails.** Zig reports a test binary whose filters select nothing as a pass, so each MLX
   bucket, each exl3 binary, the encoder binary and the unfiltered host binary is followed by
   `scripts/test_count_guard.zig`, which asks the runner for the binary's test list (nothing runs) and fails, naming the

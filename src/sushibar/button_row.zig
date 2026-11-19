@@ -3,7 +3,6 @@
 //! the app's target, closing the menu first unless the button says it stays open. What each button says and does
 //! is decided in `sushibar_logic.zig` (`updateButton`, `toggle`, `modelButton`). Single instance: its state is
 //! module-level.
-const std = @import("std");
 const objc = @import("objc.zig");
 
 const msg = objc.msg;
@@ -34,9 +33,9 @@ const Btn = struct {
     view: id = null,
     selector: [*:0]const u8,
     action: ?[*:0]const u8 = null,
-    label: [32:0]u8 = @splat(0),
-    tip: [128:0]u8 = @splat(0),
-    symbol: [48:0]u8 = @splat(0),
+    label: id = null,
+    tip: id = null,
+    symbol: id = null,
     accent: bool = false,
     enabled: bool = true,
     closes_menu: bool = true,
@@ -62,16 +61,6 @@ var btns = [5]Btn{
 var target: id = null;
 var menu: id = null;
 var opaque_bg = false;
-
-fn setZ(dst: []u8, s: []const u8) void {
-    const n = @min(s.len, dst.len - 1);
-    @memcpy(dst[0..n], s[0..n]);
-    dst[n] = 0;
-}
-
-fn same(z: []const u8, s: []const u8) bool {
-    return std.mem.eql(u8, std.mem.sliceTo(z, 0), s);
-}
 
 fn btnOf(view: id) ?*Btn {
     for (&btns) |*b| if (b.view == view) return b;
@@ -112,10 +101,10 @@ fn drawRect(self: id, _: objc.SEL, _: NSRect) callconv(.c) void {
     msg(void, msg(id, objc.class("NSBezierPath"), "bezierPathWithRoundedRect:xRadius:yRadius:", .{ bounds, radius, radius }), "fill", .{});
 
     const c = ink(b);
-    const img = if (b.spinner) null else objc.symbolImage(&b.symbol, c);
+    const img = if (b.spinner) null else objc.symbolImage(b.symbol, c);
     const lay = layout(b, c, bounds.w, img);
     if (img != null) msg(void, img, "drawInRect:", .{NSRect{ .x = lay.icon_x, .y = (bounds.h - symbol_h) / 2, .w = lay.icon_w, .h = symbol_h }});
-    msg(void, objc.nsString(&b.label), "drawAtPoint:withAttributes:", .{ objc.NSPoint{ .x = lay.text_x, .y = (bounds.h - lay.text_h) / 2 }, lay.attrs });
+    msg(void, b.label, "drawAtPoint:withAttributes:", .{ objc.NSPoint{ .x = lay.text_x, .y = (bounds.h - lay.text_h) / 2 }, lay.attrs });
 }
 
 const Layout = struct { icon_x: f64, icon_w: f64, text_x: f64, text_h: f64, attrs: id };
@@ -126,7 +115,7 @@ fn layout(b: *const Btn, c: id, w: f64, img: id) Layout {
     var keys = [_]id{ NSFontAttributeName, NSForegroundColorAttributeName };
     var vals = [_]id{ font, c };
     const attrs = msg(id, objc.class("NSDictionary"), "dictionaryWithObjects:forKeys:count:", .{ @as([*]id, &vals), @as([*]id, &keys), @as(usize, 2) });
-    const tsize = msg(objc.NSSize, objc.nsString(&b.label), "sizeWithAttributes:", .{attrs});
+    const tsize = msg(objc.NSSize, b.label, "sizeWithAttributes:", .{attrs});
     const isize_ = if (img != null) msg(objc.NSSize, img, "size", .{}) else objc.NSSize{ .width = 0, .height = 0 };
     const iw: f64 = if (b.spinner) symbol_h else if (isize_.height > 0) isize_.width * symbol_h / isize_.height else 0;
     const total = iw + (if (iw > 0) symbol_gap else 0) + tsize.width;
@@ -243,15 +232,13 @@ fn set(i: usize, look: Look) void {
     const b = &btns[i];
     b.closes_menu = look.closes_menu;
     b.action = look.selector;
-    if (same(&b.label, look.label) and same(&b.symbol, look.symbol) and same(&b.tip, look.tip) and b.accent == look.accent and b.enabled == look.enabled and b.spinner == look.spinner) return;
-    setZ(&b.label, look.label);
-    setZ(&b.symbol, look.symbol);
-    setZ(&b.tip, look.tip);
+    const new_text = @intFromBool(objc.keepText(&b.label, look.label)) | @intFromBool(objc.keepText(&b.symbol, look.symbol)) | @intFromBool(objc.keepText(&b.tip, look.tip));
+    if (new_text == 0 and b.accent == look.accent and b.enabled == look.enabled and b.spinner == look.spinner) return;
     b.accent = look.accent;
     b.enabled = look.enabled;
     b.spinner = look.spinner;
     placeWheel(b);
-    msg(void, b.view, "setToolTip:", .{objc.nsString(&b.tip)});
+    msg(void, b.view, "setToolTip:", .{b.tip});
     objc.fadeNext(b.view, 0.18);
     redraw(b);
 }
@@ -317,9 +304,7 @@ pub fn renderPng(row: id, path: [*:0]const u8, dark: bool, hover: ?usize, presse
         msg(void, row, "setFrameOrigin:", .{objc.NSPoint{ .x = 0, .y = 0 }});
     }
     if (caption.len > 0) {
-        var z: [128:0]u8 = undefined;
-        setZ(&z, caption);
-        const label = msg(id, objc.class("NSTextField"), "labelWithString:", .{objc.nsString(&z)});
+        const label = msg(id, objc.class("NSTextField"), "labelWithString:", .{objc.nsText(caption)});
         msg(void, label, "setFrame:", .{NSRect{ .x = 0, .y = 0, .w = width, .h = caption_h }});
         msg(void, label, "setDrawsBackground:", .{true});
         msg(void, label, "setBackgroundColor:", .{color("windowBackgroundColor")});

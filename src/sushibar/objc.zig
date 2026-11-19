@@ -43,6 +43,23 @@ pub fn nsString(s: [*:0]const u8) id {
     return msg(id, class("NSString"), "stringWithUTF8String:", .{s});
 }
 
+/// An autoreleased NSString of all of the UTF-8 `s`. Text shown to the user goes through this, never a fixed C-string
+/// buffer: a cut loses the end, and a cut inside a character makes the whole string nil.
+pub fn nsText(s: []const u8) id {
+    const utf8: usize = 4;
+    const str = msg(id, msg(id, class("NSString"), "alloc", .{}), "initWithBytes:length:encoding:", .{ s.ptr, s.len, utf8 });
+    return msg(id, str, "autorelease", .{});
+}
+
+/// `s` retained in `slot`, whose old string is released; false when `slot` already held the same text.
+pub fn keepText(slot: *id, s: []const u8) bool {
+    const t = nsText(s);
+    if (slot.* != null and msg(bool, slot.*, "isEqualToString:", .{t})) return false;
+    if (slot.* != null) release(slot.*);
+    slot.* = msg(id, t, "retain", .{});
+    return true;
+}
+
 pub const Method = struct { selector: [*:0]const u8, imp: *const anyopaque, types: [*:0]const u8 };
 
 pub const NSPoint = extern struct { x: f64, y: f64 };
@@ -122,8 +139,8 @@ pub fn withAlpha(c: id, a: f64) id {
 }
 
 /// A system symbol drawn in the single colour `c`, or null when the system has no such symbol.
-pub fn symbolImage(name: [*:0]const u8, c: id) id {
-    const img = msg(id, class("NSImage"), "imageWithSystemSymbolName:accessibilityDescription:", .{ nsString(name), @as(id, null) });
+pub fn symbolImage(name: id, c: id) id {
+    const img = msg(id, class("NSImage"), "imageWithSystemSymbolName:accessibilityDescription:", .{ name, @as(id, null) });
     if (img == null) return null;
     const colors = msg(id, class("NSArray"), "arrayWithObject:", .{c});
     const cfg = msg(id, class("NSImageSymbolConfiguration"), "configurationWithPaletteColors:", .{colors});

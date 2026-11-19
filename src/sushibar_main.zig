@@ -597,8 +597,7 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
     const r = request(a, p, .POST, urlFor(&url, p, "/v1/update"), origin_s) orelse return setUpdateNote("Update failed: the server did not answer", true);
     if (r.status != 202) {
         const why = errorMessage(a, r.body);
-        var msg: [400]u8 = undefined;
-        return setUpdateNote(std.fmt.bufPrint(&msg, "Update refused: {s}", .{if (why.len > 0) why else "the server did not accept it"}) catch "Update refused", true);
+        return setUpdateNote(std.fmt.allocPrint(a, "Update refused: {s}", .{if (why.len > 0) why else "the server did not accept it"}) catch "Update refused", true);
     }
     setUpdateNote("Updating…", false);
     var down = false;
@@ -626,9 +625,8 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
         var msg: [64]u8 = undefined;
         return finishUpdate(a, std.fmt.bufPrint(&msg, "Updated to sushi {s}", .{up.current}) catch "Updated");
     };
-    var msg: [400]u8 = undefined;
     const why = if (u) |up| up.err orelse "sushi restarted on the version it had" else "the server did not come back";
-    setUpdateNote(std.fmt.bufPrint(&msg, "Update failed: {s}", .{why}) catch "Update failed", true);
+    setUpdateNote(std.fmt.allocPrint(a, "Update failed: {s}", .{why}) catch "Update failed", true);
 }
 
 /// Two minutes of half-second polls: past that the update is reported as failed instead of locking the menu.
@@ -648,8 +646,7 @@ fn updateViaCli(a: std.mem.Allocator) void {
         unlock();
         return finishUpdate(a, text);
     }
-    var msg: [400]u8 = undefined;
-    setUpdateNote(std.fmt.bufPrint(&msg, "Update failed: {s}", .{logic.failureLine(got.text)}) catch "Update failed", true);
+    setUpdateNote(std.fmt.allocPrint(a, "Update failed: {s}", .{logic.failureLine(got.text)}) catch "Update failed", true);
 }
 
 const WorkerKind = enum { auto_check, check, update };
@@ -1135,7 +1132,6 @@ fn modelOpWorker(job: ModelOp) void {
     const payload = if (job.unload) logic.unloadModelBody(&body, job.model.get()) else logic.loadModelBody(&body, job.model.get());
     const reply = requestWithin(a, job.port, .POST, target, origin_s, load_timeout_s, payload);
     const verb = if (job.unload) "unload" else "load";
-    var msg: [note_cap]u8 = undefined;
     if (reply) |r| if (r.status == 200) {
         lock();
         if (shared.port == job.port) {
@@ -1148,7 +1144,7 @@ fn modelOpWorker(job: ModelOp) void {
     // A server that was stopped under the request is reported by its own exit note.
     if (get(a, job.port, urlFor(&url, job.port, "/health")) == null) return;
     const why = if (reply) |r| errorMessage(a, r.body) else "";
-    setProblem(std.fmt.bufPrint(&msg, "Port {d}: could not {s} {s}: {s}", .{ job.port, verb, job.model.get(), if (why.len > 0) why else if (reply == null) "no answer" else "the server refused" }) catch "Could not load or unload the model");
+    setProblem(std.fmt.allocPrint(a, "Port {d}: could not {s} {s}: {s}", .{ job.port, verb, job.model.get(), if (why.len > 0) why else if (reply == null) "no answer" else "the server refused" }) catch "Could not load or unload the model");
 }
 
 const Tm = extern struct { sec: c_int, min: c_int, hour: c_int, mday: c_int, mon: c_int, year: c_int, wday: c_int, yday: c_int, isdst: c_int, gmtoff: c_long, zone: ?[*:0]const u8 };
@@ -1168,16 +1164,12 @@ const alert_third = 1002;
 
 /// Runs the alert and returns which button ended it (`alert_first` is the default one).
 fn runAlert(message: []const u8, info: []const u8, ok: [*:0]const u8, cancel: ?[*:0]const u8, third: ?[*:0]const u8, field: objc.id) isize {
-    var m: [160:0]u8 = undefined;
-    var i: [200:0]u8 = undefined;
-    const mz = std.fmt.bufPrintSentinel(&m, "{s}", .{message}, 0) catch return 0;
-    const iz = std.fmt.bufPrintSentinel(&i, "{s}", .{info}, 0) catch return 0;
     const app = objc.msg(objc.id, objc.class("NSApplication"), "sharedApplication", .{});
     objc.msg(void, app, "activateIgnoringOtherApps:", .{true});
     const alert = objc.new(objc.class("NSAlert"));
     defer objc.release(alert);
-    objc.msg(void, alert, "setMessageText:", .{objc.nsString(mz.ptr)});
-    objc.msg(void, alert, "setInformativeText:", .{objc.nsString(iz.ptr)});
+    objc.msg(void, alert, "setMessageText:", .{objc.nsText(message)});
+    objc.msg(void, alert, "setInformativeText:", .{objc.nsText(info)});
     _ = objc.msg(objc.id, alert, "addButtonWithTitle:", .{objc.nsString(ok)});
     if (cancel) |c| _ = objc.msg(objc.id, alert, "addButtonWithTitle:", .{objc.nsString(c)});
     if (third) |t| _ = objc.msg(objc.id, alert, "addButtonWithTitle:", .{objc.nsString(t)});
@@ -1346,19 +1338,11 @@ var port_sig: [1536]u8 = undefined;
 var port_sig_len: usize = std.math.maxInt(usize);
 
 fn setText(setter_target: objc.id, selector: [*:0]const u8, text: []const u8) void {
-    var z: [256:0]u8 = undefined;
-    const n = @min(text.len, z.len - 1);
-    @memcpy(z[0..n], text[0..n]);
-    z[n] = 0;
-    objc.msg(void, setter_target, selector, .{objc.nsString(&z)});
+    objc.msg(void, setter_target, selector, .{objc.nsText(text)});
 }
 
 fn symbol(name: []const u8) objc.id {
-    var z: [48:0]u8 = undefined;
-    const n = @min(name.len, z.len - 1);
-    @memcpy(z[0..n], name[0..n]);
-    z[n] = 0;
-    return objc.msg(objc.id, objc.class("NSImage"), "imageWithSystemSymbolName:accessibilityDescription:", .{ objc.nsString(&z), @as(objc.id, null) });
+    return objc.msg(objc.id, objc.class("NSImage"), "imageWithSystemSymbolName:accessibilityDescription:", .{ objc.nsText(name), @as(objc.id, null) });
 }
 
 fn showIcon(button: objc.id, icon: logic.Icon) void {
@@ -1373,10 +1357,7 @@ fn setButtonTitle(button: objc.id, text: []const u8) void {
     if (shown_title_len == text.len and std.mem.eql(u8, shown_title[0..text.len], text)) return;
     shown_title_len = text.len;
     @memcpy(shown_title[0..text.len], text);
-    var z: [192:0]u8 = undefined;
-    @memcpy(z[0..text.len], text);
-    z[text.len] = 0;
-    const s = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsString(&z), header_view.titleAttributes() });
+    const s = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsText(text), header_view.titleAttributes() });
     defer objc.release(s);
     objc.msg(void, button, "setAttributedTitle:", .{s});
 }
@@ -1508,12 +1489,8 @@ fn showNote(title: []const u8, full: []const u8, problem: bool) void {
     objc.msg(void, note_mi, "setEnabled:", .{problem});
     objc.msg(void, note_mi, "setAction:", .{if (problem) objc.sel("showLog:") else null});
     if (!problem) return objc.msg(void, note_mi, "setAttributedTitle:", .{@as(objc.id, null)});
-    var z: [256:0]u8 = undefined;
-    const n = @min(title.len, z.len - 1);
-    @memcpy(z[0..n], title[0..n]);
-    z[n] = 0;
     const attrs = header_view.noteAttributes();
-    const text = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsString(&z), attrs });
+    const text = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsText(title), attrs });
     defer objc.release(text);
     objc.msg(void, note_mi, "setAttributedTitle:", .{text});
 }
@@ -1842,11 +1819,7 @@ fn relaunchSelf(p: u16) void {
 }
 
 fn openUrl(url: []const u8) void {
-    var z: [256:0]u8 = undefined;
-    const n = @min(url.len, z.len - 1);
-    @memcpy(z[0..n], url[0..n]);
-    z[n] = 0;
-    const ns_url = objc.msg(objc.id, objc.class("NSURL"), "URLWithString:", .{objc.nsString(&z)});
+    const ns_url = objc.msg(objc.id, objc.class("NSURL"), "URLWithString:", .{objc.nsText(url)});
     _ = objc.msg(bool, objc.msg(objc.id, objc.class("NSWorkspace"), "sharedWorkspace", .{}), "openURL:", .{ns_url});
 }
 
@@ -2586,4 +2559,37 @@ pub fn main(init: std.process.Init) !void {
     }
     adoptStarted();
     runMenuBar();
+}
+
+fn testToolTip(view: objc.id) []const u8 {
+    const tip = objc.msg(objc.id, view, "toolTip", .{});
+    if (tip == null) return "";
+    return std.mem.span(objc.msg([*:0]const u8, tip, "UTF8String", .{}));
+}
+
+test "the note of a refused load keeps its whole text in the tooltip, a character across the old 255-byte cut included" {
+    const pad: [183]u8 = @splat('x');
+    var msg: [note_cap]u8 = undefined;
+    const full = try std.fmt.bufPrint(&msg, "Port 8080: could not load Pack-{s}: Not enough memory to load this model.\u{2014} It needs 20.0 GB, and only 12.0 GB of RAM is free right now. To load it:\n- Quit other apps or unload another model to free about 8.0 GB, then retry.\n- Use a smaller pack of this model.", .{&pad});
+    try std.testing.expect(full.len > 300 and std.mem.indexOf(u8, full, "\u{2014}").? < 255 and std.mem.indexOf(u8, full, "\u{2014}").? + 3 > 255);
+    note_mi = objc.new(objc.class("NSMenuItem"));
+    defer {
+        objc.release(note_mi);
+        note_mi = null;
+        shown_note_sig_len = std.math.maxInt(usize);
+    }
+    var fit_b: [logic.note_title_max + 4]u8 = undefined;
+    showNote(logic.fitNote(&fit_b, full, logic.note_title_max), full, true);
+    try std.testing.expectEqualStrings(full, testToolTip(note_mi));
+}
+
+test "the Load button tooltip keeps a long model name whole" {
+    const row = button_row.createServerRow();
+    defer objc.release(row);
+    const name: [150]u8 = @splat('m');
+    var tip_b: [200]u8 = undefined;
+    const tip = try std.fmt.bufPrint(&tip_b, "Load {s}\u{2014}é", .{&name});
+    button_row.setLoad(.{ .label = "Load", .symbol = "arrow.down.circle", .tip = tip, .closes_menu = false });
+    const load = objc.msg(objc.id, objc.msg(objc.id, row, "subviews", .{}), "objectAtIndex:", .{@as(usize, 1)});
+    try std.testing.expectEqualStrings(tip, testToolTip(load));
 }

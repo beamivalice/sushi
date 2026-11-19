@@ -26,7 +26,7 @@ const State = struct {
     view: id = null,
     x: id = null,
     port: u16 = 0,
-    label: [112:0]u8 = @splat(0),
+    label: id = null,
     checked: bool = false,
     removable: bool = false,
     hover: bool = false,
@@ -89,11 +89,7 @@ fn trailing(removable: bool) f64 {
 
 /// The widest a row needs for its label, so a long model name is not cut when there is room.
 pub fn widthFor(label: []const u8, removable: bool) f64 {
-    var z: [112:0]u8 = undefined;
-    const n = @min(label.len, z.len - 1);
-    @memcpy(z[0..n], label[0..n]);
-    z[n] = 0;
-    const w = msg(objc.NSSize, objc.nsString(&z), "sizeWithAttributes:", .{textAttrs(objc.color("labelColor"))}).width;
+    const w = msg(objc.NSSize, objc.nsText(label), "sizeWithAttributes:", .{textAttrs(objc.color("labelColor"))}).width;
     return std.math.clamp(w + 30 + 8 + trailing(removable), min_width, max_width);
 }
 
@@ -111,9 +107,9 @@ fn drawRect(self: id, _: objc.SEL, _: NSRect) callconv(.c) void {
     }
     const ink = objc.color(if (r.hover) "selectedMenuItemTextColor" else "labelColor");
     if (r.checked) {
-        if (objc.symbolImage("checkmark", ink)) |img| msg(void, img, "drawInRect:", .{NSRect{ .x = 12, .y = (bounds.h - 11) / 2, .w = 11, .h = 11 }});
+        if (objc.symbolImage(objc.nsString("checkmark"), ink)) |img| msg(void, img, "drawInRect:", .{NSRect{ .x = 12, .y = (bounds.h - 11) / 2, .w = 11, .h = 11 }});
     }
-    const text = objc.nsString(&r.label);
+    const text = r.label;
     const attrs = textAttrs(ink);
     const th = msg(objc.NSSize, text, "sizeWithAttributes:", .{attrs}).height;
     const room = bounds.w - 30 - 8 - trailing(r.removable);
@@ -132,7 +128,7 @@ fn xDrawRect(self: id, _: objc.SEL, _: NSRect) callconv(.c) void {
     const ink = objc.color("selectedMenuItemTextColor");
     msg(void, objc.withAlpha(ink, if (r.x_hover) 0.42 else 0.22), "setFill", .{});
     msg(void, msg(id, objc.class("NSBezierPath"), "bezierPathWithOvalInRect:", .{bounds}), "fill", .{});
-    if (objc.symbolImage("xmark", ink)) |img| msg(void, img, "drawInRect:", .{NSRect{ .x = 4.5, .y = 4.5, .w = 7, .h = 7 }});
+    if (objc.symbolImage(objc.nsString("xmark"), ink)) |img| msg(void, img, "drawInRect:", .{NSRect{ .x = 4.5, .y = 4.5, .w = 7, .h = 7 }});
 }
 
 fn showX(r: *State) void {
@@ -223,10 +219,9 @@ pub fn create(app_target: id, top_menu: id, row: Row, w: f64) id {
     if (row_n == rows.len) return null;
     const r = &rows[row_n];
     row_n += 1;
-    r.* = .{ .port = row.port, .checked = row.checked, .removable = row.removable };
-    const n = @min(row.label.len, r.label.len);
-    @memcpy(r.label[0..n], row.label[0..n]);
-    r.label[n] = 0;
+    var label = r.label;
+    _ = objc.keepText(&label, row.label);
+    r.* = .{ .port = row.port, .label = label, .checked = row.checked, .removable = row.removable };
     r.view = msg(id, msg(id, row_class, "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = w, .h = height }});
     trackingArea(r.view);
     r.x = msg(id, msg(id, x_class, "alloc", .{}), "initWithFrame:", .{NSRect{ .x = w - 12 - x_size, .y = (height - x_size) / 2, .w = x_size, .h = x_size }});
