@@ -250,6 +250,8 @@ const State = struct {
 pub const Stats = struct {
     dispatches: u64 = 0,
     barriers: u64 = 0,
+    /// Dispatches encoded a second time by the double switch (`kernelDoubled`), not counted in `dispatches`.
+    doubled: u64 = 0,
     /// Time the inference thread spent waiting for the GPU, and committing passes.
     wait_ns: u64 = 0,
     commit_ns: u64 = 0,
@@ -1305,12 +1307,41 @@ fn beforeDispatch() void {
 pub fn dispatch(p: metal.Pass, grid: metal.Size, group: metal.Size) void {
     beforeDispatch();
     p.dispatch(grid, group);
+    if (kernelDoubled()) {
+        p.barrier();
+        p.dispatch(grid, group);
+    }
 }
 
 /// `dispatch` with `grid` in threadgroups.
 pub fn dispatchGroups(p: metal.Pass, grid: metal.Size, group: metal.Size) void {
     beforeDispatch();
     p.dispatchGroups(grid, group);
+    if (kernelDoubled()) {
+        p.barrier();
+        p.dispatchGroups(grid, group);
+    }
+}
+
+/// Tests set this; otherwise `SUSHI_ENGINE_KERNEL_DOUBLE` decides, read once.
+pub var kernel_double_hook: ?[]const u8 = null;
+var double_env: ?[]const u8 = null;
+var double_read = false;
+
+/// Whether the dispatch just encoded runs again behind a barrier: its pipeline name holds the switch's text. A
+/// forward then pays that kernel twice, so the forward meter's difference is what the kernel costs inside the forward,
+/// overlap and all. Its outputs are written twice from the same inputs; a kernel that reads what it writes is off.
+fn kernelDoubled() bool {
+    if (!double_read) {
+        double_read = true;
+        if (std.c.getenv("SUSHI_ENGINE_KERNEL_DOUBLE")) |v| if (v[0] != 0) {
+            double_env = std.mem.span(v);
+        };
+    }
+    const sub = kernel_double_hook orelse double_env orelse return false;
+    if (std.mem.indexOf(u8, pipelineName(metal.bound_pipeline), sub) == null) return false;
+    state.?.stats.doubled += 1;
+    return true;
 }
 
 /// Pipelines made since the process began, the time they took, and those made after `sealed`: a model sets it once

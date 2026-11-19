@@ -4618,6 +4618,22 @@ test "the kernel profile leaves values as they were" {
     try t_std.expectEqualSlices(u8, &plain, &profiled);
 }
 
+test "the double switch runs the kernels it names twice and leaves values as they were" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const plain = try addMatmulSum();
+    core.kernel_double_hook = "gemv";
+    defer core.kernel_double_hook = null;
+    const before = core.stats();
+    const doubled = try addMatmulSum();
+    const after = core.stats();
+    try t_std.expectEqual(@as(u64, 3), after.dispatches - before.dispatches);
+    try t_std.expectEqual(@as(u64, 1), after.doubled - before.doubled);
+    try t_std.expectEqualSlices(u8, &plain, &doubled);
+}
+
 test "with the kernel profile off, the profile is empty and the three ops share one command buffer" {
     try mlx.requireGpu();
     const was = enabled;

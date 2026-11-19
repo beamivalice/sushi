@@ -712,6 +712,10 @@ rebuilds one.
   joined by ` + `). The `[engine-prof] <name>: <n> dispatches, <ms> ms total, <us> us each` lines (debug; the top 40
   by total GPU time and one remainder line) follow `[engine] since load:` and the decode meter's `[fwd-ubench] engine:`
   line, the latter per forward. The forward runs slower under it; read the table's shares, not the forward's wall time.
+- **`SUSHI_ENGINE_KERNEL_DOUBLE=<text>` prices a kernel inside the forward**: every dispatch whose pipeline name holds
+  the text runs a second time behind a barrier (`stats.doubled` counts them), so the decode meter's difference against a
+  load without it is what that kernel costs where it runs, overlap and all, at the forward's own clock. The profile above
+  times kernels alone at a clock its waits lower. A kernel that reads what it writes is not doubled meaningfully.
 - **Dispatches a forward, one row at 4096 keys, M5 Max, STQ 1.75bpw** (`SUSHI_DECODE_FWD_UBENCH` S=1 and S=3,
   `SUSHI_ENGINE_KERNEL_PROF=1`, `--ssd-budget-gb 108`, 100 forwards, one load each): 1140 on 97995014, 1043 with three glue ops folded into the kernel before them
   (slots of the picks in the router's launch, the window row's ring write in `dsv41_rope_kv_ring`, the index picks' mask in the

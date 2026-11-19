@@ -462,6 +462,33 @@ head's rows per query head: a threadgroup holding 2, 4 or 8 heads, each row read
 67.4 and 221.6 us against 31.5 at 512 picks over 4k (`dsv41.attn_decode`, 15 rounds, quiet; 64 picks 24.2 against 27.1
 at two heads).
 
+**Where a one-row forward goes, kernel by kernel, inside the forward** (`SUSHI_ENGINE_KERNEL_DOUBLE` per kernel family,
+decode meter 100 forwards at 4096 keys, `aaff302f` plus the switch, one load each, GPU lock; base 14.84 / 14.80 ms at
+the first and last load; us a layer = the doubled forward's extra ms / 40, each including one barrier):
+
+| family | us a layer | kernels |
+|---|---:|---|
+| routed experts | 108.5 | pair 63.9, down 32.0, reduce-expand 6.5, mid 3.2, prep 2.9 |
+| trunk linears | 104.8 | `wo_b` reading `wo_a`'s partials 33.7, `wq_b` 26.4, `wo_a` 21.4, `wq_a`+`wkv` 12.4, finishes 10.9 |
+| attention | 32.1 | split 19.1, rope + ring 5.7, merge 4.2, picks unpack 3.1 |
+| hyper-connections, router | 33.2 | two stages 16.0, route + split 9.1, gate 8.1 |
+
+The routed pair and down are the ALU-bound trellis decode; the trunk linears sit 1.2 to 1.6x their streaming floor
+(`shared.exl3_trunk_rows` floor arm: `wo_b` 21.3, `wq_b` 21.7, `wo_a` 17.7 us). No family past those two holds a
+large share alone.
+
+**Ruled out here, the same session:**
+- The router gate with 4-wide loads and its width a template constant, bit-identical (a standalone Metal probe: 7.8
+  against 10.0 us a call over 40 cold banks): the decode meter, arms A B A B one load each, read 14.907 / 14.873 ms
+  before and 14.903 / 14.857 after at one row, inside noise.
+- The decoded trunk path for DeepSeek prefill (`trunk_gemm.innerDense`): `sushi-ubench run shared.exl3_trunk_prefill
+  --rungs k=4 --rungs rows=2048` (`aaff302f`, 5 rounds) runs the sorted GEMM at 80 to 88 TFLOP/s on the large shapes
+  (`attn_q` 1529 us, decoded 1548, dense bf16 ceiling 1272): the decode pass buys nothing on this GPU.
+- The prefill attention's matrix-unit arm reading each simdgroup's key channels direct into its fragments, without
+  the 16 KB tile (bit-identical to the staged arm): `dsv41.picks_span` packed_nax 2.1 / 1.9 ms at span 256 and 1.1 /
+  1.2 at span 128, against 1.64 / 1.26 and 0.70 / 0.72 staged (`7424e2c0`). The scattered reads cost more than the
+  occupancy the tile gave back.
+
 ## DeepSeek-V4.1 STQ on an M1 Max 32 GB: Sushi Cooler against MLX (2026-11-15)
 
 The first run on a GPU without matrix units. M1 Max (`applegpu_g13s`, 32 GPU cores) 32 GB, macOS 26.5.2, STQ 1.75bpw on
