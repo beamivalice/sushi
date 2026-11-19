@@ -3173,6 +3173,20 @@ pub const Engine = struct {
             }
         }
         layer.saved = try saved.toOwnedSlice(self.allocator);
+        const freed = self.dropPool(layer, gl);
+        layer.borrowed = true;
+        layer.lent = freed;
+        // Released first, so the workspace comes out of the pool it replaces; without one the layer takes its pool back.
+        self.ensureUnion() catch |e| {
+            self.restoreLayer(li) catch |re| log.err("[expert-stream] layer {d} stays released with no union workspace: {s}\n", .{ li, @errorName(re) });
+            return e;
+        };
+        self.publishBorrowable();
+        return freed;
+    }
+
+    /// Drops a layer's bank, caches, slabs and resident map once no reader holds them; returns the bytes MLX gave back.
+    fn dropPool(self: *Engine, layer: *LayerState, gl: *GroupedLayer) u64 {
         const meta = gl.cache_ragged.meta;
         var freed: u64 = if (meta.ctx != null) mlx.mlx_array_size(meta) * mlx.mlx_array_itemsize(meta) else 0;
         gl.cache_ragged.deinit();
@@ -3188,11 +3202,6 @@ pub const Engine = struct {
         layer.slabs = &.{};
         if (layer.resident_map.ctx != null) _ = mlx.mlx_array_free(layer.resident_map);
         layer.resident_map = .{ .ctx = null };
-        layer.borrowed = true;
-        layer.lent = freed;
-        // Released first, so the workspace comes out of the pool it replaces.
-        try self.ensureUnion();
-        self.publishBorrowable();
         return freed;
     }
 
@@ -3200,26 +3209,33 @@ pub const Engine = struct {
         return if (self.layers[li].borrowed) self.layers[li].lent else 0;
     }
 
-    /// Gives a released layer its pool back and reads into it the experts it held when released.
+    /// Gives a released layer its pool back and reads into it the experts it held when released. A restore that fails
+    /// leaves the layer released, as it was.
     pub fn restoreLayer(self: *Engine, li: u16) !void {
         self.prefetchWait(li);
         const layer = &self.layers[li];
         const gl = layer.grouped orelse return error.ExpertLayerNotGrouped;
         if (!layer.borrowed) return;
         try self.rebuildPool(layer, gl);
+        errdefer {
+            self.drainPendingReaders();
+            _ = mlx.mlx_synchronize(self.s);
+            _ = self.dropPool(layer, gl);
+        }
+        // The refill reads into the pool, which only a layer that is not released has.
         layer.borrowed = false;
-        self.publishBorrowable();
-        const saved = layer.saved;
-        layer.saved = &.{};
-        defer self.allocator.free(saved);
-        if (saved.len != 0) {
+        errdefer layer.borrowed = true;
+        if (layer.saved.len != 0) {
             const stats = layer.stats;
             defer layer.stats = stats;
-            var prepared = try self.prepareHost(li, saved);
+            var prepared = try self.prepareHost(li, layer.saved);
             prepared.deinit();
         }
+        if (self.plan.resident) try self.buildResidentMap(li);
+        self.allocator.free(layer.saved);
+        layer.saved = &.{};
+        self.publishBorrowable();
         if (!self.plan.resident) return;
-        try self.buildResidentMap(li);
         for (self.layers) |*other| if (other.borrowed) return;
         self.drainPendingReaders();
         _ = mlx.mlx_synchronize(self.s);

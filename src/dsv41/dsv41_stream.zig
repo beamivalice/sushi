@@ -2575,6 +2575,138 @@ test "dsv41 resident: a budget that holds every expert reads them all at load, m
     }
 }
 
+/// A resident pair, streamed and resident, of the tiny STQ pack, the resident one releasable from its CED split.
+const ResidentPair = struct {
+    streamed: StqServed,
+    resident: StqServed,
+
+    fn init(self: *ResidentPair, dir: []const u8, s: mlx.mlx_stream) !void {
+        try self.streamed.init(dir, .bfloat16, true, false, 3, s);
+        errdefer self.streamed.deinit();
+        try self.resident.initBytes(dir, .bfloat16, true, false, 1 << 40, s);
+        self.resident.engine.borrow_from = @intCast(self.resident.m.ced_split.?);
+    }
+    fn deinit(self: *ResidentPair) void {
+        self.resident.deinit();
+        self.streamed.deinit();
+    }
+    fn last(self: *ResidentPair) u16 {
+        return @intCast(self.resident.m.cfg.layers - 1);
+    }
+};
+
+/// Arms checked call `k`, runs `op` on `engine`'s last layer, disarms and drops what the fault left latched. The
+/// result is the error `op` returned, null when it completed; the fault must have fired.
+fn faulted(engine: *stream.Engine, k: u64, comptime op: fn (*stream.Engine, u16) anyerror!void) !?anyerror {
+    mlx.fault.arm(k);
+    const r = op(engine, @intCast(engine.layers.len - 1));
+    mlx.fault.disarm();
+    var msg: [300]u8 = undefined;
+    _ = mlx.takeError(&msg);
+    try testing.expect(mlx.fault.didFire());
+    r catch |e| return @as(?anyerror, e);
+    return null;
+}
+
+const LayerOps = struct {
+    fn borrow(e: *stream.Engine, li: u16) anyerror!void {
+        _ = try e.borrowLayer(li);
+    }
+    fn borrowLast(e: *stream.Engine) anyerror!void {
+        try borrow(e, @intCast(e.layers.len - 1));
+    }
+};
+
+test "dsv41 borrow: a release that fails at any checked call leaves the layer holding its pool and map, never released with no union workspace, and the next prefill serves (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.plain(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var pair: ResidentPair = undefined;
+    try pair.init(dir, s);
+    defer pair.deinit();
+    const engine = &pair.resident.engine;
+    const last = pair.last();
+    const pool = engine.poolBytes(last);
+
+    mlx.fault.sites = .{ .lasts = false };
+    defer mlx.fault.sites = .{};
+    const points = try mlx.sweepPoints(testing.allocator, &mlx.fault.sites, engine, LayerOps.borrowLast);
+    defer testing.allocator.free(points);
+    try engine.restoreLayer(last);
+    var first_failure: ?u64 = null;
+    for (points) |k| {
+        if (try faulted(engine, k, LayerOps.borrow)) |_| {
+            if (first_failure == null) first_failure = k;
+            try testing.expect(!engine.isBorrowed(last));
+            try testing.expectEqual(@as(usize, 0), engine.grouped_union.len);
+            try testing.expectEqual(pool, engine.poolBytes(last));
+            try testing.expect(engine.residentRoute(last) != null);
+        } else {
+            try testing.expect(engine.isBorrowed(last));
+            try testing.expectEqual(@as(usize, stream.quant.component_count), engine.grouped_union.len);
+        }
+        try engine.restoreLayer(last);
+    }
+
+    // A failed release is the last thing a request did; the next one's prefill finds room and borrows nothing.
+    try testing.expect(try faulted(engine, first_failure.?, LayerOps.borrow) != null);
+    try expectSameStep(&sc, pair.streamed.m, pair.resident.m, ids[0..25]);
+}
+
+test "dsv41 borrow: a restore whose allocation fails at any point leaves the layer released with its union workspace and its experts remembered, and the next restore completes (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.plain(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var pair: ResidentPair = undefined;
+    try pair.init(dir, s);
+    defer pair.deinit();
+    const engine = &pair.resident.engine;
+    const last = pair.last();
+    const pool = engine.poolBytes(last);
+    const gpa = engine.allocator;
+    defer engine.allocator = gpa;
+
+    // The restore's allocations fail one at a time, the pool's, the refill's and the resident map's, until none does.
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        _ = try engine.borrowLayer(last);
+        const saved = engine.layers[last].saved.len;
+        var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        engine.allocator = failing.allocator();
+        const r = engine.restoreLayer(last);
+        engine.allocator = gpa;
+        if (r) |_| {
+            try testing.expect(!failing.has_induced_failure);
+            break;
+        } else |_| {
+            try testing.expect(engine.isBorrowed(last));
+            try testing.expectEqual(@as(usize, stream.quant.component_count), engine.grouped_union.len);
+            try testing.expectEqual(saved, engine.layers[last].saved.len);
+            try testing.expectEqual(@as(u64, 0), engine.poolBytes(last));
+            try engine.restoreLayer(last);
+        }
+        try testing.expect(!engine.isBorrowed(last));
+        try testing.expectEqual(@as(usize, 0), engine.grouped_union.len);
+        try testing.expectEqual(pool, engine.poolBytes(last));
+        try testing.expect(engine.residentRoute(last) != null);
+    }
+    try testing.expect(fail_index > 0);
+    try testing.expect(!engine.isBorrowed(last) and engine.residentRoute(last) != null);
+    try expectSameStep(&sc, pair.streamed.m, pair.resident.m, ids[0..25]);
+}
+
 test "dsv41 drop: a budget that holds the kept experts alone serves them resident, and a dropped id is in no pool and no map (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = try stqDir();

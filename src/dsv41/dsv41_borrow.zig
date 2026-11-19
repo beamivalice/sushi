@@ -352,13 +352,15 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
         return error.PrefillDoesNotFit;
     };
     var m: LiveBorrow = .{ .engine = engine, .order = order[0..n], .config = config, .read = headroom, .wired = status.getWiredMemBytes() };
-    const r = releaseUntil(&m, n, count, need);
+    const r = releaseUntil(&m, n, count, need) catch |e| {
+        log.warn("[dsv41-borrow] a release for a {d}-row forward at {d} failed after {d:.2} GB: {s}\n", .{ rows, seq, gb(m.released), @errorName(e) });
+        return e;
+    };
     if (m.released > 0) {
         log.info("[dsv41-borrow] released layers {d}..{d} ({d:.2} GB) for a {d}-row forward at {d}: need {d:.2} GB, headroom {d:.2} -> {d:.2} GB, unwired in {d} ms\n", .{
             order[r.layers - 1], order[0], gb(m.released), rows, seq, gb(need), gb(before), gb(r.have), m.waited,
         });
     }
-    if (m.err) |e| return e;
     if (r.have < need) return error.PrefillDoesNotFit;
 }
 
@@ -372,13 +374,9 @@ const LiveBorrow = struct {
     wired: u64,
     released: u64 = 0,
     waited: u64 = 0,
-    err: ?anyerror = null,
 
-    fn release(self: *LiveBorrow, i: usize) u64 {
-        const bytes = self.engine.borrowLayer(self.order[i]) catch |e| {
-            self.err = e;
-            return 0;
-        };
+    fn release(self: *LiveBorrow, i: usize) !u64 {
+        const bytes = try self.engine.borrowLayer(self.order[i]);
         self.released += bytes;
         return bytes;
     }
@@ -392,15 +390,15 @@ const LiveBorrow = struct {
 
 /// Releases the first `count` of `n` pools (the plan, counted from their bytes), waits for the kernel to unwire them,
 /// then reads the headroom: freed pages count in it only once unwired. Still short, it releases one more and waits
-/// again. `m` gives `release(i)`, `wait()` and `headroom()`.
-fn releaseUntil(m: anytype, n: usize, count: usize, need: u64) struct { layers: usize, have: u64 } {
+/// again. A release that fails ends the borrow. `m` gives `release(i)`, `wait()` and `headroom()`.
+fn releaseUntil(m: anytype, n: usize, count: usize, need: u64) !struct { layers: usize, have: u64 } {
     var i: usize = 0;
-    while (i < @min(count, n)) : (i += 1) _ = m.release(i);
+    while (i < @min(count, n)) : (i += 1) _ = try m.release(i);
     if (i > 0) m.wait();
     var have = m.headroom();
     // The plan counts what the pools hold; the headroom read after the unwire decides, so a short one takes the next.
     while (i < n and have < need) : (i += 1) {
-        _ = m.release(i);
+        _ = try m.release(i);
         m.wait();
         have = m.headroom();
     }
@@ -463,7 +461,7 @@ const LateUnwire = struct {
     unwired: u64 = 0,
     count: usize = 0,
 
-    fn release(self: *LateUnwire, i: usize) u64 {
+    fn release(self: *LateUnwire, i: usize) !u64 {
         self.count += 1;
         self.released += self.pools[i];
         return self.pools[i];
@@ -483,7 +481,7 @@ test "issue 105: a borrow whose freed pools unwire late releases only the pools 
     const need: u64 = 4_350_000_000;
     const count = releaseCount(&pools, need, m.headroom()).?;
     try testing.expectEqual(@as(usize, 1), count);
-    const r = releaseUntil(&m, pools.len, count, need);
+    const r = try releaseUntil(&m, pools.len, count, need);
     try testing.expectEqual(@as(usize, 1), m.count);
     try testing.expectEqual(@as(usize, 1), r.layers);
     try testing.expect(r.have >= need);
@@ -493,13 +491,42 @@ test "issue 105: a borrow still short after its planned pools have unwired relea
     const pools = [_]u64{ 2, 2, 2 };
     var m: LateUnwire = .{ .pools = &pools, .free = 1 };
     // The plan counted 1 pool, but the machine gives back half of what each frees: the next pools go one by one.
-    const r = releaseUntil(&m, pools.len, 1, 4);
+    const r = try releaseUntil(&m, pools.len, 1, 4);
     try testing.expectEqual(@as(usize, 2), r.layers);
     try testing.expect(r.have >= 4);
     var short: LateUnwire = .{ .pools = &pools, .free = 0 };
-    const all = releaseUntil(&short, pools.len, 3, 7);
+    const all = try releaseUntil(&short, pools.len, 3, 7);
     try testing.expectEqual(@as(usize, 3), all.layers);
     try testing.expect(all.have < 7);
+}
+
+/// A machine whose release of pool `fail_at` fails.
+const FailingRelease = struct {
+    pools: []const u64,
+    fail_at: usize,
+    released: u64 = 0,
+    count: usize = 0,
+
+    fn release(self: *FailingRelease, i: usize) !u64 {
+        self.count += 1;
+        if (i == self.fail_at) return error.ImportFailed;
+        self.released += self.pools[i];
+        return self.pools[i];
+    }
+    fn wait(_: *FailingRelease) void {}
+    fn headroom(self: *FailingRelease) u64 {
+        return self.released;
+    }
+};
+
+test "dsv41 borrow: a release that fails stops the borrow, planned or one at a time: no pool after it is released" {
+    const pools = [_]u64{ 2, 2, 2 };
+    var planned: FailingRelease = .{ .pools = &pools, .fail_at = 0 };
+    try testing.expectError(error.ImportFailed, releaseUntil(&planned, pools.len, 2, 4));
+    try testing.expectEqual(@as(usize, 1), planned.count);
+    var late: FailingRelease = .{ .pools = &pools, .fail_at = 1 };
+    try testing.expectError(error.ImportFailed, releaseUntil(&late, pools.len, 1, 6));
+    try testing.expectEqual(@as(usize, 2), late.count);
 }
 
 test "dsv41 borrow: a forward releases pools in order until the headroom covers its need, and no more" {

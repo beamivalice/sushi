@@ -359,6 +359,9 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   either way) but as one ~9 GB/s read before the first decode step (~0.3 s a layer) instead of per-token stalls,
   which would also feed DSpark's measured round cost (a cold cache once drove it off wide verifies). Against a 2k-20k
   token decode at ~65 ms a token that is 0.02-0.2% a layer.
+- A release or a restore that fails leaves the layer as it was, and the borrow stops at the first failure: a released
+  layer always has the union workspace, so a release that cannot make it takes its pool back (an error line names a
+  layer whose take-back failed too).
 - Log lines: `[dsv41-borrow] released layers a..39 (X GB) for a N-row forward at P: need, headroom before -> after,
   unwired in T ms` and `[dsv41-borrow] restored n layers (X GB) in T ms before decode`.
 

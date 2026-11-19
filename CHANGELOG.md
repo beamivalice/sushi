@@ -13,6 +13,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **DeepSeek no longer releases every decoder layer to fit one prefill chunk**: it read the free memory before macOS had
   given back what it released, so it kept releasing, failed the request (`PrefillDoesNotFit`) and spent seconds
   reloading the layers. It now waits for each release to land before deciding it needs more (#105).
+- **A failed memory borrow no longer breaks every later long prompt on DeepSeek until a reload**: a decoder layer whose
+  release or read-back failed was left without the memory its prompts read through, so every later prompt past 17
+  tokens failed (`MissingExpertSlab`); a failed release or read-back now leaves the layer as it was.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many
