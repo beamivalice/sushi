@@ -276,6 +276,8 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   prompt's bill (MiMo refuses rather than evicts); else that room, at most half the bill, so an outgrown session's
   trim copy fits beside it. A flag stands, `2GB` too; context sizing and the chunk pin still read the raw ask.
 - A replacement over the budget sheds ring checkpoints (thinned as above) before the entry goes (`shedRingCheckpoints`).
+- **A cut of an entry's checkpoints bills what they hold after it, on every arm** (`rebillCheckpoints`): a shed or a
+  trim moves the QSA bank onto a kept checkpoint, and a failed cut (`truncateCheckpoints`) may have moved it already.
 - Measured (b9dbbf53 plus this change, Sushi-3bpw, auto context 1M, kv8, MTP on; a ~200k-token three-turn session; `taskpolicy -a`,
   fans max, GPU lock per boot; 2026-09-27): unset, the budget is 11516 MB and turns 2-3 prefill in 0.35 s (199.7k
   reused); `--prefix-cache-mem 2GB` keeps a 139k-147k prefix and prefills in 36.0 / 31.3 s (turn 1: 114-115 s cold). The

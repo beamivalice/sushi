@@ -1064,12 +1064,22 @@ test "HotPrefixCache: shed rescues an interior QSA bank" {
     _ = try hc.commitWithState(&probe, &toks, false, 0, cps, null, null);
     const before = hc.current_kv_bytes;
     const listed = hc.entries.items[0].ssm_checkpoints.?;
-    hc.max_kv_bytes = before - ssmCheckpointBytes(&listed[1]) + 1;
+    // One checkpoint over, less the bank a shed of the interior one moves onto the one below (at most all of it).
+    var bank: u64 = 0;
+    for (listed[1].layers) |l| {
+        if (l.qsa_pooled.ctx != null) bank += @as(u64, mlx.mlx_array_size(l.qsa_pooled)) * mlx.mlx_array_itemsize(l.qsa_pooled);
+    }
+    hc.max_kv_bytes = before - ssmCheckpointBytes(&listed[1]) + bank + 1;
     hc.shedCheckpointsToFit();
     try testing.expect(hc.entryCount() == 1);
     const kept = hc.entries.items[0].ssm_checkpoints.?;
     try testing.expect(kept.len >= 1);
     try testing.expect(qwen4_qsa_state.checkpointListHasQsaPooled(kept));
+    // The bank the shed moved onto the checkpoint below is billed.
+    var held: u64 = 0;
+    for (kept) |*cp| held += ssmCheckpointBytes(cp);
+    try testing.expectEqual(held, hc.entries.items[0].ssm_bytes);
+    try testing.expectEqual(hc.entries.items[0].kv_bytes, hc.current_kv_bytes);
 }
 
 test "HotPrefixCache: dropLastRestored removes the restored entry so the next lookup is cold" {
@@ -1590,6 +1600,84 @@ test "HotPrefixCache: a hybrid full-prefix extend checks out under SSD-first" {
     try testing.expect(r.matched > 0);
     try testing.expect(r.checked_out);
     try testing.expectEqual(@as(usize, 0xA11CE), hc.entries.items[0].checkout.?.slot);
+}
+
+test "HotPrefixCache: a partial takeover whose QSA slice fails, at any of its calls or at the kept list's copy, bills what its checkpoints hold" {
+    try mlx.requireGpu();
+    const Take = struct {
+        /// Fail the kept list's copy, `truncateCheckpoints`' allocation after the keep's tokens.
+        fail_copy: bool = false,
+
+        fn go(self: @This()) anyerror!void {
+            try self.donate(null);
+        }
+
+        /// A 1024-token hybrid entry with four checkpoints, the QSA bank on the newest, restored by a slot at 512 of a
+        /// prompt that shares 600 and taken over: its donation keeps the two checkpoints below the share and slices
+        /// the bank onto the second, refused at the `at`-th checked call. A sweep records the donation's calls alone.
+        fn donate(self: @This(), at: ?u64) !void {
+            const s = mlx.gpuStream();
+            const rec = &mlx.fault.sites;
+            const recording = rec.list != null;
+            if (recording) rec.paused = true;
+            pc.restore_move_override = true;
+            defer pc.restore_move_override = null;
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+            const a = failing.allocator();
+            var toks: [1024]u32 = undefined;
+            for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+            var prompt = toks;
+            prompt[600] = 999_999;
+            var live = pcBuildQsaHybrid(s, 1024, 100.0);
+            defer pcFreeQsaHybrid(&live);
+            var cache = try KVCache.init(testing.allocator, 3);
+            defer cache.deinit();
+            try testFillCache(&cache, s, 3, toks.len);
+            const cps = try a.alloc(SSMCheckpoint, 4);
+            for (cps, 0..) |*cp, i| cp.* = try trunk_mod.captureSsmCheckpoint(a, &live, (i + 1) * 256, s);
+            try qwen4_qsa_state.attachQsaHistoryToLatest(cps, &live, s);
+            var hc = HotPrefixCache.initWithMem(a, 4, 0);
+            defer hc.deinit();
+            hc.qsa_history_required = true;
+            _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
+            var slot = try KVCache.init(testing.allocator, 3);
+            defer slot.deinit();
+            var target = pcEmptySsm();
+            defer pcFreeQsaHybrid(&target);
+            var moe_off: usize = 0;
+            const r = try hc.lookupAndRestoreForSlot(&slot, &moe_off, &target, s, &prompt, false, 0, null, null, null, 7);
+            try testing.expectEqual(@as(usize, 512), r.matched);
+            try testing.expect(hc.checkoutRestored(7, prompt.len, true));
+            const e = &hc.entries.items[0];
+            const rest = e.kv_bytes - e.ssm_bytes;
+            if (self.fail_copy) failing.fail_index = failing.alloc_index + 1;
+            if (recording) rec.paused = false;
+            if (at) |k| mlx.fault.arm(k);
+            hc.donateCheckout(7);
+            if (recording) rec.paused = true;
+            if (at != null) {
+                try testing.expect(mlx.fault.didFire());
+                mlx.fault.disarm();
+            }
+            try testing.expectEqual(self.fail_copy, failing.has_induced_failure);
+            var held: u64 = 0;
+            for (e.ssm_checkpoints.?) |*cp| held += ssmCheckpointBytes(cp);
+            try testing.expectEqual(held, e.ssm_bytes);
+            try testing.expectEqual(rest + held, e.kv_bytes);
+            try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
+            hc.releaseCheckout(7, "finished");
+        }
+    };
+    try (Take{ .fail_copy = true }).donate(null);
+    mlx.fault.sites = .{ .lasts = false };
+    defer mlx.fault.sites = .{};
+    const points = try mlx.sweepPoints(testing.allocator, &mlx.fault.sites, Take{}, Take.go);
+    defer testing.allocator.free(points);
+    try testing.expect(points.len > 0);
+    for (points) |k| {
+        errdefer std.debug.print("the donation's slice refused at its checked call {d} of {d} sites\n", .{ k, points.len });
+        try (Take{}).donate(k);
+    }
 }
 
 test "HotPrefixCache: walk-down restores the higher covering checkpoint, not a lower one" {

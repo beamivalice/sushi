@@ -1906,15 +1906,12 @@ pub const HotPrefixCache = struct {
         if (e.ssm_checkpoints) |cps| {
             const kept = truncateCheckpoints(self.allocator, cps, keep, self.arraysStream()) catch {
                 self.allocator.free(tokens);
+                // The slice may already have moved the QSA bank onto a kept checkpoint.
+                self.rebillCheckpoints(e, checkpointListBytes(cps));
                 return;
             };
-            var bytes: u64 = 0;
-            for (kept) |*cp| bytes += ssmCheckpointBytes(cp);
-            const freed = e.ssm_bytes -| bytes;
             e.ssm_checkpoints = kept;
-            e.ssm_bytes = bytes;
-            e.kv_bytes -|= freed;
-            self.current_kv_bytes -|= freed;
+            self.rebillCheckpoints(e, checkpointListBytes(kept));
         }
         self.allocator.free(e.tokens);
         e.tokens = tokens;
@@ -2634,6 +2631,19 @@ pub const HotPrefixCache = struct {
         for (cps[kept..]) |*cp| cp.deinit(allocator);
         allocator.free(cps);
         return shrunk;
+    }
+
+    fn checkpointListBytes(cps: []const SSMCheckpoint) u64 {
+        var bytes: u64 = 0;
+        for (cps) |*cp| bytes += ssmCheckpointBytes(cp);
+        return bytes;
+    }
+
+    /// Bills `e`'s checkpoints at `bytes`, moving its bill and the cache's by the change.
+    fn rebillCheckpoints(self: *HotPrefixCache, e: *Entry, bytes: u64) void {
+        e.kv_bytes = e.kv_bytes - e.ssm_bytes + bytes;
+        self.current_kv_bytes = self.current_kv_bytes - e.ssm_bytes + bytes;
+        e.ssm_bytes = bytes;
     }
 
     fn retainNewEntry(self: *HotPrefixCache, entry: Entry) !bool {
@@ -3663,7 +3673,6 @@ pub const HotPrefixCache = struct {
         var shed: usize = 0;
         while (n > 1 and self.current_kv_bytes > self.max_kv_bytes) {
             const drop = trunk_mod.ssmCheckpointDropIndex(cps[0..n], self.cp_thin, null);
-            const freed = ssmCheckpointBytes(&cps[drop]);
             if (checkpointHasQsaPooled(&cps[drop])) {
                 if (drop > 0) {
                     sliceQsaHistoryOntoCheckpoint(&cps[drop - 1], &cps[drop], cps[drop - 1].pos, self.arraysStream()) catch |err| {
@@ -3676,9 +3685,8 @@ pub const HotPrefixCache = struct {
             while (k + 1 < n) : (k += 1) cps[k] = cps[k + 1];
             n -= 1;
             shed += 1;
-            newest.ssm_bytes -|= freed;
-            newest.kv_bytes -|= freed;
-            self.current_kv_bytes -|= freed;
+            // What the kept checkpoints hold, the bank a slice moved onto the one below included.
+            self.rebillCheckpoints(newest, checkpointListBytes(cps[0..n]));
         }
         if (shed == 0) return;
         // Shrink-in-place realloc cannot practically fail; if it somehow
@@ -3791,18 +3799,13 @@ pub const HotPrefixCache = struct {
             self.allocator.free(tokens);
             return "snapshot copy failed";
         };
-        const before_ssm = e.ssm_bytes;
         var new_cps: ?[]SSMCheckpoint = null;
         if (e.ssm_checkpoints) |cps| {
             new_cps = truncateCheckpoints(self.allocator, cps, tl, self.arraysStream()) catch |err| {
                 self.allocator.free(tokens);
                 snap.deinit();
-                // The slice may already have re-billed the kept checkpoint's bank.
-                var ssm: u64 = 0;
-                for (cps) |*cp| ssm += ssmCheckpointBytes(cp);
-                e.ssm_bytes = ssm;
-                e.kv_bytes = e.kv_bytes - before_ssm + ssm;
-                self.current_kv_bytes = self.current_kv_bytes - before_ssm + ssm;
+                // The slice may already have moved the QSA bank onto a kept checkpoint.
+                self.rebillCheckpoints(e, checkpointListBytes(cps));
                 return @errorName(err);
             };
         }
