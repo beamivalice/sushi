@@ -264,18 +264,20 @@ landing's subset, the full suite at a series' end, `tests/gate.sh` on the commit
 knowledge in the matching doc in the branch.
 
 **Bug hunt** ([process-bug-hunt](docs/process-bug-hunt.md)). New code is closed by a hunt before its phase is called done.
-- Three hunters, one surface each, each in its own worktree at the head, write and run scratch tests on the tiny
+- Hunters, one surface each, each in its own worktree at the head, write and run scratch tests on the tiny
   fixtures; they report, never fix, and name the bug class and its sibling sites for every finding.
 - The coordinator synthesizes: per component, refactor when the class repeats, has siblings or is made possible by
   the structure; a normal fix only for a one-off. The long-term codebase decides, not today's diff.
 - A finding closes by a fix with its regression test, or a test proving the contract: never by argument, never by
   moving it to a later phase. A class a rule can name becomes a lint rule.
+- One wave per agent: a hunter or fixer that finishes its round or its batch of findings retires, and a fresh agent
+  takes the next surface or batch (no queues carried across waves); the owner sets the team size.
 
 **Clean up.** Once a branch lands, remove its worktree and branch (local and remote). When a job ends, stop by PID every
 process it started (servers, watchers, `tail -F`, samplers) and delete what it made under `~/.sushi/runs/` and
 `~/.claude/jobs/`, keeping only the raw files a committed number cites; packs need the owner.
 
-**Growth policy (ENFORCED).** This file holds rules and links only and stays under 25 KB; every rule bullet is
+**Growth policy (ENFORCED).** This file holds rules and links only and stays under 30 KB; every rule bullet is
 ≤ 3 lines. Knowledge, measurements and war stories go to `docs/` (converter knowledge to `docs/private/`); commit
 messages carry the story of a change.
 
