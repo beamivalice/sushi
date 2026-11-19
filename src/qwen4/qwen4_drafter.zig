@@ -65,10 +65,11 @@ pub const Cache = struct {
     }
 
     /// The head's KV at the request's reserved rows, billed as `bills.mtpHeadKvBytesPerToken` per reserved token.
-    pub fn reserve(self: *const Cache, rows: usize, s: mlx.mlx_stream) !void {
+    pub fn reserve(self: *const Cache, hold: trunk_mod.Hold, s: mlx.mlx_stream) !void {
         self.activate();
         const kv_cache = &self.t.arch_state.qwen4.mtp.?.cache;
-        kv_cache.reserve(rows);
+        kv_cache.reserve(@intCast(hold.reserve));
+        kv_cache.bound(@intCast(hold.end));
         try kv_cache.growToReservation(s);
     }
 

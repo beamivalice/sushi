@@ -62,10 +62,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   ringed arch reserves always (`ModelConfig.reservesKvCapacity`). A shorter prompt of
   several chunks reserves its own length (`prefill_plan.reservedPrefillTokens`, as the bill floors it), so its prefill
   grows each layer's buffers once, not once a chunk.
-- On MLX a grown layer's capacity is on MLX's page grid (`KVCache.pagedCapacity`, `mlx_pages`): every buffer past a
+- On MLX a grown layer's capacity is on MLX's page grid (`KVCache.heldRows`, `mlx_pages`): every buffer past a
   16 KB page is whole pages, or MLX's pool can hand it a buffer it never donates and each append copies. At 2 heads of
   256, kv8, past 1,024 rows the cache steps by 1,024 (16 B scale rows); the bill pages the same (`cacheCapacityTokens`).
   A ring keeps its fixed rows; the engine of our own appends in place at any size.
+- **A grow never passes the request's last row** (`KVCache.bound`, `requestEnd`: prompt, clamped reply, speculative
+  rows): `heldRows` is the one capacity rule, and the bill prices it at that row, so a cache restored off the policy's
+  steps, or a prompt that does not fill the context, holds no more than its bill and than a prompt that fills it.
 - **A shared restore whose buffer is longer than the request reserves copies its rows into a request-sized buffer**
   on the first append (`KVCache.copiesSharedRestore`), because the admission bills the copy at the reservation: a 4k
   chat restored from an 80k entry held the 80k buffer (mlx-serve #492), and a donor that decoded past its own

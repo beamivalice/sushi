@@ -45,7 +45,7 @@ pub const Cache = struct {
     pub const rebuilt_from_tail = true;
 
     /// The heads' rows are window rings, billed whole (`mimo_mtp.State.billedBytes`): nothing grows with the request.
-    pub fn reserve(_: *const Cache, _: usize, _: mlx.mlx_stream) !void {}
+    pub fn reserve(_: *const Cache, _: trunk_mod.Hold, _: mlx.mlx_stream) !void {}
 
     pub fn truncate(self: *Cache, len: usize, s: mlx.mlx_stream) !void {
         try self.st.truncate(s, len);

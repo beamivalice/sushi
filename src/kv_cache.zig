@@ -291,6 +291,14 @@ pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) 
     return .{ .span = span, .kv_len = kv_len };
 }
 
+/// What a request asks of a cache buffer's growth (`KVCache.heldRows`).
+pub const Hold = struct {
+    /// Rows reserved up front (`KVCache.reservedTokens`, `prefill_plan.reservedPrefillTokens`); 0 = none.
+    reserve: u64 = 0,
+    /// The request's last row (`KVCache.requestEnd`); 0 = no request bounds the buffer.
+    end: u64 = 0,
+};
+
 pub const KVCache = struct {
     entries: []KVCacheEntry,
     step: usize, // absolute sequence position (not affected by sliding window trimming)
@@ -300,6 +308,8 @@ pub const KVCache = struct {
     /// `reservedCacheTokens`). A grow is not in place, so a long prefill's peak carried a
     /// second copy of ~6 GB of KV at 458k; reserving on the first grow removes the transient.
     reserve_tokens: usize = 0,
+    /// The request's last row (`requestEnd`): no grow passes it (`heldRows`). 0 = no request bounds this cache.
+    end_tokens: usize = 0,
     /// Window a sliding layer's storage rings at (`ModelConfig.sliding_window`);
     /// 0 = every layer stores the whole sequence. A layer rings only on a
     /// forward that hands `update` a non-zero `max_seq` — the one predicate
@@ -611,6 +621,40 @@ pub const KVCache = struct {
         return nextCapacityPolicy(current_cap, needed);
     }
 
+    /// PURE: the rows a growing cache buffer holds once it grows from `cur_cap` to take `needed`: the +25% policy,
+    /// raised to the reservation and capped at the request's end, on MLX's page grid for buffers of `parts` bytes a row
+    /// (none: any rows). The allocators grow to it and the bills price it at the request's end, so from any start,
+    /// restored or cold, a cache holds at most `heldRows(0, asked.end, asked, parts)`.
+    pub fn heldRows(cur_cap: u64, needed: u64, asked: Hold, parts: []const u64) u64 {
+        var rows: u64 = nextCapacityPolicy(@intCast(cur_cap), @intCast(needed));
+        if (asked.reserve > rows) rows = roundToStep(asked.reserve);
+        if (asked.end > 0) rows = @min(rows, roundToStep(@max(asked.end, asked.reserve)));
+        rows = @max(rows, roundToStep(needed));
+        return if (parts.len == 0) rows else mlx_pages.pagedRows(rows, parts);
+    }
+
+    fn roundToStep(rows: u64) u64 {
+        return (rows +| chunk_step - 1) / chunk_step * chunk_step;
+    }
+
+    /// The request's last row: its prompt, the reply the context leaves it (at least one token, as
+    /// `request_policy.clampMaxTokens` grants) and the rows a speculative round writes past it.
+    pub fn requestEnd(seq: u64, max_tokens: u64, ctx: u64, past_end: u64) u64 {
+        const reply = if (ctx > seq) @min(max_tokens, ctx - seq) else @min(max_tokens, 1);
+        return seq +| reply +| past_end;
+    }
+
+    /// What a request asks of a cache's growth: its reservation (`reservedTokens`) and its last row (`requestEnd`).
+    pub fn hold(self: *const KVCache) Hold {
+        return .{ .reserve = self.reserve_tokens, .end = self.end_tokens };
+    }
+
+    /// Bound every later grow at the request's last row. A cache outlives its request in the hot cache: a new
+    /// request sets its own.
+    pub fn bound(self: *KVCache, end: usize) void {
+        self.end_tokens = end;
+    }
+
     /// Tokens of capacity a request reserves: prompt + allowed generation + one chunk of slack.
     /// The one definition; `server.reservedCacheTokens` delegates here.
     pub fn reservedTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {
@@ -635,26 +679,17 @@ pub const KVCache = struct {
         if (tokens > self.reserve_tokens) self.reserve_tokens = tokens;
     }
 
-    /// The capacity a grow takes: the proportional policy, raised to the reservation when there is one.
-    fn nextCapacityReserved(self: *const KVCache, current_cap: usize, needed: usize) usize {
-        const policy = nextCapacity(current_cap, needed);
-        if (self.reserve_tokens <= policy) return policy;
-        // Round the reservation the same way the policy rounds.
-        const n_chunks = (self.reserve_tokens + chunk_step - 1) / chunk_step;
-        return n_chunks * chunk_step;
-    }
-
     /// Grow every restored non-ringed layer below the reservation to it, one layer per eval.
     /// Called before a warm prefill writes: left to the decode, the first step past the restored
     /// capacity grows every layer inside one forward, all the old buffers alive beside the new.
     pub fn growToReservation(self: *KVCache, s: mlx.mlx_stream) !void {
         if (self.reserve_tokens == 0) return;
-        const reserved = (self.reserve_tokens + chunk_step - 1) / chunk_step * chunk_step;
         const n: usize = if (self.config.scheme == .off) 2 else 6;
         for (self.entries) |*entry| {
             if (!entry.initialized or entry.ringed) continue;
-            if (bufferCapacity(entry.keys) >= self.reserve_tokens) continue;
-            const new_cap: c_int = @intCast(pagedCapacity(entry, reserved, &entryRowBytes(entry, n), s));
+            const cur_cap = bufferCapacity(entry.keys);
+            if (cur_cap >= self.reserve_tokens) continue;
+            const new_cap: c_int = @intCast(self.grownCapacity(entry, cur_cap, self.reserve_tokens, &entryRowBytes(entry, n), s));
             const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
             for (views) |view| {
                 _ = mlx.mlx_array_free(view.*);
@@ -686,7 +721,7 @@ pub const KVCache = struct {
             const cur_cap = bufferCapacity(entry.keys);
             const needed = entry.offset + rows;
             if (needed <= cur_cap) continue;
-            const new_cap: c_int = @intCast(pagedCapacity(entry, self.growCapacityFor(entry, cur_cap, needed), &entryRowBytes(entry, n), s));
+            const new_cap: c_int = @intCast(self.grownCapacity(entry, cur_cap, needed, &entryRowBytes(entry, n), s));
             const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
             for (views) |view| {
                 _ = mlx.mlx_array_free(view.*);
@@ -990,7 +1025,7 @@ pub const KVCache = struct {
                 rowBytes(B, heads, q_last, .uint32),   rowBytes(B, heads, vq_last, .uint32),
                 rowBytes(B, heads, sc_last, ksc_dt),   rowBytes(B, heads, vsc_last, vsc_dt),
             };
-            const new_cap: c_int = @intCast(pagedCapacity(entry, self.growCapacityFor(entry, cur_cap, needed), &parts, s));
+            const new_cap: c_int = @intCast(self.grownCapacity(entry, cur_cap, needed, &parts, s));
             kv_cap_buf_grows += 1;
             try growQuantBuf(s, &entry.keys, entry.initialized, entry.ringed, entry.offset, new_cap, B, heads, q_last, .uint32);
             try growQuantBuf(s, &entry.values, entry.initialized, entry.ringed, entry.offset, new_cap, B, heads, vq_last, .uint32);
@@ -1110,7 +1145,7 @@ pub const KVCache = struct {
             const needed = entry.offset + new_len;
             const cur_cap = if (entry.initialized and !shared) bufferCapacity(entry.keys) else 0;
             const parts = [_]u64{ rowBytes(B, heads, head_dim, dtype), rowBytes(B, heads, v_head_dim, dtype) };
-            const new_cap: c_int = @intCast(pagedCapacity(entry, self.growCapacityFor(entry, cur_cap, needed), &parts, s));
+            const new_cap: c_int = @intCast(self.grownCapacity(entry, cur_cap, needed, &parts, s));
             kv_cap_buf_grows += 1;
             const initialized = entry.initialized;
             try growQuantBuf(s, &entry.keys, initialized, entry.ringed, entry.offset, new_cap, B, heads, head_dim, dtype);
@@ -1332,19 +1367,12 @@ pub const KVCache = struct {
         return true;
     }
 
-    /// The capacity a grow takes for THIS entry. A ringed entry never takes the
-    /// session reservation (it holds a window, not a context) and floors at the
-    /// ring cap so a cold decode does not grow twice to reach it.
-    fn growCapacityFor(self: *const KVCache, entry: *const KVCacheEntry, cur_cap: usize, needed: usize) usize {
-        if (!entry.ringed) return self.nextCapacityReserved(cur_cap, needed);
-        return @max(nextCapacity(cur_cap, needed), ringCap(self.swa_ring_window));
-    }
-
-    /// A grown layer's capacity on MLX: on its page grid for buffers of `parts` bytes a row (`mlx_pages`), so every
-    /// write lands in place. A ring keeps its fixed rows; the engine of our own appends in place at any size.
-    fn pagedCapacity(entry: *const KVCacheEntry, cap: usize, parts: []const u64, s: mlx.mlx_stream) usize {
-        if (entry.ringed or mlx.engine.isStream(s)) return cap;
-        return @intCast(mlx_pages.pagedRows(cap, parts));
+    /// The capacity a grow takes for THIS entry (`heldRows`): on MLX on its page grid for buffers of `parts` bytes a
+    /// row, so every write lands in place; the engine of our own appends in place at any size. A ringed entry holds a
+    /// window, not a context: it keeps its fixed rows, floored at the ring cap so a cold decode does not grow twice.
+    fn grownCapacity(self: *const KVCache, entry: *const KVCacheEntry, cur_cap: usize, needed: usize, parts: []const u64, s: mlx.mlx_stream) usize {
+        if (entry.ringed) return @max(nextCapacity(cur_cap, needed), ringCap(self.swa_ring_window));
+        return @intCast(heldRows(cur_cap, needed, self.hold(), if (mlx.engine.isStream(s)) &.{} else parts));
     }
 
     /// One cache row's bytes in a `[B, heads, rows, last]` buffer of `dtype`.
@@ -2653,7 +2681,7 @@ test "KVCache: a shared restore's first append allocates what the request reserv
         defer _ = mlx.mlx_array_free(tail);
         var wv = try warm.update(0, tail, tail, s, 0);
         defer wv.deinit();
-        const want = warm.nextCapacityReserved(0, 1024 + 8);
+        const want = KVCache.heldRows(0, 1024 + 8, warm.hold(), &.{});
         try testing.expect(want < 16384);
         try testing.expectEqual(want, KVCache.bufferCapacity(warm.entries[0].keys));
         try testing.expectEqual(want, KVCache.bufferCapacity(warm.entries[0].values));
@@ -3378,7 +3406,7 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     while (rpos < seq) {
         const end = @min(rpos + chunk, seq);
         if (end > rcap) {
-            rcap = rcache.nextCapacityReserved(rcap, end);
+            rcap = KVCache.heldRows(rcap, end, rcache.hold(), &.{});
             rgrows += 1;
         }
         rpos = end;
@@ -3426,7 +3454,7 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     small.reserve(@intCast(KVCache.reservedTokens(4096, 2048, chunk, 0)));
     try t.expectEqual(
         KVCache.nextCapacityPolicy(1024, 2048),
-        small.nextCapacityReserved(1024, 2048),
+        KVCache.heldRows(1024, 2048, small.hold(), &.{}),
     );
 }
 
@@ -3542,4 +3570,66 @@ test "KVCache on MLX appends kv8 rows in place when MLX's pool holds buffers two
             if (step == 0) p.* = mlx.mlx_array_data_uint8(buf) else try testing.expectEqual(p.*, mlx.mlx_array_data_uint8(buf));
         }
     }
+}
+
+/// One Flash-Next KV layer (2 heads of 256, kv8) restored at exactly `restored` rows (as an SSD restore or a trimmed hot
+/// entry installs it; 0: cold), reserved and bounded as the engine runs the request (`reserveRequestCapacity`), then the
+/// prompt's tail and the reply appended a row at a time: the rows it holds at the end.
+fn requestHeldRows(cfg: *const @import("model.zig").ModelConfig, restored: c_int, seq: c_int, reply: c_int, chunk: u64) !usize {
+    const s = mlx.gpuStream();
+    var donor = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
+    defer donor.deinit();
+    var rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_ones(&rows, &[_]c_int{ 1, 2, if (restored > 0) restored else 1, 256 }, 4, .bfloat16, s));
+    var warm = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
+    defer warm.deinit();
+    if (restored > 0) {
+        var dv = try donor.update(0, rows, rows, s, 0);
+        dv.deinit();
+        var snap = try donor.snapshot();
+        defer snap.deinit();
+        var trimmed = try snap.trimmedCopy(@intCast(restored), null, s);
+        defer trimmed.deinit();
+        try warm.restore(&trimmed);
+        warm.adoptRestored();
+    }
+    _ = try @import("generate.zig").reserveRequestCapacity(&warm, cfg, @intCast(seq), @intCast(reply), chunk, 0, s);
+    var tail = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tail);
+    try mlx.check(mlx.mlx_ones(&tail, &[_]c_int{ 1, 2, seq - restored, 256 }, 4, .bfloat16, s));
+    var tv = try warm.update(0, tail, tail, s, 0);
+    tv.deinit();
+    var one = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(one);
+    try mlx.check(mlx.mlx_ones(&one, &[_]c_int{ 1, 2, 1, 256 }, 4, .bfloat16, s));
+    var i: c_int = 0;
+    while (i < reply) : (i += 1) {
+        try warm.growAhead(1, s);
+        var ov = try warm.update(0, one, one, s, 0);
+        ov.deinit();
+    }
+    return KVCache.bufferCapacity(warm.entries[0].keys);
+}
+
+test "a Flash-Next cache restored at its rows or cold holds no more rows than its request's bill, nor than a prompt filling its context" {
+    try mlx.requireGpu();
+    const bills = @import("bills.zig");
+    var cfg = @import("bills_fixtures_test.zig").qwen4ExpOomConfig();
+    // {context, restored, prompt, reply}: up to a chunk no reservation (`prefill_plan.reservedPrefillTokens`), so the
+    // cache grows by the policy from where the restore left it; the last three end at their context.
+    const cases = [_][4]c_int{
+        .{ 0, 0, 1950, 50 },    .{ 0, 1900, 1950, 50 },    .{ 0, 1600, 1700, 300 }, .{ 0, 1000, 1100, 900 },
+        .{ 4100, 0, 3000, 1100 }, .{ 4100, 0, 2000, 2100 }, .{ 4100, 1900, 1950, 2150 },
+    };
+    var over: usize = 0;
+    for (cases) |c| {
+        cfg.pinned_context = @intCast(c[0]);
+        const ctx = bills.getEffectiveContextLength(&cfg);
+        const chunk: u64 = 2048;
+        const held = try requestHeldRows(&cfg, c[1], c[2], c[3], chunk);
+        const billed = bills.cacheCapacityTokens(&cfg, @intCast(c[2]), @intCast(c[3]), chunk, ctx, 0, 8);
+        if (held > billed or billed > bills.cacheCapacityTokens(&cfg, ctx, 0, chunk, ctx, 0, 8)) over += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), over);
 }

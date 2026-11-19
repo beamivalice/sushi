@@ -2285,39 +2285,20 @@ pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
     return one + config.qsaScoreBankBytesPerToken();
 }
 
-/// Tokens of capacity a request's cache holds by its last row, as `KVCache` allocates them at its 256-row step: a long
-/// prompt's reservation (prompt, reply and a chunk); a shorter one of several chunks reserves its own length
-/// (`prefill_plan.reservedPrefillTokens`), else the prefill's chunks grow it; then each decode grow takes the +25%
-/// policy up to the prompt, its reply and the `past_end` rows a speculative round writes past the reply's last
-/// (`speculativeRowsPastEnd`). What the bill and the commit count.
+/// Tokens of capacity a request's cache holds by its last row (`KVCache.heldRows` at the request's end, the bound every
+/// grow lands under from any start, restored or cold): its reservation (a long prompt's prompt, reply and a chunk; a
+/// shorter one of several chunks its own length, `prefill_plan.reservedPrefillTokens`), else the prompt, its reply and
+/// the `past_end` rows a speculative round writes past the reply's last (`speculativeRowsPastEnd`). Null `paged_bits`:
+/// a buffer that grows on the policy alone (the QSA history). What the bill and the commit count.
 pub fn cacheCapacityTokens(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, chunk: u64, ctx: u64, past_end: u64, paged_bits: ?u64) u64 {
     const KV = trunk.KVCache;
-    const end = seq +| (if (ctx > seq) @min(max_tokens, ctx - seq) else 0) +| past_end;
+    const end = @max(KV.requestEnd(seq, max_tokens, ctx, past_end), seq);
     const reserves = config.reservesKvCapacity();
     const long = if (reserves) reservedCacheTokens(seq, max_tokens, chunk, ctx) else 0;
-    var cap: u64 = 0;
-    if (long > 0) {
-        cap = pagedCacheRows(config, roundToCacheStep(long), paged_bits);
-    } else if (reserves and seq > chunk) {
-        cap = pagedCacheRows(config, roundToCacheStep(seq), paged_bits);
-    } else {
-        var at: u64 = 0;
-        while (at < seq) {
-            at = @min(seq, at + @max(chunk, 1));
-            cap = pagedCacheRows(config, KV.nextCapacityPolicy(@intCast(cap), @intCast(at)), paged_bits);
-        }
-    }
-    while (cap < end) cap = pagedCacheRows(config, KV.nextCapacityPolicy(@intCast(cap), @intCast(cap + 1)), paged_bits);
-    return cap;
-}
-
-/// The rows a cache layer of `kv_bits` grown to `rows` holds (`KVCache.pagedCapacity`): on a load on MLX, its buffers on
-/// MLX's page grid, the most any full-context layer's geometry takes. Null: a buffer that grows on the policy alone (the
-/// QSA history).
-fn pagedCacheRows(config: *const model_mod.ModelConfig, rows: u64, paged_bits: ?u64) u64 {
-    const kv_bits = paged_bits orelse return rows;
-    if (cooler_side.onEngine(config)) return rows;
-    var most = rows;
+    const hold: trunk.Hold = .{ .reserve = if (long > 0) long else if (reserves and seq > chunk) seq else 0, .end = end };
+    const kv_bits = paged_bits orelse return KV.heldRows(0, end, hold, &.{});
+    if (cooler_side.onEngine(config)) return KV.heldRows(0, end, hold, &.{});
+    var most: u64 = KV.heldRows(0, end, hold, &.{});
     var li: u32 = 0;
     while (li < config.num_hidden_layers) : (li += 1) {
         if (!config.isGlobalLayer(li)) continue;
@@ -2325,14 +2306,9 @@ fn pagedCacheRows(config: *const model_mod.ModelConfig, rows: u64, paged_bits: ?
         const v: u64 = @as(u64, config.layerKVHeads(li)) * config.layerVHeadDim(li) * 2;
         // Codes, then the BF16 scales and biases of each group of 64 (`kvBytesPerTokenAtBits`).
         const parts: [4]u64 = if (kv_bits >= 16) .{ k, v, 0, 0 } else .{ k * kv_bits / 16, v * kv_bits / 16, k / 64, v / 64 };
-        most = @max(most, @import("mlx_pages.zig").pagedRows(rows, &parts));
+        most = @max(most, KV.heldRows(0, end, hold, &parts));
     }
     return most;
-}
-
-fn roundToCacheStep(tokens: u64) u64 {
-    const step: u64 = 256;
-    return (tokens + step - 1) / step * step;
 }
 
 /// On a Cooler load each cache buffer is held at its pool size class, at most a sixteenth over its bytes.
@@ -6295,16 +6271,16 @@ test "bill pin: reservedCacheTokens" {
 
 test "bill pin: prefillRequestTerms" {
     try pinConfigs("prefillRequestTerms", &.{
-        53790720, 14155776, 115458048, 0, 0, 98304, 0, 0,
-        16, 2048000, 53790720, 15335424, 115458048, 0, 0, 106496,
-        12582912, 0, 16, 2048000, 53790720, 14155776, 0, 66846720,
-        0, 98304, 0, 0, 16, 2048000, 53790720, 15335424,
-        230916096, 0, 0, 106496, 12582912, 0, 16, 2048000,
-        126418944, 14155776, 115458048, 0, 0, 98304, 0, 0,
-        16, 2048000, 126418944, 15335424, 115458048, 0, 0, 106496,
-        12582912, 0, 16, 2048000, 126418944, 14155776, 0, 150994944,
-        0, 98304, 0, 0, 16, 2048000, 126418944, 15335424,
-        230916096, 0, 0, 106496, 12582912, 0, 16, 2048000,
+        53790720, 11796480, 115458048, 0, 0, 98304, 0, 0,
+        16, 2048000, 53790720, 12779520, 115458048, 0, 0, 106496,
+        10485760, 0, 16, 2048000, 53790720, 11796480, 0, 66846720,
+        0, 98304, 0, 0, 16, 2048000, 53790720, 12779520,
+        230916096, 0, 0, 106496, 10485760, 0, 16, 2048000,
+        101253120, 11796480, 115458048, 0, 0, 98304, 0, 0,
+        16, 2048000, 101253120, 12779520, 115458048, 0, 0, 106496,
+        10485760, 0, 16, 2048000, 101253120, 11796480, 0, 125829120,
+        0, 98304, 0, 0, 16, 2048000, 101253120, 12779520,
+        230916096, 0, 0, 106496, 10485760, 0, 16, 2048000,
         84811776, 244776960, 346374144, 0, 0, 98304, 0, 0,
         20, 204800000, 84811776, 265175040, 346374144, 0, 0, 106496,
         217579520, 0, 20, 204800000, 84811776, 244776960, 346374144, 783360000,
@@ -6320,10 +6296,10 @@ test "bill pin: prefillRequestTerms" {
         0, 0, 20, 3276800, 62962560, 0, 0, 75202560,
         1360000, 207572352, 0, 0, 20, 3276800, 62962560, 15173632,
         0, 0, 1360000, 207572352, 0, 0, 20, 3276800,
-        118517760, 0, 0, 0, 2560000, 348541440, 0, 0,
-        20, 3276800, 118517760, 15173632, 0, 0, 2560000, 348541440,
-        0, 0, 20, 3276800, 118517760, 0, 0, 141557760,
-        2560000, 348541440, 0, 0, 20, 3276800, 118517760, 15173632,
+        94924800, 0, 0, 0, 2560000, 348541440, 0, 0,
+        20, 3276800, 94924800, 15173632, 0, 0, 2560000, 348541440,
+        0, 0, 20, 3276800, 94924800, 0, 0, 117964800,
+        2560000, 348541440, 0, 0, 20, 3276800, 94924800, 15173632,
         0, 0, 2560000, 348541440, 0, 0, 20, 3276800,
         79511040, 0, 0, 0, 136000000, 207572352, 0, 0,
         20, 167772160, 79511040, 15173632, 0, 0, 136000000, 207572352,
@@ -6415,12 +6391,12 @@ test "bill pin: growCoexistBytes and the eval-window terms" {
 
 test "bill pin: prefillNeededAtChunk" {
     try pinConfigs("prefillNeededAtChunk", &.{
-        1114378240, 1128148992, 932073472, 1243607040, 1475517760, 1489288512, 1293212992, 1604746560,
-        1196478464, 1210249216, 930025472, 1325707264, 1557617984, 1571388736, 1291164992, 1686846784,
+        1112018944, 1123495936, 929714176, 1238953984, 1473158464, 1484635456, 1290853696, 1600093504,
+        1168953344, 1180430336, 927666176, 1295888384, 1530092864, 1541569856, 1288805696, 1657027904,
         4463783936, 4756965376, 3566183936, 4901287936, 6209949824, 6507432064, 5312349824, 6651754624,
         5702987776, 5996169216, 4013387776, 6140491776, 7479627904, 7777110144, 5790027904, 7921432704,
         1717825920, 1736792960, 1623822720, 1736792960, 2373073280, 2392040320, 2279070080, 2392040320,
-        1974385280, 1993352320, 1797438080, 1993352320, 2629632640, 2648599680, 2452685440, 2648599680,
+        1944894080, 1963861120, 1797438080, 1963861120, 2600141440, 2619108480, 2452685440, 2619108480,
         3627130720, 3646097760, 2641130720, 3646097760, 5689548640, 5708515680, 4703548640, 5708515680,
         5129713280, 5148680320, 3273713280, 5148680320, 7236368000, 7255335040, 5380368000, 7255335040,
         2089683520, 2089683520, 2089683520, 2274208320, 2729646720, 2729646720, 2729646720, 2914171520,
@@ -6543,7 +6519,7 @@ test "bill pin: creditedAdmissionBill and its verdict" {
         10737418240, 12884901888, 5368709120, 3221225472, 1024, 1, 1, 0,
         2147483648, 12884901888, 10737418240, 5368709120, 3221225472, 1024, 0, 1,
         1, 2147483648, 12884901888, 11811160064, 5368709120, 3221225472, 1024, 0,
-        1, 1, 2147483648, 143917056, 10737418240, 12884901888, 5368709120, 3221225472,
+        1, 1, 2147483648, 141557760, 10737418240, 12884901888, 5368709120, 3221225472,
         1024, 1, 1, 0, 2147483648, 12884901888, 10737418240, 5368709120,
         3221225472, 1024, 0, 1, 1, 2147483648, 12884901888, 11811160064,
         5368709120, 3221225472, 1024, 0, 1, 1, 2147483648, 0,
@@ -8270,4 +8246,21 @@ test "a load refusal offers a smaller pack only when the build lists one, and na
     // Streaming, when it fits, is the first action.
     const streamed = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0, .total_ram = 32 * gib, .stream_fits_gb = 17 });
     try testing.expect(std.mem.indexOf(u8, streamed, "To load it:\n- Stream its experts from the SSD") != null);
+}
+
+test "a request whose prompt does not fill the context holds no more cache than one that fills it" {
+    const t = std.testing;
+    var cfg = fixtures.qwen4ExpOomConfig();
+    var over: usize = 0;
+    // The advertised context is sized with the prompt filling it (`maxSushiContextUpTo`): a shorter prompt and the
+    // reply the context leaves it must be billed under that, at every speculative depth.
+    for ([_]u32{ 4100, 9000, 70_000 }) |ctx| for ([_]u64{ 0, mtp_mod.MAX_DEPTH }) |past| for ([_]?u64{ 8, null }) |bits| {
+        cfg.pinned_context = ctx;
+        const full = cacheCapacityTokens(&cfg, ctx, 0, 2048, ctx, past, bits);
+        var seq: u64 = 1;
+        while (seq < ctx) : (seq += 97) {
+            if (cacheCapacityTokens(&cfg, seq, ctx - seq, 2048, ctx, past, bits) > full) over += 1;
+        }
+    };
+    try t.expectEqual(@as(usize, 0), over);
 }

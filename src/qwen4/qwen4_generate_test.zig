@@ -239,7 +239,7 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     );
     try t.expect(reservedPrefillTokens(&qwen4, seq, max_tokens, chunk) > seq);
 
-    // Every other arch: zero, which leaves `nextCapacityReserved` == `nextCapacity`.
+    // Every other arch: zero, which leaves `KVCache.heldRows` the policy alone.
     for ([_][]const u8{ "glm5_next", "deepseek_v41", "not_a_served_arch" }) |mt| {
         var cfg = model_mod.ModelConfig{ .model_type = mt, .max_position_embeddings = 262_144 };
         try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, seq, max_tokens, chunk));

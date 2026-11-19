@@ -115,6 +115,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   `/v1/messages` answered in OpenAI's shape; a refused API key now takes the same shape as every other error (a HEAD
   gets no body), and the metrics feed's refusals carry the `error.message` the dashboard reads.
 - **A failed self-update's message stays in the web page until you dismiss it**, as a refused load's does.
+- **MLX-route memory: a request whose prompt does not fill the advertised context is admitted again**: its cache no
+  longer grows past the request's last token, so it holds and is billed no more than a prompt that fills the context;
+  a warm cache restored at its own length no longer grows past its bill either.
 - **APIs and server**: a shutdown refuses the requests still waiting from the moment it is asked, instead of serving
   those it reaches within the next second.
 - **Stopping the server during an unload answers the requests waiting on that model**: a request sent while an unload

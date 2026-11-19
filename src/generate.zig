@@ -425,11 +425,14 @@ fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *con
     return captureSsmCheckpoint(allocator, ctx.ssm_entries.?, pos, xfm.s);
 }
 
-/// Reserve this request's cache capacity, and grow the restored layers to it, before the
-/// prefill's first chunk writes (`KVCache.growToReservation`). Returns the reserved tokens.
-pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelConfig, total_ctx: u64, max_tokens: u64, chunk: u64, s: mlx.mlx_stream) !u64 {
+/// Reserve this request's cache capacity, bound its growth at the request's last row (`max_tokens` is the clamped
+/// reply, `past_end` the speculative rows past it, as `bills.cacheCapacityTokens` prices them), and grow the restored
+/// layers to the reservation before the prefill's first chunk writes (`KVCache.growToReservation`). Returns the
+/// reserved tokens.
+pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelConfig, total_ctx: u64, max_tokens: u64, chunk: u64, past_end: u64, s: mlx.mlx_stream) !u64 {
     const reserved = prefill_plan.reservedPrefillTokens(config, total_ctx, max_tokens, chunk);
     cache.reserve(@intCast(reserved));
+    cache.bound(@intCast(KVCache.requestEnd(total_ctx, max_tokens, total_ctx +| max_tokens, past_end)));
     try cache.growToReservation(s);
     return reserved;
 }
@@ -1504,9 +1507,10 @@ pub const Generator = struct {
             const cp_thin: trunk.ThinPolicy =
                 if (xfm.config.longCtxGated() or arch_request != null) .min_span_recency else .oldest;
 
-            const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, s);
+            const past_end = @import("bills.zig").speculativeRowsPastEnd(&xfm.config, .{ .mtp_on = mtp_active });
+            const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, past_end, s);
             // The arch's own per-request buffers reserve at the same length; the head's rows start at its base.
-            if (mtp_cache) |*mc| try mc.reserve(reserved_tokens -| mtp_position_base, s);
+            if (mtp_cache) |*mc| try mc.reserve(.{ .reserve = reserved_tokens -| mtp_position_base, .end = ctx.cache.end_tokens -| mtp_position_base }, s);
             prefix_arch.aux.reserveQsaHistoryWithHead(
                 ctx.ssm_entries,
                 arch_state.headEntry(&xfm.arch_state),
@@ -4410,7 +4414,7 @@ test "a warm prefill grows its restored layers to the reservation before the fir
                 }
                 const ring_cap = mlx.getShape(warm.entries[1].keys)[2];
 
-                const reserved = try reserveRequestCapacity(&warm, cfg, seq, 32_000, 2048, s);
+                const reserved = try reserveRequestCapacity(&warm, cfg, seq, 32_000, 2048, 0, s);
                 try t.expect(seq <= capacity and capacity < reserved);
                 try t.expectEqual(@as(c_int, capacity), mlx.getShape(donor.entries[0].keys)[2]);
                 try t.expect(mlx.getShape(warm.entries[0].keys)[2] >= reserved);

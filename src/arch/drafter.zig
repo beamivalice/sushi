@@ -295,11 +295,11 @@ pub const DraftCache = struct {
         };
     }
 
-    /// Reserves the head's history at `rows`, beside the trunk's reservation, so its storage is the bill's
+    /// Reserves the head's history at `hold`, beside the trunk's reservation and bound, so its storage is the bill's
     /// (`bills.prefillRequestTerms`). Every arch's cache declares it: one whose rows are a fixed ring reserves nothing.
-    pub fn reserve(self: *const DraftCache, rows: usize, s: mlx.mlx_stream) !void {
+    pub fn reserve(self: *const DraftCache, hold: trunk.Hold, s: mlx.mlx_stream) !void {
         if (no_caches) unreachable else switch (self.u) {
-            inline else => |*c| try c.reserve(rows, s),
+            inline else => |*c| try c.reserve(hold, s),
         }
     }
 
