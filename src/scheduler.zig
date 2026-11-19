@@ -986,9 +986,8 @@ pub const LoadRequest = struct {
     /// Borrows the conn thread's stack buffer; valid until `done`.
     evict_entries: []*LoadedModel = &.{},
 
-    /// Output: error name on failure (owned by `allocator`; conn thread
-    /// frees). Null on success.
-    error_name: ?[]const u8 = null,
+    /// Output, read once `done`.
+    outcome: model_registry_mod.LoadAttempt.Outcome = .pending,
     memory_context_refusal: ?model_registry_mod.MemoryContextRefusal = null,
     /// Output: the refusal text a load's memory check wrote, which the client gets whole.
     refusal_text: [load_refusal_cap]u8 = undefined,
@@ -996,7 +995,6 @@ pub const LoadRequest = struct {
 
     /// Conn-thread synchronization. Inference thread broadcasts when done.
     done: bool = false,
-    allocator: std.mem.Allocator,
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
 
@@ -1509,19 +1507,10 @@ pub const Scheduler = struct {
 
     fn finishShutdown(self: *Scheduler, req: anytype) void {
         req.done_mu.lockUncancelable(self.io);
-        req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
+        if (@TypeOf(req) == *LoadRequest) req.outcome = .shutdown else req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
         req.done = true;
         req.done_cond.broadcast(self.io);
         req.done_mu.unlock(self.io);
-    }
-
-    /// A load or unload that ended before the inference thread took it: the entry it claimed and the entries it marked
-    /// for eviction return to where they stood, so a request waiting on either does not wait on a job that never runs.
-    fn rollBackUntaken(self: *Scheduler, claimed: ?*LoadedModel, marked: []const *LoadedModel) void {
-        self.registry.mutex.lockUncancelable(self.io);
-        defer self.registry.mutex.unlock(self.io);
-        for (marked) |v| if (v.state == .evicting) self.registry.unmarkEvictingLocked(v);
-        if (claimed) |c| if (c.state == .loading) self.registry.markUnloadedLocked(c);
     }
 
     /// Hands `req` to the inference thread through `queue`, refused once a shutdown was asked.
@@ -1782,21 +1771,15 @@ pub const Scheduler = struct {
 
         // CPU-only pre-load: parse config / load tokenizer / load chat
         // config. Cheap (~tens of ms); kept outside the mutex so other
-        // requests on other models stay unblocked. On failure, mark the
-        // entry `.error_state` so /v1/models surfaces the failure (and
-        // future ensureLoaded calls fail fast instead of re-tripping the
-        // same parse error). FileNotFound / parse errors land here.
-        self.registry.mutex.lockUncancelable(self.io);
-        const settings_gen = entry.settings_gen;
-        self.registry.mutex.unlock(self.io);
+        // requests on other models stay unblocked. On failure, the attempt
+        // stores it so /v1/models surfaces the failure (and future
+        // ensureLoaded calls fail fast instead of re-tripping the same parse
+        // error). FileNotFound / parse errors land here.
+        var attempt = self.registry.beginAttempt(entry);
+        defer attempt.end();
         const settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
         const cpu_state = model_load.preloadCpuState(self.allocator, self.io, entry.path) catch |err| {
-            self.registry.mutex.lockUncancelable(self.io);
-            // Another request may have claimed or loaded the model meanwhile: its state is that request's. A setting
-            // saved since the read above makes the next request try again.
-            if ((entry.state == .unloaded or entry.state == .error_state) and !self.registry.settingsSavedSinceLocked(entry, settings_gen))
-                self.registry.markErrorLocked(entry, @errorName(err));
-            self.registry.mutex.unlock(self.io);
+            attempt.outcome = .{ .failed = @errorName(err) };
             return error.LoadFailed;
         };
         // Ownership: on success transfers to the entry inside the
@@ -1819,8 +1802,6 @@ pub const Scheduler = struct {
         // slice handed to the LoadRequest stays valid while we block on `done`.
         var victims_buf: [16]*LoadedModel = undefined;
         var n_victims: usize = 0;
-        var pinned = false;
-        errdefer if (pinned) self.registry.releaseStatus(entry);
 
         const settings_choice = model_load.resolveSsdBudget(self.ssd_budget_bytes, owned.config.ssd_budget_gb_override, owned.config.supportsExpertStreaming());
         const settings_budget = settings_choice.bytes;
@@ -1895,7 +1876,6 @@ pub const Scheduler = struct {
                     .error_state => {
                         if (!retry_failed) return ModelRegistry.loadErrorFromName(entry.error_name);
                         // The stored failure stays until this attempt claims the slot, in the same hold.
-                        self.registry.markUnloadedLocked(entry);
                         break :wait_loop;
                     },
                     .unloaded => break :wait_loop,
@@ -1904,9 +1884,7 @@ pub const Scheduler = struct {
             // Checked again under the mutex a download start holds while it enqueues, so the two never overlap.
             if (self.registry.loadBlocked(&gate_buf, entry.path) != null) return error.PackDownloading;
 
-            // Claim the slot.
-            std.debug.assert(self.registry.tryBeginLoadReadLocked(entry, settings_gen));
-            pinned = true;
+            attempt.claimLocked();
 
             // Estimate post-load bytes (`gateEstimateBytes`).
             const estimated: u64 = streaming_gate_bytes orelse model_load.gateEstimateBytes(entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
@@ -1938,10 +1916,10 @@ pub const Scheduler = struct {
                     log.err("Refusing to load {s}: {s}\n", .{ entry.id, text });
                     recordLoadRefusal(text);
                 }
-                self.registry.markUnloadedLocked(entry); // releases the reservation
                 return if (count_cap) error.ResidentModelsCapReached else error.NotEnoughMemory;
             };
             n_victims = n;
+            attempt.victims = victims_buf[0..n_victims];
             // Drain readers on each victim before the inference thread frees it.
             for (victims_buf[0..n_victims]) |v| self.registry.waitForRefcountZeroLocked(v);
             self.registry.mutex.unlock(self.io);
@@ -1984,33 +1962,29 @@ pub const Scheduler = struct {
             .mtp_head_kv_quant = self.mtp_head_kv_quant,
             .mtp_depth = self.mtp_depth,
             .evict_entries = victims_buf[0..n_victims],
-            .allocator = self.allocator,
         };
 
-        self.post(&self.load_queue, &req) catch |err| {
-            self.rollBackUntaken(entry, victims_buf[0..n_victims]);
-            return err;
-        };
+        try self.post(&self.load_queue, &req);
 
         // Block until the inference thread signals done.
         req.done_mu.lockUncancelable(self.io);
         while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
         req.done_mu.unlock(self.io);
 
-        if (req.error_name) |name| {
-            last_load_context_refusal = req.memory_context_refusal;
-            if (req.refusal_text_len > 0) recordLoadRefusal(req.refusal_text[0..req.refusal_text_len]);
-            // The failure crosses the thread boundary by NAME — map it back
-            // to a typed error so a memory-preflight refusal surfaces as a
-            // named 503, not the generic "Model load failed" 500 (#144).
-            defer self.allocator.free(name);
-            if (std.mem.eql(u8, name, "Shutdown")) {
-                self.rollBackUntaken(entry, victims_buf[0..n_victims]);
-                return error.Shutdown;
-            }
-            // On success the inference thread took ownership of cpu_state;
-            // on failure it didn't, so we still hold it.
-            return ModelRegistry.loadErrorFromName(name);
+        // On success the inference thread took ownership of cpu_state; otherwise we still hold it.
+        attempt.outcome = req.outcome;
+        switch (req.outcome) {
+            .pending => unreachable, // `done` comes with an outcome
+            .ok => {},
+            .shutdown => return error.Shutdown,
+            .failed, .refused => |name| {
+                last_load_context_refusal = req.memory_context_refusal;
+                if (req.refusal_text_len > 0) recordLoadRefusal(req.refusal_text[0..req.refusal_text_len]);
+                // The failure crosses the thread boundary by NAME — map it back
+                // to a typed error so a memory-preflight refusal surfaces as a
+                // named 503, not the generic "Model load failed" 500 (#144).
+                return ModelRegistry.loadErrorFromName(name);
+            },
         }
 
         // Success — inference thread installed cpu_state onto the entry.
@@ -2022,6 +1996,7 @@ pub const Scheduler = struct {
         const ready = entry.state == .ready;
         self.registry.mutex.unlock(self.io);
         if (!ready) return error.NotLoaded;
+        attempt.kept = true;
         return entry;
     }
 
@@ -2121,7 +2096,10 @@ pub const Scheduler = struct {
 
         var req = UnloadRequest{ .entry = entry };
         self.post(&self.unload_queue, &req) catch |err| {
-            self.rollBackUntaken(null, &.{entry});
+            // Refused at the queue: the model serves on, so a request waiting on it does not wait on a job that never runs.
+            self.registry.mutex.lockUncancelable(self.io);
+            defer self.registry.mutex.unlock(self.io);
+            if (entry.state == .evicting) self.registry.unmarkEvictingLocked(entry);
             return err;
         };
         req.done_mu.lockUncancelable(self.io);
@@ -6825,11 +6803,8 @@ const FailNextLoad = struct {
         if (s.load_queue.items.len == 0) return s.queue_mu.unlock(s.io);
         const req = s.load_queue.orderedRemove(0);
         s.queue_mu.unlock(s.io);
-        s.registry.mutex.lockUncancelable(s.io);
-        s.registry.markLoadFailedLocked(req.entry, self.name);
-        s.registry.mutex.unlock(s.io);
         req.done_mu.lockUncancelable(s.io);
-        req.error_name = req.allocator.dupe(u8, self.name) catch null;
+        req.outcome = model_registry_mod.LoadAttempt.Outcome.ofLoadError(self.name);
         req.done = true;
         req.done_cond.broadcast(s.io);
         req.done_mu.unlock(s.io);
@@ -6896,4 +6871,92 @@ test "a setting saved after a cold load read its settings and before it claims t
         // The load ran on the settings read before the save: the next request loads again.
         try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
     }
+}
+
+test "a queued cold load a shutdown ends with no memory left for its answer still sets back its claim and its victim" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const victim = try reg.registerStub("a", "a", 10);
+    const target = try reg.registerStub("b", dir, 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(victim, 10);
+    reg.mutex.unlock(io);
+    var sch = coldLoadTestScheduler(reg);
+    defer sch.load_queue.deinit(testing.allocator);
+
+    var call: ModelCall = .{ .sch = &sch, .id = "b", .load = true };
+    const t = try std.Thread.spawn(.{}, ModelCall.run, .{&call});
+    // The load is posted, its claim and victim marked, and no inference thread takes it.
+    var posted = false;
+    for (0..20_000) |_| {
+        sch.queue_mu.lockUncancelable(io);
+        posted = sch.load_queue.items.len == 1;
+        sch.queue_mu.unlock(io);
+        if (posted) break;
+        const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    sch.allocator = failing.allocator();
+    sch.beginShutdown();
+    sch.allocator = testing.allocator;
+    const answered = call.answeredWithin(5000);
+    t.join();
+    const target_state = target.state;
+    const victim_state = victim.state;
+    // The registry's deinit needs both at rest, whatever the verdict.
+    reg.mutex.lockUncancelable(io);
+    if (victim.state == .evicting) reg.unmarkEvictingLocked(victim);
+    if (target.state == .loading) reg.markUnloadedLocked(target);
+    reg.mutex.unlock(io);
+    try testing.expect(posted);
+    try testing.expect(answered);
+    try testing.expectError(error.Shutdown, call.got);
+    try testing.expectEqual(model_registry_mod.LoadState.unloaded, target_state);
+    try testing.expectEqual(model_registry_mod.LoadState.ready, victim_state);
+}
+
+test "an explicit load of a failed model refused at its claim keeps the stored failure" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    const target = try reg.registerStub("b", dir, 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markErrorLocked(target, "Exl3ShardStampMismatch");
+    reg.mutex.unlock(io);
+    var sch = coldLoadTestScheduler(reg);
+    defer sch.load_queue.deinit(testing.allocator);
+    // A download into the folder starts between the gate before the files and the one at the claim.
+    const Gate = struct {
+        var r: *ModelRegistry = undefined;
+        fn check(_: []u8, _: []const u8) ?[]const u8 {
+            const at_claim = !r.mutex.tryLock();
+            if (!at_claim) r.mutex.unlock(r.io);
+            return if (at_claim) "a download into this folder is running" else null;
+        }
+    };
+    Gate.r = reg;
+    reg.load_gate = Gate.check;
+    try testing.expectError(error.PackDownloading, sch.ensureLoadedFresh("b"));
+    try testing.expectEqual(model_registry_mod.LoadState.error_state, target.state);
+    try testing.expectEqualStrings("Exl3ShardStampMismatch", target.error_name.?);
+    try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
 }

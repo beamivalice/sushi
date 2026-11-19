@@ -1953,7 +1953,7 @@ pub fn rearmDiskTier(allocator: std.mem.Allocator, io: std.Io, entry: *LoadedMod
 ///
 /// On any error the partial state has already been freed via errdefer; the
 /// caller decides how to surface (startup → recordLoadError + signal
-/// started; on-demand → req.error_name + done broadcast).
+/// started; on-demand → req.outcome + done broadcast).
 /// The MLX message behind a failed load step, for its log line.
 fn latchedCause(buf: *[512]u8) []const u8 {
     return mlx.peekErrorMessage(buf) orelse "no MLX message";
@@ -2897,26 +2897,21 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // Re-apply so `fit` capacity covers everything this load brought in
     // (MTP head / drafter / vision land after the mid-load apply).
     logWiredPolicy(mlx.applyWiredPolicy());
-    finishLoadRequest(sch, req, null);
+    finishLoadRequest(sch, req, .ok);
 }
 
 fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror, had_error: bool) void {
     log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
     // The load's own MLX error is reported here; latched, it would fail the next request.
     mlx.dropLatchedErrorUnless(had_error);
-    sch.registry.mutex.lockUncancelable(sch.io);
-    sch.registry.markLoadFailedLocked(req.entry, @errorName(err));
-    sch.registry.mutex.unlock(sch.io);
-    finishLoadRequest(sch, req, @errorName(err));
+    finishLoadRequest(sch, req, model_registry_mod.LoadAttempt.Outcome.ofLoadError(@errorName(err)));
 }
 
-fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) void {
+/// The requester's `LoadAttempt` stores the outcome: this only hands it over.
+fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, outcome: model_registry_mod.LoadAttempt.Outcome) void {
     req.done_mu.lockUncancelable(sch.io);
     defer req.done_mu.unlock(sch.io);
-    if (err_name) |name| {
-        if (req.error_name) |old| req.allocator.free(old);
-        req.error_name = req.allocator.dupe(u8, name) catch null;
-    }
+    req.outcome = outcome;
     req.done = true;
     req.done_cond.broadcast(sch.io);
 }
@@ -3170,8 +3165,7 @@ test "a failed cold load drops the MLX error it latched and keeps one latched be
     var sch: Scheduler = undefined;
     sch.registry = reg;
     sch.io = testing.io;
-    var req = LoadRequest{ .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = "", .allocator = testing.allocator };
-    defer if (req.error_name) |name| testing.allocator.free(name);
+    var req = LoadRequest{ .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = "" };
 
     try testing.expect(!mlx.errorPending());
     mlx.latchErrorForTest("[load] the load's own failure");
@@ -3184,7 +3178,7 @@ test "a failed cold load drops the MLX error it latched and keeps one latched be
     mlx.dropLatchedErrorUnless(false);
 }
 
-test "a cold load refused for memory or a setting returns the entry to unloaded, any other failure keeps its name" {
+test "a cold load refused for memory or a setting answers refused, any other failure answers failed with its name" {
     try mlx.requireGpu();
     mlx.installErrorHandler();
     var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
@@ -3193,15 +3187,14 @@ test "a cold load refused for memory or a setting returns the entry to unloaded,
     var sch: Scheduler = undefined;
     sch.registry = reg;
     sch.io = testing.io;
-    var req = LoadRequest{ .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = "", .allocator = testing.allocator };
-    defer if (req.error_name) |name| testing.allocator.free(name);
+    var req = LoadRequest{ .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = "" };
 
     for ([_]anyerror{ error.InsufficientMemory, error.OutOfMemory, error.SsdBudgetBelowResident, error.ExpertCacheDoesNotFit }) |memory| {
         failLoadRequest(&sch, &req, memory, false);
-        try testing.expectEqual(model_registry_mod.LoadState.unloaded, entry.state);
+        try testing.expectEqualStrings(@errorName(memory), req.outcome.refused);
     }
     failLoadRequest(&sch, &req, error.LoadFailed, false);
-    try testing.expectEqual(model_registry_mod.LoadState.error_state, entry.state);
+    try testing.expectEqualStrings("LoadFailed", req.outcome.failed);
 }
 
 // ── Prefix-cache attach ──

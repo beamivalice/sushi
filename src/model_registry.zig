@@ -306,10 +306,9 @@ pub const LoadedModel = struct {
     error_name: ?[]const u8,
     /// Kept through a transient memory refusal's unloaded reset; cleared on retry or success.
     memory_context_refusal: ?MemoryContextRefusal = null,
-    /// Counts the saves of a setting that reaches loading (`forgetLoadFailureLocked`).
+    /// Counts the saves of a setting that reaches loading (`forgetLoadFailureLocked`): a `LoadAttempt` that read its
+    /// settings at an older count never stores its failure.
     settings_gen: u64 = 0,
-    /// `settings_gen` when the claimed load read its settings: a load that read older settings never stores its failure.
-    load_settings_gen: u64 = 0,
 
     /// Token → bytes table backing the JSON grammar mask, built lazily on this
     /// entry's first schema-constrained request. Its lifetime matches
@@ -565,6 +564,79 @@ pub const ModelStatus = struct {
 /// Load failures a setting or the memory limit decides: the entry goes back to `.unloaded`, so the next load re-reads
 /// model-settings.json. Every other failure is the pack's and is stored.
 pub const refusals = [_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetExceedsWiredLimit", "SsdBudgetBelowResident", "SsdBudgetBelowVision", "ExpertCacheDoesNotFit", "ContextSizeAboveWindow", "GlmKvQuantUnsupported" };
+
+/// One load of one model by the request that asked for it, from the read of its settings to its end: the settings
+/// generation it read, the marks it made (its claim, the victims it marked for eviction) and how it ended. `end` runs
+/// once, on that request's thread, and stores the outcome or sets every mark back: no mark outlives its attempt. The
+/// launch load is not one: its failure ends the process.
+pub const LoadAttempt = struct {
+    registry: *ModelRegistry,
+    entry: *LoadedModel,
+    /// `entry.settings_gen` before the attempt read model-settings.json.
+    settings_gen: u64,
+    claimed: bool = false,
+    /// Marked `.evicting` by this attempt; once the inference thread takes the load they are its to free.
+    victims: []const *LoadedModel = &.{},
+    outcome: Outcome = .pending,
+    /// The caller keeps the claim's reference past `end`: the model it loaded is ready.
+    kept: bool = false,
+
+    pub const Outcome = union(enum) {
+        /// Ended before the inference thread took it.
+        pending,
+        ok,
+        /// A failure of the pack or its files, stored until something ends it. An `@errorName`: static, no allocation.
+        failed: []const u8,
+        /// A refusal a setting or the memory limit decides (`refusals`): not stored.
+        refused: []const u8,
+        /// A shutdown ended it before the inference thread took it.
+        shutdown,
+
+        /// How a load the inference thread ran ended with the error `name`.
+        pub fn ofLoadError(name: []const u8) Outcome {
+            for (refusals) |n| if (std.mem.eql(u8, n, name)) return .{ .refused = name };
+            return .{ .failed = name };
+        }
+
+        pub fn errorName(self: Outcome) ?[]const u8 {
+            return switch (self) {
+                .failed, .refused => |name| name,
+                .pending, .ok, .shutdown => null,
+            };
+        }
+    };
+
+    /// Claims the entry, the caller holding `mutex`. An explicit retry's stored failure ends here, in the hold that
+    /// claims, never before a refusal at the claim.
+    pub fn claimLocked(self: *LoadAttempt) void {
+        if (self.entry.state == .error_state) self.registry.markUnloadedLocked(self.entry);
+        std.debug.assert(self.registry.tryBeginLoadLocked(self.entry));
+        self.claimed = true;
+    }
+
+    pub fn end(self: *LoadAttempt) void {
+        const reg = self.registry;
+        const entry = self.entry;
+        reg.mutex.lockUncancelable(reg.io);
+        defer reg.mutex.unlock(reg.io);
+        switch (self.outcome) {
+            .ok => {},
+            .pending, .shutdown => {
+                for (self.victims) |v| if (v.state == .evicting) reg.unmarkEvictingLocked(v);
+                if (self.claimed and entry.state == .loading) reg.markUnloadedLocked(entry);
+            },
+            .refused => if (self.claimed) reg.markUnloadedLocked(entry),
+            // Unclaimed, the failure is of the files read before the claim: stored only on an entry no other request
+            // has claimed or loaded since.
+            .failed => |name| if (entry.settings_gen != self.settings_gen) {
+                if (self.claimed) reg.markUnloadedLocked(entry);
+            } else if (self.claimed or entry.state == .unloaded or entry.state == .error_state) {
+                reg.markErrorLocked(entry, name);
+            },
+        }
+        if (self.claimed and !self.kept) reg.releaseRefLocked(entry);
+    }
+};
 
 /// The roots a rescan walks: the boot roots plus the settings file's models directory, unless a launch flag pins them.
 fn rootsWithFileDir(buf: *[9][]const u8, boot_roots: []const []const u8, pinned: bool, file_dir: ?[]const u8) []const []const u8 {
@@ -1058,16 +1130,10 @@ pub const ModelRegistry = struct {
     /// On true the claimant holds a reference from here on: a model that turns `.ready` with
     /// none is another load's eviction victim before the claimant wakes.
     pub fn tryBeginLoadLocked(self: *ModelRegistry, entry: *LoadedModel) bool {
-        return self.tryBeginLoadReadLocked(entry, entry.settings_gen);
-    }
-
-    /// `tryBeginLoadLocked` for a load that read its settings before the claim, when `settings_gen` was `read_gen`.
-    pub fn tryBeginLoadReadLocked(self: *ModelRegistry, entry: *LoadedModel, read_gen: u64) bool {
         if (entry.state != .unloaded) return false;
         entry.state = .loading;
         _ = entry.refcount.fetchAdd(1, .acq_rel);
         entry.memory_context_refusal = null;
-        entry.load_settings_gen = read_gen;
         self.state_cond.broadcast(self.io);
         return true;
     }
@@ -1528,18 +1594,11 @@ pub const ModelRegistry = struct {
         if (entry.state == .error_state) self.markUnloadedLocked(entry);
     }
 
-    /// A setting that reaches loading was saved after a load read its settings at `read_gen`.
-    pub fn settingsSavedSinceLocked(_: *const ModelRegistry, entry: *const LoadedModel, read_gen: u64) bool {
-        return entry.settings_gen != read_gen;
-    }
-
-    /// A failed load's end state. A refusal that a setting or the memory limit decides goes back to `.unloaded`, so
-    /// the next load re-reads model-settings.json, as does any failure of a load that read its settings before a
-    /// setting that reaches loading was saved; any other failure is the pack's and fails fast as `.error_state`.
-    pub fn markLoadFailedLocked(self: *ModelRegistry, entry: *LoadedModel, error_name: []const u8) void {
-        if (self.settingsSavedSinceLocked(entry, entry.load_settings_gen)) return self.markUnloadedLocked(entry);
-        for (refusals) |n| if (std.mem.eql(u8, n, error_name)) return self.markUnloadedLocked(entry);
-        self.markErrorLocked(entry, error_name);
+    /// A load of `entry` by the calling request, taking the settings generation before it reads model-settings.json.
+    pub fn beginAttempt(self: *ModelRegistry, entry: *LoadedModel) LoadAttempt {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return .{ .registry = self, .entry = entry, .settings_gen = entry.settings_gen };
     }
 
     /// Duped copy of the stored load-failure name for `id` (empty/"sushi"
@@ -2101,9 +2160,12 @@ test "ModelRegistry: a refused load is unloaded, any other failure is stored, an
     defer reg.deinit();
     const stub = try reg.registerStub("m", "/path/to/m", 1024);
     for (refusals ++ [_][]const u8{ "FileNotFound", "LoadFailed", "Exl3ShardStampMismatch" }) |name| {
+        var attempt = reg.beginAttempt(stub);
         reg.mutex.lockUncancelable(reg.io);
-        reg.markLoadFailedLocked(stub, name);
+        attempt.claimLocked();
         reg.mutex.unlock(reg.io);
+        attempt.outcome = LoadAttempt.Outcome.ofLoadError(name);
+        attempt.end();
         const refused = for (refusals) |r| {
             if (std.mem.eql(u8, r, name)) break true;
         } else false;
@@ -2144,22 +2206,18 @@ test "ModelRegistry: a setting that reaches loading saved while the model loads 
     const one = try reg.registerStub("one", "/path/to/one", 1024);
     const all = try reg.registerStub("all", "/path/to/all", 1024);
     for ([_]*LoadedModel{ one, all }) |e| {
-        reg.mutex.lockUncancelable(reg.io);
-        try testing.expect(reg.tryBeginLoadLocked(e));
-        reg.mutex.unlock(reg.io);
-        if (e == one) reg.forgetLoadFailure(e) else reg.forgetLoadFailures();
-        reg.mutex.lockUncancelable(reg.io);
-        reg.markLoadFailedLocked(e, "FileNotFound");
-        reg.mutex.unlock(reg.io);
-        reg.releaseStatus(e);
-        try expectError(error.NotLoaded, reg.ensureLoaded(e.id));
-        // The next attempt that fails with no save meanwhile stores its failure again.
-        reg.mutex.lockUncancelable(reg.io);
-        try testing.expect(reg.tryBeginLoadLocked(e));
-        reg.markLoadFailedLocked(e, "FileNotFound");
-        reg.mutex.unlock(reg.io);
-        reg.releaseStatus(e);
-        try expectError(error.LoadFailed, reg.ensureLoaded(e.id));
+        // The next attempt, which fails with no save meanwhile, stores its failure again.
+        for ([_]bool{ true, false }) |saved| {
+            var attempt = reg.beginAttempt(e);
+            reg.mutex.lockUncancelable(reg.io);
+            attempt.claimLocked();
+            reg.mutex.unlock(reg.io);
+            if (saved) if (e == one) reg.forgetLoadFailure(e) else reg.forgetLoadFailures();
+            attempt.outcome = .{ .failed = "FileNotFound" };
+            attempt.end();
+            try expectError(if (saved) error.NotLoaded else error.LoadFailed, reg.ensureLoaded(e.id));
+            try testing.expectEqual(@as(u32, 0), e.refcount.load(.acquire));
+        }
     }
 }
 

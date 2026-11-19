@@ -5031,21 +5031,20 @@ test "cooler contract: a resident load beside buffers already past a declared wi
     sch.io = io;
     sch.allocator = a;
     sch.ctx_size_flag = 0;
-    var req: scheduler_mod.LoadRequest = .{ .entry = entry, .config = &config, .tok = undefined, .chat_config = undefined, .model_dir = dir, .evict_entries = &.{}, .allocator = a };
+    var req: scheduler_mod.LoadRequest = .{ .entry = entry, .config = &config, .tok = undefined, .chat_config = undefined, .model_dir = dir, .evict_entries = &.{} };
     // Past the preflight the first checked MLX call is the weights': failing it ends an admitted load before it needs a
     // tokenizer.
     mlx.fault.arm(1);
     model_load.runLoadRequest(&sch, &req);
     const admitted = mlx.fault.didFire();
     mlx.fault.disarm();
-    defer if (req.error_name) |n| a.free(n);
     if (admitted) {
         var msg: [300]u8 = undefined;
         _ = mlx.takeError(&msg);
     }
-    errdefer std.debug.print("a load beside {d} MB in use under a {d} MB floor ended {s}; the preflight admitted it: {}\n", .{ @import("gpu_mem.zig").activeBytes() >> 20, floor >> 20, req.error_name orelse "loaded", admitted });
+    errdefer std.debug.print("a load beside {d} MB in use under a {d} MB floor ended {s}; the preflight admitted it: {}\n", .{ @import("gpu_mem.zig").activeBytes() >> 20, floor >> 20, req.outcome.errorName() orelse "loaded", admitted });
     try testing.expect(!admitted);
-    try testing.expectEqualStrings("InsufficientMemory", req.error_name.?);
+    try testing.expectEqualStrings("InsufficientMemory", req.outcome.errorName().?);
     try testing.expect(std.mem.indexOf(u8, req.refusal_text[0..req.refusal_text_len], "iogpu.wired_limit_mb = ") != null);
 }
 
@@ -5129,10 +5128,9 @@ fn evictMlxModel(new_on_engine: bool) !usize {
     defer scheduler_mod.load_serving_bill = hook_was;
     scheduler_mod.load_serving_bill = &PreflightSawMlx.bill;
     PreflightSawMlx.mlx_cache = null;
-    var req: scheduler_mod.LoadRequest = .{ .entry = other, .config = &other_config, .tok = undefined, .chat_config = undefined, .model_dir = dir, .evict_entries = &victims, .allocator = a };
+    var req: scheduler_mod.LoadRequest = .{ .entry = other, .config = &other_config, .tok = undefined, .chat_config = undefined, .model_dir = dir, .evict_entries = &victims };
     model_load.runLoadRequest(&sch, &req);
     mlx.fault.disarm();
-    defer if (req.error_name) |n| a.free(n);
     var msg: [300]u8 = undefined;
     _ = mlx.takeError(&msg);
     try testing.expectEqual(registry_mod.LoadState.unloaded, victim.state);
