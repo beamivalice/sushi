@@ -18,7 +18,7 @@ const fill_marks = @import("../fill_marks.zig");
 pub const max_dims = 8;
 pub const Dtype = mlx.mlx_dtype;
 
-pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, TensorNull, MlxAtRest, PoolOverBudget, ReadsFillingSlab };
+pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, TensorNull, MlxAtRest, PoolOverBudget, ReadsFillingSlab, EnvUnparsed };
 
 /// The restriction behind the last `TensorUnsupported` or `TensorDtype` an op returned through `refusing`; the route
 /// that reports the refusal names it once and clears it.
@@ -297,7 +297,13 @@ const gpa = std.heap.c_allocator;
 var state: ?State = null;
 
 fn st() Error!*State {
-    if (state == null) state = .{ .dev = try metal.device() };
+    if (state == null) {
+        double_env = doubleSwitch(std.c.getenv("SUSHI_ENGINE_KERNEL_DOUBLE")) catch |e| {
+            std.log.err("SUSHI_ENGINE_KERNEL_DOUBLE takes text from a kernel's pipeline name (letters, digits, _; not a number), or 0 or off", .{});
+            return e;
+        };
+        state = .{ .dev = try metal.device() };
+    }
     return &state.?;
 }
 
@@ -1350,21 +1356,27 @@ pub fn dispatchGroups(p: metal.Pass, grid: metal.Size, group: metal.Size) void {
     }
 }
 
-/// Tests set this; otherwise `SUSHI_ENGINE_KERNEL_DOUBLE` decides, read once.
+/// Tests set this; otherwise `SUSHI_ENGINE_KERNEL_DOUBLE` decides, read when the engine starts.
 pub var kernel_double_hook: ?[]const u8 = null;
 var double_env: ?[]const u8 = null;
-var double_read = false;
+
+/// The double switch's text: unset, empty, `0` or `off` is off; otherwise a piece of a pipeline name. A bare number
+/// is refused, since it would match every name holding that digit rather than switch the doubling on or off.
+fn doubleSwitch(raw: ?[*:0]const u8) error{EnvUnparsed}!?[]const u8 {
+    const v = std.mem.span(raw orelse return null);
+    if (v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off")) return null;
+    var digits = true;
+    for (v) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return error.EnvUnparsed;
+        digits = digits and std.ascii.isDigit(c);
+    }
+    return if (digits) error.EnvUnparsed else v;
+}
 
 /// Whether the dispatch just encoded runs again behind a barrier: its pipeline name holds the switch's text. A
 /// forward then pays that kernel twice, so the forward meter's difference is what the kernel costs inside the forward,
 /// overlap and all. Its outputs are written twice from the same inputs; a kernel that reads what it writes is off.
 fn kernelDoubled() bool {
-    if (!double_read) {
-        double_read = true;
-        if (std.c.getenv("SUSHI_ENGINE_KERNEL_DOUBLE")) |v| if (v[0] != 0) {
-            double_env = std.mem.span(v);
-        };
-    }
     const sub = kernel_double_hook orelse double_env orelse return false;
     if (std.mem.indexOf(u8, pipelineName(metal.bound_pipeline), sub) == null) return false;
     state.?.stats.doubled += 1;
@@ -1740,6 +1752,13 @@ test "a long open pass holds no more than it uses plus the bytes it may free bef
     defer release(x);
     const in_use = stats().pool_bytes - stats().pool_free;
     try t.expect(stats().pool_bytes - held0 <= in_use + pass_freed_cap + 2 * 8 * 1024 * 1024);
+}
+
+test "the double switch is off at 0, off or empty, names a kernel by its text, and refuses a number or other characters" {
+    for ([_]?[*:0]const u8{ null, "", "0", "off" }) |v| try std.testing.expectEqual(@as(?[]const u8, null), try doubleSwitch(v));
+    try std.testing.expectEqualStrings("exl3_k4_gemm", (try doubleSwitch("exl3_k4_gemm")).?);
+    try std.testing.expectEqualStrings("k4", (try doubleSwitch("k4")).?);
+    for ([_][*:0]const u8{ "1", "00", "gemm,rms", "rms ", "gemm*" }) |v| try std.testing.expectError(error.EnvUnparsed, doubleSwitch(v));
 }
 
 test "a trim waits for the oldest pass whose end frees enough, not for every pass in flight" {
