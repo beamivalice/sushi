@@ -76,7 +76,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `store:false` chain stays on its connection, never in the shared store (lint `response-store-field`), and its
   response says `"store":false`, as asked (the turn reaches `handleResponses` forced to store, `turn.kept` set). On the
   WebSocket every refusal is the turn's terminal `{"type":"error","status":N,...}` frame, sent by the one error sender
-  (`http.sendErrorResponse`), never an HTTP body. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
+  (`http.sendErrorResponse`), never an HTTP body. A message is JSON in a text frame: a binary one is answered by a 400
+  error frame and a 1003 close. Every end of the socket sends its close frame from one sender (`wsEndOf`): 1000 to the
+  client's close, 1002 a protocol error, 1003 a binary message, 1009 a message over the cap, 1011 anything else;
+  an upgrade without `Sec-WebSocket-Key` is a 400. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
   `/v1/messages`.
 - **Anthropic `/v1/messages`** (Claude Code): typed blocks, `input_schema`→`parameters`, stop-reason map incl.
   `stop_sequence` echo, full SSE block lifecycle (a block opens only once the open one is stopped, so each owns its

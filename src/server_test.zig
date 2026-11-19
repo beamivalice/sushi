@@ -474,6 +474,11 @@ test "server: an unload whose model stays held past its drain bound is refused b
 
 /// The next WebSocket frame the server sends (unmasked), its payload; the caller frees.
 fn wsReadFrame(fd: std.posix.fd_t) ![]u8 {
+    return (try wsReadFrameOf(fd)).payload;
+}
+
+/// The next WebSocket frame the server sends, its opcode and payload; the caller frees the payload.
+fn wsReadFrameOf(fd: std.posix.fd_t) !struct { opcode: u4, payload: []u8 } {
     var head: [10]u8 = undefined;
     try readExact(fd, head[0..2]);
     var len: u64 = head[1] & 0x7f;
@@ -487,7 +492,7 @@ fn wsReadFrame(fd: std.posix.fd_t) ![]u8 {
     const payload = try gpa.alloc(u8, @intCast(len));
     errdefer gpa.free(payload);
     try readExact(fd, payload);
-    return payload;
+    return .{ .opcode = @truncate(head[0]), .payload = payload };
 }
 
 fn readExact(fd: std.posix.fd_t, out: []u8) !void {
@@ -682,6 +687,64 @@ test "server: every request to a model whose load is refused for memory gets the
                     if (!std.mem.startsWith(u8, message, head)) return error.AnotherRefusal;
                     gpa.free(message);
                 } else first = message;
+            }
+        }
+    }.run);
+}
+
+/// The close code of the next frame, which must be a close.
+fn wsReadCloseCode(fd: std.posix.fd_t) !u16 {
+    const frame = try wsReadFrameOf(fd);
+    defer gpa.free(frame.payload);
+    if (frame.opcode != 0x8 or frame.payload.len < 2) {
+        std.debug.print("expected a close frame, got opcode {d}: {s}\n", .{ frame.opcode, frame.payload[0..@min(frame.payload.len, 300)] });
+        return error.NotAClose;
+    }
+    return std.mem.readInt(u16, frame.payload[0..2], .big);
+}
+
+/// The model answers on this box: a fixture it cannot load (the DeepSeek tiny on a 32 GB Mac) answers before any upgrade.
+fn modelServes() !bool {
+    var b: [512]u8 = undefined;
+    const warm = try request("POST", "/v1/completions", try completionBody(&b, "hi", 2, false));
+    defer gpa.free(warm);
+    return std.mem.startsWith(u8, warm, "HTTP/1.1 200");
+}
+
+test "server: a Responses WebSocket message sent as a binary frame is answered by an error frame and a 1003 close, never silence" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            if (!try modelServes()) return;
+            const fd = try wsConnect();
+            defer _ = std.c.close(fd);
+            const text = "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}";
+            // One masked binary frame (opcode 2), a zero mask.
+            try sendAll(fd, &.{ 0x82, 0x80 | @as(u8, @intCast(text.len)), 0, 0, 0, 0 });
+            try sendAll(fd, text);
+            const answer = try wsReadFrameOf(fd);
+            defer gpa.free(answer.payload);
+            if (answer.opcode != 0x1 or !std.mem.startsWith(u8, answer.payload, "{\"type\":\"error\",\"status\":400")) {
+                std.debug.print("binary turn answered by opcode {d}: {s}\n", .{ answer.opcode, answer.payload[0..@min(answer.payload.len, 300)] });
+                return error.NoErrorFrame;
+            }
+            if (try wsReadCloseCode(fd) != 1003) return error.NotUnsupportedData;
+        }
+    }.run);
+}
+
+test "server: a WebSocket upgrade the server cannot complete is answered 400, never closed bare" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            if (!try modelServes()) return;
+            const fd = try connect();
+            defer _ = std.c.close(fd);
+            // No Sec-WebSocket-Key.
+            try sendAll(fd, "GET /v1/responses HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n");
+            const answer = try readUntil(fd, null);
+            defer gpa.free(answer);
+            if (!std.mem.startsWith(u8, answer, "HTTP/1.1 400")) {
+                std.debug.print("upgrade without a key: {d} bytes: {s}\n", .{ answer.len, answer[0..@min(answer.len, 400)] });
+                return error.BareClose;
             }
         }
     }.run);

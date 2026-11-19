@@ -1467,78 +1467,93 @@ pub fn handleResponsesWebSocket(
     headers: []const u8,
     lm: *LoadedModel,
 ) !void {
-    ws_mod.handshake(stream, headers) catch |err| {
-        log.warn("WS handshake failed: {s}\n", .{@errorName(err)});
-        return;
+    ws_mod.handshake(stream, headers) catch |err| switch (err) {
+        error.WsHandshake => {
+            log.warn("WS handshake refused: no Sec-WebSocket-Key\n", .{});
+            return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "A WebSocket upgrade needs its Sec-WebSocket-Key header", 400);
+        },
+        else => return err,
     };
     log.info("WS /v1/responses connected\n", .{});
 
     var ws_conn = WsConnT.init(stream, &server_state.max_request_bytes);
     defer ws_conn.deinit(allocator);
+    var reason_buf: [123]u8 = undefined;
+    const end = wsServeTurns(allocator, stream, &ws_conn, lm) catch |err| wsEndOf(err, ws_conn.message_limit, &reason_buf);
+    if (end.code) |code| ws_conn.writeClose(code, end.reason) catch {};
+}
 
+/// How a Responses WebSocket ends: the close frame `handleResponsesWebSocket` sends, none when the peer is gone.
+const WsEnd = struct { code: ?u16, reason: []const u8 = "" };
+
+fn wsEndOf(err: anyerror, message_limit: usize, reason_buf: *[123]u8) WsEnd {
+    return switch (err) {
+        error.WsClosed => .{ .code = null },
+        error.WsProtocol => .{ .code = 1002, .reason = "protocol error" },
+        error.WsTooLarge => blk: {
+            const msg = payloadTooLargeMessage(reason_buf, null, message_limit);
+            log.warn("[http] WS 1009: {s}\n", .{msg});
+            break :blk .{ .code = 1009, .reason = msg };
+        },
+        else => blk: {
+            log.warn("WS /v1/responses ended: {s}\n", .{@errorName(err)});
+            break :blk .{ .code = 1011, .reason = "internal error" };
+        },
+    };
+}
+
+/// The frame loop, one iteration per inbound message, until the socket ends: every end returns or raises here, so
+/// one sender closes it.
+fn wsServeTurns(allocator: std.mem.Allocator, stream: *Conn, ws_conn: *WsConnT, lm: *LoadedModel) !WsEnd {
     var local_cache: WsLocalCache = .{ .gpa = allocator };
     defer local_cache.deinit();
 
-    var bridge: WsBridge = .{ .impl = &ws_conn, .sendTextFn = &wsBridgeSend, .allocator = allocator };
+    var bridge: WsBridge = .{ .impl = ws_conn, .sendTextFn = &wsBridgeSend, .allocator = allocator };
     defer bridge.reset();
 
-    // Frame loop — one iteration per inbound WS message.
     while (true) {
-        const msg = ws_conn.readMessage(allocator) catch |err| switch (err) {
-            error.WsClosed => return,
-            error.WsProtocol => {
-                ws_conn.writeClose(1002, "protocol error") catch {};
-                return;
-            },
-            error.WsTooLarge => {
-                var msg_buf: [123]u8 = undefined;
-                const msg = payloadTooLargeMessage(&msg_buf, null, ws_conn.message_limit);
-                log.warn("[http] WS 1009: {s}\n", .{msg});
-                ws_conn.writeClose(1009, msg) catch {};
-                return;
-            },
-            else => return,
-        };
+        const msg = try ws_conn.readMessage(allocator);
         defer allocator.free(msg.payload);
 
         switch (msg.opcode) {
-            .close => {
-                ws_conn.writeClose(1000, "") catch {};
-                return;
-            },
+            .close => return .{ .code = 1000 },
             .ping => {
                 try ws_conn.writePong(msg.payload);
                 continue;
             },
             .pong => continue,
             .text => {},
-            else => continue,
+            .binary => {
+                try wsSendErrorTurn(allocator, ws_conn, 400, "invalid_request_error", "A Responses WebSocket message is JSON in a text frame; a binary frame is not accepted");
+                return .{ .code = 1003, .reason = "binary frames are not accepted" };
+            },
+            else => return error.WsProtocol,
         }
 
         if (chat_mod.jsonNestingExceeds(msg.payload, chat_mod.max_json_nesting)) {
-            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "JSON nesting is too deep");
+            try wsSendErrorTurn(allocator, ws_conn, 400, "invalid_request_error", "JSON nesting is too deep");
             continue;
         }
         // Parse the request payload — must be {"type":"response.create", ...}
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, msg.payload, .{}) catch {
-            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "Invalid JSON in request body");
+            try wsSendErrorTurn(allocator, ws_conn, 400, "invalid_request_error", "Invalid JSON in request body");
             continue;
         };
         defer parsed.deinit();
         if (parsed.value != .object) {
-            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "Request must be a JSON object");
+            try wsSendErrorTurn(allocator, ws_conn, 400, "invalid_request_error", "Request must be a JSON object");
             continue;
         }
         const root = parsed.value.object;
         const type_val = root.get("type");
         if (type_val == null or type_val.? != .string or !std.mem.eql(u8, type_val.?.string, "response.create")) {
-            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "Expected type=response.create");
+            try wsSendErrorTurn(allocator, ws_conn, 400, "invalid_request_error", "Expected type=response.create");
             continue;
         }
         // The plan disallows stream/stream_options/background here — WS is
         // inherently streaming and stateless (no background jobs).
         if (root.get("stream") != null or root.get("stream_options") != null or root.get("background") != null) {
-            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "stream/stream_options/background are not allowed over WebSocket");
+            try wsSendErrorTurn(allocator, ws_conn, 400, "invalid_request_error", "stream/stream_options/background are not allowed over WebSocket");
             continue;
         }
 
@@ -1560,7 +1575,7 @@ pub fn handleResponsesWebSocket(
                 prev_history = sr.history;
             } else {
                 local_cache.evict(pid);
-                try wsSendErrorTurn(allocator, &ws_conn, 404, "previous_response_not_found", "previous_response_id not found");
+                try wsSendErrorTurn(allocator, ws_conn, 404, "previous_response_not_found", "previous_response_id not found");
                 continue;
             }
         }
@@ -1575,7 +1590,7 @@ pub fn handleResponsesWebSocket(
             if (root.get("input")) |input_v| {
                 if (orphanFunctionCallOutputId(input_v, prev_history)) |_| {
                     local_cache.evict(pid);
-                    try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "function_call_output references a missing call_id");
+                    try wsSendErrorTurn(allocator, ws_conn, 400, "invalid_request_error", "function_call_output references a missing call_id");
                     continue;
                 }
             }
@@ -1598,7 +1613,7 @@ pub fn handleResponsesWebSocket(
         if (kept) |sr| local_cache.put(sr) catch sr.deinit();
         turn_result catch |err| {
             log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
-            wsGenerationErrorTurn(allocator, &ws_conn, err) catch {};
+            wsGenerationErrorTurn(allocator, ws_conn, err) catch {};
             continue;
         };
 
