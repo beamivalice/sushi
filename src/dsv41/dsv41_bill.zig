@@ -89,8 +89,7 @@ pub fn slotRing(config: *const model_mod.ModelConfig, kv_bits: u64) ?u64 {
 }
 
 pub fn neutralChunkWidth(config: *const model_mod.ModelConfig) ?u32 {
-    _ = config;
-    return dsv41_config.prefill_width;
+    return config.prefillStartWidth();
 }
 
 pub fn diskTokenBytes(config: *const model_mod.ModelConfig, kv_bits: u64) ?u64 {
@@ -109,11 +108,11 @@ pub fn memoryContext(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling
 
 /// The width line of the load log: DeepSeek starts at its own prefill width and says when memory sized it down.
 pub fn prefillChunkLoadLine(config: *const model_mod.ModelConfig, buf: []u8, pinned: u32, launch: usize) ?[]const u8 {
-    _ = config;
-    if (launch <= dsv41_config.prefill_width) return null;
-    if (pinned == dsv41_config.prefill_width)
+    const start = config.prefillStartWidth();
+    if (launch <= start) return null;
+    if (pinned == start)
         return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (DeepSeek's default width; --prefill-chunk overrides)\n", .{pinned}) catch null;
-    return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from DeepSeek's {d}; --prefill-chunk overrides)\n", .{ pinned, dsv41_config.prefill_width }) catch null;
+    return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from DeepSeek's {d}; --prefill-chunk overrides)\n", .{ pinned, start }) catch null;
 }
 
 /// `dsv41_borrow.headroom_fn`: the one live headroom (`bills.headroomNow`).

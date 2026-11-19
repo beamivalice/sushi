@@ -95,7 +95,7 @@ test "issue 105: a raised --wired-margin-gib lowers the declared ceiling only; t
     try t.expect(width >= 2048);
 }
 
-test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024, then 512, never wider" {
+test "DeepSeek prices its chunk per request: 8192 while the bill fits, then each narrower rung, never wider" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
@@ -108,32 +108,33 @@ test "DeepSeek prices its chunk per request: 2048 while the bill fits, then 1024
     const MB: u64 = 1 << 20;
     // What `--ssd-budget-gb 96` on the 128 GB M5 Max leaves to serve, as its pin measured it.
     const at96: u64 = 110_100 * MB - 97_080 * MB;
-    try t.expectEqual(@as(u32, 2048), bills.chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, 0, .{}));
-    // Its attention scores only the picked keys, so a long prompt keeps the width while the bill fits.
-    try t.expectEqual(@as(u32, 2048), bills.chooseRequestPrefillChunk(&config, 400_000, 2048, 16, at96, 512, 0, .{}));
+    // There, a short prompt's 8192 rows do not fit beside the load and 4096 do.
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, 0, .{}));
+    // Its attention scores only the picked keys, so a long prompt keeps each rung while that rung's bill fits.
     const long: u64 = 524_288;
-    const at1024 = bills.prefillNeededAtChunk(&config, long, 2048, 16, 1024, .{});
-    const only_narrow = bills.prefillNeededAtChunk(&config, long, 2048, 16, 512, .{});
-    try t.expect(bills.prefillNeededAtChunk(&config, long, 2048, 16, 2048, .{}) > at1024 and at1024 > only_narrow);
-    try t.expectEqual(@as(u32, 1024), bills.chooseRequestPrefillChunk(&config, long, 2048, 16, at1024, 512, 0, .{}));
-    try t.expectEqual(@as(u32, 512), bills.chooseRequestPrefillChunk(&config, long, 2048, 16, only_narrow, 512, 0, .{}));
+    var wider: u64 = std.math.maxInt(u64);
+    for (bills.PREFILL_CHUNK_LADDER) |rung| {
+        const need = bills.prefillNeededAtChunk(&config, long, 2048, 16, rung, .{});
+        try t.expect(need < wider);
+        wider = need;
+        try t.expectEqual(rung, bills.chooseRequestPrefillChunk(&config, long, 2048, 16, need, 512, 0, .{}));
+    }
     try t.expectEqual(@as(u32, 512), bills.chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, 512, .{}));
     var buf: [256]u8 = undefined;
-    try t.expectEqualStrings("Prefill chunk: per request, up to 2048 at a short prompt (the widest rung each request's bill admits); load-time fallback 512\n", bills.prefillChunkLoadLine(&buf, &config, 512, 8192).?);
+    try t.expectEqualStrings("Prefill chunk: per request, up to 8192 at a short prompt (the widest rung each request's bill admits); load-time fallback 512\n", bills.prefillChunkLoadLine(&buf, &config, 512, 8192).?);
     // The ladder never narrows the advertised context: it is priced at the 512 floor.
     try t.expectEqual(@as(u32, 1_000_000), bills.advertisedContextAt(&config, 16, 110_100 * MB, 97_080 * MB, 512));
 }
 
-test "a DeepSeek load's served warm forwards at the widest width a served request takes, 2048, not the global 8192" {
+test "a DeepSeek load's served warm forwards at the widest width a served request takes, its start width" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
     config.num_attention_heads = 64;
-    try t.expectEqual(@as(u32, 2048), bills.widestServedRung(&config));
-    const generic = prefill_plan.requestPrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, 1, config.has_sliding_window, config.isMoe(), config.longCtxGated(), 0);
-    try t.expect(generic > bills.widestServedRung(&config));
+    try t.expectEqual(@as(u32, 8192), bills.widestServedRung(&config));
+    try t.expectEqual(config.prefillStartWidth(), bills.widestServedRung(&config));
     // An operator's --prefill-chunk is what served requests take, so the warm follows it.
     const sr = @import("../settings_resolve.zig");
     const saved_width = sr.prefill_chunk.value;
@@ -263,7 +264,7 @@ test "DeepSeek's request bill takes its prefill working set out of the decoder p
     }
     // The widest rung is then always affordable, and a chunk boundary never steps down for the working set.
     const MB: u64 = 1 << 20;
-    try t.expectEqual(@as(u32, 2048), bills.chooseRequestPrefillChunk(&config, seq, 2048, 16, state + decode + config.expertPoolBytes(), 512, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&config, seq, 2048, 16, state + decode + config.expertPoolBytes(), 512, 0, .{}));
     var st: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), bills.adaptivePrefillWidth(&config, 16, seq, 64 * MB, 2048, 2048, &st));
     config.expert_borrow_bytes = 0;

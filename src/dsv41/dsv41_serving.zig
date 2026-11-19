@@ -142,7 +142,7 @@ pub fn warmAfter(scope: dsv41_model.WarmScope, engine_prefill: bool) struct { sa
 /// forward of the engine runs under the budget a request's forward has (`dsv41_borrow.enterWarm`), and one the bill does
 /// not cover fails the load.
 pub fn warmAll(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, scope: dsv41_model.WarmScope) !void {
-    return warmAllAt(self, mdl, stq, scope, dsv41_config.prefill_width);
+    return warmAllAt(self, mdl, stq, scope, dsv41_config.warm_width);
 }
 
 /// `warmAll` with the widest wide chunk it runs.
@@ -170,7 +170,7 @@ fn warmForwards(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqSt
         try warmSampledVerdict(mdl);
         try warmSerialSampler(mdl);
     }
-    if (after.split) if (stq) |st| try st.warmSplit(mdl, dsv41_config.prefill_width, false);
+    if (after.split) if (stq) |st| try st.warmSplit(mdl, dsv41_config.warm_width, false);
     if (after.wide) {
         var clock = expert_stream_mod.Clock.init();
         try warmWide(self, mdl, stq, width);

@@ -50,6 +50,8 @@ pub const Facts = struct {
     streams_rate_groups: bool = false,
     /// The width its prefill starts at, resolved per request by the admission bill; 0 = not a per-request arch of this kind.
     prefill_start_width: u32 = 0,
+    /// `prefill_start_width` by the GPU's name (`chip.chipBrand()`), where it is set.
+    prefill_start_width_of: ?*const fn (chip: []const u8) u32 = null,
     /// The MLX buffer pool its streamed decode holds, billed in the SSD-budget ledger.
     expert_pool_bytes: u64 = 0,
     /// Its routed experts always stream.
@@ -427,6 +429,13 @@ test "the arch gate text keeps the order its refusal has always listed" {
 test "a per-request-prefill arch states its start width and the others state none" {
     if (factsOfType("glm5_next")) |f| try std.testing.expectEqual(@as(u32, 2048), f.prefill_start_width);
     if (factsOfType("qwen4_exp")) |f| try std.testing.expectEqual(@as(u32, 0), f.prefill_start_width);
+    // DeepSeek's is the GPU's: its config reads it per chip and prices every request from it.
+    if (factsOfType("deepseek_v41")) |f| {
+        try std.testing.expect(f.prefill_start_width_of != null);
+        const c = model.ModelConfig{ .model_type = "deepseek_v41" };
+        try std.testing.expect(c.perRequestPrefillChunk());
+        try std.testing.expectEqual(f.prefill_start_width_of.?(@import("../chip.zig").chipBrand()), c.prefillStartWidth());
+    }
 }
 
 test "a config takes its arch's pack layout; an unclaimed one the default" {

@@ -207,7 +207,7 @@ Each is optional; shared code asks through the dispatch file named, never the ar
   struct in a build without the arch). `releaseOwn` and `serveDefaults` let a shared test build the arch's release geometry
   (`arch_config.releaseOwn`, `releaseServeDefaults`; its config text is the chat face's `fixtures.config`, `arch_config.fixtureConfig`), and a
   test that needs it skips where the arch is not built.
-- `Facts.prefill_start_width`, `.expert_pool_bytes`, `.streams_experts` and `.reads_own_source` (its weight loader checks the pack, so the
+- `Facts.prefill_start_width` (or `.prefill_start_width_of`, the width by the GPU's `chip.chipBrand()`), `.expert_pool_bytes`, `.streams_experts` and `.reads_own_source` (its weight loader checks the pack, so the
   shared EXL3 pack index check does not apply); `kvBytesPerToken`, `cacheLayoutNamespace` and `dsparkOn`, `config`-keyed through
   `arch/config.zig`. The arch's own weights and whether its pack ships its drafting head are the `load` slot's `weights` and `shipsHead`
   (`arch/load.zig`).

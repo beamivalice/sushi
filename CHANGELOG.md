@@ -9,6 +9,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Prefill on Sushi Cooler no longer waits between chunks**: the GPU sat idle at every 2048-row boundary while the
   host trimmed the engine's buffer pool and a resident DeepSeek chunk drained its last layers; the pool now carries to
   the next chunk and those layers finish behind it, for faster long-prompt prefill at the same output.
+- **DeepSeek prefills 8192 tokens a chunk by default**, stepping down to 4096, 2048, 1024 and 512 only where a
+  request's memory does not fit: 7.1% faster on a 29k-token prompt on an M5 Ultra, at the same output.
 - **Sushi Cooler keeps the GPU busy while its buffer pool trims**: a trim under a forward's memory cap waited for every
   queued pass instead of only those that free enough, so the GPU went idle until the host caught up.
 - **DeepSeek prefill bills 1.4 GB less a 2048-row chunk**: its Engram layers gate the n-gram rows in one kernel at every

@@ -386,10 +386,19 @@ State-only chunks (a chunk another chunk follows runs no decoder tail):
   unsynced chunk.
 
 Prefill width:
-- DeepSeek picks its chunk per request: 2048 (`dsv41_config.prefill_width`) while that request's bill fits, then 1024,
-  then 512. Load line: `Prefill chunk: per request, up to 2048 at a short prompt (...); load-time fallback N`. On an STQ
-  pack the lendable decoder pools cover the working set, so every request takes 2048 and a chunk that does not fit
-  releases pools instead of narrowing ([borrow](dsv41-memory.md#borrow)); the rungs below are the FP4 release's.
+- DeepSeek picks its chunk per request: 8192 (`dsv41_config.prefillWidthFor`, the start width by the GPU's name, the
+  arch's `Facts.prefill_start_width_of`) while that request's bill fits, then 4096, 2048, 1024 and 512. Load line:
+  `Prefill chunk: per request, up to 8192 at a short prompt (...); load-time fallback N`. On an STQ pack the lendable
+  decoder pools cover the working set, so every request takes the start width and a chunk that does not fit releases
+  pools instead of narrowing ([borrow](dsv41-memory.md#borrow)); the rungs below are the FP4 release's, measured at
+  the earlier 2048 start. One width serves every chip until a chip measures another; a per-chip row goes in
+  `prefillWidthFor` with its numbers here.
+  - M5 Ultra, STQ 1.75bpw resident, 29,006-token code prompt, second request, `--ctx-size 200000`, one boot a width,
+    `taskpolicy -a`, GPU lock, at `c995c297` (the same bytes at every width): 2048 3,027 tok/s, peak 131.6 GB; 4096
+    3,097, 134.9 GB; 8192 3,241 (+7.1%), 139.6 GB. Against mlx-serve's sushi_ds41 plugin on the same box and prompts
+    (2 samples a rung): 32k 3,232 / 3,256 against 2,987, 64k 3,132 / 3,186 against 2,958; at 2048 they were level.
+  - The restore-point grid stays at 8192 (a 16384 grid read 3,326 at 8192 rows): a restore at a mid-prompt divergence
+    would re-prefill up to 8k more tokens, and restores come every turn where a cold prefill comes once.
   - The advertised context is priced at 512, so the wider start leaves it unchanged (701440 at budget 96).
   - At 8k and longer a 2048 bill is the 1024 bill plus 2500 MiB (1024 more rows at 400 B a channel, x 5/4). At
     budget 96 (13020 MiB to serve) prompts up to ~413k take 2048, up to ~642k take 1024, and the rest take 512.

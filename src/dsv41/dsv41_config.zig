@@ -294,14 +294,22 @@ fn compRowBytes(width: u64) u64 {
 fn indexRowBytes(width: u64) u64 {
     return width / 2 + width / 32;
 }
-/// The prefill chunk a load runs at when its bill fits (an explicit `--prefill-chunk` outranks it): with CED the bulk of a
-/// chunk is the encoder's 20 layers, whose experts a wider chunk reads once for more rows.
-pub const prefill_width: u32 = 2048;
+/// The prefill chunk a request starts at on the GPU named `chip` (`chip.chipBrand()`), stepping down where its bill does
+/// not fit (an explicit `--prefill-chunk` outranks it): with CED the bulk of a chunk is the encoder's 20 layers, whose
+/// experts a wider chunk reads once for more rows. One width for every chip until a chip measures another.
+pub fn prefillWidthFor(chip: []const u8) u32 {
+    _ = chip;
+    return 8192;
+}
 
-/// Rows the router scores in one dense product on a prefill chunk (`dsv41_model.gateLogitsWide`): the load's chunk
-/// width, so a chunk of it pads nothing. A narrower forward pads one f32 tile a layer at a time (42 MB at the release
-/// width), inside the cap's margin: the measured chunk peaks the cap is fitted to are taken with it.
-pub const gate_tile_rows: u64 = prefill_width;
+/// The widest chunk the load's own kernel warm runs (`dsv41_serving.warmAll`); the served warm (`cooler_warm`) runs a
+/// request's widest rung.
+pub const warm_width: u32 = 2048;
+
+/// Rows the router scores in one dense product on a prefill chunk (`dsv41_model.gateLogitsWide`): a divisor of every
+/// ladder rung from 2048 up, so those chunks pad nothing. A narrower forward pads one f32 tile a layer at a time (42 MB
+/// at the release width), inside the cap's margin: the measured chunk peaks the cap is fitted to are taken with it.
+pub const gate_tile_rows: u64 = 2048;
 
 /// The MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
 pub const dsv41_pool_bytes: u64 = 1 << 30;
@@ -669,6 +677,13 @@ test "dsv41 forward cap: a wide forward's row term is the shape sum of its wides
         const got = k.c.forwardCap(k.rows, k.rows) - k.c.growthBytes(k.rows) - BILL_MARGIN_BYTES;
         errdefer std.debug.print("{d} rows: shape sum {d}\n", .{ k.rows, got });
         try testing.expectEqual(k.shapes, got);
+    }
+}
+
+test "dsv41 prefill width: a request starts at 8192 rows on every chip, the router's tile a whole number of times" {
+    for ([_][]const u8{ "Apple M5 Ultra", "Apple M5 Max", "Apple M1 Max", "" }) |chip| {
+        try testing.expectEqual(@as(u32, 8192), prefillWidthFor(chip));
+        try testing.expectEqual(@as(u64, 0), prefillWidthFor(chip) % gate_tile_rows);
     }
 }
 

@@ -72,7 +72,7 @@ pub fn snapshotBackoff(tok: anytype, prompt_ids: []const u32) ?usize {
 pub const config_facts: arch_config.Facts = .{
     .thinks_by_default = true,
     .reads_pair_major = true,
-    .prefill_start_width = config_file.prefill_width,
+    .prefill_start_width_of = config_file.prefillWidthFor,
     .expert_pool_bytes = config_file.dsv41_pool_bytes,
     .streams_experts = true,
     .renders_own_chat_template = true,

@@ -591,13 +591,17 @@ pub const ModelConfig = struct {
     /// once at load: a long session's load-time reserve (and, ungated, the hot-cache ask) pins
     /// every ordinary prompt to a narrow rung.
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
-        return self.longCtxGated() or self.swaRingTokens() > 0 or (arch_config.facts(self) orelse arch_config.Facts{}).prefill_start_width != 0;
+        const f = arch_config.facts(self) orelse arch_config.Facts{};
+        return self.longCtxGated() or self.swaRingTokens() > 0 or f.prefill_start_width != 0 or f.prefill_start_width_of != null;
     }
 
     /// The width a per-request arch's prefill starts at; only a chunk that no longer fits beside its
     /// KV steps down. GLM's native prefill paths are built for 2048 rows.
     pub fn prefillStartWidth(self: *const ModelConfig) u32 {
-        if (arch_config.facts(self)) |f| if (f.prefill_start_width != 0) return f.prefill_start_width;
+        if (arch_config.facts(self)) |f| {
+            if (f.prefill_start_width_of) |of| return of(@import("chip.zig").chipBrand());
+            if (f.prefill_start_width != 0) return f.prefill_start_width;
+        }
         if (self.longCtxGated()) return 4096;
         if (self.swaRingTokens() > 0) return 2048;
         return std.math.maxInt(u32);
