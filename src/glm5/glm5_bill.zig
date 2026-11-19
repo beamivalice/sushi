@@ -121,15 +121,24 @@ pub fn latentPartBytes(width: u64, bits: u8, itemsize: u64) [3]u64 {
     return .{ width * bits / 8, width / 64 * 2, width / 64 * 2 };
 }
 
-/// A native GLM request's latent and pooled-index capacity at its eventual length.
-pub fn glmCacheBytes(config: *const model_mod.ModelConfig, prompt_len: u64, max_tokens: u32, kv_bits: u64) u64 {
+/// Rows a DFlash2 request's verifier capacity holds past its reply's last (`glm5_dflash_reserve.reserve`).
+pub const dflash_rows_past_end: u64 = 3;
+
+/// The latent rows a native GLM request holds at its eventual length, a DFlash2 reservation's rows past the reply
+/// included.
+pub fn glmCacheRows(config: *const model_mod.ModelConfig, prompt_len: u64, max_tokens: u32, kv_bits: u64) u64 {
     const ctx = bills.getEffectiveContextLength(config);
-    const reserved = @max(prompt_len, @min(prompt_len +| max_tokens, ctx));
+    const past: u64 = if (config.dflash_loaded) dflash_rows_past_end else 0;
+    const reserved = @max(prompt_len, @min(prompt_len +| max_tokens, ctx)) +| past;
     // Native appendRows steps the latent and the pooled index (a row per four) separately in 256 rows, the latent's
     // on MLX's pages.
     const parts = latentPartBytes(config.mla_kv_lora_rank, if (kv_bits >= 16) 0 else @intCast(kv_bits), 2);
-    const rows = @max((reserved +| 1023) / 1024 * 1024, @import("../mlx_pages.zig").pagedRows(reserved, &parts));
-    return bills.sessionBytesPerToken(config, kv_bits) *| rows;
+    return @max((reserved +| 1023) / 1024 * 1024, @import("../mlx_pages.zig").pagedRows(reserved, &parts));
+}
+
+/// A native GLM request's latent and pooled-index capacity at its eventual length.
+pub fn glmCacheBytes(config: *const model_mod.ModelConfig, prompt_len: u64, max_tokens: u32, kv_bits: u64) u64 {
+    return bills.sessionBytesPerToken(config, kv_bits) *| glmCacheRows(config, prompt_len, max_tokens, kv_bits);
 }
 
 // Hooks: bills.zig reaches these through the arch's `bill` declaration; a hook returns null where it has no say.

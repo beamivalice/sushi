@@ -136,7 +136,7 @@ pub fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, a
     const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
     const held = request.residentBytes() +| assistant.cache.residentBytes();
     const budget = @import("glm5_bill.zig").dflashReserveBudget(config, request.offset, max_tokens, kv_bits, held);
-    _ = try @import("glm5_dflash_reserve.zig").reserve(request, request.offset + max_tokens + 3, budget, s);
+    _ = try @import("glm5_dflash_reserve.zig").reserve(request, request.offset + max_tokens + @import("glm5_bill.zig").dflash_rows_past_end, budget, s);
 }
 
 /// GLM's chunk grid: absolute multiples of its widest prefill chunk. A narrower chunk divides

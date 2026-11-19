@@ -260,3 +260,26 @@ test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the adve
         }
     }
 }
+
+test "GLM's DFlash2 reserve holds no more latent or pooled rows than its request bill's cache rows" {
+    const reserve = @import("glm5_dflash_reserve.zig");
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/glm5_config.json"));
+    defer cfg.deinit(std.testing.allocator);
+    cfg.dflash_loaded = true;
+    cfg.pinned_context = 1048576;
+    var bad: usize = 0;
+    for ([_]u64{ 16, 8, 6 }) |kv_bits| {
+        const parts = glm_bill.latentPartBytes(cfg.mla_kv_lora_rank, if (kv_bits == 16) 0 else @intCast(kv_bits), 2);
+        const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
+        for ([_][2]usize{ .{ 1000, 1048 }, .{ 3000, 1096 }, .{ 2008, 2400 }, .{ 30000, 2768 } }) |shape| {
+            const seq = shape[0];
+            const max_tokens: u32 = @intCast(shape[1]);
+            const lc = try reserve.capacity(seq, &parts);
+            const pc = try reserve.capacity(seq / 4, &.{pool_row});
+            const p = try reserve.plan(seq, lc, pc, &parts, cfg.indexer_head_dim, 2, seq + max_tokens + glm_bill.dflash_rows_past_end);
+            const billed_rows = glm_bill.glmCacheRows(&cfg, seq, max_tokens, kv_bits);
+            if (p.latent_capacity > billed_rows or p.pool_capacity * 4 > billed_rows) bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}

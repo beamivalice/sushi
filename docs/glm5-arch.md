@@ -136,7 +136,8 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
 - **A round's tree is cut to `min(output budget, positions left)` rows deep** (`proposeRoundAdaptive`): the verifier refuses an
   ancestry past the context, so a two-token tail never carries a three-row chain.
 - **Bills**: assistant weights at load; per request the sliding window ×4, captures per prefill row, three recurrent
-  checkpoints, the 256 MiB verification-scratch cap and 64 MiB. The MLA reservation is input + max_tokens + 3 rows:
+  checkpoints, the 256 MiB verification-scratch cap and 64 MiB. The MLA reservation is input + max_tokens + 3 rows
+  (`dflash_rows_past_end`, which the cache term `glmCacheRows` prices too):
   a request without max_tokens reserves its whole context window (946K rows: 11.3 GB BF16, 6.3 GB kv8).
   The reserve gate's budget sizes the cache from the request's own clamped rows, never from the generator's config
   copy (unpinned, it resolves a smaller auto context and under-budgets the reservation).
