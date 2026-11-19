@@ -391,8 +391,11 @@ test "server: a shutdown with the submit queue full ends the request waiting for
 }
 
 /// A stream the client stops reading after its first token, with its socket left open, an unload asked behind it and
-/// then another request: each of the two answers within `ms`. Returns their answers; the caller frees.
+/// then another request. The stall stays open until both answer: a hold by the stalled reader lasts until its socket
+/// shuts. `ms` budgets the reload's served warm; the request behind must claim its model within `claim_ms` of the
+/// unload's answer. Returns the two answers; the caller frees.
 fn behindAStalledReader(ms: u32) ![2][]u8 {
+    const claim_ms = 5_000;
     var b: [2][512]u8 = undefined;
     gpa.free(try request("POST", "/v1/completions", try completionBody(&b[0], "hi", 2, false)));
     const stalled = try connect();
@@ -421,16 +424,19 @@ fn behindAStalledReader(ms: u32) ![2][]u8 {
             _ = std.posix.poll(&none, 10) catch {};
         };
     }
-    while (!(asked[0].done.load(.acquire) and asked[1].done.load(.acquire)) and waited < ms) : (waited += 10) {
+    var unclaimed: u32 = 0;
+    while (!(asked[0].done.load(.acquire) and asked[1].done.load(.acquire)) and waited < ms and unclaimed < claim_ms) : (waited += 10) {
         var none = [_]std.posix.pollfd{};
         _ = std.posix.poll(&none, 10) catch {};
+        const behind_waits = asked[0].done.load(.acquire) and !asked[1].done.load(.acquire);
+        unclaimed = if (behind_waits and tinyState() == .unloaded) unclaimed + 10 else 0;
     }
     const wedged = !asked[1].done.load(.acquire);
     // The stall ends here either way, so the threads end.
     _ = std.c.shutdown(stalled, std.posix.SHUT.RDWR);
     for (threads) |t| t.join();
     if (wedged) {
-        std.debug.print("{d} ms behind a stalled reader: the unload done={any} ({s}), the request behind it done={any}\n", .{ waited, asked[0].done.load(.acquire), asked[0].out[0..@min(asked[0].out.len, 200)], asked[1].done.load(.acquire) });
+        std.debug.print("{d} ms behind a stalled reader: the unload done={any} ({s}), the request behind it done={any}, its model unclaimed {d} ms\n", .{ waited, asked[0].done.load(.acquire), asked[0].out[0..@min(asked[0].out.len, 200)], asked[1].done.load(.acquire), unclaimed });
         for (asked) |q| gpa.free(q.out);
         return error.WedgedByAStalledReader;
     }
@@ -438,10 +444,14 @@ fn behindAStalledReader(ms: u32) ![2][]u8 {
 }
 
 fn unloadPending() bool {
+    return tinyState() == .evicting;
+}
+
+fn tinyState() @import("model_registry.zig").LoadState {
     const reg = server_state.global_registry.?;
     reg.mutex.lockUncancelable(reg.io);
     defer reg.mutex.unlock(reg.io);
-    return reg.entries.get("tiny").?.state == .evicting;
+    return reg.entries.get("tiny").?.state;
 }
 
 test "server: a client that stops reading its stream gives up its model, so an unload behind it and every request behind that go on" {
@@ -450,7 +460,7 @@ test "server: a client that stops reading its stream gives up its model, so an u
     defer http_conn.send_limit_ms = was;
     try eachArch(4, .{}, struct {
         fn run() !void {
-            const got = try behindAStalledReader(10_000);
+            const got = try behindAStalledReader(120_000);
             defer for (got) |g| gpa.free(g);
             if (!std.mem.startsWith(u8, got[0], "HTTP/1.1 200")) return error.UnloadFailed;
             if (!std.mem.startsWith(u8, got[1], "HTTP/1.1 200")) return error.RequestBehindFailed;
@@ -464,7 +474,7 @@ test "server: an unload whose model stays held past its drain bound is refused b
     defer scheduler_mod.Scheduler.unload_drain_ms = was;
     try eachArch(4, .{}, struct {
         fn run() !void {
-            const got = try behindAStalledReader(10_000);
+            const got = try behindAStalledReader(120_000);
             defer for (got) |g| gpa.free(g);
             if (!std.mem.startsWith(u8, got[0], "HTTP/1.1 409") or std.mem.indexOf(u8, got[0], "model_busy") == null) return error.UnloadNotRefusedByName;
             if (!std.mem.startsWith(u8, got[1], "HTTP/1.1 200")) return error.RequestBehindFailed;
