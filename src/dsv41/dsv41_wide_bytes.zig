@@ -16,6 +16,25 @@ pub var expand_fused: ?bool = null;
 /// `engramGateOps`'s chain (the composed diagnostic). Null before a load: the kernel, the served default.
 pub var engram_fused: ?bool = null;
 
+/// Tests: the arms a shape sum reads, pinned. A load records them; unpinned, they follow the last load in the process,
+/// else this GPU's class, so a number taken on one box reads another elsewhere. `restore` puts them back.
+pub const ArmsPin = struct {
+    expand: ?bool,
+    engram: ?bool,
+
+    pub fn restore(self: ArmsPin) void {
+        expand_fused = self.expand;
+        engram_fused = self.engram;
+    }
+};
+
+pub fn pinArms(expand: bool, engram: bool) ArmsPin {
+    const was: ArmsPin = .{ .expand = expand_fused, .engram = engram_fused };
+    expand_fused = expand;
+    engram_fused = engram;
+    return was;
+}
+
 fn expandFused() bool {
     if (expand_fused) |on| return on;
     return sushi_exl3.kernels.gemmNaxOn();

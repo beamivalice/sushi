@@ -691,15 +691,21 @@ test "dsv41 borrow: the pool cap is the decode cap up to a verify block and the 
 
 test "dsv41 borrow: at the budget-115 and 117 geometries no chunk releases a pool, and under a 2048-row chunk's cap one goes" {
     const c = try cfg_mod.releaseStqForTest();
-    // Live at `--ssd-budget-gb 115` (280 slots a layer): the decoder pools a prefill may release, and the headroom there.
-    const pools = [_]u64{ 2_700_000_000, 2_700_000_000, 2_760_000_000 };
-    const headroom: u64 = 8_950_000_000;
-    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 31, 14766), headroom));
-    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), headroom));
-    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048 + 511, 1 << 20), headroom));
-    // At 117 the headroom is ~4.6 GB, over the 2.97 GB a 2048-row chunk holds on the engine; under it, one pool goes.
-    try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 4_600_000_000));
-    try testing.expectEqual(@as(?usize, 1), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 2_900_000_000));
+    // Both expand arms: the fused one serves on a matrix-unit GPU, the chain elsewhere.
+    for ([_]bool{ true, false }) |fused_expand| {
+        const pin = @import("dsv41_wide_bytes.zig").pinArms(fused_expand, true);
+        defer pin.restore();
+        errdefer std.debug.print("dsv41 borrow: fused expand {any}: a 2048-row chunk needs {d}\n", .{ fused_expand, prefillNeed(&c, true, 2048, 2048) });
+        // Live at `--ssd-budget-gb 115` (280 slots a layer): the decoder pools a prefill may release, and the headroom there.
+        const pools = [_]u64{ 2_700_000_000, 2_700_000_000, 2_760_000_000 };
+        const headroom: u64 = 8_950_000_000;
+        try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 31, 14766), headroom));
+        try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), headroom));
+        try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048 + 511, 1 << 20), headroom));
+        // At 117 the headroom is ~4.6 GB, over what a 2048-row chunk holds on the engine; under it, one pool goes.
+        try testing.expectEqual(@as(?usize, 0), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 4_600_000_000));
+        try testing.expectEqual(@as(?usize, 1), releaseCount(&pools, prefillNeed(&c, true, 2048, 2048), 2_900_000_000));
+    }
 }
 
 const PoolProbe = struct {

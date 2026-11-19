@@ -661,6 +661,9 @@ test "dsv41 forward cap: a wide forward's row term is the shape sum of its wides
     const rel_stq = try releaseStqForTest();
     const rel = try parseText(release_config);
     const Case = struct { c: *const Config, rows: u64, shapes: u64 };
+    // The served kernels' arms: the fused hyper-connection expand and the Engram gate kernel.
+    const pin = @import("dsv41_wide_bytes.zig").pinArms(true, true);
+    defer pin.restore();
     // The tiny: layer 2 (Engram, KV source and index owner) at its routed chain over six pools; its trace at three
     // pools reads these less the three spill pools. The release: layer 14 (the same roles) over ten pools (the STQ
     // pack's combined chain) or the FP4 experts' sorted gather.
