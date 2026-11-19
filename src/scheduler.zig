@@ -1754,7 +1754,7 @@ pub const Scheduler = struct {
             const assistant_bytes = try model_load.streamedAssistantBytes(self.io, self.allocator, owned.config, self.no_drafter, model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path), entry.path);
             const gate_budget = if (settings_budget > 0) settings_budget else model_load.ramDefaultFor(self.io, self.allocator, owned.config, entry.path, model_load.ramDefaultTierFor(owned.config).?, model_load.coldLoadVision(owned.config, true), assistant_bytes).bytes;
             const plan = try model_load.planExpertStreamingWith(self.io, self.allocator, owned.config, entry.path, gate_budget, model_load.coldLoadVision(owned.config, true), assistant_bytes);
-            break :blk model_load.streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, model_load.loadStagingBytes(owned.config, model_load.billedFillPeakBytes(owned.config, plan.cache.prefill_peak_bytes), plan.cache.workspace_bytes), plan.cache.bounce_bytes);
+            break :blk model_load.streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, model_load.loadStagingBytes(owned.config, model_load.billedFillPeakBytes(owned.config, plan.cache.prefill_peak_bytes), plan.cache.workspace_bytes), plan.cache.bounce_bytes, model_load.warmFloorChunkBytes(owned.config));
         } else if (try sched.coldLoadBill(.{
             .io = self.io,
             .allocator = self.allocator,

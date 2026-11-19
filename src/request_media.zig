@@ -1,6 +1,5 @@
 const std = @import("std");
 const fx = @import("request_media_fixtures_test.zig");
-const gpu_mem = @import("gpu_mem.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
@@ -24,7 +23,7 @@ const server_state = @import("server_state.zig");
 const generation_stream = @import("generation_stream.zig");
 const MropeData = server.MropeData;
 const WirePos = server.WirePos;
-const liveGpuMemoryCeiling = @import("bills.zig").liveGpuMemoryCeiling;
+const prefillHeadroomNow = @import("bills.zig").prefillHeadroomNow;
 const mapGenerationError = generation_stream.mapGenerationError;
 const testWire = server.testWire;
 const test_png_blue = server.test_png_blue;
@@ -498,8 +497,7 @@ pub fn visionEncodeBillBytes(config: *const model_mod.ModelConfig, images: []con
 
 /// What `scheduler_mod.vision_encode_available` reads on the inference thread, right before an encode.
 pub fn visionEncodeAvailable(config: *const model_mod.ModelConfig) u64 {
-    const active_mem = gpu_mem.activeBytes();
-    return liveGpuMemoryCeiling(config, active_mem) -| active_mem;
+    return prefillHeadroomNow(config, 0);
 }
 
 /// One media block of the expanded prompt, in prompt order.

@@ -198,8 +198,8 @@ test "DeepSeek's live headroom and its load fit each count the decode pool the l
     config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     config.max_position_embeddings = 1_048_576;
     // The parked pool is in MLX's cache, not its active bytes, so `ceiling - active` does not see it.
-    try t.expectEqual(@as(u64, 10 << 30) - config.expertPoolBytes(), dsv41_bill.dsv41HeadroomOf(10 << 30, &config));
-    try t.expectEqual(@as(u64, 0), dsv41_bill.dsv41HeadroomOf(1 << 20, &config));
+    try t.expectEqual(@as(u64, 10 << 30) - config.expertPoolBytes(), dsv41_bill.dsv41HeadroomFrom(10 << 30, 0, 0, &config));
+    try t.expectEqual(@as(u64, 0), dsv41_bill.dsv41HeadroomFrom(1 << 20, 0, 0, &config));
     // The load fit holds the pool in its staging term, so the serving term it adds is the bill without it.
     config.expert_borrow_bytes = 60_000_000_000;
     const bill = bills.prefillNeededAtChunk(&config, bills.expertStreamingPlannedSeq(&config), 2048, bills.defaultKvBits(&config), 512, .{});
@@ -213,7 +213,7 @@ test "DeepSeek's live headroom is the ceiling less the active bytes and the engi
     config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     const gb: u64 = 1 << 30;
     const without = dsv41_bill.dsv41HeadroomFrom(100 * gb, 60 * gb, 0, &config);
-    try t.expectEqual(dsv41_bill.dsv41HeadroomOf(40 * gb, &config), without);
+    try t.expectEqual(40 * gb - config.expertPoolBytes(), without);
     try t.expectEqual(without - 3 * gb, dsv41_bill.dsv41HeadroomFrom(100 * gb, 63 * gb, 0, &config));
     try t.expectEqual(without - 3 * gb, dsv41_bill.dsv41HeadroomFrom(100 * gb, 60 * gb, 3 * gb, &config));
     try t.expectEqual(@as(u64, 0), dsv41_bill.dsv41HeadroomFrom(100 * gb, 110 * gb, 0, &config));
@@ -396,4 +396,112 @@ test "DeepSeek: a request's decode state is billed as growth after admission onl
     const c = &config.dsv41.?;
     const state = (4096 + 512) * c.stateBytesPerToken() + c.stateFixedBytes(config.dsparkOn());
     try std.testing.expectEqual(state, bills.admissionCommitBytes(&config, 4096, 512, 16));
+}
+
+/// What the served warm reads as its headroom right after a streamed load took what it holds out of `avail` free bytes:
+/// the live headroom, whose footprint is the load's bytes, the decode pool among them parked as the engine's.
+fn warmHeadroomAfterLoad(config: *const model_mod.ModelConfig, ceiling: u64, avail: u64, weights: u64) u64 {
+    const held = bills.expertStreamingGateBytes(weights, config.expert_cache_bytes, model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes);
+    const pool = config.expertPoolBytes();
+    return bills.liveHeadroomFrom(config, bills.liveCeilingFrom(ceiling, held, avail -| held), held - pool, 0, pool);
+}
+
+test "DeepSeek: a streamed load the preflight and the fit admit on a 32 GB Mac leaves its served warm a prefill chunk, and a refused budget names one that fits" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.cooler_for_test = true;
+    // dsv41-memory, the 32 GB Mac at --ssd-budget-gb 18: trunk, MTP and vision 9.55 GB, workspace 3.70, bounce 0.54,
+    // cache 4.23 GB; decoder pools about 2.1 GB, which the warm cannot borrow.
+    const MiB: u64 = 1 << 20;
+    const weights: u64 = 9_550_000_000;
+    config.expert_cache_bytes = 4_230_000_000;
+    config.expert_workspace_bytes = 3_700_000_000;
+    config.expert_bounce_bytes = 540_000_000;
+    config.expert_borrow_bytes = 2_100_000_000;
+    config.expert_ssd_budget_bytes = 18 << 30;
+    const bits = bills.defaultKvBits(&config);
+    const top = bills.widestServedRung(&config);
+
+    // Free memory: every reading the preflight admits leaves the warm a chunk.
+    const ceiling = bills.wiredLimitFloor(28_000 * MiB, 32 << 30, 1 << 30);
+    const need = bills.loadRequirementBytes(&config, weights, true, 0);
+    var avail = need -| (2 << 30);
+    while (avail < need + (2 << 30)) : (avail += 50 * MiB) {
+        if (bills.memInsufficientForLoad(weights, avail, need)) {
+            // The refusal's budget fits what is free.
+            var smaller = config;
+            const fits = bills.streamedBudgetThatFits(config.expert_ssd_budget_bytes, need, avail);
+            smaller.expert_cache_bytes -= config.expert_ssd_budget_bytes - (fits << 30);
+            try t.expect(!bills.memInsufficientForLoad(weights, avail, bills.loadRequirementBytes(&smaller, weights, true, 0)));
+            continue;
+        }
+        try t.expect(bills.widestChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, ceiling, avail, weights)) > 0);
+    }
+
+    // The declared ceiling: every one the load's fit admits leaves the warm a chunk with memory to spare.
+    var c: u64 = 18_000 * MiB;
+    while (c < 24_000 * MiB) : (c += 50 * MiB) {
+        if (!bills.expertStreamingConfigFits(&config, c, 0, weights)) continue;
+        try t.expect(bills.widestChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, c, 1 << 40, weights)) > 0);
+    }
+
+    // The RAM default's budget is bounded by a request at the default context beside it, which leaves the warm a chunk.
+    try t.expect(bills.defaultRequestBill(&config) >= bills.warmFloorChunkBytes(&config));
+}
+
+/// A DeepSeek prompt of `seq` tokens on a machine with `avail` bytes free beside the load, as serve runs it: admission
+/// picks and bills its width, the per-chunk hook narrows the adaptive start, and before each forward the borrow covers
+/// its need from the headroom and the decoder pools. The forward the borrow cannot cover, if one is.
+fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, explicit: u32) ?struct { rows: u64, end: u64 } {
+    const c = &config.dsv41.?;
+    const bits = bills.defaultKvBits(config);
+    const max_tokens: u32 = 8192;
+    const available = bills.admissionAvailableFor(config, avail, 0, 0);
+    const billed = bills.chooseRequestPrefillChunk(config, seq, max_tokens, bits, available, 0, explicit, .{});
+    if (bills.prefillNeededAtChunk(config, seq, max_tokens, bits, billed, .{}) > available) return null;
+    const adaptive = explicit == 0;
+    const cap: u32 = @min(prefill_plan.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, seq, config.has_sliding_window, config.isMoe(), config.longCtxGated(), 0), config.prefillStartWidth());
+    var cur: u32 = @intCast(prefill_plan.firstChunkWidth(config, billed, cap, adaptive));
+    var st: mtp_plan.AdaptiveWidthState = .{ .width_min = @intCast(billed), .width_max = @intCast(billed) };
+    const loop_end = seq - 1;
+    var pos: u64 = 0;
+    while (pos < loop_end) {
+        const grown = c.stateFixedBytes(config.dsparkOn()) + pos * c.stateBytesPerToken();
+        if (adaptive) {
+            const next = bills.adaptivePrefillWidth(config, bits, pos, bills.liveHeadroomFrom(config, avail, grown, 0, 0), cur, cap, &st);
+            if (next != 0 and next < cur) cur = next;
+        }
+        var end = @min(pos + cur, loop_end);
+        if (end < loop_end and loop_end - end < prefill_plan.tailMergeMaxFor(cur, adaptive)) end = loop_end;
+        const cover = dsv41_bill.dsv41HeadroomFrom(avail, grown, 0, config) +| config.expert_borrow_bytes;
+        if (cover < c.forwardCapOn(true, end - pos, end)) return .{ .rows = end - pos, .end = end };
+        pos = end;
+    }
+    return null;
+}
+
+test "DeepSeek: on the 32 GB Mac's budget-18 ledger an admitted prompt is never refused by a forward's borrow, at the default width or --prefill-chunk 512" {
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.pinned_context = 1_000_000;
+    config.cooler_for_test = true;
+    // dsv41-memory, the 32 GB Mac at --ssd-budget-gb 18: the decoder pools hold about 2.1 GB.
+    config.expert_borrow_bytes = 2_100_000_000;
+    const MiB: u64 = 1 << 20;
+    for ([_]u64{ 4096, 4097, 4300, 5000, 6300, 8400, 20_000 }) |seq| {
+        var avail: u64 = 256 * MiB;
+        while (avail <= 8192 * MiB) : (avail += 16 * MiB) {
+            for ([_]u32{ 0, 512 }) |explicit| {
+                if (borrowRefusal(&config, seq, avail, explicit)) |r| {
+                    std.debug.print("a {d}-token prompt admitted with {d} MB free (--prefill-chunk {d}): the borrow refuses its {d}-row forward ending at {d}\n", .{ seq, avail / MiB, explicit, r.rows, r.end });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
 }

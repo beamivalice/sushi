@@ -24,6 +24,12 @@ pub fn activeBytes() usize {
     return active + engineInUse();
 }
 
+/// The engine's free pool buffers: held by the process, reusable only by the engine.
+pub fn engineFree() usize {
+    if (host_tier) return liveRead();
+    return mlx.engine.poolFree();
+}
+
 /// MLX's reclaimable pool plus the engine's free pool buffers: held by the process, reusable only by their owner.
 pub fn cacheBytes() usize {
     if (host_tier) return liveRead();

@@ -34,6 +34,14 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Concurrent requests on Sushi Cooler no longer fail with `PoolOverBudget` beside another request's prefill**:
   requests decoding together ran under the memory cap of the last prefill chunk, sized for that chunk alone; a
   decode of several requests now lifts it as a single request's step does (#106).
+- **A streamed load no longer reads every weight and then fails its warm-up**: an `--ssd-budget-gb` that left no room
+  for the first prefill chunk passed the memory check, loaded, then failed (`WarmChunkDoesNotFit`). The check now
+  counts that chunk and refuses such a budget before loading, naming one that fits.
+- **A long prompt no longer runs past the memory it was admitted with**: a cold prompt's first chunk started wider than
+  admission billed, and DeepSeek's borrow priced memory its own way, so a 4k DeepSeek prompt on a 32 GB Mac was refused
+  mid-prefill (`PrefillDoesNotFit`) and a long Qwen or MiMo prompt could hold up to 2 GB more than admitted. The first
+  chunk now runs at the admitted width, and admission, the chunk width, the warm-up, image encodes and the borrow read
+  one headroom.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many

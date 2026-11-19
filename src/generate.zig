@@ -1508,9 +1508,9 @@ pub const Generator = struct {
                 arch_state.headEntry(&xfm.arch_state),
                 @intCast(reserved_tokens),
             );
-            // Admission billed the request's top at `default_chunk`; the chunks before it start at
-            // the widest width and step down only where one no longer fits beside the reserved KV.
-            const start_chunk = if (width_is_adaptive) cap_adapt else 0;
+            // Admission billed the request at `default_chunk`; where the hook may, the first chunk starts wider and
+            // steps down only where it no longer fits.
+            const start_chunk = prefill_plan.firstChunkWidth(&xfm.config, cur_chunk, cap_adapt, width_is_adaptive);
             if (start_chunk > cur_chunk) {
                 cur_chunk = start_chunk;
                 adapt_state.width_min = @intCast(start_chunk);

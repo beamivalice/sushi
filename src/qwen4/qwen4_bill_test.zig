@@ -2084,3 +2084,33 @@ test "a Cooler prefill row bills the down GEMM's two planes in flight once, besi
     try t.expectEqual(@as(u64, 10 * (2560 + 640) * 2), r.inflight);
     try t.expectEqual(@max(@max(@max(r.gdn, r.attn), @max(r.moe, r.ple)), r.mtp) + r.trunk + r.inflight, r.peak());
 }
+
+test "Flash-Next: a streamed load the preflight and the fit admit leaves its served warm a prefill chunk" {
+    const t = std.testing;
+    var config = try model_mod.parseConfigFromJson(t.allocator, @embedFile("../fixtures/model-configs/qwen4_exp.json"));
+    defer config.deinit(t.allocator);
+    @import("../cooler_side.zig").forTest(&config, true);
+    config.expert_streaming = true;
+    config.pinned_context = 65_536;
+    const MiB: u64 = 1 << 20;
+    const weights: u64 = 5_850_000_000;
+    config.expert_cache_bytes = 11_450_000_000;
+    config.expert_workspace_bytes = 1 << 30;
+    config.expert_bounce_bytes = 512 * MiB;
+    const bits = defaultKvBits(&config);
+    const top = bills.widestServedRung(&config);
+    const held = bills.expertStreamingGateBytes(weights, config.expert_cache_bytes, model_load.loadStagingBytes(&config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes);
+
+    const ceiling = bills.wiredLimitFloor(28_000 * MiB, 32 << 30, 1 << 30);
+    const need = bills.loadRequirementBytes(&config, weights, true, 0);
+    var avail = need;
+    while (avail < need + (2 << 30)) : (avail += 50 * MiB) {
+        const headroom = bills.liveHeadroomFrom(&config, bills.liveCeilingFrom(ceiling, held, avail - held), held, 0, 0);
+        try t.expect(bills.widestChunkAdmitted(&config, bits, top, headroom) > 0);
+    }
+    var c: u64 = 18_000 * MiB;
+    while (c < 24_000 * MiB) : (c += 50 * MiB) {
+        if (!bills.expertStreamingConfigFits(&config, c, 0, weights)) continue;
+        try t.expect(bills.widestChunkAdmitted(&config, bits, top, bills.liveHeadroomFrom(&config, c, held, 0, 0)) > 0);
+    }
+}

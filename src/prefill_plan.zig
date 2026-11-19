@@ -394,6 +394,14 @@ pub fn shouldClearAllocatorCache(step: u32, last_clear: u32, interval: u32) bool
     return step -| last_clear >= interval;
 }
 
+/// PURE: the width a prefill's first chunk runs at, from the width admission billed. A cache that reserves the request's
+/// capacity grows it inside the first chunk, so the live headroom the width hook reads does not hold it yet: that chunk
+/// runs at the billed width, and the hook may widen from the next boundary. Elsewhere it starts at the widest, `cap`.
+pub fn firstChunkWidth(config: *const model_mod.ModelConfig, billed: usize, cap: usize, adaptive: bool) usize {
+    if (!adaptive or config.reservesKvCapacity()) return billed;
+    return @max(billed, cap);
+}
+
 /// PURE: does this request return MLX's allocator pool once, between its last
 /// prefill chunk and its first decode tick?
 ///

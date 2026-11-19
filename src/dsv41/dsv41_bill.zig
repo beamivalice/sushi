@@ -3,9 +3,7 @@ const std = @import("std");
 const settings_resolve = @import("../settings_resolve.zig");
 const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
-const mlx = @import("../mlx.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
-const gpu_mem = @import("../gpu_mem.zig");
 const dsv41_config = @import("dsv41_config.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
@@ -63,6 +61,15 @@ pub fn transientReserve(config: *const model_mod.ModelConfig, kv_bits: u64, chun
     return c.chunkCapOn(@import("../cooler_side.zig").onEngine(config), chunk, seq) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 
+/// A chunk's live price at `kv_len` (the width hook, the served warm): the forward it becomes with the tail it may absorb
+/// under the per-chunk width (`prefill_plan.tailMergeMax`), at the position that forward ends at.
+pub fn chunkTransientAt(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64) ?u64 {
+    _ = kv_bits;
+    const c = config.dsv41 orelse return null;
+    const rows = width +| (prefill_plan.tailMergeMax(@intCast(width)) - 1);
+    return c.forwardCapOn(@import("../cooler_side.zig").onEngine(config), rows, kv_len +| rows) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+}
+
 pub fn sessionBytes(config: *const model_mod.ModelConfig, kv_bits: u64) ?u64 {
     _ = kv_bits;
     const c = config.dsv41 orelse return null;
@@ -105,22 +112,18 @@ pub fn prefillChunkLoadLine(config: *const model_mod.ModelConfig, buf: []u8, pin
 
 /// `dsv41_borrow.headroom_fn`: what admission reads as available, live.
 pub fn dsv41Headroom(config: *const model_mod.ModelConfig) u64 {
-    const active_mem: u64 = gpu_mem.activeBytes();
-    return dsv41HeadroomFrom(bills.liveGpuMemoryCeiling(config, active_mem), active_mem, mlx.engine.poolFree(), config);
+    return bills.prefillHeadroomNow(config, 0);
 }
 
-/// PURE: `dsv41HeadroomOf` over the readings. `active` is `gpu_mem.activeBytes`, MLX's and the engine's bytes in use.
-/// `engine_free`, the engine's free pool buffers, comes off too: MLX makes what a borrow frees room for, and nothing on
-/// MLX's side can reclaim a buffer the engine holds.
+/// PURE: `dsv41Headroom` over the readings. `active` is `gpu_mem.activeBytes`, MLX's and the engine's bytes in use.
 pub fn dsv41HeadroomFrom(ceiling: u64, active: u64, engine_free: u64, config: *const model_mod.ModelConfig) u64 {
-    // On a Cooler load the parked pool IS the engine's free buffers under its cap: off once, at the larger of the two.
-    if (@import("../cooler_side.zig").onEngine(config))
-        return bills.admissionAvailable(ceiling, active) -| @max(engine_free, config.expertPoolBytes());
-    return dsv41HeadroomOf(bills.admissionAvailable(ceiling, active +| engine_free), config);
+    return bills.liveHeadroomFrom(config, ceiling, active, 0, engine_free);
 }
 
-/// The decode pool the ledger parks in MLX's cache is no part of its active bytes, so every live check (decode and
-/// prefill width) takes it off here once; `prefillNeededAtChunk` bills it once for the same reason.
-pub fn dsv41HeadroomOf(available: u64, config: *const model_mod.ModelConfig) u64 {
-    return available -| config.expertPoolBytes();
+/// Off every live headroom of a DeepSeek forward (`bills.liveHeadroomFrom`): the decode pool the ledger parks, no part
+/// of the active bytes, and the engine's free pool buffers, which nothing on MLX's side can reclaim. On a Cooler load
+/// the parked pool IS the engine's free buffers under its cap: off once, at the larger of the two.
+pub fn parkedBytes(config: *const model_mod.ModelConfig, engine_free: u64) u64 {
+    if (@import("../cooler_side.zig").onEngine(config)) return @max(engine_free, config.expertPoolBytes());
+    return engine_free +| config.expertPoolBytes();
 }

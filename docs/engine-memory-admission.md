@@ -88,6 +88,19 @@ bill function's output on the committed fixture configs of all served packs: a b
   frees none: on a 128 GB M5 at `iogpu.wired_limit_mb=125000` with the owner's apps open, DeepSeek at `--ssd-budget-gb
   108` (105 GiB active) took an 8,192-row warm chunk the 121 GiB floor admitted and the kernel panicked (r-65). A quiet
   box reclaims its file cache, so there the declared limit stands.
+- **One live headroom, one first width.** `bills.prefillHeadroomNow` (pure `liveHeadroomFrom`) is the live ceiling less
+  the active and staged bytes and what the arch parks (`parkedBytes`: DeepSeek's decode pool and the engine's free
+  buffers); the chunk-width hook, the widen re-check, the served warm, an image encode and DeepSeek's borrow read it,
+  and admission reads it plus the pool its bill holds (`admissionAvailableFor`). A DeepSeek chunk is priced as the
+  forward it becomes (`chunkTransientAt`: its width and the tail it may absorb, at the position it ends), as the borrow
+  prices it. Each once priced its own way, and a 4k DeepSeek prompt admitted at one width was refused by the borrow at
+  another. A cache that reserves runs its
+  first chunk at the width admission billed (`firstChunkWidth`): the reservation grows inside that chunk, out of the
+  hook's sight, and a cold start at the widest held up to ~2 GB past the bill. The hook widens from the next boundary.
+- **A streamed preflight proves the served warm**: `streamedLoadRequirementBytes` adds the warm's narrowest chunk with no
+  pool lent (`warmFloorChunkBytes`) and `LIVE_RESERVE_BYTES`, and the fit bills the larger of that chunk and a request
+  under the ceiling; a refusal names the ssd budget that fits. Without it a 32 GB Mac read every weight, then failed
+  `WarmChunkDoesNotFit`.
 - **A declared `iogpu.wired_limit_mb` is the resident Sushi preflight's available figure, as it is request admission's ceiling** (`effectiveSushiAvailableBytes`: wired limit less `--wired-margin-gib` or the GPU floor, less resident buffers, still under the working set), however much RAM is free. Free RAM alone read file cache and other apps' pages as gone and refused a 32 GB box whose declared limit admitted the load; free RAM above the ceiling passed a load whose every request was then refused, a 1-token context.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,

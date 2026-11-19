@@ -652,6 +652,12 @@ pub fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
     return prefillNeededAtChunk(config, @max(seq, chunk), 2048, defaultKvBits(config), chunk, .{}) -| config.expert_fill_peak_bytes -| config.expertPoolBytes();
 }
 
+/// What a streamed load must leave under its ceiling beside what it holds: a request's working set at the planned
+/// context, the served warm's narrowest chunk (which lends no decoder pool), and an image encode.
+fn expertStreamingBesideLoadBytes(config: *const model_mod.ModelConfig) u64 {
+    return @max(@max(expertStreamingServingBytes(config), warmFloorChunkBytes(config)), config.expert_vision_encode_bytes);
+}
+
 /// What a streamed load holds beside its ssd budget: the planned KV and, under `--vision`, its largest image encode.
 pub fn expertStreamingBesideBudgetBytes(config: *const model_mod.ModelConfig) u64 {
     return expertStreamingPlannedKvBytes(config) +| config.expert_vision_encode_bytes;
@@ -677,13 +683,13 @@ pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_byte
     const active_mem: usize = gpu_mem.activeBytes();
     const ceiling = currentGpuMemoryCeiling(config, active_mem);
     if (!expertStreamingConfigFits(config, ceiling, active_mem, resident_bytes)) {
-        log.err("the streamed load bills {d} MB (active {d}, resident {d}, cache {d}, workspace and bounce {d}, serving {d}) against {d} MB; lower --ssd-budget-gb\n", .{
-            (active_mem + resident_bytes + config.expert_cache_bytes + config.expert_bounce_bytes + model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes) + @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes)) >> 20,
+        log.err("the streamed load bills {d} MB (active {d}, resident {d}, cache {d}, workspace and bounce {d}, a request or the warm beside it {d}) against {d} MB; lower --ssd-budget-gb\n", .{
+            (active_mem + resident_bytes + config.expert_cache_bytes + config.expert_bounce_bytes + model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes) + expertStreamingBesideLoadBytes(config)) >> 20,
             active_mem >> 20,
             resident_bytes >> 20,
             config.expert_cache_bytes >> 20,
             (config.expert_bounce_bytes + model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes)) >> 20,
-            @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes) >> 20,
+            expertStreamingBesideLoadBytes(config) >> 20,
             ceiling >> 20,
         });
         return error.ExpertCacheDoesNotFit;
@@ -698,7 +704,7 @@ pub fn expertStreamingConfigFits(config: *const model_mod.ModelConfig, ceiling: 
         config.expert_cache_bytes,
         config.expert_bounce_bytes,
         model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes),
-        @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes),
+        expertStreamingBesideLoadBytes(config),
     );
 }
 
@@ -2493,7 +2499,9 @@ pub fn prefillChunkCost(
 fn chunkCostLending(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, lent: u64) u64 {
     const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
         statePerTokenBilled(config);
-    return (prefillTransientReserveAtKv(config, kv_bits, width, kv_len) -| lent) +| (width *| per_tok);
+    // An arch whose forward's cap grows with the position it ends at prices the chunk as the forward it becomes.
+    const transient = archHook("chunkTransientAt", u64, config, .{ kv_bits, width, kv_len }) orelse prefillTransientReserveAtKv(config, kv_bits, width, kv_len);
+    return (transient -| lent) +| (width *| per_tok);
 }
 
 /// The widest ladder width, at most `top`, whose first chunk fits `headroom` with no decoder pool borrowed: a load's
@@ -2503,6 +2511,12 @@ pub fn widestChunkAdmitted(config: *const model_mod.ModelConfig, kv_bits: u64, t
         if (w <= top and chunkCostLending(config, kv_bits, w, 0, 0) <= headroom) return w;
     }
     return 0;
+}
+
+/// What a load's served warm needs free beside the load for the ladder's narrowest chunk, lending no decoder pool: the
+/// warm runs before the server installs the borrow (`widestChunkAdmitted`).
+pub fn warmFloorChunkBytes(config: *const model_mod.ModelConfig) u64 {
+    return chunkCostLending(config, defaultKvBits(config), PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], 0, 0);
 }
 
 /// The decoder pools a prefill may still release for its working set (`ModelConfig.expert_borrow_bytes`); 0 where the arch lends none.
@@ -2562,18 +2576,35 @@ pub fn adaptivePrefillWidth(
     return next;
 }
 
-/// The live headroom one prefill chunk has to fit in: the GPU ceiling less what MLX's
-/// allocator holds, read once per chunk boundary after its `mlx_clear_cache`. The same
-/// expression `prefillAdmissionBill` compares against.
+/// The one live headroom of a forward: what a prefill chunk's width, the served warm, an image encode and DeepSeek's
+/// borrow all fit their working set in, and what admission compares against (`admissionAvailableFor`). Read once per
+/// chunk boundary after its `mlx_clear_cache`.
 pub fn prefillHeadroomNow(config: *const model_mod.ModelConfig, staged_host: u64) u64 {
     const active_mem: usize = gpu_mem.activeBytes();
     // The SSD write-through stages chunk blobs as host bytes behind a ~1 GiB permit that
     // `mlx_get_active_memory` does not count; on unified memory they are the same pool. Read at
     // the hook site (inference thread) and passed in.
-    return prefillHeadroomFrom(liveGpuMemoryCeiling(config, active_mem), active_mem, staged_host);
+    return liveHeadroomFrom(config, liveGpuMemoryCeiling(config, active_mem), active_mem, staged_host, gpu_mem.engineFree());
 }
 
-/// Pure half of `prefillHeadroomNow`.
+/// What an arch keeps parked beside its active bytes that no forward of it may take (DeepSeek's decode pool and the
+/// engine's free buffers); 0 elsewhere.
+fn parkedBytes(config: *const model_mod.ModelConfig, engine_free: u64) u64 {
+    return archHook("parkedBytes", u64, config, .{engine_free}) orelse 0;
+}
+
+/// PURE half of `prefillHeadroomNow`.
+pub fn liveHeadroomFrom(config: *const model_mod.ModelConfig, ceiling: u64, active: u64, staged_host: u64, engine_free: u64) u64 {
+    return prefillHeadroomFrom(ceiling, active, staged_host) -| parkedBytes(config, engine_free);
+}
+
+/// What admission compares a request's bill against: the live headroom, plus the decode pool the bill holds itself
+/// (`prefillNeededAtChunk`), so admission and every live check read one number.
+pub fn admissionAvailableFor(config: *const model_mod.ModelConfig, ceiling: u64, active: u64, engine_free: u64) u64 {
+    return admissionAvailable(ceiling, active) -| (parkedBytes(config, engine_free) -| config.expertPoolBytes());
+}
+
+/// The ceiling less what is in use and staged, before an arch's parked bytes (`liveHeadroomFrom`).
 pub fn prefillHeadroomFrom(ceiling: u64, active: u64, staged_host: u64) u64 {
     return ceiling -| active -| staged_host;
 }
@@ -2646,7 +2677,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     // now (#64). Read before the width is chosen: on a per-request arch the width is a function of it.
     const active_mem: usize = gpu_mem.activeBytes();
     const total_limit: u64 = liveGpuMemoryCeiling(config, active_mem);
-    const available = admissionAvailable(total_limit, active_mem);
+    const available = admissionAvailableFor(config, total_limit, active_mem, gpu_mem.engineFree());
 
     // A vision prefill chunks like text since issue #197 (the splice resumes
     // its row index across chunks), so it bills the chunk-bounded envelope —
@@ -6045,9 +6076,9 @@ test "bill pin: prefillChunkCost and the adaptive width" {
         1705423360, 5489439232, 512, 512, 0, 1, 512, 512,
         0, 1, 512, 1024, 0, 0, 2048, 2048,
         0, 0, 512, 1024, 0, 0, 2048, 4096,
-        0, 0, 1, 1, 2952876768, 11762606816, 512, 512,
+        0, 0, 1, 1, 1852108293, 11764500293, 512, 512,
         0, 1, 512, 512, 0, 1, 512, 1024,
-        0, 0, 1024, 1024, 0, 1, 512, 1024,
+        0, 0, 2048, 2048, 0, 0, 512, 1024,
         0, 0, 2048, 4096, 0, 0, 1, 1,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6462,16 +6493,24 @@ pub fn loadWarmupBytes(config: *const model_mod.ModelConfig, mtp_on: bool) u64 {
     return gib / 8 +| (if (mtp_on) gib * 9 / 8 else 0) +| config.dflash_load_transient_bytes;
 }
 
-/// A streamed load holds the cache, the whole-layer fill union and the bounce buffers beside the resident trunk.
-pub fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_peak_bytes: u64, bounce_bytes: u64) u64 {
-    return expertStreamingGateBytes(resident_bytes, cache_bytes, fill_peak_bytes, bounce_bytes) +| LOAD_SAFETY_NET_BYTES;
+/// A streamed load holds the cache, the whole-layer fill union and the bounce buffers beside the resident trunk; then its
+/// served warm needs its narrowest chunk (`warmFloorChunkBytes`) free past the live check's reserve.
+pub fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_peak_bytes: u64, bounce_bytes: u64, warm_chunk_bytes: u64) u64 {
+    return expertStreamingGateBytes(resident_bytes, cache_bytes, fill_peak_bytes, bounce_bytes) +| LOAD_SAFETY_NET_BYTES +| warm_chunk_bytes +| LIVE_RESERVE_BYTES;
 }
 
 /// Free memory a load demands: its billed weights, then the larger of the warmup transient plus the safety net and
 /// the requested context's admission bill (the warmup ends before any request allocates).
 pub fn loadRequirementBytes(config: *const model_mod.ModelConfig, weights_bytes: u64, mtp_on: bool, context_bill: u64) u64 {
-    if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes);
+    if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes, warmFloorChunkBytes(config));
     return weights_bytes +| @max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill);
+}
+
+/// PURE: the largest whole-GiB ssd budget below `budget` whose streamed load fits `avail`, a GiB of budget being a GiB
+/// of expert cache; 0 when none does.
+pub fn streamedBudgetThatFits(budget: u64, needed: u64, avail: u64) u64 {
+    const short = needed -| avail;
+    return if (short >= budget) 0 else (budget - short) >> 30;
 }
 
 /// Unknown figures (a failed memory query, an unmeasurable size) never block a load.
@@ -6592,12 +6631,14 @@ test "effectiveAvailableBytes prefers the per-process jetsam headroom when prese
     try std.testing.expectEqual(@as(u64, 0), effectiveAvailableBytes(0, 0, 0)); // both unknown → 0 (never blocks)
 }
 
-test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net" {
+test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net, and its warm's narrowest chunk past the live reserve" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const gib: u64 = 1 << 30;
     const cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true, .expert_cache_bytes = 12 * gib, .expert_fill_peak_bytes = 2 * gib, .expert_bounce_bytes = gib / 2 };
-    try testing.expectEqual(6 * gib + 12 * gib + 2 * gib + gib / 2 + gib, loadRequirementBytes(&cfg, 6 * gib, true, 0));
-    try testing.expectEqual(loadRequirementBytes(&cfg, 6 * gib, true, 0), streamedLoadRequirementBytes(6 * gib, 12 * gib, 2 * gib, gib / 2));
+    const warm = warmFloorChunkBytes(&cfg);
+    try testing.expect(warm > 0);
+    try testing.expectEqual(6 * gib + 12 * gib + 2 * gib + gib / 2 + gib + warm + LIVE_RESERVE_BYTES, loadRequirementBytes(&cfg, 6 * gib, true, 0));
+    try testing.expectEqual(loadRequirementBytes(&cfg, 6 * gib, true, 0), streamedLoadRequirementBytes(6 * gib, 12 * gib, 2 * gib, gib / 2, warm));
 }
 
 test "the exact load bill admits a MiMo load the flat 7 GiB headroom refused" {
@@ -6647,10 +6688,10 @@ test "bill pin: loadWarmupBytes" {
 
 test "bill pin: loadRequirementBytes" {
     try pinLoadConfigs("loadRequirementBytes", &.{
-        65632468992, 85899345920, 66840428544, 85899345920, 77309411328, 77309411328, 77309411328, 77309411328,
-        65766686720, 85899345920, 65766686720, 85899345920, 77309411328, 77309411328, 77309411328, 77309411328,
-        66060796416, 85899345920, 66060796416, 85899345920, 77309411328, 77309411328, 77309411328, 77309411328,
-        66571993088, 66571993088, 66571993088, 66571993088, 79456894976, 79456894976, 79456894976, 79456894976,
+        65632468992, 85899345920, 66840428544, 85899345920, 79304687616, 79304687616, 79304687616, 79304687616,
+        65766686720, 85899345920, 65766686720, 85899345920, 79961826912, 79961826912, 79961826912, 79961826912,
+        66060796416, 85899345920, 66060796416, 85899345920, 80023784960, 80023784960, 80023784960, 80023784960,
+        69456957221, 69456957221, 69456957221, 69456957221, 82341859109, 82341859109, 82341859109, 82341859109,
     }, struct {
         fn run(c: *const model_mod.ModelConfig, g: *PinGot) void {
             var streamed = c.*;
@@ -6666,10 +6707,10 @@ test "bill pin: loadRequirementBytes" {
 
 test "bill pin: streamedLoadRequirementBytes and expertStreamingGateBytes" {
     var got = PinGot{};
-    got.add(streamedLoadRequirementBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30));
+    got.add(streamedLoadRequirementBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30, 0));
     got.add(expertStreamingGateBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30));
     got.add(expertStreamingGateBytes(std.math.maxInt(u64), 1, 1, 1));
-    try pinEq("streamedLoadRequirementBytes", &.{ 20401094656, 19327352832, 18446744073709551615 }, got.slice());
+    try pinEq("streamedLoadRequirementBytes", &.{ 21474836480, 19327352832, 18446744073709551615 }, got.slice());
 }
 
 test "bill pin: rerankCoarseBill and the coarse head bytes" {
@@ -6720,4 +6761,52 @@ test "bill pin: fp8ExpertScratchBytes" {
     got.add(fp8ExpertScratchBytes(.fp8_individual, geometry));
     got.add(fp8ExpertScratchBytes(.mxfp4_individual, geometry));
     try pinEq("fp8ExpertScratchBytes", &.{ 1179648, 0 }, got.slice());
+}
+
+test "a long cold prompt admitted at the edge runs its first chunk at a width whose bill fits the memory admission read, on every arch's geometry" {
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const bits: u64 = 8;
+    inline for (.{ "qwen4", "mimo2", "glm5" }) |arch| if (archBuilt(arch)) {
+        const json: []const u8 = if (comptime std.mem.eql(u8, arch, "qwen4"))
+            @embedFile("fixtures/model-configs/qwen4_exp.json")
+        else if (comptime std.mem.eql(u8, arch, "glm5"))
+            @embedFile("fixtures/glm5_config.json")
+        else
+            arch_config.fixtureConfig("mimo2") orelse return error.SkipZigTest;
+        var config = try model_mod.parseConfigFromJson(t.allocator, json);
+        defer config.deinit(t.allocator);
+        config.pinned_context = 1_048_576;
+        const reserves = config.reservesKvCapacity();
+        for ([_]u64{ 65_536, 200_000 }) |seq| for ([_]bool{ false, true }) |mtp| {
+            const warm: WarmPrefix = .{ .mtp_on = mtp };
+            const max_tokens: u32 = 32_768;
+            // The least memory admission takes this prompt at, at its narrowest rung.
+            var least: u64 = std.math.maxInt(u64);
+            for (PREFILL_CHUNK_LADDER) |rung| {
+                const w = chooseRequestPrefillChunk(&config, seq, max_tokens, bits, std.math.maxInt(u64) / 4, 0, rung, warm);
+                least = @min(least, prefillNeededAtChunk(&config, seq, max_tokens, bits, w, warm));
+            }
+            const cap: u32 = @intCast(@min(prefill_plan.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, seq, config.has_sliding_window, config.isMoe(), config.longCtxGated(), 0), config.prefillStartWidth()));
+            var avail = least;
+            while (avail < least + 4096 * MiB) : (avail += 64 * MiB) {
+                const billed = chooseRequestPrefillChunk(&config, seq, max_tokens, bits, avail, 0, 0, warm);
+                if (prefillNeededAtChunk(&config, seq, max_tokens, bits, billed, warm) > avail) continue;
+                // As the chunk loop picks it: the first chunk's width, and the hook's word on it at a cold start.
+                var st: mtp_plan.AdaptiveWidthState = .{ .width_min = billed, .width_max = billed };
+                var width: u32 = @intCast(prefill_plan.firstChunkWidth(&config, billed, cap, true));
+                if (width > billed) width = adaptivePrefillWidth(&config, bits, 0, liveHeadroomFrom(&config, avail, 0, 0, 0), width, cap, &st);
+                // A cache that reserves grows its whole reservation inside the first chunk, which holds the request's
+                // stored terms beside its own transient; one that grows row by row holds the rows the hook priced.
+                const peak = if (reserves)
+                    prefillNeededAtChunk(&config, seq, max_tokens, bits, width, warm) - prefillTransientReserveAtKv(&config, bits, width, seq) + prefillTransientReserveAtKv(&config, bits, width, width)
+                else
+                    prefillChunkCost(&config, bits, width, 0);
+                if (peak > avail) {
+                    std.debug.print("{s}: {d} tokens, MTP {}, admitted with {d} MB at width {d}: the first chunk runs {d} rows and holds about {d} MB\n", .{ arch, seq, mtp, avail / MiB, billed, width, peak / MiB });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        };
+    };
 }

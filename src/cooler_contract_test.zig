@@ -3430,3 +3430,76 @@ test "cooler contract: a Cooler load under each KV precision and context extensi
         }
     }.run);
 }
+
+/// The served width hook (`bills.adaptivePrefillWidth`) on a box whose free memory is what admission read, less what
+/// the request has taken from the engine's pool since. Records the width each boundary chose.
+const AdmittedBox = struct {
+    cfg: *const @import("model.zig").ModelConfig,
+    bits: u64,
+    avail: u64,
+    in0: u64,
+    widths: [64]u32 = @splat(0),
+    n: usize = 0,
+
+    fn call(ctx: *anyopaque, pos: usize, cur: u32, cap: u32, st: *@import("mtp_plan.zig").AdaptiveWidthState) u32 {
+        const box: *AdmittedBox = @ptrCast(@alignCast(ctx));
+        const used = (mlx.engine.poolTotal() - mlx.engine.poolFree()) -| box.in0;
+        const w = @import("bills.zig").adaptivePrefillWidth(box.cfg, box.bits, pos, box.avail -| used, cur, cap, st);
+        if (box.n < box.widths.len) box.widths[box.n] = if (w != 0) w else cur;
+        box.n += 1;
+        return w;
+    }
+    fn confirm(_: *anyopaque, _: usize, _: u32) bool {
+        return false;
+    }
+};
+
+test "cooler contract: a cold prompt admitted at its 512-row bill holds no more than that bill through its prefill, under the served width hook" {
+    const Q = ContractOf("qwen4");
+    if (comptime !@hasDecl(Q, "prompt")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const bills = @import("bills.zig");
+    const ids = try Q.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(Q, dir, true);
+    defer _ = ld.close();
+    // Long enough that the request's reservation outgrows the cache's floor.
+    const len: usize = @intCast(@import("kv_cache.zig").KVCache.RESERVE_MIN_TOKENS + 1024);
+    const n: u32 = 16;
+    const long = try a.alloc(u32, len);
+    defer a.free(long);
+    for (long, 0..) |*t, i| t.* = ids[i % ids.len];
+    const c = &ld.config;
+    const bits = bills.defaultKvBits(c);
+    // Admission at the edge: the memory it reads is the 512-row bill, and the width it picks there.
+    const bill = bills.prefillNeededAtChunk(c, len, n, bits, 512, .{});
+    const picked = bills.chooseRequestPrefillChunk(c, len, n, bits, bill, 0, 0, .{});
+    const turn = arch_handle.turnFor(ld.h, c);
+    defer turn.end();
+    defer arch_sched.endRequest(c);
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    try ld.xfm.resetCache();
+    mlx.engine.close();
+    mlx.engine.trim();
+    const held0 = mlx.engine.poolTotal();
+    var box: AdmittedBox = .{ .cfg = c, .bits = bits, .avail = bill, .in0 = mlx.engine.poolTotal() - mlx.engine.poolFree() };
+    mlx.engine.resetPoolPeak(.process);
+    var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, long, n, .{ .temperature = 0.0 }, &.{}, .{
+        .pinned_prefill_chunk = picked,
+        .adaptive_chunk_width = true,
+        .chunk_width_hook = .{ .ctx = &box, .call = AdmittedBox.call, .confirm = AdmittedBox.confirm },
+    });
+    defer gen.deinit(a);
+    _ = try gen.next(a);
+    mlx.engine.close();
+    const held = mlx.engine.poolHeldPeak(.process) -| held0;
+    errdefer std.debug.print("a cold {d}-token prompt admitted at its {d} MB bill (width {d}), the hook's widths {any}: {d} MB held at the peak\n", .{ len, bill >> 20, picked, box.widths[0..@min(box.n, box.widths.len)], held >> 20 });
+    try testing.expect(held <= bill);
+}

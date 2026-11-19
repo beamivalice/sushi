@@ -64,6 +64,7 @@ pub const loadStagingBytes = bills.loadStagingBytes;
 pub const coarseHeadBytes = bills.coarseHeadBytes;
 const residentWeightBytes = bills.residentWeightBytes;
 pub const streamedLoadRequirementBytes = bills.streamedLoadRequirementBytes;
+pub const warmFloorChunkBytes = bills.warmFloorChunkBytes;
 const scheduler_mod = @import("scheduler.zig");
 const BudgetRevise = scheduler_mod.BudgetRevise;
 const LoadRequest = scheduler_mod.LoadRequest;
@@ -1889,6 +1890,19 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.err("Insufficient memory for requested context: {d} tokens at KV{d} and prefill chunk {d} need ~{d:.2} GiB including {d:.2} GiB of enabled model/vision/MTP weights, but only {d:.2} GiB is available. Maximum context with this memory budget: {d} tokens. Lower --ctx-size or free memory; --skip-mem-preflight, or \"Skip the memory check before loading\" in Settings, overrides this check.\n", .{
                     b.requested_context,                         b.kv_bits,                                 b.chunk,                                                                              @as(f64, @floatFromInt(needed)) / gb,
                     @as(f64, @floatFromInt(weights_bytes)) / gb, @as(f64, @floatFromInt(avail_bytes)) / gb, maximum,
+                });
+                return error.InsufficientMemory;
+            }
+            if (params.config.expert_streaming and params.config.expert_ssd_budget_bytes > 0) {
+                const budget = params.config.expert_ssd_budget_bytes;
+                log.err("Insufficient memory for an ssd budget of {d} GiB: the streamed load needs ~{d:.1} GB free (its {d:.1} GB, the served warm's narrowest prefill chunk {d:.2} GB and the {d} GiB live reserve) but only {d:.1} GB is available; --ssd-budget-gb {d} fits it (0 = none does), or free memory. --skip-mem-preflight (or \"Skip the memory check before loading\" in Settings) overrides this check.\n", .{
+                    budget >> 30,
+                    @as(f64, @floatFromInt(needed)) / gb,
+                    @as(f64, @floatFromInt(needed -| bills.warmFloorChunkBytes(params.config) -| bills.LIVE_RESERVE_BYTES)) / gb,
+                    @as(f64, @floatFromInt(bills.warmFloorChunkBytes(params.config))) / gb,
+                    bills.LIVE_RESERVE_BYTES >> 30,
+                    @as(f64, @floatFromInt(avail_bytes)) / gb,
+                    bills.streamedBudgetThatFits(budget, needed, avail_bytes),
                 });
                 return error.InsufficientMemory;
             }
