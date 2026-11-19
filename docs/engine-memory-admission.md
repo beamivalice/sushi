@@ -135,7 +135,9 @@ bill function's output on the committed fixture configs of all served packs: a b
   `effectiveAvailableBytes`, `memInsufficientForLoad` and `settleAvailableBytes` carry `?u64`, so buffers past a
   declared floor or the working set are refused by name (the bound in words), never waved through as an unknown 0.
 - A short reading waits for a just-freed process's memory (`settleAvailableBytes`, up to 2 s without growth) only while
-  free RAM is the bound: a reading a GPU limit binds (the working set, a declared wired limit) is refused at once.
+  free RAM is the bound: a reading a GPU limit binds (the working set, a declared wired limit) is refused at once. A read
+  that fails during the wait ends it on the last figure read, which still refuses: a short figure is never dropped for an
+  unread one.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
   `iogpu.wired_limit_mb`). The client-facing preflight message also names the Settings switch "Skip the memory check

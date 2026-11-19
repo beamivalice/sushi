@@ -2066,9 +2066,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             readings: bills.FitReadings = .{},
             last: ?bills.SushiAvailable = null,
             pub fn read(r: *@This()) ?u64 {
-                r.readings = bills.FitReadings.now(r.config);
-                r.last = r.readings.preflightAvailable(r.sushi);
-                return r.last.?.bytes;
+                const readings = bills.FitReadings.now(r.config);
+                const got = readings.preflightAvailable(r.sushi);
+                // An unread figure keeps the last one read, which the wait returns and a refusal is priced on.
+                if (got.bytes == null and r.last != null) return null;
+                r.readings = readings;
+                r.last = got;
+                return got.bytes;
             }
             pub fn sleep(r: *@This()) void {
                 std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};

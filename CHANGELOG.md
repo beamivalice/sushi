@@ -40,6 +40,8 @@ earlier history is mlx-serve's, in that project's changelog.
   the user to "use one of the options below" when it listed none.
 - **A refusal suggests a smaller pack only when one exists**: a request refused for memory always said to use a
   smaller pack (or a smaller model), and an SSD streaming memory refusal a smaller pack, even on a model's smallest.
+- **A load short of free RAM is refused even if a memory reading fails while it waits**: the preflight waited for
+  memory to come back after a short reading, and a failed reading then let the load through.
 - **No command fails silently**: every error that ends a `sushi` command prints a line saying what to do; `sushi kld` on
   a DeepSeek-V4.1 pack without `--ssd-budget-gb` used to exit with no message and now asks for it.
 

@@ -6821,8 +6821,9 @@ pub fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64)
 }
 
 /// A just-exited process returns its Metal memory over seconds: while a short reading keeps
-/// rising, poll every 500 ms; stop at enough, after 2 s without growth, or after 15 s. An unread figure ends the wait.
-/// Only free RAM comes back: a reading a GPU limit binds (`reader.freeRamBinds()` false) is final.
+/// rising, poll every 500 ms; stop at enough, after 2 s without growth, or after 15 s. An unread figure ends the wait on
+/// the last figure read, which still refuses. Only free RAM comes back: a reading a GPU limit binds
+/// (`reader.freeRamBinds()` false) is final.
 pub fn settleAvailableBytes(first: ?u64, needed: u64, reader: anytype) ?u64 {
     var avail = first;
     var stalled: u32 = 0;
@@ -6830,8 +6831,9 @@ pub fn settleAvailableBytes(first: ?u64, needed: u64, reader: anytype) ?u64 {
     while (avail) |now| : (polls += 1) {
         if (now >= needed or stalled >= 4 or polls >= 30 or !reader.freeRamBinds()) break;
         reader.sleep();
-        avail = reader.read();
-        if (avail) |next| stalled = if (next > now) 0 else stalled + 1;
+        const next = @as(?u64, reader.read()) orelse break;
+        stalled = if (next > now) 0 else stalled + 1;
+        avail = next;
     }
     return avail;
 }
@@ -7278,6 +7280,37 @@ test "on a Cooler load the coarse rerank head is billed as the pool holds it, ea
     // On MLX it is the bytes MLX allocates.
     @import("cooler_side.zig").forTest(&config, false);
     try testing.expectEqual(mtp_mod.rerankCoarseBytes(248320, 2560, 3), rerankCoarseBill(affine, &config, true, 3));
+}
+
+test "the settle wait is bounded on every reading shape, and a figure that was read short is never dropped for an unread one" {
+    const gib: u64 = 1 << 30;
+    const Fake = struct {
+        seq: []const ?u64,
+        i: usize = 0,
+        fn read(f: *@This()) ?u64 {
+            const v = f.seq[@min(f.i, f.seq.len - 1)];
+            f.i += 1;
+            return v;
+        }
+        fn sleep(_: *@This()) void {}
+        fn freeRamBinds(_: *@This()) bool {
+            return true;
+        }
+    };
+    // A reading that drops stalls the wait, which ends on the last (lowest) reading.
+    var drop = Fake{ .seq = &.{ 60 * gib, 60 * gib, 60 * gib, 60 * gib, 200 * gib } };
+    try testing.expectEqual(@as(?u64, 60 * gib), settleAvailableBytes(69 * gib, 100 * gib, &drop));
+    // A reading that swings up and down never stalls four times running: the 30-poll cap ends it.
+    var swing_seq: [64]?u64 = undefined;
+    for (&swing_seq, 0..) |*v, i| v.* = if (i % 2 == 0) 60 * gib else 70 * gib;
+    var swing = Fake{ .seq = &swing_seq };
+    _ = settleAvailableBytes(69 * gib, 100 * gib, &swing);
+    try testing.expect(swing.i <= 30);
+    // A short figure, then a read that fails: the preflight still refuses on the figure it read.
+    var lost = Fake{ .seq = &.{ 80 * gib, null } };
+    const after = settleAvailableBytes(69 * gib, 100 * gib, &lost);
+    try testing.expectEqual(@as(?u64, 80 * gib), after);
+    try testing.expect(memInsufficientForLoad(10 * gib, after, 100 * gib));
 }
 
 test "bf16 streaming registry gate uses resident plan not checkpoint disk size" {
