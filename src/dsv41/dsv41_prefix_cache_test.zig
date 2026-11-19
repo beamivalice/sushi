@@ -1207,7 +1207,9 @@ test "DeepSeek live rollback: the state rolled back to each kept point is a full
         try testing.expectEqual(t, idx);
         try live.rollback(a, net.m, idx, &prompt);
         try testing.expectEqual(t + 1, live.points.items.len);
-        try testing.expect(!live.ready);
+        // Open for the request, the turn up to the point still recorded.
+        try testing.expect(live.open);
+        try testing.expectEqualSlices(u32, turn[0..target], live.tokens);
 
         var got = try dsv41_prefix.capture(a, net.m, target);
         defer got.deinit(a);
@@ -1455,6 +1457,54 @@ test "DeepSeek live rollback: another conversation, a replaced state or a point 
 
 // A cancelled request publishes its live record when the scheduler culls it, before the next exclusive request is
 // admitted (`cullDecodingWith`); its tokens are never paired with that request's state, whatever happens to it.
+test "DeepSeek live rollback: a follow-up cancelled in its prefill after rolling the record back leaves the last turn's points to its retry and to the next handover (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var first_buf: [flush_first_len]u32 = undefined;
+    var gen: [40]u32 = undefined;
+    const first = flushTurnTokens(&net, &first_buf, &gen);
+    var next: [flush_first_len + 40 + 30]u32 = undefined;
+    @memcpy(next[0..flush_first_len], first);
+    @memcpy(next[flush_first_len..][0..40], &gen);
+    for (next[flush_first_len + 40 ..], 0..) |*t, i| t.* = (net.ids[(i * 5 + 2) % net.ids.len] + 9) % 90;
+    var other: [300]u32 = undefined;
+    for (&other, 0..) |*t, i| t.* = (net.ids[(i * 3 + 1) % net.ids.len] + 11) % 90;
+    for ([_]bool{ false, true }) |handover| {
+        errdefer std.debug.print("DeepSeek live rollback: {s}\n", .{if (handover) "the handover" else "the retry"});
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = buf[0..try tmp.dir.realPath(io, &buf)];
+        var want_end: SSMCheckpoint = undefined;
+        var want_thought: SSMCheckpoint = undefined;
+        var hc = try dsv41SplitCache(io, base, "dsv41-cancelled-rollback", &net, 128);
+        defer hc.deinit();
+        try flushTurn(&net, &hc, first, &gen, &want_end, &want_thought);
+        defer want_end.deinit(testing.allocator);
+        defer want_thought.deinit(testing.allocator);
+        // The follow-up rolls the live state back to the thought point, prefills a chunk and is cancelled: no publish.
+        const res = try dsv41Lookup(&hc, &net, &next);
+        try testing.expectEqual(@as(usize, flush_thought), res.matched);
+        try testing.expect(hc.last_restored_live);
+        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[flush_thought .. flush_thought + 20], .last));
+        if (!handover) {
+            const again = try dsv41Lookup(&hc, &net, &next);
+            try testing.expectEqual(@as(usize, flush_thought), again.matched);
+            try testing.expect(hc.last_restored_live);
+            continue;
+        }
+        _ = try dsv41Lookup(&hc, &net, &other);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        try testing.expectEqualSlices(u32, &.{ 512, flush_prompt_end, flush_thought }, hc.disk.?.entries.items[0].ssm_positions);
+        try expectPointOnDisk(&hc, &net, &want_thought);
+    }
+}
+
 test "DeepSeek live rollback: a cancelled request's record, published at the cull, never serves a request that continues it from the next one's state (DSV41_TINY)" {
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();

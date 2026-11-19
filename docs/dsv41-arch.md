@@ -1148,6 +1148,8 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   or a row buffer exceeds what the prompt's own state would be billed with its quarter (`liveRowsFit`): the live rows
   past the point stay allocated, so they must fit that bill. The admission reserve adds 8 sets of fixed rings
   (`dsv41CheckpointReserve`). Log: `[dsv41-prefix] reused N of M prompt tokens from the live state`.
+  The rollback keeps the record's tokens up to the point (`Live.open`): a follow-up cancelled or failed before it
+  publishes leaves the last turn's points, which its retry rolls back to again and a handover flushes to SSD.
 - **One decode state is resident, and the slot running holds it** (`dsv41_model.Request`, `bind`): a slot's first
   forward takes the state the model parked, the slot's request bills it (`sched.requestBytes`), and its end parks it
   again (`Request.reset`), where the model bills it (`dsv41StateBytes`). The rollback above runs on the parked state
@@ -1166,6 +1168,8 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   (`writeEndPoint`); the request keeps its restore position (`Request.rows_base`), so its write-through links the
   stored entry's row segments below it as at one row. A next turn restores from SSD at the position a one-row load rolls back to, ~25 ms for 1.5k
   tokens on the M5 against none from RAM. A per-request record would win that back for ~50 MB a running request.
+  The tier keeps no point under `MIN_PERSIST_TOKENS` (512), so a next turn of a conversation shorter than that reuses
+  nothing on a joined load, where a one-row load rolls its live record back.
 - **A fully resident load joins rows** (`dsv41_sched.coolerRows`, the owner's call: batching for full residence, never
   for streaming; on Sushi Cooler only, so the opt-out to MLX keeps one request at a time): when the expert plan holds
   every routed expert (`ModelConfig.expert_resident`, from
@@ -1263,7 +1267,9 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   (bf16, QAT on and off) over odd-width prefill chunks, decode, a verify round and its rollback, and the state they end
   in, are identical bytes, from RAM and from an SSD file written by one tier and read by a fresh one. A restore off the
   cold run's chunk grid differs from cold at rounding level, as on every arch (the GPU forward is not
-  batch-invariant); the Generator test restores at the prompt-end snapshot.
+  batch-invariant); the Generator test restores at the prompt-end snapshot. On Sushi Cooler a restore can change whole
+  tokens, by design: a restored prompt prefills its rest as other chunks (CED's split and the decode-width rows a
+  short rest takes are not the cold run's), so a test of a restore holds it to a twin restored the same way, not cold.
 - **A point's file is not byte-stable across round mixes; its continuation is**: `captureStateShared` keeps the
   whole window ring and the draft stage rings, dead slots too, so the rows a verify cut back stay in them. Of 1,768
   (lead, width, accepted) combinations on the tiny pack, 1,664 gave another state digest and all 1,768 the same

@@ -22,6 +22,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A DeepSeek request cancelled as its prompt finished no longer hands its next turn another conversation's cache**:
   it saved its prompt cache after the next request had taken the model's state, so the conversation's next turn
   continued from the other conversation's state and the SSD cache could store it under the wrong prompt.
+- **A DeepSeek follow-up cancelled or failed before it answered no longer costs its retry the last turn's cache**: the
+  retry, or the next conversation's save to SSD, found the last turn's latest restore points gone and prefilled from
+  the last grid point again, up to 8,192 tokens back.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many

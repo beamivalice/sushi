@@ -210,6 +210,9 @@ pub const Live = struct {
     base: usize = 0,
     /// A request finished over it; false while one is running, whose state is moving past the points.
     ready: bool = false,
+    /// A request rolled the record back and runs past its last point: the tokens and points up to that point still
+    /// stand, for the request's retry and a flush, until it publishes its own.
+    open: bool = false,
 
     pub fn deinit(self: *Live, allocator: std.mem.Allocator) void {
         self.clear(allocator);
@@ -222,6 +225,7 @@ pub const Live = struct {
         allocator.free(self.tokens);
         self.tokens = &.{};
         self.ready = false;
+        self.open = false;
         self.base = 0;
     }
 
@@ -241,7 +245,7 @@ pub const Live = struct {
 
     /// Keeps the fixed arrays of `cp`, a point of the request now running, and drops the shallowest past the cap.
     pub fn keep(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint, disk_id: ?u64) !void {
-        if (self.ready) self.clear(allocator);
+        if (self.ready and !self.open) self.clear(allocator);
         const n_slots = model.slotCount(m);
         if (cp.layers.len != 2 * n_slots) return error.Dsv41CheckpointMismatch;
         while (self.points.items.len > 0 and self.points.items[self.points.items.len - 1].pos >= cp.pos) {
@@ -316,6 +320,7 @@ pub const Live = struct {
         self.media_start = media_start;
         self.state_id = st.id;
         self.ready = true;
+        self.open = false;
     }
 
     /// The deepest point a request over `prompt` may roll the live state back to: at most `media_cap` tokens in,
@@ -338,16 +343,20 @@ pub const Live = struct {
     }
 
     /// Rolls the live state back to point `idx`; the points past it go, and the record is open until its request publishes.
+    /// The tokens up to the point stay: a request cancelled or failed before it publishes leaves the record as of the
+    /// point, which its retry rolls back to again and a handover flushes.
     pub fn rollback(self: *Live, allocator: std.mem.Allocator, m: *model.Model, idx: usize, prompt: []const u32) !void {
         const p = self.points.items[idx];
+        const kept = try allocator.dupe(u32, self.tokens[0..p.pos]);
+        errdefer allocator.free(kept);
         try model.rollbackState(m, p.slots, p.pos, prompt);
         while (self.points.items.len > idx + 1) {
             var q = self.points.pop().?;
             freePoint(allocator, &q);
         }
         allocator.free(self.tokens);
-        self.tokens = &.{};
-        self.ready = false;
+        self.tokens = kept;
+        self.open = true;
         self.base = p.pos;
     }
 };
@@ -673,7 +682,7 @@ pub fn writeDecodePointDsv41(self: *pc.HotPrefixCache, cache: *transformer.KVCac
 /// record (a RAM tier, checkpoints off) keeps none, and neither does a state that stands elsewhere.
 pub fn keepEndPointDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, pos: usize) !bool {
     const live = liveOf(self);
-    if (live.ready or live.points.items.len == 0) return false;
+    if ((live.ready and !live.open) or live.points.items.len == 0) return false;
     const st = (try model.currentState(m)) orelse return false;
     if (st.n != pos or live.points.items[live.points.items.len - 1].pos >= pos) return false;
     const handled = Handled.begin();
