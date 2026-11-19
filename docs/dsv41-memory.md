@@ -368,16 +368,21 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   either way) but as one ~9 GB/s read before the first decode step (~0.3 s a layer) instead of per-token stalls,
   which would also feed DSpark's measured round cost (a cold cache once drove it off wide verifies). Against a 2k-20k
   token decode at ~65 ms a token that is 0.02-0.2% a layer.
+- Released pools are a lease of the request whose prefill runs over them (`Model.lessee`, `dsv41_borrow.Lease`): only
+  its own decode-width forward (one row, a joined row or a DSpark verify) or its end reads them back. A joined row of
+  another request decoding between its chunks runs over them released, never reading back what the next chunk releases.
 - A release or a restore that fails leaves the layer as it was, and the borrow stops at the first failure: a released
   layer always has the union workspace, so a release that cannot make it takes its pool back. One whose take-back
   failed too is healed before the next forward (workspace, else pool), or that forward is `ReleasedLayerHasNoUnion`.
 - Log lines: `[dsv41-borrow] released layers a..39 (X GB) for a N-row forward at P: need, headroom before -> after,
   unwired in T ms` and `[dsv41-borrow] restored n layers (X GB) in T ms before decode`.
 
-Why it never over-commits: admission proved `state + max(decode, prefill - lendable) <= available` against live
-memory, and the request runs alone (`exclusive`). During the prefill each forward runs only once `headroom >= need`,
-counting the bytes just released; its transient is freed before the next, so the state it promised later still fits.
-A restore gives back exactly the bytes released, so the decode finds what admission promised it.
+Why it never over-commits: admission proved each request's `state + max(decode, prefill - lendable) <= available`
+against live memory, beside the requests already holding theirs. During the prefill each forward runs only once
+`headroom >= need`, counting the bytes just released; its transient is freed before the next, so the state it promised
+later still fits. A joined row decoding between the chunks runs under its own billed cap (`Config.joinedCap`) over the
+leased pools released, reading its picks through the union workspace the first release paid for: it takes no byte the
+prefill counted. A restore gives back exactly the bytes released, so the decode finds what admission promised it.
 
 **Restore points** (`dsv41_prefix.captureShared`, `HotPrefixCache.writeThroughDsv41`): SSD-first, a point at or past the
 tier's 512-token floor shares the request's compressed rows and index keys (views, no copy), and the prefill

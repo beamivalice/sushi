@@ -1,8 +1,8 @@
 //! DeepSeek-V4.1's prefill takes its working set from the expert cache. A forward that does not fit the free memory
 //! first releases whole decoder-layer pools, latest layer first: under CED those layers run only a chunk's last
-//! `window` rows, and a released layer's picks are read into the union workspace. The first decode forward after the
-//! prefill reads the pools back. Every forward runs under a transient cap (`Config.forwardCap`), which is what admission
-//! bills: a request's state, a decode forward's cap and the part of a prefill's the pools cannot cover.
+//! `window` rows, and a released layer's picks are read into the union workspace. The request's first decode forward
+//! reads the pools back (`Lease`). Every forward runs under a transient cap (`Config.forwardCap`), which is what
+//! admission bills: a request's state, a decode forward's cap and the part of a prefill's the pools cannot cover.
 const std = @import("std");
 const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
@@ -14,6 +14,7 @@ const ModelConfig = @import("../model.zig").ModelConfig;
 const Config = cfg_mod.Config;
 const cooler_side = @import("../cooler_side.zig");
 const Mem = @import("../bills.zig").Mem;
+const dsv41_model = @import("dsv41_model.zig");
 
 /// The live headroom (`bills.headroomNow`), installed by the server. Unset (tests, `sushi kld`), nothing is ever released.
 pub var headroom_fn: ?*const fn (*const ModelConfig) Headroom = null;
@@ -145,12 +146,44 @@ pub fn enterRows(seqs: []const u64, config: *const ModelConfig, c: *const Config
     return moveCap(rowsCap(seqs.len, config), config, ops);
 }
 
+/// Released pools are a lease of the request whose prefill-width forwards run over them (`Model.lessee`): only its own
+/// decode-width forward or its end gives them back, so another request's forward between its chunks runs over them
+/// released (the union path) instead of reading back what the next chunk releases again.
+pub const Lease = struct {
+    /// Null (a forward outside a model's serving, a test of the borrow alone): every decode-width forward reads back.
+    model: ?*dsv41_model.Model = null,
+    /// The forward's request; null for one that carries none (the warm, a tool's run).
+    request: ?*const dsv41_model.Request = null,
+    /// A joined forward's rows.
+    rows: []const dsv41_model.Seg = &.{},
+
+    /// Whether this decode-width forward reads released pools back; the lessee's ends its lease.
+    fn readsBack(self: Lease) bool {
+        const m = self.model orelse return true;
+        const holder = m.lessee orelse return true;
+        var holds = self.request == holder;
+        for (self.rows) |row| holds = holds or row.request == holder;
+        if (holds) m.lessee = null;
+        return holds;
+    }
+
+    /// A prefill-width forward runs over the pools released when it runs: its request holds them.
+    fn take(self: Lease, engine: *const stream.Engine) void {
+        const m = self.model orelse return;
+        for (engine.borrow_from..engine.layers.len) |li| if (engine.isBorrowed(@intCast(li))) {
+            m.lessee = self.request;
+            return;
+        };
+    }
+};
+
 /// `beforeForward` of a joined decode forward (`enterRows`).
-pub fn beforeRowsForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, seqs: []const u64) !void {
+pub fn beforeRowsForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, seqs: []const u64, lease: Lease) !void {
     try engine.healReleased();
     _ = enterRows(seqs, config, c, mlx_ops);
     const headroom = headroom_fn orelse return;
     if (engine.borrow_from >= engine.layers.len) return;
+    if (!lease.readsBack()) return;
     return restore(engine, config, headroom, c.joinedCap(seqs));
 }
 
@@ -335,14 +368,18 @@ pub fn releaseCount(pools: []const u64, need: u64, headroom: u64) ?usize {
 /// Before a forward of `rows` that ends at `seq`. A released layer left with no union workspace is healed first. A
 /// prefill-width forward releases decoder pools, latest first, until its need fits the live headroom, and is refused
 /// when all of them do not cover it. A decode forward reads released pools back while each fits beside its own
-/// working set.
+/// working set, the pools' lessee's alone (`Lease`).
 /// `rest`: the prompt tokens the prefill runs after this forward (`ForwardCtx.prefill_rest`), 0 past it.
-pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, rows: u64, seq: u64, rest: u64) !void {
+pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, rows: u64, seq: u64, rest: u64, lease: Lease) !void {
     try engine.healReleased();
     _ = enterForward(rows, seq, config, c, mlx_ops);
     const headroom = headroom_fn orelse return;
     if (engine.borrow_from >= engine.layers.len) return;
-    if (rows <= verify_rows) return restore(engine, config, headroom, c.forwardCap(rows, seq));
+    if (rows <= verify_rows) {
+        if (!lease.readsBack()) return;
+        return restore(engine, config, headroom, c.forwardCap(rows, seq));
+    }
+    defer lease.take(engine);
     const need = prefillNeed(c, cooler_side.onEngine(config), rows, seq);
     forward_need = need;
     if (headroom(config).forNeed(need) >= need) return;

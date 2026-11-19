@@ -759,6 +759,9 @@ pub const Model = struct {
     dec_state: ?State = null,
     /// The slot request whose state the model runs; null runs `dec_state`.
     bound: ?*Request = null,
+    /// The request whose prefill runs over released decoder pools (`dsv41_borrow.Lease`): they stay released until its
+    /// own decode-width forward or its end.
+    lessee: ?*const Request = null,
     /// Tests: the error the next `pipeDrain` returns, its ring left as it was.
     drain_fault: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
     /// Tests: named intermediates of a chunk.
@@ -3300,6 +3303,7 @@ pub const Request = struct {
     /// The request ended: its state is the model's again. With joined rows it stays the request's until the slot goes
     /// (`deinit`), so the slot's commit still writes its points from it.
     pub fn reset(self: *Request) void {
+        self.endLease();
         if (self.model) |m| if (m.serves_rows) {
             if (m.bound == self) m.bound = null;
             return;
@@ -3315,7 +3319,14 @@ pub const Request = struct {
         return if (self.state) |st| st.n else 0;
     }
 
+    /// A request that ends gives its lease back: the next decode-width forward reads the pools back.
+    fn endLease(self: *const Request) void {
+        const m = self.model orelse return;
+        if (m.lessee == self) m.lessee = null;
+    }
+
     fn park(self: *Request) void {
+        self.endLease();
         const m = self.model orelse return;
         // A failed wait still empties the ring, so nothing in flight reads the state where it moves from.
         pipeDrain(m) catch |e| log.warn("[dsv41] a pipelined layer failed as its request ended: {s}\n", .{@errorName(e)});

@@ -4690,3 +4690,159 @@ test "cooler contract: joined speculative rows under a logit bias, failed at any
         }
     }.run);
 }
+
+/// A box whose free memory is `base` plus what the decoder pools gave back, less a resident pack's union workspace (as
+/// `dsv41_stream.BorrowProbe`); it counts the pools released and read back between its reads.
+const LeaseProbe = struct {
+    var engine: ?*@import("expert_stream.zig").Engine = null;
+    var base: u64 = 0;
+    var seen: usize = 0;
+    var released: usize = 0;
+    var restored: usize = 0;
+
+    fn reset() void {
+        seen = 0;
+        released = 0;
+        restored = 0;
+    }
+
+    fn headroom(_: *const model_mod.ModelConfig) @import("bills.zig").Headroom {
+        const e = engine.?;
+        var lent: u64 = 0;
+        var n: usize = 0;
+        for (e.borrow_from..e.layers.len) |li| {
+            lent += e.lentBytes(@intCast(li));
+            n += @intFromBool(e.isBorrowed(@intCast(li)));
+        }
+        if (n > seen) released += n - seen;
+        if (n < seen) restored += seen - n;
+        seen = n;
+        const made = if (e.plan.resident and e.grouped_union.len != 0) e.unionBytes() else 0;
+        return .{ .live = (base + lent) -| made };
+    }
+};
+
+const LeaseRun = struct {
+    a_tokens: std.ArrayList(u32) = .empty,
+    released: usize = 0,
+    restored: usize = 0,
+    filled: u64 = 0,
+    b_ticks: u32 = 0,
+    failed: usize = 0,
+
+    fn deinit(self: *LeaseRun) void {
+        self.a_tokens.deinit(testing.allocator);
+    }
+};
+
+/// Request A prefills `a_prompt` under the probe; with `b_spec`, request B (in DSpark rounds or not) decodes joined
+/// rows between A's chunks. Then both decode to their end.
+fn leaseRun(ld: *Load, dir: []const u8, a_prompt: []const u32, b_prompt: []const u32, b_spec: ?bool) !LeaseRun {
+    const scheduler = Served.scheduler;
+    const a = testing.allocator;
+    var sv: Served = undefined;
+    try sv.init(ld, dir);
+    defer sv.deinit();
+    const sch = &sv.sch;
+    const engine = LeaseProbe.engine.?;
+    var run: LeaseRun = .{};
+    errdefer run.deinit();
+    var slots: [2]?*scheduler.Slot = .{ null, null };
+    defer {
+        for (slots) |s| if (s) |x| sch.complete(x);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+        sch.cleanup_queue.clearRetainingCapacity();
+    }
+    if (b_spec) |spec| {
+        const head = if (spec) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
+        const b = try sch.submit(.{ .model = sv.entry, .prompt_ids = b_prompt, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 400, .enable_mtp = spec, .mtp = head });
+        slots[1] = b;
+        _ = sch.pending.orderedRemove(0);
+        try scheduler.runPrefill(sch, b);
+        if (!scheduler.postPrefillTerminal(sch, b)) try sch.decoding.append(a, b);
+        var one = [_]*scheduler.Slot{b};
+        for (0..2) |_| try scheduler.runDecodeTick(sch, &one);
+    }
+    const b_before: u32 = if (slots[1]) |b| b.completion_tokens else 0;
+    const fill0 = engine.fill_bytes_total;
+    LeaseProbe.reset();
+    const slot_a = try sch.submit(.{ .model = sv.entry, .prompt_ids = a_prompt, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 8 });
+    slots[0] = slot_a;
+    _ = sch.pending.orderedRemove(0);
+    scheduler.runPrefill(sch, slot_a) catch |e| slot_a.markError(@errorName(e));
+    run.released = LeaseProbe.released;
+    run.restored = LeaseProbe.restored;
+    run.filled = engine.fill_bytes_total - fill0;
+    run.b_ticks = (if (slots[1]) |b| b.completion_tokens else 0) - b_before;
+    if (!scheduler.postPrefillTerminal(sch, slot_a)) try sch.decoding.append(a, slot_a);
+    var guard: usize = 0;
+    while (guard < 2000) : (guard += 1) {
+        var act: [2]*scheduler.Slot = undefined;
+        var k: usize = 0;
+        for (sch.decoding.items) |s| if (s.joinsTick()) {
+            act[k] = s;
+            k += 1;
+        };
+        if (k == 0) break;
+        scheduler.runDecodeTick(sch, act[0..k]) catch |e| for (act[0..k]) |s| s.markError(@errorName(e));
+        scheduler.cullDecoding(sch);
+    }
+    scheduler.cullDecoding(sch);
+    for (slots) |s| if (s) |x| if (x.error_code != null) {
+        run.failed += 1;
+        var msg: [300]u8 = undefined;
+        _ = mlx.takeError(&msg);
+    };
+    if (slot_a.error_code == null) try run.a_tokens.appendSlice(a, slot_a.legacy_gen.?.generated_ids.items);
+    return run;
+}
+
+test "cooler contract: a DeepSeek prefill that releases decoder pools keeps them released through another request's joined and DSpark decode ticks between its chunks, and says its solo tokens" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const ids = try D.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(D, dir, true);
+    defer _ = ld.close();
+    if ((arch_sched.rowCap(&ld.config) orelse 1) < 2) return error.SkipZigTest;
+    const borrow = @import("dsv41/dsv41_borrow.zig");
+    const xfm = arch_handle.trunk(ld.h);
+    const engine = xfm.expert_stream.?;
+    const m = @import("dsv41/dsv41_state.zig").modelOf(xfm).?;
+    // Three 2048-row chunks and the held-back span; the free memory is the second chunk's need less half a pool, so the
+    // first chunk fits, the second and third release pools, and a decode step between them finds room to read one back.
+    ld.config.pinned_prefill_chunk = 2048;
+    const len: usize = 3 * 2048 + prefill_plan.SSM_SNAPSHOT_BACKOFF + 1;
+    var long: [len]u32 = undefined;
+    for (&long, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
+    var short: [40]u32 = undefined;
+    for (&short, 0..) |*t, i| t.* = ids[(i * 5 + 2) % ids.len];
+    const need = borrow.prefillNeed(&m.cfg, @import("cooler_side.zig").onEngine(&ld.config), 2048, 4096);
+    LeaseProbe.engine = engine;
+    defer LeaseProbe.engine = null;
+    LeaseProbe.base = need - engine.poolBytes(@intCast(engine.layers.len - 1)) / 2;
+    borrow.headroom_fn = &LeaseProbe.headroom;
+    defer borrow.headroom_fn = null;
+    var solo = try leaseRun(&ld, dir, &long, &short, null);
+    defer solo.deinit();
+    try testing.expect(solo.failed == 0 and solo.released > 0);
+    for ([_]bool{ false, true }) |b_spec| {
+        var pair = try leaseRun(&ld, dir, &long, &short, b_spec);
+        defer pair.deinit();
+        errdefer std.debug.print("B {s}, {d} of its tokens inside A's prefill: A alone released {d} pools, read back {d}, filled {d} KB; beside B {d}, {d}, {d} KB\n", .{
+            if (b_spec) "in DSpark rounds" else "joined", pair.b_ticks, solo.released, solo.restored, solo.filled >> 10, pair.released, pair.restored, pair.filled >> 10,
+        });
+        try testing.expect(pair.b_ticks > 0);
+        try testing.expectEqual(@as(usize, 0), pair.failed);
+        try testing.expectEqual(solo.released, pair.released);
+        try testing.expectEqual(solo.restored, pair.restored);
+        try testing.expectEqualSlices(u32, solo.a_tokens.items, pair.a_tokens.items);
+    }
+}

@@ -492,7 +492,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     var one: [1]u32 = undefined;
     const host: []const u32 = if (lazy) &one else (mlx.mlx_array_data_uint32(flat) orelse return error.InvalidDsv41Input)[0..n];
     if (self.expert_stream) |engine| {
-        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, n, st.n + n, ctx.prefill_rest);
+        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, n, st.n + n, ctx.prefill_rest, .{ .model = m, .request = dsv41_state.requestOf(ctx) });
         engine.beginForward();
     }
     // The model splices the image rows itself: the span's embedding never leaves it.
@@ -560,7 +560,7 @@ pub fn forwardRows(self: *Trunk, segs: []const dsv41_model.Seg) !mlx.mlx_array {
     const armed = m.arm(.rows);
     defer armed.end();
     if (self.expert_stream) |engine| {
-        try dsv41_borrow.beforeRowsForward(engine, &self.config, &m.cfg, seqs[0..segs.len]);
+        try dsv41_borrow.beforeRowsForward(engine, &self.config, &m.cfg, seqs[0..segs.len], .{ .model = m, .rows = segs });
         engine.beginForward();
     }
     const own = m.onEngine();
@@ -597,7 +597,7 @@ pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.ml
     const st = try dsv41_model.ensureState(m);
     if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
     if (self.expert_stream) |engine| {
-        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len, 0);
+        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len, 0, .{ .model = m, .request = dsv41_state.requestOf(ctx) });
         engine.beginForward();
     }
     if (m.onEngine()) _ = dsv41_model.ownBegin(m);
