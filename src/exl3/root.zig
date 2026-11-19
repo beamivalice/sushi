@@ -516,6 +516,7 @@ test {
     _ = @import("sorted_windows.zig");
     _ = codebook_tables;
     _ = trunk;
+    _ = group_layout;
 }
 
 test "exl3 Sushi CPU config and packed shapes admit K1 through K8" {

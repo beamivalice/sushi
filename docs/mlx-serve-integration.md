@@ -7,7 +7,7 @@ described in [engine-exl3-experts](engine-exl3-experts.md); the pack format it r
 
 Renaming a name below, or changing its signature or meaning, breaks a host's next re-vendor: add new names instead, and
 say so in the CHANGELOG. A change that keeps the names, passes `zig build exl3-host-check` and the module's tests
-(`exl3-test-N` on `zig build test`) is safe to re-vendor.
+(`test-exl3-experts`, `-trunk` and `-format` on `zig build test`) is safe to re-vendor.
 
 ## What the unit holds
 

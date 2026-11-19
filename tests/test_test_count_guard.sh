@@ -34,9 +34,9 @@ build test "$TMP/some.zig" --test-no-exec "-femit-bin=$TMP/some" || { fail "the 
 # `two` would exit 7 if it ran: the guard only counts.
 "$TMP/guard" some-bucket "$TMP/some" >"$TMP/out" 2>&1 || fail "a binary with tests should pass"
 [ ! -s "$TMP/out" ] || fail "a passing guard prints nothing"
-if "$TMP/guard" test-rest "$TMP/empty" >"$TMP/out" 2>&1; then
+if "$TMP/guard" test-exl3-trunk "$TMP/empty" >"$TMP/out" 2>&1; then
   fail "a binary with no tests should fail"
-elif ! grep -q "test-rest" "$TMP/out"; then
+elif ! grep -q "test bucket test-exl3-trunk ran 0 tests" "$TMP/out"; then
   fail "the failure should name its bucket"
 fi
 

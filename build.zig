@@ -246,16 +246,17 @@ pub fn build(b: *std.Build) void {
     const encoder_tests = b.addTest(.{
         .test_runner = testRunner(b),
         .max_rss = 5 * gib,
-        .name = "encoder-test",
+        .name = "test-encoder",
         .root_module = encoder_mod,
         .filters = test_filter orelse &.{},
     });
-    if (test_model == null or test_model == .enc) {
+    if ((test_model == null or test_model == .enc) and encoderSelected(b, test_filter)) {
         test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_encoder = b.addRunArtifact(encoder_tests);
         runEveryTime(run_encoder);
         logTo(run_encoder, test_log, encoder_tests.name);
         test_step.dependOn(&run_encoder.step);
+        test_step.dependOn(countGuard(b, count_guard, encoder_tests));
     }
 
     guardBenchFiles(b, build_roots);
@@ -753,44 +754,47 @@ fn namedBucket(stem: []const u8) usize {
     return test_buckets.len;
 }
 
-/// Seconds of the slow src/exl3 tests with the binaries running side by side; any other test weighs 1. Only the
-/// balance of the exl3 binaries reads this: a stale entry costs speed, never coverage.
-const exl3_test_weights = [_]struct { []const u8, u16 }{
-    .{ "prefill rows hold the f32-truth bar for every codebook, past 24 groups", 39 },
-    .{ "the grouped chain at 5120x2304", 108 },
-    .{ "SPEC1 per-rate table: every reader decodes", 13 },
-    .{ "SPEC1 below K1.5 and above K4: the prefill GEMM", 40 },
-    .{ "SPEC1 below K1.5 and above K4: every reader decodes", 2 },
-    .{ "one-bank and grouped trellis linears", 32 },
-    .{ "PAIR1 decode and prefill rows hold the f32-truth bar", 27 },
-    .{ "BF16 prefill on the simdgroup-matrix body", 20 },
-    .{ "Sushi GPU decode and prefill match scalar truth", 19 },
-    .{ "the shared expert as a one-expert fused chain", 19 },
-    .{ "multi-row projection holds the bar at every admitted rate", 14 },
-    .{ "SPEC1 per-rate table: decode and prefill rows hold", 12 },
-    .{ "the simdgroup-matrix body and the scalar body both match", 10 },
-    .{ "multi-row projection matches projectIndexed per row", 10 },
-    .{ "MCG n48 BF16 decode and NAX preserve f32 truth", 9 },
+/// The exl3 tests run as one binary per area, `test-exl3-<area>`: the tests of the src/exl3 files listed for it, with
+/// its compile's RSS bound in GiB (as `bucket_compile_gib`). Every file that holds a test is listed once, and every
+/// listed file holds one.
+const exl3_test_bins = [_]struct { []const u8, u64, []const []const u8 }{
+    .{ "experts", 3, &.{ "expert_exl3_kernels", "expert_exl3", "rate_groups", "project_rows", "coop_rows2", "prefill_grid", "sorted_windows", "geometry_5120x2304_test" } },
+    .{ "trunk", 2, &.{ "linear", "trunk", "trunk_gemm" } },
+    .{ "format", 2, &.{ "root", "device", "kernel_source", "codebook_tables", "side_cache", "layout", "pack" } },
 };
-const exl3_test_bins = 6;
 
-const Exl3Test = struct { filter: []const u8, weight: u16, bin: usize = 0 };
+/// The binary `exl3_test_bins` lists the file `stem` under.
+fn exl3Bin(stem: []const u8) usize {
+    var bin: ?usize = null;
+    for (exl3_test_bins, 0..) |area, i| for (area[2]) |listed| if (std.mem.eql(u8, listed, stem)) {
+        if (bin != null) std.debug.panic("exl3_test_bins lists src/exl3/{s}.zig under two binaries", .{stem});
+        bin = i;
+    };
+    return bin orelse std.debug.panic("src/exl3/{s}.zig holds tests that exl3_test_bins lists under no binary", .{stem});
+}
 
-/// The exl3 tests compile and run as several binaries. A filter matches `<file stem>.test.<name>`,
-/// so each test is a filter of its own, found by scanning src/exl3, and the tests are balanced by weight.
+const Exl3Test = struct { filter: []const u8, bin: usize };
+
+/// The exl3 tests compile and run as the binaries of `exl3_test_bins`. A filter matches `<file stem>.test.<name>`,
+/// so each test is a filter of its own, found by scanning src/exl3.
 fn addExl3TestBins(b: *std.Build, root: *std.Build.Module, user: ?[]const []const u8) []const *std.Build.Step.Compile {
     const io = b.graph.io;
     var tests: std.ArrayList(Exl3Test) = .empty;
     var all_names: std.ArrayList([]const u8) = .empty;
+    var all_bins: std.ArrayList(usize) = .empty;
+    var with_tests: std.ArrayList([]const u8) = .empty;
     var dir = buildRootHandle(b).openDir(io, "src/exl3", .{ .iterate = true }) catch |e| std.debug.panic("src/exl3/: {t}", .{e});
     defer dir.close(io);
     b.dependOnDirectoryContents(b.path("src/exl3"));
     var files = dir.iterate();
     while (files.next(io) catch |e| std.debug.panic("src/exl3/: {t}", .{e})) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
-        const stem = entry.name[0 .. entry.name.len - ".zig".len];
+        // host_min.zig roots exl3-host-check, which compiles its test; the exl3 root reaches it from no binary.
+        if (std.mem.eql(u8, entry.name, "host_min.zig")) continue;
+        const stem = b.dupe(entry.name[0 .. entry.name.len - ".zig".len]);
         const source = dir.readFileAlloc(io, entry.name, b.allocator, .limited(8 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
         b.dependOnFileContents(b.path(b.fmt("src/exl3/{s}", .{entry.name})));
+        var bin: ?usize = null;
         var lines = std.mem.splitScalar(u8, source, '\n');
         while (lines.next()) |line| {
             if (!std.mem.startsWith(u8, line, "test \"")) continue;
@@ -798,48 +802,59 @@ fn addExl3TestBins(b: *std.Build, root: *std.Build.Module, user: ?[]const []cons
             if (!std.mem.endsWith(u8, line, "\" {") or std.mem.indexOfScalar(u8, line, '\\') != null)
                 std.debug.panic("{s}: write `test \"name\" {{` on one line without escapes: {s}", .{ entry.name, line });
             const name = line["test \"".len .. line.len - "\" {".len];
-            var weight: u16 = 1;
-            for (exl3_test_weights) |w| if (std.mem.indexOf(u8, name, w[0]) != null) {
-                weight = w[1];
-            };
+            if (bin == null) {
+                bin = exl3Bin(stem);
+                with_tests.append(b.allocator, stem) catch @panic("OOM");
+            }
             const full = b.fmt("{s}.test.{s}", .{ stem, name });
             all_names.append(b.allocator, full) catch @panic("OOM");
-            if (selectedByUser(user, full)) tests.append(b.allocator, .{ .filter = full, .weight = weight }) catch @panic("OOM");
+            all_bins.append(b.allocator, bin.?) catch @panic("OOM");
+            if (selectedByUser(user, full)) tests.append(b.allocator, .{ .filter = full, .bin = bin.? }) catch @panic("OOM");
         }
     }
+    for (exl3_test_bins) |area| for (area[2]) |listed| {
+        for (with_tests.items) |stem| {
+            if (std.mem.eql(u8, stem, listed)) break;
+        } else std.debug.panic("exl3_test_bins lists {s}, which is no src/exl3 file with tests", .{listed});
+    };
     if (user) |u| for (tests.items) |*t| {
         t.filter = nameFilter(t.filter, all_names.items, u);
     };
-    std.mem.sortUnstable(Exl3Test, tests.items, {}, struct {
-        fn lt(_: void, x: Exl3Test, y: Exl3Test) bool {
-            return if (x.weight != y.weight) x.weight > y.weight else std.mem.lessThan(u8, x.filter, y.filter);
-        }
-    }.lt);
-    var load: [exl3_test_bins]u32 = @splat(0);
-    for (tests.items) |*t| {
-        t.bin = std.mem.indexOfMin(u32, &load);
-        load[t.bin] += t.weight;
-    }
-    // A filter matches anywhere in a name, so a test whose name holds another's runs in that one's binary.
-    var moved = true;
-    while (moved) {
-        moved = false;
-        for (tests.items, 0..) |a, i| {
-            for (tests.items, 0..) |*c, j| {
-                if (i == j or a.bin == c.bin or std.mem.indexOf(u8, c.filter, a.filter) == null) continue;
-                c.bin = a.bin;
-                moved = true;
-            }
-        }
-    }
+    // A filter matches anywhere in a name: one that also selects a test of another binary would run that test twice.
+    for (tests.items) |t| for (all_names.items, all_bins.items) |other, bin| {
+        if (bin != t.bin and std.mem.indexOf(u8, other, t.filter) != null)
+            std.debug.panic("the exl3 filter '{s}' also selects '{s}' of another binary in exl3_test_bins", .{ t.filter, other });
+    };
     var out: std.ArrayList(*std.Build.Step.Compile) = .empty;
-    for (0..exl3_test_bins) |i| {
+    for (exl3_test_bins, 0..) |area, i| {
         var filters: std.ArrayList([]const u8) = .empty;
         for (tests.items) |t| if (t.bin == i) filters.append(b.allocator, t.filter) catch @panic("OOM");
         if (filters.items.len == 0) continue;
-        out.append(b.allocator, b.addTest(.{ .name = b.fmt("exl3-test-{d}", .{i + 1}), .root_module = root, .filters = filters.items, .test_runner = testRunner(b), .max_rss = 3 * gib })) catch @panic("OOM");
+        out.append(b.allocator, b.addTest(.{ .name = b.fmt("test-exl3-{s}", .{area[0]}), .root_module = root, .filters = filters.items, .test_runner = testRunner(b), .max_rss = area[1] * gib })) catch @panic("OOM");
     }
     return out.items;
+}
+
+/// Whether the user's filters select a test of src/encoder, the encoder binary's root module; with none, no binary.
+fn encoderSelected(b: *std.Build, user: ?[]const []const u8) bool {
+    const filters = user orelse return true;
+    const io = b.graph.io;
+    var dir = buildRootHandle(b).openDir(io, "src/encoder", .{ .iterate = true }) catch |e| std.debug.panic("src/encoder/: {t}", .{e});
+    defer dir.close(io);
+    var walker = dir.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    var names: std.ArrayList([]const u8) = .empty;
+    while (walker.next(io) catch |e| std.debug.panic("src/encoder/: {t}", .{e})) |entry| {
+        if (entry.kind == .directory) b.dependOnDirectoryContents(b.path(b.fmt("src/encoder/{s}", .{entry.path})));
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        const source = dir.readFileAlloc(io, entry.path, b.allocator, .limited(8 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.path, e });
+        b.dependOnFileContents(b.path(b.fmt("src/encoder/{s}", .{entry.path})));
+        const stem = std.mem.replaceOwned(u8, b.allocator, entry.path[0 .. entry.path.len - ".zig".len], "/", ".") catch @panic("OOM");
+        appendTestNames(b, &names, stem, source);
+    }
+    b.dependOnDirectoryContents(b.path("src/encoder"));
+    for (names.items) |name| if (selectedByUser(filters, name)) return true;
+    return false;
 }
 
 fn addCHeaderModule(
@@ -997,7 +1012,7 @@ fn addArchSlice(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     step.dependOn(&b.addTest(.{ .name = b.fmt("arch-slice-{s}", .{arch}), .root_module = check, .emit_object = true }).step);
 }
 
-/// The encoder behind `sushi convert exl3`, also tested alone as `encoder-test`.
+/// The encoder behind `sushi convert exl3`, also tested alone as `test-encoder`.
 fn addEncoderModule(b: *std.Build, host: *std.Build.Module, exl3: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const encoder = b.createModule(.{
         .root_source_file = b.path("src/encoder/root.zig"),

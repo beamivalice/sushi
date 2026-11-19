@@ -58,10 +58,16 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   `build_options.host_tier`, under which a live GPU read (`gpu_mem.zig`) panics and the NAX probe answers false.
   Every `<arch>/<arch>_bill.zig` is a host file too, by its `_bill` stem; `bills.zig` reaches the enabled archs' through the registry.
   A bill test that needs the live GPU lives in `bills_live_test.zig` (or `<arch>_bill_test.zig`) in the MLX tier.
-- `zig build test` runs the host tier, the MLX buckets, the exl3 binaries and the encoder binary.
+- `zig build test` runs the host tier, the MLX buckets, the exl3 binaries and the encoder binary, `test-encoder`.
+  The exl3 tests run as one binary per area of `exl3_test_bins` (build.zig): `test-exl3-experts` (the expert
+  kernels, rate groups, windows, prefill grid), `test-exl3-trunk` (the trellis linears) and `test-exl3-format`
+  (root, device, kernel source, codebook tables, side cache, layout, pack). A file with tests that the table does not
+  list, lists twice or whose filter selects a test of another binary is refused at configure, by name.
+  `test-encoder` builds only when the run's `-Dtest-filter` selects one of its tests (or there is none).
 - **A binary that runs no test fails.** Zig reports a test binary whose filters select nothing as a pass, so each MLX
-  bucket, each exl3 binary and the unfiltered host binary is followed by `scripts/test_count_guard.zig`, which asks the
-  runner for the binary's test list (nothing runs) and fails, naming the bucket (`test-rest`, `exl3-test-3`), when no
+  bucket, each exl3 binary, the encoder binary and the unfiltered host binary is followed by
+  `scripts/test_count_guard.zig`, which asks the runner for the binary's test list (nothing runs) and fails, naming the
+  bucket (`test-rest`, `test-exl3-trunk`), when no
   named test is in it. The root file's anonymous `test { ... }` does not count: it survives every filter. A run with a
   `-Dtest-filter` skips the host check, since a filter may select nothing there. `tests/test_test_count_guard.sh` pins it.
 - build.zig names a bucket's files at configure time, so every folder or file it scans is declared with

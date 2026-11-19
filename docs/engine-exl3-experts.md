@@ -34,7 +34,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 **`src/exl3` is a module** (`sushi_exl3`), so another MLX host (mlx-serve) can serve EXL3 packs through the same code.
 It reaches `mlx`, `log` and `io_util` through an `mlx_host` import whose root file exposes them as `pub const`; here that
 root is `src/main.zig` (and `src/tests.zig` for tests), and it can never import a Sushi file by path. Its tests run as
-their own artifacts (`exl3-test-1` to `-6`, balanced by `exl3_test_weights` in `build.zig`) on `zig build test`.
+their own artifacts on `zig build test`, one per area of `exl3_test_bins` in `build.zig`: `test-exl3-experts`,
+`test-exl3-trunk` and `test-exl3-format`. A new file with tests is listed there, or the build refuses it by name.
 `zig build exl3-host-check` compiles the module and walks its public declarations against `host_min.zig`, a host that
 exports exactly those three names, so a fourth `mlx_host` name is a build error. The vendorable unit, its names and its
 hidden state are [mlx-serve-integration](mlx-serve-integration.md); `root.version` is the Sushi version it was cut at
