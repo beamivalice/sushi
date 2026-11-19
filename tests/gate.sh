@@ -1,17 +1,24 @@
 #!/bin/bash
 # sushi-test: tier=tool
 # The local release gate: every check a local run can prove, run once on one commit in a clean worktree of it.
-#   tests/gate.sh [--test-budget-gib N] [<ref>]
+#   tests/gate.sh [--test-budget-gib N] [--continue <prior-ref>] [<ref>]
 #                             the ref as this repo has it (default origin/main: fetch first); N is the test step's
 #                             memory budget (zig build --maxrss), by default the box's row: 72 GiB on 96 GiB or more
 #                             (the M5 Max), 20 GiB and -j8 on 32 GiB or more (the M1 Max); a smaller box names N itself
+#   --continue <prior-ref>    reuses a prior gate run's per-test results for every test run step whose key is the
+#                             same (tests/lib/test_keys.py: its binary's code and data, its env, the box, lib/mlx,
+#                             the tracked files that are not Zig or docs, the fixtures) and that ended whole there;
+#                             every other step runs, lint, ubench and the guards always; the record names the reuse
 # It refuses while the GPU lock is held: a full model load owns the box, and the suite's fixture loads would join it.
 # Steps, each under `taskpolicy -a`, stopping at the first failure: zig build lint, zig build ubench, then
 # zig build test -Doptimize=ReleaseFast --summary all with the tiny-fixture envs of tests/lib/fixture_envs.sh,
 # -Dtest-log and, when they name the Qwen cut, -Dfixture-cut=true, with tests/hermetic_guards.sh running beside it. Each test's log line shows as it lands; at the end the
 # per-step table, the 10 slowest tests and, last, every failed test with its error block (tests/lib/test_log.py).
 # On success it writes ${SUSHI_GATE_DIR:-$HOME/.sushi/runs/gate}/<sha>.json, the record ./release.sh requires; each
-# step's log and the per-test log (tests.tsv) stay in <sha>.logs/ beside it. The worktree is removed either way.
+# step's log, the per-test log (tests.tsv) and each run step's key (step-keys.tsv) stay in <sha>.logs/ beside it.
+# The worktree is <gate dir>/worktree, one path for every gate (a binary holds its sources' paths, so a rebuild of
+# the same code elsewhere is other bytes); it is removed either way. One a running gate holds (worktree.pid) refuses
+# this gate; one a stopped gate left is removed, and the gate says so.
 # Every zig build keeps its local cache in <gate dir>/zig-cache, so a fresh worktree is not a cold build; after a
 # toolchain or SDK change remove it (configure-time output is cached).
 # The worktree borrows this checkout's .zig-toolchain and lib/mlx (symlinks). SUSHI_GATE_PYTHON names the python3
@@ -25,11 +32,17 @@ die() { echo "gate.sh: $*" >&2; exit 1; }
 
 REF=""
 BUDGET_GIB=""
+CONTINUE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --test-budget-gib)
       [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] || die "refused: --test-budget-gib ${2:-} is not a whole number of GiB"
       BUDGET_GIB=$2
+      shift 2
+      ;;
+    --continue)
+      [ -n "${2:-}" ] || die "refused: --continue names no prior gate's ref"
+      CONTINUE=$2
       shift 2
       ;;
     -*) die "refused: unknown flag $1" ;;
@@ -43,6 +56,14 @@ done
 REF="${REF:-origin/main}"
 
 SHA="$(git -C "$ROOT" rev-parse --verify --quiet "$REF^{commit}")" || die "refused: '$REF' names no commit in $ROOT"
+PRIOR_LOGS=""
+if [ -n "$CONTINUE" ]; then
+  PRIOR="$(git -C "$ROOT" rev-parse --verify --quiet "$CONTINUE^{commit}")" \
+    || die "refused: --continue '$CONTINUE' names no commit in $ROOT"
+  PRIOR_LOGS="$GATE_DIR/$PRIOR.logs"
+  [ -f "$PRIOR_LOGS/step-keys.tsv" ] && [ -f "$PRIOR_LOGS/tests.tsv" ] \
+    || die "refused: --continue $PRIOR: $PRIOR_LOGS holds no step keys and per-test log to reuse"
+fi
 for d in .zig-toolchain lib/mlx; do
   [ -e "$ROOT/$d" ] || die "refused: $ROOT/$d is missing; the gate's worktree borrows it"
 done
@@ -68,7 +89,19 @@ else
 fi
 echo "gate: test budget $BUDGET_GIB GiB ($BUDGET_FROM)${JOBS[*]+, ${JOBS[*]}}"
 
-WT="$(mktemp -d "${TMPDIR:-/tmp}/sushi-gate.XXXXXX")"
+WT="$GATE_DIR/worktree"
+WT_PID="$GATE_DIR/worktree.pid"
+# The worktree's gate pid: a live gate refuses this one; one that is gone (or never wrote it) was stopped mid-run.
+if [ -e "$WT" ]; then
+  HOLDER="$(cat "$WT_PID" 2> /dev/null || true)"
+  if [ -n "$HOLDER" ] && ps -p "$HOLDER" -o command= 2> /dev/null | grep -F gate.sh > /dev/null; then
+    die "refused: $WT belongs to the running gate pid $HOLDER"
+  fi
+  git -C "$ROOT" worktree remove --force "$WT" 2> /dev/null || rm -rf "$WT"
+  git -C "$ROOT" worktree prune
+  echo "gate: removed the worktree of a stopped gate (pid ${HOLDER:-unknown})"
+fi
+mkdir -p "$GATE_DIR"
 GUARDS_PID=""
 FOLLOW_PID=""
 cleanup() {
@@ -78,8 +111,10 @@ cleanup() {
     wait "$GUARDS_PID" 2> /dev/null || true
   fi
   git -C "$ROOT" worktree remove --force "$WT" 2> /dev/null || rm -rf "$WT"
+  rm -f "$WT_PID"
 }
 trap cleanup EXIT
+echo $$ > "$WT_PID"
 git -C "$ROOT" worktree add --quiet --detach "$WT" "$SHA"
 ln -s "$(cd "$ROOT/.zig-toolchain" && pwd -P)" "$WT/.zig-toolchain"
 ln -s "$(cd "$ROOT/lib/mlx" && pwd -P)" "$WT/lib/mlx"
@@ -88,6 +123,7 @@ cd "$WT"
 [ -f tests/lib/fixture_envs.sh ] || die "refused: $SHA has no tests/lib/fixture_envs.sh"
 grep -q '"test-log"' build.zig || die "refused: $SHA's build.zig has no -Dtest-log, which the gate's per-test log needs"
 grep -q '"fixture-cut"' build.zig || die "refused: $SHA's build.zig has no -Dfixture-cut, which declares the Qwen cut's memory"
+grep -q '"test-skip-step"' build.zig || die "refused: $SHA's build.zig has no test-plan and -Dtest-skip-step, which --continue keys and skips by"
 # shellcheck source=lib/fixture_envs.sh
 source tests/lib/fixture_envs.sh || die "refused: tests/lib/fixture_envs.sh failed (above)"
 for v in $SUSHI_FIXTURE_ENVS; do
@@ -101,6 +137,12 @@ ZIG_CACHE="$GATE_DIR/zig-cache"
 mkdir -p "$GATE_DIR/lib"
 ln -sfn "$(cd "$ROOT/lib/mlx" && pwd -P)" "$GATE_DIR/lib/mlx"
 LOGS="$GATE_DIR/$SHA.logs"
+# A gate continued onto its own commit reads the run it replaces.
+if [ "$PRIOR_LOGS" = "$LOGS" ]; then
+  rm -rf "$LOGS.prior"
+  mv "$LOGS" "$LOGS.prior"
+  PRIOR_LOGS="$LOGS.prior"
+fi
 rm -rf "$LOGS"
 mkdir -p "$LOGS"
 export PATH="$WT/.zig-toolchain:$PATH"
@@ -147,20 +189,35 @@ join_guards() {
   STEP_SECONDS="$STEP_SECONDS guards=$secs"
 }
 
-# The test step, its log lines shown as they land, then the summary; a failure ends the gate naming the step.
+# The test step: its binaries and their plan built first and every run step keyed (step-keys.tsv), the steps a
+# --continue reuses left out, the rest with their log lines shown as they land, then the summary; a failure ends the
+# gate naming the step.
 TEST_LOG="$LOGS/tests.tsv"
+REUSED=()
 run_tests() {
-  local t0 rc=0
+  local t0 rc=0 skips=()
+  run_step test-build zig build test-build test-plan -Doptimize=ReleaseFast --cache-dir "$ZIG_CACHE" \
+    --maxrss $((BUDGET_GIB << 30)) ${JOBS[@]+"${JOBS[@]}"} ${CUT[@]+"${CUT[@]}"}
+  SUSHI_FIXTURE_ENVS="$SUSHI_FIXTURE_ENVS" "$PY" -I "$ROOT/tests/lib/test_keys.py" keys zig-out/test-plan.json "$WT" \
+    > "$LOGS/step-keys.tsv" \
+    || die "step 'test' failed: the run steps could not be keyed on $SHA; no record written"
+  if [ -n "$PRIOR_LOGS" ]; then
+    while IFS= read -r s; do [ -z "$s" ] || REUSED+=("$s"); done \
+      < <("$PY" -I "$ROOT/tests/lib/test_keys.py" reuse "$PRIOR_LOGS" "$LOGS/step-keys.tsv" "$LOGS/reused.tsv")
+    echo "gate: reused from $PRIOR: ${REUSED[*]:-none}"
+    for s in ${REUSED[@]+"${REUSED[@]}"}; do skips+=("-Dtest-skip-step=$s"); done
+  fi
   echo "gate: test"
   "$PY" -I "$ROOT/tests/lib/test_log.py" follow "$TEST_LOG" "$LOGS/tests.done" &
   FOLLOW_PID=$!
   t0=$(date +%s)
   taskpolicy -a zig build test -Doptimize=ReleaseFast --summary all --cache-dir "$ZIG_CACHE" \
-    --maxrss $((BUDGET_GIB << 30)) ${JOBS[@]+"${JOBS[@]}"} ${CUT[@]+"${CUT[@]}"} "-Dtest-log=$TEST_LOG" \
-    > "$LOGS/test.log" 2>&1 || rc=$?
+    --maxrss $((BUDGET_GIB << 30)) ${JOBS[@]+"${JOBS[@]}"} ${CUT[@]+"${CUT[@]}"} ${skips[@]+"${skips[@]}"} \
+    "-Dtest-log=$TEST_LOG" > "$LOGS/test.log" 2>&1 || rc=$?
   touch "$LOGS/tests.done"
   wait "$FOLLOW_PID" || true
   FOLLOW_PID=""
+  [ ! -s "$LOGS/reused.tsv" ] || cat "$LOGS/reused.tsv" >> "$TEST_LOG"
   local failed=()
   [ "$rc" -eq 0 ] || failed=(--step-failed)
   "$PY" -I "$ROOT/tests/lib/test_log.py" summary "$TEST_LOG" "$LOGS/test.log" ${failed[@]+"${failed[@]}"} \
@@ -177,7 +234,7 @@ join_guards
 
 SUMMARY_LINE="$(grep '^Build Summary:' "$LOGS/test.log" | tail -n 1)" || die "the test step printed no Build Summary: $LOGS/test.log"
 mkdir -p "$GATE_DIR"
-GATE_SHA="$SHA" GATE_REF="$REF" GATE_ZIG="$(zig version)" GATE_SUMMARY="$SUMMARY_LINE" GATE_STEPS="$STEP_SECONDS" \
+GATE_REUSED_FROM="${PRIOR_LOGS:+$PRIOR}" GATE_REUSED="${REUSED[*]:-}" GATE_SHA="$SHA" GATE_REF="$REF" GATE_ZIG="$(zig version)" GATE_SUMMARY="$SUMMARY_LINE" GATE_STEPS="$STEP_SECONDS" \
   GATE_TIMES="$TEST_LOG" GATE_FIXTURES="$SUSHI_FIXTURE_ENVS" GATE_OUT="$GATE_DIR/$SHA.json" "$PY" -I - << 'EOF'
 import datetime, json, os, re
 
@@ -219,6 +276,7 @@ record = {
     "build_summary": build,
     "minutes": minutes,
     "test_times": times,
+    "reused": {"from": env["GATE_REUSED_FROM"], "steps": env["GATE_REUSED"].split()} if env["GATE_REUSED_FROM"] else None,
     "summary": f"{env['GATE_SHA'][:12]} green at {finished}, zig {env['GATE_ZIG']}: {counts}"
     + (f" ({extra})" if extra else "") + "; " + ", ".join(f"{k} {v} min" for k, v in minutes.items()),
 }

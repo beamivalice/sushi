@@ -386,6 +386,14 @@ envs of `tests/lib/fixture_envs.sh`, `-Dtest-log`, `--maxrss` of the test budget
 smaller box refuses until `--test-budget-gib` names one. Each test's log line shows as it lands; at the end
 `tests/lib/test_log.py` prints the per-step table (tests, pass, skip, fail, wall), the 10 slowest tests and, last,
 every failed test with the error block the build runner printed for it.
+`--continue <prior-ref>` reruns only what changed: every run step is keyed (`tests/lib/test_keys.py`) by its test
+binary's code and data (not its UUID, signature or symbol tables, which every build changes), its env, the box,
+`lib/mlx`, the tracked files that are not Zig or docs, the SUSHI_/MLX_/fixture env and every fixture folder's
+contents; a step whose key is the prior gate's and whose run there ended whole is left out (`-Dtest-skip-step`) and
+its prior lines go into the log, and the record names the reuse (`reused.from`, `reused.steps`). Lint, ubench and the
+guards always run; in doubt, a step reruns. With the domains, an edit to one domain's tests reruns that domain. The
+worktree is `~/.sushi/runs/gate/worktree` for every gate, since a binary holds its sources' paths: one a running gate
+holds (`worktree.pid`) refuses the gate, one a stopped gate left is removed with a line saying so.
 Its zig builds share a persistent local cache, `~/.sushi/runs/gate/zig-cache` (`--cache-dir`), so a fresh worktree is
 not a cold build; remove it after a toolchain or SDK change, as a checkout's `.zig-cache`.
 Green writes `~/.sushi/runs/gate/<sha>.json` (sha, time, Zig version, the Build Summary counts, each step's minutes,

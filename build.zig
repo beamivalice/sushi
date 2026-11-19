@@ -160,6 +160,12 @@ pub fn build(b: *std.Build) void {
     );
     const test_log = b.option([]const u8, "test-log", "Append a line per test (UTC, step, PASS/SKIP/FAIL, ms, name) and each step's DONE totals to this absolute path");
     const fixture_cut = b.option(bool, "fixture-cut", "QWEN4_TEST_MODEL names a Qwen cut or pack: the test steps that load it declare 16 GiB; a test step that sees it without this fails") orelse false;
+    var runs: TestRuns = .{
+        .b = b,
+        .log = test_log,
+        .fixture_cut = fixture_cut,
+        .skip = b.option([]const []const u8, "test-skip-step", "Leave out this test run step (repeat for several): tests/gate.sh --continue reuses its tests' results") orelse &.{},
+    };
     if (test_log) |path| if (!std.fs.path.isAbsolute(path)) std.debug.panic("-Dtest-log={s} is not an absolute path", .{path});
     const test_build = b.step("test-build", "Compile unit tests without running them");
     const test_step = b.step("test", "Run unit tests");
@@ -190,12 +196,10 @@ pub fn build(b: *std.Build) void {
     if (host_filters.len > 0) {
         const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = host_filters, .test_runner = testRunner(b), .max_rss = 4 * gib });
         test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        const run_host_tests = b.addRunArtifact(host_tests);
-        runEveryTime(run_host_tests);
-        logTo(run_host_tests, test_log, host_tests.name);
-        declareRun(run_host_tests, fixture_cut, false, 1);
-        test_host_step.dependOn(&run_host_tests.step);
-        test_step.dependOn(&run_host_tests.step);
+        if (runs.add(host_tests, host_tests.name, &.{}, false, 1)) |run_host_tests| {
+            test_host_step.dependOn(&run_host_tests.step);
+            test_step.dependOn(&run_host_tests.step);
+        }
         if (test_filter == null) {
             const host_count = countGuard(b, count_guard, host_tests);
             test_host_step.dependOn(host_count);
@@ -209,16 +213,12 @@ pub fn build(b: *std.Build) void {
     for (domains) |domain| {
         test_build.dependOn(&b.addInstallArtifact(domain.compile, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         for (domain.steps) |step| {
-            const run = b.addRunArtifact(domain.compile);
-            runEveryTime(run);
-            run.setName(b.fmt("run {s}", .{step.name}));
-            run.setEnvironmentVariable("SUSHI_TEST_SELECT", step.select);
-            run.setEnvironmentVariable("SUSHI_TEST_STEP", step.name);
-            if (step.env) |kv| run.setEnvironmentVariable(kv[0], kv[1]);
-            logTo(run, test_log, step.name);
-            declareRun(run, fixture_cut, domain.domain.cut, domain.domain.run_gib);
+            var env: std.ArrayList([2][]const u8) = .empty;
+            env.append(b.allocator, .{ "SUSHI_TEST_SELECT", step.select }) catch @panic("OOM");
+            if (step.env) |kv| env.append(b.allocator, kv) catch @panic("OOM");
+            if (qwen_preprocess_fixture) |fixture| env.append(b.allocator, .{ "QWEN_PREPROCESS_FIXTURE", fixture }) catch @panic("OOM");
+            const run = runs.add(domain.compile, step.name, env.items, domain.domain.cut, domain.domain.run_gib) orelse continue;
             if (qwen_preprocess_fixture) |fixture| {
-                run.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
                 run.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
                 run.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
                 run.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
@@ -235,14 +235,10 @@ pub fn build(b: *std.Build) void {
         addExl3TestBins(b, exl3_test_mod, test_filter);
     for (exl3_tests) |exl3_test| {
         test_build.dependOn(&b.addInstallArtifact(exl3_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        const run_exl3 = b.addRunArtifact(exl3_test);
-        runEveryTime(run_exl3);
-        logTo(run_exl3, test_log, exl3_test.name);
         const area = for (exl3_test_bins) |area| {
             if (std.mem.eql(u8, exl3_test.name, b.fmt("test-exl3-{s}", .{area.area}))) break area;
         } else unreachable;
-        declareRun(run_exl3, fixture_cut, area.cut, area.run_gib);
-        test_step.dependOn(&run_exl3.step);
+        if (runs.add(exl3_test, exl3_test.name, &.{}, area.cut, area.run_gib)) |run_exl3| test_step.dependOn(&run_exl3.step);
         test_step.dependOn(countGuard(b, count_guard, exl3_test));
     }
 
@@ -255,11 +251,7 @@ pub fn build(b: *std.Build) void {
     });
     if ((test_model == null or test_model == .enc) and encoderSelected(b, test_filter)) {
         test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        const run_encoder = b.addRunArtifact(encoder_tests);
-        runEveryTime(run_encoder);
-        logTo(run_encoder, test_log, encoder_tests.name);
-        declareRun(run_encoder, fixture_cut, false, 6);
-        test_step.dependOn(&run_encoder.step);
+        if (runs.add(encoder_tests, encoder_tests.name, &.{}, false, 6)) |run_encoder| test_step.dependOn(&run_encoder.step);
         test_step.dependOn(countGuard(b, count_guard, encoder_tests));
     }
 
@@ -272,13 +264,11 @@ pub fn build(b: *std.Build) void {
             .filters = filters,
         });
         test_build.dependOn(&b.addInstallArtifact(bar_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        const run_bar = b.addRunArtifact(bar_tests);
-        runEveryTime(run_bar);
-        logTo(run_bar, test_log, bar_tests.name);
-        declareRun(run_bar, fixture_cut, false, 1);
-        test_step.dependOn(&run_bar.step);
+        if (runs.add(bar_tests, bar_tests.name, &.{}, false, 1)) |run_bar| test_step.dependOn(&run_bar.step);
         test_step.dependOn(countGuard(b, count_guard, bar_tests));
     };
+
+    runs.finish();
 
     guardBenchFiles(b, build_roots);
     const ubench_step = b.step("ubench", "Build zig-out/bin/sushi-ubench (always ReleaseFast): the microbenches, which no test step builds");
@@ -1248,18 +1238,52 @@ fn runEveryTime(run: *std.Build.Step.Run) void {
     run.has_side_effects = true;
 }
 
-/// A run step's RSS bound for `--maxrss` (Metal is not in RSS, so it is generous). A step that can load the Qwen cut
-/// holds `cut_run_gib` under `-Dfixture-cut=true`; without it, its runner refuses QWEN4_TEST_MODEL (`SUSHI_TEST_FIXTURE_CUT`).
-fn declareRun(run: *std.Build.Step.Run, fixture_cut: bool, holds_cut: bool, run_gib: u64) void {
-    run.step.max_rss = (if (fixture_cut and holds_cut) cut_run_gib else run_gib) * gib;
-    if (holds_cut) run.setEnvironmentVariable("SUSHI_TEST_FIXTURE_CUT", if (fixture_cut) "1" else "0");
-}
+/// The test run steps, each a process of one test binary, and their plan, which `zig build test-plan` writes to
+/// `zig-out/test-plan.json`: each step's name, its binary's path beside the plan (`zig build test-build`) and the env it sets. tests/gate.sh
+/// keys a step by them (tests/lib/test_keys.py) and leaves out, with `-Dtest-skip-step`, the steps it reuses.
+const TestRuns = struct {
+    b: *std.Build,
+    log: ?[]const u8,
+    fixture_cut: bool,
+    skip: []const []const u8,
+    plan: std.ArrayList(PlanRow) = .empty,
 
-/// `-Dtest-log`: the run's runner appends its per-test lines to `path` under `step` (scripts/test_runner.zig).
-fn logTo(run: *std.Build.Step.Run, path: ?[]const u8, step: []const u8) void {
-    run.setEnvironmentVariable("SUSHI_TEST_LOG", path orelse return);
-    run.setEnvironmentVariable("SUSHI_TEST_STEP", step);
-}
+    const PlanRow = struct { step: []const u8, binary: []const u8, env: []const [2][]const u8 };
+
+    /// The run step `name` of `compile` with `env` set, or null when `-Dtest-skip-step` names it. Its RSS bound for
+    /// `--maxrss` is `run_gib` (Metal is not in RSS, so it is generous); a step that can load the Qwen cut holds
+    /// `cut_run_gib` under `-Dfixture-cut=true`, and without it its runner refuses QWEN4_TEST_MODEL.
+    fn add(self: *TestRuns, compile: *std.Build.Step.Compile, name: []const u8, env: []const [2][]const u8, holds_cut: bool, run_gib: u64) ?*std.Build.Step.Run {
+        const b = self.b;
+        var all: std.ArrayList([2][]const u8) = .empty;
+        all.append(b.allocator, .{ "SUSHI_TEST_STEP", name }) catch @panic("OOM");
+        all.appendSlice(b.allocator, env) catch @panic("OOM");
+        if (holds_cut) all.append(b.allocator, .{ "SUSHI_TEST_FIXTURE_CUT", if (self.fixture_cut) "1" else "0" }) catch @panic("OOM");
+        self.plan.append(b.allocator, .{ .step = name, .binary = b.fmt("tests/{s}", .{compile.name}), .env = all.items }) catch @panic("OOM");
+        for (self.skip) |s| if (std.mem.eql(u8, s, name)) return null;
+        const run = b.addRunArtifact(compile);
+        runEveryTime(run);
+        run.setName(b.fmt("run {s}", .{name}));
+        for (all.items) |kv| run.setEnvironmentVariable(kv[0], kv[1]);
+        if (self.log) |path| run.setEnvironmentVariable("SUSHI_TEST_LOG", path);
+        run.step.max_rss = (if (self.fixture_cut and holds_cut) cut_run_gib else run_gib) * gib;
+        return run;
+    }
+
+    /// Writes the plan for `zig build test-plan`; a `-Dtest-skip-step` that names no run step fails.
+    fn finish(self: *TestRuns) void {
+        const b = self.b;
+        for (self.skip) |s| {
+            for (self.plan.items) |row| {
+                if (std.mem.eql(u8, row.step, s)) break;
+            } else std.debug.panic("-Dtest-skip-step={s} names no test run step", .{s});
+        }
+        const json = std.json.Stringify.valueAlloc(b.allocator, self.plan.items, .{}) catch @panic("OOM");
+        const file = b.addWriteFiles().add("test-plan.json", json);
+        const step = b.step("test-plan", "Write zig-out/test-plan.json: each test run step's name, binary and env");
+        step.dependOn(&b.addInstallFileWithDir(file, .prefix, "test-plan.json").step);
+    }
+};
 
 fn countGuard(b: *std.Build, guard: *std.Build.Step.Compile, unit_test: *std.Build.Step.Compile) *std.Build.Step {
     const run = b.addRunArtifact(guard);

@@ -61,9 +61,10 @@ REPO="$TMP/repo"
 g init -q "$REPO"
 mkdir -p "$REPO/tests/lib" "$REPO/scripts" "$REPO/.zig-toolchain" "$REPO/lib/mlx"
 cp "$ROOT/tests/gate.sh" "$REPO/tests/" 2> /dev/null
-cp "$ROOT/tests/lib/fixture_envs.sh" "$ROOT/tests/lib/test_log.py" "$REPO/tests/lib/" 2> /dev/null
+cp "$ROOT/tests/lib/fixture_envs.sh" "$ROOT/tests/lib/test_log.py" "$ROOT/tests/lib/test_keys.py" "$REPO/tests/lib/" 2> /dev/null
 cp "$ROOT/scripts/gpu-lock.sh" "$REPO/scripts/" 2> /dev/null
-printf '%s\n' 'const test_log = b.option([]const u8, "test-log", "");' 'const cut = b.option(bool, "fixture-cut", "");' > "$REPO/build.zig"
+printf '%s\n' 'const test_log = b.option([]const u8, "test-log", "");' 'const cut = b.option(bool, "fixture-cut", "");' \
+  'const skip = b.option([]const []const u8, "test-skip-step", "");' > "$REPO/build.zig"
 echo 'tracked, as the real lib/ is' > "$REPO/lib/stb_image.h"
 # The guards wait for the test step to start: run before it instead of beside it, they find it never did.
 cat > "$REPO/tests/hermetic_guards.sh" << 'EOF'
@@ -82,17 +83,30 @@ if [ "$1" = version ]; then echo 0.17.1; exit 0; fi
 step=$2
 echo "zig $step $PWD QWEN4_STQ_TINY=${QWEN4_STQ_TINY:-unset} DSV41_EPI_TINY=${DSV41_EPI_TINY:-unset} args=$*" >> "$STUB_CALLS"
 [ "${STUB_FAIL:-}" = "$step" ] && { echo "error: stub $step failed"; exit 1; }
+# test-build + test-plan: the two binaries (their bytes from STUB_BIN_<name>) and the plan beside them.
+if [ "$step" = test-build ]; then
+  mkdir -p zig-out/tests
+  printf '%s' "${STUB_BIN_HOST:-host v1}" > zig-out/tests/test-host
+  printf '%s' "${STUB_BIN_REST:-rest v1}" > zig-out/tests/test-rest
+  printf '%s' '[{"step":"test-host","binary":"tests/test-host","env":[["SUSHI_TEST_STEP","test-host"]]},' \
+    '{"step":"test-rest","binary":"tests/test-rest","env":[["SUSHI_TEST_STEP","test-rest"]]}]' > zig-out/test-plan.json
+fi
 if [ "$step" = test ]; then
   touch "$STUB_CALLS.test-started"
-  log=; for a in "$@"; do case "$a" in -Dtest-log=*) log=${a#-Dtest-log=} ;; esac; done
+  log=; skip=" "
+  for a in "$@"; do case "$a" in -Dtest-log=*) log=${a#-Dtest-log=} ;; -Dtest-skip-step=*) skip+="${a#-Dtest-skip-step=} " ;; esac; done
   t=2026-11-19T07:13:02.000Z
-  printf '%s\ttest-host\tPASS\t12\tfirst: a test\n' $t >> "$log"
-  printf '%s\ttest-rest\tPASS\t345\tsecond: "quoted" test\n%s\ttest-rest\tSKIP\t0\tthird: a skip\n' $t $t >> "$log"
-  if [ "${STUB_FAIL:-}" = a-test ]; then
-    printf '%s\ttest-rest\tFAIL\t7\tfourth: a failure\n' $t >> "$log"
-    printf "error: 'fourth: a failure' failed:\n       expected 1, found 2\nfailed command: test-rest --listen=-\n"
+  if [ "$skip" = "${skip/ test-host /}" ]; then
+    printf '%s\ttest-host\tPASS\t12\tfirst: a test\n%s\ttest-host\tDONE\t12\t1 pass, 0 skip, 0 fail\n' $t $t >> "$log"
   fi
-  printf '%s\ttest-host\tDONE\t12\t1 pass, 0 skip, 0 fail\n%s\ttest-rest\tDONE\t352\t1 pass, 1 skip, 0 fail\n' $t $t >> "$log"
+  if [ "$skip" = "${skip/ test-rest /}" ]; then
+    printf '%s\ttest-rest\tPASS\t345\tsecond: "quoted" test\n%s\ttest-rest\tSKIP\t0\tthird: a skip\n' $t $t >> "$log"
+    if [ "${STUB_FAIL:-}" = a-test ]; then
+      printf '%s\ttest-rest\tFAIL\t7\tfourth: a failure\n' $t >> "$log"
+      printf "error: 'fourth: a failure' failed:\n       expected 1, found 2\nfailed command: test-rest --listen=-\n"
+    fi
+    printf '%s\ttest-rest\tDONE\t352\t1 pass, 1 skip, 0 fail\n' $t >> "$log"
+  fi
   [ "${STUB_FAIL:-}" = a-test ] && exit 1
   echo "Build Summary: 22/22 steps succeeded; 939/1001 tests passed (62 skipped)"
 fi
@@ -163,9 +177,12 @@ has "the test step declares the Qwen cut that the fixture envs name" "$(grep '^z
 ok "  and keeps zig's default job count on the M5 row" "$(grep '^zig test ' "$CALLS" | grep -c -- ' -j')" "0"
 has "the record holds a summary line" "$(field "$REC" summary)" "939/1001"
 ZIGS="$(grep '^zig ' "$CALLS" | cut -d' ' -f2 | tr '\n' ' ')"
-ok "lint, then ubench, then the test step" "$(grep -E '^zig ' "$CALLS" | cut -d' ' -f1-2 | tr '\n' ',')" "zig lint,zig ubench,zig test,"
+ok "lint, then ubench, then the test binaries and plan, then the test step" "$(grep -E '^zig ' "$CALLS" | cut -d' ' -f1-2 | tr '\n' ',')" "zig lint,zig ubench,zig test-build,zig test,"
+has "  the binaries and plan built with the test step's flags" "$(grep '^zig test-build ' "$CALLS")" "args=build test-build test-plan -Doptimize=ReleaseFast"
+ok "the gate keeps each run step's key" "$(cut -f1 "$GATE_DIR/$SHA1.logs/step-keys.tsv" 2> /dev/null | tr '\n' ',')" "test-host,test-rest,"
+ok "the steps run in the gate dir's one worktree path, so a rebuild of the same code is the same binary" "$(sed -n 's/^zig lint \([^ ]*\) .*/\1/p' "$CALLS")" "$GATE_DIR/worktree"
 has "the guards run beside the test step" "$(grep '^guards ' "$CALLS")" "beside=yes"
-ok "every step runs under taskpolicy -a" "$(grep -c '^taskpolicy ' "$CALLS")" "4"
+ok "every step runs under taskpolicy -a" "$(grep -c '^taskpolicy ' "$CALLS")" "5"
 WT_DIR="$(sed -n 's/^zig lint \([^ ]*\) .*/\1/p' "$CALLS")"
 ok "the steps run outside the checkout" "$([ -n "$WT_DIR" ] && [ "$WT_DIR" != "$REPO" ] && echo yes || echo no)" "yes"
 has "the guards run in a tree without the checkout's untracked files" "$(grep '^guards ' "$CALLS")" "untracked=no"
@@ -219,6 +236,80 @@ has "  naming it" "$OUT" "--test-budget-gib abc"
 gate -- --no-such-flag HEAD
 ok "an unknown flag refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
 has "  naming it" "$OUT" "--no-such-flag"
+
+echo "── a stopped gate's worktree ──"
+git -C "$REPO" worktree add --quiet --detach "$GATE_DIR/worktree" HEAD
+sleep 0 & DEAD=$!
+wait "$DEAD"
+echo "$DEAD" > "$GATE_DIR/worktree.pid"
+gate -- HEAD
+ok "a worktree whose gate is gone is removed and the gate runs" "$RC" "0"
+has "  saying so" "$OUT" "gate: removed the worktree of a stopped gate (pid $DEAD)"
+ok "  and leaves none behind" "$(worktrees)" "1"
+git -C "$REPO" worktree add --quiet --detach "$GATE_DIR/worktree" HEAD
+rm -f "$GATE_DIR/worktree.pid"
+gate -- HEAD
+ok "a worktree with no gate pid is a stopped gate's too" "$RC" "0"
+git -C "$REPO" worktree add --quiet --detach "$GATE_DIR/worktree" HEAD
+printf '#!/bin/bash\nsleep 30\n' > "$TMP/live-gate.sh"
+bash "$TMP/live-gate.sh" & LIVE=$!
+echo "$LIVE" > "$GATE_DIR/worktree.pid"
+gate -- HEAD
+ok "a worktree a running gate holds refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
+has "  naming its pid" "$OUT" "gate pid $LIVE"
+ok "  before any step" "$(grep -c -E '^(zig|guards) ' "$CALLS")" "0"
+ok "  and leaves its worktree alone" "$([ -d "$GATE_DIR/worktree" ] && echo yes || echo no)" "yes"
+kill "$LIVE" 2> /dev/null
+wait "$LIVE" 2> /dev/null
+git -C "$REPO" worktree remove --force "$GATE_DIR/worktree"
+rm -f "$GATE_DIR/worktree.pid"
+
+echo "── continue ──"
+rm -rf "$GATE_DIR"
+gate -- HEAD
+PRIOR="$SHA2"
+mkdir -p "$REPO/src"
+echo 'pub const a = 1;' > "$REPO/src/a.zig"
+g -C "$REPO" add src/a.zig
+g -C "$REPO" commit -qm "a zig-only change"
+SHA3="$(git -C "$REPO" rev-parse HEAD)"
+skips() { grep '^zig test ' "$CALLS" | tr ' ' '\n' | sed -n 's/^-Dtest-skip-step=//p' | tr '\n' ','; }
+gate -- --continue "$PRIOR" HEAD
+ok "a continued gate passes" "$RC" "0"
+ok "  leaving out every step whose binary and inputs are the prior gate's" "$(skips)" "test-host,test-rest,"
+ok "  with their prior lines in its log" "$(grep -c $'\ttest-rest\t' "$GATE_DIR/$SHA3.logs/tests.tsv")" "3"
+ok "  the record names the gate it reused" "$(field "$GATE_DIR/$SHA3.json" reused.from)" "$PRIOR"
+ok "  and the steps" "$(field "$GATE_DIR/$SHA3.json" reused.steps.1)" "test-rest"
+has "  and says so" "$OUT" "gate: reused from $PRIOR: test-host test-rest"
+ok "  lint and the guards still run" "$(grep -c -E '^(zig lint|guards) ' "$CALLS")" "2"
+gate STUB_BIN_REST="rest v2" -- --continue "$PRIOR" HEAD
+ok "a step whose binary changed runs again" "$(skips)" "test-host,"
+ok "  and the record lists only the reused one" "$(field "$GATE_DIR/$SHA3.json" reused.steps.1 > /dev/null && echo two || echo one)" "one"
+gate STUB_FAIL=a-test -- HEAD
+echo 'pub const a = 2;' > "$REPO/src/a.zig"
+g -C "$REPO" commit -qam "another zig-only change"
+gate -- --continue "$SHA3" HEAD
+ok "a step that failed in the prior gate runs again" "$(skips)" "test-host,"
+SHA4="$(git -C "$REPO" rev-parse HEAD)"
+gate -- --continue "$SHA4" HEAD
+ok "a continue onto the same commit reuses its own last run" "$(skips)" "test-host,test-rest,"
+echo changed >> "$QWEN_TINY/weights"
+gate -- --continue "$SHA4" HEAD
+ok "a fixture whose files changed reruns every step" "$(skips)" ""
+echo data > "$REPO/data.txt"
+g -C "$REPO" add data.txt
+g -C "$REPO" commit -qm "a tracked data file"
+gate -- --continue "$SHA4" HEAD
+ok "a tracked file that is not Zig or docs reruns every step" "$(skips)" ""
+gate -- --continue no-such-ref HEAD
+ok "a --continue ref that names no commit refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
+has "  naming it" "$OUT" "no-such-ref"
+gate -- --continue "$SHA1" HEAD
+ok "a prior gate with no step keys refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
+has "  naming the sha" "$OUT" "$SHA1"
+ok "  before any step" "$(grep -c -E '^(zig|guards) ' "$CALLS")" "0"
+gate -- --continue
+ok "--continue with no ref refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
 
 echo "── refusals ──"
 rm -rf "$GATE_DIR"
