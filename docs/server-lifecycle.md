@@ -460,6 +460,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **The gate shuts when the shutdown is asked, not when it begins**: `refusingLocked` reads
   `server_state.shutdown_requested` too, since `beginShutdown` runs only when the accept loop next sees the flag (up to
   1 s later); a pending slot is neither admitted nor counted as work then, so the loop parks instead of spinning.
+- **A shutdown ends every wait on a model's state**: `requestShutdown` (`stopServing` runs it too) calls
+  `ModelRegistry.beginShutdown`, so `waitStateChangeLocked` (the one wait on a `loading`/`evicting` entry) and an
+  unload's drain return `error.Shutdown`; a request behind an unload otherwise hung the shutdown to exit 1.
 - **A shutdown drain is an ERROR, never a finish reason**: `beginShutdown` marks `Slot.shutdown_cancelled`, so the
   reader gets `.err` (`error.ServerShutdown`, 503 "Server is shutting down") instead of `.done`, whose default
   `finish_reason` is `length` (a queued request logged `0+0 tokens [length]`).

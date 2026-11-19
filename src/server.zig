@@ -161,6 +161,7 @@ fn signalHandler(_: std.posix.SIG) callconv(.c) void {
 
 pub fn requestShutdown() void {
     server_state.shutdown_requested.store(true, .release);
+    if (server_state.global_registry) |r| r.beginShutdown();
 }
 
 
@@ -1111,7 +1112,7 @@ const CONN_DRAIN_MS: u64 = 35_000;
 /// `error.ConnectionsOutliveShutdown`, and its caller must free nothing it passed in.
 /// Idempotent; also the cleanup of a boot whose load failed with the listener up.
 fn stopServing(accept_thread: *?std.Thread) bool {
-    server_state.shutdown_requested.store(true, .release);
+    requestShutdown();
     downloads.stop();
     if (accept_thread.*) |t| {
         t.join();

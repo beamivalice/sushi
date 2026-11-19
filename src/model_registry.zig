@@ -634,6 +634,8 @@ pub const ModelRegistry = struct {
     /// blocked in `ensureLoaded` (on a `.loading`/`.evicting` entry) wake
     /// here. The mutex is the predicate; the cond-var is the wake signal.
     state_cond: std.Io.Condition,
+    /// A shutdown was asked: every wait on `state_cond` returns `error.Shutdown` instead of waiting (`beginShutdown`).
+    shutting_down: std.atomic.Value(bool) = .init(false),
 
     /// Running sum of `bytes_resident` across `.ready` entries. Updated
     /// under `mutex` on every state transition.
@@ -1008,7 +1010,7 @@ pub const ModelRegistry = struct {
                     return entry;
                 },
                 .loading, .evicting => {
-                    self.state_cond.waitUncancelable(self.io, &self.mutex);
+                    try self.waitStateChangeLocked();
                     continue;
                 },
                 .error_state => return if (retry_failed) error.NotLoaded else loadErrorFromName(entry.error_name),
@@ -1068,6 +1070,21 @@ pub const ModelRegistry = struct {
         self.state_cond.broadcast(self.io);
     }
 
+    /// Waits for the next state change, the caller holding `mutex`; `error.Shutdown` once a shutdown was asked, whose
+    /// entries may never change again.
+    pub fn waitStateChangeLocked(self: *ModelRegistry) error{Shutdown}!void {
+        if (self.shutting_down.load(.acquire)) return error.Shutdown;
+        self.state_cond.waitUncancelable(self.io, &self.mutex);
+    }
+
+    /// From here every wait on an entry's state or on its readers ends with `error.Shutdown`; wakes those waiting now.
+    pub fn beginShutdown(self: *ModelRegistry) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.shutting_down.store(true, .release);
+        self.state_cond.broadcast(self.io);
+    }
+
     /// Phase D: block until `entry.refcount == 0`. Caller holds `mutex`.
     /// Wakes when any `release` lands on a zero refcount.
     pub fn waitForRefcountZeroLocked(self: *ModelRegistry, entry: *LoadedModel) void {
@@ -1077,9 +1094,10 @@ pub const ModelRegistry = struct {
     }
 
     /// `waitForRefcountZeroLocked` for at most `ms`; false when a reader still holds `entry` then.
-    pub fn waitForRefcountZeroWithinLocked(self: *ModelRegistry, entry: *LoadedModel, ms: i64) bool {
+    pub fn waitForRefcountZeroWithinLocked(self: *ModelRegistry, entry: *LoadedModel, ms: i64) error{Shutdown}!bool {
         const deadline = io_util.nowMsMonotonic(self.io) + ms;
         while (entry.refcount.load(.acquire) != 0) {
+            if (self.shutting_down.load(.acquire)) return error.Shutdown;
             const left = deadline - io_util.nowMsMonotonic(self.io);
             if (left <= 0) return false;
             self.state_cond.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(left), .clock = .awake } }) catch {};
@@ -1966,6 +1984,50 @@ test "ModelRegistry: a launch model claimed for its startup load lists loading, 
     reg.release(e);
     reg.releaseStatus(e);
     try testing.expectEqual(@as(u32, 0), e.refcount.load(.acquire));
+}
+
+test "ModelRegistry: a shutdown ends a wait on a loading or evicting entry and an unload's drain with error.Shutdown" {
+    for ([_]LoadState{ .loading, .evicting }) |state| {
+        var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+        defer reg.deinit();
+        const e = try reg.registerStub("m", "/path/to/m", 1024);
+        try reg.setDefault("m");
+        e.state = state;
+        var w: StartupWaiter = .{ .reg = reg };
+        const t = try std.Thread.spawn(.{}, StartupWaiter.run, .{&w});
+        try testing.expect(w.stillWaiting());
+        reg.beginShutdown();
+        const answered = !w.stillWaiting();
+        if (!answered) {
+            reg.mutex.lockUncancelable(reg.io);
+            reg.markUnloadedLocked(e);
+            reg.mutex.unlock(reg.io);
+        }
+        t.join();
+        try testing.expect(answered);
+        try testing.expectError(error.Shutdown, w.got.?);
+    }
+    // The drain an unload waits in, its model held by a request a shutdown has not ended yet.
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStub("m", "/path/to/m", 1024);
+    e.state = .evicting;
+    e.refcount.store(1, .release);
+    defer e.refcount.store(0, .release);
+    const Drain = struct {
+        fn run(r: *ModelRegistry, entry: *LoadedModel, out: *error{Shutdown}!bool) void {
+            r.mutex.lockUncancelable(r.io);
+            defer r.mutex.unlock(r.io);
+            out.* = r.waitForRefcountZeroWithinLocked(entry, 2000);
+        }
+    };
+    var drained: error{Shutdown}!bool = true;
+    const t = try std.Thread.spawn(.{}, Drain.run, .{ reg, e, &drained });
+    const ts = std.c.timespec{ .sec = 0, .nsec = 50_000_000 };
+    _ = std.c.nanosleep(&ts, null);
+    reg.beginShutdown();
+    t.join();
+    try testing.expectError(error.Shutdown, drained);
 }
 
 test "ModelRegistry: a startup load that fails reaches the waiting request by name" {

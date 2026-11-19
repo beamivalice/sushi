@@ -31,6 +31,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A failed self-update's message stays in the web page until you dismiss it**, as a refused load's does.
 - **APIs and server**: a shutdown refuses the requests still waiting from the moment it is asked, instead of serving
   those it reaches within the next second.
+- **Stopping the server during an unload answers the requests waiting on that model**: a request sent while an unload
+  waited for its model's last stream never got an answer once a shutdown came, and the server exited with an error
+  after 35 s without its cleanup; it now gets the shutdown error at once.
 - **A long Qwen3.8 conversation's next turn is refused less often near the memory limit**: a turn that takes the cached
   conversation over is no longer billed again for the room its taken-over cache already holds for the reply.
 - **A DeepSeek-V4.1 request admitted while another request's borrowed decoder pools are out is no longer promised the

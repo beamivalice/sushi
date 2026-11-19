@@ -1870,7 +1870,7 @@ pub const Scheduler = struct {
                         return entry;
                     },
                     .loading, .evicting => {
-                        self.registry.state_cond.waitUncancelable(self.io, &self.registry.mutex);
+                        try self.registry.waitStateChangeLocked();
                         continue :wait_loop;
                     },
                     .error_state => {
@@ -2076,7 +2076,10 @@ pub const Scheduler = struct {
                     // Another caller is mid load/evict — wait it out, then
                     // re-check (it may end up resident or unloaded).
                     .loading, .evicting => {
-                        self.registry.state_cond.waitUncancelable(self.io, &self.registry.mutex);
+                        self.registry.waitStateChangeLocked() catch |err| {
+                            self.registry.mutex.unlock(self.io);
+                            return err;
+                        };
                         continue :wait;
                     },
                     .ready => break :wait,
@@ -2090,7 +2093,12 @@ pub const Scheduler = struct {
                 }
             }
             self.registry.markEvictingLocked(entry);
-            if (!self.registry.waitForRefcountZeroWithinLocked(entry, unload_drain_ms)) {
+            const drained = self.registry.waitForRefcountZeroWithinLocked(entry, unload_drain_ms) catch |err| {
+                self.registry.unmarkEvictingLocked(entry);
+                self.registry.mutex.unlock(self.io);
+                return err;
+            };
+            if (!drained) {
                 const held = entry.refcount.load(.acquire);
                 self.registry.unmarkEvictingLocked(entry);
                 self.registry.mutex.unlock(self.io);
@@ -6432,6 +6440,130 @@ test "ensureLoadedFresh: a model whose load failed is tried again, not answered 
     try testing.expect(reg.mutex.tryLock());
     reg.mutex.unlock(io);
     resident.refcount.store(0, .release);
+}
+
+/// One `unloadModel` or `ensureLoaded` on a thread of its own, for a test that ends what it waits on.
+const ModelCall = struct {
+    sch: *Scheduler,
+    id: []const u8,
+    load: bool,
+    got: anyerror!void = error.NotRun,
+    done: std.atomic.Value(bool) = .init(false),
+    fn run(self: *@This()) void {
+        self.got = if (self.load) if (self.sch.ensureLoaded(self.id)) |lm| self.sch.release(lm) else |e| e else self.sch.unloadModel(self.id);
+        self.done.store(true, .release);
+    }
+    fn answeredWithin(self: *@This(), ms: u32) bool {
+        for (0..ms) |_| {
+            if (self.done.load(.acquire)) return true;
+            const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+            _ = std.c.nanosleep(&ts, null);
+        }
+        return self.done.load(.acquire);
+    }
+};
+
+test "a shutdown ends an unload's wait on another job and its drain, and leaves its model as it stood" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 2, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStub("m", "m", 10);
+    var sch = submitTestScheduler(testing.allocator, 1);
+    defer sch.unload_queue.deinit(testing.allocator);
+    sch.registry = reg;
+    const drain_was = Scheduler.unload_drain_ms;
+    Scheduler.unload_drain_ms = 1000;
+    defer Scheduler.unload_drain_ms = drain_was;
+
+    // Waiting on another job, then draining the requests that hold the model: the shutdown ends both at once.
+    for ([_]model_registry_mod.LoadState{ .loading, .ready }) |state| {
+        reg.shutting_down.store(false, .release);
+        e.state = state;
+        if (state == .ready) e.refcount.store(1, .release);
+        defer e.refcount.store(0, .release);
+        var call: ModelCall = .{ .sch = &sch, .id = "m", .load = false };
+        const t = try std.Thread.spawn(.{}, ModelCall.run, .{&call});
+        try testing.expect(!call.answeredWithin(50));
+        reg.beginShutdown();
+        const answered = call.answeredWithin(500);
+        if (!answered) {
+            reg.mutex.lockUncancelable(reg.io);
+            if (e.state == .loading) reg.markUnloadedLocked(e);
+            reg.mutex.unlock(reg.io);
+        }
+        t.join();
+        try testing.expect(answered);
+        try testing.expectError(error.Shutdown, call.got);
+        try testing.expectEqual(state, e.state);
+    }
+}
+
+test "a shutdown ends a cold load's wait on another load of its model" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const victim = try reg.registerStub("a", "a", 10);
+    const target = try reg.registerStub("b", dir, 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(victim, 10);
+    reg.mutex.unlock(io);
+
+    var sch = submitTestScheduler(testing.allocator, 1);
+    defer sch.load_queue.deinit(testing.allocator);
+    sch.registry = reg;
+    sch.ssd_budget_bytes = 0;
+    sch.mtp = null;
+    sch.kv_quant = null;
+    sch.ctx_size_flag = 0;
+    sch.test_on_cooler = null;
+    sch.no_drafter = true;
+    sch.drafter_dir = "";
+    sch.primary_model_dir = "";
+    sch.ssm_checkpoint_stride = 0;
+    sch.ssm_checkpoint_max = 0;
+    sch.prefix_cache_capacity = 0;
+    sch.prefix_cache_ram_enabled = false;
+    sch.prefix_cache_mem_bytes = 0;
+    sch.prefix_cache_mem_resolver = null;
+    sch.prefix_cache_disk_resolver = null;
+    sch.expert_cache_fit_resolver = null;
+    sch.mtp_head_kv_quant = false;
+    sch.mtp_depth = 0;
+
+    // Another load claims the model while this one reads its files, at the gate check made before them.
+    const Claim = struct {
+        var entry: *LoadedModel = undefined;
+        var fired = false;
+        fn gate(_: []u8, _: []const u8) ?[]const u8 {
+            if (!fired) entry.state = .loading;
+            fired = true;
+            return null;
+        }
+    };
+    Claim.entry = target;
+    reg.load_gate = Claim.gate;
+    var call: ModelCall = .{ .sch = &sch, .id = "b", .load = true };
+    const t = try std.Thread.spawn(.{}, ModelCall.run, .{&call});
+    try testing.expect(!call.answeredWithin(200));
+    reg.beginShutdown();
+    const answered = call.answeredWithin(500);
+    if (!answered) {
+        reg.mutex.lockUncancelable(io);
+        reg.markErrorLocked(target, "Unblocked");
+        reg.mutex.unlock(io);
+    }
+    t.join();
+    try testing.expect(answered);
+    try testing.expectError(error.Shutdown, call.got);
+    target.state = .unloaded;
 }
 
 test "ensureLoaded: a streamed pack with no ssd budget is gated at its RAM-tier default, not at 0" {

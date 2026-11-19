@@ -415,6 +415,18 @@ test "server: a shutdown with the submit queue full ends the request waiting for
     }.run);
 }
 
+/// A POST on a thread of its own: `out` holds the whole answer once `done`; empty when it failed.
+const Asked = struct {
+    path: []const u8,
+    body: []const u8,
+    out: []u8 = &.{},
+    done: std.atomic.Value(bool) = .init(false),
+    fn run(q: *@This()) void {
+        q.out = request("POST", q.path, q.body) catch &.{};
+        q.done.store(true, .release);
+    }
+};
+
 /// A stream the client stops reading after its first token, with its socket left open, an unload asked behind it and
 /// then another request. The stall stays open until both answer: a hold by the stalled reader lasts until its socket
 /// shuts. `ms` budgets the reload's served warm; the request behind must claim its model within `claim_ms` of the
@@ -427,16 +439,6 @@ fn behindAStalledReader(ms: u32) ![2][]u8 {
     defer _ = std.c.close(stalled);
     try send(stalled, "POST", "/v1/completions", try completionBody(&b[1], "a long tale of the sea", 64, true));
     gpa.free(try readUntil(stalled, "\"choices\""));
-    const Asked = struct {
-        path: []const u8,
-        body: []const u8,
-        out: []u8 = &.{},
-        done: std.atomic.Value(bool) = .init(false),
-        fn run(q: *@This()) void {
-            q.out = request("POST", q.path, q.body) catch &.{};
-            q.done.store(true, .release);
-        }
-    };
     var asked = [_]Asked{ .{ .path = "/v1/unload-model", .body = "{\"model\":\"tiny\"}" }, .{ .path = "/v1/completions", .body = try completionBody(&b[0], "hello", 4, false) } };
     var threads: [2]std.Thread = undefined;
     var waited: u32 = 0;
@@ -503,6 +505,46 @@ test "server: an unload whose model stays held past its drain bound is refused b
             defer for (got) |g| gpa.free(g);
             if (!std.mem.startsWith(u8, got[0], "HTTP/1.1 409") or std.mem.indexOf(u8, got[0], "model_busy") == null) return error.UnloadNotRefusedByName;
             if (!std.mem.startsWith(u8, got[1], "HTTP/1.1 200")) return error.RequestBehindFailed;
+        }
+    }.run);
+}
+
+test "server: a shutdown during an unload's drain ends the unload and the request waiting behind it with the shutdown error" {
+    const was = http_conn.send_limit_ms;
+    http_conn.send_limit_ms = 3000;
+    defer http_conn.send_limit_ms = was;
+    try eachArch(4, .{}, struct {
+        var asked: [2]Asked = undefined;
+        fn bothDone() bool {
+            return asked[0].done.load(.acquire) and asked[1].done.load(.acquire);
+        }
+        fn run() !void {
+            var b: [2][512]u8 = undefined;
+            gpa.free(try request("POST", "/v1/completions", try completionBody(&b[0], "hi", 2, false)));
+            // A stream the client stops reading holds the model through the unload's drain.
+            const stalled = try connect();
+            defer _ = std.c.close(stalled);
+            try send(stalled, "POST", "/v1/completions", try completionBody(&b[1], "a long tale of the sea", 100, true));
+            gpa.free(try readUntil(stalled, "\"choices\""));
+            asked = .{ .{ .path = "/v1/unload-model", .body = "{\"model\":\"tiny\"}" }, .{ .path = "/v1/completions", .body = try completionBody(&b[0], "hello", 4, false) } };
+            const unload = try std.Thread.spawn(.{}, Asked.run, .{&asked[0]});
+            const marked = within(5000, unloadPending);
+            const behind = try std.Thread.spawn(.{}, Asked.run, .{&asked[1]});
+            // The request reaches its wait behind the unload before the shutdown is asked.
+            var none = [_]std.posix.pollfd{};
+            _ = std.posix.poll(&none, 300) catch {};
+            server.requestShutdown();
+            const answered = within(2000, bothDone);
+            _ = std.c.shutdown(stalled, std.posix.SHUT.RDWR);
+            unload.join();
+            behind.join();
+            defer for (asked) |q| gpa.free(q.out);
+            if (!marked) return error.UnloadNeverMarked;
+            if (!answered) return error.ShutdownLeftAWaiterUnanswered;
+            for (asked) |q| if (!std.mem.startsWith(u8, q.out, "HTTP/1.1 503") or std.mem.indexOf(u8, q.out, @import("http.zig").shutting_down_message) == null) {
+                std.debug.print("{s} answered at the shutdown: {s}\n", .{ q.path, q.out[0..@min(q.out.len, 300)] });
+                return error.NotTheShutdownError;
+            };
         }
     }.run);
 }
