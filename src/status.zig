@@ -159,7 +159,12 @@ pub fn getWiredMemBytes() u64 {
     return @as(u64, vm.wire_count) * page;
 }
 
+/// Test seam: the reclaimable bytes `getAvailableMemBytes` reads, in place of the machine's, which other processes move
+/// between two reads.
+pub var available_mem_override: ?u64 = null;
+
 pub fn getAvailableMemBytes() u64 {
+    if (available_mem_override) |bytes| return bytes;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;

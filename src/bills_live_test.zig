@@ -412,6 +412,10 @@ test "the width the scheduler runs a request at is the one its admission bill wa
     _ = @import("metal.zig").device() catch return error.SkipZigTest;
     var cfg = fixtures.qwen4DeployedTestConfig();
     @import("cooler_side.zig").forTest(&cfg, true);
+    // One free-RAM reading for the bill and the width: the machine's moves between them.
+    const status = @import("status.zig");
+    status.available_mem_override = status.getAvailableMemBytes();
+    defer status.available_mem_override = null;
     // Free buffers the engine keeps: the live headroom leaves them out, and so must the width the request runs at.
     try core.sync();
     const idle = try core.fresh(.uint8, &.{256 << 20});

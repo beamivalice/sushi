@@ -90,6 +90,8 @@ bill function's output on the committed fixture configs of all served packs: a b
   frees none: on a 128 GB M5 at `iogpu.wired_limit_mb=125000` with the owner's apps open, DeepSeek at `--ssd-budget-gb
   108` (105 GiB active) took an 8,192-row warm chunk the 121 GiB floor admitted and the kernel panicked (r-65). A quiet
   box reclaims its file cache, so there the declared limit stands.
+- A test that compares two live readings pins the free-RAM one (`status.available_mem_override`): other processes move
+  the reclaimable pages between two reads, so equal formulas read unequal figures whenever free RAM binds.
 - **One live headroom, one first width.** `bills.prefillHeadroomNow` (pure `liveHeadroomFrom`) is the live ceiling less
   the active and staged bytes and what the arch parks (`parkedBytes`: DeepSeek's decode pool and the engine's free
   buffers); the chunk-width hook, the widen re-check, the served warm, an image encode and DeepSeek's borrow read it,
