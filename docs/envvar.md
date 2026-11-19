@@ -38,6 +38,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_TEST_NO_GPU` | `mlx.zig` (`testNoGpuEnv`) | a test build sees no Metal backend, so `requireGpu` tests skip | test | yes: testsuite |
 | `SUSHI_TEST_LOG` | `scripts/test_runner.zig` (`main`) | `<abs path>` (`-Dtest-log` sets it): every test appends `<UTC>\t<step>\t<PASS\|SKIP\|FAIL>\t<ms>\t<name>`, its at-rest check included, and each process a `DONE` line with its totals; prints nothing; a relative path panics | test | yes: testsuite |
 | `SUSHI_TEST_STEP` | `scripts/test_runner.zig` (`main`) | the step name the log lines carry (`-Dtest-log` sets it to the run step's binary); `SUSHI_TEST_LOG` without it panics | test | yes: testsuite |
+| `SUSHI_TEST_SELECT` | `scripts/test_runner.zig` (`main`, `isSelected`) | one test-name prefix a line, and `!<prefix>` lines that drop what they match: the process runs only the tests it selects; one that selects none fails, naming `SUSHI_TEST_STEP`; unset, every test runs | test | yes: testsuite |
 | `QWEN4_GDN_CHECK` | `qwen4_gdn.zig:2703, 2849` | runs the composed GDN prework beside the fused kernel and compares | once | no |
 | `QWEN4_NO_POOLED` | `qwen4_qsa.zig:1242` | forces `QsaPooledRequired` to exercise the pooled-key fallback | once | no |
 | `QWEN4_OPCOUNT` | `qwen4_forward.zig:2940` | FFI op counts per block of the Qwen4 forward | once | no |

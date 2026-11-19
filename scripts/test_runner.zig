@@ -1,7 +1,8 @@
 //! Sushi's test runner: Zig 0.17.1's default runner (`lib/compiler/test_runner.zig`, MIT), unchanged but for `runTest`,
 //! which asks after every test whether the engine is at rest (`sushi_after_each`, exported where the engine is built)
-//! and fails the test that left it otherwise, by name, before the next one starts, and for the per-test log that
-//! `main` reads from `SUSHI_TEST_LOG` and `SUSHI_TEST_STEP` (`zig build test -Dtest-log=<path>`).
+//! and fails the test that left it otherwise, by name, before the next one starts, for the per-test log that
+//! `main` reads from `SUSHI_TEST_LOG` and `SUSHI_TEST_STEP` (`zig build test -Dtest-log=<path>`), and for the run step's
+//! selection, `SUSHI_TEST_SELECT`.
 const builtin = @import("builtin");
 
 const std = @import("std");
@@ -76,6 +77,37 @@ fn writeUtc(w: *std.Io.Writer, t: Io.Timestamp) !void {
 }
 
 var test_log: ?TestLog = null;
+
+/// `SUSHI_TEST_SELECT`: one test-name prefix a line, and `!<prefix>` lines that drop what they match; the process runs
+/// only the tests it selects, so several run steps of one binary each run their own. Unset, every test runs.
+var select: ?[]const u8 = null;
+/// The selected tests' indexes in `builtin.test_functions`, in the order the build runner was told them.
+var selected_tests: []u32 = &.{};
+
+fn isSelected(name: []const u8) bool {
+    const lines = select orelse return true;
+    var kept = false;
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (line[0] == '!') {
+            if (std.mem.startsWith(u8, name, line[1..])) return false;
+        } else if (std.mem.startsWith(u8, name, line)) kept = true;
+    }
+    return kept;
+}
+
+/// Fills `selected_tests`; a selection that keeps no test fails the process, naming its step.
+fn selectTests(gpa: std.mem.Allocator, step: ?[]const u8) void {
+    var kept: std.ArrayList(u32) = .empty;
+    for (builtin.test_functions, 0..) |test_fn, i| if (isSelected(test_fn.name))
+        kept.append(gpa, @intCast(i)) catch @panic("OOM");
+    if (select != null and kept.items.len == 0) {
+        std.debug.print("step '{s}': SUSHI_TEST_SELECT selects no test of this binary\n", .{step orelse "(no SUSHI_TEST_STEP)"});
+        std.process.exit(1);
+    }
+    selected_tests = kept.items;
+}
 /// The milliseconds of the last `runTest`, its at-rest check included.
 var last_test_ms: i64 = 0;
 
@@ -169,6 +201,8 @@ pub fn main(init: std.process.Init.Minimal) void {
             panic("SUSHI_TEST_LOG names no step: zig build test -Dtest-log=<path> sets SUSHI_TEST_STEP beside it", .{});
         test_log = .{ .path = path, .step = step };
     }
+    select = init.environ.getPosix("SUSHI_TEST_SELECT");
+    selectTests(std.heap.page_allocator, init.environ.getPosix("SUSHI_TEST_STEP"));
 
     if (builtin.fuzz) {
         const cache_dir = opt_cache_dir orelse @panic("missing --cache-dir=[path] argument");
@@ -208,13 +242,13 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 defer string_bytes.deinit(gpa);
                 try string_bytes.append(gpa, 0); // Reserve 0 for null.
 
-                const test_fns = builtin.test_functions;
-                const names = try gpa.alloc(u32, test_fns.len);
+                const names = try gpa.alloc(u32, selected_tests.len);
                 defer gpa.free(names);
-                const expected_panic_msgs = try gpa.alloc(u32, test_fns.len);
+                const expected_panic_msgs = try gpa.alloc(u32, selected_tests.len);
                 defer gpa.free(expected_panic_msgs);
 
-                for (test_fns, names, expected_panic_msgs) |test_fn, *name, *expected_panic_msg| {
+                for (selected_tests, names, expected_panic_msgs) |fn_index, *name, *expected_panic_msg| {
+                    const test_fn = builtin.test_functions[fn_index];
                     name.* = @intCast(string_bytes.items.len);
                     try string_bytes.ensureUnusedCapacity(gpa, test_fn.name.len + 1);
                     string_bytes.appendSliceAssumeCapacity(test_fn.name);
@@ -241,7 +275,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 });
                 log_err_count = 0;
                 const index = try server.receiveBody_u32();
-                const test_fn = builtin.test_functions[index];
+                const test_fn = builtin.test_functions[selected_tests[index]];
                 is_fuzz_test = false;
 
                 // let the build server know we're starting the test now
@@ -369,19 +403,19 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
     @disableInstrumentation();
     if (builtin.fuzz) @panic("fuzz test requires server");
 
-    const test_fn_list = builtin.test_functions;
     var ok_count: usize = 0;
     var skip_count: usize = 0;
     var fail_count: usize = 0;
     var fuzz_count: usize = 0;
     const root_node = if (builtin.fuzz) std.Progress.Node.none else std.Progress.start(runner_threaded_io, .{
         .root_name = "Test",
-        .estimated_total_items = test_fn_list.len,
+        .estimated_total_items = selected_tests.len,
     });
     const have_tty = Io.File.stderr().isTty(runner_threaded_io) catch unreachable;
 
     var leaks: usize = 0;
-    for (test_fn_list, 0..) |test_fn, i| {
+    for (selected_tests, 0..) |fn_index, i| {
+        const test_fn = builtin.test_functions[fn_index];
         testing.allocator_instance = .init(std.heap.page_allocator, .{
             .canary = 0xc3a701ba,
             .check_write_after_free = true,
@@ -404,7 +438,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
 
         const test_node = root_node.start(test_fn.name, 0);
         if (!have_tty) {
-            std.debug.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name });
+            std.debug.print("{d}/{d} {s}...", .{ i + 1, selected_tests.len, test_fn.name });
         }
         is_fuzz_test = false;
         if (runTest(test_fn.func)) |_| {
@@ -417,7 +451,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
                 ran = .SKIP;
                 skip_count += 1;
                 if (have_tty) {
-                    std.debug.print("{d}/{d} {s}...SKIP\n", .{ i + 1, test_fn_list.len, test_fn.name });
+                    std.debug.print("{d}/{d} {s}...SKIP\n", .{ i + 1, selected_tests.len, test_fn.name });
                 } else {
                     std.debug.print("SKIP\n", .{});
                 }
@@ -427,7 +461,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
                 fail_count += 1;
                 if (have_tty) {
                     std.debug.print("{d}/{d} {s}...FAIL ({t})\n", .{
-                        i + 1, test_fn_list.len, test_fn.name, err,
+                        i + 1, selected_tests.len, test_fn.name, err,
                     });
                 } else {
                     std.debug.print("FAIL ({t})\n", .{err});
@@ -442,7 +476,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
     }
     root_node.end();
     logDone();
-    if (ok_count == test_fn_list.len) {
+    if (ok_count == selected_tests.len) {
         std.debug.print("All {d} tests passed.\n", .{ok_count});
     } else {
         std.debug.print("{d} passed; {d} skipped; {d} failed.\n", .{ ok_count, skip_count, fail_count });

@@ -87,6 +87,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   <f> fail` when its process ends, and prints nothing. A leak or a logged error is a FAIL, as the build runner counts
   it; a crashed test has no line (the build runner's error names it) and the restarted process ends on a DONE of its own.
   The slow tests: `sort -t$'\t' -k4,4rn <file> | head`.
+  `SUSHI_TEST_SELECT` (one name prefix a line, `!<prefix>` drops) makes the runner run only the tests it selects, so
+  several run steps can share one binary; one that selects nothing fails, naming its step.
 - Every test compile declares its measured peak RSS (`max_rss`, `bucket_compile_gib` in build.zig), so `zig build test
   --maxrss <bytes>` runs only the compiles that fit at once; run steps declare none, since RSS does not see Metal.
   Without `--maxrss` the budget is the machine's RAM (`hw.memsize`); a box under the largest bound, test-rest's

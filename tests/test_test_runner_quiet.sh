@@ -127,7 +127,8 @@ pub fn build(b: *std.Build) void {
         .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .server },
     });
     const run = b.addRunArtifact(t);
-    run.setEnvironmentVariable("SUSHI_TEST_LOG", b.option([]const u8, "log", "").?);
+    const log = b.option([]const u8, "log", "").?;
+    run.setEnvironmentVariable("SUSHI_TEST_LOG", log);
     run.setEnvironmentVariable("SUSHI_TEST_STEP", "scratch step");
     b.default_step.dependOn(&run.step);
     b.installArtifact(b.addTest(.{
@@ -135,6 +136,16 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{ .root_source_file = b.path("by_hand.zig"), .target = target }),
         .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .server },
     }));
+    if (b.option([]const u8, "select", "")) |select| {
+        const run_select = b.addRunArtifact(b.addTest(.{
+            .root_module = b.createModule(.{ .root_source_file = b.path("select.zig"), .target = target }),
+            .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .server },
+        }));
+        run_select.setEnvironmentVariable("SUSHI_TEST_SELECT", select);
+        run_select.setEnvironmentVariable("SUSHI_TEST_LOG", log);
+        run_select.setEnvironmentVariable("SUSHI_TEST_STEP", "select step");
+        b.step("select", "").dependOn(&run_select.step);
+    }
 }
 EOF
 cat >"$TMP/scratch/by_hand.zig" <<'EOF'
@@ -163,6 +174,56 @@ want="by hand|PASS|by_hand.test.passes;by hand|SKIP|by_hand.test.skips;by hand|F
 want+="by hand|DONE|1 pass, 1 skip, 1 fail;"
 if [ "$got" != "$want" ] || LC_ALL=C grep -v -E "$LINE" "$TMP/by-hand.tsv" >/dev/null; then
   echo "  FAIL: a test binary run by hand should log [$want], got [$got]"
+  FAIL=1
+fi
+
+# SUSHI_TEST_SELECT: the runner keeps the tests whose name starts with a line of it, less those a `!` line names, and
+# the build runner sees only those; one that selects nothing fails, naming its step.
+cat >"$TMP/scratch/select.zig" <<'EOF'
+const std = @import("std");
+test "alpha one" {}
+test "alpha two" {
+    try std.testing.expect(false);
+}
+test "beta" {
+    return error.SkipZigTest;
+}
+test "gamma" {
+    try std.testing.expect(false);
+}
+const Inner = struct {
+    test "nested" {}
+};
+test {
+    _ = Inner;
+}
+EOF
+select=$'select.test.alpha\n!select.test.alpha two\nselect.Inner.\nselect.test.beta'
+(cd "$TMP/scratch" && "$ZIG" build select "-Dselect=$select" "-Dlog=$TMP/select.tsv" >"$TMP/out" 2>&1)
+SELECT_RC=$?
+got=$(grep -v $'\tDONE\t' "$TMP/select.tsv" 2>/dev/null | cut -f2,3,5 | tr '\t' '|' | sort | tr '\n' ';')
+got+=$(grep $'\tDONE\t' "$TMP/select.tsv" 2>/dev/null | cut -f2,3,5 | tr '\t' '|' | tr '\n' ';')
+want="select step|PASS|select.Inner.test.nested;select step|PASS|select.test.alpha one;select step|SKIP|select.test.beta;"
+want+="select step|DONE|2 pass, 1 skip, 0 fail;"
+if [ $SELECT_RC -ne 0 ] || [ "$got" != "$want" ]; then
+  echo "  FAIL: SUSHI_TEST_SELECT should run and log only [$want] and pass, got [$got] (exit $SELECT_RC)"
+  sed 's/^/    | /' "$TMP/out" | head -20
+  FAIL=1
+fi
+rm -f "$TMP/select.tsv"
+if (cd "$TMP/scratch" && "$ZIG" build select "-Dselect=select.test.zeta" "-Dlog=$TMP/select.tsv" >"$TMP/out" 2>&1) ||
+  ! grep -q "step 'select step': SUSHI_TEST_SELECT selects no test of this binary" "$TMP/out"; then
+  echo "  FAIL: a SUSHI_TEST_SELECT that selects nothing should fail, naming its step"
+  sed 's/^/    | /' "$TMP/out" | head -20
+  FAIL=1
+fi
+SUSHI_TEST_SELECT=$'by_hand.test.passes\nby_hand.test.skips' SUSHI_TEST_LOG="$TMP/by-hand-select.tsv" \
+  SUSHI_TEST_STEP="by hand" "$TMP/scratch/zig-out/bin/by-hand" >/dev/null 2>&1
+BY_HAND_RC=$?
+got=$(cut -f3,5 "$TMP/by-hand-select.tsv" 2>/dev/null | tr '\t' '|' | tr '\n' ';')
+want="PASS|by_hand.test.passes;SKIP|by_hand.test.skips;DONE|1 pass, 1 skip, 0 fail;"
+if [ $BY_HAND_RC -ne 0 ] || [ "$got" != "$want" ]; then
+  echo "  FAIL: a binary run by hand under SUSHI_TEST_SELECT should run and log only [$want], got [$got] (exit $BY_HAND_RC)"
   FAIL=1
 fi
 
