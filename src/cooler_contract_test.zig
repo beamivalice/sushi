@@ -1859,7 +1859,7 @@ const Served = struct {
         _ = setenv("SUSHI_PREFIX_CACHE_DIR", self.cache_dir.ptr, 1);
         defer _ = unsetenv("SUSHI_PREFIX_CACHE_DIR");
         const server_state = @import("server_state.zig");
-        try model_load.attachPrefixCache(a, io, self.entry, .{
+        model_load.attachPrefixCache(a, io, self.entry, .{
             .capacity = 4,
             .ram_enabled = false,
             .mem_bytes = 0,
