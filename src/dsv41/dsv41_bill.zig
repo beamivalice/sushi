@@ -115,9 +115,9 @@ pub fn prefillChunkLoadLine(config: *const model_mod.ModelConfig, buf: []u8, pin
     return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from DeepSeek's {d}; --prefill-chunk overrides)\n", .{ pinned, start }) catch null;
 }
 
-/// `dsv41_borrow.headroom_fn`: the one live headroom (`bills.headroomNow`).
+/// `dsv41_borrow.headroom_fn`: the live headroom of the lessee of the pools it releases (`bills.leaseHolderHeadroomNow`).
 pub fn dsv41Headroom(config: *const model_mod.ModelConfig) bills.Headroom {
-    return bills.headroomNow(config, 0);
+    return bills.leaseHolderHeadroomNow(config);
 }
 
 /// PURE: `dsv41Headroom` over the readings. `active` is `gpu_mem.activeBytes`, MLX's and the engine's bytes in use.

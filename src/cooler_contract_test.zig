@@ -5702,6 +5702,78 @@ test "cooler contract: a DeepSeek prefill that releases decoder pools keeps them
     }
 }
 
+test "cooler contract: a DeepSeek decoder pool left released with no lessee, beside the engine's parked free buffers, is held off admission, a co-loaded model's, the other forwards' headroom and a load's preflight, and only the lessee's own reading counts it" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const bills = @import("bills.zig");
+    const gpu_mem = @import("gpu_mem.zig");
+    const status = @import("status.zig");
+    const ids = try D.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(D, dir, true);
+    defer _ = ld.close();
+    const engine = arch_handle.trunk(ld.h).expert_stream.?;
+    if (engine.borrow_from >= engine.layers.len) return error.SkipZigTest;
+    // Free RAM never binds: the ceiling is the GPU's, so only what the engine holds moves the readings.
+    const avail_was = status.available_mem_override;
+    status.available_mem_override = 1 << 40;
+    defer status.available_mem_override = avail_was;
+    // A request first: it parks the engine's free buffers, which admission credits as its forwards reuse them.
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    var prompt: [40]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 2) % ids.len];
+    var f: u32 = 0;
+    var said = try sv.request(&prompt, 8, &f);
+    said.deinit(a);
+    try testing.expect(gpu_mem.engineFree() > 0);
+    const config = &ld.config;
+    var qwen = @import("bills_fixtures_test.zig").qwen4ExpOomConfig();
+    const Reading = struct { admission: u64, beside: u64, forward: u64, load: u64, own: u64 };
+    const read = struct {
+        fn at(c: *const model_mod.ModelConfig, q: *const model_mod.ModelConfig) Reading {
+            return .{
+                .admission = bills.admissionAvailableNow(c),
+                .beside = bills.admissionAvailableNow(q),
+                .forward = bills.prefillHeadroomNow(c, 0),
+                .load = bills.FitReadings.now(q).preflightAvailable(true).bytes orelse 0,
+                .own = @import("dsv41/dsv41_bill.zig").dsv41Headroom(c).bound(),
+            };
+        }
+    }.at;
+    const rest = read(config, &qwen);
+    // A borrower that ended before any decode-width forward (cancelled, failed, its reply done at its prefill) leaves
+    // its pools released with no lessee: the next decode-width forward reads them back whole. Two: on a resident pack
+    // the first release pays for the union workspace, which the last read-back drops.
+    if (engine.layers.len - engine.borrow_from < 2) return error.SkipZigTest;
+    const last: u16 = @intCast(engine.layers.len - 1);
+    var lent = try engine.borrowLayer(last);
+    lent += engine.borrowLayer(last - 1) catch |e| {
+        try engine.restoreLayer(last);
+        return e;
+    };
+    const now = read(config, &qwen);
+    try engine.restoreLayer(last - 1);
+    try engine.restoreLayer(last);
+    errdefer std.debug.print("cooler contract: {d} B lent, union {d} B; at rest {any}, lent {any}\n", .{ lent, engine.unionBytes(), rest, now });
+    try testing.expect(lent > 0);
+    // Held off once: a reading that credits no free buffer falls by those the release parked, none by the pools again.
+    for ([_][2]u64{ .{ rest.admission, now.admission }, .{ rest.beside, now.beside }, .{ rest.forward, now.forward }, .{ rest.load, now.load } }) |r| {
+        try testing.expect(r[1] <= r[0]);
+        try testing.expect(r[0] - r[1] < lent / 2);
+    }
+    // The read-back's room: the lessee's own reading counts what it takes back.
+    try testing.expect(now.own > rest.own);
+}
+
 /// One request prefilled under `LeaseProbe`, so its wide chunk released decoder pools, and decoding.
 const LeasedDecode = struct {
     sv: Served,

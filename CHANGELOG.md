@@ -33,6 +33,9 @@ earlier history is mlx-serve's, in that project's changelog.
   those it reaches within the next second.
 - **A long Qwen3.8 conversation's next turn is refused less often near the memory limit**: a turn that takes the cached
   conversation over is no longer billed again for the room its taken-over cache already holds for the reply.
+- **A DeepSeek-V4.1 request admitted while another request's borrowed decoder pools are out is no longer promised the
+  memory they take back**: pools a long prefill released and had not yet read back counted as free, so a request
+  admitted then could run short, or keep the pools from coming back, when they did.
 - **Continuing a cut reply of a long Qwen3.8 conversation near the memory limit is no longer refused**: a turn whose
   prompt was exactly the cached conversation (an assistant prefill continuing a reply cut at `max_tokens`) was refused
   for memory where a longer or shorter one took the cached conversation over; it now takes it over too.

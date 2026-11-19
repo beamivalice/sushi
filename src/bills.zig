@@ -692,7 +692,9 @@ pub const FitReadings = struct {
     unplanned: u64 = 0,
 
     pub fn now(config: *const model_mod.ModelConfig) FitReadings {
-        const active: u64 = gpu_mem.activeBytes();
+        // The lent decoder pools are in use for a load (`promisedActive`), and not the free RAM their pages show as.
+        const lent = gpu_mem.lentBytes();
+        const active: u64 = gpu_mem.activeBytes() +| lent;
         return .{
             .wired_limit = wiredLimitBytes(),
             .budget_working_set = staticGpuMemoryCeiling(),
@@ -700,8 +702,8 @@ pub const FitReadings = struct {
             .wired_floor = wiredCeilingFloorFor(config),
             .active = active,
             .cache = gpu_mem.cacheBytes(),
-            .free = metrics.getAvailableMemBytes(),
-            .proc_free = metrics.getProcAvailableMemBytes(),
+            .free = metrics.getAvailableMemBytes() -| lent,
+            .proc_free = metrics.getProcAvailableMemBytes() -| lent,
             .total_ram = metrics.getTotalMemBytes(),
             .unplanned = wiredUnplannedBytes(launch_state.wired_limit_margin_bytes, gpu_floor_bytes.load(.monotonic)),
         };
@@ -1657,7 +1659,7 @@ fn logOneSessionAsk(ask: u64, ctx_tokens: u64, one: OneSession) void {
 pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, revise: scheduler_mod.BudgetRevise, idle_out: *u64) u64 {
     // RAM-first default: no idle allowance. Written first so every early return carries it.
     idle_out.* = 0;
-    var active_mem: usize = gpu_mem.activeBytes();
+    var active_mem: usize = promisedActive(gpu_mem.activeBytes());
     active_mem -|= @as(usize, @intCast(@min(revise.exclude_bytes, std.math.maxInt(usize))));
     const kv_bits: u64 = defaultKvBits(config);
     // Arch gate: the budget resolver changed three inputs at once (static ceiling, the
@@ -2917,7 +2919,14 @@ fn parkedBytes(config: *const model_mod.ModelConfig, engine_free: u64) u64 {
 /// scheduler runs the request at (`requestPrefillChunkNow`) read this one number.
 pub fn admissionAvailableNow(config: *const model_mod.ModelConfig) u64 {
     const active_mem: usize = gpu_mem.activeBytes();
-    return admissionAvailableFor(config, liveGpuMemoryCeiling(config, active_mem), active_mem, gpu_mem.engineFree());
+    return admissionAvailableFor(config, liveGpuMemoryCeiling(config, active_mem), promisedActive(active_mem), gpu_mem.engineFree());
+}
+
+/// What a reading whose promise outlives a lease counts in use: the active bytes and the decoder pools lent out of
+/// them, which their lessee's read-back takes back. Only the lessee's own reading (`leaseHolderHeadroomNow`) counts
+/// them free. The ceiling is read from the active bytes alone: the lent pages are the system's until the read-back.
+fn promisedActive(active: u64) u64 {
+    return active +| gpu_mem.lentBytes();
 }
 
 /// One reading of the memory a forward, an encode or a pool's read-back may take now. `live` is the ceiling less the
@@ -2946,10 +2955,17 @@ pub fn headroomFrom(config: *const model_mod.ModelConfig, ceiling: u64, active: 
     };
 }
 
-/// `headroomFrom` over the live readings.
+/// `headroomFrom` over the live readings, the lent decoder pools held off (`promisedActive`).
 pub fn headroomNow(config: *const model_mod.ModelConfig, staged_host: u64) Headroom {
     const active_mem: usize = gpu_mem.activeBytes();
-    return headroomFrom(config, liveGpuMemoryCeiling(config, active_mem), active_mem, staged_host, gpu_mem.engineFree());
+    return headroomFrom(config, liveGpuMemoryCeiling(config, active_mem), promisedActive(active_mem), staged_host, gpu_mem.engineFree());
+}
+
+/// The one reading that counts the lent decoder pools free: their lessee's (DeepSeek's borrow, for its prefill's
+/// releases and its read-back), whose own forwards take them back.
+pub fn leaseHolderHeadroomNow(config: *const model_mod.ModelConfig) Headroom {
+    const active_mem: usize = gpu_mem.activeBytes();
+    return headroomFrom(config, liveGpuMemoryCeiling(config, active_mem), active_mem, 0, gpu_mem.engineFree());
 }
 
 /// PURE half of `prefillHeadroomNow`.

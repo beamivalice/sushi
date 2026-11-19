@@ -30,6 +30,12 @@ pub fn engineFree() usize {
     return mlx.engine.poolFree();
 }
 
+/// The decoder pools lent out of the active bytes, which their lessee's read-back takes back (`expert_stream.lent_total`).
+pub fn lentBytes() u64 {
+    if (host_tier) return liveRead();
+    return @import("expert_stream.zig").lent_total.load(.monotonic);
+}
+
 /// MLX's reclaimable pool plus the engine's free pool buffers: held by the process, reusable only by their owner.
 pub fn cacheBytes() usize {
     if (host_tier) return liveRead();
@@ -54,7 +60,8 @@ pub fn resetPeak() void {
     mlx.engine.resetPoolPeak(.process);
 }
 
-fn engineInUse() usize {
+/// The engine's pool buffers bound to tensors and the mappings it wraps: its part of `activeBytes`.
+pub fn engineInUse() usize {
     return (mlx.engine.poolTotal() -| mlx.engine.poolFree()) + mlx.engine.mappedTotal();
 }
 

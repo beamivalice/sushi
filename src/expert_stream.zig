@@ -2,6 +2,7 @@ const std = @import("std");
 const expert_stats = @import("expert_stats.zig");
 const fill_marks = @import("fill_marks.zig");
 const mlx = @import("mlx.zig");
+const gpu_mem = @import("gpu_mem.zig");
 const log = @import("log.zig");
 const io_mod = @import("expert_io.zig");
 const kernels = @import("expert_bf16_kernels.zig");
@@ -1197,6 +1198,16 @@ pub const Bf16NgramStore = struct {
 
 pub var slab_release_timeouts: std.atomic.Value(u64) = .init(0);
 
+/// Every engine's lent decoder pools (`Engine.lentOutstanding`), the process's: a promise that outlives a lease counts
+/// them in use (`gpu_mem.lentBytes`). Written only by `Engine.publishLent`.
+pub var lent_total: std.atomic.Value(u64) = .init(0);
+
+/// What a release frees for a reading that credits the engine's free buffers (`bills.admissionAvailableFor`): a buffer
+/// that leaves those in use for the free ones counts twice, since the read-back reuses it.
+fn lentReading() i64 {
+    return -@as(i64, @intCast(gpu_mem.engineInUse())) + @as(i64, @intCast(mlx.engine.poolFree()));
+}
+
 const SlabOperand = struct {
     present: bool = false,
     slab: ?*io_mod.PageSlab = null,
@@ -1665,6 +1676,8 @@ const LayerState = struct {
     /// release gave back.
     saved: []u16 = &.{},
     lent: u64 = 0,
+    /// What the release, union workspace included, moved in `lentReading` (`Engine.lentOutstanding`).
+    lent_read: i64 = 0,
     /// A resident pack's int32 `[experts]` map from expert id to its global slot in the cache bank; null while released.
     resident_map: mlx.mlx_array = .{ .ctx = null },
     /// A rate-grouped layer's `substituteMisses` starvation counts, by global expert id.
@@ -2073,6 +2086,8 @@ pub const Engine = struct {
     /// published (`ModelConfig.expert_borrow_bytes`, read by admission on other threads).
     borrow_from: u16 = std.math.maxInt(u16),
     borrow_publish: ?*u64 = null,
+    /// This engine's share of `lent_total`, as last published.
+    lent_published: u64 = 0,
     /// Routed ids the lossy pick replaced on rate-grouped layers, of the ids it saw (`swapGroupedMisses`).
     swapped_ids: u64 = 0,
     swap_seen_ids: u64 = 0,
@@ -2273,6 +2288,7 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         expert_stats.process.engine(false, self.plan.cache_bytes);
+        self.publishLent(0);
         self.stopPrefetch();
         self.drainPendingReaders();
         self.releaseSlabs();
@@ -3151,8 +3167,26 @@ pub const Engine = struct {
         return .{ .map = layer.resident_map, .bank = &layer.grouped.?.cache_ragged };
     }
 
-    pub fn publishBorrowable(self: *const Engine) void {
+    /// Publishes what a prefill may still borrow (`ModelConfig.expert_borrow_bytes`) and what is lent (`lent_total`).
+    pub fn publishBorrowable(self: *Engine) void {
         if (self.borrow_publish) |dst| @atomicStore(u64, dst, self.borrowableBytes(), .monotonic);
+        self.publishLent(self.lentOutstanding());
+    }
+
+    fn publishLent(self: *Engine, lent: u64) void {
+        _ = lent_total.fetchAdd(lent, .monotonic);
+        _ = lent_total.fetchSub(self.lent_published, .monotonic);
+        self.lent_published = lent;
+    }
+
+    /// What the released pools' read-back takes back from admission's reading: what each release, its union workspace
+    /// included (a resident pack's, which the last read-back drops), moved in `lentReading`.
+    pub fn lentOutstanding(self: *const Engine) u64 {
+        var lent: i64 = 0;
+        for (self.layers) |*layer| if (layer.borrowed) {
+            lent += layer.lent_read;
+        };
+        return @intCast(@max(lent, 0));
     }
 
     /// Releases rate-grouped layer `li`'s pool: its experts are remembered, its bank dropped and its slabs unmapped
@@ -3173,6 +3207,7 @@ pub const Engine = struct {
             }
         }
         layer.saved = try saved.toOwnedSlice(self.allocator);
+        const before = lentReading();
         const freed = self.dropPool(layer, gl);
         layer.borrowed = true;
         layer.lent = freed;
@@ -3181,6 +3216,7 @@ pub const Engine = struct {
             self.restoreLayer(li) catch |re| log.err("[expert-stream] layer {d} stays released with no union workspace until the next forward: {s}\n", .{ li, @errorName(re) });
             return e;
         };
+        layer.lent_read = lentReading() - before;
         self.publishBorrowable();
         return freed;
     }

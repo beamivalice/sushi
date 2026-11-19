@@ -387,6 +387,10 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   whole bill, and the cap in force, at least the resting cap a request's end leaves, holds the heal.
   A refused read-back never fails the decode: its layer and the ones after it stay released, served by the union
   workspace, and a later forward retries them.
+- **Lent pools are no one else's free memory**: while pools stay released (a borrower that ended before any decode-width
+  forward, a refused read-back), every reading whose promise outlives the lease holds them off (`gpu_mem.lentBytes`,
+  [engine-memory-admission](engine-memory-admission.md#gpu-memory-readers)); only the lessee's borrow and read-back count
+  them free.
 - Log lines: `[dsv41-borrow] released layers a..39 (X GB) for a N-row forward at P: need, headroom before -> after,
   unwired in T ms` and `[dsv41-borrow] restored n layers (X GB) in T ms before decode`.
 
