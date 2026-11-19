@@ -122,6 +122,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   each chunk it read, so it briefly held about twice the conversation's cache before the request was admitted.
 - **MLX-route speed: a turn that reuses a trimmed cached conversation no longer copies its cache every token**: when
   the turn diverged before the cached end, each new token copied the whole cache until it caught up.
+- **DeepSeek-V4.1 on the MLX engine (`--ds41-mlx-engine`) no longer copies its compressed cache every token**: its row
+  stores grow on MLX's page grid, so each token's rows are written in place.
 - **APIs and server**: a shutdown refuses the requests still waiting from the moment it is asked, instead of serving
   those it reaches within the next second.
 - **Stopping the server during an unload answers the requests waiting on that model**: a request sent while an unload

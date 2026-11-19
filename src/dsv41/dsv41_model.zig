@@ -11,6 +11,7 @@ const arm_trial = @import("../arm_trial.zig");
 const log = @import("../log.zig");
 const builtin = @import("builtin");
 const cfg_mod = @import("dsv41_config.zig");
+const mlx_pages = @import("../mlx_pages.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
@@ -343,11 +344,10 @@ pub const Rows = struct {
         if (self.sbuf.ctx != null) _ = mlx.mlx_array_free(self.sbuf);
     }
 
-    /// `buf` grown to `cap` rows of `cols`, its first `used` rows kept.
+    /// `buf` grown to `cap` rows of `cols`, its first `used` rows kept (`cap` from `pagedCap`).
     fn grow(buf: *A, used: usize, cap: usize, cols: usize, dt: mlx.mlx_dtype, s: S) !void {
-        var z = mlx.mlx_array_new();
+        var z = try mlx_pages.inPlaceBuffer(&.{ ci(cap), ci(cols) }, dt, s);
         errdefer _ = mlx.mlx_array_free(z);
-        try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ ci(cap), ci(cols) }, 2, dt, s));
         if (used > 0) {
             var old = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(old);
@@ -372,10 +372,19 @@ pub const Rows = struct {
         buf.* = up;
     }
 
+    /// `count` rows on MLX's page grid for every buffer that grows with these rows (`mlx_pages`), so each append writes in
+    /// place; the engine of our own appends in place at any size.
+    fn pagedCap(self: *const Rows, count: usize, s: S) usize {
+        if (mlx.engine.isStream(s)) return count;
+        const item: u64 = @import("../tensor/core.zig").itemSize(self.dtype);
+        const parts: []const u64 = if (self.pack) |pk| &.{ self.width / 2, self.width / pk.group } else &.{self.width * item};
+        return @intCast(mlx_pages.pagedCountAll(count, parts));
+    }
+
     /// The grow the next append would make, made now: a buffer of this state's own with that append's slack.
     fn reserve(self: *Rows, s: S) !void {
         if (self.used == 0) return;
-        const cap = @max(64, self.used + @max(1, self.used / cfg_mod.rows_grow_div));
+        const cap = self.pagedCap(@max(64, self.used + @max(1, self.used / cfg_mod.rows_grow_div)), s);
         if (self.pack) |pk| {
             try grow(&self.buf, self.used, cap, self.width / 2, .uint8, s);
             try grow(&self.sbuf, self.used, cap, self.width / pk.group, .uint8, s);
@@ -400,7 +409,7 @@ pub const Rows = struct {
         if (n == 0) return;
         const s = sc.s;
         if (self.used + n > self.cap) {
-            const cap = @max(self.used + n, @max(64, self.cap + self.cap / cfg_mod.rows_grow_div));
+            const cap = self.pagedCap(@max(self.used + n, @max(64, self.cap + self.cap / cfg_mod.rows_grow_div)), s);
             if (self.pack) |pk| {
                 try grow(&self.buf, self.used, cap, self.width / 2, .uint8, s);
                 try grow(&self.sbuf, self.used, cap, self.width / pk.group, .uint8, s);
@@ -7936,4 +7945,46 @@ test "dsv41 pipeline: the ring hands back the oldest layer once more than the de
     try testing.expectEqual(h.at(3 + 2 * pipe_max).ctx, ring.pop().?.ctx);
     try testing.expectEqual(@as(?A, null), ring.pop());
     try testing.expectEqual(@as(usize, 0), ring.n);
+}
+
+test "dsv41 rows on MLX append in place when MLX's pool holds buffers a page past them, and the grid adds under one step" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var sc = Scope.plain(std.testing.allocator, s);
+    defer sc.deinit();
+    // A 512-wide BF16 compressed-KV layer (1 KiB a row): 3,000 rows, then single rows until the store grows by its
+    // sixteenth: 3,187 rows are 199.2 pages, a free 201-page buffer is theirs and MLX never donates it; on the grid
+    // the grow takes 3,200 rows, 200 pages, and the same buffer is donated.
+    var rows: Rows = .{ .width = 512, .dtype = .bfloat16 };
+    defer rows.deinit();
+    var big = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(big);
+    try mlx.check(mlx.mlx_ones(&big, &[_]c_int{ 3000, 512 }, 2, .bfloat16, s));
+    var one = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(one);
+    try mlx.check(mlx.mlx_ones(&one, &[_]c_int{ 1, 512 }, 2, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(big));
+    try mlx.check(mlx.mlx_array_eval(one));
+    try rows.append(&sc, big);
+    try mlx.check(mlx.mlx_array_eval(rows.buf));
+    try mlx.check(mlx.mlx_synchronize(s));
+    try @import("../test_support.zig").seedMlxPool(s, 201 * 16384, 16);
+    const before = rows.cap;
+    var grown_at: ?[*]const u8 = null;
+    var after: usize = 0;
+    var moved: usize = 0;
+    while (after < 5) {
+        try rows.append(&sc, one);
+        try mlx.check(mlx.mlx_array_eval(rows.buf));
+        try mlx.check(mlx.mlx_synchronize(s));
+        if (rows.cap == before) continue;
+        const p = mlx.mlx_array_data_uint8(rows.buf);
+        if (grown_at) |g| {
+            if (p != g) moved += 1;
+            after += 1;
+        } else grown_at = p;
+    }
+    try std.testing.expectEqual(@as(usize, 0), moved);
+    const asked = before + before / cfg_mod.rows_grow_div;
+    try std.testing.expect((rows.cap - asked) * 1024 < mlx_pages.gridStepBytes(&.{1024}));
 }

@@ -136,7 +136,7 @@ pub fn enterForward(rows: u64, seq: u64, config: *const ModelConfig, c: *const C
 /// `enterForward` of a joined decode forward, a row per request at `seqs`: its cap is `Config.joinedCap`.
 pub fn enterRows(seqs: []const u64, config: *const ModelConfig, c: *const Config, ops: PoolOps) bool {
     if (!arch_config.isOf(config, "dsv41")) return false;
-    const cap = c.joinedCap(seqs);
+    const cap = c.joinedCapOn(cooler_side.onEngine(config), seqs);
     if (cooler_side.onEngine(config)) {
         ops.set_own(ownBudget(cap));
         return false;
@@ -828,7 +828,7 @@ test "dsv41 borrow: a joined decode forward of one request installs that request
                 try testing.expectEqual(solo, .{ PoolProbe.own, PoolProbe.transient });
                 PoolProbe.reset();
                 _ = enterRows(&.{ 4097, 70_000 }, &config, c, PoolProbe.ops);
-                const two = c.forwardCap(1, 4097) + c.forwardCap(1, 70_000) - cfg_mod.cap_fixed_bytes;
+                const two = c.forwardCapOn(cooler, 1, 4097) + c.forwardCapOn(cooler, 1, 70_000) - cfg_mod.cap_fixed_bytes;
                 if (cooler) try testing.expectEqual(two, PoolProbe.own) else try testing.expectEqual(two, PoolProbe.transient - config.expertPoolBytes());
             }
         }
@@ -917,9 +917,9 @@ test "dsv41 borrow: every phase installs the cap it bills and the decode pool be
             const c = &config.dsv41.?;
             const pool = config.expertPoolBytes();
             _ = enterForward(1, 9_000, &config, c, PoolProbe.ops);
-            try testing.expectEqual(c.forwardCap(1, 9_000) + pool, PoolProbe.transient);
+            try testing.expectEqual(c.mlxForwardCap(1, 9_000) + pool, PoolProbe.transient);
             _ = enterForward(17, 225_000, &config, c, PoolProbe.ops);
-            try testing.expectEqual(c.forwardCap(17, 225_000) + pool, PoolProbe.transient);
+            try testing.expectEqual(c.mlxForwardCap(17, 225_000) + pool, PoolProbe.transient);
             _ = enterForward(2048, 225_000, &config, c, PoolProbe.ops);
             try testing.expectEqual(c.mlxForwardCap(2048, 225_000) + pool, PoolProbe.transient);
             // The same rows further into the context cost more: the cap follows the position.

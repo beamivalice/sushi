@@ -42,6 +42,18 @@ pub fn pagedCountAll(rows: u64, part_bytes: []const u64) u64 {
     }
 }
 
+/// PURE: the bytes one grid step of `pagedCountAll` spans across buffers of `part_bytes` a row: the most the grid adds.
+pub fn gridStepBytes(part_bytes: []const u64) u64 {
+    var step: u64 = 1;
+    for (part_bytes) |b| if (b > 0) {
+        const s = page / std.math.gcd(page, b);
+        step = step / std.math.gcd(step, s) * s;
+    };
+    var bytes: u64 = 0;
+    for (part_bytes) |b| bytes +|= step *| b;
+    return bytes;
+}
+
 /// PURE: what an append into a buffer of `bytes` copies when it sits off the page grid: the most MLX's pool hands it
 /// (its pages and one more), which MLX never donates. Zero on the grid or within a page, where the append is in place.
 pub fn offGridCopyBytes(bytes: u64) u64 {

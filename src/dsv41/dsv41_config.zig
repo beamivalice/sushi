@@ -267,9 +267,20 @@ pub const Config = struct {
     /// `forwardCap` of a load on MLX's stream: MLX's graph holds what its evaluation order keeps, which no shape sum
     /// of ours counts, so a prefill-width forward there keeps the per-row rate measured on it.
     pub fn mlxForwardCap(self: *const Config, rows: u64, seq: u64) u64 {
-        if (rows <= verify_rows) return self.forwardCap(rows, seq);
+        if (rows <= verify_rows) return self.forwardCap(rows, seq) +| self.rowsGridBytes();
         const ctx = @max(seq, 1);
-        return rows *| self.dim *| mlx_row_bytes_per_dim +| self.growthBytes(ctx) +| cap_fixed_bytes;
+        return rows *| self.dim *| mlx_row_bytes_per_dim +| self.growthBytes(ctx) +| self.rowsGridBytes() +| cap_fixed_bytes;
+    }
+
+    /// The most MLX's page grid adds to the row stores (`Rows.pagedCap`): under one grid step of each packed buffer.
+    pub fn rowsGridBytes(self: *const Config) u64 {
+        const pages = @import("../mlx_pages.zig");
+        var sum: u64 = 0;
+        for (0..self.layers) |l| {
+            if (self.isKvSource(l)) sum +|= pages.gridStepBytes(&.{ self.head_dim / 2, self.head_dim / 16 });
+            if (self.isOwner(l)) sum +|= pages.gridStepBytes(&.{ self.index_head_dim / 2, self.index_head_dim / 32 });
+        }
+        return sum;
     }
 
     /// `forwardCap` on the side a load runs on: the engine of our own (`engine`) or MLX.
@@ -284,8 +295,13 @@ pub const Config = struct {
     /// `forwardCap` of a joined decode forward, a row per request at `seqs`: each request's scores and state growth are
     /// its own, `cap_fixed_bytes` the forward's.
     pub fn joinedCap(self: *const Config, seqs: []const u64) u64 {
+        return self.joinedCapOn(true, seqs);
+    }
+
+    /// `joinedCap` on the side a load runs on (`forwardCapOn`): on MLX each request's row stores take the grid's step.
+    pub fn joinedCapOn(self: *const Config, engine: bool, seqs: []const u64) u64 {
         var sum: u64 = 0;
-        for (seqs) |seq| sum +|= self.forwardCap(1, seq) - cap_fixed_bytes;
+        for (seqs) |seq| sum +|= self.forwardCapOn(engine, 1, seq) - cap_fixed_bytes;
         return sum +| cap_fixed_bytes;
     }
 
