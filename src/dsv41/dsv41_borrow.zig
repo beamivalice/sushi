@@ -457,15 +457,16 @@ pub fn refusalText(buf: []u8, rows: u64, seq: u64, need: u64, have: u64, chunk_f
 
 fn writeRefusal(w: *std.Io.Writer, rows: u64, seq: u64, need: u64, have: u64, chunk_fits: u64) std.Io.Writer.Error!void {
     const u = Mem.unitOf(need, have);
-    try w.print("This prompt ran out of GPU memory partway through its prefill.\n", .{});
-    try w.print("Its {d}-token chunk, tokens {d} to {d}, needs {f}, and the free memory, with the expert cache lent to the prefill, holds {f}: {f} short. The chunks before it ran.\n", .{
-        rows, seq -| rows, seq, Mem.need(need, u), Mem.have(have, u), Mem.short(need, have, u),
+    // A first chunk has no chunk before it that ran, nor a shorter prompt those chunks prove.
+    const first = seq <= rows;
+    try w.print("This prompt ran out of GPU memory {s} its prefill.\n", .{if (first) "at the first chunk of" else "partway through"});
+    try w.print("Its {d}-token chunk, tokens {d} to {d}, needs {f}, and the free memory, with the expert cache lent to the prefill, holds {f}: {f} short.{s}\n", .{
+        rows, seq -| rows, seq, Mem.need(need, u), Mem.have(have, u), Mem.short(need, have, u), if (first) "" else " The chunks before it ran.",
     });
     try w.print("To serve it:\n", .{});
     if (chunk_fits > 0) try w.print("- Restart sushi with --prefill-chunk {d} (a launch flag; Settings has none): a narrower chunk needs less memory at this length.\n", .{chunk_fits});
     try w.print("- Quit other apps or unload another model on the Models page, then retry: the memory they hold comes back.", .{});
-    // A first chunk has no shorter prompt the chunks before it prove.
-    if (seq > rows) try w.print("\n- Shorten the prompt to {d} tokens or fewer: the chunks up to there fit.", .{seq - rows});
+    if (!first) try w.print("\n- Shorten the prompt to {d} tokens or fewer: the chunks up to there fit.", .{seq - rows});
 }
 
 fn refuse(c: *const Config, engine: bool, rows: u64, seq: u64, rest: u64, need: u64, have: u64) error{PrefillChunkDoesNotFit} {
@@ -1371,11 +1372,15 @@ test "dsv41 borrow: a mid-prefill refusal a byte short shows its need above what
     try testing.expect(std.mem.indexOf(u8, text, " holds 276 MB: 1 MB short.") != null);
 }
 
-test "dsv41 borrow: a first chunk refused mid-request names no shorter prompt (it would be 0 tokens)" {
+test "dsv41 borrow: a first chunk refused mid-request says it ran out at its first chunk, with no chunk before it run and no shorter prompt (it would be 0 tokens)" {
     const gib: u64 = 1 << 30;
     var buf: [1024]u8 = undefined;
     const text = refusalText(&buf, 2048, 2048, 5 * gib, 4 * gib, 1024);
     errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.startsWith(u8, text, "This prompt ran out of GPU memory at the first chunk of its prefill.\n"));
+    try testing.expect(std.mem.indexOf(u8, text, "tokens 0 to 2048, needs 5.0 GB") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "partway") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "The chunks before it ran.") == null);
     try testing.expect(std.mem.indexOf(u8, text, "Shorten the prompt") == null);
     try testing.expect(std.mem.endsWith(u8, text, "the memory they hold comes back."));
 }

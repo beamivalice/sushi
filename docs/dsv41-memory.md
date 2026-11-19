@@ -361,7 +361,8 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   reading inside the release loop stays flat and released every pool (issue 105). Still short, one more pool goes and
   is waited for (`releaseUntil`). A refused forward names the widest `--prefill-chunk` whose rerun of the prompt fits
   (`chunkThatFits`): every forward that width makes, priced where it ends with the state grown to there, its tail merged
-  only where the prompt has the rows (a full 511-row tail on every width offered a short prompt no width at all).
+  only where the prompt has the rows (a full 511-row tail on every width offered a short prompt no width at all). A first
+  chunk's refusal says it ran out at the first chunk: no chunk before it ran, and no shorter prompt is offered.
 - A release drops the layer's bank, waits for the slabs' holder to let go of each (MLX, or on a Cooler load the
   engine, whose own wait is enough) and unmaps it: the active count falls by exactly the pool's bytes (tested), and the forward waits up to 1 s for 90% of them to leave the wired set.
 - Under CED a decoder layer runs only the chunk's last 128 rows, so a released layer reads that chunk's picks (~130

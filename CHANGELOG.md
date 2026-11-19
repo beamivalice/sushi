@@ -47,6 +47,8 @@ earlier history is mlx-serve's, in that project's changelog.
   the unloaded model's memory (its prompt cache among it) until the next load succeeded.
 - **A long Qwen3.8 conversation's next turn is refused less often near the memory limit**: a turn that takes the cached
   conversation over is no longer billed again for the room its taken-over cache already holds for the reply.
+- **A DeepSeek-V4.1 prompt refused for memory at its first prefill chunk says so**: the refusal said it ran out
+  partway through the prefill and that the chunks before it ran, when none had.
 - **A DeepSeek-V4.1 request admitted under memory pressure is no longer promised memory a stranded or reading-back
   decoder pool holds**: a pool whose release failed half way, every pool released on an MLX load, and the workspace a
   read-back holds beside the pools it takes back counted as free.

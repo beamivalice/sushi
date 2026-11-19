@@ -2065,7 +2065,7 @@ fn borrowCase(cache_bytes: u64) !void {
     const chunk = try sc.ints(@as([]const i32, @ptrCast(ids[0..first])), &.{ 1, first });
     try testing.expectError(error.PrefillChunkDoesNotFit, xfm.forward(chunk));
     const refusal = @import("../forward_refusal.zig").take().?;
-    try testing.expect(std.mem.startsWith(u8, refusal.text(), "This prompt ran out of GPU memory partway through its prefill.\n"));
+    try testing.expect(std.mem.startsWith(u8, refusal.text(), "This prompt ran out of GPU memory at the first chunk of its prefill.\n"));
     for (engine.borrow_from..engine.layers.len) |li| try testing.expect(!engine.isBorrowed(@intCast(li)));
 }
 
