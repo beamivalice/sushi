@@ -3941,7 +3941,7 @@ const LateUnwireHeadroom = struct {
     }
 };
 
-test "cooler contract: the first served DeepSeek request after a Cooler load's warm starts from the state the second does, and its first wide prefill is served through a late-unwiring borrow (issue 107)" {
+test "cooler contract: the first served DeepSeek request after a Cooler load's warm starts from the state the second does, and a streamed load's first wide prefill is served through a late-unwiring borrow (issue 107)" {
     try eachFixture(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
@@ -3978,8 +3978,11 @@ test "cooler contract: the first served DeepSeek request after a Cooler load's w
             const rest = @max(starts[0].pool_free, starts[1].pool_free);
             const in_use = [2]u64{ starts[0].pool -| starts[0].pool_free, starts[1].pool -| starts[1].pool_free };
             errdefer std.debug.print("first request: MLX cache {d} KB, pool in use {d} KB, grew {d} KB, pool rest {d} KB; second: MLX cache {d} KB, pool in use {d} KB, grew {d} KB, pool rest {d} KB; borrowed {}\n", .{ starts[0].mlx_cache >> 10, in_use[0] >> 10, grew[0] >> 10, starts[0].pool_free >> 10, starts[1].mlx_cache >> 10, in_use[1] >> 10, grew[1] >> 10, starts[1].pool_free >> 10, LateUnwireHeadroom.borrowed });
-            // The late-unwiring borrow ran in the first request, and the request was served.
-            try testing.expect(LateUnwireHeadroom.borrowed);
+            // The late-unwiring borrow ran in the first request, and the request was served. Only a streamed load's
+            // decoder holds expert-cache pools a prefill can borrow: a resident one never takes the borrow path.
+            const stq = arch_handle.trunk(sv.entry.handle.?).arch_state.dsv41.stq_experts;
+            const lends = if (stq) |x| x.engine.borrow_from < x.engine.layers.len else false;
+            try testing.expectEqual(lends, LateUnwireHeadroom.borrowed);
             // A headroom read counts MLX's cache and the pool's free buffers as free: the first request starts as the second.
             try testing.expectEqual(starts[1].mlx_cache, starts[0].mlx_cache);
             // The warm leaves no more of the pool in use than a finished request does.
