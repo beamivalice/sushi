@@ -1289,6 +1289,34 @@ test "DeepSeek live rollback: only a state still standing for the same history s
     try testing.expectEqual(@as(?usize, null), try live.pick(net.m, turn[0..30], false, max));
 }
 
+test "DeepSeek live rollback: the same prompt sent again after a reply four times its length rolls back to its point, and the state then holds no rows past the prompt's own bill (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var turn_buf: [150]u32 = undefined;
+    const turn = dsv41LongPrompt(&net, &turn_buf, null, 0);
+    const prompt = turn[0..30];
+    var live: dsv41_prefix.Live = .{};
+    defer live.deinit(a);
+    dsv41_model.resetState(net.m);
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[0..20], .last));
+    var cp = try dsv41_prefix.capture(a, net.m, 20);
+    defer cp.deinit(a);
+    try live.keep(a, net.m, &cp, null);
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[20..30], .last));
+    // The reply: 120 tokens past a 30-token prompt.
+    for (0..12) |k| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[30 + 10 * k ..][0..10], .last));
+    try live.publish(a, net.m, turn, false, 0, null);
+    try testing.expect(!try dsv41_model.liveRowsFit(net.m, prompt.len));
+
+    const idx = try live.pick(net.m, prompt, false, std.math.maxInt(u32)) orelse return error.RegeneratePrefillsCold;
+    try live.rollback(a, net.m, idx, prompt);
+    try testing.expect(try dsv41_model.liveRowsFit(net.m, prompt.len));
+}
+
 test "DeepSeek live rollback: a turn that diverges inside the last turn's generation rolls back to its deepest kept point and continues like an SSD restore (DSV41_TINY)" {
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
     try mlx.requireGpu();

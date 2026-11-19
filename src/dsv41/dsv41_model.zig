@@ -383,6 +383,15 @@ pub const Rows = struct {
         self.cap = cap;
     }
 
+    /// The buffer cut back to the rows it holds with `reserve`'s slack, or gone when it holds none.
+    fn trim(self: *Rows, s: S) !void {
+        if (self.used > 0) return self.reserve(s);
+        self.deinit();
+        self.buf = none;
+        self.sbuf = none;
+        self.cap = 0;
+    }
+
     pub fn append(self: *Rows, sc: *Scope, x: A) !void {
         const n = dim(x, 0);
         if (n == 0) return;
@@ -3972,14 +3981,17 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
 }
 
 /// Whether no row buffer of the live state is larger than a `prompt_len`-token request's own would be, with the
-/// quarter its bill adds (`server.prefillNeededAtChunk`): the live buffers are kept whole by `rollbackState`, so only then are they paid for.
+/// quarter its bill adds (`server.prefillNeededAtChunk`): only then is it paid for (`rollbackState` trims one that is not).
 pub fn liveRowsFit(m: *const Model, prompt_len: usize) !bool {
     const st = (try currentState(m)) orelse return false;
     for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |r| {
-        const own = (prompt_len / m.ratio(li) + 1) * 5 / 4;
-        if (r.cap > @max(own, 64)) return false;
+        if (!rowsFit(m, li, r.cap, prompt_len)) return false;
     };
     return true;
+}
+
+fn rowsFit(m: *const Model, li: usize, cap: usize, prompt_len: usize) bool {
+    return cap <= @max((prompt_len / m.ratio(li) + 1) * 5 / 4, 64);
 }
 
 /// Makes the live state its own earlier self at `n`: `slots` are the fixed arrays a restore point of the same
@@ -4014,6 +4026,14 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
     st.n = n;
     st.main_lazy = false;
     if (m.hash != null) st.hist.shrinkRetainingCapacity(n);
+    // A buffer sized for the reply rolled back from, past what the `ids.len`-token request bills, is cut to the state's
+    // own as a restore makes it, as the state's room and not a forward's.
+    if (try liveRowsFit(m, ids.len)) return;
+    const cap = mlx.engine.uncapped();
+    defer mlx.engine.capped(cap);
+    for (st.layers, 0..) |*ls, li| for ([_]*?Rows{ &ls.comp, &ls.idx_k }) |rows_| if (rows_.*) |*rows| {
+        if (!rowsFit(m, li, rows.cap, ids.len)) try rows.trim(stateStream(m));
+    };
 }
 
 /// The restore point `fixed` (a kept point's fixed arrays) at `n` as `captureStateShared` would hold it, for a state that

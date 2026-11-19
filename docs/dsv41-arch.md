@@ -1146,9 +1146,10 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   (`live_point_cap`; those it writes through and the point it restored from) and publishes them at its commit with its
   tokens. The next prompt rolls back to the deepest point at or below its shared prefix (under the prompt's end, the
   media rule's ceiling, equal `has_tools`) unless a stored point reaches further; the result is byte-identical to an
-  SSD restore of that point. It is skipped when the state was replaced (the record's `State.id`), the request never finished,
-  or a row buffer exceeds what the prompt's own state would be billed with its quarter (`liveRowsFit`): the live rows
-  past the point stay allocated, so they must fit that bill. The admission reserve adds 8 sets of fixed rings
+  SSD restore of that point. It is skipped when the state was replaced (the record's `State.id`) or the request never
+  finished. A row buffer larger than what the prompt's own state is billed with its quarter (`liveRowsFit`: a reply
+  longer than about a quarter of the prompt grew it) is cut to the rows the point keeps with their slack as the rollback
+  ends, as a restore sizes them, so a regenerate after a long reply still rolls back. The admission reserve adds 8 sets of fixed rings
   (`dsv41CheckpointReserve`). Log: `[dsv41-prefix] reused N of M prompt tokens from the live state`.
   The rollback keeps the record's tokens up to the point (`Live.open`): a follow-up cancelled or failed before it
   publishes leaves the last turn's points, which its retry rolls back to again and a handover flushes to SSD.

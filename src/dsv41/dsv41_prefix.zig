@@ -323,8 +323,8 @@ pub const Live = struct {
         self.open = false;
     }
 
-    /// The deepest point a request over `prompt` may roll the live state back to: at most `media_cap` tokens in,
-    /// short of the prompt's end, and only while the state's rows outside the request's own bill would still fit it.
+    /// The deepest point a request over `prompt` may roll the live state back to: at most `media_cap` tokens in, short of
+    /// the prompt's end. Rows the reply grew past the request's own bill are trimmed by the rollback (`rollbackState`).
     pub fn pick(self: *const Live, m: *const model.Model, prompt: []const u32, has_tools: bool, media_cap: usize) !?usize {
         const st = (try model.currentState(m)) orelse return null;
         if (!self.ready or self.state_id != st.id or self.has_tools != has_tools) return null;
@@ -332,8 +332,6 @@ pub const Live = struct {
         const max_shared = @min(self.tokens.len, prompt.len);
         while (shared < max_shared and self.tokens[shared] == prompt[shared]) shared += 1;
         const limit = @min(@min(shared, st.n), @min(media_cap, prompt.len -| 1));
-        // The request bills its own prompt's state: rows kept past that are memory nobody paid for.
-        if (!try model.liveRowsFit(m, prompt.len)) return null;
         var i = self.points.items.len;
         while (i > 0) {
             i -= 1;
