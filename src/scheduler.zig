@@ -1511,13 +1511,22 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
     }
 
-    /// A cold load a shutdown refused before the inference thread took it: its entry and its victims return to where
-    /// they stood, so a request waiting on either does not wait on a load that never runs.
-    fn rollBackUntakenLoad(self: *Scheduler, entry: *LoadedModel, victims: []const *LoadedModel) void {
+    /// A load or unload that ended before the inference thread took it: the entry it claimed and the entries it marked
+    /// for eviction return to where they stood, so a request waiting on either does not wait on a job that never runs.
+    fn rollBackUntaken(self: *Scheduler, claimed: ?*LoadedModel, marked: []const *LoadedModel) void {
         self.registry.mutex.lockUncancelable(self.io);
         defer self.registry.mutex.unlock(self.io);
-        for (victims) |v| if (v.state == .evicting) self.registry.unmarkEvictingLocked(v);
-        if (entry.state == .loading) self.registry.markUnloadedLocked(entry);
+        for (marked) |v| if (v.state == .evicting) self.registry.unmarkEvictingLocked(v);
+        if (claimed) |c| if (c.state == .loading) self.registry.markUnloadedLocked(c);
+    }
+
+    /// Hands `req` to the inference thread through `queue`, refused once a shutdown was asked.
+    fn post(self: *Scheduler, queue: anytype, req: anytype) (error{Shutdown} || std.mem.Allocator.Error)!void {
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        if (self.refusingLocked()) return error.Shutdown;
+        try queue.append(self.allocator, req);
+        self.queue_cond.broadcast(self.io);
     }
 
     /// Submit a new request. Builds a Slot, queues it, returns the handle.
@@ -1968,18 +1977,10 @@ pub const Scheduler = struct {
             .allocator = self.allocator,
         };
 
-        const refused = blk: {
-            self.queue_mu.lockUncancelable(self.io);
-            defer self.queue_mu.unlock(self.io);
-            if (self.refusingLocked()) break :blk true;
-            try self.load_queue.append(self.allocator, &req);
-            self.queue_cond.broadcast(self.io);
-            break :blk false;
+        self.post(&self.load_queue, &req) catch |err| {
+            self.rollBackUntaken(entry, victims_buf[0..n_victims]);
+            return err;
         };
-        if (refused) {
-            self.rollBackUntakenLoad(entry, victims_buf[0..n_victims]);
-            return error.Shutdown;
-        }
 
         // Block until the inference thread signals done.
         req.done_mu.lockUncancelable(self.io);
@@ -1994,7 +1995,7 @@ pub const Scheduler = struct {
             // named 503, not the generic "Model load failed" 500 (#144).
             defer self.allocator.free(name);
             if (std.mem.eql(u8, name, "Shutdown")) {
-                self.rollBackUntakenLoad(entry, victims_buf[0..n_victims]);
+                self.rollBackUntaken(entry, victims_buf[0..n_victims]);
                 return error.Shutdown;
             }
             // On success the inference thread took ownership of cpu_state;
@@ -2109,15 +2110,10 @@ pub const Scheduler = struct {
         }
 
         var req = UnloadRequest{ .entry = entry };
-        {
-            self.queue_mu.lockUncancelable(self.io);
-            defer self.queue_mu.unlock(self.io);
-            // On shutdown the entry stays `.evicting`; `Scheduler.deinit`
-            // unloads every `.ready`/`.evicting` entry, so it's still freed.
-            if (self.refusingLocked()) return error.Shutdown;
-            try self.unload_queue.append(self.allocator, &req);
-            self.queue_cond.broadcast(self.io);
-        }
+        self.post(&self.unload_queue, &req) catch |err| {
+            self.rollBackUntaken(null, &.{entry});
+            return err;
+        };
         req.done_mu.lockUncancelable(self.io);
         while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
         req.done_mu.unlock(self.io);
@@ -6463,7 +6459,7 @@ const ModelCall = struct {
     }
 };
 
-test "a shutdown ends an unload's wait on another job and its drain, and leaves its model as it stood" {
+test "an unload ended before the inference thread takes it leaves its model ready, and a shutdown ends its waits" {
     var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 2, 0, null);
     defer reg.deinit();
     const e = try reg.registerStub("m", "m", 10);
@@ -6473,6 +6469,20 @@ test "a shutdown ends an unload's wait on another job and its drain, and leaves 
     const drain_was = Scheduler.unload_drain_ms;
     Scheduler.unload_drain_ms = 1000;
     defer Scheduler.unload_drain_ms = drain_was;
+
+    // Refused at the queue: the shutdown was asked and the registry not yet told, or the queue could not grow.
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(e, 10);
+    reg.mutex.unlock(reg.io);
+    for ([_]bool{ true, false }) |asked| {
+        server_state.shutdown_requested.store(asked, .release);
+        defer server_state.shutdown_requested.store(false, .release);
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        sch.allocator = if (asked) testing.allocator else failing.allocator();
+        defer sch.allocator = testing.allocator;
+        try testing.expectError(if (asked) error.Shutdown else error.OutOfMemory, sch.unloadModel("m"));
+        try testing.expectEqual(model_registry_mod.LoadState.ready, e.state);
+    }
 
     // Waiting on another job, then draining the requests that hold the model: the shutdown ends both at once.
     for ([_]model_registry_mod.LoadState{ .loading, .ready }) |state| {
@@ -6497,7 +6507,7 @@ test "a shutdown ends an unload's wait on another job and its drain, and leaves 
     }
 }
 
-test "a shutdown ends a cold load's wait on another load of its model" {
+test "a cold load ended before the inference thread takes it returns its model and its victim, and a shutdown ends its wait" {
     const io = testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -6538,18 +6548,48 @@ test "a shutdown ends a cold load's wait on another load of its model" {
     sch.mtp_head_kv_quant = false;
     sch.mtp_depth = 0;
 
-    // Another load claims the model while this one reads its files, at the gate check made before them.
-    const Claim = struct {
-        var entry: *LoadedModel = undefined;
-        var fired = false;
-        fn gate(_: []u8, _: []const u8) ?[]const u8 {
-            if (!fired) entry.state = .loading;
-            fired = true;
+    // What a test does at the gate check the claim makes under the registry mutex, or at the one before the files.
+    const Gate = struct {
+        var reg_: *ModelRegistry = undefined;
+        var sch_: *Scheduler = undefined;
+        var failing: std.testing.FailingAllocator = undefined;
+        var mode: enum { none, fail_post, claim_meanwhile } = .none;
+        fn check(_: []u8, _: []const u8) ?[]const u8 {
+            const at_claim = !reg_.mutex.tryLock();
+            if (!at_claim) reg_.mutex.unlock(reg_.io);
+            switch (mode) {
+                .none => {},
+                // Past the claim the next allocation is the post's.
+                .fail_post => if (at_claim) {
+                    sch_.allocator = failing.allocator();
+                },
+                .claim_meanwhile => if (!at_claim) {
+                    reg_.entries.get("b").?.state = .loading;
+                },
+            }
             return null;
         }
     };
-    Claim.entry = target;
-    reg.load_gate = Claim.gate;
+    Gate.reg_ = reg;
+    Gate.sch_ = &sch;
+    Gate.failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    reg.load_gate = Gate.check;
+
+    // Refused at the queue: the shutdown was asked, or the queue could not grow.
+    for ([_]bool{ true, false }) |asked| {
+        server_state.shutdown_requested.store(asked, .release);
+        defer server_state.shutdown_requested.store(false, .release);
+        Gate.mode = if (asked) .none else .fail_post;
+        defer sch.allocator = testing.allocator;
+        try testing.expectError(if (asked) error.Shutdown else error.OutOfMemory, sch.ensureLoaded("b"));
+        try testing.expectEqual(model_registry_mod.LoadState.ready, victim.state);
+        try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
+        try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
+        try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
+    }
+
+    // Another load claims the model while this one reads its files: the shutdown ends the wait for it.
+    Gate.mode = .claim_meanwhile;
     var call: ModelCall = .{ .sch = &sch, .id = "b", .load = true };
     const t = try std.Thread.spawn(.{}, ModelCall.run, .{&call});
     try testing.expect(!call.answeredWithin(200));

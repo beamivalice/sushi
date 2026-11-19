@@ -463,6 +463,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **A shutdown ends every wait on a model's state**: `requestShutdown` (`stopServing` runs it too) calls
   `ModelRegistry.beginShutdown`, so `waitStateChangeLocked` (the one wait on a `loading`/`evicting` entry) and an
   unload's drain return `error.Shutdown`; a request behind an unload otherwise hung the shutdown to exit 1.
+- **A load or unload the inference thread never took undoes its marks**: every error past `post` returns its claimed
+  entry and its `evicting` victims through `rollBackUntaken`, or a request waiting on them waits forever.
 - **A shutdown drain is an ERROR, never a finish reason**: `beginShutdown` marks `Slot.shutdown_cancelled`, so the
   reader gets `.err` (`error.ServerShutdown`, 503 "Server is shutting down") instead of `.done`, whose default
   `finish_reason` is `length` (a queued request logged `0+0 tokens [length]`).
