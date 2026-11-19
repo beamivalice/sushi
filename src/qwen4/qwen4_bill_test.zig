@@ -2195,10 +2195,10 @@ test "Flash-Next: a resident load the free-RAM preflight admits at its edge leav
 
 /// The bill the connection thread takes (`bills.prefillAdmissionBill` without its live read): the width
 /// `requestPrefillPick` chooses at `available`, then the bill at that width.
-fn connBillAt(cfg: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, available: u64) bills.AdmissionBill {
-    const chosen = bills.requestPrefillPick(cfg, seq, max_tokens, kv_bits, available, false, .{});
+fn connBillAt(cfg: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, available: u64, warm: WarmPrefix) bills.AdmissionBill {
+    const chosen = bills.requestPrefillPick(cfg, seq, max_tokens, kv_bits, available, false, warm);
     const chunk: u64 = prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, @intCast(seq), cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), chosen);
-    return bills.creditedAdmissionBill(cfg, prefillNeededAtChunk(cfg, seq, max_tokens, kv_bits, chunk, .{}), available, 0, 0, chunk);
+    return bills.creditedAdmissionBill(cfg, prefillNeededAtChunk(cfg, seq, max_tokens, kv_bits, chunk, warm), available, 0, 0, chunk);
 }
 
 fn coolerFlashNext() model_mod.ModelConfig {
@@ -2211,7 +2211,7 @@ fn coolerFlashNext() model_mod.ModelConfig {
     return cfg;
 }
 
-test "Flash-Next on Cooler: the max_tokens and the maximum context a refusal names are admitted when applied with the request's own prompt" {
+test "Flash-Next on Cooler: a refusal's max_tokens and maximum context are admitted when applied, MTP on and off, the maximum at every prompt and reply split when the prompt does not fit alone" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
     const no_tier = TierGuard.pin(false, 0);
@@ -2220,32 +2220,44 @@ test "Flash-Next on Cooler: the max_tokens and the maximum context a refusal nam
     try t.expect(@import("../cooler_side.zig").onEngine(&cfg));
     const kv = trunk.KVQuantConfig.affine(8);
     const ctx = getEffectiveContextLength(&cfg);
+    const big = std.math.maxInt(u64) / 4;
     var failures: usize = 0;
     var cases: usize = 0;
-    for ([_]u64{ 100, 3_000, 20_000, 32_767, 32_768, 60_000, 200_000 }) |seq| for ([_]u32{ 4_096, 32_768, 200_000 }) |asked| {
+    for ([_]bool{ false, true }) |mtp| for ([_]u64{ 100, 3_000, 20_000, 32_767, 32_768, 60_000, 200_000 }) |seq| for ([_]u32{ 4_096, 32_768, 200_000 }) |asked| {
         if (seq + asked > ctx) continue;
-        // A headroom a little under the asked bill, then much under it.
-        const asked_bill = connBillAt(&cfg, seq, asked, 8, std.math.maxInt(u64) / 4).needed;
-        const prompt_only = connBillAt(&cfg, seq, 1, 8, std.math.maxInt(u64) / 4).needed;
-        for ([_]u64{ asked_bill - 1, prompt_only + (asked_bill - prompt_only) / 2, prompt_only + 1 }) |available| {
-            const bill = connBillAt(&cfg, seq, asked, 8, available);
+        const warm: WarmPrefix = .{ .mtp_on = mtp };
+        // A headroom a little under the asked bill, then much under it, then under the prompt alone.
+        const asked_bill = connBillAt(&cfg, seq, asked, 8, big, warm).needed;
+        const prompt_only = connBillAt(&cfg, seq, 1, 8, big, warm).needed;
+        for ([_]u64{ asked_bill - 1, prompt_only + (asked_bill - prompt_only) / 2, prompt_only + 1, prompt_only - 1, prompt_only / 2 }) |available| {
+            const bill = connBillAt(&cfg, seq, asked, 8, available, warm);
             if (bill.fits()) continue;
             cases += 1;
-            const r = bills.requestContextRefusal(&cfg, @intCast(seq), asked, kv, bill, .{}) orelse return error.TestUnexpectedResult;
+            const r = bills.requestContextRefusal(&cfg, @intCast(seq), asked, kv, bill, warm) orelse return error.TestUnexpectedResult;
             if (r.fitting_max_tokens > 0) {
-                const b = connBillAt(&cfg, seq, r.fitting_max_tokens, 8, available);
+                const b = connBillAt(&cfg, seq, r.fitting_max_tokens, 8, available, warm);
                 if (!b.fits()) {
                     failures += 1;
-                    std.debug.print("seq {d} asked {d} avail {d} MB: max_tokens {d} named as fitting is refused (needs {d} MB at width {d})\n", .{ seq, asked, available >> 20, r.fitting_max_tokens, b.needed >> 20, b.chunk });
+                    std.debug.print("mtp {} seq {d} asked {d} avail {d} MB: max_tokens {d} named as fitting is refused (needs {d} MB at width {d})\n", .{ mtp, seq, asked, available >> 20, r.fitting_max_tokens, b.needed >> 20, b.chunk });
                 }
             }
-            // The maximum context with this prompt: the reply up to it.
             if (r.maximum > seq) {
+                // The maximum context with this prompt: the reply up to it.
                 const m: u32 = @intCast(@min(r.maximum - seq, asked));
-                const b = connBillAt(&cfg, seq, m, 8, available);
+                const b = connBillAt(&cfg, seq, m, 8, available, warm);
                 if (!b.fits()) {
                     failures += 1;
-                    std.debug.print("seq {d} asked {d} avail {d} MB: the named maximum context {d} (max_tokens {d}) is refused (needs {d} MB at width {d})\n", .{ seq, asked, available >> 20, r.maximum, m, b.needed >> 20, b.chunk });
+                    std.debug.print("mtp {} seq {d} asked {d} avail {d} MB: the named maximum context {d} (max_tokens {d}) is refused (needs {d} MB at width {d})\n", .{ mtp, seq, asked, available >> 20, r.maximum, m, b.needed >> 20, b.chunk });
+                }
+            } else if (r.fitting_max_tokens == 0 and r.maximum > 0) {
+                // "Shorten the prompt so that it and its reply fit in N tokens": any prompt of N or less, the rest its reply.
+                const n = r.maximum;
+                var prompt: u64 = n;
+                while (prompt > 0) : (prompt = if (prompt == n) n - 1 else if (prompt > 40_000) @max(prompt -| n / 7, 40_000) else if (prompt > 251) prompt - 251 else if (prompt > 15) 15 else 0) {
+                    const b = connBillAt(&cfg, prompt, @intCast(n - prompt), 8, available, warm);
+                    if (b.fits()) continue;
+                    failures += 1;
+                    if (failures < 12) std.debug.print("mtp {} seq {d} asked {d} avail {d} MB: the prompt alone is refused, maximum {d}; prompt {d} + reply {d} needs {d} MB at width {d}\n", .{ mtp, seq, asked, available >> 20, n, prompt, n - prompt, b.needed >> 20, b.chunk });
                 }
             }
         }

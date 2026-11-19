@@ -1129,14 +1129,32 @@ pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
 /// The full-context admission bill at the width a requested launch can run.
 /// An explicit prefill width is priced as requested; auto picks the per-request floor.
 fn sushiContextBytesAt(config: *const model_mod.ModelConfig, context: u32, kv_bits: u64) struct { bytes: u64, chunk: u64 } {
+    const chunk = sushiContextWidth(config, context);
+    return .{
+        .bytes = contextNeed(config, context, kv_bits, chunk, .{ .mtp_on = mtpHeadDefaultOn(config) }),
+        .chunk = chunk,
+    };
+}
+
+fn sushiContextWidth(config: *const model_mod.ModelConfig, context: u32) u64 {
     const explicit = explicitPrefillChunk();
     const rung: u32 = if (explicit > 0) explicit else perRequestFloorWidth(config) orelse
         (if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else 8192);
-    const chunk = rungWidth(config, context, rung, config.longCtxGated());
-    return .{
-        .bytes = prefillNeededAtChunk(config, context, 0, kv_bits, chunk, .{ .mtp_on = mtpHeadDefaultOn(config) }),
-        .chunk = chunk,
-    };
+    return rungWidth(config, context, rung, config.longCtxGated());
+}
+
+/// The dearest request a context of `ctx` tokens can be asked for, over every split of it between prompt and reply: what
+/// every context the server names (advertised, admitted at load, or in a refusal) is priced at.
+pub fn contextNeed(config: *const model_mod.ModelConfig, ctx: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
+    var most = prefillNeededAtChunk(config, ctx, 0, kv_bits, chunk, warm);
+    // A prompt under the reservation grows its cache from its own 256-row step by the +25% policy
+    // (`cacheCapacityTokens`), which can pass the prompt alone's; within one step the longest prompt is dearest.
+    if (!config.reservesKvCapacity()) return most;
+    const below = @min(ctx, trunk.KVCache.RESERVE_MIN_TOKENS);
+    var seq: u64 = 256;
+    while (seq < below) : (seq += 256) most = @max(most, prefillNeededAtChunk(config, seq, @intCast(ctx - seq), kv_bits, chunk, warm));
+    if (below < ctx) most = @max(most, prefillNeededAtChunk(config, below - 1, @intCast(ctx - below + 1), kv_bits, chunk, warm));
+    return most;
 }
 
 /// PURE with respect to memory: solve the same admission bill used to check the requested context.
@@ -1163,8 +1181,8 @@ pub fn maxSushiContextUpTo(config: *const model_mod.ModelConfig, upper: u32, kv_
         const mid = low + @as(u32, @intCast((@as(u64, high) - low + 1) / 2));
         var probe = config.*;
         if (unpinned) probe.pinned_context = mid;
-        const chunk = fixed_chunk orelse sushiContextBytesAt(&probe, mid, kv_bits).chunk;
-        if (prefillNeededAtChunk(&probe, mid, 0, kv_bits, chunk, warm) <= budget)
+        const chunk = fixed_chunk orelse sushiContextWidth(&probe, mid);
+        if (contextNeed(&probe, mid, kv_bits, chunk, warm) <= budget)
             low = mid
         else
             high = mid - 1;
