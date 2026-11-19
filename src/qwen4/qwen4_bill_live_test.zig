@@ -629,6 +629,10 @@ test "Flash-Next streamed: the 32 GB recipe's verdicts at --ssd-budget-gb 17 and
     var config = try model_mod.parseConfig(t.io, a, dir);
     defer config.deinit(a);
     model_load.applyModelSettings(&config, .{});
+    // The recipe's M1 runs no fused QSA score kernel, so its history bills the score bank; left to the process, the
+    // bill reads whether an earlier load's trial kept the kernel on this box.
+    const fused_off = @import("qwen4_bill_test.zig").qsaScoreFusedOffGuard();
+    defer fused_off.deinit();
     const gib: u64 = 1 << 30;
     const mib: u64 = 1 << 20;
     const plan_at = model_load.BudgetPlanner{ .io = t.io, .allocator = a, .config = &config, .model_dir = dir, .vision = false, .assistant = 0, .beside = 0, .mtp_on = false };
