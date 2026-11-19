@@ -384,13 +384,28 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
 /// past `seq`, beside the state those tokens grow; halving to 64, 0 when none does. An explicit width's forward takes up
 /// to a whole merged tail beside it (`prefill_plan.TAIL_MERGE_MAX`), and its cap grows with the position it ends at.
 pub fn chunkThatFits(c: *const Config, engine: bool, rows: u64, seq: u64, rest: u64, have: u64) u64 {
-    const tail = @import("../prefill_plan.zig").TAIL_MERGE_MAX - 1;
     if (rows < 2) return 0;
-    const end = seq +| rest;
-    const growth = rest *| c.stateBytesPerToken();
     var w = std.math.floorPowerOfTwo(u64, rows / 2);
-    while (w >= 64) : (w /= 2) if (prefillNeed(c, engine, w + tail, end) +| growth <= have) return w;
+    while (w >= 64) : (w /= 2) if (widestAt(c, engine, w, seq, rest) <= have) return w;
     return 0;
+}
+
+/// The dearest forward of the prompt's prefill rerun at `--prefill-chunk w` (`prefill_plan.nextChunkEnd`, with and
+/// without the checkpoint stride, the tail merged as the loop merges it), each at the position it ends with the state
+/// grown past `seq` to there: a tail merges only where the prompt has the rows.
+fn widestAt(c: *const Config, engine: bool, w: u64, seq: u64, rest: u64) u64 {
+    const plan = @import("../prefill_plan.zig");
+    const loop_end: usize = @intCast(seq +| rest);
+    var widest: u64 = 0;
+    for ([_]usize{ 0, plan.effectiveSsmCheckpointStride(@import("../server_state.zig").ssm_checkpoint_stride, @intCast(w)) }) |stride| {
+        var pos: usize = 0;
+        while (pos < loop_end) {
+            const end = plan.nextChunkEnd(pos, loop_end, @intCast(w), stride > 0, stride, 0, false);
+            widest = @max(widest, prefillNeed(c, engine, end - pos, end) +| (end -| seq) *| c.stateBytesPerToken());
+            pos = end;
+        }
+    }
+    return widest;
 }
 
 /// What the client reads when a forward is refused mid-request: what did not fit, by how much, and what to change. `seq`
@@ -1274,11 +1289,12 @@ test "dsv41 borrow: a forward refused mid-prefill names its chunk, the shortfall
     const rows: u64 = 2048;
     const seq: u64 = 6144;
     const need = prefillNeed(&c, true, rows, seq);
-    // A 1024 chunk's forward may merge a 511-row tail: the width that fits is priced with it.
+    // What is free holds a 1024-row forward at the prompt's end.
     const have = prefillNeed(&c, true, 1024 + 511, seq) + (1 << 20);
     try testing.expect(have < need);
     try testing.expectEqual(@as(u64, 1024), chunkThatFits(&c, true, rows, seq, 0, have));
-    try testing.expectEqual(@as(u64, 512), chunkThatFits(&c, true, rows, seq, 0, prefillNeed(&c, true, 1024 + 511, seq) - 1));
+    // The refused forward is the prompt's last: at 1024 its 2048 rows run as two whole chunks, no tail to merge.
+    try testing.expectEqual(@as(u64, 512), chunkThatFits(&c, true, rows, seq, 0, prefillNeed(&c, true, 1024, seq) - 1));
     try testing.expectEqual(@as(u64, 0), chunkThatFits(&c, true, rows, seq, 0, 0));
     var buf: [1024]u8 = undefined;
     const text = refusalText(&buf, rows, seq, 5 * gib, 4 * gib + gib / 2, 1024);
@@ -1318,6 +1334,25 @@ test "dsv41 borrow: the --prefill-chunk a mid-prefill refusal names fits the pro
     try testing.expect(w > 0);
     // At --prefill-chunk w the same request's last forward ends at the prompt's end; the state between grows too.
     const growth = (prompt - seq) * c.stateBytesPerToken();
-    errdefer std.debug.print("named --prefill-chunk {d}: its last forward at {d} needs {d} MB beside {d} MB of state growth, {d} MB free\n", .{ w, prompt, prefillNeed(&c, true, w + tail, prompt) / MiB, growth / MiB, have / MiB });
-    try testing.expect(prefillNeed(&c, true, w + tail, prompt) + growth <= have);
+    // Its last forward: the prompt's chunks at `w`, the tail merged as the loop merges it.
+    var pos: usize = 0;
+    var last: u64 = 0;
+    while (pos < prompt) {
+        const end = @import("../prefill_plan.zig").nextChunkEnd(pos, prompt, @intCast(w), false, 0, 0, false);
+        last = end - pos;
+        pos = end;
+    }
+    errdefer std.debug.print("named --prefill-chunk {d}: its last forward of {d} rows at {d} needs {d} MB beside {d} MB of state growth, {d} MB free\n", .{ w, last, prompt, prefillNeed(&c, true, last, prompt) / MiB, growth / MiB, have / MiB });
+    try testing.expect(prefillNeed(&c, true, last, prompt) + growth <= have);
+}
+
+test "dsv41 borrow: a short prompt refused mid-prefill is offered the narrower --prefill-chunk its own remaining rows fit" {
+    const c = try cfg_mod.parseText(cfg_mod.release_config);
+    // An 1,100-token prompt's whole forward refused; at --prefill-chunk 512 its prefill runs 512 rows, then the 588
+    // left as one forward (its 76-row tail merged): never the 1,023 a full tail past 512 would make.
+    const rows: u64 = 1100;
+    const seq: u64 = 1100;
+    const have = prefillNeed(&c, true, 588, seq);
+    try testing.expect(have < prefillNeed(&c, true, rows, seq));
+    try testing.expectEqual(@as(u64, 512), chunkThatFits(&c, true, rows, seq, 0, have));
 }

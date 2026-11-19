@@ -10,6 +10,9 @@ earlier history is mlx-serve's, in that project's changelog.
   for memory (a host allocation, say) failed every request decoding at that moment, other models' included.
 - **A Qwen image encode on Sushi Cooler stays inside its memory bill**: its patch arrays were made before the encode's
   cap went in, so they could land on free buffers past the bill.
+- **A DeepSeek prompt refused for memory partway through its prefill is offered a narrower `--prefill-chunk` wherever
+  one fits**: each width was priced with a full merged tail even where the prompt has fewer rows left, so a short
+  prompt was offered none.
 - **An image request on a DeepSeek Sushi Cooler load is no longer refused for memory a prefill of the same size gets**:
   the image encode left out the free memory the engine keeps for its forwards, which the encode reuses too.
 - **The context a model advertises can be used at its length when free RAM, not the GPU limit, is what binds**: the
