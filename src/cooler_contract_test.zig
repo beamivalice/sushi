@@ -1840,6 +1840,11 @@ const Served = struct {
     quiet_failures: bool = false,
 
     fn init(self: *Served, ld: *Load, dir: []const u8) !void {
+        return self.initTiers(ld, dir, 0);
+    }
+
+    /// `ram_bytes`: the RAM tier's budget, 0 for the SSD tier alone.
+    fn initTiers(self: *Served, ld: *Load, dir: []const u8, ram_bytes: u64) !void {
         const a = testing.allocator;
         self.reused = 0;
         self.quiet_failures = false;
@@ -1861,8 +1866,8 @@ const Served = struct {
         const server_state = @import("server_state.zig");
         model_load.attachPrefixCache(a, io, self.entry, .{
             .capacity = 4,
-            .ram_enabled = false,
-            .mem_bytes = 0,
+            .ram_enabled = ram_bytes > 0,
+            .mem_bytes = ram_bytes,
             .mem_resolver = null,
             .disk_resolver = null,
             .ssm_checkpoint_stride = server_state.ssm_checkpoint_stride,
@@ -3506,6 +3511,48 @@ test "cooler contract: a served Qwen conversation keeps its newest off-grid rest
             @import("scheduler.zig").flushLiveState(sv.entry, "test");
             disk.drainWriter();
             try testing.expect(dws.process.snapshot().written[ssm] - before > 0);
+        }
+    }.run);
+}
+
+test "cooler contract: a served Qwen turn that leaves the last turn's text between two restore points inherits the one below the cut, the engine refusing nothing" {
+    try eachQwenServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const route = @import("tensor/route.zig");
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.initTiers(&ld, dir, 1 << 30);
+            defer sv.deinit();
+            const refused0 = route.refusals;
+            var f: u32 = 0;
+            var first = try heldPrompt(a, ids, 1500, 0);
+            defer first.deinit(a);
+            var reply = try sv.request(first.items, 16, &f);
+            defer reply.deinit(a);
+            // Turn 2 extends turn 1: its entry holds both prompt ends' restore points.
+            var second: std.ArrayList(u32) = .empty;
+            defer second.deinit(a);
+            try second.appendSlice(a, first.items);
+            try second.appendSlice(a, reply.items);
+            var said = try heldPrompt(a, ids, 1500, 2);
+            defer said.deinit(a);
+            try second.appendSlice(a, said.items);
+            var reply2 = try sv.request(second.items, 16, &f);
+            defer reply2.deinit(a);
+            // Turn 3 cuts between them: its commit inherits turn 1's point, the QSA history moved onto it.
+            var next: std.ArrayList(u32) = .empty;
+            defer next.deinit(a);
+            try next.appendSlice(a, second.items[0 .. second.items.len - 100]);
+            var more = try heldPrompt(a, ids, 200, 1);
+            defer more.deinit(a);
+            try next.appendSlice(a, more.items);
+            var got = try sv.request(next.items, 16, &f);
+            defer got.deinit(a);
+            try testing.expect(sv.reused > 0 and sv.reused < first.items.len + reply.items.len);
+            try testing.expectEqual(@as(u64, 0), route.refusals - refused0);
         }
     }.run);
 }

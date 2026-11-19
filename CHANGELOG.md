@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+<<<<<<< HEAD
 - **A streamed load the GPU memory limit leaves no room for is refused by name**: it answered a 500 "Failed to
   load model: ExpertCacheTooSmall" with no reason; it now answers the 503 that names the Memory for SSD streaming (GiB)
   setting (`--ssd-budget-gb`) that loads it, as a budget set too small does.
@@ -24,6 +25,11 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A Responses WebSocket turn refused before it runs now ends**: a turn refused for memory, context length, a bad
   field, an image or an effort word sent one `{"error":...}` frame and then nothing, so a client waiting for the turn's
   end hung; it now ends in the `{"type":"error"}` frame every other failed turn ends in, and the socket serves the next.
+=======
+- **A long Qwen conversation on Sushi Cooler keeps its restore points across turns that share only part of the last
+  one**: such a turn's cache entry lost the restore points it inherits (`checkpoint inheritance failed`), so later turns
+  restored from further back and prefilled more.
+>>>>>>> 08b8b5bc (The hot cache moves the QSA history on its own stream, so a Qwen turn on Sushi Cooler keeps the restore points it inherits)
 - **A failure in one group of a decode step fails that group's requests alone**: a failure the engine did not report
   for memory (a host allocation, say) failed every request decoding at that moment, other models' included.
 - **A Qwen image encode on Sushi Cooler stays inside its memory bill**: its patch arrays were made before the encode's

@@ -890,6 +890,9 @@ process start whatever turns `--metrics` on.
   idle entry at each request finish, so a copy already on disk must cost no probe; below the store floor it still
   counts as persisted. The probe's budget GC swap-removes entries, so the extend/SSM-only candidate is selected
   AGAIN after it (`selectStoreTarget`); an index held across a probe names another entry.
+- **The cache's array work runs on its arrays' stream** (`arraysStream`: the engine's on Sushi Cooler): a checkpoint
+  trim, an inheritance or a shed that moves the QSA history on MLX's stream inside an engine forward is refused, and
+  the request or the commit fails with it.
 - **A checkout is a PROMISE until the append DONATES** (`donateCheckout` right before `Generator.initWithOptions`,
   below every refusal; `releaseCheckout` hands an undonated entry back intact).
 - **Off SSD-first, a warm share that does not fit is taken over, not refused** (`checkoutRestored`, qwen4_exp's

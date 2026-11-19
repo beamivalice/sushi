@@ -2215,7 +2215,7 @@ pub const HotPrefixCache = struct {
                     new_mtp_bytes = 0;
                 }
                 if (eff_cps) |cps| {
-                    eff_cps = truncateCheckpoints(self.allocator, cps, tl) catch |err| {
+                    eff_cps = truncateCheckpoints(self.allocator, cps, tl, self.arraysStream()) catch |err| {
                         decline = switch (err) {
                             error.QsaHistorySliceFailed => .qsa_history_slice_failed,
                             error.CheckpointListCopyFailed => .checkpoint_list_copy_failed,
@@ -2327,7 +2327,7 @@ pub const HotPrefixCache = struct {
             const donor_cps = self.entries.items[donor.idx].ssm_checkpoints.?;
             const prompt_cap = @min(if (prompt_len == 0) eff_tokens.len else prompt_len, eff_tokens.len);
             const inherit_limit = @min(donor.shared, prompt_cap);
-            const cloned = (cloneCheckpointsWithBank(self.allocator, donor_cps, inherit_limit, budget) catch |err| {
+            const cloned = (cloneCheckpointsWithBank(self.allocator, donor_cps, inherit_limit, budget, self.arraysStream()) catch |err| {
                 log.warn("  [hot-cache] checkpoint inheritance failed: {s}\n", .{@errorName(err)});
                 break :inherit;
             }) orelse break :inherit;
@@ -2559,12 +2559,12 @@ pub const HotPrefixCache = struct {
     /// The checkpoints at or below `tl`, the rest freed. The pooled indexer bank lives only on the latest
     /// checkpoint, so it is sliced onto the last KEPT one first; a history-less hybrid entry would make
     /// every later restore a silent miss. On error `cps` stays owned by the caller.
-    fn truncateCheckpoints(allocator: std.mem.Allocator, cps: []SSMCheckpoint, tl: usize) TruncateCheckpointsError![]SSMCheckpoint {
+    fn truncateCheckpoints(allocator: std.mem.Allocator, cps: []SSMCheckpoint, tl: usize, s: mlx.mlx_stream) TruncateCheckpointsError![]SSMCheckpoint {
         var kept: usize = 0;
         while (kept < cps.len and cps[kept].pos <= tl) kept += 1;
         if (kept == cps.len) return cps;
         if (kept > 0 and checkpointHasQsaPooled(&cps[cps.len - 1])) {
-            sliceQsaHistoryOntoCheckpoint(&cps[kept - 1], &cps[cps.len - 1], cps[kept - 1].pos, mlx.gpuStream()) catch
+            sliceQsaHistoryOntoCheckpoint(&cps[kept - 1], &cps[cps.len - 1], cps[kept - 1].pos, s) catch
                 return error.QsaHistorySliceFailed;
         }
         const shrunk = allocator.dupe(SSMCheckpoint, cps[0..kept]) catch return error.CheckpointListCopyFailed;
@@ -2727,7 +2727,7 @@ pub const HotPrefixCache = struct {
             return;
         };
         if (ssm_cps) |cps| {
-            rec.ssm_cps = cloneCheckpointsWithBank(self.allocator, cps, text_len, null) catch null;
+            rec.ssm_cps = cloneCheckpointsWithBank(self.allocator, cps, text_len, null, self.arraysStream()) catch null;
         }
         const quant = source_cache.config;
         const cap = @min(if (prompt_len == 0) text_len else prompt_len, text_len);
@@ -3480,7 +3480,7 @@ pub const HotPrefixCache = struct {
 
     /// `cloneCheckpointsUpTo`, plus the pooled indexer bank: it lives on the newest checkpoint,
     /// which a `limit` below it drops, so it is sliced onto the last one kept.
-    fn cloneCheckpointsWithBank(allocator: std.mem.Allocator, src: []const SSMCheckpoint, limit: usize, budget: ?u64) !?[]SSMCheckpoint {
+    fn cloneCheckpointsWithBank(allocator: std.mem.Allocator, src: []const SSMCheckpoint, limit: usize, budget: ?u64, s: mlx.mlx_stream) !?[]SSMCheckpoint {
         const cloned = (try cloneCheckpointsUpTo(allocator, src, limit, budget)) orelse return null;
         var bank: ?*const SSMCheckpoint = null;
         for (src) |*cp| {
@@ -3489,7 +3489,7 @@ pub const HotPrefixCache = struct {
         const b = bank orelse return cloned;
         if (b.pos <= limit) return cloned;
         const last = &cloned[cloned.len - 1];
-        sliceQsaHistoryOntoCheckpoint(last, b, last.pos, mlx.gpuStream()) catch |err| {
+        sliceQsaHistoryOntoCheckpoint(last, b, last.pos, s) catch |err| {
             for (cloned) |*c| c.deinit(allocator);
             allocator.free(cloned);
             return err;
@@ -3513,7 +3513,7 @@ pub const HotPrefixCache = struct {
     fn textCheckpoints(self: *const HotPrefixCache, cps: ?[]SSMCheckpoint, len: usize, tokens_len: usize) ?TextCps {
         if (len >= tokens_len) return .{ .list = cps, .cut = false };
         const src = cps orelse return .{ .list = null, .cut = true };
-        const cloned = cloneCheckpointsWithBank(self.allocator, src, len, null) catch |err| {
+        const cloned = cloneCheckpointsWithBank(self.allocator, src, len, null, self.arraysStream()) catch |err| {
             log.warn("  [disk-cache] text checkpoints failed: {s} — nothing persisted\n", .{@errorName(err)});
             return null;
         };
@@ -3603,7 +3603,7 @@ pub const HotPrefixCache = struct {
             const freed = ssmCheckpointBytes(&cps[drop]);
             if (checkpointHasQsaPooled(&cps[drop])) {
                 if (drop > 0) {
-                    sliceQsaHistoryOntoCheckpoint(&cps[drop - 1], &cps[drop], cps[drop - 1].pos, mlx.gpuStream()) catch |err| {
+                    sliceQsaHistoryOntoCheckpoint(&cps[drop - 1], &cps[drop], cps[drop - 1].pos, self.arraysStream()) catch |err| {
                         log.warn("  [hot-cache] shed dropped the QSA indexer history: {s}\n", .{@errorName(err)});
                     };
                 }
@@ -3731,7 +3731,7 @@ pub const HotPrefixCache = struct {
         const before_ssm = e.ssm_bytes;
         var new_cps: ?[]SSMCheckpoint = null;
         if (e.ssm_checkpoints) |cps| {
-            new_cps = truncateCheckpoints(self.allocator, cps, tl) catch |err| {
+            new_cps = truncateCheckpoints(self.allocator, cps, tl, self.arraysStream()) catch |err| {
                 self.allocator.free(tokens);
                 snap.deinit();
                 // The slice may already have re-billed the kept checkpoint's bank.
