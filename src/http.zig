@@ -341,6 +341,13 @@ pub fn sendErrorResponse(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
 
 /// `sendErrorResponse` whose head also carries `extra_headers` (complete `Name: value\r\n` lines).
 pub fn sendErrorResponseWithHeaders(allocator: std.mem.Allocator, stream: *http_conn.Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32, extra_headers: []const u8) !void {
+    // On a Responses WebSocket every refusal ends its turn, whichever check sent it.
+    if (stream.ws_mode) |bridge| {
+        const frame = try wsErrorFrame(allocator, statusCode(status), err_type, message);
+        defer allocator.free(frame);
+        logHttpResponse(status, "application/json", frame);
+        return bridge.sendText(frame);
+    }
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
 
@@ -356,6 +363,22 @@ pub fn sendErrorResponseWithHeaders(allocator: std.mem.Allocator, stream: *http_
     defer allocator.free(body);
     if (extra_headers.len == 0) return sendResponse(stream, status, "application/json", body);
     try sendResponseWithHeaders(stream, status, "application/json", body, extra_headers);
+}
+
+/// The terminal frame of a refused Responses WebSocket turn: a client ends the turn on `"type":"error"`.
+pub fn wsErrorFrame(allocator: std.mem.Allocator, status: u32, code: []const u8, message: []const u8) ![]u8 {
+    const esc_code = try jsonEscape(allocator, code);
+    defer allocator.free(esc_code);
+    const esc_msg = try jsonEscape(allocator, message);
+    defer allocator.free(esc_msg);
+    return std.fmt.allocPrint(allocator,
+        \\{{"type":"error","status":{d},"error":{{"code":{s},"message":{s}}}}}
+    , .{ status, esc_code, esc_msg });
+}
+
+/// The number of a status line (`NNN Reason`); one without a number is the server's own error.
+fn statusCode(status: []const u8) u32 {
+    return std.fmt.parseInt(u32, status[0..@min(status.len, 3)], 10) catch 500;
 }
 
 /// THE JSON string escaper for every response body. Every string here is model bytes

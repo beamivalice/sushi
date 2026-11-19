@@ -4199,3 +4199,23 @@ test "a request whose max_tokens alone does not fit is refused on the connection
     try t.expect(std.mem.indexOf(u8, body, " does not fit in GPU memory: the request needs ") != null);
     try t.expect(std.mem.indexOf(u8, body, " fits (asked 1000000); maximum context: ") != null);
 }
+
+test "a kv_quant the arch refuses ends a Responses WebSocket turn in its error frame" {
+    if (!bills.archBuilt("glm5")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Frames = struct {
+        out: std.ArrayList(u8) = .empty,
+        fn record(impl: *anyopaque, data: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(impl));
+            try self.out.appendSlice(std.testing.allocator, data);
+        }
+    };
+    var frames = Frames{};
+    defer frames.out.deinit(a);
+    var bridge: http_conn.WsBridge = .{ .impl = &frames, .sendTextFn = &Frames.record };
+    var conn: http_conn.Conn = undefined;
+    conn.ws_mode = &bridge;
+    const cfg = try fixtures.glmAssistantFixture();
+    try std.testing.expect(!try checkAttentionMemory(a, &conn, &.{ 1, 2, 3 }, 8, &cfg, "glm", false, trunk.KVQuantConfig.affine(4), false, false));
+    try std.testing.expect(std.mem.startsWith(u8, frames.out.items, "{\"type\":\"error\",\"status\":400,"));
+}

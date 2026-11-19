@@ -1442,16 +1442,7 @@ fn wsGenerationErrorTurn(allocator: std.mem.Allocator, ws_conn: *WsConnT, err: a
 }
 
 fn wsSendErrorTurn(allocator: std.mem.Allocator, ws_conn: *WsConnT, status: u32, code: []const u8, message: []const u8) !void {
-    const esc_code = try jsonEscape(allocator, code);
-    defer allocator.free(esc_code);
-    const esc_msg = try jsonEscape(allocator, message);
-    defer allocator.free(esc_msg);
-    const err_frame = try std.fmt.allocPrint(
-        allocator,
-        \\{{"type":"error","status":{d},"error":{{"code":{s},"message":{s}}}}}
-    ,
-        .{ status, esc_code, esc_msg },
-    );
+    const err_frame = try http.wsErrorFrame(allocator, status, code, message);
     defer allocator.free(err_frame);
     try ws_conn.writeText(err_frame);
 }

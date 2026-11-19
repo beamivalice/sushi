@@ -13,6 +13,7 @@ const responses_api = @import("responses_api.zig");
 const http_conn = @import("http_conn.zig");
 const scheduler_mod = @import("scheduler.zig");
 const test_support = @import("test_support.zig");
+const bills = @import("bills.zig");
 const ModelRegistry = @import("model_registry.zig").ModelRegistry;
 
 const io = std.testing.io;
@@ -449,6 +450,87 @@ test "server: an unload whose model stays held past its drain bound is refused b
             defer for (got) |g| gpa.free(g);
             if (!std.mem.startsWith(u8, got[0], "HTTP/1.1 409") or std.mem.indexOf(u8, got[0], "model_busy") == null) return error.UnloadNotRefusedByName;
             if (!std.mem.startsWith(u8, got[1], "HTTP/1.1 200")) return error.RequestBehindFailed;
+        }
+    }.run);
+}
+
+/// The next WebSocket frame the server sends (unmasked), its payload; the caller frees.
+fn wsReadFrame(fd: std.posix.fd_t) ![]u8 {
+    var head: [10]u8 = undefined;
+    try readExact(fd, head[0..2]);
+    var len: u64 = head[1] & 0x7f;
+    if (len == 126) {
+        try readExact(fd, head[2..4]);
+        len = std.mem.readInt(u16, head[2..4], .big);
+    } else if (len == 127) {
+        try readExact(fd, head[2..10]);
+        len = std.mem.readInt(u64, head[2..10], .big);
+    }
+    const payload = try gpa.alloc(u8, @intCast(len));
+    errdefer gpa.free(payload);
+    try readExact(fd, payload);
+    return payload;
+}
+
+fn readExact(fd: std.posix.fd_t, out: []u8) !void {
+    var got: usize = 0;
+    while (got < out.len) {
+        const n = std.c.read(fd, out[got..].ptr, out.len - got);
+        if (n <= 0) return error.ConnectionEnded;
+        got += @intCast(n);
+    }
+}
+
+/// Sets a declared `iogpu.wired_limit_mb` whose floor (the limit less the margin) is `floor` bytes; null restores both.
+fn setWiredFloor(floor: ?u64) void {
+    const limit_mb: u64 = 120_000;
+    bills.wired_limit_mb_override = if (floor != null) limit_mb else null;
+    server_state.wired_limit_margin_bytes = if (floor) |f| (limit_mb << 20) - f else server_state.WIRED_LIMIT_MARGIN_BYTES;
+}
+
+test "server: a Responses WebSocket turn refused before it runs ends in the error frame, whichever check refused it" {
+    try eachArch(4, .{}, struct {
+        const Case = struct { name: []const u8, frame: []const u8 };
+        const long_input = blk: {
+            var s: []const u8 = "";
+            for (0..300) |_| s = s ++ "salmon ";
+            break :blk s;
+        };
+        const cases = [_]Case{
+            .{ .name = "no input", .frame = "{\"type\":\"response.create\",\"model\":\"tiny\"}" },
+            .{ .name = "schema without a schema", .frame = "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"x\"}}}" },
+            .{ .name = "effort not a word", .frame = "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"reasoning\":{\"effort\":5}}" },
+            .{ .name = "tool_choice undeclared", .frame = "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}],\"tool_choice\":{\"type\":\"function\",\"name\":\"g\"}}" },
+            .{ .name = "media refused", .frame = "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AAAA\"}]}]}" },
+            .{ .name = "context overflow", .frame = "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"" ++ long_input ++ "\"}" },
+            .{ .name = "memory admission", .frame = "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"max_output_tokens\":8,\"temperature\":0}" },
+        };
+        fn run() !void {
+            const fd = try wsConnect();
+            defer _ = std.c.close(fd);
+            defer setWiredFloor(null);
+            const ctx_was = server_state.server_config.max_context_size;
+            defer server_state.server_config.max_context_size = ctx_was;
+            for (cases) |c| {
+                if (std.mem.eql(u8, c.name, "memory admission")) setWiredFloor(1 << 20);
+                server_state.server_config.max_context_size = if (std.mem.eql(u8, c.name, "context overflow")) 64 else ctx_was;
+                try wsSend(fd, c.frame);
+                const frame = try wsReadFrame(fd);
+                defer gpa.free(frame);
+                if (!std.mem.startsWith(u8, frame, "{\"type\":\"error\",\"status\":4")) {
+                    std.debug.print("refused turn ({s}) ended in: {s}\n", .{ c.name, frame[0..@min(frame.len, 400)] });
+                    return error.RefusalNotTheTurnsErrorFrame;
+                }
+            }
+            setWiredFloor(null);
+            // The connection serves the next turn.
+            try wsSend(fd, "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}");
+            while (true) {
+                const frame = try wsReadFrame(fd);
+                defer gpa.free(frame);
+                if (std.mem.indexOf(u8, frame, "\"type\":\"response.completed\"") != null) break;
+                if (std.mem.startsWith(u8, frame, "{\"type\":\"error\"")) return error.NextTurnFailed;
+            }
         }
     }.run);
 }
