@@ -1763,9 +1763,10 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
         if (fitAfterUnloadingIdle(&unloading, IdleUnloadFit.fits, IdleUnloadFit.unloadOne)) return true;
     };
     if (bill.needed > bill.available) {
-        const needed_mb = bill.needed / (1024 * 1024);
-        const avail_mb = bill.available / (1024 * 1024);
-        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
+        const u = bills.Mem.unitOf(bill.needed, bill.available +| bill.evictable);
+        log.warn("  prompt {d} tokens needs {f} (KV+working+margin) at prefill chunk {d}, {f} available + {f} reclaimable of {f} resident hot cache — rejecting\n", .{
+            prompt_len, bills.Mem.need(bill.needed, u), bill.chunk, bills.Mem.have(bill.available, u), bills.Mem.have(bill.evictionCredit(), u), bills.Mem.have(bill.evictable, u),
+        });
         // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
         // is evictable here by construction (the withheld case took the deferral arm). Where a refusal can name the
         // max_tokens and context that fit, it is the inference thread's text; else the cache clause is only true
@@ -1775,7 +1776,21 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
         const msg = if (refusal) |r|
             try bills.memoryContextRefusalMessage(allocator, r)
         else
-            try bills.memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.admissionEvictsHotCache());
+            try bills.memoryRefusalMessage(allocator, prompt_len, max_tokens, fitting: {
+                const carries = config.admissionEvictsHotCache();
+                const Need = struct {
+                    config: *const model_mod.ModelConfig,
+                    prompt_ids: []const u32,
+                    kv_override: ?trunk.KVQuantConfig,
+                    unchunked_prefill: bool,
+                    enable_mtp: bool,
+                    pub fn at(n: @This(), m: u32) u64 {
+                        return prefillAdmissionBill(n.config, n.prompt_ids.len, m, n.kv_override, n.unchunked_prefill, n.prompt_ids, .{ .mtp_on = n.enable_mtp }).needed;
+                    }
+                };
+                const need: Need = .{ .config = config, .prompt_ids = prompt_ids, .kv_override = kv_override, .unchunked_prefill = unchunked_prefill, .enable_mtp = enable_mtp };
+                break :fitting bills.fittingMaxTokensBy(max_tokens, if (carries) bill.available +| bill.evictionCredit() else bill.available, need);
+            }, bill, config.admissionEvictsHotCache());
         defer allocator.free(msg);
         countRejected();
         if (is_anthropic) {
@@ -4113,6 +4128,41 @@ test "promptOpensThink: only the think token opens a think block, never its spel
     try std.testing.expect(!promptOpensThink(a, &tok, &spelled));
     try std.testing.expect(promptOpensThink(a, &tok, &.{ 'x', 256, '\n' }));
     try std.testing.expect(!promptOpensThink(a, &tok, &.{ 256, 'x' }));
+}
+
+test "a request a non-Sushi bill refuses for its max_tokens names the max_tokens that fits, and that one is admitted" {
+    const t = std.testing;
+    const a = t.allocator;
+    const saved_ctx = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = saved_ctx;
+    const saved_mtp = server_state.configured_mtp;
+    defer server_state.configured_mtp = saved_mtp;
+    server_state.server_config.max_context_size = 1_048_576;
+    server_state.configured_mtp = null;
+    var cfg = fixtures.qwen4RequestTestConfig();
+    cfg.num_key_value_heads = 64;
+    try t.expect(!model_mod.usesSushiQuantMemoryBill(&cfg));
+    var prompt: [64]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast(i + 10);
+    var sv: [2]std.posix.fd_t = undefined;
+    try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: http_conn.Conn = undefined;
+    http_conn.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+    const admitted = try checkAttentionMemory(a, &conn, &prompt, 1_000_000, &cfg, "", false, null, false, false);
+    _ = std.c.close(sv[0]);
+    var buf: [8192]u8 = undefined;
+    const raw = readAllFromPair(sv[1], &buf);
+    const body = raw[(std.mem.indexOf(u8, raw, "\r\n\r\n") orelse 0)..];
+    errdefer std.debug.print("the refusal (admitted {}): {s}\n", .{ admitted, body });
+    try t.expect(!admitted);
+    const key = "max_tokens ";
+    const at = std.mem.indexOf(u8, body, " fits: lower max_tokens to ") orelse return error.TestUnexpectedResult;
+    const start = std.mem.lastIndexOf(u8, body[0..at], key).? + key.len;
+    const fits = try std.fmt.parseInt(u32, body[start..at], 10);
+    try t.expect(fits > 0);
+    const bill = prefillAdmissionBill(&cfg, prompt.len, fits, null, false, &prompt, .{});
+    try t.expect(bill.needed <= bill.available);
 }
 
 test "a request whose max_tokens alone does not fit is refused on the connection thread in the inference thread's words, with the max_tokens that fits" {

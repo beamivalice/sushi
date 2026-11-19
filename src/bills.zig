@@ -1184,14 +1184,17 @@ pub fn requestContextRefusal(config: *const model_mod.ModelConfig, prompt_len: u
 
 /// The largest max_tokens up to `asked` whose bill fits `budget`; 0 when the prompt alone does not.
 fn fittingMaxTokens(config: *const model_mod.ModelConfig, prompt_len: usize, asked: u32, kv_bits: u64, chunk: u64, warm: WarmPrefix, budget: u64) u32 {
-    var low: u32 = 0;
-    var high: u32 = asked;
-    if (prefillNeededAtChunk(config, prompt_len, 0, kv_bits, chunk, warm) > budget) return 0;
-    while (low < high) {
-        const mid = low + (high - low + 1) / 2;
-        if (prefillNeededAtChunk(config, prompt_len, mid, kv_bits, chunk, warm) <= budget) low = mid else high = mid - 1;
-    }
-    return low;
+    const Need = struct {
+        config: *const model_mod.ModelConfig,
+        prompt_len: usize,
+        kv_bits: u64,
+        chunk: u64,
+        warm: WarmPrefix,
+        pub fn at(n: @This(), max_tokens: u32) u64 {
+            return prefillNeededAtChunk(n.config, n.prompt_len, max_tokens, n.kv_bits, n.chunk, n.warm);
+        }
+    };
+    return fittingMaxTokensBy(asked, budget, Need{ .config = config, .prompt_len = prompt_len, .kv_bits = kv_bits, .chunk = chunk, .warm = warm });
 }
 
 /// The refusal's text, whole: the caller frees it.
@@ -2385,22 +2388,42 @@ pub fn roundCaptureBytes(config: *const model_mod.ModelConfig) u64 {
     return (archHook("roundCaptureStates", u64, config, .{}) orelse 0) *| config.ssmCheckpointBytes();
 }
 
-/// The body of the pre-flight memory 400. Two arms: with the credits present the message
-/// quotes them; with them structurally zero (every arch outside `admissionEvictsHotCache`)
-/// the previous sentence, which named no cache. The discriminator is the arch gate, not `bill.evictable`,
-/// so the qwen4_exp bytes stay exactly as they were. Caller owns the returned bytes.
+/// The body of the pre-flight memory 400 where `requestContextRefusal` names no figures (a bill that is not a Sushi
+/// pack's): the need, what is available (with the prefix cache's credit where the arch evicts it for admission) and the
+/// max_tokens that fits (`fitting_max_tokens`, 0 when the prompt alone does not). Caller owns the returned bytes.
 pub fn memoryRefusalMessage(
     allocator: std.mem.Allocator,
     prompt_len: usize,
-    needed_mb: u64,
-    avail_mb: u64,
+    max_tokens: u32,
+    fitting_max_tokens: u32,
     bill: AdmissionBill,
     carries_cache: bool,
 ) ![]u8 {
-    if (!carries_cache) {
-        return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    const have = if (carries_cache) bill.available +| bill.evictionCredit() else bill.available;
+    const u = Mem.unitOf(bill.needed, have);
+    try w.print("Not enough GPU memory for this request: with a {d}-token prompt and max_tokens {d} it needs {f}, and {f} is available", .{ prompt_len, max_tokens, Mem.need(bill.needed, u), Mem.have(have, u) });
+    if (carries_cache) try w.print(", counting the {f} the prefix cache can give back", .{Mem.have(bill.evictionCredit(), u)});
+    if (fitting_max_tokens > 0)
+        try w.print(".\nmax_tokens {d} fits: lower max_tokens to {d} or less, shorten the prompt, or free memory (quit other apps or unload another model).", .{ fitting_max_tokens, fitting_max_tokens })
+    else
+        try w.print(".\nThe prompt alone does not fit: shorten it, free memory (quit other apps or unload another model), or use a smaller model.", .{});
+    return out.toOwnedSlice();
+}
+
+/// The largest max_tokens up to `asked` whose need (`need_at.at(max_tokens)`) fits `budget`; 0 when the prompt alone does
+/// not.
+pub fn fittingMaxTokensBy(asked: u32, budget: u64, need_at: anytype) u32 {
+    if (need_at.at(0) > budget) return 0;
+    var low: u32 = 0;
+    var high: u32 = asked;
+    while (low < high) {
+        const mid = low + (high - low + 1) / 2;
+        if (need_at.at(mid) <= budget) low = mid else high = mid - 1;
     }
-    return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.evictionCredit() / (1024 * 1024) });
+    return low;
 }
 
 /// The admission bill and the headroom it is compared against, so the connection thread's
@@ -6366,12 +6389,14 @@ test "bill pin: admissionLogLevel" {
 test "bill pin: the refusal sentences" {
     const a = std.testing.allocator;
     const bill = AdmissionBill{ .needed = 13_664 << 20, .available = 13_374 << 20, .evictable = 7_802 << 20, .reclaimable = 2_000 << 20, .chunk = 512 };
-    const plain = try memoryRefusalMessage(a, 5000, 13_664, 13_374, bill, false);
+    const plain = try memoryRefusalMessage(a, 5000, 4096, 1200, bill, false);
     defer a.free(plain);
-    try std.testing.expectEqualStrings("Prompt (5000 tokens) requires ~13664MB GPU memory but only ~13374MB available. Reduce prompt size or use a smaller model.", plain);
-    const cached = try memoryRefusalMessage(a, 5000, 13_664, 13_374, bill, true);
+    try std.testing.expectEqualStrings("Not enough GPU memory for this request: with a 5000-token prompt and max_tokens 4096 it needs 13.4 GB, and 13.0 GB is available.\nmax_tokens 1200 fits: lower max_tokens to 1200 or less, shorten the prompt, or free memory (quit other apps or unload another model).", plain);
+    var tight = bill;
+    tight.reclaimable = 200 << 20;
+    const cached = try memoryRefusalMessage(a, 5000, 4096, 0, tight, true);
     defer a.free(cached);
-    try std.testing.expectEqualStrings("Prompt (5000 tokens) requires ~13664MB GPU memory but only ~13374MB is available and the hot prefix cache holds ~7802MB more, all of which can be reclaimed (~2000MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", cached);
+    try std.testing.expectEqualStrings("Not enough GPU memory for this request: with a 5000-token prompt and max_tokens 4096 it needs 13.4 GB, and 13.2 GB is available, counting the 0.1 GB the prefix cache can give back.\nThe prompt alone does not fit: shorten it, free memory (quit other apps or unload another model), or use a smaller model.", cached);
     const fits = try memoryContextRefusalMessage(a, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024, .asked_max_tokens = 96_000, .fitting_max_tokens = 2000 });
     defer a.free(fits);
     try std.testing.expectEqualStrings("Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024: the request needs 9000 MB and 7000 MB is available. max_tokens 2000 fits (asked 96000); maximum context: 64000 tokens. Lower max_tokens, reduce context or free memory.", fits);
@@ -7514,4 +7539,15 @@ test "a streamed load whose expert cache does not fit its ceiling is refused wit
     const f = expertCacheRefusal(&cfg, gib / 2, floored).?;
     try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, f.refusal), "the GPU memory limit (iogpu.wired_limit_mb = 2048 MB) leaves 0.0 GB beside what is already loaded") != null);
     try testing.expect(expertCacheRefusal(&cfg, gib / 2, .{ .working_set = 64 * gib, .free = 64 * gib }) == null);
+}
+
+test "a request a non-Sushi bill refuses shows its need above what is available and names the max_tokens that fits" {
+    const a = testing.allocator;
+    const mib: u64 = 1 << 20;
+    const bill = AdmissionBill{ .needed = 635 * mib + 600 * 1024, .available = 635 * mib + 100 * 1024, .chunk = 512 };
+    const text = try memoryRefusalMessage(a, 98, 100, 40, bill, false);
+    defer a.free(text);
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "needs 636 MB, and 635 MB is available") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "max_tokens 40 fits") != null);
 }

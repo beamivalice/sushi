@@ -28,6 +28,10 @@ earlier history is mlx-serve's, in that project's changelog.
   which already carries the margin, and added it again, so a request within 256 MB of the edge was refused and the
   advertised context came out that much smaller. Its last decode forward is now priced where it runs, at the reply's
   end, so a short prompt with a long reply is billed the scores and state growth of its whole context.
+- **A request refused for memory on a model without a Sushi bill names the `max_tokens` that fits**: it read "Prompt (98
+  tokens) requires ~635MB GPU memory but only ~635MB available. Reduce prompt size", though `max_tokens` was the cause
+  and the need was over what was available; it now gives both figures, need above what is available, and the largest
+  `max_tokens` that fits, or says the prompt alone does not fit.
 - **A streamed load refused because its SSD streaming memory does not fit says why, with figures and what helps**: it
   read a fixed sentence about "full-union workspace, bounce buffers" or sent the user to the server log for a
   `sysctl` command, which on a Mac with less RAM than the budget asked for a GPU limit past its RAM. It now reads as the
