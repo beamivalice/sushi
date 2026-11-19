@@ -35,6 +35,10 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A failed speculative Qwen request no longer leaves memory held until restart**: a request whose MTP verify failed,
   for example refused for memory, kept the verify's recurrent-state capture (about 6 MB per layer it had reached), and
   every such failure added to it. The round frees it as it fails, and the request's teardown frees it too.
+- **A Responses continuation no longer reads freed memory when its previous response is deleted or evicted mid-reply**:
+  the stored history it continued, a `GET /v1/responses/{id}` body and a WebSocket chain were read after the store had
+  let go of them, so the reply could store garbage history or crash; the store now keeps a response whole until every
+  request reading it is done.
 - **A raised `--wired-margin-gib` no longer stops a model from loading**: 1.7.0 took the margin off the memory still
   free as well as off the wired limit, so a margin that left room for other apps' models on 1.6.0 left no room for a
   prefill and the load failed (`WarmChunkDoesNotFit`). The margin now applies once, under the wired limit, as before,

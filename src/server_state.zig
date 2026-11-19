@@ -73,6 +73,8 @@ pub const ServerConfig = struct {
     /// Starts a client that submits to the scheduler directly, once the model is loaded and the context is
     /// pinned. The server binds no socket; the client ends the run with `requestShutdown`.
     embedded_client: ?*const fn () anyerror!std.Thread = null,
+    /// A test build's server names the side its loads run on (`cooler_side.forTest`); null keeps a test's MLX.
+    test_on_cooler: ?bool = null,
     /// Maximum context size (0 = unlimited). `--ctx-size N`.
     max_context_size: u32 = 0,
     /// Request timeout in seconds (0 = no timeout). `--timeout N`.

@@ -28,6 +28,20 @@ pub fn prepare(a: std.mem.Allocator, config: *model_mod.ModelConfig, dir: []cons
     config.expert_source_dir = try a.dupe(u8, dir);
 }
 
+/// The served tiny ends a chat or Responses reply within a few tokens, and holds 128: a long reply is a completion
+/// with `ignore_eos`.
+pub const server_long_replies = false;
+
+/// What a server test serves (`src/server_test.zig`), in `dir`: the DSpark tiny's weights, and a byte-level tokenizer
+/// of the release's specials and the tiny's 96 ids, which the fixture lacks.
+pub fn serverDir(dir: std.Io.Dir) !void {
+    const tiny = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    try @import("../test_support.zig").linkInto(dir, tiny, &.{});
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = @embedFile("../fixtures/dsv41_tiny_tokenizer.json") });
+    try dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = @embedFile("../fixtures/dsv41_tiny_tokenizer_config.json") });
+}
+
 /// The fixture's prompt ids (allocated with `a`), read before any load.
 pub fn prompt(a: std.mem.Allocator, dir: []const u8) ![]u32 {
     var fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");

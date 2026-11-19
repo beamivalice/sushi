@@ -2227,6 +2227,10 @@ const CountTokensFixture = struct {
     }
 };
 
+fn handleResponsesTurnless(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel) !void {
+    return handleResponses(allocator, stream, body, lm, .{});
+}
+
 test "a refused chat template answers a named 500 on every generative surface, streamed or not" {
     const t = std.testing;
     var f: CountTokensFixture = undefined;
@@ -2243,8 +2247,8 @@ test "a refused chat template answers a named 500 on every generative surface, s
         .{ .handler = handleAnthropicMessages, .body = "{\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
         .{ .handler = handleAnthropicMessages, .body = "{\"max_tokens\":8,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
         .{ .handler = handleAnthropicCountTokens, .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
-        .{ .handler = handleResponses, .body = "{\"input\":\"hi\"}" },
-        .{ .handler = handleResponses, .body = "{\"stream\":true,\"input\":\"hi\"}" },
+        .{ .handler = handleResponsesTurnless, .body = "{\"input\":\"hi\"}" },
+        .{ .handler = handleResponsesTurnless, .body = "{\"stream\":true,\"input\":\"hi\"}" },
     };
     for (cases) |c| {
         const response = try f.postTo(c.handler, c.body);

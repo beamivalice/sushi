@@ -754,6 +754,7 @@ pub fn serve(
 
     scheduler_mod.prefill_ubench_chunk = &requestPrefillChunkNow;
     defer scheduler_mod.prefill_ubench_chunk = null;
+    if (comptime @import("builtin").is_test) if (cfg.test_on_cooler) |on| @import("cooler_side.zig").forTest(load_params.config, on);
 
     server_state.listen_host = host;
     server_state.listen_port = port;
@@ -790,6 +791,9 @@ pub fn serve(
     server_state.global_registry = scheduler.registry;
     defer server_state.global_registry = null;
     scheduler.registry.load_gate = downloads.loadGate;
+    scheduler.test_on_cooler = cfg.test_on_cooler;
+    responses_api.initGlobalResponseStore(io, allocator);
+    defer responses_api.deinitGlobalResponseStore();
 
     if (instr.current() != null) {
         startGaugeSampler() catch |err| log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
@@ -995,8 +999,6 @@ pub fn serve(
     } else acceptLoop(allocator, io, null);
     stopServing(&accept_thread);
 
-    responses_api.deinitGlobalResponseStore();
-
     log.info("\nShutting down gracefully...\n", .{});
 }
 
@@ -1045,29 +1047,39 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.S
         // thread, so the connection thread NEVER touches `xfm.s` directly —
         // it parses HTTP, encodes the prompt, calls `scheduler.submit`,
         // reads tokens via `slot.waitNext`, and writes the response.
-        const args = allocator.create(http_conn.ConnThreadArgs) catch |err| {
-            log.err("conn thread args alloc failed: {}\n", .{err});
-            accepted_stream.close(io);
-            continue;
-        };
-        args.* = .{
-            .allocator = allocator,
-            .accepted_stream = accepted_stream,
-            .io = io,
-        };
-        // Count the thread before spawning so the shutdown drain can't miss a
-        // thread that's about to start; the thread decrements on return.
-        _ = active_conn_threads.fetchAdd(1, .acq_rel);
-        const conn_thread = std.Thread.spawn(.{}, handleConnectionThread, .{args}) catch |err| {
-            log.err("spawn conn thread failed: {}\n", .{err});
-            _ = active_conn_threads.fetchSub(1, .acq_rel);
-            accepted_stream.close(io);
-            allocator.destroy(args);
-            continue;
-        };
-        // Detach: a joinable handle dropped per request leaks a stack region; no spawn site may discard its handle.
-        conn_thread.detach();
+        spawnConnection(allocator, io, accepted_stream);
     }
+}
+
+/// Serves `accepted_stream` on a detached thread of its own; on a failure to start one, closes it.
+pub fn spawnConnection(allocator: std.mem.Allocator, io: std.Io, accepted_stream: std.Io.net.Stream) void {
+    const args = allocator.create(http_conn.ConnThreadArgs) catch |err| {
+        log.err("conn thread args alloc failed: {}\n", .{err});
+        accepted_stream.close(io);
+        return;
+    };
+    args.* = .{
+        .allocator = allocator,
+        .accepted_stream = accepted_stream,
+        .io = io,
+    };
+    // Count the thread before spawning so the shutdown drain can't miss a
+    // thread that's about to start; the thread decrements on return.
+    _ = active_conn_threads.fetchAdd(1, .acq_rel);
+    const conn_thread = std.Thread.spawn(.{}, handleConnectionThread, .{args}) catch |err| {
+        log.err("spawn conn thread failed: {}\n", .{err});
+        _ = active_conn_threads.fetchSub(1, .acq_rel);
+        accepted_stream.close(io);
+        allocator.destroy(args);
+        return;
+    };
+    // Detach: a joinable handle dropped per request leaks a stack region; no spawn site may discard its handle.
+    conn_thread.detach();
+}
+
+/// The connection threads not yet returned.
+pub fn activeConnections() u32 {
+    return active_conn_threads.load(.acquire);
 }
 
 fn logFdQuota(allocator: std.mem.Allocator, err: anyerror) void {
@@ -1590,7 +1602,7 @@ pub fn handleConnection(
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try responses_api.handleResponses(allocator, stream, body, lm);
+        try responses_api.handleResponses(allocator, stream, body, lm, .{});
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/tokenize")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];

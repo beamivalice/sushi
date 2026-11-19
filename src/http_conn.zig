@@ -29,7 +29,6 @@ const EMPTY_PROMPT_MSG = generation_stream.EMPTY_PROMPT_MSG;
 const SSE_ALLOW_HEADERS_DEFAULT = http.SSE_ALLOW_HEADERS_DEFAULT;
 const bindAddress = http.bindAddress;
 const chatPageUrl = server_mod.chatPageUrl;
-const getOrInitResponseStore = responses_api.getOrInitResponseStore;
 const handleCompletions = completions.handleCompletions;
 const handleConnection = server_mod.handleConnection;
 const handleResponses = responses_api.handleResponses;
@@ -94,21 +93,12 @@ pub fn startListener(host: []const u8, port: u16) (error{InvalidHost} || std.Io.
 pub const WsBridge = struct {
     impl: *anyopaque,
     sendTextFn: *const fn (impl: *anyopaque, data: []const u8) anyerror!void,
-    /// Captured response id from the first event seen this turn (for moving
-    /// the entry between global and connection-local caches afterwards).
-    /// Owned by `allocator`; freed by the WS handler at end of turn.
-    captured_resp_id: ?[]u8 = null,
     allocator: ?std.mem.Allocator = null,
     /// Status emitted in the most recent `response.completed`-class event,
     /// or null if no terminal event was seen.
     captured_status: ?[]u8 = null,
 
     pub fn sendText(self: *WsBridge, data: []const u8) !void {
-        if (self.captured_resp_id == null) {
-            if (self.allocator) |a| {
-                if (extractResponseId(a, data)) |id| self.captured_resp_id = id;
-            }
-        }
         if (self.allocator) |a| {
             if (extractCompletedStatus(a, data)) |st| {
                 if (self.captured_status) |old| a.free(old);
@@ -120,24 +110,11 @@ pub const WsBridge = struct {
 
     pub fn reset(self: *WsBridge) void {
         if (self.allocator) |a| {
-            if (self.captured_resp_id) |id| a.free(id);
             if (self.captured_status) |st| a.free(st);
         }
-        self.captured_resp_id = null;
         self.captured_status = null;
     }
 };
-
-/// Pull the value of the first `"id":"resp_..."` field out of a JSON
-/// payload. Returns an owned copy or null. Used by `WsBridge.sendText` to
-/// learn the response id without parsing the whole envelope.
-fn extractResponseId(allocator: std.mem.Allocator, data: []const u8) ?[]u8 {
-    const needle = "\"id\":\"resp_";
-    const start = std.mem.indexOf(u8, data, needle) orelse return null;
-    const v_start = start + "\"id\":\"".len;
-    const v_end = std.mem.indexOfScalarPos(u8, data, v_start, '"') orelse return null;
-    return allocator.dupe(u8, data[v_start..v_end]) catch null;
-}
 
 /// Pull the value of `"status":"..."` (response-level, not item-level)
 /// from a `response.completed`/`.failed`/`.incomplete` payload.
@@ -1352,24 +1329,16 @@ const WsLocalCache = struct {
 /// has no matching `function_call` in the prev response's history (or in
 /// the same input list, for parallel tool-call replies). Returns null if
 /// every output has a matching call.
-fn orphanFunctionCallOutputId(
-    input_val: std.json.Value,
-    prev_id: ?[]const u8,
-    local: *WsLocalCache,
-    global: *responses_mod.ResponseStore,
-) ?[]const u8 {
+fn orphanFunctionCallOutputId(input_val: std.json.Value, prev_history: ?[]const chat_mod.Message) ?[]const u8 {
     if (input_val != .array) return null;
     // Collect all known call_ids from (a) prev history and (b) current input's
     // function_call items.
     var known: std.StringHashMapUnmanaged(void) = .{};
     defer known.deinit(std.heap.page_allocator);
-    if (prev_id) |pid| blk: {
-        const sr = local.get(pid) orelse global.get(pid) orelse break :blk;
-        for (sr.history) |m| {
-            if (m.tool_calls) |tcs| for (tcs) |tc| {
-                _ = known.put(std.heap.page_allocator, tc.id, {}) catch {};
-            };
-        }
+    for (prev_history orelse &.{}) |m| {
+        if (m.tool_calls) |tcs| for (tcs) |tc| {
+            _ = known.put(std.heap.page_allocator, tc.id, {}) catch {};
+        };
     }
     for (input_val.array.items) |item| {
         if (item != .object) continue;
@@ -1512,29 +1481,29 @@ pub fn handleResponsesWebSocket(
             continue;
         }
 
-        // ── Resolve previous_response_id against per-conn cache first.
-        //    For store:false continuations on this connection, the chain
-        //    root is in `local_cache` only. For store:true responses we
-        //    fall back to the global store (lets stored chains survive
-        //    across connections). On miss, evict any stale local entry
-        //    before reporting the error.
+        // ── Resolve previous_response_id: a `store:false` chain root lives in `local_cache` on this connection only,
+        //    a stored one in the shared store, held for the whole turn. On a miss, any stale local entry goes.
         const prev_id_owned: ?[]const u8 = if (root.get("previous_response_id")) |v|
             (if (v == .string) v.string else null)
         else
             null;
-        var prev_in_local: bool = false;
+        const store = responses_api.responseStore();
+        var prev_history: ?[]const chat_mod.Message = null;
+        var prev_held: ?*responses_mod.StoredResponse = null;
+        defer if (prev_held) |sr| store.release(sr);
         if (prev_id_owned) |pid| {
-            if (local_cache.get(pid) != null) {
-                prev_in_local = true;
+            if (local_cache.get(pid)) |sr| {
+                prev_history = sr.history;
+            } else if (store.acquire(pid)) |sr| {
+                prev_held = sr;
+                prev_history = sr.history;
             } else {
-                const store = getOrInitResponseStore(stream.io, allocator);
-                if (store.get(pid) == null) {
-                    local_cache.evict(pid);
-                    try wsSendErrorTurn(allocator, &ws_conn, 404, "previous_response_not_found", "previous_response_id not found");
-                    continue;
-                }
+                local_cache.evict(pid);
+                try wsSendErrorTurn(allocator, &ws_conn, 404, "previous_response_not_found", "previous_response_id not found");
+                continue;
             }
         }
+        const prev_in_local = prev_id_owned != null and prev_held == null;
 
         // Validate any function_call_output items reference real call_ids
         // in the prev response's history. An orphan output means the user
@@ -1543,7 +1512,7 @@ pub fn handleResponsesWebSocket(
         // root from the local cache.
         if (prev_id_owned) |pid| {
             if (root.get("input")) |input_v| {
-                if (orphanFunctionCallOutputId(input_v, prev_id_owned, &local_cache, getOrInitResponseStore(stream.io, allocator))) |_| {
+                if (orphanFunctionCallOutputId(input_v, prev_history)) |_| {
                     local_cache.evict(pid);
                     try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "function_call_output references a missing call_id");
                     continue;
@@ -1551,84 +1520,31 @@ pub fn handleResponsesWebSocket(
             }
         }
 
-        // For store:false continuations on this connection, the chain root
-        // lives in `local_cache` (not the global store). Move it into the
-        // global store *just for this turn* so handleResponses' lookup at
-        // line 4634 can find it. We restore the original location at end
-        // of turn. (The kludge avoids modifying handleResponses.)
-        const did_borrow_to_global = prev_id_owned != null and prev_in_local;
-        if (did_borrow_to_global) {
-            const sr = local_cache.map.get(prev_id_owned.?).?;
-            // Remove from local without freeing.
-            _ = local_cache.map.remove(prev_id_owned.?);
-            const store = getOrInitResponseStore(stream.io, allocator);
-            store.put(sr) catch {};
-        }
-
         // ── Reserialize the request as an HTTP body, forcing
         //    `stream: true` (WS is inherently streaming) and `store: true`
-        //    so handleResponses always persists the result. We move the
-        //    entry to local_cache below if the user actually wanted
-        //    `store: false`, achieving connection-scoped lifetime.
+        //    so handleResponses always keeps the result: in the shared store,
+        //    or on this connection when the user asked for `store: false`.
         const want_user_store: bool = if (root.get("store")) |v| (if (v == .bool) v.bool else true) else true;
         const body = try buildResponsesBodyFromWsRequest(allocator, root);
         defer allocator.free(body);
-
-        // Reset sequence numbering per response per the OpenAI spec.
-        // (handleResponses owns its own seq_num, fresh each call.)
-        var seq: u64 = 0;
-        _ = &seq;
 
         stream.ws_mode = &bridge;
         defer stream.ws_mode = null;
 
         bridge.reset();
-        handleResponses(allocator, stream, body, lm) catch |err| {
+        var kept: ?*responses_mod.StoredResponse = null;
+        const turn_result = handleResponses(allocator, stream, body, lm, .{ .prev_history = prev_history, .kept = if (want_user_store) null else &kept });
+        if (kept) |sr| local_cache.put(sr) catch sr.deinit();
+        turn_result catch |err| {
             log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
             wsGenerationErrorTurn(allocator, &ws_conn, err) catch {};
-            // Restore borrowed prev entry back to local cache on failure.
-            if (did_borrow_to_global and prev_id_owned != null) {
-                const store = getOrInitResponseStore(stream.io, allocator);
-                if (store.map.fetchRemove(prev_id_owned.?)) |kv| {
-                    store.lru.remove(&kv.value.list_node);
-                    local_cache.map.put(local_cache.gpa, kv.value.id, kv.value) catch {};
-                }
-            }
             continue;
         };
 
-        // Handle the borrowed prev: move it back from global to local
-        // cache. On success, also do the eviction-on-failure check —
-        // if the just-completed turn ended in a non-completed status
-        // (failed/incomplete), evict the chain root from local cache.
-        if (did_borrow_to_global and prev_id_owned != null) {
-            const store = getOrInitResponseStore(stream.io, allocator);
-            if (store.map.fetchRemove(prev_id_owned.?)) |kv| {
-                store.lru.remove(&kv.value.list_node);
-                const turn_failed = bridge.captured_status != null and !std.mem.eql(u8, bridge.captured_status.?, "completed");
-                if (turn_failed) {
-                    // Compliance: a failed continuation evicts the chain root.
-                    kv.value.deinit();
-                } else {
-                    local_cache.map.put(local_cache.gpa, kv.value.id, kv.value) catch {};
-                }
-            }
-        }
-
-        // For store:false on this WS, move the freshly-stored response
-        // from the global store into the connection-local cache so it
-        // (a) survives the user's `store: false` semantics within this
-        // connection (allowing previous_response_id chains) and
-        // (b) does NOT leak across reconnects (other WS connections
-        // looking up this id should get previous_response_not_found).
-        if (!want_user_store) {
-            if (bridge.captured_resp_id) |rid| {
-                const store = getOrInitResponseStore(stream.io, allocator);
-                if (store.map.fetchRemove(rid)) |kv| {
-                    store.lru.remove(&kv.value.list_node);
-                    local_cache.map.put(local_cache.gpa, kv.value.id, kv.value) catch {};
-                }
-            }
+        // Compliance: a continuation of a local chain that ended failed or incomplete evicts its chain root.
+        if (prev_in_local) {
+            const turn_failed = bridge.captured_status != null and !std.mem.eql(u8, bridge.captured_status.?, "completed");
+            if (turn_failed) local_cache.evict(prev_id_owned.?);
         }
 
         // No `[DONE]` on the WS success path: over WebSocket the per-response

@@ -308,6 +308,15 @@ printf '%s\n' 'fn side(c: *const C) bool {' '    return c.cooler_ask == .none;' 
 printf '%s\n' 'test "t" {' '    c.cooler_for_test = true;' '}' > "$TMP/t/src/p.zig"
 expect_green "cooler_side itself, and a test"
 
+# rule response-store-field
+tree
+printf '%s\n' 'fn take(store: *S, id: []const u8) void {' '    _ = store.by_id.fetchRemove(id);' '}' > "$TMP/t/src/p.zig"
+expect_red "the Responses store's map outside its file" "src/p.zig:2:15 \[response-store-field\] take: by_id outside src/responses.zig: go through ResponseStore's methods"
+
+tree
+printf '%s\n' 'fn take(self: *S, id: []const u8) void {' '    _ = self.by_id.fetchRemove(id);' '    self.recency.remove(id);' '}' > "$TMP/t/src/responses.zig"
+expect_green "the store's own file"
+
 # rule engine-lifecycle
 tree
 printf '%s\n' 'fn load() void {' '    mlx.engine.hold();' '    mlx.engine.own_weights = true;' '}' > "$TMP/t/src/p.zig"

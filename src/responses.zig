@@ -742,6 +742,10 @@ pub const StoredResponse = struct {
     arena: std.heap.ArenaAllocator,
 
     list_node: std.DoublyLinkedList.Node = .{},
+    /// The `ResponseStore.acquire` holds not yet released, and whether the store has let the record go (deleted,
+    /// evicted or replaced): the last release of a let-go record frees it. Both under the store's lock.
+    holds: u32 = 0,
+    dropped: bool = false,
 
     pub fn deinit(self: *StoredResponse) void {
         var arena = self.arena;
@@ -751,10 +755,12 @@ pub const StoredResponse = struct {
     }
 };
 
+/// The stored responses, bounded LRU. Every read and write takes its lock: a caller holds a record through
+/// `acquire`/`release`, never a bare pointer, so a delete or an eviction while it reads frees nothing under it.
 pub const ResponseStore = struct {
     mu: std.Io.Mutex = .init,
-    map: std.StringHashMapUnmanaged(*StoredResponse) = .{},
-    lru: std.DoublyLinkedList = .{},
+    by_id: std.StringHashMapUnmanaged(*StoredResponse) = .{},
+    recency: std.DoublyLinkedList = .{},
     cap: usize,
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -763,18 +769,12 @@ pub const ResponseStore = struct {
         return .{ .io = io, .gpa = gpa, .cap = cap };
     }
 
+    /// Frees every record; a record still held is the holder's to release, and its release frees it.
     pub fn deinit(self: *ResponseStore) void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        var node = self.lru.first;
-        while (node) |n| {
-            const next = n.next;
-            const sr: *StoredResponse = @fieldParentPtr("list_node", n);
-            sr.deinit();
-            node = next;
-        }
-        self.map.deinit(self.gpa);
-        self.lru = .{};
+        while (self.recency.first) |n| self.dropLocked(@fieldParentPtr("list_node", n));
+        self.by_id.deinit(self.gpa);
     }
 
     /// Take ownership of `sr`. Evicts the LRU tail if at capacity.
@@ -782,46 +782,46 @@ pub const ResponseStore = struct {
     pub fn put(self: *ResponseStore, sr: *StoredResponse) !void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-
-        // If id already exists, evict the old entry first
-        if (self.map.fetchRemove(sr.id)) |kv| {
-            const old = kv.value;
-            self.lru.remove(&old.list_node);
-            old.deinit();
+        if (self.by_id.get(sr.id)) |old| self.dropLocked(old);
+        if (self.by_id.count() >= self.cap) {
+            if (self.recency.last) |tail| self.dropLocked(@fieldParentPtr("list_node", tail));
         }
-
-        if (self.map.count() >= self.cap) {
-            // Evict LRU tail
-            if (self.lru.last) |tail_node| {
-                const tail: *StoredResponse = @fieldParentPtr("list_node", tail_node);
-                _ = self.map.remove(tail.id);
-                self.lru.remove(tail_node);
-                tail.deinit();
-            }
-        }
-
-        try self.map.put(self.gpa, sr.id, sr);
-        self.lru.prepend(&sr.list_node);
+        try self.by_id.put(self.gpa, sr.id, sr);
+        self.recency.prepend(&sr.list_node);
     }
 
-    /// Returns a borrowed reference (do not free). Touches LRU.
-    pub fn get(self: *ResponseStore, id: []const u8) ?*StoredResponse {
+    /// The record `id` held until `release`, which the caller owes; it stays whole whatever the store does meanwhile.
+    /// Touches LRU.
+    pub fn acquire(self: *ResponseStore, id: []const u8) ?*StoredResponse {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        const sr = self.map.get(id) orelse return null;
-        self.lru.remove(&sr.list_node);
-        self.lru.prepend(&sr.list_node);
+        const sr = self.by_id.get(id) orelse return null;
+        self.recency.remove(&sr.list_node);
+        self.recency.prepend(&sr.list_node);
+        sr.holds += 1;
         return sr;
+    }
+
+    pub fn release(self: *ResponseStore, sr: *StoredResponse) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        sr.holds -= 1;
+        if (sr.dropped and sr.holds == 0) sr.deinit();
     }
 
     /// Returns true if removed.
     pub fn delete(self: *ResponseStore, id: []const u8) bool {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        const kv = self.map.fetchRemove(id) orelse return false;
-        self.lru.remove(&kv.value.list_node);
-        kv.value.deinit();
+        self.dropLocked(self.by_id.get(id) orelse return false);
         return true;
+    }
+
+    fn dropLocked(self: *ResponseStore, sr: *StoredResponse) void {
+        _ = self.by_id.remove(sr.id);
+        self.recency.remove(&sr.list_node);
+        sr.dropped = true;
+        if (sr.holds == 0) sr.deinit();
     }
 };
 
@@ -1197,10 +1197,10 @@ test "ResponseStore basic put/get/delete" {
     const sr = try makeTestStored(gpa, "resp_1");
     try store.put(sr);
 
-    try testing.expect(store.get("resp_1") != null);
-    try testing.expect(store.get("missing") == null);
+    store.release(store.acquire("resp_1").?);
+    try testing.expect(store.acquire("missing") == null);
     try testing.expectEqual(true, store.delete("resp_1"));
-    try testing.expect(store.get("resp_1") == null);
+    try testing.expect(store.acquire("resp_1") == null);
 }
 
 test "ResponseStore evicts LRU at cap" {
@@ -1215,9 +1215,29 @@ test "ResponseStore evicts LRU at cap" {
         try store.put(sr);
     }
     // Cap is 2, inserted 3 — first one should be evicted
-    try testing.expect(store.get("id_0") == null);
-    try testing.expect(store.get("id_1") != null);
-    try testing.expect(store.get("id_2") != null);
+    try testing.expect(store.acquire("id_0") == null);
+    store.release(store.acquire("id_1").?);
+    store.release(store.acquire("id_2").?);
+}
+
+test "ResponseStore: a held record stays whole through its delete and its eviction, and its last release frees it" {
+    const gpa = testing.allocator;
+    var store = ResponseStore.init(testing.io, gpa, 1);
+    defer store.deinit();
+    try store.put(try makeTestStored(gpa, "a"));
+    const held = store.acquire("a").?;
+    const again = store.acquire("a").?;
+    try testing.expect(store.delete("a"));
+    try testing.expectEqualStrings("a", held.id);
+    store.release(again);
+    try testing.expectEqualStrings("{}", held.body_json);
+    store.release(held);
+    try store.put(try makeTestStored(gpa, "b"));
+    const b = store.acquire("b").?;
+    try store.put(try makeTestStored(gpa, "c"));
+    try testing.expect(store.acquire("b") == null);
+    try testing.expectEqualStrings("b", b.id);
+    store.release(b);
 }
 
 /// `holds`: text the prompt must carry, so two renders that both lost it do not pass as equal.

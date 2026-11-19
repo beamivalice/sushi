@@ -185,7 +185,9 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `engine-hold-end` flags a call of `engine.unhold` outside `arch_handle.engineHoldEnd` and `src/tensor/`: the last
   hold's end also gives back the EXL3 module's engine-side arrays. `engine-lifecycle` flags a load's engine step
   (`enable`, `hold`, setting `own_weights`, `unsealed`, `seal`) outside `arch/cooler.zig` and `arch/handle.zig`;
-  `cooler-side-query` flags `cooler_ask` or `cooler_for_test` outside `cooler_side.zig`.
+  `cooler-side-query` flags `cooler_ask` or `cooler_for_test` outside `cooler_side.zig`. `response-store-field` flags
+  the Responses store's map or LRU (`by_id`, `recency`) touched outside `responses.zig`: a record is held through
+  `acquire`/`release`.
   `template-runtime-safety` flags a fn under `src/template/` whose body does not open with `@setRuntimeSafety(true)`,
   and any `@setRuntimeSafety(false)` there: the engine reads pack text, and in ReleaseFast only that keeps its bounds
   and overflow checks. It covers the engine's own code, not the std functions it calls (those run unchecked); that is
@@ -253,6 +255,9 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - A scenario across several modules, or a table of real captures, is its own `<topic>_test.zig`.
 - A helper, constant or fixture builder only tests use is not declared in a shared file outside its `test` blocks: it
   goes to the arch's folder when one arch owns it, else to a `*_test.zig` beside the shared file.
+- A server scenario under concurrency (requests racing a delete, a shutdown or an unload) runs in process through
+  `src/server_test.zig`: `serve` with an embedded client, each arch's servable tiny (`cooler_contract.serverDir`) on
+  Sushi Cooler, socketpair connections, an allocator that poisons what it frees.
 - Integration scripts in `tests/` cover only what HTTP shows and a unit test cannot reach.
 
 ## How a test is built

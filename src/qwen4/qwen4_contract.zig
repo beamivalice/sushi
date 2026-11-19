@@ -75,6 +75,23 @@ pub fn dropExperts(a: std.mem.Allocator, config: *model_mod.ModelConfig, dir: []
     return @intCast(config.num_experts / 4 * 3);
 }
 
+/// The served tiny's chat and Responses replies run on for hundreds of tokens.
+pub const server_long_replies = true;
+
+/// What a server test serves (`src/server_test.zig`), linked into `dir`: the tiny's weights with the cut fixture's
+/// tokenizer and chat template, which the tiny lacks.
+pub fn serverDir(dir: std.Io.Dir) !void {
+    const tiny = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const cut = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
+    const words = [_][]const u8{ "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json", "vocab.json", "merges.txt" };
+    try @import("../test_support.zig").linkInto(dir, tiny, &words);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for (words) |name| {
+        var target: [1024]u8 = undefined;
+        try dir.symLink(io, try std.fmt.bufPrint(&target, "{s}/{s}", .{ cut, name }), name, .{});
+    }
+}
+
 /// The tiny pack ships no tokenizer: ids under the 128 its calibration drew from.
 pub fn prompt(a: std.mem.Allocator, dir: []const u8) ![]u32 {
     _ = dir;

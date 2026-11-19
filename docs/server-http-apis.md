@@ -71,7 +71,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   two turns). A replayed `reasoning` input item (`content[].reasoning_text`, else `summary[].summary_text`) is that
   turn's `reasoning_content`, and the
   store keeps it in the same field, so an input replay and a `previous_response_id` chain render the same prompt;
-  an encrypted, empty or malformed item is dropped, never a 400. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
+  an encrypted, empty or malformed item is dropped, never a 400. A stored response is read only while held
+  (`ResponseStore.acquire`/`release`): a delete or an eviction mid-request frees it at the last release; a WS
+  `store:false` chain stays on its connection, never in the shared store (lint `response-store-field`). Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
   `/v1/messages`.
 - **Anthropic `/v1/messages`** (Claude Code): typed blocks, `input_schema`→`parameters`, stop-reason map incl.
   `stop_sequence` echo, full SSE block lifecycle (a block opens only once the open one is stopped, so each owns its

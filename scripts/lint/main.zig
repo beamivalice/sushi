@@ -37,6 +37,7 @@ const rules = .{
     @import("closure_compile_seam.zig"),
     @import("random_draw_seam.zig"),
     @import("cooler_side_query.zig"),
+    @import("response_store_field.zig"),
     @import("engine_lifecycle.zig"),
     @import("disk_read_stream.zig"),
     @import("host_maker_unchecked.zig"),

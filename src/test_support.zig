@@ -444,13 +444,19 @@ pub fn qsaArraysAllEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) 
 
 /// Every entry of `fixture` linked into `tmp`: a scratch pack a test can add a file to.
 pub fn linkPack(tmp: *testing.TmpDir, fixture: []const u8) !void {
+    return linkInto(tmp.dir, fixture, &.{});
+}
+
+/// Every entry of `fixture` but those named in `skip` linked into `dir`.
+pub fn linkInto(dir: std.Io.Dir, fixture: []const u8, skip: []const []const u8) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     var src = try std.Io.Dir.openDirAbsolute(io, fixture, .{ .iterate = true });
     defer src.close(io);
     var it = src.iterate();
-    while (try it.next(io)) |entry| {
+    next: while (try it.next(io)) |entry| {
+        for (skip) |name| if (std.mem.eql(u8, name, entry.name)) continue :next;
         var target: [1024]u8 = undefined;
-        try tmp.dir.symLink(io, try std.fmt.bufPrint(&target, "{s}/{s}", .{ fixture, entry.name }), entry.name, .{});
+        try dir.symLink(io, try std.fmt.bufPrint(&target, "{s}/{s}", .{ fixture, entry.name }), entry.name, .{});
     }
 }
 

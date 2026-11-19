@@ -1244,6 +1244,8 @@ pub const Scheduler = struct {
     submit_cond: std.Io.Condition,
 
     inference_thread: ?std.Thread,
+    /// `ServerConfig.test_on_cooler`, for the cold loads (read in test builds only).
+    test_on_cooler: ?bool = null,
     shutdown: std.atomic.Value(bool),
     started: std.atomic.Value(bool),
     started_mu: std.Io.Mutex,
@@ -1742,6 +1744,7 @@ pub const Scheduler = struct {
         var owned_active: bool = true;
         defer if (owned_active) model_load.freeCpuState(self.allocator, &owned);
         model_load.applyModelSettings(owned.config, settings);
+        if (comptime @import("builtin").is_test) if (self.test_on_cooler) |on| @import("cooler_side.zig").forTest(owned.config, on);
         var launch_buf: [384]u8 = undefined;
         if (model_load.launchRefusal(&launch_buf, owned.config, self.kv_quant, self.ctx_size_flag)) |r| {
             log.err("{s}\n", .{r.line});

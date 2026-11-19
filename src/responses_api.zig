@@ -102,17 +102,17 @@ const sendResponse = http.sendResponse;
 const shouldParseToolCalls = reply_mod.shouldParseToolCalls;
 
 /// In-memory store for OpenAI Responses API state (`store: true` requests).
-/// Bounded LRU; lost on restart.
+/// Bounded LRU; lost on restart. `serve` makes it before the first connection and drops it after the last.
 var global_response_store: ?responses_mod.ResponseStore = null;
-var global_response_store_gpa: ?std.mem.Allocator = null;
 const RESPONSE_STORE_CAP: usize = 256;
 const DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS: u32 = 2048;
 
-pub fn getOrInitResponseStore(io: std.Io, gpa: std.mem.Allocator) *responses_mod.ResponseStore {
-    if (global_response_store == null) {
-        global_response_store = responses_mod.ResponseStore.init(io, gpa, RESPONSE_STORE_CAP);
-        global_response_store_gpa = gpa;
-    }
+pub fn initGlobalResponseStore(io: std.Io, gpa: std.mem.Allocator) void {
+    std.debug.assert(global_response_store == null);
+    global_response_store = responses_mod.ResponseStore.init(io, gpa, RESPONSE_STORE_CAP);
+}
+
+pub fn responseStore() *responses_mod.ResponseStore {
     return &global_response_store.?;
 }
 
@@ -120,9 +120,17 @@ pub fn deinitGlobalResponseStore() void {
     if (global_response_store) |*store| {
         store.deinit();
         global_response_store = null;
-        global_response_store_gpa = null;
     }
 }
+
+/// What a caller of `handleResponses` resolved for it. The WebSocket loop keeps a `store:false` chain on its
+/// connection, never in the shared store.
+pub const ResponsesTurn = struct {
+    /// The history `previous_response_id` names, held by the caller until the call returns; null looks it up.
+    prev_history: ?[]const chat_mod.Message = null,
+    /// A finished response that would be stored goes here, the caller's to own, instead of into the store.
+    kept: ?*?*responses_mod.StoredResponse = null,
+};
 
 /// The `/v1/responses` terminal `error` event payload (`sendResponsesEvent` adds `sequence_number`).
 pub fn buildResponsesStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
@@ -213,8 +221,9 @@ pub fn sendResponsesEvent(
 // ─── /v1/responses (OpenAI Responses API) ────────────────────────────────
 
 pub fn handleResponsesGet(allocator: std.mem.Allocator, stream: *Conn, id: []const u8) !void {
-    const store = getOrInitResponseStore(stream.io, allocator);
-    if (store.get(id)) |sr| {
+    const store = responseStore();
+    if (store.acquire(id)) |sr| {
+        defer store.release(sr);
         try sendResponse(stream, "200 OK", "application/json", sr.body_json);
     } else {
         try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Response not found", 404);
@@ -222,8 +231,7 @@ pub fn handleResponsesGet(allocator: std.mem.Allocator, stream: *Conn, id: []con
 }
 
 pub fn handleResponsesDelete(allocator: std.mem.Allocator, stream: *Conn, id: []const u8) !void {
-    const store = getOrInitResponseStore(stream.io, allocator);
-    if (store.delete(id)) {
+    if (responseStore().delete(id)) {
         const esc_id = try jsonEscape(allocator, id);
         defer allocator.free(esc_id);
         const body = try std.fmt.allocPrint(allocator,
@@ -370,14 +378,14 @@ pub fn handleResponsesCompact(
         null;
 
     var prev_messages: ?[]const chat_mod.Message = null;
+    var prev_held: ?*responses_mod.StoredResponse = null;
+    defer if (prev_held) |sr| responseStore().release(sr);
     if (prev_id) |pid| {
-        const store = getOrInitResponseStore(stream.io, allocator);
-        if (store.get(pid)) |sr| {
-            prev_messages = sr.history;
-        } else {
+        prev_held = responseStore().acquire(pid) orelse {
             try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "previous_response_id not found", 404);
             return;
-        }
+        };
+        prev_messages = prev_held.?.history;
     }
 
     // ── parse → resolved message history ──
@@ -425,9 +433,10 @@ pub fn handleResponses(
     stream: *Conn,
     body: []const u8,
     lm: *LoadedModel,
+    turn: ResponsesTurn,
 ) !void {
     var seq_num: u64 = 0;
-    handleResponsesInner(allocator, stream, body, lm, &seq_num) catch |err| {
+    handleResponsesInner(allocator, stream, body, lm, turn, &seq_num) catch |err| {
         // The WS transport keeps its error: it has its own terminal frame and cleanup.
         if (stream.ws_mode != null) return err;
         log.err("  -> responses error: {s}\n", .{@errorName(err)});
@@ -440,6 +449,7 @@ fn handleResponsesInner(
     stream: *Conn,
     body: []const u8,
     lm: *LoadedModel,
+    turn: ResponsesTurn,
     /// Owned by `handleResponses` so its error arm can number the terminal `error` event.
     seq_num: *u64,
 ) !void {
@@ -677,14 +687,17 @@ fn handleResponsesInner(
         servedModelId(lm, config);
 
     // ── previous response — fetch stored history ──
+    // Held to the end: the parsed input borrows it, and the stored record copies it only once the reply is done.
     var prev_messages: ?[]const chat_mod.Message = null;
+    var prev_held: ?*responses_mod.StoredResponse = null;
+    defer if (prev_held) |sr| responseStore().release(sr);
     if (prev_id) |pid| {
-        const store = getOrInitResponseStore(stream.io, allocator);
-        if (store.get(pid)) |sr| {
-            prev_messages = sr.history;
-        } else {
-            try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "previous_response_id not found", 404);
-            return;
+        if (turn.prev_history) |h| prev_messages = h else {
+            prev_held = responseStore().acquire(pid) orelse {
+                try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "previous_response_id not found", 404);
+                return;
+            };
+            prev_messages = prev_held.?.history;
         }
     }
 
@@ -1461,7 +1474,8 @@ fn handleResponsesInner(
     // ── store response ──
     if (responsesStoresFinish(finish_reason, should_store)) {
         const stored_tool_calls: ?[]const chat_mod.ToolCall = if (emitted_tool_calls.items.len > 0) emitted_tool_calls.items else null;
-        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope_noted, pi.messages.items, message_text, reasoning_text, stored_tool_calls, result.finish_details) catch |err| {
+        const into: KeepIn = if (turn.kept) |k| .{ .caller = k } else .{ .store = responseStore() };
+        storeResponse(stream.io, allocator, into, resp_id, model_name, status_str, envelope_noted, pi.messages.items, message_text, reasoning_text, stored_tool_calls, result.finish_details) catch |err| {
             log.warn("[responses] store failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -2143,12 +2157,15 @@ fn emitResponsesMessageEvents(
     try emitResponsesMessageEnd(allocator, stream, seq, output_index, item_id, text);
 }
 
-/// Persist a finished response to the in-memory store. The stored history is
+const KeepIn = union(enum) { store: *responses_mod.ResponseStore, caller: *?*responses_mod.StoredResponse };
+
+/// Persist a finished response into `into`. The stored history is
 /// the input messages plus a non-loop-cut assistant turn, deep-copied into
 /// the entry's arena so it stays valid across requests.
 fn storeResponse(
     io: std.Io,
     gpa: std.mem.Allocator,
+    into: KeepIn,
     resp_id: []const u8,
     model_name: []const u8,
     status_str: []const u8,
@@ -2226,8 +2243,10 @@ fn storeResponse(
     };
     errdefer sr.deinit();
 
-    const store = getOrInitResponseStore(io, gpa);
-    try store.put(sr);
+    switch (into) {
+        .store => |store| try store.put(sr),
+        .caller => |k| k.* = sr,
+    }
 }
 
 test "responsesToolExists validates Responses function tool names" {
@@ -2266,12 +2285,13 @@ test "shouldInjectResponsesJsonInstruction skips required tool turns" {
 }
 
 test "Responses history omits loop cuts while retaining the response and input" {
-    deinitGlobalResponseStore();
-    defer deinitGlobalResponseStore();
+    var store = responses_mod.ResponseStore.init(testing.io, testing.allocator, 8);
+    defer store.deinit();
     const messages = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
     const calls = [_]chat_mod.ToolCall{.{ .id = "call_1", .name = "writeFile", .arguments = "{}" }};
-    try storeResponse(testing.io, testing.allocator, "loop", "model", "completed", "{\"status\":\"completed\"}", &messages, "loop fragment", "repeated thought", &calls, "repetition_loop");
-    const stored = global_response_store.?.map.get("loop").?;
+    try storeResponse(testing.io, testing.allocator, .{ .store = &store }, "loop", "model", "completed", "{\"status\":\"completed\"}", &messages, "loop fragment", "repeated thought", &calls, "repetition_loop");
+    const stored = store.acquire("loop").?;
+    defer store.release(stored);
     try testing.expectEqualStrings("completed", stored.status);
     try testing.expectEqualStrings("{\"status\":\"completed\"}", stored.body_json);
     try testing.expectEqual(@as(usize, 1), stored.history.len);
@@ -2279,21 +2299,23 @@ test "Responses history omits loop cuts while retaining the response and input" 
     try testing.expectEqualStrings("hi", stored.history[0].content);
 
     // A continuation keeps earlier input and its healthy assistant output.
-    try storeResponse(testing.io, testing.allocator, "next", "model", "completed", "{}", stored.history, "answer", null, null, null);
-    const next = global_response_store.?.map.get("next").?;
+    try storeResponse(testing.io, testing.allocator, .{ .store = &store }, "next", "model", "completed", "{}", stored.history, "answer", null, null, null);
+    const next = store.acquire("next").?;
+    defer store.release(next);
     try testing.expectEqual(@as(usize, 2), next.history.len);
     try testing.expectEqualStrings("hi", next.history[0].content);
     try testing.expectEqualStrings("answer", next.history[1].content);
 }
 
 test "Responses: a stored chain and an input replay render the same Qwen prompt" {
-    deinitGlobalResponseStore();
-    defer deinitGlobalResponseStore();
+    var store = responses_mod.ResponseStore.init(testing.io, testing.allocator, 8);
+    defer store.deinit();
     const a = testing.allocator;
     const calls = [_]chat_mod.ToolCall{.{ .id = "c1", .name = "lookup", .arguments = "{\"id\":1}" }};
     const first = [_]chat_mod.Message{.{ .role = "user", .content = "compare" }};
-    try storeResponse(testing.io, a, "r1", "model", "completed", "{}", &first, "", "inspect it", &calls, null);
-    const stored = global_response_store.?.map.get("r1").?;
+    try storeResponse(testing.io, a, .{ .store = &store }, "r1", "model", "completed", "{}", &first, "", "inspect it", &calls, null);
+    const stored = store.acquire("r1").?;
+    defer store.release(stored);
 
     const out = try std.json.parseFromSlice(std.json.Value, a,
         \\[{"type":"function_call_output","call_id":"c1","output":"done"}]
@@ -2321,14 +2343,15 @@ test "Responses: a stored chain and an input replay render the same Qwen prompt"
 }
 
 test "Responses history keeps reasoning as reasoning_content, as an input replay does" {
-    deinitGlobalResponseStore();
-    defer deinitGlobalResponseStore();
+    var store = responses_mod.ResponseStore.init(testing.io, testing.allocator, 8);
+    defer store.deinit();
     const messages = [_]chat_mod.Message{
         .{ .role = "user", .content = "hi" },
         .{ .role = "assistant", .content = "", .reasoning_content = "replayed thought" },
     };
-    try storeResponse(testing.io, testing.allocator, "r1", "model", "completed", "{}", &messages, "answer", "fresh thought", null, null);
-    const stored = global_response_store.?.map.get("r1").?;
+    try storeResponse(testing.io, testing.allocator, .{ .store = &store }, "r1", "model", "completed", "{}", &messages, "answer", "fresh thought", null, null);
+    const stored = store.acquire("r1").?;
+    defer store.release(stored);
     try testing.expectEqual(@as(usize, 3), stored.history.len);
     try testing.expectEqualStrings("replayed thought", stored.history[1].reasoning_content.?);
     try testing.expectEqualStrings("answer", stored.history[2].content);
@@ -2336,18 +2359,11 @@ test "Responses history keeps reasoning as reasoning_content, as an input replay
 }
 
 test "deinitGlobalResponseStore frees stored responses" {
-    deinitGlobalResponseStore();
+    initGlobalResponseStore(testing.io, testing.allocator);
     defer deinitGlobalResponseStore();
-
     const messages = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
-    try storeResponse(testing.io, testing.allocator, "resp_test", "sushi", "completed", "{}", &messages, "hello", null, null, null);
-
-    if (global_response_store) |*store| {
-        try testing.expectEqual(@as(usize, 1), store.map.count());
-    } else {
-        return error.TestUnexpectedResult;
-    }
-
+    try storeResponse(testing.io, testing.allocator, .{ .store = responseStore() }, "resp_test", "sushi", "completed", "{}", &messages, "hello", null, null, null);
+    responseStore().release(responseStore().acquire("resp_test").?);
     deinitGlobalResponseStore();
     try testing.expect(global_response_store == null);
 }
@@ -2393,8 +2409,8 @@ test "a Responses reply with a call carries the text before it as a message item
 }
 
 test "a Responses output replayed as input renders the prompt its stored chain does, a call's preamble included" {
-    deinitGlobalResponseStore();
-    defer deinitGlobalResponseStore();
+    var store = responses_mod.ResponseStore.init(testing.io, testing.allocator, 8);
+    defer store.deinit();
     const a = testing.allocator;
     const tools = try std.json.parseFromSlice(std.json.Value, a,
         \\[{"type":"function","name":"lookup","parameters":{"type":"object"}}]
@@ -2404,8 +2420,9 @@ test "a Responses output replayed as input renders the prompt its stored chain d
     const text = responsesMessageText(a, tools.value, &parsed, "I will look it up.").?;
     const calls = [_]chat_mod.ToolCall{.{ .id = "c1", .name = "lookup", .arguments = "{\"id\":1}" }};
     const first = [_]chat_mod.Message{.{ .role = "user", .content = "compare" }};
-    try storeResponse(testing.io, a, "r1", "model", "completed", "{}", &first, text, "inspect it", &calls, null);
-    const stored = global_response_store.?.map.get("r1").?;
+    try storeResponse(testing.io, a, .{ .store = &store }, "r1", "model", "completed", "{}", &first, text, "inspect it", &calls, null);
+    const stored = store.acquire("r1").?;
+    defer store.release(stored);
     const out = try std.json.parseFromSlice(std.json.Value, a,
         \\[{"type":"function_call_output","call_id":"c1","output":"done"}]
     , .{});
@@ -2432,8 +2449,8 @@ test "a Responses output replayed as input renders the prompt its stored chain d
 }
 
 test "a text.format chain through previous_response_id carries one JSON instruction, and each turn's prompt extends the last" {
-    deinitGlobalResponseStore();
-    defer deinitGlobalResponseStore();
+    var store = responses_mod.ResponseStore.init(testing.io, testing.allocator, 8);
+    defer store.deinit();
     const a = testing.allocator;
     var allocs = std.ArrayList([]const u8).empty;
     defer {
@@ -2443,7 +2460,6 @@ test "a text.format chain through previous_response_id carries one JSON instruct
     const instruction = try buildResponsesJsonInstruction(a, null, false);
     try allocs.append(a, instruction);
     for ([_]?[]const u8{ "Be terse.", null }) |instructions| {
-        deinitGlobalResponseStore();
         const in1 = try std.json.parseFromSlice(std.json.Value, a, "[{\"role\":\"user\",\"content\":\"give me json\"}]", .{});
         defer in1.deinit();
         var t1 = try responses_mod.parseInput(a, in1.value, instructions, null, null, .{});
@@ -2452,10 +2468,12 @@ test "a text.format chain through previous_response_id carries one JSON instruct
         defer a.free(m1);
         const p1 = try renderQwenForResponsesTest(a, m1);
         defer a.free(p1);
-        try storeResponse(testing.io, a, "r1", "model", "completed", "{}", t1.messages.items, "{\"a\":1}", null, null, null);
+        try storeResponse(testing.io, a, .{ .store = &store }, "r1", "model", "completed", "{}", t1.messages.items, "{\"a\":1}", null, null, null);
         const in2 = try std.json.parseFromSlice(std.json.Value, a, "[{\"role\":\"user\",\"content\":\"again\"}]", .{});
         defer in2.deinit();
-        var t2 = try responses_mod.parseInput(a, in2.value, null, global_response_store.?.map.get("r1").?.history, null, .{});
+        const r1 = store.acquire("r1").?;
+        defer store.release(r1);
+        var t2 = try responses_mod.parseInput(a, in2.value, null, r1.history, null, .{});
         defer t2.deinit();
         const m2 = try withJsonInstruction(a, t2.messages.items, instruction, &allocs);
         defer a.free(m2);
