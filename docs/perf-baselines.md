@@ -504,6 +504,10 @@ large share alone.
 - The draft's Markov bias over the stage logits' top 512 instead of the vocabulary (it reads the 66 MB bias table
   once a position): the first pick agreed with the full chain in 661 of 831 drafts, all five in 264. The bias lifts a
   token from outside the top 512 too often to keep the drafts.
+- A cheaper PAIR1 decode cannot pay much: with the pair decode replaced by a bare reinterpret of the codeword (wrong
+  values, timing only), `dsv41.experts` rows 1 read 87.1 against 94.9 us (L2) and 91.2 against 93.0 (L23), best of 7
+  rounds; the chain already reads its banks at 0.6 to 0.9 of the memory roofline. A one-row token is bound by its reads,
+  not by the codebook's arithmetic.
 
 <a id="m5u-chunk-handoff"></a>
 **The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
