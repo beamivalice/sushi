@@ -1737,16 +1737,15 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
         const avail_mb = bill.available / (1024 * 1024);
         log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
         // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
-        // is evictable here by construction (the withheld case took the deferral arm). The cache
-        // clause is only true where the bill carries the cache; `memoryRefusalMessage` is the one formatter.
-        const base = try bills.memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.admissionEvictsHotCache());
-        defer allocator.free(base);
+        // is evictable here by construction (the withheld case took the deferral arm). Where a refusal can name the
+        // max_tokens and context that fit, it is the inference thread's text; else the cache clause is only true
+        // where the bill carries the cache.
         const kv = kv_override orelse configuredKvQuantFor(config);
         const refusal = bills.requestContextRefusal(config, prompt_len, max_tokens, kv, bill, .{ .mtp_on = enable_mtp });
         const msg = if (refusal) |r|
-            try std.fmt.allocPrint(allocator, "{s} Maximum context at KV{d} and prefill chunk {d}: {d} tokens.", .{ base, r.kv_bits, r.chunk, r.maximum })
+            try bills.memoryContextRefusalMessage(allocator, r)
         else
-            try allocator.dupe(u8, base);
+            try bills.memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.admissionEvictsHotCache());
         defer allocator.free(msg);
         countRejected();
         if (is_anthropic) {
@@ -4080,4 +4079,39 @@ test "promptOpensThink: only the think token opens a think block, never its spel
     try std.testing.expect(!promptOpensThink(a, &tok, &spelled));
     try std.testing.expect(promptOpensThink(a, &tok, &.{ 'x', 256, '\n' }));
     try std.testing.expect(!promptOpensThink(a, &tok, &.{ 256, 'x' }));
+}
+
+test "a request whose max_tokens alone does not fit is refused on the connection thread in the inference thread's words, with the max_tokens that fits" {
+    const t = std.testing;
+    const a = t.allocator;
+    const saved_ctx = server_state.server_config.max_context_size;
+    defer server_state.server_config.max_context_size = saved_ctx;
+    const saved_mtp = server_state.configured_mtp;
+    defer server_state.configured_mtp = saved_mtp;
+    server_state.server_config.max_context_size = 1_048_576;
+    server_state.configured_mtp = null;
+    var cfg = fixtures.qwen4RequestTestConfig();
+    cfg.expert_layout = .exl3_k4;
+    cfg.cooler_for_test = true;
+    // KV wide enough that no box holds a 1M-token reply beside the weights.
+    cfg.num_key_value_heads = 64;
+    var prompt: [64]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast(i + 10);
+    // 64 prompt tokens and a reply no machine holds: the prompt alone fits, max_tokens is the whole cause.
+    const asked: u32 = 1_000_000;
+    var sv: [2]std.posix.fd_t = undefined;
+    try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: http_conn.Conn = undefined;
+    http_conn.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+    const admitted = try checkAttentionMemory(a, &conn, &prompt, asked, &cfg, "", false, null, false, false);
+    _ = std.c.close(sv[0]);
+    var buf: [8192]u8 = undefined;
+    const raw = readAllFromPair(sv[1], &buf);
+    const body = raw[(std.mem.indexOf(u8, raw, "\r\n\r\n") orelse 0)..];
+    errdefer std.debug.print("the connection thread's refusal (admitted {}): {s}\n", .{ admitted, body });
+    try t.expect(!admitted);
+    // `memoryContextRefusalMessage`'s text, as the inference thread's refusal reads.
+    try t.expect(std.mem.indexOf(u8, body, " does not fit available GPU memory at KV") != null);
+    try t.expect(std.mem.indexOf(u8, body, " fits (asked 1000000); maximum context: ") != null);
 }

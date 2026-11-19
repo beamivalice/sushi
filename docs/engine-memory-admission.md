@@ -151,8 +151,9 @@ bill function's output on the committed fixture configs of all served packs: a b
   successful load clear it.
 - Request-time memory refusals for these packs also report a maximum context using the request's actual KV width,
   effective chunk, MTP choice and warm-prefix credits. The connection-thread 400 and a later scheduler refusal
-  carry the same numeric diagnostic; generation error mapping consumes the slot's diagnostic on its connection
-  thread so it cannot leak into another request.
+  are one text (`memoryContextRefusalMessage`: the bill, what is available, the max_tokens and the context that fit);
+  generation error mapping consumes the slot's diagnostic on its connection thread so it cannot leak into another
+  request.
 - **A streamed load bills what it holds** (`streamedLoadRequirementBytes`): resident trunk, MTP and vision + the expert
   cache + the whole-layer fill union + the bounce buffers + the MLX pool's decode cap (DeepSeek, `ModelConfig.expertPoolBytes`, 1 GiB) + the net; `expertCacheFitForLoad` separately proves the
   planned KV against the wired limit. GLM allocates KV row by row per request, so its load bill carries no context

@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A request whose `max_tokens` does not fit in memory is told the `max_tokens` that does**: refused before its prefill,
+  it read "Prompt (64 tokens) requires ... Reduce prompt size", which named neither `max_tokens` nor what fits; it now
+  reads as a refusal from the scheduler does, with the bill, what is available and the largest `max_tokens` and
+  context that fit.
 - **The maximum context a Sushi Cooler memory refusal names is admitted when applied**: it was priced as a prompt alone,
   while the request it names bills the reply's cache rows at the pool's size class, so the request was refused again.
   The bill now counts the prompt's cache rows at that size too, as the pool holds them: a Qwen request on Sushi Cooler
