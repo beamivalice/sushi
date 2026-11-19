@@ -893,7 +893,7 @@ pub fn ssdBudgetBelowRefusal(buf: []u8, io: std.Io, allocator: std.mem.Allocator
         .flag => .flag,
         .ram_default => .ram_default,
         .model_settings, .none => .setting,
-    });
+    }, smallerPackOf(model_dir) == .exists);
 }
 
 const PlanFloor = struct {
@@ -1917,6 +1917,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     defer job.end();
     const own_load = job.own;
     if (params.config.unsupported_note) |note| log.warn("{s}\n", .{note});
+    // Every refusal of this model, a request's included, offers a smaller pack from this one fact.
+    params.config.smaller_pack = smallerPackOf(params.model_dir) == .exists;
     var streaming_resident_bytes: ?u64 = null;
     // A failed load runs no unload hook (`failLoadRequest`): the caps its plan lowered go back here.
     var pool_capped = false;
@@ -2109,7 +2111,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (serving) |b| {
                 const maximum: u32 = if (avail < loadRequirementBytes(params.config, weights_bytes, mtp_on, 0)) 0 else b.max_context;
                 sch.registry.mutex.lockUncancelable(sch.io);
-                const context = model_registry_mod.MemoryContextRefusal{ .requested = b.requested_context, .maximum = maximum, .needed = needed, .available = avail, .kv_bits = b.kv_bits, .chunk = b.chunk };
+                const context = model_registry_mod.MemoryContextRefusal{ .requested = b.requested_context, .maximum = maximum, .needed = needed, .available = avail, .kv_bits = b.kv_bits, .chunk = b.chunk, .smaller_pack = params.config.smaller_pack };
                 params.entry.memory_context_refusal = context;
                 if (@TypeOf(params) == *LoadRequest) params.memory_context_refusal = context;
                 sch.registry.mutex.unlock(sch.io);

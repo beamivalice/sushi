@@ -38,6 +38,8 @@ earlier history is mlx-serve's, in that project's changelog.
   named 26, which free RAM then refused); a named budget now passes every check the load runs.
 - **A load refusal points only to options it lists**: one that said this Mac cannot give the GPU enough memory told
   the user to "use one of the options below" when it listed none.
+- **A refusal suggests a smaller pack only when one exists**: a request refused for memory always said to use a
+  smaller pack (or a smaller model), and an SSD streaming memory refusal a smaller pack, even on a model's smallest.
 - **No command fails silently**: every error that ends a `sushi` command prints a line saying what to do; `sushi kld` on
   a DeepSeek-V4.1 pack without `--ssd-budget-gb` used to exit with no message and now asks for it.
 

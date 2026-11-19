@@ -135,6 +135,8 @@ pub const MemoryContextRefusal = struct {
     /// The max_tokens the request asked, and the largest that its bill fits (0: the prompt alone does not fit).
     asked_max_tokens: u32 = 0,
     fitting_max_tokens: u32 = 0,
+    /// A published pack of this model is smaller (`ModelConfig.smaller_pack`); false names none.
+    smaller_pack: bool = false,
 };
 
 /// One model's SSD prefix tier as the inference thread last saw it: the budget, bytes in use, entry

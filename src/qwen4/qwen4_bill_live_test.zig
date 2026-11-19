@@ -547,6 +547,21 @@ test "Flash-Next streamed: the ssd budget a refused budget names is admitted und
     try t.expect(planner.needAt((fits + 1) << 30).? > 0);
 }
 
+test "Flash-Next streamed: an ssd budget refusal for a pack with no smaller published pack names none (QWEN4_STQ_TINY)" {
+    const t = std.testing;
+    const a = t.allocator;
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    var config = try model_mod.parseConfig(t.io, a, dir);
+    defer config.deinit(a);
+    model_load.applyModelSettings(&config, .{});
+    var buf: [512]u8 = undefined;
+    // A RAM default the GPU limit left no room for, the one text that suggested a pack.
+    const text = model_load.ssdBudgetBelowRefusal(&buf, t.io, a, &config, dir, .{ .bytes = 0, .origin = .ram_default, .setting_ignored = false }, false, 0);
+    errdefer std.debug.print("{s}\n", .{text});
+    try t.expect(std.mem.indexOf(u8, text, "is unset") != null);
+    try t.expect(std.mem.indexOf(u8, text, "smaller pack") == null);
+}
+
 test "Flash-Next streamed: the ssd budget a fit refusal names passes the preflight on the readings that refused it (QWEN4_TEST_MODEL)" {
     const t = std.testing;
     const a = t.allocator;

@@ -1200,6 +1200,7 @@ pub fn requestContextRefusal(config: *const model_mod.ModelConfig, prompt_len: u
         .chunk = bill.chunk,
         .asked_max_tokens = max_tokens,
         .fitting_max_tokens = @min(reply, max_tokens),
+        .smaller_pack = config.smaller_pack,
     };
 }
 
@@ -1236,7 +1237,8 @@ pub fn writeMemoryContextRefusal(w: *std.Io.Writer, refusal: model_registry_mod.
         // A zero maximum is no advice: nothing this request can shed fits.
         if (refusal.maximum > 0) try w.print(" Maximum context: {d} tokens.\nTo serve it:\n- Shorten the prompt so that it and its reply fit in {d} tokens.\n", .{ refusal.maximum, refusal.maximum }) else try w.print("\nTo serve it:\n", .{});
     }
-    try w.print("- Quit other apps or unload another model on the Models page, then retry.\n- Use a smaller pack of this model.", .{});
+    try w.print("- Quit other apps or unload another model on the Models page, then retry.", .{});
+    if (refusal.smaller_pack) try w.print("\n- Use a smaller pack of this model.", .{});
 }
 
 pub fn loadServingBill(config: *const model_mod.ModelConfig, budget: u64) ?model_load.LoadServingBill {
@@ -2486,7 +2488,7 @@ pub fn memoryRefusalMessage(
     if (fitting_max_tokens > 0)
         try w.print(".\nmax_tokens {d} fits: lower max_tokens to {d} or less, shorten the prompt, or free memory (quit other apps or unload another model).", .{ fitting_max_tokens, fitting_max_tokens })
     else
-        try w.print(".\nThe prompt alone does not fit: shorten it, free memory (quit other apps or unload another model), or use a smaller model.", .{});
+        try w.print(".\nThe prompt alone does not fit: shorten it, free memory (quit other apps or unload another model){s}.", .{if (bill.smaller_pack) ", or use a smaller pack of this model" else ""});
     return out.toOwnedSlice();
 }
 
@@ -2515,6 +2517,8 @@ pub const AdmissionBill = struct {
     reclaimable: u64 = 0,
     /// The prefill width this bill was taken at, so a refusal can name it.
     chunk: u64 = 0,
+    /// A published pack of the model is smaller (`ModelConfig.smaller_pack`), which a refusal may offer.
+    smaller_pack: bool = false,
 
     pub fn fits(self: AdmissionBill) bool {
         return self.needed <= self.available;
@@ -3039,9 +3043,9 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
 /// the single `needed > available` refusal stands. The publishers stay on every arch.
 pub fn creditedAdmissionBill(config: *const model_mod.ModelConfig, needed: u64, available: u64, evictable: u64, reclaimable: u64, chunk: u64) AdmissionBill {
     if (!config.admissionEvictsHotCache()) {
-        return .{ .needed = needed, .available = available, .chunk = chunk };
+        return .{ .needed = needed, .available = available, .chunk = chunk, .smaller_pack = config.smaller_pack };
     }
-    return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk };
+    return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk, .smaller_pack = config.smaller_pack };
 }
 
 /// Bytes of the resident hot cache this prompt pins: residency less what an eviction can prove
@@ -6475,15 +6479,16 @@ test "bill pin: the refusal sentences" {
     try std.testing.expectEqualStrings("Not enough GPU memory for this request: with a 5000-token prompt and max_tokens 4096 it needs 13.4 GB, and 13.0 GB is available.\nmax_tokens 1200 fits: lower max_tokens to 1200 or less, shorten the prompt, or free memory (quit other apps or unload another model).", plain);
     var tight = bill;
     tight.reclaimable = 200 << 20;
+    tight.smaller_pack = true;
     const cached = try memoryRefusalMessage(a, 5000, 4096, 0, tight, true);
     defer a.free(cached);
-    try std.testing.expectEqualStrings("Not enough GPU memory for this request: with a 5000-token prompt and max_tokens 4096 it needs 13.4 GB, and 13.2 GB is available, counting the 0.1 GB the prefix cache can give back.\nThe prompt alone does not fit: shorten it, free memory (quit other apps or unload another model), or use a smaller model.", cached);
-    const fits = try memoryContextRefusalMessage(a, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024, .asked_max_tokens = 96_000, .fitting_max_tokens = 2000 });
+    try std.testing.expectEqualStrings("Not enough GPU memory for this request: with a 5000-token prompt and max_tokens 4096 it needs 13.4 GB, and 13.2 GB is available, counting the 0.1 GB the prefix cache can give back.\nThe prompt alone does not fit: shorten it, free memory (quit other apps or unload another model), or use a smaller pack of this model.", cached);
+    const fits = try memoryContextRefusalMessage(a, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024, .asked_max_tokens = 96_000, .fitting_max_tokens = 2000, .smaller_pack = true });
     defer a.free(fits);
     try std.testing.expectEqualStrings("Context 160000 does not fit in GPU memory: the request needs 8.8 GB and 6.8 GB is available. max_tokens 2000 fits (asked 96000); maximum context: 64000 tokens.\nTo serve it:\n- Lower max_tokens to 2000 or less.\n- Shorten the prompt.\n- Quit other apps or unload another model on the Models page, then retry.\n- Use a smaller pack of this model.", fits);
     const alone = try memoryContextRefusalMessage(a, .{ .requested = 160_000, .maximum = 64_000, .needed = 9000 << 20, .available = 7000 << 20, .kv_bits = 4, .chunk = 1024 });
     defer a.free(alone);
-    try std.testing.expectEqualStrings("Context 160000 does not fit in GPU memory: the request needs 8.8 GB and 6.8 GB is available, and the prompt alone does not fit. Maximum context: 64000 tokens.\nTo serve it:\n- Shorten the prompt so that it and its reply fit in 64000 tokens.\n- Quit other apps or unload another model on the Models page, then retry.\n- Use a smaller pack of this model.", alone);
+    try std.testing.expectEqualStrings("Context 160000 does not fit in GPU memory: the request needs 8.8 GB and 6.8 GB is available, and the prompt alone does not fit. Maximum context: 64000 tokens.\nTo serve it:\n- Shorten the prompt so that it and its reply fit in 64000 tokens.\n- Quit other apps or unload another model on the Models page, then retry.", alone);
 }
 
 test "a memory refusal names a max_tokens and a maximum context its own request admits, on every served pack's bill" {
@@ -7133,25 +7138,26 @@ pub fn smallestBudgetGb(asked_gb: u64, planner: anytype) ?BudgetFloor {
 pub const BudgetSource = enum { flag, setting, ram_default };
 
 /// The refusal of an ssd budget below what a streamed pack holds beside two cache slots per layer.
-pub fn ssdBudgetBelowText(buf: []u8, asked_gb: u64, floor: ?BudgetFloor, source: BudgetSource) []const u8 {
+/// `smaller`: a published pack of the model is smaller (`packs.smallerPack`).
+pub fn ssdBudgetBelowText(buf: []u8, asked_gb: u64, floor: ?BudgetFloor, source: BudgetSource, smaller: bool) []const u8 {
     var w = std.Io.Writer.fixed(buf);
-    writeSsdBudgetBelow(&w, asked_gb, floor, source) catch return "This model's SSD streaming memory is too small to load it.";
+    writeSsdBudgetBelow(&w, asked_gb, floor, source, smaller) catch return "This model's SSD streaming memory is too small to load it.";
     return w.buffered();
 }
 
-fn writeSsdBudgetBelow(w: *std.Io.Writer, asked_gb: u64, floor: ?BudgetFloor, source: BudgetSource) std.Io.Writer.Error!void {
+fn writeSsdBudgetBelow(w: *std.Io.Writer, asked_gb: u64, floor: ?BudgetFloor, source: BudgetSource, smaller: bool) std.Io.Writer.Error!void {
     try w.print("This model's SSD streaming memory is too small to load it.\n", .{});
     switch (source) {
         .flag => try w.print("--ssd-budget-gb (which outranks Memory for SSD streaming (GiB) in Settings) is {d}", .{asked_gb}),
         .setting => try w.print("Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is {d}", .{asked_gb}),
         .ram_default => try w.print("Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is unset; the GPU memory limit leaves room for a default of {d}", .{asked_gb}),
     }
-    const f = floor orelse return w.print(", and no setting up to 512 holds this pack beside its expert cache: use a smaller pack.", .{});
+    const f = floor orelse return w.print(", and no setting up to 512 holds this pack beside its expert cache{s}.", .{if (smaller) ": use a smaller pack" else ""});
     try w.print(", and this pack holds {f} beside its expert cache, which needs room for two experts per layer. ", .{Mem.need(f.held, MemUnit.of(f.held))});
     switch (source) {
         .flag => try w.print("Restart sushi with --ssd-budget-gb {d} or more.", .{f.gb}),
         .setting => try w.print("Set it to {d} or more.", .{f.gb}),
-        .ram_default => try w.print("Free GPU memory (quit other apps or unload another model) and set it to {d} or more, or use a smaller pack.", .{f.gb}),
+        .ram_default => try w.print("Free GPU memory (quit other apps or unload another model) and set it to {d} or more{s}.", .{ f.gb, if (smaller) ", or use a smaller pack" else "" }),
     }
 }
 
@@ -7774,12 +7780,12 @@ test "an ssd budget below what a streamed pack holds is refused naming the small
         }
     };
     var buf: [1024]u8 = undefined;
-    const text = ssdBudgetBelowText(&buf, 12, smallestBudgetGb(12, Planner{}), .setting);
+    const text = ssdBudgetBelowText(&buf, 12, smallestBudgetGb(12, Planner{}), .setting, false);
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) is 12, and this pack holds 19.5 GB beside its expert cache") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Set it to 21 or more.") != null);
     // A RAM default the GPU memory limit left no room for names the setting unset, never a value the user chose.
-    const unset = ssdBudgetBelowText(&buf, 0, smallestBudgetGb(0, Planner{}), .ram_default);
+    const unset = ssdBudgetBelowText(&buf, 0, smallestBudgetGb(0, Planner{}), .ram_default, true);
     try testing.expect(std.mem.indexOf(u8, unset, "(--ssd-budget-gb) is unset; the GPU memory limit leaves room for a default of 0, and this pack holds 19.5 GB") != null);
     try testing.expect(std.mem.indexOf(u8, unset, "set it to 21 or more, or use a smaller pack.") != null);
     try testing.expectEqual(@as(?BudgetFloor, null), smallestBudgetGb(12, struct {
@@ -7876,6 +7882,39 @@ test "the ssd budget is admitted against the ceiling the preflight and admission
     errdefer std.debug.print("{s}\n", .{text});
     try testing.expect(std.mem.indexOf(u8, text, "sudo sysctl") == null);
     try testing.expect(std.mem.indexOf(u8, text, "This Mac cannot give the GPU enough memory for it") != null);
+}
+
+test "a request refusal offers a smaller pack only when the load found one, and one built without that fact offers none" {
+    const a = testing.allocator;
+    const mib: u64 = 1 << 20;
+    // Built without the fact: the default names none.
+    const context = try memoryContextRefusalMessage(a, .{ .requested = 14, .maximum = 0, .needed = 276 * mib, .available = 274 * mib, .kv_bits = 8, .chunk = 512 });
+    defer a.free(context);
+    const plain = try memoryRefusalMessage(a, 98, 100, 0, .{ .needed = 636 * mib, .available = 635 * mib, .chunk = 512 }, false);
+    defer a.free(plain);
+    for ([_][]const u8{ context, plain }) |text| {
+        errdefer std.debug.print("{s}\n", .{text});
+        try testing.expect(std.mem.indexOf(u8, text, "smaller") == null);
+    }
+    // The load's stamp reaches both texts through the bill and the context refusal built from its config.
+    var fx = try fixtures.PinFx.init();
+    defer fx.deinit();
+    var c = fx.all()[0].*;
+    c.expert_layout = .exl3_k4;
+    for ([_]bool{ false, true }) |smaller| {
+        c.smaller_pack = smaller;
+        const bill = creditedAdmissionBill(&c, 636 * mib, 635 * mib, 0, 0, 1024);
+        try testing.expectEqual(smaller, bill.smaller_pack);
+        const r = requestContextRefusal(&c, 64, 90_000, trunk.KVQuantConfig.affine(8), bill, .{}) orelse return error.TestExpectedRefusalFigures;
+        const named = try memoryContextRefusalMessage(a, r);
+        defer a.free(named);
+        const fixed = try memoryRefusalMessage(a, 98, 100, 0, bill, false);
+        defer a.free(fixed);
+        for ([_][]const u8{ named, fixed }) |text| {
+            errdefer std.debug.print("{s}\n", .{text});
+            try testing.expectEqual(smaller, std.mem.indexOf(u8, text, "smaller pack of this model") != null);
+        }
+    }
 }
 
 test "a load refusal that points to the options below lists one" {
