@@ -73,7 +73,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   store keeps it in the same field, so an input replay and a `previous_response_id` chain render the same prompt;
   an encrypted, empty or malformed item is dropped, never a 400. A stored response is read only while held
   (`ResponseStore.acquire`/`release`): a delete or an eviction mid-request frees it at the last release; a WS
-  `store:false` chain stays on its connection, never in the shared store (lint `response-store-field`). On the
+  `store:false` chain stays on its connection, never in the shared store (lint `response-store-field`), and its
+  response says `"store":false`, as asked (the turn reaches `handleResponses` forced to store, `turn.kept` set). On the
   WebSocket every refusal is the turn's terminal `{"type":"error","status":N,...}` frame, sent by the one error sender
   (`http.sendErrorResponse`), never an HTTP body. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
   `/v1/messages`.

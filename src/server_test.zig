@@ -608,3 +608,28 @@ test "server: a completions stream that fails mid-reply ends in a completions ch
         }
     }.run);
 }
+
+test "server: a WebSocket turn's response says the store the client asked for" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const fd = try wsConnect();
+            defer _ = std.c.close(fd);
+            for ([_][2][]const u8{ .{ ",\"store\":false", "\"store\":false" }, .{ "", "\"store\":true" } }) |c| {
+                var b: [256]u8 = undefined;
+                try wsSend(fd, try std.fmt.bufPrint(&b, "{{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0{s}}}", .{c[0]}));
+                while (true) {
+                    const frame = try wsReadFrame(fd);
+                    defer gpa.free(frame);
+                    if (std.mem.startsWith(u8, frame, "{\"type\":\"error\"")) return error.TurnFailed;
+                    const created = std.mem.indexOf(u8, frame, "\"type\":\"response.created\"") != null;
+                    const completed = std.mem.indexOf(u8, frame, "\"type\":\"response.completed\"") != null;
+                    if ((created or completed) and std.mem.indexOf(u8, frame, c[1]) == null) {
+                        std.debug.print("asked{s}: {s}\n", .{ c[0], frame[0..@min(frame.len, 600)] });
+                        return error.StoreNotAsAsked;
+                    }
+                    if (completed) break;
+                }
+            }
+        }
+    }.run);
+}

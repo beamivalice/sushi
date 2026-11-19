@@ -500,6 +500,8 @@ fn handleResponsesInner(
 
     // ── store (default true) ──
     const should_store = if (root.get("store")) |v| (if (v == .bool) v.bool else true) else true;
+    // A WebSocket `store:false` turn comes forced to store and is kept on its connection (`turn.kept`).
+    const store_echo = should_store and turn.kept == null;
 
     // ── streaming ──
     const is_stream = if (root.get("stream")) |v| (v == .bool and v.bool) else false;
@@ -949,7 +951,7 @@ fn handleResponsesInner(
             0,
             0,
             0,
-            should_store,
+            store_echo,
             prev_id,
             false,
             false,
@@ -1457,7 +1459,7 @@ fn handleResponsesInner(
         result.completion_tokens,
         result.cached_tokens,
         reasoning_tok_count,
-        should_store,
+        store_echo,
         prev_id,
         is_incomplete,
         is_completed_status,

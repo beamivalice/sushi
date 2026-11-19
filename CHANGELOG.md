@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A Responses WebSocket turn sent with `store: false` now says `"store":false` in its response**: it was kept on its
+  connection as asked, but its `response.created` and `response.completed` events said `"store":true`.
 - **A model load refused by the GPU memory limit answers at once**: the memory check waited about 2 s for memory to come
   back before every refusal, even when the bound was the GPU limit, which waiting cannot raise; it now waits only while
   free RAM is the bound.
