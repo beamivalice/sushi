@@ -89,14 +89,14 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
         // free up to its cap is not a bill's. The bill lends no decoder pool: the warm's chunk fits the headroom
         // (`warmChunkAdmitted` lends none either), so it releases none and takes its whole cap from the pool.
         const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
-        const billed = bills.prefillNeededAtChunkUnlent(c, longest, 96, bits, chunk, .{});
+        const billed = bills.warmRequestBill(c, bits, chunk, spec.drafter != null);
         const bill = if (@import("builtin").is_test) bill_for_test orelse billed else billed;
         mlx.engine.close();
         const in_use0 = mlx.engine.poolTotal() - mlx.engine.poolFree();
         const held0 = mlx.engine.poolTotal();
         const refusals0 = mlx.engine.poolRefusals();
         mlx.engine.resetPoolPeak(.process);
-        const ran = request(io, a, xfm, ids[0..longest], spec, .{ .temperature = 0 }, 96, @import("server_state.zig").ssm_checkpoint_stride);
+        const ran = request(io, a, xfm, ids[0..longest], spec, .{ .temperature = 0 }, bills.WARM_REPLY_TOKENS, @import("server_state.zig").ssm_checkpoint_stride);
         mlx.engine.close();
         const asked = mlx.engine.poolPeak(.process) -| in_use0;
         const held = mlx.engine.poolHeldPeak(.process) -| held0;

@@ -1943,6 +1943,9 @@ pub const PrefillRequestTerms = struct {
     cooler_row_bytes: u64 = 0,
     /// Beside them, the recurrent states a chunk replaces (`ModelConfig.ssmCheckpointBytes`).
     cooler_turnover_bytes: u64 = 0,
+    /// A speculative round's transient (`roundTransientBytes`): the request's transient is the larger of its prefill
+    /// chunk's and its round's.
+    round_bytes: u64 = 0,
 };
 
 pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms) u64 {
@@ -1966,7 +1969,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // figure is conservative on plain attention archs and would be a 33%
     // UNDER-bill on a GatedDeltaNet hybrid.
     // An exact Cooler forward's rows, and each linear layer's state replaced beside the old until its pass has run.
-    const envelope: u64 = if (req.cooler_row_bytes > 0) fwd * req.cooler_row_bytes + req.cooler_turnover_bytes else @max(3 * mlp, mlp + fwd * stream_per_tok);
+    const envelope: u64 = if (req.cooler_row_bytes > 0) @max(fwd * req.cooler_row_bytes + req.cooler_turnover_bytes, req.round_bytes) else @max(3 * mlp, mlp + fwd * stream_per_tok);
     const runtime_floor: u64 = if (req.cooler_row_bytes > 0) 0 else PREFILL_RUNTIME_FLOOR_BYTES;
     // The dequant+GEMM prefill route (verify_moe.prefillDqGemm) materializes
     // a bf16 copy of the weight it is about to multiply plus its transpose,
@@ -2100,18 +2103,20 @@ pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
     return one + config.qsaScoreBankBytesPerToken();
 }
 
-/// Tokens of capacity a request's cache holds by its last token, as `KVCache` allocates them at its 256-row step: a long
+/// Tokens of capacity a request's cache holds by its last row, as `KVCache` allocates them at its 256-row step: a long
 /// prompt's reservation (prompt, reply and a chunk); a shorter one of several chunks reserves its own length
 /// (`prefill_plan.reservedPrefillTokens`), else the prefill's chunks grow it; then each decode grow takes the +25%
-/// policy up to the prompt and its reply. What the bill and the commit count.
-pub fn cacheCapacityTokens(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {
+/// policy up to the prompt, its reply and the `past_end` rows a speculative round writes past the reply's last
+/// (`speculativeRowsPastEnd`). What the bill and the commit count.
+pub fn cacheCapacityTokens(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, chunk: u64, ctx: u64, past_end: u64) u64 {
     const KV = trunk.KVCache;
-    const end = seq +| (if (ctx > seq) @min(max_tokens, ctx - seq) else 0);
+    const end = seq +| (if (ctx > seq) @min(max_tokens, ctx - seq) else 0) +| past_end;
     const reserves = config.reservesKvCapacity();
     const long = if (reserves) reservedCacheTokens(seq, max_tokens, chunk, ctx) else 0;
-    if (long > 0) return roundToCacheStep(long);
     var cap: u64 = 0;
-    if (reserves and seq > chunk) {
+    if (long > 0) {
+        cap = roundToCacheStep(long);
+    } else if (reserves and seq > chunk) {
         cap = roundToCacheStep(seq);
     } else {
         var at: u64 = 0;
@@ -2134,11 +2139,46 @@ fn pooledCacheBytes(config: *const model_mod.ModelConfig, bytes: u64) u64 {
     return if (@import("cooler_side.zig").onEngine(config)) bytes +| bytes / 16 else bytes;
 }
 
-/// What a request commits at admission where its arch's bill opts in (`commitsCache`): its whole cache and per-token
-/// state at `cacheCapacityTokens`, drained as the cache becomes resident.
-pub fn cacheCommitBytes(config: *const model_mod.ModelConfig, prompt_len: u64, max_tokens: u64, kv_bits: u64, chunk: u64) u64 {
-    const cap = cacheCapacityTokens(config, prompt_len, max_tokens, chunk, getEffectiveContextLength(config));
-    return pooledCacheBytes(config, cap *| (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)));
+/// Rows a speculative round writes past the reply's last row: the drafts of its widest verify, the MTP head's depth or
+/// a block drafter's block less its anchor. The trunk's cache, its history and the head's grow to them.
+pub fn speculativeRowsPastEnd(config: *const model_mod.ModelConfig, warm: WarmPrefix) u64 {
+    if (headBilled(config, warm)) return mtp_mod.MAX_DEPTH;
+    if (config.dflash_loaded and !arch_config.fact(config, "own_dflash_bill")) return @import("sampler_draw.zig").max_rows - 1;
+    return 0;
+}
+
+/// Whether a request's bill holds the MTP head's cache: it runs MTP, or MTP is forced and no DFlash2 drafter outranks it.
+fn headBilled(config: *const model_mod.ModelConfig, warm: WarmPrefix) bool {
+    return warm.mtp_on or (forceMtpFor(config) and !config.dflash_loaded);
+}
+
+/// The per-token storage of a request's cache at the rows it holds by its last (`cacheCapacityTokens`), each buffer at
+/// the pool's size class: what the bill prices and what admission commits (`cacheCommitBytes`) are these terms.
+pub const CacheStorage = struct {
+    rows: u64,
+    kv: u64,
+    /// The out-of-cache history (`statePerTokenBilled`) and, where the head is billed, the head's.
+    state: u64,
+    head_kv: u64,
+};
+
+pub fn cacheStorage(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) CacheStorage {
+    const rows = @max(cacheCapacityTokens(config, seq, max_tokens, chunk, getEffectiveContextLength(config), speculativeRowsPastEnd(config, warm)), seq);
+    const head = headBilled(config, warm);
+    const head_state: u64 = if (head) mtpHeadStateBytesPerToken(config) else 0;
+    return .{
+        .rows = rows,
+        .kv = pooledCacheBytes(config, rows *| kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits)),
+        .state = pooledCacheBytes(config, rows *| (statePerTokenBilled(config) +| head_state)),
+        .head_kv = if (head) pooledCacheBytes(config, rows *| mtpHeadKvBytesPerToken(config)) else 0,
+    };
+}
+
+/// What a request commits at admission where its arch's bill opts in (`commitsCache`): its cache's storage as its bill
+/// prices it (`cacheStorage`), the MTP head's where the request runs it, drained as the cache becomes resident.
+pub fn cacheCommitBytes(config: *const model_mod.ModelConfig, prompt_len: u64, max_tokens: u64, kv_bits: u64, chunk: u64, mtp_on: bool) u64 {
+    const st = cacheStorage(config, prompt_len, max_tokens, kv_bits, chunk, .{ .mtp_on = mtp_on });
+    return st.kv +| st.state +| st.head_kv;
 }
 
 /// Tokens of cache capacity a request reserves at admission (prompt + generation + one chunk
@@ -2162,7 +2202,7 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     // snapshot, the only capture a warm append shorter than one stride makes.
     const span: u64 = seq -| @min(matched, seq);
     var n: u64 = seq / stride -| @min(matched, seq) / stride;
-    if (span > prefill_plan.SSM_SNAPSHOT_BACKOFF) n += 1;
+    if (prefill_plan.endSnapshotTaken(@intCast(span), matched > 0, prefill_plan.SSM_SNAPSHOT_BACKOFF)) n += 1;
     if (launch_state.ssm_checkpoint_max > 0) n = @min(n, launch_state.ssm_checkpoint_max);
     if (ssmResidentCap(config)) |cap| n = @min(n, cap);
     return n * per_cp;
@@ -2222,34 +2262,50 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // joins through the narrower `reservesKvCapacity`; every term it does not have stays zero on
     // its own (no QSA history, no SSM checkpoints); its MTP heads bill `mimo_mtp.State.billedBytes`.
     if (!config.reservesKvCapacity()) return .{};
-    // The whole cache the request holds by its last token, reserved up front or grown to (`cacheCapacityTokens`).
-    const reserved = @max(cacheCapacityTokens(config, seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
+    // The whole cache the request holds by its last row, reserved up front or grown to (`cacheCapacityTokens`).
+    const storage = cacheStorage(config, seq, max_tokens, kv_bits, chunk, warm);
+    const reserved = storage.rows;
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
-    const mtp_on = warm.mtp_on or (forceMtpFor(config) and !config.dflash_loaded);
-    const head_per_tok: u64 = if (mtp_on) mtpHeadKvBytesPerToken(config) else 0;
+    const mtp_on = headBilled(config, warm);
     const head_qsa_ring: u64 = if (mtp_on) mtpHeadQsaRingBytes(config) else 0;
-    const head_state_per_tok: u64 = if (mtp_on) mtpHeadStateBytesPerToken(config) else 0;
     // Rows the restore hands over without allocating another copy. KV only: the history is
     // privatised on restore (`seedCapBuf`), so crediting it cancelled the one-copy bill outright.
     const credited = warm.creditedRows(reserved);
     return .{
         // The pool holds each layer's whole cache at its size class, the prompt's rows with the reply's: this prices
         // it whole, less the prompt's raw rows `prefillMemoryNeeded` bills.
-        .reserved_kv_bytes = pooledCacheBytes(config, reserved * kv_per_tok) -| seq * kv_per_tok,
-        .state_bytes = pooledCacheBytes(config, reserved * (statePerTokenBilled(config) +| head_state_per_tok)) +|
-            (if (mtp_on) mtpHeadRingBytes(config) else 0),
+        .reserved_kv_bytes = storage.kv -| seq * kv_per_tok,
+        .state_bytes = storage.state +| (if (mtp_on) mtpHeadRingBytes(config) else 0),
         // The warm span, not the prompt; read regardless of `will_donate` (a shared restore skips the same rows).
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk) +| thoughtPointBytes(config, warm),
         .shared_resident_bytes = credited *| kv_per_tok,
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, reserved, kv_per_tok),
         .qsa_ring_bytes = slotRingBytes(config, kv_bits) +| head_qsa_ring,
-        .mtp_head_kv_bytes = reserved *| head_per_tok,
+        .mtp_head_kv_bytes = storage.head_kv,
         .dflash_bytes = dflashRequestBytes(config, @min(chunk, @max(seq, 1))),
         .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(chunk, seq)),
         .uplift_16ths = billUplift16ths(config, seq),
         .cooler_row_bytes = coolerPrefillRowBytes(config),
         .cooler_turnover_bytes = config.ssmCheckpointBytes(),
+        .round_bytes = if (speculativeRowsPastEnd(config, warm) > 0) roundTransientBytes(config, seq +| max_tokens +| speculativeRowsPastEnd(config, warm)) else 0,
     };
+}
+
+/// Rows a speculative round's verify forward is billed at: a verify block's.
+const ROUND_ROWS: u64 = @import("sampler_draw.zig").max_rows;
+
+/// A speculative round's transient beside the request's storage, where the bill's rows are exact (0 elsewhere): its
+/// verify block's rows and state turnover, the recurrent states its capture keeps from the verify to the rollback
+/// (`roundCaptureBytes`), and the verify's QSA mask over every key up to `kv_end`.
+pub fn roundTransientBytes(config: *const model_mod.ModelConfig, kv_end: u64) u64 {
+    const rows = coolerPrefillRowBytes(config);
+    if (rows == 0) return 0;
+    return ROUND_ROWS *| rows +| config.ssmCheckpointBytes() +| roundCaptureBytes(config) +| qsaMaskBilled(config, ROUND_ROWS, kv_end);
+}
+
+/// The recurrent states a speculative round's capture keeps past the new state, by the arch's rule.
+pub fn roundCaptureBytes(config: *const model_mod.ModelConfig) u64 {
+    return (archHook("roundCaptureStates", u64, config, .{}) orelse 0) *| config.ssmCheckpointBytes();
 }
 
 /// The body of the pre-flight memory 400. Two arms: with the credits present the message
@@ -2866,14 +2922,14 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) slot_admission.MemoryBill {
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
-    return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits) };
+    return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits, enable_mtp) };
 }
 
 /// Bytes the bill prices for a request's cache that it allocates AFTER admission. A native GLM
 /// MLA cache grows row by row (a DFlash2 request reserves it after prefill); a Qwen or MiMo
 /// request takes its reserved capacity at its first grow, so it is resident before the next admission.
-pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64) u64 {
-    return archHook("commitBytes", u64, config, .{ prompt_len, max_tokens, kv_bits }) orelse 0;
+pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, mtp_on: bool) u64 {
+    return archHook("commitBytes", u64, config, .{ prompt_len, max_tokens, kv_bits, mtp_on }) orelse 0;
 }
 
 /// The inference thread's refusal, quoting the numbers it compared.
@@ -5091,7 +5147,7 @@ test "a prompt of several chunks under the long-prompt threshold reserves its ow
     for ([_]u64{ 1025, 5000, 32767 }) |seq| {
         try t.expectEqual(seq, prefill_plan.reservedPrefillTokens(&cfg, seq, 2048, chunk));
         // The reply grows the cache past the prompt by the +25% policy, each grow billed.
-        const cap = cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg));
+        const cap = cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg), 0);
         try t.expect(cap >= seq + 2048);
         try t.expectEqual((cap - seq) * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8), prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{}).reserved_kv_bytes);
     }
@@ -5445,12 +5501,12 @@ test "a Qwen request commits its whole cache at admission, as admission counts w
     // A long prompt reserves the prompt, the reply and a chunk; a short one grows to its reply by the cache's steps.
     for ([_]u64{ 40_000, 1_000 }) |seq| {
         const per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + statePerTokenBilled(&cfg);
-        const cap = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx);
+        const cap = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx, 0);
         try std.testing.expect(cap >= seq + 4096);
-        try std.testing.expectEqual(cap * per_tok, admissionCommitBytes(&cfg, seq, 4096, 8));
+        try std.testing.expectEqual(cap * per_tok, admissionCommitBytes(&cfg, seq, 4096, 8, false));
     }
     const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
-    try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&mimo, 40_000, 4096, 8));
+    try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&mimo, 40_000, 4096, 8, false));
 }
 
 test "GLM release defaults advertise the full context at the widest prefill chunk that keeps it" {
@@ -6188,7 +6244,7 @@ test "bill pin: creditedAdmissionBill and its verdict" {
                 g.add(admissionVerdict(bill));
                 g.add(pinnedResidentBytes(bill));
             }
-            g.add(admissionCommitBytes(c, 5000, 4096, 8));
+            g.add(admissionCommitBytes(c, 5000, 4096, 8, false));
         }
     }.run);
 }
@@ -6390,7 +6446,7 @@ test "a warm restore whose buffers hold the prompt but not the reservation bills
     const chunk: u64 = 2048;
     for ([_]*const model_mod.ModelConfig{ &q4, &mimo }) |cfg| {
         const kv = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
-        const reserved = cacheCapacityTokens(cfg, seq, 32_000, chunk, getEffectiveContextLength(cfg));
+        const reserved = cacheCapacityTokens(cfg, seq, 32_000, chunk, getEffectiveContextLength(cfg), 0);
         try t.expect(seq <= capacity and capacity < reserved);
         const window = capacity * kv / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(cfg, trunk.Trunk.MOE_EVAL_EVERY_N_LAYERS);
         try t.expect(window > 0 and window < capacity * kv);
@@ -6721,7 +6777,22 @@ pub fn loadWarmupBytes(config: *const model_mod.ModelConfig, mtp_on: bool) u64 {
 /// (`warmFloorChunkBytes`), and the live check's reserve, which its headroom leaves out. The resident and the streamed
 /// requirement read it, and through them the cold-load gate (`residentColdLoadBillBytes`) and a refusal.
 pub fn warmNeedBytes(config: *const model_mod.ModelConfig) u64 {
-    return warmFloorChunkBytes(config) +| LIVE_RESERVE_BYTES;
+    const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+    const request = if (coolerPrefillRowBytes(config) > 0) warmRequestBill(config, defaultKvBits(config), floor, mtpHeadDefaultOn(config)) else 0;
+    return @max(warmFloorChunkBytes(config), request) +| LIVE_RESERVE_BYTES;
+}
+
+/// The reply of the served warm's longest request (`cooler_warm.warmServed`).
+pub const WARM_REPLY_TOKENS: u32 = 96;
+
+/// The bill the served warm's longest request is held to at `chunk`-row chunks, its drafter's round with it when
+/// `mtp_on`: the whole request, its storage and its dearest phase, lending no decoder pool.
+pub fn warmRequestBill(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64, mtp_on: bool) u64 {
+    const longest = warmLongestPrompt(config, chunk);
+    // A load's preflight runs before its auto context is pinned: the warm's request is billed as the context it fills.
+    var probe = config.*;
+    if (manualContext(config) == 0 and config.pinned_context == 0) probe.pinned_context = @intCast(longest + WARM_REPLY_TOKENS);
+    return prefillNeededAtChunkUnlent(&probe, longest, WARM_REPLY_TOKENS, kv_bits, chunk, .{ .mtp_on = mtp_on });
 }
 
 /// A streamed load holds the cache, the whole-layer fill union and the bounce buffers beside the resident trunk; then its

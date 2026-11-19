@@ -295,6 +295,14 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   `billMargin`): no net, and DeepSeek's request bill drops its quarter there too. The live 364k Turn A on an STQ pack
   bills 15,741 MB. Measured whole requests (33k-token prompt, 1,024 new tokens, on Cooler): tiny held 2,368 MB of a
   3,072 MB bill; the 2.75 cut 6,882 of 7,161; the stq4 cut 6,541 of 7,289. MLX and GLM keep the net below.
+- **A Cooler request's transient is the larger of its prefill chunk's and its speculative round's**
+  (`roundTransientBytes`, `PrefillRequestTerms.round_bytes`): a verify block's rows and turnover, the recurrent states the
+  round's capture keeps from the verify to the rollback (`qwen4_bill.roundCaptureStates`: the fold's two at a two-row
+  verify, the replay's one wider, two more a row where rows join), and the verify's QSA mask over the whole reply. Its
+  cache is billed to the rows the round's drafts write past the reply (`speculativeRowsPastEnd`), the trunk's and the
+  head's, and the growth commit is the same storage terms (`cacheStorage`), the head's with them; the end-of-prompt
+  snapshot is counted by the rule the prefill takes it by (`prefill_plan.endSnapshotTaken`). Priced by the prefill
+  alone, a 9-token speculative request held 3.3 recurrent-state sets past its bill, joined rows 5 a row.
 - **A Flash-Next STQ chunk's transient on Cooler is its layers' own rows** (`qwen4_bill.PrefillRows`), in place of the
   MLP envelope, the stream slope, the 512 MB floor and the net: the max over the layer kinds a chunk peaks in, plus the
   trunk's rows held across all, per row, f16 unless named. From the buffers alive at each peak

@@ -710,7 +710,7 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     // the prompt's own rows, not a second copy of the cache.
     const terms = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
-    const cap = bills.cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg));
+    const cap = bills.cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg), 0);
     try t.expect(cap >= seq + 2048 + chunk);
     try t.expectEqual((cap - seq) * kv_per_tok, terms.reserved_kv_bytes);
     try t.expect(terms.reserved_kv_bytes * 4 < seq * kv_per_tok); // headroom, not a copy
@@ -733,7 +733,7 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
 
     // A short prompt reserves nothing past itself, and is billed the cache its reply grows it to.
     const short = prefillRequestTerms(&cfg, 4096, 2048, 8, chunk, .{});
-    const short_cap = bills.cacheCapacityTokens(&cfg, 4096, 2048, chunk, getEffectiveContextLength(&cfg));
+    const short_cap = bills.cacheCapacityTokens(&cfg, 4096, 2048, chunk, getEffectiveContextLength(&cfg), 0);
     try t.expect(short_cap >= 4096 + 2048);
     try t.expectEqual((short_cap - 4096) * kv_per_tok, short.reserved_kv_bytes);
     try t.expectEqual(short_cap * statePerTokenBilled(&cfg), short.state_bytes);
@@ -753,7 +753,7 @@ test "the QSA history is billed at the one copy a slot HOLDS, plus the score ban
 
     const seq: u64 = 458_832;
     const terms = prefillRequestTerms(&cfg, seq, 2048, 8, 4096, .{});
-    try t.expectEqual(bills.cacheCapacityTokens(&cfg, seq, 2048, 4096, getEffectiveContextLength(&cfg)) * (one + bank), terms.state_bytes);
+    try t.expectEqual(bills.cacheCapacityTokens(&cfg, seq, 2048, 4096, getEffectiveContextLength(&cfg), 0) * (one + bank), terms.state_bytes);
 
     var dense = model_mod.ModelConfig{};
     dense.num_hidden_layers = 32;
@@ -1498,7 +1498,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     const chunk: u64 = 512;
     const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
-    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg), 0);
 
     // Pessimal reading of the entry: capacity exactly the rows it matched, so the append DOES
     // grow every attention layer.
@@ -1561,7 +1561,7 @@ test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the 
 
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
     // Billed at the capacity the cache allocates for it, the reservation at the cache's 256-row step.
-    const cap = bills.cacheCapacityTokens(&cfg, seq, clamped, chunk, ctx);
+    const cap = bills.cacheCapacityTokens(&cfg, seq, clamped, chunk, ctx, 0);
     try t.expectEqual(@as(u64, 420_096), cap);
     const terms = prefillRequestTerms(&cfg, seq, clamped, 8, chunk, .{});
     try t.expectEqual((cap - seq) * kv_per_tok, terms.reserved_kv_bytes);
@@ -1832,7 +1832,7 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const off = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{});
     try t.expectEqual(@as(u64, 0), off.mtp_head_kv_bytes);
     const on = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{ .mtp_on = true });
-    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg), 0);
     try t.expectEqual(reserved * 2048, on.mtp_head_kv_bytes);
     const n: u64 = cfg.attnCacheLayerCount();
     try t.expectEqual(cfg.qsaRingBytes() + cfg.qsaRingBytes() / n, on.qsa_ring_bytes);
@@ -1867,7 +1867,7 @@ test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_q
     try t.expectEqual(@as(u64, 576), request_head);
     try t.expectEqual(@as(u64, 1088), mtpHeadKvBytesPerToken(&cfg));
     const on = prefillRequestTerms(&cfg, seq, max_tokens, request_bits, chunk, .{ .mtp_on = true });
-    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    const reserved = bills.cacheCapacityTokens(&cfg, seq, max_tokens, chunk, getEffectiveContextLength(&cfg), 0);
     try t.expectEqual(reserved * 1088, on.mtp_head_kv_bytes);
 }
 
@@ -1996,8 +1996,8 @@ test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a re
     try t.expect(@import("../cooler_side.zig").onEngine(&cfg));
     const ctx = getEffectiveContextLength(&cfg);
     const seq: u64 = 364_509;
-    const short = bills.cacheCapacityTokens(&cfg, seq, 8192, 2048, ctx);
-    const long = bills.cacheCapacityTokens(&cfg, seq, 421_923, 2048, ctx);
+    const short = bills.cacheCapacityTokens(&cfg, seq, 8192, 2048, ctx, 0);
+    const long = bills.cacheCapacityTokens(&cfg, seq, 421_923, 2048, ctx, 0);
     // Each reserved token costs its KV and state, held at the pool's size class (at most a sixteenth over).
     const pooled = struct {
         fn of(b: u64) u64 {
@@ -2257,8 +2257,35 @@ test "Flash-Next on Cooler: a request's bill holds every KV and state row of its
         const terms = bills.prefillRequestTerms(&cfg, seq, reply, 8, 2048, .{});
         // The prompt's raw rows `prefillMemoryNeeded` bills, and the request's terms on top of them.
         const billed = seq * kv_per_tok + terms.reserved_kv_bytes + terms.state_bytes;
-        const held = bills.cacheCommitBytes(&cfg, seq, reply, 8, 2048);
+        const held = bills.cacheCommitBytes(&cfg, seq, reply, 8, 2048, false);
         errdefer std.debug.print("seq {d} reply {d}: the bill holds {d} KB of cache, the pool {d} KB\n", .{ seq, reply, billed >> 10, held >> 10 });
         try t.expect(billed >= held);
     };
+}
+
+test "Flash-Next on Cooler: a drafted request's growth commit holds the MTP head's KV and history its bill prices" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const cfg = coolerFlashNext();
+    const chunk: u64 = @import("../settings_resolve.zig").prefill_chunk.value;
+    for ([_]u64{ 100, 4_000, 40_000 }) |seq| for ([_]u32{ 4_096, 32_768 }) |n| {
+        const terms = prefillRequestTerms(&cfg, seq, n, 8, chunk, .{ .mtp_on = true });
+        // Every row the bill prices that grows after admission: the trunk's KV past the prompt's raw rows, the
+        // histories and the head's KV; the head's fixed rings are not per row.
+        const grows = seq * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + terms.reserved_kv_bytes + terms.state_bytes - bills.mtpHeadQsaRingBytes(&cfg) + terms.mtp_head_kv_bytes;
+        const commit = bills.admissionCommitBytes(&cfg, @intCast(seq), n, 8, true);
+        errdefer std.debug.print("seq {d} + {d}: the commit holds {d} KB, the bill's growing storage {d} KB\n", .{ seq, n, commit >> 10, grows >> 10 });
+        try t.expect(commit + 4096 >= grows);
+        try t.expect(commit > bills.admissionCommitBytes(&cfg, @intCast(seq), n, 8, false));
+    };
+}
+
+test "Flash-Next on Cooler: a load's preflight leaves its served warm the whole bill of its longest request, its drafter's round with it" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const cfg = coolerFlashNext();
+    const floor: u64 = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
+    const bill = bills.warmRequestBill(&cfg, bills.defaultKvBits(&cfg), floor, bills.mtpHeadDefaultOn(&cfg));
+    try t.expect(bills.warmNeedBytes(&cfg) >= bill + bills.LIVE_RESERVE_BYTES);
+    try t.expect(bill > bills.warmFloorChunkBytes(&cfg));
 }

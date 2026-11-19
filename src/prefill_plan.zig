@@ -269,6 +269,13 @@ pub fn snapshotBackoffOf(want_ssm_cp: bool, prefix_len: usize, restored: bool, b
     return back;
 }
 
+/// Whether a prefill over `span` prompt tokens takes its end-of-prompt snapshot: its chunk loop stops
+/// `snapshotBackoffOf` short of the last token and captures there, unless it ran no chunk. The bill counts it by this.
+pub fn endSnapshotTaken(span: usize, restored: bool, back: usize) bool {
+    if (span < 2) return false;
+    return span - 1 > snapshotBackoffOf(true, span - 1, restored, back);
+}
+
 /// Effective SSM-checkpoint stride for a model, given the base (configured)
 /// stride: checkpointing never sub-divides the prefill chunk, on ANY arch.
 ///

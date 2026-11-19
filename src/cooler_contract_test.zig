@@ -4304,3 +4304,124 @@ test "cooler contract: a second Cooler load beside a sealed one whose warm fails
         }
     }.run);
 }
+
+test "cooler contract: a speculative request whose reply ends at a cache step grows its KV and its draft head's KV no further than the rows its bill prices" {
+    const Q = ContractOf("qwen4");
+    if (comptime !@hasDecl(Q, "specOptions")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    if (!fixtureChosen(selection(), "QWEN4_STQ_TINY")) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const a = testing.allocator;
+    const ids = try Q.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(Q, dir, true);
+    defer _ = ld.close();
+    const bills = @import("bills.zig");
+    const depth_bounds = @import("mtp_depth_bounds.zig");
+    const saved = depth_bounds.active;
+    defer depth_bounds.active = saved;
+    depth_bounds.active = .{ .min = 6, .max = 6 };
+    const prompt = ids[0..@min(ids.len, 9)];
+    const ctx: u64 = bills.getEffectiveContextLength(&ld.config);
+    var over: usize = 0;
+    // A reply that ends at, or a draft block short of, a 256-row step and a +25% step.
+    for ([_]u32{ 256, 512, 1280 }) |end| for ([_]u32{ 0, 1, 3, 6 }) |less| {
+        const n: u32 = end - @as(u32, @intCast(prompt.len)) - less;
+        const billed = bills.cacheCapacityTokens(&ld.config, prompt.len, n, ld.config.prefillStartWidth(), ctx, bills.speculativeRowsPastEnd(&ld.config, .{ .mtp_on = true }));
+        const turn = arch_handle.turnFor(ld.h, &ld.config);
+        defer turn.end();
+        defer arch_sched.endRequest(&ld.config);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, prompt, n, .{ .temperature = 0.0 }, &.{}, Q.specOptions(ld.xfm, 6));
+        defer gen.deinit(a);
+        var head: usize = 0;
+        while (try gen.nextMtp(a)) |r| {
+            a.free(r.tokens);
+            if (gen.mtp_cache) |*mc| mc.activate();
+            head = @max(head, Q.headCacheTokens(ld.xfm));
+        }
+        const trunk_rows = ld.xfm.cache.residentCapacityTokens();
+        if (head > billed or trunk_rows > billed) {
+            over += 1;
+            std.debug.print("cooler contract: prompt {d} + max_tokens {d}: KV capacity {d} rows, the head's {d}, past the {d} its bill prices\n", .{ prompt.len, n, trunk_rows, head, billed });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), over);
+}
+
+/// The engine pool's bytes in use at its peak over `body`, past those in use before it.
+fn inUsePeak(ctx: anytype, comptime body: fn (@TypeOf(ctx)) anyerror!void) !u64 {
+    mlx.engine.close();
+    mlx.engine.trim();
+    const in0 = mlx.engine.poolTotal() - mlx.engine.poolFree();
+    mlx.engine.resetPoolPeak(.process);
+    try body(ctx);
+    mlx.engine.close();
+    return mlx.engine.poolPeak(.process) -| in0;
+}
+
+test "cooler contract: a served request, plain or speculative, solo or joined, short or past a chunk, holds no more in use than the exact part of its bill" {
+    try eachQwenServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const bills = @import("bills.zig");
+            const depth_bounds = @import("mtp_depth_bounds.zig");
+            const saved = depth_bounds.active;
+            defer depth_bounds.active = saved;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            const c = &ld.config;
+            const kv = bills.configuredKvQuantFor(c);
+            const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+            const chunk: u64 = c.prefillStartWidth();
+            // The unnamed small tensors of a request: well under one recurrent state set.
+            const small: u64 = 4 << 20;
+            const long = try a.alloc(u32, chunk + 1);
+            defer a.free(long);
+            for (long, 0..) |*t, i| t.* = ids[(i * 7) % ids.len];
+            var other: [9]u32 = undefined;
+            for (&other, 0..) |*t, i| t.* = ids[(i * 3 + 1) % ids.len];
+            const n: u32 = 64;
+            var over: usize = 0;
+            const Ask = struct { sv: *Served, prompts: []const []const u32, n: u32, mtp: bool };
+            // Depth 1 verifies two rows (the fold), depth 6 seven (the replay).
+            for ([_]?u32{ null, 1, 6 }) |depth| for ([_][]const u32{ ids[0..@min(ids.len, 9)], long }) |p| for ([_]usize{ 1, 2 }) |rows| {
+                if (rows == 2 and p.len > 9) continue;
+                const mtp = depth != null;
+                if (depth) |d| depth_bounds.active = .{ .min = d, .max = d };
+                defer depth_bounds.active = saved;
+                const prompts = [2][]const u32{ p, &other };
+                var exact: u64 = 0;
+                for (prompts[0..rows]) |q| exact += bills.requestHeldBytes(c, q.len, n, kv_bits, chunk, .{ .mtp_on = mtp });
+                const asked = try inUsePeak(Ask{ .sv = &sv, .prompts = prompts[0..rows], .n = n, .mtp = mtp }, struct {
+                    fn go(q: Ask) !void {
+                        if (q.prompts.len == 1) {
+                            var f: u32 = 0;
+                            var got = try q.sv.requestWith(q.prompts[0], q.n, .{ .temperature = 0.0 }, q.mtp, &f);
+                            got.deinit(testing.allocator);
+                        } else {
+                            var o: [2]std.ArrayList(u32) = undefined;
+                            try servedRows(q.sv, q.prompts[0..2].*, q.n, q.mtp, &o);
+                            for (&o) |*x| x.deinit(testing.allocator);
+                        }
+                    }
+                }.go);
+                if (asked > exact + small) {
+                    over += 1;
+                    std.debug.print("cooler contract: {s}: {d} row(s) of a {d}-token prompt + {d}, depth {?d}: {d} KB in use at the peak, {d} KB past the exact bill ({d} KB)\n", .{ dir, rows, p.len, n, depth, asked >> 10, (asked - exact) >> 10, exact >> 10 });
+                }
+            };
+            try testing.expectEqual(@as(usize, 0), over);
+        }
+    }.run);
+}

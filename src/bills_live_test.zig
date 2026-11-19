@@ -243,7 +243,7 @@ test "a second GLM admission leaves free the cache growth the first was admitted
     for ([_]u64{ 16, 8 }) |kv_bits| {
         const bill = bills.prefillAdmissionBill(&cfg, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, null, .{});
         const nums = bills.prefillBillNumbersNow(&cfg, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, false);
-        const commit = bills.admissionCommitBytes(&cfg, prompt, max_tokens, kv_bits);
+        const commit = bills.admissionCommitBytes(&cfg, prompt, max_tokens, kv_bits, false);
         try std.testing.expectEqual(commit, nums.commit);
         // What the request retains is most of its bill, and it is not resident at admission.
         try std.testing.expect(commit > bill.needed / 2 and commit <= bill.needed);
@@ -254,9 +254,9 @@ test "a second GLM admission leaves free the cache growth the first was admitted
         try std.testing.expectEqual(@as(usize, 0), slot_admission.admitsWithinMemory(&.{b}, true, commit));
     }
     // kv8 audit shape: one request's eventual state is 6.669 GiB.
-    const kv8 = bills.admissionCommitBytes(&cfg, prompt, max_tokens, 8);
+    const kv8 = bills.admissionCommitBytes(&cfg, prompt, max_tokens, 8, false);
     try std.testing.expect(kv8 > 6 * gib + gib * 2 / 3 and kv8 < 6 * gib + gib * 7 / 10);
-    try std.testing.expect(bills.admissionCommitBytes(&cfg, prompt, max_tokens, 16) > kv8);
+    try std.testing.expect(bills.admissionCommitBytes(&cfg, prompt, max_tokens, 16, false) > kv8);
 }
 
 test "GLM raw FP8 honors the declared wired limit with the same reserve as MiMo" {

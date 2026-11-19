@@ -17,6 +17,14 @@ earlier history is mlx-serve's, in that project's changelog.
   it read "Prompt (64 tokens) requires ... Reduce prompt size", which named neither `max_tokens` nor what fits; it now
   reads as a refusal from the scheduler does, with the bill, what is available and the largest `max_tokens` and
   context that fit.
+- **A speculative Qwen request on Sushi Cooler is billed for the memory its draft rounds hold**: a round keeps up to two
+  recurrent-state copies from its verify to its rollback (four a row when requests decode joined), its drafts grow the
+  cache and the MTP head's cache a step past the reply, and a short prompt keeps its end-of-prompt snapshot; none of it
+  was billed, so a short speculative request could hold ~350 MB past its bill (90 MB past the margin). Such a request
+  now needs up to ~560 MB more free on the release pack; the advertised context does not move (1,048,576 at 128 GB,
+  where the long prompt's prefill still sets the bill). Admission also counts the MTP head's cache as a running
+  request's growth, so a later request no longer starts in memory that head will take, and a load's memory check
+  leaves its served warm the whole bill of the warm's longest request, not only its widest forward.
 - **The maximum context a Sushi Cooler memory refusal names is admitted when applied**: it was priced as a prompt alone,
   while the request it names bills the reply's cache rows at the pool's size class, so the request was refused again.
   The bill now counts the prompt's cache rows at that size too, as the pool holds them: a Qwen request on Sushi Cooler

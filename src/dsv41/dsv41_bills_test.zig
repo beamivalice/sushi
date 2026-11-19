@@ -387,15 +387,15 @@ test "DeepSeek: a request's decode state is billed as growth after admission onl
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     // A streamed load serves one row: the model's parked state is resident before the request is admitted.
-    try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16));
+    try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16, false));
     // A fully resident load joins rows: the request makes its own state at its first forward, all of it after admission.
     config.expert_resident = true;
     // Rows are Sushi Cooler's: a resident load on MLX keeps the one-row decode and its parked state.
-    try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16));
+    try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16, false));
     config.cooler_for_test = true;
     const c = &config.dsv41.?;
     const state = (4096 + 512) * c.stateBytesPerToken() + c.stateFixedBytes(config.dsparkOn());
-    try std.testing.expectEqual(state, bills.admissionCommitBytes(&config, 4096, 512, 16));
+    try std.testing.expectEqual(state, bills.admissionCommitBytes(&config, 4096, 512, 16, false));
 }
 
 /// What the served warm reads as its headroom right after a streamed load took what it holds out of `avail` free bytes:

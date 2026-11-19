@@ -99,7 +99,8 @@ pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.Forward
         install(at.cap(config));
         return at;
     }
-    liftWide(config, rows, at.seq);
+    // A capturing verify keeps its round's states (`bills.roundCaptureBytes`) beside its forward's transient.
+    liftWide(config, rows, at.seq, if (ctx.capture_ssm_seq) bills.roundCaptureBytes(config) else 0);
     return at;
 }
 
@@ -107,7 +108,7 @@ pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.Forward
 /// ending at `seq`. It is a narrow forward whatever its rows: a wide forward's cap is lifted for it, none installed.
 pub fn enterJoined(config: *const ModelConfig, rows: u64, seq: u64) void {
     if (!joinedLifts(config)) return;
-    liftWide(config, rows, seq);
+    liftWide(config, rows, seq, 0);
 }
 
 /// Whether a joined forward of `config`'s model would lift a cap now, so its rows are worth reading.
@@ -116,11 +117,11 @@ pub fn joinedLifts(config: *const ModelConfig) bool {
 }
 
 /// After a wide forward, the free buffers past a narrow forward's cap go and no cap stays in force.
-fn liftWide(config: *const ModelConfig, rows: u64, seq: u64) void {
+fn liftWide(config: *const ModelConfig, rows: u64, seq: u64, capture: u64) void {
     if (!after_wide) return;
     after_wide = false;
     mlx.engine.close();
-    trimTo(forwardCap(config, rows, seq));
+    trimTo(forwardCap(config, rows, seq) +| capture);
 }
 
 fn install(bytes: u64) void {

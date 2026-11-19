@@ -6,15 +6,34 @@ const trunk_mod = @import("../trunk.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
+const qwen4_gdn = @import("qwen4_gdn.zig");
 
 // Hooks: bills.zig reaches these through the arch's `bill` declaration; a hook returns null where it has no say.
 
 /// The mapped n-gram table's GPU bytes, billed as taken whichever model asks.
 /// A Qwen request commits its whole cache at admission (`bills.cacheCommitBytes`), as GLM's does: admission counts
 /// what it is still to grow beside the requests it admits after it.
-pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64) ?u64 {
-    return bills.cacheCommitBytes(config, prompt_len, max_tokens, kv_bits, @import("../settings_resolve.zig").prefill_chunk.value);
+pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, mtp_on: bool) ?u64 {
+    return bills.cacheCommitBytes(config, prompt_len, max_tokens, kv_bits, @import("../settings_resolve.zig").prefill_chunk.value, mtp_on);
 }
+
+/// The recurrent state sets a speculative round keeps past its new state from the verify to the rollback, at its
+/// dearest verify width: a fold verify's per-row states (`qwen4_gdn.gdnVerifyFoldFor`), else the replay's pre-state.
+/// A round of joined rows also holds each row's state in the group's merged state and that state's successor.
+pub fn roundCaptureStates(config: *const model_mod.ModelConfig) ?u64 {
+    var solo: u64 = 1;
+    var rows: c_int = 2;
+    while (rows <= 1 + @as(c_int, @intCast(@import("../mtp.zig").MAX_DEPTH))) : (rows += 1) {
+        if (qwen4_gdn.gdnVerifyFoldFor(rows)) solo = @max(solo, @as(u64, @intCast(rows)));
+    }
+    const joins = @import("../cooler_side.zig").onEngine(config) and @import("qwen4_config.zig").supportsBatchedRows(config);
+    return solo + (if (joins) joined_round_states else 0);
+}
+
+/// The states a round of joined rows holds a row past a solo round's (`qwen4_forward.forwardMoeBatchedRows` keeps the
+/// group's merged state and its captures beside the rows'): two, measured at depths 1 and 6 by the contract cell
+/// `a served request, plain or speculative, solo or joined...`.
+pub const joined_round_states: u64 = 2;
 
 /// On Sushi Cooler, the bytes each prefill row holds at the peak of each kind of layer, f16 unless named, from the
 /// buffers alive there (`SUSHI_ENGINE_POOL_PEAK_TRACE`). A chunk peaks in one kind; the trunk's rows are held across all.

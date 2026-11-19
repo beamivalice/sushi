@@ -153,6 +153,11 @@ pub fn specOptions(xfm: *Trunk, depth: u32) Generator.InitOptions {
     };
 }
 
+/// The rows of KV the MTP head holds for the request whose half of the head is installed.
+pub fn headCacheTokens(xfm: *Trunk) usize {
+    return xfm.arch_state.qwen4.mtp.?.cache.residentCapacityTokens();
+}
+
 /// `n` greedy tokens for each of `prompts`, every prompt prefilled in a slot of its own and every tick one forward of
 /// all the rows: the joined decode a served Cooler load runs (`qwen4_forward.forwardQwen4DecodeRows`).
 pub fn greedyRows(a: std.mem.Allocator, xfm: *Trunk, prompts: []const []const u32, n: u32) ![]std.ArrayList(u32) {
