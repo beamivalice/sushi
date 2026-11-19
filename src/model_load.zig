@@ -543,8 +543,11 @@ pub const BudgetLimits = struct {
     user_wire: u64,
     user_wire_name: []const u8,
     user_wire_margin: u64,
-    /// The free RAM the load's preflight compares its need with (`sushiAvailable`'s free term); null = unread.
+    /// What the planner's need at the default must fit (`ramDefaultBudget`): the free RAM for a preflight's need, 0 for a
+    /// `LoadPlanner`'s, which is 0 where every check admits; null = unread.
     free: ?u64 = null,
+    /// What a step-down by `free` is said to fit (`RamDefault.bound_by`).
+    free_name: []const u8 = "free RAM",
 };
 
 /// A 128 GB Mac takes the larger default only with the wired limit raised to at least this (`iogpu.wired_limit_mb`).
@@ -574,7 +577,16 @@ pub fn ramDefaultBudget(tier: RamTier, resident_need: u64, beside: u64, limits: 
     if (need <= free) return d;
     const fits = bills.streamedBudgetThatFits(d.bytes, free, preflight);
     if (fits == 0) return d;
-    return .{ .bytes = fits << 30, .resident = false, .wanted_bytes = if (d.wanted_bytes > 0) d.wanted_bytes else d.bytes, .bound_by = "free RAM" };
+    return .{ .bytes = fits << 30, .resident = false, .wanted_bytes = if (d.wanted_bytes > 0) d.wanted_bytes else d.bytes, .bound_by = limits.free_name };
+}
+
+/// The default a load takes: the limits' default, stepped down to the largest budget every check the load runs admits
+/// on `readings` (`LoadPlannerOf(plan)`); none admitted leaves it to the load, whose refusal names the budget that fits.
+pub fn ramDefaultAtLoad(tier: RamTier, resident_need: u64, beside: u64, limits: BudgetLimits, plan: anytype, readings: bills.FitReadings) RamDefault {
+    var at = limits;
+    at.free = 0;
+    at.free_name = "the memory free at the load";
+    return ramDefaultBudget(tier, resident_need, beside, at, LoadPlannerOf(@TypeOf(plan)){ .plan = plan, .readings = readings });
 }
 
 fn limitsDefault(tier: RamTier, resident_need: u64, beside: u64, limits: BudgetLimits) RamDefault {
@@ -633,8 +645,9 @@ pub const budget_required_message = "This checkpoint streams its experts from SS
 
 /// The budget a DeepSeek load takes from its Mac's RAM tier. The planner is asked what holding every routed expert
 /// resident needs (a budget no pack exhausts), and the limits then decide whether that, or a streamed budget, fits.
-/// `at_load` adds the free RAM the load's preflight reads, once memory still being released has come back; the
-/// registry gate, before its evictions, bills the default without it (never less). It calls no MLX.
+/// `at_load` steps it down to what every check the load runs admits on the readings at the load, once memory still being
+/// released has come back; the registry gate, before its evictions, bills the default without them (never less). It
+/// calls no MLX.
 pub fn ramDefaultFor(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, tier: RamTier, load_vision: bool, assistant_bytes: u64, at_load: bool) RamDefault {
     const unbounded: u64 = 1 << 50;
     const probe = planExpertStreamingWith(io, allocator, config, model_dir, unbounded, load_vision, assistant_bytes) catch null;
@@ -647,30 +660,44 @@ pub fn ramDefaultFor(io: std.Io, allocator: std.mem.Allocator, config: *const Mo
         };
     }
     // A streamed plan's requirement does not read `mtp_on`.
-    const preflight = BudgetPlanner{ .io = io, .allocator = allocator, .config = config, .model_dir = model_dir, .vision = load_vision, .assistant = assistant_bytes, .beside = 0, .mtp_on = false };
+    const plan = BudgetPlanner{ .io = io, .allocator = allocator, .config = config, .model_dir = model_dir, .vision = load_vision, .assistant = assistant_bytes, .beside = 0, .mtp_on = false };
     const beside = bills.defaultRequestBill(config) +| encode;
-    var limits = bills.defaultBudgetLimits();
-    if (at_load) limits.free = freeRamAtLoad(io, preflight.needAt(ramDefaultBudget(tier, resident_need, beside, limits, preflight).bytes) orelse 0);
-    return ramDefaultBudget(tier, resident_need, beside, limits, preflight);
+    const limits = bills.defaultBudgetLimits();
+    const unbound = ramDefaultBudget(tier, resident_need, beside, limits, plan);
+    if (!at_load) return unbound;
+    // A streamed load's preflight reads free RAM under the working set alone.
+    var reader = PreflightReader{ .io = io, .config = config, .sushi = false };
+    _ = bills.settleAvailableBytes(reader.read(), plan.needAt(unbound.bytes) orelse 0, &reader);
+    return ramDefaultAtLoad(tier, resident_need, beside, limits, plan, reader.readings);
 }
 
-/// The free RAM the load preflight reads, polled as the preflight does while it is short of `needed` and still rising.
-fn freeRamAtLoad(io: std.Io, needed: u64) ?u64 {
-    const Reader = struct {
-        io: std.Io,
-        pub fn read(_: *@This()) ?u64 {
-            return bills.sushiAvailable(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), 0, 0, 0).free;
-        }
-        pub fn sleep(r: *@This()) void {
-            std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
-        }
-        pub fn freeRamBinds(_: *@This()) bool {
-            return true;
-        }
-    };
-    var reader = Reader{ .io = io };
-    return bills.settleAvailableBytes(reader.read(), needed, &reader);
-}
+/// The load preflight's readings, polled by `bills.settleAvailableBytes` while memory still being released comes back:
+/// each read takes `bills.FitReadings.now` and the bound the preflight compares its need with.
+const PreflightReader = struct {
+    io: std.Io,
+    config: *const ModelConfig,
+    /// A Sushi resident load's bound (`FitReadings.preflightAvailable`).
+    sushi: bool,
+    /// The readings last taken, which a refusal and the budgets it names are priced on, and their bounds.
+    readings: bills.FitReadings = .{},
+    last: ?bills.SushiAvailable = null,
+
+    pub fn read(r: *PreflightReader) ?u64 {
+        const readings = bills.FitReadings.now(r.config);
+        const got = readings.preflightAvailable(r.sushi);
+        // An unread figure keeps the last one read, which the wait returns and a refusal is priced on.
+        if (got.bytes == null and r.last != null) return null;
+        r.readings = readings;
+        r.last = got;
+        return got.bytes;
+    }
+    pub fn sleep(r: *PreflightReader) void {
+        std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
+    }
+    pub fn freeRamBinds(r: *PreflightReader) bool {
+        return r.last.?.bound() == .free_ram;
+    }
+};
 
 fn ramDefaultChoice(sch: *Scheduler, params: anytype, tier: RamTier, load_vision: bool, assistant_bytes: u64) !SsdBudgetChoice {
     const d = ramDefaultFor(sch.io, sch.allocator, params.config, params.model_dir, tier, load_vision, assistant_bytes, true);
@@ -869,20 +896,26 @@ pub const FitResolver = *const fn (*const model_mod.ModelConfig, u64) ?bills.Exp
 /// runs, in its order (the budget against the GPU limit and the fit under the ceiling, then the preflight), admits the
 /// budget's plan on `readings`, and past any figure where one refuses, so `streamedBudgetThatFits(budget, 0, ...)`
 /// finds the largest the load admits.
-pub const LoadPlanner = struct {
-    plan: BudgetPlanner,
-    readings: bills.FitReadings,
+pub const LoadPlanner = LoadPlannerOf(BudgetPlanner);
 
-    pub fn needAt(p: LoadPlanner, budget_bytes: u64) ?u64 {
-        const at = p.plan.planAt(budget_bytes) orelse return null;
-        const r = p.readings.streamed();
-        if (bills.expertCacheRefusal(&at.config, at.resident, r) != null) return std.math.maxInt(u64);
-        const weights = at.resident +| p.plan.beside;
-        const avail = r.preflightAvailable(model_mod.usesSushiQuantMemoryBill(&at.config)).bytes;
-        if (bills.memInsufficientForLoad(weights, avail, loadRequirementBytes(&at.config, weights, p.plan.mtp_on, 0))) return std.math.maxInt(u64);
-        return 0;
-    }
-};
+/// `Plan` gives the config a load at a budget applies and its resident bytes (`planAt`), and the `beside` and `mtp_on`
+/// its preflight bills: `BudgetPlanner`, or a test's stand-in for a pack's planner.
+pub fn LoadPlannerOf(comptime Plan: type) type {
+    return struct {
+        plan: Plan,
+        readings: bills.FitReadings,
+
+        pub fn needAt(p: @This(), budget_bytes: u64) ?u64 {
+            const at = p.plan.planAt(budget_bytes) orelse return null;
+            const r = p.readings.streamed();
+            if (bills.expertCacheRefusal(&at.config, at.resident, r) != null) return std.math.maxInt(u64);
+            const weights = at.resident +| p.plan.beside;
+            const avail = r.preflightAvailable(model_mod.usesSushiQuantMemoryBill(&at.config)).bytes;
+            if (bills.memInsufficientForLoad(weights, avail, loadRequirementBytes(&at.config, weights, p.plan.mtp_on, 0))) return std.math.maxInt(u64);
+            return 0;
+        }
+    };
+}
 
 /// What a budget's plan holds beside its expert cache, null when the plan refuses it (`bills.smallestBudgetGb`).
 /// The refusal of a streamed load whose ssd budget holds less than its pack beside two cache slots per layer, naming
@@ -2058,30 +2091,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // its memory" case. Bypass with --skip-mem-preflight.
     if (!scheduler_mod.skipMemPreflight()) {
         const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
-        const Reader = struct {
-            io: std.Io,
-            config: *const ModelConfig,
-            sushi: bool,
-            /// The readings last taken, which a refusal and the budgets it names are priced on, and their bounds.
-            readings: bills.FitReadings = .{},
-            last: ?bills.SushiAvailable = null,
-            pub fn read(r: *@This()) ?u64 {
-                const readings = bills.FitReadings.now(r.config);
-                const got = readings.preflightAvailable(r.sushi);
-                // An unread figure keeps the last one read, which the wait returns and a refusal is priced on.
-                if (got.bytes == null and r.last != null) return null;
-                r.readings = readings;
-                r.last = got;
-                return got.bytes;
-            }
-            pub fn sleep(r: *@This()) void {
-                std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
-            }
-            pub fn freeRamBinds(r: *@This()) bool {
-                return r.last.?.bound() == .free_ram;
-            }
-        };
-        var reader = Reader{ .io = sch.io, .config = params.config, .sushi = model_mod.usesSushiQuantMemoryBill(params.config) };
+        var reader = PreflightReader{ .io = sch.io, .config = params.config, .sushi = model_mod.usesSushiQuantMemoryBill(params.config) };
         var avail_bytes = reader.read();
         const mtp_on = mtpChoiceFor(params.mtp, params.config).on;
         // Its maximum context is read only by a refusal, which an unread figure never makes.

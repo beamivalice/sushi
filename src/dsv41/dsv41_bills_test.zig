@@ -652,3 +652,61 @@ test "DeepSeek: an image encode on a Cooler load reads the headroom a forward of
     // The live part alone, which an encode read before, is short of it.
     try std.testing.expect(h.live < bill);
 }
+
+/// A DeepSeek release load's plan at a budget, as the 32 GB rows of dsv41-memory size it: the trunk, MTP and vision
+/// resident, a fixed workspace and bounce, and the expert cache the rest of the budget.
+const ReleasePlan = struct {
+    config: *const model_mod.ModelConfig,
+    beside: u64 = 0,
+    mtp_on: bool = false,
+    const resident: u64 = 9_550_000_000;
+    const workspace: u64 = 3_700_000_000;
+    const bounce: u64 = 540_000_000;
+
+    pub fn planAt(p: ReleasePlan, budget: u64) ?struct { config: model_mod.ModelConfig, resident: u64 } {
+        if (budget < resident + workspace + bounce + (1 << 30)) return null;
+        var c = p.config.*;
+        c.expert_ssd_budget_bytes = budget;
+        c.expert_cache_bytes = budget - resident - workspace - bounce;
+        c.expert_workspace_bytes = workspace;
+        c.expert_bounce_bytes = bounce;
+        return .{ .config = c, .resident = resident };
+    }
+
+    pub fn needAt(p: ReleasePlan, budget: u64) ?u64 {
+        const at = p.planAt(budget) orelse return null;
+        return bills.loadRequirementBytes(&at.config, at.resident, false, 0);
+    }
+};
+
+test "DeepSeek: the RAM default a load takes passes every check the load runs on the readings at the load, another model's buffers active" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
+    config.expert_borrow_bytes = 2_100_000_000;
+    const plan = ReleasePlan{ .config = &config };
+    const GiB: u64 = 1 << 30;
+    const ram: u64 = 128 * GiB;
+    const wired: u64 = 125_000 << 20;
+    const limits = model_load.BudgetLimits{ .wired_limit = wired, .ceiling = wired, .ceiling_name = "iogpu.wired_limit_mb", .margin = GiB, .user_wire = 0, .user_wire_name = "", .user_wire_margin = GiB };
+    // A 128 GB Mac at iogpu.wired_limit_mb 125000 with plenty of RAM free, and another model holding 20 GiB on the GPU.
+    const readings = bills.FitReadings{ .wired_limit = wired, .wired_floor = bills.wiredLimitFloor(wired, ram, GiB), .budget_working_set = wired, .working_set = wired, .active = 20 * GiB, .free = 118 * GiB, .total_ram = ram, .unplanned = GiB };
+    const d = model_load.ramDefaultAtLoad(.gb128, 0, 5_000_000_000, limits, plan, readings);
+    // It steps down from 108 rather than leave the load to refuse it.
+    try t.expect(d.bytes > 0 and d.bytes < 108 * GiB);
+    try t.expectEqualStrings("the memory free at the load", d.bound_by);
+    const at = plan.planAt(d.bytes).?;
+    if (bills.expertCacheRefusal(&at.config, at.resident, readings)) |refused| {
+        var buf: [2048]u8 = undefined;
+        std.debug.print("the RAM default {d} GiB is refused at the load:\n{s}\n", .{ d.bytes >> 30, bills.loadMemoryRefusalText(&buf, refused.refusal) });
+        return error.TestUnexpectedResult;
+    }
+    try t.expect(!bills.memInsufficientForLoad(at.resident, readings.preflightAvailable(false).bytes, plan.needAt(d.bytes).?));
+    // With nothing else on the GPU the same Mac keeps 108.
+    var idle = readings;
+    idle.active = 0;
+    try t.expectEqual(108 * GiB, model_load.ramDefaultAtLoad(.gb128, 0, 5_000_000_000, limits, plan, idle).bytes);
+}

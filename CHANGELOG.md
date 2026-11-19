@@ -43,6 +43,9 @@ earlier history is mlx-serve's, in that project's changelog.
   a message that cannot know the pack no longer suggests one.
 - **A load short of free RAM is refused even if a memory reading fails while it waits**: the preflight waited for
   memory to come back after a short reading, and a failed reading then let the load through.
+- **DeepSeek-V4.1's default SSD budget loads beside another model**: the default was checked against free RAM alone,
+  so with another model already on the GPU it could be refused by the load's own checks; it now steps down to what
+  every check admits at the load.
 - **No command fails silently**: every error that ends a `sushi` command prints a line saying what to do; `sushi kld` on
   a DeepSeek-V4.1 pack without `--ssd-budget-gb` used to exit with no message and now asks for it.
 
