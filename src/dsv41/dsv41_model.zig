@@ -223,6 +223,9 @@ pub const Experts = union(enum) {
         can_prefetch: ?*const fn (ctx: *anyopaque, layer: usize) bool = null,
         /// Decode widths: the routed chain queued before the host knows the picks, checked one layer late.
         spec: ?Spec = null,
+        /// Whether every layer routes through its resident slots right now, so no route writes a slab from the host.
+        /// Null: the hook may stream (`streamsExperts`).
+        all_resident: ?*const fn (ctx: *anyopaque) bool = null,
         /// The layer's pick-score penalty (`--expert-cache-bias`), f32 `[experts]`, added to the router's bias at decode
         /// widths. Null leaves the pick exact.
         penalty: ?*const fn (ctx: *anyopaque, layer: usize) anyerror!?A = null,
@@ -2896,6 +2899,14 @@ fn pipeOn(m: *const Model, rows: usize) bool {
 
 /// Queues a layer's arrays `ev` and tracks its output stream `x`; past `pipe_depth` layers in flight, waits for the
 /// oldest. The same graphs as an evaluation in place: only when the host waits changes.
+/// Whether a route may write an expert slab from the host: a hook that does not say every layer is resident.
+fn streamsExperts(m: *const Model) bool {
+    return switch (m.experts) {
+        .resident => false,
+        .hook => |hk| if (hk.all_resident) |f| !f(hk.ctx) else true,
+    };
+}
+
 fn pipeSubmit(m: *Model, ev: []const A, x: A) !void {
     try submitAll(ev);
     if (m.pipe.push(m.pipe_depth, handle(x))) |old| try waitFree(old);
@@ -3902,6 +3913,8 @@ pub fn captureStateShared(m: *Model, out: []Slot) !void {
 }
 
 fn captureInto(m: *Model, out: []Slot, share: bool) !void {
+    // A resident state-only chunk returns with its last layers in flight.
+    try pipeDrain(m);
     const st = try ensureState(m);
     if (st.verify != null) return error.Dsv41VerifyOpen;
     if (out.len != slotCount(m)) return error.Dsv41CheckpointMismatch;
@@ -5032,8 +5045,14 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(m.gpa);
     try appendStateArrays(m.gpa, &ev, &st.layers[split]);
-    try evalAll(ev.items);
-    try pipeDrain(m);
+    // With resident experts the next chunk keeps the GPU busy behind this one's last layers; its caller drains
+    // (`pipeDrain`) before it reads the state. A streamed expert's next refill must not race a queued reader.
+    if (pipeOn(m, ids.len) and !streamsExperts(m)) {
+        try submitAll(ev.items);
+    } else {
+        try evalAll(ev.items);
+        try pipeDrain(m);
+    }
     reportEngramWait(m, ids.len);
     st.n = pass.p0 + ids.len;
     m.state_only_used += 1;
@@ -6579,6 +6598,36 @@ test "dsv41 state-only chunks: a chunk another chunk wider than the window follo
         defer lean.deinit();
         try expectArmsEqual(&sc, m, &full, &lean);
     }
+}
+
+test "dsv41 state-only chunks: a resident chunk returns with its last layers in flight, and the next chunk gives the drained run's logits (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.plain(testing.allocator, s);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    const ids = try syntheticPrompt(base, 120);
+    defer testing.allocator.free(ids);
+    const m = try wideWindowModel(dir, .{ .act = .bfloat16, .qat = true, .dspark = true }, s);
+    defer m.deinit();
+    const w = m.cfg.window;
+    try testing.expect(pipeOn(m, w + 1) and !streamsExperts(m));
+    var lasts: [2][]f32 = undefined;
+    for (&lasts, [_]bool{ false, true }) |*last, overlap| {
+        resetState(m);
+        try extendState(m, ids[0 .. w + 1], SPAN, null, &.{});
+        if (overlap) try testing.expect(m.pipe.n > 0) else try pipeDrain(m);
+        const lg = try extendVision(m, ids[w + 1 ..][0 .. w + 1], .last, SPAN, null);
+        defer _ = mlx.mlx_array_free(lg);
+        try testing.expectEqual(@as(usize, 0), m.pipe.n);
+        last.* = try hostRows(&sc, lg);
+    }
+    defer for (lasts) |l| testing.allocator.free(l);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(lasts[0]), std.mem.sliceAsBytes(lasts[1]));
 }
 
 test "dsv41 state-only chunks: skipping before a chunk the window covers leaves stale rows, which the logits show (DSV41_TINY)" {

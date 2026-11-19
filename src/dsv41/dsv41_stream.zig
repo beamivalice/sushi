@@ -212,7 +212,17 @@ pub const StqStream = struct {
             .can = canQueue,
             .queue = queueOpaque,
             .settle = settleOpaque,
-        }, .penalty = penaltyOpaque };
+        }, .penalty = penaltyOpaque, .all_resident = allResident };
+    }
+
+    /// Every active expert layer routes through its resident map (`Engine.residentRoute`): no route fills a slab from
+    /// the host.
+    fn allResident(ctx: *anyopaque) bool {
+        const self: *StqStream = @ptrCast(@alignCast(ctx));
+        for (self.engine.layers, 0..) |*layer, li| {
+            if (layer.active and self.engine.residentRoute(@intCast(li)) == null) return false;
+        }
+        return true;
     }
 
     fn penaltyOpaque(ctx: *anyopaque, layer: usize) anyerror!?A {

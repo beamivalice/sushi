@@ -416,8 +416,11 @@ Prefill width:
 <a id="prefill-pipeline"></a>
 Prefill pipeline (`Model.pipe_depth`, 2; load line `[dsv41] prefill pipeline: 2 layers in flight`):
 - A wide layer is submitted, not waited on: no evaluation at the routed sum or the layer's end, the host waits only on
-  the oldest of more than 2 layers in flight, and each chunk drains at its end (`finishPass`, `extendState`), so two
-  chunks never overlap. Streamed experts keep the router readback, which orders every slab refill after the layer
+  the oldest of more than 2 layers in flight. A state-only chunk (`extendState`) on resident experts returns with its
+  last layers and its split compressor still queued, so the host builds the next chunk while the GPU finishes them
+  (`streamsExperts` false: no route writes a slab); every reader of the state drains first (`finishPass`,
+  `captureInto`, `resetState`), and a streamed load drains at the chunk's end, so a slab refill never races a queued
+  reader. Streamed experts keep the router readback, which orders every slab refill after the layer
   before it. Same graphs, so the same bytes (proven at 2291e1b0 against depth 0; the test went once proven).
 - Measured on 59e7a562 + caee00fe against 59e7a562 (pack revision 2.0, `--ssd-budget-gb 108`, debug log,
   `taskpolicy -a`, GPU lock, AC, fans max and under 50 C before each boot, one boot an arm, six pipelined boots and six
