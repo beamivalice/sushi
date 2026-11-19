@@ -6693,6 +6693,51 @@ pub fn sushiAvailable(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: 
     return .{ .bytes = bytes, .free = free, .gpu = gpu, .declared = declared };
 }
 
+/// The unit of every memory figure in one refusal text and its log line: GB (2^30 bytes) with one decimal, or whole MB
+/// (2^20) when the text's largest figure is under 1 GB.
+pub const MemUnit = enum {
+    mb,
+    gb,
+
+    pub fn of(largest: u64) MemUnit {
+        return if (largest < 1 << 30) .mb else .gb;
+    }
+
+    fn count(unit: MemUnit, bytes: u64, up: bool) u64 {
+        return switch (unit) {
+            .mb => if (up) std.math.divCeil(u64, bytes, 1 << 20) catch unreachable else bytes >> 20,
+            .gb => (bytes *| 10 +| (if (up) @as(u64, (1 << 30) - 1) else 0)) >> 30,
+        };
+    }
+};
+
+/// A memory figure as a refusal prints it (`{f}`): a need rounded up, what is available rounded down, and a shortfall
+/// that is their printed difference, so a refusal never shows its need equal to what is available, nor arithmetic
+/// that does not add up.
+pub const Mem = struct {
+    units: u64,
+    unit: MemUnit,
+
+    pub fn need(bytes: u64, unit: MemUnit) Mem {
+        return .{ .units = unit.count(bytes, true), .unit = unit };
+    }
+
+    pub fn have(bytes: u64, unit: MemUnit) Mem {
+        return .{ .units = unit.count(bytes, false), .unit = unit };
+    }
+
+    pub fn short(need_bytes: u64, have_bytes: u64, unit: MemUnit) Mem {
+        return .{ .units = unit.count(need_bytes, true) -| unit.count(have_bytes, false), .unit = unit };
+    }
+
+    pub fn format(self: Mem, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self.unit) {
+            .mb => try w.print("{d} MB", .{self.units}),
+            .gb => try w.print("{d}.{d} GB", .{ self.units / 10, self.units % 10 }),
+        }
+    }
+};
+
 fn gbOf(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0);
 }
@@ -7330,3 +7375,20 @@ test "a refused request's message never shows its need equal to what is availabl
     }
 }
 
+test "a refusal's memory figures: need up, available down, the shortfall their printed difference, one unit" {
+    const gib: u64 = 1 << 30;
+    const mib: u64 = 1 << 20;
+    var buf: [128]u8 = undefined;
+    const u = MemUnit.of(2 * gib + gib / 4);
+    try testing.expectEqual(MemUnit.gb, u);
+    // 2.25 GiB needed, 0.08 GiB available: 2.3 GB, 0.0 GB, 2.3 GB short.
+    try testing.expectEqualStrings("2.3 GB, 0.0 GB, 2.3 GB", try std.fmt.bufPrint(&buf, "{f}, {f}, {f}", .{ Mem.need(2 * gib + gib / 4, u), Mem.have(gib / 12, u), Mem.short(2 * gib + gib / 4, gib / 12, u) }));
+    // One byte apart never prints equal.
+    try testing.expectEqualStrings("5.1 GB > 5.0 GB", try std.fmt.bufPrint(&buf, "{f} > {f}", .{ Mem.need(5 * gib + 1, .gb), Mem.have(5 * gib + 1 - 1, .gb) }));
+    try testing.expectEqualStrings("1.0 GB", try std.fmt.bufPrint(&buf, "{f}", .{Mem.need(gib, .gb)}));
+    // Under 1 GB the text counts whole MB, so a 20 MB gap does not read as 0.3 GB against 0.2 GB.
+    const small = MemUnit.of(297 * mib);
+    try testing.expectEqual(MemUnit.mb, small);
+    try testing.expectEqualStrings("298 MB, 276 MB, 22 MB", try std.fmt.bufPrint(&buf, "{f}, {f}, {f}", .{ Mem.need(297 * mib + 1, small), Mem.have(277 * mib - 1, small), Mem.short(297 * mib + 1, 277 * mib - 1, small) }));
+    try testing.expectEqualStrings("0 MB", try std.fmt.bufPrint(&buf, "{f}", .{Mem.short(10 * mib, 20 * mib, small)}));
+}
