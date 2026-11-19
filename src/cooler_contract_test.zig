@@ -3787,6 +3787,331 @@ test "cooler contract: a served Qwen turn whose partial share fits once an idle 
     }.run);
 }
 
+/// Admission that refuses a warm share the request did not take over: a copy of the prefix does not fit.
+fn fitsOnlyTaken(_: *const @import("model.zig").ModelConfig, _: usize, _: u32, _: @import("trunk.zig").KVQuantConfig, _: bool, matched: u64, _: u64, will_donate: bool, _: bool, _: @import("scheduler.zig").CheckpointPlan) bool {
+    return matched == 0 or will_donate;
+}
+
+/// The #109 conversation served: turn 1, a turn 2 that extends it (its entry holds both prompt ends' restore points),
+/// and the prompt of a turn 3 that leaves turn 2's text between those points (turn 2 less its last 100 tokens, then
+/// `say` new ones): a partial share of turn 2's entry.
+const PartialShare = struct {
+    /// Turn 2's prompt, and the tokens of the entry its commit left (the prompt and its reply).
+    second: std.ArrayList(u32) = .empty,
+    entry: std.ArrayList(u32) = .empty,
+    third: std.ArrayList(u32) = .empty,
+
+    fn serve(sv: *Served, ids: []const u32, say: usize) !PartialShare {
+        const a = testing.allocator;
+        var c: PartialShare = .{};
+        errdefer c.deinit();
+        var f: u32 = 0;
+        var first = try heldPrompt(a, ids, 1500, 0);
+        defer first.deinit(a);
+        var reply = try sv.request(first.items, 16, &f);
+        defer reply.deinit(a);
+        try c.second.appendSlice(a, first.items);
+        try c.second.appendSlice(a, reply.items);
+        var said = try heldPrompt(a, ids, 1500, 2);
+        defer said.deinit(a);
+        try c.second.appendSlice(a, said.items);
+        var reply2 = try sv.request(c.second.items, 16, &f);
+        defer reply2.deinit(a);
+        try c.entry.appendSlice(a, c.second.items);
+        try c.entry.appendSlice(a, reply2.items);
+        try c.third.appendSlice(a, c.second.items[0 .. c.second.items.len - 100]);
+        var more = try heldPrompt(a, ids, say, 1);
+        defer more.deinit(a);
+        try c.third.appendSlice(a, more.items);
+        return c;
+    }
+
+    fn deinit(self: *PartialShare) void {
+        self.second.deinit(testing.allocator);
+        self.entry.deinit(testing.allocator);
+        self.third.deinit(testing.allocator);
+    }
+};
+
+/// A hot cache at rest: no entry is checked out, and the cache bills the sum of its entries' bills.
+fn takeoverAtRest(hc: *const @import("prefix_cache.zig").HotPrefixCache) bool {
+    var sum: u64 = 0;
+    for (hc.entries.items) |*e| {
+        if (e.checked_out_by != null) return false;
+        sum += e.kv_bytes;
+    }
+    return sum == hc.current_kv_bytes;
+}
+
+test "cooler contract: a served Qwen takeover turn refused at each pool site it reaches leaves the hot cache at rest and the pool as it was, and the next turn is served" {
+    try qwenTinyServed(struct {
+        ld: *Load,
+        dir: []const u8,
+        ids: []const u32,
+
+        /// Turns 1 and 2, then the partial takeover turn 3, refused at `at` (none: served). A sweep records turn 3 alone.
+        fn turns(q: @This(), sv: *Served, at: ?mlx.FaultSites.SitePoint) !void {
+            const rec = &mlx.engine.fault.sites;
+            const recording = rec.list != null;
+            if (recording) rec.paused = true;
+            var c = try PartialShare.serve(sv, q.ids, 200);
+            defer c.deinit();
+            const fits_was = Served.scheduler.prefill_admission_fits;
+            defer Served.scheduler.prefill_admission_fits = fits_was;
+            Served.scheduler.prefill_admission_fits = fitsOnlyTaken;
+            if (recording) rec.paused = false;
+            if (at) |pt| {
+                // As the inference loop runs a failing request: failPrefill or failTick, then the cleanup drain.
+                mlx.engine.fault.armAt(pt);
+                _ = try sv.requestToCleanup(c.third.items, 16, false);
+                return;
+            }
+            var f: u32 = 0;
+            var got = try sv.request(c.third.items, 16, &f);
+            got.deinit(testing.allocator);
+        }
+
+        fn go(q: @This()) anyerror!void {
+            var sv: Served = undefined;
+            try sv.initTiers(q.ld, q.dir, 1 << 30);
+            defer sv.deinit();
+            try q.turns(&sv, null);
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            const q: @This() = .{ .ld = &ld, .dir = dir, .ids = ids };
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            const points = try firstAsks(a, &seen, Q, q, go);
+            defer a.free(points);
+            try testing.expect(points.len > 0);
+            const base = Sheet.now();
+            for (points, 1..) |pt, k| {
+                errdefer std.debug.print("cooler contract: the takeover turn refused at pool site {d} of {d}\n", .{ k, points.len });
+                {
+                    var sv: Served = undefined;
+                    try sv.initTiers(&ld, dir, 1 << 30);
+                    defer sv.deinit();
+                    sv.quiet_failures = true;
+                    try q.turns(&sv, pt);
+                    if (pt.strict) try testing.expect(!mlx.engine.fault.armed());
+                    mlx.engine.fault.disarm();
+                    const hc = &sv.entry.prefix_cache.?;
+                    if (hc.disk) |*d| d.drainWriter();
+                    try testing.expect(takeoverAtRest(hc));
+                    try testing.expect(!mlx.errorPending());
+                    // The conversation goes on past its third turn.
+                    var f: u32 = 0;
+                    var next = try heldPrompt(a, ids, 3300, 0);
+                    defer next.deinit(a);
+                    var got = try sv.request(next.items, 8, &f);
+                    got.deinit(a);
+                    try testing.expect(takeoverAtRest(hc));
+                }
+                const now = Sheet.now();
+                try testing.expectEqual(base.in_use, now.in_use);
+                try testing.expectEqual(@as(u32, 0), now.open);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a served Qwen conversation of takeovers, partial, regenerated and diverging, says its share arm's tokens with the pool poisoned, under a roomy and a tight RAM budget" {
+    try qwenTinyServed(struct {
+        /// Turn 1, turn 2, a partial takeover turn 3, a regenerate of turn 3, a turn 5 that diverges inside the taken
+        /// prefix, a turn 6 that extends turn 5: every reply, in order. Taken, every free buffer is poisoned between turns.
+        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, taken: bool, ram: u64, out: *std.ArrayList(u32)) !void {
+            const a = testing.allocator;
+            var sv: Served = undefined;
+            try sv.initTiers(ld, dir, ram);
+            defer sv.deinit();
+            const poison: ?u8 = if (taken) 0xFF else null;
+            mlx.engine.poison.byte = poison;
+            defer mlx.engine.poison.byte = null;
+            var f: u32 = 0;
+            const fits_was = Served.scheduler.prefill_admission_fits;
+            defer Served.scheduler.prefill_admission_fits = fits_was;
+            if (taken) Served.scheduler.prefill_admission_fits = fitsOnlyTaken;
+            var prompt = try heldPrompt(a, ids, 1500, 0);
+            defer prompt.deinit(a);
+            const plans = [_]struct { cut: usize, say: usize, seed: usize }{
+                .{ .cut = 0, .say = 1500, .seed = 2 }, // turn 2 extends turn 1 and its reply
+                .{ .cut = 100, .say = 200, .seed = 1 }, // turn 3 re-renders the reply's tail: a partial takeover
+                .{ .cut = 0, .say = 0, .seed = 0 }, // turn 4 regenerates turn 3
+                .{ .cut = 1200, .say = 300, .seed = 3 }, // turn 5 diverges well inside the taken prefix
+                .{ .cut = 0, .say = 400, .seed = 4 }, // turn 6 extends turn 5
+            };
+            var last: std.ArrayList(u32) = .empty;
+            defer last.deinit(a);
+            for (0..plans.len + 1) |k| {
+                if (k > 0 and k != 3) {
+                    // This prompt, its reply, cut, then new text; turn 4 resends turn 3's prompt.
+                    const pl = plans[k - 1];
+                    try prompt.appendSlice(a, last.items);
+                    prompt.shrinkRetainingCapacity(prompt.items.len - pl.cut);
+                    var said = try heldPrompt(a, ids, pl.say, pl.seed);
+                    defer said.deinit(a);
+                    try prompt.appendSlice(a, said.items);
+                }
+                if (poison) |b| _ = mlx.engine.poison.free(b);
+                var r = try sv.request(prompt.items, 16, &f);
+                defer r.deinit(a);
+                try out.appendSlice(a, r.items);
+                last.clearRetainingCapacity();
+                try last.appendSlice(a, r.items);
+                try testing.expect(takeoverAtRest(&sv.entry.prefix_cache.?));
+            }
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            for ([_]u64{ 1 << 30, 24 << 20 }) |ram| {
+                errdefer std.debug.print("cooler contract: the takeover conversation under a {d} MB RAM budget\n", .{ram >> 20});
+                var shared: std.ArrayList(u32) = .empty;
+                defer shared.deinit(a);
+                try conversation(&ld, dir, ids, false, ram, &shared);
+                var taken: std.ArrayList(u32) = .empty;
+                defer taken.deinit(a);
+                try conversation(&ld, dir, ids, true, ram, &taken);
+                try testing.expectEqualSlices(u32, shared.items, taken.items);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a served Qwen takeover turn cancelled as its prefill ends leaves the hot cache at rest, and the next turn restores and says what the share arm's does" {
+    try qwenTinyServed(struct {
+        /// The #109 conversation, its turn 3 cancelled once its prefill ends, then a turn 4 that extends turn 3's prompt.
+        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, taken: bool, reused: *u32, out: *std.ArrayList(u32)) !void {
+            const a = testing.allocator;
+            const scheduler = Served.scheduler;
+            var sv: Served = undefined;
+            try sv.initTiers(ld, dir, 1 << 30);
+            defer sv.deinit();
+            var c = try PartialShare.serve(&sv, ids, 200);
+            defer c.deinit();
+            {
+                const fits_was = scheduler.prefill_admission_fits;
+                defer scheduler.prefill_admission_fits = fits_was;
+                if (taken) scheduler.prefill_admission_fits = fitsOnlyTaken;
+                const sch = &sv.sch;
+                const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = c.third.items, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 16 });
+                _ = sch.pending.orderedRemove(0);
+                try scheduler.runPrefill(sch, slot);
+                slot.cancelled.store(true, .release);
+                try testing.expect(scheduler.postPrefillTerminal(sch, slot));
+                sch.complete(slot);
+                for (sch.cleanup_queue.items) |s| {
+                    scheduler.cleanupSlot(sch, s);
+                    const turn = arch_handle.turnFor(s.model.handle, s.model.config);
+                    defer turn.end();
+                    s.deinit();
+                }
+                sch.cleanup_queue.clearRetainingCapacity();
+                const hc = &sv.entry.prefix_cache.?;
+                hc.flushPendingDisk(arch_handle.trunk(sv.entry.handle.?).s);
+                hc.disk.?.drainWriter();
+                try testing.expect(takeoverAtRest(hc));
+            }
+            var fourth: std.ArrayList(u32) = .empty;
+            defer fourth.deinit(a);
+            try fourth.appendSlice(a, c.third.items);
+            var said = try heldPrompt(a, ids, 300, 6);
+            defer said.deinit(a);
+            try fourth.appendSlice(a, said.items);
+            var f: u32 = 0;
+            var got = try sv.request(fourth.items, 16, &f);
+            defer got.deinit(a);
+            reused.* = sv.reused;
+            try out.appendSlice(a, got.items);
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var shared_reused: u32 = 0;
+            var taken_reused: u32 = 0;
+            var shared: std.ArrayList(u32) = .empty;
+            defer shared.deinit(a);
+            var taken: std.ArrayList(u32) = .empty;
+            defer taken.deinit(a);
+            try conversation(&ld, dir, ids, false, &shared_reused, &shared);
+            try conversation(&ld, dir, ids, true, &taken_reused, &taken);
+            try testing.expect(taken_reused > 0);
+            try testing.expectEqual(shared_reused, taken_reused);
+            try testing.expectEqualSlices(u32, shared.items, taken.items);
+        }
+    }.run);
+}
+
+test "cooler contract: a served speculative Qwen conversation of takeovers, partial and whole, says its share arm's tokens with the pool poisoned" {
+    try qwenTinyServed(struct {
+        fn conversation(ld: *Load, dir: []const u8, ids: []const u32, taken: bool, out: *std.ArrayList(u32)) !void {
+            const a = testing.allocator;
+            var sv: Served = undefined;
+            try sv.initTiers(ld, dir, 1 << 30);
+            defer sv.deinit();
+            const poison: ?u8 = if (taken) 0xFF else null;
+            mlx.engine.poison.byte = poison;
+            defer mlx.engine.poison.byte = null;
+            var f: u32 = 0;
+            const fits_was = Served.scheduler.prefill_admission_fits;
+            defer Served.scheduler.prefill_admission_fits = fits_was;
+            if (taken) Served.scheduler.prefill_admission_fits = fitsOnlyTaken;
+            var prompt = try heldPrompt(a, ids, 1500, 0);
+            defer prompt.deinit(a);
+            const plans = [_]struct { cut: usize, say: usize, seed: usize }{
+                .{ .cut = 0, .say = 1500, .seed = 2 },
+                .{ .cut = 10, .say = 200, .seed = 1 }, // re-renders the reply's tail: a partial share of a speculative entry
+                .{ .cut = 0, .say = 300, .seed = 4 }, // extends: a whole-entry hit
+                .{ .cut = 300, .say = 400, .seed = 5 }, // re-renders inside the last prompt: partial again
+            };
+            var last: std.ArrayList(u32) = .empty;
+            defer last.deinit(a);
+            for (0..plans.len + 1) |k| {
+                if (k > 0) {
+                    const pl = plans[k - 1];
+                    try prompt.appendSlice(a, last.items);
+                    prompt.shrinkRetainingCapacity(prompt.items.len - pl.cut);
+                    var said = try heldPrompt(a, ids, pl.say, pl.seed);
+                    defer said.deinit(a);
+                    try prompt.appendSlice(a, said.items);
+                }
+                if (poison) |b| _ = mlx.engine.poison.free(b);
+                var r = try sv.requestWith(prompt.items, 24, .{ .temperature = 0.0 }, true, &f);
+                defer r.deinit(a);
+                try out.appendSlice(a, r.items);
+                last.clearRetainingCapacity();
+                try last.appendSlice(a, r.items);
+                try testing.expect(takeoverAtRest(&sv.entry.prefix_cache.?));
+            }
+        }
+
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var shared: std.ArrayList(u32) = .empty;
+            defer shared.deinit(a);
+            try conversation(&ld, dir, ids, false, &shared);
+            var taken: std.ArrayList(u32) = .empty;
+            defer taken.deinit(a);
+            try conversation(&ld, dir, ids, true, &taken);
+            try testing.expectEqualSlices(u32, shared.items, taken.items);
+        }
+    }.run);
+}
+
 test "cooler contract: a streamed Qwen Cooler load decodes one row per forward, so a restore while two requests decode patches no live group and the engine refuses nothing" {
     try qwenTinyServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
