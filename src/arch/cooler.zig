@@ -99,11 +99,28 @@ pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.Forward
         install(at.cap(config));
         return at;
     }
-    if (!after_wide) return at;
+    liftWide(config, rows, at.seq);
+    return at;
+}
+
+/// A forward of several requests' rows begins (joined decode rows, a grouped verify): `rows` in all, the longest
+/// ending at `seq`. It is a narrow forward whatever its rows: a wide forward's cap is lifted for it, none installed.
+pub fn enterJoined(config: *const ModelConfig, rows: u64, seq: u64) void {
+    if (!joinedLifts(config)) return;
+    liftWide(config, rows, seq);
+}
+
+/// Whether a joined forward of `config`'s model would lift a cap now, so its rows are worth reading.
+pub fn joinedLifts(config: *const ModelConfig) bool {
+    return after_wide and onEngine(config) and !ownCaps(config);
+}
+
+/// After a wide forward, the free buffers past a narrow forward's cap go and no cap stays in force.
+fn liftWide(config: *const ModelConfig, rows: u64, seq: u64) void {
+    if (!after_wide) return;
     after_wide = false;
     mlx.engine.close();
-    trimTo(forwardCap(config, rows, at.seq));
-    return at;
+    trimTo(forwardCap(config, rows, seq));
 }
 
 fn install(bytes: u64) void {

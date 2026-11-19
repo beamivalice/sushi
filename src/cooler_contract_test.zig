@@ -2371,6 +2371,68 @@ test "cooler contract: two unseeded sampled requests under one sampler decoded a
     }.run);
 }
 
+test "cooler contract: a grouped tick after another request's prefill chunk runs under no cap that chunk installed, and both requests serve, plain and speculative (#106)" {
+    try eachQwenServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            var long: [300]u32 = undefined;
+            for (&long, 0..) |*t, i| t.* = ids[(i * 3 + 1) % ids.len];
+            for ([_]bool{ false, true }) |mtp| try groupedAfterPrefill(&sv, &long, mtp);
+        }
+    }.run);
+}
+
+/// A request decodes alone; a second arrives and prefills (wide forwards, each installing its chunk's cap); then the
+/// two decode as a group, to their ends.
+fn groupedAfterPrefill(sv: *Served, long: []const u32, mtp: bool) !void {
+    const a = testing.allocator;
+    const scheduler = Served.scheduler;
+    const sch = &sv.sch;
+    const head = if (mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
+    var slots: [2]*scheduler.Slot = undefined;
+    var made: usize = 0;
+    defer {
+        for (slots[0..made]) |slot| sch.complete(slot);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+        sch.cleanup_queue.clearRetainingCapacity();
+    }
+    const uncapped = std.math.maxInt(u64);
+    for ([_][]const u32{ long[0..40], long }) |p| {
+        const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = p, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = 24, .enable_mtp = mtp, .mtp = head });
+        slots[made] = slot;
+        made += 1;
+        _ = sch.pending.orderedRemove(0);
+        try scheduler.runPrefill(sch, slot);
+        if (!scheduler.postPrefillTerminal(sch, slot)) try sch.decoding.append(a, slot);
+        if (made == 1) try scheduler.runDecodeTick(sch, slots[0..1]);
+    }
+    // The second request's last chunk left its cap in force.
+    try testing.expect((mlx.engine.poolLimit() orelse uncapped) < uncapped);
+    try scheduler.runDecodeTick(sch, slots[0..2]);
+    // A grouped tick is a narrow forward: the prefill's cap is lifted for it, as for a one-request step.
+    try testing.expectEqual(uncapped, mlx.engine.poolLimit() orelse uncapped);
+    while (true) {
+        var live: [2]*scheduler.Slot = undefined;
+        var k: usize = 0;
+        for (slots[0..made]) |slot| if (slot.joinsTick()) {
+            live[k] = slot;
+            k += 1;
+        };
+        if (k == 0) break;
+        try scheduler.runDecodeTick(sch, live[0..k]);
+        scheduler.cullDecoding(sch);
+    }
+    for (slots[0..made]) |slot| if (slot.error_code) |e| {
+        std.debug.print("cooler contract: a served request failed ({s})\n", .{e});
+        return error.RequestFailed;
+    };
+}
+
 test "cooler contract: a served request restored from a shorter prompt's SSD record takes it, and says the same tokens every time" {
     // Bytewise cold holds only for a restore at the request's own point (the SSD contract above): another prompt's
     // record sits off this prompt's cold split ([0, N - 31) then the tail), so its state reaches N - 31 in two

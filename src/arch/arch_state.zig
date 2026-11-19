@@ -288,6 +288,7 @@ pub fn verifyRowsGrouped(t: *Trunk, token_rows: []const mlx.mlx_array, ctxs: []c
 
 /// The grouped forward `verifyRowsGrouped` admitted.
 pub fn forwardVerifyRowsGrouped(t: *Trunk, token_rows: []const mlx.mlx_array, ctxs: []const *ForwardCtx, logits: []mlx.mlx_array, last: []mlx.mlx_array, all: []mlx.mlx_array) !void {
+    @import("sched.zig").enterJoinedRows(t, ctxs, token_rows);
     inline for (tags) |tag| {
         const S = Decl(tag, "State");
         if (comptime has(S, "forwardVerifyRowsGrouped")) return S.forwardVerifyRowsGrouped(t, token_rows, ctxs, logits, last, all);

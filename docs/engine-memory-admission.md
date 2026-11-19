@@ -489,6 +489,10 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - **A per-request buffer the bill prices at the reservation is reserved at it** (`DraftCache.reserve` beside
   `reserveRequestCapacity`): the MTP head's KV, billed at the reserved tokens but grown by the +25% policy, raised the
   cap at every grow (`roomFor`) and held 6.3 MB over the bill at 33,792 tokens on the cut, 140 MB at 98,304 (H1-2).
+- **A wide chunk's cap lasts to the next narrow forward of any kind** (`arch_cooler.enterForward` for one request,
+  `enterJoined` for joined decode rows, a grouped verify and batched head chains): grouped ticks that bypassed the
+  seam ran under the last prefill chunk's cap, ~291 MB over what was in use on the cut, and a fold met
+  `PoolOverBudget` (#106).
 - **A chunk's cap counts from the buffers in use, not their asks** (`core.budget`): a turn restored at 58,180 tokens
   of a 58,334-token prompt (Qwen STQ 4bpw, kv8, reserving 256,000 more) holds 8.8 GB of state as its 154-row chunk's
   564 MB cap goes in; at the refusal the pool held 9,366 MB for tensors asking 9,109 (257 MB of size rounding, no

@@ -31,6 +31,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Two or more sampled requests decode at once on Sushi Cooler again**: concurrent Qwen requests under the same
   sampling settings and no seed failed together (`a draw needs a key`); each row now draws under its own request's
   key. Thanks @younesehb for the report and the diagnosis (#106).
+- **Concurrent requests on Sushi Cooler no longer fail with `PoolOverBudget` beside another request's prefill**:
+  requests decoding together ran under the memory cap of the last prefill chunk, sized for that chunk alone; a
+  decode of several requests now lifts it as a single request's step does (#106).
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many
