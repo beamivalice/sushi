@@ -207,13 +207,14 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     // Per-position SSM capture on a GDN trunk so partial accept can roll
     // back the recurrent state without re-forwarding (mirrors nextMtp).
     self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
-    var verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
-    errdefer _ = mlx.mlx_array_free(verify_logits);
-    _ = try self.thinkShiftRows(&verify_logits, verify_input);
-    self.ctx.capture_ssm_seq = false;
     defer if (self.ctx.ssm_entries) |entries| {
         for (entries) |*entry| trunk.ssmFreeSpecCapture(entry);
     };
+    const verified = xfm.forwardWith(&self.ctx, verify_input);
+    self.ctx.capture_ssm_seq = false;
+    var verify_logits = try verified;
+    errdefer _ = mlx.mlx_array_free(verify_logits);
+    _ = try self.thinkShiftRows(&verify_logits, verify_input);
     self.dflash_attempted += 1;
     if (tracing) {
         // Captures ride the same forward — eval them here or their cost

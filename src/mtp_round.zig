@@ -1374,6 +1374,11 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     // sequential recurrence AND a full trunk weight read, and at depth > 1
     // MOST rounds are partial, so it dominated the round cost).
     self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
+    // Only the finish frees the capture on the request's entries: a round that fails before it frees it here.
+    errdefer {
+        self.ctx.capture_ssm_seq = false;
+        if (self.ctx.ssm_entries) |entries| for (entries) |*entry| trunk.ssmFreeSpecCapture(entry);
+    }
     // DIAGNOSTIC (SUSHI_MTP_TRACE_SYNC=1): drain the GPU before the
     // verify build so the `sync` lap shows the pending lazy work (draft
     // chain, rollback, commit) and `verify` the forward alone.

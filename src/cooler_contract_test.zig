@@ -1913,14 +1913,16 @@ const Served = struct {
     /// One greedy request through the scheduler's slot path (submit, `runPrefill`, decode ticks, the finish that
     /// commits), its writes to the tier drained; the tokens it said, and whether it restored from SSD and how far.
     fn request(self: *Served, prompt: []const u32, n: u32, restored: *u32) !std.ArrayList(u32) {
-        return self.requestWith(prompt, n, .{ .temperature = 0.0 }, restored);
+        return self.requestWith(prompt, n, .{ .temperature = 0.0 }, false, restored);
     }
 
     /// `restored`: the prompt tokens an SSD restore gave; `reused` holds what any tier or the live state gave.
-    fn requestWith(self: *Served, prompt: []const u32, n: u32, sampling: @import("sampler.zig").SamplingParams, restored: *u32) !std.ArrayList(u32) {
+    /// `mtp`: with the model's MTP head, its rounds solo, as one speculative request decodes.
+    fn requestWith(self: *Served, prompt: []const u32, n: u32, sampling: @import("sampler.zig").SamplingParams, mtp: bool, restored: *u32) !std.ArrayList(u32) {
         const a = testing.allocator;
         const sch = &self.sch;
-        const slot = try sch.submit(.{ .model = self.entry, .prompt_ids = prompt, .sampling = sampling, .eos_token_ids = &.{}, .max_tokens = n });
+        const head = if (mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(self.entry.handle.?), true, null) else null;
+        const slot = try sch.submit(.{ .model = self.entry, .prompt_ids = prompt, .sampling = sampling, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
         defer {
             sch.complete(slot);
             for (sch.cleanup_queue.items) |s| s.deinit();
@@ -2076,7 +2078,7 @@ test "cooler contract: after a Cooler load's served warm, the release bench's fi
             const late = mlx.engine.latePipelines();
             mlx.engine.late_names.clear();
             var from: u32 = 0;
-            var got = try sv.requestWith(prompt, 64, .{ .temperature = 0, .top_p = 0.95, .top_k = 20 }, &from);
+            var got = try sv.requestWith(prompt, 64, .{ .temperature = 0, .top_p = 0.95, .top_k = 20 }, false, &from);
             got.deinit(a);
             errdefer std.debug.print("cooler contract: the bench's first request compiled:\n{s}", .{mlx.engine.late_names.text()});
             try testing.expectEqual(late, mlx.engine.latePipelines());
@@ -2923,6 +2925,73 @@ test "cooler contract: speculative rows failed at any checked MLX call site thei
                 const now = Sheet.now();
                 try testing.expectEqual(base.in_use, now.in_use);
                 try testing.expectEqual(@as(u64, 0), now.open);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a served speculative request refused at any pool buffer site its plain request lacks, at its first ask or its last, leaves the pool as it was and the next says its tokens" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            const depth_bounds = @import("mtp_depth_bounds.zig");
+            const saved = depth_bounds.active;
+            defer depth_bounds.active = saved;
+            depth_bounds.active = .{ .min = 3, .max = 3 };
+            var p: [40]u32 = undefined;
+            for (&p, 0..) |*t, i| t.* = ids[(i * 5 + 1) % ids.len];
+            var from: u32 = 0;
+            var want = try sv.requestWith(&p, 12, .{ .temperature = 0 }, true, &from);
+            defer want.deinit(a);
+            const Req = struct {
+                sv: *Served,
+                p: []const u32,
+                mtp: bool,
+                fn go(q: @This()) anyerror!void {
+                    var f: u32 = 0;
+                    var got = try q.sv.requestWith(q.p, 12, .{ .temperature = 0 }, q.mtp, &f);
+                    got.deinit(testing.allocator);
+                }
+            };
+            // A round's verify holds what its rollback needs on the request's own state, and its forward asks at
+            // the sites a prefill chunk does: eight frames tell the two apart, whose unwinding differs above it.
+            const sites = &mlx.engine.fault.sites;
+            defer sites.* = .{};
+            sites.* = .{ .frames = 8 };
+            const plain = try mlx.sweepSites(a, sites, Req{ .sv = &sv, .p = &p, .mtp = false }, Req.go);
+            defer a.free(plain);
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            for (plain) |pt| try seen.put(a, pt.site, {});
+            sites.* = .{ .lasts = true, .frames = 8 };
+            const all = try mlx.sweepSites(a, sites, Req{ .sv = &sv, .p = &p, .mtp = true }, Req.go);
+            defer a.free(all);
+            sv.quiet_failures = true;
+            const base = Sheet.now();
+            var msg: [300]u8 = undefined;
+            for (all, 0..) |pt, at| {
+                if (seen.contains(pt.site)) continue;
+                errdefer std.debug.print("cooler contract: a speculative request refused at pool point {d} of {d} (ask {d} of its site)\n", .{ at, all.len, pt.n });
+                mlx.engine.fault.armAt(pt);
+                const r = Req.go(.{ .sv = &sv, .p = &p, .mtp = true });
+                const fired = !mlx.engine.fault.armed();
+                mlx.engine.fault.disarm();
+                r catch {
+                    if (mlx.errorPending()) _ = mlx.takeError(&msg);
+                };
+                try testing.expect(fired or !pt.strict);
+                var got = try sv.requestWith(&p, 12, .{ .temperature = 0 }, true, &from);
+                defer got.deinit(a);
+                try testing.expectEqualSlices(u32, want.items, got.items);
+                const now = Sheet.now();
+                try testing.expectEqual(base.in_use, now.in_use);
+                try testing.expectEqual(@as(u32, 0), now.open);
             }
         }
     }.run);

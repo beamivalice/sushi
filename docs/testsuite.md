@@ -105,7 +105,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   the named fixtures, and a cell that ran on them passes: the way to check one cell on one fixture.
   A fault sweep refuses each pool-buffer or checked-call site once, at its first ask, and not again on another arm or
   fixture of the same arch (`firstAsks`); a sweep of one step (an image splice, an SSD restore, a rows tick) refuses only
-  the sites that step adds to a plain request's. A load sweep refuses each step of the load at its first and last
+  the sites that step adds to a plain request's. A speculative round's sweep tells sites apart over eight frames: at
+  the default four, a verify forward asks at a prefill chunk's sites, so the plain request's set takes them all. A load sweep refuses each step of the load at its first and last
   call, and each step of its warm at its first.
   Its no-late-kernel test proves its property only on a fresh pipeline cache (run it alone): the cache is the process's.
 - **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device

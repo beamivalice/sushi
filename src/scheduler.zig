@@ -630,6 +630,7 @@ pub const Slot = struct {
         if (self.ssm_entries) |entries| {
             if (self.model.handle) |h| arch_state.dropGroup(arch_handle.trunk(h), entries);
             for (entries) |*e| {
+                trunk.ssmFreeSpecCapture(e);
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
                 arch_prefix.aux.ssmFreeQsaState(e);
