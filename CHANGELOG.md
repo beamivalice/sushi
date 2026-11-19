@@ -10,6 +10,8 @@ earlier history is mlx-serve's, in that project's changelog.
   for memory (a host allocation, say) failed every request decoding at that moment, other models' included.
 - **A Qwen image encode on Sushi Cooler stays inside its memory bill**: its patch arrays were made before the encode's
   cap went in, so they could land on free buffers past the bill.
+- **Joined speculative requests with a logit bias or a think penalty no longer leak GPU memory when one request's
+  verify fails**: the later requests' verify outputs were left behind.
 - **A DeepSeek prompt refused for memory partway through its prefill is offered a narrower `--prefill-chunk` wherever
   one fits**: each width was priced with a full merged tail even where the prompt has fewer rows left, so a short
   prompt was offered none.

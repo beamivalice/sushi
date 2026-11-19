@@ -2590,6 +2590,10 @@ test "cooler contract: a served SSD restore refused at any pool buffer site its 
 
 /// Two served requests decoded as rows of one tick through the scheduler, as serve runs them.
 fn servedRows(sv: *Served, prompts: [2][]const u32, n: u32, mtp: bool, out: *[2]std.ArrayList(u32)) !void {
+    return servedRowsWith(sv, prompts, n, mtp, .{ .temperature = 0.0 }, out);
+}
+
+fn servedRowsWith(sv: *Served, prompts: [2][]const u32, n: u32, mtp: bool, sampling: @import("sampler.zig").SamplingParams, out: *[2]std.ArrayList(u32)) !void {
     const scheduler = @import("scheduler.zig");
     const a = testing.allocator;
     const sch = &sv.sch;
@@ -2602,7 +2606,7 @@ fn servedRows(sv: *Served, prompts: [2][]const u32, n: u32, mtp: bool, out: *[2]
     }
     for (0..2) |i| {
         const head = if (mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
-        slots[i] = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompts[i], .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
+        slots[i] = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompts[i], .sampling = sampling, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
         made += 1;
     }
     sch.pending.clearRetainingCapacity();
@@ -4421,6 +4425,80 @@ test "cooler contract: a served request, plain or speculative, solo or joined, s
                 }
             };
             try testing.expectEqual(@as(usize, 0), over);
+        }
+    }.run);
+}
+
+test "cooler contract: joined speculative rows under a logit bias, failed at any checked MLX call their unbiased rows lack, leave the next rows their tokens and the pool as it was" {
+    // A repeat, presence or frequency penalty keeps a row out of a joined round; a logit bias does not, and shifts each
+    // row's verify block after the joined forward made every row's.
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            const depth_bounds = @import("mtp_depth_bounds.zig");
+            const saved = depth_bounds.active;
+            defer depth_bounds.active = saved;
+            depth_bounds.active = .{ .min = 3, .max = 3 };
+            var p1: [37]u32 = undefined;
+            for (&p1, 0..) |*t, i| t.* = ids[(i * 3) % ids.len];
+            const prompts = [2][]const u32{ ids[0..@min(ids.len, 23)], &p1 };
+            const bias = [_]@import("logit_bias.zig").Bias{.{ .id = ids[1], .delta = -2 }};
+            const biased: @import("sampler.zig").SamplingParams = .{ .temperature = 0.0, .think_penalty = .{ .biases = &bias } };
+            var want: [2]std.ArrayList(u32) = undefined;
+            try servedRowsWith(&sv, prompts, 12, true, biased, &want);
+            defer for (&want) |*x| x.deinit(a);
+            const Rows = struct {
+                sv: *Served,
+                p: [2][]const u32,
+                sampling: @import("sampler.zig").SamplingParams,
+                fn go(q: @This()) anyerror!void {
+                    var o: [2]std.ArrayList(u32) = undefined;
+                    try servedRowsWith(q.sv, q.p, 12, true, q.sampling, &o);
+                    for (&o) |*x| x.deinit(testing.allocator);
+                }
+            };
+            const sites = &mlx.fault.sites;
+            defer sites.* = .{};
+            const plain = try mlx.sweepSites(a, sites, Rows{ .sv = &sv, .p = prompts, .sampling = .{ .temperature = 0.0 } }, Rows.go);
+            defer a.free(plain);
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            for (plain) |pt| try seen.put(a, pt.site, {});
+            sites.* = .{};
+            const all = try mlx.sweepSites(a, sites, Rows{ .sv = &sv, .p = prompts, .sampling = biased }, Rows.go);
+            defer a.free(all);
+            sv.quiet_failures = true;
+            const base = Sheet.now();
+            var swept: usize = 0;
+            for (all, 0..) |pt, at| {
+                if (seen.contains(pt.site)) continue;
+                errdefer std.debug.print("cooler contract: biased speculative rows failed at MLX point {d} of {d} (call {d} of its site)\n", .{ at, all.len, pt.n });
+                sites.armAt(pt);
+                var o: [2]std.ArrayList(u32) = undefined;
+                const r = servedRowsWith(&sv, prompts, 12, true, biased, &o);
+                swept += @intFromBool(sites.target == null);
+                mlx.fault.disarm();
+                if (r) |_| {
+                    for (&o) |*x| x.deinit(a);
+                } else |_| {}
+                try testing.expect(!mlx.errorPending());
+                var o2: [2]std.ArrayList(u32) = undefined;
+                try servedRowsWith(&sv, prompts, 12, true, biased, &o2);
+                for (&o2, 0..) |*x, i| {
+                    defer x.deinit(a);
+                    try testing.expectEqualSlices(u32, want[i].items, x.items);
+                }
+                const now = Sheet.now();
+                try testing.expectEqual(base.in_use, now.in_use);
+                try testing.expectEqual(@as(u64, 0), now.open);
+            }
+            try testing.expect(swept > 0);
         }
     }.run);
 }

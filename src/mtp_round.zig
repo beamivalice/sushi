@@ -1460,14 +1460,17 @@ pub fn mtpGroupVerify(gens: []const *Generator, states: []const *MtpRoundState) 
         if (st.tracing) tracing_any = true;
     }
     try xfm.forwardRowAxisVerify(rows[0..n], ctxs[0..n], out_logits[0..n], out_last[0..n], out_all[0..n], if (tracing_any) row_ns[0..n] else null, if (retain_rollback) rollback[0..n] else null);
-    var shifted_any = false;
-    for (gens[0..n], states[0..n], 0..) |gen, st, i| {
+    // Every row owns its outputs before any shift may fail, so the round's unwind frees them all.
+    for (states[0..n], 0..) |st, i| {
         if (retain_rollback) st.verify_rollback = rollback[i];
         st.verify_logits = out_logits[i];
         st.new_hidden = out_last[i];
         st.verify_hidden_all = out_all[i];
-        // Row 0 owns the joined block for the round when the lm_head ran once.
-        if (i == 0) st.group_logits = xfm.takeJoinedVerifyLogits();
+    }
+    // Row 0 owns the joined block for the round when the lm_head ran once.
+    states[0].group_logits = xfm.takeJoinedVerifyLogits();
+    var shifted_any = false;
+    for (gens[0..n], states[0..n], 0..) |gen, st, i| {
         if (try gen.thinkShiftRows(&st.verify_logits, st.verify_input)) shifted_any = true;
         if (try gen.penaltyShiftRows(&st.verify_logits, st.verify_input)) shifted_any = true;
         if (st.tracing) {

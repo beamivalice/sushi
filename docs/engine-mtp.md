@@ -87,7 +87,8 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   (`dsparkRowsForRoom`) and resumes by draining the commit (`dsparkResumeAfterForced`); DFlash2 still decodes the answer plain.
 - A verify's per-position SSM capture sits on the request's own entries and only the round's finish frees it: a round
   that fails before the finish frees it on its way out (`mtpRoundVerify`, `nextDflash`, the grouped `verify_ctx`), and
-  `Slot.deinit` frees it with every other entry field.
+  `Slot.deinit` frees it with every other entry field. A grouped verify hands every row its outputs before any row's
+  bias or penalty shift runs (`mtpGroupVerify`): a shift that fails on one row left the later rows' blocks unowned.
 - `commitForcedTokens` forwards a spec exit's pending token alone before the forced ids, as the pipelined state did, so
   the forced ids take one width whichever state the bound fired in; folded in, the width followed the round plan
   (measured round times) and a greedy answer behind the close changed bytes from run to run.
