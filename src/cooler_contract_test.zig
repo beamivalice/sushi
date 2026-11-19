@@ -3707,6 +3707,91 @@ test "cooler contract: a served Qwen turn whose partial share fits once an idle 
     }.run);
 }
 
+test "cooler contract: a streamed Qwen Cooler load decodes one row per forward, so a restore while two requests decode patches no live group and the engine refuses nothing" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const route = @import("tensor/route.zig");
+            const scheduler = Served.scheduler;
+            var ld: Load = undefined;
+            try ld.prepare(Q, dir, true);
+            {
+                errdefer ld.config.deinit(a);
+                // The smallest budget the pack plans: its experts read from the SSD, as `--ssd-budget-gb` loads it.
+                var budget: u64 = 1 << 30;
+                const plan = while (budget <= 64 << 30) : (budget += 1 << 30) {
+                    break model_load.planExpertStreamingWith(io, a, &ld.config, dir, budget, false, 0) catch continue;
+                } else return error.TestUnexpectedResult;
+                model_load.applyStreamingPlan(&ld.config, plan, budget);
+                if (ld.config.expert_source_dir == null) ld.config.expert_source_dir = try a.dupe(u8, dir);
+                try testing.expect(ld.config.expert_streaming and !ld.config.expert_resident);
+            }
+            try ld.loadServed(dir);
+            defer _ = ld.close();
+            try testing.expect(ld.onEngine());
+            // The gate: one row per forward, so no tick joins two requests and no group goes live.
+            try testing.expectEqual(@as(?usize, 1), arch_sched.rowCap(&ld.config));
+            try testing.expect(!arch_sched.modelBatches(ld.xfm));
+            const group = &ld.xfm.arch_state.qwen4.ssm_group;
+            var sv: Served = undefined;
+            try sv.initTiers(&ld, dir, 1 << 30);
+            defer sv.deinit();
+            sv.sch.queue_cap = 3;
+            const refused0 = route.refusals;
+            var f: u32 = 0;
+            var first = try heldPrompt(a, ids, 1500, 0);
+            defer first.deinit(a);
+            var reply = try sv.request(first.items, 8, &f);
+            defer reply.deinit(a);
+            const sch = &sv.sch;
+            var slots: [3]*scheduler.Slot = undefined;
+            var made: usize = 0;
+            defer {
+                for (slots[0..made]) |slot| sch.complete(slot);
+                for (sch.cleanup_queue.items) |s| s.deinit();
+                sch.cleanup_queue.clearRetainingCapacity();
+            }
+            var other: [2]std.ArrayList(u32) = undefined;
+            for (&other, 0..) |*p, i| p.* = try heldPrompt(a, ids, 300, 3 + i);
+            defer for (&other) |*p| p.deinit(a);
+            // The third extends the first conversation: it restores a checkpoint while the other two decode.
+            var next: std.ArrayList(u32) = .empty;
+            defer next.deinit(a);
+            try next.appendSlice(a, first.items);
+            try next.appendSlice(a, reply.items);
+            try next.appendSlice(a, other[0].items[0..40]);
+            for ([_][]const u32{ other[0].items, other[1].items, next.items }) |p| {
+                const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = p, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = 8 });
+                slots[made] = slot;
+                made += 1;
+                _ = sch.pending.orderedRemove(0);
+                try scheduler.runPrefill(sch, slot);
+                if (!scheduler.postPrefillTerminal(sch, slot)) try sch.decoding.append(a, slot);
+                if (made == 2) try scheduler.runDecodeTick(sch, slots[0..2]);
+                try testing.expect(!group.live);
+            }
+            try testing.expect(slots[2].cached_tokens > 0);
+            while (true) {
+                var live: [3]*scheduler.Slot = undefined;
+                var k: usize = 0;
+                for (slots[0..made]) |slot| if (slot.joinsTick()) {
+                    live[k] = slot;
+                    k += 1;
+                };
+                if (k == 0) break;
+                try scheduler.runDecodeTick(sch, live[0..k]);
+                try testing.expect(!group.live);
+                scheduler.cullDecoding(sch);
+            }
+            for (slots[0..made]) |slot| if (slot.error_code) |e| {
+                std.debug.print("cooler contract: a served request failed ({s})\n", .{e});
+                return error.RequestFailed;
+            };
+            try testing.expectEqual(@as(u64, 0), route.refusals - refused0);
+        }
+    }.run);
+}
+
 /// A Qwen conversation of `n` tokens, its own: `seed` picks the ids.
 fn heldPrompt(a: std.mem.Allocator, ids: []const u32, n: usize, seed: usize) !std.ArrayList(u32) {
     var p: std.ArrayList(u32) = .empty;

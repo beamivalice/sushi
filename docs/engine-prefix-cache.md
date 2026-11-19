@@ -893,6 +893,8 @@ process start whatever turns `--metrics` on.
 - **The cache's array work runs on its arrays' stream** (`arraysStream`: the engine's on Sushi Cooler): a checkpoint
   trim, an inheritance or a shed that moves the QSA history on MLX's stream inside an engine forward is refused, and
   the request or the commit fails with it.
+- **A restore never patches a live SSM group row**: `prefillSteps` releases the slot from the group before its lookup,
+  and a streamed Qwen load on Sushi Cooler carries one row per forward, so no group is live there at all.
 - **A checkout is a PROMISE until the append DONATES** (`donateCheckout` right before `Generator.initWithOptions`,
   below every refusal; `releaseCheckout` hands an undonated entry back intact). The donation also frees the record's
   MTP and DFlash history: the slot restored its own, and nothing reads a checked-out record.

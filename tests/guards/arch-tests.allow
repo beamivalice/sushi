@@ -79,6 +79,7 @@ cooler contract: a held Qwen restore point whose write fails as it gives way to 
 cooler contract: a regenerated Qwen turn restores from its own prompt end, live and after a flush
 cooler contract: a rewind past a Qwen conversation's held restore points restores from the grid point, the same tokens every time
 cooler contract: a served Qwen conversation keeps its newest off-grid restore points in RAM, writes none while the next turn extends them, and a flush writes the held ones
+cooler contract: a streamed Qwen Cooler load decodes one row per forward, so a restore while two requests decode patches no live group and the engine refuses nothing
 cooler contract: a served Qwen turn that leaves the last turn's text between two restore points inherits the one below the cut, the engine refusing nothing
 cooler contract: a served Qwen turn that shares part of the last turn's RAM entry, and fits only by taking it over, takes it and says the shared restore's tokens, the engine refusing nothing (#109)
 cooler contract: a served Qwen turn whose partial share fits once an idle entry is evicted is served as a share, and the entry it restores from stays whole (#109)
