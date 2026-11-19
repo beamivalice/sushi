@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 157 vars. By kind: tradeoff levers 14, diagnostics 59, microbenches 19, test-only seams 55, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 158 vars. By kind: tradeoff levers 14, diagnostics 60, microbenches 19, test-only seams 55, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (64)
+## Diagnostics (65)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -36,7 +36,8 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `QWEN4_DUMP_QSA_BLOCKS` | `qwen4_qsa.zig:627` | `<path>` dumps the selected QSA block indices | once | no |
 | `QWEN4_FIXTURE_ROWS` | `qwen4_fixture_test.zig` | prints per-row cos/margin in the Qwen4 fixture test | test | no |
 | `SUSHI_TEST_NO_GPU` | `mlx.zig` (`testNoGpuEnv`) | a test build sees no Metal backend, so `requireGpu` tests skip | test | yes: testsuite |
-| `SUSHI_TEST_TIMES` | `scripts/test_runner.zig` (`main`) | `<abs path>`: every test appends `<ms>\t<test name>` there, its at-rest check included; prints nothing; a relative path panics | test | yes: testsuite |
+| `SUSHI_TEST_LOG` | `scripts/test_runner.zig` (`main`) | `<abs path>` (`-Dtest-log` sets it): every test appends `<UTC>\t<step>\t<PASS\|SKIP\|FAIL>\t<ms>\t<name>`, its at-rest check included, and each process a `DONE` line with its totals; prints nothing; a relative path panics | test | yes: testsuite |
+| `SUSHI_TEST_STEP` | `scripts/test_runner.zig` (`main`) | the step name the log lines carry (`-Dtest-log` sets it to the run step's binary); `SUSHI_TEST_LOG` without it panics | test | yes: testsuite |
 | `QWEN4_GDN_CHECK` | `qwen4_gdn.zig:2703, 2849` | runs the composed GDN prework beside the fused kernel and compares | once | no |
 | `QWEN4_NO_POOLED` | `qwen4_qsa.zig:1242` | forces `QsaPooledRequired` to exercise the pooled-key fallback | once | no |
 | `QWEN4_OPCOUNT` | `qwen4_forward.zig:2940` | FFI op counts per block of the Qwen4 forward | once | no |
@@ -159,6 +160,11 @@ Kept because the launch flag cannot express what the env does.
 ## Reads to fix
 
 - *Stale scripts*: benches that export `SUSHI_ROUND_COST_PERSIST=0` set the default (persistence is opt-in); `SUSHI_QSA_NAX_PRECISION` is script-side only.
+
+## Removed 2026-11-19
+
+- `SUSHI_TEST_TIMES`: the runner's `<ms>\t<test name>` per test, replaced by `-Dtest-log` (`SUSHI_TEST_LOG`,
+  `SUSHI_TEST_STEP`), whose lines also carry the time, the step and the status.
 
 ## Removed 2026-11-18
 

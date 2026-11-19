@@ -74,8 +74,16 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - **Tests run under sushi's runner** (`scripts/test_runner.zig`, std's with one check): after each test it asks
   `sushi_after_each` (`src/test_rest.zig`), which fails that test by name when it left a hold, a turn, a model's budget
   slot, a forward scope, a seal, an armed fault, an opt-out or a latched MLX error, then puts the engine back at rest.
-  `SUSHI_TEST_TIMES=<abs path>` makes it append `<ms>\t<test name>` per test to that file, from every binary of the run
-  (each line under the file's lock), and print nothing: the way to find the slow tests (`sort -rn <file> | head`).
+  `zig build test -Dtest-log=<abs path>` gives every test run step `SUSHI_TEST_LOG` and its name as `SUSHI_TEST_STEP`
+  (the second tier run: `test-kv_disk_cache (SUSHI_PREFIX_FS=real)`); each runner appends, under the file's lock,
+  `<UTC>\t<step>\t<PASS|SKIP|FAIL>\t<ms>\t<test name>` per test and `<UTC>\t<step>\tDONE\t<ms>\t<p> pass, <s> skip,
+  <f> fail` when its process ends, and prints nothing. A leak or a logged error is a FAIL, as the build runner counts
+  it; a crashed test has no line (the build runner's error names it) and the restarted process ends on a DONE of its own.
+  The slow tests: `sort -t$'\t' -k4,4rn <file> | head`.
+- Every test compile declares its measured peak RSS (`max_rss`, `bucket_compile_gib` in build.zig), so `zig build test
+  --maxrss <bytes>` runs only the compiles that fit at once; run steps declare none, since RSS does not see Metal.
+  Without `--maxrss` the budget is the machine's RAM (`hw.memsize`); a box under the largest bound, test-rest's
+  13 GiB, refuses the build by name.
 - **The Sushi Cooler contract** (`src/cooler_contract_test.zig`, tests `cooler contract:`) runs on the tiny fixtures of
   every arch that declares `cooler_contract`: the side, every weight in an owned region, a request and the model's
   teardown asking MLX nothing, an exact speculative request saying its greedy tokens, fault sweeps over the load and a
@@ -284,13 +292,18 @@ A full-suite run compares its test total (`Build Summary` plus `test-host`) with
 unexplained drop means tests were not built, and blocks the push.
 
 **The local gate.** Every check a local run can prove runs locally, once, on the exact commit a release cuts:
-`tests/gate.sh [<ref>]` (default `origin/main`; fetch first) makes a clean worktree of it (no untracked file can mask a
-missing one) and runs, under `taskpolicy -a`, `zig build lint`, `tests/hermetic_guards.sh`, `zig build ubench` and
-`zig build test -Doptimize=ReleaseFast --summary all` with the tiny-fixture envs of `tests/lib/fixture_envs.sh`.
+`tests/gate.sh [--test-budget-gib N] [<ref>]` (default `origin/main`; fetch first) refuses while the GPU lock is held,
+makes a clean worktree of the commit (no untracked file can mask a missing one) and runs, under `taskpolicy -a`,
+`zig build lint`, `zig build ubench` and `zig build test -Doptimize=ReleaseFast --summary all` with the tiny-fixture
+envs of `tests/lib/fixture_envs.sh`, `-Dtest-log` and `--maxrss` of the test budget, with `tests/hermetic_guards.sh`
+running beside the test step. The budget is 72 GiB on a box of 96 GiB or more (M5 Max), 20 GiB on 32 GiB or more
+(M1 Max); a smaller box refuses until `--test-budget-gib` names one. Each test's log line shows as it lands; at the end
+`tests/lib/test_log.py` prints the per-step table (tests, pass, skip, fail, wall), the 10 slowest tests and, last,
+every failed test with the error block the build runner printed for it.
 Its zig builds share a persistent local cache, `~/.sushi/runs/gate/zig-cache` (`--cache-dir`), so a fresh worktree is
 not a cold build; remove it after a toolchain or SDK change, as a checkout's `.zig-cache`.
 Green writes `~/.sushi/runs/gate/<sha>.json` (sha, time, Zig version, the Build Summary counts, each step's minutes,
-per-test times when the runner has `SUSHI_TEST_TIMES`); a failed step names itself and writes none.
+every test's ms, step and status from the log, `<sha>.logs/tests.tsv`); a failed step names itself and writes none.
 `./release.sh` dispatches only with a record for origin's main head and passes its sha; `release.yml` starts only
 from a dispatch and refuses a release run that builds any other commit (a `dry_run` packaging check needs none). The runner keeps only what a clean checkout alone proves: the build from the pins,
 the shipped binary's smoke test and staged-mlx check, `test_no_local_paths.sh`, signing and packaging.

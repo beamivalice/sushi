@@ -158,6 +158,8 @@ pub fn build(b: *std.Build) void {
         "qwen-preprocess-fixture",
         "CPU reference fixture for the gated Qwen preprocessing parity test",
     );
+    const test_log = b.option([]const u8, "test-log", "Append a line per test (UTC, step, PASS/SKIP/FAIL, ms, name) and each step's DONE totals to this absolute path");
+    if (test_log) |path| if (!std.fs.path.isAbsolute(path)) std.debug.panic("-Dtest-log={s} is not an absolute path", .{path});
     const test_build = b.step("test-build", "Compile unit tests without running them");
     const test_step = b.step("test", "Run unit tests");
     // The host root links no MLX: a file in it that reaches MLX fails the link, so this tier can run beside a live server.
@@ -185,10 +187,11 @@ pub fn build(b: *std.Build) void {
     const host_filters = if (test_filter) |user| hostUserFilters(b, user) else hostFilters(b);
     const count_guard = addCountGuard(b, target);
     if (host_filters.len > 0) {
-        const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = host_filters, .test_runner = testRunner(b) });
+        const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = host_filters, .test_runner = testRunner(b), .max_rss = 4 * gib });
         test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_host_tests = b.addRunArtifact(host_tests);
         runEveryTime(run_host_tests);
+        logTo(run_host_tests, test_log, host_tests.name);
         test_host_step.dependOn(&run_host_tests.step);
         test_step.dependOn(&run_host_tests.step);
         if (test_filter == null) {
@@ -205,6 +208,7 @@ pub fn build(b: *std.Build) void {
         test_build.dependOn(&b.addInstallArtifact(unit_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_unit_tests = b.addRunArtifact(unit_test);
         runEveryTime(run_unit_tests);
+        logTo(run_unit_tests, test_log, unit_test.name);
         if (qwen_preprocess_fixture) |fixture| {
             run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
             run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
@@ -217,6 +221,7 @@ pub fn build(b: *std.Build) void {
         if (test_filter == null and std.mem.eql(u8, unit_test.name, "test-" ++ tier_bucket[0])) {
             const on_files = b.addRunArtifact(unit_test);
             runEveryTime(on_files);
+            logTo(on_files, test_log, "test-" ++ tier_bucket[0] ++ " (SUSHI_PREFIX_FS=real)");
             on_files.setName("run test-" ++ tier_bucket[0] ++ " (SUSHI_PREFIX_FS=real)");
             on_files.setEnvironmentVariable("SUSHI_PREFIX_FS", "real");
             test_step.dependOn(&on_files.step);
@@ -233,12 +238,14 @@ pub fn build(b: *std.Build) void {
         test_build.dependOn(&b.addInstallArtifact(exl3_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_exl3 = b.addRunArtifact(exl3_test);
         runEveryTime(run_exl3);
+        logTo(run_exl3, test_log, exl3_test.name);
         test_step.dependOn(&run_exl3.step);
         test_step.dependOn(countGuard(b, count_guard, exl3_test));
     }
 
     const encoder_tests = b.addTest(.{
         .test_runner = testRunner(b),
+        .max_rss = 5 * gib,
         .name = "encoder-test",
         .root_module = encoder_mod,
         .filters = test_filter orelse &.{},
@@ -247,6 +254,7 @@ pub fn build(b: *std.Build) void {
         test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_encoder = b.addRunArtifact(encoder_tests);
         runEveryTime(run_encoder);
+        logTo(run_encoder, test_log, encoder_tests.name);
         test_step.dependOn(&run_encoder.step);
     }
 
@@ -426,6 +434,12 @@ const test_buckets = [_][]const []const u8{
     tier_bucket,
 };
 
+/// Each bucket's compile RSS bound, in `test_buckets` order and then test-rest: a cold ReleaseFast compile's MaxRSS,
+/// which `--summary all` floors to 10^9 bytes, so `N`G is held as (N + 1) * 10^9 rounded up to whole GiB. `--maxrss`
+/// (tests/gate.sh --test-budget-gib) then runs only the compiles that fit at once; run steps declare none (Metal).
+const bucket_compile_gib = [test_buckets.len + 1]u64{ 3, 6, 6, 4, 13 };
+const gib: u64 = 1 << 30;
+
 /// The SSD tier's tests, which run once on each file backend (`SUSHI_PREFIX_FS`).
 const tier_bucket: []const []const u8 = &.{ "kv_disk_cache", "kv_disk_fs", "prefix_cache", "disk_placement", "prefix_cache_admin", "prefix_vfs_tensors_test", "qwen4_disk_qsa", "qwen4_prefix_cache_test", "glm5_prefix_cache_test", "dsv41_prefix_cache_test" };
 
@@ -579,7 +593,7 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
         }
         if (filters.items.len == 0) continue;
         const name = if (i < test_buckets.len) b.fmt("test-{s}", .{test_buckets[i][0]}) else "test-rest";
-        out.append(b.allocator, b.addTest(.{ .name = name, .root_module = root, .filters = filters.items, .test_runner = testRunner(b) })) catch @panic("OOM");
+        out.append(b.allocator, b.addTest(.{ .name = name, .root_module = root, .filters = filters.items, .test_runner = testRunner(b), .max_rss = bucket_compile_gib[i] * gib })) catch @panic("OOM");
     }
     return out.items;
 }
@@ -823,7 +837,7 @@ fn addExl3TestBins(b: *std.Build, root: *std.Build.Module, user: ?[]const []cons
         var filters: std.ArrayList([]const u8) = .empty;
         for (tests.items) |t| if (t.bin == i) filters.append(b.allocator, t.filter) catch @panic("OOM");
         if (filters.items.len == 0) continue;
-        out.append(b.allocator, b.addTest(.{ .name = b.fmt("exl3-test-{d}", .{i + 1}), .root_module = root, .filters = filters.items, .test_runner = testRunner(b) })) catch @panic("OOM");
+        out.append(b.allocator, b.addTest(.{ .name = b.fmt("exl3-test-{d}", .{i + 1}), .root_module = root, .filters = filters.items, .test_runner = testRunner(b), .max_rss = 3 * gib })) catch @panic("OOM");
     }
     return out.items;
 }
@@ -924,6 +938,12 @@ fn addCountGuard(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Ste
 /// cache key sees: the run always executes, so a pass made without a fixture never stands for a run with it.
 fn runEveryTime(run: *std.Build.Step.Run) void {
     run.has_side_effects = true;
+}
+
+/// `-Dtest-log`: the run's runner appends its per-test lines to `path` under `step` (scripts/test_runner.zig).
+fn logTo(run: *std.Build.Step.Run, path: ?[]const u8, step: []const u8) void {
+    run.setEnvironmentVariable("SUSHI_TEST_LOG", path orelse return);
+    run.setEnvironmentVariable("SUSHI_TEST_STEP", step);
 }
 
 fn countGuard(b: *std.Build, guard: *std.Build.Step.Compile, unit_test: *std.Build.Step.Compile) *std.Build.Step {

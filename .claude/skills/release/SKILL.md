@@ -23,7 +23,7 @@ Order (owner, 2026-10-31):
 
 | # | Step | Command | Pass |
 |---|---|---|---|
-| 1 | **Local gate** + binary | `git fetch && tests/gate.sh` (origin/main: lint, hermetic guards, ubench, the full suite with the tiny-fixture envs, in a clean worktree); `zig build -Doptimize=ReleaseFast`; `sushi --version` | `~/.sushi/runs/gate/<sha>.json` written; names `build.zig.zon`'s version |
+| 1 | **Local gate** + binary | `git fetch && tests/gate.sh` (origin/main, refused while the GPU lock is held: lint, ubench, the full suite with the tiny-fixture envs and the hermetic guards beside it, in a clean worktree); `zig build -Doptimize=ReleaseFast`; `sushi --version` | `~/.sushi/runs/gate/<sha>.json` written; names `build.zig.zon`'s version |
 | 2 | **Perf gate** | `tests/bench.sh --version <ver> [--tokens 512] <pack>` (below; `--tokens 512` for Qwen and GLM) on Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, Sushi-4bpw, GLM-5.3-Flash-Sushi-2.4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
 | 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on Qwen Sushi-STQ-2.75bpw and the DeepSeek STQ pack | within ~1% of its row in `docs/quality-kld.md` |
 | 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh` on the `qwen4`, `glm5` and `dsv41` passes, plus the live test of each area the release changed (step 2's bench covers the rest) | all pass |

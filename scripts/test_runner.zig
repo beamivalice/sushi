@@ -1,7 +1,7 @@
 //! Sushi's test runner: Zig 0.17.1's default runner (`lib/compiler/test_runner.zig`, MIT), unchanged but for `runTest`,
 //! which asks after every test whether the engine is at rest (`sushi_after_each`, exported where the engine is built)
-//! and fails the test that left it otherwise, by name, before the next one starts, and records the test's time when
-//! `main` read `SUSHI_TEST_TIMES`.
+//! and fails the test that left it otherwise, by name, before the next one starts, and for the per-test log that
+//! `main` reads from `SUSHI_TEST_LOG` and `SUSHI_TEST_STEP` (`zig build test -Dtest-log=<path>`).
 const builtin = @import("builtin");
 
 const std = @import("std");
@@ -20,21 +20,74 @@ comptime {
 }
 extern fn sushi_after_each() callconv(.c) ?[*:0]const u8;
 
-/// `SUSHI_TEST_TIMES=<abs path>`: each test appends `<ms>\t<name>` there, its at-rest check included.
-var times_path: ?[]const u8 = null;
+/// The per-test log: after each test `<UTC>\t<step>\t<PASS|SKIP|FAIL>\t<ms>\t<name>`, and once a process has run a
+/// test, `<UTC>\t<step>\tDONE\t<ms>\t<p> pass, <s> skip, <f> fail` as it exits. A test's ms hold its at-rest check;
+/// DONE's are the process's own wall from its first test. Nothing goes to the test's own streams.
+const TestLog = struct {
+    path: []const u8,
+    step: []const u8,
+    counts: [3]u32 = @splat(0),
+    first: ?Io.Timestamp = null,
+
+    const Status = enum { PASS, SKIP, FAIL };
+
+    /// A test leaking or logging an error fails its step as a failed test does, so it is a FAIL here too.
+    fn status(passed: bool, skipped: bool, leaked: bool, logged_errors: bool) Status {
+        if (skipped and !leaked and !logged_errors) return .SKIP;
+        return if (passed and !leaked and !logged_errors) .PASS else .FAIL;
+    }
+
+    fn record(self: *TestLog, name: []const u8, s: Status, ms: i64) !void {
+        self.counts[@backingInt(s)] += 1;
+        try self.append("{t}\t{d}\t{s}", .{ s, ms, name });
+    }
+
+    fn done(self: *TestLog) !void {
+        const first = self.first orelse return;
+        const ms = first.untilNow(runner_threaded_io, .awake).toMilliseconds();
+        const c = self.counts;
+        try self.append("DONE\t{d}\t{d} pass, {d} skip, {d} fail", .{ ms, c[0], c[1], c[2] });
+    }
+
+    /// The binaries run as parallel processes, so a line is written under the file's exclusive lock at its current end.
+    fn append(self: *TestLog, comptime fmt: []const u8, args: anytype) !void {
+        var line_buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&line_buf);
+        writeUtc(&w, Io.Timestamp.now(runner_threaded_io, .real)) catch return error.TestNameTooLong;
+        w.print("\t{s}\t" ++ fmt ++ "\n", .{self.step} ++ args) catch return error.TestNameTooLong;
+        const file = try Io.Dir.createFileAbsolute(runner_threaded_io, self.path, .{ .truncate = false, .lock = .exclusive });
+        defer file.close(runner_threaded_io);
+        try file.writePositionalAll(runner_threaded_io, w.buffered(), try file.length(runner_threaded_io));
+    }
+};
+
+/// `2026-11-19T07:13:02.123Z`.
+fn writeUtc(w: *std.Io.Writer, t: Io.Timestamp) !void {
+    const ms: u64 = @intCast(@divTrunc(t.nanoseconds, std.time.ns_per_ms));
+    const secs: std.time.epoch.EpochSeconds = .{ .secs = ms / 1000 };
+    const year_day = secs.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day = secs.getDaySeconds();
+    try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        year_day.year,         month_day.month.numeric(), month_day.day_index + 1,
+        day.getHoursIntoDay(), day.getMinutesIntoHour(),  day.getSecondsIntoMinute(),
+        ms % 1000,
+    });
+}
+
+var test_log: ?TestLog = null;
+/// The milliseconds of the last `runTest`, its at-rest check included.
+var last_test_ms: i64 = 0;
 
 /// The test, then the engine put back at rest; a test that passed but left it otherwise fails, naming what it left.
-fn runTest(name: []const u8, func: *const fn () anyerror!void) anyerror!void {
+fn runTest(func: *const fn () anyerror!void) anyerror!void {
     const start: Io.Timestamp = .now(runner_threaded_io, .awake);
+    if (test_log) |*l| if (l.first == null) {
+        l.first = start;
+    };
     const result = func();
     const left = sushi_after_each();
-    if (times_path) |path| {
-        const ms = start.untilNow(runner_threaded_io, .awake).toMilliseconds();
-        appendTime(path, ms, name) catch |err| {
-            std.debug.print("SUSHI_TEST_TIMES={s}: {t}\n", .{ path, err });
-            return err;
-        };
-    }
+    last_test_ms = start.untilNow(runner_threaded_io, .awake).toMilliseconds();
     try result;
     if (left) |why| {
         std.debug.print("{s}\n", .{why});
@@ -42,13 +95,18 @@ fn runTest(name: []const u8, func: *const fn () anyerror!void) anyerror!void {
     }
 }
 
-/// The buckets run as parallel processes, so a line is written under the file's exclusive lock at its current end.
-fn appendTime(path: []const u8, ms: i64, name: []const u8) !void {
-    const file = try Io.Dir.createFileAbsolute(runner_threaded_io, path, .{ .truncate = false, .lock = .exclusive });
-    defer file.close(runner_threaded_io);
-    var line_buf: [4096]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{d}\t{s}\n", .{ ms, name }) catch return error.TestNameTooLong;
-    try file.writePositionalAll(runner_threaded_io, line, try file.length(runner_threaded_io));
+/// Logs a test that ended as `s`; a log that cannot be written fails the test, naming the file.
+fn logTest(name: []const u8, s: TestLog.Status) bool {
+    const l = &(test_log orelse return true);
+    l.record(name, s, last_test_ms) catch |err| {
+        std.debug.print("SUSHI_TEST_LOG={s}: {t}\n", .{ l.path, err });
+        return false;
+    };
+    return true;
+}
+
+fn logDone() void {
+    if (test_log) |*l| l.done() catch |err| std.debug.print("SUSHI_TEST_LOG={s}: {t}\n", .{ l.path, err });
 }
 
 pub const std_options: std.Options = .{
@@ -105,9 +163,11 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
     }
 
-    if (init.environ.getPosix("SUSHI_TEST_TIMES")) |path| {
-        if (!std.fs.path.isAbsolute(path)) panic("SUSHI_TEST_TIMES must be an absolute path, not {s}", .{path});
-        times_path = path;
+    if (init.environ.getPosix("SUSHI_TEST_LOG")) |path| {
+        if (!std.fs.path.isAbsolute(path)) panic("SUSHI_TEST_LOG must be an absolute path, not {s}", .{path});
+        const step = init.environ.getPosix("SUSHI_TEST_STEP") orelse
+            panic("SUSHI_TEST_LOG names no step: zig build test -Dtest-log=<path> sets SUSHI_TEST_STEP beside it", .{});
+        test_log = .{ .path = path, .step = step };
     }
 
     if (builtin.fuzz) {
@@ -136,6 +196,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
         const hdr = try server.receiveMessage();
         switch (hdr.tag) {
             .exit => {
+                logDone();
                 return std.process.exit(0);
             },
             .query_test_metadata => {
@@ -187,7 +248,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 try server.serveStringMessage(.test_started, &.{});
 
                 const TestResults = std.zig.Server.Message.TestResults;
-                const status: TestResults.Status = if (runTest(test_fn.name, test_fn.func)) |v| s: {
+                var status: TestResults.Status = if (runTest(test_fn.func)) |v| s: {
                     v;
                     break :s .pass;
                 } else |err| switch (err) {
@@ -201,6 +262,8 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 };
                 testing.io_instance.deinit();
                 const leak_count = testing.allocator_instance.deinit();
+                if (!logTest(test_fn.name, TestLog.status(status == .pass, status == .skip, leak_count != 0, log_err_count != 0)))
+                    status = .fail;
                 try server.serveTestResults(.{
                     .index = index,
                     .flags = .{
@@ -327,9 +390,14 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             .argv0 = .init(init.args),
             .environ = init.environ,
         });
+        var ran: TestLog.Status = .FAIL;
+        const errors_before = log_err_count;
         defer {
             testing.io_instance.deinit();
-            if (testing.allocator_instance.deinit() != 0) leaks += 1;
+            const leaked = testing.allocator_instance.deinit() != 0;
+            if (leaked) leaks += 1;
+            if (!logTest(test_fn.name, TestLog.status(ran == .PASS, ran == .SKIP, leaked, log_err_count != errors_before)))
+                fail_count += 1;
         }
         testing.log_level = .warn;
         testing.environ = init.environ;
@@ -339,12 +407,14 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             std.debug.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name });
         }
         is_fuzz_test = false;
-        if (runTest(test_fn.name, test_fn.func)) |_| {
+        if (runTest(test_fn.func)) |_| {
+            ran = .PASS;
             ok_count += 1;
             test_node.end();
             if (!have_tty) std.debug.print("OK\n", .{});
         } else |err| switch (err) {
             error.SkipZigTest => {
+                ran = .SKIP;
                 skip_count += 1;
                 if (have_tty) {
                     std.debug.print("{d}/{d} {s}...SKIP\n", .{ i + 1, test_fn_list.len, test_fn.name });
@@ -371,6 +441,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
         fuzz_count += @intFromBool(is_fuzz_test);
     }
     root_node.end();
+    logDone();
     if (ok_count == test_fn_list.len) {
         std.debug.print("All {d} tests passed.\n", .{ok_count});
     } else {
@@ -438,7 +509,7 @@ pub fn mainSimple() anyerror!void {
             stdout.writeStreamingAll(runner_threaded_io, test_fn.name) catch {};
             stdout.writeStreamingAll(runner_threaded_io, "... ") catch {};
         }
-        if (runTest(test_fn.name, test_fn.func)) |_| {
+        if (runTest(test_fn.func)) |_| {
             if (enable_write) stdout.writeStreamingAll(runner_threaded_io, "PASS\n") catch {};
         } else |err| {
             if (err != error.SkipZigTest) {
