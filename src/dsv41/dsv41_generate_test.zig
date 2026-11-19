@@ -3893,7 +3893,7 @@ const WidthProbe = struct {
         const m = dsv41_state.modelOf(xfm).?;
         const engine = xfm.expert_stream.?;
         const st = try dsv41_model.ensureState(m);
-        try @import("dsv41_borrow.zig").beforeForward(engine, &xfm.config, &m.cfg, ids.len, st.n + ids.len);
+        try @import("dsv41_borrow.zig").beforeForward(engine, &xfm.config, &m.cfg, ids.len, st.n + ids.len, 0);
         engine.beginForward();
         const out = if (plain) try dsv41_model.extendAhead(m, ids, .last, dsv41_model.SPAN, null, &.{}) else try dsv41_model.verify(m, ids);
         engine.finishForward(ids.len);

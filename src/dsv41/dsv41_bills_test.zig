@@ -451,14 +451,14 @@ test "DeepSeek: a streamed load the preflight and the fit admit on a 32 GB Mac l
             if (fits > 0) try t.expect(SlotPlanner.needAt(.{ .config = &config, .weights = weights }, fits << 30).? <= avail);
             continue;
         }
-        try t.expect(bills.widestChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, ceiling, avail, weights)) > 0);
+        try t.expect(bills.warmChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, ceiling, avail, weights)) > 0);
     }
 
     // The declared ceiling: every one the load's fit admits leaves the warm a chunk with memory to spare.
     var c: u64 = 18_000 * MiB;
     while (c < 24_000 * MiB) : (c += 50 * MiB) {
         if (!bills.expertStreamingConfigFits(&config, c, 0, weights)) continue;
-        try t.expect(bills.widestChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, c, 1 << 40, weights)) > 0);
+        try t.expect(bills.warmChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, c, 1 << 40, weights)) > 0);
     }
 
     // The RAM default's budget is bounded by a request at the default context beside it, which leaves the warm a chunk.
@@ -467,12 +467,16 @@ test "DeepSeek: a streamed load the preflight and the fit admit on a 32 GB Mac l
 
 /// A DeepSeek prompt of `seq` tokens on a machine with `avail` bytes free beside the load, as serve runs it: admission
 /// picks and bills its width, the per-chunk hook narrows the adaptive start, and before each forward the borrow covers
-/// its need from the headroom and the decoder pools. The forward the borrow cannot cover, if one is.
-fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, explicit: u32) ?struct { rows: u64, end: u64 } {
+/// its need from the headroom and the decoder pools. On a Cooler load the engine keeps `free_pct`% of the last forward's
+/// cap as free buffers at a chunk boundary (its free cap), trimmed to the next forward's cap as it begins, and starts
+/// with the decode pool parked as free buffers. The forward the borrow cannot cover, if one is, and by how much.
+fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, explicit: u32, max_tokens: u32, free_pct: u64) ?struct { rows: u64, end: u64, short: u64 } {
     const c = &config.dsv41.?;
+    const cooler = @import("../cooler_side.zig").onEngine(config);
     const bits = bills.defaultKvBits(config);
-    const max_tokens: u32 = 8192;
-    const available = bills.admissionAvailableFor(config, avail, 0, 0);
+    const pool = config.expertPoolBytes();
+    var free: u64 = if (cooler) pool else 0;
+    const available = bills.admissionAvailableFor(config, avail, 0, free);
     const billed = bills.chooseRequestPrefillChunk(config, seq, max_tokens, bits, available, 0, explicit, .{});
     if (bills.prefillNeededAtChunk(config, seq, max_tokens, bits, billed, .{}) > available) return null;
     const adaptive = explicit == 0;
@@ -484,35 +488,48 @@ fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, exp
     while (pos < loop_end) {
         const grown = c.stateFixedBytes(config.dsparkOn()) + pos * c.stateBytesPerToken();
         if (adaptive) {
-            const next = bills.adaptivePrefillWidth(config, bits, pos, bills.liveHeadroomFrom(config, avail, grown, 0, 0), cur, cap, &st);
+            const next = bills.adaptivePrefillWidth(config, bits, pos, bills.liveHeadroomFrom(config, avail, grown, 0, free), cur, cap, &st);
             if (next != 0 and next < cur) cur = next;
         }
         var end = @min(pos + cur, loop_end);
         if (end < loop_end and loop_end - end < prefill_plan.tailMergeMaxFor(cur, adaptive)) end = loop_end;
-        const cover = dsv41_bill.dsv41HeadroomFrom(avail, grown, 0, config) +| config.expert_borrow_bytes;
-        if (cover < c.forwardCapOn(true, end - pos, end)) return .{ .rows = end - pos, .end = end };
+        const need = c.forwardCapOn(cooler, end - pos, end);
+        const kept = @min(free, need);
+        const cover = dsv41_bill.borrowHeadroomFrom(avail, grown, kept, config) +| config.expert_borrow_bytes;
+        if (cover < need) return .{ .rows = end - pos, .end = end, .short = need - cover };
+        if (cooler) free = @max(pool, need * free_pct / 100);
         pos = end;
     }
     return null;
 }
 
-test "DeepSeek: on the 32 GB Mac's budget-18 ledger an admitted prompt is never refused by a forward's borrow, at the default width or --prefill-chunk 512" {
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
-    config.max_position_embeddings = 1_048_576;
-    config.pinned_context = 1_000_000;
-    config.cooler_for_test = true;
-    // dsv41-memory, the 32 GB Mac at --ssd-budget-gb 18: the decoder pools hold about 2.1 GB.
-    config.expert_borrow_bytes = 2_100_000_000;
+test "DeepSeek: an admitted prompt is never refused by a forward's borrow, at the default width or --prefill-chunk 512, whatever the decoder pools hold and the engine keeps free" {
     const MiB: u64 = 1 << 20;
-    for ([_]u64{ 4096, 4097, 4300, 5000, 6300, 8400, 20_000 }) |seq| {
-        var avail: u64 = 256 * MiB;
-        while (avail <= 8192 * MiB) : (avail += 16 * MiB) {
-            for ([_]u32{ 0, 512 }) |explicit| {
-                if (borrowRefusal(&config, seq, avail, explicit)) |r| {
-                    std.debug.print("a {d}-token prompt admitted with {d} MB free (--prefill-chunk {d}): the borrow refuses its {d}-row forward ending at {d}\n", .{ seq, avail / MiB, explicit, r.rows, r.end });
-                    return error.TestUnexpectedResult;
+    for ([_]bool{ true, false }) |cooler| {
+        var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+        config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+        config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+        config.max_position_embeddings = 1_048_576;
+        config.pinned_context = 1_000_000;
+        config.cooler_for_test = cooler;
+        // dsv41-memory, the 32 GB Mac at --ssd-budget-gb 18 holds about 2.1 GB of decoder pools; smaller budgets less.
+        for ([_]u64{ 300_000_000, 1_000_000_000, 2_100_000_000 }) |borrowable| {
+            config.expert_borrow_bytes = borrowable;
+            for ([_]u64{ 0, 50, 100 }) |free_pct| {
+                if (!cooler and free_pct > 0) continue;
+                for ([_]u32{ 16, 8192 }) |max_tokens| {
+                    for ([_]u64{ 4096, 4097, 4300, 4600, 5100, 6300, 8400, 20_000 }) |seq| {
+                        var avail: u64 = 256 * MiB;
+                        while (avail <= 8192 * MiB) : (avail += 16 * MiB) {
+                            for ([_]u32{ 0, 512 }) |explicit| {
+                                const r = borrowRefusal(&config, seq, avail, explicit, max_tokens, free_pct) orelse continue;
+                                std.debug.print("{s}, {d} MB of decoder pools, the engine keeping {d}% free: a {d}-token prompt (max_tokens {d}) admitted with {d} MB free at --prefill-chunk {d} has its {d}-row forward ending at {d} refused {d} MB short\n", .{
+                                    if (cooler) "Cooler" else "MLX", borrowable / 1_000_000, free_pct, seq, max_tokens, avail / MiB, explicit, r.rows, r.end, r.short / MiB,
+                                });
+                                return error.TestUnexpectedResult;
+                            }
+                        }
+                    }
                 }
             }
         }

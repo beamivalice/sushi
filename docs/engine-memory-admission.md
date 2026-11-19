@@ -91,14 +91,24 @@ bill function's output on the committed fixture configs of all served packs: a b
 - **One live headroom, one first width.** `bills.prefillHeadroomNow` (pure `liveHeadroomFrom`) is the live ceiling less
   the active and staged bytes and what the arch parks (`parkedBytes`: DeepSeek's decode pool and the engine's free
   buffers); the chunk-width hook, the widen re-check, the served warm, an image encode and DeepSeek's borrow read it,
-  and admission reads it plus the pool its bill holds (`admissionAvailableFor`). A DeepSeek chunk is priced as the
-  forward it becomes (`chunkTransientAt`: its width and the tail it may absorb, at the position it ends), as the borrow
-  prices it. Each once priced its own way, and a 4k DeepSeek prompt admitted at one width was refused by the borrow at
-  another. A cache that reserves runs its
-  first chunk at the width admission billed (`firstChunkWidth`): the reservation grows inside that chunk, out of the
-  hook's sight, and a cold start at the widest held up to ~2 GB past the bill. The hook widens from the next boundary.
-- **A streamed preflight proves the served warm**: `streamedLoadRequirementBytes` adds the warm's narrowest chunk with no
-  pool lent (`warmFloorChunkBytes`) and `LIVE_RESERVE_BYTES`, and the fit bills the larger of that chunk and a request
+  and admission reads it plus only the parked bytes its bill holds itself (`admissionAvailableFor`, the arch's
+  `billedParkedBytes`: DeepSeek's decode pool on MLX; none on Sushi Cooler, whose bill holds no pool term, so adding it
+  back admitted an explicit `--prefill-chunk 512` prompt its last merged 1,003-row forward was then refused). The borrow
+  on Cooler adds the engine's free buffers under the forward's cap (`borrowHeadroomFrom`), which the forward reuses. A
+  DeepSeek chunk is priced as the forward it becomes (`chunkTransientAt`: its width and the tail it may absorb, at the
+  position it ends), as the borrow prices it. Each once priced its own way, and a 4k DeepSeek prompt admitted at one
+  width was refused by the borrow at another. A cache that reserves (Qwen, MiMo) runs its first chunk at the width
+  admission billed (`firstChunkWidth`): the reservation grows inside that chunk, out of the hook's sight, and a cold
+  start at the widest held up to ~2 GB past the bill. DeepSeek and GLM grow row by row and keep the wide start, which
+  the hook checks at the first position. The hook widens at the earliest at the third chunk, after
+  `PREFILL_WIDEN_PROBES` (2) supporting probes.
+- **A load's preflight proves its served warm** (`warmNeedBytes`, read by the resident and the streamed requirement and
+  the cold-load gate): a resident Cooler load bills the larger of its warmup and that need beside its weights, as the
+  warm's live reserve otherwise eats the safety net (a Flash-Next 27.4 GB load admitted at its edge failed its warm).
+  `streamedLoadRequirementBytes` adds the warm's dearest forward at the
+  narrowest chunk with no pool lent (`warmFloorChunkBytes`, `warmChunkPeakBytes`: the warm's longest prompt walked as
+  its prefill runs it, its merged tail and checkpoint stride included; Qwen's 2,348-token warm at 512 rows ends in an
+  811-row forward at 1,536, dearer than the first chunk; the warm picks its width by the same function) and `LIVE_RESERVE_BYTES`, and the fit bills the larger of that chunk and a request
   under the ceiling; a refusal names the ssd budget that fits. Without it a 32 GB Mac read every weight, then failed
   `WarmChunkDoesNotFit`.
 - **Owner rule: under a declared `iogpu.wired_limit_mb`, if the free RAM is under the limit, the resident Sushi preflight uses the free RAM at that instant** (`sushiAvailable`: the lesser of the limit's floor, less `--wired-margin-gib` or the GPU floor and the resident buffers, and the free RAM `effectiveAvailableBytes` reads, the streamed preflight's reading; still under the working set). The `[preflight]` line names the bound in words. A refusal (`loadMemoryRefusalText`) is one text for the log, the 503 body (`error.message`, which the web UI and Sushibar show whole) and the Models page. It gives a headline, then the need, the bound in words and the shortfall, then that bound's actions, most effective first: for free RAM, quit apps or unload a model (the retry re-reads free RAM); for the GPU limit, the `iogpu.wired_limit_mb` value that holds the load beside what is loaded and the unplanned margin, as the full command Settings builds (`wireLimitsCommand`, the GPU limit and both user wire limits; not offered past RAM less 12 GB). After those come the `--ctx-size` or `--ssd-budget-gb` that fits and a smaller pack. `--skip-mem-preflight` comes last. The `--ssd-budget-gb` that fits is the load's own planner's (`streamedBudgetThatFits` searches the planner, which rounds the cache to whole slots and refuses a budget below its fixed terms and two slots), never a GiB-for-GiB shrink. The floor alone passed a load on a box whose RAM other apps held, which then failed its warm; free RAM above the floor still never raises it (a load whose every request would be refused, a 1-token context).

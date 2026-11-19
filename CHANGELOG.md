@@ -34,14 +34,17 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Concurrent requests on Sushi Cooler no longer fail with `PoolOverBudget` beside another request's prefill**:
   requests decoding together ran under the memory cap of the last prefill chunk, sized for that chunk alone; a
   decode of several requests now lifts it as a single request's step does (#106).
-- **A streamed load no longer reads every weight and then fails its warm-up**: an `--ssd-budget-gb` that left no room
-  for the first prefill chunk passed the memory check, loaded, then failed (`WarmChunkDoesNotFit`). The check now
-  counts that chunk and refuses such a budget before loading, naming one that fits.
+- **A load on Sushi Cooler no longer reads every weight and then fails its warm-up**: an `--ssd-budget-gb`, or for a
+  resident model the last gigabyte or so of free memory, that left no room for the warm-up's prefill passed the memory
+  check, loaded, then failed (`WarmChunkDoesNotFit`). The check now counts the warm-up's widest chunk as it runs and
+  refuses such a load before reading weights, naming the budget or the memory that fits.
 - **A long prompt no longer runs past the memory it was admitted with**: a cold prompt's first chunk started wider than
   admission billed, and DeepSeek's borrow priced memory its own way, so a 4k DeepSeek prompt on a 32 GB Mac was refused
-  mid-prefill (`PrefillDoesNotFit`) and a long Qwen or MiMo prompt could hold up to 2 GB more than admitted. The first
-  chunk now runs at the admitted width, and admission, the chunk width, the warm-up, image encodes and the borrow read
-  one headroom.
+  mid-prefill (`PrefillDoesNotFit`) and a long Qwen or MiMo prompt could hold up to 2 GB more than admitted. A Qwen or
+  MiMo prompt's first chunk now runs at the admitted width (DeepSeek and GLM keep the wide start, checked against the
+  memory free at the first position), and admission, the chunk width, the warm-up, image encodes and the borrow read
+  one headroom. On Sushi Cooler a DeepSeek prompt at an explicit `--prefill-chunk` is no longer admitted only to be
+  refused at its last chunk.
 - **A DeepSeek load that fails with Sushi Cooler turned off no longer shrinks memory reuse for every later model**: it
   left MLX's buffer pool and the engine's free buffers capped at its own small figure until the server restarted, and
   an unload gave back MLX's cap only. A failed load and an unload now give both back.

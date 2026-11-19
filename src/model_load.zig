@@ -65,6 +65,7 @@ pub const coarseHeadBytes = bills.coarseHeadBytes;
 const residentWeightBytes = bills.residentWeightBytes;
 pub const streamedLoadRequirementBytes = bills.streamedLoadRequirementBytes;
 pub const warmFloorChunkBytes = bills.warmFloorChunkBytes;
+pub const warmNeedBytes = bills.warmNeedBytes;
 const scheduler_mod = @import("scheduler.zig");
 const BudgetRevise = scheduler_mod.BudgetRevise;
 const LoadRequest = scheduler_mod.LoadRequest;

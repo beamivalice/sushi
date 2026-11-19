@@ -1578,12 +1578,14 @@ pub const Generator = struct {
                     else
                         prompt_ids.len;
                     ctx.ahead_ids = ids_i32[end..ahead_end];
+                    ctx.prefill_rest = prompt_ids.len - end;
                     // A narrower width can follow the hook's step-down at this boundary, never below the ladder's floor.
                     const floor: usize = if (adapt_chunked and options.chunk_width_hook != null) @min(cap_adapt, prefill_plan.PREFILL_CHUNK_FLOOR) else std.math.maxInt(usize);
                     ctx.ahead_min_rows = if (options.skip_unread_tails and end < loop_end) @min(ahead_end - end, floor) else 0;
                     ctx.holds_point = want_ssm_cp and cp_grid > 0 and (end + ssm_cp_offset) % cp_grid == 0;
                 }
                 defer ctx.ahead_ids = &.{};
+                defer ctx.prefill_rest = 0;
                 defer ctx.ahead_min_rows = 0;
                 defer ctx.holds_point = false;
                 const chunk_len: c_int = @intCast(end - pos);

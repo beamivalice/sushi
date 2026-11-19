@@ -3359,7 +3359,8 @@ pub fn towerFitFault(config: *const model_mod.ModelConfig, images: []const chat_
     const needed = bill.bytes;
     if (needed <= available) return null;
     const mb: u64 = 1024 * 1024;
-    return request_media.MediaFault.init(false, "encoding the media needs ~{d} MB of GPU memory (its largest block has {d} patches), ~{d} MB is available", .{ needed / mb, worst, available / mb });
+    // The need rounds up and what is free down: a refusal never reads as fitting.
+    return request_media.MediaFault.init(false, "encoding the media needs ~{d} MB of GPU memory (its largest block has {d} patches), ~{d} MB is available", .{ (needed + mb - 1) / mb, worst, available / mb });
 }
 
 fn towerFitFaultText(out: []u8, config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, rows: usize, available: u64) ?[]const u8 {

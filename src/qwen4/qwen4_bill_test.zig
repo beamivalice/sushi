@@ -2041,7 +2041,7 @@ test "a request refused by its bill names the bill, what is available and the la
     const msg = bills.memoryContextRefusalMessage(&buf, refusal);
     var want: [3][64]u8 = undefined;
     for ([_][]const u8{
-        try std.fmt.bufPrint(&want[0], "{d} MB", .{bill.needed / mb}),
+        try std.fmt.bufPrint(&want[0], "{d} MB", .{(bill.needed + mb - 1) / mb}),
         try std.fmt.bufPrint(&want[1], "{d} MB", .{room / mb}),
         try std.fmt.bufPrint(&want[2], "max_tokens {d}", .{fit}),
     }) |part| if (std.mem.indexOf(u8, msg, part) == null) {
@@ -2085,6 +2085,37 @@ test "a Cooler prefill row bills the down GEMM's two planes in flight once, besi
     try t.expectEqual(@max(@max(@max(r.gdn, r.attn), @max(r.moe, r.ple)), r.mtp) + r.trunk + r.inflight, r.peak());
 }
 
+/// Every forward of the served warm's longest prompt at `chunk`-row chunks fits `headroom`, walked as the prefill runs
+/// it: the pinned width, a merged tail and, with the checkpoint stride, its boundaries and the backoff.
+fn warmFits(config: *const model_mod.ModelConfig, bits: u64, chunk: u64, headroom: u64) !void {
+    const pp = @import("../prefill_plan.zig");
+    const prefix_len: usize = @intCast(bills.warmLongestPrompt(config, chunk) - 1);
+    for ([_]usize{ 0, 256 }) |stride| {
+        const loop_end = if (stride > 0) prefix_len - pp.SSM_SNAPSHOT_BACKOFF else prefix_len;
+        var pos: usize = 0;
+        while (pos < loop_end) {
+            const end = pp.nextChunkEnd(pos, loop_end, @intCast(chunk), stride > 0, stride, 0, false);
+            const cost = bills.prefillChunkCost(config, bits, end - pos, pos);
+            errdefer std.debug.print("the warm at {d}-row chunks, stride {d}: its {d}-row forward at {d} costs {d} MB, the headroom is {d} MB\n", .{ chunk, stride, end - pos, pos, cost >> 20, headroom >> 20 });
+            try std.testing.expect(cost <= headroom);
+            pos = end;
+        }
+    }
+}
+
+test "Flash-Next: the served warm's widest forward is its longest prompt's merged last chunk, which the warm floor prices" {
+    var config = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/model-configs/qwen4_exp.json"));
+    defer config.deinit(std.testing.allocator);
+    @import("../cooler_side.zig").forTest(&config, true);
+    config.expert_streaming = true;
+    config.pinned_context = 65_536;
+    const bits = defaultKvBits(&config);
+    // 2,348 tokens at 512-row chunks: three chunks, then an 811-row one at 1,536 with the tail merged.
+    try std.testing.expectEqual(@as(u64, 2348), bills.warmLongestPrompt(&config, 512));
+    try std.testing.expect(bills.warmFloorChunkBytes(&config) >= bills.prefillChunkCost(&config, bits, 811, 1536));
+    try warmFits(&config, bits, 512, bills.warmFloorChunkBytes(&config));
+}
+
 test "Flash-Next: a streamed load the preflight and the fit admit leaves its served warm a prefill chunk" {
     const t = std.testing;
     var config = try model_mod.parseConfigFromJson(t.allocator, @embedFile("../fixtures/model-configs/qwen4_exp.json"));
@@ -2106,11 +2137,50 @@ test "Flash-Next: a streamed load the preflight and the fit admit leaves its ser
     var avail = need;
     while (avail < need + (2 << 30)) : (avail += 50 * MiB) {
         const headroom = bills.liveHeadroomFrom(&config, bills.liveCeilingFrom(ceiling, held, avail - held), held, 0, 0);
-        try t.expect(bills.widestChunkAdmitted(&config, bits, top, headroom) > 0);
+        const chunk = bills.warmChunkAdmitted(&config, bits, top, headroom);
+        try t.expect(chunk > 0);
+        try warmFits(&config, bits, chunk, headroom);
     }
     var c: u64 = 18_000 * MiB;
     while (c < 24_000 * MiB) : (c += 50 * MiB) {
         if (!bills.expertStreamingConfigFits(&config, c, 0, weights)) continue;
-        try t.expect(bills.widestChunkAdmitted(&config, bits, top, bills.liveHeadroomFrom(&config, c, held, 0, 0)) > 0);
+        const headroom = bills.liveHeadroomFrom(&config, c, held, 0, 0);
+        const chunk = bills.warmChunkAdmitted(&config, bits, top, headroom);
+        try t.expect(chunk > 0);
+        try warmFits(&config, bits, chunk, headroom);
     }
+}
+
+test "Flash-Next: a resident load the free-RAM preflight admits at its edge leaves its served warm a prefill chunk, MTP or not, under a declared floor or none" {
+    const t = std.testing;
+    var config = try model_mod.parseConfigFromJson(t.allocator, @embedFile("../fixtures/model-configs/qwen4_exp.json"));
+    defer config.deinit(t.allocator);
+    // An STQ pack: the format Sushi Cooler loads, whose load runs the served warm.
+    config.expert_layout = .exl3_k4;
+    config.expert_quant_codebook = .spec1;
+    @import("../cooler_side.zig").forTest(&config, true);
+    try t.expect(@import("../cooler_side.zig").onEngine(&config));
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const bits = defaultKvBits(&config);
+    const top = bills.widestServedRung(&config);
+    const weights: u64 = 27_400_000_000;
+    const working_set: u64 = 96 * GiB;
+    // A declared limit whose floor sits above what other apps leave free (the owner's free-RAM rule), and none.
+    for ([_]u64{ 0, 60 * GiB }) |floor| for ([_]bool{ false, true }) |mtp| {
+        const need = bills.loadRequirementBytes(&config, weights, mtp, 0);
+        var free = need;
+        while (free < need + 2 * GiB) : (free += 10 * MiB) {
+            const a = bills.sushiAvailable(free, 0, working_set, 0, floor);
+            if (bills.memInsufficientForLoad(weights, a.bytes, need)) continue;
+            // After the load the weights are active and the rest of the free RAM is what macOS can still give.
+            const reclaimable = free - weights;
+            const ceiling = bills.gpuCeilingWithWiredFloor(working_set, weights, reclaimable, floor);
+            const headroom = bills.liveHeadroomFrom(&config, bills.liveCeilingFrom(ceiling, weights, reclaimable), weights, 0, 0);
+            const chunk = bills.warmChunkAdmitted(&config, bits, top, headroom);
+            errdefer std.debug.print("floor {d} MB, MTP {}: admitted with {d} MB free for a {d} MB need; the warm's headroom is {d} MB and its dearest forward at the narrowest chunk needs {d} MB\n", .{ floor / MiB, mtp, free / MiB, need / MiB, headroom / MiB, bills.warmFloorChunkBytes(&config) / MiB });
+            try t.expect(chunk > 0);
+            try warmFits(&config, bits, chunk, headroom);
+        }
+    };
 }

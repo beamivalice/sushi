@@ -54,7 +54,9 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
     at it and the parked pool never passes what was billed. The decode cap is a standing term of the live headroom
     (`server.dsv41Headroom` takes it off ceiling less active, since the parked pool sits in MLX's cache, not its active
     bytes; on a Cooler load it is the engine's free buffers under the cap, taken off once, at the larger of the two);
-    a lower cap clears the pool. Admission (`prefillNeededAtChunk`) bills the decode cap beside every request;
+    a lower cap clears the pool. On MLX admission (`prefillNeededAtChunk`) bills the decode cap beside every request;
+    on Cooler the bill holds no pool term, so admission adds none back (`billedParkedBytes`), and the borrow counts the
+    engine's free buffers under a forward's cap as the forward's (`borrowHeadroomFrom`), since the forward reuses them;
     at load `expertStreamingServingBytes` leaves it out, the ledger's staging term already holds it.
   - Unloading a DeepSeek model gives the next model the process-wide cap `applyMlxCacheLimit` installed, MLX's and the
     engine's free cap both (`gpu_mem.restoreMlxPool`), forgets the raised cap and lifts the transient cap

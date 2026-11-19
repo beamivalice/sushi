@@ -3443,8 +3443,9 @@ test "cooler contract: a Cooler load under each KV precision and context extensi
     }.run);
 }
 
-/// The served width hook (`bills.adaptivePrefillWidth`) on a box whose free memory is what admission read, less what
-/// the request has taken from the engine's pool since. Records the width each boundary chose.
+/// The served width hook (`bills.adaptivePrefillWidth`) and its widen confirmation (`adaptivePrefillWidenStillFits`'s
+/// test) on a box whose free memory is what admission read, less what the request has taken from the engine's pool
+/// since. Records the width each boundary chose, and the widens it confirmed.
 const AdmittedBox = struct {
     cfg: *const @import("model.zig").ModelConfig,
     bits: u64,
@@ -3452,6 +3453,7 @@ const AdmittedBox = struct {
     in0: u64,
     widths: [64]u32 = @splat(0),
     n: usize = 0,
+    widened: u32 = 0,
 
     fn call(ctx: *anyopaque, pos: usize, cur: u32, cap: u32, st: *@import("mtp_plan.zig").AdaptiveWidthState) u32 {
         const box: *AdmittedBox = @ptrCast(@alignCast(ctx));
@@ -3461,8 +3463,13 @@ const AdmittedBox = struct {
         box.n += 1;
         return w;
     }
-    fn confirm(_: *anyopaque, _: usize, _: u32) bool {
-        return false;
+    fn confirm(ctx: *anyopaque, pos: usize, want: u32) bool {
+        const box: *AdmittedBox = @ptrCast(@alignCast(ctx));
+        const bills = @import("bills.zig");
+        const used = (mlx.engine.poolTotal() - mlx.engine.poolFree()) -| box.in0;
+        const fits = bills.prefillChunkHeldMax(box.cfg, box.bits, want, pos) <= box.avail -| used;
+        if (fits) box.widened += 1;
+        return fits;
     }
 };
 
@@ -3512,7 +3519,7 @@ test "cooler contract: a cold prompt admitted at its 512-row bill holds no more 
     _ = try gen.next(a);
     mlx.engine.close();
     const held = mlx.engine.poolHeldPeak(.process) -| held0;
-    errdefer std.debug.print("a cold {d}-token prompt admitted at its {d} MB bill (width {d}), the hook's widths {any}: {d} MB held at the peak\n", .{ len, bill >> 20, picked, box.widths[0..@min(box.n, box.widths.len)], held >> 20 });
+    errdefer std.debug.print("a cold {d}-token prompt admitted at its {d} MB bill (width {d}), the hook's widths {any}, {d} widens confirmed: {d} MB held at the peak\n", .{ len, bill >> 20, picked, box.widths[0..@min(box.n, box.widths.len)], box.widened, held >> 20 });
     try testing.expect(held <= bill);
 }
 
@@ -3584,7 +3591,8 @@ const LateUnwireHeadroom = struct {
         const need = @import("dsv41/dsv41_borrow.zig").forward_need;
         if (req == 0 and !borrowed and need > 0) {
             reads += 1;
-            if (reads <= 3) return need - 1;
+            // The borrow adds the engine's free buffers the forward reuses; the read is a byte short of the need with them.
+            if (reads <= 3) return (need - 1) -| @min(mlx.engine.poolFree(), need);
             borrowed = true;
         }
         return std.math.maxInt(u64) / 4;
@@ -3623,12 +3631,14 @@ test "cooler contract: the first served DeepSeek request after a Cooler load's w
                 try testing.expectEqual(@as(usize, 8), got.items.len);
                 grew[r] = mlx.engine.poolHeldPeak(.process) -| starts[r].pool;
             }
-            errdefer std.debug.print("first request: MLX cache {d} KB, grew {d} KB; second: MLX cache {d} KB, grew {d} KB, pool rest {d} KB\n", .{ starts[0].mlx_cache >> 10, grew[0] >> 10, starts[1].mlx_cache >> 10, grew[1] >> 10, starts[1].pool_free >> 10 });
+            // The rest a request start finds free in the pool, at either start.
+            const rest = @max(starts[0].pool_free, starts[1].pool_free);
+            errdefer std.debug.print("first request: MLX cache {d} KB, grew {d} KB, pool rest {d} KB; second: MLX cache {d} KB, grew {d} KB, pool rest {d} KB; borrowed {}\n", .{ starts[0].mlx_cache >> 10, grew[0] >> 10, starts[0].pool_free >> 10, starts[1].mlx_cache >> 10, grew[1] >> 10, starts[1].pool_free >> 10, LateUnwireHeadroom.borrowed });
             // The late-unwiring borrow ran in the first request, and the request was served.
             try testing.expect(LateUnwireHeadroom.borrowed);
             // A headroom read counts MLX's cache and the pool's free buffers as free: the first request starts as the second.
             try testing.expectEqual(starts[1].mlx_cache, starts[0].mlx_cache);
-            try testing.expect(@max(grew[0], grew[1]) - @min(grew[0], grew[1]) <= starts[1].pool_free);
+            try testing.expect(@max(grew[0], grew[1]) - @min(grew[0], grew[1]) <= rest);
         }
     }.run);
 }

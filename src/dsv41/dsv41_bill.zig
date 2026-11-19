@@ -120,6 +120,19 @@ pub fn dsv41HeadroomFrom(ceiling: u64, active: u64, engine_free: u64, config: *c
     return bills.liveHeadroomFrom(config, ceiling, active, 0, engine_free);
 }
 
+/// PURE: what the borrow compares a forward's need against (`dsv41_borrow.beforeForward`): the live headroom, and on a
+/// Cooler load the engine's free buffers `kept` under the forward's cap, which the forward reuses.
+pub fn borrowHeadroomFrom(ceiling: u64, active: u64, kept: u64, config: *const model_mod.ModelConfig) u64 {
+    const reuse = if (@import("../cooler_side.zig").onEngine(config)) kept else 0;
+    return dsv41HeadroomFrom(ceiling, active, kept, config) +| reuse;
+}
+
+/// The decode pool a request's bill holds itself (`requestBill`): MLX's parked pool; on a Cooler load none, the pool being
+/// the engine's free buffers, which the live headroom already leaves out.
+pub fn billedParkedBytes(config: *const model_mod.ModelConfig) u64 {
+    return if (@import("../cooler_side.zig").onEngine(config)) 0 else config.expertPoolBytes();
+}
+
 /// Off every live headroom of a DeepSeek forward (`bills.liveHeadroomFrom`): the decode pool the ledger parks, no part
 /// of the active bytes, and the engine's free pool buffers, which nothing on MLX's side can reclaim. On a Cooler load
 /// the parked pool IS the engine's free buffers under its cap: off once, at the larger of the two.

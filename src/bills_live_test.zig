@@ -406,3 +406,21 @@ test "the peak reading never sits under the active reading, right after a reset 
     gpu_mem.resetPeak();
     try testing.expect(gpu_mem.peakBytes() >= gpu_mem.activeBytes());
 }
+
+test "the width the scheduler runs a request at is the one its admission bill was taken at, the engine holding free buffers" {
+    const core = @import("tensor/core.zig");
+    _ = @import("metal.zig").device() catch return error.SkipZigTest;
+    var cfg = fixtures.qwen4DeployedTestConfig();
+    @import("cooler_side.zig").forTest(&cfg, true);
+    // Free buffers the engine keeps: the live headroom leaves them out, and so must the width the request runs at.
+    try core.sync();
+    const idle = try core.fresh(.uint8, &.{256 << 20});
+    core.release(idle);
+    try core.sync();
+    for ([_]usize{ 4096, 65_536, 262_144 }) |prompt| {
+        const bill = bills.prefillAdmissionBill(&cfg, prompt, 4096, trunk.KVQuantConfig.affine(8), false, null, .{});
+        const width = bills.requestPrefillChunkNow(&cfg, prompt, 4096, trunk.KVQuantConfig.affine(8), false, 0, 0, false, false);
+        try testing.expectEqual(bills.admissionAvailableNow(&cfg), bill.available);
+        try testing.expectEqual(bills.requestPrefillPick(&cfg, prompt, 4096, 8, bill.available, false, .{}), width);
+    }
+}

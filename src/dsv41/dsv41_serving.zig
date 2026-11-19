@@ -492,7 +492,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     var one: [1]u32 = undefined;
     const host: []const u32 = if (lazy) &one else (mlx.mlx_array_data_uint32(flat) orelse return error.InvalidDsv41Input)[0..n];
     if (self.expert_stream) |engine| {
-        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, n, st.n + n);
+        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, n, st.n + n, ctx.prefill_rest);
         engine.beginForward();
     }
     // The model splices the image rows itself: the span's embedding never leaves it.
@@ -593,7 +593,7 @@ pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.ml
     const st = try dsv41_model.ensureState(m);
     if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
     if (self.expert_stream) |engine| {
-        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len);
+        try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len, 0);
         engine.beginForward();
     }
     if (m.onEngine()) _ = dsv41_model.ownBegin(m);

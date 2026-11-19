@@ -329,7 +329,8 @@ pub fn releaseCount(pools: []const u64, need: u64, headroom: u64) ?usize {
 /// prefill-width forward releases decoder pools, latest first, until its need fits the live headroom, and is refused
 /// when all of them do not cover it. A decode forward reads released pools back while each fits beside its own
 /// working set.
-pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, rows: u64, seq: u64) !void {
+/// `rest`: the prompt tokens the prefill runs after this forward (`ForwardCtx.prefill_rest`), 0 past it.
+pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, rows: u64, seq: u64, rest: u64) !void {
     try engine.healReleased();
     _ = enterForward(rows, seq, config, c, mlx_ops);
     const headroom = headroom_fn orelse return;
@@ -337,9 +338,11 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
     if (rows <= verify_rows) return restore(engine, config, headroom, c.forwardCap(rows, seq));
     const need = prefillNeed(c, cooler_side.onEngine(config), rows, seq);
     forward_need = need;
-    if (headroom(config) >= need) return;
+    // On Sushi Cooler the forward reuses the engine's free buffers under its cap, which the live headroom leaves out.
+    const reuse: u64 = if (cooler_side.onEngine(config)) @min(mlx.engine.poolFree(), need) else 0;
+    if (headroom(config) +| reuse >= need) return;
     _ = mlx.mlx_clear_cache();
-    const before = headroom(config);
+    const before = headroom(config) +| reuse;
     const gpa = engine.allocator;
     const order = try gpa.alloc(u16, engine.layers.len - engine.borrow_from);
     defer gpa.free(order);
@@ -358,9 +361,9 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
     const count = releaseCount(pools[0..n], need +| engine.unionPending(), before) orelse {
         const have = (before +| sum(pools[0..n])) -| engine.unionPending();
         log.warn("[dsv41-borrow] a {d}-row forward at {d} needs {d:.2} GB; the headroom and every decoder pool hold {d:.2} GB\n", .{ rows, seq, gb(need), gb(have) });
-        return refuse(c, cooler_side.onEngine(config), rows, seq, need, have);
+        return refuse(c, cooler_side.onEngine(config), rows, seq, rest, need, have);
     };
-    var m: LiveBorrow = .{ .engine = engine, .order = order[0..n], .config = config, .read = headroom, .wired = status.getWiredMemBytes() };
+    var m: LiveBorrow = .{ .engine = engine, .order = order[0..n], .config = config, .read = headroom, .reuse = reuse, .wired = status.getWiredMemBytes() };
     const r = releaseUntil(&m, n, count, need) catch |e| {
         log.warn("[dsv41-borrow] a release for a {d}-row forward at {d} failed after {d:.2} GB: {s}\n", .{ rows, seq, gb(m.released), @errorName(e) });
         return e;
@@ -370,16 +373,19 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
             order[r.layers - 1], order[0], gb(m.released), rows, seq, gb(need), gb(before), gb(r.have), m.waited,
         });
     }
-    if (r.have < need) return refuse(c, cooler_side.onEngine(config), rows, seq, need, r.have);
+    if (r.have < need) return refuse(c, cooler_side.onEngine(config), rows, seq, rest, need, r.have);
 }
 
-/// The widest `--prefill-chunk` below the refused forward's whose forward ending at `seq` fits `have`, halving to 64; 0
-/// when none does. An explicit width's forward takes up to a whole merged tail beside it (`prefill_plan.TAIL_MERGE_MAX`).
-pub fn chunkThatFits(c: *const Config, engine: bool, rows: u64, seq: u64, have: u64) u64 {
+/// The widest `--prefill-chunk` below the refused forward's whose forwards fit `have` to the prompt's end, `rest` tokens
+/// past `seq`, beside the state those tokens grow; halving to 64, 0 when none does. An explicit width's forward takes up
+/// to a whole merged tail beside it (`prefill_plan.TAIL_MERGE_MAX`), and its cap grows with the position it ends at.
+pub fn chunkThatFits(c: *const Config, engine: bool, rows: u64, seq: u64, rest: u64, have: u64) u64 {
     const tail = @import("../prefill_plan.zig").TAIL_MERGE_MAX - 1;
     if (rows < 2) return 0;
+    const end = seq +| rest;
+    const growth = rest *| c.stateBytesPerToken();
     var w = std.math.floorPowerOfTwo(u64, rows / 2);
-    while (w >= 64) : (w /= 2) if (prefillNeed(c, engine, w + tail, seq) <= have) return w;
+    while (w >= 64) : (w /= 2) if (prefillNeed(c, engine, w + tail, end) +| growth <= have) return w;
     return 0;
 }
 
@@ -400,13 +406,17 @@ fn writeRefusal(w: *std.Io.Writer, rows: u64, seq: u64, need: u64, have: u64, ch
     });
     try w.print("To serve it:\n", .{});
     if (chunk_fits > 0) try w.print("- Lower --prefill-chunk to {d}: a narrower chunk needs less memory at this length.\n", .{chunk_fits});
-    try w.print("- Retry when other requests finish or other apps quit: the memory they hold comes back.\n", .{});
-    try w.print("- Shorten the prompt to {d} tokens or fewer: the chunks up to there fit.", .{seq -| rows});
+    try w.print("- Retry when other requests finish or other apps quit: the memory they hold comes back.", .{});
+    // A first chunk has no shorter prompt the chunks before it prove.
+    if (seq > rows) try w.print("\n- Shorten the prompt to {d} tokens or fewer: the chunks up to there fit.", .{seq - rows});
 }
 
-fn refuse(c: *const Config, engine: bool, rows: u64, seq: u64, need: u64, have: u64) error{PrefillChunkDoesNotFit} {
+fn refuse(c: *const Config, engine: bool, rows: u64, seq: u64, rest: u64, need: u64, have: u64) error{PrefillChunkDoesNotFit} {
     var buf: [1024]u8 = undefined;
-    @import("../forward_refusal.zig").record(refusalText(&buf, rows, seq, need, have, chunkThatFits(c, engine, rows, seq, have)));
+    const text = refusalText(&buf, rows, seq, need, have, chunkThatFits(c, engine, rows, seq, rest, have));
+    // The console carries the client's text whole, its actions with it.
+    log.err("{s}\n", .{text});
+    @import("../forward_refusal.zig").record(text);
     return error.PrefillChunkDoesNotFit;
 }
 
@@ -417,6 +427,8 @@ const LiveBorrow = struct {
     order: []const u16,
     config: *const ModelConfig,
     read: *const fn (*const ModelConfig) u64,
+    /// The engine's free buffers the forward reuses (`beforeForward`).
+    reuse: u64,
     wired: u64,
     released: u64 = 0,
     waited: u64 = 0,
@@ -430,7 +442,7 @@ const LiveBorrow = struct {
         self.waited += waitForUnwire(self.wired, self.released);
     }
     fn headroom(self: *LiveBorrow) u64 {
-        return self.read(self.config);
+        return self.read(self.config) +| self.reuse;
     }
 };
 
@@ -1260,9 +1272,9 @@ test "dsv41 borrow: a forward refused mid-prefill names its chunk, the shortfall
     // A 1024 chunk's forward may merge a 511-row tail: the width that fits is priced with it.
     const have = prefillNeed(&c, true, 1024 + 511, seq) + (1 << 20);
     try testing.expect(have < need);
-    try testing.expectEqual(@as(u64, 1024), chunkThatFits(&c, true, rows, seq, have));
-    try testing.expectEqual(@as(u64, 512), chunkThatFits(&c, true, rows, seq, prefillNeed(&c, true, 1024 + 511, seq) - 1));
-    try testing.expectEqual(@as(u64, 0), chunkThatFits(&c, true, rows, seq, 0));
+    try testing.expectEqual(@as(u64, 1024), chunkThatFits(&c, true, rows, seq, 0, have));
+    try testing.expectEqual(@as(u64, 512), chunkThatFits(&c, true, rows, seq, 0, prefillNeed(&c, true, 1024 + 511, seq) - 1));
+    try testing.expectEqual(@as(u64, 0), chunkThatFits(&c, true, rows, seq, 0, 0));
     var buf: [1024]u8 = undefined;
     const text = refusalText(&buf, rows, seq, 5 * gib, 4 * gib + gib / 2, 1024);
     for ([_][]const u8{
@@ -1277,4 +1289,30 @@ test "dsv41 borrow: a forward refused mid-prefill names its chunk, the shortfall
         try testing.expect(std.mem.indexOf(u8, text, part) != null);
     }
     try testing.expect(std.mem.indexOf(u8, refusalText(&buf, rows, seq, 5 * gib, 0, 0), "--prefill-chunk") == null);
+}
+
+test "dsv41 borrow: a first chunk refused mid-request names no shorter prompt (it would be 0 tokens)" {
+    const gib: u64 = 1 << 30;
+    var buf: [1024]u8 = undefined;
+    const text = refusalText(&buf, 2048, 2048, 5 * gib, 4 * gib, 1024);
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "Shorten the prompt") == null);
+    try testing.expect(std.mem.endsWith(u8, text, "the memory they hold comes back."));
+}
+
+test "dsv41 borrow: the --prefill-chunk a mid-prefill refusal names fits the prompt's later chunks, not only the one it refused" {
+    const c = try cfg_mod.parseText(cfg_mod.release_config);
+    const tail: u64 = @import("../prefill_plan.zig").TAIL_MERGE_MAX - 1;
+    const MiB: u64 = 1 << 20;
+    // A 32k-token prompt refused at its 2048-row chunk ending at 8192; what is free then holds a 1024 chunk there.
+    const rows: u64 = 2048;
+    const seq: u64 = 8192;
+    const prompt: u64 = 32768;
+    const have = prefillNeed(&c, true, 1024 + tail, seq) + MiB;
+    const w = chunkThatFits(&c, true, rows, seq, prompt - seq, have);
+    try testing.expect(w > 0);
+    // At --prefill-chunk w the same request's last forward ends at the prompt's end; the state between grows too.
+    const growth = (prompt - seq) * c.stateBytesPerToken();
+    errdefer std.debug.print("named --prefill-chunk {d}: its last forward at {d} needs {d} MB beside {d} MB of state growth, {d} MB free\n", .{ w, prompt, prefillNeed(&c, true, w + tail, prompt) / MiB, growth / MiB, have / MiB });
+    try testing.expect(prefillNeed(&c, true, w + tail, prompt) + growth <= have);
 }

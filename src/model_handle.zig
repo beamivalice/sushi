@@ -77,6 +77,9 @@ pub const ForwardCtx = struct {
     /// DeepSeek-V4.1 chunked prefill: the fewest rows the chunk after this one can have, 0 when none follows in the
     /// prefill loop. A model whose decoder tail nothing reads may leave state only (`dsv41_model.extendState`).
     ahead_min_rows: usize = 0,
+    /// DeepSeek-V4.1 chunked prefill: the prompt tokens the prefill runs after this chunk, which a refusal prices a
+    /// narrower width against. 0 for the last chunk and for decode.
+    prefill_rest: usize = 0,
     /// A restore point is taken at this chunk's end.
     holds_point: bool = false,
     /// Return the post-final-norm hidden instead of logits (caller frees

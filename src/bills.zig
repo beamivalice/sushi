@@ -1121,10 +1121,10 @@ fn fittingMaxTokens(config: *const model_mod.ModelConfig, prompt_len: usize, ask
 pub fn memoryContextRefusalMessage(buf: []u8, refusal: model_registry_mod.MemoryContextRefusal) []const u8 {
     const mb: u64 = 1 << 20;
     if (refusal.fitting_max_tokens > 0) return std.fmt.bufPrint(buf, "Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}: the request needs {d} MB and {d} MB is available. max_tokens {d} fits (asked {d}); maximum context: {d} tokens. Lower max_tokens, reduce context or free memory.", .{
-        refusal.requested, refusal.kv_bits, refusal.chunk, refusal.needed / mb, refusal.available / mb, refusal.fitting_max_tokens, refusal.asked_max_tokens, refusal.maximum,
+        refusal.requested, refusal.kv_bits, refusal.chunk, (refusal.needed + mb - 1) / mb, refusal.available / mb, refusal.fitting_max_tokens, refusal.asked_max_tokens, refusal.maximum,
     }) catch "The requested context does not fit in available GPU memory.";
     return std.fmt.bufPrint(buf, "Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}: the request needs {d} MB and {d} MB is available, and the prompt alone does not fit. Maximum context: {d} tokens. Reduce context or free memory.", .{
-        refusal.requested, refusal.kv_bits, refusal.chunk, refusal.needed / mb, refusal.available / mb, refusal.maximum,
+        refusal.requested, refusal.kv_bits, refusal.chunk, (refusal.needed + mb - 1) / mb, refusal.available / mb, refusal.maximum,
     }) catch "The requested context does not fit in available GPU memory.";
 }
 
@@ -2455,8 +2455,7 @@ pub fn requestPrefillChunkNow(
     const pin: u32 = config.pinned_prefill_chunk;
     const seq: u64 = @intCast(prompt_len);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
-    const active_mem: usize = gpu_mem.activeBytes();
-    const available: u64 = liveGpuMemoryCeiling(config, active_mem) -| active_mem;
+    const available = admissionAvailableNow(config);
     const warm = WarmPrefix{ .matched_tokens = warm_matched, .capacity_tokens = warm_capacity, .will_donate = warm_will_donate, .mtp_on = enable_mtp };
     const chosen = requestPrefillPick(config, seq, max_tokens, kv_bits, available, unchunked_prefill, warm);
     if (chosen != pin and !unchunked_prefill and perRequestPrefillChunkEnabled(config)) {
@@ -2513,10 +2512,42 @@ pub fn widestChunkAdmitted(config: *const model_mod.ModelConfig, kv_bits: u64, t
     return 0;
 }
 
-/// What a load's served warm needs free beside the load for the ladder's narrowest chunk, lending no decoder pool: the
-/// warm runs before the server installs the borrow (`widestChunkAdmitted`).
+/// The served warm's longest prompt at `chunk`-row chunks (`cooler_warm.warmServed`): past a sparse indexer's budget, and
+/// past one chunk.
+pub fn warmLongestPrompt(config: *const model_mod.ModelConfig, chunk: u64) u64 {
+    const past_budget: u64 = if (config.indexer_budget > 0) @as(u64, config.indexer_budget) + 300 else 0;
+    return @max(past_budget, chunk + 1);
+}
+
+/// The dearest forward of the served warm's longest prompt at `chunk`-row chunks, as its prefill runs it (the pinned
+/// width, a merged tail of up to `TAIL_MERGE_MAX`, with and without the checkpoint stride), lending no decoder pool: the
+/// warm runs before the server installs the borrow.
+pub fn warmChunkPeakBytes(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) u64 {
+    const prefix_len: usize = @intCast(warmLongestPrompt(config, chunk) - 1);
+    var peak: u64 = 0;
+    for ([_]usize{ 0, launch_state.ssm_checkpoint_stride }) |stride| {
+        const loop_end = if (stride > 0) prefix_len -| prefill_plan.SSM_SNAPSHOT_BACKOFF else prefix_len;
+        var pos: usize = 0;
+        while (pos < loop_end) {
+            const end = prefill_plan.nextChunkEnd(pos, loop_end, @intCast(chunk), stride > 0, stride, 0, false);
+            peak = @max(peak, chunkCostLending(config, kv_bits, end - pos, pos, 0));
+            pos = end;
+        }
+    }
+    return peak;
+}
+
+/// The widest rung up to `top` whose served warm fits `headroom` (`warmChunkPeakBytes`); 0 when none does.
+pub fn warmChunkAdmitted(config: *const model_mod.ModelConfig, kv_bits: u64, top: u64, headroom: u64) u32 {
+    for (PREFILL_CHUNK_LADDER) |w| {
+        if (w <= top and warmChunkPeakBytes(config, kv_bits, w) <= headroom) return w;
+    }
+    return 0;
+}
+
+/// What a load's served warm needs free beside the load at the ladder's narrowest chunk (`warmChunkAdmitted`).
 pub fn warmFloorChunkBytes(config: *const model_mod.ModelConfig) u64 {
-    return chunkCostLending(config, defaultKvBits(config), PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], 0, 0);
+    return warmChunkPeakBytes(config, defaultKvBits(config), PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
 }
 
 /// The decoder pools a prefill may still release for its working set (`ModelConfig.expert_borrow_bytes`); 0 where the arch lends none.
@@ -2593,15 +2624,24 @@ fn parkedBytes(config: *const model_mod.ModelConfig, engine_free: u64) u64 {
     return archHook("parkedBytes", u64, config, .{engine_free}) orelse 0;
 }
 
+/// What admission reads now (`admissionAvailableFor` over the live readings): the bill's width and the width the
+/// scheduler runs the request at (`requestPrefillChunkNow`) read this one number.
+pub fn admissionAvailableNow(config: *const model_mod.ModelConfig) u64 {
+    const active_mem: usize = gpu_mem.activeBytes();
+    return admissionAvailableFor(config, liveGpuMemoryCeiling(config, active_mem), active_mem, gpu_mem.engineFree());
+}
+
 /// PURE half of `prefillHeadroomNow`.
 pub fn liveHeadroomFrom(config: *const model_mod.ModelConfig, ceiling: u64, active: u64, staged_host: u64, engine_free: u64) u64 {
     return prefillHeadroomFrom(ceiling, active, staged_host) -| parkedBytes(config, engine_free);
 }
 
-/// What admission compares a request's bill against: the live headroom, plus the decode pool the bill holds itself
-/// (`prefillNeededAtChunk`), so admission and every live check read one number.
+/// What admission compares a request's bill against: the live headroom, plus the parked bytes the bill holds itself
+/// (an arch's `billedParkedBytes`: DeepSeek's decode pool on MLX, none on Cooler), so admission and every live check
+/// read one number.
 pub fn admissionAvailableFor(config: *const model_mod.ModelConfig, ceiling: u64, active: u64, engine_free: u64) u64 {
-    return admissionAvailable(ceiling, active) -| (parkedBytes(config, engine_free) -| config.expertPoolBytes());
+    const billed = archHook("billedParkedBytes", u64, config, .{}) orelse 0;
+    return admissionAvailable(ceiling, active) -| (parkedBytes(config, engine_free) -| billed);
 }
 
 /// The ceiling less what is in use and staged, before an arch's parked bytes (`liveHeadroomFrom`).
@@ -2675,9 +2715,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     // Available = the lesser of Metal's static working-set max and what is physically reachable
     // now (#64). Read before the width is chosen: on a per-request arch the width is a function of it.
-    const active_mem: usize = gpu_mem.activeBytes();
-    const total_limit: u64 = liveGpuMemoryCeiling(config, active_mem);
-    const available = admissionAvailableFor(config, total_limit, active_mem, gpu_mem.engineFree());
+    const available = admissionAvailableNow(config);
 
     // A vision prefill chunks like text since issue #197 (the splice resumes
     // its row index across chunks), so it bills the chunk-bounded envelope —
@@ -6564,30 +6602,37 @@ pub fn loadMemoryRefusalText(buf: []u8, r: LoadMemoryRefusal) []const u8 {
 
 fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!void {
     const a = r.avail;
-    const short = r.needed -| a.bytes;
+    // Each bound short of the need gets its action: freeing RAM past a GPU limit that is short too is refused again.
+    const ram_short = r.needed -| a.free;
+    const gpu_room = a.gpuAllows();
+    const gpu_short = if (gpu_room) |g| r.needed -| g else 0;
     try w.print("Not enough memory to load this model.\n", .{});
     switch (a.bound()) {
         .free_ram => {
             try w.print("It needs {d:.1} GB, and only {d:.1} GB of RAM is free right now (other apps and the system hold the rest)", .{ gbOf(r.needed), gbOf(a.free) });
-            if (a.gpuAllows()) |gpu| try w.print("; your GPU memory limit would allow {d:.1} GB", .{gbOf(gpu)});
-            try w.print(". Free about {d:.1} GB more.\n", .{gbUp(short)});
+            if (gpu_room) |gpu| {
+                if (gpu_short > 0)
+                    try w.print("; your GPU memory limit allows only {d:.1} GB, about {d:.1} GB short as well", .{ gbOf(gpu), gbUp(gpu_short) })
+                else
+                    try w.print("; your GPU memory limit would allow {d:.1} GB", .{gbOf(gpu)});
+            }
+            try w.print(". Free about {d:.1} GB more.\n", .{gbUp(ram_short)});
         },
         .wired_limit, .gpu_limit => {
             try w.print("It needs {d:.1} GB, and the GPU memory limit (", .{gbOf(r.needed)});
             if (r.wired_limit_mb > 0) try w.print("iogpu.wired_limit_mb = {d} MB", .{r.wired_limit_mb}) else try w.print("macOS's default", .{});
-            try w.print(") leaves {d:.1} GB beside what is already loaded: about {d:.1} GB short. {d:.1} GB of RAM is free.\n", .{ gbOf(a.bytes), gbUp(short), gbOf(a.free) });
+            try w.print(") leaves {d:.1} GB beside what is already loaded: about {d:.1} GB short. {d:.1} GB of RAM is free", .{ gbOf(a.bytes), gbUp(gpu_short), gbOf(a.free) });
+            if (ram_short > 0) try w.print(", about {d:.1} GB short as well", .{gbUp(ram_short)});
+            try w.print(".\n", .{});
         },
     }
     try w.print("To load it:\n", .{});
     if (a.bound() == .free_ram) {
-        try w.print("- Quit other apps or unload another model, then retry: the check reads free memory when the load starts, so a retry sees what you freed.\n", .{});
-    } else if (r.wiredLimitThatFits()) |mb| {
-        var cmd: [192]u8 = undefined;
-        try w.print("- Raise the GPU memory limit: {s} (it resets at reboot), then retry.", .{wireLimitsCommand(&cmd, mb)});
-        if (a.free < r.needed) try w.print(" Free about {d:.1} GB of RAM as well: quit other apps or unload another model.", .{gbUp(r.needed - a.free)});
-        try w.print("\n", .{});
+        try writeRamAction(w, ram_short);
+        if (gpu_short > 0) try writeGpuAction(w, r);
     } else {
-        try w.print("- This Mac cannot give the GPU enough memory for it, even with a raised limit: use one of the options below.\n", .{});
+        try writeGpuAction(w, r);
+        if (ram_short > 0) try writeRamAction(w, ram_short);
     }
     switch (r.knob) {
         .none => {},
@@ -6596,6 +6641,18 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
     }
     try w.print("- Use a smaller pack of this model.\n", .{});
     try w.print("- Last resort: --skip-mem-preflight (or \"Skip the memory check before loading\" in Settings) skips this check; the load can then fail later or stall the Mac.", .{});
+}
+
+fn writeRamAction(w: *std.Io.Writer, short: u64) std.Io.Writer.Error!void {
+    try w.print("- Quit other apps or unload another model to free about {d:.1} GB, then retry: the check reads free memory when the load starts, so a retry sees what you freed.\n", .{gbUp(short)});
+}
+
+/// The raise holds the load beside what is loaded; the limit and the working set are read once, when sushi starts.
+fn writeGpuAction(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer.Error!void {
+    const mb = r.wiredLimitThatFits() orelse
+        return w.print("- This Mac cannot give the GPU enough memory for it, even with a raised limit: use one of the options below.\n", .{});
+    var cmd: [192]u8 = undefined;
+    try w.print("- Raise the GPU memory limit in Terminal: {s} (it resets at reboot), then restart sushi: the limit is read when sushi starts.\n", .{wireLimitsCommand(&cmd, mb)});
 }
 
 /// PURE: the largest whole-GiB ssd budget below `budget` whose streamed load fits `avail`, priced by the load's own
@@ -6630,17 +6687,26 @@ pub fn loadWarmupBytes(config: *const model_mod.ModelConfig, mtp_on: bool) u64 {
     return gib / 8 +| (if (mtp_on) gib * 9 / 8 else 0) +| config.dflash_load_transient_bytes;
 }
 
+/// What a load's served warm needs free past what the load holds: its dearest forward as it runs, lending no pool
+/// (`warmFloorChunkBytes`), and the live check's reserve, which its headroom leaves out. The resident and the streamed
+/// requirement read it, and through them the cold-load gate (`residentColdLoadBillBytes`) and a refusal.
+pub fn warmNeedBytes(config: *const model_mod.ModelConfig) u64 {
+    return warmFloorChunkBytes(config) +| LIVE_RESERVE_BYTES;
+}
+
 /// A streamed load holds the cache, the whole-layer fill union and the bounce buffers beside the resident trunk; then its
-/// served warm needs its narrowest chunk (`warmFloorChunkBytes`) free past the live check's reserve.
-pub fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_peak_bytes: u64, bounce_bytes: u64, warm_chunk_bytes: u64) u64 {
-    return expertStreamingGateBytes(resident_bytes, cache_bytes, fill_peak_bytes, bounce_bytes) +| LOAD_SAFETY_NET_BYTES +| warm_chunk_bytes +| LIVE_RESERVE_BYTES;
+/// served warm needs `warm_need_bytes` (`warmNeedBytes`) free.
+pub fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_peak_bytes: u64, bounce_bytes: u64, warm_need_bytes: u64) u64 {
+    return expertStreamingGateBytes(resident_bytes, cache_bytes, fill_peak_bytes, bounce_bytes) +| LOAD_SAFETY_NET_BYTES +| warm_need_bytes;
 }
 
 /// Free memory a load demands: its billed weights, then the larger of the warmup transient plus the safety net and
 /// the requested context's admission bill (the warmup ends before any request allocates).
 pub fn loadRequirementBytes(config: *const model_mod.ModelConfig, weights_bytes: u64, mtp_on: bool, context_bill: u64) u64 {
-    if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes, warmFloorChunkBytes(config));
-    return weights_bytes +| @max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill);
+    if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes, warmNeedBytes(config));
+    // A load on Sushi Cooler runs its served warm once the load's own transient is gone.
+    const warm = if (@import("cooler_side.zig").onEngine(config)) warmNeedBytes(config) else 0;
+    return weights_bytes +| @max(@max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill), warm);
 }
 
 
@@ -6769,8 +6835,9 @@ test "a streamed load bills its trunk, expert cache, fill union and bounce buffe
     const cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true, .expert_cache_bytes = 12 * gib, .expert_fill_peak_bytes = 2 * gib, .expert_bounce_bytes = gib / 2 };
     const warm = warmFloorChunkBytes(&cfg);
     try testing.expect(warm > 0);
+    try testing.expectEqual(warm + LIVE_RESERVE_BYTES, warmNeedBytes(&cfg));
     try testing.expectEqual(6 * gib + 12 * gib + 2 * gib + gib / 2 + gib + warm + LIVE_RESERVE_BYTES, loadRequirementBytes(&cfg, 6 * gib, true, 0));
-    try testing.expectEqual(loadRequirementBytes(&cfg, 6 * gib, true, 0), streamedLoadRequirementBytes(6 * gib, 12 * gib, 2 * gib, gib / 2, warm));
+    try testing.expectEqual(loadRequirementBytes(&cfg, 6 * gib, true, 0), streamedLoadRequirementBytes(6 * gib, 12 * gib, 2 * gib, gib / 2, warmNeedBytes(&cfg)));
 }
 
 test "the exact load bill admits a MiMo load the flat 7 GiB headroom refused" {
@@ -6820,9 +6887,9 @@ test "bill pin: loadWarmupBytes" {
 
 test "bill pin: loadRequirementBytes" {
     try pinLoadConfigs("loadRequirementBytes", &.{
-        65632468992, 85899345920, 66840428544, 85899345920, 79304687616, 79304687616, 79304687616, 79304687616,
+        65632468992, 85899345920, 66840428544, 85899345920, 79541548544, 79541548544, 79541548544, 79541548544,
         65766686720, 85899345920, 65766686720, 85899345920, 79961826912, 79961826912, 79961826912, 79961826912,
-        66060796416, 85899345920, 66060796416, 85899345920, 80023784960, 80023784960, 80023784960, 80023784960,
+        66060796416, 85899345920, 66060796416, 85899345920, 80340094144, 80340094144, 80340094144, 80340094144,
         69456957221, 69456957221, 69456957221, 69456957221, 82341859109, 82341859109, 82341859109, 82341859109,
     }, struct {
         fn run(c: *const model_mod.ModelConfig, g: *PinGot) void {
@@ -6839,7 +6906,7 @@ test "bill pin: loadRequirementBytes" {
 
 test "bill pin: streamedLoadRequirementBytes and expertStreamingGateBytes" {
     var got = PinGot{};
-    got.add(streamedLoadRequirementBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30, 0));
+    got.add(streamedLoadRequirementBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30, LIVE_RESERVE_BYTES));
     got.add(expertStreamingGateBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30));
     got.add(expertStreamingGateBytes(std.math.maxInt(u64), 1, 1, 1));
     try pinEq("streamedLoadRequirementBytes", &.{ 21474836480, 19327352832, 18446744073709551615 }, got.slice());
@@ -6924,10 +6991,16 @@ test "a long cold prompt admitted at the edge runs its first chunk at a width wh
             while (avail < least + 4096 * MiB) : (avail += 64 * MiB) {
                 const billed = chooseRequestPrefillChunk(&config, seq, max_tokens, bits, avail, 0, 0, warm);
                 if (prefillNeededAtChunk(&config, seq, max_tokens, bits, billed, warm) > avail) continue;
-                // As the chunk loop picks it: the first chunk's width, and the hook's word on it at a cold start.
+                // As the chunk loop picks it: a reserving cache starts at the billed width; one that grows row by row
+                // starts wide and takes the hook's word on it at a cold start.
                 var st: mtp_plan.AdaptiveWidthState = .{ .width_min = billed, .width_max = billed };
-                var width: u32 = @intCast(prefill_plan.firstChunkWidth(&config, billed, cap, true));
-                if (width > billed) width = adaptivePrefillWidth(&config, bits, 0, liveHeadroomFrom(&config, avail, 0, 0, 0), width, cap, &st);
+                const start: u32 = @intCast(prefill_plan.firstChunkWidth(&config, billed, cap, true));
+                if (reserves) try t.expectEqual(billed, start) else try t.expectEqual(@max(billed, cap), start);
+                var width = start;
+                if (!reserves) {
+                    const hooked = adaptivePrefillWidth(&config, bits, 0, liveHeadroomFrom(&config, avail, 0, 0, 0), start, cap, &st);
+                    if (hooked != 0) width = hooked;
+                }
                 // A cache that reserves grows its whole reservation inside the first chunk, which holds the request's
                 // stored terms beside its own transient; one that grows row by row holds the rows the hook priced.
                 const peak = if (reserves)
@@ -6959,7 +7032,7 @@ test "a refused load's message names the bound in words, the shortfall and the b
     try has(free_text, "Not enough memory to load this model.\n");
     try has(free_text, "only 12.0 GB of RAM is free right now (other apps and the system hold the rest); your GPU memory limit would allow 28.0 GB");
     try has(free_text, "Free about 8.0 GB more.");
-    try has(free_text, "To load it:\n- Quit other apps or unload another model, then retry");
+    try has(free_text, "To load it:\n- Quit other apps or unload another model to free about 8.0 GB, then retry");
     try has(free_text, "- Lower --ctx-size to 65536 or less (it is 262144).");
     try testing.expect(std.mem.endsWith(u8, free_text, "the load can then fail later or stall the Mac."));
     // The declared limit binds: its floor less 10 GB loaded leaves 18 GB; the raise holds the load, the loaded and the margin.
@@ -6968,7 +7041,7 @@ test "a refused load's message names the bound in words, the shortfall and the b
     const floor_text = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = by_floor, .wired_limit_mb = 29696, .wired_beside = 11 * gib, .total_ram = 64 * gib, .knob = .{ .ssd_budget = .{ .gb = 18, .fits_gb = 15 } } });
     try has(floor_text, "the GPU memory limit (iogpu.wired_limit_mb = 29696 MB) leaves 18.0 GB beside what is already loaded: about 2.0 GB short.");
     // The command the Settings page builds (`#wiredCmd`): the GPU limit and both user wire limits, from one rule.
-    try has(floor_text, "To load it:\n- Raise the GPU memory limit: sudo sysctl iogpu.wired_limit_mb=31800 vm.global_user_wire_limit=33344716800 vm.user_wire_limit=33344716800 (it resets at reboot), then retry.");
+    try has(floor_text, "To load it:\n- Raise the GPU memory limit in Terminal: sudo sysctl iogpu.wired_limit_mb=31800 vm.global_user_wire_limit=33344716800 vm.user_wire_limit=33344716800 (it resets at reboot), then restart sushi: the limit is read when sushi starts.");
     try has(floor_text, "- Lower --ssd-budget-gb to 15 (it is 18)");
     // A limit this Mac cannot wire is not offered.
     const no_raise = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = by_floor, .wired_limit_mb = 29696, .wired_beside = 11 * gib, .total_ram = 32 * gib });
@@ -7006,3 +7079,44 @@ test "the ssd budget a refused streamed load names is the largest the planner it
         if (fits + 1 < 18) try testing.expect(planner.needAt((fits + 1) * gib).? > avail);
     }
 }
+
+test "a load refused by free RAM with the GPU limit short too names both actions, and doing both loads it" {
+    const gib: u64 = 1 << 30;
+    var buf: [2048]u8 = undefined;
+    // 64 GB Mac at macOS's default limit (a 48 GB working set), an 11 GB model loaded, 12 GB of RAM free; a 40 GB load.
+    const before = sushiAvailable(12 * gib, 0, 48 * gib, 11 * gib, 0);
+    const r = LoadMemoryRefusal{ .needed = 40 * gib, .avail = before, .wired_beside = 12 * gib, .total_ram = 64 * gib };
+    const text = loadMemoryRefusalText(&buf, r);
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expectEqual(SushiAvailable.Bound.free_ram, before.bound());
+    try testing.expect(std.mem.indexOf(u8, text, "your GPU memory limit allows only 37.0 GB, about 3.0 GB short as well. Free about 28.0 GB more.") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "- Quit other apps or unload another model to free about 28.0 GB") != null);
+    const mb = r.wiredLimitThatFits().?;
+    var cmd: [192]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, text, wireLimitsCommand(&cmd, mb)) != null);
+    // Freeing what it names and raising the limit to what it names admits the load.
+    const after = sushiAvailable(12 * gib + 28 * gib, 0, mb << 20, 11 * gib, 0);
+    try testing.expect(!memInsufficientForLoad(30 * gib, after.bytes, 40 * gib));
+}
+
+test "a GPU-limit refusal says to restart sushi after the sysctl, as Settings does: the limit is read once per process" {
+    const gib: u64 = 1 << 30;
+    var buf: [2048]u8 = undefined;
+    const by_floor = sushiAvailable(40 * gib, 0, 29 * gib, 10 * gib, 28 * gib);
+    const text = loadMemoryRefusalText(&buf, .{ .needed = 20 * gib, .avail = by_floor, .wired_limit_mb = 29696, .wired_beside = 11 * gib, .total_ram = 64 * gib });
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "sudo sysctl") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "then restart sushi") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "then retry.") == null);
+}
+
+test "a refused request's message never shows its need equal to what is available" {
+    const mb: u64 = 1 << 20;
+    var buf: [512]u8 = undefined;
+    for ([_]u32{ 0, 2048 }) |fitting| {
+        const msg = memoryContextRefusalMessage(&buf, .{ .requested = 70000, .maximum = 65536, .needed = 5000 * mb + 1, .available = 5000 * mb + mb - 1, .kv_bits = 8, .chunk = 2048, .asked_max_tokens = 4096, .fitting_max_tokens = fitting });
+        errdefer std.debug.print("{s}\n", .{msg});
+        try testing.expect(std.mem.indexOf(u8, msg, "needs 5001 MB and 5000 MB is available") != null);
+    }
+}
+

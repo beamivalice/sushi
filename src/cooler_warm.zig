@@ -55,18 +55,17 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
     const top = bills.widestServedRung(c);
     const kv = bills.configuredKvQuantFor(c);
     const headroom = bills.prefillHeadroomNow(c, 0);
-    const chunk = bills.widestChunkAdmitted(c, if (kv.scheme == .off) 16 else kv.bits, top, headroom);
+    const chunk = bills.warmChunkAdmitted(c, if (kv.scheme == .off) 16 else kv.bits, top, headroom);
     if (chunk == 0) {
         const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
         const floor = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
         log.warn("[warm] no prefill chunk fits beside the load: the narrowest ({d} rows) needs {d} MB, the live headroom is {d} MB (reclaimable {d} MB less the {d} MB live reserve, under the ceiling --wired-margin-gib {d} GiB sets); a lower --ssd-budget-gb leaves room\n", .{
-            floor, bills.prefillChunkCost(c, bits, floor, 0) >> 20, headroom >> 20, @import("status.zig").getAvailableMemBytes() >> 20, bills.LIVE_RESERVE_BYTES >> 20, bills.launch_state.wired_limit_margin_bytes >> 30,
+            floor, bills.warmChunkPeakBytes(c, bits, floor) >> 20, headroom >> 20, @import("status.zig").getAvailableMemBytes() >> 20, bills.LIVE_RESERVE_BYTES >> 20, bills.launch_state.wired_limit_margin_bytes >> 30,
         });
         return error.WarmChunkDoesNotFit;
     }
     log.info("[warm] the widest chunk is {d} rows of {d}: headroom {d} MB\n", .{ chunk, top, headroom >> 20 });
-    const past_budget: usize = if (c.indexer_budget > 0) c.indexer_budget + 300 else 0;
-    const longest = @max(past_budget, chunk + 1);
+    const longest: usize = @intCast(bills.warmLongestPrompt(c, chunk));
     const ids = try a.alloc(u32, @max(wide[wide.len - 1], longest));
     defer a.free(ids);
     // A repeated span: a model continues it, so its drafts are accepted and the round shapes acceptance unlocks (prompt
@@ -88,7 +87,7 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
         // The widest chunk's request, measured against its bill: a pack whose forwards ask more than the bill says, or
         // that the pool refuses, is refused here by name, not deep in a kernel on a served request. What the pool keeps
         // free up to its cap is not a bill's. The bill lends no decoder pool: the warm's chunk fits the headroom
-        // (`widestChunkAdmitted` lends none either), so it releases none and takes its whole cap from the pool.
+        // (`warmChunkAdmitted` lends none either), so it releases none and takes its whole cap from the pool.
         const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
         const billed = bills.prefillNeededAtChunkUnlent(c, longest, 96, bits, chunk, .{});
         const bill = if (@import("builtin").is_test) bill_for_test orelse billed else billed;
@@ -390,7 +389,7 @@ fn archWarmPackedGather(xfm: *Trunk) !void {
 const Spec = struct {
     drafter: ?generate.MtpHeadRef = null,
     dspark: bool = false,
-    /// The prefill chunk the warm's widest fits (`widestChunkAdmitted`).
+    /// The prefill chunk the warm's widest fits (`warmChunkAdmitted`).
     chunk: usize = 0,
 };
 
