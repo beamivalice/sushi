@@ -1786,11 +1786,16 @@ pub const Scheduler = struct {
         // entry `.error_state` so /v1/models surfaces the failure (and
         // future ensureLoaded calls fail fast instead of re-tripping the
         // same parse error). FileNotFound / parse errors land here.
+        self.registry.mutex.lockUncancelable(self.io);
+        const settings_gen = entry.settings_gen;
+        self.registry.mutex.unlock(self.io);
         const settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
         const cpu_state = model_load.preloadCpuState(self.allocator, self.io, entry.path) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
-            // Another request may have claimed or loaded the model meanwhile: its state is that request's.
-            if (entry.state == .unloaded or entry.state == .error_state) self.registry.markErrorLocked(entry, @errorName(err));
+            // Another request may have claimed or loaded the model meanwhile: its state is that request's. A setting
+            // saved since the read above makes the next request try again.
+            if ((entry.state == .unloaded or entry.state == .error_state) and !self.registry.settingsSavedSinceLocked(entry, settings_gen))
+                self.registry.markErrorLocked(entry, @errorName(err));
             self.registry.mutex.unlock(self.io);
             return error.LoadFailed;
         };
@@ -1900,7 +1905,7 @@ pub const Scheduler = struct {
             if (self.registry.loadBlocked(&gate_buf, entry.path) != null) return error.PackDownloading;
 
             // Claim the slot.
-            std.debug.assert(self.registry.tryBeginLoadLocked(entry));
+            std.debug.assert(self.registry.tryBeginLoadReadLocked(entry, settings_gen));
             pinned = true;
 
             // Estimate post-load bytes (`gateEstimateBytes`).
@@ -6545,27 +6550,8 @@ test "a cold load ended before the inference thread takes it returns its model a
     reg.markReadyLocked(victim, 10);
     reg.mutex.unlock(io);
 
-    var sch = submitTestScheduler(testing.allocator, 1);
+    var sch = coldLoadTestScheduler(reg);
     defer sch.load_queue.deinit(testing.allocator);
-    sch.registry = reg;
-    sch.ssd_budget_bytes = 0;
-    sch.mtp = null;
-    sch.kv_quant = null;
-    sch.ctx_size_flag = 0;
-    sch.test_on_cooler = null;
-    sch.no_drafter = true;
-    sch.drafter_dir = "";
-    sch.primary_model_dir = "";
-    sch.ssm_checkpoint_stride = 0;
-    sch.ssm_checkpoint_max = 0;
-    sch.prefix_cache_capacity = 0;
-    sch.prefix_cache_ram_enabled = false;
-    sch.prefix_cache_mem_bytes = 0;
-    sch.prefix_cache_mem_resolver = null;
-    sch.prefix_cache_disk_resolver = null;
-    sch.expert_cache_fit_resolver = null;
-    sch.mtp_head_kv_quant = false;
-    sch.mtp_depth = 0;
 
     // What a test does at the gate check the claim makes under the registry mutex, or at the one before the files.
     const Gate = struct {
@@ -6800,4 +6786,114 @@ test "a slot that fails names its error in the log, whichever path latched it" {
     try testing.expect(std.mem.indexOf(u8, text, "NeverLands") == null);
     try testing.expect(std.mem.indexOf(u8, text, "request 78") != null);
     try testing.expect(std.mem.indexOf(u8, text, "OutOfMemory") != null);
+}
+
+/// The scheduler of a cold-load test, its launch settings at their test values.
+fn coldLoadTestScheduler(reg: *ModelRegistry) Scheduler {
+    var sch = submitTestScheduler(testing.allocator, 1);
+    sch.registry = reg;
+    sch.ssd_budget_bytes = 0;
+    sch.mtp = null;
+    sch.kv_quant = null;
+    sch.ctx_size_flag = 0;
+    sch.test_on_cooler = null;
+    sch.no_drafter = true;
+    sch.drafter_dir = "";
+    sch.primary_model_dir = "";
+    sch.ssm_checkpoint_stride = 0;
+    sch.ssm_checkpoint_max = 0;
+    sch.prefix_cache_capacity = 0;
+    sch.prefix_cache_ram_enabled = false;
+    sch.prefix_cache_mem_bytes = 0;
+    sch.prefix_cache_mem_resolver = null;
+    sch.prefix_cache_disk_resolver = null;
+    sch.expert_cache_fit_resolver = null;
+    sch.mtp_head_kv_quant = false;
+    sch.mtp_depth = 0;
+    return sch;
+}
+
+/// The inference thread's answer to the next posted load, as `model_load.failLoadRequest` gives it: it fails by `name`.
+const FailNextLoad = struct {
+    sch: *Scheduler,
+    name: []const u8,
+    stop: std.atomic.Value(bool) = .init(false),
+    fn run(self: *@This()) void {
+        const s = self.sch;
+        s.queue_mu.lockUncancelable(s.io);
+        while (s.load_queue.items.len == 0 and !self.stop.load(.acquire)) s.queue_cond.waitUncancelable(s.io, &s.queue_mu);
+        if (s.load_queue.items.len == 0) return s.queue_mu.unlock(s.io);
+        const req = s.load_queue.orderedRemove(0);
+        s.queue_mu.unlock(s.io);
+        s.registry.mutex.lockUncancelable(s.io);
+        s.registry.markLoadFailedLocked(req.entry, self.name);
+        s.registry.mutex.unlock(s.io);
+        req.done_mu.lockUncancelable(s.io);
+        req.error_name = req.allocator.dupe(u8, self.name) catch null;
+        req.done = true;
+        req.done_cond.broadcast(s.io);
+        req.done_mu.unlock(s.io);
+    }
+    fn end(self: *@This()) void {
+        self.stop.store(true, .release);
+        self.sch.queue_mu.lockUncancelable(self.sch.io);
+        self.sch.queue_cond.broadcast(self.sch.io);
+        self.sch.queue_mu.unlock(self.sch.io);
+    }
+};
+
+test "a setting saved after a cold load read its settings and before it claims the model keeps that load's failure from being stored" {
+    const io = testing.io;
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    const C = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    // The save names this model, or a server key and so every model; the load then fails on the inference thread, or
+    // at its files.
+    const Row = struct { server_wide: bool, tokenizer: []const u8 };
+    const tok = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}";
+    for ([_]Row{ .{ .server_wide = false, .tokenizer = tok }, .{ .server_wide = true, .tokenizer = tok }, .{ .server_wide = false, .tokenizer = "not json" } }) |row| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+        try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+        // tokenizer.json is a FIFO the load reads after its settings (`model_settings.overrideFor`): until the test
+        // writes it, the load has read its settings and not claimed the model.
+        var fifo_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+        const fifo = try std.fmt.bufPrintSentinel(&fifo_buf, "{s}/tokenizer.json", .{dir}, 0);
+        if (C.mkfifo(fifo.ptr, 0o600) != 0) return error.MkfifoFailed;
+
+        var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+        defer reg.deinit();
+        const target = try reg.registerStub("b", dir, 10);
+        var sch = coldLoadTestScheduler(reg);
+        defer sch.load_queue.deinit(testing.allocator);
+
+        var infer = FailNextLoad{ .sch = &sch, .name = "FileNotFound" };
+        const it = try std.Thread.spawn(.{}, FailNextLoad.run, .{&infer});
+        defer it.join();
+        defer infer.end();
+        var call: ModelCall = .{ .sch = &sch, .id = "b", .load = true };
+        const t = try std.Thread.spawn(.{}, ModelCall.run, .{&call});
+        defer t.join();
+        // The writing end opens once the load opened its reading end.
+        var fd: c_int = -1;
+        for (0..20_000) |_| {
+            fd = std.c.open(fifo.ptr, .{ .ACCMODE = .WRONLY, .NONBLOCK = true });
+            if (fd >= 0) break;
+            const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+            _ = std.c.nanosleep(&ts, null);
+        }
+        if (fd < 0) return error.LoadNeverReadItsTokenizer;
+        try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
+        if (row.server_wide) reg.forgetLoadFailures() else reg.forgetLoadFailure(target);
+        _ = std.c.write(fd, row.tokenizer.ptr, row.tokenizer.len);
+        _ = std.c.close(fd);
+        try testing.expect(call.answeredWithin(20_000));
+        try testing.expectError(error.LoadFailed, call.got);
+        // The load ran on the settings read before the save: the next request loads again.
+        try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
+    }
 }

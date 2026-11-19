@@ -306,9 +306,10 @@ pub const LoadedModel = struct {
     error_name: ?[]const u8,
     /// Kept through a transient memory refusal's unloaded reset; cleared on retry or success.
     memory_context_refusal: ?MemoryContextRefusal = null,
-    /// A setting that reaches loading was saved while this entry loaded: the load ran on the old settings, so its
-    /// failure is not stored. Cleared at each claim.
-    settings_saved_mid_load: bool = false,
+    /// Counts the saves of a setting that reaches loading (`forgetLoadFailureLocked`).
+    settings_gen: u64 = 0,
+    /// `settings_gen` when the claimed load read its settings: a load that read older settings never stores its failure.
+    load_settings_gen: u64 = 0,
 
     /// Token → bytes table backing the JSON grammar mask, built lazily on this
     /// entry's first schema-constrained request. Its lifetime matches
@@ -1057,11 +1058,16 @@ pub const ModelRegistry = struct {
     /// On true the claimant holds a reference from here on: a model that turns `.ready` with
     /// none is another load's eviction victim before the claimant wakes.
     pub fn tryBeginLoadLocked(self: *ModelRegistry, entry: *LoadedModel) bool {
+        return self.tryBeginLoadReadLocked(entry, entry.settings_gen);
+    }
+
+    /// `tryBeginLoadLocked` for a load that read its settings before the claim, when `settings_gen` was `read_gen`.
+    pub fn tryBeginLoadReadLocked(self: *ModelRegistry, entry: *LoadedModel, read_gen: u64) bool {
         if (entry.state != .unloaded) return false;
         entry.state = .loading;
         _ = entry.refcount.fetchAdd(1, .acq_rel);
         entry.memory_context_refusal = null;
-        entry.settings_saved_mid_load = false;
+        entry.load_settings_gen = read_gen;
         self.state_cond.broadcast(self.io);
         return true;
     }
@@ -1518,18 +1524,20 @@ pub const ModelRegistry = struct {
     }
 
     fn forgetLoadFailureLocked(self: *ModelRegistry, entry: *LoadedModel) void {
-        switch (entry.state) {
-            .error_state => self.markUnloadedLocked(entry),
-            .loading => entry.settings_saved_mid_load = true,
-            .unloaded, .ready, .evicting => {},
-        }
+        entry.settings_gen +%= 1;
+        if (entry.state == .error_state) self.markUnloadedLocked(entry);
+    }
+
+    /// A setting that reaches loading was saved after a load read its settings at `read_gen`.
+    pub fn settingsSavedSinceLocked(_: *const ModelRegistry, entry: *const LoadedModel, read_gen: u64) bool {
+        return entry.settings_gen != read_gen;
     }
 
     /// A failed load's end state. A refusal that a setting or the memory limit decides goes back to `.unloaded`, so
-    /// the next load re-reads model-settings.json, as does any failure of a load a setting that reaches loading was saved
-    /// during; any other failure is the pack's and fails fast as `.error_state`.
+    /// the next load re-reads model-settings.json, as does any failure of a load that read its settings before a
+    /// setting that reaches loading was saved; any other failure is the pack's and fails fast as `.error_state`.
     pub fn markLoadFailedLocked(self: *ModelRegistry, entry: *LoadedModel, error_name: []const u8) void {
-        if (entry.settings_saved_mid_load) return self.markUnloadedLocked(entry);
+        if (self.settingsSavedSinceLocked(entry, entry.load_settings_gen)) return self.markUnloadedLocked(entry);
         for (refusals) |n| if (std.mem.eql(u8, n, error_name)) return self.markUnloadedLocked(entry);
         self.markErrorLocked(entry, error_name);
     }
