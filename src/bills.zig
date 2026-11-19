@@ -7101,7 +7101,7 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
         .ctx_size => |c| c.fits > 0,
         .ssd_budget => |b| b.fits_gb > 0,
     };
-    const later = knob_fits or r.smaller_pack != .none or r.check == .preflight;
+    const later = knob_fits or r.smaller_pack == .exists or r.check == .preflight;
     if (a.bound() == .free_ram) {
         if (ram_helps) try writeRamAction(w, free_short);
         if (gpu_short > 0) try writeGpuAction(w, r, later);
@@ -7124,11 +7124,8 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
                 try w.print("- Lower Memory for SSD streaming (GiB) in this model's settings (--ssd-budget-gb) to {d} (it is {d}): a smaller expert cache, slower decode.\n", .{ b.fits_gb, b.gb });
         },
     }
-    switch (r.smaller_pack) {
-        .exists => try w.print("- Use a smaller pack of this model.\n", .{}),
-        .unknown => try w.print("- Use a smaller pack of this model, if one exists.\n", .{}),
-        .none => {},
-    }
+    // A pack the build does not list may have no smaller one: offered only where the build lists one.
+    if (r.smaller_pack == .exists) try w.print("- Use a smaller pack of this model.\n", .{});
     if (r.check != .preflight) return;
     try w.print("- Last resort: --skip-mem-preflight (or \"Skip the memory check before loading\" in Settings) skips this check; the load can then fail later or stall the Mac.", .{});
 }
@@ -8007,7 +8004,7 @@ test "a load refusal that points to the options below lists one" {
     const gib: u64 = 1 << 30;
     var buf: [2048]u8 = undefined;
     // Past what this Mac can ever wire: each check, with and without a smaller pack and a budget that fits.
-    for ([_]LoadMemoryRefusal.Check{ .preflight, .fit, .budget }) |check| for ([_]LoadMemoryRefusal.SmallerPack{ .none, .exists }) |smaller| for ([_]u64{ 0, 7 }) |fits| {
+    for ([_]LoadMemoryRefusal.Check{ .preflight, .fit, .budget }) |check| for ([_]LoadMemoryRefusal.SmallerPack{ .none, .exists, .unknown }) |smaller| for ([_]u64{ 0, 7 }) |fits| {
         const avail: SushiAvailable = .{ .bytes = 20 * gib, .free = if (check == .budget) null else 24 * gib, .gpu = 20 * gib };
         const text = loadMemoryRefusalText(&buf, .{ .needed = 40 * gib, .avail = avail, .wired_beside = 0, .total_ram = 32 * gib, .check = check, .smaller_pack = smaller, .knob = .{ .ssd_budget = .{ .gb = 30, .fits_gb = fits } } });
         errdefer std.debug.print("{s}\n", .{text});
@@ -8017,13 +8014,14 @@ test "a load refusal that points to the options below lists one" {
     };
 }
 
-test "a load refusal offers a smaller pack only when one exists, and says so when that is unknown" {
+test "a load refusal offers a smaller pack only when the build lists one, and names none when that is unknown" {
     const gib: u64 = 1 << 30;
     var buf: [2048]u8 = undefined;
     const avail = sushiAvailable(20 * gib, 0, 26 * gib, 0, 0);
     try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0, .smaller_pack = .none }), "smaller pack") == null);
     try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0, .smaller_pack = .exists }), "- Use a smaller pack of this model.\n") != null);
-    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0 }), "- Use a smaller pack of this model, if one exists.\n") != null);
+    // A pack the build does not list: the text never names an action the server has not checked.
+    try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0 }), "smaller pack") == null);
     // Streaming, when it fits, is the first action.
     const streamed = loadMemoryRefusalText(&buf, .{ .needed = 47 * gib, .avail = avail, .wired_beside = 0, .total_ram = 32 * gib, .stream_fits_gb = 17 });
     try testing.expect(std.mem.indexOf(u8, streamed, "To load it:\n- Stream its experts from the SSD") != null);
