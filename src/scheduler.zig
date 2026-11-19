@@ -2873,6 +2873,12 @@ pub fn failPrefill(slot: *Slot, err: anyerror) void {
 }
 
 /// A decode tick that failed fails the slots it ran, by its settled error's name.
+/// One unit of a tick (a row, a joined group, a planner's round): its requests fail by its error, settled, and the
+/// tick goes on to the next unit. A unit is the work one error can reach.
+pub fn tickUnit(slots: []const *Slot, result: anyerror!void, tag: []const u8) void {
+    result catch |e| failTick(slots, e, tag);
+}
+
 pub fn failTick(active: []const *Slot, err: anyerror, tag: []const u8) void {
     const name = mlx.settledErrorName(err);
     log.err("{s} decode tick failed: {s}\n", .{ tag, name });
@@ -4237,7 +4243,11 @@ fn runSideTick(sch: *Scheduler, active: []*Slot, own: bool) anyerror!void {
             slot.planner_plain_transition = false;
             slot.planner_force_plain = false;
         };
-        if (try mtp_tick.tryPlannerTick(sch, active)) return;
+        const planned = mtp_tick.tryPlannerTick(sch, active) catch |e| {
+            failTick(active, e, "[mtp-planner]");
+            return;
+        };
+        if (planned) return;
         for (active) |slot| if (slot.legacy_gen) |*gen| {
             if (gen.mtp_planner_owned) slot.planner_force_plain = true;
         };
@@ -4253,7 +4263,7 @@ fn runSideTick(sch: *Scheduler, active: []*Slot, own: bool) anyerror!void {
     // byte-equivalence test can run the batched kernel at active.len==1 and
     // assert it matches the single-slot path token-for-token.
     if (active.len == 1 and !sch.force_batched) {
-        try runSingleDecodeTick(sch, active[0]);
+        tickUnit(active[0..1], runSingleDecodeTick(sch, active[0]), "[scheduler] a row");
         return;
     }
 
@@ -4290,7 +4300,7 @@ fn runSideTick(sch: *Scheduler, active: []*Slot, own: bool) anyerror!void {
             .serial => {
                 // legacy single-slot for spec / grammar / overflow
                 slot_admission.noteSerial(sch, s, why);
-                try runSingleDecodeTick(sch, s);
+                tickUnit((&s)[0..1], runSingleDecodeTick(sch, s), "[scheduler] a serial row");
             },
         }
     }
@@ -4324,14 +4334,14 @@ fn runSideTick(sch: *Scheduler, active: []*Slot, own: bool) anyerror!void {
             i = j;
         }
     }
-    try mtp_tick.runMtpGroups(sch, mtp_buf[0..mtp_group_n]);
+    mtp_tick.runMtpGroups(sch, mtp_buf[0..mtp_group_n]);
     // A DFlash2 GLM slot in company decodes as a plain row of the grouped tick (a row for another
     // request beats a draft row, glm5-arch#concurrency); alone it drafts.
     for (rows_buf[0..rows_n]) |slot| {
         if (sched.rowsInCompany(slot, rows_buf[0..rows_n], batchable_buf[0..batchable_n]) and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = slot;
             batchable_n += 1;
-        } else try runSingleDecodeTick(sch, slot);
+        } else tickUnit((&slot)[0..1], runSingleDecodeTick(sch, slot), "[scheduler] a row");
     }
     if (batchable_n == 0) {
         if (sch.metrics) |m| m.batched_group_size.set(0);
@@ -4351,7 +4361,7 @@ fn runSideTick(sch: *Scheduler, active: []*Slot, own: bool) anyerror!void {
         if (group.len > row_cap) {
             for (group[row_cap..]) |s| {
                 slot_admission.noteSerial(sch, s, .row_cap);
-                try runSingleDecodeTick(sch, s);
+                tickUnit((&s)[0..1], runSingleDecodeTick(sch, s), "[scheduler] a row past the group's cap");
             }
             group = group[0..row_cap];
         }
@@ -4380,7 +4390,7 @@ fn runSideTick(sch: *Scheduler, active: []*Slot, own: bool) anyerror!void {
                 }
                 for (group[keep..]) |s| {
                     slot_admission.noteSerial(sch, s, .pad_waste);
-                    try runSingleDecodeTick(sch, s);
+                    tickUnit((&s)[0..1], runSingleDecodeTick(sch, s), "[scheduler] a row past the pad-waste cap");
                 }
                 group = group[0..keep];
             }
@@ -4389,9 +4399,9 @@ fn runSideTick(sch: *Scheduler, active: []*Slot, own: bool) anyerror!void {
         // test hook actually exercises forwardBatchedDecode at N=1.
         if (group.len >= 2 or (sch.force_batched and group.len == 1)) {
             if (sch.metrics) |m| m.batched_group_size.set(group.len);
-            try runBatchedDecodeTick(sch, group);
+            tickUnit(group, runBatchedDecodeTick(sch, group), "[batched] a joined group");
         } else if (group.len == 1) {
-            try runSingleDecodeTick(sch, group[0]);
+            tickUnit(group, runSingleDecodeTick(sch, group[0]), "[scheduler] a row");
         }
         start = end;
     }
@@ -5510,7 +5520,7 @@ test "retained position: a padded row can never take the full-accept arm" {
     try testing.expectEqual(@as(u32, 1), generate_mod.Generator.mtpRetained(0));
 }
 
-test "single MTP slot reaches the round entry through runDecodeTick" {
+test "single MTP slot reaches the round entry through runDecodeTick, and its refusal fails that slot alone" {
     if (comptime !@import("arch/drafter.zig").Drafter.has("mimo2") or !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     try mlx.requireGpu();
     var xfm: Trunk = undefined;
@@ -5529,7 +5539,13 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     gen.sampling = .{};
     gen.logprobs_n = 1;
     var slot: Slot = undefined;
+    slot.io = testing.io;
     slot.allocator = testing.allocator;
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    slot.state = .decoding;
+    slot.request_id = 0;
     slot.model = &model;
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
@@ -5545,7 +5561,9 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     var active = [_]*Slot{&slot};
     // The tick's decode checkpoint consumes any MLX error latched before it and errors the slot instead.
     try testing.expect(!mlx.errorPending());
-    try testing.expectError(error.SpecDecodeUnsupported, runDecodeTick(&sch, &active));
+    try runDecodeTick(&sch, &active);
+    try testing.expectEqualStrings("SpecDecodeUnsupported", slot.error_code.?);
+    try testing.expectEqual(sched_policy.SlotState.errored, slot.state);
     try testing.expect(slot.legacy_gen.?.spec_cost_solo);
     try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);
 }

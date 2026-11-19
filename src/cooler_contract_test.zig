@@ -4156,3 +4156,107 @@ test "cooler contract: a load that evicts a model on MLX reads its preflight wit
         try testing.expect(parked < 1 << 20);
     }
 }
+
+/// An allocator that refuses its `at`-th allocation alone; every other call is its child's.
+const RefuseOnce = struct {
+    child: std.mem.Allocator,
+    at: usize = std.math.maxInt(usize),
+    n: usize = 0,
+    fired: bool = false,
+
+    fn allocator(self: *RefuseOnce) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        defer self.n += 1;
+        if (self.n == self.at) {
+            self.fired = true;
+            return null;
+        }
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "cooler contract: a tick unit failed by an error no latch explains fails its own requests only, not a drafting request or the joined rows beside it" {
+    try eachFixture(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const scheduler = Served.scheduler;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            if ((arch_sched.rowCap(&ld.config) orelse 1) < 2) return error.SkipZigTest;
+            // The bucket path: a planner's round is one unit over every row it plans.
+            const planner = @import("mtp_group_planner.zig");
+            const planner_was = planner.enabled_override;
+            planner.enabled_override = false;
+            defer planner.enabled_override = planner_was;
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            const sch = &sv.sch;
+            sch.queue_cap = 3;
+            var prompts: [3][40]u32 = undefined;
+            for (&prompts, 0..) |*p, r| for (p, 0..) |*t, i| {
+                t.* = ids[(i * (5 + 2 * r) + r + 1) % ids.len];
+            };
+            // The requests' own allocator, from their submit on (their generators keep it): refused once in a tick. It
+            // lives past every tick, so a structure that kept it still reaches its child.
+            var refuse: RefuseOnce = .{ .child = a };
+            sch.allocator = refuse.allocator();
+            defer sch.allocator = a;
+            var asks: usize = 0;
+            var k: usize = 0;
+            var fired_n: usize = 0;
+            var collateral: usize = 0;
+            while (true) : (k += 1) {
+                // One drafting request (a unit of its own) and two plain rows (one joined group), each decoding.
+                var slots: [3]*scheduler.Slot = undefined;
+                for (&slots, 0..) |*slot, r| {
+                    const spec = r == 0;
+                    const head = if (spec) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
+                    slot.* = try sch.submit(.{ .model = sv.entry, .prompt_ids = &prompts[r], .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 24, .enable_mtp = spec, .mtp = head });
+                    for (sch.pending.items, 0..) |p, i| if (p == slot.*) {
+                        _ = sch.pending.orderedRemove(i);
+                        break;
+                    };
+                    scheduler.runPrefill(sch, slot.*) catch |e| scheduler.failPrefill(slot.*, e);
+                    if (!scheduler.postPrefillTerminal(sch, slot.*)) try sch.decoding.append(a, slot.*);
+                }
+                MixedTick.tick(sch);
+                refuse.n = 0;
+                refuse.fired = false;
+                refuse.at = if (k == 0) std.math.maxInt(usize) else k - 1;
+                MixedTick.tick(sch);
+                refuse.at = std.math.maxInt(usize);
+                if (k == 0) asks = refuse.n;
+                const drafting_failed = slots[0].error_code != null;
+                const rows_failed = slots[1].error_code != null or slots[2].error_code != null;
+                if (k == 0) try testing.expect(!drafting_failed and !rows_failed);
+                if (refuse.fired) fired_n += 1;
+                if (refuse.fired and drafting_failed and rows_failed) {
+                    collateral += 1;
+                    if (collateral <= 3) std.debug.print("allocation {d} of {d} refused in a tick: drafting {s}, rows {s} / {s}\n", .{ k - 1, asks, slots[0].error_code.?, slots[1].error_code orelse "ok", slots[2].error_code orelse "ok" });
+                }
+                for (slots) |s| sch.complete(s);
+                MixedTick.drain(sch);
+                if (k > asks) break;
+            }
+            try testing.expect(fired_n > 0);
+            try testing.expectEqual(@as(usize, 0), collateral);
+        }
+    }.run);
+}

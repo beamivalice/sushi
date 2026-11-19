@@ -587,8 +587,8 @@ fn failRows(rows: []const *Slot, err: anyerror) void {
 /// Every MTP slot that reaches here is Flash-Next (`slotMtpGroupable` needs its GDN trunk) or MiMo
 /// (`slotMimoMtpCrowdable`), and both keep each round solo: a MiMo verify holds each row's decode arithmetic only
 /// in its own forward, and Flash-Next verify rows are expert bytes, so a batched verify measured no better.
-pub fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
-    for (slots) |slot| try runSingleDecodeTick(sch, slot);
+pub fn runMtpGroups(sch: *Scheduler, slots: []*Slot) void {
+    for (slots) |slot| scheduler_mod.tickUnit((&slot)[0..1], runSingleDecodeTick(sch, slot), "[mtp] a row");
 }
 
 fn groupCostSampleComplete(expected: usize, retained: []const u32, published: []const bool) bool {
