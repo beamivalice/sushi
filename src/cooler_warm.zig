@@ -282,7 +282,8 @@ pub fn joinedRows(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, ids: []const u3
         if (arm.advances_offset) for (ctxs[0..n]) |ctx| {
             ctx.moe_seq_offset.* += 1;
         };
-        for ([_]sampler.SamplingParams{ .{ .temperature = 0 }, sampled[3] }) |sp| {
+        // Seeded rows draw one by one; unseeded rows under one sampler draw as one (`sampleRowsLazy`).
+        for ([_]sampler.SamplingParams{ .{ .temperature = 0 }, sampled[3], .{ .temperature = 0.7, .top_p = 0.9, .top_k = 40 } }) |sp| {
             for (gens[0..n], 0..) |*g, i| {
                 params[i] = sp;
                 params[i].suppress_mask = g.sampling.suppress_mask;

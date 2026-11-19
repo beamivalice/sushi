@@ -651,7 +651,9 @@ pub fn mtpGroupSampledDrafts(
         }
         return;
     }
-    const group = try sampler.shortlistProposalRows(shortlists[0..n], sampled[0..k_sampled], params[0], s);
+    var draws: [32]sampler.SamplingParams = undefined;
+    for (sampled[0..k_sampled], params[0..k_sampled], draws[0..k_sampled]) |row, row_params, *d| d.* = gens[row].mtpSamplingDraw(row_params);
+    const group = try sampler.shortlistProposalRows(shortlists[0..n], sampled[0..k_sampled], params[0], draws[0..k_sampled], s);
     for (sampled[0..k_sampled], 0..) |row, j| {
         chains[row].draft_arrs[step] = group.ids[j];
         chains[row].n_drafted = step + 1;

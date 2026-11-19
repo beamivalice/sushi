@@ -348,20 +348,11 @@ pub fn probAt(probs: mlx.mlx_array, token_id: u32, s: mlx.mlx_stream) !f32 {
     return v;
 }
 
-/// Sample one token from probability distribution `probs` (shape `[B, V]`).
-/// Returns a u32 token id (caller can append directly).
-pub fn sampleFromProbs(probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
-    // mlx_random_categorical takes logits and applies softmax. Feed log(probs)
-    // so the categorical's softmax recovers the original distribution.
-    var log_probs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(log_probs);
-    try mlx.check(mlx.mlx_log(&log_probs, probs, s));
-
-    const null_key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(null_key);
-    var sampled = mlx.mlx_array_new();
+/// Sample one token from probability distribution `probs` (shape `[1, V]`) under the draw `sampling` names
+/// (`drawRowsLogProbs`: the request's key on the engine). Returns a u32 token id (caller can append directly).
+pub fn sampleFromProbs(probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !u32 {
+    const sampled = try sampleFromProbsLazy(probs, sampling, s);
     defer _ = mlx.mlx_array_free(sampled);
-    try mlx.check(mlx.mlx_random_categorical(&sampled, log_probs, -1, null_key, s));
     try mlx.check(mlx.mlx_array_eval(sampled));
     var v: i32 = 0;
     try mlx.check(mlx.mlx_array_item_int32(&v, sampled));
@@ -487,12 +478,13 @@ pub fn logitsStepProposal(logits: mlx.mlx_array, sampling: SamplingParams, s: ml
 /// `shortlistProposal` for K rows at once: ONE filtered block over the
 /// stacked `[K, 32]` logits and ONE categorical (the kernels are launch-bound,
 /// so rows are nearly free and a per-row loop is not). Requires one shared
-/// sampler (`sampleRowsHomogeneous`) and no seeded row: one categorical
-/// cannot carry a per-row key.
+/// sampler (`sampleRowsHomogeneous`) and no seeded row; row j draws under
+/// `draws[j]` (`drawRowsEach`).
 pub fn shortlistProposalRows(
     shortlists: []const mtp_mod.Shortlist,
     rows: []const usize,
     sampling: SamplingParams,
+    draws: []const SamplingParams,
     s: mlx.mlx_stream,
 ) !struct {
     ids: [32]mlx.mlx_array,
@@ -528,15 +520,13 @@ pub fn shortlistProposalRows(
     defer _ = mlx.mlx_array_free(q_block);
 
     // ONE categorical over the block -> [K] shortlist indices.
-    var picks = mlx.mlx_array_new();
+    var picks: mlx.mlx_array = .{ .ctx = null };
     defer _ = mlx.mlx_array_free(picks);
     {
         var logq = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(logq);
         try mlx.check(mlx.mlx_log(&logq, q_block, s));
-        const null_key = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(null_key);
-        try mlx.check(mlx.mlx_random_categorical(&picks, logq, -1, null_key, s));
+        picks = try drawRowsEach(logq, draws, s);
     }
 
     var ids: [32]mlx.mlx_array = @splat(.{ .ctx = null });
@@ -654,7 +644,7 @@ fn lazyOneHotRow(id: mlx.mlx_array, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_ar
 /// renormalized. Used on stochastic-verify reject so the corrected token
 /// preserves the target distribution (per Leviathan et al. speculative
 /// decoding paper).
-pub fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
+pub fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !u32 {
     var diff = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(diff);
     try mlx.check(mlx.mlx_subtract(&diff, target_probs, draft_probs, s));
@@ -665,7 +655,7 @@ pub fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s
     defer _ = mlx.mlx_array_free(residual);
     try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
 
-    return sampleFromProbs(residual, s);
+    return sampleFromProbs(residual, sampling, s);
 }
 
 /// Lazy categorical sample from an already-filtered probability row
@@ -955,7 +945,8 @@ pub fn sampleRowsAnySeed(params: []const SamplingParams) bool {
 
 fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     const n: c_int = @intCast(row_logits.len);
-    if (row_logits.len == 1 or !sampleRowsHomogeneous(params) or sampleRowsAnySeed(params)) {
+    const past_engine_draw = mlx.engine.isStream(s) and row_logits.len > sampler_draw.max_rows;
+    if (row_logits.len == 1 or !sampleRowsHomogeneous(params) or sampleRowsAnySeed(params) or past_engine_draw) {
         return sampleRowsLazyConcat(row_logits, params, s);
     }
     const stacked = try concatLogitRows(row_logits, s);
@@ -991,6 +982,12 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
         _ = mlx.mlx_array_free(current);
         owned = false;
         return result;
+    }
+    if (mlx.engine.isStream(s)) {
+        const drawn = try engineDrawsJoined(current, params, s);
+        _ = mlx.mlx_array_free(current);
+        owned = false;
+        return drawn;
     }
 
     if (p0.temperature != 1.0) {
@@ -1045,6 +1042,42 @@ pub fn engineDraws(rows2d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_s
     if (n > keys.len) return error.SamplerDrawUnsupported;
     for (keys[0..n], 0..) |*k, j| k.* = random.drawKey(root, sampling.draw +% j);
     return sampler_draw.rows(rows2d, sampling.temperature, sampling.top_p, sampling.top_k, sampling.min_p, keys[0..n], s);
+}
+
+/// The engine's draws of joined rows `rows2d` (`[rows, vocab]`, masked, before temperature), one request a row under
+/// one sampler: row j under its own request's key at its own draw index, as its one-row step draws (`engineDraws`).
+fn engineDrawsJoined(rows2d: mlx.mlx_array, params: []const SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    var keys: [sampler_draw.max_rows][2]u32 = undefined;
+    const p0 = params[0];
+    return sampler_draw.rows(rows2d, p0.temperature, p0.top_p, p0.top_k, p0.min_p, try rowKeys(params, &keys), s);
+}
+
+/// Row j's key: its own request's root at its own draw index, as its one-row draw takes it.
+fn rowKeys(params: []const SamplingParams, keys: *[sampler_draw.max_rows][2]u32) ![]const [2]u32 {
+    if (params.len > keys.len) return error.SamplerDrawUnsupported;
+    for (params, keys[0..params.len]) |p, *k| {
+        const root = p.draw_root orelse {
+            _ = mlx.engine.refuse("sampler draw", "a draw on the engine needs the request's draw root for its key");
+            return error.EngineDrawNeedsRoot;
+        };
+        k.* = random.drawKey(root, p.draw);
+    }
+    return keys[0..params.len];
+}
+
+/// One categorical draw per row of `logp2d` (`[rows, vocab]` log-probabilities), row j under `draws[j]`: on the
+/// engine's stream its request's key (`rowKeys`), on MLX's under `seedKey` of the first, whose rows share no seed.
+fn drawRowsEach(logp2d: mlx.mlx_array, draws: []const SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (mlx.engine.isStream(s)) {
+        var keys: [sampler_draw.max_rows][2]u32 = undefined;
+        return sampler_draw.rows(logp2d, 1.0, 1.0, 0, 0, try rowKeys(draws, &keys), s);
+    }
+    var sampled = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sampled);
+    const key = seedKey(draws[0]);
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_categorical(&sampled, logp2d, -1, key, s));
+    return sampled;
 }
 
 /// PRNG key for one draw: `seed` mixed with the draw index, so a seeded
@@ -2538,7 +2571,8 @@ test "shortlistProposalRows: every row's q belongs to that row's own shortlist" 
 
     const sampling = Generator.mtpDraftSamplingFor(.{ .temperature = 1.0 }, false, mtp_round.MTP_DRAFT_TEMP);
     const rows = [_]usize{ 0, 1, 2 };
-    const out = try shortlistProposalRows(&sl, &rows, sampling, s);
+    const draws = [_]SamplingParams{ sampling, sampling, sampling };
+    const out = try shortlistProposalRows(&sl, &rows, sampling, &draws, s);
     defer for (0..N) |j| {
         _ = mlx.mlx_array_free(out.ids[j]);
         _ = mlx.mlx_array_free(out.qs[j]);
@@ -2916,6 +2950,43 @@ test "suppress_mask: a mask the engine could not apply fails the draw by its err
     defer _ = mlx.mlx_array_free(drawn);
     try mlx.check(mlx.mlx_array_eval(drawn));
     try std.testing.expectEqual(@as(u32, 5), mlx.mlx_array_data_uint32(drawn).?[0]);
+}
+
+test "sampler: on the engine joined unseeded rows draw each row under its own request's key, as its one-row draw does, and a probabilities draw takes its request's key (#106)" {
+    try mlx.requireGpu();
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("test_support.zig").restoreEngine(was_enabled);
+    const s = mlx.engine.stream();
+    const host = mlx.engine.enter(s);
+    defer host.end();
+    const V = 600;
+    const n = 3;
+    var flat: [n * V]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x106);
+    for (&flat) |*x| x.* = prng.random().floatNorm(f32) * 2;
+    var rows: [n]mlx.mlx_array = undefined;
+    for (&rows, 0..) |*r, j| r.* = mlx.mlx_array_new_data(flat[j * V ..].ptr, &[_]c_int{ 1, 1, V }, 3, .float32);
+    defer for (rows) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    // One sampler, no seed: the rows may draw as one.
+    var params: [n]SamplingParams = undefined;
+    for (&params, 0..) |*p, j| p.* = .{ .temperature = 0.6, .top_p = 0.95, .top_k = 20, .draw_root = 11 + 7 * j, .draw = 40 + j };
+    const solo = params;
+    var joined: [n]i32 = undefined;
+    try sampleRows(&joined, &rows, &params, s);
+    for (rows, solo, joined) |r, p, got| {
+        var one = [_]SamplingParams{p};
+        var want: [1]i32 = undefined;
+        try sampleRows(&want, &.{r}, &one, s);
+        try testing.expectEqual(want[0], got);
+    }
+    const probs = try probsAtLastPos(rows[0], solo[0], s);
+    defer _ = mlx.mlx_array_free(probs);
+    _ = try sampleFromProbs(probs, solo[0], s);
 }
 
 test "sampler: on the engine a draft off a shortlist holding the target's kept ids draws the target's token at its position" {

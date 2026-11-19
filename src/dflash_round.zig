@@ -331,9 +331,9 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
                 else
                     try sampler.pldOneHotRow(drafts[accepted], vl_shape[2], s);
                 defer _ = mlx.mlx_array_free(q_row);
-                break :blk try sampler.sampleResidual(probs, q_row, s);
+                break :blk try sampler.sampleResidual(probs, q_row, self.mtpSamplingDraw(self.sampling), s);
             } else {
-                break :blk try sampler.sampleFromProbs(probs, s);
+                break :blk try sampler.sampleFromProbs(probs, self.mtpSamplingDraw(self.sampling), s);
             }
         } else {
             const argmax_data = try verify_argmax.ids(1 + m);

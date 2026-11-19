@@ -223,6 +223,8 @@ before reading a completed stream and requires clean EOF.
   rows, so a seed gives one text; it is another text than the MLX route's, and than a Cooler load's before this
   kernel. A call two float orders can make differently (a nucleus threshold within 1e-5 of the kept mass) is not part
   of the rule.
+  Joined rows of several requests under one sampler draw in one call, each row under its own request's root and draw
+  index (`sampler.sampleRowsLazy`): a draw on the engine never takes a shared or absent key, which it refuses (#106).
 - Logprobs are the MODEL's distribution (pre-temperature), ids travel WITH values, entry belongs to the RETURNED
   token (one-token delay); `logprobs.content` describes `message.content` (`contentTokenRange`); streaming logprobs
   are a SIBLING of `delta` shipped EXACTLY once against a high-water mark. logprobs>0 + grammar disable spec.

@@ -2352,6 +2352,25 @@ fn requestWithinBillOn(comptime Q: type, dir: []const u8, spec: bool) !void {
     try testing.expect(held <= bill);
 }
 
+test "cooler contract: two unseeded sampled requests under one sampler decoded at once serve, plain and speculative, each row drawn under its own request's key (#106)" {
+    try eachQwenServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            var long: [120]u32 = undefined;
+            for (&long, 0..) |*t, i| t.* = ids[i % ids.len];
+            // Rows that sample alike with no seed draw as one: the issue's sampler, temperature alone, and min-p.
+            for ([_]SamplingParams{ .{ .temperature = 0.6, .top_p = 0.95, .top_k = 20 }, .{ .temperature = 0.8 }, .{ .temperature = 0.7, .min_p = 0.05 } }) |sp| {
+                for ([_]bool{ false, true }) |mtp| try sv.concurrent(&.{ long[0..40], long[0..101] }, 32, sp, mtp);
+            }
+        }
+    }.run);
+}
+
 test "cooler contract: a served request restored from a shorter prompt's SSD record takes it, and says the same tokens every time" {
     // Bytewise cold holds only for a restore at the request's own point (the SSD contract above): another prompt's
     // record sits off this prompt's cold split ([0, N - 31) then the tail), so its state reaches N - 31 in two

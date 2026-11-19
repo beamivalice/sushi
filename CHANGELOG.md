@@ -28,6 +28,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A seeded DeepSeek request on the release's own layout (FP8 trunk, MXFP4 experts) repeats its text on Sushi Cooler**:
   its DSpark rounds took their width from measured timings, which changes that layout's rows, so the same seed could
   give another text. It now verifies at a fixed width, as on MLX; STQ packs keep the adaptive width.
+- **Two or more sampled requests decode at once on Sushi Cooler again**: concurrent Qwen requests under the same
+  sampling settings and no seed failed together (`a draw needs a key`); each row now draws under its own request's
+  key. Thanks @younesehb for the report and the diagnosis (#106).
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many
