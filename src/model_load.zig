@@ -1853,9 +1853,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             gpu_limit: usize,
             sushi: bool,
             wired_floor: u64,
+            /// The Sushi reading's two bounds, as last read.
+            last: ?bills.SushiAvailable = null,
             pub fn read(r: *@This()) u64 {
                 if (!r.sushi) return bills.effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit);
-                return bills.effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, gpu_mem.activeBytes(), r.wired_floor);
+                r.last = bills.sushiAvailable(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, gpu_mem.activeBytes(), r.wired_floor);
+                return r.last.?.bytes;
             }
             pub fn sleep(r: *@This()) void {
                 std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
@@ -1876,11 +1879,14 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         }
         const active: usize = if (reader.sushi) gpu_mem.activeBytes() else 0;
-        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB (warmup + net or context ~{d:.2} GB)\n", .{
+        var avail_buf: [160]u8 = undefined;
+        const avail_line = if (reader.last) |last| bills.sushiAvailableLine(&avail_buf, last) else "free RAM, capped at the GPU working-set limit that iogpu.wired_limit_mb sets";
+        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB (warmup + net or context ~{d:.2} GB; {s})\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed -| weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
+            avail_line,
         });
         const gpu_exhausted = model_mod.usesSushiQuantMemoryBill(params.config) and gpu_limit > 0 and active >= gpu_limit;
         if (weights_bytes > 0 and (bills.memInsufficientForLoad(weights_bytes, avail_bytes, needed) or gpu_exhausted)) {
@@ -1892,9 +1898,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 params.entry.memory_context_refusal = refusal;
                 if (@TypeOf(params) == *LoadRequest) params.memory_context_refusal = refusal;
                 sch.registry.mutex.unlock(sch.io);
-                log.err("Insufficient memory for requested context: {d} tokens at KV{d} and prefill chunk {d} need ~{d:.2} GiB including {d:.2} GiB of enabled model/vision/MTP weights, but only {d:.2} GiB is available. Maximum context with this memory budget: {d} tokens. Lower --ctx-size or free memory; --skip-mem-preflight, or \"Skip the memory check before loading\" in Settings, overrides this check.\n", .{
+                log.err("Insufficient memory for requested context: {d} tokens at KV{d} and prefill chunk {d} need ~{d:.2} GiB including {d:.2} GiB of enabled model/vision/MTP weights, but only {d:.2} GiB is available ({s}). Maximum context with this memory budget: {d} tokens. Lower --ctx-size or free memory; --skip-mem-preflight, or \"Skip the memory check before loading\" in Settings, overrides this check.\n", .{
                     b.requested_context,                         b.kv_bits,                                 b.chunk,                                                                              @as(f64, @floatFromInt(needed)) / gb,
-                    @as(f64, @floatFromInt(weights_bytes)) / gb, @as(f64, @floatFromInt(avail_bytes)) / gb, maximum,
+                    @as(f64, @floatFromInt(weights_bytes)) / gb, @as(f64, @floatFromInt(avail_bytes)) / gb, avail_line,
+                    maximum,
                 });
                 return error.InsufficientMemory;
             }
@@ -1915,7 +1922,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 @as(f64, @floatFromInt(needed)) / gb,
                 @as(f64, @floatFromInt(weights_bytes)) / gb,
                 @as(f64, @floatFromInt(avail_bytes)) / gb,
-                if (reader.sushi and reader.wired_floor > 0) "the iogpu.wired_limit_mb ceiling less what other processes hold on the GPU" else "free RAM, capped at the GPU working-set limit that iogpu.wired_limit_mb sets",
+                avail_line,
             });
             return error.InsufficientMemory;
         }

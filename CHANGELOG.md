@@ -45,6 +45,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A DeepSeek load that fails with Sushi Cooler turned off no longer shrinks memory reuse for every later model**: it
   left MLX's buffer pool and the engine's free buffers capped at its own small figure until the server restarted, and
   an unload gave back MLX's cap only. A failed load and an unload now give both back.
+- **With a raised `iogpu.wired_limit_mb`, a model is refused before loading when other apps hold the memory it needs**:
+  the memory check read the wired limit alone, so a load passed it, read every weight and failed its warm-up. It now
+  uses the free memory when that is lower, and its line says which of the two it compared.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many

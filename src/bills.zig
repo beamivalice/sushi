@@ -6471,13 +6471,42 @@ pub fn settleAvailableBytes(first: u64, needed: u64, reader: anytype) u64 {
     return avail;
 }
 
-/// A resident Sushi load shares the working-set cap with already active model buffers. A declared
-/// wired limit (`wired_floor`, 0 = none) replaces the free-RAM figure with what that limit leaves the
-/// GPU: the same ceiling request admission reads, however much RAM is free.
+/// What a resident Sushi load may have: the free RAM (`effectiveAvailableBytes`, the reading the streamed preflight
+/// takes) under the working-set cap, less the already active model buffers; under a declared wired limit
+/// (`wired_floor`, 0 = none) no more than that limit's floor less them, and the free RAM when it is below.
+pub const SushiAvailable = struct {
+    bytes: u64,
+    free: u64,
+    /// The declared limit's floor less the active buffers; null without one.
+    declared: ?u64,
+
+    pub fn byFree(self: SushiAvailable) bool {
+        return self.declared == null or self.free <= self.declared.?;
+    }
+};
+
+pub fn sushiAvailable(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) SushiAvailable {
+    const available = effectiveAvailableBytes(host_avail, proc_avail, gpu_limit);
+    const free = if (gpu_limit > 0) @min(available, gpu_limit -| active) else available;
+    if (wired_floor == 0) return .{ .bytes = free, .free = free, .declared = null };
+    const declared = if (gpu_limit > 0) @min(wired_floor -| active, gpu_limit -| active) else wired_floor -| active;
+    return .{ .bytes = @min(free, declared), .free = free, .declared = declared };
+}
+
+/// Which bound a Sushi preflight compared, with both numbers, for its line and its refusal.
+pub fn sushiAvailableLine(buf: []u8, a: SushiAvailable) []const u8 {
+    const gb = 1024.0 * 1024.0 * 1024.0;
+    const free = @as(f64, @floatFromInt(a.free)) / gb;
+    const declared = a.declared orelse return std.fmt.bufPrint(buf, "free RAM {d:.1} GB under the GPU working-set limit", .{free}) catch "free RAM";
+    const floor = @as(f64, @floatFromInt(declared)) / gb;
+    return (if (a.byFree())
+        std.fmt.bufPrint(buf, "free RAM {d:.1} GB, below the iogpu.wired_limit_mb floor less resident buffers, {d:.1} GB", .{ free, floor })
+    else
+        std.fmt.bufPrint(buf, "the iogpu.wired_limit_mb floor less resident buffers, {d:.1} GB, below free RAM {d:.1} GB", .{ floor, free })) catch "free RAM or the wired-limit floor";
+}
+
 pub fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) u64 {
-    const host = if (wired_floor > 0) wired_floor -| active else host_avail;
-    const available = effectiveAvailableBytes(host, proc_avail, gpu_limit);
-    return if (gpu_limit > 0) @min(available, gpu_limit -| active) else available;
+    return sushiAvailable(host_avail, proc_avail, gpu_limit, active, wired_floor).bytes;
 }
 
 /// Free memory a load keeps beyond everything it bills: allocator slack and pages macOS has not yet handed back.
@@ -6596,17 +6625,18 @@ test "Sushi quant memory subtracts existing resident buffers from the GPU limit"
     try testing.expectEqual(@as(u64, 88 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 0, 40 * gib, 0));
 }
 
-test "a declared wired limit sets the load preflight's figure, never past the working set" {
+test "under a declared wired limit the load preflight reads the free RAM when it is below the limit's floor, never past the working set" {
     const gib: u64 = 1 << 30;
-    // 32 GB box, iogpu.wired_limit_mb raised: file cache and other apps' pages read as gone,
-    // but the declared limit says the GPU may claim the floor.
-    try testing.expectEqual(@as(u64, 28 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 28 * gib));
-    // Resident buffers come off the floor, as they come off the working set.
-    try testing.expectEqual(@as(u64, 18 * gib), effectiveSushiAvailableBytes(15 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
-    // More free RAM than the floor does not raise it: the declared limit is the ceiling.
+    // 32 GB box, iogpu.wired_limit_mb raised, other apps holding RAM: the free RAM is what a load can have now.
+    try testing.expectEqual(@as(u64, 25 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 28 * gib));
+    try testing.expectEqual(@as(u64, 15 * gib), effectiveSushiAvailableBytes(15 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
+    // A resident load of 20 GB that today's floor reading admitted with 12 GB free, to fail its warm, is refused.
+    try testing.expect(memInsufficientForLoad(18 * gib, effectiveSushiAvailableBytes(12 * gib, 0, 29 * gib, 0, 28 * gib), 20 * gib));
+    // More free RAM than the floor does not raise it: the declared limit is the ceiling, resident buffers off it.
     try testing.expectEqual(@as(u64, 28 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 28 * gib));
+    try testing.expectEqual(@as(u64, 18 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
     // A floor above the working set never raises the cap.
-    try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 31 * gib));
+    try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 31 * gib));
 }
 
 test "the load preflight never reads more than the wired-limit ceiling its requests are admitted under" {
@@ -6752,7 +6782,7 @@ test "bill pin: the preflight's available figures" {
     got.add(effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 28 * gib));
     got.add(memInsufficientForLoad(70 * gib, 36 * gib, 71 * gib));
     got.add(memInsufficientForLoad(0, 36 * gib, 71 * gib));
-    try pinEq("effectiveAvailableBytes", &.{ 38654705664, 6442450944, 57982058496, 30064771072, 1, 0 }, got.slice());
+    try pinEq("effectiveAvailableBytes", &.{ 38654705664, 6442450944, 57982058496, 26843545600, 1, 0 }, got.slice());
 }
 
 test "bill pin: fp8ExpertScratchBytes" {
@@ -6809,4 +6839,15 @@ test "a long cold prompt admitted at the edge runs its first chunk at a width wh
             }
         };
     };
+}
+
+test "the Sushi preflight's line names the bound it compared, with both numbers" {
+    const gib: u64 = 1 << 30;
+    var buf: [160]u8 = undefined;
+    const by_free = sushiAvailable(12 * gib, 0, 29 * gib, 0, 28 * gib);
+    try testing.expect(by_free.byFree());
+    try testing.expectEqualStrings("free RAM 12.0 GB, below the iogpu.wired_limit_mb floor less resident buffers, 28.0 GB", sushiAvailableLine(&buf, by_free));
+    const by_floor = sushiAvailable(40 * gib, 0, 29 * gib, 10 * gib, 28 * gib);
+    try testing.expect(!by_floor.byFree());
+    try testing.expectEqualStrings("the iogpu.wired_limit_mb floor less resident buffers, 18.0 GB, below free RAM 19.0 GB", sushiAvailableLine(&buf, by_floor));
 }
