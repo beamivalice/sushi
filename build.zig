@@ -469,7 +469,23 @@ fn linkApple(module: *std.Build.Module, macos_sdk_frameworks: ?[]const u8) void 
 /// `compile_gib` bounds the compile's RSS, `run_gib` each run step's (`--maxrss` schedules both); a `cut` domain's
 /// steps can hold the Qwen cut, which `-Dfixture-cut=true` declares at `cut_run_gib`.
 const test_domains = [_]TestDomain{
-    .{ .name = "cooler", .files = &.{"cooler_contract_test"}, .cut = true },
+    .{
+        .name = "cooler",
+        .cut = true,
+        .files = &.{
+            "cooler_contract_test",     "cooler_late_test",     "cooler_load_test",    "cooler_pool_test",
+            "cooler_prefill_bill_test", "cooler_requests_test", "cooler_restore_test",
+        },
+        .steps = &.{
+            .{ .name = "cooler-load", .files = &.{ "cooler_contract_test", "cooler_load_test" } },
+            .{ .name = "cooler-pool", .files = &.{"cooler_pool_test"} },
+            .{ .name = "cooler-prefill-bill", .files = &.{"cooler_prefill_bill_test"} },
+            .{ .name = "cooler-requests", .files = &.{"cooler_requests_test"} },
+            .{ .name = "cooler-restore", .files = &.{"cooler_restore_test"} },
+            // Every test of the file runs alone (`alone_tests`).
+            .{ .name = "cooler-late", .files = &.{"cooler_late_test"} },
+        },
+    },
     .{ .name = "deepseek", .folders = &.{"dsv41"}, .compile_gib = 8, .run_gib = 9 },
     .{ .name = "qwen", .folders = &.{"qwen4"}, .cut = true },
     .{ .name = "glm", .folders = &.{"glm5"} },
@@ -508,6 +524,38 @@ const test_domains = [_]TestDomain{
         .{ .name = "test-prefix-cache (SUSHI_PREFIX_FS=real)", .env = .{ "SUSHI_PREFIX_FS", "real" }, .again = true },
     } },
 };
+
+/// Tests that run alone, each in a process of its own (a step named `step`), left out of their file's step: what they
+/// prove holds only on state the process starts with. `name` is the test's name in `src/<file>.zig`.
+const alone_tests = [_]AloneTest{
+    .{ .step = "cooler-late-widest", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, a prompt at the widest chunk and a repetitive one past a sparse indexer's budget, greedy, speculative and sampled, compile no kernel" },
+    .{ .step = "cooler-late-lengths", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, greedy requests of every prompt length to 40, and speculative and sampled ones, compile no kernel" },
+    .{ .step = "cooler-late-restore", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, a served request that restores the live state behind its reply compiles no kernel" },
+    .{ .step = "cooler-late-bench", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, the release bench's first request through the scheduler compiles no kernel" },
+    .{ .step = "deepseek-late-new-row-count", .file = "dsv41/dsv41_kernels", .name = "dsv41 kernels: a new row count, pick count, split count or context width compiles no new Metal library" },
+    .{ .step = "deepseek-late-image-splice", .file = "dsv41/dsv41_generate_test", .name = "dsv41 engine: a forward that splices image rows runs on the engine at a prefill width and at a decode width, with no op on MLX and no kernel compiled after the warm (DSV41_STQ_TINY)" },
+    .{ .step = "deepseek-late-nax-gemm", .file = "dsv41/dsv41_generate_test", .name = "dsv41 engine: a load with decode on the engine keeps the NAX GEMM arm, and after its warm nothing compiles a kernel: a forward of every width from 1 to 16 and a DSpark round on either side, a round whose rows take two attention split counts, a restore point captured at any position, a step or round of any width, the split top-k a one-row step takes over 131072 keys, a draft at any fill of the stages' windows; a decode forward, a draft and a verify round of the same width build no kernel instance key once they have run (DSV41_STQ_TINY)" },
+    .{ .step = "deepseek-late-no-drafter", .file = "dsv41/dsv41_generate_test", .name = "dsv41 engine: a load with no drafter compiles nothing after the load at any forward width from 1 to 16 from any position, STQ or the release's layout (DSV41_STQ_TINY, DSV41_TINY)" },
+    .{ .step = "deepseek-late-cut-widths", .file = "dsv41/dsv41_generate_test", .name = "dsv41 engine: after the load's wide warm, prompts cut at other widths compile no kernel, through the union (DSV41_STQ_TINY)" },
+    .{ .step = "deepseek-late-sampled-dspark", .file = "dsv41/dsv41_generate_test", .name = "dsv41 engine: after the load's warm a sampled DSpark request, seeded or not, compiles no kernel, at any filter setting or with a suppress mask (DSV41_STQ_TINY)" },
+    .{ .step = "deepseek-late-release-layout", .file = "dsv41/dsv41_generate_test", .name = "dsv41 engine: the release's layout (FP8 trunk, MXFP4 experts) on Sushi Cooler gives the same logits and DSpark tokens at each round-width mix, every expert cached or read at each forward, and a load that reads them asks MLX nothing and compiles nothing after the load (DSV41_TINY)" },
+    .{ .step = "deepseek-late-joined-rows", .file = "dsv41/dsv41_generate_test", .name = "dsv41 engine: a load that joins rows, with DSpark or without, compiles nothing after its warm at joined rows of every width (DSV41_STQ_TINY)" },
+    .{ .step = "deepseek-late-manifest", .file = "dsv41/dsv41_pipelines", .name = "dsv41 pipelines: a load with no manifest writes one with the wide chunks' recipes, and a load from it skips the engine's forwards, the wide ones included, serves the same tokens and compiles none inside a prompt (DSV41_STQ_TINY)" },
+    .{ .step = "deepseek-late-topk-tiles", .file = "dsv41/dsv41_pipelines", .name = "dsv41 pipelines: a chunk whose index top-k streams over key tiles compiles nothing inside a prompt, after a full warm and after a load from the manifest (DSV41_STQ_TINY)" },
+    .{ .step = "deepseek-late-stream", .file = "dsv41/dsv41_stream", .name = "dsv41 kernels: after the load's warm, prompts of any length, every verify width and a growing context compile no Metal library on the STQ pack, streamed and resident, DSpark on and off (DSV41_STQ_TINY)" },
+    .{ .step = "qwen-late-gdn-captured-verify", .file = "qwen4/gdn_decode", .name = "gdn recur: on the engine before the seal a captured verify makes the replay kernel at each count up to its own" },
+    .{ .step = "qwen-late-gdn-final-state", .file = "qwen4/gdn_decode", .name = "gdn recur: on the engine before the seal a verify that keeps only its final state makes the replay at each count up to its own" },
+    .{ .step = "qwen-late-vision-tower", .file = "qwen4/qwen_vision", .name = "qwen vision: a Cooler load's tower warms before the seal, so images and videos of any grid compile nothing inside a request" },
+    .{ .step = "qwen-late-qsa-split", .file = "qwen4/qwen4_qsa_select", .name = "qsa select on the engine before the seal makes the split's pipelines, so a long select after it compiles none" },
+    .{ .step = "qwen-late-qsa-row-class", .file = "qwen4/qwen4_qsa_select", .name = "qsa select before the seal, at the one row class a warm's wide chunk takes, makes every row class's, so a chunk's remainder of any width compiles none" },
+    .{ .step = "kernels-late-f32-simd", .file = "tensor/route", .name = "engine f32 matmul on the SIMD tiles: the first use of a tile before the seal makes every alignment of it, so no length compiles inside a request" },
+    .{ .step = "kernels-late-bf16-nax", .file = "tensor/route", .name = "engine bf16 matmul on the NAX tiles: a weight's first product before the seal makes what every row count to the widest chunk picks, so no length compiles inside a request" },
+    .{ .step = "kernels-late-by-size", .file = "tensor/route", .name = "engine kernels a request's lengths pick by size: an elementwise op's and a matrix-vector product's first use before the seal makes every size's, so a long prompt compiles nothing" },
+};
+
+/// What every `alone_tests` entry proves: no kernel compiles after a load's warm or seal, which only a process whose
+/// pipeline cache that load filled can show (an earlier test's compiles would hide a late one).
+const AloneTest = struct { step: []const u8, file: []const u8, name: []const u8 };
 
 const TestDomain = struct {
     name: []const u8,
@@ -741,22 +789,31 @@ fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
         for (steps) |s| {
             if (s.again and user != null) continue;
             var select: std.ArrayList(u8) = .empty;
-            var chosen = false;
             for (files) |f| {
-                if (f.host or f.domain != di or !f.in_scope) continue;
-                if (s.files.len > 0) {
-                    for (s.files) |sf| {
-                        if (std.mem.eql(u8, sf, f.path)) break;
-                    } else continue;
-                }
-                const wanted = for (f.names) |n| {
-                    if (!n.anonymous and selectedByUser(user, n.full)) break true;
-                } else user == null;
-                if (!wanted) continue;
-                chosen = true;
+                if (f.host or f.domain != di or !f.in_scope or !stepHolds(s, f.path)) continue;
                 select.print(b.allocator, "{s}\n", .{f.prefix}) catch @panic("OOM");
+                for (alone_tests) |t| if (std.mem.eql(u8, t.file, f.path))
+                    select.print(b.allocator, "!{s}test.{s}\n", .{ f.prefix, t.name }) catch @panic("OOM");
             }
-            if (chosen) planned.append(b.allocator, .{ .domain = di, .step = .{ .name = s.name, .select = select.items, .env = s.env }, .again = s.again }) catch @panic("OOM");
+            // A step is made when it runs a test the user's filters select (any named test without filters).
+            var runs_one = false;
+            for (files) |f| {
+                if (f.host or f.domain != di or !f.in_scope or !stepHolds(s, f.path)) continue;
+                for (f.names) |n| runs_one = runs_one or (!n.anonymous and selectedByUser(user, n.full) and selects(select.items, n.full));
+            }
+            if (runs_one) planned.append(b.allocator, .{ .domain = di, .step = .{ .name = s.name, .select = select.items, .env = s.env }, .again = s.again }) catch @panic("OOM");
+        }
+        for (alone_tests) |t| {
+            const f = for (files) |f| {
+                if (!f.host and std.mem.eql(u8, f.path, t.file)) break f;
+            } else std.debug.panic("alone_tests names src/{s}.zig, which holds no MLX test", .{t.file});
+            if (f.domain != di or !f.in_scope) continue;
+            const full = b.fmt("{s}test.{s}", .{ f.prefix, t.name });
+            var held: usize = 0;
+            for (f.names) |n| held += @intFromBool(std.mem.startsWith(u8, n.full, full));
+            if (held != 1) std.debug.panic("alone_tests' step {s} would run {d} tests, not one: {s}", .{ t.step, held, full });
+            if (!selectedByUser(user, full)) continue;
+            planned.append(b.allocator, .{ .domain = di, .step = .{ .name = t.step, .select = b.fmt("{s}\n", .{full}), .env = null }, .again = false }) catch @panic("OOM");
         }
         for (d.steps) |s| for (s.files) |sf| if (domainOf(sf) != di)
             std.debug.panic("test-{s}'s step {s} names {s}, a file of another domain", .{ d.name, s.name, sf });
@@ -804,6 +861,12 @@ fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
         out.append(b.allocator, .{ .compile = compile, .domain = d, .steps = steps.items }) catch @panic("OOM");
     }
     return out.items;
+}
+
+fn stepHolds(step: RunStep, path: []const u8) bool {
+    if (step.files.len == 0) return true;
+    for (step.files) |f| if (std.mem.eql(u8, f, path)) return true;
+    return false;
 }
 
 /// The runner's reading of `SUSHI_TEST_SELECT` (scripts/test_runner.zig `isSelected`).

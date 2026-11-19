@@ -57,6 +57,12 @@ test {
     _ = @import("model.zig");
     _ = @import("owned_weights.zig");
     _ = @import("cooler_contract_test.zig");
+    _ = @import("cooler_late_test.zig");
+    _ = @import("cooler_load_test.zig");
+    _ = @import("cooler_pool_test.zig");
+    _ = @import("cooler_prefill_bill_test.zig");
+    _ = @import("cooler_requests_test.zig");
+    _ = @import("cooler_restore_test.zig");
     _ = @import("effort.zig");
     _ = @import("exl3_flat_layout_test.zig");
     _ = @import("generate.zig");

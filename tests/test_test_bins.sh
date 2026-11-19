@@ -54,7 +54,7 @@ taskpolicy -a "$ZIG" build test -Doptimize=ReleaseFast "-Dtest-filter=$COOLER" "
   "-Dtest-filter=$QWEN" "-Dtest-filter=$GLM" "-Dtest-filter=$MIMO" "-Dtest-filter=$KERNELS" "-Dtest-filter=$LOAD" \
   "-Dtest-filter=$SERVER" "-Dtest-filter=$PREFIX" "-Dtest-log=$TMP/domains.tsv" >"$TMP/out" 2>&1 \
   || fail "one test of each domain runs green"
-want="test-cooler PASS cooler_contract_test.test.$COOLER
+want="cooler-load PASS cooler_contract_test.test.$COOLER
 test-deepseek PASS dsv41.dsv41_config.test.$DEEPSEEK
 test-glm PASS glm5.glm5_config.test.$GLM
 test-kernels PASS mlx_util.test.$KERNELS
@@ -64,6 +64,15 @@ test-prefix-cache PASS prefix_cache.test.$PREFIX
 test-qwen PASS qwen4.qwen4_config.test.$QWEN
 test-server PASS http_conn.test.$SERVER"
 [ "$(steps "$TMP/domains.tsv")" = "$want" ] || fail "each test runs in its domain's step; got: $(steps "$TMP/domains.tsv")"
+
+# A test of `alone_tests` runs in a step of its own, out of its file's step.
+ALONE="engine kernels a request's lengths pick by size: an elementwise op's and a matrix-vector product's first use before the seal makes every size's, so a long prompt compiles nothing"
+while [ -e "$QUIET" ]; do sleep 5; done
+taskpolicy -a "$ZIG" build test -Doptimize=ReleaseFast "-Dtest-filter=$ALONE" "-Dtest-filter=$KERNELS" \
+  "-Dtest-log=$TMP/alone.tsv" >"$TMP/out" 2>&1 || fail "an alone test and a test of its domain run green"
+want="kernels-late-by-size PASS tensor.route.test.$ALONE
+test-kernels PASS mlx_util.test.$KERNELS"
+[ "$(steps "$TMP/alone.tsv")" = "$want" ] || fail "an alone test runs in its own step; got: $(steps "$TMP/alone.tsv")"
 
 # A test file that no domain holds fails the configure by name: a copy of the tree whose src/ gains one.
 mkdir -p "$TMP/tree/src"

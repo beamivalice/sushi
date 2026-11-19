@@ -1,0 +1,875 @@
+//! The Sushi Cooler contract's load cells: where a load's weights live, its warm and seal, its manifest, its refusals
+//! and its teardown. The runner and the shared helpers are in `cooler_contract_test.zig`.
+
+const std = @import("std");
+const testing = std.testing;
+const mlx = @import("mlx.zig");
+const model_mod = @import("model.zig");
+const Trunk = @import("trunk.zig").Trunk;
+const registry = @import("arch/registry.zig");
+const arch_handle = @import("arch/handle.zig");
+const test_support = @import("test_support.zig");
+const model_load = @import("model_load.zig");
+const arch_sched = @import("arch/sched.zig");
+const io = std.Io.Threaded.global_single_threaded.io();
+const contract = @import("cooler_contract_test.zig");
+const Load = contract.Load;
+const Served = contract.Served;
+const Sheet = contract.Sheet;
+const eachArch = contract.eachArch;
+const eachFixture = contract.eachFixture;
+const eachLayout = contract.eachLayout;
+const firstAsks = contract.firstAsks;
+const greedy = contract.greedy;
+const withUiSettings = contract.withUiSettings;
+
+
+test "cooler contract: a Cooler load that drops experts by usage serves, routing only the kept ones on the GPU" {
+    // A route to a dropped expert fails the request (`ExpertDropped`): the router must never pick one.
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            if (comptime !@hasDecl(C, "dropExperts")) return error.SkipZigTest;
+            const a = testing.allocator;
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            var ld: Load = undefined;
+            try ld.prepare(C, dir, true);
+            const root = @import("test_support.zig").usagePack(&tmp, dir, ld.config.num_hidden_layers, ld.config.num_experts, ld.config.num_experts_per_tok) catch |e| {
+                ld.config.deinit(a);
+                return e;
+            };
+            defer a.free(root);
+            const n = (C.dropExperts(a, &ld.config, root) catch |e| {
+                ld.config.deinit(a);
+                return e;
+            }) orelse {
+                ld.config.deinit(a);
+                return error.SkipZigTest;
+            };
+            ld.config.drop_expert = n;
+            try ld.load(root);
+            defer _ = ld.close();
+            try testing.expect(ld.onEngine());
+            // Every expert the router can pick is resident: a one-row request reads no route on the host.
+            const engine = ld.xfm.expert_stream orelse return error.TestExpectedExpertStream;
+            if (engine.plan.resident) {
+                const before = engine.hostRoutes();
+                const handed = mlx.engine.stats().handovers;
+                const tokens = 4;
+                var one = try greedy(&ld, ids[0..1], tokens);
+                one.deinit(a);
+                try testing.expectEqual(before, engine.hostRoutes());
+                // Nor does a layer hand its pass over early: each boundary leaves the GPU idle, and the kicks start it.
+                // A token hands over two: the step's own next forward, and its sample's pass before the next
+                // forward reads the ids (`qwen4_hc.handOverIdsWriter`).
+                try testing.expect(mlx.engine.stats().handovers - handed <= 2 * tokens);
+            }
+            var said = try greedy(&ld, ids[0..@min(ids.len, 9)], 6);
+            said.deinit(a);
+        }
+    }.run);
+}
+
+test "cooler contract: a Cooler load runs on the engine and holds every weight in an owned region, none in the forward pool" {
+    try eachLayout(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            var cooler: Load = undefined;
+            try cooler.open(C, dir, true);
+            defer _ = cooler.close();
+            try testing.expect(cooler.onEngine());
+            try testing.expectEqual(@as(usize, 0), try C.weightsOutsideRegions(cooler.xfm));
+            try testing.expect(C.headLoaded(cooler.xfm));
+        }
+    }.run);
+}
+
+test "cooler contract: a Cooler load opens under whatever engine cap was in force before it, and its unload leaves the pool as it found it" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const base = Sheet.now();
+            // A cap an earlier forward left in force, below the smallest buffer the load makes.
+            try mlx.engine.budget(4 << 10);
+            defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            _ = ld.close();
+            try testing.expectEqual(base, Sheet.now());
+        }
+    }.run);
+}
+
+test "cooler contract: a Cooler load refused at a pool buffer where its cleanup changes frees what it made, and the next load serves the same tokens" {
+    try eachLayout(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            defer mlx.engine.fault.disarm();
+            const prompt = ids[0..@min(ids.len, 30)];
+            var want: std.ArrayList(u32) = .empty;
+            defer want.deinit(testing.allocator);
+            {
+                var first: Load = undefined;
+                try first.open(C, dir, true);
+                defer _ = first.close();
+                want = try greedy(&first, prompt, 8);
+            }
+            const base = Sheet.now();
+            // The asks of the trunk's bring-up (`Load.load`, whose errdefers free the weights and the trunk) and of the
+            // served warm (`serve`, whose failure closes the whole load), counted on a clean load after the first.
+            var asks: [2]u64 = undefined;
+            {
+                var counted: Load = undefined;
+                try counted.prepare(C, dir, true);
+                const c0 = mlx.engine.fault.count();
+                try counted.load(dir);
+                defer _ = counted.close();
+                const c1 = mlx.engine.fault.count();
+                try counted.serve();
+                asks = .{ c1 - c0, mlx.engine.fault.count() - c1 };
+            }
+            try testing.expectEqual(base, Sheet.now());
+            try testing.expect(asks[0] > 0 and asks[1] > 0);
+            // The bring-up's first and last ask (nothing of it made yet; all of it but one buffer), and the warm's first:
+            // a warm failed anywhere closes the whole load, and its forwards' own unwinding is the request sweeps'.
+            const points = [_]u64{ 1, asks[0], asks[0] + 1 };
+            var msg: [300]u8 = undefined;
+            for (points) |k| {
+                var fx: Load = undefined;
+                try fx.prepare(C, dir, true);
+                mlx.engine.fault.arm(k);
+                const r = fx.loadServed(dir);
+                const fired = !mlx.engine.fault.armed();
+                mlx.engine.fault.disarm();
+                errdefer std.debug.print("cooler contract: the load refused at pool buffer {d} of {d} ({s}) left {any} -> {any}\n", .{ k, asks[0] + asks[1], if (r) |_| "it loaded" else |_| "it failed", base, Sheet.now() });
+                if (r) |_| {
+                    _ = fx.close();
+                    try testing.expect(!mlx.errorPending());
+                } else |_| _ = mlx.takeError(&msg);
+                try testing.expect(fired);
+                try testing.expect(!mlx.engine.holding());
+                try testing.expectEqual(base, Sheet.now());
+            }
+            var after: Load = undefined;
+            try after.open(C, dir, true);
+            defer _ = after.close();
+            var got = try greedy(&after, prompt, 8);
+            defer got.deinit(testing.allocator);
+            try testing.expectEqualSlices(u32, want.items, got.items);
+        }
+    }.run);
+}
+
+test "cooler contract: a Cooler warm's image splice refused at any of its pool buffer sites frees what it made" {
+    try eachArch(struct {
+        fn go(ld: *Load) anyerror!void {
+            const turn = arch_handle.turnFor(ld.h, &ld.config);
+            defer turn.end();
+            return @import("cooler_warm.zig").spliceAhead(ld.xfm);
+        }
+
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const a = testing.allocator;
+            defer mlx.engine.fault.disarm();
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            if (ld.config.image_token_id == 0) return error.SkipZigTest;
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            const points = try firstAsks(a, &seen, C, &ld, go);
+            defer a.free(points);
+            try testing.expect(points.len > 1);
+            const base = Sheet.now();
+            var msg: [300]u8 = undefined;
+            for (points, 0..) |pt, at| {
+                mlx.engine.fault.armAt(pt);
+                const r = go(&ld);
+                const fired = !mlx.engine.fault.armed();
+                mlx.engine.fault.disarm();
+                _ = mlx.takeError(&msg);
+                errdefer std.debug.print("cooler contract: the image splice refused at point {d} of {d} left {any} -> {any}\n", .{ at, points.len, base, Sheet.now() });
+                try testing.expect(fired);
+                try testing.expect(std.meta.isError(r));
+                // What the refused splice encoded is lazy, not held: the next splice runs it.
+                try go(&ld);
+                try testing.expectEqual(base, Sheet.now());
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a Cooler load's warm that ends seals the engine, and one refused at a pool buffer fails the load" {
+    try eachArch(struct {
+        fn warm(ld: *Load) !void {
+            const turn = arch_handle.turnFor(ld.h, &ld.config);
+            defer turn.end();
+            return @import("model_load.zig").warmLoad(io, testing.allocator, &ld.config, ld.xfm, null, null, ld.xfm.cache.config);
+        }
+
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            defer mlx.engine.fault.disarm();
+            var total: u64 = 0;
+            {
+                var ld: Load = undefined;
+                try ld.open(C, dir, true);
+                defer _ = ld.close();
+                const c0 = mlx.engine.fault.count();
+                try warm(&ld);
+                total = mlx.engine.fault.count() - c0;
+                try testing.expect(mlx.engine.sealed());
+            }
+            // An arch that warms inside its init (DeepSeek) fails its load there; its served warm makes nothing more.
+            if (total < 2) return;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            mlx.engine.fault.arm(total / 2);
+            const r = warm(&ld);
+            mlx.engine.fault.disarm();
+            var msg: [300]u8 = undefined;
+            _ = mlx.takeError(&msg);
+            errdefer std.debug.print("cooler contract: the warm refused at pool buffer {d} of {d} served on\n", .{ total / 2, total });
+            // The load doesn't serve; the refusal is named by whichever op or host maker met it.
+            if (r) |_| return error.TestUnexpectedResult else |_| {}
+        }
+    }.run);
+}
+
+test "cooler contract: a second Cooler load beside a sealed one, of another arch, warms unsealed and ends sealed" {
+    // The load scope is shared: the second load's warm makes its own pipelines, none of them counted as late.
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    var ran = false;
+    inline for (comptime std.meta.tags(registry.Tag)) |ta| {
+        if (comptime !@hasDecl(registry.Mod(ta), "cooler_contract")) continue;
+        inline for (comptime std.meta.tags(registry.Tag)) |tb| {
+            if (comptime ta == tb or !@hasDecl(registry.Mod(tb), "cooler_contract")) continue;
+            ran = (try besideSealed(registry.Mod(ta).cooler_contract, registry.Mod(tb).cooler_contract)) or ran;
+        }
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+/// A load of `A`'s first fixture, warmed and sealed, then a load of `B`'s beside it; false when either is missing.
+fn besideSealed(comptime A: type, comptime B: type) !bool {
+    const da = std.mem.span(std.c.getenv(A.fixtures[0]) orelse return false);
+    const db = std.mem.span(std.c.getenv(B.fixtures[0]) orelse return false);
+    const Warm = struct {
+        fn run(ld: *Load) !void {
+            const turn = arch_handle.turnFor(ld.h, &ld.config);
+            defer turn.end();
+            return @import("model_load.zig").warmLoad(io, testing.allocator, &ld.config, ld.xfm, null, null, ld.xfm.cache.config);
+        }
+    };
+    var first: Load = undefined;
+    try first.open(A, da, true);
+    defer _ = first.close();
+    try Warm.run(&first);
+    try testing.expect(mlx.engine.sealed());
+    const late = mlx.engine.latePipelines();
+    mlx.engine.late_names.clear();
+    var second: Load = undefined;
+    try second.open(B, db, true);
+    defer _ = second.close();
+    try Warm.run(&second);
+    errdefer std.debug.print("cooler contract: the second load's warm ({s} beside {s}) counted late:\n{s}", .{ B.fixtures[0], A.fixtures[0], mlx.engine.late_names.text() });
+    try testing.expectEqual(late, mlx.engine.latePipelines());
+    try testing.expect(mlx.engine.sealed());
+    return true;
+}
+
+test "cooler contract: a Cooler load's prefix cache keeps its arrays on the engine, and an MLX load's on MLX" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const prefix_arch = @import("arch/prefix.zig");
+            inline for (.{ true, false }) |cool| {
+                var ld: Load = undefined;
+                try ld.open(C, dir, cool);
+                defer _ = ld.close();
+                const on = prefix_arch.arraysOn(&ld.config);
+                errdefer std.debug.print("cooler contract: a load {s} keeps its prefix arrays on {s}\n", .{ if (cool) "on Cooler" else "on MLX", if (on == null) "MLX" else "the engine" });
+                if (cool) try testing.expect(on != null and mlx.engine.isStream(on.?)) else try testing.expect(on == null);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a pipeline a Cooler request compiles late is written to the load's manifest, for the next load to make ahead" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const shared = @import("arch/cooler_pipelines.zig");
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            shared.root_hook = tmp.dir;
+            defer shared.root_hook = null;
+            defer shared.forget();
+            var cooler: Load = undefined;
+            try cooler.open(C, dir, true);
+            defer _ = cooler.close();
+            {
+                const turn = arch_handle.turnFor(cooler.h, &cooler.config);
+                defer turn.end();
+                try @import("model_load.zig").warmLoad(io, testing.allocator, &cooler.config, cooler.xfm, null, null, cooler.xfm.cache.config);
+            }
+            const key = shared.writtenKey() orelse return error.NoManifestWritten;
+            {
+                // A kernel no warm makes: a unary op over int16, inside a request.
+                const turn = arch_handle.turnFor(cooler.h, &cooler.config);
+                defer turn.end();
+                defer arch_sched.endRequest(&cooler.config);
+                const vals = [_]i16{ -3, 4, -5, 6 };
+                const x = mlx.mlx_array_new_data(&vals, &[_]c_int{4}, 1, .int16);
+                defer _ = mlx.mlx_array_free(x);
+                var y = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(y);
+                try mlx.check(mlx.mlx_abs(&y, x, mlx.engine.stream()));
+                try mlx.check(mlx.mlx_array_eval(y));
+            }
+            var found = try @import("pipeline_manifest.zig").lookup(testing.allocator, io, tmp.dir, key);
+            defer found.deinit();
+            const recipes = switch (found) {
+                .same => |l| l.recipes,
+                else => return error.NoManifestWritten,
+            };
+            for (recipes) |r| if (std.mem.indexOf(u8, r.function, "Abs") != null and std.mem.indexOf(u8, r.function, "int16") != null) return;
+            return error.LatePipelineNotWritten;
+        }
+    }.run);
+}
+
+test "cooler contract: a Cooler load whose manifest made every pipeline runs no served warm" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const shared = @import("arch/cooler_pipelines.zig");
+            const cooler_warm = @import("cooler_warm.zig");
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            shared.root_hook = tmp.dir;
+            defer shared.root_hook = null;
+            defer shared.forget();
+            var runs: [2]u32 = undefined;
+            var scoped = false;
+            for (&runs) |*r| {
+                // `open` is the served load, its warm included.
+                const before = cooler_warm.runs_for_test;
+                var cooler: Load = undefined;
+                try cooler.open(C, dir, true);
+                defer _ = cooler.close();
+                r.* = cooler_warm.runs_for_test - before;
+                scoped = switch (@import("arch/config.zig").tagOf(&cooler.config).?) {
+                    inline else => |t| @hasDecl(registry.Mod(t), "coolerPipelineScope"),
+                };
+            }
+            // An arch that settles its manifest in its own load (no scope hook) warms every load.
+            try testing.expectEqual(@as(u32, 1), runs[0]);
+            try testing.expectEqual(@as(u32, if (scoped) 0 else 1), runs[1]);
+        }
+    }.run);
+}
+
+test "cooler contract: a Cooler load whose widest served request holds more than its bill is refused by name" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const shared = @import("arch/cooler_pipelines.zig");
+            const cooler_warm = @import("cooler_warm.zig");
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            // A fresh manifest, so the load runs its served warm.
+            shared.root_hook = tmp.dir;
+            defer shared.root_hook = null;
+            defer shared.forget();
+            cooler_warm.bill_for_test = 1 << 20;
+            defer cooler_warm.bill_for_test = null;
+            var cooler: Load = undefined;
+            if (cooler.open(C, dir, true)) |_| {
+                _ = cooler.close();
+                return error.TestUnexpectedResult;
+            } else |e| try testing.expectEqual(error.WarmOverBill, e);
+            var msg: [512]u8 = undefined;
+            _ = mlx.takeError(&msg);
+        }
+    }.run);
+}
+
+/// One Cooler load of `dir` with its `k`-th checked MLX call failed, on an allocator of its own: whether anything of it
+/// stays (the allocator's, the engine's or a hold), and whether the fault fired.
+/// A served load's two phases, each swept from its own root: `load` brings the trunk up, `serve` warms it.
+const Phase = enum { load, serve };
+
+/// A served load whose `phase` fails at its checked call `k` from the phase's start (0: none fails), on an allocator that
+/// counts leaks: whether the fault fired, and whether anything of the load was left.
+fn faultedLoad(comptime C: type, dir: []const u8, phase: Phase, k: u64) !struct { fired: bool, left: bool } {
+    // Safety on whatever the build: it is what counts a leak at `deinit`, and ReleaseFast turns it off by default.
+    var gpa: std.heap.DebugAllocator(.{ .safety = true }) = .init;
+    const base = Sheet.now();
+    var fx: Load = undefined;
+    try fx.prepareOn(gpa.allocator(), C, dir, true);
+    if (phase == .load) mlx.fault.arm(k);
+    const loaded = fx.load(dir);
+    if (phase == .load) mlx.fault.disarm();
+    const r = if (loaded) |_| blk: {
+        if (phase == .serve) mlx.fault.arm(k);
+        const served = fx.serve();
+        if (phase == .serve) mlx.fault.disarm();
+        if (served) |_| {} else |_| fx.discard();
+        break :blk served;
+    } else |e| e;
+    const fired = mlx.fault.didFire();
+    if (r) {
+        _ = fx.close();
+    } else |_| {
+        var msg: [300]u8 = undefined;
+        _ = mlx.takeError(&msg);
+    }
+    const leaked = gpa.deinit() == .leak;
+    const after = Sheet.now();
+    const left = leaked or mlx.engine.holding() or !std.meta.eql(base, after);
+    if (left) std.debug.print("cooler contract: the load failed at checked MLX call {d} of its {s} left: allocator {}, hold {}, {any} -> {any}\n", .{ k, @tagName(phase), leaked, mlx.engine.holding(), base, after });
+    return .{ .fired = fired, .left = left };
+}
+
+/// Frames from each phase's root a load's sweep tells sites by: one site per step of the phase. `load`: the weights,
+/// the trunk's init, its closures, the handle. `serve`: the cache, the draft rerank, the warm; what runs inside a step
+/// unwinds through that step's cleanup, and the forwards inside the warm are the request sweeps'.
+const load_sweep_frames = std.enums.EnumArray(Phase, usize).init(.{ .load = 3, .serve = 3 });
+
+test "cooler contract: a Cooler load failed at the first checked MLX call of any step, or the last of a bring-up step, leaves nothing of it behind" {
+    var paths = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer paths.deinit();
+    const S = struct {
+        var seen: *std.AutoHashMap(u64, void) = undefined;
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            defer mlx.fault.disarm();
+            defer mlx.fault.sites = .{};
+            {
+                var warm: Load = undefined;
+                try warm.open(C, dir, true);
+                _ = warm.close();
+            }
+            var left: usize = 0;
+            for ([_]Phase{ .load, .serve }) |phase| {
+                // One clean load records the phase's steps; each is failed at its first call (nothing of it made), and a
+                // bring-up step at its last too (all of it made but that call); the warm's tail varies by a call from load
+                // to load. A fixture whose phase makes the very calls another's did is that path again, and is not swept
+                // twice.
+                const R = struct {
+                    dir: []const u8,
+                    phase: Phase,
+                    fn go(r: @This()) anyerror!void {
+                        if ((try faultedLoad(C, r.dir, r.phase, 0)).left) return error.CleanLoadLeft;
+                    }
+                };
+                mlx.fault.sites = .{ .from = .root, .frames = load_sweep_frames.get(phase), .lasts = phase == .load };
+                const points = try mlx.sweepPoints(testing.allocator, &mlx.fault.sites, R{ .dir = dir, .phase = phase }, R.go);
+                defer testing.allocator.free(points);
+                const path = std.hash.Wyhash.hash(@backingInt(phase), std.mem.sliceAsBytes(points));
+                if ((try seen.getOrPut(path)).found_existing) continue;
+                for (points) |k| {
+                    const r = try faultedLoad(C, dir, phase, k);
+                    if (!r.fired) {
+                        std.debug.print("cooler contract: the load's {s} never reached its checked call {d}: it makes other calls than the one recorded\n", .{ @tagName(phase), k });
+                        return error.TestUnexpectedResult;
+                    }
+                    if (r.left) {
+                        left += 1;
+                        mlx.fault.trace = true;
+                        defer mlx.fault.trace = false;
+                        _ = try faultedLoad(C, dir, phase, k);
+                    }
+                }
+            }
+            try testing.expectEqual(@as(usize, 0), left);
+        }
+    };
+    S.seen = &paths;
+    try eachLayout(S.run);
+}
+
+test "cooler contract: a Cooler load's /props names Sushi Cooler as the engine its forwards run on" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            _ = ids;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            try testing.expectEqualStrings("sushi-cooler", @import("models_api.zig").propsSettingsFor(sv.entry).engine);
+        }
+    }.run);
+}
+
+test "cooler contract: a Cooler load under each KV precision and context extension the web UI offers takes it and loads on the engine" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            _ = ids;
+            const rows = [_]struct { []const u8, []const u8, []const u8 }{
+                .{ "{\"kv_quant\": \"off\"}", "kv_quant", "off" },
+                .{ "{\"kv_quant\": \"4\"}", "kv_quant", "4" },
+                .{ "{\"kv_quant\": \"6\"}", "kv_quant", "6" },
+                .{ "{\"yarn_factor\": 2}", "yarn_factor", "2" },
+            };
+            inline for (rows) |r| {
+                const row = r[0];
+                const Cell = struct {
+                    var d: []const u8 = undefined;
+                    fn body() !void {
+                        var ld: Load = undefined;
+                        try ld.open(C, d, true);
+                        defer _ = ld.close();
+                        // A row the web UI does not offer for this model (DeepSeek keeps no KV cache to quantize, a
+                        // RoPE with no YaRN) has nothing to hold; one it offers must take effect, never skip.
+                        const fit = @import("arch/flags.zig").settingsFit(&ld.config);
+                        const model_settings = @import("model_settings.zig");
+                        if (!model_settings.applies(r[1], fit) or !model_settings.choiceAllowed(r[1], r[2], fit)) return;
+                        errdefer std.debug.print("cooler contract: {s} is offered for this model and did not take effect\n", .{row});
+                        if (comptime std.mem.eql(u8, r[1], "kv_quant")) {
+                            try testing.expect(ld.config.kv_quant_override != null);
+                        } else try testing.expect(ld.config.yarn_factor_override != null);
+                        try testing.expect(ld.onEngine());
+                    }
+                };
+                Cell.d = dir;
+                try withUiSettings(dir, row, Cell.body);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a Cooler load whose warm fails, torn down as a served load's failure is, leaves the pool holding no more than before the load" {
+    try eachFixture(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            defer mlx.engine.fault.disarm();
+            // The pool buffers a warm asks for, counted on a load that serves.
+            var total: u64 = 0;
+            {
+                var fx: Load = undefined;
+                try fx.prepare(C, dir, true);
+                try fx.load(dir);
+                const c0 = mlx.engine.fault.count();
+                fx.serve() catch |e| {
+                    fx.discard();
+                    return e;
+                };
+                total = mlx.engine.fault.count() - c0;
+                _ = fx.close();
+            }
+            mlx.engine.close();
+            const before = mlx.engine.stats().pool_bytes;
+            for ([_]u64{ total / 4, total / 2, total * 3 / 4, total - 2 }) |k| {
+                var fx: Load = undefined;
+                try fx.prepare(C, dir, true);
+                try fx.load(dir);
+                mlx.engine.fault.arm(k);
+                const r = fx.serve();
+                mlx.engine.fault.disarm();
+                if (r) |_| {
+                    _ = fx.close();
+                    continue;
+                } else |_| {}
+                var msg: [300]u8 = undefined;
+                _ = mlx.takeError(&msg);
+                fx.discard();
+                mlx.engine.close();
+                const held = mlx.engine.stats().pool_bytes;
+                errdefer std.debug.print("{s}: a warm failed at pool buffer {d} of {d} leaves the pool at {d} MB, {d} MB before the load\n", .{ std.fs.path.basename(dir), k, total, held >> 20, before >> 20 });
+                try testing.expect(held <= before);
+            }
+        }
+    }.run);
+}
+
+/// The process's memory as a headroom read sees it: MLX's bytes and the engine's pool.
+const MemSnap = struct {
+    mlx_cache: u64,
+    pool: u64,
+    pool_free: u64,
+
+    fn now() MemSnap {
+        mlx.engine.close();
+        var cache: usize = 0;
+        _ = mlx.mlx_get_cache_memory(&cache);
+        const st = mlx.engine.stats();
+        return .{ .mlx_cache = cache, .pool = st.pool_bytes, .pool_free = st.pool_free };
+    }
+};
+
+/// A borrow whose freed pools unwire late (issue 105): the first request's first wide forward reads its headroom a byte
+/// short until the read after its first release has passed, then has room.
+const LateUnwireHeadroom = struct {
+    var req: usize = 0;
+    var reads: u32 = 0;
+    var borrowed = false;
+    fn headroom(_: *const model_mod.ModelConfig) @import("bills.zig").Headroom {
+        const need = @import("dsv41/dsv41_borrow.zig").forward_need;
+        if (req == 0 and !borrowed and need > 0) {
+            reads += 1;
+            if (reads <= 3) return .{ .live = need - 1 };
+            borrowed = true;
+        }
+        return .{ .live = std.math.maxInt(u64) / 4 };
+    }
+};
+
+test "cooler contract: the first served DeepSeek request after a Cooler load's warm starts from the state the second does, and a streamed load's first wide prefill is served through a late-unwiring borrow (issue 107)" {
+    try eachFixture(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            if (!@import("arch/config.zig").isOf(&ld.config, "dsv41")) return error.SkipZigTest;
+            const borrow = @import("dsv41/dsv41_borrow.zig");
+            const was_fn = borrow.headroom_fn;
+            borrow.headroom_fn = &LateUnwireHeadroom.headroom;
+            defer borrow.headroom_fn = was_fn;
+            LateUnwireHeadroom.reads = 0;
+            LateUnwireHeadroom.borrowed = false;
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            var starts: [2]MemSnap = undefined;
+            var grew: [2]u64 = undefined;
+            for (0..2) |r| {
+                const prompt = try a.alloc(u32, 3000);
+                defer a.free(prompt);
+                for (prompt, 0..) |*t, i| t.* = ids[(i * (r + 1) + r * 7) % ids.len];
+                LateUnwireHeadroom.req = r;
+                starts[r] = MemSnap.now();
+                mlx.engine.resetPoolPeak(.process);
+                var from: u32 = 0;
+                var got = try sv.requestWith(prompt, 8, .{ .temperature = 0 }, false, &from);
+                defer got.deinit(a);
+                try testing.expectEqual(@as(usize, 8), got.items.len);
+                // From what was in use at the start: a headroom read counts the pool's free buffers as free.
+                grew[r] = mlx.engine.poolHeldPeak(.process) -| (starts[r].pool -| starts[r].pool_free);
+            }
+            // A start's free buffers are reused in other sizes than a cold start makes: its peak moves by up to them.
+            const rest = @max(starts[0].pool_free, starts[1].pool_free);
+            const in_use = [2]u64{ starts[0].pool -| starts[0].pool_free, starts[1].pool -| starts[1].pool_free };
+            errdefer std.debug.print("first request: MLX cache {d} KB, pool in use {d} KB, grew {d} KB, pool rest {d} KB; second: MLX cache {d} KB, pool in use {d} KB, grew {d} KB, pool rest {d} KB; borrowed {}\n", .{ starts[0].mlx_cache >> 10, in_use[0] >> 10, grew[0] >> 10, starts[0].pool_free >> 10, starts[1].mlx_cache >> 10, in_use[1] >> 10, grew[1] >> 10, starts[1].pool_free >> 10, LateUnwireHeadroom.borrowed });
+            // The late-unwiring borrow ran in the first request, and the request was served. Only a streamed load's
+            // decoder holds expert-cache pools a prefill can borrow: a resident one never takes the borrow path.
+            const stq = arch_handle.trunk(sv.entry.handle.?).arch_state.dsv41.stq_experts;
+            const lends = if (stq) |x| x.engine.borrow_from < x.engine.layers.len else false;
+            try testing.expectEqual(lends, LateUnwireHeadroom.borrowed);
+            // A headroom read counts MLX's cache and the pool's free buffers as free: the first request starts as the second.
+            try testing.expectEqual(starts[1].mlx_cache, starts[0].mlx_cache);
+            // The warm leaves no more of the pool in use than a finished request does.
+            try testing.expect(in_use[0] <= in_use[1]);
+            try testing.expect(@max(grew[0], grew[1]) - @min(grew[0], grew[1]) <= rest);
+        }
+    }.run);
+}
+
+test "cooler contract: a resident load beside buffers already past a declared wired limit's floor is refused by the preflight, which names that limit" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const bills = @import("bills.zig");
+    const status = @import("status.zig");
+    const registry_mod = @import("model_registry.zig");
+    const scheduler_mod = @import("scheduler.zig");
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.fault.disarm();
+
+    // A declared iogpu.wired_limit_mb (above 75% of RAM) whose floor, less the unplanned margin, is 1 GiB.
+    const total = status.getTotalMemBytes();
+    const mb_was = bills.wired_limit_mb_override;
+    defer bills.wired_limit_mb_override = mb_was;
+    bills.wired_limit_mb_override = (total - (1 << 30)) >> 20;
+    const margin_was = bills.launch_state.wired_margin_flag_bytes;
+    defer bills.launch_state.wired_margin_flag_bytes = margin_was;
+    bills.launch_state.wired_margin_flag_bytes = total - (2 << 30);
+    const floor_was = bills.gpu_floor_bytes.load(.monotonic);
+    defer bills.gpu_floor_bytes.store(floor_was, .monotonic);
+
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    @import("cooler_side.zig").forTest(&config, true);
+    const floor = bills.ceilingNow().floor().?;
+    try testing.expect(floor > 0 and floor <= 1 << 30);
+
+    // 1.5 GiB already in use: past the declared floor, well under Metal's working set.
+    const shape = [_]c_int{3 << 27};
+    var held: mlx.mlx_array = .{ .ctx = null };
+    try mlx.check(mlx.mlx_zeros(&held, &shape, 1, .float32, mlx.gpuStream()));
+    defer _ = mlx.mlx_array_free(held);
+    try mlx.check(mlx.mlx_array_eval(held));
+
+    const reg = try registry_mod.ModelRegistry.init(a, io, null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("past-floor", dir, 0);
+    reg.mutex.lockUncancelable(io);
+    try testing.expect(reg.tryBeginLoadLocked(entry));
+    reg.mutex.unlock(io);
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = io;
+    sch.allocator = a;
+    sch.ctx_size_flag = 0;
+    var req: scheduler_mod.LoadRequest = .{ .entry = entry, .config = &config, .tok = undefined, .chat_config = undefined, .model_dir = dir, .evict_entries = &.{} };
+    // Past the preflight the first checked MLX call is the weights': failing it ends an admitted load before it needs a
+    // tokenizer.
+    mlx.fault.arm(1);
+    model_load.runLoadRequest(&sch, &req);
+    const admitted = mlx.fault.didFire();
+    mlx.fault.disarm();
+    if (admitted) {
+        var msg: [300]u8 = undefined;
+        _ = mlx.takeError(&msg);
+    }
+    errdefer std.debug.print("a load beside {d} MB in use under a {d} MB floor ended {s}; the preflight admitted it: {}\n", .{ @import("gpu_mem.zig").activeBytes() >> 20, floor >> 20, req.outcome.errorName() orelse "loaded", admitted });
+    try testing.expect(!admitted);
+    try testing.expectEqualStrings("InsufficientMemory", req.outcome.errorName().?);
+    try testing.expect(std.mem.indexOf(u8, req.refusal_text[0..req.refusal_text_len], "iogpu.wired_limit_mb = ") != null);
+}
+
+/// What a load's preflight saw of MLX's pool when it read the memory (the serving-bill hook runs inside it).
+const PreflightSawMlx = struct {
+    var mlx_cache: ?usize = null;
+    fn bill(_: *const model_mod.ModelConfig, _: u64) ?model_load.LoadServingBill {
+        var c: usize = 0;
+        _ = mlx.mlx_get_cache_memory(&c);
+        mlx_cache = c;
+        // Past the eviction: the first checked MLX call from here is the new load's weights'.
+        mlx.fault.arm(1);
+        return null;
+    }
+};
+
+/// A load of the tiny Qwen (on the engine or on MLX) that evicts the same pack loaded on MLX, failed at its first
+/// weights call; returns what MLX's pool held when its preflight read the memory.
+fn evictMlxModel(new_on_engine: bool) !usize {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const registry_mod = @import("model_registry.zig");
+    const scheduler_mod = @import("scheduler.zig");
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.fault.disarm();
+    _ = mlx.mlx_clear_cache();
+
+    const reg = try registry_mod.ModelRegistry.init(a, io, null, 3, 0, null);
+    defer reg.deinit();
+    // The victim: the same pack loaded on MLX (the user's opt-out), as a served load leaves it on the heap.
+    const victim = try reg.registerStub("victim", dir, 0);
+    const config = try a.create(model_mod.ModelConfig);
+    victim.config = config;
+    {
+        const off = model_mod.cooler_off;
+        defer model_mod.cooler_off = off;
+        model_mod.cooler_off = .full;
+        config.* = try model_mod.parseConfig(io, a, dir);
+        model_load.applyModelSettings(config, .{});
+    }
+    @import("cooler_side.zig").forTest(config, true);
+    try testing.expect(!arch_handle.onEngine(null, config));
+    const weights = try a.create(model_mod.Weights);
+    weights.* = try model_mod.loadWeightsForConfig(io, a, dir, config, false);
+    victim.weights = weights;
+    const t = try a.create(Trunk);
+    t.* = try Trunk.init(io, a, config.*, weights);
+    victim.handle = arch_handle.adopt(t);
+    var active_victim: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_victim);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(victim, active_victim);
+    reg.markEvictingLocked(victim);
+    reg.mutex.unlock(io);
+
+    // A second id has a folder of its own (`FolderId`); the load reads the pack from `req.model_dir`.
+    var other_tmp = testing.tmpDir(.{});
+    defer other_tmp.cleanup();
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    const other = try reg.registerStub("other", ob[0..try other_tmp.dir.realPath(io, &ob)], 0);
+    reg.mutex.lockUncancelable(io);
+    try testing.expect(reg.tryBeginLoadLocked(other));
+    reg.mutex.unlock(io);
+    var other_config = blk: {
+        const off = model_mod.cooler_off;
+        defer model_mod.cooler_off = off;
+        if (!new_on_engine) model_mod.cooler_off = .full;
+        var c = try model_mod.parseConfig(io, a, dir);
+        model_load.applyModelSettings(&c, .{});
+        break :blk c;
+    };
+    defer other_config.deinit(a);
+    @import("cooler_side.zig").forTest(&other_config, true);
+    try testing.expectEqual(new_on_engine, arch_handle.onEngine(null, &other_config));
+    var victims = [_]*registry_mod.LoadedModel{victim};
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = io;
+    sch.allocator = a;
+    sch.ctx_size_flag = 0;
+    const hook_was = scheduler_mod.load_serving_bill;
+    defer scheduler_mod.load_serving_bill = hook_was;
+    scheduler_mod.load_serving_bill = &PreflightSawMlx.bill;
+    PreflightSawMlx.mlx_cache = null;
+    var req: scheduler_mod.LoadRequest = .{ .entry = other, .config = &other_config, .tok = undefined, .chat_config = undefined, .model_dir = dir, .evict_entries = &victims };
+    model_load.runLoadRequest(&sch, &req);
+    mlx.fault.disarm();
+    var msg: [300]u8 = undefined;
+    _ = mlx.takeError(&msg);
+    try testing.expectEqual(registry_mod.LoadState.unloaded, victim.state);
+    _ = mlx.mlx_clear_cache();
+    return PreflightSawMlx.mlx_cache orelse error.TestUnexpectedResult;
+}
+
+test "cooler contract: a load that evicts a model on MLX reads its preflight with the victim's freed buffers given back, on the engine as on MLX" {
+    for ([_]bool{ true, false }) |new_on_engine| {
+        const parked = try evictMlxModel(new_on_engine);
+        errdefer std.debug.print("a load {s} that evicted a model on MLX read its preflight beside {d} KB in MLX's pool\n", .{ if (new_on_engine) "on the engine" else "on MLX", parked >> 10 });
+        try testing.expect(parked < 1 << 20);
+    }
+}
+
+test "cooler contract: a second Cooler load beside a sealed one whose warm fails leaves the engine sealed, as the second load's success would" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            defer mlx.engine.fault.disarm();
+            var first: Load = undefined;
+            try first.open(C, dir, true);
+            defer _ = first.close();
+            try testing.expect(mlx.engine.sealed());
+            // The warm's pool asks, counted on a second load that serves: it ends sealed.
+            var total: u64 = 0;
+            {
+                var fx: Load = undefined;
+                try fx.prepare(C, dir, true);
+                try fx.load(dir);
+                try testing.expect(!mlx.engine.sealed());
+                const c0 = mlx.engine.fault.count();
+                fx.serve() catch |e| {
+                    fx.discard();
+                    return e;
+                };
+                total = mlx.engine.fault.count() - c0;
+                _ = fx.close();
+            }
+            try testing.expect(mlx.engine.sealed());
+            if (total < 2) return error.SkipZigTest;
+            var fx: Load = undefined;
+            try fx.prepare(C, dir, true);
+            try fx.load(dir);
+            mlx.engine.fault.arm(total / 2);
+            const r = fx.serve();
+            mlx.engine.fault.disarm();
+            if (r) |_| {
+                _ = fx.close();
+                return error.SkipZigTest;
+            } else |_| {}
+            var msg: [300]u8 = undefined;
+            _ = mlx.takeError(&msg);
+            fx.discard();
+            errdefer std.debug.print("{s}: the first load serves on with the engine unsealed after a second load's warm failed at pool buffer {d} of {d}\n", .{ std.fs.path.basename(dir), total / 2, total });
+            try testing.expect(mlx.engine.sealed());
+        }
+    }.run);
+}

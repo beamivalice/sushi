@@ -63,7 +63,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 
   | binary | holds |
   |---|---|
-  | `test-cooler` | the Sushi Cooler contract |
+  | `test-cooler` | the Sushi Cooler contract: a run step per family file (`cooler-load`, `-pool`, `-prefill-bill`, `-requests`, `-restore`) and one per late cell |
   | `test-deepseek`, `test-qwen`, `test-glm`, `test-mimo` | `src/dsv41/`, `src/qwen4/`, `src/glm5/`, `src/mimo2/`, less their prefix-cache files |
   | `test-kernels` | `src/tensor/` and the shared kernels (attention, verify, MoE, FP8, MTP, DFlash, MLX and Metal glue) |
   | `test-generate` | generation, the scheduler, MTP and DFlash rounds, sampling, the KV and SSM caches, the trunk |
@@ -113,7 +113,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   sets `QWEN4_TEST_MODEL` passes (`tests/gate.sh` does): without it such a step fails before its first test, naming
   the flag (`SUSHI_TEST_FIXTURE_CUT`). Without `--maxrss` the budget is the machine's RAM (`hw.memsize`); a box under
   the largest bound refuses the build by name.
-- **The Sushi Cooler contract** (`src/cooler_contract_test.zig`, tests `cooler contract:`) runs on the tiny fixtures of
+- **The Sushi Cooler contract** (`src/cooler_contract_test.zig`, its runner and helpers, and its cells in one file per
+  family, `cooler_<family>_test.zig`, each a run step of `test-cooler`; tests `cooler contract:`) runs on the tiny fixtures of
   every arch that declares `cooler_contract`: the side, every weight in an owned region, a request and the model's
   teardown asking MLX nothing, an exact speculative request saying its greedy tokens, fault sweeps over the load and a
   request, nothing compiled after it, and a load of more than one row (`coolerRows`) giving each row its solo request's
@@ -133,7 +134,11 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   call, and each step of its warm at its first. A checked call is one that makes a result on a stream: a call on the
   stream handle itself is not (a fault there skipped its free), and a test-only reading made on the way to the call
   under test (the TF32 probe) goes past the fault (`mlx.past_fault`), so a test passes alone as in the suite.
-  Its no-late-kernel test proves its property only on a fresh pipeline cache (run it alone): the cache is the process's.
+  Its no-late-kernel tests prove their property only on a fresh pipeline cache, which is the process's: they run alone.
+- **Tests that run alone** (`alone_tests` in build.zig): each is a run step of its own, a fresh process, left out of its
+  file's step. Every test that proves nothing compiles after a load's warm or seal is one (the contract's late cells,
+  DeepSeek's, Qwen's GDN, QSA and vision warms, the engine route's first uses): an earlier test's compiles in the same
+  process would hide a late one. A new such test joins the table in its landing; an entry must name exactly one test.
 - **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device
   profile and the engine dispatch as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`). A test about one arm's bytes names it
   (`device.current().has(.matrix_g17)`), never a chip.
