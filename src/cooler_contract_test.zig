@@ -1879,7 +1879,6 @@ const Served = struct {
         self.sch = scheduler.submitTestScheduler(a, 2);
         self.sch.kv_quant = null;
         self.sch.metrics = null;
-        self.sch.hot_prefix_cache = null;
         self.sch.requests_prefilling = .init(0);
         self.sch.inflight_prefill_tokens = .init(0);
         self.sch.inflight_prefill_expected = .init(0);

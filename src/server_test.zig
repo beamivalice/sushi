@@ -668,7 +668,7 @@ test "server: a load that fails after evicting the model in use leaves no view o
                 // The inference loop runs its post-load revise between jobs.
                 var none = [_]std.posix.pollfd{};
                 _ = std.posix.poll(&none, 200) catch {};
-                if (sch.current_model == tiny or sch.hot_prefix_cache != null) return error.EvictedModelStillInView;
+                if (sch.current_model == tiny or sch.hotPrefixCache() != null) return error.EvictedModelStillInView;
                 if (sch.resident_hot_cache_bytes.load(.monotonic) != 0) return error.EvictedModelHotCacheCredited;
                 gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
                 const retry = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
@@ -678,6 +678,49 @@ test "server: a load that fails after evicting the model in use leaves no view o
         }.run);
     }
     try testing.expect(Scenario.failed_loads > 0);
+}
+
+test "server: a model loaded beside the current one with no hot cache of its own leaves no view of the other's cache, which then unloads" {
+    const ram_was = server_state.prefix_cache_ram_enabled;
+    defer server_state.prefix_cache_ram_enabled = ram_was;
+    server_state.prefix_cache_ram_enabled = false;
+    const Scenario = struct {
+        var seen: u32 = 0;
+    };
+    try eachArch(4, .{ .tiny2 = true, .max_resident = 2 }, struct {
+        fn run() !void {
+            var b: [512]u8 = undefined;
+            gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "the river runs to the sea and on and on", 8, false)));
+            const sch = server_state.global_scheduler.?;
+            const reg = server_state.global_registry.?;
+            const tiny = reg.entries.get("tiny").?;
+            const tiny2 = reg.entries.get("tiny2").?;
+            // With RAM retention off a hot cache is an SSD tier's; an arch whose tiny keeps none has no view to leave.
+            if (tiny.prefix_cache == null) return;
+            const tiny_hc = &tiny.prefix_cache.?;
+            // tiny2's SSD tier cannot come up (an unusable cache folder), so it loads with no hot cache.
+            var keep: [1024]u8 = undefined;
+            const cache_dir = try std.fmt.bufPrintSentinel(&keep, "{s}", .{std.mem.span(std.c.getenv("SUSHI_PREFIX_CACHE_DIR").?)}, 0);
+            _ = setenv("SUSHI_PREFIX_CACHE_DIR", "not-absolute", 1);
+            const second = request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
+            _ = setenv("SUSHI_PREFIX_CACHE_DIR", cache_dir.ptr, 1);
+            const s2 = try second;
+            defer gpa.free(s2);
+            if (!std.mem.startsWith(u8, s2, "HTTP/1.1 200")) return error.SecondModelNotServed;
+            if (tiny2.prefix_cache != null) return error.SecondModelKeptAHotCache;
+            Scenario.seen += 1;
+            if (sch.current_model != tiny2) return error.SecondModelNotCurrent;
+            if (sch.hotPrefixCache() == tiny_hc) return error.OtherModelsHotCacheInView;
+            const unloaded = try request("POST", "/v1/unload-model", "{\"model\":\"tiny\"}");
+            defer gpa.free(unloaded);
+            if (!std.mem.startsWith(u8, unloaded, "HTTP/1.1 200")) return error.UnloadFailed;
+            if (sch.hotPrefixCache() != null) return error.UnloadedModelsHotCacheStillInView;
+            const third = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
+            defer gpa.free(third);
+            if (!std.mem.startsWith(u8, third, "HTTP/1.1 200")) return error.SecondModelStoppedServing;
+        }
+    }.run);
+    try testing.expect(Scenario.seen > 0);
 }
 
 /// The next WebSocket frame the server sends (unmasked), its payload; the caller frees.

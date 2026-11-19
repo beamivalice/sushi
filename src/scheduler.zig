@@ -46,7 +46,6 @@ const spec_stats = @import("spec_stats.zig");
 const cache_stats = @import("cache_stats.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const model_mod = @import("model.zig");
-const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const restore_dump = @import("restore_dump.zig");
@@ -72,8 +71,6 @@ const dflash_mod = @import("dflash.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const DflashModel = dflash_mod.DflashModel;
-const VisionEncoder = vision_mod.VisionEncoder;
-const Weights = model_mod.Weights;
 const ChatConfig = chat_mod.ChatConfig;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -149,7 +146,7 @@ pub const SubmitParams = struct {
     /// resolves this via `scheduler.ensureLoaded(id)` BEFORE submitting and
     /// keeps a refcount on it for the slot's lifetime, so the model can't
     /// be evicted mid-flight. The scheduler routes prefill/decode through
-    /// `slot.model.handle` (and friends) instead of `sch.xfm`, so
+    /// `slot.model.handle` (and friends) instead of `sch.current_model`, so
     /// per-tick model switching is just a pointer hop. Required field
     /// post-Phase-D; tests using the legacy path pass the default model.
     model: *model_registry_mod.LoadedModel,
@@ -1069,20 +1066,11 @@ pub const Scheduler = struct {
 
     // ── Plan 05 — multi-model state. Source of truth for model fields is
     //    `current_model` (a borrowed *LoadedModel owned by the registry).
-    //    The fields below (`xfm`, `weights`, …) are *borrowed views* into
-    //    `current_model` set at load time so existing scheduler-internal
-    //    code can keep reading them as fields. Phase D will refresh these
-    //    views on every model swap inside `pickNextTickWork`.
     registry: *ModelRegistry,
+    /// The model loaded last, the only per-model state the scheduler keeps: every view of a model derives from it
+    /// (`hotPrefixCache`, `currentDflash`), so none outlives the model.
     current_model: ?*LoadedModel,
 
-    // ── Borrowed views (non-owning). Cleared on shutdown via
-    //    `clearCurrentModelViews`. Null only before load completes or after
-    //    an eviction in Phase D.
-    xfm: ?*Trunk,
-    weights: ?*Weights,
-    vision_encoder: ?*VisionEncoder,
-    dflash: ?*DflashModel = null,
     drafter_block_size: u32,
     kv_quant: ?trunk.KVQuantConfig,
     /// `LoadParams.ctx_size`, retained so every load resolves its context
@@ -1126,13 +1114,7 @@ pub const Scheduler = struct {
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     drafter_path: []const u8,
 
-    /// Phase A6 → Plan 05: per-model hot prefix cache. Pre-Plan-05 this was
-    /// a server-owned global; Plan 05 moves it onto `LoadedModel` so each
-    /// model gets isolation by construction. Borrowed view here is the
-    /// current model's cache (or null when the cache isn't applicable for
-    /// the model, e.g. hybrid SSM archs).
-    hot_prefix_cache: ?*prefix_cache_mod.HotPrefixCache,
-    /// Resident hot-cache bytes, published for the connection thread: `hot_prefix_cache` is
+    /// Resident hot-cache bytes, published for the connection thread: `hotPrefixCache()` is
     /// inference-thread state, freed on every model switch, so the guard reads this number
     /// and never the pointer.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -1301,9 +1283,6 @@ pub const Scheduler = struct {
             .io = io,
             .registry = params.registry,
             .current_model = null,
-            .xfm = null,
-            .weights = null,
-            .vision_encoder = null,
             .drafter_block_size = 0,
             .kv_quant = params.kv_quant,
             .ctx_size_flag = params.ctx_size,
@@ -1323,7 +1302,6 @@ pub const Scheduler = struct {
             .drafter_dir = params.drafter_dir,
             .primary_model_dir = params.model_dir,
             .drafter_path = params.drafter_dir,
-            .hot_prefix_cache = null,
             .max_concurrent = cap,
             .force_batched = force_batched,
             .queue_mu = .init,
@@ -1398,6 +1376,18 @@ pub const Scheduler = struct {
         const name = self.load_error_name orelse "unknown";
         log.err("[scheduler] model load failed: {s}\n", .{name});
         return error.LoadFailed;
+    }
+
+    /// The current model's hot prefix cache: a view derived from `current_model` each time, never stored.
+    pub fn hotPrefixCache(self: *const Scheduler) ?*prefix_cache_mod.HotPrefixCache {
+        const model = self.current_model orelse return null;
+        return if (model.prefix_cache) |*hc| hc else null;
+    }
+
+    /// The current model's DFlash drafter, derived as `hotPrefixCache` is.
+    pub fn currentDflash(self: *const Scheduler) ?*DflashModel {
+        const model = self.current_model orelse return null;
+        return model.dflash;
     }
 
     pub fn releaseStartupPin(self: *Scheduler) void {
@@ -1475,13 +1465,6 @@ pub const Scheduler = struct {
             }
         }
         self.current_model = null;
-        // Clear the borrowed views so post-shutdown reads (defensive) see
-        // null rather than dangling pointers.
-        self.xfm = null;
-        self.weights = null;
-        self.vision_encoder = null;
-        self.dflash = null;
-        self.hot_prefix_cache = null;
         self.resident_hot_cache_bytes.store(0, .monotonic);
         if (hot_cache_budget_invalidate) |f| f();
         self.reclaimable_hot_cache_bytes.store(0, .monotonic);
@@ -2372,10 +2355,10 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
 }
 
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
-    const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    const bytes: u64 = if (sch.hotPrefixCache()) |hc| hc.residentBytes() else 0;
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
     cache_stats.process.setHotBytes(readyHotCacheBytes(sch));
-    const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
+    const reclaimable: u64 = if (sch.hotPrefixCache()) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
     publishDiskStats(sch);
     publishHotCacheDigests(sch);
@@ -2428,11 +2411,11 @@ fn publishCachedSessions(sch: *Scheduler) void {
 /// An allocation failure keeps the previous snapshot: a stale digest is a hint, an empty one
 /// credits bytes that exist.
 fn publishHotCacheDigests(sch: *Scheduler) void {
-    const fresh: []prefix_cache_mod.HotPrefixCache.EntryDigest = if (sch.hot_prefix_cache) |hc|
+    const fresh: []prefix_cache_mod.HotPrefixCache.EntryDigest = if (sch.hotPrefixCache()) |hc|
         (hc.digestsAlloc(sch.allocator) catch return)
     else
         &.{};
-    const residency: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    const residency: u64 = if (sch.hotPrefixCache()) |hc| hc.residentBytes() else 0;
     sch.digest_mu.lockUncancelable(sch.io);
     const old = sch.hot_cache_digests;
     sch.hot_cache_digests = fresh;
@@ -2564,7 +2547,6 @@ fn rearmDeclinedTiers(sch: *Scheduler) void {
         }
         if (!model_load.rearmDiskTier(sch.allocator, sch.io, entry, cacheAttach(sch), if (forced) "SSD-cache setting changed" else "free space returned")) continue;
         armed = true;
-        if (entry == sch.current_model) sch.hot_prefix_cache = &entry.prefix_cache.?;
     }
     sch.rearm_wait_ns = sched_policy.rearmWaitNs(busy);
     sch.rearm_sw.reset();
@@ -3135,7 +3117,7 @@ pub fn slotStateBytes(s: *const Slot) u64 {
 /// buffers, when the slot's cache is the one published.
 fn slotDonatedBytes(sch: *const Scheduler, s: *const Slot) u64 {
     const hc = if (s.model.prefix_cache) |*h| h else return 0;
-    if (sch.hot_prefix_cache != hc) return 0;
+    if (sch.hotPrefixCache() != hc) return 0;
     return hc.donatedBytes(@intFromPtr(s));
 }
 
@@ -3564,7 +3546,7 @@ const ChunkWidthCtx = struct {
     sch: *Scheduler,
     cfg: ?*const model_mod.ModelConfig,
     kv_bits: u64,
-    /// This slot's own per-model cache, never `sch.hot_prefix_cache`; only `stagedHostBytes`
+    /// This slot's own per-model cache, never `sch.hotPrefixCache()`; only `stagedHostBytes`
     /// is read, on the inference thread.
     hc: ?*prefix_cache_mod.HotPrefixCache,
     /// The prefill loop's end the width was last asked at (`AdaptiveWidthState.loop_end`), which a widen re-prices at.
@@ -4036,7 +4018,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
                 if (prefill_request_chunk) |pick_pre| {
                     admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
                 }
-                // Per-model, off the slot: `sch.hot_prefix_cache` is whichever model loaded last.
+                // Per-model, off the slot: `sch.hotPrefixCache()` is whichever model loaded last's.
                 // Captured by pointer: a `|hc|` capture would evict from a stack copy.
                 var report = if (slot.model.prefix_cache) |*hc|
                     // Never evict the entry this request restored from: its buffers are shared.
@@ -4960,7 +4942,7 @@ test "a cancelled prefill with no Generator commits its forwarded prefix, pad-on
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     sch.metrics = null;
-    sch.hot_prefix_cache = null;
+    sch.current_model = null;
     sch.hot_cache_digests = &.{};
     sch.digest_residency = 0;
     sch.digest_mu = .init;
@@ -6300,7 +6282,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     model.handle = null;
     model.config = null;
     defer model.prefix_cache.?.entries.deinit(testing.allocator);
-    sch.hot_prefix_cache = &model.prefix_cache.?;
+    sch.current_model = &model;
 
     var cp_entries = [_]trunk.KVCacheEntry{trunk.newEmptyKVEntry()};
     _ = mlx.mlx_zeros(&cp_entries[0].keys, &[_]c_int{ 1, 1, 8, 4 }, 4, .bfloat16, s);

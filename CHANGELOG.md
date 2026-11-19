@@ -156,6 +156,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **Stopping the server during an unload answers the requests waiting on that model**: a request sent while an unload
   waited for its model's last stream never got an answer once a shutdown came, and the server exited with an error
   after 35 s without its cleanup; it now gets the shutdown error at once.
+- **A model loaded beside another with no prefix cache of its own no longer reports the other's**: the memory and
+  cache figures kept counting the first model's cache, and kept pointing at it once that model was unloaded.
 - **A load the server's shutdown ends answers the shutdown even when memory is short**: the load could read as done,
   leaving the model it was to evict marked for eviction; and **`POST /v1/load-model` of a failed model refused because
   a download into its folder just started keeps the model's failure**, which it erased without loading.

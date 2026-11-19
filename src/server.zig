@@ -873,7 +873,7 @@ pub fn serve(
     // (entry.prefix_cache) and is set up by `loadModelOnInferenceThread`
     // using the per-LoadParams capacity + byte budget. Surface a friendly
     // log line so users see whether the cache engaged.
-    if (scheduler.hot_prefix_cache != null) {
+    if (scheduler.hotPrefixCache() != null) {
         if (!server_state.prefix_cache_ram_enabled and diskTierOn(config)) {
             log.info("Prefix cache: SSD ONLY (RAM retention off)\n", .{});
         } else if (resolvedPrefixCacheMem() > 0) {
@@ -945,7 +945,7 @@ pub fn serve(
     }
     var default_max_tokens_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
     log.info("default max_tokens for omitted requests: {s}\n", .{request_policy.describeMaxTokens(&default_max_tokens_buf, request_policy.filledMaxTokens(config), request_policy.maxTokensOrigin(null, request_policy.launchMaxTokensDefault(), config.defaultMaxTokens()))});
-    if (scheduler.dflash != null) {
+    if (scheduler.currentDflash() != null) {
         log.info("DFlash speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
     if (arch_flags.mtpOffLine(config)) |line| {

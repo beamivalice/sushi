@@ -2766,14 +2766,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.registry.markReadyLocked(entry, bytes_resident);
     sch.registry.mutex.unlock(sch.io);
 
-    // Set borrowed views for scheduler-internal code (and `current_model`
-    // for ensureLoaded → request handlers in Phase C).
     sch.current_model = entry;
-    sch.weights = weights_ptr;
-    sch.xfm = xfm_ptr;
-    sch.vision_encoder = vision_ptr;
-    sch.dflash = dflash_ptr;
-    if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
     publishHotCacheResidency(sch);
     load_clock.end();
     if (params.config.dsv41 != null) {
@@ -2834,16 +2827,11 @@ fn retire(entry: *LoadedModel, why: []const u8) void {
     if (on_mlx) _ = mlx.mlx_clear_cache();
 }
 
-/// The scheduler's borrowed views of a model `retire` freed: an unload's or an eviction's, whether the load that evicted
-/// it then succeeds or fails, or the next reader dereferences freed memory.
+/// The scheduler's view of a model `retire` freed: an unload's or an eviction's, whether the load that evicted it then
+/// succeeds or fails, or the next reader dereferences freed memory. Every other view derives from `current_model`.
 fn dropViewsOf(sch: *Scheduler, entry: *LoadedModel) void {
     if (sch.current_model != entry) return;
     sch.current_model = null;
-    sch.xfm = null;
-    sch.weights = null;
-    sch.vision_encoder = null;
-    sch.dflash = null;
-    sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
     if (scheduler_mod.hot_cache_budget_invalidate) |f| f();
 }

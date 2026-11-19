@@ -195,9 +195,10 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   wait let a request claim the load, and the finalize then overwrote its `.loading` — a second claim loaded the model again
   (44 GB leaked, the retained tokenizer freed under a live request: SIGSEGV). Guard: `an entry being unloaded cannot be
   claimed for a load until its eviction is finalized` (model_registry.zig), `tests/test_cold_load.sh` boot 3.
-- **A model `retire` freed leaves no view behind**: `dropViewsOf` clears the scheduler's borrowed views (current model,
-  xfm, weights, vision, DFlash, hot cache) after every unload AND every eviction, so a load that fails after evicting
-  the model in use does not leave the next reader on freed memory. Guard: `server: a load that fails after evicting`.
+- **A model `retire` freed leaves no view behind**: the scheduler stores only `current_model`, which `dropViewsOf` clears
+  after every unload AND every eviction; every per-model view (`hotPrefixCache`, `currentDflash`) derives from it on
+  each read, so no view can name a model that is not the current one, or one already freed. Guards: `server: a load
+  that fails after evicting`, `server: a model loaded beside the current one with no hot cache of its own`.
 - **`loaded:false` in `/v1/models` is not "freed"**: the row turns false at `.evicting`, while the free, the MLX cache clear
   and the unwire wait still run on the inference thread (RSS reads GBs high until then). A script that samples memory
   after an unload waits for state `unloaded`.
