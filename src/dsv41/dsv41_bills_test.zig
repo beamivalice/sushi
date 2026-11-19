@@ -572,3 +572,32 @@ test "DeepSeek's request bill prices its decode forward at the reply's end, not 
     const decode = c.forwardCap(dsv41_config.verify_rows, seq + reply + dsv41_config.verify_rows);
     try t.expect(bills.prefillNeededAtChunk(&config, seq, reply, 16, 2048, .{}) >= stored + decode);
 }
+
+// Contract (engine-memory-admission, Admission): an explicit max_tokens that does not fit is refused by name, with the
+// largest max_tokens that fits; any value a refusal names is admitted when applied.
+test "DeepSeek: a refusal caused by max_tokens names the max_tokens and the context that fit, and both are admitted when applied" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.num_attention_heads = 64;
+    config.pinned_context = 1_048_576;
+    config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
+    config.expert_borrow_bytes = 0;
+    for ([_]bool{ false, true }) |cooler| {
+        config.cooler_for_test = cooler;
+        const seq: u64 = 64;
+        const asked: u32 = 1_000_000;
+        const needed = bills.prefillNeededAtChunk(&config, seq, asked, 16, 512, .{});
+        const prompt_alone = bills.prefillNeededAtChunk(&config, seq, 1, 16, 512, .{});
+        const available = prompt_alone + (needed - prompt_alone) / 2;
+        const bill = bills.creditedAdmissionBill(&config, needed, available, 0, 0, 512);
+        try t.expect(!bill.fits());
+        const r = bills.requestContextRefusal(&config, seq, asked, @import("../kv_quant.zig").KVQuantConfig.dense, bill, .{}) orelse return error.TestExpectedRefusalFigures;
+        try t.expect(r.fitting_max_tokens > 0 and r.fitting_max_tokens < asked);
+        try t.expect(bills.prefillNeededAtChunk(&config, seq, r.fitting_max_tokens, 16, 512, .{}) <= available);
+        try t.expect(r.maximum > seq);
+        try t.expect(bills.prefillNeededAtChunk(&config, seq, @intCast(r.maximum - seq), 16, 512, .{}) <= available);
+    }
+}

@@ -552,7 +552,8 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   the 256-row step and, on Sushi Cooler, the pool's size class), drained as it becomes resident; MiMo's is zero.
 - **A request's whole reply is billed** (`bills.cacheCapacityTokens`): a long prompt's reservation, else the cache its
   decode grows to by the +25% steps. An explicit `max_tokens` that does not fit is refused by name: the refusal gives
-  the bill, what is available and the largest `max_tokens` that fits (`requestContextRefusal`, EXL3 packs). The live
+  the bill, what is available and the largest `max_tokens` that fits (`requestContextRefusal`, on EXL3 packs and every
+  arch with its own request bill: DeepSeek, GLM). The live
   364k session's Turn A, admitted at 13,269 MB under the old 8192-token headroom, bills 20,845 MB on MLX.
 - **A refusal names only values its own bill admits**: the maximum context is the request's prompt and the longest reply
   that fits (the longest prompt alone when the prompt does not fit), and the bill prices every cache row the same way,

@@ -1090,8 +1090,18 @@ pub fn maxSushiContextUpTo(config: *const model_mod.ModelConfig, upper: u32, kv_
     return low;
 }
 
+/// Whether a refusal can name the max_tokens and the context that fit: the resident Sushi EXL3 bill, or an arch's own
+/// request bill (`requestBill`), each priced by `prefillNeededAtChunk` at any prompt and reply.
+fn refusalNamesFigures(config: *const model_mod.ModelConfig) bool {
+    if (model_mod.usesSushiQuantMemoryBill(config)) return true;
+    const claimed = arch_spec.of(config) orelse return false;
+    return switch (claimed) {
+        inline else => |_, tag| @hasDecl(arch_registry.Mod(tag).bill, "requestBill"),
+    };
+}
+
 pub fn requestContextRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv: trunk.KVQuantConfig, bill: AdmissionBill, warm: WarmPrefix) ?model_registry_mod.MemoryContextRefusal {
-    if (!model_mod.usesSushiQuantMemoryBill(config)) return null;
+    if (!refusalNamesFigures(config)) return null;
     const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
     const budget = bill.available +| bill.evictionCredit();
     const ctx = getEffectiveContextLength(config);
@@ -6272,14 +6282,41 @@ test "bill pin: the refusal sentences" {
     try std.testing.expectEqualStrings("Context 160000 does not fit available GPU memory at KV4, prefill chunk 1024: the request needs 9000 MB and 7000 MB is available, and the prompt alone does not fit. Maximum context: 64000 tokens. Reduce context or free memory.", alone);
 }
 
+test "a memory refusal names a max_tokens and a maximum context its own request admits, on every served pack's bill" {
+    const saved = launch_state.server_config.max_context_size;
+    defer launch_state.server_config.max_context_size = saved;
+    launch_state.server_config.max_context_size = 100_000;
+    var fx = try fixtures.PinFx.init();
+    defer fx.deinit();
+    var named: usize = 0;
+    for (fx.all()) |cfg| {
+        var c = cfg.*;
+        c.expert_layout = .exl3_k4;
+        const seq: u64 = 64;
+        const asked: u32 = 90_000;
+        const needed = prefillNeededAtChunk(&c, seq, asked, 8, 1024, .{});
+        const alone = prefillNeededAtChunk(&c, seq, 1, 8, 1024, .{});
+        const available = alone + (needed - alone) / 2;
+        const r = requestContextRefusal(&c, seq, asked, trunk.KVQuantConfig.affine(8), .{ .needed = needed, .available = available, .chunk = 1024 }, .{}) orelse return error.TestExpectedRefusalFigures;
+        errdefer std.debug.print("{s}: max_tokens {d} and maximum context {d} named against {d} MB\n", .{ c.model_type, r.fitting_max_tokens, r.maximum, available >> 20 });
+        try std.testing.expect(r.fitting_max_tokens > 0 and r.fitting_max_tokens < asked);
+        try std.testing.expect(prefillNeededAtChunk(&c, seq, r.fitting_max_tokens, 8, 1024, .{}) <= available);
+        try std.testing.expect(prefillNeededAtChunk(&c, seq, @intCast(r.maximum - seq), 8, 1024, .{}) <= available);
+        named += 1;
+    }
+    try std.testing.expectEqual(fx.all().len, named);
+}
+
 test "bill pin: requestContextRefusal" {
     const saved = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("requestContextRefusal", &.{
         1, 94096, 100000, 32212254720, 22548578304, 8, 1024, 1,
-        94096, 100000, 32212254720, 22548578304, 8, 1024, 0, 0,
-    }, .{ 7, 7, 1, 1 }, struct {
+        94096, 100000, 32212254720, 22548578304, 8, 1024, 1, 94096,
+        100000, 32212254720, 22548578304, 8, 1024, 1,
+        94096, 100000, 32212254720, 22548578304, 8, 1024,
+    }, .{ 7, 7, 7, 7 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             var exl3 = c.*;
             exl3.expert_layout = .exl3_k4;

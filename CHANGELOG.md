@@ -10,6 +10,9 @@ earlier history is mlx-serve's, in that project's changelog.
   for memory (a host allocation, say) failed every request decoding at that moment, other models' included.
 - **A Qwen image encode on Sushi Cooler stays inside its memory bill**: its patch arrays were made before the encode's
   cap went in, so they could land on free buffers past the bill.
+- **A DeepSeek or GLM request whose `max_tokens` does not fit in memory is told the `max_tokens` and context that do**:
+  it read "Reduce prompt size or use a smaller model", which named neither; the values it now names are admitted when
+  applied.
 - **A DeepSeek request on Sushi Cooler is billed its one 256 MB memory margin once**: the bill took a forward's cap,
   which already carries the margin, and added it again, so a request within 256 MB of the edge was refused and the
   advertised context came out that much smaller. Its last decode forward is now priced where it runs, at the reply's
