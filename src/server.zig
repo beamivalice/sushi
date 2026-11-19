@@ -1096,8 +1096,8 @@ fn logFdQuota(allocator: std.mem.Allocator, err: anyerror) void {
     log.err("{s}\n", .{fd_limits.quotaLine(&line_buf, err, c)});
 }
 
-/// How long a shutdown waits for its connection threads. Past `beginShutdown` each one's wait is bounded by the read
-/// and send limits: no new work is taken, and what it waited on is cancelled or failed.
+/// How long a shutdown waits for its connection threads. Past `beginShutdown` a read ends at the shutdown
+/// (`Conn.awaitReadable`) and a send at its limit: no new work is taken, and what a thread waited on is cancelled or failed.
 const CONN_DRAIN_MS: u64 = 35_000;
 
 /// Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): stop the accept

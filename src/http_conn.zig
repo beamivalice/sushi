@@ -313,7 +313,9 @@ pub const Conn = struct {
     /// Read up to buf.len bytes; may return fewer (HTTP-style short read). Returns 0 on EOF.
     /// Uses `readVec` because `readSliceShort` blocks until the buffer is full or EOF —
     /// wrong semantics for HTTP request parsing where we read until headers terminate.
+    /// Waits without a limit for bytes, as `awaitReadable(null)`: a shutdown ends it with `error.Shutdown`.
     pub fn read(c: *Conn, buf: []u8) !usize {
+        _ = try c.awaitReadable(null);
         var bufs: [1][]u8 = .{buf};
         return c.reader().readVec(&bufs) catch |err| switch (err) {
             error.EndOfStream => 0,
@@ -321,14 +323,25 @@ pub const Conn = struct {
         };
     }
 
-    /// Waits up to `ms` for bytes to read; false when none came. Bytes the reader already
-    /// buffered count as readable.
-    fn awaitReadable(c: *Conn, ms: i64) bool {
+    /// How often a wait for a client's bytes looks at the shutdown flag.
+    const SHUTDOWN_POLL_MS: i64 = 100;
+
+    /// Waits up to `limit_ms` (null: no limit) for bytes to read; false when none came. Every read of a connection
+    /// waits here, so a shutdown ends the wait (`error.Shutdown`) within `SHUTDOWN_POLL_MS` and no client holds the
+    /// drain; bytes that already arrived are still read. Bytes the reader already buffered count as readable.
+    fn awaitReadable(c: *Conn, limit_ms: ?i64) error{Shutdown}!bool {
         if (c.reader().bufferedLen() > 0) return true;
-        if (ms <= 0) return false;
+        const deadline = if (limit_ms) |ms| nowMsMonotonic(c.io) +| ms else null;
         var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        const n = std.posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) catch return true;
-        return n > 0;
+        var slice_ms: i64 = 0;
+        while (true) {
+            const n = std.posix.poll(&fds, @intCast(slice_ms)) catch return true;
+            if (n > 0) return true;
+            if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
+            const left = if (deadline) |d| d - nowMsMonotonic(c.io) else SHUTDOWN_POLL_MS;
+            if (left <= 0) return false;
+            slice_ms = @min(left, SHUTDOWN_POLL_MS);
+        }
     }
 
     const CLOSE_WAIT_MS: i64 = 5 * 60 * 1000;
@@ -736,7 +749,7 @@ fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64
                 return null;
             }
         }
-        if (!stream.awaitReadable(limit_ms)) {
+        if (!(stream.awaitReadable(limit_ms) catch false)) {
             out.deinit(allocator);
             return null;
         }
@@ -763,7 +776,7 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
 
     // Phase 1: Read until we have complete headers
     while (total_read < hdr_buf.len) {
-        if (!stream.awaitReadable(head_deadline - nowMsMonotonic(stream.io))) return null;
+        if (!(stream.awaitReadable(head_deadline - nowMsMonotonic(stream.io)) catch false)) return null;
         const n = try stream.read(hdr_buf[total_read..]);
         if (n == 0) break;
         total_read += n;
@@ -806,7 +819,7 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
     }
 
     while (total_read < total_size) {
-        if (!stream.awaitReadable(limit_ms)) {
+        if (!(stream.awaitReadable(limit_ms) catch false)) {
             allocator.free(buf);
             return null;
         }
@@ -1489,6 +1502,7 @@ const WsEnd = struct { code: ?u16, reason: []const u8 = "" };
 fn wsEndOf(err: anyerror, message_limit: usize, reason_buf: *[123]u8) WsEnd {
     return switch (err) {
         error.WsClosed => .{ .code = null },
+        error.Shutdown => .{ .code = 1001, .reason = "server shutting down" },
         error.WsProtocol => .{ .code = 1002, .reason = "protocol error" },
         error.WsTooLarge => blk: {
             const msg = payloadTooLargeMessage(reason_buf, null, message_limit);
@@ -1512,6 +1526,7 @@ fn wsServeTurns(allocator: std.mem.Allocator, stream: *Conn, ws_conn: *WsConnT, 
     defer bridge.reset();
 
     while (true) {
+        if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
         const msg = try ws_conn.readMessage(allocator);
         defer allocator.free(msg.payload);
 

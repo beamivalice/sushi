@@ -454,6 +454,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   are refused with `error.Shutdown`, and queued loads and encodes fail then, not at `deinit`; with a connection thread
   still alive past the drain bound `serve` skips the teardown that would free what it holds and returns
   `error.ConnectionsOutliveShutdown` (the CLI exits 1 on it before its own defers free anything).
+- **A shutdown ends every wait for a client's bytes**: `Conn.awaitReadable` is the one read wait and looks at the flag
+  every 100 ms, so an idle connection closes and a WebSocket between turns gets its 1001 close at once; only a request
+  in flight holds the drain.
 - **The gate shuts when the shutdown is asked, not when it begins**: `refusingLocked` reads
   `server_state.shutdown_requested` too, since `beginShutdown` runs only when the accept loop next sees the flag (up to
   1 s later); a pending slot is neither admitted nor counted as work then, so the loop parks instead of spinning.

@@ -703,6 +703,17 @@ fn wsReadCloseCode(fd: std.posix.fd_t) !u16 {
     return std.mem.readInt(u16, frame.payload[0..2], .big);
 }
 
+/// One completed turn on `fd`, which leaves the WebSocket idle between turns.
+fn wsCompletedTurn(fd: std.posix.fd_t) !void {
+    try wsSend(fd, "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}");
+    while (true) {
+        const frame = try wsReadFrame(fd);
+        defer gpa.free(frame);
+        if (std.mem.startsWith(u8, frame, "{\"type\":\"error\"")) return error.TurnFailed;
+        if (std.mem.indexOf(u8, frame, "\"type\":\"response.completed\"") != null) return;
+    }
+}
+
 /// The model answers on this box: a fixture it cannot load (the DeepSeek tiny on a 32 GB Mac) answers before any upgrade.
 fn modelServes() !bool {
     var b: [512]u8 = undefined;
@@ -746,6 +757,35 @@ test "server: a WebSocket upgrade the server cannot complete is answered 400, ne
                 std.debug.print("upgrade without a key: {d} bytes: {s}\n", .{ answer.len, answer[0..@min(answer.len, 400)] });
                 return error.BareClose;
             }
+        }
+    }.run);
+}
+
+/// A read on `fd` that waits past `sec` fails instead of blocking.
+fn readLimit(fd: std.posix.fd_t, sec: i64) void {
+    const limit: std.posix.timeval = .{ .sec = @intCast(sec), .usec = 0 };
+    _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit), @sizeOf(std.posix.timeval));
+}
+
+test "server: a shutdown closes a WebSocket idle between turns with 1001 and an idle connection at once, and serve runs its teardown" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            if (!try modelServes()) return;
+            // Between turns, as Codex keeps one.
+            const ws = try wsConnect();
+            defer _ = std.c.close(ws);
+            try wsCompletedTurn(ws);
+            // A connection that has sent nothing yet (a browser's preconnect).
+            const idle = try connect();
+            defer _ = std.c.close(idle);
+            // Well under the request read limit (30 s) and the drain bound (35 s) that bounded these waits before.
+            readLimit(ws, 10);
+            readLimit(idle, 10);
+            server.requestShutdown();
+            if (try wsReadCloseCode(ws) != 1001) return error.NotGoingAway;
+            var b: [64]u8 = undefined;
+            if (std.c.read(idle, &b, b.len) != 0) return error.IdleConnectionOutlivesShutdown;
+            // serve returns `ConnectionsOutliveShutdown` when a connection thread outlives the drain.
         }
     }.run);
 }
