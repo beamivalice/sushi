@@ -40,6 +40,8 @@ earlier history is mlx-serve's, in that project's changelog.
   it listed `error` while it stayed in memory.
 - **A pack update waits for a model being unloaded**: started while the unload still waited on the model's requests, it
   replaced the files those requests read, and the model served on from mixed files if the unload was refused.
+- **A model load that fails after unloading the model in use leaves the server sound**: the scheduler kept pointing at
+  the unloaded model's memory (its prompt cache among it) until the next load succeeded.
 - **A long Qwen3.8 conversation's next turn is refused less often near the memory limit**: a turn that takes the cached
   conversation over is no longer billed again for the room its taken-over cache already holds for the reply.
 - **A DeepSeek-V4.1 request admitted while another request's borrowed decoder pools are out is no longer promised the

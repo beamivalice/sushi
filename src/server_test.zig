@@ -69,6 +69,10 @@ const Arch = struct { name: []const u8, tmp: testing.TmpDir, ssd_budget_gb: ?u32
 const Needs = struct {
     /// A chat or Responses reply that runs on for hundreds of tokens (`cooler_contract.server_long_replies`).
     long_replies: bool = false,
+    /// A second copy of the fixture, served as `tiny2`.
+    tiny2: bool = false,
+    /// How many models the registry keeps resident.
+    max_resident: u32 = 2,
 };
 
 /// `body` as the embedded client of a server of `max_concurrent` rows, once per arch that declares a servable fixture
@@ -82,19 +86,22 @@ fn eachArch(max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void)
         if (comptime @hasDecl(M, "cooler_contract") and @hasDecl(M.cooler_contract, "serverDir")) if (!needs.long_replies or M.cooler_contract.server_long_replies) {
             var tmp = testing.tmpDir(.{});
             archs[i] = .{ .name = @tagName(t), .tmp = tmp, .ssd_budget_gb = if (@hasDecl(M.cooler_contract, "server_ssd_budget_gb")) M.cooler_contract.server_ssd_budget_gb else null };
-            try tmp.dir.createDirPath(io, "m");
-            var m = try tmp.dir.openDir(io, "m", .{});
-            defer m.close(io);
-            try M.cooler_contract.serverDir(m);
+            const dirs = [_][]const u8{ "m", "m2" };
+            for (dirs[0..if (needs.tiny2) 2 else 1]) |sub| {
+                try tmp.dir.createDirPath(io, sub);
+                var m = try tmp.dir.openDir(io, sub, .{});
+                defer m.close(io);
+                try M.cooler_contract.serverDir(m);
+            }
         };
     }
-    for (&archs) |*a| if (a.*) |*x| withServer(&x.tmp, x.ssd_budget_gb, max_concurrent, body) catch |e| {
+    for (&archs) |*a| if (a.*) |*x| withServer(&x.tmp, x.ssd_budget_gb, max_concurrent, needs, body) catch |e| {
         if (e != error.SkipZigTest) std.debug.print("server test on {s}: {s}\n", .{ x.name, @errorName(e) });
         return e;
     };
 }
 
-fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, body: *const fn () anyerror!void) !void {
+fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void) !void {
     const a = Poison.allocator();
     try tmp.dir.createDirPath(io, "home/.sushi");
     try tmp.dir.createDirPath(io, "cache");
@@ -118,16 +125,22 @@ fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, bo
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was_enabled);
 
-    const reg = try ModelRegistry.init(a, io, null, 2, 0, null);
+    const reg = try ModelRegistry.init(a, io, null, needs.max_resident, 0, null);
     defer reg.deinit();
     var settings_buf: [1024]u8 = undefined;
     reg.settings_path = try std.fmt.bufPrint(&settings_buf, "{s}/.sushi/model-settings.json", .{home});
+    var pb2: [1024]u8 = undefined;
+    const model_dir2 = try std.fmt.bufPrint(&pb2, "{s}/m2", .{root});
     if (ssd_budget_gb) |gb| {
-        var sb: [1200]u8 = undefined;
-        const settings = try std.fmt.bufPrint(&sb, "{{\"{s}\":{{\"ssd_budget_gb\":{d}}}}}", .{ model_dir, gb });
+        var sb: [2400]u8 = undefined;
+        const settings = if (needs.tiny2)
+            try std.fmt.bufPrint(&sb, "{{\"{s}\":{{\"ssd_budget_gb\":{d}}},\"{s}\":{{\"ssd_budget_gb\":{d}}}}}", .{ model_dir, gb, model_dir2, gb })
+        else
+            try std.fmt.bufPrint(&sb, "{{\"{s}\":{{\"ssd_budget_gb\":{d}}}}}", .{ model_dir, gb });
         try tmp.dir.writeFile(io, .{ .sub_path = "home/.sushi/model-settings.json", .data = settings });
     }
     const entry = try reg.registerStub("tiny", model_dir, 90 << 20);
+    if (needs.tiny2) _ = try reg.registerStub("tiny2", model_dir2, 90 << 20);
     try reg.setDefault("tiny");
 
     var stub = try model_load.headlessStubCpuState(a);
@@ -547,6 +560,51 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
             };
         }
     }.run);
+}
+
+test "server: a load that fails after evicting the model in use leaves no view of the evicted model, so its retry serves" {
+    const ram_was = server_state.prefix_cache_ram_enabled;
+    defer server_state.prefix_cache_ram_enabled = ram_was;
+    const Scenario = struct {
+        var failed_loads: u32 = 0;
+    };
+    for ([_]bool{ false, true }) |ram| {
+        server_state.prefix_cache_ram_enabled = ram;
+        try eachArch(4, .{ .tiny2 = true, .max_resident = 1 }, struct {
+            fn run() !void {
+                var b: [512]u8 = undefined;
+                gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "the river runs to the sea and on and on", 8, false)));
+                const sch = server_state.global_scheduler.?;
+                // The load of tiny2 evicts tiny, then fails at its first pool buffer.
+                mlx.engine.fault.arm(1);
+                const failed_load = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
+                defer gpa.free(failed_load);
+                const fired = !mlx.engine.fault.armed();
+                mlx.engine.fault.disarm();
+                if (!fired) return error.FaultNeverFired;
+                // An arch whose load absorbs that refusal (Flash-Next's does) has no failed load to look past; the count
+                // below fails the test when every arch absorbs it.
+                if (std.mem.startsWith(u8, failed_load, "HTTP/1.1 200")) return;
+                Scenario.failed_loads += 1;
+                const reg = server_state.global_registry.?;
+                reg.mutex.lockUncancelable(reg.io);
+                const tiny = reg.entries.get("tiny").?;
+                const evicted = tiny.state == .unloaded;
+                reg.mutex.unlock(reg.io);
+                if (!evicted) return error.VictimNotEvicted;
+                // The inference loop runs its post-load revise between jobs.
+                var none = [_]std.posix.pollfd{};
+                _ = std.posix.poll(&none, 200) catch {};
+                if (sch.current_model == tiny or sch.hot_prefix_cache != null) return error.EvictedModelStillInView;
+                if (sch.resident_hot_cache_bytes.load(.monotonic) != 0) return error.EvictedModelHotCacheCredited;
+                gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
+                const retry = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
+                defer gpa.free(retry);
+                if (!std.mem.startsWith(u8, retry, "HTTP/1.1 200")) return error.RetryFailed;
+            }
+        }.run);
+    }
+    try testing.expect(Scenario.failed_loads > 0);
 }
 
 /// The next WebSocket frame the server sends (unmasked), its payload; the caller frees.

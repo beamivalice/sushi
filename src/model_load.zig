@@ -2801,6 +2801,20 @@ fn retire(entry: *LoadedModel, why: []const u8) void {
     if (on_mlx) _ = mlx.mlx_clear_cache();
 }
 
+/// The scheduler's borrowed views of a model `retire` freed: an unload's or an eviction's, whether the load that evicted
+/// it then succeeds or fails, or the next reader dereferences freed memory.
+fn dropViewsOf(sch: *Scheduler, entry: *LoadedModel) void {
+    if (sch.current_model != entry) return;
+    sch.current_model = null;
+    sch.xfm = null;
+    sch.weights = null;
+    sch.vision_encoder = null;
+    sch.dflash = null;
+    sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
+    if (scheduler_mod.hot_cache_budget_invalidate) |f| f();
+}
+
 pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     const job = JobTurn.begin(null, req.config);
     defer job.end();
@@ -2820,6 +2834,7 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
             defer victim_job.end();
             retire(victim, "evict");
         }
+        dropViewsOf(sch, victim);
         evicted_bytes +|= victim_bytes;
         sch.registry.mutex.lockUncancelable(sch.io);
         sch.registry.accountEvictedLocked(victim_bytes);
@@ -2890,19 +2905,7 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     retire(entry, "unload");
     waitForUnwire(sch.io, wired_before, bytes);
     job.end();
-    // Drop any borrowed views that pointed at this entry so post-unload reads
-    // don't dangle (gen entries leave xfm null already, but an LLM unload
-    // must clear them).
-    if (sch.current_model == entry) {
-        sch.current_model = null;
-        sch.xfm = null;
-        sch.weights = null;
-        sch.vision_encoder = null;
-        sch.dflash = null;
-        sch.hot_prefix_cache = null;
-        publishHotCacheResidency(sch);
-        if (scheduler_mod.hot_cache_budget_invalidate) |f| f();
-    }
+    dropViewsOf(sch, entry);
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.accountEvictedLocked(bytes);
     sch.registry.finalizeEvictionLocked(entry);
