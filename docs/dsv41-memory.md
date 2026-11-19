@@ -56,8 +56,10 @@ expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The c
     bytes; on a Cooler load it is the engine's free buffers under the cap, taken off once, at the larger of the two);
     a lower cap clears the pool. Admission (`prefillNeededAtChunk`) bills the decode cap beside every request;
     at load `expertStreamingServingBytes` leaves it out, the ledger's staging term already holds it.
-  - Unloading a DeepSeek model gives the next model the process-wide cap `applyMlxCacheLimit` installed, forgets the
-    raised cap and lifts the transient cap (`dsv41_borrow.unloadModel`, in the scheduler's unload and eviction paths).
+  - Unloading a DeepSeek model gives the next model the process-wide cap `applyMlxCacheLimit` installed, MLX's and the
+    engine's free cap both (`gpu_mem.restoreMlxPool`), forgets the raised cap and lifts the transient cap
+    (`dsv41_borrow.unloadModel`, in the scheduler's unload and eviction paths). A load that fails after its plan capped
+    the pool runs the same hook from its own errdefer: a failed load runs no unload (`failLoadRequest`).
   - A request that ends, by finish, cancel or error, drops the pool cap to the decode cap and lifts the transient cap
     (`endRequest`, in the scheduler's slot cleanup), so a prefill with no decode forward after it does not leave the
     raised pool parked, and the next request's restore allocates its state uncapped.

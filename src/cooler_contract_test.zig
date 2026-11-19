@@ -80,8 +80,20 @@ const Load = struct {
     /// `load` and then `serve`, as a served load runs them; on an error nothing of the load stays.
     fn loadServed(self: *Load, dir: []const u8) !void {
         try self.load(dir);
-        errdefer _ = self.close();
+        errdefer self.discard();
         try self.serve();
+    }
+
+    /// The teardown of a served load that failed (`model_load.failLoadRequest` after the load's own errdefers): the
+    /// model and its weights go, and no unload hook runs.
+    fn discard(self: *Load) void {
+        {
+            const job = JobTurn.begin(self.h, &self.config);
+            defer job.end();
+            arch_handle.destroy(self.h, self.a);
+            self.weights.deinit();
+        }
+        self.config.deinit(self.a);
     }
 
     /// What a served load runs once its trunk is up: the KV scheme a launch with no flag gets, the MTP head's draft
@@ -1617,7 +1629,7 @@ fn faultedLoad(comptime C: type, dir: []const u8, phase: Phase, k: u64) !struct 
         if (phase == .serve) mlx.fault.arm(k);
         const served = fx.serve();
         if (phase == .serve) mlx.fault.disarm();
-        if (served) |_| {} else |_| _ = fx.close();
+        if (served) |_| {} else |_| fx.discard();
         break :blk served;
     } else |e| e;
     const fired = mlx.fault.didFire();
@@ -3502,4 +3514,47 @@ test "cooler contract: a cold prompt admitted at its 512-row bill holds no more 
     const held = mlx.engine.poolHeldPeak(.process) -| held0;
     errdefer std.debug.print("a cold {d}-token prompt admitted at its {d} MB bill (width {d}), the hook's widths {any}: {d} MB held at the peak\n", .{ len, bill >> 20, picked, box.widths[0..@min(box.n, box.widths.len)], held >> 20 });
     try testing.expect(held <= bill);
+}
+
+test "cooler contract: a Cooler load whose warm fails, torn down as a served load's failure is, leaves the pool holding no more than before the load" {
+    try eachFixture(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            defer mlx.engine.fault.disarm();
+            // The pool buffers a warm asks for, counted on a load that serves.
+            var total: u64 = 0;
+            {
+                var fx: Load = undefined;
+                try fx.prepare(C, dir, true);
+                try fx.load(dir);
+                const c0 = mlx.engine.fault.count();
+                fx.serve() catch |e| {
+                    fx.discard();
+                    return e;
+                };
+                total = mlx.engine.fault.count() - c0;
+                _ = fx.close();
+            }
+            mlx.engine.close();
+            const before = mlx.engine.stats().pool_bytes;
+            for ([_]u64{ total / 4, total / 2, total * 3 / 4, total - 2 }) |k| {
+                var fx: Load = undefined;
+                try fx.prepare(C, dir, true);
+                try fx.load(dir);
+                mlx.engine.fault.arm(k);
+                const r = fx.serve();
+                mlx.engine.fault.disarm();
+                if (r) |_| {
+                    _ = fx.close();
+                    continue;
+                } else |_| {}
+                var msg: [300]u8 = undefined;
+                _ = mlx.takeError(&msg);
+                fx.discard();
+                mlx.engine.close();
+                const held = mlx.engine.stats().pool_bytes;
+                errdefer std.debug.print("{s}: a warm failed at pool buffer {d} of {d} leaves the pool at {d} MB, {d} MB before the load\n", .{ std.fs.path.basename(dir), k, total, held >> 20, before >> 20 });
+                try testing.expect(held <= before);
+            }
+        }
+    }.run);
 }

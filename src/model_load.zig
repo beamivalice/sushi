@@ -1735,6 +1735,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const own_load = job.own;
     if (params.config.unsupported_note) |note| log.warn("{s}\n", .{note});
     var streaming_resident_bytes: ?u64 = null;
+    // A failed load runs no unload hook (`failLoadRequest`): the caps its plan lowered go back here.
+    var pool_capped = false;
+    errdefer if (pool_capped) arch_serve.unloadModel(params.config);
     var expert_source_assigned = false;
     errdefer if (expert_source_assigned) {
         sch.allocator.free(params.config.expert_source_dir.?);
@@ -1803,7 +1806,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         });
         applyStreamingPlan(params.config, plan, budget.bytes);
         // MLX's pool holds nothing under a load that is the engine's: its cap stays the process's, with none to give back.
-        if (!own_load) if (plan.resolved.ledger) |led| if (led.pool_bytes > 0) gpu_mem.capMlxPool(led.pool_bytes);
+        if (!own_load) if (plan.resolved.ledger) |led| if (led.pool_bytes > 0) {
+            pool_capped = gpu_mem.capMlxPool(led.pool_bytes);
+        };
         if (params.config.expert_source_dir == null) {
             params.config.expert_source_dir = try sch.allocator.dupe(u8, params.model_dir);
             expert_source_assigned = true;

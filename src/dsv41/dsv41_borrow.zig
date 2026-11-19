@@ -58,6 +58,8 @@ pub const PoolOps = struct {
     set_transient: *const fn (bytes: u64) void,
     /// Caps what the engine of our own may hold beyond what its tensors in use ask for, its free buffers included.
     set_own: *const fn (bytes: u64) void,
+    /// Gives MLX's pool and the engine's free buffers the process-wide cap the load lowered back.
+    restore_ram: *const fn (bytes: u64) void,
 };
 
 /// Set while the load's warm runs. `serve` installs the caps after the load, so each engine forward of the warm takes the
@@ -250,7 +252,7 @@ pub fn unloadModel(config: *const ModelConfig, ops: PoolOps) bool {
     ram_cappers -|= 1;
     if (ram_cappers > 0) return false;
     ram_limit = null;
-    ops.set_limit(prev);
+    ops.restore_ram(prev);
     return true;
 }
 
@@ -291,7 +293,7 @@ fn ownSet(bytes: u64) void {
     mlx.engine.budget(bytes) catch |e| log.warn("[engine] pool: the cap of {d} MB was not installed: {s}\n", .{ bytes >> 20, @errorName(e) });
 }
 
-const mlx_ops: PoolOps = .{ .set_limit = &mlxSetLimit, .clear = &mlxClear, .set_transient = &mlxSetTransient, .set_own = &ownSet };
+const mlx_ops: PoolOps = .{ .set_limit = &mlxSetLimit, .clear = &mlxClear, .set_transient = &mlxSetTransient, .set_own = &ownSet, .restore_ram = &@import("../gpu_mem.zig").restoreMlxPool };
 
 /// The image-encode hooks on the real MLX allocator.
 pub fn enterVisionMlx(bill: u64, config: *const ModelConfig) void {
@@ -614,7 +616,7 @@ const PoolProbe = struct {
         own = bytes;
         own_sets += 1;
     }
-    const ops: PoolOps = .{ .set_limit = &set, .clear = &clear, .set_transient = &capTransient, .set_own = &capOwn };
+    const ops: PoolOps = .{ .set_limit = &set, .clear = &clear, .set_transient = &capTransient, .set_own = &capOwn, .restore_ram = &set };
 };
 
 fn withPoolState(ram_cap: u64, body: *const fn () anyerror!void) !void {
@@ -1143,3 +1145,67 @@ test "dsv41 borrow: a load's served warm runs its forwards under the warm budget
     try testing.expect(!warm_budget);
 }
 
+
+/// A load's fit check that refuses it, noting the engine's free cap it found: the load's plan has capped the pool by then.
+const RefusingFit = struct {
+    var free_cap_seen: ?u64 = null;
+    fn fit(_: *const ModelConfig, _: u64) anyerror!void {
+        free_cap_seen = @import("../tensor/core.zig").free_cap;
+        return error.ExpertCacheDoesNotFit;
+    }
+};
+
+test "dsv41 borrow: a DeepSeek load on MLX that fails after its plan capped the pool gives both caps back, and so does an unload (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const Body = struct {
+        fn run() anyerror!void {
+            const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+            const model_mod = @import("../model.zig");
+            const model_load = @import("../model_load.zig");
+            const core = @import("../tensor/core.zig");
+            const a = testing.allocator;
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const was_enabled = mlx.engine.enabled;
+            mlx.engine.enabled = true;
+            defer @import("../test_support.zig").restoreEngine(was_enabled);
+            const free_was = core.free_cap;
+            defer core.free_cap = free_was;
+            const ram: usize = 8 << 30;
+            var orig: usize = 0;
+            try mlx.check(mlx.mlx_set_cache_limit(&orig, ram));
+            defer {
+                var unused: usize = 0;
+                _ = mlx.mlx_set_cache_limit(&unused, orig);
+            }
+            core.free_cap = ram;
+
+            // The user's opt-out: the load is MLX's, whose plan caps MLX's pool and the engine's free buffers.
+            const off = model_mod.cooler_off;
+            defer model_mod.cooler_off = off;
+            model_mod.cooler_off = .full;
+            var config = try model_mod.parseConfig(io, a, dir);
+            defer config.deinit(a);
+            var sch: @import("../scheduler.zig").Scheduler = undefined;
+            sch.io = io;
+            sch.allocator = a;
+            sch.ctx_size_flag = 0;
+            RefusingFit.free_cap_seen = null;
+            const params: model_load.LoadParams = .{ .registry = undefined, .entry = undefined, .config = &config, .tok = undefined, .chat_config = undefined, .model_dir = dir, .ssd_budget_bytes = 16 << 30, .expert_cache_fit_resolver = &RefusingFit.fit };
+            try testing.expectError(error.ExpertCacheDoesNotFit, model_load.doLoadOnInferenceThread(&sch, params));
+            try testing.expect(RefusingFit.free_cap_seen.? < ram);
+            var now: usize = 0;
+            try mlx.check(mlx.mlx_set_cache_limit(&now, ram));
+            try testing.expectEqual(ram, now);
+            try testing.expectEqual(@as(?u64, ram), core.free_cap);
+            try testing.expectEqual(@as(u32, 0), ram_cappers);
+
+            // A load that serves and is unloaded gives both back too.
+            try testing.expect(@import("../gpu_mem.zig").capMlxPool(1 << 30));
+            unloadModelMlx(&config);
+            try mlx.check(mlx.mlx_set_cache_limit(&now, ram));
+            try testing.expectEqual(ram, now);
+            try testing.expectEqual(@as(?u64, ram), core.free_cap);
+        }
+    };
+    try withPoolState(8 << 30, &Body.run);
+}

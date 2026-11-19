@@ -159,16 +159,26 @@ pub fn applyMlxCacheLimit() void {
     log.info("[mem] MLX buffer-pool cap {d} MB (was {d} MB)\n", .{ cap >> 20, prev >> 20 });
 }
 
-/// Lowers MLX's buffer-pool cap to a per-model ledger term; never raises the RAM-wide cap.
-pub fn capMlxPool(bytes: u64) void {
+/// Lowers MLX's buffer-pool cap and the engine's free cap to a per-model ledger term; never raises the RAM-wide cap.
+/// True when it lowered them: the model's arch holds them from then (`arch_serve.poolCapped`), and its unload hook gives
+/// them back (`restoreMlxPool`), on a failed load as on an unload.
+pub fn capMlxPool(bytes: u64) bool {
     var prev: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev, @intCast(bytes));
     if (prev < bytes) {
         var tmp: usize = 0;
         _ = mlx.mlx_set_cache_limit(&tmp, prev);
-        return;
+        return false;
     }
     mlx.engine.setFreeCap(bytes);
     arch_serve.poolCapped(prev);
     log.info("[mem] MLX buffer-pool cap {d} MB from the ssd-budget ledger (was {d} MB)\n", .{ bytes >> 20, prev >> 20 });
+    return true;
+}
+
+/// Gives MLX's buffer pool and the engine's free buffers the process-wide cap `bytes` back.
+pub fn restoreMlxPool(bytes: u64) void {
+    var prev: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev, @intCast(bytes));
+    mlx.engine.setFreeCap(bytes);
 }

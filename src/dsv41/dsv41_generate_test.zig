@@ -5403,7 +5403,7 @@ const ServedCaps = struct {
     }
     fn ignore(_: u64) void {}
     fn clear() void {}
-    const ops: dsv41_borrow.PoolOps = .{ .set_limit = &ignore, .clear = &clear, .set_transient = &ignore, .set_own = &setOwn };
+    const ops: dsv41_borrow.PoolOps = .{ .set_limit = &ignore, .clear = &clear, .set_transient = &ignore, .set_own = &setOwn, .restore_ram = &ignore };
 };
 
 test "dsv41 engine: after a model on MLX beside it served and ended a request, the Cooler's next request of any kind has the engine's room (DSV41_STQ_TINY)" {

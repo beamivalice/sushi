@@ -42,6 +42,9 @@ earlier history is mlx-serve's, in that project's changelog.
   mid-prefill (`PrefillDoesNotFit`) and a long Qwen or MiMo prompt could hold up to 2 GB more than admitted. The first
   chunk now runs at the admitted width, and admission, the chunk width, the warm-up, image encodes and the borrow read
   one headroom.
+- **A DeepSeek load that fails with Sushi Cooler turned off no longer shrinks memory reuse for every later model**: it
+  left MLX's buffer pool and the engine's free buffers capped at its own small figure until the server restarted, and
+  an unload gave back MLX's cap only. A failed load and an unload now give both back.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many
