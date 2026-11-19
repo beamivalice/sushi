@@ -860,6 +860,7 @@ pub const Model = struct {
     /// their one-row bytes at every width a verify accepts (`Mode.wide`: on a machine with matrix units the rows past
     /// `PROJECT_ROWS_MAX` stay on that arm). With no drafter there are no rounds, and a step keeps the one-row arm
     /// that costs less, unless the load joins requests as rows: a joined row is its request's step by two roads too.
+    /// The mode moves the trellis linears only: on a layout that is not `widthExact` the rows still differ by width.
     fn rowsOf(self: *const Model, kind: Forward) exl3.project_rows.Mode {
         return switch (kind) {
             .prefill => .{},
@@ -869,13 +870,15 @@ pub const Model = struct {
         };
     }
 
-    /// The most requests one joined forward takes: the widest whose rows are their one-row steps' bits.
+    /// The most requests one joined forward takes: on a `widthExact` layout, the widest whose rows are their one-row
+    /// steps' bits.
     pub fn maxJoinedRows(self: *const Model) usize {
         return @intCast(exl3.project_rows.rowsMax(self.rowsOf(.rows)));
     }
 
-    /// The widest verify whose rows are their one-row step's bits: 16 on a machine with matrix units, 8 without, where
-    /// the trunk linears leave the multi-row arm past `PROJECT_ROWS_MAX` for the sorted GEMM and its other sum order.
+    /// The widest verify the trellis arm keeps exact: 16 on a machine with matrix units, 8 without, where the trunk
+    /// linears leave the multi-row arm past `PROJECT_ROWS_MAX` for the sorted GEMM and its other sum order. Its rows
+    /// are their one-row step's bits on a `widthExact` layout only.
     pub fn exactVerifyRows(self: *const Model) usize {
         return @intCast(exl3.project_rows.rowsMax(self.rowsOf(.verify)));
     }
@@ -985,6 +988,26 @@ pub const Model = struct {
     /// own (`src/tensor`), not on MLX: the side its load decided (`cooler_side`), for its whole life.
     pub fn onEngine(self: *const Model) bool {
         return self.on_engine;
+    }
+
+    /// Whether a row has one arm at every width: no linear runs an MLX quantized product (an mxfp8 trunk linear, an
+    /// mxfp4 expert bank), whose plan follows the row count. An STQ pack whose trunk and experts are trellis banks is.
+    pub fn widthExact(self: *const Model) bool {
+        if (self.cfg.expert_dec == null) return false;
+        const mlxQuant = struct {
+            fn of(l: Lin) bool {
+                return l.stq == null and l.s.ctx != null;
+            }
+        }.of;
+        if (mlxQuant(self.head)) return false;
+        for (self.layers) |ly| {
+            for ([_]Lin{ ly.wq_a, ly.wq_b, ly.wkv, ly.wo_a, ly.wo_b, ly.shared[0], ly.shared[1], ly.shared[2] }) |l| if (mlxQuant(l)) return false;
+            if (ly.comp) |cw| if (mlxQuant(cw.wkv) or (cw.wgate != null and mlxQuant(cw.wgate.?))) return false;
+            if (ly.idx) |iw| if (mlxQuant(iw.wq_b) or mlxQuant(iw.weights_proj) or (iw.wk != null and mlxQuant(iw.wk.?))) return false;
+        }
+        for (self.engrams) |e| if (mlxQuant(e.wkv)) return false;
+        if (self.dspark) |ds| if (mlxQuant(ds.main_proj)) return false;
+        return true;
     }
 
     /// Frees `x`, an array the model owns, ahead of `deinit`.

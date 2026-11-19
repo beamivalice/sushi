@@ -758,14 +758,14 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   cleared by a round that pays. One dismissed block does not back off: blocks are bimodal (on the sweep prompt 26% accept
   nothing and 24% all five), the next block pays whatever happened between, and the earlier per-block rule (R=1 owes the next
   `period` plain steps) turned 25% dismissals into 55% one-row rounds once the verify got cheap (replay of the sweep's 68 blocks
-  through the policy: 44.8 tok/s with it, 50.4 without; the gate ended 12-18 ticks of 3000 either way). Live (the shipped STQ pack, budget 110, `--ctx-size 65536`, one A then one B, die under 50 °C, commit c42b60a5): the 5.4k harbour prompt 45.1 -> 47.9 tok/s, a novel story 44.0 -> 47.6 (the old rule made 590 of 595 rounds plain there, the new one drafts a third). Greedy text is the same at every round-width mix (exact greedy, below): a row has the same bytes at every verify width. The stop switch is GLM's
+  through the policy: 44.8 tok/s with it, 50.4 without; the gate ended 12-18 ticks of 3000 either way). Live (the shipped STQ pack, budget 110, `--ctx-size 65536`, one A then one B, die under 50 °C, commit c42b60a5): the 5.4k harbour prompt 45.1 -> 47.9 tok/s, a novel story 44.0 -> 47.6 (the old rule made 590 of 595 rounds plain there, the new one drafts a third). On an STQ pack greedy text is the same at every round-width mix (exact greedy, below): a row has the same bytes at every verify width. The stop switch is GLM's
   (`spec_cost_gate.zig`: 8-round windows against a probed plain step, 5% margin); the plain step is the 1-row round, so the state
   is the engine's and no other drafter runs. The probe prices the plain step once, from three ticks at rounds 8 to 10, and goes stale within a request when the streamed experts of a new text load and every forward slows: on the first run of a prompt rounds paying 16 to 20 ms a token read as losing against a stale 18 ms and the switch sent 64 tokens to plain steps (195 rounds, 71 plain; 1158 mJ a token against 916 for the same text a request later). A trip now prices the step afresh from the stretch's own second and third plain steps (`Policy.reprice`, fields of the gate only) and ends the stretch there when the window that tripped pays against that price; a window that loses keeps the full stretch. Greedy text and a seeded sampled request's text are unchanged by the mix (hashes cb93dccdc327442f and 7c4c6064b1a58645; the seeded one was measured with MLX's keys, and on Sushi Cooler a seed gives another text). `erun` by position, 1.75bpw STQ, budget 108, M5 Max, AC, GPU lock, 11:35 binary on 2146f69b: the first greedy request 195 rounds / 71 plain / 55.5 tok/s / 1158 mJ a token becomes 151 / 9 / 59.1 / 1105; the cached repeats are 135-136 rounds, 3 plain, 69.0-69.8 tok/s, 915-927 mJ against 69.6-71.2 and 891-916 on main (the same code spreads 878-939 between loads there). What remains of that request's gap to its repeats is the cold experts (verify 36.9 ms against 34.6), not the switch. Sampled requests use the same choice and the acceptance rule above (a 1-row round draws
   its token from the filtered row). `--mtp-max-depth n` caps R at n+1 and `--mtp-min-depth n` floors it at n+1 with no plain step or back-off below it (equal values pin R; a depth past the 5-draft block is refused at load by name; `--mtp-min-depth 1` is the default). `model-settings.json` has no depth keys. `SUSHI_DSV41_DSPARK_ROWS` forces or sweeps R. The adaptive R follows measured ms. On the MLX
   route (`--ds41-mlx-engine`) the shipped pack's rows are not byte-exact at every width, so a seeded sampled request there
   verifies at a fixed R=3 (clamped to the depth flags) and draws each row with the key of the position it predicts: its text is
   the same on every repeat and streamed or not (live, STQ 1.75bpw: three runs byte-identical with and without a reasoning
-  budget; 52-60 tok/s against 52-63 adaptive, which repeated nothing). On Sushi Cooler a row is the same bytes at every width
+  budget; 52-60 tok/s against 52-63 adaptive, which repeated nothing). On Sushi Cooler with an STQ pack (`Model.widthExact`) a row is the same bytes at every width
   and the key is the engine's own (`random.drawKey`, a host mix of the seed and the position; an unseeded request
   takes one root from the OS, `SamplingParams.draw_root`), and the request's first token and every serial step draw it too, by
   the same kernel as a DSpark row (`sampler.engineDraws`, [the rule](server-http-apis.md#sampled-draw)), so a position has one
@@ -1292,9 +1292,11 @@ another job:
 | code | 69% | 3.44 | 5.8-6.2 | 4.2 | differ from char 449 (a near-tie) |
 | copy | 100% | 4.93 | 12.2-13.0 | 5.5 | identical |
 
-Greedy DSpark text is the same at every round-width mix on the same hardware (exact greedy): the same request gives the same
+On an STQ pack (`Model.widthExact`: trellis trunk and experts) greedy DSpark text is the same at every round-width mix on the same hardware (exact greedy): the same request gives the same
 bytes whatever plain and drafted rounds the policy (`dspark_rows.Policy`) picks from measured timings, and at any forced width
-(`SUSHI_DSV41_DSPARK_ROWS`). A row's bytes depend on the arm of each linear it passes through, so each linear has one arm at
+(`SUSHI_DSV41_DSPARK_ROWS`). The release's own layout (FP8 trunk, MXFP4 experts) is not width-exact: MLX's quantized products
+pick their plan by row count, so its greedy text follows the round mix on either route, and a seeded request there verifies at
+the fixed R=3 on Sushi Cooler too. A row's bytes depend on the arm of each linear it passes through, so each linear has one arm at
 every width. The trunk linears (`projectRows`) were the only arms that changed with the width: the one-row step took the SIMD
 rows arm and 2 or more rows the NAX arm, whose k sums differ. A DSpark round now runs the NAX arm at one row too
 (`project_rows.Mode.exact`, carried by the scopes `verify` opens), except the lm_head, whose SIMD rows arm equals its one-row launch bit for bit and

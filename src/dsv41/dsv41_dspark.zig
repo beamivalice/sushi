@@ -31,11 +31,12 @@ pub fn dsparkRowsForRoom(rows: usize, room: ?u32) usize {
 /// adaptive widths (2 to 3 rows at ~70% per-draft acceptance), where the round-cost model also puts the best tokens per ms.
 const dspark_seeded_rows: u32 = 3;
 
-/// The fixed width a request's DSpark rounds verify at, or null for the adaptive policy. On MLX's route a row's bytes
-/// move with the verify width, so a seeded sampled request there must not take its width from measured ms. On the
-/// engine (`own_rows`) a row is the same bytes at every width, and a seeded request keeps the policy and its text.
-pub fn dsparkSeededRows(sampling: sampler.SamplingParams, range: dspark_rows.Range, own_rows: bool) ?usize {
-    if (own_rows or sampling.seed == null or sampler.isGreedyTemperature(sampling.temperature)) return null;
+/// The fixed width a request's DSpark rounds verify at, or null for the adaptive policy. On MLX's route, and on a layout
+/// that is not width-exact (`Model.widthExact`), a row's bytes move with the verify width, so a seeded sampled request
+/// must not take its width from measured ms. Where a row is the same bytes at every width (`exact_rows`), a seeded
+/// request keeps the policy and its text.
+pub fn dsparkSeededRows(sampling: sampler.SamplingParams, range: dspark_rows.Range, exact_rows: bool) ?usize {
+    if (exact_rows or sampling.seed == null or sampler.isGreedyTemperature(sampling.temperature)) return null;
     return std.math.clamp(dspark_seeded_rows, range.min_rows, range.max_rows);
 }
 
@@ -134,7 +135,8 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         tb.observe(self.generated_ids.items);
         break :room tb.room();
     } else null;
-    const seeded_rows = dsparkSeededRows(self.sampling, policy.range, mlx.engine.isStream(s));
+    const exact_rows = mlx.engine.isStream(s) and (if (dsv41_state.modelOf(xfm)) |m| m.widthExact() else false);
+    const seeded_rows = dsparkSeededRows(self.sampling, policy.range, exact_rows);
     const adaptive = (diag == .off or diag == .log) and seeded_rows == null;
     var ids_buf: [dsv41_max_drafts + 1]u32 = undefined;
     const copied: usize = if (self.dspark_copy and adaptive and !self.spec_disabled_runtime and (think_room orelse 2) > 1)

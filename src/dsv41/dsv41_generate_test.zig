@@ -2088,6 +2088,7 @@ test "dsv41 engine: each row of a verify, at every width the model accepts, is t
     try fx.open(dir);
     defer fx.deinit();
     // The widest verify whose rows are the serial step's bits on this GPU (`Model.exactVerifyRows`).
+    try testing.expect(fx.model().widthExact());
     const widest: usize = @min(dsv41_max_verify_rows, fx.model().exactVerifyRows());
     const vocab = fx.model().cfg.vocab;
     var buf: [48]u32 = undefined;
@@ -6040,6 +6041,45 @@ test "dsv41 engine: the release's layout (FP8 trunk, MXFP4 experts) on Sushi Coo
     }
     try testing.expectEqual(ops, mlx.engine.mlx_ops);
     try testing.expectEqual(made, mlx.engine.pipelinesMade().count);
+}
+
+test "dsv41 engine: on the release's layout (FP8 trunk, MXFP4 experts) on Sushi Cooler a seeded DSpark request says one text whatever its rounds cost (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    try testing.expect(fx.model().onEngine());
+    // Its FP8 linears and FP4 experts take MLX's product plan by row count: rows differ by width.
+    try testing.expect(!fx.model().widthExact());
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    const sampling: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
+    var parted: usize = 0;
+    for (0..4) |shift| {
+        var buf: [30]u32 = undefined;
+        for (&buf, 0..) |*t, i| t.* = fx.ids[(i * 5 + 3 + shift * 11) % fx.ids.len];
+        // A dear plain step makes the policy draft wide; a cheap one keeps it plain.
+        var said: [2]std.ArrayList(u32) = @splat(.empty);
+        defer for (&said) |*s| s.deinit(a);
+        for ([_]bool{ true, false }, &said) |dear, *got| {
+            try fx.xfm.resetCache();
+            var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, &buf, 40, sampling, &.{}, .{ .dspark_enabled = true });
+            defer gen.deinit(a);
+            gen.dspark_policy.cost = if (dear) .{ .plain_ms = 900, .step_ms = 40, .draft_ms = 40, .prior = 40 } else .{ .plain_ms = 5, .step_ms = 3, .draft_ms = 1, .prior = 3 };
+            while (try gen.nextDspark(a)) |r| {
+                defer a.free(r.tokens);
+                try got.appendSlice(a, r.tokens);
+            }
+        }
+        if (!std.mem.eql(u32, said[0].items, said[1].items)) {
+            std.debug.print("prompt {d}: the dear and the cheap cost model part at token {d}\n", .{ shift, std.mem.indexOfDiff(u32, said[0].items, said[1].items).? });
+            parted += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), parted);
 }
 
 test "dsv41 engine: two Cooler loads in one process each find their own engine budget at their turn: one with no cap yet starts its first request under no cap the other installed and says the other's tokens, and each finds its own cap whatever the other installed (DSV41_STQ_TINY)" {

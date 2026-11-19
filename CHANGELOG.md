@@ -25,6 +25,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A DeepSeek follow-up cancelled or failed before it answered no longer costs its retry the last turn's cache**: the
   retry, or the next conversation's save to SSD, found the last turn's latest restore points gone and prefilled from
   the last grid point again, up to 8,192 tokens back.
+- **A seeded DeepSeek request on the release's own layout (FP8 trunk, MXFP4 experts) repeats its text on Sushi Cooler**:
+  its DSpark rounds took their width from measured timings, which changes that layout's rows, so the same seed could
+  give another text. It now verifies at a fixed width, as on MLX; STQ packs keep the adaptive width.
 
 - **The HTTP request-size limit is a setting**: `server.max_request_mb` (Settings > Server, 1-1,024 MiB, 128 by
   default) applies at once to HTTP requests and `/v1/responses` WebSocket messages, so a long conversation with many
