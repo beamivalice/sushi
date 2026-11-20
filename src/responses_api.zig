@@ -1816,9 +1816,12 @@ fn buildResponsesEnvelope(
     try buf.appendSlice(allocator, ",\"background\":");
     try buf.appendSlice(allocator, if (echo.background) "true" else "false");
 
-    try buf.appendSlice(allocator, ",\"service_tier\":\"");
-    try buf.appendSlice(allocator, echo.service_tier);
-    try buf.append(allocator, '"');
+    {
+        const esc = try jsonEscape(allocator, echo.service_tier);
+        defer allocator.free(esc);
+        try buf.appendSlice(allocator, ",\"service_tier\":");
+        try buf.appendSlice(allocator, esc);
+    }
 
     try buf.appendSlice(allocator, ",\"metadata\":");
     try buf.appendSlice(allocator, echo.metadata_json);

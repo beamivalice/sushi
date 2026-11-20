@@ -262,7 +262,7 @@ before reading a completed stream and requires clean EOF.
   | `top_a`, `mirostat`, `dry_multiplier`, `xtc_probability` | all | accepted only at 0 | not run |
   | `suffix` | completions | null or `""` only; fill-in-the-middle is a 400 | |
   | `best_of` | completions | 1 only | |
-  | `service_tier` | all | accepted and ignored: a billing hint with no meaning on a local server (Responses echoes it) | |
+  | `service_tier` | all | accepted and ignored: a billing hint with no meaning on a local server (Responses echoes it, escaped like every request string its hand-built envelope carries) | |
 
   Min-p after top-k and the nucleus is the same set as before them: an id's ratio to the top id survives
   renormalization, and the top id survives every filter. Every sampler applies the chain alike (`sampler.filterRows`

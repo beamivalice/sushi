@@ -17,6 +17,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 
 - **A pack listed while its download was still running is billed at its full size once the download finishes**: its entry kept the partial byte count it was listed with, so the eviction gate and the resident bill under-counted it until the next restart; a finished download or a rescan now refreshes it.
 - **A prefix-cache clear no longer deletes the SSD root of a model that loads while it runs**: the clear's lock file lived inside the namespace it deleted, so a tier opening mid-delete took a fresh lock, then lost its root (two tiers could later own one); a clear and a tier opening now take a gate file beside the namespace.
+- **A Responses reply that echoes a `service_tier` with a quote or backslash is valid JSON**: the tier was written raw into
+  the created and completed events, the non-streamed body and the stored record, where it broke the JSON or injected fields.
 - **A streamed `/v1/responses` reply cut by a stop sequence inside a tool call no longer returns the half call**: the
   stream searched for the stop in text its gate had already cut, found none, and shipped the call it salvaged from the
   open markup; a stream now ends as the stop its gate matched, as the non-streamed reply, Chat and Messages do.

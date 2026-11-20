@@ -1494,3 +1494,74 @@ test "server: a Content-Length body read past the reader's buffer, then stalled,
         }
     }.run);
 }
+
+/// Every SSE event of a streamed body, in order: its `event:` name and `data:` line.
+const SseEvent = struct { name: []const u8, data: []const u8 };
+
+/// The events of `body`; the caller frees the slice only.
+fn sseEvents(body: []const u8) ![]SseEvent {
+    var out: std.ArrayList(SseEvent) = .empty;
+    var blocks = std.mem.splitSequence(u8, body, "\n\n");
+    while (blocks.next()) |blk| {
+        var ev: SseEvent = .{ .name = "", .data = "" };
+        var lines = std.mem.splitScalar(u8, blk, '\n');
+        while (lines.next()) |l| {
+            if (std.mem.startsWith(u8, l, "event: ")) ev.name = l["event: ".len..];
+            if (std.mem.startsWith(u8, l, "data: ")) ev.data = l["data: ".len..];
+        }
+        if (ev.data.len > 0) try out.append(gpa, ev);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn parseBody(bytes: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |e| {
+        std.debug.print("not JSON ({s}): {s}\n", .{ @errorName(e), bytes[0..@min(bytes.len, 600)] });
+        return e;
+    };
+}
+
+test "server: h21 a Responses envelope echoing service_tier is valid JSON" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            // A tier with a quote and a backslash, and one that closes the string to inject a sibling field.
+            const tiers = [_][]const u8{ "a\\\"b\\\\", "x\\\",\\\"injected\\\":\\\"1" };
+            const want = [_][]const u8{ "a\"b\\", "x\",\"injected\":\"1" };
+            for (tiers, want) |tier, sent| {
+                var body: [256]u8 = undefined;
+                const req = try std.fmt.bufPrint(&body, "{{\"model\":\"tiny\",\"max_output_tokens\":2,\"service_tier\":\"{s}\",\"input\":\"hi\"}}", .{tier});
+                const resp = try request("POST", "/v1/responses", req);
+                defer gpa.free(resp);
+                const p = try parseBody(bodyOf(resp));
+                defer p.deinit();
+                try testing.expectEqualStrings(sent, p.value.object.get("service_tier").?.string);
+                try testing.expect(p.value.object.get("injected") == null);
+
+                const streamed = try std.fmt.bufPrint(&body, "{{\"model\":\"tiny\",\"max_output_tokens\":2,\"stream\":true,\"service_tier\":\"{s}\",\"input\":\"hi\"}}", .{tier});
+                const sresp = try request("POST", "/v1/responses", streamed);
+                defer gpa.free(sresp);
+                const evs = try sseEvents(bodyOf(sresp));
+                defer gpa.free(evs);
+                var seen: usize = 0;
+                for (evs) |e| {
+                    if (!std.mem.eql(u8, e.name, "response.created") and !std.mem.eql(u8, e.name, "response.completed")) continue;
+                    const ep = try parseBody(e.data);
+                    defer ep.deinit();
+                    const r = ep.value.object.get("response").?.object;
+                    try testing.expectEqualStrings(sent, r.get("service_tier").?.string);
+                    try testing.expect(r.get("injected") == null);
+                    seen += 1;
+                }
+                try testing.expectEqual(@as(usize, 2), seen);
+
+                const id = try respId(resp);
+                var path: [128]u8 = undefined;
+                const got = try request("GET", try std.fmt.bufPrint(&path, "/v1/responses/{s}", .{id}), "");
+                defer gpa.free(got);
+                const gp = try parseBody(bodyOf(got));
+                defer gp.deinit();
+                try testing.expectEqualStrings(sent, gp.value.object.get("service_tier").?.string);
+            }
+        }
+    }.run);
+}
