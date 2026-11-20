@@ -128,7 +128,7 @@ test "MiMo honors the declared wired limit streamed or resident, without enablin
     const prior = bills.wired_limit_mb_override;
     bills.wired_limit_mb_override = 120000;
     defer bills.wired_limit_mb_override = prior;
-    const floor = bills.wiredLimitFloor(120000 * 1024 * 1024, 128 << 30, launch_state.wired_limit_margin_bytes);
+    const floor = bills.wiredLimitFloor(120000 * 1024 * 1024, 128 << 30, launch_state.wiredMarginBytes());
     var c = model_mod.ModelConfig{ .model_type = "mimo_v2", .expert_streaming = true };
     try std.testing.expect(!c.longCtxGated());
     try std.testing.expectEqual(floor, bills.wiredCeilingFloorForRam(&c, 128 << 30));
@@ -264,7 +264,7 @@ test "GLM raw FP8 honors the declared wired limit with the same reserve as MiMo"
     bills.wired_limit_mb_override = 120000;
     defer bills.wired_limit_mb_override = prior;
     const cfg = model_mod.ModelConfig{ .model_type = "glm5_next", .fp8_block128_trunk = true };
-    try std.testing.expectEqual(bills.wiredLimitFloor(120000 * 1024 * 1024, 128 << 30, launch_state.wired_limit_margin_bytes), bills.wiredCeilingFloorForRam(&cfg, 128 << 30));
+    try std.testing.expectEqual(bills.wiredLimitFloor(120000 * 1024 * 1024, 128 << 30, launch_state.wiredMarginBytes()), bills.wiredCeilingFloorForRam(&cfg, 128 << 30));
     bills.wired_limit_mb_override = 98304;
     try std.testing.expectEqual(@as(u64, 0), bills.wiredCeilingFloorForRam(&cfg, 128 << 30));
 }

@@ -51,6 +51,7 @@ function makeServer(opts = {}) {
       pack_update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
       skip_mem_preflight: { file: null, flag: null, default: false, source: 'default', locked: false, applies: 'applies at once' },
       port: { file: null, flag: null, default: 12345, source: 'default', locked: false, applies: 'the next start; a running server keeps its port' },
+      wired_margin_gib: { file: null, flag: null, default: 1, min: 1, max: 32, source: 'default', locked: false, applies: 'applies at once: the next request and the next load use it' },
       max_request_mb: { file: null, default: 128, min: 1, max: 1024, source: 'default', locked: false, applies: 'applies at once to new requests; uploads already in progress keep their limit' },
     },
     cache: {
@@ -1148,6 +1149,38 @@ async function main() {
       await page.click('#requestSave');
       await page.waitForFunction(() => document.querySelector('#requestMb').value === '');
       assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings')[1].body, { server: { max_request_mb: null } });
+    });
+    await scenario('the safety margin sits under the GPU limit command, validates, saves and resets', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#marginGib', { timeout: 3000 });
+      const order = await page.evaluate(() => { const cmd = document.querySelector('#wiredCard .cmd'), row = document.querySelector('#wiredCard .set[data-key="wired_margin_gib"]'); return !!(cmd.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING); });
+      assert.equal(order, true, 'the safety margin row follows the command row in the GPU memory card');
+      assert.equal(await page.textContent('.set[data-key="wired_margin_gib"] label'), 'Safety margin (GB)');
+      assert.equal(await page.getAttribute('#marginGib', 'placeholder'), 'Default (1)');
+      assert.match(await page.textContent('.set[data-key="wired_margin_gib"] .help'), /macOS, the window server and your other apps/, 'the row says who the margin protects');
+      for (const value of ['0', '33', '1.5', 'abc']) {
+        await page.fill('#marginGib', value);
+        assert.equal(await page.isDisabled('#marginSave'), true);
+        assert.equal(await page.textContent('.set[data-key="wired_margin_gib"] .bad'), 'Enter a whole number from 1 to 32 GB.');
+      }
+      await page.fill('#marginGib', '6');
+      await page.click('#marginSave');
+      await page.waitForFunction(() => document.querySelector('.set[data-key="wired_margin_gib"] .badges').textContent.includes('Saved'));
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { wired_margin_gib: 6 } });
+      assert.match(await page.textContent('.set[data-key="wired_margin_gib"] .badges'), /Now/);
+      await page.fill('#marginGib', '');
+      await page.click('#marginSave');
+      await page.waitForFunction(() => document.querySelector('#marginGib').value === '');
+      assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings')[1].body, { server: { wired_margin_gib: null } });
+    });
+    await scenario('a launch flag shows its value read-only in the safety margin row and says where it comes from', { path: '/settings', setup: (s) => {
+      Object.assign(s.state.server.wired_margin_gib, { file: 8, flag: '3', source: 'flag', locked: true, applies: 'set by --wired-margin-gib until a start without it' });
+    } }, async ({ page }) => {
+      await page.waitForSelector('#marginGib', { timeout: 3000 });
+      assert.equal(await page.inputValue('#marginGib'), '3', 'the flag outranks the saved 8');
+      assert.equal(await page.isDisabled('#marginGib'), true);
+      assert.equal(await page.isHidden('#marginSave'), true);
+      assert.match(await page.textContent('.set[data-key="wired_margin_gib"] .hint'), /--wired-margin-gib 3 at launch/);
+      assert.match(await page.textContent('.set[data-key="wired_margin_gib"] .badges'), /Set at launch/);
     });
     await scenario('the request size limit takes its range from the server', { path: '/settings', setup: (s) => {
       Object.assign(s.state.server.max_request_mb, { min: 2, max: 300 });

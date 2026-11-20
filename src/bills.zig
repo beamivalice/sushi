@@ -293,7 +293,7 @@ pub fn wiredLimitFloor(wired_limit: u64, total_ram: u64, margin: u64) u64 {
 
 pub fn parseWiredMarginGib(raw: []const u8) error{InvalidWiredMargin}!u64 {
     const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidWiredMargin;
-    if (n < 1 or n > 32) return error.InvalidWiredMargin;
+    if (n < model_settings.wired_margin_gib_min or n > model_settings.wired_margin_gib_max) return error.InvalidWiredMargin;
     return @as(u64, n) << 30;
 }
 
@@ -521,7 +521,7 @@ pub fn defaultBudgetLimits() model_load.BudgetLimits {
         .wired_limit = wiredLimitBytes(),
         .ceiling = ssdBudgetCeiling(wiredLimitBytes(), staticGpuMemoryCeiling()),
         .ceiling_name = if (wiredLimitBytes() > 0) "iogpu.wired_limit_mb" else "the GPU working-set limit",
-        .margin = launch_state.wired_limit_margin_bytes,
+        .margin = launch_state.wiredMarginBytes(),
         .user_wire = wire[wire_bind],
         .user_wire_name = if (wire_bind == 0) "vm.global_user_wire_limit" else "vm.user_wire_limit",
         .user_wire_margin = USER_WIRE_MARGIN_BYTES,
@@ -550,14 +550,14 @@ pub fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram:
     const c = config orelse return 0;
     // Resident MiMo fills a 128 GB Mac, so its ceiling is the declared limit, not what other apps leave free.
     if (!c.longCtxGated() and !c.expert_streaming and !arch_config.fact(c, "declared_wired_ceiling")) return 0;
-    const unplanned = wiredUnplannedBytes(launch_state.wired_limit_margin_bytes, gpu_floor_bytes.load(.monotonic));
+    const unplanned = wiredUnplannedBytes(launch_state.wiredMarginBytes(), gpu_floor_bytes.load(.monotonic));
     const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, unplanned);
     if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
         log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB, GPU floor {d} MB, unplanned {d} MB)\n", .{
             floor >> 20,
             wiredLimitBytes() >> 20,
             gpu_mem.getGpuWorkingSetLimit() >> 20,
-            launch_state.wired_limit_margin_bytes >> 20,
+            launch_state.wiredMarginBytes() >> 20,
             gpu_floor_bytes.load(.monotonic) >> 20,
             unplanned >> 20,
         });
@@ -705,7 +705,7 @@ pub const FitReadings = struct {
             .free = metrics.getAvailableMemBytes() -| lent,
             .proc_free = metrics.getProcAvailableMemBytes() -| lent,
             .total_ram = metrics.getTotalMemBytes(),
-            .unplanned = wiredUnplannedBytes(launch_state.wired_limit_margin_bytes, gpu_floor_bytes.load(.monotonic)),
+            .unplanned = wiredUnplannedBytes(launch_state.wiredMarginBytes(), gpu_floor_bytes.load(.monotonic)),
         };
     }
 
@@ -3396,6 +3396,36 @@ test "a load with no model resident lowers a GPU floor other processes have rele
     try t.expectEqual(16 * mb, idleGpuFloor(98_355 * mb, 16 * mb, 0, 0));
     try t.expectEqual(620 * mb, idleGpuFloor(620 * mb, 4_000 * mb, 0, 0));
     try t.expectEqual(98_355 * mb, idleGpuFloor(98_355 * mb, 0, 0, 0));
+}
+
+test "the declared ceiling reads the safety margin at call time: the saved value, the default, and the launch flag over both" {
+    const t = std.testing;
+    const gib: u64 = 1 << 30;
+    const limit_was = wired_limit_mb_override;
+    const floor_was = gpu_floor_bytes.load(.monotonic);
+    const logged_was = wired_floor_logged.load(.monotonic);
+    const flag_was = launch_state.wired_margin_flag_bytes;
+    defer {
+        wired_limit_mb_override = limit_was;
+        gpu_floor_bytes.store(floor_was, .monotonic);
+        wired_floor_logged.store(logged_was, .monotonic);
+        launch_state.wired_margin_flag_bytes = flag_was;
+        launch_state.setWiredMarginFile(null);
+    }
+    wired_limit_mb_override = 120_000;
+    gpu_floor_bytes.store(0, .monotonic);
+    wired_floor_logged.store(true, .monotonic);
+    launch_state.wired_margin_flag_bytes = null;
+    const config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true };
+    const ram = 128 * gib;
+    const limit = wiredLimitBytes();
+    try t.expectEqual(limit - 1 * gib, wiredCeilingFloorForRam(&config, ram));
+    launch_state.setWiredMarginFile(8);
+    try t.expectEqual(limit - 8 * gib, wiredCeilingFloorForRam(&config, ram));
+    launch_state.setWiredMarginFile(2);
+    try t.expectEqual(limit - 2 * gib, wiredCeilingFloorForRam(&config, ram));
+    launch_state.wired_margin_flag_bytes = 4 * gib;
+    try t.expectEqual(limit - 4 * gib, wiredCeilingFloorForRam(&config, ram));
 }
 
 test "the bill plans the non-MLX GPU floor and the command-buffer size" {

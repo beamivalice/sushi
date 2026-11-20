@@ -580,8 +580,8 @@ fn runCli(init: std.process.Init) !void {
             server_state.ssm_checkpoint_max = flagInt(u32, "--ssm-checkpoint-max", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and flag_value.follows(args, i)) {
             i += 1;
-            server_state.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
-                log.err("--wired-margin-gib: expected an integer 1..32, got '{s}'\n", .{args[i]});
+            server_state.wired_margin_flag_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
+                log.err("--wired-margin-gib: expected an integer {d}..{d}, got '{s}'\n", .{ model_settings_mod.wired_margin_gib_min, model_settings_mod.wired_margin_gib_max, args[i] });
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--expert-pick-tolerance") and flag_value.follows(args, i)) {
@@ -860,6 +860,7 @@ fn runCli(init: std.process.Init) !void {
         const srv = model_settings_mod.server(&file);
         scheduler_mod.setSkipMemPreflight(model_settings_mod.skipMemPreflight(skip_mem_preflight, srv.skip_mem_preflight).value);
         server_state.setMaxRequestMb(srv.max_request_mb);
+        server_state.setWiredMarginFile(srv.wired_margin_gib);
         const serving = serve_mode and prompt == null and bench_run == null;
         if (serving) update_mod.startDailyCheck(io, no_update_check, srv.update_check);
         cli_mod.configurePackUpdates(io, serving and !no_update_check, model_settings_mod.autoCheck(no_update_check, srv.pack_update_check).value);
@@ -1555,6 +1556,7 @@ fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bo
         var size_buf: [32]u8 = undefined;
         locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_state.prefix_cache_disk_bytes)});
     }
+    if (server_state.wired_margin_flag_bytes) |b| locks.wired_margin_gib.pin("{d}", .{b >> 30});
     if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
     if (given.port) |p| locks.port.pin("{d}", .{p});
     if (given.skip_mem_preflight) locks.skip_mem_preflight.pin("--skip-mem-preflight", .{});
@@ -1654,6 +1656,22 @@ test "launch flags: --skip-mem-preflight pins server.skip_mem_preflight, and no 
     try std.testing.expect(!model_settings_mod.launch_locks.skip_mem_preflight.set);
     pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .skip_mem_preflight = true });
     try std.testing.expectEqualStrings("--skip-mem-preflight", model_settings_mod.launch_locks.skip_mem_preflight.text());
+}
+
+test "launch flags: --wired-margin-gib pins server.wired_margin_gib to the flag's value, and no flag leaves it free" {
+    const saved = model_settings_mod.launch_locks;
+    const flag_was = server_state.wired_margin_flag_bytes;
+    defer {
+        model_settings_mod.launch_locks = saved;
+        server_state.wired_margin_flag_bytes = flag_was;
+    }
+    model_settings_mod.launch_locks = .{};
+    server_state.wired_margin_flag_bytes = null;
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.wired_margin_gib.set);
+    server_state.wired_margin_flag_bytes = 5 << 30;
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expectEqualStrings("5", model_settings_mod.launch_locks.wired_margin_gib.text());
 }
 
 test "launch flags: --config-overrides pins yarn_factor only when it names the RoPE or the window" {

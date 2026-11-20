@@ -348,6 +348,16 @@ pub fn render(
     try w.print(",\"default\":{d},\"min\":1,\"max\":{d},\"source\":\"{s}\",\"locked\":false,\"applies\":\"applies at once to new requests; uploads already in progress keep their limit\"}}", .{
         model_settings.default_max_request_mb, model_settings.max_request_mb_limit, if (srv.max_request_mb != null) "file" else "default",
     });
+    const margin_pinned = locks.wired_margin_gib.set;
+    try w.writeAll(",\"wired_margin_gib\":{\"file\":");
+    try writeJson(w, srv.wired_margin_gib);
+    try w.writeAll(",\"flag\":");
+    if (margin_pinned) try writeJson(w, locks.wired_margin_gib.text()) else try w.writeAll("null");
+    try w.print(",\"default\":{d},\"min\":{d},\"max\":{d},\"source\":\"{s}\",\"locked\":{},\"applies\":\"{s}\"}}", .{
+        model_settings.default_wired_margin_gib, model_settings.wired_margin_gib_min, model_settings.wired_margin_gib_max,
+        if (margin_pinned) "flag" else if (srv.wired_margin_gib != null) "file" else "default",
+        margin_pinned, if (margin_pinned) wired_margin_flag_applies else wired_margin_applies,
+    });
     const port_pinned = locks.port.set;
     try w.writeAll(",\"port\":{\"file\":");
     try writeJson(w, srv.port);
@@ -794,6 +804,8 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         } else if (std.mem.eql(u8, e.key, "max_request_mb")) {
             server_state.setMaxRequestMb(if (e.value) |v| std.math.cast(u32, v.integer) orelse return error.InvalidSetting else null);
             try writeJson(w, "applies to the next request");
+        } else if (std.mem.eql(u8, e.key, "wired_margin_gib")) {
+            try writeJson(w, applyWiredMargin(&model_settings.launch_locks, e.value));
         } else if (std.mem.eql(u8, e.key, "port")) {
             try writeJson(w, portMessage(&model_settings.launch_locks));
         } else {
@@ -839,13 +851,13 @@ fn savesSsdTier(plan: Plan) bool {
 
 /// Whether saving `key` changes what a load or its preflight reads, so a model that failed to load deserves another try.
 pub fn reachesLoad(key: []const u8) bool {
-    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" };
+    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" };
     for (reads) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
 
 test "settings api: every saved key is classified, and the ones a load reads clear a stored load failure" {
-    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight" }) |key| {
+    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" }) |key| {
         try std.testing.expect(reachesLoad(key));
     }
     for ([_][]const u8{ "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb" }) |key| {
@@ -865,7 +877,7 @@ test "settings api: only the two SSD size keys re-arm a declined SSD tier, and b
 }
 
 fn classified(key: []const u8) bool {
-    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb" };
+    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "wired_margin_gib" };
     for (known) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
@@ -922,6 +934,15 @@ fn applySkipMemPreflight(locks: *const model_settings.LaunchLocks, value: ?std.j
     if (locks.skip_mem_preflight.set) return "saved; --skip-mem-preflight still skips the check until a start without it";
     scheduler.setSkipMemPreflight(if (value) |v| v.bool else false);
     return "applies at once";
+}
+
+const wired_margin_applies = "applies at once: the next request and the next load use it";
+const wired_margin_flag_applies = "set by --wired-margin-gib until a start without it";
+
+/// The launch flag outranks the saved value inside `wiredMarginBytes`, so a save under it is kept and not applied.
+fn applyWiredMargin(locks: *const model_settings.LaunchLocks, value: ?std.json.Value) []const u8 {
+    server_state.setWiredMarginFile(if (value) |v| std.math.cast(u32, v.integer) else null);
+    return if (locks.wired_margin_gib.set) "saved; --wired-margin-gib still sets the margin until a start without it" else wired_margin_applies;
 }
 
 fn portMessage(locks: *const model_settings.LaunchLocks) []const u8 {
@@ -1173,6 +1194,69 @@ test "settings api: request size limit accepts MiB or null and rejects invalid v
     for ([_][]const u8{ "0", "-1", "1025", "1.5", "\"5\"", "true" }) |value| {
         const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"server\":{{\"max_request_mb\":{s}}}}}", .{value});
         try expectRejected(body, 400, "invalid_setting");
+    }
+}
+
+test "settings api: wired_margin_gib accepts 1..32 or null and rejects every other value" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const plan = parseRequest(arena_state.allocator(), "{\"server\":{\"wired_margin_gib\":8}}");
+    try testing.expectEqual(@as(i64, 8), plan.ok.server_edits[0].value.?.integer);
+    try testing.expect(parseRequest(arena_state.allocator(), "{\"server\":{\"wired_margin_gib\":null}}").ok.server_edits[0].value == null);
+    for ([_][]const u8{ "1", "32" }) |value| {
+        const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"server\":{{\"wired_margin_gib\":{s}}}}}", .{value});
+        try testing.expect(parseRequest(arena_state.allocator(), body) == .ok);
+    }
+    for ([_][]const u8{ "0", "-1", "33", "1.5", "\"4\"", "true" }) |value| {
+        const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"server\":{{\"wired_margin_gib\":{s}}}}}", .{value});
+        try expectRejected(body, 400, "invalid_setting");
+    }
+}
+
+test "settings api: a saved safety margin reaches the margin the ceiling reads at once, and the launch flag outranks it" {
+    const flag_was = server_state.wired_margin_flag_bytes;
+    defer server_state.wired_margin_flag_bytes = flag_was;
+    defer server_state.setWiredMarginFile(null);
+    server_state.wired_margin_flag_bytes = null;
+    var locks: model_settings.LaunchLocks = .{};
+    try testing.expectEqual(@as(u64, 1) << 30, server_state.wiredMarginBytes());
+    try testing.expectEqualStrings("applies at once: the next request and the next load use it", applyWiredMargin(&locks, .{ .integer = 6 }));
+    try testing.expectEqual(@as(u64, 6) << 30, server_state.wiredMarginBytes());
+    _ = applyWiredMargin(&locks, null);
+    try testing.expectEqual(@as(u64, 1) << 30, server_state.wiredMarginBytes());
+
+    server_state.wired_margin_flag_bytes = 3 << 30;
+    locks.wired_margin_gib.pin("3", .{});
+    try testing.expectEqualStrings("saved; --wired-margin-gib still sets the margin until a start without it", applyWiredMargin(&locks, .{ .integer = 6 }));
+    try testing.expectEqual(@as(u64, 3) << 30, server_state.wiredMarginBytes());
+}
+
+test "settings api: render reports the safety margin from the file, the default or the launch flag that pins it" {
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
+    var locks: model_settings.LaunchLocks = .{};
+    const cases = [_]struct { file: []const u8, flag: ?[]const u8, source: []const u8 }{
+        .{ .file = "{\"server\": {\"wired_margin_gib\": 8}}", .flag = null, .source = "file" },
+        .{ .file = "{}", .flag = null, .source = "default" },
+        .{ .file = "{\"server\": {\"wired_margin_gib\": 8}}", .flag = "3", .source = "flag" },
+    };
+    for (cases) |c| {
+        locks.wired_margin_gib = .{};
+        if (c.flag) |f| locks.wired_margin_gib.pin("{s}", .{f});
+        var file = try model_settings.parse(testing.allocator, c.file);
+        defer file.deinit();
+        const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+        defer testing.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        const o = parsed.value.object.get("server").?.object.get("wired_margin_gib").?.object;
+        try testing.expectEqualStrings(c.source, o.get("source").?.string);
+        try testing.expectEqual(c.flag != null, o.get("locked").?.bool);
+        try testing.expectEqual(@as(i64, 1), o.get("default").?.integer);
+        try testing.expectEqual(@as(i64, 1), o.get("min").?.integer);
+        try testing.expectEqual(@as(i64, 32), o.get("max").?.integer);
+        if (c.flag) |f| try testing.expectEqualStrings(f, o.get("flag").?.string) else try testing.expect(o.get("flag").? == .null);
+        if (std.mem.eql(u8, c.source, "default")) try testing.expect(o.get("file").? == .null) else try testing.expectEqual(@as(i64, 8), o.get("file").?.integer);
+        try testing.expectEqualStrings(if (c.flag != null) "set by --wired-margin-gib until a start without it" else "applies at once: the next request and the next load use it", o.get("applies").?.string);
     }
 }
 

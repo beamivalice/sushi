@@ -5021,9 +5021,9 @@ test "cooler contract: a resident load beside buffers already past a declared wi
     const mb_was = bills.wired_limit_mb_override;
     defer bills.wired_limit_mb_override = mb_was;
     bills.wired_limit_mb_override = (total - (1 << 30)) >> 20;
-    const margin_was = bills.launch_state.wired_limit_margin_bytes;
-    defer bills.launch_state.wired_limit_margin_bytes = margin_was;
-    bills.launch_state.wired_limit_margin_bytes = total - (2 << 30);
+    const margin_was = bills.launch_state.wired_margin_flag_bytes;
+    defer bills.launch_state.wired_margin_flag_bytes = margin_was;
+    bills.launch_state.wired_margin_flag_bytes = total - (2 << 30);
     const floor_was = bills.gpu_floor_bytes.load(.monotonic);
     defer bills.gpu_floor_bytes.store(floor_was, .monotonic);
 

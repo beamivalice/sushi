@@ -460,8 +460,8 @@ test "Flash-Next streamed: a request refused at admission for its max_tokens nam
     try t.expect(config.expert_streaming and !config.expert_resident);
     // A declared GPU limit whose floor is `room` past what the process holds: the streamed load's ceiling.
     const ram = @import("../status.zig").getTotalMemBytes();
-    const saved_margin = launch_state.wired_limit_margin_bytes;
-    defer launch_state.wired_limit_margin_bytes = saved_margin;
+    const saved_margin = launch_state.wired_margin_flag_bytes;
+    defer launch_state.wired_margin_flag_bytes = saved_margin;
     bills.wired_limit_mb_override = ram >> 20;
     defer bills.wired_limit_mb_override = null;
     var prompt: [15]u32 = undefined;
@@ -487,10 +487,10 @@ test "Flash-Next streamed: a request refused at admission for its max_tokens nam
     var hi: u64 = 4 << 30;
     while (hi - lo > 1 << 20) {
         const mid = lo + (hi - lo) / 2;
-        launch_state.wired_limit_margin_bytes = (ram -| mid) -| active;
+        launch_state.wired_margin_flag_bytes = (ram -| mid) -| active;
         if ((try Ask.at(1, &config, &prompt, &buf)).admitted) hi = mid else lo = mid;
     }
-    launch_state.wired_limit_margin_bytes = (ram -| hi) -| active;
+    launch_state.wired_margin_flag_bytes = (ram -| hi) -| active;
     const got = try Ask.at(asked, &config, &prompt, &buf);
     errdefer std.debug.print("the streamed load's refusal at {d} MB of room: {s}\n", .{ hi >> 20, got.body });
     try t.expect(!got.admitted);

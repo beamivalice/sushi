@@ -966,7 +966,7 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     if (opts.layer_major) return error.LayerMajorNeedsNativeGlmTeacher;
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
     if (opts.cache_bias > 0) @import("model_settings.zig").expert_cache_bias_flag = opts.cache_bias;
-    if (opts.wired_margin_bytes > 0) server_state.wired_limit_margin_bytes = opts.wired_margin_bytes;
+    if (opts.wired_margin_bytes > 0) server_state.wired_margin_flag_bytes = opts.wired_margin_bytes;
     const loaded = try loadModel(io, allocator, opts);
     defer loaded.deinit();
     switch (opts.command) {

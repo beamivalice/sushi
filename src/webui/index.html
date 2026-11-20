@@ -990,6 +990,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <div id="wiredSet"></div>
         <div class="cmd"><code class="mono" id="wiredCmd"></code><button class="icon-btn" id="wiredCopy" type="button" title="Copy" aria-label="Copy command"></button></div>
         <div class="lead">Run it in Terminal, then restart sushi: the GPU limit is read when sushi starts, and macOS resets all three at reboot. All three limits move together.</div>
+        <div id="marginSet"></div>
       </div>
     </section>
     <h2 class="sec-h" id="secStorage" hidden>Storage</h2>
@@ -3691,7 +3692,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
   const isOff = (flag) => flag === "off" || flag === "false" || flag === "--ds41-mlx-engine" || flag === "--qwen-mlx-engine" || /^--no-/.test(flag);
   // The server may send a flag's whole spelling ("--qwen-mlx-engine") or just its value ("8").
-  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check", skip_mem_preflight: "--skip-mem-preflight" }[key] ?? "";
+  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check", skip_mem_preflight: "--skip-mem-preflight", wired_margin_gib: "--wired-margin-gib" }[key] ?? "";
   // The model-settings.json key beside its launch flag, after any engineering name the plain label replaced.
   const keyTerm = (key, eng = KEY[key]?.[4]) => `${[eng, key].filter(Boolean).join(", ")}${flagName(key) ? ` (${flagName(key)})` : ""}`;
   const flagText = (key, flag) => /^--/.test(flag) ? flag : key === "mtp" || key === "vision" ? flagName(key).replace("--", isOff(flag) ? "--no-" : "--") : flagName(key) ? `${flagName(key)} ${flag}` : "";
@@ -3703,7 +3704,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
 
   const A = { view: "chat", settings: null, cache: null, texts: {}, seq: {}, applied: {}, error: null,
-    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, wiredText: null, requestText: null, serr: {}, timer: null, retry: null, tbody: "",
+    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, wiredText: null, requestText: null, marginText: null, serr: {}, timer: null, retry: null, tbody: "",
     busy: new Set(), wsample: null, rates: new Map() };
   const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, refused: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
 
@@ -4291,6 +4292,16 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     wiredIn.setAttribute("aria-invalid", String(!!wiredRow.bad.textContent));
     setText(wiredDefaultNote, `Default ${def} (Mac memory ${Math.round(A.settings.gpu_limit.total_ram_bytes / 2 ** 30)} GB less 4)`);
   }
+  // The range is the server's, as for the request limit. The launch flag shows read-only in the box.
+  const marginSpec = (p) => ({ type: "int", min: p.min, max: p.max });
+  const marginRow = setRow("wired_margin_gib", "Safety margin (GB)", "marginGib", "Memory under the GPU limit that sushi never plans to use, kept for macOS and your other apps.", keyTerm("wired_margin_gib", "GPU safety margin"));
+  const marginIn = h("input", { id: "marginGib", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default (1)", "aria-label": "Safety margin under the GPU memory limit in GB", oninput: () => { A.marginText = marginIn.value; typed("wired_margin_gib"); renderMargin(A.settings.server.wired_margin_gib); }, onkeydown: (e) => enterTo(marginSave)(e) });
+  const marginSave = h("button", { class: "btn sm primary", id: "marginSave", type: "button", text: "Save", onclick: () => {
+    const v = adminControlValue(marginSpec(A.settings.server.wired_margin_gib), marginIn.value);
+    if (v.ok) saveServer("wired_margin_gib", v.value, "Saved.", marginSave, "Saving…");
+  } });
+  marginRow.ctl.append(h("div", { class: "row-in" }, marginIn, marginSave), marginRow.hint, marginRow.bad);
+  q("marginSet").replaceWith(marginRow.row);
   const GB_SPEC = { type: "int", min: 0, max: 1048576 };
   // Assigned space reuses the setting row; the models folder is chosen on the Models page.
   const cacheRow = setRow("prefix_cache_disk_gb", "Assigned space", "cacheGb", "How much disk space saved conversations may take, in GiB. More space keeps more conversations ready to continue fast; 0 turns the cache off.", keyTerm("prefix_cache_disk_gb", "SSD prefix cache size"));
@@ -4508,7 +4519,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         const r = await postJson("/v1/settings", { server: { [key]: value } });
         typed(key);
         toast(typeof r.applied?.[key] === "string" && r.applied[key] ? sentence(r.applied[key]) : text);
-        if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null; else if (key === "max_request_mb") A.requestText = null;
+        if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null; else if (key === "max_request_mb") A.requestText = null; else if (key === "wired_margin_gib") A.marginText = null;
       } catch (e) { A.serr[key] = adminErrorText(e); }
     });
     await refresh();
@@ -4526,6 +4537,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     for (const id of ["cacheCard", "portCard", "requestCard", "memoryCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
     for (const id of ["secStorage", "secServer"]) setHidden(q(id), false);
     renderWired();
+    if (s.server.wired_margin_gib) renderMargin(s.server.wired_margin_gib);
     setHidden(q("secInference"), !s.effort);
     setHidden(q("effortCard"), !s.effort);
     renderEffort(s.effort);
@@ -4610,6 +4622,22 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       setText(row.help, locked ? flagHelp(key, st.flag) : help);
       setText(row.bad, A.serr[key] || "");
     }
+  }
+  function renderMargin(p) {
+    const locked = !!p.locked, file = adminFileText(p.file), shown = locked ? adminFileText(p.flag) : file;
+    badges(marginRow.badge, p, p.applies);
+    if (A.marginText === shown) A.marginText = null;
+    if ((locked || A.marginText === null) && marginIn.value !== shown) marginIn.value = shown;
+    marginIn.placeholder = `Default (${p.default})`;
+    setText(marginRow.help, "Memory under the GPU limit that sushi never plans to use. macOS, the window server and your other apps use GPU memory too; this keeps room for them so a long prompt cannot push the Mac into a freeze or make other apps fail when the limit is reached. Default 1 GB; sushi keeps more on its own when it measures that other apps already use more. Raise it if your Mac stutters or apps misbehave while sushi works.");
+    setText(marginRow.hint, locked ? flagHelp("wired_margin_gib", p.flag) : "");
+    const text = marginIn.value.trim(), parsed = adminControlValue(marginSpec(p), text), dirty = !locked && text !== file, busy = marginSave.getAttribute("aria-busy") === "true";
+    marginIn.disabled = locked;
+    setHidden(marginSave, !dirty);
+    marginSave.disabled = !dirty || !parsed.ok || busy;
+    if (!busy) setText(marginSave, text === "" ? "Use default" : "Save");
+    setText(marginRow.bad, (dirty && text && !parsed.ok ? `Enter a whole number from ${p.min} to ${p.max} GB.` : "") || A.serr.wired_margin_gib || "");
+    marginIn.setAttribute("aria-invalid", String(!!marginRow.bad.textContent));
   }
   function renderRequestLimit(p) {
     const file = adminFileText(p.file);

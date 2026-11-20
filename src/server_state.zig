@@ -223,10 +223,24 @@ pub var max_concurrent: u32 = 1;
 
 /// How far under the enforced wired limit a plan may reach: past the limit Metal returns
 /// zeros before an uncatchable abort, so a real transient's worth of margin stays unplanned.
-pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 1 << 30;
+pub const WIRED_LIMIT_MARGIN_BYTES: u64 = @as(u64, model_settings.default_wired_margin_gib) << 30;
 
-/// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
-pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
+/// `--wired-margin-gib` in bytes; null = not given. It outranks the saved `server.wired_margin_gib`.
+pub var wired_margin_flag_bytes: ?u64 = null;
+
+/// The saved `server.wired_margin_gib`, 0 = none. The settings API sets it while serving.
+var wired_margin_file_gib = std.atomic.Value(u32).init(0);
+
+pub fn setWiredMarginFile(gib: ?u32) void {
+    wired_margin_file_gib.store(gib orelse 0, .monotonic);
+}
+
+/// What stays unplanned under a raised wired limit: flag, else the saved value, else the default. Every reader asks at
+/// the moment it plans, so a save reaches the next request and the next load.
+pub fn wiredMarginBytes() u64 {
+    const file = wired_margin_file_gib.load(.monotonic);
+    return settings_resolve.resolve(u64, wired_margin_flag_bytes, if (file > 0) @as(u64, file) << 30 else null, WIRED_LIMIT_MARGIN_BYTES).value;
+}
 
 // Numeric slot diagnostics cross to error mapping only on this connection's thread.
 pub threadlocal var slot_memory_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;

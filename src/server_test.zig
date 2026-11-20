@@ -674,8 +674,8 @@ fn setWiredFloor(floor: u64) !void {
     const total = @import("status.zig").getTotalMemBytes();
     const limit_mb: u64 = total >> 20;
     bills.wired_limit_mb_override = limit_mb;
-    server_state.wired_limit_margin_bytes = (limit_mb << 20) - floor;
-    const unplanned = bills.wiredUnplannedBytes(server_state.wired_limit_margin_bytes, bills.gpu_floor_bytes.load(.monotonic));
+    server_state.wired_margin_flag_bytes = (limit_mb << 20) - floor;
+    const unplanned = bills.wiredUnplannedBytes(server_state.wiredMarginBytes(), bills.gpu_floor_bytes.load(.monotonic));
     if (bills.wiredLimitFloor(bills.wiredLimitBytes(), total, unplanned) == floor) return;
     clearWiredFloor();
     return error.WiredFloorNotDeclared;
@@ -683,7 +683,7 @@ fn setWiredFloor(floor: u64) !void {
 
 fn clearWiredFloor() void {
     bills.wired_limit_mb_override = null;
-    server_state.wired_limit_margin_bytes = server_state.WIRED_LIMIT_MARGIN_BYTES;
+    server_state.wired_margin_flag_bytes = null;
 }
 
 test "server: a Responses WebSocket turn refused before it runs ends in the error frame, whichever check refused it" {

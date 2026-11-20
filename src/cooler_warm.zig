@@ -90,8 +90,8 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
     if (chunk == 0) {
         const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
         const floor = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
-        log.warn("[warm] no prefill chunk fits beside the load: the narrowest ({d} rows) needs {d} MB, the live headroom is {d} MB (reclaimable {d} MB less the {d} MB live reserve, under the ceiling --wired-margin-gib {d} GiB sets); a lower --ssd-budget-gb leaves room\n", .{
-            floor, bills.warmChunkPeakBytes(c, bits, floor) >> 20, headroom >> 20, @import("status.zig").getAvailableMemBytes() >> 20, bills.LIVE_RESERVE_BYTES >> 20, bills.launch_state.wired_limit_margin_bytes >> 30,
+        log.warn("[warm] no prefill chunk fits beside the load: the narrowest ({d} rows) needs {d} MB, the live headroom is {d} MB (reclaimable {d} MB less the {d} MB live reserve, under the ceiling the {d} GiB safety margin sets); a lower --ssd-budget-gb leaves room\n", .{
+            floor, bills.warmChunkPeakBytes(c, bits, floor) >> 20, headroom >> 20, @import("status.zig").getAvailableMemBytes() >> 20, bills.LIVE_RESERVE_BYTES >> 20, bills.launch_state.wiredMarginBytes() >> 30,
         });
         return error.WarmChunkDoesNotFit;
     }

@@ -27,6 +27,10 @@ pub const default_preserve_thinking = true;
 pub const default_think_penalty: f32 = 0;
 pub const default_max_request_mb: u32 = 128;
 pub const max_request_mb_limit: u32 = 1024;
+/// The safety margin under the GPU memory limit, in GiB: `--wired-margin-gib` and `server.wired_margin_gib` share it.
+pub const default_wired_margin_gib: u32 = 1;
+pub const wired_margin_gib_min: u32 = 1;
+pub const wired_margin_gib_max: u32 = 32;
 
 /// `--expert-cache-bias <n>`; null = not given. It outranks a model's `expert_cache_bias`.
 pub var expert_cache_bias_flag: ?f32 = null;
@@ -483,6 +487,7 @@ pub const server_keys = [_]KeySpec{
     .{ .name = "skip_mem_preflight", .kind = .bool },
     .{ .name = "port", .kind = .int, .min = 1, .max = 65535 },
     .{ .name = "max_request_mb", .kind = .int, .min = 1, .max = max_request_mb_limit },
+    .{ .name = "wired_margin_gib", .kind = .int, .min = wired_margin_gib_min, .max = wired_margin_gib_max },
 };
 
 pub const server_section = "server";
@@ -795,6 +800,8 @@ pub const Server = struct {
     /// The port a server binds and the clients target without `--port`.
     port: ?u16 = null,
     max_request_mb: ?u32 = null,
+    /// GiB kept unplanned under the wired GPU limit (`--wired-margin-gib` outranks it).
+    wired_margin_gib: ?u32 = null,
 };
 
 /// An automatic network look is on unless `--no-update-check` or the file turns it off.
@@ -837,6 +844,9 @@ pub fn server(self: *const Settings) Server {
     if (sec.get("port")) |v| out.port = default_port.fromValue(v);
     if (sec.get("max_request_mb")) |v| if (v == .integer and v.integer >= 1 and v.integer <= max_request_mb_limit) {
         out.max_request_mb = @intCast(v.integer);
+    };
+    if (sec.get("wired_margin_gib")) |v| if (v == .integer and v.integer >= wired_margin_gib_min and v.integer <= wired_margin_gib_max) {
+        out.wired_margin_gib = @intCast(v.integer);
     };
     return out;
 }
@@ -927,6 +937,7 @@ pub const LaunchLocks = struct {
     pack_update_check: Lock = .{},
     skip_mem_preflight: Lock = .{},
     port: Lock = .{},
+    wired_margin_gib: Lock = .{},
 
     pub fn model(self: *const LaunchLocks, name: []const u8) ?*const Lock {
         for (model_keys, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) return &self.models[i];
@@ -1255,6 +1266,29 @@ test "model_settings: server request limit reads a bounded MiB value" {
         var file = try parse(t.allocator, text);
         defer file.deinit();
         try t.expectEqual(c.want, server(&file).max_request_mb);
+    }
+}
+
+test "model_settings: server.wired_margin_gib reads an integer from the lowest to the highest margin the launch flag takes" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 1), default_wired_margin_gib);
+    const spec = findKey(&server_keys, "wired_margin_gib").?;
+    try t.expectEqual(@as(f64, wired_margin_gib_min), spec.min);
+    try t.expectEqual(@as(f64, wired_margin_gib_max), spec.max);
+    for ([_]struct { value: []const u8, want: ?u32 }{
+        .{ .value = "1", .want = 1 },
+        .{ .value = "32", .want = 32 },
+        .{ .value = "0", .want = null },
+        .{ .value = "33", .want = null },
+        .{ .value = "1.5", .want = null },
+        .{ .value = "\"4\"", .want = null },
+    }) |c| {
+        const text = try std.fmt.allocPrint(t.allocator, "{{\"server\":{{\"wired_margin_gib\":{s}}}}}", .{c.value});
+        defer t.allocator.free(text);
+        var file = try parse(t.allocator, text);
+        defer file.deinit();
+        try t.expectEqual(c.want, server(&file).wired_margin_gib);
+        try t.expectEqual(c.want != null, if (validate(spec, file.parsed.?.value.object.get("server").?.object.get("wired_margin_gib").?)) true else |_| false);
     }
 }
 
