@@ -139,6 +139,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **MLX-route memory: a request answered from a whole cached prompt (a regenerate, a repeated prompt) no longer grows
   its cache past its bill**: a one-token prompt skipped the cache's end bound, so its cache fell back to the +25% growth
   and held up to about 13 MB more than admission billed.
+- **MLX-route speed: a GLM turn that reuses a cached conversation no longer copies its latent every token**: a restore
+  held the conversation's rows exactly, off the page grid MLX writes in place on, so each new token copied the whole
+  latent (and its kv8 scales) until it grew past the cached rows; the first token now moves it onto the grid.
 - **MLX-route memory: a conversation restored from the SSD cache is held once**: the restore copied its whole cache at
   each chunk it read, so it briefly held about twice the conversation's cache before the request was admitted.
 - **MLX-route speed: a turn that reuses a trimmed cached conversation no longer copies its cache every token**: when

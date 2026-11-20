@@ -2,6 +2,7 @@
 //! latent is BF16, kv8 or kv6 as the request asks (`State.latent_bits`).
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const mlx_pages = @import("../mlx_pages.zig");
 const latent_store = @import("glm5_latent.zig");
 const glm5_bill = @import("glm5_bill.zig");
 pub const Latent = latent_store.Latent;
@@ -101,24 +102,40 @@ pub const Scope = struct {
         try mlx.check(mlx.mlx_add(out, a, zero, self.s));
         return out.*;
     }
-    /// `parts`: a row's bytes in each buffer that grows with `buffer` (`mlx_pages.pagedRows`).
-    fn appendRows(self: *Scope, buffer: Arr, used: usize, chunk: Arr, parts: []const u64) !Arr {
+    /// `parts`: a row's bytes in each buffer that grows with `buffer` (`mlx_pages.pagedRows`). `in_place`: every
+    /// buffer growing with it sits on MLX's page grid (`inPlaceRows`), so a write below its rows lands in place;
+    /// otherwise the write grows it onto the grid, keeping its first `used` rows.
+    fn appendRows(self: *Scope, buffer: Arr, used: usize, chunk: Arr, parts: []const u64, in_place: bool) !Arr {
         const sh = mlx.getShape(chunk);
         const needed = try std.math.add(usize, used, @intCast(sh[0]));
         if (needed > std.math.maxInt(c_int)) return error.InvalidGlmAttentionShape;
-        const current: usize = if (buffer.ctx == null) 0 else @intCast(mlx.getShape(buffer)[0]);
+        const current: usize = if (buffer.ctx == null) 0 else if (in_place) @intCast(mlx.getShape(buffer)[0]) else used;
         var target = buffer;
         if (needed > current) {
-            const capacity: usize = @intCast(@import("../mlx_pages.zig").pagedRows(needed, parts));
+            const capacity: usize = @intCast(mlx_pages.pagedRows(needed, parts));
             if (capacity > std.math.maxInt(c_int)) return error.InvalidGlmAttentionShape;
-            const padding = try self.zeros(&.{ @intCast(capacity - current), sh[1] }, mlx.mlx_array_dtype(chunk));
-            target = try self.join(buffer, padding);
+            const grown = [_]c_int{ @intCast(capacity), sh[1] };
+            const dtype = mlx.mlx_array_dtype(chunk);
+            target = try self.own(if (buffer.ctx == null or used == 0)
+                try mlx_pages.inPlaceBuffer(&grown, dtype, self.s)
+            else
+                try mlx_pages.grownBuffer(try self.cut(buffer, 0, @intCast(used)), &grown, 0, dtype, false, self.s));
         }
         const out = try self.slot();
         try mlx.check(mlx.mlx_slice_update(out, target, chunk, &.{ @intCast(used), 0 }, 2, &.{ @intCast(needed), sh[1] }, 2, &.{ 1, 1 }, 2, self.s));
         return out.*;
     }
 };
+
+/// Whether every one of `buffers` takes a write in place: on MLX's page grid, where its pool donates the buffer. A
+/// restore binds an entry's exact rows (`MlaRows.trimmedCopy`), which sit off it.
+fn inPlaceRows(buffers: []const Arr, s: mlx.mlx_stream) bool {
+    if (mlx.engine.isStream(s)) return true;
+    for (buffers) |b| {
+        if (b.ctx != null and !mlx_pages.onGrid(@as(u64, mlx.mlx_array_size(b)) * mlx.mlx_array_itemsize(b))) return false;
+    }
+    return true;
+}
 
 fn supported(dtype: mlx.mlx_dtype) bool {
     return dtype == .bfloat16 or dtype == .float32;
@@ -225,19 +242,20 @@ pub const State = struct {
         var l_scales = self.latent_scales;
         var l_biases = self.latent_biases;
         const parts = glm5_bill.latentPartBytes(@intCast(ls[1]), self.latent_bits, mlx.mlx_array_itemsize(latent));
-        if (store_latent and self.latent_bits == 0) l = try scope.appendRows(self.latent, self.processed, latent, &parts);
+        const latent_in_place = inPlaceRows(&.{ self.latent, self.latent_scales, self.latent_biases }, s);
+        if (store_latent and self.latent_bits == 0) l = try scope.appendRows(self.latent, self.processed, latent, &parts, latent_in_place);
         if (store_latent and self.latent_bits != 0) {
             var q = try latent_store.quantize(latent, self.latent_bits, s);
             defer q.deinit();
-            l = try scope.appendRows(self.latent, self.processed, q.q, &parts);
-            l_scales = try scope.appendRows(self.latent_scales, self.processed, q.scales, &parts);
-            l_biases = try scope.appendRows(self.latent_biases, self.processed, q.biases, &parts);
+            l = try scope.appendRows(self.latent, self.processed, q.q, &parts, latent_in_place);
+            l_scales = try scope.appendRows(self.latent_scales, self.processed, q.scales, &parts, latent_in_place);
+            l_biases = try scope.appendRows(self.latent_biases, self.processed, q.biases, &parts, latent_in_place);
         }
         const k = try scope.join(self.tail_keys, keys);
         const g = try scope.join(self.tail_gates, gates);
         const ready = @divTrunc(mlx.getShape(k)[0], 4) * 4;
         const fresh = if (ready > 0) try compress(&scope, k, g, ape, ready) else nil;
-        const p = if (ready > 0 and store_latent) try scope.appendRows(self.pooled, self.processed / 4, fresh, &.{@as(u64, @intCast(ks[1])) * mlx.mlx_array_itemsize(keys)}) else self.pooled;
+        const p = if (ready > 0 and store_latent) try scope.appendRows(self.pooled, self.processed / 4, fresh, &.{@as(u64, @intCast(ks[1])) * mlx.mlx_array_itemsize(keys)}, inPlaceRows(&.{self.pooled}, s)) else self.pooled;
         const pt = if (ready > 0 and !store_latent) try scope.join(self.pool_tail, fresh) else self.pool_tail;
         const tail_k = try scope.copy(try scope.cut(k, ready, mlx.getShape(k)[0]));
         const tail_g = try scope.copy(try scope.cut(g, ready, mlx.getShape(g)[0]));
@@ -1925,4 +1943,64 @@ test "GLM sparse prefill without NAX takes the FP32 composite, no worse than the
         try std.testing.expect(@abs(c - o) <= @abs(r - o) + @abs(o) / 128 + slack);
     }
     for (got[(rows - 1) * 64 * 512 ..]) |c| try std.testing.expectEqual(@as(f32, 0), c);
+}
+
+const RestoredLatent = struct { moved: usize, on_grid: bool };
+
+/// Appends five decode rows to a latent restored at 1,000 of an entry's `len` exact rows (what `MlaRows.trimmedCopy`
+/// binds, off MLX's page grid) while MLX's pool holds free buffers of `pages` pages: how many appends moved the BF16
+/// buffer, and whether every latent buffer then sits on the grid.
+fn restoredLatent(bits: u8, donate: bool, len: c_int, pages: c_int) !RestoredLatent {
+    const s = mlx.gpuStream();
+    const pos: usize = 1000;
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const ape = try scope.zeros(&.{ 4, 128 }, .bfloat16);
+    const keys = try normal(&scope, &.{ len, 128 }, 4, 1);
+    var whole = State{ .latent_bits = bits };
+    defer whole.deinit();
+    _ = try whole.append(try scope.own(try latent_store.randomRows(len, 512, 3, s)), keys, keys, ape, s);
+    try whole.evaluate();
+    try @import("../test_support.zig").seedMlxPool(s, pages * 16384, 16);
+    var state = State{ .latent_bits = bits, .processed = pos };
+    defer state.deinit();
+    const exact = [_]c_int{ len, len, len, @divExact(len, 4) };
+    inline for (.{ "latent", "latent_scales", "latent_biases", "pooled" }, exact) |name, rows| {
+        const from = @field(whole, name);
+        if (from.ctx != null) @field(state, name) = try @import("../mlx_util.zig").materializedOwnedCopy(s, try scope.cut(from, 0, rows));
+    }
+    try state.evaluate();
+    // The entry keeps a handle unless the request owns the rows alone, which MLX's pool then donates.
+    var entry = if (donate) State{} else try state.share();
+    defer entry.deinit();
+    const one = try normal(&scope, &.{ 1, 512 }, 4, 5);
+    const key = try normal(&scope, &.{ 1, 128 }, 4, 6);
+    var out = RestoredLatent{ .moved = 0, .on_grid = true };
+    var last: ?[*]const u8 = null;
+    for (0..6) |step| {
+        _ = try state.append(one, key, key, ape, s);
+        try state.evaluate();
+        try mlx.check(mlx.mlx_synchronize(s));
+        const at = mlx.mlx_array_data_uint8(state.latent);
+        if (bits == 0 and step > 1 and at != last) out.moved += 1;
+        last = at;
+    }
+    for ([_]Arr{ state.latent, state.latent_scales, state.latent_biases, state.pooled }) |a| {
+        if (a.ctx != null and !@import("../mlx_pages.zig").onGrid(@as(u64, mlx.mlx_array_size(a)) * mlx.mlx_array_itemsize(a))) out.on_grid = false;
+    }
+    return out;
+}
+
+test "a GLM latent restored below its exact rows grows onto MLX's page grid at its first write and appends in place after it" {
+    try mlx.requireGpu();
+    // 1,024 rows are 64 whole pages: a free 65-page buffer is donatable, and the latent never moves.
+    const grid = try restoredLatent(0, true, 1024, 65);
+    try std.testing.expectEqual(@as(usize, 0), grid.moved);
+    // 1,100 rows are 68.75 pages: past its first write each append lands in place, donated to the request or not.
+    for ([_]bool{ true, false }) |donate| {
+        const off = try restoredLatent(0, donate, 1100, 70);
+        try std.testing.expectEqual(@as(usize, 0), off.moved);
+        try std.testing.expectEqual(true, off.on_grid);
+    }
+    try std.testing.expectEqual(true, (try restoredLatent(latent_store.kv8_bits, false, 1100, 70)).on_grid);
 }

@@ -72,6 +72,8 @@ pooled index (`src/glm5/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   ([SSD flush](engine-prefix-cache.md#ssd-flush)).
   - Billed in `kv_bytes` beside the checkpoints: 6,688 bytes per row at kv8, 11,968 at BF16.
   - A budget trim lands on a checkpoint (`MlaRows.trimmedCopy`), sheds interior checkpoints and keeps the window.
+  - A trimmed copy holds exactly its rows, off MLX's page grid, so a restore's first append grows each latent buffer
+    onto it (`Scope.appendRows`, `inPlaceRows`); a write below its rows would copy the whole latent every append.
   - Beside an SSD tier the hot entry keeps only its newest 2 checkpoints (`CHECKPOINT_HOT_KEPT`): the pending record
     holds all of them for the flush, and a restore under the oldest of the two reads SSD
     ([the longer tier restores](engine-prefix-cache.md#ssd-flush)). Without an SSD tier it keeps them all.
