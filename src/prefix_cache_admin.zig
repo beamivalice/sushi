@@ -247,9 +247,11 @@ pub fn runClear(io: std.Io, req: *ClearRequest) void {
 
 // ── HTTP ──
 
-const Loaded = struct { id: []const u8, entry: *model_registry_mod.LoadedModel, snap: model_registry_mod.DiskStats.Snapshot };
+const Loaded = struct { id: []const u8, entry: *model_registry_mod.LoadedModel, snap: model_registry_mod.DiskStats.Snapshot, ready: bool };
 
-/// Ready models with an SSD tier. Entry pointers stay valid while the server runs (stubs stay registered).
+/// This process's models with an SSD tier: a model holds its namespace while it loads, serves and evicts, so a
+/// clear never takes it from under a load or an eviction. Entry pointers stay valid while the server runs (stubs stay
+/// registered).
 fn loadedTiers(allocator: std.mem.Allocator, registry: *model_registry_mod.ModelRegistry) ![]Loaded {
     var list = std.ArrayList(Loaded).empty;
     errdefer list.deinit(allocator);
@@ -258,10 +260,13 @@ fn loadedTiers(allocator: std.mem.Allocator, registry: *model_registry_mod.Model
     var it = registry.entries.valueIterator();
     while (it.next()) |p| {
         const e = p.*;
-        if (e.state != .ready) continue;
+        switch (e.state) {
+            .loading, .ready, .evicting => {},
+            .unloaded, .error_state => continue,
+        }
         const snap = e.disk_stats.snapshot();
         if (snap.namespace == 0) continue;
-        try list.append(allocator, .{ .id = e.id, .entry = e, .snap = snap });
+        try list.append(allocator, .{ .id = e.id, .entry = e, .snap = snap, .ready = e.state == .ready });
     }
     return list.toOwnedSlice(allocator);
 }
@@ -455,6 +460,11 @@ pub fn handleClear(allocator: std.mem.Allocator, stream: *http_conn.Conn, reques
         const loaded = try loadedTiers(allocator, sch.registry);
         defer allocator.free(loaded);
         for (loaded) |l| {
+            // A model mid-load or mid-eviction is left alone, as a busy one is.
+            if (!l.ready) {
+                try busy.append(allocator, l.id);
+                continue;
+            }
             const r = sch.prefixAdmin(.{ .entry = l.entry }) catch break;
             switch (r.outcome) {
                 .cleared => {
@@ -736,10 +746,38 @@ test "prefix cache admin: clearNamespaceId: only a namespace folder name names a
     try testing.expectEqual(@as(?u64, null), clearNamespaceId(try parse(a, "{\"id\":\"../etc\"}")));
 }
 
+test "prefix cache admin: a namespace this process's model holds is owned while it loads, serves or evicts, never while unloaded" {
+    const reg = try model_registry_mod.ModelRegistry.init(testing.allocator, testing.io, null, 4, 0, null);
+    defer reg.deinit();
+    const Case = struct { id: []const u8, state: model_registry_mod.LoadState, ns: u64, owned: bool };
+    const cases = [_]Case{
+        .{ .id = "loading", .state = .loading, .ns = 0xa1, .owned = true },
+        .{ .id = "ready", .state = .ready, .ns = 0xb2, .owned = true },
+        .{ .id = "evicting", .state = .evicting, .ns = 0xc3, .owned = true },
+        .{ .id = "unloaded", .state = .unloaded, .ns = 0xd4, .owned = false },
+        .{ .id = "failed", .state = .error_state, .ns = 0xe5, .owned = false },
+    };
+    for (cases) |c| {
+        const e = try reg.registerStub(c.id, c.id, 10);
+        e.state = c.state;
+        e.disk_stats.publish(.{ .namespace = c.ns });
+    }
+    defer for (cases) |c| {
+        reg.entries.get(c.id).?.state = .unloaded;
+    };
+    // A namespace clear answers 409 for an owned one, and the stale sweep keeps it.
+    const held = try loadedTiers(testing.allocator, reg);
+    defer testing.allocator.free(held);
+    for (cases) |c| {
+        errdefer std.debug.print("\n{s}: owned {}\n", .{ c.id, ownerOf(held, c.ns) != null });
+        try testing.expectEqual(c.owned, ownerOf(held, c.ns) != null);
+    }
+}
+
 test "prefix cache admin: renderList: a loaded model's namespace carries its tier, the rest are stale or held elsewhere" {
     const ns = [_]Namespace{ .{ .id = 0xa1, .bytes = 10, .entries = 1, .newest_ns = 5 * std.time.ns_per_s }, .{ .id = 0xb2, .bytes = 20 }, .{ .id = 0xc3 } };
     var entry: model_registry_mod.LoadedModel = undefined;
-    const loaded = [_]Loaded{.{ .id = "m", .entry = &entry, .snap = .{ .budget = 100, .used = 10, .entries = 1, .written = 77, .namespace = 0xa1 } }};
+    const loaded = [_]Loaded{.{ .id = "m", .entry = &entry, .snap = .{ .budget = 100, .used = 10, .entries = 1, .written = 77, .namespace = 0xa1 }, .ready = true }};
     const body = try renderList(testing.allocator, "/cache", .{ .free = 9, .total = 99 }, "test-volume", "/cache", &ns, &loaded, &.{ false, false, true });
     defer testing.allocator.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
