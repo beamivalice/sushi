@@ -223,6 +223,16 @@ pub fn mapGenerationError(allocator: std.mem.Allocator, err: anyerror) !GenError
             .anthropic_type = "invalid_request_error",
             .message = "messages hold no user turn to answer: this model's chat template needs one",
         },
+        error.ChatRoleUnknown => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = blk: {
+                try said.writer.print("a message role must be one of system, user, assistant or tool; got \"{s}\"", .{chat_mod.roleRefusal()});
+                break :blk said.written();
+            },
+        },
         error.ChatTemplateUnusable => .{
             .status_line = "500 Internal Server Error",
             .code = 500,
@@ -2615,6 +2625,19 @@ test "a slot the transient cap failed answers a named 503, not the memory 503" {
 
     slot.error_code = "OutOfMemory";
     try t.expect(slotFailure(&slot) == error.GenerationOutOfMemory);
+}
+
+test "a refused message role is a 400 that names the role, on both dialects" {
+    const t = std.testing;
+    var config = chat_mod.ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = t.allocator };
+    const msgs = [_]chat_mod.Message{.{ .role = "narrator", .content = "x" }};
+    try t.expectError(error.ChatRoleUnknown, chat_mod.renderChatTemplate(t.allocator, &msgs, &config, null, null, true, null, false));
+    const w = try mapGenerationError(t.allocator, error.ChatRoleUnknown);
+    defer w.deinit(t.allocator);
+    try t.expectEqual(@as(u32, 400), w.code);
+    try t.expectEqualStrings("invalid_request_error", w.openai_type);
+    try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
+    try t.expect(std.mem.indexOf(u8, w.message, "\"narrator\"") != null);
 }
 
 test "a streaming fault answers with the SAME mapped error a non-streaming one does" {

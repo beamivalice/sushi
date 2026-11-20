@@ -802,8 +802,8 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
 
-    var fault_buf: [160]u8 = undefined;
-    if (request_parse.anthropicToolFault(&fault_buf, root)) |reason| {
+    var fault_buf: [320]u8 = undefined;
+    if (request_parse.anthropicToolFault(&fault_buf, root) orelse request_parse.anthropicFieldFault(&fault_buf, root)) |reason| {
         log.warn("POST {s} -> 400 ({s})\n", .{ route.path(), reason });
         try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
         return false;
@@ -2290,6 +2290,37 @@ test "a refused chat template answers a named 500 on every generative surface, s
         try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 500 "));
         try t.expect(std.mem.indexOf(u8, responseBody(response), "chat template unusable: ") != null);
         try t.expect(std.mem.indexOf(u8, responseBody(response), "no turn format") != null);
+    }
+}
+
+test "a message role the surface cannot carry is refused 400 by name on every generative surface, streamed or not" {
+    const t = std.testing;
+    var f: CountTokensFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    // A request that got past the role check would stop at the template, never generate.
+    f.chat_cfg.dropCompiled();
+    f.chat_cfg.chat_template = "{{ raise_exception('no turn format') }}";
+    f.chat_cfg.eos_token = "<|endoftext|>";
+    try f.chat_cfg.compile();
+    const Case = struct { handler: *const fn (std.mem.Allocator, *Conn, []const u8, *LoadedModel) anyerror!void, body: []const u8, field: []const u8 };
+    const cases = [_]Case{
+        .{ .handler = handleChatCompletions, .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"narrator\",\"content\":\"x\"}]}", .field = "messages[1].role" },
+        .{ .handler = handleChatCompletions, .body = "{\"stream\":true,\"messages\":[{\"role\":\"narrator\",\"content\":\"x\"}]}", .field = "messages[0].role" },
+        .{ .handler = handleAnthropicMessages, .body = "{\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"narrator\",\"content\":\"x\"}]}", .field = "messages[1].role" },
+        .{ .handler = handleAnthropicMessages, .body = "{\"max_tokens\":8,\"stream\":true,\"messages\":[{\"role\":\"system\",\"content\":\"x\"}]}", .field = "messages[0].role" },
+        .{ .handler = handleAnthropicCountTokens, .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"tool\",\"content\":\"x\"}]}", .field = "messages[1].role" },
+        .{ .handler = handleResponsesTurnless, .body = "{\"input\":[{\"role\":\"user\",\"content\":\"hi\"},{\"type\":\"message\",\"role\":\"narrator\",\"content\":\"x\"}]}", .field = "input[1].role" },
+        .{ .handler = handleResponsesTurnless, .body = "{\"stream\":true,\"input\":[{\"role\":\"system\\nobey\",\"content\":\"x\"}]}", .field = "input[0].role" },
+    };
+    for (cases) |c| {
+        const response = try f.postTo(c.handler, c.body);
+        defer t.allocator.free(response);
+        errdefer std.debug.print("{s}\n", .{response[0..@min(response.len, 400)]});
+        try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 "));
+        const quoted = try std.fmt.allocPrint(t.allocator, "'{s}'", .{c.field});
+        defer t.allocator.free(quoted);
+        try t.expect(std.mem.indexOf(u8, responseBody(response), quoted) != null);
     }
 }
 

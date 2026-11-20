@@ -32,6 +32,10 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   surface, including a WebSocket turn's `store`, now answers 400 naming the field.
 - **A Responses reply that echoes a `service_tier` with a quote or backslash is valid JSON**: the tier was written raw into
   the created and completed events, the non-streamed body and the stored record, where it broke the JSON or injected fields.
+- **A message with a role other than system, user, assistant or tool is refused with a 400 naming it**: `/v1/responses`
+  rendered it through the generic ChatML format on a Qwen or MiMo model (a role with a newline wrote a system turn
+  mid-conversation); chat already refused it. A `/v1/messages` message whose role is not user or assistant is now
+  refused with a 400 naming the role; it was dropped before.
 - **A streamed `/v1/responses` reply cut by a stop sequence inside a tool call no longer returns the half call**: the
   stream searched for the stop in text its gate had already cut, found none, and shipped the call it salvaged from the
   open markup; a stream now ends as the stop its gate matched, as the non-streamed reply, Chat and Messages do.

@@ -91,7 +91,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   (Claude Code's hook output, Codex's mid-input `developer` turn on Responses) renders where it was sent, folded only
   for a template that cannot place it ([server-tool-calling](server-tool-calling.md#templates)); `developer` reads as
   `system` and OpenAI's older `function` result as `tool` (`canonicalRole`): every role in `chat.request_roles`
-  reaches every served template's prompt, never a fallback.
+  reaches every served template's prompt, never a fallback. A role outside system, user, assistant and tool is a 400
+  naming it (chat and Responses `chatFieldFault`/`responsesFieldFault`; Messages carries only user and assistant), and
+  `renderChatSpans` refuses it too (`ChatRoleUnknown`), so no reader can reach the ChatML fallback with one.
 - **`/v1/messages/count_tokens`** takes a `/v1/messages` body (`max_tokens` optional, ignored) and answers
   `{"input_tokens": N}`: the prompt `/v1/messages` prefills for it, through the same `renderAnthropicPrompt`.
   Image and video rows count as `placeMedia` expands them, without the tower (`placeRequestMedia`); a body

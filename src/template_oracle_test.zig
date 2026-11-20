@@ -1077,10 +1077,6 @@ fn jsonText(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
 const PoisonOut = struct { ids: []u32, text: []const u8 };
 
 fn poisonRender(a: std.mem.Allocator, arena: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, cfg: *const chat.ChatConfig, field: PoisonField, x: []const u8, xb: []const u8) !PoisonOut {
-    return poisonRenderWith(a, arena, tok, cfg, field, x, xb, null);
-}
-
-fn poisonRenderWith(a: std.mem.Allocator, arena: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, cfg: *const chat.ChatConfig, field: PoisonField, x: []const u8, xb: []const u8, extra_role: ?[]const u8) !PoisonOut {
     const P = struct {
         fn pick(f: PoisonField, want: PoisonField, poison: []const u8) []const u8 {
             return if (f == want) poison else "x";
@@ -1116,7 +1112,6 @@ fn poisonRenderWith(a: std.mem.Allocator, arena: std.mem.Allocator, tok: *const 
     });
     try h_msgs.append(arena, .{ .role = "tool", .content = try std.mem.concat(arena, u8, &.{ "t ", P.pick(field, .tool_content, xx), " t" }), .tool_call_id = call_id });
     if (field == .late_system) try h_msgs.append(arena, .{ .role = "system", .content = try std.mem.concat(arena, u8, &.{ "late ", xx, " late" }) });
-    if (extra_role) |r| try h_msgs.append(arena, .{ .role = r, .content = "f" });
     if (field == .text_around_image) {
         try h_msgs.append(arena, .{ .role = "user", .content = around, .images = img, .media_parts = parts });
     } else try h_msgs.append(arena, .{ .role = "user", .content = "u2" });
@@ -1175,29 +1170,27 @@ test "served packs: the fallbacks (ChatML after a raise, a template with no tool
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const qwen = arch_fx.qwen_template orelse return error.SkipZigTest;
-    const Cfg = struct { text: []const u8, extra_role: ?[]const u8 };
-    const cfgs = [_]Cfg{
-        // An unknown role makes Qwen3.8's template raise.
-        .{ .text = qwen, .extra_role = "narrator" },
-        .{ .text = "{% for m in messages %}{% if m.role in ['system','user','assistant'] %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}", .extra_role = null },
-        .{ .text = "", .extra_role = null },
+    const cfgs = [_][]const u8{
+        // A template that raises.
+        "{{ raise_exception('no turn format') }}",
+        "{% for m in messages %}{% if m.role in ['system','user','assistant'] %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
+        "",
     };
-    for (cfgs) |c| {
+    for (cfgs) |text| {
         const pt = try tokenizer_mod.packTokenizerForTests(a, arena, "qwen38_flash_next");
         const tok = try arena.create(tokenizer_mod.Tokenizer);
         tok.* = pt.tok;
         defer tokenizer_mod.deinitTestTokenizer(tok);
-        var cfg: chat.ChatConfig = .{ .chat_template = c.text, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a, .model_type = arch_fx.qwen_model_type };
+        var cfg: chat.ChatConfig = .{ .chat_template = text, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a, .model_type = arch_fx.qwen_model_type };
         try cfg.compile();
         defer cfg.dropCompiled();
         try tok.bindTemplate(cfg.printedFacts(), pt.stops, &.{});
         const x = try poisonSpecials(arena, tok, false);
         const xb = try poisonSpecials(arena, tok, true);
         for (std.enums.values(PoisonField)) |field| {
-            const clean = try poisonRenderWith(a, arena, tok, &cfg, field, "x", "x", c.extra_role);
+            const clean = try poisonRender(a, arena, tok, &cfg, field, "x", "x");
             defer a.free(clean.ids);
-            const got = try poisonRenderWith(a, arena, tok, &cfg, field, x, xb, c.extra_role);
+            const got = try poisonRender(a, arena, tok, &cfg, field, x, xb);
             defer a.free(got.ids);
             const want_sp = try specialIds(a, clean.ids);
             defer a.free(want_sp);

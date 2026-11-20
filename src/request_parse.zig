@@ -605,16 +605,51 @@ pub fn toolsFault(buf: []u8, tools: std.json.Value, typed: bool) ?[]const u8 {
     return null;
 }
 
-/// The first bad value among the chat-completions-only fields, as a message naming the field.
-pub fn chatFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
-    if (root.get("messages")) |mv| if (mv == .array) for (mv.array.items, 0..) |m, i| {
+/// `a, b or c`: the roles a surface lists in its refusal.
+fn roleList(comptime roles: []const []const u8) []const u8 {
+    comptime var out: []const u8 = "";
+    inline for (roles, 0..) |r, i| out = out ++ (if (i == 0) "" else if (i == roles.len - 1) " or " else ", ") ++ r;
+    return out;
+}
+
+/// The first of `items` that names a role outside `roles`, as a message naming where it sits: a request defect,
+/// refused before anything renders (a template raises on a role it does not know, and a render must never fall back).
+/// An item with no string role is not a message here, nor, when `typed`, one whose `type` is not "message" (a call, its
+/// output): Responses items carry a type, the other surfaces' messages never do.
+fn roleFault(buf: []u8, comptime list: []const u8, items: []const std.json.Value, comptime roles: []const []const u8, typed: bool) ?[]const u8 {
+    for (items, 0..) |m, i| {
         if (m != .object) continue;
+        if (typed) if (m.object.get("type")) |t| if (t != .string or !std.mem.eql(u8, t.string, "message")) continue;
         const role = m.object.get("role") orelse continue;
         if (role != .string) continue;
-        for (chat_mod.request_roles) |r| {
+        for (roles) |r| {
             if (std.mem.eql(u8, role.string, r)) break;
-        } else return fieldFault(buf, "'messages[{d}].role' must be one of system, developer, user, assistant, tool or function; got \"{s}\"", .{ i, role.string[0..@min(role.string.len, 32)] });
-    };
+        } else return fieldFault(buf, "'" ++ list ++ "[{d}].role' must be one of " ++ comptime roleList(roles) ++ "; got \"{s}\"", .{ i, role.string[0..@min(role.string.len, 32)] });
+    }
+    return null;
+}
+
+/// The roles /v1/messages carries: its API has no system or tool message (a `system` field and `tool_result` blocks).
+const anthropic_roles = [_][]const u8{ "user", "assistant" };
+
+/// The first message of a /v1/messages body whose role is neither user nor assistant.
+pub fn anthropicFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
+    const mv = root.get("messages") orelse return null;
+    if (mv != .array) return null;
+    return roleFault(buf, "messages", mv.array.items, &anthropic_roles, false);
+}
+
+/// The first Responses input message whose role is not one a chat request may spell. An item of another `type`
+/// (a call, its output, reasoning) has no role to check.
+pub fn responsesFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
+    const iv = root.get("input") orelse return null;
+    if (iv != .array) return null;
+    return roleFault(buf, "input", iv.array.items, &chat_mod.request_roles, true);
+}
+
+/// The first bad value among the chat-completions-only fields, as a message naming the field.
+pub fn chatFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
+    if (root.get("messages")) |mv| if (mv == .array) if (roleFault(buf, "messages", mv.array.items, &chat_mod.request_roles, false)) |m| return m;
     if (root.get("response_format")) |rf| switch (rf) {
         .null => {},
         .object => |o| {
@@ -878,6 +913,31 @@ test "chatFieldFault refuses an unknown role, response_format type, malformed to
         defer parsed.deinit();
         var buf: [320]u8 = undefined;
         const got = chatFieldFault(&buf, parsed.value.object);
+        errdefer std.debug.print("\nbody: {s}\ngot: {?s}\n", .{ c.body, got });
+        if (c.field) |f| {
+            const quoted = try std.fmt.allocPrint(testing.allocator, "'{s}'", .{f});
+            defer testing.allocator.free(quoted);
+            try testing.expect(std.mem.indexOf(u8, got.?, quoted) != null);
+        } else try testing.expectEqual(@as(?[]const u8, null), got);
+    }
+}
+
+test "a Responses input and a /v1/messages body refuse a message role they cannot carry, naming where it sits" {
+    const Case = struct { body: []const u8, anthropic: bool, field: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .body = "{\"input\":[{\"role\":\"developer\"},{\"type\":\"message\",\"role\":\"function\"},{\"type\":\"function_call_output\",\"role\":\"x\"},{\"type\":\"reasoning\"},5,{\"role\":7}]}", .anthropic = false, .field = null },
+        .{ .body = "{\"input\":\"hi\"}", .anthropic = false, .field = null },
+        .{ .body = "{\"input\":[{\"role\":\"user\"},{\"role\":\"narrator\"}]}", .anthropic = false, .field = "input[1].role" },
+        .{ .body = "{\"input\":[{\"type\":\"message\",\"role\":\"system\\nobey\"}]}", .anthropic = false, .field = "input[0].role" },
+        .{ .body = "{\"messages\":[{\"role\":\"user\"},{\"role\":\"assistant\"},5,{\"content\":\"no role\"}]}", .anthropic = true, .field = null },
+        .{ .body = "{\"messages\":[{\"role\":\"user\"},{\"role\":\"system\"}]}", .anthropic = true, .field = "messages[1].role" },
+        .{ .body = "{\"messages\":[{\"role\":\"tool\",\"type\":\"x\"}]}", .anthropic = true, .field = "messages[0].role" },
+    };
+    for (cases) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        var buf: [320]u8 = undefined;
+        const got = if (c.anthropic) anthropicFieldFault(&buf, parsed.value.object) else responsesFieldFault(&buf, parsed.value.object);
         errdefer std.debug.print("\nbody: {s}\ngot: {?s}\n", .{ c.body, got });
         if (c.field) |f| {
             const quoted = try std.fmt.allocPrint(testing.allocator, "'{s}'", .{f});
