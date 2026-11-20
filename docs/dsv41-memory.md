@@ -391,7 +391,8 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
 - **Lent pools are no one else's free memory**: while pools stay released (a borrower that ended before any decode-width
   forward, a refused read-back), every reading whose promise outlives the lease holds them off (`gpu_mem.lentBytes`,
   [engine-memory-admission](engine-memory-admission.md#gpu-memory-readers)); only the lessee's borrow and read-back count
-  them free.
+  them free, and only its own model's (`ModelConfig.expert_lent_bytes`): a second DeepSeek model's borrow and read-back
+  hold the first's lent pools off like any promise.
 - **Every exit that leaves a layer lent publishes the change in admission's own reading, on every engine**: a pool is
   measured as it leaves (`gpu_mem.activeBytes`, MLX's and the engine's, less the free buffers admission credits) and
   published on every exit, a release whose workspace and take-back both failed included. The union workspace a resident

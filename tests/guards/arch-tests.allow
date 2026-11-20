@@ -80,6 +80,7 @@ cooler contract: a held Qwen restore point restores the same tokens as its file 
 cooler contract: a held Qwen restore point whose write fails as it gives way to a staged write mid-commit leaves no listed point without bytes
 cooler contract: a regenerated Qwen turn restores from its own prompt end, live and after a flush
 cooler contract: a rewind past a Qwen conversation's held restore points restores from the grid point, the same tokens every time
+cooler contract: a second DeepSeek model's own lessee reading counts only its own lent pools free, not the first model's, on Sushi Cooler and on MLX
 cooler contract: a served Qwen conversation keeps its newest off-grid restore points in RAM, writes none while the next turn extends them, and a flush writes the held ones
 cooler contract: a served Qwen conversation of takeovers, partial, regenerated and diverging, says its share arm's tokens with the pool poisoned, under a roomy and a tight RAM budget
 cooler contract: a served Qwen partial takeover refused before it donates leaves no cut on the entry, so the next turn takes the entry whole and keeps its restore points

@@ -1,7 +1,8 @@
 //! Rule `promise-active`: a fn that reads the GPU's active bytes (`.activeBytes()`) and never asks
 //! `bills.promisedActive`. A promise (admission, a headroom, a load's fit, a pinned context or chunk) counts the decoder
-//! pools a lease lent out of the active bytes in use; a reading that took them raw promised them free. A report, a
-//! ceiling's own input or the lessee's own reading is an allowlist entry with its reason. Token scan, no Sema.
+//! pools a lease lent out of the active bytes in use; a reading that took them raw promised them free (the lessee's
+//! own reading too: it frees only its own model's). A report or the lent term's own measure is an allowlist entry with
+//! its reason. Token scan, no Sema.
 const std = @import("std");
 const Ast = std.zig.Ast;
 const rule = @import("rule.zig");

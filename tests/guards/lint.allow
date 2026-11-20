@@ -69,7 +69,6 @@ error-body-literal src/http_conn.zig:anthropicEnvelope a test helper that reads 
 promise-active src/kld.zig:runCompare a report of the memory a KLD run measured, no promise
 promise-active src/server.zig:sampleGauges the metrics gauges report the allocators' counters, no promise
 promise-active src/generate.zig:prefillMem the prefill-trace log line reports the counters, no promise
-promise-active src/bills.zig:leaseHolderHeadroomNow the lessee's own reading counts its lent pools free: its read-back takes them back
 promise-active src/models_api.zig:handleProps /props reports the active bytes as MLX and the engine count them, no promise
 promise-active src/models_api.zig:handlePropsNoModel /props reports the active bytes as MLX and the engine count them, no promise
 promise-active src/expert_stream.zig:lentReading measures the lent term itself, on the reading admission subtracts it from

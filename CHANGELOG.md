@@ -58,6 +58,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   conversation over is no longer billed again for the room its taken-over cache already holds for the reply.
 - **A DeepSeek-V4.1 prompt refused for memory at its first prefill chunk says so**: the refusal said it ran out
   partway through the prefill and that the chunks before it ran, when none had.
+- **Two DeepSeek-V4.1 models loaded together no longer count each other's lent decoder pools as free**: one model's
+  prefill borrow or read-back could take the memory the other's read-back needed.
 - **A DeepSeek-V4.1 request admitted under memory pressure is no longer promised memory a stranded or reading-back
   decoder pool holds**: a pool whose release failed half way and the workspace its heal makes, every pool released on
   an MLX load, and the workspace a read-back holds beside the pools it takes back counted as free.

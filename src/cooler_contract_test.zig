@@ -68,6 +68,7 @@ const Load = struct {
         self.xfm = try a.create(Trunk);
         errdefer a.destroy(self.xfm);
         self.xfm.* = try Trunk.init(io, a, self.config, &self.weights);
+        model_load.publishEngine(self.xfm, &self.config);
         @import("model_load.zig").compileClosures(self.xfm, .all);
         self.h = arch_handle.adopt(self.xfm);
     }
@@ -5889,7 +5890,10 @@ const LentSweep = struct {
         errdefer std.debug.print("{t} with {s} {d} refused: released {any}, union {}; lent {d} B, pools unmapped {d} B, union {d} B; admission at rest {d}, stranded {d}, now {d}\n", .{
             self.step, refused, k, .{ e.isBorrowed(self.layer[0]), e.isBorrowed(self.layer[1]) }, e.grouped_union.len != 0, lent, unmapped, self.union_read, self.rest, self.stranded, now,
         });
-        if (stranded) try testing.expect(lent >= unmapped + self.union_read) else try testing.expectEqual(unmapped, lent);
+        // Within a page: MLX's active bytes are the process's, and a free another load left pending may land in a
+        // release's reading or the pools' measure.
+        const page: i64 = 16 << 10;
+        if (stranded) try testing.expect(lent + page >= unmapped + self.union_read) else try testing.expect(@abs(lent - unmapped) <= page);
         try testing.expect(now <= self.rest);
         if (self.step == .heal) try testing.expect(now >= self.stranded);
     }
@@ -6024,6 +6028,51 @@ fn readBackHoldsUnion(dir: []const u8, cooler: bool) !void {
         try testing.expect(e.grouped_union.len != 0);
         try testing.expect(admitted <= free);
     }
+}
+
+test "cooler contract: a second DeepSeek model's own lessee reading counts only its own lent pools free, not the first model's, on Sushi Cooler and on MLX" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const dir2 = std.mem.span(std.c.getenv("DSV41_STQ_TINY_PM") orelse return error.SkipZigTest);
+    // Each engine is read whatever the other said.
+    var failed: ?anyerror = null;
+    for ([_]bool{ true, false }) |cooler| twoLessees(dir, dir2, cooler) catch |e| {
+        if (e == error.SkipZigTest) return e;
+        failed = failed orelse e;
+    };
+    if (failed) |e| return e;
+}
+
+fn twoLessees(dir: []const u8, dir2: []const u8, cooler: bool) !void {
+    const own = @import("dsv41/dsv41_bill.zig").dsv41Headroom;
+    var lease: LentLease = undefined;
+    try lease.open(dir, cooler);
+    defer lease.close();
+    var other: Load = undefined;
+    try other.open(ContractOf("dsv41"), dir2, cooler);
+    defer _ = other.close();
+    const e = lease.engine;
+    if (e.layers.len - e.borrow_from < 3) return error.SkipZigTest;
+    const last: u16 = @intCast(e.layers.len - 1);
+    // The union workspace made first, so only the pools move the readings.
+    _ = try e.borrowLayer(last - 2);
+    defer e.restoreLayer(last - 2) catch {};
+    const rest = .{ own(&lease.ld.config).bound(), own(&other.config).bound() };
+    var lent = try e.borrowLayer(last);
+    lent += try e.borrowLayer(last - 1);
+    const now = .{ own(&lease.ld.config).bound(), own(&other.config).bound() };
+    try e.restoreLayer(last - 1);
+    try e.restoreLayer(last);
+    errdefer std.debug.print("on {s}: {d} B lent by the first model; its own reading {d} -> {d}, the second's {d} -> {d}\n", .{ if (cooler) "Sushi Cooler" else "MLX", lent, rest[0], now[0], rest[1], now[1] });
+    try testing.expect(lent > 0);
+    // The lessee's read-back takes its own pools back; another model's borrow or read-back would take them twice.
+    try testing.expect(now[0] > rest[0]);
+    try testing.expect(now[1] <= rest[1] + lent / 2);
 }
 
 /// One request prefilled under `LeaseProbe`, so its wide chunk released decoder pools, and decoding.

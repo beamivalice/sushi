@@ -188,6 +188,9 @@ pub const ModelConfig = struct {
     /// The expert-cache bytes a prefill may still take for its working set (DeepSeek's decoder pools), written by the
     /// inference thread as pools are released and restored; read it with `@atomicLoad`.
     expert_borrow_bytes: u64 = 0,
+    /// This model's share of the decoder pools lent out of the active bytes (`gpu_mem.lentBytes`), written with
+    /// `expert_borrow_bytes`: only its own lessee reading counts them free (`bills.leaseHolderHeadroomNow`).
+    expert_lent_bytes: u64 = 0,
     /// A streamed load's resident vision tower (in the ssd budget) and its largest single-image
     /// encode (beside the budget, at the wired-limit admission); 0 = tower off.
     expert_vision_tower_bytes: u64 = 0,

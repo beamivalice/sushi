@@ -2965,11 +2965,13 @@ pub fn headroomNow(config: *const model_mod.ModelConfig, staged_host: u64) Headr
     return headroomFrom(config, liveGpuMemoryCeiling(config, active_mem), promisedActive(active_mem), staged_host, gpu_mem.engineFree());
 }
 
-/// The one reading that counts the lent decoder pools free: their lessee's (DeepSeek's borrow, for its prefill's
-/// releases and its read-back), whose own forwards take them back.
+/// The one reading that counts lent decoder pools free: their lessee's (DeepSeek's borrow, for its prefill's releases
+/// and its read-back), and only its OWN (`ModelConfig.expert_lent_bytes`), whose own forwards take them back. Another
+/// model's stay in use, as for every promise.
 pub fn leaseHolderHeadroomNow(config: *const model_mod.ModelConfig) Headroom {
     const active_mem: usize = gpu_mem.activeBytes();
-    return headroomFrom(config, liveGpuMemoryCeiling(config, active_mem), active_mem, 0, gpu_mem.engineFree());
+    const own = @atomicLoad(u64, &config.expert_lent_bytes, .monotonic);
+    return headroomFrom(config, liveGpuMemoryCeiling(config, active_mem), promisedActive(active_mem) -| own, 0, gpu_mem.engineFree());
 }
 
 /// PURE half of `prefillHeadroomNow`.

@@ -1270,9 +1270,14 @@ const SlabOperand = struct {
     }
 
     fn destroy(self: *SlabOperand, allocator: std.mem.Allocator, s: mlx.mlx_stream) void {
-        if (!self.present) return;
-        const slab = self.slab orelse return;
-        const payload = self.payload orelse return;
+        _ = self.release(allocator, s);
+    }
+
+    /// `destroy`, and whether this slab's pages left: false when its release timed out and they stay mapped.
+    fn release(self: *SlabOperand, allocator: std.mem.Allocator, s: mlx.mlx_stream) bool {
+        if (!self.present) return true;
+        const slab = self.slab orelse return true;
+        const payload = self.payload orelse return true;
         _ = mlx.mlx_array_free(self.array);
         // The engine's imports of the array end when its passes have run, which only its own wait lets it know.
         if (mlx.engine.enabled) mlx.engine.close();
@@ -1286,11 +1291,12 @@ const SlabOperand = struct {
             const timeouts = slab_release_timeouts.fetchAdd(1, .monotonic) + 1;
             log.warn("[expert-stream] slab release timed out: {d} bytes stay mapped for MLX and are never freed (timeouts so far {d})\n", .{ slab.bytes.len, timeouts });
             self.* = undefined;
-            return;
+            return false;
         }
         slab.destroy();
         allocator.destroy(payload);
         self.* = undefined;
+        return true;
     }
 
     pub fn slotBytes(self: *const SlabOperand, slot: usize) []u8 {
@@ -2087,6 +2093,8 @@ pub const Engine = struct {
     /// published (`ModelConfig.expert_borrow_bytes`, read by admission on other threads).
     borrow_from: u16 = std.math.maxInt(u16),
     borrow_publish: ?*u64 = null,
+    /// Where this engine's share of `lent_total` is published (`ModelConfig.expert_lent_bytes`).
+    lent_publish: ?*u64 = null,
     /// This engine's share of `lent_total`, as last published.
     lent_published: u64 = 0,
     /// Routed ids the lossy pick replaced on rate-grouped layers, of the ids it saw (`swapGroupedMisses`).
@@ -3180,10 +3188,12 @@ pub const Engine = struct {
         return .{ .map = layer.resident_map, .bank = &layer.grouped.?.cache_ragged };
     }
 
-    /// Publishes what a prefill may still borrow (`ModelConfig.expert_borrow_bytes`) and what is lent (`lent_total`).
+    /// Publishes what a prefill may still borrow (`ModelConfig.expert_borrow_bytes`) and what is lent (`lent_total`,
+    /// this engine's share in `ModelConfig.expert_lent_bytes`).
     pub fn publishBorrowable(self: *Engine) void {
         if (self.borrow_publish) |dst| @atomicStore(u64, dst, self.borrowableBytes(), .monotonic);
         self.publishLent(self.lentOutstanding());
+        if (self.lent_publish) |dst| @atomicStore(u64, dst, self.lent_published, .monotonic);
     }
 
     fn publishLent(self: *Engine, lent: u64) void {
@@ -3269,9 +3279,7 @@ pub const Engine = struct {
         for (layer.slabs) |*operand| {
             if (!operand.present) continue;
             const bytes = operand.stride * operand.count;
-            const timeouts = slab_release_timeouts.load(.monotonic);
-            operand.destroy(self.allocator, self.s);
-            if (slab_release_timeouts.load(.monotonic) == timeouts) freed += bytes;
+            if (operand.release(self.allocator, self.s)) freed += bytes;
         }
         if (layer.slabs.len != 0) self.allocator.free(layer.slabs);
         layer.slabs = &.{};

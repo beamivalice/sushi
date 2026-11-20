@@ -740,7 +740,7 @@ tensor lent to MLX is in both counters, so the sum errs high.
   prefill released leave the active bytes until their lessee's read-back takes them back, so admission (every
   model's), the live headroom, the load's fit, the hot-cache budget and the auto-context and prefill chunk a load pins
   (a pin outlives any lease) add them; only the lessee's own reading (`bills.leaseHolderHeadroomNow`, `dsv41Headroom`)
-  counts them free. A promise reads the active bytes only through `promisedActive` (lint `promise-active`). Each
+  counts them free, its own model's alone (`ModelConfig.expert_lent_bytes`). A promise reads the active bytes only through `promisedActive` (lint `promise-active`). Each
   engine publishes what its releases moved in admission's reading (`Engine.lentOutstanding`: the active bytes, MLX's
   and the engine's, as each pool leaves, on every exit that leaves it lent), a buffer parked in its free list twice,
   since the credit reads it and the read-back reuses it.

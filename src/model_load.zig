@@ -307,6 +307,15 @@ pub fn warmLoad(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xf
     if (plan) |*p| p.store() else cooler_pipelines.rewriteLate();
 }
 
+/// Points a load's expert engine at the config admission reads: what a prefill may still borrow, and its own share of
+/// the lent decoder pools.
+pub fn publishEngine(xfm: *Trunk, config: *model_mod.ModelConfig) void {
+    const engine = xfm.expert_stream orelse return;
+    engine.borrow_publish = &config.expert_borrow_bytes;
+    engine.lent_publish = &config.expert_lent_bytes;
+    engine.publishBorrowable();
+}
+
 /// JIT-compiles the activation kernels, bound to this thread's MLX stream. Skipped when there's no GPU backend
 /// (iOS Simulator's CPU-only MLX): mlx_compile is Metal kernel fusion and asks for a GPU stream that doesn't exist;
 /// the runtime falls back to the uncompiled paths when compiled_* stays null. A Cooler load compiles none: an MLX
@@ -2204,10 +2213,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     xfm_ptr.* = try Trunk.init(sch.io, sch.allocator, params.config.*, weights_ptr);
     load_clock.buildDone(build_t0);
     errdefer xfm_ptr.deinit();
-    if (xfm_ptr.expert_stream) |engine| {
-        engine.borrow_publish = &params.config.expert_borrow_bytes;
-        engine.publishBorrowable();
-    }
+    publishEngine(xfm_ptr, params.config);
 
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
     // specials): derived per model from tokenizer + template + eos.
