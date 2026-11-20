@@ -329,8 +329,8 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
 test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
-    // Bar: a raised sysctl lifts the free-RAM term and nothing else; every other arch and the
-    // default sysctl keep the old expression byte for byte.
+    // Bar: a declared sysctl lifts the free-RAM term and nothing else; none declared keeps the old expression byte for
+    // byte.
     const t = std.testing;
     qwen4_qsa_select.qsa_score_fused_override = false;
     defer qwen4_qsa_select.qsa_score_fused_override = null;
@@ -342,35 +342,28 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     bills.wired_limit_mb_override = 120_000;
 
     try t.expectEqual(@as(u64, 1 << 30), launch_state.WIRED_LIMIT_MARGIN_BYTES);
-    try t.expectEqual(@as(u64, 118_976), bills.wiredLimitFloor(120_000 * mb, total_ram, launch_state.WIRED_LIMIT_MARGIN_BYTES) / mb);
-    // The macOS default (75% of RAM) and anything under it declares nothing; and however
-    // absurd the sysctl, never plan within the margin of physical RAM.
-    try t.expectEqual(@as(u64, 0), bills.wiredLimitFloor(98_304 * mb, total_ram, launch_state.WIRED_LIMIT_MARGIN_BYTES));
-    try t.expectEqual(@as(u64, 0), bills.wiredLimitFloor(0, total_ram, launch_state.WIRED_LIMIT_MARGIN_BYTES));
-    try t.expectEqual(@as(u64, 0), bills.wiredLimitFloor(120_000 * mb, 0, launch_state.WIRED_LIMIT_MARGIN_BYTES));
-    try t.expectEqual(total_ram - launch_state.WIRED_LIMIT_MARGIN_BYTES, bills.wiredLimitFloor(400 * (1 << 30), total_ram, launch_state.WIRED_LIMIT_MARGIN_BYTES));
+    try t.expectEqual(@as(?u64, 118_976 * mb), bills.wiredLimitFloor(120_000 * mb, total_ram, launch_state.WIRED_LIMIT_MARGIN_BYTES));
+    // Owner ruling: any declared value is a declaration, the macOS default's 75% of RAM and under included; none
+    // declared is no floor; and however absurd the sysctl, never plan within the margin of physical RAM.
+    try t.expectEqual(@as(?u64, 97_280 * mb), bills.wiredLimitFloor(98_304 * mb, total_ram, launch_state.WIRED_LIMIT_MARGIN_BYTES));
+    try t.expectEqual(@as(?u64, null), bills.wiredLimitFloor(null, total_ram, launch_state.WIRED_LIMIT_MARGIN_BYTES));
+    try t.expectEqual(@as(?u64, 118_976 * mb), bills.wiredLimitFloor(120_000 * mb, 0, launch_state.WIRED_LIMIT_MARGIN_BYTES));
+    try t.expectEqual(@as(?u64, total_ram - launch_state.WIRED_LIMIT_MARGIN_BYTES), bills.wiredLimitFloor(400 * (1 << 30), total_ram, launch_state.WIRED_LIMIT_MARGIN_BYTES));
 
     const box96: u64 = 96_000 * mb;
     const six: u64 = 6 << 30;
-    try t.expectEqual(@as(u64, 90_000) * mb - six, bills.wiredLimitFloor(90_000 * mb, box96, six));
-    try t.expectEqual(box96 - six, bills.wiredLimitFloor(96_000 * mb, box96, six));
-    try t.expectEqual(@as(u64, 90_000) * mb - launch_state.WIRED_LIMIT_MARGIN_BYTES, bills.wiredLimitFloor(90_000 * mb, box96, launch_state.WIRED_LIMIT_MARGIN_BYTES));
+    try t.expectEqual(@as(?u64, 90_000 * mb - six), bills.wiredLimitFloor(90_000 * mb, box96, six));
+    try t.expectEqual(@as(?u64, box96 - six), bills.wiredLimitFloor(96_000 * mb, box96, six));
+    try t.expectEqual(@as(?u64, 90_000 * mb - launch_state.WIRED_LIMIT_MARGIN_BYTES), bills.wiredLimitFloor(90_000 * mb, box96, launch_state.WIRED_LIMIT_MARGIN_BYTES));
 
-    // Gated: every other arch takes floor 0, which is `physicalMemoryCeiling` exactly.
-    var cfg = fixtures.qwen4ExpLive364kConfig();
-    try t.expect(bills.wiredCeilingFloorForRam(&cfg, total_ram) > 0);
-    try t.expectEqual(@as(u64, 0), bills.wiredCeilingFloorForRam(null, total_ram));
-    for ([_][]const u8{"not_a_served_arch"}) |mt| {
-        var other = cfg;
-        other.model_type = mt;
-        try t.expect(!other.longCtxGated());
-        try t.expectEqual(@as(u64, 0), bills.wiredCeilingFloorForRam(&other, total_ram));
-    }
+    // No floor is `physicalMemoryCeiling` exactly.
+    const cfg = fixtures.qwen4ExpLive364kConfig();
+    const declared_floor = bills.wiredLimitFloor(120_000 * mb, total_ram, launch_state.WIRED_LIMIT_MARGIN_BYTES).?;
     const footprint: u64 = 87_722 * mb;
     for ([_]u64{ 0, 12_934 * mb, 400 * (1 << 30) }) |free| {
         try t.expectEqual(
             bills.physicalMemoryCeiling(working_set, footprint, free),
-            bills.gpuCeilingWithWiredFloor(working_set, footprint, free, 0),
+            bills.gpuCeilingWithWiredFloor(working_set, footprint, free, null),
         );
     }
 
@@ -381,16 +374,15 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     const shared = bills.WarmPrefix{ .matched_tokens = 448_531, .capacity_tokens = 448_531, .will_donate = false };
     const needed = bills.prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, shared);
     try t.expectEqual(@as(u64, 17_504), needed / mb);
-    try t.expect(needed > bills.gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, 0) -| footprint);
-    const lifted = bills.gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, bills.wiredCeilingFloorForRam(&cfg, total_ram));
+    try t.expect(needed > bills.gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, null) -| footprint);
+    const lifted = bills.gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, declared_floor);
     try t.expectEqual(@as(u64, 31_254), (lifted -| footprint) / mb);
     try t.expect(needed <= lifted -| footprint);
 
     // Under a declared limit the margin holds however much RAM is free: a load on a quiet box saw the
     // working set, the margin gone, and proved a context its own requests then refused.
-    const floor = bills.wiredCeilingFloorForRam(&cfg, total_ram);
-    try t.expectEqual(floor, bills.gpuCeilingWithWiredFloor(working_set, 0, working_set, floor));
-    try t.expectEqual(floor, bills.gpuCeilingWithWiredFloor(working_set, footprint, 400 * (1 << 30), floor));
+    try t.expectEqual(declared_floor, bills.gpuCeilingWithWiredFloor(working_set, 0, working_set, declared_floor));
+    try t.expectEqual(declared_floor, bills.gpuCeilingWithWiredFloor(working_set, footprint, 400 * (1 << 30), declared_floor));
 }
 
 test "the admission probe bills the request's OWN kv-quant and chunking, not the process defaults" {
@@ -697,4 +689,55 @@ test "Flash-Next: the context the auto search names at a budget is admitted at e
         };
     };
     try std.testing.expectEqual(@as(u32, 0), refused);
+}
+
+test "under a declared wired limit the RAM hot-cache budget leaves the unplanned margin, as every runtime ceiling does" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    const status = @import("../status.zig");
+    const gpu = @import("../gpu_mem.zig");
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    var cfg = fixtures.qwen4RequestTestConfig();
+    defer bills.clearResolvedPrefixCacheMem();
+    const orig_disk = launch_state.prefix_cache_disk_bytes;
+    defer launch_state.prefix_cache_disk_bytes = orig_disk;
+    launch_state.prefix_cache_disk_bytes = 0; // the RAM arm
+    const orig_src = launch_state.prefix_cache_mem_source;
+    defer launch_state.prefix_cache_mem_source = orig_src;
+    launch_state.prefix_cache_mem_source = .flag; // `--prefix-cache-mem 64GB`
+    const orig_ctx = launch_state.server_config.max_context_size;
+    defer launch_state.server_config.max_context_size = orig_ctx;
+    launch_state.server_config.max_context_size = 262_144;
+    cfg.pinned_context = 0;
+    // #110's box: 64 GB, iogpu.wired_limit_mb=59392, --wired-margin-gib 4; the working set tracks the sysctl.
+    const saved_total = status.total_mem_override;
+    const saved_wired = bills.wired_limit_mb_override;
+    const saved_margin = launch_state.wired_margin_flag_bytes;
+    const saved_avail = status.available_mem_override;
+    const saved_static = bills.static_ceiling_override;
+    defer {
+        status.total_mem_override = saved_total;
+        bills.wired_limit_mb_override = saved_wired;
+        launch_state.wired_margin_flag_bytes = saved_margin;
+        status.available_mem_override = saved_avail;
+        bills.static_ceiling_override = saved_static;
+    }
+    status.total_mem_override = 64 * GiB;
+    bills.wired_limit_mb_override = 59_392;
+    launch_state.wired_margin_flag_bytes = 4 * GiB;
+    status.available_mem_override = 3_501 * MiB;
+    bills.static_ceiling_override = 59_392 * MiB;
+
+    var idle: u64 = 0;
+    const budget = bills.prefixCacheMemForLoad(&cfg, 64 * GiB, .{}, &idle);
+    const active: u64 = gpu.activeBytes();
+    const floor = bills.currentGpuMemoryCeiling(active);
+    const kv_bits = bills.defaultKvBits(&cfg);
+    const ctx_kv = bills.sessionBytesPerToken(&cfg, kv_bits) *| 262_144 +| bills.slotRingBytes(&cfg, kv_bits);
+    const reserve = bills.prefillTransientReserve(&cfg, kv_bits, bills.clampReserveWidth(&cfg, cfg.pinned_prefill_chunk));
+    errdefer std.debug.print("ceiling {d} MiB: hot cache {d} MiB + active {d} MiB + 262,144-token KV {d} MiB + reserve {d} MiB = {d} MiB\n", .{ floor / MiB, budget / MiB, active / MiB, ctx_kv / MiB, reserve / MiB, (budget + active + ctx_kv + reserve) / MiB });
+    try t.expectEqual(@as(u64, 55_296) * MiB, floor);
+    try t.expect(budget +| active +| ctx_kv +| reserve <= floor);
 }

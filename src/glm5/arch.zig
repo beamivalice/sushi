@@ -46,7 +46,7 @@ const config_file = @import("glm5_config.zig");
 const arch_config = @import("../arch/config.zig");
 pub const config_types = [_][]const u8{ "glm5_next", "glm5_next_text" };
 pub const discovery_types = model_types;
-pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .expert_source = .individual_source, .state_beside_kv = true, .no_mtp_head = true, .mtp_unserved = true, .latent_kv = true, .kda_state = true, .evicts_hot_cache = true, .declared_wired_ceiling = true, .own_dflash_bill = true, .prefill_start_width = @import("glm5_forward.zig").prefill_chunk };
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .expert_source = .individual_source, .state_beside_kv = true, .no_mtp_head = true, .mtp_unserved = true, .latent_kv = true, .kda_state = true, .evicts_hot_cache = true, .own_dflash_bill = true, .prefill_start_width = @import("glm5_forward.zig").prefill_chunk };
 
 /// A pack stores the MTP layers after the trunk's, under the same prefix (`pack_index`'s range check).
 pub fn trailingPackLayers(config: *const Config) u32 {

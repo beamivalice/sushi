@@ -83,14 +83,21 @@ bill function's output on the committed fixture configs of all served packs: a b
   load line): the arch's start width (DeepSeek's 2048) or `--prefill-chunk`, never the global default. The warm took the
   generic 8192 on DeepSeek, a width no DeepSeek request forwards at, and at `--ssd-budget-gb 108` it reset the Mac.
 - **Every runtime ceiling is the wired limit alone, as on 1.6.0** (`currentGpuMemoryCeiling`, #110): under a declared
-  `iogpu.wired_limit_mb` the limit less the unplanned margin, whatever free RAM other apps leave; with none declared, or
-  for an arch that takes no declared floor, Metal's working set capped at the footprint plus free RAM
-  (`physicalMemoryCeiling`, the #64 guard: no user contract there to respect). Admission, the prefill chunk's width, the
-  served warm, an image encode, DeepSeek's borrow, the auto-context pin and the advertised context read it. The cost:
+  `iogpu.wired_limit_mb` the limit less the unplanned margin, whatever free RAM other apps leave; with none declared,
+  Metal's working set capped at the footprint plus free RAM (`physicalMemoryCeiling`, the #64 guard: no user contract
+  there to respect). Admission, the prefill chunk's width, the served warm, an image encode, DeepSeek's borrow, the
+  auto-context pin and the advertised context read it. The cost:
   GPU memory grows into other apps' pages and relies on macOS compressing or swapping them, so the declared limit and
   `--wired-margin-gib` are the user's contract for the room other apps keep. A live free-RAM bound (1.7.0-1.7.1) refused a
   64 GB M2 Ultra's 60k-token request with 2.5 GB "available" under a 55,296 MB ceiling; it also caught r-65, DeepSeek at
   `--ssd-budget-gb 108` on a 128 GB M5 with apps open, which after the revert only the declared limit protects.
+- **One `bills.Ceiling` per reading, the same for every load and arch** (owner ruling): `ceilingNow` reads the declared
+  limit, the RAM and `--wired-margin-gib` once, and a load's checks (`FitReadings.now`, `defaultBudgetLimits`) carry
+  that value; `runtime()` is what live checks read, `planning()` (the floor, else the working set, never free RAM) what
+  the load-time hot-cache budget and the SSD-first allowance plan against, so a `--prefix-cache-mem` never plans away the
+  margin. Any nonzero `iogpu.wired_limit_mb` declares, at or under macOS's default 75% of RAM too: that rule read a
+  lowered limit as none and admitted on free RAM. A margin at or past the declared limit is refused at launch by name
+  (`wiredMarginRefusal`); it saturated the floor to the "none" sentinel and gave back the whole limit.
 - A test that compares two live readings pins the free-RAM one (`status.available_mem_override`): other processes move
   the reclaimable pages between two reads, so equal formulas read unequal figures whenever free RAM binds.
 - **One live headroom, one first width.** `bills.prefillHeadroomNow` (pure `liveHeadroomFrom`) is the ceiling less

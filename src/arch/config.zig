@@ -100,8 +100,6 @@ pub const Facts = struct {
     own_kv_state: bool = false,
     /// Attention scores only each row's picked keys, billed in its own transient: no dense score sheet narrows its prefill chunk.
     scores_picked_keys: bool = false,
-    /// Its resident pack fills the machine: the wired ceiling is the declared limit, not what other apps leave free.
-    declared_wired_ceiling: bool = false,
     /// Its DFlash2 assistant is billed by the arch's own bill, not the shared sliding-assistant terms.
     own_dflash_bill: bool = false,
     /// Streamed experts fill preallocated slabs in place: the fill stages nothing beyond the workspace and bounce.

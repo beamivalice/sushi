@@ -15,6 +15,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 | Low | 2 / 5 | 4 / 4 | 3 / 9 | 3 / 4 | 12 / 22 |
 | Total | 15 / 28 | 8 / 8 | 11 / 24 | 3 / 5 | 37 / 65 |
 
+- **A declared `iogpu.wired_limit_mb` is the ceiling at any size, for every model**: a limit lowered under macOS's
+  default (75% of RAM) was read as none, so requests went back to free RAM, and a `--prefix-cache-mem` could plan the
+  margin away; a `--wired-margin-gib` at or past the limit is now refused at launch instead of lifting it.
 - **Requests are admitted up to the wired limit again, as in 1.6.0 (#110)**: other apps' memory no longer shrinks the
   context a request may use, so a 64 GB Mac with a raised `iogpu.wired_limit_mb` serves the long Qwen requests 1.6.0
   served; set `iogpu.wired_limit_mb` and `--wired-margin-gib` to keep room for other apps.

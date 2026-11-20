@@ -56,7 +56,6 @@ pub const config_facts: arch_config.Facts = .{
     .expert_source = .flat_banks,
     .sliding_ring = true,
     .sushi_quant_memory_bill = true,
-    .declared_wired_ceiling = true,
     .mtp_adaptive_calibrated = true,
     // Its verify rows stay cheap until its global layers read many keys, so below this its rounds beat serial even on
     // prose and a probe could only cost.

@@ -58,7 +58,7 @@ test "issue 105: a raised --wired-margin-gib lowers the declared ceiling only, s
     // The report: an M5 at iogpu.wired_limit_mb=124518 with --wired-margin-gib 16 for other apps' models, DeepSeek STQ
     // 1.75 at --ssd-budget-gb 100 loaded (~99.4 GB active).
     const margin: u64 = 16 * GiB;
-    const declared: u64 = bills.wiredLimitFloor(124_518 * MiB, 128 * GiB, margin);
+    const declared: u64 = bills.wiredLimitFloor(124_518 * MiB, 128 * GiB, margin).?;
     try t.expectEqual(@as(u64, 108_134 * MiB), declared);
     const active: u64 = 99_400 * MiB;
     const width = bills.widestChunkAdmitted(&config, 16, 8192, bills.prefillHeadroomFrom(declared, active, 0));
@@ -412,7 +412,7 @@ test "DeepSeek: a streamed load the preflight and the fit admit on a 32 GB Mac l
     const top = bills.widestServedRung(&config);
 
     // Free memory: every reading the preflight admits leaves the warm a chunk.
-    const ceiling = bills.wiredLimitFloor(28_000 * MiB, 32 << 30, 1 << 30);
+    const ceiling = bills.wiredLimitFloor(28_000 * MiB, 32 << 30, 1 << 30).?;
     const need = bills.loadRequirementBytes(&config, weights, true, 0);
     var avail = need -| (2 << 30);
     while (avail < need + (2 << 30)) : (avail += 50 * MiB) {
@@ -448,9 +448,9 @@ test "DeepSeek: the iogpu.wired_limit_mb a refused ssd budget names admits that 
     // macOS's default limit and two declared ones, at the default margin and a raised one; a budget just past each.
     for ([_]u64{ 1, 4 }) |margin_gib| for ([_]u64{ 0, 100_000, 110_000 }) |wired_mb| {
         const unplanned = margin_gib * GiB;
-        const floor = bills.wiredLimitFloor(wired_mb * MiB, ram, unplanned);
+        const floor = bills.wiredLimitFloor(if (wired_mb > 0) wired_mb * MiB else null, ram, unplanned);
         const r = bills.FitReadings{ .wired_limit = wired_mb * MiB, .wired_floor = floor, .budget_working_set = 96 * GiB, .working_set = 96 * GiB, .free = ram, .total_ram = ram, .unplanned = unplanned };
-        const limit = if (floor > 0) floor else r.budget_working_set;
+        const limit = floor orelse r.budget_working_set;
         config.expert_ssd_budget_bytes = (limit -| bills.expertStreamingBesideBudgetBytes(&config)) / GiB * GiB + GiB;
         const refused = bills.expertCacheRefusal(&config, 0, r) orelse return error.TestExpectedRefusal;
         try t.expectEqual(error.SsdBudgetExceedsWiredLimit, refused.err);
@@ -682,7 +682,7 @@ test "DeepSeek: the RAM default a load takes passes every check the load runs on
     try t.expectEqual(108 * GiB, model_load.ramDefaultAtLoad(.gb128, 0, 5_000_000_000, limits, plan, idle).bytes);
 }
 
-// Contract (engine-memory-admission "A live check..."): the advertised context is admitted when asked, at the readings
+// Contract (engine-memory-admission "Every runtime ceiling..."): the advertised context is admitted when asked, at the readings
 // the load saw and after an earlier request left the engine's free buffers (up to its free cap, RAM/16: 2 GiB on 32 GB),
 // which admission takes off as parked (`dsv41_bill.parkedBytes`) and a forward reuses under its cap.
 test "DeepSeek: a request at the advertised context is admitted at the readings the load saw, and after a request leaves the engine's free buffers" {

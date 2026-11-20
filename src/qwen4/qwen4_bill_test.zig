@@ -2144,7 +2144,7 @@ test "Flash-Next: a streamed load the preflight and the fit admit leaves its ser
     const top = bills.widestServedRung(&config);
     const held = bills.expertStreamingGateBytes(weights, config.expert_cache_bytes, model_load.loadStagingBytes(&config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes);
 
-    const ceiling = bills.wiredLimitFloor(28_000 * MiB, 32 << 30, 1 << 30);
+    const ceiling = bills.wiredLimitFloor(28_000 * MiB, 32 << 30, 1 << 30).?;
     const need = bills.loadRequirementBytes(&config, weights, true, 0);
     var avail = need;
     while (avail < need + (2 << 30)) : (avail += 50 * MiB) {
@@ -2179,7 +2179,7 @@ test "Flash-Next: a resident load the free-RAM preflight admits at its edge leav
     const weights: u64 = 27_400_000_000;
     const working_set: u64 = 96 * GiB;
     // A declared limit whose floor sits above what other apps leave free (the owner's free-RAM rule), and none.
-    for ([_]u64{ 0, 60 * GiB }) |floor| for ([_]bool{ false, true }) |mtp| {
+    for ([_]?u64{ null, 60 * GiB }) |floor| for ([_]bool{ false, true }) |mtp| {
         const need = bills.loadRequirementBytes(&config, weights, mtp, 0);
         var free = need;
         while (free < need + 2 * GiB) : (free += 10 * MiB) {
@@ -2190,7 +2190,7 @@ test "Flash-Next: a resident load the free-RAM preflight admits at its edge leav
             const ceiling = bills.gpuCeilingWithWiredFloor(working_set, weights, reclaimable, floor);
             const headroom = bills.liveHeadroomFrom(&config, ceiling, weights, 0, 0);
             const chunk = bills.warmChunkAdmitted(&config, bits, top, headroom);
-            errdefer std.debug.print("floor {d} MB, MTP {}: admitted with {d} MB free for a {d} MB need; the warm's headroom is {d} MB and its dearest forward at the narrowest chunk needs {d} MB\n", .{ floor / MiB, mtp, free / MiB, need / MiB, headroom / MiB, bills.warmFloorChunkBytes(&config) / MiB });
+            errdefer std.debug.print("floor {d} MB, MTP {}: admitted with {d} MB free for a {d} MB need; the warm's headroom is {d} MB and its dearest forward at the narrowest chunk needs {d} MB\n", .{ (floor orelse 0) / MiB, mtp, free / MiB, need / MiB, headroom / MiB, bills.warmFloorChunkBytes(&config) / MiB });
             try t.expect(chunk > 0);
             try warmFits(&config, bits, chunk, headroom);
         }
@@ -2353,10 +2353,10 @@ fn admittedAt(cfg: *const model_mod.ModelConfig, prompt: u64, reply: u32, availa
     return prefillNeededAtChunk(cfg, prompt, reply, 8, pick, w) <= available;
 }
 
-// A resident Cooler load of W bytes on a Mac of working set `ws` with F free (`floor` a declared floor, or 0); after the
+// A resident Cooler load of W bytes on a Mac of working set `ws` with F free (`floor` a declared floor, or null); after the
 // load admission reads the same machine, F less the W the load wired. The --ctx-size a refusal names (the edge, at
 // 1M asked) passes the preflight and is admitted at every split once loaded.
-fn namedContextHolds(cfg: *const model_mod.ModelConfig, weights: u64, ws: u64, free: u64, floor: u64) !?u32 {
+fn namedContextHolds(cfg: *const model_mod.ModelConfig, weights: u64, ws: u64, free: u64, floor: ?u64) !?u32 {
     const a = bills.sushiAvailable(free, 0, ws, 0, floor);
     const avail = a.bytes.?;
     launch_state.server_config.max_context_size = 1_000_000;
@@ -2366,7 +2366,7 @@ fn namedContextHolds(cfg: *const model_mod.ModelConfig, weights: u64, ws: u64, f
     if (named < 1024) return null;
     launch_state.server_config.max_context_size = named;
     const at = preflightAt(cfg, weights, a);
-    errdefer std.debug.print("ws {d} MB, floor {d} MB, free {d} MB, weights {d} MB: --ctx-size {d} named; preflight needs {d} MB of {d} MB\n", .{ ws >> 20, floor >> 20, free >> 20, weights >> 20, named, at.needed >> 20, avail >> 20 });
+    errdefer std.debug.print("ws {d} MB, floor {d} MB, free {d} MB, weights {d} MB: --ctx-size {d} named; preflight needs {d} MB of {d} MB\n", .{ ws >> 20, (floor orelse 0) >> 20, free >> 20, weights >> 20, named, at.needed >> 20, avail >> 20 });
     try std.testing.expect(at.needed <= avail);
     const ceiling = bills.gpuCeilingWithWiredFloor(ws, weights, free - weights, floor);
     const available = bills.admissionAvailableFor(cfg, ceiling, weights, 0);
@@ -2392,7 +2392,7 @@ test "Flash-Next on Cooler: the --ctx-size a resident load refusal names loads, 
     // Free RAM binds below a 21 GiB working set.
     var free: u64 = 12 * GiB;
     while (free < 21 * GiB) : (free += 256 * MiB) {
-        if (try namedContextHolds(&cfg, 10 * GiB, 21 * GiB, free, 0)) |_| named += 1;
+        if (try namedContextHolds(&cfg, 10 * GiB, 21 * GiB, free, null)) |_| named += 1;
     }
     try std.testing.expect(named > 0);
 }
@@ -2416,7 +2416,7 @@ test "Flash-Next on Cooler: where the GPU limit binds, the --ctx-size at the edg
         var limit: u64 = 12 * GiB;
         while (limit <= 21 * GiB) : (limit += 512 * MiB) {
             const ws = if (declared) 28 * GiB else limit;
-            const floor = if (declared) limit else 0;
+            const floor: ?u64 = if (declared) limit else null;
             const at = try namedContextHolds(&cfg, weights, ws, 64 * GiB, floor) orelse continue;
             named += 1;
             errdefer std.debug.print("{s} {d} MB: a refusal names {d}\n", .{ if (declared) "declared floor" else "working set", limit >> 20, at });

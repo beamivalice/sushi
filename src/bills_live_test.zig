@@ -124,21 +124,6 @@ test "GLM near the top of its context keeps fewer checkpoints at the start width
     try std.testing.expectEqual(@as(?u32, null), slot_admission.fewerCheckpointsToAdmit(cap, &probe, Fits.at));
 }
 
-test "MiMo honors the declared wired limit streamed or resident, without enabling long-context paths" {
-    const prior = bills.wired_limit_mb_override;
-    bills.wired_limit_mb_override = 120000;
-    defer bills.wired_limit_mb_override = prior;
-    const floor = bills.wiredLimitFloor(120000 * 1024 * 1024, 128 << 30, launch_state.wiredMarginBytes());
-    var c = model_mod.ModelConfig{ .model_type = "mimo_v2", .expert_streaming = true };
-    try std.testing.expect(!c.longCtxGated());
-    try std.testing.expectEqual(floor, bills.wiredCeilingFloorForRam(&c, 128 << 30));
-    c.expert_streaming = false;
-    try std.testing.expectEqual(floor, bills.wiredCeilingFloorForRam(&c, 128 << 30));
-    // An arch the engine does not serve keeps the free-RAM ceiling.
-    const other = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
-    try std.testing.expectEqual(@as(u64, 0), bills.wiredCeilingFloorForRam(&other, 128 << 30));
-}
-
 test "diskContextForLoad pins the served context, so the Allocating line names what /props and /v1/models name" {
     const t = std.testing;
     var cfg = fixtures.qwen4DeployedTestConfig();
@@ -258,17 +243,6 @@ test "a second GLM admission leaves free the cache growth the first was admitted
     try std.testing.expect(kv8 > 6 * gib + gib * 2 / 3 and kv8 < 6 * gib + gib * 7 / 10);
     try std.testing.expect(bills.admissionCommitBytes(&cfg, prompt, max_tokens, 16, 2048, false) > kv8);
 }
-
-test "GLM raw FP8 honors the declared wired limit with the same reserve as MiMo" {
-    const prior = bills.wired_limit_mb_override;
-    bills.wired_limit_mb_override = 120000;
-    defer bills.wired_limit_mb_override = prior;
-    const cfg = model_mod.ModelConfig{ .model_type = "glm5_next", .fp8_block128_trunk = true };
-    try std.testing.expectEqual(bills.wiredLimitFloor(120000 * 1024 * 1024, 128 << 30, launch_state.wiredMarginBytes()), bills.wiredCeilingFloorForRam(&cfg, 128 << 30));
-    bills.wired_limit_mb_override = 98304;
-    try std.testing.expectEqual(@as(u64, 0), bills.wiredCeilingFloorForRam(&cfg, 128 << 30));
-}
-
 
 test "GPU memory readings are MLX's plus the engine's pool: tensors in use as active, free buffers as cache" {
     const core = @import("tensor/core.zig");
@@ -553,21 +527,41 @@ const live_gpu = @import("gpu_mem.zig");
 const Machine = struct {
     total: ?u64,
     wired_mb: ?u64,
-    margin: u64,
+    margin: ?u64,
     avail: ?u64,
     gpu_floor: u64,
 
     fn pin(m: Machine) Machine {
         const status = @import("status.zig");
-        const was: Machine = .{ .total = status.total_mem_override, .wired_mb = bills.wired_limit_mb_override, .margin = launch_state.wired_limit_margin_bytes, .avail = status.available_mem_override, .gpu_floor = bills.gpu_floor_bytes.load(.monotonic) };
+        const was: Machine = .{ .total = status.total_mem_override, .wired_mb = bills.wired_limit_mb_override, .margin = launch_state.wired_margin_flag_bytes, .avail = status.available_mem_override, .gpu_floor = bills.gpu_floor_bytes.load(.monotonic) };
         status.total_mem_override = m.total;
         bills.wired_limit_mb_override = m.wired_mb;
-        launch_state.wired_limit_margin_bytes = m.margin;
+        launch_state.wired_margin_flag_bytes = m.margin;
         status.available_mem_override = m.avail;
         bills.gpu_floor_bytes.store(m.gpu_floor, .monotonic);
         return was;
     }
 };
+
+test "a declared wired limit is the ceiling a request is admitted under on MiMo and GLM too, streamed or resident, and on an arch the engine does not serve" {
+    const MiB: u64 = 1 << 20;
+    const was = (Machine{ .total = 128 << 30, .wired_mb = 120_000, .margin = 1 << 30, .avail = 2 << 30, .gpu_floor = 0 }).pin();
+    defer _ = was.pin();
+    const floor = bills.wiredLimitFloor(120_000 * MiB, 128 << 30, 1 << 30).?;
+    const active: u64 = live_gpu.activeBytes();
+    var mimo = model_mod.ModelConfig{ .model_type = "mimo_v2", .expert_streaming = true };
+    var glm = model_mod.ModelConfig{ .model_type = "glm5_next", .fp8_block128_trunk = true };
+    const other = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
+    try testing.expect(!mimo.longCtxGated());
+    const cases = [_]*const model_mod.ModelConfig{ &mimo, &glm, &other };
+    for (cases) |c| try testing.expectEqual(floor -| active, bills.admissionAvailableNow(c));
+    mimo.expert_streaming = false;
+    try testing.expectEqual(floor -| active, bills.admissionAvailableNow(&mimo));
+    // Any declared limit is the ceiling, whatever its size against the RAM.
+    bills.wired_limit_mb_override = 98_304;
+    glm.expert_streaming = false;
+    try testing.expectEqual(bills.wiredLimitFloor(98_304 * MiB, 128 << 30, 1 << 30).? -| active, bills.admissionAvailableNow(&glm));
+}
 
 test "#110: under a declared wired limit a Flash-Next request on MLX is admitted up to the limit, however little free RAM other apps leave" {
     var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
@@ -652,4 +646,49 @@ test "a Qwen request commits the cache its admitted width reserves, not the defa
     try testing.expect(bill.chunk < @import("settings_resolve.zig").prefill_chunk.value);
     const nums = bills.prefillBillNumbersNow(&cfg, seq, 4096, kv8, false, false);
     try testing.expectEqual(bills.cacheCommitBytes(&cfg, seq, 4096, 8, bill.chunk, false), nums.commit);
+}
+
+test "owner ruling: #109 at a declared limit equal to the macOS default and under it: admission reads the same room whatever free RAM moves to" {
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer cfg.deinit(testing.allocator);
+    cfg.pinned_context = 208_896;
+    const MiB: u64 = 1 << 20;
+    // 64 GiB: 75% is 49,152 MiB; 40,000 is a limit lowered to keep room for other apps, as the #110 CHANGELOG advises.
+    for ([_]u64{ 49_152, 40_000, 49_153 }) |wired_mb| {
+        var room: ?u64 = null;
+        for ([_]u64{ 4_608, 1_741 }) |free_mb| {
+            const was = (Machine{ .total = 64 << 30, .wired_mb = wired_mb, .margin = 4 << 30, .avail = free_mb * MiB, .gpu_floor = 340 * MiB }).pin();
+            defer _ = was.pin();
+            const available = bills.admissionAvailableNow(&cfg);
+            errdefer std.debug.print("iogpu.wired_limit_mb={d}, free {d} MB: admission reads {d} MB (first reading {?d} MB)\n", .{ wired_mb, free_mb, available >> 20, if (room) |r| r >> 20 else null });
+            try testing.expectEqual(room orelse available, available);
+            room = available;
+        }
+    }
+}
+
+/// What every load's runtime reads under a declared wired limit (owner ruling, #110): the limit's floor less its active
+/// bytes, whatever free RAM other apps leave.
+fn readsDeclaredFloor(cfg: *const model_mod.ModelConfig, machine: Machine, floor: u64) !void {
+    const was = machine.pin();
+    defer _ = was.pin();
+    const active: u64 = live_gpu.activeBytes() + live_gpu.lentBytes();
+    errdefer std.debug.print("{s} at iogpu.wired_limit_mb={?d}: headroom {d} MB, the floor less active {d} MB\n", .{ cfg.model_type, machine.wired_mb, bills.headroomNow(cfg, 0).live >> 20, (floor -| active) >> 20 });
+    try testing.expectEqual(bills.liveHeadroomFrom(cfg, floor, active, 0, live_gpu.engineFree()), bills.headroomNow(cfg, 0).live);
+}
+
+test "owner ruling: a declared iogpu.wired_limit_mb is the ceiling of every load, GLM and MiMo resident on MLX and DeepSeek resident included, at any size" {
+    const MiB: u64 = 1 << 20;
+    var glm = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    defer glm.deinit(testing.allocator);
+    const mimo = fixtures.mimoV2FlashBillConfig();
+    const dsv41_config = @import("dsv41/dsv41_config.zig");
+    var dsv = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_resident = true };
+    dsv.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    dsv.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    dsv.max_position_embeddings = 1_048_576;
+    // A 128 GB Mac whose owner lowered the limit under macOS's default 75% (98,304 MiB) to keep room for other apps,
+    // 2 GB reclaimable; the default 1 GiB margin.
+    const machine: Machine = .{ .total = 128 << 30, .wired_mb = 90_000, .margin = 1 << 30, .avail = 2_000 * MiB, .gpu_floor = 0 };
+    for ([_]*const model_mod.ModelConfig{ &glm, &mimo, &dsv }) |cfg| try readsDeclaredFloor(cfg, machine, 88_976 * MiB);
 }

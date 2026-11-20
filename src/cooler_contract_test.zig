@@ -4994,7 +4994,7 @@ test "cooler contract: a resident load beside buffers already past a declared wi
     var config = try model_mod.parseConfig(io, a, dir);
     defer config.deinit(a);
     @import("cooler_side.zig").forTest(&config, true);
-    const floor = bills.wiredCeilingFloorFor(&config);
+    const floor = bills.ceilingNow().floor().?;
     try testing.expect(floor > 0 and floor <= 1 << 30);
 
     // 1.5 GiB already in use: past the declared floor, well under Metal's working set.
@@ -5735,7 +5735,7 @@ fn lentHeldOff(dir: []const u8, cooler: bool) !void {
                 .admission = bills.admissionAvailableNow(c),
                 .beside = bills.admissionAvailableNow(q),
                 .forward = bills.prefillHeadroomNow(c, 0),
-                .load = bills.FitReadings.now(q).preflightAvailable(true).bytes orelse 0,
+                .load = bills.FitReadings.now().preflightAvailable(true).bytes orelse 0,
                 .own = @import("dsv41/dsv41_bill.zig").dsv41Headroom(c).bound(),
             };
         }

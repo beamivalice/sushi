@@ -1930,7 +1930,7 @@ const TestHost = struct {
     }
 
     fn sawServer(self: *TestHost) void {
-        self.margin_at_forget = server_state.wiredMarginBytes();
+        self.margin_at_forget = bills.ceilingNow().margin;
         self.skip_at_forget = scheduler.skipMemPreflight();
         self.max_request_at_forget = server_state.max_request_bytes.load(.monotonic);
     }
@@ -2114,8 +2114,15 @@ test "settings api: a save that moves the margin logs one new ceiling line, and 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true };
-    const ram: u64 = 128 << 30;
+    const status = @import("status.zig");
+    const total_was = status.total_mem_override;
+    const static_was = bills.static_ceiling_override;
+    defer {
+        status.total_mem_override = total_was;
+        bills.static_ceiling_override = static_was;
+    }
+    status.total_mem_override = 128 << 30;
+    bills.static_ceiling_override = 100 << 30;
     var host: TestHost = .{ .io = testing.io, .path = path };
     const bodies = [_][]const u8{
         "{\"server\":{\"wired_margin_gib\":2}}", // unchanged
@@ -2123,13 +2130,13 @@ test "settings api: a save that moves the margin logs one new ceiling line, and 
         "{\"server\":{\"wired_margin_gib\":8}}", // unchanged again
     };
     bills.wired_floor_logged.store(false, .monotonic);
-    _ = bills.wiredCeilingFloorForRam(&config, ram);
+    _ = bills.ceilingNow();
     var seen: usize = 1;
     const expect_new = [_]usize{ 0, 1, 0 };
     for (bodies, expect_new) |body, new| {
         try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, body).ok, "") == .saved);
-        _ = bills.wiredCeilingFloorForRam(&config, ram);
-        _ = bills.wiredCeilingFloorForRam(&config, ram);
+        _ = bills.ceilingNow();
+        _ = bills.ceilingNow();
         const text = try tmp.dir.readFileAlloc(testing.io, "model-settings.json.log", a, .limited(1 << 16));
         const lines = std.mem.count(u8, text, "[mem] ceiling");
         try testing.expectEqual(seen + new, lines);

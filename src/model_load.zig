@@ -694,7 +694,7 @@ const PreflightReader = struct {
     last: ?bills.SushiAvailable = null,
 
     pub fn read(r: *PreflightReader) ?u64 {
-        const readings = bills.FitReadings.now(r.config);
+        const readings = bills.FitReadings.now();
         const got = readings.preflightAvailable(r.sushi);
         // An unread figure keeps the last one read, which the wait returns and a refusal is priced on.
         if (got.bytes == null and r.last != null) return null;
@@ -933,7 +933,7 @@ pub fn LoadPlannerOf(comptime Plan: type) type {
 
         pub fn needAt(p: @This(), budget_bytes: u64) ?u64 {
             const at = p.plan.planAt(budget_bytes) orelse return null;
-            const r = p.readings.streamed();
+            const r = p.readings;
             if (bills.expertCacheRefusal(&at.config, at.resident, r) != null) return std.math.maxInt(u64);
             const weights = at.resident +| p.plan.beside;
             const avail = r.preflightAvailable(model_mod.usesSushiQuantMemoryBill(&at.config)).bytes;
@@ -2157,7 +2157,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         var avail_buf: [192]u8 = undefined;
         const wired_mb = reader.readings.wired_limit >> 20;
-        const avail_line = bills.sushiAvailableLine(&avail_buf, reader.last.?, if (reader.sushi and reader.readings.wired_floor > 0) wired_mb else 0);
+        const avail_line = bills.sushiAvailableLine(&avail_buf, reader.last.?, if (reader.sushi and reader.readings.wired_floor != null) wired_mb else 0);
         var line_buf: [384]u8 = undefined;
         log.info("[preflight] {s}\n", .{bills.preflightLine(&line_buf, params.config, weights_bytes, needed, avail_line)});
         // Every bound that was read refuses here, an exhausted one (read as 0) included.
@@ -2166,7 +2166,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var refusal = bills.LoadMemoryRefusal{
                 .needed = needed,
                 .avail = reader.last.?,
-                .wired_limit_mb = if (reader.sushi and reader.readings.wired_floor > 0) wired_mb else 0,
+                .wired_limit_mb = if (reader.sushi and reader.readings.wired_floor != null) wired_mb else 0,
                 .wired_beside = (if (reader.sushi) reader.readings.active else 0) +| reader.readings.unplanned,
                 .total_ram = reader.readings.total_ram,
                 .smaller_pack = smallerPackOf(params.model_dir),

@@ -28,6 +28,7 @@ const dflash_mod = @import("dflash.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const server_state = @import("server_state.zig");
+const bills_mod = @import("bills.zig");
 const scheduler_mod = @import("scheduler.zig");
 const arch_state = @import("arch/arch_state.zig");
 const model_load = @import("model_load.zig");
@@ -760,6 +761,11 @@ fn runCli(init: std.process.Init) !void {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
         std.process.exit(1);
     };
+    var margin_buf: [192]u8 = undefined;
+    if (bills_mod.wiredMarginRefusal(&margin_buf, bills_mod.declaredWiredLimit(), server_state.wiredMarginBytes())) |why| {
+        log.err("{s}\n", .{why});
+        std.process.exit(1);
+    }
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.sushi/models

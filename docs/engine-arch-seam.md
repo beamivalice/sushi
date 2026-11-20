@@ -165,7 +165,7 @@ without it. An arch added later joins the list in the landing that adds it.
   `model_type`). The facts that replace a predicate are named by the capability: `state_beside_kv`, `no_mtp_head`, `mtp_unserved`,
   `latent_kv`, `kda_state`, `long_ctx_gated`, `evicts_hot_cache`, `sliding_ring`, `dflash_by_flag`, `vision_on_streamed`,
   `sushi_quant_memory_bill`, `thinking_off_checkpoint`, `skips_mtp_weights_when_off`, `own_kv_state`, `scores_picked_keys`,
-  `declared_wired_ceiling`, `own_dflash_bill` and `fills_slabs_in_place`. A predicate only one arch's folder reads (batched decode,
+  `own_dflash_bill` and `fills_slabs_in_place`. A predicate only one arch's folder reads (batched decode,
   the source trunk) is a function of that arch's config file. An arch declares
   `config_types` (what its parse reads, text twins included), `discovery_types`, `config_facts` and `parseConfig`,
   and may declare `parseDir`, `adoptLayout`, `adoptLoaded` (`model_load.initTrunk`), `samplingDefaults` and `streamedResidentSplit`. `model.served_model_types`
