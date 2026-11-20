@@ -135,6 +135,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   stream handle itself is not (a fault there skipped its free), and a test-only reading made on the way to the call
   under test (the TF32 probe) goes past the fault (`mlx.past_fault`), so a test passes alone as in the suite.
   Its no-late-kernel tests prove their property only on a fresh pipeline cache, which is the process's: they run alone.
+- **A bill test pins every probed arm its bill reads** (`qsaScoreFusedOffGuard` and its kin): a kernel trial runs once a
+  process, so an unpinned bill reads whatever arm an earlier test's forward tried.
 - **A part of a test that did not run is said, never silent**: a cell that runs once per arch leaves out an arch whose
   fixture is missing and calls `test_rest.notePartSkipped` naming it; the runner writes it as the test's log line's
   sixth field (`parts skipped: ...`) and tests/gate.sh's summary lists every such test, so a box's run says what it

@@ -623,6 +623,9 @@ test "Flash-Next streamed: the 32 GB recipe's verdicts at --ssd-budget-gb 17 and
     const t = std.testing;
     const a = t.allocator;
     const dir = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
+    // An M1 has no NAX, so its select is the composed one, whatever arm this process's forwards have tried.
+    const composed = qsaScoreFusedOffGuard();
+    defer composed.deinit();
     var config = try model_mod.parseConfig(t.io, a, dir);
     defer config.deinit(a);
     model_load.applyModelSettings(&config, .{});
