@@ -485,21 +485,6 @@ test "cooler contract: a Cooler load failed at the first checked MLX call of any
     try eachLayout(S.run);
 }
 
-test "cooler contract: a Cooler load's /props names Sushi Cooler as the engine its forwards run on" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            _ = ids;
-            var ld: Load = undefined;
-            try ld.open(C, dir, true);
-            defer _ = ld.close();
-            var sv: Served = undefined;
-            try sv.init(&ld, dir);
-            defer sv.deinit();
-            try testing.expectEqualStrings("sushi-cooler", @import("models_api.zig").propsSettingsFor(sv.entry).engine);
-        }
-    }.run);
-}
-
 test "cooler contract: a Cooler load under each KV precision and context extension the web UI offers takes it and loads on the engine" {
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {

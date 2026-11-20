@@ -18,8 +18,19 @@ fn noHook() callconv(.c) ?[*:0]const u8 {
 }
 comptime {
     @export(&noHook, .{ .name = "sushi_after_each", .linkage = .weak });
+    @export(&noHook, .{ .name = "sushi_after_all", .linkage = .weak });
 }
 extern fn sushi_after_each() callconv(.c) ?[*:0]const u8;
+/// As the process ends: what the loads a run step kept across its tests left once unloaded (null: nothing).
+extern fn sushi_after_all() callconv(.c) ?[*:0]const u8;
+
+/// The step's end: a held load's unload that left anything fails the step, logged as a test of its own.
+fn afterAll() bool {
+    const why = sushi_after_all() orelse return true;
+    std.debug.print("after the step's last test, the loads it held: {s}\n", .{why});
+    _ = logTest("(the step's held loads, unloaded)", .FAIL);
+    return false;
+}
 
 /// The per-test log: after each test `<UTC>\t<step>\t<PASS|SKIP|FAIL>\t<ms>\t<name>`, and once a process has run a
 /// test, `<UTC>\t<step>\tDONE\t<ms>\t<p> pass, <s> skip, <f> fail` as it exits. A test's ms hold its at-rest check;
@@ -240,8 +251,9 @@ fn mainServer(init: std.process.Init.Minimal) !void {
         const hdr = try server.receiveMessage();
         switch (hdr.tag) {
             .exit => {
+                const ok = afterAll();
                 logDone();
-                return std.process.exit(0);
+                return std.process.exit(if (ok) 0 else 1);
             },
             .query_test_metadata => {
                 var sa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
@@ -486,6 +498,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
         fuzz_count += @intFromBool(is_fuzz_test);
     }
     root_node.end();
+    if (!afterAll()) fail_count += 1;
     logDone();
     if (ok_count == selected_tests.len) {
         std.debug.print("All {d} tests passed.\n", .{ok_count});

@@ -115,12 +115,17 @@ pub fn holding() bool {
     return holds > 0;
 }
 
+pub fn holdCount() u32 {
+    return holds;
+}
+
 /// Test builds, after each test (`scripts/test_runner.zig`): what the engine was left holding, written to `w`, with
 /// its turns, scope and seal put back at rest; the holds stay for the caller to end (`arch_handle.engineHoldEnd`).
-pub fn leftByTest(w: *std.Io.Writer) !bool {
+/// `kept`: the holds of the loads a run step keeps across tests (`test_rest.held`), which are not left.
+pub fn leftByTest(w: *std.Io.Writer, kept: u32) !bool {
     var left = false;
-    if (holds > 0) {
-        try w.print(" {d} Sushi Cooler hold(s) open;", .{holds});
+    if (holds > kept) {
+        try w.print(" {d} Sushi Cooler hold(s) open;", .{holds - kept});
         left = true;
     }
     if (depth > 0) {
@@ -132,7 +137,8 @@ pub fn leftByTest(w: *std.Io.Writer) !bool {
         try w.writeAll(" a forward scope open;");
         left = true;
     }
-    if (turn_slot != null or (budget_slot != null and budget_slot != &no_model)) {
+    // A model a run step holds across tests keeps its cap installed between turns.
+    if (turn_slot != null or (kept == 0 and budget_slot != null and budget_slot != &no_model)) {
         try w.writeAll(" a model's budget slot still in force;");
         left = true;
     }

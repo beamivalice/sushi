@@ -7,18 +7,19 @@ const mlx = @import("mlx.zig");
 const arch_handle = @import("arch/handle.zig");
 const test_support = @import("test_support.zig");
 const arch_sched = @import("arch/sched.zig");
-const Generator = @import("generate.zig").Generator;
-const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const SamplingParams = @import("sampler.zig").SamplingParams;
 const io = std.Io.Threaded.global_single_threaded.io();
 const contract = @import("cooler_contract_test.zig");
+const eachArch = contract.eachArch;
+const archSite = contract.archSite;
+const serial = contract.serial;
+const Tokenizer = @import("tokenizer.zig").Tokenizer;
+const Generator = @import("generate.zig").Generator;
 const ContractOf = contract.ContractOf;
 const Load = contract.Load;
 const MixedTick = contract.MixedTick;
 const Served = contract.Served;
 const Sheet = contract.Sheet;
-const archSite = contract.archSite;
-const eachArch = contract.eachArch;
 const eachFixture = contract.eachFixture;
 const eachLayout = contract.eachLayout;
 const eachQwenServed = contract.eachQwenServed;
@@ -26,7 +27,6 @@ const eachResidency = contract.eachResidency;
 const firstAsks = contract.firstAsks;
 const greedy = contract.greedy;
 const qwenTinyServed = contract.qwenTinyServed;
-const serial = contract.serial;
 const servedRows = contract.servedRows;
 const servedRowsWith = contract.servedRowsWith;
 
@@ -77,18 +77,6 @@ test "cooler contract: a Cooler load that serves more than one row gives each ro
     }.body);
 }
 
-test "cooler contract: a prompt token id outside the model's vocabulary is refused before any forward reads past the embedding" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            var cooler: Load = undefined;
-            try cooler.open(C, dir, true);
-            defer _ = cooler.close();
-            const past: u32 = @intCast(cooler.config.vocab_size);
-            try testing.expectError(error.PromptTokenOutOfVocab, greedy(&cooler, &.{ ids[0], past }, 1));
-        }
-    }.run);
-}
-
 test "cooler contract: a Cooler load's request and unload ask nothing of MLX" {
     try eachLayout(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
@@ -106,70 +94,6 @@ test "cooler contract: a Cooler load's request and unload ask nothing of MLX" {
             // The job's end then pays MLX what it was owed while at rest: not the teardown's.
             closed = true;
             try testing.expectEqual(@as(u64, 0), cooler.close());
-        }
-    }.run);
-}
-
-test "cooler contract: a Cooler image request refused at any pool buffer site a text request lacks frees what it made, the embedding its rows splice into too" {
-    try eachArch(struct {
-        const Req = struct {
-            ld: *Load,
-            prompt: []const u32,
-            fn go(q: @This()) anyerror!void {
-                var got = try greedy(q.ld, q.prompt, 2);
-                got.deinit(testing.allocator);
-            }
-        };
-
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            const a = testing.allocator;
-            defer mlx.engine.fault.disarm();
-            var ld: Load = undefined;
-            try ld.open(C, dir, true);
-            defer _ = ld.close();
-            // A cut fixture's vocabulary may end before its image placeholder: no prompt can carry one.
-            if (ld.config.image_token_id == 0 or ld.config.image_token_id >= ld.config.vocab_size) return error.SkipZigTest;
-            var prompt: [12]u32 = undefined;
-            for (&prompt, 0..) |*t, i| t.* = if (i >= 3 and i < 7) ld.config.image_token_id else ids[i % ids.len];
-            {
-                const turn = arch_handle.turnFor(ld.h, &ld.config);
-                defer turn.end();
-                const scope = mlx.engine.enter(ld.xfm.s);
-                defer scope.end();
-                var rows = mlx.mlx_array_new();
-                errdefer _ = mlx.mlx_array_free(rows);
-                try mlx.check(mlx.mlx_zeros(&rows, &[_]c_int{ 1, 4, @intCast(ld.config.hidden_size) }, 3, .bfloat16, ld.xfm.s));
-                try mlx.check(mlx.mlx_array_eval(rows));
-                ld.xfm.vision_embeddings = rows;
-            }
-            defer {
-                const turn = arch_handle.turnFor(ld.h, &ld.config);
-                defer turn.end();
-                _ = mlx.mlx_array_free(ld.xfm.vision_embeddings.?);
-                ld.xfm.vision_embeddings = null;
-            }
-            // A text request's sites are the request sweep's; this one refuses those the image's rows add.
-            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-            defer seen.deinit(a);
-            var text: [12]u32 = undefined;
-            for (&text, 0..) |*t, i| t.* = ids[i % ids.len];
-            a.free(try firstAsks(a, &seen, C, Req{ .ld = &ld, .prompt = &text }, Req.go));
-            const points = try firstAsks(a, &seen, C, Req{ .ld = &ld, .prompt = &prompt }, Req.go);
-            defer a.free(points);
-            const base = Sheet.now();
-            var msg: [300]u8 = undefined;
-            for (points, 0..) |pt, at| {
-                mlx.engine.fault.armAt(pt);
-                const r = Req.go(.{ .ld = &ld, .prompt = &prompt });
-                const fired = !mlx.engine.fault.armed();
-                mlx.engine.fault.disarm();
-                if (r) |_| try testing.expect(!mlx.errorPending()) else |_| _ = mlx.takeError(&msg);
-                errdefer std.debug.print("cooler contract: an image request refused at point {d} of {d} left {any} -> {any}\n", .{ at, points.len, base, Sheet.now() });
-                try testing.expect(fired or !pt.strict);
-                // A request leaves the load's caches as it found them only once one runs whole after the refusal.
-                try Req.go(.{ .ld = &ld, .prompt = &prompt });
-                try testing.expectEqual(base, Sheet.now());
-            }
         }
     }.run);
 }
@@ -211,207 +135,6 @@ test "cooler contract: a Cooler load's speculative requests ask nothing of MLX, 
     }.run);
 }
 
-test "cooler contract: a Cooler load's sampled speculative requests, seeded or not, serve and ask nothing of MLX" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            if (comptime !@hasDecl(C, "specTokensWith")) return error.SkipZigTest;
-            const a = testing.allocator;
-            var cooler: Load = undefined;
-            try cooler.open(C, dir, true);
-            defer _ = cooler.close();
-            const cases = [_]@import("sampler.zig").SamplingParams{
-                .{ .temperature = 0.8, .top_p = 0.95 },
-                .{ .temperature = 0.8, .top_p = 0.95, .seed = 7 },
-                .{ .temperature = 1.0, .top_k = 20 },
-            };
-            // The sampler's draw follows no prompt length: each length's forward is the greedy cell's.
-            const prompt = ids[0..@min(ids.len, 9)];
-            for (cases) |sampling| {
-                const turn = arch_handle.turnFor(cooler.h, &cooler.config);
-                defer turn.end();
-                defer arch_sched.endRequest(&cooler.config);
-                const calls = mlx.engine.mlxCalls();
-                errdefer std.debug.print("cooler contract: sampled speculative request over {d} tokens, seed {?d}, top_k {d}\n", .{ prompt.len, sampling.seed, sampling.top_k });
-                var got = try C.specTokensWith(a, cooler.xfm, prompt, 12, sampling);
-                defer got.deinit(a);
-                try testing.expectEqual(@as(usize, 12), got.items.len);
-                try testing.expectEqual(calls, mlx.engine.mlxCalls());
-            }
-        }
-    }.run);
-}
-
-test "cooler contract: a seeded sampled speculative request says the seeded serial request's tokens, again after another request and at every pinned depth" {
-    try eachFixture(struct {
-        fn spec(ld: *Load, comptime C: type, prompt: []const u32, n: u32, sampling: SamplingParams, depth: u32) !std.ArrayList(u32) {
-            const turn = arch_handle.turnFor(ld.h, &ld.config);
-            defer turn.end();
-            defer arch_sched.endRequest(&ld.config);
-            return C.specTokensAt(testing.allocator, ld.xfm, prompt, n, sampling, depth);
-        }
-
-        fn differs(what: []const u8, depth: u32, sampling: SamplingParams, len: usize, want: []const u32, got: []const u32) bool {
-            const at = std.mem.indexOfDiff(u32, want, got) orelse return false;
-            std.debug.print("cooler contract: seed {?d} over {d} tokens: {s} (pinned depth {d}) differs from token {d}\n", .{ sampling.seed, len, what, depth, at });
-            return true;
-        }
-
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            if (comptime !@hasDecl(C, "specTokensAt") or !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
-            const a = testing.allocator;
-            var ld: Load = undefined;
-            try ld.open(C, dir, true);
-            defer _ = ld.close();
-            // Verify rows another plan computes at each row count give no position one token.
-            if (!C.specIsGreedy(&ld.config)) return error.SkipZigTest;
-            const depth_bounds = @import("mtp_depth_bounds.zig");
-            const saved = depth_bounds.active;
-            defer depth_bounds.active = saved;
-            var long: [300]u32 = undefined;
-            for (&long, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
-            const cases = [_]SamplingParams{
-                .{ .temperature = 0.8, .top_k = 20, .seed = 42 },
-                .{ .temperature = 1.0, .top_p = 0.95, .top_k = 40, .min_p = 0.05, .seed = 11 },
-            };
-            var bad: u32 = 0;
-            const len = long.len;
-            const prompt: []const u32 = &long;
-            for (cases) |sampling| {
-                var want = try serial(&ld, prompt, 32, sampling);
-                defer want.deinit(a);
-                var first = try spec(&ld, C, prompt, 32, sampling, 0);
-                defer first.deinit(a);
-                if (differs("the speculative request against the serial one", 0, sampling, len, want.items, first.items)) bad += 1;
-                // Another request between publishes the acceptance the next one plans from.
-                {
-                    var other = try spec(&ld, C, long[0..100], 24, .{ .temperature = 0 }, 0);
-                    other.deinit(a);
-                    var again = try spec(&ld, C, prompt, 32, sampling, 0);
-                    defer again.deinit(a);
-                    if (differs("the speculative request after another against the first", 0, sampling, len, first.items, again.items)) bad += 1;
-                }
-                for ([_]u32{ 1, 3, 6 }) |depth| {
-                    depth_bounds.active = .{ .min = depth, .max = depth };
-                    defer depth_bounds.active = saved;
-                    var pinned = try spec(&ld, C, prompt, 32, sampling, depth);
-                    defer pinned.deinit(a);
-                    if (differs("the speculative request against the first", depth, sampling, len, first.items, pinned.items)) bad += 1;
-                }
-            }
-            try testing.expectEqual(@as(u32, 0), bad);
-        }
-    }.run);
-}
-
-/// One greedy request under a thinking bound, ticked in the scheduler's order (`loopGuardTick` before every tick,
-/// `commitThoughtClose` when it fires).
-const BoundRun = struct {
-    /// `drained` decodes serial but leaves the pipeline before the thought's last token, as an MTP serial block's exit
-    /// does, so the bound fires with no token in flight whatever the model accepts; `mtp` runs rounds at a pinned depth.
-    const Mode = union(enum) { serial, drained, mtp: u32 };
-
-    tokens: std.ArrayList(u32) = .empty,
-    /// The logits the forced commit leaves for the token after it.
-    logits: []f32 = &.{},
-    /// The bound fired on a speculative round's exit (no pipelined token in flight).
-    at_exit: bool = false,
-
-    fn deinit(self: *BoundRun, a: std.mem.Allocator) void {
-        self.tokens.deinit(a);
-        a.free(self.logits);
-    }
-
-    fn run(ld: *Load, comptime C: type, prompt: []const u32, n: u32, budget: u32, forced: []const u32, mode: Mode) !BoundRun {
-        const a = testing.allocator;
-        const scheduler = @import("scheduler.zig");
-        const turn = arch_handle.turnFor(ld.h, &ld.config);
-        defer turn.end();
-        defer arch_sched.endRequest(&ld.config);
-        var bound = @import("mtp_plan.zig").ThinkBound{ .budget = budget, .opener_id = null, .closer_id = forced[forced.len - 2], .forced = forced, .in_think = true };
-        var tok = Tokenizer.initEmpty(a);
-        defer tok.deinit();
-        try ld.xfm.resetCache();
-        const options: Generator.InitOptions = if (mode == .mtp) C.specOptions(ld.xfm, mode.mtp) else .{};
-        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, prompt, n, .{ .temperature = 0.0, .think_bound = &bound }, &.{}, options);
-        defer gen.deinit(a);
-        var out: BoundRun = .{};
-        errdefer out.deinit(a);
-        while (true) {
-            bound.observe(gen.generated_ids.items);
-            if (bound.due()) {
-                bound.fired = true;
-                out.at_exit = gen.pending == null;
-                const r = try gen.commitForcedTokens(a, forced);
-                defer a.free(r.emitted);
-                try out.tokens.appendSlice(a, r.emitted);
-                if (r.stopped) break;
-                out.logits = try test_support.qwen4ReadF32(a, gen.pending.?.logits, ld.xfm.s);
-                if (!try gen.mtpResumeAfterForced(a)) {
-                    gen.spec_disabled_runtime = true;
-                    gen.spec_disable_reason = .think_bound;
-                }
-                continue;
-            }
-            if (mode == .mtp and !scheduler.thinkBoundForcesPlain(&gen)) {
-                gen.mtp_group_cap = 0;
-                scheduler.capMtpRoundToThinkBound(&gen);
-                const r = (try gen.nextMtp(a)) orelse break;
-                defer a.free(r.tokens);
-                try out.tokens.appendSlice(a, r.tokens);
-            } else if (mode == .drained and bound.room() == 1) switch (try gen.drainPipelineForSpec(a)) {
-                .drained => |t| try out.tokens.append(a, t),
-                .already_clean => return error.NoPipelineToDrain,
-                .stopped => break,
-            } else try out.tokens.append(a, (try gen.next(a)) orelse break);
-        }
-        if (!bound.fired) return error.BoundNeverFired;
-        return out;
-    }
-};
-
-test "cooler contract: a greedy request's thought closed by its budget says the serial request's tokens, whether the close lands on a serial tick or a speculative round's exit" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            if (comptime !@hasDecl(C, "specOptions") or !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
-            const a = testing.allocator;
-            var ld: Load = undefined;
-            try ld.open(C, dir, true);
-            defer _ = ld.close();
-            if (!C.specIsGreedy(&ld.config)) return error.SkipZigTest;
-            const depth_bounds = @import("mtp_depth_bounds.zig");
-            const saved = depth_bounds.active;
-            defer depth_bounds.active = saved;
-            // As wide as a served close (an early-stop line, the closer, a separator), past the verify rows.
-            var forced: [24]u32 = undefined;
-            for (&forced, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
-            forced[forced.len - 2] = @intCast(ld.config.vocab_size - 1);
-            var bad: u32 = 0;
-            for ([_]u32{ 3, 6, 10, 15 }) |budget| {
-                var want = try BoundRun.run(&ld, C, ids, 64, budget, &forced, .serial);
-                defer want.deinit(a);
-                try testing.expect(!want.at_exit);
-                const modes = [_]BoundRun.Mode{ .drained, .{ .mtp = 1 }, .{ .mtp = 2 }, .{ .mtp = 3 }, .{ .mtp = 6 } };
-                for (modes) |mode| {
-                    if (mode == .mtp) depth_bounds.active = .{ .min = mode.mtp, .max = mode.mtp };
-                    defer depth_bounds.active = saved;
-                    var got = try BoundRun.run(&ld, C, ids, 64, budget, &forced, mode);
-                    defer got.deinit(a);
-                    if (mode == .drained) try testing.expect(got.at_exit);
-                    const tokens_at = std.mem.indexOfDiff(u32, want.tokens.items, got.tokens.items);
-                    const logits_same = std.mem.eql(u8, std.mem.sliceAsBytes(want.logits), std.mem.sliceAsBytes(got.logits));
-                    if (tokens_at == null and logits_same) continue;
-                    bad += 1;
-                    const depth = if (mode == .mtp) mode.mtp else 0;
-                    const flight = if (got.at_exit) "no token in flight" else "a token in flight";
-                    const logits = if (logits_same) "equal" else "differ";
-                    std.debug.print("cooler contract: budget {d}, {s} depth {d}, closed with {s}: tokens differ from {?d}, logits after the close {s}\n", .{ budget, @tagName(mode), depth, flight, tokens_at, logits });
-                }
-            }
-            try testing.expectEqual(@as(u32, 0), bad);
-        }
-    }.run);
-}
-
 test "cooler contract: requests, repeated, leave the engine as they found it, and an unload gives back everything, load after load" {
     try eachResidency(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
@@ -434,94 +157,6 @@ test "cooler contract: requests, repeated, leave the engine as they found it, an
                 }
                 _ = cooler.close();
                 try testing.expectEqual(before, Sheet.now());
-            }
-        }
-    }.run);
-}
-
-test "cooler contract: a Cooler request failed at any of its checked MLX call sites leaves the engine as a whole request does, and the next says the same tokens" {
-    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    defer seen.deinit(testing.allocator);
-    const S = struct {
-        var sites: *std.AutoHashMapUnmanaged(u64, void) = undefined;
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            defer mlx.fault.disarm();
-            const prompt = ids[0..@min(ids.len, 30)];
-            var cooler: Load = undefined;
-            try cooler.open(C, dir, true);
-            defer _ = cooler.close();
-            var want = try greedy(&cooler, prompt, 6);
-            defer want.deinit(testing.allocator);
-            {
-                var again = try greedy(&cooler, prompt, 6);
-                again.deinit(testing.allocator);
-            }
-            const base = Sheet.now();
-            const Req = struct {
-                ld: *Load,
-                prompt: []const u32,
-                fn go(r: @This()) anyerror!void {
-                    var got = try greedy(r.ld, r.prompt, 6);
-                    got.deinit(testing.allocator);
-                }
-            };
-            // Each op under its callers fails once, at its first call, on the first fixture of the arch that reaches it.
-            var list: std.ArrayList(u64) = .empty;
-            defer list.deinit(testing.allocator);
-            mlx.fault.sites = .{ .list = &list, .gpa = testing.allocator };
-            const recorded = Req.go(.{ .ld = &cooler, .prompt = prompt });
-            const unrecorded = mlx.fault.sites.failed;
-            mlx.fault.sites = .{};
-            try recorded;
-            if (unrecorded) return error.OutOfMemory;
-            var points: std.ArrayList(u64) = .empty;
-            defer points.deinit(testing.allocator);
-            for (list.items, 1..) |site, k| {
-                if (!(try sites.getOrPut(testing.allocator, archSite(C, site))).found_existing) try points.append(testing.allocator, k);
-            }
-            for (points.items) |k| {
-                mlx.fault.arm(k);
-                var faulted = greedy(&cooler, prompt, 6);
-                mlx.fault.disarm();
-                if (faulted) |*g| g.deinit(testing.allocator) else |_| {}
-                if (!mlx.fault.didFire()) {
-                    std.debug.print("cooler contract: the request's checked call {d} was never reached: a request makes other calls than the one recorded\n", .{k});
-                    return error.TestUnexpectedResult;
-                }
-                var msg: [300]u8 = undefined;
-                _ = mlx.takeError(&msg);
-                var got = try greedy(&cooler, prompt, 6);
-                defer got.deinit(testing.allocator);
-                errdefer std.debug.print("cooler contract: a request failed at checked MLX call {d}\n", .{k});
-                try testing.expectEqualSlices(u32, want.items, got.items);
-                try testing.expectEqual(base, Sheet.now());
-            }
-        }
-    };
-    S.sites = &seen;
-    try eachLayout(S.run);
-}
-
-test "cooler contract: an exact Cooler speculative request says its greedy tokens, over one row, past the verify edge and a chunk" {
-    try eachFixture(struct {
-        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            if (comptime !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
-            const a = testing.allocator;
-            var ld: Load = undefined;
-            try ld.open(C, dir, true);
-            defer _ = ld.close();
-            if (!C.specIsGreedy(&ld.config)) return error.SkipZigTest;
-            for ([_]usize{ 1, 9, 40 }) |len| {
-                const prompt = ids[0..@min(ids.len, len)];
-                errdefer std.debug.print("cooler contract: a prompt of {d} tokens\n", .{prompt.len});
-                var g = try greedy(&ld, prompt, 12);
-                defer g.deinit(a);
-                const turn = arch_handle.turnFor(ld.h, &ld.config);
-                defer turn.end();
-                defer arch_sched.endRequest(&ld.config);
-                var sp = try C.specTokens(a, ld.xfm, prompt, 12);
-                defer sp.deinit(a);
-                try testing.expectEqualSlices(u32, g.items, sp.items);
             }
         }
     }.run);
@@ -764,7 +399,7 @@ test "cooler contract: speculative rows failed at any checked MLX call site thei
 }
 
 /// `n` ids of real text: Pride and Prejudice (public domain, the bench's corpus) through the fixture's own tokenizer.
-fn realTextIds(a: std.mem.Allocator, dir: []const u8, n: usize) ![]u32 {
+pub fn realTextIds(a: std.mem.Allocator, dir: []const u8, n: usize) ![]u32 {
     const prose = @embedFile("fixtures/prose_pride_and_prejudice.txt");
     var tok = try @import("tokenizer.zig").loadTokenizer(io, a, dir);
     defer tok.deinit();
@@ -772,60 +407,6 @@ fn realTextIds(a: std.mem.Allocator, dir: []const u8, n: usize) ![]u32 {
     defer a.free(text);
     try testing.expect(text.len >= n);
     return a.dupe(u32, text[0..n]);
-}
-
-fn greedyOn(ld: *Load, ids: []const u32, n: u32) !std.ArrayList(u32) {
-    const a = testing.allocator;
-    const turn = arch_handle.turnFor(ld.h, &ld.config);
-    defer turn.end();
-    defer arch_sched.endRequest(&ld.config);
-    var tok = Tokenizer.initEmpty(a);
-    defer tok.deinit();
-    try ld.xfm.resetCache();
-    var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, ids, n, .{ .temperature = 0.0 }, &.{}, .{});
-    defer gen.deinit(a);
-    var got: std.ArrayList(u32) = .empty;
-    errdefer got.deinit(a);
-    while (try gen.next(a)) |t| try got.append(a, t);
-    return got;
-}
-
-test "cooler contract: on real text, greedy speculative at depths 1, 3 and 6 says greedy's tokens, short and past the two-pass context (cut)" {
-    const Q = ContractOf("qwen4");
-    if (comptime !@hasDecl(Q, "prompt")) return error.SkipZigTest;
-    try mlx.requireGpu();
-    const was_enabled = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was_enabled);
-    const dir = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
-    errdefer {
-        var msg: [512]u8 = undefined;
-        std.debug.print("cooler contract: fixture {s}: {s}\n", .{ dir, mlx.takeError(&msg) orelse "no MLX or engine error latched" });
-    }
-    const a = testing.allocator;
-    const ids = try realTextIds(a, dir, 4097);
-    defer a.free(ids);
-    var ld: Load = undefined;
-    try ld.open(Q, dir, true);
-    defer _ = ld.close();
-    // Below and past the 2048 context where verify takes the two-pass kernel, the second a chunked prefill; the short
-    // prompt arms are the tiny's.
-    for ([_]usize{ 17, 4097 }) |len| {
-        var greedy_said = try greedyOn(&ld, ids[0..len], 40);
-        defer greedy_said.deinit(a);
-        // The shallowest and deepest round and one between: each depth re-prefills the prompt.
-        for ([_]u32{ 1, 3, 6 }) |depth| {
-            var spec = blk: {
-                const turn = arch_handle.turnFor(ld.h, &ld.config);
-                defer turn.end();
-                defer arch_sched.endRequest(&ld.config);
-                break :blk try Q.specTokensAt(a, ld.xfm, ids[0..len], 40, .{ .temperature = 0.0 }, depth);
-            };
-            defer spec.deinit(a);
-            errdefer std.debug.print("cooler contract: real text of {d} tokens at depth {d}: speculative differs from greedy at {?d}\n", .{ len, depth, std.mem.indexOfDiff(u32, greedy_said.items, spec.items) });
-            try testing.expectEqualSlices(u32, greedy_said.items, spec.items);
-        }
-    }
 }
 
 test "cooler contract: on real text, joined decode rows say their solo rows' tokens for a long chunked prompt beside a short one (cut)" {
@@ -1054,4 +635,347 @@ test "cooler contract: joined speculative rows under a logit bias, failed at any
             try testing.expect(swept > 0);
         }
     }.run);
+}
+
+test "cooler contract: a Cooler load's sampled speculative requests, seeded or not, serve and ask nothing of MLX" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            if (comptime !@hasDecl(C, "specTokensWith")) return error.SkipZigTest;
+            const a = testing.allocator;
+            var cooler: Load = undefined;
+            try cooler.open(C, dir, true);
+            defer _ = cooler.close();
+            const cases = [_]@import("sampler.zig").SamplingParams{
+                .{ .temperature = 0.8, .top_p = 0.95 },
+                .{ .temperature = 0.8, .top_p = 0.95, .seed = 7 },
+                .{ .temperature = 1.0, .top_k = 20 },
+            };
+            // The sampler's draw follows no prompt length: each length's forward is the greedy cell's.
+            const prompt = ids[0..@min(ids.len, 9)];
+            for (cases) |sampling| {
+                const turn = arch_handle.turnFor(cooler.h, &cooler.config);
+                defer turn.end();
+                defer arch_sched.endRequest(&cooler.config);
+                const calls = mlx.engine.mlxCalls();
+                errdefer std.debug.print("cooler contract: sampled speculative request over {d} tokens, seed {?d}, top_k {d}\n", .{ prompt.len, sampling.seed, sampling.top_k });
+                var got = try C.specTokensWith(a, cooler.xfm, prompt, 12, sampling);
+                defer got.deinit(a);
+                try testing.expectEqual(@as(usize, 12), got.items.len);
+                try testing.expectEqual(calls, mlx.engine.mlxCalls());
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a seeded sampled speculative request says the seeded serial request's tokens, again after another request and at every pinned depth" {
+    try eachFixture(struct {
+        fn spec(ld: *Load, comptime C: type, prompt: []const u32, n: u32, sampling: SamplingParams, depth: u32) !std.ArrayList(u32) {
+            const turn = arch_handle.turnFor(ld.h, &ld.config);
+            defer turn.end();
+            defer arch_sched.endRequest(&ld.config);
+            return C.specTokensAt(testing.allocator, ld.xfm, prompt, n, sampling, depth);
+        }
+
+        fn differs(what: []const u8, depth: u32, sampling: SamplingParams, len: usize, want: []const u32, got: []const u32) bool {
+            const at = std.mem.indexOfDiff(u32, want, got) orelse return false;
+            std.debug.print("cooler contract: seed {?d} over {d} tokens: {s} (pinned depth {d}) differs from token {d}\n", .{ sampling.seed, len, what, depth, at });
+            return true;
+        }
+
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            if (comptime !@hasDecl(C, "specTokensAt") or !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            // Verify rows another plan computes at each row count give no position one token.
+            if (!C.specIsGreedy(&ld.config)) return error.SkipZigTest;
+            const depth_bounds = @import("mtp_depth_bounds.zig");
+            const saved = depth_bounds.active;
+            defer depth_bounds.active = saved;
+            var long: [300]u32 = undefined;
+            for (&long, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
+            const cases = [_]SamplingParams{
+                .{ .temperature = 0.8, .top_k = 20, .seed = 42 },
+                .{ .temperature = 1.0, .top_p = 0.95, .top_k = 40, .min_p = 0.05, .seed = 11 },
+            };
+            var bad: u32 = 0;
+            const len = long.len;
+            const prompt: []const u32 = &long;
+            for (cases) |sampling| {
+                var want = try serial(&ld, prompt, 32, sampling);
+                defer want.deinit(a);
+                var first = try spec(&ld, C, prompt, 32, sampling, 0);
+                defer first.deinit(a);
+                if (differs("the speculative request against the serial one", 0, sampling, len, want.items, first.items)) bad += 1;
+                // Another request between publishes the acceptance the next one plans from.
+                {
+                    var other = try spec(&ld, C, long[0..100], 24, .{ .temperature = 0 }, 0);
+                    other.deinit(a);
+                    var again = try spec(&ld, C, prompt, 32, sampling, 0);
+                    defer again.deinit(a);
+                    if (differs("the speculative request after another against the first", 0, sampling, len, first.items, again.items)) bad += 1;
+                }
+                for ([_]u32{ 1, 3, 6 }) |depth| {
+                    depth_bounds.active = .{ .min = depth, .max = depth };
+                    defer depth_bounds.active = saved;
+                    var pinned = try spec(&ld, C, prompt, 32, sampling, depth);
+                    defer pinned.deinit(a);
+                    if (differs("the speculative request against the first", depth, sampling, len, first.items, pinned.items)) bad += 1;
+                }
+            }
+            try testing.expectEqual(@as(u32, 0), bad);
+        }
+    }.run);
+}
+
+/// One greedy request under a thinking bound, ticked in the scheduler's order (`loopGuardTick` before every tick,
+/// `commitThoughtClose` when it fires).
+const BoundRun = struct {
+    /// `drained` decodes serial but leaves the pipeline before the thought's last token, as an MTP serial block's exit
+    /// does, so the bound fires with no token in flight whatever the model accepts; `mtp` runs rounds at a pinned depth.
+    const Mode = union(enum) { serial, drained, mtp: u32 };
+
+    tokens: std.ArrayList(u32) = .empty,
+    /// The logits the forced commit leaves for the token after it.
+    logits: []f32 = &.{},
+    /// The bound fired on a speculative round's exit (no pipelined token in flight).
+    at_exit: bool = false,
+
+    fn deinit(self: *BoundRun, a: std.mem.Allocator) void {
+        self.tokens.deinit(a);
+        a.free(self.logits);
+    }
+
+    fn run(ld: *Load, comptime C: type, prompt: []const u32, n: u32, budget: u32, forced: []const u32, mode: Mode) !BoundRun {
+        const a = testing.allocator;
+        const scheduler = @import("scheduler.zig");
+        const turn = arch_handle.turnFor(ld.h, &ld.config);
+        defer turn.end();
+        defer arch_sched.endRequest(&ld.config);
+        var bound = @import("mtp_plan.zig").ThinkBound{ .budget = budget, .opener_id = null, .closer_id = forced[forced.len - 2], .forced = forced, .in_think = true };
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        const options: Generator.InitOptions = if (mode == .mtp) C.specOptions(ld.xfm, mode.mtp) else .{};
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, prompt, n, .{ .temperature = 0.0, .think_bound = &bound }, &.{}, options);
+        defer gen.deinit(a);
+        var out: BoundRun = .{};
+        errdefer out.deinit(a);
+        while (true) {
+            bound.observe(gen.generated_ids.items);
+            if (bound.due()) {
+                bound.fired = true;
+                out.at_exit = gen.pending == null;
+                const r = try gen.commitForcedTokens(a, forced);
+                defer a.free(r.emitted);
+                try out.tokens.appendSlice(a, r.emitted);
+                if (r.stopped) break;
+                out.logits = try test_support.qwen4ReadF32(a, gen.pending.?.logits, ld.xfm.s);
+                if (!try gen.mtpResumeAfterForced(a)) {
+                    gen.spec_disabled_runtime = true;
+                    gen.spec_disable_reason = .think_bound;
+                }
+                continue;
+            }
+            if (mode == .mtp and !scheduler.thinkBoundForcesPlain(&gen)) {
+                gen.mtp_group_cap = 0;
+                scheduler.capMtpRoundToThinkBound(&gen);
+                const r = (try gen.nextMtp(a)) orelse break;
+                defer a.free(r.tokens);
+                try out.tokens.appendSlice(a, r.tokens);
+            } else if (mode == .drained and bound.room() == 1) switch (try gen.drainPipelineForSpec(a)) {
+                .drained => |t| try out.tokens.append(a, t),
+                .already_clean => return error.NoPipelineToDrain,
+                .stopped => break,
+            } else try out.tokens.append(a, (try gen.next(a)) orelse break);
+        }
+        if (!bound.fired) return error.BoundNeverFired;
+        return out;
+    }
+};
+
+test "cooler contract: a greedy request's thought closed by its budget says the serial request's tokens, whether the close lands on a serial tick or a speculative round's exit" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            if (comptime !@hasDecl(C, "specOptions") or !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            if (!C.specIsGreedy(&ld.config)) return error.SkipZigTest;
+            const depth_bounds = @import("mtp_depth_bounds.zig");
+            const saved = depth_bounds.active;
+            defer depth_bounds.active = saved;
+            // As wide as a served close (an early-stop line, the closer, a separator), past the verify rows.
+            var forced: [24]u32 = undefined;
+            for (&forced, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
+            forced[forced.len - 2] = @intCast(ld.config.vocab_size - 1);
+            var bad: u32 = 0;
+            for ([_]u32{ 3, 6, 10, 15 }) |budget| {
+                var want = try BoundRun.run(&ld, C, ids, 64, budget, &forced, .serial);
+                defer want.deinit(a);
+                try testing.expect(!want.at_exit);
+                const modes = [_]BoundRun.Mode{ .drained, .{ .mtp = 1 }, .{ .mtp = 2 }, .{ .mtp = 3 }, .{ .mtp = 6 } };
+                for (modes) |mode| {
+                    if (mode == .mtp) depth_bounds.active = .{ .min = mode.mtp, .max = mode.mtp };
+                    defer depth_bounds.active = saved;
+                    var got = try BoundRun.run(&ld, C, ids, 64, budget, &forced, mode);
+                    defer got.deinit(a);
+                    if (mode == .drained) try testing.expect(got.at_exit);
+                    const tokens_at = std.mem.indexOfDiff(u32, want.tokens.items, got.tokens.items);
+                    const logits_same = std.mem.eql(u8, std.mem.sliceAsBytes(want.logits), std.mem.sliceAsBytes(got.logits));
+                    if (tokens_at == null and logits_same) continue;
+                    bad += 1;
+                    const depth = if (mode == .mtp) mode.mtp else 0;
+                    const flight = if (got.at_exit) "no token in flight" else "a token in flight";
+                    const logits = if (logits_same) "equal" else "differ";
+                    std.debug.print("cooler contract: budget {d}, {s} depth {d}, closed with {s}: tokens differ from {?d}, logits after the close {s}\n", .{ budget, @tagName(mode), depth, flight, tokens_at, logits });
+                }
+            }
+            try testing.expectEqual(@as(u32, 0), bad);
+        }
+    }.run);
+}
+
+test "cooler contract: an exact Cooler speculative request says its greedy tokens, over one row, past the verify edge and a chunk" {
+    try eachFixture(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            if (comptime !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            if (!C.specIsGreedy(&ld.config)) return error.SkipZigTest;
+            for ([_]usize{ 1, 9, 40 }) |len| {
+                const prompt = ids[0..@min(ids.len, len)];
+                errdefer std.debug.print("cooler contract: a prompt of {d} tokens\n", .{prompt.len});
+                var g = try greedy(&ld, prompt, 12);
+                defer g.deinit(a);
+                const turn = arch_handle.turnFor(ld.h, &ld.config);
+                defer turn.end();
+                defer arch_sched.endRequest(&ld.config);
+                var sp = try C.specTokens(a, ld.xfm, prompt, 12);
+                defer sp.deinit(a);
+                try testing.expectEqualSlices(u32, g.items, sp.items);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: on real text, greedy speculative at depths 1, 3 and 6 says greedy's tokens, short and past the two-pass context (cut)" {
+    const Q = ContractOf("qwen4");
+    if (comptime !@hasDecl(Q, "prompt")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
+    errdefer {
+        var msg: [512]u8 = undefined;
+        std.debug.print("cooler contract: fixture {s}: {s}\n", .{ dir, mlx.takeError(&msg) orelse "no MLX or engine error latched" });
+    }
+    const a = testing.allocator;
+    const ids = try realTextIds(a, dir, 4097);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(Q, dir, true);
+    defer _ = ld.close();
+    // Below and past the 2048 context where verify takes the two-pass kernel, the second a chunked prefill; the short
+    // prompt arms are the tiny's.
+    for ([_]usize{ 17, 4097 }) |len| {
+        var greedy_said = try greedyOn(&ld, ids[0..len], 40);
+        defer greedy_said.deinit(a);
+        // The shallowest and deepest round and one between: each depth re-prefills the prompt.
+        for ([_]u32{ 1, 3, 6 }) |depth| {
+            var spec = blk: {
+                const turn = arch_handle.turnFor(ld.h, &ld.config);
+                defer turn.end();
+                defer arch_sched.endRequest(&ld.config);
+                break :blk try Q.specTokensAt(a, ld.xfm, ids[0..len], 40, .{ .temperature = 0.0 }, depth);
+            };
+            defer spec.deinit(a);
+            errdefer std.debug.print("cooler contract: real text of {d} tokens at depth {d}: speculative differs from greedy at {?d}\n", .{ len, depth, std.mem.indexOfDiff(u32, greedy_said.items, spec.items) });
+            try testing.expectEqualSlices(u32, greedy_said.items, spec.items);
+        }
+    }
+}
+
+fn greedyOn(ld: *Load, ids: []const u32, n: u32) !std.ArrayList(u32) {
+    const a = testing.allocator;
+    const turn = arch_handle.turnFor(ld.h, &ld.config);
+    defer turn.end();
+    defer arch_sched.endRequest(&ld.config);
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    try ld.xfm.resetCache();
+    var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, ids, n, .{ .temperature = 0.0 }, &.{}, .{});
+    defer gen.deinit(a);
+    var got: std.ArrayList(u32) = .empty;
+    errdefer got.deinit(a);
+    while (try gen.next(a)) |t| try got.append(a, t);
+    return got;
+}
+
+test "cooler contract: a Cooler request failed at any of its checked MLX call sites leaves the engine as a whole request does, and the next says the same tokens" {
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(testing.allocator);
+    const S = struct {
+        var sites: *std.AutoHashMapUnmanaged(u64, void) = undefined;
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            defer mlx.fault.disarm();
+            const prompt = ids[0..@min(ids.len, 30)];
+            var cooler: Load = undefined;
+            try cooler.open(C, dir, true);
+            defer _ = cooler.close();
+            var want = try greedy(&cooler, prompt, 6);
+            defer want.deinit(testing.allocator);
+            {
+                var again = try greedy(&cooler, prompt, 6);
+                again.deinit(testing.allocator);
+            }
+            const base = Sheet.now();
+            const Req = struct {
+                ld: *Load,
+                prompt: []const u32,
+                fn go(r: @This()) anyerror!void {
+                    var got = try greedy(r.ld, r.prompt, 6);
+                    got.deinit(testing.allocator);
+                }
+            };
+            // Each op under its callers fails once, at its first call, on the first fixture of the arch that reaches it.
+            var list: std.ArrayList(u64) = .empty;
+            defer list.deinit(testing.allocator);
+            mlx.fault.sites = .{ .list = &list, .gpa = testing.allocator };
+            const recorded = Req.go(.{ .ld = &cooler, .prompt = prompt });
+            const unrecorded = mlx.fault.sites.failed;
+            mlx.fault.sites = .{};
+            try recorded;
+            if (unrecorded) return error.OutOfMemory;
+            var points: std.ArrayList(u64) = .empty;
+            defer points.deinit(testing.allocator);
+            for (list.items, 1..) |site, k| {
+                if (!(try sites.getOrPut(testing.allocator, archSite(C, site))).found_existing) try points.append(testing.allocator, k);
+            }
+            for (points.items) |k| {
+                mlx.fault.arm(k);
+                var faulted = greedy(&cooler, prompt, 6);
+                mlx.fault.disarm();
+                if (faulted) |*g| g.deinit(testing.allocator) else |_| {}
+                if (!mlx.fault.didFire()) {
+                    std.debug.print("cooler contract: the request's checked call {d} was never reached: a request makes other calls than the one recorded\n", .{k});
+                    return error.TestUnexpectedResult;
+                }
+                var msg: [300]u8 = undefined;
+                _ = mlx.takeError(&msg);
+                var got = try greedy(&cooler, prompt, 6);
+                defer got.deinit(testing.allocator);
+                errdefer std.debug.print("cooler contract: a request failed at checked MLX call {d}\n", .{k});
+                try testing.expectEqualSlices(u32, want.items, got.items);
+                try testing.expectEqual(base, Sheet.now());
+            }
+        }
+    };
+    S.sites = &seen;
+    try eachLayout(S.run);
 }

@@ -464,7 +464,8 @@ const test_domains = [_]TestDomain{
         .cut = true,
         .files = &.{
             "cooler_contract_test",     "cooler_late_test",     "cooler_load_test",    "cooler_pool_test",
-            "cooler_prefill_bill_test", "cooler_requests_test", "cooler_restore_test",
+            "cooler_prefill_bill_test", "cooler_requests_test", "cooler_restore_test", "cooler_held_requests_test",
+            "cooler_held_restore_test",
         },
         .steps = &.{
             .{ .name = "cooler-load", .files = &.{ "cooler_contract_test", "cooler_load_test" } },
@@ -472,6 +473,10 @@ const test_domains = [_]TestDomain{
             .{ .name = "cooler-prefill-bill", .files = &.{"cooler_prefill_bill_test"} },
             .{ .name = "cooler-requests", .files = &.{"cooler_requests_test"} },
             .{ .name = "cooler-restore", .files = &.{"cooler_restore_test"} },
+            // A served load per fixture held across the step's request-level cells (`heldLoad`), apart from the cells
+            // that make their own loads.
+            .{ .name = "cooler-held-requests", .files = &.{"cooler_held_requests_test"} },
+            .{ .name = "cooler-held-restore", .files = &.{"cooler_held_restore_test"} },
             // Every test of the file runs alone (`alone_tests`).
             .{ .name = "cooler-late", .files = &.{"cooler_late_test"} },
         },

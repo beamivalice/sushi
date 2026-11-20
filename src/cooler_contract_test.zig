@@ -36,13 +36,13 @@ pub const Load = struct {
     xfm: *Trunk,
     h: arch_handle.Handle,
 
-    fn prepare(self: *Load, comptime C: type, dir: []const u8, cooler: bool) !void {
+    pub fn prepare(self: *Load, comptime C: type, dir: []const u8, cooler: bool) !void {
         return self.prepareOn(testing.allocator, C, dir, cooler);
     }
 
     /// A load on MLX is the one the user's opt-out flag makes, through the parse and the settings stamp a served load
     /// takes; a Cooler load lifts the tests' MLX default.
-    fn prepareOn(self: *Load, a: std.mem.Allocator, comptime C: type, dir: []const u8, cooler: bool) !void {
+    pub fn prepareOn(self: *Load, a: std.mem.Allocator, comptime C: type, dir: []const u8, cooler: bool) !void {
         self.a = a;
         const off = model_mod.cooler_off;
         defer model_mod.cooler_off = off;
@@ -55,7 +55,7 @@ pub const Load = struct {
     }
 
     /// The load after `prepare`; on an error nothing of the load stays.
-    fn load(self: *Load, dir: []const u8) !void {
+    pub fn load(self: *Load, dir: []const u8) !void {
         const a = self.a;
         errdefer self.config.deinit(a);
         const job = JobTurn.begin(null, &self.config);
@@ -71,13 +71,13 @@ pub const Load = struct {
         self.h = arch_handle.adopt(self.xfm);
     }
 
-    fn open(self: *Load, comptime C: type, dir: []const u8, cooler: bool) !void {
+    pub fn open(self: *Load, comptime C: type, dir: []const u8, cooler: bool) !void {
         try self.prepare(C, dir, cooler);
         try self.loadServed(dir);
     }
 
     /// `load` and then `serve`, as a served load runs them; on an error nothing of the load stays.
-    fn loadServed(self: *Load, dir: []const u8) !void {
+    pub fn loadServed(self: *Load, dir: []const u8) !void {
         try self.load(dir);
         errdefer self.discard();
         try self.serve();
@@ -85,7 +85,7 @@ pub const Load = struct {
 
     /// The teardown of a served load that failed (`model_load.failLoadRequest` after the load's own errdefers): the
     /// model and its weights go, and no unload hook runs.
-    fn discard(self: *Load) void {
+    pub fn discard(self: *Load) void {
         {
             const job = JobTurn.begin(self.h, &self.config);
             defer job.end();
@@ -97,7 +97,7 @@ pub const Load = struct {
 
     /// What a served load runs once its trunk is up: the KV scheme a launch with no flag gets, the MTP head's draft
     /// rerank, and the warm (`model_load.warmLoad`, fatal on Cooler, which ends sealed). No aux head is loaded.
-    fn serve(self: *Load) !void {
+    pub fn serve(self: *Load) !void {
         const job = JobTurn.begin(self.h, &self.config);
         defer job.end();
         const kv = @import("bills.zig").kvCacheForLaunch(&self.config, null).config;
@@ -111,13 +111,13 @@ pub const Load = struct {
         try model_load.warmLoad(io, self.a, &self.config, self.xfm, verify_cap, null, kv);
     }
 
-    fn onEngine(self: *Load) bool {
+    pub fn onEngine(self: *Load) bool {
         return arch_handle.onEngine(self.h, null);
     }
 
     /// The unload serve runs (`model_load.retire`, in the model's job): the model, its weights, its arch's hook. Returns
     /// the MLX calls the teardown made before the job's end.
-    fn close(self: *Load) u64 {
+    pub fn close(self: *Load) u64 {
         const calls = mlx.engine.mlxCalls();
         const asked = blk: {
             const job = JobTurn.begin(self.h, &self.config);
@@ -132,6 +132,94 @@ pub const Load = struct {
     }
 };
 
+/// A run step's served Cooler loads, one per fixture folder, opened by the first request-level cell that asks
+/// (`heldLoad`) and kept for the next. After every test the runner reads them back (`heldRest`): each model put
+/// between requests, its config unchanged, no dispatch open and the weights' mappings as the last open left them; a
+/// test that left otherwise fails by name.
+/// The process's end unloads them and asks for an empty pool (`heldClose`).
+pub const Held = struct { dir: []u8, ld: *Load, config_hash: u64 };
+var held_loads: [8]Held = undefined;
+var held_count: usize = 0;
+/// The engine with every held load at rest, read after the last open.
+var held_sheet: Sheet = undefined;
+
+pub fn heldLoad(comptime C: type, dir: []const u8) !*Load {
+    for (held_loads[0..held_count]) |*h| if (std.mem.eql(u8, h.dir, dir)) return h.ld;
+    if (held_count == held_loads.len) return error.TooManyHeldLoads;
+    const a = std.heap.smp_allocator;
+    const ld = try a.create(Load);
+    errdefer a.destroy(ld);
+    try ld.prepareOn(a, C, dir, true);
+    try ld.loadServed(dir);
+    errdefer _ = ld.close();
+    const name = try a.dupe(u8, dir);
+    held_loads[held_count] = .{ .dir = name, .ld = ld, .config_hash = configHash(&ld.config) };
+    held_count += 1;
+    const rest = @import("test_rest.zig");
+    rest.held = .{ .holds = rest.held.holds + 1, .rest = heldRest, .close = heldClose };
+    var none = std.Io.Writer.fixed(&.{});
+    _ = heldRest(&none);
+    held_sheet = Sheet.now();
+    return ld;
+}
+
+fn configHash(config: *const model_mod.ModelConfig) u64 {
+    return std.hash.Wyhash.hash(0, std.mem.asBytes(config));
+}
+
+/// Each held model put between requests as serve leaves it (its cache reset, its request ended), then read: what a
+/// test left of them is written to `w`.
+pub fn heldRest(w: *std.Io.Writer) bool {
+    var left = false;
+    const open = mlx.engine.openDispatches();
+    if (open != 0) {
+        w.print(" {d} dispatches open beside the held loads;", .{open}) catch {};
+        left = true;
+    }
+    for (held_loads[0..held_count]) |*h| {
+        if (configHash(&h.ld.config) != h.config_hash) {
+            w.print(" the held load of {s} with its config changed;", .{std.fs.path.basename(h.dir)}) catch {};
+            left = true;
+        }
+        const turn = arch_handle.turnFor(h.ld.h, &h.ld.config);
+        defer turn.end();
+        // A cache keeps the capacity its longest request grew it to: the load's own, made again as serve made it.
+        h.ld.xfm.resetCache() catch {
+            w.writeAll(" a held load's cache not reset;") catch {};
+            left = true;
+        };
+        h.ld.xfm.cache.reinit(h.ld.config.num_hidden_layers, @import("bills.zig").kvCacheForLaunch(&h.ld.config, null).config) catch {
+            w.writeAll(" a held load's cache not made again;") catch {};
+            left = true;
+        };
+        arch_sched.endRequest(&h.ld.config);
+    }
+    // What is in use is not read: a model keeps caches its longest request grew, which no cell made.
+    const now = Sheet.now();
+    if (now.mapped != held_sheet.mapped or now.regions != held_sheet.regions) {
+        w.print(" beside the held loads: {d} B mapped ({d} held), {d} owned regions ({d});", .{ now.mapped, held_sheet.mapped, now.regions, held_sheet.regions }) catch {};
+        return true;
+    }
+    return left;
+}
+
+/// The held loads unloaded, newest first; the pool must then hold nothing in use.
+fn heldClose(w: *std.Io.Writer) bool {
+    const rest = @import("test_rest.zig");
+    while (held_count > 0) {
+        held_count -= 1;
+        const h = held_loads[held_count];
+        _ = h.ld.close();
+        std.heap.smp_allocator.destroy(h.ld);
+        std.heap.smp_allocator.free(h.dir);
+    }
+    rest.held = .{};
+    const now = Sheet.now();
+    if (now.in_use == 0 and now.regions == 0 and now.open == 0) return false;
+    w.print(" {d} B in use, {d} owned regions, {d} dispatches open after the held loads' unload;", .{ now.in_use, now.regions, now.open }) catch {};
+    return true;
+}
+
 /// The engine's pool and mappings, the pool's free buffers taken back first, and the owned regions weights live in; and
 /// the dispatches a pass still held open when the sheet was read, which at rest are none.
 pub const Sheet = struct {
@@ -142,7 +230,7 @@ pub const Sheet = struct {
     regions: usize,
     owned: u64,
 
-    fn now() Sheet {
+    pub fn now() Sheet {
         const open = mlx.engine.openDispatches();
         mlx.engine.close();
         const s = mlx.engine.stats();
@@ -276,7 +364,7 @@ const Which = enum { every, first, per_residency, per_layout, tinies, cut };
 /// The fixture env of the Qwen cut (`QWEN4_TEST_MODEL`).
 const cut_env = "QWEN4_TEST_MODEL";
 
-fn takes(comptime which: Which, env: []const u8) bool {
+pub fn takes(comptime which: Which, env: []const u8) bool {
     return switch (which) {
         .tinies => !std.mem.eql(u8, env, cut_env),
         .cut => std.mem.eql(u8, env, cut_env),
@@ -418,7 +506,7 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 /// A contract load served by the scheduler's own slot path: a registry entry holding the load's handle and config, the
 /// SSD-only tier a served load arms for it (`attachPrefixCache`, its cache dir under a tmp dir), and a test scheduler.
 pub const Served = struct {
-    const scheduler = @import("scheduler.zig");
+    pub const scheduler = @import("scheduler.zig");
     const registry_mod = @import("model_registry.zig");
 
     tmp: testing.TmpDir,
@@ -432,12 +520,12 @@ pub const Served = struct {
     /// A fault sweep refuses requests on purpose: their failures are expected, not news.
     quiet_failures: bool = false,
 
-    fn init(self: *Served, ld: *Load, dir: []const u8) !void {
+    pub fn init(self: *Served, ld: *Load, dir: []const u8) !void {
         return self.initTiers(ld, dir, 0);
     }
 
     /// `ram_bytes`: the RAM tier's budget, 0 for the SSD tier alone.
-    fn initTiers(self: *Served, ld: *Load, dir: []const u8, ram_bytes: u64) !void {
+    pub fn initTiers(self: *Served, ld: *Load, dir: []const u8, ram_bytes: u64) !void {
         const a = testing.allocator;
         self.reused = 0;
         self.quiet_failures = false;
@@ -492,7 +580,7 @@ pub const Served = struct {
         self.tok.deinit();
     }
 
-    fn deinit(self: *Served) void {
+    pub fn deinit(self: *Served) void {
         self.sch.pending.deinit(testing.allocator);
         self.sch.decoding.deinit(testing.allocator);
         self.sch.cleanup_queue.deinit(testing.allocator);
@@ -505,13 +593,13 @@ pub const Served = struct {
 
     /// One greedy request through the scheduler's slot path (submit, `runPrefill`, decode ticks, the finish that
     /// commits), its writes to the tier drained; the tokens it said, and whether it restored from SSD and how far.
-    fn request(self: *Served, prompt: []const u32, n: u32, restored: *u32) !std.ArrayList(u32) {
+    pub fn request(self: *Served, prompt: []const u32, n: u32, restored: *u32) !std.ArrayList(u32) {
         return self.requestWith(prompt, n, .{ .temperature = 0.0 }, false, restored);
     }
 
     /// `restored`: the prompt tokens an SSD restore gave; `reused` holds what any tier or the live state gave.
     /// `mtp`: with the model's MTP head, its rounds solo, as one speculative request decodes.
-    fn requestWith(self: *Served, prompt: []const u32, n: u32, sampling: @import("sampler.zig").SamplingParams, mtp: bool, restored: *u32) !std.ArrayList(u32) {
+    pub fn requestWith(self: *Served, prompt: []const u32, n: u32, sampling: @import("sampler.zig").SamplingParams, mtp: bool, restored: *u32) !std.ArrayList(u32) {
         const a = testing.allocator;
         const sch = &self.sch;
         const head = if (mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(self.entry.handle.?), true, null) else null;
@@ -550,7 +638,7 @@ pub const Served = struct {
     /// One request as the inference loop runs it, a failure settled by `failPrefill` or `failTick`, then completed and
     /// taken by the loop's cleanup drain (`cleanupSlot`, then the slot's memory goes): the dispatches still open between
     /// the drain and the slot's end.
-    fn requestToCleanup(self: *Served, prompt: []const u32, n: u32, mtp: bool) !u32 {
+    pub fn requestToCleanup(self: *Served, prompt: []const u32, n: u32, mtp: bool) !u32 {
         const sch = &self.sch;
         const head = if (mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(self.entry.handle.?), true, null) else null;
         const slot = try sch.submit(.{ .model = self.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
@@ -577,7 +665,7 @@ pub const Served = struct {
 
     /// Requests through the scheduler, each prefilled in turn and then decoded together, their rows joined in its ticks
     /// as concurrent requests are, with the model's MTP head when `mtp`. `reused`: what the last took from a tier.
-    fn concurrent(self: *Served, prompts: []const []const u32, n: u32, sampling: SamplingParams, mtp: bool) !void {
+    pub fn concurrent(self: *Served, prompts: []const []const u32, n: u32, sampling: SamplingParams, mtp: bool) !void {
         const a = testing.allocator;
         const sch = &self.sch;
         var slots: [4]*scheduler.Slot = undefined;
@@ -722,7 +810,7 @@ pub fn servedRowsWith(sv: *Served, prompts: [2][]const u32, n: u32, mtp: bool, s
 /// submitted at once and prefilled in turn (a second one after a tick of the first, as `interleaveDecodeTick` runs),
 /// then joined in each decode tick; a client that leaves is completed and drained at its tick.
 pub const MixedTick = struct {
-    const scheduler = Served.scheduler;
+    pub const scheduler = Served.scheduler;
     const max = 4;
 
     const Spec = struct {
@@ -750,7 +838,7 @@ pub const MixedTick = struct {
         }
     };
 
-    fn tick(sch: *scheduler.Scheduler) void {
+    pub fn tick(sch: *scheduler.Scheduler) void {
         var act: [max]*scheduler.Slot = undefined;
         var k: usize = 0;
         for (sch.decoding.items) |s| if (s.joinsTick()) {
@@ -761,7 +849,7 @@ pub const MixedTick = struct {
         scheduler.cullDecoding(sch);
     }
 
-    fn drain(sch: *scheduler.Scheduler) void {
+    pub fn drain(sch: *scheduler.Scheduler) void {
         for (sch.cleanup_queue.items) |s| scheduler.cleanupSlot(sch, s);
         for (sch.cleanup_queue.items) |s| {
             const turn = arch_handle.turnFor(s.model.handle, s.model.config);
@@ -827,7 +915,7 @@ pub const MixedTick = struct {
     /// `specs` refused at each pool-buffer site of their joined run that `seen` lacks, at its first ask: at most one
     /// request fails, and by its settled name; every other one says its solo tokens, the next joined run says them all
     /// and the pool is as it was.
-    fn faultSweep(comptime C: type, sv: *Served, specs: []const Spec, seen: *std.AutoHashMapUnmanaged(u64, void)) !void {
+    pub fn faultSweep(comptime C: type, sv: *Served, specs: []const Spec, seen: *std.AutoHashMapUnmanaged(u64, void)) !void {
         const a = testing.allocator;
         var solo: [max]Out = undefined;
         var made: usize = 0;

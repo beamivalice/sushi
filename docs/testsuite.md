@@ -63,7 +63,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 
   | binary | holds |
   |---|---|
-  | `test-cooler` | the Sushi Cooler contract: a run step per family file (`cooler-load`, `-pool`, `-prefill-bill`, `-requests`, `-restore`) and one per late cell |
+  | `test-cooler` | the Sushi Cooler contract: a run step per family file (`cooler-load`, `-pool`, `-prefill-bill`, `-requests`, `-restore`), two for the cells on held loads (`cooler-held-requests`, `-held-restore`) and one per late cell |
   | `test-deepseek`, `test-qwen`, `test-glm`, `test-mimo` | `src/dsv41/`, `src/qwen4/`, `src/glm5/`, `src/mimo2/`, less their prefix-cache files |
   | `test-kernels` | `src/tensor/` and the shared kernels (attention, verify, MoE, FP8, MTP, DFlash, MLX and Metal glue) |
   | `test-generate` | generation, the scheduler, MTP and DFlash rounds, sampling, the KV and SSM caches, the trunk |
@@ -135,6 +135,13 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   stream handle itself is not (a fault there skipped its free), and a test-only reading made on the way to the call
   under test (the TF32 probe) goes past the fault (`mlx.past_fault`), so a test passes alone as in the suite.
   Its no-late-kernel tests prove their property only on a fresh pipeline cache, which is the process's: they run alone.
+- **Held loads** (`heldLoad` in `cooler_contract_test.zig`): a request-level contract cell that proves nothing about
+  a load asks for the step's served load of its fixture instead of making one; such cells sit in the
+  `cooler_held_*_test.zig` files, run steps of their own, so no cell that makes its own load shares their process.
+  After every test the runner's at-rest hook puts each held model between requests and fails the test that left it a
+  changed config, other weights' mappings or a dispatch open; the step's end unloads them and asks for an empty pool.
+  Pool bytes in use are not read: a model keeps caches its longest request grew. A cell that measures the pool or
+  makes a speculative request's first-use state keeps its own load.
 - **Tests that run alone** (`alone_tests` in build.zig): each is a run step of its own, a fresh process, left out of its
   file's step. Every test that proves nothing compiles after a load's warm or seal is one (the contract's late cells,
   DeepSeek's, Qwen's GDN, QSA and vision warms, the engine route's first uses): an earlier test's compiles in the same
