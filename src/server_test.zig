@@ -806,6 +806,8 @@ test "server: a model loaded beside the current one with no hot cache of its own
 }
 
 test "server: a request for the model that is not current is credited only with its own model's hot cache" {
+    // Of the served archs only Qwen's admission evicts its hot cache: a build without it has nothing to check.
+    try @import("test_note.zig").needArchs(&.{"qwen4"});
     const ram_was = server_state.prefix_cache_ram_enabled;
     defer server_state.prefix_cache_ram_enabled = ram_was;
     server_state.prefix_cache_ram_enabled = true;
@@ -836,7 +838,12 @@ test "server: a request for the model that is not current is credited only with 
             if (bill.evictable > own or bill.reclaimable > own) return error.CreditedAnotherModelsHotCache;
         }
     }.run);
-    try testing.expect(Scenario.seen > 0);
+    // Every arch that ran returned before the check (none evicts its hot cache to admit, or one's fixture was left
+    // out): nothing was checked, which is a skip by name, never a pass or a failure.
+    if (Scenario.seen == 0) {
+        @import("test_note.zig").notePartSkipped("no arch that ran evicts its hot cache to admit");
+        return error.SkipZigTest;
+    }
 }
 
 /// Holds the next load at its prefix-cache sizing (or, streamed, its expert-cache fit) until `released`: the load has
