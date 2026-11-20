@@ -20,6 +20,10 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   and a shutdown.
 - **A request ended by a shutdown says so in its error type**: its 503 carried `server_error` where every other
   shutdown refusal carries `shutting_down`; all now carry `shutting_down`.
+- **A load started right after the previous server quit waits for its memory to be released**: the free-RAM check gave up
+  after 2 s without a rise and refused while the kernel was still returning memory (a launchd restart hit it); it now
+  waits while the memory keeps coming back, up to 10 s without a rise and 60 s in all, and logs what it read when it
+  gives up.
 - **A reply cancelled mid-stream no longer says it ran out of tokens**: a request stopped by `POST /v1/slots/cancel`
   (or the dashboard's Cancel) ended with `finish_reason: length` (Responses: incomplete, `max_output_tokens`) and zero
   usage on every surface; it now ends as cancelled, and its usage counts the tokens it returned.

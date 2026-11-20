@@ -700,8 +700,8 @@ const PreflightReader = struct {
         r.last = got;
         return got.bytes;
     }
-    pub fn sleep(r: *PreflightReader) void {
-        std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
+    pub fn sleep(r: *PreflightReader, ms: u64) void {
+        std.Io.sleep(r.io, .fromMilliseconds(@intCast(ms)), .real) catch {};
     }
     pub fn freeRamBinds(r: *PreflightReader) bool {
         return r.last.?.bound() == .free_ram;
@@ -2123,10 +2123,14 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 @as(f64, @floatFromInt(avail_bytes.?)) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             });
-            avail_bytes = bills.settleAvailableBytes(avail_bytes, needed, &reader);
+            const settled = bills.settleAvailableBytes(avail_bytes, needed, &reader);
+            avail_bytes = settled.avail;
             priced = preflightServing(params.config, weights_bytes, mtp_on, reader.last.?);
             serving = priced.serving;
             needed = priced.needed;
+            var give_up_buf: [320]u8 = undefined;
+            const gave_up = settled.giveUpLine(&give_up_buf, needed);
+            if (gave_up.len > 0) log.info("[preflight] {s}\n", .{gave_up});
         }
         var avail_buf: [192]u8 = undefined;
         const wired_mb = reader.readings.wired_limit >> 20;

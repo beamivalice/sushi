@@ -135,7 +135,9 @@ bill function's output on the committed fixture configs of all served packs: a b
 - **A bound read as exhausted is 0 and refuses a load; only a figure never read (null) admits it**: `sushiAvailable`,
   `effectiveAvailableBytes`, `memInsufficientForLoad` and `settleAvailableBytes` carry `?u64`, so buffers past a
   declared floor or the working set are refused by name (the bound in words), never waved through as an unknown 0.
-- A short reading waits for a just-freed process's memory (`settleAvailableBytes`, up to 2 s without growth) only while
+- A short reading waits for a just-freed process's memory (`settleAvailableBytes`) while it keeps rising, and gives up
+  once it has not risen for `settle_stall_ms` (10 s: a teardown returns memory in bursts with flat stretches between) or
+  at `settle_total_ms` (60 s), with one `[preflight] waited …` line naming what it read and for how long; it waits only while
   free RAM is the bound: a reading a GPU limit binds (the working set, a declared wired limit) is refused at once. A read
   that fails during the wait ends it on the last figure read, which still refuses: a short figure is never dropped for an
   unread one.
