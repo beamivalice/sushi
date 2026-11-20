@@ -1840,3 +1840,37 @@ test "server: a shutdown ends a chunked upload whose client floods carriage retu
         }
     }.run);
 }
+
+fn modelState(id: []const u8) @import("model_registry.zig").LoadState {
+    const reg = server_state.global_registry.?;
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    return reg.entries.get(id).?.state;
+}
+
+fn rawExchange(bytes: []const u8) ![]u8 {
+    const fd = try connect();
+    defer _ = std.c.close(fd);
+    readLimit(fd, 30);
+    try sendAll(fd, bytes);
+    return readUntil(fd, null);
+}
+
+test "server: an unload whose Content-Length has no space after its colon unloads the model it names, or is refused, never another" {
+    try eachArch(4, .{ .tiny2 = true }, struct {
+        fn run() !void {
+            gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
+            gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
+            const before = .{ modelState("tiny"), modelState("tiny2") };
+            // A valid HTTP/1.1 head: the field value's leading whitespace is optional (RFC 9110 §5.6.3).
+            const answer = try rawExchange("POST /v1/unload-model HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length:17\r\n\r\n{\"model\":\"tiny2\"}");
+            defer gpa.free(answer);
+            const after = .{ modelState("tiny"), modelState("tiny2") };
+            const refused = std.mem.startsWith(u8, answer, "HTTP/1.1 400 ");
+            if (!refused and (after[0] != before[0] or after[1] == before[1])) {
+                std.debug.print("unload of tiny2 by Content-Length:17: before tiny={s} tiny2={s}, after tiny={s} tiny2={s}; answer: {s}\n", .{ @tagName(before[0]), @tagName(before[1]), @tagName(after[0]), @tagName(after[1]), answer[0..@min(answer.len, 300)] });
+                return error.BodyDroppedWrongModel;
+            }
+        }
+    }.run);
+}

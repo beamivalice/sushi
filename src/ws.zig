@@ -7,6 +7,7 @@
 //! loop and decides what to do with text frames.
 
 const std = @import("std");
+const http_head = @import("http_head.zig");
 
 /// Magic GUID per RFC 6455 §1.3.
 const ws_magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -233,31 +234,11 @@ pub fn computeAccept(out: *[28]u8, key: []const u8) void {
     _ = enc.encode(out, &digest);
 }
 
-/// Find a header value (case-insensitive name). Returns the value substring
-/// (trimmed of leading/trailing whitespace) or null.
-pub fn findHeader(headers: []const u8, name: []const u8) ?[]const u8 {
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const lname = line[0..colon];
-        if (lname.len != name.len) continue;
-        var match = true;
-        for (lname, name) |a, b| {
-            if (std.ascii.toLower(a) != std.ascii.toLower(b)) {
-                match = false;
-                break;
-            }
-        }
-        if (!match) continue;
-        return std.mem.trim(u8, line[colon + 1 ..], " \t");
-    }
-    return null;
-}
 
 /// Returns true if the given headers represent a WebSocket upgrade request.
 pub fn isUpgrade(headers: []const u8) bool {
-    const upg = findHeader(headers, "Upgrade") orelse return false;
-    const conn = findHeader(headers, "Connection") orelse return false;
+    const upg = http_head.value(headers, "Upgrade") orelse return false;
+    const conn = http_head.value(headers, "Connection") orelse return false;
     if (std.ascii.findIgnoreCase(upg, "websocket") == null) return false;
     if (std.ascii.findIgnoreCase(conn, "upgrade") == null) return false;
     return true;
@@ -265,7 +246,7 @@ pub fn isUpgrade(headers: []const u8) bool {
 
 /// Perform the server-side handshake. Writes the 101 response.
 pub fn handshake(conn: anytype, headers: []const u8) !void {
-    const key = findHeader(headers, "Sec-WebSocket-Key") orelse return error.WsHandshake;
+    const key = http_head.value(headers, "Sec-WebSocket-Key") orelse return error.WsHandshake;
     var accept_buf: [28]u8 = undefined;
     computeAccept(&accept_buf, key);
 
@@ -282,14 +263,6 @@ test "computeAccept matches RFC 6455 §1.3 example" {
     var out: [28]u8 = undefined;
     computeAccept(&out, "dGhlIHNhbXBsZSBub25jZQ==");
     try testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &out);
-}
-
-test "findHeader case insensitive" {
-    const hdrs = "Host: example.com\r\nUpgrade: websocket\r\nSec-WebSocket-Key: abc123\r\n";
-    try testing.expectEqualStrings("websocket", findHeader(hdrs, "Upgrade").?);
-    try testing.expectEqualStrings("websocket", findHeader(hdrs, "upgrade").?);
-    try testing.expectEqualStrings("abc123", findHeader(hdrs, "sec-websocket-key").?);
-    try testing.expect(findHeader(hdrs, "missing") == null);
 }
 
 test "isUpgrade detects upgrade headers" {

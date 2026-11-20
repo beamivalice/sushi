@@ -41,6 +41,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **Stopping the server no longer waits on a client that keeps sending**: a chunked upload of bare carriage returns or a
   WebSocket message of empty fragments was read forever, past the size limit and past a shutdown, after which the
   server exited with an error; both now end at the limit, and a shutdown ends every read at once.
+- **A request whose `Content-Length` has no space after its colon is read with its body**: `Content-Length:17` (or a
+  tab, or trailing whitespace) read as no body, so an unload or load acted on the default model instead of the one it
+  named; an unreadable or conflicting length or transfer coding is now a 400.
 - **A request head over 16 KB is answered 431**, where the connection was closed with no reply; and a body the client
   cuts short (it closes before its `Content-Length`) is dropped instead of being run on the bytes that arrived.
 - **A request ended by a shutdown says so in its error type**: its 503 carried `server_error` where every other

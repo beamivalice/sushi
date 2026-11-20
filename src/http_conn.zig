@@ -18,6 +18,7 @@ const request_parse = @import("request_parse.zig");
 const writeEffortNoticeHeader = request_policy.writeEffortNoticeHeader;
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
+const http_head = @import("http_head.zig");
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const testing = std.testing;
 const server_mod = @import("server.zig");
@@ -552,7 +553,7 @@ pub fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const
             std.mem.eql(u8, path, "/v1/downloads") or std.mem.eql(u8, path, "/v1/downloads/cancel") or
             std.mem.eql(u8, path, "/v1/slots/cancel");
     if (!guarded) return false;
-    const origin = findHeaderValueCI(headers, "origin") orelse return false;
+    const origin = http_head.value(headers, "origin") orelse return false;
     // A wildcard bind has no host of its own: a page opened at any IP address the server answers on is its own
     // page, so match the Origin against the Host the client reached. Only an IP literal counts: a DNS name can be
     // rebound to this Mac and would then send itself as both Origin and Host.
@@ -562,7 +563,7 @@ pub fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const
 
 /// The `Host` header's host when it is an IP literal (IPv4, or bracketed IPv6), its port stripped; null otherwise.
 fn hostHeaderIp(headers: []const u8) ?[]const u8 {
-    const h = std.mem.trim(u8, findHeaderValueCI(headers, "host") orelse return null, " ");
+    const h = std.mem.trim(u8, http_head.value(headers, "host") orelse return null, " ");
     if (h.len == 0) return null;
     if (h[0] == '[') {
         const close = std.mem.indexOfScalar(u8, h, ']') orelse return null;
@@ -684,6 +685,9 @@ pub const ReadOutcome = union(enum) {
     /// Refused with its answer sent: a body over the cap (413), a transfer coding (501), an expectation (417), a bad
     /// chunk (400).
     refused,
+    /// A body framing that is not one reading (RFC 9112 §6.3): a Content-Length not one number, Transfer-Encoding
+    /// twice or beside Content-Length. Answered 400 and closed.
+    bad_framing,
     /// A shutdown ended the read: a request whose line arrived got the shutdown error.
     shutdown,
 };
@@ -758,15 +762,11 @@ const ChunkDecoder = struct {
     }
 };
 
-fn endsWithChunked(transfer_encoding: []const u8) bool {
-    const last = if (std.mem.lastIndexOfScalar(u8, transfer_encoding, ',')) |at| transfer_encoding[at + 1 ..] else transfer_encoding;
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, last, " \t"), "chunked");
-}
 
 /// Answers `Expect: 100-continue` so a client holding its body back sends it; any other expectation is a 417.
 /// False when the request was refused.
 fn answerExpect(allocator: std.mem.Allocator, stream: *Conn, head: []const u8) !bool {
-    const expect = findHeaderValueCI(head, "expect") orelse return true;
+    const expect = http_head.value(head, "expect") orelse return true;
     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
         try stream.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
         return true;
@@ -865,15 +865,20 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
     stream.api = apiOfHead(head);
     const max_request_bytes = server_state.max_request_bytes.load(.monotonic);
 
-    if (findHeaderValueCI(head, "transfer-encoding")) |coding| {
-        if (!endsWithChunked(coding)) {
+    const length = switch (http_head.framing(head) catch |err| switch (err) {
+        error.BadFraming => {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "The request body's framing is ambiguous: a Content-Length that is not one number, or Transfer-Encoding twice or beside Content-Length", 400);
+            return .bad_framing;
+        },
+        error.UnsupportedCoding => {
             try sendErrorResponse(allocator, stream, "501 Not Implemented", "invalid_request_error", "Only Transfer-Encoding: chunked is supported", 501);
             return .refused;
-        }
-        return readChunkedRequest(allocator, stream, limit_ms, head, hdr_buf[header_end_pos..total_read], max_request_bytes);
-    }
-
-    const total_size = header_end_pos +| (findContentLength(head[0 .. header_end_pos - 4]) orelse 0);
+        },
+    }) {
+        .chunked => return readChunkedRequest(allocator, stream, limit_ms, head, hdr_buf[header_end_pos..total_read], max_request_bytes),
+        .length => |n| n,
+    };
+    const total_size = header_end_pos +| length;
     if (total_size > max_request_bytes) {
         var msg_buf: [128]u8 = undefined;
         const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_bytes);
@@ -950,25 +955,6 @@ fn logHttpStreamStart(kind: []const u8) void {
     log.debug("[http] <- 200 OK text/event-stream ({s})\n", .{kind});
 }
 
-fn findContentLength(headers: []const u8) ?usize {
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    while (lines.next()) |line| {
-        const lower = "content-length: ";
-        if (line.len >= lower.len) {
-            var match = true;
-            for (0..lower.len) |j| {
-                if (std.ascii.toLower(line[j]) != lower[j]) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
-                return std.fmt.parseInt(usize, std.mem.trim(u8, line[lower.len..], " "), 10) catch null;
-            }
-        }
-    }
-    return null;
-}
 
 /// Whether the API-key auth gate covers this peer at all: a key must be set,
 /// and the peer must be non-loopback — unless `--api-key-strict` removed the
@@ -989,25 +975,6 @@ test "apiKeyGateApplies: strict removes exactly the loopback exemption" {
     try std.testing.expect(apiKeyGateApplies(true, true, false));
 }
 
-/// Case-insensitive HTTP header lookup in the raw header block. `name_lower`
-/// must be lowercase (e.g. "authorization"). Returns the trimmed value, or null.
-pub fn findHeaderValueCI(headers: []const u8, name_lower: []const u8) ?[]const u8 {
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    while (lines.next()) |line| {
-        if (line.len <= name_lower.len + 1) continue;
-        var match = true;
-        for (0..name_lower.len) |j| {
-            if (std.ascii.toLower(line[j]) != name_lower[j]) {
-                match = false;
-                break;
-            }
-        }
-        if (!match) continue;
-        if (line[name_lower.len] != ':') continue;
-        return std.mem.trim(u8, line[name_lower.len + 1 ..], " \t");
-    }
-    return null;
-}
 
 /// Constant-time equality — avoids a timing oracle on the API key.
 fn constTimeEql(a: []const u8, b: []const u8) bool {
@@ -1047,14 +1014,14 @@ fn basicAuthMatches(enc: []const u8, key: []const u8) bool {
 /// the password), `x-api-key: <key>` (Anthropic), and `?api_key=` / `?key=`.
 pub fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
     const key = server_state.g_api_key orelse return true;
-    if (findHeaderValueCI(raw_headers, "authorization")) |auth| {
+    if (http_head.value(raw_headers, "authorization")) |auth| {
         if (std.ascii.startsWithIgnoreCase(auth, "Bearer ")) {
             if (constTimeEql(std.mem.trim(u8, auth["Bearer ".len..], " \t"), key)) return true;
         } else if (std.ascii.startsWithIgnoreCase(auth, "Basic ")) {
             if (basicAuthMatches(std.mem.trim(u8, auth["Basic ".len..], " \t"), key)) return true;
         }
     }
-    if (findHeaderValueCI(raw_headers, "x-api-key")) |xk| {
+    if (http_head.value(raw_headers, "x-api-key")) |xk| {
         if (constTimeEql(xk, key)) return true;
     }
     if (queryParamValue(raw_path, "api_key")) |q| {
@@ -1882,21 +1849,6 @@ test "Conn.close lingers only briefly for the peer after a Content-Length respon
 
 test "Conn.close stops waiting when the server shuts down" {
     try expectCloseWaitsForPeer(true, true);
-}
-
-test "findContentLength parses header" {
-    try testing.expectEqual(@as(?usize, 42), findContentLength("Host: localhost\r\nContent-Length: 42\r\nAccept: */*"));
-}
-
-test "findContentLength case insensitive" {
-    try testing.expectEqual(@as(?usize, 100), findContentLength("content-length: 100"));
-    try testing.expectEqual(@as(?usize, 100), findContentLength("Content-Length: 100"));
-    try testing.expectEqual(@as(?usize, 100), findContentLength("CONTENT-LENGTH: 100"));
-}
-
-test "findContentLength returns null when missing" {
-    try testing.expect(findContentLength("Host: localhost\r\nAccept: */*") == null);
-    try testing.expect(findContentLength("") == null);
 }
 
 test "StreamHeartbeat: a write resets the deadline, silence expires it" {
@@ -2940,6 +2892,29 @@ test "read: a body cut short by the client's EOF is dropped, by length or chunke
         defer freeRead(r);
         if (!r.returned or r.outcome != .cut_short) {
             std.debug.print("EOF mid-body ({s}): returned={any} outcome={?} body='{s}'\n", .{ sent[0..20], r.returned, r.outcome, r.body });
+            bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "read: a Content-Length the reader does not take whole (no space, a tab, junk, two values) is never routed with its body dropped" {
+    var bad: usize = 0;
+    for ([_][]const u8{
+        "POST /v1/load-model HTTP/1.1\r\nContent-Length:16\r\n\r\n{\"model\":\"tiny\"}",
+        "POST /v1/load-model HTTP/1.1\r\nContent-Length:\t16\r\n\r\n{\"model\":\"tiny\"}",
+        "POST /v1/load-model HTTP/1.1\r\nContent-Length: 16\t\r\n\r\n{\"model\":\"tiny\"}",
+        "POST /v1/load-model HTTP/1.1\r\nContent-Length: 1_6\r\n\r\n{\"model\":\"tiny\"}",
+        "POST /v1/load-model HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 16\r\n\r\n{\"model\":\"tiny\"}",
+    }) |sent| {
+        const r = try readAgainst(.{ .sent = sent, .limit_ms = 500 });
+        defer freeRead(r);
+        // The contract: routed with its whole body, or refused (400). Never routed with the body left behind.
+        const whole = r.outcome == .request and std.mem.eql(u8, r.body, "{\"model\":\"tiny\"}");
+        const refused = r.outcome == .bad_framing and std.mem.startsWith(u8, r.reply, "HTTP/1.1 400 ");
+        if (!whole and !refused) {
+            const hl = std.mem.indexOf(u8, sent, "Content-Length") orelse 0;
+            std.debug.print("'{s}': outcome={s} routed body='{s}' ({d} B)\n", .{ sent[hl .. std.mem.indexOf(u8, sent, "\r\n\r\n") orelse sent.len], if (r.outcome) |x| @tagName(x) else "none", r.body, r.body.len });
             bad += 1;
         }
     }

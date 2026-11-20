@@ -38,6 +38,7 @@ const completions = @import("completions.zig");
 const responses_api = @import("responses_api.zig");
 const generation_stream = @import("generation_stream.zig");
 const http_conn = @import("http_conn.zig");
+const http_head = @import("http_head.zig");
 const boot_gate = @import("boot_gate.zig");
 const fd_limits = @import("fd_limits.zig");
 const request_media = @import("request_media.zig");
@@ -239,7 +240,7 @@ const chat_page_html = @embedFile("webui/index.html");
 
 /// The browser orchestrates calls; this local-only bridge shares the REPL's restrictions.
 fn handleWebTools(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: []const u8, body: []const u8) !void {
-    const origin = http_conn.findHeaderValueCI(headers, "origin") orelse "";
+    const origin = http_head.value(headers, "origin") orelse "";
     if (!peerIsLoopback(stream) or !update_mod.isLoopbackHost(server_state.listen_host) or
         !update_mod.originMatches(origin, server_state.listen_host, server_state.listen_port))
     {
@@ -2198,7 +2199,7 @@ fn handleUpdate(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: 
         .bind_host = server_state.listen_host,
         .port = server_state.listen_port,
         .peer_loopback = peerIsLoopback(stream),
-        .origin = http_conn.findHeaderValueCI(headers, "origin"),
+        .origin = http_head.value(headers, "origin"),
         .key_set = server_state.g_api_key != null,
         .key_ok = http_conn.apiKeyAuthorized(headers, raw_path),
         .host_managed = server_state.host_managed,
@@ -3136,7 +3137,7 @@ test "metrics off: /metrics answers its 503 in plain text for a scraper, /metric
     defer t.allocator.free(text);
     try t.expect(std.mem.startsWith(u8, text, "HTTP/1.1 503 Service Unavailable\r\n"));
     const head = text[0 .. std.mem.indexOf(u8, text, "\r\n\r\n") orelse return error.NoHead];
-    try t.expectEqualStrings("text/plain", http_conn.findHeaderValueCI(head, "content-type") orelse "");
+    try t.expectEqualStrings("text/plain", http_head.value(head, "content-type") orelse "");
     try t.expect(std.mem.startsWith(u8, responseBody(text), "metrics not enabled"));
     const json = try http_conn.serveOneForTest("GET /metrics.json HTTP/1.1\r\n\r\n");
     defer t.allocator.free(json);
