@@ -1751,8 +1751,8 @@ pub const Scheduler = struct {
         defer attempt.end();
         const settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
         const cpu_state = model_load.preloadCpuState(self.allocator, self.io, entry.path) catch |err| {
-            attempt.outcome = .{ .failed = @errorName(err) };
-            return error.LoadFailed;
+            attempt.outcome = .{ .failed = err };
+            return ModelRegistry.loadErrorFromName(@errorName(err));
         };
         // Ownership: on success transfers to the entry inside the
         // inference thread's `doLoadOnInferenceThread`; on any error from
@@ -1953,13 +1953,12 @@ pub const Scheduler = struct {
             .pending => unreachable, // `done` comes with an outcome
             .ok => {},
             .shutdown => return error.Shutdown,
-            .failed, .refused => |name| {
+            .failed => |err| {
                 last_load_context_refusal = req.memory_context_refusal;
                 if (req.refusal_text_len > 0) recordLoadRefusal(req.refusal_text[0..req.refusal_text_len]);
-                // The failure crosses the thread boundary by NAME — map it back
-                // to a typed error so a memory-preflight refusal surfaces as a
+                // Mapped to a typed error so a memory-preflight refusal surfaces as a
                 // named 503, not the generic "Model load failed" 500 (#144).
-                return ModelRegistry.loadErrorFromName(name);
+                return ModelRegistry.loadErrorFromName(@errorName(err));
             },
         }
 
@@ -6734,10 +6733,10 @@ fn coldLoadTestScheduler(reg: *ModelRegistry) Scheduler {
     return sch;
 }
 
-/// The inference thread's answer to the next posted load, as `model_load.failLoadRequest` gives it: it fails by `name`.
+/// The inference thread's answer to the next posted load, as `model_load.failLoadRequest` gives it: it fails with `err`.
 const FailNextLoad = struct {
     sch: *Scheduler,
-    name: []const u8,
+    err: anyerror,
     stop: std.atomic.Value(bool) = .init(false),
     fn run(self: *@This()) void {
         const s = self.sch;
@@ -6747,7 +6746,7 @@ const FailNextLoad = struct {
         const req = s.load_queue.orderedRemove(0);
         s.queue_mu.unlock(s.io);
         req.done_mu.lockUncancelable(s.io);
-        req.outcome = model_registry_mod.LoadAttempt.Outcome.ofLoadError(self.name);
+        req.outcome = .{ .failed = self.err };
         req.done = true;
         req.done_cond.broadcast(s.io);
         req.done_mu.unlock(s.io);
@@ -6789,7 +6788,7 @@ test "a setting saved after a cold load read its settings and before it claims t
         var sch = coldLoadTestScheduler(reg);
         defer sch.load_queue.deinit(testing.allocator);
 
-        var infer = FailNextLoad{ .sch = &sch, .name = "FileNotFound" };
+        var infer = FailNextLoad{ .sch = &sch, .err = error.FileNotFound };
         const it = try std.Thread.spawn(.{}, FailNextLoad.run, .{&infer});
         defer it.join();
         defer infer.end();
@@ -6902,4 +6901,28 @@ test "an explicit load of a failed model refused at its claim keeps the stored f
     try testing.expectEqual(model_registry_mod.LoadState.error_state, target.state);
     try testing.expectEqualStrings("Exl3ShardStampMismatch", target.error_name.?);
     try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
+}
+
+test "a cold load whose files read runs out of memory is not stored, as a load's OutOfMemory is not" {
+    const io = testing.io;
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    const target = try reg.registerStub("b", dir, 10);
+    var sch = coldLoadTestScheduler(reg);
+    defer sch.load_queue.deinit(testing.allocator);
+    // Every allocation of the files read fails, as under memory pressure.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    sch.allocator = failing.allocator();
+    const got = sch.ensureLoaded("b");
+    sch.allocator = testing.allocator;
+    try testing.expectError(error.InsufficientMemory, got);
+    try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
 }

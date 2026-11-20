@@ -590,26 +590,25 @@ pub const LoadAttempt = struct {
         /// Ended before the inference thread took it.
         pending,
         ok,
-        /// A failure of the pack or its files, stored until something ends it. An `@errorName`: static, no allocation.
-        failed: []const u8,
-        /// A refusal a setting or the memory limit decides (`refusals`): not stored.
-        refused: []const u8,
+        /// The load or its files read ended with this error. The error itself, never a name: whether it is stored or a
+        /// refusal is `isRefusal`'s answer alone, so no site can class it by hand.
+        failed: anyerror,
         /// A shutdown ended it before the inference thread took it.
         shutdown,
 
-        /// How a load the inference thread ran ended with the error `name`.
-        pub fn ofLoadError(name: []const u8) Outcome {
-            for (refusals) |n| if (std.mem.eql(u8, n, name)) return .{ .refused = name };
-            return .{ .failed = name };
-        }
-
         pub fn errorName(self: Outcome) ?[]const u8 {
             return switch (self) {
-                .failed, .refused => |name| name,
+                .failed => |err| @errorName(err),
                 .pending, .ok, .shutdown => null,
             };
         }
     };
+
+    /// A refusal a setting or the memory limit decides (`refusals`): not stored, so the next load re-reads the settings.
+    pub fn isRefusal(err: anyerror) bool {
+        for (refusals) |n| if (std.mem.eql(u8, n, @errorName(err))) return true;
+        return false;
+    }
 
     /// Claims the entry, the caller holding `mutex`. An explicit retry's stored failure ends here, in the hold that
     /// claims, never before a refusal at the claim.
@@ -630,13 +629,12 @@ pub const LoadAttempt = struct {
                 for (self.victims) |v| if (v.state == .evicting) reg.unmarkEvictingLocked(v);
                 if (self.claimed and entry.state == .loading) reg.markUnloadedLocked(entry);
             },
-            .refused => if (self.claimed) reg.markUnloadedLocked(entry),
             // Unclaimed, the failure is of the files read before the claim: stored only on an entry no other request
             // has claimed or loaded since.
-            .failed => |name| if (entry.settings_gen != self.settings_gen) {
+            .failed => |err| if (isRefusal(err) or entry.settings_gen != self.settings_gen) {
                 if (self.claimed) reg.markUnloadedLocked(entry);
             } else if (self.claimed or entry.state == .unloaded or entry.state == .error_state) {
-                reg.markErrorLocked(entry, name);
+                reg.markErrorLocked(entry, @errorName(err));
             },
         }
         if (self.claimed and !self.kept) reg.releaseRefLocked(entry);
@@ -2210,12 +2208,12 @@ test "ModelRegistry: a refused load is unloaded, any other failure is stored, an
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
     const stub = try reg.registerStub("m", "/path/to/m", 1024);
-    for (refusals ++ [_][]const u8{ "FileNotFound", "LoadFailed", "Exl3ShardStampMismatch" }) |name| {
+    inline for (refusals ++ [_][]const u8{ "FileNotFound", "LoadFailed", "Exl3ShardStampMismatch" }) |name| {
         var attempt = reg.beginAttempt(stub);
         reg.mutex.lockUncancelable(reg.io);
         attempt.claimLocked();
         reg.mutex.unlock(reg.io);
-        attempt.outcome = LoadAttempt.Outcome.ofLoadError(name);
+        attempt.outcome = .{ .failed = @field(anyerror, name) };
         attempt.end();
         const refused = for (refusals) |r| {
             if (std.mem.eql(u8, r, name)) break true;
@@ -2264,7 +2262,7 @@ test "ModelRegistry: a setting that reaches loading saved while the model loads 
             attempt.claimLocked();
             reg.mutex.unlock(reg.io);
             if (saved) if (e == one) reg.forgetLoadFailure(e) else reg.forgetLoadFailures();
-            attempt.outcome = .{ .failed = "FileNotFound" };
+            attempt.outcome = .{ .failed = error.FileNotFound };
             attempt.end();
             try expectError(if (saved) error.NotLoaded else error.LoadFailed, reg.ensureLoaded(e.id));
             try testing.expectEqual(@as(u32, 0), e.refcount.load(.acquire));

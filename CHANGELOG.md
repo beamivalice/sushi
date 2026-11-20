@@ -156,6 +156,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **Stopping the server during an unload answers the requests waiting on that model**: a request sent while an unload
   waited for its model's last stream never got an answer once a shutdown came, and the server exited with an error
   after 35 s without its cleanup; it now gets the shutdown error at once.
+- **A model whose files could not be read for lack of memory is not marked failed**: every later request failed fast
+  with a 500 until a setting was saved or the model loaded explicitly; it now answers the memory refusal and the next
+  request reads the files again.
 - **A request for a model other than the last one loaded is admitted on its own model's cache**: it was credited with
   the other model's prompt cache, admitted on memory its prefill could not free, and refused late without first
   unloading idle models.

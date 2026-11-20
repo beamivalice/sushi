@@ -2892,7 +2892,7 @@ fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror, had_error:
     log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
     // The load's own MLX error is reported here; latched, it would fail the next request.
     mlx.dropLatchedErrorUnless(had_error);
-    finishLoadRequest(sch, req, model_registry_mod.LoadAttempt.Outcome.ofLoadError(@errorName(err)));
+    finishLoadRequest(sch, req, .{ .failed = err });
 }
 
 /// The requester's `LoadAttempt` stores the outcome: this only hands it over.
@@ -3166,7 +3166,7 @@ test "a failed cold load drops the MLX error it latched and keeps one latched be
     mlx.dropLatchedErrorUnless(false);
 }
 
-test "a cold load refused for memory or a setting answers refused, any other failure answers failed with its name" {
+test "a failed cold load hands its error over as it is, a refusal for memory or a setting and any other failure alike" {
     try mlx.requireGpu();
     mlx.installErrorHandler();
     var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
@@ -3179,10 +3179,10 @@ test "a cold load refused for memory or a setting answers refused, any other fai
 
     for ([_]anyerror{ error.InsufficientMemory, error.OutOfMemory, error.SsdBudgetBelowResident, error.ExpertCacheDoesNotFit }) |memory| {
         failLoadRequest(&sch, &req, memory, false);
-        try testing.expectEqualStrings(@errorName(memory), req.outcome.refused);
+        try testing.expectEqual(memory, req.outcome.failed);
     }
     failLoadRequest(&sch, &req, error.LoadFailed, false);
-    try testing.expectEqualStrings("LoadFailed", req.outcome.failed);
+    try testing.expectEqual(error.LoadFailed, req.outcome.failed);
 }
 
 // ── Prefix-cache attach ──
