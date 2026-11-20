@@ -421,6 +421,21 @@ printf '%s\n' 'fn contextNow(c: *const C) u32 {' '    const active = gpu_mem.act
 printf '%s\n' 'pub fn activeBytes() usize {' '    return 0;' '}' 'fn floor() usize {' '    return activeBytes();' '}' > "$TMP/t/src/gpu_mem.zig"
 expect_green "a reading through promisedActive, a test, and gpu_mem's own"
 
+# rule ceiling-raw-read
+tree
+printf '%s\n' 'fn headroom(c: *const C) u64 {' '    return gpu_mem.getGpuWorkingSetLimit() - c.active;' '}' > "$TMP/t/src/p.zig"
+expect_red "a headroom off the raw working set" "src/p.zig:2:20 \[ceiling-raw-read\] headroom: getGpuWorkingSetLimit read raw"
+
+tree
+printf '%s\n' 'fn warn() void {' '    log(launch_state.wiredMarginBytes());' '}' > "$TMP/t/src/p.zig"
+expect_red "a text off the raw margin" "src/p.zig:2:22 \[ceiling-raw-read\] warn: wiredMarginBytes read raw"
+
+tree
+printf '%s\n' 'fn parse(v: u64) void {' '    server_state.wired_margin_flag_bytes = v;' '}' 'test "t" {' '    _ = gpu_mem.getGpuWorkingSetLimit();' '}' > "$TMP/t/src/p.zig"
+printf '%s\n' 'fn declaredWiredLimit() ?u64 {' '    return wiredLimitBytes();' '}' 'fn ceilingNow() C {' '    return .{ .declared = declaredWiredLimit(), .margin = launch_state.wiredMarginBytes() };' '}' > "$TMP/t/src/bills.zig"
+printf '%s\n' 'pub fn getGpuWorkingSetLimit() u64 {' '    return mlx.maxRecommendedWorkingSet();' '}' > "$TMP/t/src/gpu_mem.zig"
+expect_green "a margin write, a test, the Ceiling's own readers and gpu_mem's"
+
 # rule response-store-field
 tree
 printf '%s\n' 'fn take(store: *S, id: []const u8) void {' '    _ = store.by_id.fetchRemove(id);' '}' > "$TMP/t/src/p.zig"

@@ -676,8 +676,7 @@ pub fn ramDefaultFor(io: std.Io, allocator: std.mem.Allocator, config: *const Mo
     const limits = bills.defaultBudgetLimits();
     const unbound = ramDefaultBudget(tier, resident_need, beside, limits, plan);
     if (!at_load) return unbound;
-    // A streamed load's preflight reads free RAM under the working set alone.
-    var reader = PreflightReader{ .io = io, .config = config, .sushi = false };
+    var reader = PreflightReader{ .io = io, .config = config };
     _ = bills.settleAvailableBytes(reader.read(), plan.needAt(unbound.bytes) orelse 0, &reader);
     return ramDefaultAtLoad(tier, resident_need, beside, limits, plan, reader.readings);
 }
@@ -687,15 +686,13 @@ pub fn ramDefaultFor(io: std.Io, allocator: std.mem.Allocator, config: *const Mo
 const PreflightReader = struct {
     io: std.Io,
     config: *const ModelConfig,
-    /// A Sushi resident load's bound (`FitReadings.preflightAvailable`).
-    sushi: bool,
     /// The readings last taken, which a refusal and the budgets it names are priced on, and their bounds.
     readings: bills.FitReadings = .{},
     last: ?bills.SushiAvailable = null,
 
     pub fn read(r: *PreflightReader) ?u64 {
         const readings = bills.FitReadings.now();
-        const got = readings.preflightAvailable(r.sushi);
+        const got = readings.preflightAvailable();
         // An unread figure keeps the last one read, which the wait returns and a refusal is priced on.
         if (got.bytes == null and r.last != null) return null;
         r.readings = readings;
@@ -936,7 +933,7 @@ pub fn LoadPlannerOf(comptime Plan: type) type {
             const r = p.readings;
             if (bills.expertCacheRefusal(&at.config, at.resident, r) != null) return std.math.maxInt(u64);
             const weights = at.resident +| p.plan.beside;
-            const avail = r.preflightAvailable(model_mod.usesSushiQuantMemoryBill(&at.config)).bytes;
+            const avail = r.preflightAvailable().bytes;
             if (bills.memInsufficientForLoad(weights, avail, loadRequirementBytes(&at.config, weights, p.plan.mtp_on, 0))) return std.math.maxInt(u64);
             return 0;
         }
@@ -2130,7 +2127,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // its memory" case. Bypass with --skip-mem-preflight.
     if (!scheduler_mod.skipMemPreflight()) {
         const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
-        var reader = PreflightReader{ .io = sch.io, .config = params.config, .sushi = model_mod.usesSushiQuantMemoryBill(params.config) };
+        var reader = PreflightReader{ .io = sch.io, .config = params.config };
         var avail_bytes = reader.read();
         const mtp_on = mtpChoiceFor(params.mtp, params.config).on;
         // Its maximum context is read only by a refusal, which an unread figure never makes.
@@ -2156,8 +2153,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (gave_up.len > 0) log.info("[preflight] {s}\n", .{gave_up});
         }
         var avail_buf: [192]u8 = undefined;
-        const wired_mb = reader.readings.wired_limit >> 20;
-        const avail_line = bills.sushiAvailableLine(&avail_buf, reader.last.?, if (reader.sushi and reader.readings.wired_floor != null) wired_mb else 0);
+        const wired_mb = (reader.readings.ceiling.declared orelse 0) >> 20;
+        const avail_line = bills.sushiAvailableLine(&avail_buf, reader.last.?, wired_mb);
         var line_buf: [384]u8 = undefined;
         log.info("[preflight] {s}\n", .{bills.preflightLine(&line_buf, params.config, weights_bytes, needed, avail_line)});
         // Every bound that was read refuses here, an exhausted one (read as 0) included.
@@ -2166,9 +2163,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var refusal = bills.LoadMemoryRefusal{
                 .needed = needed,
                 .avail = reader.last.?,
-                .wired_limit_mb = if (reader.sushi and reader.readings.wired_floor != null) wired_mb else 0,
-                .wired_beside = (if (reader.sushi) reader.readings.active else 0) +| reader.readings.unplanned,
-                .total_ram = reader.readings.total_ram,
+                .wired_limit_mb = wired_mb,
+                .wired_beside = reader.readings.active +| reader.readings.ceiling.unplanned,
+                .total_ram = reader.readings.ceiling.total_ram,
                 .smaller_pack = smallerPackOf(params.model_dir),
             };
             if (serving) |b| {

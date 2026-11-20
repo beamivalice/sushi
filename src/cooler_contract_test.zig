@@ -5735,7 +5735,7 @@ fn lentHeldOff(dir: []const u8, cooler: bool) !void {
                 .admission = bills.admissionAvailableNow(c),
                 .beside = bills.admissionAvailableNow(q),
                 .forward = bills.prefillHeadroomNow(c, 0),
-                .load = bills.FitReadings.now().preflightAvailable(true).bytes orelse 0,
+                .load = bills.FitReadings.now().preflightAvailable().bytes orelse 0,
                 .own = @import("dsv41/dsv41_bill.zig").dsv41Headroom(c).bound(),
             };
         }

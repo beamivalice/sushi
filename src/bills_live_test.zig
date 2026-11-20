@@ -675,6 +675,8 @@ fn readsDeclaredFloor(cfg: *const model_mod.ModelConfig, machine: Machine, floor
     const active: u64 = live_gpu.activeBytes() + live_gpu.lentBytes();
     errdefer std.debug.print("{s} at iogpu.wired_limit_mb={?d}: headroom {d} MB, the floor less active {d} MB\n", .{ cfg.model_type, machine.wired_mb, bills.headroomNow(cfg, 0).live >> 20, (floor -| active) >> 20 });
     try testing.expectEqual(bills.liveHeadroomFrom(cfg, floor, active, 0, live_gpu.engineFree()), bills.headroomNow(cfg, 0).live);
+    // The load preflight reads the same Ceiling, whichever engine loads the model.
+    try testing.expect(bills.FitReadings.now().preflightAvailable().bytes.? <= floor -| active);
 }
 
 test "owner ruling: a declared iogpu.wired_limit_mb is the ceiling of every load, GLM and MiMo resident on MLX and DeepSeek resident included, at any size" {
@@ -691,4 +693,133 @@ test "owner ruling: a declared iogpu.wired_limit_mb is the ceiling of every load
     // 2 GB reclaimable; the default 1 GiB margin.
     const machine: Machine = .{ .total = 128 << 30, .wired_mb = 90_000, .margin = 1 << 30, .avail = 2_000 * MiB, .gpu_floor = 0 };
     for ([_]*const model_mod.ModelConfig{ &glm, &mimo, &dsv }) |cfg| try readsDeclaredFloor(cfg, machine, 88_976 * MiB);
+}
+
+// engine-memory-admission "One bills.Ceiling per reading, the same for every load and arch" + "Under a declared
+// iogpu.wired_limit_mb the ceiling IS the limit less --wired-margin-gib, however much RAM is free": a load's preflight
+// is a reader of that Ceiling, so on a quiet box it reads no more than the floor, whichever engine loads the model.
+test "under a declared wired limit every load's preflight reads at most the Ceiling's floor, an MLX load's included" {
+    const MiB: u64 = 1 << 20;
+    // The working set tracks the sysctl (`[mem] ceiling 26976 MB from iogpu.wired_limit_mb=28000 (working set 28000 MB`):
+    // declare the limit this box's Metal reports, 40 GB of RAM free (a quiet box), the default 1 GiB margin.
+    const ws = live_gpu.getGpuWorkingSetLimit();
+    const was = (Machine{ .total = 64 << 30, .wired_mb = ws / MiB, .margin = 1 << 30, .avail = 40 << 30, .gpu_floor = 0 }).pin();
+    defer _ = was.pin();
+    const r = bills.FitReadings.now();
+    const floor = r.ceiling.floor().?;
+    const got = r.preflightAvailable().bytes.?;
+    errdefer std.debug.print("preflight: limit {d} MiB, floor {d} MiB, active {d} MiB; preflight {d} MiB\n", .{ ws / MiB, floor / MiB, r.active / MiB, got / MiB });
+    try testing.expect(got <= floor);
+}
+
+// defaultBudgetLimits' doc: "the residency limit ... and the lower user-wire sysctl, each less what stays unplanned under
+// it"; engine-memory-admission: "The ssd budget is admitted against ... a declared iogpu.wired_limit_mb's floor (less the
+// unplanned margin) ...; never the raw declared limit". The RAM default's room is the Ceiling's floor at most.
+test "a default ssd budget's limits plan against the Ceiling's floor: the GPU floor's margin and a limit past RAM" {
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const model_load = @import("model_load.zig");
+    const NoPreflight = struct {
+        pub fn needAt(_: @This(), _: u64) ?u64 {
+            return null;
+        }
+    };
+    const cases = [_]Machine{
+        // This box: 28,000 MiB declared, default 1 GiB flag, a 3 GiB GPU floor (other apps' Metal): unplanned 3.5 GiB.
+        .{ .total = 32 * GiB, .wired_mb = 28_000, .margin = GiB, .avail = 20 * GiB, .gpu_floor = 3 * GiB },
+        // A limit declared past the RAM: the floor clamps at the RAM.
+        .{ .total = 32 * GiB, .wired_mb = 40_000, .margin = GiB, .avail = 20 * GiB, .gpu_floor = 0 },
+    };
+    var bad: usize = 0;
+    for (cases) |m| {
+        const was = m.pin();
+        defer _ = was.pin();
+        const c = bills.ceilingNow();
+        const floor = c.floor().?;
+        const limits = bills.defaultBudgetLimits();
+        const d = model_load.ramDefaultBudget(.gb96, 0, 0, limits, NoPreflight{});
+        const by_ceiling = limits.ceiling -| limits.margin;
+        if (by_ceiling > floor or d.bytes > floor) {
+            bad += 1;
+            std.debug.print("budget: limit {d} MiB, RAM {d} MiB, flag margin {d} MiB, unplanned {d} MiB: floor {d} MiB, but the default's limits plan {d} MiB ({s} {d} MiB less margin {d} MiB) and the default is {d} MiB\n", .{ m.wired_mb.?, m.total.? / MiB, c.margin / MiB, c.unplanned / MiB, floor / MiB, by_ceiling / MiB, limits.ceiling_name, limits.ceiling / MiB, limits.margin / MiB, d.bytes / MiB });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+// The commit's contract ("a margin at or past the declared limit refused at boot by name") and the brief's definition of
+// the margin (the max of --wired-margin-gib and the GPU floor + 512 MB, `wiredUnplannedBytes`): a Ceiling whose floor is
+// 0 is one the launch refuses, and one the launch admits has a floor above 0.
+test "a Ceiling the unplanned margin leaves no floor is refused at boot, whatever made the margin" {
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const cases = [_]Machine{
+        // The flag alone past the limit: refused (the commit's case).
+        .{ .total = 32 * GiB, .wired_mb = 28_000, .margin = 28 * GiB, .avail = 20 * GiB, .gpu_floor = 0 },
+        // A lowered limit (any value declares, owner ruling) under the GPU floor + 512 MB, the flag at its default.
+        .{ .total = 32 * GiB, .wired_mb = 2_048, .margin = GiB, .avail = 20 * GiB, .gpu_floor = 1_600 * MiB },
+        // A limit declared past the RAM, the flag at the RAM: under the limit, past what the floor clamps to.
+        .{ .total = 32 * GiB, .wired_mb = 40_000, .margin = 32 * GiB, .avail = 20 * GiB, .gpu_floor = 0 },
+    };
+    var bad: usize = 0;
+    for (cases) |m| {
+        const was = m.pin();
+        defer _ = was.pin();
+        const c = bills.ceilingNow();
+        var buf: [192]u8 = undefined;
+        // As main.zig and `sushi kld` call it.
+        const refused = bills.wiredMarginRefusal(&buf, c) != null;
+        const runtime = c.runtime(0, 20 * GiB);
+        if ((c.floor().? == 0) != refused) {
+            bad += 1;
+            std.debug.print("boot: limit {d} MiB, RAM {d} MiB, flag {d} MiB, unplanned {d} MiB: floor {d} MiB, runtime ceiling {d} MiB, refused at boot: {}\n", .{ m.wired_mb.?, m.total.? / MiB, c.margin / MiB, c.unplanned / MiB, c.floor().? / MiB, runtime / MiB, refused });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+// h20-1: one FitReadings reading takes one margin, its floor and its unplanned term on the same value, while a write of
+// the margin races it.
+test "a margin written while a load reads takes one margin per reading" {
+    const t = std.testing;
+    // The saved margin moves under no launch flag.
+    const was = (Machine{ .total = 128 << 30, .wired_mb = 120_000, .margin = null, .avail = 20 << 30, .gpu_floor = 0 }).pin();
+    defer _ = was.pin();
+    defer launch_state.setWiredMarginFile(null);
+    var stop = std.atomic.Value(bool).init(false);
+    const Saver = struct {
+        fn run(s: *std.atomic.Value(bool)) void {
+            var g: u32 = 1;
+            while (!s.load(.monotonic)) {
+                launch_state.setWiredMarginFile(g);
+                g = if (g == 1) 16 else 1;
+            }
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Saver.run, .{&stop});
+    var torn: usize = 0;
+    var i: usize = 0;
+    while (i < 200_000) : (i += 1) {
+        const r = bills.FitReadings.now();
+        const c = r.ceiling;
+        if (c.unplanned != bills.wiredUnplannedBytes(c.margin, c.gpu_floor) or c.floor().? != bills.wiredLimitFloor(c.declared, c.total_ram, bills.wiredUnplannedBytes(c.margin, c.gpu_floor)).?) torn += 1;
+    }
+    stop.store(true, .monotonic);
+    th.join();
+        try t.expectEqual(@as(usize, 0), torn);
+}
+
+// The same reader beside a model already loaded (pure readings, as the bills tests build them): a 128 GB Mac at
+// iogpu.wired_limit_mb=120000, 60 GiB of a first model active, 60 GiB of RAM free. The declared ceiling leaves the second
+// load its floor less the active buffers (engine-memory-admission's owner rule: "the lesser of the limit's floor, less
+// --wired-margin-gib or the GPU floor and the resident buffers, and the free RAM").
+test "beside a loaded model an MLX load's preflight reads at most the declared floor less the active buffers" {
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const limit: u64 = 120_000 * MiB;
+    const floor = bills.wiredLimitFloor(limit, 128 * GiB, GiB).?;
+    const r = bills.FitReadings{ .ceiling = .{ .declared = limit, .working_set = limit, .total_ram = 128 * GiB, .margin = GiB, .unplanned = GiB }, .active = 60 * GiB, .free = 60 * GiB };
+    const got = r.preflightAvailable().bytes.?;
+    errdefer std.debug.print("beside: floor {d} MiB less active {d} MiB = {d} MiB; preflight {d} MiB\n", .{ floor / MiB, r.active / MiB, (floor - r.active) / MiB, got / MiB });
+    try testing.expect(got <= floor - r.active);
 }

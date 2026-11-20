@@ -52,6 +52,7 @@ const rules = .{
     @import("request_bool_read.zig"),
     @import("in_place_buffer.zig"),
     @import("cache_room.zig"),
+    @import("ceiling_raw_read.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

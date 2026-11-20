@@ -15,6 +15,10 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 | Low | 2 / 5 | 4 / 4 | 3 / 9 | 3 / 4 | 12 / 22 |
 | Total | 15 / 28 | 8 / 8 | 11 / 24 | 3 / 5 | 37 / 65 |
 
+- **Every model's load checks its memory against the declared GPU limit less its margin and what is already loaded**:
+  GLM, DeepSeek and any pack loaded through MLX read the whole limit with no margin and none of a loaded model's
+  memory, so a second load could pass and end the server at its warm; a default `--ssd-budget-gb` now leaves the same
+  margin, and a GPU limit the margin leaves nothing of is refused at launch.
 - **A declared `iogpu.wired_limit_mb` is the ceiling at any size, for every model**: a limit lowered under macOS's
   default (75% of RAM) was read as none, so requests went back to free RAM, and a `--prefix-cache-mem` could plan the
   margin away; a `--wired-margin-gib` at or past the limit is now refused at launch instead of lifting it.

@@ -287,11 +287,14 @@ pub fn wiredLimitFloor(wired_limit: ?u64, total_ram: u64, margin: u64) ?u64 {
     return (if (total_ram > 0) @min(limit, total_ram) else limit) -| margin;
 }
 
-/// The refusal of a `--wired-margin-gib` at or past the declared limit, which would leave no ceiling; null when it fits.
-pub fn wiredMarginRefusal(buf: []u8, wired_limit: ?u64, margin: u64) ?[]const u8 {
-    const limit = wired_limit orelse return null;
-    if (margin < limit) return null;
-    return std.fmt.bufPrint(buf, "--wired-margin-gib {d} is at or past iogpu.wired_limit_mb={d}: it would leave the GPU no memory; lower it or raise the limit", .{ margin >> 30, limit >> 20 }) catch "--wired-margin-gib is at or past iogpu.wired_limit_mb";
+/// The refusal of a declared ceiling the unplanned bytes leave nothing of (`--wired-margin-gib`, or the GPU memory
+/// other processes hold, at or past the limit or the RAM); null when it has room.
+pub fn wiredMarginRefusal(buf: []u8, c: Ceiling) ?[]const u8 {
+    const declared = c.declared orelse return null;
+    if (c.floor().? > 0) return null;
+    return std.fmt.bufPrint(buf, "iogpu.wired_limit_mb={d} leaves the GPU no memory: {s} keeps {d} MB unplanned under it (--wired-margin-gib {d} GiB, GPU memory other processes hold {d} MB), at or past the limit or the {d} MB of RAM; lower the margin or raise the limit", .{
+        declared >> 20, c.unplannedName(), c.unplanned >> 20, c.margin >> 30, c.gpu_floor >> 20, c.total_ram >> 20,
+    }) catch "the unplanned margin is at or past iogpu.wired_limit_mb";
 }
 
 pub fn parseWiredMarginGib(raw: []const u8) error{InvalidWiredMargin}!u64 {
@@ -304,12 +307,6 @@ pub fn parseSsdBudgetGb(raw: []const u8) error{InvalidSsdBudgetGb}!u64 {
     const gb = std.fmt.parseInt(u64, raw, 10) catch return error.InvalidSsdBudgetGb;
     if (gb == 0 or gb > 512) return error.InvalidSsdBudgetGb;
     return std.math.mul(u64, gb, 1 << 30) catch return error.InvalidSsdBudgetGb;
-}
-
-/// PURE: the residency limit the SSD budget is admitted against — `iogpu.wired_limit_mb`
-/// when the owner declared one, else Metal's recommended working set.
-pub fn ssdBudgetCeiling(wired_limit: ?u64, working_set: u64) u64 {
-    return wired_limit orelse working_set;
 }
 
 pub fn ssdBudgetAdmits(budget_bytes: u64, kv_bytes: u64, limit: u64) bool {
@@ -414,8 +411,8 @@ var wired_limit_bytes_cached: u64 = 0;
 var wired_limit_read: bool = false;
 
 /// `iogpu.wired_limit_mb` in bytes, read ONCE per process: re-reading it per admission would
-/// let the ceiling move under a live request. 0 when the OID is absent.
-pub fn wiredLimitBytes() u64 {
+/// let the ceiling move under a live request. 0 when the OID is absent. Read through `ceilingNow`.
+fn wiredLimitBytes() u64 {
     if (wired_limit_mb_override) |mb| return mb *| (1024 * 1024);
     if (wired_limit_read) return wired_limit_bytes_cached;
     var v: u32 = 0;
@@ -428,27 +425,41 @@ pub fn wiredLimitBytes() u64 {
     return wired_limit_bytes_cached;
 }
 
-/// `iogpu.wired_limit_mb` as declared, in bytes; null when it is unset (the sysctl reads 0).
-pub fn declaredWiredLimit() ?u64 {
+/// `iogpu.wired_limit_mb` as declared, in bytes; null when it is unset (the sysctl reads 0). Read through `ceilingNow`.
+fn declaredWiredLimit() ?u64 {
     const bytes = wiredLimitBytes();
     return if (bytes > 0) bytes else null;
 }
 
 /// The GPU ceiling of every load, one value per reading (#110).
+/// The only public source of the declared limit, the margin and the working set: their raw readers are private to it.
 pub const Ceiling = struct {
-    /// `declaredWiredLimit`.
-    declared: ?u64,
-    total_ram: u64,
-    /// `--wired-margin-gib`, read once for the whole value, and what stays unplanned under a declared limit
-    /// (`wiredUnplannedBytes` of it).
-    margin: u64,
-    unplanned: u64,
+    /// `iogpu.wired_limit_mb` as declared; null when it is unset.
+    declared: ?u64 = null,
+    total_ram: u64 = 0,
+    /// `--wired-margin-gib`, read once for the whole value.
+    margin: u64 = 0,
+    /// The GPU memory other processes held at startup (`gpu_floor_bytes`).
+    gpu_floor: u64 = 0,
+    /// What stays unplanned under a declared limit (`wiredUnplannedBytes` of the margin and the GPU floor).
+    unplanned: u64 = 0,
     /// Metal's recommended working set.
-    working_set: u64,
+    working_set: u64 = 0,
+
+    /// The declared limit, at most the RAM; null when none is declared.
+    pub fn limit(c: Ceiling) ?u64 {
+        const d = c.declared orelse return null;
+        return if (c.total_ram > 0) @min(d, c.total_ram) else d;
+    }
 
     /// The plan's ceiling under a declared limit (`wiredLimitFloor`); null when none is declared.
     pub fn floor(c: Ceiling) ?u64 {
         return wiredLimitFloor(c.declared, c.total_ram, c.unplanned);
+    }
+
+    /// What sets the unplanned bytes, for a text that names it.
+    pub fn unplannedName(c: Ceiling) []const u8 {
+        return if (c.unplanned > c.margin) "the GPU memory other processes hold, plus 512 MB," else "--wired-margin-gib";
     }
 
     /// What a live check reads: a declared limit's floor, else the working set capped at MLX's `footprint` plus the
@@ -467,11 +478,13 @@ pub const Ceiling = struct {
 /// The ceiling at this reading; the first reading under a declared limit logs it.
 pub fn ceilingNow() Ceiling {
     const margin = launch_state.wiredMarginBytes();
+    const gpu_floor = gpu_floor_bytes.load(.monotonic);
     const c: Ceiling = .{
         .declared = declaredWiredLimit(),
         .total_ram = metrics.getTotalMemBytes(),
         .margin = margin,
-        .unplanned = wiredUnplannedBytes(margin, gpu_floor_bytes.load(.monotonic)),
+        .gpu_floor = gpu_floor,
+        .unplanned = wiredUnplannedBytes(margin, gpu_floor),
         .working_set = staticGpuMemoryCeiling(),
     };
     if (c.floor()) |f| if (wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
@@ -480,7 +493,7 @@ pub fn ceilingNow() Ceiling {
             c.declared.? >> 20,
             c.working_set >> 20,
             c.margin >> 20,
-            gpu_floor_bytes.load(.monotonic) >> 20,
+            c.gpu_floor >> 20,
             c.unplanned >> 20,
         });
     };
@@ -570,7 +583,8 @@ pub fn warnUserWireLimit() void {
     if (user_wire_warned.cmpxchgStrong(false, true, .monotonic, .monotonic) != null) return;
     var buf: [384]u8 = undefined;
     const limits = [2]u64{ readSysctlU64("vm.global_user_wire_limit"), readSysctlU64("vm.user_wire_limit") };
-    if (userWireWarning(&buf, model_mod.ownedBytesTotal(), limits, wiredLimitBytes(), metrics.getTotalMemBytes())) |line|
+    const c = ceilingNow();
+    if (userWireWarning(&buf, model_mod.ownedBytesTotal(), limits, c.declared orelse 0, c.total_ram)) |line|
         log.warn("{s}\n", .{line});
 }
 
@@ -580,11 +594,12 @@ pub fn defaultBudgetLimits() model_load.BudgetLimits {
     const wire = [2]u64{ readSysctlU64("vm.global_user_wire_limit"), readSysctlU64("vm.user_wire_limit") };
     const wire_bind: usize = if (wire[0] == 0 or (wire[1] != 0 and wire[1] < wire[0])) 1 else 0;
     const c = ceilingNow();
+    // Under a declared limit the ceiling less its margin is the Ceiling's floor.
     return .{
         .wired_limit = c.declared orelse 0,
-        .ceiling = ssdBudgetCeiling(c.declared, c.working_set),
+        .ceiling = c.limit() orelse c.working_set,
         .ceiling_name = if (c.declared != null) "iogpu.wired_limit_mb" else "the GPU working-set limit",
-        .margin = c.margin,
+        .margin = if (c.declared != null) c.unplanned else c.margin,
         .user_wire = wire[wire_bind],
         .user_wire_name = if (wire_bind == 0) "vm.global_user_wire_limit" else "vm.user_wire_limit",
         .user_wire_margin = USER_WIRE_MARGIN_BYTES,
@@ -632,7 +647,7 @@ pub fn mlxCacheLimitBytes(total_ram: u64) u64 {
 /// Tests only: stand in for the machine's working-set limit (CI runners have 7 GB).
 pub var static_ceiling_override: ?u64 = null;
 
-pub fn staticGpuMemoryCeiling() u64 {
+fn staticGpuMemoryCeiling() u64 {
     return static_ceiling_override orelse gpu_mem.getGpuWorkingSetLimit();
 }
 
@@ -685,48 +700,32 @@ pub fn expertStreamingBesideBudgetBytes(config: *const model_mod.ModelConfig) u6
 
 /// What the streamed load's fit checks read, once, so a refusal and the budget it names price the same figures.
 pub const FitReadings = struct {
-    /// `iogpu.wired_limit_mb` in bytes, 0 when undeclared.
-    wired_limit: u64 = 0,
-    /// Metal's recommended working set, which the ssd budget is admitted against without a declared limit.
-    budget_working_set: u64 = 0,
-    /// The working set and the declared limit's floor (null = none) the load's ceiling is made of.
-    working_set: u64 = 0,
-    wired_floor: ?u64 = null,
+    /// The one Ceiling every check of this reading reads.
+    ceiling: Ceiling = .{},
     /// MLX's active buffers, and its pool beside them.
     active: u64 = 0,
     cache: u64 = 0,
     free: u64 = 0,
     /// The per-process headroom (iOS's jetsam limit; 0 elsewhere), which the preflight trusts over `free`.
     proc_free: u64 = 0,
-    total_ram: u64 = 0,
-    /// What stays unplanned under a declared limit (`wiredUnplannedBytes`): a raised limit holds it beside the load.
-    unplanned: u64 = 0,
 
     pub fn now() FitReadings {
         // The lent decoder pools are in use for a load (`promisedActive`), and not the free RAM their pages show as.
         const lent = gpu_mem.lentBytes();
         const active: u64 = promisedActive(gpu_mem.activeBytes());
-        // One reading of the ceiling, so every check of a load reads one margin.
-        const c = ceilingNow();
         return .{
-            .wired_limit = c.declared orelse 0,
-            .budget_working_set = c.working_set,
-            .working_set = gpu_mem.getGpuWorkingSetLimit(),
-            .wired_floor = c.floor(),
+            .ceiling = ceilingNow(),
             .active = active,
             .cache = gpu_mem.cacheBytes(),
             .free = metrics.getAvailableMemBytes() -| lent,
             .proc_free = metrics.getProcAvailableMemBytes() -| lent,
-            .total_ram = c.total_ram,
-            .unplanned = c.unplanned,
         };
     }
 
-    /// What the load preflight compares its need with: a Sushi load's least bound less the active buffers, under the
-    /// declared floor; an MLX load's free RAM under the working set alone.
-    pub fn preflightAvailable(r: FitReadings, sushi: bool) SushiAvailable {
-        if (!sushi) return sushiAvailable(r.free, r.proc_free, r.working_set, 0, null);
-        return sushiAvailable(r.free, r.proc_free, r.working_set, r.active, r.wired_floor);
+    /// What every load's preflight compares its need with, whichever engine loads it: the least of the free RAM, the
+    /// working set and the declared floor, each GPU bound less the active buffers.
+    pub fn preflightAvailable(r: FitReadings) SushiAvailable {
+        return sushiAvailable(r.free, r.proc_free, r.ceiling.working_set, r.active, r.ceiling.floor());
     }
 };
 
@@ -741,34 +740,36 @@ pub const ExpertCacheRefusal = struct {
 /// cache, workspace and serving state do not fit the ceiling beside what is loaded; null when it fits.
 pub fn expertCacheRefusal(config: *const model_mod.ModelConfig, resident_bytes: u64, r: FitReadings) ?ExpertCacheRefusal {
     if (!config.expert_streaming) return null;
+    const c = r.ceiling;
+    const declared = c.floor() != null;
     const budget = config.expert_ssd_budget_bytes;
     if (budget > 0) {
         const beside = expertStreamingBesideBudgetBytes(config);
         // The ceiling the preflight and admission read: a declared limit's floor, else Metal's working set.
-        const limit = r.wired_floor orelse r.budget_working_set;
+        const limit = c.planning();
         if (!ssdBudgetAdmits(budget, beside, limit)) return .{ .err = error.SsdBudgetExceedsWiredLimit, .refusal = .{
             .needed = budget +| beside,
-            .avail = .{ .bytes = limit, .free = null, .gpu = if (r.wired_floor != null) null else limit, .declared = if (r.wired_floor != null) limit else null },
-            .wired_limit_mb = if (r.wired_floor != null) r.wired_limit >> 20 else 0,
+            .avail = .{ .bytes = limit, .free = null, .gpu = if (declared) null else limit, .declared = if (declared) limit else null },
+            .wired_limit_mb = (c.declared orelse 0) >> 20,
             // The budget is admitted against the limit as a whole, less what stays unplanned under it.
-            .wired_beside = r.unplanned,
-            .total_ram = r.total_ram,
+            .wired_beside = c.unplanned,
+            .total_ram = c.total_ram,
             .check = .budget,
         }, .readings = r };
     }
-    const ceiling = gpuCeilingWithWiredFloor(r.working_set, r.active +| r.cache, r.free, r.wired_floor);
+    const ceiling = c.runtime(r.active +| r.cache, r.free);
     if (expertStreamingConfigFits(config, ceiling, r.active, resident_bytes)) return null;
     const room = ceiling -| r.active;
-    const avail: SushiAvailable = if (r.wired_floor != null)
+    const avail: SushiAvailable = if (declared)
         .{ .bytes = room, .free = null, .declared = room }
     else
-        .{ .bytes = room, .free = r.cache +| r.free, .gpu = r.working_set -| r.active };
+        .{ .bytes = room, .free = r.cache +| r.free, .gpu = c.working_set -| r.active };
     return .{ .err = error.ExpertCacheDoesNotFit, .refusal = .{
         .needed = expertStreamingFitNeed(config, 0, resident_bytes),
         .avail = avail,
-        .wired_limit_mb = if (r.wired_floor != null) r.wired_limit >> 20 else 0,
-        .wired_beside = r.active +| r.unplanned,
-        .total_ram = r.total_ram,
+        .wired_limit_mb = (c.declared orelse 0) >> 20,
+        .wired_beside = r.active +| c.unplanned,
+        .total_ram = c.total_ram,
         .check = .fit,
     }, .readings = r };
 }
@@ -1330,7 +1331,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
                 active_mem >> 20,
                 cache_mem >> 20,
                 metrics.getAvailableMemBytes() >> 20,
-                gpu_mem.getGpuWorkingSetLimit() >> 20,
+                ceilingNow().working_set >> 20,
             });
         }
         // Say when the ctx bar is the binding one.
@@ -3727,8 +3728,8 @@ test "ssd budget parses GiB and admits against the wired limit" {
     try t.expectError(error.InvalidSsdBudgetGb, parseSsdBudgetGb("513"));
     try t.expectError(error.InvalidSsdBudgetGb, parseSsdBudgetGb("100.5"));
     // The sysctl is the limit when it is set; otherwise Metal's recommended working set.
-    try t.expectEqual(120 * GiB, ssdBudgetCeiling(120 * GiB, 96 * GiB));
-    try t.expectEqual(96 * GiB, ssdBudgetCeiling(null, 96 * GiB));
+    try t.expectEqual(120 * GiB, (Ceiling{ .declared = 120 * GiB, .working_set = 96 * GiB }).planning());
+    try t.expectEqual(96 * GiB, (Ceiling{ .working_set = 96 * GiB }).planning());
     try t.expect(ssdBudgetAdmits(80 * GiB, 8 * GiB, 96 * GiB));
     try t.expect(!ssdBudgetAdmits(100 * GiB, 8 * GiB, 96 * GiB));
     try t.expectEqual(@as(u64, 110_592), wiredLimitMbForBudget(100 * GiB, 8 * GiB));
@@ -6642,8 +6643,8 @@ test "bill pin: the machine-limit arithmetic" {
     got.add(wiredLimitFloor(120_000 * mb, 128 * pin_gib, pin_gib));
     got.add(wiredLimitFloor(90 * pin_gib, 128 * pin_gib, pin_gib));
     got.add(wiredLimitFloor(null, 128 * pin_gib, pin_gib));
-    got.add(ssdBudgetCeiling(null, 100 * pin_gib));
-    got.add(ssdBudgetCeiling(110 * pin_gib, 100 * pin_gib));
+    got.add((Ceiling{ .working_set = 100 * pin_gib }).planning());
+    got.add((Ceiling{ .declared = 110 * pin_gib, .working_set = 100 * pin_gib }).planning());
     got.add(ssdBudgetAdmits(80 * pin_gib, 10 * pin_gib, 100 * pin_gib));
     got.add(ssdBudgetAdmits(95 * pin_gib, 10 * pin_gib, 100 * pin_gib));
     got.add(wiredLimitMbForBudget(80 * pin_gib, 10 * pin_gib));
@@ -6908,6 +6909,11 @@ pub fn rerankCoarseBill(split: model_mod.ResidentSplit, config: *const model_mod
 /// below free RAM, and weights past it OOM in warmup instead of refusing by name. Null when neither was read.
 pub fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) ?u64 {
     return sushiAvailable(host_avail, proc_avail, gpu_limit, 0, null).bytes;
+}
+
+/// What a load's preflight compares its need with now: one reading of the Ceiling (`FitReadings.preflightAvailable`).
+pub fn preflightAvailableNow() ?u64 {
+    return FitReadings.now().preflightAvailable().bytes;
 }
 
 /// The preflight's wait for a just-exited process's memory polls this often.
@@ -7190,6 +7196,7 @@ fn writeLoadMemoryRefusal(w: *std.Io.Writer, r: LoadMemoryRefusal) std.Io.Writer
             if (r.check == .budget) try w.print(" for SSD streaming and the context it plans", .{});
             try w.print(", and the GPU memory limit (", .{});
             if (r.wired_limit_mb > 0) try w.print("iogpu.wired_limit_mb = {d} MB", .{r.wired_limit_mb}) else try w.print("macOS's default", .{});
+            if (r.total_ram > 0 and r.wired_limit_mb << 20 > r.total_ram) try w.print(", capped at the {f} of RAM", .{Mem.have(r.total_ram, u)});
             if (r.check != .budget)
                 try w.print(") leaves {f} beside what is already loaded", .{Mem.have(a.bytes.?, u)})
             else if (r.wired_limit_mb > 0)
@@ -8019,7 +8026,7 @@ test "a streamed load whose ssd budget passes the GPU limit is refused in the lo
     cfg.expert_ssd_budget_bytes = 150 * gib;
     var buf: [2048]u8 = undefined;
     // A 128 GB Mac at macOS's default limit: no raise can hold 150 GB.
-    const small = expertCacheRefusal(&cfg, 0, .{ .budget_working_set = 96 * gib, .total_ram = 128 * gib }).?;
+    const small = expertCacheRefusal(&cfg, 0, .{ .ceiling = .{ .working_set = 96 * gib, .total_ram = 128 * gib } }).?;
     try testing.expectEqual(error.SsdBudgetExceedsWiredLimit, small.err);
     const text = loadMemoryRefusalText(&buf, small.refusal);
     errdefer std.debug.print("{s}\n", .{text});
@@ -8030,7 +8037,7 @@ test "a streamed load whose ssd budget passes the GPU limit is refused in the lo
     try testing.expect(std.mem.indexOf(u8, text, "--skip-mem-preflight") == null);
     // A 256 GB Mac can raise its limit to hold it.
     // Its declared limit's floor is the limit less what stays unplanned under it, which the raise holds too.
-    const big = expertCacheRefusal(&cfg, 0, .{ .budget_working_set = 192 * gib, .wired_limit = 141 * gib, .wired_floor = 140 * gib, .total_ram = 256 * gib, .unplanned = gib }).?;
+    const big = expertCacheRefusal(&cfg, 0, .{ .ceiling = .{ .working_set = 192 * gib, .declared = 141 * gib, .total_ram = 256 * gib, .margin = gib, .unplanned = gib } }).?;
     const raised = loadMemoryRefusalText(&buf, big.refusal);
     try testing.expect(std.mem.indexOf(u8, raised, "the GPU memory limit (iogpu.wired_limit_mb = 144384 MB) leaves 140.0 GB once 1.0 GB stays unplanned under it: about 10.0 GB short.") != null);
     try testing.expect(std.mem.indexOf(u8, raised, "sudo sysctl iogpu.wired_limit_mb=154700 ") != null);
@@ -8042,7 +8049,7 @@ test "a streamed load whose expert cache does not fit its ceiling is refused wit
     cfg.expert_cache_bytes = gib;
     var buf: [2048]u8 = undefined;
     // 2 GiB loaded under a 3 GiB working set leaves 1 GiB; the load needs its 1 GiB cache and 0.5 GiB resident beside the rest.
-    const readings = FitReadings{ .working_set = 3 * gib, .active = 2 * gib, .free = 10 * gib, .total_ram = 64 * gib, .unplanned = gib };
+    const readings = FitReadings{ .ceiling = .{ .working_set = 3 * gib, .total_ram = 64 * gib, .margin = gib, .unplanned = gib }, .active = 2 * gib, .free = 10 * gib };
     const r = expertCacheRefusal(&cfg, gib / 2, readings).?;
     try testing.expectEqual(error.ExpertCacheDoesNotFit, r.err);
     try testing.expectEqual(expertStreamingFitNeed(&cfg, 0, gib / 2), r.refusal.needed);
@@ -8055,11 +8062,10 @@ test "a streamed load whose expert cache does not fit its ceiling is refused wit
     try testing.expect(std.mem.indexOf(u8, text, "--skip-mem-preflight") == null);
     // Under a declared limit the ceiling is its floor, and the refusal names that limit.
     var floored = readings;
-    floored.wired_floor = 64 << 20;
-    floored.wired_limit = 2048 << 20;
+    floored.ceiling.declared = 2048 << 20;
     const f = expertCacheRefusal(&cfg, gib / 2, floored).?;
     try testing.expect(std.mem.indexOf(u8, loadMemoryRefusalText(&buf, f.refusal), "the GPU memory limit (iogpu.wired_limit_mb = 2048 MB) leaves 0.0 GB beside what is already loaded") != null);
-    try testing.expect(expertCacheRefusal(&cfg, gib / 2, .{ .working_set = 64 * gib, .free = 64 * gib }) == null);
+    try testing.expect(expertCacheRefusal(&cfg, gib / 2, .{ .ceiling = .{ .working_set = 64 * gib }, .free = 64 * gib }) == null);
 }
 
 test "a request a non-Sushi bill refuses shows its need above what is available and names the max_tokens that fits" {
@@ -8167,12 +8173,21 @@ test "a streamed load's preflight line names its expert cache as its own term" {
     try testing.expectEqualStrings("weights 5.0 GB, warmup and context 15.0 GB: needs 20.0 GB (bound by free RAM, 30.0 GB)", preflightLine(&buf, &resident, 5 * gib, 20 * gib, "bound by free RAM, 30.0 GB"));
 }
 
+test "a refusal under a limit declared past the RAM names the cap, so the limit it states is what it leaves plus what stays unplanned" {
+    const gib: u64 = 1 << 30;
+    var buf: [2048]u8 = undefined;
+    // A 32 GB Mac at iogpu.wired_limit_mb 40000: the limit binds at the RAM, its floor 31 GiB under the 1 GiB margin.
+    const text = loadMemoryRefusalText(&buf, .{ .needed = 40 * gib, .avail = .{ .bytes = 31 * gib, .free = null, .declared = 31 * gib }, .wired_limit_mb = 40000, .wired_beside = gib, .total_ram = 32 * gib, .check = .budget });
+    errdefer std.debug.print("{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "(iogpu.wired_limit_mb = 40000 MB, capped at the 32.0 GB of RAM) leaves 31.0 GB once 1.0 GB stays unplanned under it") != null);
+}
+
 test "the ssd budget is admitted against the ceiling the preflight and admission read: a declared limit's floor" {
     const gib: u64 = 1 << 30;
     const mib: u64 = 1 << 20;
     var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true };
     // M1's 32 GB Mac: iogpu.wired_limit_mb 28000, its floor 26976 MB under the 1 GiB margin, the ceiling it logs.
-    const m1 = FitReadings{ .wired_limit = 28000 * mib, .wired_floor = 26976 * mib, .budget_working_set = 21 * gib, .working_set = 21 * gib, .total_ram = 32 * gib };
+    const m1 = FitReadings{ .ceiling = .{ .declared = 28000 * mib, .working_set = 21 * gib, .total_ram = 32 * gib, .margin = gib, .unplanned = gib } };
     cfg.expert_ssd_budget_bytes = 27 * gib;
     const r = expertCacheRefusal(&cfg, 0, m1) orelse return error.TestExpectedRefusal;
     try testing.expectEqual(error.SsdBudgetExceedsWiredLimit, r.err);
@@ -8309,8 +8324,9 @@ test "a --wired-margin-gib at or past the declared limit never gives back the wh
         prev = ceiling;
         // One at or past the limit leaves none, and the launch refuses it by name.
         var buf: [192]u8 = undefined;
-        try t.expectEqual(margin >= limit, wiredMarginRefusal(&buf, limit, margin) != null);
+        const c: Ceiling = .{ .declared = limit, .total_ram = ram, .margin = margin, .unplanned = margin, .working_set = limit };
+        try t.expectEqual(margin >= limit, wiredMarginRefusal(&buf, c) != null);
     }
     var buf: [192]u8 = undefined;
-    try t.expect(wiredMarginRefusal(&buf, null, 32 * GiB) == null);
+    try t.expect(wiredMarginRefusal(&buf, .{ .declared = null, .total_ram = ram, .margin = 32 * GiB, .unplanned = 32 * GiB, .working_set = limit }) == null);
 }

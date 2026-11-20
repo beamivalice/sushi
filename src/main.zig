@@ -762,7 +762,7 @@ fn runCli(init: std.process.Init) !void {
         std.process.exit(1);
     };
     var margin_buf: [192]u8 = undefined;
-    if (bills_mod.wiredMarginRefusal(&margin_buf, bills_mod.declaredWiredLimit(), server_state.wiredMarginBytes())) |why| {
+    if (bills_mod.wiredMarginRefusal(&margin_buf, bills_mod.ceilingNow())) |why| {
         log.err("{s}\n", .{why});
         std.process.exit(1);
     }

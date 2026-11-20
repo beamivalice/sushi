@@ -59,8 +59,14 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
     if (chunk == 0) {
         const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
         const floor = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
-        log.warn("[warm] no prefill chunk fits beside the load: the narrowest ({d} rows) needs {d} MB, the headroom is {d} MB (under the ceiling the {d} GiB safety margin sets); a lower --ssd-budget-gb leaves room\n", .{
-            floor, bills.warmChunkPeakBytes(c, bits, floor) >> 20, headroom >> 20, bills.launch_state.wiredMarginBytes() >> 30,
+        const ceil = bills.ceilingNow();
+        var under_buf: [160]u8 = undefined;
+        const under = if (ceil.declared) |d|
+            std.fmt.bufPrint(&under_buf, "iogpu.wired_limit_mb={d} less the {d} MB {s} keeps unplanned", .{ d >> 20, ceil.unplanned >> 20, ceil.unplannedName() }) catch "the declared limit"
+        else
+            "the GPU working set";
+        log.warn("[warm] no prefill chunk fits beside the load: the narrowest ({d} rows) needs {d} MB, the headroom is {d} MB (under {s}); a lower --ssd-budget-gb leaves room\n", .{
+            floor, bills.warmChunkPeakBytes(c, bits, floor) >> 20, headroom >> 20, under,
         });
         return error.WarmChunkDoesNotFit;
     }

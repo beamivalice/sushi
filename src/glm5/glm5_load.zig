@@ -4,7 +4,6 @@ const std = @import("std");
 const mlx = @import("../mlx.zig");
 const bills = @import("../bills.zig");
 const log = @import("../log.zig");
-const status = @import("../status.zig");
 const scheduler_mod = @import("../scheduler.zig");
 const trunk_mod = @import("../trunk.zig");
 const dflash_mod = @import("../dflash.zig");
@@ -81,7 +80,7 @@ pub fn prepareDrafter(io: std.Io, allocator: std.mem.Allocator, config: *const M
         const bf16_bytes = try diagnostic.assistantResidentBytes(io, allocator, prepared.path);
         bytes = resident_bytes.? -| cached_bytes +| bf16_bytes;
         if (!scheduler_mod.skipMemPreflight()) {
-            const available = bills.effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+            const available = bills.preflightAvailableNow();
             const needed = model_load.loadRequirementBytes(config, bytes.?, false, 0);
             log.info("[preflight] BF16 DFlash2 fallback: weights ~{d:.2} GiB, needs ~{d:.2} GiB, available {?d} MiB\n", .{ @as(f64, @floatFromInt(bytes.?)) / (1 << 30), @as(f64, @floatFromInt(needed)) / (1 << 30), if (available) |b| b >> 20 else null });
             if (bills.memInsufficientForLoad(bytes.?, available, needed)) return error.InsufficientMemory;

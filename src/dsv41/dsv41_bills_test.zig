@@ -449,15 +449,14 @@ test "DeepSeek: the iogpu.wired_limit_mb a refused ssd budget names admits that 
     for ([_]u64{ 1, 4 }) |margin_gib| for ([_]u64{ 0, 100_000, 110_000 }) |wired_mb| {
         const unplanned = margin_gib * GiB;
         const floor = bills.wiredLimitFloor(if (wired_mb > 0) wired_mb * MiB else null, ram, unplanned);
-        const r = bills.FitReadings{ .wired_limit = wired_mb * MiB, .wired_floor = floor, .budget_working_set = 96 * GiB, .working_set = 96 * GiB, .free = ram, .total_ram = ram, .unplanned = unplanned };
-        const limit = floor orelse r.budget_working_set;
+        const r = bills.FitReadings{ .ceiling = .{ .declared = if (wired_mb > 0) wired_mb * MiB else null, .working_set = 96 * GiB, .total_ram = ram, .margin = unplanned, .unplanned = unplanned }, .free = ram };
+        const limit = floor orelse r.ceiling.working_set;
         config.expert_ssd_budget_bytes = (limit -| bills.expertStreamingBesideBudgetBytes(&config)) / GiB * GiB + GiB;
         const refused = bills.expertCacheRefusal(&config, 0, r) orelse return error.TestExpectedRefusal;
         try t.expectEqual(error.SsdBudgetExceedsWiredLimit, refused.err);
         const mb = refused.refusal.wiredLimitThatFits() orelse return error.TestExpectedWiredLimit;
         var raised = r;
-        raised.wired_limit = mb * MiB;
-        raised.wired_floor = bills.wiredLimitFloor(mb * MiB, ram, unplanned);
+        raised.ceiling.declared = mb * MiB;
         if (bills.expertCacheRefusal(&config, 0, raised)) |again| {
             var buf: [2048]u8 = undefined;
             std.debug.print("margin {d} GiB, iogpu.wired_limit_mb {d}, --ssd-budget-gb {d}: the refusal names {d}, under which the same check refuses again:\n{s}\n", .{ margin_gib, wired_mb, config.expert_ssd_budget_bytes / GiB, mb, bills.loadMemoryRefusalText(&buf, again.refusal) });
@@ -664,7 +663,7 @@ test "DeepSeek: the RAM default a load takes passes every check the load runs on
     const wired: u64 = 125_000 << 20;
     const limits = model_load.BudgetLimits{ .wired_limit = wired, .ceiling = wired, .ceiling_name = "iogpu.wired_limit_mb", .margin = GiB, .user_wire = 0, .user_wire_name = "", .user_wire_margin = GiB };
     // A 128 GB Mac at iogpu.wired_limit_mb 125000 with plenty of RAM free, and another model holding 20 GiB on the GPU.
-    const readings = bills.FitReadings{ .wired_limit = wired, .wired_floor = bills.wiredLimitFloor(wired, ram, GiB), .budget_working_set = wired, .working_set = wired, .active = 20 * GiB, .free = 118 * GiB, .total_ram = ram, .unplanned = GiB };
+    const readings = bills.FitReadings{ .ceiling = .{ .declared = wired, .working_set = wired, .total_ram = ram, .margin = GiB, .unplanned = GiB }, .active = 20 * GiB, .free = 118 * GiB };
     const d = model_load.ramDefaultAtLoad(.gb128, 0, 5_000_000_000, limits, plan, readings);
     // It steps down from 108 rather than leave the load to refuse it.
     try t.expect(d.bytes > 0 and d.bytes < 108 * GiB);
@@ -675,7 +674,7 @@ test "DeepSeek: the RAM default a load takes passes every check the load runs on
         std.debug.print("the RAM default {d} GiB is refused at the load:\n{s}\n", .{ d.bytes >> 30, bills.loadMemoryRefusalText(&buf, refused.refusal) });
         return error.TestUnexpectedResult;
     }
-    try t.expect(!bills.memInsufficientForLoad(at.resident, readings.preflightAvailable(false).bytes, plan.needAt(d.bytes).?));
+    try t.expect(!bills.memInsufficientForLoad(at.resident, readings.preflightAvailable().bytes, plan.needAt(d.bytes).?));
     // With nothing else on the GPU the same Mac keeps 108.
     var idle = readings;
     idle.active = 0;

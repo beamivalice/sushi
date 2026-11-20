@@ -691,7 +691,7 @@ pub fn handleGet(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
         .ask_bytes = server.diskAsk().bytes,
         .think = effort_mod.think_effort_flag,
         .total_ram = status_mod.getTotalMemBytes(),
-        .wired_in_use = bills.wiredLimitBytes(),
+        .wired_in_use = bills.ceilingNow().declared orelse 0,
         .wire_now = bills.wireLimitsNow(),
     });
     defer allocator.free(body);

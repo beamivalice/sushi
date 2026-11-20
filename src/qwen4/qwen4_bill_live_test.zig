@@ -527,7 +527,7 @@ test "Flash-Next streamed: the ssd budget a refused budget names is admitted und
     model_load.applyModelSettings(&config, .{});
     const gib: u64 = 1 << 30;
     // A 32 GB Mac with iogpu.wired_limit_mb 28000: its floor under the 1 GiB margin is the ceiling every check reads.
-    const readings = bills.FitReadings{ .wired_limit = 28000 << 20, .wired_floor = 26976 << 20, .budget_working_set = 21 * gib, .working_set = 21 * gib, .free = 20 * gib, .total_ram = 32 * gib };
+    const readings = bills.FitReadings{ .ceiling = .{ .declared = 28000 << 20, .working_set = 21 * gib, .total_ram = 32 * gib, .margin = gib, .unplanned = gib }, .free = 20 * gib };
     const asked: u64 = 30 * gib;
     var planned = config;
     model_load.applyStreamingPlan(&planned, try model_load.planExpertStreamingWith(t.io, a, &config, dir, asked, false, 0), asked);
@@ -571,13 +571,13 @@ test "Flash-Next streamed: the ssd budget a fit refusal names passes the preflig
     const resident = plan.split.trunk +| plan.split.mtp +| plan.split.vision;
     // A 32 GB Mac at iogpu.wired_limit_mb 28000 (floor 26976 MB under the 1 GiB margin), its free RAM below the floor.
     for ([_]u64{ 6, 8 }) |free_gib| {
-        const readings = bills.FitReadings{ .wired_limit = 28000 << 20, .wired_floor = 26976 << 20, .budget_working_set = 28000 << 20, .working_set = 28000 << 20, .free = free_gib * gib, .total_ram = 32 * gib, .unplanned = gib };
+        const readings = bills.FitReadings{ .ceiling = .{ .declared = 28000 << 20, .working_set = 28000 << 20, .total_ram = 32 * gib, .margin = gib, .unplanned = gib }, .free = free_gib * gib };
         _ = bills.expertCacheRefusal(&planned, resident, readings) orelse return error.TestExpectedRefusal;
         const plan_at = model_load.BudgetPlanner{ .io = t.io, .allocator = a, .config = &config, .model_dir = dir, .vision = false, .assistant = 0, .beside = 0, .mtp_on = false };
         const fits = bills.streamedBudgetThatFits(asked, 0, model_load.LoadPlanner{ .plan = plan_at, .readings = readings });
         try t.expect(fits > 0);
         const need = plan_at.needAt(fits << 30).?;
-        const avail = readings.preflightAvailable(true).bytes.?;
+        const avail = readings.preflightAvailable().bytes.?;
         errdefer std.debug.print("free {d} GiB: the fit refusal names --ssd-budget-gb {d}, whose preflight needs {d} MB of {d} MB\n", .{ free_gib, fits, need >> 20, avail >> 20 });
         try t.expect(need <= avail);
     }
@@ -601,7 +601,7 @@ test "Flash-Next: the ssd budget a resident or streamed preflight refusal names 
     for ([_]u32{ 0, 262_144 }) |ctx| for ([_]u64{ 0, 28000 }) |wired_mb| for ([_]u64{ 4, 8, 12, 16 }) |free_gib| {
         launch_state.server_config.max_context_size = @min(ctx, config.contextCap());
         const ws: u64 = if (wired_mb > 0) wired_mb * mib else 21 * gib;
-        const readings = bills.FitReadings{ .wired_limit = wired_mb * mib, .wired_floor = bills.wiredLimitFloor(wired_mb * mib, 32 * gib, gib), .budget_working_set = ws, .working_set = ws, .free = free_gib * gib, .total_ram = 32 * gib, .unplanned = gib };
+        const readings = bills.FitReadings{ .ceiling = .{ .declared = if (wired_mb > 0) wired_mb * mib else null, .working_set = ws, .total_ram = 32 * gib, .margin = gib, .unplanned = gib }, .free = free_gib * gib };
         const fits = bills.streamedBudgetThatFits(512 << 30, 0, model_load.LoadPlanner{ .plan = plan_at, .readings = readings });
         if (fits == 0) continue;
         named += 1;
@@ -611,7 +611,7 @@ test "Flash-Next: the ssd budget a resident or streamed preflight refusal names 
             std.debug.print("--ctx-size {d}, wired {d} MB, free {d} GiB: the named --ssd-budget-gb {d} is refused by the fit check:\n{s}\n", .{ ctx, wired_mb, free_gib, fits, bills.loadMemoryRefusalText(&buf, refused.refusal) });
             return error.TestUnexpectedResult;
         }
-        try t.expect(plan_at.needAt(fits << 30).? <= readings.preflightAvailable(true).bytes.?);
+        try t.expect(plan_at.needAt(fits << 30).? <= readings.preflightAvailable().bytes.?);
     };
     try t.expect(named > 0);
 }
@@ -635,7 +635,7 @@ test "Flash-Next streamed: the 32 GB recipe's verdicts at --ssd-budget-gb 17 and
     // A 32 GB M1 at iogpu.wired_limit_mb 28000 (floor 26976 MB under the 1 GiB margin): about 21 GB free, then free RAM
     // 200 MB over and under the cut's need.
     for ([_]u64{ 21 * gib, 7_744_608_602 + 200 * mib, 7_744_608_602 - 200 * mib }) |free| {
-        const readings = bills.FitReadings{ .wired_limit = 28000 * mib, .wired_floor = 26976 * mib, .budget_working_set = 28000 * mib, .working_set = 28000 * mib, .free = free, .total_ram = 32 * gib, .unplanned = gib };
+        const readings = bills.FitReadings{ .ceiling = .{ .declared = 28000 * mib, .working_set = 28000 * mib, .total_ram = 32 * gib, .margin = gib, .unplanned = gib }, .free = free };
         const planner = model_load.LoadPlanner{ .plan = plan_at, .readings = readings };
         for ([_]u64{ 17, 18 }) |budget| got.add(planner.needAt(budget * gib).? == 0);
         got.add(bills.streamedBudgetThatFits(512 * gib, 0, planner));

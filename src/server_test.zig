@@ -720,8 +720,7 @@ fn setWiredFloor(floor: u64) !void {
     const limit_mb: u64 = total >> 20;
     bills.wired_limit_mb_override = limit_mb;
     server_state.wired_margin_flag_bytes = (limit_mb << 20) - floor;
-    const unplanned = bills.wiredUnplannedBytes(server_state.wiredMarginBytes(), bills.gpu_floor_bytes.load(.monotonic));
-    if (bills.wiredLimitFloor(bills.wiredLimitBytes(), total, unplanned) == floor) return;
+    if (bills.ceilingNow().floor() == floor) return;
     clearWiredFloor();
     return error.WiredFloorNotDeclared;
 }
