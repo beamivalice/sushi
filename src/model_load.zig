@@ -706,6 +706,9 @@ const PreflightReader = struct {
     pub fn freeRamBinds(r: *PreflightReader) bool {
         return r.last.?.bound() == .free_ram;
     }
+    pub fn shutdownAsked(_: *PreflightReader) bool {
+        return server_state.shutdown_requested.load(.acquire);
+    }
 };
 
 fn ramDefaultChoice(sch: *Scheduler, params: anytype, tier: RamTier, load_vision: bool, assistant_bytes: u64) !SsdBudgetChoice {
@@ -2131,6 +2134,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             });
             const settled = bills.settleAvailableBytes(avail_bytes, needed, &reader);
+            if (settled.end == .shutdown) {
+                log.info("[preflight] a shutdown was asked while waiting for memory; the load is refused\n", .{});
+                return error.Shutdown;
+            }
             avail_bytes = settled.avail;
             priced = preflightServing(params.config, weights_bytes, mtp_on, reader.last.?);
             serving = priced.serving;

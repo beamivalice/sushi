@@ -143,7 +143,8 @@ bill function's output on the committed fixture configs of all served packs: a b
   at `settle_total_ms` (60 s), with one `[preflight] waited …` line naming what it read and for how long; it waits only while
   free RAM is the bound: a reading a GPU limit binds (the working set, a declared wired limit) is refused at once. A read
   that fails during the wait ends it on the last figure read, which still refuses: a short figure is never dropped for an
-  unread one.
+  unread one. A shutdown ends it within one poll (`SettleEnd.shutdown`, asked through the reader) and the load is refused
+  as the shutdown: a wait never holds the inference thread past the connection drain.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
   `iogpu.wired_limit_mb`). The client-facing preflight message also names the Settings switch "Skip the memory check

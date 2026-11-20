@@ -6949,6 +6949,8 @@ pub const SettleEnd = enum {
     limit,
     /// A read failed: the last figure read stands.
     unread,
+    /// A shutdown was asked: the wait ends within a poll and the load is refused as the shutdown.
+    shutdown,
 };
 
 pub const Settled = struct {
@@ -6969,6 +6971,7 @@ pub const Settled = struct {
             .capped => "the wait reached its limit while free memory was still rising",
             .limit => "a GPU limit binds",
             .unread => "a read failed",
+            .shutdown => "a shutdown was asked",
             .enough => unreachable,
         };
         return std.fmt.bufPrint(buf, "waited {d:.1} s while memory was released: {d:.2} GB read of {d:.2} GB needed (began at {d:.2} GB), {s} ({d:.1} s without a rise)", .{
@@ -6985,11 +6988,16 @@ pub const Settled = struct {
 /// A just-exited process returns its Metal memory over seconds, in bursts: while a short reading is still rising, poll
 /// every `settle_poll_ms`; stop at enough, after `settle_stall_ms` without a rise, or after `settle_total_ms`. An unread
 /// figure ends the wait on the last figure read, which still refuses. Only free RAM comes back: a reading a GPU limit
-/// binds (`reader.freeRamBinds()` false) is final. The wait's time is the polls it slept (`reader.sleep(ms)`).
+/// binds (`reader.freeRamBinds()` false) is final. The wait's time is the polls it slept (`reader.sleep(ms)`). A shutdown
+/// (`reader.shutdownAsked()`) ends it at the next poll: a load's wait never holds the server past its drain.
 pub fn settleAvailableBytes(first: ?u64, needed: u64, reader: anytype) Settled {
     var out = Settled{ .avail = first, .end = .enough, .first = first };
     while (out.avail) |now| {
         if (now >= needed) break;
+        if (reader.shutdownAsked()) {
+            out.end = .shutdown;
+            break;
+        }
         if (!reader.freeRamBinds()) {
             out.end = .limit;
             break;
@@ -7477,6 +7485,9 @@ test "the settle wait is bounded on every reading shape, and a figure that was r
         fn freeRamBinds(_: *@This()) bool {
             return true;
         }
+        fn shutdownAsked(_: *@This()) bool {
+            return false;
+        }
     };
     const stall_polls = settle_stall_ms / settle_poll_ms;
     const total_polls = settle_total_ms / settle_poll_ms;
@@ -7528,6 +7539,9 @@ test "load preflight waits for a prior process's memory to come back, and only w
         fn freeRamBinds(f: *@This()) bool {
             return f.free_binds;
         }
+        fn shutdownAsked(_: *@This()) bool {
+            return false;
+        }
     };
     var rising = Fake{ .seq = &.{ 80 * gib, 95 * gib, 110 * gib } };
     const rose = settleAvailableBytes(69 * gib, 100 * gib, &rising);
@@ -7559,6 +7573,42 @@ test "load preflight waits for a prior process's memory to come back, and only w
     try testing.expectEqual(@as(usize, 0), limit.i);
 }
 
+test "load preflight's wait ends within a poll of a shutdown, however the reading keeps rising" {
+    const gib: u64 = 1 << 30;
+    const Fake = struct {
+        reads: u64 = 0,
+        slept_ms: u64 = 0,
+        /// The poll whose read a shutdown request lands on; a request already asked is 0.
+        asked_at: u64,
+        fn read(f: *@This()) u64 {
+            f.reads += 1;
+            return 40 * gib + f.reads * gib / 8;
+        }
+        fn sleep(f: *@This(), ms: u64) void {
+            f.slept_ms += ms;
+        }
+        fn freeRamBinds(_: *@This()) bool {
+            return true;
+        }
+        fn shutdownAsked(f: *@This()) bool {
+            return f.reads >= f.asked_at;
+        }
+    };
+    var mid = Fake{ .asked_at = 3 };
+    const ended = settleAvailableBytes(40 * gib, 100 * gib, &mid);
+    try testing.expectEqual(SettleEnd.shutdown, ended.end);
+    try testing.expectEqual(3 * settle_poll_ms, mid.slept_ms);
+    try testing.expectEqual(@as(?u64, 40 * gib + 3 * gib / 8), ended.avail);
+    // Asked before the wait began: it never sleeps.
+    var first = Fake{ .asked_at = 0 };
+    const none = settleAvailableBytes(40 * gib, 100 * gib, &first);
+    try testing.expectEqual(SettleEnd.shutdown, none.end);
+    try testing.expectEqual(@as(u64, 0), first.slept_ms);
+    // A reading that already reached the need is not a shutdown's to refuse.
+    var enough = Fake{ .asked_at = 0 };
+    try testing.expectEqual(SettleEnd.enough, settleAvailableBytes(120 * gib, 100 * gib, &enough).end);
+}
+
 test "load preflight keeps waiting through the flat stretches of a release that comes back in bursts" {
     const gib: u64 = 1 << 30;
     const Fake = struct {
@@ -7572,6 +7622,9 @@ test "load preflight keeps waiting through the flat stretches of a release that 
         fn sleep(_: *@This(), _: u64) void {}
         fn freeRamBinds(_: *@This()) bool {
             return true;
+        }
+        fn shutdownAsked(_: *@This()) bool {
+            return false;
         }
     };
     // 28 GB read, flat for 8 s (16 polls), a burst to 40, flat for 6 s (12 polls), then the last burst past the 51 GB need.
