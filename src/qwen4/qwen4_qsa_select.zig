@@ -2217,6 +2217,8 @@ test "qsa select: 8-bit digits are the exact top-k" {
 test "qsa score kernel: fused score sheet is bit-identical to the composed chain" {
     try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    // A process whose GLM teacher capture ran has MLX's TF32 off for good: the fused kernel declines there.
+    if (!qsaScoreTf32Enabled()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     qsa_score_fused_override = true;
     defer qsa_score_fused_override = null;
@@ -2360,6 +2362,8 @@ test "qsa score kernel: fused score sheet is bit-identical to the composed chain
 test "qsa score kernel: block ids through qsaSelectTopBlocks are identical on both arms" {
     try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    // A process whose GLM teacher capture ran has MLX's TF32 off for good: the fused kernel declines there.
+    if (!qsaScoreTf32Enabled()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     qsa_score_fused_override = true;
@@ -2589,6 +2593,8 @@ test "qsa score fused: sizing policy" {
 test "qsa score fused: the argpartition decline arm consumes the fused sheet" {
     try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    // A process whose GLM teacher capture ran has MLX's TF32 off for good: the fused kernel declines there.
+    if (!qsaScoreTf32Enabled()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     qsa_score_fused_override = true;
@@ -2670,6 +2676,8 @@ test "qsa score fused: no bank is built under the fused arm" {
 test "qsa score fused: dump hook writes a parseable line" {
     try mlx.requireGpu();
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    // A process whose GLM teacher capture ran has MLX's TF32 off for good: the fused kernel declines there.
+    if (!qsaScoreTf32Enabled()) return error.SkipZigTest;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
