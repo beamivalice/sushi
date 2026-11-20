@@ -2071,6 +2071,31 @@ test "server: h21 a Responses envelope echoing service_tier is valid JSON" {
     }.run);
 }
 
+test "server: a chat object tool_choice naming no function, and a Responses field of the wrong type, are refused by name on every route that reads them" {
+    try eachArch(4, .{}, struct {
+        const Case = struct { path: []const u8, body: []const u8, field: []const u8 };
+        const chat_tail = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
+        const cases = [_]Case{
+            .{ .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"tool_choice\":{\"type\":\"bogus\"}," ++ chat_tail ++ "}", .field = "'tool_choice.type'" },
+            .{ .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"tool_choice\":{\"type\":\"function\"}," ++ chat_tail ++ "}", .field = "'tool_choice.name'" },
+            .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"instructions\":5,\"input\":\"hi\"}", .field = "'instructions'" },
+            .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"truncation\":\"middle\",\"input\":\"hi\"}", .field = "'truncation'" },
+            .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"max_tool_calls\":\"3\",\"input\":\"hi\"}", .field = "'max_tool_calls'" },
+            .{ .path = "/v1/responses/compact", .body = "{\"model\":\"tiny\",\"previous_response_id\":42,\"input\":\"hi\"}", .field = "'previous_response_id'" },
+        };
+        fn run() !void {
+            for (cases) |c| {
+                const resp = try request("POST", c.path, c.body);
+                defer gpa.free(resp);
+                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 400") or std.mem.indexOf(u8, bodyOf(resp), c.field) == null) {
+                    std.debug.print("not refused by name: {s} {s}\n  -> {s}\n", .{ c.path, c.body, resp[0..@min(resp.len, 200)] });
+                    return error.FieldReadAsAbsent;
+                }
+            }
+        }
+    }.run);
+}
+
 test "server: h21 a request field of the wrong type is refused by name, never read as absent" {
     try eachArch(4, .{}, struct {
         const Case = struct { path: []const u8, body: []const u8, field: []const u8 };

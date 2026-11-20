@@ -363,6 +363,12 @@ pub fn handleResponsesCompact(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' is a required field", 400);
         return;
     };
+    var fault_buf: [384]u8 = undefined;
+    if (request_parse.responsesFieldFault(&fault_buf, root)) |reason| {
+        log.warn("POST /v1/responses/compact -> 400 ({s})\n", .{reason});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
 
     // ── instructions (optional) ──
     const instructions: ?[]const u8 = if (root.get("instructions")) |v|

@@ -476,16 +476,19 @@ pub fn responsesToolChoiceFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8
             if (ok) return null;
             return fieldFault(buf, "'tool_choice' must be auto, none, required or a function object; got \"{s}\"", .{s[0..@min(s.len, 32)]});
         },
-        .object => |o| {
-            const t = o.get("type") orelse return "'tool_choice.type' is required: this server calls function tools only, so it is function";
-            if (t != .string or !std.mem.eql(u8, t.string, "function")) return "'tool_choice.type' must be function: this server calls function tools only";
-            const holder = if (o.get("function")) |f| (if (f == .object) f.object else o) else o;
-            const name = holder.get("name") orelse return "'tool_choice.name' is required: the function the model must call";
-            if (name != .string or name.string.len == 0) return "'tool_choice.name' must be the name of a declared function";
-            return null;
-        },
+        .object => |o| return functionChoiceFault(o),
         else => return "'tool_choice' must be auto, none, required or a function object",
     }
+}
+
+/// An object `tool_choice` on chat and Responses: a function to call, named flat or under `function`.
+fn functionChoiceFault(o: std.json.ObjectMap) ?[]const u8 {
+    const t = o.get("type") orelse return "'tool_choice.type' is required: this server calls function tools only, so it is function";
+    if (t != .string or !std.mem.eql(u8, t.string, "function")) return "'tool_choice.type' must be function: this server calls function tools only";
+    const holder = if (o.get("function")) |f| (if (f == .object) f.object else o) else o;
+    const name = holder.get("name") orelse return "'tool_choice.name' is required: the function the model must call";
+    if (name != .string or name.string.len == 0) return "'tool_choice.name' must be the name of a declared function";
+    return null;
 }
 
 /// Anthropic's `tool_choice` (an object typed auto, any, tool or none, `tool` naming a function) and each
@@ -670,9 +673,24 @@ pub fn anthropicFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
     return roleFault(buf, "messages", mv.array.items, &anthropic_roles, false);
 }
 
-/// The first Responses input message whose role is not one a chat request may spell. An item of another `type`
-/// (a call, its output, reasoning) has no role to check.
+/// The Responses fields the turn reads or the envelope echoes, past what `generationFieldFault` checks; null is absent.
+const responses_string_fields = [_][]const u8{ "instructions", "previous_response_id", "safety_identifier", "prompt_cache_key" };
+
+/// The first Responses field of the wrong type (a value is used or refused, never read as absent), then the first
+/// input message whose role is not one a chat request may spell. An item of another `type` (a call, its output,
+/// reasoning) has no role to check.
 pub fn responsesFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
+    for (responses_string_fields) |k| if (root.get(k)) |v| if (v != .null and v != .string) {
+        return fieldFault(buf, "'{s}' must be a string", .{k});
+    };
+    if (root.get("truncation")) |v| if (v != .null) {
+        const ok = v == .string and (std.mem.eql(u8, v.string, "auto") or std.mem.eql(u8, v.string, "disabled"));
+        if (!ok) return "'truncation' must be auto or disabled";
+    };
+    if (root.get("max_tool_calls")) |v| if (v != .null) {
+        const n = wholeNumber(v) orelse return "'max_tool_calls' must be a whole number of 0 or more";
+        if (n < 0 or n > std.math.maxInt(u32)) return "'max_tool_calls' must be a whole number of 0 or more";
+    };
     const iv = root.get("input") orelse return null;
     if (iv != .array) return null;
     return roleFault(buf, "input", iv.array.items, &chat_mod.request_roles, true);
@@ -693,7 +711,8 @@ pub fn chatFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
     };
     if (root.get("tools")) |tv| if (toolsFault(buf, tv, true)) |m| return m;
     if (root.get("tool_choice")) |tc| switch (tc) {
-        .null, .object => {},
+        .null => {},
+        .object => |o| if (functionChoiceFault(o)) |m| return m,
         .string => |s| {
             const ok = std.mem.eql(u8, s, "auto") or std.mem.eql(u8, s, "none") or std.mem.eql(u8, s, "required") or std.mem.eql(u8, s, "any");
             if (!ok) return "'tool_choice' must be auto, none, required or a function object";
@@ -939,6 +958,13 @@ test "chatFieldFault refuses an unknown role, response_format type, malformed to
         .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"my tool/v1.2\"}}]}", .field = "tools[0]" },
         .{ .body = "{\"tool_choice\":\"sometimes\"}", .field = "tool_choice" },
         .{ .body = "{\"tool_choice\":7}", .field = "tool_choice" },
+        // An object tool_choice names a function to call, or it is refused: never read as auto.
+        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":\"a\"}}", .field = null },
+        .{ .body = "{\"tool_choice\":{}}", .field = "tool_choice.type" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"bogus\"}}", .field = "tool_choice.type" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"function\"}}", .field = "tool_choice.name" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"\"}}}", .field = "tool_choice.name" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":7}}}", .field = "tool_choice.name" },
     };
     for (cases) |c| {
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
@@ -952,6 +978,24 @@ test "chatFieldFault refuses an unknown role, response_format type, malformed to
             try testing.expect(std.mem.indexOf(u8, got.?, quoted) != null);
         } else try testing.expectEqual(@as(?[]const u8, null), got);
     }
+}
+
+test "a Responses field the envelope echoes or the turn reads is refused by name when its type is wrong, never read as absent" {
+    const Case = struct { body: []const u8, field: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .body = "{\"instructions\":\"be brief\",\"previous_response_id\":\"resp_1\",\"safety_identifier\":\"u\",\"prompt_cache_key\":\"k\",\"truncation\":\"auto\",\"max_tool_calls\":3}", .field = null },
+        .{ .body = "{\"instructions\":null,\"previous_response_id\":null,\"safety_identifier\":null,\"prompt_cache_key\":null,\"truncation\":\"disabled\",\"max_tool_calls\":null}", .field = null },
+        .{ .body = "{\"instructions\":5}", .field = "instructions" },
+        .{ .body = "{\"previous_response_id\":42}", .field = "previous_response_id" },
+        .{ .body = "{\"safety_identifier\":true}", .field = "safety_identifier" },
+        .{ .body = "{\"prompt_cache_key\":[\"k\"]}", .field = "prompt_cache_key" },
+        .{ .body = "{\"truncation\":\"middle\"}", .field = "truncation" },
+        .{ .body = "{\"truncation\":1}", .field = "truncation" },
+        .{ .body = "{\"max_tool_calls\":\"3\"}", .field = "max_tool_calls" },
+        .{ .body = "{\"max_tool_calls\":-1}", .field = "max_tool_calls" },
+        .{ .body = "{\"max_tool_calls\":2.5}", .field = "max_tool_calls" },
+    };
+    for (cases) |c| try expectFault(responsesFieldFault, c.body, c.field);
 }
 
 test "a Responses input and a /v1/messages body refuse a message role they cannot carry, naming where it sits" {
