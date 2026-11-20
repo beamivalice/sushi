@@ -2778,7 +2778,7 @@ pub fn prefillChunkCost(
     width: u64,
     kv_len: u64,
 ) u64 {
-    return chunkCostLending(config, kv_bits, width, kv_len, borrowableBytes(config));
+    return chunkCostLending(config, kv_bits, width, kv_len, lendableBytes(config));
 }
 
 fn chunkCostLending(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, lent: u64) u64 {
@@ -2837,8 +2837,9 @@ pub fn borrowableBytes(config: *const model_mod.ModelConfig) u64 {
 }
 
 /// What this model's next prefill takes its working set from: the pools it may still release and those already lent out
-/// of it, whose lessee it becomes (`leaseHolderHeadroomNow` counts them free). A request bill nets this out, and the
-/// live reading it is compared with holds the lent pools off (`promisedActive`): each pool is moved once.
+/// of it, whose lessee it becomes (`leaseHolderHeadroomNow` counts them free). A request bill and a chunk's width cost
+/// net this out, and the live reading they are compared with holds the lent pools off (`promisedActive`): each pool is
+/// moved once.
 pub fn lendableBytes(config: *const model_mod.ModelConfig) u64 {
     return borrowableBytes(config) +| @atomicLoad(u64, &config.expert_lent_bytes, .monotonic);
 }

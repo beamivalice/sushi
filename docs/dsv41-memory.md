@@ -399,7 +399,8 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   hold the first's lent pools off like any promise.
   A request's bill nets out what its prefill may take (`bills.lendableBytes`: the pools still to release and the model's
   own lent ones, which its lease takes over), so a lent pool leaves the verdict once, by the hold-off, not again as
-  lendable (the live width, whose headroom already counts its own lent pools free, reads `borrowableBytes`).
+  lendable (the live width's chunk cost nets the same `lendableBytes` against the same held-off headroom, so a
+  prefill's width never steps down for pools admission already priced).
 - **Every exit that leaves a layer lent publishes the change in admission's own reading, on every engine**: a pool is
   measured as it leaves (`gpu_mem.activeBytes`, MLX's and the engine's, less the free buffers admission credits) and
   published on every exit, a release whose workspace and take-back both failed included. The union workspace a resident

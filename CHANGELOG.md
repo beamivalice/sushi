@@ -18,6 +18,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A download whose files are all present is never refused for disk space**, however full the disk already is.
 - **A tool call the model's own end leaves open is no longer sent as a half call, and every reply that declines a call names it**: `finish_details` (`stop_details` on Messages, the response object on Responses) reads `{"type":"tool_call_cut","name":"read_file"}` when a stop sequence, the length limit, a cancel or the model's end cut a call open.
 - **A call left open in MiniCPM5, bare `<function=`, `<invoke>`, `<tool>` and DSML-invoke markup is declined and named like every other dialect**, where it still shipped as a half call; prose that only mentions such markup stays text.
+- **A DeepSeek-V4.1 prefill after a cancelled long prompt keeps the chunk width its request was admitted at**: the pools the
+  cancelled request left lent were held off the width's headroom but not netted from its cost, so the prefill stepped
+  down to a narrower, slower chunk for memory admission had already counted.
 
 ## v1.7.2 — Memory you can count on, faster concurrent Qwen
 

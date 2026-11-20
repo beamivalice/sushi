@@ -1452,6 +1452,65 @@ test "cooler contract: a DeepSeek request admitted while an earlier borrower's p
     try testing.expect(margin_rest - margin_lent < @as(i64, @intCast(lent / 2)));
 }
 
+test "cooler contract: a DeepSeek prefill's chunk width holds where it held before its own pools were left lent: the pools move its verdict once" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const bills = @import("bills.zig");
+    var lease: LentLease = undefined;
+    try lease.open(dir, true);
+    defer lease.close();
+    const engine = lease.engine;
+    const config = &lease.ld.config;
+    // The working set is the ceiling the width reads, whatever wired limit the box declares.
+    const ceil_was = bills.static_ceiling_override;
+    const wired_was = bills.wired_limit_mb_override;
+    defer bills.static_ceiling_override = ceil_was;
+    defer bills.wired_limit_mb_override = wired_was;
+    bills.wired_limit_mb_override = 0;
+    if (engine.layers.len - engine.borrow_from < 3) return error.SkipZigTest;
+    try testing.expect(bills.adaptivePrefillChunkEnabled(config));
+    const last: u16 = @intCast(engine.layers.len - 1);
+    _ = try engine.borrowLayer(last - 2);
+    defer engine.restoreLayer(last - 2) catch {};
+    const chunk: u32 = 2048;
+    const Pick = struct {
+        fn at(c: *const model_mod.ModelConfig, ceiling: u64) u32 {
+            @import("bills.zig").static_ceiling_override = ceiling;
+            var st: @import("mtp_plan.zig").AdaptiveWidthState = .{};
+            return @import("bills.zig").adaptivePrefillWidthNow(c, 8, 0, chunk, chunk, &st, 0);
+        }
+    };
+    // The ceiling at which the width just holds at rest: the pools still to release are what its chunk takes from.
+    var lo: u64 = 0;
+    var hi: u64 = 256 << 30;
+    try testing.expectEqual(chunk, Pick.at(config, hi));
+    try testing.expect(Pick.at(config, lo) < chunk);
+    while (hi - lo > 1 << 10) {
+        const mid = lo + (hi - lo) / 2;
+        if (Pick.at(config, mid) == chunk) hi = mid else lo = mid;
+    }
+    const edge = hi;
+    const borrowable_rest = bills.borrowableBytes(config);
+    var lent = try engine.borrowLayer(last);
+    lent += engine.borrowLayer(last - 1) catch |e| {
+        try engine.restoreLayer(last);
+        return e;
+    };
+    // Lent pools are held off in the reading and netted out of the cost: the ceiling that held the width holds it still.
+    const picked = Pick.at(config, edge + lent / 4);
+    const borrowable_lent = bills.borrowableBytes(config);
+    try engine.restoreLayer(last - 1);
+    try engine.restoreLayer(last);
+    errdefer std.debug.print("lent width: {d} B lent, borrowable {d} -> {d}; the width held at {d} at rest under a {d} B ceiling, with the pools lent under {d} B: {d}\n", .{ lent, borrowable_rest, borrowable_lent, chunk, edge, edge + lent / 4, picked });
+    try testing.expect(lent > 0);
+    try testing.expectEqual(chunk, picked);
+}
+
 /// A request whose prompt reaches `generate` as one token: a full hot-cache match leaves `full_prompt[hot_matched..]`
 /// one token long, and its cache must be bound at the request's end like any other.
 fn oneTokenRequestHeld(comptime Q: type, cooler: bool) !void {
