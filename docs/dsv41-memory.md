@@ -465,4 +465,9 @@ whose experts total 119.6 GB, dropping 8 per layer frees 2.1-2.5 GB and dropping
 - The near-resident arm with DSpark is the streamed path at the largest budget whose 1M bill fits (94% of the expert
   bytes cached). It keeps the 3.70 GB union and reads its misses from SSD; the lossy pick (`--expert-pick-tolerance`)
   swaps those misses on grouped layers.
+- **No load term holds a resident load's wide forward.** The load bills the floor rung's warm; the warm takes the
+  widest rung its live headroom holds; a request bills its forward's cap less the decoder pools it may release
+  (`Engine.borrowableBytes`, the union workspace out), and the borrow releases them before a forward the headroom does
+  not hold. A pack with no pool to lend (not STQ, or no CED split) bills the cap whole. A resident peak far over the
+  preflight's need is that transient taken from free headroom, not an unbilled term.
 - Every arm wires more than `vm.global_user_wire_limit` (116.82 GB); a decode measured at half speed past it once.

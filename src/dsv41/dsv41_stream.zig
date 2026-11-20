@@ -2105,8 +2105,13 @@ test "dsv41 resident: a budget that holds every expert reads them all at load, m
     const loaded = engine.fill_bytes_total;
     try testing.expect(loaded > 0);
 
+    // Until the load names the borrowing layers an engine lends nothing, which is what its borrow and its bill both read.
+    try testing.expectEqual(@as(u64, 0), engine.borrowableBytes());
     const split = resident.m.ced_split.?;
     engine.borrow_from = @intCast(split);
+    var pools: u64 = 0;
+    for (split..resident.m.cfg.layers) |li| pools += engine.poolBytes(@intCast(li));
+    try testing.expectEqual(pools - engine.unionBytes(), engine.borrowableBytes());
     const last: u16 = @intCast(resident.m.cfg.layers - 1);
     var at: usize = 0;
     for ([_]usize{ 20, 9, 1, 1, 3, 1 }, 0..) |n, step| {

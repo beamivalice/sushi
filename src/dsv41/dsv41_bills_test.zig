@@ -3,6 +3,8 @@
 const std = @import("std");
 const bills = @import("../bills.zig");
 const dsv41_bill = @import("dsv41_bill.zig");
+const dsv41_borrow = @import("dsv41_borrow.zig");
+const dsv41_wide_bytes = @import("dsv41_wide_bytes.zig");
 const dsv41_config = @import("dsv41_config.zig");
 const model_load = @import("../model_load.zig");
 const model_mod = @import("../model.zig");
@@ -764,4 +766,76 @@ test "DeepSeek: a request at the advertised context is admitted at the readings 
     };
     try std.testing.expect(tried > 0);
     try std.testing.expectEqual(@as(u32, 0), bad);
+}
+
+/// The STQ-1.75bpw pack served fully resident (dsv41-memory#resident): every expert cached, no union workspace, no
+/// bounce, and the decoder pools a prefill may release less the union workspace its first release makes.
+fn residentPack(lend: bool) !model_mod.ModelConfig {
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .expert_resident = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    config.cooler_for_test = true;
+    config.expert_cache_bytes = 111_400_000_000;
+    config.expert_borrow_bytes = if (lend) dsv41_borrow.plannedBytes(&config.dsv41.?, true, config.expert_cache_bytes) - 3_540_000_000 else 0;
+    return config;
+}
+
+const resident_weights: u64 = 9_000_000_000;
+
+test "DeepSeek: a fully resident load whose ceiling fits it and its floor warm serves every width as a rung, a borrow or a named refusal, never a forward past the headroom" {
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    for ([_]bool{ true, false }) |lend| {
+        const config = try residentPack(lend);
+        const owned = resident_weights + config.expert_cache_bytes;
+        const bits = bills.defaultKvBits(&config);
+        const top = bills.widestServedRung(&config);
+        var narrowed: u32 = 0;
+        var borrowed: u32 = 0;
+        // From the least ceiling the load's fit admits to one that holds the widest forward beside it.
+        var ceiling: u64 = owned;
+        while (ceiling < owned + 24 * (1 << 30)) : (ceiling += 32 * MiB) {
+            if (!bills.expertStreamingConfigFits(&config, ceiling, 0, resident_weights)) continue;
+            // The served warm takes the widest rung its headroom holds, and the fit leaves it one.
+            const head = warmHeadroomAfterLoad(&config, ceiling, 1 << 40, resident_weights);
+            const rung = bills.warmChunkAdmitted(&config, bits, top, head);
+            try t.expect(rung > 0);
+            try t.expect(bills.warmChunkPeakBytes(&config, bits, rung) <= head);
+            if (rung < top) {
+                narrowed += 1;
+                for (bills.PREFILL_CHUNK_LADDER) |wider| {
+                    if (wider > rung and wider <= top) try t.expect(bills.warmChunkPeakBytes(&config, bits, wider) > head);
+                }
+            }
+            // A request at that ceiling is admitted, then every forward of it is covered by the headroom and the pools it
+            // may release, or it is refused at admission with its figures.
+            for ([_]u64{ 4096, 131_072 }) |seq| {
+                if (borrowRefusal(&config, seq, ceiling - owned, 0, 256, 0)) |r| {
+                    std.debug.print("{s} resident, ceiling owned + {d} MiB: a {d}-token prompt admitted has its {d}-row forward ending at {d} refused {d} MB short\n", .{
+                        if (lend) "lending" else "non-lending", (ceiling - owned) / MiB, seq, r.rows, r.end, r.short / MiB,
+                    });
+                    return error.TestUnexpectedResult;
+                }
+                const need = config.dsv41.?.chunkCap(top, seq);
+                if (ceiling - owned < need and bills.prefillNeededAtChunk(&config, seq, 256, bits, top, .{}) <= ceiling - owned) borrowed += 1;
+            }
+        }
+        try t.expect(narrowed > 0);
+        // Pools to lend are what let the widest rung through a ceiling that cannot hold it.
+        try t.expectEqual(lend, borrowed > 0);
+    }
+}
+
+test "DeepSeek: a resident load with no decoder pool to lend bills its widest forward whole" {
+    const t = std.testing;
+    const config = try residentPack(false);
+    const c = &config.dsv41.?;
+    const top = bills.widestServedRung(&config);
+    try t.expectEqual(@as(u64, 0), dsv41_borrow.plannedBytes(c, false, config.expert_cache_bytes));
+    try t.expectEqual(@as(u64, 0), bills.lendableBytes(&config));
+    const seq: u64 = 4096;
+    const wide = c.chunkCap(top, seq) - dsv41_config.BILL_MARGIN_BYTES;
+    try t.expect(wide >= dsv41_wide_bytes.bytes(c, @min(top + dsv41_config.tail_merge_rows, seq), seq));
+    try t.expect(bills.prefillNeededAtChunk(&config, seq, 256, bills.defaultKvBits(&config), top, .{}) >= wide);
 }
