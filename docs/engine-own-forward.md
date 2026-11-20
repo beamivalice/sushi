@@ -674,8 +674,11 @@ rebuilds one.
   DeepSeek's own load, which also decides from it which warm forwards run); `model_load.warmLoad` makes the manifest's
   recipes before the warm and writes it after; a request that compiled a pipeline late writes it again
   (`arch_cooler.endRequest`), so the next load of the pack makes it ahead. A shape only a served request reaches costs
-  its compile once per box, not once per load. A load whose manifest made every pipeline skips the served warm, which
-  exists only to make them (`[warm] served requests skipped`): 14.6 s of the real Qwen pack's load.
+  its compile once per box, not once per load. The served warm exists only to make pipelines, so it ends by recording a
+  `served warm` marker keyed by its shape (widths, KV scheme, drafter, its bill, the pool settings), and a load whose
+  manifest holds the marker of its own shape skips the requests (`[warm] served requests skipped`: 14.6 s of the real Qwen
+  pack's load, DeepSeek's repeat start and every reload in a process alike); the chunk's fit against the live headroom
+  still runs, and a load of another shape or scope warms in full.
 - **Key.** `scope` (16 hex) is, for DeepSeek, the pack (its config.json, its index, the name and size of each shard: not
   their bytes) and what shapes the warm (context, window, YaRN factor, candidate blocks, DSpark, tile order,
   expert-cache and SSD bytes, resident or streamed, dropped experts, and its `recipe_env` variables); for Qwen, the
