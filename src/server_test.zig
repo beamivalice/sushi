@@ -66,6 +66,10 @@ fn startClient() anyerror!std.Thread {
     return std.Thread.spawn(.{}, clientMain, .{});
 }
 
+fn startClientOnReady(_: u16) anyerror!std.Thread {
+    return startClient();
+}
+
 /// `ssd_budget_gb`: what the fixture's load names in its model-settings.json (`cooler_contract.server_ssd_budget_gb`).
 const Arch = struct { name: []const u8, tmp: testing.TmpDir, ssd_budget_gb: ?u32 = null };
 
@@ -77,6 +81,8 @@ const Needs = struct {
     tiny2: bool = false,
     /// How many models the registry keeps resident.
     max_resident: u32 = 2,
+    /// Serve on a real listener (an ephemeral port) with the client started by `on_ready`, so `acceptLoop` runs.
+    listener: bool = false,
 };
 
 /// `body` as the embedded client of a server of `max_concurrent` rows, once per arch that declares a servable fixture
@@ -175,7 +181,13 @@ fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, ne
     server_state.max_concurrent = max_concurrent;
     defer server_state.max_concurrent = prev_max;
     defer server_state.shutdown_requested.store(false, .release);
-    try server.serve(io, a, params, stub.config, "127.0.0.1", 0, .{ .embedded_client = startClient, .request_timeout_sec = 300, .test_on_cooler = true });
+    server.accept_spawned_with_hooks = false;
+    try server.serve(io, a, params, stub.config, "127.0.0.1", 0, .{
+        .embedded_client = if (needs.listener) null else startClient,
+        .on_ready = if (needs.listener) startClientOnReady else null,
+        .request_timeout_sec = 300,
+        .test_on_cooler = true,
+    });
     if (failed) |e| return e;
 }
 
@@ -364,6 +376,14 @@ fn within(ms: u32, done: *const fn () bool) bool {
         _ = std.posix.poll(&none, 10) catch {};
     }
     return true;
+}
+
+test "server: a headless boot starts accepting only once the request hooks are installed" {
+    try eachArch(1, .{ .listener = true }, struct {
+        fn run() !void {
+            try testing.expect(server.accept_spawned_with_hooks);
+        }
+    }.run);
 }
 
 test "server: a shutdown with the submit queue full ends the request waiting for room with the shutdown error too" {

@@ -812,11 +812,9 @@ pub fn serve(
     defer if (!stopped) {
         drained = stopServing(&accept_thread);
     };
-    if (listener != null) {
-        log.info("\nServer listening on http://{s}:{d}\n", .{ host, server_state.listen_port });
-        if (boots_model) log.info("  {s} is loading: the page, /health, /v1/models, /props, /v1/settings and the metrics answer now; generation waits for the model\n", .{load_params.entry.id});
-        accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{ allocator, io, &listener.? });
-    }
+    // A `--model` boot accepts while its model loads: a request that got the model waits at `boot_gate` for the hooks
+    // below. A headless boot has no gate and loads nothing, so it accepts once they are installed.
+    if (boots_model) accept_thread = try startAccepting(allocator, io, &listener, host, load_params.entry.id);
 
     scheduler.awaitStartupLoad() catch |err| {
         boot_gate.process.fail(io);
@@ -850,6 +848,7 @@ pub fn serve(
     scheduler_mod.vision_image_decode = &request_media.decodeEncodedImage;
     scheduler_mod.vision_fit_fault = &towerFitFault;
     defer scheduler_mod.vision_encode_available = null;
+    if (!boots_model) accept_thread = try startAccepting(allocator, io, &listener, host, "");
 
     // Idle eviction (--idle-evict-secs). Same lifetime shape as the sampler,
     // and never in `Scheduler.deinit` — see `IdleEvictCtx.stop`.
@@ -1008,6 +1007,19 @@ pub fn serve(
     if (!drained) return error.ConnectionsOutliveShutdown;
 
     log.info("\nShutting down gracefully...\n", .{});
+}
+
+/// Whether the request hooks were installed when the accept thread was spawned (a test reads it).
+pub var accept_spawned_with_hooks: bool = false;
+
+/// Logs the listening line and starts the accept thread; null for a boot without a listener. `loading_id` is the launch
+/// model still loading ("" for a headless boot).
+fn startAccepting(allocator: std.mem.Allocator, io: std.Io, listener: *?std.Io.net.Server, host: []const u8, loading_id: []const u8) !?std.Thread {
+    if (listener.* == null) return null;
+    log.info("\nServer listening on http://{s}:{d}\n", .{ host, server_state.listen_port });
+    if (loading_id.len > 0) log.info("  {s} is loading: the page, /health, /v1/models, /props, /v1/settings and the metrics answer now; generation waits for the model\n", .{loading_id});
+    if (comptime @import("builtin").is_test) accept_spawned_with_hooks = scheduler_mod.prefill_admission_fits != null;
+    return try std.Thread.spawn(.{}, acceptLoop, .{ allocator, io, &listener.*.? });
 }
 
 /// Accepts until shutdown, one detached thread per connection. With no listener (an embedded client) it only
