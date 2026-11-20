@@ -1746,7 +1746,8 @@ pub fn qsaAppendKeys(self: *Trunk, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, 
     }
 
     const ring_cap: usize = @intCast(QSA_RING_ROWS);
-    if (add >= QSA_RING_ROWS) {
+    // A fresh layer seeds the ring at its own rows: grown by the cache's rule it would hold a whole 256-row step.
+    if (add >= QSA_RING_ROWS or entry.qsa_key_buf.ctx == null) {
         try qsaInstallRing(self, entry, k_raw, s, false);
     } else if (held + add <= QSA_RING_ROWS) {
         try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1, .{ .reserve = ring_cap }, 1);

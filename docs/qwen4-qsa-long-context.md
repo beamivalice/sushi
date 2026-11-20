@@ -81,7 +81,8 @@ separate M-RoPE guard.
 
 - ONE copy per (slot ∪ entry); the newest snap VIEWS the live buffer at commit (`handoffQsaHistoryToLatest`); none
   after restore = MISS; the f32 score bank is billed; raw keys are a 32-row ring billed once per slot
-  (`qsaRingBytes`).
+  (`qsaRingBytes`), held at those rows from a fresh layer's first append (`qsaInstallRing`), never grown by the cache's
+  256-row step.
 - Per-request state outside conv/ssm rides `SSMCacheEntry.aux_state` + `ple_prev`, freed only through
   `ssmFreeQsaState`. Never hand a null `mlx_array` to the spec tensor-map insert (a pooled-only head arrives with
   `aux_state.ctx == null`).

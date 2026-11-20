@@ -851,6 +851,32 @@ test "qsa raw-key ring is O(RING_ROWS) at N rows" {
     try t.expectEqual(ring_cap, raw);
 }
 
+test "qsa raw-key ring: a fresh layer's first rows under the ring's size hold the ring's rows on MLX's page grid, as its bill prices" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var xfm: Trunk = undefined;
+    xfm.s = s;
+    xfm.allocator = t.allocator;
+    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    defer ssmFreeQsaState(&entry);
+    entry.qsa_ratio = 4;
+    // Flash-Next's indexer keys: 128 bf16 a row. A short prompt's first forward, then decode rows.
+    const hd: c_int = 128;
+    var prng = std.Random.DefaultPrng.init(0x51A0_0032);
+    const chunk = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 5, hd }, s);
+    defer _ = mlx.mlx_array_free(chunk);
+    try qwen4_qsa.qsaAppendKeys(&xfm, &entry, chunk, 0);
+    const row = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 1, hd }, s);
+    defer _ = mlx.mlx_array_free(row);
+    try qwen4_qsa.qsaAppendKeys(&xfm, &entry, row, 5);
+    try mlx.check(mlx.mlx_array_eval(entry.qsa_key_buf));
+    const row_bytes: u64 = @as(u64, @intCast(hd)) * 2;
+    const billed = @import("../mlx_pages.zig").pagedCount(@intCast(QSA_RING_ROWS), row_bytes) * row_bytes;
+    try t.expectEqual(billed, qsaRawKeyBytes(&entry));
+    try t.expectEqual(@as(c_int, 6), mlx.getShape(entry.aux_state)[1]);
+}
+
 test "qsa raw-key ring: on the engine a decode row appended to a full ring is one dispatch and keeps the newest rows" {
     try mlx.requireGpu();
     const t = std.testing;
