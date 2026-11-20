@@ -689,9 +689,12 @@ test "a 64 GB Mac at a declared 59,000 MB serves the 2.75 pack at kv8 to 262,144
 }
 
 test "DeepSeek streamed under a declared wired limit reads the limit's floor as its headroom, however little free RAM other apps leave (#110)" {
+
+    try test_note.needArchs(&.{"dsv41"});
     const dsv41_config = @import("dsv41/dsv41_config.zig");
     var cfg = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    cfg.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    // A build without DeepSeek (`-Darchs`) has no field of its config to set.
+    if (comptime bills.archBuilt("dsv41")) cfg.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     cfg.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     cfg.max_position_embeddings = 1_048_576;
     cfg.cooler_for_test = true;
@@ -706,6 +709,8 @@ test "DeepSeek streamed under a declared wired limit reads the limit's floor as 
 }
 
 test "a Qwen request commits the cache its admitted width reserves, not the default chunk's" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const cfg = fixtures.qwen4ExpOomConfig();
     const status = @import("status.zig");
     const avail_was = status.available_mem_override;
@@ -752,13 +757,15 @@ fn readsDeclaredFloor(cfg: *const model_mod.ModelConfig, machine: Machine, floor
 }
 
 test "owner ruling: a declared iogpu.wired_limit_mb is the ceiling of every load, GLM and MiMo resident on MLX and DeepSeek resident included, at any size" {
+
+    try test_note.needArchs(&.{"dsv41"});
     const MiB: u64 = 1 << 20;
     var glm = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
     defer glm.deinit(testing.allocator);
     const mimo = fixtures.mimoV2FlashBillConfig();
     const dsv41_config = @import("dsv41/dsv41_config.zig");
     var dsv = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_resident = true };
-    dsv.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    if (comptime bills.archBuilt("dsv41")) dsv.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     dsv.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
     dsv.max_position_embeddings = 1_048_576;
     // A 128 GB Mac whose owner lowered the limit under macOS's default 75% (98,304 MiB) to keep room for other apps,
@@ -900,6 +907,8 @@ test "beside a loaded model an MLX load's preflight reads at most the declared f
 // after the eviction pass. Readings: no declared limit, a 64 GB Mac; admission reads `before` free, the eviction pass
 // returns 8 GiB of hot cache and the re-ask reads that much more.
 test "a Qwen request's growth commit covers the cache it reserves at the width the post-eviction re-ask runs it at" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const cfg = fixtures.qwen4ExpOomConfig();
     const MiB: u64 = 1 << 20;
     const saved_static = bills.static_ceiling_override;

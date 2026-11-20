@@ -4251,6 +4251,8 @@ test "a request whose max_tokens alone does not fit is refused on the connection
 }
 
 test "admission: a prompt that fits once the running requests finish waits in the queue, and one that would not fit even then is refused in today's words" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const a = t.allocator;
     const saved_ctx = server_state.server_config.max_context_size;

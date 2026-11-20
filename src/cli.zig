@@ -2248,7 +2248,7 @@ test "memory tiers: installed RAM rounds down to whole GB and picks fits or may 
 
 test "list recommends one pack per family from the tier table" {
 
-    try test_note.needArchs(&.{ "mimo2", "glm5", "dsv41" });
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5", "dsv41" });
     const q = "qwen3.8-flash-next";
     try testing.expect(recommendedAlias(q, 16) == null);
     try testing.expectEqualStrings("2bpw", recommendedAlias(q, 32).?.tag);
