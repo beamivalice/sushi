@@ -82,6 +82,7 @@ fn chunkAsked(ld: *Load, ids: []const u32) !u64 {
     defer turn.end();
     defer arch_sched.endRequest(&ld.config);
     try ld.xfm.resetCache();
+    ld.xfm.bindOwnRows(ids.len);
     mlx.engine.close();
     mlx.engine.trim();
     const in0 = mlx.engine.poolTotal() - mlx.engine.poolFree();
