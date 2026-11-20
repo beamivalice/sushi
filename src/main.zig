@@ -1254,7 +1254,7 @@ fn runCli(init: std.process.Init) !void {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
         //    scheduler. The same load path as pre-A1.
         if (config.expertStreamingRequired()) {
-            log.err("This checkpoint requires expert streaming. Use `run <model>` or `--serve` with --ssd-budget-gb.\n", .{});
+            log.err("This checkpoint requires expert streaming. Use `run <model>` or `--serve`.\n", .{});
             return error.ExpertStreamingRequired;
         }
         var launch_buf: [384]u8 = undefined;

@@ -625,7 +625,7 @@ fn limitsDefault(tier: RamTier, resident_need: u64, beside: u64, limits: BudgetL
 }
 
 /// The load line naming the arm and where the budget came from.
-fn budgetOriginLine(buf: []u8, choice: SsdBudgetChoice, resident: bool) []const u8 {
+pub fn budgetOriginLine(buf: []u8, choice: SsdBudgetChoice, resident: bool) []const u8 {
     const gib = choice.bytes >> 30;
     return (switch (choice.origin) {
         .flag => std.fmt.bufPrint(buf, "[expert-stream] ssd budget {d} GiB (--ssd-budget-gb)", .{gib}),
@@ -711,8 +711,20 @@ const PreflightReader = struct {
     }
 };
 
-fn ramDefaultChoice(sch: *Scheduler, params: anytype, tier: RamTier, load_vision: bool, assistant_bytes: u64) !SsdBudgetChoice {
-    const d = ramDefaultFor(sch.io, sch.allocator, params.config, params.model_dir, tier, load_vision, assistant_bytes, true);
+/// The refusal of a streamed load with no flag, no setting and no RAM tier to take a default from.
+pub fn requireBudgetSource(choice: SsdBudgetChoice, tier: ?RamTier) error{ExpertStreamingRequired}!void {
+    if (choice.bytes == 0 and tier == null) {
+        log.err("{s}\n", .{budget_required_message});
+        return error.ExpertStreamingRequired;
+    }
+}
+
+/// The one place a streamed load with no flag and no setting takes its budget: every load path that takes `--ssd-budget-gb`
+/// (serve, `kld`) resolves it here, so a box whose tier defaults to fully resident loads resident on each.
+pub fn withRamDefault(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, choice: SsdBudgetChoice, tier: ?RamTier, load_vision: bool, assistant_bytes: u64) error{ExpertStreamingRequired}!SsdBudgetChoice {
+    try requireBudgetSource(choice, tier);
+    if (choice.bytes > 0) return choice;
+    const d = ramDefaultFor(io, allocator, config, model_dir, tier.?, load_vision, assistant_bytes, true);
     var buf: [256]u8 = undefined;
     if (d.bound_by.len > 0) log.warn("{s}\n", .{stepDownLine(&buf, d)});
     return .{ .bytes = d.bytes, .origin = .ram_default, .setting_ignored = false, .wired_limit_mb = d.wired_limit_mb };
@@ -2012,10 +2024,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (streamed) {
         var budget = streaming_budget;
         const tier = ramDefaultTierFor(params.config);
-        if (budget.bytes == 0 and tier == null) {
-            log.err("{s}\n", .{budget_required_message});
-            return error.ExpertStreamingRequired;
-        }
+        try requireBudgetSource(budget, tier);
         const mtp = mtpChoiceFor(params.mtp, params.config);
         const verdict = mtpStreamingVerdict(mtp, streamedHeadSupportedAt(sch.io, sch.allocator, params.config, params.model_dir));
         switch (verdict) {
@@ -2034,7 +2043,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             .drop_default, .off => {},
         }
         const assistant_bytes = try streamedAssistantBytes(sch.io, sch.allocator, params.config, params.no_drafter, params.drafter_dir, params.model_dir);
-        if (budget.bytes == 0) budget = try ramDefaultChoice(sch, params, tier.?, load_vision, assistant_bytes);
+        budget = try withRamDefault(sch.io, sch.allocator, params.config, params.model_dir, budget, tier, load_vision, assistant_bytes);
         const plan = planExpertStreamingWith(sch.io, sch.allocator, params.config, params.model_dir, budget.bytes, load_vision, assistant_bytes) catch |e| {
             if (e == error.SsdBudgetBelowResident) {
                 var text_buf: [512]u8 = undefined;

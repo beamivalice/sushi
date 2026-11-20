@@ -93,8 +93,7 @@ seeded GLM checks this at several W, across chunks and across a resume (`glm5_la
 <a id="dsv41-kld"></a>
 ### DeepSeek-V4.1
 
-`kld capture` and `compare` run `deepseek_v41` through the generic path, streamed (`--ssd-budget-gb` is required; the
-load names it before touching the GPU). The state is the activation dtype and the model keeps its own, so a flag that
+`kld capture` and `compare` run `deepseek_v41` through the generic path, streamed (`--ssd-budget-gb` is optional: with no flag and no setting the load takes serve's RAM default through `model_load.withRamDefault`, fully resident on a 192 or 256 GB Mac, and a box outside the tiers is refused by name before touching the GPU). The state is the activation dtype and the model keeps its own, so a flag that
 would silently do nothing is refused by name at load (`kld_capture.refuse`): `--kv-quant` (`Dsv41KvQuantUnsupported`),
 `--qwen-gdn 16` (`Dsv41HasNoQwenGdnState`), `--hidden-out` (`Dsv41HiddenCaptureUnsupported`) and `SUSHI_IMATRIX_OUT`
 (`Dsv41ImatrixCaptureUnsupported`; the layer-major capture below takes it). The teacher is exact routing: `capture` refuses `--drop-expert`,

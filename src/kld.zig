@@ -320,8 +320,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         self.config.expertStreamingRequired(),
         kld_budget.bytes,
     )) {
-        const budget = kld_budget;
-        if (budget.bytes == 0) return error.ExpertStreamingRequired;
+        const budget = try model_load.withRamDefault(io, allocator, &self.config, opts.model_dir, kld_budget, model_load.ramDefaultTierFor(&self.config), false, 0);
         const mtp = model_settings_mod.MtpChoice.resolve(opts.mtp, self.config.mtp_override, false);
         switch (expert_stream_mod.mtpUnderStreaming(mtp.on, mtp.source == .model_settings, mtp.source == .default, false)) {
             .keep, .refuse => {
@@ -336,6 +335,8 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         }
         const plan = try model_load.planExpertStreaming(io, allocator, &self.config, opts.model_dir, budget.bytes, false);
         model_load.applyStreamingPlan(&self.config, plan, budget.bytes);
+        var origin_buf: [160]u8 = undefined;
+        log.info("{s}\n", .{model_load.budgetOriginLine(&origin_buf, budget, if (plan.resolved.ledger) |led| led.resident else false)});
         if (self.config.expert_source_dir == null) self.config.expert_source_dir = try allocator.dupe(u8, opts.model_dir);
         log.info("[kld] expert streaming: cache {d:.2} GB, {d} slots/layer\n", .{
             @as(f64, @floatFromInt(plan.cache.cache_bytes)) / 1e9,
@@ -1130,6 +1131,25 @@ test "kld records the budget that shaped the load, never the raw flag" {
     try testing.expectEqual(@as(u64, 60), capturedSsdBudgetGb(&q4, 0));
     q4.expert_ssd_budget_bytes = 0;
     try testing.expectEqual(@as(u64, 48), capturedSsdBudgetGb(&q4, 48 * GiB));
+}
+
+test "kld: a streamed load with no flag and no setting takes serve's RAM default on every tier" {
+    const fixture = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const io = testing.io;
+    var cfg = try model_mod.parseConfig(io, testing.allocator, fixture);
+    defer cfg.deinit(testing.allocator);
+    try testing.expect(cfg.expertStreamingRequired());
+    const none = model_load.resolveSsdBudget(0, cfg.ssd_budget_gb_override, cfg.supportsExpertStreaming());
+    for ([_]model_load.RamTier{ .gb96, .gb128, .gb192, .gb256 }) |tier| {
+        const serve = model_load.ramDefaultFor(io, testing.allocator, &cfg, fixture, tier, false, 0, true);
+        const got = try model_load.withRamDefault(io, testing.allocator, &cfg, fixture, none, tier, false, 0);
+        try testing.expectEqual(model_load.SsdBudgetOrigin.ram_default, got.origin);
+        try testing.expectEqual(serve.bytes, got.bytes);
+        try testing.expectEqual(serve.wired_limit_mb, got.wired_limit_mb);
+        // A big tier is resident unless this box's own limits stepped it down, which the default says.
+        if (tier == .gb192 or tier == .gb256) try testing.expect(serve.resident or serve.bound_by.len > 0);
+    }
+    try testing.expectError(error.ExpertStreamingRequired, model_load.withRamDefault(io, testing.allocator, &cfg, fixture, none, null, false, 0));
 }
 
 test {

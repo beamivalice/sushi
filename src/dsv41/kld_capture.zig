@@ -1981,10 +1981,14 @@ test "kld: deepseek_v41 refuses by name what its module-owned state cannot honor
     try refuse(&qwen, .{ .qwen_gdn_f32 = false, .kv_quant_config = trunk_mod.KVQuantConfig.affine(8) });
 }
 
-test "kld: a deepseek_v41 load names the missing streaming budget before touching the GPU (DSV41_TINY)" {
+test "kld: a deepseek_v41 load with no budget takes the RAM default, and a box outside the tiers is refused by name (DSV41_TINY)" {
     const dir = try @import("dsv41_model.zig").fixtureDir();
     const io = std.Io.Threaded.global_single_threaded.io();
-    try testing.expectError(error.ExpertStreamingRequired, kld.loadModel(io, testing.allocator, .{ .model_dir = dir }));
+    var cfg = try model.parseConfig(io, testing.allocator, dir);
+    defer cfg.deinit(testing.allocator);
+    if (@import("../model_load.zig").ramDefaultTierFor(&cfg) == null) {
+        try testing.expectError(error.ExpertStreamingRequired, kld.loadModel(io, testing.allocator, .{ .model_dir = dir }));
+    } else if (kld.loadModel(io, testing.allocator, .{ .model_dir = dir })) |l| l.deinit() else |e| try testing.expect(e != error.ExpertStreamingRequired);
     try testing.expectError(error.Dsv41KvQuantUnsupported, kld.loadModel(io, testing.allocator, .{ .model_dir = dir, .kv_quant_config = trunk_mod.KVQuantConfig.affine(8), .ssd_budget_bytes = 1 << 30 }));
 }
 
