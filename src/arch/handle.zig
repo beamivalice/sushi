@@ -50,6 +50,8 @@ pub fn engineHoldEnd() void {
     // The side's arrays went back to the pool after the unload emptied it: the last Cooler model leaves it empty.
     mlx.engine.close();
     mlx.engine.trim();
+    // A cap is a forward's: with no Cooler model left, none stays, whichever path ended the last hold.
+    _ = mlx.engine.uncapped();
 }
 
 /// Models on MLX's side the registry holds (inference thread). The EXL3 module caches arrays per side for the process;

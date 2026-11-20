@@ -298,6 +298,8 @@ route and the MLX arm still build the bank at prepare time.
   So does a Cooler load that fails after its warm made them: every hold ends in `arch_handle.engineHoldEnd`, which
   drops them when no hold is left (lint rule `engine-hold-end`); a failed load's own unhold kept up to 393 KB in the
   pool, unbilled, until the next Cooler load and unload. Pinned by `a Cooler load refused at any of its pool buffers`.
+  It also leaves no pool cap in force (a cap is a forward's), however a test's or a failed load's path ended the last hold:
+  `engineHoldEnd` lifts it, pinned by `the last hold's end leaves no cap in force`.
   The last unload of a model on MLX gives back MLX's side the same way (`arch_handle.adopt` counts them, `destroy`
   drops at zero), pinned from zero by `the last model on MLX's side gives back the arrays the EXL3 module cached`.
 

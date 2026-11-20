@@ -7387,6 +7387,19 @@ const TurnFixture = struct {
     }
 };
 
+test "engine: the last hold's end leaves no cap in force, whichever forward installed it" {
+    try mlx.requireGpu();
+    const was = enabled;
+    hold();
+    defer @import("../test_support.zig").restoreEngine(was);
+    const made = try TurnFixture.made(64);
+    try budget(1 << 20);
+    try std.testing.expect(core.poolLimit() != null);
+    _ = mlx.mlx_array_free(made);
+    @import("../arch/handle.zig").engineHoldEnd();
+    try std.testing.expectEqual(@as(?u64, null), core.poolLimit());
+}
+
 test "engine: a turn inside another Cooler model's turn gives the outer model its cap back at its end, over what the tensors in use hold then" {
     try mlx.requireGpu();
     const fx = TurnFixture.begin();
