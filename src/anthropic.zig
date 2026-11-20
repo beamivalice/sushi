@@ -929,10 +929,9 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     // OpenAI surface is not an inconsistency — it is each surface's documented
     // behaviour, so an Anthropic SDK client gets prefill for free.
     //
-    // And because it is INFERRED, a model that cannot serve one gets an
-    // ordinary turn rather than a 400: the client never asked for a
-    // continuation, so refusing its request would take away an answer this
-    // endpoint has always given.
+    // A conversation that is no continuation gets an ordinary turn. One that
+    // is, and that its template cannot write (a thought it drops, a thought
+    // sent as text), is refused by name as on the chat route.
     p.continue_final = think_tags.continuationRequested(messages.items);
     var tokenize_sw = Stopwatch.init(stream.io);
     // The `thinking` budget object carries no effort string, but

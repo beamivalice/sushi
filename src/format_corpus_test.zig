@@ -2773,6 +2773,54 @@ test "format corpus: a continuation ends on the family's own rendering of the pa
     }
 }
 
+test "format corpus: a continued turn holding only its thought ends where the family writes its content, the thought closed once" {
+    // A model that ends inside its thought leaves a reply of reasoning_content alone; continuing it rendered history and
+    // opened a second assistant turn (DeepSeek: a prompt ending in end-of-sentence), and a thought sent in content got
+    // a second close tag.
+    const allocator = testing.allocator;
+    const Case = struct { name: []const u8, tpl: []const u8, thinking_off_drops: bool = false };
+    const cases = [_]Case{
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
+        .{ .name = "glm-5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja") },
+        .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+        .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .thinking_off_drops = true },
+    };
+    const thought = "I should call the tool.";
+    const text = "Calling it now.";
+    const user: chat.Message = .{ .role = "user", .content = "What time is it?" };
+    for (cases) |c| {
+        var config = chat.ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        for ([_]bool{ true, false }) |thinking| {
+            errdefer std.debug.print("\n[{s}] thinking={}\n", .{ c.name, thinking });
+            const only = [_]chat.Message{ user, .{ .role = "assistant", .content = " \n", .reasoning_content = thought } };
+            if (!thinking and c.thinking_off_drops) {
+                try testing.expectError(error.ContinuationDropsThought, chat.renderChatTemplate(allocator, &only, &config, null, null, thinking, null, true));
+                continue;
+            }
+            const full = [_]chat.Message{ user, .{ .role = "assistant", .content = text, .reasoning_content = thought } };
+            const history = try chat.renderChatTemplate(allocator, &full, &config, null, null, thinking, null, false);
+            defer allocator.free(history);
+            const cont = try chat.renderChatTemplate(allocator, &only, &config, null, null, thinking, null, true);
+            defer allocator.free(cont);
+            const want = history[0..std.mem.lastIndexOf(u8, history, text).?];
+            errdefer std.debug.print(" want tail {f}\n got tail  {f}\n", .{ std.zig.fmtString(want[want.len -| 60..]), std.zig.fmtString(cont[cont.len -| 60..]) });
+            try testing.expectEqualStrings(want, cont);
+            const turn = cont[std.mem.lastIndexOf(u8, cont, user.content).?..];
+            try testing.expect(std.mem.indexOf(u8, turn, thought) != null);
+            try testing.expectEqual(@as(usize, 1), std.mem.count(u8, turn[std.mem.indexOf(u8, turn, thought).?..], "</think>"));
+            try testing.expect(!think_tags.promptTailOpensThink(cont));
+        }
+        // The thought rides reasoning_content: a close tag in the continued content is refused, never doubled.
+        for ([_][]const u8{ thought ++ "</think>", "<think>\n" ++ thought ++ "\n</think>\n\n" }) |content| {
+            const in_content = [_]chat.Message{ user, .{ .role = "assistant", .content = content } };
+            try testing.expectError(error.ContinuationThoughtInContent, chat.renderChatTemplate(allocator, &in_content, &config, null, null, true, null, true));
+        }
+        // A close tag quoted in prose is text: that continuation is served.
+        const quoted = [_]chat.Message{ user, .{ .role = "assistant", .content = "The tag is `</think>`, and" } };
+        allocator.free(try chat.renderChatTemplate(allocator, &quoted, &config, null, null, true, null, true));
+    }
+}
+
 /// Streams the thought in `raw` one byte at a time the way each chat stream path
 /// does and returns (tools path, no-tools path) deltas joined.
 fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![2][]u8 {

@@ -1119,6 +1119,48 @@ test "server: a message role no template renders is refused 400 naming it on cha
     }.run);
 }
 
+test "server: a continued reply holding only its thought resumes after its closed think block, on the chat and Anthropic routes" {
+    // A thinking-on prompt is longer than DeepSeek's tiny holds (128 tokens), as a long reply is.
+    try eachArch(4, .{ .long_replies = true }, struct {
+        const user = "{\"role\":\"user\",\"content\":\"What time is it?\"}";
+        const thought = "I should check the clock.";
+        fn chatTurn(comptime assistant: []const u8) []const u8 {
+            return "{\"model\":\"tiny\",\"max_tokens\":1,\"temperature\":0,\"enable_thinking\":true,\"continue_final_message\":true,\"messages\":[" ++ user ++ "," ++ assistant ++ "]}";
+        }
+        fn anthropicTurn(comptime blocks: []const u8) []const u8 {
+            return "{\"model\":\"tiny\",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":64},\"messages\":[" ++ user ++ ",{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"" ++ thought ++ "\",\"signature\":\"\"}" ++ blocks ++ "]}]}";
+        }
+        /// The number after `key` in a 200 answer.
+        fn counted(path: []const u8, body: []const u8, key: []const u8) !u64 {
+            const resp = try request("POST", path, body);
+            defer gpa.free(resp);
+            errdefer std.debug.print("{s}: {s}\n", .{ path, resp[0..@min(resp.len, 600)] });
+            if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) return error.NotServed;
+            return lastNumber(bodyOf(resp), key) orelse error.NoCount;
+        }
+        fn run() !void {
+            // The visible text a prose continuation adds is its own tokens, so the thought-only prompt is that prompt without them.
+            const hello = blk: {
+                const resp = try request("POST", "/tokenize", "{\"content\":\"Hello\"}");
+                defer gpa.free(resp);
+                break :blk std.mem.count(u8, bodyOf(resp), ",") + 1;
+            };
+            const chat_only = try counted("/v1/chat/completions", chatTurn("{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"" ++ thought ++ "\"}"), "\"prompt_tokens\":");
+            const chat_prose = try counted("/v1/chat/completions", chatTurn("{\"role\":\"assistant\",\"content\":\"Hello\",\"reasoning_content\":\"" ++ thought ++ "\"}"), "\"prompt_tokens\":");
+            try testing.expectEqual(chat_prose, chat_only + hello);
+            const messages_only = try counted("/v1/messages/count_tokens", anthropicTurn(""), "\"input_tokens\":");
+            const messages_prose = try counted("/v1/messages/count_tokens", anthropicTurn(",{\"type\":\"text\",\"text\":\"Hello\"}"), "\"input_tokens\":");
+            try testing.expectEqual(messages_prose, messages_only + hello);
+            // A thought sent as text with its close tag is refused by name, never closed twice.
+            const resp = try request("POST", "/v1/chat/completions", chatTurn("{\"role\":\"assistant\",\"content\":\"" ++ thought ++ "</think>\"}"));
+            defer gpa.free(resp);
+            errdefer std.debug.print("close tag in content: {s}\n", .{resp[0..@min(resp.len, 600)]});
+            try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400"));
+            try testing.expect(std.mem.indexOf(u8, bodyOf(resp), "send its thought in reasoning_content") != null);
+        }
+    }.run);
+}
+
 test "server: a completions stream that fails mid-reply ends in a completions chunk, not a chat delta" {
     try eachArch(4, .{}, struct {
         fn run() !void {

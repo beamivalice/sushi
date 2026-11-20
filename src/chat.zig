@@ -869,9 +869,14 @@ pub fn renderChatSpans(
     defer mend.deinit();
     const prefill = if (think_tags.continuationPrefill(messages, continue_final)) |p| try utf8Text(mend.allocator(), p) else null;
     const msgs = if (prefill != null) messages[0 .. messages.len - 1] else messages;
+    // The thought of a continued turn rides `reasoning_content`; a close tag in its text would close the block twice.
+    if (prefill) |partial| if (think_tags.indexOfThinkCloseTag(partial, 0) != null) return error.ContinuationThoughtInContent;
+    // A turn holding only its thought is continued only as the template writes its think block.
+    const thought_only = if (prefill) |partial| partial.len == 0 else false;
 
     if (chat_config.chat_template.len == 0) {
         if (!fallbackIsChatMl(chat_config)) return refuseTemplate("the model has no chat template and no fallback format");
+        if (thought_only) return error.ContinuationDropsThought;
         const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
         if (prefill) |partial| {
             defer freeSpans(allocator, base);
@@ -957,6 +962,7 @@ pub fn renderChatSpans(
     if (prefill) |partial| {
         const turn = messages[messages.len - 1];
         if (try renderContinuation(allocator, render_tpl, &settings, effective_tools_json, effective_messages, turn, partial, chat_config)) |cont| return cont;
+        if (thought_only) return error.ContinuationDropsThought;
     }
 
     var failure: EngineFailure = .{};
@@ -1005,6 +1011,7 @@ pub fn renderChatSpans(
     if (failure.err == error.TemplateRaised and failure.diag.messageIs(NO_USER_QUERY_RAISE)) return error.ChatNeedsUserTurn;
     _ = template_fallbacks.fetchAdd(1, .monotonic);
     log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{reason});
+    if (thought_only) return error.ContinuationDropsThought;
     const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
     if (prefill) |partial| {
         defer freeSpans(allocator, base);
@@ -1017,7 +1024,9 @@ pub fn renderChatSpans(
 /// cut right after its text (transformers' `continue_final_message` rule): the
 /// think block and separators match every earlier turn, thinking on or off.
 /// Null when the render fails or does not carry the text, and the caller falls
-/// back to the generation prompt plus the content-channel tail.
+/// back to the generation prompt plus the content-channel tail. An empty
+/// `partial` is a turn holding only its thought: the cut is where the template
+/// starts its content, and a render without the thought is refused by name.
 fn renderContinuation(
     allocator: std.mem.Allocator,
     tmpl: *const Tpl,
@@ -1031,21 +1040,31 @@ fn renderContinuation(
     const turns = try allocator.alloc(Message, history.len + 1);
     defer allocator.free(turns);
     @memcpy(turns[0..history.len], history);
-    turns[history.len] = .{ .role = "assistant", .content = partial, .reasoning_content = turn.reasoning_content };
+    // A probe stands in for the absent text so the template writes the turn up to where its content starts.
+    const probe = "\u{E000}sushi-content\u{E000}";
+    turns[history.len] = .{ .role = "assistant", .content = if (partial.len == 0) probe else partial, .reasoning_content = turn.reasoning_content };
     var failure: EngineFailure = .{};
     const context = RenderContext{ .messages = turns, .image_atom = chat_config.image_placeholder, .tools = tools, .settings = settings };
     const engine_out = try renderEngine(allocator, tmpl, &context, false, &failure) orelse return null;
     defer freeSpans(allocator, engine_out);
     const rendered = try collapseDoubledThinkTags(allocator, engine_out);
     defer freeSpans(allocator, rendered);
+    var cut = std.heap.ArenaAllocator.init(allocator);
+    defer cut.deinit();
+    if (partial.len == 0) {
+        const at = std.mem.lastIndexOf(u8, rendered.bytes, probe) orelse return null;
+        if (rendered.originOf(at, at + probe.len) != .assistant) return null;
+        const thought = std.mem.trim(u8, turn.reasoning_content.?, " \t\r\n");
+        const t = std.mem.lastIndexOf(u8, rendered.bytes[0..at], thought) orelse return error.ContinuationDropsThought;
+        if (rendered.originOf(t, t + thought.len) != .assistant) return error.ContinuationDropsThought;
+        return try dupeSpans(allocator, try rendered.slice(cut.allocator(), 0, at));
+    }
     // A template may trim the text's leading whitespace, as transformers allows for. The cut is where the partial
     // turn's own bytes end, and they must end with its text: a search could land inside an earlier turn.
     const text = std.mem.trimStart(u8, partial, " \t\r\n");
     const end = rendered.lastEnd(.assistant) orelse return null;
     if (end < text.len or !std.mem.eql(u8, rendered.bytes[end - text.len .. end], text)) return null;
     if (rendered.originOf(end - text.len, end) != .assistant) return null;
-    var cut = std.heap.ArenaAllocator.init(allocator);
-    defer cut.deinit();
     return try dupeSpans(allocator, try rendered.slice(cut.allocator(), 0, end));
 }
 
@@ -4068,7 +4087,8 @@ test "renderChatTemplate: a continuation the template drops follows the generati
     const hist = try a.alloc(u8, 2 * m);
     defer a.free(hist);
     @memset(hist, 'a');
-    const partial = try std.mem.concat(a, u8, &.{ hist[0..m], "<think>z</think>x" });
+    // GLM-5.3 splits a content at any `</think>`; a quoted one is text to the server, so the continuation is served.
+    const partial = try std.mem.concat(a, u8, &.{ hist[0..m], "`<think>z</think>`x" });
     defer a.free(partial);
     const msgs = [_]Message{ .{ .role = "user", .content = hist }, .{ .role = "assistant", .content = partial } };
     var config = ChatConfig{ .chat_template = @embedFile("fixtures/glm53_chat_template.jinja"), .bos_token = null, .eos_token = "<|endoftext|>", .add_bos_token = false, .allocator = a };
@@ -5037,7 +5057,8 @@ test "renderChatSpans: GLM-5.3 continuing a reply that spells a think closer kee
     var cc = ChatConfig{ .chat_template = @embedFile("fixtures/glm53_chat_template.jinja"), .bos_token = null, .eos_token = "<|endoftext|>", .add_bos_token = false, .allocator = a };
     try cc.compile();
     defer cc.dropCompiled();
-    const partial = "The tag is </think>  then the answer";
+    // Quoted, the closer is text; a bare one is refused (`error.ContinuationThoughtInContent`).
+    const partial = "The tag is `</think>`  then the answer";
     const msgs = [_]Message{
         .{ .role = "user", .content = "Finish my sentence: " ++ partial ++ " ... and explain." },
         .{ .role = "assistant", .content = partial },

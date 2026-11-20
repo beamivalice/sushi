@@ -31,6 +31,11 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   served; set `iogpu.wired_limit_mb` and `--wired-margin-gib` to keep room for other apps.
 - **`sushi kld` with no `--ssd-budget-gb` takes the same memory default as serve**, so a 192 or 256 GB Mac scores a DeepSeek pack fully resident instead of refusing it; the load logs where the budget came from.
 - **`sushi kld` with no `--ssd-budget-gb` takes the same memory default as serve**, so a 192 or 256 GB Mac scores a DeepSeek pack fully resident instead of refusing it, and the DeepSeek layer-major capture sizes its window batch from that default (refusing by name, with `--ssd-budget-gb`, one that buys no window); the load logs where the budget came from.
+- **`sushi kld` with no `--ssd-budget-gb` takes the same memory default as serve**, so a 192 or 256 GB Mac scores a DeepSeek pack fully resident instead of refusing it; the load logs where the budget came from.
+- **A reply holding only its thought can be continued**: `continue_final_message` on Chat, and a trailing assistant
+  message on `/v1/messages`, rendered a reply of `reasoning_content` alone as history and opened a new turn after it; it
+  now resumes after its thought, closed once in the template's think block, and a thought sent in `content` with its
+  close tag is refused by name. Thanks @yanun0323 for the report.
 - **A pack listed while its download was still running is billed at its full size once the download finishes**: its entry kept the partial byte count it was listed with, so the eviction gate and the resident bill under-counted it until the next restart; a finished download or a rescan now refreshes it.
 - **A prefix-cache clear no longer deletes the SSD root of a model that loads while it runs**: the clear's lock file lived inside the namespace it deleted, so a tier opening mid-delete took a fresh lock, then lost its root (two tiers could later own one); a clear and a tier opening now take a gate file beside the namespace.
 - **An unknown `tool_choice` is refused by name on Responses and Messages, and a Messages `tool_result` flagged `is_error` says so

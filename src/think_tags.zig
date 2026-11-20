@@ -692,7 +692,7 @@ pub fn contentChannelTail(rendered: []const u8) []const u8 {
 }
 
 /// Whether this conversation SHAPE is a continuation: it ends with an
-/// assistant message carrying prose. The one predicate every surface asks, so
+/// assistant message carrying prose or only its thought. The one predicate every surface asks, so
 /// "what counts as continuable" cannot differ between the endpoint that
 /// implies it and the endpoint that takes a flag — and so the answer matches
 /// what `continuationPrefill` will actually do with it.
@@ -701,7 +701,8 @@ pub fn continuationRequested(messages: []const Message) bool {
 }
 
 /// The partial assistant reply a continuation request is asking to extend, or
-/// null when this is an ordinary turn.
+/// null when this is an ordinary turn. Empty when the reply holds only its
+/// thought (`reasoning_content`): generation resumes in the content channel.
 ///
 /// The flag describes the SHAPE of the request, so a client that sets it on a
 /// conversation not ending in an assistant message gets an ordinary turn —
@@ -720,7 +721,9 @@ pub fn continuationPrefill(messages: []const Message, continue_final: bool) ?[]c
     // continuation onto it would re-run the parse chain over half a call.
     if (last.tool_calls != null) return null;
     const trimmed = std.mem.trimEnd(u8, last.content, " \t\r\n");
-    return if (trimmed.len > 0) trimmed else null;
+    if (trimmed.len > 0) return trimmed;
+    const thought = std.mem.trim(u8, last.reasoning_content orelse "", " \t\r\n");
+    return if (thought.len > 0) trimmed else null;
 }
 
 /// Split model output into reasoning_content and content.

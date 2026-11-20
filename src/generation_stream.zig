@@ -235,6 +235,20 @@ pub fn mapGenerationError(allocator: std.mem.Allocator, err: anyerror) !GenError
                 break :blk said.written();
             },
         },
+        error.ContinuationThoughtInContent => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = "the continued assistant message holds a think close tag in its text: send its thought in reasoning_content (a thinking block on /v1/messages) and only the visible reply as content",
+        },
+        error.ContinuationDropsThought => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = "the continued assistant message holds only its thought, and this model's chat template writes no thought for it in this request (a template whose thinking-off turns carry none drops it): turn thinking on, or send the visible reply so far as content",
+        },
         error.ChatTemplateUnusable => .{
             .status_line = "500 Internal Server Error",
             .code = 500,
