@@ -305,15 +305,12 @@ pub const Config = struct {
         return sum +| cap_fixed_bytes;
     }
 
-    /// `forwardCap` of a prefill chunk of `chunk` rows ending at `seq`: the last chunk of a prompt absorbs a tail of
-    /// up to `tail_merge_rows`, so the widest forward is `chunk + tail_merge_rows` rows.
+    /// `forwardCap` of the widest forward a prefill of `seq` tokens runs at `chunk`-row chunks with the flat tail merge
+    /// (`prefill_plan.widestForward`): a served request's is `bills.requestForwardRows`.
     pub fn chunkCap(self: *const Config, chunk: u64, seq: u64) u64 {
-        return self.chunkCapOn(true, chunk, seq);
-    }
-
-    /// `chunkCap` on the side a load runs on (`forwardCapOn`).
-    pub fn chunkCapOn(self: *const Config, engine: bool, chunk: u64, seq: u64) u64 {
-        return self.forwardCapOn(engine, @min(chunk +| tail_merge_rows, @max(seq, 1)), seq);
+        const prefill_plan = @import("../prefill_plan.zig");
+        const widest = prefill_plan.widestForward(@intCast(seq -| 1), @intCast(@max(chunk, 1)), false);
+        return self.forwardCapOn(true, @max(@min(chunk, @max(seq, 1)), widest), seq);
     }
 };
 
@@ -354,8 +351,6 @@ pub const BILL_MARGIN_BYTES: u64 = 256 << 20;
 /// What a decode or verify forward's cap carries beyond its scores and its context.
 pub const cap_fixed_bytes: u64 = forward_held_bytes + BILL_MARGIN_BYTES;
 const score_copies: u64 = 3;
-/// `prefill_plan.TAIL_MERGE_MAX - 1`: the longest tail the last chunk of a prompt absorbs.
-pub const tail_merge_rows: u64 = 511;
 /// Rows of a wide chunk one attention span takes: a span's scores and gathered rows are freed before the next.
 pub const attn_span: u64 = 256;
 /// Layers a prefill pass keeps in flight (`Model.pipe_depth`): their output streams stay in use until it waits on them.
@@ -753,7 +748,9 @@ test "dsv41 forward cap: grows with the rows and the context, a chunk's tail mer
     try testing.expect(c.forwardCap(2048, m) > c.forwardCap(2048, 9_000));
     try testing.expect(c.forwardCap(verify_rows, m) > c.forwardCap(1, 9_000));
     try testing.expect(c.forwardCap(verify_rows, m) * 3 < c.forwardCap(2048, m));
-    try testing.expectEqual(c.forwardCap(2048 + tail_merge_rows, m), c.chunkCap(2048, m));
+    // A prompt's widest forward is a chunk with the longest tail it absorbs; one 300 rows past a chunk runs them whole.
+    try testing.expectEqual(c.forwardCap(2048 + 511, m), c.chunkCap(2048, m));
+    try testing.expectEqual(c.forwardCap(2348, 2349), c.chunkCap(2048, 2349));
     // A prompt shorter than the chunk cannot run more rows than it has.
     try testing.expectEqual(c.forwardCap(100, 100), c.chunkCap(2048, 100));
     // The measured growth beyond the state rows (1094 B a token less 890) is a fraction of the cap's per-token slope.

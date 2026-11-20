@@ -230,6 +230,77 @@ pub fn nextChunkEnd(
     return end;
 }
 
+/// One prefill's forwards as the chunk loop cuts them (`nextChunkEnd`), each `next` the next forward's rows.
+pub const ForwardWalk = struct {
+    pos: usize = 0,
+    loop_end: usize,
+    chunk: usize,
+    stride: usize,
+    adaptive: bool,
+
+    /// The loop of a prefill of `prefix_len` tokens at `default_chunk`; a checkpoint stride holds the snapshot backoff
+    /// out of it.
+    pub fn init(prefix_len: usize, default_chunk: usize, ssm_cp_stride: usize, adaptive_width: bool) ForwardWalk {
+        return .{
+            .loop_end = if (ssm_cp_stride > 0) prefix_len -| SSM_SNAPSHOT_BACKOFF else prefix_len,
+            .chunk = default_chunk,
+            .stride = ssm_cp_stride,
+            .adaptive = adaptive_width,
+        };
+    }
+
+    pub fn next(w: *ForwardWalk) ?struct { pos: usize, end: usize } {
+        if (w.pos >= w.loop_end) return null;
+        const pos = w.pos;
+        w.pos = nextChunkEnd(pos, w.loop_end, w.chunk, w.stride > 0, w.stride, 0, w.adaptive);
+        return .{ .pos = pos, .end = w.pos };
+    }
+};
+
+/// The widest forward any prefill of at most `prefix_len` tokens runs at `default_chunk`: the longest span a chunk
+/// absorbs whole (`nextChunkEnd`'s own merge, searched; a checkpoint boundary only cuts a chunk shorter). The rows a
+/// request's forward-width bill terms price, so its bill grows with its prompt.
+pub fn widestForward(prefix_len: usize, default_chunk: usize, adaptive_width: bool) usize {
+    if (prefix_len <= default_chunk) return prefix_len;
+    var lo: usize = default_chunk;
+    var hi: usize = prefix_len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo + 1) / 2;
+        if (nextChunkEnd(0, mid, default_chunk, false, 0, 0, adaptive_width) == mid) lo = mid else hi = mid - 1;
+    }
+    return lo;
+}
+
+/// The rows the forward a chunk of `width` starting at `pos` runs, in a loop that ends at `loop_end` (`nextChunkEnd`
+/// under the adaptive width): what the adaptive width prices a candidate at.
+pub fn adaptiveForwardRows(pos: usize, loop_end: usize, width: usize) usize {
+    if (pos >= loop_end) return width;
+    return nextChunkEnd(pos, loop_end, width, false, 0, 0, true) - pos;
+}
+
+test "the widest forward is the chunk loop's own: a tail it absorbs widens the forward before it" {
+    const t = testing;
+    // --prefill-chunk 512: a 1023-row prefix runs as one forward, and no prompt runs a wider one.
+    try t.expectEqual(@as(usize, 1023), widestForward(1023, 512, false));
+    try t.expectEqual(@as(usize, 1023), widestForward(100_000, 512, false));
+    // The adaptive width absorbs at most an eighth: a 575-row prefix runs as one forward.
+    try t.expectEqual(@as(usize, 512 + 63), widestForward(1023, 512, true));
+    try t.expectEqual(@as(usize, 540), widestForward(540, 512, true));
+    // A prompt under the chunk is one forward of its rows.
+    try t.expectEqual(@as(usize, 300), widestForward(300, 512, false));
+    for ([_]usize{ 513, 575, 576, 1023, 1024, 5000 }) |n| for ([_]bool{ false, true }) |adaptive| {
+        var walk = ForwardWalk.init(n, 512, 0, adaptive);
+        while (walk.next()) |f| try t.expect(f.end - f.pos <= widestForward(n, 512, adaptive));
+    };
+    var walk = ForwardWalk.init(2047, 512, 0, false);
+    var n: usize = 0;
+    while (walk.next()) |f| : (n += 1) try t.expectEqual(nextChunkEnd(f.pos, 2047, 512, false, 0, 0, false), f.end);
+    try t.expectEqual(prefillChunkCount(2047, 512, false, 0, 0, false), n);
+    // Mid-prompt a candidate runs its width; at the loop's end it absorbs the tail its width allows.
+    try t.expectEqual(@as(usize, 512), adaptiveForwardRows(0, 4096, 512));
+    try t.expectEqual(@as(usize, 560), adaptiveForwardRows(0, 560, 512));
+}
+
 /// Tokens held back from the chunked-prefill loop and forwarded together with
 /// the final (logits) forward when SSM checkpointing is active, so the
 /// always-on snapshot lands SSM_SNAPSHOT_BACKOFF tokens BEFORE the prompt end.

@@ -113,8 +113,15 @@ bill function's output on the committed fixture configs of all served packs: a b
   which a forward or an encode under its own cap reuses (`reusable`, up to its need: `forNeed`, compared at `bound`);
   the borrow, its read-back, an image encode, the warm and the chunk width read it. An encode read the live part alone
   and was refused at a size a forward ran at (free 2,427 MB: encode 7,812 MB, forward 10,240 MB, bill 8,836 MB). A
-  DeepSeek chunk is priced as the forward it becomes (`chunkTransientAt`: its width and the tail it may absorb, at the
-  position it ends), as the borrow prices it. Each once priced its own way, and a 4k DeepSeek prompt admitted at one
+  DeepSeek chunk is priced as the forward it becomes (`chunkTransientAt`, at the position it ends), as the borrow
+  prices it. **One rule for the forward a chunk becomes**: the loop's own cut (`prefill_plan.nextChunkEnd`, which
+  absorbs a tail under `tailMergeMaxFor`), walked by `ForwardWalk`. A request's bill prices the widest forward any
+  prompt of its unrestored length runs (`widestForward`, `bills.requestForwardRows`: every forward-width term, GLM's
+  transient and DeepSeek's chunk cap), so it grows with the prompt and a context search admits every split; this
+  prompt's own widest made the bill dip where a tail stops merging. The warm walks its exact forwards, and the
+  chunk-width hook prices a candidate at the loop's end as the forward it runs there (`adaptiveForwardRows`,
+  `AdaptiveWidthState.loop_end`). The reservation keeps the chunk. Priced at the chunk, a 1,024-token prompt at
+  `--prefill-chunk 512` ran one 1,023-row forward 190 MB over its bill on the cut fixture on MLX. Each once priced its own way, and a 4k DeepSeek prompt admitted at one
   width was refused by the borrow at another. A cache that reserves (Qwen, MiMo) runs its first chunk at the width
   admission billed (`firstChunkWidth`): the reservation grows inside that chunk, out of the hook's sight, and a cold
   start at the widest held up to ~2 GB past the bill. DeepSeek and GLM grow row by row and keep the wide start, which

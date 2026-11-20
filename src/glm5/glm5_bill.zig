@@ -145,7 +145,7 @@ pub fn glmCacheBytes(config: *const model_mod.ModelConfig, prompt_len: u64, max_
 
 pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, chunk: u64, warm: bills.WarmPrefix) ?u64 {
     return (glmCacheBytes(config, seq, max_tokens, kv_bits) +| @max(
-        glm5TransientBytes(config, seq, chunk, kv_bits) +| glmPrefixStateBytes(config, seq, warm),
+        glm5TransientBytes(config, seq, bills.requestForwardRows(config, seq, chunk, warm.matched_tokens), kv_bits) +| glmPrefixStateBytes(config, seq, warm),
         glmCommitStateBytes(config, seq, warm, kv_bits) +| glmThoughtPointBytes(config, warm),
     )) *| 5 / 4 +|
         (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +|

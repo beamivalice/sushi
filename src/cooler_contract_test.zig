@@ -6391,7 +6391,7 @@ test "cooler contract: a DeepSeek request admitted while an earlier borrower's p
     var chunk: u64 = 2048;
     const mt: u32 = 8;
     const borrowable_rest = bills.borrowableBytes(config);
-    while (m.cfg.chunkCapOn(on, chunk, seq) -| borrowable_rest <= m.cfg.forwardCap(borrow.verify_rows, seq + mt + borrow.verify_rows) + (64 << 20)) {
+    while (m.cfg.forwardCapOn(on, bills.requestForwardRows(config, seq, chunk, 0), seq) -| borrowable_rest <= m.cfg.forwardCap(borrow.verify_rows, seq + mt + borrow.verify_rows) + (64 << 20)) {
         if (seq >= 1 << 20) return error.SkipZigTest;
         seq *= 2;
         chunk = @min(seq, 8192);
@@ -6442,7 +6442,7 @@ test "cooler contract: a DeepSeek request admitted while an earlier borrower's p
         const lessee_room = @import("dsv41/dsv41_bill.zig").dsv41Headroom(config).bound();
         try engine.restoreLayer(last - 1);
         try engine.restoreLayer(last);
-        errdefer std.debug.print("double hold verdict: footprint {d} -> {d}; at rest available {d}, need {d}, fits {}; with the pools lent available {d}, need {d}, fits {}; the lessee's own headroom then {d} B (its prefill working set {d} B, the lendable left {d} B)\n", .{ fp_rest, fp_lent, at_rest, n0, fits_rest, at_lent, need_v, fits_lent, lessee_room, m.cfg.chunkCapOn(on, chunk, seq), borrowable_lent });
+        errdefer std.debug.print("double hold verdict: footprint {d} -> {d}; at rest available {d}, need {d}, fits {}; with the pools lent available {d}, need {d}, fits {}; the lessee's own headroom then {d} B (its prefill working set {d} B, the lendable left {d} B)\n", .{ fp_rest, fp_lent, at_rest, n0, fits_rest, at_lent, need_v, fits_lent, lessee_room, m.cfg.forwardCapOn(on, bills.requestForwardRows(config, seq, chunk, 0), seq), borrowable_lent });
         try testing.expect(fits_rest);
         try testing.expect(fits_lent);
     }

@@ -1178,15 +1178,16 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
     const mb: u64 = 1024 * 1024;
     const kv_bits: u64 = 8;
     // Turn A, width 2048, prompt 364,509, max_gen 421,923: the reply is billed whole, so the turn the incident admitted
-    // at 13,269 MB is refused by name now unless 20,845 MB fit.
+    // at 13,269 MB is refused by name now unless 21,067 MB fit: 20,845 MB at the chunk's own 2,048 rows, 222 MB for the
+    // 255 more rows its last forward may absorb (`bills.requestForwardRows`).
     try t.expectEqual(
-        @as(u64, 20_845),
+        @as(u64, 21_067),
         prefillNeededAtChunk(&cfg, 364_509, 421_923, kv_bits, 2048, .{}) / mb,
     );
-    // Turn B: 11,854 MB with the 8192-token headroom, 19,372 MB with its reply billed whole (the context's
-    // bill at its costliest split, which a shorter prompt sets here by 1 MB).
+    // Turn B: 11,854 MB with the 8192-token headroom, 19,427 MB with its reply billed whole (the context's bill at its
+    // costliest split, 19,372 MB at the chunk's own 512 rows, and 55 MB for the 63 its last forward may absorb).
     try t.expectEqual(
-        @as(u64, 19_372),
+        @as(u64, 19_427),
         prefillNeededAtChunk(&cfg, 368_208, 418_224, kv_bits, 512, .{}) / mb,
     );
 }
@@ -1231,7 +1232,7 @@ test "a streamed Qwen plans its QSA history beside its KV for every planned toke
     try std.testing.expectEqual(per_token * expertStreamingPlannedSeq(&cfg) + slotRingBytes(&cfg, 8), expertStreamingPlannedKvBytes(&cfg));
 }
 
-test "a 32 GB Mac's lean Flash-Next budget on MLX admits the context it advertises, 79,872 tokens" {
+test "a 32 GB Mac's lean Flash-Next budget on MLX admits the context it advertises, 75,776 tokens" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
@@ -1253,7 +1254,7 @@ test "a 32 GB Mac's lean Flash-Next budget on MLX admits the context it advertis
     // MLX's page grid takes up to 768 rows more than the 256-row step, which costs this tight budget its 80k.
     var sized = cfg;
     sized.pinned_context = ssdFirstSessionTokensNow(&cfg, 8, ceiling, active, 512);
-    try std.testing.expect(sized.pinned_context >= 79_872);
+    try std.testing.expect(sized.pinned_context >= 75_776);
     const prompt: u64 = sized.pinned_context - new_tokens;
     const budget = admissionAvailable(ceiling, active);
     try std.testing.expect(prefillNeededAtChunk(&sized, prompt, new_tokens, 8, 512, .{}) <= budget);
@@ -1475,7 +1476,9 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
     const reserved = @max(reservedCacheTokens(seq, 2048, 4096, getEffectiveContextLength(&cfg)), seq);
     const new_needed = prefillNeededAtChunk(&cfg, seq, 2048, 8, 4096, .{});
     const old_needed = new_needed +| (reserved * 3_072 * 5 / 4);
-    const ceiling: u64 = 26_000 * 1024 * 1024;
+    // 26,000 MiB held the bill at the chunk's own 4,096 rows (25,584 MiB); the 511 rows its last forward may absorb add
+    // 1,466 MiB (`bills.requestForwardRows`), so the ceiling that separates the two bills moved by as much.
+    const ceiling: u64 = 27_500 * 1024 * 1024;
     try t.expect(old_needed > ceiling);
     try t.expect(new_needed <= ceiling);
 }
@@ -1938,8 +1941,11 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
     const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
     // On a GDN MoE the envelope is the stream arm, not 3 x MLP.
-    const mlp: u64 = 8 * chunk * @max(cfg.hidden_size, prefillFfnWidth(&cfg)) * 2;
-    const envelope: u64 = @max(3 * mlp, mlp + chunk * prefillStreamBytesPerToken(&cfg));
+    // The forward-width terms price the widest forward the loop runs: 575 rows at width 512 (a tail under an eighth).
+    const fwd = bills.requestForwardRows(&cfg, seq, chunk, matched);
+    try t.expectEqual(@as(u64, 575), fwd);
+    const mlp: u64 = 8 * fwd * @max(cfg.hidden_size, prefillFfnWidth(&cfg)) * 2;
+    const envelope: u64 = @max(3 * mlp, mlp + fwd * prefillStreamBytesPerToken(&cfg));
     try t.expect(envelope > 3 * mlp);
     const gross =
         seq * kv_per_tok +
@@ -1953,18 +1959,18 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     // No score scratch (hd 256 is fused) and no dequant-GEMM weights (fwd 512
     // is below PREFILL_DQ_GEMM_MIN_M) at this width.
     try t.expect(trunk.prefillHeadDimFused(@intCast(cfg.prefillScoreHeadDim())));
-    try t.expect(chunk < trunk.PREFILL_DQ_GEMM_MIN_M);
+    try t.expect(fwd < trunk.PREFILL_DQ_GEMM_MIN_M);
     const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
-    try t.expectEqual(gross * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq), needed);
+    try t.expectEqual(gross * 5 / 4 + qsaMaskBytes(&cfg, fwd, seq), needed);
 
-    // AND THE VERDICT MOVES. 11,871 MB refused against 10,000 MB available;
-    // the honest checkpoint term brings it to 9,807 MB, so the turn is served.
+    // AND THE VERDICT MOVES. 11,927 MB refused against 10,000 MB available;
+    // the honest checkpoint term brings it to 9,862 MB, so the turn is served.
     const available: u64 = 10_000 * mb;
     try t.expect(needed < available);
-    try t.expectEqual(@as(u64, 9_807), needed / mb);
+    try t.expectEqual(@as(u64, 9_862), needed / mb);
     const before = gross - terms.checkpoint_bytes + @as(u64, launch_state.ssm_checkpoint_max) * per_cp;
-    try t.expectEqual(@as(u64, 11_871), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
-    try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) > available);
+    try t.expectEqual(@as(u64, 11_927), (before * 5 / 4 + qsaMaskBytes(&cfg, fwd, seq)) / mb);
+    try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, fwd, seq)) > available);
 }
 
 test "an arch without QSA bills its requests and transients free of the QSA kernel arms" {
@@ -1987,6 +1993,54 @@ test "an arch without QSA bills its requests and transients free of the QSA kern
         const got = [2]u64{ prefillTransientReserve(&glm, 8, 4096), prefillNeededAtChunk(&glm, 70_000, 4096, 8, 4096, .{}) };
         if (first) |want| try t.expectEqualSlices(u64, &want, &got) else first = got;
     };
+}
+
+test "the adaptive width prices a candidate as the forward the loop runs at it, a tail it absorbs at the prompt's end included" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const State = @import("../mtp_plan.zig").AdaptiveWidthState;
+    const cfg = fixtures.qwen4ExpLive364kConfig();
+    const kv_bits: u64 = 8;
+    const kv: u64 = 4096;
+    const headroom = bills.prefillChunkCost(&cfg, kv_bits, 1024, kv);
+    // Mid-prompt a 1024-row chunk runs 1024 rows, which the headroom holds.
+    var mid: State = .{ .loop_end = kv + 8192 };
+    try t.expectEqual(@as(u32, 1024), bills.adaptivePrefillWidth(&cfg, kv_bits, kv, headroom, 1024, 1024, &mid));
+    // 1,124 rows from the end the loop runs them as one forward (a tail under an eighth), which it does not.
+    var last: State = .{ .loop_end = kv + 1124 };
+    const got = bills.adaptivePrefillWidth(&cfg, kv_bits, kv, headroom, 1024, 1024, &last);
+    errdefer std.debug.print("1,124 rows left at a 1024-row width: kept {d}, headroom {d} MB, the merged forward costs {d} MB\n", .{ got, headroom >> 20, bills.prefillChunkCost(&cfg, kv_bits, 1124, kv) >> 20 });
+    try t.expect(got < 1024);
+}
+
+test "a request whose tail the chunk loop absorbs is billed at the merged forward's rows, on Sushi Cooler and on MLX" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const saved_adapt = bills.adaptive_chunk_override;
+    defer bills.adaptive_chunk_override = saved_adapt;
+    for ([_]bool{ true, false }) |cooler| {
+        var cfg = fixtures.qwen4ExpLive364kConfig();
+        if (cooler) {
+            cfg.cooler_for_test = true;
+            cfg.expert_layout = .exl3_k4;
+            cfg.expert_quant_codebook = .spec1;
+            cfg.trunk_quant = null;
+            cfg.quant_bits = 0;
+        }
+        // The per-chunk width absorbs at most an eighth of the chunk.
+        bills.adaptive_chunk_override = true;
+        const split = bills.requestHeldBytes(&cfg, 1024, 16, 8, 512, .{});
+        // Without it (`--prefill-chunk`) the loop absorbs a tail under 512 rows: one 1023-row forward.
+        bills.adaptive_chunk_override = false;
+        const merged = bills.requestHeldBytes(&cfg, 1024, 16, 8, 512, .{});
+        const rows: u64 = if (cooler) bills.coolerPrefillRowBytes(&cfg) else 0;
+        // The widest forward any 1,024-token prompt runs: 575 rows under the eighth, 1,023 without it.
+        const added: u64 = 1023 - 575;
+        errdefer std.debug.print("cooler {}: a 1024-token prompt at chunk 512 bills {d} MB at the eighth, {d} MB merged whole; the {d} rows the merge adds hold {d} MB\n", .{ cooler, split >> 20, merged >> 20, added, (added * rows) >> 20 });
+        try t.expect(!cooler or rows > 0);
+        try t.expect(merged > split);
+        try t.expect(merged - split >= added * rows);
+    }
 }
 
 test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a reserved token costs its storage, no net" {
@@ -2022,9 +2076,10 @@ test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a re
     try t.expectEqual(exact, held - bills.requestHeldBytes(&cfg, seq, 8192, 8, 2048, .{}));
     // The bill is what it holds and the margin, once.
     try t.expectEqual(held + bills.BILL_MARGIN_BYTES, prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}));
-    // Turn A of the live 364k session as a Cooler load: 15,741 MB exact with the margin, its chunk's transient from the
-    // layers' own rows (`qwen4_bill.PrefillRows`), where its MLX load keeps the calibrated net (20,845 MB).
-    try t.expectEqual(@as(u64, 15_741), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
+    // Turn A of the live 364k session as a Cooler load: 15,748 MB exact with the margin, its widest forward's transient
+    // from the layers' own rows (`qwen4_bill.PrefillRows`; 15,741 MB at the chunk's own 2,048 rows, 7 MB for the 255 its
+    // last forward may absorb), where its MLX load keeps the calibrated net (21,067 MB).
+    try t.expectEqual(@as(u64, 15_748), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
 }
 
 test "a request refused by its bill names the bill, what is available and the largest max_tokens that fits" {

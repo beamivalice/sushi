@@ -2457,8 +2457,8 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, reserved, kv_per_tok),
         .qsa_ring_bytes = slotRingBytes(config, kv_bits) +| head_qsa_ring,
         .mtp_head_kv_bytes = storage.head_kv,
-        .dflash_bytes = dflashRequestBytes(config, @min(chunk, @max(seq, 1))),
-        .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(chunk, seq)),
+        .dflash_bytes = dflashRequestBytes(config, requestForwardRows(config, seq, chunk, warm.matched_tokens)),
+        .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(requestForwardRows(config, seq, chunk, warm.matched_tokens), seq)),
         .uplift_16ths = billUplift16ths(config, seq),
         .cooler_row_bytes = coolerPrefillRowBytes(config),
         .cooler_turnover_bytes = config.ssmCheckpointBytes(),
@@ -2609,13 +2609,23 @@ pub fn requestHeldBytes(
     const hdim: u64 = config.head_dim;
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
-    return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
-        qsaMaskBilled(config, @min(chunk, @max(seq, 1)), seq) +
-        slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
-        fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
-        trunkDecodeScratchBytes(config, @min(chunk, @max(seq, 1))) +
+    // The forward terms price the widest forward; the reservation keeps the chunk.
+    const fwd = requestForwardRows(config, seq, chunk, warm.matched_tokens);
+    return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, fwd, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
+        qsaMaskBilled(config, fwd, seq) +
+        slidingBandScoreBytes(config, fwd) +
+        fp8DequantScratchBytes(config, fwd) +
+        trunkDecodeScratchBytes(config, fwd) +
         (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
         cadenceInflightBytes(mlx_mb_per_buffer);
+}
+
+/// The widest forward a request of `seq` tokens, `matched` of them restored, runs at `chunk` (`prefill_plan.widestForward`:
+/// the chunk loop's own cut, a tail it absorbs included), never under the chunk: the rows every forward-width term of
+/// its bill prices.
+pub fn requestForwardRows(config: *const model_mod.ModelConfig, seq: u64, chunk: u64, matched: u64) u64 {
+    const widest = prefill_plan.widestForward(@intCast(seq -| matched -| 1), @intCast(@max(chunk, 1)), adaptivePrefillChunkEnabled(config));
+    return @max(@min(chunk, @max(seq, 1)), widest);
 }
 
 /// Headroom a rung must clear beyond its own bill when the long-context gate is what widened
@@ -2796,13 +2806,8 @@ pub fn warmChunkPeakBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ch
     const prefix_len: usize = @intCast(warmLongestPrompt(config, chunk) - 1);
     var peak: u64 = 0;
     for ([_]usize{ 0, launch_state.ssm_checkpoint_stride }) |stride| {
-        const loop_end = if (stride > 0) prefix_len -| prefill_plan.SSM_SNAPSHOT_BACKOFF else prefix_len;
-        var pos: usize = 0;
-        while (pos < loop_end) {
-            const end = prefill_plan.nextChunkEnd(pos, loop_end, @intCast(chunk), stride > 0, stride, 0, false);
-            peak = @max(peak, chunkCostLending(config, kv_bits, end - pos, pos, 0));
-            pos = end;
-        }
+        var walk = prefill_plan.ForwardWalk.init(prefix_len, @intCast(chunk), stride, false);
+        while (walk.next()) |f| peak = @max(peak, chunkCostLending(config, kv_bits, f.end - f.pos, f.pos, 0));
     }
     return peak;
 }
@@ -2849,14 +2854,14 @@ pub fn adaptivePrefillWidth(
     if (cap == 0 or current == 0) return current;
     const floor: u32 = @min(cap, @as(u32, @intCast(prefill_plan.PREFILL_CHUNK_FLOOR)));
 
-    if (prefillChunkCost(config, kv_bits, current, kv_len) > headroom) {
+    if (adaptiveChunkCost(config, kv_bits, current, kv_len, st.loop_end) > headroom) {
         st.supporting = 0;
         st.ratcheted = true;
         var best: u32 = floor;
         for (PREFILL_CHUNK_LADDER) |rung| {
             const w: u32 = @min(rung, cap);
             if (w >= current) continue;
-            if (prefillChunkCost(config, kv_bits, w, kv_len) <= headroom) {
+            if (adaptiveChunkCost(config, kv_bits, w, kv_len, st.loop_end) <= headroom) {
                 best = w;
                 break;
             }
@@ -2873,7 +2878,7 @@ pub fn adaptivePrefillWidth(
         st.supporting = 0;
         return current;
     }
-    const asked: u64 = chunkAsk(config, prefillChunkCost(config, kv_bits, next, kv_len));
+    const asked: u64 = chunkAsk(config, adaptiveChunkCost(config, kv_bits, next, kv_len, st.loop_end));
     if (asked > headroom) {
         st.supporting = 0;
         return current;
@@ -2987,11 +2992,12 @@ pub fn adaptivePrefillWidenStillFits(
     kv_bits: u64,
     pos: usize,
     want: u32,
+    loop_end: ?usize,
     staged_host: u64,
 ) bool {
     if (!adaptivePrefillChunkEnabled(config)) return false;
     const headroom = prefillHeadroomNow(config, staged_host);
-    const asked: u64 = chunkAsk(config, prefillChunkCost(config, kv_bits, want, pos));
+    const asked: u64 = chunkAsk(config, adaptiveChunkCost(config, kv_bits, want, pos, loop_end));
     if (asked <= headroom) return true;
     log.info("[prefill] widen to {d} withdrawn at pos {d} (headroom {d} MB after the decode tick, cost {d} MB)\n", .{
         want,
@@ -3024,10 +3030,17 @@ pub fn adaptivePrefillWidthNow(
             next,
             pos,
             headroom >> 20,
-            prefillChunkCost(config, kv_bits, next, pos) >> 20,
+            adaptiveChunkCost(config, kv_bits, next, pos, st.loop_end) >> 20,
         });
     }
     return next;
+}
+
+/// `prefillChunkCost` of the forward a chunk of `width` at `kv_len` runs, a tail the loop absorbs at `loop_end` included
+/// (`prefill_plan.adaptiveForwardRows`); the width alone where the end is not known.
+fn adaptiveChunkCost(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, loop_end: ?usize) u64 {
+    const rows: u64 = if (loop_end) |e| prefill_plan.adaptiveForwardRows(@intCast(kv_len), e, @intCast(width)) else width;
+    return prefillChunkCost(config, kv_bits, rows, kv_len);
 }
 
 /// What a request may allocate: the ceiling less MLX's allocations. The SSD writers' host bytes are
@@ -5128,7 +5141,7 @@ test "prefillRequestTerms: a loaded DFlash2 assistant bills its window and chunk
     cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
     cfg.dflash_capture_bytes_per_token = (5 * 2560 + 2 * 2560) * 2 + 5 * 8 * 128 * 4;
     const on = prefillRequestTerms(&cfg, seq, 8192, 8, chunk, .{});
-    try t.expectEqual(cfg.dflash_window_bytes * 4 + cfg.dflash_capture_bytes_per_token * chunk + 64 * 1024 * 1024, on.dflash_bytes);
+    try t.expectEqual(cfg.dflash_window_bytes * 4 + cfg.dflash_capture_bytes_per_token * requestForwardRows(&cfg, seq, chunk, 0) + 64 * 1024 * 1024, on.dflash_bytes);
     const short = prefillRequestTerms(&cfg, 100, 8192, 8, chunk, .{});
     try t.expectEqual(cfg.dflash_window_bytes * 4 + cfg.dflash_capture_bytes_per_token * 100 + 64 * 1024 * 1024, short.dflash_bytes);
     var other = cfg;
@@ -5158,13 +5171,13 @@ test "the 64 GB Sushi-STQ-2.75bpw recipe's bills at both GDN widths: 250000 cont
     const warm = WarmPrefix{ .mtp_on = true };
     // The load bill's context term is the narrowest rung; at this pack's weights the 59,000 MB ceiling admits
     // the 2048 rung. With the SSD tier up (the default) the prefill holds 3 checkpoints, not the 16 it captures.
-    try t.expectEqual(@as(u64, 7_852), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 9_356), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
-    try t.expectEqual(@as(u64, 11_176), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 7_907), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_577), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
+    try t.expectEqual(@as(u64, 11_619), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
     cfg.gdn_state_f32 = false;
-    try t.expectEqual(@as(u64, 7_650), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 9_153), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
-    try t.expectEqual(@as(u64, 10_973), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 7_704), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_375), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
+    try t.expectEqual(@as(u64, 11_417), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
 }
 
 test "an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN widths" {
@@ -5693,8 +5706,13 @@ test "mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops the band she
     try t.expectEqual(MOE_PREFILL_COEXIST * 64 * chunk * (128 + chunk - 1) * 2, band);
     const composed = prefillNeededAtChunk(&cfg, seq, 2048, 8, chunk, .{});
     attn_kernels.sliding_prefill_fused_override = null;
+    // The bill's band is its widest forward's, a tail the loop absorbs included.
+    const widest = requestForwardRows(&cfg, seq, chunk, 0);
+    attn_kernels.sliding_prefill_fused_override = false;
+    const fwd_band = slidingBandScoreBytes(&cfg, widest);
+    attn_kernels.sliding_prefill_fused_override = null;
     const band_15 = MOE_PREFILL_COEXIST * 64 * 15 * (128 + 14) * 2;
-    try t.expectEqual(composed - band + band_15, prefillNeededAtChunk(&cfg, seq, 2048, 8, chunk, .{}));
+    try t.expectEqual(composed - fwd_band + band_15, prefillNeededAtChunk(&cfg, seq, 2048, 8, chunk, .{}));
 
     // One predicate decides the dispatch and the bill, at every width and switch state: a composed width bills its own
     // sheet, a fused one the widest composed width's, so the band never falls as the forward widens.
@@ -5973,7 +5991,7 @@ test "bill pin: prefillTransientReserve and prefillTransientReserveAtKv" {
         913670144, 2007965696, 3841163264, 5598519296, 912621568, 1751965696, 3832774656, 5342519296,
         1641361120, 1847799520, 6463500000, 6660108000, 1814295680, 1814295680, 6626604160, 6626604160,
         1637207552, 1701999104, 5399432704, 5462045184, 1635074560, 1747620352, 5397070336, 5505716736,
-        1657615872, 2954339040, 10467127296, 11762377440, 1657615872, 2954339040, 10467127296, 11762377440,
+        1657615872, 1698505440, 10467127296, 10506543840, 1657615872, 1698505440, 10467127296, 10506543840,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             for (pin_bits) |b| for ([_]u64{ 512, 4096 }) |chunk| {
@@ -6068,8 +6086,8 @@ test "bill pin: sushiContextBytesAt and the max-context search" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigs("maxSushiContext", &.{
-        4669249536, 512, 1048576, 1048576, 200000, 3584519520, 512, 1048576,
-        1048576, 200000, 2966441600, 512, 1048576, 1048576, 200000, 4337257344,
+        4802232960, 512, 1048576, 1048576, 200000, 3669110880, 512, 1048576,
+        1048576, 200000, 3049059800, 512, 1048576, 1048576, 200000, 3236252544,
         512, 1048576, 1048576, 200000,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6088,8 +6106,8 @@ test "bill pin: loadServingBill" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("loadServingBill", &.{
-        0, 1, 100000, 4669249536, 1048576, 8, 512, 0,
-        1, 100000, 3852954976, 1048576, 8, 512, 0, 0,
+        0, 1, 100000, 4802232960, 1048576, 8, 512, 0,
+        1, 100000, 3937546336, 1048576, 8, 512, 0, 0,
         0, 0,
     }, .{ 7, 7, 2, 2 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6112,7 +6130,7 @@ test "bill pin: loadServingBill" {
 
 test "bill pin: memoryContextAt and memoryContextAtChunk" {
     try pinConfigs("memoryContextAt", &.{
-        1048576, 1048576, 445952, 445952, 2051901, 2159911, 479887, 587897,
+        1048576, 1048576, 439808, 439808, 2051901, 2159911, 479887, 587897,
         3799051, 3953345, 922039, 1076334, 1076224, 1076224, 1076224, 1076224,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6246,9 +6264,9 @@ test "bill pin: the unnamed hot-cache ask" {
 
 test "bill pin: oneSessionEntryBytes and oneSessionFor" {
     try pinConfigs("oneSession", &.{
-        2250651648, 2250651648, 36548110336, 5327820800, 1073741824, 2250651648, 1526246400, 1526246400,
-        37603938976, 4271992160, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
-        1073741824, 2052183552, 96290880, 96290880, 36280382592, 5595548544, 1073741824, 96290880,
+        2250651648, 2250651648, 36432432640, 5443498496, 1073741824, 2250651648, 1526246400, 1526246400,
+        37433413536, 4442517600, 1073741824, 1526246400, 2052183552, 2052183552, 38071504936, 3804426200,
+        1073741824, 2052183552, 96290880, 96290880, 37224100992, 4651830144, 1073741824, 96290880,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             g.add(oneSessionEntryBytes(c, 8, 100_000, 1024));
@@ -6398,22 +6416,22 @@ test "bill pin: growCoexistBytes and the eval-window terms" {
 
 test "bill pin: prefillNeededAtChunk" {
     try pinConfigs("prefillNeededAtChunk", &.{
-        1112018944, 1123495936, 929714176, 1238953984, 1473158464, 1484635456, 1290853696, 1600093504,
-        1168953344, 1180430336, 927666176, 1295888384, 1530092864, 1541569856, 1288805696, 1657027904,
-        4465995776, 4759361536, 3568395776, 4903684096, 6210793472, 6508337152, 5313193472, 6652659712,
-        5705199616, 5998565376, 4015599616, 6142887936, 7480471552, 7778015232, 5790871552, 7922337792,
-        1718916480, 1737883520, 1624913280, 1737883520, 2374163840, 2393130880, 2280160640, 2393130880,
-        1945984640, 1964951680, 1798528640, 1964951680, 2601232000, 2620199040, 2453776000, 2620199040,
-        3628221280, 3647188320, 2642221280, 3647188320, 5690639200, 5709606240, 4704639200, 5709606240,
-        5130803840, 5149770880, 3274803840, 5149770880, 7237458560, 7256425600, 5381458560, 7256425600,
-        2089683520, 2089683520, 2089683520, 2274208320, 2729646720, 2729646720, 2729646720, 2914171520,
-        2121102080, 2121102080, 2121102080, 2305626880, 2760733440, 2760733440, 2760733440, 2945258240,
-        3000684160, 3000684160, 3000684160, 3369733760, 5014994560, 5014994560, 5014994560, 5384044160,
-        3747067520, 3747067520, 3747067520, 4116117120, 5760333440, 5760333440, 5760333440, 6129383040,
-        4024325344, 4024325344, 4024325344, 4024325344, 4024325344, 4024325344, 4024325344, 4024325344,
-        4024325344, 4024325344, 4024325344, 4024325344, 4024325344, 4024325344, 4024325344, 4024325344,
-        4341814144, 4341814144, 4341814144, 4341814144, 8116687744, 8116687744, 8116687744, 8116687744,
-        4341814144, 4341814144, 4341814144, 4341814144, 8116687744, 8116687744, 8116687744, 8116687744,
+        1158641464, 1170118456, 929714176, 1285576504, 1473158464, 1484635456, 1290853696, 1600093504,
+        1215575864, 1227052856, 927666176, 1342510904, 1530092864, 1541569856, 1288805696, 1657027904,
+        4598979200, 4892344960, 3701379200, 5036667520, 6443059712, 6740603392, 5545459712, 6884925952,
+        5838183040, 6131548800, 4148583040, 6275871360, 7712737792, 8010281472, 6023137792, 8154604032,
+        1803507840, 1822474880, 1624913280, 1822474880, 2374163840, 2393130880, 2280160640, 2393130880,
+        2030576000, 2049543040, 1798528640, 2049543040, 2601232000, 2620199040, 2453776000, 2620199040,
+        3712812640, 3731779680, 2726812640, 3731779680, 6033032800, 6051999840, 5047032800, 6051999840,
+        5215395200, 5234362240, 3359395200, 5234362240, 7579852160, 7598819200, 5723852160, 7598819200,
+        2172301720, 2172301720, 2089683520, 2356826520, 2729646720, 2729646720, 2729646720, 2914171520,
+        2203677440, 2203677440, 2121102080, 2388202240, 2760733440, 2760733440, 2760733440, 2945258240,
+        3083302360, 3083302360, 3083302360, 3452351960, 5349401560, 5349401560, 5349401560, 5718451160,
+        3829642880, 3829642880, 3829642880, 4198692480, 6094567040, 6094567040, 6094567040, 6463616640,
+        2979845344, 2979845344, 2825016544, 2979845344, 4024325344, 4024325344, 4024325344, 4024325344,
+        2979845344, 2979845344, 2825016544, 2979845344, 4024325344, 4024325344, 4024325344, 4024325344,
+        3240809344, 3240809344, 3240809344, 3240809344, 7487542144, 7487542144, 7487542144, 7487542144,
+        3240809344, 3240809344, 3240809344, 3240809344, 7487542144, 7487542144, 7487542144, 7487542144,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             for ([_]u64{ 1000, 100_000 }) |seq| for (pin_bits) |b| for ([_]u64{ 512, 2048 }) |chunk| for (pinWarms()) |w|
@@ -6433,7 +6451,7 @@ test "bill pin: defaultRequestBill" {
 test "bill pin: chooseRequestPrefillChunk and requestPrefillPick" {
     try pinConfigs("chooseRequestPrefillChunk", &.{
         4096, 1024, 4096, 2048, 4096, 1024, 4096, 2048,
-        2048, 1024, 2048, 2048, 4096, 1024, 4096, 2048,
+        1024, 1024, 1024, 2048, 4096, 1024, 4096, 2048,
         2048, 1024, 2048, 2048, 2048, 1024, 2048, 2048,
         2048, 1024, 2048, 2048, 2048, 1024, 2048, 2048,
         2048, 1024, 2048, 2048, 2048, 1024, 2048, 2048,
@@ -6492,7 +6510,7 @@ test "bill pin: prefillChunkCost and the adaptive width" {
         1705423360, 5489439232, 512, 512, 0, 1, 512, 512,
         0, 1, 512, 1024, 0, 0, 2048, 2048,
         0, 0, 512, 1024, 0, 0, 2048, 4096,
-        0, 0, 1, 1, 1853812229, 11766204229, 512, 512,
+        0, 0, 1, 1, 1698957536, 10510160608, 512, 512,
         0, 1, 512, 512, 0, 1, 512, 1024,
         0, 0, 2048, 2048, 0, 0, 512, 1024,
         0, 0, 2048, 4096, 0, 0, 1, 1,
@@ -6686,9 +6704,9 @@ test "bill pin: the wire-limit sentences" {
 
 test "bill pin: the streamed-load fit" {
     try pinConfigs("expertStreaming", &.{
-        65536, 1006731264, 4493721600, 3154214912, 1, 0, 65536, 978283392,
-        5028719200, 3125767040, 1, 0, 65536, 585941504, 4677861760, 2733425152,
-        1, 0, 65536, 64630784, 6949820416, 2212114432, 1, 0,
+        65536, 1006731264, 4679639040, 3154214912, 1, 0, 65536, 978283392,
+        5371112800, 3125767040, 1, 0, 65536, 585941504, 5012268760, 2733425152,
+        1, 0, 65536, 64630784, 6320674816, 2212114432, 1, 0,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             var s = c.*;
@@ -7762,7 +7780,7 @@ test "bill pin: loadRequirementBytes" {
         65632468992, 85899345920, 66840428544, 85899345920, 78467806720, 78467806720, 78467806720, 78467806720,
         65766686720, 85899345920, 65766686720, 85899345920, 78898760288, 78898760288, 78898760288, 78898760288,
         66060796416, 85899345920, 66060796416, 85899345920, 79266352320, 79266352320, 79266352320, 79266352320,
-        68384919333, 68384919333, 68384919333, 68384919333, 81269821221, 81269821221, 81269821221, 81269821221,
+        68230064640, 68230064640, 68230064640, 68230064640, 81114966528, 81114966528, 81114966528, 81114966528,
     }, struct {
         fn run(c: *const model_mod.ModelConfig, g: *PinGot) void {
             var streamed = c.*;

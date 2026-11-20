@@ -19,7 +19,6 @@ test "DeepSeek: the streamed request bill brackets the prefill peaks measured on
     config.expert_fill_peak_bytes = model_load.billedFillPeakBytes(&config, 9_911 << 20);
     // No decoder pool to lend: the bill is the working set's, as measured.
     config.expert_borrow_bytes = 0;
-    try std.testing.expectEqual(prefill_plan.TAIL_MERGE_MAX - 1, dsv41_config.tail_merge_rows);
     // Live per-chunk `peak_bytes - active_bytes` (`SUSHI_PREFILL_CHUNK_PEAK`), CED prefill, `--ssd-budget-gb 94`, the STQ d4
     // pack, DSpark on: `chunk` is the configured width, `seq` where the chunk ended (a last chunk absorbs its tail).
     const measured = [_]struct { seq: u64, chunk: u64, peak_mb: u64 }{
@@ -36,7 +35,12 @@ test "DeepSeek: the streamed request bill brackets the prefill peaks measured on
         .{ .seq = 2048, .chunk = 2048, .peak_mb = 4_907 + 250 },
         .{ .seq = 225_000, .chunk = 2048, .peak_mb = 5_124 + 250 },
     };
+    // Each ran at `--prefill-chunk`, whose loop absorbs a tail under 512 rows.
+    const sr = @import("../settings_resolve.zig");
+    const saved_chunk = sr.prefill_chunk;
+    defer sr.prefill_chunk = saved_chunk;
     for (measured) |m| {
+        sr.prefill_chunk = .{ .value = m.chunk, .source = .flag };
         const bill = bills.prefillNeededAtChunk(&config, m.seq, 16, 16, m.chunk, .{});
         const peak = m.peak_mb * 1_000_000;
         // Under-billing is a Metal OOM: at least a tenth over the peak. The upper bar keeps the net small.
@@ -219,7 +223,7 @@ test "DeepSeek's request bill takes its prefill working set out of the decoder p
     const seq: u64 = 524_288;
     const state = ((seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(true) + bills.checkpointReserve(&config, seq, 2048)) * 5 / 4;
     // A load on MLX: its chunk bills MLX's per-row rate.
-    const work = c.chunkCapOn(false, 2048, seq) + config.expertPoolBytes();
+    const work = c.forwardCapOn(false, bills.requestForwardRows(&config, seq, 2048, 0), seq) + config.expertPoolBytes();
     const decode = c.forwardCap(dsv41_config.verify_rows, seq + 2048 + dsv41_config.verify_rows);
     // No pool to lend: the whole working set is billed, as before.
     try t.expectEqual(state + work, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
@@ -290,7 +294,7 @@ test "with its decoder pools lendable, DeepSeek at --ssd-budget-gb 117 with DSpa
     try t.expectEqual(@as(u32, 1_000_000), bills.advertisedContextAt(&config, 16, ceiling, active, 2048));
     // Billing the working set to the request, with nothing to lend, advertises well under the whole context.
     config.expert_borrow_bytes = 0;
-    try t.expectEqual(@as(u32, 581_632), bills.advertisedContextAt(&config, 16, ceiling, active, 512));
+    try t.expectEqual(@as(u32, 969_728), bills.advertisedContextAt(&config, 16, ceiling, active, 512));
 }
 
 test "a default context never exceeds the checkpoint's window, and --ctx-size or model-settings still win" {
@@ -348,8 +352,9 @@ test "DeepSeek's request bill on a Cooler load is its exact state and one forwar
         const off = bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{});
         config.cooler_for_test = true;
         const net = stored * 5 / 4 - stored;
-        const engine_chunk = c.chunkCap(2048, seq);
-        try t.expectEqual(off - dsv41_config.dsv41_pool_bytes - net - c.chunkCapOn(false, 2048, seq) + engine_chunk, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
+        const rows = bills.requestForwardRows(&config, seq, 2048, 0);
+        const engine_chunk = c.forwardCapOn(true, rows, seq);
+        try t.expectEqual(off - dsv41_config.dsv41_pool_bytes - net - c.forwardCapOn(false, rows, seq) + engine_chunk, bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{}));
     }
 }
 
@@ -475,6 +480,11 @@ fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, exp
     const cooler = @import("../cooler_side.zig").onEngine(config);
     const bits = bills.defaultKvBits(config);
     const pool = config.expertPoolBytes();
+    // `--prefill-chunk`, as admission reads it.
+    const sr = @import("../settings_resolve.zig");
+    const saved_chunk = sr.prefill_chunk;
+    defer sr.prefill_chunk = saved_chunk;
+    if (explicit > 0) sr.prefill_chunk = .{ .value = explicit, .source = .flag };
     var free: u64 = if (cooler) pool else 0;
     const available = bills.admissionAvailableFor(config, avail, 0, free);
     const billed = bills.chooseRequestPrefillChunk(config, seq, max_tokens, bits, available, 0, explicit, .{});
@@ -482,8 +492,8 @@ fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, exp
     const adaptive = explicit == 0;
     const cap: u32 = @min(prefill_plan.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, seq, config.has_sliding_window, config.isMoe(), config.longCtxGated(), 0), config.prefillStartWidth());
     var cur: u32 = @intCast(prefill_plan.firstChunkWidth(config, billed, cap, adaptive));
-    var st: mtp_plan.AdaptiveWidthState = .{ .width_min = @intCast(billed), .width_max = @intCast(billed) };
     const loop_end = seq - 1;
+    var st: mtp_plan.AdaptiveWidthState = .{ .width_min = @intCast(billed), .width_max = @intCast(billed), .loop_end = loop_end };
     var pos: u64 = 0;
     while (pos < loop_end) {
         const grown = c.stateFixedBytes(config.dsparkOn()) + pos * c.stateBytesPerToken();
@@ -491,8 +501,7 @@ fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, exp
             const next = bills.adaptivePrefillWidth(config, bits, pos, bills.headroomFrom(config, avail, grown, 0, free).bound(), cur, cap, &st);
             if (next != 0 and next < cur) cur = next;
         }
-        var end = @min(pos + cur, loop_end);
-        if (end < loop_end and loop_end - end < prefill_plan.tailMergeMaxFor(cur, adaptive)) end = loop_end;
+        const end = prefill_plan.nextChunkEnd(pos, loop_end, cur, false, 0, 0, adaptive);
         const need = c.forwardCapOn(cooler, end - pos, end);
         const cover = bills.headroomFrom(config, avail, grown, 0, free).forNeed(need) +| config.expert_borrow_bytes;
         if (cover < need) return .{ .rows = end - pos, .end = end, .short = need - cover };
@@ -547,7 +556,7 @@ test "DeepSeek's Cooler request bill carries its one margin once, not once in th
     const c = &config.dsv41.?;
     for ([_]u64{ 100, 9_000, 225_000, 1_000_000 }) |seq| for ([_]u64{ 512, 2048 }) |chunk| {
         const stored = (seq + 2048) * c.stateBytesPerToken() + c.stateFixedBytes(config.dsparkOn()) + dsv41_bill.checkpointReserve(&config, seq, chunk);
-        const cap = @max(c.forwardCap(dsv41_config.verify_rows, seq + 2048 + dsv41_config.verify_rows), c.chunkCap(chunk, seq));
+        const cap = @max(c.forwardCap(dsv41_config.verify_rows, seq + 2048 + dsv41_config.verify_rows), c.forwardCapOn(true, bills.requestForwardRows(&config, seq, chunk, 0), seq));
         const exact = stored + cap - bills.BILL_MARGIN_BYTES;
         const bill = bills.prefillNeededAtChunk(&config, seq, 2048, 16, chunk, .{});
         errdefer std.debug.print("DeepSeek seq {d} chunk {d}: bill {d} MB = exact {d} MB + {d} MB of margin\n", .{ seq, chunk, bill >> 20, exact >> 20, (bill -% exact) >> 20 });
@@ -765,7 +774,7 @@ test "DeepSeek: a fully resident load whose ceiling fits it and its floor warm s
         while (ceiling < owned + 24 * (1 << 30)) : (ceiling += 32 * MiB) {
             if (!bills.expertStreamingConfigFits(&config, ceiling, 0, resident_weights)) continue;
             // The served warm takes the widest rung its headroom holds, and the fit leaves it one.
-            const head = warmHeadroomAfterLoad(&config, ceiling, 1 << 40, resident_weights);
+            const head = warmHeadroomAfterLoad(&config, ceiling, resident_weights);
             const rung = bills.warmChunkAdmitted(&config, bits, top, head);
             try t.expect(rung > 0);
             try t.expect(bills.warmChunkPeakBytes(&config, bits, rung) <= head);
@@ -803,7 +812,7 @@ test "DeepSeek: a resident load with no decoder pool to lend bills its widest fo
     try t.expectEqual(@as(u64, 0), bills.lendableBytes(&config));
     const seq: u64 = 4096;
     const wide = c.chunkCap(top, seq) - dsv41_config.BILL_MARGIN_BYTES;
-    try t.expect(wide >= dsv41_wide_bytes.bytes(c, @min(top + dsv41_config.tail_merge_rows, seq), seq));
+    try t.expect(wide >= dsv41_wide_bytes.bytes(c, bills.requestForwardRows(&config, seq, top, 0), seq));
     try t.expect(bills.prefillNeededAtChunk(&config, seq, 256, bills.defaultKvBits(&config), top, .{}) >= wide);
 }
 

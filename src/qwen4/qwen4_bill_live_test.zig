@@ -227,9 +227,12 @@ test "admission tries the ladder DOWN before refusing: a prompt that fits only a
         settings_resolve.prefill_chunk.value = 8192;
         settings_resolve.prefill_chunk.source = .default;
     }
-    const capped = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, bills.explicitPrefillChunk(), .{});
+    // The flag's loop absorbs a tail under 512 rows, so the floor's bill is its own, not the adaptive width's.
+    const available_flag = bills.prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width, .{});
+    try t.expect(available_flag > available);
+    const capped = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available_flag, pin, bills.explicitPrefillChunk(), .{});
     try t.expectEqual(floor_width, capped);
-    try t.expect(bills.prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, capped, .{}) <= available);
+    try t.expect(bills.prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, capped, .{}) <= available_flag);
 }
 
 test "the post-eviction re-ask never exceeds what live memory affords, and never runs on an arch that has no per-request width" {

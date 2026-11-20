@@ -34,6 +34,9 @@ pub const AdaptiveWidthState = struct {
     transitions: u32 = 0,
     width_min: u32 = 0,
     width_max: u32 = 0,
+    /// The prefill loop's end, in absolute positions: a candidate width is priced as the forward the loop runs at it
+    /// there, a tail it absorbs included. Null prices the width alone.
+    loop_end: ?usize = null,
 };
 
 /// Why a request left speculative decoding for the rest of its generation.

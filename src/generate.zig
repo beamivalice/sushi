@@ -1497,6 +1497,7 @@ pub const Generator = struct {
             ), @as(usize, xfm.config.prefillStartWidth())));
             adapt_state.width_min = @intCast(default_chunk);
             adapt_state.width_max = @intCast(default_chunk);
+            adapt_state.loop_end = ssm_cp_offset + loop_end;
             var cur_chunk: usize = default_chunk;
 
             // Reserve the whole request's cache capacity before the first chunk writes: a grow

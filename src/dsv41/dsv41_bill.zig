@@ -32,7 +32,6 @@ pub fn checkpointReserve(config: *const model_mod.ModelConfig, seq: u64, chunk: 
 
 pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, chunk: u64, warm: bills.WarmPrefix) ?u64 {
     _ = kv_bits;
-    _ = warm;
     const c = config.dsv41 orelse return null;
     const held = (@as(u64, seq) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
     // The cap a forward runs under (`Config.forwardCap`) is its bill. The prefill's comes out of the decoder pools it
@@ -41,7 +40,7 @@ pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u
     // Cooler load the engine's pool is the cap itself (its free buffers are inside it) and MLX holds nothing.
     const engine = @import("../cooler_side.zig").onEngine(config);
     const decode_end = seq +| max_tokens +| dsv41_borrow.verify_rows;
-    const capped = @max(c.forwardCap(dsv41_borrow.verify_rows, decode_end), c.chunkCapOn(engine, chunk, seq) -| bills.lendableBytes(config));
+    const capped = @max(c.forwardCap(dsv41_borrow.verify_rows, decode_end), c.forwardCapOn(engine, bills.requestForwardRows(config, seq, chunk, warm.matched_tokens), seq) -| bills.lendableBytes(config));
     // A Cooler cap carries the bill's one margin, which `bills.billMargin` adds to the bill: the bill takes the cost.
     const forward = if (engine) capped -| dsv41_config.BILL_MARGIN_BYTES else capped;
     const work = forward +| (if (engine) 0 else config.expertPoolBytes());
@@ -65,16 +64,16 @@ pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_
 pub fn transientReserve(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64, seq: u64) ?u64 {
     _ = kv_bits;
     const c = config.dsv41 orelse return null;
-    return c.chunkCapOn(@import("../cooler_side.zig").onEngine(config), chunk, seq) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+    // `chunk` is one forward's rows at `seq` (the warm and the adaptive width price a tail the loop absorbs).
+    return c.forwardCapOn(@import("../cooler_side.zig").onEngine(config), @min(chunk, @max(seq, 1)), seq) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 
-/// A chunk's live price at `kv_len` (the width hook, the served warm): the forward it becomes with the tail it may absorb
-/// under the per-chunk width (`prefill_plan.tailMergeMax`), at the position that forward ends at.
+/// A forward's live price at `kv_len` (the width hook, the served warm), at the position it ends at: `width` is its rows,
+/// a tail the loop absorbs included (`prefill_plan.ForwardWalk`, `adaptiveForwardRows`).
 pub fn chunkTransientAt(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64) ?u64 {
     _ = kv_bits;
     const c = config.dsv41 orelse return null;
-    const rows = width +| (prefill_plan.tailMergeMax(@intCast(width)) - 1);
-    return c.forwardCapOn(@import("../cooler_side.zig").onEngine(config), rows, kv_len +| rows) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+    return c.forwardCapOn(@import("../cooler_side.zig").onEngine(config), width, kv_len +| width) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 
 pub fn sessionBytes(config: *const model_mod.ModelConfig, kv_bits: u64) ?u64 {
