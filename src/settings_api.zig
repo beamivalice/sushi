@@ -738,6 +738,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = model_settings.defaultPath(&path_buf);
     var model_path: []const u8 = "";
+    var model_entry: ?*model_registry_mod.LoadedModel = null;
     var model_loaded = false;
     if (plan.model_id) |id| {
         const entry = sch.registry.resolveEntry(id) catch {
@@ -745,6 +746,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
             return;
         };
         model_path = entry.path;
+        model_entry = entry;
         sch.registry.mutex.lockUncancelable(sch.io);
         model_loaded = entry.state == .ready;
         var row = heldRow(entry);
@@ -760,7 +762,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         }
     }
 
-    const live: Live = .{ .sch = sch, .io = stream.io, .path = path };
+    const live: Live = .{ .sch = sch, .io = stream.io, .path = path, .model = model_entry };
     const saved = save(live, arena, stream.io, path, plan, model_path) catch |err| return writeFailed(allocator, stream, err);
     const messages = switch (saved) {
         .refused => |message| {
@@ -802,6 +804,8 @@ const Live = struct {
     sch: *scheduler.Scheduler,
     io: std.Io,
     path: []const u8,
+    /// The entry the request resolved: a save reaches it with no second lookup by path.
+    model: ?*model_registry_mod.LoadedModel,
 
     fn write(self: Live, arena: std.mem.Allocator, sections: []const model_settings.SectionEdits) !void {
         return model_settings.writeSectionsLocked(arena, self.io, self.path, sections);
@@ -811,8 +815,8 @@ const Live = struct {
         self.sch.registry.forgetLoadFailures();
     }
 
-    fn forgetModel(self: Live, model_path: []const u8) void {
-        if (self.sch.registry.peekByPath(model_path)) |entry| self.sch.registry.forgetLoadFailure(entry);
+    fn forgetModel(self: Live) void {
+        if (self.model) |entry| self.sch.registry.forgetLoadFailure(entry);
     }
 
     fn cacheBudget(self: Live, value: ?std.json.Value) []const u8 {
@@ -921,7 +925,7 @@ fn save(host: anytype, arena: std.mem.Allocator, io: std.Io, path: []const u8, p
         host.forgetAll();
     } else for (plan.model_edits) |e| {
         if (reachesLoad(e.key) and modelKeyMoves(arena, locks, model_settings.modelObject(&file, model_path), e)) {
-            host.forgetModel(model_path);
+            host.forgetModel();
             break;
         }
     }
@@ -1908,7 +1912,6 @@ const TestHost = struct {
     margin_at_forget: u64 = 0,
     skip_at_forget: bool = false,
     max_request_at_forget: usize = 0,
-    forgot_model: ?[]const u8 = null,
 
     const Event = enum { write, cache_budget, models_dir, forget_all, forget_model, rearm };
 
@@ -1940,9 +1943,8 @@ const TestHost = struct {
         self.note(.forget_all);
     }
 
-    fn forgetModel(self: *TestHost, model_path: []const u8) void {
+    fn forgetModel(self: *TestHost) void {
         self.sawServer();
-        self.forgot_model = model_path;
         self.note(.forget_model);
     }
 

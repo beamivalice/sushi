@@ -1596,11 +1596,14 @@ pub const ModelRegistry = struct {
     }
 
     /// A settings change that reaches loading invalidates the stored failure: the entry goes back to unloaded, so the next
-    /// request loads again with the new settings. A loading model's coming failure is not stored either.
+    /// request loads again with the new settings. A loading model's coming failure is not stored either. The settings
+    /// are keyed by folder, so every entry registered at `entry`'s folder (another root's id for it) is reached.
     pub fn forgetLoadFailure(self: *ModelRegistry, entry: *LoadedModel) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.forgetLoadFailureLocked(entry);
+        const folder = std.mem.trimEnd(u8, entry.path, "/");
+        var it = self.entries.valueIterator();
+        while (it.next()) |e| if (std.mem.eql(u8, std.mem.trimEnd(u8, e.*.path, "/"), folder)) self.forgetLoadFailureLocked(e.*);
     }
 
     /// `forgetLoadFailure` for every model, after a server-wide setting changed.
@@ -2247,6 +2250,23 @@ test "ModelRegistry: a settings change that reaches loading forgets the stored f
     try testing.expectEqual(LoadState.ready, c.state);
     reg.forgetLoadFailure(c);
     try testing.expectEqual(LoadState.ready, c.state);
+}
+
+test "ModelRegistry: a setting saved for a model's folder ends the stored failure of every model registered at that folder" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    // Two roots, one inside the other, discover one folder under two ids: model-settings.json keys it by path, so a
+    // save reaches both.
+    const nested = try reg.registerStub("org/m", "/models/org/m", 1024);
+    const flat = try reg.registerStub("m", "/models/org/m/", 1024);
+    const other = try reg.registerStub("x", "/models/x", 1024);
+    reg.mutex.lockUncancelable(reg.io);
+    for ([_]*LoadedModel{ nested, flat, other }) |e| reg.markErrorLocked(e, "FileNotFound");
+    reg.mutex.unlock(reg.io);
+    reg.forgetLoadFailure(nested);
+    try testing.expectEqual(LoadState.unloaded, nested.state);
+    try testing.expectEqual(LoadState.unloaded, flat.state);
+    try testing.expectEqual(LoadState.error_state, other.state);
 }
 
 test "ModelRegistry: a setting that reaches loading saved while the model loads ends the failure that load then stores" {
