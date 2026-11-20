@@ -4110,6 +4110,8 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
             slot.enable_mtp,
         );
         const decision = slot_admission.postEvictionPrefillChunk(admitted_prefill_chunk, reasked);
+        const kv_bits: u64 = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits;
+        slot.growth_commit = slot_admission.growthCommitAt(cfg, slot.full_prompt.len, slot.max_tokens, kv_bits, slot.growth_commit, decision, slot.enable_mtp);
         if (decision.widened) {
             log.info("[prefill] re-ask: width {d} -> {d} after the eviction pass returned {d} MB\n", .{ admitted_prefill_chunk, decision.width, evicted_live_bytes >> 20 });
         } else if (decision.moved) {

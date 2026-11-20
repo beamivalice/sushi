@@ -37,6 +37,13 @@ pub fn postEvictionPrefillChunk(admitted: u32, reasked: u32) PostEvictionWidth {
     };
 }
 
+/// The growth a request commits once the eviction pass re-asked its width: the cache it reserves at the width it runs
+/// (`bills.admissionCommitBytes`), re-priced where the re-ask moved the width.
+pub fn growthCommitAt(cfg: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, admitted_commit: u64, decision: PostEvictionWidth, mtp_on: bool) u64 {
+    if (!decision.widened and !decision.moved) return admitted_commit;
+    return @import("bills.zig").admissionCommitBytes(cfg, prompt_len, max_tokens, kv_bits, decision.width, mtp_on);
+}
+
 /// A GLM request whose prefix-cache checkpoints do not fit even with the hot cache evicted keeps
 /// fewer rather than be refused: the most below `cap` that `fits` admits, 0 = none; null = not
 /// even that.

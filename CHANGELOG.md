@@ -15,6 +15,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 | Low | 2 / 5 | 4 / 4 | 3 / 9 | 3 / 4 | 12 / 22 |
 | Total | 15 / 28 | 8 / 8 | 11 / 24 | 3 / 5 | 37 / 65 |
 
+- **A request whose prefill widens once the prompt cache makes room keeps the memory that width reserves promised**:
+  admission counted the narrower width's cache, so a request admitted beside it could take the difference.
 - **A prompt whose last few tokens the prefill folds into the chunk before them is admitted at that wider forward's
   memory**: it was billed at the chunk alone, so a short prompt could run past what admission reserved for it.
 - **Every model's load checks its memory against the declared GPU limit less its margin and what is already loaded**:

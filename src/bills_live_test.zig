@@ -823,3 +823,39 @@ test "beside a loaded model an MLX load's preflight reads at most the declared f
     errdefer std.debug.print("beside: floor {d} MiB less active {d} MiB = {d} MiB; preflight {d} MiB\n", .{ floor / MiB, r.active / MiB, (floor - r.active) / MiB, got / MiB });
     try testing.expect(got <= floor - r.active);
 }
+
+// The growth a request commits covers the cache the engine reserves at the width it runs at, which the scheduler re-asks
+// after the eviction pass. Readings: no declared limit, a 64 GB Mac; admission reads `before` free, the eviction pass
+// returns 8 GiB of hot cache and the re-ask reads that much more.
+test "a Qwen request's growth commit covers the cache it reserves at the width the post-eviction re-ask runs it at" {
+    const cfg = fixtures.qwen4ExpOomConfig();
+    const MiB: u64 = 1 << 20;
+    const saved_static = bills.static_ceiling_override;
+    defer bills.static_ceiling_override = saved_static;
+    bills.static_ceiling_override = 48 << 30;
+    const kv8 = trunk.KVQuantConfig.affine(8);
+    const seq: usize = 40_000;
+    var widened: usize = 0;
+    var bad: usize = 0;
+    var before: u64 = 2 << 30;
+    while (before <= 24 << 30) : (before += 1 << 30) {
+        const at_admit = (Machine{ .total = 64 << 30, .wired_mb = 0, .margin = 1 << 30, .avail = before, .gpu_floor = 0 }).pin();
+        const nums = bills.prefillBillNumbersNow(&cfg, seq, 4096, kv8, false, false);
+        const admitted = bills.requestPrefillChunkNow(&cfg, seq, 4096, kv8, false, 0, 0, false, false);
+        _ = at_admit.pin();
+        const after_pin = (Machine{ .total = 64 << 30, .wired_mb = 0, .margin = 1 << 30, .avail = before + (8 << 30), .gpu_floor = 0 }).pin();
+        const reasked = bills.requestPrefillChunkNow(&cfg, seq, 4096, kv8, false, 0, 0, false, false);
+        _ = after_pin.pin();
+        if (reasked <= admitted) continue;
+        widened += 1;
+        const reserved = bills.cacheCommitBytes(&cfg, seq, 4096, 8, reasked, false);
+        const commit = slot_admission.growthCommitAt(&cfg, seq, 4096, 8, nums.commit, slot_admission.postEvictionPrefillChunk(admitted, reasked), false);
+        if (commit < reserved) {
+            bad += 1;
+            std.debug.print("{d} MiB free at admission: commit {d} MiB at width {d}; the re-ask after 8 GiB evicted runs {d} rows and reserves {d} MiB (+{d} MiB uncommitted)\n", .{ before / MiB, commit / MiB, admitted, reasked, reserved / MiB, (reserved - commit) / MiB });
+        }
+    }
+    errdefer std.debug.print("{d} readings widened, {d} under-committed\n", .{ widened, bad });
+    try testing.expect(widened > 0);
+    try testing.expectEqual(@as(usize, 0), bad);
+}
