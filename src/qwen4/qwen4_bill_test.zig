@@ -2082,6 +2082,37 @@ test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a re
     try t.expectEqual(@as(u64, 15_748), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
 }
 
+test "on Sushi Cooler a prefill chunk bills its cache growth at the pool size class of the buffers it takes from empty, at every width" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    qwen4_qsa_select.qsa_score_fused_override = false;
+    defer qwen4_qsa_select.qsa_score_fused_override = null;
+    const cfg = coolerFlashNext();
+    const pool_class = @import("../tensor/pool_class.zig");
+    const ratio: u64 = @max(cfg.indexer_compress_ratio, 1);
+    const layers: u64 = cfg.attnCacheLayerCount();
+    try t.expect(layers > 0 and cfg.qsaHistoryBytesPerToken() > 0 and cfg.qsaScoreBankBytesPerToken() > 0);
+    for ([_]u64{ 1, 100, 511, 512, 2048, 8192 }) |width| {
+        // The chunk ends the prompt and one reply token follows: the cache grows once, to the request's end.
+        const end = width + 1;
+        const kv_rows = trunk.KVCache.heldRows(0, end, .{ .end = end }, &.{});
+        const state_rows = trunk.KVCache.heldRows(0, (end + ratio - 1) / ratio, (trunk.Hold{ .end = end }).per(ratio), &.{}) * ratio;
+        var held: u64 = 0;
+        var li: u32 = 0;
+        while (li < cfg.num_hidden_layers) : (li += 1) {
+            if (!cfg.isGlobalLayer(li)) continue;
+            const k: u64 = @as(u64, cfg.layerKVHeads(li)) * cfg.layerHeadDim(li) * 2;
+            const v: u64 = @as(u64, cfg.layerKVHeads(li)) * cfg.layerVHeadDim(li) * 2;
+            // Codes, then the scales and biases of each group of 64 (`kvBytesPerTokenAtBits`).
+            for ([_]u64{ k / 2, v / 2, k / 64, v / 64 }) |part| held += pool_class.poolBytes(kv_rows * part);
+            held += pool_class.poolBytes(state_rows * cfg.qsaHistoryBytesPerToken() / layers);
+            held += pool_class.poolBytes(state_rows * cfg.qsaScoreBankBytesPerToken() / layers);
+        }
+        errdefer std.debug.print("a {d}-row chunk's cache takes {d} B from the pool, billed {d} B\n", .{ width, held, bills.chunkGrowthBytes(&cfg, 8, width) });
+        try t.expect(bills.chunkGrowthBytes(&cfg, 8, width) >= held);
+    }
+}
+
 test "a request refused by its bill names the bill, what is available and the largest max_tokens that fits" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;

@@ -596,7 +596,8 @@ pub const KVCache = struct {
         }
     }
 
-    const chunk_step = 256;
+    /// The rows a cache buffer's capacity moves in.
+    pub const chunk_step = 256;
 
     /// Cap on the slack a single growth event adds, in tokens. Keeps the
     /// proportional term from over-allocating at very long context (25% of

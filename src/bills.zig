@@ -2789,11 +2789,21 @@ pub fn prefillChunkCost(
 }
 
 fn chunkCostLending(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, lent: u64) u64 {
-    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
-        statePerTokenBilled(config);
     // An arch whose forward's cap grows with the position it ends at prices the chunk as the forward it becomes.
     const transient = archHook("chunkTransientAt", u64, config, .{ kv_bits, width, kv_len }) orelse prefillTransientReserveAtKv(config, kv_bits, width, kv_len);
-    return (transient -| lent) +| (width *| per_tok);
+    return (transient -| lent) +| chunkGrowthBytes(config, kv_bits, width);
+}
+
+/// What a chunk's rows add to the cache. On a Cooler load each buffer is held at its pool size class and its capacity
+/// is whole `chunk_step`s: the KV's buffers at most one step past the rows, the QSA history's (a row spans
+/// `indexer_compress_ratio` tokens) a step of such rows, which `pooledCacheBytes` prices.
+pub fn chunkGrowthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64) u64 {
+    const kv_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
+    const state_tok = statePerTokenBilled(config);
+    if (!cooler_side.onEngine(config)) return width *| (kv_tok +| state_tok);
+    const step: u64 = trunk.KVCache.chunk_step;
+    const ratio: u64 = @max(config.indexer_compress_ratio, 1);
+    return pooledCacheBytes(config, (width +| step) *| kv_tok) +| pooledCacheBytes(config, (width +| step *| ratio) *| state_tok);
 }
 
 /// The widest ladder width, at most `top`, whose first chunk fits `headroom` with no decoder pool borrowed: a load's

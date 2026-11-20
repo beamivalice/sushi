@@ -385,6 +385,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   no term names come to under 1 MB, and the over-bill to 55 MB on tiny and 130 MB on the cuts, most of it the dq-GEMM
   weight below. A chunk's cap and the sizer's ask are its cost plus the margin, and a rung the long-context gate
   widened clears that bill alone (`PREFILL_WIDE_RUNG_MARGIN_PCT` stays for the fitted bills).
+- **A Cooler chunk bills the cache it grows at the pool's size classes** (`bills.chunkGrowthBytes`): each buffer is held a size class (at most a sixteenth) over its rows and its capacity moves in whole `chunk_step`s (the QSA history's in rows of `indexer_compress_ratio` tokens), so the rows' bytes alone were 1.6 MB short at 8,192 rows on the Qwen tiny, which a pool held at its cap fills.
 - **Open fitted terms on Cooler:** the dq-GEMM weight (`prefillDequantWeightBytes`, billed beside the rows though it
   lives at its own matmul) and a BF16 Cooler load's envelope. DeepSeek's wide forward is a shape sum
   ([dsv41-memory](dsv41-memory.md#wide-shape-sum)); its decode forward keeps `forward_held_bytes`, measured.

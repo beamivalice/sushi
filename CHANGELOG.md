@@ -30,6 +30,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **`--log-level debug` names every term of a prefill's memory bill** (`[bill] prefill seq=… envelope=… gross=…`), so a
   long-context request's cost is read off a live server instead of re-derived; a measured walkthrough on a 64 GB M1 Max
   is in the Qwen performance notes. Thanks @catalinb13.
+- **A Sushi Cooler prefill chunk is billed for the size class and capacity step of the cache it grows**, where its rows' bytes alone left a long chunk about a megabyte over its bill when the pool sits at its cap.
 
 ## v1.7.2 — Memory you can count on, faster concurrent Qwen
 
