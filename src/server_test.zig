@@ -129,6 +129,8 @@ var each_arch_ran: u32 = 0;
 
 test "server: a served cell runs on every arch whose fixture is present and notes the one it skips (DSV41_TINY)" {
     if (std.c.getenv("DSV41_TINY") == null) return error.SkipZigTest;
+    // The arch it pretends is missing must be built, or there is nothing to skip and no note to read.
+    try @import("test_note.zig").needArchs(&.{ "qwen4", "dsv41" });
     arch_missing_for_test = "qwen4";
     defer arch_missing_for_test = null;
     each_arch_ran = 0;
