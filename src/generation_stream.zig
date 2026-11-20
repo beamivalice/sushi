@@ -34,6 +34,7 @@ const formatLogprobsObject = logprobs.formatLogprobsObject;
 const io_util = @import("io_util.zig");
 const mtp_plan = @import("mtp_plan.zig");
 const sampler = @import("sampler.zig");
+const tool_calls_mod = @import("tool_calls.zig");
 const nowSecs = io_util.nowSecs;
 const nowMs = io_util.nowMs;
 const nowMsMonotonic = io_util.nowMsMonotonic;
@@ -392,6 +393,8 @@ pub const ThoughtResume = struct {
     stops: []const []const u8,
     has_tools: bool,
     allow_parallel: bool,
+    /// The request's tool_choice: a forced call stays forced in the continuation.
+    tool_choice: tool_calls_mod.ToolChoice = .auto,
     /// Why this request is not continued; `finish_details` names it when its turn ends inside the thought.
     kept: ?reply_mod.ThoughtKept = null,
 
@@ -416,7 +419,8 @@ const ThoughtStep = union(enum) {
 
 /// After `slot`'s turn ends: whether it ended on its end-of-turn token with a thought and nothing else, and if so the
 /// once-only continuation, submitted, or why none runs. `params` is what `slot` was submitted with.
-fn continueAfterThought(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler, tok: *const Tokenizer, r: *const ThoughtResume, slot: *scheduler_mod.Slot, generated: []const u32, params: scheduler_mod.SubmitParams) !ThoughtStep {
+/// `force` holds the continuation's forced call, if any, until its slot completes.
+fn continueAfterThought(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler, tok: *const Tokenizer, r: *const ThoughtResume, slot: *scheduler_mod.Slot, generated: []const u32, params: scheduler_mod.SubmitParams, force: *?generate_mod.CallForce) !ThoughtStep {
     if (!std.mem.eql(u8, slot.finish_reason, "stop") or slot.finish_details != null) return .none;
     const stop = slot.stop_token orelse return .none;
     if (!generate_mod.isEosId(stop, slot.eos_token_ids) or !server_state.continueAfterThought()) return .none;
@@ -454,14 +458,23 @@ fn continueAfterThought(allocator: std.mem.Allocator, sch: *scheduler_mod.Schedu
     next.full_prompt = prompt;
     next.cached_tokens = 0;
     next.max_tokens = left;
-    next.sampling.think_bound = null;
-    next.sampling.call_force = null;
-    next.sampling.think_penalty.phase = .after;
+    next.sampling = continuationSampling(allocator, tok, r, prompt, params.sampling, force);
     const bridge = if (think_tags.indexOfThinkCloseTag(text, 0) == null) try tok.encode(allocator, think_tags.BARE_THINK_CLOSER) else try allocator.alloc(u32, 0);
     errdefer allocator.free(bridge);
     const cont = try sch.submit(next);
     log.info("  [thought] request {d} ended its turn inside its thought: continued once after its closed think block as request {d} ({d} prompt tokens, {d} max_tokens left)\n", .{ slot.request_id, cont.request_id, prompt.len, left });
     return .{ .continued = .{ .slot = cont, .bridge = bridge } };
+}
+
+/// The request's sampling for its continuation, which starts after the closed thought.
+fn continuationSampling(allocator: std.mem.Allocator, tok: *const Tokenizer, r: *const ThoughtResume, prompt: []const u32, base: sampler.SamplingParams, force: *?generate_mod.CallForce) sampler.SamplingParams {
+    var s = base;
+    s.think_bound = null;
+    s.think_penalty.phase = .after;
+    // The prompt closed the thought, so a forced call is armed as an answer's: committed at the first token.
+    force.* = server_mod.armCallForce(allocator, tok, r.chat_config, prompt, false, r.tool_choice, r.tools_json);
+    s.call_force = if (force.*) |*f| f else null;
+    return s;
 }
 
 fn keptThought(slot: *const scheduler_mod.Slot, k: reply_mod.ThoughtKept) ThoughtStep {
@@ -608,13 +621,16 @@ pub fn nonStreamingViaScheduler(
     defer if (early) |*e| e.gate.deinit(allocator);
     var end = try drainSettled(sch, slot, conn, allocator, &output_ids, if (early) |*e| e else null);
     if (end == .failed) return slotFailure(slot);
-    // The part a continuation after the thought generates: its slot, and where its tokens start in `output_ids`.
+    // The part a continuation after the thought generates: its forced call, its slot, and where its tokens start in
+    // `output_ids`. The force outlives the slot.
+    var force: ?generate_mod.CallForce = null;
+    defer if (force) |*f| f.deinit(allocator);
     var cont: ?*scheduler_mod.Slot = null;
     defer if (cont) |c| sch.complete(c);
     var cont_from: usize = 0;
     var bridged: usize = 0;
     var details = slot.finish_details;
-    if (end == .done) if (thought) |r| switch (try continueAfterThought(allocator, sch, tok, r, slot, output_ids.items, params)) {
+    if (end == .done) if (thought) |r| switch (try continueAfterThought(allocator, sch, tok, r, slot, output_ids.items, params, &force)) {
         .none => {},
         .kept => |d| details = d,
         .continued => |c| {
@@ -1070,6 +1086,8 @@ pub const StreamingTokenStream = struct {
         bridge_at: usize = 0,
         /// Why the turn that ended inside its thought was not continued.
         kept: ?[]const u8 = null,
+        /// The continuation's forced call, freed once its slot completes.
+        force: ?generate_mod.CallForce = null,
     };
 
     /// Phase A2-streaming: build a token stream backed by a scheduler Slot.
@@ -1090,6 +1108,7 @@ pub const StreamingTokenStream = struct {
             t.ids.deinit(allocator);
             allocator.free(t.bridge);
             if (t.first != null) t.sch.complete(self.slot.?);
+            if (t.force) |*f| f.deinit(allocator);
         }
     }
 
@@ -1104,7 +1123,7 @@ pub const StreamingTokenStream = struct {
         const t = if (self.thought) |*t| t else return false;
         if (t.first != null) return false;
         const s = self.slot.?;
-        switch (try continueAfterThought(allocator, t.sch, t.tok, t.render, s, t.ids.items, t.params)) {
+        switch (try continueAfterThought(allocator, t.sch, t.tok, t.render, s, t.ids.items, t.params, &t.force)) {
             .none => return false,
             .kept => |d| {
                 t.kept = d;
@@ -3318,4 +3337,47 @@ test "a files read that ran out of memory is answered with its own refusal, not 
     var buf: [4096]u8 = undefined;
     const raw = try answerOf("b", error.InsufficientMemory, &report, reg, &buf);
     try std.testing.expect(std.mem.indexOf(u8, raw, "500000") == null);
+}
+
+test "a continued thought keeps the request's forced tool_choice: the call is committed at the continuation's first token on every family" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_start|>", "<|im_end|>", "<arg_key>" });
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
+    const families = @import("arch_fixtures_test.zig").forced_families;
+    if (families.len == 0) return error.SkipZigTest;
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
+    const user: chat_mod.Message = .{ .role = "user", .content = "What time is it?" };
+    for (families) |f| {
+        var config = chat_mod.ChatConfig{ .chat_template = f.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        try config.compile();
+        defer config.dropCompiled();
+        for ([_]tool_calls_mod.ToolChoice{ .required, .{ .named = "get_time" } }) |choice| {
+            const instruction = try choice.instruction(a);
+            defer if (instruction) |i| a.free(i);
+            const r: ThoughtResume = .{ .chat_config = &config, .messages = &.{user}, .tools_json = tools, .tool_choice_instruction = instruction, .enable_thinking = true, .effort = null, .stops = &.{}, .has_tools = true, .allow_parallel = true, .tool_choice = choice };
+            const turns = [_]chat_mod.Message{ user, .{ .role = "assistant", .content = "", .reasoning_content = "hmm" } };
+            const prompt = try chat_mod.formatChat(a, &tok, &turns, &config, tools, instruction, true, null, true);
+            defer a.free(prompt);
+            var force: ?generate_mod.CallForce = null;
+            defer if (force) |*cf| cf.deinit(a);
+            const sampling = continuationSampling(a, &tok, &r, prompt, .{}, &force);
+            errdefer std.debug.print("[{s}] {s}\n", .{ f.head, @tagName(choice) });
+            const cf = sampling.call_force orelse return error.ForceNotCarried;
+            // The thought is closed in the prompt: the call starts at the continuation's first token.
+            var published = std.ArrayList(u32).empty;
+            defer published.deinit(a);
+            while (true) switch (cf.decide(published.items)) {
+                .force => |id| try published.append(a, id),
+                .choose => |ids| try published.append(a, ids[0]),
+                .sample => if (cf.pending()) return error.CallNotAtFirstToken else break,
+            };
+            const text = try tok.decode(a, published.items);
+            defer a.free(text);
+            const want = try std.mem.concat(a, u8, &.{ f.head, "get_time", f.name_tail });
+            defer a.free(want);
+            try std.testing.expectEqualStrings(want, text);
+        }
+    }
 }

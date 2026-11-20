@@ -726,6 +726,7 @@ pub fn handleAnthropicMessages(
         .stops = stop_sequences.items,
         .has_tools = has_tools,
         .allow_parallel = prompt.allow_parallel_tools,
+        .tool_choice = if (has_tools) prompt.tool_choice else .auto,
         .kept = generation_stream.ThoughtResume.keptFor(continue_final, req_media.chain.len > 0, false, sampling.constraint != null),
     };
     // Hand vision ownership to the sub-handler (slot takes it on submit).

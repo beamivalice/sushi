@@ -2835,6 +2835,7 @@ pub fn handleChatCompletions(
         .stops = stop_sequences.items,
         .has_tools = has_tools,
         .allow_parallel = allow_parallel_tools,
+        .tool_choice = if (has_tools) tool_choice else .auto,
         .kept = generation_stream.ThoughtResume.keptFor(continue_final, req_media.chain.len > 0, asked_logprobs != null, sampling.constraint != null),
     };
     // Hand vision ownership off to the sub-handler, which transfers it to

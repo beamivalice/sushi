@@ -986,6 +986,7 @@ fn handleResponsesInner(
         .stops = stop_sequences.items,
         .has_tools = active_has_tools,
         .allow_parallel = parallel_tool_calls_echo,
+        .tool_choice = if (active_has_tools) tool_choice else .auto,
         .kept = generation_stream.ThoughtResume.keptFor(false, req_media.chain.len > 0, false, sampling.constraint != null),
     };
     var result: generate_mod.GenerationResult = undefined;
