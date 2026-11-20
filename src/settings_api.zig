@@ -551,19 +551,19 @@ pub fn parseRequest(arena: std.mem.Allocator, body: []const u8) Parsed {
     return .{ .ok = plan };
 }
 
-/// Writes the named families' tables (only what differs from built-in) and publishes them for the next request. Every
-/// family is checked before any is written; returns the refusal text, or null.
-pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans: [effort_mod.family_count]EffortPlan) !?[]const u8 {
-    // Read, check, write and publish under the write lock: a save never merges into a file another one is rewriting.
-    model_settings.lockWrites(io);
-    defer model_settings.unlockWrites(io);
-    var file = model_settings.load(arena, io, path);
-    defer file.deinit();
-    var next: [effort_mod.family_count]effort_mod.Edits = undefined;
+/// Checks every named family's table against the file `file` holds and builds the sections that write it (only what
+/// differs from built-in); returns the refusal text, or null with `next` and `sections` filled.
+fn effortSections(
+    arena: std.mem.Allocator,
+    file: *const model_settings.Settings,
+    plans: [effort_mod.family_count]EffortPlan,
+    next: *[effort_mod.family_count]effort_mod.Edits,
+    sections: *std.ArrayList(model_settings.SectionEdits),
+) !?[]const u8 {
     for (effort_mod.families) |f| {
         const p = plans[@intFromEnum(f)];
         const n = &next[@intFromEnum(f)];
-        n.* = model_settings.effortEdits(&file, f, false);
+        n.* = model_settings.effortEdits(file, f, false);
         if (!p.named) continue;
         if (p.reset) n.* = .{};
         if (p.default) |d| n.default = d;
@@ -579,9 +579,6 @@ pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans
         };
         n.* = effort_mod.normalize(f, n.*);
     }
-    // Every family in one rewrite, so a failed write leaves none of them saved.
-    var sections: [effort_mod.family_count]model_settings.SectionEdits = undefined;
-    var n_sections: usize = 0;
     for (effort_mod.families) |f| {
         if (!plans[@intFromEnum(f)].named) continue;
         const n = next[@intFromEnum(f)];
@@ -589,14 +586,8 @@ pub fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans
         edits[0] = .{ .key = "default", .value = if (n.default) |d| .{ .string = @tagName(d) } else null };
         for (effort_mod.table_words, n.rows, 1..) |word, row, i| edits[i] = .{ .key = @tagName(word), .value = if (row.isEmpty()) null else try effort_mod.rowJson(arena, f, row) };
         var buf: [64]u8 = undefined;
-        sections[n_sections] = .{ .section = try arena.dupe(u8, effort_mod.sectionName(&buf, f)), .edits = edits };
-        n_sections += 1;
-    }
-    try model_settings.writeSectionsLocked(arena, io, path, sections[0..n_sections]);
-    for (effort_mod.families) |f| {
-        if (!plans[@intFromEnum(f)].named) continue;
-        effort_mod.publish(f, next[@intFromEnum(f)]);
-        log.info("[effort] {s}: table saved, serving from the next request\n", .{@tagName(f)});
+        const name = try arena.dupe(u8, effort_mod.sectionName(&buf, f));
+        try sections.append(arena, .{ .section = name, .edits = edits });
     }
     return null;
 }
@@ -769,50 +760,27 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         }
     }
 
-    var message_buf: [160]u8 = undefined;
-    const write = struct {
-        fn run(a: std.mem.Allocator, io: std.Io, p: []const u8, section: []const u8, edits: []const Edit) !void {
-            if (edits.len > 0) try model_settings.writeEdits(a, io, p, section, edits);
-        }
-    }.run;
-    if (plan.namesEffort()) {
-        const refused = applyEffort(arena, stream.io, path, plan.effort) catch |err| return writeFailed(allocator, stream, err);
-        if (refused) |message| {
+    const live: Live = .{ .sch = sch, .io = stream.io, .path = path };
+    const saved = save(live, arena, stream.io, path, plan, model_path) catch |err| return writeFailed(allocator, stream, err);
+    const messages = switch (saved) {
+        .refused => |message| {
             try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", message, 400);
             return;
-        }
-    }
-    write(allocator, stream.io, path, model_settings.server_section, plan.server_edits) catch |err| return writeFailed(allocator, stream, err);
-    write(allocator, stream.io, path, model_path, plan.model_edits) catch |err| return writeFailed(allocator, stream, err);
-    forgetFailuresFor(sch.registry, plan, model_path);
+        },
+        .saved => |m| m,
+    };
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
     try w.writeAll("{\"ok\":true,\"applied\":{");
     var first = true;
-    for (plan.server_edits) |e| {
+    for (plan.server_edits, messages) |e, message| {
         if (!first) try w.writeAll(",");
         first = false;
         try w.print("\"{s}\":", .{e.key});
-        if (std.mem.eql(u8, e.key, "prefix_cache_disk_gb")) {
-            try writeJson(w, applyCacheBudget(sch, e.value));
-        } else if (std.mem.eql(u8, e.key, "update_check") or std.mem.eql(u8, e.key, "pack_update_check")) {
-            try writeJson(w, applyUpdateCheck(&model_settings.launch_locks, e.key, e.value));
-        } else if (std.mem.eql(u8, e.key, "skip_mem_preflight")) {
-            try writeJson(w, applySkipMemPreflight(&model_settings.launch_locks, e.value));
-        } else if (std.mem.eql(u8, e.key, "max_request_mb")) {
-            server_state.setMaxRequestMb(if (e.value) |v| std.math.cast(u32, v.integer) orelse return error.InvalidSetting else null);
-            try writeJson(w, "applies to the next request");
-        } else if (std.mem.eql(u8, e.key, "wired_margin_gib")) {
-            try writeJson(w, applyWiredMargin(&model_settings.launch_locks, e.value));
-        } else if (std.mem.eql(u8, e.key, "port")) {
-            try writeJson(w, portMessage(&model_settings.launch_locks));
-        } else {
-            try writeJson(w, applyModelsDir(sch, &message_buf));
-        }
+        try writeJson(w, message);
     }
-    if (savesSsdTier(plan)) sch.requestDiskRearm();
     if (plan.namesEffort()) {
         if (!first) try w.writeAll(",");
         first = false;
@@ -828,13 +796,137 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
     try http.sendResponse(stream, "200 OK", "application/json", out.written());
 }
 
-/// A saved setting that a load reads ends the stored failure of the model it names, or of every model for a server one.
-fn forgetFailuresFor(registry: *model_registry_mod.ModelRegistry, plan: Plan, model_path: []const u8) void {
-    for (plan.server_edits) |e| if (reachesLoad(e.key)) return registry.forgetLoadFailures();
-    for (plan.model_edits) |e| if (reachesLoad(e.key)) {
-        if (registry.peekByPath(model_path)) |entry| registry.forgetLoadFailure(entry);
-        return;
-    };
+/// What a save reaches beyond its own file: the scheduler's SSD tiers and model rescan, and the registry's stored load
+/// failures. `Live` is the running server's; a test stands in its own.
+const Live = struct {
+    sch: *scheduler.Scheduler,
+    io: std.Io,
+    path: []const u8,
+
+    fn write(self: Live, arena: std.mem.Allocator, sections: []const model_settings.SectionEdits) !void {
+        return model_settings.writeSectionsLocked(arena, self.io, self.path, sections);
+    }
+
+    fn forgetAll(self: Live) void {
+        self.sch.registry.forgetLoadFailures();
+    }
+
+    fn forgetModel(self: Live, model_path: []const u8) void {
+        if (self.sch.registry.peekByPath(model_path)) |entry| self.sch.registry.forgetLoadFailure(entry);
+    }
+
+    fn cacheBudget(self: Live, value: ?std.json.Value) []const u8 {
+        return applyCacheBudget(self.sch, value);
+    }
+
+    fn modelsDir(self: Live, arena: std.mem.Allocator) []const u8 {
+        return applyModelsDir(self.sch, arena.alloc(u8, 160) catch return "saved; models rescanned");
+    }
+
+    fn rearmDisk(self: Live) void {
+        self.sch.requestDiskRearm();
+    }
+};
+
+pub const Outcome = union(enum) {
+    /// The save broke a rule of the effort tables; nothing was written.
+    refused: []const u8,
+    /// One answer per server edit, in the plan's order.
+    saved: []const []const u8,
+};
+
+fn differs(comptime T: type, was: ?T, now: ?T, default: T) bool {
+    return (was orelse default) != (now orelse default);
+}
+
+fn sameText(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// Whether saving `e` moves what the server runs on: a value other than the one the file held (an absent key is its
+/// default), and never under a flag that pins the key. Keys no load reads never move one.
+fn serverKeyMoves(locks: *const model_settings.LaunchLocks, was: model_settings.Server, e: Edit) bool {
+    const eql = std.mem.eql;
+    const now_int: ?u32 = if (e.value) |v| if (v == .integer) std.math.cast(u32, v.integer) else null else null;
+    if (eql(u8, e.key, "models_dir")) return !locks.models_dir.set and !sameText(was.models_dir, if (e.value) |v| v.string else null);
+    if (eql(u8, e.key, "prefix_cache_disk_gb")) return !locks.prefix_cache_disk_gb.set and differs(u32, was.prefix_cache_disk_gb, now_int, @intCast(disk_placement.DEFAULT_DISK_CAP >> 30));
+    if (eql(u8, e.key, "skip_mem_preflight")) return !locks.skip_mem_preflight.set and differs(bool, was.skip_mem_preflight, if (e.value) |v| v.bool else null, false);
+    if (eql(u8, e.key, "max_request_mb")) return differs(u32, was.max_request_mb, now_int, model_settings.default_max_request_mb);
+    if (eql(u8, e.key, "wired_margin_gib")) return !locks.wired_margin_gib.set and differs(u32, was.wired_margin_gib, now_int, model_settings.default_wired_margin_gib);
+    return false;
+}
+
+/// A model's key moves what its next load reads when the file's value changes and no flag pins the key; a key left
+/// out of the file reads as the model's own default, so only the file's text is compared.
+fn modelKeyMoves(arena: std.mem.Allocator, locks: *const model_settings.LaunchLocks, was: ?std.json.ObjectMap, e: Edit) bool {
+    if (locks.model(e.key)) |lock| if (lock.set) return false;
+    const old: ?std.json.Value = if (was) |o| o.get(e.key) else null;
+    if (old == null or e.value == null) return old == null and e.value == null;
+    const a = std.json.Stringify.valueAlloc(arena, old.?, .{}) catch return true;
+    const b = std.json.Stringify.valueAlloc(arena, e.value.?, .{}) catch return true;
+    return !std.mem.eql(u8, a, b);
+}
+
+/// Applies one saved server key; `parseRequest` has checked its value, so nothing here fails after the write.
+fn applyServerEdit(host: anytype, arena: std.mem.Allocator, locks: *const model_settings.LaunchLocks, e: Edit, moved: bool) []const u8 {
+    const eql = std.mem.eql;
+    if (eql(u8, e.key, "prefix_cache_disk_gb")) return host.cacheBudget(e.value);
+    if (eql(u8, e.key, "update_check") or eql(u8, e.key, "pack_update_check")) return applyUpdateCheck(locks, e.key, e.value);
+    if (eql(u8, e.key, "skip_mem_preflight")) return applySkipMemPreflight(locks, e.value);
+    if (eql(u8, e.key, "max_request_mb")) {
+        server_state.setMaxRequestMb(if (e.value) |v| std.math.cast(u32, v.integer) orelse unreachable else null);
+        return "applies to the next request";
+    }
+    if (eql(u8, e.key, "wired_margin_gib")) return applyWiredMargin(locks, e.value, moved);
+    if (eql(u8, e.key, "port")) return portMessage(locks);
+    return host.modelsDir(arena);
+}
+
+/// The one save path: every section in one rewrite of the file, then each server key applied to the running server,
+/// then the stored load failures its moved keys end. A write that fails returns before anything is applied.
+fn save(host: anytype, arena: std.mem.Allocator, io: std.Io, path: []const u8, plan: Plan, model_path: []const u8) !Outcome {
+    const locks = &model_settings.launch_locks;
+    // Read, check, write and apply under the write lock: a save never merges into a file another one is rewriting,
+    // and the file's last save is the server's last apply.
+    model_settings.lockWrites(io);
+    defer model_settings.unlockWrites(io);
+    var file = model_settings.load(arena, io, path);
+    defer file.deinit();
+    var next: [effort_mod.family_count]effort_mod.Edits = undefined;
+    var sections = std.ArrayList(model_settings.SectionEdits).empty;
+    if (plan.namesEffort()) {
+        if (try effortSections(arena, &file, plan.effort, &next, &sections)) |refused| return .{ .refused = refused };
+    }
+    if (plan.server_edits.len > 0) try sections.append(arena, .{ .section = model_settings.server_section, .edits = plan.server_edits });
+    if (plan.model_edits.len > 0) try sections.append(arena, .{ .section = model_path, .edits = plan.model_edits });
+
+    const messages = try arena.alloc([]const u8, plan.server_edits.len);
+    try host.write(arena, sections.items);
+
+    const was = model_settings.server(&file);
+    var forget_all = false;
+    for (plan.server_edits, messages) |e, *message| {
+        const moved = serverKeyMoves(locks, was, e);
+        message.* = applyServerEdit(host, arena, locks, e, moved);
+        if (moved and reachesLoad(e.key)) forget_all = true;
+    }
+    for (effort_mod.families) |f| {
+        if (!plan.effort[@intFromEnum(f)].named) continue;
+        effort_mod.publish(f, next[@intFromEnum(f)]);
+        log.info("[effort] {s}: table saved, serving from the next request\n", .{@tagName(f)});
+    }
+    // Last, so a load that starts after it reads the new values, and one already running is marked to forget its failure.
+    if (forget_all) {
+        host.forgetAll();
+    } else for (plan.model_edits) |e| {
+        if (reachesLoad(e.key) and modelKeyMoves(arena, locks, model_settings.modelObject(&file, model_path), e)) {
+            host.forgetModel(model_path);
+            break;
+        }
+    }
+    if (savesSsdTier(plan)) host.rearmDisk();
+    return .{ .saved = messages };
 }
 
 /// A saved key that sizes an SSD tier: the SSD prefix cache's size, or the expert-streaming SSD budget.
@@ -888,7 +980,7 @@ fn writeFailed(allocator: std.mem.Allocator, stream: *http_conn.Conn, err: anyer
         return;
     }
     log.warn("[settings] write failed: {s}\n", .{@errorName(err)});
-    try http.sendErrorResponse(allocator, stream, "500 Internal Server Error", "settings_write_failed", "Could not write the settings file", 500);
+    try http.sendErrorResponse(allocator, stream, "500 Internal Server Error", "settings_write_failed", "Could not write the settings file; nothing was saved or applied", 500);
 }
 
 fn cacheBudgetMessage(running_tiers_resized: usize) []const u8 {
@@ -940,8 +1032,9 @@ const wired_margin_applies = "applies at once: the next request and the next loa
 const wired_margin_flag_applies = "set by --wired-margin-gib until a start without it";
 
 /// The launch flag outranks the saved value inside `wiredMarginBytes`, so a save under it is kept and not applied.
-fn applyWiredMargin(locks: *const model_settings.LaunchLocks, value: ?std.json.Value) []const u8 {
+fn applyWiredMargin(locks: *const model_settings.LaunchLocks, value: ?std.json.Value, moved: bool) []const u8 {
     server_state.setWiredMarginFile(if (value) |v| std.math.cast(u32, v.integer) else null);
+    if (moved) bills.relogCeiling();
     return if (locks.wired_margin_gib.set) "saved; --wired-margin-gib still sets the margin until a start without it" else wired_margin_applies;
 }
 
@@ -1220,14 +1313,14 @@ test "settings api: a saved safety margin reaches the margin the ceiling reads a
     server_state.wired_margin_flag_bytes = null;
     var locks: model_settings.LaunchLocks = .{};
     try testing.expectEqual(@as(u64, 1) << 30, server_state.wiredMarginBytes());
-    try testing.expectEqualStrings("applies at once: the next request and the next load use it", applyWiredMargin(&locks, .{ .integer = 6 }));
+    try testing.expectEqualStrings("applies at once: the next request and the next load use it", applyWiredMargin(&locks, .{ .integer = 6 }, false));
     try testing.expectEqual(@as(u64, 6) << 30, server_state.wiredMarginBytes());
-    _ = applyWiredMargin(&locks, null);
+    _ = applyWiredMargin(&locks, null, false);
     try testing.expectEqual(@as(u64, 1) << 30, server_state.wiredMarginBytes());
 
     server_state.wired_margin_flag_bytes = 3 << 30;
     locks.wired_margin_gib.pin("3", .{});
-    try testing.expectEqualStrings("saved; --wired-margin-gib still sets the margin until a start without it", applyWiredMargin(&locks, .{ .integer = 6 }));
+    try testing.expectEqualStrings("saved; --wired-margin-gib still sets the margin until a start without it", applyWiredMargin(&locks, .{ .integer = 6 }, false));
     try testing.expectEqual(@as(u64, 3) << 30, server_state.wiredMarginBytes());
 }
 
@@ -1801,4 +1894,247 @@ test "settings api: ds41_cooler is offered only where the arch has Sushi Cooler,
     try testing.expect(models[0].object.get("defaults").?.object.get("ds41_cooler").?.bool);
     try testing.expect(models[0].object.get("limits").?.object.get("ds41_cooler") == null);
     try testing.expect(reachesLoad("ds41_cooler") and reachesLoad("qwen_cooler"));
+}
+
+/// A save's reach in a test: it writes the real file, answers the tier keys with fixed text, and records the order of
+/// what the save did and what the running server read at the moment the stored load failures were forgotten.
+const TestHost = struct {
+    io: std.Io,
+    path: []const u8,
+    /// A write that carries this section fails, as a full disk fails it.
+    fail_section: ?[]const u8 = null,
+    events: [16]Event = undefined,
+    n_events: usize = 0,
+    margin_at_forget: u64 = 0,
+    skip_at_forget: bool = false,
+    max_request_at_forget: usize = 0,
+    forgot_model: ?[]const u8 = null,
+
+    const Event = enum { write, cache_budget, models_dir, forget_all, forget_model, rearm };
+
+    fn note(self: *TestHost, e: Event) void {
+        self.events[self.n_events] = e;
+        self.n_events += 1;
+    }
+
+    fn count(self: *const TestHost, e: Event) usize {
+        var n: usize = 0;
+        for (self.events[0..self.n_events]) |x| n += @intFromBool(x == e);
+        return n;
+    }
+
+    fn write(self: *TestHost, arena: std.mem.Allocator, sections: []const model_settings.SectionEdits) !void {
+        self.note(.write);
+        if (self.fail_section) |bad| for (sections) |one| if (std.mem.eql(u8, one.section, bad)) return error.NoSpaceLeft;
+        return model_settings.writeSectionsLocked(arena, self.io, self.path, sections);
+    }
+
+    fn sawServer(self: *TestHost) void {
+        self.margin_at_forget = server_state.wiredMarginBytes();
+        self.skip_at_forget = scheduler.skipMemPreflight();
+        self.max_request_at_forget = server_state.max_request_bytes.load(.monotonic);
+    }
+
+    fn forgetAll(self: *TestHost) void {
+        self.sawServer();
+        self.note(.forget_all);
+    }
+
+    fn forgetModel(self: *TestHost, model_path: []const u8) void {
+        self.sawServer();
+        self.forgot_model = model_path;
+        self.note(.forget_model);
+    }
+
+    fn cacheBudget(self: *TestHost, _: ?std.json.Value) []const u8 {
+        self.note(.cache_budget);
+        return "tier";
+    }
+
+    fn modelsDir(self: *TestHost, _: std.mem.Allocator) []const u8 {
+        self.note(.models_dir);
+        return "rescanned";
+    }
+
+    fn rearmDisk(self: *TestHost) void {
+        self.note(.rearm);
+    }
+};
+
+/// The process-wide values a save sets, put back after a test that saves.
+const SavedGlobals = struct {
+    skip: bool,
+    max_request: usize,
+    flag: ?u64,
+    locks: model_settings.LaunchLocks,
+
+    fn take() SavedGlobals {
+        return .{
+            .skip = scheduler.skipMemPreflight(),
+            .max_request = server_state.max_request_bytes.load(.monotonic),
+            .flag = server_state.wired_margin_flag_bytes,
+            .locks = model_settings.launch_locks,
+        };
+    }
+
+    fn restore(self: SavedGlobals) void {
+        scheduler.setSkipMemPreflight(self.skip);
+        server_state.max_request_bytes.store(self.max_request, .monotonic);
+        server_state.wired_margin_flag_bytes = self.flag;
+        server_state.setWiredMarginFile(null);
+        model_settings.launch_locks = self.locks;
+    }
+};
+
+fn savedFile(tmp: *testing.TmpDir, path_buf: []u8, body: ?[]const u8) ![]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    if (body) |text| try tmp.dir.writeFile(testing.io, .{ .sub_path = "model-settings.json", .data = text });
+    return std.fmt.bufPrint(path_buf, "{s}/model-settings.json", .{dir});
+}
+
+/// The effort tables alone, saved to the real file the way a request that names nothing else saves them.
+fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans: [effort_mod.family_count]EffortPlan) !?[]const u8 {
+    var host: TestHost = .{ .io = io, .path = path };
+    return switch (try save(&host, arena, io, path, .{ .effort = plans }, "")) {
+        .refused => |message| message,
+        .saved => null,
+    };
+}
+
+test "settings api: a save writes the file, applies every key, then forgets the stored load failures" {
+    const globals = SavedGlobals.take();
+    defer globals.restore();
+    server_state.wired_margin_flag_bytes = null;
+    model_settings.launch_locks = .{};
+    scheduler.setSkipMemPreflight(false);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [600]u8 = undefined;
+    const path = try savedFile(&tmp, &path_buf, null);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var host: TestHost = .{ .io = testing.io, .path = path };
+    const plan = parseRequest(a,
+        \\{"server":{"wired_margin_gib":8,"skip_mem_preflight":true,"max_request_mb":64,"prefix_cache_disk_gb":40,"models_dir":"/tmp"}}
+    ).ok;
+    try testing.expect(try save(&host, a, testing.io, path, plan, "") == .saved);
+    try testing.expectEqualSlices(TestHost.Event, &.{ .write, .cache_budget, .models_dir, .forget_all, .rearm }, host.events[0..host.n_events]);
+    try testing.expectEqual(@as(u64, 8) << 30, host.margin_at_forget);
+    try testing.expect(host.skip_at_forget);
+    try testing.expectEqual(@as(usize, 64) << 20, host.max_request_at_forget);
+}
+
+test "settings api: a save whose write fails leaves the file and the running server as they were" {
+    const globals = SavedGlobals.take();
+    defer globals.restore();
+    server_state.wired_margin_flag_bytes = null;
+    model_settings.launch_locks = .{};
+    server_state.setWiredMarginFile(2);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const before = "{\"server\":{\"wired_margin_gib\":2}}";
+    var path_buf: [600]u8 = undefined;
+    const path = try savedFile(&tmp, &path_buf, before);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var host: TestHost = .{ .io = testing.io, .path = path, .fail_section = "/m/a" };
+    const plan = parseRequest(a, "{\"server\":{\"wired_margin_gib\":8},\"model\":\"m\",\"set\":{\"ctx_size\":4096}}").ok;
+    try testing.expectError(error.NoSpaceLeft, save(&host, a, testing.io, path, plan, "/m/a"));
+    const kept = try tmp.dir.readFileAlloc(testing.io, "model-settings.json", a, .limited(1 << 16));
+    try testing.expectEqualStrings(before, kept);
+    try testing.expectEqual(@as(u64, 2) << 30, server_state.wiredMarginBytes());
+    try testing.expectEqual(@as(usize, 0), host.count(.forget_all) + host.count(.forget_model));
+}
+
+test "settings api: a save forgets the stored load failures only for a key whose running value moved" {
+    const globals = SavedGlobals.take();
+    defer globals.restore();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const Case = struct {
+        file: []const u8,
+        body: []const u8,
+        /// `--wired-margin-gib` pins the margin.
+        flag: bool = false,
+        forgets: enum { none, all, model },
+    };
+    const cases = [_]Case{
+        .{ .file = "{\"server\":{\"wired_margin_gib\":8}}", .body = "{\"server\":{\"wired_margin_gib\":8}}", .forgets = .none },
+        .{ .file = "{\"server\":{\"wired_margin_gib\":2}}", .body = "{\"server\":{\"wired_margin_gib\":8}}", .forgets = .all },
+        .{ .file = "{\"server\":{\"wired_margin_gib\":2}}", .body = "{\"server\":{\"wired_margin_gib\":8}}", .flag = true, .forgets = .none },
+        .{ .file = "{}", .body = "{\"server\":{\"wired_margin_gib\":1}}", .forgets = .none },
+        .{ .file = "{\"server\":{\"wired_margin_gib\":4}}", .body = "{\"server\":{\"wired_margin_gib\":null}}", .forgets = .all },
+        .{ .file = "{\"server\":{\"max_request_mb\":64}}", .body = "{\"server\":{\"port\":9000}}", .forgets = .none },
+        .{ .file = "{\"/m/a\":{\"ctx_size\":4096}}", .body = "{\"model\":\"m\",\"set\":{\"ctx_size\":4096}}", .forgets = .none },
+        .{ .file = "{\"/m/a\":{\"ctx_size\":4096}}", .body = "{\"model\":\"m\",\"set\":{\"ctx_size\":8192}}", .forgets = .model },
+    };
+    for (cases) |c| {
+        server_state.wired_margin_flag_bytes = if (c.flag) 3 << 30 else null;
+        model_settings.launch_locks = .{};
+        if (c.flag) model_settings.launch_locks.wired_margin_gib.pin("3", .{});
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [600]u8 = undefined;
+        const path = try savedFile(&tmp, &path_buf, c.file);
+        var host: TestHost = .{ .io = testing.io, .path = path };
+        try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, c.body).ok, "/m/a") == .saved);
+        try testing.expectEqual(c.forgets == .all, host.count(.forget_all) == 1);
+        try testing.expectEqual(c.forgets == .model, host.count(.forget_model) == 1);
+        try testing.expectEqual(@as(usize, if (c.forgets == .none) 0 else 1), host.count(.forget_all) + host.count(.forget_model));
+    }
+}
+
+test "settings api: a save that moves the margin logs one new ceiling line, and one that moves nothing logs none" {
+    const globals = SavedGlobals.take();
+    defer globals.restore();
+    const limit_was = bills.wired_limit_mb_override;
+    const floor_was = bills.gpu_floor_bytes.load(.monotonic);
+    const logged_was = bills.wired_floor_logged.load(.monotonic);
+    defer {
+        bills.wired_limit_mb_override = limit_was;
+        bills.gpu_floor_bytes.store(floor_was, .monotonic);
+        bills.wired_floor_logged.store(logged_was, .monotonic);
+        log.closeFile();
+    }
+    bills.wired_limit_mb_override = 120_000;
+    bills.gpu_floor_bytes.store(0, .monotonic);
+    server_state.wired_margin_flag_bytes = null;
+    model_settings.launch_locks = .{};
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [600]u8 = undefined;
+    const path = try savedFile(&tmp, &path_buf, "{\"server\":{\"wired_margin_gib\":2}}");
+    var log_buf: [640]u8 = undefined;
+    const log_path = try std.fmt.bufPrint(&log_buf, "{s}.log", .{path});
+    try log.openFile(log_path, 0);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true };
+    const ram: u64 = 128 << 30;
+    var host: TestHost = .{ .io = testing.io, .path = path };
+    const bodies = [_][]const u8{
+        "{\"server\":{\"wired_margin_gib\":2}}", // unchanged
+        "{\"server\":{\"wired_margin_gib\":8}}", // moved
+        "{\"server\":{\"wired_margin_gib\":8}}", // unchanged again
+    };
+    bills.wired_floor_logged.store(false, .monotonic);
+    _ = bills.wiredCeilingFloorForRam(&config, ram);
+    var seen: usize = 1;
+    const expect_new = [_]usize{ 0, 1, 0 };
+    for (bodies, expect_new) |body, new| {
+        try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, body).ok, "") == .saved);
+        _ = bills.wiredCeilingFloorForRam(&config, ram);
+        _ = bills.wiredCeilingFloorForRam(&config, ram);
+        const text = try tmp.dir.readFileAlloc(testing.io, "model-settings.json.log", a, .limited(1 << 16));
+        const lines = std.mem.count(u8, text, "[mem] ceiling");
+        try testing.expectEqual(seen + new, lines);
+        seen = lines;
+    }
+    const text = try tmp.dir.readFileAlloc(testing.io, "model-settings.json.log", a, .limited(1 << 16));
+    try testing.expect(std.mem.indexOf(u8, text, "margin 8192 MB") != null);
 }

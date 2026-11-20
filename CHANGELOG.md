@@ -34,6 +34,7 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **Batched Qwen decode on Sushi Cooler is up to 35% faster with an STQ pack**: requests decoding together ran most of
   the trunk once per request; four together now total about 155 tok/s on an M5 Ultra, against 115, each still getting
   the bytes it gets alone.
+- **A Settings save writes the file in one piece, applies it, and only then clears failed loads, for a key that changed and no launch flag pins**; a new safety margin logs its `[mem] ceiling` line again.
 - **The GPU memory card in Settings sets the safety margin sushi keeps under the GPU limit** for macOS and other apps
   (`--wired-margin-gib` still outranks it).
 - **A reply cancelled mid-stream no longer says it ran out of tokens**: a request stopped by `POST /v1/slots/cancel`

@@ -539,6 +539,11 @@ pub fn defaultRequestBill(config: *const model_mod.ModelConfig) u64 {
 
 pub var wired_floor_logged = std.atomic.Value(bool).init(false);
 
+/// The next reading logs its `[mem] ceiling` line again, after an input of the ceiling (the margin) moved.
+pub fn relogCeiling() void {
+    wired_floor_logged.store(false, .monotonic);
+}
+
 /// Long-context models and engaged expert streams honor the operator's wired limit.
 /// `null` config (no model resolved yet) takes no floor.
 pub fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
