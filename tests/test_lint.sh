@@ -98,6 +98,15 @@ printf '%s\n' 'const tc = @import("tool_calls.zig");' 'pub fn f(a: u8) void {' '
 printf '%s\n' 'test "t" { _ = .{ .prefill_tps = 0.0 }; }' > "$TMP/t/src/generation_stream.zig"
 expect_green "the raw parser outside a surface, and a result literal in a test or in generation_stream.zig"
 
+tree
+printf '%s\n' 'pub fn f() void {' '    _ = .{ .stops = 0, .normalize = true };' '}' > "$TMP/t/src/generation_stream.zig"
+expect_red "a surface writing an Ask's normalize as a literal" "src/generation_stream.zig:2:25 \[reply-bypass\] f: normalize"
+
+tree
+printf '%s\n' 'pub fn f(c: u8) void {' '    _ = .{ .stops = 0, .normalize = !routed(c) };' '}' > "$TMP/t/src/anthropic.zig"
+printf '%s\n' 'test "t" { _ = .{ .normalize = true }; }' > "$TMP/t/src/responses_api.zig"
+expect_green "a normalize that reads the one predicate, and a literal in a test"
+
 # rule request-bool-read
 tree
 printf '%s\n' 'fn f(root: Obj) bool {' '    return if (root.get("stream")) |v| v == .bool and v.bool else false;' '}' > "$TMP/t/src/server.zig"

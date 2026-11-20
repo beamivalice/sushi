@@ -83,3 +83,4 @@ ceiling-raw-read src/glm5/glm5_kld_capture.zig:run the offline GLM teacher captu
 folder-bytes-compare src/model_registry.zig:registerByPath trims the stored path and its id's name; folders are compared as FolderId
 folder-bytes-compare src/model_registry.zig:newFolderIdLocked slices the id's names out of the path; folders are compared as FolderId
 result-field-free src/generate.zig:deinit the one owner of a GenerationResult: frees its fields together
+reply-bypass src/generation_stream.zig:continueAfterThought a continuation is never offered to a constrained request (`ThoughtKept.keptFor`), so its ask has no span-routed case

@@ -1060,7 +1060,7 @@ fn handleResponsesInner(
         // asked for thinking off — generated reasoning is delivered, never
         // dropped (thinking-off is enforced prompt-side, noThinkTailSuffix).
         // Prompt-derived, never flag-derived — see the chat streaming arm.
-        const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
+        const constrained_proto = generate_mod.payloadRouted(sampling.constraint);
         var in_think_block = promptOpensThink(allocator, tok, prompt_ids) and !constrained_proto;
         var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
         defer if (delivery) |*d| d.deinit(allocator);
@@ -1304,7 +1304,7 @@ fn handleResponsesInner(
     const opens_think = promptOpensThink(allocator, tok, prompt_ids);
     var ended = try reply_mod.settle(allocator, generation_stream.generatedOf(&result), .{
         .stops = stop_sequences.items,
-        .normalize = sampling.constraint == null or sampling.constraint.?.proto == null,
+        .normalize = !generate_mod.payloadRouted(sampling.constraint),
         .has_tools = active_has_tools,
         .tools_json = active_tools_json,
         .allow_parallel = parallel_tool_calls_echo,

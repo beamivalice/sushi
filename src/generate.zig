@@ -167,6 +167,13 @@ pub const Constraint = struct {
     }
 };
 
+/// Whether a reasoning protocol routes the request's reply (`Constraint.proto`): its payload is authoritative, so marker
+/// text inside it is data and no surface normalizes it (`reply.Ask.normalize`), streamed or not.
+pub fn payloadRouted(constraint: ?*const Constraint) bool {
+    const c = constraint orelse return false;
+    return c.proto != null;
+}
+
 /// A forced recovery must leave room for the whole remaining transition AND
 /// at least one constrained answer token. At the ordinary completion cap the
 /// caller keeps the existing length-stop behavior — no reserve is created.

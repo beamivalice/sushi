@@ -803,7 +803,7 @@ pub fn handleNonStreamingGeneration(
     // The stop that ended the generation, the text it leaves and the calls in it (`reply.settle`).
     const settled = try reply_mod.settle(allocator, generatedOf(&result), .{
         .stops = stop_sequences,
-        .normalize = sampling.constraint == null or sampling.constraint.?.proto == null,
+        .normalize = !generate_mod.payloadRouted(sampling.constraint),
         .has_tools = has_tools,
         .tools_json = tools_json,
         .allow_parallel = allow_parallel_tools,
@@ -1596,7 +1596,7 @@ pub fn handleStreamingGeneration(
     // begun (a generated opener must strip, not leak), and flips straight to
     // the content arm when the generator reports a DIRECT answer — the whole
     // point is that no reasoning block exists to scan for.
-    const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
+    const constrained_proto = generate_mod.payloadRouted(sampling.constraint);
     // A stream starts in a think block from the rendered prompt, never from the request flag.
     var in_think_block = prompt_opened_think and !constrained_proto;
     var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
@@ -2042,7 +2042,7 @@ pub fn handleStreamingGeneration(
             .finish_details = ts.finish_details,
         }, .{
             .stops = stop_sequences,
-            .normalize = true,
+            .normalize = !constrained_proto,
             .has_tools = has_tools,
             .tools_json = tools_json,
             .allow_parallel = allow_parallel_tools,

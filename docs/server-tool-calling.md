@@ -30,7 +30,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   where the parser would read one (a name attribute and a `<param`, a `<parameter=`, a JSON body), so text that
   mentions the markup stays text. The stop is read once, by `reply.settle` (`stop_sequences.cut`): a stream's reply carries
   its gate's match (`GenerationResult.stop_source`), never a stop searched for again in text the gate already cut. Lint
-  `reply-bypass`: a surface never calls the raw `parseToolCalls`.
+  `reply-bypass`: a surface never calls the raw `parseToolCalls`, and an `Ask`'s `normalize` is `!generate.payloadRouted(constraint)`, never a
+  literal: a span-routed constrained reply keeps marker text in its payload as data, streamed or not.
 - Template input `chat.templateMessages`: role "tool" native, a call's `arguments` the client's JSON object (`{}` for
   anything else), every string valid UTF-8 (U+FFFD for a bad sequence, as `appendJsonString` writes). Streaming: full args in ONE SSE delta, thinking → `reasoning_content`.
 - **A call's id comes from `io_util.callId`, on every surface** (`call_`, Anthropic `toolu_`): random digits beside a per-process count, never a clock tick, so two requests in one millisecond or one restart apart never share an id.

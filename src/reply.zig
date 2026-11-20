@@ -958,6 +958,27 @@ test "a declined call is named in the details field of every surface's key, and 
     try testing.expectEqualStrings(note, own);
 }
 
+test "a span-routed constrained reply keeps the marker text in its payload as written, streamed or not, and a call after it still ships" {
+    const a = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+    ;
+    const call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
+    const payload = "{\"note\":\"a <think>b</think> c <think>d</think> e\"}\n";
+    const text = payload ++ call;
+    const routed: Ask = .{ .stops = &.{}, .normalize = false, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+    try expectSameEnd(a, text, &.{}, "stop", routed, null, "stop", 1, .none);
+    const kept = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, routed);
+    defer kept.deinit(a);
+    try testing.expectEqualStrings(text, kept.text);
+    // The witness: the same text normalized is another text, which is why every surface asks by one predicate.
+    var merged = routed;
+    merged.normalize = true;
+    const changed = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, merged);
+    defer changed.deinit(a);
+    try testing.expect(!std.mem.eql(u8, text, changed.text));
+}
+
 test "a reply holds only its thought when it has no visible text and no call, its thought open or closed" {
     const a = testing.allocator;
     const tools =
