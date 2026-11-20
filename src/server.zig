@@ -1211,16 +1211,14 @@ pub fn handleConnection(
     const total_read = raw.buf.len;
     const header_end_pos = raw.header_end;
     const request = raw.buf[0..total_read];
-    const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse return;
-    const first_line = request[0..first_line_end];
-
-    var line_iter = std.mem.splitScalar(u8, first_line, ' ');
-    const wire_method = line_iter.next() orelse return;
+    // The reader checked the request line (`http_head.check`): it has a method and a target.
+    const line = http_head.requestLine(request[0..header_end_pos]);
+    const wire_method = line.method;
     // HEAD is the GET without its body.
     const is_head = std.mem.eql(u8, wire_method, "HEAD");
     const method = if (is_head) "GET" else wire_method;
     stream.head_only = is_head;
-    const raw_path = line_iter.next() orelse return;
+    const raw_path = line.target;
     // Strip query string for route matching (e.g. /v1/messages?beta=true -> /v1/messages)
     const path = if (std.mem.indexOf(u8, raw_path, "?")) |qpos| raw_path[0..qpos] else raw_path;
     const request_body = if (total_read > header_end_pos) request[header_end_pos..total_read] else "";

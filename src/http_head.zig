@@ -9,10 +9,11 @@ const ows = " \t";
 /// The request line: method, target and version, split on single spaces.
 pub const RequestLine = struct { method: []const u8 = "", target: []const u8 = "", version: []const u8 = "" };
 
-/// The request line: empty until its CRLF arrived. Empty lines before it are skipped (§2.2).
+/// The request line of the bytes that arrived: up to the first CRLF, or all of them when none came (a line over the
+/// head limit), so even a refusal knows its route and method. Empty lines before it are skipped (§2.2).
 pub fn requestLine(head: []const u8) RequestLine {
     const text = skipEmptyLines(head);
-    return splitLine(text[0 .. std.mem.indexOf(u8, text, "\r\n") orelse return .{}]);
+    return splitLine(text[0 .. std.mem.indexOf(u8, text, "\r\n") orelse text.len]);
 }
 
 fn splitLine(line: []const u8) RequestLine {
@@ -220,8 +221,11 @@ test "http_head: the framing a head declares, and the ones refused" {
     try t.expectError(error.UnsupportedCoding, framing(line ++ "Transfer-Encoding: gzip, chunked"));
 }
 
-test "http_head: the request line's method and target" {
+test "http_head: the request line's method and target, whole or cut short" {
     const l = requestLine("HEAD /v1/models?x=1 HTTP/1.1\r\nHost: h");
     try std.testing.expectEqualStrings("HEAD", l.method);
     try std.testing.expectEqualStrings("/v1/models?x=1", l.target);
+    const cut = requestLine("HEAD /health?x=qqqq");
+    try std.testing.expectEqualStrings("HEAD", cut.method);
+    try std.testing.expectEqualStrings("/health?x=qqqq", cut.target);
 }

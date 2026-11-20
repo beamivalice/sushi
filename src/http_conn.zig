@@ -3079,6 +3079,39 @@ test "read: a chunk size is hex digits alone: a sign, an underscore or a negativ
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
 
+test "read: a HEAD whose request line alone runs past 16 KB gets its 431 without a body" {
+    // docs/server-http-apis.md: "a HEAD gets every refusal (431, 413, 501, 417, 400, the shutdown 503) without a body".
+    const a = std.testing.allocator;
+    const line = try std.mem.concat(a, u8, &.{ "HEAD /health?x=", &@as([17_000]u8, @splat('q')), " HTTP/1.1\r\n\r\n" });
+    defer a.free(line);
+    const r = try readAgainst(.{ .sent = line, .limit_ms = 1000 });
+    defer freeRead(r);
+    const body = responseBody(r.reply);
+    if (!std.mem.startsWith(u8, r.reply, "HTTP/1.1 431 ") or body.len != 0) {
+        std.debug.print("HEAD with a 17 KB target: outcome={s} reply='{s}' {d}-byte body: '{s}'\n", .{ if (r.outcome) |x| @tagName(x) else "none", statusLineOf(r.reply), body.len, body[0..@min(body.len, 120)] });
+        return error.HeadBodySent;
+    }
+}
+
+test "serve: a request line the router cannot split, or one after a leading CRLF, is answered, never closed bare" {
+    // RFC 9112 §2.2: a server SHOULD ignore at least one empty line before the request line; §3: an invalid
+    // request line SHOULD be a 400. The brief's invariant: never closed bare when an answer is owed.
+    var bad: usize = 0;
+    for ([_][]const u8{
+        "\r\nGET /health HTTP/1.1\r\n\r\n",
+        "GET\r\n\r\n",
+        "GET  /health HTTP/1.1\r\n\r\n",
+    }) |req| {
+        const reply = try serveOneForTest(req);
+        defer std.testing.allocator.free(reply);
+        if (!std.mem.startsWith(u8, reply, "HTTP/1.1 ")) {
+            std.debug.print("'{f}': reply={d} B '{s}'\n", .{ std.zig.fmtString(req), reply.len, statusLineOf(reply) });
+            bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
 /// A chunked body of `total` bytes in chunks of `size` (one or two hex digits), after `chunked_head`.
 fn chunkedOf(a: std.mem.Allocator, total: usize, comptime size: usize) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
