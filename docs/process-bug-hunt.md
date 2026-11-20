@@ -19,8 +19,8 @@ Rules: [CLAUDE.md](../CLAUDE.md#team-process). Tests and tiers: [testsuite](test
    state and lifecycle (orders of events, failed and repeated loads, models side by side), memory and long-lived
    state (pool, caps, bills against storage, caches, leaks), what is computed (kernels against a reference at edge
    shapes, determinism, rollback, sampling).
-3. **Hunters.** Three unless the owner sets otherwise, launched together; the agents, their models and the briefs
-   are in the `/hunt-fix` skill (`.claude/skills/hunt-fix/`). Each gets its own git worktree at the head (toolchain and `lib/mlx` linked from the
+3. **Hunters.** Three unless the owner sets otherwise, launched together. The agents are in `.claude/agents/` (model
+   and effort in each file's frontmatter); the coordinator's procedure is the `/hunt-fix` skill. Each gets its own git worktree at the head (toolchain and `lib/mlx` linked from the
    main checkout) and its own temp directory. One wave per agent: a hunter that finishes its round, or a fixer its
    batch of findings, retires, and a fresh agent with a self-contained brief takes the next surface or batch.
 4. **Known list.** The brief names every defect already fixed or open, so a hunter spends its runs on new ones and
@@ -39,8 +39,9 @@ Rules: [CLAUDE.md](../CLAUDE.md#team-process). Tests and tiers: [testsuite](test
 - Use `mlx.engine.poison` to find a read of bytes nothing wrote: `byte` set, every buffer the pool hands out is
   written over with it first, and `free(b)` writes it over the free ones. The clean bytes must come back.
 
-A hunter never commits, pushes, stashes or fixes product code, never loads a real pack, boots a server, binds a port
-or takes the GPU lock, and checks `QUIET` before every build. It works only in its own worktree.
+A hunter never commits, pushes, stashes or fixes product code, never loads a real pack, boots the sushi binary, uses
+the real server port or takes the GPU lock, and checks `QUIET` before every build. An in-process test harness on an
+ephemeral listener is allowed: it is how served paths are hunted. It works only in its own worktree.
 
 ## What counts
 
@@ -48,6 +49,11 @@ A wrong result, a crash, a hang, a leak, storage the bill does not cover, a brok
 fallback, state left dirty after an error or a cancel, the same request giving two answers. A red scratch test is a
 finding only when its expectation is the contract: the report cites the doc line, comment or sibling test that says
 so. A suspicion that did not reproduce is listed as such in one line.
+
+Severity:
+- HIGH: a crash, corruption, wrong output, a hang, a bill that under-covers storage.
+- MED: wrong but safe behaviour a user hits, an over-bill that refuses work that fits, a wrong answer type.
+- LOW: unreachable today, wording, a question about a doc or a contract.
 
 ## The report
 

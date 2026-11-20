@@ -7,8 +7,8 @@ description: Run a sushi bug hunt and fix cycle as the coordinator - cut surface
 
 This is the coordinator's procedure: what to launch, what to brief, how to review and land. Read first:
 - `docs/process-bug-hunt.md`: the round, what counts as a finding, the report, synthesis, closing a finding.
-- `.claude/agents/hunter.md`, `fixer.md`, `issue-fixer.md`: each agent's rules, and the severity scale (in
-  `hunter.md`). An agent already has its file as its system prompt. Do not repeat it in a brief; review holds the agent
+- `.claude/agents/hunter.md`, `fixer.md`, `issue-fixer.md`: each agent's rules. The severity scale is in the process
+  doc, under "What counts". An agent already has its file as its system prompt. Do not repeat it in a brief; review holds the agent
   to it.
 
 ## Agents
@@ -94,6 +94,8 @@ what the fixer cannot judge about its own work:
   it. Refuse a two-sided band around a residue nobody has explained.
 - **Siblings.** No named sibling site keeps the bug.
 - **A red on one box only** is proven red at `origin/main` on that box before the branch is blamed for it.
+- **A path that will run for hours** is accepted on its measured rate, never on correctness alone: compute the
+  expected rate and compare the first batch; more than 2x off stops it until explained.
 
 ## Landing
 
