@@ -5609,10 +5609,16 @@ test "retained position: a padded row can never take the full-accept arm" {
 test "single MTP slot reaches the round entry through runDecodeTick, and its refusal fails that slot alone" {
     if (comptime !@import("arch/drafter.zig").Drafter.has("mimo2") or !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     try mlx.requireGpu();
-    var xfm: Trunk = undefined;
+    const round_cost = @import("round_cost.zig");
+    var xfm = testTrunk("qwen4_exp");
+    // The slot's model carries the round-cost table a load leaves it: the tick must leave it as it was.
+    xfm.round_cost = .{ .layout = round_cost.layoutFor(xfm.config), .folded = 3 };
     var model: model_registry_mod.LoadedModel = undefined;
     model.handle = null;
     var gen: Generator = undefined;
+    gen.xfm = &xfm;
+    gen.loop_guard = .{};
+    gen.dspark = false;
     gen.mtp_planner_owned = false;
     gen.generated_ids = .empty;
     gen.loop_guard_start = 0;
@@ -5652,6 +5658,9 @@ test "single MTP slot reaches the round entry through runDecodeTick, and its ref
     try testing.expectEqual(sched_policy.SlotState.errored, slot.state);
     try testing.expect(slot.legacy_gen.?.spec_cost_solo);
     try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);
+    // A refused round feeds nothing to its model's cost table.
+    try testing.expectEqual(@as(u32, 3), round_cost.totalFolded(&xfm.round_cost));
+    try testing.expectEqual(@as(u32, 0), xfm.round_cost.stored_at);
 }
 
 test "planner and batch entry count each pending punctuation token once" {
