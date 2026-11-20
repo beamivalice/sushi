@@ -319,7 +319,9 @@ test "dsv41 pipelines: a truncated manifest is reported by name and rebuilt, nev
     const file = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ key.dirName(&name_buf), manifest.file_name });
     const whole = try tmp.dir.readFileAlloc(io, file, testing.allocator, .limited(1 << 30));
     defer testing.allocator.free(whole);
-    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = whole[0 .. whole.len / 2] });
+    // A tail cut, whatever size the recipes this GPU recorded make the file: it keeps the fixed header and a digest's
+    // length, so the checksum, not the header check, names it.
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = whole[0 .. whole.len - 1] });
 
     var second = plainBegin(tmp.dir, key);
     defer second.deinit();
