@@ -274,6 +274,7 @@ pub fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
 /// handler — an UNCATCHABLE async C++ throw that terminates the process.
 /// Capping by real free RAM makes the two prefill guards
 /// reject/clamp before that allocation is ever submitted.
+/// With no wired limit declared there is no user contract to respect, so free RAM bounds the ceiling (the #64 guard).
 pub fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system: u64) u64 {
     return @min(working_set_limit, mlx_footprint +| free_system);
 }
@@ -608,7 +609,9 @@ pub fn staticGpuMemoryCeiling() u64 {
     return static_ceiling_override orelse gpu_mem.getGpuWorkingSetLimit();
 }
 
-/// THE ceiling helper: `available`, `/props`, the hot-cache clamp, the auto-context pin and the
+/// The user's declared wired limit is the ceiling, not instantaneous free RAM: room for other apps is the user's call
+/// (`iogpu.wired_limit_mb`, `--wired-margin-gib`), and macOS compresses or swaps their pages, as on 1.6.0 (#110).
+/// `available`, `/props`, the hot-cache clamp, the auto-context pin and the
 /// admission bill all read it, so the wired-limit floor cannot reach some of them and not others.
 pub fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
     const cache_mem: usize = gpu_mem.cacheBytes();
@@ -618,24 +621,6 @@ pub fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem
         metrics.getAvailableMemBytes(),
         wiredCeilingFloorFor(config),
     );
-}
-
-/// The ceiling a live check reads (a request's admission, a prefill chunk's width, an image encode, a borrow): the
-/// load's ceiling, but never past the process's GPU footprint plus what the system can still reclaim, less the
-/// unplanned margin (`--wired-margin-gib`) the kernel and other processes keep. A raised `iogpu.wired_limit_mb` lifts
-/// the planning ceiling over other processes' pages; it does not free them, and growth past them takes the machine down.
-pub fn liveGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
-    return liveCeilingFrom(currentGpuMemoryCeiling(config, active_mem), active_mem +| @as(u64, gpu_mem.cacheBytes()), metrics.getAvailableMemBytes());
-}
-
-/// What a live check leaves of the reclaimable pages for the kernel: the 1 GiB the r-65 guard was proven at.
-/// `--wired-margin-gib` is not taken here: the reclaimable pages already exclude what other processes hold, and
-/// the margin keeps their room under the declared limit (`wiredLimitFloor`).
-pub const LIVE_RESERVE_BYTES: u64 = 1 << 30;
-
-/// PURE half of `liveGpuMemoryCeiling`.
-pub fn liveCeilingFrom(ceiling: u64, footprint: u64, reclaimable: u64) u64 {
-    return @min(ceiling, footprint +| (reclaimable -| LIVE_RESERVE_BYTES));
 }
 
 pub fn expertStreamingLoadFits(ceiling: u64, active_mem: u64, resident_bytes: u64, cache_bytes: u64, bounce_bytes: u64, fill_peak_bytes: u64, serving_bytes: u64) bool {
@@ -1579,7 +1564,7 @@ fn billedAutoContext(config: *const model_mod.ModelConfig) bool {
 /// The context the RAM-first clamp bills, through the one shared pure resolver.
 fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
     // The reading the advertised context is priced on (`computeMemoryContext`).
-    const ceiling = liveGpuMemoryCeiling(config, active_mem);
+    const ceiling = currentGpuMemoryCeiling(config, active_mem);
     if (billedAutoContext(config)) return billedAdvertisedContext(config, memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk));
     return resolvedContextForLoad(
         manualContext(config),
@@ -1787,13 +1772,7 @@ pub fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 
 /// A context pinned at load outlives any lease: the lent decoder pools are in use (`promisedActive`).
 pub fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const active_mem: usize = gpu_mem.activeBytes();
-    return memoryContextLive(config, currentGpuMemoryCeiling(config, active_mem), active_mem +| @as(u64, gpu_mem.cacheBytes()), metrics.getAvailableMemBytes(), promisedActive(active_mem));
-}
-
-/// PURE: the memory context at the reading admission compares a request's bill against (`admissionAvailableNow`): the
-/// load's `ceiling`, never past the process's `footprint` plus what the system can still `reclaim`.
-pub fn memoryContextLive(config: *const model_mod.ModelConfig, ceiling: u64, footprint: u64, reclaimable: u64, active_mem: u64) u32 {
-    return memoryContextAt(config, liveCeilingFrom(ceiling, footprint, reclaimable), active_mem);
+    return memoryContextAt(config, currentGpuMemoryCeiling(config, active_mem), promisedActive(active_mem));
 }
 
 /// `computeMemoryContext` at one reading of the ceiling and MLX's active memory.
@@ -2907,7 +2886,7 @@ fn parkedBytes(config: *const model_mod.ModelConfig, engine_free: u64) u64 {
 /// scheduler runs the request at (`requestPrefillChunkNow`) read this one number.
 pub fn admissionAvailableNow(config: *const model_mod.ModelConfig) u64 {
     const active_mem: usize = gpu_mem.activeBytes();
-    return admissionAvailableFor(config, liveGpuMemoryCeiling(config, active_mem), promisedActive(active_mem), gpu_mem.engineFree());
+    return admissionAvailableFor(config, currentGpuMemoryCeiling(config, active_mem), promisedActive(active_mem), gpu_mem.engineFree());
 }
 
 /// What a reading whose promise outlives a lease counts in use: the active bytes and the decoder pools lent out of
@@ -2946,7 +2925,7 @@ pub fn headroomFrom(config: *const model_mod.ModelConfig, ceiling: u64, active: 
 /// `headroomFrom` over the live readings, the lent decoder pools held off (`promisedActive`).
 pub fn headroomNow(config: *const model_mod.ModelConfig, staged_host: u64) Headroom {
     const active_mem: usize = gpu_mem.activeBytes();
-    return headroomFrom(config, liveGpuMemoryCeiling(config, active_mem), promisedActive(active_mem), staged_host, gpu_mem.engineFree());
+    return headroomFrom(config, currentGpuMemoryCeiling(config, active_mem), promisedActive(active_mem), staged_host, gpu_mem.engineFree());
 }
 
 /// The one reading that counts lent decoder pools free: their lessee's (DeepSeek's borrow, for its prefill's releases
@@ -2955,7 +2934,7 @@ pub fn headroomNow(config: *const model_mod.ModelConfig, staged_host: u64) Headr
 pub fn leaseHolderHeadroomNow(config: *const model_mod.ModelConfig) Headroom {
     const active_mem: usize = gpu_mem.activeBytes();
     const own = @atomicLoad(u64, &config.expert_lent_bytes, .monotonic);
-    return headroomFrom(config, liveGpuMemoryCeiling(config, active_mem), promisedActive(active_mem) -| own, 0, gpu_mem.engineFree());
+    return headroomFrom(config, currentGpuMemoryCeiling(config, active_mem), promisedActive(active_mem) -| own, 0, gpu_mem.engineFree());
 }
 
 /// PURE half of `prefillHeadroomNow`.
@@ -7028,14 +7007,6 @@ pub const SushiAvailable = struct {
         const gpu = self.gpu orelse return self.declared;
         return @min(gpu, self.declared orelse gpu);
     }
-
-    /// What of the live checks' reserve binds below this reading once a load is resident: `liveCeilingFrom` keeps it
-    /// off what macOS can still give, the free RAM, never off the GPU limit or a declared floor.
-    pub fn liveReserve(self: SushiAvailable) u64 {
-        const bytes = self.bytes orelse return 0;
-        const free = self.free orelse return 0;
-        return bytes -| @min(self.gpuAllows() orelse bytes, free -| LIVE_RESERVE_BYTES);
-    }
 };
 
 pub fn sushiAvailable(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) SushiAvailable {
@@ -7363,12 +7334,12 @@ pub fn loadWarmupBytes(config: *const model_mod.ModelConfig, mtp_on: bool) u64 {
 }
 
 /// What a load's served warm needs free past what the load holds: its dearest forward as it runs, lending no pool
-/// (`warmFloorChunkBytes`), and the live check's reserve, which its headroom leaves out. The resident and the streamed
+/// (`warmFloorChunkBytes`). The resident and the streamed
 /// requirement read it, and through them the cold-load gate (`residentColdLoadBillBytes`) and a refusal.
 pub fn warmNeedBytes(config: *const model_mod.ModelConfig) u64 {
     const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
     const request = if (coolerPrefillRowBytes(config) > 0) warmRequestBill(config, defaultKvBits(config), floor, mtpHeadDefaultOn(config)) else 0;
-    return @max(warmFloorChunkBytes(config), request) +| LIVE_RESERVE_BYTES;
+    return @max(warmFloorChunkBytes(config), request);
 }
 
 /// The reply of the served warm's longest request (`cooler_warm.warmServed`).
@@ -7697,14 +7668,14 @@ test "effectiveAvailableBytes prefers the per-process jetsam headroom when prese
     try std.testing.expectEqual(@as(?u64, 4 * GB), effectiveAvailableBytes(4 * GB, 0, 0)); // macOS: proc query = 0 → host
 }
 
-test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net, and its warm's narrowest chunk past the live reserve" {
+test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net, and its warm's narrowest chunk" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const gib: u64 = 1 << 30;
     const cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true, .expert_cache_bytes = 12 * gib, .expert_fill_peak_bytes = 2 * gib, .expert_bounce_bytes = gib / 2 };
     const warm = warmFloorChunkBytes(&cfg);
     try testing.expect(warm > 0);
-    try testing.expectEqual(warm + LIVE_RESERVE_BYTES, warmNeedBytes(&cfg));
-    try testing.expectEqual(6 * gib + 12 * gib + 2 * gib + gib / 2 + gib + warm + LIVE_RESERVE_BYTES, loadRequirementBytes(&cfg, 6 * gib, true, 0));
+    try testing.expectEqual(warm, warmNeedBytes(&cfg));
+    try testing.expectEqual(6 * gib + 12 * gib + 2 * gib + gib / 2 + gib + warm, loadRequirementBytes(&cfg, 6 * gib, true, 0));
     try testing.expectEqual(loadRequirementBytes(&cfg, 6 * gib, true, 0), streamedLoadRequirementBytes(6 * gib, 12 * gib, 2 * gib, gib / 2, warmNeedBytes(&cfg)));
 }
 
@@ -7756,10 +7727,10 @@ test "bill pin: loadWarmupBytes" {
 
 test "bill pin: loadRequirementBytes" {
     try pinLoadConfigs("loadRequirementBytes", &.{
-        65632468992, 85899345920, 66840428544, 85899345920, 79541548544, 79541548544, 79541548544, 79541548544,
-        65766686720, 85899345920, 65766686720, 85899345920, 79972502112, 79972502112, 79972502112, 79972502112,
-        66060796416, 85899345920, 66060796416, 85899345920, 80340094144, 80340094144, 80340094144, 80340094144,
-        69458661157, 69458661157, 69458661157, 69458661157, 82343563045, 82343563045, 82343563045, 82343563045,
+        65632468992, 85899345920, 66840428544, 85899345920, 78467806720, 78467806720, 78467806720, 78467806720,
+        65766686720, 85899345920, 65766686720, 85899345920, 78898760288, 78898760288, 78898760288, 78898760288,
+        66060796416, 85899345920, 66060796416, 85899345920, 79266352320, 79266352320, 79266352320, 79266352320,
+        68384919333, 68384919333, 68384919333, 68384919333, 81269821221, 81269821221, 81269821221, 81269821221,
     }, struct {
         fn run(c: *const model_mod.ModelConfig, g: *PinGot) void {
             var streamed = c.*;
@@ -7775,7 +7746,7 @@ test "bill pin: loadRequirementBytes" {
 
 test "bill pin: streamedLoadRequirementBytes and expertStreamingGateBytes" {
     var got = PinGot{};
-    got.add(streamedLoadRequirementBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30, LIVE_RESERVE_BYTES));
+    got.add(streamedLoadRequirementBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30, 1 << 30));
     got.add(expertStreamingGateBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30));
     got.add(expertStreamingGateBytes(std.math.maxInt(u64), 1, 1, 1));
     try pinEq("streamedLoadRequirementBytes", &.{ 21474836480, 19327352832, 18446744073709551615 }, got.slice());

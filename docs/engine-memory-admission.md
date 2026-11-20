@@ -82,20 +82,18 @@ bill function's output on the committed fixture configs of all served packs: a b
 - **A load's served warm forwards at the widest width a served request takes** (`widestServedRung`, shared with the
   load line): the arch's start width (DeepSeek's 2048) or `--prefill-chunk`, never the global default. The warm took the
   generic 8192 on DeepSeek, a width no DeepSeek request forwards at, and at `--ssd-budget-gb 108` it reset the Mac.
-- **A live check never grows past what the machine can still give** (`liveGpuMemoryCeiling`: the ceiling above, capped at
-  the process's GPU footprint plus `getAvailableMemBytes`' reclaimable pages less `LIVE_RESERVE_BYTES`, 1 GiB).
-  `--wired-margin-gib` is not taken there again: the reclaimable pages already leave out what other processes hold, and
-  the margin keeps their room under the declared limit; taken twice, a 16 GiB margin left no prefill width (issue 105). Request
-  admission, the prefill chunk's width (the served warm's included), an image encode, DeepSeek's borrow and the advertised
-  context (`computeMemoryContext`, `max_safe_context`) read it, so the context a load advertises is admitted when asked;
-  the load keeps the declared floor. A 32 GB M1 whose free RAM bound below its limit advertised 444,416 tokens and
-  refused a request at that length (8,313 MB needed, 7,178 MB available). A raised limit lifts the plan over other processes' pages but
-  frees none: on a 128 GB M5 at `iogpu.wired_limit_mb=125000` with the owner's apps open, DeepSeek at `--ssd-budget-gb
-  108` (105 GiB active) took an 8,192-row warm chunk the 121 GiB floor admitted and the kernel panicked (r-65). A quiet
-  box reclaims its file cache, so there the declared limit stands.
+- **Every runtime ceiling is the wired limit alone, as on 1.6.0** (`currentGpuMemoryCeiling`, #110): under a declared
+  `iogpu.wired_limit_mb` the limit less the unplanned margin, whatever free RAM other apps leave; with none declared, or
+  for an arch that takes no declared floor, Metal's working set capped at the footprint plus free RAM
+  (`physicalMemoryCeiling`, the #64 guard: no user contract there to respect). Admission, the prefill chunk's width, the
+  served warm, an image encode, DeepSeek's borrow, the auto-context pin and the advertised context read it. The cost:
+  GPU memory grows into other apps' pages and relies on macOS compressing or swapping them, so the declared limit and
+  `--wired-margin-gib` are the user's contract for the room other apps keep. A live free-RAM bound (1.7.0-1.7.1) refused a
+  64 GB M2 Ultra's 60k-token request with 2.5 GB "available" under a 55,296 MB ceiling; it also caught r-65, DeepSeek at
+  `--ssd-budget-gb 108` on a 128 GB M5 with apps open, which after the revert only the declared limit protects.
 - A test that compares two live readings pins the free-RAM one (`status.available_mem_override`): other processes move
   the reclaimable pages between two reads, so equal formulas read unequal figures whenever free RAM binds.
-- **One live headroom, one first width.** `bills.prefillHeadroomNow` (pure `liveHeadroomFrom`) is the live ceiling less
+- **One live headroom, one first width.** `bills.prefillHeadroomNow` (pure `liveHeadroomFrom`) is the ceiling less
   the active and staged bytes and what the arch parks (`parkedBytes`: DeepSeek's decode pool and the engine's free
   buffers); the chunk-width hook, the widen re-check, the served warm, an image encode and DeepSeek's borrow read it,
   and admission reads it plus only the parked bytes its bill holds itself (`admissionAvailableFor`, the arch's
@@ -114,12 +112,12 @@ bill function's output on the committed fixture configs of all served packs: a b
   the hook checks at the first position. The hook widens at the earliest at the third chunk, after
   `PREFILL_WIDEN_PROBES` (2) supporting probes.
 - **A load's preflight proves its served warm** (`warmNeedBytes`, read by the resident and the streamed requirement and
-  the cold-load gate): a resident Cooler load bills the larger of its warmup and that need beside its weights, as the
-  warm's live reserve otherwise eats the safety net (a Flash-Next 27.4 GB load admitted at its edge failed its warm).
+  the cold-load gate): a resident Cooler load bills the larger of its warmup and that need beside its weights (a Flash-Next
+  27.4 GB load admitted at its edge failed its warm).
   `streamedLoadRequirementBytes` adds the warm's dearest forward at the
   narrowest chunk with no pool lent (`warmFloorChunkBytes`, `warmChunkPeakBytes`: the warm's longest prompt walked as
   its prefill runs it, its merged tail and checkpoint stride included; Qwen's 2,348-token warm at 512 rows ends in an
-  811-row forward at 1,536, dearer than the first chunk; the warm picks its width by the same function) and `LIVE_RESERVE_BYTES`, and the fit bills the larger of that chunk and a request
+  811-row forward at 1,536, dearer than the first chunk; the warm picks its width by the same function), and the fit bills the larger of that chunk and a request
   under the ceiling; a refusal names the ssd budget that fits. Without it a 32 GB Mac read every weight, then failed
   `WarmChunkDoesNotFit`.
 - **Owner rule: under a declared `iogpu.wired_limit_mb`, if the free RAM is under the limit, the resident Sushi preflight uses the free RAM at that instant** (`sushiAvailable`: the lesser of the limit's floor, less `--wired-margin-gib` or the GPU floor and the resident buffers, and the free RAM `effectiveAvailableBytes` reads, the streamed preflight's reading; still under the working set). The `[preflight]` line names the bound in words, and its figures as terms that add up to the need: the weights, a streamed load's expert cache, the warmup and context (`bills.preflightLine`). A refusal (`loadMemoryRefusalText`) is one text for the log, the 503 body (`error.message`, which the web UI and Sushibar show whole) and the Models page. It gives a headline, then the need, the bound in words and the shortfall, then that bound's actions, most effective first: for free RAM, quit apps or unload a model (the retry re-reads free RAM); for the GPU limit, the `iogpu.wired_limit_mb` value that holds the load beside what is loaded and the unplanned margin, as the full command Settings builds (`wireLimitsCommand`, the GPU limit and both user wire limits; not offered past RAM less 12 GB). After those come the `--ctx-size` or `--ssd-budget-gb` that fits and a smaller pack. `--skip-mem-preflight` comes last. The `--ssd-budget-gb` that fits is the load's own planner's (`streamedBudgetThatFits` searches the planner, which rounds the cache to whole slots and refuses a budget below its fixed terms and two slots), never a GiB-for-GiB shrink. Every ssd budget a load refusal names (the fit's, the preflight's, a resident load's streaming offer) comes from one planner, `model_load.LoadPlanner`: it is named only when every check the load runs, in its order (the budget and the fit, then the preflight), admits its plan on the readings that refused (`bills.FitReadings`, which the preflight reads too). The RAM default a load picks is held to the same planner on the readings at the load (`ramDefaultAtLoad`). The floor alone passed a load on a box whose RAM other apps held, which then failed its warm; free RAM above the floor still never raises it (a load whose every request would be refused, a 1-token context).
@@ -176,11 +174,8 @@ bill function's output on the committed fixture configs of all served packs: a b
   `loadServingBill` uses `prefillNeededAtChunk`, including KV, rings, recurrent/history state, MTP and prefill scratch.
   It prices an explicit prefill width at that width after the architecture's cap; otherwise it proves the per-request
   floor. A refusal reports the largest context that fits the same bill and available memory, capped at
-  the model's context limit. Both price the context on the room admission reads once loaded (`preflightServing`):
-  the reading less the weights, and less the live checks' `LIVE_RESERVE_BYTES` only where free RAM binds
-  (`SushiAvailable.liveReserve`; `liveCeilingFrom` keeps it off the free RAM, never off the GPU limit or a declared
-  floor), so a named or admitted `--ctx-size` is admitted at that length (free 12 GB, 10 GB of weights: 32,248 named
-  and 1 GiB short once loaded), and a GPU-bound edge still loads. Existing active MLX buffers are subtracted from the GPU working-set limit before this
+  the model's context limit. Both price the context on the preflight's reading less the weights (`preflightServing`),
+  never above what admission reads once loaded, so a named or admitted `--ctx-size` is admitted at that length. Existing active MLX buffers are subtracted from the GPU working-set limit before this
   check. Cold-load HTTP 503 responses retain the numeric maximum through the transient unloaded reset; retry and
   successful load clear it.
 - Request-time memory refusals for these packs also report a maximum context using the request's actual KV width,

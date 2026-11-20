@@ -642,13 +642,13 @@ test "Flash-Next streamed: the 32 GB recipe's verdicts at --ssd-budget-gb 17 and
     for ([_]u64{ 17, 18 }) |budget| got.add(plan_at.needAt(budget * gib).?);
     // A 32 GB M1 at iogpu.wired_limit_mb 28000 (floor 26976 MB under the 1 GiB margin): about 21 GB free, then free RAM
     // 200 MB over and under the cut's need.
-    for ([_]u64{ 21 * gib, 8_818_350_426 + 200 * mib, 8_818_350_426 - 200 * mib }) |free| {
+    for ([_]u64{ 21 * gib, 7_744_608_602 + 200 * mib, 7_744_608_602 - 200 * mib }) |free| {
         const readings = bills.FitReadings{ .wired_limit = 28000 * mib, .wired_floor = 26976 * mib, .budget_working_set = 28000 * mib, .working_set = 28000 * mib, .free = free, .total_ram = 32 * gib, .unplanned = gib };
         const planner = model_load.LoadPlanner{ .plan = plan_at, .readings = readings };
         for ([_]u64{ 17, 18 }) |budget| got.add(planner.needAt(budget * gib).? == 0);
         got.add(bills.streamedBudgetThatFits(512 * gib, 0, planner));
     }
-    try bills.pinEq("the 32 GB recipe", &.{ 8818350426, 8818350426, 1, 1, 26, 1, 1, 26, 0, 0, 4 }, got.slice());
+    try bills.pinEq("the 32 GB recipe", &.{ 7744608602, 7744608602, 1, 1, 26, 1, 1, 26, 0, 0, 4 }, got.slice());
 }
 
 const Refused = struct { tried: u32 = 0, refused: u32 = 0, worst: u64 = 0, worst_prompt: u64 = 0 };

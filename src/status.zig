@@ -141,8 +141,12 @@ pub fn getProcAvailableMemBytes() u64 {
     return @intCast(os_proc_available_memory());
 }
 
+/// Test seam: the RAM `getTotalMemBytes` reads, for a machine of another size.
+pub var total_mem_override: ?u64 = null;
+
 /// Total physical RAM (hw.memsize; works on macOS and iOS). 0 on failure.
 pub fn getTotalMemBytes() u64 {
+    if (total_mem_override) |bytes| return bytes;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;

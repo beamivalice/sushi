@@ -546,3 +546,95 @@ test "the width the max-context search prices never narrows as the context grows
     };
     try testing.expectEqual(@as(u32, 0), narrows);
 }
+
+const live_gpu = @import("gpu_mem.zig");
+
+/// One machine's readings for a live test: its RAM, declared wired limit and margin, and the pages macOS can reclaim.
+const Machine = struct {
+    total: ?u64,
+    wired_mb: ?u64,
+    margin: u64,
+    avail: ?u64,
+    gpu_floor: u64,
+
+    fn pin(m: Machine) Machine {
+        const status = @import("status.zig");
+        const was: Machine = .{ .total = status.total_mem_override, .wired_mb = bills.wired_limit_mb_override, .margin = launch_state.wired_limit_margin_bytes, .avail = status.available_mem_override, .gpu_floor = bills.gpu_floor_bytes.load(.monotonic) };
+        status.total_mem_override = m.total;
+        bills.wired_limit_mb_override = m.wired_mb;
+        launch_state.wired_limit_margin_bytes = m.margin;
+        status.available_mem_override = m.avail;
+        bills.gpu_floor_bytes.store(m.gpu_floor, .monotonic);
+        return was;
+    }
+};
+
+test "#110: under a declared wired limit a Flash-Next request on MLX is admitted up to the limit, however little free RAM other apps leave" {
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer cfg.deinit(testing.allocator);
+    cfg.pinned_context = 262_144;
+    const MiB: u64 = 1 << 20;
+    // The reporter's M2 Ultra 64 GB: `iogpu.wired_limit_mb=59392 --wired-margin-gib 4`, 3,501 MB that macOS could still
+    // reclaim beside the 42.8 GB pack (1.7.0's reading at margin 2: 1,453 MB available + 2,048).
+    const was = (Machine{ .total = 64 << 30, .wired_mb = 59_392, .margin = 4 << 30, .avail = 3_501 * MiB, .gpu_floor = 340 * MiB }).pin();
+    defer _ = was.pin();
+    const kv4 = trunk.KVQuantConfig.affine(4);
+    const active: u64 = live_gpu.activeBytes();
+    try testing.expectEqual((55_296 * MiB) -| active, bills.admissionAvailableNow(&cfg));
+    // The whole 262,144-token context, a 32,000-token reply in it, as asked at `--kv-quant 4`.
+    const bill = bills.prefillAdmissionBill(&cfg, 262_144 - 32_000, 32_000, kv4, false, null, .{});
+    errdefer std.debug.print("needed {d} MB, available {d} MB\n", .{ bill.needed >> 20, bill.available >> 20 });
+    try testing.expect(bill.fits());
+}
+
+test "#110: with no declared wired limit a request is bounded by the working set and the RAM macOS can reclaim, as on 1.6.0" {
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer cfg.deinit(testing.allocator);
+    cfg.pinned_context = 262_144;
+    const free: u64 = 2 << 30;
+    const was = (Machine{ .total = null, .wired_mb = 0, .margin = 1 << 30, .avail = free, .gpu_floor = 0 }).pin();
+    defer _ = was.pin();
+    const active: u64 = live_gpu.activeBytes();
+    const footprint = active + live_gpu.cacheBytes();
+    try testing.expectEqual(@min(live_gpu.getGpuWorkingSetLimit(), footprint + free) -| active, bills.admissionAvailableNow(&cfg));
+}
+
+test "#109: admission under a declared wired limit reads the same room whatever free RAM moves to between requests" {
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer cfg.deinit(testing.allocator);
+    cfg.pinned_context = 208_896;
+    const MiB: u64 = 1 << 20;
+    const kv4 = trunk.KVQuantConfig.affine(4);
+    // #109's readings between requests with nothing beside them (4.5, 3.2, 3.1, 2.1 and 1.7 GB free), on #110's
+    // declared limit; its prompts of 156k-183k tokens with max_gen 52,769 at KV4, MTP on.
+    var room: ?u64 = null;
+    for ([_]u64{ 4_608, 3_277, 3_174, 2_150, 1_741 }) |free_mb| {
+        const was = (Machine{ .total = 64 << 30, .wired_mb = 59_392, .margin = 4 << 30, .avail = free_mb * MiB, .gpu_floor = 340 * MiB }).pin();
+        defer _ = was.pin();
+        const available = bills.admissionAvailableNow(&cfg);
+        try testing.expectEqual(room orelse available, available);
+        room = available;
+        for ([_]usize{ 156_000, 183_000 }) |prompt| {
+            const bill = bills.prefillAdmissionBill(&cfg, prompt, 52_769, kv4, false, null, .{ .mtp_on = true });
+            errdefer std.debug.print("free {d} MB: a {d}-token prompt needs {d} MB, available {d} MB\n", .{ free_mb, prompt, bill.needed >> 20, bill.available >> 20 });
+            try testing.expect(bill.fits());
+        }
+    }
+}
+
+test "DeepSeek streamed under a declared wired limit reads the limit's floor as its headroom, however little free RAM other apps leave (#110)" {
+    const dsv41_config = @import("dsv41/dsv41_config.zig");
+    var cfg = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    cfg.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    cfg.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    cfg.max_position_embeddings = 1_048_576;
+    cfg.cooler_for_test = true;
+    cfg.expert_borrow_bytes = 0;
+    const MiB: u64 = 1 << 20;
+    // r-65's box, the owner's decision: a 128 GB M5 at iogpu.wired_limit_mb=125000 with the default 1 GiB margin and
+    // 3 GB that macOS could still reclaim beside other apps. The declared limit is the user's contract for their room.
+    const was = (Machine{ .total = 128 << 30, .wired_mb = 125_000, .margin = 1 << 30, .avail = 3_000 * MiB, .gpu_floor = 0 }).pin();
+    defer _ = was.pin();
+    const active: u64 = live_gpu.activeBytes() + live_gpu.lentBytes();
+    try testing.expectEqual(bills.liveHeadroomFrom(&cfg, 123_976 * MiB, active, 0, live_gpu.engineFree()), bills.headroomNow(&cfg, 0).live);
+}

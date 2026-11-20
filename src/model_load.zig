@@ -1190,12 +1190,10 @@ pub const LoadServingBill = struct {
 pub const PreflightServing = struct { serving: ?LoadServingBill, needed: u64 };
 
 /// A load's requirement on a preflight reading, and its explicit context's serving bill: the context is priced on the room
-/// admission reads once the weights are resident, the reading less the live checks' reserve where free RAM binds
-/// (`bills.SushiAvailable.liveReserve`), so a context the preflight admits or a refusal names is admitted at its length.
+/// the reading leaves once the weights are resident.
 pub fn preflightServing(config: *const ModelConfig, weights: u64, mtp_on: bool, avail: bills.SushiAvailable) PreflightServing {
-    const reserve = avail.liveReserve();
-    const serving = if (scheduler_mod.load_serving_bill) |bill| bill(config, if (avail.bytes) |b| b -| weights -| reserve else 0) else null;
-    return .{ .serving = serving, .needed = loadRequirementBytes(config, weights, mtp_on, if (serving) |b| b.needed +| reserve else 0) };
+    const serving = if (scheduler_mod.load_serving_bill) |bill| bill(config, if (avail.bytes) |b| b -| weights else 0) else null;
+    return .{ .serving = serving, .needed = loadRequirementBytes(config, weights, mtp_on, if (serving) |b| b.needed else 0) };
 }
 
 /// The drafter is quantized at load, so it stays resident at its quantized bytes, not its file bytes.

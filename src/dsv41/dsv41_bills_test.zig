@@ -45,36 +45,7 @@ test "DeepSeek: the streamed request bill brackets the prefill peaks measured on
     }
 }
 
-test "DeepSeek's live headroom under a raised wired limit is what the machine can still give, not the declared limit" {
-    const t = std.testing;
-    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
-    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
-    config.max_position_embeddings = 1_048_576;
-    config.cooler_for_test = true;
-    config.expert_borrow_bytes = 0;
-    const MiB: u64 = 1 << 20;
-    const GB: u64 = 1_000_000_000;
-    // r-65, the M5 at --ssd-budget-gb 108: iogpu.wired_limit_mb=125000 less the 1 GiB margin, every expert cached
-    // (112.83 GB active), and the owner's apps holding the rest of the 128 GB, so 3 GB reclaimable, the live reserve of it kept.
-    const declared: u64 = 123_976 * MiB;
-    const active: u64 = 112_828_234_064;
-    const footprint: u64 = active + 400 * MiB;
-    const reclaimable: u64 = 3 * GB;
-    const live = bills.liveCeilingFrom(declared, footprint, reclaimable);
-    try t.expectEqual(footprint + reclaimable - bills.LIVE_RESERVE_BYTES, live);
-    // The served warm's widest chunk is what that headroom holds: never the 8192 rows the declared limit admitted,
-    // whose ~13 GB took the box down.
-    const at_declared = bills.widestChunkAdmitted(&config, 16, 8192, bills.prefillHeadroomFrom(declared, active, 0));
-    const at_live = bills.widestChunkAdmitted(&config, 16, 8192, bills.prefillHeadroomFrom(live, active, 0));
-    try t.expectEqual(@as(u32, 8192), at_declared);
-    try t.expect(at_live < 8192);
-    try t.expect(at_live == 0 or bills.prefillChunkCost(&config, 16, at_live, 0) <= live - active);
-    // With the memory free, the declared limit stands.
-    try t.expectEqual(declared, bills.liveCeilingFrom(declared, footprint, 40 * GB));
-}
-
-test "issue 105: a raised --wired-margin-gib lowers the declared ceiling only; the live headroom keeps its own reserve, so the served warm still finds DeepSeek's 2048-row chunk" {
+test "issue 105: a raised --wired-margin-gib lowers the declared ceiling only, so the served warm still finds DeepSeek's 2048-row chunk" {
     const t = std.testing;
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
@@ -85,15 +56,12 @@ test "issue 105: a raised --wired-margin-gib lowers the declared ceiling only; t
     const MiB: u64 = 1 << 20;
     const GiB: u64 = 1 << 30;
     // The report: an M5 at iogpu.wired_limit_mb=124518 with --wired-margin-gib 16 for other apps' models, DeepSeek STQ
-    // 1.75 at --ssd-budget-gb 100 loaded (~99.4 GB active), and ~10.4 GiB still reclaimable.
+    // 1.75 at --ssd-budget-gb 100 loaded (~99.4 GB active).
     const margin: u64 = 16 * GiB;
     const declared: u64 = bills.wiredLimitFloor(124_518 * MiB, 128 * GiB, margin);
     try t.expectEqual(@as(u64, 108_134 * MiB), declared);
     const active: u64 = 99_400 * MiB;
-    const footprint: u64 = active + 400 * MiB;
-    const reclaimable: u64 = 10_600 * MiB;
-    const live = bills.liveCeilingFrom(declared, footprint, reclaimable);
-    const width = bills.widestChunkAdmitted(&config, 16, 8192, bills.prefillHeadroomFrom(live, active, 0));
+    const width = bills.widestChunkAdmitted(&config, 16, 8192, bills.prefillHeadroomFrom(declared, active, 0));
     try t.expect(width >= 2048);
 }
 
@@ -401,12 +369,12 @@ test "DeepSeek: a request's decode state is billed as growth after admission onl
     try std.testing.expectEqual(state, bills.admissionCommitBytes(&config, 4096, 512, 16, false));
 }
 
-/// What the served warm reads as its headroom right after a streamed load took what it holds out of `avail` free bytes:
-/// the live headroom, whose footprint is the load's bytes, the decode pool among them parked as the engine's.
-fn warmHeadroomAfterLoad(config: *const model_mod.ModelConfig, ceiling: u64, avail: u64, weights: u64) u64 {
+/// What the served warm reads as its headroom right after a streamed load took what it holds under `ceiling`, the
+/// decode pool among it parked as the engine's.
+fn warmHeadroomAfterLoad(config: *const model_mod.ModelConfig, ceiling: u64, weights: u64) u64 {
     const held = bills.expertStreamingGateBytes(weights, config.expert_cache_bytes, model_load.loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes);
     const pool = config.expertPoolBytes();
-    return bills.liveHeadroomFrom(config, bills.liveCeilingFrom(ceiling, held, avail -| held), held - pool, 0, pool);
+    return bills.liveHeadroomFrom(config, ceiling, held - pool, 0, pool);
 }
 
 /// The 32 GB ledger's planner at a smaller budget: the GiBs it gives up come out of the cache, which keeps whole slots of
@@ -454,14 +422,14 @@ test "DeepSeek: a streamed load the preflight and the fit admit on a 32 GB Mac l
             if (fits > 0) try t.expect(SlotPlanner.needAt(.{ .config = &config, .weights = weights }, fits << 30).? <= avail);
             continue;
         }
-        try t.expect(bills.warmChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, ceiling, avail, weights)) > 0);
+        try t.expect(bills.warmChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, ceiling, weights)) > 0);
     }
 
     // The declared ceiling: every one the load's fit admits leaves the warm a chunk with memory to spare.
     var c: u64 = 18_000 * MiB;
     while (c < 24_000 * MiB) : (c += 50 * MiB) {
         if (!bills.expertStreamingConfigFits(&config, c, 0, weights)) continue;
-        try t.expect(bills.warmChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, c, 1 << 40, weights)) > 0);
+        try t.expect(bills.warmChunkAdmitted(&config, bits, top, warmHeadroomAfterLoad(&config, c, weights)) > 0);
     }
 
     // The RAM default's budget is bounded by a request at the default context beside it, which leaves the warm a chunk.

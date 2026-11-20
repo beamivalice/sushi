@@ -15,6 +15,10 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 | Low | 2 / 5 | 4 / 4 | 3 / 9 | 3 / 4 | 12 / 22 |
 | Total | 15 / 28 | 8 / 8 | 11 / 24 | 3 / 5 | 37 / 65 |
 
+- **Requests are admitted up to the wired limit again, as in 1.6.0 (#110)**: other apps' memory no longer shrinks the
+  context a request may use, so a 64 GB Mac with a raised `iogpu.wired_limit_mb` serves the long Qwen requests 1.6.0
+  served; set `iogpu.wired_limit_mb` and `--wired-margin-gib` to keep room for other apps.
+- **`sushi kld` with no `--ssd-budget-gb` takes the same memory default as serve**, so a 192 or 256 GB Mac scores a DeepSeek pack fully resident instead of refusing it; the load logs where the budget came from.
 - **`sushi kld` with no `--ssd-budget-gb` takes the same memory default as serve**, so a 192 or 256 GB Mac scores a DeepSeek pack fully resident instead of refusing it, and the DeepSeek layer-major capture sizes its window batch from that default (refusing by name, with `--ssd-budget-gb`, one that buys no window); the load logs where the budget came from.
 - **A pack listed while its download was still running is billed at its full size once the download finishes**: its entry kept the partial byte count it was listed with, so the eviction gate and the resident bill under-counted it until the next restart; a finished download or a rescan now refreshes it.
 - **A prefix-cache clear no longer deletes the SSD root of a model that loads while it runs**: the clear's lock file lived inside the namespace it deleted, so a tier opening mid-delete took a fresh lock, then lost its root (two tiers could later own one); a clear and a tier opening now take a gate file beside the namespace.

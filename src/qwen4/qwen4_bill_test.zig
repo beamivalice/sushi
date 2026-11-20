@@ -2148,7 +2148,7 @@ test "Flash-Next: a streamed load the preflight and the fit admit leaves its ser
     const need = bills.loadRequirementBytes(&config, weights, true, 0);
     var avail = need;
     while (avail < need + (2 << 30)) : (avail += 50 * MiB) {
-        const headroom = bills.liveHeadroomFrom(&config, bills.liveCeilingFrom(ceiling, held, avail - held), held, 0, 0);
+        const headroom = bills.liveHeadroomFrom(&config, ceiling, held, 0, 0);
         const chunk = bills.warmChunkAdmitted(&config, bits, top, headroom);
         try t.expect(chunk > 0);
         try warmFits(&config, bits, chunk, headroom);
@@ -2188,7 +2188,7 @@ test "Flash-Next: a resident load the free-RAM preflight admits at its edge leav
             // After the load the weights are active and the rest of the free RAM is what macOS can still give.
             const reclaimable = free - weights;
             const ceiling = bills.gpuCeilingWithWiredFloor(working_set, weights, reclaimable, floor);
-            const headroom = bills.liveHeadroomFrom(&config, bills.liveCeilingFrom(ceiling, weights, reclaimable), weights, 0, 0);
+            const headroom = bills.liveHeadroomFrom(&config, ceiling, weights, 0, 0);
             const chunk = bills.warmChunkAdmitted(&config, bits, top, headroom);
             errdefer std.debug.print("floor {d} MB, MTP {}: admitted with {d} MB free for a {d} MB need; the warm's headroom is {d} MB and its dearest forward at the narrowest chunk needs {d} MB\n", .{ floor / MiB, mtp, free / MiB, need / MiB, headroom / MiB, bills.warmFloorChunkBytes(&config) / MiB });
             try t.expect(chunk > 0);
@@ -2310,11 +2310,11 @@ test "Flash-Next on Cooler: a load's preflight leaves its served warm the whole 
     const cfg = coolerFlashNext();
     const floor: u64 = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
     const bill = bills.warmRequestBill(&cfg, bills.defaultKvBits(&cfg), floor, bills.mtpHeadDefaultOn(&cfg));
-    try t.expect(bills.warmNeedBytes(&cfg) >= bill + bills.LIVE_RESERVE_BYTES);
+    try t.expect(bills.warmNeedBytes(&cfg) >= bill);
     try t.expect(bill > bills.warmFloorChunkBytes(&cfg));
 }
 
-test "Flash-Next on Cooler: the advertised context is admitted when asked on a Mac whose free RAM binds below its declared GPU limit" {
+test "Flash-Next on Cooler: the advertised context is admitted when asked under a declared GPU limit, however little free RAM other apps leave (#110)" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
     const no_tier = TierGuard.pin(false, 0);
@@ -2322,14 +2322,13 @@ test "Flash-Next on Cooler: the advertised context is admitted when asked on a M
     var cfg = coolerFlashNext();
     cfg.expert_streaming = true;
     const GiB: u64 = 1 << 30;
-    // A 32 GB M1 under a declared limit: the streamed load's bytes in use, and what macOS can still give beside them.
+    // A 32 GB M1 under a declared limit, the streamed load's bytes in use.
     const ceiling: u64 = 28 * GiB;
     const active: u64 = 12 * GiB;
-    const reclaimable: u64 = 8 * GiB;
-    const ctx = bills.memoryContextLive(&cfg, ceiling, active, reclaimable, active);
+    const ctx = bills.memoryContextAt(&cfg, ceiling, active);
     var probe = cfg;
     probe.pinned_context = bills.autoContextFrom(ctx, cfg.contextCap(), 0);
-    const available = bills.admissionAvailableFor(&probe, bills.liveCeilingFrom(ceiling, active, reclaimable), active, 0);
+    const available = bills.admissionAvailableFor(&probe, ceiling, active, 0);
     const chunk: u64 = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
     // A prompt that fills the advertised context, and a short one whose reply does.
     for ([_]u64{ probe.pinned_context, 1_000 }) |seq| {
@@ -2355,9 +2354,8 @@ fn admittedAt(cfg: *const model_mod.ModelConfig, prompt: u64, reply: u32, availa
 }
 
 // A resident Cooler load of W bytes on a Mac of working set `ws` with F free (`floor` a declared floor, or 0); after the
-// load the live check reads the same machine, F less the W the load wired. The --ctx-size a refusal names (the edge, at
-// 1M asked) passes the preflight and is admitted at every split once loaded. Free RAM binding, the live checks keep their
-// reserve of it; the GPU limit or a declared floor binding, they keep none, and neither does the preflight.
+// load admission reads the same machine, F less the W the load wired. The --ctx-size a refusal names (the edge, at
+// 1M asked) passes the preflight and is admitted at every split once loaded.
 fn namedContextHolds(cfg: *const model_mod.ModelConfig, weights: u64, ws: u64, free: u64, floor: u64) !?u32 {
     const a = bills.sushiAvailable(free, 0, ws, 0, floor);
     const avail = a.bytes.?;
@@ -2371,7 +2369,7 @@ fn namedContextHolds(cfg: *const model_mod.ModelConfig, weights: u64, ws: u64, f
     errdefer std.debug.print("ws {d} MB, floor {d} MB, free {d} MB, weights {d} MB: --ctx-size {d} named; preflight needs {d} MB of {d} MB\n", .{ ws >> 20, floor >> 20, free >> 20, weights >> 20, named, at.needed >> 20, avail >> 20 });
     try std.testing.expect(at.needed <= avail);
     const ceiling = bills.gpuCeilingWithWiredFloor(ws, weights, free - weights, floor);
-    const available = bills.admissionAvailableFor(cfg, bills.liveCeilingFrom(ceiling, weights, free - weights), weights, 0);
+    const available = bills.admissionAvailableFor(cfg, ceiling, weights, 0);
     for ([_]u64{ named, named - 1, named / 2, 15 }) |prompt| {
         errdefer std.debug.print("loaded at --ctx-size {d}: prompt {d} + max_tokens {d} refused at {d} MB\n", .{ named, prompt, named - prompt, available >> 20 });
         try std.testing.expect(admittedAt(cfg, prompt, @intCast(named - prompt), available));
@@ -2400,8 +2398,7 @@ test "Flash-Next on Cooler: the --ctx-size a resident load refusal names loads, 
 }
 
 // The mirror of the test above: where the GPU limit or a declared floor binds, admission once loaded reads the whole
-// ceiling (`liveCeilingFrom` takes its reserve off the free RAM only), so the edge the room beside the weights holds
-// loads and is the context a refusal names.
+// ceiling, so the edge the room beside the weights holds loads and is the context a refusal names.
 test "Flash-Next on Cooler: where the GPU limit binds, the --ctx-size at the edge of the room beside the weights loads and is the one a refusal names" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const no_tier = TierGuard.pin(false, 0);
