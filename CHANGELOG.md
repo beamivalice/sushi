@@ -29,6 +29,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **Requests are admitted up to the wired limit again, as in 1.6.0 (#110)**: other apps' memory no longer shrinks the
   context a request may use, so a 64 GB Mac with a raised `iogpu.wired_limit_mb` serves the long Qwen requests 1.6.0
   served; set `iogpu.wired_limit_mb` and `--wired-margin-gib` to keep room for other apps.
+- **Logprobs list only the bytes a reply returned**: a stop inside a token listed the whole token (`[section` for the text `[s`), and a chat reply's trimmed leading space stayed in its first entry; both now list the returned bytes, streamed or not, with the whole token's logprob.
+- **`sushi kld` with no `--ssd-budget-gb` takes the same memory default as serve**, so a 192 or 256 GB Mac scores a DeepSeek pack fully resident instead of refusing it; the load logs where the budget came from.
 - **`sushi kld` with no `--ssd-budget-gb` takes the same memory default as serve**, so a 192 or 256 GB Mac scores a DeepSeek pack fully resident instead of refusing it, and the DeepSeek layer-major capture sizes its window batch from that default (refusing by name, with `--ssd-budget-gb`, one that buys no window); the load logs where the budget came from.
 - **A reply whose turn ends inside its thinking is continued once**: a model that wrote its end-of-turn token inside its
   thought returned a reply with no answer and no tool call, which an agent took as an empty turn; sushi now closes the

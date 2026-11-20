@@ -2456,9 +2456,14 @@ test "server: logprobs list exactly the text a reply returns, streamed or not: a
                 defer gpa.free(plain);
                 var free = try deliveredBy(arm.chat, false, plain);
                 defer free.deinit();
-                if (free.text.items.len < 4) return error.ReplyTooShortToCut;
-                // The third byte as the stop: content survives it and its own tokens follow.
-                const stop = try std.json.Stringify.valueAlloc(gpa, free.text.items[2..3], .{});
+                // The first whole character at or after the third byte as the stop: content survives it and its own
+                // tokens follow. A byte inside a UTF-8 sequence would go out as a number array, not a string.
+                const text = free.text.items;
+                var at: usize = 0;
+                while (at < 2 and at < text.len) at += try std.unicode.utf8ByteSequenceLength(text[at]);
+                const n = if (at < text.len) try std.unicode.utf8ByteSequenceLength(text[at]) else 0;
+                if (n == 0 or at + n >= text.len) return error.ReplyTooShortToCut;
+                const stop = try std.json.Stringify.valueAlloc(gpa, text[at .. at + n], .{});
                 defer gpa.free(stop);
                 for ([_]bool{ false, true }) |stream| {
                     const body = try std.fmt.allocPrint(gpa, "{s}{s},\"stop\":[{s}],\"stream\":{}}}", .{ arm.head, arm.extra, stop, stream });

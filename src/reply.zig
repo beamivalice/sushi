@@ -724,8 +724,9 @@ fn expectSameEnd(allocator: std.mem.Allocator, generated: []const u8, stops: []c
 
 /// The tokens a stream lists logprobs for, one token per fragment: its gate releases the text, a content chunk goes out
 /// when the think split of the delivered text grows, and the final chunk lists what lagged behind (the newest entry
-/// has not landed when its chunk goes out).
-fn streamListed(allocator: std.mem.Allocator, frags: []const []const u8, stops: []const []const u8, opens_think: bool, listed: []bool) !void {
+/// has not landed when its chunk goes out). The content arm withholds a content's trailing whitespace; it ships at
+/// the end of the reply when the non-stream content reaches the end of the text (`tail_ships`), else it is cut.
+fn streamListed(allocator: std.mem.Allocator, frags: []const []const u8, stops: []const []const u8, opens_think: bool, tail_ships: bool, listed: []bool, cut: *listed_tokens.Cut) !void {
     // A tools stream buffers from the first tool markup on and sends no content after it (`ToolHoldScan`).
     var tool_scan: think_tags.ToolHoldScan = .{};
     var listing: listed_tokens.Listing = .{};
@@ -747,18 +748,31 @@ fn streamListed(allocator: std.mem.Allocator, frags: []const []const u8, stops: 
         } else break;
         defer allocator.free(piece);
         listing.released = gate.released;
+        listing.ended = listing.ended or gate.matched != null or tail;
         try delivered.appendSlice(allocator, piece);
         // The content arm holds a tail that may still grow into a think opener.
         const content = if (think_tags.endsWithPartialThinkOpen(delivered.items) or think_tags.streamShouldBufferForToolsScan(delivered.items, &tool_scan)) delivered.items[0..0] else think_tags.splitThinkBlock(delivered.items, true, opens_think).content;
         if (content.len > sent_content) {
             listing.skipTo(@intFromPtr(content.ptr) - @intFromPtr(delivered.items.ptr));
             sent_content = content.len;
-            const r = listing.sent(@min(i, frags.len));
-            for (r.start..r.end) |k| listed[k] = true;
+            const content_end = @intFromPtr(content.ptr) - @intFromPtr(delivered.items.ptr) + content.len;
+            const withheld = listing.released -| content_end + (content.len - std.mem.trimEnd(u8, content, "\n ").len);
+            noteListed(listing.sent(@min(i, frags.len), withheld), listed, cut);
         }
         if (gate.matched != null) break;
     }
-    const r = listing.late(frags.len);
+    listing.ended = true;
+    if (tail_ships) noteListed(listing.sent(frags.len, 0), listed, cut);
+    noteListed(listing.late(frags.len), listed, cut);
+}
+
+/// A drained range joins the listing: the first token listed carries the head cut, the last the tail cut.
+fn noteListed(r: listed_tokens.Range, listed: []bool, cut: *listed_tokens.Cut) void {
+    if (r.end <= r.start) return;
+    var first = true;
+    for (listed) |l| first = first and !l;
+    if (first) cut.head = r.head;
+    cut.tail = r.tail;
     for (r.start..r.end) |k| listed[k] = true;
 }
 
@@ -773,8 +787,6 @@ fn expectSameListing(allocator: std.mem.Allocator, generated: []const u8, frag_l
     const got = try allocator.alloc(bool, frags.items.len);
     defer allocator.free(got);
     @memset(got, false);
-    try streamListed(allocator, frags.items, stops, ask.opens_think, got);
-
     const whole = try settle(allocator, .{ .text = generated, .source = .whole, .finish_reason = "length", .finish_details = null }, ask);
     defer whole.deinit(allocator);
     var listing: listed_tokens.Listing = .{};
@@ -784,7 +796,11 @@ fn expectSameListing(allocator: std.mem.Allocator, generated: []const u8, frag_l
     const content = if (whole.reply) |r| r.preamble else think_tags.splitThinkBlock(whole.text, true, ask.opens_think).content;
     const from = if (content.len > 0) @intFromPtr(content.ptr) - @intFromPtr(whole.text.ptr) else 0;
     const r = listing.touching(from, from + content.len);
+    var streamed_cut: listed_tokens.Cut = .{};
+    try streamListed(allocator, frags.items, stops, ask.opens_think, content.len > 0 and from + content.len == whole.text.len, got, &streamed_cut);
     for (got, 0..) |g, k| try testing.expectEqual(k >= r.start and k < r.end, g);
+    // A token the reply returned part of lists those bytes on both.
+    try testing.expectEqual(r.cut(), streamed_cut);
 }
 
 test "a stream and a non-stream reply end the same: a stop in a call, a stop after one, a length end, a cancel" {

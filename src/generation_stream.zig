@@ -724,7 +724,7 @@ fn emitConstrainedChat(a: std.mem.Allocator, stream: *Conn, id: i64, model: []co
         try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = null, .reasoning_content = d.reasoning.items }, null, null, null, .{ .logprobs_json = null });
     }
     if (d.content.items.len > 0) {
-        try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = d.content.items }, null, null, null, .{ .logprobs_json = try lps.take() });
+        try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = d.content.items }, null, null, null, .{ .logprobs_json = try lps.take(0) });
     } else lps.dropPending();
 }
 
@@ -1547,7 +1547,7 @@ pub fn handleStreamingGeneration(
     defer lps.deinit();
 
     // First chunk: role announcement
-    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = "assistant", .content = "" }, null, null, null, .{ .logprobs_json = try lps.take() });
+    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = "assistant", .content = "" }, null, null, null, .{ .logprobs_json = try lps.take(0) });
 
     // Buffer for stop sequence and tool call detection
     var text_buf = std.ArrayList(u8).empty;
@@ -1672,7 +1672,7 @@ pub fn handleStreamingGeneration(
             if (delivery) |*d| d.noteToken(raw_decoded.len, ts.slot.?.constraintPayloadStart());
             break :blk try stop_gate.push(allocator, raw_decoded);
         };
-        lps.release(stop_gate.released);
+        lps.release(stop_gate.released, tail_flush or stop_gate.matched != null);
         stopped = stop_gate.matched != null;
         if (stopped) ts.slot.?.stop_hit.store(true, .release);
         if (token_text.len == 0) {
@@ -1789,21 +1789,27 @@ pub fn handleStreamingGeneration(
                         reasoning_streamed = 0;
                         content.endPart();
                         if (split.content.len > 0) switch (try content.deliver(allocator, split.content)) {
-                            .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take() }),
+                            .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take(content.withheld()) }),
                             else => {},
                         };
                     },
                     .flush_text => {
+                        // The pieces end at the gate's `released`: each one's offset in the generation follows.
+                        var piece_at = lps.listing.released;
+                        for (token_texts.items) |tt| piece_at -|= tt.len;
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
-                            switch (try content.deliver(allocator, tt)) {
+                            const step = try content.deliver(allocator, tt);
+                            if (content.trimmed > 0) lps.contentFrom(piece_at + content.trimmed);
+                            piece_at += tt.len;
+                            switch (step) {
                                 .marker => {},
                                 .hold => if (content.mark.cut) lps.dropPending(),
                                 // Suppressed lead: nothing pending describes text the
                                 // client received, so retire it rather than letting it
                                 // ride the next chunk (logprobs.content ↔ content).
                                 .drop => lps.dropPending(),
-                                .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take() }),
+                                .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take(content.withheld()) }),
                             }
                         }
                         token_texts.clearRetainingCapacity();
@@ -1904,7 +1910,7 @@ pub fn handleStreamingGeneration(
                     // so its entries stop here rather than riding the answer.
                     lps.skipToContent(think_buf.items, content_after);
                     switch (try content.deliver(allocator, content_after)) {
-                        .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take() }),
+                        .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take(content.withheld()) }),
                         else => {},
                     }
                 } else {
@@ -1944,12 +1950,13 @@ pub fn handleStreamingGeneration(
                 continue;
             }
             const step = try content.deliver(allocator, token_text);
+            if (content.trimmed > 0) lps.contentFrom(lps.listing.released -| token_text.len + content.trimmed);
             channel_armed = step == .marker and !content.started and std.mem.eql(u8, token_text, "<|channel>");
             switch (step) {
                 .marker => {},
                 .hold => if (content.mark.cut) lps.dropPending(),
                 .drop => lps.dropPending(),
-                .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take() }),
+                .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take(content.withheld()) }),
             }
         }
 
@@ -1979,7 +1986,7 @@ pub fn handleStreamingGeneration(
     // thought, or before tool markup (a tools request decides below).
     if (!client_gone and !gated_stream) {
         const held = try content.finish(allocator, join.closed);
-        if (held.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = held }, null, null, null, .{ .logprobs_json = try lps.take() });
+        if (held.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = held }, null, null, null, .{ .logprobs_json = try lps.take(content.withheld()) });
     }
 
     // Flush any remaining think buffer
@@ -2000,7 +2007,7 @@ pub fn handleStreamingGeneration(
             const vis_tail = lead[0..content.mark.final(lead)];
             if (vis_tail.len > 0) {
                 content.started = true;
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_tail }, null, null, null, .{ .logprobs_json = try lps.take() });
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_tail }, null, null, null, .{ .logprobs_json = try lps.take(0) });
             }
         }
     }
@@ -2090,7 +2097,7 @@ pub fn handleStreamingGeneration(
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
                 const think_split = think_tags.splitThinkBlock(flush_text, true, opens_think and !think_closed);
                 const held = try content.finish(allocator, join.closed and think_split.content.len == 0);
-                if (held.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = held }, null, null, null, .{ .logprobs_json = try lps.take() });
+                if (held.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = held }, null, null, null, .{ .logprobs_json = try lps.take(content.withheld()) });
                 // `budget_exhausted` means the cap was already streamed in full.
                 if (think_tags.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
@@ -2105,7 +2112,7 @@ pub fn handleStreamingGeneration(
                     // (normalization moved it) nothing is skipped, which is the
                     // old behaviour rather than a wrong boundary.
                     lps.skipToContent(full_text.items, think_split.content);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null, null, .{ .logprobs_json = try lps.take() });
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null, null, .{ .logprobs_json = try lps.take(content.withheld()) });
                 } else {
                     // All reasoning, no content: those entries describe text the
                     // client never received.
@@ -2707,7 +2714,7 @@ pub fn contentLogprobsJson(
     const r = contentTokenRange(allocator, tok, token_ids[0..n], full_text, content);
     const a = @min(r.start, n);
     const b = @min(@max(r.end, a), n);
-    return formatLogprobsObject(allocator, tok, token_ids[a..b], lps[a..b], top);
+    return formatLogprobsObject(allocator, tok, token_ids[a..b], lps[a..b], top, r.cut());
 }
 
 /// The half-open token range whose decoded text lands inside `content`.

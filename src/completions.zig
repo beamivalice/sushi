@@ -471,7 +471,7 @@ fn handleNonStreamingCompletion(
         const lps = result.logprobs.?;
         const n = @min(result.token_ids.len, lps.len);
         const r = try listedBy(allocator, tok, result.token_ids[0..n], skip_special, final_text.len);
-        break :lp try formatCompletionsLogprobs(allocator, tok, result.token_ids[r.start..r.end], lps[r.start..r.end], asked_logprobs.?.top, &lp_offset_base);
+        break :lp try formatCompletionsLogprobs(allocator, tok, result.token_ids[r.start..r.end], lps[r.start..r.end], asked_logprobs.?.top, r.cut(), &lp_offset_base);
     } else "null";
     defer if (!std.mem.eql(u8, lp_json, "null")) allocator.free(lp_json);
 
@@ -632,7 +632,7 @@ fn handleStreamingCompletion(
             try lps.note(token_id, raw_decoded_c.len);
             break :blk try stop_gate.push(allocator, raw_decoded_c);
         };
-        lps.release(stop_gate.released);
+        lps.release(stop_gate.released, tail_flush or stop_gate.matched != null);
         defer allocator.free(token_text);
 
         stopped = stop_gate.matched != null;
@@ -646,7 +646,7 @@ fn handleStreamingCompletion(
         defer allocator.free(escaped);
         // Legacy `logprobs` is a sibling of `text` on the choice. OpenAI sends
         // `null` on a chunk that has none, never an absent key.
-        const lp_field = (try lps.take()) orelse "null";
+        const lp_field = (try lps.take(0)) orelse "null";
         const chunk = try std.fmt.allocPrint(allocator,
             \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":null}}]}}
         , .{ cmpl_id, created_ts, model_name, escaped, lp_field });

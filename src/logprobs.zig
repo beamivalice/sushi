@@ -7,7 +7,9 @@ const server = @import("server.zig");
 const generation_stream = @import("generation_stream.zig");
 const contentTokenRange = generation_stream.contentTokenRange;
 const contentLogprobsJson = generation_stream.contentLogprobsJson;
-const Listing = @import("listed_tokens.zig").Listing;
+const listed_tokens = @import("listed_tokens.zig");
+const Listing = listed_tokens.Listing;
+const Cut = listed_tokens.Cut;
 const jsonEscape = server.jsonEscape;
 
 /// Streaming-side logprobs accumulator.
@@ -58,10 +60,17 @@ pub const StreamLogprobs = struct {
         try self.listing.note(self.allocator, shown_len);
     }
 
-    /// The stop gate's running count of delivered bytes (`Gate.released`), after each token it took. Tokens past it
-    /// (a held stop prefix, a stop's own) are never listed while held, nor once the stop fired.
-    pub fn release(self: *StreamLogprobs, delivered: usize) void {
+    /// The stop gate's running count of delivered bytes (`Gate.released`), after each token it took, and whether the
+    /// reply takes no more text (a stop matched, or the held tail was flushed). Bytes past it (a held stop prefix,
+    /// a stop's own) are never listed while held, nor once the stop fired.
+    pub fn release(self: *StreamLogprobs, delivered: usize, ended: bool) void {
         self.listing.released = delivered;
+        self.listing.ended = self.listing.ended or ended;
+    }
+
+    /// The reply's content starts at `offset` of the generation text: the token holding it lists what follows.
+    pub fn contentFrom(self: *StreamLogprobs, offset: usize) void {
+        if (self.enabled) self.listing.skipTo(offset);
     }
 
     /// Skip the entries of text the client never receives as content.
@@ -91,18 +100,20 @@ pub const StreamLogprobs = struct {
     }
 
     /// Render what a content chunk going out now describes, or null when logprobs weren't requested or
-    /// nothing has landed since the last chunk.
-    pub fn take(self: *StreamLogprobs) !?[]const u8 {
-        return self.drain(true);
+    /// nothing has landed since the last chunk. `withheld` is the tail of the released bytes the content arm holds
+    /// back: the chunk does not carry it yet, and a trimmed reply never will.
+    pub fn take(self: *StreamLogprobs, withheld: usize) !?[]const u8 {
+        return self.drain(true, withheld);
     }
 
     /// Render the entries of content already sent that had not landed when it went out. A chunk that carries no
     /// content (the final one) takes through this: what the reply did not return is never listed there.
     pub fn takeLate(self: *StreamLogprobs) !?[]const u8 {
-        return self.drain(false);
+        self.listing.ended = true;
+        return self.drain(false, 0);
     }
 
-    fn drain(self: *StreamLogprobs, content_chunk: bool) !?[]const u8 {
+    fn drain(self: *StreamLogprobs, content_chunk: bool, withheld: usize) !?[]const u8 {
         if (!self.enabled) return null;
         if (self.rendered) |r| {
             self.allocator.free(r);
@@ -111,20 +122,22 @@ pub const StreamLogprobs = struct {
         if (self.slot) |slot| self.cursor = try slot.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
         // An id with no entry yet (or the reverse) is a partially published
         // token — hold it for the next chunk rather than shipping a half pair.
-        const r = if (content_chunk) self.listing.sent(self.entries.items.len) else self.listing.late(self.entries.items.len);
+        const r = if (content_chunk) self.listing.sent(self.entries.items.len, withheld) else self.listing.late(self.entries.items.len);
         if (r.end <= r.start) return null;
         const ids = self.ids.items[r.start..r.end];
         const lps = self.entries.items[r.start..r.end];
         const json = if (self.legacy)
-            try formatCompletionsLogprobs(self.allocator, self.tok, ids, lps, self.top, &self.text_offset)
+            try formatCompletionsLogprobs(self.allocator, self.tok, ids, lps, self.top, r.cut(), &self.text_offset)
         else
-            try formatLogprobsObject(self.allocator, self.tok, ids, lps, self.top);
+            try formatLogprobsObject(self.allocator, self.tok, ids, lps, self.top, r.cut());
         self.rendered = json;
         return json;
     }
 };
 
-/// Build logprobs JSON for a single token (for both streaming and non-streaming).
+/// Build logprobs JSON for a single token (for both streaming and non-streaming). `head` and `tail` bytes of the
+/// token are not text the reply returned: `token` and `bytes` carry the rest, `logprob` and the alternatives stay
+/// the whole token's.
 /// Returns a string like: {"token":"hello","logprob":-1.23,"bytes":[104,101],"top_logprobs":[...]}
 fn formatTokenLogprob(
     allocator: std.mem.Allocator,
@@ -132,12 +145,14 @@ fn formatTokenLogprob(
     token_id: u32,
     logprob: f32,
     top_logprobs: []const sampler.TokenLogprob,
+    cut: Cut,
 ) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
-    const token_text = try tok.decode(allocator, &[_]u32{token_id});
-    defer allocator.free(token_text);
+    const whole = try tok.decode(allocator, &[_]u32{token_id});
+    defer allocator.free(whole);
+    const token_text = whole[@min(cut.head, whole.len)..whole.len -| cut.tail];
 
     const escaped_token = try jsonEscape(allocator, token_text);
     defer allocator.free(escaped_token);
@@ -207,6 +222,7 @@ pub fn formatCompletionsLogprobs(
     token_ids: []const u32,
     logprobs: []const sampler.LogprobResult,
     top: u32,
+    cut: Cut,
     offset_base: *usize,
 ) ![]const u8 {
     var toks = std.ArrayList(u8).empty;
@@ -231,8 +247,9 @@ pub fn formatCompletionsLogprobs(
             try tops.appendSlice(allocator, ",");
             try offs.appendSlice(allocator, ",");
         }
-        const text = try tok.decode(allocator, &[_]u32{token_ids[i]});
-        defer allocator.free(text);
+        const whole = try tok.decode(allocator, &[_]u32{token_ids[i]});
+        defer allocator.free(whole);
+        const text = whole[if (i == 0) @min(cut.head, whole.len) else 0 .. whole.len -| (if (i + 1 == count) cut.tail else 0)];
         const esc = try jsonEscape(allocator, text);
         defer allocator.free(esc);
         try toks.appendSlice(allocator, esc);
@@ -273,6 +290,7 @@ pub fn formatLogprobsObject(
     token_ids: []const u32,
     logprobs: []const sampler.LogprobResult,
     top: u32,
+    cut: Cut,
 ) ![]const u8 {
     var content_buf = std.ArrayList(u8).empty;
     defer content_buf.deinit(allocator);
@@ -281,7 +299,8 @@ pub fn formatLogprobsObject(
     const count = @min(token_ids.len, logprobs.len);
     for (0..count) |i| {
         if (i > 0) try content_buf.appendSlice(allocator, ",");
-        const entry = try formatTokenLogprob(allocator, tok, token_ids[i], logprobs[i].token_logprob, logprobs[i].top_logprobs[0..@min(top, logprobs[i].top_logprobs.len)]);
+        const own: Cut = .{ .head = if (i == 0) cut.head else 0, .tail = if (i + 1 == count) cut.tail else 0 };
+        const entry = try formatTokenLogprob(allocator, tok, token_ids[i], logprobs[i].token_logprob, logprobs[i].top_logprobs[0..@min(top, logprobs[i].top_logprobs.len)], own);
         defer allocator.free(entry);
         try content_buf.appendSlice(allocator, entry);
     }
@@ -320,7 +339,7 @@ test "skipToContent keeps the content token when a multi-byte character splits a
     try lps.note(2, 1);
     try lps.note(3, lead.len);
     // The gate delivered "RC"; the lead byte of the split character is still its carry.
-    lps.release(2);
+    lps.release(2, false);
     const tail = "RC";
     lps.skipToContent(tail, tail[1..]);
     try std.testing.expectEqual(@as(usize, 1), lps.listing.emitted);
@@ -360,7 +379,7 @@ test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tok
     };
 
     var tbase: usize = 0;
-    const json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &lps, 20, &tbase);
+    const json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &lps, 20, .{}, &tbase);
     defer allocator.free(json);
 
     // Must be parseable at all — the control byte is the reason that matters.
@@ -431,7 +450,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     const token_ids = [_]u32{1};
 
     // Chat shape.
-    const chat_json = try formatTokenLogprob(allocator, &tok, 2, -9.0, &t0);
+    const chat_json = try formatTokenLogprob(allocator, &tok, 2, -9.0, &t0, .{});
     defer allocator.free(chat_json);
     try std.testing.expect(std.unicode.utf8ValidateSlice(chat_json));
     const chat_parsed = try std.json.parseFromSlice(std.json.Value, allocator, chat_json, .{});
@@ -456,7 +475,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     };
     const comp_lps = [_]sampler.LogprobResult{.{ .token_logprob = -0.1, .top_logprobs = &comp_top }};
     var tbase: usize = 0;
-    const comp_json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &comp_lps, 20, &tbase);
+    const comp_json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &comp_lps, 20, .{}, &tbase);
     defer allocator.free(comp_json);
     try std.testing.expect(std.unicode.utf8ValidateSlice(comp_json));
     const comp_parsed = try std.json.parseFromSlice(std.json.Value, allocator, comp_json, .{});
@@ -467,7 +486,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
 
     // Valid UTF-8 is untouched, including multi-byte that arrives whole.
     try tok.id_to_token.put(5, "é€");
-    const clean = try formatTokenLogprob(allocator, &tok, 5, -1.0, &[_]sampler.TokenLogprob{});
+    const clean = try formatTokenLogprob(allocator, &tok, 5, -1.0, &[_]sampler.TokenLogprob{}, .{});
     defer allocator.free(clean);
     const clean_parsed = try std.json.parseFromSlice(std.json.Value, allocator, clean, .{});
     defer clean_parsed.deinit();
@@ -557,4 +576,44 @@ test "contentLogprobsJson: a reply with a call lists the tokens of its content, 
         try std.testing.expectEqualStrings(" it.\n", entries[1].object.get("token").?.string);
         for (entries) |e| try std.testing.expectEqual(@as(usize, top), e.object.get("top_logprobs").?.array.items.len);
     }
+}
+
+test "a token the reply returned part of lists those bytes, its logprob and alternatives whole, on both shapes" {
+    const allocator = std.testing.allocator;
+    var tok = Tokenizer.initEmpty(allocator);
+    defer tok.vocab.deinit();
+    defer tok.id_to_token.deinit();
+    defer tok.merge_ranks.deinit();
+    defer tok.special_tokens.deinit();
+    defer tok.unicode_to_byte.deinit();
+    try tok.id_to_token.put(1, " 빵");
+    try tok.id_to_token.put(2, "[section");
+    const ids = [_]u32{ 1, 2 };
+    var alt = [_]sampler.TokenLogprob{.{ .token_id = 2, .logprob = -0.5 }};
+    const lps = [_]sampler.LogprobResult{ .{ .token_logprob = -0.25, .top_logprobs = &alt }, .{ .token_logprob = -0.75, .top_logprobs = &alt } };
+    // The reply returned "빵[s": the first token's space and the last token's "ection" are not its text.
+    const cut: Cut = .{ .head = 1, .tail = 6 };
+
+    const chat = try formatLogprobsObject(allocator, &tok, &ids, &lps, 1, cut);
+    defer allocator.free(chat);
+    const cp = try std.json.parseFromSlice(std.json.Value, allocator, chat, .{});
+    defer cp.deinit();
+    const entries = cp.value.object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("빵", entries[0].object.get("token").?.string);
+    try std.testing.expectEqualStrings("[s", entries[1].object.get("token").?.string);
+    try std.testing.expectEqual(@as(usize, 3), entries[0].object.get("bytes").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 2), entries[1].object.get("bytes").?.array.items.len);
+    try std.testing.expectApproxEqAbs(@as(f64, -0.25), entries[0].object.get("logprob").?.float, 1e-6);
+    try std.testing.expectEqualStrings("[section", entries[1].object.get("top_logprobs").?.array.items[0].object.get("token").?.string);
+
+    var base: usize = 0;
+    const legacy = try formatCompletionsLogprobs(allocator, &tok, &ids, &lps, 1, cut, &base);
+    defer allocator.free(legacy);
+    const lp = try std.json.parseFromSlice(std.json.Value, allocator, legacy, .{});
+    defer lp.deinit();
+    try std.testing.expectEqualStrings("빵", lp.value.object.get("tokens").?.array.items[0].string);
+    try std.testing.expectEqualStrings("[s", lp.value.object.get("tokens").?.array.items[1].string);
+    // text_offset indexes the returned text, and the running base ends where it ends.
+    try std.testing.expectEqual(@as(i64, 3), lp.value.object.get("text_offset").?.array.items[1].integer);
+    try std.testing.expectEqual(@as(usize, 5), base);
 }

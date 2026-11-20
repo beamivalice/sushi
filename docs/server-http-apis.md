@@ -174,8 +174,8 @@ answers while the weights load:
 - Chat usage reports `completion_tokens_details.reasoning_tokens` by tokenizing concatenated delivered reasoning; streaming includes it only with `stream_options.include_usage`.
 
 - **A stream and a non-stream answer are the SAME BYTES**; whitespace is the one thing a stream may withhold: a
-  leading run of a content part, inside its first token too (`streamContentLead`, `ContentStream`; a logprobs entry stays
-  the sampled token, whole, on both), and a token's trailing whitespace until text follows (`ContentStream`). The held
+  leading run of a content part, inside its first token too (`streamContentLead`, `ContentStream`; a logprobs entry lists only
+  the bytes returned, on both), and a token's trailing whitespace until text follows (`ContentStream`). The held
   tail ships at the end of the reply unless the non-stream reply trims it: after a closed thought, or before tool
   markup (`ContentStream.finish`). The format corpus pins it for any token split. A spent reasoning budget WITHHOLDS the rest of the thought; a thought cut to a token budget after the fact ends on a whole character (`reasoningWithinBudget` drops the half a token cut); a tool-call reply, streamed or not,
   carries the pre-markup text (`visibleToolPreamble`; Responses lists it as a message item ahead of its `function_call`s,
@@ -251,6 +251,9 @@ before reading a completed stream and requires clean EOF.
   (`listed_tokens.Listing`): a stop's own tokens (the stop gate's `released` bytes) and a thought the reply does not ship
   are never listed, and a chunk with no content (the final one) lists only what sent content left behind. A tool call's tokens
   are never listed either: a streamed call chunk carries no logprobs, and a non-streamed reply with calls lists its preamble, `null` without one.
+  A token a stop or a trimmed lead cut into is listed with only the bytes the reply returned (`token`, `bytes`, `text_offset`), its
+  `logprob` the whole token's and its alternatives untrimmed; a stream lists a token once all its bytes have shipped (a stop's hold-back and the content arm's withheld trailing whitespace
+  included), and the token a stop or a trimmed tail ends on at the end of the reply. `Listing` owns the cut (`Range.head`/`tail`) and stream and non-stream list the same entries.
 - **`logprobs: true` (chat) or an integer `logprobs` (legacy) turns logprobs on, whatever the alternatives count**: `top_logprobs`
   absent or 0 lists the sampled token with an empty alternatives list (`request_parse.Logprobs`; the engine ranks at least one
   candidate, `engineN`, and the reply lists `top` of them).

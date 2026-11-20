@@ -22,6 +22,7 @@ test {
     _ = @import("tool_calls.zig");
     _ = @import("think_tags.zig");
     _ = @import("reply.zig");
+    _ = @import("listed_tokens.zig");
     _ = @import("format_corpus_test.zig");
     _ = @import("template_oracle_test.zig");
     _ = @import("template/template.zig");

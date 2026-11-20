@@ -156,6 +156,8 @@ pub const ContentStream = struct {
     started: bool = false,
     /// The current part has sent nothing yet.
     lead: bool = true,
+    /// Bytes `deliver` cut from the start of its last input: a part's leading whitespace never ships.
+    trimmed: usize = 0,
     held: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
     /// Where the reply's tool markup is cut (`MarkupCut`), and the bytes it has not let go yet.
@@ -181,8 +183,14 @@ pub const ContentStream = struct {
         self.span = .{};
     }
 
+    /// Bytes `deliver` has taken but not sent: a tail whitespace run and markup that may still be cut.
+    pub fn withheld(self: *const ContentStream) usize {
+        return self.held.items.len + self.unsent.items.len;
+    }
+
     /// One token (or the content a thought's close token carried). `.send` is valid until the next call.
     pub fn deliver(self: *ContentStream, allocator: std.mem.Allocator, tt: []const u8) !ContentStep {
+        self.trimmed = 0;
         const think_tag = std.mem.eql(u8, tt, BARE_THINK_OPENER) or std.mem.eql(u8, tt, BARE_THINK_CLOSER);
         if (isChannelMarkerToken(tt) and !(think_tag and self.span.openStart() != null)) return .marker;
         self.span.feed(tt);
@@ -192,6 +200,7 @@ pub const ContentStream = struct {
             return .hold;
         }
         const body = if (self.lead) std.mem.trimStart(u8, tt, "\n ") else tt;
+        self.trimmed = tt.len - body.len;
         const text = body[0..std.mem.trimEnd(u8, body, "\n ").len];
         self.out.clearRetainingCapacity();
         if (self.lead and self.started) try self.out.append(allocator, '\n');
@@ -1532,13 +1541,8 @@ pub fn streamTailIsReasoning(in_think_block: bool, prompt_opened_think: bool, sa
 /// Leading whitespace is the ONE thing a stream can still withhold: nothing
 /// visible has been sent yet, so this is a suppression, never a retraction.
 ///
-/// It suppresses a chunk that is ENTIRELY whitespace, never a prefix of one. A
-/// partial trim would ship a logprobs entry whose `token` no longer appears in
-/// `content` — the collector describes whole tokens and cannot split one — so
-/// the two contracts are kept consistent by never cutting inside a token. A
-/// single token mixing leading whitespace with visible text is the residual
-/// case, and it keeps its whitespace on both surfaces' terms: the stream ships
-/// it, and the caller flips `content_started` so nothing later is touched.
+/// It cuts the leading whitespace of a chunk, inside a token too; a logprobs entry lists only the bytes that
+/// ship (`ContentStream.trimmed`, `Listing.skipTo`).
 ///
 /// `content_started` must flip on the first NON-EMPTY emission, so a suppressed
 /// whitespace token leaves the next one still eligible.
