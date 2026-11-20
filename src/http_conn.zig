@@ -266,6 +266,8 @@ pub const Conn = struct {
     /// True once this connection has written a `text/event-stream` head: past it a generation
     /// failure can only be an SSE `error` event. Set only in `sendSseHeaders`.
     sse_headers_sent: bool = false,
+    /// Bytes the request reader took past its request (a WebSocket frame sent with the upgrade): read before the socket.
+    early: []const u8 = &.{},
     /// The request was HEAD: a response sends its head and never its body.
     head_only: bool = false,
     /// A Content-Length response ends by length and can release its socket immediately.
@@ -284,6 +286,7 @@ pub const Conn = struct {
         c.write_state = SocketWriter.init(stream.socket.handle, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
+        c.early = &.{};
         c.api = .openai;
         c.sse_headers_sent = false;
         c.head_only = false;
@@ -337,15 +340,21 @@ pub const Conn = struct {
     /// Up to buf.len of the bytes already here, whatever the shutdown flag says, without waiting: 0 when none. Bounded
     /// by `buf`, so a shutdown still learns the request line of a request that arrived.
     pub fn readArrived(c: *Conn, buf: []u8) usize {
-        if (c.reader().bufferedLen() == 0) {
+        if (c.early.len == 0 and c.reader().bufferedLen() == 0) {
             var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
             if ((std.posix.poll(&fds, 0) catch 0) == 0) return 0;
         }
         return c.takeReadable(buf) catch 0;
     }
 
-    /// The held bytes alone, else one read of a socket seen readable.
+    /// The early bytes or the held bytes alone, else one read of a socket seen readable.
     fn takeReadable(c: *Conn, buf: []u8) !usize {
+        if (c.early.len > 0) {
+            const n = @min(c.early.len, buf.len);
+            @memcpy(buf[0..n], c.early[0..n]);
+            c.early = c.early[n..];
+            return n;
+        }
         const r = c.reader();
         if (r.bufferedLen() > 0) {
             const n = @min(r.bufferedLen(), buf.len);
@@ -368,7 +377,7 @@ pub const Conn = struct {
     /// an idle one is let go within `SHUTDOWN_POLL_MS`. Bytes the reader already buffered count as readable.
     fn awaitReadable(c: *Conn, limit_ms: ?i64) error{Shutdown}!bool {
         if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
-        if (c.reader().bufferedLen() > 0) return true;
+        if (c.early.len > 0 or c.reader().bufferedLen() > 0) return true;
         const deadline = if (limit_ms) |ms| nowMsMonotonic(c.io) +| ms else null;
         var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         var slice_ms: i64 = 0;
@@ -665,11 +674,13 @@ fn seedRequestBuf(buf: []u8, already_read: []const u8) usize {
     return n;
 }
 
-/// One whole request, owned: its head (`buf[0..header_end]`) and its complete body after it. Built only once the body
-/// is whole, so a short body never reaches the router.
+/// One whole request, owned: its head (`buf[0..header_end]`), its complete body to `end`, then any bytes the read took
+/// past it (a WebSocket frame sent with the upgrade). Built only once the body is whole, so a short body never reaches
+/// the router.
 pub const RawRequest = struct {
     buf: []u8,
     header_end: usize,
+    end: usize,
 };
 
 /// What reading one request came to; only `.request` is routed.
@@ -802,7 +813,7 @@ fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64
     var pending = leftover;
     var asked = false;
     while (true) {
-        _ = decoder.feed(allocator, &out, pending, &budget) catch |err| switch (err) {
+        const used = decoder.feed(allocator, &out, pending, &budget) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.TooLarge => {
                 var msg_buf: [128]u8 = undefined;
@@ -825,7 +836,12 @@ fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64
                 return .refused;
             },
         };
-        if (decoder.state == .done) break;
+        if (decoder.state == .done) {
+            const end = out.items.len;
+            try out.appendSlice(allocator, pending[used..]);
+            const owned = try out.toOwnedSlice(allocator);
+            return .{ .request = .{ .buf = owned, .header_end = head.len, .end = end } };
+        }
         if (!asked) {
             asked = true;
             if (!try answerExpect(allocator, stream, head)) {
@@ -847,8 +863,6 @@ fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64
         }
         pending = buf[0..n];
     }
-    const owned = try out.toOwnedSlice(allocator);
-    return .{ .request = .{ .buf = owned, .header_end = head.len } };
 }
 
 /// Reads one request: the head (up to `MAX_HEAD_BYTES`), then its `Content-Length` or chunked body, whole. Sets
@@ -905,13 +919,13 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
         return .refused;
     }
 
-    const buf = try allocator.alloc(u8, total_size);
+    const buf = try allocator.alloc(u8, @max(total_size, total_read));
     var whole = false;
     defer if (!whole) allocator.free(buf);
     var got = seedRequestBuf(buf, hdr_buf[0..total_read]);
     if (got < total_size and !try answerExpect(allocator, stream, head)) return .refused;
     while (got < total_size) {
-        const n = stream.read(buf[got..], limit_ms) catch |err| switch (err) {
+        const n = stream.read(buf[got..total_size], limit_ms) catch |err| switch (err) {
             error.Shutdown => return refuseAtShutdown(allocator, stream, head),
             error.ReadStalled => return .stalled,
             else => return err,
@@ -920,7 +934,7 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
         got += n;
     }
     whole = true;
-    return .{ .request = .{ .buf = buf, .header_end = header_end_pos } };
+    return .{ .request = .{ .buf = buf, .header_end = header_end_pos, .end = total_size } };
 }
 
 /// True for a read-only route that reports on a model without using it.
@@ -2728,8 +2742,8 @@ fn readAgainst(o: ReadOpts) !ReadResult {
             if (readRequestWithin(t.allocator, c, limit) catch null) |got| {
                 s.outcome = got;
                 if (got == .request) {
-                    s.len = got.request.buf.len;
-                    s.body = t.allocator.dupe(u8, got.request.buf[got.request.header_end..]) catch &.{};
+                    s.len = got.request.end;
+                    s.body = t.allocator.dupe(u8, got.request.buf[got.request.header_end..got.request.end]) catch &.{};
                     t.allocator.free(got.request.buf);
                 }
             }
@@ -3208,4 +3222,27 @@ test "serve: a request line the router cannot split, or one after a leading CRLF
         }
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "read: bytes sent past a request in the same write are kept for the connection, never dropped" {
+    const frame = comptime clientFrame(0x89, "hi");
+    for ([_][]const u8{
+        "GET /v1/responses HTTP/1.1\r\nUpgrade: websocket\r\n\r\n",
+        "POST /v1/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+        chunked_head ++ "2\r\n{}\r\n0\r\n\r\n",
+    }) |head| {
+        const t = std.testing;
+        const sv = try widePair();
+        var conn: Conn = undefined;
+        Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+        defer conn.close();
+        defer _ = std.c.close(sv[1]);
+        const sent = try std.mem.concat(t.allocator, u8, &.{ head, frame });
+        defer t.allocator.free(sent);
+        _ = std.c.send(sv[1], sent.ptr, sent.len, 0);
+        const got = try readRequestWithin(t.allocator, &conn, 1000);
+        try t.expect(got == .request);
+        defer t.allocator.free(got.request.buf);
+        try t.expectEqualStrings(frame, got.request.buf[got.request.end..]);
+    }
 }

@@ -1204,11 +1204,13 @@ pub fn handleConnection(
         else => return,
     };
     defer allocator.free(raw.buf);
+    // A WebSocket frame sent with the upgrade is read before the socket.
+    stream.early = raw.buf[raw.end..];
     const registry = server_state.global_registry orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
-    const total_read = raw.buf.len;
+    const total_read = raw.end;
     const header_end_pos = raw.header_end;
     const request = raw.buf[0..total_read];
     // The reader checked the request line (`http_head.check`): it has a method and a target.

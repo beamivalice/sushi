@@ -1905,3 +1905,29 @@ test "server: an unload whose Content-Length has whitespace before its colon, is
         }
     }.run);
 }
+
+test "server: a ping sent in the same write as the WebSocket upgrade gets its pong" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const fd = try connect();
+            defer _ = std.c.close(fd);
+            readLimit(fd, 5);
+            try sendAll(fd, "GET /v1/responses HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n" ++ [_]u8{ 0x89, 0x80 | 2, 0, 0, 0, 0, 'h', 'i' });
+            const head = try readUntil(fd, "\r\n\r\n");
+            defer gpa.free(head);
+            if (!std.mem.startsWith(u8, head, "HTTP/1.1 101")) return error.NoUpgrade;
+            // The pong can arrive in the same read as the 101.
+            const past = head[std.mem.indexOf(u8, head, "\r\n\r\n").? + 4 ..];
+            if (past.len > 0) {
+                if (past[0] != 0x8A) return error.NotAPong;
+                return;
+            }
+            const f = wsReadFrameOf(fd) catch |e| {
+                std.debug.print("eager ping: no frame in 5 s ({s})\n", .{@errorName(e)});
+                return error.EagerFrameLost;
+            };
+            defer gpa.free(f.payload);
+            if (f.opcode != 0xA) return error.NotAPong;
+        }
+    }.run);
+}
