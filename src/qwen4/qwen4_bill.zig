@@ -13,8 +13,8 @@ const qwen4_gdn = @import("qwen4_gdn.zig");
 /// The mapped n-gram table's GPU bytes, billed as taken whichever model asks.
 /// A Qwen request commits its whole cache at admission (`bills.cacheCommitBytes`), as GLM's does: admission counts
 /// what it is still to grow beside the requests it admits after it.
-pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, mtp_on: bool) ?u64 {
-    return bills.cacheCommitBytes(config, prompt_len, max_tokens, kv_bits, @import("../settings_resolve.zig").prefill_chunk.value, mtp_on);
+pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, chunk: u64, mtp_on: bool) ?u64 {
+    return bills.cacheCommitBytes(config, prompt_len, max_tokens, kv_bits, chunk, mtp_on);
 }
 
 /// The recurrent state sets a speculative round keeps past its new state from the verify to the rollback, at its

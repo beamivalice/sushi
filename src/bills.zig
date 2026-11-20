@@ -3164,14 +3164,15 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) slot_admission.MemoryBill {
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
-    return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits, enable_mtp) };
+    return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits, bill.chunk, enable_mtp) };
 }
 
 /// Bytes the bill prices for a request's cache that it allocates AFTER admission. A native GLM
 /// MLA cache grows row by row (a DFlash2 request reserves it after prefill); a Qwen or MiMo
-/// request takes its reserved capacity at its first grow, so it is resident before the next admission.
-pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, mtp_on: bool) u64 {
-    return archHook("commitBytes", u64, config, .{ prompt_len, max_tokens, kv_bits, mtp_on }) orelse 0;
+/// request takes its reserved capacity at its first grow, so it is resident before the next admission. `chunk` is the
+/// width the request is admitted and reserved at.
+pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, chunk: u64, mtp_on: bool) u64 {
+    return archHook("commitBytes", u64, config, .{ prompt_len, max_tokens, kv_bits, chunk, mtp_on }) orelse 0;
 }
 
 /// The inference thread's refusal, quoting the numbers it compared.
@@ -5784,10 +5785,10 @@ test "a Qwen request commits its whole cache at admission, as admission counts w
         const cap = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx, 0, 8);
         const history = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx, 0, null);
         try std.testing.expect(cap >= seq + 4096);
-        try std.testing.expectEqual(cap * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + history * statePerTokenBilled(&cfg), admissionCommitBytes(&cfg, seq, 4096, 8, false));
+        try std.testing.expectEqual(cap * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + history * statePerTokenBilled(&cfg), admissionCommitBytes(&cfg, seq, 4096, 8, chunk, false));
     }
     const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
-    try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&mimo, 40_000, 4096, 8, false));
+    try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&mimo, 40_000, 4096, 8, chunk, false));
 }
 
 test "GLM release defaults advertise the full context at the widest prefill chunk that keeps it" {
@@ -6525,7 +6526,7 @@ test "bill pin: creditedAdmissionBill and its verdict" {
                 g.add(admissionVerdict(bill));
                 g.add(pinnedResidentBytes(bill));
             }
-            g.add(admissionCommitBytes(c, 5000, 4096, 8, false));
+            g.add(admissionCommitBytes(c, 5000, 4096, 8, settings_resolve.prefill_chunk.value, false));
         }
     }.run);
 }

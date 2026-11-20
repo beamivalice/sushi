@@ -243,7 +243,7 @@ test "a second GLM admission leaves free the cache growth the first was admitted
     for ([_]u64{ 16, 8 }) |kv_bits| {
         const bill = bills.prefillAdmissionBill(&cfg, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, null, .{});
         const nums = bills.prefillBillNumbersNow(&cfg, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, false);
-        const commit = bills.admissionCommitBytes(&cfg, prompt, max_tokens, kv_bits, false);
+        const commit = bills.admissionCommitBytes(&cfg, prompt, max_tokens, kv_bits, bill.chunk, false);
         try std.testing.expectEqual(commit, nums.commit);
         // What the request retains is most of its bill, and it is not resident at admission.
         try std.testing.expect(commit > bill.needed / 2 and commit <= bill.needed);
@@ -254,9 +254,9 @@ test "a second GLM admission leaves free the cache growth the first was admitted
         try std.testing.expectEqual(@as(usize, 0), slot_admission.admitsWithinMemory(&.{b}, true, commit));
     }
     // kv8 audit shape: one request's eventual state is 6.669 GiB.
-    const kv8 = bills.admissionCommitBytes(&cfg, prompt, max_tokens, 8, false);
+    const kv8 = bills.admissionCommitBytes(&cfg, prompt, max_tokens, 8, 2048, false);
     try std.testing.expect(kv8 > 6 * gib + gib * 2 / 3 and kv8 < 6 * gib + gib * 7 / 10);
-    try std.testing.expect(bills.admissionCommitBytes(&cfg, prompt, max_tokens, 16, false) > kv8);
+    try std.testing.expect(bills.admissionCommitBytes(&cfg, prompt, max_tokens, 16, 2048, false) > kv8);
 }
 
 test "GLM raw FP8 honors the declared wired limit with the same reserve as MiMo" {
@@ -637,4 +637,19 @@ test "DeepSeek streamed under a declared wired limit reads the limit's floor as 
     defer _ = was.pin();
     const active: u64 = live_gpu.activeBytes() + live_gpu.lentBytes();
     try testing.expectEqual(bills.liveHeadroomFrom(&cfg, 123_976 * MiB, active, 0, live_gpu.engineFree()), bills.headroomNow(&cfg, 0).live);
+}
+
+test "a Qwen request commits the cache its admitted width reserves, not the default chunk's" {
+    const cfg = fixtures.qwen4ExpOomConfig();
+    const status = @import("status.zig");
+    const avail_was = status.available_mem_override;
+    status.available_mem_override = 1 << 40;
+    defer status.available_mem_override = avail_was;
+    const kv8 = trunk.KVQuantConfig.affine(8);
+    // A long prompt reserves its prompt, its reply and one chunk of the width it is admitted at.
+    const seq: usize = 40_000;
+    const bill = bills.prefillAdmissionBill(&cfg, seq, 4096, kv8, false, null, .{});
+    try testing.expect(bill.chunk < @import("settings_resolve.zig").prefill_chunk.value);
+    const nums = bills.prefillBillNumbersNow(&cfg, seq, 4096, kv8, false, false);
+    try testing.expectEqual(bills.cacheCommitBytes(&cfg, seq, 4096, 8, bill.chunk, false), nums.commit);
 }

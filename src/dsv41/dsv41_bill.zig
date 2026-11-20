@@ -52,8 +52,9 @@ pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u
 
 /// A fully resident load joins rows (`dsv41_sched.coolerRows`): a request's decode state is its own, made at its first
 /// forward, so all of it grows after admission. At one row the model's parked state is resident already.
-pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, mtp_on: bool) ?u64 {
+pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, chunk: u64, mtp_on: bool) ?u64 {
     _ = kv_bits;
+    _ = chunk;
     _ = mtp_on;
     const c = config.dsv41 orelse return null;
     // As `dsv41_sched.coolerRows`: rows are a resident load's on Sushi Cooler.

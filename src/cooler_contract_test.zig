@@ -5357,7 +5357,7 @@ test "cooler contract: a speculative request's growth commit, less its resident 
     var under: usize = 0;
     for ([_]u32{ 256, 1280 }) |end| for ([_]u32{ 0, 6 }) |less| {
         const n: u32 = end - @as(u32, @intCast(prompt.len)) - less;
-        const commit = bills.admissionCommitBytes(&ld.config, prompt.len, n, kv_bits, true);
+        const commit = bills.admissionCommitBytes(&ld.config, prompt.len, n, kv_bits, ld.config.prefillStartWidth(), true);
         const turn = arch_handle.turnFor(ld.h, &ld.config);
         defer turn.end();
         defer arch_sched.endRequest(&ld.config);

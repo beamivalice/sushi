@@ -2297,10 +2297,10 @@ test "Flash-Next on Cooler: a drafted request's growth commit holds the MTP head
         // Every row the bill prices that grows after admission: the trunk's KV past the prompt's raw rows, the
         // histories and the head's KV; the head's fixed rings are not per row.
         const grows = seq * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + terms.reserved_kv_bytes + terms.state_bytes - bills.mtpHeadQsaRingBytes(&cfg) + terms.mtp_head_kv_bytes;
-        const commit = bills.admissionCommitBytes(&cfg, @intCast(seq), n, 8, true);
+        const commit = bills.admissionCommitBytes(&cfg, @intCast(seq), n, 8, chunk, true);
         errdefer std.debug.print("seq {d} + {d}: the commit holds {d} KB, the bill's growing storage {d} KB\n", .{ seq, n, commit >> 10, grows >> 10 });
         try t.expect(commit + 4096 >= grows);
-        try t.expect(commit > bills.admissionCommitBytes(&cfg, @intCast(seq), n, 8, false));
+        try t.expect(commit > bills.admissionCommitBytes(&cfg, @intCast(seq), n, 8, chunk, false));
     };
 }
 

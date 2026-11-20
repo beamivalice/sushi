@@ -5137,7 +5137,7 @@ test "dsv41 engine: a slot request holds the one decode state while it runs and 
     defer slot.cache.deinit();
     const scheduler = @import("../scheduler.zig");
     // DeepSeek commits no growth at admission, so a slot's outstanding growth is none either way: the bill is the total.
-    try testing.expectEqual(@as(u64, 0), @import("../bills.zig").admissionCommitBytes(&fx.config, 40, 6, 16, false));
+    try testing.expectEqual(@as(u64, 0), @import("../bills.zig").admissionCommitBytes(&fx.config, 40, 6, 16, 2048, false));
     var main_running: u64 = 0;
     var main_parked: u64 = 0;
     // Main's path (no slot request) first, then the slots' over the same turns: the same bytes.
@@ -6510,7 +6510,7 @@ test "dsv41 engine: a fully resident load the user put on MLX keeps one request 
     try testing.expectEqual(@as(usize, 1), rows.rows);
     try testing.expect(std.mem.indexOf(u8, rows.why.?, "MLX") != null);
     try testing.expect(!sched.batches(&fx.config));
-    try testing.expectEqual(@as(u64, 0), @import("../bills.zig").admissionCommitBytes(&fx.config, 64, 8, 16, false));
+    try testing.expectEqual(@as(u64, 0), @import("../bills.zig").admissionCommitBytes(&fx.config, 64, 8, 16, 2048, false));
     try fx.load(dir);
     defer fx.deinit();
     try testing.expect(!fx.model().serves_rows);

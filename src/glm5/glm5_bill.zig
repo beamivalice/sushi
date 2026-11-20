@@ -173,7 +173,8 @@ pub fn retainedCheckpoints(config: *const model_mod.ModelConfig, seq: u64, match
     return glmPrefillSchedule(seq, matched, glm5_prefix.checkpointMax(bills.launch_state.ssm_checkpoint_max)).peak * config.ssmCheckpointBytes();
 }
 
-pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, mtp_on: bool) ?u64 {
+pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, chunk: u64, mtp_on: bool) ?u64 {
+    _ = chunk;
     _ = mtp_on;
     return glmCacheBytes(config, prompt_len, max_tokens, kv_bits) +| bills.slotRingBytes(config, kv_bits);
 }
