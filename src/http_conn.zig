@@ -663,12 +663,33 @@ fn seedRequestBuf(buf: []u8, already_read: []const u8) usize {
     return n;
 }
 
-const RawRequest = struct {
-    /// Owned; `buf[0..len]` is the head plus as much of the body as arrived.
+/// One whole request, owned: its head (`buf[0..header_end]`) and its complete body after it. Built only once the body
+/// is whole, so a short body never reaches the router.
+pub const RawRequest = struct {
     buf: []u8,
-    len: usize,
     header_end: usize,
 };
+
+/// What reading one request came to; only `.request` is routed.
+pub const ReadOutcome = union(enum) {
+    request: RawRequest,
+    /// Nothing came within the read limit: the connection closes bare.
+    stalled,
+    /// The client closed before its head ended.
+    closed,
+    /// The client closed mid-body: what arrived is dropped, never routed (RFC 9112 §6.3).
+    cut_short,
+    /// The head ran past `MAX_HEAD_BYTES`: answered 431.
+    head_too_large,
+    /// Refused with its answer sent: a body over the cap (413), a transfer coding (501), an expectation (417), a bad
+    /// chunk (400).
+    refused,
+    /// A shutdown ended the read: a request whose line arrived got the shutdown error.
+    shutdown,
+};
+
+/// The most a request head (its line and headers) may take.
+pub const MAX_HEAD_BYTES = 16 * 1024;
 
 /// Decodes a `Transfer-Encoding: chunked` body one piece at a time, however the bytes arrive.
 const ChunkDecoder = struct {
@@ -756,15 +777,16 @@ fn answerExpect(allocator: std.mem.Allocator, stream: *Conn, head: []const u8) !
 
 /// A shutdown ended a request's read: one whose request line arrived gets the shutdown error, an idle connection
 /// nothing.
-fn refuseAtShutdown(allocator: std.mem.Allocator, stream: *Conn, head: []const u8) !void {
-    if (std.mem.indexOf(u8, head, "\r\n") == null) return;
+fn refuseAtShutdown(allocator: std.mem.Allocator, stream: *Conn, head: []const u8) !ReadOutcome {
+    if (std.mem.indexOf(u8, head, "\r\n") == null) return .shutdown;
     stream.api = apiOfHead(head);
     try sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503);
+    return .shutdown;
 }
 
 /// Reads a chunked body after `head` (the request line and headers through the blank line); `leftover` is what
 /// already arrived past it. The result holds the head followed by the decoded body.
-fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64, head: []const u8, leftover: []const u8, max_request_bytes: usize) !?RawRequest {
+fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64, head: []const u8, leftover: []const u8, max_request_bytes: usize) !ReadOutcome {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, head);
@@ -781,12 +803,12 @@ fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64
                 log.warn("[http] 413: {s}\n", .{msg});
                 try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
                 out.deinit(allocator);
-                return null;
+                return .refused;
             },
             error.BadChunk => {
                 try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid chunked request body", 400);
                 out.deinit(allocator);
-                return null;
+                return .refused;
             },
         };
         if (decoder.state == .done) break;
@@ -794,108 +816,88 @@ fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64
             asked = true;
             if (!try answerExpect(allocator, stream, head)) {
                 out.deinit(allocator);
-                return null;
+                return .refused;
             }
         }
-        const n = stream.read(&buf, limit_ms) catch |err| switch (err) {
-            error.Shutdown => {
-                try refuseAtShutdown(allocator, stream, head);
-                out.deinit(allocator);
-                return null;
-            },
-            error.ReadStalled => 0,
-            else => return err,
+        const n = stream.read(&buf, limit_ms) catch |err| {
+            out.deinit(allocator);
+            return switch (err) {
+                error.Shutdown => refuseAtShutdown(allocator, stream, head),
+                error.ReadStalled => .stalled,
+                else => err,
+            };
         };
         if (n == 0) {
             out.deinit(allocator);
-            return null;
+            return .cut_short;
         }
         pending = buf[0..n];
     }
     const owned = try out.toOwnedSlice(allocator);
-    return .{ .buf = owned, .len = owned.len, .header_end = head.len };
+    return .{ .request = .{ .buf = owned, .header_end = head.len } };
 }
 
-/// Reads one request: the head (up to 16 KB), then its `Content-Length` or chunked body. Null when no
-/// complete head arrived, the client stalled, or the body is over the cap (the 413 is already sent). Sets `Conn.api`
-/// from the head before it can send anything, so every error of the request takes its API's envelope.
-pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64) !?RawRequest {
+/// Reads one request: the head (up to `MAX_HEAD_BYTES`), then its `Content-Length` or chunked body, whole. Sets
+/// `Conn.api` from the head before it can send anything, so every error of the request takes its API's envelope.
+pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64) !ReadOutcome {
     const head_deadline = nowMsMonotonic(stream.io) + limit_ms;
-    // Read HTTP headers first (up to 16KB), then allocate for the full body based on Content-Length.
-    var hdr_buf: [16 * 1024]u8 = undefined;
+    var hdr_buf: [MAX_HEAD_BYTES]u8 = undefined;
     var total_read: usize = 0;
-    var content_length: ?usize = null;
-    var header_end_pos: usize = 0;
-
-    // Phase 1: Read until we have complete headers
-    while (total_read < hdr_buf.len) {
+    const header_end_pos = while (total_read < hdr_buf.len) {
         const n = stream.read(hdr_buf[total_read..], head_deadline - nowMsMonotonic(stream.io)) catch |err| switch (err) {
             error.Shutdown => {
                 total_read += stream.readArrived(hdr_buf[total_read..]);
-                try refuseAtShutdown(allocator, stream, hdr_buf[0..total_read]);
-                return null;
+                return refuseAtShutdown(allocator, stream, hdr_buf[0..total_read]);
             },
-            error.ReadStalled => return null,
+            error.ReadStalled => return .stalled,
             else => return err,
         };
-        if (n == 0) break;
+        if (n == 0) return .closed;
         total_read += n;
-
-        if (std.mem.indexOf(u8, hdr_buf[0..total_read], "\r\n\r\n")) |he| {
-            header_end_pos = he + 4;
-            content_length = findContentLength(hdr_buf[0..he]);
-            stream.api = apiOfHead(hdr_buf[0..he]);
-            break;
-        }
-    }
-
-    if (header_end_pos == 0) return null;
+        if (std.mem.indexOf(u8, hdr_buf[0..total_read], "\r\n\r\n")) |he| break he + 4;
+    } else {
+        stream.api = apiOfHead(hdr_buf[0..total_read]);
+        log.warn("[http] 431: a request head over {d} KB\n", .{MAX_HEAD_BYTES / 1024});
+        try sendErrorResponse(allocator, stream, "431 Request Header Fields Too Large", "invalid_request_error", "The request head (its line and headers) is over the 16 KB limit", 431);
+        return .head_too_large;
+    };
+    const head = hdr_buf[0..header_end_pos];
+    stream.api = apiOfHead(head);
     const max_request_bytes = server_state.max_request_bytes.load(.monotonic);
 
-    if (findHeaderValueCI(hdr_buf[0..header_end_pos], "transfer-encoding")) |coding| {
+    if (findHeaderValueCI(head, "transfer-encoding")) |coding| {
         if (!endsWithChunked(coding)) {
             try sendErrorResponse(allocator, stream, "501 Not Implemented", "invalid_request_error", "Only Transfer-Encoding: chunked is supported", 501);
-            return null;
+            return .refused;
         }
-        return readChunkedRequest(allocator, stream, limit_ms, hdr_buf[0..header_end_pos], hdr_buf[header_end_pos..total_read], max_request_bytes);
+        return readChunkedRequest(allocator, stream, limit_ms, head, hdr_buf[header_end_pos..total_read], max_request_bytes);
     }
 
-    // Phase 2: Allocate buffer for full request and read remaining body
-    const cl = content_length orelse 0;
-    const total_size = header_end_pos +| cl;
+    const total_size = header_end_pos +| (findContentLength(head[0 .. header_end_pos - 4]) orelse 0);
     if (total_size > max_request_bytes) {
         var msg_buf: [128]u8 = undefined;
         const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_bytes);
         log.warn("[http] 413: {s}\n", .{msg});
         try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
-        return null;
+        return .refused;
     }
 
     const buf = try allocator.alloc(u8, total_size);
-    errdefer allocator.free(buf);
-    total_read = seedRequestBuf(buf, hdr_buf[0..total_read]);
-    if (total_read < total_size and !try answerExpect(allocator, stream, hdr_buf[0..header_end_pos])) {
-        allocator.free(buf);
-        return null;
-    }
-
-    while (total_read < total_size) {
-        const n = stream.read(buf[total_read..total_size], limit_ms) catch |err| switch (err) {
-            error.Shutdown => {
-                try refuseAtShutdown(allocator, stream, hdr_buf[0..header_end_pos]);
-                allocator.free(buf);
-                return null;
-            },
-            error.ReadStalled => {
-                allocator.free(buf);
-                return null;
-            },
+    var whole = false;
+    defer if (!whole) allocator.free(buf);
+    var got = seedRequestBuf(buf, hdr_buf[0..total_read]);
+    if (got < total_size and !try answerExpect(allocator, stream, head)) return .refused;
+    while (got < total_size) {
+        const n = stream.read(buf[got..], limit_ms) catch |err| switch (err) {
+            error.Shutdown => return refuseAtShutdown(allocator, stream, head),
+            error.ReadStalled => return .stalled,
             else => return err,
         };
-        if (n == 0) break;
-        total_read += n;
+        if (n == 0) return .cut_short;
+        got += n;
     }
-    return .{ .buf = buf, .len = total_read, .header_end = header_end_pos };
+    whole = true;
+    return .{ .request = .{ .buf = buf, .header_end = header_end_pos } };
 }
 
 /// True for a read-only route that reports on a model without using it.
@@ -2300,7 +2302,7 @@ fn readerGivesUp(sent: []const u8, limit_ms: i64, drip_ms: u64) !bool {
     var done = std.atomic.Value(bool).init(false);
     const reader = try std.Thread.spawn(.{}, struct {
         fn run(c: *Conn, limit: i64, d: *std.atomic.Value(bool)) void {
-            if (readRequestWithin(t.allocator, c, limit) catch null) |r| t.allocator.free(r.buf);
+            if (readRequestWithin(t.allocator, c, limit) catch null) |o| if (o == .request) t.allocator.free(o.request.buf);
             d.store(true, .release);
         }
     }.run, .{ &conn, limit_ms, &done });
@@ -2658,8 +2660,10 @@ const ReadOpts = struct {
     ws_limit: usize = 1 << 20,
     /// The shutdown flag is set before the read starts, with every byte of `sent` already waiting.
     shutdown_first: bool = false,
+    /// The client closes its side after `sent` and `drip`.
+    half_close: bool = false,
 };
-const ReadResult = struct { returned: bool, ms: i64, len: ?usize, reply: []u8, body: []u8 };
+const ReadResult = struct { returned: bool, ms: i64, outcome: ?std.meta.Tag(ReadOutcome), len: ?usize, reply: []u8, body: []u8 };
 
 const FeedClient = struct {
     fd: std.posix.fd_t,
@@ -2688,6 +2692,7 @@ const FeedClient = struct {
             std.Io.sleep(std.testing.io, .fromMilliseconds(@intCast(c.o.drip_ms)), .real) catch {};
             if (!sendAllNb(c.fd, &.{b}, c.stop)) return;
         }
+        if (c.o.half_close) _ = std.c.shutdown(c.fd, std.posix.SHUT.WR);
         if (c.o.flood) |f| {
             var block: [64 * 1024]u8 = undefined;
             var i: usize = 0;
@@ -2733,6 +2738,7 @@ fn readAgainst(o: ReadOpts) !ReadResult {
     var client: FeedClient = .{ .fd = sv[1], .o = o, .stop = &stop };
     const State = struct {
         done: std.atomic.Value(bool) = .init(false),
+        outcome: ?ReadOutcome = null,
         len: ?usize = null,
         body: []u8 = &.{},
         ms: i64 = 0,
@@ -2745,10 +2751,13 @@ fn readAgainst(o: ReadOpts) !ReadResult {
     const t0 = nowMsMonotonic(t.io);
     const reader = try std.Thread.spawn(.{}, struct {
         fn run(c: *Conn, limit: i64, s: *State, start: i64) void {
-            if (readRequestWithin(t.allocator, c, limit) catch null) |r| {
-                s.len = r.len;
-                s.body = t.allocator.dupe(u8, r.buf[r.header_end..r.len]) catch &.{};
-                t.allocator.free(r.buf);
+            if (readRequestWithin(t.allocator, c, limit) catch null) |got| {
+                s.outcome = got;
+                if (got == .request) {
+                    s.len = got.request.buf.len;
+                    s.body = t.allocator.dupe(u8, got.request.buf[got.request.header_end..]) catch &.{};
+                    t.allocator.free(got.request.buf);
+                }
             }
             s.ms = nowMsMonotonic(t.io) - start;
             s.done.store(true, .release);
@@ -2772,7 +2781,7 @@ fn readAgainst(o: ReadOpts) !ReadResult {
     reader.join();
     server_state.shutdown_requested.store(false, .release);
     conn.close();
-    return .{ .returned = returned, .ms = if (returned) st.ms - shut_at else -1, .len = st.len, .reply = reply, .body = st.body };
+    return .{ .returned = returned, .ms = if (returned) st.ms - shut_at else -1, .outcome = if (st.outcome) |x| std.meta.activeTag(x) else null, .len = st.len, .reply = reply, .body = st.body };
 }
 
 fn freeRead(r: ReadResult) void {
@@ -2910,4 +2919,29 @@ test "Conn.read: a shutdown ends a read with bytes waiting, held by the reader o
     conn.reader().tossBuffered();
     _ = std.c.send(sv[1], &sent, sent.len, 0);
     try t.expectError(error.Shutdown, conn.read(&buf, 1000));
+}
+
+test "read: a head over 16 KB is answered 431, never closed bare" {
+    const r = try readAgainst(.{ .sent = "GET /health HTTP/1.1\r\nX-Pad: " ++ @as([17_000]u8, @splat('p')) ++ "\r\n\r\n", .limit_ms = 1000 });
+    defer freeRead(r);
+    if (r.outcome != .head_too_large or !std.mem.startsWith(u8, r.reply, "HTTP/1.1 431 Request Header Fields Too Large\r\n") or std.mem.indexOf(u8, r.reply, "16 KB") == null) {
+        std.debug.print("a 17 KB head: outcome={?} {d}-byte answer '{s}'\n", .{ r.outcome, r.reply.len, r.reply[0..@min(r.reply.len, 80)] });
+        return error.HeadOverLimitUnanswered;
+    }
+}
+
+test "read: a body cut short by the client's EOF is dropped, by length or chunked, never routed truncated" {
+    var bad: usize = 0;
+    for ([_][]const u8{
+        "POST /v1/load-model HTTP/1.1\r\nContent-Length: 100\r\n\r\n{\"model\":\"tiny\"}",
+        chunked_head ++ "40\r\n{\"model\":\"tiny\"}",
+    }) |sent| {
+        const r = try readAgainst(.{ .sent = sent, .limit_ms = 2000, .half_close = true });
+        defer freeRead(r);
+        if (!r.returned or r.outcome != .cut_short) {
+            std.debug.print("EOF mid-body ({s}): returned={any} outcome={?} body='{s}'\n", .{ sent[0..20], r.returned, r.outcome, r.body });
+            bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
 }

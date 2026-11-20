@@ -1197,13 +1197,17 @@ pub fn handleConnection(
     // and parse out the optional `"model"` field. For Phase C we use the
     // default model for everything (only one is loaded), but the plumbing
     // is in place for Phase D's hot-load path.
-    const raw = (try http_conn.readRequestWithin(allocator, stream, REQUEST_READ_LIMIT_MS)) orelse return;
+    const raw = switch (try http_conn.readRequestWithin(allocator, stream, REQUEST_READ_LIMIT_MS)) {
+        .request => |r| r,
+        // Answered already, or dropped: nothing to route.
+        else => return,
+    };
     defer allocator.free(raw.buf);
     const registry = server_state.global_registry orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
-    const total_read = raw.len;
+    const total_read = raw.buf.len;
     const header_end_pos = raw.header_end;
     const request = raw.buf[0..total_read];
     const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse return;
