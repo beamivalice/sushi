@@ -582,6 +582,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   reuses its own turns, never the shared root's entries, has its own budget, and is removed at `deinit`. A crashed
   one's is reaped (`reapPrivateRoots`) by the next tier or sweep on that fingerprint once its lock is free and its
   files are 10 minutes old.
+- **A lock never lives inside the tree it guards the deletion of**: a clear of a namespace holds `<base>/<fp>.gate` (never unlinked), and `DiskTier.init` takes it while it creates and locks its root, so a tier cannot open in a namespace mid-delete (the root's own `.lock` dies with the tree). A private root's reap and `deinit` delete a path only its owner can open, so they need no gate.
 - A new entry claims its id by creating `e<id>` (an existing directory is never adopted); staging files are
   `<file>.<pid>.tmp`.
 - **A restore re-reads `tokens.bin` up to the restored length**: a record that differs from the index poisons the

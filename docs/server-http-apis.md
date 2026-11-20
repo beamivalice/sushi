@@ -573,7 +573,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   sole owner): staged writes are fenced, the index, `total_bytes` and the files go together, and the tier takes new writes
   at once. It is refused with 409 `model_busy` while a request holds the model (retry; it is not queued), and 409
   `model_not_loaded` for a model without a tier. `stale` deletes the namespace directories no loaded model uses, each under
-  the root's lock (a root another server holds is skipped), and never follows a symlink out of the cache root. `all` is both,
+  the namespace's gate and the root's lock (a root another server holds is skipped; a tier that loads meanwhile waits for the gate), and never follows a symlink out of the cache root. `all` is both,
   with busy models listed and left alone. A `model` scope needs a string `model` (400 without one: the empty id would
   mean the default model). `namespace` deletes exactly that namespace directory under the same locks as `stale`, so a
   namespace another server holds is skipped (`skipped_live_namespaces: 1`, nothing removed) and a symlink is refused;

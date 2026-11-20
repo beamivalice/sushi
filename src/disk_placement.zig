@@ -428,6 +428,17 @@ pub fn lockRoot(io: std.Io, root_abs: []const u8) !?std.Io.File {
     };
 }
 
+/// The gate of one namespace, `<base>/<fingerprint>.gate`, taken blocking and held briefly. It lives beside the
+/// namespace directory, never inside it, so deleting the namespace leaves it in place. A tier holds it while it
+/// creates and locks its root; a clear holds it from its liveness check to the end of its delete. A root's own
+/// `.lock` is inside the tree a clear deletes, so it cannot order a clear against a tier that opens meanwhile. The
+/// file is never unlinked (a racing open would lock a second inode).
+pub fn lockNamespaceGate(io: std.Io, base_abs: []const u8, fingerprint: []const u8) !std.Io.File {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/{s}.gate", .{ base_abs, fingerprint });
+    return std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = false, .lock = .exclusive });
+}
+
 /// Does a live tier own `root_abs`? A root without a lock file has none.
 pub fn rootIsLive(io: std.Io, root_abs: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;

@@ -446,12 +446,21 @@ pub const DiskTier = struct {
         var root = shared;
         defer if (root.ptr != shared.ptr) allocator.free(shared);
         errdefer allocator.free(root);
-        try std.Io.Dir.cwd().createDirPath(io, root);
-        var lock = try disk_placement.lockRoot(io, shared);
-        if (lock == null) {
-            const own = try disk_placement.ownPrivateRoot(allocator, io, shared);
-            root = own.root;
-            lock = own.lock;
+        try std.Io.Dir.cwd().createDirPath(io, base_dir);
+        // The gate keeps a stale clear from deleting the namespace between this tier's mkdir and its lock.
+        const gate = try disk_placement.lockNamespaceGate(io, base_dir, fingerprint);
+        var lock: ?std.Io.File = null;
+        {
+            defer gate.close(io);
+            try std.Io.Dir.cwd().createDirPath(io, root);
+            lock = try disk_placement.lockRoot(io, shared);
+            if (lock == null) {
+                const own = try disk_placement.ownPrivateRoot(allocator, io, shared);
+                root = own.root;
+                lock = own.lock;
+            }
+        }
+        if (root.ptr != shared.ptr) {
             log.info("[disk-cache] {s} is in use by another sushi process: this one keeps a private SSD tier at {s}, removed at exit\n", .{ shared, root });
         }
         disk_placement.reapPrivateRoots(allocator, io, shared);

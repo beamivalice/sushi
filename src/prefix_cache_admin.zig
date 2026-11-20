@@ -143,8 +143,9 @@ pub const Deleted = struct {
     refused_links: u32 = 0,
 };
 
-/// Deletes every namespace directory whose id is not in `keep`. Each root's lock is held across its delete, so a tier
-/// that loads meanwhile takes a fresh root and one another process holds is skipped.
+/// Deletes every namespace directory whose id is not in `keep`. Each namespace's gate and root lock are held across its
+/// delete, so a tier that loads meanwhile waits for the gate and then takes a fresh root, and one another process holds
+/// is skipped.
 pub fn deleteUnused(allocator: std.mem.Allocator, io: std.Io, base_abs: []const u8, keep: []const u64) Deleted {
     return deleteNamespaces(allocator, io, base_abs, keep, null);
 }
@@ -166,6 +167,12 @@ pub fn deleteNamespaces(allocator: std.mem.Allocator, io: std.Io, base_abs: []co
         if (std.mem.indexOfScalar(u64, keep, id) != null) continue;
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ base_abs, dent.name }) catch continue;
+        // The root's own lock is inside the tree deleted below: the gate is what keeps a tier from opening in it meanwhile.
+        const gate = disk_placement.lockNamespaceGate(io, base_abs, dent.name) catch |err| {
+            log.warn("[prefix-cache-admin] could not take the gate of {s}: {s}\n", .{ path, @errorName(err) });
+            continue;
+        };
+        defer gate.close(io);
         const lock = (disk_placement.lockRoot(io, path) catch continue) orelse {
             res.skipped_live += 1;
             continue;
@@ -792,4 +799,66 @@ test "prefix cache admin: clearDisk: the index, the files and the budget agree, 
     try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
     try testing.expect(hc.disk.?.total_bytes > 0);
     try testing.expect(scanNamespace(testing.allocator, io, base, 0xa1).bytes > 0);
+}
+
+test "a stale clear never deletes the root a tier opens while the clear holds its namespace" {
+    const io = testing.io;
+    const kv_disk_cache = @import("kv_disk_cache.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    // A stale namespace big enough that its delete takes a while; the tier below opens in the middle of it.
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        var nb: [128]u8 = undefined;
+        try put(&tmp, io, try std.fmt.bufPrint(&nb, "root/00000000000000a1/e{d}/meta.json", .{i}), "{}");
+    }
+    var rbuf: [1024]u8 = undefined;
+    const root = try std.fmt.bufPrint(&rbuf, "{s}/root", .{base});
+
+    const Opener = struct {
+        root: []const u8,
+        stop: std.atomic.Value(bool) = .init(false),
+        tier: ?kv_disk_cache.DiskTier = null,
+        open_err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var lb: [1024]u8 = undefined;
+            const lock_path = std.fmt.bufPrint(&lb, "{s}/00000000000000a1/.lock", .{self.root}) catch return;
+            // The clear took its namespace's lock once the lock file exists.
+            while (true) {
+                if (std.Io.Dir.cwd().statFile(testing.io, lock_path, .{})) |_| break else |_| {}
+                if (self.stop.load(.acquire)) return;
+            }
+            // The tier opens once the clear has begun deleting entries.
+            const samples = [_][]const u8{ "e0", "e1000", "e2000", "e3000", "e3999" };
+            outer: while (!self.stop.load(.acquire)) {
+                for (samples) |e| {
+                    var sb: [1024]u8 = undefined;
+                    const p = std.fmt.bufPrint(&sb, "{s}/00000000000000a1/{s}/meta.json", .{ self.root, e }) catch return;
+                    if (std.Io.Dir.cwd().statFile(testing.io, p, .{})) |_| {} else |_| break :outer;
+                }
+            }
+            self.tier = kv_disk_cache.DiskTier.initBackend(testing.allocator, testing.io, self.root, "00000000000000a1", 0, 128, .real) catch |e| {
+                self.open_err = e;
+                return;
+            };
+        }
+    };
+    var op: Opener = .{ .root = root };
+    const t = try std.Thread.spawn(.{}, Opener.run, .{&op});
+    const res = deleteUnused(testing.allocator, io, root, &.{});
+    op.stop.store(true, .release);
+    t.join();
+    defer if (op.tier) |*tr| tr.deinit();
+    if (op.open_err) |e| return e;
+    // The opener must have reached its open while the clear ran: a test that never raced proves nothing.
+    const tier = &(op.tier orelse return error.OpenerMissedTheClear);
+    try testing.expectEqual(@as(u32, 1), res.namespaces);
+    // The tier owns a root that exists, and a second tier on the namespace takes a private root, not a second lock on it.
+    const gone = if (std.Io.Dir.cwd().access(io, tier.root, .{})) |_| false else |_| true;
+    try testing.expect(!gone);
+    var second = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, root, "00000000000000a1", 0, 128, .real);
+    defer second.deinit();
+    try testing.expect(second.private_root);
 }
