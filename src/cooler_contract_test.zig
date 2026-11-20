@@ -2287,45 +2287,60 @@ fn decodeGrowsInPlace(comptime Q: type) !void {
     try ld.xfm.resetCache();
     var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, long, n, .{ .temperature = 0.0 }, &.{}, .{});
     defer gen.deinit(a);
+    const KV = @import("kv_cache.zig").KVCache;
+    const cache = &ld.xfm.cache;
+    var caps: [64]usize = undefined;
+    std.debug.assert(cache.entries.len <= caps.len);
     var steps: usize = 0;
-    var in0: u64 = 0;
-    var grows0: usize = 0;
-    // The decode's own scratch: its peak over what is in use at the step before its first grow.
-    var scratch: u64 = 0;
+    var grows: usize = 0;
+    var capped: usize = 0;
+    // Each step's start: what is in use, and the step's own peak over it before a grow (its scratch).
     var before: u64 = 0;
-    var grown = false;
+    var scratch: u64 = 0;
+    var grows_seen: usize = 0;
     while (try gen.next(a)) |_| {
         steps += 1;
-        // Stops short of the request's last row, where `heldRows` caps the last grow: a capped grow adds less than the
-        // quarter this bar's arithmetic counts on (its peak is lower, its growth smaller still).
-        if (steps > 2000) break;
-        if (steps > 1 and !grown) {
-            if (@import("kv_cache.zig").KVCache.kv_cap_buf_grows > grows0) {
-                grown = true;
-                scratch = before;
-            } else before = mlx.engine.poolHeldPeak(.process) -| in0;
-        }
-        if (steps == 1) {
-            // From the first token on: the prefill's own transients are its bill's.
-            mlx.engine.close();
-            in0 = Sheet.now().in_use;
-            mlx.engine.resetPoolPeak(.process);
-            grows0 = @import("kv_cache.zig").KVCache.kv_cap_buf_grows;
-        }
+        const peak = mlx.engine.poolHeldPeak(.process) -| before;
+        if (steps > 1 and KV.kv_cap_buf_grows > grows_seen) {
+            const grew = Sheet.now().in_use -| before;
+            // The request's last row bounds every grow (`requestEnd`): the prompt and the whole reply.
+            try testing.expect(cache.end_tokens >= len + n);
+            const end_rows = std.mem.alignForward(usize, cache.end_tokens, 256);
+            var tail: u64 = 0;
+            for (cache.entries, 0..) |entry, i| if (entry.initialized) {
+                const old = caps[i];
+                const now = KV.bufferCapacity(entry.keys);
+                if (now == old) continue;
+                // A grow is +25% (one 256-row step at least, 8192 rows at most, on the 256-row step) or exactly to the
+                // request's end, whichever is smaller.
+                const quarter = std.mem.alignForward(usize, old + @min(@max(old / 4, 256), 8192), 256);
+                if (now != @min(quarter, end_rows)) std.debug.print("cooler contract: a decode's KV grew {d} -> {d} rows; +25% is {d}, the request's end {d}\n", .{ old, now, quarter, end_rows });
+                try testing.expectEqual(@min(quarter, end_rows), now);
+                if (end_rows < quarter) capped += 1;
+                for ([_]mlx.mlx_array{ entry.keys, entry.values, entry.keys_scales, entry.keys_biases, entry.values_scales, entry.values_biases }) |buf| {
+                    if (buf.ctx == null) continue;
+                    const row = mlx.mlx_array_size(buf) * mlx.mlx_array_itemsize(buf) / now;
+                    tail += mlx.engine.poolBytes((now - old) * row);
+                }
+            };
+            grows += 1;
+            // What the grow held past the decode's scratch and the growth itself: the zero tails of the buffers it
+            // grew, which one pass may hold together. A grow that built a zeros buffer of the whole capacity first held
+            // that buffer once more.
+            const transient = peak -| scratch -| grew;
+            if (transient > tail) std.debug.print("cooler contract: a decode's KV grow at step {d} held {d} KB past its growth and scratch, over its {d} KB of new rows\n", .{ steps, transient >> 10, tail >> 10 });
+            try testing.expect(transient <= tail);
+        } else if (steps > 1) scratch = peak;
+        // From the first token on: the prefill's own transients are its bill's.
+        before = Sheet.now().in_use;
+        mlx.engine.resetPoolPeak(.process);
+        grows_seen = KV.kv_cap_buf_grows;
+        for (cache.entries, 0..) |entry, i| caps[i] = if (entry.initialized) KV.bufferCapacity(entry.keys) else 0;
     }
-    mlx.engine.close();
-    try testing.expect(@import("kv_cache.zig").KVCache.kv_cap_buf_grows > grows0);
-    const grew = Sheet.now().in_use -| in0;
-    var widest: u64 = 0;
-    for (ld.xfm.cache.entries) |entry| if (entry.initialized) {
-        widest = @max(widest, mlx.engine.poolBytes(mlx.mlx_array_size(entry.keys) * mlx.mlx_array_itemsize(entry.keys)), mlx.engine.poolBytes(mlx.mlx_array_size(entry.values) * mlx.mlx_array_itemsize(entry.values)));
-    };
-    // What the grows held past the decode's own scratch and the growth itself: the zero tail of the buffer being
-    // grown, at most a quarter of it (the cache grows by a quarter). A grow that built a zeros buffer of the whole
-    // capacity first held the widest buffer once more (4096 KB on the tiny STQ fixture, against 448 KB).
-    const transient = (mlx.engine.poolHeldPeak(.process) -| in0) -| scratch -| grew;
-    if (transient > widest / 4) std.debug.print("cooler contract: a decode's KV grows held {d} KB past its growth and scratch, over a quarter of its {d} KB widest buffer\n", .{ transient >> 10, widest >> 10 });
-    try testing.expect(transient <= widest / 4);
+    // The reply grows the cache, and its last grow stops at the request's end.
+    if (capped == 0) std.debug.print("cooler contract: {d} decode steps, {d} grows, none at the request's end\n", .{ steps, grows });
+    try testing.expect(grows > 0);
+    try testing.expect(capped > 0);
 }
 
 test "cooler contract: a long reserved request holds no more than its admission bill, prefill and decode" {
