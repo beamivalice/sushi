@@ -1,44 +1,43 @@
 //! What one message read off the wire may cost, for the chunked request reader and the WebSocket reader alike: its
-//! decoded payload against `payload_cap` (a message of exactly the cap is read) and every raw byte, framing included,
-//! against `raw_cap`, so framing that decodes to little or nothing (chunk extensions, empty fragments) still ends.
+//! decoded payload against `payload_cap` (a message of exactly the cap is read, in pieces of any size: a piece's own
+//! minimal framing rides free with the bytes it carries), and framing that carries nothing (chunk extensions and
+//! padding, the last chunk and trailers, empty fragments) against a fixed allowance, so it cannot run on.
 const std = @import("std");
 
 pub const ByteBudget = struct {
     payload_cap: usize,
-    raw_cap: usize,
     payload: usize = 0,
-    raw: usize = 0,
+    idle: usize = 0,
 
-    /// What framing may add to a payload of the cap: a chunk's size line and CRLFs, or a client frame's head, is 6
-    /// bytes for a piece under 256 bytes, so pieces of 64 bytes and up stay under an eighth; 1 KiB covers a small
-    /// message's last chunk, trailers or few frames.
-    pub const framing_fixed: usize = 1024;
+    /// Framing that carries no payload a message may hold: a client sends none or a few bytes of it (a last chunk, a
+    /// trailer, an empty final fragment); 8 KiB is the trailer room the chunked reader always allowed.
+    pub const idle_framing_cap: usize = 8 * 1024;
 
     pub fn init(payload_cap: usize) ByteBudget {
-        return .{ .payload_cap = payload_cap, .raw_cap = payload_cap +| payload_cap / 8 +| framing_fixed };
+        return .{ .payload_cap = payload_cap };
     }
 
     pub const Error = error{
         /// The payload is over the cap.
         TooLarge,
-        /// The payload fits, but the framing around it is over its allowance: pieces too small.
+        /// Framing that carries nothing is over `idle_framing_cap`.
         FramingOverAllowance,
     };
 
-    /// Charges `raw` wire bytes and `payload` decoded bytes.
-    pub fn take(b: *ByteBudget, raw: usize, payload: usize) Error!void {
-        b.raw +|= raw;
+    /// Charges `payload` decoded bytes and `idle` framing bytes that carried none.
+    pub fn take(b: *ByteBudget, payload: usize, idle: usize) Error!void {
         b.payload +|= payload;
+        b.idle +|= idle;
         if (b.payload > b.payload_cap) return error.TooLarge;
-        if (b.raw > b.raw_cap) return error.FramingOverAllowance;
+        if (b.idle > idle_framing_cap) return error.FramingOverAllowance;
     }
 };
 
-test "ByteBudget: a payload of exactly the cap is taken, a byte more of either is not" {
+test "ByteBudget: a payload of exactly the cap is taken, a byte more is not, and idle framing has its own allowance" {
     var b = ByteBudget.init(8);
-    try b.take(8, 8);
-    try b.take(ByteBudget.framing_fixed + 1, 0);
-    try std.testing.expectError(error.FramingOverAllowance, b.take(1, 0));
+    try b.take(8, 0);
+    try std.testing.expectError(error.TooLarge, b.take(1, 0));
     var c = ByteBudget.init(8);
-    try std.testing.expectError(error.TooLarge, c.take(9, 9));
+    try c.take(0, ByteBudget.idle_framing_cap);
+    try std.testing.expectError(error.FramingOverAllowance, c.take(0, 1));
 }

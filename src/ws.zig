@@ -45,8 +45,8 @@ pub fn WsConn(comptime ConnT: type) type {
         /// (continuation) and != control is a protocol violation.
         in_message: ?std.ArrayList(u8) = null,
         in_opcode: Opcode = .continuation,
-        /// What the fragments read so far cost: their payload against `message_limit`, their wire bytes against it
-        /// plus the framing allowance, so frames that carry nothing still end.
+        /// What the fragments read so far cost: their payload against `message_limit`; an empty fragment's whole frame
+        /// as idle framing, so frames that carry nothing still end.
         budget: ByteBudget = .init(0),
 
         pub fn init(conn: *ConnT, limit: *const std.atomic.Value(usize)) Self {
@@ -110,7 +110,7 @@ pub fn WsConn(comptime ConnT: type) type {
         }
 
         fn charge(self: *Self, frame: RawFrame) error{ WsTooLarge, WsFraming }!void {
-            self.budget.take(frame.wire, frame.payload.len) catch |err| return switch (err) {
+            self.budget.take(frame.payload.len, if (frame.payload.len == 0) frame.wire else 0) catch |err| return switch (err) {
                 error.TooLarge => error.WsTooLarge,
                 error.FramingOverAllowance => error.WsFraming,
             };
