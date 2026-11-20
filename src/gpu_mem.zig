@@ -40,8 +40,12 @@ pub fn lentBytes() u64 {
     return @import("expert_stream.zig").lent_total.load(.monotonic);
 }
 
+/// Tests only: stand in for the pool `cacheBytes` reads, which GPU completions fill when no test is looking.
+pub var cache_bytes_override: ?usize = null;
+
 /// MLX's reclaimable pool plus the engine's free pool buffers: held by the process, reusable only by their owner.
 pub fn cacheBytes() usize {
+    if (cache_bytes_override) |bytes| return bytes;
     if (host_tier) return liveRead();
     var cache: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache);

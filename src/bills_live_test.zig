@@ -538,25 +538,50 @@ test "the width the max-context search prices never narrows as the context grows
 
 const live_gpu = @import("gpu_mem.zig");
 
-/// One machine's readings for a live test: its RAM, declared wired limit and margin, and the pages macOS can reclaim.
+/// One machine's readings for a live test: its RAM, declared wired limit and margin, the pages macOS can reclaim, and
+/// the pool MLX and the engine hold beside the active bytes (none unless a test names one).
 const Machine = struct {
     total: ?u64,
     wired_mb: ?u64,
     margin: ?u64,
     avail: ?u64,
     gpu_floor: u64,
+    cache: ?usize = 0,
 
     fn pin(m: Machine) Machine {
         const status = @import("status.zig");
-        const was: Machine = .{ .total = status.total_mem_override, .wired_mb = bills.wired_limit_mb_override, .margin = launch_state.wired_margin_flag_bytes, .avail = status.available_mem_override, .gpu_floor = bills.gpu_floor_bytes.load(.monotonic) };
+        const was: Machine = .{ .total = status.total_mem_override, .wired_mb = bills.wired_limit_mb_override, .margin = launch_state.wired_margin_flag_bytes, .avail = status.available_mem_override, .gpu_floor = bills.gpu_floor_bytes.load(.monotonic), .cache = live_gpu.cache_bytes_override };
         status.total_mem_override = m.total;
         bills.wired_limit_mb_override = m.wired_mb;
         launch_state.wired_margin_flag_bytes = m.margin;
         status.available_mem_override = m.avail;
         bills.gpu_floor_bytes.store(m.gpu_floor, .monotonic);
+        live_gpu.cache_bytes_override = m.cache;
         return was;
     }
 };
+
+test "a pinned machine's room is the one it names, whatever pool MLX holds beside its active bytes" {
+    const mlx = @import("mlx.zig");
+    try mlx.requireGpu();
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer cfg.deinit(testing.allocator);
+    // A freed buffer goes to MLX's pool when its command buffer completes, on a thread no test orders.
+    var z: mlx.mlx_array = .{};
+    try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{(2 << 30) / 4}, 1, .float32, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_array_eval(z));
+    _ = mlx.mlx_array_free(z);
+    defer _ = mlx.mlx_clear_cache();
+    var spins: usize = 0;
+    while (live_gpu.cacheBytes() < 2 << 30 and spins < 10_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(live_gpu.cacheBytes() >= 2 << 30);
+    const saved_static = bills.static_ceiling_override;
+    defer bills.static_ceiling_override = saved_static;
+    bills.static_ceiling_override = 48 << 30;
+    const was = (Machine{ .total = 64 << 30, .wired_mb = 0, .margin = 1 << 30, .avail = 4 << 30, .gpu_floor = 0 }).pin();
+    defer _ = was.pin();
+    try testing.expectEqual(@as(u64, 4 << 30), bills.admissionAvailableNow(&cfg));
+}
 
 test "a declared wired limit is the ceiling a request is admitted under on MiMo and GLM too, streamed or resident, and on an arch the engine does not serve" {
     const MiB: u64 = 1 << 20;

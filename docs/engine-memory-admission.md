@@ -102,6 +102,8 @@ bill function's output on the committed fixture configs of all served packs: a b
   refused every load. A limit past the RAM binds at the RAM, and a refusal says so.
 - A test that compares two live readings pins the free-RAM one (`status.available_mem_override`): other processes move
   the reclaimable pages between two reads, so equal formulas read unequal figures whenever free RAM binds.
+  The pool MLX and the engine hold (`gpu_mem.cache_bytes_override`) is pinned too: a freed buffer reaches it when its command
+  buffer completes, which adds to the room admission reads (`bills_live_test`'s `Machine` pins both).
 - **One live headroom, one first width.** `bills.prefillHeadroomNow` (pure `liveHeadroomFrom`) is the ceiling less
   the active and staged bytes and what the arch parks (`parkedBytes`: DeepSeek's decode pool and the engine's free
   buffers); the chunk-width hook, the widen re-check, the served warm, an image encode and DeepSeek's borrow read it,
