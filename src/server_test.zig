@@ -236,6 +236,25 @@ fn readUntil(fd: std.posix.fd_t, needle: ?[]const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// Whether `text` holds a Responses reply's terminal event: completed, or incomplete when max_output_tokens cut it.
+fn hasResponsesTerminal(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "\"type\":\"response.completed\"") != null or std.mem.indexOf(u8, text, "\"type\":\"response.incomplete\"") != null;
+}
+
+/// Everything read until the Responses terminal event.
+fn readUntilResponsesTerminal(fd: std.posix.fd_t) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var buf: [16 * 1024]u8 = undefined;
+    while (!hasResponsesTerminal(out.items)) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n == 0) break;
+        if (n < 0) return if (std.posix.errno(n) == .AGAIN) error.ReadTimedOut else error.ReadFailed;
+        try out.appendSlice(gpa, buf[0..@intCast(n)]);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 test "server test client: a read past its limit fails by name, never as a short answer" {
     gpa = testing.allocator;
     var sv: [2]std.posix.fd_t = undefined;
@@ -343,7 +362,7 @@ test "server: a WebSocket store:false chain stays on its connection, never in th
             const fd = try wsConnect();
             defer _ = std.c.close(fd);
             try wsSend(fd, "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"remember the word salmon please\",\"max_output_tokens\":4,\"temperature\":0,\"store\":false}");
-            const t1 = try readUntil(fd, "response.completed");
+            const t1 = try readUntilResponsesTerminal(fd);
             defer gpa.free(t1);
             const id1 = try respId(t1);
             var b: [512]u8 = undefined;
@@ -354,7 +373,7 @@ test "server: a WebSocket store:false chain stays on its connection, never in th
             const got = try request("GET", try std.fmt.bufPrint(&b, "/v1/responses/{s}", .{id1}), "");
             defer gpa.free(got);
             if (!std.mem.startsWith(u8, got, "HTTP/1.1 404")) return error.LocalRecordInSharedStore;
-            const rest = try readUntil(fd, "response.completed");
+            const rest = try readUntilResponsesTerminal(fd);
             defer gpa.free(rest);
             if (rest.len <= try buffered(fd)) return error.LookupNotMidTurn;
             if (std.mem.indexOf(u8, rest, "\"type\":\"error\"") != null) return error.TurnFailed;
@@ -726,7 +745,7 @@ test "server: a Responses WebSocket turn refused before it runs ends in the erro
             while (true) {
                 const frame = try wsReadFrame(fd);
                 defer gpa.free(frame);
-                if (std.mem.indexOf(u8, frame, "\"type\":\"response.completed\"") != null) break;
+                if (hasResponsesTerminal(frame)) break;
                 if (std.mem.startsWith(u8, frame, "{\"type\":\"error\"")) return error.NextTurnFailed;
             }
         }
@@ -821,7 +840,7 @@ test "server: a WebSocket turn's response says the store the client asked for" {
                     defer gpa.free(frame);
                     if (std.mem.startsWith(u8, frame, "{\"type\":\"error\"")) return error.TurnFailed;
                     const created = std.mem.indexOf(u8, frame, "\"type\":\"response.created\"") != null;
-                    const completed = std.mem.indexOf(u8, frame, "\"type\":\"response.completed\"") != null;
+                    const completed = hasResponsesTerminal(frame);
                     if ((created or completed) and std.mem.indexOf(u8, frame, c[1]) == null) {
                         std.debug.print("asked{s}: {s}\n", .{ c[0], frame[0..@min(frame.len, 600)] });
                         return error.StoreNotAsAsked;
@@ -886,7 +905,7 @@ fn wsCompletedTurn(fd: std.posix.fd_t) !void {
         const frame = try wsReadFrame(fd);
         defer gpa.free(frame);
         if (std.mem.startsWith(u8, frame, "{\"type\":\"error\"")) return error.TurnFailed;
-        if (std.mem.indexOf(u8, frame, "\"type\":\"response.completed\"") != null) return;
+        if (hasResponsesTerminal(frame)) return;
     }
 }
 
@@ -1544,7 +1563,7 @@ test "server: h21 a Responses envelope echoing service_tier is valid JSON" {
                 defer gpa.free(evs);
                 var seen: usize = 0;
                 for (evs) |e| {
-                    if (!std.mem.eql(u8, e.name, "response.created") and !std.mem.eql(u8, e.name, "response.completed")) continue;
+                    if (!std.mem.eql(u8, e.name, "response.created") and !std.mem.eql(u8, e.name, "response.completed") and !std.mem.eql(u8, e.name, "response.incomplete")) continue;
                     const ep = try parseBody(e.data);
                     defer ep.deinit();
                     const r = ep.value.object.get("response").?.object;
@@ -1600,6 +1619,56 @@ test "server: h21 a request field of the wrong type is refused by name, never re
             if (!std.mem.startsWith(u8, frame, "{\"type\":\"error\",\"status\":400") or std.mem.indexOf(u8, frame, "'store'") == null) {
                 std.debug.print("a WebSocket turn with store:\"false\" ended in: {s}\n", .{frame[0..@min(frame.len, 300)]});
                 return error.FieldReadAsAbsent;
+            }
+        }
+    }.run);
+}
+
+test "server: h21 a Responses stream cut by max_output_tokens ends in response.incomplete" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const resp = try request("POST", "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":1,\"temperature\":0,\"stream\":true,\"reasoning\":{\"effort\":\"none\"},\"input\":\"hi\"}");
+            defer gpa.free(resp);
+            const evs = try sseEvents(bodyOf(resp));
+            defer gpa.free(evs);
+            var terminals: usize = 0;
+            for (evs) |e| {
+                if (std.mem.eql(u8, e.name, "response.completed")) {
+                    std.debug.print("a reply cut by max_output_tokens ended in response.completed: {s}\n", .{e.data[0..@min(e.data.len, 200)]});
+                    return error.CutReplyEndedCompleted;
+                }
+                if (!std.mem.eql(u8, e.name, "response.incomplete")) continue;
+                terminals += 1;
+                const p = try parseBody(e.data);
+                defer p.deinit();
+                try testing.expectEqualStrings("response.incomplete", p.value.object.get("type").?.string);
+                const r = p.value.object.get("response").?.object;
+                try testing.expectEqualStrings("incomplete", r.get("status").?.string);
+                try testing.expectEqualStrings("max_output_tokens", r.get("incomplete_details").?.object.get("reason").?.string);
+            }
+            try testing.expectEqual(@as(usize, 1), terminals);
+            // `data: [DONE]` follows it, and nothing else.
+            try testing.expectEqualStrings("[DONE]", evs[evs.len - 1].data);
+            try testing.expectEqualStrings("response.incomplete", evs[evs.len - 2].name);
+
+            // Not streamed: the same status and reason.
+            const plain = try request("POST", "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":1,\"temperature\":0,\"reasoning\":{\"effort\":\"none\"},\"input\":\"hi\"}");
+            defer gpa.free(plain);
+            const pp = try parseBody(bodyOf(plain));
+            defer pp.deinit();
+            try testing.expectEqualStrings("incomplete", pp.value.object.get("status").?.string);
+            try testing.expectEqualStrings("max_output_tokens", pp.value.object.get("incomplete_details").?.object.get("reason").?.string);
+
+            // A WebSocket turn cut the same way ends in the same event.
+            const fd = try wsConnect();
+            defer _ = std.c.close(fd);
+            try wsSend(fd, "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"max_output_tokens\":1,\"temperature\":0,\"reasoning\":{\"effort\":\"none\"}}");
+            while (true) {
+                const frame = try wsReadFrame(fd);
+                defer gpa.free(frame);
+                if (std.mem.indexOf(u8, frame, "\"type\":\"response.completed\"") != null) return error.CutTurnEndedCompleted;
+                if (std.mem.indexOf(u8, frame, "\"type\":\"response.incomplete\"") != null) break;
+                if (std.mem.startsWith(u8, frame, "{\"type\":\"error\"")) return error.TurnFailed;
             }
         }
     }.run);

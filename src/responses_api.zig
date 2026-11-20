@@ -1455,13 +1455,15 @@ fn handleResponsesInner(
     }
 
     if (is_stream) {
-        const completed_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope_noted});
-        defer allocator.free(completed_payload);
-        try sendResponsesEvent(allocator, stream, seq_num, "response.completed", completed_payload);
+        // A reply cut by max_output_tokens ends in response.incomplete, as OpenAI's does.
+        const terminal = if (is_incomplete) "response.incomplete" else "response.completed";
+        const terminal_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"{s}\",\"response\":{s}}}", .{ terminal, envelope_noted });
+        defer allocator.free(terminal_payload);
+        try sendResponsesEvent(allocator, stream, seq_num, terminal, terminal_payload);
         // OpenAI terminates the Responses HTTP SSE stream with the same
         // `data: [DONE]` sentinel as chat completions; generic SSE middleware
         // keys stream end off it. The WS transport must NOT get one — its
-        // per-response terminator is the `response.completed` event, and a
+        // per-response terminator is the `response.completed` (or `.incomplete`) event, and a
         // trailing [DONE] frame would be misread as the NEXT turn's marker
         // on a chained session (see the WS turn loop below).
         if (stream.ws_mode == null) {

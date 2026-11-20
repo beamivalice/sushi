@@ -156,7 +156,7 @@ def resp_output(output):
 def resp_read(raw, stream):
     if not stream: return resp_output(json.loads(raw).get("output") or [])
     for ev in sse(raw):
-        if ev.get("type") == "response.completed": return resp_output(ev["response"].get("output") or [])
+        if ev.get("type") in ("response.completed", "response.incomplete"): return resp_output(ev["response"].get("output") or [])
     return [], "", ""
 
 def resp_choice(kind):

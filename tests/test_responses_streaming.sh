@@ -156,7 +156,7 @@ BODY='{"model":"sushi","input":"@N Say hi.","max_output_tokens":16,"temperature"
 SSE=$(sse_with_timestamps "$(rbody "$BODY")")
 
 LAST_DATA=$(echo "$SSE" | grep $'\tdata: ' | tail -1 | cut -f2-)
-COMPLETED_COUNT=$(echo "$SSE" | grep -c $'\tdata: {"type":"response.completed"' || true)
+COMPLETED_COUNT=$(echo "$SSE" | grep -cE $'\tdata: {"type":"response.(completed|incomplete)"' || true)
 echo "  last data frame: ${LAST_DATA:0:60}"
 if [ "$LAST_DATA" = "data: [DONE]" ]; then
     run_test "stream terminates with data: [DONE]" "PASS" ""
@@ -166,7 +166,7 @@ fi
 if [ "$COMPLETED_COUNT" -ge 1 ]; then
     run_test "response.completed precedes [DONE]" "PASS" ""
 else
-    run_test "response.completed precedes [DONE]" "FAIL" "no response.completed event seen"
+    run_test "response.completed precedes [DONE]" "FAIL" "no response.completed or response.incomplete event seen"
 fi
 echo ""
 

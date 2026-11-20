@@ -74,7 +74,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   an encrypted, empty or malformed item is dropped, never a 400. A stored response is read only while held
   (`ResponseStore.acquire`/`release`): a delete or an eviction mid-request frees it at the last release; a WS
   `store:false` chain stays on its connection, never in the shared store (lint `response-store-field`), and its
-  response says `"store":false`, as asked (the turn reaches `handleResponses` forced to store, `turn.kept` set). On the
+  response says `"store":false`, as asked (the turn reaches `handleResponses` forced to store, `turn.kept` set). A reply cut by `max_output_tokens` ends in
+  `response.incomplete` (status `incomplete`, `incomplete_details.reason` `max_output_tokens`), stream, WebSocket and not alike. On the
   WebSocket every refusal is the turn's terminal `{"type":"error","status":N,...}` frame, sent by the one error sender
   (`http.sendErrorResponse`), never an HTTP body. A message is JSON in a text frame: a binary one is answered by a 400
   error frame and a 1003 close. Every end of the socket sends its close frame from one sender (`wsEndOf`): 1000 to the

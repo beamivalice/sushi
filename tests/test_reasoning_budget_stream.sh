@@ -144,7 +144,7 @@ for l in open(sys.argv[1]).read().splitlines():
     try: d=json.loads(l[6:])
     except Exception: continue
     if d.get("type","").startswith("response.reasoning") and d.get("type","").endswith(".delta"): r+=d.get("delta","")
-    if d.get("type")=="response.completed": done=d["response"].get("status","")
+    if d.get("type") in ("response.completed","response.incomplete"): done=d["response"].get("status","")
 print(f"RSS_CLOSED={1 if 'Considering the limited time' in r else 0}; RSS_STATUS={done}")
 PY
 )"
