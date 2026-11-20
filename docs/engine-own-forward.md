@@ -674,8 +674,15 @@ rebuilds one.
   DeepSeek's own load, which also decides from it which warm forwards run); `model_load.warmLoad` makes the manifest's
   recipes before the warm and writes it after; a request that compiled a pipeline late writes it again
   (`arch_cooler.endRequest`), so the next load of the pack makes it ahead. A shape only a served request reaches costs
-  its compile once per box, not once per load. A load whose manifest made every pipeline skips the served warm, which
-  exists only to make them (`[warm] served requests skipped`): 14.6 s of the real Qwen pack's load.
+  its compile once per box, not once per load. The served warm exists only to make pipelines, so it ends by recording a
+  `served warm` marker, and a load whose manifest holds the marker of its own key skips the requests (`[warm] served
+  requests skipped`: 14.6 s of the real Qwen pack's load, DeepSeek's repeat start and every reload alike); the chunk's fit
+  against the live headroom still runs. The marker's key is the manifest's scope plus what the requests are made of:
+  widths, KV scheme and group, drafter, the MTP settings its rounds read (`--no-mtp-lookup`, `--max-mtp-ctx`,
+  `--mtp-min-depth`, `--mtp-max-depth`), its bill and the pool settings; a load of another key warms in full. A marker is
+  one manifest's: each settle (trusted or not, even when its workers did not start) replaces the markers the process
+  holds with that manifest's own, and a manifest is written with its load's markers only. Two packs of one scope share
+  their manifest's marker; the skipped warm's measure (`WarmOverBill`) and its kernels are the scope's.
 - **Key.** `scope` (16 hex) is, for DeepSeek, the pack (its config.json, its index, the name and size of each shard: not
   their bytes) and what shapes the warm (context, window, YaRN factor, candidate blocks, DSpark, tile order,
   expert-cache and SSD bytes, resident or streamed, dropped experts, and its `recipe_env` variables); for Qwen, the
@@ -695,7 +702,7 @@ rebuilds one.
   `0 kernels compiled after the load`.
 - **No manifest, or one that cannot be read** (the reason is named): today's load, then a manifest is written. A recipe that
   fails to make from a same-key manifest makes it untrusted: the full warm runs.
-- Written only after a warm that returned without error, through a temp file and a rename. One `[pipelines]` line says
+- Written only after a warm that returned without error, through a temp file of its own (process and write) and a rename. One `[pipelines]` line says
   which case ran. A later warm (the tower's) writes it again only where a complete one stands, found or stored by this
   load: a short manifest would be trusted by every later load, which skips the warm that could fill it.
 - **A Cooler load whose warm fails does not serve**: a forward of the engine's that fails in the warm fails in a

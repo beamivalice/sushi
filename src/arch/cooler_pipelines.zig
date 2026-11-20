@@ -80,6 +80,10 @@ pub const Plan = struct {
     pub fn settle(p: *Plan) bool {
         // A later warm adds to a manifest only where a complete one stands: the one found, or the one `store` writes.
         last = null;
+        // Every way out settles the markers: this manifest's if it is trusted, and none of an earlier load's.
+        var trusted = false;
+        defer registry.settleMarkers(trusted);
+        settled_scope = if (p.root != null) p.key.scope else null;
         var dir_buf: [manifest.Key.dir_len]u8 = undefined;
         const dir = p.key.dirName(&dir_buf);
         const recipes: []const manifest.Recipe = switch (p.found) {
@@ -98,12 +102,11 @@ pub const Plan = struct {
             p.made_count = report.made;
             const wall_ms = wall / std.time.ns_per_ms;
             if (report.failed > 0) {
-                registry.settleMarkers(false);
                 log.warn("[pipelines] manifest {s}: {d} of {d} recipes did not make ({s}); not trusted, the warm forwards run and rebuild it\n", .{ dir, report.failed, recipes.len, report.firstError() });
                 p.case = .unreadable;
                 return false;
             }
-            registry.settleMarkers(p.case == .same);
+            trusted = p.case == .same;
             if (p.case == .same) {
                 // Every recipe of the file made, so every one is a pipeline of this process: a manifest rewritten
                 // after a late warm keeps the ones this load never launched.
@@ -115,7 +118,6 @@ pub const Plan = struct {
             log.info("[pipelines] manifest of another build, recompiled {d} on {d} threads in {d} ms; the warm forwards run and the manifest {s} is rewritten (key {d} ms)\n", .{ report.made, p.threads, wall_ms, dir, p.key_ms });
             return false;
         }
-        registry.settleMarkers(false);
         switch (p.case) {
             .none => log.info("[pipelines] no manifest; the warm forwards run and write {s} (key {d} ms)\n", .{ dir, p.key_ms }),
             .unreadable => log.warn("[pipelines] manifest unreadable ({s}); the warm forwards run and rebuild it (key {d} ms)\n", .{ p.why, p.key_ms }),
@@ -142,6 +144,14 @@ pub const Plan = struct {
 /// Where this load's manifest lives once it holds a complete warm, for a warm that runs after the load's own (the
 /// vision tower's).
 var last: ?struct { a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: manifest.Key } = null;
+
+/// The scope of the manifest the load in progress settled, which its warm keys its markers by; null when no manifest
+/// can hold them (no root, or no scope).
+var settled_scope: ?[16]u8 = null;
+
+pub fn settledScope() ?[16]u8 {
+    return settled_scope;
+}
 
 /// The key the load's manifest is written under, once it holds a complete warm.
 pub fn writtenKey() ?manifest.Key {

@@ -201,7 +201,7 @@ test "cooler contract: a pipeline a Cooler request compiles late is written to t
     }.run);
 }
 
-test "cooler contract: a Cooler load whose manifest made every pipeline runs no served warm" {
+test "cooler contract: a Cooler load whose manifest holds a complete served warm runs none, in the process that wrote it and in a fresh one" {
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
             const shared = @import("arch/cooler_pipelines.zig");
@@ -211,22 +211,335 @@ test "cooler contract: a Cooler load whose manifest made every pipeline runs no 
             shared.root_hook = tmp.dir;
             defer shared.root_hook = null;
             defer shared.forget();
-            var runs: [2]u32 = undefined;
-            var scoped = false;
-            for (&runs) |*r| {
+            var runs: [3]u32 = undefined;
+            for (&runs, 0..) |*r, i| {
+                // The third load is a fresh process: it knows the manifest's file and nothing the first two made.
+                if (i == 2) mlx.engine.pipeline_registry.resetForTest();
                 // `open` is the served load, its warm included.
                 const before = cooler_warm.runs_for_test;
                 var cooler: Load = undefined;
                 try cooler.open(C, dir, true);
                 defer _ = cooler.close();
                 r.* = cooler_warm.runs_for_test - before;
-                scoped = switch (@import("arch/config.zig").tagOf(&cooler.config).?) {
-                    inline else => |t| @hasDecl(registry.Mod(t), "coolerPipelineScope"),
-                };
             }
-            // An arch that settles its manifest in its own load (no scope hook) warms every load.
             try testing.expectEqual(@as(u32, 1), runs[0]);
-            try testing.expectEqual(@as(u32, if (scoped) 0 else 1), runs[1]);
+            try testing.expectEqual(@as(u32, 0), runs[1]);
+            try testing.expectEqual(@as(u32, 0), runs[2]);
+        }
+    }.run);
+}
+
+test "cooler contract: a Cooler load whose manifest holds a served warm of another shape or another scope still runs it in full" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const shared = @import("arch/cooler_pipelines.zig");
+            const cooler_warm = @import("cooler_warm.zig");
+            const dir_len = @import("pipeline_manifest.zig").Key.dir_len;
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            shared.root_hook = tmp.dir;
+            defer shared.root_hook = null;
+            defer shared.forget();
+            var runs: [3]u32 = undefined;
+            for (&runs, 0..) |*r, i| {
+                const before = cooler_warm.runs_for_test;
+                var cooler: Load = undefined;
+                try cooler.prepare(C, dir, true);
+                // A narrower `--prefill-chunk`: the same pack, another chunk for the warm's requests.
+                const settings = @import("settings_resolve.zig");
+                const was = settings.prefill_chunk;
+                if (i == 1) settings.prefill_chunk = .{ .value = 2048, .source = .flag };
+                defer settings.prefill_chunk = was;
+                try cooler.loadServed(dir);
+                defer _ = cooler.close();
+                r.* = cooler_warm.runs_for_test - before;
+                if (i == 1) {
+                    // The manifest of another scope: the build stays, what selects the pack's kernels does not.
+                    var it = tmp.dir.iterate();
+                    var from: [dir_len]u8 = undefined;
+                    while (try it.next(io)) |e| if (e.kind == .directory and e.name.len == dir_len) @memcpy(&from, e.name);
+                    var to = from;
+                    @memset(to[0..16], '0');
+                    try tmp.dir.rename(&from, tmp.dir, &to, io);
+                }
+            }
+            try testing.expectEqual(@as(u32, 1), runs[0]);
+            try testing.expectEqual(@as(u32, 1), runs[1]);
+            try testing.expectEqual(@as(u32, 1), runs[2]);
+        }
+    }.run);
+}
+
+/// The served warms that ran their requests in one served load of `dir`, the warm's chunk pinned to `chunk` (0: not
+/// pinned).
+fn warmRuns(comptime C: type, dir: []const u8, chunk: u32) !u32 {
+    const cooler_warm = @import("cooler_warm.zig");
+    const before = cooler_warm.runs_for_test;
+    var cooler: Load = undefined;
+    try cooler.prepare(C, dir, true);
+    const settings = @import("settings_resolve.zig");
+    const was = settings.prefill_chunk;
+    if (chunk != 0) settings.prefill_chunk = .{ .value = chunk, .source = .flag };
+    defer settings.prefill_chunk = was;
+    try cooler.loadServed(dir);
+    defer _ = cooler.close();
+    return cooler_warm.runs_for_test - before;
+}
+
+/// Two DeepSeek packs whose scopes differ (the tile order does) and whose served warm has one shape.
+fn twoPacks() ?struct { a: []const u8, b: []const u8 } {
+    const a = std.mem.span(std.c.getenv("DSV41_STQ_TINY_PM") orelse return null);
+    const b = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return null);
+    return .{ .a = a, .b = b };
+}
+
+/// The process the two-pack tests share: a manifest root of its own, the engine on.
+const TwoPacks = struct {
+    tmp: testing.TmpDir,
+    was_enabled: bool,
+    packs: @TypeOf(twoPacks().?),
+
+    fn begin(self: *TwoPacks) !void {
+        try mlx.requireGpu();
+        self.packs = twoPacks() orelse return error.SkipZigTest;
+        self.was_enabled = mlx.engine.enabled;
+        mlx.engine.enabled = true;
+        self.tmp = testing.tmpDir(.{ .iterate = true });
+        @import("arch/cooler_pipelines.zig").root_hook = self.tmp.dir;
+        mlx.engine.pipeline_registry.resetForTest();
+    }
+
+    fn end(self: *TwoPacks) void {
+        const shared = @import("arch/cooler_pipelines.zig");
+        shared.root_hook = null;
+        shared.forget();
+        self.tmp.cleanup();
+        test_support.restoreEngine(self.was_enabled);
+    }
+
+    /// A new process: it knows the manifests' files and nothing the last one made.
+    fn restart(_: *TwoPacks) void {
+        mlx.engine.pipeline_registry.resetForTest();
+    }
+};
+
+test "cooler contract: a served-warm marker one pack's manifest holds is not taken under another pack whose own manifest never held it" {
+    const C = @import("dsv41/arch.zig").cooler_contract;
+    var two: TwoPacks = undefined;
+    try two.begin();
+    defer two.end();
+    // Process 1: pack B at a narrower chunk, so B's manifest holds that shape's marker only.
+    const b_narrow = try warmRuns(C, two.packs.b, 2048);
+    // Process 2: pack A at its own shape.
+    two.restart();
+    const a_first = try warmRuns(C, two.packs.a, 0);
+    // Process 3: A again, trusted and skipped as designed, then B at the default shape: B's manifest holds no warm of it.
+    two.restart();
+    const a_again = try warmRuns(C, two.packs.a, 0);
+    const b_default = try warmRuns(C, two.packs.b, 0);
+    errdefer std.debug.print("served warms that ran: b_narrow={d} a_first={d} a_again={d} b_default={d}\n", .{ b_narrow, a_first, a_again, b_default });
+    try testing.expectEqual(@as(u32, 1), b_narrow);
+    try testing.expectEqual(@as(u32, 1), a_first);
+    try testing.expectEqual(@as(u32, 0), a_again);
+    try testing.expectEqual(@as(u32, 1), b_default);
+}
+
+test "cooler contract: a served-warm marker one pack's warm recorded is not written into another pack's manifest" {
+    const C = @import("dsv41/arch.zig").cooler_contract;
+    var two: TwoPacks = undefined;
+    try two.begin();
+    defer two.end();
+    // Process 1: A at the default shape, then B at a narrower chunk: B's warm never ran at the default shape.
+    const a_first = try warmRuns(C, two.packs.a, 0);
+    const b_narrow = try warmRuns(C, two.packs.b, 2048);
+    // Process 2: B at the default shape warms in full.
+    two.restart();
+    const b_default = try warmRuns(C, two.packs.b, 0);
+    errdefer std.debug.print("served warms that ran: a_first={d} b_narrow={d} b_default={d}\n", .{ a_first, b_narrow, b_default });
+    try testing.expectEqual(@as(u32, 1), a_first);
+    try testing.expectEqual(@as(u32, 1), b_narrow);
+    try testing.expectEqual(@as(u32, 1), b_default);
+}
+
+test "cooler contract: two packs whose served warms have one shape and one bill each measure their widest request against it" {
+    const C = @import("dsv41/arch.zig").cooler_contract;
+    const cooler_warm = @import("cooler_warm.zig");
+    var two: TwoPacks = undefined;
+    try two.begin();
+    defer two.end();
+    // Process 1: B at a narrower chunk, then A at the shape both share.
+    _ = try warmRuns(C, two.packs.b, 2048);
+    _ = try warmRuns(C, two.packs.a, 0);
+    // Process 2: A skips its warm, as its own manifest says. B, whose manifest holds no warm of this shape, runs it, and
+    // the measure of its widest request runs with it: a bill it exceeds is refused by name.
+    two.restart();
+    try testing.expectEqual(@as(u32, 0), try warmRuns(C, two.packs.a, 0));
+    cooler_warm.bill_for_test = 1 << 20;
+    defer cooler_warm.bill_for_test = null;
+    try testing.expectError(error.WarmOverBill, warmRuns(C, two.packs.b, 0));
+    var msg: [512]u8 = undefined;
+    _ = mlx.takeError(&msg);
+}
+
+/// A process setting the served warm reads, flipped between the process that wrote the manifest and the one that loads
+/// from it. Returns the loading process's served warms and the kernels a full warm under its setting then compiles late
+/// (what a skipped warm left for requests).
+fn settingProbe(comptime C: type, dir: []const u8, comptime Setting: type, flip: bool) !struct { runs: u32, late: u64 } {
+    const shared = @import("arch/cooler_pipelines.zig");
+    const cooler_warm = @import("cooler_warm.zig");
+    const reg = mlx.engine.pipeline_registry;
+    var tmp1 = testing.tmpDir(.{ .iterate = true });
+    defer tmp1.cleanup();
+    var tmp2 = testing.tmpDir(.{ .iterate = true });
+    defer tmp2.cleanup();
+    defer shared.root_hook = null;
+    defer shared.forget();
+    const was = Setting.get();
+    defer Setting.set(was);
+    // Process 1 writes the manifest under the setting's `written` value.
+    shared.root_hook = tmp1.dir;
+    reg.resetForTest();
+    Setting.set(Setting.written);
+    {
+        var first: Load = undefined;
+        try first.open(C, dir, true);
+        _ = first.close();
+    }
+    // Process 2 loads from it, the setting flipped to `loaded` (or not, the control).
+    reg.resetForTest();
+    Setting.set(if (flip) Setting.loaded else Setting.written);
+    const before = cooler_warm.runs_for_test;
+    var cooler: Load = undefined;
+    try cooler.open(C, dir, true);
+    defer _ = cooler.close();
+    const runs = cooler_warm.runs_for_test - before;
+    // A full warm under process 2's setting from no manifest: what it compiles now, the skipped warm left out.
+    shared.root_hook = tmp2.dir;
+    reg.settleMarkers(false);
+    const late = mlx.engine.latePipelines();
+    mlx.engine.late_names.clear();
+    {
+        const turn = arch_handle.turnFor(cooler.h, &cooler.config);
+        defer turn.end();
+        const verify_cap: ?u32 = if (@hasDecl(C, "specTokens")) @import("generate.zig").Generator.mtpVerifyDraftsMax(&cooler.config) else null;
+        try model_load.warmLoad(io, testing.allocator, &cooler.config, cooler.xfm, verify_cap, null, cooler.xfm.cache.config);
+    }
+    const added = mlx.engine.latePipelines() - late;
+    if (added > 0) std.debug.print("{s} (flip={}) left {d} kernels late:\n{s}\n", .{ @typeName(Setting), flip, added, mlx.engine.late_names.text() });
+    return .{ .runs = runs, .late = added };
+}
+
+/// `--no-mtp-lookup`: the manifest's process ran with it, the loading one with prompt lookup on.
+const LookupSetting = struct {
+    const written = true;
+    const loaded = false;
+    fn get() bool {
+        return @import("generate.zig").mtp_lookup_disabled;
+    }
+    fn set(v: bool) void {
+        @import("generate.zig").mtp_lookup_disabled = v;
+    }
+};
+
+/// `--max-mtp-ctx 24`: the manifest's process ran with it, the loading one with no ceiling.
+const MaxMtpCtxSetting = struct {
+    const written: u32 = 24;
+    const loaded: u32 = 0;
+    fn get() u32 {
+        return @import("generate.zig").max_mtp_ctx;
+    }
+    fn set(v: u32) void {
+        @import("generate.zig").max_mtp_ctx = v;
+    }
+};
+
+/// `--mtp-max-depth 2`: the manifest's process ran with it, the loading one with the planner's own cap.
+const MtpMaxDepthSetting = struct {
+    const written: u32 = 2;
+    const loaded: u32 = 0;
+    fn get() u32 {
+        return @import("mtp_depth_bounds.zig").active.max;
+    }
+    fn set(v: u32) void {
+        @import("mtp_depth_bounds.zig").active.max = v;
+    }
+};
+
+test "cooler contract: a manifest's served-warm marker written under one MTP setting is not taken under another the warm reads" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            inline for (.{ LookupSetting, MaxMtpCtxSetting, MtpMaxDepthSetting }) |Setting| {
+                // The control: no setting flipped, the manifest's warm skipped and nothing left late.
+                const control = try settingProbe(C, dir, Setting, false);
+                const flipped = try settingProbe(C, dir, Setting, true);
+                errdefer std.debug.print("{s}: control runs={d} late={d}; flipped runs={d} late={d}\n", .{ @typeName(Setting), control.runs, control.late, flipped.runs, flipped.late });
+                try testing.expectEqual(@as(u32, 0), control.runs);
+                try testing.expectEqual(@as(u64, 0), control.late);
+                try testing.expectEqual(@as(u32, 1), flipped.runs);
+                try testing.expectEqual(@as(u64, 0), flipped.late);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a reload of a pack in its own scope skips its served warm, answers as a warmed load does and leaves its warm's requests no kernel to compile" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const shared = @import("arch/cooler_pipelines.zig");
+            const cooler_warm = @import("cooler_warm.zig");
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            var empty = testing.tmpDir(.{ .iterate = true });
+            defer empty.cleanup();
+            shared.root_hook = tmp.dir;
+            defer shared.root_hook = null;
+            defer shared.forget();
+            mlx.engine.pipeline_registry.resetForTest();
+            const prompt = ids[0..@min(ids.len, 20)];
+            var full: std.ArrayList(u32) = .empty;
+            defer full.deinit(a);
+            {
+                var cooler: Load = undefined;
+                const before = cooler_warm.runs_for_test;
+                try cooler.open(C, dir, true);
+                defer _ = cooler.close();
+                try testing.expectEqual(@as(u32, 1), cooler_warm.runs_for_test - before);
+                var sv: Served = undefined;
+                try sv.init(&cooler, dir);
+                defer sv.deinit();
+                var from: u32 = 0;
+                full = try sv.request(prompt, 12, &from);
+            }
+            var cooler: Load = undefined;
+            const before = cooler_warm.runs_for_test;
+            try cooler.open(C, dir, true);
+            defer _ = cooler.close();
+            try testing.expectEqual(@as(u32, 0), cooler_warm.runs_for_test - before);
+            {
+                const late = mlx.engine.latePipelines();
+                var sv: Served = undefined;
+                try sv.init(&cooler, dir);
+                defer sv.deinit();
+                var from: u32 = 0;
+                var skipped = try sv.request(prompt, 12, &from);
+                defer skipped.deinit(a);
+                try testing.expectEqualSlices(u32, full.items, skipped.items);
+                try testing.expectEqual(late, mlx.engine.latePipelines());
+            }
+            // The skipped warm's own requests, run now: the pipelines the manifest made are all they ask for.
+            shared.root_hook = empty.dir;
+            mlx.engine.pipeline_registry.settleMarkers(false);
+            const late = mlx.engine.latePipelines();
+            mlx.engine.late_names.clear();
+            {
+                const turn = arch_handle.turnFor(cooler.h, &cooler.config);
+                defer turn.end();
+                const verify_cap: ?u32 = if (@hasDecl(C, "specTokens")) @import("generate.zig").Generator.mtpVerifyDraftsMax(&cooler.config) else null;
+                try model_load.warmLoad(io, a, &cooler.config, cooler.xfm, verify_cap, null, cooler.xfm.cache.config);
+            }
+            errdefer std.debug.print("the skipped warm left these to its requests:\n{s}", .{mlx.engine.late_names.text()});
+            try testing.expectEqual(late, mlx.engine.latePipelines());
         }
     }.run);
 }

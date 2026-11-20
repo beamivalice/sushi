@@ -30,6 +30,14 @@ fn dupeRecipe(r: Recipe) !Recipe {
     return .{ .kind = r.kind, .function = function, .key = key, .text = text, .flags = flags, .ints = ints };
 }
 
+fn freeRecipe(r: Recipe) void {
+    gpa.free(r.function);
+    gpa.free(r.key);
+    gpa.free(r.text);
+    gpa.free(r.flags);
+    gpa.free(r.ints);
+}
+
 fn has(r: Recipe) bool {
     for (recorded.items) |x| if (x.eql(r)) return true;
     return false;
@@ -97,6 +105,7 @@ pub fn takeStock(key: []const u8) ?metal.Pipeline {
 
 /// Markers a manifest held, not yet trusted: `Plan.settle` accepts them once every recipe of that manifest has made.
 var pending_markers: std.ArrayList(Recipe) = .empty;
+/// The markers of the manifest the load in progress settled: no other load's.
 var accepted_markers: std.ArrayList(Recipe) = .empty;
 
 pub fn putMarker(r: Recipe) !void {
@@ -104,20 +113,26 @@ pub fn putMarker(r: Recipe) !void {
     pending_markers.appendAssumeCapacity(try dupeRecipe(r));
 }
 
-/// The markers seen are trusted (the manifest's recipes all made), or dropped.
+/// One load's settle: its manifest's markers replace the last load's, trusted (the manifest's recipes all made) or
+/// dropped. A marker a warm recorded under the last load leaves `recorded` too, so the manifest written next holds
+/// this load's markers only.
 pub fn settleMarkers(trusted: bool) void {
-    if (trusted) accepted_markers.appendSlice(gpa, pending_markers.items) catch {};
+    var i: usize = 0;
+    while (i < recorded.items.len) {
+        if (recorded.items[i].kind == .marker) freeRecipe(recorded.orderedRemove(i)) else i += 1;
+    }
+    for (accepted_markers.items) |m| freeRecipe(m);
+    accepted_markers.clearRetainingCapacity();
+    if (trusted) {
+        accepted_markers.appendSlice(gpa, pending_markers.items) catch {};
+        for (pending_markers.items) |m| record(m);
+    } else for (pending_markers.items) |m| freeRecipe(m);
     pending_markers.clearRetainingCapacity();
-    if (!trusted) accepted_markers.clearRetainingCapacity();
 }
 
 /// Whether a trusted manifest holds the marker `key`: the warm it names was made whole by recipes already made.
-/// The marker is then recorded, so a manifest written later keeps it.
 pub fn takeMarker(key: []const u8) bool {
-    for (accepted_markers.items) |m| if (std.mem.eql(u8, m.key, key)) {
-        record(m);
-        return true;
-    };
+    for (accepted_markers.items) |m| if (std.mem.eql(u8, m.key, key)) return true;
     return false;
 }
 
@@ -133,4 +148,62 @@ pub fn resetForTest() void {
     lost = 0;
     pending_markers.clearRetainingCapacity();
     accepted_markers.clearRetainingCapacity();
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+
+fn markerRecipe(key: []const u8) Recipe {
+    return .{ .kind = .marker, .function = "served warm", .key = key };
+}
+
+fn markerRecorded(key: []const u8) bool {
+    for (recipes()) |r| if (r.kind == .marker and std.mem.eql(u8, r.key, key)) return true;
+    return false;
+}
+
+test "pipeline registry: a marker a trusted manifest held is not taken under a later load whose own manifest never held it" {
+    resetForTest();
+    defer resetForTest();
+    try putMarker(markerRecipe("K"));
+    settleMarkers(true);
+    try testing.expect(takeMarker("K"));
+    // The next load's manifest made every recipe and held no marker.
+    settleMarkers(true);
+    try testing.expect(!takeMarker("K"));
+}
+
+test "pipeline registry: a load whose manifest is not trusted, or whose workers did not start, takes no marker of the load before it" {
+    resetForTest();
+    defer resetForTest();
+    try putMarker(markerRecipe("K"));
+    settleMarkers(true);
+    settleMarkers(false);
+    try testing.expect(!takeMarker("K"));
+    // Markers seen in a manifest that did not make whole are dropped, not kept for the next settle.
+    try putMarker(markerRecipe("L"));
+    settleMarkers(false);
+    settleMarkers(true);
+    try testing.expect(!takeMarker("L"));
+}
+
+test "pipeline registry: a marker one load's warm recorded is not among the recipes the next load's manifest is written with" {
+    resetForTest();
+    defer resetForTest();
+    record(.{ .kind = .source, .function = "kernel_a", .text = "source a" });
+    // Load 1 settled its manifest and its warm ran whole.
+    settleMarkers(false);
+    recordMarker("served warm", "K1");
+    try testing.expect(markerRecorded("K1"));
+    // Load 2, another scope: its manifest holds one marker of its own. Pipelines are the process's; markers are the manifest's.
+    try putMarker(markerRecipe("K2"));
+    settleMarkers(true);
+    try testing.expect(markerRecorded("K2"));
+    try testing.expect(!markerRecorded("K1"));
+    try testing.expect(takeMarker("K2"));
+    try testing.expect(!takeMarker("K1"));
+    var has_source = false;
+    for (recipes()) |r| has_source = has_source or r.kind == .source;
+    try testing.expect(has_source);
 }

@@ -24,6 +24,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A DeepSeek-V4.1 prefill after a cancelled long prompt keeps the chunk width its request was admitted at**: the pools the
   cancelled request left lent were held off the width's headroom but not netted from its cost, so the prefill stepped
   down to a narrower, slower chunk for memory admission had already counted.
+- **A repeat start or reload of a model skips its served warm when its own pipeline manifest already made it**: the
+  warm's requests ran on every DeepSeek load (1.7 s of 1.8 s on the tiny fixture) and every reload; the manifest now
+  records the warm it ran under its pack's scope, chunk, drafter and MTP settings, and a load of that key skips it.
 
 ## v1.7.2 — Memory you can count on, faster concurrent Qwen
 

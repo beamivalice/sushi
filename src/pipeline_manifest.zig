@@ -10,7 +10,8 @@ const metal = @import("metal.zig");
 pub const version: u32 = 2;
 const magic = "SUSHIPLM";
 pub const file_name = "manifest.bin";
-const temp_name = "manifest.bin.tmp";
+/// A writer's temp file is its own (process and write), so two writers of one manifest never share bytes.
+var temp_seq = std.atomic.Value(u32).init(0);
 
 pub const Kind = enum(u8) {
     /// A function of `mlx.metallib` made as it is: `function` is its name and `key` the engine's table key.
@@ -368,6 +369,8 @@ pub fn write(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: Key, recip
     defer a.free(bytes);
     var dir = try root.createDirPathOpen(io, dir_name, .{});
     defer dir.close(io);
+    var temp_buf: [64]u8 = undefined;
+    const temp_name = std.fmt.bufPrint(&temp_buf, "{s}.{d}-{d}.tmp", .{ file_name, std.c.getpid(), temp_seq.fetchAdd(1, .monotonic) }) catch unreachable;
     try dir.writeFile(io, .{ .sub_path = temp_name, .data = bytes });
     errdefer dir.deleteFile(io, temp_name) catch {};
     try dir.rename(temp_name, dir, file_name, io);
@@ -566,9 +569,10 @@ test "pipeline manifest: a write leaves no temp file, and a prune removes only t
     const foreign = testKey("bbbbbbbbbbbbbbbb", "2222222222222222");
     for ([_]Key{ old, foreign, mine }) |k| try write(testing.allocator, io, tmp.dir, k, &recipes);
     var name_buf: [Key.dir_len]u8 = undefined;
-    var temp_path: [64]u8 = undefined;
-    const temp = try std.fmt.bufPrint(&temp_path, "{s}/{s}", .{ mine.dirName(&name_buf), temp_name });
-    try testing.expectError(error.FileNotFound, tmp.dir.access(io, temp, .{}));
+    var left = try tmp.dir.openDir(io, mine.dirName(&name_buf), .{ .iterate = true });
+    defer left.close(io);
+    var it = left.iterate();
+    while (try it.next(io)) |entry| try testing.expectEqualStrings(file_name, entry.name);
 
     var removed: std.ArrayList([Key.dir_len]u8) = .empty;
     defer removed.deinit(testing.allocator);
@@ -581,6 +585,30 @@ test "pipeline manifest: a write leaves no temp file, and a prune removes only t
     var kept = try lookup(testing.allocator, io, tmp.dir, foreign);
     defer kept.deinit();
     try testing.expect(kept == .same);
+}
+
+test "pipeline manifest: a write never touches a temp file another writer of the same manifest has open" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const flags = [_]metal.Flag{};
+    const recipes = sample(&flags);
+    const mine = testKey("aaaaaaaaaaaaaaaa", "1111111111111111");
+    var name_buf: [Key.dir_len]u8 = undefined;
+    const dir_name = mine.dirName(&name_buf);
+    try tmp.dir.createDirPath(io, dir_name);
+    // A peer process mid-write: its temp file stays whole until it renames it itself.
+    var peer_path: [64]u8 = undefined;
+    const peer = try std.fmt.bufPrint(&peer_path, "{s}/manifest.bin.tmp", .{dir_name});
+    try tmp.dir.writeFile(io, .{ .sub_path = peer, .data = "peer's half-written bytes" });
+    try write(testing.allocator, io, tmp.dir, mine, &recipes);
+    const kept = try tmp.dir.readFileAlloc(io, peer, testing.allocator, .limited(1 << 10));
+    defer testing.allocator.free(kept);
+    try testing.expectEqualStrings("peer's half-written bytes", kept);
+    var found = try lookup(testing.allocator, io, tmp.dir, mine);
+    defer found.deinit();
+    try testing.expect(found == .same);
+    try testing.expectEqual(recipes.len, found.same.recipes.len);
 }
 
 test "pipeline manifest: a pack's key part follows its config and the size of each shard, not other files" {
