@@ -57,39 +57,65 @@ pub fn check(head: []const u8) Error!void {
         '\n' => if (i == 0 or head[i - 1] != '\r') return error.BadHead,
         else => {},
     };
-    var lines = std.mem.splitSequence(u8, skipEmptyLines(head), "\r\n");
-    const first = lines.next() orelse return error.BadHead;
+    const text = skipEmptyLines(head);
+    const first = text[0 .. std.mem.indexOf(u8, text, "\r\n") orelse text.len];
     const line = splitLine(first);
     if (!isToken(line.method) or line.target.len == 0 or first.len != line.method.len + line.target.len + line.version.len + 2) return error.BadHead;
     for (line.target) |b| if (b <= 0x20 or b == 0x7f) return error.BadHead;
     if (!std.mem.eql(u8, line.version, "HTTP/1.1") and !std.mem.eql(u8, line.version, "HTTP/1.0")) return error.BadHead;
     var hosts: usize = 0;
-    while (lines.next()) |field| {
-        if (field.len == 0) break;
-        const colon = std.mem.indexOfScalar(u8, field, ':') orelse return error.BadHead;
-        if (!isToken(field[0..colon]) or !isFieldValue(field[colon + 1 ..])) return error.BadHead;
-        if (std.ascii.eqlIgnoreCase(field[0..colon], "host")) hosts += 1;
+    var it = fieldLines(head);
+    while (try it.next()) |field| {
+        if (std.ascii.eqlIgnoreCase(field.name, "host")) hosts += 1;
     }
     if (hosts > 1) return error.BadHead;
 }
 
-/// The fields named `name`, in order, of a head `check` passed (the request line is no field: its name is no token).
-pub const Fields = struct {
+/// One field line: its name, and its value with the optional whitespace trimmed.
+pub const FieldLine = struct { name: []const u8, value: []const u8 };
+
+/// The field lines of a head, in order, up to its blank line: the one place a line is split into name and value, so
+/// `check`, `value` and `hasToken` share the field grammar by construction.
+pub const FieldLines = struct {
     lines: std.mem.SplitIterator(u8, .sequence),
+
+    /// The next field line; `error.BadHead` for a line that is no field line (no colon, a name that is no token,
+    /// whitespace or a fold before it, a control byte in its value).
+    pub fn next(it: *FieldLines) Error!?FieldLine {
+        const line = it.lines.next() orelse return null;
+        if (line.len == 0) return null;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadHead;
+        if (!isToken(line[0..colon]) or !isFieldValue(line[colon + 1 ..])) return error.BadHead;
+        return .{ .name = line[0..colon], .value = std.mem.trim(u8, line[colon + 1 ..], ows) };
+    }
+};
+
+/// The field lines of `head`, past its request line (a line whose text before its colon is no token); a block of
+/// field lines alone starts at its first.
+pub fn fieldLines(head: []const u8) FieldLines {
+    const text = skipEmptyLines(head);
+    var lines = std.mem.splitSequence(u8, text, "\r\n");
+    const first = text[0 .. std.mem.indexOf(u8, text, "\r\n") orelse text.len];
+    const colon = std.mem.indexOfScalar(u8, first, ':');
+    if (colon == null or !isToken(first[0..colon.?])) _ = lines.next();
+    return .{ .lines = lines };
+}
+
+/// The values of the fields named `name`, in order, of a head `check` passed; a line it would refuse ends them.
+pub const Fields = struct {
+    lines: FieldLines,
     name: []const u8,
 
     pub fn next(it: *Fields) ?[]const u8 {
-        while (it.lines.next()) |line| {
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-            if (!isToken(line[0..colon]) or !std.ascii.eqlIgnoreCase(line[0..colon], it.name)) continue;
-            return std.mem.trim(u8, line[colon + 1 ..], ows);
+        while (it.lines.next() catch return null) |field| {
+            if (std.ascii.eqlIgnoreCase(field.name, it.name)) return field.value;
         }
         return null;
     }
 };
 
 pub fn fields(head: []const u8, name: []const u8) Fields {
-    return .{ .lines = std.mem.splitSequence(u8, head, "\r\n"), .name = name };
+    return .{ .lines = fieldLines(head), .name = name };
 }
 
 /// The first field named `name`.
