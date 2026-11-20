@@ -2151,6 +2151,13 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     const dq_weights: u64 = if (fwd >= trunk.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
         req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + scores + dequant + envelope + dq_weights + runtime_floor;
+    // The one place a budget is argued about: every term, so `--log-level debug` on a live box
+    // names what a chunk's bill is made of instead of leaving it to be re-derived by hand.
+    if (log.enabled(.debug)) log.debug("[bill] prefill seq={d} fwd={d} kv={d} reserved={d} state={d} ckpt={d} coexist={d} ring={d} mtpkv={d} dflash={d} scores={d} dequant={d} envelope={d} dq={d} floor={d} shared={d} gross={d}\n", .{
+        seq, fwd, kv_bytes, req.reserved_kv_bytes, req.state_bytes, req.checkpoint_bytes,
+        req.grow_coexist_bytes, req.qsa_ring_bytes, req.mtp_head_kv_bytes, req.dflash_bytes,
+        scores, dequant, envelope, dq_weights, runtime_floor, req.shared_resident_bytes, gross,
+    });
     // The one place a warm turn's resident rows leave the bill, inside the net.
     return (gross -| req.shared_resident_bytes) * req.uplift_16ths / 16;
 }
