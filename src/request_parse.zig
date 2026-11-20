@@ -253,6 +253,10 @@ pub fn completionsFieldFault(root: std.json.ObjectMap) ?[]const u8 {
     if (root.get("best_of")) |v| if (v != .null and wholeNumber(v) != 1) {
         return "'best_of' must be 1: this server returns one completion per request and ranks no candidates";
     };
+    if (root.get("logprobs")) |v| if (v != .null) {
+        const n = wholeNumber(v) orelse return "'logprobs' must be an integer from 0 to 20";
+        if (n < 0 or n > MAX_TOP_LOGPROBS) return "'logprobs' must be an integer from 0 to 20";
+    };
     return null;
 }
 
@@ -405,6 +409,13 @@ pub const Logprobs = struct {
         return @max(self.top, 1);
     }
 };
+
+/// Legacy completions' integer `logprobs` (null or absent: off; the range is `completionsFieldFault`'s).
+pub fn completionsLogprobs(root: std.json.ObjectMap) ?Logprobs {
+    const v = root.get("logprobs") orelse return null;
+    const n = wholeNumber(v) orelse return null;
+    return .{ .top = @intCast(@max(n, 0)) };
+}
 
 /// Chat's `logprobs: true` with its `top_logprobs` (absent or null: none; the range is `generationFieldFault`'s).
 pub fn chatLogprobs(root: std.json.ObjectMap) ?Logprobs {
@@ -669,6 +680,7 @@ pub fn responsesFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
 
 /// The first bad value among the chat-completions-only fields, as a message naming the field.
 pub fn chatFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
+    if (root.get("logprobs")) |v| if (v != .null and v != .bool) return "'logprobs' must be a boolean";
     if (root.get("messages")) |mv| if (mv == .array) if (roleFault(buf, "messages", mv.array.items, &chat_mod.request_roles, false)) |m| return m;
     if (root.get("response_format")) |rf| switch (rf) {
         .null => {},
@@ -1371,5 +1383,35 @@ test "chat logprobs: true is on whatever top_logprobs says, 0 and absent include
         try std.testing.expectEqual(c.want, if (got) |l| l.top else null);
         // The engine reads 0 as off: a request that is on always asks it for at least one candidate.
         if (got) |l| try std.testing.expect(l.engineN() >= 1);
+    }
+}
+
+test "logprobs of the wrong type or range is refused by name on each route, null is absent" {
+    var buf: [256]u8 = undefined;
+    const chat = [_]struct { body: []const u8, refused: bool }{
+        .{ .body = "{\"logprobs\":null}", .refused = false },
+        .{ .body = "{\"logprobs\":false}", .refused = false },
+        .{ .body = "{\"logprobs\":1}", .refused = true },
+        .{ .body = "{\"logprobs\":\"true\"}", .refused = true },
+    };
+    for (chat) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(c.refused, chatFieldFault(&buf, parsed.value.object) != null);
+    }
+    const legacy = [_]struct { body: []const u8, top: ?u32, refused: bool }{
+        .{ .body = "{}", .top = null, .refused = false },
+        .{ .body = "{\"logprobs\":null}", .top = null, .refused = false },
+        .{ .body = "{\"logprobs\":0}", .top = 0, .refused = false },
+        .{ .body = "{\"logprobs\":20}", .top = 20, .refused = false },
+        .{ .body = "{\"logprobs\":21}", .top = null, .refused = true },
+        .{ .body = "{\"logprobs\":true}", .top = null, .refused = true },
+        .{ .body = "{\"logprobs\":\"2\"}", .top = null, .refused = true },
+    };
+    for (legacy) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(c.refused, completionsFieldFault(parsed.value.object) != null);
+        if (!c.refused) try std.testing.expectEqual(c.top, if (completionsLogprobs(parsed.value.object)) |l| l.top else null);
     }
 }

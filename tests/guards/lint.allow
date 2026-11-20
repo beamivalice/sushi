@@ -76,4 +76,3 @@ promise-active src/model_load.zig:doLoadOnInferenceThread the load's decode prof
 request-bool-read src/responses_api.zig:renderResponsesToolsEcho echoes a tool's `strict` as null for another type; it reads nothing the request acts on
 request-bool-read src/server.zig:handleWebTools refuses a non-bool browse, vision and write by name before reading them
 request-bool-read src/server.zig:handleLoadModelStrict refuses a non-bool default by name before reading it
-request-bool-read src/server.zig:handleChatCompletions the logprobs flag, whose reader is the logprobs fix's

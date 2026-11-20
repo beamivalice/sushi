@@ -210,19 +210,8 @@ pub fn handleCompletions(
         return;
     }
 
-    // Legacy-completions `logprobs` is an INTEGER (how many alternatives per
-    // token), not chat's bool + `top_logprobs`. It was parsed nowhere and the
-    // handler passed a hardcoded 0 while still emitting a `logprobs` key — a
-    // silently ignored field, which reads to a client as "this model has no
-    // opinion" rather than "this server never asked".
-    const asked_logprobs: ?request_parse.Logprobs = if (root.get("logprobs")) |v| switch (v) {
-        .integer => |i| if (i >= 0 and i <= request_parse.MAX_TOP_LOGPROBS) .{ .top = std.math.cast(u32, i).? } else {
-            log.warn("POST /v1/completions -> 400 (logprobs out of range)\n", .{});
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'logprobs' must be an integer from 0 to 20", 400);
-            return;
-        },
-        else => null,
-    } else null;
+    // Legacy completions' `logprobs` is an INTEGER (alternatives per token), not chat's bool + `top_logprobs`.
+    const asked_logprobs = request_parse.completionsLogprobs(root);
     const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
 
     if (echoRejectReason(root)) |reason| {

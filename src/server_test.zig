@@ -2105,3 +2105,27 @@ test "server: logprobs on with no alternatives still list the sampled tokens, an
         }
     }.run);
 }
+
+test "server: a logprobs of the wrong type is refused by name on chat and completions, never read as off" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const Case = struct { path: []const u8, body: []const u8 };
+            const cases = [_]Case{
+                .{ .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"logprobs\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+                .{ .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"logprobs\":\"true\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+                .{ .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"logprobs\":true,\"prompt\":\"a long tale\"}" },
+                .{ .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"logprobs\":\"2\",\"prompt\":\"a long tale\"}" },
+            };
+            var bad: usize = 0;
+            for (cases) |c| {
+                const resp = try request("POST", c.path, c.body);
+                defer gpa.free(resp);
+                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 400") or std.mem.indexOf(u8, bodyOf(resp), "'logprobs'") == null) {
+                    std.debug.print("{s} {s}\n  -> {s}\n", .{ c.path, c.body, resp[0..@min(resp.len, 160)] });
+                    bad += 1;
+                }
+            }
+            if (bad > 0) return error.WrongTypeNotRefused;
+        }
+    }.run);
+}
