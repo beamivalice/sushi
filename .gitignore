@@ -3,9 +3,10 @@ zig-out/
 
 # Pinned Zig release, staged at build time by scripts/fetch-zig.sh (not vendored)
 /.zig-toolchain
-# .claude stays private (settings.local.json, locks) EXCEPT checked-in project skills
+# .claude stays private (settings.local.json, locks) EXCEPT checked-in project skills and agent definitions
 .claude/*
 !.claude/skills/
+!.claude/agents/
 /models/
 *.safetensors
 # ...except small hermetic TEST fixtures. The rule above exists to keep model

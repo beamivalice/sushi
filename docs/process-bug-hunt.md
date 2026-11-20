@@ -19,8 +19,8 @@ Rules: [CLAUDE.md](../CLAUDE.md#team-process). Tests and tiers: [testsuite](test
    state and lifecycle (orders of events, failed and repeated loads, models side by side), memory and long-lived
    state (pool, caps, bills against storage, caches, leaks), what is computed (kernels against a reference at edge
    shapes, determinism, rollback, sampling).
-3. **Hunters.** Reviewers at the strongest model and effort the owner allows, three unless the owner sets
-   otherwise, launched together. Each gets its own git worktree at the head (toolchain and `lib/mlx` linked from the
+3. **Hunters.** Three unless the owner sets otherwise, launched together; the agents, their models and the briefs
+   are in the `/hunt-fix` skill (`.claude/skills/hunt-fix/`). Each gets its own git worktree at the head (toolchain and `lib/mlx` linked from the
    main checkout) and its own temp directory. One wave per agent: a hunter that finishes its round, or a fixer its
    batch of findings, retires, and a fresh agent with a self-contained brief takes the next surface or batch.
 4. **Known list.** The brief names every defect already fixed or open, so a hunter spends its runs on new ones and

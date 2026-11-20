@@ -91,7 +91,8 @@ link to or quote them from a committed file.
 | `docs/private/fail/` | one file per failed experiment: the numbers that killed it, where its code lives |
 | `docs/private/hf-upload.md` | publishing a pack to Hugging Face: staging, card, upload, verification |
 
-Skills: `/release` (release order, gates, CHANGELOG, contributor credit), `/bench` (methodology, claim etiquette).
+Skills: `/release` (release order, gates, CHANGELOG, contributor credit), `/bench` (methodology, claim etiquette),
+`/hunt-fix` (a hunt and fix cycle: hunter, fixer and issue-fixer agents in `.claude/agents/`, briefs, review, landing).
 
 ## Stack and building
 
