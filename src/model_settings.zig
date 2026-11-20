@@ -488,6 +488,7 @@ pub const server_keys = [_]KeySpec{
     .{ .name = "port", .kind = .int, .min = 1, .max = 65535 },
     .{ .name = "max_request_mb", .kind = .int, .min = 1, .max = max_request_mb_limit },
     .{ .name = "wired_margin_gib", .kind = .int, .min = wired_margin_gib_min, .max = wired_margin_gib_max },
+    .{ .name = "continue_after_thought", .kind = .bool },
 };
 
 pub const server_section = "server";
@@ -802,6 +803,8 @@ pub const Server = struct {
     max_request_mb: ?u32 = null,
     /// GiB kept unplanned under the wired GPU limit (`--wired-margin-gib` outranks it).
     wired_margin_gib: ?u32 = null,
+    /// Continue once a reply whose turn ends inside its thought; null = the file says nothing (on).
+    continue_after_thought: ?bool = null,
 };
 
 /// An automatic network look is on unless `--no-update-check` or the file turns it off.
@@ -812,6 +815,11 @@ pub fn autoCheck(no_update_check: bool, file: ?bool) settings_resolve.Setting(bo
 /// The load-time memory check runs unless `--skip-mem-preflight` or the file turns it off.
 pub fn skipMemPreflight(flag: bool, file: ?bool) settings_resolve.Setting(bool) {
     return settings_resolve.resolve(bool, if (flag) true else null, file, false);
+}
+
+/// A reply whose turn ends inside its thought is continued unless `--no-continue-after-thought` or the file turns it off.
+pub fn continueAfterThought(no_flag: bool, file: ?bool) settings_resolve.Setting(bool) {
+    return settings_resolve.resolve(bool, if (no_flag) false else null, file, true);
 }
 
 /// The file's `"server"` section. `models_dir` borrows from `self`.
@@ -847,6 +855,9 @@ pub fn server(self: *const Settings) Server {
     };
     if (sec.get("wired_margin_gib")) |v| if (v == .integer and v.integer >= wired_margin_gib_min and v.integer <= wired_margin_gib_max) {
         out.wired_margin_gib = @intCast(v.integer);
+    };
+    if (sec.get("continue_after_thought")) |v| if (v == .bool) {
+        out.continue_after_thought = v.bool;
     };
     return out;
 }
@@ -938,6 +949,7 @@ pub const LaunchLocks = struct {
     skip_mem_preflight: Lock = .{},
     port: Lock = .{},
     wired_margin_gib: Lock = .{},
+    continue_after_thought: Lock = .{},
 
     pub fn model(self: *const LaunchLocks, name: []const u8) ?*const Lock {
         for (model_keys, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) return &self.models[i];

@@ -343,6 +343,7 @@ pub fn render(
     try writeToggle(w, "update_check", srv.update_check, &locks.update_check, true);
     try writeToggle(w, "pack_update_check", srv.pack_update_check, &locks.pack_update_check, true);
     try writeToggle(w, "skip_mem_preflight", srv.skip_mem_preflight, &locks.skip_mem_preflight, false);
+    try writeToggle(w, "continue_after_thought", srv.continue_after_thought, &locks.continue_after_thought, true);
     try w.writeAll(",\"max_request_mb\":{\"file\":");
     try writeJson(w, srv.max_request_mb);
     try w.print(",\"default\":{d},\"min\":1,\"max\":{d},\"source\":\"{s}\",\"locked\":false,\"applies\":\"applies at once to new requests; uploads already in progress keep their limit\"}}", .{
@@ -878,6 +879,7 @@ fn applyServerEdit(host: anytype, arena: std.mem.Allocator, locks: *const model_
     if (eql(u8, e.key, "prefix_cache_disk_gb")) return host.cacheBudget(e.value);
     if (eql(u8, e.key, "update_check") or eql(u8, e.key, "pack_update_check")) return applyUpdateCheck(locks, e.key, e.value);
     if (eql(u8, e.key, "skip_mem_preflight")) return applySkipMemPreflight(locks, e.value);
+    if (eql(u8, e.key, "continue_after_thought")) return applyContinueAfterThought(locks, e.value);
     if (eql(u8, e.key, "max_request_mb")) {
         server_state.setMaxRequestMb(if (e.value) |v| std.math.cast(u32, v.integer) orelse unreachable else null);
         return "applies to the next request";
@@ -956,7 +958,7 @@ test "settings api: every saved key is classified, and the ones a load reads cle
     for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" }) |key| {
         try std.testing.expect(reachesLoad(key));
     }
-    for ([_][]const u8{ "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb" }) |key| {
+    for ([_][]const u8{ "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "continue_after_thought" }) |key| {
         try std.testing.expect(!reachesLoad(key));
     }
     // A new key must be classified above before it ships.
@@ -973,7 +975,7 @@ test "settings api: only the two SSD size keys re-arm a declined SSD tier, and b
 }
 
 fn classified(key: []const u8) bool {
-    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "wired_margin_gib" };
+    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "wired_margin_gib", "continue_after_thought" };
     for (known) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
@@ -1029,6 +1031,13 @@ fn applyUpdateCheck(locks: *const model_settings.LaunchLocks, key: []const u8, v
 fn applySkipMemPreflight(locks: *const model_settings.LaunchLocks, value: ?std.json.Value) []const u8 {
     if (locks.skip_mem_preflight.set) return "saved; --skip-mem-preflight still skips the check until a start without it";
     scheduler.setSkipMemPreflight(if (value) |v| v.bool else false);
+    return "applies at once";
+}
+
+/// The next reply to end inside its thought reads the published value; null (key removed) is the default, on.
+fn applyContinueAfterThought(locks: *const model_settings.LaunchLocks, value: ?std.json.Value) []const u8 {
+    if (locks.continue_after_thought.set) return "saved; --no-continue-after-thought still keeps it off until a start without it";
+    server_state.setContinueAfterThought(if (value) |v| v.bool else true);
     return "applies at once";
 }
 
@@ -1276,6 +1285,56 @@ test "settings api: render reports skip_mem_preflight off by default, with the f
     try testing.expectEqualStrings("flag", o.get("source").?.string);
     try testing.expect(o.get("locked").?.bool);
     try testing.expectEqualStrings("--skip-mem-preflight", o.get("flag").?.string);
+}
+
+test "settings api: continue_after_thought is on by default, takes a boolean or null at once, and the flag keeps it off" {
+    defer server_state.setContinueAfterThought(true);
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
+    var locks: model_settings.LaunchLocks = .{};
+    for ([_]struct { file: []const u8, source: []const u8 }{
+        .{ .file = "{}", .source = "default" },
+        .{ .file = "{\"server\": {\"continue_after_thought\": false}}", .source = "file" },
+    }) |c| {
+        var file = try model_settings.parse(testing.allocator, c.file);
+        defer file.deinit();
+        const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+        defer testing.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        const o = parsed.value.object.get("server").?.object.get("continue_after_thought").?.object;
+        try testing.expect(o.get("default").?.bool);
+        try testing.expectEqualStrings(c.source, o.get("source").?.string);
+        try testing.expect(!o.get("locked").?.bool);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expect(!parseRequest(arena_state.allocator(), "{\"server\":{\"continue_after_thought\":false}}").ok.server_edits[0].value.?.bool);
+    try testing.expect(parseRequest(arena_state.allocator(), "{\"server\":{\"continue_after_thought\":null}}").ok.server_edits[0].value == null);
+    try expectRejected("{\"server\":{\"continue_after_thought\":\"off\"}}", 400, "invalid_setting");
+    try expectRejected("{\"server\":{\"continue_after_thought\":0}}", 400, "invalid_setting");
+    try testing.expectEqualStrings("applies at once", applyContinueAfterThought(&locks, .{ .bool = false }));
+    try testing.expect(!server_state.continueAfterThought());
+    _ = applyContinueAfterThought(&locks, null);
+    try testing.expect(server_state.continueAfterThought());
+
+    // The launch flag outranks the file: off whatever was saved, and a save under it is kept, not applied.
+    try testing.expect(!model_settings.continueAfterThought(true, true).value);
+    try testing.expect(model_settings.continueAfterThought(false, null).value);
+    try testing.expect(!model_settings.continueAfterThought(false, false).value);
+    server_state.setContinueAfterThought(false);
+    locks.continue_after_thought.pin("--no-continue-after-thought", .{});
+    try testing.expect(std.mem.startsWith(u8, applyContinueAfterThought(&locks, .{ .bool = true }), "saved; --no-continue-after-thought"));
+    try testing.expect(!server_state.continueAfterThought());
+    var empty = try model_settings.parse(testing.allocator, "{\"server\": {\"continue_after_thought\": true}}");
+    defer empty.deinit();
+    const body = try render(testing.allocator, "/h/s.json", &empty, &.{}, &locks, view);
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object.get("server").?.object.get("continue_after_thought").?.object;
+    try testing.expectEqualStrings("flag", o.get("source").?.string);
+    try testing.expect(o.get("locked").?.bool);
+    try testing.expectEqualStrings("--no-continue-after-thought", o.get("flag").?.string);
 }
 
 test "settings api: request size limit accepts MiB or null and rejects invalid values" {

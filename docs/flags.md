@@ -29,6 +29,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--gpu-warm-secs` | `60` → keep the GPU awake this long after a request (main.zig:953) | machine | help, server-lifecycle; 0 tests | keep: a power-against-latency choice |
 | `--no-tool-autocorrect` | off → stop coercing tool-call arguments to the schema's types; a tag dialect's values then ship as strings (main.zig:706) | dev | help, server-tool-calling; 0 tests | cut: kill switch of an adopted default, no test, no measurement |
 | `--no-update-check` | off → never ask GitHub for a newer release or Hugging Face for a pack revision; pins the settings keys `server.update_check` and `server.pack_update_check` off, reported locked (main.zig:818) | operator | help, server-lifecycle; 3 tests | keep |
+| `--no-continue-after-thought` | off → a reply that ends its turn with only its thinking (no answer, no tool call) is returned as it is, not continued once after its closed think block; settings twin `server.continue_after_thought` (Settings › Replies, on by default), the flag pins it off, locked | operator | help, server-tool-calling; settings api and served tests | keep: owner's switch for 1.7.2 |
 
 ## Model, memory and context
 

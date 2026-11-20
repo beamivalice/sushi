@@ -35,7 +35,7 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **A reply whose turn ends inside its thinking is continued once**: a model that wrote its end-of-turn token inside its
   thought returned a reply with no answer and no tool call, which an agent took as an empty turn; sushi now closes the
   thought and lets it continue once on Chat, Messages and Responses, and says so in `finish_details` (`stop_details` on
-  `/v1/messages`).
+  `/v1/messages`). Settings › Replies, or `--no-continue-after-thought`, turns it off.
 - **A reply holding only its thought can be continued**: `continue_final_message` on Chat, and a trailing assistant
   message on `/v1/messages`, rendered a reply of `reasoning_content` alone as history and opened a new turn after it; it
   now resumes after its thought, closed once in the template's think block, and a thought sent in `content` with its

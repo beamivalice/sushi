@@ -288,6 +288,7 @@ fn runCli(init: std.process.Init) !void {
     var parent_pid: ?std.posix.pid_t = null;
     var no_update_check = false;
     var skip_mem_preflight = false;
+    var no_continue_after_thought = false;
     var serve_mode = false;
     var serve_explicit = false;
     var stream_mode = false;
@@ -452,6 +453,8 @@ fn runCli(init: std.process.Init) !void {
             sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             skip_mem_preflight = true;
+        } else if (std.mem.eql(u8, args[i], "--no-continue-after-thought")) {
+            no_continue_after_thought = true;
         } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
             server_state.g_tool_autocorrect = false;
         } else if (cli_mod.isNoMtpLookupFlag(args[i])) {
@@ -741,6 +744,7 @@ fn runCli(init: std.process.Init) !void {
         .models_dir = models_root,
         .no_update_check = no_update_check,
         .skip_mem_preflight = skip_mem_preflight,
+        .no_continue_after_thought = no_continue_after_thought,
         .port = port_flag,
     });
     if (dflash_mod.drafter_min_depth) |lo| if (dflash_mod.drafter_max_depth) |hi| if (lo > hi) {
@@ -867,6 +871,7 @@ fn runCli(init: std.process.Init) !void {
         scheduler_mod.setSkipMemPreflight(model_settings_mod.skipMemPreflight(skip_mem_preflight, srv.skip_mem_preflight).value);
         server_state.setMaxRequestMb(srv.max_request_mb);
         server_state.setWiredMarginFile(srv.wired_margin_gib);
+        server_state.setContinueAfterThought(model_settings_mod.continueAfterThought(no_continue_after_thought, srv.continue_after_thought).value);
         const serving = serve_mode and prompt == null and bench_run == null;
         if (serving) update_mod.startDailyCheck(io, no_update_check, srv.update_check);
         cli_mod.configurePackUpdates(io, serving and !no_update_check, model_settings_mod.autoCheck(no_update_check, srv.pack_update_check).value);
@@ -1527,7 +1532,7 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
 /// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
-fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool, skip_mem_preflight: bool = false, port: ?u16 = null }) void {
+fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool, skip_mem_preflight: bool = false, no_continue_after_thought: bool = false, port: ?u16 = null }) void {
     const locks = &model_settings_mod.launch_locks;
     if (given.ctx_size > 0) locks.modelMut("ctx_size").pin("{d}", .{given.ctx_size});
     if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
@@ -1551,6 +1556,7 @@ fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bo
     if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
     if (given.port) |p| locks.port.pin("{d}", .{p});
     if (given.skip_mem_preflight) locks.skip_mem_preflight.pin("--skip-mem-preflight", .{});
+    if (given.no_continue_after_thought) locks.continue_after_thought.pin("--no-continue-after-thought", .{});
     if (given.no_update_check) {
         locks.update_check.pin("--no-update-check", .{});
         locks.pack_update_check.pin("--no-update-check", .{});

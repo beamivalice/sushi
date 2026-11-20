@@ -50,6 +50,7 @@ function makeServer(opts = {}) {
       update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
       pack_update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
       skip_mem_preflight: { file: null, flag: null, default: false, source: 'default', locked: false, applies: 'applies at once' },
+      continue_after_thought: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
       port: { file: null, flag: null, default: 12345, source: 'default', locked: false, applies: 'the next start; a running server keeps its port' },
       wired_margin_gib: { file: null, flag: null, default: 1, min: 1, max: 32, source: 'default', locked: false, applies: 'applies at once: the next request and the next load use it' },
       max_request_mb: { file: null, default: 128, min: 1, max: 1024, source: 'default', locked: false, applies: 'applies at once to new requests; uploads already in progress keep their limit' },
@@ -1103,6 +1104,27 @@ async function main() {
       await page.waitForFunction(() => document.querySelector('.set[data-key="skip_mem_preflight"] button[data-value="true"]').getAttribute('aria-pressed') === 'true');
       assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { skip_mem_preflight: true } });
       assert.match(await row.locator('.badges').textContent(), /Now/);
+    });
+    await scenario('the continue-after-thought switch defaults to On, says what it does, and saves Off', { path: '/settings', open: { mode: 'advanced' } }, async ({ page, server }) => {
+      await page.waitForSelector('.set[data-key="continue_after_thought"]');
+      const row = page.locator('.set[data-key="continue_after_thought"]');
+      assert.equal(await row.locator('.lab > .tip-u').textContent(), 'Continue a reply that ends its turn with only its thinking');
+      assert.match(await row.locator('.lab > .tip-u').getAttribute('data-term'), /continue_after_thought.*--no-continue-after-thought/);
+      assert.equal(await row.locator('.help').textContent(), 'When a model ends its turn with its thinking and no answer or tool call, sushi closes the thought and lets it continue once, so agents do not receive an empty turn. On by default.');
+      assert.equal(await row.locator('button[data-value="null"]').textContent(), 'Default (On)');
+      assert.equal(await row.locator('button[data-value="null"]').getAttribute('aria-pressed'), 'true');
+      await row.locator('button[data-value="false"]').click();
+      await page.waitForFunction(() => document.querySelector('.set[data-key="continue_after_thought"] button[data-value="false"]').getAttribute('aria-pressed') === 'true');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { continue_after_thought: false } });
+    });
+    await scenario('--no-continue-after-thought locks the continue-after-thought switch off', { path: '/settings', setup: (s) => {
+      Object.assign(s.state.server.continue_after_thought, { flag: '--no-continue-after-thought', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector('.set[data-key="continue_after_thought"]');
+      const row = page.locator('.set[data-key="continue_after_thought"]');
+      assert.equal(await row.locator('button[data-value="true"]').isDisabled(), true);
+      assert.equal(await row.locator('button[data-value="false"]').getAttribute('aria-pressed'), 'true');
+      assert.match(await row.textContent(), /Set by --no-continue-after-thought at launch/);
     });
     await scenario('--skip-mem-preflight locks the memory-check switch on', { path: '/settings', setup: (s) => {
       Object.assign(s.state.server.skip_mem_preflight, { flag: '--skip-mem-preflight', source: 'flag', locked: true });

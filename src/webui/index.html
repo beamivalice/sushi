@@ -1039,6 +1039,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       <div class="card-h">HTTP requests</div>
       <div class="card-b"><div id="requestSet"></div></div>
     </section>
+    <section class="card" id="repliesCard" hidden>
+      <div class="card-h">Replies</div>
+      <div class="card-b"><div id="thoughtSet"></div></div>
+    </section>
     <section class="card" id="memoryCard" hidden>
       <div class="card-h">Memory</div>
       <div class="card-b"><div id="memorySet"></div></div>
@@ -3692,7 +3696,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
   const isOff = (flag) => flag === "off" || flag === "false" || flag === "--ds41-mlx-engine" || flag === "--qwen-mlx-engine" || /^--no-/.test(flag);
   // The server may send a flag's whole spelling ("--qwen-mlx-engine") or just its value ("8").
-  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check", skip_mem_preflight: "--skip-mem-preflight", wired_margin_gib: "--wired-margin-gib" }[key] ?? "";
+  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check", skip_mem_preflight: "--skip-mem-preflight", wired_margin_gib: "--wired-margin-gib", continue_after_thought: "--no-continue-after-thought" }[key] ?? "";
   // The model-settings.json key beside its launch flag, after any engineering name the plain label replaced.
   const keyTerm = (key, eng = KEY[key]?.[4]) => `${[eng, key].filter(Boolean).join(", ")}${flagName(key) ? ` (${flagName(key)})` : ""}`;
   const flagText = (key, flag) => /^--/.test(flag) ? flag : key === "mtp" || key === "vision" ? flagName(key).replace("--", isOff(flag) ? "--no-" : "--") : flagName(key) ? `${flagName(key)} ${flag}` : "";
@@ -4342,6 +4346,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Off stops automatic checks; a check you start yourself still runs.", "When a newer sushi is out, a banner offers it. Nothing installs without you."],
     ["pack_update_check", "packUpdateSet", "Model packs", "Look for a newer revision of each model pack on Hugging Face once a day. Off stops automatic checks, the Available list's included; Check again on Available still looks.", "A model with a newer version gets a note on Models. Nothing downloads without you."],
     ["skip_mem_preflight", "memorySet", "Skip the memory check before loading", "Load a model even when sushi thinks there is not enough free memory. The check is cautious and can refuse a model that would fit. If the model really does not fit, the Mac can run out of memory: sushi may crash or the system may stall.", "Turn this on only if a model you know fits is refused with \"Not enough free memory\". If it does not fit, the Mac can run out of memory: sushi may crash or the whole system may stall. Applies to the next load."],
+    ["continue_after_thought", "thoughtSet", "Continue a reply that ends its turn with only its thinking", "When a model ends its turn with its thinking and no answer or tool call, sushi closes the thought and lets it continue once, so agents do not receive an empty turn. On by default.", "The reply says so beside its finish (finish_details, or stop_details on /v1/messages). Off returns the thought alone, as the model left it."],
   ].map(([key, slot, label, help, tip]) => {
     const row = setRow(key, label, null, tip, keyTerm(key));
     const btns = [[null, "Default"], [true, "On"], [false, "Off"]].map(([value, text]) => h("button", { type: "button", "data-value": String(value), text, onclick: async (e) => {
@@ -4534,7 +4539,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const s = A.settings, c = A.cache;
     if (!s) return;
     setHidden(q("settingsSkel"), true);
-    for (const id of ["cacheCard", "portCard", "requestCard", "memoryCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
+    for (const id of ["cacheCard", "portCard", "requestCard", "repliesCard", "memoryCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
     for (const id of ["secStorage", "secServer"]) setHidden(q(id), false);
     renderWired();
     if (s.server.wired_margin_gib) renderMargin(s.server.wired_margin_gib);
@@ -4678,7 +4683,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
     const off = !!msg && !!A.settings;
-    for (const id of ["modelsMd", "wiredCard", "cacheCard", "effortCard", "portCard", "requestCard", "memoryCard", "updatesCard", "aboutCard"]) {
+    for (const id of ["modelsMd", "wiredCard", "cacheCard", "effortCard", "portCard", "requestCard", "repliesCard", "memoryCard", "updatesCard", "aboutCard"]) {
       q(id).classList.toggle("stale-view", off);
       if (q(id).inert !== off) q(id).inert = off;
     }
