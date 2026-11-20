@@ -41,6 +41,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **Stopping the server no longer waits on a client that keeps sending**: a chunked upload of bare carriage returns or a
   WebSocket message of empty fragments was read forever, past the size limit and past a shutdown, after which the
   server exited with an error; both now end at the limit, and a shutdown ends every read at once.
+- **A request head the HTTP grammar does not allow is a 400**: a field with whitespace before its colon, a folded line or a
+  bare LF was read without its `Content-Length`, so an unload acted on the default model; a chunk size with a sign or
+  `_` was read as a number.
 - **A request whose `Content-Length` has no space after its colon is read with its body**: `Content-Length:17` (or a
   tab, or trailing whitespace) read as no body, so an unload or load acted on the default model instead of the one it
   named; an unreadable or conflicting length or transfer coding is now a 400.

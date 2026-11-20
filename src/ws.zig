@@ -248,11 +248,7 @@ pub fn computeAccept(out: *[28]u8, key: []const u8) void {
 
 /// Returns true if the given headers represent a WebSocket upgrade request.
 pub fn isUpgrade(headers: []const u8) bool {
-    const upg = http_head.value(headers, "Upgrade") orelse return false;
-    const conn = http_head.value(headers, "Connection") orelse return false;
-    if (std.ascii.findIgnoreCase(upg, "websocket") == null) return false;
-    if (std.ascii.findIgnoreCase(conn, "upgrade") == null) return false;
-    return true;
+    return http_head.hasToken(headers, "upgrade", "websocket") and http_head.hasToken(headers, "connection", "upgrade");
 }
 
 /// Perform the server-side handshake. Writes the 101 response.

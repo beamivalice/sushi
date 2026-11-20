@@ -746,8 +746,9 @@ const ChunkDecoder = struct {
             switch (d.state) {
                 .size => {
                     const text = d.line[0..d.line_len];
-                    const hex = std.mem.trim(u8, text[0 .. std.mem.indexOfScalar(u8, text, ';') orelse text.len], " \t");
-                    const size = std.fmt.parseInt(usize, hex, 16) catch return error.BadChunk;
+                    // chunk-size = 1*HEXDIG, then optional whitespace only before an extension's ';' (RFC 9112 §7.1).
+                    const hex = if (std.mem.indexOfScalar(u8, text, ';')) |semi| std.mem.trimEnd(u8, text[0..semi], " \t") else text;
+                    const size = http_head.digits(hex, 16) orelse return error.BadChunk;
                     d.line_len = 0;
                     d.remaining = size;
                     d.state = if (size == 0) .trailer else .data;
@@ -875,6 +876,10 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
     };
     const head = hdr_buf[0..header_end_pos];
     noteRequestLine(stream, head);
+    http_head.check(head) catch {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "The request head is malformed: a request line, a field line or a line end the HTTP/1.1 grammar does not allow", 400);
+        return .bad_framing;
+    };
     const max_request_bytes = server_state.max_request_bytes.load(.monotonic);
 
     const length = switch (http_head.framing(head) catch |err| switch (err) {
@@ -3016,6 +3021,62 @@ test "read: chunk-size lines (extensions) count toward the request cap, so raw b
         std.debug.print("chunk extensions: {d} raw bytes under a 4096 B cap routed as a request of {d} B (body {d} B)\n", .{ sent.items.len, r.len orelse 0, r.body.len });
         return error.RawBytesUncapped;
     }
+}
+
+fn statusLineOf(reply: []const u8) []const u8 {
+    return reply[0..@min(reply.len, std.mem.indexOf(u8, reply, "\r\n") orelse reply.len)];
+}
+
+test "read: a field name with whitespace before its colon, a folded line or a bare LF is a 400, never a body dropped" {
+    // RFC 9112 §5.1: whitespace between a field name and its colon MUST be a 400. §5.2: an obs-fold MUST be a 400 or
+    // read as SP ("1 6" is then no number, a 400). §2.2: a bare LF may end a line (then Content-Length is 16) or be
+    // refused. The contract of the h15-1 test: routed with its whole body, or refused 400; never routed with it dropped.
+    const body = "{\"model\":\"tiny\"}";
+    var bad: usize = 0;
+    for ([_][]const u8{
+        "POST /v1/load-model HTTP/1.1\r\nContent-Length : 16\r\n\r\n" ++ body,
+        "POST /v1/load-model HTTP/1.1\r\nContent-Length\t: 16\r\n\r\n" ++ body,
+        "POST /v1/load-model HTTP/1.1\r\nContent-Length: 1\r\n 6\r\n\r\n" ++ body,
+        "POST /v1/load-model HTTP/1.1\r\nContent-Length: 1\r\n\t6\r\n\r\n" ++ body,
+        "POST /v1/load-model HTTP/1.1\r\nHost: x\nContent-Length: 16\r\n\r\n" ++ body,
+        "POST /v1/load-model HTTP/1.1\r\nTransfer-Encoding : chunked\r\n\r\n10\r\n" ++ body ++ "\r\n0\r\n\r\n",
+        "POST /v1/load-model HTTP/1.1\r\nHost: x\nTransfer-Encoding: chunked\r\n\r\n10\r\n" ++ body ++ "\r\n0\r\n\r\n",
+    }) |sent| {
+        const r = try readAgainst(.{ .sent = sent, .limit_ms = 500 });
+        defer freeRead(r);
+        const whole = r.outcome == .request and std.mem.eql(u8, r.body, body);
+        const refused = std.mem.startsWith(u8, r.reply, "HTTP/1.1 400 ");
+        if (!whole and !refused) {
+            const he = std.mem.indexOf(u8, sent, "\r\n\r\n").?;
+            std.debug.print("head '{f}': outcome={s} routed body='{s}' ({d} B) reply='{s}'\n", .{ std.zig.fmtString(sent[30..he]), if (r.outcome) |x| @tagName(x) else "none", r.body, r.body.len, statusLineOf(r.reply) });
+            bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "read: a chunk size is hex digits alone: a sign, an underscore or a negative zero is a 400" {
+    // RFC 9112 §7.1: chunk-size = 1*HEXDIG. The sibling rule http_head took for Content-Length ("1_6" and "+16" are a
+    // 400, its own test): Zig's parseInt also reads '+', '_' and "-0".
+    const body = "{\"model\":\"tiny\"}";
+    var bad: usize = 0;
+    for ([_][]const u8{
+        "+10\r\n" ++ body ++ "\r\n0\r\n\r\n",
+        "1_0\r\n" ++ body ++ "\r\n0\r\n\r\n",
+        "10\r\n" ++ body ++ "\r\n-0\r\n\r\n",
+        "10\r\n" ++ body ++ "\r\n+0\r\n\r\n",
+        "0_10\r\n" ++ body ++ "\r\n0\r\n\r\n",
+    }) |chunks| {
+        const whole = try std.mem.concat(std.testing.allocator, u8, &.{ chunked_head, chunks });
+        defer std.testing.allocator.free(whole);
+        const r = try readAgainst(.{ .sent = whole, .limit_ms = 500 });
+        defer freeRead(r);
+        if (!std.mem.startsWith(u8, r.reply, "HTTP/1.1 400 ")) {
+            std.debug.print("chunks '{f}': outcome={s} routed body='{s}' reply='{s}'\n", .{ std.zig.fmtString(chunks[0..@min(chunks.len, 8)]), if (r.outcome) |x| @tagName(x) else "none", r.body, statusLineOf(r.reply) });
+            bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
 }
 
 /// A chunked body of `total` bytes in chunks of `size` (one or two hex digits), after `chunked_head`.

@@ -1874,3 +1874,34 @@ test "server: an unload whose Content-Length has no space after its colon unload
         }
     }.run);
 }
+
+test "server: an unload whose Content-Length has whitespace before its colon, is folded or follows a bare LF unloads the model it names, or is refused" {
+    // RFC 9112 §5.1 (whitespace before the colon: MUST 400), §5.2 (obs-fold: 400 or SP), §2.2 (bare LF: a line end or
+    // refused). The contract of h15-1's served test: unloads the model it names, or a 400, never another.
+    try eachArch(4, .{ .tiny2 = true }, struct {
+        fn run() !void {
+            var bad: usize = 0;
+            for ([_][]const u8{
+                "Content-Length : 17\r\n",
+                "Content-Length\t:17\r\n",
+                "Content-Length: 1\r\n 7\r\n",
+                "X-A: b\nContent-Length: 17\r\n",
+            }) |field| {
+                gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
+                gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
+                const before = .{ modelState("tiny"), modelState("tiny2") };
+                const sent = try std.mem.concat(gpa, u8, &.{ "POST /v1/unload-model HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n", field, "\r\n{\"model\":\"tiny2\"}" });
+                defer gpa.free(sent);
+                const answer = try rawExchange(sent);
+                defer gpa.free(answer);
+                const after = .{ modelState("tiny"), modelState("tiny2") };
+                const refused = std.mem.startsWith(u8, answer, "HTTP/1.1 400 ");
+                if (!refused and (after[0] != before[0] or after[1] == before[1])) {
+                    std.debug.print("unload of tiny2 by '{f}': before tiny={s} tiny2={s}, after tiny={s} tiny2={s}; answer: {s}\n", .{ std.zig.fmtString(field), @tagName(before[0]), @tagName(before[1]), @tagName(after[0]), @tagName(after[1]), answer[0..@min(answer.len, 200)] });
+                    bad += 1;
+                }
+            }
+            if (bad != 0) return error.BodyDroppedWrongModel;
+        }
+    }.run);
+}
