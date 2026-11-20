@@ -63,6 +63,7 @@ an unloaded qwen4 stub is text-only only when the checkpoint must stream
 applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the checkpoint ships no generation_config
 bf16 slab kernels hold parity at the Qwen3.8-Flash-Next expert geometry
 capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS_DIR): the layer-streamed capture of a real four-layer slice reproduces the full forward's hidden boundaries, MLP input rows, routing and Hessians
+capture: a calibration window's forward runs on the cut Qwen pack, bound at the window's rows (QWEN4_TEST_MODEL)
 characterization: a sidecar boot's width-trial SCHEDULE re-reads its period like qwen4
 chat: Qwen's late-system edit reaches only a Qwen-typed config, never another arch's or an untyped one
 chat: the embedded V4.1 template renders through the template engine byte-exact with DeepSeek's encoder
@@ -78,6 +79,7 @@ cooler contract: a DeepSeek request admitted while an earlier borrower's pools s
 cooler contract: a DeepSeek request cancelled as its prefill ends, its cleanup run after the next request took the state, gives its continuation what a cleanup run first does, from RAM or the SSD tier
 cooler contract: a DeepSeek request committed after another took the state publishes no record over that state
 cooler contract: a Qwen prompt that re-renders an earlier reply restores from that turn's own point, written when the held points pass the cap
+cooler contract: a Qwen request reaching generate as one token holds no more cache rows than its bill, on Cooler and on MLX
 cooler contract: a held Qwen restore point another conversation pushes out of RAM is written, not dropped, and restores
 cooler contract: a held Qwen restore point restores the same tokens as its file after a flush
 cooler contract: a held Qwen restore point whose write fails as it gives way to a staged write mid-commit leaves no listed point without bytes
@@ -141,6 +143,7 @@ fusedSdpaPrefill: qk 192 / v 128 causal parity vs fp32 truth (MiMo global geomet
 glm5 replay: what the next prompt shares with a generated turn (GLM-5.3 tokenizer.json, real template)
 grok config.toml for GLM: chat completions at the server, advertised budgets, only accepted efforts
 kld: --qwen-gdn 16 stores the GDN state in bf16, 32 is the default width
+kld: a capture and a compare run on the cut Qwen pack, each pass bound at the rows it writes (QWEN4_TEST_MODEL)
 kv6 is a first-class wire value: parsed, named and served by GLM's latent backend
 layout resolution is qwen4_exp only: the same index declares nothing for another arch
 list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.75bpw recommended
