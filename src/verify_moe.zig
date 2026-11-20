@@ -447,10 +447,16 @@ pub fn verifyIndexedExpertInput(s: mlx.mlx_stream, x: mlx.mlx_array, lhs: mlx.ml
     return view;
 }
 
+/// The rows of the joined group the inference thread is running: 1 outside one.
+pub var group_rows: usize = 1;
+
 pub fn verifySharedHardware() bool {
-    if (!verifyQmmNaxAvailable()) return false;
-    const p = device.current();
-    return p.generation == 17 and p.class != .d;
+    return verifyQmmNaxAvailable() and verifySharedOn(device.current(), group_rows);
+}
+
+/// The fused verify kernels need an M5 GPU. On the Ultra's two dies they lift a joined group and slow a lone row.
+fn verifySharedOn(p: device.Profile, rows: usize) bool {
+    return p.generation == 17 and (p.class != .d or rows >= 2);
 }
 
 pub const VerifyProjectionKind = enum { shared, gdn, lm_head, attention };
@@ -762,6 +768,16 @@ test "qmatmulBits dispatches to plain matmul when scales has null ctx (Unsloth D
     // (w transposed from [[0,1,2,3],[4,5,6,7]] gives w_t = [[0,4],[1,5],[2,6],[3,7]])
     try testing.expectApproxEqAbs(@as(f32, 14.0), data[0], 1e-3);
     try testing.expectApproxEqAbs(@as(f32, 38.0), data[1], 1e-3);
+}
+
+test "the fused verify kernels serve every M5 at any group and the Ultra in a joined group only, and no earlier generation" {
+    const os: device.Os = .{ .major = 26, .minor = 2 };
+    for ([_][]const u8{ "applegpu_g17g", "applegpu_g17s", "applegpu_g17c" }) |arch| for ([_]usize{ 1, 2, 4 }) |rows|
+        try testing.expect(verifySharedOn(device.Profile.from(arch, os, false), rows));
+    const ultra = device.Profile.from("applegpu_g17d", os, false);
+    try testing.expect(!verifySharedOn(ultra, 1));
+    for ([_]usize{ 2, 4, 8 }) |rows| try testing.expect(verifySharedOn(ultra, rows));
+    for ([_][]const u8{ "applegpu_g16s", "applegpu_g15d" }) |arch| try testing.expect(!verifySharedOn(device.Profile.from(arch, os, false), 4));
 }
 
 test "verify shared projection preserves solo qmv values across request widths" {

@@ -95,6 +95,7 @@ const capturePrefillHiddenLast = trunk_mod.capturePrefillHiddenLast;
 const constTableAs = trunk_mod.constTableAs;
 const decodeProfileEnabled = trunk_mod.decodeProfileEnabled;
 const decodeRowsProjection = trunk_mod.decodeRowsProjection;
+const verify_moe = @import("../verify_moe.zig");
 const diagEnvOn = trunk_mod.diagEnvOn;
 const diagEnvOnCached = trunk_mod.diagEnvOnCached;
 const fusedSdpa256Masked = qwen4_qsa_gather.fusedSdpa256Masked;
@@ -1726,6 +1727,8 @@ pub fn forwardQwen4DecodeRows(
         qwen4_rows_logged = true;
         log.info("[batched] qwen4 per-row decode engaged (slots={d})\n", .{n});
     }
+    verify_moe.group_rows = n;
+    defer verify_moe.group_rows = 1;
     const cfg = &self.config;
     const layers = self.moe_layers.?;
     const hc: c_int = @intCast(cfg.hc_count);
