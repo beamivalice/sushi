@@ -499,6 +499,8 @@ pub const SsdBudgetChoice = struct {
     setting_ignored: bool,
     /// The `iogpu.wired_limit_mb` that earned a 128 GB Mac the larger default; 0 = none did.
     wired_limit_mb: u64 = 0,
+    /// The RAM default holds every routed expert resident (a 192 or 256 GB Mac).
+    resident: bool = false,
 };
 
 /// The launch flag wins over the per-model setting; a non-streaming model ignores the
@@ -727,7 +729,7 @@ pub fn withRamDefault(io: std.Io, allocator: std.mem.Allocator, config: *const M
     const d = ramDefaultFor(io, allocator, config, model_dir, tier.?, load_vision, assistant_bytes, true);
     var buf: [256]u8 = undefined;
     if (d.bound_by.len > 0) log.warn("{s}\n", .{stepDownLine(&buf, d)});
-    return .{ .bytes = d.bytes, .origin = .ram_default, .setting_ignored = false, .wired_limit_mb = d.wired_limit_mb };
+    return .{ .bytes = d.bytes, .origin = .ram_default, .setting_ignored = false, .wired_limit_mb = d.wired_limit_mb, .resident = d.resident };
 }
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread

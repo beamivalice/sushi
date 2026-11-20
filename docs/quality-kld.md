@@ -115,7 +115,7 @@ main and for the reordered trunk rows) and is gated by the f32-truth bars and th
 
 `--layer-major --tokens 1 --no-template` on a `deepseek_v41` checkpoint (`kld_capture.zig`) runs W windows through
 layer 0, then layer 1, and so on, with one pinned union of the layer's 384 FP4 experts per batch
-(`dsv41_stream.Stream.pin`, `--ssd-budget-gb` sizes W: the cache itself stays at its two-slot floor). A window is one
+(`dsv41_stream.Stream.pin`, the budget sizes W: the cache itself stays at its two-slot floor). The budget is `--ssd-budget-gb`, else the setting, else serve's RAM default through `model_load.withRamDefault` (a resident default sizes W as an explicit budget of its size would); a default that buys no window, or a box outside the tiers, is refused before the load with `--ssd-budget-gb <GB>` named. A window is one
 forward of at most 2048 rows (longer ones run in 2048-row chunks, each layer over all its chunks in order); the layer step
 is the model's own (`dsv41_model.passLayer`, the same code `extendSpan` loops), so the standard fixture (`prompts/NN_id`,
 `baseline.json`) is the window-major capture's byte for byte. It also writes, in `<out>/calib/`, what a quantizer needs:

@@ -33,6 +33,8 @@ const trunk_mod = @import("../trunk.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const expert_stream = @import("../expert_stream.zig");
 const util = @import("../kld_capture_util.zig");
+const model_load = @import("../model_load.zig");
+const log = @import("../log.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const A = sc_mod.A;
@@ -88,7 +90,7 @@ pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
     if (opts.hidden_out.len > 0) return error.Dsv41HiddenCaptureUnsupported;
     if (opts.imatrix_windows != 0) return error.Dsv41ImatrixWindowsUnsupported;
     if (opts.tokens != 1) return error.Dsv41LayerMajorNeedsOneRow;
-    if (!opts.no_template or opts.ssd_budget_bytes == 0 or opts.pick_tolerance != 0 or (opts.mtp orelse false) or opts.wired_margin_bytes != 0) return error.Dsv41CaptureNeedsLosslessStreaming;
+    if (!opts.no_template or opts.pick_tolerance != 0 or (opts.mtp orelse false) or opts.wired_margin_bytes != 0) return error.Dsv41CaptureNeedsLosslessStreaming;
     return true;
 }
 
@@ -98,14 +100,15 @@ pub fn tryRun(a: std.mem.Allocator, io: std.Io, opts: kld.Options, out: *kld.Out
     defer cfg.deinit(a);
     if (!try accepts(&cfg, opts)) return false;
     _ = try modeFromEnv();
-    const dc = cfg.dsv41.?;
     // The batch pins one layer's whole union at a time, so the cache itself stays at its two-slot floor.
     const floor = try captureFloor(io, a, &cfg, opts.model_dir);
     const load = loadOptions(opts, floor);
-    const batch = if (opts.batch_windows != 0) opts.batch_windows else try batchWindows(&dc, opts.ssd_budget_bytes, floor, chunk_rows);
+    const sizing = try sizeBatch(io, a, &cfg, opts, floor, model_load.ramDefaultTierFor(&cfg));
+    var origin_buf: [160]u8 = undefined;
+    log.info("{s}; {d} windows per batch\n", .{ model_load.budgetOriginLine(&origin_buf, sizing.budget, sizing.budget.resident), sizing.batch });
     const loaded = try kld.loadModel(io, a, load);
     defer loaded.deinit();
-    try runLoaded(a, io, loaded, opts, batch, chunk_rows, out);
+    try runLoaded(a, io, loaded, opts, sizing.batch, chunk_rows, out);
     return true;
 }
 
@@ -152,13 +155,50 @@ fn carriedPerWindow(dc: *const dsv_cfg.Config, rows: usize) u64 {
         r * dc.index_topk * 4 + r * dc.engram.n * dc.engram.cols() * 4;
 }
 
+/// What a batch holds beside the floor whatever its window count: the chunk workspace, the trunk sums and a 2 GiB margin.
+fn batchReserve(dc: *const dsv_cfg.Config, rows: usize) u64 {
+    return dc.chunkCap(chunk_rows, rows) + sumsBytes(dc) + (2 << 30);
+}
+
+/// The least budget that buys a batch of one window.
+fn minBudget(dc: *const dsv_cfg.Config, floor: u64, rows: usize) u64 {
+    return floor + batchReserve(dc, rows) + carriedPerWindow(dc, rows);
+}
+
 /// The largest batch, at most `batch_cap` windows of `rows` tokens, that fits `budget`.
 pub fn batchWindows(dc: *const dsv_cfg.Config, budget: u64, floor: u64, rows: usize) !u32 {
-    const reserve = dc.chunkCap(chunk_rows, rows) + sumsBytes(dc) + (2 << 30);
+    const reserve = batchReserve(dc, rows);
     if (budget <= floor or budget - floor <= reserve) return error.Dsv41CaptureBudgetTooSmall;
     const fits = (budget - floor - reserve) / carriedPerWindow(dc, rows);
     if (fits == 0) return error.Dsv41CaptureBudgetTooSmall;
     return @intCast(@min(fits, batch_cap));
+}
+
+const Sizing = struct { budget: model_load.SsdBudgetChoice, batch: u32 };
+
+/// The budget the batch is sized from (flag, setting, else the RAM default of `tier`, resolved as serve does) and the
+/// batch it buys. A RAM default too small for one window is refused by name: only the owner's flag can grant more.
+fn sizeBatch(io: std.Io, a: std.mem.Allocator, cfg: *const model.ModelConfig, opts: kld.Options, floor: u64, tier: ?model_load.RamTier) !Sizing {
+    const dc = cfg.dsv41.?;
+    const asked = model_load.resolveSsdBudget(opts.ssd_budget_bytes, cfg.ssd_budget_gb_override, cfg.supportsExpertStreaming());
+    const budget = try model_load.withRamDefault(io, a, cfg, opts.model_dir, asked, tier, false, 0);
+    if (opts.batch_windows != 0) return .{ .budget = budget, .batch = opts.batch_windows };
+    const batch = batchWindows(&dc, budget.bytes, floor, chunk_rows) catch |e| {
+        if (e != error.Dsv41CaptureBudgetTooSmall or budget.origin != .ram_default) return e;
+        var buf: [320]u8 = undefined;
+        log.err("{s}\n", .{ramDefaultTooSmallLine(&buf, budget, minBudget(&dc, floor, chunk_rows))});
+        return error.Dsv41CaptureRamDefaultTooSmall;
+    };
+    return .{ .budget = budget, .batch = batch };
+}
+
+fn ramDefaultTooSmallLine(buf: []u8, budget: model_load.SsdBudgetChoice, needed: u64) []const u8 {
+    const gib: f64 = 1 << 30;
+    return std.fmt.bufPrint(buf, "[kld] the RAM default ssd budget ({d:.1} GiB{s}) does not fit this layer-major capture, which needs at least {d:.1} GiB for one window: pass --ssd-budget-gb <GB>", .{
+        @as(f64, @floatFromInt(budget.bytes)) / gib,
+        if (budget.resident) ", resident" else "",
+        @as(f64, @floatFromInt(needed)) / gib,
+    }) catch "[kld] the RAM default ssd budget does not fit this layer-major capture: pass --ssd-budget-gb <GB>";
 }
 
 // ── what a resumed run must match ────────────────────────────────────────────────────────────────
@@ -1759,6 +1799,9 @@ test "deepseek_v41 layer-major capture: flags it takes and refuses, and the batc
     try testing.expectError(error.Dsv41HiddenCaptureUnsupported, accepts(&cfg, bad));
     bad = ok;
     bad.ssd_budget_bytes = 0;
+    try testing.expect(try accepts(&cfg, bad));
+    bad = ok;
+    bad.pick_tolerance = 0.1;
     try testing.expectError(error.Dsv41CaptureNeedsLosslessStreaming, accepts(&cfg, bad));
     bad = ok;
     bad.imatrix_out = "/x.safetensors";
@@ -1778,6 +1821,72 @@ test "deepseek_v41 layer-major capture: flags it takes and refuses, and the batc
     const half = floor + reserve + carriedPerWindow(&dc, chunk_rows) * (batch_cap / 2);
     try testing.expectEqual(@as(u32, batch_cap / 2), try batchWindows(&dc, half, floor, chunk_rows));
     try testing.expectEqual(@as(u32, batch_cap / 2 - 1), try batchWindows(&dc, half - 1, floor, chunk_rows));
+}
+
+test "deepseek_v41 layer-major capture: with no --ssd-budget-gb the capture is still taken (DSV41_TINY)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var cfg = try model.parseConfig(io, testing.allocator, try dsv.fixtureDir());
+    defer cfg.deinit(testing.allocator);
+    const no_flag = kld.Options{ .command = .capture, .layer_major = true, .no_template = true, .tokens = 1 };
+    try testing.expect(try accepts(&cfg, no_flag));
+}
+
+test "deepseek_v41 layer-major capture: with no budget the batch is sized from the RAM default, or refused naming the flag (DSV41_TINY)" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try dsv.fixtureDir();
+    var cfg = try model.parseConfig(io, a, dir);
+    defer cfg.deinit(a);
+    const dc = cfg.dsv41.?;
+    const floor = try captureFloor(io, a, &cfg, dir);
+    const no_flag = kld.Options{ .model_dir = dir, .command = .capture, .layer_major = true, .no_template = true, .tokens = 1 };
+
+    // A streamed tier: W is what an explicit budget of the default's size buys.
+    for ([_]model_load.RamTier{ .gb96, .gb128 }) |tier| {
+        const serve = model_load.ramDefaultFor(io, a, &cfg, dir, tier, false, 0, true);
+        const got = try sizeBatch(io, a, &cfg, no_flag, floor, tier);
+        try testing.expectEqual(model_load.SsdBudgetOrigin.ram_default, got.budget.origin);
+        try testing.expectEqual(serve.bytes, got.budget.bytes);
+        var explicit = no_flag;
+        explicit.ssd_budget_bytes = serve.bytes;
+        try testing.expectEqual(got.batch, (try sizeBatch(io, a, &cfg, explicit, floor, tier)).batch);
+        try testing.expectEqual(try batchWindows(&dc, serve.bytes, floor, chunk_rows), got.batch);
+    }
+
+    // A default that cannot clear the capture's floor buys no window, on a streamed tier and a resident one alike.
+    for ([_]model_load.RamTier{ .gb96, .gb192 }) |tier| {
+        const granted = model_load.ramDefaultFor(io, a, &cfg, dir, tier, false, 0, true).bytes;
+        try testing.expectError(error.Dsv41CaptureRamDefaultTooSmall, sizeBatch(io, a, &cfg, no_flag, granted, tier));
+        try testing.expectError(error.Dsv41CaptureRamDefaultTooSmall, sizeBatch(io, a, &cfg, no_flag, granted - minBudget(&dc, 0, chunk_rows) + 1, tier));
+        try testing.expectEqual(@as(u32, 1), (try sizeBatch(io, a, &cfg, no_flag, granted - minBudget(&dc, 0, chunk_rows), tier)).batch);
+    }
+    var buf: [320]u8 = undefined;
+    const line = ramDefaultTooSmallLine(&buf, .{ .bytes = 3 << 30, .origin = .ram_default, .setting_ignored = false, .resident = true }, 5 << 30);
+    try testing.expectEqualStrings("[kld] the RAM default ssd budget (3.0 GiB, resident) does not fit this layer-major capture, which needs at least 5.0 GiB for one window: pass --ssd-budget-gb <GB>", line);
+
+    // A box outside the tiers has no default to take.
+    try testing.expectError(error.ExpertStreamingRequired, sizeBatch(io, a, &cfg, no_flag, floor, null));
+}
+
+test "deepseek_v41 layer-major capture: an explicit budget sizes the batch as before, whatever the tier (DSV41_TINY)" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try dsv.fixtureDir();
+    var cfg = try model.parseConfig(io, a, dir);
+    defer cfg.deinit(a);
+    const dc = cfg.dsv41.?;
+    const floor = try captureFloor(io, a, &cfg, dir);
+    var opts = kld.Options{ .model_dir = dir, .command = .capture, .layer_major = true, .no_template = true, .tokens = 1, .ssd_budget_bytes = 100 << 30 };
+    for ([_]?model_load.RamTier{ null, .gb96, .gb192 }) |tier| {
+        const got = try sizeBatch(io, a, &cfg, opts, floor, tier);
+        try testing.expectEqual(model_load.SsdBudgetOrigin.flag, got.budget.origin);
+        try testing.expectEqual(@as(u64, 100 << 30), got.budget.bytes);
+        try testing.expectEqual(try batchWindows(&dc, 100 << 30, floor, chunk_rows), got.batch);
+    }
+    opts.ssd_budget_bytes = floor;
+    try testing.expectError(error.Dsv41CaptureBudgetTooSmall, sizeBatch(io, a, &cfg, opts, floor, .gb96));
+    opts.batch_windows = 3;
+    try testing.expectEqual(@as(u32, 3), (try sizeBatch(io, a, &cfg, opts, floor, .gb96)).batch);
 }
 
 /// The head applied to row `row` of the stored head inputs must give the logits the capture wrote for that window.
@@ -1963,7 +2072,6 @@ test "deepseek_v41 capture: the floor budget is the least the streamed load's pl
     const dir = try dsv.fixtureDir();
     var cfg = try model.parseConfig(io, a, dir);
     defer cfg.deinit(a);
-    const model_load = @import("../model_load.zig");
     const floor = try captureFloor(io, a, &cfg, dir);
     const plan = try model_load.planExpertStreaming(io, a, &cfg, dir, floor, false);
     try testing.expectEqual(@as(u16, 2), plan.cache.slots_per_layer);
