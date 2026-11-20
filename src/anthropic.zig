@@ -1105,7 +1105,7 @@ fn handleAnthropicNonStreaming(
             log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_use: {d}]\n", .{
                 result.prompt_tokens, result.completion_tokens, elapsed_ms, tu_perf, tool_reply.calls.len,
             });
-            try appendToolReplyBlocks(allocator, &content, &block_count, tool_reply, nowMs(stream.io));
+            try appendToolReplyBlocks(stream.io, allocator, &content, &block_count, tool_reply);
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
             // No tool calls — emit text block. Nothing parsed, so any tool
@@ -1159,7 +1159,7 @@ fn handleAnthropicNonStreaming(
 }
 
 /// The text block of what the model said before its calls, then one `tool_use` block per call.
-fn appendToolReplyBlocks(allocator: std.mem.Allocator, content: *std.ArrayList(u8), block_count: *u32, tool_reply: reply_mod.ToolReply, now_ms: i64) !void {
+fn appendToolReplyBlocks(io: std.Io, allocator: std.mem.Allocator, content: *std.ArrayList(u8), block_count: *u32, tool_reply: reply_mod.ToolReply) !void {
     if (tool_reply.preamble.len > 0) {
         if (block_count.* > 0) try content.append(allocator, ',');
         const esc_pre = try jsonEscape(allocator, tool_reply.preamble);
@@ -1167,11 +1167,13 @@ fn appendToolReplyBlocks(allocator: std.mem.Allocator, content: *std.ArrayList(u
         try content.print(allocator, "{{\"type\":\"text\",\"text\":{s}}}", .{esc_pre});
         block_count.* += 1;
     }
-    for (tool_reply.calls, 0..) |tc, i| {
+    for (tool_reply.calls) |tc| {
         if (block_count.* > 0) try content.append(allocator, ',');
         const esc_name = try jsonEscape(allocator, tc.name);
         defer allocator.free(esc_name);
-        try content.print(allocator, "{{\"type\":\"tool_use\",\"id\":\"toolu_{d}_{d}\",\"name\":{s},\"input\":{s}}}", .{ now_ms, i, esc_name, tc.arguments });
+        const tc_id = try io_util.callId(io, allocator, "toolu");
+        defer allocator.free(tc_id);
+        try content.print(allocator, "{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":{s},\"input\":{s}}}", .{ tc_id, esc_name, tc.arguments });
         block_count.* += 1;
     }
 }
@@ -1692,8 +1694,8 @@ fn handleAnthropicStreaming(
             };
             try closeAnthropicBlock(allocator, stream, &block_index, &text_block_open, &thinking_block_open);
 
-            for (tool_calls, 0..) |tc, i| {
-                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ nowMs(stream.io), i });
+            for (tool_calls) |tc| {
+                const tc_id = try io_util.callId(stream.io, allocator, "toolu");
                 defer allocator.free(tc_id);
                 const esc_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(esc_name);
@@ -2411,8 +2413,11 @@ test "a /v1/messages reply with a call inside a thought the prompt opened and ne
     var content = std.ArrayList(u8).empty;
     defer content.deinit(a);
     var block_count: u32 = 0;
-    try appendToolReplyBlocks(a, &content, &block_count, tool_reply, 7);
-    try std.testing.expectEqualStrings("{\"type\":\"tool_use\",\"id\":\"toolu_7_0\",\"name\":\"get_weather\",\"input\":{\"city\":\"Tokyo\"}}", content.items);
+    try appendToolReplyBlocks(std.testing.io, a, &content, &block_count, tool_reply);
+    const id_key = "{\"type\":\"tool_use\",\"id\":\"";
+    try std.testing.expect(std.mem.startsWith(u8, content.items, id_key ++ "toolu_"));
+    const id_end = std.mem.indexOfScalarPos(u8, content.items, id_key.len, '"').?;
+    try std.testing.expectEqualStrings("\",\"name\":\"get_weather\",\"input\":{\"city\":\"Tokyo\"}}", content.items[id_end..]);
     // The thought carries the words and none of the markup.
     const split = think_tags.splitThinkBlock(generated, true, true);
     try std.testing.expectEqualStrings("I'll check.", split.reasoning_content.?);

@@ -58,6 +58,17 @@ pub fn nextCompletionId(counter: *std.atomic.Value(i64), now_ms: i64) i64 {
     }
 }
 
+var call_id_seq = std.atomic.Value(u64).init(0);
+
+/// A tool call's id, `<prefix>_<16 random hex digits>_<per-process count>`: unique across the requests running
+/// together, and across restarts, where a clock tick (the id's old part) repeats. The one maker of every surface's call id.
+pub fn callId(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8) std.mem.Allocator.Error![]u8 {
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    const seq = call_id_seq.fetchAdd(1, .monotonic);
+    return std.fmt.allocPrint(allocator, "{s}_{x:0>16}_{x}", .{ prefix, std.mem.readInt(u64, &random, .little), seq });
+}
+
 /// Diagnostic switches are off for empty values and values beginning with `0`.
 pub fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
     const v = raw orelse return false;
@@ -87,4 +98,38 @@ pub fn readExact(fd: std.c.fd_t, dst: []u8, offset: u64) !void {
         if (got == 0) return error.FillShortRead;
         done += @intCast(got);
     }
+}
+
+const IdBatch = struct {
+    ids: [2000][]u8 = undefined,
+    made: usize = 0,
+
+    fn run(self: *IdBatch, prefix: []const u8) void {
+        for (&self.ids) |*slot| {
+            slot.* = callId(std.testing.io, std.testing.allocator, prefix) catch return;
+            self.made += 1;
+        }
+    }
+};
+
+test "tool call ids made by concurrent requests, in the same millisecond or not, never repeat" {
+    var a: IdBatch = .{};
+    var b: IdBatch = .{};
+    const ta = try std.Thread.spawn(.{}, IdBatch.run, .{ &a, "call" });
+    const tb = try std.Thread.spawn(.{}, IdBatch.run, .{ &b, "call" });
+    ta.join();
+    tb.join();
+    defer for ([_]*IdBatch{ &a, &b }) |batch| for (batch.ids[0..batch.made]) |id| std.testing.allocator.free(id);
+    try std.testing.expectEqual(a.ids.len, a.made);
+    try std.testing.expectEqual(b.ids.len, b.made);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(std.testing.allocator);
+    for ([_]*IdBatch{ &a, &b }) |batch| for (batch.ids) |id| {
+        try std.testing.expect(std.mem.startsWith(u8, id, "call_"));
+        const entry = try seen.getOrPut(std.testing.allocator, id);
+        if (entry.found_existing) {
+            std.debug.print("tool call id made twice: {s}\n", .{id});
+            return error.ToolCallIdRepeated;
+        }
+    };
 }

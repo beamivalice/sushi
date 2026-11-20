@@ -689,7 +689,7 @@ pub fn handleNonStreamingGeneration(
             try tc_buf.appendSlice(allocator, "[");
             for (tool_calls, 0..) |tc, i| {
                 if (i > 0) try tc_buf.appendSlice(allocator, ",");
-                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ nowMs(stream.io), i });
+                const tc_id = try io_util.callId(stream.io, allocator, "call");
                 defer allocator.free(tc_id);
                 const escaped_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(escaped_name);
@@ -1813,7 +1813,7 @@ pub fn handleStreamingGeneration(
 
             // Emit tool call deltas in OpenAI streaming format
             for (tool_calls, 0..) |tc, i| {
-                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ chat_id, i });
+                const tc_id = try io_util.callId(stream.io, allocator, "call");
                 defer allocator.free(tc_id);
 
                 // Escape the full arguments string for embedding in JSON

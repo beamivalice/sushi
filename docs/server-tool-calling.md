@@ -25,6 +25,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `reply-bypass`: a surface never calls the raw `parseToolCalls`.
 - Template input `chat.templateMessages`: role "tool" native, a call's `arguments` the client's JSON object (`{}` for
   anything else), every string valid UTF-8 (U+FFFD for a bad sequence, as `appendJsonString` writes). Streaming: full args in ONE SSE delta, thinking → `reasoning_content`.
+- **A call's id comes from `io_util.callId`, on every surface** (`call_`, Anthropic `toolu_`): random digits beside a per-process count, never a clock tick, so two requests in one millisecond or one restart apart never share an id.
 - Buffered calls may exceed a client's inter-event progress deadline even while SSE keepalives arrive. The omp launcher
   disables that deadline only for its Sushi provider; argument truncation and loop-stop rules remain unchanged.
 - **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups; coercion

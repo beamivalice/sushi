@@ -1388,7 +1388,7 @@ fn handleResponsesInner(
             }
             const fc_id = try responses_mod.makeId(stream.io, allocator, "fc");
             defer allocator.free(fc_id);
-            const call_id = try responses_mod.makeId(stream.io, allocator, "call");
+            const call_id = try io_util.callId(stream.io, allocator, "call");
             defer allocator.free(call_id);
             const stored_call_id = try allocator.dupe(u8, call_id);
             emitted_tool_calls.append(allocator, .{ .id = stored_call_id, .name = tc.name, .arguments = tc.arguments }) catch |err| {
