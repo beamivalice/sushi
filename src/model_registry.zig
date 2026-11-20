@@ -873,7 +873,8 @@ pub const ModelRegistry = struct {
     /// Browser downloads models while the server runs, and a boot-only scan
     /// can't see them). Add-only: an id or path already registered wins
     /// (first-wins, like boot) and live entries are never re-pointed or
-    /// removed. A failed load at the same path becomes retryable. Returns the
+    /// removed. An entry no load holds, at the same path, takes the folder's facts again
+    /// (a pull that finished), and a failed load there becomes retryable. Returns the
     /// number of stubs added. A `--model`-only server with no
     /// settings-file models directory rescans nothing (`absorbDownload`
     /// still lists what the Downloads tab fetched).
@@ -891,9 +892,39 @@ pub const ModelRegistry = struct {
 
     pub fn absorbDownloadWithSettings(self: *ModelRegistry, settings_path: []const u8, path: []const u8) !u32 {
         const added = try self.rescanWithSettings(settings_path);
-        if (self.peekByPath(path) != null) return added;
+        if (self.peekByPath(path) != null) {
+            self.refreshFolderFacts(path);
+            return added;
+        }
         _ = self.registerByPath(self.io, path) catch return added;
         return added + @intFromBool(self.peekByPath(path) != null);
+    }
+
+    /// The folder of a registered entry as it is now, for a folder a download finished in that no walked root holds.
+    fn refreshFolderFacts(self: *ModelRegistry, path: []const u8) void {
+        const probe = model_discovery.probeModelDir(self.io, self.allocator, path) catch return;
+        defer self.allocator.free(probe.model_type);
+        const streaming = expert_quant.isExpertStreamingArch(probe.model_type) and
+            model_discovery.streamingIndexComplete(self.io, self.allocator, path) != null;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const e = self.peekByPathLocked(path) orelse return;
+        self.refreshFactsLocked(e, probe.bytes_on_disk, probe.bytes_linked, probe.bytes_total, streaming);
+    }
+
+    /// An entry no load holds takes the folder's facts as discovery read them now: a pack listed while its pull was
+    /// partial would otherwise bill its partial bytes for good. A failed load becomes retryable. `arch_hint` stays:
+    /// it is read without the lock, and `config.json` lands before any shard. Caller holds `mutex`.
+    fn refreshFactsLocked(self: *ModelRegistry, e: *LoadedModel, bytes_on_disk: ?u64, bytes_linked: u64, bytes_total: ?u64, streaming_index_complete: bool) void {
+        switch (e.state) {
+            .unloaded => {},
+            .error_state => self.markUnloadedLocked(e),
+            else => return,
+        }
+        e.bytes_on_disk = bytes_on_disk;
+        e.bytes_linked = bytes_linked;
+        e.bytes_total = bytes_total;
+        e.streaming_index_complete = streaming_index_complete;
     }
 
     /// `rescan` reading the settings file at `settings_path`.
@@ -912,12 +943,7 @@ pub const ModelRegistry = struct {
         defer self.mutex.unlock(self.io);
         for (found.models) |m| {
             if (self.entries.get(m.id)) |e| {
-                if (e.state == .error_state and std.mem.eql(u8, e.path, m.path)) {
-                    self.markUnloadedLocked(e);
-                    e.bytes_on_disk = m.bytes_on_disk;
-                    e.bytes_linked = m.bytes_linked;
-                    e.bytes_total = m.bytes_total;
-                }
+                if (std.mem.eql(u8, e.path, m.path)) self.refreshFactsLocked(e, m.bytes_on_disk, m.bytes_linked, m.bytes_total, m.streaming_index_complete);
                 continue;
             }
             if (self.peekByPathLocked(m.path) != null) continue;
@@ -2833,4 +2859,53 @@ test "LoadedModel: prompts encoded while the model unloads get the ids a quiet e
     for (&readers) |*r| try testing.expectEqual(@as(u32, 0), r.wrong.load(.monotonic));
     entry.unloadResident();
     try testing.expectEqual(before, cache_stats.process.snapshot().token_bytes);
+}
+
+test "a pack listed while its pull was partial carries its full bytes once the pull finishes" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // A pull stopped half way (or one running at boot): the config and one shard, and the pull's marker.
+    try model_discovery.writePackStub(io, tmp.dir, "beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00001.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/.pull-incomplete", .data = "" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = rb[0..try tmp.dir.realPath(io, &rb)];
+    const found = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    const reg = try ModelRegistry.init(testing.allocator, io, found, 2, 0, null);
+    defer reg.deinit();
+    const e = reg.peek("beamster/P") orelse return error.PartialPackNotListed;
+    // The pull resumes and finishes: the second shard lands and the marker goes.
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00002.safetensors", .data = &@as([1000]u8, @splat('x')) });
+    try tmp.dir.deleteFile(io, "beamster/P/.pull-incomplete");
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    var sb: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try reg.absorbDownloadWithSettings(try std.fmt.bufPrint(&sb, "{s}/settings.json", .{root}), try std.fmt.bufPrint(&pb, "{s}/beamster/P", .{root}));
+    // bytes_on_disk is the eviction gate's estimate and the resident bill.
+    const config_bytes = (try tmp.dir.statFile(io, "beamster/P/config.json", .{})).size;
+    try testing.expectEqual(@as(?u64, 1010), e.bytes_on_disk);
+    try testing.expectEqual(@as(?u64, 1010 + config_bytes), e.bytes_total);
+}
+
+test "a pack a --model-only server listed while its pull was partial carries its full bytes once the pull finishes" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00001.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/.pull-incomplete", .data = "" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = rb[0..try tmp.dir.realPath(io, &rb)];
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, "{s}/beamster/P", .{root});
+    const id = try reg.registerByPath(io, path);
+    const e = reg.peek(id) orelse return error.PartialPackNotListed;
+    try testing.expectEqual(@as(?u64, 10), e.bytes_on_disk);
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00002.safetensors", .data = &@as([1000]u8, @splat('x')) });
+    try tmp.dir.deleteFile(io, "beamster/P/.pull-incomplete");
+    var sb: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try reg.absorbDownloadWithSettings(try std.fmt.bufPrint(&sb, "{s}/settings.json", .{root}), path);
+    try testing.expectEqual(@as(?u64, 1010), e.bytes_on_disk);
 }
