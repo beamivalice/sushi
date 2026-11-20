@@ -184,6 +184,9 @@ pub var mtp_verify_attn_output_calls: u64 = 0;
 
 pub var mtp_verify_lmhead_rows_calls: u64 = 0;
 
+/// Joined row groups whose trellis projections ran as one launch over every row.
+pub var trellis_rows_joined: u64 = 0;
+
 pub var mtp_verify_hc_prepared_active = false;
 
 pub var mtp_verify_hc_prepared_calls: u64 = 0;
@@ -2675,20 +2678,28 @@ pub fn verifyRowsJoined(
     },
 ) !?[]mlx.mlx_array {
     if (inputs.len < 2 or inputs.len > 8) return null;
-    // The joined kernels serve affine banks only: one look at the group's kinds, not a query per projection.
+    // The joined affine kernel and the trellis rows launch both give a row its one-row bytes: one look at the group's
+    // kinds, not a query per projection.
+    var trellis = false;
     inline for (switch (kind) {
         .attention => .{ "q", "k", "v" },
         .gdn => .{ "qkv", "z", "a", "b" },
-    }) |name| if (@field(w, name) != .affine) return null;
+    }) |name| switch (@field(w, name)) {
+        .affine => {},
+        .trellis => trellis = true,
+        else => return null,
+    };
     var widths: [MAX_BATCH_ROWS]c_int = undefined;
     var total: c_int = 0;
     for (inputs, 0..) |input, i| {
         const shape = mlx.getShape(input);
-        if (shape.len != 3 or shape[0] != 1 or shape[2] != 2560 or shape[1] < (if (decode) 1 else 2) or shape[1] > 6) return null;
+        if (shape.len != 3 or shape[0] != 1 or shape[2] != @as(c_int, @intCast(self.config.hidden_size)) or shape[1] < (if (decode) 1 else 2) or shape[1] > 6) return null;
         widths[i] = shape[1];
         total += shape[1];
     }
     if (total > 12) return null;
+    // Past the rows launch the trellis GEMM serves, in other bytes than a row's own tick.
+    if (trellis and @import("sushi_exl3").trunk.gemmRows(@intCast(total), self.spec_capture_ssm)) return null;
     const vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     var joined = mlx.mlx_array_new();
@@ -2699,15 +2710,29 @@ pub fn verifyRowsJoined(
         .gdn => Trunk.GdnVerifyInputs,
     } = .{};
     defer projections.deinit();
+    // A trellis part runs the call the row's solo tick runs (a stacked bank where it has one), over every row at once.
+    // A stacked bank the rows outgrow would run its parts alone, in other bytes: the rows then run alone too.
+    if (trellis) switch (kind) {
+        .attention => if (w.qkv_stack != null) {
+            projections = try stackedAttnProjections(self, joined, w) orelse return null;
+        },
+        .gdn => if (w.qkvz_stack != null) {
+            const pair = try self.stackedPair(joined, w.qkvz_stack) orelse return null;
+            projections.qkv = pair[0];
+            projections.z = pair[1];
+        },
+    };
     inline for (switch (kind) {
         .attention => .{ "q", "k", "v" },
         .gdn => .{ "qkv", "z", "a", "b" },
     }) |name| {
-        const part = switch (kind) {
-            .attention => try projectRows(self.s, decode, .attention, joined, &@field(w, name), widths[0..inputs.len]),
-            .gdn => try projectRows(self.s, decode, .gdn, joined, &@field(w, name), widths[0..inputs.len]),
-        };
-        @field(projections, name) = part orelse return null;
+        if (@field(projections, name).ctx == null) @field(projections, name) = if (@field(w, name) == .trellis)
+            try self.qmatmul(joined, &@field(w, name))
+        else
+            try projectRows(self.s, decode, switch (kind) {
+                .attention => .attention,
+                .gdn => .gdn,
+            }, joined, &@field(w, name), widths[0..inputs.len]) orelse return null;
     }
     var flat: [MAX_BATCH_ROWS]mlx.mlx_array = @splat(.{});
     defer for (flat[0..inputs.len]) |value| {
@@ -2740,7 +2765,7 @@ pub fn verifyRowsJoined(
     var joined_flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(joined_flat);
     try mlx.check(mlx.mlx_concatenate_axis(&joined_flat, flat_vec, 1, self.s));
-    const projected = try projectRows(self.s, decode, kind, joined_flat, out, widths[0..inputs.len]);
+    const projected = if (out.* == .trellis) try self.qmatmul(joined_flat, out) else try projectRows(self.s, decode, kind, joined_flat, out, widths[0..inputs.len]);
     defer if (projected) |value| {
         _ = mlx.mlx_array_free(value);
     };
@@ -2763,6 +2788,7 @@ pub fn verifyRowsJoined(
         built += 1;
         offset += widths[i];
     }
+    if (trellis) trellis_rows_joined +%= 1;
     if (!decode) switch (kind) {
         .attention => {
             mtp_verify_attn_rows_calls +%= 1;

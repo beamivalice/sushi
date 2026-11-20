@@ -1117,3 +1117,26 @@ llmprobe prints one median per context rung. Decode tok/s:
 - Streamed (`--ssd-budget-gb 32`, Sushi-2.6bpw, a 3.7k-token prompt, untimed, two requests each): DFlash2 27.9 and 30.4
   tok/s, MTP (`--mtp`) 22.8 and 29.0.
 
+<a id="cooler-joined-trellis"></a>
+## Flash-Next: joined rows on Sushi Cooler with a trellis trunk
+
+An STQ pack's trunk is a trellis bank, which the joined-row kernels declined: every attention and GDN projection, the
+attention and GDN outputs and the shared expert ran once a row in a batched tick, and on an M5 Ultra the joined
+hyper-connection read and router were gated off too (upstream mlx-serve #534: on the Ultra they lift a joined group and slow a lone row, so they now serve groups of two or more there). A joined group now runs each trellis projection the call a row's
+solo tick runs (a stacked bank where it has one) over every row at once; the rows launch gives each row its one-row
+bytes, and a group past the rows launch (the GEMM arm) or a stack it outgrows runs its rows alone.
+
+M5 Ultra 256 GB, Qwen3.8-Flash-Next STQ 2.75bpw, `--kv-quant 8 --mtp-head-kv-quant --max-concurrent 4 --mtp`, 400-token
+replies, thinking off, one boot, shipping arm A against both changes B in the order A B B A per cell, `taskpolicy -a`,
+GPU lock. Sum of the rows' decode tok/s (each row's own rate), A / B:
+
+| rows | sampled MTP | sampled plain | greedy MTP | greedy plain |
+|---|---|---|---|---|
+| 1 | 127 / 127 | 89 / 89 | 131 / 127 | 90 / 90 |
+| 2 | 105 / 118 | 102 / 116 | 158 / 157 | 103 / 117 |
+| 4 | 117 / 155 | 115 / 155 | 170 / 180 | 116 / 156 |
+
+One row runs no changed code; its MTP rows spread 126 to 133 tok/s on either arm. `--qwen-mlx-engine` on the same box and settings read 112 / 155 / 185 (sampled MTP, n=1/2/4) and 87 / 107 / 125 (greedy
+plain). A 4-row plain tick's GPU time (engine kernel profile) went 52 to 38 ms. The batched MTP planner still picks no
+drafts for sampled rows: a 4-row round of two drafts each costs about twice a plain tick (52 against 26 ms), which
+sampled acceptance (~55% a draft) does not repay; greedy rows keep `{2,2,2,2}` rounds.

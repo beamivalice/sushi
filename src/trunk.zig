@@ -3276,8 +3276,10 @@ pub const Trunk = struct {
     /// Gate/up/geglu/down of the shared expert. Only `.verify_rows` declines (null);
     /// the other primitives always project.
     pub fn moeSharedDown(self: *Trunk, comptime proj: SharedProjKind, x: mlx.mlx_array, mw: *const MoeMlpWeights, widths: []const c_int) !?mlx.mlx_array {
-        // The joined rows of `.verify_rows` decline a trellis bank before any projection runs.
-        const stacked = if (proj == .verify_rows) null else try self.stackedPair(x, mw.shared_gate_up_stack);
+        // Joined rows run a stacked trellis bank over every row as one row's tick runs it; a stack the rows outgrow
+        // would run its parts alone, in other bytes, so the rows decline it.
+        const stacked = try self.stackedPair(x, mw.shared_gate_up_stack);
+        if (proj == .verify_rows and mw.shared_gate_up_stack != null and stacked == null) return null;
         const gate = if (stacked) |pair| pair[0] else (try self.moeSharedProject(proj, x, &mw.shared_gate, widths)) orelse return null;
         defer _ = mlx.mlx_array_free(gate);
         const up = if (stacked) |pair| pair[1] else (try self.moeSharedProject(proj, x, &mw.shared_up, widths)) orelse return null;
@@ -3294,6 +3296,8 @@ pub const Trunk = struct {
             // Only an affine bank rides the joined kernels; every other kind declines them.
             .verify_rows => switch (lin.*) {
                 .affine => |a| (try decodeRowsProjection(self.s, x, a.w, a.s, a.b, widths)) orelse try verifySharedProjection(self.s, x, a.w, a.s, a.b, widths),
+                // The rows launch gives each row its one-row bytes.
+                .trellis => try self.qmatmul(x, lin),
                 else => null,
             },
         };
