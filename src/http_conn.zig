@@ -2439,9 +2439,13 @@ test "request framing: a chunked body is decoded and routed like its Content-Len
     try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 "));
     try t.expect(std.mem.indexOf(u8, responseBody(response), "org beamster only") != null);
 
-    const gzip = try serveOneForTest("POST /v1/downloads HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n");
+    // A coding the server does not implement before `chunked` is a 501; one that leaves the body unframed a 400.
+    const gzip = try serveOneForTest("POST /v1/downloads HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n");
     defer t.allocator.free(gzip);
     try t.expect(std.mem.startsWith(u8, gzip, "HTTP/1.1 501 "));
+    const bare = try serveOneForTest("POST /v1/downloads HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n");
+    defer t.allocator.free(bare);
+    try t.expect(std.mem.startsWith(u8, bare, "HTTP/1.1 400 "));
     const garbled = try serveOneForTest("POST /v1/downloads HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nnot-hex\r\n");
     defer t.allocator.free(garbled);
     try t.expect(std.mem.startsWith(u8, garbled, "HTTP/1.1 400 "));
@@ -3258,4 +3262,24 @@ test "ws: a frame stalled mid-payload is dropped at the frame read limit" {
         std.debug.print("a half frame under a 200 ms frame limit: returned={any} err={s}\n", .{ r.returned, if (r.err) |e| @errorName(e) else "none" });
         return error.HalfFrameHeld;
     }
+}
+
+test "read: RFC 9112 framing statuses: chunked not last is a 400, Transfer-Encoding on HTTP/1.0 is faulty" {
+    // RFC 9112 §6.3 (4): Transfer-Encoding whose final coding is not chunked: MUST 400 and close. §6.1: Transfer-Encoding
+    // in an HTTP/1.0 request MUST be treated as faulty framing.
+    var bad: usize = 0;
+    for ([_][]const u8{
+        "POST /v1/completions HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+        "POST /v1/completions HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n{}",
+        "POST /v1/completions HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+    }) |sent| {
+        const r = try readAgainst(.{ .sent = sent, .limit_ms = 500 });
+        defer freeRead(r);
+        if (!std.mem.startsWith(u8, r.reply, "HTTP/1.1 400 ")) {
+            const he = std.mem.indexOf(u8, sent, "\r\n\r\n").?;
+            std.debug.print("'{f}': outcome={s} reply='{s}'\n", .{ std.zig.fmtString(sent[0..he]), if (r.outcome) |x| @tagName(x) else "none", statusLineOf(r.reply) });
+            bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
 }

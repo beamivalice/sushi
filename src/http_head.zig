@@ -154,9 +154,10 @@ pub const Framing = union(enum) {
 
 pub const FramingError = error{
     /// A Content-Length that is not digits alone, two that differ, two Transfer-Encoding fields, `chunked` named
-    /// twice, or Transfer-Encoding beside Content-Length: answered 400 and closed.
+    /// twice or not last, Transfer-Encoding beside Content-Length or on HTTP/1.0 (RFC 9112 §6.1, §6.3): answered 400
+    /// and closed.
     BadFraming,
-    /// A transfer coding other than `chunked`: answered 501.
+    /// `chunked` last after a coding the server does not implement (`gzip, chunked`): answered 501.
     UnsupportedCoding,
 };
 
@@ -168,14 +169,17 @@ pub fn framing(head: []const u8) FramingError!Framing {
     const length = try contentLength(head);
     const c = coding orelse return .{ .length = length orelse 0 };
     // A request carrying both is refused, never framed by one and smuggled by the other.
-    if (length != null) return error.BadFraming;
+    if (length != null or std.mem.eql(u8, requestLine(head).version, "HTTP/1.0")) return error.BadFraming;
     var chunked: usize = 0;
+    var other = false;
+    var last: []const u8 = "";
     var items = std.mem.splitScalar(u8, c, ',');
     while (items.next()) |item| {
-        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, item, ows), "chunked")) return error.UnsupportedCoding;
-        chunked += 1;
+        last = std.mem.trim(u8, item, ows);
+        if (std.ascii.eqlIgnoreCase(last, "chunked")) chunked += 1 else other = true;
     }
-    return if (chunked == 1) .chunked else error.BadFraming;
+    if (chunked != 1 or !std.ascii.eqlIgnoreCase(last, "chunked")) return error.BadFraming;
+    return if (other) error.UnsupportedCoding else .chunked;
 }
 
 /// The Content-Length `head` declares, null without one; every field and list item must be the same digits.
@@ -242,9 +246,10 @@ test "http_head: the framing a head declares, and the ones refused" {
     inline for (.{ "Content-Length:16", "Content-Length:\t16", "Content-Length: 16\t", "Content-Length: 16\r\nContent-Length: 16", "Content-Length: 16, 16" }) |f|
         try t.expectEqual(Framing{ .length = 16 }, try framing(line ++ f));
     try t.expectEqual(Framing.chunked, try framing(line ++ "Transfer-Encoding: Chunked"));
-    inline for (.{ "Content-Length: 1_6", "Content-Length: +16", "Content-Length: ", "Content-Length: 0\r\nContent-Length: 16", "Content-Length: 16, 17", "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked", "Transfer-Encoding: chunked, chunked", "Transfer-Encoding: chunked\r\nContent-Length: 5" }) |f|
+    inline for (.{ "Content-Length: 1_6", "Content-Length: +16", "Content-Length: ", "Content-Length: 0\r\nContent-Length: 16", "Content-Length: 16, 17", "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked", "Transfer-Encoding: chunked, chunked", "Transfer-Encoding: chunked\r\nContent-Length: 5", "Transfer-Encoding: chunked, gzip", "Transfer-Encoding: gzip" }) |f|
         try t.expectError(error.BadFraming, framing(line ++ f));
     try t.expectError(error.UnsupportedCoding, framing(line ++ "Transfer-Encoding: gzip, chunked"));
+    try t.expectError(error.BadFraming, framing("POST /x HTTP/1.0\r\nTransfer-Encoding: chunked"));
 }
 
 test "http_head: the request line's method and target, whole or cut short" {

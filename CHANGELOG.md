@@ -53,6 +53,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   exactly the size limit is read again when one of its fragments is empty.
 - **A WebSocket frame sent in the same write as the upgrade is answered**, where it was dropped; and a frame left half
   sent closes after 30 s, as a half-sent request body does.
+- **A Transfer-Encoding the server cannot frame is a 400**: `chunked, gzip`, a bare `gzip`, or any on an HTTP/1.0 request
+  answered 501 or read as chunked; `gzip, chunked` stays a 501.
 - **A request ended by a shutdown says so in its error type**: its 503 carried `server_error` where every other
   shutdown refusal carries `shutting_down`; all now carry `shutting_down`.
 - **A load started right after the previous server quit waits for its memory to be released**: the free-RAM check gave up
