@@ -142,6 +142,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **MLX-route speed: a GLM turn that reuses a cached conversation no longer copies its latent every token**: a restore
   held the conversation's rows exactly, off the page grid MLX writes in place on, so each new token copied the whole
   latent (and its kv8 scales) until it grew past the cached rows; the first token now moves it onto the grid.
+- **DeepSeek-V4.1 on the MLX engine: a follow-up turn rolled back on the live state no longer copies every layer's rows
+  each time**: the fit check ignored MLX's page grid, so rows cut back to the prompt's own size read as too large and
+  were cut again on every rollback, landing at the same size.
 - **MLX-route memory: a conversation restored from the SSD cache is held once**: the restore copied its whole cache at
   each chunk it read, so it briefly held about twice the conversation's cache before the request was admitted.
 - **MLX-route speed: a turn that reuses a trimmed cached conversation no longer copies its cache every token**: when

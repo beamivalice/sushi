@@ -381,6 +381,12 @@ pub const Rows = struct {
         return @intCast(mlx_pages.pagedCountAll(count, parts));
     }
 
+    /// Whether this store is no larger than a request billed `billed` rows pays for: the bill on MLX's page grid, which
+    /// `Config.mlxForwardCap` adds (`rowsGridBytes`) and `pagedCap` sizes every store by.
+    fn fitsBill(self: *const Rows, billed: usize, s: S) bool {
+        return self.cap <= self.pagedCap(billed, s);
+    }
+
     /// The grow the next append would make, made now: a buffer of this state's own with that append's slack.
     fn reserve(self: *Rows, s: S) !void {
         if (self.used == 0) return;
@@ -4035,13 +4041,15 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
 pub fn liveRowsFit(m: *const Model, prompt_len: usize) !bool {
     const st = (try currentState(m)) orelse return false;
     for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |r| {
-        if (!rowsFit(m, li, r.cap, prompt_len)) return false;
+        if (!r.fitsBill(billedRows(m.ratio(li), prompt_len), stateStream(m))) return false;
     };
     return true;
 }
 
-fn rowsFit(m: *const Model, li: usize, cap: usize, prompt_len: usize) bool {
-    return cap <= @max((prompt_len / m.ratio(li) + 1) * 5 / 4, 64);
+/// The rows a store of ratio `ratio` is billed for a `prompt_len`-token request: its own with the quarter the bill adds
+/// (`server.prefillNeededAtChunk`).
+fn billedRows(ratio: usize, prompt_len: usize) usize {
+    return @max((prompt_len / ratio + 1) * 5 / 4, 64);
 }
 
 /// Makes the live state its own earlier self at `n`: `slots` are the fixed arrays a restore point of the same
@@ -4082,7 +4090,7 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
     const cap = mlx.engine.uncapped();
     defer mlx.engine.capped(cap);
     for (st.layers, 0..) |*ls, li| for ([_]*?Rows{ &ls.comp, &ls.idx_k }) |rows_| if (rows_.*) |*rows| {
-        if (!rowsFit(m, li, rows.cap, ids.len)) try rows.trim(stateStream(m));
+        if (!rows.fitsBill(billedRows(m.ratio(li), ids.len), stateStream(m))) try rows.trim(stateStream(m));
     };
 }
 
@@ -7945,6 +7953,29 @@ test "dsv41 pipeline: the ring hands back the oldest layer once more than the de
     try testing.expectEqual(h.at(3 + 2 * pipe_max).ctx, ring.pop().?.ctx);
     try testing.expectEqual(@as(?A, null), ring.pop());
     try testing.expectEqual(@as(usize, 0), ring.n);
+}
+
+test "dsv41 rows a restore reserves at served geometry on MLX fit the bill of the request they serve" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var sc = Scope.plain(std.testing.allocator, s);
+    defer sc.deinit();
+    const prompt_len: usize = 4096;
+    const ratio: usize = 4;
+    const billed = billedRows(ratio, prompt_len);
+    // The compressed KV (head_dim 512, FP4 E4M3 group 16) and the index keys (128, UE8M0 group 32) of a ratio-4 layer.
+    for ([_][2]usize{ .{ 512, 16 }, .{ 128, 32 } }) |g| {
+        var rows = Rows{ .width = g[0], .dtype = .bfloat16, .pack = .{ .mode = if (g[1] == 16) .fp4_e4m3 else .fp4_ue8m0, .group = g[1] } };
+        defer rows.deinit();
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_ones(&x, &[_]c_int{ @intCast(prompt_len / ratio), @intCast(g[0]) }, 2, .bfloat16, s));
+        try rows.append(&sc, x);
+        try rows.reserve(s);
+        try std.testing.expectEqual(true, rows.fitsBill(billed, s));
+        // A store on the grid one step past the bill's rows is not the bill's.
+        try std.testing.expectEqual(false, rows.fitsBill(rows.used - 1, s));
+    }
 }
 
 test "dsv41 rows on MLX append in place when MLX's pool holds buffers a page past them, and the grid adds under one step" {
