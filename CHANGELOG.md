@@ -51,7 +51,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   cuts short (it closes before its `Content-Length`) is dropped instead of being run on the bytes that arrived.
 - **A HEAD request refused before it is routed gets no body**, as every other HEAD answer; and a WebSocket message of
   exactly the size limit is read again when one of its fragments is empty.
-- **A WebSocket frame sent in the same write as the upgrade is answered**, where it was dropped.
+- **A WebSocket frame sent in the same write as the upgrade is answered**, where it was dropped; and a frame left half
+  sent closes after 30 s, as a half-sent request body does.
 - **A request ended by a shutdown says so in its error type**: its 503 carried `server_error` where every other
   shutdown refusal carries `shutting_down`; all now carry `shutting_down`.
 - **A load started right after the previous server quit waits for its memory to be released**: the free-RAM check gave up

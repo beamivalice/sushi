@@ -40,6 +40,9 @@ pub fn WsConn(comptime ConnT: type) type {
         limit: *const std.atomic.Value(usize),
         /// The cap of the message being read, or of the last one.
         message_limit: usize = 0,
+        /// How long a frame, once its first byte came, may wait for each of the rest (null: no limit), as a request
+        /// body waits.
+        frame_limit_ms: ?i64 = null,
         /// Set when a control or fragmented data message has been partially
         /// reassembled. When non-null, any incoming frame with opcode != 0
         /// (continuation) and != control is a protocol violation.
@@ -64,7 +67,7 @@ pub fn WsConn(comptime ConnT: type) type {
         pub fn readMessage(self: *Self, allocator: std.mem.Allocator) !Message {
             while (true) {
                 if (self.in_message == null) self.message_limit = self.limit.load(.monotonic);
-                const frame = try readFrame(self.conn, allocator, self.message_limit);
+                const frame = try readFrame(self.conn, allocator, self.message_limit, self.frame_limit_ms);
                 // The payload is freed on every exit except the ones that hand it to the caller.
                 var returned = false;
                 defer if (!returned) allocator.free(frame.payload);
@@ -160,18 +163,21 @@ const RawFrame = struct {
     wire: usize,
 };
 
-fn readExact(conn: anytype, buf: []u8) !void {
+fn readExact(conn: anytype, buf: []u8, limit_ms: ?i64) !void {
     var off: usize = 0;
     while (off < buf.len) {
-        const n = try conn.read(buf[off..], null);
+        const n = try conn.read(buf[off..], limit_ms);
         if (n == 0) return error.WsClosed;
         off += n;
     }
 }
 
-fn readFrame(conn: anytype, allocator: std.mem.Allocator, limit: usize) !RawFrame {
+/// One frame. The wait for its first byte has no limit (a socket idle between messages); each later read waits at most
+/// `frame_limit_ms`, so a frame left half sent is dropped.
+fn readFrame(conn: anytype, allocator: std.mem.Allocator, limit: usize, frame_limit_ms: ?i64) !RawFrame {
     var hdr: [2]u8 = undefined;
-    try readExact(conn, &hdr);
+    try readExact(conn, hdr[0..1], null);
+    try readExact(conn, hdr[1..], frame_limit_ms);
 
     const fin = (hdr[0] & 0x80) != 0;
     const rsv = (hdr[0] & 0x70) != 0;
@@ -186,22 +192,22 @@ fn readFrame(conn: anytype, allocator: std.mem.Allocator, limit: usize) !RawFram
     var payload_len: u64 = len7;
     if (len7 == 126) {
         var ext: [2]u8 = undefined;
-        try readExact(conn, &ext);
+        try readExact(conn, &ext, frame_limit_ms);
         payload_len = std.mem.readInt(u16, &ext, .big);
     } else if (len7 == 127) {
         var ext: [8]u8 = undefined;
-        try readExact(conn, &ext);
+        try readExact(conn, &ext, frame_limit_ms);
         payload_len = std.mem.readInt(u64, &ext, .big);
     }
     if (payload_len > limit) return error.WsTooLarge;
 
     var mask_key: [4]u8 = undefined;
-    try readExact(conn, &mask_key);
+    try readExact(conn, &mask_key, frame_limit_ms);
 
     const len_usize: usize = @intCast(payload_len);
     const payload = try allocator.alloc(u8, len_usize);
     errdefer allocator.free(payload);
-    if (len_usize > 0) try readExact(conn, payload);
+    if (len_usize > 0) try readExact(conn, payload, frame_limit_ms);
     for (payload, 0..) |*b, i| b.* ^= mask_key[i & 3];
 
     const ext_len: usize = if (len7 == 126) 2 else if (len7 == 127) 8 else 0;

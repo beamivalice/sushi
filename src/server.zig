@@ -1187,7 +1187,7 @@ fn handleConnectionThread(args: *http_conn.ConnThreadArgs) void {
 
 /// A client gets this long between bytes of its request, and in all for its head: an idle or
 /// dripping connection otherwise holds its thread forever.
-const REQUEST_READ_LIMIT_MS: i64 = 30_000;
+pub const REQUEST_READ_LIMIT_MS: i64 = 30_000;
 
 pub fn handleConnection(
     allocator: std.mem.Allocator,

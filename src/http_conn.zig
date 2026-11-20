@@ -1551,6 +1551,7 @@ pub fn handleResponsesWebSocket(
     log.info("WS /v1/responses connected\n", .{});
 
     var ws_conn = WsConnT.init(stream, &server_state.max_request_bytes);
+    ws_conn.frame_limit_ms = server_mod.REQUEST_READ_LIMIT_MS;
     defer ws_conn.deinit(allocator);
     var reason_buf: [123]u8 = undefined;
     const end = wsServeTurns(allocator, stream, &ws_conn, models) catch |err| wsEndOf(err, ws_conn.message_limit, &reason_buf);
@@ -1573,6 +1574,7 @@ fn wsEndOf(err: anyerror, message_limit: usize, reason_buf: *[123]u8) WsEnd {
         error.Shutdown => .{ .code = 1001, .reason = "server shutting down" },
         error.WsProtocol => .{ .code = 1002, .reason = "protocol error" },
         error.WsFraming => .{ .code = 1009, .reason = "empty fragments over the 8 KiB framing allowance" },
+        error.ReadStalled => .{ .code = 1008, .reason = "a frame stalled past the read limit" },
         error.WsTooLarge => blk: {
             const msg = payloadTooLargeMessage(reason_buf, null, message_limit);
             log.warn("[http] WS 1009: {s}\n", .{msg});
@@ -2650,6 +2652,8 @@ const ReadOpts = struct {
     shutdown_first: bool = false,
     /// The client closes its side after `sent` and `drip`.
     half_close: bool = false,
+    /// `WsConnT.frame_limit_ms` for `wsReadAgainst`.
+    ws_frame_limit_ms: ?i64 = null,
 };
 const ReadResult = struct { returned: bool, ms: i64, outcome: ?std.meta.Tag(ReadOutcome), len: ?usize, reply: []u8, body: []u8 };
 
@@ -2799,8 +2803,9 @@ fn wsReadAgainst(o: ReadOpts) !WsReadResult {
     }
     const t0 = nowMsMonotonic(t.io);
     const reader = try std.Thread.spawn(.{}, struct {
-        fn run(c: *Conn, lim: *std.atomic.Value(usize), s: *State, start: i64) void {
+        fn run(c: *Conn, lim: *std.atomic.Value(usize), frame_limit: ?i64, s: *State, start: i64) void {
             var ws = WsConnT.init(c, lim);
+            ws.frame_limit_ms = frame_limit;
             defer ws.deinit(t.allocator);
             while (true) {
                 const m = ws.readMessage(t.allocator) catch |e| {
@@ -2813,7 +2818,7 @@ fn wsReadAgainst(o: ReadOpts) !WsReadResult {
             s.ms = nowMsMonotonic(t.io) - start;
             s.done.store(true, .release);
         }
-    }.run, .{ &conn, &limit, &st, t0 });
+    }.run, .{ &conn, &limit, o.ws_frame_limit_ms, &st, t0 });
     const sender = try std.Thread.spawn(.{}, FeedClient.run, .{&client});
     var shut_at: i64 = 0;
     var waited: u64 = 0;
@@ -3244,5 +3249,13 @@ test "read: bytes sent past a request in the same write are kept for the connect
         try t.expect(got == .request);
         defer t.allocator.free(got.request.buf);
         try t.expectEqualStrings(frame, got.request.buf[got.request.end..]);
+    }
+}
+
+test "ws: a frame stalled mid-payload is dropped at the frame read limit" {
+    const r = try wsReadAgainst(.{ .sent = comptime clientFrame(0x81, &@as([20_000]u8, @splat('w')))[0..18_000], .limit_ms = 0, .ws_frame_limit_ms = 200, .wait_ms = 3000 });
+    if (!r.returned or r.err == null or r.err.? != error.ReadStalled) {
+        std.debug.print("a half frame under a 200 ms frame limit: returned={any} err={s}\n", .{ r.returned, if (r.err) |e| @errorName(e) else "none" });
+        return error.HalfFrameHeld;
     }
 }
