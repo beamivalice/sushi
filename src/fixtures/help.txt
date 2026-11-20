@@ -120,6 +120,11 @@ Options:
                       come out of the expert cache)
   --no-prevent-sleep  Allow Mac idle sleep during inference and model
                       loads. Display sleep is always allowed.
+  --no-continue-after-thought
+                      Return a reply that ends its turn with only its
+                      thinking as it is: no answer or tool call. By default
+                      sushi closes the thought and lets the model continue
+                      once (finish_details says so). Outranks the setting.
   --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
                         refuses a load whose weights + warmup headroom
                         look too big for current free memory. The check
