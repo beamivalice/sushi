@@ -2700,6 +2700,10 @@ pub fn verifyRowsJoined(
     if (total > 12) return null;
     // Past the rows launch the trellis GEMM serves, in other bytes than a row's own tick.
     if (trellis and @import("sushi_exl3").trunk.gemmRows(@intCast(total), self.spec_capture_ssm)) return null;
+    // A speculative group's total is any sum of its rows' widths: one pipeline serves them all, so none compiles inside a
+    // request. A plain group's total is its row count, each of which the warm joins.
+    const joined_was = @import("sushi_exl3").trunk.joinedRows(trellis and total > inputs.len);
+    defer _ = @import("sushi_exl3").trunk.joinedRows(joined_was);
     const vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     var joined = mlx.mlx_array_new();

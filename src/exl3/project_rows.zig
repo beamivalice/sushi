@@ -505,6 +505,102 @@ var rows_nax_pend_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 
 var rows_finish_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
+/// Joined rows of a batch (`trunk.joinedRows`): a NAX launch of any row total runs one of two pipelines, compiled at
+/// eight rows or the cap's and their chunk, its kernel reading the row count off its input, so a total no warm met
+/// compiles nothing. On the NAX
+/// arm the k walk never depends on the row count (`rowsLaunch`), so a row keeps its bits.
+pub var dyn_rows: bool = false;
+
+var rows_nax_dyn_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+
+var rows_finish_dyn_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+var rows_dyn_cfgs: kernel_src.CfgCache(RowsKey, 64) = .{};
+
+var rows_finish_dyn_cfgs: kernel_src.CfgCache(RowsFinishKey, 64) = .{};
+
+/// `src` with its row count `RN`, read at run time as `rn`; the threadgroup arrays keep the compiled ROWS (the cap).
+fn dynRowsSource(comptime src: []const u8, comptime rn: []const u8) [:0]const u8 {
+    comptime {
+        var t: []const u8 = kernels.metalReplaceFound(src, "uint(ROWS)", "RN");
+        // Past eight rows is decided at compile time on an eight-row pipeline, at run time on the cap's.
+        if (std.mem.indexOf(u8, t, "ROWS > 8") != null) t = kernels.metalReplaceFound(t, "ROWS > 8", "(ROWS > 8 && RN > 8u)");
+        for ([_][]const u8{ "PREP_F", "PART_F" }) |f| {
+            if (std.mem.indexOf(u8, t, "constexpr uint " ++ f ++ " = RN") != null)
+                t = kernels.metalReplaceFound(t, "constexpr uint " ++ f ++ " = RN", "constexpr uint " ++ f ++ " = uint(ROWS)");
+        }
+        return "const uint RN = " ++ rn ++ ";\n" ++ t;
+    }
+}
+
+const ROWS_NAX_DYN_SOURCE: [:0]const u8 = dynRowsSource(ROWS_NAX_SOURCE, "uint(x_shape[0]) / uint(GROUPS)");
+
+const ROWS_FINISH_DYN_SOURCE: [:0]const u8 = dynRowsSource(ROWS_FINISH_SOURCE, "uint(threadgroups_per_grid.y)");
+
+/// The rows a dynamic-rows launch of `rows` compiles at: eight or the cap, so a small total keeps a wide chunk.
+fn dynCap(rows: c_int) c_int {
+    return if (rows <= 8) 8 else NAX_ROWS_MAX;
+}
+
+/// The geometry a dynamic-rows launch compiles at: `g`'s, staged at its cap's chunk.
+fn dynGeom(l: RowsLaunch, g: RowsGeom) RowsGeom {
+    var d = g;
+    d.chunk = rowsChunk(l.in_dim, dynCap(l.rows), g.nsplit);
+    return d;
+}
+
+/// How many template sets a dynamic-rows launch of this shape compiles over every row total: one a cap.
+fn dynTemplates(in_dim: c_int, out_dim: c_int, groups: c_int, mode: Mode) usize {
+    const Set = struct { cap: c_int, geom: RowsGeom };
+    var seen: [@intCast(NAX_ROWS_MAX)]Set = undefined;
+    var count: usize = 0;
+    for (1..@as(usize, @intCast(NAX_ROWS_MAX)) + 1) |rows| {
+        const l: RowsLaunch = .{ .in_dim = in_dim, .out_dim = out_dim, .rows = @intCast(rows), .groups = groups, .n = 0, .out_dt = .bfloat16 };
+        const d: Set = .{ .cap = dynCap(l.rows), .geom = dynGeom(l, rowsGeometry(in_dim, out_dim, @intCast(rows), groups, mode)) };
+        for (seen[0..count]) |x| {
+            if (std.meta.eql(x, d)) break;
+        } else {
+            seen[count] = d;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn launchRowsDyn(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, bounds: [3]c_int) !mlx.mlx_array {
+    const d = dynGeom(l, g);
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = d };
+    const cfg = rows_dyn_cfgs.get(key) orelse blk: {
+        const c = try buildRowsCfg(l, d, bounds, .{}, dynCap(l.rows));
+        rows_dyn_cfgs.put(key, c);
+        break :blk c;
+    };
+    const kernel = try kernel_src.codebookKernelWith(&rows_nax_dyn_kernel, "sushi_exl3_rows_nax_dyn", &ROWS_INS, &.{"y"}, ROWS_NAX_DYN_SOURCE, ROWS_NAX_FRAGS);
+    const ov = try kernels.applyOuts(s, kernel, &.{ x, trellis, suh, svh }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+    if (rowsFolds(d)) {
+        const whole = y;
+        y = mlx.mlx_array_new();
+        return whole;
+    }
+    const fkey = RowsFinishKey{ .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .nsplit = d.nsplit, .out_dt = l.out_dt, .bounds = bounds };
+    const fcfg = rows_finish_dyn_cfgs.get(fkey) orelse blk: {
+        const c = try buildFinishCfg(l, d.nsplit, bounds, dynCap(l.rows));
+        rows_finish_dyn_cfgs.put(fkey, c);
+        break :blk c;
+    };
+    const fk = try kernels.getNamedKernel(&rows_finish_dyn_kernel, "sushi_exl3_rows_finish_dyn", &.{ "part", "svh" }, &.{"y"}, ROWS_FINISH_DYN_SOURCE, ROWS_HELPERS);
+    const fv = try kernels.applyOuts(s, fk, &.{ y, svh }, fcfg, 1);
+    defer _ = mlx.mlx_vector_array_free(fv);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, fv, 0));
+    return out;
+}
+
 const RowsFinishRmsKey = struct { out_dim: c_int, rows: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int, norm: c_int };
 
 /// A stacked shape at each of its decode widths.
@@ -749,14 +845,15 @@ pub fn pinCfg(l: RowsLaunch, g: RowsGeom, seg_bounds: ?[3]c_int) !PinnedCfg {
     const bounds = seg_bounds orelse @as([3]c_int, @splat(l.out_dim));
     const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
     for (pinned.items) |p| if (std.meta.eql(p.key, key)) return p.cfgs;
-    const cfg = try buildRowsCfg(l, g, bounds, .{});
+    const cfg = try buildRowsCfg(l, g, bounds, .{}, null);
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    const finish: ?mlx.mlx_fast_metal_kernel_config = if (rowsFolds(g)) null else try buildFinishCfg(l, g.nsplit, bounds);
+    const finish: ?mlx.mlx_fast_metal_kernel_config = if (rowsFolds(g)) null else try buildFinishCfg(l, g.nsplit, bounds, null);
     try pinned.append(std.heap.page_allocator, .{ .key = key, .cfgs = .{ .cfg = cfg, .finish = finish } });
     return pinned.items[pinned.items.len - 1].cfgs;
 }
 
-fn buildRowsCfg(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, pend: Pending) !mlx.mlx_fast_metal_kernel_config {
+/// `tmpl_rows`: the ROWS the kernel is compiled at (null: `l.rows`); a dynamic-rows kernel takes the cap's.
+fn buildRowsCfg(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, pend: Pending, tmpl_rows: ?c_int) !mlx.mlx_fast_metal_kernel_config {
     const fold = rowsFolds(g);
     const c = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -766,7 +863,7 @@ fn buildRowsCfg(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, pend: Pending) !ml
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", l.out_dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(@divExact(l.out_dim, 16), 2 * g.tgrp) * sgs * 32, g.nsplit, l.groups));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, sgs * 32, 1, 1));
-    inline for (.{ "IDIM", "ODIM", "ROWS", "GROUPS", "TGRP", "KPH", "NSPLIT", "CHUNK", "FOLD" }, .{ l.in_dim, l.out_dim, l.rows, l.groups, g.tgrp, g.kph, g.nsplit, g.chunk, @as(c_int, @intFromBool(fold)) }) |name, v|
+    inline for (.{ "IDIM", "ODIM", "ROWS", "GROUPS", "TGRP", "KPH", "NSPLIT", "CHUNK", "FOLD" }, .{ l.in_dim, l.out_dim, tmpl_rows orelse l.rows, l.groups, g.tgrp, g.kph, g.nsplit, g.chunk, @as(c_int, @intFromBool(fold)) }) |name, v|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, v));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(l.n)));
     if (g.nax) {
@@ -787,9 +884,10 @@ fn buildRowsCfg(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, pend: Pending) !ml
 pub fn launchRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, seg_bounds: ?[3]c_int, pin: ?PinnedCfg) !mlx.mlx_array {
     const fold = rowsFolds(g);
     const bounds = seg_bounds orelse @as([3]c_int, @splat(l.out_dim));
+    if (dyn_rows and g.nax) return launchRowsDyn(s, x, trellis, suh, svh, l, g, bounds);
     const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
     const cfg = if (pin) |p| p.cfg else rows_cfgs.get(key) orelse blk: {
-        const c = try buildRowsCfg(l, g, bounds, .{});
+        const c = try buildRowsCfg(l, g, bounds, .{}, null);
         rows_cfgs.put(key, c);
         break :blk c;
     };
@@ -824,7 +922,7 @@ pub fn launchRowsNormed(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_ar
     if (!normedFits(l, g, bounds, norm)) return error.BadExl3Shape;
     const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 1, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
     const cfg = if (pin) |p| p.cfg else rows_cfgs.get(key) orelse blk: {
-        const c = try buildRowsCfg(l, g, bounds, .{});
+        const c = try buildRowsCfg(l, g, bounds, .{}, null);
         rows_cfgs.put(key, c);
         break :blk c;
     };
@@ -863,7 +961,7 @@ pub fn launchRowsParts(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_arr
     const bounds: [3]c_int = @splat(l.out_dim);
     const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
     const cfg = rows_cfgs.get(key) orelse blk: {
-        const c = try buildRowsCfg(l, g, bounds, .{});
+        const c = try buildRowsCfg(l, g, bounds, .{}, null);
         rows_cfgs.put(key, c);
         break :blk c;
     };
@@ -884,7 +982,7 @@ pub fn launchRowsFrom(s: mlx.mlx_stream, part: mlx.mlx_array, xsvh: mlx.mlx_arra
     const bounds: [3]c_int = @splat(l.out_dim);
     const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 1, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g, .pend = pend };
     const cfg = rows_cfgs.get(key) orelse blk: {
-        const c = try buildRowsCfg(l, g, bounds, pend);
+        const c = try buildRowsCfg(l, g, bounds, pend, null);
         rows_cfgs.put(key, c);
         break :blk c;
     };
@@ -915,7 +1013,7 @@ pub fn rowsFinishRowMajor(s: mlx.mlx_stream, part: mlx.mlx_array, svh: mlx.mlx_a
     const bounds: [3]c_int = @splat(l.out_dim);
     const key = RowsFinishKey{ .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .nsplit = nsplit, .out_dt = l.out_dt, .bounds = bounds };
     const cfg = rows_finish_row_major_cfgs.get(key) orelse blk: {
-        const c = try buildFinishCfg(l, nsplit, bounds);
+        const c = try buildFinishCfg(l, nsplit, bounds, null);
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "GRP", l.groups));
         rows_finish_row_major_cfgs.put(key, c);
@@ -976,7 +1074,7 @@ pub fn hasFinish(g: RowsGeom) bool {
     return !rowsFolds(g);
 }
 
-fn buildFinishCfg(l: RowsLaunch, nsplit: c_int, bounds: [3]c_int) !mlx.mlx_fast_metal_kernel_config {
+fn buildFinishCfg(l: RowsLaunch, nsplit: c_int, bounds: [3]c_int, tmpl_rows: ?c_int) !mlx.mlx_fast_metal_kernel_config {
     const c = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ l.groups * l.rows, l.out_dim }, 2, l.out_dt));
@@ -984,7 +1082,7 @@ fn buildFinishCfg(l: RowsLaunch, nsplit: c_int, bounds: [3]c_int) !mlx.mlx_fast_
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(l.out_dim, 128) * 32, l.rows, l.groups));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", l.out_dim));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ROWS", l.rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ROWS", tmpl_rows orelse l.rows));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NSPLIT", nsplit));
     inline for (.{ "SB1", "SB2", "SB3" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, bounds[i]));
     return c;
@@ -993,7 +1091,7 @@ fn buildFinishCfg(l: RowsLaunch, nsplit: c_int, bounds: [3]c_int) !mlx.mlx_fast_
 fn rowsFinish(s: mlx.mlx_stream, part: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, nsplit: c_int, bounds: [3]c_int, pin: ?mlx.mlx_fast_metal_kernel_config) !mlx.mlx_array {
     const key = RowsFinishKey{ .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .nsplit = nsplit, .out_dt = l.out_dt, .bounds = bounds };
     const cfg = pin orelse rows_finish_cfgs.get(key) orelse blk: {
-        const c = try buildFinishCfg(l, nsplit, bounds);
+        const c = try buildFinishCfg(l, nsplit, bounds, null);
         rows_finish_cfgs.put(key, c);
         break :blk c;
     };
@@ -1237,6 +1335,40 @@ test "exl3 NAX multi-row: at 9 to 16 rows every row equals the one-row launch bi
             for (0..sh[2]) |grp| for (0..rows) |r|
                 try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
         }
+    }
+}
+
+test "exl3 NAX joined rows: one launch at every row total gives each row its one-row launch's bits, folded and k-split" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s) or !kernels.gemmNaxOn()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    defer kernels.setDecodeParams(.mul1);
+    const exact: Mode = .{ .exact = true };
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    const n: u32 = 96;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    defer dyn_rows = false;
+    // A bank on the folded launch and a deep k split through the finish.
+    for ([_][3]usize{ .{ 1024, 256, 2 }, .{ 131072, 256, 1 } }) |sh| {
+        const rig = try RowsRig.init(alloc, 0x70a1 + sh[0] + n, sh[0], sh[1], sh[2], n);
+        const g1 = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), exact);
+        dyn_rows = false;
+        var alone: [@as(usize, @intCast(NAX_ROWS_MAX))][]const u16 = undefined;
+        for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
+        dyn_rows = true;
+        for (1..@as(usize, @intCast(NAX_ROWS_MAX)) + 1) |rows| {
+            const g = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), exact);
+            const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
+            for (0..sh[2]) |grp| for (0..rows) |r| {
+                errdefer std.debug.print("joined rows: {d}x{d} bank of {d}, {d} rows, row {d} of group {d}\n", .{ sh[0], sh[1], sh[2], rows, r, grp });
+                try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
+            };
+        }
+        // Every total ran one template set a cap: eight rows' and the cap's.
+        try std.testing.expectEqual(@as(usize, 2), dynTemplates(@intCast(sh[0]), @intCast(sh[1]), @intCast(sh[2]), exact));
     }
 }
 

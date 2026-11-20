@@ -3279,6 +3279,13 @@ pub const Trunk = struct {
     pub fn moeSharedDown(self: *Trunk, comptime proj: SharedProjKind, x: mlx.mlx_array, mw: *const MoeMlpWeights, widths: []const c_int) !?mlx.mlx_array {
         // Joined rows run a stacked trellis bank over every row as one row's tick runs it; a stack the rows outgrow
         // would run its parts alone, in other bytes, so the rows decline it.
+        var total: c_int = 0;
+        for (widths) |w| total += w;
+        // Speculative rows (a row wider than one) run every total through one pipeline, as `verifyRowsJoined` does.
+        const joined_was: ?bool = if (proj == .verify_rows) @import("sushi_exl3").trunk.joinedRows(total > widths.len) else null;
+        defer if (joined_was) |was| {
+            _ = @import("sushi_exl3").trunk.joinedRows(was);
+        };
         const stacked = try self.stackedPair(x, mw.shared_gate_up_stack);
         if (proj == .verify_rows and mw.shared_gate_up_stack != null and stacked == null) return null;
         const gate = if (stacked) |pair| pair[0] else (try self.moeSharedProject(proj, x, &mw.shared_gate, widths)) orelse return null;

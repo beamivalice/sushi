@@ -302,6 +302,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## NAX and Metal pitfalls
 
+- **A template value a request varies compiles inside the request**: the warm compiles only the values it meets. A
+  speculative group's joined row total is any sum of its rows' widths, so its EXL3 rows launch reads the count at run
+  time (`project_rows.dyn_rows`: two pipelines, at eight rows and at the cap, past eight decided at compile time on the
+  first); a plain group's total, its row count, stays a template value, since the warm joins every count and a run-time
+  count costs a plain tick about 3%.
 - **A cooperative-tensor template arg is `metal::remove_addrspace_t<decltype(t)>`**, never `decltype(t)` (the
   macOS 27 MPP header rejects the `thread` qualifier).
 - Metal JIT-compiles at first EVAL, not at apply, so an optional NAX arm is PROBED on a one-tile problem before it

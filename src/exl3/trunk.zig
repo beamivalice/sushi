@@ -37,6 +37,13 @@ fn launchOpts(wide: bool) linear.Opts {
     return .{ .rows = .{ .exact = true, .wide = wide }, .decoded_billed = true };
 }
 
+/// Joined rows of a batch run every row total through one pipeline (`project_rows.dyn_rows`); returns what it was.
+pub fn joinedRows(on: bool) bool {
+    const was = project_rows.dyn_rows;
+    project_rows.dyn_rows = on;
+    return was;
+}
+
 /// Whether `matmul` of `rows` rows runs the sorted GEMM, which holds its prepared rows and an f16 plane beside its output.
 pub fn gemmRows(rows: u64, wide: bool) bool {
     return rows > @as(u64, @intCast(project_rows.rowsMax(launchOpts(wide).rows)));
