@@ -94,12 +94,12 @@ pub fn apiOfPath(path: []const u8) Api {
     return if (std.mem.eql(u8, path, "/v1/messages") or std.mem.startsWith(u8, path, "/v1/messages/")) .anthropic else .openai;
 }
 
-/// The API of a request head's target, its query left out.
-fn apiOfHead(head: []const u8) Api {
-    var words = std.mem.splitScalar(u8, head[0 .. std.mem.indexOf(u8, head, "\r\n") orelse head.len], ' ');
-    _ = words.next();
-    const target = words.next() orelse return .openai;
-    return apiOfPath(target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len]);
+/// The request line decides the error envelope and whether an answer carries a body, so it is read before the reader
+/// can answer anything (a 431, a 413, the shutdown error).
+fn noteRequestLine(stream: *Conn, head: []const u8) void {
+    const line = http_head.requestLine(head);
+    stream.api = apiOfPath(line.target[0 .. std.mem.indexOfScalar(u8, line.target, '?') orelse line.target.len]);
+    stream.head_only = std.mem.eql(u8, line.method, "HEAD");
 }
 
 /// Bridge that lets a Conn route OpenAI-Responses output through a WebSocket
@@ -779,7 +779,7 @@ fn answerExpect(allocator: std.mem.Allocator, stream: *Conn, head: []const u8) !
 /// nothing.
 fn refuseAtShutdown(allocator: std.mem.Allocator, stream: *Conn, head: []const u8) !ReadOutcome {
     if (std.mem.indexOf(u8, head, "\r\n") == null) return .shutdown;
-    stream.api = apiOfHead(head);
+    noteRequestLine(stream, head);
     try sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503);
     return .shutdown;
 }
@@ -856,13 +856,13 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
         total_read += n;
         if (std.mem.indexOf(u8, hdr_buf[0..total_read], "\r\n\r\n")) |he| break he + 4;
     } else {
-        stream.api = apiOfHead(hdr_buf[0..total_read]);
+        noteRequestLine(stream, hdr_buf[0..total_read]);
         log.warn("[http] 431: a request head over {d} KB\n", .{MAX_HEAD_BYTES / 1024});
         try sendErrorResponse(allocator, stream, "431 Request Header Fields Too Large", "invalid_request_error", "The request head (its line and headers) is over the 16 KB limit", 431);
         return .head_too_large;
     };
     const head = hdr_buf[0..header_end_pos];
-    stream.api = apiOfHead(head);
+    noteRequestLine(stream, head);
     const max_request_bytes = server_state.max_request_bytes.load(.monotonic);
 
     const length = switch (http_head.framing(head) catch |err| switch (err) {
@@ -2915,6 +2915,44 @@ test "read: a Content-Length the reader does not take whole (no space, a tab, ju
         if (!whole and !refused) {
             const hl = std.mem.indexOf(u8, sent, "Content-Length") orelse 0;
             std.debug.print("'{s}': outcome={s} routed body='{s}' ({d} B)\n", .{ sent[hl .. std.mem.indexOf(u8, sent, "\r\n\r\n") orelse sent.len], if (r.outcome) |x| @tagName(x) else "none", r.body, r.body.len });
+            bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+/// A request head of exactly `total` bytes: `line`, one pad header, the blank line.
+fn headOfSize(a: std.mem.Allocator, line: []const u8, extra: []const u8, total: usize) ![]u8 {
+    const fixed = line.len + "X-Pad: ".len + "\r\n".len + extra.len + "\r\n".len;
+    const pad = total - fixed;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, line);
+    try out.appendSlice(a, "X-Pad: ");
+    try out.appendNTimes(a, 'p', pad);
+    try out.appendSlice(a, "\r\n");
+    try out.appendSlice(a, extra);
+    try out.appendSlice(a, "\r\n");
+    std.debug.assert(out.items.len == total);
+    return out.toOwnedSlice(a);
+}
+
+test "read: a HEAD refused by the reader (431, 413, 503 at a shutdown) carries no body" {
+    const a = std.testing.allocator;
+    var bad: usize = 0;
+    const big = try headOfSize(a, "HEAD /health HTTP/1.1\r\n", "", 17_000);
+    defer a.free(big);
+    const previous = server_state.max_request_bytes.swap(4096, .monotonic);
+    defer server_state.max_request_bytes.store(previous, .monotonic);
+    for ([_]struct { what: []const u8, o: ReadOpts }{
+        .{ .what = "431", .o = .{ .sent = big, .limit_ms = 1000 } },
+        .{ .what = "413", .o = .{ .sent = "HEAD /v1/models HTTP/1.1\r\nContent-Length: 999999\r\n\r\n", .limit_ms = 1000 } },
+        .{ .what = "503 shutdown", .o = .{ .sent = "HEAD /v1/models HTTP/1.1\r\nHost: x\r\n\r\n", .limit_ms = 1000, .shutdown_first = true } },
+    }) |c| {
+        const r = try readAgainst(c.o);
+        defer freeRead(r);
+        const body = responseBody(r.reply);
+        if (!std.mem.startsWith(u8, r.reply, "HTTP/1.1 ") or body.len != 0) {
+            std.debug.print("HEAD {s}: outcome={s} {d}-byte body: '{s}'\n", .{ c.what, if (r.outcome) |x| @tagName(x) else "none", body.len, body[0..@min(body.len, 120)] });
             bad += 1;
         }
     }
