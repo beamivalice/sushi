@@ -1193,6 +1193,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   tokens on the M5 against none from RAM. A per-request record would win that back for ~50 MB a running request.
   The tier keeps no point under `MIN_PERSIST_TOKENS` (512), so a next turn of a conversation shorter than that reuses
   nothing on a joined load, where a one-row load rolls its live record back.
+<a id="concurrency"></a>
 - **A fully resident load joins rows** (`dsv41_sched.coolerRows`, the owner's call: batching for full residence, never
   for streaming; on Sushi Cooler only, so the opt-out to MLX keeps one request at a time): when the expert plan holds
   every routed expert (`ModelConfig.expert_resident`, from
@@ -1202,7 +1203,10 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   request at a time (`ownsModuleDecodeState`), and the scheduler's plain decode tick joins the slots
   (`dsv41_sched.batchedForward` over `forwardRows`, each slot's position moved as its solo step would). A slot joins
   once its prefill made its state (`readyToBatch`), an image prompt's too (its decode rows carry no image rows); a
-  DSpark slot ticks alone as a spec slot does, beside the joined rows. Admission bills each request's state as growth
+  DSpark slot drafts alone, and with `rows_company_min` (3) of its model's slots decoding rides the joined tick as a plain
+  row (`dsv41_sched.tickClass` `.rows_company`, as GLM's DFlash2 slots do): measured on the M5 Ultra (STQ 1.75bpw, d35144e3,
+  aggregate tok/s, DSpark against joined plain) 2 slots 95.3 / 92.2 greedy, 3 slots 94.0 / 107.5, 4 slots 87.1 / 116.7;
+  each request keeps its solo DSpark text, greedy and seeded (`three DeepSeek DSpark requests decoding at once`). Admission bills each request's state as growth
   after admission (`dsv41_bill.commitBytes`). Decode rows take no lazy first layer, layer pipelining or CED, none of
   which runs at a resident load's decode anyway. A forward with no slot request (a warm, a test) runs the state lent
   around it, else the model's own (`lendOwn`). Load line: `[cooler] one forward carries N rows; steps run the exact

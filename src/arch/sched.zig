@@ -312,7 +312,15 @@ pub fn rowsInCompany(slot: *const Slot, drafting: []const *Slot, plain: []const 
     var company: usize = 0;
     for (drafting) |other| company += @intFromBool(other.model == slot.model);
     for (plain) |other| company += @intFromBool(other.model == slot.model);
-    return company >= 2;
+    return company >= rowsCompanyMin(slot);
+}
+
+/// How many slots of one model decoding at once make a drafting slot ride a plain row: the arch's crossover, else two.
+fn rowsCompanyMin(slot: *const Slot) usize {
+    const tag = tagOfSlot(slot) orelse return 2;
+    return switch (tag) {
+        inline else => |t| if (comptime has(t, "rows_company_min")) S(t).rows_company_min else 2,
+    };
 }
 
 /// The state a new slot owns beside its KV cache; null where the arch keeps none per request.
@@ -556,7 +564,7 @@ const known_hooks = [_][]const u8{
     "prepareCommit",   "publishLive",   "commitOwn",      "cancelledNeedsCheckpoints", "handoffHistory",  "mtpHeadCommit",
     "restoreTarget",   "restoreEnd",    "writeThrough",  "nativeDflashArmed",                          "thoughtGrid",     "armThoughtPoint",
     "afterSpecBlock",  "endRequest",    "resetForRetry",  "flushResident",
-    "logCheckpointsKept", "prepare_commit_label", "cancelled_entry_label",
+    "logCheckpointsKept", "prepare_commit_label", "cancelled_entry_label", "rows_company_min",
 };
 
 fn isHook(comptime name: []const u8) bool {

@@ -577,3 +577,134 @@ fn greedyOn(ld: *Load, ids: []const u32, n: u32) !std.ArrayList(u32) {
     while (try gen.next(a)) |t| try got.append(a, t);
     return got;
 }
+
+/// DeepSeek DSpark requests decoded together: each slot's tokens, and the DSpark rounds every slot had run when all three
+/// were decoding after one tick, and when the last one was left alone.
+const DsparkCompany = struct {
+    tokens: [3]std.ArrayList(u32) = .{ .empty, .empty, .empty },
+    rounds_before_joined_tick: [3]u64 = @splat(0),
+    rounds_after_joined_tick: [3]u64 = @splat(0),
+    last_alone_rounds: u64 = 0,
+    last_end_rounds: u64 = 0,
+    failed: usize = 0,
+
+    fn deinit(self: *DsparkCompany) void {
+        for (&self.tokens) |*t| t.deinit(testing.allocator);
+    }
+};
+
+/// DSpark requests over `prompts`, each to its own `max`, decoded in one scheduler as the server ticks them.
+fn dsparkCompany(ld: *Load, dir: []const u8, prompts: []const []const u32, max: []const u32, sampling: SamplingParams) !DsparkCompany {
+    const scheduler = Served.scheduler;
+    const a = testing.allocator;
+    var sv: Served = undefined;
+    try sv.init(ld, dir);
+    defer sv.deinit();
+    const sch = &sv.sch;
+    // Every request in flight at once: the harness's queue holds two.
+    sch.queue_cap = @intCast(prompts.len);
+    var run: DsparkCompany = .{};
+    errdefer run.deinit();
+    var slots: [3]?*scheduler.Slot = .{ null, null, null };
+    defer {
+        for (slots) |s| if (s) |x| sch.complete(x);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+        sch.cleanup_queue.clearRetainingCapacity();
+    }
+    const head = @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null);
+    for (prompts, max, 0..) |p, m, i| {
+        const s = try sch.submit(.{ .model = sv.entry, .prompt_ids = p, .sampling = sampling, .eos_token_ids = &.{}, .max_tokens = m, .enable_mtp = true, .mtp = head });
+        slots[i] = s;
+        _ = sch.pending.orderedRemove(0);
+        try scheduler.runPrefill(sch, s);
+        if (!scheduler.postPrefillTerminal(sch, s)) try sch.decoding.append(a, s);
+    }
+    const n = prompts.len;
+    const roundsOf = struct {
+        fn f(s: *scheduler.Slot) u64 {
+            return s.legacy_gen.?.dspark_stats.rounds;
+        }
+    }.f;
+    var ticks: usize = 0;
+    var alone_seen = false;
+    while (ticks < 2000) : (ticks += 1) {
+        var act: [3]*scheduler.Slot = undefined;
+        var k: usize = 0;
+        for (sch.decoding.items) |s| if (s.joinsTick()) {
+            act[k] = s;
+            k += 1;
+        };
+        if (k == 0) break;
+        if (ticks == 0 and k == n) for (slots[0..n], 0..) |s, i| {
+            run.rounds_before_joined_tick[i] = roundsOf(s.?);
+        };
+        if (k == 1 and !alone_seen) {
+            alone_seen = true;
+            run.last_alone_rounds = roundsOf(act[0]);
+        }
+        scheduler.runDecodeTick(sch, act[0..k]) catch |e| for (act[0..k]) |s| s.markError(@errorName(e));
+        if (ticks == 0 and k == n) for (slots[0..n], 0..) |s, i| {
+            run.rounds_after_joined_tick[i] = roundsOf(s.?);
+        };
+        scheduler.cullDecoding(sch);
+    }
+    run.last_end_rounds = roundsOf(slots[n - 1].?);
+    for (slots[0..n], 0..) |s, i| {
+        const x = s.?;
+        if (x.error_code) |code| {
+            run.failed += 1;
+            var msg: [300]u8 = undefined;
+            const why = mlx.takeError(&msg);
+            std.debug.print("dsparkCompany: request {d} of {d} failed: {s} ({?s})\n", .{ i, n, code, why });
+            continue;
+        }
+        try run.tokens[i].appendSlice(a, x.legacy_gen.?.generated_ids.items);
+    }
+    return run;
+}
+
+test "cooler contract: three DeepSeek DSpark requests decoding at once run as joined plain rows, each its solo DSpark text greedy and seeded, and the one left alone drafts again" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const ids = try D.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(D, dir, true);
+    defer _ = ld.close();
+    if ((arch_sched.rowCap(&ld.config) orelse 1) < 3) return error.SkipZigTest;
+    var bufs: [3][18]u32 = undefined;
+    var prompts: [3][]const u32 = undefined;
+    for (&bufs, &prompts, 0..) |*b, *p, i| {
+        for (b, 0..) |*t, j| t.* = ids[(j * (i + 2) + 3 * i) % ids.len];
+        p.* = b[0 .. 10 + 4 * i];
+    }
+    const max = [3]u32{ 8, 14, 24 };
+    // A sampled request draws each position once (its seed's), so its text is the same however its rounds ran.
+    for ([_]SamplingParams{ .{ .temperature = 0.0 }, .{ .temperature = 0.8, .top_p = 0.95, .seed = 7 } }) |sampling| {
+        var solo: [3]DsparkCompany = undefined;
+        var made: usize = 0;
+        defer for (solo[0..made]) |*r| r.deinit();
+        for (0..3) |i| {
+            solo[i] = try dsparkCompany(&ld, dir, prompts[i .. i + 1], max[i .. i + 1], sampling);
+            made += 1;
+            try testing.expectEqual(@as(usize, 0), solo[i].failed);
+            try testing.expect(solo[i].last_end_rounds > 0);
+        }
+        var together = try dsparkCompany(&ld, dir, &prompts, &max, sampling);
+        defer together.deinit();
+        try testing.expectEqual(@as(usize, 0), together.failed);
+        for (0..3) |i| {
+            // Joined: three requests decoding at once run no DSpark round, each its plain row.
+            try testing.expectEqual(together.rounds_before_joined_tick[i], together.rounds_after_joined_tick[i]);
+            try testing.expectEqualSlices(u32, solo[i].tokens[0].items, together.tokens[i].items);
+        }
+        // Left alone, the last request drafts again.
+        try testing.expect(together.last_end_rounds > together.last_alone_rounds);
+    }
+}

@@ -76,6 +76,18 @@ pub fn padsBatch(config: *const ModelConfig) bool {
     return joinedRows(config) <= 1;
 }
 
+/// A DSpark slot with this many of its model's slots decoding (itself included) rides the joined tick as a plain row:
+/// from three, joined plain rows out-run DSpark rounds taken one slot at a time (dsv41-arch#concurrency).
+pub const rows_company_min: usize = 3;
+
+/// A DSpark slot on a load that joins rows decodes as a plain row of the joined tick when in company; alone it drafts.
+pub fn tickClass(slot: *const Slot) sched.TickClass {
+    const gen = if (slot.legacy_gen) |*g| g else return .none;
+    if (!gen.dspark or gen.done) return .none;
+    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or @import("../sampler.zig").penaltyActive(slot.sampling)) return .none;
+    return if (modelBatches(arch_handle.trunk(slot.model.handle orelse return .none))) .rows_company else .none;
+}
+
 /// A slot joins once its prefill made its request's state.
 pub fn readyToBatch(xfm: *const Trunk, ctx: *ForwardCtx) bool {
     const m = xfm.arch_state.dsv41.model orelse return true;
@@ -274,13 +286,18 @@ test "an arch whose request state lives in the model restores into it under its 
     try std.testing.expect(!sched.commitsAtCull(&slot));
 }
 
-test "a DeepSeek DSpark slot ticks alone beside the joined rows, and a plain slot joins them" {
+test "a DeepSeek slot with no DSpark round ticks alone or joins as plain, and a drafting one needs three of its model's slots for company" {
     const sched_policy = @import("../sched_policy.zig");
     var xfm = testTrunk("deepseek_v41");
     var lm: model_registry.LoadedModel = undefined;
-    const slot = sched.testSlot(&xfm, &lm, .{ .model_type = "deepseek_v41" });
-    // No DeepSeek slot rides another bucket: a DSpark one (a spec slot) runs its own round each tick.
-    try std.testing.expectEqual(sched.TickClass.none, sched.tickClass(&slot));
+    var other: model_registry.LoadedModel = undefined;
+    var slots = [_]Slot{ sched.testSlot(&xfm, &lm, .{ .model_type = "deepseek_v41" }), sched.testSlot(&xfm, &lm, .{ .model_type = "deepseek_v41" }), sched.testSlot(&xfm, &lm, .{ .model_type = "deepseek_v41" }), sched.testSlot(&xfm, &other, .{ .model_type = "deepseek_v41" }) };
+    // A slot with no generator drafting: no rows class.
+    try std.testing.expectEqual(sched.TickClass.none, sched.tickClass(&slots[0]));
     try std.testing.expectEqual(sched_policy.TickBucket.serial, sched_policy.bucketOf(.spec_active, .none, .{}));
     try std.testing.expectEqual(sched_policy.TickBucket.batch, sched_policy.bucketOf(.ok, .none, .{}));
+    // Two of the model's slots are no company for a drafting one; three are, a slot of another model never counts.
+    try std.testing.expect(!sched.rowsInCompany(&slots[0], &.{&slots[0]}, &.{&slots[1]}));
+    try std.testing.expect(!sched.rowsInCompany(&slots[0], &.{ &slots[0], &slots[1] }, &.{&slots[3]}));
+    try std.testing.expect(sched.rowsInCompany(&slots[0], &.{ &slots[0], &slots[1] }, &.{&slots[2]}));
 }
