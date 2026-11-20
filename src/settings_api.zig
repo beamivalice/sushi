@@ -741,6 +741,7 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
     var model_path: []const u8 = "";
     var model_entry: ?*model_registry_mod.LoadedModel = null;
     var model_loaded = false;
+    var model_fit: ?model_settings.Fit = null;
     if (plan.model_id) |id| {
         const entry = sch.registry.resolveEntry(id) catch {
             try http.sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
@@ -754,17 +755,12 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         sch.registry.mutex.unlock(sch.io);
         if (plan.model_edits.len > 0) {
             readPackFacts(stream.io, allocator, &row);
-            var held = model_settings.load(allocator, stream.io, path);
-            defer held.deinit();
-            if (refusalMessage(arena, row.fit, model_settings.modelObject(&held, model_path), plan.model_edits)) |message| {
-                try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", message, 400);
-                return;
-            }
+            model_fit = row.fit;
         }
     }
 
     const live: Live = .{ .sch = sch, .io = stream.io, .path = path, .model = model_entry };
-    const saved = save(live, arena, stream.io, path, plan, model_path) catch |err| return writeFailed(allocator, stream, err);
+    const saved = save(live, arena, stream.io, path, plan, model_path, model_fit) catch |err| return writeFailed(allocator, stream, err);
     const messages = switch (saved) {
         .refused => |message| {
             try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", message, 400);
@@ -834,7 +830,7 @@ const Live = struct {
 };
 
 pub const Outcome = union(enum) {
-    /// The save broke a rule of the effort tables; nothing was written.
+    /// The save broke a rule of the effort tables or of the model's settings; nothing was written.
     refused: []const u8,
     /// One answer per server edit, in the plan's order.
     saved: []const []const u8,
@@ -891,7 +887,8 @@ fn applyServerEdit(host: anytype, arena: std.mem.Allocator, locks: *const model_
 
 /// The one save path: every section in one rewrite of the file, then each server key applied to the running server,
 /// then the stored load failures its moved keys end. A write that fails returns before anything is applied.
-fn save(host: anytype, arena: std.mem.Allocator, io: std.Io, path: []const u8, plan: Plan, model_path: []const u8) !Outcome {
+/// `fit`: the model's, when the plan edits a model: its edits are judged against the file this save rewrites.
+fn save(host: anytype, arena: std.mem.Allocator, io: std.Io, path: []const u8, plan: Plan, model_path: []const u8, fit: ?model_settings.Fit) !Outcome {
     const locks = &model_settings.launch_locks;
     // Read, check, write and apply under the write lock: a save never merges into a file another one is rewriting,
     // and the file's last save is the server's last apply.
@@ -899,6 +896,10 @@ fn save(host: anytype, arena: std.mem.Allocator, io: std.Io, path: []const u8, p
     defer model_settings.unlockWrites(io);
     var file = model_settings.load(arena, io, path);
     defer file.deinit();
+    // Under the lock: a save checked against a file another save then rewrote could land a pair either alone is refused.
+    if (fit) |f| if (plan.model_edits.len > 0) {
+        if (refusalMessage(arena, f, model_settings.modelObject(&file, model_path), plan.model_edits)) |message| return .{ .refused = message };
+    };
     var next: [effort_mod.family_count]effort_mod.Edits = undefined;
     var sections = std.ArrayList(model_settings.SectionEdits).empty;
     if (plan.namesEffort()) {
@@ -1617,6 +1618,30 @@ test "settings api: the resolved defaults ignore the file's values the config wa
     try testing.expectEqual(@as(?u32, 999), loadedWith(&stamped).max_tokens);
 }
 
+test "settings api: a model save is judged against the file it rewrites, so two concurrent saves never land a pair either alone is refused for" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const saved_globals = SavedGlobals.take();
+    defer saved_globals.restore();
+    // A streamed model whose MTP head cannot run while its experts stream: `mtp` is refused while `ssd_budget_gb` is set.
+    const fit: model_settings.Fit = .{ .arch = "a", .streams_experts = true, .has_vision = false, .head_streams = false };
+    // Save A asked for `mtp` when the file had no budget; save B's budget landed before A took the write lock.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [600]u8 = undefined;
+    const path = try savedFile(&tmp, &path_buf, "{\"/m/a\":{\"ssd_budget_gb\":20}}");
+    var host: TestHost = .{ .io = testing.io, .path = path };
+    const outcome = try save(&host, a, testing.io, path, parseRequest(a, "{\"model\":\"m\",\"set\":{\"mtp\":true}}").ok, "/m/a", fit);
+    try testing.expect(outcome == .refused);
+    try testing.expect(std.mem.indexOf(u8, outcome.refused, "\"mtp\"") != null);
+    try testing.expectEqual(@as(usize, 0), host.count(.write));
+    // The same save against a file with no budget lands.
+    const path2 = try savedFile(&tmp, &path_buf, "{}");
+    var host2: TestHost = .{ .io = testing.io, .path = path2 };
+    try testing.expect(try save(&host2, a, testing.io, path2, parseRequest(a, "{\"model\":\"m\",\"set\":{\"mtp\":true}}").ok, "/m/a", fit) == .saved);
+}
+
 test "settings api: max_tokens round-trips as a positive integer and is refused above the context window" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -2057,7 +2082,7 @@ fn savedFile(tmp: *testing.TmpDir, path_buf: []u8, body: ?[]const u8) ![]const u
 /// The effort tables alone, saved to the real file the way a request that names nothing else saves them.
 fn applyEffort(arena: std.mem.Allocator, io: std.Io, path: []const u8, plans: [effort_mod.family_count]EffortPlan) !?[]const u8 {
     var host: TestHost = .{ .io = io, .path = path };
-    return switch (try save(&host, arena, io, path, .{ .effort = plans }, "")) {
+    return switch (try save(&host, arena, io, path, .{ .effort = plans }, "", null)) {
         .refused => |message| message,
         .saved => null,
     };
@@ -2080,7 +2105,7 @@ test "settings api: a save writes the file, applies every key, then forgets the 
     const plan = parseRequest(a,
         \\{"server":{"wired_margin_gib":8,"skip_mem_preflight":true,"max_request_mb":64,"prefix_cache_disk_gb":40,"models_dir":"/tmp"}}
     ).ok;
-    try testing.expect(try save(&host, a, testing.io, path, plan, "") == .saved);
+    try testing.expect(try save(&host, a, testing.io, path, plan, "", null) == .saved);
     try testing.expectEqualSlices(TestHost.Event, &.{ .write, .cache_budget, .models_dir, .forget_all, .rearm }, host.events[0..host.n_events]);
     try testing.expectEqual(@as(u64, 8) << 30, host.margin_at_forget);
     try testing.expect(host.skip_at_forget);
@@ -2103,7 +2128,7 @@ test "settings api: a save whose write fails leaves the file and the running ser
     const a = arena_state.allocator();
     var host: TestHost = .{ .io = testing.io, .path = path, .fail_section = "/m/a" };
     const plan = parseRequest(a, "{\"server\":{\"wired_margin_gib\":8},\"model\":\"m\",\"set\":{\"ctx_size\":4096}}").ok;
-    try testing.expectError(error.NoSpaceLeft, save(&host, a, testing.io, path, plan, "/m/a"));
+    try testing.expectError(error.NoSpaceLeft, save(&host, a, testing.io, path, plan, "/m/a", null));
     const kept = try tmp.dir.readFileAlloc(testing.io, "model-settings.json", a, .limited(1 << 16));
     try testing.expectEqualStrings(before, kept);
     try testing.expectEqual(@as(u64, 2) << 30, server_state.wiredMarginBytes());
@@ -2145,7 +2170,7 @@ test "settings api: a save forgets the stored load failures only for a key whose
         var path_buf: [600]u8 = undefined;
         const path = try savedFile(&tmp, &path_buf, c.file);
         var host: TestHost = .{ .io = testing.io, .path = path };
-        try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, c.body).ok, "/m/a") == .saved);
+        try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, c.body).ok, "/m/a", null) == .saved);
         try testing.expectEqual(c.forgets == .all, host.count(.forget_all) == 1);
         try testing.expectEqual(c.forgets == .model, host.count(.forget_model) == 1);
         try testing.expectEqual(@as(usize, if (c.forgets == .none) 0 else 1), host.count(.forget_all) + host.count(.forget_model));
@@ -2198,7 +2223,7 @@ test "settings api: a save that moves the margin logs one new ceiling line, and 
     var seen: usize = 1;
     const expect_new = [_]usize{ 0, 1, 0 };
     for (bodies, expect_new) |body, new| {
-        try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, body).ok, "") == .saved);
+        try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, body).ok, "", null) == .saved);
         _ = bills.ceilingNow();
         _ = bills.ceilingNow();
         const text = try tmp.dir.readFileAlloc(testing.io, "model-settings.json.log", a, .limited(1 << 16));
