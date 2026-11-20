@@ -466,7 +466,7 @@ test "cooler contract runner: SUSHI_CONTRACT_FIXTURE names the fixtures a run ta
 }
 
 /// `e`, after naming the fixture it came from.
-fn named(env: []const u8, dir: []const u8, e: anyerror) anyerror {
+pub fn named(env: []const u8, dir: []const u8, e: anyerror) anyerror {
     var msg: [512]u8 = undefined;
     std.debug.print("cooler contract: fixture {s} ({s}): {s}: {s}\n", .{ env, dir, @errorName(e), mlx.takeError(&msg) orelse "no MLX or engine error latched" });
     return e;

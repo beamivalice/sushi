@@ -218,7 +218,7 @@ pub fn build(b: *std.Build) void {
             env.append(b.allocator, .{ "SUSHI_TEST_SELECT", step.select }) catch @panic("OOM");
             if (step.env) |kv| env.append(b.allocator, kv) catch @panic("OOM");
             if (qwen_preprocess_fixture) |fixture| env.append(b.allocator, .{ "QWEN_PREPROCESS_FIXTURE", fixture }) catch @panic("OOM");
-            const run = runs.add(domain.compile, step.name, env.items, domain.domain.cut, domain.domain.run_gib) orelse continue;
+            const run = runs.add(domain.compile, step.name, env.items, step.holds_cut orelse domain.domain.cut, step.run_gib orelse domain.domain.run_gib) orelse continue;
             if (qwen_preprocess_fixture) |fixture| {
                 run.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
                 run.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
@@ -476,14 +476,17 @@ const test_domains = [_]TestDomain{
         .files = &.{
             "cooler_contract_test",     "cooler_late_test",     "cooler_load_test",    "cooler_pool_test",
             "cooler_prefill_bill_test", "cooler_requests_test", "cooler_restore_test", "cooler_held_requests_test",
-            "cooler_held_restore_test",
+            "cooler_held_restore_test", "cooler_load_fault_test",    "cooler_requests_fault_test",
         },
         .steps = &.{
             .{ .name = "cooler-load", .files = &.{ "cooler_contract_test", "cooler_load_test" } },
             .{ .name = "cooler-pool", .files = &.{"cooler_pool_test"} },
             .{ .name = "cooler-prefill-bill", .files = &.{"cooler_prefill_bill_test"} },
             .{ .name = "cooler-requests", .files = &.{"cooler_requests_test"} },
-            .{ .name = "cooler-restore", .files = &.{"cooler_restore_test"} },
+            // The fault sweeps, each family's longest cells, run beside their family's step, not after it.
+            .{ .name = "cooler-load-fault", .files = &.{"cooler_load_fault_test"} },
+            .{ .name = "cooler-requests-fault", .files = &.{"cooler_requests_fault_test"} },
+            .{ .name = "cooler-restore", .files = &.{"cooler_restore_test"}, .holds_cut = false },
             // A served load per fixture held across the step's request-level cells (`heldLoad`), apart from the cells
             // that make their own loads.
             .{ .name = "cooler-held-requests", .files = &.{"cooler_held_requests_test"} },
@@ -534,9 +537,9 @@ const test_domains = [_]TestDomain{
 /// Tests that run alone, each in a process of its own (a step named `step`), left out of their file's step: what they
 /// prove holds only on state the process starts with. `name` is the test's name in `src/<file>.zig`.
 const alone_tests = [_]AloneTest{
-    .{ .step = "cooler-late-widest-tinies", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, a prompt at the widest chunk and a repetitive one past a sparse indexer's budget, greedy, speculative and sampled, compile no kernel, on the tiny fixtures" },
+    .{ .step = "cooler-late-widest-tinies", .holds_cut = false, .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, a prompt at the widest chunk and a repetitive one past a sparse indexer's budget, greedy, speculative and sampled, compile no kernel, on the tiny fixtures" },
     .{ .step = "cooler-late-widest-cut", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, a prompt at the widest chunk and a repetitive one past a sparse indexer's budget, greedy, speculative and sampled, compile no kernel, on the cut" },
-    .{ .step = "cooler-late-lengths-tinies", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, greedy requests of every prompt length to 40, and speculative and sampled ones, compile no kernel, on the tiny fixtures" },
+    .{ .step = "cooler-late-lengths-tinies", .holds_cut = false, .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, greedy requests of every prompt length to 40, and speculative and sampled ones, compile no kernel, on the tiny fixtures" },
     .{ .step = "cooler-late-lengths-cut", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, greedy requests of every prompt length to 40, and speculative and sampled ones, compile no kernel, on the cut" },
     .{ .step = "cooler-late-restore", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, a served request that restores the live state behind its reply compiles no kernel" },
     .{ .step = "cooler-late-bench", .file = "cooler_late_test", .name = "cooler contract: after a Cooler load's served warm, the release bench's first request through the scheduler compiles no kernel" },
@@ -563,7 +566,8 @@ const alone_tests = [_]AloneTest{
 
 /// What every `alone_tests` entry proves: no kernel compiles after a load's warm or seal, which only a process whose
 /// pipeline cache that load filled can show (an earlier test's compiles would hide a late one).
-const AloneTest = struct { step: []const u8, file: []const u8, name: []const u8 };
+/// `holds_cut`: false for a test of a cut domain that never loads the Qwen cut (its runner then refuses it).
+const AloneTest = struct { step: []const u8, holds_cut: ?bool = null, file: []const u8, name: []const u8 };
 
 const TestDomain = struct {
     name: []const u8,
@@ -583,9 +587,15 @@ const RunStep = struct {
     files: []const []const u8 = &.{},
     env: ?[2][]const u8 = null,
     again: bool = false,
+    /// False for a step of a cut domain whose tests never load the Qwen cut (its runner then refuses it).
+    holds_cut: ?bool = null,
 };
 
-const cut_run_gib: u64 = 16;
+/// The RSS a step that loads the Qwen cut declares: its measured peak is 10 GB. `--maxrss` (the box's RAM) runs as
+/// many steps at once as their declared bounds fit, so a bound past the peak keeps steps waiting.
+const cut_run_gib: u64 = 12;
+/// An alone step outside a cut domain: one test, its measured peak 1 GB.
+const alone_run_gib: u64 = 2;
 const gib: u64 = 1 << 30;
 
 /// The model folders hold their own test files beside the root's; src/exl3 and src/encoder are modules of their own.
@@ -784,6 +794,9 @@ const PlannedStep = struct {
     /// `SUSHI_TEST_SELECT`: the prefix of each file the step runs.
     select: []const u8,
     env: ?[2][]const u8,
+    /// Null: the domain's.
+    holds_cut: ?bool = null,
+    run_gib: ?u64 = null,
 };
 
 fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, user: ?[]const []const u8) []const DomainBuild {
@@ -809,7 +822,7 @@ fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
                 if (f.host or f.domain != di or !f.in_scope or !stepHolds(s, f.path)) continue;
                 for (f.names) |n| runs_one = runs_one or (!n.anonymous and selectedByUser(user, n.full) and selects(select.items, n.full));
             }
-            if (runs_one) planned.append(b.allocator, .{ .domain = di, .step = .{ .name = s.name, .select = select.items, .env = s.env }, .again = s.again }) catch @panic("OOM");
+            if (runs_one) planned.append(b.allocator, .{ .domain = di, .step = .{ .name = s.name, .select = select.items, .env = s.env, .holds_cut = s.holds_cut }, .again = s.again }) catch @panic("OOM");
         }
         for (alone_tests) |t| {
             const f = for (files) |f| {
@@ -821,7 +834,7 @@ fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
             for (f.names) |n| held += @intFromBool(std.mem.startsWith(u8, n.full, full));
             if (held != 1) std.debug.panic("alone_tests' step {s} would run {d} tests, not one: {s}", .{ t.step, held, full });
             if (!selectedByUser(user, full)) continue;
-            planned.append(b.allocator, .{ .domain = di, .step = .{ .name = t.step, .select = b.fmt("{s}\n", .{full}), .env = null }, .again = false }) catch @panic("OOM");
+            planned.append(b.allocator, .{ .domain = di, .step = .{ .name = t.step, .select = b.fmt("{s}\n", .{full}), .env = null, .holds_cut = t.holds_cut, .run_gib = if (d.cut) null else alone_run_gib }, .again = false }) catch @panic("OOM");
         }
         for (d.steps) |s| for (s.files) |sf| if (domainOf(sf) != di)
             std.debug.panic("test-{s}'s step {s} names {s}, a file of another domain", .{ d.name, s.name, sf });

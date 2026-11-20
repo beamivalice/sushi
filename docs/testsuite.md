@@ -63,7 +63,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 
   | binary | holds |
   |---|---|
-  | `test-cooler` | the Sushi Cooler contract: a run step per family file (`cooler-load`, `-pool`, `-prefill-bill`, `-requests`, `-restore`), two for the cells on held loads (`cooler-held-requests`, `-held-restore`) and one per late cell |
+  | `test-cooler` | the Sushi Cooler contract: a run step per family file (`cooler-load`, `-pool`, `-prefill-bill`, `-requests`, `-restore`), one per family's fault sweeps (`cooler-load-fault`, `-requests-fault`), two for the cells on held loads (`cooler-held-requests`, `-held-restore`) and one per late cell |
   | `test-deepseek`, `test-qwen`, `test-glm`, `test-mimo` | `src/dsv41/`, `src/qwen4/`, `src/glm5/`, `src/mimo2/`, less their prefix-cache files |
   | `test-kernels` | `src/tensor/` and the shared kernels (attention, verify, MoE, FP8, MTP, DFlash, MLX and Metal glue) |
   | `test-generate` | generation, the scheduler, MTP and DFlash rounds, sampling, the KV and SSM caches, the trunk |
@@ -141,6 +141,10 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   fixture is missing and calls `test_note.notePartSkipped` naming it; the runner writes it as the test's log line's
   sixth field (`parts skipped: ...`) and tests/gate.sh's summary lists every such test, so a box's run says what it
   did not cover. The test skips only when no part of it ran.
+- **A step declares the RSS it reaches** (`run_gib`, `cut_run_gib`, `holds_cut`, `alone_run_gib` in build.zig): zig runs
+  as many steps at once as their declared bounds fit in `--maxrss` (the gate's budget), so a bound far past the
+  measured peak keeps steps waiting. A step whose cells never load the Qwen cut says so (`.holds_cut = false`); its
+  runner then refuses QWEN4_TEST_MODEL. The longest step bounds the run: split a family's fault sweeps out first.
 - **A test whose arch this build leaves out skips by name, never runs**: a shared test that reads an arch's config or
   fixture starts with `test_note.needArchs(&.{...})`; under `-Darchs` it skips with `<arch>: not in this build
   (-Darchs)` on its log line, and an arch's own steps are not made. Check: `zig build test -Darchs=<one>` with no

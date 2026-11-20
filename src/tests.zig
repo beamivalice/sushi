@@ -66,6 +66,8 @@ test {
     _ = @import("cooler_restore_test.zig");
     _ = @import("cooler_held_requests_test.zig");
     _ = @import("cooler_held_restore_test.zig");
+    _ = @import("cooler_load_fault_test.zig");
+    _ = @import("cooler_requests_fault_test.zig");
     _ = @import("effort.zig");
     _ = @import("exl3_flat_layout_test.zig");
     _ = @import("generate.zig");
