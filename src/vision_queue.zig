@@ -192,7 +192,7 @@ pub fn freeVisionArray(ve: mlx.mlx_array) void {
 pub const VisionImagePixels = struct {
     /// Raw bytes holding float32 pixel data. Qwen3-VL:
     /// merge-order pixel_values (N × C·tps·ps·ps × 4). Borrowed; must outlive the
-    /// encodeVision call (which blocks until completion).
+    /// encode.
     pixels: []const u8,
     width: u32,
     height: u32,
@@ -205,7 +205,7 @@ pub const VisionImagePixels = struct {
 
 /// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
 /// groups, concatenated (see `vision_common.buildPixelValuesVideo`). Borrowed;
-/// must outlive the encodeVision call.
+/// must outlive the encode.
 pub const VisionVideoPixels = struct {
     pixels: []const u8,
     grid_t: u32,
@@ -213,12 +213,8 @@ pub const VisionVideoPixels = struct {
     grid_w: u32,
 };
 
-/// Phase A4: vision-encode work item. Conn thread fills `images` (raw pixel
-/// data, CPU-only) and calls `Scheduler.encodeVision`, which posts the
-/// request and blocks until the inference thread fills `result` and signals
-/// `done`. Ownership of `result` transfers to the caller on success — pass
-/// to `scheduler.submit(.{ .vision_embeddings = arr, ... })` and the slot's
-/// `deinit` will free it.
+/// One vision encode, run by `runVisionEncode` on the inference thread (`encodeMediaAfterRestore`). Ownership of
+/// `result` transfers to the caller on success.
 pub const VisionEncodeRequest = struct {
     /// Plan 05 Phase D: target model whose `vision_encoder` services this
     /// request. The conn thread holds a refcount (via `ensureLoaded`) for
@@ -403,10 +399,7 @@ fn yieldStep(req: *VisionEncodeRequest) void {
     req.yielded_ns +|= y.call(y.ctx);
 }
 
-/// Phase A4: encode one or more images on the inference thread. Writes the
-/// result into a request struct + signals done, so the conn thread (blocked
-/// in `encodeVision`) gets the output. On error, sets `req.error_name` and
-/// still signals done.
+/// Encode one or more images on the inference thread into `req.result`. On error, sets `req.error_name`.
 /// Plan 05 Phase D: routes the encode through `req.model.vision_encoder`,
 /// not the scheduler's borrowed-view singleton — each LoadedModel has its
 /// own vision encoder when applicable.

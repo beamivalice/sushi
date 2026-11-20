@@ -1149,10 +1149,6 @@ pub const Scheduler = struct {
     queue_cond: std.Io.Condition,
     pending: std.ArrayList(*Slot),
     decoding: std.ArrayList(*Slot),
-    /// Phase A4: pending vision-encode requests. The inference thread drains
-    /// these in the gap before/after each prefill+decode tick. Posting
-    /// broadcasts on `queue_cond` to wake an idle inference thread.
-    vision_queue: std.ArrayList(*vision_queue.VisionEncodeRequest),
     /// Phase D: pending cold-load requests. Conn threads post here via
     /// `scheduler.ensureLoaded`; the inference thread drains between ticks
     /// (load runs after cleanup + vision/embed, before prefill). Multiple
@@ -1294,7 +1290,6 @@ pub const Scheduler = struct {
             .queue_cond = .init,
             .pending = std.ArrayList(*Slot).empty,
             .decoding = std.ArrayList(*Slot).empty,
-            .vision_queue = std.ArrayList(*vision_queue.VisionEncodeRequest).empty,
             .load_queue = std.ArrayList(*LoadRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
             .prefix_clear_queue = std.ArrayList(*prefix_cache_admin.ClearRequest).empty,
@@ -1406,7 +1401,6 @@ pub const Scheduler = struct {
         for (self.orphan_vision[0..self.orphan_vision_n]) |ve| vision_queue.freeVisionArray(ve);
         self.prefilling.deinit(self.allocator);
         self.failQueuedWaiters();
-        self.vision_queue.deinit(self.allocator);
         self.load_queue.deinit(self.allocator);
         // Wake any conn threads blocked in unloadModel so they don't hang.
         for (self.unload_queue.items) |req| {
@@ -1457,18 +1451,16 @@ pub const Scheduler = struct {
         return self.draining or self.shutdown.load(.acquire) or server_state.shutdown_requested.load(.acquire);
     }
 
-    /// Ends every queued cold load and image encode the inference thread has not taken with the shutdown error: their
-    /// requesters roll back their entry and free what they hold.
+    /// Ends every queued cold load the inference thread has not taken with the shutdown error: their requesters roll
+    /// back their entry and free what they hold.
     fn failQueuedWaiters(self: *Scheduler) void {
-        for (self.vision_queue.items) |req| finishShutdown(self, req);
-        self.vision_queue.clearRetainingCapacity();
         for (self.load_queue.items) |req| finishShutdown(self, req);
         self.load_queue.clearRetainingCapacity();
     }
 
-    fn finishShutdown(self: *Scheduler, req: anytype) void {
+    fn finishShutdown(self: *Scheduler, req: *LoadRequest) void {
         req.done_mu.lockUncancelable(self.io);
-        if (@TypeOf(req) == *LoadRequest) req.outcome = .shutdown else req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
+        req.outcome = .shutdown;
         req.done = true;
         req.done_cond.broadcast(self.io);
         req.done_mu.unlock(self.io);
@@ -2120,41 +2112,6 @@ pub const Scheduler = struct {
         return .{ .id = entry.id, .bytes = bytes };
     }
 
-    /// Phase A4: synchronously encode one or more images and return the
-    /// embedding tensor. Conn thread fills `req.images` (CHW float32 pixel
-    /// buffers, decoded by stb_image / libwebp on the conn thread); this
-    /// method posts the request to the inference thread, blocks until done,
-    /// and returns the resulting `mlx_array` on success. Ownership of the
-    /// returned array transfers to the caller — typically passed straight
-    /// into `submit(.{ .vision_embeddings = arr, ... })` so the slot owns
-    /// it and frees on `deinit`.
-    ///
-    /// Returns `error.VisionEncodeFailed` if the inference thread fails.
-    /// The request struct must outlive this call, but since the call blocks,
-    /// a stack allocation in the caller works.
-    pub fn encodeVision(self: *Scheduler, req: *vision_queue.VisionEncodeRequest) !mlx.mlx_array {
-        // Post + wake.
-        self.queue_mu.lockUncancelable(self.io);
-        if (self.refusingLocked()) {
-            self.queue_mu.unlock(self.io);
-            return error.Shutdown;
-        }
-        self.vision_queue.append(self.allocator, req) catch |err| {
-            self.queue_mu.unlock(self.io);
-            return err;
-        };
-        self.queue_cond.broadcast(self.io);
-        self.queue_mu.unlock(self.io);
-
-        // Wait for completion.
-        req.done_mu.lockUncancelable(self.io);
-        defer req.done_mu.unlock(self.io);
-        while (!req.done) {
-            req.done_cond.waitUncancelable(self.io, &req.done_mu);
-        }
-        if (req.error_name) |_| return error.VisionEncodeFailed;
-        return req.result orelse error.VisionEncodeFailed;
-    }
 
     /// Does this slot's next decode tick actually run the regular (non-speculative)
     /// path? The slot's `enable_*` flags carry the REQUEST's wish; `specTickMode` is
@@ -2442,7 +2399,6 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
     // A refused pending slot waits for its connection to complete it, which wakes the loop.
     return (sch.pending.items.len > 0 and !sch.refusingLocked()) or
         sch.decoding.items.len > 0 or
-        sch.vision_queue.items.len > 0 or
         sch.cleanup_queue.items.len > 0 or
         sch.abandoned != null or
         sch.orphan_vision_n > 0 or
@@ -2626,12 +2582,6 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         var abandoned: ?*Slot = null;
         var orphan_vision: [vision_queue.orphan_vision_cap]mlx.mlx_array = undefined;
         var orphan_vision_n: usize = 0;
-        // 0b. Drain any pending vision work. It runs synchronously on behalf of
-        //     conn threads waiting in `encodeVision`. Processed here (not
-        //     concurrently with decode ticks) so it shares the inference
-        //     thread's mlx stream cleanly.
-        var vision_batch: [4]*vision_queue.VisionEncodeRequest = undefined;
-        var vision_n: usize = 0;
         // Phase D: cold-load drain. Process ONE load per tick — loading a
         // model is heavy (~seconds; weight read + JIT compile + warmup)
         // and we want the rest of the inference loop to stay responsive.
@@ -2648,10 +2598,6 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             cleanup_n = teardown.cleanup_n;
             abandoned = teardown.abandoned;
             orphan_vision_n = takeOrphanedVisionLocked(sch, &orphan_vision);
-            while (vision_n < vision_batch.len and sch.vision_queue.items.len > 0) {
-                vision_batch[vision_n] = sch.vision_queue.orderedRemove(0);
-                vision_n += 1;
-            }
             load_req = teardown.load;
             unload_req = teardown.unload;
             // After the teardown settles, like a load: a finished slot's flush has run by then.
@@ -2672,7 +2618,6 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             defer turn.end();
             for (orphan_vision[0..orphan_vision_n]) |ve| vision_queue.freeVisionArray(ve);
         }
-        for (vision_batch[0..vision_n]) |req| vision_queue.runVisionEncode(sch, req);
         if (load_req) |req| model_load.runLoadRequest(sch, req);
         if (unload_req) |req| model_load.runUnloadRequest(sch, req);
         if (clear_req) |req| {
@@ -5724,7 +5669,6 @@ pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Schedul
     sch.cleanup_queue = .empty;
     sch.prefilling = .empty;
     sch.load_queue = .empty;
-    sch.vision_queue = .empty;
     sch.unload_queue = .empty;
     sch.abandoned = null;
     sch.orphan_vision_n = 0;
