@@ -38,6 +38,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **A large chunked upload is answered**: a `Transfer-Encoding: chunked` request over about 16 KB sent in one go got no
   answer and held its connection forever, and a body or WebSocket frame left half sent outlasted the 30 s read limit
   and a shutdown.
+- **Stopping the server no longer waits on a client that keeps sending**: a chunked upload of bare carriage returns or a
+  WebSocket message of empty fragments was read forever, past the size limit and past a shutdown, after which the
+  server exited with an error; both now end at the limit, and a shutdown ends every read at once.
 - **A request ended by a shutdown says so in its error type**: its 503 carried `server_error` where every other
   shutdown refusal carries `shutting_down`; all now carry `shutting_down`.
 - **A load started right after the previous server quit waits for its memory to be released**: the free-RAM check gave up

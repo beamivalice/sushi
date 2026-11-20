@@ -28,7 +28,7 @@ pub const Message = struct {
 };
 
 /// Minimal `Conn`-like interface used by this module. Keeps `ws.zig`
-/// independent of `server.zig`. Any caller that exposes `read(buf) -> usize`
+/// independent of `server.zig`. Any caller that exposes `read(buf, limit_ms) -> usize`
 /// and `writeAll([]const u8) -> !void` works.
 pub fn WsConn(comptime ConnT: type) type {
     return struct {
@@ -43,6 +43,9 @@ pub fn WsConn(comptime ConnT: type) type {
         /// (continuation) and != control is a protocol violation.
         in_message: ?std.ArrayList(u8) = null,
         in_opcode: Opcode = .continuation,
+        /// What the fragments read so far cost against `message_limit`: each at least one byte, so frames that carry
+        /// nothing still end at the cap.
+        charged: usize = 0,
 
         pub fn init(conn: *ConnT, limit: *const std.atomic.Value(usize)) Self {
             return .{ .conn = conn, .limit = limit };
@@ -87,10 +90,12 @@ pub fn WsConn(comptime ConnT: type) type {
                     try buf.appendSlice(allocator, frame.payload);
                     self.in_message = buf;
                     self.in_opcode = frame.opcode;
+                    self.charged = @max(frame.payload.len, 1);
                 } else {
                     if (frame.opcode != .continuation) return error.WsProtocol;
                     var buf = &self.in_message.?;
-                    if (buf.items.len + frame.payload.len > self.message_limit) return error.WsTooLarge;
+                    self.charged += @max(frame.payload.len, 1);
+                    if (self.charged > self.message_limit) return error.WsTooLarge;
                     try buf.appendSlice(allocator, frame.payload);
                     if (frame.fin) {
                         const owned = try buf.toOwnedSlice(allocator);
@@ -147,7 +152,7 @@ const RawFrame = struct {
 fn readExact(conn: anytype, buf: []u8) !void {
     var off: usize = 0;
     while (off < buf.len) {
-        const n = try conn.read(buf[off..]);
+        const n = try conn.read(buf[off..], null);
         if (n == 0) return error.WsClosed;
         off += n;
     }
@@ -311,7 +316,7 @@ const MockConn = struct {
         self.write_buf.deinit(self.allocator);
     }
 
-    pub fn read(self: *MockConn, buf: []u8) !usize {
+    pub fn read(self: *MockConn, buf: []u8, _: ?i64) !usize {
         const remaining = self.read_data.len - self.read_pos;
         if (remaining == 0) return 0;
         // Simulate short reads to exercise the readExact loop.

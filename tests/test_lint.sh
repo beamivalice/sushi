@@ -688,9 +688,13 @@ expect_green "a Scheduler from submitTestScheduler, and a bare one that never su
 # rule conn-read-unbounded
 tree
 printf '%s\n' 'const Conn = struct {' '    fn reader(c: *Conn) *R { return &c.read_state.interface; }' \
-  '    fn read(c: *Conn, buf: []u8) !usize { return c.reader().readVec(buf); }' '};' \
+  '    fn takeReadable(c: *Conn, buf: []u8) !usize { return c.reader().readVec(buf); }' '};' \
   'fn body(c: *Conn, buf: []u8) !void {' '    try c.reader().readSliceAll(buf);' '}' > "$TMP/t/src/http_conn.zig"
 expect_red "a read of the connection's reader outside Conn.read" "src/http_conn.zig:6:11 \[conn-read-unbounded\] body: the connection's reader outside Conn.read"
+
+tree
+printf '%s\n' 'fn chunk(c: *Conn, buf: []u8) !usize {' '    return c.takeReadable(buf);' '}' > "$TMP/t/src/http_conn.zig"
+expect_red "a take that skips Conn.read's wait" "src/http_conn.zig:2:14 \[conn-read-unbounded\] chunk:"
 
 tree
 printf '%s\n' 'fn peek(conn: *Conn) usize {' '    return conn.read_state.interface.bufferedLen();' '}' > "$TMP/t/src/server.zig"
@@ -698,7 +702,8 @@ expect_red "read_state.interface outside the connection file" "src/server.zig:2:
 
 tree
 printf '%s\n' 'const Conn = struct {' '    fn reader(c: *Conn) *R { return &c.read_state.interface; }' \
-  '    fn awaitReadable(c: *Conn) bool { return c.reader().bufferedLen() > 0; }' '};' \
+  '    fn awaitReadable(c: *Conn) bool { return c.reader().bufferedLen() > 0; }' \
+  '    fn read(c: *Conn, buf: []u8) !usize { return c.takeReadable(buf); }' '};' \
   'fn open(f: F, io: Io, buf: []u8) R { return f.reader(io, buf); }' 'fn err(c: *Conn) ?E { return c.read_state.err; }' \
   'test "t" {' '    _ = conn.reader().bufferedLen();' '}' > "$TMP/t/src/http_conn.zig"
 printf '%s\n' 'fn lines(r: *R) void {' '    _ = r.reader().takeDelimiter(10);' '}' > "$TMP/t/src/cli.zig"

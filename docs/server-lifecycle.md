@@ -460,12 +460,16 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   are refused with `error.Shutdown`, and queued loads and encodes fail then, not at `deinit`; with a connection thread
   still alive past the drain bound `serve` skips the teardown that would free what it holds and returns
   `error.ConnectionsOutliveShutdown` (the CLI exits 1 on it before its own defers free anything).
-- **A shutdown ends every wait for a client's bytes**: `Conn.awaitReadable` is the one read wait and looks at the flag
-  every 100 ms, so an idle connection closes and a WebSocket between turns gets its 1001 close at once; only a request
-  in flight holds the drain.
-- **`Conn.read` is the one read of a connection**: it returns the bytes the reader holds alone and reads the socket only
-  after `awaitReadable` saw it readable, since a `readVec` past the held bytes blocks in the socket with no limit and no
-  shutdown poll (a chunked upload sent whole got no answer); lint `conn-read-unbounded` keeps the reader inside it.
+- **A shutdown ends every read of a client's bytes**: `Conn.awaitReadable` is the one read wait, reads the flag first
+  and then every 100 ms, so an idle connection closes, a WebSocket between turns gets its 1001 close and a client that
+  keeps bytes arriving is cut off at once; a request whose line arrived gets the shutdown error (`Conn.readArrived`
+  takes what is already there, bounded); only a request in flight holds the drain.
+- **`Conn.read(buf, limit_ms)` is the one read of a connection**: it waits first (`error.ReadStalled` past the limit,
+  `error.Shutdown`), returns the bytes the reader holds alone and reads the socket only after it was seen readable,
+  since a `readVec` past the held bytes blocks in the socket with no limit and no shutdown poll (a chunked upload sent
+  whole got no answer); lint `conn-read-unbounded` keeps the reader and `takeReadable` inside it.
+- **Every byte a decoder takes counts toward a cap**: a chunked body takes a CR only right before its LF, and each
+  WebSocket fragment costs at least one byte of the message cap, so a flood of bytes that decode to nothing ends.
 - **The gate shuts when the shutdown is asked, not when it begins**: `refusingLocked` reads
   `server_state.shutdown_requested` too, since `beginShutdown` runs only when the accept loop next sees the flag (up to
   1 s later); a pending slot is neither admitted nor counted as work then, so the loop parks instead of spinning.

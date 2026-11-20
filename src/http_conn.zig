@@ -302,7 +302,7 @@ pub const Conn = struct {
         return &c.write_state.interface;
     }
 
-    /// Only `read` and `awaitReadable` reach it (lint `conn-read-unbounded`).
+    /// Only `takeReadable`, `readArrived` and `awaitReadable` reach it (lint `conn-read-unbounded`).
     fn reader(c: *Conn) *std.Io.Reader {
         return &c.read_state.interface;
     }
@@ -323,10 +323,27 @@ pub const Conn = struct {
         try c.writer().flush();
     }
 
-    /// The one read of a connection: up to buf.len bytes, maybe fewer, 0 at EOF. Bytes the reader holds come back
-    /// alone; the socket is read only once `awaitReadable` saw it readable, so no read outwaits a caller's limit or a
-    /// shutdown (`error.Shutdown`). A `readVec` that wants more than the reader holds blocks in the socket for the rest.
-    pub fn read(c: *Conn, buf: []u8) !usize {
+    /// The one read of a connection: up to buf.len bytes, maybe fewer, 0 at EOF; `error.ReadStalled` when nothing came
+    /// within `limit_ms` (null: no limit). It waits in `awaitReadable` first, so a shutdown ends it (`error.Shutdown`)
+    /// even with bytes waiting. Bytes the reader holds come back alone: a `readVec` that wants more blocks in the
+    /// socket for the rest.
+    pub fn read(c: *Conn, buf: []u8, limit_ms: ?i64) !usize {
+        if (!try c.awaitReadable(limit_ms)) return error.ReadStalled;
+        return c.takeReadable(buf);
+    }
+
+    /// Up to buf.len of the bytes already here, whatever the shutdown flag says, without waiting: 0 when none. Bounded
+    /// by `buf`, so a shutdown still learns the request line of a request that arrived.
+    pub fn readArrived(c: *Conn, buf: []u8) usize {
+        if (c.reader().bufferedLen() == 0) {
+            var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            if ((std.posix.poll(&fds, 0) catch 0) == 0) return 0;
+        }
+        return c.takeReadable(buf) catch 0;
+    }
+
+    /// The held bytes alone, else one read of a socket seen readable.
+    fn takeReadable(c: *Conn, buf: []u8) !usize {
         const r = c.reader();
         if (r.bufferedLen() > 0) {
             const n = @min(r.bufferedLen(), buf.len);
@@ -334,7 +351,6 @@ pub const Conn = struct {
             r.toss(n);
             return n;
         }
-        _ = try c.awaitReadable(null);
         var bufs: [1][]u8 = .{buf};
         return r.readVec(&bufs) catch |err| switch (err) {
             error.EndOfStream => 0,
@@ -346,9 +362,10 @@ pub const Conn = struct {
     const SHUTDOWN_POLL_MS: i64 = 100;
 
     /// Waits up to `limit_ms` (null: no limit) for bytes to read; false when none came. Every read of a connection
-    /// waits here, so a shutdown ends the wait (`error.Shutdown`) within `SHUTDOWN_POLL_MS` and no client holds the
-    /// drain; bytes that already arrived are still read. Bytes the reader already buffered count as readable.
+    /// waits here, and the shutdown flag is read first: a client that keeps bytes arriving cannot hold the drain, and
+    /// an idle one is let go within `SHUTDOWN_POLL_MS`. Bytes the reader already buffered count as readable.
     fn awaitReadable(c: *Conn, limit_ms: ?i64) error{Shutdown}!bool {
+        if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
         if (c.reader().bufferedLen() > 0) return true;
         const deadline = if (limit_ms) |ms| nowMsMonotonic(c.io) +| ms else null;
         var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
@@ -660,6 +677,7 @@ const ChunkDecoder = struct {
     line: [80]u8 = undefined,
     line_len: usize = 0,
     trailer_bytes: usize = 0,
+    cr: bool = false,
 
     const max_trailer_bytes = 8 * 1024;
 
@@ -678,7 +696,10 @@ const ChunkDecoder = struct {
             }
             const b = input[i];
             i += 1;
-            if (b == '\r') continue;
+            // A CR only right before its LF: a skipped byte would count toward no cap.
+            if (d.cr and b != '\n') return error.BadChunk;
+            d.cr = b == '\r';
+            if (d.cr) continue;
             if (b != '\n') {
                 switch (d.state) {
                     .size => {
@@ -733,6 +754,14 @@ fn answerExpect(allocator: std.mem.Allocator, stream: *Conn, head: []const u8) !
     return false;
 }
 
+/// A shutdown ended a request's read: one whose request line arrived gets the shutdown error, an idle connection
+/// nothing.
+fn refuseAtShutdown(allocator: std.mem.Allocator, stream: *Conn, head: []const u8) !void {
+    if (std.mem.indexOf(u8, head, "\r\n") == null) return;
+    stream.api = apiOfHead(head);
+    try sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503);
+}
+
 /// Reads a chunked body after `head` (the request line and headers through the blank line); `leftover` is what
 /// already arrived past it. The result holds the head followed by the decoded body.
 fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64, head: []const u8, leftover: []const u8, max_request_bytes: usize) !?RawRequest {
@@ -768,11 +797,15 @@ fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64
                 return null;
             }
         }
-        if (!(stream.awaitReadable(limit_ms) catch false)) {
-            out.deinit(allocator);
-            return null;
-        }
-        const n = try stream.read(&buf);
+        const n = stream.read(&buf, limit_ms) catch |err| switch (err) {
+            error.Shutdown => {
+                try refuseAtShutdown(allocator, stream, head);
+                out.deinit(allocator);
+                return null;
+            },
+            error.ReadStalled => 0,
+            else => return err,
+        };
         if (n == 0) {
             out.deinit(allocator);
             return null;
@@ -796,8 +829,15 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
 
     // Phase 1: Read until we have complete headers
     while (total_read < hdr_buf.len) {
-        if (!(stream.awaitReadable(head_deadline - nowMsMonotonic(stream.io)) catch false)) return null;
-        const n = try stream.read(hdr_buf[total_read..]);
+        const n = stream.read(hdr_buf[total_read..], head_deadline - nowMsMonotonic(stream.io)) catch |err| switch (err) {
+            error.Shutdown => {
+                total_read += stream.readArrived(hdr_buf[total_read..]);
+                try refuseAtShutdown(allocator, stream, hdr_buf[0..total_read]);
+                return null;
+            },
+            error.ReadStalled => return null,
+            else => return err,
+        };
         if (n == 0) break;
         total_read += n;
 
@@ -840,11 +880,18 @@ pub fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: 
     }
 
     while (total_read < total_size) {
-        if (!(stream.awaitReadable(limit_ms) catch false)) {
-            allocator.free(buf);
-            return null;
-        }
-        const n = try stream.read(buf[total_read..total_size]);
+        const n = stream.read(buf[total_read..total_size], limit_ms) catch |err| switch (err) {
+            error.Shutdown => {
+                try refuseAtShutdown(allocator, stream, hdr_buf[0..header_end_pos]);
+                allocator.free(buf);
+                return null;
+            },
+            error.ReadStalled => {
+                allocator.free(buf);
+                return null;
+            },
+            else => return err,
+        };
         if (n == 0) break;
         total_read += n;
     }
@@ -2593,4 +2640,274 @@ test "the metrics feed's refusal carries the error envelope the page reads error
     const parsed = try std.json.parseFromSlice(E, t.allocator, responseBody(response), .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try t.expect(std.mem.indexOf(u8, parsed.value.@"error".message, "--metrics") != null);
+}
+
+/// A client for the read tests: sends `sent` whole (a wide socket, so the first read can take past the head), then
+/// drips, floods or stalls; the shutdown flag is set after `shutdown_after_ms`.
+const ReadOpts = struct {
+    sent: []const u8,
+    /// Sent one byte per `drip_ms` after `sent`.
+    drip: []const u8 = "",
+    drip_ms: u64 = 0,
+    limit_ms: i64,
+    shutdown_after_ms: ?u64 = null,
+    /// Sent forever after `sent` (and `drip`), as fast as the socket takes it.
+    flood: ?[]const u8 = null,
+    wait_ms: u64 = 2000,
+    /// The WebSocket message cap `wsReadAgainst` reads with.
+    ws_limit: usize = 1 << 20,
+    /// The shutdown flag is set before the read starts, with every byte of `sent` already waiting.
+    shutdown_first: bool = false,
+};
+const ReadResult = struct { returned: bool, ms: i64, len: ?usize, reply: []u8, body: []u8 };
+
+const FeedClient = struct {
+    fd: std.posix.fd_t,
+    o: ReadOpts,
+    stop: *std.atomic.Value(bool),
+    fn sendAllNb(fd: std.posix.fd_t, bytes: []const u8, stop: *std.atomic.Value(bool)) bool {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            if (stop.load(.acquire)) return false;
+            const n = std.c.send(fd, bytes[off..].ptr, bytes.len - off, std.posix.MSG.DONTWAIT);
+            if (n > 0) {
+                off += @intCast(n);
+                continue;
+            }
+            if (n < 0 and std.posix.errno(n) == .AGAIN) {
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .real) catch {};
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+    fn run(c: *FeedClient) void {
+        if (!c.o.shutdown_first and !sendAllNb(c.fd, c.o.sent, c.stop)) return;
+        for (c.o.drip) |b| {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(@intCast(c.o.drip_ms)), .real) catch {};
+            if (!sendAllNb(c.fd, &.{b}, c.stop)) return;
+        }
+        if (c.o.flood) |f| {
+            var block: [64 * 1024]u8 = undefined;
+            var i: usize = 0;
+            while (i + f.len <= block.len) : (i += f.len) @memcpy(block[i..][0..f.len], f);
+            while (!c.stop.load(.acquire)) if (!sendAllNb(c.fd, block[0..i], c.stop)) return;
+        }
+    }
+};
+
+fn widePair() ![2]std.posix.fd_t {
+    var sv: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(1, 1, 0, &sv) != 0) return error.SocketPairFailed;
+    const wide: c_int = 256 * 1024;
+    for (sv) |fd| {
+        _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
+        _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
+    }
+    // The client's send gives up after 20 ms when the server stops reading (MSG_DONTWAIT alone can still block here).
+    const send_limit: std.posix.timeval = .{ .sec = 0, .usec = 20_000 };
+    _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_limit), @sizeOf(std.posix.timeval));
+    return sv;
+}
+
+fn drainReply(a: std.mem.Allocator, fd: std.posix.fd_t) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.recv(fd, &buf, buf.len, std.posix.MSG.DONTWAIT);
+        if (n <= 0) break;
+        try out.appendSlice(a, buf[0..@intCast(n)]);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// `readRequestWithin(limit_ms)` against a client that sends `o.sent` whole (a wide socket, so the first read can take
+/// past the head), then drips, floods or stalls; the shutdown flag set after `shutdown_after_ms`.
+fn readAgainst(o: ReadOpts) !ReadResult {
+    const t = std.testing;
+    const sv = try widePair();
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+    var stop = std.atomic.Value(bool).init(false);
+    var client: FeedClient = .{ .fd = sv[1], .o = o, .stop = &stop };
+    const State = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        len: ?usize = null,
+        body: []u8 = &.{},
+        ms: i64 = 0,
+    };
+    var st: State = .{};
+    if (o.shutdown_first) {
+        _ = std.c.send(sv[1], o.sent.ptr, o.sent.len, 0);
+        server_state.shutdown_requested.store(true, .release);
+    }
+    const t0 = nowMsMonotonic(t.io);
+    const reader = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Conn, limit: i64, s: *State, start: i64) void {
+            if (readRequestWithin(t.allocator, c, limit) catch null) |r| {
+                s.len = r.len;
+                s.body = t.allocator.dupe(u8, r.buf[r.header_end..r.len]) catch &.{};
+                t.allocator.free(r.buf);
+            }
+            s.ms = nowMsMonotonic(t.io) - start;
+            s.done.store(true, .release);
+        }
+    }.run, .{ &conn, o.limit_ms, &st, t0 });
+    const sender = try std.Thread.spawn(.{}, FeedClient.run, .{&client});
+    var shut_at: i64 = 0;
+    var waited: u64 = 0;
+    while (!st.done.load(.acquire) and waited < o.wait_ms) : (waited += 5) {
+        std.Io.sleep(t.io, .fromMilliseconds(5), .real) catch {};
+        if (o.shutdown_after_ms) |s| if (waited >= s and shut_at == 0) {
+            server_state.shutdown_requested.store(true, .release);
+            shut_at = nowMsMonotonic(t.io) - t0;
+        };
+    }
+    const returned = st.done.load(.acquire);
+    stop.store(true, .release);
+    sender.join();
+    const reply = try drainReply(t.allocator, sv[1]);
+    _ = std.c.close(sv[1]);
+    reader.join();
+    server_state.shutdown_requested.store(false, .release);
+    conn.close();
+    return .{ .returned = returned, .ms = if (returned) st.ms - shut_at else -1, .len = st.len, .reply = reply, .body = st.body };
+}
+
+fn freeRead(r: ReadResult) void {
+    std.testing.allocator.free(r.reply);
+    if (r.body.len > 0) std.testing.allocator.free(r.body);
+}
+
+
+/// `WsConnT.readMessage` in a loop (pings and pongs are messages) over a `Conn`, against a `ReadOpts` client.
+const WsReadResult = struct { returned: bool, ms: i64, err: ?anyerror, messages: usize };
+
+/// `readMessage` in a loop (pings and pongs are messages) until it fails, against a client that sends `o.sent` whole
+/// and then stalls, drips or floods; the shutdown flag set after `shutdown_after_ms`.
+fn wsReadAgainst(o: ReadOpts) !WsReadResult {
+    const t = std.testing;
+    const sv = try widePair();
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+    var stop = std.atomic.Value(bool).init(false);
+    var client: FeedClient = .{ .fd = sv[1], .o = o, .stop = &stop };
+    const State = struct { done: std.atomic.Value(bool) = .init(false), err: ?anyerror = null, ms: i64 = 0, messages: usize = 0 };
+    var st: State = .{};
+    var limit = std.atomic.Value(usize).init(o.ws_limit);
+    if (o.shutdown_first) {
+        _ = std.c.send(sv[1], o.sent.ptr, o.sent.len, 0);
+        server_state.shutdown_requested.store(true, .release);
+    }
+    const t0 = nowMsMonotonic(t.io);
+    const reader = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Conn, lim: *std.atomic.Value(usize), s: *State, start: i64) void {
+            var ws = WsConnT.init(c, lim);
+            defer ws.deinit(t.allocator);
+            while (true) {
+                const m = ws.readMessage(t.allocator) catch |e| {
+                    s.err = e;
+                    break;
+                };
+                t.allocator.free(m.payload);
+                s.messages += 1;
+            }
+            s.ms = nowMsMonotonic(t.io) - start;
+            s.done.store(true, .release);
+        }
+    }.run, .{ &conn, &limit, &st, t0 });
+    const sender = try std.Thread.spawn(.{}, FeedClient.run, .{&client});
+    var shut_at: i64 = 0;
+    var waited: u64 = 0;
+    while (!st.done.load(.acquire) and waited < o.wait_ms) : (waited += 5) {
+        std.Io.sleep(t.io, .fromMilliseconds(5), .real) catch {};
+        if (o.shutdown_after_ms) |s| if (waited >= s and shut_at == 0) {
+            server_state.shutdown_requested.store(true, .release);
+            shut_at = nowMsMonotonic(t.io) - t0;
+        };
+    }
+    const returned = st.done.load(.acquire);
+    stop.store(true, .release);
+    sender.join();
+    _ = std.c.close(sv[1]);
+    reader.join();
+    server_state.shutdown_requested.store(false, .release);
+    conn.close();
+    return .{ .returned = returned, .ms = if (returned) st.ms - shut_at else -1, .err = st.err, .messages = st.messages };
+}
+
+/// A masked client frame with a zero mask.
+fn clientFrame(comptime b0: u8, comptime payload: []const u8) []const u8 {
+    if (payload.len < 126) return &[_]u8{ b0, 0x80 | @as(u8, payload.len), 0, 0, 0, 0 } ++ payload;
+    return &[_]u8{ b0, 0x80 | 126, @as(u8, payload.len >> 8), @as(u8, payload.len & 0xff), 0, 0, 0, 0 } ++ payload;
+}
+
+
+const chunked_head = "POST /v1/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+test "read: a shutdown answers a request still arriving with the shutdown error, never reads it on" {
+    // The whole request is waiting: a reader that takes waiting bytes before the flag would read it to its end.
+    const r = try readAgainst(.{ .sent = chunked_head ++ "4e20\r\n" ++ @as([20_000]u8, @splat('a')) ++ "\r\n0\r\n\r\n", .limit_ms = 30_000, .shutdown_first = true });
+    defer freeRead(r);
+    if (!r.returned or r.len != null or !std.mem.startsWith(u8, r.reply, "HTTP/1.1 503 ") or std.mem.indexOf(u8, r.reply, http.shutting_down_type) == null) {
+        std.debug.print("a request waiting at a shutdown: returned={any} len={?d} reply '{s}'\n", .{ r.returned, r.len, r.reply[0..@min(r.reply.len, 120)] });
+        return error.ReadOnPastShutdown;
+    }
+}
+
+test "read: a chunked body of carriage returns alone stops at the request cap" {
+    const previous = server_state.max_request_bytes.swap(4096, .monotonic);
+    defer server_state.max_request_bytes.store(previous, .monotonic);
+    const r = try readAgainst(.{ .sent = chunked_head, .flood = "\r", .limit_ms = 30_000, .wait_ms = 3000 });
+    defer freeRead(r);
+    if (!r.returned or r.len != null or !(std.mem.startsWith(u8, r.reply, "HTTP/1.1 400 ") or std.mem.startsWith(u8, r.reply, "HTTP/1.1 413 "))) {
+        std.debug.print("a CR flood under a 4 KB cap: returned={any} reply '{s}'\n", .{ r.returned, r.reply[0..@min(r.reply.len, 60)] });
+        return error.UncappedRead;
+    }
+}
+
+test "ws: a shutdown ends a fragmented message whose empty continuation frames are already waiting" {
+    const a = std.testing.allocator;
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(a);
+    try frames.appendSlice(a, comptime clientFrame(0x01, "{"));
+    for (0..1000) |_| try frames.appendSlice(a, comptime clientFrame(0x00, ""));
+    try frames.appendSlice(a, comptime clientFrame(0x80, "}"));
+    const r = try wsReadAgainst(.{ .sent = frames.items, .limit_ms = 0, .shutdown_first = true });
+    if (!r.returned or r.messages != 0 or r.err == null or r.err.? != error.Shutdown) {
+        std.debug.print("a fragmented message waiting at a shutdown: returned={any} messages={d} err={s}\n", .{ r.returned, r.messages, if (r.err) |e| @errorName(e) else "none" });
+        return error.ReadOnPastShutdown;
+    }
+}
+
+test "ws: empty continuation frames end at the message cap" {
+    const r = try wsReadAgainst(.{ .sent = comptime clientFrame(0x01, "{"), .flood = comptime clientFrame(0x00, ""), .limit_ms = 0, .wait_ms = 3000, .ws_limit = 4096 });
+    if (!r.returned or r.err == null or r.err.? != error.WsTooLarge) {
+        std.debug.print("an empty-continuation flood under a 4 KB cap: returned={any} err={s}\n", .{ r.returned, if (r.err) |e| @errorName(e) else "none" });
+        return error.UncappedMessage;
+    }
+}
+
+test "Conn.read: a shutdown ends a read with bytes waiting, held by the reader or in the socket" {
+    const t = std.testing;
+    const sv = try widePair();
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+    // The peer goes first, so the close does not wait for it.
+    defer conn.close();
+    defer _ = std.c.close(sv[1]);
+    const sent: [64]u8 = @splat('x');
+    _ = std.c.send(sv[1], &sent, sent.len, 0);
+    // The first read takes 8 bytes and leaves the rest held by the reader.
+    var buf: [8]u8 = undefined;
+    try t.expectEqual(@as(usize, 8), try conn.read(&buf, null));
+    try t.expect(conn.reader().bufferedLen() > 0);
+    server_state.shutdown_requested.store(true, .release);
+    defer server_state.shutdown_requested.store(false, .release);
+    try t.expectError(error.Shutdown, conn.read(&buf, null));
+    // Bytes in the socket and none held.
+    conn.reader().tossBuffered();
+    _ = std.c.send(sv[1], &sent, sent.len, 0);
+    try t.expectError(error.Shutdown, conn.read(&buf, 1000));
 }

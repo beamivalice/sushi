@@ -1726,3 +1726,117 @@ test "server: h21 a tool_choice the surface does not serve is refused by name, n
         }
     }.run);
 }
+
+/// A connection whose request is in its socket before the server's thread starts, so a shutdown already asked cannot
+/// end the read first: the request reaches its route.
+fn askedBeforeServed(path: []const u8, body: []const u8) ![]u8 {
+    var sv: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(sv[1]);
+    readLimit(sv[1], 30);
+    try send(sv[1], "POST", path, body);
+    server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
+    return readUntil(sv[1], null);
+}
+
+/// The OpenAI routes carry `shutting_down`, Anthropic's `api_error` (typed by status, by ruling), all the message.
+fn saysShutdown(path: []const u8, answer: []const u8) bool {
+    const anthropic = std.mem.startsWith(u8, path, "/v1/messages");
+    const ty = if (anthropic) "\"type\":\"api_error\"" else "\"type\":\"" ++ http.shutting_down_type ++ "\"";
+    const code = "\"code\":\"" ++ http.shutting_down_type ++ "\"";
+    return std.mem.indexOf(u8, answer, http.shutting_down_message) != null and
+        (std.mem.indexOf(u8, answer, ty) != null or (!anthropic and std.mem.indexOf(u8, answer, code) != null));
+}
+
+test "server: every route asked after the shutdown answers the one shutdown error" {
+    try eachArch(4, .{ .tiny2 = true }, struct {
+        fn run() !void {
+            gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
+            server.requestShutdown();
+            const rows = [_][2][]const u8{
+                .{ "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}" },
+                .{ "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2,\"stream\":true}" },
+                .{ "/v1/chat/completions", "{\"model\":\"tiny\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+                .{ "/v1/chat/completions", "{\"model\":\"tiny\",\"max_tokens\":2,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+                .{ "/v1/messages", "{\"model\":\"tiny\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+                .{ "/v1/messages", "{\"model\":\"tiny\",\"max_tokens\":2,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+                .{ "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":2,\"input\":\"hi\"}" },
+                .{ "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":2,\"stream\":true,\"input\":\"hi\"}" },
+                .{ "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}" },
+                .{ "/v1/load-model", "{\"model\":\"tiny2\"}" },
+                .{ "/v1/load-model", "{\"model\":\"tiny\"}" },
+                .{ "/v1/unload-model", "{\"model\":\"tiny\"}" },
+            };
+            var bad: usize = 0;
+            for (rows) |row| {
+                const answer = try askedBeforeServed(row[0], row[1]);
+                defer gpa.free(answer);
+                if (!saysShutdown(row[0], answer)) {
+                    std.debug.print("after shutdown {s} {s}: {s}\n", .{ row[0], row[1], answer[0..@min(answer.len, 320)] });
+                    bad += 1;
+                }
+            }
+            if (bad > 0) return error.NotTheShutdownError;
+        }
+    }.run);
+}
+
+const Flood = struct {
+    fd: std.posix.fd_t,
+    bytes: []const u8,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Monotonic ms when a send first failed (the server closed); 0 while it takes bytes.
+    ended_ms: std.atomic.Value(i64) = .init(0),
+    fn run(f: *Flood) void {
+        while (!f.stop.load(.acquire)) {
+            const n = std.c.send(f.fd, f.bytes.ptr, f.bytes.len, std.posix.MSG.DONTWAIT);
+            if (n < 0 and std.posix.errno(n) == .AGAIN) {
+                pause(1);
+                continue;
+            }
+            if (n <= 0) {
+                f.ended_ms.store(nowMsMonotonic(io), .release);
+                return;
+            }
+        }
+    }
+};
+
+test "server: a shutdown ends a chunked upload whose client floods carriage returns, and a WebSocket fed empty continuation frames" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            var cr: [16 * 1024]u8 = @splat('\r');
+            const up = try connectReceiveWide();
+            defer _ = std.c.close(up);
+            try sendAll(up, "POST /v1/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n");
+            var empties: [6 * 2048]u8 = undefined;
+            for (0..2048) |i| @memcpy(empties[i * 6 ..][0..6], &[_]u8{ 0x00, 0x80, 0, 0, 0, 0 });
+            const ws = try wsConnect();
+            defer _ = std.c.close(ws);
+            try sendAll(ws, &.{ 0x01, 0x80 | 1, 0, 0, 0, 0, '{' });
+            var floods = [_]Flood{ .{ .fd = up, .bytes = &cr }, .{ .fd = ws, .bytes = &empties } };
+            var threads: [2]std.Thread = undefined;
+            for (&floods, 0..) |*f, i| threads[i] = try std.Thread.spawn(.{}, Flood.run, .{f});
+            pause(500);
+            const t0 = nowMsMonotonic(io);
+            server.requestShutdown();
+            // The drain is 35 s; give each a 5 s bound, then let go so serve can finish.
+            var waited: i64 = 0;
+            while (waited < 5000 and (floods[0].ended_ms.load(.acquire) == 0 or floods[1].ended_ms.load(.acquire) == 0)) : (waited += 20) pause(20);
+            for (&floods) |*f| f.stop.store(true, .release);
+            for (threads) |th| th.join();
+            var bad: usize = 0;
+            for (floods, [_][]const u8{ "chunked CR flood", "WS empty-continuation flood" }) |f, what| {
+                const end = f.ended_ms.load(.acquire);
+                if (end == 0 or end - t0 > 1000) {
+                    std.debug.print("{s}: {s}\n", .{ what, if (end == 0) "still taking bytes 5 s after the shutdown" else "ended late" });
+                    bad += 1;
+                }
+            }
+            // Stop the floods; the half-done requests now end at their next wait.
+            _ = std.c.shutdown(up, std.posix.SHUT.WR);
+            _ = std.c.shutdown(ws, std.posix.SHUT.WR);
+            if (bad > 0) return error.FloodOutlivesShutdown;
+        }
+    }.run);
+}
