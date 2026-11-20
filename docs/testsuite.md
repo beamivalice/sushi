@@ -240,6 +240,9 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   written through `.?`) outside `prefix_cache.zig`'s `beginCheckout`, `donateCheckout` and `endCheckout`, tests exempt.
   `error-body-literal` flags a string literal that spells an error envelope (`{"error":`, `"type":"error"`) outside
   `src/http.zig`, whose `sendError` picks the envelope by the request's API; tests and `*_test.zig` files exempt.
+  `request-bool-read` flags `x == .bool` and `x != .bool` in the files that read a request body (`server`, `anthropic`,
+  `completions`, `responses_api`, `http_conn`, `request_policy`, `generation_stream`): a request's bool is read by
+  `request_parse.boolField`, so another type is refused by name and never read as the default.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
   that matches nothing is stale and fails, so the list only shrinks.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its

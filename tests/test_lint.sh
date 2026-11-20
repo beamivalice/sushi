@@ -98,6 +98,16 @@ printf '%s\n' 'const tc = @import("tool_calls.zig");' 'pub fn f(a: u8) void {' '
 printf '%s\n' 'test "t" { _ = .{ .prefill_tps = 0.0 }; }' > "$TMP/t/src/generation_stream.zig"
 expect_green "the raw parser outside a surface, and a result literal in a test or in generation_stream.zig"
 
+# rule request-bool-read
+tree
+printf '%s\n' 'fn f(root: Obj) bool {' '    return if (root.get("stream")) |v| v == .bool and v.bool else false;' '}' > "$TMP/t/src/server.zig"
+expect_red "a request bool read that takes its default for another type" "src/server.zig:2:42 \[request-bool-read\] f: a bool compared with .bool"
+
+tree
+printf '%s\n' 'fn f(root: Obj) bool {' '    return if (root.get("stream")) |v| v == .bool and v.bool else false;' '}' > "$TMP/t/src/other.zig"
+printf '%s\n' 'fn g(v: Value) bool {' '    return switch (v) { .bool => |b| b, else => false };' '}' 'test "t" { _ = v == .bool; }' > "$TMP/t/src/server.zig"
+expect_green "a bool compared in a file that reads no request, a switch prong and a test"
+
 # rule error-body-literal
 tree
 printf '%s\n' 'fn f(s: *S) !void {' '    try send(s, "{\"error\":\"metrics off\"}");' '}' > "$TMP/t/src/p.zig"

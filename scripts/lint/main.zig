@@ -49,6 +49,7 @@ const rules = .{
     @import("entry_checkout.zig"),
     @import("error_body_literal.zig"),
     @import("conn_read_unbounded.zig"),
+    @import("request_bool_read.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

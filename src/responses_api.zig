@@ -498,12 +498,12 @@ fn handleResponsesInner(
         null;
 
     // ── store (default true) ──
-    const should_store = if (root.get("store")) |v| (if (v == .bool) v.bool else true) else true;
+    const should_store = request_parse.boolField(root, .store) orelse true;
     // A WebSocket `store:false` turn comes forced to store and is kept on its connection (`turn.kept`).
     const store_echo = should_store and turn.kept == null;
 
     // ── streaming ──
-    const is_stream = if (root.get("stream")) |v| (v == .bool and v.bool) else false;
+    const is_stream = request_parse.boolField(root, .stream) orelse false;
 
     // ── text.format (or chat-style response_format alias) ──
     var text_format = responses_mod.parseTextFormat(root.get("text"));
@@ -566,14 +566,8 @@ fn handleResponsesInner(
         (if (v == .string and (std.mem.eql(u8, v.string, "auto") or std.mem.eql(u8, v.string, "disabled"))) v.string else "disabled")
     else
         "disabled";
-    const parallel_tool_calls_echo: bool = if (root.get("parallel_tool_calls")) |v|
-        (if (v == .bool) v.bool else true)
-    else
-        true;
-    const background_echo: bool = if (root.get("background")) |v|
-        (if (v == .bool) v.bool else false)
-    else
-        false;
+    const parallel_tool_calls_echo = request_parse.boolField(root, .parallel_tool_calls) orelse true;
+    const background_echo = request_parse.boolField(root, .background) orelse false;
     // Honest rejection: there is no queue/poll machinery behind `background`.
     // Accepting it and running synchronously returns status "completed" on a
     // request the caller expects to come back "queued" — a silent lie strict
@@ -809,14 +803,12 @@ fn handleResponsesInner(
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom.
     const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, req_max_output_tokens != null, prompt_ids.len, effective_ctx);
 
-    const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
+    const allow_batch_mtp = request_parse.boolField(root, .enable_batch_mtp) orelse true;
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, request_parse.boolField(root, .enable_mtp) orelse false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
-    var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
-        (v == .bool and v.bool)
-    else
+    var enable_mtp_resp: bool = request_parse.boolField(root, .enable_mtp) orelse
         defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp_resp and lm.mtp == null) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
@@ -824,10 +816,7 @@ fn handleResponsesInner(
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
     const lm_default_enable_drafter_resp: bool = lm.dflash != null;
-    var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter_resp;
+    var enable_drafter_resp: bool = request_parse.boolField(root, .enable_drafter) orelse lm_default_enable_drafter_resp;
     if (enable_drafter_resp and lm.dflash == null) enable_drafter_resp = false;
 
     // Check if attention computation would exceed GPU memory.

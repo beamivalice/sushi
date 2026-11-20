@@ -118,8 +118,7 @@ pub fn parseRequestSeed(v: ?std.json.Value) ?u64 {
 pub const MAX_TOKENS_DESC_LEN: usize = 27;
 
 pub fn ignoreEosRequested(root: std.json.ObjectMap) bool {
-    const v = root.get("ignore_eos") orelse return false;
-    return v == .bool and v.bool;
+    return boolField(root, .ignore_eos) orelse false;
 }
 
 /// Chat refuses `ignore_eos`: past its end of turn the model writes another turn, whose think
@@ -280,6 +279,48 @@ pub fn requestedMaxTokens(root: std.json.ObjectMap) ?std.json.Value {
     return root.get("max_tokens");
 }
 
+/// The bool fields a request carries. `boolField` is the one reader and `boolFieldFault` refuses any other type by
+/// name, so a surface cannot read a wrong-typed one as absent.
+pub const BoolField = enum { stream, store, echo, ignore_eos, background, enable_mtp, enable_drafter, enable_batch_mtp, parallel_tool_calls, enable_thinking, continue_final_message };
+
+/// `field` as the request set it; null when absent or null, so the surface's default applies. A value of another type
+/// reads as null too, which `generationFieldFault` has refused before any surface asks.
+pub fn boolField(root: std.json.ObjectMap, field: BoolField) ?bool {
+    const v = root.get(@tagName(field)) orelse return null;
+    return if (v == .bool) v.bool else null;
+}
+
+/// `stream_options.include_usage`: off unless the client set it true (`boolFieldFault` refuses another type).
+pub fn includeUsage(root: std.json.ObjectMap) bool {
+    const so = root.get("stream_options") orelse return false;
+    if (so != .object) return false;
+    const v = so.object.get("include_usage") orelse return false;
+    return v == .bool and v.bool;
+}
+
+/// `chat_template_kwargs` keys that take a bool; `chatTemplateKwargBool` reads them.
+const kwarg_bools = [_][]const u8{ "enable_thinking", "preserve_thinking" };
+
+/// The first bool field (or `stream_options`, `chat_template_kwargs` entry) of another type, as a message naming it.
+pub fn boolFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
+    inline for (comptime std.meta.tags(BoolField)) |f| if (root.get(@tagName(f))) |v| if (v != .null and v != .bool) {
+        return fieldFault(buf, "'{s}' must be true or false", .{@tagName(f)});
+    };
+    if (root.get("stream_options")) |so| switch (so) {
+        .null => {},
+        .object => |o| if (o.get("include_usage")) |v| if (v != .null and v != .bool) return "'stream_options.include_usage' must be true or false",
+        else => return "'stream_options' must be an object",
+    };
+    if (root.get("chat_template_kwargs")) |kw| switch (kw) {
+        .null => {},
+        .object => |o| for (kwarg_bools) |k| if (o.get(k)) |v| if (v != .null and v != .bool) {
+            return fieldFault(buf, "'chat_template_kwargs.{s}' must be true or false", .{k});
+        },
+        else => return "'chat_template_kwargs' must be an object",
+    };
+    return null;
+}
+
 /// Where a surface spells the fields `generationFieldFault` checks.
 pub const GenerationKeys = struct {
     max_tokens: []const []const u8 = &.{ "max_completion_tokens", "max_tokens" },
@@ -369,6 +410,8 @@ pub fn generationFieldFault(buf: []u8, root: std.json.ObjectMap, keys: Generatio
         if (n < 0 or n > MAX_TOP_LOGPROBS) return "'top_logprobs' must be an integer from 0 to 20";
     };
     if (reasoningBudgetFault(buf, root)) |m| return m;
+    if (boolFieldFault(buf, root)) |m| return m;
+    if (root.get("service_tier")) |v| if (v != .null and v != .string) return "'service_tier' must be a string";
     // A negative seed is the documented "unseeded"; an integer wider than i64 is no seed at all.
     if (root.get("seed")) |v| if (v != .null and wholeNumber(v) == null) return "'seed' must be an integer that fits in 64 bits; a negative one means unseeded";
     if (keys.stop) |sk| if (root.get(sk)) |v| switch (v) {
@@ -576,6 +619,25 @@ test "generationFieldFault names the field a bad value sits in" {
         .{ .body = "{\"dry_multiplier\":0.8}", .field = "dry_multiplier" },
         .{ .body = "{\"xtc_probability\":0.5}", .field = "xtc_probability" },
         .{ .body = "{\"mirostat\":\"off\"}", .field = "mirostat" },
+        .{ .body = "{\"stream\":true,\"store\":false,\"echo\":false,\"ignore_eos\":true,\"enable_mtp\":true,\"enable_drafter\":false,\"enable_batch_mtp\":true,\"parallel_tool_calls\":false,\"enable_thinking\":true,\"service_tier\":\"auto\"}", .field = null },
+        .{ .body = "{\"stream\":null,\"store\":null,\"enable_mtp\":null,\"stream_options\":null,\"chat_template_kwargs\":null,\"service_tier\":null}", .field = null },
+        .{ .body = "{\"stream_options\":{\"include_usage\":true},\"chat_template_kwargs\":{\"enable_thinking\":false,\"preserve_thinking\":true,\"other\":5}}", .field = null },
+        .{ .body = "{\"stream\":\"true\"}", .field = "stream" },
+        .{ .body = "{\"stream\":1}", .field = "stream" },
+        .{ .body = "{\"store\":\"false\"}", .field = "store" },
+        .{ .body = "{\"echo\":0}", .field = "echo" },
+        .{ .body = "{\"ignore_eos\":\"true\"}", .field = "ignore_eos" },
+        .{ .body = "{\"enable_mtp\":\"yes\"}", .field = "enable_mtp" },
+        .{ .body = "{\"enable_drafter\":1}", .field = "enable_drafter" },
+        .{ .body = "{\"enable_batch_mtp\":\"off\"}", .field = "enable_batch_mtp" },
+        .{ .body = "{\"parallel_tool_calls\":\"false\"}", .field = "parallel_tool_calls" },
+        .{ .body = "{\"enable_thinking\":\"false\"}", .field = "enable_thinking" },
+        .{ .body = "{\"stream_options\":\"all\"}", .field = "stream_options" },
+        .{ .body = "{\"stream_options\":{\"include_usage\":\"true\"}}", .field = "stream_options.include_usage" },
+        .{ .body = "{\"chat_template_kwargs\":5}", .field = "chat_template_kwargs" },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":\"no\"}}", .field = "chat_template_kwargs.enable_thinking" },
+        .{ .body = "{\"chat_template_kwargs\":{\"preserve_thinking\":1}}", .field = "chat_template_kwargs.preserve_thinking" },
+        .{ .body = "{\"service_tier\":5}", .field = "service_tier" },
     };
     for (cases) |c| {
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});

@@ -408,7 +408,7 @@ pub fn effortRefusalFor(allocator: std.mem.Allocator, lm: *LoadedModel, word: []
 
 /// The client's thinking bool: top-level `enable_thinking`, else `chat_template_kwargs.enable_thinking`.
 fn requestEnableThinking(root: std.json.ObjectMap) ?bool {
-    if (root.get("enable_thinking")) |v| if (v == .bool) return v.bool;
+    if (request_parse.boolField(root, .enable_thinking)) |b| return b;
     return chatTemplateKwargBool(root, "enable_thinking");
 }
 

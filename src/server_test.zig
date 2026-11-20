@@ -1565,3 +1565,42 @@ test "server: h21 a Responses envelope echoing service_tier is valid JSON" {
         }
     }.run);
 }
+
+test "server: h21 a request field of the wrong type is refused by name, never read as absent" {
+    try eachArch(4, .{}, struct {
+        const Case = struct { path: []const u8, body: []const u8, field: []const u8 };
+        const chat_tail = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
+        const cases = [_]Case{
+            .{ .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"stream\":\"true\"," ++ chat_tail ++ "}", .field = "'stream'" },
+            .{ .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"stream\":true,\"stream_options\":{\"include_usage\":\"true\"}," ++ chat_tail ++ "}", .field = "'stream_options.include_usage'" },
+            .{ .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"enable_mtp\":\"yes\"," ++ chat_tail ++ "}", .field = "'enable_mtp'" },
+            .{ .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"stream\":\"true\"," ++ chat_tail ++ "}", .field = "'stream'" },
+            .{ .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"enable_drafter\":1," ++ chat_tail ++ "}", .field = "'enable_drafter'" },
+            .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"stream\":1,\"input\":\"hi\"}", .field = "'stream'" },
+            .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"store\":\"false\",\"input\":\"hi\"}", .field = "'store'" },
+            .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"service_tier\":5,\"input\":\"hi\"}", .field = "'service_tier'" },
+            .{ .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"echo\":\"true\",\"prompt\":\"hi\"}", .field = "'echo'" },
+            .{ .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"stream\":true,\"stream_options\":\"all\",\"prompt\":\"hi\"}", .field = "'stream_options'" },
+        };
+        fn run() !void {
+            for (cases) |c| {
+                const resp = try request("POST", c.path, c.body);
+                defer gpa.free(resp);
+                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 400") or std.mem.indexOf(u8, bodyOf(resp), c.field) == null) {
+                    std.debug.print("wrong-typed field not refused by name: {s} {s}\n  -> {s}\n", .{ c.path, c.body, resp[0..@min(resp.len, 200)] });
+                    return error.FieldReadAsAbsent;
+                }
+            }
+            // A WebSocket turn forces `store` true in the body it reserializes: its own `store` is read before that.
+            const fd = try wsConnect();
+            defer _ = std.c.close(fd);
+            try wsSend(fd, "{\"type\":\"response.create\",\"model\":\"tiny\",\"input\":\"hi\",\"max_output_tokens\":2,\"store\":\"false\"}");
+            const frame = try wsReadFrame(fd);
+            defer gpa.free(frame);
+            if (!std.mem.startsWith(u8, frame, "{\"type\":\"error\",\"status\":400") or std.mem.indexOf(u8, frame, "'store'") == null) {
+                std.debug.print("a WebSocket turn with store:\"false\" ended in: {s}\n", .{frame[0..@min(frame.len, 300)]});
+                return error.FieldReadAsAbsent;
+            }
+        }
+    }.run);
+}

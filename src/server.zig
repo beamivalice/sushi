@@ -266,7 +266,10 @@ fn handleWebTools(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers
         if (browse != .bool) return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Browse must be a boolean", 400);
         if (browse.bool) return sendWebToolFolders(allocator, stream, root);
     }
-    const vision = if (parsed.value.object.get("vision")) |v| v == .bool and v.bool else false;
+    const vision = if (parsed.value.object.get("vision")) |v| blk: {
+        if (v != .bool) return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Vision must be a boolean", 400);
+        break :blk v.bool;
+    } else false;
     if (parsed.value.object.get("write")) |w| {
         if (w != .bool) return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Write must be a boolean", 400);
     }
@@ -1905,6 +1908,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
                 if (m == .string) requested_id = m.string;
             }
             if (parsed.value.object.get("default")) |d| {
+                if (d != .bool and d != .null) return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'default' must be true or false", 400);
                 if (d == .bool) make_default = d.bool;
             }
         }
@@ -2341,8 +2345,7 @@ pub fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) Escaped
 /// ordinary turn, and refusing it would break the obvious client that sets the
 /// field once for the whole session.
 fn continueFinalMessageRequested(root: std.json.ObjectMap, messages: []const chat_mod.Message) bool {
-    const v = root.get("continue_final_message") orelse return false;
-    if (v != .bool or !v.bool) return false;
+    if (!(request_parse.boolField(root, .continue_final_message) orelse false)) return false;
     return think_tags.continuationRequested(messages);
 }
 
@@ -2438,7 +2441,7 @@ pub fn handleChatCompletions(
     // Who decided it: the log line names it, and only the client's own number is a cut to report.
     const max_tokens_origin = request_policy.maxTokensOrigin(requested_max_tokens, request_policy.launchMaxTokensDefault(), config.defaultMaxTokens());
 
-    const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    const is_stream = request_parse.boolField(root, .stream) orelse false;
 
     const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature"));
     const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p"));
@@ -2470,10 +2473,7 @@ pub fn handleChatCompletions(
 
     // OpenAI parallel_tool_calls: only an explicit false clamps to one call
     // per response (the SDK sets false in strict structured-output mode).
-    const allow_parallel_tools = if (root.get("parallel_tool_calls")) |v|
-        !(v == .bool and !v.bool)
-    else
-        true;
+    const allow_parallel_tools = request_parse.boolField(root, .parallel_tool_calls) orelse true;
 
     defer if (tools_json) |t| allocator.free(t);
     if (has_tools) {
@@ -2593,13 +2593,7 @@ pub fn handleChatCompletions(
     }
 
     // Parse stream_options
-    const include_usage = if (root.get("stream_options")) |so| blk: {
-        if (so != .object) break :blk false;
-        if (so.object.get("include_usage")) |iu| {
-            break :blk iu == .bool and iu.bool;
-        }
-        break :blk false;
-    } else false;
+    const include_usage = request_parse.includeUsage(root);
 
     // Thinking opt-ins: the OpenAI-standard `reasoning_effort` string and the
     // vendor `enable_thinking` bool (top-level, or nested in `chat_template_kwargs`).
@@ -2644,10 +2638,7 @@ pub fn handleChatCompletions(
     // routing penalty overwhelms the win). Per-request `enable_drafter` JSON
     // overrides either way.
     const lm_default_enable_drafter: bool = lm.dflash != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter;
+    var enable_drafter: bool = request_parse.boolField(root, .enable_drafter) orelse lm_default_enable_drafter;
     if (enable_drafter and lm.dflash == null) {
         enable_drafter = false; // no drafter loaded; quietly fall through
     }
@@ -2660,14 +2651,12 @@ pub fn handleChatCompletions(
     // drafter caution). Priority DFlash > MTP at
     // dispatch (`requestSpecModes`). The trained head holds ~73%
     // per-draft acceptance even on fully novel content.
-    const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
+    const allow_batch_mtp = request_parse.boolField(root, .enable_batch_mtp) orelse true;
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, request_parse.boolField(root, .enable_mtp) orelse false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
-    var enable_mtp: bool = if (root.get("enable_mtp")) |v|
-        (v == .bool and v.bool)
-    else
+    var enable_mtp: bool = request_parse.boolField(root, .enable_mtp) orelse
         defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {

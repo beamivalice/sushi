@@ -522,7 +522,7 @@ pub fn handleAnthropicMessages(
         }
     }
 
-    const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    const is_stream = request_parse.boolField(root, .stream) orelse false;
     const model_name_raw = if (root.get("model")) |v| (if (v == .string) v.string else servedModelId(lm, config)) else servedModelId(lm, config);
     const model_name = try json_text.innerAlloc(allocator, model_name_raw);
     defer allocator.free(model_name);
@@ -532,15 +532,10 @@ pub fn handleAnthropicMessages(
 
     // Drafter: same disable rules as chat-completions parse site.
     const lm_default_enable_drafter: bool = lm.dflash != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter;
+    var enable_drafter: bool = request_parse.boolField(root, .enable_drafter) orelse lm_default_enable_drafter;
     if (enable_drafter and lm.dflash == null) enable_drafter = false;
-    const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    var enable_mtp: bool = if (root.get("enable_mtp")) |v|
-        (v == .bool and v.bool)
-    else
+    const allow_batch_mtp = request_parse.boolField(root, .enable_batch_mtp) orelse true;
+    var enable_mtp: bool = request_parse.boolField(root, .enable_mtp) orelse
         defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
 
@@ -548,7 +543,7 @@ pub fn handleAnthropicMessages(
     defer prompt.deinit();
     defer clearEffortNotice(stream);
     if (!try renderAnthropicPrompt(allocator, stream, lm, root, spelled.value.object, .messages, &prompt)) return;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, request_parse.boolField(root, .enable_mtp) orelse false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }

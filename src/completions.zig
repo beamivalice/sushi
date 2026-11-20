@@ -153,8 +153,7 @@ fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab
 /// Prompt-token logprobs are not computed, so an echo would hand lm-eval an empty sum it
 /// reads as perplexity 1; refused by name instead.
 fn echoRejectReason(root: std.json.ObjectMap) ?[]const u8 {
-    const v = root.get("echo") orelse return null;
-    if (v != .bool or !v.bool) return null;
+    if (!(request_parse.boolField(root, .echo) orelse false)) return null;
     return "'echo' is not supported: the prompt is not echoed and its tokens carry no logprobs";
 }
 
@@ -234,7 +233,7 @@ pub fn handleCompletions(
     // Who decided it: the log line names it, and only the client's own number is a cut to report.
     const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault(), config.defaultMaxTokens());
 
-    const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    const is_stream = request_parse.boolField(root, .stream) orelse false;
 
     var sampling = requestSampling(config, root);
 
@@ -260,16 +259,10 @@ pub fn handleCompletions(
     const model_name = try json_text.innerAlloc(allocator, model_name_raw);
     defer allocator.free(model_name);
 
-    const include_usage = if (root.get("stream_options")) |so| blk: {
-        if (so != .object) break :blk false;
-        if (so.object.get("include_usage")) |iu| {
-            break :blk iu == .bool and iu.bool;
-        }
-        break :blk false;
-    } else false;
+    const include_usage = request_parse.includeUsage(root);
 
     // Spec-decode flags (mirror chat-completions).
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, request_parse.boolField(root, .enable_mtp) orelse false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
@@ -368,15 +361,13 @@ const SpecRequest = struct { drafter: bool, mtp: bool, allow_batch_mtp: bool };
 
 /// The speculative switches a request resolves: its own fields, else what the loaded model defaults to.
 fn requestSpec(config: *const model_mod.ModelConfig, root: std.json.ObjectMap, dflash_loaded: bool, mtp_loaded: bool, native_measured: bool) SpecRequest {
-    const drafter = if (root.get("enable_drafter")) |v| (v == .bool and v.bool) else dflash_loaded;
-    const mtp = if (root.get("enable_mtp")) |v|
-        (v == .bool and v.bool)
-    else
+    const drafter = request_parse.boolField(root, .enable_drafter) orelse dflash_loaded;
+    const mtp = request_parse.boolField(root, .enable_mtp) orelse
         defaultEnableMtpForStreaming(mtp_loaded, config.isMoe(), forceMtpFor(config), native_measured, model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     return .{
         .drafter = drafter and dflash_loaded,
         .mtp = mtp and mtp_loaded,
-        .allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true,
+        .allow_batch_mtp = request_parse.boolField(root, .enable_batch_mtp) orelse true,
     };
 }
 
