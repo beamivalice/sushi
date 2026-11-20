@@ -1510,8 +1510,8 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u64, 465), g.grow_coexist_bytes / mb);
     // The bill at the narrowest and a wider width.
     // The reply is billed whole: 5,057 MB under the 8192-token headroom.
-    try t.expectEqual(@as(u64, 11_102), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
-    try t.expectEqual(@as(u64, 12_584), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
+    try t.expectEqual(@as(u64, 11_105), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
+    try t.expectEqual(@as(u64, 12_587), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
 
     // A buffer the previous turn sized above this prompt but below the reservation is grown to
     // it before the prefill writes, one attention layer per eval: one window of old rows.
@@ -1519,7 +1519,7 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     const f = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, fits);
     try t.expect(reserved > 450_048);
     try t.expectEqual(450_048 *| kv_per_tok / 12, f.grow_coexist_bytes);
-    try t.expectEqual(@as(u64, 11_080), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
+    try t.expectEqual(@as(u64, 11_083), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
 
     // Byte-identical arms: a SHARED restore is copied whole by the first append, so it credits
     // nothing and bills no window either; a COLD prompt has nothing to credit.

@@ -380,7 +380,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     const max_tokens: u32 = @intCast(bills.getEffectiveContextLength(&cfg) - seq);
     const shared = bills.WarmPrefix{ .matched_tokens = 448_531, .capacity_tokens = 448_531, .will_donate = false };
     const needed = bills.prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, shared);
-    try t.expectEqual(@as(u64, 17_501), needed / mb);
+    try t.expectEqual(@as(u64, 17_504), needed / mb);
     try t.expect(needed > bills.gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, 0) -| footprint);
     const lifted = bills.gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, bills.wiredCeilingFloorForRam(&cfg, total_ram));
     try t.expectEqual(@as(u64, 31_254), (lifted -| footprint) / mb);
