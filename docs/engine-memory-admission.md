@@ -154,7 +154,9 @@ bill function's output on the committed fixture configs of all served packs: a b
   declared floor or the working set are refused by name (the bound in words), never waved through as an unknown 0.
 - A short reading waits for a just-freed process's memory (`settleAvailableBytes`) while it keeps rising, and gives up
   once it has not risen for `settle_stall_ms` (10 s: a teardown returns memory in bursts with flat stretches between) or
-  at `settle_total_ms` (60 s), with one `[preflight] waited …` line naming what it read and for how long; it waits only while
+  at `settle_total_ms` (60 s), with one `[preflight] waited …` line naming what it read, the figure it waited for and for how long;
+  that bound is the LOAD's (`SettleBudget`): a DeepSeek default budget's check (`ramDefaultFor`, which logs its own lines) and the
+  preflight spend one 60 s between them. It waits only while
   free RAM is the bound: a reading a GPU limit binds (the working set, a declared wired limit) is refused at once. A read
   that fails during the wait ends it on the last figure read, which still refuses: a short figure is never dropped for an
   unread one. A shutdown ends it within one poll (`SettleEnd.shutdown`, asked through the reader) and the load is refused

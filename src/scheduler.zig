@@ -1815,7 +1815,7 @@ pub const Scheduler = struct {
                 .drop_default, .off => {},
             }
             const assistant_bytes = try model_load.streamedAssistantBytes(self.io, self.allocator, owned.config, self.no_drafter, model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path), entry.path);
-            const gate_budget: model_load.SsdBudgetChoice = if (settings_budget > 0) settings_choice else .{ .bytes = model_load.ramDefaultFor(self.io, self.allocator, owned.config, entry.path, model_load.ramDefaultTierFor(owned.config).?, model_load.coldLoadVision(owned.config, true), assistant_bytes, false).bytes, .origin = .ram_default, .setting_ignored = false };
+            const gate_budget: model_load.SsdBudgetChoice = if (settings_budget > 0) settings_choice else .{ .bytes = model_load.ramDefaultFor(self.io, self.allocator, owned.config, entry.path, model_load.ramDefaultTierFor(owned.config).?, model_load.coldLoadVision(owned.config, true), assistant_bytes, null).bytes, .origin = .ram_default, .setting_ignored = false };
             const plan = model_load.planExpertStreamingWith(self.io, self.allocator, owned.config, entry.path, gate_budget.bytes, model_load.coldLoadVision(owned.config, true), assistant_bytes) catch |e| {
                 if (e == error.SsdBudgetBelowResident) {
                     var text_buf: [512]u8 = undefined;

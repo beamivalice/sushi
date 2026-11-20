@@ -659,10 +659,10 @@ pub const budget_required_message = "This checkpoint streams its experts from SS
 
 /// The budget a DeepSeek load takes from its Mac's RAM tier. The planner is asked what holding every routed expert
 /// resident needs (a budget no pack exhausts), and the limits then decide whether that, or a streamed budget, fits.
-/// `at_load` steps it down to what every check the load runs admits on the readings at the load, once memory still being
-/// released has come back; the registry gate, before its evictions, bills the default without them (never less). It
-/// calls no MLX.
-pub fn ramDefaultFor(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, tier: RamTier, load_vision: bool, assistant_bytes: u64, at_load: bool) RamDefault {
+/// A `settle` budget (the load's `bills.SettleBudget`) steps it down to what every check the load runs admits on the
+/// readings at the load, once memory still being released has come back, and charges the wait to that budget; none
+/// (the registry gate, before its evictions) bills the default without them (never less). It calls no MLX.
+pub fn ramDefaultFor(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, tier: RamTier, load_vision: bool, assistant_bytes: u64, settle: ?*bills.SettleBudget) RamDefault {
     const unbounded: u64 = 1 << 50;
     const probe = planExpertStreamingWith(io, allocator, config, model_dir, unbounded, load_vision, assistant_bytes) catch null;
     var resident_need: u64 = 0;
@@ -678,9 +678,18 @@ pub fn ramDefaultFor(io: std.Io, allocator: std.mem.Allocator, config: *const Mo
     const beside = bills.defaultRequestBill(config) +| encode;
     const limits = bills.defaultBudgetLimits();
     const unbound = ramDefaultBudget(tier, resident_need, beside, limits, plan);
-    if (!at_load) return unbound;
+    const budget = settle orelse return unbound;
     var reader = PreflightReader{ .io = io, .config = config };
-    _ = bills.settleAvailableBytes(reader.read(), plan.needAt(unbound.bytes) orelse 0, &reader);
+    const first = reader.read();
+    const needed = plan.needAt(unbound.bytes) orelse 0;
+    if (first) |f| if (f < needed and reader.freeRamBinds()) log.info("[expert-stream] {d:.2} GB available of {d:.2} GB needed at the default ssd budget; waiting while memory is still being released\n", .{
+        @as(f64, @floatFromInt(f)) / (1024.0 * 1024.0 * 1024.0),
+        @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
+    });
+    const settled = bills.settleAvailableBytes(first, needed, budget, &reader);
+    var give_up_buf: [320]u8 = undefined;
+    const gave_up = settled.giveUpLine(&give_up_buf);
+    if (gave_up.len > 0) log.info("[expert-stream] {s}\n", .{gave_up});
     return ramDefaultAtLoad(tier, resident_need, beside, limits, plan, reader.readings);
 }
 
@@ -723,10 +732,10 @@ pub fn requireBudgetSource(choice: SsdBudgetChoice, tier: ?RamTier) error{Expert
 
 /// The one place a streamed load with no flag and no setting takes its budget: every load path that takes `--ssd-budget-gb`
 /// (serve, `kld`) resolves it here, so a box whose tier defaults to fully resident loads resident on each.
-pub fn withRamDefault(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, choice: SsdBudgetChoice, tier: ?RamTier, load_vision: bool, assistant_bytes: u64) error{ExpertStreamingRequired}!SsdBudgetChoice {
+pub fn withRamDefault(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, choice: SsdBudgetChoice, tier: ?RamTier, load_vision: bool, assistant_bytes: u64, settle: *bills.SettleBudget) error{ExpertStreamingRequired}!SsdBudgetChoice {
     try requireBudgetSource(choice, tier);
     if (choice.bytes > 0) return choice;
-    const d = ramDefaultFor(io, allocator, config, model_dir, tier.?, load_vision, assistant_bytes, true);
+    const d = ramDefaultFor(io, allocator, config, model_dir, tier.?, load_vision, assistant_bytes, settle);
     var buf: [256]u8 = undefined;
     if (d.bound_by.len > 0) log.warn("{s}\n", .{stepDownLine(&buf, d)});
     return .{ .bytes = d.bytes, .origin = .ram_default, .setting_ignored = false, .wired_limit_mb = d.wired_limit_mb, .resident = d.resident };
@@ -1998,6 +2007,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Every refusal of this model, a request's included, offers a smaller pack from this one fact.
     params.config.smaller_pack = smallerPackOf(params.model_dir) == .exists;
     var streaming_resident_bytes: ?u64 = null;
+    // The waits for memory to come back, here and in the preflight, share one bound.
+    var settle_budget: bills.SettleBudget = .{};
     // A failed load runs no unload hook (`failLoadRequest`): the caps its plan lowered go back here.
     var pool_capped = false;
     errdefer if (pool_capped) arch_serve.unloadModel(params.config);
@@ -2046,7 +2057,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             .drop_default, .off => {},
         }
         const assistant_bytes = try streamedAssistantBytes(sch.io, sch.allocator, params.config, params.no_drafter, params.drafter_dir, params.model_dir);
-        budget = try withRamDefault(sch.io, sch.allocator, params.config, params.model_dir, budget, tier, load_vision, assistant_bytes);
+        budget = try withRamDefault(sch.io, sch.allocator, params.config, params.model_dir, budget, tier, load_vision, assistant_bytes, &settle_budget);
         const plan = planExpertStreamingWith(sch.io, sch.allocator, params.config, params.model_dir, budget.bytes, load_vision, assistant_bytes) catch |e| {
             if (e == error.SsdBudgetBelowResident) {
                 var text_buf: [512]u8 = undefined;
@@ -2145,7 +2156,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 @as(f64, @floatFromInt(avail_bytes.?)) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             });
-            const settled = bills.settleAvailableBytes(avail_bytes, needed, &reader);
+            const settled = bills.settleAvailableBytes(avail_bytes, needed, &settle_budget, &reader);
             if (settled.end == .shutdown) {
                 log.info("[preflight] a shutdown was asked while waiting for memory; the load is refused\n", .{});
                 return error.Shutdown;
@@ -2155,7 +2166,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             serving = priced.serving;
             needed = priced.needed;
             var give_up_buf: [320]u8 = undefined;
-            const gave_up = settled.giveUpLine(&give_up_buf, needed);
+            const gave_up = settled.giveUpLine(&give_up_buf);
             if (gave_up.len > 0) log.info("[preflight] {s}\n", .{gave_up});
         }
         var avail_buf: [192]u8 = undefined;

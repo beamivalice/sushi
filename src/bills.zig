@@ -6947,8 +6947,13 @@ pub const settle_poll_ms: u64 = 500;
 /// in bursts with flat stretches between (a wait that ends inside one refuses a load that would have fit), so the bound
 /// is a time that outlasts a stretch, not a count of reads.
 pub const settle_stall_ms: u64 = 10_000;
-/// The wait never outlasts this, however slowly the reading keeps creeping up: a boot that waits longer is hung.
+/// All the waits of one load never outlast this, however slowly the reading keeps creeping up: a boot that waits longer
+/// is hung (`SettleBudget`).
 pub const settle_total_ms: u64 = 60_000;
+
+/// What one load has spent waiting for memory to come back: its default budget's check and its preflight share the
+/// `settle_total_ms` of the load, never one each.
+pub const SettleBudget = struct { spent_ms: u64 = 0 };
 
 /// Why `settleAvailableBytes` stopped.
 pub const SettleEnd = enum {
@@ -6956,7 +6961,7 @@ pub const SettleEnd = enum {
     enough,
     /// Free memory stopped rising for `settle_stall_ms`.
     stalled,
-    /// `settle_total_ms` passed with the reading still creeping up.
+    /// The load's `settle_total_ms` passed (this wait's or an earlier one's) with the reading still creeping up.
     capped,
     /// A GPU limit binds the reading, which waiting cannot raise.
     limit,
@@ -6969,15 +6974,19 @@ pub const SettleEnd = enum {
 pub const Settled = struct {
     avail: ?u64,
     end: SettleEnd,
-    /// Slept in all, and since the reading last rose.
+    /// Slept in all by this wait, and since the reading last rose.
     waited_ms: u64 = 0,
     flat_ms: u64 = 0,
-    /// The reading the wait began on.
+    /// The reading the wait began on, and the figure it waited for.
     first: ?u64 = null,
+    needed: u64 = 0,
+    /// What the load has waited in all, this wait included.
+    spent_ms: u64 = 0,
 
-    /// The one line a wait that gave up logs: what it read, and for how long. Empty for a wait that ended `enough`.
-    pub fn giveUpLine(s: Settled, buf: []u8, needed: u64) []const u8 {
-        if (s.end == .enough or s.waited_ms == 0) return "";
+    /// The one line a wait that gave up logs: what it read, and for how long. Empty for a wait that ended `enough`, and
+    /// for one that never slept and was not the budget's end.
+    pub fn giveUpLine(s: Settled, buf: []u8) []const u8 {
+        if (s.end == .enough or (s.waited_ms == 0 and s.end != .capped)) return "";
         const gb: f64 = 1024.0 * 1024.0 * 1024.0;
         const reason = switch (s.end) {
             .stalled => "free memory stopped rising",
@@ -6987,10 +6996,11 @@ pub const Settled = struct {
             .shutdown => "a shutdown was asked",
             .enough => unreachable,
         };
-        return std.fmt.bufPrint(buf, "waited {d:.1} s while memory was released: {d:.2} GB read of {d:.2} GB needed (began at {d:.2} GB), {s} ({d:.1} s without a rise)", .{
+        return std.fmt.bufPrint(buf, "waited {d:.1} s ({d:.1} s in all this load) while memory was released: {d:.2} GB read of {d:.2} GB needed (began at {d:.2} GB), {s} ({d:.1} s without a rise)", .{
             @as(f64, @floatFromInt(s.waited_ms)) / 1000.0,
+            @as(f64, @floatFromInt(s.spent_ms)) / 1000.0,
             @as(f64, @floatFromInt(s.avail orelse 0)) / gb,
-            @as(f64, @floatFromInt(needed)) / gb,
+            @as(f64, @floatFromInt(s.needed)) / gb,
             @as(f64, @floatFromInt(s.first orelse 0)) / gb,
             reason,
             @as(f64, @floatFromInt(s.flat_ms)) / 1000.0,
@@ -6999,12 +7009,13 @@ pub const Settled = struct {
 };
 
 /// A just-exited process returns its Metal memory over seconds, in bursts: while a short reading is still rising, poll
-/// every `settle_poll_ms`; stop at enough, after `settle_stall_ms` without a rise, or after `settle_total_ms`. An unread
+/// every `settle_poll_ms`; stop at enough, after `settle_stall_ms` without a rise, or when the load's waits (`budget`)
+/// reach `settle_total_ms`; the time slept is added to `budget`. An unread
 /// figure ends the wait on the last figure read, which still refuses. Only free RAM comes back: a reading a GPU limit
 /// binds (`reader.freeRamBinds()` false) is final. The wait's time is the polls it slept (`reader.sleep(ms)`). A shutdown
 /// (`reader.shutdownAsked()`) ends it at the next poll: a load's wait never holds the server past its drain.
-pub fn settleAvailableBytes(first: ?u64, needed: u64, reader: anytype) Settled {
-    var out = Settled{ .avail = first, .end = .enough, .first = first };
+pub fn settleAvailableBytes(first: ?u64, needed: u64, budget: *SettleBudget, reader: anytype) Settled {
+    var out = Settled{ .avail = first, .end = .enough, .first = first, .needed = needed };
     while (out.avail) |now| {
         if (now >= needed) break;
         if (reader.shutdownAsked()) {
@@ -7019,7 +7030,7 @@ pub fn settleAvailableBytes(first: ?u64, needed: u64, reader: anytype) Settled {
             out.end = .stalled;
             break;
         }
-        if (out.waited_ms >= settle_total_ms) {
+        if (budget.spent_ms + out.waited_ms >= settle_total_ms) {
             out.end = .capped;
             break;
         }
@@ -7032,6 +7043,8 @@ pub fn settleAvailableBytes(first: ?u64, needed: u64, reader: anytype) Settled {
         out.flat_ms = if (next > now) 0 else out.flat_ms + settle_poll_ms;
         out.avail = next;
     }
+    budget.spent_ms += out.waited_ms;
+    out.spent_ms = budget.spent_ms;
     return out;
 }
 
@@ -7477,6 +7490,12 @@ test "on a Cooler load the coarse rerank head is billed as the pool holds it, ea
     try testing.expectEqual(mtp_mod.rerankCoarseBytes(248320, 2560, 3), rerankCoarseBill(affine, &config, true, 3));
 }
 
+/// One wait of a load that has waited before for nothing.
+fn settleFresh(first: ?u64, needed: u64, reader: anytype) Settled {
+    var budget: SettleBudget = .{};
+    return settleAvailableBytes(first, needed, &budget, reader);
+}
+
 test "the settle wait is bounded on every reading shape, and a figure that was read short is never dropped for an unread one" {
     const gib: u64 = 1 << 30;
     const Fake = struct {
@@ -7501,7 +7520,7 @@ test "the settle wait is bounded on every reading shape, and a figure that was r
     var drop_seq: [stall_polls + 2]?u64 = undefined;
     for (&drop_seq, 0..) |*v, i| v.* = if (i < stall_polls) 60 * gib else 200 * gib;
     var drop = Fake{ .seq = &drop_seq };
-    const dropped = settleAvailableBytes(69 * gib, 100 * gib, &drop);
+    const dropped = settleFresh(69 * gib, 100 * gib, &drop);
     try testing.expectEqual(@as(?u64, 60 * gib), dropped.avail);
     try testing.expectEqual(SettleEnd.stalled, dropped.end);
     try testing.expectEqual(@as(usize, stall_polls), drop.i);
@@ -7509,16 +7528,51 @@ test "the settle wait is bounded on every reading shape, and a figure that was r
     var swing_seq: [total_polls + 8]?u64 = undefined;
     for (&swing_seq, 0..) |*v, i| v.* = if (i % 2 == 0) 60 * gib else 70 * gib;
     var swing = Fake{ .seq = &swing_seq };
-    const swung = settleAvailableBytes(69 * gib, 100 * gib, &swing);
+    const swung = settleFresh(69 * gib, 100 * gib, &swing);
     try testing.expectEqual(SettleEnd.capped, swung.end);
     try testing.expectEqual(settle_total_ms, swung.waited_ms);
     try testing.expectEqual(@as(usize, total_polls), swing.i);
     // A short figure, then a read that fails: the preflight still refuses on the figure it read.
     var lost = Fake{ .seq = &.{ 80 * gib, null } };
-    const after = settleAvailableBytes(69 * gib, 100 * gib, &lost);
+    const after = settleFresh(69 * gib, 100 * gib, &lost);
     try testing.expectEqual(@as(?u64, 80 * gib), after.avail);
     try testing.expectEqual(SettleEnd.unread, after.end);
     try testing.expect(memInsufficientForLoad(10 * gib, after.avail, 100 * gib));
+}
+
+test "the waits one load makes for memory together never outlast settle_total_ms" {
+    const gib: u64 = 1 << 30;
+    // Memory that creeps up a byte a poll and never reaches the need: each wait ends only at the total cap.
+    const Creep = struct {
+        at: u64 = 20 * (1 << 30),
+        fn read(f: *@This()) ?u64 {
+            f.at += 1;
+            return f.at;
+        }
+        fn sleep(_: *@This(), _: u64) void {}
+        fn freeRamBinds(_: *@This()) bool {
+            return true;
+        }
+        fn shutdownAsked(_: *@This()) bool {
+            return false;
+        }
+    };
+    var reader = Creep{};
+    var budget: SettleBudget = .{};
+    const first = settleAvailableBytes(reader.at, 100 * gib, &budget, &reader);
+    const second = settleAvailableBytes(reader.at, 90 * gib, &budget, &reader);
+    errdefer std.debug.print("a load's two waits: {d} ms then {d} ms, {d} ms spent against {d}\n", .{ first.waited_ms, second.waited_ms, budget.spent_ms, settle_total_ms });
+    try testing.expectEqual(SettleEnd.capped, first.end);
+    try testing.expectEqual(settle_total_ms, first.waited_ms);
+    // The second wait begins with the budget spent: it sleeps no more, and says it is the load's limit, for the figure it waited for.
+    try testing.expectEqual(SettleEnd.capped, second.end);
+    try testing.expectEqual(@as(u64, 0), second.waited_ms);
+    try testing.expectEqual(settle_total_ms, budget.spent_ms);
+    var buf: [320]u8 = undefined;
+    try testing.expectEqualStrings(
+        "waited 0.0 s (60.0 s in all this load) while memory was released: 20.00 GB read of 90.00 GB needed (began at 20.00 GB), the wait reached its limit while free memory was still rising (0.0 s without a rise)",
+        second.giveUpLine(&buf),
+    );
 }
 
 test "bf16 streaming registry gate uses resident plan not checkpoint disk size" {
@@ -7550,7 +7604,7 @@ test "load preflight waits for a prior process's memory to come back, and only w
         }
     };
     var rising = Fake{ .seq = &.{ 80 * gib, 95 * gib, 110 * gib } };
-    const rose = settleAvailableBytes(69 * gib, 100 * gib, &rising);
+    const rose = settleFresh(69 * gib, 100 * gib, &rising);
     try testing.expectEqual(@as(?u64, 110 * gib), rose.avail);
     try testing.expectEqual(SettleEnd.enough, rose.end);
     try testing.expectEqual(3 * settle_poll_ms, rising.slept_ms);
@@ -7558,22 +7612,22 @@ test "load preflight waits for a prior process's memory to come back, and only w
     var short_seq: [stall_polls + 1]u64 = undefined;
     for (&short_seq, 0..) |*v, i| v.* = if (i < stall_polls) 70 * gib else 200 * gib;
     var short = Fake{ .seq = &short_seq };
-    const flat = settleAvailableBytes(70 * gib, 100 * gib, &short);
+    const flat = settleFresh(70 * gib, 100 * gib, &short);
     try testing.expectEqual(@as(?u64, 70 * gib), flat.avail);
     try testing.expectEqual(SettleEnd.stalled, flat.end);
     try testing.expectEqual(settle_stall_ms, short.slept_ms);
     // A bound read as exhausted waits as any short figure does; an unread one ends the wait.
     var exhausted = Fake{ .seq = &.{0} };
-    const spent = settleAvailableBytes(0, 100 * gib, &exhausted);
+    const spent = settleFresh(0, 100 * gib, &exhausted);
     try testing.expectEqual(@as(?u64, 0), spent.avail);
     try testing.expectEqual(settle_stall_ms, exhausted.slept_ms);
-    try testing.expectEqual(@as(?u64, null), settleAvailableBytes(null, 100 * gib, &exhausted).avail);
+    try testing.expectEqual(@as(?u64, null), settleFresh(null, 100 * gib, &exhausted).avail);
     var never = Fake{ .seq = &.{200 * gib} };
-    try testing.expectEqual(@as(?u64, 120 * gib), settleAvailableBytes(120 * gib, 100 * gib, &never).avail);
+    try testing.expectEqual(@as(?u64, 120 * gib), settleFresh(120 * gib, 100 * gib, &never).avail);
     try testing.expectEqual(@as(usize, 0), never.i);
     // A reading a GPU limit binds (the working set, a declared wired limit) cannot rise by waiting.
     var limit = Fake{ .seq = &.{200 * gib}, .free_binds = false };
-    const bound = settleAvailableBytes(70 * gib, 100 * gib, &limit);
+    const bound = settleFresh(70 * gib, 100 * gib, &limit);
     try testing.expectEqual(@as(?u64, 70 * gib), bound.avail);
     try testing.expectEqual(SettleEnd.limit, bound.end);
     try testing.expectEqual(@as(usize, 0), limit.i);
@@ -7601,18 +7655,18 @@ test "load preflight's wait ends within a poll of a shutdown, however the readin
         }
     };
     var mid = Fake{ .asked_at = 3 };
-    const ended = settleAvailableBytes(40 * gib, 100 * gib, &mid);
+    const ended = settleFresh(40 * gib, 100 * gib, &mid);
     try testing.expectEqual(SettleEnd.shutdown, ended.end);
     try testing.expectEqual(3 * settle_poll_ms, mid.slept_ms);
     try testing.expectEqual(@as(?u64, 40 * gib + 3 * gib / 8), ended.avail);
     // Asked before the wait began: it never sleeps.
     var first = Fake{ .asked_at = 0 };
-    const none = settleAvailableBytes(40 * gib, 100 * gib, &first);
+    const none = settleFresh(40 * gib, 100 * gib, &first);
     try testing.expectEqual(SettleEnd.shutdown, none.end);
     try testing.expectEqual(@as(u64, 0), first.slept_ms);
     // A reading that already reached the need is not a shutdown's to refuse.
     var enough = Fake{ .asked_at = 0 };
-    try testing.expectEqual(SettleEnd.enough, settleAvailableBytes(120 * gib, 100 * gib, &enough).end);
+    try testing.expectEqual(SettleEnd.enough, settleFresh(120 * gib, 100 * gib, &enough).end);
 }
 
 test "load preflight keeps waiting through the flat stretches of a release that comes back in bursts" {
@@ -7637,21 +7691,21 @@ test "load preflight keeps waiting through the flat stretches of a release that 
     var seq: [31]u64 = undefined;
     for (&seq, 0..) |*v, i| v.* = if (i < 16) 28 * gib else if (i < 29) 40 * gib else 52 * gib;
     var release = Fake{ .seq = &seq };
-    const settled = settleAvailableBytes(28 * gib, 51 * gib, &release);
+    const settled = settleFresh(28 * gib, 51 * gib, &release);
     try testing.expectEqual(@as(?u64, 52 * gib), settled.avail);
     try testing.expectEqual(SettleEnd.enough, settled.end);
     // A flat stretch past the bound is where it gives up, and the line says what it read and for how long.
     var flat_seq: [64]u64 = undefined;
     for (&flat_seq) |*v| v.* = 28 * gib;
     var flat = Fake{ .seq = &flat_seq };
-    const gave_up = settleAvailableBytes(28 * gib, 51 * gib, &flat);
+    const gave_up = settleFresh(28 * gib, 51 * gib, &flat);
     try testing.expectEqual(SettleEnd.stalled, gave_up.end);
     var buf: [256]u8 = undefined;
     try testing.expectEqualStrings(
-        "waited 10.0 s while memory was released: 28.00 GB read of 51.00 GB needed (began at 28.00 GB), free memory stopped rising (10.0 s without a rise)",
-        gave_up.giveUpLine(&buf, 51 * gib),
+        "waited 10.0 s (10.0 s in all this load) while memory was released: 28.00 GB read of 51.00 GB needed (began at 28.00 GB), free memory stopped rising (10.0 s without a rise)",
+        gave_up.giveUpLine(&buf),
     );
-    try testing.expectEqualStrings("", settled.giveUpLine(&buf, 51 * gib));
+    try testing.expectEqualStrings("", settled.giveUpLine(&buf));
 }
 
 test "a load beside buffers past a bound reads that bound as 0 and is refused; only a figure never read admits it" {

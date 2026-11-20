@@ -34,6 +34,7 @@ const tokenizer_mod = @import("../tokenizer.zig");
 const expert_stream = @import("../expert_stream.zig");
 const util = @import("../kld_capture_util.zig");
 const model_load = @import("../model_load.zig");
+const bills = @import("../bills.zig");
 const log = @import("../log.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -181,7 +182,8 @@ const Sizing = struct { budget: model_load.SsdBudgetChoice, batch: u32 };
 fn sizeBatch(io: std.Io, a: std.mem.Allocator, cfg: *const model.ModelConfig, opts: kld.Options, floor: u64, tier: ?model_load.RamTier) !Sizing {
     const dc = cfg.dsv41.?;
     const asked = model_load.resolveSsdBudget(opts.ssd_budget_bytes, cfg.ssd_budget_gb_override, cfg.supportsExpertStreaming());
-    const budget = try model_load.withRamDefault(io, a, cfg, opts.model_dir, asked, tier, false, 0);
+    var settle: bills.SettleBudget = .{};
+    const budget = try model_load.withRamDefault(io, a, cfg, opts.model_dir, asked, tier, false, 0, &settle);
     if (opts.batch_windows != 0) return .{ .budget = budget, .batch = opts.batch_windows };
     const batch = batchWindows(&dc, budget.bytes, floor, chunk_rows) catch |e| {
         if (e != error.Dsv41CaptureBudgetTooSmall or budget.origin != .ram_default) return e;
@@ -1843,7 +1845,8 @@ test "deepseek_v41 layer-major capture: with no budget the batch is sized from t
 
     // A streamed tier: W is what an explicit budget of the default's size buys.
     for ([_]model_load.RamTier{ .gb96, .gb128 }) |tier| {
-        const serve = model_load.ramDefaultFor(io, a, &cfg, dir, tier, false, 0, true);
+        var serve_wait: bills.SettleBudget = .{};
+        const serve = model_load.ramDefaultFor(io, a, &cfg, dir, tier, false, 0, &serve_wait);
         const got = try sizeBatch(io, a, &cfg, no_flag, floor, tier);
         try testing.expectEqual(model_load.SsdBudgetOrigin.ram_default, got.budget.origin);
         try testing.expectEqual(serve.bytes, got.budget.bytes);
@@ -1855,7 +1858,8 @@ test "deepseek_v41 layer-major capture: with no budget the batch is sized from t
 
     // A default that cannot clear the capture's floor buys no window, on a streamed tier and a resident one alike.
     for ([_]model_load.RamTier{ .gb96, .gb192 }) |tier| {
-        const granted = model_load.ramDefaultFor(io, a, &cfg, dir, tier, false, 0, true).bytes;
+        var granted_wait: bills.SettleBudget = .{};
+        const granted = model_load.ramDefaultFor(io, a, &cfg, dir, tier, false, 0, &granted_wait).bytes;
         try testing.expectError(error.Dsv41CaptureRamDefaultTooSmall, sizeBatch(io, a, &cfg, no_flag, granted, tier));
         try testing.expectError(error.Dsv41CaptureRamDefaultTooSmall, sizeBatch(io, a, &cfg, no_flag, granted - minBudget(&dc, 0, chunk_rows) + 1, tier));
         try testing.expectEqual(@as(u32, 1), (try sizeBatch(io, a, &cfg, no_flag, granted - minBudget(&dc, 0, chunk_rows), tier)).batch);
