@@ -4567,7 +4567,8 @@ fn pinValue(w: *std.Io.Writer, comptime T: type, v: T, d: ?T, name: []const u8) 
         .@"struct" => |info| inline for (info.field_names) |f| {
             var buf: [192]u8 = undefined;
             const sub = try std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ name, if (name.len > 0) "." else "", f });
-            if (comptime !std.mem.eql(u8, f, "arch"))
+            // The parse's wide arms guess this GPU's class (`gemmNaxOn`): a box-dependent value, never the config text's.
+            if (comptime !std.mem.eql(u8, f, "arch") and !std.mem.eql(u8, f, "wide_arms"))
                 try pinValue(w, @FieldType(T, f), @field(v, f), if (d) |dd| @field(dd, f) else null, sub);
         },
         .@"union" => try w.print("{s}={any}\n", .{ name, v }),

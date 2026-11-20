@@ -152,7 +152,7 @@ without it. An arch added later joins the list in the landing that adds it.
   `pack_index`'s preflight), its trailing head layers the `trailingPackLayers` hook. An arch's committed test data (configs, its chat template) live in its chat face's `fixtures` (MLX-free): a shared test
   reads the config with `arch_config.fixtureConfig(name)` (null when the build left it out) and any other decl through
   `arch_chat.Fixtures(name)` (an empty struct when it did, so the test checks `@hasDecl` and skips), and the config
-  pins take each arch's `fixtures.config_pins` and `config_variants`. A helper or constant that builds a shared type
+  pins take each arch's `fixtures.config_pins` and `config_variants` (a parse output that reads the box, such as the DeepSeek `wide_arms` GPU-class guess, is left out of `pinValue` by name). A helper or constant that builds a shared type
   from an arch's data (a `ModelConfig`, a `ChatConfig`) sits in a `*_test.zig` beside the shared file that uses it
   (`arch_fixtures_test.zig`, `bills_fixtures_test.zig`, `request_media_fixtures_test.zig`), never in the shared file. Its microbenches are `ubench` in its `arch.zig`, which `sushi-ubench` lists.
 - `-Darchs=<a,b,...>` (default: every registered arch) builds `Tag`, `Spec` and `Arch` from the listed archs. An
