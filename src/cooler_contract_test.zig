@@ -5890,10 +5890,15 @@ const LentSweep = struct {
         errdefer std.debug.print("{t} with {s} {d} refused: released {any}, union {}; lent {d} B, pools unmapped {d} B, union {d} B; admission at rest {d}, stranded {d}, now {d}\n", .{
             self.step, refused, k, .{ e.isBorrowed(self.layer[0]), e.isBorrowed(self.layer[1]) }, e.grouped_union.len != 0, lent, unmapped, self.union_read, self.rest, self.stranded, now,
         });
-        // Within a page: MLX's active bytes are the process's, and a free another load left pending may land in a
-        // release's reading or the pools' measure.
-        const page: i64 = 16 << 10;
-        if (stranded) try testing.expect(lent + page >= unmapped + self.union_read) else try testing.expect(@abs(lent - unmapped) <= page);
+        // Never under. Over by at most a page, from one cause: MLX's active bytes are the process's, and MLX frees a
+        // finished command buffer's temporaries on its completion thread, which can land inside a release's reading
+        // after the synchronize before it (116 B once on MLX); it can only free, so it never reads under.
+        if (stranded) {
+            try testing.expect(lent >= unmapped + self.union_read);
+        } else {
+            try testing.expect(lent >= unmapped);
+            try testing.expect(lent - unmapped <= 16 << 10);
+        }
         try testing.expect(now <= self.rest);
         if (self.step == .heal) try testing.expect(now >= self.stranded);
     }
@@ -5963,13 +5968,17 @@ fn lentSweep(dir: []const u8, cooler: bool) !void {
     if (e.layers.len - e.borrow_from < 2) return error.SkipZigTest;
     const last: u16 = @intCast(e.layers.len - 1);
     var sw: LentSweep = .{ .engine = e, .config = &lease.ld.config, .layer = .{ last, last - 1 } };
-    // Each pool alone: released beside the other, which made the union workspace.
+    // Each pool alone: released beside the other, which made the union workspace. The least of three: a free MLX
+    // makes off its thread only adds to a reading (`check`).
     for (0..2) |i| {
-        _ = try e.borrowLayer(sw.layer[1 - i]);
-        const before = admissionReading();
-        _ = try e.borrowLayer(sw.layer[i]);
-        sw.pool[i] = admissionReading() - before;
-        try sw.toRest();
+        sw.pool[i] = std.math.maxInt(i64);
+        for (0..3) |_| {
+            _ = try e.borrowLayer(sw.layer[1 - i]);
+            const before = admissionReading();
+            _ = try e.borrowLayer(sw.layer[i]);
+            sw.pool[i] = @min(sw.pool[i], admissionReading() - before);
+            try sw.toRest();
+        }
         try testing.expect(sw.pool[i] > 0);
     }
     // The first release makes the union workspace out of its pool.
