@@ -3050,7 +3050,8 @@ pub fn admissionAvailable(total_limit: u64, active_mem: u64) u64 {
 }
 
 /// The hot cache is read once, as the published evictable atomic, never billed on top.
-pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?trunk.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
+/// `model` is the requested model, whose own hot cache alone is credited; null credits none.
+pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, model: ?*model_registry_mod.LoadedModel, prompt_len: usize, max_tokens: u32, kv_override: ?trunk.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
     const heads = config.num_attention_heads;
     if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
     const seq: u64 = @intCast(prompt_len);
@@ -3081,19 +3082,15 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     // grows. Adding the resident entry here again would invent a third copy
     // and reject long warm prompts (and even cache misses) spuriously.
     const needed: u64 = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, chunk, warm);
-    // Published number, never the pointer: `hot_prefix_cache` is inference-thread state, freed
-    // on every model switch. Stale by at most one entry, which is all a hint has to be.
-    const evictable: u64 = if (launch_state.global_scheduler) |sch|
-        sch.resident_hot_cache_bytes.load(.monotonic)
-    else
-        0;
+    // The requested model's published gauge, never the cache: that is inference-thread state. Stale by at most one
+    // entry, which is all a hint has to be. A prefill evicts only its own model's cache, so no other is credited.
+    const sch = launch_state.global_scheduler;
+    const gauge: ?*prefix_cache_mod.HotCacheGauge = if (sch == null) null else if (model) |m| &m.hot_gauge else null;
+    const evictable: u64 = if (gauge) |g| g.resident.load(.monotonic) else 0;
     // Prompt-aware when the caller has the ids: an entry this prompt could not restore from is
-    // genuinely evictable. Still a published snapshot, never the cache pointer.
-    const reclaimable: u64 = if (launch_state.global_scheduler) |sch|
-        if (prompt_tokens) |toks|
-            scheduler_mod.reclaimableHotCacheBytesFor(sch, toks)
-        else
-            sch.reclaimable_hot_cache_bytes.load(.monotonic)
+    // genuinely evictable.
+    const reclaimable: u64 = if (gauge) |g|
+        if (prompt_tokens) |toks| g.reclaimableFor(sch.?.io, toks) else g.reclaimable.load(.monotonic)
     else
         0;
     return creditedAdmissionBill(config, needed, available, evictable, reclaimable, chunk);
@@ -3180,7 +3177,8 @@ pub fn logAdmissionDecision(bill: AdmissionBill) void {
 /// right now, with live memory re-read? Every input is forwarded, none defaulted (a hardcoded
 /// `kv_override = null` priced a `kv_quant: 4` request at fp16 and evicted a cache for nothing).
 pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: scheduler_mod.CheckpointPlan) bool {
-    return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
+    // `fits` reads no hot-cache credit: the pass that calls this evicts and asks again.
+    return prefillAdmissionBill(config, null, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
         .matched_tokens = warm_matched,
         .capacity_tokens = warm_capacity,
         .will_donate = warm_will_donate,
@@ -3193,7 +3191,7 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 
 /// The cold bill, live memory re-read, for the scheduler's sibling hold.
 pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) slot_admission.MemoryBill {
-    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
+    const bill = prefillAdmissionBill(config, null, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits, bill.chunk, enable_mtp) };
 }
@@ -3207,7 +3205,7 @@ pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: us
 }
 
 /// The inference thread's refusal, quoting the numbers it compared.
-pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: scheduler_mod.CheckpointPlan) ?model_registry_mod.MemoryContextRefusal {
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, model: ?*model_registry_mod.LoadedModel, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool, checkpoints: scheduler_mod.CheckpointPlan) ?model_registry_mod.MemoryContextRefusal {
     // The same warm inputs the probe was refused on, the checkout decision included.
     const warm = WarmPrefix{
         .matched_tokens = warm_matched,
@@ -3218,7 +3216,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
         .released = checkpoints.released,
         .thought = checkpoints.thought,
     };
-    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, warm);
+    const bill = prefillAdmissionBill(config, model, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, warm);
     // "Narrowest width tried" is only true where the ladder was walked.
     const width_note: []const u8 = if (perRequestPrefillChunkEnabled(config)) "the narrowest width tried" else "the pinned width";
     // The comparison first (`fitsAfterEviction` spelled out), then the residency as context, with

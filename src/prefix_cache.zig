@@ -599,6 +599,48 @@ pub const EvictionReport = struct {
     admitted: bool = false,
 };
 
+/// One model's hot cache as a connection thread may know it, published by the inference thread
+/// (`scheduler.publishHotCacheResidency`): never the cache, which only the inference thread touches. Each model has its
+/// own (`LoadedModel.hot_gauge`), so an admission bill reads the requested model's and no other.
+pub const HotCacheGauge = struct {
+    resident: std.atomic.Value(u64) = .init(0),
+    /// The part of `resident` an eviction can prove it will return (residency minus the largest entry).
+    reclaimable: std.atomic.Value(u64) = .init(0),
+    mu: std.Io.Mutex = .init,
+    digests: []HotPrefixCache.EntryDigest = &.{},
+    /// The residency the digests describe, published under the same lock.
+    digest_residency: u64 = 0,
+
+    /// Publishes `hc` (null: the model holds none). An allocation failure keeps the previous digests: a stale digest is
+    /// a hint, an empty one credits bytes that exist.
+    pub fn publish(self: *HotCacheGauge, allocator: std.mem.Allocator, io: std.Io, hc: ?*const HotPrefixCache) void {
+        const residency: u64 = if (hc) |c| c.residentBytes() else 0;
+        self.resident.store(residency, .monotonic);
+        self.reclaimable.store(if (hc) |c| c.reclaimableBytes() else 0, .monotonic);
+        const fresh: []HotPrefixCache.EntryDigest = if (hc) |c| (c.digestsAlloc(allocator) catch return) else &.{};
+        self.mu.lockUncancelable(io);
+        const old = self.digests;
+        self.digests = fresh;
+        self.digest_residency = residency;
+        self.mu.unlock(io);
+        if (old.len > 0) allocator.free(old);
+    }
+
+    /// What an eviction pass can prove it will get back for this prompt.
+    pub fn reclaimableFor(self: *HotCacheGauge, io: std.Io, prompt_tokens: []const u32) u64 {
+        const fp = HotPrefixCache.prefixFingerprint(prompt_tokens);
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        return HotPrefixCache.reclaimableFromDigests(self.digests, self.digest_residency, fp);
+    }
+
+    /// Back to nothing published, for a model nobody holds (its unload, its teardown).
+    pub fn reset(self: *HotCacheGauge, allocator: std.mem.Allocator) void {
+        if (self.digests.len > 0) allocator.free(self.digests);
+        self.* = .{};
+    }
+};
+
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
     max_entries: u32,

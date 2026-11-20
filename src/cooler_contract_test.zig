@@ -1882,14 +1882,10 @@ const Served = struct {
         self.sch.requests_prefilling = .init(0);
         self.sch.inflight_prefill_tokens = .init(0);
         self.sch.inflight_prefill_expected = .init(0);
-        self.sch.resident_hot_cache_bytes = .init(0);
-        self.sch.reclaimable_hot_cache_bytes = .init(0);
         self.sch.resident_live_kv_bytes = .init(0);
         self.sch.live_session_count = 0;
         self.sch.registry = self.reg;
         self.sch.digest_mu = .init;
-        self.sch.hot_cache_digests = &.{};
-        self.sch.digest_residency = 0;
         self.sch.tiers_declined = .init(0);
         self.sch.force_batched = false;
     }

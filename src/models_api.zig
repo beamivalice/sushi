@@ -1,4 +1,5 @@
 const std = @import("std");
+const cache_stats = @import("cache_stats.zig");
 const sched_policy = @import("sched_policy.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
@@ -963,7 +964,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (server_state.global_scheduler) |sch|
-        sch.resident_hot_cache_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic)
+        cache_stats.process.hot_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic)
     else
         0;
     const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, kv_cache_mem, extra_json);

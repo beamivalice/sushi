@@ -397,9 +397,9 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
     const seq: usize = 200_000;
     const q4 = trunk.KVQuantConfig.affine(4);
     const q8 = trunk.KVQuantConfig.affine(8);
-    const bill4 = bills.prefillAdmissionBill(&cfg, seq, 2048, q4, false, null, .{});
-    const bill8 = bills.prefillAdmissionBill(&cfg, seq, 2048, q8, false, null, .{});
-    const bill16 = bills.prefillAdmissionBill(&cfg, seq, 2048, trunk.KVQuantConfig.dense, false, null, .{});
+    const bill4 = bills.prefillAdmissionBill(&cfg, null, seq, 2048, q4, false, null, .{});
+    const bill8 = bills.prefillAdmissionBill(&cfg, null, seq, 2048, q8, false, null, .{});
+    const bill16 = bills.prefillAdmissionBill(&cfg, null, seq, 2048, trunk.KVQuantConfig.dense, false, null, .{});
     try t.expect(bill4.needed < bill8.needed);
     try t.expect(bill8.needed < bill16.needed);
 }
@@ -471,7 +471,7 @@ test "Flash-Next streamed: a request refused at admission for its max_tokens nam
             defer _ = std.c.close(sv[1]);
             var conn: http_conn.Conn = undefined;
             http_conn.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
-            const admitted = try server.checkAttentionMemory(t.allocator, &conn, ids, max_tokens, cfg, "", false, null, false, false);
+            const admitted = try server.checkAttentionMemory(t.allocator, &conn, ids, max_tokens, cfg, null, false, null, false, false);
             _ = std.c.close(sv[0]);
             const raw = server.readAllFromPair(sv[1], out);
             return .{ .admitted = admitted, .body = raw[(std.mem.indexOf(u8, raw, "\r\n\r\n") orelse 0)..] };

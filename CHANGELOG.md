@@ -156,6 +156,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **Stopping the server during an unload answers the requests waiting on that model**: a request sent while an unload
   waited for its model's last stream never got an answer once a shutdown came, and the server exited with an error
   after 35 s without its cleanup; it now gets the shutdown error at once.
+- **A request for a model other than the last one loaded is admitted on its own model's cache**: it was credited with
+  the other model's prompt cache, admitted on memory its prefill could not free, and refused late without first
+  unloading idle models.
 - **`--max-resident-models` holds while two models load at once**: a request for one model, made while another
   model's load ran, loaded beside it and left both in memory over the cap; it now waits for that load and evicts as
   usual.

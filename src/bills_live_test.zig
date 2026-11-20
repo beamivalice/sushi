@@ -226,7 +226,7 @@ test "a second GLM admission leaves free the cache growth the first was admitted
     const prompt: usize = 16;
     const max_tokens: u32 = 1_048_560;
     for ([_]u64{ 16, 8 }) |kv_bits| {
-        const bill = bills.prefillAdmissionBill(&cfg, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, null, .{});
+        const bill = bills.prefillAdmissionBill(&cfg, null, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, null, .{});
         const nums = bills.prefillBillNumbersNow(&cfg, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, false);
         const commit = bills.admissionCommitBytes(&cfg, prompt, max_tokens, kv_bits, bill.chunk, false);
         try std.testing.expectEqual(commit, nums.commit);
@@ -396,7 +396,7 @@ test "the width the scheduler runs a request at is the one its admission bill wa
     core.release(idle);
     try core.sync();
     for ([_]usize{ 4096, 65_536, 262_144 }) |prompt| {
-        const bill = bills.prefillAdmissionBill(&cfg, prompt, 4096, trunk.KVQuantConfig.affine(8), false, null, .{});
+        const bill = bills.prefillAdmissionBill(&cfg, null, prompt, 4096, trunk.KVQuantConfig.affine(8), false, null, .{});
         const width = bills.requestPrefillChunkNow(&cfg, prompt, 4096, trunk.KVQuantConfig.affine(8), false, 0, 0, false, false);
         try testing.expectEqual(bills.admissionAvailableNow(&cfg), bill.available);
         try testing.expectEqual(bills.requestPrefillPick(&cfg, prompt, 4096, 8, bill.available, false, .{}), width);
@@ -576,7 +576,7 @@ test "#110: under a declared wired limit a Flash-Next request on MLX is admitted
     const active: u64 = live_gpu.activeBytes();
     try testing.expectEqual((55_296 * MiB) -| active, bills.admissionAvailableNow(&cfg));
     // The whole 262,144-token context, a 32,000-token reply in it, as asked at `--kv-quant 4`.
-    const bill = bills.prefillAdmissionBill(&cfg, 262_144 - 32_000, 32_000, kv4, false, null, .{});
+    const bill = bills.prefillAdmissionBill(&cfg, null, 262_144 - 32_000, 32_000, kv4, false, null, .{});
     errdefer std.debug.print("needed {d} MB, available {d} MB\n", .{ bill.needed >> 20, bill.available >> 20 });
     try testing.expect(bill.fits());
 }
@@ -609,7 +609,7 @@ test "#109: admission under a declared wired limit reads the same room whatever 
         try testing.expectEqual(room orelse available, available);
         room = available;
         for ([_]usize{ 156_000, 183_000 }) |prompt| {
-            const bill = bills.prefillAdmissionBill(&cfg, prompt, 52_769, kv4, false, null, .{ .mtp_on = true });
+            const bill = bills.prefillAdmissionBill(&cfg, null, prompt, 52_769, kv4, false, null, .{ .mtp_on = true });
             errdefer std.debug.print("free {d} MB: a {d}-token prompt needs {d} MB, available {d} MB\n", .{ free_mb, prompt, bill.needed >> 20, bill.available >> 20 });
             try testing.expect(bill.fits());
         }
@@ -642,7 +642,7 @@ test "a Qwen request commits the cache its admitted width reserves, not the defa
     const kv8 = trunk.KVQuantConfig.affine(8);
     // A long prompt reserves its prompt, its reply and one chunk of the width it is admitted at.
     const seq: usize = 40_000;
-    const bill = bills.prefillAdmissionBill(&cfg, seq, 4096, kv8, false, null, .{});
+    const bill = bills.prefillAdmissionBill(&cfg, null, seq, 4096, kv8, false, null, .{});
     try testing.expect(bill.chunk < @import("settings_resolve.zig").prefill_chunk.value);
     const nums = bills.prefillBillNumbersNow(&cfg, seq, 4096, kv8, false, false);
     try testing.expectEqual(bills.cacheCommitBytes(&cfg, seq, 4096, 8, bill.chunk, false), nums.commit);

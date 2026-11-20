@@ -206,7 +206,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 ) bool = null;
 
 /// Logs the numbers the estimator compared on a refusal.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, trunk.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) ?model_registry_mod.MemoryContextRefusal = null;
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, ?*LoadedModel, usize, u32, trunk.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) ?model_registry_mod.MemoryContextRefusal = null;
 
 /// GPU bytes a vision encode may still take, read live (`request_media.visionEncodeAvailable`). Null skips the recheck.
 pub var vision_encode_available: ?*const fn (*const model_mod.ModelConfig) u64 = null;
@@ -1114,20 +1114,14 @@ pub const Scheduler = struct {
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     drafter_path: []const u8,
 
-    /// Resident hot-cache bytes, published for the connection thread: `hotPrefixCache()` is
-    /// inference-thread state, freed on every model switch, so the guard reads this number
-    /// and never the pointer.
-    resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// KV + recurrent state the live slots own beyond what the hot caches bill, and the state the current model keeps
     /// between requests, once per tick (`/props`).
     resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// The part of the above an eviction can prove it will return (residency minus the largest entry).
-    reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Per-slot context snapshot for `/metrics.json`, published by the inference
     /// thread inside the `queue_mu` holds that already bracket the cull, the
     /// prefill entry, and the interleave chunk boundaries; readers copy under the
-    /// same lock (the `hot_cache_digests` discipline, on the queue instead).
+    /// same lock (the `cached_sessions` discipline, on the queue instead).
     live_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
     live_session_count: usize = 0,
     /// A DeepSeek live record holds restore points not yet on SSD: the idle park flushes them (`flushLiveStates`).
@@ -1143,11 +1137,7 @@ pub const Scheduler = struct {
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
     budget_revise_sw: ?io_util.Stopwatch = null,
 
-    /// Per-entry digest snapshot the connection-thread guard reads instead of the cache.
-    /// Replaced under `digest_mu` by the inference thread; readers copy under the lock.
-    hot_cache_digests: []prefix_cache_mod.HotPrefixCache.EntryDigest = &.{},
-    /// The residency the digests describe, published in the same critical section.
-    digest_residency: u64 = 0,
+    /// Guards `cached_sessions`.
     digest_mu: std.Io.Mutex = .init,
 
     max_concurrent: u32,
@@ -1407,12 +1397,6 @@ pub const Scheduler = struct {
         if (self.inference_thread) |t| t.join();
         self.releaseStartupPin();
 
-        // Freed below the join: the publisher is gone, so this is the last writer.
-        if (self.hot_cache_digests.len > 0) {
-            self.allocator.free(self.hot_cache_digests);
-            self.hot_cache_digests = &.{};
-        }
-
         // Drain any leftover slots — should be empty if all conn threads
         // called `complete` properly, but defensive. Inference thread has
         // already exited by now (joined above), so freeing here is safe.
@@ -1465,9 +1449,7 @@ pub const Scheduler = struct {
             }
         }
         self.current_model = null;
-        self.resident_hot_cache_bytes.store(0, .monotonic);
         if (hot_cache_budget_invalidate) |f| f();
-        self.reclaimable_hot_cache_bytes.store(0, .monotonic);
         if (self.load_error_name) |n| self.allocator.free(n);
 
         self.allocator.destroy(self);
@@ -2366,27 +2348,23 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
 }
 
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
-    const bytes: u64 = if (sch.hotPrefixCache()) |hc| hc.residentBytes() else 0;
-    sch.resident_hot_cache_bytes.store(bytes, .monotonic);
-    cache_stats.process.setHotBytes(readyHotCacheBytes(sch));
-    const reclaimable: u64 = if (sch.hotPrefixCache()) |hc| hc.reclaimableBytes() else 0;
-    sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
+    cache_stats.process.setHotBytes(publishModelGauges(sch));
     publishDiskStats(sch);
-    publishHotCacheDigests(sch);
     if (sch.metrics != null) publishCachedSessions(sch);
 }
 
-/// The RAM tier of every ready model, where `resident_hot_cache_bytes` is the current model's alone.
-/// Caller must not hold `registry.mutex`.
-fn readyHotCacheBytes(sch: *Scheduler) u64 {
+/// Every model's `hot_gauge` from its own cache, none for a model that is not ready; returns what the ready models'
+/// caches hold together. Caller must not hold `registry.mutex`.
+fn publishModelGauges(sch: *Scheduler) u64 {
     sch.registry.mutex.lockUncancelable(sch.io);
     defer sch.registry.mutex.unlock(sch.io);
     var sum: u64 = 0;
     var it = sch.registry.entries.valueIterator();
     while (it.next()) |entry_ptr| {
         const entry = entry_ptr.*;
-        if (entry.state != .ready) continue;
-        if (entry.prefix_cache) |*hc| sum += hc.residentBytes();
+        const hc: ?*prefix_cache_mod.HotPrefixCache = if (entry.state != .ready) null else if (entry.prefix_cache) |*h| h else null;
+        entry.hot_gauge.publish(entry.allocator, sch.io, hc);
+        if (hc) |h| sum += h.residentBytes();
     }
     return sum;
 }
@@ -2418,35 +2396,6 @@ fn publishCachedSessions(sch: *Scheduler) void {
     sch.cached_session_count = n;
 }
 
-/// Swap in a fresh digest snapshot and free the one it supersedes (inference thread only).
-/// An allocation failure keeps the previous snapshot: a stale digest is a hint, an empty one
-/// credits bytes that exist.
-fn publishHotCacheDigests(sch: *Scheduler) void {
-    const fresh: []prefix_cache_mod.HotPrefixCache.EntryDigest = if (sch.hotPrefixCache()) |hc|
-        (hc.digestsAlloc(sch.allocator) catch return)
-    else
-        &.{};
-    const residency: u64 = if (sch.hotPrefixCache()) |hc| hc.residentBytes() else 0;
-    sch.digest_mu.lockUncancelable(sch.io);
-    const old = sch.hot_cache_digests;
-    sch.hot_cache_digests = fresh;
-    // Published under the same lock as the digests it describes.
-    sch.digest_residency = residency;
-    sch.digest_mu.unlock(sch.io);
-    if (old.len > 0) sch.allocator.free(old);
-}
-
-/// Connection-thread entry point: what an eviction pass can prove it will get back for this prompt.
-pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) u64 {
-    const fp = prefix_cache_mod.HotPrefixCache.prefixFingerprint(prompt_tokens);
-    sch.digest_mu.lockUncancelable(sch.io);
-    defer sch.digest_mu.unlock(sch.io);
-    return prefix_cache_mod.HotPrefixCache.reclaimableFromDigests(
-        sch.hot_cache_digests,
-        sch.digest_residency,
-        fp,
-    );
-}
 
 /// What one inference pass takes under `queue_mu` for teardown and model jobs.
 const TeardownTake = struct {
@@ -3075,13 +3024,13 @@ fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot) void {
     var current_billed = false;
     if (prefilling) |p| {
         const b = slotStateBytes(p);
-        bytes += b -| slotDonatedBytes(sch, p);
+        bytes += b -| slotDonatedBytes(p);
         current_billed = p.model == sch.current_model;
         if (observe) recordLiveSession(sch, p, .prefill, b);
     }
     for (sch.decoding.items) |s| {
         const b = slotStateBytes(s);
-        bytes += b -| slotDonatedBytes(sch, s);
+        bytes += b -| slotDonatedBytes(s);
         current_billed = current_billed or s.model == sch.current_model;
         if (observe) recordLiveSession(sch, s, .decode, b);
     }
@@ -3124,11 +3073,10 @@ pub fn slotStateBytes(s: *const Slot) u64 {
     return bytes + s.ring_cps.bytes() + sched.modelStateBytes(s);
 }
 
-/// The part of `slotStateBytes` that `resident_hot_cache_bytes` already bills: a donated checkout's
-/// buffers, when the slot's cache is the one published.
-fn slotDonatedBytes(sch: *const Scheduler, s: *const Slot) u64 {
+/// The part of `slotStateBytes` that the hot-cache bytes already bill: a donated checkout's buffers, which its
+/// model's cache counts.
+fn slotDonatedBytes(s: *const Slot) u64 {
     const hc = if (s.model.prefix_cache) |*h| h else return 0;
-    if (sch.hotPrefixCache() != hc) return 0;
     return hc.donatedBytes(@intFromPtr(s));
 }
 
@@ -4059,7 +4007,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
                 if (!report.admitted and kept == null) {
                     log.warn("[scheduler] prefill refused: {d} tokens do not fit after evicting every hot-cache entry but the one it restores from\n", .{slot.full_prompt.len});
                     if (prefill_admission_refused_log) |report_fn| {
-                        slot.memory_context_refusal = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp, probe.checkpoints);
+                        slot.memory_context_refusal = report_fn(cfg, slot.model, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp, probe.checkpoints);
                     }
                     // Not `error.OutOfMemory` (the MLX latch's name, a 503): this is a request the
                     // machine cannot hold, a named 400.
@@ -4954,8 +4902,6 @@ test "a cancelled prefill with no Generator commits its forwarded prefix, pad-on
     sch.allocator = testing.allocator;
     sch.metrics = null;
     sch.current_model = null;
-    sch.hot_cache_digests = &.{};
-    sch.digest_residency = 0;
     sch.digest_mu = .init;
     var model: model_registry_mod.LoadedModel = undefined;
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(testing.allocator, 4, 0);
@@ -6671,19 +6617,23 @@ test "ensureLoaded: a streamed pack with no ssd budget is gated at its RAM-tier 
 
 pub var queue_test_prompt: [4096]u32 = undefined;
 
-test "the hot-tier bytes gauge sums the RAM tier of every ready model" {
+test "the hot-tier bytes gauge sums the RAM tier of every ready model, and each model's gauge is its own cache's" {
     var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
     defer reg.deinit();
-    for ([_][]const u8{ "a", "b", "c" }, [_]u64{ 100, 20, 3 }, [_]model_registry_mod.LoadState{ .ready, .ready, .evicting }) |id, bytes, state| {
+    var entries: [3]*LoadedModel = undefined;
+    for ([_][]const u8{ "a", "b", "c" }, [_]u64{ 100, 20, 3 }, [_]model_registry_mod.LoadState{ .ready, .ready, .evicting }, &entries) |id, bytes, state, *e| {
         const entry = try reg.registerStub(id, id, 1);
         entry.state = state;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
         entry.prefix_cache.?.current_kv_bytes = bytes;
+        e.* = entry;
     }
     var sch: Scheduler = undefined;
     sch.registry = reg;
     sch.io = testing.io;
-    try testing.expectEqual(@as(u64, 120), readyHotCacheBytes(&sch));
+    try testing.expectEqual(@as(u64, 120), publishModelGauges(&sch));
+    for (entries, [_]u64{ 100, 20, 0 }) |e, bytes| try testing.expectEqual(bytes, e.hot_gauge.resident.load(.monotonic));
+    for (entries) |e| e.state = .unloaded;
 }
 
 test "tier hits: a restore a retry throws away is not counted, the one a prefill keeps is, once" {

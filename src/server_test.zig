@@ -691,7 +691,7 @@ test "server: a load that fails after evicting the model in use leaves no view o
                 var none = [_]std.posix.pollfd{};
                 _ = std.posix.poll(&none, 200) catch {};
                 if (sch.current_model == tiny or sch.hotPrefixCache() != null) return error.EvictedModelStillInView;
-                if (sch.resident_hot_cache_bytes.load(.monotonic) != 0) return error.EvictedModelHotCacheCredited;
+                if (tiny.hot_gauge.resident.load(.monotonic) != 0) return error.EvictedModelHotCacheCredited;
                 gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
                 const retry = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
                 defer gpa.free(retry);
@@ -740,6 +740,40 @@ test "server: a model loaded beside the current one with no hot cache of its own
             const third = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
             defer gpa.free(third);
             if (!std.mem.startsWith(u8, third, "HTTP/1.1 200")) return error.SecondModelStoppedServing;
+        }
+    }.run);
+    try testing.expect(Scenario.seen > 0);
+}
+
+test "server: a request for the model that is not current is credited only with its own model's hot cache" {
+    const ram_was = server_state.prefix_cache_ram_enabled;
+    defer server_state.prefix_cache_ram_enabled = ram_was;
+    server_state.prefix_cache_ram_enabled = true;
+    const Scenario = struct {
+        var seen: u32 = 0;
+    };
+    try eachArch(4, .{ .tiny2 = true, .max_resident = 2 }, struct {
+        fn run() !void {
+            var p: [6000]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&p);
+            try w.writeAll("{\"model\":\"tiny2\",\"prompt\":\"");
+            for (0..120) |i| try w.print("river {d} runs to the sea, ", .{i});
+            try w.writeAll("\",\"max_tokens\":4,\"temperature\":0}");
+            gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
+            for (0..2) |_| gpa.free(try request("POST", "/v1/completions", w.buffered()));
+            const reg = server_state.global_registry.?;
+            const tiny = reg.entries.get("tiny").?;
+            const tiny2 = reg.entries.get("tiny2").?;
+            const cfg = tiny.config orelse return error.NoConfig;
+            // Only an arch that evicts its hot cache to admit is credited with it.
+            if (!cfg.admissionEvictsHotCache() or tiny.prefix_cache == null or tiny2.prefix_cache == null) return;
+            const own = tiny.prefix_cache.?.residentBytes();
+            const other = tiny2.prefix_cache.?.residentBytes();
+            if (other <= own) return error.SecondModelsCacheNotLarger;
+            Scenario.seen += 1;
+            const ids = [_]u32{ 11, 12, 13, 14 };
+            const bill = bills.prefillAdmissionBill(cfg, tiny, ids.len, 2, null, false, &ids, .{});
+            if (bill.evictable > own or bill.reclaimable > own) return error.CreditedAnotherModelsHotCache;
         }
     }.run);
     try testing.expect(Scenario.seen > 0);

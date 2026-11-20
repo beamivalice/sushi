@@ -870,8 +870,13 @@ process start whatever turns `--metrics` on.
   tier counts every drop through `evictForSpace`: its budget or entry cap (`evictOneLru`), a prefill being admitted
   (`evictLruToAdmit`) and an SSD-first idle-allowance drop of an entry with no SSD copy; the SSD tier counts `gcToBudget`.
   An invalidation (a failed QSA check, a merge failure), an idle spill to disk and `clear` are not evictions.
-- **`sushi:prefix_cache_hot_bytes`**: the RAM tiers of every ready model (`readyHotCacheBytes`), republished with
-  `publishHotCacheResidency`; `resident_hot_cache_bytes` (admission, `/props`) stays the current model's alone.
+- **`sushi:prefix_cache_hot_bytes`**: the RAM tiers of every ready model, republished with `publishHotCacheResidency`
+  (and `/props`' KV cache memory with them).
+- **A hot-cache figure is one model's, read for that model**: `publishHotCacheResidency` publishes each model's
+  `LoadedModel.hot_gauge` (residency, what an eviction can prove it returns, the entry digests) from its own cache, and
+  every admission reader (`bills.prefillAdmissionBill`'s credits, so the warm deferral and the evict-to-admit verdict,
+  the refusal text) reads the requested model's: a prefill evicts only its own model's cache. No process-wide
+  hot-cache number stands for one model. Guard: `server: a request for the model that is not current is credited`.
 - Guards: `cache_stats.zig`, `tier hits:` in `scheduler.zig`, `a capacity eviction is counted`, `the tier that served a restore` in `prefix_cache.zig`,
   `DiskTier: byte budget evicts LRU entries` in `kv_disk_cache.zig`.
 

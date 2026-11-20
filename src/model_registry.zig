@@ -244,6 +244,8 @@ pub const LoadedModel = struct {
     /// cache. `model_id`-keyed isolation falls out of "one cache per
     /// LoadedModel" by construction.
     prefix_cache: ?HotPrefixCache,
+    /// `prefix_cache` as the connection thread's admission bill reads it.
+    hot_gauge: prefix_cache_mod.HotCacheGauge = .{},
     /// This model's SSD tier, published by the inference thread (`/props`, the per-turn usage line,
     /// the admission guard's writer bill).
     disk_stats: DiskStats = .{},
@@ -361,6 +363,7 @@ pub const LoadedModel = struct {
     /// stream); the caller arranges this via `unloadResident` invoked
     /// from the inference thread before registry teardown.
     pub fn deinit(self: *LoadedModel) void {
+        self.hot_gauge.reset(self.allocator);
         if (self.mtp) |h| {
             // Only MiMo's heads are a separately allocated object; an
             // in-trunk head would be owned by the Trunk and freed with
@@ -484,6 +487,8 @@ pub const LoadedModel = struct {
     /// inference thread. It leaves `state` alone: the entry turns `.unloaded`
     /// only in `finalizeEvictionLocked`, under the mutex, once the memory is back.
     pub fn unloadResident(self: *LoadedModel) void {
+        // Nobody holds a model that unloads, so no bill reads its gauge meanwhile.
+        self.hot_gauge.reset(self.allocator);
         if (self.mtp) |h| {
             // Only MiMo's heads are a separately allocated object; an
             // in-trunk head would be owned by the Trunk and freed with
