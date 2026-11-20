@@ -71,6 +71,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   steps, or a prompt that does not fill the context, holds no more than its bill and than a prompt that fills it.
   Qwen's QSA banks grow on the same rule in pooled rows (`indexer_compress_ratio` tokens each, `Hold.per`), and the
   bill prices the history in those rows (`qsaKeyAppendPlan`, `cacheCapacityTokens`).
+  Every request binds its caches before anything writes (`generate.reserveRequestCapacity`), a request of one token
+  included; a cache no request has bound has no hold and cannot grow (`KvCacheUnbound`, `QsaHistoryUnbound`), so a path
+  with no request (a warm, a KLD run, a capture) binds the rows it writes (`Trunk.bindOwnRows`).
 - **A shared restore whose buffer is longer than the request reserves copies its rows into a request-sized buffer**
   on the first append (`KVCache.copiesSharedRestore`), because the admission bills the copy at the reservation: a 4k
   chat restored from an 80k entry held the 80k buffer (mlx-serve #492), and a donor that decoded past its own

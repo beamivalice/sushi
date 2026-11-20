@@ -4433,6 +4433,8 @@ test "prefix cache: MTP committed history round-trips, clamped; a history ending
 }
 
 pub fn testWriteCacheLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: u32, step: u32) !void {
+    // A write is a request whose last row is its own: it binds the cache there, past any earlier request's end.
+    cache.bound(@max(cache.end_tokens, written + step));
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     const count: f64 = @floatFromInt(step * 8);
@@ -4459,6 +4461,7 @@ pub fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: 
 /// One layer's chunk at absolute rows `[written, written+step)`, handed the
 /// `max_seq` its attention would ask for: non-zero IS the ring predicate.
 fn ringWriteLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: u32, step: u32, window: u32) !trunk_mod.DenseKVView {
+    cache.bound(@max(cache.end_tokens, written + step));
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     const count: f64 = @floatFromInt(step * 8);
@@ -9739,7 +9742,8 @@ test "prefix cache: the trim's row price is the entry's own bytes divided by its
                 return a;
             }
         }.f;
-        // Two writes so the second crosses a growth event.
+        // Two writes so the second crosses a growth event; the request ends at their last row.
+        cache.bound(64 + 40);
         for ([_]c_int{ 64, 40 }) |n| {
             const k = try mk(s, n);
             defer _ = mlx.mlx_array_free(k);

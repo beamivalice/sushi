@@ -2265,6 +2265,16 @@ pub const Trunk = struct {
         arch_state_mod.clearCompiled(&self.arch_state);
     }
 
+    /// Binds this model's own request state, its KV cache and QSA histories, for a pass no request runs (a warm, a KLD
+    /// run, a capture) that writes `rows` rows: an unbound cache cannot grow (`KVCache.grownCapacity`), and a pass past
+    /// `rows` grows to exactly its own.
+    pub fn bindOwnRows(self: *Trunk, rows: usize) void {
+        self.cache.bound(rows);
+        // The MTP head's cache rides the model's state (`arch_state.headCache`, read-only there): bound with it.
+        if (arch_state_mod.headCache(&self.arch_state)) |head| @constCast(head).bound(rows);
+        prefix_arch.aux.reserveQsaHistoryWithHead(self.ssm_entries, arch_state_mod.headEntry(&self.arch_state), .{ .end = rows });
+    }
+
     /// Pre-fault weight pages and trigger first-touch kernel compiles before
     /// the first real request so cold prefill doesn't pay 800+ms of GPU page
     /// faulting. Runs three forward passes:
@@ -2279,6 +2289,7 @@ pub const Trunk = struct {
         const decode_shape = [_]c_int{ 1, 1 };
         const decode_input = try mlx.newData(&dummy_id, &decode_shape, .int32);
         defer _ = mlx.mlx_array_free(decode_input);
+        self.bindOwnRows(1);
         const decode_logits = try self.forward(decode_input);
         _ = mlx.mlx_array_free(decode_logits);
         // Materialize the cache update so subsequent forwards see initialized entries.
@@ -2302,6 +2313,7 @@ pub const Trunk = struct {
         const prefill_shape = [_]c_int{ 1, 8 };
         const prefill_input = try mlx.newData(&ids_8, &prefill_shape, .int32);
         defer _ = mlx.mlx_array_free(prefill_input);
+        self.bindOwnRows(ids_8.len);
         const prefill_logits = try self.forward(prefill_input);
         _ = mlx.mlx_array_free(prefill_logits);
         {
@@ -2326,15 +2338,19 @@ pub const Trunk = struct {
         entries: []SSMCacheEntry,
         ctx: ForwardCtx = undefined,
 
-        pub fn init(xfm: *Trunk, kv_config: KVQuantConfig) !*SpecWarmSlot {
+        /// `rows`: the rows the slot's widest pass writes, where its cache and QSA histories are bound; a request run
+        /// on the slot binds them at its own (`generate.reserveRequestCapacity`), and a pass past them grows to its own.
+        pub fn init(xfm: *Trunk, kv_config: KVQuantConfig, rows: usize) !*SpecWarmSlot {
             const alloc = xfm.allocator;
             const n_layers = xfm.config.num_hidden_layers;
             const sl = try alloc.create(SpecWarmSlot);
             errdefer alloc.destroy(sl);
             var cache = try KVCache.initWithConfig(alloc, n_layers, kv_config);
             errdefer cache.deinit();
+            cache.bound(rows);
             sl.* = .{ .cache = cache, .entries = try alloc.alloc(SSMCacheEntry, n_layers) };
             for (sl.entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+            prefix_arch.aux.reserveQsaHistoryWithHead(sl.entries, null, .{ .end = rows });
             sl.ctx = .{
                 .cache = &sl.cache,
                 .moe_seq_offset = &sl.off,

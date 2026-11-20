@@ -1659,8 +1659,8 @@ pub fn stampDflashRequestTerms(io: std.Io, allocator: std.mem.Allocator, config:
     config.dflash_loaded = true;
     if (arch_config.fact(config, "dflash_by_flag")) config.dflash_load_transient_bytes = (try dflash_mod.assistantLoadBytes(io, allocator, directory, dflash_mod.quantBitsFromEnv())).transient;
     const per_token = @as(u64, cfg.num_hidden_layers) * cfg.num_key_value_heads * cfg.head_dim * 4;
-    // A draft block grows a 2047-row window to the next 256-row allocation.
-    config.dflash_window_bytes = per_token * ((@as(u64, cfg.sliding_window) + cfg.block_size + 255) / 256 * 256);
+    // A draft block grows a 2047-row window to the next 256-row allocation, where its cache is bound (`DflashCtx.init`).
+    config.dflash_window_bytes = per_token * ((dflash_mod.contextRows(&cfg) + 255) / 256 * 256);
     config.dflash_capture_bytes_per_token = (@as(u64, cfg.target_layer_ids.len) * cfg.hidden_size + @as(u64, cfg.hidden_size) * 2) * 2 + per_token;
 }
 
@@ -2332,6 +2332,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 const r = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_KV") orelse break :blk 0;
                 break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
             };
+            // The prefilled context and its first pass; a later pass grows to exactly its own rows.
+            xfm_ptr.bindOwnRows(kv_pre + 1);
             if (kv_pre > 0) {
                 var done_pre: usize = 0;
                 const pre_buf = try sch.allocator.alloc(i32, 2048);
@@ -3026,6 +3028,7 @@ fn prefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, cfg: *const ModelConfig,
             exl3_kernels.nax_reference_override = if (arm) |a| !a else false;
         for (0..n + 1) |iter| {
             xfm.resetCache() catch return;
+            xfm.bindOwnRows(rows);
             var ctx = xfm.defaultCtx();
             ctx.skip_lm_head = true;
             const ti = mlx.newData(ids.ptr, &shape, .int32) catch return;

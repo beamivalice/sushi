@@ -224,7 +224,7 @@ pub fn joinedRounds(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: gene
     };
     defer for (gens[0..started]) |*g| g.deinit(a);
     for (prompts, 0..) |p, i| {
-        slots[i] = try Trunk.SpecWarmSlot.init(xfm, xfm.cache.config);
+        slots[i] = try Trunk.SpecWarmSlot.init(xfm, xfm.cache.config, p.len + n);
         made += 1;
         gens[i] = try generate.Generator.initWithOptions(io, a, xfm, &tok, p, n, sampling, &.{}, .{ .ctx = slots[i].ctx, .mtp = drafter, .mtp_enabled = true, .model_has_mtp = true });
         ptrs[i] = &gens[i];
@@ -257,7 +257,7 @@ pub fn joinedRows(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, ids: []const u3
     };
     defer for (gens[0..started]) |*g| g.deinit(a);
     for (0..most) |i| {
-        slots[i] = try Trunk.SpecWarmSlot.init(xfm, xfm.cache.config);
+        slots[i] = try Trunk.SpecWarmSlot.init(xfm, xfm.cache.config, 9 + i + 64);
         made += 1;
         gens[i] = try generate.Generator.initWithOptions(io, a, xfm, &tok, ids[0 .. 9 + i], 64, .{ .temperature = 0 }, &.{}, .{ .ctx = slots[i].ctx, .skip_lazy_preforward = true });
         started += 1;

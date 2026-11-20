@@ -295,8 +295,9 @@ pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) 
 pub const Hold = struct {
     /// Rows reserved up front (`KVCache.reservedTokens`, `prefill_plan.reservedPrefillTokens`); 0 = none.
     reserve: u64 = 0,
-    /// The request's last row (`KVCache.requestEnd`); 0 = no request bounds the buffer.
-    end: u64 = 0,
+    /// The request's last row (`KVCache.requestEnd`): no grow passes it. Every hold names one; a buffer no request
+    /// has bound has no hold and cannot grow (`KVCache.hold`, `qwen4_qsa_state.qsaHold`).
+    end: u64,
 
     /// The hold of a buffer whose rows each hold `ratio` tokens (a QSA bank's pooled blocks).
     pub fn per(self: Hold, ratio: u64) Hold {
@@ -314,7 +315,8 @@ pub const KVCache = struct {
     /// `reservedCacheTokens`). A grow is not in place, so a long prefill's peak carried a
     /// second copy of ~6 GB of KV at 458k; reserving on the first grow removes the transient.
     reserve_tokens: usize = 0,
-    /// The request's last row (`requestEnd`): no grow passes it (`heldRows`). 0 = no request bounds this cache.
+    /// The request's last row (`requestEnd`): no grow passes it (`heldRows`). 0 = no request has bound this cache yet,
+    /// and it cannot grow (`grownCapacity`): a request binds it before its first write (`generate.reserveRequestCapacity`).
     end_tokens: usize = 0,
     /// Window a sliding layer's storage rings at (`ModelConfig.sliding_window`);
     /// 0 = every layer stores the whole sequence. A layer rings only on a
@@ -632,9 +634,10 @@ pub const KVCache = struct {
     /// (none: any rows). The allocators grow to it and the bills price it at the request's end, so from any start,
     /// restored or cold, a cache holds at most `heldRows(0, asked.end, asked, parts)`.
     pub fn heldRows(cur_cap: u64, needed: u64, asked: Hold, parts: []const u64) u64 {
+        std.debug.assert(asked.end > 0);
         var rows: u64 = nextCapacityPolicy(@intCast(cur_cap), @intCast(needed));
         if (asked.reserve > rows) rows = roundToStep(asked.reserve);
-        if (asked.end > 0) rows = @min(rows, roundToStep(@max(asked.end, asked.reserve)));
+        rows = @min(rows, roundToStep(@max(asked.end, asked.reserve)));
         rows = @max(rows, roundToStep(needed));
         return if (parts.len == 0) rows else mlx_pages.pagedRows(rows, parts);
     }
@@ -650,8 +653,10 @@ pub const KVCache = struct {
         return seq +| reply +| past_end;
     }
 
-    /// What a request asks of a cache's growth: its reservation (`reservedTokens`) and its last row (`requestEnd`).
-    pub fn hold(self: *const KVCache) Hold {
+    /// What a request asks of a cache's growth: its reservation (`reservedTokens`) and its last row (`requestEnd`);
+    /// null until a request binds it (`bound`).
+    pub fn hold(self: *const KVCache) ?Hold {
+        if (self.end_tokens == 0) return null;
         return .{ .reserve = self.reserve_tokens, .end = self.end_tokens };
     }
 
@@ -695,7 +700,7 @@ pub const KVCache = struct {
             if (!entry.initialized or entry.ringed) continue;
             const cur_cap = bufferCapacity(entry.keys);
             if (inPlaceCapacity(entry) >= self.reserve_tokens) continue;
-            const new_cap: c_int = @intCast(self.grownCapacity(entry, cur_cap, self.reserve_tokens, &entryRowBytes(entry, n), s));
+            const new_cap: c_int = @intCast(try self.grownCapacity(entry, cur_cap, self.reserve_tokens, &entryRowBytes(entry, n), s));
             const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
             for (views) |view| {
                 _ = mlx.mlx_array_free(view.*);
@@ -727,7 +732,7 @@ pub const KVCache = struct {
             const cur_cap = bufferCapacity(entry.keys);
             const needed = entry.offset + rows;
             if (needed <= inPlaceCapacity(entry)) continue;
-            const new_cap: c_int = @intCast(self.grownCapacity(entry, cur_cap, needed, &entryRowBytes(entry, n), s));
+            const new_cap: c_int = @intCast(try self.grownCapacity(entry, cur_cap, needed, &entryRowBytes(entry, n), s));
             const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
             for (views) |view| {
                 _ = mlx.mlx_array_free(view.*);
@@ -1031,7 +1036,7 @@ pub const KVCache = struct {
                 rowBytes(B, heads, q_last, .uint32),   rowBytes(B, heads, vq_last, .uint32),
                 rowBytes(B, heads, sc_last, ksc_dt),   rowBytes(B, heads, vsc_last, vsc_dt),
             };
-            const new_cap: c_int = @intCast(self.grownCapacity(entry, cur_cap, needed, &parts, s));
+            const new_cap: c_int = @intCast(try self.grownCapacity(entry, cur_cap, needed, &parts, s));
             kv_cap_buf_grows += 1;
             try growQuantBuf(s, &entry.keys, entry.initialized, entry.ringed, entry.offset, new_cap, B, heads, q_last, .uint32);
             try growQuantBuf(s, &entry.values, entry.initialized, entry.ringed, entry.offset, new_cap, B, heads, vq_last, .uint32);
@@ -1151,7 +1156,7 @@ pub const KVCache = struct {
             const needed = entry.offset + new_len;
             const cur_cap = if (entry.initialized and !shared) bufferCapacity(entry.keys) else 0;
             const parts = [_]u64{ rowBytes(B, heads, head_dim, dtype), rowBytes(B, heads, v_head_dim, dtype) };
-            const new_cap: c_int = @intCast(self.grownCapacity(entry, cur_cap, needed, &parts, s));
+            const new_cap: c_int = @intCast(try self.grownCapacity(entry, cur_cap, needed, &parts, s));
             kv_cap_buf_grows += 1;
             const initialized = entry.initialized;
             try growQuantBuf(s, &entry.keys, initialized, entry.ringed, entry.offset, new_cap, B, heads, head_dim, dtype);
@@ -1389,9 +1394,10 @@ pub const KVCache = struct {
     /// The capacity a grow takes for THIS entry (`heldRows`): on MLX on its page grid for buffers of `parts` bytes a
     /// row, so every write lands in place; the engine of our own appends in place at any size. A ringed entry holds a
     /// window, not a context: it keeps its fixed rows, floored at the ring cap so a cold decode does not grow twice.
-    fn grownCapacity(self: *const KVCache, entry: *const KVCacheEntry, cur_cap: usize, needed: usize, parts: []const u64, s: mlx.mlx_stream) usize {
+    fn grownCapacity(self: *const KVCache, entry: *const KVCacheEntry, cur_cap: usize, needed: usize, parts: []const u64, s: mlx.mlx_stream) error{KvCacheUnbound}!usize {
         if (entry.ringed) return @max(nextCapacity(cur_cap, needed), ringCap(self.swa_ring_window));
-        return @intCast(heldRows(cur_cap, needed, self.hold(), if (mlx.engine.isStream(s)) &.{} else parts));
+        const asked = self.hold() orelse return error.KvCacheUnbound;
+        return @intCast(heldRows(cur_cap, needed, asked, if (mlx.engine.isStream(s)) &.{} else parts));
     }
 
     /// One cache row's bytes in a `[B, heads, rows, last]` buffer of `dtype`.
@@ -1719,12 +1725,14 @@ fn testKV(seq_len: usize, s: mlx.mlx_stream) mlx.mlx_array {
 /// A donor that reserved `reserve` rows and wrote `rows`, and a cache restored from its snapshot.
 fn sharedRestoreFixture(s: mlx.mlx_stream, cfg: KVQuantConfig, reserve: usize, rows: c_int, donor: *KVCache, snap: *KVCacheSnapshot, warm: *KVCache) !mlx.mlx_array {
     donor.* = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+    donor.*.bound(test_request_end);
     donor.reserve(reserve);
     const k = try qkvIdentityArray(s, 2, rows, 64, 0.5, .bfloat16);
     var dv = try donor.update(0, k, k, s, 0);
     dv.deinit();
     snap.* = try donor.snapshot();
     warm.* = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+    warm.*.bound(test_request_end);
     try warm.restore(snap);
     return k;
 }
@@ -1766,7 +1774,9 @@ fn batchedAppendMatchesSolo(bits: u8) !void {
         defer alloc.free(batched_ptrs);
         for (0..n) |i| {
             solo[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            solo[i].bound(test_request_end);
             batched[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            batched[i].bound(test_request_end);
             try kvAppendPrefill(&solo[i], lens[i], @intCast(0xA000 + i), s);
             try kvAppendPrefill(&batched[i], lens[i], @intCast(0xA000 + i), s);
             solo_ptrs[i] = &solo[i];
@@ -1813,7 +1823,9 @@ fn batchedAppendOpCount(bits: u8) !void {
         defer alloc.free(batched_ptrs);
         for (0..n) |i| {
             solo[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            solo[i].bound(test_request_end);
             batched[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            batched[i].bound(test_request_end);
             try kvAppendPrefill(&solo[i], lens[i], @intCast(0xB000 + i), s);
             try kvAppendPrefill(&batched[i], lens[i], @intCast(0xB000 + i), s);
             solo_ptrs[i] = &solo[i];
@@ -1847,8 +1859,10 @@ fn swaRingWalk(kv_cfg: KVQuantConfig) !void {
 
     var plain = try KVCache.initWithConfig(alloc, 1, kv_cfg);
     defer plain.deinit();
+    plain.bound(test_request_end);
     var ringed = try KVCache.initWithConfig(alloc, 1, kv_cfg);
     defer ringed.deinit();
+    ringed.bound(test_request_end);
     ringed.setSwaRing(window);
 
     // Three prefill chunks past the compaction cap, then decode steps past it
@@ -1892,6 +1906,7 @@ fn swaRingChunkResidue(kv_cfg: KVQuantConfig, layers: u32, chunk: c_int) !usize 
     const window: u32 = 128;
     var cache = try KVCache.initWithConfig(alloc, layers, kv_cfg);
     defer cache.deinit();
+    cache.bound(test_request_end);
     cache.setSwaRing(window);
     var ks: [2]mlx.mlx_array = undefined;
     var vs: [2]mlx.mlx_array = undefined;
@@ -1942,9 +1957,11 @@ fn ringCheckpointRestore(kv_cfg: KVQuantConfig) !void {
 
     var live = try KVCache.initWithConfig(alloc, 2, kv_cfg);
     defer live.deinit();
+    live.bound(test_request_end);
     live.setSwaRing(window);
     var plain = try KVCache.initWithConfig(alloc, 2, kv_cfg);
     defer plain.deinit();
+    plain.bound(test_request_end);
     try ringCheckpointFeed(&live, &plain, window, 0, prompt, 250);
 
     var cp = (try live.ringCheckpoint(prompt, s)) orelse return error.TestExpectedRingCheckpoint;
@@ -1960,6 +1977,7 @@ fn ringCheckpointRestore(kv_cfg: KVQuantConfig) !void {
 
     var restored = try KVCache.initWithConfig(alloc, 2, kv_cfg);
     defer restored.deinit();
+    restored.bound(test_request_end);
     restored.setSwaRing(window);
     try restored.restore(&end);
     try std.testing.expectError(error.SlidingRingRewindPastWindow, restored.truncate(prompt - 1, s));
@@ -1983,9 +2001,11 @@ fn ringMarksCapture(kv_cfg: KVQuantConfig) !void {
 
     var live = try KVCache.initWithConfig(alloc, 2, kv_cfg);
     defer live.deinit();
+    live.bound(test_request_end);
     live.setSwaRing(window);
     var twin = try KVCache.initWithConfig(alloc, 2, kv_cfg);
     defer twin.deinit();
+    twin.bound(test_request_end);
     twin.setSwaRing(window);
     var marks: [at.len]KVCacheSnapshot = undefined;
     var n: usize = 0;
@@ -2008,9 +2028,11 @@ fn ringMarksCapture(kv_cfg: KVQuantConfig) !void {
         try std.testing.expect(live.ringMarkComplete(m));
         var ref = try KVCache.initWithConfig(alloc, 2, kv_cfg);
         defer ref.deinit();
+        ref.bound(test_request_end);
         ref.setSwaRing(window);
         var scratch = try KVCache.initWithConfig(alloc, 2, kv_cfg);
         defer scratch.deinit();
+        scratch.bound(test_request_end);
         try ringCheckpointFeed(&ref, &scratch, window, 0, m.step, 300);
         var want = (try ref.ringCheckpoint(m.step, s)) orelse return error.TestExpectedRingCheckpoint;
         defer want.deinit();
@@ -2050,8 +2072,10 @@ fn verifyRollbackKvCase(config: KVQuantConfig, prefix_len: usize, force_growth: 
     const stream = mlx.gpuStream();
     var cache = try KVCache.initWithConfig(allocator, 1, config);
     defer cache.deinit();
+    cache.bound(test_request_end);
     var reference = try KVCache.initWithConfig(allocator, 1, config);
     defer reference.deinit();
+    reference.bound(test_request_end);
     var prng = std.Random.DefaultPrng.init(1911 + prefix_len + @intFromBool(force_growth));
     if (prefix_len != 0) {
         const prefix = try attn256RandBf16(prng.random(), &.{ 1, 1, @intCast(prefix_len), 64 }, stream);
@@ -2154,6 +2178,7 @@ test "KVCache trims the tail view for a BLOCK-wide update, not just decode" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     // 10 prefill positions, untrimmed (a wide chunk keeps the full view).
     {
@@ -2200,6 +2225,7 @@ test "KVCache carries a V head dim narrower than K (MLA 192/128)" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     // Prefill 3 tokens, then two decode steps that grow both buffers.
     {
@@ -2247,6 +2273,7 @@ test "KVCache affine quant carries an asymmetric K/V too (--kv-quant on MLA)" {
     const s = mlx.gpuStream();
     var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     const mk = struct {
         fn f(str: mlx.mlx_stream, len: c_int, d: c_int) !mlx.mlx_array {
@@ -2322,6 +2349,7 @@ test "a REFUSED KVCache re-init leaves the live cache intact, not freed" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
     var cache = try KVCache.initWithConfig(failing.allocator(), 2, kv_quant.KVQuantConfig.affine(8));
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     // Real handles in the cache, so a double free has something to land on.
     {
@@ -2368,6 +2396,7 @@ test "KVCache sliding window views return last max_seq entries" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     // Simulate 3 prefill tokens (max_seq=4 sliding window)
     {
@@ -2435,6 +2464,7 @@ test "KVCache updateAffine returns quant triples so fused attention can engage" 
     const s = mlx.gpuStream();
     var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     const shape = [_]c_int{ 1, 2, 4, 64 };
     var k = mlx.mlx_array_new();
@@ -2461,8 +2491,10 @@ test "KVCache updatePacked on the engine builds no dense pair until asked, then 
     const s = mlx.engine.stream();
     var eager = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
     defer eager.deinit();
+    eager.bound(test_request_end);
     var deferred = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
     defer deferred.deinit();
+    deferred.bound(test_request_end);
     const k = try qkvIdentityArray(s, 2, 300, 256, 0.5, .bfloat16);
     defer _ = mlx.mlx_array_free(k);
     const v = try qkvIdentityArray(s, 2, 300, 256, 0.25, .bfloat16);
@@ -2491,6 +2523,7 @@ test "KVCache step resets on truncate" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     // Add 5 tokens
     {
@@ -2512,6 +2545,7 @@ test "KVCache step without trimming matches offset" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     // Add tokens without max_seq (no trimming)
     for (0..10) |_| {
@@ -2562,6 +2596,7 @@ test "KVCache step with multi-layer only increments once per update" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     // Update all 3 layers with 2 tokens each
     for (0..3) |layer| {
@@ -2581,6 +2616,7 @@ test "KVCache snapshot/restore round-trip preserves entries and step" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     // Build state: 4 tokens across 2 layers.
     for (0..2) |layer| {
@@ -2624,6 +2660,7 @@ test "KVCache snapshot then more updates does not corrupt the snapshot" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     {
         const k = testKV(2, s);
@@ -2696,11 +2733,12 @@ test "KVCache: a shared restore's first append allocates what the request reserv
         defer warm.deinit();
         try testing.expectEqual(@as(usize, 16384), KVCache.bufferCapacity(donor.entries[0].keys));
         warm.reserve(2048);
+        warm.bound(2048);
         const tail = try sliceAttentionSeq(s, k, 0, 8);
         defer _ = mlx.mlx_array_free(tail);
         var wv = try warm.update(0, tail, tail, s, 0);
         defer wv.deinit();
-        const want = KVCache.heldRows(0, 1024 + 8, warm.hold(), &.{});
+        const want = KVCache.heldRows(0, 1024 + 8, warm.hold().?, &.{});
         try testing.expect(want < 16384);
         try testing.expectEqual(want, KVCache.bufferCapacity(warm.entries[0].keys));
         try testing.expectEqual(want, KVCache.bufferCapacity(warm.entries[0].values));
@@ -2729,9 +2767,11 @@ test "KVCache: a donated restore appends in place, at the entry's own capacity" 
         defer warm.deinit();
         donor.deinit();
         donor = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+        donor.bound(test_request_end);
         snap.releaseHandles();
         warm.adoptRestored();
         warm.reserve(2048);
+        warm.bound(2048);
         const tail = try sliceAttentionSeq(s, k, 0, 8);
         defer _ = mlx.mlx_array_free(tail);
         var wv = try warm.update(0, tail, tail, s, 0);
@@ -2758,11 +2798,13 @@ test "KVCache.growToReservation: the attention reads the same rows, and the deco
             defer eager.deinit();
             var lazy = try KVCache.initWithConfig(testing.allocator, 1, cfg);
             defer lazy.deinit();
+            lazy.bound(test_request_end);
             try lazy.restore(&snap);
             if (donate) {
                 // Each cache owns its buffers, as a donated checkout does.
                 donor.deinit();
                 donor = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+                donor.bound(test_request_end);
                 snap.releaseHandles();
                 eager.adoptRestored();
                 try cowAffineOrDense(&lazy, s);
@@ -2804,6 +2846,7 @@ test "KVCache snapshot/restore in a tight loop does not leak" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     {
         const k = testKV(3, s);
@@ -2853,7 +2896,9 @@ test "batched KV append: caches of different widths append per slot, byte-equal 
         for (0..n) |i| {
             const cfg = kv_quant.KVQuantConfig.affine(mix[i]);
             solo[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            solo[i].bound(test_request_end);
             batched[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            batched[i].bound(test_request_end);
             try kvAppendPrefill(&solo[i], 3 + i, @intCast(0xB000 + i), s);
             try kvAppendPrefill(&batched[i], 3 + i, @intCast(0xB000 + i), s);
             solo_ptrs[i] = &solo[i];
@@ -2880,6 +2925,7 @@ test "batched KV append: two restored siblings append and truncate independently
     const cfg = kv_quant.KVQuantConfig.affine(8);
     var src = try KVCache.initWithConfig(alloc, 1, cfg);
     defer src.deinit();
+    src.bound(test_request_end);
     try kvAppendPrefill(&src, 6, 0x51A0, s);
     var snap = try src.snapshot();
     defer snap.deinit();
@@ -2898,8 +2944,10 @@ test "batched KV append: two restored siblings append and truncate independently
     try mlx.check(mlx.mlx_array_eval(snap_k));
     var a = try KVCache.initWithConfig(alloc, 1, cfg);
     defer a.deinit();
+    a.bound(test_request_end);
     var b = try KVCache.initWithConfig(alloc, 1, cfg);
     defer b.deinit();
+    b.bound(test_request_end);
     try a.restore(&snap);
     try b.restore(&snap);
     const stacked_k = try kvAppendPacked(2, 1, 0xABBA, s);
@@ -2946,6 +2994,8 @@ test "batched KV append: dense and affine-4 stay on the per-slot path" {
         var batched: [2]KVCache = .{ try KVCache.initWithConfig(alloc, 1, cfg), try KVCache.initWithConfig(alloc, 1, cfg) };
         defer for (&solo) |*c| c.deinit();
         defer for (&batched) |*c| c.deinit();
+        for (&solo) |*c| c.bound(test_request_end);
+        for (&batched) |*c| c.bound(test_request_end);
         try kvAppendPrefill(&solo[0], 3, 0x10, s);
         try kvAppendPrefill(&solo[1], 5, 0x11, s);
         try kvAppendPrefill(&batched[0], 3, 0x10, s);
@@ -3042,6 +3092,7 @@ test "KVCache resident bytes are the buffers it owns, never a restored donor's" 
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
+    cache.bound(test_request_end);
     try testing.expectEqual(@as(u64, 0), cache.residentBytes());
     const k = testKVWide(3, 64, s);
     defer _ = mlx.mlx_array_free(k);
@@ -3085,9 +3136,11 @@ test "a trim below the ring takes the ringed rows from a checkpoint at the trim 
 
     var live = try KVCache.init(alloc, 2);
     defer live.deinit();
+    live.bound(test_request_end);
     live.setSwaRing(window);
     var plain = try KVCache.init(alloc, 2);
     defer plain.deinit();
+    plain.bound(test_request_end);
     try ringCheckpointFeed(&live, &plain, window, 0, prompt, 250);
     var cp = (try live.ringCheckpoint(prompt, s)) orelse return error.TestExpectedRingCheckpoint;
     defer cp.deinit();
@@ -3104,6 +3157,7 @@ test "a trim below the ring takes the ringed rows from a checkpoint at the trim 
 
     var restored = try KVCache.init(alloc, 2);
     defer restored.deinit();
+    restored.bound(test_request_end);
     restored.setSwaRing(window);
     try restored.restore(&kept);
     try restored.truncate(prompt - 1, s);
@@ -3128,9 +3182,11 @@ test "a ring restored from a checkpoint below its position still checkpoints a s
 
     var live = try KVCache.init(alloc, 2);
     defer live.deinit();
+    live.bound(test_request_end);
     live.setSwaRing(window);
     var plain = try KVCache.init(alloc, 2);
     defer plain.deinit();
+    plain.bound(test_request_end);
     try ringCheckpointFeed(&live, &plain, window, 0, prompt, 250);
     var cp = (try live.ringCheckpoint(prompt, s)) orelse return error.TestExpectedRingCheckpoint;
     defer cp.deinit();
@@ -3141,6 +3197,7 @@ test "a ring restored from a checkpoint below its position still checkpoints a s
     // ring then holds fewer than window + backoff rows below the new prompt end.
     var restored = try KVCache.init(alloc, 2);
     defer restored.deinit();
+    restored.bound(test_request_end);
     restored.setSwaRing(window);
     try restored.restore(&entry);
     try restored.restoreRing(&cp);
@@ -3157,6 +3214,7 @@ test "a ring restored from a checkpoint below its position still checkpoints a s
     // Fewer rows than the window below the position is still no checkpoint.
     var short = try KVCache.init(alloc, 2);
     defer short.deinit();
+    short.bound(test_request_end);
     short.setSwaRing(window);
     try short.restore(&entry);
     try short.restoreRing(&cp);
@@ -3223,6 +3281,7 @@ test "KV growth does not ratchet the MLX buffer pool" {
 
     var cache = try KVCache.init(testing.allocator, LAYERS);
     defer cache.deinit();
+    cache.bound(test_request_end);
 
     _ = mlx.mlx_clear_cache();
 
@@ -3323,6 +3382,7 @@ test "KVCache dense update: a faulted op leaves no freed view handle in the entr
         {
             var cache = try KVCache.init(testing.allocator, 1);
             defer cache.deinit();
+            cache.bound(test_request_end);
             var dv = try cache.update(0, first, first, s, 0);
             dv.deinit();
             const c0 = mlx.op_count.load(.monotonic);
@@ -3335,6 +3395,7 @@ test "KVCache dense update: a faulted op leaves no freed view handle in the entr
         while (k <= n_ops.*) : (k += 1) {
             var cache = try KVCache.init(testing.allocator, 1);
             defer cache.deinit();
+            cache.bound(test_request_end);
             var dv = try cache.update(0, first, first, s, 0);
             dv.deinit();
             mlx.fault.arm(k);
@@ -3364,6 +3425,7 @@ test "a reservation holds the request's whole generation: neither its prefill no
     const s_gpu = mlx.gpuStream();
     var cache = try KVCache.init(t.allocator, 1);
     defer cache.deinit();
+    cache.bound(test_request_end);
     cache.reserve(reserved);
     var written: usize = 0;
     var allocs: usize = 0;
@@ -3418,14 +3480,16 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     try t.expectEqual(seq + 2048 + chunk, reserved);
     var rcache = try KVCache.init(t.allocator, 1);
     defer rcache.deinit();
+    rcache.bound(test_request_end);
     rcache.reserve(reserved);
+    rcache.bound(reserved);
     var rcap: usize = 0;
     var rpos: usize = 0;
     var rgrows: usize = 0;
     while (rpos < seq) {
         const end = @min(rpos + chunk, seq);
         if (end > rcap) {
-            rcap = KVCache.heldRows(rcap, end, rcache.hold(), &.{});
+            rcap = KVCache.heldRows(rcap, end, rcache.hold().?, &.{});
             rgrows += 1;
         }
         rpos = end;
@@ -3439,6 +3503,7 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     const live_reserve: usize = @intCast(KVCache.reservedTokens(walk, 512, step, 0));
     var live = try KVCache.init(t.allocator, 1);
     defer live.deinit();
+    live.bound(test_request_end);
     live.reserve(live_reserve);
     var written: usize = 0;
     var caps: usize = 0;
@@ -3470,10 +3535,12 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     try t.expectEqual(@as(u64, 0), KVCache.reservedTokens(4096, 2048, chunk, 0));
     var small = try KVCache.init(t.allocator, 1);
     defer small.deinit();
+    small.bound(test_request_end);
     small.reserve(@intCast(KVCache.reservedTokens(4096, 2048, chunk, 0)));
+    small.bound(@intCast(KVCache.requestEnd(4096, 2048, 4096 + 2048, 0)));
     try t.expectEqual(
         KVCache.nextCapacityPolicy(1024, 2048),
-        KVCache.heldRows(1024, 2048, small.hold(), &.{}),
+        KVCache.heldRows(1024, 2048, small.hold().?, &.{}),
     );
 }
 
@@ -3529,6 +3596,7 @@ test "upstream bugfix: KVCache affine quant keeps its dtype through growth" {
     for ([_]mlx.mlx_dtype{ .float16, .bfloat16 }) |dt| {
         var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
         defer cache.deinit();
+        cache.bound(test_request_end);
         for (0..2) |pass| {
             const count: c_int = if (pass == 0) 4 else @intCast(KVCache.bufferCapacity(cache.entries[0].keys) + 1);
             const old_cap = if (pass == 0) 0 else KVCache.bufferCapacity(cache.entries[0].keys);
@@ -3557,6 +3625,7 @@ test "KVCache on MLX appends kv8 rows in place when MLX's pool holds buffers two
     const s = mlx.gpuStream();
     var cache = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
     defer cache.deinit();
+    cache.bound(test_request_end);
     // Two heads of 256: 16 B of scales a row, so 1,280 rows are 1.25 pages, which a free 3-page buffer could hold.
     var prompt = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(prompt);
@@ -3598,11 +3667,13 @@ fn requestHeldRows(cfg: *const @import("model.zig").ModelConfig, restored: c_int
     const s = mlx.gpuStream();
     var donor = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
     defer donor.deinit();
+    donor.bound(test_request_end);
     var rows = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(rows);
     try mlx.check(mlx.mlx_ones(&rows, &[_]c_int{ 1, 2, if (restored > 0) restored else 1, 256 }, 4, .bfloat16, s));
     var warm = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
     defer warm.deinit();
+    warm.bound(test_request_end);
     if (restored > 0) {
         var dv = try donor.update(0, rows, rows, s, 0);
         dv.deinit();
@@ -3676,6 +3747,7 @@ fn clampedRestoreMoves(donated: bool) !usize {
     const s = mlx.gpuStream();
     var donor = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
     defer donor.deinit();
+    donor.bound(test_request_end);
     var rows = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(rows);
     try mlx.check(mlx.mlx_ones(&rows, &[_]c_int{ 1, 2, 1100, 256 }, 4, .bfloat16, s));
@@ -3694,6 +3766,7 @@ fn clampedRestoreMoves(donated: bool) !usize {
     defer trimmed.deinit();
     var warm = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
     defer warm.deinit();
+    warm.bound(test_request_end);
     try warm.restore(&trimmed);
     if (donated) {
         warm.adoptRestored();
@@ -3726,3 +3799,79 @@ test "a trimmed restore clamped below its rows appends in place when MLX's pool 
     const shared = try clampedRestoreMoves(false);
     try testing.expectEqual(@as(usize, 0), donated + shared);
 }
+
+/// Rows a warm cache holds once a request restored at `restored` of a `seq`-token prompt writes its tail and decodes
+/// `reply` tokens, bound as `generate` binds every request, its tail one token or more.
+fn warmTailHeldRows(cfg: *const @import("model.zig").ModelConfig, restored: c_int, seq: c_int, reply: c_int, chunk: u64) !usize {
+    const s = mlx.gpuStream();
+    var donor = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
+    defer donor.deinit();
+    donor.bound(@intCast(restored));
+    var rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_ones(&rows, &[_]c_int{ 1, 2, restored, 256 }, 4, .bfloat16, s));
+    var warm = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
+    defer warm.deinit();
+    var dv = try donor.update(0, rows, rows, s, 0);
+    dv.deinit();
+    var snap = try donor.snapshot();
+    defer snap.deinit();
+    var trimmed = try snap.trimmedCopy(@intCast(restored), null, s);
+    defer trimmed.deinit();
+    try warm.restore(&trimmed);
+    warm.adoptRestored();
+    _ = try @import("generate.zig").reserveRequestCapacity(&warm, cfg, @intCast(seq), @intCast(reply), chunk, 0, s);
+    var tail = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tail);
+    try mlx.check(mlx.mlx_ones(&tail, &[_]c_int{ 1, 2, seq - restored, 256 }, 4, .bfloat16, s));
+    var tv = try warm.update(0, tail, tail, s, 0);
+    tv.deinit();
+    var one = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(one);
+    try mlx.check(mlx.mlx_ones(&one, &[_]c_int{ 1, 2, 1, 256 }, 4, .bfloat16, s));
+    var i: c_int = 0;
+    while (i < reply) : (i += 1) {
+        try warm.growAhead(1, s);
+        var ov = try warm.update(0, one, one, s, 0);
+        ov.deinit();
+    }
+    return KVCache.bufferCapacity(warm.entries[0].keys);
+}
+
+test "a warm Flash-Next request restored at all but its last token holds no more rows than its request's bill" {
+    try mlx.requireGpu();
+    const bills = @import("bills.zig");
+    var cfg = @import("bills_fixtures_test.zig").qwen4ExpOomConfig();
+    // {restored, prompt, reply}: a regenerate's trimmed RAM restore (off the grid, exact rows), an SSD-sized one, and a
+    // 50-token tail beside them.
+    const cases = [_][3]c_int{ .{ 1900, 1901, 100 }, .{ 8000, 8001, 300 }, .{ 1900, 1950, 100 } };
+    for (cases) |c| {
+        const ctx = bills.getEffectiveContextLength(&cfg);
+        const chunk: u64 = 2048;
+        const held = try warmTailHeldRows(&cfg, c[0], c[1], c[2], chunk);
+        const billed = bills.cacheCapacityTokens(&cfg, @intCast(c[1]), @intCast(c[2]), chunk, ctx, 0, 8);
+        if (held > billed) std.debug.print("restored {d} seq {d} reply {d}: held {d} rows, bill {d}\n", .{ c[0], c[1], c[2], held, billed });
+        try testing.expect(held <= billed);
+    }
+}
+
+test "a KV cache no request has bound cannot grow" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |q| {
+        var cache = try KVCache.initWithConfig(testing.allocator, 1, q);
+        defer cache.deinit();
+        var rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_ones(&rows, &[_]c_int{ 1, 2, 8, 256 }, 4, .bfloat16, s));
+        try testing.expect(cache.hold() == null);
+        try testing.expectError(error.KvCacheUnbound, cache.update(0, rows, rows, s, 0));
+        cache.bound(8);
+        var v = try cache.update(0, rows, rows, s, 0);
+        v.deinit();
+    }
+}
+
+/// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
+/// sizes its grows (`KVCache.heldRows`).
+const test_request_end: usize = 1 << 20;

@@ -669,6 +669,9 @@ test "MTP head: N=4 mlx_equal drafts/logits vs solo, with and without a stash" {
     {
         var warm = try qwen4_forward.qwen4MtpStateNew(&xfm);
         defer warm.deinit();
+        // One head step: one row.
+        warm.cache.bound(1);
+        warm.entry.qsa_end_rows = 1;
         const idw = H.tok(host_ids[1]);
         defer _ = mlx.mlx_array_free(idw);
         const o = try qwen4_forward.qwen4MtpForwardOn(&xfm, &warm, ha, idw, 1, null, .last_row);
@@ -692,6 +695,11 @@ test "MTP head: N=4 mlx_equal drafts/logits vs solo, with and without a stash" {
                     bat[k] = try qwen4_forward.qwen4MtpStateNew(&xfm);
                     solo[k].pos_base = @intCast(1 + (k % 2) * 7);
                     bat[k].pos_base = solo[k].pos_base;
+                    // Each head writes a row per depth step.
+                    for ([_]*qwen4_forward.Qwen4MtpState{ &solo[k], &bat[k] }) |st| {
+                        st.cache.bound(depth);
+                        st.entry.qsa_end_rows = depth;
+                    }
                 }
                 defer for (0..n_use) |k| {
                     solo[k].deinit();
@@ -1485,8 +1493,9 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
         entries: []SSMCacheEntry,
         pub fn init(a: std.mem.Allocator, n_layers: u32) !@This() {
             const entries = try a.alloc(SSMCacheEntry, n_layers);
-            for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-            const cache = try KVCache.init(a, n_layers);
+            for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false, .qsa_end_rows = test_request_end };
+            var cache = try KVCache.init(a, n_layers);
+            cache.bound(test_request_end);
             return .{ .cache = cache, .entries = entries };
         }
         pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
@@ -2427,6 +2436,7 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
+    xfm.bindOwnRows(test_request_end);
     if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     qwen4_forward.compileQwen4Hc(&xfm);
     xfm.compileMoeRouting();
@@ -2511,6 +2521,7 @@ test "qwen4 MTP head: quantized KV rollback + re-append matches dense draft ids 
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
+    xfm.bindOwnRows(test_request_end);
     if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     qwen4_forward.compileQwen4Hc(&xfm);
     xfm.compileMoeRouting();
@@ -2579,6 +2590,7 @@ test "qwen4 MTP head: quantized KV rollback + re-append matches dense draft ids 
     const dense_l = try Run.lastLogits(&xfm, s, allocator, stream_prev, ids, keep);
     defer allocator.free(dense_l);
     try qwen4_forward.qwen4MtpApplyKvQuant(&xfm, kv_quant.KVQuantConfig.affine(8));
+    xfm.bindOwnRows(test_request_end);
     try testing.expectEqual(kv_quant.Scheme.affine, xfm.arch_state.qwen4.mtp.?.cache.config.scheme);
     try testing.expectEqual(@as(u8, 8), xfm.arch_state.qwen4.mtp.?.cache.config.bits);
     const quant_l = try Run.lastLogits(&xfm, s, allocator, stream_prev, ids, keep);
@@ -2626,6 +2638,7 @@ test "qwen4MtpForward: every error path of the MTP head forward releases its str
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
+    xfm.bindOwnRows(test_request_end);
     if (xfm.arch_state.qwen4.mtp == null) return error.SkipZigTest;
     qwen4_forward.compileQwen4Hc(&xfm);
     xfm.compileMoeRouting();
@@ -3281,3 +3294,7 @@ test "qwen4 checkpoint affine8 and dense projections are row-identical (QWEN4_TE
     }
     try testing.expect(checked > 0);
 }
+
+/// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
+/// sizes its grows (`KVCache.heldRows`).
+const test_request_end: usize = 1 << 20;

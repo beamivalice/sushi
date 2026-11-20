@@ -254,6 +254,7 @@ test "kld: a resident mimo_v2 load takes the source trunk and its logits follow 
         try testing.expectEqual(mlx.mlx_dtype.uint8, mlx.mlx_array_dtype(qkv));
         try testing.expect(loaded.weights.get("model.layers.0.self_attn.q_proj.weight") == null);
 
+        loaded.xfm.bindOwnRows(ids.len);
         var ctx = loaded.xfm.defaultCtx();
         const logits = try kld.forwardPrompt(allocator, loaded, &ctx, &ids);
         defer _ = mlx.mlx_array_free(logits);
@@ -291,10 +292,12 @@ test "kld: a prompt longer than the chunk is forwarded chunk by chunk, a shorter
     for (ids, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % TinyMimo.vocab);
     for ([_]usize{ chunk, 2 * chunk }) |len| {
         try loaded.xfm.resetCache();
+        loaded.xfm.bindOwnRows(len);
         var ctx = loaded.xfm.defaultCtx();
         const got = try kld.forwardPrompt(allocator, loaded, &ctx, ids[0..len]);
         defer _ = mlx.mlx_array_free(got);
         try loaded.xfm.resetCache();
+        loaded.xfm.bindOwnRows(len);
         var ref_ctx = loaded.xfm.defaultCtx();
         const expected = try kld.forwardPromptChunks(allocator, loaded, &ref_ctx, ids[0..len], chunk);
         defer _ = mlx.mlx_array_free(expected);
@@ -337,6 +340,7 @@ test "kld: an imatrix capture records every mimo_v2 o_proj input and the lm_head
     const ids = [_]u32{ 1, 3, 5, 2, 7, 0 };
     var hidden = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(hidden);
+    loaded.xfm.bindOwnRows(ids.len);
     var ctx = loaded.xfm.defaultCtx();
     ctx.capture_hidden_all = &hidden;
     const logits = try kld.forwardPrompt(allocator, loaded, &ctx, &ids);
@@ -467,6 +471,7 @@ test "kld: a hidden capture appends every block boundary of each prompt and leav
         var final = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(final);
         var cl: trunk_mod.CaptureLayers = .{ .ids = &layer_ids, .out = &outs, .input = &input };
+        loaded.xfm.bindOwnRows(w.len);
         var ctx = loaded.xfm.defaultCtx();
         ctx.capture_layers = &cl;
         ctx.capture_hidden_all = &final;
@@ -532,6 +537,7 @@ test "kld: a pack storing o_proj, lm_head and embed_tokens affine serves them pa
             try testing.expectEqual(if (packed_here) mlx.mlx_dtype.uint32 else mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(w));
         }
 
+        loaded.xfm.bindOwnRows(ids.len);
         var ctx = loaded.xfm.defaultCtx();
         const logits = try kld.forwardPrompt(allocator, loaded, &ctx, &ids);
         defer _ = mlx.mlx_array_free(logits);
@@ -552,4 +558,25 @@ test "kld: a pack storing o_proj, lm_head and embed_tokens affine serves them pa
         }
         try testing.expect(dot / @sqrt(na * nb) > 0.98);
     }
+}
+
+test "kld: a tiny MiMo pack's load warm and verify warm run, each pass bound at the rows it writes" {
+    try mlx.requireGpu();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    try tmp.dir.createDirPath(io, "pack");
+    var dir = try tmp.dir.openDir(io, "pack", .{});
+    defer dir.close(io);
+    try writeTinyMimoResidentPack(io, arena_state.allocator(), dir, 1);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try dir.realPath(io, &path_buf);
+    const loaded = try kld.loadModel(io, allocator, .{ .model_dir = path_buf[0..path_len] });
+    defer loaded.deinit();
+    try loaded.xfm.warmupTrunk();
+    // A dense cache: the tiny's 16-wide heads take no 64-wide quantization group.
+    _ = try @import("mimo_forward.zig").warmupMimoVerify(&loaded.xfm, .dense);
 }

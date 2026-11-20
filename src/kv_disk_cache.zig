@@ -5059,6 +5059,8 @@ pub fn fillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32,
     // arange-derived K/V so restored values are checkable. Dense tests use
     // float32 (every position stays exactly distinguishable); the affine test
     // uses bf16, the production dtype the quant write path expects.
+    // A fill is a request whose last row is its own: it binds the cache there, past any earlier request's end.
+    cache.bound(@max(cache.end_tokens, cache.step + tokens));
     var written: u32 = 0;
     while (written < tokens) {
         const step: u32 = @min(64, tokens - written);

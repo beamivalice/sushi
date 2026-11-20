@@ -1225,6 +1225,7 @@ test "cooler contract: a wide forward that reads out every row's logits, as `sus
                 defer turn.end();
                 defer arch_sched.endRequest(&ld.config);
                 try ld.xfm.resetCache();
+                ld.xfm.bindOwnRows(width);
                 const arr = mlx.mlx_array_new_data(@ptrCast(wide.ptr), &[_]c_int{ 1, @intCast(width) }, 2, .int32);
                 defer _ = mlx.mlx_array_free(arr);
                 var ctx = ld.xfm.defaultCtx();
@@ -6465,4 +6466,52 @@ test "cooler contract: a DeepSeek request admitted while an earlier borrower's p
     // the pools again"): the request's prefill runs over the released pools as their lessee (`leaseHolderHeadroomNow`
     // counts them free), so its verdict may not move by the pools a second time through the lendable term.
     try testing.expect(margin_rest - margin_lent < @as(i64, @intCast(lent / 2)));
+}
+
+/// A request whose prompt reaches `generate` as one token: a full hot-cache match leaves `full_prompt[hot_matched..]`
+/// one token long, and its cache must be bound at the request's end like any other.
+fn oneTokenRequestHeld(comptime Q: type, cooler: bool) !void {
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = cooler;
+    defer test_support.restoreEngine(was_enabled);
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try Q.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(Q, dir, cooler);
+    defer _ = ld.close();
+    const bills = @import("bills.zig");
+    const c = &ld.config;
+    const kv = bills.configuredKvQuantFor(c);
+    const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+    const chunk: u64 = c.prefillStartWidth();
+    const n: u32 = 1799;
+    const one = [_]u32{ids[0]};
+    const turn = arch_handle.turnFor(ld.h, c);
+    defer turn.end();
+    defer arch_sched.endRequest(c);
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    try ld.xfm.resetCache();
+    var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, &one, n, .{ .temperature = 0.0 }, &.{}, .{});
+    defer gen.deinit(a);
+    var steps: usize = 0;
+    while (try gen.next(a)) |_| steps += 1;
+    var held: usize = 0;
+    for (ld.xfm.cache.entries) |entry| if (entry.initialized) {
+        held = @max(held, @import("kv_cache.zig").KVCache.bufferCapacity(entry.keys));
+    };
+    const st = bills.cacheStorage(c, 1, n, kv_bits, chunk, .{});
+    if (held > st.rows) std.debug.print("cooler contract: cooler {}: a 1-token prompt, {d} decoded, end_tokens {d}: the cache holds {d} rows, the bill prices {d}\n", .{ cooler, steps, ld.xfm.cache.end_tokens, held, st.rows });
+    try testing.expect(ld.xfm.cache.end_tokens >= 1 + n);
+    try testing.expect(held <= st.rows);
+}
+
+test "cooler contract: a Qwen request reaching generate as one token holds no more cache rows than its bill, on Cooler and on MLX" {
+    const Q = ContractOf("qwen4");
+    if (comptime !@hasDecl(Q, "prompt")) return error.SkipZigTest;
+    try oneTokenRequestHeld(Q, true);
+    try oneTokenRequestHeld(Q, false);
 }

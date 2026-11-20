@@ -521,7 +521,7 @@ pub fn warmupMimoVerify(self: *Trunk, kv_config: KVQuantConfig) !MimoWarmRows {
     forward_diag.moe_dump_warmup_depth += 1;
     defer forward_diag.moe_dump_warmup_depth -= 1;
     if (!arch_config.isOf(self.config, "mimo2")) return 0;
-    const sl = try Trunk.SpecWarmSlot.init(self, kv_config);
+    const sl = try Trunk.SpecWarmSlot.init(self, kv_config, 8 + MIMO_VERIFY_ROWS_MAX);
     defer {
         sl.deinit(self.allocator);
         _ = mlx.mlx_clear_cache();
@@ -2193,6 +2193,7 @@ fn qkvPackedParityCase(comptime cand_fn: anytype, rnd: std.Random, h_q: c_int, h
     const s = mlx.gpuStream();
     var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(bits));
     defer cache.deinit();
+    cache.bound(test_request_end);
     {
         const k = try testRandWeightBf16(rnd, &[_]c_int{ 1, h_kv, t_prefill, dk }, s);
         defer _ = mlx.mlx_array_free(k);
@@ -2248,6 +2249,7 @@ fn mimoVerifyRowsIdentityCaseHeads(config: KVQuantConfig, is_global: bool, prefi
     var caches: [2]KVCache = undefined;
     for (&caches) |*c| {
         c.* = try KVCache.initWithConfig(a, 1, config);
+        c.*.bound(test_request_end);
         if (!is_global) c.setSwaRing(@intCast(window));
     }
     defer for (&caches) |*c| c.deinit();
@@ -2326,6 +2328,7 @@ fn mimoSlidingRowsCase(config: KVQuantConfig, prefix: c_int, width: c_int, gain:
     const scale: f32 = 1.0 / @sqrt(192.0);
     var cache = try KVCache.initWithConfig(testing.allocator, 1, config);
     defer cache.deinit();
+    cache.bound(test_request_end);
     cache.setSwaRing(@intCast(window));
     const g = try bf16Scalar(gain, s);
     defer _ = mlx.mlx_array_free(g);
@@ -3070,6 +3073,7 @@ test "mimoGlobalDecodeArm: a packed cache grown one token at a time switches to 
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
     try cache.reinit(1, KVQuantConfig.affine(8));
+    cache.bound(test_request_end);
     const floor: usize = @intCast(QKV_MPP_DECODE_MIN_TK);
     {
         const k = testKVWide(floor - 2, 192, s);
@@ -3796,3 +3800,7 @@ test "sigmoidBiasRoutingChain route_norm=false keeps raw sigmoid weights (scaled
     // (0.880797 + 0.731059) × 2.0 = 3.2237 — un-normalized, scaled.
     try testing.expect(@abs(ss[0] - 3.2237) < 0.02);
 }
+
+/// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
+/// sizes its grows (`KVCache.heldRows`).
+const test_request_end: usize = 1 << 20;

@@ -93,7 +93,17 @@ pub const Qwen4TestSlot = struct {
         sl.cache.deinit();
         alloc.destroy(sl);
     }
+    /// A pass of `rows` rows is a request whose last row is its own: it binds the slot there, past any earlier
+    /// request's end.
+    pub fn bindPass(sl: *Qwen4TestSlot, rows: usize) void {
+        const end = @max(sl.cache.end_tokens, sl.cache.step + rows);
+        sl.cache.bound(end);
+        sl.head.cache.bound(end);
+        qwen4_qsa_state.reserveQsaHistoryWithHead(sl.entries, &sl.head.entry, .{ .end = end });
+    }
+
     pub fn forward(sl: *Qwen4TestSlot, xfm: *Trunk, ids: []const i32) !mlx.mlx_array {
+        sl.bindPass(ids.len);
         const shape = [_]c_int{ 1, @intCast(ids.len) };
         const arr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &shape, 2, .int32);
         defer _ = mlx.mlx_array_free(arr);

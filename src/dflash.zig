@@ -1021,6 +1021,14 @@ fn loadDynConv(
 
 // ── Per-request context cache ──
 
+/// The rows a test's non-sliding assistant context is bound at: it holds the test's whole sequence, under these.
+pub const test_context_rows: usize = 4096;
+
+/// The rows a sliding assistant's context holds at most: its window, and a draft block passing through it.
+pub fn contextRows(cfg: *const DflashConfig) u64 {
+    return @as(u64, cfg.sliding_window) + cfg.block_size;
+}
+
 /// The assistant's context K/V, one entry per ASSISTANT layer, dense.
 /// Grows with committed trunk tokens; block K/V transit through spare
 /// capacity and are truncated straight back out (never cached). Invariant
@@ -1033,11 +1041,12 @@ pub const DflashCtx = struct {
     /// same rule as the MTP history).
     base_pos: usize,
 
+    /// A sliding assistant's context is bound at the rows it holds at most (`contextRows`), which the load bills; any
+    /// other context's creator binds it at its request's end before it writes (`KVCache.bound`).
     pub fn init(allocator: std.mem.Allocator, model: *const DflashModel, base_pos: usize) !DflashCtx {
-        return .{
-            .cache = try KVCache.init(allocator, model.config.num_hidden_layers),
-            .base_pos = base_pos,
-        };
+        var cache = try KVCache.init(allocator, model.config.num_hidden_layers);
+        if (model.sliding_serving) cache.bound(@intCast(contextRows(&model.config)));
+        return .{ .cache = cache, .base_pos = base_pos };
     }
 
     pub fn deinit(self: *DflashCtx) void {
@@ -2728,6 +2737,7 @@ test "dflash: appendContext grows the cache; forwardBlock evicts its block K/V" 
 
     var ctx = try DflashCtx.init(allocator, &m, 0);
     defer ctx.deinit();
+    ctx.cache.bound(test_context_rows);
 
     // Append 6 context tokens (2 capture streams, one per target layer id).
     {
@@ -2770,6 +2780,7 @@ test "dflash: appendContext grows the cache; forwardBlock evicts its block K/V" 
 fn tinyBlockHidden(m: *DflashModel, allocator: std.mem.Allocator, s: mlx.mlx_stream) ![]f32 {
     var ctx = try DflashCtx.init(allocator, m, 0);
     defer ctx.deinit();
+    ctx.cache.bound(test_context_rows);
     const c0 = try TinyFix.capArr(10, 600, s);
     defer _ = mlx.mlx_array_free(c0);
     const c1 = try TinyFix.capArr(10, 601, s);
@@ -3101,6 +3112,7 @@ test "dflash: sliding window hides out-of-window context from the block, in-wind
         fn f(mm: *DflashModel, alloc: std.mem.Allocator, st: mlx.mlx_stream, perturb_row: ?usize) ![]f32 {
             var ctx = try DflashCtx.init(alloc, mm, 0);
             defer ctx.deinit();
+            ctx.cache.bound(test_context_rows);
             const c0 = try TinyFix.capArr(12, 400, st);
             defer _ = mlx.mlx_array_free(c0);
             var c1 = try TinyFix.capArr(12, 401, st);
@@ -3279,6 +3291,7 @@ test "dflash fixture parity: encoder + two draft rounds vs transformers referenc
     // Round 1: context [0, n_ctx), block anchored at n_ctx.
     var dctx = try DflashCtx.init(allocator, &m, 0);
     defer dctx.deinit();
+    dctx.cache.bound(test_context_rows);
     try appendContext(&m, &dctx, caps1, 0);
     {
         const noise = try fixtureArr(noise1, bs, h, s);
@@ -3363,6 +3376,7 @@ test "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab
     // ── Conv block forward parity ──
     var dctx = try DflashCtx.init(allocator, &model, 0);
     defer dctx.deinit();
+    dctx.cache.bound(test_context_rows);
     const caps = try fixtureCaptures(allocator, ctx_stream, n_ctx, nt, h, s);
     defer {
         for (caps) |a| _ = mlx.mlx_array_free(a);
@@ -3466,6 +3480,7 @@ test "sliding-serving DFlash2 trims physical window and preserves absolute appen
     model.s = s;
     model.layers = @as(*[1]DflashLayer, @ptrCast(&layer));
     model.config = .{ .hidden_size = 8, .num_hidden_layers = 1, .num_attention_heads = 2, .num_key_value_heads = 2, .head_dim = 4, .intermediate_size = 16, .rms_norm_eps = 1e-5, .rope_theta = 10000, .sliding_window = 8, .layer_types = &types, .block_size = 4, .mask_token_id = 3, .target_layer_ids = &.{} };
+    model.sliding_serving = true;
     var ctx = try DflashCtx.init(a, &model, 0);
     defer ctx.deinit();
     var values: [80]f32 = undefined;
@@ -3488,6 +3503,53 @@ test "sliding-serving DFlash2 trims physical window and preserves absolute appen
     try std.testing.expectEqual(@as(usize, 11), ctx.absLen());
     try std.testing.expectEqual(@as(usize, 4), ctx.base_pos);
     try std.testing.expectEqual(@as(u64, 224), ctx.cache.residentBytes());
+}
+
+test "a sliding DFlash context holds no more rows than the load bills it, and an unbound one cannot grow" {
+    try mlx.requireGpu();
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var ops = @import("mlx_ops.zig").Ops{ .s = s };
+    defer ops.deinit();
+    var layer: DflashLayer = undefined;
+    layer.layer_type = .sliding_attention;
+    var types = [_]LayerType{.sliding_attention};
+    var model: DflashModel = undefined;
+    model.s = s;
+    model.layers = @as(*[1]DflashLayer, @ptrCast(&layer));
+    // The served geometry: a 2,048-row window and 8-row draft blocks.
+    model.config = .{ .hidden_size = 8, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .head_dim = 128, .intermediate_size = 16, .rms_norm_eps = 1e-5, .rope_theta = 10000, .sliding_window = 2048, .layer_types = &types, .block_size = 8, .mask_token_id = 3, .target_layer_ids = &.{} };
+    const billed = (contextRows(&model.config) + 255) / 256 * 256;
+    try std.testing.expectEqual(@as(u64, 2304), billed);
+    const rows = struct {
+        fn of(o: *@import("mlx_ops.zig").Ops, n: c_int) !mlx.mlx_array {
+            return o.own(blk: {
+                var out = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_ones(&out, &[_]c_int{ 1, 1, n, 128 }, 4, .bfloat16, o.s));
+                break :blk out;
+            });
+        }
+    }.of;
+    for ([_]bool{ true, false }) |sliding| {
+        model.sliding_serving = sliding;
+        var ctx = try DflashCtx.init(a, &model, 0);
+        defer ctx.deinit();
+        if (!sliding) {
+            try std.testing.expectError(error.KvCacheUnbound, ctx.cache.update(0, try rows(&ops, 8), try rows(&ops, 8), s, 0));
+            continue;
+        }
+        // A prompt past the window, trimmed to it; then rounds: a committed row in, a block passing through.
+        _ = try ctx.cache.update(0, try rows(&ops, 2048), try rows(&ops, 2048), s, 0);
+        try trimSlidingContext(&model, &ctx);
+        for (0..4) |_| {
+            _ = try ctx.cache.update(0, try rows(&ops, 1), try rows(&ops, 1), s, 0);
+            try trimSlidingContext(&model, &ctx);
+            const before = ctx.cache.step;
+            _ = try ctx.cache.update(0, try rows(&ops, 8), try rows(&ops, 8), s, 0);
+            try std.testing.expect(KVCache.bufferCapacity(ctx.cache.entries[0].keys) <= billed);
+            try ctx.cache.truncate(before, s);
+        }
+    }
 }
 
 test "DFlash block tail engages only for the native GLM drafter" {
@@ -3540,6 +3602,7 @@ test "dflash2: prefix outputs preserve full block attention and causal convoluti
         defer m.deinit();
         var ctx = try DflashCtx.init(allocator, &m, 0);
         defer ctx.deinit();
+        ctx.cache.bound(test_context_rows);
         const c0 = try TinyFix.capArr(10, 600, s);
         defer _ = mlx.mlx_array_free(c0);
         const c1 = try TinyFix.capArr(10, 601, s);

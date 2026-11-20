@@ -654,10 +654,14 @@ pub fn qwen4MtpRelease(self: *Trunk, st: *Qwen4MtpState) void {
 /// Reset the MTP head's per-request state (KV, indexer keys, position).
 pub fn qwen4MtpReset(self: *Trunk) !void {
     const m = &(self.arch_state.qwen4.mtp orelse return);
-    // A head reset inside a request keeps the request's reservation: the history it regrows is still billed.
-    const reserved = m.cache.reserve_tokens;
+    // A head reset inside a request keeps the request's hold: the history it regrows is still billed, and bound at
+    // the request's end.
+    const asked = m.cache.hold();
     try m.cache.reinit(self.config.num_hidden_layers + 1, m.cache.config);
-    m.cache.reserve(reserved);
+    if (asked) |h| {
+        m.cache.reserve(@intCast(h.reserve));
+        m.cache.bound(@intCast(h.end));
+    }
     ssmFreeQsaState(&m.entry);
     m.qsa_marks.deinit();
     m.seq_offset = 0;
@@ -3929,6 +3933,7 @@ const Qwen4LadderRig = struct {
     }
 
     fn prefill(self: *Qwen4LadderRig, sl: *Qwen4TestSlot, ids: []const i32) !void {
+        sl.bindPass(ids.len);
         const shape = [_]c_int{ 1, @intCast(ids.len) };
         const arr = try mlx.newData(@ptrCast(ids.ptr), &shape, .int32);
         defer _ = mlx.mlx_array_free(arr);
@@ -3942,6 +3947,7 @@ const Qwen4LadderRig = struct {
         const x = self.fx.xfm();
         x.arch_state.qwen4.decode_async_ladder = ladder;
         defer x.arch_state.qwen4.decode_async_ladder = qwen4DecodeLadderStride(null);
+        for (slots) |sl| sl.bindPass(1);
         const run = try qwen4BatchedPleForward(x, slots, ids, 1, false, true, fill);
         defer _ = mlx.mlx_array_free(run.logits);
         return .{ .logits = try qwen4ReadF32(testing.allocator, run.logits, x.s), .pending = run.pending };
@@ -5221,6 +5227,7 @@ test "causal verify attention rows are bit-identical to decode at Qwen3.8 geomet
                 const width: c_int = @intCast(wi);
                 var cache = try KVCache.initWithConfig(testing.allocator, 1, config);
                 defer cache.deinit();
+                cache.bound(test_request_end);
                 const k = try qkvIdentityArray(s, 2, prefix + width, 256, 0.17, .bfloat16);
                 defer _ = mlx.mlx_array_free(k);
                 const v = try qkvIdentityArray(s, 2, prefix + width, 256, 3.37, .bfloat16);
@@ -6239,3 +6246,7 @@ test "batched rows refuse a trunk that holds no Flash-Next state" {
     const ctxs = [_]*ForwardCtx{&ctx};
     try testing.expectError(error.BatchedRowsNeedQwen4State, forwardMoeBatchedRows(&xfm, .{ .ctx = null }, &ctxs, &.{0}, false, null, null));
 }
+
+/// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
+/// sizes its grows (`KVCache.heldRows`).
+const test_request_end: usize = 1 << 20;

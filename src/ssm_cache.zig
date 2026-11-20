@@ -1573,7 +1573,7 @@ test "a QSA pooled bank and score bank append in place at a reservation off MLX'
         var count: c_int = 0;
         var first: ?[*]const u8 = null;
         for (0..4) |step| {
-            try capBufAppend(s, &buf, &view, &count, chunks[@min(step, 1)], c.axis, .{ .reserve = reserve * 4 }, 4);
+            try capBufAppend(s, &buf, &view, &count, chunks[@min(step, 1)], c.axis, .{ .reserve = reserve * 4, .end = reserve * 4 }, 4);
             try mlx.check(mlx.mlx_array_eval(buf));
             try mlx.check(mlx.mlx_synchronize(s));
             if (step == 0) first = mlx.mlx_array_data_uint8(buf) else try testing.expectEqual(first, mlx.mlx_array_data_uint8(buf));
@@ -1602,7 +1602,7 @@ test "a QSA pooled bank re-seeded at a reservation off MLX's page grid appends i
     var count: c_int = 512;
     var first: ?[*]const u8 = null;
     for (0..4) |step| {
-        try capBufAppend(s, &buf, &view, &count, row, 1, .{ .reserve = 1274 * 4 }, 4);
+        try capBufAppend(s, &buf, &view, &count, row, 1, .{ .reserve = 1274 * 4, .end = 1274 * 4 }, 4);
         try mlx.check(mlx.mlx_array_eval(buf));
         try mlx.check(mlx.mlx_synchronize(s));
         if (step == 0) first = mlx.mlx_array_data_uint8(buf) else try testing.expectEqual(first, mlx.mlx_array_data_uint8(buf));
@@ -1656,7 +1656,8 @@ test "a seedCapBuf copy with no reservation, resliced below its rows, appends in
     var first: ?[*]const u8 = null;
     var moved: usize = 0;
     for (0..6) |step| {
-        try capBufAppend(s, &buf, &view, &count, row, 1, .{}, 1);
+        // The request ends at its sixth appended row.
+        try capBufAppend(s, &buf, &view, &count, row, 1, .{ .end = 1070 + 6 }, 1);
         try mlx.check(mlx.mlx_array_eval(buf));
         try mlx.check(mlx.mlx_synchronize(s));
         const p = mlx.mlx_array_data_uint8(buf);

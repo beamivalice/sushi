@@ -1603,6 +1603,8 @@ pub fn qsaAttnCacheFixture(
     cache: *KVCache,
 ) !DenseKVView {
     _ = alloc;
+    // The fixture is a request whose last row is the `kv`-th.
+    cache.bound(@intCast(kv));
     const st = [_]c_int{ 1, 1, 1, 1 };
     var k0 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(k0);
@@ -2149,6 +2151,7 @@ test "qsa verify gather: subset SDPA matches masked full SDPA at verify widths (
 
         var cache = try KVCache.initWithConfig(std.testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
         defer cache.deinit();
+        cache.bound(test_request_end);
         var view = try cache.update(0, k_dense, v_dense, s, 0);
         defer view.deinit();
         try std.testing.expect(view.has_quant_triple);
@@ -2255,6 +2258,7 @@ test "qsa sparse attn: dense and affine strided caches retain the reference erro
         // Packed arm: a real affine cache, filled in two appends so the view is strided.
         var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(c.bits));
         defer cache.deinit();
+        cache.bound(test_request_end);
         var view = try qsaAttnCacheFixture(ta, s, k_dense, v_dense, c.kv, @divTrunc(c.kv, 2), kv_quant.KVQuantConfig.affine(c.bits), &cache);
         defer view.deinit();
         try std.testing.expect(view.has_quant_triple);
@@ -2319,6 +2323,7 @@ test "qsa sparse attn: packed caches serve widths past 15 within the error bar o
         defer _ = mlx.mlx_array_free(mask);
         var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(c.bits));
         defer cache.deinit();
+        cache.bound(test_request_end);
         var view = try qsaAttnCacheFixture(ta, s, k_dense, v_dense, c.kv, @divTrunc(c.kv, 2), kv_quant.KVQuantConfig.affine(c.bits), &cache);
         defer view.deinit();
         const scale: f32 = 1.0 / 16.0;
@@ -2370,6 +2375,7 @@ test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 
 
     var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(8));
     defer cache.deinit();
+    cache.bound(test_request_end);
     var view = try qsaAttnCacheFixture(ta, s, k_dense, v_dense, kv, @divTrunc(kv, 2), kv_quant.KVQuantConfig.affine(8), &cache);
     defer view.deinit();
     const ref = try attn256Reference(q, view.k, view.v, scale, "array", mask, s);
@@ -2482,11 +2488,13 @@ test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q 
     const qcfg = kv_quant.KVQuantConfig.affine(8);
     var cache_r = try KVCache.initWithConfig(ta, 1, qcfg);
     defer cache_r.deinit();
+    cache_r.bound(test_request_end);
     var v_reuse = try qsaAttnCacheFixture(ta, s, k1, v1, kv, @divTrunc(kv, 2), qcfg, &cache_r); // gqa 12
     defer v_reuse.deinit();
     try std.testing.expect(v_reuse.has_quant_triple);
     var cache_n = try KVCache.initWithConfig(ta, 1, qcfg);
     defer cache_n.deinit();
+    cache_n.bound(test_request_end);
     var v_noreuse = try qsaAttnCacheFixture(ta, s, k12c, v12c, kv, @divTrunc(kv, 2), qcfg, &cache_n); // gqa 1
     defer v_noreuse.deinit();
     const a = (try qsaSparseAttn(s, q, &v_reuse, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
@@ -2525,6 +2533,7 @@ test "qsa sparse attn: loader simdgroups leave every output bit unchanged" {
         defer _ = mlx.mlx_array_free(blocks);
         var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(c.bits));
         defer cache.deinit();
+        cache.bound(test_request_end);
         var view = try qsaAttnCacheFixture(ta, s, k_dense, v_dense, c.kv, @divTrunc(c.kv, 2), kv_quant.KVQuantConfig.affine(c.bits), &cache);
         defer view.deinit();
 
@@ -2627,6 +2636,7 @@ test "qsa sparse attn: one fused dispatch replaces the arm's op chain (>= 100 op
 
     var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(8));
     defer cache.deinit();
+    cache.bound(test_request_end);
     var view = try qsaAttnCacheFixture(ta, s, kd, vd, kv, @divTrunc(kv, 2), kv_quant.KVQuantConfig.affine(8), &cache);
     defer view.deinit();
 
@@ -2669,6 +2679,7 @@ test "qsa sparse attn: the width gate, the kill switch and the quant preconditio
     const qcfg = kv_quant.KVQuantConfig.affine(8);
     var qcache = try KVCache.initWithConfig(ta, 1, qcfg);
     defer qcache.deinit();
+    qcache.bound(test_request_end);
     var dv = try qsaAttnCacheFixture(ta, s, kd, vd, kv, @divTrunc(kv, 2), qcfg, &qcache);
     defer dv.deinit();
     try std.testing.expect(dv.has_quant_triple);
@@ -2771,6 +2782,7 @@ test "qsa sparse attn: the config key is kv- and kb-INDEPENDENT (one build per w
             defer _ = mlx.mlx_array_free(bl);
             var cache = try KVCache.initWithConfig(alloc, 1, kv_quant.KVQuantConfig.affine(8));
             defer cache.deinit();
+            cache.bound(test_request_end);
             var view = try qsaAttnCacheFixture(alloc, st, kd, vd, kv, @divTrunc(kv, 2), kv_quant.KVQuantConfig.affine(8), &cache);
             defer view.deinit();
             const o = (try qsaSparseAttn(st, q, &view, bl, 4, 1.0)) orelse return error.SparseAttnDeclined;
@@ -2953,7 +2965,7 @@ test "qsa score fused: unsupported indexer geometry falls back to the composed c
     const nb: c_int = 32;
     const rows: c_int = 4;
     {
-        var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+        var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end };
         defer ssmFreeQsaState(&entry);
         entry.qsa_ratio = 4;
         entry.qsa_reserve_rows = 256;
@@ -2973,7 +2985,7 @@ test "qsa score fused: unsupported indexer geometry falls back to the composed c
         try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(sheet, want, s));
     }
     {
-        var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+        var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end };
         defer ssmFreeQsaState(&entry);
         entry.qsa_ratio = 4;
         entry.qsa_reserve_rows = 256;
@@ -2993,7 +3005,7 @@ test "qsa score fused: unsupported indexer geometry falls back to the composed c
         try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(sheet, want, s));
     }
     {
-        var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+        var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end };
         defer ssmFreeQsaState(&entry);
         entry.qsa_ratio = 4;
         entry.qsa_reserve_rows = 256;
@@ -3047,6 +3059,7 @@ test "QSA verify rows are bit-identical to decode at both KV tile sizes" {
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8), .{ .scheme = .affine, .bits = 8, .group_size = 32 } }) |config| {
         var cache = try KVCache.initWithConfig(a, 1, config);
         defer cache.deinit();
+        cache.bound(test_request_end);
         var view = try qsaAttnCacheFixture(a, s, kd, vd, length, 20000, config, &cache);
         defer view.deinit();
         for ([_]c_int{ 16, 32 }) |bk| {
@@ -3099,10 +3112,12 @@ test "QSA aligned sparse attention past the budget reads only the quant triples:
     for ([_]c_int{ 1, 8 }) |width| {
         var built_cache = try KVCache.initWithConfig(a, 1, KVQuantConfig.affine(8));
         defer built_cache.deinit();
+        built_cache.bound(test_request_end);
         var built = try built_cache.update(0, kd, vd, s, 0);
         defer built.deinit();
         var packed_cache = try KVCache.initWithConfig(a, 1, KVQuantConfig.affine(8));
         defer packed_cache.deinit();
+        packed_cache.bound(test_request_end);
         var deferred = try packed_cache.updatePacked(0, kd, vd, s, 0);
         defer deferred.deinit();
         const q = try qkvIdentityArray(s, 24, width, 256, 0.31, .bfloat16);
@@ -3132,6 +3147,7 @@ test "QSA verify preserves serial arithmetic across the sparse budget boundary" 
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
         var cache = try KVCache.initWithConfig(a, 1, config);
         defer cache.deinit();
+        cache.bound(test_request_end);
         const kd = try qkvIdentityArray(s, 2, length, 256, 0.7, .bfloat16);
         defer _ = mlx.mlx_array_free(kd);
         const vd = try qkvIdentityArray(s, 2, length, 256, 1.7, .bfloat16);
@@ -3171,3 +3187,7 @@ test "QSA verify preserves serial arithmetic across the sparse budget boundary" 
         }
     }
 }
+
+/// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
+/// sizes its grows (`KVCache.heldRows`).
+const test_request_end: usize = 1 << 20;

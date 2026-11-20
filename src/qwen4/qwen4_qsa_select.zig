@@ -1281,12 +1281,13 @@ test "qsa pooled keys: the pooled bank after prefill, decode and verify is bit-i
     defer _ = mlx.mlx_array_free(fa.idx_k_norm);
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
+    cache.bound(test_request_end);
     var seq_off: usize = 0;
     var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
     // A 37-row prefill leaves a 1-row tail; 36 is block-aligned, so its later 4-row verifies read strided views.
     const widths = [_][]const c_int{ &.{ 37, 1, 1, 1, 3, 3, 3, 5, 5, 5, 5, 1, 2 }, &.{ 36, 4, 4, 1, 1, 1, 1, 5, 3, 3, 5, 4 } };
     for ([_]c_int{ 0, 262_101, 999_937 }) |pos_base| for (widths) |seq| {
-        var arms: [2]SSMCacheEntry = @splat(.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true });
+        var arms: [2]SSMCacheEntry = @splat(.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end });
         defer for (&arms) |*e| ssmFreeQsaState(e);
         const launched = qsa_pool_rope_dispatches;
         var offset: c_int = 0;
@@ -2632,7 +2633,7 @@ test "qsa score fused: no bank is built under the fused arm" {
     xfm.s = s;
     xfm.allocator = testing.allocator;
     xfm.arch_state.qwen4.qsa_score_bank_builds = 0;
-    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end };
     defer ssmFreeQsaState(&entry);
     entry.qsa_ratio = 4;
     entry.qsa_reserve_rows = 256;
@@ -2718,3 +2719,7 @@ test "qsa select tg policy: a pure function of rows" {
     try testing.expectEqual(@as(c_int, 1024), qsaSelectTgFor(16));
     try testing.expectEqual(@as(c_int, 1024), qsaSelectTgFor(1));
 }
+
+/// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
+/// sizes its grows (`KVCache.heldRows`).
+const test_request_end: usize = 1 << 20;

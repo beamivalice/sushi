@@ -144,8 +144,10 @@ pub fn reserveQsaHistoryWithHead(entries: ?[]SSMCacheEntry, head: ?*SSMCacheEntr
     if (head) |h| reserveQsaHistory(h[0..1], hold);
 }
 
-/// What the entry's request asks of its QSA history's growth, in tokens.
-pub fn qsaHold(e: *const SSMCacheEntry) Hold {
+/// What the entry's request asks of its QSA history's growth, in tokens; null until a request binds it
+/// (`reserveQsaHistory`), and an unbound history cannot grow.
+pub fn qsaHold(e: *const SSMCacheEntry) ?Hold {
+    if (e.qsa_end_rows == 0) return null;
     return .{ .reserve = e.qsa_reserve_rows, .end = e.qsa_end_rows };
 }
 
@@ -240,6 +242,8 @@ pub fn qsaTestAppendPool(xfm: *Trunk, entry: *SSMCacheEntry, chunk: mlx.mlx_arra
     const ratio = @max(entry.qsa_ratio, 1);
     const add = mlx.getShape(chunk)[1];
     const kv = offset + add;
+    // A feed is a request whose last row is its own: it binds the history there, past any earlier request's end.
+    entry.qsa_end_rows = @max(entry.qsa_end_rows, @as(usize, @intCast(kv)));
     const nb = @divTrunc(kv, ratio);
     const nb_cached: c_int = if (entry.qsa_pooled.ctx != null) mlx.getShape(entry.qsa_pooled)[1] else 0;
     if (nb > nb_cached) {
@@ -1019,7 +1023,7 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     xfm.allocator = t.allocator;
     xfm.arch_state.qwen4.qsa_score_bank_builds = 0;
 
-    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end };
     defer ssmFreeQsaState(&entry);
     entry.qsa_ratio = 4;
     entry.qsa_reserve_rows = 64;
@@ -1789,7 +1793,7 @@ test "handoffQsaHistoryToLatest: the newest snap takes a VIEW of the live buffer
     var prng = std.Random.DefaultPrng.init(0x5A5A_1D0F);
     const rnd = prng.random();
 
-    var live = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
+    var live = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end }};
     defer ssmFreeQsaState(&live[0]);
     // A reserved append: the buffer carries slack past the published rows.
     const keys = try attn256RandBf16(rnd, &[_]c_int{ 1, QSA_RING_ROWS, hd }, s);
@@ -1878,13 +1882,13 @@ test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the 
     }
     var pooled = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_ones(&pooled, &[_]c_int{ 1, n / 4, 8 }, 3, .float32, s));
-    var live = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = aux, .qsa_pooled = pooled, .qsa_ratio = 4 }};
+    var live = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end, .aux_state = aux, .qsa_pooled = pooled, .qsa_ratio = 4 }};
     defer ssmFreeQsaState(&live[0]);
     var cps = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, 32, s)};
     defer cps[0].deinit(testing.allocator);
     try attachQsaHistoryToLatest(&cps, &live, s);
 
-    var dest = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
+    var dest = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end }};
     defer ssmFreeQsaState(&dest[0]);
     try restoreSsmCheckpoint(&dest, &cps[0], s);
     try applyQsaHistoryAt(&dest, &cps[0], 16, s, false);
@@ -1984,26 +1988,28 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
 }
 
 test "qsa key append plan: rows advance by S, capacity grows only when it must" {
-    const p0 = qsaKeyAppendPlan(0, 0, 4, .{}, 1);
+    // A request ending past every append here: the policy alone sizes each grow.
+    const far: Hold = .{ .end = 1 << 20 };
+    const p0 = qsaKeyAppendPlan(0, 0, 4, far, 1);
     try testing.expectEqual(@as(usize, 0), p0.write_at);
     try testing.expectEqual(@as(usize, 4), p0.new_rows);
     try testing.expect(p0.new_cap >= 4);
 
-    const p1 = qsaKeyAppendPlan(100, 512, 1, .{}, 1);
+    const p1 = qsaKeyAppendPlan(100, 512, 1, far, 1);
     try testing.expectEqual(@as(usize, 512), p1.new_cap);
     try testing.expectEqual(@as(usize, 100), p1.write_at);
     try testing.expectEqual(@as(usize, 101), p1.new_rows);
 
-    const p2 = qsaKeyAppendPlan(511, 512, 1, .{}, 1);
+    const p2 = qsaKeyAppendPlan(511, 512, 1, far, 1);
     try testing.expectEqual(@as(usize, 512), p2.new_cap);
     try testing.expectEqual(@as(usize, 512), p2.new_rows);
 
-    const p3 = qsaKeyAppendPlan(512, 512, 1, .{}, 1);
+    const p3 = qsaKeyAppendPlan(512, 512, 1, far, 1);
     try testing.expect(p3.new_cap >= 513);
     try testing.expectEqual(@as(usize, 512), p3.write_at);
     try testing.expectEqual(@as(usize, 513), p3.new_rows);
 
-    const p4 = qsaKeyAppendPlan(500, 512, 4096, .{}, 1);
+    const p4 = qsaKeyAppendPlan(500, 512, 4096, far, 1);
     try testing.expect(p4.new_cap >= 4596);
     try testing.expectEqual(@as(usize, 4596), p4.new_rows);
 }
@@ -2012,7 +2018,7 @@ test "reserveQsaHistory: the MTP head entry is reserved at the same length" {
     var slot = [_]SSMCacheEntry{.{ .ssm_state = .{ .ctx = null }, .conv_state = .{ .ctx = null }, .initialized = false }};
     var head: SSMCacheEntry = .{ .ssm_state = .{ .ctx = null }, .conv_state = .{ .ctx = null }, .initialized = false };
     const tokens: usize = 8192;
-    reserveQsaHistoryWithHead(slot[0..], &head, .{ .reserve = tokens });
+    reserveQsaHistoryWithHead(slot[0..], &head, .{ .reserve = tokens, .end = tokens });
     try testing.expectEqual(tokens, slot[0].qsa_reserve_rows);
     try testing.expectEqual(tokens, head.qsa_reserve_rows);
 }
@@ -2040,7 +2046,7 @@ test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#3
         _ = mlx.mlx_array_free(entry.conv_state);
     }
 
-    reserveQsaHistory(entries[0..], .{ .reserve = total });
+    reserveQsaHistory(entries[0..], .{ .reserve = total, .end = total });
     try testing.expectEqual(total, entry.qsa_reserve_rows);
 
     var rows: c_int = 0;
@@ -2056,7 +2062,8 @@ test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#3
 }
 
 test "qsa key append plan: a reservation raises the FIRST grow and nothing else" {
-    const r: Hold = .{ .reserve = 400_000 };
+    // A request ending past every append here: only the reservation raises a grow.
+    const r: Hold = .{ .reserve = 400_000, .end = 1 << 30 };
     try testing.expectEqual(@as(usize, 512), qsaKeyAppendPlan(100, 512, 1, r, 1).new_cap);
     // The reservation on the cache's 256-row steps (`KVCache.heldRows`).
     try testing.expectEqual(@as(usize, 400_128), qsaKeyAppendPlan(0, 0, 4096, r, 1).new_cap);
@@ -2174,7 +2181,7 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
     t.arch_state.qwen4.qsa_score_bank_builds = 0;
 
     const hd: c_int = 16;
-    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end };
     defer ssmFreeQsaState(&entry);
 
     var prng = std.Random.DefaultPrng.init(0x9A17_3D02);
@@ -2255,9 +2262,9 @@ test "qsa score bank: incremental column append matches a from-scratch rebuild" 
     var prng = std.Random.DefaultPrng.init(0x5C0E_BA11);
     const rnd = prng.random();
 
-    var scratch: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    var scratch: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end };
     defer ssmFreeQsaState(&scratch);
-    var incr: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    var incr: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_end_rows = test_request_end };
     defer ssmFreeQsaState(&incr);
 
     const before = qwen4_qsa.qsa_score_incremental_appends;
@@ -2316,7 +2323,7 @@ test "qsa history: a restore-shaped re-seed lands AT the reservation, so the app
         _ = mlx.mlx_array_free(entry.ssm_state);
         _ = mlx.mlx_array_free(entry.conv_state);
     }
-    reserveQsaHistory(entries[0..], .{ .reserve = reserve });
+    reserveQsaHistory(entries[0..], .{ .reserve = reserve, .end = reserve });
 
     {
         const chunk = try attn256RandBf16(rnd, &[_]c_int{ 1, held, hd }, s);
@@ -2399,3 +2406,7 @@ test "QSA checkpoint copy failure preserves the destination pooled bank" {
     try testing.expectEqual(original, dst.layers[0].qsa_pooled.ctx);
     try testing.expectEqualSlices(c_int, &shape, mlx.getShape(dst.layers[0].qsa_pooled));
 }
+
+/// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
+/// sizes its grows (`KVCache.heldRows`).
+const test_request_end: usize = 1 << 20;

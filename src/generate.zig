@@ -1467,18 +1467,36 @@ pub const Generator = struct {
             .width_max = @intCast(PREFILL_CHUNK),
         };
 
+        const prefix_len = prompt_ids.len - 1;
+        const snapshot_backoff = if (prefix_len == 0)
+            0
+        else if (arch_request != null and want_state_cp)
+            prefix_arch.requestCaptureBackoff(options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len)
+        else
+            prefill_plan.snapshotBackoffOf(want_state_cp, prefix_len, ssm_cp_offset > 0, arch_config.snapshotBackoff(&xfm.config, tok, prompt_ids) orelse prefill_plan.SSM_SNAPSHOT_BACKOFF);
+        const loop_end = prefix_len - snapshot_backoff;
+        // Vision prompts chunk like text (issue #197) — the splice offset
+        // below keeps the row scatter chunk-exact. Kill switch restores
+        // the whole-prompt forward.
+        const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
+
+        // Every request bounds its caches at its last row before anything writes, a one-token tail (a full hot-cache
+        // match) as much as a prompt: an unbound cache cannot grow (`KVCache.grownCapacity`). A grow is not in place,
+        // so the whole request's capacity is reserved before the first chunk writes: a long prefill's peak carried a
+        // second copy of everything so far (~7.75 GB at 458k on qwen4_exp, #353). Same number the admission guard
+        // billed (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after a prefix-cache hit.
+        const past_end = @import("bills.zig").speculativeRowsPastEnd(&xfm.config, .{ .mtp_on = mtp_active });
+        const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, past_end, s);
+        // The arch's own per-request buffers reserve at the same length; the head's rows start at its base.
+        if (mtp_cache) |*mc| try mc.reserve(.{ .reserve = reserved_tokens -| mtp_position_base, .end = ctx.cache.end_tokens -| mtp_position_base }, s);
+        prefix_arch.aux.reserveQsaHistoryWithHead(
+            ctx.ssm_entries,
+            arch_state.headEntry(&xfm.arch_state),
+            .{ .reserve = reserved_tokens, .end = ctx.cache.end_tokens },
+        );
+
         if (prompt_ids.len > 1) {
-            const prefix_len = prompt_ids.len - 1;
-            const snapshot_backoff = if (arch_request != null and want_state_cp)
-                prefix_arch.requestCaptureBackoff(options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len)
-            else
-                prefill_plan.snapshotBackoffOf(want_state_cp, prefix_len, ssm_cp_offset > 0, arch_config.snapshotBackoff(&xfm.config, tok, prompt_ids) orelse prefill_plan.SSM_SNAPSHOT_BACKOFF);
-            const loop_end = prefix_len - snapshot_backoff;
             final_start = loop_end;
-            // Vision prompts chunk like text (issue #197) — the splice offset
-            // below keeps the row scatter chunk-exact. Kill switch restores
-            // the whole-prompt forward.
-            const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
             // Per-chunk adaptive width: the first chunk runs the arch's widest width, and every
             // boundary re-asks the same estimator. `cap_adapt` is the widest this arch forwards
             // for this prompt, never wider than `ssm_cp_stride`.
@@ -1500,23 +1518,10 @@ pub const Generator = struct {
             adapt_state.loop_end = ssm_cp_offset + loop_end;
             var cur_chunk: usize = default_chunk;
 
-            // Reserve the whole request's cache capacity before the first chunk writes: a grow
-            // is not in place, so a long prefill's peak carried a second copy of everything so
-            // far (~7.75 GB at 458k on qwen4_exp, #353). Same number the admission guard billed
-            // (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after
-            // a prefix-cache hit. `cp_thin` names this site's previous retention policy.
+            // `cp_thin` names this site's previous retention policy.
             const cp_thin: trunk.ThinPolicy =
                 if (xfm.config.longCtxGated() or arch_request != null) .min_span_recency else .oldest;
 
-            const past_end = @import("bills.zig").speculativeRowsPastEnd(&xfm.config, .{ .mtp_on = mtp_active });
-            const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, past_end, s);
-            // The arch's own per-request buffers reserve at the same length; the head's rows start at its base.
-            if (mtp_cache) |*mc| try mc.reserve(.{ .reserve = reserved_tokens -| mtp_position_base, .end = ctx.cache.end_tokens -| mtp_position_base }, s);
-            prefix_arch.aux.reserveQsaHistoryWithHead(
-                ctx.ssm_entries,
-                arch_state.headEntry(&xfm.arch_state),
-                .{ .reserve = reserved_tokens, .end = ctx.cache.end_tokens },
-            );
             // Admission billed the request at `default_chunk`; where the hook may, the first chunk starts wider and
             // steps down only where it no longer fits.
             const start_chunk = prefill_plan.firstChunkWidth(&xfm.config, cur_chunk, cap_adapt, width_is_adaptive);
@@ -4399,6 +4404,7 @@ test "a warm prefill grows its restored layers to the reservation before the fir
                 defer donor.deinit();
                 donor.setSwaRing(ring);
                 donor.reserve(capacity);
+                donor.bound(capacity);
                 for (0..2) |li| {
                     var v = try donor.update(@intCast(li), rows, rows, s, if (li == 1) ring else 0);
                     v.deinit();

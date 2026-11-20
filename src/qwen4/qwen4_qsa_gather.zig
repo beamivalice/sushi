@@ -1908,6 +1908,7 @@ test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the
     var qs: [2]mlx.mlx_array = undefined;
     for (0..2) |i| {
         caches[i] = try KVCache.init(ta, 1);
+        caches[i].bound(test_request_end);
         const k = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kls[i], hd }, s);
         defer _ = mlx.mlx_array_free(k);
         const v = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kls[i], hd }, s);
@@ -2030,6 +2031,7 @@ test "qsa packed gather: prefill widths read the packed cache as precisely as th
         defer _ = mlx.mlx_array_free(mask);
         var cache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(c.bits));
         defer cache.deinit();
+        cache.bound(test_request_end);
         var view = try qsaAttnCacheFixture(ta, s, k_dense, v_dense, c.kv, @divTrunc(c.kv, 2), kv_quant.KVQuantConfig.affine(c.bits), &cache);
         defer view.deinit();
         const scale: f32 = 1.0 / 16.0;
@@ -2075,3 +2077,7 @@ test "qsa wide µbench: prefill chunk widths (SUSHI_QSA_PREFILL_UBENCH=1)" {
     if (!diagEnvOn("SUSHI_QSA_PREFILL_UBENCH")) return error.SkipZigTest;
     try qsaWideUbench(&.{ 4096, 6144, 8192, 12288, 16384, 32768, 65536, 131072 }, &.{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 }, &.{ .mask_rebuild, .gather_rebuild, .packed_nax }, 5);
 }
+
+/// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
+/// sizes its grows (`KVCache.heldRows`).
+const test_request_end: usize = 1 << 20;

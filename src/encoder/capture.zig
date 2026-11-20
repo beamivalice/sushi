@@ -225,6 +225,7 @@ pub const Capture = struct {
         const info = self.info.?;
         for (0..self.windows.count) |w| {
             try loaded.xfm.resetCache();
+            loaded.xfm.bindOwnRows(calib.window_len);
             var ctx = loaded.xfm.defaultCtx();
             ctx.skip_lm_head = true;
             const input = if (layer > 0) self.hidden.?.array(w) else mlx.mlx_array_new();
@@ -344,6 +345,7 @@ fn fullForwardRows(allocator: std.mem.Allocator, io: std.Io, pack_abs: []const u
         tap.armRows(layer);
         for (0..windows.count) |w| {
             try full.xfm.resetCache();
+            full.xfm.bindOwnRows(calib.window_len);
             var ctx = full.xfm.defaultCtx();
             ctx.skip_lm_head = true;
             const tokens = windowTokensOf(allocator, windows, w);
@@ -470,6 +472,7 @@ test "capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS
     var full = try kld.loadModel(io, t.allocator, .{ .model_dir = pack_abs });
     defer full.deinit();
     try full.xfm.resetCache();
+    full.xfm.bindOwnRows(calib.window_len);
     var ctx = full.xfm.defaultCtx();
     ctx.skip_lm_head = true;
     const layer_ids = [_]u32{ 0, 1, 2, 3 };
@@ -562,4 +565,25 @@ test "capture: a hidden boundary survives a save and a load, an older boundary i
     defer _ = mlx.mlx_array_free(arr);
     try copy.store(mlx.gpuStream(), 1, arr);
     try t.expectEqualSlices(u8, want[cap.hidden.?.window_bytes..], copy.bytes[copy.window_bytes..]);
+}
+
+test "capture: a calibration window's forward runs on the cut Qwen pack, bound at the window's rows (QWEN4_TEST_MODEL)" {
+    const t = std.testing;
+    const dir = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
+    try mlx.requireGpu();
+    var loaded = try kld.loadModel(t.io, t.allocator, .{ .model_dir = dir });
+    defer loaded.deinit();
+    var ids: [calib.window_len]u32 = undefined;
+    for (&ids, 0..) |*v, i| v.* = @intCast((i * 7 + 3) % @as(usize, loaded.config.vocab_size));
+    var windows = try calib.fromTokens(t.allocator, &ids, ids.len);
+    defer windows.deinit();
+    var cap = Capture.init(t.allocator, t.io, mlx.gpuStream(), &windows, undefined, 0);
+    defer cap.deinit();
+    var info: driver.Info = undefined;
+    info.ple_layer = std.math.maxInt(u32);
+    cap.info = info;
+    var hidden: ?Hidden = null;
+    defer if (hidden) |*h| h.deinit();
+    try cap.forwardWindows(loaded, 0, &hidden);
+    try t.expect(hidden != null);
 }

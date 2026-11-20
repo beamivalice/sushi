@@ -191,6 +191,11 @@ fn cloneContext(assistant: *const draft.DflashModel, source: *const draft.Dflash
     var copy = try draft.DflashCtx.init(assistant.allocator, assistant, source.base_pos);
     errdefer copy.deinit();
     try copy.cache.restore(&snapshot);
+    // The copy holds what its source does.
+    if (source.cache.hold()) |h| {
+        copy.cache.reserve(@intCast(h.reserve));
+        copy.cache.bound(@intCast(h.end));
+    }
     return copy;
 }
 
@@ -443,6 +448,7 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
     };
     var context = try draft.DflashCtx.init(allocator, &assistant, 0);
     defer context.deinit();
+    context.cache.bound(draft.test_context_rows);
     try draft.appendContext(&assistant, &context, captures.hook.out, 0);
     try evaluateContext(&context);
     const proposal = try proposeTree(&assistant, &context, &target, 1, 4);
@@ -525,6 +531,7 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
     request.reset();
     context.deinit();
     context = try draft.DflashCtx.init(allocator, &assistant, 0);
+    context.cache.bound(draft.test_context_rows);
     const pending = try prefill(&assistant, &context, &target, &request, prefix_ids);
     const round = try roundTreeOracle(std.Io.Threaded.global_single_threaded.io(), &assistant, &context, &target, &request, pending, 4, 2, &.{});
     try std.testing.expect(round.count >= 1 and round.count <= 2);
@@ -604,6 +611,7 @@ test "GLM DFlash bounds proposal depth by budget and remaining context before ve
     };
     var context = try draft.DflashCtx.init(allocator, &assistant, 0);
     defer context.deinit();
+    context.cache.bound(draft.test_context_rows);
     var prefix: [14]u32 = undefined;
     for (&prefix, 0..) |*t, i| t.* = @intCast(i % 4);
     const prefix_ids = try ops.own(mlx.mlx_array_new_data(&prefix, &[_]c_int{ 1, 14 }, 2, .uint32));
@@ -648,6 +656,7 @@ test "GLM DFlash bounds proposal depth by budget and remaining context before ve
     defer open_request.deinit();
     var open_context = try draft.DflashCtx.init(allocator, &assistant, 0);
     defer open_context.deinit();
+    open_context.cache.bound(draft.test_context_rows);
     var open_prefix: [6]u32 = undefined;
     for (&open_prefix, 0..) |*t, i| t.* = @intCast(i % 4);
     const open_ids = try ops.own(mlx.mlx_array_new_data(&open_prefix, &[_]c_int{ 1, 6 }, 2, .uint32));

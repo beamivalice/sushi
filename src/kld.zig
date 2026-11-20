@@ -552,6 +552,8 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         var generated: std.ArrayList(u32) = .empty;
         defer generated.deinit(allocator);
 
+        // The prompt and the tokens it scores.
+        l.xfm.bindOwnRows(ids.len + (if (p.force) |f| f.len else opts.tokens));
         var ctx = l.xfm.defaultCtx();
         var logits = try forwardPromptCapture(allocator, l, &ctx, ids, hidden);
         defer _ = mlx.mlx_array_free(logits);
@@ -705,6 +707,8 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         const model_row = try allocator.alloc(f32, teacher.vocab);
         defer allocator.free(model_row);
 
+        // The prompt and the teacher's generated tokens it scores.
+        l.xfm.bindOwnRows(tokens.prompt.len + generated.len);
         var ctx = l.xfm.defaultCtx();
         var logits = try forwardPrompt(allocator, l, &ctx, tokens.prompt);
         defer _ = mlx.mlx_array_free(logits);
@@ -1196,4 +1200,31 @@ test "kld: ropeOf names the RoPE a model runs under and what overrode it" {
     model_mod.setConfigOverrides("{}");
     try testing.expectEqual(fixture_mod.Rope.Source.both, ropeOf(&yarn).source);
     try testing.expectEqual(fixture_mod.Rope.Source.launch_flag, ropeOf(&native).source);
+}
+
+test "kld: a capture and a compare run on the cut Qwen pack, each pass bound at the rows it writes (QWEN4_TEST_MODEL)" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const dir = std.mem.span(std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest);
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(t.io, &buf)];
+    const base = try std.fmt.allocPrint(t.allocator, "{s}/base", .{root});
+    defer t.allocator.free(base);
+    const cmp = try std.fmt.allocPrint(t.allocator, "{s}/cmp", .{root});
+    defer t.allocator.free(cmp);
+    var out = Out{ .silent = true };
+    {
+        const opts = Options{ .model_dir = dir, .prompts = "standard4", .out_dir = base, .tokens = 4, .limit = 1 };
+        const l = try loadModel(t.io, t.allocator, opts);
+        defer l.deinit();
+        try runCapture(t.io, t.allocator, l, opts, &out);
+    }
+    {
+        const opts = Options{ .command = .compare, .model_dir = dir, .fixture = base, .out_dir = cmp, .limit = 1 };
+        const l = try loadModel(t.io, t.allocator, opts);
+        defer l.deinit();
+        try runCompare(t.io, t.allocator, l, opts, &out);
+    }
 }

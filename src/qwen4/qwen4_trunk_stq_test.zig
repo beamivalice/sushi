@@ -411,6 +411,7 @@ fn attnTwinCase(stacked: bool) !void {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
+    cache.bound(test_request_end);
     var xfm = bareTransformer(s, cache);
     const dec = expert_exl3.Decode.tabled(.spec1, .w15);
     const hidden: usize = 128;
@@ -473,6 +474,7 @@ fn attnTwinCase(stacked: bool) !void {
         const x = try rand(rnd, &.{ 1, seq, @intCast(hidden) }, 2.0, s);
         defer _ = mlx.mlx_array_free(x);
         var outs: [2]mlx.mlx_array = undefined;
+        for (slots) |sl| sl.bindPass(@intCast(seq));
         for ([_]*const FullAttnWeights{ &fa_stq, &fa_twin }, slots, &outs) |fa, sl, *o| {
             o.* = try qwen4_forward.qwen4AttnWith(&xfm, &sl.ctx, x, fa, &sl.entries[0], 0, offset, 0, 1, seq, seq > 1);
         }
@@ -516,6 +518,7 @@ fn gdnTwinCase(stacked: bool) !void {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
+    cache.bound(test_request_end);
     var xfm = bareTransformer(s, cache);
     defer inline for (.{ &xfm.arch_state.qwen4.gdn_q_scale, &xfm.arch_state.qwen4.gdn_k_scale, &xfm.arch_state.qwen4.gdn_eps }) |p| {
         if (p.*) |arr| _ = mlx.mlx_array_free(arr);
@@ -725,3 +728,7 @@ test "trunk STQ: a Qwen verify plans no more rows than the trellis trunk keeps a
     const affine = ModelConfig{ .model_type = "qwen4_exp" };
     try testing.expectEqual(@as(u32, mtp_mod.MAX_DEPTH), mtp_policy.mtpVerifyDraftsMax(&affine));
 }
+
+/// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
+/// sizes its grows (`KVCache.heldRows`).
+const test_request_end: usize = 1 << 20;

@@ -440,6 +440,8 @@ fn runGlobalDecode(run: *report.Run) anyerror!void {
         for (0..layers) |i| {
             const seed = @as(u64, 0x3D2D_BE7C) + i * 4;
             caches[i] = try trunk.KVCache.initWithConfig(a, 1, kv_quant.KVQuantConfig.affine(bits));
+            // The bench writes `kv` rows: the context and one decode row.
+            caches[i].bound(@intCast(kv));
             {
                 const k = try uniformBf16(seed, &[_]c_int{ 1, decode_hkv, kv - 1, decode_dk }, -0.5, 0.5, s);
                 defer _ = mlx.mlx_array_free(k);

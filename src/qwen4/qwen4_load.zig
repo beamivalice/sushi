@@ -170,7 +170,7 @@ fn warmupSpecVerify(self: *Trunk, max_width: u32, kv_config: KVQuantConfig) !voi
     };
     while (n_slots < max_rows) {
         const first = n_slots == 0;
-        slots[n_slots] = try SpecWarmSlot.init(self, kv_config);
+        slots[n_slots] = try SpecWarmSlot.init(self, kv_config, SPEC_WARM_PREFILL_ROWS);
         // Counted before its forward, so a forward that fails gives the slot back with the rest.
         const sl = slots[n_slots];
         n_slots += 1;
@@ -223,6 +223,9 @@ fn specWarmGroupSeq(group_cap: usize, rows: usize, width_cap: usize) usize {
 fn specWarmHead(self: *Trunk, stream_row: mlx.mlx_array) !void {
     var st = try qwen4_forward.qwen4MtpStateNew(self);
     defer st.deinit();
+    // No request runs the warm: its head state is bound at the two one-row steps it writes.
+    st.cache.bound(2);
+    st.entry.qsa_end_rows = 2;
     var id_buf: [1]i32 = undefined;
     const id_arr = try specWarmIds(&id_buf);
     defer _ = mlx.mlx_array_free(id_arr);
