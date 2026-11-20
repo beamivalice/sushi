@@ -472,7 +472,7 @@ const test_buckets = [_][]const []const u8{
 /// Each bucket's compile RSS bound, in `test_buckets` order and then test-rest: a cold ReleaseFast compile's MaxRSS,
 /// which `--summary all` floors to 10^9 bytes, so `N`G is held as (N + 1) * 10^9 rounded up to whole GiB. `--maxrss`
 /// (tests/gate.sh --test-budget-gib) then runs only the compiles that fit at once; run steps declare none (Metal).
-const bucket_compile_gib = [test_buckets.len + 1]u64{ 3, 6, 7, 4, 13 };
+const bucket_compile_gib = [test_buckets.len + 1]u64{ 3, 6, 8, 4, 13 };
 const gib: u64 = 1 << 30;
 
 /// The SSD tier's tests, which run once on each file backend (`SUSHI_PREFIX_FS`).
