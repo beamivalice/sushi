@@ -1097,8 +1097,7 @@ fn handleAnthropicNonStreaming(
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
     const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, 0, kv_quant_override, stream, .{ .stops = stop_sequences }, thought);
-    defer allocator.free(result.text);
-    defer allocator.free(result.token_ids);
+    defer result.deinit(allocator);
 
     // The stop that ended the generation (Anthropic reports it as stop_reason "stop_sequence" + the echoed
     // `stop_sequence` field), the text it leaves and the calls in it (`reply.settle`).

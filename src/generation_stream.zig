@@ -791,12 +791,7 @@ pub fn handleNonStreamingGeneration(
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
     const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences }, thought);
-    defer allocator.free(result.text);
-    defer allocator.free(result.token_ids);
-    defer if (result.logprobs) |lps| {
-        for (lps) |*lp| allocator.free(lp.top_logprobs);
-        allocator.free(lps);
-    };
+    defer result.deinit(allocator);
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
     // Not ANDed with enable_thinking: generated reasoning is always DELIVERED,

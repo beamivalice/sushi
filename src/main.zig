@@ -1351,8 +1351,7 @@ fn runCli(init: std.process.Init) !void {
         } else {
             // Non-streaming: generate all tokens then print
             const result = try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
-            defer allocator.free(result.text);
-            defer allocator.free(result.token_ids);
+            defer result.deinit(allocator);
 
             try stdout_w.writeAll("==========\n");
             try stdout_w.writeAll(result.text);

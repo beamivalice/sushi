@@ -777,6 +777,17 @@ printf '%s\n' 'const Conn = struct {' '    fn reader(c: *Conn) *R { return &c.re
 printf '%s\n' 'fn lines(r: *R) void {' '    _ = r.reader().takeDelimiter(10);' '}' > "$TMP/t/src/cli.zig"
 expect_green "Conn's own reads, a reader with arguments, read_state.err, a test, and another file's reader()"
 
+# rule result-field-free
+tree
+printf '%s\n' 'const A = struct { fn free(a: A, x: []u32) void { _ = a; _ = x; } };' 'const R = struct { token_ids: []u32, logprobs: []u32 };' \
+  'fn f(a: A, r: R) void {' '    defer a.free(r.token_ids);' '    defer a.free(r.logprobs);' '}' > "$TMP/t/src/p.zig"
+expect_red "a result's token_ids freed by hand" "src/p.zig:4:13 \[result-field-free\] f: 'token_ids' freed by hand"
+
+tree
+printf '%s\n' 'const A = struct { fn free(a: A, x: []u32) void { _ = a; _ = x; } };' 'const R = struct { token_ids: []u32, text: []u32, fn deinit(r: R, a: A) void { a.free(r.text); } };' \
+  'fn f(a: A, ids: []u32, r: R) void {' '    defer a.free(ids);' '    defer r.deinit(a);' '}' > "$TMP/t/src/p.zig"
+expect_green "a plain slice freed, and a result released through deinit"
+
 # the allowlist
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn handleOf(s: *S) *S { return s; }' 'fn f(self: *const S) *S {' \

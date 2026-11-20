@@ -236,6 +236,7 @@ before reading a completed stream and requires clean EOF.
 
 ## Seeds, logprobs, sampling
 
+- **A `GenerationResult` owns its text, token ids and logprobs together**: every receiver frees it with `deinit`, never a field at a time (lint `result-field-free`).
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`sampler.seedKey`).
 - <a id="sampled-draw"></a>**On Sushi Cooler a sampled token is one kernel's draw** (`sampler_draw.zig`,
   `sampler.engineDraws`), a serial step's, a DSpark row's and an MTP verify row's alike. Its rule, which `hostDraw`

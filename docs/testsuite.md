@@ -246,6 +246,7 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   its caller's stream ([engine-prefix-cache](engine-prefix-cache.md)). `response-store-field` flags
   the Responses store's map or LRU (`by_id`, `recency`) touched outside `responses.zig`: a record is held through
   `acquire`/`release`.
+  `result-field-free` flags `.free(x.token_ids)` and `.free(x.logprobs)`: a `GenerationResult` is released with `deinit`.
   `template-runtime-safety` flags a fn under `src/template/` whose body does not open with `@setRuntimeSafety(true)`,
   and any `@setRuntimeSafety(false)` there: the engine reads pack text, and in ReleaseFast only that keeps its bounds
   and overflow checks. It covers the engine's own code, not the std functions it calls (those run unchecked); that is

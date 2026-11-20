@@ -431,14 +431,8 @@ fn handleNonStreamingCompletion(
     const use_drafter = spec.use_drafter;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special }, null);
-    _ = &result;
-    defer allocator.free(result.text);
-    defer allocator.free(result.token_ids);
-    defer if (result.logprobs) |lps| {
-        for (lps) |*lp| allocator.free(lp.top_logprobs);
-        allocator.free(lps);
-    };
+    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special }, null);
+    defer result.deinit(allocator);
 
     // Text completion is a raw continuation: FIM clients rely on exact
     // indentation (stream and non-stream bytes match).

@@ -1441,8 +1441,7 @@ const LocalBackend = struct {
         const ended_ms = timed.ended_ms;
         const wall_ms = timed.wall_ms;
         const spent = timed.spent;
-        defer a.free(r.text);
-        defer a.free(r.token_ids);
+        defer r.deinit(a);
 
         var gpu: gpu_clock.Summary = .{};
         if (sampler) |s| {

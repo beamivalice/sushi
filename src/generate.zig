@@ -376,7 +376,8 @@ pub const GenerationResult = struct {
     /// is what was actually run through the model this turn, so `prefill_tps`
     /// reflects real compute rather than an inflated full-prompt rate.
     cached_tokens: u32 = 0,
-    logprobs: ?[]sampler.LogprobResult = null, // per-token logprobs (caller must free)
+    /// Per-token logprobs, each with its own `top_logprobs` slice.
+    logprobs: ?[]sampler.LogprobResult = null,
     /// Non-null only when the degenerate-tail guard cut this generation:
     /// the `finish_details.type` value emitted beside `finish_reason`
     /// ("stop" for loop cuts — see `slot_outcome.loopStopReason`).
@@ -394,6 +395,16 @@ pub const GenerationResult = struct {
     /// Where a stop sequence that ended the generation is read from: a stream's text is cut by its gate (which
     /// carries the match), a non-stream text still holds the stop (`stop_sequences.cut`).
     stop_source: stop_seq_mod.Source = .whole,
+
+    /// Frees everything the result owns, allocated by `allocator`: `text`, `token_ids` and `logprobs`.
+    pub fn deinit(self: GenerationResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.token_ids);
+        if (self.logprobs) |lps| {
+            for (lps) |lp| allocator.free(lp.top_logprobs);
+            allocator.free(lps);
+        }
+    }
 };
 
 /// Throughput in tokens/sec. Returns 0 when no time elapsed so unmeasured paths

@@ -2728,3 +2728,22 @@ test "server: a request that fits once the running one finishes waits for it and
         }
     }.run);
 }
+
+test "server: a non-stream reply on every surface frees every allocation of its result, logprobs included" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const resp = try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"a long tale\",\"max_tokens\":3,\"temperature\":0,\"ignore_eos\":true,\"logprobs\":1}");
+            defer gpa.free(resp);
+            if (std.mem.indexOf(u8, bodyOf(resp), "\"token_logprobs\"") == null) return error.NoLogprobs;
+            const plain = [_]struct { path: []const u8, body: []const u8 }{
+                .{ .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":3,\"temperature\":0,\"logprobs\":true,\"top_logprobs\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+                .{ .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"max_tokens\":3,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+                .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":3,\"temperature\":0,\"input\":\"hi\"}" },
+            };
+            for (plain) |r| {
+                const out = try request("POST", r.path, r.body);
+                gpa.free(out);
+            }
+        }
+    }.run);
+}

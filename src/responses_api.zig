@@ -1298,8 +1298,7 @@ fn handleResponsesInner(
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
         result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, stream, .{ .stops = stop_sequences.items }, &thought);
     }
-    defer allocator.free(result.text);
-    defer allocator.free(result.token_ids);
+    defer result.deinit(allocator);
 
     // ── apply stop sequences, split calls ──
     const opens_think = promptOpensThink(allocator, tok, prompt_ids);
