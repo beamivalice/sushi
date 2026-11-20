@@ -1213,6 +1213,8 @@ fn handleAnthropicNonStreaming(
     const usage = try formatAnthropicUsage(allocator, prompt_token_count, result.completion_tokens, result.cached_tokens);
     defer allocator.free(usage);
 
+    const stop_details = try reply_mod.detailsField(allocator, "stop_details", settled.declined, reply_mod.thoughtDetailsField("stop_details", result.finish_details));
+    defer allocator.free(stop_details);
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s}{s},"usage":{s}{s}}}
     , .{
@@ -1221,7 +1223,7 @@ fn handleAnthropicNonStreaming(
         model_name,
         stop_reason,
         stop_seq_json,
-        reply_mod.thoughtDetailsField("stop_details", result.finish_details),
+        stop_details,
         usage,
         timings_field,
     });
@@ -1725,6 +1727,9 @@ fn handleAnthropicStreaming(
 
     // Handle tool calls
     var finish_reason: []const u8 = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;
+    // The `stop_details` field naming a call the reply declined, set where the end is settled.
+    var stop_details: []const u8 = "";
+    defer allocator.free(stop_details);
 
     if (gated_stream and !client_gone) {
         if (log.isDebug() and text_buf.items.len > 0) {
@@ -1749,6 +1754,7 @@ fn handleAnthropicStreaming(
             .opens_think = opens_think and !think_closed,
         });
         defer settled.deinit(allocator);
+        stop_details = try reply_mod.detailsField(allocator, "stop_details", settled.declined, "");
         const gen_text = settled.text;
         if (settled.reply) |tool_reply| {
             const tool_calls = tool_reply.calls;
@@ -1856,7 +1862,7 @@ fn handleAnthropicStreaming(
             defer allocator.free(usage);
             const md = try std.fmt.allocPrint(allocator,
                 \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}{s}}},"usage":{s}}}
-            , .{ stop_reason, stop_seq_json, reply_mod.thoughtDetailsField("stop_details", ts.finish_details), usage });
+            , .{ stop_reason, stop_seq_json, if (stop_details.len > 0) stop_details else reply_mod.thoughtDetailsField("stop_details", ts.finish_details), usage });
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }

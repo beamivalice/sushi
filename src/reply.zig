@@ -8,13 +8,13 @@ const server_state = @import("server_state.zig");
 const log = @import("log.zig");
 const stop_seq_mod = @import("stop_sequences.zig");
 const listed_tokens = @import("listed_tokens.zig");
+const http = @import("http.zig");
 
 /// Finish reason for a response whose generated text yielded tool calls.
 /// A TRUNCATED generation ("length": max_tokens or the request timeout) must
 /// keep reporting "length" even when calls the model finished before the cut
 /// are in the reply — clients key their truncation recovery on it. Overriding
-/// to "tool_calls" hides the cut (an open call is declined, `settle`, so the
-/// client learns the model was stopped mid-call only from "length").
+/// to "tool_calls" hides the cut (an open call is declined and named by `settle`).
 pub fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
     return if (std.mem.eql(u8, pre_parse, "length")) "length" else "tool_calls";
 }
@@ -101,9 +101,37 @@ pub const Origin = struct {
     dialect: ?tool_calls_mod.Dialect,
     /// The prompt ended inside a think block (`promptOpensThink`): text with no closer is reasoning.
     opens_think: bool = false,
-    /// A stop sequence, the length cap or a cancel ended the generation, not the model: markup it left open is no call.
-    cut: bool = false,
 };
+
+/// `finish_details.type` (Anthropic `stop_details`, the Responses `finish_details`) of a reply that declined a call.
+pub const tool_call_cut = "tool_call_cut";
+
+/// A tool call the generation left open. It is no call, and the reply names it.
+pub const Declined = struct {
+    /// The tool the parser read from the markup; null when the markup stopped before the name.
+    name: ?[]u8,
+
+    pub fn deinit(self: Declined, allocator: std.mem.Allocator) void {
+        if (self.name) |n| allocator.free(n);
+    }
+};
+
+/// The details object that names a declined call, owned.
+pub fn declinedObject(allocator: std.mem.Allocator, d: Declined) ![]u8 {
+    const name = d.name orelse return allocator.dupe(u8, "{\"type\":\"" ++ tool_call_cut ++ "\"}");
+    const escaped = try http.jsonEscape(allocator, name);
+    defer allocator.free(escaped);
+    return std.fmt.allocPrint(allocator, "{{\"type\":\"" ++ tool_call_cut ++ "\",\"name\":{s}}}", .{escaped});
+}
+
+/// The details field named `key` of a finish, with its leading comma, owned: the declined call when the reply declined
+/// one (it outranks a thought's note, which asks nothing of the client), else a copy of `otherwise`, the surface's own.
+pub fn detailsField(allocator: std.mem.Allocator, comptime key: []const u8, declined: ?Declined, otherwise: []const u8) ![]u8 {
+    const d = declined orelse return allocator.dupe(u8, otherwise);
+    const object = try declinedObject(allocator, d);
+    defer allocator.free(object);
+    return std.fmt.allocPrint(allocator, ",\"" ++ key ++ "\":{s}", .{object});
+}
 
 /// A reply that holds calls: the text before them and the calls, as every surface lists them.
 pub const ToolReply = struct {
@@ -161,16 +189,20 @@ pub const Settled = struct {
     /// "stop" when a stop ended it, else the generation's own; a surface maps it with `toolCallFinishReason` when `reply` holds calls.
     finish_reason: []const u8,
     reply: ?ToolReply,
+    /// The call the generation left open, whatever ended it.
+    declined: ?Declined,
     normalized: ?[]u8,
 
     pub fn deinit(self: Settled, allocator: std.mem.Allocator) void {
         if (self.reply) |r| r.deinit(allocator);
+        if (self.declined) |d| d.deinit(allocator);
         if (self.normalized) |n| allocator.free(n);
     }
 };
 
 /// The one end handling of a reply: the stop that ended the generation, the text it leaves, the calls that text
-/// holds and the finish a stop leaves. A call a stop, the length cap or a cancel left open is not a call (`parseToolCallsForRequest`).
+/// holds and the finish a stop leaves. A call left open, by whatever ended the generation, is not a call and is named
+/// (`Settled.declined`).
 pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
     const cut = stop_seq_mod.cut(gen.text, ask.stops, gen.source);
     var out: Settled = .{
@@ -178,6 +210,7 @@ pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
         .stop = cut.stop,
         .finish_reason = if (cut.stop != null) "stop" else gen.finish_reason,
         .reply = null,
+        .declined = null,
         .normalized = null,
     };
     errdefer out.deinit(allocator);
@@ -186,11 +219,25 @@ pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
         if (out.normalized) |n| out.text = n;
     }
     if (ask.has_tools and shouldParseToolCalls(gen.finish_details)) {
-        // The model's own end is the stop finish; any other (length, cancelled) cut it short.
-        const model_ended = cut.stop == null and std.mem.eql(u8, gen.finish_reason, "stop");
-        out.reply = try toolReply(allocator, out.text, ask.tools_json, ask.allow_parallel, .{ .dialect = ask.dialect, .opens_think = ask.opens_think, .cut = !model_ended });
+        const origin: Origin = .{ .dialect = ask.dialect, .opens_think = ask.opens_think };
+        out.reply = try toolReply(allocator, out.text, ask.tools_json, ask.allow_parallel, origin);
+        out.declined = try declinedCall(allocator, out.text, origin);
     }
     return out;
+}
+
+/// The call `text` leaves open, named as far as its markup went, or null when it leaves none.
+fn declinedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin) !?Declined {
+    const open = think_tags.openToolCallStart(text) orelse return null;
+    const calls = (try tool_calls_mod.parseToolCallsAs(allocator, text[open..], origin.dialect)) orelse return .{ .name = null };
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    return .{ .name = try allocator.dupe(u8, calls[0].name) };
 }
 
 /// The ONE tool-call extraction path for every HTTP surface: parse, fall back to
@@ -212,12 +259,13 @@ pub fn parseToolCallsForRequest(
     allow_parallel: bool,
     origin: Origin,
 ) !?[]tool_schema.ParsedToolCall {
-    // An unfinished call is never shipped, whatever ended the generation: the calls the model finished before it stay.
+    // An unfinished call is never shipped, whatever ended the generation (the model's own end included): the calls the
+    // model finished before it stay, and `declinedCall` names the one left open.
     var body = text;
-    if (origin.cut) if (think_tags.openToolCallStart(text)) |open| {
+    if (think_tags.openToolCallStart(text)) |open| {
         tool_schema.noteUnparsedToolMarkup(text);
         body = text[0..open];
-    };
+    }
     return tool_schema.parseForRequest(allocator, body, tools_json, .{
         .allow_parallel = allow_parallel,
         .autocorrect = server_state.g_tool_autocorrect,
@@ -637,7 +685,7 @@ test "a call inside a thought the prompt opened and the model never closed is a 
     }
 }
 
-test "a generation cut inside a call (a stop, the length cap, a cancel) leaves no call, in every dialect" {
+test "a generation that ended inside a call (the model's own end, a stop, the length cap, a cancel) leaves no call, in every dialect" {
     const cut = [_][]const u8{
         "Plan.\n</think>\n\n<tool_call>\n<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\nline one\n",
         "Plan.</think><tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>line one\n",
@@ -646,10 +694,12 @@ test "a generation cut inside a call (a stop, the length cap, a cancel) leaves n
         "<|tool_call>call:write_file{path:<|\"|>notes.md<|\"|>,content:<|\"|>line one\n",
     };
     for (cut) |text| {
-        try expectCalls(text, .{ .dialect = null, .cut = true }, 0);
-        // The model's own end inside a call keeps the salvage it had.
-        errdefer std.debug.print("salvage changed for {f}\n", .{std.zig.fmtString(text)});
-        try expectCalls(text, .{ .dialect = null }, 1);
+        try expectCalls(text, .{ .dialect = null }, 0);
+        // The call it left open is named by its markup, in each dialect.
+        const left = (try declinedCall(testing.allocator, text, .{ .dialect = null })) orelse return error.DeclineNotNamed;
+        defer left.deinit(testing.allocator);
+        errdefer std.debug.print("declined {?s} for {f}\n", .{ left.name, std.zig.fmtString(text) });
+        try testing.expectEqualStrings("write_file", left.name orelse return error.DeclineNotNamed);
     }
 }
 
@@ -660,7 +710,7 @@ test "a cut after a call closed leaves the call" {
         "<|tool_call>call:get_weather{city:<|\"|>Tokyo<|\"|>}<tool_call|>",
         "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     };
-    for (whole) |text| try expectCalls(text, .{ .dialect = null, .cut = true }, 1);
+    for (whole) |text| try expectCalls(text, .{ .dialect = null }, 1);
 }
 
 test "a call the model finished before a cut stays and the open one after it is declined, in every dialect" {
@@ -674,7 +724,7 @@ test "a call the model finished before a cut stays and the open one after it is 
     for (pairs) |p| {
         const text = try std.mem.concat(testing.allocator, u8, &.{ p.done, "\n", p.open });
         defer testing.allocator.free(text);
-        const calls = (try parseToolCallsForRequest(testing.allocator, text, test_tools, true, .{ .dialect = null, .cut = true })) orelse return error.FinishedCallDropped;
+        const calls = (try parseToolCallsForRequest(testing.allocator, text, test_tools, true, .{ .dialect = null })) orelse return error.FinishedCallDropped;
         defer {
             for (calls) |c| {
                 testing.allocator.free(c.name);
@@ -688,9 +738,13 @@ test "a call the model finished before a cut stays and the open one after it is 
     }
 }
 
+/// What a reply says of the call its generation left open.
+const Cut = union(enum) { none, named: []const u8, unnamed };
+
 /// One generated text as a stream hands it to a surface (its gate delivers the text and reports the match) and as a
 /// non-stream reply does (the whole text, the stop still in it), settled under the same ask.
-fn expectSameEnd(allocator: std.mem.Allocator, generated: []const u8, stops: []const []const u8, gen_finish: []const u8, ask: Ask, want_stop: ?[]const u8, want_finish: []const u8, want_calls: ?usize) !void {
+fn expectSameEnd(allocator: std.mem.Allocator, generated: []const u8, stops: []const []const u8, gen_finish: []const u8, ask: Ask, want_stop: ?[]const u8, want_finish: []const u8, want_calls: ?usize, want_cut: Cut) !void {
+    errdefer std.debug.print("generation ending {s}: {f}\n", .{ gen_finish, std.zig.fmtString(generated) });
     var frags = std.ArrayList([]const u8).empty;
     defer frags.deinit(allocator);
     var at: usize = 0;
@@ -709,6 +763,21 @@ fn expectSameEnd(allocator: std.mem.Allocator, generated: []const u8, stops: []c
         if (want_stop) |w| try testing.expectEqualStrings(w, got.stop.?) else try testing.expect(got.stop == null);
         try testing.expectEqualStrings(want_finish, got.finish_reason);
         try testing.expectEqual(want_calls, if (got.reply) |r| @as(?usize, r.calls.len) else null);
+        switch (want_cut) {
+            .none => try testing.expect(got.declined == null),
+            .named => |n| try testing.expectEqualStrings(n, (got.declined orelse return error.DeclineNotNamed).name orelse return error.DeclineNotNamed),
+            .unnamed => try testing.expect((got.declined orelse return error.DeclineNotNamed).name == null),
+        }
+    }
+    try testing.expectEqual(streamed.declined == null, whole.declined == null);
+    if (streamed.declined) |s| {
+        const sn = s.name orelse "";
+        try testing.expectEqualStrings(sn, whole.declined.?.name orelse "");
+        const a_obj = try declinedObject(allocator, s);
+        defer allocator.free(a_obj);
+        const b_obj = try declinedObject(allocator, whole.declined.?);
+        defer allocator.free(b_obj);
+        try testing.expectEqualStrings(a_obj, b_obj);
     }
     try testing.expectEqualStrings(streamed.text, whole.text);
     if (streamed.reply) |s| {
@@ -818,20 +887,25 @@ test "a stream and a non-stream reply end the same: a stop in a call, a stop aft
         .{ .stops = &stops, .normalize = false, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false },
         .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = true },
     };
+    const named: Cut = .{ .named = "get_weather" };
     for (asks) |ask| {
         // A stop cut the call open: no call. (A stream's gate never holds the stop; the text it cut ends in the open call.)
-        try expectSameEnd(a, open ++ "STOP and more", &stops, "length", ask, "STOP", "stop", null);
-        // A stop after a closed call: the call stays.
-        try expectSameEnd(a, call ++ "\nSTOP and more", &stops, "length", ask, "STOP", "stop", 1);
-        // No stop: a length end and a cancel inside an open call decline it as a stop does, on both paths, and say why.
-        try expectSameEnd(a, open, &stops, "length", ask, null, "length", null);
-        try expectSameEnd(a, open, &stops, "cancelled", ask, null, "cancelled", null);
+        try expectSameEnd(a, open ++ "STOP and more", &stops, "length", ask, "STOP", "stop", null, named);
+        // A stop after a closed call: the call stays, and nothing was declined.
+        try expectSameEnd(a, call ++ "\nSTOP and more", &stops, "length", ask, "STOP", "stop", 1, .none);
+        // No stop: the model's own end, a length end and a cancel inside an open call decline it alike, on both paths,
+        // and name it; the finish stays the end's own.
+        try expectSameEnd(a, open, &stops, "stop", ask, null, "stop", null, named);
+        try expectSameEnd(a, open, &stops, "length", ask, null, "length", null, named);
+        try expectSameEnd(a, open, &stops, "cancelled", ask, null, "cancelled", null, named);
+        // A call whose name the markup never reached is declined unnamed.
+        try expectSameEnd(a, "Let me check.\n<tool_call>\n<function=", &stops, "stop", ask, null, "stop", null, .unnamed);
         // A call the model finished before the end ships as it is, however the end came; only the open one is declined.
-        for ([_][]const u8{ "length", "cancelled" }) |finish| {
-            try expectSameEnd(a, call, &stops, finish, ask, null, finish, 1);
-            try expectSameEnd(a, call ++ "\n" ++ open, &stops, finish, ask, null, finish, 1);
+        for ([_][]const u8{ "stop", "length", "cancelled" }) |finish| {
+            try expectSameEnd(a, call, &stops, finish, ask, null, finish, 1, .none);
+            try expectSameEnd(a, call ++ "\n" ++ open, &stops, finish, ask, null, finish, 1, named);
         }
-        try expectSameEnd(a, call ++ "\n" ++ open ++ "STOP and more", &stops, "length", ask, "STOP", "stop", 1);
+        try expectSameEnd(a, call ++ "\n" ++ open ++ "STOP and more", &stops, "length", ask, "STOP", "stop", 1, named);
         // Logprobs list the text returned: a stop's own tokens, and a thought the reply does not ship, are never listed.
         try expectSameListing(a, "an answer that runs on STOP and more", 5, &stops, ask);
         try expectSameListing(a, "<think>a thought the cap cut off", 5, &stops, ask);
@@ -842,6 +916,24 @@ test "a stream and a non-stream reply end the same: a stop in a call, a stop aft
         // A stop prefix one token holds is not listed while a later token releases the text before it.
         try expectSameListing(a, "ab STXQ more", 1, &.{ "STOP", "TXQ" }, ask);
     }
+}
+
+test "a declined call is named in the details field of every surface's key, and outranks a thought's note" {
+    const a = testing.allocator;
+    const named: Declined = .{ .name = try a.dupe(u8, "read\"file") };
+    defer named.deinit(a);
+    const unnamed: Declined = .{ .name = null };
+    const note = thoughtDetailsField("stop_details", thought_continued);
+    const got = try detailsField(a, "stop_details", named, note);
+    defer a.free(got);
+    try testing.expectEqualStrings(",\"stop_details\":{\"type\":\"tool_call_cut\",\"name\":\"read\\\"file\"}", got);
+    const bare = try detailsField(a, "finish_details", unnamed, "");
+    defer a.free(bare);
+    try testing.expectEqualStrings(",\"finish_details\":{\"type\":\"tool_call_cut\"}", bare);
+    // No decline: the surface's own field, byte for byte.
+    const own = try detailsField(a, "stop_details", null, note);
+    defer a.free(own);
+    try testing.expectEqualStrings(note, own);
 }
 
 test "a reply holds only its thought when it has no visible text and no call, its thought open or closed" {

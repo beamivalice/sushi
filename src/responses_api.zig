@@ -948,6 +948,7 @@ fn handleResponsesInner(
             false,
             false,
             null,
+            null,
             response_echo,
             0,
             0,
@@ -1456,6 +1457,7 @@ fn handleResponsesInner(
         is_incomplete,
         is_completed_status,
         result.finish_details,
+        ended.declined,
         response_echo,
         result.prefill_ns,
         result.decode_ns,
@@ -1704,6 +1706,8 @@ fn buildResponsesEnvelope(
     completed: bool,
     /// What became of a turn that ended inside its thought (`reply.thoughtDetailsField`); null = nothing to say.
     finish_details: ?[]const u8,
+    /// A call the reply declined: named in `finish_details` before a thought's note (`reply.detailsField`).
+    declined: ?reply_mod.Declined,
     echo: ResponseEcho,
     /// Iteration 1: timings extension. The Responses spec doesn't model
     /// per-stage timings, so we attach a sibling `timings` block at the
@@ -1741,7 +1745,9 @@ fn buildResponsesEnvelope(
     } else {
         try buf.appendSlice(allocator, ",\"incomplete_details\":null");
     }
-    try buf.appendSlice(allocator, reply_mod.thoughtDetailsField("finish_details", finish_details));
+    const details_field = try reply_mod.detailsField(allocator, "finish_details", declined, reply_mod.thoughtDetailsField("finish_details", finish_details));
+    defer allocator.free(details_field);
+    try buf.appendSlice(allocator, details_field);
 
     try buf.appendSlice(allocator, ",\"model\":");
     try buf.appendSlice(allocator, esc_model);
@@ -2484,5 +2490,31 @@ test "a text.format chain through previous_response_id carries one JSON instruct
         const p2 = try renderQwenForResponsesTest(a, m2);
         defer a.free(p2);
         try testing.expect(std.mem.startsWith(u8, p2, p1[0..std.mem.lastIndexOf(u8, p1, "<|im_start|>assistant").?]));
+    }
+}
+
+test "a Responses envelope names the call a reply declined, ahead of a thought's note, and says nothing when none was" {
+    const a = testing.allocator;
+    const named: reply_mod.Declined = .{ .name = try a.dupe(u8, "read_file") };
+    defer named.deinit(a);
+    const Case = struct { details: ?[]const u8, declined: ?reply_mod.Declined, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .details = null, .declined = null, .want = null },
+        .{ .details = reply_mod.thought_continued, .declined = null, .want = "continued_after_thought" },
+        .{ .details = null, .declined = named, .want = "tool_call_cut" },
+        .{ .details = reply_mod.thought_continued, .declined = named, .want = "tool_call_cut" },
+    };
+    for (cases) |c| {
+        const envelope = try buildResponsesEnvelope(testing.io, a, "\"resp_1\"", "\"m\"", "completed", "[]", 1, 1, 0, 0, false, null, false, true, c.details, c.declined, .{}, 0, 0, 0, 0);
+        defer a.free(envelope);
+        errdefer std.debug.print("envelope: {s}\n", .{envelope});
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, envelope, .{});
+        defer parsed.deinit();
+        const details = parsed.value.object.get("finish_details") orelse {
+            try testing.expect(c.want == null);
+            continue;
+        };
+        try testing.expectEqualStrings(c.want.?, details.object.get("type").?.string);
+        if (c.declined != null) try testing.expectEqualStrings("read_file", details.object.get("name").?.string);
     }
 }

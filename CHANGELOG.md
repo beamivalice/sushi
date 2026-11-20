@@ -16,6 +16,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Two settings saves at once can no longer land a pair of model settings one of them is refused for**: a model's
   edits are checked against the file each save rewrites.
 - **A download whose files are all present is never refused for disk space**, however full the disk already is.
+- **A tool call the model's own end leaves open is no longer sent as a half call, and every reply that declines a call names it**: `finish_details` (`stop_details` on Messages, the response object on Responses) reads `{"type":"tool_call_cut","name":"read_file"}` when a stop sequence, the length limit, a cancel or the model's end cut a call open.
 
 ## v1.7.2 — Memory you can count on, faster concurrent Qwen
 

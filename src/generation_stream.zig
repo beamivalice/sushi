@@ -920,6 +920,8 @@ pub fn handleNonStreamingGeneration(
             const tc_usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, tc_details);
             defer allocator.free(tc_usage_obj);
 
+            const tc_finish_details = try reply_mod.detailsField(allocator, "finish_details", settled.declined, finishDetailsField(toolCallFinishReason(finish_reason), result.finish_details));
+            defer allocator.free(tc_finish_details);
             // finish_reason always carries finish_details beside it.
             const response = try std.fmt.allocPrint(allocator,
                 \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
@@ -932,7 +934,7 @@ pub fn handleNonStreamingGeneration(
                 tc_buf.items,
                 tc_logprobs_json,
                 toolCallFinishReason(finish_reason),
-                finishDetailsField(toolCallFinishReason(finish_reason), result.finish_details),
+                tc_finish_details,
                 tc_usage_obj,
                 tc_timings_field,
             });
@@ -997,6 +999,8 @@ pub fn handleNonStreamingGeneration(
     const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, usage_details_json);
     defer allocator.free(usage_obj);
 
+    const finish_details = try reply_mod.detailsField(allocator, "finish_details", settled.declined, finishDetailsField(finish_reason, result.finish_details));
+    defer allocator.free(finish_details);
     // finish_reason always carries finish_details beside it.
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
@@ -1008,7 +1012,7 @@ pub fn handleNonStreamingGeneration(
         reasoning_json,
         logprobs_json,
         finish_reason,
-        finishDetailsField(finish_reason, result.finish_details),
+        finish_details,
         usage_obj,
         timings_field,
     });
@@ -1589,6 +1593,9 @@ pub fn handleStreamingGeneration(
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
     const gated_stream = has_tools;
+    // The `finish_details` field naming a call the reply declined, set where the end is settled.
+    var declined_field: []const u8 = "";
+    defer allocator.free(declined_field);
     // Constrained requests route through the protocol, not the response-side
     // close scan. The stream seeds the think arm while the payload has not
     // begun (a generated opener must strip, not leak), and flips straight to
@@ -2048,6 +2055,7 @@ pub fn handleStreamingGeneration(
             .opens_think = opens_think and !think_closed,
         });
         defer settled.deinit(allocator);
+        declined_field = try reply_mod.detailsField(allocator, "finish_details", settled.declined, "");
         const gen_text = settled.text;
         if (settled.reply) |tool_reply| {
             const tool_calls = tool_reply.calls;
@@ -2126,7 +2134,7 @@ pub fn handleStreamingGeneration(
     const total_prompt = ts.prompt_tokens;
     if (!client_gone) {
         // Final chunk with finish_reason
-        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish_reason, .details = ts.finish_details }, null, null, .{ .logprobs_json = try lps.takeLate() });
+        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish_reason, .details = ts.finish_details, .declined_field = if (declined_field.len > 0) declined_field else null }, null, null, .{ .logprobs_json = try lps.takeLate() });
 
         // Usage chunk (if requested via stream_options.include_usage). Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
@@ -2180,6 +2188,8 @@ const ChunkExtras = struct {
 const Finish = struct {
     reason: []const u8,
     details: ?[]const u8 = null,
+    /// The `finish_details` field naming a call the reply declined (`reply.detailsField`); it outranks `details`.
+    declined_field: ?[]const u8 = null,
 };
 
 /// A reasoning delta, led by the blank line that joins a later thought to an earlier one (`ThoughtJoin`).
@@ -2254,7 +2264,7 @@ fn sendSSEChunk(
         std.fmt.bufPrint(&fr_buf, "\"{s}\"", .{f.reason}) catch "null"
     else
         "null";
-    const fd_str = if (finish) |f| finishDetailsField(f.reason, f.details) else "";
+    const fd_str = if (finish) |f| (f.declined_field orelse finishDetailsField(f.reason, f.details)) else "";
 
     // `logprobs` is a sibling of `delta` on the choice, not a field inside it.
     // Emitted only when the request asked; OpenAI's own chunk shape carries
@@ -3335,6 +3345,40 @@ fn answerOf(id: []const u8, err: anyerror, report: *const scheduler_mod.LoadRepo
         got += @intCast(n);
     }
     return out[0..got];
+}
+
+test "a stream's final chunk names the call its reply declined, ahead of a thought's note" {
+    const a = std.testing.allocator;
+    const named: reply_mod.Declined = .{ .name = try a.dupe(u8, "read_file") };
+    defer named.deinit(a);
+    const field = try reply_mod.detailsField(a, "finish_details", named, "");
+    defer a.free(field);
+    const Case = struct { finish: Finish, want: []const u8 };
+    const cases = [_]Case{
+        .{ .finish = .{ .reason = "stop" }, .want = "\"finish_reason\":\"stop\"}" },
+        .{ .finish = .{ .reason = "stop", .details = reply_mod.thought_continued }, .want = "\"finish_details\":{\"type\":\"continued_after_thought\"" },
+        .{ .finish = .{ .reason = "length", .declined_field = field }, .want = "\"finish_reason\":\"length\",\"finish_details\":{\"type\":\"tool_call_cut\",\"name\":\"read_file\"}" },
+        .{ .finish = .{ .reason = "stop", .details = reply_mod.thought_continued, .declined_field = field }, .want = "\"finish_reason\":\"stop\",\"finish_details\":{\"type\":\"tool_call_cut\",\"name\":\"read_file\"}" },
+    };
+    for (cases) |c| {
+        var sv: [2]std.posix.fd_t = undefined;
+        try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+        defer _ = std.c.close(sv[1]);
+        var conn: Conn = undefined;
+        Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, std.testing.io);
+        try sendSSEChunk(a, &conn, 1, "m", .{ .role = null, .content = null }, c.finish, null, null, .{ .logprobs_json = null });
+        _ = std.posix.system.shutdown(sv[1], std.posix.SHUT.WR);
+        conn.close();
+        var buf: [4096]u8 = undefined;
+        var got: usize = 0;
+        while (got < buf.len) {
+            const n = std.c.recv(sv[1], buf[got..].ptr, buf.len - got, 0);
+            if (n <= 0) break;
+            got += @intCast(n);
+        }
+        errdefer std.debug.print("chunk: {s}\n", .{buf[0..got]});
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..got], c.want) != null);
+    }
 }
 
 test "a files read that ran out of memory is answered with its own refusal, not an earlier load's context figures" {

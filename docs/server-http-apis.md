@@ -195,6 +195,11 @@ answers while the weights load:
   the whole decoded text holds it too, so the answer bytes stay `earliest`'s and generation ends within one token.
   The cancelled slot is quiesced (`Scheduler.quiesce`, waits out `in_pass`) BEFORE its statistics are read, and usage
   counts the tokens returned, not the ones a speculative block decoded past the stop (a stream: `finalizeStopped`).
+- **Every end names a tool call it declined**: a generation that ends inside a tool call (a stop sequence, `length`,
+  a cancel, the model's own end) ships no call for it, and the finish carries `{"type":"tool_call_cut","name":"<tool>"}`
+  beside the finish reason: `finish_details` on chat (the final chunk of a stream; legacy completions take no tools),
+  `stop_details` on `/v1/messages` (the `message_delta` of a stream), `finish_details` on the Responses object, the
+  same bytes streamed or not ([server-tool-calling](server-tool-calling.md#the-pipeline)).
 - **A terminal envelope comes from the terminator the reader got, never from slot fields only some end paths set**:
   a slot the cancel API ended answers `.cancelled` (`Slot.waitNext`), and every surface quiesces it, says cancelled
   (chat and completions `cancelled`, Messages `end_turn`, Responses `completed`) and counts the tokens it returned.

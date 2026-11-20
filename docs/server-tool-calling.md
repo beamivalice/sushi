@@ -18,10 +18,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **A call is a call wherever the generation puts it, on every surface** (`reply.toolReply`, `reply.Origin`): one the
   model wrote inside a prompt-opened thought it never closed ships, its markup cut out of `reasoning_content`
   (`splitThinkBlock`), since dropping it turns an agent turn into a bare `stop`; a call inside a thought that closed
-  stays skipped. A generation cut inside a call (`think_tags.openToolCallStart`: the last opener has no
-  closer) by a stop sequence, the length cap or a cancel leaves that call out and the finish says why (`stop`, `length`,
-  `cancelled`; Anthropic's `stop_sequence` stays set), as a loop cut does; a call the model finished before the cut
-  ships as it is. Only the model's own end (EOS) inside a call keeps the name-and-`{}` salvage below. The stop is read once, by `reply.settle` (`stop_sequences.cut`): a stream's reply carries
+  stays skipped. A call a generation leaves open (`think_tags.openToolCallStart`: the last opener has no
+  closer) is declined however the generation ended (a stop sequence, the length cap, a cancel, the model's own end) and
+  the reply NAMES it: `finish_details` (`stop_details` on `/v1/messages`, the response object's `finish_details` on
+  Responses) is `{"type":"tool_call_cut","name":"<tool>"}`, `name` left out when the markup stopped before it
+  (`Settled.declined`, `reply.detailsField`; the name is the parser's salvage of the open tail). It outranks a thought's
+  note in that slot, and the finish stays the end's own (`stop`, `length`, `cancelled`; Anthropic's `stop_sequence`
+  stays set); a loop cut names its own cause and parses no call. A call the model finished before the end ships as it
+  is. Dialects the opener list does not hold (MiniCPM5 `<function name=`, a bare `<function=`) still ship their
+  salvage at the model's own end. The stop is read once, by `reply.settle` (`stop_sequences.cut`): a stream's reply carries
   its gate's match (`GenerationResult.stop_source`), never a stop searched for again in text the gate already cut. Lint
   `reply-bypass`: a surface never calls the raw `parseToolCalls`.
 - Template input `chat.templateMessages`: role "tool" native, a call's `arguments` the client's JSON object (`{}` for
@@ -262,7 +267,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **Framing is removed only where the family writes it**: a newline-framed `<function=>` body (Qwen3.8) loses one
   newline per value side, an unframed one (MiMo) keeps the value verbatim, so a written file keeps its last newline.
 - **A JSON call cut INSIDE the object still names its tool** (`truncatedJsonCallName`): recover NAME + `{}`, NEVER ship
-  partial values, never ship raw markup as content. Model-mangled arg JSON → `looseRepairToolCallJson`, never drop
+  partial values, never ship raw markup as content. A call the end left open is not shipped; this salvage names it. Model-mangled arg JSON → `looseRepairToolCallJson`, never drop
   the whole call. A tag parser never bails on ONE missing delimiter.
 - **Claude's `<function_calls><invoke name=…><parameter name=…>` is a call** when no other family matched
   (`BARE_INVOKE`; qwen4_exp writes it after Claude transcripts). It is
