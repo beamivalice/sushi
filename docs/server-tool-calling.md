@@ -287,7 +287,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## tool_choice
 
 - **One parser, every wire shape** (`tool_calls.parseToolChoice`): chat nests the name under `function`, Responses and
-  Anthropic carry it flat, Anthropic spells required `any`; anything else is `auto`, which is unchanged.
+  Anthropic carry it flat, Anthropic spells required `any`. A Responses string other than auto, none or required, a Responses object that is not a function and an Anthropic `tool_choice` that is not an object typed auto, any, tool or none (`tool` naming a function) is a 400 by name (`request_parse.responsesToolChoiceFault`, `anthropicToolFault`), never read as `auto`; chat reads any object as before. A Messages `tool_result` flagged `is_error` reaches the prompt as `Error: ` before its text (`markToolError`).
 - **`none` withholds the tools, skips the parser, and on chat completions bans the call opener**: a model that sees
   earlier calls in the history writes one anyway, as raw text in the answer. `server.noneCallBan` adds a -100 bias on
   the template's opener tag (`chat.callOpener`, `<tool_call>` on all three families) when it is one token, and leaves

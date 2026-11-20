@@ -435,6 +435,79 @@ pub fn generationFieldFault(buf: []u8, root: std.json.ObjectMap, keys: Generatio
     return null;
 }
 
+/// Responses `tool_choice`: auto, none, required or a function (`{"type":"function","name":...}`); null is absent.
+pub fn responsesToolChoiceFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
+    const tc = root.get("tool_choice") orelse return null;
+    switch (tc) {
+        .null => return null,
+        .string => |s| {
+            const ok = std.mem.eql(u8, s, "auto") or std.mem.eql(u8, s, "none") or std.mem.eql(u8, s, "required");
+            if (ok) return null;
+            return fieldFault(buf, "'tool_choice' must be auto, none, required or a function object; got \"{s}\"", .{s[0..@min(s.len, 32)]});
+        },
+        .object => |o| {
+            const t = o.get("type") orelse return "'tool_choice.type' is required: this server calls function tools only, so it is function";
+            if (t != .string or !std.mem.eql(u8, t.string, "function")) return "'tool_choice.type' must be function: this server calls function tools only";
+            const holder = if (o.get("function")) |f| (if (f == .object) f.object else o) else o;
+            const name = holder.get("name") orelse return "'tool_choice.name' is required: the function the model must call";
+            if (name != .string or name.string.len == 0) return "'tool_choice.name' must be the name of a declared function";
+            return null;
+        },
+        else => return "'tool_choice' must be auto, none, required or a function object",
+    }
+}
+
+/// Anthropic's `tool_choice` (an object typed auto, any, tool or none, `tool` naming a function) and each
+/// `tool_result.is_error` of the messages; null is absent.
+pub fn anthropicToolFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
+    if (root.get("tool_choice")) |tc| switch (tc) {
+        .null => {},
+        .object => |o| {
+            const t = o.get("type") orelse return "'tool_choice.type' is required: auto, any, tool or none";
+            if (t != .string) return "'tool_choice.type' must be auto, any, tool or none";
+            if (std.mem.eql(u8, t.string, "tool")) {
+                const name = o.get("name") orelse return "'tool_choice.name' is required when 'tool_choice.type' is tool";
+                if (name != .string or name.string.len == 0) return "'tool_choice.name' must be the name of a declared tool";
+            } else if (!std.mem.eql(u8, t.string, "auto") and !std.mem.eql(u8, t.string, "any") and !std.mem.eql(u8, t.string, "none")) {
+                return "'tool_choice.type' must be auto, any, tool or none";
+            }
+            if (o.get("disable_parallel_tool_use")) |d| if (d != .null and d != .bool) {
+                return "'tool_choice.disable_parallel_tool_use' must be true or false";
+            };
+        },
+        else => return "'tool_choice' must be an object typed auto, any, tool or none",
+    };
+    const messages = root.get("messages") orelse return null;
+    if (messages != .array) return null;
+    for (messages.array.items, 0..) |m, mi| {
+        if (m != .object) continue;
+        const content = m.object.get("content") orelse continue;
+        if (content != .array) continue;
+        for (content.array.items, 0..) |block, bi| {
+            if (block != .object) continue;
+            const flag = block.object.get("is_error") orelse continue;
+            if (flag != .null and flag != .bool) {
+                return fieldFault(buf, "'messages[{d}].content[{d}].is_error' must be true or false", .{ mi, bi });
+            }
+        }
+    }
+    return null;
+}
+
+/// Whether a `tool_result` block says its tool failed.
+pub fn toolResultIsError(block: std.json.ObjectMap) bool {
+    const v = block.get("is_error") orelse return false;
+    return v == .bool and v.bool;
+}
+
+/// `tool_choice.disable_parallel_tool_use`: at most one call per reply.
+pub fn disableParallelToolUse(root: std.json.ObjectMap) bool {
+    const tc = root.get("tool_choice") orelse return false;
+    if (tc != .object) return false;
+    const v = tc.object.get("disable_parallel_tool_use") orelse return false;
+    return v == .bool and v.bool;
+}
+
 /// Whether the request declares at least one tool: `tools` null or `[]` is no tools.
 pub fn toolsDeclared(root: std.json.ObjectMap) bool {
     const t = root.get("tools") orelse return false;
@@ -1121,4 +1194,82 @@ test "chatToolsJson reads the body's own top-level tools, whatever else names to
     const none = try parseSpelled(testing.allocator, "{\"messages\":[],\"tools\":[]}");
     defer none.deinit();
     try testing.expect((try chatToolsJson(testing.allocator, none.value.object)) == null);
+}
+
+test "responsesToolChoiceFault refuses a tool_choice this server cannot honour, by name" {
+    const Case = struct { body: []const u8, field: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .body = "{}", .field = null },
+        .{ .body = "{\"tool_choice\":null}", .field = null },
+        .{ .body = "{\"tool_choice\":\"auto\"}", .field = null },
+        .{ .body = "{\"tool_choice\":\"none\"}", .field = null },
+        .{ .body = "{\"tool_choice\":\"required\"}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":\"f\"}}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"f\"}}}", .field = null },
+        .{ .body = "{\"tool_choice\":\"bogus\"}", .field = "tool_choice" },
+        .{ .body = "{\"tool_choice\":\"any\"}", .field = "tool_choice" },
+        .{ .body = "{\"tool_choice\":5}", .field = "tool_choice" },
+        .{ .body = "{\"tool_choice\":true}", .field = "tool_choice" },
+        .{ .body = "{\"tool_choice\":[]}", .field = "tool_choice" },
+        .{ .body = "{\"tool_choice\":{}}", .field = "tool_choice.type" },
+        .{ .body = "{\"tool_choice\":{\"type\":5}}", .field = "tool_choice.type" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"allowed_tools\",\"mode\":\"auto\"}}", .field = "tool_choice.type" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"function\"}}", .field = "tool_choice.name" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":\"\"}}", .field = "tool_choice.name" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":7}}", .field = "tool_choice.name" },
+    };
+    for (cases) |c| try expectFault(responsesToolChoiceFault, c.body, c.field);
+}
+
+test "anthropicToolFault refuses a tool_choice type it does not serve and a tool_result flag that is no bool, by name" {
+    const Case = struct { body: []const u8, field: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .body = "{}", .field = null },
+        .{ .body = "{\"tool_choice\":null}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"auto\"}}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"any\",\"disable_parallel_tool_use\":true}}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"none\"}}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"tool\",\"name\":\"f\",\"disable_parallel_tool_use\":false}}", .field = null },
+        .{ .body = "{\"tool_choice\":\"auto\"}", .field = "tool_choice" },
+        .{ .body = "{\"tool_choice\":5}", .field = "tool_choice" },
+        .{ .body = "{\"tool_choice\":{}}", .field = "tool_choice.type" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"bogus\"}}", .field = "tool_choice.type" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":\"f\"}}", .field = "tool_choice.type" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"tool\"}}", .field = "tool_choice.name" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"tool\",\"name\":\"\"}}", .field = "tool_choice.name" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":\"yes\"}}", .field = "tool_choice.disable_parallel_tool_use" },
+        .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"x\",\"is_error\":true}]}]}", .field = null },
+        .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"x\",\"is_error\":null}]}]}", .field = null },
+        .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"x\",\"is_error\":\"yes\"}]}]}", .field = "messages[0].content[0].is_error" },
+    };
+    for (cases) |c| try expectFault(anthropicToolFault, c.body, c.field);
+}
+
+fn expectFault(check: *const fn ([]u8, std.json.ObjectMap) ?[]const u8, body: []const u8, field: ?[]const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    var buf: [256]u8 = undefined;
+    const got = check(&buf, parsed.value.object);
+    errdefer std.debug.print("\nbody: {s}\ngot: {?s}\n", .{ body, got });
+    if (field) |f| {
+        const quoted = try std.fmt.allocPrint(testing.allocator, "'{s}'", .{f});
+        defer testing.allocator.free(quoted);
+        try testing.expect(std.mem.indexOf(u8, got.?, quoted) != null);
+    } else try testing.expectEqual(@as(?[]const u8, null), got);
+}
+
+test "toolResultIsError reads the flag, and disableParallelToolUse the Anthropic parallel clamp" {
+    const Case = struct { body: []const u8, error_flag: bool, no_parallel: bool };
+    const cases = [_]Case{
+        .{ .body = "{}", .error_flag = false, .no_parallel = false },
+        .{ .body = "{\"is_error\":true,\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":true}}", .error_flag = true, .no_parallel = true },
+        .{ .body = "{\"is_error\":false,\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":false}}", .error_flag = false, .no_parallel = false },
+        .{ .body = "{\"is_error\":null,\"tool_choice\":{\"type\":\"auto\"}}", .error_flag = false, .no_parallel = false },
+    };
+    for (cases) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        try testing.expectEqual(c.error_flag, toolResultIsError(parsed.value.object));
+        try testing.expectEqual(c.no_parallel, disableParallelToolUse(parsed.value.object));
+    }
 }

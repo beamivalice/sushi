@@ -17,6 +17,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 
 - **A pack listed while its download was still running is billed at its full size once the download finishes**: its entry kept the partial byte count it was listed with, so the eviction gate and the resident bill under-counted it until the next restart; a finished download or a rescan now refreshes it.
 - **A prefix-cache clear no longer deletes the SSD root of a model that loads while it runs**: the clear's lock file lived inside the namespace it deleted, so a tier opening mid-delete took a fresh lock, then lost its root (two tiers could later own one); a clear and a tier opening now take a gate file beside the namespace.
+- **An unknown `tool_choice` is refused by name on Responses and Messages, and a Messages `tool_result` flagged `is_error` says so
+  in the prompt**: a Responses string or an Anthropic type the server does not serve was read as `auto`, and the error flag was
+  dropped before the model saw the result.
 - **Tool-call ids are unique across concurrent requests**: a chat, Messages or Responses call id came from the wall clock in
   milliseconds, so two replies finishing in one tick could share one; every surface now takes a random part and a counter.
 - **A null or zero token budget no longer hides its alias**: Responses `max_output_tokens: null` beside `max_tokens: 1` served the

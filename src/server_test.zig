@@ -1702,3 +1702,27 @@ test "server: h21 a null or zero token-budget field leaves the surface's alias i
         }
     }.run);
 }
+
+test "server: h21 a tool_choice the surface does not serve is refused by name, never read as auto" {
+    try eachArch(4, .{}, struct {
+        const Case = struct { path: []const u8, body: []const u8, field: []const u8 };
+        const tail = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
+        const cases = [_]Case{
+            .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"tool_choice\":\"bogus\",\"input\":\"hi\"}", .field = "'tool_choice'" },
+            .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"tool_choice\":{\"type\":\"allowed_tools\"},\"input\":\"hi\"}", .field = "'tool_choice.type'" },
+            .{ .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"tool_choice\":{\"type\":\"bogus\"}," ++ tail ++ "}", .field = "'tool_choice.type'" },
+            .{ .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"tool_choice\":{\"type\":\"tool\"}," ++ tail ++ "}", .field = "'tool_choice.name'" },
+            .{ .path = "/v1/messages/count_tokens", .body = "{\"model\":\"tiny\",\"tool_choice\":\"auto\"," ++ tail ++ "}", .field = "'tool_choice'" },
+        };
+        fn run() !void {
+            for (cases) |c| {
+                const resp = try request("POST", c.path, c.body);
+                defer gpa.free(resp);
+                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 400") or std.mem.indexOf(u8, bodyOf(resp), c.field) == null) {
+                    std.debug.print("tool_choice not refused by name: {s} {s}\n  -> {s}\n", .{ c.path, c.body, resp[0..@min(resp.len, 300)] });
+                    return error.ToolChoiceReadAsAuto;
+                }
+            }
+        }
+    }.run);
+}

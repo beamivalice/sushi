@@ -473,7 +473,7 @@ fn handleResponsesInner(
     defer spelled.deinit();
 
     var fault_buf: [384]u8 = undefined;
-    if (request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &request_parse.responses_max_tokens, .stop = null })) |reason| {
+    if (request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &request_parse.responses_max_tokens, .stop = null }) orelse request_parse.responsesToolChoiceFault(&fault_buf, root)) |reason| {
         log.warn("POST /v1/responses -> 400 ({s})\n", .{reason});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;

@@ -257,6 +257,23 @@ fn readAnthropicConversation(wire: *WireMessages, system: ?std.json.Value, items
     try readAnthropicMessages(wire, items, vp);
 }
 
+/// What a tool_result flagged `is_error` hands the prompt: its text opens with `Error: `, the one way a model
+/// tells a tool that failed from one that answered. Media placed in the result moves past the lead with its text.
+fn markToolError(wire: *WireMessages, result: *ReadContent) !void {
+    const lead = "Error: ";
+    const text = try std.mem.concat(wire.allocator, u8, &.{ lead, result.text });
+    errdefer wire.allocator.free(text);
+    try wire.texts.ensureUnusedCapacity(wire.allocator, 1);
+    if (result.media_parts) |parts| {
+        var moved: std.ArrayList(chat_mod.MediaPart) = .empty;
+        errdefer moved.deinit(wire.allocator);
+        for (parts) |p| try moved.append(wire.allocator, .{ .at = p.at + lead.len, .kind = p.kind });
+        result.media_parts = try wire.media.ownParts(&moved);
+    }
+    wire.texts.appendAssumeCapacity(text);
+    result.text = text;
+}
+
 /// Every message of a /v1/messages body. A user message's `tool_result`
 /// blocks become tool messages ahead of its own text, and every image — in a
 /// tool result or beside the text — is decoded and placed where it sat.
@@ -289,6 +306,7 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
                             .array => |result_arr| result = try readContentParts(allocator, &wire.media, &wire.texts, result_arr.items, .anthropic, pos, vp),
                             else => {},
                         };
+                        if (request_parse.toolResultIsError(block.object)) try markToolError(wire, &result);
                         try wire.push(.{
                             .role = "tool",
                             .content = result.text,
@@ -410,6 +428,40 @@ test "readAnthropicMessages: a tool_result image is the tool message's placed me
     try std.testing.expectEqualStrings("user", msgs[3].role);
     try std.testing.expectEqualStrings("describe it", msgs[3].content);
     try std.testing.expect(msgs[3].images == null);
+}
+
+test "readAnthropicMessages: a tool_result the client flags is_error reaches the prompt as an error" {
+    const parsed = try request_parse.parseSpelled(std.testing.allocator, "{\"messages\":[" ++
+        "{\"role\":\"user\",\"content\":\"run it\"}," ++
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"shell\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"shell\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"t3\",\"name\":\"shell\",\"input\":{}}]}," ++
+        "{\"role\":\"user\",\"content\":[" ++
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"is_error\":true,\"content\":\"no such file\"}," ++
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"t2\",\"is_error\":false,\"content\":\"fine\"}," ++
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"t3\",\"is_error\":true,\"content\":[{\"type\":\"text\",\"text\":\"a\"}]}" ++
+        "]}]}");
+    defer parsed.deinit();
+    var wire = WireMessages.init(std.testing.allocator);
+    defer wire.deinit();
+    try readAnthropicMessages(&wire, parsed.value.object.get("messages").?.array.items, .{});
+    const msgs = wire.messages.items;
+    try std.testing.expectEqual(@as(usize, 5), msgs.len);
+    try std.testing.expectEqualStrings("Error: no such file", msgs[2].content);
+    try std.testing.expectEqualStrings("fine", msgs[3].content);
+    try std.testing.expectEqualStrings("Error: a", msgs[4].content);
+}
+
+test "readAnthropicMessages: a tool_result flagged is_error keeps its media where it sat, past the error lead" {
+    var t = try testWire("{\"messages\":[" ++
+        "{\"role\":\"user\",\"content\":\"look\"}," ++
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t3\",\"name\":\"shell\",\"input\":{}}]}," ++
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t3\",\"is_error\":true,\"content\":[{\"type\":\"text\",\"text\":\"here\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"" ++ test_png_blue ++ "\"}}]}]}" ++
+        "]}", .anthropic);
+    defer t.parsed.deinit();
+    defer t.wire.deinit();
+    try std.testing.expect(t.wire.media.refusal() == null);
+    const msg = t.wire.messages.items[2];
+    try std.testing.expectEqualStrings("Error: here", msg.content);
+    try std.testing.expectEqualSlices(chat_mod.MediaPart, &.{.{ .at = 11, .kind = .image }}, msg.media_parts.?);
 }
 
 // ── Anthropic Messages API ──
@@ -750,6 +802,12 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
 
+    var fault_buf: [160]u8 = undefined;
+    if (request_parse.anthropicToolFault(&fault_buf, root)) |reason| {
+        log.warn("POST {s} -> 400 ({s})\n", .{ route.path(), reason });
+        try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+        return false;
+    }
     const messages_val = spelled.get("messages") orelse {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' is required", 400);
         return false;
@@ -777,14 +835,8 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
             // Convert Anthropic tools to OpenAI format for chat template
             p.tools_json = try buildOpenAIToolsJson(allocator, tools_val.array);
 
-            if (root.get("tool_choice")) |tc| {
-                if (tc == .object) {
-                    // Anthropic spelling of the parallel clamp.
-                    if (tc.object.get("disable_parallel_tool_use")) |d| {
-                        if (d == .bool and d.bool) p.allow_parallel_tools = false;
-                    }
-                }
-            }
+            // Anthropic spelling of the parallel clamp.
+            if (request_parse.disableParallelToolUse(root)) p.allow_parallel_tools = false;
             p.tool_choice = tool_calls_mod.parseToolChoice(root.get("tool_choice"));
             if (p.tool_choice == .none) p.has_tools = false;
             p.tool_choice_instruction = try p.tool_choice.instruction(allocator);
