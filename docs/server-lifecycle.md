@@ -115,6 +115,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
    before the context is pinned or the hooks are in.
    A headless boot (`--no-initial-load`) has no gate, so its accept thread starts only after the hooks are installed
    (`startAccepting`; guard `server: a headless boot starts accepting …`): a request never reaches admission without them.
+   `stopServing` fails the gate before it drains (a boot that stops before it opened, on any error exit after the hooks, wakes the
+   request parked there at once instead of holding the drain for `CONN_DRAIN_MS`; guard `server: a boot that stops before its gate opened …`).
 - **`serve` first raises the soft open-file limit** (`fd_limits.raiseOpenFileLimit`, before the listener and the SSD
   tier): to the hard limit, capped at `kern.maxfilesperproc`, never lower, as Go does since 1.19. One line says what it
   did: `[limits] open files: soft 256 -> 245760 (hard unlimited)`, `soft N, unchanged (hard H)`, or `raising it to N

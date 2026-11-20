@@ -827,16 +827,13 @@ pub fn serve(
     var accept_thread: ?std.Thread = null;
     var stopped = false;
     defer if (!stopped) {
-        drained = stopServing(&accept_thread);
+        drained = stopServing(io, &accept_thread);
     };
     // A `--model` boot accepts while its model loads: a request that got the model waits at `boot_gate` for the hooks
     // below. A headless boot has no gate and loads nothing, so it accepts once they are installed.
     if (boots_model) accept_thread = try startAccepting(allocator, io, &listener, host, load_params.entry.id);
 
-    scheduler.awaitStartupLoad() catch |err| {
-        boot_gate.process.fail(io);
-        return err;
-    };
+    try scheduler.awaitStartupLoad();
 
     // The inference thread's evict-or-refuse hook (#353); the scheduler has no server import.
     scheduler_mod.prefill_admission_fits = &prefillFitsNow;
@@ -1020,7 +1017,7 @@ pub fn serve(
         accept_thread = null;
     } else acceptLoop(allocator, io, null);
     stopped = true;
-    drained = stopServing(&accept_thread);
+    drained = stopServing(io, &accept_thread);
     if (!drained) return error.ConnectionsOutliveShutdown;
 
     log.info("\nShutting down gracefully...\n", .{});
@@ -1140,7 +1137,9 @@ const CONN_DRAIN_MS: u64 = 35_000;
 /// the teardown frees, so `serve` skips that teardown and returns
 /// `error.ConnectionsOutliveShutdown`, and its caller must free nothing it passed in.
 /// Idempotent; also the cleanup of a boot whose load failed with the listener up.
-fn stopServing(accept_thread: *?std.Thread) bool {
+fn stopServing(io: std.Io, accept_thread: *?std.Thread) bool {
+    // A request parked at the boot gate holds the drain below: a boot that stops before its gate opened fails it first.
+    if (!boot_gate.process.opened.isSet()) boot_gate.process.fail(io);
     requestShutdown();
     downloads.stop();
     if (accept_thread.*) |t| {

@@ -19,6 +19,8 @@ pub fn healthFor(phase: Phase) Health {
 pub const Gate = struct {
     phase: std.atomic.Value(Phase) = .init(.ready),
     opened: std.Io.Event = .is_set,
+    /// Requests parked in `waitOpen`.
+    waiting: std.atomic.Value(u32) = .init(0),
 
     /// Before the listener accepts: nothing waits on the gate yet.
     pub fn begin(self: *Gate) void {
@@ -38,6 +40,8 @@ pub const Gate = struct {
     }
 
     pub fn waitOpen(self: *Gate, io: std.Io) void {
+        _ = self.waiting.fetchAdd(1, .acq_rel);
+        defer _ = self.waiting.fetchSub(1, .acq_rel);
         self.opened.waitUncancelable(io);
     }
 

@@ -444,6 +444,28 @@ test "server: a headless boot starts accepting only once the request hooks are i
     }.run);
 }
 
+test "server: a boot that stops before its gate opened releases the request parked at the gate, so the drain does not wait on it" {
+    const boot_gate = @import("boot_gate.zig");
+    // The gate is the process's: a boot that never opened leaves it failed, which the other cells' servers must not see.
+    defer boot_gate.process.open(io);
+    try eachArch(1, .{}, struct {
+        fn parked() bool {
+            return boot_gate.process.waiting.load(.acquire) == 1;
+        }
+        fn run() !void {
+            var b: [512]u8 = undefined;
+            // The model is resident before the gate shuts, so the next request reaches the gate at once.
+            gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "hi", 2, false)));
+            boot_gate.process.begin();
+            const fd = try connect();
+            defer _ = std.c.close(fd);
+            try send(fd, "POST", "/v1/completions", try completionBody(&b, "hi", 2, false));
+            try testing.expect(within(10_000, parked));
+            // The scenario ends here: the client's exit asks the shutdown, which drains this request's connection thread.
+        }
+    }.run);
+}
+
 test "server: a shutdown with the submit queue full ends the request waiting for room with the shutdown error too" {
     try eachArch(1, .{}, struct {
         var next_id: u64 = 0;
