@@ -24,4 +24,4 @@
 | Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | 146.2 / 65.6 mtp | 144.8 / 77.4 mtp | 142.7 / 77.1 mtp | 145.0 / 79.9 mtp | 146.2 / 79.5 mtp | · | · |
 | Qwen3.8-Flash-Next-Sushi-STQ-4bpw (MTP) | · | · | · | · | · | 160.9 / 73.1 mtp | 191.3 / 81.4 mtp |
 | GLM-5.3-Flash-Sushi-2.4bpw (DFlash2) | 71.5 / 50.9 dflash | 70.5 / 41.0 dflash | 70.7 / 40.5 dflash | 70.4 / · dflash | 71.5 / 40.9 dflash | · | · |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw (DSpark, `--ssd-budget-gb 108`) | 76.6 / 49.3 dspark | 79.5 / 51.4 dspark | 80.9 / 52.8 dspark | 98.2 / 56.4 dspark | 95.5 / 50.3 dspark | 90.6, 93.0 / · dspark (2 runs) | · |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw (DSpark, `--ssd-budget-gb 108`) | 76.6 / 49.3 dspark | 79.5 / 51.4 dspark | 80.9 / 52.8 dspark | 98.2 / 56.4 dspark | 95.5 / 50.3 dspark | 90.6, 93.0 / · dspark (2 runs) | 95.1 / 58.2 dspark |
