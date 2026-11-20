@@ -18,9 +18,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **A call is a call wherever the generation puts it, on every surface** (`reply.toolReply`, `reply.Origin`): one the
   model wrote inside a prompt-opened thought it never closed ships, its markup cut out of `reasoning_content`
   (`splitThinkBlock`), since dropping it turns an agent turn into a bare `stop`; a call inside a thought that closed
-  stays skipped. A stop sequence that matched inside a call (`think_tags.endsInsideToolCall`: the last opener has no
-  closer) leaves no call, the finish stays `stop` and Anthropic's `stop_sequence` stays set, as a loop cut does; a stop
-  after the closer keeps the call. The stop is read once, by `reply.settle` (`stop_sequences.cut`): a stream's reply carries
+  stays skipped. A generation cut inside a call (`think_tags.openToolCallStart`: the last opener has no
+  closer) by a stop sequence, the length cap or a cancel leaves that call out and the finish says why (`stop`, `length`,
+  `cancelled`; Anthropic's `stop_sequence` stays set), as a loop cut does; a call the model finished before the cut
+  ships as it is. Only the model's own end (EOS) inside a call keeps the name-and-`{}` salvage below. The stop is read once, by `reply.settle` (`stop_sequences.cut`): a stream's reply carries
   its gate's match (`GenerationResult.stop_source`), never a stop searched for again in text the gate already cut. Lint
   `reply-bypass`: a surface never calls the raw `parseToolCalls`.
 - Template input `chat.templateMessages`: role "tool" native, a call's `arguments` the client's JSON object (`{}` for

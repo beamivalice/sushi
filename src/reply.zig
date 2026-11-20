@@ -10,12 +10,10 @@ const stop_seq_mod = @import("stop_sequences.zig");
 
 /// Finish reason for a response whose generated text yielded tool calls.
 /// A TRUNCATED generation ("length": max_tokens or the request timeout) must
-/// keep reporting "length" even when the cut-off text salvaged a partial tool
-/// call (the truncated-opener recovery in tool_calls.parseToolCalls) — clients key
-/// their truncation recovery on it (the app's chunk-and-retry nudge fires on
-/// finish_reason "length" + tool calls present). Overriding to "tool_calls"
-/// hides the cut: the client executes a half-argument call, blames the model
-/// ("you sent no content"), and the model re-emits the same doomed mega-call.
+/// keep reporting "length" even when calls the model finished before the cut
+/// are in the reply — clients key their truncation recovery on it. Overriding
+/// to "tool_calls" hides the cut (an open call is declined, `settle`, so the
+/// client learns the model was stopped mid-call only from "length").
 pub fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
     return if (std.mem.eql(u8, pre_parse, "length")) "length" else "tool_calls";
 }
@@ -34,8 +32,8 @@ pub const Origin = struct {
     dialect: ?tool_calls_mod.Dialect,
     /// The prompt ended inside a think block (`promptOpensThink`): text with no closer is reasoning.
     opens_think: bool = false,
-    /// A stop sequence cut `text`: markup it left open is no call.
-    stop_cut: bool = false,
+    /// A stop sequence, the length cap or a cancel ended the generation, not the model: markup it left open is no call.
+    cut: bool = false,
 };
 
 /// A reply that holds calls: the text before them and the calls, as every surface lists them.
@@ -103,7 +101,7 @@ pub const Settled = struct {
 };
 
 /// The one end handling of a reply: the stop that ended the generation, the text it leaves, the calls that text
-/// holds and the finish a stop leaves. A stop that cut a call open leaves no call (`parseToolCallsForRequest`).
+/// holds and the finish a stop leaves. A call a stop, the length cap or a cancel left open is not a call (`parseToolCallsForRequest`).
 pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
     const cut = stop_seq_mod.cut(gen.text, ask.stops, gen.source);
     var out: Settled = .{
@@ -119,7 +117,9 @@ pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
         if (out.normalized) |n| out.text = n;
     }
     if (ask.has_tools and shouldParseToolCalls(gen.finish_details)) {
-        out.reply = try toolReply(allocator, out.text, ask.tools_json, ask.allow_parallel, .{ .dialect = ask.dialect, .opens_think = ask.opens_think, .stop_cut = cut.stop != null });
+        // The model's own end is the stop finish; any other (length, cancelled) cut it short.
+        const model_ended = cut.stop == null and std.mem.eql(u8, gen.finish_reason, "stop");
+        out.reply = try toolReply(allocator, out.text, ask.tools_json, ask.allow_parallel, .{ .dialect = ask.dialect, .opens_think = ask.opens_think, .cut = !model_ended });
     }
     return out;
 }
@@ -143,12 +143,13 @@ pub fn parseToolCallsForRequest(
     allow_parallel: bool,
     origin: Origin,
 ) !?[]tool_schema.ParsedToolCall {
-    // A stop that cut a call open left no complete call (the loop cut declines the same way).
-    if (origin.stop_cut and think_tags.endsInsideToolCall(text)) {
+    // An unfinished call is never shipped, whatever ended the generation: the calls the model finished before it stay.
+    var body = text;
+    if (origin.cut) if (think_tags.openToolCallStart(text)) |open| {
         tool_schema.noteUnparsedToolMarkup(text);
-        return null;
-    }
-    return tool_schema.parseForRequest(allocator, text, tools_json, .{
+        body = text[0..open];
+    };
+    return tool_schema.parseForRequest(allocator, body, tools_json, .{
         .allow_parallel = allow_parallel,
         .autocorrect = server_state.g_tool_autocorrect,
         .dialect = origin.dialect,
@@ -567,7 +568,7 @@ test "a call inside a thought the prompt opened and the model never closed is a 
     }
 }
 
-test "a stop that cut a call open leaves no call, in every dialect" {
+test "a generation cut inside a call (a stop, the length cap, a cancel) leaves no call, in every dialect" {
     const cut = [_][]const u8{
         "Plan.\n</think>\n\n<tool_call>\n<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\nline one\n",
         "Plan.</think><tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>line one\n",
@@ -576,21 +577,46 @@ test "a stop that cut a call open leaves no call, in every dialect" {
         "<|tool_call>call:write_file{path:<|\"|>notes.md<|\"|>,content:<|\"|>line one\n",
     };
     for (cut) |text| {
-        try expectCalls(text, .{ .dialect = null, .stop_cut = true }, 0);
-        // Without a stop the same text is a length cut, whose salvage ships as it did.
+        try expectCalls(text, .{ .dialect = null, .cut = true }, 0);
+        // The model's own end inside a call keeps the salvage it had.
         errdefer std.debug.print("salvage changed for {f}\n", .{std.zig.fmtString(text)});
         try expectCalls(text, .{ .dialect = null }, 1);
     }
 }
 
-test "a stop after a call closed leaves the call" {
+test "a cut after a call closed leaves the call" {
     const whole = [_][]const u8{
         "Let me look.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>\n",
         "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>",
         "<|tool_call>call:get_weather{city:<|\"|>Tokyo<|\"|>}<tool_call|>",
         "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     };
-    for (whole) |text| try expectCalls(text, .{ .dialect = null, .stop_cut = true }, 1);
+    for (whole) |text| try expectCalls(text, .{ .dialect = null, .cut = true }, 1);
+}
+
+test "a call the model finished before a cut stays and the open one after it is declined, in every dialect" {
+    const Pair = struct { done: []const u8, open: []const u8 };
+    const pairs = [_]Pair{
+        .{ .done = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>", .open = "<tool_call>\n<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\nline one\n" },
+        .{ .done = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>", .open = "<tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>line one\n" },
+        .{ .done = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>", .open = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">notes.md</｜DSML｜parameter>\n<｜DSML｜parameter name=\"content\" string=\"true\">line one\n" },
+        .{ .done = "<|tool_call>call:get_weather{city:<|\"|>Tokyo<|\"|>}<tool_call|>", .open = "<|tool_call>call:write_file{path:<|\"|>notes.md<|\"|>,content:<|\"|>line one\n" },
+    };
+    for (pairs) |p| {
+        const text = try std.mem.concat(testing.allocator, u8, &.{ p.done, "\n", p.open });
+        defer testing.allocator.free(text);
+        const calls = (try parseToolCallsForRequest(testing.allocator, text, test_tools, true, .{ .dialect = null, .cut = true })) orelse return error.FinishedCallDropped;
+        defer {
+            for (calls) |c| {
+                testing.allocator.free(c.name);
+                testing.allocator.free(c.arguments);
+            }
+            testing.allocator.free(calls);
+        }
+        errdefer std.debug.print("calls kept for {f}\n", .{std.zig.fmtString(text)});
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("get_weather", calls[0].name);
+    }
 }
 
 /// One generated text as a stream hands it to a surface (its gate delivers the text and reports the match) and as a
@@ -647,8 +673,14 @@ test "a stream and a non-stream reply end the same: a stop in a call, a stop aft
         try expectSameEnd(a, open ++ "STOP and more", &stops, "length", ask, "STOP", "stop", null);
         // A stop after a closed call: the call stays.
         try expectSameEnd(a, call ++ "\nSTOP and more", &stops, "length", ask, "STOP", "stop", 1);
-        // No stop: a length end and a cancel salvage the open call the same way on both paths, and keep their reason.
-        try expectSameEnd(a, open, &stops, "length", ask, null, "length", 1);
-        try expectSameEnd(a, open, &stops, "cancelled", ask, null, "cancelled", 1);
+        // No stop: a length end and a cancel inside an open call decline it as a stop does, on both paths, and say why.
+        try expectSameEnd(a, open, &stops, "length", ask, null, "length", null);
+        try expectSameEnd(a, open, &stops, "cancelled", ask, null, "cancelled", null);
+        // A call the model finished before the end ships as it is, however the end came; only the open one is declined.
+        for ([_][]const u8{ "length", "cancelled" }) |finish| {
+            try expectSameEnd(a, call, &stops, finish, ask, null, finish, 1);
+            try expectSameEnd(a, call ++ "\n" ++ open, &stops, finish, ask, null, finish, 1);
+        }
+        try expectSameEnd(a, call ++ "\n" ++ open ++ "STOP and more", &stops, "length", ask, "STOP", "stop", 1);
     }
 }

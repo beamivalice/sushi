@@ -32,6 +32,10 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   surface, including a WebSocket turn's `store`, now answers 400 naming the field.
 - **A Responses reply that echoes a `service_tier` with a quote or backslash is valid JSON**: the tier was written raw into
   the created and completed events, the non-streamed body and the stored record, where it broke the JSON or injected fields.
+- **A reply cut by the length limit or a cancel inside a tool call no longer returns the half call**: the call was
+  shipped as its name with `{}` arguments on every surface, streamed or not, and the client ran it; it is now left out
+  and the finish reason says `length` or `cancelled`, as a stop sequence inside a call already did. A call the model
+  finished before the cut still ships.
 - **A shutdown no longer waits out a cold load's memory wait**: the preflight's wait for a just-exited process's memory
   ran up to a minute whatever was asked of the server, past the 35 s connection drain; it now ends within half a
   second of the shutdown and the load is refused as the shutdown.

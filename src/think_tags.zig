@@ -541,8 +541,8 @@ const tool_markup_families = [_]ToolMarkupFamily{
     .{ .opener = "<function_calls>", .closers = &.{"</function_calls>"} },
 };
 
-/// True when the last tool-call opener in `text` has no closer after it: the text stops inside a call.
-pub fn endsInsideToolCall(text: []const u8) bool {
+/// Where the last tool-call opener in `text` starts when no closer follows it: the text stops inside a call.
+pub fn openToolCallStart(text: []const u8) ?usize {
     var last: ?struct { at: usize, family: *const ToolMarkupFamily } = null;
     for (&tool_markup_families) |*f| {
         var from: usize = 0;
@@ -552,9 +552,9 @@ pub fn endsInsideToolCall(text: []const u8) bool {
             if (last == null or at > last.?.at) last = .{ .at = at, .family = f };
         }
     }
-    const l = last orelse return false;
-    for (l.family.closers) |c| if (std.mem.indexOfPos(u8, text, l.at, c) != null) return false;
-    return true;
+    const l = last orelse return null;
+    for (l.family.closers) |c| if (std.mem.indexOfPos(u8, text, l.at, c) != null) return null;
+    return l.at;
 }
 
 /// The text the model said before the tool markup, byte for byte as the stream flushes it.
