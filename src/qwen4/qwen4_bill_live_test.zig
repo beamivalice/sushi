@@ -18,6 +18,8 @@ const prefillRequestTerms = server.prefillRequestTerms;
 const qsaScoreFusedOffGuard = @import("qwen4_bill_test.zig").qsaScoreFusedOffGuard;
 const qsaWholeRebuildGuard = @import("qwen4_bill_test.zig").qsaWholeRebuildGuard;
 const qwen4ExpOomConfig = fixtures.qwen4ExpOomConfig;
+const coolerFlashNext = @import("qwen4_bill_test.zig").coolerFlashNext;
+const nextSplitPrompt = @import("qwen4_bill_test.zig").nextSplitPrompt;
 
 test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M session cannot" {
     // `--ctx-size 1048576` with no chunk or cache flags must still prefill ordinary prompts at
@@ -647,4 +649,52 @@ test "Flash-Next streamed: the 32 GB recipe's verdicts at --ssd-budget-gb 17 and
         got.add(bills.streamedBudgetThatFits(512 * gib, 0, planner));
     }
     try bills.pinEq("the 32 GB recipe", &.{ 8818350426, 8818350426, 1, 1, 26, 1, 1, 26, 0, 0, 4 }, got.slice());
+}
+
+const Refused = struct { tried: u32 = 0, refused: u32 = 0, worst: u64 = 0, worst_prompt: u64 = 0 };
+
+/// The splits of `named` that the width admission picks at `budget` refuses, served at `named`, and the worst overshoot.
+fn refusedSplits(cfg: *const model_mod.ModelConfig, named: u64, budget: u64, warm: bills.WarmPrefix) Refused {
+    var probe = cfg.*;
+    probe.pinned_context = @intCast(named);
+    var r: Refused = .{};
+    var p: u64 = 1;
+    while (p < named) : (p = nextSplitPrompt(p, named)) {
+        r.tried += 1;
+        const reply: u32 = @intCast(named - p);
+        const pick = bills.chooseRequestPrefillChunk(&probe, p, reply, 8, budget, probe.pinned_prefill_chunk, 0, warm);
+        const n = bills.prefillNeededAtChunk(&probe, p, reply, 8, pick, warm);
+        if (n <= budget) continue;
+        r.refused += 1;
+        if (n - budget > r.worst) {
+            r.worst = n - budget;
+            r.worst_prompt = p;
+        }
+    }
+    return r;
+}
+
+test "Flash-Next: the context the auto search names at a budget is admitted at every prompt and reply split, at the width admission picks, from 1k to 600k tokens" {
+    if (!bills.archBuilt("qwen4")) return error.SkipZigTest;
+    const no_tier = bills.TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    var cfgs = [_]model_mod.ModelConfig{ coolerFlashNext(), fixtures.qwen4MeasuredTestConfig() };
+    var refused: u32 = 0;
+    for (&cfgs, 0..) |*cfg, ci| for ([_]u32{ 0, 512 }) |pin| {
+        var target: u64 = 1000;
+        while (target < 600_000) : (target = target * 23 / 20) for ([_]i64{ -3, 0 }) |nudge| {
+            cfg.pinned_context = 0;
+            cfg.pinned_prefill_chunk = pin;
+            const w: bills.WarmPrefix = .{ .mtp_on = bills.mtpHeadDefaultOn(cfg) };
+            // A budget about a prompt of `target` tokens alone, at the width a request of it runs.
+            const base = bills.prefillNeededAtChunk(cfg, target, 0, 8, bills.chooseRequestPrefillChunk(cfg, target, 0, 8, std.math.maxInt(u64) / 4, pin, 0, w), w);
+            const budget: u64 = @intCast(@as(i64, @intCast(base)) + nudge * (1 << 20));
+            const named = bills.maxSushiContextForBudget(cfg, 8, budget);
+            if (named < 2) continue;
+            const r = refusedSplits(cfg, named, budget, w);
+            refused += r.refused;
+            if (r.refused > 0) std.debug.print("cfg {d} pin {d} target {d}{d:>3} MiB: named {d}; {d} of {d} splits refused, worst prompt {d} + reply {d} {d} B over\n", .{ ci, pin, target, nudge, named, r.refused, r.tried, r.worst_prompt, named - r.worst_prompt, r.worst });
+        };
+    };
+    try std.testing.expectEqual(@as(u32, 0), refused);
 }

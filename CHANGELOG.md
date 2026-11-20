@@ -180,7 +180,8 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   for a prompt that did not fit named a context that a shorter prompt with a longer reply was then refused at; every
   context the server names (advertised, `--ctx-size` at load, a refusal's maximum) is now priced at its dearest split.
   Where little memory is left beside the model (a context under about 50,000 tokens), the advertised context can be a
-  little smaller, so a request at its length is admitted at any split.
+  little smaller, so a request at its length is admitted at any split; past about 130,000 tokens, where a long prompt
+  with a short reply could still be refused by a few MB, it can be up to 256 tokens smaller.
 - **A load refusal for a pack this build does not list no longer suggests a smaller pack "if one exists"**: it names
   only actions the server has checked.
 - **A load refusal points only to options it lists**: one that said this Mac cannot give the GPU enough memory told

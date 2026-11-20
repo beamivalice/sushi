@@ -1153,15 +1153,12 @@ fn sushiContextWidth(config: *const model_mod.ModelConfig, context: u32) u64 {
 /// The dearest request a context of `ctx` tokens can be asked for, over every split of it between prompt and reply: what
 /// every context the server names (advertised, admitted at load, or in a refusal) is priced at.
 pub fn contextNeed(config: *const model_mod.ModelConfig, ctx: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
-    var most = splitNeed(config, ctx, ctx, kv_bits, chunk, warm);
-    // A prompt under the reservation grows its cache from its own 256-row step by the +25% policy
-    // (`cacheCapacityTokens`), which can pass the prompt alone's; within one step the longest prompt is dearest.
-    if (!config.reservesKvCapacity()) return most;
-    const below = @min(ctx, trunk.KVCache.RESERVE_MIN_TOKENS);
-    var seq: u64 = 256;
-    while (seq < below) : (seq += 256) most = @max(most, splitNeed(config, ctx, seq, kv_bits, chunk, warm));
-    if (below < ctx) most = @max(most, splitNeed(config, ctx, below - 1, kv_bits, chunk, warm));
-    return most;
+    // A request's bill never falls as its prompt grows within a context (the QSA sheet by `qsaBilledSheetCells`), so
+    // the prompt alone is dearest; but a prompt at the reservation starts reserving its cache, so the longest under it.
+    const alone = splitNeed(config, ctx, ctx, kv_bits, chunk, warm);
+    const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
+    if (!config.reservesKvCapacity() or ctx < edge) return alone;
+    return @max(alone, splitNeed(config, ctx, edge - 1, kv_bits, chunk, warm));
 }
 
 fn splitNeed(config: *const model_mod.ModelConfig, ctx: u64, prompt: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
@@ -1184,36 +1181,28 @@ pub fn memoryContextForMargined(target: u32) u32 {
 }
 
 pub fn maxSushiContextUpTo(config: *const model_mod.ModelConfig, upper: u32, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix) u32 {
-    // Every split is dearer than the prompt alone or as dear, and pricing them walks each one's growth: the prompt
-    // alone bounds the answer, which is searched again under it only where a split is dearer.
-    const alone = contextSearch(config, upper, kv_bits, budget, fixed_chunk, warm, false);
-    if (alone == 0 or contextFits(config, alone, kv_bits, budget, fixed_chunk, warm, true)) return alone;
-    return contextSearch(config, alone - 1, kv_bits, budget, fixed_chunk, warm, true);
-}
-
-fn contextSearch(config: *const model_mod.ModelConfig, upper: u32, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix, every_split: bool) u32 {
+    // `contextNeed` never falls as the context grows (a longer context holds each split's reply one token longer), so
+    // one binary search over it names the largest context that fits.
     var low: u32 = 0;
     var high: u32 = upper;
     while (low < high) {
         const mid = low + @as(u32, @intCast((@as(u64, high) - low + 1) / 2));
-        if (contextFits(config, mid, kv_bits, budget, fixed_chunk, warm, every_split)) low = mid else high = mid - 1;
+        if (contextFits(config, mid, kv_bits, budget, fixed_chunk, warm)) low = mid else high = mid - 1;
     }
     return low;
 }
 
-/// Bills the max-context search and `contextNeed` have priced: each walks a request's cache growth, so the test that
+/// Bills the max-context search has priced (`contextNeed`'s): each walks a request's cache growth, so the test that
 /// holds the search's cost counts them.
 pub var context_bills_priced = std.atomic.Value(u64).init(0);
 
-fn contextFits(config: *const model_mod.ModelConfig, ctx: u32, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix, every_split: bool) bool {
+fn contextFits(config: *const model_mod.ModelConfig, ctx: u32, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix) bool {
     // Before the auto context is pinned the bill's reservation reads `getEffectiveContextLength`,
     // which is this very search: bill each probe as the context it is asking about.
     var probe = config.*;
     if (manualContext(config) == 0 and config.pinned_context == 0) probe.pinned_context = ctx;
     const chunk = fixed_chunk orelse sushiContextWidth(&probe, ctx);
-    if (every_split) return contextNeed(&probe, ctx, kv_bits, chunk, warm) <= budget;
-    _ = context_bills_priced.fetchAdd(1, .monotonic);
-    return prefillNeededAtChunk(&probe, ctx, 0, kv_bits, chunk, warm) <= budget;
+    return contextNeed(&probe, ctx, kv_bits, chunk, warm) <= budget;
 }
 
 /// Whether a refusal can name the max_tokens and the context that fit: the resident Sushi EXL3 bill, or an arch's own
@@ -5160,13 +5149,13 @@ test "the 64 GB Sushi-STQ-2.75bpw recipe's bills at both GDN widths: 250000 cont
     const warm = WarmPrefix{ .mtp_on = true };
     // The load bill's context term is the narrowest rung; at this pack's weights the 59,000 MB ceiling admits
     // the 2048 rung. With the SSD tier up (the default) the prefill holds 3 checkpoints, not the 16 it captures.
-    try t.expectEqual(@as(u64, 7_851), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 9_355), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
-    try t.expectEqual(@as(u64, 11_174), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 7_852), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_356), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
+    try t.expectEqual(@as(u64, 11_176), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
     cfg.gdn_state_f32 = false;
-    try t.expectEqual(@as(u64, 7_648), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
-    try t.expectEqual(@as(u64, 9_152), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
-    try t.expectEqual(@as(u64, 10_972), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
+    try t.expectEqual(@as(u64, 7_650), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 512, warm) / mb);
+    try t.expectEqual(@as(u64, 9_153), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 2048, warm) / mb);
+    try t.expectEqual(@as(u64, 10_973), prefillNeededAtChunk(&cfg, 250_000, 32_000, 8, 4096, warm) / mb);
 }
 
 test "an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN widths" {
@@ -5965,7 +5954,7 @@ test "bill pin: prefillMemoryNeeded" {
 
 test "bill pin: prefillTransientReserve and prefillTransientReserveAtKv" {
     try pinConfigs("prefillTransientReserve", &.{
-        913670144, 2007965696, 3841163264, 5598412928, 912621568, 1751965696, 3832774656, 5342412928,
+        913670144, 2007965696, 3841163264, 5598519296, 912621568, 1751965696, 3832774656, 5342519296,
         1640270560, 1846708960, 6462409440, 6659017440, 1813205120, 1813205120, 6625513600, 6625513600,
         1637207552, 1701999104, 5399432704, 5462045184, 1635074560, 1747620352, 5397070336, 5505716736,
         1657615872, 2954339040, 10467127296, 11762377440, 1657615872, 2954339040, 10467127296, 11762377440,
@@ -5982,7 +5971,7 @@ test "bill pin: prefillTransientReserve and prefillTransientReserveAtKv" {
 test "bill pin: the per-forward scratch terms" {
     try pinConfigs("scratchTerms", &.{
         0, 0, 0, 4231168, 350000, 0, 0, 0,
-        143360000, 431128576, 0, 0, 0, 143360000, 813108608, 65536,
+        143360000, 431128576, 0, 0, 0, 143360000, 813694976, 65536,
         0, 0, 167772160, 0, 0, 0, 0, 167772160,
         0, 0, 0, 0, 167772160, 0, 0, 0,
         0, 0, 350000, 0, 0, 0, 0, 179200000,
@@ -6241,7 +6230,7 @@ test "bill pin: the unnamed hot-cache ask" {
 
 test "bill pin: oneSessionEntryBytes and oneSessionFor" {
     try pinConfigs("oneSession", &.{
-        2250651648, 2250651648, 36548216704, 5327714432, 1073741824, 2250651648, 1526246400, 1526246400,
+        2250651648, 2250651648, 36548110336, 5327820800, 1073741824, 2250651648, 1526246400, 1526246400,
         37605029536, 4270901600, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
         1073741824, 2052183552, 96290880, 96290880, 36280382592, 5595548544, 1073741824, 96290880,
     }, struct {
@@ -6395,8 +6384,8 @@ test "bill pin: prefillNeededAtChunk" {
     try pinConfigs("prefillNeededAtChunk", &.{
         1112018944, 1123495936, 929714176, 1238953984, 1473158464, 1484635456, 1290853696, 1600093504,
         1168953344, 1180430336, 927666176, 1295888384, 1530092864, 1541569856, 1288805696, 1657027904,
-        4465995776, 4759361536, 3568395776, 4903684096, 6210687104, 6508230784, 5313087104, 6652553344,
-        5705199616, 5998565376, 4015599616, 6142887936, 7480365184, 7777908864, 5790765184, 7922231424,
+        4465995776, 4759361536, 3568395776, 4903684096, 6210793472, 6508337152, 5313193472, 6652659712,
+        5705199616, 5998565376, 4015599616, 6142887936, 7480471552, 7778015232, 5790871552, 7922337792,
         1717825920, 1736792960, 1623822720, 1736792960, 2373073280, 2392040320, 2279070080, 2392040320,
         1944894080, 1963861120, 1797438080, 1963861120, 2600141440, 2619108480, 2452685440, 2619108480,
         3627130720, 3646097760, 2641130720, 3646097760, 5689548640, 5708515680, 4703548640, 5708515680,
@@ -6477,7 +6466,7 @@ test "bill pin: rungWidth and cappedRung" {
 
 test "bill pin: prefillChunkCost and the adaptive width" {
     try pinConfigs("adaptivePrefillWidth", &.{
-        2015830016, 5661327488, 512, 512, 0, 1, 512, 512,
+        2015830016, 5661433856, 512, 512, 0, 1, 512, 512,
         0, 1, 512, 1024, 0, 0, 2048, 2048,
         0, 0, 512, 1024, 0, 0, 2048, 4096,
         0, 0, 1, 1, 1852975840, 6709152480, 512, 512,

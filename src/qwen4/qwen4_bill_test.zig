@@ -1183,9 +1183,10 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
         @as(u64, 20_845),
         prefillNeededAtChunk(&cfg, 364_509, 421_923, kv_bits, 2048, .{}) / mb,
     );
-    // Turn B: 11,854 MB with the 8192-token headroom, 19,371 MB with its reply billed whole.
+    // Turn B: 11,854 MB with the 8192-token headroom, 19,372 MB with its reply billed whole (the context's
+    // bill at its costliest split, which a shorter prompt sets here by 1 MB).
     try t.expectEqual(
-        @as(u64, 19_371),
+        @as(u64, 19_372),
         prefillNeededAtChunk(&cfg, 368_208, 418_224, kv_bits, 512, .{}) / mb,
     );
 }
@@ -2204,7 +2205,7 @@ fn connBillAt(cfg: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_b
     return bills.creditedAdmissionBill(cfg, prefillNeededAtChunk(cfg, seq, max_tokens, kv_bits, chunk, warm), available, 0, 0, chunk);
 }
 
-fn coolerFlashNext() model_mod.ModelConfig {
+pub fn coolerFlashNext() model_mod.ModelConfig {
     var cfg = fixtures.qwen4ExpLive364kConfig();
     cfg.cooler_for_test = true;
     cfg.expert_layout = .exl3_k4;
@@ -2428,9 +2429,9 @@ test "Flash-Next on Cooler: where the GPU limit binds, the --ctx-size at the edg
     try std.testing.expect(named > 0);
 }
 
-// Pricing every split walks each one's cache growth (on MLX a page grid a layer a step): the search prices them only to
-// confirm the prompt alone's answer, or below it where a split is dearer. Counted, not timed.
-test "Flash-Next on MLX: a max-context search with no cap or a large one prices every split once, to confirm the prompt alone's answer" {
+// Pricing a split walks its cache growth (on MLX a page grid a layer a step): the search prices two a probe, the prompt
+// alone and the longest prompt under the reservation. Counted, not timed.
+test "Flash-Next on MLX: a max-context search with no cap or a large one prices two bills a probe, the prompt alone and the reservation's edge" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
     const no_tier = TierGuard.pin(false, 0);
@@ -2439,15 +2440,85 @@ test "Flash-Next on MLX: a max-context search with no cap or a large one prices 
     cfg.pinned_context = 0;
     try t.expect(!@import("../cooler_side.zig").onEngine(&cfg) and cfg.reservesKvCapacity());
     const GiB: u64 = 1 << 30;
-    const splits: u64 = trunk.KVCache.RESERVE_MIN_TOKENS / 256 + 1;
     for ([_]u32{ 1_048_576, std.math.maxInt(u32) }) |upper| for ([_]u64{ 8 * GiB, 40 * GiB }) |budget| {
         bills.context_bills_priced.store(0, .monotonic);
         const ctx = bills.maxSushiContextUpTo(&cfg, upper, 8, budget, null, .{});
         const priced = bills.context_bills_priced.load(.monotonic);
-        // The prompt alone's search prices a bill a halving of the range, as it did before splits were priced.
         const halvings: u64 = std.math.log2_int_ceil(u64, @as(u64, upper) + 1);
-        errdefer std.debug.print("upper {d}, budget {d} GiB: context {d} priced {d} bills, the prompt alone's search {d}\n", .{ upper, budget >> 30, ctx, priced, halvings });
+        errdefer std.debug.print("upper {d}, budget {d} GiB: context {d} priced {d} bills over {d} halvings\n", .{ upper, budget >> 30, ctx, priced, halvings });
         try t.expect(ctx > 32_768);
-        try t.expect(priced <= halvings + splits);
+        try t.expect(priced <= 2 * halvings);
     };
+}
+
+/// The bill of a request served at `ctx` whose prompt is `prompt` tokens and whose reply takes the rest of the context.
+fn splitBill(cfg: *const model_mod.ModelConfig, ctx: u64, prompt: u64, chunk: u64, warm: WarmPrefix) u64 {
+    var probe = cfg.*;
+    probe.pinned_context = @intCast(ctx);
+    return prefillNeededAtChunk(&probe, prompt, @intCast(ctx - prompt), 8, chunk, warm);
+}
+
+/// The prompts a split sweep of `ctx` prices: every one near the context's end, the reservation and each 256-row step,
+/// a prime stride elsewhere (shorter than the QSA select sheet's steps, so a fall between two shows).
+pub fn nextSplitPrompt(p: u64, ctx: u64) u64 {
+    const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
+    const near = ctx - p < 300 or (p + 300 > edge and p < edge + 300) or p % 256 < 3 or p % 256 > 252;
+    return p + @as(u64, if (near) 1 else 53);
+}
+
+test "Flash-Next: a request's bill never falls as its prompt grows within a context, on Cooler and MLX, MTP on and off, across the reservation" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    const cfgs = [_]model_mod.ModelConfig{ coolerFlashNext(), fixtures.qwen4MeasuredTestConfig() };
+    var falls: u32 = 0;
+    for (&cfgs, 0..) |*cfg, ci| for ([_]bool{ false, true }) |mtp| for ([_]u64{ 512, 2048 }) |chunk| for ([_]u64{ 32_768, 40_000, 133_043, 232_471, 467_395 }) |ctx| {
+        const warm: WarmPrefix = .{ .mtp_on = mtp };
+        var prev: u64 = 0;
+        var prev_p: u64 = 0;
+        var p: u64 = 1;
+        while (p <= ctx) : (p = nextSplitPrompt(p, ctx)) {
+            const b = splitBill(cfg, ctx, p, chunk, warm);
+            if (b < prev) {
+                falls += 1;
+                if (falls < 10) std.debug.print("cfg {d} mtp {} chunk {d} ctx {d}: prompt {d} bills {d}, {d} B under prompt {d}\n", .{ ci, mtp, chunk, ctx, p, b, prev - b, prev_p });
+            }
+            prev = b;
+            prev_p = p;
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 0), falls);
+}
+
+test "Flash-Next: the max-context search names the largest context whose every prompt and reply split fits, on Cooler and MLX, at the reservation's edge too" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    var cfgs = [_]model_mod.ModelConfig{ coolerFlashNext(), fixtures.qwen4MeasuredTestConfig() };
+    var bad: u32 = 0;
+    for (&cfgs, 0..) |*cfg, ci| {
+        cfg.pinned_context = 0;
+        for ([_]bool{ false, true }) |mtp| for ([_]u64{ 512, 2048 }) |chunk| for ([_]u64{ 9_000, 32_767, 32_768, 33_000, 40_000, 100_000 }) |target| for ([_]i64{ -3, 0, 5 }) |nudge| {
+            const warm: WarmPrefix = .{ .mtp_on = mtp };
+            // A budget about the context's own bill, a little under, at and over it.
+            const base = splitBill(cfg, target, target, chunk, warm);
+            const budget: u64 = @intCast(@as(i64, @intCast(base)) + nudge * (1 << 20));
+            const named = bills.maxSushiContextUpTo(cfg, std.math.maxInt(u32), 8, budget, chunk, warm);
+            // Every split of the named context fits; some split of each of the next contexts does not.
+            var p: u64 = 1;
+            while (p <= named) : (p = nextSplitPrompt(p, named)) {
+                const b = splitBill(cfg, named, p, chunk, warm);
+                if (b <= budget) continue;
+                bad += 1;
+                if (bad < 10) std.debug.print("cfg {d} mtp {} chunk {d} budget {d}: named {d}; prompt {d} + reply {d} bills {d} B over\n", .{ ci, mtp, chunk, budget, named, p, named - p, b - budget });
+                break;
+            }
+            for ([_]u64{ named + 1, named + 37, named + 256 }) |above| {
+                if (splitBill(cfg, above, above, chunk, warm) > budget or splitBill(cfg, above, @min(above, trunk.KVCache.RESERVE_MIN_TOKENS) - 1, chunk, warm) > budget) continue;
+                bad += 1;
+                if (bad < 10) std.debug.print("cfg {d} mtp {} chunk {d} budget {d}: named {d}, yet {d} fits\n", .{ ci, mtp, chunk, budget, named, above });
+            }
+        };
+    }
+    try std.testing.expectEqual(@as(u32, 0), bad);
 }

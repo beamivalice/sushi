@@ -1240,13 +1240,22 @@ pub fn qsaPrefillTransientBytes(n_idx: u64, fwd: u64, kv: u64, ratio: u64, idx_h
     if (ratio == 0) return 0;
     const nb = kv / ratio;
     const fused = qsaScoreFusedActiveFor(1, @intCast(n_idx), @intCast(idx_hd));
-    const rows = qsaScoreRowsPerChunkFused(n_idx, nb, fwd, fused);
+    const cells = qsaBilledSheetCells(n_idx, nb, fwd, fused);
     if (fused) {
-        const sheet = rows * nb * 4;
         const select_mult: u64 = if (qsaSelectKernelEnabled()) 1 else 4;
-        return sheet * select_mult + fwd * @min(nb, 512) * 4;
+        return cells * 4 * select_mult + fwd * @min(nb, 512) * 4;
     }
-    return rows * nb * 4 * (n_idx * 2 + 4) + fwd * @min(nb, 512) * 4;
+    return cells * 4 * (n_idx * 2 + 4) + fwd * @min(nb, 512) * 4;
+}
+
+/// The score sheet's cells (rows x blocks) as billed: the forward's (`qsaScoreRowsPerChunkFused`), except that where the
+/// budget bounds the rows they are billed at the budget's cells, which the forward's never pass. The forward's rows x
+/// blocks falls as the history grows past a row of the budget; this never does, so no shorter prompt bills more.
+pub fn qsaBilledSheetCells(n_idx: u64, nb: u64, fwd: u64, fused: bool) u64 {
+    const per_cell: u64 = if (fused) 4 else n_idx * 4;
+    if (per_cell == 0 or nb == 0) return fwd * nb;
+    // The forward's floor of 16 rows, then its rows up to the budget.
+    return @max(16 * nb, @min(fwd * nb, qsaScoreSheetBudget() / per_cell));
 }
 
 /// The same select on the engine of our own, which chains the head weighting into the score: composed, the matmul's
@@ -1255,8 +1264,8 @@ pub fn qsaPrefillTransientBytesEngine(n_idx: u64, fwd: u64, kv: u64, ratio: u64,
     if (ratio == 0) return 0;
     const nb = kv / ratio;
     const fused = qsaScoreFusedActiveFor(1, @intCast(n_idx), @intCast(idx_hd));
-    const rows = qsaScoreRowsPerChunkFused(n_idx, nb, fwd, fused);
-    const sheet: u64 = if (fused) rows * nb * 4 else rows * nb * 4 * (2 * n_idx + 1);
+    const cells = qsaBilledSheetCells(n_idx, nb, fwd, fused);
+    const sheet: u64 = if (fused) cells * 4 else cells * 4 * (2 * n_idx + 1);
     return sheet + fwd * @min(nb, 512) * 4;
 }
 
@@ -2878,13 +2887,13 @@ test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95
     try t.expectEqual(@as(u64, 24), passes(rows_256, chunk));
     try t.expectEqual(@as(u64, 6), passes(rows_1024, chunk));
 
-    // A wider sheet must be billed: the admission guard reads the same helper.
+    // A wider sheet must be billed: the admission guard reads the same budget, at the cells it buys.
     qsa_score_sheet_mb_override = 256;
     const bill_256 = qsaPrefillTransientBytes(n_idx, chunk, 383205, 4, 128);
     qsa_score_sheet_mb_override = 1024;
     const bill_1024 = qsaPrefillTransientBytes(n_idx, chunk, 383205, 4, 128);
     try t.expect(bill_1024 > bill_256);
-    try t.expectEqual((rows_1024 - rows_256) * nb * 4 * (n_idx * 2 + 4), bill_1024 - bill_256);
+    try t.expectEqual(((1024 << 20) / (n_idx * 4) - (256 << 20) / (n_idx * 4)) * 4 * (n_idx * 2 + 4), bill_1024 - bill_256);
 
     qsa_score_sheet_mb_override = 4096;
     try t.expectEqual(@as(u64, 64), qsaScoreRowsPerChunk(n_idx, 1024, 64, 128));

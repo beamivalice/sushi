@@ -839,3 +839,35 @@ test "DeepSeek: a resident load with no decoder pool to lend bills its widest fo
     try t.expect(wide >= dsv41_wide_bytes.bytes(c, @min(top + dsv41_config.tail_merge_rows, seq), seq));
     try t.expect(bills.prefillNeededAtChunk(&config, seq, 256, bills.defaultKvBits(&config), top, .{}) >= wide);
 }
+
+test "DeepSeek: a request's bill never falls as its prompt grows within a context, on Cooler and MLX, its checkpoints in RAM or SSD-first" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.max_position_embeddings = 1_048_576;
+    const launch = bills.launch_state;
+    const saved = .{ launch.prefix_cache_ram_enabled, launch.ssm_checkpoint_stride };
+    defer {
+        launch.prefix_cache_ram_enabled = saved[0];
+        launch.ssm_checkpoint_stride = saved[1];
+    }
+    launch.ssm_checkpoint_stride = 2048;
+    var falls: u32 = 0;
+    for ([_]bool{ false, true }) |engine| for ([_]bool{ false, true }) |ram| for ([_]u64{ 2048, 8192 }) |chunk| for ([_]u64{ 9_000, 131_072, 1_000_000 }) |ctx| {
+        config.cooler_for_test = engine;
+        launch.prefix_cache_ram_enabled = ram;
+        config.pinned_context = @intCast(ctx);
+        var prev: u64 = 0;
+        var p: u64 = 1;
+        while (p <= ctx) : (p += @as(u64, if (ctx - p < 300 or p < 1100 or p % 2048 < 3 or p % 2048 > 2045) 1 else 97)) {
+            const b = bills.prefillNeededAtChunk(&config, p, @intCast(ctx - p), 16, chunk, .{});
+            if (b < prev) {
+                falls += 1;
+                if (falls < 10) std.debug.print("engine {} ram {} chunk {d} ctx {d}: prompt {d} bills {d} B under the prompt before it\n", .{ engine, ram, chunk, ctx, p, prev - b });
+            }
+            prev = b;
+        }
+    };
+    try t.expectEqual(@as(u32, 0), falls);
+}

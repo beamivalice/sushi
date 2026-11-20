@@ -599,8 +599,10 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   the prompt's at the pool's size class as the reply's (`prefillRequestTerms`), so it holds what `cacheCommitBytes` does.
 - **Every context the server names is priced at its dearest prompt/reply split** (`contextNeed`): the advertised
   context, an explicit `--ctx-size` the preflight admits, a load refusal's `--ctx-size` and a request refusal's maximum.
-  A prompt under the reservation grows its cache by the +25% policy from its own step, so a shorter prompt with a long
-  reply can hold more rows than the prompt alone: a maximum of 16,383 tokens priced as a prompt was refused at 12,288 + 4,095.
+  Priced as a prompt alone, a maximum of 16,383 tokens was refused at 12,288 + 4,095, and an advertised 175,713 at 175,679 + 34.
+- **A request's bill never falls as its prompt grows within a context**, so its dearest split is the prompt alone, or the
+  longest prompt under the reservation where the cache starts reserving, and one binary search names the maximum. A term
+  the forward steps down as the prompt grows is billed at a ceiling that does not (`qsaBilledSheetCells`).
 - The hot-cache budget is clamped at load and follows residency ([engine-prefix-cache](engine-prefix-cache.md#budget)).
 - Context-overflow 400s name BOTH counts.
 - **A freed reserved-KV slot goes back to the OS, not MLX's pool** (`deinitSlotsReturningPool`, and the prefill-end

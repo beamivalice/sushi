@@ -94,6 +94,8 @@ separate M-RoPE guard.
   PROVABLY reclaimable bytes, refuses by NAME `PrefillDoesNotFit` → 400, defers a warm prompt to the `WarmPrefix`
   bill); ONE `[admission]` line.
 - The prefill width is per-REQUEST and re-chosen per CHUNK (`chooseRequestPrefillChunk`, `adaptivePrefillWidth`).
+- The select sheet is billed at the score-sheet budget's cells where that budget bounds its rows (`qsaBilledSheetCells`):
+  the forward's rows x blocks falls as the history grows past a row of the budget, which a bill may never do.
 - **Load-time bills** run in the load, on the inference thread (the preflight before `Scheduler.init` returns): KV width from `configuredKvQuantFor(config)`, context from
   `resolvedContextForLoad` with the CONSTANT `CTX_SIZING_CACHE_RESERVE`, the hot-cache clamp reserves the ladder
   FLOOR. A KV bill is per CACHING LAYER (`kvBytesPerToken` via `attnCacheLayerCount`); `prefillStreamBytesPerToken`
