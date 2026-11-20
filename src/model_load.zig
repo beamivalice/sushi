@@ -273,7 +273,7 @@ pub fn warmLoad(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xf
     const cooler_pipelines = @import("arch/cooler_pipelines.zig");
     var plan: ?cooler_pipelines.Plan = if (on_engine) cooler_pipelines.beginFor(a, io, config) else null;
     defer if (plan) |*p| p.deinit();
-    if (plan) |*p| _ = p.settle();
+    const made_all = if (plan) |*p| p.settle() else false;
     xfm.warmup() catch |err| {
         var cause: [512]u8 = undefined;
         if (on_engine) {
@@ -294,10 +294,11 @@ pub fn warmLoad(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xf
     };
     arch_load.warmSpec(io, config, xfm, aux_head, kv);
     if (!on_engine) return;
-    // The served warm runs to make pipelines: a manifest that holds the marker of a warm that ran whole under this load's
-    // shape has made every one, and the warm skips its requests (`cooler_warm.warmServed`); a request that compiles one
-    // late writes it in for the next load.
-    @import("cooler_warm.zig").warmServed(io, a, xfm, generate_mod.MtpHeadRef.fromModel(xfm, verify_cap != null, aux_head)) catch |err| {
+    // The served warm runs to make pipelines: a manifest that made every one leaves it nothing, and a request that
+    // compiles one late writes it in for the next load.
+    if (made_all) {
+        log.info("[warm] served requests skipped: the manifest made every pipeline they would\n", .{});
+    } else @import("cooler_warm.zig").warmServed(io, a, xfm, generate_mod.MtpHeadRef.fromModel(xfm, verify_cap != null, aux_head)) catch |err| {
         var cause: [512]u8 = undefined;
         log.err("[warm] a served request failed ({s}: {s}); a load on Sushi Cooler does not serve without it\n", .{ @errorName(err), latchedCause(&cause) });
         return err;

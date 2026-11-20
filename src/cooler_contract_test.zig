@@ -1556,7 +1556,7 @@ test "cooler contract: a pipeline a Cooler request compiles late is written to t
     }.run);
 }
 
-test "cooler contract: a Cooler load whose manifest holds a complete served warm runs none, in the process that wrote it and in a fresh one" {
+test "cooler contract: a Cooler load whose manifest made every pipeline runs no served warm" {
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
             const shared = @import("arch/cooler_pipelines.zig");
@@ -1566,61 +1566,22 @@ test "cooler contract: a Cooler load whose manifest holds a complete served warm
             shared.root_hook = tmp.dir;
             defer shared.root_hook = null;
             defer shared.forget();
-            var runs: [3]u32 = undefined;
-            for (&runs, 0..) |*r, i| {
-                // The third load is a fresh process: it knows the manifest's file and nothing the first two made.
-                if (i == 2) mlx.engine.pipeline_registry.resetForTest();
+            var runs: [2]u32 = undefined;
+            var scoped = false;
+            for (&runs) |*r| {
                 // `open` is the served load, its warm included.
                 const before = cooler_warm.runs_for_test;
                 var cooler: Load = undefined;
                 try cooler.open(C, dir, true);
                 defer _ = cooler.close();
                 r.* = cooler_warm.runs_for_test - before;
+                scoped = switch (@import("arch/config.zig").tagOf(&cooler.config).?) {
+                    inline else => |t| @hasDecl(registry.Mod(t), "coolerPipelineScope"),
+                };
             }
+            // An arch that settles its manifest in its own load (no scope hook) warms every load.
             try testing.expectEqual(@as(u32, 1), runs[0]);
-            try testing.expectEqual(@as(u32, 0), runs[1]);
-            try testing.expectEqual(@as(u32, 0), runs[2]);
-        }
-    }.run);
-}
-
-test "cooler contract: a Cooler load whose manifest holds a served warm of another shape or another scope still runs it in full" {
-    try eachArch(struct {
-        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
-            const shared = @import("arch/cooler_pipelines.zig");
-            const cooler_warm = @import("cooler_warm.zig");
-            const dir_len = @import("pipeline_manifest.zig").Key.dir_len;
-            var tmp = testing.tmpDir(.{ .iterate = true });
-            defer tmp.cleanup();
-            shared.root_hook = tmp.dir;
-            defer shared.root_hook = null;
-            defer shared.forget();
-            var runs: [3]u32 = undefined;
-            for (&runs, 0..) |*r, i| {
-                const before = cooler_warm.runs_for_test;
-                var cooler: Load = undefined;
-                try cooler.prepare(C, dir, true);
-                // A narrower `--prefill-chunk`: the same pack, another chunk for the warm's requests.
-                const settings = @import("settings_resolve.zig");
-                const was = settings.prefill_chunk;
-                if (i == 1) settings.prefill_chunk = .{ .value = 2048, .source = .flag };
-                defer settings.prefill_chunk = was;
-                try cooler.loadServed(dir);
-                defer _ = cooler.close();
-                r.* = cooler_warm.runs_for_test - before;
-                if (i == 1) {
-                    // The manifest of another scope: the build stays, what selects the pack's kernels does not.
-                    var it = tmp.dir.iterate();
-                    var from: [dir_len]u8 = undefined;
-                    while (try it.next(io)) |e| if (e.kind == .directory and e.name.len == dir_len) @memcpy(&from, e.name);
-                    var to = from;
-                    @memset(to[0..16], '0');
-                    try tmp.dir.rename(&from, tmp.dir, &to, io);
-                }
-            }
-            try testing.expectEqual(@as(u32, 1), runs[0]);
-            try testing.expectEqual(@as(u32, 1), runs[1]);
-            try testing.expectEqual(@as(u32, 1), runs[2]);
+            try testing.expectEqual(@as(u32, if (scoped) 0 else 1), runs[1]);
         }
     }.run);
 }

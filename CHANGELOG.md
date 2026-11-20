@@ -18,10 +18,6 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **A streamed `/v1/responses` reply cut by a stop sequence inside a tool call no longer returns the half call**: the
   stream searched for the stop in text its gate had already cut, found none, and shipped the call it salvaged from the
   open markup; a stream now ends as the stop its gate matched, as the non-streamed reply, Chat and Messages do.
-- **A repeat start of DeepSeek, and any reload of a model, skips the served warm**: the warm's requests ran on every
-  DeepSeek load even from a complete pipeline manifest (1.7 s of 1.8 s on the tiny fixture); the manifest now records
-  the served warm it ran, and a load of the same shape skips it, as Qwen's did. A load with another chunk, drafter or
-  KV scheme than the manifest's warm runs it in full (Qwen's skipped it on the pack alone).
 - **A large chunked upload is answered**: a `Transfer-Encoding: chunked` request over about 16 KB sent in one go got no
   answer and held its connection forever, and a body or WebSocket frame left half sent outlasted the 30 s read limit
   and a shutdown.

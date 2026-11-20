@@ -373,8 +373,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   bill covered. It still refuses between a dispatch's binds.
 - **A Cooler load checks its bill at the served warm** (`cooler_warm.warmServed`): the widest chunk's request runs once,
   and a pool refusal, or more bytes in use at its peak than its request bill, fails the load with `WarmOverBill`,
-  naming both. A load whose manifest holds the marker of a served warm of its shape (`engine-own-forward.md`) skips those
-  requests, this measure with them: the bill is in the marker's key, so a bill that moved warms in full. Free buffers the pool keeps up to its cap are not billed; the debug line logs them beside the peak.
+  naming both. Free buffers the pool keeps up to its cap are not billed; the debug line logs them beside the peak.
   The bill there lends no decoder pool (`bills.prefillNeededAtChunkUnlent`): admission nets out the pools a DeepSeek
   prefill may release, which a forward the headroom cannot hold releases first (`dsv41_borrow.beforeForward`, else
   `PrefillDoesNotFit`), but the warm's chunk fits the headroom, so it releases none and takes its whole cap from the

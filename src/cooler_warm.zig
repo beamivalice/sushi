@@ -1,8 +1,7 @@
 //! The served warm of a load on Sushi Cooler: requests through the Generator as a served one runs them, at every prompt
 //! width a kernel takes as a template value, past them and at the widest chunk, greedy and sampled, with the load's
 //! drafter and without, across the indexer's budget, as joined rows and with an image. A request after the seal then
-//! makes no pipeline it could have made here. A manifest that holds the marker of a warm of the load's shape skips the
-//! requests. Names no arch: what a request reaches is the arch's, the sweep is the
+//! makes no pipeline it could have made here. Names no arch: what a request reaches is the arch's, the sweep is the
 //! engine's.
 const std = @import("std");
 const generate = @import("generate.zig");
@@ -14,7 +13,6 @@ const trunk_mod = @import("trunk.zig");
 const Trunk = trunk_mod.Trunk;
 const bills = @import("bills.zig");
 const arch_state = @import("arch/arch_state.zig");
-const manifest = @import("pipeline_manifest.zig");
 
 /// Every chunk width to twice a verify block's rows: kernels take a narrow width as a template value, and a prompt
 /// runs one row fewer than its length before its last token.
@@ -38,43 +36,14 @@ const penalized = [_]sampler.SamplingParams{
     .{ .temperature = 0.7, .top_p = 0.9, .top_k = 40, .seed = 1, .repeat_penalty = 1.3, .presence_penalty = 1.0, .frequency_penalty = 0.7 },
 };
 
-/// Served warms that ran their requests, in a test process.
+/// `drafter`: the load's drafter, if it drafts; a DSpark one drafts in its own rounds, as the scheduler arms it.
+/// Served warms run, in a test process.
 pub var runs_for_test: u32 = 0;
-/// The manifest's name for a served warm that ran whole.
-const marker_function = "served warm";
-
-/// What the served warm's requests are made of, as the key of its manifest marker: the widths, the KV scheme, the
-/// drafter, the bill of its widest request (which reads the whole config) and what the pool and the checkpoints hold
-/// around it. A load that differs in any of them makes pipelines these requests would not, so it warms in full.
-fn warmMarker(c: *const @import("model.zig").ModelConfig, drafter: ?generate.MtpHeadRef, chunk: u32, top: u32, longest: usize, kv: trunk_mod.KVQuantConfig) [16]u8 {
-    var d: manifest.Digest = .{};
-    d.addInt("rung", top);
-    d.addInt("chunk", chunk);
-    d.addInt("longest", longest);
-    d.addInt("kv scheme", @intFromEnum(kv.scheme));
-    d.addInt("kv bits", kv.bits);
-    const dspark = if (drafter) |h| h.kind() == .dspark else false;
-    d.addInt("drafter", if (drafter) |h| @as(u64, @intFromEnum(h.kind())) + 1 else 0);
-    d.addInt("verify drafts", generate.Generator.mtpVerifyDraftsMax(c));
-    d.addInt("bill", bills.warmRequestBill(c, if (kv.scheme == .off) 16 else kv.bits, chunk, drafter != null and !dspark));
-    d.addInt("checkpoint stride", @import("server_state.zig").ssm_checkpoint_stride);
-    d.addInt("indexer budget", c.indexer_budget);
-    d.addInt("vocab", c.vocab_size);
-    d.addInt("image", @intFromBool(c.image_token_id != 0 and c.image_token_id < c.vocab_size and c.mrope_section[0] != 0));
-    d.addInt("streaming", @intFromBool(c.expert_streaming));
-    d.addInt("resident", @intFromBool(c.expert_resident));
-    d.addInt("expert cache", c.expert_cache_bytes);
-    d.addInt("ssd budget", c.expert_ssd_budget_bytes);
-    return d.hex();
-}
-
 /// Test seam: the bill the warm's widest request is held to, in place of its own.
 pub var bill_for_test: ?u64 = null;
 
-/// `drafter`: the load's drafter, if it drafts; a DSpark one drafts in its own rounds, as the scheduler arms it. The warm
-/// ends by recording its marker; a load whose manifest holds that marker skips the requests, and still refuses by name a
-/// load no chunk fits.
 pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?generate.MtpHeadRef) !void {
+    if (@import("builtin").is_test) runs_for_test += 1;
     arch_state.servedWarmBegin(&xfm.arch_state);
     defer arch_state.servedWarmEnd(&xfm.arch_state);
     var lap = @import("io_util.zig").Stopwatch.init(io);
@@ -97,15 +66,6 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
     }
     log.info("[warm] the widest chunk is {d} rows of {d}: headroom {d} MB\n", .{ chunk, top, headroom >> 20 });
     const longest: usize = @intCast(bills.warmLongestPrompt(c, chunk));
-    const drafts = if (drafter) |d| (if (d.kind() == .dspark) "DSpark" else "the MTP head") else "no drafter";
-    // A manifest that holds the marker of a warm that ran whole under this shape has every pipeline these requests
-    // make, already made from it: they are skipped, the fit above still holds.
-    const marker = warmMarker(c, drafter, chunk, top, longest, kv);
-    if (mlx.engine.pipeline_registry.takeMarker(&marker)) {
-        log.info("[warm] served requests skipped: the manifest holds a complete served warm of {d}-row chunks to {d} tokens with {s}, and made every pipeline it makes\n", .{ chunk, longest, drafts });
-        return;
-    }
-    if (@import("builtin").is_test) runs_for_test += 1;
     const ids = try a.alloc(u32, @max(wide[wide.len - 1], longest));
     defer a.free(ids);
     // A repeated span: a model continues it, so its drafts are accepted and the round shapes acceptance unlocks (prompt
@@ -177,7 +137,7 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
     if (c.image_token_id != 0) try spliceAhead(xfm);
     try mlx.engine.makeCopiesAhead();
     try xfm.resetCache();
-    mlx.engine.pipeline_registry.recordMarker(marker_function, &marker);
+    const drafts = if (dspark) "DSpark" else if (spec.drafter != null) "the MTP head" else "no drafter";
     log.info("[warm] served requests to {d} tokens with {s}: {d} pipelines in {d} ms ({d} ms across the budget, joined and with an image)\n", .{ longest, drafts, mlx.engine.pipelinesMade().count - made_before, lap.read() / std.time.ns_per_ms, added_ms });
 }
 
