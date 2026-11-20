@@ -89,6 +89,8 @@ pub const Gate = struct {
     carry_len: u8 = 0,
     /// Set once a stop fired; nothing is pushed after that.
     matched: ?[]const u8 = null,
+    /// Bytes delivered so far: the generation up to the stop's start, never the stop or what a held prefix still waits on.
+    released: usize = 0,
 
     pub fn deinit(self: *Gate, allocator: std.mem.Allocator) void {
         self.held.deinit(allocator);
@@ -132,6 +134,7 @@ pub const Gate = struct {
             self.matched = hit.stop;
         };
         const out = try allocator.dupe(u8, buf[0..n]);
+        self.released += n;
         if (self.matched != null) {
             self.held.clearRetainingCapacity();
         } else {

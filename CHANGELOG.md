@@ -43,6 +43,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   rendered it through the generic ChatML format on a Qwen or MiMo model (a role with a newline wrote a system turn
   mid-conversation); chat already refused it. A `/v1/messages` message whose role is not user or assistant is now
   refused with a 400 naming the role; it was dropped before.
+- **Logprobs list exactly the text a reply returns**: a streamed chat reply listed the tokens of the stop sequence that
+  cut it and of a thought the token cap left open, and `/v1/completions` listed a stop's tokens streamed or not; none of
+  them is listed now, on any surface, and a non-streamed completion no longer leaks its logprobs.
 - **A streamed `/v1/responses` reply cut by a stop sequence inside a tool call no longer returns the half call**: the
   stream searched for the stop in text its gate had already cut, found none, and shipped the call it salvaged from the
   open markup; a stream now ends as the stop its gate matched, as the non-streamed reply, Chat and Messages do.

@@ -1955,3 +1955,102 @@ test "server: a ping sent in the same write as the WebSocket upgrade gets its po
         }
     }.run);
 }
+
+/// What a reply returned as text and what its `logprobs` listed, both as bytes: chat entries' `bytes`, a legacy
+/// completion's `tokens`, in the order they arrive.
+const Delivered = struct {
+    text: std.ArrayList(u8) = .empty,
+    listed: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *Delivered) void {
+        self.text.deinit(gpa);
+        self.listed.deinit(gpa);
+    }
+
+    fn addChoice(self: *Delivered, chat: bool, stream: bool, choice: std.json.Value) !void {
+        if (choice != .object) return;
+        const part = if (!chat) choice else (choice.object.get(if (stream) "delta" else "message") orelse return);
+        if (part == .object) if (part.object.get(if (chat) "content" else "text")) |t| if (t == .string) try self.text.appendSlice(gpa, t.string);
+        const lp = choice.object.get("logprobs") orelse return;
+        if (lp != .object) return;
+        if (!chat) {
+            for ((lp.object.get("tokens") orelse return).array.items) |t| try self.listed.appendSlice(gpa, t.string);
+            return;
+        }
+        for ((lp.object.get("content") orelse return).array.items) |entry| {
+            for (entry.object.get("bytes").?.array.items) |b| try self.listed.append(gpa, @intCast(b.integer));
+        }
+    }
+};
+
+/// A request's reply, streamed or not, as `Delivered`; the caller frees.
+fn deliveredBy(chat: bool, stream: bool, body: []const u8) !Delivered {
+    const resp = try request("POST", if (chat) "/v1/chat/completions" else "/v1/completions", body);
+    defer gpa.free(resp);
+    if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) return error.NotOk;
+    var out: Delivered = .{};
+    errdefer out.deinit();
+    if (!stream) {
+        const p = try std.json.parseFromSlice(std.json.Value, gpa, bodyOf(resp), .{});
+        defer p.deinit();
+        try out.addChoice(chat, false, p.value.object.get("choices").?.array.items[0]);
+        return out;
+    }
+    var lines = std.mem.splitScalar(u8, bodyOf(resp), '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "data: ") or std.mem.eql(u8, line, "data: [DONE]")) continue;
+        const p = try std.json.parseFromSlice(std.json.Value, gpa, line["data: ".len..], .{});
+        defer p.deinit();
+        const choices = p.value.object.get("choices").?.array.items;
+        if (choices.len > 0) try out.addChoice(chat, true, choices[0]);
+    }
+    return out;
+}
+
+test "server: logprobs list exactly the text a reply returns, streamed or not: a stop's own tokens and a cut thought are never listed" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const chat_head = "{\"model\":\"tiny\",\"max_tokens\":8,\"temperature\":0,\"logprobs\":true,\"top_logprobs\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi there\"}]";
+            const comp_head = "{\"model\":\"tiny\",\"max_tokens\":40,\"temperature\":0,\"ignore_eos\":true,\"logprobs\":1,\"prompt\":\"a long tale of the sea\"";
+            var bad: usize = 0;
+            // Each arm asks for the same reply streamed and not: what a reply lists is the text it returns.
+            const Arm = struct { name: []const u8, chat: bool, head: []const u8, extra: []const u8 };
+            const arms = [_]Arm{
+                .{ .name = "chat, a stop", .chat = true, .head = chat_head, .extra = ",\"reasoning_effort\":\"none\"" },
+                .{ .name = "completions, a stop", .chat = false, .head = comp_head, .extra = "" },
+            };
+            for (arms) |arm| {
+                const plain = try std.fmt.allocPrint(gpa, "{s}{s}}}", .{ arm.head, arm.extra });
+                defer gpa.free(plain);
+                var free = try deliveredBy(arm.chat, false, plain);
+                defer free.deinit();
+                if (free.text.items.len < 4) return error.ReplyTooShortToCut;
+                // The third byte as the stop: content survives it and its own tokens follow.
+                const stop = try std.json.Stringify.valueAlloc(gpa, free.text.items[2..3], .{});
+                defer gpa.free(stop);
+                for ([_]bool{ false, true }) |stream| {
+                    const body = try std.fmt.allocPrint(gpa, "{s}{s},\"stop\":[{s}],\"stream\":{}}}", .{ arm.head, arm.extra, stop, stream });
+                    defer gpa.free(body);
+                    var got = try deliveredBy(arm.chat, stream, body);
+                    defer got.deinit();
+                    if (!std.mem.eql(u8, got.text.items, got.listed.items) or got.text.items.len == 0) {
+                        std.debug.print("{s}, stream={}: text {f}, listed {f}\n", .{ arm.name, stream, std.zig.fmtString(got.text.items), std.zig.fmtString(got.listed.items) });
+                        bad += 1;
+                    }
+                }
+            }
+            // A thought the token cap cuts open returns no content: nothing is listed.
+            for ([_]bool{ false, true }) |stream| {
+                const body = try std.fmt.allocPrint(gpa, "{s},\"stream\":{}}}", .{ chat_head, stream });
+                defer gpa.free(body);
+                var got = try deliveredBy(true, stream, body);
+                defer got.deinit();
+                if (!std.mem.eql(u8, got.text.items, got.listed.items)) {
+                    std.debug.print("chat, a cut thought, stream={}: text {f}, listed {f}\n", .{ stream, std.zig.fmtString(got.text.items), std.zig.fmtString(got.listed.items) });
+                    bad += 1;
+                }
+            }
+            if (bad > 0) return error.ListedWhatWasNotReturned;
+        }
+    }.run);
+}

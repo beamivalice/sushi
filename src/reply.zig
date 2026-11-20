@@ -7,6 +7,7 @@ const tool_schema = @import("tool_schema.zig");
 const server_state = @import("server_state.zig");
 const log = @import("log.zig");
 const stop_seq_mod = @import("stop_sequences.zig");
+const listed_tokens = @import("listed_tokens.zig");
 
 /// Finish reason for a response whose generated text yielded tool calls.
 /// A TRUNCATED generation ("length": max_tokens or the request timeout) must
@@ -653,6 +654,69 @@ fn expectSameEnd(allocator: std.mem.Allocator, generated: []const u8, stops: []c
     }
 }
 
+/// The tokens a stream lists logprobs for, one token per fragment: its gate releases the text, a content chunk goes out
+/// when the think split of the delivered text grows, and the final chunk lists what lagged behind (the newest entry
+/// has not landed when its chunk goes out).
+fn streamListed(allocator: std.mem.Allocator, frags: []const []const u8, stops: []const []const u8, opens_think: bool, listed: []bool) !void {
+    var listing: listed_tokens.Listing = .{};
+    defer listing.deinit(allocator);
+    var gate = stop_seq_mod.Gate{ .stops = stops };
+    defer gate.deinit(allocator);
+    var delivered = std.ArrayList(u8).empty;
+    defer delivered.deinit(allocator);
+    var sent_content: usize = 0;
+    var tail = false;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const piece = if (i < frags.len) blk: {
+            try listing.note(allocator, frags[i].len);
+            break :blk try gate.push(allocator, frags[i]);
+        } else if (gate.matched == null and gate.hasHeld() and !tail) blk: {
+            tail = true;
+            break :blk try gate.finish(allocator);
+        } else break;
+        defer allocator.free(piece);
+        listing.released = gate.released;
+        try delivered.appendSlice(allocator, piece);
+        // The content arm holds a tail that may still grow into a think opener.
+        const content = if (think_tags.endsWithPartialThinkOpen(delivered.items)) delivered.items[0..0] else think_tags.splitThinkBlock(delivered.items, true, opens_think).content;
+        if (content.len > sent_content) {
+            listing.skipTo(@intFromPtr(content.ptr) - @intFromPtr(delivered.items.ptr));
+            sent_content = content.len;
+            const r = listing.sent(@min(i, frags.len));
+            for (r.start..r.end) |k| listed[k] = true;
+        }
+        if (gate.matched != null) break;
+    }
+    const r = listing.late(frags.len);
+    for (r.start..r.end) |k| listed[k] = true;
+}
+
+/// A stream and a non-stream reply list logprobs for the same tokens: those whose bytes the reply returned. Prose only:
+/// a stream gates tool markup before it sends, which this driver does not model.
+fn expectSameListing(allocator: std.mem.Allocator, generated: []const u8, frag_len: usize, stops: []const []const u8, ask_in: Ask) !void {
+    var ask = ask_in;
+    ask.stops = stops;
+    var frags = std.ArrayList([]const u8).empty;
+    defer frags.deinit(allocator);
+    var at: usize = 0;
+    while (at < generated.len) : (at += frag_len) try frags.append(allocator, generated[at..@min(at + frag_len, generated.len)]);
+    const got = try allocator.alloc(bool, frags.items.len);
+    defer allocator.free(got);
+    @memset(got, false);
+    try streamListed(allocator, frags.items, stops, ask.opens_think, got);
+
+    const whole = try settle(allocator, .{ .text = generated, .source = .whole, .finish_reason = "length", .finish_details = null }, ask);
+    defer whole.deinit(allocator);
+    var listing: listed_tokens.Listing = .{};
+    defer listing.deinit(allocator);
+    for (frags.items) |f| try listing.note(allocator, f.len);
+    const content = think_tags.splitThinkBlock(whole.text, true, ask.opens_think).content;
+    const from = if (content.len > 0) @intFromPtr(content.ptr) - @intFromPtr(whole.text.ptr) else 0;
+    const r = listing.touching(from, from + content.len);
+    for (got, 0..) |g, k| try testing.expectEqual(k >= r.start and k < r.end, g);
+}
+
 test "a stream and a non-stream reply end the same: a stop in a call, a stop after one, a length end, a cancel" {
     const a = testing.allocator;
     const tools =
@@ -682,5 +746,11 @@ test "a stream and a non-stream reply end the same: a stop in a call, a stop aft
             try expectSameEnd(a, call ++ "\n" ++ open, &stops, finish, ask, null, finish, 1);
         }
         try expectSameEnd(a, call ++ "\n" ++ open ++ "STOP and more", &stops, "length", ask, "STOP", "stop", 1);
+        // Logprobs list the text returned: a stop's own tokens, and a thought the reply does not ship, are never listed.
+        try expectSameListing(a, "an answer that runs on STOP and more", 5, &stops, ask);
+        try expectSameListing(a, "<think>a thought the cap cut off", 5, &stops, ask);
+        try expectSameListing(a, "<think>a thought</think>then an answer STOP more", 5, &stops, ask);
+        // A stop prefix one token holds is not listed while a later token releases the text before it.
+        try expectSameListing(a, "ab STXQ more", 1, &.{ "STOP", "TXQ" }, ask);
     }
 }

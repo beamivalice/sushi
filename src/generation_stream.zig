@@ -27,6 +27,7 @@ const sendSseHeaders = http_conn.sendSseHeaders;
 const request_policy = @import("request_policy.zig");
 const withEffortNoticeJson = request_policy.withEffortNoticeJson;
 const logprobs = @import("logprobs.zig");
+const listed_tokens = @import("listed_tokens.zig");
 const StreamLogprobs = logprobs.StreamLogprobs;
 const formatLogprobsObject = logprobs.formatLogprobsObject;
 const io_util = @import("io_util.zig");
@@ -1431,12 +1432,13 @@ pub fn handleStreamingGeneration(
         // The gate delivers the bytes before a match and holds back any tail that could still become
         // one, or a character the token left unfinished.
         const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
-            try lps.note(token_id);
             const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
             defer allocator.free(raw_decoded);
+            try lps.note(token_id, raw_decoded.len);
             if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
             break :blk try stop_gate.push(allocator, raw_decoded);
         };
+        lps.release(stop_gate.released);
         stopped = stop_gate.matched != null;
         if (stopped) slot_handle.?.stop_hit.store(true, .release);
         if (token_text.len == 0) {
@@ -1527,7 +1529,7 @@ pub fn handleStreamingGeneration(
                         // after it: everything buffered so far was reasoning,
                         // and leaving it pending hands it to the NEXT chunk
                         // (measured: 42 entries on a 1-char delta).
-                        if (split.content.len > 0) lps.skipToContent(undelivered, split.content, stop_gate.carry_len) else lps.dropPending();
+                        if (split.content.len > 0) lps.skipToContent(undelivered, split.content) else lps.dropPending();
                         for (token_texts.items) |tt| allocator.free(tt);
                         token_texts.clearRetainingCapacity();
                         text_buf.clearRetainingCapacity();
@@ -1666,7 +1668,7 @@ pub fn handleStreamingGeneration(
                 if (content_after.len > 0) {
                     // The reasoning above this point never reaches the client,
                     // so its entries stop here rather than riding the answer.
-                    lps.skipToContent(think_buf.items, content_after, stop_gate.carry_len);
+                    lps.skipToContent(think_buf.items, content_after);
                     switch (try content.deliver(allocator, content_after)) {
                         .send => |bytes| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take() }),
                         else => {},
@@ -1868,7 +1870,7 @@ pub fn handleStreamingGeneration(
                     // normalized rewrite. If the content cannot be found there
                     // (normalization moved it) nothing is skipped, which is the
                     // old behaviour rather than a wrong boundary.
-                    lps.skipToContent(full_text.items, think_split.content, stop_gate.carry_len);
+                    lps.skipToContent(full_text.items, think_split.content);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null, null, .{ .logprobs_json = try lps.take() });
                 } else {
                     // All reasoning, no content: those entries describe text the
@@ -1882,14 +1884,14 @@ pub fn handleStreamingGeneration(
     const total_prompt = ts.prompt_tokens;
     if (!client_gone) {
         // Final chunk with finish_reason
-        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish_reason, .details = ts.finish_details }, null, null, .{ .logprobs_json = try lps.take() });
+        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish_reason, .details = ts.finish_details }, null, null, .{ .logprobs_json = try lps.takeLate() });
 
         // Usage chunk (if requested via stream_options.include_usage). Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
         // OpenAI ships this chunk with an EMPTY choices array — restating
         // finish_reason/finish_details here made every per-event client render
-        // the ending twice (PR #147's doubled truncation banner). Pending
-        // logprobs all drained on the final chunk above.
+        // the ending twice (PR #147's doubled truncation banner). The
+        // final chunk above listed what content had left unlisted.
         if (include_usage) {
             const details = try formatReasoningDetails(allocator, tok, delivered_reasoning.items);
             defer allocator.free(details);
@@ -2457,7 +2459,7 @@ fn formatChatStreamToolCall(allocator: std.mem.Allocator, index: usize, id: []co
 }
 
 /// The half-open token range whose decoded text lands inside `content`.
-const ContentTokenRange = struct { start: usize, end: usize };
+const ContentTokenRange = listed_tokens.Range;
 
 /// Which of the generated tokens survive into `message.content`.
 ///
@@ -2488,19 +2490,15 @@ pub fn contentTokenRange(
         cptr - base
     else
         std.mem.indexOf(u8, full_text, content) orelse return all;
-    const end_off = start_off + content.len;
 
-    var start: ?usize = null;
-    var off: usize = 0;
-    for (token_ids, 0..) |id, i| {
-        if (off >= end_off) return .{ .start = start orelse i, .end = i };
+    var listing: listed_tokens.Listing = .{};
+    defer listing.deinit(allocator);
+    for (token_ids) |id| {
         const text = tok.decode(allocator, &[_]u32{id}) catch return all;
         defer allocator.free(text);
-        // A token straddling the boundary belongs to content: it put bytes there.
-        if (start == null and off + text.len > start_off) start = i;
-        off += text.len;
+        listing.note(allocator, text.len) catch return all;
     }
-    return .{ .start = start orelse token_ids.len, .end = token_ids.len };
+    return listing.touching(start_off, start_off + content.len);
 }
 
 /// SSE comment keepalive for the OpenAI-style streaming surfaces. Comments

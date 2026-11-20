@@ -247,6 +247,9 @@ before reading a completed stream and requires clean EOF.
 - Logprobs are the MODEL's distribution (pre-temperature), ids travel WITH values, entry belongs to the RETURNED
   token (one-token delay); `logprobs.content` describes `message.content` (`contentTokenRange`); streaming logprobs
   are a SIBLING of `delta` shipped EXACTLY once against a high-water mark. logprobs>0 + grammar disable spec.
+- **Logprobs list exactly the tokens whose bytes the reply returns**, chat and legacy completions, streamed or not
+  (`listed_tokens.Listing`): a stop's own tokens (the stop gate's `released` bytes) and a thought the reply does not ship
+  are never listed, and a chunk with no content (the final one) lists only what sent content left behind.
 - Logprobs are `logits - logsumexp` in f32 (`sampler.computeLogprobs`): `log(softmax)` in bf16 lands on bf16's grid, 0.125
   apart between -16 and -32. On DeepSeek on Sushi Cooler the engine has no logsumexp or argpartition, so the row is read
   back once and ranked on the host (f64 sum): ids and order are MLX's (ties by the lower id), values may differ in the last bits.

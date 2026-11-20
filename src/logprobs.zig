@@ -6,6 +6,7 @@ const sampler = @import("sampler.zig");
 const server = @import("server.zig");
 const generation_stream = @import("generation_stream.zig");
 const contentTokenRange = generation_stream.contentTokenRange;
+const Listing = @import("listed_tokens.zig").Listing;
 const jsonEscape = server.jsonEscape;
 
 /// Streaming-side logprobs accumulator.
@@ -13,9 +14,9 @@ const jsonEscape = server.jsonEscape;
 /// The generator produces one entry per token; the SSE side emits chunks on
 /// its own cadence — the think gate and tool detection buffer many tokens into
 /// one delta, and some tokens produce no chunk at all. So entries are drained
-/// against a high-water mark rather than paired 1:1 with chunks, and each is
-/// shipped EXACTLY once: a delta cannot be retracted, so a re-send is as wrong
-/// as a drop.
+/// against the bytes the reply has delivered (`Listing`) rather than paired 1:1
+/// with chunks, and each is shipped EXACTLY once: a delta cannot be retracted,
+/// so a re-send is as wrong as a drop.
 ///
 /// Entries are BORROWED from the slot, which owns each `top_logprobs`
 /// allocation and frees it in `Slot.deinit`. Nothing here frees them.
@@ -26,15 +27,9 @@ pub const StreamLogprobs = struct {
     enabled: bool,
     /// High-water mark in the slot's buffer (what we have copied out).
     cursor: usize = 0,
-    /// How many entries have already ridden a chunk.
-    emitted: usize = 0,
+    /// Which noted tokens the reply returned text for.
+    listing: Listing = .{},
     ids: std.ArrayList(u32) = .empty,
-    /// Decoded byte length of each noted token, so a byte offset in the
-    /// generated text converts to a token index WITHOUT re-decoding and without
-    /// depending on how far entry publication has lagged behind `ids`.
-    lens: std.ArrayList(usize) = .empty,
-    /// Total decoded bytes noted so far — the generation's length.
-    bytes_noted: usize = 0,
     entries: std.ArrayList(sampler.LogprobResult) = .empty,
     /// The last rendered JSON, owned here and freed on the next drain — the
     /// caller passes it straight into a chunk and never sees the lifetime.
@@ -48,33 +43,32 @@ pub const StreamLogprobs = struct {
     pub fn deinit(self: *StreamLogprobs) void {
         if (self.rendered) |r| self.allocator.free(r);
         self.ids.deinit(self.allocator);
-        self.lens.deinit(self.allocator);
+        self.listing.deinit(self.allocator);
         self.entries.deinit(self.allocator);
     }
 
-    /// Record the id of a token the loop just consumed. The id is what renders
-    /// the `token`/`bytes` fields; the logprob values arrive separately.
-    pub fn note(self: *StreamLogprobs, id: u32) !void {
+    /// Record a token the loop just consumed and the bytes it adds to the reply's text (0 for one the reply hides).
+    /// The id is what renders the `token`/`bytes` fields; the logprob values arrive separately.
+    pub fn note(self: *StreamLogprobs, id: u32, shown_len: usize) !void {
         if (!self.enabled) return;
         try self.ids.append(self.allocator, id);
-        const text = self.tok.decode(self.allocator, &[_]u32{id}) catch "";
-        defer if (text.len > 0) self.allocator.free(text);
-        try self.lens.append(self.allocator, text.len);
-        self.bytes_noted += text.len;
+        try self.listing.note(self.allocator, shown_len);
     }
 
-    /// Drop the entries for tokens whose bytes never reach the client.
+    /// The stop gate's running count of delivered bytes (`Gate.released`), after each token it took. Tokens past it
+    /// (a held stop prefix, a stop's own) are never listed while held, nor once the stop fired.
+    pub fn release(self: *StreamLogprobs, delivered: usize) void {
+        self.listing.released = delivered;
+    }
+
+    /// Skip the entries of text the client never receives as content.
     ///
     /// `logprobs.content` describes `message.content`, and the think gate cuts
     /// the reasoning block out of the stream — so without this the entries
     /// shipped alongside the answer were the model's *thinking*. `tail` is the
-    /// gate's buffer (always a suffix of the generation, since it is only ever
-    /// cleared wholesale) and `content` the part of it that survives.
-    ///
-    /// Indexes `ids`/`lens`, which are complete, rather than the pending
-    /// window — a token whose logprob has not been published yet still has a
-    /// length, so a lagging publisher cannot skew the boundary.
-    pub fn skipToContent(self: *StreamLogprobs, tail: []const u8, content: []const u8, carry: usize) void {
+    /// gate's buffer (always a suffix of the delivered text, since it is only
+    /// ever cleared wholesale) and `content` the part of it that survives.
+    pub fn skipToContent(self: *StreamLogprobs, tail: []const u8, content: []const u8) void {
         if (!self.enabled or content.len == 0) return;
         const base = @intFromPtr(tail.ptr);
         const cptr = @intFromPtr(content.ptr);
@@ -82,51 +76,46 @@ pub const StreamLogprobs = struct {
             cptr - base
         else
             std.mem.indexOf(u8, tail, content) orelse return;
-        const noted = self.bytes_noted -| carry;
-        if (noted < tail.len) return;
-        const abs = noted - tail.len + off_in_tail;
-
-        var off: usize = 0;
-        for (self.lens.items, 0..) |len, i| {
-            // A token straddling the boundary put bytes into content, so it is
-            // the first content token rather than the last reasoning one.
-            if (off + len > abs) {
-                if (i > self.emitted) self.emitted = i;
-                return;
-            }
-            off += len;
-        }
-        self.emitted = self.ids.items.len;
+        if (self.listing.released < tail.len) return;
+        self.listing.skipTo(self.listing.released - tail.len + off_in_tail);
     }
 
     /// Retire every pending entry unshipped — the turn produced no content, so
     /// nothing pending describes text the client received.
     pub fn dropPending(self: *StreamLogprobs) void {
         if (!self.enabled) return;
-        self.emitted = self.ids.items.len;
+        self.listing.retire();
     }
 
-    /// Render everything new, or null when logprobs weren't requested or
+    /// Render what a content chunk going out now describes, or null when logprobs weren't requested or
     /// nothing has landed since the last chunk.
     pub fn take(self: *StreamLogprobs) !?[]const u8 {
+        return self.drain(true);
+    }
+
+    /// Render the entries of content already sent that had not landed when it went out. A chunk that carries no
+    /// content (the final one) takes through this: what the reply did not return is never listed there.
+    pub fn takeLate(self: *StreamLogprobs) !?[]const u8 {
+        return self.drain(false);
+    }
+
+    fn drain(self: *StreamLogprobs, content_chunk: bool) !?[]const u8 {
         if (!self.enabled) return null;
         if (self.rendered) |r| {
             self.allocator.free(r);
             self.rendered = null;
         }
-        const slot = self.slot orelse return null;
-        self.cursor = try slot.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
+        if (self.slot) |slot| self.cursor = try slot.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
         // An id with no entry yet (or the reverse) is a partially published
         // token — hold it for the next chunk rather than shipping a half pair.
-        const avail = @min(self.ids.items.len, self.entries.items.len);
-        if (avail <= self.emitted) return null;
-        const ids = self.ids.items[self.emitted..avail];
-        const lps = self.entries.items[self.emitted..avail];
+        const r = if (content_chunk) self.listing.sent(self.entries.items.len) else self.listing.late(self.entries.items.len);
+        if (r.end <= r.start) return null;
+        const ids = self.ids.items[r.start..r.end];
+        const lps = self.entries.items[r.start..r.end];
         const json = if (self.legacy)
             try formatCompletionsLogprobs(self.allocator, self.tok, ids, lps, &self.text_offset)
         else
             try formatLogprobsObject(self.allocator, self.tok, ids, lps);
-        self.emitted = avail;
         self.rendered = json;
         return json;
     }
@@ -322,12 +311,14 @@ test "skipToContent keeps the content token when a multi-byte character splits a
 
     var lps = StreamLogprobs{ .allocator = a, .tok = &tok, .slot = null, .enabled = true };
     defer lps.deinit();
-    try lps.note(1);
-    try lps.note(2);
-    try lps.note(3);
+    try lps.note(1, 1);
+    try lps.note(2, 1);
+    try lps.note(3, lead.len);
+    // The gate delivered "RC"; the lead byte of the split character is still its carry.
+    lps.release(2);
     const tail = "RC";
-    lps.skipToContent(tail, tail[1..], lead.len);
-    try std.testing.expectEqual(@as(usize, 1), lps.emitted);
+    lps.skipToContent(tail, tail[1..]);
+    try std.testing.expectEqual(@as(usize, 1), lps.listing.emitted);
 }
 
 test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tokens" {

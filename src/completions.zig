@@ -43,6 +43,7 @@ const clampMaxTokens = request_policy.clampMaxTokens;
 const parseRepeatPenalty = request_policy.parseRepeatPenalty;
 const parseAdditivePenalty = request_policy.parseAdditivePenalty;
 const logprobs = @import("logprobs.zig");
+const listed_tokens = @import("listed_tokens.zig");
 const StreamLogprobs = logprobs.StreamLogprobs;
 const formatCompletionsLogprobs = logprobs.formatCompletionsLogprobs;
 const io_util = @import("io_util.zig");
@@ -103,6 +104,22 @@ pub fn completionText(allocator: std.mem.Allocator, tok: *const Tokenizer, ids: 
     defer shown.deinit(allocator);
     for (ids) |id| if (completionShowsToken(tok, id, true)) try shown.append(allocator, id);
     return tok.decode(allocator, shown.items);
+}
+
+/// The tokens of `ids` that put a byte into the first `text_len` bytes of the completion's text.
+fn listedBy(allocator: std.mem.Allocator, tok: *const Tokenizer, ids: []const u32, skip_special: bool, text_len: usize) !listed_tokens.Range {
+    var listing: listed_tokens.Listing = .{};
+    defer listing.deinit(allocator);
+    for (ids) |id| {
+        if (!completionShowsToken(tok, id, skip_special)) {
+            try listing.note(allocator, 0);
+            continue;
+        }
+        const text = try tok.decode(allocator, &[_]u32{id});
+        defer allocator.free(text);
+        try listing.note(allocator, text.len);
+    }
+    return listing.touching(0, text_len);
 }
 
 fn withTextPromptBos(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, body: []const u32) ![]u32 {
@@ -427,6 +444,10 @@ fn handleNonStreamingCompletion(
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
+    defer if (result.logprobs) |lps| {
+        for (lps) |*lp| allocator.free(lp.top_logprobs);
+        allocator.free(lps);
+    };
 
     // Text completion is a raw continuation: FIM clients rely on exact
     // indentation (stream and non-stream bytes match).
@@ -454,10 +475,13 @@ fn handleNonStreamingCompletion(
     // `null` unless the request asked: OpenAI omits the field's content rather
     // than shipping an empty object that reads as "no alternatives exist".
     var lp_offset_base: usize = 0;
-    const lp_json: []const u8 = if (logprobs_n > 0 and result.logprobs != null)
-        try formatCompletionsLogprobs(allocator, tok, result.token_ids, result.logprobs.?, &lp_offset_base)
-    else
-        "null";
+    const lp_json: []const u8 = if (logprobs_n > 0 and result.logprobs != null) lp: {
+        // The tokens whose bytes the text kept: a stop's own tokens are cut from the text, and from the list.
+        const lps = result.logprobs.?;
+        const n = @min(result.token_ids.len, lps.len);
+        const r = try listedBy(allocator, tok, result.token_ids[0..n], skip_special, final_text.len);
+        break :lp try formatCompletionsLogprobs(allocator, tok, result.token_ids[r.start..r.end], lps[r.start..r.end], &lp_offset_base);
+    } else "null";
     defer if (!std.mem.eql(u8, lp_json, "null")) allocator.free(lp_json);
 
     const timings_field = try completionTimingsField(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
@@ -606,12 +630,16 @@ fn handleStreamingCompletion(
             break;
         }
         const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
-            try lps.note(token_id);
-            if (!completionShowsToken(tok, token_id, skip_special)) continue;
+            if (!completionShowsToken(tok, token_id, skip_special)) {
+                try lps.note(token_id, 0);
+                continue;
+            }
             const raw_decoded_c = try tok.decode(allocator, &[_]u32{token_id});
             defer allocator.free(raw_decoded_c);
+            try lps.note(token_id, raw_decoded_c.len);
             break :blk try stop_gate.push(allocator, raw_decoded_c);
         };
+        lps.release(stop_gate.released);
         defer allocator.free(token_text);
 
         stopped = stop_gate.matched != null;
@@ -644,7 +672,7 @@ fn handleStreamingCompletion(
     const total_prompt = ts.prompt_tokens;
 
     if (!client_gone) {
-        const final_lp = (try lps.take()) orelse "null";
+        const final_lp = (try lps.takeLate()) orelse "null";
         // finish_reason always carries finish_details beside it.
         const final_chunk = try std.fmt.allocPrint(allocator,
             \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":"","logprobs":{s},"finish_reason":"{s}"{s}}}]}}
