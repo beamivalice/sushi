@@ -182,12 +182,21 @@ fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, ne
     defer server_state.max_concurrent = prev_max;
     defer server_state.shutdown_requested.store(false, .release);
     server.accept_spawned_with_hooks = false;
-    try server.serve(io, a, params, stub.config, "127.0.0.1", 0, .{
+    server.serve(io, a, params, stub.config, "127.0.0.1", 0, .{
         .embedded_client = if (needs.listener) null else startClient,
         .on_ready = if (needs.listener) startClientOnReady else null,
         .request_timeout_sec = 300,
         .test_on_cooler = true,
-    });
+    }) catch |err| {
+        // The scenario's own error is the cause when it failed first: a shutdown it asked on the way out is what
+        // serve then failed to drain.
+        if (failed) |e| std.debug.print("server test: the scenario failed with {s}\n", .{@errorName(e)});
+        if (err != error.ConnectionsOutliveShutdown) return err;
+        // Serve skipped its teardown: the scheduler and inference thread are alive and a connection thread holds the
+        // model, so the defers below would free under them. `main` exits here too.
+        std.debug.print("server test: {s}: a connection thread outlived the shutdown drain, ending the process\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
     if (failed) |e| return e;
 }
 
@@ -466,6 +475,23 @@ test "server: a shutdown with the submit queue full ends the request waiting for
                 if (std.mem.indexOf(u8, all, "\"finish_reason\":\"length\"") != null or std.mem.indexOf(u8, all, "\"finish_reason\":\"stop\"") != null)
                     return error.ServedPastTheShutdown;
                 if (std.mem.indexOf(u8, all, "shutting down") == null) return error.EndedWithoutTheShutdownError;
+            }
+        }
+    }.run);
+}
+
+test "server: a request whose connection thread reads it after the shutdown was asked is answered with the shutdown error" {
+    try eachArch(1, .{}, struct {
+        fn run() !void {
+            // The flag is up before the connection exists, so its thread's first read finds the shutdown with the
+            // whole request already in the socket, as a thread the box scheduled late does.
+            server.requestShutdown();
+            var b: [512]u8 = undefined;
+            const all = try request("POST", "/v1/completions", try completionBody(&b, "hi", 2, true));
+            defer gpa.free(all);
+            if (!std.mem.startsWith(u8, all, "HTTP/1.1 503") or std.mem.indexOf(u8, all, "shutting down") == null) {
+                std.debug.print("a request read after the shutdown was asked: '{s}'\n", .{all[0..@min(all.len, 200)]});
+                return error.EndedWithoutTheShutdownError;
             }
         }
     }.run);

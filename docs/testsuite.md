@@ -279,6 +279,9 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - A server scenario under concurrency (requests racing a delete, a shutdown or an unload) runs in process through
   `src/server_test.zig`: `serve` with an embedded client, each arch's servable tiny (`cooler_contract.serverDir`) on
   Sushi Cooler, socketpair connections, an allocator that poisons what it frees.
+  A scenario that fails while a connection thread still loads leaves `serve` with `ConnectionsOutliveShutdown` and no
+  teardown: the harness prints the scenario's error beside it and ends the process, as `main` does, since freeing under
+  the live scheduler and inference thread is undefined (a segfault that hid the cause).
   A cell under a declared wired limit sets it with `setWiredFloor`, whose limit is the box's RAM (a floor is at most
   the RAM less the margin) and which refuses a floor the bill would not read: a 120,000 MB limit declared none below
   about 118 GB of RAM, so its cells tested nothing there.
