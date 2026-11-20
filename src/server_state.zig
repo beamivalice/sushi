@@ -24,6 +24,18 @@ pub fn setMaxRequestMb(value: ?u32) void {
     max_request_bytes.store(@as(usize, value orelse model_settings.default_max_request_mb) << 20, .monotonic);
 }
 
+/// `server.continue_after_thought`: a reply whose turn ends inside its thought is continued once after its closed think
+/// block. The settings API changes it while serving; each request reads it once, at its turn's end.
+var continue_after_thought = std.atomic.Value(bool).init(true);
+
+pub fn setContinueAfterThought(on: bool) void {
+    continue_after_thought.store(on, .monotonic);
+}
+
+pub fn continueAfterThought() bool {
+    return continue_after_thought.load(.monotonic);
+}
+
 /// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
 /// (i.e. from another machine over the network) except the `/health` probe and
 /// CORS preflight requires the key — the OpenAI/Anthropic APIs AND the

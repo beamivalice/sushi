@@ -24,7 +24,75 @@ pub fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
 /// this intentional stop must not ask clients to recover by compacting/retrying.
 pub fn shouldParseToolCalls(finish_details: ?[]const u8) bool {
     const d = finish_details orelse return true;
-    return !std.mem.eql(u8, d, "repetition_loop");
+    return !std.mem.eql(u8, d, "repetition_loop") and !std.mem.eql(u8, d, thought_loop);
+}
+
+/// `finish_details` of a reply whose turn ended inside its thought (`server.continue_after_thought`).
+pub const thought_continued = "continued_after_thought";
+/// The continuation then stopped on a repetition loop.
+pub const thought_loop = "repetition_loop_after_thought";
+
+/// Why a reply whose turn ended inside its thought was not continued.
+pub const ThoughtKept = enum {
+    /// max_tokens (or the context the request was billed) leaves no token for the continuation.
+    max_tokens,
+    /// The template writes no thought for the turn (DeepSeek's chat mode): its continuation would drop it.
+    template_drops_thought,
+    /// The template could not render the continuation.
+    render_failed,
+    /// The request carries images: the continuation does not encode them again.
+    images,
+    /// The request asked for logprobs, which describe one generation.
+    logprobs,
+    /// A JSON schema constrains the reply.
+    json_schema,
+    /// The request is itself a continuation of an assistant message.
+    continuation_request,
+
+    /// The `finish_details` value naming it.
+    pub fn details(self: ThoughtKept) []const u8 {
+        return switch (self) {
+            inline else => |k| "thought_not_continued:" ++ @tagName(k),
+        };
+    }
+};
+
+/// The `finish_details` object (with no key) a details value names, or null for none this module defines.
+pub fn thoughtDetailsJson(details: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, details, thought_continued)) return "{\"type\":\"continued_after_thought\",\"message\":\"continued after the thought ended the turn\"}";
+    if (std.mem.eql(u8, details, thought_loop)) return "{\"type\":\"repetition_loop\",\"continued_after_thought\":true}";
+    inline for (comptime std.enums.values(ThoughtKept)) |k| {
+        if (std.mem.eql(u8, details, k.details())) return "{\"type\":\"thought_ended_turn\",\"not_continued\":\"" ++ @tagName(k) ++ "\"}";
+    }
+    return null;
+}
+
+/// The thought's details object as a field named `key`, with its leading comma, or "" when `details` names none: the
+/// surfaces whose finish carries no `finish_details` (Anthropic's `stop_details`, the Responses object).
+pub fn thoughtDetailsField(comptime key: []const u8, details: ?[]const u8) []const u8 {
+    const d = details orelse return "";
+    inline for ([_][]const u8{ thought_continued, thought_loop } ++ kept_details) |v| {
+        if (std.mem.eql(u8, d, v)) return ",\"" ++ key ++ "\":" ++ comptime thoughtDetailsJson(v).?;
+    }
+    return "";
+}
+
+const kept_details = blk: {
+    const kept = std.enums.values(ThoughtKept);
+    var out: [kept.len][]const u8 = undefined;
+    for (kept, 0..) |k, i| out[i] = k.details();
+    break :blk out;
+};
+
+/// The thought of a reply that holds only its thought (no visible text, no call), trimmed and owned, or null.
+pub fn soleThought(allocator: std.mem.Allocator, text: []const u8, ask: Ask) !?[]u8 {
+    const settled = try settle(allocator, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+    defer settled.deinit(allocator);
+    if (settled.reply != null) return null;
+    const split = think_tags.splitThinkBlock(settled.text, true, ask.opens_think);
+    const thought = std.mem.trim(u8, split.reasoning_content orelse return null, " \t\r\n");
+    if (thought.len == 0 or std.mem.trim(u8, split.content, " \t\r\n").len > 0) return null;
+    return try allocator.dupe(u8, thought);
 }
 
 /// How the text came to be.
@@ -758,4 +826,33 @@ test "a stream and a non-stream reply end the same: a stop in a call, a stop aft
         // A stop prefix one token holds is not listed while a later token releases the text before it.
         try expectSameListing(a, "ab STXQ more", 1, &.{ "STOP", "TXQ" }, ask);
     }
+}
+
+test "a reply holds only its thought when it has no visible text and no call, its thought open or closed" {
+    const a = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+    ;
+    const call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
+    const Case = struct { text: []const u8, opens: bool, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .text = "I should check the clock.\n", .opens = true, .want = "I should check the clock." },
+        .{ .text = "I should check the clock.\n</think>\n\n", .opens = true, .want = "I should check the clock." },
+        .{ .text = "<think>plan</think>", .opens = false, .want = "plan" },
+        .{ .text = "plan</think>\n\nIt is noon.", .opens = true, .want = null },
+        .{ .text = "plan\n" ++ call, .opens = true, .want = null },
+        .{ .text = "plan</think>\n\n" ++ call, .opens = true, .want = null },
+        .{ .text = " \n", .opens = true, .want = null },
+        .{ .text = "It is noon.", .opens = false, .want = null },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("text: {f}\n", .{std.zig.fmtString(c.text)});
+        const got = try soleThought(a, c.text, .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = c.opens });
+        defer if (got) |g| a.free(g);
+        if (c.want) |w| try testing.expectEqualStrings(w, got.?) else try testing.expect(got == null);
+    }
+    // Every details value this module writes has its object, and a loop after the continuation still parses no call.
+    try testing.expect(thoughtDetailsJson(thought_continued) != null);
+    try testing.expect(!shouldParseToolCalls(thought_loop));
+    for (std.enums.values(ThoughtKept)) |k| try testing.expect(thoughtDetailsJson(k.details()) != null);
 }

@@ -229,6 +229,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   The thinking-on prompt plus a bare closer gave `<think>\n</think>` and no block at all; it is only the fallback now.
   A turn of `reasoning_content` alone is cut where its content starts, the thought closed once; a template that writes
   no thought for it, and a close tag in the continued `content`, are refused by name (400), never a new turn.
+- **A turn that ends on its end-of-turn token with a thought and nothing else is continued once, in the same request**
+  (`generation_stream.continueAfterThought`, `server.continue_after_thought`, on by default): the prompt is that same
+  continuation render, the reply carries the close tag then the new tokens, and `finish_details` (`stop_details` on
+  `/v1/messages`, the response object on Responses) says `continued_after_thought`, or `thought_ended_turn` and why not.
 - **A rewrite after the render reads byte origins, never bare bytes**: the continuation is cut where the partial turn's
   assistant bytes end, which must end with its text (else the fallback: a search found it in the user's turn); a
   doubled `</think></think>` collapses, and a think opener is closed, only where the template wrote it.

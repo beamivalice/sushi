@@ -379,6 +379,107 @@ const EarlyStop = struct {
     }
 };
 
+/// What a request gives the server to continue a reply whose turn ended inside its thought
+/// (`server.continue_after_thought`): the render a client-side `continue_final_message` of that thought-only reply gives.
+pub const ThoughtResume = struct {
+    chat_config: *const chat_mod.ChatConfig,
+    messages: []const chat_mod.Message,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    effort: ?[]const u8,
+    /// The reply's end handling, as its surface settles it (`reply.Ask`).
+    stops: []const []const u8,
+    has_tools: bool,
+    allow_parallel: bool,
+    /// Why this request is not continued; `finish_details` names it when its turn ends inside the thought.
+    kept: ?reply_mod.ThoughtKept = null,
+
+    /// What a request that cannot be continued is kept for, or null when it can be.
+    pub fn keptFor(continue_final: bool, images: bool, asked_logprobs: bool, constrained: bool) ?reply_mod.ThoughtKept {
+        if (continue_final) return .continuation_request;
+        if (images) return .images;
+        if (asked_logprobs) return .logprobs;
+        if (constrained) return .json_schema;
+        return null;
+    }
+};
+
+const ThoughtStep = union(enum) {
+    /// The turn did not end inside its thought, or the setting is off: the reply is the generation's own.
+    none,
+    /// It did, and is not continued: the `finish_details` naming why.
+    kept: []const u8,
+    /// The continuation's slot, and the close tag the reply carries before its tokens (empty when the model closed it).
+    continued: struct { slot: *scheduler_mod.Slot, bridge: []u32 },
+};
+
+/// After `slot`'s turn ends: whether it ended on its end-of-turn token with a thought and nothing else, and if so the
+/// once-only continuation, submitted, or why none runs. `params` is what `slot` was submitted with.
+fn continueAfterThought(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler, tok: *const Tokenizer, r: *const ThoughtResume, slot: *scheduler_mod.Slot, generated: []const u32, params: scheduler_mod.SubmitParams) !ThoughtStep {
+    if (!std.mem.eql(u8, slot.finish_reason, "stop") or slot.finish_details != null) return .none;
+    const stop = slot.stop_token orelse return .none;
+    if (!generate_mod.isEosId(stop, slot.eos_token_ids) or !server_state.continueAfterThought()) return .none;
+    const text = try tok.decode(allocator, generated);
+    defer allocator.free(text);
+    const ask: reply_mod.Ask = .{
+        .stops = r.stops,
+        .normalize = true,
+        .has_tools = r.has_tools,
+        .tools_json = r.tools_json,
+        .allow_parallel = r.allow_parallel,
+        .dialect = if (r.has_tools) try chat_mod.callDialect(allocator, r.chat_config) else null,
+        .opens_think = promptOpensThink(allocator, tok, params.prompt_ids),
+    };
+    const thought = (try reply_mod.soleThought(allocator, text, ask)) orelse return .none;
+    defer allocator.free(thought);
+    if (r.kept) |k| return keptThought(slot, k);
+    const turns = try std.mem.concat(allocator, chat_mod.Message, &.{ r.messages, &.{.{ .role = "assistant", .content = "", .reasoning_content = thought }} });
+    defer allocator.free(turns);
+    const prompt = chat_mod.formatChat(allocator, tok, turns, r.chat_config, r.tools_json, r.tool_choice_instruction, r.enable_thinking, r.effort, true) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ContinuationDropsThought => return keptThought(slot, .template_drops_thought),
+        else => {
+            log.warn("  [thought] request {d}: the continuation did not render ({s})\n", .{ slot.request_id, @errorName(err) });
+            return keptThought(slot, .render_failed);
+        },
+    };
+    defer allocator.free(prompt);
+    // The continuation spends what the thought left of max_tokens, inside the prompt plus max_tokens the request was billed.
+    const billed = params.prompt_ids.len + params.max_tokens;
+    const left = @min(params.max_tokens -| slot.completion_tokens, billed -| prompt.len);
+    if (left == 0) return keptThought(slot, .max_tokens);
+    var next = params;
+    next.prompt_ids = prompt;
+    next.full_prompt = prompt;
+    next.cached_tokens = 0;
+    next.max_tokens = left;
+    next.sampling.think_bound = null;
+    next.sampling.call_force = null;
+    next.sampling.think_penalty.phase = .after;
+    const bridge = if (think_tags.indexOfThinkCloseTag(text, 0) == null) try tok.encode(allocator, think_tags.BARE_THINK_CLOSER) else try allocator.alloc(u32, 0);
+    errdefer allocator.free(bridge);
+    const cont = try sch.submit(next);
+    log.info("  [thought] request {d} ended its turn inside its thought: continued once after its closed think block as request {d} ({d} prompt tokens, {d} max_tokens left)\n", .{ slot.request_id, cont.request_id, prompt.len, left });
+    return .{ .continued = .{ .slot = cont, .bridge = bridge } };
+}
+
+fn keptThought(slot: *const scheduler_mod.Slot, k: reply_mod.ThoughtKept) ThoughtStep {
+    log.info("  [thought] request {d} ended its turn inside its thought: not continued ({s})\n", .{ slot.request_id, @tagName(k) });
+    return .{ .kept = k.details() };
+}
+
+/// What the continuation reused: its prompt's tokens the prefix cache restored, and its prefill time.
+fn logContinuation(cont: *const scheduler_mod.Slot) void {
+    log.debug("  [thought] request {d}: {d} of {d} prompt tokens restored, prefill {d} us\n", .{ cont.request_id, cont.cached_tokens, cont.prompt_tokens, cont.prefill_ns / std.time.ns_per_us });
+}
+
+/// The `finish_details` of a reply its continuation ended: the continuation's own loop stop, or that it ran.
+fn continuedDetails(last: ?[]const u8) []const u8 {
+    if (last) |d| if (std.mem.eql(u8, d, "repetition_loop")) return reply_mod.thought_loop;
+    return reply_mod.thought_continued;
+}
+
 const DrainEnd = enum { done, client_gone, stopped, cancelled, failed };
 
 /// Connection thread: collect the slot's tokens until it ends, the client leaves or `early` sees a stop complete.
@@ -462,8 +563,10 @@ pub fn nonStreamingViaScheduler(
     /// instead of grinding out a ghost generation nobody will read.
     conn: ?*Conn,
     stop: StopSpec,
+    /// Continue a turn that ends inside its thought (`server.continue_after_thought`); null on a surface with none.
+    thought: ?*const ThoughtResume,
 ) !generate_mod.GenerationResult {
-    var slot = try sch.submit(.{
+    const params: scheduler_mod.SubmitParams = .{
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = full_prompt,
@@ -490,7 +593,8 @@ pub fn nonStreamingViaScheduler(
         .mrope_delta = mrope.delta,
         .logprobs_n = logprobs_n,
         .kv_quant_config = kv_quant_override,
-    });
+    };
+    const slot = try sch.submit(params);
     defer sch.complete(slot);
 
     var output_ids = std.ArrayList(u32).empty;
@@ -502,16 +606,41 @@ pub fn nonStreamingViaScheduler(
         .completion_skip_special = stop.completion_skip_special,
     } else null;
     defer if (early) |*e| e.gate.deinit(allocator);
-    const end = try drainSettled(sch, slot, conn, allocator, &output_ids, if (early) |*e| e else null);
+    var end = try drainSettled(sch, slot, conn, allocator, &output_ids, if (early) |*e| e else null);
     if (end == .failed) return slotFailure(slot);
+    // The part a continuation after the thought generates: its slot, and where its tokens start in `output_ids`.
+    var cont: ?*scheduler_mod.Slot = null;
+    defer if (cont) |c| sch.complete(c);
+    var cont_from: usize = 0;
+    var bridged: usize = 0;
+    var details = slot.finish_details;
+    if (end == .done) if (thought) |r| switch (try continueAfterThought(allocator, sch, tok, r, slot, output_ids.items, params)) {
+        .none => {},
+        .kept => |d| details = d,
+        .continued => |c| {
+            defer allocator.free(c.bridge);
+            cont = c.slot;
+            try output_ids.appendSlice(allocator, c.bridge);
+            bridged = c.bridge.len;
+            cont_from = output_ids.items.len;
+            end = try drainSettled(sch, c.slot, conn, allocator, &output_ids, if (early) |*e| e else null);
+            if (end == .failed) return slotFailure(c.slot);
+            logContinuation(c.slot);
+            details = continuedDetails(c.slot.finish_details);
+        },
+    };
+    const last = cont orelse slot;
     // An early stop or a cancel reports the tokens it returned, not the ones decoded past its end.
     const returned = end == .stopped or end == .cancelled;
+    const generated: u32 = slot.completion_tokens + if (cont) |c| c.completion_tokens else 0;
+    const prefill_ns = slot.prefill_ns + if (cont) |c| c.prefill_ns else 0;
+    const decode_ns = slot.decode_ns + if (cont) |c| c.decode_ns else 0;
 
     // The scheduler measures prefill_ns / decode_ns per-slot directly. Pull
     // those instead of the old single-wall-clock approximation, which
     // double-counted total time into both phases.
-    const prefill_tps = generate_mod.prefillTokensPerSec(slot.prompt_tokens, slot.cached_tokens, slot.prefill_ns);
-    const decode_tps = generate_mod.tokensPerSec(slot.completion_tokens, slot.decode_ns);
+    const prefill_tps = generate_mod.prefillTokensPerSec(slot.prompt_tokens, slot.cached_tokens, prefill_ns);
+    const decode_tps = generate_mod.tokensPerSec(generated, decode_ns);
 
     // A loop cut is a truncation, and the degenerate span is the part the
     // client must not get: an agent re-sends the cut turn as history, the
@@ -519,7 +648,7 @@ pub fn nonStreamingViaScheduler(
     // row, each firing sooner than the last (live 2026-08-05, under pi).
     // Only reachable non-streaming: a delta cannot be retracted, so a
     // streaming client has already received the tail.
-    const emit_ids = loopTrimmedIds(output_ids.items, slot.loop_trim_start);
+    const emit_ids = loopTrimmedIds(output_ids.items, if (last.loop_trim_start) |t| cont_from + t else null);
     const text = try tok.decode(allocator, emit_ids);
     const token_ids = try output_ids.toOwnedSlice(allocator);
 
@@ -552,15 +681,15 @@ pub fn nonStreamingViaScheduler(
         .text = text,
         .token_ids = token_ids,
         .prompt_tokens = slot.prompt_tokens,
-        .completion_tokens = if (returned) @intCast(token_ids.len) else slot.completion_tokens,
-        .finish_reason = nonStreamFinishReason(end, slot.finish_reason),
+        .completion_tokens = if (returned) @intCast(token_ids.len - bridged) else generated,
+        .finish_reason = nonStreamFinishReason(end, last.finish_reason),
         .prefill_tps = prefill_tps,
         .decode_tps = decode_tps,
-        .prefill_ns = slot.prefill_ns,
-        .decode_ns = slot.decode_ns,
+        .prefill_ns = prefill_ns,
+        .decode_ns = decode_ns,
         .cached_tokens = slot.cached_tokens,
         .logprobs = logprobs_slice,
-        .finish_details = slot.finish_details,
+        .finish_details = details,
         .constraint_payload_byte = constraint_payload_byte,
         .restore_ns = slot.restore_ns,
         .spec_mode = slot.spec_mode,
@@ -616,6 +745,7 @@ pub fn handleNonStreamingGeneration(
     /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
     /// the non-streaming chat response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
+    thought: ?*const ThoughtResume,
 ) !void {
     const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
     // Phase A8: this handler owns the vision array on entry; ownership
@@ -643,7 +773,7 @@ pub fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences });
+    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences }, thought);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -923,6 +1053,24 @@ pub const StreamingTokenStream = struct {
     delivered: u32 = 0,
     /// The slot was cancelled under the reader before it finished (`NextResult.cancelled`).
     cancelled: bool = false,
+    /// Continues a turn that ends inside its thought (`armThought`); `slot` is then the part generating now.
+    thought: ?ThoughtArm = null,
+
+    const ThoughtArm = struct {
+        sch: *scheduler_mod.Scheduler,
+        tok: *const Tokenizer,
+        render: *const ThoughtResume,
+        params: scheduler_mod.SubmitParams,
+        /// The thought part's tokens, read when its turn ends.
+        ids: std.ArrayList(u32) = .empty,
+        /// The thought part's slot once the continuation runs: the handler that submitted it completes it.
+        first: ?*scheduler_mod.Slot = null,
+        /// The close tag handed out before the continuation's tokens.
+        bridge: []u32 = &.{},
+        bridge_at: usize = 0,
+        /// Why the turn that ended inside its thought was not continued.
+        kept: ?[]const u8 = null,
+    };
 
     /// Phase A2-streaming: build a token stream backed by a scheduler Slot.
     /// `mode` is recorded for telemetry but doesn't drive next()'s dispatch
@@ -938,6 +1086,37 @@ pub const StreamingTokenStream = struct {
 
     pub fn deinit(self: *StreamingTokenStream, allocator: std.mem.Allocator) void {
         self.pending_buf.deinit(allocator);
+        if (self.thought) |*t| {
+            t.ids.deinit(allocator);
+            allocator.free(t.bridge);
+            if (t.first != null) t.sch.complete(self.slot.?);
+        }
+    }
+
+    /// Continue the turn once when it ends inside its thought; `params` is what the stream's slot was submitted with.
+    pub fn armThought(self: *StreamingTokenStream, sch: *scheduler_mod.Scheduler, tok: *const Tokenizer, render: ?*const ThoughtResume, params: scheduler_mod.SubmitParams) void {
+        const r = render orelse return;
+        self.thought = .{ .sch = sch, .tok = tok, .render = r, .params = params };
+    }
+
+    /// At the end of the thought part: switch to the continuation when its turn ended inside its thought.
+    fn resumeThought(self: *StreamingTokenStream, allocator: std.mem.Allocator) !bool {
+        const t = if (self.thought) |*t| t else return false;
+        if (t.first != null) return false;
+        const s = self.slot.?;
+        switch (try continueAfterThought(allocator, t.sch, t.tok, t.render, s, t.ids.items, t.params)) {
+            .none => return false,
+            .kept => |d| {
+                t.kept = d;
+                return false;
+            },
+            .continued => |c| {
+                t.first = s;
+                t.bridge = c.bridge;
+                self.slot = c.slot;
+                return true;
+            },
+        }
     }
 
     /// `finalize` after the request's own stop sequence ended the stream: the slot is cancelled and waited
@@ -955,14 +1134,17 @@ pub const StreamingTokenStream = struct {
     pub fn finalize(self: *StreamingTokenStream, sch: *scheduler_mod.Scheduler) void {
         if (self.slot) |s| {
             if (s.cancelled.load(.acquire)) sch.quiesce(s);
-            self.prompt_tokens = s.prompt_tokens;
-            self.cached_tokens = s.cached_tokens;
+            const first: ?*scheduler_mod.Slot = if (self.thought) |t| t.first else null;
+            if (first != null) logContinuation(s);
+            const head = first orelse s;
+            self.prompt_tokens = head.prompt_tokens;
+            self.cached_tokens = head.cached_tokens;
             // A cancel ends the stream on what it handed out; no finish set the slot's reason.
-            self.completion_tokens = if (self.cancelled) self.delivered else s.completion_tokens;
+            self.completion_tokens = if (self.cancelled) self.delivered else s.completion_tokens + if (first) |f| f.completion_tokens else 0;
             self.finish_reason = if (self.cancelled) "cancelled" else s.finish_reason;
-            self.finish_details = s.finish_details;
-            self.prefill_ns = s.prefill_ns;
-            self.decode_ns = s.decode_ns;
+            self.finish_details = if (first != null) continuedDetails(s.finish_details) else if (self.thought) |t| t.kept orelse s.finish_details else s.finish_details;
+            self.prefill_ns = s.prefill_ns + if (first) |f| f.prefill_ns else 0;
+            self.decode_ns = s.decode_ns + if (first) |f| f.decode_ns else 0;
         } else if (self.gen) |g| {
             self.prompt_tokens = g.prompt_tokens;
             self.completion_tokens = g.completion_tokens;
@@ -999,15 +1181,21 @@ pub const StreamingTokenStream = struct {
     /// socket and emit SSE keepalives during long prefills. The local-
     /// generator path computes synchronously and never idles.
     pub fn nextOrIdle(self: *StreamingTokenStream, allocator: std.mem.Allocator, timeout_ms: i64) !NextOrIdle {
-        if (self.slot) |s| {
+        while (self.slot) |s| {
+            if (self.thought) |*t| if (t.bridge_at < t.bridge.len) {
+                t.bridge_at += 1;
+                return .{ .token = t.bridge[t.bridge_at - 1] };
+            };
             if (self.finished) return .done;
             const nr = s.waitNextTimeout(timeout_ms) orelse return .idle;
             switch (nr) {
                 .token => |t| {
                     self.delivered += 1;
+                    if (self.thought) |*th| if (th.first == null) try th.ids.append(allocator, t);
                     return .{ .token = t };
                 },
                 .done => {
+                    if (try self.resumeThought(allocator)) continue;
                     self.finished = true;
                     return .done;
                 },
@@ -1247,6 +1435,7 @@ pub fn handleStreamingGeneration(
     /// usage SSE chunk so streaming clients see the same metric as
     /// non-streaming.
     tokenize_ns: u64,
+    thought: ?*const ThoughtResume,
 ) !void {
     const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
     // Vision array ownership: held by this handler on entry, transfers to
@@ -1289,7 +1478,7 @@ pub fn handleStreamingGeneration(
     const slot_ve_s = ve_local;
     ve_local = null;
     const sch = server_state.global_scheduler.?;
-    slot_handle = try sch.submit(.{
+    const params: scheduler_mod.SubmitParams = .{
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
@@ -1316,9 +1505,11 @@ pub fn handleStreamingGeneration(
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
-    });
+    };
+    slot_handle = try sch.submit(params);
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
+    ts.armThought(sch, tok, thought, params);
 
     // Send SSE headers (no Content-Length — we stream until done)
     try sendSseHeaders(stream, "chat.completions", SSE_ALLOW_HEADERS_DEFAULT);
@@ -1435,13 +1626,13 @@ pub fn handleStreamingGeneration(
                 // keepalive stops clients timing out on stream silence.
                 if (stream.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
-                    slot_handle.?.cancel();
+                    ts.slot.?.cancel();
                     client_gone = true;
                     break;
                 }
-                sendStreamIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, slot_handle.?)) catch {
+                sendStreamIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, ts.slot.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-                    slot_handle.?.cancel();
+                    ts.slot.?.cancel();
                     client_gone = true;
                     break;
                 };
@@ -1449,7 +1640,7 @@ pub fn handleStreamingGeneration(
             },
         };
         if (stream.peerClosed()) {
-            slot_handle.?.cancel();
+            ts.slot.?.cancel();
             client_gone = true;
             break;
         }
@@ -1459,12 +1650,12 @@ pub fn handleStreamingGeneration(
             const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
             defer allocator.free(raw_decoded);
             try lps.note(token_id, raw_decoded.len);
-            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
+            if (delivery) |*d| d.noteToken(raw_decoded.len, ts.slot.?.constraintPayloadStart());
             break :blk try stop_gate.push(allocator, raw_decoded);
         };
         lps.release(stop_gate.released);
         stopped = stop_gate.matched != null;
-        if (stopped) slot_handle.?.stop_hit.store(true, .release);
+        if (stopped) ts.slot.?.stop_hit.store(true, .release);
         if (token_text.len == 0) {
             allocator.free(token_text);
             if (stopped) break;
@@ -1750,7 +1941,7 @@ pub fn handleStreamingGeneration(
         // stream mid-generation.
         beatStreamKeepalive(stream, .sse_comment) catch {
             log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-            slot_handle.?.cancel();
+            ts.slot.?.cancel();
             client_gone = true;
             break;
         };

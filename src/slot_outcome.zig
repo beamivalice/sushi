@@ -302,6 +302,12 @@ pub fn finishSpec(slot: anytype, g: anytype) void {
     spec_stats.process.record(slot.spec_mode, slot.spec_totals, g.specRows());
 }
 
+fn endTurnAtCapForTest(slot: *Slot, reason: []const u8) []const u8 {
+    if (!slot.end_turn_at_cap_for_test or !std.mem.eql(u8, reason, "length") or slot.eos_token_ids.len == 0) return reason;
+    slot.stop_token = slot.eos_token_ids[0];
+    return "stop";
+}
+
 /// A slot that errored in a tick never reaches `finishSlot`; the cleanup drain keeps its speculation here, before the
 /// request-log row reads it.
 pub fn finishSpecAtCleanup(slot: anytype) void {
@@ -309,7 +315,8 @@ pub fn finishSpecAtCleanup(slot: anytype) void {
     if (slot.legacy_gen) |*g| finishSpec(slot, g);
 }
 
-pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
+pub fn finishSlot(sch: *Scheduler, slot: *Slot, cap_reason: []const u8) void {
+    const reason = if (comptime @import("builtin").is_test) endTurnAtCapForTest(slot, cap_reason) else cap_reason;
     if (restore_dump.tapeOn()) restore_dump.tapeGen(slot.request_id, if (slot.legacy_gen) |*g| g.generated_ids.items else &.{}, reason);
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots

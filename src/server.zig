@@ -37,6 +37,7 @@ const anthropic = @import("anthropic.zig");
 const completions = @import("completions.zig");
 const responses_api = @import("responses_api.zig");
 const generation_stream = @import("generation_stream.zig");
+const reply_mod = @import("reply.zig");
 const http_conn = @import("http_conn.zig");
 const http_head = @import("http_head.zig");
 const boot_gate = @import("boot_gate.zig");
@@ -685,6 +686,8 @@ pub fn resolveReasoningProtocol(
 /// closest precedent, and conforming clients ignore keys they don't know.
 pub fn finishDetailsField(reason: []const u8, details: ?[]const u8) []const u8 {
     const d = details orelse return "";
+    // A reply whose turn ended inside its thought says what became of it whatever its finish.
+    if (thoughtFinishDetails(d)) |field| return field;
     // Every emitter can override the slot's reason after the fact. Gate on the
     // reason actually being emitted so a cause never accompanies a genuine
     // length exhaustion, tool completion, or client disconnect.
@@ -692,7 +695,16 @@ pub fn finishDetailsField(reason: []const u8, details: ?[]const u8) []const u8 {
     // One known value today; a switch here keeps an unknown string from
     // reaching the wire as an unescaped literal.
     if (std.mem.eql(u8, d, "repetition_loop")) return ",\"finish_details\":{\"type\":\"repetition_loop\"}";
+    if (std.mem.eql(u8, d, reply_mod.thought_loop)) return ",\"finish_details\":" ++ comptime reply_mod.thoughtDetailsJson(reply_mod.thought_loop).?;
     return "";
+}
+
+fn thoughtFinishDetails(d: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, d, reply_mod.thought_continued)) return ",\"finish_details\":" ++ comptime reply_mod.thoughtDetailsJson(reply_mod.thought_continued).?;
+    inline for (comptime std.enums.values(reply_mod.ThoughtKept)) |k| {
+        if (std.mem.eql(u8, d, k.details())) return ",\"finish_details\":" ++ comptime reply_mod.thoughtDetailsJson(k.details()).?;
+    }
+    return null;
 }
 
 /// Debug-only corpus-harvest aid (`SUSHI_RAW_DUMP_FILE`). Appends ONE framed
@@ -2813,6 +2825,18 @@ pub fn handleChatCompletions(
     defer if (call_force) |*cf| cf.deinit(allocator);
     if (call_force) |*cf| sampling.call_force = cf;
 
+    const thought: generation_stream.ThoughtResume = .{
+        .chat_config = &render_config,
+        .messages = messages.items,
+        .tools_json = tools_json,
+        .tool_choice_instruction = tool_choice_instruction,
+        .enable_thinking = enable_thinking,
+        .effort = template_effort,
+        .stops = stop_sequences.items,
+        .has_tools = has_tools,
+        .allow_parallel = allow_parallel_tools,
+        .kept = generation_stream.ThoughtResume.keptFor(continue_final, req_media.chain.len > 0, asked_logprobs != null, sampling.constraint != null),
+    };
     // Hand vision ownership off to the sub-handler, which transfers it to
     // the slot at submit time.
     const sub_ve = req_media.deferred;
@@ -2820,13 +2844,13 @@ pub fn handleChatCompletions(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, asked_logprobs, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, asked_logprobs, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        generation_stream.handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, asked_logprobs, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        generation_stream.handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, asked_logprobs, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
         };

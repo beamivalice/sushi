@@ -92,6 +92,11 @@ pub const first_request_id: u64 = 1;
 /// slot so callers can free their copies immediately. `vision_embeddings`
 /// ownership transfers into the slot when non-null (the slot will free on
 /// deinit); a `submit` that fails hands it to the inference thread to free.
+/// Test seam: the next slot submitted under `cache_key` ends after `after` tokens as on its end-of-turn token
+/// (one-shot), so a served test can end a tiny's turn inside its thought and no other request.
+pub const EndTurnForTest = struct { cache_key: u64, after: u32 };
+pub var end_turn_for_test: ?EndTurnForTest = null;
+
 pub const SubmitParams = struct {
     prompt_ids: []const u32,
     /// Full original prompt for the MTP lookup. When null, defaults to
@@ -392,6 +397,8 @@ pub const Slot = struct {
     stop_token: ?u32 = null,
     /// `"spec"` or `"batch"` where the finishing tick knew; empty = derive from the slot's mode.
     stop_path: []const u8 = "",
+    /// Test builds: this slot's token cap is `end_turn_for_test`'s, and reaching it ends the turn as its end token.
+    end_turn_at_cap_for_test: bool = false,
     cancelled: std.atomic.Value(bool),
     /// The server, not the client, ended this slot (shutdown drain): readers see an error, never a finish reason.
     shutdown_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1495,6 +1502,11 @@ pub const Scheduler = struct {
             if (params.vision_embeddings) |ve| self.orphanVision(ve);
             if (params.deferred_media) |d| d.deinit();
             return err;
+        };
+        if (comptime @import("builtin").is_test) if (end_turn_for_test) |e| if (e.cache_key == params.cache_key) {
+            end_turn_for_test = null;
+            slot.max_tokens = @min(slot.max_tokens, e.after);
+            slot.end_turn_at_cap_for_test = true;
         };
         // The slot may own GPU arrays that only the inference thread frees.
         errdefer self.abandon(slot);

@@ -941,6 +941,7 @@ fn handleResponsesInner(
             prev_id,
             false,
             false,
+            null,
             response_echo,
             0,
             0,
@@ -975,6 +976,18 @@ fn handleResponsesInner(
 
     // Wave 1.A: per-request KV-quant override (Responses path mirror).
 
+    const thought: generation_stream.ThoughtResume = .{
+        .chat_config = &render_config,
+        .messages = prompt_messages,
+        .tools_json = active_tools_json,
+        .tool_choice_instruction = active_tool_choice_instruction,
+        .enable_thinking = enable_thinking,
+        .effort = template_effort,
+        .stops = stop_sequences.items,
+        .has_tools = active_has_tools,
+        .allow_parallel = parallel_tool_calls_echo,
+        .kept = generation_stream.ThoughtResume.keptFor(false, req_media.chain.len > 0, false, sampling.constraint != null),
+    };
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
@@ -992,7 +1005,7 @@ fn handleResponsesInner(
         const slot_mrope_resp = req_media.mrope;
         req_media.mrope = .{};
         const sch = server_state.global_scheduler.?;
-        slot_handle = try sch.submit(.{
+        const params: scheduler_mod.SubmitParams = .{
             .model = lm,
             .prompt_ids = prompt_ids,
             .full_prompt = prompt_ids,
@@ -1019,9 +1032,11 @@ fn handleResponsesInner(
             .mrope_delta = slot_mrope_resp.delta,
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
-        });
+        };
+        slot_handle = try sch.submit(params);
         var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_slice);
         defer ts.deinit(allocator);
+        ts.armThought(sch, tok, &thought, params);
 
         var raw_buf = std.ArrayList(u8).empty;
         defer raw_buf.deinit(allocator);
@@ -1068,13 +1083,13 @@ fn handleResponsesInner(
                     // keepalive stops clients timing out on stream silence.
                     if (stream.peerClosed()) {
                         log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
-                        slot_handle.?.cancel();
+                        ts.slot.?.cancel();
                         client_gone = true;
                         break;
                     }
-                    sendStreamIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, slot_handle.?)) catch {
+                    sendStreamIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, ts.slot.?)) catch {
                         log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-                        slot_handle.?.cancel();
+                        ts.slot.?.cancel();
                         client_gone = true;
                         break;
                     };
@@ -1082,7 +1097,7 @@ fn handleResponsesInner(
                 },
             };
             if (stream.peerClosed()) {
-                slot_handle.?.cancel();
+                ts.slot.?.cancel();
                 client_gone = true;
                 break;
             }
@@ -1090,13 +1105,13 @@ fn handleResponsesInner(
                 try token_ids_buf.append(allocator, token_id);
                 const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
                 defer allocator.free(raw_decoded);
-                if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
+                if (delivery) |*d| d.noteToken(raw_decoded.len, ts.slot.?.constraintPayloadStart());
                 break :blk try stop_gate.push(allocator, raw_decoded);
             };
             defer allocator.free(token_text);
 
             stopped = stop_gate.matched != null;
-            if (stopped) slot_handle.?.stop_hit.store(true, .release);
+            if (stopped) ts.slot.?.stop_hit.store(true, .release);
             if (token_text.len == 0) {
                 if (stopped) break;
                 continue;
@@ -1110,7 +1125,7 @@ fn handleResponsesInner(
             // from the client's socket.
             beatStreamKeepalive(stream, .sse_comment) catch {
                 log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-                slot_handle.?.cancel();
+                ts.slot.?.cancel();
                 client_gone = true;
                 break;
             };
@@ -1273,7 +1288,7 @@ fn handleResponsesInner(
         const slot_mrope_ns = req_media.mrope;
         req_media.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, stream, .{ .stops = stop_sequences.items });
+        result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, stream, .{ .stops = stop_sequences.items }, &thought);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -1433,6 +1448,7 @@ fn handleResponsesInner(
         prev_id,
         is_incomplete,
         is_completed_status,
+        result.finish_details,
         response_echo,
         result.prefill_ns,
         result.decode_ns,
@@ -1679,6 +1695,8 @@ fn buildResponsesEnvelope(
     prev_id: ?[]const u8,
     incomplete: bool,
     completed: bool,
+    /// What became of a turn that ended inside its thought (`reply.thoughtDetailsField`); null = nothing to say.
+    finish_details: ?[]const u8,
     echo: ResponseEcho,
     /// Iteration 1: timings extension. The Responses spec doesn't model
     /// per-stage timings, so we attach a sibling `timings` block at the
@@ -1716,6 +1734,7 @@ fn buildResponsesEnvelope(
     } else {
         try buf.appendSlice(allocator, ",\"incomplete_details\":null");
     }
+    try buf.appendSlice(allocator, reply_mod.thoughtDetailsField("finish_details", finish_details));
 
     try buf.appendSlice(allocator, ",\"model\":");
     try buf.appendSlice(allocator, esc_model);

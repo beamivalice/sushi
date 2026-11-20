@@ -398,7 +398,7 @@ pub fn completeIds(allocator: std.mem.Allocator, lm: *LoadedModel, ids: []const 
     const enable_mtp = admitMtpForCtx(spec_request.mtp, ids.len);
     const spec = requestSpecModes(spec_request.drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
 
-    return nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, ids, ids, clampMaxTokens(max_tokens, true, ids.len, effective_ctx), sampling, requestEosSlice(config, root), 0, false, false, spec.use_drafter, spec.use_mtp, spec_request.allow_batch_mtp, getTimeoutNs(), null, &.{}, requestCacheKey(root), .{}, 0, parseKvQuantOverride(root), null, .{ .stops = &.{}, .completion_skip_special = true });
+    return nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, ids, ids, clampMaxTokens(max_tokens, true, ids.len, effective_ctx), sampling, requestEosSlice(config, root), 0, false, false, spec.use_drafter, spec.use_mtp, spec_request.allow_batch_mtp, getTimeoutNs(), null, &.{}, requestCacheKey(root), .{}, 0, parseKvQuantOverride(root), null, .{ .stops = &.{}, .completion_skip_special = true }, null);
 }
 
 fn handleNonStreamingCompletion(
@@ -431,7 +431,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = spec.use_drafter;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special });
+    var result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special }, null);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);

@@ -716,18 +716,30 @@ pub fn handleAnthropicMessages(
     defer if (call_force) |*cf| cf.deinit(allocator);
     if (call_force) |*cf| sampling.call_force = cf;
 
+    const thought: generation_stream.ThoughtResume = .{
+        .chat_config = &prompt.render_config,
+        .messages = messages.items,
+        .tools_json = if (has_tools) tools_json else null,
+        .tool_choice_instruction = prompt.tool_choice_instruction,
+        .enable_thinking = enable_thinking,
+        .effort = prompt.effort_word,
+        .stops = stop_sequences.items,
+        .has_tools = has_tools,
+        .allow_parallel = prompt.allow_parallel_tools,
+        .kept = generation_stream.ThoughtResume.keptFor(continue_final, req_media.chain.len > 0, false, sampling.constraint != null),
+    };
     // Hand vision ownership to the sub-handler (slot takes it on submit).
     const sub_ve = req_media.deferred;
     req_media.deferred = null;
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, prompt.allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, prompt.allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, prompt.allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, prompt.allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
@@ -770,6 +782,9 @@ const AnthropicPrompt = struct {
     tokenize_ns: u64 = 0,
     /// Armed on the connection when an effort word is served as another; the handler clears it.
     effort_notice: ?EffortNotice = null,
+    /// What the prompt rendered with, for a continuation after the thought (`ThoughtResume`).
+    render_config: chat_mod.ChatConfig = undefined,
+    effort_word: ?[]const u8 = null,
 
     fn deinit(p: *AnthropicPrompt) void {
         const a = p.wire.allocator;
@@ -980,6 +995,8 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     }
     p.tokenize_ns = tokenize_sw.read();
     p.enable_thinking = enable_thinking;
+    p.render_config = render_config;
+    p.effort_word = effort_word;
     p.reasoning_budget = reasoning_budget;
     return true;
 }
@@ -1051,6 +1068,7 @@ fn handleAnthropicNonStreaming(
     /// by the parent handleAnthropicMessages. Threaded through so the
     /// non-streaming response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
+    thought: *const generation_stream.ThoughtResume,
 ) !void {
     // Vision-array ownership: nulled below before scheduler.submit so the
     // early-return defer doesn't double-free.
@@ -1077,7 +1095,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, 0, kv_quant_override, stream, .{ .stops = stop_sequences });
+    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, 0, kv_quant_override, stream, .{ .stops = stop_sequences }, thought);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -1195,13 +1213,14 @@ fn handleAnthropicNonStreaming(
     defer allocator.free(usage);
 
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{s}{s}}}
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s}{s},"usage":{s}{s}}}
     , .{
         nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io)),
         content.items,
         model_name,
         stop_reason,
         stop_seq_json,
+        reply_mod.thoughtDetailsField("stop_details", result.finish_details),
         usage,
         timings_field,
     });
@@ -1269,6 +1288,7 @@ fn handleAnthropicStreaming(
     /// but plumbing the value through keeps the signature consistent with
     /// non-streaming and unblocks a future message_delta extension.
     tokenize_ns: u64,
+    thought: *const generation_stream.ThoughtResume,
 ) !void {
     _ = tokenize_ns; // reserved; see doc comment
     // Vision-array ownership: held by this handler on entry, transfers to
@@ -1291,7 +1311,7 @@ fn handleAnthropicStreaming(
     const slot_ve_anth = ve_local;
     ve_local = null;
     const sch = server_state.global_scheduler.?;
-    slot_handle = try sch.submit(.{
+    const params: scheduler_mod.SubmitParams = .{
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
@@ -1318,9 +1338,11 @@ fn handleAnthropicStreaming(
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
-    });
+    };
+    slot_handle = try sch.submit(params);
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
+    ts.armThought(sch, tok, thought, params);
 
     // SSE headers
     try sendSseHeaders(stream, "anthropic.messages", SSE_ALLOW_HEADERS_ANTHROPIC);
@@ -1426,13 +1448,13 @@ fn handleAnthropicStreaming(
                 // keepalive stops clients timing out on stream silence.
                 if (stream.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
-                    slot_handle.?.cancel();
+                    ts.slot.?.cancel();
                     client_gone = true;
                     break;
                 }
-                sendAnthropicIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, slot_handle.?)) catch {
+                sendAnthropicIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, ts.slot.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-                    slot_handle.?.cancel();
+                    ts.slot.?.cancel();
                     client_gone = true;
                     break;
                 };
@@ -1440,7 +1462,7 @@ fn handleAnthropicStreaming(
             },
         };
         if (stream.peerClosed()) {
-            slot_handle.?.cancel();
+            ts.slot.?.cancel();
             client_gone = true;
             break;
         }
@@ -1449,11 +1471,11 @@ fn handleAnthropicStreaming(
         const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
             const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
             defer allocator.free(raw_decoded);
-            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
+            if (delivery) |*d| d.noteToken(raw_decoded.len, ts.slot.?.constraintPayloadStart());
             break :blk try stop_gate.push(allocator, raw_decoded);
         };
         stopped = stop_gate.matched != null;
-        if (stopped) slot_handle.?.stop_hit.store(true, .release);
+        if (stopped) ts.slot.?.stop_hit.store(true, .release);
         if (token_text.len == 0) {
             allocator.free(token_text);
             if (stopped) break;
@@ -1669,7 +1691,7 @@ fn handleAnthropicStreaming(
         // silence, not off token arrival.
         beatStreamKeepalive(stream, .anthropic_ping) catch {
             log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-            slot_handle.?.cancel();
+            ts.slot.?.cancel();
             client_gone = true;
             break;
         };
@@ -1832,8 +1854,8 @@ fn handleAnthropicStreaming(
             const usage = try formatAnthropicUsage(allocator, prompt_token_count, ts.completion_tokens, ts.cached_tokens);
             defer allocator.free(usage);
             const md = try std.fmt.allocPrint(allocator,
-                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{s}}}
-            , .{ stop_reason, stop_seq_json, usage });
+                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}{s}}},"usage":{s}}}
+            , .{ stop_reason, stop_seq_json, reply_mod.thoughtDetailsField("stop_details", ts.finish_details), usage });
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
