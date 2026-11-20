@@ -20,7 +20,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (`splitThinkBlock`), since dropping it turns an agent turn into a bare `stop`; a call inside a thought that closed
   stays skipped. A stop sequence that matched inside a call (`think_tags.endsInsideToolCall`: the last opener has no
   closer) leaves no call, the finish stays `stop` and Anthropic's `stop_sequence` stays set, as a loop cut does; a stop
-  after the closer keeps the call. Lint `reply-bypass`: a surface never calls the raw `parseToolCalls`.
+  after the closer keeps the call. The stop is read once, by `reply.settle` (`stop_sequences.cut`): a stream's reply carries
+  its gate's match (`GenerationResult.stop_source`), never a stop searched for again in text the gate already cut. Lint
+  `reply-bypass`: a surface never calls the raw `parseToolCalls`.
 - Template input `chat.templateMessages`: role "tool" native, a call's `arguments` the client's JSON object (`{}` for
   anything else), every string valid UTF-8 (U+FFFD for a bad sequence, as `appendJsonString` writes). Streaming: full args in ONE SSE delta, thinking → `reasoning_content`.
 - Buffered calls may exceed a client's inter-event progress deadline even while SSE keepalives arrive. The omp launcher

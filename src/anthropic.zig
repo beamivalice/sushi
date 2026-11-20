@@ -108,7 +108,6 @@ const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
 const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
 const parseKvQuantOverride = request_parse.parseKvQuantOverride;
 const parseRequestSeed = request_parse.parseRequestSeed;
-const parseToolCallsForRequest = reply_mod.parseToolCallsForRequest;
 const promptOpensThink = server_mod.promptOpensThink;
 const readAllFromPair = server_mod.readAllFromPair;
 const readContentParts = server_mod.readContentParts;
@@ -1036,27 +1035,22 @@ fn handleAnthropicNonStreaming(
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
-    // Apply stop sequences; remember WHICH one matched (Anthropic reports it
-    // as stop_reason "stop_sequence" + the echoed `stop_sequence` field).
-    var final_text: []const u8 = result.text;
-    var finish_reason = result.finish_reason;
-    var matched_stop_seq: ?[]const u8 = null;
-    if (stop_seq_mod.earliest(final_text, stop_sequences)) |hit| {
-        final_text = final_text[0..hit.index];
-        finish_reason = "stop";
-        matched_stop_seq = hit.stop;
-    }
-
-    // Merge re-opened mid-text thought channels into the leading block so the
-    // split/parse below never leaks raw tags (Gemma 12B re-opens channels
-    // mid-turn). A span-routed constrained response skips this: its payload
-    // is authoritative and marker text inside it is DATA.
-    var normalized_text: ?[]u8 = null;
-    defer if (normalized_text) |n| allocator.free(n);
-    if (sampling.constraint == null or sampling.constraint.?.proto == null) {
-        normalized_text = try think_tags.normalizeEmbeddedThinkBlocks(allocator, final_text);
-        if (normalized_text) |n| final_text = n;
-    }
+    // The stop that ended the generation (Anthropic reports it as stop_reason "stop_sequence" + the echoed
+    // `stop_sequence` field), the text it leaves and the calls in it (`reply.settle`).
+    const opens_think = promptOpensThink(allocator, tok, prompt_ids);
+    const settled = try reply_mod.settle(allocator, generation_stream.generatedOf(&result), .{
+        .stops = stop_sequences,
+        .normalize = sampling.constraint == null or sampling.constraint.?.proto == null,
+        .has_tools = has_tools,
+        .tools_json = tools_json,
+        .allow_parallel = allow_parallel_tools,
+        .dialect = if (has_tools) try chat_mod.callDialect(allocator, lm.chat_config.?) else null,
+        .opens_think = opens_think,
+    });
+    defer settled.deinit(allocator);
+    var final_text: []const u8 = settled.text;
+    var finish_reason = settled.finish_reason;
+    const matched_stop_seq = settled.stop;
 
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
 
@@ -1075,8 +1069,6 @@ fn handleAnthropicNonStreaming(
     // the request's thinking flag shaped the prompt, never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
-    const opens_think = promptOpensThink(allocator, tok, prompt_ids);
-    const generated = final_text;
     {
         const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, opens_think);
         // Reasoning is never fed back to the parser, so it is cut here.
@@ -1112,10 +1104,7 @@ fn handleAnthropicNonStreaming(
 
     // Check for tool calls
     if (has_tools and shouldParseToolCalls(result.finish_details)) {
-        const found_calls = try reply_mod.toolReply(allocator, generated, tools_json, allow_parallel_tools, .{ .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?), .opens_think = opens_think, .stop_cut = matched_stop_seq != null });
-        if (found_calls) |tool_reply| {
-            defer tool_reply.deinit(allocator);
-
+        if (settled.reply) |tool_reply| {
             var tu_perf_buf: [160]u8 = undefined;
             const tu_perf = formatPerfBracket(&tu_perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
             log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_use: {d}]\n", .{
@@ -1673,21 +1662,25 @@ fn handleAnthropicStreaming(
                 appendRawToolDump(std.mem.span(dump_path), tools_json, text_buf.items);
             }
         }
-        // Merge re-opened mid-text thought channels into the leading block so
-        // the split/parse below never leaks raw tags (Gemma 12B re-opens
-        // channels mid-turn — observed live via Claude Code on this surface).
-        const norm_owned = try think_tags.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
-        defer if (norm_owned) |n| allocator.free(n);
-        const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools, .{ .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?), .stop_cut = stopped }) else null;
-        if (found_calls) |tool_calls| {
-            defer {
-                for (tool_calls) |tc| {
-                    allocator.free(tc.name);
-                    allocator.free(tc.arguments);
-                }
-                allocator.free(tool_calls);
-            }
+        // The text is what the gate delivered; its match is the stop that ended the stream (`reply.settle`).
+        const settled = try reply_mod.settle(allocator, .{
+            .text = text_buf.items,
+            .source = .{ .gated = stop_gate.matched },
+            .finish_reason = finish_reason,
+            .finish_details = ts.finish_details,
+        }, .{
+            .stops = stop_sequences,
+            .normalize = true,
+            .has_tools = has_tools,
+            .tools_json = tools_json,
+            .allow_parallel = allow_parallel_tools,
+            .dialect = if (has_tools) try chat_mod.callDialect(allocator, lm.chat_config.?) else null,
+            .opens_think = opens_think and !think_closed,
+        });
+        defer settled.deinit(allocator);
+        const gen_text = settled.text;
+        if (settled.reply) |tool_reply| {
+            const tool_calls = tool_reply.calls;
 
             // Emit thinking from buffered text if present — delivery does not
             // key on the request's thinking flag. Once the in-loop split

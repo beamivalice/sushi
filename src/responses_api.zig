@@ -88,7 +88,6 @@ const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
 const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
 const parseKvQuantOverride = request_parse.parseKvQuantOverride;
 const parseRequestSeed = request_parse.parseRequestSeed;
-const parseToolCallsForRequest = reply_mod.parseToolCallsForRequest;
 const promptOpensThink = server_mod.promptOpensThink;
 const renderConfigFor = server_mod.renderConfigFor;
 const renderQwenForResponsesTest = server_mod.renderQwenForResponsesTest;
@@ -1273,6 +1272,7 @@ fn handleResponsesInner(
             try token_ids_buf.toOwnedSlice(allocator),
             if (stopped) "stop" else ts.finish_reason,
             if (delivery) |d| d.payload_byte else null,
+            stop_gate.matched,
         );
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
@@ -1291,15 +1291,20 @@ fn handleResponsesInner(
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
-    // ── apply stop sequences ──
-    var final_text: []const u8 = result.text;
-    var finish_reason = result.finish_reason;
-    var stop_cut = false;
-    if (stop_seq_mod.earliest(final_text, stop_sequences.items)) |hit| {
-        final_text = final_text[0..hit.index];
-        finish_reason = "stop";
-        stop_cut = true;
-    }
+    // ── apply stop sequences, split calls ──
+    const opens_think = promptOpensThink(allocator, tok, prompt_ids);
+    var ended = try reply_mod.settle(allocator, generation_stream.generatedOf(&result), .{
+        .stops = stop_sequences.items,
+        .normalize = sampling.constraint == null or sampling.constraint.?.proto == null,
+        .has_tools = active_has_tools,
+        .tools_json = active_tools_json,
+        .allow_parallel = parallel_tool_calls_echo,
+        .dialect = if (active_has_tools) try chat_mod.callDialect(allocator, chat_config) else null,
+        .opens_think = opens_think,
+    });
+    defer ended.deinit(allocator);
+    const final_text = ended.text;
+    const finish_reason = ended.finish_reason;
 
     if (!responsesStoresFinish(finish_reason, true)) {
         log.info("  <- {d}+{d} tokens [client_disconnect]\n", .{ result.prompt_tokens, result.completion_tokens });
@@ -1308,39 +1313,17 @@ fn handleResponsesInner(
 
     const status_str: []const u8 = if (std.mem.eql(u8, finish_reason, "length")) "incomplete" else "completed";
 
-    // Merge re-opened mid-text thought channels into the leading block so the
-    // split/parse below never leaks raw tags (Gemma 12B re-opens channels
-    // mid-turn). A span-routed constrained response skips this: its payload
-    // is authoritative and marker text inside it is DATA.
-    var normalized_text: ?[]u8 = null;
-    defer if (normalized_text) |n| allocator.free(n);
-    if (sampling.constraint == null or sampling.constraint.?.proto == null) {
-        normalized_text = try think_tags.normalizeEmbeddedThinkBlocks(allocator, final_text);
-        if (normalized_text) |n| final_text = n;
-    }
-
     // ── split thinking & tool calls ──
     // Reasoning the model actually generated is always delivered — the
     // request's thinking flag shaped the PROMPT (think_tags.noThinkTailSuffix),
     // never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
-    const opens_think = promptOpensThink(allocator, tok, prompt_ids);
     const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, opens_think);
     const reasoning_text: ?[]const u8 = think_split.reasoning_content;
     const visible_text: []const u8 = think_split.content;
 
-    var tool_calls: ?[]tool_schema.ParsedToolCall = null;
-    if (active_has_tools and shouldParseToolCalls(result.finish_details)) {
-        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo, .{ .stop_cut = stop_cut, .dialect = try chat_mod.callDialect(allocator, chat_config) });
-    }
-    defer if (tool_calls) |tcs| {
-        for (tcs) |tc| {
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        allocator.free(tcs);
-    };
+    const tool_calls: ?[]tool_schema.ParsedToolCall = if (ended.reply) |r| r.calls else null;
 
     // ── build output[] array (shared between streaming + non-streaming) ──
     var out_buf = std.ArrayList(u8).empty;

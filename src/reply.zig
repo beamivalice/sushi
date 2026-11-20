@@ -6,6 +6,7 @@ const tool_calls_mod = @import("tool_calls.zig");
 const tool_schema = @import("tool_schema.zig");
 const server_state = @import("server_state.zig");
 const log = @import("log.zig");
+const stop_seq_mod = @import("stop_sequences.zig");
 
 /// Finish reason for a response whose generated text yielded tool calls.
 /// A TRUNCATED generation ("length": max_tokens or the request timeout) must
@@ -59,6 +60,68 @@ pub fn toolReply(allocator: std.mem.Allocator, text: []const u8, tools_json: ?[]
     const calls = (try parseToolCallsForRequest(allocator, text, tools_json, allow_parallel, origin)) orelse return null;
     const split = think_tags.splitThinkBlock(text, true, origin.opens_think);
     return .{ .preamble = think_tags.visibleToolPreamble(split.content), .calls = calls };
+}
+
+/// A generation as a surface got it.
+pub const Generated = struct {
+    text: []const u8,
+    /// Where the stop that ended it is read from (`stop_sequences.cut`).
+    source: stop_seq_mod.Source,
+    finish_reason: []const u8,
+    finish_details: ?[]const u8,
+};
+
+/// What the request asks of the end handling.
+pub const Ask = struct {
+    stops: []const []const u8,
+    /// Merge re-opened mid-text thought channels into the leading block so no parse below leaks raw tags (Gemma 12B
+    /// re-opens channels mid-turn). A span-routed constrained response sets false: its payload is authoritative and
+    /// marker text inside it is DATA.
+    normalize: bool,
+    has_tools: bool,
+    tools_json: ?[]const u8,
+    allow_parallel: bool,
+    dialect: ?tool_calls_mod.Dialect,
+    opens_think: bool,
+};
+
+/// How a generation ended, decided once for every surface, streamed or not.
+pub const Settled = struct {
+    /// What the model said, cut at the stop that ended it and normalized: the text every later split reads.
+    text: []const u8,
+    /// The stop that ended the generation.
+    stop: ?[]const u8,
+    /// "stop" when a stop ended it, else the generation's own; a surface maps it with `toolCallFinishReason` when `reply` holds calls.
+    finish_reason: []const u8,
+    reply: ?ToolReply,
+    normalized: ?[]u8,
+
+    pub fn deinit(self: Settled, allocator: std.mem.Allocator) void {
+        if (self.reply) |r| r.deinit(allocator);
+        if (self.normalized) |n| allocator.free(n);
+    }
+};
+
+/// The one end handling of a reply: the stop that ended the generation, the text it leaves, the calls that text
+/// holds and the finish a stop leaves. A stop that cut a call open leaves no call (`parseToolCallsForRequest`).
+pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
+    const cut = stop_seq_mod.cut(gen.text, ask.stops, gen.source);
+    var out: Settled = .{
+        .text = cut.text,
+        .stop = cut.stop,
+        .finish_reason = if (cut.stop != null) "stop" else gen.finish_reason,
+        .reply = null,
+        .normalized = null,
+    };
+    errdefer out.deinit(allocator);
+    if (ask.normalize) {
+        out.normalized = try think_tags.normalizeEmbeddedThinkBlocks(allocator, cut.text);
+        if (out.normalized) |n| out.text = n;
+    }
+    if (ask.has_tools and shouldParseToolCalls(gen.finish_details)) {
+        out.reply = try toolReply(allocator, out.text, ask.tools_json, ask.allow_parallel, .{ .dialect = ask.dialect, .opens_think = ask.opens_think, .stop_cut = cut.stop != null });
+    }
+    return out;
 }
 
 /// The ONE tool-call extraction path for every HTTP surface: parse, fall back to
@@ -528,4 +591,64 @@ test "a stop after a call closed leaves the call" {
         "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     };
     for (whole) |text| try expectCalls(text, .{ .dialect = null, .stop_cut = true }, 1);
+}
+
+/// One generated text as a stream hands it to a surface (its gate delivers the text and reports the match) and as a
+/// non-stream reply does (the whole text, the stop still in it), settled under the same ask.
+fn expectSameEnd(allocator: std.mem.Allocator, generated: []const u8, stops: []const []const u8, gen_finish: []const u8, ask: Ask, want_stop: ?[]const u8, want_finish: []const u8, want_calls: ?usize) !void {
+    var frags = std.ArrayList([]const u8).empty;
+    defer frags.deinit(allocator);
+    var at: usize = 0;
+    while (at < generated.len) : (at += 5) try frags.append(allocator, generated[at..@min(at + 5, generated.len)]);
+    var matched: ?[]const u8 = null;
+    const delivered = try stop_seq_mod.streamDelivered(allocator, frags.items, stops, &matched);
+    defer allocator.free(delivered);
+
+    // What each path's surface passes: the stream ends "stop" when its gate matched, the non-stream keeps the slot's own.
+    const streamed = try settle(allocator, .{ .text = delivered, .source = .{ .gated = matched }, .finish_reason = if (matched != null) "stop" else gen_finish, .finish_details = null }, ask);
+    defer streamed.deinit(allocator);
+    const whole = try settle(allocator, .{ .text = generated, .source = .whole, .finish_reason = gen_finish, .finish_details = null }, ask);
+    defer whole.deinit(allocator);
+
+    for ([_]Settled{ streamed, whole }) |got| {
+        if (want_stop) |w| try testing.expectEqualStrings(w, got.stop.?) else try testing.expect(got.stop == null);
+        try testing.expectEqualStrings(want_finish, got.finish_reason);
+        try testing.expectEqual(want_calls, if (got.reply) |r| @as(?usize, r.calls.len) else null);
+    }
+    try testing.expectEqualStrings(streamed.text, whole.text);
+    if (streamed.reply) |s| {
+        const w = whole.reply.?;
+        try testing.expectEqualStrings(s.preamble, w.preamble);
+        try testing.expectEqual(s.calls.len, w.calls.len);
+        for (s.calls, w.calls) |a, b| {
+            try testing.expectEqualStrings(a.name, b.name);
+            try testing.expectEqualStrings(a.arguments, b.arguments);
+        }
+    }
+}
+
+test "a stream and a non-stream reply end the same: a stop in a call, a stop after one, a length end, a cancel" {
+    const a = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+    ;
+    const call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
+    const open = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTok";
+    const stops = [_][]const u8{"STOP"};
+    // Chat and Messages ask alike; Responses asks the same, or skips the normalization of a constrained reply; a
+    // template-opened think block changes where the thought ends.
+    const asks = [_]Ask{
+        .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false },
+        .{ .stops = &stops, .normalize = false, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false },
+        .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = true },
+    };
+    for (asks) |ask| {
+        // A stop cut the call open: no call. (A stream's gate never holds the stop; the text it cut ends in the open call.)
+        try expectSameEnd(a, open ++ "STOP and more", &stops, "length", ask, "STOP", "stop", null);
+        // A stop after a closed call: the call stays.
+        try expectSameEnd(a, call ++ "\nSTOP and more", &stops, "length", ask, "STOP", "stop", 1);
+        // No stop: a length end and a cancel salvage the open call the same way on both paths, and keep their reason.
+        try expectSameEnd(a, open, &stops, "length", ask, null, "length", 1);
+        try expectSameEnd(a, open, &stops, "cancelled", ask, null, "cancelled", 1);
+    }
 }

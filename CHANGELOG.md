@@ -15,6 +15,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 | Low | 2 / 5 | 4 / 4 | 3 / 9 | 3 / 4 | 12 / 22 |
 | Total | 15 / 28 | 8 / 8 | 11 / 24 | 3 / 5 | 37 / 65 |
 
+- **A streamed `/v1/responses` reply cut by a stop sequence inside a tool call no longer returns the half call**: the
+  stream searched for the stop in text its gate had already cut, found none, and shipped the call it salvaged from the
+  open markup; a stream now ends as the stop its gate matched, as the non-streamed reply, Chat and Messages do.
 - **A large chunked upload is answered**: a `Transfer-Encoding: chunked` request over about 16 KB sent in one go got no
   answer and held its connection forever, and a body or WebSocket frame left half sent outlasted the 30 s read limit
   and a shutdown.

@@ -7,6 +7,7 @@ const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
+const stop_seq_mod = @import("stop_sequences.zig");
 const json_grammar = @import("json_grammar.zig");
 const json_schema = @import("json_schema.zig");
 const token_mask = @import("token_mask.zig");
@@ -389,6 +390,9 @@ pub const GenerationResult = struct {
     /// Time the prefix lookup and restore took inside `prefill_ns`; null when no lookup ran.
     restore_ns: ?u64 = null,
     spec_mode: Generator.SpecMode = .none,
+    /// Where a stop sequence that ended the generation is read from: a stream's text is cut by its gate (which
+    /// carries the match), a non-stream text still holds the stop (`stop_sequences.cut`).
+    stop_source: stop_seq_mod.Source = .whole,
 };
 
 /// Throughput in tokens/sec. Returns 0 when no time elapsed so unmeasured paths

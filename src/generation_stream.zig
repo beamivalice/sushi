@@ -63,7 +63,6 @@ const logHttpSseData = http.logHttpSseData;
 const memoryContextRefusalMessage = server_mod.memoryContextRefusalMessage;
 const mtpCapable = server_mod.mtpCapable;
 const not_enough_memory_message = http.not_enough_memory_message;
-const parseToolCallsForRequest = reply_mod.parseToolCallsForRequest;
 const promptOpensThink = server_mod.promptOpensThink;
 const reasoningWithinBudget = server_mod.reasoningWithinBudget;
 const sendAnthropicEvent = anthropic.sendAnthropicEvent;
@@ -307,6 +306,11 @@ fn nonStreamFinishReason(end: DrainEnd, slot_reason: []const u8) []const u8 {
         .cancelled => "cancelled",
         else => slot_reason,
     };
+}
+
+/// A generation result as the reply end handling reads it.
+pub fn generatedOf(r: *const generate_mod.GenerationResult) reply_mod.Generated {
+    return .{ .text = r.text, .source = r.stop_source, .finish_reason = r.finish_reason, .finish_details = r.finish_details };
 }
 
 pub const visibleToolPreamble = think_tags.visibleToolPreamble;
@@ -620,33 +624,26 @@ pub fn handleNonStreamingGeneration(
         allocator.free(lps);
     };
 
-    // Apply stop sequences: truncate at the earliest occurrence (`stop_sequences.zig`)
-    var final_text: []const u8 = result.text;
-    var finish_reason = result.finish_reason;
-    var stop_cut = false;
-    if (stop_seq_mod.earliest(final_text, stop_sequences)) |hit| {
-        final_text = final_text[0..hit.index];
-        finish_reason = "stop";
-        stop_cut = true;
-    }
-
-    // Merge re-opened mid-text thought channels into the leading block so the
-    // split/parse below never leaks raw tags (Gemma 12B re-opens channels
-    // mid-turn). A span-routed constrained response skips this: its payload
-    // is authoritative and marker text inside it is DATA.
-    var normalized_text: ?[]u8 = null;
-    defer if (normalized_text) |n| allocator.free(n);
-    if (sampling.constraint == null or sampling.constraint.?.proto == null) {
-        normalized_text = try think_tags.normalizeEmbeddedThinkBlocks(allocator, final_text);
-        if (normalized_text) |n| final_text = n;
-    }
-
     // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
     // Not ANDed with enable_thinking: generated reasoning is always DELIVERED,
     // never paid-for-and-dropped — thinking-off is enforced on the PROMPT side
     // (think_tags.noThinkTailSuffix commits the channel), so any reasoning that
     // still shows up here is real work the client gets to see.
     const opens_think = promptOpensThink(allocator, tok, prompt_ids);
+
+    // The stop that ended the generation, the text it leaves and the calls in it (`reply.settle`).
+    const settled = try reply_mod.settle(allocator, generatedOf(&result), .{
+        .stops = stop_sequences,
+        .normalize = sampling.constraint == null or sampling.constraint.?.proto == null,
+        .has_tools = has_tools,
+        .tools_json = tools_json,
+        .allow_parallel = allow_parallel_tools,
+        .dialect = if (has_tools) try chat_mod.callDialect(allocator, lm.chat_config.?) else null,
+        .opens_think = opens_think,
+    });
+    defer settled.deinit(allocator);
+    const final_text = settled.text;
+    const finish_reason = settled.finish_reason;
 
     // Apply reasoning budget: truncate reasoning by token count
     // For non-streaming, we truncate after generation since we can't interrupt mid-generation
@@ -676,16 +673,9 @@ pub fn handleNonStreamingGeneration(
 
     // Check for tool calls in the output
     if (has_tools and shouldParseToolCalls(result.finish_details)) {
-        log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
-        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools, .{ .stop_cut = stop_cut, .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?) });
-        if (found_calls) |tool_calls| {
-            defer {
-                for (tool_calls) |tc| {
-                    allocator.free(tc.name);
-                    allocator.free(tc.arguments);
-                }
-                allocator.free(tool_calls);
-            }
+        log.debug("  checked {d} bytes of generated text for tool calls\n", .{final_text.len});
+        if (settled.reply) |tool_reply| {
+            const tool_calls = tool_reply.calls;
 
             var tc_perf_buf: [160]u8 = undefined;
             const tc_perf = formatPerfBracket(&tc_perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
@@ -948,7 +938,8 @@ pub const StreamingTokenStream = struct {
     }
 
     /// The finalized stream as the result a non-stream generation returns: the one place the stats are copied.
-    pub fn result(self: *const StreamingTokenStream, text: []u8, token_ids: []u32, finish_reason: []const u8, constraint_payload_byte: ?usize) generate_mod.GenerationResult {
+    /// `gate_matched` is the stop the stream's `Gate` matched (null when none): `text` is what the gate delivered, cut before it.
+    pub fn result(self: *const StreamingTokenStream, text: []u8, token_ids: []u32, finish_reason: []const u8, constraint_payload_byte: ?usize, gate_matched: ?[]const u8) generate_mod.GenerationResult {
         return .{
             .text = text,
             .token_ids = token_ids,
@@ -964,6 +955,7 @@ pub const StreamingTokenStream = struct {
             .constraint_payload_byte = constraint_payload_byte,
             .restore_ns = if (self.slot) |sl| sl.restore_ns else null,
             .spec_mode = if (self.slot) |sl| sl.spec_mode else .none,
+            .stop_source = .{ .gated = gate_matched },
         };
     }
 
@@ -1786,20 +1778,25 @@ pub fn handleStreamingGeneration(
                 appendRawToolDump(std.mem.span(dump_path), tools_json, text_buf.items);
             }
         }
-        // Merge re-opened mid-text thought channels into the leading block so
-        // the split/parse below never leaks raw tags (Gemma 12B tail behavior).
-        const norm_owned = try think_tags.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
-        defer if (norm_owned) |n| allocator.free(n);
-        const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools, .{ .stop_cut = stopped, .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?) }) else null;
-        if (found_calls) |tool_calls| {
-            defer {
-                for (tool_calls) |tc| {
-                    allocator.free(tc.name);
-                    allocator.free(tc.arguments);
-                }
-                allocator.free(tool_calls);
-            }
+        // The text is what the gate delivered; its match is the stop that ended the stream (`reply.settle`).
+        const settled = try reply_mod.settle(allocator, .{
+            .text = text_buf.items,
+            .source = .{ .gated = stop_gate.matched },
+            .finish_reason = finish_reason,
+            .finish_details = ts.finish_details,
+        }, .{
+            .stops = stop_sequences,
+            .normalize = true,
+            .has_tools = has_tools,
+            .tools_json = tools_json,
+            .allow_parallel = allow_parallel_tools,
+            .dialect = if (has_tools) try chat_mod.callDialect(allocator, lm.chat_config.?) else null,
+            .opens_think = opens_think and !think_closed,
+        });
+        defer settled.deinit(allocator);
+        const gen_text = settled.text;
+        if (settled.reply) |tool_reply| {
+            const tool_calls = tool_reply.calls;
 
             // Emit reasoning_content before tool calls — whatever the model
             // generated is delivered, thinking flag or not.
@@ -3022,7 +3019,7 @@ test "a streamed result carries the prefix reuse and the timings its stream fina
         .decode_ns = 1_000_000_000,
         .finish_details = "repetition_loop",
     };
-    const r = ts.result(&text, &ids, "stop", 3);
+    const r = ts.result(&text, &ids, "stop", 3, "cd");
     try std.testing.expectEqual(@as(u32, 683), r.prompt_tokens);
     try std.testing.expectEqual(@as(u32, 457), r.cached_tokens);
     try std.testing.expectEqual(@as(u32, 20), r.completion_tokens);
@@ -3032,4 +3029,6 @@ test "a streamed result carries the prefix reuse and the timings its stream fina
     try std.testing.expectEqual(@as(f64, 20), r.decode_tps);
     try std.testing.expectEqualStrings("repetition_loop", r.finish_details.?);
     try std.testing.expectEqual(@as(?usize, 3), r.constraint_payload_byte);
+    // The stream's own end: the stop its gate matched, which `reply.settle` reads instead of searching the cut text.
+    try std.testing.expectEqualStrings("cd", generatedOf(&r).source.gated.?);
 }

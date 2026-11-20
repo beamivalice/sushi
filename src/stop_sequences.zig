@@ -22,6 +22,31 @@ pub fn earliest(text: []const u8, stops: []const []const u8) ?Hit {
     return best;
 }
 
+/// How a reply surface got its text, which decides where the stop that ended it is read from.
+pub const Source = union(enum) {
+    /// Everything the model generated (a non-stream reply): the stop that ended it is still in the text.
+    whole,
+    /// What a `Gate` delivered (a stream's reply): cut before the stop, which the text never holds. `matched` is the
+    /// gate's own match, null when none fired; the cut position is the end of the text.
+    gated: ?[]const u8,
+};
+
+pub const Cut = struct {
+    text: []const u8,
+    /// The stop that ended the generation, null when none did.
+    stop: ?[]const u8,
+};
+
+/// The ONE place a reply's stop is read, for every surface, streamed or not: a stream's end is the terminator its
+/// gate matched, never one searched for again in text the gate already cut.
+pub fn cut(text: []const u8, stops: []const []const u8, source: Source) Cut {
+    switch (source) {
+        .whole => if (earliest(text, stops)) |hit| return .{ .text = text[0..hit.index], .stop = hit.stop },
+        .gated => |matched| return .{ .text = text, .stop = matched },
+    }
+    return .{ .text = text, .stop = null };
+}
+
 /// Start of the longest suffix of `text` that is a proper prefix of some stop (`text.len` if none):
 /// the bytes a later token could still turn into a match.
 fn pendingStart(text: []const u8, stops: []const []const u8) usize {
