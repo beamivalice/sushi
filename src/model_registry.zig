@@ -1557,7 +1557,7 @@ pub const ModelRegistry = struct {
     /// surfaces. A memory-preflight refusal keeps its identity so the HTTP
     /// layer answers with a named 503 instead of the generic "Model load
     /// failed" 500 (#144); everything else is `LoadFailed` with the name
-    /// readable via `loadErrorNameDupe`.
+    /// kept in the entry's `error_name`.
     /// `OutOfMemory` counts too: an allocator failure during a load is the same
     /// actionable thing to the user as the preflight's own refusal, and it
     /// reached the client as a generic "Model load failed" 500 before
@@ -1701,32 +1701,6 @@ pub const ModelRegistry = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return .{ .registry = self, .entry = entry, .settings_gen = entry.settings_gen, .claim_gen = entry.claim_gen };
-    }
-
-    /// Duped copy of the stored load-failure name for `id` (empty/"sushi"
-    /// route to the default), or null when the entry isn't in `.error_state`.
-    /// Caller frees. Feeds the HTTP "Model load failed: <name>" message (#144).
-    pub fn loadErrorNameDupe(self: *ModelRegistry, alloc: std.mem.Allocator, id_or_empty: []const u8) ?[]u8 {
-        const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "sushi"))
-            self.default_id
-        else
-            id_or_empty;
-        if (id.len == 0) return null;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const entry = self.entries.get(id) orelse return null;
-        if (entry.state != .error_state) return null;
-        const name = entry.error_name orelse return null;
-        return alloc.dupe(u8, name) catch null;
-    }
-
-    /// Read the most recent numeric refusal, including a transient unloaded entry.
-    pub fn loadContextRefusal(self: *ModelRegistry, id_or_empty: []const u8) ?MemoryContextRefusal {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "sushi")) self.default_id else id_or_empty;
-        const entry = self.entries.get(id) orelse return null;
-        return entry.memory_context_refusal;
     }
 
     /// Snapshot of every entry for `/v1/models`. Sort: default first
@@ -2386,11 +2360,7 @@ test "ModelRegistry: memory-refused loads keep their identity, other failures ex
     reg.markErrorLocked(stub, "FileNotFound");
     reg.mutex.unlock(reg.io);
     try expectError(error.LoadFailed, reg.ensureLoaded("krea"));
-    const name = reg.loadErrorNameDupe(testing.allocator, "krea");
-    defer if (name) |n| testing.allocator.free(n);
-    try testing.expectEqualStrings("FileNotFound", name.?);
-    // Non-error entries have no name to report.
-    try testing.expectEqual(@as(?[]u8, null), reg.loadErrorNameDupe(testing.allocator, "missing"));
+    try testing.expectEqualStrings("FileNotFound", stub.error_name.?);
 }
 
 test "ModelRegistry: pickLruEvictable orders by last_used_ns, ignores refcounted" {
@@ -2977,14 +2947,14 @@ test "Sushi quant memory load diagnostics survive refusal and clear on retry and
     stub.memory_context_refusal = .{ .requested = 500000, .maximum = 128000, .needed = 100, .available = 90, .kv_bits = 8, .chunk = 2048 };
     reg.markUnloadedLocked(stub);
     reg.mutex.unlock(reg.io);
-    try testing.expectEqual(@as(u32, 128000), reg.loadContextRefusal("quant").?.maximum);
+    try testing.expectEqual(@as(u32, 128000), stub.memory_context_refusal.?.maximum);
     reg.mutex.lockUncancelable(reg.io);
     try testing.expect(reg.tryBeginLoadLocked(stub));
     try testing.expectEqual(@as(?MemoryContextRefusal, null), stub.memory_context_refusal);
     stub.memory_context_refusal = .{ .requested = 500000, .maximum = 128000, .needed = 100, .available = 90, .kv_bits = 8, .chunk = 2048 };
     reg.markReadyLocked(stub, 1024);
     reg.mutex.unlock(reg.io);
-    try testing.expectEqual(@as(?MemoryContextRefusal, null), reg.loadContextRefusal("quant"));
+    try testing.expectEqual(@as(?MemoryContextRefusal, null), stub.memory_context_refusal);
 }
 
 test "DiskStats: each model keeps its own tier, and a reader never mixes two publishes" {
