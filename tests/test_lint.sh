@@ -371,6 +371,26 @@ printf '%s\n' 'fn inPlaceBuffer(s: S) !A {' '    try mlx.check(mlx.mlx_zeros(&z,
 printf '%s\n' 'fn grow(s: S) !void {' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/mlx_pages.zig"
 expect_green "zeros and a write in different fns, a test and a fn only tests reach, and mlx_pages itself"
 
+tree
+printf '%s\n' 'fn appendRows(self: *Scope, buf: A, chunk: A) !A {' '    const pad = try self.zeros(&.{ 4, 8 }, dt);' '    const t = try self.join(buf, pad);' '    try mlx.check(mlx.mlx_slice_update(&out, t, chunk, &a, 2, &b, 2, &c, 2, self.s));' '}' > "$TMP/t/src/p.zig"
+expect_red "a buffer made by a scope's zeros and join, written by slice_update" "\[in-place-buffer\] appendRows: a buffer made by zeros and written by slice_update"
+
+tree
+printf '%s\n' 'fn fill(s: S) !void {' '    try mlx.check(mlx.mlx_full(&z, &shape, 2, v, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/p.zig"
+expect_red "a buffer made by mlx_full and written by slice_update" "\[in-place-buffer\] fill: a buffer made by mlx_full and written by slice_update"
+
+tree
+printf '%s\n' 'fn grow(s: S) !void {' '    try mlx.check(mlx.mlx_concatenate_axis(&g, vec, 0, s));' '    try mlx.check(mlx.mlx_slice_update(&up, g, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/p.zig"
+expect_red "a buffer grown by a concatenate and written by slice_update" "\[in-place-buffer\] grow: a buffer made by mlx_concatenate_axis and written by slice_update"
+
+tree
+printf '%s\n' 'fn ring(sc: *Sc, row: A) !A {' '    var r = try sc.zeros(&.{ 8, 512 }, dt);' '    r = try sc.res(mlx.mlx_slice_update(&up, r, row, &a, 2, &b, 2, &c, 2, sc.s), &up);' '}' > "$TMP/t/src/p.zig"
+expect_red "a scope's zeros written by a slice_update it holds" "\[in-place-buffer\] ring: a buffer made by zeros and written by slice_update"
+
+tree
+printf '%s\n' 'fn tail(self: *Scope, a: A, b: A) !A {' '    const z = try self.zeros(&.{ 4, 8 }, dt);' '    return self.join(a, try self.join(b, z));' '}' > "$TMP/t/src/p.zig"
+expect_green "a join and a zeros no slice_update writes into"
+
 # rule cache-room
 tree
 printf '%s\n' 'fn grow(s: S) !void {' '    mlx.engine.roomFor(&shape, dt);' '    buf = try mlx_pages.inPlaceBuffer(&shape, dt, s);' '}' > "$TMP/t/src/kv_cache.zig"
