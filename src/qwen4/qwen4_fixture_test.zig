@@ -1324,9 +1324,20 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
     try testing.expect(pooled);
 }
 
-test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/leave, M-RoPE)" {
-    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+// The cut pack's trunk is affine, the tiny's a trellis bank: each joins its rows through its own kernels.
+test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/leave, M-RoPE; QWEN4_TEST_MODEL, QWEN4_STQ_TINY)" {
     try mlx.requireGpu();
+    var ran = false;
+    for ([_][*:0]const u8{ "QWEN4_TEST_MODEL", "QWEN4_STQ_TINY" }) |env| {
+        const model_dir = std.c.getenv(env) orelse continue;
+        ran = true;
+        errdefer std.debug.print("[qwen4 rows] fixture {s}\n", .{env});
+        try perRowDecodeEqualsSolo(model_dir);
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+fn perRowDecodeEqualsSolo(model_dir: [*:0]const u8) !void {
     const old_path = diagEnvOn("QWEN4_ROWS_OLD");
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -1380,6 +1391,8 @@ test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/le
         }
     }
 
+    const joined0 = qwen4_forward.trellis_rows_joined;
+    const shared0 = trunk.mtp_verify_shared_rows_calls;
     // Slots 0 and 1 run together, 2 joins, 0 leaves as 3 joins, 2 is cancelled, 0 comes back.
     const active = [_][]const usize{
         &.{ 0, 1 },    &.{ 0, 1 }, &.{ 0, 1, 2 }, &.{ 0, 1, 2 }, &.{ 1, 2, 3 },
@@ -1417,6 +1430,11 @@ test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/le
     }
     try testing.expectEqual(@as(usize, 0), mismatched);
     if (old_path) return;
+    // A trellis trunk's projections and shared expert ran once over the joined rows, not once a row.
+    if (config.trunk_quant != null) {
+        try testing.expect(qwen4_forward.trellis_rows_joined > joined0);
+        try testing.expect(trunk.mtp_verify_shared_rows_calls > shared0);
+    }
 
     for (0..4) |slot| {
         for (0..n_layers) |l| {

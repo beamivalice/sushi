@@ -24,6 +24,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
   after 2 s without a rise and refused while the kernel was still returning memory (a launchd restart hit it); it now
   waits while the memory keeps coming back, up to 10 s without a rise and 60 s in all, and logs what it read when it
   gives up.
+- **Batched Qwen decode on Sushi Cooler is up to 35% faster with an STQ pack**: requests decoding together ran most of
+  the trunk once per request; four together now total about 155 tok/s on an M5 Ultra, against 115, each still getting
+  the bytes it gets alone.
 - **A reply cancelled mid-stream no longer says it ran out of tokens**: a request stopped by `POST /v1/slots/cancel`
   (or the dashboard's Cancel) ended with `finish_reason: length` (Responses: incomplete, `max_output_tokens`) and zero
   usage on every surface; it now ends as cancelled, and its usage counts the tokens it returned.
