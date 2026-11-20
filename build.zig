@@ -252,7 +252,7 @@ pub fn build(b: *std.Build) void {
     });
     if ((test_model == null or test_model == .enc) and encoderSelected(b, test_filter)) {
         test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        if (runs.add(encoder_tests, encoder_tests.name, &.{}, false, 6)) |run_encoder| test_step.dependOn(&run_encoder.step);
+        if (runs.add(encoder_tests, encoder_tests.name, &.{}, false, 7)) |run_encoder| test_step.dependOn(&run_encoder.step);
         test_step.dependOn(countGuard(b, count_guard, encoder_tests));
     }
 
@@ -511,7 +511,7 @@ const test_domains = [_]TestDomain{
         "think_penalty", "trunk",        "trunk_helpers_test", "trunk_stq",
     } },
     // `tests` is the MLX root: its own test only names the files the binaries reach.
-    .{ .name = "load", .folders = &.{"arch"}, .files = &.{
+    .{ .name = "load", .folders = &.{"arch"}, .run_gib = 7, .files = &.{
         "arch_host_stub", "bills_live_test", "exl3_flat_layout_test", "expert_io",     "expert_store", "expert_stream",
         "hidden_capture", "imatrix",         "kld",                   "layer_weights", "model",        "model_discovery",
         "model_load",     "model_registry",  "owned_weights",         "pack_index",    "tests",        "transient_peak",
