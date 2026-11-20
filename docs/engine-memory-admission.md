@@ -329,6 +329,9 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   `billMargin`): no net, and DeepSeek's request bill drops its quarter there too. The live 364k Turn A on an STQ pack
   bills 15,741 MB. Measured whole requests (33k-token prompt, 1,024 new tokens, on Cooler): tiny held 2,368 MB of a
   3,072 MB bill; the 2.75 cut 6,882 of 7,161; the stq4 cut 6,541 of 7,289. MLX and GLM keep the net below.
+- **Two terms are billed at a named ceiling over their bytes, so a bill never falls as its prompt grows**: the QSA select
+  sheet at its budget's cells (`qsaBilledSheetCells`), at most one sheet row over what is held (fused, about 1 MB at 1M
+  tokens), and a fused sliding band at the 15-row sheet of the widest composed width (`slidingBandScoreBytes`).
 - **A Cooler request's transient is the larger of its prefill chunk's and its speculative round's**
   (`roundTransientBytes`, `PrefillRequestTerms.round_bytes`): a verify block's rows and turnover, the recurrent states the
   round's capture keeps from the verify to the rollback (`qwen4_bill.roundCaptureStates`: the fold's two at a two-row

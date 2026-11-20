@@ -456,3 +456,93 @@ test "a model loaded while decoder pools are lent pins its auto-context and pref
     try testing.expect(now.context < rest.context);
     try testing.expect(now.chunk < rest.chunk);
 }
+
+const ArchCfg = struct { name: []const u8, cfg: model_mod.ModelConfig };
+
+/// Every served arch's bill config, on each engine an arch runs on: Qwen on MLX and Cooler, MiMo, MiMo-Flash's band
+/// geometry, GLM with and without its DFlash2 assistant, DeepSeek on MLX and Cooler.
+fn everyArchConfig(fx: *const fixtures.PinFx, glm_dflash: *const model_mod.ModelConfig, out: *[9]ArchCfg) []ArchCfg {
+    var n: usize = 0;
+    if (bills.archBuilt("qwen4")) {
+        out[n] = .{ .name = "qwen-mlx", .cfg = fixtures.qwen4MeasuredTestConfig() };
+        out[n + 1] = .{ .name = "qwen-cooler", .cfg = @import("qwen4/qwen4_bill_test.zig").coolerFlashNext() };
+        out[n + 2] = .{ .name = "qwen-pack", .cfg = fx.qwen };
+        n += 3;
+    }
+    if (bills.archBuilt("mimo2")) {
+        out[n] = .{ .name = "mimo", .cfg = fx.mimo };
+        out[n + 1] = .{ .name = "mimo-flash", .cfg = fixtures.mimoV2FlashBillConfig() };
+        n += 2;
+    }
+    if (bills.archBuilt("glm5")) {
+        out[n] = .{ .name = "glm", .cfg = fx.glm };
+        out[n + 1] = .{ .name = "glm-dflash", .cfg = glm_dflash.* };
+        n += 2;
+    }
+    if (bills.archBuilt("dsv41")) {
+        out[n] = .{ .name = "dsv-mlx", .cfg = fx.dsv };
+        out[n].cfg.cooler_for_test = false;
+        out[n + 1] = .{ .name = "dsv-cooler", .cfg = fx.dsv };
+        out[n + 1].cfg.cooler_for_test = true;
+        n += 2;
+    }
+    return out[0..n];
+}
+
+test "a request's bill never falls as its prompt grows within a context, every served arch on each engine, MTP on and off, the SSD tier on and off" {
+    var fx = try fixtures.PinFx.init();
+    defer fx.deinit();
+    var glm_dflash = try fixtures.glmAssistantFixture();
+    defer glm_dflash.deinit(testing.allocator);
+    var buf: [9]ArchCfg = undefined;
+    const cfgs = everyArchConfig(&fx, &glm_dflash, &buf);
+    const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
+    var falls: u32 = 0;
+    for ([_]bool{ false, true }) |tier| {
+        const guard = bills.TierGuard.pin(false, if (tier) launch_state.prefix_cache_disk_bytes else 0);
+        defer guard.restore();
+        for (cfgs) |*c| for ([_]bool{ false, true }) |mtp| for ([_]u64{ 512, 8192 }) |chunk| for ([_]u64{ 16_383, 32_768, 70_001, 262_144 }) |ctx| {
+            const warm: bills.WarmPrefix = .{ .mtp_on = mtp };
+            var probe = c.cfg;
+            probe.pinned_context = @intCast(ctx);
+            var prev: u64 = 0;
+            var p: u64 = 1;
+            // Every prompt near a step a term may take (the forward widths, 256 rows, the reservation, the end).
+            while (p <= ctx) : (p += @as(u64, if (ctx - p < 300 or p < 1100 or (p + 300 > edge and p < edge + 300) or p % 256 < 3 or p % 256 > 252) 1 else 67)) {
+                const b = bills.prefillNeededAtChunk(&probe, p, @intCast(ctx - p), 8, chunk, warm);
+                if (b < prev) {
+                    falls += 1;
+                    if (falls < 10) std.debug.print("{s} tier {} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B under the prompt before it\n", .{ c.name, tier, mtp, chunk, ctx, p, prev - b });
+                }
+                prev = b;
+            }
+        };
+    }
+    try testing.expectEqual(@as(u32, 0), falls);
+}
+
+test "the width the max-context search prices never narrows as the context grows, every served arch on each engine" {
+    var fx = try fixtures.PinFx.init();
+    defer fx.deinit();
+    var glm_dflash = try fixtures.glmAssistantFixture();
+    defer glm_dflash.deinit(testing.allocator);
+    var buf: [9]ArchCfg = undefined;
+    const cfgs = everyArchConfig(&fx, &glm_dflash, &buf);
+    var narrows: u32 = 0;
+    for (cfgs) |*c| for ([_]u32{ 0, 512, 2048 }) |pin| {
+        var probe = c.cfg;
+        probe.pinned_prefill_chunk = pin;
+        var prev: u64 = 0;
+        var ctx: u64 = 1;
+        while (ctx <= 1 << 20) : (ctx += @max(1, ctx / 64)) {
+            probe.pinned_context = @intCast(ctx);
+            const w = bills.sushiContextWidth(&probe, @intCast(ctx));
+            if (w < prev) {
+                narrows += 1;
+                if (narrows < 10) std.debug.print("{s} pin {d}: context {d} priced at width {d}, under {d} a shorter context priced\n", .{ c.name, pin, ctx, w, prev });
+            }
+            prev = w;
+        }
+    };
+    try testing.expectEqual(@as(u32, 0), narrows);
+}

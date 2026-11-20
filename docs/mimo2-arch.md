@@ -142,7 +142,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **Every layer PREFILLS FUSED** (`sushi_attn_pd`, qk 192 / v 128). A sliding layer's learned sink joins the online
   max and sum with no value row (template flag `SINK`; `SINK=0` compiles the global layers' code unchanged, proven
   byte-identical); `slidingPrefillFused` gates the dispatch AND `server.slidingBandScoreBytes`, so the band sheet is
-  billed only where it still composes (chunks under 16 rows). A quantized cache is read one
+  billed where it still composes (chunks under 16 rows) and, at a fused width, at the 15-row sheet those build, so the
+  bill never falls as the prompt grows. A quantized cache is read one
   DISPATCH at a time (`fusedSdpaPrefillKv`; `kr` = {begin, end, koff, kL_abs} puts every causal comparison in CACHE
   coordinates), never rebuilt whole; the sliding ring view is window + chunk rows, dequantized per view.
   Landed 2026-09-23 (668278c): 39-layer band attention 39.5 -> 20.3 ms at chunk 512, 603 -> 95.5 at 2048, 2439 -> 181

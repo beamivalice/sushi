@@ -149,7 +149,7 @@ mimo_v2 EXL3 prefill layers built lazily keep their own window count and rate
 mimo_v2 EXL3 prefill rows match the host SwiGLU oracle past one GEMM window
 mimo_v2 EXL3 stacked experts resolve as a layout and keep the dense prefix
 mimo_v2 admission credits the hot cache: a gap the cache covers is an evict, not a refusal
-mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops exactly the band sheet
+mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops the band sheet but the widest composed width's
 mimo_v2 is the only additional expert streaming architecture
 mimo_v2 original source discovery validates individual MXFP4 tensors
 mimo_v2 prefill bill carries the FP8 trunk's dequant scratch past the GEMV width

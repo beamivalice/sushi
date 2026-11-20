@@ -917,13 +917,15 @@ pub fn prefillTransientReserveAtKv(
 /// `sushi_attn_pd` does not serve their band + sink attention. Their attention
 /// is a band, so one layer's sheet is `[heads, fwd, window + fwd - 1]` whatever
 /// the prompt length. Billed at `MOE_PREFILL_COEXIST` layers, the same
-/// coexistence the other per-layer prefill transients are billed at. Zero
-/// exactly where the dispatch's own predicate (`slidingPrefillFused`) holds.
+/// coexistence the other per-layer prefill transients are billed at. Where the
+/// dispatch's own predicate (`slidingPrefillFused`) holds there is no sheet, but a
+/// width under the fused kernel's floor builds one: a fused width bills the widest
+/// composed one, so the bill never falls as the prompt grows.
 pub fn slidingBandScoreBytes(config: *const model_mod.ModelConfig, fwd: u64) u64 {
     if (config.swaRingTokens() == 0) return 0;
-    if (trunk.slidingPrefillFused(config, fwd)) return 0;
-    const keys: u64 = @as(u64, config.sliding_window) +| fwd -| 1;
-    return MOE_PREFILL_COEXIST *| @as(u64, config.num_attention_heads) *| fwd *| keys *| 2;
+    const rows: u64 = if (trunk.slidingPrefillFused(config, fwd)) @as(u64, @intCast(trunk.FUSED256_MIN_Q_LEN)) - 1 else fwd;
+    const keys: u64 = @as(u64, config.sliding_window) +| rows -| 1;
+    return MOE_PREFILL_COEXIST *| @as(u64, config.num_attention_heads) *| rows *| keys *| 2;
 }
 
 /// The bf16 copy a source FP8 linear dequantizes into when a forward is wider than its GEMV.
@@ -1143,7 +1145,8 @@ fn sushiContextBytesAt(config: *const model_mod.ModelConfig, context: u32, kv_bi
     };
 }
 
-fn sushiContextWidth(config: *const model_mod.ModelConfig, context: u32) u64 {
+/// The width the max-context search prices a context at: an explicit `--prefill-chunk`, else the per-request floor rung.
+pub fn sushiContextWidth(config: *const model_mod.ModelConfig, context: u32) u64 {
     const explicit = explicitPrefillChunk();
     const rung: u32 = if (explicit > 0) explicit else perRequestFloorWidth(config) orelse
         (if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else 8192);
@@ -1153,8 +1156,9 @@ fn sushiContextWidth(config: *const model_mod.ModelConfig, context: u32) u64 {
 /// The dearest request a context of `ctx` tokens can be asked for, over every split of it between prompt and reply: what
 /// every context the server names (advertised, admitted at load, or in a refusal) is priced at.
 pub fn contextNeed(config: *const model_mod.ModelConfig, ctx: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
-    // A request's bill never falls as its prompt grows within a context (the QSA sheet by `qsaBilledSheetCells`), so
-    // the prompt alone is dearest; but a prompt at the reservation starts reserving its cache, so the longest under it.
+    // A request's bill never falls as its prompt grows within a context, so the prompt alone is dearest. The longest
+    // prompt under the reservation is priced too, where the cache's rule changes: a guard for MiMo or any arch that
+    // reserves, whose bill could fall there.
     const alone = splitNeed(config, ctx, ctx, kv_bits, chunk, warm);
     const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
     if (!config.reservesKvCapacity() or ctx < edge) return alone;
@@ -5462,8 +5466,9 @@ test "mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sh
     const fused_bill = prefillNeededAtChunk(&cfg, seq, 2048, 8, chunk, .{});
     try t.expect(fused_bill < global_sheet);
 
-    // The sliding layers' band + sink attention runs in the same kernel: no sheet left.
-    try t.expectEqual(@as(u64, 0), slidingBandScoreBytes(&cfg, chunk));
+    // The sliding layers' band + sink attention runs in the same kernel: only the sheet of the widest composed width,
+    // 15 rows, which a prompt one row short of the kernel's floor builds.
+    try t.expectEqual(MOE_PREFILL_COEXIST * @as(u64, cfg.num_attention_heads) * 15 * (128 + 14) * 2, slidingBandScoreBytes(&cfg, chunk));
 
     // Kill switch: composed attention restores both sheets, and the bill with them. The
     // band sheet is prompt-length independent, `window + fwd - 1` keys wide, at the same
@@ -5668,7 +5673,7 @@ test "mimo_v2 warm bill credits only the restored global rows, never the ring" {
     try t.expectEqual(@as(u64, 0), shared.shared_resident_bytes);
 }
 
-test "mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops exactly the band sheet" {
+test "mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops the band sheet but the widest composed width's" {
     if (!archBuilt("mimo2")) return error.SkipZigTest;
     const t = std.testing;
     const cfg = fixtures.mimoV2FlashBillConfig();
@@ -5683,13 +5688,19 @@ test "mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops exactly the 
     try t.expectEqual(MOE_PREFILL_COEXIST * 64 * chunk * (128 + chunk - 1) * 2, band);
     const composed = prefillNeededAtChunk(&cfg, seq, 2048, 8, chunk, .{});
     attn_kernels.sliding_prefill_fused_override = null;
-    try t.expectEqual(composed - band, prefillNeededAtChunk(&cfg, seq, 2048, 8, chunk, .{}));
+    const band_15 = MOE_PREFILL_COEXIST * 64 * 15 * (128 + 14) * 2;
+    try t.expectEqual(composed - band + band_15, prefillNeededAtChunk(&cfg, seq, 2048, 8, chunk, .{}));
 
-    // One predicate decides the dispatch and the bill, at every width and switch state.
+    // One predicate decides the dispatch and the bill, at every width and switch state: a composed width bills its own
+    // sheet, a fused one the widest composed width's, so the band never falls as the forward widens.
     for ([_]?bool{ null, false }) |ov| {
         attn_kernels.sliding_prefill_fused_override = ov;
+        var prev: u64 = 0;
         for ([_]u64{ 1, 8, 15, 16, 512, 2048, 4096 }) |fwd| {
-            try t.expectEqual(trunk.slidingPrefillFused(&cfg, fwd), slidingBandScoreBytes(&cfg, fwd) == 0);
+            const rows = if (trunk.slidingPrefillFused(&cfg, fwd)) 15 else fwd;
+            try t.expectEqual(MOE_PREFILL_COEXIST * 64 * rows * (128 + rows - 1) * 2, slidingBandScoreBytes(&cfg, fwd));
+            try t.expect(slidingBandScoreBytes(&cfg, fwd) >= prev);
+            prev = slidingBandScoreBytes(&cfg, fwd);
         }
     }
 }
@@ -5955,7 +5966,7 @@ test "bill pin: prefillMemoryNeeded" {
 test "bill pin: prefillTransientReserve and prefillTransientReserveAtKv" {
     try pinConfigs("prefillTransientReserve", &.{
         913670144, 2007965696, 3841163264, 5598519296, 912621568, 1751965696, 3832774656, 5342519296,
-        1640270560, 1846708960, 6462409440, 6659017440, 1813205120, 1813205120, 6625513600, 6625513600,
+        1641361120, 1847799520, 6463500000, 6660108000, 1814295680, 1814295680, 6626604160, 6626604160,
         1637207552, 1701999104, 5399432704, 5462045184, 1635074560, 1747620352, 5397070336, 5505716736,
         1657615872, 2954339040, 10467127296, 11762377440, 1657615872, 2954339040, 10467127296, 11762377440,
     }, struct {
@@ -5972,8 +5983,8 @@ test "bill pin: the per-forward scratch terms" {
     try pinConfigs("scratchTerms", &.{
         0, 0, 0, 4231168, 350000, 0, 0, 0,
         143360000, 431128576, 0, 0, 0, 143360000, 813694976, 65536,
-        0, 0, 167772160, 0, 0, 0, 0, 167772160,
-        0, 0, 0, 0, 167772160, 0, 0, 0,
+        0, 0, 167772160, 0, 1090560, 0, 0, 167772160,
+        0, 1090560, 0, 0, 167772160, 0, 0, 0,
         0, 0, 350000, 0, 0, 0, 0, 179200000,
         0, 0, 0, 0, 1433600000, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0,
@@ -6052,7 +6063,7 @@ test "bill pin: sushiContextBytesAt and the max-context search" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigs("maxSushiContext", &.{
-        4669249536, 512, 1048576, 1048576, 200000, 3583428960, 512, 1048576,
+        4669249536, 512, 1048576, 1048576, 200000, 3584519520, 512, 1048576,
         1048576, 200000, 2966441600, 512, 1048576, 1048576, 200000, 4337257344,
         512, 1048576, 1048576, 200000,
     }, struct {
@@ -6073,7 +6084,7 @@ test "bill pin: loadServingBill" {
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("loadServingBill", &.{
         0, 1, 100000, 4669249536, 1048576, 8, 512, 0,
-        1, 100000, 3851864416, 1048576, 8, 512, 0, 0,
+        1, 100000, 3852954976, 1048576, 8, 512, 0, 0,
         0, 0,
     }, .{ 7, 7, 2, 2 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6096,7 +6107,7 @@ test "bill pin: loadServingBill" {
 
 test "bill pin: memoryContextAt and memoryContextAtChunk" {
     try pinConfigs("memoryContextAt", &.{
-        1048576, 1048576, 445952, 445952, 2051958, 2159968, 479944, 587954,
+        1048576, 1048576, 445952, 445952, 2051901, 2159911, 479887, 587897,
         3799051, 3953345, 922039, 1076334, 1076224, 1076224, 1076224, 1076224,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6164,9 +6175,9 @@ test "bill pin: planHotCache" {
     try pinConfigs("planHotCache", &.{
         8192, 512, 913670144, 1760098304, 40275904512, 1024, 512, 913670144,
         1760098304, 40275904512, 8192, 512, 913670144, 1760098304, 2147483648, 1024,
-        512, 913670144, 1760098304, 2147483648, 4096, 512, 1640270560, 1431572352,
-        39877830048, 1024, 512, 1640270560, 1431572352, 39877830048, 4096, 512,
-        1640270560, 1431572352, 2147483648, 1024, 512, 1640270560, 1431572352, 2147483648,
+        512, 913670144, 1760098304, 2147483648, 4096, 512, 1641361120, 1431572352,
+        39876739488, 1024, 512, 1641361120, 1431572352, 39876739488, 4096, 512,
+        1641361120, 1431572352, 2147483648, 1024, 512, 1641361120, 1431572352, 2147483648,
         2048, 512, 1637207552, 816436736, 40496028672, 1024, 512, 1637207552,
         816436736, 40496028672, 2048, 512, 1637207552, 816436736, 2147483648, 1024,
         512, 1637207552, 816436736, 2147483648, 8192, 512, 1657615872, 95303744,
@@ -6231,7 +6242,7 @@ test "bill pin: the unnamed hot-cache ask" {
 test "bill pin: oneSessionEntryBytes and oneSessionFor" {
     try pinConfigs("oneSession", &.{
         2250651648, 2250651648, 36548110336, 5327820800, 1073741824, 2250651648, 1526246400, 1526246400,
-        37605029536, 4270901600, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
+        37603938976, 4271992160, 1073741824, 1526246400, 2052183552, 2052183552, 38238052736, 3637878400,
         1073741824, 2052183552, 96290880, 96290880, 36280382592, 5595548544, 1073741824, 96290880,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6386,10 +6397,10 @@ test "bill pin: prefillNeededAtChunk" {
         1168953344, 1180430336, 927666176, 1295888384, 1530092864, 1541569856, 1288805696, 1657027904,
         4465995776, 4759361536, 3568395776, 4903684096, 6210793472, 6508337152, 5313193472, 6652659712,
         5705199616, 5998565376, 4015599616, 6142887936, 7480471552, 7778015232, 5790871552, 7922337792,
-        1717825920, 1736792960, 1623822720, 1736792960, 2373073280, 2392040320, 2279070080, 2392040320,
-        1944894080, 1963861120, 1797438080, 1963861120, 2600141440, 2619108480, 2452685440, 2619108480,
-        3627130720, 3646097760, 2641130720, 3646097760, 5689548640, 5708515680, 4703548640, 5708515680,
-        5129713280, 5148680320, 3273713280, 5148680320, 7236368000, 7255335040, 5380368000, 7255335040,
+        1718916480, 1737883520, 1624913280, 1737883520, 2374163840, 2393130880, 2280160640, 2393130880,
+        1945984640, 1964951680, 1798528640, 1964951680, 2601232000, 2620199040, 2453776000, 2620199040,
+        3628221280, 3647188320, 2642221280, 3647188320, 5690639200, 5709606240, 4704639200, 5709606240,
+        5130803840, 5149770880, 3274803840, 5149770880, 7237458560, 7256425600, 5381458560, 7256425600,
         2089683520, 2089683520, 2089683520, 2274208320, 2729646720, 2729646720, 2729646720, 2914171520,
         2121102080, 2121102080, 2121102080, 2305626880, 2760733440, 2760733440, 2760733440, 2945258240,
         3000684160, 3000684160, 3000684160, 3369733760, 5014994560, 5014994560, 5014994560, 5384044160,
@@ -6469,7 +6480,7 @@ test "bill pin: prefillChunkCost and the adaptive width" {
         2015830016, 5661433856, 512, 512, 0, 1, 512, 512,
         0, 1, 512, 1024, 0, 0, 2048, 2048,
         0, 0, 512, 1024, 0, 0, 2048, 4096,
-        0, 0, 1, 1, 1852975840, 6709152480, 512, 512,
+        0, 0, 1, 1, 1854066400, 6710243040, 512, 512,
         0, 1, 512, 512, 0, 1, 512, 1024,
         0, 0, 2048, 2048, 0, 0, 512, 1024,
         0, 0, 2048, 4096, 0, 0, 1, 1,
@@ -6671,7 +6682,7 @@ test "bill pin: the wire-limit sentences" {
 test "bill pin: the streamed-load fit" {
     try pinConfigs("expertStreaming", &.{
         65536, 1006731264, 4493721600, 3154214912, 1, 0, 65536, 978283392,
-        5027628640, 3125767040, 1, 0, 65536, 585941504, 4677861760, 2733425152,
+        5028719200, 3125767040, 1, 0, 65536, 585941504, 4677861760, 2733425152,
         1, 0, 65536, 64630784, 6949820416, 2212114432, 1, 0,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -7746,7 +7757,7 @@ test "bill pin: loadWarmupBytes" {
 test "bill pin: loadRequirementBytes" {
     try pinLoadConfigs("loadRequirementBytes", &.{
         65632468992, 85899345920, 66840428544, 85899345920, 79541548544, 79541548544, 79541548544, 79541548544,
-        65766686720, 85899345920, 65766686720, 85899345920, 79971411552, 79971411552, 79971411552, 79971411552,
+        65766686720, 85899345920, 65766686720, 85899345920, 79972502112, 79972502112, 79972502112, 79972502112,
         66060796416, 85899345920, 66060796416, 85899345920, 80340094144, 80340094144, 80340094144, 80340094144,
         69458661157, 69458661157, 69458661157, 69458661157, 82343563045, 82343563045, 82343563045, 82343563045,
     }, struct {
