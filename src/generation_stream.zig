@@ -2252,7 +2252,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
     };
 }
 
-pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, err: anyerror) !bool {
+pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, err: anyerror, report: *const scheduler_mod.LoadReport) !bool {
     if (err == error.PackDownloading) {
         var gate_buf: [512]u8 = undefined;
         const entry = scheduler.registry.resolveEntry(id) catch null;
@@ -2262,8 +2262,9 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
         return true;
     }
     const refusal = loadRefusalFor(err) orelse return false;
-    const context = if (err == error.InsufficientMemory) scheduler.takeLoadContextRefusal(id) else null;
-    const message = try loadRefusalMessage(allocator, err, refusal, context);
+    // A refusal answered from the stored state (`memory_context_refusal`) is an earlier load's, by design.
+    const context = if (err == error.InsufficientMemory) report.context orelse scheduler.registry.loadContextRefusal(id) else null;
+    const message = try loadRefusalMessage(allocator, err, refusal, context, report.refusalText());
     defer allocator.free(message);
     var retry_buf: [40]u8 = undefined;
     const retry = if (refusal.retry_after) |secs| std.fmt.bufPrint(&retry_buf, "Retry-After: {d}\r\n", .{secs}) catch "" else "";
@@ -2273,10 +2274,10 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
 
 /// The message a load refusal's answer carries: the text the load wrote when it wrote one (the memory check's names the
 /// bound and what to free or change), else the refusal's own. The caller frees it.
-pub fn loadRefusalMessage(allocator: std.mem.Allocator, err: anyerror, refusal: LoadRefusal, context: ?model_registry_mod.MemoryContextRefusal) ![]u8 {
+pub fn loadRefusalMessage(allocator: std.mem.Allocator, err: anyerror, refusal: LoadRefusal, context: ?model_registry_mod.MemoryContextRefusal, text: ?[]const u8) ![]u8 {
     const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported or
         err == error.SsdBudgetExceedsWiredLimit or err == error.ExpertCacheDoesNotFit or err == error.SsdBudgetBelowResident or err == error.NotEnoughMemory;
-    if (written) if (scheduler_mod.takeLoadRefusal()) |text| return allocator.dupe(u8, text);
+    if (written) if (text) |t| return allocator.dupe(u8, t);
     if (context) |c| return memoryContextRefusalMessage(allocator, c);
     return allocator.dupe(u8, refusal.message);
 }
@@ -2315,8 +2316,7 @@ test "a prefill chunk refused mid-request for memory answers 503 with the arch's
 test "a load refused by a check that wrote its text answers with that text, as the memory preflight does" {
     const a = std.testing.allocator;
     for ([_]anyerror{ error.SsdBudgetExceedsWiredLimit, error.ExpertCacheDoesNotFit, error.SsdBudgetBelowResident, error.NotEnoughMemory }) |e| {
-        scheduler_mod.recordLoadRefusal("Not enough memory to load this model.\nIt needs 150.0 GB ...");
-        const message = try loadRefusalMessage(a, e, loadRefusalFor(e).?, null);
+        const message = try loadRefusalMessage(a, e, loadRefusalFor(e).?, null, "Not enough memory to load this model.\nIt needs 150.0 GB ...");
         defer a.free(message);
         try std.testing.expectEqualStrings("Not enough memory to load this model.\nIt needs 150.0 GB ...", message);
     }
@@ -2327,9 +2327,8 @@ test "a memory-refused load's 503 carries the check's whole text, its lines inta
     var text_buf: [2048]u8 = undefined;
     const gib: u64 = 1 << 30;
     const text = bills_mod.loadMemoryRefusalText(&text_buf, .{ .needed = 20 * gib, .avail = bills_mod.sushiAvailable(12 * gib, 0, 29 * gib, 0, 28 * gib), .wired_beside = 0 });
-    scheduler_mod.recordLoadRefusal(text);
     const context = model_registry_mod.MemoryContextRefusal{ .requested = 9, .maximum = 4, .needed = 1, .available = 0, .kv_bits = 8, .chunk = 512 };
-    const message = try loadRefusalMessage(a, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context);
+    const message = try loadRefusalMessage(a, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context, text);
     defer a.free(message);
     try std.testing.expectEqualStrings(text, message);
     // The body the web UI and Sushibar read `error.message` from.
@@ -2342,8 +2341,8 @@ test "a memory-refused load's 503 carries the check's whole text, its lines inta
     defer parsed.deinit();
     try std.testing.expectEqualStrings(text, parsed.value.@"error".message);
     try std.testing.expect(std.mem.indexOf(u8, parsed.value.@"error".message, "Free about 8.0 GB more.\nTo load it:\n- Quit other apps") != null);
-    // Read once: an answer with no text written falls back to the context figures.
-    const again = try loadRefusalMessage(a, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context);
+    // An answer with no text written falls back to the context figures.
+    const again = try loadRefusalMessage(a, error.InsufficientMemory, loadRefusalFor(error.InsufficientMemory).?, context, null);
     defer a.free(again);
     try std.testing.expect(std.mem.startsWith(u8, again, "Context 9 does not fit"));
 }
@@ -2351,16 +2350,21 @@ test "a memory-refused load's 503 carries the check's whole text, its lines inta
 /// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for
 /// every on-demand load failure — the inference thread's error name was
 /// dropped at the thread boundary. The registry keeps it; echo it.
-pub fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8) !void {
+pub fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8, report: *const scheduler_mod.LoadReport) !void {
+    if (report.failed) |err| return sendLoadFailedNamed(allocator, stream, @errorName(err));
+    // No load of this request's own: the stored failure it was answered from fast, an earlier load's by design.
     if (sched.loadErrorName(allocator, id)) |name| {
         defer allocator.free(name);
-        if (std.fmt.allocPrint(allocator, "Model load failed: {s}", .{name}) catch null) |msg| {
-            defer allocator.free(msg);
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
-            return;
-        }
+        return sendLoadFailedNamed(allocator, stream, name);
     }
     try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
+}
+
+fn sendLoadFailedNamed(allocator: std.mem.Allocator, stream: *Conn, name: []const u8) !void {
+    const msg = std.fmt.allocPrint(allocator, "Model load failed: {s}", .{name}) catch
+        return sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
+    defer allocator.free(msg);
+    try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
 }
 
 pub fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {

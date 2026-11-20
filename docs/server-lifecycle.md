@@ -486,6 +486,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **Every route asked after a shutdown answers the shutdown error**: `Scheduler.ensureLoaded`/`ensureLoadedFresh`
   return `error.Shutdown` once one is asked, for a resident model too, and every route that holds or loads a model
   (generation, Responses WebSocket turns, `/v1/load-model`) answers through one map, `server.sendModelRefusal`.
+- **A load's answer is its own outcome, returned, never left on the thread**: `ensureLoaded` fills the caller's
+  `LoadReport` (the error, a check's text, a memory refusal's context) and the answer reads it; the registry's stored
+  name and context answer only a request that was answered fast from a stored failure, an earlier load's by design.
 - **A load or unload the inference thread never took undoes its marks**: a load's `LoadAttempt.end` returns its claimed
   entry and its `evicting` victims on every way out (a refusal at the queue, a shutdown), and an unload refused at the
   queue sets its model back to `ready`, or a request waiting on them waits forever.

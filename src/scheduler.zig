@@ -1023,36 +1023,32 @@ fn coldLoadDisk(raw_stride: u32, capacity: u32, ram_enabled: bool) ColdLoadDisk 
     return .{ .bytes = ask.bytes, .stride = @import("server.zig").effectiveSsmCheckpointStride(raw_stride, capacity, ram_enabled, ask.bytes) };
 }
 
-// Connection-local transport preserves a load diagnostic across a concurrent retry.
-threadlocal var last_load_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
 pub const load_refusal_cap = 2048;
-threadlocal var last_load_refusal: [load_refusal_cap]u8 = undefined;
-threadlocal var last_load_refusal_len: usize = 0;
 
-/// The text of the setting, launch-flag or memory refusal the calling thread's last cold load raised, read once by the
-/// HTTP answer.
-pub fn takeLoadRefusal() ?[]const u8 {
-    const len = last_load_refusal_len;
-    last_load_refusal_len = 0;
-    return if (len == 0) null else last_load_refusal[0..len];
-}
+/// What the caller's own cold load reports beside its error, handed back to that caller as a value (`ensureLoaded`'s
+/// out-parameter), never left on the thread for a later reader.
+pub const LoadReport = struct {
+    /// The error the load, or its files read, ended with.
+    failed: ?anyerror = null,
+    /// The context a memory refusal names.
+    context: ?model_registry_mod.MemoryContextRefusal = null,
+    text: [load_refusal_cap]u8 = undefined,
+    text_len: usize = 0,
 
-pub fn recordLoadRefusal(text: []const u8) void {
-    warnPastStore(text.len);
-    const n = @min(text.len, last_load_refusal.len);
-    @memcpy(last_load_refusal[0..n], text[0..n]);
-    last_load_refusal_len = n;
-}
+    /// The text a setting, launch-flag or memory check wrote, which the client gets whole.
+    pub fn record(self: *LoadReport, text: []const u8) void {
+        warnPastStore(text.len);
+        self.text_len = @min(text.len, self.text.len);
+        @memcpy(self.text[0..self.text_len], text[0..self.text_len]);
+    }
+
+    pub fn refusalText(self: *const LoadReport) ?[]const u8 {
+        return if (self.text_len == 0) null else self.text[0..self.text_len];
+    }
+};
 
 fn warnPastStore(len: usize) void {
     if (len > load_refusal_cap) log.warn("[load] a refusal of {d} bytes is past its {d}-byte store: the client reads its start\n", .{ len, load_refusal_cap });
-}
-
-test "the refusal a cold load records is read once" {
-    try std.testing.expect(takeLoadRefusal() == null);
-    recordLoadRefusal("--ctx-size 9 is above the 4-token window");
-    try std.testing.expectEqualStrings("--ctx-size 9 is above the 4-token window", takeLoadRefusal().?);
-    try std.testing.expect(takeLoadRefusal() == null);
 }
 
 /// Continuous-batching scheduler. One per server. Owns the inference
@@ -1706,14 +1702,15 @@ pub const Scheduler = struct {
     ///                             RAM can't hold weights + headroom).
     ///   error.LoadFailed        — inference thread reported a load failure.
     ///   error.Shutdown          — scheduler is shutting down.
-    pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
-        return self.refuseAfterShutdown(try self.ensureLoadedWith(id_or_empty, false));
+    /// `report` (null: nobody answers from it) receives what this call's own load reports beside its error.
+    pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8, report: ?*LoadReport) !*LoadedModel {
+        return self.refuseAfterShutdown(try self.ensureLoadedWith(id_or_empty, false, report));
     }
 
     /// `ensureLoaded` for an explicit load request: a model whose last load failed is tried again with the
     /// current settings and memory instead of answering from the stored failure.
-    pub fn ensureLoadedFresh(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
-        return self.refuseAfterShutdown(try self.ensureLoadedWith(id_or_empty, true));
+    pub fn ensureLoadedFresh(self: *Scheduler, id_or_empty: []const u8, report: ?*LoadReport) !*LoadedModel {
+        return self.refuseAfterShutdown(try self.ensureLoadedWith(id_or_empty, true, report));
     }
 
     /// A model held or loaded once a shutdown was asked, a resident one's too, answers the shutdown as every route does.
@@ -1723,9 +1720,10 @@ pub const Scheduler = struct {
         return error.Shutdown;
     }
 
-    fn ensureLoadedWith(self: *Scheduler, id_or_empty: []const u8, retry_failed: bool) !*LoadedModel {
-        last_load_context_refusal = null;
-        last_load_refusal_len = 0;
+    fn ensureLoadedWith(self: *Scheduler, id_or_empty: []const u8, retry_failed: bool, report: ?*LoadReport) !*LoadedModel {
+        var unread: LoadReport = .{};
+        const rep = report orelse &unread;
+        rep.* = .{};
         // Fast path: ready entries. registry.ensureLoaded handles waiting
         // out .loading / .evicting transitions by other callers.
         const fast_result = if (retry_failed) self.registry.ensureLoadedRetrying(id_or_empty) else self.registry.ensureLoaded(id_or_empty);
@@ -1752,6 +1750,7 @@ pub const Scheduler = struct {
         const settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
         const cpu_state = model_load.preloadCpuState(self.allocator, self.io, entry.path) catch |err| {
             attempt.outcome = .{ .failed = err };
+            rep.failed = err;
             return ModelRegistry.loadErrorFromName(@errorName(err));
         };
         // Ownership: on success transfers to the entry inside the
@@ -1765,7 +1764,7 @@ pub const Scheduler = struct {
         var launch_buf: [384]u8 = undefined;
         if (model_load.launchRefusal(&launch_buf, owned.config, self.kv_quant, self.ctx_size_flag)) |r| {
             log.err("{s}\n", .{r.line});
-            recordLoadRefusal(r.line);
+            rep.record(r.line);
             return r.err;
         }
 
@@ -1798,7 +1797,7 @@ pub const Scheduler = struct {
                     var text_buf: [512]u8 = undefined;
                     const text = model_load.ssdBudgetBelowRefusal(&text_buf, self.io, self.allocator, owned.config, entry.path, gate_budget, model_load.coldLoadVision(owned.config, true), assistant_bytes);
                     log.err("{s}\n", .{text});
-                    recordLoadRefusal(text);
+                    rep.record(text);
                 }
                 return e;
             };
@@ -1890,7 +1889,7 @@ pub const Scheduler = struct {
                     var text_buf: [768]u8 = undefined;
                     const text = bills.residentBudgetRefusalText(&text_buf, estimated, self.registry.max_resident_mem, self.registry.current_resident_bytes +| (self.registry.reserved_bytes -| estimated), self.registry.countLoadedLocked());
                     log.err("Refusing to load {s}: {s}\n", .{ entry.id, text });
-                    recordLoadRefusal(text);
+                    rep.record(text);
                 }
                 return if (count_cap) error.ResidentModelsCapReached else error.NotEnoughMemory;
             };
@@ -1954,8 +1953,9 @@ pub const Scheduler = struct {
             .ok => {},
             .shutdown => return error.Shutdown,
             .failed => |err| {
-                last_load_context_refusal = req.memory_context_refusal;
-                if (req.refusal_text_len > 0) recordLoadRefusal(req.refusal_text[0..req.refusal_text_len]);
+                rep.failed = err;
+                rep.context = req.memory_context_refusal;
+                if (req.refusal_text_len > 0) rep.record(req.refusal_text[0..req.refusal_text_len]);
                 // Mapped to a typed error so a memory-preflight refusal surfaces as a
                 // named 503, not the generic "Model load failed" 500 (#144).
                 return ModelRegistry.loadErrorFromName(@errorName(err));
@@ -1988,17 +1988,10 @@ pub const Scheduler = struct {
         self.registry.releaseStatus(lm);
     }
 
-    /// Duped stored failure name for the id `ensureLoaded` just refused with
-    /// `error.LoadFailed` — feeds the "Model load failed: <name>" HTTP
-    /// message (#144). Caller frees.
+    /// Duped stored failure name for the id `ensureLoaded` refused with `error.LoadFailed` from that stored failure,
+    /// for the "Model load failed: <name>" HTTP message (#144). Caller frees.
     pub fn loadErrorName(self: *Scheduler, alloc: std.mem.Allocator, id_or_empty: []const u8) ?[]u8 {
         return self.registry.loadErrorNameDupe(alloc, id_or_empty);
-    }
-
-    pub fn takeLoadContextRefusal(self: *Scheduler, id: []const u8) ?model_registry_mod.MemoryContextRefusal {
-        const context = last_load_context_refusal;
-        last_load_context_refusal = null;
-        return context orelse self.registry.loadContextRefusal(id);
     }
 
     /// Free a model's resident GPU state, returning its registry stub to
@@ -6320,7 +6313,7 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     sch.kv_quant = null;
     sch.ctx_size_flag = 0;
 
-    try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoaded("b"));
+    try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoaded("b", null));
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
     try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
     // The failed claim unlocked once: a second unlock would leave this free or release another thread's hold.
@@ -6329,7 +6322,7 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
 
     // A model of no served arch is refused as that before the eviction gate plans for it.
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"not_a_served_arch\"}" });
-    try testing.expectError(error.ArchitectureUnsupported, sch.ensureLoaded("b"));
+    try testing.expectError(error.ArchitectureUnsupported, sch.ensureLoaded("b", null));
     try testing.expectEqual(model_registry_mod.LoadState.ready, resident.state);
     try testing.expect(reg.mutex.tryLock());
     reg.mutex.unlock(io);
@@ -6367,10 +6360,10 @@ test "ensureLoadedFresh: a model whose load failed is tried again, not answered 
     sch.ctx_size_flag = 0;
 
     // An ordinary request keeps failing fast, and the failure stays on /v1/models.
-    try testing.expectError(error.InsufficientMemory, sch.ensureLoaded("b"));
+    try testing.expectError(error.InsufficientMemory, sch.ensureLoaded("b", null));
     try testing.expectEqual(model_registry_mod.LoadState.error_state, target.state);
     // An explicit load runs the whole attempt again: here it reaches the eviction gate and its own verdict.
-    try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoadedFresh("b"));
+    try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoadedFresh("b", null));
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
     try testing.expect(target.error_name == null);
     try testing.expect(reg.mutex.tryLock());
@@ -6386,7 +6379,7 @@ const ModelCall = struct {
     got: anyerror!void = error.NotRun,
     done: std.atomic.Value(bool) = .init(false),
     fn run(self: *@This()) void {
-        self.got = if (self.load) if (self.sch.ensureLoaded(self.id)) |lm| self.sch.release(lm) else |e| e else self.sch.unloadModel(self.id);
+        self.got = if (self.load) if (self.sch.ensureLoaded(self.id, null)) |lm| self.sch.release(lm) else |e| e else self.sch.unloadModel(self.id);
         self.done.store(true, .release);
     }
     fn answeredWithin(self: *@This(), ms: u32) bool {
@@ -6502,7 +6495,7 @@ test "a cold load ended before the inference thread takes it returns its model a
         defer server_state.shutdown_requested.store(false, .release);
         Gate.mode = if (asked) .none else .fail_post;
         defer sch.allocator = testing.allocator;
-        try testing.expectError(if (asked) error.Shutdown else error.OutOfMemory, sch.ensureLoaded("b"));
+        try testing.expectError(if (asked) error.Shutdown else error.OutOfMemory, sch.ensureLoaded("b", null));
         try testing.expectEqual(model_registry_mod.LoadState.ready, victim.state);
         try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
         try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
@@ -6558,13 +6551,13 @@ test "ensureLoaded: a load whose files fail to read stores the failure only on a
     reg.load_gate = Meanwhile.gate;
     for ([_]model_registry_mod.LoadState{ .ready, .loading }) |state| {
         Meanwhile.to = state;
-        try testing.expectError(error.LoadFailed, sch.ensureLoaded("b"));
+        try testing.expectError(error.LoadFailed, sch.ensureLoaded("b", null));
         try testing.expectEqual(state, target.state);
         target.state = .unloaded;
     }
     // With nothing meanwhile the failure is stored.
     Meanwhile.to = null;
-    try testing.expectError(error.LoadFailed, sch.ensureLoaded("b"));
+    try testing.expectError(error.LoadFailed, sch.ensureLoaded("b", null));
     try testing.expectEqual(model_registry_mod.LoadState.error_state, target.state);
 }
 
@@ -6609,7 +6602,7 @@ test "ensureLoaded: a streamed pack with no ssd budget is gated at its RAM-tier 
     sch.primary_model_dir = "";
 
     // The plan the gate bills reaches the eviction verdict: the pinned resident model cannot go.
-    try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoaded("b"));
+    try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoaded("b", null));
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
     resident.refcount.store(0, .release);
 }
@@ -6897,7 +6890,7 @@ test "an explicit load of a failed model refused at its claim keeps the stored f
     };
     Gate.r = reg;
     reg.load_gate = Gate.check;
-    try testing.expectError(error.PackDownloading, sch.ensureLoadedFresh("b"));
+    try testing.expectError(error.PackDownloading, sch.ensureLoadedFresh("b", null));
     try testing.expectEqual(model_registry_mod.LoadState.error_state, target.state);
     try testing.expectEqualStrings("Exl3ShardStampMismatch", target.error_name.?);
     try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
@@ -6921,7 +6914,7 @@ test "a cold load whose files read runs out of memory is not stored, as a load's
     // Every allocation of the files read fails, as under memory pressure.
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     sch.allocator = failing.allocator();
-    const got = sch.ensureLoaded("b");
+    const got = sch.ensureLoaded("b", null);
     sch.allocator = testing.allocator;
     try testing.expectError(error.InsufficientMemory, got);
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);

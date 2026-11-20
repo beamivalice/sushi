@@ -1762,7 +1762,7 @@ fn refuseNonTextModel(allocator: std.mem.Allocator, stream: *http_conn.Conn, reg
 /// The answer to a request whose model `ensureLoaded` or `ensureLoadedFresh` refused with `err`: the one map every
 /// route that holds or loads a model answers through. `props`: the request is `GET /props`, answered without a model
 /// when none is the default.
-fn sendModelRefusal(allocator: std.mem.Allocator, stream: *http_conn.Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, err: anyerror, props: bool) !void {
+fn sendModelRefusal(allocator: std.mem.Allocator, stream: *http_conn.Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, err: anyerror, report: *const scheduler_mod.LoadReport, props: bool) !void {
     switch (err) {
         error.UnknownModelId => try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404),
         error.NotLoaded => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", http.model_not_loaded_message, 503),
@@ -1773,7 +1773,7 @@ fn sendModelRefusal(allocator: std.mem.Allocator, stream: *http_conn.Conn, sched
             try models_api.handlePropsNoModel(allocator, stream)
         else
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", http.no_model_message, 503),
-        error.LoadFailed => try generation_stream.sendLoadFailedResponse(allocator, stream, scheduler, id),
+        error.LoadFailed => try generation_stream.sendLoadFailedResponse(allocator, stream, scheduler, id, report),
         error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
@@ -1781,7 +1781,7 @@ fn sendModelRefusal(allocator: std.mem.Allocator, stream: *http_conn.Conn, sched
         // registry preserves by name answers 503 under that name; anything
         // else is a 500 with the error name, never a hung connection.
         else => {
-            if (try generation_stream.sendNamedLoadRefusal(allocator, stream, scheduler, id, err)) return;
+            if (try generation_stream.sendNamedLoadRefusal(allocator, stream, scheduler, id, err, report)) return;
             log.warn("  -> 500 ({s}) while resolving model\n", .{@errorName(err)});
             const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch
                 return sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
@@ -1794,8 +1794,9 @@ fn sendModelRefusal(allocator: std.mem.Allocator, stream: *http_conn.Conn, sched
 /// Holds `id`'s model (`ensureLoaded`, loading it when it is not resident); null once the refusal is sent. `props`:
 /// the request is `GET /props`, answered without a model when none is the default.
 fn holdModel(allocator: std.mem.Allocator, stream: *http_conn.Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, props: bool) !?*LoadedModel {
-    const lm = scheduler.ensureLoaded(id) catch |err| {
-        try sendModelRefusal(allocator, stream, scheduler, id, err, props);
+    var report: scheduler_mod.LoadReport = .{};
+    const lm = scheduler.ensureLoaded(id, &report) catch |err| {
+        try sendModelRefusal(allocator, stream, scheduler, id, err, &report, props);
         return null;
     };
     // The launch model turns ready before its boot pins its context and installs the request hooks.
@@ -1939,7 +1940,8 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
             else => return err,
         };
     }
-    const lm = scheduler.ensureLoadedFresh(requested_id) catch |err| return sendModelRefusal(allocator, stream, scheduler, requested_id, err, false);
+    var report: scheduler_mod.LoadReport = .{};
+    const lm = scheduler.ensureLoadedFresh(requested_id, &report) catch |err| return sendModelRefusal(allocator, stream, scheduler, requested_id, err, &report, false);
     defer scheduler.release(lm);
     boot_gate.process.waitOpen(stream.io);
     // Promotion happens only past ensureLoaded's error switch: a load that

@@ -1647,7 +1647,7 @@ fn runLocal(run: *InProcess) !void {
     const a = run.arena.allocator();
     const io = run.io;
     const sch = server_state.global_scheduler orelse return error.BenchNoScheduler;
-    const lm = try sch.ensureLoaded("");
+    const lm = try sch.ensureLoaded("", null);
     defer sch.release(lm);
     var local: LocalBackend = .{ .io = io, .lm = lm };
     const out = try runArms(run.gpa, a, io, run.opts, lm.id, local.backend(), true);

@@ -862,7 +862,7 @@ fn serverKeyMoves(locks: *const model_settings.LaunchLocks, was: model_settings.
 fn modelKeyMoves(arena: std.mem.Allocator, locks: *const model_settings.LaunchLocks, was: ?std.json.ObjectMap, e: Edit) bool {
     if (locks.model(e.key)) |lock| if (lock.set) return false;
     const old: ?std.json.Value = if (was) |o| o.get(e.key) else null;
-    if (old == null or e.value == null) return old == null and e.value == null;
+    if (old == null or e.value == null) return old != null or e.value != null;
     const a = std.json.Stringify.valueAlloc(arena, old.?, .{}) catch return true;
     const b = std.json.Stringify.valueAlloc(arena, e.value.?, .{}) catch return true;
     return !std.mem.eql(u8, a, b);
@@ -2071,6 +2071,9 @@ test "settings api: a save forgets the stored load failures only for a key whose
         .{ .file = "{\"server\":{\"max_request_mb\":64}}", .body = "{\"server\":{\"port\":9000}}", .forgets = .none },
         .{ .file = "{\"/m/a\":{\"ctx_size\":4096}}", .body = "{\"model\":\"m\",\"set\":{\"ctx_size\":4096}}", .forgets = .none },
         .{ .file = "{\"/m/a\":{\"ctx_size\":4096}}", .body = "{\"model\":\"m\",\"set\":{\"ctx_size\":8192}}", .forgets = .model },
+        .{ .file = "{}", .body = "{\"model\":\"m\",\"set\":{\"ctx_size\":4096}}", .forgets = .model },
+        .{ .file = "{\"/m/a\":{\"ctx_size\":4096}}", .body = "{\"model\":\"m\",\"set\":{\"ctx_size\":null}}", .forgets = .model },
+        .{ .file = "{}", .body = "{\"model\":\"m\",\"set\":{\"ctx_size\":null}}", .forgets = .none },
     };
     for (cases) |c| {
         server_state.wired_margin_flag_bytes = if (c.flag) 3 << 30 else null;

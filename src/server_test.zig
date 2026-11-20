@@ -780,7 +780,8 @@ test "server: a request for the model that is not current is credited only with 
 }
 
 /// Holds the next load at its prefix-cache sizing (or, streamed, its expert-cache fit) until `released`: the load has
-/// claimed its model and freed its victims, and its body has not run.
+/// claimed its model and freed its victims, and its body has not run. `fail_after`: the load then fails at its next
+/// pool buffer.
 const LoadBodyHold = struct {
     const Resolver = *const fn (*model_mod.ModelConfig, u64, scheduler_mod.BudgetRevise, *u64) u64;
     var served: ?Resolver = null;
@@ -788,6 +789,7 @@ const LoadBodyHold = struct {
     var armed: std.atomic.Value(bool) = .init(false);
     var held: std.atomic.Value(bool) = .init(false);
     var released: std.atomic.Value(bool) = .init(false);
+    var fail_after: bool = false;
     fn hold() void {
         if (!armed.swap(false, .acq_rel)) return;
         held.store(true, .release);
@@ -796,6 +798,7 @@ const LoadBodyHold = struct {
             var none = [_]std.posix.pollfd{};
             _ = std.posix.poll(&none, 1) catch {};
         }
+        if (fail_after) mlx.engine.fault.arm(1);
     }
     fn mem(cfg: *model_mod.ModelConfig, requested: u64, revise: scheduler_mod.BudgetRevise, idle: *u64) u64 {
         hold();
@@ -809,6 +812,62 @@ const LoadBodyHold = struct {
         return held.load(.acquire);
     }
 };
+
+test "server: a load that fails after a setting saved during it answers its own failure's name, and the next request loads" {
+    const ram_was = server_state.prefix_cache_ram_enabled;
+    defer server_state.prefix_cache_ram_enabled = ram_was;
+    server_state.prefix_cache_ram_enabled = true;
+    const Scenario = struct {
+        var failed: u32 = 0;
+    };
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const sch = server_state.global_scheduler.?;
+            LoadBodyHold.held.store(false, .release);
+            LoadBodyHold.released.store(false, .release);
+            LoadBodyHold.fail_after = true;
+            defer LoadBodyHold.fail_after = false;
+            LoadBodyHold.armed.store(true, .release);
+            LoadBodyHold.served = sch.prefix_cache_mem_resolver;
+            sch.prefix_cache_mem_resolver = &LoadBodyHold.mem;
+            defer sch.prefix_cache_mem_resolver = LoadBodyHold.served;
+            LoadBodyHold.fit_served = sch.expert_cache_fit_resolver;
+            sch.expert_cache_fit_resolver = &LoadBodyHold.fit;
+            defer sch.expert_cache_fit_resolver = LoadBodyHold.fit_served;
+            var first = Background{ .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}" };
+            const t = try std.Thread.spawn(.{}, Background.run, .{&first});
+            if (!within(30_000, LoadBodyHold.isHeld)) {
+                // An arch whose load asks neither hook has no hold; the count below fails when no arch fails a load.
+                LoadBodyHold.armed.store(false, .release);
+                LoadBodyHold.released.store(true, .release);
+                t.join();
+                gpa.free(first.out);
+                return;
+            }
+            const saved = try request("POST", "/v1/settings", "{\"model\":\"tiny\",\"set\":{\"ctx_size\":96}}");
+            defer gpa.free(saved);
+            LoadBodyHold.released.store(true, .release);
+            t.join();
+            defer gpa.free(first.out);
+            mlx.engine.fault.disarm();
+            if (!std.mem.startsWith(u8, saved, "HTTP/1.1 200")) return error.SaveRefused;
+            // An arch whose load absorbs the refused buffer, or reaches it only in the request, has no failed load; the
+            // count below fails when every arch does.
+            const state = tinyState();
+            if (std.mem.startsWith(u8, first.out, "HTTP/1.1 200") or state == .ready) return;
+            Scenario.failed += 1;
+            if (state == .error_state) return error.FailureStoredDespiteTheSave;
+            if (std.mem.indexOf(u8, first.out, "Model load failed: ") == null) {
+                std.debug.print("the failed load answered: {s}\n", .{bodyOf(first.out)});
+                return error.FailedLoadAnswerLostItsName;
+            }
+            const retry = try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}");
+            defer gpa.free(retry);
+            if (!std.mem.startsWith(u8, retry, "HTTP/1.1 200")) return error.RetryFailed;
+        }
+    }.run);
+    try testing.expect(Scenario.failed > 0);
+}
 
 test "server: a cold load asked while another model's load runs keeps --max-resident-models" {
     const ram_was = server_state.prefix_cache_ram_enabled;
