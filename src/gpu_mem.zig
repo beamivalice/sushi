@@ -14,10 +14,14 @@ fn liveRead() noreturn {
     @panic("a host-tier test read the live GPU: it belongs in bills_live_test.zig");
 }
 
+/// Tests only: stand in for the bytes a loaded pack holds, which a test never loads.
+pub var active_bytes_override: ?usize = null;
+
 /// Bytes MLX has in use plus the engine's: its pool buffers bound to live tensors and the mappings it wraps (weights).
 /// Safe off the inference thread: the engine's side is atomics, and a tensor lent to MLX is in both counters, so the
 /// sum errs high, never low.
 pub fn activeBytes() usize {
+    if (active_bytes_override) |bytes| return bytes;
     if (host_tier) return liveRead();
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);

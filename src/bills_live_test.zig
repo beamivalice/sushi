@@ -1,9 +1,13 @@
 //! The bill tests that read the live GPU or need MLX. They run in the MLX tier; the rest of bills.zig runs in test-host.
 const fixtures = @import("bills_fixtures_test.zig");
 const arch_prefix = @import("arch/prefix.zig");
+const arch_media = @import("arch/media.zig");
 const bills = @import("bills.zig");
+const chat_mod = @import("chat.zig");
 const launch_state = @import("server_state.zig");
 const model_mod = @import("model.zig");
+const request_media = @import("request_media.zig");
+const server = @import("server.zig");
 const mtp_plan = @import("mtp_plan.zig");
 const slot_admission = @import("slot_admission.zig");
 const std = @import("std");
@@ -613,6 +617,63 @@ test "#109: admission under a declared wired limit reads the same room whatever 
             errdefer std.debug.print("free {d} MB: a {d}-token prompt needs {d} MB, available {d} MB\n", .{ free_mb, prompt, bill.needed >> 20, bill.available >> 20 });
             try testing.expect(bill.fits());
         }
+    }
+}
+
+test "a 64 GB Mac at a declared 59,000 MB serves the 2.75 pack at kv8 to 262,144 with a 124K prompt, and an image at 131,072 and 262,144, whatever free RAM other apps leave" {
+    if (!bills.archBuilt("qwen4")) return error.SkipZigTest;
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer cfg.deinit(testing.allocator);
+    cfg.expert_layout = .exl3_k4;
+    cfg.gdn_state_f32 = false; // --qwen-gdn 16
+    const MiB: u64 = 1 << 20;
+    const saved = .{ trunk.Trunk.mtp_head_kv_quant_flag, launch_state.server_config.max_context_size, launch_state.configured_kv_quant, launch_state.configured_mtp, live_gpu.active_bytes_override };
+    defer {
+        trunk.Trunk.mtp_head_kv_quant_flag = saved[0];
+        launch_state.server_config.max_context_size = saved[1];
+        launch_state.configured_kv_quant = saved[2];
+        launch_state.configured_mtp = saved[3];
+        live_gpu.active_bytes_override = saved[4];
+    }
+    trunk.Trunk.mtp_head_kv_quant_flag = true;
+    launch_state.server_config.max_context_size = 0; // no --ctx-size: the model's own
+    const kv8 = trunk.KVQuantConfig.affine(8);
+    launch_state.configured_kv_quant = kv8;
+    launch_state.configured_mtp = true;
+    // The booted pack: its resident bytes (trunk, vision tower, MTP head and its rerank copy) and the 1 GiB hot cache.
+    live_gpu.active_bytes_override = 49_784_531_962 + (1 << 30);
+
+    const vp = request_media.visionPreprocFromConfig(&cfg);
+    const plan = arch_media.planImage(vp, 1536, 1536).?;
+    const shot = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = plan.width, .height = plan.height, .grid_h = plan.grid_h, .grid_w = plan.grid_w }};
+    const shot_rows = arch_media.imageRows(&cfg, vp.merge, plan.grid_h, plan.grid_w);
+
+    var first: ?struct { bill: bills.AdmissionBill, image: u64, advertised: u32 } = null;
+    // #109's readings (4.5, 3.2, 3.1, 2.1 and 1.7 GB free), the 64 GB user's 5.8 GB, and almost none.
+    for ([_]u64{ 5_939, 4_608, 3_277, 3_174, 2_150, 1_741, 256 }) |free_mb| {
+        const was = (Machine{ .total = 64 << 30, .wired_mb = 59_000, .margin = 1 << 30, .avail = free_mb * MiB, .gpu_floor = 340 * MiB }).pin();
+        defer _ = was.pin();
+        cfg.pinned_context = 0;
+        const advertised = bills.getEffectiveContextLength(&cfg);
+        const bill = bills.prefillAdmissionBill(&cfg, null, 124_000, 32_000, kv8, false, null, .{ .mtp_on = true });
+        const image_bill = request_media.visionEncodeBill(&cfg, &shot, &.{}, shot_rows).bytes;
+        errdefer std.debug.print("free {d} MB: advertised {d}; the 124K request needs {d} MB of {d} MB; the image encode needs {d} MB of {d} MB\n", .{ free_mb, advertised, bill.needed >> 20, bill.available >> 20, image_bill >> 20, request_media.visionEncodeAvailable(&cfg) >> 20 });
+        try testing.expectEqual(bills.AdmissionVerdict.admit, bills.admissionVerdict(bill));
+        try testing.expect(advertised >= 262_144);
+        // The context is the model's own, so the request is the whole window, as the user's client sent it.
+        for ([_]u32{ 131_072, 262_144 }) |context| {
+            cfg.pinned_context = context;
+            const whole = bills.prefillAdmissionBill(&cfg, null, context - 32_000, 32_000, kv8, false, null, .{ .mtp_on = true });
+            try testing.expect(whole.fits());
+            try testing.expectEqual(@as(?request_media.MediaFault, null), server.towerFitFault(&cfg, &shot, &.{}, shot_rows, request_media.visionEncodeAvailable(&cfg)));
+        }
+        // The same verdict and the same figures at every reading.
+        if (first) |f| {
+            try testing.expectEqual(f.bill.needed, bill.needed);
+            try testing.expectEqual(f.bill.available, bill.available);
+            try testing.expectEqual(f.image, image_bill);
+            try testing.expectEqual(f.advertised, advertised);
+        } else first = .{ .bill = bill, .image = image_bill, .advertised = advertised };
     }
 }
 

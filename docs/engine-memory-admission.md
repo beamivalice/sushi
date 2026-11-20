@@ -523,6 +523,10 @@ other rows predate that bill and on today's code would read slightly more contex
 The ladder widens the chunk until the bill nearly fills what is available, so the spare in a row is small by
 construction; "largest admitted" (2000-token steps) is where even the 512 rung stops fitting. The ceiling assumes
 the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lower (`currentGpuMemoryCeiling`).
+Under a declared limit it does not: `a 64 GB Mac at a declared 59,000 MB serves the 2.75 pack at kv8 to 262,144` pins
+the pack's 124K-token request at kv8 (9241 of 9473 MiB at the default 1 GiB margin), the advertised context and a 1536x1536 image encode (1633 MiB)
+at 131,072 and 262,144 as admitted at every free-RAM reading, 5.8 GB to 256 MB (`gpu_mem.active_bytes_override` stands
+in for the booted pack's bytes).
 
 ## Admission
 
