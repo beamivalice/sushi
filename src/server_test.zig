@@ -2624,7 +2624,7 @@ test "server: a request that fits once the running one finishes waits for it and
             const in_use = probe - free_hi;
             const drift = free_hi - free_lo;
             const live = @import("slot_admission.zig").liveHold(sch);
-            const needed = bills.prefillAdmissionBill(cfg, waiting_ids.len, 8, null, false, &waiting_ids, .{}).needed;
+            const needed = bills.prefillAdmissionBill(cfg, null, waiting_ids.len, 8, null, false, &waiting_ids, .{}).needed;
             // The waiting request's floor leaves it short by `margin` at the highest reading now, and over by
             // `margin` at the lowest once the running requests are gone.
             const margin = (held -| drift) / 2;
