@@ -135,6 +135,10 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   stream handle itself is not (a fault there skipped its free), and a test-only reading made on the way to the call
   under test (the TF32 probe) goes past the fault (`mlx.past_fault`), so a test passes alone as in the suite.
   Its no-late-kernel tests prove their property only on a fresh pipeline cache, which is the process's: they run alone.
+- **A part of a test that did not run is said, never silent**: a cell that runs once per arch leaves out an arch whose
+  fixture is missing and calls `test_rest.notePartSkipped` naming it; the runner writes it as the test's log line's
+  sixth field (`parts skipped: ...`) and tests/gate.sh's summary lists every such test, so a box's run says what it
+  did not cover. The test skips only when no part of it ran.
 - **Held loads** (`heldLoad` in `cooler_contract_test.zig`): a request-level contract cell that proves nothing about
   a load asks for the step's served load of its fixture instead of making one; such cells sit in the
   `cooler_held_*_test.zig` files, run steps of their own, so no cell that makes its own load shares their process.

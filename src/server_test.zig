@@ -86,7 +86,11 @@ const Needs = struct {
 };
 
 /// `body` as the embedded client of a server of `max_concurrent` rows, once per arch that declares a servable fixture
-/// with what `needs` asks. A missing fixture skips the test before any load.
+/// with what `needs` asks. An arch whose fixture is missing is left out before any load and named on the test's log
+/// line (`test_rest.notePartSkipped`); the test skips only when no arch is left.
+/// The arch whose server fixture a test reads as missing, the process's environment left as it is.
+var arch_missing_for_test: ?[]const u8 = null;
+
 fn eachArch(max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void) !void {
     try mlx.requireGpu();
     var archs: [std.meta.tags(registry.Tag).len]?Arch = @splat(null);
@@ -101,14 +105,40 @@ fn eachArch(max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void)
                 try tmp.dir.createDirPath(io, sub);
                 var m = try tmp.dir.openDir(io, sub, .{});
                 defer m.close(io);
-                try M.cooler_contract.serverDir(m);
+                const dir: anyerror!void = if (arch_missing_for_test) |n| (if (std.mem.eql(u8, n, @tagName(t))) error.SkipZigTest else M.cooler_contract.serverDir(m)) else M.cooler_contract.serverDir(m);
+                dir catch |e| {
+                    if (e != error.SkipZigTest) return e;
+                    archs[i].?.tmp.cleanup();
+                    archs[i] = null;
+                    @import("test_rest.zig").notePartSkipped(@tagName(t) ++ ": its server fixture is missing");
+                    break;
+                };
             }
         };
     }
+    var any = false;
+    for (archs) |a| any = any or a != null;
+    if (!any) return error.SkipZigTest;
     for (&archs) |*a| if (a.*) |*x| withServer(&x.tmp, x.ssd_budget_gb, max_concurrent, needs, body) catch |e| {
         if (e != error.SkipZigTest) std.debug.print("server test on {s}: {s}\n", .{ x.name, @errorName(e) });
         return e;
     };
+}
+
+var each_arch_ran: u32 = 0;
+
+test "server: a served cell runs on every arch whose fixture is present and notes the one it skips (DSV41_TINY)" {
+    if (std.c.getenv("DSV41_TINY") == null) return error.SkipZigTest;
+    arch_missing_for_test = "qwen4";
+    defer arch_missing_for_test = null;
+    each_arch_ran = 0;
+    try eachArch(1, .{}, struct {
+        fn body() anyerror!void {
+            each_arch_ran += 1;
+        }
+    }.body);
+    try testing.expectEqual(@as(u32, 1), each_arch_ran);
+    try testing.expect(std.mem.indexOf(u8, @import("test_rest.zig").notes(), "qwen4") != null);
 }
 
 fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void) !void {

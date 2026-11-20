@@ -213,6 +213,7 @@ round_cost: a MiMo boot keeps each long-context rung's rounds in its own bucket
 selectEffort: GLM medium re-routes to high and xhigh to max; other missing words stay refused
 selectEffort: Qwen high and max re-route to xhigh; other unknowns stay refused
 selectEffortPick: only Qwen high and max carry a re-route; MiMo's on-fold stays quiet
+server: a served cell runs on every arch whose fixture is present and notes the one it skips (DSV41_TINY)
 slice (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1, SUSHI_MODELS_DIR and ENCODER_SLICE_OUT): writes a layers-by-experts slice for conversion runs
 source: SafetensorsSource streams per-expert public weights for Qwen, GLM and MiMo and refuses GGUF
 spliceVisionRows: video placeholders are scattered like image rows (Qwen video_token_id)

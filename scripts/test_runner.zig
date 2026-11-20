@@ -19,7 +19,10 @@ fn noHook() callconv(.c) ?[*:0]const u8 {
 comptime {
     @export(&noHook, .{ .name = "sushi_after_each", .linkage = .weak });
     @export(&noHook, .{ .name = "sushi_after_all", .linkage = .weak });
+    @export(&noHook, .{ .name = "sushi_test_note", .linkage = .weak });
 }
+/// After each test: what of it did not run (null: all of it ran), written on its log line.
+extern fn sushi_test_note() callconv(.c) ?[*:0]const u8;
 extern fn sushi_after_each() callconv(.c) ?[*:0]const u8;
 /// As the process ends: what the loads a run step kept across its tests left once unloaded (null: nothing).
 extern fn sushi_after_all() callconv(.c) ?[*:0]const u8;
@@ -49,8 +52,10 @@ const TestLog = struct {
         return if (passed and !leaked and !logged_errors) .PASS else .FAIL;
     }
 
-    fn record(self: *TestLog, name: []const u8, s: Status, ms: i64) !void {
+    /// `note`: the parts of the test that did not run, a sixth field after the name.
+    fn record(self: *TestLog, name: []const u8, s: Status, ms: i64, note: ?[*:0]const u8) !void {
         self.counts[@backingInt(s)] += 1;
+        if (note) |n| return self.append("{t}\t{d}\t{s}\tparts skipped: {s}", .{ s, ms, name, std.mem.span(n) });
         try self.append("{t}\t{d}\t{s}", .{ s, ms, name });
     }
 
@@ -150,8 +155,9 @@ fn runTest(func: *const fn () anyerror!void) anyerror!void {
 
 /// Logs a test that ended as `s`; a log that cannot be written fails the test, naming the file.
 fn logTest(name: []const u8, s: TestLog.Status) bool {
+    const note = sushi_test_note();
     const l = &(test_log orelse return true);
-    l.record(name, s, last_test_ms) catch |err| {
+    l.record(name, s, last_test_ms, note) catch |err| {
         std.debug.print("SUSHI_TEST_LOG={s}: {t}\n", .{ l.path, err });
         return false;
     };

@@ -21,8 +21,9 @@ STATUSES = ("PASS", "SKIP", "FAIL")
 
 
 def parse(line):
-    """(time, step, status, ms, text) of a log line, or None for one that is not."""
-    parts = line.rstrip("\n").split("\t", 4)
+    """(time, step, status, ms, text) of a log line, or None for one that is not; a test's sixth field, the parts of it
+    that did not run, is `note`'s."""
+    parts = line.rstrip("\n").split("\t")[:5]
     if len(parts) != 5 or not parts[3].isdigit():
         return None
     try:
@@ -30,6 +31,12 @@ def parse(line):
     except ValueError:
         return None
     return t, parts[1], parts[2], int(parts[3]), parts[4]
+
+
+def note(line):
+    """The parts of a test that did not run, from its log line's sixth field, or None."""
+    parts = line.rstrip("\n").split("\t")
+    return parts[5] if len(parts) > 5 and parts[2] in STATUSES else None
 
 
 def read(path):
@@ -119,6 +126,18 @@ def summary(path, build_log, step_failed):
         print("gate: the 10 slowest tests")
         for _, step, _, ms, name in sorted(tests, key=lambda r: -r[3])[:10]:
             print(f"  {secs(ms):>9}  {step:<44} {name}")
+
+    noted = []
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                n = note(line)
+                if n:
+                    noted.append((line.split("\t")[1], line.split("\t")[4], n))
+    if noted:
+        print(f"gate: {len(noted)} tests ran with parts skipped")
+        for step, name, n in noted:
+            print(f"  [{step}] {name}: {n}")
 
     blocks, lines = error_blocks(build_log)
     failed = [r for r in tests if r[2] == "FAIL"]
