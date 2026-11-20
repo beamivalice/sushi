@@ -13,6 +13,7 @@
 //! plan 01 Phase 0 (detangling Trunk state).
 
 const arch_packs = @import("arch/packs.zig");
+const FolderId = @import("folder_identity.zig").FolderId;
 const std = @import("std");
 const log = @import("log.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
@@ -346,6 +347,8 @@ pub const DiscoveredModel = struct {
     id: []const u8,
     /// Absolute path to the model directory.
     path: []const u8,
+    /// The folder's identity: two entries with one are one model.
+    folder: FolderId,
     /// Approximate weight size on disk in bytes (sum of *.safetensors). Used
     /// later by eviction; null if scan failed.
     bytes_on_disk: ?u64,
@@ -461,13 +464,13 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
         for (one.models) |m| {
             var dup = false;
             for (merged.items) |seen| {
-                if (std.mem.eql(u8, seen.id, m.id)) {
+                if (std.mem.eql(u8, seen.id, m.id) or seen.folder.eql(&m.folder)) {
                     dup = true;
                     break;
                 }
             }
             if (dup) {
-                log.warn("[discovery] {s}: already found in an earlier --model-dir, skipping {s}\n", .{ m.id, m.path });
+                log.warn("[discovery] {s}: already found (same id or folder) in an earlier --model-dir, skipping {s}\n", .{ m.id, m.path });
                 allocator.free(m.id);
                 allocator.free(m.path);
                 if (m.model_type.len > 0) allocator.free(m.model_type);
@@ -625,6 +628,7 @@ fn tryAddModel(
     try found.append(allocator, .{
         .id = id,
         .path = path,
+        .folder = try FolderId.of(io, path),
         .bytes_on_disk = if (bytes_ok) bytes else null,
         .bytes_linked = linked,
         .bytes_total = if (total > 0) total else null,
@@ -1462,8 +1466,8 @@ test "trimTrailingSlash" {
 }
 
 test "lessThanById sorts ascending" {
-    const a: DiscoveredModel = .{ .id = "a", .path = "x", .bytes_on_disk = null };
-    const b: DiscoveredModel = .{ .id = "b", .path = "x", .bytes_on_disk = null };
+    const a: DiscoveredModel = .{ .id = "a", .path = "x", .folder = .unset, .bytes_on_disk = null };
+    const b: DiscoveredModel = .{ .id = "b", .path = "x", .folder = .unset, .bytes_on_disk = null };
     try testing.expect(lessThanById({}, a, b));
     try testing.expect(!lessThanById({}, b, a));
     try testing.expect(!lessThanById({}, a, a));

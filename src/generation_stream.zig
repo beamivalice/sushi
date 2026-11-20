@@ -2256,7 +2256,7 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
     if (err == error.PackDownloading) {
         var gate_buf: [512]u8 = undefined;
         const entry = scheduler.registry.resolveEntry(id) catch null;
-        const why = (if (entry) |e| scheduler.registry.loadBlocked(&gate_buf, e.path) else null) orelse
+        const why = (if (entry) |e| scheduler.registry.loadBlocked(&gate_buf, e) else null) orelse
             "A download into this model's folder was running: load it again";
         try sendErrorResponse(allocator, stream, "409 Conflict", "pack_downloading", why, 409);
         return true;

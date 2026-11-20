@@ -138,7 +138,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - A load stores the failure of its own file read (`preloadCpuState`) only on an entry still `unloaded` or `error`: another request may have claimed or loaded it meanwhile, and that state is that request's.
 - Every `POST /v1/load-model` on a stored failure runs a new attempt (`Scheduler.ensureLoadedFresh`): settings are read again, the preflight reruns, and the stored error is kept through the claim, its name owned by the attempt (the entry carries a name only while `error`), and ends only once the load is posted (`LoadAttempt.posted`), or when a setting saved meanwhile ended it: a refusal at the claim, the count cap or the queue decides nothing about the model and leaves the failure as it was.
 - Saving a setting that a load reads (`reachesLoad` in settings_api.zig: context, KV, MTP, vision, SSD budget and read-ahead, models folder, prompt cache size, skip-memory-check) ends the stored failure of that model (of every id registered at its folder, which the file keys it by), or of every model for a server key, so the next request loads again; saved after a load read its settings (while it loads, or before it claims the model), it keeps that load's failure from being stored: the attempt takes the entry's `settings_gen` before it reads model-settings.json, every such save bumps it, and `end` stores a failure only at an unchanged generation and an unchanged `claim_gen` (no other load of the entry since a files read began; a rescan that ends a failure bumps the settings generation as a save does); a request with nothing changed still fails fast. A save is one path (`save` in settings_api.zig): one rewrite of the file, each key applied to the running server, then the failures forgotten and the generations bumped, and only for a key whose running value moved (a key a launch flag pins moves nothing); a write that fails applies nothing, and a save that moves the safety margin logs a new `[mem] ceiling` line.
-- A rescan, and a finished download, refresh the folder's facts (`bytes_on_disk`, `bytes_total`, the streaming-index flag) of every entry at the same path that no load holds, so a pack listed while its pull was partial bills its full bytes; one with a failed load also becomes retryable. Live entries are never disturbed.
+- A rescan, and a finished download, refresh the folder's facts (`bytes_on_disk`, `bytes_total`, the streaming-index flag) of the entry at that folder (`FolderId`) when no load holds it, so a pack listed while its pull was partial bills its full bytes; one with a failed load also becomes retryable. Live entries are never disturbed.
 - A qwen4_exp load that fails after the n-gram state or the MTP head exists frees both (`Qwen4Mtp.deinit`; the
   state's `deinit` joins the table's warm thread first). Guard: the `QWEN4_TEST_MODEL` FailingAllocator sweep over
   `loadQwen4Mtp`.
@@ -178,8 +178,12 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **A missing tensor is a load ERROR, never `unreachable`** (`error.MissingWeight` → named 503 via
   `loadErrorFromName`); a load failure crosses the inference thread by NAME, in `LoadRequest.outcome` (`LoadAttempt.Outcome`, a failure's name a static `@errorName`): an answer never rides an allocation whose failure would read as success.
 - Discovery (`src/model_discovery.zig` / `src/model_registry.zig`): two-level org/name, multi-root, streaming stubs,
-  multi-model registry. **`--model-dir` is REPEATABLE** (`discoverModelsMany` merges roots FIRST-WINS). One path never
-  registers under TWO ids (`registry.peekByPath`).
+  multi-model registry. **`--model-dir` is REPEATABLE** (`discoverModelsMany` merges roots FIRST-WINS, by id and by folder).
+  **A folder has ONE identity, `FolderId` (`src/folder_identity.zig`: what the filesystem says, so a trailing slash, `//`,
+  a symlink and APFS case are one folder)**: the registry, the download queue, discovery and `--model` compare folders
+  only by it (lint `folder-bytes-compare`), a folder registers once (`error.FolderRegistered`), and a path no entry is at
+  names no model: never another folder's by its name (`registry.peekByPath`; a new folder whose name is taken takes
+  `<parent>/<name>`, else `IdTaken` → 409).
 - **Discovery never lists a dot folder or a folder named `test-fixtures` BELOW a root**, at either depth (`skipsBelowRoot`;
   one debug line per skipped fixtures folder). The repo's tiny test models live in `${SUSHI_MODELS_DIR}/test-fixtures/<name>`
   and are not packs to serve. A root the user NAMES is always scanned (`--model-dir .../test-fixtures` lists them), and

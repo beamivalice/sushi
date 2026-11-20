@@ -158,6 +158,16 @@ tree
 printf '%s\n' 'const std = @import("std");' 'const XxHash3 = struct {};' 'pub fn f(b: []const u8) u64 {' '    _ = XxHash3;' '    return std.hash.Wyhash.hash(0, b);' '}' > "$TMP/t/src/p.zig"
 expect_green "another hash and a local type of the same name"
 
+# rule folder-bytes-compare
+tree
+printf '%s\n' 'const std = @import("std");' 'fn same(a: []const u8, path: []const u8) bool {' '    return std.mem.eql(u8, std.mem.trimEnd(u8, a, "/"), path);' '}' > "$TMP/t/src/model_registry.zig"
+expect_red "a registry comparison of a folder's path bytes" "src/model_registry.zig:3:20 \[folder-bytes-compare\] same: std.mem.eql over 'path'"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'fn same(a: []const u8, b: []const u8, path: []const u8) bool {' '    _ = path;' '    return std.mem.eql(u8, a, b);' '}' > "$TMP/t/src/model_registry.zig"
+printf '%s\n' 'const std = @import("std");' 'fn same(path: []const u8) bool {' '    return std.mem.eql(u8, path, "/");' '}' > "$TMP/t/src/other.zig"
+expect_green "a comparison of other bytes, and a path comparison outside the registry and downloads"
+
 # rule undefined-nested-write
 tree
 printf '%s\n' 'const Cfg = struct { a: u32 = 0, b: u32 = 0 };' 'const T = struct { config: Cfg, n: u32 };' \

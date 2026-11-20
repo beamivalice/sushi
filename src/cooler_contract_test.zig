@@ -5098,7 +5098,11 @@ fn evictMlxModel(new_on_engine: bool) !usize {
     reg.markEvictingLocked(victim);
     reg.mutex.unlock(io);
 
-    const other = try reg.registerStub("other", dir, 0);
+    // A second id has a folder of its own (`FolderId`); the load reads the pack from `req.model_dir`.
+    var other_tmp = testing.tmpDir(.{});
+    defer other_tmp.cleanup();
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    const other = try reg.registerStub("other", ob[0..try other_tmp.dir.realPath(io, &ob)], 0);
     reg.mutex.lockUncancelable(io);
     try testing.expect(reg.tryBeginLoadLocked(other));
     reg.mutex.unlock(io);

@@ -1925,6 +1925,10 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
             return;
         };
         requested_id = registry.registerByPath(stream.io, requested_id) catch |err| switch (err) {
+            error.IdTaken => {
+                try sendErrorResponse(allocator, stream, "409 Conflict", "model_id_taken", "Another model folder is registered under this folder's name and under its org/name: load it by its id", 409);
+                return;
+            },
             error.ModelDirNotFound, error.InvalidModelPath => {
                 try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No loadable model directory at that path", 404);
                 return;
@@ -2049,11 +2053,12 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn
         requested_id = parseModelFromBody(request_body) orelse "";
     }
     if (std.mem.startsWith(u8, requested_id, "/")) {
-        var trimmed = requested_id;
-        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
-        // A discovered entry is keyed `org/name`, so the path is the only exact handle.
-        const by_path = if (server_state.global_registry) |r| r.peekByPath(trimmed) else null;
-        requested_id = if (by_path) |e| e.id else std.fs.path.basename(trimmed);
+        // A discovered entry is keyed `org/name`, so the path is the only exact handle; a path no entry is at names none.
+        const by_path = if (server_state.global_registry) |r| r.peekByPath(requested_id) else null;
+        requested_id = (by_path orelse {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
+            return;
+        }).id;
     }
 
     scheduler.unloadModel(requested_id) catch |err| switch (err) {

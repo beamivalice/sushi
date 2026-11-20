@@ -953,12 +953,12 @@ pub fn catalogRow(a: Alias, outcome: FetchOutcome, downloaded: bool) CatalogRow 
 
 /// Where a catalog pack sits on disk, or null when it is not downloaded. Caller frees.
 pub fn catalogPackPath(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) ?[]u8 {
-    const org_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo }) catch return null;
+    const org_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ std.mem.trimEnd(u8, root, "/"), repo }) catch return null;
     if (modelPresent(io, org_path)) return org_path;
     allocator.free(org_path);
     // `hf download --local-dir ~/.sushi/models/<pack>` (docs/usage.md) lands without the org folder.
     const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return null;
-    const flat_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo[slash + 1 ..] }) catch return null;
+    const flat_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ std.mem.trimEnd(u8, root, "/"), repo[slash + 1 ..] }) catch return null;
     if (modelPresent(io, flat_path)) return flat_path;
     allocator.free(flat_path);
     return null;

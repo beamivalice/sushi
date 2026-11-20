@@ -474,7 +474,7 @@ pub fn routeRequestModel(registry: *ModelRegistry, id: []const u8, home: ?[]cons
         id
     else
         return .default;
-    const e = registry.peekPath(path) orelse return .not_found;
+    const e = registry.peekByPath(path) orelse return .not_found;
     return .{ .entry = e.id };
 }
 
@@ -485,7 +485,7 @@ test "routeRequestModel: a path names its own entry, an unknown name the default
     _ = try reg.registerStub("org/good", "/m/org/good", 1);
     // The exact path wins over another pack registered under the same basename.
     _ = try reg.registerStub("good", "/elsewhere/good", 1);
-    // `--model` and `/v1/load-model` register a path under its basename.
+    // `--model` and `/v1/load-model` register a folder under its name.
     _ = try reg.registerStub("Pack", "/x/y/Pack", 1);
     _ = try reg.registerStub("home-pack", "/Users/t/.sushi/models/home-pack", 1);
     const home: ?[]const u8 = "/Users/t";
@@ -494,8 +494,8 @@ test "routeRequestModel: a path names its own entry, an unknown name the default
     try t.expectEqualDeep(ModelRoute{ .entry = "org/good" }, routeRequestModel(reg, "/m/org/good", home));
     try t.expectEqualDeep(ModelRoute{ .entry = "org/good" }, routeRequestModel(reg, "/m/org/good/", home));
     try t.expectEqualDeep(ModelRoute{ .entry = "Pack" }, routeRequestModel(reg, "/x/y/Pack", home));
-    // The same basename-id resolution `/v1/load-model` applies.
-    try t.expectEqualDeep(ModelRoute{ .entry = "Pack" }, routeRequestModel(reg, "/elsewhere/Pack", home));
+    // A folder no entry is at names none, whatever its name: another model answering would pass for it.
+    try t.expectEqualDeep(ModelRoute.not_found, routeRequestModel(reg, "/elsewhere/Pack", home));
     try t.expectEqualDeep(ModelRoute{ .entry = "home-pack" }, routeRequestModel(reg, "~/.sushi/models/home-pack", home));
 
     try t.expectEqualDeep(ModelRoute.not_found, routeRequestModel(reg, "/m/org/missing", home));

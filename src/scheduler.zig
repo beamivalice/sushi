@@ -52,6 +52,7 @@ const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
+const FolderId = @import("folder_identity.zig").FolderId;
 const model_settings = @import("model_settings.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
@@ -1738,7 +1739,7 @@ pub const Scheduler = struct {
         // caller could have completed the load.
         const entry = try self.registry.resolveEntry(id_or_empty);
         var gate_buf: [512]u8 = undefined;
-        if (self.registry.loadBlocked(&gate_buf, entry.path) != null) return error.PackDownloading;
+        if (self.registry.loadBlocked(&gate_buf, entry) != null) return error.PackDownloading;
 
         // CPU-only pre-load: parse config / load tokenizer / load chat
         // config. Cheap (~tens of ms); kept outside the mutex so other
@@ -1861,7 +1862,7 @@ pub const Scheduler = struct {
                 }
             }
             // Checked again under the mutex a download start holds while it enqueues, so the two never overlap.
-            if (self.registry.loadBlocked(&gate_buf, entry.path) != null) return error.PackDownloading;
+            if (self.registry.loadBlocked(&gate_buf, entry) != null) return error.PackDownloading;
 
             attempt.claimLocked();
 
@@ -6422,7 +6423,7 @@ test "a cold load ended before the inference thread takes it returns its model a
         var sch_: *Scheduler = undefined;
         var failing: std.testing.FailingAllocator = undefined;
         var mode: enum { none, fail_post, claim_meanwhile } = .none;
-        fn check(_: []u8, _: []const u8) ?[]const u8 {
+        fn check(_: []u8, _: *const FolderId) ?[]const u8 {
             const at_claim = !reg_.mutex.tryLock();
             if (!at_claim) reg_.mutex.unlock(reg_.io);
             switch (mode) {
@@ -6492,7 +6493,7 @@ test "ensureLoaded: a load whose files fail to read stores the failure only on a
     const Meanwhile = struct {
         var r: *ModelRegistry = undefined;
         var to: ?model_registry_mod.LoadState = null;
-        fn gate(_: []u8, _: []const u8) ?[]const u8 {
+        fn gate(_: []u8, _: *const FolderId) ?[]const u8 {
             const e = r.entries.get("b").?;
             const state = to orelse return null;
             r.mutex.lockUncancelable(r.io);
@@ -6836,7 +6837,7 @@ test "an explicit load of a failed model refused at its claim keeps the stored f
     // A download into the folder starts between the gate before the files and the one at the claim.
     const Gate = struct {
         var r: *ModelRegistry = undefined;
-        fn check(_: []u8, _: []const u8) ?[]const u8 {
+        fn check(_: []u8, _: *const FolderId) ?[]const u8 {
             const at_claim = !r.mutex.tryLock();
             if (!at_claim) r.mutex.unlock(r.io);
             return if (at_claim) "a download into this folder is running" else null;

@@ -16,6 +16,7 @@ const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const http_conn = @import("http_conn.zig");
 const server_state = @import("server_state.zig");
+const FolderId = @import("folder_identity.zig").FolderId;
 
 const Allocator = std.mem.Allocator;
 const Phase = dp.Phase;
@@ -25,6 +26,8 @@ const Job = struct {
     repo: []u8,
     /// The pack folder it fills: an installed pack's own folder for an update.
     dest: []u8,
+    /// `dest`'s identity, what the registry's folders are compared with.
+    folder: FolderId,
     update: bool = false,
     phase: Phase = .queued,
     progress: dp.Progress = .{},
@@ -35,9 +38,9 @@ const Job = struct {
     pid: ?std.posix.pid_t = null,
     meter: dp.Meter = .{},
 
-    fn create(allocator: Allocator, repo: []const u8, dest: []const u8, update: bool) !*Job {
+    fn create(allocator: Allocator, io: std.Io, repo: []const u8, dest: []const u8, update: bool) !*Job {
         const job = try allocator.create(Job);
-        job.* = .{ .allocator = allocator, .repo = &.{}, .dest = &.{}, .update = update };
+        job.* = .{ .allocator = allocator, .repo = &.{}, .dest = &.{}, .folder = try FolderId.of(io, dest), .update = update };
         errdefer job.destroy();
         job.repo = try allocator.dupe(u8, repo);
         job.dest = try allocator.dupe(u8, dest);
@@ -239,11 +242,11 @@ fn dirBytesIn(io: std.Io, dir: std.Io.Dir, depth: u8) u64 {
     return total;
 }
 
-/// The id of the model in memory served from `path`, or null. Caller holds the registry's mutex. An unloading model
+/// The id of the model in memory served from `folder`, or null. Caller holds the registry's mutex. An unloading model
 /// counts: requests still read it until its drain ends, and the unload may be refused and the model serve on.
-fn loadedModelAtLocked(allocator: Allocator, path: []const u8) ?[]u8 {
+fn loadedModelAtLocked(allocator: Allocator, folder: *const FolderId) ?[]u8 {
     const reg = server_state.global_registry orelse return null;
-    const e = reg.peekByPathLocked(path) orelse return null;
+    const e = reg.peekByPathLocked(folder) orelse return null;
     switch (e.state) {
         .unloaded, .error_state => return null,
         .loading, .ready, .evicting => {},
@@ -254,12 +257,12 @@ fn loadedModelAtLocked(allocator: Allocator, path: []const u8) ?[]u8 {
 /// The registry's load gate: a pack folder a queued or running download or update fills cannot load, since its
 /// files are replaced one by one and a load would read some of each revision; nor can one a stopped or failed pull
 /// (this server's or `sushi pull`'s) left behind with its `.pull-incomplete` marker.
-pub fn loadGate(buf: []u8, path: []const u8) ?[]const u8 {
-    const want = std.mem.trimEnd(u8, path, "/");
+pub fn loadGate(buf: []u8, folder: *const FolderId) ?[]const u8 {
+    const want = folder.bytes();
     lock();
     defer unlock();
     for (jobs.items) |j| {
-        if (!j.phase.active() or !std.mem.eql(u8, std.mem.trimEnd(u8, j.dest, "/"), want)) continue;
+        if (!j.phase.active() or !j.folder.eql(folder)) continue;
         return std.fmt.bufPrint(buf, "{s} is being {s} on Downloads: wait for it to finish, or stop it there, then load it", .{ j.repo, if (j.update) "updated" else "downloaded" }) catch
             "This model is being downloaded on Downloads: wait for it to finish, or stop it there, then load it";
     }
@@ -384,7 +387,7 @@ fn enqueue(io: std.Io, repo: []const u8, dest: []const u8, update: bool) !bool {
             j.destroy();
         } else i += 1;
     }
-    const job = try Job.create(gpa, repo, dest, update);
+    const job = try Job.create(gpa, io, repo, dest, update);
     errdefer job.destroy();
     try jobs.ensureUnusedCapacity(gpa, 1);
     // The thread waits on `mu` until this returns, so it finds the job; it is spawned before the append, so a failed
@@ -597,6 +600,17 @@ fn bodyRepo(arena: Allocator, body: []const u8) ?[]const u8 {
     return if (req.repo.len == 0) null else req.repo;
 }
 
+/// A model in memory at the folder refuses the download (`loaded_as` is its id); otherwise it is queued. The registry's
+/// mutex spans both steps: a load checks the queue under it (`load_gate`). The folder is checked whether or not its
+/// pack looks installed: a stopped pull's folder (its `.pull-incomplete` marker) can hold a loaded model too.
+fn claimDest(arena: Allocator, io: std.Io, repo: []const u8, dest: []const u8, folder: *const FolderId, update: bool) struct { loaded_as: ?[]u8, queued: anyerror!bool } {
+    const reg = server_state.global_registry;
+    if (reg) |r| r.mutex.lockUncancelable(r.io);
+    defer if (reg) |r| r.mutex.unlock(r.io);
+    const loaded_as = loadedModelAtLocked(arena, folder);
+    return .{ .loaded_as = loaded_as, .queued = if (loaded_as != null) false else enqueue(io, repo, dest, update) };
+}
+
 /// `POST /v1/downloads {"repo":"beamster/<repo>"}`: only a pack the catalog lists, under its own spelling. A pack
 /// already downloaded is updated in its own folder, and refused while it is loaded. A new pack that would eat into the
 /// destination's reserve is refused with 507 and one that leaves under a tenth of the volume free carries a `warning`;
@@ -637,17 +651,13 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
             .fits => {},
         }
     };
-    // The registry's mutex spans the loaded check and the enqueue: a load checks the queue under it (`load_gate`).
-    const reg = server_state.global_registry;
-    if (reg) |r| r.mutex.lockUncancelable(r.io);
-    const loaded_as = if (installed) |path| loadedModelAtLocked(arena, path) else null;
-    const queued = if (loaded_as != null) false else enqueue(stream.io, repo, dest, installed != null);
-    if (reg) |r| r.mutex.unlock(r.io);
-    if (loaded_as) |id| {
+    const dest_folder = FolderId.of(stream.io, dest) catch return http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "The downloads folder is not a usable path", 400);
+    const claim = claimDest(arena, stream.io, repo, dest, &dest_folder, installed != null);
+    if (claim.loaded_as) |id| {
         const msg = try std.fmt.allocPrint(arena, "{s} is loaded as {s}: unload {s} first, then update it", .{ repo, id, id });
         return http.sendErrorResponse(allocator, stream, "409 Conflict", "model_loaded", msg, 409);
     }
-    const queued_now = queued catch |err| switch (err) {
+    const queued_now = claim.queued catch |err| switch (err) {
         error.ShuttingDown => return http.sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503),
         else => return err,
     };
@@ -707,7 +717,7 @@ test "downloads: an update is refused for a model in memory, also while it loads
     defer server_state.global_registry = prev;
     for (std.enums.values(@import("model_registry.zig").LoadState)) |state| {
         e.state = state;
-        const id = loadedModelAtLocked(testing.allocator, "/packs/m/");
+        const id = loadedModelAtLocked(testing.allocator, &(try FolderId.of(testing.io, "/packs/m/")));
         defer if (id) |i| testing.allocator.free(i);
         const in_memory = state == .loading or state == .ready or state == .evicting;
         try testing.expectEqual(in_memory, id != null);
@@ -734,7 +744,7 @@ test "downloads: progress follows the pull's events, and a stop is answered at t
     defer tmp.cleanup();
     var p: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPath(testing.io, &p);
-    const job = try Job.create(testing.allocator, "beamster/X", p[0..n], false);
+    const job = try Job.create(testing.allocator, testing.io, "beamster/X", p[0..n], false);
     defer job.destroy();
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.safetensors.partial", .data = "1234" });
     try testing.expect(onEvent(job, .{ .listed = .{ .files = 3, .bytes = 30, .present = 0 } }));
@@ -754,11 +764,172 @@ test "downloads: progress follows the pull's events, and a stop is answered at t
 
 test "downloads: a pack that cannot fit is stopped once its listing is known, naming the space" {
     worker_io = testing.io;
-    const job = try Job.create(testing.allocator, "beamster/X", "/", false);
+    const job = try Job.create(testing.allocator, testing.io, "beamster/X", "/", false);
     defer job.destroy();
     const v = disk_placement.volumeSpaceNear("/").?;
     try testing.expect(!onEvent(job, .{ .listed = .{ .files = 1, .bytes = v.free + (1 << 40), .present = 0 } }));
     try testing.expect(std.mem.indexOf(u8, job.message, "GiB free") != null);
     // What is on disk already is not needed again.
     try testing.expect(onEvent(job, .{ .listed = .{ .files = 1, .bytes = v.free + (1 << 40), .present = v.free + (1 << 40) } }));
+}
+
+
+// ── One folder, one identity: spellings of a folder never make two models ──
+
+const FolderFixture = struct {
+    tmp: testing.TmpDir,
+    root_buf: [std.fs.max_path_bytes]u8 = undefined,
+    root: []const u8 = "",
+    reg: *@import("model_registry.zig").ModelRegistry = undefined,
+    prev_reg: ?*@import("model_registry.zig").ModelRegistry = null,
+    saved_locks: model_settings.LaunchLocks = undefined,
+
+    /// A pack of the catalog installed under a models root that `--model-dir` names with a trailing slash (as a shell's
+    /// tab completion leaves it), discovered by the registry as a boot does.
+    fn init(self: *FolderFixture) !void {
+        const io = testing.io;
+        const md = @import("model_discovery.zig");
+        self.tmp = testing.tmpDir(.{ .iterate = true });
+        const repo = cli.aliases[0].repo;
+        try md.writePackStub(io, self.tmp.dir, repo);
+        var sb: [256]u8 = undefined;
+        try self.tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/model.safetensors", .{repo}), .data = "0123456789" });
+        var rb: [std.fs.max_path_bytes]u8 = undefined;
+        const real = rb[0..try self.tmp.dir.realPath(io, &rb)];
+        self.root = try std.fmt.bufPrint(&self.root_buf, "{s}/", .{real});
+        self.saved_locks = model_settings.launch_locks;
+        model_settings.launch_locks.models_dir.pin("{s}", .{self.root});
+        const found = try md.discoverModelsMany(io, testing.allocator, &.{self.root});
+        self.reg = try @import("model_registry.zig").ModelRegistry.init(testing.allocator, io, found, 2, 0, null);
+        self.reg.load_gate = &loadGate;
+        self.prev_reg = server_state.global_registry;
+        server_state.global_registry = self.reg;
+    }
+
+    fn deinit(self: *FolderFixture) void {
+        server_state.global_registry = self.prev_reg;
+        self.reg.deinit();
+        model_settings.launch_locks = self.saved_locks;
+        self.tmp.cleanup();
+    }
+
+    /// handleStart's own step: the folder an update of `repo` fills.
+    fn installed(self: *FolderFixture, arena: Allocator) ![]const u8 {
+        _ = self;
+        var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var roots_buf: [9][]const u8 = undefined;
+        return installedPath(arena, testing.io, roots(&roots_buf, destRoot(&dest_buf, testing.io).path), cli.aliases[0].repo) orelse error.PackNotInstalled;
+    }
+};
+
+test "downloads: with --model-dir typed with a trailing slash, an update of the loaded pack is still refused" {
+    var s: FolderFixture = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    const e = s.reg.peek(cli.aliases[0].repo) orelse return error.PackNotDiscovered;
+    e.state = .ready;
+    defer e.state = .unloaded;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const installed = try s.installed(arena_state.allocator());
+    s.reg.mutex.lockUncancelable(testing.io);
+    const loaded_as = loadedModelAtLocked(arena_state.allocator(), &(try FolderId.of(testing.io, installed)));
+    s.reg.mutex.unlock(testing.io);
+    try testing.expect(loaded_as != null);
+}
+
+test "downloads: with --model-dir typed with a trailing slash, a running update of an installed pack gates its load" {
+    var s: FolderFixture = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    const e = s.reg.peek(cli.aliases[0].repo) orelse return error.PackNotDiscovered;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const installed = try s.installed(arena_state.allocator());
+    const job = try Job.create(testing.allocator, testing.io, cli.aliases[0].repo, installed, true);
+    job.phase = .downloading;
+    lock();
+    jobs.append(gpa, job) catch unreachable;
+    unlock();
+    defer {
+        lock();
+        _ = jobs.pop();
+        unlock();
+        job.destroy();
+    }
+    var gb: [512]u8 = undefined;
+    const why = s.reg.loadBlocked(&gb, e);
+    try testing.expect(why != null);
+}
+
+test "downloads: with --model-dir typed with a trailing slash, a finished update registers no second entry for its folder" {
+    var s: FolderFixture = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const installed = try s.installed(arena_state.allocator());
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const settings = try std.fmt.bufPrint(&pb, "{s}settings.json", .{s.root});
+    const before = s.reg.entries.count();
+    _ = try s.reg.absorbDownloadWithSettings(settings, installed);
+    try testing.expectEqual(before, s.reg.entries.count());
+}
+
+test "downloads: a pack folder spelled in another case than the catalog's still refuses an update while loaded" {
+    const io = testing.io;
+    const md = @import("model_discovery.zig");
+    const ModelRegistry = @import("model_registry.zig").ModelRegistry;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const repo = cli.aliases[0].repo;
+    const name = repo[std.mem.indexOfScalar(u8, repo, '/').? + 1 ..];
+    var lower_buf: [256]u8 = undefined;
+    const lower = std.ascii.lowerString(&lower_buf, name);
+    try md.writePackStub(io, tmp.dir, lower);
+    var sb: [512]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/model.safetensors", .{lower}), .data = "0123456789" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = rb[0..try tmp.dir.realPath(io, &rb)];
+    const saved_locks = model_settings.launch_locks;
+    defer model_settings.launch_locks = saved_locks;
+    model_settings.launch_locks.models_dir.pin("{s}", .{root});
+    const found = try md.discoverModelsMany(io, testing.allocator, &.{root});
+    const reg = try ModelRegistry.init(testing.allocator, io, found, 2, 0, null);
+    defer reg.deinit();
+    const prev = server_state.global_registry;
+    server_state.global_registry = reg;
+    defer server_state.global_registry = prev;
+    const e = reg.peek(lower) orelse return error.PackNotDiscovered;
+    e.state = .ready;
+    defer e.state = .unloaded;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // The folder is found under another case only on a case-insensitive volume.
+    tmp.dir.access(io, name, .{}) catch return error.SkipZigTest;
+    var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var roots_buf: [9][]const u8 = undefined;
+    const installed = installedPath(arena_state.allocator(), io, roots(&roots_buf, destRoot(&dest_buf, io).path), repo) orelse return error.PackNotInstalled;
+    reg.mutex.lockUncancelable(io);
+    const loaded_as = loadedModelAtLocked(arena_state.allocator(), &(try FolderId.of(testing.io, installed)));
+    reg.mutex.unlock(io);
+    try testing.expect(loaded_as != null);
+}
+
+test "downloads: a folder a stopped pull left, with a model loaded from it, refuses a new download" {
+    var s: FolderFixture = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    const e = s.reg.peek(cli.aliases[0].repo) orelse return error.PackNotDiscovered;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const dest = try std.fmt.allocPrint(arena_state.allocator(), "{s}/{s}", .{ std.mem.trimEnd(u8, s.root, "/"), cli.aliases[0].repo });
+    try s.tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(arena_state.allocator(), "{s}/{s}", .{ cli.aliases[0].repo, cli.pull_marker }), .data = "" });
+    // The marker makes the pack read as not installed: the check must not depend on that.
+    try testing.expect(!cli.modelPresent(testing.io, dest));
+    e.state = .ready;
+    defer e.state = .unloaded;
+    const folder = try FolderId.of(testing.io, dest);
+    const claim = claimDest(arena_state.allocator(), testing.io, cli.aliases[0].repo, dest, &folder, false);
+    try testing.expectEqualStrings(e.id, claim.loaded_as orelse return error.DownloadQueuedOverALoadedModel);
 }

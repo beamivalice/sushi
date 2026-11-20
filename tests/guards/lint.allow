@@ -80,3 +80,5 @@ in-place-buffer src/kv_cache.zig:ringTailBuf a sliding ring keeps its window's f
 ceiling-raw-read src/main.zig:settleDeviceReads asks the device once before any load so a load asks MLX nothing; it reads no ceiling
 ceiling-raw-read src/main.zig:autoResidentMemBytes the registry's resident-model cap at boot, before the GPU floor is measured; no admission reads it
 ceiling-raw-read src/glm5/glm5_kld_capture.zig:run the offline GLM teacher capture checks its explicit stream budget against Metal's working set; no server ceiling exists there
+folder-bytes-compare src/model_registry.zig:registerByPath trims the stored path and its id's name; folders are compared as FolderId
+folder-bytes-compare src/model_registry.zig:newFolderIdLocked slices the id's names out of the path; folders are compared as FolderId

@@ -27,6 +27,7 @@ const tokenize_cache_mod = @import("tokenize_cache.zig");
 const token_mask_mod = @import("token_mask.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const model_discovery = @import("model_discovery.zig");
+const FolderId = @import("folder_identity.zig").FolderId;
 const model_settings = @import("model_settings.zig");
 const io_util = @import("io_util.zig");
 const generate_mod = @import("generate.zig");
@@ -196,6 +197,8 @@ pub const LoadedModel = struct {
     id: []const u8,
     /// Full absolute path on disk. Allocator-owned dupe.
     path: []const u8,
+    /// The folder's identity (`FolderId`): the one thing two entries' folders are compared by.
+    folder: FolderId = .unset,
     /// Approximate weight bytes on disk (sum of *.safetensors). Used for
     /// pre-load eviction estimates so we don't oversubscribe wired memory.
     bytes_on_disk: ?u64,
@@ -724,9 +727,9 @@ pub const ModelRegistry = struct {
     /// The settings file `rescan` reads; null is `~/.sushi/model-settings.json`. Borrowed.
     settings_path: ?[]const u8 = null,
 
-    /// Set by the server: why the pack folder `path` cannot load now (a download or update is replacing its files),
+    /// Set by the server: why the pack folder `folder` cannot load now (a download or update is replacing its files),
     /// written into `buf`, or null. Called under `mutex`, so it must never take it.
-    load_gate: ?*const fn (buf: []u8, path: []const u8) ?[]const u8 = null,
+    load_gate: ?*const fn (buf: []u8, folder: *const FolderId) ?[]const u8 = null,
 
     /// Map of id → entry. Keys are borrowed from `LoadedModel.id`; entries
     /// are heap-allocated and owned by the registry. Iteration order isn't
@@ -818,7 +821,7 @@ pub const ModelRegistry = struct {
         if (discovery) |d| {
             errdefer self.deinitInternal();
             for (d.models) |m| {
-                const stub = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
+                const stub = try self.registerStubAt(m.id, m.path, m.folder, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
                 stub.bytes_linked = m.bytes_linked;
                 stub.bytes_total = m.bytes_total;
             }
@@ -863,7 +866,15 @@ pub const ModelRegistry = struct {
     }
 
     pub fn registerStubWithMeta(self: *ModelRegistry, id: []const u8, path: []const u8, bytes_on_disk: ?u64, arch_hint: []const u8, streaming_index_complete: bool) !*LoadedModel {
+        const folder = FolderId.of(self.io, path) catch return error.InvalidModelPath;
+        return self.registerStubAt(id, path, folder, bytes_on_disk, arch_hint, streaming_index_complete);
+    }
+
+    /// `registerStubWithMeta` for a caller that has the folder's identity. A folder has one entry: a second id or
+    /// spelling of it is `error.FolderRegistered`, never a second model over the same weights.
+    fn registerStubAt(self: *ModelRegistry, id: []const u8, path: []const u8, folder: FolderId, bytes_on_disk: ?u64, arch_hint: []const u8, streaming_index_complete: bool) !*LoadedModel {
         if (self.entries.get(id) != null) return error.DuplicateId;
+        if (self.peekByPathLocked(&folder) != null) return error.FolderRegistered;
 
         const stub = try self.allocator.create(LoadedModel);
         errdefer self.allocator.destroy(stub);
@@ -878,6 +889,7 @@ pub const ModelRegistry = struct {
             .allocator = self.allocator,
             .id = id_owned,
             .path = path_owned,
+            .folder = folder,
             .bytes_on_disk = bytes_on_disk,
             .arch_hint = arch_owned,
             .streaming_index_complete = streaming_index_complete,
@@ -906,24 +918,21 @@ pub const ModelRegistry = struct {
 
     /// Register-by-path (/v1/load-model with an absolute path): validate
     /// `abs_path` exactly like discovery would (config.json, supported
-    /// model_type + quant mode) and insert an `.unloaded` stub keyed by the
-    /// directory basename, carrying the arch hint and weight bytes. An
-    /// existing entry with that id wins — same id means same model in the
-    /// registry's world, and we never re-point a live entry's path. Returns
-    /// the entry's stable id slice (owned by the registry).
+    /// model_type + quant mode) and insert an `.unloaded` stub for the folder, carrying the arch hint and weight
+    /// bytes. A folder that already has an entry is that entry, whatever spelling named it (`FolderId`), and a live
+    /// entry's path is never re-pointed. Returns the entry's stable id slice (owned by the registry).
     ///
     /// Exists for models OUTSIDE the --model-dir scan: the app registers a pack
     /// from its download root here no matter which org dir the chat model (and
     /// thus --model-dir) points at.
     pub fn registerByPath(self: *ModelRegistry, io: std.Io, abs_path: []const u8) ![]const u8 {
-        var trimmed = abs_path;
-        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
-        const base = std.fs.path.basename(trimmed);
-        if (base.len == 0) return error.InvalidModelPath;
+        const trimmed = std.mem.trimEnd(u8, abs_path, "/");
+        if (std.fs.path.basename(trimmed).len == 0) return error.InvalidModelPath;
+        const folder = FolderId.of(io, trimmed) catch return error.InvalidModelPath;
 
         // Fast path: already registered (discovered, --model, or a previous
-        // register-by-path). No filesystem touch.
-        if (self.peekPath(trimmed)) |existing| return existing.id;
+        // register-by-path). No filesystem probe.
+        if (self.peekByFolder(&folder)) |existing| return existing.id;
 
         const probe = try model_discovery.probeModelDir(io, self.allocator, trimmed);
         defer self.allocator.free(probe.model_type);
@@ -933,11 +942,34 @@ pub const ModelRegistry = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         // Re-check under the lock — another conn thread may have raced us.
-        if (self.entries.get(base)) |existing| return existing.id;
-        const stub = try self.registerStubWithMeta(base, trimmed, probe.bytes_on_disk, probe.model_type, streaming_index_complete);
+        if (self.peekByPathLocked(&folder)) |existing| return existing.id;
+        const stub = try self.registerStubAt(try self.newFolderIdLocked(trimmed), trimmed, folder, probe.bytes_on_disk, probe.model_type, streaming_index_complete);
         stub.bytes_linked = probe.bytes_linked;
         stub.bytes_total = probe.bytes_total;
         return stub.id;
+    }
+
+    /// The entry of the `--model` folder, registered when discovery did not list it.
+    pub fn registerLaunchFolder(self: *ModelRegistry, model_dir: []const u8) !*LoadedModel {
+        const folder = FolderId.of(self.io, model_dir) catch return error.InvalidModelPath;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.peekByPathLocked(&folder)) |existing| return existing;
+        return self.registerStubAt(try self.newFolderIdLocked(model_dir), model_dir, folder, null, "", false);
+    }
+
+    /// The id for a folder no entry has: its name, else `<parent>/<name>` as discovery spells an org folder, else
+    /// `error.IdTaken`: an id never names another folder's model. Caller holds `mutex`; the result borrows `path`.
+    fn newFolderIdLocked(self: *ModelRegistry, path: []const u8) ![]const u8 {
+        const trimmed = std.mem.trimEnd(u8, path, "/");
+        const base = std.fs.path.basename(trimmed);
+        if (base.len == 0) return error.InvalidModelPath;
+        if (self.entries.get(base) == null) return base;
+        const parent = std.fs.path.dirname(trimmed) orelse return error.IdTaken;
+        const org = std.fs.path.basename(parent);
+        if (org.len == 0) return error.IdTaken;
+        const two = trimmed[trimmed.len - base.len - 1 - org.len ..];
+        return if (self.entries.get(two) == null) two else error.IdTaken;
     }
 
     /// Set the default model id used for requests that omit `model` or
@@ -954,39 +986,23 @@ pub const ModelRegistry = struct {
         self.default_promoted = false;
     }
 
-    /// Look up an entry by its on-disk path (trailing slashes ignored).
-    /// Same read-only contract as `peek`. Exists so the `--model` path and
-    /// register-by-path flows reuse a discovery entry even when their
-    /// basename-derived id differs from the discovered `org/name` id —
-    /// two ids for one path would let the same weights load twice.
+    /// The entry whose folder is the one `path` names (any spelling of it), or null: no entry is ever another
+    /// folder's, whatever its name. Same read-only contract as `peek`; a request path and a discovery entry's
+    /// `org/name` id meet only here.
     pub fn peekByPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.peekByPathLocked(path);
+        const folder = FolderId.of(self.io, path) catch return null;
+        return self.peekByFolder(&folder);
     }
 
-    /// The entry a model-directory path names: the one AT that path (a
-    /// discovery entry's org/name id differs from the basename), else the one
-    /// registered under its basename. `/v1/load-model` and request routing
-    /// both resolve a path here, so they cannot disagree on the model.
-    pub fn peekPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
+    pub fn peekByFolder(self: *ModelRegistry, folder: *const FolderId) ?*LoadedModel {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.peekByPathLocked(path)) |e| return e;
-        const base = std.fs.path.basename(std.mem.trimEnd(u8, path, "/"));
-        return if (base.len == 0) null else self.entries.get(base);
+        return self.peekByPathLocked(folder);
     }
 
-    pub fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
-        var trimmed = path;
-        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
-        if (trimmed.len == 0) return null;
+    pub fn peekByPathLocked(self: *ModelRegistry, folder: *const FolderId) ?*LoadedModel {
         var it = self.entries.valueIterator();
-        while (it.next()) |entry_ptr| {
-            var entry_path: []const u8 = entry_ptr.*.path;
-            while (entry_path.len > 0 and entry_path[entry_path.len - 1] == '/') entry_path = entry_path[0 .. entry_path.len - 1];
-            if (std.mem.eql(u8, entry_path, trimmed)) return entry_ptr.*;
-        }
+        while (it.next()) |entry_ptr| if (entry_ptr.*.folder.eql(folder)) return entry_ptr.*;
         return null;
     }
 
@@ -1019,7 +1035,7 @@ pub const ModelRegistry = struct {
             return added;
         }
         _ = self.registerByPath(self.io, path) catch return added;
-        return added + @intFromBool(self.peekByPath(path) != null);
+        return added + 1;
     }
 
     /// The folder of a registered entry as it is now, for a folder a download finished in that no walked root holds.
@@ -1028,9 +1044,10 @@ pub const ModelRegistry = struct {
         defer self.allocator.free(probe.model_type);
         const streaming = expert_quant.isExpertStreamingArch(probe.model_type) and
             model_discovery.streamingIndexComplete(self.io, self.allocator, path) != null;
+        const folder = FolderId.of(self.io, path) catch return;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const e = self.peekByPathLocked(path) orelse return;
+        const e = self.peekByPathLocked(&folder) orelse return;
         self.refreshFactsLocked(e, probe.bytes_on_disk, probe.bytes_linked, probe.bytes_total, streaming);
     }
 
@@ -1066,11 +1083,11 @@ pub const ModelRegistry = struct {
         defer self.mutex.unlock(self.io);
         for (found.models) |m| {
             if (self.entries.get(m.id)) |e| {
-                if (std.mem.eql(u8, e.path, m.path)) self.refreshFactsLocked(e, m.bytes_on_disk, m.bytes_linked, m.bytes_total, m.streaming_index_complete);
+                if (e.folder.eql(&m.folder)) self.refreshFactsLocked(e, m.bytes_on_disk, m.bytes_linked, m.bytes_total, m.streaming_index_complete);
                 continue;
             }
-            if (self.peekByPathLocked(m.path) != null) continue;
-            const stub = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
+            if (self.peekByPathLocked(&m.folder) != null) continue;
+            const stub = try self.registerStubAt(m.id, m.path, m.folder, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
             stub.bytes_linked = m.bytes_linked;
             stub.bytes_total = m.bytes_total;
             added += 1;
@@ -1106,10 +1123,10 @@ pub const ModelRegistry = struct {
     /// `error.NoDefaultModel` if `id_or_empty` is empty AND no default is
     /// set. The returned pointer is borrowed; valid for the registry's
     /// lifetime.
-    /// Why `path` cannot load now (`load_gate`), or null.
-    pub fn loadBlocked(self: *ModelRegistry, buf: []u8, path: []const u8) ?[]const u8 {
+    /// Why `entry` cannot load now (`load_gate`), or null.
+    pub fn loadBlocked(self: *ModelRegistry, buf: []u8, entry: *const LoadedModel) ?[]const u8 {
         const gate = self.load_gate orelse return null;
-        return gate(buf, path);
+        return gate(buf, &entry.folder);
     }
 
     pub fn resolveEntry(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
@@ -1659,13 +1676,11 @@ pub const ModelRegistry = struct {
 
     /// A settings change that reaches loading invalidates the stored failure: the entry goes back to unloaded, so the next
     /// request loads again with the new settings. A loading model's coming failure is not stored either. The settings
-    /// are keyed by folder, so every entry registered at `entry`'s folder (another root's id for it) is reached.
+    /// are keyed by folder, and a folder has one entry.
     pub fn forgetLoadFailure(self: *ModelRegistry, entry: *LoadedModel) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const folder = std.mem.trimEnd(u8, entry.path, "/");
-        var it = self.entries.valueIterator();
-        while (it.next()) |e| if (std.mem.eql(u8, std.mem.trimEnd(u8, e.*.path, "/"), folder)) self.forgetLoadFailureLocked(e.*);
+        self.forgetLoadFailureLocked(entry);
     }
 
     /// `forgetLoadFailure` for every model, after a server-wide setting changed.
@@ -1811,16 +1826,16 @@ test "ModelRegistry: streaming discovery verdict is cached on the stub" {
     try testing.expect(stub.streaming_index_complete);
 }
 
-test "ModelRegistry: registerByPath reuses an existing id without touching the filesystem" {
+test "ModelRegistry: registerByPath reuses the entry at the same folder without a probe, and never another folder's by its name" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
     defer reg.deinit();
     const stub = try reg.registerStubWithArch("q4-x", "/models/q4-x", 64, "qwen4_exp");
-    // The path's parent doesn't exist — proves the fast path resolves by
-    // basename before any probe.
-    const id = try reg.registerByPath(io, "/nonexistent/parent/q4-x/");
-    try testing.expectEqualStrings("q4-x", id);
+    // The folder does not exist, so an answer here came from the registry alone.
+    const id = try reg.registerByPath(io, "/models/q4-x/");
     try testing.expectEqual(stub.id.ptr, id.ptr);
+    // Another folder of the same name is probed as its own model, not taken for this one.
+    try expectError(error.ModelDirNotFound, reg.registerByPath(io, "/nonexistent/parent/q4-x/"));
 }
 
 test "ModelRegistry: peekByPath dedupes org/name discovery ids against basename registration" {
@@ -2314,20 +2329,20 @@ test "ModelRegistry: a settings change that reaches loading forgets the stored f
     try testing.expectEqual(LoadState.ready, c.state);
 }
 
-test "ModelRegistry: a setting saved for a model's folder ends the stored failure of every model registered at that folder" {
+test "ModelRegistry: a folder registers once: a second id or spelling of it is refused" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
-    // Two roots, one inside the other, discover one folder under two ids: model-settings.json keys it by path, so a
-    // save reaches both.
     const nested = try reg.registerStub("org/m", "/models/org/m", 1024);
-    const flat = try reg.registerStub("m", "/models/org/m/", 1024);
+    try expectError(error.FolderRegistered, reg.registerStub("m", "/models/org/m/", 1024));
+    try expectError(error.FolderRegistered, reg.registerStub("m", "/models//org/./m", 1024));
+    try testing.expectEqual(@as(usize, 1), reg.entries.count());
+    // A save for the model ends its stored failure; another folder's stays.
     const other = try reg.registerStub("x", "/models/x", 1024);
     reg.mutex.lockUncancelable(reg.io);
-    for ([_]*LoadedModel{ nested, flat, other }) |e| reg.markErrorLocked(e, "FileNotFound");
+    for ([_]*LoadedModel{ nested, other }) |e| reg.markErrorLocked(e, "FileNotFound");
     reg.mutex.unlock(reg.io);
     reg.forgetLoadFailure(nested);
     try testing.expectEqual(LoadState.unloaded, nested.state);
-    try testing.expectEqual(LoadState.unloaded, flat.state);
     try testing.expectEqual(LoadState.error_state, other.state);
 }
 
@@ -3136,4 +3151,49 @@ test "a pack a --model-only server listed while its pull was partial carries its
     var sb: [std.fs.max_path_bytes]u8 = undefined;
     _ = try reg.absorbDownloadWithSettings(try std.fmt.bufPrint(&sb, "{s}/settings.json", .{root}), path);
     try testing.expectEqual(@as(?u64, 1010), e.bytes_on_disk);
+}
+
+test "ModelRegistry: a --model-only server lists a downloaded pack whose folder has the launch model's name" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "old/Pk");
+    try model_discovery.writePackStub(io, tmp.dir, "models/beamster/Pk");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/beamster/Pk/model.safetensors", .data = "0123456789" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = rb[0..try tmp.dir.realPath(io, &rb)];
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    const old = try std.fmt.bufPrint(&ob, "{s}/old/Pk", .{root});
+    const launch = try reg.registerLaunchFolder(old);
+    try testing.expectEqualStrings("Pk", launch.id);
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const new = try std.fmt.bufPrint(&pb, "{s}/models/beamster/Pk", .{root});
+    var sb: [std.fs.max_path_bytes]u8 = undefined;
+    const added = try reg.absorbDownloadWithSettings(try std.fmt.bufPrint(&sb, "{s}/settings.json", .{root}), new);
+    try testing.expectEqual(@as(u32, 1), added);
+    try testing.expectEqualStrings(new, reg.peekByPath(new).?.path);
+    try testing.expectEqualStrings(old, reg.peekByPath(old).?.path);
+}
+
+test "ModelRegistry: a path of no known folder resolves to no entry, whatever its folder is named" {
+    const io = testing.io;
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    _ = try reg.registerStub("Pk", "/old/Pk", 1);
+    try testing.expect(reg.peekByPath("/elsewhere/Pk") == null);
+    try testing.expect(reg.peekByPath("/old/Pk/") != null);
+}
+
+test "ModelRegistry: the launch model attaches to the entry at its own folder, never to one of the same name" {
+    const io = testing.io;
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    const other = try reg.registerStub("Pk", "/models/other/Pk", 1);
+    const launch = try reg.registerLaunchFolder("/old/Pk");
+    try testing.expect(launch != other);
+    try testing.expectEqualStrings("/old/Pk", launch.path);
+    try testing.expectEqual(launch, try reg.registerLaunchFolder("/old/Pk/"));
+    try testing.expectEqual(@as(usize, 2), reg.entries.count());
 }

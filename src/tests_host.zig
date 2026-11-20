@@ -64,6 +64,7 @@ test {
     _ = @import("test_expect.zig");
     _ = @import("kld_fixture.zig");
     _ = @import("io_util.zig");
+    _ = @import("folder_identity.zig");
     _ = @import("expert_drop.zig");
     _ = @import("pipeline_manifest.zig");
     _ = @import("expert_usage.zig");

@@ -72,6 +72,11 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **A streamed `/v1/responses` reply cut by a stop sequence inside a tool call no longer returns the half call**: the
   stream searched for the stop in text its gate had already cut, found none, and shipped the call it salvaged from the
   open markup; a stream now ends as the stop its gate matched, as the non-streamed reply, Chat and Messages do.
+- **A model folder is one model, whichever way its path is spelled**: with `--model-dir` typed with a trailing slash (or a
+  pack folder in another case), an update of a loaded pack was allowed, a load of a pack mid-update was allowed, and the
+  finished update listed the folder a second time; and a downloaded pack whose folder name matched the `--model` folder's
+  was never listed and its path loaded the other model. Folders are now compared by what the filesystem says they are,
+  and a path no model is at is never answered by another model's name.
 - **A large chunked upload is answered**: a `Transfer-Encoding: chunked` request over about 16 KB sent in one go got no
   answer and held its connection forever, and a body or WebSocket frame left half sent outlasted the 30 s read limit
   and a shutdown.

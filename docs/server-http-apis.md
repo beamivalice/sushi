@@ -132,7 +132,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - Endpoint EXISTENCE never depends on model state and the 404 is answered BEFORE the model resolves (`ROUTE_PATHS`);
   a status route never reaches `ensureLoaded` (`handlePropsNoModel`). Removed upstream routes answer named 404s.
 - **Only an unknown NAME falls back to the default model** (SDK names like `gpt-4`); a PATH (`/…`, `~/…`, never
-  `org/repo`) names its own entry as `/v1/load-model` resolves it (`routeRequestModel` → `registry.peekPath`), and an
+  `org/repo`) names its own entry as `/v1/load-model` resolves it (`routeRequestModel` → `registry.peekByPath`), and an
   unregistered path is a 404 `model_not_found` (Anthropic `not_found_error`), never another model's answer.
 - **One conversation renders one prompt on every surface** (the `one conversation renders the same prompt` test in
   `anthropic.zig`): text parts, Anthropic text and thinking blocks and Responses reasoning parts join by one rule

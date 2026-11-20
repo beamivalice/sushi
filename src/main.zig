@@ -1154,14 +1154,6 @@ fn runCli(init: std.process.Init) !void {
         //    takes ownership of `discovery_storage` (if any) and, once
         //    the inference thread completes loading, ownership of
         //    config/tok/chat_config too.
-        const model_id = blk: {
-            var p = model_dir;
-            while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-            if (p.len == 0) break :blk config.model_type;
-            if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash_idx| break :blk p[slash_idx + 1 ..];
-            break :blk p;
-        };
-
         const discovery_for_registry = discovery_storage;
         discovery_storage = null; // ownership moves to the registry
 
@@ -1195,14 +1187,7 @@ fn runCli(init: std.process.Init) !void {
         // Register the loaded model. Use the pre-registered discovery entry
         // when available (so id/path/bytes_on_disk are consistent across
         // /v1/models listings); otherwise create a fresh stub.
-        const entry = if (registry.peek(model_id)) |e|
-            e
-        else if (registry.peekByPath(model_dir)) |e|
-            // Discovered under an org/name id whose basename differs from
-            // model_id — reuse it, never register the same path twice.
-            e
-        else
-            try registry.registerStub(model_id, model_dir, null);
+        const entry = try registry.registerLaunchFolder(model_dir);
         try registry.setDefault(entry.id);
 
         // Ownership-transfer defer: registry takes ownership of
