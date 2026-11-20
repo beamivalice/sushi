@@ -292,9 +292,12 @@ fn gib(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1 << 30);
 }
 
+/// Tests only: the destination volume's space, so a test's verdict does not depend on the disk it runs on.
+var volume_space_override: ?disk_placement.VolumeSpace = null;
+
 fn onEvent(impl: *anyopaque, ev: cli.PullEvent) bool {
     const job: *Job = @ptrCast(@alignCast(impl));
-    const space = if (ev == .listed) disk_placement.volumeSpaceNear(job.dest) else null;
+    const space = if (ev == .listed) (volume_space_override orelse disk_placement.volumeSpaceNear(job.dest)) else null;
     const partial = if (ev == .file and !ev.file.skip) partialSize(worker_io, job.dest, ev.file.path) else 0;
     lock();
     defer unlock();
@@ -748,6 +751,8 @@ test "downloads: a finished pull drops the update claim from the pack row" {
 
 test "downloads: progress follows the pull's events, and a stop is answered at the next one" {
     worker_io = testing.io;
+    volume_space_override = .{ .free = 300 << 30, .total = 1000 << 30 };
+    defer volume_space_override = null;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var p: [std.fs.max_path_bytes]u8 = undefined;
@@ -774,7 +779,10 @@ test "downloads: a pack that cannot fit is stopped once its listing is known, na
     worker_io = testing.io;
     const job = try Job.create(testing.allocator, testing.io, "beamster/X", "/", false);
     defer job.destroy();
-    const v = disk_placement.volumeSpaceNear("/").?;
+    // A disk already inside its reserve (a twentieth of 1 TiB): a need of any size is short, a need of 0 is not.
+    const v: disk_placement.VolumeSpace = .{ .free = 20 << 30, .total = 1 << 40 };
+    volume_space_override = v;
+    defer volume_space_override = null;
     try testing.expect(!onEvent(job, .{ .listed = .{ .files = 1, .bytes = v.free + (1 << 40), .present = 0 } }));
     try testing.expect(std.mem.indexOf(u8, job.message, "GiB free") != null);
     // What is on disk already is not needed again.

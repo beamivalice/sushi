@@ -63,8 +63,10 @@ pub fn reserve(total: u64) u64 {
     return @max(total / 20, 4 << 30);
 }
 
-/// `short`: the download would eat into the reserve. `low`: it leaves under a tenth of the volume free.
+/// `short`: the download would eat into the reserve. `low`: it leaves under a tenth of the volume free. A download
+/// that needs nothing (every file present) writes nothing, so it fits however full the volume already is.
 pub fn spaceVerdict(need: u64, free: u64, total: u64) Space {
+    if (need == 0) return .fits;
     if (need +| reserve(total) > free) return .short;
     return if (free - need < total / 10) .low else .fits;
 }
@@ -192,6 +194,8 @@ test "downloads: a pack that eats into the reserve is refused, one that leaves u
     try testing.expectEqual(Space.short, spaceVerdict(251 << 30, free, total)); // would leave under 50 GiB, a twentieth
     try testing.expectEqual(Space.short, spaceVerdict(2 << 30, 5 << 30, 40 << 30)); // a small disk keeps 4 GiB
     try testing.expectEqual(Space.short, spaceVerdict(std.math.maxInt(u64), free, total));
+    // A pull whose files are all present writes nothing: never refused, however full the disk already is.
+    try testing.expectEqual(Space.fits, spaceVerdict(0, 1 << 30, total));
 }
 
 test "downloads: speed is the average over the last few seconds of samples" {

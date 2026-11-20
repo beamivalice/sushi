@@ -710,7 +710,8 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   neither slips past the other. A new pack whose size, less what its folder holds, would leave less
   than a twentieth of the volume (at least 4 GiB, the SSD cache's reserve) is a 507 `insufficient_storage`; under a
   tenth free it carries a `warning`. The download checks again before it writes, against the listing: the listed bytes
-  less the files already at their size and the partials of the others (`hf_pull.bytesPresent`).
+  less the files already at their size and the partials of the others (`hf_pull.bytesPresent`); one that needs nothing
+  more writes nothing, so it passes however full the volume already is.
 - One download runs at a time on a thread `downloads.zig` owns (never the inference thread or a connection thread),
   through `cli.pullRepo`: same manifest, content-id skip, `curl -C -` partials and verify-before-rename as `sushi pull`.
   `phase` is `queued|listing|checking|downloading|verifying|done|failed|cancelled`; `done_bytes` counts finished files and
