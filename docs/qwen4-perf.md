@@ -1136,7 +1136,13 @@ GPU lock. Sum of the rows' decode tok/s (each row's own rate), A / B:
 | 2 | 105 / 118 | 102 / 116 | 158 / 157 | 103 / 117 |
 | 4 | 117 / 155 | 115 / 155 | 170 / 180 | 116 / 156 |
 
-One row runs no changed code; its MTP rows spread 126 to 133 tok/s on either arm. `--qwen-mlx-engine` on the same box and settings read 112 / 155 / 185 (sampled MTP, n=1/2/4) and 87 / 107 / 125 (greedy
+One row runs no changed code; its MTP rows spread 126 to 133 tok/s on either arm.
+
+Sampled rows drafted only in calibration probes: the planner looked their one-draft price up under a key no round
+recorded (a proposal bit from the draft temperature, where a served request's chain keeps no draft probabilities), so it
+never found one and kept them plain. With the key the rounds record, same boot, A B B A, the old key A against B, sum of
+the rows' tok/s: sampled MTP 2 rows 118.7, 118.8 / 150.5, 154.9 (163 speculative rounds a 400-token reply against 20
+probes); 4 rows 156.1, 154.2 / 157.7 (still calibrating), 169.1; 4-row sampled plain 155 / 155; greedy unchanged. `--qwen-mlx-engine` on the same box and settings read 112 / 155 / 185 (sampled MTP, n=1/2/4) and 87 / 107 / 125 (greedy
 plain). A 4-row plain tick's GPU time (engine kernel profile) went 52 to 38 ms. The batched MTP planner still picks no
 drafts for sampled rows: a 4-row round of two drafts each costs about twice a plain tick (52 against 26 ms), which
 sampled acceptance (~55% a draft) does not repay; greedy rows keep `{2,2,2,2}` rounds.

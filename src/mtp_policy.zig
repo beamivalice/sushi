@@ -4,6 +4,7 @@ const depth_bounds = @import("mtp_depth_bounds.zig");
 const generate_mod = @import("generate.zig");
 const spec_types = @import("spec_types.zig");
 const group_cost = @import("mtp_group_cost.zig");
+const mtp_round = @import("mtp_round.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
@@ -933,8 +934,13 @@ pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
 /// One debug line per planned round with every input the planner read.
 pub fn mtpPlannerMode(self: *const Generator) u8 {
     const head = self.mtp orelse return 0;
-    const sharp = !sampler.isGreedyTemperature(self.mtpDraftSampling().temperature);
-    return group_cost.GroupShape.samplingMode(head.canRerankDrafts(), false, sharp, !sampler.isGreedyTemperature(self.sampling.temperature));
+    return plannerModeFor(head.canRerankDrafts(), self.mtpDraftSampling(), self.mtpDrawsAtPositions(), !sampler.isGreedyTemperature(self.sampling.temperature));
+}
+
+/// The sampling mode a planner key names: the mode its round records (`mtp_tick.observeGroupRound`), whose proposal bit
+/// is the chain's kept probabilities.
+pub fn plannerModeFor(rerank: bool, draft: sampler.SamplingParams, draws_at_positions: bool, stochastic: bool) u8 {
+    return group_cost.GroupShape.samplingMode(rerank, false, mtp_round.mtpKeepsDraftProbs(draft, draws_at_positions), stochastic);
 }
 
 pub fn mtpPlannerObserve(self: *Generator, observed: u32, accepted: u32) void {

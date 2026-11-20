@@ -173,6 +173,12 @@ pub fn mtpDraftDraw(self: *Generator, params: sampler.SamplingParams, step: u32)
     return at;
 }
 
+/// Whether a round's draft chain keeps each draft's proposal probabilities (`q_probs`): sampled drafts not drawn at
+/// positions. The planner's price key reads the same answer (`mtp_policy.mtpPlannerMode`), or it prices no round.
+pub fn mtpKeepsDraftProbs(draft: sampler.SamplingParams, draws_at_positions: bool) bool {
+    return !sampler.isGreedyTemperature(draft.temperature) and !draws_at_positions;
+}
+
 /// Allocate an empty draft chain for `plan` (nothing built yet).
 pub fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !MtpPreDraft {
     if (plan.m_hi > mtp_mod.MAX_DEPTH) return error.MtpDepthRange;
@@ -182,7 +188,7 @@ pub fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRou
     errdefer allocator.free(drafts);
     const conf_arrs: ?[]mlx.mlx_array = if (consider_ext) try allocator.alloc(mlx.mlx_array, plan.m_lo) else null;
     errdefer if (conf_arrs) |slots| allocator.free(slots);
-    const q_probs: ?[]mlx.mlx_array = if (sharp_drafts and !self.mtpDrawsAtPositions()) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null;
+    const q_probs: ?[]mlx.mlx_array = if (mtpKeepsDraftProbs(self.mtpDraftSampling(), self.mtpDrawsAtPositions())) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null;
     const t1_i32: i32 = @intCast(t1);
     const t1_shape = [_]c_int{1};
     return .{
@@ -2771,4 +2777,19 @@ test "MTP depth bounds: a lookup draft is never wider than an explicit max" {
     const cap = depth_bounds.lookupCap(Generator.mtpLookupDraftCap(&.{ .model_type = "lookup-cap-test" }), .{ .max = 3 });
     const got = idx.match(1, cap) orelse return error.NoMatch;
     try testing.expectEqual(@as(usize, 3), got.draft.len);
+}
+
+test "a round keeps its drafts' proposal probabilities only for sampled drafts not drawn at positions, and the planner's price key says the same" {
+    const greedy: sampler.SamplingParams = .{ .temperature = 0 };
+    const sharp: sampler.SamplingParams = .{ .temperature = 0.6 };
+    try testing.expect(!mtpKeepsDraftProbs(greedy, false));
+    try testing.expect(!mtpKeepsDraftProbs(greedy, true));
+    try testing.expect(mtpKeepsDraftProbs(sharp, false));
+    // A served request draws at positions: its chain holds no probabilities, so its rounds record no proposal bit.
+    try testing.expect(!mtpKeepsDraftProbs(sharp, true));
+    const group_cost = @import("mtp_group_cost.zig");
+    for ([_]bool{ false, true }) |at| {
+        const recorded = group_cost.GroupShape.samplingMode(false, false, mtpKeepsDraftProbs(sharp, at), true);
+        try testing.expectEqual(recorded, mtp_policy.plannerModeFor(false, sharp, at, true));
+    }
 }
