@@ -2262,8 +2262,8 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
         return true;
     }
     const refusal = loadRefusalFor(err) orelse return false;
-    // A refusal answered from the stored state (`memory_context_refusal`) is an earlier load's, by design.
-    const context = if (err == error.InsufficientMemory) report.context orelse scheduler.registry.loadContextRefusal(id) else null;
+    // Only this request's own load names a context: a fast answer from a stored failure is never a refusal.
+    const context = if (err == error.InsufficientMemory) report.context else null;
     const message = try loadRefusalMessage(allocator, err, refusal, context, report.refusalText());
     defer allocator.free(message);
     var retry_buf: [40]u8 = undefined;
@@ -2350,13 +2350,10 @@ test "a memory-refused load's 503 carries the check's whole text, its lines inta
 /// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for
 /// every on-demand load failure — the inference thread's error name was
 /// dropped at the thread boundary. The registry keeps it; echo it.
-pub fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8, report: *const scheduler_mod.LoadReport) !void {
+pub fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, report: *const scheduler_mod.LoadReport) !void {
     if (report.failed) |err| return sendLoadFailedNamed(allocator, stream, @errorName(err));
     // No load of this request's own: the stored failure it was answered from fast, an earlier load's by design.
-    if (sched.loadErrorName(allocator, id)) |name| {
-        defer allocator.free(name);
-        return sendLoadFailedNamed(allocator, stream, name);
-    }
+    if (report.stored.get()) |name| return sendLoadFailedNamed(allocator, stream, name);
     try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
 }
 
@@ -3083,4 +3080,37 @@ test "a streamed result carries the prefix reuse and the timings its stream fina
     try std.testing.expectEqual(@as(?usize, 3), r.constraint_payload_byte);
     // The stream's own end: the stop its gate matched, which `reply.settle` reads instead of searching the cut text.
     try std.testing.expectEqualStrings("cd", generatedOf(&r).source.gated.?);
+}
+
+/// The answer `sendNamedLoadRefusal` writes for `err`, read back off a socket pair. Only the scheduler's registry is read.
+fn answerOf(id: []const u8, err: anyerror, report: *const scheduler_mod.LoadReport, reg: *model_registry_mod.ModelRegistry, out: []u8) ![]u8 {
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, std.testing.io);
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.registry = reg;
+    try std.testing.expect(try sendNamedLoadRefusal(std.testing.allocator, &conn, &sch, id, err, report));
+    _ = std.posix.system.shutdown(sv[1], std.posix.SHUT.WR);
+    conn.close();
+    var got: usize = 0;
+    while (got < out.len) {
+        const n = std.c.recv(sv[1], out[got..].ptr, out.len - got, 0);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    return out[0..got];
+}
+
+test "a files read that ran out of memory is answered with its own refusal, not an earlier load's context figures" {
+    var reg = try model_registry_mod.ModelRegistry.init(std.testing.allocator, std.testing.io, null, 2, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStub("b", "b", 10);
+    // An earlier load of b was refused for its context, which the entry keeps.
+    e.memory_context_refusal = .{ .requested = 500000, .maximum = 128000, .needed = 100, .available = 90, .kv_bits = 8, .chunk = 2048 };
+    const report: scheduler_mod.LoadReport = .{ .failed = error.OutOfMemory };
+    var buf: [4096]u8 = undefined;
+    const raw = try answerOf("b", error.InsufficientMemory, &report, reg, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "500000") == null);
 }

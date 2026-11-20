@@ -1773,7 +1773,7 @@ fn sendModelRefusal(allocator: std.mem.Allocator, stream: *http_conn.Conn, sched
             try models_api.handlePropsNoModel(allocator, stream)
         else
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", http.no_model_message, 503),
-        error.LoadFailed => try generation_stream.sendLoadFailedResponse(allocator, stream, scheduler, id, report),
+        error.LoadFailed => try generation_stream.sendLoadFailedResponse(allocator, stream, report),
         error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed

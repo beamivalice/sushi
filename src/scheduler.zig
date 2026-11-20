@@ -1032,6 +1032,8 @@ pub const LoadReport = struct {
     failed: ?anyerror = null,
     /// The context a memory refusal names.
     context: ?model_registry_mod.MemoryContextRefusal = null,
+    /// The stored failure the request was answered with fast, when it ran no load of its own.
+    stored: model_registry_mod.FailureName = .{},
     text: [load_refusal_cap]u8 = undefined,
     text_len: usize = 0,
 
@@ -1725,7 +1727,7 @@ pub const Scheduler = struct {
         rep.* = .{};
         // Fast path: ready entries. registry.ensureLoaded handles waiting
         // out .loading / .evicting transitions by other callers.
-        const fast_result = if (retry_failed) self.registry.ensureLoadedRetrying(id_or_empty) else self.registry.ensureLoaded(id_or_empty);
+        const fast_result = self.registry.ensureLoadedNaming(id_or_empty, retry_failed, &rep.stored);
         if (fast_result) |lm| return lm else |err| switch (err) {
             error.NotLoaded => {}, // fall through to slow path
             else => return err,
@@ -1844,7 +1846,10 @@ pub const Scheduler = struct {
                         continue :wait_loop;
                     },
                     .unloaded, .error_state => {
-                        if (entry.state == .error_state and !retry_failed) return ModelRegistry.loadErrorFromName(entry.error_name);
+                        if (entry.state == .error_state and !retry_failed) {
+                            rep.stored.set(entry.error_name);
+                            return ModelRegistry.loadErrorFromName(entry.error_name);
+                        }
                         // Another model's load turns resident when it ends: plan after it, so a model switch queues
                         // behind it instead of loading past the count cap. A stored failure stays until the claim.
                         if (self.registry.otherLoadInFlightLocked(entry)) {
@@ -1986,12 +1991,6 @@ pub const Scheduler = struct {
     /// stamp. See `ModelRegistry.releaseStatus`.
     pub fn releaseStatus(self: *Scheduler, lm: *LoadedModel) void {
         self.registry.releaseStatus(lm);
-    }
-
-    /// Duped stored failure name for the id `ensureLoaded` refused with `error.LoadFailed` from that stored failure,
-    /// for the "Model load failed: <name>" HTTP message (#144). Caller frees.
-    pub fn loadErrorName(self: *Scheduler, alloc: std.mem.Allocator, id_or_empty: []const u8) ?[]u8 {
-        return self.registry.loadErrorNameDupe(alloc, id_or_empty);
     }
 
     /// Free a model's resident GPU state, returning its registry stub to
@@ -6920,4 +6919,176 @@ test "a files-read failure is not stored on a model another request loaded and u
     try testing.expect(call.answeredWithin(20_000));
     try testing.expectError(error.LoadFailed, call.got);
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
+}
+
+fn writeTinyDir(tmp: *std.testing.TmpDir) !void {
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+}
+
+fn sleep1ms() void {
+    const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+/// One `ensureLoadedFresh("b")` on a thread of its own.
+const FreshCall = struct {
+    sch: *Scheduler,
+    got: anyerror!void = error.NotRun,
+    done: std.atomic.Value(bool) = .init(false),
+    fn run(self: *@This()) void {
+        self.got = if (self.sch.ensureLoadedFresh("b", null)) |lm| self.sch.release(lm) else |e| e;
+        self.done.store(true, .release);
+    }
+};
+
+test "an explicit retry whose load turns ready before it is marked posted frees the kept failure's name" {
+    const io = testing.io;
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try writeTinyDir(&tmp);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    const target = try reg.registerStub("b", dir, 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markErrorLocked(target, "Exl3ShardStampMismatch");
+    reg.mutex.unlock(io);
+    var sch = coldLoadTestScheduler(reg);
+    defer sch.load_queue.deinit(testing.allocator);
+    // Hold the queue so the request stops at its post, then the registry once it has claimed.
+    sch.queue_mu.lockUncancelable(io);
+    var call: FreshCall = .{ .sch = &sch };
+    const t = try std.Thread.spawn(.{}, FreshCall.run, .{&call});
+    defer t.join();
+    var claimed = false;
+    for (0..20_000) |_| {
+        if (reg.mutex.tryLock()) {
+            if (target.state == .loading) {
+                claimed = true;
+                break;
+            }
+            reg.mutex.unlock(io);
+        }
+        sleep1ms();
+    }
+    sch.queue_mu.unlock(io);
+    if (!claimed) return error.NeverClaimed;
+    // Registry held: the request posts, then waits in posted(). The "inference thread" takes the load and marks it
+    // ready first, as a load that finishes before the request thread is scheduled again does.
+    var req: *LoadRequest = undefined;
+    while (true) {
+        sch.queue_mu.lockUncancelable(io);
+        if (sch.load_queue.items.len > 0) {
+            req = sch.load_queue.orderedRemove(0);
+            sch.queue_mu.unlock(io);
+            break;
+        }
+        sch.queue_mu.unlock(io);
+        sleep1ms();
+    }
+    // The attempt holds the kept name: the entry carries one only while `.error_state`.
+    const name_on_entry_while_loading = target.error_name != null;
+    reg.markReadyLocked(target, 10);
+    reg.mutex.unlock(io);
+    var cs: model_load.CpuState = .{ .config = req.config, .tok = req.tok, .chat_config = req.chat_config };
+    model_load.freeCpuState(testing.allocator, &cs);
+    req.done_mu.lockUncancelable(io);
+    req.outcome = .ok;
+    req.done = true;
+    req.done_cond.broadcast(io);
+    req.done_mu.unlock(io);
+    for (0..20_000) |_| {
+        if (call.done.load(.acquire)) break;
+        sleep1ms();
+    }
+    try call.got;
+    try testing.expect(!name_on_entry_while_loading);
+    // Return the entry to rest so deinit frees nothing it never installed; the leak check is testing.allocator's.
+    reg.mutex.lockUncancelable(io);
+    target.state = .unloaded;
+    reg.current_resident_bytes = 0;
+    reg.mutex.unlock(io);
+}
+
+/// Wraps testing.allocator: the first allocation made while `target` is claimed and the registry mutex is free saves
+/// a setting for it (as settings_api does), then fails, so the attempt ends before its post.
+const SaveThenFail = struct {
+    reg: *ModelRegistry,
+    target: *LoadedModel,
+    fired: bool = false,
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (!self.fired and self.target.state == .loading and self.reg.mutex.tryLock()) {
+            const claimed = self.target.state == .loading;
+            self.reg.mutex.unlock(self.reg.io);
+            if (claimed) {
+                self.fired = true;
+                self.reg.forgetLoadFailure(self.target);
+                return null;
+            }
+        }
+        return testing.allocator.rawAlloc(len, a, ra);
+    }
+    fn resize(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        return testing.allocator.rawResize(m, a, n, ra);
+    }
+    fn remap(_: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        return testing.allocator.rawRemap(m, a, n, ra);
+    }
+    fn free(_: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        testing.allocator.rawFree(m, a, ra);
+    }
+};
+
+test "a setting saved while an explicit retry holds its claim ends the stored failure even when the retry ends before its post" {
+    const io = testing.io;
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try writeTinyDir(&tmp);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    const target = try reg.registerStub("b", dir, 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markErrorLocked(target, "Exl3ShardStampMismatch");
+    reg.mutex.unlock(io);
+    var sch = coldLoadTestScheduler(reg);
+    defer sch.load_queue.deinit(testing.allocator);
+    var hook: SaveThenFail = .{ .reg = reg, .target = target };
+    sch.allocator = hook.allocator();
+    const got = sch.ensureLoadedFresh("b", null);
+    sch.allocator = testing.allocator;
+    if (got) |lm| {
+        sch.release(lm);
+        return error.LoadSucceeded;
+    } else |_| {}
+    try testing.expect(hook.fired);
+    try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
+    // The save ended the failure: an ordinary request loads again instead of answering the old one.
+    try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
+}
+
+test "a request answered fast from a stored failure carries that failure's name in its report" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 2, 0, null);
+    defer reg.deinit();
+    const target = try reg.registerStub("b", "/b", 10);
+    reg.mutex.lockUncancelable(testing.io);
+    reg.markErrorLocked(target, "FileNotFound");
+    reg.mutex.unlock(testing.io);
+    var sch = coldLoadTestScheduler(reg);
+    var report: LoadReport = .{};
+    try testing.expectError(error.LoadFailed, sch.ensureLoaded("b", &report));
+    try testing.expectEqualStrings("FileNotFound", report.stored.get().?);
+    try testing.expect(report.failed == null);
 }

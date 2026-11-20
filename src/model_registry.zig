@@ -573,6 +573,23 @@ pub const ModelStatus = struct {
 /// model-settings.json. Every other failure is the pack's and is stored.
 pub const refusals = [_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetExceedsWiredLimit", "SsdBudgetBelowResident", "SsdBudgetBelowVision", "ExpertCacheDoesNotFit", "ContextSizeAboveWindow", "GlmKvQuantUnsupported" };
 
+/// The name of the stored failure a request was refused with, copied while the registry held it: by the time the answer
+/// is written an explicit retry may have claimed the entry.
+pub const FailureName = struct {
+    buf: [128]u8 = undefined,
+    len: usize = 0,
+
+    pub fn set(self: *FailureName, name: ?[]const u8) void {
+        const n = name orelse return;
+        self.len = @min(n.len, self.buf.len);
+        @memcpy(self.buf[0..self.len], n[0..self.len]);
+    }
+
+    pub fn get(self: *const FailureName) ?[]const u8 {
+        return if (self.len == 0) null else self.buf[0..self.len];
+    }
+};
+
 /// One load of one model by the request that asked for it, from the read of its settings to its end: the settings
 /// generation it read, the marks it made (its claim, the victims it marked for eviction) and how it ended. `end` runs
 /// once, on that request's thread, and stores the outcome or sets every mark back: no mark outlives its attempt. The
@@ -585,9 +602,10 @@ pub const LoadAttempt = struct {
     /// `entry.claim_gen` at the start, then after this attempt's own claim.
     claim_gen: u64,
     claimed: bool = false,
-    /// The entry's stored failure, kept through the claim until the load is posted (`posted`): a refusal decides
-    /// nothing about the model, so it leaves the failure as it was.
-    kept_failure: bool = false,
+    /// The entry's stored failure name, owned by the attempt from its claim until the load is posted (`posted` frees
+    /// it): a refusal decides nothing about the model, so it gives the failure back. The entry carries a name only
+    /// while `.error_state`.
+    kept_name: ?[]const u8 = null,
     /// Marked `.evicting` by this attempt; once the inference thread takes the load they are its to free.
     victims: []const *LoadedModel = &.{},
     outcome: Outcome = .pending,
@@ -620,8 +638,11 @@ pub const LoadAttempt = struct {
 
     /// Claims the entry, the caller holding `mutex`. An explicit retry's stored failure is kept until `posted`.
     pub fn claimLocked(self: *LoadAttempt) void {
-        self.kept_failure = self.entry.state == .error_state;
-        if (self.kept_failure) self.entry.state = .unloaded;
+        if (self.entry.state == .error_state) {
+            self.kept_name = self.entry.error_name;
+            self.entry.error_name = null;
+            self.entry.state = .unloaded;
+        }
         std.debug.assert(self.registry.tryBeginLoadLocked(self.entry));
         self.claimed = true;
         self.claim_gen = self.entry.claim_gen;
@@ -629,13 +650,8 @@ pub const LoadAttempt = struct {
 
     /// The load is the inference thread's now: an explicit retry's stored failure ends here.
     pub fn posted(self: *LoadAttempt) void {
-        if (!self.kept_failure) return;
-        const reg = self.registry;
-        reg.mutex.lockUncancelable(reg.io);
-        defer reg.mutex.unlock(reg.io);
-        if (self.entry.error_name) |n| reg.allocator.free(n);
-        self.entry.error_name = null;
-        self.kept_failure = false;
+        if (self.kept_name) |n| self.registry.allocator.free(n);
+        self.kept_name = null;
     }
 
     pub fn end(self: *LoadAttempt) void {
@@ -648,7 +664,11 @@ pub const LoadAttempt = struct {
             .pending, .shutdown => {
                 for (self.victims) |v| if (v.state == .evicting) reg.unmarkEvictingLocked(v);
                 if (self.claimed and entry.state == .loading) {
-                    if (self.kept_failure) reg.restoreFailureLocked(entry) else reg.markUnloadedLocked(entry);
+                    // A setting saved meanwhile ended the failure, as it would have at rest.
+                    if (self.kept_name != null and entry.settings_gen == self.settings_gen) {
+                        reg.restoreFailureLocked(entry, self.kept_name.?);
+                        self.kept_name = null;
+                    } else reg.markUnloadedLocked(entry);
                 }
             },
             // Stored only when nothing it read has changed since: no setting saved, no other load of the entry (for a
@@ -661,6 +681,8 @@ pub const LoadAttempt = struct {
                 if (store) reg.markErrorLocked(entry, @errorName(err)) else if (self.claimed) reg.markUnloadedLocked(entry);
             },
         }
+        if (self.kept_name) |n| reg.allocator.free(n);
+        self.kept_name = null;
         if (self.claimed and !self.kept) reg.releaseRefLocked(entry);
     }
 };
@@ -1112,15 +1134,16 @@ pub const ModelRegistry = struct {
     ///
     /// Caller MUST call `release(lm)` once done with the returned pointer.
     pub fn ensureLoaded(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
-        return self.ensureLoadedWith(id_or_empty, false);
+        return self.ensureLoadedNaming(id_or_empty, false, null);
     }
 
     /// `ensureLoaded` that treats a failed entry as `error.NotLoaded`, so the caller can start a new attempt.
     pub fn ensureLoadedRetrying(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
-        return self.ensureLoadedWith(id_or_empty, true);
+        return self.ensureLoadedNaming(id_or_empty, true, null);
     }
 
-    fn ensureLoadedWith(self: *ModelRegistry, id_or_empty: []const u8, retry_failed: bool) !*LoadedModel {
+    /// `stored` (null: unread) receives the name of the stored failure a request is refused with, in the same hold.
+    pub fn ensureLoadedNaming(self: *ModelRegistry, id_or_empty: []const u8, retry_failed: bool, stored: ?*FailureName) !*LoadedModel {
         const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "sushi"))
             self.default_id
         else
@@ -1143,7 +1166,11 @@ pub const ModelRegistry = struct {
                     try self.waitStateChangeLocked();
                     continue;
                 },
-                .error_state => return if (retry_failed) error.NotLoaded else loadErrorFromName(entry.error_name),
+                .error_state => {
+                    if (retry_failed) return error.NotLoaded;
+                    if (stored) |s| s.set(entry.error_name);
+                    return loadErrorFromName(entry.error_name);
+                },
                 .unloaded => return error.NotLoaded,
             }
         }
@@ -1191,9 +1218,11 @@ pub const ModelRegistry = struct {
         self.state_cond.broadcast(self.io);
     }
 
-    /// A claim that never reached the inference thread gives its entry back to the failure it kept. Caller holds `mutex`.
-    fn restoreFailureLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+    /// A claim that never reached the inference thread gives its entry back to the failure it kept, `name` (owned)
+    /// included. Caller holds `mutex`.
+    fn restoreFailureLocked(self: *ModelRegistry, entry: *LoadedModel, name: []const u8) void {
         self.releaseReservationLocked(entry);
+        entry.error_name = name;
         entry.state = .error_state;
         self.state_cond.broadcast(self.io);
     }
