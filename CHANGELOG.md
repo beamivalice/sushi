@@ -4,6 +4,19 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **A request field of the wrong type is refused by name on more of the API**: a chat `tool_choice` object that names
+  no function, and a Responses `instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`,
+  `truncation` or `max_tool_calls` of the wrong type (on `/v1/responses/compact` too) are now a 400 naming the field;
+  they were read as absent.
+- **Clearing the prefix-cache namespace of a model that is loading or unloading answers 409 `namespace_in_use`**, as
+  for a loaded one; it answered 200 with nothing removed. The stale sweep keeps that namespace, and an `all` clear
+  lists the model as busy.
+- **Two settings saves at once can no longer land a pair of model settings one of them is refused for**: a model's
+  edits are checked against the file each save rewrites.
+- **A download whose files are all present is never refused for disk space**, however full the disk already is.
+
 ## v1.7.2 — Memory you can count on, faster concurrent Qwen
 
 Bugs fixed in this release, by severity and area:
