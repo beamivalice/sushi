@@ -473,7 +473,7 @@ fn handleResponsesInner(
     defer spelled.deinit();
 
     var fault_buf: [384]u8 = undefined;
-    if (request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &.{ "max_output_tokens", "max_tokens" }, .stop = null })) |reason| {
+    if (request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &request_parse.responses_max_tokens, .stop = null })) |reason| {
         log.warn("POST /v1/responses -> 400 ({s})\n", .{reason});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
@@ -541,9 +541,7 @@ fn handleResponsesInner(
     // Track whether the user explicitly supplied max_output_tokens so we can
     // echo `null` (vs. our internal default) in the response envelope.
     const req_max_output_tokens: ?u32 = blk: {
-        const v = root.get("max_output_tokens") orelse root.get("max_tokens");
-        // <= 0 is an omission: the filled budget below.
-        const r = resolveRequestMaxTokens(v, 0);
+        const r = resolveRequestMaxTokens(request_parse.requestedMaxTokens(root, &request_parse.responses_max_tokens), 0);
         break :blk if (r > 0) r else null;
     };
     const max_tokens: u32 = req_max_output_tokens orelse

@@ -273,10 +273,18 @@ pub fn wholeNumber(v: std.json.Value) ?i64 {
     };
 }
 
-/// The request value a token budget reads: OpenAI's `max_completion_tokens` supersedes `max_tokens`.
-pub fn requestedMaxTokens(root: std.json.ObjectMap) ?std.json.Value {
-    if (root.get("max_completion_tokens")) |v| if (v != .null) return v;
-    return root.get("max_tokens");
+/// Each surface's spelling of the token budget, in precedence order.
+pub const chat_max_tokens = [_][]const u8{ "max_completion_tokens", "max_tokens" };
+pub const responses_max_tokens = [_][]const u8{ "max_output_tokens", "max_tokens" };
+
+/// The request value a token budget reads: the first of a surface's `keys` that carries a positive number, so an
+/// absent, null or 0 field (the app's Auto) leaves the next in force. `generationFieldFault` refused another type.
+pub fn requestedMaxTokens(root: std.json.ObjectMap, keys: []const []const u8) ?std.json.Value {
+    for (keys) |k| {
+        const v = root.get(k) orelse continue;
+        if (wholeNumber(v)) |n| if (n > 0) return v;
+    }
+    return null;
 }
 
 /// The bool fields a request carries. `boolField` is the one reader and `boolFieldFault` refuses any other type by
@@ -323,7 +331,7 @@ pub fn boolFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
 
 /// Where a surface spells the fields `generationFieldFault` checks.
 pub const GenerationKeys = struct {
-    max_tokens: []const []const u8 = &.{ "max_completion_tokens", "max_tokens" },
+    max_tokens: []const []const u8 = &chat_max_tokens,
     /// Null where the surface has no stop field.
     stop: ?[]const u8 = "stop",
     /// False where the surface's API has no `min_p`: a value there is refused rather than read.
@@ -750,13 +758,27 @@ test "parseMinP: an omitted or null min_p is off" {
     }
 }
 
-test "a request's max_completion_tokens supersedes its max_tokens" {
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"max_tokens\":20,\"max_completion_tokens\":7}", .{});
-    defer parsed.deinit();
-    try testing.expectEqual(@as(i64, 7), requestedMaxTokens(parsed.value.object).?.integer);
-    var only = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"max_tokens\":20,\"max_completion_tokens\":null}", .{});
-    defer only.deinit();
-    try testing.expectEqual(@as(i64, 20), requestedMaxTokens(only.value.object).?.integer);
+test "a surface's first positive token budget key wins, and a null or zero one leaves the next in force" {
+    const Case = struct { body: []const u8, keys: []const []const u8, want: ?i64 };
+    const cases = [_]Case{
+        .{ .body = "{\"max_tokens\":20,\"max_completion_tokens\":7}", .keys = &chat_max_tokens, .want = 7 },
+        .{ .body = "{\"max_tokens\":20,\"max_completion_tokens\":null}", .keys = &chat_max_tokens, .want = 20 },
+        .{ .body = "{\"max_tokens\":5,\"max_completion_tokens\":0}", .keys = &chat_max_tokens, .want = 5 },
+        .{ .body = "{\"max_tokens\":5.0}", .keys = &chat_max_tokens, .want = 5 },
+        .{ .body = "{\"max_tokens\":0,\"max_completion_tokens\":null}", .keys = &chat_max_tokens, .want = null },
+        .{ .body = "{}", .keys = &chat_max_tokens, .want = null },
+        .{ .body = "{\"max_output_tokens\":null,\"max_tokens\":1}", .keys = &responses_max_tokens, .want = 1 },
+        .{ .body = "{\"max_output_tokens\":0,\"max_tokens\":1}", .keys = &responses_max_tokens, .want = 1 },
+        .{ .body = "{\"max_output_tokens\":9,\"max_tokens\":1}", .keys = &responses_max_tokens, .want = 9 },
+        .{ .body = "{\"max_completion_tokens\":3,\"max_tokens\":4}", .keys = &.{"max_tokens"}, .want = 4 },
+    };
+    for (cases) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        errdefer std.debug.print("\nbody: {s}\n", .{c.body});
+        const got = requestedMaxTokens(parsed.value.object, c.keys);
+        try testing.expectEqual(c.want, if (got) |v| wholeNumber(v) else null);
+    }
 }
 
 test "chatFieldFault refuses an unknown role, response_format type, malformed tools and tool_choice" {

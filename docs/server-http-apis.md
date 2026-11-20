@@ -286,7 +286,7 @@ before reading a completed stream and requires clean EOF.
   `text`), built once per surface.
 - **A field the server reads is used or refused by name, never read as absent** (`request_parse.generationFieldFault`,
   one check for chat, completions, Messages and Responses; `chatFieldFault` adds roles, `response_format.type`, `tools`
-  and `tool_choice`): `max_tokens`/`max_completion_tokens` (the latter supersedes) and `seed` take an integer or a whole
+  and `tool_choice`): `max_tokens`/`max_completion_tokens` (Responses: `max_output_tokens`; the first positive one wins, a null or 0 leaves the next in force) and `seed` take an integer or a whole
   float (`7.0`); `temperature`, `top_p`, `top_k`, the penalties and `top_logprobs` take a number; `stop` a string or
   strings; `kv_quant` `off|0|4|6|8|16`; every bool (`request_parse.BoolField`, `stream_options.include_usage`, the `chat_template_kwargs` bools) takes true or false and is read by `request_parse.boolField` alone (lint `request-bool-read`), `service_tier` a string; null is absent. A wrong type is a 400 naming the field, and so is a number out of
   its range, with the range in the message (`tests/test_api_edges.sh`): `temperature` 0..2, `top_p` 0..1, `top_k` 0..1000

@@ -17,6 +17,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 
 - **A pack listed while its download was still running is billed at its full size once the download finishes**: its entry kept the partial byte count it was listed with, so the eviction gate and the resident bill under-counted it until the next restart; a finished download or a rescan now refreshes it.
 - **A prefix-cache clear no longer deletes the SSD root of a model that loads while it runs**: the clear's lock file lived inside the namespace it deleted, so a tier opening mid-delete took a fresh lock, then lost its root (two tiers could later own one); a clear and a tier opening now take a gate file beside the namespace.
+- **A null or zero token budget no longer hides its alias**: Responses `max_output_tokens: null` beside `max_tokens: 1` served the
+  default budget, and chat `max_completion_tokens: 0` beside `max_tokens: 5` ignored the 5; every surface reads the first
+  positive spelling.
 - **A `/v1/responses` reply cut by `max_output_tokens` ends in `response.incomplete`**: the stream (and a WebSocket turn)
   ended in `response.completed` while the body said `incomplete`; the event now says it, as OpenAI's does.
 - **A request field of the wrong type is refused by name instead of read as absent**: `"stream":"true"`, `"store":"false"`, a

@@ -2433,7 +2433,7 @@ pub fn handleChatCompletions(
 
     // Support both max_tokens and max_completion_tokens (OpenAI alias). Absent
     // or <= 0 → the filled budget.
-    const requested_max_tokens = request_parse.requestedMaxTokens(root);
+    const requested_max_tokens = request_parse.requestedMaxTokens(root, &request_parse.chat_max_tokens);
     const max_tokens: u32 = request_policy.resolveRequestMaxTokens(
         requested_max_tokens,
         request_policy.filledMaxTokens(config),

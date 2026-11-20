@@ -1673,3 +1673,32 @@ test "server: h21 a Responses stream cut by max_output_tokens ends in response.i
         }
     }.run);
 }
+
+/// The integer at `path` of `v`; null when the path ends elsewhere or on another type.
+fn jsonInt(v: std.json.Value, path: []const []const u8) ?i64 {
+    var cur = v;
+    for (path) |k| {
+        if (cur != .object) return null;
+        cur = cur.object.get(k) orelse return null;
+    }
+    return if (cur == .integer) cur.integer else null;
+}
+
+test "server: h21 a null or zero token-budget field leaves the surface's alias in force" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const resp = try request("POST", "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":null,\"max_tokens\":1,\"temperature\":0,\"reasoning\":{\"effort\":\"none\"},\"input\":\"hi\"}");
+            defer gpa.free(resp);
+            const p = try parseBody(bodyOf(resp));
+            defer p.deinit();
+            try testing.expectEqual(@as(?i64, 1), jsonInt(p.value, &.{"max_output_tokens"}));
+            try testing.expectEqual(@as(?i64, 1), jsonInt(p.value, &.{ "usage", "output_tokens" }));
+
+            const chat = try request("POST", "/v1/chat/completions", "{\"model\":\"tiny\",\"max_completion_tokens\":0,\"max_tokens\":1,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+            defer gpa.free(chat);
+            const cp = try parseBody(bodyOf(chat));
+            defer cp.deinit();
+            try testing.expectEqual(@as(?i64, 1), jsonInt(cp.value, &.{ "usage", "completion_tokens" }));
+        }
+    }.run);
+}
