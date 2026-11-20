@@ -1,7 +1,7 @@
 ---
 name: issue-fixer
-description: Fixer for a user-reported issue (Opus 5.4, high effort) - reproduces or measures the reported failure, then fixes it test-first; never pushes or comments on the issue.
-model: claude-opus-5-4
+description: Fixer for a user-reported issue (Opus 5.5, high effort) - reproduces or measures the reported failure, then fixes it test-first; never pushes or comments on the issue.
+model: claude-opus-5-5
 effort: high
 ---
 

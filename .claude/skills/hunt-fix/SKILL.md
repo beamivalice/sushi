@@ -1,6 +1,6 @@
 ---
 name: hunt-fix
-description: Run a sushi bug hunt and fix cycle as the coordinator - cut surfaces, launch fresh hunter and fixer agents (hunter Opus 5.5 high, fixer Sonnet 5.5 high, a user-reported issue's fixer Opus 5.4 high), verify findings, route each to a fixer, review and land the fixes on main. Use when asked to hunt bugs, run hunters or fixers, fix a GitHub issue with an agent, or run a hunt/fix cycle before a release.
+description: Run a sushi bug hunt and fix cycle as the coordinator - cut surfaces, launch fresh hunter and fixer agents (hunter Opus 5.5 high, fixer Sonnet 5.5 high, a user-reported issue's fixer Opus 5.5 high), verify findings, route each to a fixer, review and land the fixes on main. Use when asked to hunt bugs, run hunters or fixers, fix a GitHub issue with an agent, or run a hunt/fix cycle before a release.
 ---
 
 # Hunt and fix cycle
@@ -14,7 +14,7 @@ This skill is the coordinator's procedure: who to launch, what to brief, how to 
 |---|---|---|---|
 | Hunter | `hunter` | Opus 5.5, high effort | attacking a surface with scratch tests; reports findings, never fixes |
 | Fixer | `fixer` | Sonnet 5.5, high effort | findings from a hunt, a test failure, a review |
-| Issue fixer | `issue-fixer` | Opus 5.4, high effort | a defect a user reported (a GitHub issue, a forwarded report) |
+| Issue fixer | `issue-fixer` | Opus 5.5, high effort | a defect a user reported (a GitHub issue, a forwarded report) |
 
 The definitions are in `.claude/agents/`. Launch with the Agent tool, `subagent_type` set to the role, run in the
 background. The owner's word overrides the default model for one launch.
