@@ -25,8 +25,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (`Settled.declined`, `reply.detailsField`; the name is the parser's salvage of the open tail). It outranks a thought's
   note in that slot, and the finish stays the end's own (`stop`, `length`, `cancelled`; Anthropic's `stop_sequence`
   stays set); a loop cut names its own cause and parses no call. A call the model finished before the end ships as it
-  is. Dialects the opener list does not hold (MiniCPM5 `<function name=`, a bare `<function=`) still ship their
-  salvage at the model's own end. The stop is read once, by `reply.settle` (`stop_sequences.cut`): a stream's reply carries
+  is. Every dialect the parse chain reads has a family in `think_tags.tool_markup_families`; one whose opener alone is
+  prose (MiniCPM5 `<function name=`, bare `<function=`, `<invoke`, `<tool name=`, `<tool_request`) opens a call only
+  where the parser would read one (a name attribute and a `<param`, a `<parameter=`, a JSON body), so text that
+  mentions the markup stays text. The stop is read once, by `reply.settle` (`stop_sequences.cut`): a stream's reply carries
   its gate's match (`GenerationResult.stop_source`), never a stop searched for again in text the gate already cut. Lint
   `reply-bypass`: a surface never calls the raw `parseToolCalls`.
 - Template input `chat.templateMessages`: role "tool" native, a call's `arguments` the client's JSON object (`{}` for

@@ -1009,7 +1009,7 @@ fn dsmlParamEndsAt(text: []const u8, p: usize) bool {
 
 /// Tolerant quoted-attribute extraction from a tag-attribute segment:
 /// `name="X"` / `name='X'` / mangled unquoted `name=X` (to whitespace/`>`).
-fn dsmlAttr(seg: []const u8, comptime key: []const u8) ?[]const u8 {
+pub fn dsmlAttr(seg: []const u8, comptime key: []const u8) ?[]const u8 {
     const pat = key ++ "=";
     var start: usize = 0;
     while (std.mem.indexOfPos(u8, seg, start, pat)) |at| {

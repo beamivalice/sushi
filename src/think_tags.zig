@@ -540,30 +540,98 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
     return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
 }
 
-const ToolMarkupFamily = struct { opener: []const u8, closers: []const []const u8 };
-
-/// Each call dialect's opener and the closers that end it, where `tool_markup_openers` knows only the openers.
-const tool_markup_families = [_]ToolMarkupFamily{
-    .{ .opener = "<|tool_call", .closers = &.{"<tool_call|>"} },
-    .{ .opener = "<tool_call", .closers = &.{ "</tool_call>", "</tool_calls>", "</tool>", "</tool_request>", "</tool_requests>" } },
-    .{ .opener = "<｜DSML｜tool_calls", .closers = &.{"</｜DSML｜tool_calls>"} },
-    .{ .opener = "<function_calls>", .closers = &.{"</function_calls>"} },
+/// One call dialect: the openers that may start a call, the closers that end it, and for a dialect whose opener
+/// alone is prose, what the text from the opener on must hold for the parser to read a call there.
+const ToolMarkupFamily = struct {
+    openers: []const []const u8,
+    closers: []const []const u8,
+    /// Spellings that begin with an opener and are another dialect's closer.
+    not_openers: []const []const u8 = &.{},
+    reads_as_call: ?*const fn (tail: []const u8) bool = null,
 };
 
-/// Where the last tool-call opener in `text` starts when no closer follows it: the text stops inside a call.
+const hermes_closers = [_][]const u8{ "</tool_call>", "</tool_calls>", "</tool>", "</tool_request>", "</tool_requests>" };
+
+/// Every dialect `parseToolCallsAs` reads, so a call left open in any of them is found.
+const tool_markup_families = [_]ToolMarkupFamily{
+    .{ .openers = &.{"<|tool_call"}, .closers = &.{"<tool_call|>"} },
+    .{ .openers = &.{"<tool_call"}, .closers = &hermes_closers, .not_openers = &.{"<tool_call|>"} },
+    .{ .openers = &.{ "<tool>", "<tool ", "<tool\t", "<tool\n", "<tool_request" }, .closers = &hermes_closers, .reads_as_call = genericToolTagReadsAsCall },
+    .{ .openers = &.{"<｜DSML｜tool_calls"}, .closers = &.{"</｜DSML｜tool_calls>"} },
+    .{ .openers = &.{ "<｜DSML｜invoke", "<｜DSML｜ invoke" }, .closers = &.{ "</｜DSML｜invoke>", "</｜DSML｜ invoke>" } },
+    .{ .openers = &.{FUNCTION_CALLS_TAG}, .closers = &.{"</function_calls>"} },
+    .{ .openers = &.{BARE_INVOKE.invoke}, .closers = &.{BARE_INVOKE.invoke_close}, .reads_as_call = invokeReadsAsCall },
+    .{ .openers = &.{"<function"}, .closers = &.{"</function>"}, .reads_as_call = functionReadsAsCall },
+};
+
+/// `<tool name="x">{…`, `<tool>{"name":…` and `<tool_request>{…`: the tag's `>` opens a body that is a JSON object or Hermes' function tag.
+/// A self-closing `<tool …/>` is a whole call, never an open one.
+fn genericToolTagReadsAsCall(tail: []const u8) bool {
+    const gt = std.mem.indexOfScalar(u8, tail[0..@min(tail.len, 256)], '>') orelse return false;
+    if (tail[gt - 1] == '/') return false;
+    const body = std.mem.trimStart(u8, tail[gt + 1 ..], " \t\n\r");
+    if (std.mem.startsWith(u8, body, "{")) return std.mem.startsWith(u8, std.mem.trimStart(u8, body[1..], " \t\n\r"), "\"");
+    return std.mem.startsWith(u8, body, "<function=");
+}
+
+/// `<invoke name="x">` with a `<parameter ` of its own before the next `<invoke`: the opener alone is prose.
+fn invokeReadsAsCall(tail: []const u8) bool {
+    const after = BARE_INVOKE.invoke.len;
+    if (tail.len <= after or !std.ascii.isWhitespace(tail[after])) return false;
+    const name = tool_calls_mod.dsmlAttr(tail[after..@min(tail.len, after + 512)], "name") orelse return false;
+    if (name.len == 0) return false;
+    const own = tail[after .. std.mem.indexOfPos(u8, tail, after, BARE_INVOKE.invoke) orelse tail.len];
+    return std.mem.indexOf(u8, own, BARE_INVOKE.param ++ " ") != null;
+}
+
+/// MiniCPM5's `<function name="x">` with a `<param` after its tag, and Hermes' bare `<function=x>` with a
+/// `<parameter=`: either opener alone is prose.
+fn functionReadsAsCall(tail: []const u8) bool {
+    const after = "<function".len;
+    if (tail.len <= after) return false;
+    if (tail[after] == '=') return std.mem.indexOf(u8, tail, "<parameter=") != null;
+    if (!std.ascii.isWhitespace(tail[after])) return false;
+    const gt = std.mem.indexOfScalarPos(u8, tail, after, '>') orelse return false;
+    const name = tool_calls_mod.miniCpm5AttrValue(tail[after..gt], "name") orelse return false;
+    return name.len > 0 and std.mem.indexOf(u8, tail[gt + 1 ..], "<param") != null;
+}
+
+/// Where the call `text` leaves open starts: the first dialect whose last call opener has no closer after it. Null when
+/// the text stops outside a call.
 pub fn openToolCallStart(text: []const u8) ?usize {
-    var last: ?struct { at: usize, family: *const ToolMarkupFamily } = null;
+    var first: ?usize = null;
     for (&tool_markup_families) |*f| {
-        var from: usize = 0;
-        while (std.mem.indexOfPos(u8, text, from, f.opener)) |at| : (from = at + 1) {
-            // Gemma's closer `<tool_call|>` begins with the Hermes opener.
-            if (std.mem.startsWith(u8, text[at..], "<tool_call|>")) continue;
-            if (last == null or at > last.?.at) last = .{ .at = at, .family = f };
+        const at = lastCallOpener(f, text) orelse continue;
+        if (closedAfter(f, text, at)) continue;
+        if (first == null or at < first.?) first = at;
+    }
+    return first;
+}
+
+fn closedAfter(f: *const ToolMarkupFamily, text: []const u8, from: usize) bool {
+    for (f.closers) |c| if (std.mem.indexOfPos(u8, text, from, c) != null) return true;
+    return false;
+}
+
+/// The last place in `text` where `f` has a call opener: one that is no closer of another dialect and that the
+/// dialect's own reading accepts as a call.
+fn lastCallOpener(f: *const ToolMarkupFamily, text: []const u8) ?usize {
+    var last: ?usize = null;
+    for (f.openers) |o| {
+        var end = text.len;
+        while (std.mem.lastIndexOf(u8, text[0..end], o)) |at| : (end = at + o.len - 1) {
+            if (last != null and at < last.?) break;
+            if (!opensCall(f, text[at..])) continue;
+            last = at;
+            break;
         }
     }
-    const l = last orelse return null;
-    for (l.family.closers) |c| if (std.mem.indexOfPos(u8, text, l.at, c) != null) return null;
-    return l.at;
+    return last;
+}
+
+fn opensCall(f: *const ToolMarkupFamily, tail: []const u8) bool {
+    for (f.not_openers) |n| if (std.mem.startsWith(u8, tail, n)) return false;
+    return if (f.reads_as_call) |reads| reads(tail) else true;
 }
 
 /// The text the model said before the tool markup, byte for byte as the stream flushes it.

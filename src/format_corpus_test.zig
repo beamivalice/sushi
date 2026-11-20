@@ -44,6 +44,7 @@ const think_tags = @import("think_tags.zig");
 const tool_calls_mod = @import("tool_calls.zig");
 const tool_schema = @import("tool_schema.zig");
 const stop_sequences = @import("stop_sequences.zig");
+const reply_mod = @import("reply.zig");
 
 test "format corpus: concurrent completion IDs stay distinct within one millisecond" {
     const Worker = struct {
@@ -2299,6 +2300,87 @@ test "format corpus: every dialect a family declares parses to the same call" {
             std.debug.print("\n[{s}] {s}: {s}={s} (want {s})\n", .{ d.family, d.dialect, d.key, v, d.value });
             return error.DialectWrongArg;
         }
+    }
+}
+
+/// One call in each dialect the parse chain reads, whole, for `weather_tool_schema`.
+const dialect_calls = [_][]const u8{
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>",
+    "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>",
+    "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>",
+    "<|tool_call>call:get_weather{city:<|\"|>Tokyo<|\"|>}<tool_call|>",
+    "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Tokyo</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
+    "<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Tokyo</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>",
+    "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Tokyo</parameter>\n</invoke>\n</function_calls>",
+    "<invoke name=\"get_weather\">\n<parameter name=\"city\">Tokyo</parameter>\n</invoke>",
+    "<function name=\"get_weather\"><param name=\"city\">Tokyo</param></function>",
+    "<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>",
+    "<tool name=\"get_weather\">{\"city\": \"Tokyo\"}</tool>",
+    "<tool_request>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}</tool_request>",
+};
+
+/// Text that mentions call markup and is not a call.
+const markup_prose = [_][]const u8{
+    "Document the syntax as <function name=\"shell\"> before discussing parameters.",
+    "You write <function name=\"get_weather\"> to open a call.",
+    "Wrap it in a <functional> block, or a <function-like> one.",
+    "Call it as <function=get_weather> and then list the <parameters>.",
+    "Wrap it in <invoke name=\"get_weather\"> and then the arguments.",
+    "An <invoked> word is no tag, and <invoke> alone is not a call.",
+    "The <tool> tag and the <tool name=\"get_weather\"> attribute are described below.",
+    "A <tool_request> and a <toolbar> are different things; {name} is a placeholder.",
+};
+
+fn settleCut(allocator: std.mem.Allocator, text: []const u8) !reply_mod.Settled {
+    return reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = "length", .finish_details = null }, .{
+        .stops = &.{},
+        .normalize = true,
+        .has_tools = true,
+        .tools_json = weather_tool_schema,
+        .allow_parallel = true,
+        .dialect = null,
+        .opens_think = false,
+    });
+}
+
+test "format corpus: an unfinished call of any dialect never ships, and prose that mentions call markup is never declined" {
+    const allocator = testing.allocator;
+    for (dialect_calls) |call| {
+        const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", call });
+        defer allocator.free(text);
+        // The whole call ships and declines nothing.
+        const whole = try settleCut(allocator, text);
+        defer whole.deinit(allocator);
+        errdefer std.debug.print("whole call: {f}\n", .{std.zig.fmtString(text)});
+        try testing.expectEqual(@as(usize, 1), (whole.reply orelse return error.WholeCallDropped).calls.len);
+        try testing.expect(whole.declined == null);
+        // No prefix of it ships a call; a prefix the parser reads a call from names it declined.
+        var cut: usize = "Let me check.\n".len;
+        while (cut < text.len) : (cut += 1) {
+            if (text[cut] & 0xC0 == 0x80) continue;
+            const got = try settleCut(allocator, text[0..cut]);
+            defer got.deinit(allocator);
+            errdefer std.debug.print("cut at {d}: {f}\n", .{ cut, std.zig.fmtString(text[0..cut]) });
+            try testing.expect(got.reply == null);
+            if (try tool_calls_mod.parseToolCalls(allocator, text[0..cut])) |read| {
+                defer {
+                    for (read) |c| {
+                        allocator.free(c.name);
+                        allocator.free(c.arguments);
+                    }
+                    allocator.free(read);
+                }
+                if (!read[0].inferred) try testing.expect(got.declined != null);
+            }
+        }
+    }
+    for (markup_prose) |prose| {
+        const got = try settleCut(allocator, prose);
+        defer got.deinit(allocator);
+        errdefer std.debug.print("prose: {s}\n", .{prose});
+        try testing.expect(got.reply == null);
+        try testing.expect(got.declined == null);
+        try testing.expectEqualStrings(prose, got.text);
     }
 }
 

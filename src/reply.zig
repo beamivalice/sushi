@@ -918,6 +918,28 @@ test "a stream and a non-stream reply end the same: a stop in a call, a stop aft
     }
 }
 
+test "an unfinished call of every dialect the parse chain reads is declined and named, whatever ended the generation" {
+    const a = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+    ;
+    const open = [_][]const u8{
+        "<function name=\"get_weather\"><param name=\"city\">Tok",
+        "<function=get_weather>\n<parameter=city>\nTok",
+        "<invoke name=\"get_weather\">\n<parameter name=\"city\">Tok",
+        "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Tok",
+        "<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Tok",
+        "<tool name=\"get_weather\">{\"city\": \"Tokyo\"}",
+        "<tool_request>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok",
+    };
+    const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+    for (open) |call| for ([_][]const u8{ "", "Let me check.\n" }) |lead| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const text = try std.mem.concat(a, u8, &.{ lead, call });
+        defer a.free(text);
+        try expectSameEnd(a, text, &.{}, finish, ask, null, finish, null, .{ .named = "get_weather" });
+    };
+}
+
 test "a declined call is named in the details field of every surface's key, and outranks a thought's note" {
     const a = testing.allocator;
     const named: Declined = .{ .name = try a.dupe(u8, "read\"file") };
